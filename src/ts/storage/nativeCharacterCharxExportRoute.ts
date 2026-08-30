@@ -15,6 +15,7 @@ import { getPersistentDataRuntime } from './persistentDataRuntime.svelte'
 interface NativeCharacterCharxPickerInput {
     characterId: string
     suggestedName: string
+    container?: 'appended-charx-jpeg'
     projectCharacter(character: CharacterDetail): {
         card: Record<string, unknown>
         module: Record<string, unknown>
@@ -81,6 +82,7 @@ export async function exportNativeCharacterCharxFromPicker(
                 ? { type: 'desktopPath', path: destination }
                 : { type: 'androidSaf', suggestedName: input.suggestedName },
             expectedRevision,
+            ...(input.container ? { container: input.container } : {}),
             card: projected.card,
             module: projected.module,
         },
