@@ -24,6 +24,7 @@ const startup = vi.hoisted(() => {
             throw stopAfterAutoListen
         }),
         alertError: vi.fn(),
+        bootFailure: vi.fn(),
     }
 })
 
@@ -162,6 +163,7 @@ vi.mock('./globalApi.svelte', () => ({
 vi.mock('./stores.svelte', () => ({
     MobileGUI: { set: vi.fn() }, botMakerMode: { set: vi.fn() }, selectedCharID: { set: vi.fn() },
     loadedStore: {}, DBState: {}, LoadingStatusState: { text: '' },
+    bootFailure: { set: (...args: unknown[]) => startup.bootFailure(...args) },
 }))
 vi.mock('./alert', () => ({
     alertConfirm: vi.fn(), alertError: (...args: unknown[]) => startup.alertError(...args),
@@ -178,6 +180,7 @@ describe('device sync bootstrap wiring', () => {
         startup.startAutoListen.mockClear()
         startup.controller.initialize.mockClear()
         startup.alertError.mockClear()
+        startup.bootFailure.mockClear()
     })
 
     it('connects the production controller to auto-listen after native data initialization', async () => {
@@ -199,5 +202,10 @@ describe('device sync bootstrap wiring', () => {
             expect.objectContaining({ controller: startup.controller }),
         )
         expect(startup.alertError).toHaveBeenCalledWith(startup.stopAfterAutoListen)
+        expect(startup.bootFailure).toHaveBeenCalledWith({
+            kind: 'unknown',
+            message: startup.stopAfterAutoListen.message,
+            stage: 'device-sync',
+        })
     })
 })
