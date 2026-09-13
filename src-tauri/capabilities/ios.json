@@ -40,6 +40,20 @@
     },
     "os:default",
     "shell:allow-open",
-    "deep-link:default"
+    "deep-link:default",
+    "barcode-scanner:allow-scan",
+    "barcode-scanner:allow-cancel",
+    "barcode-scanner:allow-check-permissions",
+    "barcode-scanner:allow-request-permissions",
+    "ios-native:allow-state",
+    "ios-native:allow-begin",
+    "ios-native:allow-end",
+    "ios-native:allow-request-notifications",
+    "ios-native:allow-notify",
+    "ios-native:allow-open-settings",
+    "ios-native:allow-pick-file",
+    "ios-native:allow-export-file",
+    "ios-native:allow-discard-file",
+    "ios-native:allow-publication"
   ]
 }
