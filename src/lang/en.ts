@@ -2055,9 +2055,11 @@ export const languageEnglish = {
             capturing: 'Locking the saved revision for this exit.',
             syncing: 'Publishing saved changes before the app closes.',
             delayed: 'Synchronization is taking longer than usual. The app will stay open until you choose what to do.',
-            blocked: 'Synchronization needs attention before it can finish. You can keep waiting, exit without syncing, or return to the app.',
+            blocked: 'Synchronization needs attention before it can finish. You can retry, exit without syncing, or return to the app.',
             saveFailed: 'Local changes could not be saved. Retry saving, exit without saving, or return to the app.',
             keepWaiting: 'Keep waiting',
+            retrySync: 'Retry',
+            syncFailedTitle: 'Could not finish synchronization',
             retrySaving: 'Retry saving',
             exitWithoutSync: 'Exit without syncing',
             exitWithoutSaving: 'Exit without saving',
@@ -2250,7 +2252,7 @@ export const languageEnglish = {
             itemsCount: '{0} items',
             progress: {
                 saving: 'Saving changes on this device',
-                preparing: 'Receiving changes from the server',
+                preparing: 'Comparing changes on this device and the server',
                 applying: 'Applying received changes',
                 refreshing: 'Updating the screen',
                 publishing: 'Uploading this device’s changes',
@@ -2268,8 +2270,9 @@ export const languageEnglish = {
                 'The same items were edited on this device and on the server. Choose which side to keep. Both sides are saved as conflict backups before applying.',
             keepLocal: 'Keep this device',
             keepRemote: 'Keep server version',
+            busyHelp: 'Another operation is using the library. Wait for it to finish and try again.',
             errorHelp:
-                'Sync could not finish. Your edits on this device are unchanged. Check your internet connection and try again.',
+                'Sync could not finish. Your edits on this device are unchanged. Try again.',
             refreshHelp:
                 'The received changes are saved. Refresh the screen to continue editing.',
         },

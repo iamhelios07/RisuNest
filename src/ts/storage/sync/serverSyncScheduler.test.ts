@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createServerSyncController } from "./serverSyncController";
+import { connectServerSync } from "./serverSyncConnectFlow";
 import { createServerSyncScheduler } from "./serverSyncScheduler";
 import type { ServerCycle, ServerStatus, ServerSyncFacade } from "./serverSync";
 
@@ -43,6 +44,8 @@ function fixture() {
   const cycle = vi.fn(async () => result);
   const controller = createServerSyncController({
     status: async () => status,
+    bind: async () => status,
+    reregister: async () => status,
     cycle,
     cancel: async () => {},
     needsRefresh: () => false,
@@ -65,6 +68,52 @@ function fixture() {
 beforeEach(() => vi.useFakeTimers());
 afterEach(() => vi.useRealTimers());
 describe("server sync scheduler", () => {
+  it.each([false, true])("holds automatic sync until connection policy is saved (replacing=%s)", async (replacing) => {
+    const f = fixture();
+    let release!: () => void;
+    const policy = vi.fn(() => new Promise<void>((resolve) => { release = resolve; }));
+    const connecting = connectServerSync(f.controller, policy, {
+      config: { endpoint: "http://localhost", libraryId: "library", deviceId: "device", token: "a".repeat(64) },
+      residency: "remote",
+      replacing,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(policy).toHaveBeenCalledOnce();
+    expect(f.cycle).not.toHaveBeenCalled();
+    expect(f.controller.snapshot().connecting).toBe(true);
+    expect(f.controller.canAutoSync()).toBe(false);
+    expect(f.controller.canRestore()).toBe(false);
+    f.scheduler.resume();
+    f.scheduler.localCommit();
+    f.scheduler.remoteHint();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(f.cycle).not.toHaveBeenCalled();
+    await expect(f.controller.synchronize()).rejects.toMatchObject({ code: "library-operation-busy" });
+    release();
+    await connecting;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.cycle).toHaveBeenCalledTimes(1);
+    expect(f.controller.snapshot()).toMatchObject({ connecting: false, error: "" });
+    f.scheduler.stop();
+  });
+  it("keeps automatic sync paused after policy failure and allows a connection retry", async () => {
+    const f = fixture();
+    const request = {
+      config: { endpoint: "http://localhost", libraryId: "library", deviceId: "device", token: "a".repeat(64) },
+      residency: "remote" as const,
+    };
+    await expect(connectServerSync(f.controller, async () => {
+      throw { code: "library-operation-busy" };
+    }, request)).rejects.toMatchObject({ code: "library-operation-busy" });
+    f.scheduler.resume();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(f.cycle).not.toHaveBeenCalled();
+    expect(f.controller.snapshot()).toMatchObject({ connecting: false, paused: true });
+    await connectServerSync(f.controller, async () => {}, request);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.cycle).toHaveBeenCalledTimes(1);
+    f.scheduler.stop();
+  });
   it("checks after initialization and lengthens idle polls without reading every local object", async () => {
     const f = fixture();
     await f.controller.initialize();

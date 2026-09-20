@@ -15,8 +15,8 @@ export interface ServerSyncConnectRequest {
   replacing?: boolean;
 }
 export interface ServerSyncConnectPort {
-  bind(config: ServerConfig): Promise<void>;
-  reregister(config: ServerConfig): Promise<void>;
+  bind(config: ServerConfig, prepare?: () => Promise<unknown>): Promise<void>;
+  reregister(config: ServerConfig, prepare?: () => Promise<unknown>): Promise<void>;
   synchronize(): Promise<void>;
 }
 
@@ -32,9 +32,9 @@ export async function connectServerSync(
   setAssetResidencyPolicy: (policy: AssetResidencyPolicy) => Promise<unknown>,
   request: ServerSyncConnectRequest,
 ): Promise<void> {
-  if (request.replacing) await controller.reregister(request.config);
-  else await controller.bind(request.config);
-  await setAssetResidencyPolicy(request.residency);
+  const prepare = () => setAssetResidencyPolicy(request.residency);
+  if (request.replacing) await controller.reregister(request.config, prepare);
+  else await controller.bind(request.config, prepare);
   await controller.synchronize();
 }
 
@@ -52,6 +52,8 @@ export function serverSyncErrorHelp(code: string, text: ServerSyncText): string 
       return text.activationHelp;
     case "committed-refresh-pending":
       return text.refreshHelp;
+    case "library-operation-busy":
+      return text.busyHelp;
     case "device-credential-unavailable":
       return text.credentialUnavailable;
     default:

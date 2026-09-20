@@ -1,6 +1,7 @@
 <script lang="ts">
     import { AlertTriangleIcon, LoaderCircleIcon, SaveIcon } from '@lucide/svelte'
     import { language } from 'src/lang'
+    import { serverSyncErrorHelp } from 'src/ts/storage/sync/serverSyncConnectFlow'
     import SettingButton from 'src/lib/Setting/RisuNest/SettingButton.svelte'
     import {
         decideSyncExit,
@@ -17,6 +18,7 @@
     const needsChoice = $derived(
         dialogState.phase === 'local-failed'
         || dialogState.phase === 'edit-blocked'
+        || dialogState.phase === 'remote-waiting'
         || dialogState.phase === 'remote-delayed'
         || dialogState.phase === 'remote-blocked',
     )
@@ -27,16 +29,23 @@
     const title = $derived(
         localFailure ? copy.saveFailedTitle
             : editBlocked ? copy.editBlockedTitle
-                : copy.title,
+                : dialogState.phase === 'remote-blocked' ? copy.syncFailedTitle
+                    : copy.title,
     )
     const detail = $derived.by(() => {
         switch (dialogState.phase) {
             case 'saving': return copy.saving
             case 'edit-blocked': return copy.editBlocked
             case 'capturing': return copy.capturing
+            case 'remote-waiting':
             case 'syncing': return copy.syncing
             case 'remote-delayed': return copy.delayed
-            case 'remote-blocked': return copy.blocked
+            case 'remote-blocked': {
+                const help = (dialogState.destination === 'server' || dialogState.destination.startsWith('server:'))
+                    ? serverSyncErrorHelp(dialogState.reason, language.risuNest.serverSync)
+                    : copy.blocked
+                return `${help} (${dialogState.reason})`
+            }
             case 'local-failed': return copy.saveFailed
             default: return ''
         }
@@ -99,9 +108,11 @@
                                 {localFailure ? copy.exitWithoutSaving : copy.exitWithoutSync}
                             </SettingButton>
                         {/if}
-                        <SettingButton onclick={() => decideSyncExit('wait')}>
-                            {localFailure ? copy.retrySaving : copy.keepWaiting}
-                        </SettingButton>
+                        {#if dialogState.phase !== 'remote-waiting'}
+                            <SettingButton onclick={() => decideSyncExit('wait')}>
+                                {localFailure ? copy.retrySaving : dialogState.phase === 'remote-blocked' ? copy.retrySync : copy.keepWaiting}
+                            </SettingButton>
+                        {/if}
                     </div>
                 {/if}
             </div>

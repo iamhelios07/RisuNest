@@ -36,6 +36,7 @@ export interface ServerSyncSnapshot {
   initialSyncComplete?: boolean;
   refreshPending?: boolean;
   replacing?: boolean;
+  connecting?: boolean;
 }
 export function createServerSyncController(
   facade: ServerSyncFacade,
@@ -152,7 +153,7 @@ export function createServerSyncController(
     }
   };
   const requireAvailable = (): void => {
-    if (state.running || state.replacing || isLibraryFileOperationReserved())
+    if (state.running || state.connecting || state.replacing || isLibraryFileOperationReserved())
       throw new ServerSyncError("library-operation-busy");
   };
   const invalidateCompletion = (): void => {
@@ -165,7 +166,7 @@ export function createServerSyncController(
     explicitResume: boolean,
   ): Promise<void> => {
     if (active) return active;
-    if (state.replacing || isLibraryFileOperationReserved())
+    if (state.connecting || state.replacing || isLibraryFileOperationReserved())
       return Promise.reject(new ServerSyncError("library-operation-busy"));
     if (explicitResume) controllerOptions.onExplicitResume?.();
     state.paused = false;
@@ -203,11 +204,11 @@ export function createServerSyncController(
       return "new-device-registration-required";
     if (state.status.reconciling) return "epoch-reconciliation-required";
     if (state.result?.phase === "conflict") return "server-sync-conflict";
-    if (state.replacing) return "library-operation-busy";
+    if (state.connecting || state.replacing) return "library-operation-busy";
     return undefined;
   };
   const beginReplacement = async (): Promise<() => Promise<void>> => {
-    if (state.running || state.replacing || facade.needsRefresh())
+    if (state.running || state.connecting || state.replacing || facade.needsRefresh())
       throw new ServerSyncError("resolve-pending-operation-first");
     state.replacing = true;
     invalidateCompletion();
@@ -241,6 +242,33 @@ export function createServerSyncController(
       throw cause;
     }
   };
+  const register = async (
+    config: ServerConfig,
+    replacing: boolean,
+    prepare?: () => Promise<unknown>,
+  ): Promise<void> => {
+    requireAvailable();
+    state.connecting = true;
+    invalidateCompletion();
+    publish();
+    try {
+      const status = await (replacing ? facade.reregister(config) : facade.bind(config));
+      state.status = status;
+      state.lastSuccessAt = undefined;
+      publish();
+      await prepare?.();
+      state.error = "";
+      controllerOptions.onExplicitResume?.();
+      state.paused = false;
+    } catch (cause) {
+      state.error = serverSyncError(cause).code;
+      state.paused = true;
+      throw cause;
+    } finally {
+      state.connecting = false;
+      publish();
+    }
+  };
   return {
     holdAutomaticSync(): void {
       state.paused = true;
@@ -252,7 +280,7 @@ export function createServerSyncController(
       publish();
     },
     assertFileOperationAvailable(): void {
-      if (state.running || state.replacing || facade.needsRefresh())
+      if (state.running || state.connecting || state.replacing || facade.needsRefresh())
         throw new ServerSyncError("server-sync-busy");
     },
     async confirmReplacement(): Promise<void> {
@@ -315,6 +343,7 @@ export function createServerSyncController(
     waitForIdle: () => active ?? Promise.resolve(),
     canRestore: () =>
       !state.running &&
+      !state.connecting &&
       !state.replacing &&
       statusFresh &&
       Boolean(state.status) &&
@@ -336,16 +365,8 @@ export function createServerSyncController(
         publish();
       }
     },
-    async bind(config: ServerConfig): Promise<void> {
-      requireAvailable();
-      invalidateCompletion();
-      const status = await facade.bind(config);
-      state.status = status;
-      state.lastSuccessAt = undefined;
-      state.error = "";
-      controllerOptions.onExplicitResume?.();
-      state.paused = false;
-      publish();
+    bind(config: ServerConfig, prepare?: () => Promise<unknown>): Promise<void> {
+      return register(config, false, prepare);
     },
     async unbind(): Promise<void> {
       requireAvailable();
@@ -355,16 +376,8 @@ export function createServerSyncController(
       state.result = undefined;
       await refreshStatus();
     },
-    async reregister(config: ServerConfig): Promise<void> {
-      requireAvailable();
-      invalidateCompletion();
-      const status = await facade.reregister(config);
-      state.status = status;
-      state.result = undefined;
-      state.error = "";
-      controllerOptions.onExplicitResume?.();
-      state.paused = false;
-      publish();
+    reregister(config: ServerConfig, prepare?: () => Promise<unknown>): Promise<void> {
+      return register(config, true, prepare);
     },
     async reconcile(): Promise<void> {
       requireAvailable();
@@ -441,6 +454,7 @@ export function createServerSyncController(
         state.status?.configured &&
         !state.status.registrationRequired &&
         !state.running &&
+        !state.connecting &&
         !state.replacing &&
         !isLibraryFileOperationReserved() &&
         !state.paused &&
