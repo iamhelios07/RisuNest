@@ -163,6 +163,17 @@ pub(crate) struct CompleteAuthorizationRequest {
     client_secret: Option<String>,
 }
 
+fn authorization_client_secret(
+    provider: &str,
+    client_secret: Option<String>,
+) -> Result<Option<Zeroizing<String>>> {
+    let client_secret = client_secret.map(Zeroizing::new);
+    if client_secret.is_some() && provider != "google_drive" {
+        return Err(ProviderError::new(ErrorKind::Unsupported));
+    }
+    Ok(client_secret)
+}
+
 #[derive(Serialize)]
 #[serde(untagged)]
 pub(crate) enum CompleteAuthorizationResult {
@@ -722,17 +733,23 @@ pub(crate) async fn external_storage_begin_authorization(
 pub(crate) async fn external_storage_complete_authorization(
     app: AppHandle,
     state: State<'_, ConnectionCommandState>,
-    request: CompleteAuthorizationRequest,
+    mut request: CompleteAuthorizationRequest,
 ) -> ConnectResult<CompleteAuthorizationResult> {
     let _cleanup_guard = state.admit()?;
-    let client_secret = request.client_secret.map(Zeroizing::new);
-    if client_secret.is_some() {
-        return Err(ProviderError::new(ErrorKind::Unsupported).into());
-    }
     if let Some(mut redirect_url) = request.redirect_url {
         redirect_url.zeroize();
         return Err(ProviderError::new(ErrorKind::Unsupported).into());
     }
+    let client_secret = {
+        let authorizations = lock(&state.authorizations)?;
+        let authorization = authorizations
+            .get(&request.authorization_id)
+            .ok_or_else(|| ProviderError::new(ErrorKind::NotFound))?;
+        authorization_client_secret(
+            &authorization.exchange_config.provider,
+            request.client_secret.take(),
+        )?
+    };
     let authorization = lock(&state.authorizations)?
         .remove(&request.authorization_id)
         .ok_or_else(|| ProviderError::new(ErrorKind::NotFound))?;
@@ -761,7 +778,7 @@ pub(crate) async fn external_storage_complete_authorization(
                     &dependencies,
                     &authorization.exchange_config,
                     &grant,
-                    None,
+                    client_secret,
                     &cancel,
                 )
                 .await?;
@@ -819,12 +836,22 @@ pub(crate) async fn external_storage_complete_authorization(
 pub(crate) async fn external_storage_complete_authorization(
     app: AppHandle,
     state: State<'_, ConnectionCommandState>,
-    request: CompleteAuthorizationRequest,
+    mut request: CompleteAuthorizationRequest,
 ) -> ConnectResult<CompleteAuthorizationResult> {
     let _cleanup_guard = state.admit()?;
-    if request.redirect_url.is_some() || request.client_secret.is_some() {
+    if request.redirect_url.is_some() {
         return Err(ProviderError::new(ErrorKind::Unsupported).into());
     }
+    let client_secret = {
+        let authorizations = lock(&state.authorizations)?;
+        let authorization = authorizations
+            .get(&request.authorization_id)
+            .ok_or_else(|| ProviderError::new(ErrorKind::NotFound))?;
+        authorization_client_secret(
+            &authorization.exchange_config.provider,
+            request.client_secret.take(),
+        )?
+    };
     let authorization = lock(&state.authorizations)?
         .remove(&request.authorization_id)
         .ok_or_else(|| ProviderError::new(ErrorKind::NotFound))?;
@@ -852,7 +879,7 @@ pub(crate) async fn external_storage_complete_authorization(
                     &dependencies,
                     &authorization.exchange_config,
                     &authorization.grant,
-                    None,
+                    client_secret,
                     &cancel,
                 )
                 .await?;
@@ -1783,6 +1810,26 @@ mod tests {
         assert_eq!(
             serde_json::to_value(rejected).unwrap(),
             serde_json::json!({"authorizationPending":true,"callbackRejected":true})
+        );
+    }
+
+    #[test]
+    fn only_google_authorization_accepts_a_client_secret() {
+        let secret = authorization_client_secret(
+            "google_drive",
+            Some("synthetic-secret".to_owned()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(secret.as_str(), "synthetic-secret");
+        assert!(authorization_client_secret("google_drive", None)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            authorization_client_secret("onedrive", Some("synthetic-secret".to_owned()))
+                .unwrap_err()
+                .kind,
+            ErrorKind::Unsupported
         );
     }
 
