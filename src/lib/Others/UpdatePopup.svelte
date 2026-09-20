@@ -50,7 +50,8 @@
 {#snippet inline(tokens: ReleaseNoteInline[])}
     {#each tokens as token}
         {#if token.type === 'strong'}<strong>{token.text}</strong>
-        {:else if token.type === 'code'}<code class="rounded-sm bg-bgcolor px-1 py-0.5">{token.text}</code>
+        {:else if token.type === 'em'}<em>{token.text}</em>
+        {:else if token.type === 'code'}<code class="rounded-sm bg-bgcolor px-1 py-0.5 whitespace-pre-wrap">{token.text}</code>
         {:else if token.type === 'link'}<button class="underline" type="button" onclick={() => openURL(token.url)}>{token.text}</button>
         {:else}{token.text}{/if}
     {/each}
@@ -83,9 +84,9 @@
                 {#if $appUpdateState.update.format === 'ipa'}<p class="rounded-md border border-darkborderc bg-bgcolor p-2 text-sm">{text.iosResign}</p>{/if}
                 <div class="flex flex-col gap-2 text-sm leading-relaxed">
                     {#each noteBlocks as block}
-                        {#if block.type === 'heading'}<h3 class="font-bold">{@render inline(block.content)}</h3>
+                        {#if block.type === 'heading'}<h3 class="font-bold" class:text-base={block.level <= 2}>{@render inline(block.content)}</h3>
                         {:else if block.type === 'paragraph'}<p>{@render inline(block.content)}</p>
-                        {:else}<div class:pl-5={block.depth === 2} class="flex gap-2"><span>•</span><span>{@render inline(block.content)}</span></div>{/if}
+                        {:else}<div class="flex gap-2" style:padding-left={`${(block.depth - 1) * 1.25}rem`}><span class="min-w-4 shrink-0 text-right">{block.marker}</span><span>{@render inline(block.content)}</span></div>{/if}
                     {/each}
                 </div>
                 {#if model.busy}
