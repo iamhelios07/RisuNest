@@ -363,7 +363,9 @@ fn builder_with_main_window(
     let setup_native_log_state = native_log_state.clone();
     let native_startup_state = NativeStartupState::default();
     let setup_native_startup_state = native_startup_state.clone();
-    let mut builder = tauri::Builder::default().manage(native_startup_state);
+    let mut builder = tauri::Builder::default()
+        .manage(native_startup_state)
+        .plugin(tauri_plugin_opener::init());
     #[cfg(desktop)]
     {
         // Reject a second process before plugins with startup side effects run.
@@ -382,8 +384,7 @@ fn builder_with_main_window(
     {
         builder = builder
             .append_invoke_initialization_script(include_str!("ios_ipc.js"))
-            .manage(ios_lifecycle::RestartState::default())
-            .plugin(tauri_plugin_opener::init());
+            .manage(ios_lifecycle::RestartState::default());
     }
     #[cfg(not(target_os = "ios"))]
     {
