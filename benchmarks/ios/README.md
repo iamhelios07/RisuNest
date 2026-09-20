@@ -1,56 +1,25 @@
 # iOS native verification
 
-This harness uses synthetic fixtures, a separate app identifier, and the product
-builder and command router. Run it in agent mode. Never point it at installed app
-data or use live character libraries.
+Builds and runs isolated iOS product and harness targets with synthetic fixtures. It uses a separate application identifier and never reads installed app data.
 
-The build-lab `ios-check.yml` workflow builds the product and harness for the
-simulator, then runs storage, restart, streaming, file, lifecycle, product UI and
-XCTest checks. The controller remains in build-lab and consumes immutable audited
-source snapshots.
+The build-lab `ios-check.yml` workflow runs simulator storage, restart, streaming, file, lifecycle, product UI, and XCTest checks from an audited source snapshot.
 
-## Firebase Test Lab preparation
+## Physical-device package
 
-The manual build-lab `ios-testlab-package.yml` workflow runs `buildTestLab.py` on
-macOS with Xcode. It produces:
+The manual `ios-testlab-package.yml` workflow produces:
 
-- `RisuNest-ios-testlab.zip`: `Debug-iphoneos`, the isolated app, signed UI test
-  runner, and `.xctestrun` configuration. Tests cover synthetic file publication
-  and import, notification permission, external URL opening, product chat
-  persistence and keyboard input, and a measured app transition.
-- `RisuNest-ios-device-agent.ipa`: the product agent build, separate from the
-  verification app. This is not a distribution-signed or TestFlight build.
-- `testlab-package.json`: source provenance, Xcode, target, size and SHA-256.
+- `RisuNest-ios-testlab.zip`, containing the app, UI test runner, and `.xctestrun`
+- `RisuNest-ios-device-agent.ipa`, an agent build that is not a distribution build
+- `testlab-package.json`, containing source and toolchain provenance plus hashes
 
-The script verifies arm64/iphoneos, ad-hoc signatures and the compiled continued
-processing API when selecting Xcode 26 or later. Firebase re-signs submitted
-apps. Inspect each app's `DTSDKName` and `DTXcodeBuild` as well: the controller's
-Xcode version alone does not prove which toolchain Tauri's nested build used.
-Each package requires its own device validation. No Firebase SDK or credentials
-are added to the product.
-
-The device-core test additionally measures alternating JSON and worker/raw
-storage commits, exact Unicode and revision contracts, native regex against its
-JavaScript oracle, and tokenizer results. It attaches measurements instead of
-asserting a speedup: simulator trials showed inconsistent storage timing gains.
-
-`testNetworkReachability` is a diagnostic comparison using only the public
-Ollama model-list endpoint, without credentials or retained response bodies.
-It records URLSession status/numeric errors in the runner, and reqwest status,
-fixed error categories and numeric OS errors in the app before and during a
-generation lease. A completed diagnostic test is not a successful Cloud test;
-the separate live Cloud tests still require streaming, storage and cleanup.
-
-After Firebase is configured, inspect its current device and Xcode catalog:
+Inspect the current Firebase device and Xcode catalog before choosing IDs:
 
 ```sh
 gcloud firebase test ios models list --project=YOUR_PROJECT
 gcloud firebase test ios versions list --project=YOUR_PROJECT
 ```
 
-Select a supported iPhone and iPad, and an Xcode version compatible with their OS
-versions. Rebuild using that workflow input when needed. Then upload the XCTest
-ZIP in the Firebase console or run the equivalent command with verified IDs:
+Run an authorized test with verified values:
 
 ```sh
 gcloud firebase test ios run --project=YOUR_PROJECT --type=xctest \
@@ -59,12 +28,6 @@ gcloud firebase test ios run --project=YOUR_PROJECT --type=xctest \
   --xcode-version=VERIFIED_XCODE
 ```
 
-UI selectors use English system labels. The app-transition test attaches its
-measured ticks, execution gap and native state; it does not assert unlimited
-background execution. Test Lab runs are bounded and do not replace long locked
-device, battery/thermal, personal iCloud provider or camera-content validation.
-No service upload or paid execution happens as part of the package workflow.
+Firebase execution is never part of the packaging workflow and requires separate authorization. Package generation does not establish a device pass. Long locked-device, battery, thermal, iCloud provider, camera-content, and distribution-signing checks remain separate.
 
-References: [XCTest packaging](https://firebase.google.com/docs/test-lab/ios/run-xctest),
-[device catalog](https://firebase.google.com/docs/test-lab/ios/available-testing-devices),
-[CLI](https://docs.cloud.google.com/sdk/gcloud/reference/firebase/test/ios/run).
+See `docs/ios-testing.md` for the current build-lab and device procedure.

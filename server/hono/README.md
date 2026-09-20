@@ -1,5 +1,5 @@
 # RisuNest Hono Server
 
-> Note: This server is currently under development and may not be fully functional. **use node version instead if you do not know what you are doing.**
+Experimental Hono replacement for the legacy Node.js self-hosting server. It is not yet the recommended self-hosting path.
 
-This directory contains the implementation of the RisuNest server using the Hono framework, which is made for replacement of the original RisuNest node.js server.
+From this directory, install dependencies and run one of `pnpm start:node`, `pnpm start:bun`, or `pnpm start:cloudflare`. Use `pnpm runserver` from the repository root when you need the current Node.js server.

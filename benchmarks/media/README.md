@@ -5,7 +5,7 @@ Only synthetic data and a fresh temporary WebView2 profile are used. No app boot
 Build the native test binary with the shared Cargo target:
 
 ```powershell
-$env:CARGO_TARGET_DIR='E:/Programming/Github/RisuNest/src-tauri/target'
+$env:CARGO_TARGET_DIR=(Resolve-Path 'src-tauri/target').Path
 cargo test --manifest-path src-tauri/Cargo.toml --offline --locked --lib native_media:: --no-run
 ```
 
