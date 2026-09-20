@@ -10,7 +10,7 @@ type StagedDatabase = {
     characters: Database['characters']
 }
 
-class NativeStoreBoundary {
+class InMemoryNativeCommandDouble {
     revision = 0
     database = { characters: [] } as unknown as Database
     rejectNextCharacterBatch = false
@@ -94,7 +94,7 @@ class NativeStoreBoundary {
     }
 }
 
-const native = vi.hoisted(() => ({ boundary: null as unknown as NativeStoreBoundary }))
+const native = vi.hoisted(() => ({ boundary: null as unknown as InMemoryNativeCommandDouble }))
 const platform = vi.hoisted(() => ({ isTauri: true }))
 
 vi.mock('../../platform', () => platform)
@@ -132,11 +132,11 @@ function createStateAdapter(initial: Database): PersistentDataRuntimeStateAdapte
     }
 }
 
-describe('native persistent local backup integration', () => {
+describe('simulated native persistent local backup boundary', () => {
     let indexedDbOpen: ReturnType<typeof vi.fn>
 
     beforeEach(() => {
-        native.boundary = new NativeStoreBoundary()
+        native.boundary = new InMemoryNativeCommandDouble()
         platform.isTauri = true
         indexedDbOpen = vi.fn(() => {
             throw new Error('IndexedDB must not open in Tauri')
