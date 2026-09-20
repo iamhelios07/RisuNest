@@ -2684,7 +2684,6 @@ export const languageEnglish = {
             deleteAndExit: 'Delete and exit',
             confirmReset: 'Delete local data and reset RisuNest?',
             confirmRemoval: 'Delete local data and prepare RisuNest for removal?',
-            pending: 'Deleting local data',
             failed: 'Local data deletion could not start. Please retry.',
         },
         platform: {

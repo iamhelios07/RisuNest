@@ -2496,7 +2496,6 @@ export const languageKorean = {
             deleteAndExit: '삭제 후 종료',
             confirmReset: '로컬 데이터를 삭제하고 RisuNest를 초기화하시겠습니까?',
             confirmRemoval: '로컬 데이터를 삭제하고 RisuNest 제거를 준비하시겠습니까?',
-            pending: '로컬 데이터 삭제 중',
             failed: '로컬 데이터 삭제를 시작하지 못했습니다. 다시 시도해주세요.',
         },
         platform: {
