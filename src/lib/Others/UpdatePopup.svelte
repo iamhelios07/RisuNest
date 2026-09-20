@@ -66,7 +66,14 @@
                 {/if}
             </header>
 
-            {#if $appUpdateState.phase === 'current'}
+            {#if $appUpdateState.phase === 'checking'}
+                <div class="flex flex-col gap-1" aria-live="polite">
+                    <div role="progressbar" aria-label={text.checking} class="h-2 overflow-hidden rounded-md border border-darkborderc bg-bgcolor">
+                        <div class="h-full w-full animate-pulse bg-borderc/60"></div>
+                    </div>
+                    <span class="text-xs text-textcolor2">{text.checking}</span>
+                </div>
+            {:else if $appUpdateState.phase === 'current'}
                 <p>{text.current}</p>
             {:else if $appUpdateState.phase === 'disabled'}
                 <p>{text.notConfigured}</p>
