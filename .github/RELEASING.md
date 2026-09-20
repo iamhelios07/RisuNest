@@ -26,7 +26,7 @@ For a Sync release, set the same version in:
 - `release-notes/sync/<version>.md`
 
 Update every affected lockfile in the same commit. Release notes must begin with a
-Markdown title.
+Markdown title and contain non-empty `## English` and `## 한국어` sections.
 
 ## Repository configuration
 
@@ -62,8 +62,8 @@ For Sync, use the corresponding Sync tag:
 
 ```powershell
 $Sha = git rev-parse HEAD
-git tag sync-v0.1.0 $Sha
-git push origin refs/tags/sync-v0.1.0
+git tag sync-v1.0.0 $Sha
+git push origin refs/tags/sync-v1.0.0
 ```
 
 The tag version must match the product version files and release-notes filename.
