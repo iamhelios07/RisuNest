@@ -31,7 +31,6 @@ export const tagWhitelist = []
 export const beginPluginClaimSession = async () => null
 export const sleep = (milliseconds: number) => new Promise(resolve => setTimeout(resolve, milliseconds))
 export const language = {}
-export const isNodeServer = false
 export const isTauri = false
 export const assertPersistentMutationAllowed = () => {}
 export const getPluginPermissionStore = () => ({ getItem: async () => Date.now(), setItem: async () => {} })

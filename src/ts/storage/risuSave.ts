@@ -4,7 +4,7 @@ import * as fflate from "fflate";
 import { getDatabase, presetTemplate, type Database } from "./database.svelte";
 import localforage from "localforage";
 import { forageStorage } from "../globalApi.svelte";
-import { isNodeServer, isTauri } from "src/ts/platform"
+import { isTauri } from "src/ts/platform"
 import {
     writeFile,
     BaseDirectory,
@@ -360,10 +360,7 @@ export class RisuSaveEncoder {
             option.remote === 'force' ||
             (
                 option.remote === 'prefer' &&
-                (
-                    isTauri ||
-                    isNodeServer
-                )
+                isTauri
             ) &&
             !disableRemoteSaving()
         ){
