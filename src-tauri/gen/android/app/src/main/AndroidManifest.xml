@@ -56,7 +56,7 @@
                 
             </intent-filter>
             <!-- DEEP LINK PLUGIN. AUTO-GENERATED. DO NOT REMOVE. -->
-            <!-- tauri-file-associations. AUTO-GENERATED. DO NOT REMOVE. -->
+            <!-- File associations are maintained here; tauri.android.conf.json disables generation. -->
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
                 <action android:name="android.intent.action.SEND_MULTIPLE" />
@@ -86,8 +86,6 @@
                 <data android:pathPattern=".*\\.risunest" />
                 <data android:pathPattern=".*\\.risudat" />
             </intent-filter>
-            
-            <!-- tauri-file-associations. AUTO-GENERATED. DO NOT REMOVE. -->
         </activity>
 
         <provider
