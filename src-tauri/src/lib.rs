@@ -55,20 +55,12 @@ mod test_memory;
 mod windows_appearance;
 
 use base64::{engine::general_purpose, Engine as _};
-use oauth2::basic::{BasicClient, BasicErrorResponseType, BasicTokenType};
-use oauth2::{
-    AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EmptyExtraTokenFields,
-    EndpointNotSet, EndpointSet, PkceCodeChallenge, RedirectUrl, RevocationErrorResponseType,
-    Scope, StandardErrorResponse, StandardRevocableToken, StandardTokenIntrospectionResponse,
-    StandardTokenResponse, TokenResponse, TokenUrl,
-};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, Listener, Manager};
+use tauri::Manager;
 
 const MAX_NATIVE_STARTUP_ERROR_CHARS: usize = 4096;
 
@@ -237,132 +229,6 @@ async fn native_request(url: String, body: String, header: String, method: Strin
             r#"{{"success":false,"body":"{}","status":400}}"#,
             e.to_string()
         ),
-    }
-}
-
-fn get_oauth_client() -> oauth2::Client<
-    StandardErrorResponse<BasicErrorResponseType>,
-    StandardTokenResponse<EmptyExtraTokenFields, BasicTokenType>,
-    StandardTokenIntrospectionResponse<EmptyExtraTokenFields, BasicTokenType>,
-    StandardRevocableToken,
-    StandardErrorResponse<RevocationErrorResponseType>,
-    EndpointSet,
-    EndpointNotSet,
-    EndpointNotSet,
-    EndpointNotSet,
-    EndpointSet,
-> {
-    let auth_url = AuthUrl::new("http://authorize".to_string()).unwrap();
-    let token_url = TokenUrl::new("http://token".to_string()).unwrap();
-    let redirection_url = RedirectUrl::new("http://redirect".to_string()).unwrap();
-    let client = BasicClient::new(ClientId::new("client_id".to_string()))
-        .set_client_secret(ClientSecret::new("client_secret".to_string()))
-        .set_auth_uri(auth_url)
-        .set_token_uri(token_url)
-        // Set the URL the user will be redirected to after the authorization process.
-        .set_redirect_uri(redirection_url);
-
-    return client;
-}
-
-#[tauri::command]
-async fn oauth_login(app: AppHandle) -> Result<String, String> {
-    let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
-    let client = get_oauth_client();
-    // Write pkce_verifier to a file or session for later use.
-    std::fs::write("pkce_verifier.txt", pkce_verifier.secret()).unwrap();
-
-    let (auth_url, _csrf_token) = client
-        .authorize_url(CsrfToken::new_random)
-        // Set the desired scopes.
-        .add_scope(Scope::new("read".to_string()))
-        .add_scope(Scope::new("write".to_string()))
-        // Set the PKCE code challenge.
-        .set_pkce_challenge(pkce_challenge)
-        .url();
-
-    let http_client = oauth2::reqwest::ClientBuilder::new()
-        // Following redirects opens the client up to SSRF vulnerabilities.
-        .redirect(oauth2::reqwest::redirect::Policy::none())
-        .build()
-        .expect("Client should build");
-
-    app.emit("oauth_open_url", auth_url.to_string()).unwrap();
-
-    let auth_code = Arc::new(Mutex::new(String::new()));
-    let auth_code_clone = Arc::clone(&auth_code);
-
-    let handle = app.app_handle().clone();
-    //promise
-    app.listen("oauth_callback_event", move |event| {
-        // Handle the event
-        let mut code = auth_code_clone.lock().unwrap();
-        *code = event.payload().to_string();
-        handle.unlisten(event.id());
-    });
-
-    //wait for auth_code to be set
-    loop {
-        {
-            let code = auth_code.lock().unwrap();
-            if !code.is_empty() {
-                break;
-            }
-        } // MutexGuard is dropped here before await
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    }
-
-    // Now you can trade it for an access token.
-    let auth_code_value = auth_code.lock().unwrap().clone();
-    let token_result = client
-        .exchange_code(AuthorizationCode::new(auth_code_value))
-        // Set the PKCE code verifier.
-        .set_pkce_verifier(pkce_verifier)
-        .request_async(&http_client)
-        .await;
-
-    return Ok(token_result.unwrap().access_token().secret().to_string());
-}
-
-#[tauri::command]
-fn check_auth(fpath: String, auth: String) -> bool {
-    //check file exists
-    let path = Path::new(&fpath);
-    if !path.exists() {
-        crate::nlog!("warn", "authentication file does not exist");
-        return false;
-    }
-
-    // check file is a file
-    if !path.is_file() {
-        crate::nlog!("warn", "authentication path is not a file");
-        return false;
-    }
-
-    // check file size
-    let size = std::fs::metadata(&fpath).unwrap().len();
-
-    //check file size is less than 1000 bytes
-    if size > 1000 {
-        crate::nlog!("warn", "authentication file is too large");
-        return false;
-    }
-
-    // read file, return false when error
-    let got_auth = std::fs::read_to_string(&path);
-
-    // check read error
-    if got_auth.is_err() {
-        crate::nlog!("warn", "authentication file could not be read");
-        return false;
-    } else {
-        // check auth
-        if got_auth.unwrap() != auth {
-            crate::nlog!("warn", "authentication did not match");
-            return false;
-        }
-        crate::nlog!("info", "authentication matched");
-        return true;
     }
 }
 
@@ -750,7 +616,6 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         boot_attempt_begin,
         boot_attempt_complete,
         native_request,
-        check_auth,
         #[cfg(desktop)]
         opened_files::opened_files_take,
         #[cfg(desktop)]
@@ -774,7 +639,6 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         native_log::native_log_error,
         native_log::native_log_file_path,
         native_log::native_log_set_file_enabled,
-        oauth_login,
         native_tokenizer::tokenize_batch,
         native_media::native_media_encode_inlay_image,
         native_media::ipc::native_media_inlay_input_open,
