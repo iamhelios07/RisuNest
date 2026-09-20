@@ -1710,6 +1710,8 @@ export const languageEnglish = {
     folderRemoveLengthError: "To remove a folder, it must not contain any entries.",
     personaNote: "Persona Note",
     mcpAccessPrompt: '{{tool}} is trying to "{{action}}". Do you want to allow this?',
+    mcpStdioModuleImportBlocked: "This module cannot be imported because it contains a local MCP program configuration. Register local MCPs directly in the module settings.",
+    mcpStdioRegisterConfirm: "Registering this MCP runs the program configured below on your computer with your user permissions. The program can access files and the network, and may run again while the module is enabled. Only register programs you trust. Do you want to run the program and register this MCP?",
     rememberToolUsage: "Remember tool usage",
     simplifiedToolUse: "Simplified tool usage",
     toolCalled: "Tool '{{tool}}' Called",

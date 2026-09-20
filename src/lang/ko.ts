@@ -1547,6 +1547,8 @@ export const languageKorean = {
     "folderRemoveLengthError": "폴더를 제거하려면 폴더가 비어 있어야 합니다.",
     "personaNote": "페르소나 노트",
     "mcpAccessPrompt": "{{tool}}이(가) \"{{action}}\"을(를) 시도하고 있습니다. 허용하시겠습니까?",
+    "mcpStdioModuleImportBlocked": "로컬 MCP 프로그램 실행 설정이 포함되어 있어 모듈을 가져올 수 없습니다. 로컬 MCP는 모듈 설정에서 직접 등록해주세요.",
+    "mcpStdioRegisterConfirm": "이 MCP를 등록하면 아래에 설정된 프로그램이 사용자 권한으로 컴퓨터에서 실행됩니다. 프로그램은 파일과 네트워크에 접근할 수 있으며, 모듈이 활성화된 동안 다시 실행될 수 있습니다. 신뢰하는 프로그램만 등록해주세요. 프로그램을 실행하고 MCP를 등록하시겠습니까?",
     "rememberToolUsage": "도구 사용 기억하기",
     "simplifiedToolUse": "단순화된 도구 사용",
     "toolCalled": "도구 '{{tool}}' 호출됨",
