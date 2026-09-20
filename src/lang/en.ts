@@ -2498,7 +2498,6 @@ export const languageEnglish = {
             actionNormalizeRecords: 'Recalculate the values',
             actionKeepSingleRecord: 'Keep one and drop the rest',
             actionRecoverOrphans: 'Put them back under an owner',
-            actionSettleAuthority: 'Finish the storage setup',
             actionDiscards: 'deletes the value',
             actionRisky:
                 'The file may not be what this was meant to point at.',
@@ -2515,7 +2514,6 @@ export const languageEnglish = {
             codeAliasObjectMismatch: 'Files whose contents changed',
             codeRecordInvalid: 'Records in the wrong shape',
             codeRecordOrphan: 'Records with no owner',
-            codeAuthorityIncomplete: 'Storage setup left unfinished',
             codeObjectUnreferenced: 'Files nothing uses',
             codeUnclassified: 'Problems that could not be sorted',
             rootFieldCharacters: 'characters',

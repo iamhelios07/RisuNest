@@ -186,7 +186,6 @@ function createReader(model: Model): PersistentRevisionReader {
         readAssetAlias: async () => unsupported('readAssetAlias'),
         readAssetAliasesByKeys: async () => unsupported('readAssetAliasesByKeys'),
         listAssetAliases: async () => unsupported('listAssetAliases'),
-        readAssetRepositoryAuthority: async () => unsupported('readAssetRepositoryAuthority'),
         readAssetOwnerHead: async () => unsupported('readAssetOwnerHead'),
     } as unknown as PersistentRevisionReader
 }

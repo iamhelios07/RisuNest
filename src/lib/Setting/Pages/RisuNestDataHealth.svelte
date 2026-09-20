@@ -91,7 +91,6 @@
         'alias-object-mismatch': strings.codeAliasObjectMismatch,
         'record-invalid': strings.codeRecordInvalid,
         'record-orphan': strings.codeRecordOrphan,
-        'authority-incomplete': strings.codeAuthorityIncomplete,
         'object-unreferenced': strings.codeObjectUnreferenced,
         unclassified: strings.codeUnclassified,
     }
@@ -236,7 +235,6 @@
         'normalize-records': strings.actionNormalizeRecords,
         'keep-single-record': strings.actionKeepSingleRecord,
         'recover-orphans': strings.actionRecoverOrphans,
-        'settle-authority': strings.actionSettleAuthority,
     }
     let choices = $derived(repairChoicesByFinding(view.candidates))
     // Select all is checked once every finding has an answer chosen.
