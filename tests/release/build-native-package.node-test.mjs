@@ -344,8 +344,10 @@ test("application bundles identify Yumi as the publisher", () => {
 
 test("Sync NSIS hook separates the default install and durable data directories", () => {
   const hook = readFileSync("server/manager/install/windows.nsh", "utf8");
-  assert.match(hook, /StrCmp \$INSTDIR "\$LOCALAPPDATA\\RisuNest Sync"/);
-  assert.match(hook, /StrCpy \$INSTDIR "\$LOCALAPPDATA\\RisuNestSync"/);
+  assert.match(hook, /!define RISUNEST_SYNC_DEFAULT_INSTALL_DIR "\$LOCALAPPDATA\\RisuNest Sync"/);
+  assert.match(hook, /!define RISUNEST_SYNC_INSTALL_DIR "\$LOCALAPPDATA\\RisuNestSync"/);
+  assert.match(hook, /StrCmp \$INSTDIR "\$\{RISUNEST_SYNC_DEFAULT_INSTALL_DIR\}"/);
+  assert.match(hook, /StrCpy \$INSTDIR "\$\{RISUNEST_SYNC_INSTALL_DIR\}"\s+SetOutPath \$INSTDIR/);
   assert.match(hook, /\$LOCALAPPDATA\\RisuNestSyncData\\manager-update/);
   assert.doesNotMatch(hook, /\$LOCALAPPDATA\\RisuNestSync\\manager-update/);
   assert.match(hook, /\$DeleteAppDataCheckboxState = 1/);

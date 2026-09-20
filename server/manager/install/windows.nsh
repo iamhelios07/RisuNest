@@ -1,6 +1,14 @@
+!ifndef RISUNEST_SYNC_DEFAULT_INSTALL_DIR
+  !define RISUNEST_SYNC_DEFAULT_INSTALL_DIR "$LOCALAPPDATA\RisuNest Sync"
+!endif
+!ifndef RISUNEST_SYNC_INSTALL_DIR
+  !define RISUNEST_SYNC_INSTALL_DIR "$LOCALAPPDATA\RisuNestSync"
+!endif
+
 !macro NSIS_HOOK_PREINSTALL
-  StrCmp $INSTDIR "$LOCALAPPDATA\RisuNest Sync" 0 sync_install_dir_ready
-  StrCpy $INSTDIR "$LOCALAPPDATA\RisuNestSync"
+  StrCmp $INSTDIR "${RISUNEST_SYNC_DEFAULT_INSTALL_DIR}" 0 sync_install_dir_ready
+  StrCpy $INSTDIR "${RISUNEST_SYNC_INSTALL_DIR}"
+  SetOutPath $INSTDIR
   sync_install_dir_ready:
   StrCpy $R7 ""
   IfFileExists "$INSTDIR\risunest-sync-manager.exe" 0 sync_prepare_done
