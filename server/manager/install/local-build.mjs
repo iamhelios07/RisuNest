@@ -18,6 +18,7 @@ import { packageNativeSuite } from "./package.mjs";
 const installDirectory = dirname(fileURLToPath(import.meta.url));
 const repository = resolve(installDirectory, "../../..");
 const localOutputBase = join(repository, ".tmp", "sync-distribution");
+const defaultRegistryUrl = "https://registry.rsyumi.workers.dev/";
 
 const targets = Object.freeze({
   "x86_64-pc-windows-msvc": Object.freeze({
@@ -86,13 +87,9 @@ export function validateLocalSyncEnvironment({ target, hostTarget = rustHost(), 
   const config = localSyncTarget(target);
   if (!env.CARGO_TARGET_DIR)
     throw new Error("Set CARGO_TARGET_DIR to the repository shared target directory.");
-  if (!env.RISUNEST_DEFAULT_REGISTRY_URL)
-    throw new Error("Set RISUNEST_DEFAULT_REGISTRY_URL to the Sync endpoint registry HTTPS base URL.");
-  if (!env.RISUNEST_UPDATE_PUBLIC_KEY)
-    throw new Error("Set RISUNEST_UPDATE_PUBLIC_KEY to the update signing public key embedded in Sync binaries.");
   if (hostTarget !== target)
     throw new Error(`Local Sync distributions must be built on their native host target (${target}); current host is ${hostTarget}.`);
-  const registry = new URL(env.RISUNEST_DEFAULT_REGISTRY_URL);
+  const registry = new URL(env.RISUNEST_DEFAULT_REGISTRY_URL || defaultRegistryUrl);
   if (registry.protocol !== "https:" || registry.username || registry.password || registry.search || registry.hash)
     throw new Error("RISUNEST_DEFAULT_REGISTRY_URL must be an HTTPS base URL without credentials, query, or fragment.");
   return { ...config, cargoTargetDir: resolve(repository, env.CARGO_TARGET_DIR), registryUrl: registry.href };
