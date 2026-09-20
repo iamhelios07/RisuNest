@@ -44,6 +44,9 @@ impl Store {
         if self.object_size(&descriptor.object_hash)?.is_none() {
             return Err(Error::new("missing-dependency", 409));
         }
+        for hash in &descriptor.dependencies {
+            if self.object_size(hash)?.is_none() { return Err(Error::new("missing-dependency", 409)); }
+        }
         if let Some(root) = &descriptor.dependency_root {
             self.prepare_reference_tree(root, false)?;
         }
@@ -172,6 +175,9 @@ impl Store {
                 |r| r.get(0),
             )?;
             let descriptor: RecordDescriptor = parse(&body)?;
+            for target in &descriptor.relations {
+                db.execute("INSERT INTO record_relations(domain,source,target) VALUES(?1,?2,?3) ON CONFLICT DO NOTHING", params![domain.as_str(),key,target])?;
+            }
             if let Some(root) = descriptor.relation_root {
                 db.execute("WITH RECURSIVE nodes(hash) AS (SELECT ?1 UNION SELECT child FROM reference_children JOIN nodes ON root=nodes.hash) INSERT INTO record_relations(domain,source,target) SELECT ?2,?3,target FROM reference_relations WHERE root IN nodes ON CONFLICT DO NOTHING",params![root,domain.as_str(),key])?;
             }

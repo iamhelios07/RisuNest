@@ -60,6 +60,9 @@ impl Drop for ReferenceSourceGuard {
 pub(crate) struct CycleItemCounts {
     done: u64,
     total: u64,
+    activity: &'static str,
+    processed: u64,
+    expected: u64,
 }
 #[derive(Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -328,9 +331,7 @@ fn manage_cache(app: &AppHandle, clean: bool) -> Result<super::management::Cache
         if let Some(id) = &active {
             let path = store.repository_root().join("server-sync").join(id);
             if path.exists() {
-                let cache = super::cache::Cache {
-                    cas: crate::asset_repository::PayloadCas::new(&path)?,
-                };
+                let cache = super::cache::Cache::open(&path)?;
                 match store.server_cache_references(&cache) {
                     Ok(hashes) => references = hashes,
                     Err(_) => block = Some("cache-references-unavailable"),
@@ -527,6 +528,11 @@ pub(crate) fn server_sync_progress_counts(app: AppHandle) -> Result<CycleItemCou
     Ok(CycleItemCounts {
         done: counter.done.load(Ordering::Relaxed),
         total: counter.total.load(Ordering::Relaxed),
+        activity: match counter.activity.load(Ordering::Relaxed) {
+            1 => "enumerating", 2 => "preparing", 3 => "downloading", 4 => "uploading", 5 => "confirming", _ => "enumerating",
+        },
+        processed: counter.processed.load(Ordering::Relaxed),
+        expected: counter.expected.load(Ordering::Relaxed),
     })
 }
 #[tauri::command]

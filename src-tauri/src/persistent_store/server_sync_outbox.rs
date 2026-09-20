@@ -14,6 +14,7 @@ CREATE TABLE server_sync_scope_clear_base(scope TEXT PRIMARY KEY,version TEXT NO
 CREATE TABLE server_sync_clears(id TEXT PRIMARY KEY,revision INTEGER NOT NULL,expected_version TEXT);
 CREATE TABLE server_sync_clear_members(clear_id TEXT NOT NULL REFERENCES server_sync_clears(id) ON DELETE CASCADE,owner TEXT NOT NULL,key TEXT NOT NULL,PRIMARY KEY(clear_id,owner,key));
 CREATE TABLE server_sync_operation(singleton INTEGER PRIMARY KEY CHECK(singleton=1),sequence TEXT NOT NULL,intent TEXT NOT NULL,phase TEXT NOT NULL,local_revision INTEGER NOT NULL);
+CREATE TABLE server_sync_prepared(key TEXT PRIMARY KEY,version TEXT NOT NULL,local_hash TEXT,revision INTEGER NOT NULL,generation TEXT NOT NULL);
 CREATE TABLE server_sync_objects(hash TEXT PRIMARY KEY,size INTEGER NOT NULL,path TEXT NOT NULL);
 CREATE TABLE server_sync_operation_records(domain TEXT NOT NULL,key TEXT NOT NULL,version TEXT NOT NULL,local_hash TEXT,kind TEXT NOT NULL,key1 TEXT NOT NULL,key2 TEXT NOT NULL,revision INTEGER NOT NULL,PRIMARY KEY(domain,key));
 CREATE TABLE server_sync_operation_pages(page INTEGER PRIMARY KEY,body BLOB NOT NULL);
@@ -69,6 +70,7 @@ pub(super) fn validate_schema(db: &Connection) -> StoreResult<()> {
         "server_sync_clear_members",
         "server_sync_operation",
         "server_sync_objects",
+        "server_sync_prepared",
         "server_sync_operation_records",
         "server_sync_operation_pages",
         "server_sync_operation_scopes",

@@ -238,8 +238,21 @@ mod commit_retry_tests {
 pub(crate) struct CycleItemCounter {
     pub total: std::sync::atomic::AtomicU64,
     pub done: std::sync::atomic::AtomicU64,
+    pub activity: std::sync::atomic::AtomicU8,
+    pub processed: std::sync::atomic::AtomicU64,
+    pub expected: std::sync::atomic::AtomicU64,
 }
 impl CycleItemCounter {
+    fn start(counter: Option<&Self>, activity: u8, total: u64) {
+        if let Some(counter) = counter {
+            counter.processed.store(0, std::sync::atomic::Ordering::Relaxed);
+            counter.expected.store(total, std::sync::atomic::Ordering::Relaxed);
+            counter.activity.store(activity, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    fn processed(counter: Option<&Self>) {
+        if let Some(counter) = counter { counter.processed.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+    }
     fn advance(counter: Option<&Self>) {
         if let Some(counter) = counter {
             counter
@@ -587,6 +600,7 @@ impl PersistentStore {
             )?;
         }
         builder.flush()?;
+        self.connection.execute("DELETE FROM server_sync_prepared", [])?;
         let changes_digest = digest.finish()?;
         let pages: i64 = self.connection.query_row(
             "SELECT count(*) FROM server_sync_operation_pages",
@@ -621,6 +635,7 @@ impl PersistentStore {
             if sealed.changes_digest != changes_digest {
                 return Err(SyncError::new("staged-intent-mismatch", 409));
             }
+            client.progress();
             let intent =
                 self.server_reserve(head, changes_digest, sealed.staged_changes_id, revision)?;
             let reply = submit_commit(client, &intent)?;
@@ -645,7 +660,7 @@ impl PersistentStore {
         let (_, stage): (_, Started) =
             client.json(Method::POST, "staged-changes/start", &[], None::<&()>, &[])?;
         self.server_reserve(head, changes_digest, stage.staged_changes_id, revision)?;
-        self.resume_server_operation(client, transfer)?;
+        self.resume_server_operation(client, transfer, cycle_items)?;
         let _ = cache;
         Ok(())
     }
@@ -655,6 +670,7 @@ impl PersistentStore {
         &mut self,
         client: &ServerClient,
         transfer: &Transfer<'_>,
+        cycle_items: Option<&CycleItemCounter>,
     ) -> Result<bool> {
         let Some(mut pending) = self.server_pending()? else {
             return Ok(false);
@@ -662,6 +678,7 @@ impl PersistentStore {
         if pending.phase.starts_with('{') {
             return Ok(false);
         }
+        CycleItemCounter::start(cycle_items, 5, 0);
         let config = self
             .server_config()?
             .ok_or_else(|| SyncError::new("server-not-bound", 409))?;
@@ -718,7 +735,7 @@ impl PersistentStore {
         } else if progress.status != 200 {
             return Err(response_error(progress));
         }
-        self.upload_pending_objects(transfer, None)?;
+        self.upload_pending_objects(transfer, cycle_items)?;
         // Pages are idempotent by index and exact bytes. Replaying them is safe
         // after process death between a successful PUT and recording its response.
         let mut page_index = 0i64;
@@ -748,6 +765,7 @@ impl PersistentStore {
             if reply.status != 204 {
                 return Err(response_error(reply));
             }
+            client.progress();
             page_index += 1;
         }
         #[derive(Deserialize)]
@@ -768,6 +786,7 @@ impl PersistentStore {
         {
             return Err(SyncError::new("staged-intent-mismatch", 409));
         }
+        client.progress();
         let reply = submit_commit(client, &pending.intent)?;
         if reply.status == 202 {
             return Ok(true);
@@ -788,7 +807,17 @@ impl PersistentStore {
         transfer: &Transfer<'_>,
         cycle_items: Option<&CycleItemCounter>,
     ) -> Result<()> {
+        let count: i64 = self.connection.query_row("SELECT count(*) FROM server_sync_operation_records", [], |row| row.get(0))?;
+        if let Some(counter) = cycle_items {
+            if counter.total.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                counter.total.store(count as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        CycleItemCounter::start(cycle_items, 4, count as u64);
         let mut remote_context = None;
+        let mut pending = Vec::new();
+        let mut pending_bytes = 0u64;
+        let mut pending_records = 0usize;
         self.connection.execute_batch("CREATE TEMP TABLE IF NOT EXISTS server_upload_objects(hash TEXT PRIMARY KEY); DELETE FROM server_upload_objects;")?;
         let mut after = (Domain::Hypa, String::new());
         loop {
@@ -851,7 +880,7 @@ impl PersistentStore {
                 let mut local = Vec::new();
                 let mut remote = Vec::new();
                 for hash in unsent {
-                    if transfer.cache.cas.stat_object(&hash)?.is_none() {
+                    if transfer.cache.stat_object(&hash)?.is_none() {
                         if remote_context.is_none() {
                             let residency = crate::server_sync::residency::Residency::open(
                                 &self.repository_root,
@@ -876,10 +905,31 @@ impl PersistentStore {
                 }
                 transfer.pin(&remote)?;
                 let hints = transfer.record_reference_hints(&version, &base)?;
-                transfer.upload_with_hints(&local, &bases, base_lease, &hints)?;
-                CycleItemCounter::advance(cycle_items);
+                let bases: std::sync::Arc<[String]> = bases.into();
+                for hash in local {
+                    let size = transfer.cache.stat_object(&hash)?
+                        .ok_or_else(|| SyncError::new("cached-object-missing", 409))?;
+                    if !pending.is_empty() && (pending.len() >= 1024 || pending_bytes.saturating_add(size) > 32 * 1024 * 1024) {
+                        transfer.upload_targets(&pending)?;
+                        pending.clear();
+                        pending_bytes = 0;
+                        for _ in 0..pending_records { CycleItemCounter::advance(cycle_items); CycleItemCounter::processed(cycle_items); }
+                        pending_records = 0;
+                    }
+                    pending.push(crate::server_sync::transfer::UploadTarget {
+                        bases: hints.get(&hash).map(|values| std::sync::Arc::from(values.as_slice()))
+                            .unwrap_or_else(|| bases.clone()),
+                        hash,
+                        base_lease,
+                    });
+                    pending_bytes = pending_bytes.saturating_add(size);
+                }
+                pending_records += 1;
             }
         }
+        transfer.upload_targets(&pending)?;
+        for _ in 0..pending_records { CycleItemCounter::advance(cycle_items); CycleItemCounter::processed(cycle_items); }
+        CycleItemCounter::start(cycle_items, 5, 0);
         Ok(())
     }
     pub(crate) fn server_cycle(&mut self, options: &CycleOptions) -> Result<CycleResult> {
@@ -920,10 +970,10 @@ impl PersistentStore {
             risunest_sync_wire::hash(
                 format!("{}:{}", config.library_id, config.device_id).as_bytes(),
             ),
-        ))?;
+        ))?.with_library(&self.repository_root)?;
         let transfer = Transfer::new(&client, &cache)?;
         let retry_budget = client.retry_budget();
-        if self.resume_server_operation(&client, &transfer)? {
+        if self.resume_server_operation(&client, &transfer, options.cycle_items.as_deref())? {
             return Ok(Preparation::Report(CycleResult {
                 endpoint: client.config().endpoint.clone(),
                 phase: "pending".into(),
@@ -974,6 +1024,7 @@ impl PersistentStore {
             committed,
             status.full_scan || !options.groups.is_empty(),
             &client,
+            options.cycle_items.as_deref(),
         );
         self.release_revision(&lease.lease)?;
         prepared?;
@@ -1229,6 +1280,7 @@ impl PersistentStore {
                 .store(total.max(0) as u64, std::sync::atomic::Ordering::Relaxed);
             counter.done.store(0, std::sync::atomic::Ordering::Relaxed);
         }
+        CycleItemCounter::start(options.cycle_items.as_deref(), 3, 0);
         after.clear();
         loop {
             let page = cycle_page(&self.connection, &after)?;
@@ -1246,21 +1298,15 @@ impl PersistentStore {
                         let (payload, hash) = if matches!(remote, RecordVersion::Live { .. }) {
                             let base_candidates =
                                 self.server_base_candidates(Domain::Library, &item.key, &cache, committed)?;
-                            if remote_assets {
-                                transfer.download_record_metadata(
-                                    &remote,
-                                    &base_candidates,
-                                    &base_version,
-                                )?;
-                            } else {
-                                transfer.download_record(
-                                    &remote,
-                                    &base_candidates,
-                                    &base_version,
-                                )?;
-                            }
+                            transfer.download_record_metadata(&remote, &base_candidates, &base_version)?;
                             let (payload, hash) = cache.restore(&remote)?;
-                            let dependencies = projection::dependencies(&payload, &cache.cas)?;
+                            let dependencies = cache.dependencies(&payload)?;
+                            if !remote_assets {
+                                let native = PayloadCas::new(&self.repository_root)?;
+                                Transfer::new(&client, &cache)?.with_destination(&native, &self.connection)
+                                    .download(&dependencies, &base_candidates)?;
+                            }
+
                             let expected = cache.project(
                                 &payload,
                                 &dependencies,
@@ -1357,11 +1403,16 @@ impl PersistentStore {
                 bases.push((Domain::Library, item.key, remote, remote_hash));
                 if applying {
                     CycleItemCounter::advance(options.cycle_items.as_deref());
+                    CycleItemCounter::processed(options.cycle_items.as_deref());
                 }
             }
         }
         let (section_applied, section_proposals) =
-            self.prepare_server_sections(&client, &transfer, &cache, &participation, committed)?;
+            self.prepare_server_sections(&client, &transfer, &cache, &participation, committed, options.cycle_items.as_deref())?;
+        if let Some(counter) = &options.cycle_items {
+            counter.total.fetch_add((section_applied + section_proposals) as u64, std::sync::atomic::Ordering::Relaxed);
+            counter.done.fetch_add(section_applied as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         let applied = records.len();
         let plugins_changed = records.affects_plugins();
         let device_plugins_changed = self.connection.query_row(
@@ -1476,7 +1527,7 @@ impl PersistentStore {
             risunest_sync_wire::hash(
                 format!("{}:{}", config.library_id, config.device_id).as_bytes(),
             ),
-        ))?;
+        ))?.with_library(&self.repository_root)?;
         let transfer = Transfer::new(&client, &cache)?;
         let through = &ready.through;
         let sections_included = ready.section_honored
@@ -1502,6 +1553,7 @@ impl PersistentStore {
         }
         let applied_records = ready.applied + if ready.section_honored { ready.section_applied } else { 0 };
         if proposals == 0 && ready.scope_fences.is_empty() {
+            self.connection.execute("DELETE FROM server_sync_prepared", [])?;
             return Ok(CycleResult {
                 endpoint: client.config().endpoint.clone(),
                 phase: "idle".into(),
@@ -1536,7 +1588,7 @@ impl PersistentStore {
         })
     }
 
-    fn server_cache(&self) -> Result<Cache> {
+    pub(crate) fn server_cache(&self) -> Result<Cache> {
         let config = self
             .server_config()?
             .ok_or_else(|| SyncError::new("server-not-bound", 409))?;
@@ -1544,7 +1596,7 @@ impl PersistentStore {
             risunest_sync_wire::hash(
                 format!("{}:{}", config.library_id, config.device_id).as_bytes(),
             ),
-        ))
+        ))?.with_library(&self.repository_root)
     }
     fn project_section(&self, cache: &Cache, entry: &sections::LocalEntry) -> Result<RecordVersion> {
         let bytes = entry
@@ -1591,11 +1643,13 @@ impl PersistentStore {
         cache: &Cache,
         participation: &[(Domain, String)],
         committed: bool,
+        counter: Option<&CycleItemCounter>,
     ) -> Result<(usize, usize)> {
         self.connection.execute_batch("CREATE TEMP TABLE IF NOT EXISTS server_section_keys(domain TEXT NOT NULL,key TEXT NOT NULL,PRIMARY KEY(domain,key)); DELETE FROM server_section_keys; CREATE TEMP TABLE IF NOT EXISTS server_section_records(domain TEXT NOT NULL,key TEXT NOT NULL,action TEXT NOT NULL,remote TEXT NOT NULL,version TEXT NOT NULL,PRIMARY KEY(domain,key)); DELETE FROM server_section_records;")?;
         if participation.is_empty() {
             return Ok((0, 0));
         }
+        CycleItemCounter::start(counter, 1, 0);
         let now_ms = u64::try_from(
             crate::persistent_store::device_store::now_ms()
                 .map_err(|_| SyncError::new("invalid-device-clock", 500))?,
@@ -1623,6 +1677,8 @@ impl PersistentStore {
             }
             self.connection.execute("INSERT OR IGNORE INTO server_section_keys SELECT domain,key FROM server_sync_remote_dirty WHERE domain=?1",[domain.as_str()])?;
         }
+        let count: i64 = self.connection.query_row("SELECT count(*) FROM server_section_keys", [], |row| row.get(0))?;
+        CycleItemCounter::start(counter, 2, count as u64);
         let mut applied = 0usize;
         let mut proposals = 0usize;
         let mut after = (String::new(), String::new());
@@ -1667,7 +1723,7 @@ impl PersistentStore {
                                 ("publish", version)
                             }
                         }
-                        _ => continue,
+                        _ => { CycleItemCounter::processed(counter); continue; }
                     }
                 } else if matches!(remote, RecordVersion::Live { .. }) {
                     transfer.download_record(&remote, &[], &base)?;
@@ -1707,6 +1763,7 @@ impl PersistentStore {
                     "INSERT INTO server_section_records VALUES(?1,?2,?3,?4,?5)",
                     params![name, key, action, json(&remote)?, json(&version)?],
                 )?;
+                CycleItemCounter::processed(counter);
             }
         }
         Ok((applied, proposals))
@@ -1825,9 +1882,12 @@ impl PersistentStore {
         committed: bool,
         full_scan: bool,
         client: &ServerClient,
+        counter: Option<&CycleItemCounter>,
     ) -> Result<()> {
-        self.connection.execute_batch("CREATE TEMP TABLE IF NOT EXISTS server_cycle_keys(key TEXT PRIMARY KEY); DELETE FROM server_cycle_keys; CREATE TEMP TABLE IF NOT EXISTS server_cycle_records(key TEXT PRIMARY KEY,version TEXT NOT NULL,local_hash TEXT,action TEXT NOT NULL DEFAULT '',remote TEXT NOT NULL DEFAULT ''); DELETE FROM server_cycle_records;")?;
+        CycleItemCounter::start(counter, 1, 0);
+        self.connection.execute_batch("CREATE TEMP TABLE IF NOT EXISTS server_cycle_keys(key TEXT PRIMARY KEY); DELETE FROM server_cycle_keys; CREATE TEMP TABLE IF NOT EXISTS server_cycle_records(key TEXT PRIMARY KEY,version TEXT NOT NULL,local_hash TEXT,action TEXT NOT NULL DEFAULT '',remote TEXT NOT NULL DEFAULT ''); DELETE FROM server_cycle_records; CREATE TEMP TABLE IF NOT EXISTS server_cycle_objects(hash TEXT PRIMARY KEY); DELETE FROM server_cycle_objects;")?;
         let (db, target) = self.read_view(Some(lease))?;
+        self.connection.execute("DELETE FROM server_sync_prepared WHERE revision<>?1 OR generation<>?2", params![target.revision,target.generation])?;
         let cas = PayloadCas::new(&self.repository_root)?;
         let full_marker: bool = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM server_sync_dirty WHERE kind='full')",
@@ -1891,6 +1951,8 @@ impl PersistentStore {
         if committed {
             self.connection.execute("INSERT OR IGNORE INTO server_cycle_keys SELECT key FROM server_sync_operation_records WHERE domain='library'",[])?;
         }
+        let count: i64 = self.connection.query_row("SELECT count(*) FROM server_cycle_keys", [], |row| row.get(0))?;
+        CycleItemCounter::start(counter, 2, count as u64);
         let mut after = String::new();
         loop {
             let mut stmt = self.connection.prepare(
@@ -1906,6 +1968,13 @@ impl PersistentStore {
             for key in keys {
                 client.ensure_active()?;
                 after = key.clone();
+                let cached: Option<(String, Option<String>)> = self.connection.query_row(
+                    "SELECT version,local_hash FROM server_sync_prepared WHERE key=?1", [&key], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+                if let Some((version, local_hash)) = cached {
+                    self.connection.execute("INSERT INTO server_cycle_records(key,version,local_hash) VALUES(?1,?2,?3)", params![key,version,local_hash])?;
+                    CycleItemCounter::processed(counter);
+                    continue;
+                }
                 let dirty = key_parts(&key, target.revision)?;
                 let (base, base_hash) = self.effective_server_base(Domain::Library, &key, committed)?;
                 let (version, local_hash) = if let Some(payload) =
@@ -1922,31 +1991,20 @@ impl PersistentStore {
                             cache.put(bytes)?;
                         }
                         for hash in &dependencies {
-                            if cache.cas.stat_object(hash)?.is_none() {
-                                if cas.stat_object(hash)?.is_none() {
-                                    let residency = crate::server_sync::residency::Residency::open(
-                                        &self.repository_root,
-                                    )?;
-                                    let config = self
-                                        .server_stored_config()?
-                                        .ok_or_else(|| SyncError::new("server-not-bound", 409))?;
-                                    if let Some(proof) = residency.object(hash, None)? {
-                                        if proof.config.library_id == config.library_id
-                                            && proof.config.device_id == config.device_id
-                                        {
-                                            continue;
-                                        }
-                                    }
+                            if self.connection.execute("INSERT OR IGNORE INTO server_cycle_objects VALUES(?1)", [hash])? == 0 { continue; }
+                            if cache.stat_object(hash)?.is_some() {
+                                cache.verify(hash, || client.ensure_active())?;
+                            } else {
+                                let residency = crate::server_sync::residency::Residency::open(&self.repository_root)?;
+                                let config = self.server_stored_config()?.ok_or_else(|| SyncError::new("server-not-bound", 409))?;
+                                let proof = residency.object(hash, None)?;
+                                if !proof.is_some_and(|proof| proof.config.library_id == config.library_id && proof.config.device_id == config.device_id) {
+                                    return Err(SyncError::new("missing-local-payload", 409));
                                 }
-                                let mut source = cas
-                                    .open_object(hash)?
-                                    .ok_or_else(|| SyncError::new("missing-local-payload", 409))?;
-                                let size = source.metadata()?.len();
-                                cache.cas.prepare_reader_expected(&mut source, hash, size)?;
                             }
                         }
-                        let projected = cache.project(
-                            &payload,
+                        let projected = cache.project_bytes(
+                            &bytes,
                             &dependencies,
                             &relations(&dirty)?,
                             scopes(&dirty),
@@ -1956,10 +2014,12 @@ impl PersistentStore {
                 } else {
                     (delete_version(&base), None)
                 };
+                self.connection.execute("INSERT INTO server_sync_prepared(key,version,local_hash,revision,generation) VALUES(?1,?2,?3,?4,?5)", params![key,json(&version)?,local_hash,target.revision,target.generation])?;
                 self.connection.execute(
                     "INSERT INTO server_cycle_records(key,version,local_hash) VALUES(?1,?2,?3)",
                     params![key, json(&version)?, local_hash],
                 )?;
+                CycleItemCounter::processed(counter);
             }
         }
         Ok(())
@@ -2214,7 +2274,7 @@ impl PersistentStore {
                     transfer.download_record_metadata(&record.version, &[], &RecordVersion::Absent)?;
                     let (payload, _) = cache.restore(&record.version)?;
                     let key = key_parts(&record.key, revision)?;
-                    let dependencies = projection::dependencies(&payload, &cache.cas)?;
+                    let dependencies = cache.dependencies(&payload)?;
                     let projected = cache.project(&payload, &dependencies, &relations(&key)?, scopes(&key))?;
                     if projected.version != record.version {
                         return Err(SyncError::new("server-descriptor-semantics-mismatch", 409));
