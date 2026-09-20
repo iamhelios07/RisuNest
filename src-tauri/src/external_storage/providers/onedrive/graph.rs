@@ -88,11 +88,15 @@ pub(super) fn classify(
             kind: ErrorKind::Transient,
             http_status: Some(status),
             retry_at_ms: None,
+            oauth_error: None,
+            oauth_error_description: None,
         },
         509 => ProviderError {
             kind: ErrorKind::RateLimited,
             http_status: Some(status),
             retry_at_ms: common::retry_after_ms(headers, now_ms),
+            oauth_error: None,
+            oauth_error_description: None,
         },
         _ => common::classify_status(status, headers, now_ms),
     }
@@ -117,6 +121,8 @@ pub(super) fn classify_token(
             kind: ErrorKind::ReauthRequired,
             http_status: Some(status),
             retry_at_ms: None,
+            oauth_error: None,
+            oauth_error_description: None,
         },
         _ => classify(status, headers, now_ms),
     }

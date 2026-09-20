@@ -9,7 +9,7 @@ use crate::external_storage::{
     auth::{AuthorizationCode, AuthorizationPolicy, SecretBytes},
     contract::*,
     http::HttpRequest,
-    providers::Dependencies,
+    providers::{common, Dependencies},
     quota::AccountKey,
 };
 use serde::Deserialize;
@@ -181,10 +181,14 @@ async fn post_token(
     if matches!(response.status, 400 | 401) {
         // invalid_grant covers a revoked, replaced or testing-expired grant;
         // every other grant failure equally needs a new user authorization.
+        let (oauth_error, oauth_error_description) =
+            common::oauth_error_details(&mut response.body, cancel).await;
         return Err(ProviderError {
             kind: ErrorKind::ReauthRequired,
             http_status: Some(response.status),
             retry_at_ms: None,
+            oauth_error,
+            oauth_error_description,
         });
     }
     Err(wire::classify(&mut response, dependencies.clock.now_ms(), cancel).await)

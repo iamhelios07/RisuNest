@@ -351,11 +351,7 @@ impl OneDrive {
         )?;
         let mut response = self.send(request, cancel).await?;
         if response.status != 200 {
-            return Err(graph::classify_token(
-                response.status,
-                &response.headers,
-                self.now(),
-            ));
+            return Err(tokens::token_error(&mut response, self.now(), cancel).await);
         }
         let refreshed = tokens::parse_grant(
             &mut response,
@@ -394,11 +390,7 @@ impl OneDrive {
         )?;
         let mut response = self.send(request, cancel).await?;
         if response.status != 200 {
-            return Err(graph::classify_token(
-                response.status,
-                &response.headers,
-                self.now(),
-            ));
+            return Err(tokens::token_error(&mut response, self.now(), cancel).await);
         }
         let granted = tokens::parse_grant(&mut response, None, self.now(), cancel).await?;
         let access_token = granted

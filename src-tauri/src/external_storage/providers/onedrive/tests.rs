@@ -865,7 +865,11 @@ fn an_unchanged_token_produces_a_conditional_not_modified_read() {
         assert_eq!(receipt, ReadReceipt::NotModified(token));
         let records = server.requests.lock().unwrap();
         assert_eq!(records.len(), 3);
-        assert!(head(&records[2]).contains("if-none-match: etag-head"));
+        assert!(
+            head(&records[2]).contains("if-none-match: etag-head"),
+            "{}",
+            head(&records[2])
+        );
     });
 }
 
@@ -1392,8 +1396,16 @@ fn head_preconditions_use_create_if_absent_and_an_exact_version() {
         for record in &records[4..] {
             assert!(!line(record).contains("conflictBehavior"));
         }
-        assert!(head(&records[4]).contains("if-match: etag-new"));
-        assert!(head(&records[5]).contains("if-match: etag-stale"));
+        assert!(
+            head(&records[4]).contains("if-match: etag-new"),
+            "{}",
+            head(&records[4])
+        );
+        assert!(
+            head(&records[5]).contains("if-match: etag-stale"),
+            "{}",
+            head(&records[5])
+        );
     });
 }
 
@@ -1598,6 +1610,8 @@ fn a_rejected_grant_requires_reauthentication_and_a_rotated_token_is_persisted()
         .await);
         assert_eq!(error.kind, ErrorKind::ReauthRequired);
         assert_eq!(error.http_status, Some(400));
+        assert_eq!(error.oauth_error.as_deref(), Some("invalid_grant"));
+        assert_eq!(error.oauth_error_description.as_deref(), Some("AADSTS70000"));
         assert_eq!(rejected.requests.lock().unwrap().len(), 1);
     });
 }
@@ -1806,6 +1820,65 @@ fn redeeming_an_authorization_code_stores_the_first_token_document() {
             "GET /synthetic/me?$select=id HTTP/1.1"
         );
         assert!(head(&records[1]).contains("authorization: bearer first-access"));
+    });
+}
+
+#[test]
+fn a_rejected_authorization_code_preserves_the_oauth_error_details() {
+    runtime().block_on(async {
+        let server = WireServer::start(vec![json(
+            400,
+            "{\"error\":\"invalid_request\",\"error_description\":\"AADSTS900144: The request body must contain the following parameter.\"}",
+        )]);
+        let harness = with_transport(
+            Arc::new(crate::external_storage::http::NativeHttpTransport::for_loopback_tests()),
+            MemoryVault::default(),
+            NOW_MS,
+        );
+        let connector = OneDrive::new(harness.dependencies.clone());
+        let cancel = Cancellation::default();
+        let mut config = config_for(&server, "business");
+        config.account_id.clear();
+        config
+            .oauth_profile
+            .as_mut()
+            .unwrap()
+            .platform_client_ids
+            .insert(
+                config::platform_key().to_owned(),
+                "platform-client".to_owned(),
+            );
+        config.location.insert(
+            "redirectUri".to_owned(),
+            "risunest://oauth/callback".to_owned(),
+        );
+        let grant = AuthorizationCode {
+            code: crate::external_storage::auth::SecretBytes(zeroize::Zeroizing::new(
+                b"synthetic-code".to_vec(),
+            )),
+            verifier: crate::external_storage::auth::SecretBytes(zeroize::Zeroizing::new(
+                b"synthetic-verifier".to_vec(),
+            )),
+            client_id: "platform-client".to_owned(),
+            redirect_url: url::Url::parse("risunest://oauth/callback").unwrap(),
+        };
+
+        let error = match connector
+            .exchange_authorization_code(&config, &grant, &cancel)
+            .await
+        {
+            Ok(_) => panic!("the synthetic token rejection must fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind, ErrorKind::ReauthRequired);
+        assert_eq!(error.http_status, Some(400));
+        assert_eq!(error.oauth_error.as_deref(), Some("invalid_request"));
+        assert_eq!(
+            error.oauth_error_description.as_deref(),
+            Some("AADSTS900144: The request body must contain the following parameter.")
+        );
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
     });
 }
 

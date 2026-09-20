@@ -116,6 +116,9 @@ describe('iOS native authorization', () => {
         await settle()
         labelControl<HTMLInputElement>(strings.confirmEndpoint).click()
         await settle()
+        const clientSecret = labelControl<HTMLInputElement>(strings.oauthClientSecret)
+        clientSecret.value = 'native-client-secret'
+        clientSecret.dispatchEvent(new Event('input', { bubbles: true }))
         button(strings.signIn).click()
 
         await vi.waitFor(() => expect(onconnected).toHaveBeenCalledWith({
@@ -123,7 +126,7 @@ describe('iOS native authorization', () => {
         }))
         expect(state.openUrl).not.toHaveBeenCalled()
         expect(state.completeAuthorization)
-            .toHaveBeenCalledExactlyOnceWith('authorization-1', undefined, undefined)
+            .toHaveBeenCalledExactlyOnceWith('authorization-1', undefined, 'native-client-secret')
         expect(target.textContent).not.toContain(strings.finishSignIn)
         expect(target.textContent).not.toContain(strings.manualOAuthCallback)
     })

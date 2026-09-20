@@ -97,6 +97,7 @@
 
     const definition = $derived(getExternalProviderDefinition(providerId))
     const requiredAcks = $derived(requiredConnectionAcknowledgements(providerId))
+    const googleOAuth = $derived(providerId === 'google_drive')
     const googleAndroid = $derived(isTauriAndroid && providerId === 'google_drive')
     const visibleFields = $derived(definition.fields.filter(field => (
         field.key !== 'oauthRedirectUri' || googleAndroid
@@ -528,10 +529,10 @@
             {#if prepared.requiresPlatformOAuthClient}
                 <label class="field"><span>{googleAndroid ? strings.webOAuthClientId : strings.platformClientId}</span><TextInput className="disabled:opacity-50" fullwidth bind:value={currentPlatformClientId} /></label>
             {/if}
-            {#if endpointConfirmed && prepared.requiresOAuth && googleAndroid}
+            {#if endpointConfirmed && prepared.requiresOAuth && googleOAuth}
                 <div class="fields two">
                     <label class="field"><span>{strings.oauthClientSecret}</span><TextInput className="disabled:opacity-50" fullwidth hideText bind:value={oauthClientSecret} /></label>
-                    {#if pendingAuthorizationId}<label class="field"><span>{strings.manualOAuthCallback}</span><TextInput className="disabled:opacity-50" fullwidth hideText bind:value={manualOAuthCallback} /><small>{strings.manualOAuthHelp}</small></label>{/if}
+                    {#if googleAndroid && pendingAuthorizationId}<label class="field"><span>{strings.manualOAuthCallback}</span><TextInput className="disabled:opacity-50" fullwidth hideText bind:value={manualOAuthCallback} /><small>{strings.manualOAuthHelp}</small></label>{/if}
                 </div>
             {/if}
             {#if endpointConfirmed && !prepared.requiresOAuth && !fromTransfer}

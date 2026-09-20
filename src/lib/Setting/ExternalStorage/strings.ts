@@ -72,10 +72,12 @@ const english = {
     googleIOSSetup: 'In Google Cloud, create an iOS OAuth client with bundle ID io.github.rsyumi.risunest and enable the Google Drive API.',
     oneDriveIOSSetup: 'In the Entra app, add an iOS/macOS platform with bundle ID io.github.rsyumi.risunest and enable public client flows.',
     iosOAuthClientId: 'iOS OAuth client ID',
-    webOAuthClientId: 'Web OAuth client ID', oauthCallbackUrl: 'Sign-in completion address (HTTPS)', oauthClientSecret: 'Client secret (optional)',
+    webOAuthClientId: 'Web OAuth client ID', oauthCallbackUrl: 'Sign-in completion address (HTTPS)', oauthClientSecret: 'Client secret',
     manualOAuthCallback: 'Sign-in completion page address (if the app does not return by itself)', manualOAuthHelp: 'If the app does not reopen by itself, paste the complete address of the sign-in completion page.',
     authorizationWaiting: 'Finish signing in in the browser and the app returns. If it does not, paste the complete address of the sign-in completion page.',
     callbackRejected: 'That address does not belong to this sign-in attempt. Check it and paste the complete address again.',
+    oauthErrorCode: 'OAuth error code: {0}',
+    oauthErrorDescription: 'OAuth error description: {0}',
     recoveryNotice: 'Save this recovery key now. It stays fixed for this repository and cannot be shown or replaced later. If it is lost, create and verify a new repository before deleting this one.',
     completed: 'Completed', failed: 'Failed', queued: 'Queued', running: 'Working…', waiting: 'Waiting', uncertain: 'Could not confirm that the repository was updated. Run the same action again to check.',
     loadMore: 'Show older history', statusReady: 'Connected', statusPaused: 'Paused', statusReauth: 'Sign-in required', statusLocked: 'Recovery key required', statusError: 'Needs attention',
@@ -215,10 +217,12 @@ const korean: typeof english = {
     googleIOSSetup: 'Google Cloud에서 번들 ID가 io.github.rsyumi.risunest인 iOS OAuth 클라이언트를 만들고 Google Drive API를 사용 설정하세요.',
     oneDriveIOSSetup: 'Entra 앱의 iOS/macOS 플랫폼에 번들 ID io.github.rsyumi.risunest를 추가하고 공용 클라이언트 흐름을 사용 설정하세요.',
     iosOAuthClientId: 'iOS OAuth 클라이언트 ID',
-    webOAuthClientId: '웹 OAuth 클라이언트 ID', oauthCallbackUrl: '로그인 완료 주소 (HTTPS)', oauthClientSecret: '클라이언트 보안 비밀 (선택)',
+    webOAuthClientId: '웹 OAuth 클라이언트 ID', oauthCallbackUrl: '로그인 완료 주소 (HTTPS)', oauthClientSecret: '클라이언트 보안 비밀',
     manualOAuthCallback: '로그인 완료 페이지 주소 (자동으로 돌아오지 않을 때)', manualOAuthHelp: '앱이 자동으로 다시 열리지 않으면 로그인 완료 페이지의 주소를 통째로 붙여넣으세요.',
     authorizationWaiting: '브라우저에서 로그인을 마치면 앱으로 돌아옵니다. 자동으로 돌아오지 않으면 로그인 완료 페이지의 주소를 통째로 붙여넣으세요.',
     callbackRejected: '이 주소는 현재 로그인 시도의 것이 아닙니다. 확인한 뒤 주소를 통째로 다시 붙여넣으세요.',
+    oauthErrorCode: 'OAuth 오류 코드: {0}',
+    oauthErrorDescription: 'OAuth 오류 설명: {0}',
     recoveryNotice: '이 복구 키를 지금 안전한 곳에 보관하세요. 저장소에서 계속 같은 키를 사용하며, 나중에 다시 표시하거나 교체할 수 없습니다. 키를 잃은 경우 새 저장소에 백업하고 검증한 뒤 기존 저장소를 삭제하세요.',
     completed: '완료', failed: '실패', queued: '대기열에 추가됨', running: '처리 중…', waiting: '대기 중', uncertain: '저장소에 반영됐는지 확인하지 못했습니다. 다시 확인하려면 같은 작업을 다시 실행하세요.',
     loadMore: '이전 이력 더 보기', statusReady: '연결됨', statusPaused: '일시 중지됨', statusReauth: '다시 로그인 필요', statusLocked: '복구 키 필요', statusError: '확인 필요',
@@ -337,10 +341,26 @@ export function externalErrorMessage(
     value: unknown,
 ): string {
     const kind = externalErrorKind(value)
+    const oauthError = typeof value === 'object' && value !== null
+        ? (value as { oauthError?: unknown }).oauthError
+        : undefined
+    const oauthErrorDescription = typeof value === 'object' && value !== null
+        ? (value as { oauthErrorDescription?: unknown }).oauthErrorDescription
+        : undefined
+    const oauthSuffix = typeof oauthError === 'string'
+        && oauthError.length > 0
+        ? strings.oauthErrorCode.replace('{0}', oauthError)
+        : ''
+    const oauthDescriptionSuffix = typeof oauthErrorDescription === 'string'
+        && oauthErrorDescription.length > 0
+        ? strings.oauthErrorDescription.replace('{0}', oauthErrorDescription)
+        : ''
     switch (kind) {
         case 'alreadyConnected': return strings.connectionAlreadyAdded
         case 'unauthorized': return strings.credentialsRejected
-        case 'reauthRequired': return strings.reauthenticate
+        case 'reauthRequired': return [strings.reauthenticate, oauthSuffix, oauthDescriptionSuffix]
+            .filter(Boolean)
+            .join('\n')
         case 'notFound': return strings.repositoryNotFound
         case 'preconditionFailed': return strings.stateChanged
         case 'rateLimited':

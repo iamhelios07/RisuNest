@@ -2234,6 +2234,55 @@ fn a_code_exchange_returns_a_storable_refresh_payload() {
 }
 
 #[test]
+fn a_rejected_code_exchange_preserves_the_oauth_error_details() {
+    runtime().block_on(async {
+        let server = WireServer::start(vec![json_reply(
+            400,
+            json!({
+                "error": "invalid_grant",
+                "error_description": "synthetic description that must stay native"
+            }),
+        )]);
+        let test = deps_with(Some(stored_secret(NOW_MS)));
+        let grant = AuthorizationCode {
+            code: SecretBytes(zeroize::Zeroizing::new(b"synthetic-code".to_vec())),
+            verifier: SecretBytes(zeroize::Zeroizing::new(b"synthetic-verifier".to_vec())),
+            client_id: client_id(config::platform_key()),
+            redirect_url: url::Url::parse("http://127.0.0.1:52001/oauth").unwrap(),
+        };
+        let error = match exchange_authorization_code(
+            &test.dependencies,
+            &connection(server.url.as_str()),
+            &grant,
+            None,
+            &Cancellation::default(),
+        )
+        .await {
+            Ok(_) => panic!("the synthetic token rejection must fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind, ErrorKind::ReauthRequired);
+        assert_eq!(error.http_status, Some(400));
+        assert_eq!(error.oauth_error.as_deref(), Some("invalid_grant"));
+        assert_eq!(
+            error.oauth_error_description.as_deref(),
+            Some("synthetic description that must stay native")
+        );
+        assert_eq!(
+            serde_json::to_value(&error).unwrap(),
+            json!({
+                "kind": "reauthRequired",
+                "httpStatus": 400,
+                "retryAtMs": null,
+                "oauthError": "invalid_grant",
+                "oauthErrorDescription": "synthetic description that must stay native"
+            })
+        );
+    });
+}
+
+#[test]
 fn deleting_checks_the_parent_and_role_of_the_file_before_removing_it() {
     runtime().block_on(async {
         let member = |role: &str, parent: &str| {

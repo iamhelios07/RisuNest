@@ -21,6 +21,23 @@ describe('externalErrorMessage', () => {
         expect(externalErrorMessage(strings, refused)).toBe(strings.unsupportedOperation)
     })
 
+    it('shows the OAuth error code and provider description', () => {
+        expect(externalErrorMessage(strings, {
+            kind: 'reauthRequired', httpStatus: 400, retryAtMs: null,
+            oauthError: 'invalid_grant', oauthErrorDescription: 'Bad Request: redirect_uri is invalid.',
+        })).toBe([
+            strings.reauthenticate,
+            strings.oauthErrorCode.replace('{0}', 'invalid_grant'),
+            strings.oauthErrorDescription.replace('{0}', 'Bad Request: redirect_uri is invalid.'),
+        ].join('\n'))
+        expect(externalErrorMessage(strings, {
+            kind: 'reauthRequired', oauthError: '<script>alert(1)</script>',
+        })).toBe([
+            strings.reauthenticate,
+            strings.oauthErrorCode.replace('{0}', '<script>alert(1)</script>'),
+        ].join('\n'))
+    })
+
     it('falls back for a local failure that carries no native kind', () => {
         expect(externalErrorMessage(strings, new Error('offline'))).toBe(strings.errorGeneric)
         expect(externalErrorMessage(strings, undefined)).toBe(strings.errorGeneric)

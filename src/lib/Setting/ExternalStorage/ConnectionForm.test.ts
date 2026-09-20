@@ -210,7 +210,12 @@ describe('Android Google authorization lifecycle', () => {
             },
         })
         await settle()
-        await beginGoogleAuthorization()
+        await prepareGoogleConnection()
+        const clientSecret = labelControl<HTMLInputElement>(strings.oauthClientSecret)
+        clientSecret.value = 'browser-client-secret'
+        clientSecret.dispatchEvent(new Event('input', { bubbles: true }))
+        button(strings.signIn).click()
+        await settle()
 
         const callback = labelControl<HTMLInputElement>(strings.manualOAuthCallback)
         callback.value = 'https://update.rsyumi.workers.dev/oauth/google-drive-callback?code=one&state=wrong'
@@ -243,7 +248,7 @@ describe('Android Google authorization lifecycle', () => {
         expect(state.completeAuthorization).toHaveBeenLastCalledWith(
             'authorization-1',
             'https://update.rsyumi.workers.dev/oauth/google-drive-callback?code=one&state=wrong',
-            undefined,
+            'browser-client-secret',
         )
         await vi.waitFor(() => expect(busyStates.at(-1)).toBe(false))
     })
@@ -518,11 +523,20 @@ describe('native failure messages', () => {
         await settle()
         await beginGoogleAuthorization()
 
-        state.completeAuthorization.mockRejectedValueOnce({ kind: 'unauthorized', httpStatus: 401, retryAtMs: null })
+        state.completeAuthorization.mockRejectedValueOnce({
+            kind: 'reauthRequired', httpStatus: 400, retryAtMs: null,
+            oauthError: 'invalid_grant', oauthErrorDescription: 'Bad Request: redirect_uri is invalid.',
+        })
         button(strings.finishSignIn).click()
         await settle()
 
-        await vi.waitFor(() => expect(target.textContent).toContain(strings.credentialsRejected))
+        await vi.waitFor(() => {
+            expect(target.textContent).toContain(strings.reauthenticate)
+            expect(target.textContent).toContain(strings.oauthErrorCode.replace('{0}', 'invalid_grant'))
+            expect(target.textContent).toContain(
+                strings.oauthErrorDescription.replace('{0}', 'Bad Request: redirect_uri is invalid.'),
+            )
+        })
         expect(target.textContent).not.toContain(strings.unsupportedOperation)
     })
 })
