@@ -17,7 +17,7 @@ const databaseState = vi.hoisted(() => ({
 }))
 
 vi.mock(import('../../process/files/inlays'), () => inlayMocks)
-vi.mock(import('../../platform'), () => ({ isTauri: false, isNodeServer: false }))
+vi.mock(import('../../platform'), () => ({ isTauri: false }))
 vi.mock(
     import('../../storage/database.svelte'),
     () => ({

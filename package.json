@@ -16,7 +16,6 @@
     "test": "vitest run",
     "tauri": "tauri",
     "buildsite": "vite build --outDir dist",
-    "runserver": "node server/node/server.cjs",
     "hono:build": "vite build --sourcemap && node server/hono/src/utils/postbuild.js",
     "tauribuild:android": "vite build --mode android",
     "tauribuild:agent": "vite build --mode agent",
@@ -115,8 +114,6 @@
     "crc": "^4.3.2",
     "diff": "^7.0.0",
     "dompurify": "^3.3.2",
-    "express": "^4.22.1",
-    "express-rate-limit": "^8.2.2",
     "fflate": "^0.8.2",
     "highlight.js": "^11.11.1",
     "html-to-image": "^1.11.13",
@@ -128,7 +125,6 @@
     "mobile-drag-drop": "3.0.0-rc.0",
     "monaco-editor": "^0.55.1",
     "msgpackr": "1.10.1",
-    "node-html-parser": "^6.1.13",
     "ollama": "^0.5.18",
     "openid-client": "^6.8.1",
     "pdfjs-dist": "^4.10.38",
@@ -148,8 +144,7 @@
     "uuid": "^9.0.1",
     "wasmoon": "^1.16.0",
     "wavefile": "^11.0.0",
-    "web-streams-polyfill": "^3.3.3",
-    "ws": "^8.18.3"
+    "web-streams-polyfill": "^3.3.3"
   },
   "devDependencies": {
     "@eslint-community/regexpp": "4.12.2",

@@ -317,7 +317,6 @@ export async function loadData() {
         const nativeDeviceSettings = isTauri ? createNativeDeviceSettings() : null
         if (nativeCredentialVault) {
             localStorage.removeItem('fallbackRisuToken')
-            localStorage.removeItem('risuauth')
         }
         const nativeCredential = nativeCredentialVault
             ? normalizeNativeOfficialAccountCredential(await nativeCredentialVault.read())
