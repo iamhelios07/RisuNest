@@ -78,7 +78,6 @@ import { getSyncConflictBackupStore } from "./storage/sync/syncConflictBackup";
 import { formatNameList, summarizePinnedSyncConflict } from "./storage/sync/syncConflictSummary";
 import { withPersistentRevisionLease } from "./storage/persistentRecordIterator";
 import {
-    activateNativeAssetRepository,
     initializePersistentStorage,
 } from "./storage/persistentStorageRuntime";
 import {
@@ -312,9 +311,6 @@ export async function loadData() {
         })
         stage = 'persistent-database'
         const local = await resolvePersistentWorkingSet()
-        await transition('asset-repository', language.risuNest.startup.data)
-        const assetRepositoryRevision = await activateNativeAssetRepository()
-        if (assetRepositoryRevision !== null) local.revision = assetRepositoryRevision
         // The web build has no OS vault, so it keeps the account token in
         // localStorage. A native install holds it in the vault alone.
         const nativeCredentialVault = isTauri ? createNativeAccountCredentialVault() : null

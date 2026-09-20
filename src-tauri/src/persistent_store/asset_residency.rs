@@ -129,17 +129,8 @@ impl PersistentStore {
                 }
             }
         }
-        // Detached consumers and staged imports still require their physical inputs.
-        for root in self
-            .active_readers
-            .detached_asset_roots()?
-            .into_iter()
-            .chain(
-                crate::asset_repository::migration_gc::collect_staged_migration_roots(
-                    &self.repository_root,
-                )?,
-            )
-        {
+        // Detached consumers still require their physical inputs.
+        for root in self.active_readers.detached_asset_roots()? {
             local.extend(root.object_hashes);
             local.extend(root.manifest_hashes);
         }

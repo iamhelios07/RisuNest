@@ -605,8 +605,6 @@ fn builder_with_main_window(
                 }
                 app.state::<native_media::ipc::NativeMediaIpcState>()
                     .configure(app_data_dir.join("native-media-ipc"))?;
-                native_media::recover_inlay_writes(&app_data_dir)
-                    .map_err(|error| format!("Inlay recovery failed: {error}"))?;
                 app.manage(native_media::streaming::MediaServerState::initialize(
                     app_data_dir.clone(),
                 ));
@@ -758,13 +756,11 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         native_log::native_log_set_file_enabled,
         oauth_login,
         native_tokenizer::tokenize_batch,
-        native_media::native_media_write_inlay_image,
         native_media::native_media_encode_inlay_image,
         native_media::ipc::native_media_inlay_input_open,
         native_media::ipc::native_media_inlay_input_chunk,
         native_media::ipc::native_media_inlay_input_cancel,
         native_media::ipc::native_media_encode_inlay_finish,
-        native_media::ipc::native_media_write_inlay_finish,
         native_media::ipc::native_media_inlay_output_read,
         native_media::ipc::native_media_inlay_output_cancel,
         asset_repository::commands::asset_cas_read_object_range,
@@ -826,7 +822,6 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         persistent_store::commands::pds_read_asset_alias,
         persistent_store::commands::pds_read_asset_aliases_by_keys,
         persistent_store::commands::pds_list_asset_aliases,
-        persistent_store::commands::pds_read_asset_repository_authority,
         persistent_store::commands::pds_read_asset_owner_head,
         persistent_store::commands::pds_commit_asset_alias,
         persistent_store::commands::pds_delete_asset_alias,
@@ -859,7 +854,6 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         persistent_store::commands::pds_replace_add_characters,
         persistent_store::commands::pds_replace_put_asset_aliases,
         persistent_store::commands::pds_replace_put_asset_owner_heads,
-        persistent_store::commands::pds_replace_put_asset_repository_authority,
         persistent_store::commands::pds_replace_preserve_repositories,
         persistent_store::commands::pds_replace_commit,
         persistent_store::commands::pds_replace_abort,

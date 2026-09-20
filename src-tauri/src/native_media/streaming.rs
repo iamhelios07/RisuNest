@@ -120,7 +120,7 @@ async fn serve(State(state): State<Files>, request: Request<Body>) -> Response<B
             return empty(StatusCode::NOT_FOUND);
         };
         let key = format!(
-            "assets-v2/objects/{}/{}",
+            "assets/objects/{}/{}",
             &object.hash[..2],
             &object.hash[2..]
         );

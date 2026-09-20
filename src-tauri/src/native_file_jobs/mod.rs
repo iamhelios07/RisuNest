@@ -6675,7 +6675,7 @@ mod tests {
             Some("unsupported-without-destination")
         );
         assert!(prepared.prepared_content.is_none());
-        assert!(!directory.path().join("assets-v2").exists());
+        assert!(!directory.path().join("assets").exists());
     }
 
     #[test]
@@ -6694,7 +6694,7 @@ mod tests {
 
         assert_eq!(prepared.state, JobState::Failed);
         assert!(prepared.prepared_content.is_none());
-        assert!(directory.path().join("assets-v2/job-pins").is_dir());
+        assert!(directory.path().join("assets/job-pins").is_dir());
         assert!(crate::asset_repository::job_pins::DurableCasJob::open(
             directory.path(),
             &started.job_id,
@@ -6709,7 +6709,7 @@ mod tests {
         fs::create_dir_all(
             directory
                 .path()
-                .join("assets-v2/objects")
+                .join("assets/objects")
                 .join(&object_hash[..2])
                 .join(&object_hash[2..]),
         )

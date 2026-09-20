@@ -2597,13 +2597,6 @@ impl PersistentStore {
             }
             tx.commit()?;
             check()?;
-            self.replace_put_asset_repository_authority(
-                &staging_id,
-                &super::AssetRepositoryAuthorityState::V2 {
-                    migration_id: source.id().to_owned(),
-                    compatibility_hash: source.index_hash().to_owned(),
-                },
-            )?;
             Ok(self.prepare_replace_commit(&staging_id, Some(expected_revision))?)
         })();
         match prepared {

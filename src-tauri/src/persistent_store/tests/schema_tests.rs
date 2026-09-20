@@ -120,26 +120,6 @@ fn assert_asset_object_schema(connection: &rusqlite::Connection) {
     );
 }
 
-fn assert_asset_repository_authority_schema(connection: &rusqlite::Connection, expected_rows: i64) {
-    assert_eq!(
-        table_columns(connection, "asset_repository_authority"),
-        vec![
-            ("generation".to_owned(), "TEXT".to_owned(), false, None, 1),
-            ("value".to_owned(), "TEXT".to_owned(), true, None, 0),
-        ]
-    );
-    assert_eq!(
-        connection
-            .query_row(
-                "SELECT COUNT(*) FROM asset_repository_authority",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .expect("count asset repository authority rows"),
-        expected_rows
-    );
-}
-
 fn assert_no_peer_schema(connection: &rusqlite::Connection) {
     let count: i64 = connection
         .query_row(
@@ -164,22 +144,10 @@ fn empty_database_creates_the_whole_current_schema() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read fresh schema version"),
-        super::super::schema::SCHEMA_VERSION as i64
+        1
     );
     assert_payload_alias_schema(&store.connection);
     assert_asset_object_schema(&store.connection);
-    assert_asset_repository_authority_schema(&store.connection, 1);
-    assert_eq!(
-        store
-            .connection
-            .query_row(
-                "SELECT value FROM asset_repository_authority WHERE generation = 'revision-0'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .expect("read fresh legacy authority"),
-        r#"{"format":"legacy"}"#
-    );
     assert_no_peer_schema(&store.connection);
 }
 
@@ -195,7 +163,7 @@ fn existing_current_database_revalidates_on_reopen() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read reopened schema version"),
-        super::super::schema::SCHEMA_VERSION as i64
+        1
     );
     assert_payload_alias_schema(&store.connection);
     assert_asset_object_schema(&store.connection);
@@ -258,7 +226,7 @@ fn a_broken_device_store_is_reported_without_blocking_the_library() {
 
 #[test]
 fn unknown_schema_version_is_rejected() {
-    for version in [1_i64, 2, 3, 17] {
+    for version in [2_i64, 3, 4, 5, 17] {
         let directory = tempfile::tempdir().expect("create unknown version directory");
         let store = PersistentStore::open(directory.path()).expect("create current store");
         drop(store);
