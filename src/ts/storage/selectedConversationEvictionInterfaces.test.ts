@@ -179,7 +179,7 @@ describe('independent windowed conversation interfaces', () => {
             luaMessage.saying = 'Lua visited complete history'
             luaOperation.commit(luaLease.session)
             luaLease.release()
-            oracle.message.push(structuredClone(luaMessage))
+            oracle.message.push({ role: 'user', data: 'Lua compatibility output', chatId: 'op-lua', saying: 'Lua visited complete history' })
             await runtime.flushPendingData('lua-operation-context')
             expectedRevision += 1
             await assertWindowed('Lua operation context')
@@ -330,9 +330,18 @@ describe('independent windowed conversation interfaces', () => {
         const generatedConversation = await store.readConversation('char-a', 'chat-a')
         const generatedMessage = generatedConversation!.value.message[generationBefore]
         expect(generatedMessage.data).toBe('Generation compatibility output')
-        oracle.message.push(structuredClone(generatedMessage))
-        oracle.isStreaming = generatedConversation!.value.isStreaming
-        oracle.lastMemory = generatedConversation!.value.lastMemory
+        oracle.message.push({
+            role: 'char', data: 'Generation compatibility output', saying: 'char-a',
+            chatId: expect.any(String), time: expect.any(Number),
+            generationInfo: {
+                model: 'test-model', generationId: expect.any(String),
+                inputTokens: expect.any(Number), outputTokens: expect.any(Number), maxContext: expect.any(Number),
+                stageTiming: { stage1: expect.any(Number), stage2: expect.any(Number), stage3: expect.any(Number), stage4: expect.any(Number) },
+            },
+            promptInfo: {},
+        })
+        oracle.isStreaming = false
+
         await assertWindowed('public generation gateway')
         vi.resetModules()
 
