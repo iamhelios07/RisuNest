@@ -22,6 +22,15 @@ pub(super) struct ExternalReferenceSources {
     entries: Mutex<BTreeMap<String, ExternalReferenceEntry>>,
 }
 
+impl ExternalReferenceSources {
+    pub(super) fn clear_for_cleanup(&self) -> Result<(), String> {
+        let mut entries = self.entries.lock().map_err(|_| "cleanup-native-jobs-busy")?;
+        if entries.values().any(|entry| entry.workers != 0) { return Err("cleanup-native-jobs-busy".into()); }
+        entries.clear();
+        Ok(())
+    }
+}
+
 pub(crate) struct ExternalReferenceSourceGuard {
     sources: Arc<ExternalReferenceSources>,
     token: String,

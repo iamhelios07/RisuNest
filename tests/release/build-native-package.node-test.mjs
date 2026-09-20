@@ -304,12 +304,17 @@ test("effective configuration preserves the approved desktop and mobile identiti
   }
 });
 
-test("RisuNest NSIS removes the dedicated Windows data directories only on request", () => {
+test("RisuNest NSIS completes requested cleanup before removing its retry entry point", () => {
   const hook = readFileSync("src-tauri/windows.nsh", "utf8");
+  assert.match(hook, /!macro NSIS_HOOK_PREUNINSTALL/);
   assert.match(hook, /\$DeleteAppDataCheckboxState = 1/);
   assert.match(hook, /\$UpdateMode <> 1/);
-  assert.match(hook, /RmDir \/r "\$LOCALAPPDATA\\RisuNestData"/);
-  assert.match(hook, /RmDir \/r "\$LOCALAPPDATA\\RisuNestWebViewData"/);
+  assert.match(hook, /!insertmacro CheckIfAppIsRunning "\$\{MAINBINARYNAME\}\.exe" "\$\{PRODUCTNAME\}"/);
+  assert.match(hook, /ExecWait '"\$INSTDIR\\\$\{MAINBINARYNAME\}\.exe" --remove-local-data --yes' \$R6/);
+  assert.ok(hook.indexOf("!insertmacro CheckIfAppIsRunning") < hook.indexOf("ExecWait"));
+  assert.match(hook, /\$\{If\} \$\{Errors\}\s+\$\{OrIf\} \$R6 != 0/);
+  assert.match(hook, /SetErrorLevel 1\s+Abort/);
+  assert.doesNotMatch(hook, /RmDir|NSIS_HOOK_POSTUNINSTALL/);
 });
 
 test("Sync GUI configuration follows each desktop platform identity", () => {
@@ -344,9 +349,12 @@ test("Sync NSIS hook separates the default install and durable data directories"
   assert.match(hook, /\$LOCALAPPDATA\\RisuNestSyncData\\manager-update/);
   assert.doesNotMatch(hook, /\$LOCALAPPDATA\\RisuNestSync\\manager-update/);
   assert.match(hook, /\$DeleteAppDataCheckboxState = 1/);
-  assert.match(hook, /RmDir \/r "\$LOCALAPPDATA\\RisuNestSyncData"/);
-  assert.match(hook, /RmDir \/r "\$LOCALAPPDATA\\RisuNestSyncWebViewData"/);
-  assert.match(hook, /IfFileExists "\$LOCALAPPDATA\\RisuNestSyncData\\manager-update\\installer-\$R7\.ready"/);
+  assert.doesNotMatch(hook, /RmDir \/r/);
+  assert.match(hook, /RISUNEST_SYNC_UNINSTALL_DATA_DIR/);
+  assert.match(hook, /--data-dir "\$R9" installer delete-data/);
+  assert.match(hook, /--data-dir "\$R9" --server "\$INSTDIR\\risunest-sync-server\.exe" installer forget-removal/);
+  assert.match(hook, /IfFileExists "\$R9\\manager-update\\installer-\$R7\.ready"/);
+  assert.ok(hook.indexOf("installer delete-data") < hook.indexOf("!macro NSIS_HOOK_POSTUNINSTALL"));
 });
 
 test("macOS package metadata and intentional ad-hoc signatures are checked", () => {

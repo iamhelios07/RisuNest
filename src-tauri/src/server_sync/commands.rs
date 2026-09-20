@@ -30,6 +30,7 @@ struct BackupSourceLease {
 }
 #[derive(Default)]
 pub(crate) struct ServerSyncCommandState {
+    cleanup_closed: AtomicBool,
     running: AtomicBool,
     cancelled: Mutex<Arc<AtomicBool>>,
     prepared: Mutex<Option<PreparedJob>>,
@@ -89,10 +90,37 @@ impl Drop for Running<'_> {
     }
 }
 impl ServerSyncCommandState {
+    pub(crate) fn begin_cleanup(&self) -> Result<()> {
+        self.cleanup_closed.store(true, Ordering::Release);
+        self.cancelled.lock().map_err(|_| SyncError::new("server-sync-state-unavailable", 503))?
+            .store(true, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn cleanup_drained(&self) -> Result<bool> {
+        if self.running.load(Ordering::Acquire) { return Ok(false); }
+        self.prepared.lock().map_err(|_| SyncError::new("server-sync-state-unavailable", 503))?.take();
+        let mut sources = self.backup_sources.lock().map_err(|_| SyncError::new("server-sync-state-unavailable", 503))?;
+        if sources.values().any(|source| source.guards != 0) { return Ok(false); }
+        sources.clear();
+        *self.retryable_failure.lock().map_err(|_| SyncError::new("server-sync-state-unavailable", 503))? = None;
+        Ok(true)
+    }
+
+    pub(crate) fn finish_cleanup(&self) -> Result<()> {
+        if !self.cleanup_drained()? { return Err(SyncError::new("server-sync-busy", 409)); }
+        self.cleanup_closed.store(false, Ordering::Release);
+        Ok(())
+    }
+
     fn claim(&self) -> Result<Running<'_>> {
         self.running
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| SyncError::new("server-sync-busy", 409))?;
+        if self.cleanup_closed.load(Ordering::Acquire) {
+            self.running.store(false, Ordering::Release);
+            return Err(SyncError::new("cleanup-pending", 409));
+        }
         Ok(Running(self))
     }
     fn claim_preparation(&self) -> Result<(Running<'_>, Arc<AtomicBool>)> {

@@ -219,3 +219,23 @@ async fn actual_loopback_http_serves_only_capability_url() {
         404
     );
 }
+
+#[test]
+fn cleanup_media_waits_for_owned_transfers_and_revokes_the_previous_capability() {
+    let root = TempDir::new().unwrap();
+    let state = MediaServerState::initialize(root.path().to_owned());
+    let (previous, slots) = {
+        let server = state.0.lock().unwrap();
+        let server = server.as_ref().unwrap();
+        (server.base_url.clone(), server.slots.clone())
+    };
+    let transfer = slots.clone().try_acquire_owned().unwrap();
+    state.begin_cleanup().unwrap();
+    assert!(slots.try_acquire_owned().is_err());
+    assert!(!state.cleanup_drained().unwrap());
+    drop(transfer);
+    assert!(state.cleanup_drained().unwrap());
+    assert!(state.0.lock().unwrap().is_err());
+    state.reopen_after_cleanup(root.path().to_owned()).unwrap();
+    assert_ne!(state.0.lock().unwrap().as_ref().unwrap().base_url, previous);
+}

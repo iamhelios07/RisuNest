@@ -88,10 +88,57 @@ struct PendingConnectionSettings {
 
 #[derive(Default)]
 pub(crate) struct ConnectionCommandState {
+    activity: Arc<Mutex<ConnectionActivity>>,
     preparations: Mutex<HashMap<String, PendingPreparation>>,
     authorizations: Mutex<HashMap<String, PendingAuthorization>>,
     authorization_cancellations: Mutex<HashMap<String, Cancellation>>,
     connection_settings: Mutex<HashMap<String, PendingConnectionSettings>>,
+}
+
+#[derive(Default)]
+struct ConnectionActivity {
+    closed: bool,
+    active: usize,
+}
+
+struct ConnectionCommandGuard(Arc<Mutex<ConnectionActivity>>);
+impl Drop for ConnectionCommandGuard {
+    fn drop(&mut self) {
+        if let Ok(mut activity) = self.0.lock() {
+            activity.active -= 1;
+        }
+    }
+}
+
+impl ConnectionCommandState {
+    fn admit(&self) -> Result<ConnectionCommandGuard> {
+        let mut activity = lock(&self.activity)?;
+        if activity.closed { return Err(ProviderError::new(ErrorKind::Cancelled)); }
+        activity.active += 1;
+        Ok(ConnectionCommandGuard(self.activity.clone()))
+    }
+
+    pub(crate) fn begin_cleanup(&self) -> Result<()> {
+        lock(&self.activity)?.closed = true;
+        for cancel in lock(&self.authorization_cancellations)?.values() { cancel.cancel(); }
+        Ok(())
+    }
+
+    pub(crate) fn cleanup_drained(&self) -> Result<bool> {
+        if lock(&self.activity)?.active != 0 { return Ok(false); }
+        lock(&self.preparations)?.clear();
+        lock(&self.authorizations)?.clear();
+        lock(&self.authorization_cancellations)?.clear();
+        lock(&self.connection_settings)?.clear();
+        Ok(true)
+    }
+
+    pub(crate) fn finish_cleanup(&self) -> Result<()> {
+        let mut activity = lock(&self.activity)?;
+        if activity.active != 0 { return Err(ProviderError::new(ErrorKind::PreconditionFailed)); }
+        activity.closed = false;
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]
@@ -160,6 +207,7 @@ pub(crate) fn external_storage_cancel_authorization(
     state: State<'_, ConnectionCommandState>,
     authorization_id: String,
 ) -> Result<()> {
+    let _cleanup_guard = state.admit()?;
     cancel_authorization(&state, &authorization_id)
 }
 
@@ -437,6 +485,7 @@ pub(crate) fn external_storage_prepare_connection(
     state: State<'_, ConnectionCommandState>,
     request: PrepareConnectionRequest,
 ) -> Result<PreparedConnection> {
+    let _cleanup_guard = state.admit()?;
     insert_preparation(&state, request, None, None, false)
 }
 
@@ -446,6 +495,7 @@ pub(crate) async fn external_storage_commit_connection(
     state: State<'_, ConnectionCommandState>,
     request: CommitConnectionRequest,
 ) -> ConnectResult<ConnectionResult> {
+    let _cleanup_guard = state.admit()?;
     let preparation_id = request.preparation_id;
     let pending = take_preparation(&state, &preparation_id)?;
     if pending.request.config.oauth_profile.is_some() {
@@ -489,6 +539,7 @@ pub(crate) async fn external_storage_begin_authorization(
     state: State<'_, ConnectionCommandState>,
     request: BeginAuthorizationRequest,
 ) -> Result<PendingAuthorizationSummary> {
+    let _cleanup_guard = state.admit()?;
     let BeginAuthorizationRequest {
         preparation_id,
         current_platform_client_id,
@@ -546,6 +597,7 @@ pub(crate) async fn external_storage_begin_authorization(
     state: State<'_, ConnectionCommandState>,
     request: BeginAuthorizationRequest,
 ) -> Result<PendingAuthorizationSummary> {
+    let _cleanup_guard = state.admit()?;
     let BeginAuthorizationRequest {
         preparation_id,
         current_platform_client_id,
@@ -608,6 +660,7 @@ pub(crate) async fn external_storage_begin_authorization(
     state: State<'_, ConnectionCommandState>,
     request: BeginAuthorizationRequest,
 ) -> Result<PendingAuthorizationSummary> {
+    let _cleanup_guard = state.admit()?;
     let BeginAuthorizationRequest {
         preparation_id,
         current_platform_client_id,
@@ -671,6 +724,7 @@ pub(crate) async fn external_storage_complete_authorization(
     state: State<'_, ConnectionCommandState>,
     request: CompleteAuthorizationRequest,
 ) -> ConnectResult<CompleteAuthorizationResult> {
+    let _cleanup_guard = state.admit()?;
     let client_secret = request.client_secret.map(Zeroizing::new);
     if client_secret.is_some() {
         return Err(ProviderError::new(ErrorKind::Unsupported).into());
@@ -767,6 +821,7 @@ pub(crate) async fn external_storage_complete_authorization(
     state: State<'_, ConnectionCommandState>,
     request: CompleteAuthorizationRequest,
 ) -> ConnectResult<CompleteAuthorizationResult> {
+    let _cleanup_guard = state.admit()?;
     if request.redirect_url.is_some() || request.client_secret.is_some() {
         return Err(ProviderError::new(ErrorKind::Unsupported).into());
     }
@@ -857,6 +912,7 @@ pub(crate) async fn external_storage_complete_authorization(
     state: State<'_, ConnectionCommandState>,
     request: CompleteAuthorizationRequest,
 ) -> ConnectResult<CompleteAuthorizationResult> {
+    let _cleanup_guard = state.admit()?;
     let redirect_url = request.redirect_url.map(Zeroizing::new);
     let client_secret = request.client_secret.map(Zeroizing::new);
     let cancel = lock(&state.authorization_cancellations)?
@@ -1440,6 +1496,8 @@ pub(crate) fn external_storage_set_capture_policy(
     connection_id: String,
     policy: super::connection::CapturePolicy,
 ) -> Result<()> {
+    let cleanup_state = app.state::<ConnectionCommandState>();
+    let _cleanup_guard = cleanup_state.admit()?;
     let root = connection_root(&app)?;
     let mut store = ConnectionStore::open(&root)?;
     store.set_capture_policy(&connection_id, policy)?;
@@ -1454,6 +1512,8 @@ pub(crate) fn external_storage_set_retention_policy(
     connection_id: String,
     policy: super::connection::RetentionPolicy,
 ) -> Result<()> {
+    let cleanup_state = app.state::<ConnectionCommandState>();
+    let _cleanup_guard = cleanup_state.admit()?;
     let root = connection_root(&app)?;
     let mut store = ConnectionStore::open(&root)?;
     store.set_retention_policy(&connection_id, policy)?;
@@ -1465,6 +1525,8 @@ pub(crate) async fn external_storage_remove_connection(
     app: AppHandle,
     connection_id: String,
 ) -> Result<()> {
+    let cleanup_state = app.state::<ConnectionCommandState>();
+    let _cleanup_guard = cleanup_state.admit()?;
     runtime::require_connection_idle(&app, &connection_id).await?;
     let root = connection_root(&app)?;
     let file_jobs = app.state::<crate::native_file_jobs::NativeFileJobState>();
@@ -1497,6 +1559,7 @@ pub(crate) async fn external_storage_begin_connection_settings_export(
     state: State<'_, ConnectionCommandState>,
     connection_id: String,
 ) -> Result<ConnectionSettingsMaterial> {
+    let _cleanup_guard = state.admit()?;
     let root = connection_root(&app)?;
     let stored = ConnectionStore::open(&root)?.read(&connection_id)?;
     let recovery_key = read_recovery_key(
@@ -1543,6 +1606,7 @@ pub(crate) async fn external_storage_save_connection_settings_file(
     state: State<'_, ConnectionCommandState>,
     transfer_id: String,
 ) -> Result<()> {
+    let _cleanup_guard = state.admit()?;
     let pending = lock(&state.connection_settings)?
         .remove(&transfer_id)
         .ok_or_else(|| ProviderError::new(ErrorKind::NotFound))?;
@@ -1609,6 +1673,7 @@ pub(crate) fn external_storage_prepare_connection_settings_import(
     state: State<'_, ConnectionCommandState>,
     request: PrepareConnectionSettingsImportRequest,
 ) -> Result<PreparedConnection> {
+    let _cleanup_guard = state.admit()?;
     let max_encoded =
         risunest_external_storage_format::crypto::MAX_CONNECTION_SETTINGS_BYTES
             .saturating_add(2)
@@ -1665,6 +1730,27 @@ mod tests {
 
     /// The form reads the kind to tell a repository this device already holds
     /// from a provider failure, and a provider failure keeps its own shape.
+    #[test]
+    fn cleanup_fences_and_drains_connection_commands_before_reopening() {
+        let state = ConnectionCommandState::default();
+        let first = state.admit().unwrap();
+        let second = state.admit().unwrap();
+        let cancellation = Cancellation::default();
+        state.authorization_cancellations.lock().unwrap().insert("synthetic".into(), cancellation.clone());
+        state.begin_cleanup().unwrap();
+        assert!(cancellation.check().is_err());
+        assert!(state.admit().is_err());
+        assert!(!state.cleanup_drained().unwrap());
+        assert!(state.finish_cleanup().is_err());
+        drop(first);
+        assert!(!state.cleanup_drained().unwrap());
+        drop(second);
+        assert!(state.cleanup_drained().unwrap());
+        assert!(state.authorization_cancellations.lock().unwrap().is_empty());
+        state.finish_cleanup().unwrap();
+        assert!(state.admit().is_ok());
+    }
+
     #[test]
     fn a_refused_connection_reports_its_own_kind() {
         assert_eq!(

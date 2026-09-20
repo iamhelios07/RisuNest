@@ -77,6 +77,7 @@ beforeEach(() => {
     trayStartup: vi.fn(async () => {}),
     updatePolicy: vi.fn(async () => {}),
     updateCheck: vi.fn(async () => ({ result: "current" })),
+    uninstall: vi.fn(async () => {}),
     requestId: vi.fn(async () => "a".repeat(64)),
     qr: vi.fn(async () => '<svg aria-label="synthetic-qr"></svg>'),
   };
@@ -391,4 +392,42 @@ it("shows the last tunnel failure and output while retrying, as text", async () 
   expect(target.textContent).toContain("tunnel-exited");
   expect(target.querySelector("pre")?.textContent).toContain("DNS lookup failed");
   expect(target.querySelector("pre script")).toBeNull();
+});
+
+
+it("preserves server data unless deletion is explicitly selected and confirmation is accepted", async () => {
+  await open();
+  button("실행 설정").click();
+  await settle();
+  button("제거").click();
+  await settle();
+  const dialog = target.querySelector("dialog")!;
+  const checkbox = dialog.querySelector<HTMLInputElement>('input[type="checkbox"]')!;
+  expect(checkbox.checked).toBe(false);
+  button("취소").click();
+  await settle();
+  expect(backend.uninstall).not.toHaveBeenCalled();
+  button("제거").click();
+  await settle();
+  const confirmation = [...dialog.querySelectorAll("button")].find(b => b.textContent?.trim() === "제거")!;
+  confirmation.click();
+  await settle();
+  expect(backend.uninstall).toHaveBeenCalledWith(false);
+});
+
+it("passes the explicit data deletion choice and keeps removal errors visible", async () => {
+  vi.mocked(backend.uninstall).mockRejectedValue("removal-shared-installation-or-data");
+  await open();
+  button("실행 설정").click();
+  await settle();
+  button("제거").click();
+  await settle();
+  const dialog = target.querySelector("dialog")!;
+  const checkbox = dialog.querySelector<HTMLInputElement>('input[type="checkbox"]')!;
+  checkbox.click();
+  await settle();
+  [...dialog.querySelectorAll("button")].find(b => b.textContent?.trim() === "제거")!.click();
+  await settle();
+  expect(backend.uninstall).toHaveBeenCalledWith(true);
+  expect(dialog.hasAttribute("open")).toBe(true);
 });

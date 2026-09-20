@@ -68,6 +68,7 @@ const backend: Backend = {
   updatePolicy: async () => {},
   updateCheck: async () => ({ result: "current" }),
   trayStartup: async () => {},
+  uninstall: async () => {},
   requestId: async () => "a".repeat(64),
   qr: async () => "",
 };

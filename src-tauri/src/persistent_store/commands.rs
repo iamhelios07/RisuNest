@@ -172,6 +172,28 @@ impl PersistentStoreState {
         })
     }
 
+    pub(crate) fn acquire_cleanup_maintenance(&self, timeout: std::time::Duration) -> StoreResult<DeviceMaintenanceGuard> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut state = self.renderer_gate.state.lock().map_err(|_| renderer_gate_error())?;
+        if state.maintenance_active { return Err(renderer_gate_error()); }
+        state.maintenance_active = true;
+        let maintenance = DeviceMaintenanceGuard { gate: Arc::clone(&self.renderer_gate) };
+        while state.operations != 0 {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                drop(state);
+                drop(maintenance);
+                return Err(renderer_gate_error());
+            }
+            let waited = self.renderer_gate.drained.wait_timeout(state, remaining)
+                .map_err(|_| renderer_gate_error())?;
+            state = waited.0;
+        }
+        drop(state);
+        self.store.lock().map_err(|_| renderer_gate_error())?.take();
+        Ok(maintenance)
+    }
+
     pub(crate) fn acquire_device_maintenance(&self) -> StoreResult<DeviceMaintenanceGuard> {
         let maintenance = self
             .try_acquire_renderer_maintenance()?
@@ -1539,6 +1561,19 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn cleanup_maintenance_timeout_preserves_admission_for_retry() {
+        let state = PersistentStoreState::default();
+        let operation = state.admit_renderer_operation().unwrap();
+        assert!(state.acquire_cleanup_maintenance(std::time::Duration::from_millis(1)).is_err());
+        assert!(state.admit_renderer_operation().is_ok());
+        drop(operation);
+        let maintenance = state.acquire_cleanup_maintenance(std::time::Duration::from_secs(1)).unwrap();
+        assert!(state.admit_renderer_operation().is_err());
+        drop(maintenance);
+        assert!(state.admit_renderer_operation().is_ok());
+    }
 
     #[test]
     fn archive_operation_cancellation_reaches_the_active_operation_and_is_released() {

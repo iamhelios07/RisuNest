@@ -157,6 +157,7 @@ pub fn initialize(root: &Path, executable: &Path) -> Result<()> {
             return Err("server-init-failed".into());
         }
     }
+    crate::removal::register(root, executable)?;
     Ok(())
 }
 
@@ -647,4 +648,12 @@ mod tests {
         }
         panic!("background child was not reaped");
     }
+}
+
+
+pub fn remove_startup(root: &Path, executable: &Path) -> Result<()> {
+    #[cfg(windows)]
+    { startup(root, executable, "remove").map(|_| ()) }
+    #[cfg(unix)]
+    { unix::remove_startup(root, executable) }
 }

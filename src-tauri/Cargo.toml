@@ -16,6 +16,8 @@ cc = "1"
 [dependencies]
 axum = "0.8.9"
 tempfile = "3"
+dirs = "6"
+fs2 = "0.4"
 risunest-release-update = { path = "../crates/release-update" }
 risunest-sync-wire = { path = "../crates/sync-wire" }
 risunest-sync-connect = { path = "../crates/sync-connect" }
@@ -115,6 +117,7 @@ libc = "0.2"
 security-framework = "2.11.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+webkit2gtk = { version = "2.0", features = ["v2_16"] }
 keyring = { version = "3.6.3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
 
 [target.'cfg(target_os = "ios")'.dependencies]

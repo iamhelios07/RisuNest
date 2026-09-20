@@ -2,6 +2,9 @@ mod account_credential;
 #[cfg(any(test, target_os = "android"))]
 mod android_commit_transport;
 mod app_data_root;
+mod cleanup_secrets;
+mod cleanup_webview;
+mod app_cleanup;
 mod app_update;
 #[cfg(desktop)]
 mod appimage_integration;
@@ -100,6 +103,19 @@ impl NativeStartupState {
             failure._persistent_gate = persistent_gate;
             failure._native_file_gate = native_file_gate;
         }
+    }
+
+    pub(crate) fn release_cleanup_gates(&self) -> Result<(), String> {
+        let mut failure = self.0.lock().map_err(|_| "cleanup-startup-state-unavailable")?;
+        failure._persistent_gate.take();
+        failure._native_file_gate.take();
+        Ok(())
+    }
+
+    pub(crate) fn finish_cleanup(&self) -> Result<(), String> {
+        let mut failure = self.0.lock().map_err(|_| "cleanup-startup-state-unavailable")?;
+        failure.message = None;
+        Ok(())
     }
 
     pub(crate) fn ensure_ready(&self) -> Result<(), String> {
@@ -536,6 +552,7 @@ fn builder_with_main_window(
 
     builder
         .setup(move |app| {
+            app.manage(app_cleanup::CleanupState::initialize(app.handle())?);
             if let Some((config, data_directory)) = &main_window {
                 tauri::WebviewWindowBuilder::from_config(app, config)?
                     .data_directory(data_directory.clone())
@@ -660,7 +677,10 @@ fn builder_with_main_window(
 
 /// The product command router, reusable by alternative native entries.
 pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static {
-    tauri::generate_handler![
+    let handler: Box<dyn Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync> = Box::new(tauri::generate_handler![
+        app_cleanup::app_cleanup_status,
+        app_cleanup::app_cleanup_request,
+        app_cleanup::app_cleanup_resume,
         external_storage::connection_commands::external_storage_list_providers,
         external_storage::connection_commands::external_storage_prepare_connection,
         external_storage::connection_commands::external_storage_commit_connection,
@@ -917,10 +937,19 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         persistent_store::commands::pds_commit_working_set_change_cursor,
         server_sync::events::server_sync_events_start,
         server_sync::events::server_sync_events_stop,
-    ]
+    ]);
+    move |invoke: tauri::ipc::Invoke<tauri::Wry>| {
+        if app_cleanup::pending(invoke.message.webview_ref().app_handle())
+            && !invoke.message.command().starts_with("app_cleanup_") {
+            invoke.resolver.reject("cleanup-pending");
+            return true;
+        }
+        handler(invoke)
+    }
 }
 
 pub fn handle_run_event(_app: &tauri::AppHandle, _event: tauri::RunEvent) {
+    if app_cleanup::closing(_app) { return; }
     #[cfg(target_os = "ios")]
     if let tauri::RunEvent::Opened { urls } = &_event {
         use tauri_plugin_ios_native::IosNativeExt;
@@ -940,6 +969,10 @@ pub fn handle_run_event(_app: &tauri::AppHandle, _event: tauri::RunEvent) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let mut context = tauri::generate_context!();
+    #[cfg(desktop)]
+    if let Some(code) = app_cleanup::run_cli(context.config()) {
+        std::process::exit(code);
+    }
     #[cfg(desktop)]
     let main_window = app_data_root::take_main_window_with_webview_root(&mut context)
         .expect("desktop WebView data directory unavailable");

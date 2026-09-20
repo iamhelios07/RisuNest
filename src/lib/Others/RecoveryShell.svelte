@@ -6,6 +6,7 @@
     import SettingButton from 'src/lib/Setting/RisuNest/SettingButton.svelte'
     import Check from 'src/lib/UI/GUI/CheckInput.svelte'
     import RisuNestDataHealth from 'src/lib/Setting/Pages/RisuNestDataHealth.svelte'
+    import LocalDataReset from 'src/lib/Setting/RisuNest/LocalDataReset.svelte'
     import { isTauri } from 'src/ts/platform'
     import { exportOriginalData } from 'src/ts/storage/rawRecoveryExport'
     import {
@@ -133,5 +134,6 @@
         <div class="flex flex-wrap gap-2">
             <SettingButton onclick={() => onStart(startNormally())}>{strings.startNormally}</SettingButton>
         </div>
+        <LocalDataReset />
     </div>
 </div>

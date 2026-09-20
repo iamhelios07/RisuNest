@@ -34,6 +34,12 @@ impl Default for DurableCasJobState {
 }
 
 impl DurableCasJobState {
+    pub(crate) fn close_for_cleanup(&self) -> Result<(), String> {
+        self.reset_renderer_session()?;
+        self.jobs.lock().map_err(|_| "cleanup-cas-busy")?.clear();
+        Ok(())
+    }
+
     pub(crate) fn reset_renderer_session(&self) -> Result<(), String> {
         self.uploads
             .lock()
