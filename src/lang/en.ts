@@ -1944,6 +1944,7 @@ export const languageEnglish = {
         pluginData: {
             title: 'Plugin data',
             description: 'Manage the values plugins have stored. Deleted data cannot be restored, so back it up separately before you continue.',
+            scopeTitle: 'Storage scope',
             scopeAllDevices: 'All devices',
             scopeThisDevice: 'This device',
             scopeAllDevicesHelp: 'Included in sync and backups.',
@@ -2146,6 +2147,7 @@ export const languageEnglish = {
             discardRegistration: 'Clear input',
             directoryEnabled: 'Server address lookup',
             manualEntry: 'Enter manually',
+            endpointPlaceholder: 'https://sync.example.com',
             reviewTitle: 'Check the server',
             reviewLead: 'These server details were read from the registration code. Check them, then connect.',
             otherCode: 'Another code',
@@ -2187,6 +2189,13 @@ export const languageEnglish = {
                 clean: 'Clear unneeded temporary files',
                 more: 'Older backups',
                 refresh: 'Refresh list',
+                blockedReasons: {
+                    'server-sync-busy': 'Sync is running',
+                    'incomplete-preservation': 'This backup is not fully preserved yet',
+                    'backup-in-use': 'This backup is in use',
+                    'cache-references-unavailable': 'Temporary files cannot be checked right now',
+                },
+                blockedReasonUnknown: 'Unavailable right now',
                 restoreConfirm:
                     'Go back to this backup? The current library is backed up first, and sync stays paused.',
                 deleteConfirm: 'Delete this conflict backup from this device?',
@@ -2236,7 +2245,6 @@ export const languageEnglish = {
             transferRate: 'Transfer speed',
             progressItems: 'Items processed',
             pendingChanges: 'Changes to upload',
-            progressLabel: 'Progress',
             elapsed: 'Elapsed',
             count: '{0}',
             itemsCount: '{0} items',
@@ -2272,6 +2280,11 @@ export const languageEnglish = {
             storage: 'Storage',
             sync: 'Backup and sync',
             pluginData: 'Plugin data',
+        },
+        pager: {
+            pages: 'Pages',
+            previous: 'Previous page',
+            next: 'Next page',
         },
         perf: {
             title: 'Performance',
@@ -2627,6 +2640,7 @@ export const languageEnglish = {
             resultFailedAfterCommit:
                 'The data was imported, but the screen could not be refreshed. Use the refresh prompt before doing anything else.',
             errorDetails: 'Error details',
+            errorDetailsHide: 'Hide error details',
             copyDetails: 'Copy',
             copied: 'Copied',
             reasonUnsupportedFormat: 'The file format is not supported.',
@@ -2785,6 +2799,7 @@ export const languageEnglish = {
                 stepPaste:
                     'Paste the code below. On mobile you can scan the QR code instead.',
                 stepReview: 'Check the server details, then connect.',
+                unsupported: 'Connecting to a sync server is available in the Android and desktop apps.',
                 linkHint: 'Opening a registration link also leads here.',
                 reviewLead: 'These server details were read from the registration code. Check them, then connect.',
                 serverTag: 'Sync server',

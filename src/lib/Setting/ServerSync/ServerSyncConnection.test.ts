@@ -153,7 +153,7 @@ describe("settings server connection", () => {
       "",
       "",
     ]);
-    expect(target.querySelector("details")!.open).toBe(true);
+    expect(button(text.manualEntry).getAttribute("aria-expanded")).toBe("true");
     expect(state.controller.bind).not.toHaveBeenCalled();
     expect(state.controller.initialize).not.toHaveBeenCalled();
     expect(state.controller.synchronize).not.toHaveBeenCalled();
@@ -249,7 +249,9 @@ describe("settings server connection", () => {
     });
     await tick();
     expect(target.textContent).toContain(`${text.running}: (corrupt-chunk)`);
-    expect(target.textContent).toContain(`${text.progress.applying} · 12 / 48 (25%)`);
+    const bar = target.querySelector("[data-setting-progress]")!;
+    expect(bar.textContent).toContain(`${text.progress.applying} · 12 / 48`);
+    expect(bar.textContent).toContain("25%");
     expect(target.textContent).toContain("2.0 MiB");
     expect(target.textContent).not.toContain("Sync could not finish");
     expect(button(text.syncNow).disabled).toBe(true);

@@ -1,7 +1,7 @@
 <script lang="ts">
     import { AlertTriangleIcon, LoaderCircleIcon, SaveIcon } from '@lucide/svelte'
     import { language } from 'src/lang'
-    import Button from 'src/lib/UI/GUI/Button.svelte'
+    import SettingButton from 'src/lib/Setting/RisuNest/SettingButton.svelte'
     import {
         decideSyncExit,
         syncExitDialogState,
@@ -86,22 +86,22 @@
                 </header>
 
                 {#if !needsChoice}
-                    <div class="h-1.5 overflow-hidden rounded-full border border-darkborderc bg-bgcolor" role="progressbar" aria-label={detail}>
+                    <div class="h-1.5 overflow-hidden rounded-full bg-darkbutton" role="progressbar" aria-label={detail}>
                         <div class="sync-exit-progress h-full w-2/5 rounded-full bg-borderc"></div>
                     </div>
                 {:else}
                     <div class="flex flex-col-reverse gap-2 sm:flex-row sm:flex-wrap sm:justify-end">
-                        <Button styled="outlined" onclick={() => decideSyncExit('cancel-exit')}>
+                        <SettingButton variant="secondary" onclick={() => decideSyncExit('cancel-exit')}>
                             {copy.cancelExit}
-                        </Button>
+                        </SettingButton>
                         {#if !editBlocked}
-                            <Button styled="danger" onclick={() => decideSyncExit('exit-unsynced')}>
+                            <SettingButton variant="danger" onclick={() => decideSyncExit('exit-unsynced')}>
                                 {localFailure ? copy.exitWithoutSaving : copy.exitWithoutSync}
-                            </Button>
+                            </SettingButton>
                         {/if}
-                        <Button onclick={() => decideSyncExit('wait')}>
+                        <SettingButton onclick={() => decideSyncExit('wait')}>
                             {localFailure ? copy.retrySaving : copy.keepWaiting}
-                        </Button>
+                        </SettingButton>
                     </div>
                 {/if}
             </div>

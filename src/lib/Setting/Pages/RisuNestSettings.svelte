@@ -117,7 +117,7 @@
             <LocalDataReset />
         {:else if activeTab === 'sync'}
             {#if isTauri}
-                <section id="risunest-server-sync" class="scroll-mt-4"><ServerSyncSettings /></section>
+                <ServerSyncSettings />
             {/if}
             <ExternalStorageSettings />
             {#if isTauri}

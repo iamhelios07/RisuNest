@@ -451,6 +451,9 @@ describe('what a connection stores', () => {
         }))
 
         state.prepareConnection.mockClear()
+        // A prepared endpoint locks the form, so the purpose changes only after going back.
+        button(strings.back).click()
+        await settle()
         button(strings.sync).click()
         await settle()
         button(strings.prepare).click()
