@@ -6,11 +6,34 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
   buildLocalSyncDistribution,
+  localCargoTargetDirectory,
   localSyncTarget,
   validateLocalSyncEnvironment,
 } from "../../server/manager/install/local-build.mjs";
 
 const repository = fileURLToPath(new URL("../..", import.meta.url));
+
+test("local Sync builds default to the main checkout Cargo cache without overriding an explicit target", () => {
+  const root = join("C:/", "workspace", "RisuNest");
+  const worktree = join("C:/", "workspace", "worktree");
+  const common = join(root, ".git");
+  assert.equal(
+    localCargoTargetDirectory({ commonGitDirectory: common, root: worktree }),
+    join(root, "src-tauri", "target"),
+  );
+  assert.equal(
+    localCargoTargetDirectory({
+      commonGitDirectory: common,
+      configuredTarget: "custom-target",
+      root: worktree,
+    }),
+    resolve(worktree, "custom-target"),
+  );
+  assert.throws(
+    () => localCargoTargetDirectory({ commonGitDirectory: join(root, "unknown"), root: worktree }),
+    /Cannot locate/,
+  );
+});
 
 test("local Sync target mapping selects the release platform and architecture", () => {
   assert.deepEqual(localSyncTarget("x86_64-pc-windows-msvc"), {
@@ -99,13 +122,16 @@ test("local Sync orchestration reuses build and package stages and gathers every
     target: "x86_64-pc-windows-msvc",
     outputRoot: root,
     env: {
-      CARGO_TARGET_DIR: join(root, "cargo"),
       RISUNEST_DEFAULT_REGISTRY_URL: "https://registry.example.com",
       RISUNEST_UPDATE_PUBLIC_KEY: "synthetic-public-key",
     },
     hostTarget: "x86_64-pc-windows-msvc",
     publishedAt: "2026-09-20T00:00:00Z",
   }, {
+    cargoTargetDirectory() {
+      calls.push(["cargo-target"]);
+      return join(root, "cargo");
+    },
     resetDirectory(path) {
       calls.push(["reset", path]);
       mkdirSync(path, { recursive: true });
@@ -140,7 +166,7 @@ test("local Sync orchestration reuses build and package stages and gathers every
     },
   });
   assert.deepEqual(calls.map(([name]) => name), [
-    "preflight", "reset", "commit", "source", "vendor", "build", "raw", "package",
+    "cargo-target", "preflight", "reset", "commit", "source", "vendor", "build", "raw", "package",
   ]);
   assert.deepEqual(result.artifacts.map((item) => basename(item.path)).sort(), [
     "RisuNest Sync_1.0.0_x64-setup.exe", "managed.zip", "raw.zip",

@@ -49,6 +49,30 @@ export function localSyncTarget(target) {
   return { ...config };
 }
 
+export function localCargoTargetDirectory({ commonGitDirectory, configuredTarget, root = repository }) {
+  if (configuredTarget) return resolve(root, configuredTarget);
+  const common = resolve(root, commonGitDirectory.trim());
+  if (basename(common) !== ".git") throw new Error("Cannot locate the main checkout shared Cargo target.");
+  return join(dirname(common), "src-tauri", "target");
+}
+
+function cargoTargetDirectory(env = process.env) {
+  if (env.CARGO_TARGET_DIR) {
+    return localCargoTargetDirectory({
+      commonGitDirectory: "",
+      configuredTarget: env.CARGO_TARGET_DIR,
+    });
+  }
+  const result = spawnSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], {
+    cwd: repository,
+    encoding: "utf8",
+    windowsHide: true,
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw new Error("Cannot locate the main checkout shared Cargo target.");
+  return localCargoTargetDirectory({ commonGitDirectory: result.stdout });
+}
+
 function rustHost() {
   const result = spawnSync("rustc", ["-vV"], { encoding: "utf8", windowsHide: true });
   if (result.error) throw result.error;
@@ -71,7 +95,7 @@ export function validateLocalSyncEnvironment({ target, hostTarget = rustHost(), 
   const registry = new URL(env.RISUNEST_DEFAULT_REGISTRY_URL);
   if (registry.protocol !== "https:" || registry.username || registry.password || registry.search || registry.hash)
     throw new Error("RISUNEST_DEFAULT_REGISTRY_URL must be an HTTPS base URL without credentials, query, or fragment.");
-  return { ...config, registryUrl: registry.href };
+  return { ...config, cargoTargetDir: resolve(repository, env.CARGO_TARGET_DIR), registryUrl: registry.href };
 }
 
 function command(name, args = ["--version"]) {
@@ -175,6 +199,7 @@ function stageArtifacts(assets, output) {
 }
 
 const runtime = {
+  cargoTargetDirectory,
   resetDirectory,
   preflight,
   sourceCommit,
@@ -186,7 +211,12 @@ const runtime = {
 };
 
 export async function buildLocalSyncDistribution(options, dependencies = runtime) {
-  const config = validateLocalSyncEnvironment(options);
+  const inputEnvironment = options.env ?? process.env;
+  const effectiveEnvironment = {
+    ...inputEnvironment,
+    CARGO_TARGET_DIR: dependencies.cargoTargetDirectory(inputEnvironment),
+  };
+  const config = validateLocalSyncEnvironment({ ...options, env: effectiveEnvironment });
   const root = resolve(options.outputRoot ?? join(localOutputBase, config.target));
   const output = join(root, "output");
   dependencies.preflight(config);
@@ -209,8 +239,10 @@ export async function buildLocalSyncDistribution(options, dependencies = runtime
 
   const previousVendorInput = process.env.RISUNEST_CLOUDFLARED_INPUT;
   const previousRegistry = process.env.RISUNEST_DEFAULT_REGISTRY_URL;
+  const previousCargoTarget = process.env.CARGO_TARGET_DIR;
   process.env.RISUNEST_CLOUDFLARED_INPUT = join(vendorDirectory, "vendor.json");
   process.env.RISUNEST_DEFAULT_REGISTRY_URL = config.registryUrl;
+  process.env.CARGO_TARGET_DIR = config.cargoTargetDir;
   try {
     const nativeBuild = dependencies.buildNativeSuite({
       target: config.target,
@@ -245,6 +277,8 @@ export async function buildLocalSyncDistribution(options, dependencies = runtime
     else process.env.RISUNEST_CLOUDFLARED_INPUT = previousVendorInput;
     if (previousRegistry === undefined) delete process.env.RISUNEST_DEFAULT_REGISTRY_URL;
     else process.env.RISUNEST_DEFAULT_REGISTRY_URL = previousRegistry;
+    if (previousCargoTarget === undefined) delete process.env.CARGO_TARGET_DIR;
+    else process.env.CARGO_TARGET_DIR = previousCargoTarget;
   }
 }
 
