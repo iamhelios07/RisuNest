@@ -76,6 +76,16 @@ GUI만 `pnpm run dev:agent`로 열면 네이티브 IPC가 없어 연결 안 됨�
 
 ## 배포 빌드
 
+로컬에서 설치 파일까지 만들 때는 공용 Cargo 출력 경로, 실제 기본 레지스트리 주소, 업데이트 서명 공개키를 설정한 뒤 현재 운영체제의 명령을 실행합니다. Windows와 macOS는 먼저 `pnpm --dir server/manager/gui --ignore-workspace install --frozen-lockfile`로 GUI 의존성을 설치해야 합니다.
+
+```sh
+pnpm sync:windows:build
+pnpm sync:linux:build
+pnpm sync:macos:build
+```
+
+각 명령은 해당 네이티브 운영체제에서만 실행되며 결과는 `.tmp/sync-distribution/<target>/output`에 생성됩니다. Windows는 NSIS와 관리형 ZIP, macOS는 DMG와 전체 앱 tar.gz, Linux는 Manager TUI가 포함된 관리형 tar.gz를 만듭니다. raw 서버 아카이브도 함께 생성됩니다. 로컬 명령은 패키지 구조와 번들 내용을 검증하지만 업데이트 서명, 게시, 태그 생성은 수행하지 않습니다.
+
 정식 배포는 [Release build](../../.github/workflows/release.yml)의 `sync-v<버전>` 파이프라인을 사용합니다. `install/build.mjs`가 플랫폼별 바이너리를 한 번 빌드하며 `install/package.mjs`는 그 빌드 명세와 이미 만든 raw 서버 아카이브를 받아 Windows NSIS/관리형 ZIP, macOS DMG/전체 app.tar.gz, Linux 관리형 tar.gz를 포장합니다. 포장 단계에서 서버를 다시 빌드하지 않습니다. Windows/macOS GUI 의존성은 빌드 전에 설치합니다.
 
 - `CARGO_TARGET_DIR`: 공용 Cargo target
