@@ -40,6 +40,7 @@ impl PersistentStore {
             "server_sync_base",
             "server_sync_remote",
             "server_sync_operation_records",
+            "server_sync_prepared",
         ] {
             let mut statement = self
                 .connection
@@ -47,7 +48,11 @@ impl PersistentStore {
             for version in statement.query_map([], |row| row.get::<_, String>(0))? {
                 let version: RecordVersion = serde_json::from_str(&version?)
                     .map_err(|_| SyncError::new("invalid-local-server-version", 409))?;
-                hashes.extend(cache.closure(&version)?);
+                match cache.closure(&version) {
+                    Ok(closure) => hashes.extend(closure),
+                    Err(error) if table == "server_sync_remote" && error.code == "cached-object-missing" => (),
+                    Err(error) => return Err(error),
+                }
             }
         }
         let mut statement = self
@@ -200,6 +205,7 @@ impl PersistentStore {
             "server_sync_remote_cursor",
             "server_sync_remote_sections",
             "server_sync_operation_records",
+            "server_sync_prepared",
             "server_sync_operation_pages",
             "server_sync_operation_scopes",
             "server_sync_operation_sections",
@@ -314,6 +320,7 @@ impl PersistentStore {
             "server_sync_remote_sections",
             "server_sync_operation",
             "server_sync_operation_records",
+            "server_sync_prepared",
             "server_sync_operation_pages",
             "server_sync_operation_scopes",
             "server_sync_operation_sections",
@@ -495,6 +502,7 @@ impl PersistentStore {
         for table in [
             "server_sync_operation",
             "server_sync_operation_records",
+            "server_sync_prepared",
             "server_sync_operation_pages",
             "server_sync_operation_scopes",
         ] {
@@ -547,6 +555,7 @@ impl PersistentStore {
             for table in [
                 "server_sync_operation",
                 "server_sync_operation_records",
+                "server_sync_prepared",
                 "server_sync_operation_pages",
                 "server_sync_operation_scopes",
             ] {

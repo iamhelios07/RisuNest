@@ -57,6 +57,13 @@ impl RetryBudget {
         }
     }
 
+    fn progress(&self) {
+        if let Ok(mut spent) = self.spent.lock() {
+            *spent = Duration::ZERO;
+            self.attempt.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     fn remaining(&self) -> Result<Duration> {
         let spent = self
             .spent
@@ -308,7 +315,12 @@ impl ServerClient {
     pub(crate) fn retry_budget(&self) -> Arc<RetryBudget> {
         self.retry_budget.clone()
     }
+    pub(crate) fn progress(&self) {
+        self.retry_budget.progress();
+        self.report_retryable_failure(None);
+    }
     pub fn verified(&self, bytes: u64) {
+        self.progress();
         if let Some(counter) = &self.verified_bytes {
             counter.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         }
@@ -377,6 +389,18 @@ impl ServerClient {
                 }
             }
         }
+    }
+
+    pub(crate) fn frame_request(&self, body: Vec<u8>) -> Result<Reply> {
+        self.request_with_policy(
+            Method::POST,
+            "uploads/frames",
+            &[],
+            Some(body),
+            &[],
+            MAX_METADATA_BYTES,
+            false,
+        )
     }
 
     fn request_with_policy(
@@ -736,6 +760,40 @@ mod tests {
             token: "a".repeat(64),
         }
     }
+    #[test]
+    fn verified_progress_renews_more_than_five_minutes_of_transient_failures() {
+        let current = Arc::new(Mutex::new(Instant::now()));
+        let clock = current.clone();
+        let sleeper = current.clone();
+        let budget = Arc::new(RetryBudget::with_driver(
+            None,
+            Arc::new(move || *clock.lock().unwrap()),
+            Arc::new(move |d| *sleeper.lock().unwrap() += d),
+        ));
+        let mut client =
+            ServerClient::with_retry_budget(config("http://127.0.0.1:1"), None, budget.clone())
+                .unwrap();
+        client.retryable_failure = Some(Arc::new(Mutex::new(None)));
+        for _ in 0..10 {
+            budget.wait(None, Duration::from_secs(60)).unwrap();
+            client.report_retryable_failure(Some("server-timeout"));
+            client.verified(1024);
+            assert_eq!(budget.remaining().unwrap(), RETRY_BUDGET);
+            assert!(client
+                .retryable_failure
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .is_none());
+        }
+        budget.charge(RETRY_BUDGET).unwrap();
+        assert_eq!(
+            budget.wait(None, Duration::ZERO).unwrap_err().code,
+            "sync-retry-budget-exhausted"
+        );
+    }
+
     #[test]
     fn fixed_endpoint_requires_https_except_loopback_and_rejects_embedded_credentials() {
         for url in [

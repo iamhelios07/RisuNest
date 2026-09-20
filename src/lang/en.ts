@@ -2250,6 +2250,7 @@ export const languageEnglish = {
             elapsed: 'Elapsed',
             count: '{0}',
             itemsCount: '{0} items',
+            activity: { enumerating: 'Counting items', preparing: 'Checking assets and preparing changes', downloading: 'Downloading', uploading: 'Uploading', confirming: 'Waiting for server confirmation' },
             progress: {
                 saving: 'Saving changes on this device',
                 preparing: 'Comparing changes on this device and the server',

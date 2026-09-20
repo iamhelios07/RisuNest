@@ -64,6 +64,9 @@ export type ServerSyncProgress =
 export interface ServerCycleItems {
   done: number;
   total: number;
+  activity?: "enumerating" | "preparing" | "downloading" | "uploading" | "confirming";
+  processed?: number;
+  expected?: number;
 }
 type Prepared =
   | { kind: "report"; result: ServerCycle }
@@ -91,7 +94,13 @@ export class ServerSyncError extends Error {
 }
 function isCycleItems(value: unknown): value is ServerCycleItems {
   if (typeof value !== "object" || value === null) return false;
-  const { done, total } = value as Record<string, unknown>;
+  const { done, total, activity, processed, expected } = value as Record<string, unknown>;
+  if (activity !== undefined && (
+    typeof activity !== "string" ||
+    !["enumerating", "preparing", "downloading", "uploading", "confirming"].includes(activity) ||
+    !Number.isSafeInteger(processed) || Number(processed) < 0 ||
+    !Number.isSafeInteger(expected) || Number(expected) < 0
+  )) return false;
   return (
     typeof done === "number" &&
     typeof total === "number" &&
@@ -170,6 +179,9 @@ export function createServerSyncFacade(options: {
           options.onCycleItems?.({
             done: items.value.done,
             total: items.value.total,
+            activity: items.value.activity,
+            processed: items.value.processed,
+            expected: items.value.expected,
           });
       } catch {
         /* Progress must never change the synchronization outcome. */

@@ -46,6 +46,7 @@ fn all_live_tables_have_an_explicit_preservation_owner() {
         "server_sync_operation",
         "server_sync_objects",
         "server_sync_operation_records",
+            "server_sync_prepared",
         "server_sync_operation_pages",
         "server_sync_operation_scopes",
         "server_sync_operation_sections",

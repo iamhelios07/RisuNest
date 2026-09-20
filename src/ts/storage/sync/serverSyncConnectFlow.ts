@@ -159,6 +159,8 @@ export function serverSyncProgressView(
     return { stage, label: text.progress[stage], state, detail };
   });
   const active = stages[activeIndex];
+  const activity = snapshot.progress === "preparing" || snapshot.progress === "publishing" ? items?.activity : undefined;
+  const activityCount = items?.expected ? `${formatCount(items.processed ?? 0)} / ${formatCount(items.expected)}` : formatCount(items?.processed ?? 0);
   const bytes =
     snapshot.verifiedBytes === undefined
       ? NO_VALUE
@@ -173,12 +175,12 @@ export function serverSyncProgressView(
       : fill(text.count, formatCount(snapshot.status.dirtyRecords))
     : NO_VALUE;
   return {
-    percent: counted ? Math.min(100, Math.round((items.done / items.total) * 100)) : null,
-    current: active.detail ? `${active.label} · ${active.detail}` : active.label,
+    percent: counted && activity !== "confirming" ? Math.min(100, Math.round((items.done / items.total) * 100)) : null,
+    current: activity ? `${text.activity[activity]}${activity === "confirming" ? "" : ` · ${activityCount}`}` : active.detail ? `${active.label} · ${active.detail}` : active.label,
     elapsed:
       snapshot.attemptStartedAt === undefined
         ? ""
-        : `${text.elapsed} ${formatElapsed(now - snapshot.attemptStartedAt)}`,
+        : `${text.elapsed} ${formatElapsed(now - (snapshot.phaseStartedAt ?? snapshot.attemptStartedAt))}`,
     stages,
     counters: [
       { key: "bytes", label: text.verifiedBytes, value: bytes },

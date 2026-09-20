@@ -2887,6 +2887,15 @@ impl PersistentStore {
             )?
             .assets,
         ));
+        if self.server_config().map_err(|e| StoreError::Store { message: e.code })?.is_some() {
+            let cache = self.server_cache().map_err(|e| StoreError::Store { message: e.code })?;
+            let mut set = crate::asset_repository::migration_gc::AssetRootSet::default();
+            let native = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
+            for hash in self.server_cache_references(&cache).map_err(|e| StoreError::Store { message: e.code })? {
+                if native.stat_object(&hash)?.is_some() { set.object_hashes.insert(hash); }
+            }
+            roots.push(("server-sync", set));
+        }
         let mut server_conflicts =
             crate::asset_repository::migration_gc::AssetRootSet::default();
         crate::server_sync::backups::references::visit_roots(

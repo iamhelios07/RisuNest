@@ -142,6 +142,7 @@ impl Store {
             CREATE TEMP TABLE IF NOT EXISTS gc_alive(hash TEXT PRIMARY KEY); DELETE FROM gc_alive;
             WITH RECURSIVE edges(source,target) AS (
                 SELECT hash,object FROM descriptors UNION ALL SELECT hash,json_extract(body,'$.dependencyRoot') FROM descriptors UNION ALL SELECT hash,json_extract(body,'$.relationRoot') FROM descriptors
+                UNION ALL SELECT descriptors.hash,json_each.value FROM descriptors,json_each(descriptors.body,'$.dependencies')
                 UNION ALL SELECT root,child FROM reference_children UNION ALL SELECT root,object FROM reference_objects
             ), alive(hash) AS (SELECT hash FROM gc_roots UNION SELECT target FROM edges JOIN alive ON source=alive.hash WHERE target IS NOT NULL)
             INSERT INTO gc_alive SELECT hash FROM alive;

@@ -274,18 +274,16 @@ impl PersistentStore {
                 let size = *objects
                     .get(&hash)
                     .ok_or_else(|| SyncError::new("invalid-missing-response", 502))?;
-                // A snapshot-only object may never have been published. The
-                // temporary transfer CAS holds at most one file, then is removed.
+                // A snapshot-only object may never have been published.
                 let directory = tempfile::Builder::new()
                     .prefix("asset-offload-")
                     .tempdir_in(&self.repository_root)?;
-                let cache = crate::server_sync::cache::Cache::open(directory.path())?;
-                let mut file = cas
-                    .open_object(&hash)?
-                    .ok_or_else(|| SyncError::new("asset-changed", 409))?;
-                crate::server_sync::transfer::prepare_checked(
-                    &cache.cas, &mut file, &hash, size, &check,
-                )?;
+                let cache = crate::server_sync::cache::Cache::open(directory.path())?
+                    .with_library(&self.repository_root)?;
+                if cache.stat_object(&hash)? != Some(size) {
+                    return Err(SyncError::new("asset-changed", 409));
+                }
+                cache.verify(&hash, &check)?;
                 crate::server_sync::transfer::Transfer::new(&client, &cache)?
                     .with_check(&check)
                     .upload_with_hints(&[hash], &[], false, &Default::default())?;
