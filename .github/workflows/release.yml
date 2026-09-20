@@ -227,6 +227,17 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y pkg-config libwebkit2gtk-4.1-dev libssl-dev libdbus-1-dev libayatana-appindicator3-dev librsvg2-dev
       - run: cargo test --manifest-path src-tauri/Cargo.toml --release --locked --target ${{ matrix.target }}
       - run: cargo test --manifest-path src-tauri/Cargo.toml --package tauri-plugin-updater --release --locked --target ${{ matrix.target }} --lib
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
+        if: matrix.runner == 'windows-2022'
+        with: { version: "10.34.1" }
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        if: matrix.runner == 'windows-2022'
+        with: { node-version: "24", package-manager-cache: false }
+      - if: matrix.runner == 'windows-2022'
+        run: pnpm install --frozen-lockfile
+      - name: Windows persistence boundary
+        if: matrix.runner == 'windows-2022'
+        run: pnpm desktop:test-boundary:agent
 
   app-android-tests:
     if: inputs.product == 'app'
