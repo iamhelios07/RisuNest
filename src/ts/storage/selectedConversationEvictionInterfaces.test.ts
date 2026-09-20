@@ -113,7 +113,6 @@ describe('independent windowed conversation interfaces', () => {
         vi.doMock('../globalApi.svelte', () => ({ fetchNative: vi.fn(), readImage: vi.fn() }))
         vi.doMock('../platform', () => ({
             isTauriMobile: true,
-            isNodeServer: false,
             isTauri: false,
             isMobile: false,
         }))

@@ -3,7 +3,9 @@
     import { isTauri, isTauriAndroid, isTauriIOS } from 'src/ts/platform'
     import { cleanupNeedsWebViewUpdate, requestAppCleanup } from 'src/ts/storage/appCleanup'
     import SettingGroup from './SettingGroup.svelte'
-    import Button from 'src/lib/UI/GUI/Button.svelte'
+    import SettingRow from './SettingRow.svelte'
+    import SettingToggle from './SettingToggle.svelte'
+    import SettingButton from './SettingButton.svelte'
 
     let prepareRemoval = $state(false)
     let busy = $state(false)
@@ -31,25 +33,26 @@
 
 {#if isTauri}
     <SettingGroup title={text.title} id="risunest-reset" description={text.scope}>
-        <div class="space-y-3 p-3">
-            <p class="text-sm text-textcolor2">{text.resetHelp}</p>
-            {#if !isTauriAndroid && !isTauriIOS}
-                <label class="flex items-center gap-2 text-sm">
-                    <input type="checkbox" bind:checked={prepareRemoval} disabled={busy || confirming} />
-                    {text.prepareRemoval}
-                </label>
-                <p class="text-sm text-textcolor2">{text.removalHelp}</p>
-            {/if}
+        {#if !isTauriAndroid && !isTauriIOS}
+            <SettingRow label={text.prepareRemoval} help={text.removalHelp} inline>
+                <SettingToggle label={text.prepareRemoval} bind:checked={prepareRemoval} disabled={busy || confirming} />
+            </SettingRow>
+        {/if}
+        <SettingRow help={text.resetHelp}>
+            {#snippet below()}
+                {#if confirming}
+                    <p class="mt-1.5 text-sm">{prepareRemoval ? text.confirmRemoval : text.confirmReset}</p>
+                {/if}
+                {#if error}
+                    <p role="alert" class="mt-1.5 text-sm text-danger-400">{error}</p>
+                {/if}
+            {/snippet}
             {#if confirming}
-                <p class="text-sm">{prepareRemoval ? text.confirmRemoval : text.confirmReset}</p>
-                <div class="flex flex-wrap gap-2">
-                    <Button disabled={busy} onclick={() => void reset()}>{busy ? text.pending : prepareRemoval ? text.deleteAndExit : text.title}</Button>
-                    <Button disabled={busy} onclick={() => { confirming = false; error = '' }}>{text.cancel}</Button>
-                </div>
+                <SettingButton variant="danger" busy={busy} onclick={() => void reset()}>{prepareRemoval ? text.deleteAndExit : text.title}</SettingButton>
+                <SettingButton variant="secondary" disabled={busy} onclick={() => { confirming = false; error = '' }}>{text.cancel}</SettingButton>
             {:else}
-                <Button onclick={() => { confirming = true }}>{prepareRemoval ? text.deleteAndExit : text.title}</Button>
+                <SettingButton variant="danger" onclick={() => { confirming = true }}>{prepareRemoval ? text.deleteAndExit : text.title}</SettingButton>
             {/if}
-            {#if error}<p role="alert" class="text-sm text-textcolor2">{error}</p>{/if}
-        </div>
+        </SettingRow>
     </SettingGroup>
 {/if}

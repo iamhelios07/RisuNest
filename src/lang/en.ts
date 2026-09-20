@@ -294,19 +294,16 @@ export const languageEnglish = {
         forcePlainFetch: "If enabled, it will use browser fetch api instead of native http request. this can cause CORS errors.",
         autoFillRequestURL: "If enabled, it will autofill request url to match the current model.",
         localNetworkModeDesc:
-            "Routes private/LAN model URLs through the local runtime path instead of browser direct fetch.\n\n" +
+            "Routes private/LAN model URLs through the native runtime path instead of browser direct fetch.\n\n" +
             "**Purpose**\n" +
-            "- Avoid browser private-network/CORS restrictions for `192.168.x.x`, `10.x.x.x`, `localhost`, `.local`, and similar local hosts.\n" +
-            "- Mitigate timeout risk for slow first-token local inference in Node self-host mode.\n\n" +
+            "- Avoid browser private-network/CORS restrictions for `192.168.x.x`, `10.x.x.x`, `localhost`, `.local`, and similar local hosts.\n\n" +
             "**How it works**\n" +
             "- Applies only when Local Network Mode is enabled and the target URL is detected as local/private.\n" +
-            "- Node self-host: streaming uses experimental Job+WebSocket relay first (fallback to `/proxy2` on failure); non-streaming uses `/proxy2`.\n" +
             "- Tauri: uses native/direct path.\n" +
             "- Public web mode: blocked for local/private direct calls by design.\n\n" +
             "**Constraints**\n" +
             "- Scope is OpenAI-compatible request paths only.\n" +
-            "- This does not bypass Cloudflare origin limits between two public domains.\n" +
-            "- Use your self-host URL (where `globalThis.__NODE__ === true`) for this feature to take effect.",
+            "- This does not bypass Cloudflare origin limits between two public domains.",
         chainOfThought: "If enabled, it will add chain of thought prompt to the prompt.",
         gptVisionQuality: "This option is used to set the quality of the image detection model. The higher the quality, the more accurate the detection, but more tokens are used.",
         genTimes:
@@ -1947,6 +1944,7 @@ export const languageEnglish = {
         pluginData: {
             title: 'Plugin data',
             description: 'Manage the values plugins have stored. Deleted data cannot be restored, so back it up separately before you continue.',
+            scopeTitle: 'Storage scope',
             scopeAllDevices: 'All devices',
             scopeThisDevice: 'This device',
             scopeAllDevicesHelp: 'Included in sync and backups.',
@@ -2149,6 +2147,7 @@ export const languageEnglish = {
             discardRegistration: 'Clear input',
             directoryEnabled: 'Server address lookup',
             manualEntry: 'Enter manually',
+            endpointPlaceholder: 'https://sync.example.com',
             reviewTitle: 'Check the server',
             reviewLead: 'These server details were read from the registration code. Check them, then connect.',
             otherCode: 'Another code',
@@ -2190,6 +2189,13 @@ export const languageEnglish = {
                 clean: 'Clear unneeded temporary files',
                 more: 'Older backups',
                 refresh: 'Refresh list',
+                blockedReasons: {
+                    'server-sync-busy': 'Sync is running',
+                    'incomplete-preservation': 'This backup is not fully preserved yet',
+                    'backup-in-use': 'This backup is in use',
+                    'cache-references-unavailable': 'Temporary files cannot be checked right now',
+                },
+                blockedReasonUnknown: 'Unavailable right now',
                 restoreConfirm:
                     'Go back to this backup? The current library is backed up first, and sync stays paused.',
                 deleteConfirm: 'Delete this conflict backup from this device?',
@@ -2239,7 +2245,6 @@ export const languageEnglish = {
             transferRate: 'Transfer speed',
             progressItems: 'Items processed',
             pendingChanges: 'Changes to upload',
-            progressLabel: 'Progress',
             elapsed: 'Elapsed',
             count: '{0}',
             itemsCount: '{0} items',
@@ -2275,6 +2280,11 @@ export const languageEnglish = {
             storage: 'Storage',
             sync: 'Backup and sync',
             pluginData: 'Plugin data',
+        },
+        pager: {
+            pages: 'Pages',
+            previous: 'Previous page',
+            next: 'Next page',
         },
         perf: {
             title: 'Performance',
@@ -2630,6 +2640,7 @@ export const languageEnglish = {
             resultFailedAfterCommit:
                 'The data was imported, but the screen could not be refreshed. Use the refresh prompt before doing anything else.',
             errorDetails: 'Error details',
+            errorDetailsHide: 'Hide error details',
             copyDetails: 'Copy',
             copied: 'Copied',
             reasonUnsupportedFormat: 'The file format is not supported.',
@@ -2673,7 +2684,6 @@ export const languageEnglish = {
             deleteAndExit: 'Delete and exit',
             confirmReset: 'Delete local data and reset RisuNest?',
             confirmRemoval: 'Delete local data and prepare RisuNest for removal?',
-            pending: 'Deleting local data',
             failed: 'Local data deletion could not start. Please retry.',
         },
         platform: {
@@ -2788,6 +2798,7 @@ export const languageEnglish = {
                 stepPaste:
                     'Paste the code below. On mobile you can scan the QR code instead.',
                 stepReview: 'Check the server details, then connect.',
+                unsupported: 'Connecting to a sync server is available in the Android and desktop apps.',
                 linkHint: 'Opening a registration link also leads here.',
                 reviewLead: 'These server details were read from the registration code. Check them, then connect.',
                 serverTag: 'Sync server',

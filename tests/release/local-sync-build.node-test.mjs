@@ -60,30 +60,19 @@ test("local Sync target mapping selects the release platform and architecture", 
   assert.throws(() => localSyncTarget("wasm32-unknown-unknown"), /Unsupported local Sync target/);
 });
 
-test("local Sync builds require shared Cargo output, registry, and a native host", () => {
+test("local Sync builds require only resolved Cargo output and a native host", () => {
   const target = "x86_64-pc-windows-msvc";
   assert.throws(
     () => validateLocalSyncEnvironment({ target, hostTarget: target, env: {} }),
     /CARGO_TARGET_DIR/,
   );
-  assert.throws(
-    () => validateLocalSyncEnvironment({
+  assert.equal(
+    validateLocalSyncEnvironment({
       target,
       hostTarget: target,
       env: { CARGO_TARGET_DIR: "C:/target" },
-    }),
-    /RISUNEST_DEFAULT_REGISTRY_URL/,
-  );
-  assert.throws(
-    () => validateLocalSyncEnvironment({
-      target,
-      hostTarget: target,
-      env: {
-        CARGO_TARGET_DIR: "C:/target",
-        RISUNEST_DEFAULT_REGISTRY_URL: "https://registry.example.com",
-      },
-    }),
-    /RISUNEST_UPDATE_PUBLIC_KEY/,
+    }).registryUrl,
+    "https://registry.rsyumi.workers.dev/",
   );
   assert.throws(
     () => validateLocalSyncEnvironment({
@@ -92,7 +81,6 @@ test("local Sync builds require shared Cargo output, registry, and a native host
       env: {
         CARGO_TARGET_DIR: "C:/target",
         RISUNEST_DEFAULT_REGISTRY_URL: "https://registry.example.com",
-        RISUNEST_UPDATE_PUBLIC_KEY: "synthetic-public-key",
       },
     }),
     /native host target/,
@@ -103,7 +91,6 @@ test("local Sync builds require shared Cargo output, registry, and a native host
     env: {
       CARGO_TARGET_DIR: "C:/target",
       RISUNEST_DEFAULT_REGISTRY_URL: "https://registry.example.com",
-      RISUNEST_UPDATE_PUBLIC_KEY: "synthetic-public-key",
     },
   }).registryUrl, "https://registry.example.com/");
 });
@@ -121,10 +108,7 @@ test("local Sync orchestration reuses build and package stages and gathers every
   const result = await buildLocalSyncDistribution({
     target: "x86_64-pc-windows-msvc",
     outputRoot: root,
-    env: {
-      RISUNEST_DEFAULT_REGISTRY_URL: "https://registry.example.com",
-      RISUNEST_UPDATE_PUBLIC_KEY: "synthetic-public-key",
-    },
+    env: {},
     hostTarget: "x86_64-pc-windows-msvc",
     publishedAt: "2026-09-20T00:00:00Z",
   }, {

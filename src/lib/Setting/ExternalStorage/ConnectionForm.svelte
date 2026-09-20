@@ -5,6 +5,7 @@
     import OptionInput from 'src/lib/UI/GUI/OptionInput.svelte'
     import SegmentedButtons from '../RisuNest/SegmentedButtons.svelte'
     import SettingButton from '../RisuNest/SettingButton.svelte'
+    import SettingToggle from '../RisuNest/SettingToggle.svelte'
     import { openUrl } from '@tauri-apps/plugin-opener'
     import { type as osType } from '@tauri-apps/plugin-os'
     import { isTauriAndroid, isTauriIOS } from 'src/ts/platform'
@@ -385,18 +386,18 @@
 <fieldset disabled={busy} class="form" data-external-storage-connection-form data-tone={tone}>
     <fieldset disabled={prepared !== null} class="contents">
     <section class="sub">
-        <h4 class="sub-title">{strings.provider}</h4>
+        <h3 class="sub-title">{strings.provider}</h3>
         <div class="fields two">
             <label class="field">
                 <span>{strings.provider}</span>
-                <SelectInput value={providerId} className="w-full" onchange={event => selectProvider(event.currentTarget.value)}>
+                <SelectInput value={providerId} className="w-full disabled:opacity-50" onchange={event => selectProvider(event.currentTarget.value)}>
                     {#each providerOptions as option (option.value)}<OptionInput value={option.value} disabled={option.disabled}>{option.label}</OptionInput>{/each}
                 </SelectInput>
                 <small>{providerStrings.description}</small>
             </label>
             {#if !restoreOnly}<div class="field">
                 <span>{strings.mode}</span>
-                <SegmentedButtons value={mode} label={strings.mode} role="radiogroup" onchange={selectMode} options={[{ value: 'create', label: strings.create }, { value: 'existing', label: strings.existing }]} />
+                <SegmentedButtons value={mode} label={strings.mode} role="radiogroup" disabled={prepared !== null} onchange={selectMode} options={[{ value: 'create', label: strings.create }, { value: 'existing', label: strings.existing }]} />
                 {#if mode === 'existing'}<small>{strings.existingHelp}</small>{/if}
             </div>{/if}
         </div>
@@ -409,9 +410,9 @@
 
     {#if mode === 'create'}
     <section class="sub">
-        <h4 class="sub-title">{strings.purpose}</h4>
+        <h3 class="sub-title">{strings.purpose}</h3>
         <div class="field">
-            <SegmentedButtons value={purpose} label={strings.purpose} role="radiogroup" onchange={selectPurpose} options={purposeOptions} />
+            <SegmentedButtons value={purpose} label={strings.purpose} role="radiogroup" disabled={prepared !== null} onchange={selectPurpose} options={purposeOptions} />
             {#if !supportsSync}<small>{strings.backupOnlyProvider}</small>{/if}
             <small>{strings.purposeHelp}</small>
         </div>
@@ -433,24 +434,25 @@
         <div class="warning">
             <strong>{strings.githubWarningTitle}</strong>
             <p>{strings.githubWarning}</p>
-            <label class="check">
-                <input type="checkbox" checked={accepted.includes(acknowledgement)} onchange={event => toggleAcknowledgement(acknowledgement, event.currentTarget.checked)} />
-                <span>{strings.acknowledge}</span>
-                <span class="sr-only">{strings.githubWarning}</span>
-            </label>
+            <SettingToggle
+                showLabel
+                label={strings.acknowledge}
+                checked={accepted.includes(acknowledgement)}
+                onchange={checked => toggleAcknowledgement(acknowledgement, checked)}
+            />
         </div>
     {/each}
 
     {#if mode === 'existing'}
     <section class="sub">
-        <h4 class="sub-title">{strings.connectionSettings}</h4>
+        <h3 class="sub-title">{strings.connectionSettings}</h3>
         <p class="sub-help">{strings.connectionSettingsImportHelp}</p>
         <div class="actions">
             <SettingButton variant="secondary" disabled={busy} onclick={loadConnectionSettingsFile}>{strings.openConnectionSettingsFile}</SettingButton>
             {#if isTauriAndroid || isTauriIOS}<SettingButton variant="secondary" disabled={busy} onclick={scanConnectionSettings}>{strings.scanConnectionSettings}</SettingButton>{/if}
         </div>
-        <label class="field"><span>{strings.connectionSettingsPayload}</span><textarea class="textarea" placeholder={strings.connectionSettingsPayloadPlaceholder} bind:value={connectionSettingsPayload}></textarea></label>
-        <label class="field"><span>{strings.recoveryCode}</span><TextInput fullwidth hideText bind:value={recoveryKey} /></label>
+        <label class="field"><span>{strings.connectionSettingsPayload}</span><textarea class="textarea rounded-md border border-darkborderc bg-transparent px-4 py-2 text-textcolor shadow-xs transition-colors duration-200 focus:border-borderc focus:ring-2 focus:ring-borderc focus:outline-hidden disabled:opacity-50" placeholder={strings.connectionSettingsPayloadPlaceholder} bind:value={connectionSettingsPayload}></textarea></label>
+        <label class="field"><span>{strings.recoveryCode}</span><TextInput className="disabled:opacity-50" fullwidth hideText bind:value={recoveryKey} /></label>
         <div class="actions">
             <SettingButton disabled={busy || !connectionSettingsPayload.trim() || !recoveryKey.trim()} onclick={importConnectionSettings}>{strings.importConnectionSettings}</SettingButton>
         </div>
@@ -459,14 +461,14 @@
     {/if}
 
     <section class="sub">
-        <h4 class="sub-title">{strings.connectionInfo}</h4>
+        <h3 class="sub-title">{strings.connectionInfo}</h3>
         <div class="fields two">
             {#if definition.customEndpoint}
-                <label class="field span2"><span>{strings.endpoint}</span><TextInput fullwidth value={values.endpoint ?? definition.defaultEndpoint} onchange={event => updateValue('endpoint', event.currentTarget.value)} placeholder={definition.defaultEndpoint || 'https://…'} /></label>
+                <label class="field span2"><span>{strings.endpoint}</span><TextInput className="disabled:opacity-50" fullwidth value={values.endpoint ?? definition.defaultEndpoint} onchange={event => updateValue('endpoint', event.currentTarget.value)} placeholder={definition.defaultEndpoint || 'https://…'} /></label>
             {/if}
             {#if definition.profiles.length > 1}
                 <label class="field"><span>{strings.profile}</span>
-                    <SelectInput value={values.profile ?? definition.profiles[0].value} className="w-full" onchange={event => updateValue('profile', event.currentTarget.value)}>
+                    <SelectInput value={values.profile ?? definition.profiles[0].value} className="w-full disabled:opacity-50" onchange={event => updateValue('profile', event.currentTarget.value)}>
                         {#each definition.profiles as profile (profile.value)}<OptionInput value={profile.value}>{externalProfileLabel(strings, providerId, profile.value, profile.label)}</OptionInput>{/each}
                     </SelectInput>
                 </label>
@@ -476,11 +478,11 @@
                 <label class="field">
                     <span>{fieldLabel(field.key)}{field.required ? '' : strings.optional}</span>
                     {#if field.type === 'select'}
-                        <SelectInput value={values[field.key] ?? field.options?.[0] ?? ''} className="w-full" onchange={event => updateValue(field.key, event.currentTarget.value)}>
+                        <SelectInput value={values[field.key] ?? field.options?.[0] ?? ''} className="w-full disabled:opacity-50" onchange={event => updateValue(field.key, event.currentTarget.value)}>
                             {#each field.options ?? [] as option (option)}<OptionInput value={option}>{externalOptionLabel(strings, providerId, field.key, option)}</OptionInput>{/each}
                         </SelectInput>
                     {:else}
-                        <TextInput fullwidth value={values[field.key] ?? ''} onchange={event => updateValue(field.key, event.currentTarget.value)} placeholder={field.placeholder ?? ''} />
+                        <TextInput className="disabled:opacity-50" fullwidth value={values[field.key] ?? ''} onchange={event => updateValue(field.key, event.currentTarget.value)} placeholder={field.placeholder ?? ''} />
                     {/if}
                     {#if help}<small>{help}</small>{/if}
                 </label>
@@ -492,13 +494,13 @@
     <fieldset class="sub">
         <legend class="sub-title">{strings.scope}</legend>
         <p class="note"><span>{strings.scopeHelp}</span></p>
-        <p class="check fixed"><span>{strings.library}</span><span class="value">{strings.included}</span></p>
+        <p class="always"><span>{strings.library}</span><span class="value">{strings.included}</span></p>
         <p class="note"><span>{strings.libraryHelp}</span></p>
-        <label class="check"><input type="checkbox" bind:checked={hypa} onchange={resetPrepared} /><span>{strings.hypa}</span></label>
+        <SettingToggle showLabel label={strings.hypa} bind:checked={hypa} onchange={resetPrepared} />
         <p class="note"><span>{strings.hypaHelp}</span></p>
-        <label class="check"><input type="checkbox" bind:checked={localPlugins} onchange={resetPrepared} /><span>{strings.devicePlugins}</span></label>
+        <SettingToggle showLabel label={strings.devicePlugins} bind:checked={localPlugins} onchange={resetPrepared} />
         <p class="note"><span>{strings.devicePluginsHelp}</span></p>
-        <label class="check"><input type="checkbox" bind:checked={localSettings} onchange={resetPrepared} /><span>{strings.deviceSettings}</span></label>
+        <SettingToggle showLabel label={strings.deviceSettings} bind:checked={localSettings} onchange={resetPrepared} />
         <p class="note"><span>{strings.deviceSettingsHelp}</span></p>
     </fieldset>
     {/if}
@@ -506,7 +508,7 @@
 
     {#if prepared}
         <section class="sub">
-            <h4 class="sub-title">{strings.endpointReview}</h4>
+            <h3 class="sub-title">{strings.endpointReview}</h3>
             <dl class="review">
                 <dt>{strings.authority}</dt><dd>{prepared.endpoint.authority}</dd>
                 {#if prepared.endpoint.accountHint}<dt>{strings.account}</dt><dd>{prepared.endpoint.accountHint}</dd>{/if}
@@ -522,14 +524,14 @@
             {/if}
             {#each prepared.endpoint.warnings as warning (warning)}<p class="note"><span>{externalEndpointWarning(strings, warning)}</span></p>{/each}
 
-            <label class="check"><input type="checkbox" bind:checked={endpointConfirmed} /><span>{strings.confirmEndpoint}</span></label>
+            <SettingToggle showLabel label={strings.confirmEndpoint} bind:checked={endpointConfirmed} />
             {#if prepared.requiresPlatformOAuthClient}
-                <label class="field"><span>{googleAndroid ? strings.webOAuthClientId : strings.platformClientId}</span><TextInput fullwidth bind:value={currentPlatformClientId} /></label>
+                <label class="field"><span>{googleAndroid ? strings.webOAuthClientId : strings.platformClientId}</span><TextInput className="disabled:opacity-50" fullwidth bind:value={currentPlatformClientId} /></label>
             {/if}
             {#if endpointConfirmed && prepared.requiresOAuth && googleAndroid}
                 <div class="fields two">
-                    <label class="field"><span>{strings.oauthClientSecret}</span><TextInput fullwidth hideText bind:value={oauthClientSecret} /></label>
-                    {#if pendingAuthorizationId}<label class="field"><span>{strings.manualOAuthCallback}</span><TextInput fullwidth hideText bind:value={manualOAuthCallback} /><small>{strings.manualOAuthHelp}</small></label>{/if}
+                    <label class="field"><span>{strings.oauthClientSecret}</span><TextInput className="disabled:opacity-50" fullwidth hideText bind:value={oauthClientSecret} /></label>
+                    {#if pendingAuthorizationId}<label class="field"><span>{strings.manualOAuthCallback}</span><TextInput className="disabled:opacity-50" fullwidth hideText bind:value={manualOAuthCallback} /><small>{strings.manualOAuthHelp}</small></label>{/if}
                 </div>
             {/if}
             {#if endpointConfirmed && !prepared.requiresOAuth && !fromTransfer}
@@ -539,13 +541,13 @@
                         <label class="field">
                             <span>{fieldLabel(field.key)}</span>
                             {#if field.type === 'select'}
-                                <SelectInput value={values[field.key] ?? field.options?.[0] ?? ''} className="w-full" onchange={event => values[field.key] = event.currentTarget.value}>
+                                <SelectInput value={values[field.key] ?? field.options?.[0] ?? ''} className="w-full disabled:opacity-50" onchange={event => values[field.key] = event.currentTarget.value}>
                                     {#each field.options ?? [] as option (option)}<OptionInput value={option}>{externalOptionLabel(strings, providerId, field.key, option)}</OptionInput>{/each}
                                 </SelectInput>
                             {:else if field.type === 'datetime-local'}
-                                <input type="datetime-local" class="datetime" bind:value={values[field.key]} />
+                                <input type="datetime-local" class="datetime rounded-md border border-darkborderc bg-transparent px-4 py-2 text-textcolor shadow-xs transition-colors duration-200 focus:border-borderc focus:ring-2 focus:ring-borderc focus:outline-hidden disabled:opacity-50" bind:value={values[field.key]} />
                             {:else}
-                                <TextInput fullwidth hideText={field.secret} bind:value={values[field.key]} />
+                                <TextInput className="disabled:opacity-50" fullwidth hideText={field.secret} bind:value={values[field.key]} />
                             {/if}
                             {#if help}<small>{help}</small>{/if}
                         </label>
@@ -554,7 +556,7 @@
             {/if}
             {#if authorizationStatus}<p class="sub-help" role="status">{authorizationStatus}</p>{/if}
             <div class="actions">
-                <SettingButton disabled={busy || !endpointConfirmed || !authorizationAvailable || (prepared.requiresPlatformOAuthClient && !currentPlatformClientId.trim())} onclick={connect}>{connectLabel}</SettingButton>
+                <SettingButton {busy} disabled={!endpointConfirmed || !authorizationAvailable || (prepared.requiresPlatformOAuthClient && !currentPlatformClientId.trim())} onclick={connect}>{connectLabel}</SettingButton>
                 <SettingButton variant="secondary" onclick={resetPrepared}>{strings.back}</SettingButton>
             </div>
             {#if !prepared.requiresOAuth && mode === 'create'}<p class="sub-help">{strings.connectHint}</p>{/if}
@@ -562,13 +564,13 @@
     {:else}
         <section class="sub">
             <div class="actions">
-                <SettingButton disabled={busy || !authorizationAvailable || (mode === 'existing' && !recoveryKey.trim()) || requiredAcks.some(item => !accepted.includes(item))} onclick={prepare}>{strings.prepare}</SettingButton>
+                <SettingButton {busy} disabled={!authorizationAvailable || (mode === 'existing' && !recoveryKey.trim()) || requiredAcks.some(item => !accepted.includes(item))} onclick={prepare}>{strings.prepare}</SettingButton>
                 <SettingButton variant="secondary" onclick={oncancel}>{strings.cancel}</SettingButton>
             </div>
             <p class="sub-help">{strings.pendingVerification}</p>
         </section>
     {/if}
-    {#if error}<p class="px-4 pb-4 text-sm text-danger-400" role="alert">{error}</p>{/if}
+    {#if error}<p class="form-error" role="alert">{error}</p>{/if}
 </fieldset>
 
 <style>
@@ -588,6 +590,12 @@
     .form[data-tone='onboarding'] .sub {
         padding: 0 0 0.75rem;
     }
+    .form[data-tone='onboarding'] .warning {
+        margin: 0 0 0.75rem;
+    }
+    .form[data-tone='onboarding'] .form-error {
+        padding: 0 0 0.75rem;
+    }
     .sub {
         display: grid;
         gap: 0.75rem;
@@ -596,11 +604,9 @@
     }
     .sub-title {
         margin: 0;
-        font-size: 0.75rem;
+        padding: 0;
+        font-size: 0.9375rem;
         font-weight: 600;
-        letter-spacing: 0.04em;
-        text-transform: uppercase;
-        color: color-mix(in srgb, var(--risu-theme-textcolor) 60%, transparent);
     }
     .fields {
         display: grid;
@@ -632,26 +638,27 @@
         line-height: 1.45;
         color: var(--risu-theme-textcolor2);
     }
-    .check {
+    .always {
         display: flex;
-        align-items: flex-start;
-        gap: 0.5rem;
-        font-size: 0.875rem;
-    }
-    .check input {
-        margin-top: 0.2rem;
-    }
-    .check.fixed {
+        flex-wrap: wrap;
+        gap: 0.35rem;
         margin: 0;
-        justify-content: space-between;
-    }
-    .check.fixed .value {
+        font-size: 0.8125rem;
         color: var(--risu-theme-textcolor2);
+    }
+    .always .value {
+        font-weight: 600;
     }
     .actions {
         display: flex;
         flex-wrap: wrap;
         gap: 0.5rem;
+    }
+    .form-error {
+        margin: 0;
+        padding: 0 1rem 1rem;
+        font-size: 0.875rem;
+        color: var(--risu-theme-danger-400);
     }
     .note {
         display: grid;
@@ -671,6 +678,7 @@
     .warning {
         display: grid;
         gap: 0.4rem;
+        margin: 0 1rem 1rem;
         padding: 0.85rem 1rem;
         border: 1px solid color-mix(in srgb, var(--risu-theme-danger-400) 45%, transparent);
         border-left-width: 3px;
@@ -687,18 +695,15 @@
         line-height: 1.45;
         opacity: 0.85;
     }
-    .warning .check {
-        margin-top: 0.15rem;
-    }
     .review {
         display: grid;
         grid-template-columns: minmax(0, 1fr);
         gap: 0.15rem 1.1rem;
         margin: 0;
         padding: 0.85rem 1rem;
-        border: 1px solid rgba(34, 200, 198, 0.35);
-        border-radius: 0.75rem;
-        background: rgba(34, 200, 198, 0.08);
+        border: 1px solid color-mix(in srgb, var(--risu-theme-primary-500) 35%, transparent);
+        border-radius: 0.5rem;
+        background: color-mix(in srgb, var(--risu-theme-primary-500) 8%, transparent);
         font-size: 0.85rem;
     }
     .review dt {
@@ -718,11 +723,6 @@
     .datetime {
         width: 100%;
         min-width: 0;
-        padding: 0.5rem 0.75rem;
-        border: 1px solid var(--risu-theme-darkborderc);
-        border-radius: 0.375rem;
-        background: transparent;
-        color: inherit;
         font: inherit;
     }
     .textarea {

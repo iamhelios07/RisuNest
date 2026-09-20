@@ -19,7 +19,6 @@ vi.mock('./platform', () => ({
     get isTauriMobile() {
         return state.isTauriMobile
     },
-    isNodeServer: false,
 }))
 vi.mock('./storage/platformBlobStore', () => ({
     configureBlobStoreStorageProvider: vi.fn(),
@@ -88,7 +87,6 @@ vi.mock('./storage/persistentSaveNotifications', () => ({
     createPersistentSaveObserverInstallation: () => ({ install: vi.fn() }),
     installPersistentSaveNotifications: vi.fn(),
 }))
-vi.mock('./storage/nodeStorage', () => ({ getNodeServerProxyAuth: vi.fn() }))
 vi.mock('./storage/databasePreparation', () => ({ checkCharOrder: vi.fn() }))
 vi.mock('./storage/risuSave', () => ({ decodeRisuSave: vi.fn() }))
 vi.mock('./storage/defaultPrompts', () => ({

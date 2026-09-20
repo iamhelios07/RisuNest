@@ -1758,6 +1758,7 @@ export const languageKorean = {
         pluginData: {
             title: '플러그인 데이터',
             description: '플러그인이 저장한 값을 관리할 수 있습니다. 데이터를 삭제할 경우 복원이 불가능하니 별도로 백업을 하고 진행하세요.',
+            scopeTitle: '저장 범위',
             scopeAllDevices: '모든 기기',
             scopeThisDevice: '이 기기',
             scopeAllDevicesHelp: '동기화와 백업에 포함됩니다.',
@@ -1960,6 +1961,7 @@ export const languageKorean = {
             discardRegistration: '입력 지우기',
             directoryEnabled: '서버 주소 자동 찾기',
             manualEntry: '직접 입력',
+            endpointPlaceholder: 'https://sync.example.com',
             reviewTitle: '서버 확인',
             reviewLead: '등록 코드에서 읽은 서버 정보입니다. 확인한 뒤 연결하세요.',
             otherCode: '다른 코드',
@@ -2000,6 +2002,13 @@ export const languageKorean = {
                 clean: '필요 없는 임시 파일 정리',
                 more: '이전 백업',
                 refresh: '목록 새로고침',
+                blockedReasons: {
+                    'server-sync-busy': '동기화가 진행 중입니다',
+                    'incomplete-preservation': '이 백업의 보관이 아직 끝나지 않았습니다',
+                    'backup-in-use': '이 백업을 사용 중입니다',
+                    'cache-references-unavailable': '임시 파일을 지금 확인할 수 없습니다',
+                },
+                blockedReasonUnknown: '지금은 사용할 수 없습니다',
                 restoreConfirm:
                     '이 백업으로 되돌릴까요? 지금 라이브러리를 먼저 백업하며, 동기화는 일시 중지 상태로 둡니다.',
                 deleteConfirm: '이 충돌 백업을 이 기기에서 삭제하시겠습니까?',
@@ -2049,7 +2058,6 @@ export const languageKorean = {
             transferRate: '전송 속도',
             progressItems: '처리한 항목',
             pendingChanges: '올릴 변경',
-            progressLabel: '진행',
             elapsed: '경과',
             count: '{0}개',
             itemsCount: '{0}개 항목',
@@ -2085,6 +2093,11 @@ export const languageKorean = {
             storage: '저장 공간',
             sync: '백업 및 동기화',
             pluginData: '플러그인 데이터',
+        },
+        pager: {
+            pages: '페이지',
+            previous: '이전 페이지',
+            next: '다음 페이지',
         },
         perf: {
             title: '성능',
@@ -2438,6 +2451,7 @@ export const languageKorean = {
             resultFailedAfterCommit:
                 '데이터는 가져왔지만 화면을 새로 고치지 못했습니다. 다른 작업을 하기 전에 화면 새로 고침 안내를 따라주세요.',
             errorDetails: '오류 상세',
+            errorDetailsHide: '오류 상세 숨기기',
             copyDetails: '복사',
             copied: '복사됨',
             reasonUnsupportedFormat: '지원하지 않는 파일 형식입니다.',
@@ -2482,7 +2496,6 @@ export const languageKorean = {
             deleteAndExit: '삭제 후 종료',
             confirmReset: '로컬 데이터를 삭제하고 RisuNest를 초기화하시겠습니까?',
             confirmRemoval: '로컬 데이터를 삭제하고 RisuNest 제거를 준비하시겠습니까?',
-            pending: '로컬 데이터 삭제 중',
             failed: '로컬 데이터 삭제를 시작하지 못했습니다. 다시 시도해주세요.',
         },
         platform: {
@@ -2597,6 +2610,7 @@ export const languageKorean = {
                 stepPaste:
                     '코드를 아래에 붙여넣습니다. 모바일에서는 QR 코드를 스캔할 수 있습니다.',
                 stepReview: '서버 정보를 확인한 뒤 연결합니다.',
+                unsupported: '동기화 서버 연결은 Android 및 데스크톱 앱에서 사용할 수 있습니다.',
                 linkHint: '등록 링크를 열어도 여기로 이어집니다.',
                 reviewLead: '등록 코드에서 읽은 서버 정보입니다. 확인한 뒤 연결해주세요.',
                 serverTag: '동기화 서버',
