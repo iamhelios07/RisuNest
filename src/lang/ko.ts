@@ -1869,9 +1869,11 @@ export const languageKorean = {
             capturing: '종료할 때 게시할 저장 리비전을 고정하고 있습니다.',
             syncing: '앱을 닫기 전에 저장된 변경사항을 게시하고 있습니다.',
             delayed: '동기화가 평소보다 오래 걸리고 있습니다. 사용자가 선택할 때까지 앱을 열어 둡니다.',
-            blocked: '동기화를 마치려면 확인이 필요합니다. 계속 기다리거나, 동기화하지 않고 종료하거나, 앱으로 돌아갈 수 있습니다.',
+            blocked: '동기화를 마치려면 확인이 필요합니다. 다시 시도하거나, 동기화하지 않고 종료하거나, 앱으로 돌아갈 수 있습니다.',
             saveFailed: '로컬 변경사항을 저장하지 못했습니다. 다시 저장하거나, 저장하지 않고 종료하거나, 앱으로 돌아갈 수 있습니다.',
             keepWaiting: '계속 기다리기',
+            retrySync: '다시 시도',
+            syncFailedTitle: '동기화 실패',
             retrySaving: '다시 저장',
             exitWithoutSync: '동기화하지 않고 종료',
             exitWithoutSaving: '저장하지 않고 종료',
@@ -2063,7 +2065,7 @@ export const languageKorean = {
             itemsCount: '{0}개 항목',
             progress: {
                 saving: '이 기기의 변경 저장 중',
-                preparing: '서버에서 변경 내용 받는 중',
+                preparing: '이 기기와 서버의 변경 내용 비교 중',
                 applying: '받은 내용 적용 중',
                 refreshing: '화면에 반영하는 중',
                 publishing: '이 기기의 변경 서버에 올리는 중',
@@ -2081,8 +2083,9 @@ export const languageKorean = {
                 '이 기기와 서버에서 같은 항목을 고쳤습니다. 어느 쪽을 남길지 고르세요. 적용하기 전에 양쪽 내용을 충돌 백업으로 남깁니다.',
             keepLocal: '이 기기 내용 유지',
             keepRemote: '서버 내용 유지',
+            busyHelp: '다른 작업이 라이브러리를 사용하고 있습니다. 작업이 끝난 후 다시 시도하세요.',
             errorHelp:
-                '동기화를 마치지 못했습니다. 이 기기에서 고친 내용은 그대로 있습니다. 인터넷 연결을 확인하고 다시 시도하세요.',
+                '동기화를 마치지 못했습니다. 이 기기에서 고친 내용은 그대로 있습니다. 다시 시도하세요.',
             refreshHelp:
                 '받은 변경 사항은 저장되었습니다. 화면을 새로고침하면 편집을 계속할 수 있습니다.',
         },

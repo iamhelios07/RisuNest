@@ -39,11 +39,13 @@ describe("connecting a sync server", () => {
   it("binds, stores the asset policy, then runs the first sync in that order", async () => {
     const trace: string[] = [];
     const controller = {
-      bind: vi.fn(async () => {
+      bind: vi.fn(async (_config: unknown, prepare?: () => Promise<unknown>) => {
         trace.push("bind");
+      await prepare?.();
       }),
-      reregister: vi.fn(async () => {
+      reregister: vi.fn(async (_config: unknown, prepare?: () => Promise<unknown>) => {
         trace.push("reregister");
+      await prepare?.();
       }),
       synchronize: vi.fn(async () => {
         trace.push("synchronize");
@@ -54,12 +56,12 @@ describe("connecting a sync server", () => {
     });
     await connectServerSync(controller, setPolicy, { config, residency: "remote" });
     expect(trace).toEqual(["bind", "policy:remote", "synchronize"]);
-    expect(controller.bind).toHaveBeenCalledWith(config);
+    expect(controller.bind).toHaveBeenCalledWith(config, expect.any(Function));
   });
   it("re-registers instead of binding when replacing the device credentials", async () => {
     const controller = {
-      bind: vi.fn(async () => {}),
-      reregister: vi.fn(async () => {}),
+      bind: vi.fn(async (_config: unknown, prepare?: () => Promise<unknown>) => { await prepare?.(); }),
+      reregister: vi.fn(async (_config: unknown, prepare?: () => Promise<unknown>) => { await prepare?.(); }),
       synchronize: vi.fn(async () => {}),
     };
     await connectServerSync(controller, async () => {}, {
@@ -67,16 +69,16 @@ describe("connecting a sync server", () => {
       residency: "full",
       replacing: true,
     });
-    expect(controller.reregister).toHaveBeenCalledWith(config);
+    expect(controller.reregister).toHaveBeenCalledWith(config, expect.any(Function));
     expect(controller.bind).not.toHaveBeenCalled();
     expect(controller.synchronize).toHaveBeenCalledOnce();
   });
   it("does not sync when binding fails", async () => {
     const controller = {
-      bind: vi.fn(async () => {
+      bind: vi.fn(async (_config: unknown, prepare?: () => Promise<unknown>) => {
         throw { code: "unauthorized" };
       }),
-      reregister: vi.fn(async () => {}),
+      reregister: vi.fn(async (_config: unknown, prepare?: () => Promise<unknown>) => { await prepare?.(); }),
       synchronize: vi.fn(async () => {}),
     };
     const setPolicy = vi.fn(async () => {});
@@ -150,6 +152,7 @@ describe("status and error copy", () => {
       text.credentialUnavailable,
     );
     expect(serverSyncErrorHelp("server-unreachable", text)).toBe(text.errorHelp);
+    expect(serverSyncErrorHelp("library-operation-busy", text)).toBe(text.busyHelp);
   });
   it("shows the address without its scheme", () => {
     expect(serverSyncHostLabel("https://sync.example/base/")).toBe(

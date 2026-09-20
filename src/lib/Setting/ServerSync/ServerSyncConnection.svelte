@@ -66,7 +66,8 @@
       pausing ||
       disconnecting ||
       snapshot.running ||
-      snapshot.replacing,
+      snapshot.replacing ||
+      snapshot.connecting,
   );
   const status = $derived(serverSyncStatus(snapshot, text, actionError));
   const progress = $derived(
@@ -116,7 +117,10 @@
     if (!snapshot.running) void loadSummaries();
   });
   onMount(() => {
+    let attemptId = snapshot.attemptId;
     const unsubscribe = controller.subscribe((value) => {
+      if (value.running && value.attemptId !== attemptId) actionError = "";
+      attemptId = value.attemptId;
       snapshot = value;
     });
     // Startup owns initialization; mounting a view must preserve its attempt.

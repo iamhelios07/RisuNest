@@ -67,6 +67,7 @@ export function createServerSyncScheduler(
     previous = { ...state };
     if (state.running && !before.running) {
       clear();
+      localSince = localDue = hintDue = undefined;
       if (!automatic) failures = 0;
     } else if (!state.running && before.running) {
       completed(state);
@@ -76,6 +77,7 @@ export function createServerSyncScheduler(
       !state.running &&
       ((!before.status?.configured && state.status?.configured) ||
         (before.paused && !state.paused) ||
+        (before.connecting && !state.connecting) ||
         (before.error && !state.error))
     ) {
       failures = 0;
