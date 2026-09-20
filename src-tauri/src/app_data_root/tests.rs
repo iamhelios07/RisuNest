@@ -135,7 +135,7 @@ fn resolved_root_does_not_allow_asset_directory_redirection() {
     let cas = PayloadCas::new(&root).unwrap();
     let sentinel = outside.path().join("sentinel");
     fs::write(&sentinel, b"untouched").unwrap();
-    link_directory(outside.path(), &root.join("assets-v2"));
+    link_directory(outside.path(), &root.join("assets"));
     assert_eq!(
         cas.prepare_bytes(b"new asset").unwrap_err().kind(),
         ErrorKind::InvalidData

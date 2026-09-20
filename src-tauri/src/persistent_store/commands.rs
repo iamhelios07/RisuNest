@@ -12,7 +12,7 @@ use super::kei::KeiUploadResult;
 use super::content_change_index::{ContentChangeWindow, ContentKey};
 use super::{
     AssetAlias, AssetAliasListQuery, AssetAliasPage, AssetOwnerHead, AssetOwnerLocator,
-    AssetRepositoryAuthorityState, AssignedPluginStorage, CharacterPage, CharacterQuery,
+    AssignedPluginStorage, CharacterPage, CharacterQuery,
     CharacterSummary, CheckpointMode, ClaimedPluginValue, ConversationPage, ConversationQuery,
     ConversationWindow, ConversationWindowQuery, LeaseResult, PersistentStorageStats,
     PersistentStore, PluginStorageCatalog, PluginStorageListItem, PresetCatalog, RevisionResult,
@@ -674,16 +674,6 @@ pub(crate) fn pds_list_asset_aliases(
 }
 
 #[tauri::command(async)]
-pub(crate) fn pds_read_asset_repository_authority(
-    state: State<'_, PersistentStoreState>,
-    lease: Option<String>,
-) -> Result<Versioned<AssetRepositoryAuthorityState>, StoreError> {
-    with_store(state, |store| {
-        store.read_asset_repository_authority(lease.as_deref())
-    })
-}
-
-#[tauri::command(async)]
 pub(crate) fn pds_read_asset_owner_head(
     state: State<'_, PersistentStoreState>,
     owner: AssetOwnerLocator,
@@ -847,17 +837,6 @@ pub(crate) fn pds_replace_put_asset_owner_heads(
 ) -> Result<(), StoreError> {
     with_store_mut(state, |store| {
         store.replace_put_asset_owner_heads(&staging_id, &heads)
-    })
-}
-
-#[tauri::command(async)]
-pub(crate) fn pds_replace_put_asset_repository_authority(
-    state: State<'_, PersistentStoreState>,
-    staging_id: String,
-    authority: AssetRepositoryAuthorityState,
-) -> Result<(), StoreError> {
-    with_store_mut(state, |store| {
-        store.replace_put_asset_repository_authority(&staging_id, &authority)
     })
 }
 
@@ -2166,7 +2145,7 @@ mod tests {
             .expect("leave released journal fixture");
         let released_journal = directory
             .path()
-            .join("assets-v2/job-pins/job-preview-released-job.journal");
+            .join("assets/job-pins/job-preview-released-job.journal");
         assert!(released_journal.is_file());
         let expected_bytes = prepared
             .iter()

@@ -262,7 +262,7 @@ fn cancellation_during_cas_copy_does_not_publish_partial_payload() {
     assert!(matches!(result, Err(error) if error.code == "cancelled"));
     assert_eq!(cas.stat_object(&hash).unwrap(), None);
     assert_eq!(
-        std::fs::read_dir(root.path().join("assets-v2/staging"))
+        std::fs::read_dir(root.path().join("assets/staging"))
             .unwrap()
             .count(),
         0

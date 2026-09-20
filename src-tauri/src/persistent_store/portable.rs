@@ -113,11 +113,6 @@ pub(crate) const TABLES: &[PortableTable] = &[
         ],
         order: "owner_kind, owner_locator",
     },
-    PortableTable {
-        name: "asset_repository_authority",
-        columns: &[("value", "TEXT")],
-        order: "value",
-    },
 ];
 
 impl PortableTable {
