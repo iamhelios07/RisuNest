@@ -53,6 +53,7 @@ dist.zip
 !/scripts/phase3AndroidSmoke.mjs
 !/scripts/phase3AndroidSmoke.test.ts
 !/scripts/realmBlocklist.mjs
+!/scripts/prepareAndroidGenerated.mjs
 !/scripts/compatibleExport*.mjs
 !/scripts/linux-native-tests.sh
 !/scripts/linux-package-smoke.py
