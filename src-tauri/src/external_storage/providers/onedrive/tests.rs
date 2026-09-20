@@ -655,7 +655,6 @@ fn reading_follows_the_download_redirect_to_another_origin_without_authorization
         let download_records = download.requests.lock().unwrap();
         assert_eq!(download_records.len(), 1);
         assert!(!head(&download_records[0]).contains("authorization"));
-
     });
 }
 
@@ -692,8 +691,7 @@ fn resume_create_reconciles_only_missing_folders_and_refuses_ambiguous_layouts()
         let records = server.requests.lock().unwrap();
         assert_eq!(
             records.len(),
-            2 + config::REPOSITORY_FOLDERS.len() - present.len()
-                + config::REPOSITORY_FOLDERS.len()
+            2 + config::REPOSITORY_FOLDERS.len() - present.len() + config::REPOSITORY_FOLDERS.len()
         );
         assert!(line(&records[1]).contains("/children?$top=1000"));
         let created_end = 2 + config::REPOSITORY_FOLDERS.len() - present.len();
@@ -1706,10 +1704,9 @@ fn the_authorization_policy_requests_the_scopes_of_its_account_type() {
         authorization_policy(&config, "android").unwrap().client_id,
         "android-client"
     );
-    config.location.insert(
-        "redirectUri".to_owned(),
-        IOS_REDIRECT_URI.to_owned(),
-    );
+    config
+        .location
+        .insert("redirectUri".to_owned(), IOS_REDIRECT_URI.to_owned());
     config
         .oauth_profile
         .as_mut()
@@ -1792,6 +1789,7 @@ fn redeeming_an_authorization_code_stores_the_first_token_document() {
             )),
             client_id: "platform-client".to_owned(),
             redirect_url: url::Url::parse("risunest://oauth/callback").unwrap(),
+            picked_file_id: None,
         };
         let stored = connector
             .exchange_authorization_code(&config, &grant, &cancel)
@@ -1861,6 +1859,7 @@ fn a_rejected_authorization_code_preserves_the_oauth_error_details() {
             )),
             client_id: "platform-client".to_owned(),
             redirect_url: url::Url::parse("risunest://oauth/callback").unwrap(),
+            picked_file_id: None,
         };
 
         let error = match connector
@@ -1883,6 +1882,104 @@ fn a_rejected_authorization_code_preserves_the_oauth_error_details() {
 }
 
 #[test]
+fn setup_resolves_drive_lists_folders_and_creates_the_requested_folder() {
+    runtime().block_on(async {
+        let server = WireServer::start(vec![
+            json(200, "{\"id\":\"drive-setup\"}"),
+            json(
+                200,
+                "{\"id\":\"root-setup\",\"name\":\"Root\",\"folder\":{}}",
+            ),
+            json(
+                200,
+                "{\"value\":[{\"id\":\"folder-docs\",\"name\":\"Documents\",\"folder\":{},\"parentReference\":{\"driveId\":\"drive-setup\"}},{\"id\":\"file-ignored\",\"name\":\"note.txt\",\"file\":{}}]}",
+            ),
+            json(
+                201,
+                "{\"id\":\"folder-backups\",\"name\":\"Backups\",\"folder\":{},\"parentReference\":{\"driveId\":\"drive-setup\"}}",
+            ),
+            json(409, "{}"),
+        ]);
+        let test = harness(NOW_MS);
+        let provider = OneDrive::new(test.dependencies);
+        let cancel = Cancellation::default();
+        let config = config_for(&server, "personal");
+
+        let drive = provider
+            .resolve_setup_drive(&config, &secret(), "account-1", &cancel)
+            .await
+            .unwrap();
+        assert_eq!(drive.drive_id, "drive-setup");
+        assert_eq!(drive.root_item_id, "root-setup");
+
+        let page = provider
+            .list_setup_folders(
+                &config,
+                &secret(),
+                "account-1",
+                &drive.drive_id,
+                &drive.root_item_id,
+                None,
+                &cancel,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.folders.len(), 1);
+        assert_eq!(page.folders[0].id, "folder-docs");
+        assert_eq!(page.folders[0].name, "Documents");
+        assert!(page.next_cursor.is_none());
+
+        let created = provider
+            .create_setup_folder(
+                &config,
+                &secret(),
+                "account-1",
+                &drive.drive_id,
+                &drive.root_item_id,
+                "Backups",
+                &cancel,
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.id, "folder-backups");
+        assert_eq!(created.name, "Backups");
+
+        let conflict = match provider
+            .create_setup_folder(
+                &config,
+                &secret(),
+                "account-1",
+                &drive.drive_id,
+                &drive.root_item_id,
+                "Backups",
+                &cancel,
+            )
+            .await
+        {
+            Ok(_) => panic!("a same-name OneDrive folder must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(conflict.kind, ErrorKind::FolderNameConflict);
+
+        let records = server.requests.lock().unwrap();
+        assert!(line(&records[0]).starts_with("GET /synthetic/me/drive?"));
+        assert!(line(&records[1]).starts_with("GET /synthetic/drives/drive-setup/root?"));
+        assert!(line(&records[2]).contains("/items/root-setup/children?"));
+        assert_eq!(
+            line(&records[3]),
+            "POST /synthetic/drives/drive-setup/items/root-setup/children HTTP/1.1"
+        );
+        let body = String::from_utf8(records[3].body.clone()).unwrap();
+        assert!(body.contains("\"name\":\"Backups\""));
+        assert!(body.contains("\"@microsoft.graph.conflictBehavior\":\"fail\""));
+        assert_eq!(
+            line(&records[4]),
+            "POST /synthetic/drives/drive-setup/items/root-setup/children HTTP/1.1"
+        );
+    });
+}
+
+#[test]
 fn deleting_addresses_one_member_path_and_refuses_the_head_and_descriptors() {
     runtime().block_on(async {
         let mut replies = existing_open();
@@ -1892,10 +1989,14 @@ fn deleting_addresses_one_member_path_and_refuses_the_head_and_descriptors() {
         let test = harness(NOW_MS);
         let provider = super::create(test.dependencies.clone()).unwrap();
         let cancel = Cancellation::default();
-        let (repository, capabilities) =
-            open(&provider, &config_for(&server, "personal"), OpenMode::Existing, &cancel)
-                .await
-                .unwrap();
+        let (repository, capabilities) = open(
+            &provider,
+            &config_for(&server, "personal"),
+            OpenMode::Existing,
+            &cancel,
+        )
+        .await
+        .unwrap();
         assert!(capabilities.require_cleanup().is_ok());
 
         let target = locator_for(&repository, "packs/pack-1");

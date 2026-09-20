@@ -401,6 +401,9 @@ pub(crate) fn authorization_policy(
         client_id: settings.client_id,
         redirect_url,
         scopes: settings.scopes,
+        picker: config.location.get("space").map(String::as_str) != Some(config::APP_DATA_FOLDER)
+            && !config.location.contains_key("folderId")
+            && !config.location.contains_key("folderName"),
     })
 }
 
@@ -429,6 +432,9 @@ pub(crate) fn ios_authorization_policy(
         client_id: settings.client_id,
         redirect_url,
         scopes: settings.scopes,
+        picker: config.location.get("space").map(String::as_str) != Some(config::APP_DATA_FOLDER)
+            && !config.location.contains_key("folderId")
+            && !config.location.contains_key("folderName"),
     };
     Ok((policy, callback_scheme))
 }
@@ -454,6 +460,9 @@ pub(crate) fn android_web_authorization_policy(
             .android_web_redirect
             .ok_or_else(config::unsupported)?,
         scopes: settings.scopes,
+        picker: config.location.get("space").map(String::as_str) != Some(config::APP_DATA_FOLDER)
+            && !config.location.contains_key("folderId")
+            && !config.location.contains_key("folderName"),
     })
 }
 

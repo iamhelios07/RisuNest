@@ -79,6 +79,11 @@ fn provider_error(error: crate::external_storage::contract::ProviderError) -> Na
         ErrorKind::FileTooLarge => "file-too-large",
         ErrorKind::Unsupported => "capability-unavailable",
         ErrorKind::Transient => "transport-failed",
+        ErrorKind::FolderNameConflict
+        | ErrorKind::FolderCreateFailed
+        | ErrorKind::FolderInaccessible
+        | ErrorKind::FolderNotRepository => "source-unavailable",
+        ErrorKind::FolderUnsupportedLocation => "capability-unavailable",
     };
     NativeJobError::new(code, "Conflict source operation failed")
 }

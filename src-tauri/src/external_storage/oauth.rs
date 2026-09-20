@@ -36,10 +36,10 @@ impl IosWebAuthenticationAuthorization {
         }
         let (pending, mut authorization_url) = PendingAuthorization::start(policy)?;
         if offline_access {
-            authorization_url
-                .query_pairs_mut()
-                .append_pair("access_type", "offline")
-                .append_pair("prompt", "consent");
+            let has_prompt = authorization_url.query_pairs().any(|(name, _)| name == "prompt");
+            let mut query = authorization_url.query_pairs_mut();
+            query.append_pair("access_type", "offline");
+            if !has_prompt { query.append_pair("prompt", "consent"); }
         }
         Ok(Self {
             pending,
@@ -563,10 +563,10 @@ fn start_android_redirect(
     }
     let (pending, mut authorization_url) = PendingAuthorization::start(policy)?;
     if offline_access {
-        authorization_url
-            .query_pairs_mut()
-            .append_pair("access_type", "offline")
-            .append_pair("prompt", "consent");
+        let has_prompt = authorization_url.query_pairs().any(|(name, _)| name == "prompt");
+        let mut query = authorization_url.query_pairs_mut();
+        query.append_pair("access_type", "offline");
+        if !has_prompt { query.append_pair("prompt", "consent"); }
     }
     let states = authorization_url
         .query_pairs()
@@ -605,6 +605,7 @@ mod tests {
             client_id: "synthetic-public-client".into(),
             redirect_url,
             scopes: vec!["synthetic.scope".into()],
+            picker: false,
         })
     }
 

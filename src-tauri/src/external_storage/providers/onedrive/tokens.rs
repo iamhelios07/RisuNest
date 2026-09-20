@@ -279,5 +279,6 @@ pub(super) fn authorization_policy(
             .iter()
             .map(|scope| (*scope).to_owned())
             .collect(),
+        picker: false,
     })
 }

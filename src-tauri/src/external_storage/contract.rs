@@ -29,6 +29,11 @@ pub(crate) enum ErrorKind {
     Transient,
     Unsupported,
     Cancelled,
+    FolderNameConflict,
+    FolderCreateFailed,
+    FolderInaccessible,
+    FolderNotRepository,
+    FolderUnsupportedLocation,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
