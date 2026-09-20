@@ -57,6 +57,9 @@ jobs:
       - name: Run tests
         run: pnpm test
 
+      - run: pnpm exec playwright install --with-deps chromium
+      - run: pnpm test:browser:agent
+
       - uses: ./.github/actions/test-references
       - name: Run Node contracts
         run: pnpm test:node

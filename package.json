@@ -36,7 +36,8 @@
     "test:protocol": "node scripts/testNative.mjs protocol",
     "test:wasm": "pwsh -NoProfile -File scripts/testExternalStorageCore.ps1 -CoreOnly",
     "test:native": "node scripts/testNative.mjs host",
-    "test:full:shared": "pnpm check:test-inventory && pnpm test && pnpm test:node && pnpm test:manager && pnpm test:registry && pnpm test:protocol && pnpm test:wasm",
+    "test:browser:agent": "playwright test --config tests/browser/playwright.config.ts",
+    "test:full:shared": "pnpm check:test-inventory && pnpm test && pnpm test:node && pnpm test:manager && pnpm test:registry && pnpm test:protocol && pnpm test:wasm && pnpm test:browser:agent",
     "test:full": "pnpm test:full:shared && pnpm test:native",
     "check:test-inventory": "node tests/testInventory.mjs",
     "test:release": "node --test tests/release/*.node-test.mjs",
@@ -148,6 +149,7 @@
   },
   "devDependencies": {
     "@eslint-community/regexpp": "4.12.2",
+    "@playwright/test": "1.63.0",
     "@rollup/plugin-strip": "^3.0.4",
     "@sveltejs/vite-plugin-svelte": "^7.0.0",
     "@swc/core": "1.5.7",
