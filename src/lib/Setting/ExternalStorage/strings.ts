@@ -35,6 +35,16 @@ const english = {
     acknowledge: 'I understand',
     endpointReview: 'Where this connects', authority: 'Server', account: 'Account', repository: 'Repository location', purposeReview: 'Purpose', includes: 'includes {0}',
     confirmEndpoint: 'This server and folder are correct', connect: 'Connect', signIn: 'Sign in', finishSignIn: 'Finish sign-in',
+    folder: 'Folder', selectFolder: 'Select folder', selectFolderAgain: 'Select again', selectingFolder: 'Selecting folder',
+    selectThisFolder: 'Select this folder', currentFolder: 'Current folder', close: 'Close',
+    noSubfolders: 'This folder has no subfolders.',
+    folderSelectHelp: 'The repository folder is selected after signing in, in the next step.',
+    folderNameRequired: 'Enter a folder name.',
+    folderNameConflict: 'A folder with this name already exists. Enter another name.',
+    folderCreateFailed: 'Could not create the folder. Try again.',
+    folderInaccessible: 'The selected folder cannot be opened. Select the folder again.',
+    folderNotRepository: 'The selected folder holds no RisuNest repository.',
+    folderUnsupportedLocation: 'This location is not supported. Select a folder in My Drive.',
     connectHint: 'Connect contacts the server, creates the folder and then shows your recovery key.',
     recoveryCode: 'Recovery key',
     connectionSettings: 'Connection settings',
@@ -126,13 +136,15 @@ const english = {
     fields: {
         'webdav.accountId': 'User name', 'webdav.root': 'Folder name', 'webdav.password': 'Application password',
         's3.bucket': 'Bucket', 's3.prefix': 'Folder', 's3.region': 'Region', 's3.addressing': 'Addressing', 's3.accessKeyId': 'Access key ID', 's3.secretAccessKey': 'Secret access key',
-        'google_drive.folderId': 'Folder ID', 'google_drive.space': 'Storage location', 'google_drive.oauthRedirectUri': 'Sign-in completion address (HTTPS)', 'google_drive.projectId': 'OAuth project ID', 'google_drive.clientId': 'OAuth client ID for this device',
-        'onedrive.accountType': 'Account type', 'onedrive.tenant': 'Tenant', 'onedrive.driveId': 'Drive ID', 'onedrive.rootItemId': 'Folder item ID', 'onedrive.redirectUri': 'Sign-in completion address', 'onedrive.projectId': 'App client ID', 'onedrive.clientId': 'Client ID for this device',
+        'google_drive.folderName': 'Folder name', 'google_drive.space': 'Storage location', 'google_drive.oauthRedirectUri': 'Sign-in completion address (HTTPS)', 'google_drive.projectId': 'OAuth project ID', 'google_drive.clientId': 'OAuth client ID for this device',
+        'onedrive.accountType': 'Account type', 'onedrive.folderName': 'Folder name', 'onedrive.tenant': 'Tenant', 'onedrive.redirectUri': 'Sign-in completion address', 'onedrive.projectId': 'App client ID', 'onedrive.clientId': 'Client ID for this device',
         'mybox.rootFolderName': 'Folder name', 'mybox.rootFolderId': 'Existing folder ID', 'mybox.pat': 'Personal access token', 'mybox.expiresAtMs': 'Token expiry',
         'github_releases.uploadEndpoint': 'Upload address', 'github_releases.owner': 'Owner', 'github_releases.repo': 'Private repository name', 'github_releases.tagPrefix': 'Tag prefix', 'github_releases.token': 'Personal access token (fine-grained)',
         'gitlab_packages.projectId': 'Project ID or path', 'gitlab_packages.packageName': 'Package name', 'gitlab_packages.maxFileBytes': 'Maximum file size (bytes)', 'gitlab_packages.token': 'Access token',
     },
     fieldHelp: {
+        'google_drive.folderName': 'After you sign in, a new folder with this name is created and the repository is created inside it.',
+        'onedrive.folderName': 'After you sign in, a new folder with this name is created and the repository is created inside it.',
         'webdav.root': 'The repository is created inside this folder. Do not keep other files in it.',
         'webdav.password': 'An application password created in the service settings, not your account password.',
         'github_releases.token': 'Needs read and write access to the contents of the backup repository.',
@@ -180,6 +192,16 @@ const korean: typeof english = {
     acknowledge: '확인했습니다',
     endpointReview: '연결할 곳', authority: '서버', account: '계정', repository: '저장소 위치', purposeReview: '용도', includes: '{0} 포함',
     confirmEndpoint: '이 서버와 폴더가 맞습니다', connect: '연결', signIn: '로그인', finishSignIn: '로그인 완료',
+    folder: '폴더', selectFolder: '폴더 선택', selectFolderAgain: '다시 선택', selectingFolder: '폴더 선택 중',
+    selectThisFolder: '이 폴더 선택', currentFolder: '현재 폴더', close: '닫기',
+    noSubfolders: '하위 폴더가 없습니다.',
+    folderSelectHelp: '저장소 폴더는 다음 단계에서 로그인한 뒤 선택합니다.',
+    folderNameRequired: '폴더 이름을 입력하세요.',
+    folderNameConflict: '같은 이름의 폴더가 있습니다. 다른 이름을 입력하세요.',
+    folderCreateFailed: '폴더를 만들지 못했습니다. 다시 시도하세요.',
+    folderInaccessible: '선택한 폴더에 접근할 수 없습니다. 폴더를 다시 선택하세요.',
+    folderNotRepository: '선택한 폴더에 RisuNest 저장소가 없습니다.',
+    folderUnsupportedLocation: '이 위치는 지원되지 않습니다. 내 드라이브의 폴더를 선택하세요.',
     connectHint: '연결을 누르면 서버에 접속해 폴더를 만들고 복구 키를 보여드립니다.',
     recoveryCode: '복구 키',
     connectionSettings: '연결 설정',
@@ -271,13 +293,15 @@ const korean: typeof english = {
     fields: {
         'webdav.accountId': '사용자 이름', 'webdav.root': '폴더 이름', 'webdav.password': '앱 비밀번호',
         's3.bucket': '버킷', 's3.prefix': '폴더', 's3.region': '리전', 's3.addressing': '주소 방식', 's3.accessKeyId': '액세스 키 ID', 's3.secretAccessKey': '시크릿 액세스 키',
-        'google_drive.folderId': '폴더 ID', 'google_drive.space': '저장 위치', 'google_drive.oauthRedirectUri': '로그인 완료 주소 (HTTPS)', 'google_drive.projectId': 'OAuth 프로젝트 ID', 'google_drive.clientId': '이 기기용 OAuth 클라이언트 ID',
-        'onedrive.accountType': '계정 종류', 'onedrive.tenant': '테넌트', 'onedrive.driveId': '드라이브 ID', 'onedrive.rootItemId': '폴더 항목 ID', 'onedrive.redirectUri': '로그인 완료 주소', 'onedrive.projectId': '앱 클라이언트 ID', 'onedrive.clientId': '이 기기용 클라이언트 ID',
+        'google_drive.folderName': '폴더 이름', 'google_drive.space': '저장 위치', 'google_drive.oauthRedirectUri': '로그인 완료 주소 (HTTPS)', 'google_drive.projectId': 'OAuth 프로젝트 ID', 'google_drive.clientId': '이 기기용 OAuth 클라이언트 ID',
+        'onedrive.accountType': '계정 종류', 'onedrive.folderName': '폴더 이름', 'onedrive.tenant': '테넌트', 'onedrive.redirectUri': '로그인 완료 주소', 'onedrive.projectId': '앱 클라이언트 ID', 'onedrive.clientId': '이 기기용 클라이언트 ID',
         'mybox.rootFolderName': '폴더 이름', 'mybox.rootFolderId': '기존 폴더 ID', 'mybox.pat': '개인 액세스 토큰', 'mybox.expiresAtMs': '토큰 만료 시각',
         'github_releases.uploadEndpoint': '업로드 주소', 'github_releases.owner': '소유자', 'github_releases.repo': '비공개 저장소 이름', 'github_releases.tagPrefix': '태그 접두어', 'github_releases.token': '개인 액세스 토큰 (fine-grained)',
         'gitlab_packages.projectId': '프로젝트 ID 또는 경로', 'gitlab_packages.packageName': '패키지 이름', 'gitlab_packages.maxFileBytes': '파일 최대 크기 (바이트)', 'gitlab_packages.token': '액세스 토큰',
     },
     fieldHelp: {
+        'google_drive.folderName': '로그인한 뒤 이 이름의 새 폴더를 만들고 그 안에 저장소를 만듭니다.',
+        'onedrive.folderName': '로그인한 뒤 이 이름의 새 폴더를 만들고 그 안에 저장소를 만듭니다.',
         'webdav.root': '이 폴더 안에 저장소를 만듭니다. 다른 파일과 함께 두지 마세요.',
         'webdav.password': '서비스 설정에서 만든 앱 비밀번호입니다. 계정 비밀번호가 아닙니다.',
         'github_releases.token': '백업 저장소의 콘텐츠 읽기·쓰기 권한이 필요합니다.',
@@ -328,11 +352,19 @@ export function externalEndpointWarning(strings: ExternalStorageStrings, code: s
 }
 
 /** Native failure kind of a rejected command (`kind`) or of a job error DTO (`code`). */
-function externalErrorKind(value: unknown): string | undefined {
+export function externalErrorKind(value: unknown): string | undefined {
     if (typeof value !== 'object' || value === null) return undefined
     const carrier = value as { kind?: unknown; code?: unknown }
     const kind = typeof carrier.kind === 'string' ? carrier.kind : carrier.code
     return typeof kind === 'string' ? kind : undefined
+}
+
+const folderErrorKinds = ['folderInaccessible', 'folderNotRepository', 'folderUnsupportedLocation'] as const
+
+/** Whether a native failure concerns the selected folder rather than the connection as a whole. */
+export function externalFolderErrorKind(value: unknown): boolean {
+    const kind = externalErrorKind(value)
+    return kind !== undefined && (folderErrorKinds as readonly string[]).includes(kind)
 }
 
 /** Sentence for a failure the native side reported. */
@@ -356,6 +388,11 @@ export function externalErrorMessage(
         ? strings.oauthErrorDescription.replace('{0}', oauthErrorDescription)
         : ''
     switch (kind) {
+        case 'folderNameConflict': return strings.folderNameConflict
+        case 'folderCreateFailed': return strings.folderCreateFailed
+        case 'folderInaccessible': return strings.folderInaccessible
+        case 'folderNotRepository': return strings.folderNotRepository
+        case 'folderUnsupportedLocation': return strings.folderUnsupportedLocation
         case 'alreadyConnected': return strings.connectionAlreadyAdded
         case 'unauthorized': return strings.credentialsRejected
         case 'reauthRequired': return [strings.reauthenticate, oauthSuffix, oauthDescriptionSuffix]

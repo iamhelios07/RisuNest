@@ -1,11 +1,12 @@
 <script lang="ts">
-    import { onDestroy, onMount } from 'svelte'
+    import { onDestroy, onMount, tick } from 'svelte'
     import TextInput from 'src/lib/UI/GUI/TextInput.svelte'
     import SelectInput from 'src/lib/UI/GUI/SelectInput.svelte'
     import OptionInput from 'src/lib/UI/GUI/OptionInput.svelte'
     import SegmentedButtons from '../RisuNest/SegmentedButtons.svelte'
     import SettingButton from '../RisuNest/SettingButton.svelte'
     import SettingToggle from '../RisuNest/SettingToggle.svelte'
+    import ExternalFolderSelector from './ExternalFolderSelector.svelte'
     import { openUrl } from '@tauri-apps/plugin-opener'
     import { type as osType } from '@tauri-apps/plugin-os'
     import { isTauriAndroid, isTauriIOS } from 'src/ts/platform'
@@ -27,10 +28,13 @@
         ExternalProviderId,
         ExternalProviderDescriptor,
         PreparedExternalConnection,
+        ExternalFolderSelection,
     } from 'src/ts/storage/sync/external/types'
     import {
         externalEndpointWarning,
         externalErrorMessage,
+        externalErrorKind,
+        externalFolderErrorKind,
         externalFieldHelp,
         externalFieldLabel,
         externalOptionLabel,
@@ -58,6 +62,7 @@
         tone = 'settings',
     }: Props = $props()
     const bridge = getExternalStorageBridge()
+    const FOLDER_NAME_ID = 'external-storage-folder-name'
     const platform = isTauriAndroid
         ? 'android'
         : isTauriIOS
@@ -69,7 +74,7 @@
     let fromTransfer = $state(false)
     let purpose = $state<ExternalConnectionPurpose>('backup')
     let values = $state<Record<string, string>>({
-        space: 'drive', accountType: 'personal', tenant: 'common',
+        space: 'drive', accountType: 'personal', tenant: 'common', folderName: 'RisuNest',
         ...(isTauriAndroid ? {
             oauthRedirectUri: 'https://update.rsyumi.workers.dev/oauth/google-drive-callback',
         } : {}),
@@ -94,14 +99,39 @@
     let authorizationCompletionInFlight = false
     let cancellationId: string | null = null
     let cancellationPromise: Promise<boolean> | null = null
+    let folder = $state<ExternalFolderSelection | null>(null)
+    let folderError = $state('')
+    let folderNameError = $state('')
+    let selectingFolder = $state(false)
+    let reselectRequired = $state(false)
+    let folderSelector = $state<{ selectionId: string; accountHint?: string } | null>(null)
+    let folderRow = $state<HTMLElement | undefined>()
+    let previousFolder: ExternalFolderSelection | null = null
 
     const definition = $derived(getExternalProviderDefinition(providerId))
     const requiredAcks = $derived(requiredConnectionAcknowledgements(providerId))
     const googleOAuth = $derived(providerId === 'google_drive')
     const googleAndroid = $derived(isTauriAndroid && providerId === 'google_drive')
+    const visibleLocation = $derived(
+        providerId === 'google_drive' ? (values.space || 'drive') === 'drive'
+        : providerId === 'onedrive' ? (values.accountType || 'personal') !== 'appFolder'
+        : true,
+    )
     const visibleFields = $derived(definition.fields.filter(field => (
-        field.key !== 'oauthRedirectUri' || googleAndroid
+        (field.key !== 'oauthRedirectUri' || googleAndroid)
+        && (!field.createOnly || (mode === 'create' && visibleLocation))
     )))
+    const folderNameField = $derived(visibleFields.find(field => field.createOnly) ?? null)
+    const locationHelp = $derived(
+        mode === 'existing' && visibleLocation && definition.fields.some(field => field.createOnly)
+            ? strings.folderSelectHelp
+            : '',
+    )
+    const folderSelection = $derived(prepared !== null && (prepared.requiresFolderSelection || reselectRequired))
+    const folderRowState = $derived<'empty' | 'selecting' | 'selected' | 'invalid'>(
+        selectingFolder ? 'selecting' : folder ? 'selected' : folderError ? 'invalid' : 'empty',
+    )
+    const accountHint = $derived(folder?.accountHint ?? folderSelector?.accountHint ?? prepared?.endpoint.accountHint)
     const authorizationAvailable = $derived(
         providerDescriptors.find(provider => provider.id === providerId)?.authorizationAvailable ?? true,
     )
@@ -125,7 +155,7 @@
     const providerWarning = $derived('warningTitle' in providerStrings
         ? { title: providerStrings.warningTitle, body: providerStrings.warning }
         : null)
-    const connectLabel = $derived(prepared?.requiresOAuth
+    const connectLabel = $derived(prepared?.requiresOAuth && !folderSelection
         ? (pendingAuthorizationId ? strings.finishSignIn : strings.signIn)
         : strings.connect)
 
@@ -144,6 +174,7 @@
         if (authorizationId && !authorizationCompletionInFlight) {
             void cancelNativeAuthorization(authorizationId)
         }
+        if (folderSelector) void bridge.cancelFolderSelection(folderSelector.selectionId).catch(() => {})
         onbusychange(false)
     })
 
@@ -183,6 +214,11 @@
             busy = false
             return
         }
+        clearPrepared()
+        busy = false
+    }
+
+    function clearPrepared(): void {
         prepared = null
         fromTransfer = false
         endpointConfirmed = false
@@ -191,7 +227,17 @@
         manualOAuthCallback = ''
         authorizationStatus = ''
         error = ''
-        busy = false
+        clearFolderSelection()
+    }
+
+    function clearFolderSelection(): void {
+        if (folderSelector) void bridge.cancelFolderSelection(folderSelector.selectionId).catch(() => {})
+        folderSelector = null
+        folder = null
+        previousFolder = null
+        folderError = ''
+        selectingFolder = false
+        reselectRequired = false
     }
 
     function selectProvider(value: string): void {
@@ -199,7 +245,7 @@
         const next = getExternalProviderDefinition(providerId)
         if (!next.supportsSync) purpose = 'backup'
         values = {
-            space: 'drive', accountType: 'personal', tenant: 'common',
+            space: 'drive', accountType: 'personal', tenant: 'common', folderName: 'RisuNest',
             ...(isTauriAndroid ? {
                 oauthRedirectUri: 'https://update.rsyumi.workers.dev/oauth/google-drive-callback',
             } : {}),
@@ -207,6 +253,7 @@
             profile: next.profiles[0]?.value ?? '',
         }
         accepted = []
+        folderNameError = ''
         resetPrepared()
     }
 
@@ -272,6 +319,7 @@
 
     function updateValue(key: string, value: string): void {
         values[key] = value
+        if (key === 'folderName') folderNameError = ''
         resetPrepared()
     }
 
@@ -280,13 +328,27 @@
         resetPrepared()
     }
 
+    function locationValues(): Record<string, string> {
+        return { ...values, folderName: folderNameField ? (values.folderName ?? '').trim() : '' }
+    }
+
+    async function focusFolderName(): Promise<void> {
+        await tick()
+        document.getElementById(FOLDER_NAME_ID)?.focus()
+    }
+
     async function prepare(): Promise<void> {
+        if (folderNameField && !(values.folderName ?? '').trim()) {
+            folderNameError = strings.folderNameRequired
+            await focusFolderName()
+            return
+        }
         busy = true
         error = ''
         let request: ReturnType<typeof buildPrepareConnectionRequest>
         try {
             request = buildPrepareConnectionRequest({
-                providerId, values, platform, mode, purpose,
+                providerId, values: locationValues(), platform, mode, purpose,
                 recoveryKey: mode === 'existing' ? recoveryKey.trim() : undefined,
                 capturePolicy: purpose === 'backup'
                     ? { hypa, localPlugins, localSettings }
@@ -321,11 +383,141 @@
         }
     }
 
+    async function focusFolderAction(): Promise<void> {
+        await tick()
+        if (busy) {
+            setTimeout(() => folderRow?.querySelector<HTMLButtonElement>('[data-folder-action]')?.focus(), 0)
+            return
+        }
+        folderRow?.querySelector<HTMLButtonElement>('[data-folder-action]')?.focus()
+    }
+
+    function commitFolder(selection: ExternalFolderSelection): void {
+        folder = selection
+        previousFolder = null
+        folderError = ''
+        selectingFolder = false
+        endpointConfirmed = false
+        void focusFolderAction()
+    }
+
+    function restorePreviousFolder(): void {
+        folder = previousFolder
+        previousFolder = null
+        selectingFolder = false
+        void focusFolderAction()
+    }
+
+    function failFolderSelection(reason: unknown): void {
+        error = ''
+        folder = null
+        previousFolder = null
+        selectingFolder = false
+        endpointConfirmed = false
+        folderError = externalErrorMessage(strings, reason)
+        void focusFolderAction()
+    }
+
+    async function selectFolder(): Promise<void> {
+        if (!prepared || busy) return
+        busy = true
+        error = ''
+        folderError = ''
+        previousFolder = folder
+        folder = null
+        endpointConfirmed = false
+        selectingFolder = true
+        try {
+            const pending = await bridge.beginAuthorization(
+                prepared.preparationId,
+                prepared.requiresPlatformOAuthClient ? currentPlatformClientId.trim() : undefined,
+            )
+            if (destroyed) {
+                await cancelNativeAuthorization(pending.authorizationId)
+                return
+            }
+            pendingAuthorizationId = pending.authorizationId
+            authorizationStatus = pending.state === 'complete' ? '' : strings.authorizationWaiting
+            if (pending.authorizationUrl) {
+                await openUrl(pending.authorizationUrl)
+                return
+            }
+            if (pending.state !== 'complete') return
+            busy = false
+            await finishFolderSelection()
+        } catch (reason) {
+            await cancelPendingAuthorization()
+            failFolderSelection(reason)
+        } finally {
+            busy = false
+        }
+    }
+
+    async function finishFolderSelection(): Promise<void> {
+        if (!pendingAuthorizationId || busy) return
+        busy = true
+        error = ''
+        authorizationCompletionInFlight = true
+        try {
+            const outcome = await bridge.completeAuthorization(
+                pendingAuthorizationId,
+                manualOAuthCallback.trim() || undefined,
+                oauthClientSecret || undefined,
+            ).finally(() => authorizationCompletionInFlight = false)
+            if (destroyed) {
+                if ('authorizationPending' in outcome) await cancelPendingAuthorization()
+                return
+            }
+            if ('authorizationPending' in outcome) {
+                authorizationStatus = outcome.callbackRejected
+                    ? strings.callbackRejected
+                    : strings.authorizationWaiting
+                return
+            }
+            pendingAuthorizationId = null
+            manualOAuthCallback = ''
+            authorizationStatus = ''
+            if ('folderSelected' in outcome) {
+                commitFolder(outcome.folder)
+            } else if ('folderSelectionRequired' in outcome) {
+                folderSelector = { selectionId: outcome.selectionId, accountHint: outcome.accountHint }
+            } else if ('folderSelectionCancelled' in outcome) {
+                restorePreviousFolder()
+            } else {
+                selectingFolder = false
+                oauthClientSecret = ''
+                await onconnected(outcome)
+            }
+        } catch (reason) {
+            await cancelPendingAuthorization()
+            failFolderSelection(reason)
+        } finally {
+            busy = false
+        }
+    }
+
+    function onSelectorSelected(selection: ExternalFolderSelection): void {
+        folderSelector = null
+        commitFolder(selection)
+    }
+
+    function onSelectorCancel(): void {
+        folderSelector = null
+        restorePreviousFolder()
+    }
+
     async function connect(): Promise<void> {
         if (!prepared || !endpointConfirmed) return
+        if (folderSelection && !folder) return
         busy = true
         error = ''
         try {
+            if (folderSelection) {
+                const result = await bridge.commitConnection(prepared.preparationId)
+                oauthClientSecret = ''
+                await onconnected(result)
+                return
+            }
             if (prepared.requiresOAuth) {
                 if (!pendingAuthorizationId) {
                     const pending = await bridge.beginAuthorization(
@@ -368,6 +560,22 @@
                 manualOAuthCallback = ''
                 pendingAuthorizationId = null
                 authorizationStatus = ''
+                if ('folderSelected' in result) {
+                    reselectRequired = true
+                    commitFolder(result.folder)
+                    return
+                }
+                if ('folderSelectionRequired' in result) {
+                    reselectRequired = true
+                    selectingFolder = true
+                    folderSelector = { selectionId: result.selectionId, accountHint: result.accountHint }
+                    return
+                }
+                if ('folderSelectionCancelled' in result) {
+                    reselectRequired = true
+                    restorePreviousFolder()
+                    return
+                }
                 await onconnected(result)
                 return
             }
@@ -377,6 +585,17 @@
             for (const field of definition.secretFields) values[field.key] = ''
         } catch (reason) {
             await cancelPendingAuthorization()
+            if (externalFolderErrorKind(reason)) {
+                reselectRequired = true
+                failFolderSelection(reason)
+                return
+            }
+            if (mode === 'create' && externalErrorKind(reason) === 'folderNameConflict') {
+                clearPrepared()
+                folderNameError = strings.folderNameConflict
+                await focusFolderName()
+                return
+            }
             error = externalErrorMessage(strings, reason)
         } finally {
             busy = false
@@ -482,10 +701,14 @@
                         <SelectInput value={values[field.key] ?? field.options?.[0] ?? ''} className="w-full disabled:opacity-50" onchange={event => updateValue(field.key, event.currentTarget.value)}>
                             {#each field.options ?? [] as option (option)}<OptionInput value={option}>{externalOptionLabel(strings, providerId, field.key, option)}</OptionInput>{/each}
                         </SelectInput>
+                    {:else if field.createOnly}
+                        <TextInput id={FOLDER_NAME_ID} className="disabled:opacity-50" fullwidth value={values[field.key] ?? ''} oninput={() => folderNameError = ''} onchange={event => updateValue(field.key, event.currentTarget.value)} placeholder={field.placeholder ?? ''} />
                     {:else}
                         <TextInput className="disabled:opacity-50" fullwidth value={values[field.key] ?? ''} onchange={event => updateValue(field.key, event.currentTarget.value)} placeholder={field.placeholder ?? ''} />
                     {/if}
+                    {#if field.createOnly && folderNameError}<small class="field-error" role="alert">{folderNameError}</small>{/if}
                     {#if help}<small>{help}</small>{/if}
+                    {#if locationHelp && (field.key === 'space' || field.key === 'accountType')}<small>{locationHelp}</small>{/if}
                 </label>
             {/each}
         </div>
@@ -512,8 +735,24 @@
             <h3 class="sub-title">{strings.endpointReview}</h3>
             <dl class="review">
                 <dt>{strings.authority}</dt><dd>{prepared.endpoint.authority}</dd>
-                {#if prepared.endpoint.accountHint}<dt>{strings.account}</dt><dd>{prepared.endpoint.accountHint}</dd>{/if}
-                <dt>{strings.repository}</dt><dd>{prepared.endpoint.repositoryHint}</dd>
+                {#if accountHint}<dt>{strings.account}</dt><dd>{accountHint}</dd>{/if}
+                {#if folderSelection}
+                    <dt>{strings.folder}</dt>
+                    <dd class="folder" bind:this={folderRow} data-folder-row data-state={folderRowState}>
+                        {#if folderRowState === 'selected' && folder}
+                            <span class="folder-name">{folder.name}</span>
+                            <SettingButton variant="secondary" data-folder-action disabled={!authorizationAvailable} onclick={selectFolder}>{strings.selectFolderAgain}</SettingButton>
+                        {:else if folderRowState === 'selecting'}
+                            <span class="folder-status" role="status">{strings.selectingFolder}</span>
+                            {#if pendingAuthorizationId}<SettingButton variant="secondary" data-folder-action {busy} onclick={finishFolderSelection}>{strings.finishSignIn}</SettingButton>{/if}
+                        {:else}
+                            <SettingButton variant="secondary" data-folder-action disabled={!authorizationAvailable} onclick={selectFolder}>{strings.selectFolder}</SettingButton>
+                        {/if}
+                        {#if folderError}<span class="field-error" role="alert">{folderError}</span>{/if}
+                    </dd>
+                {:else}
+                    <dt>{strings.repository}</dt><dd>{prepared.endpoint.repositoryHint}</dd>
+                {/if}
                 {#if mode === 'create'}
                     <dt>{strings.purposeReview}</dt>
                     <dd>{purpose === 'backup' ? `${strings.backup} · ${strings.includes.replace('{0}', scopeSummary)}` : strings.sync}</dd>
@@ -525,6 +764,23 @@
             {/if}
             {#each prepared.endpoint.warnings as warning (warning)}<p class="note"><span>{externalEndpointWarning(strings, warning)}</span></p>{/each}
 
+            {#if folderSelection}
+                {#if prepared.requiresPlatformOAuthClient}
+                    <label class="field"><span>{googleAndroid ? strings.webOAuthClientId : strings.platformClientId}</span><TextInput className="disabled:opacity-50" fullwidth bind:value={currentPlatformClientId} /></label>
+                {/if}
+                {#if googleOAuth}
+                    <div class="fields two">
+                        <label class="field"><span>{strings.oauthClientSecret}</span><TextInput className="disabled:opacity-50" fullwidth hideText bind:value={oauthClientSecret} /></label>
+                        {#if googleAndroid && pendingAuthorizationId}<label class="field"><span>{strings.manualOAuthCallback}</span><TextInput className="disabled:opacity-50" fullwidth hideText bind:value={manualOAuthCallback} /><small>{strings.manualOAuthHelp}</small></label>{/if}
+                    </div>
+                {/if}
+                {#if authorizationStatus}<p class="sub-help" role="status">{authorizationStatus}</p>{/if}
+                <SettingToggle showLabel label={strings.confirmEndpoint} disabled={!folder} bind:checked={endpointConfirmed} />
+                <div class="actions">
+                    <SettingButton {busy} disabled={!folder || !endpointConfirmed || selectingFolder || !authorizationAvailable} onclick={connect}>{strings.connect}</SettingButton>
+                    <SettingButton variant="secondary" onclick={resetPrepared}>{strings.back}</SettingButton>
+                </div>
+            {:else}
             <SettingToggle showLabel label={strings.confirmEndpoint} bind:checked={endpointConfirmed} />
             {#if prepared.requiresPlatformOAuthClient}
                 <label class="field"><span>{googleAndroid ? strings.webOAuthClientId : strings.platformClientId}</span><TextInput className="disabled:opacity-50" fullwidth bind:value={currentPlatformClientId} /></label>
@@ -561,6 +817,7 @@
                 <SettingButton variant="secondary" onclick={resetPrepared}>{strings.back}</SettingButton>
             </div>
             {#if !prepared.requiresOAuth && mode === 'create'}<p class="sub-help">{strings.connectHint}</p>{/if}
+            {/if}
         </section>
     {:else}
         <section class="sub">
@@ -573,6 +830,10 @@
     {/if}
     {#if error}<p class="form-error" role="alert">{error}</p>{/if}
 </fieldset>
+
+{#if folderSelector}
+    <ExternalFolderSelector {strings} selectionId={folderSelector.selectionId} onselected={onSelectorSelected} oncancel={onSelectorCancel} />
+{/if}
 
 <style>
     .form {
@@ -719,6 +980,33 @@
     }
     .review dd:last-child {
         margin-bottom: 0;
+    }
+    .review dd.folder {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 0.5rem 0.75rem;
+        font-weight: 400;
+    }
+    .folder-name {
+        min-width: 0;
+        overflow-wrap: anywhere;
+        font-weight: 600;
+    }
+    .folder-status {
+        font-weight: 500;
+        color: var(--risu-theme-textcolor2);
+    }
+    .field-error {
+        flex-basis: 100%;
+        margin: 0;
+        font-size: 0.8125rem;
+        line-height: 1.45;
+        font-weight: 400;
+    }
+    .field > small.field-error,
+    .review .field-error {
+        color: var(--risu-theme-danger-400);
     }
     .textarea,
     .datetime {

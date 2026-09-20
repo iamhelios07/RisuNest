@@ -85,6 +85,7 @@ beforeEach(() => {
         requiresOAuth: true,
         requiresRecoveryKey: false,
         requiresPlatformOAuthClient: false,
+        requiresFolderSelection: false,
     })
     state.beginAuthorization.mockResolvedValue({
         authorizationId: 'authorization-1',

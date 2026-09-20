@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { externalErrorMessage, externalStorageStrings } from './strings'
+import { externalErrorMessage, externalFolderErrorKind, externalStorageStrings } from './strings'
 
 const strings = externalStorageStrings('en')
 
@@ -50,10 +50,21 @@ describe('externalErrorMessage', () => {
             'unauthorized', 'reauthRequired', 'notFound', 'preconditionFailed',
             'rateLimited', 'dailyQuotaExhausted', 'storageFull', 'fileTooLarge',
             'corrupt', 'unsupported', 'cancelled', 'transient', 'alreadyConnected',
+            'folderNameConflict', 'folderCreateFailed', 'folderInaccessible',
+            'folderNotRepository', 'folderUnsupportedLocation',
         ]
         for (const kind of kinds) {
             expect(externalErrorMessage(korean, { kind })).not.toBe(korean.errorGeneric)
             expect(externalErrorMessage(korean, { kind })).not.toBe(externalErrorMessage(strings, { kind }))
+        }
+    })
+
+    it('separates folder-row failures from creation and connection failures', () => {
+        for (const kind of ['folderInaccessible', 'folderNotRepository', 'folderUnsupportedLocation']) {
+            expect(externalFolderErrorKind({ kind })).toBe(true)
+        }
+        for (const kind of ['folderNameConflict', 'notFound', undefined]) {
+            expect(externalFolderErrorKind(kind === undefined ? undefined : { kind })).toBe(false)
         }
     })
 })
