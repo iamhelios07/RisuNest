@@ -140,6 +140,8 @@ mod external_storage_tests;
 mod plugin_owner_tests;
 #[path = "tests/replacement_tests.rs"]
 mod replacement_tests;
+#[path = "tests/schema_tests.rs"]
+mod schema_tests;
 mod server_sync_apply_tests;
 mod server_sync_engine_tests;
 #[path = "tests/server_sync_outbox_tests.rs"]
