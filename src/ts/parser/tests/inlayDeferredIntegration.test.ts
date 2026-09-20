@@ -1,5 +1,9 @@
+// @vitest-environment jsdom
+
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { writable } from 'svelte/store'
+
+vi.mock('../../platform', () => ({ isTauri: false, isNodeServer: false }))
 
 const inlayMocks = vi.hoisted(() => ({
     getInlayAssetBlob: vi.fn(),

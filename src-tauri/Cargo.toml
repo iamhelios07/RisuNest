@@ -34,7 +34,6 @@ base64 = "0.21.0"
 cap-primitives = "4.0.3"
 darling = "0.20.3"
 zip = "0.6.6"
-eventsource-client = "0.12.2"
 futures = "0.3.30"
 async-trait = "0.1"
 url = "2.2"
@@ -89,9 +88,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-single-instance = { version = "2.4.3", features = ["deep-link"] }
-tauri-plugin-updater = "2.10.1"
+tauri-plugin-updater = "2.12.0"
 getrandom = "0.2.15"
-reqwest = { version = "0.11.16", features = ["blocking", "json"] }
+reqwest = { version = "0.12.28", features = ["blocking", "json"] }
 
 [target.'cfg(any(windows, target_os = "android", target_os = "linux", target_os = "ios", target_os = "macos"))'.dependencies]
 regex = "1.13.1"
@@ -129,10 +128,10 @@ tauri-plugin-barcode-scanner = { path = "../crates/tauri-plugin-barcode-scanner"
 [target.'cfg(target_os = "android")'.dependencies]
 getrandom = "0.2.15"
 jni = "0.21.1"
-reqwest = { version = "0.11.16", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
-reqwest = { version = "0.11.16", features = ["blocking", "json", "stream"] }
+reqwest = { version = "0.12.28", features = ["blocking", "json", "stream"] }
 
 [dev-dependencies]
 wry = "=0.55.1"

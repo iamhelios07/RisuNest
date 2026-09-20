@@ -87,7 +87,9 @@ fn the_account_token_never_reaches_a_snapshot_an_export_or_a_sync_capture() {
         .expect("capture the library");
     assert!(captured.projected_records > 0);
 
-    let vault_file = root.join("account-credentials").join("official-account");
+    let vault_file = root
+        .join("account-credentials")
+        .join(crate::cleanup_secrets::account_id(&root));
     assert!(vault_file.is_file(), "the vault slot must hold the token");
     assert!(
         !contains_token(&vault_file),
