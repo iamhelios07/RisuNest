@@ -45,6 +45,9 @@ OutFile "$installer"
 InstallDir "`$TEMP\RisuNestGuardTest"
 RequestExecutionLevel user
 SilentInstall silent
+!include LogicLib.nsh
+Var DeleteAppDataCheckboxState
+Var UpdateMode
 !include "$hook"
 Section
   !insertmacro NSIS_HOOK_PREINSTALL

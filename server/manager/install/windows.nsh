@@ -110,9 +110,33 @@
   IfErrors sync_uninstall_guard_failed
   FileWrite $0 '{"release":true}'
   FileClose $0
-  Goto sync_uninstall_guard_done
+  StrCpy $R6 300
+  sync_uninstall_wait_guard:
+  IfFileExists "$LOCALAPPDATA\RisuNestSyncData\manager-update\installer-$R7.ready" 0 sync_uninstall_guard_done
+  Sleep 100
+  IntOp $R6 $R6 - 1
+  IntCmp $R6 0 sync_uninstall_guard_failed sync_uninstall_guard_failed sync_uninstall_wait_guard
   sync_uninstall_guard_failed:
   DetailPrint "The installer update lock could not be released."
   SetErrorLevel 1
+  Goto sync_uninstall_finished
   sync_uninstall_guard_done:
+  ${If} $DeleteAppDataCheckboxState = 1
+  ${AndIf} $UpdateMode <> 1
+    StrCpy $R6 300
+    sync_uninstall_remove_data:
+    ClearErrors
+    RmDir /r "$LOCALAPPDATA\RisuNestSyncData"
+    RmDir /r "$LOCALAPPDATA\RisuNestSyncWebViewData"
+    IfErrors sync_uninstall_remove_data_retry sync_uninstall_remove_data_done
+    sync_uninstall_remove_data_retry:
+    Sleep 100
+    IntOp $R6 $R6 - 1
+    IntCmp $R6 0 sync_uninstall_remove_data_failed sync_uninstall_remove_data_failed sync_uninstall_remove_data
+    sync_uninstall_remove_data_failed:
+    DetailPrint "RisuNest Sync application data could not be fully removed."
+    SetErrorLevel 1
+    sync_uninstall_remove_data_done:
+  ${EndIf}
+  sync_uninstall_finished:
 !macroend

@@ -298,9 +298,18 @@ test("effective configuration preserves the approved desktop and mobile identiti
     assert.equal(assertAppIdentifier(config, os), expected[os]);
     assert.equal(config.bundle.publisher, "Yumi");
     assert.equal(config.version, "1.2.3");
+    if (os === "windows") assert.equal(config.bundle.windows.nsis.installerHooks, "windows.nsh");
     if (os === "macos") assert.equal(config.bundle.macOS.signingIdentity, "-");
     assert.throws(() => assertAppIdentifier({ ...config, identifier: "wrong" }, os), /effective/);
   }
+});
+
+test("RisuNest NSIS removes the dedicated Windows data directories only on request", () => {
+  const hook = readFileSync("src-tauri/windows.nsh", "utf8");
+  assert.match(hook, /\$DeleteAppDataCheckboxState = 1/);
+  assert.match(hook, /\$UpdateMode <> 1/);
+  assert.match(hook, /RmDir \/r "\$LOCALAPPDATA\\RisuNestData"/);
+  assert.match(hook, /RmDir \/r "\$LOCALAPPDATA\\RisuNestWebViewData"/);
 });
 
 test("Sync GUI configuration follows each desktop platform identity", () => {
@@ -334,6 +343,10 @@ test("Sync NSIS hook separates the default install and durable data directories"
   assert.match(hook, /StrCpy \$INSTDIR "\$LOCALAPPDATA\\RisuNestSync"/);
   assert.match(hook, /\$LOCALAPPDATA\\RisuNestSyncData\\manager-update/);
   assert.doesNotMatch(hook, /\$LOCALAPPDATA\\RisuNestSync\\manager-update/);
+  assert.match(hook, /\$DeleteAppDataCheckboxState = 1/);
+  assert.match(hook, /RmDir \/r "\$LOCALAPPDATA\\RisuNestSyncData"/);
+  assert.match(hook, /RmDir \/r "\$LOCALAPPDATA\\RisuNestSyncWebViewData"/);
+  assert.match(hook, /IfFileExists "\$LOCALAPPDATA\\RisuNestSyncData\\manager-update\\installer-\$R7\.ready"/);
 });
 
 test("macOS package metadata and intentional ad-hoc signatures are checked", () => {
