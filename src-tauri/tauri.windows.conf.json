@@ -15,5 +15,10 @@
         "backgroundColor": "#21222c"
       }
     ]
+  },
+  "plugins": {
+    "risunest": {
+      "dataDirectoryName": "RisuNestData"
+    }
   }
 }

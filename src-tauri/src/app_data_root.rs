@@ -3,7 +3,11 @@ use std::path::PathBuf;
 /// Resolve native storage only from the platform-owned application directory.
 pub(crate) fn resolve<R: tauri::Runtime>(app: &impl tauri::Manager<R>) -> tauri::Result<PathBuf> {
     #[cfg(windows)]
-    let root = windows_data_root(app.path().data_dir()?, "RisuNestData")?;
+    let root = configured_windows_data_root(
+        app.path().data_dir()?,
+        app.path().app_data_dir()?,
+        app.config().plugins.0.get("risunest").and_then(|value| value.get("dataDirectoryName")),
+    )?;
     #[cfg(not(windows))]
     let root = app.path().app_data_dir()?;
     #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -114,3 +118,16 @@ fn resolve_platform_root(root: &std::path::Path, create_missing: bool) -> std::i
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(any(test, windows))]
+fn configured_windows_data_root(
+    base: PathBuf,
+    default: PathBuf,
+    configured: Option<&serde_json::Value>,
+) -> std::io::Result<PathBuf> {
+    let Some(configured) = configured else { return Ok(default) };
+    let leaf = configured.as_str().filter(|name| {
+        !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    }).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid data directory name"))?;
+    windows_data_root(base, leaf)
+}

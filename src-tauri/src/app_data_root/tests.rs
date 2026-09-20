@@ -194,3 +194,16 @@ fn resolved_root_replaced_by_link_is_rejected_by_cas() {
     assert!(PayloadCas::new(&root).is_err());
     assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
 }
+
+#[test]
+fn explicit_product_directory_does_not_change_other_application_identities() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().to_owned();
+    let isolated = base.join("io.risunest.boundary.synthetic");
+    assert_eq!(super::configured_windows_data_root(base.clone(), isolated.clone(), None).unwrap(), isolated);
+    assert_eq!(super::configured_windows_data_root(base.clone(), isolated.clone(), Some(&serde_json::json!("RisuNestData"))).unwrap(), base.join("RisuNestData"));
+    for invalid in [serde_json::json!("../RisuNestData"), serde_json::json!("C:/data"), serde_json::json!(""), serde_json::json!(false)] {
+        assert!(super::configured_windows_data_root(base.clone(), isolated.clone(), Some(&invalid)).is_err());
+    }
+    assert!(fs::read_dir(base).unwrap().next().is_none());
+}
