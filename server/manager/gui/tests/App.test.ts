@@ -139,6 +139,34 @@ it("keeps a dirty form tied to its original revision during status refresh", asy
   );
 });
 
+it("keeps an untouched connection form clean as the tunnel becomes ready", async () => {
+  snapshot.connectionState.mode = "managed";
+  snapshot.connection.cloudflared = "C:\\synthetic\\cloudflared.exe";
+  snapshot.connection.endpoint = null;
+  snapshot.tunnel = { phase: "starting", endpoint: null, error: null, logs: [] };
+  await open();
+  button("연결").click();
+  await settle();
+  expect(button("설정 적용").disabled).toBe(true);
+
+  snapshot.connection.endpoint = "https://synthetic.trycloudflare.com";
+  snapshot.tunnel = {
+    phase: "connected",
+    endpoint: "https://synthetic.trycloudflare.com",
+    error: null,
+    logs: ["registered"],
+  };
+  await vi.advanceTimersByTimeAsync(3000);
+  await settle();
+
+  expect(target.textContent).toContain("현재 설정입니다.");
+  expect(target.textContent).not.toContain("아직 적용하지 않은 변경이 있습니다.");
+  expect(button("설정 적용").disabled).toBe(true);
+  button("개요").click();
+  await settle();
+  expect(target.querySelector("dialog[open]")).toBeNull();
+});
+
 it("rebases a dirty connection draft after an action from the same form", async () => {
   vi.mocked(backend.mutate).mockImplementation(async (path) => {
     if (path === "tunnel/restart") {
@@ -158,7 +186,7 @@ it("rebases a dirty connection draft after an action from the same form", async 
   registry.click();
   button("다시 시작").click();
   await vi.waitFor(() =>
-    expect(target.textContent).toContain("변경 사항을 적용했습니다."),
+    expect(target.textContent).toContain("임시 주소 연결을 다시 시작했습니다."),
   );
   await settle();
   target
@@ -172,6 +200,15 @@ it("rebases a dirty connection draft after an action from the same form", async 
 });
 
 it("labels retained overview data as last-known after losing the daemon", async () => {
+  snapshot.connectionState.mode = "managed";
+  snapshot.connection.cloudflared = "C:\\synthetic\\cloudflared.exe";
+  snapshot.connection.endpoint = "https://synthetic.trycloudflare.com";
+  snapshot.tunnel = {
+    phase: "connected",
+    endpoint: "https://synthetic.trycloudflare.com",
+    error: null,
+    logs: [],
+  };
   await open();
   expect(target.textContent).toContain("서버 실행 중");
   vi.mocked(backend.status).mockRejectedValue("daemon-unavailable");
@@ -179,6 +216,13 @@ it("labels retained overview data as last-known after losing the daemon", async 
   await settle();
   expect(target.textContent).toContain("마지막으로 확인한 서버 정보");
   expect(target.textContent).not.toContain("서버 실행 중");
+  button("연결").click();
+  await settle();
+  expect(target.textContent).toContain("확인할 수 없음");
+  expect(target.textContent).toContain("마지막 임시 주소");
+  expect(target.textContent?.replace(/\s+/g, " ")).toContain(
+    "서버를 중지하면 임시 주소 연결도 함께 종료됩니다.",
+  );
 });
 
 it("shows a registration URI once and clears it on modal close", async () => {

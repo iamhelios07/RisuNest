@@ -180,7 +180,12 @@
           ? result.revision
           : null;
       await refresh();
-      notice = "변경 사항을 적용했습니다.";
+      notice =
+        {
+          "tunnel/start": "임시 주소 연결을 시작했습니다.",
+          "tunnel/stop": "임시 주소 연결을 중지했습니다.",
+          "tunnel/restart": "임시 주소 연결을 다시 시작했습니다.",
+        }[path] ?? "변경 사항을 적용했습니다.";
       return resultRevision ?? status?.revision ?? null;
     } catch (error) {
       notice = message(error);
@@ -436,6 +441,7 @@
       {:else if page === "connection"}<Connections
           {status}
           {environment}
+          {connected}
           busy={busy || !connected}
           {mutate}
           {copy}
