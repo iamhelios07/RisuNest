@@ -16,7 +16,6 @@
     "test": "vitest run",
     "tauri": "tauri",
     "buildsite": "vite build --outDir dist",
-    "hono:build": "vite build --sourcemap && node server/hono/src/utils/postbuild.js",
     "tauribuild:android": "vite build --mode android",
     "tauribuild:agent": "vite build --mode agent",
     "dev:agent": "vite --mode agent",
