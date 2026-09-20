@@ -95,6 +95,10 @@ fn path_text(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+fn reveal_existing_window(arguments: &[String]) -> bool {
+    !arguments.iter().any(|argument| argument == "--tray")
+}
+
 fn reconcile_schedule_environment(
     policy: update::UpdatePolicy,
     mut status: impl FnMut() -> Result<platform::UpdateScheduleStatus>,
@@ -388,6 +392,15 @@ pub fn run() {
         None
     };
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, arguments, _cwd| {
+            if reveal_existing_window(&arguments) {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.unminimize();
+                    let _ = window.set_focus();
+                }
+            }
+        }))
         .manage(Context {
             root,
             executable,
@@ -511,6 +524,19 @@ mod tests {
         };
         let path = PathBuf::from(value);
         assert!(json!({"path":path_text(&path)})["path"].is_string());
+    }
+
+    #[test]
+    fn second_manual_launch_reveals_the_existing_window_but_tray_startup_does_not() {
+        assert!(reveal_existing_window(&[
+            "risunest-sync-gui".into(),
+            "--data-dir".into(),
+            "synthetic".into(),
+        ]));
+        assert!(!reveal_existing_window(&[
+            "risunest-sync-gui".into(),
+            "--tray".into(),
+        ]));
     }
 
     #[test]
