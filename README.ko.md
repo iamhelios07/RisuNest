@@ -77,6 +77,25 @@ RisuNest Sync는 여러 기기가 같은 라이브러리를 공유하도록 돕�
 - Windows와 macOS에는 관리 GUI가, Linux에는 CLI/TUI가 제공됩니다.
 - 임시 주소를 사용하는 경우, 주소가 바뀌어도 앱이 다시 찾을 수 있도록 엔드포인트 레지스트리를 함께 제공합니다.
 
+### 다운로드
+
+> [!NOTE]
+> Sync는 앱과 별도로 `sync-v<버전>` 태그로 릴리스됩니다. 아래 표는 릴리스 파이프라인이 만드는 파일 이름이며, 공개 후 [Releases](https://github.com/rsyumi/RisuNest/releases)에서 받을 수 있습니다.
+
+| 플랫폼 | aarch64 (arm64) | x86_64 (x64) |
+| --- | --- | --- |
+| Windows | `RisuNest-Sync-<버전>-managed-windows-aarch64-setup.exe` | `RisuNest-Sync-<버전>-managed-windows-x86_64-setup.exe` |
+| macOS | `RisuNest-Sync-<버전>-managed-darwin-aarch64.dmg` | `RisuNest-Sync-<버전>-managed-darwin-x86_64.dmg` |
+| Linux | `RisuNest-Sync-<버전>-managed-linux-aarch64.tar.gz` | `RisuNest-Sync-<버전>-managed-linux-x86_64.tar.gz` |
+| Windows (raw) | `RisuNest-Sync-<버전>-raw-windows-aarch64.zip` | `RisuNest-Sync-<버전>-raw-windows-x86_64.zip` |
+| macOS (raw) | `RisuNest-Sync-<버전>-raw-darwin-aarch64.tar.gz` | `RisuNest-Sync-<버전>-raw-darwin-x86_64.tar.gz` |
+| Linux (raw) | `RisuNest-Sync-<버전>-raw-linux-aarch64.tar.gz` | `RisuNest-Sync-<버전>-raw-linux-x86_64.tar.gz` |
+
+- `managed`는 권장 배포판이며, Sync 서버와 관리 GUI(Windows·macOS) 또는 `risunest-sync-manager` CLI/TUI(Linux), 업데이트 확인, `cloudflared`를 한 패키지로 담고 있습니다.
+- Linux는 아카이브를 풀고 함께 들어 있는 `install.sh`를 실행하세요. 홈 디렉터리 아래에 설치하고 사용자 서비스를 등록하므로 systemd가 필요합니다.
+- `raw`는 `risunest-sync-server` 데몬만 담은 아카이브로, 직접 관리하는 경우에 사용합니다. 자세한 내용은 [server/sync/README.md](server/sync/README.md)를 참고하세요.
+- macOS의 Sync 앱도 서명되지 않았으므로 [macOS에서 열기](#macos에서-열기)를 참고하세요.
+
 ## RisuAI에서 옮겨오기
 
 1. RisuAI에서 백업을 내보냅니다(`.bin`).

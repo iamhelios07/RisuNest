@@ -77,6 +77,25 @@ RisuNest Sync is a **personal synchronization server** that allows multiple devi
 - Windows and macOS include a management GUI, while Linux provides a CLI/TUI.
 - When using dynamic or ephemeral addresses, a built-in endpoint registry ensures clients can automatically rediscover the server when its IP or domain changes.
 
+### Downloads
+
+> [!NOTE]
+> Sync is versioned and released independently from the app under `sync-v<version>` tags. The table below lists the filenames produced by the release pipeline. Once published, they will be available on [Releases](https://github.com/rsyumi/RisuNest/releases).
+
+| Platform | aarch64 (arm64) | x86_64 (x64) |
+| --- | --- | --- |
+| Windows | `RisuNest-Sync-<version>-managed-windows-aarch64-setup.exe` | `RisuNest-Sync-<version>-managed-windows-x86_64-setup.exe` |
+| macOS | `RisuNest-Sync-<version>-managed-darwin-aarch64.dmg` | `RisuNest-Sync-<version>-managed-darwin-x86_64.dmg` |
+| Linux | `RisuNest-Sync-<version>-managed-linux-aarch64.tar.gz` | `RisuNest-Sync-<version>-managed-linux-x86_64.tar.gz` |
+| Windows (raw) | `RisuNest-Sync-<version>-raw-windows-aarch64.zip` | `RisuNest-Sync-<version>-raw-windows-x86_64.zip` |
+| macOS (raw) | `RisuNest-Sync-<version>-raw-darwin-aarch64.tar.gz` | `RisuNest-Sync-<version>-raw-darwin-x86_64.tar.gz` |
+| Linux (raw) | `RisuNest-Sync-<version>-raw-linux-aarch64.tar.gz` | `RisuNest-Sync-<version>-raw-linux-x86_64.tar.gz` |
+
+- `managed` packages are the recommended distribution. They bundle the Sync server, the management GUI (Windows and macOS) or the `risunest-sync-manager` CLI/TUI (Linux), the updater, and `cloudflared`.
+- On Linux, extract the archive and run the included `install.sh`. It installs Sync under your home directory and registers a user service, so systemd is required.
+- `raw` archives contain only the `risunest-sync-server` daemon for manual administration. See [server/sync/README.md](server/sync/README.md).
+- The macOS Sync app is unsigned as well. See [Opening on macOS](#opening-on-macos).
+
 ## Migrating from RisuAI
 
 1. Export a backup (`.bin`) from RisuAI.
