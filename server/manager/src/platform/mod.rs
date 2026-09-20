@@ -262,6 +262,25 @@ pub fn spawn_update_helper(root: &Path, command: &mut Command) -> Result<u32> {
     windows::spawn_update_helper(root, command)
 }
 
+pub fn spawn_installer_guard(root: &Path, command: &mut Command) -> Result<()> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        windows::spawn_update_helper(root, command)?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        command
+            .spawn()
+            .map(|_| ())
+            .map_err(|_| "installer-guard-unavailable".into())
+    }
+}
+
 pub fn finish_update_helper(root: &Path, task_name: &str) -> Result<()> {
     #[cfg(windows)]
     return windows::finish_update_helper(root, task_name);

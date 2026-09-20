@@ -97,6 +97,12 @@ async fn run() -> Result<()> {
         ["installer", "guard", nonce] => {
             update::run_installer_guard(&root, &executable, nonce).await
         }
+        ["installer", "guard", nonce, "--scheduled-task", task] => {
+            let result = update::run_installer_guard(&root, &executable, nonce).await;
+            let cleanup = platform::finish_update_helper(&root, task);
+            result?;
+            cleanup
+        }
         ["installer", "finish", nonce] => update::finish_installer_guard(&root, nonce),
         ["uninstall"] => {
             let _lock = update::try_lock(&root)?;
