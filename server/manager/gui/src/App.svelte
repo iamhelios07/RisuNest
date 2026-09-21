@@ -36,6 +36,7 @@
   let deleteServerData = $state(false);
   let name = $state("");
   let selected = $state<Device | null>(null);
+  let local = $state(false);
   let uri = $state("");
   let svg = $state("");
   let connectionDraftDirty = $state(false);
@@ -207,6 +208,7 @@
     dialog = kind;
     if (kind === "uninstall") deleteServerData = false;
     selected = device;
+    local = false;
     name = "";
     uri = "";
     svg = "";
@@ -220,6 +222,7 @@
     uri = "";
     svg = "";
     selected = null;
+    local = false;
     name = "";
   }
   async function register() {
@@ -232,6 +235,7 @@
         revision: status.revision,
         name,
         requestId,
+        target: local ? "local" : "configured",
       })) as { uri: string };
       let code = "";
       try {
@@ -604,6 +608,10 @@
         required
         disabled={busy}
       />
+      {#if status?.localEndpoint}<label
+          ><input type="checkbox" bind:checked={local} disabled={busy} /> 이 컴퓨터에서
+          연결</label
+        >{/if}
       <div class="dialog-actions">
         <button type="button" onclick={close} disabled={busy}>취소</button
         ><button class="primary" disabled={busy || !connected}
@@ -612,10 +620,13 @@
       </div>
     </form>
   {:else if dialog === "issued"}<h2>기기 등록 코드</h2>
-    <p>
-      등록할 기기의 RisuNest 앱에서 QR 코드를 스캔하거나 등록 링크를 붙여
-      넣으세요.
-    </p>
+    {#if local}<p>
+        이 컴퓨터에서 실행하는 RisuNest 앱에만 등록할 수 있습니다. 해당 앱에서 QR
+        코드를 스캔하거나 등록 링크를 붙여 넣으세요.
+      </p>{:else}<p>
+        등록할 기기의 RisuNest 앱에서 QR 코드를 스캔하거나 등록 링크를 붙여
+        넣으세요.
+      </p>{/if}
     {#if svg}<div class="qr">{@html svg}</div>{/if}<textarea
       readonly
       aria-label="기기 등록 링크"

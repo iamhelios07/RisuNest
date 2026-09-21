@@ -16,6 +16,7 @@ export interface Device {
 export interface NetworkSettings { schema: number; address: string; port: number; }
 export interface Status {
   listener: string;
+  localEndpoint: string | null;
   revision: string;
   uptimeSeconds: number;
   connection: Connection;
@@ -169,6 +170,8 @@ export function message(error: unknown): string {
       "이미 발급한 요청입니다. 기기 목록을 확인하세요. 링크를 잃었다면 해당 기기를 해제한 뒤 다시 등록하세요.",
     "public-endpoint-not-ready":
       "서버 주소가 준비되지 않았습니다. 연결 설정을 확인하세요.",
+    "local-endpoint-unavailable":
+      "이 컴퓨터에서 연결할 수 있는 주소가 아닙니다. 네트워크 설정에서 바인딩 IP 주소를 확인하세요.",
     "invalid-device-name":
       "기기 이름을 확인하세요. 1~80자이며 제어 문자는 사용할 수 없습니다.",
     "absolute-cloudflared-executable-required":

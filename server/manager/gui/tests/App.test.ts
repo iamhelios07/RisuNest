@@ -20,6 +20,7 @@ beforeEach(() => {
   document.body.append(target);
   snapshot = {
     listener: "127.0.0.1:14319",
+    localEndpoint: "http://127.0.0.1:14319",
     revision: "synthetic:0",
     uptimeSeconds: 5,
     connection: {
@@ -474,4 +475,71 @@ it("passes the explicit data deletion choice and keeps removal errors visible", 
   await settle();
   expect(backend.uninstall).toHaveBeenCalledWith(true);
   expect(dialog.hasAttribute("open")).toBe(true);
+});
+
+function localCheckbox() {
+  return [...target.querySelectorAll<HTMLInputElement>("dialog input[type=checkbox]")].at(0);
+}
+
+it("issues a local registration only when the listener offers a loopback endpoint", async () => {
+  const uri = "risunestlocal://sync-server/register#SYNTHETIC_LOCAL_ONLY_TEST";
+  vi.mocked(backend.mutate).mockResolvedValue({ uri });
+  await open();
+  button("기기 등록").click();
+  await settle();
+  const name = target.querySelector<HTMLInputElement>(
+    'input[aria-label="기기 이름"]',
+  )!;
+  name.value = "이 컴퓨터";
+  name.dispatchEvent(new Event("input", { bubbles: true }));
+  localCheckbox()!.click();
+  await settle();
+  target
+    .querySelector("dialog form")!
+    .dispatchEvent(new Event("submit", { cancelable: true, bubbles: true }));
+  await settle();
+  expect(backend.mutate).toHaveBeenCalledWith("devices", {
+    revision: "synthetic:0",
+    name: "이 컴퓨터",
+    requestId: "a".repeat(64),
+    target: "local",
+  });
+  await vi.waitFor(() =>
+    expect(target.textContent?.replace(/\s+/g, " ")).toContain(
+      "이 컴퓨터에서 실행하는 RisuNest 앱에만 등록할 수 있습니다.",
+    ),
+  );
+  button("완료").click();
+  await settle();
+  expect(target.innerHTML).not.toContain("SYNTHETIC_LOCAL_ONLY_TEST");
+});
+
+it("hides the local option and keeps configured issuance for a specific listener", async () => {
+  snapshot.listener = "192.0.2.1:14319";
+  snapshot.localEndpoint = null;
+  vi.mocked(backend.mutate).mockResolvedValue({ uri: "risunestlocal://sync-server/register#X" });
+  await open();
+  button("기기 등록").click();
+  await settle();
+  expect(localCheckbox()).toBeUndefined();
+  const name = target.querySelector<HTMLInputElement>(
+    'input[aria-label="기기 이름"]',
+  )!;
+  name.value = "다른 기기";
+  name.dispatchEvent(new Event("input", { bubbles: true }));
+  target
+    .querySelector("dialog form")!
+    .dispatchEvent(new Event("submit", { cancelable: true, bubbles: true }));
+  await settle();
+  expect(backend.mutate).toHaveBeenCalledWith("devices", {
+    revision: "synthetic:0",
+    name: "다른 기기",
+    requestId: "a".repeat(64),
+    target: "configured",
+  });
+  await vi.waitFor(() =>
+    expect(target.textContent?.replace(/\s+/g, " ")).toContain(
+      "등록할 기기의 RisuNest 앱에서 QR 코드를 스캔하거나",
+    ),
+  );
 });
