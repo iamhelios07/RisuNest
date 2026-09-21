@@ -192,6 +192,50 @@ describe("server sync scheduler", () => {
     expect(f.cycle).toHaveBeenCalledTimes(6);
     f.scheduler.stop();
   });
+  it("stops retrying a rejection the same attempt would receive again", async () => {
+    const f = fixture();
+    f.cycle.mockRejectedValue({
+      code: "invalid-control-schema",
+      status: 400,
+      retryable: false,
+    });
+    await f.controller.initialize();
+    await vi.advanceTimersByTimeAsync(0);
+    f.scheduler.localCommit();
+    await vi.advanceTimersByTimeAsync(999);
+    expect(f.cycle).toHaveBeenCalledTimes(1);
+    expect(f.controller.snapshot().errorRetryable).toBe(false);
+    // Neither backoff nor an ongoing edit nor a remote notice may start another.
+    await vi.advanceTimersByTimeAsync(300_000);
+    f.scheduler.localCommit();
+    f.scheduler.remoteHint();
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(f.cycle).toHaveBeenCalledTimes(1);
+    // The manual action clears the error itself, which releases the block.
+    f.cycle.mockResolvedValue(f.result);
+    await f.controller.synchronize();
+    expect(f.cycle).toHaveBeenCalledTimes(2);
+    f.scheduler.resume();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.cycle).toHaveBeenCalledTimes(3);
+    f.scheduler.stop();
+  });
+  it("keeps backing off a failure that is worth another attempt", async () => {
+    const f = fixture();
+    f.cycle.mockRejectedValue({
+      code: "server-unreachable",
+      status: 503,
+      retryable: true,
+    });
+    await f.controller.initialize();
+    await vi.advanceTimersByTimeAsync(0);
+    f.scheduler.localCommit();
+    await vi.advanceTimersByTimeAsync(999);
+    expect(f.cycle).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(f.cycle).toHaveBeenCalledTimes(2);
+    f.scheduler.stop();
+  });
   it("reaches the same state from polling alone when no notification arrives", async () => {
     const hinted = fixture();
     const silent = fixture();

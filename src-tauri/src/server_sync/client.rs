@@ -876,6 +876,60 @@ mod tests {
     }
 
     #[test]
+    fn a_peer_on_another_protocol_is_named_before_any_other_request() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut bytes = Vec::new();
+                // The blank line that ends a request head.
+                while !bytes.ends_with(&[13, 10, 13, 10]) {
+                    let mut byte = [0];
+                    if stream.read_exact(&mut byte).is_err() {
+                        break;
+                    }
+                    bytes.push(byte[0]);
+                }
+                let input = String::from_utf8(bytes).unwrap();
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(input.lines().next().unwrap_or_default().to_owned());
+                let head = serde_json::to_value(risunest_sync_wire::RemoteHead {
+                    head_id: "a".repeat(64),
+                    ..risunest_sync_wire::RemoteHead::genesis("library".into(), "epoch".into())
+                        .unwrap()
+                })
+                .unwrap();
+                let body = serde_json::json!({"head":head,"deviceId":"device","operationWatermark":"0","operationPending":false,"protocolId":"risunest-sync/v0"}).to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                stream.flush().unwrap();
+            }
+        });
+        let client = ServerClient::new(config(&endpoint)).unwrap();
+        // Registration and the start of a cycle answer the same way, and neither
+        // goes on to ask the peer for anything else.
+        for new_registration in [true, false] {
+            let error = client.resolve_identity(new_registration).unwrap_err();
+            assert_eq!(error.code, "server-incompatible");
+            assert_eq!(error.status, 409);
+            assert!(!error.retryable);
+        }
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(seen.iter().all(|line| line.starts_with("GET /session ")));
+    }
+
+    #[test]
     fn retry_policy_only_replays_reads_and_identity_bound_mutations() {
         assert!(replay_safe(&Method::GET, "head"));
         assert!(replay_safe(&Method::PUT, "staged-changes/stage/pages/0"));

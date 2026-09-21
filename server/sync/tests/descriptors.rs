@@ -100,10 +100,10 @@ fn descriptor_content_and_missing_dependency_cannot_be_forged() {
     if let RecordVersion::Live { object_hash, .. } = &mut c.changes[0].after {
         *object_hash = hash(b"wrong");
     }
-    assert_eq!(
-        store.stage_changes(&a, &c).err().unwrap().code,
-        "descriptor-object-mismatch"
-    );
+    let rejection = store.stage_changes(&a, &c).err().unwrap();
+    assert_eq!(rejection.code, "descriptor-object-mismatch");
+    // The reply names the record the page failed on, not only the reason.
+    assert_eq!(rejection.key.as_deref(), Some("child"));
     let (root, pages) = build_reference_tree(&[hash(b"missing dependency")], false).unwrap();
     for (digest, bytes) in pages {
         store.put_object(&a, &digest, &bytes).unwrap();
@@ -119,10 +119,9 @@ fn descriptor_content_and_missing_dependency_cannot_be_forged() {
         object_hash: descriptor.object_hash,
         descriptor_hash: Some(digest),
     };
-    assert_eq!(
-        store.stage_changes(&a, &c).err().unwrap().code,
-        "missing-dependency"
-    );
+    let rejection = store.stage_changes(&a, &c).err().unwrap();
+    assert_eq!(rejection.code, "missing-dependency");
+    assert_eq!(rejection.key.as_deref(), Some("child"));
 }
 
 #[test]

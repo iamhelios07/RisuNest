@@ -154,6 +154,35 @@ describe("status and error copy", () => {
     expect(serverSyncErrorHelp("server-unreachable", text)).toBe(text.errorHelp);
     expect(serverSyncErrorHelp("library-operation-busy", text)).toBe(text.busyHelp);
   });
+  it("names the stopped state and the mismatched versions", () => {
+    const blocked: ServerSyncSnapshot = {
+      ...bound(),
+      error: "invalid-control-schema",
+      errorRetryable: false,
+    };
+    expect(serverSyncStatus(blocked, text)).toEqual({
+      label: text.blocked,
+      tone: "attention",
+    });
+    expect(serverSyncErrorHelp("invalid-control-schema", text, false)).toBe(
+      text.blockedHelp,
+    );
+    expect(serverSyncErrorHelp("invalid-control-schema", text)).toBe(
+      text.errorHelp,
+    );
+    const incompatible: ServerSyncSnapshot = {
+      ...bound(),
+      error: "server-incompatible",
+      errorRetryable: false,
+    };
+    expect(serverSyncStatus(incompatible, text)).toEqual({
+      label: text.incompatible,
+      tone: "attention",
+    });
+    expect(serverSyncErrorHelp("server-incompatible", text, false)).toBe(
+      text.incompatibleHelp,
+    );
+  });
   it("shows the address without its scheme", () => {
     expect(serverSyncHostLabel("https://sync.example/base/")).toBe(
       "sync.example/base",
@@ -175,6 +204,25 @@ describe("progress view", () => {
       cycleItems: { done: 100, total: 100, activity: "confirming", processed: 0, expected: 0 } }, text, 15_000);
     expect(waiting.current).toBe(text.activity.confirming);
     expect(waiting.percent).toBeNull();
+  });
+  it("names the verification pass that sends no bytes", () => {
+    const view = serverSyncProgressView(
+      {
+        ...bound(),
+        running: true,
+        progress: "publishing",
+        cycleItems: {
+          done: 0,
+          total: 11_618,
+          activity: "verifying",
+          processed: 4_096,
+          expected: 11_618,
+        },
+      },
+      text,
+      0,
+    );
+    expect(view.current).toBe(`${text.activity.verifying} · 4,096 / 11,618`);
   });
   it("is indeterminate until native reports the cycle's record count", () => {
     const view = serverSyncProgressView(
