@@ -17,6 +17,7 @@ import {
 } from "../../scripts/release/package-app.mjs";
 import { APP_IDENTIFIER, SYNC_IDENTIFIER, assertAppIdentifier, assertNoIdentifierOverride, assertSyncIdentifier, mergeTauriConfig, releaseTauriConfig } from "../../scripts/release/tauri-config.mjs";
 import { validateOwnedInventory } from "../../server/manager/install/package.mjs";
+import { identifierDirectories, overlaps, windowsLayout } from "../pathManifest.mjs";
 
 function pe(machine) {
   const bytes = Buffer.alloc(128);
@@ -326,6 +327,54 @@ test("Sync GUI configuration carries one identity on every desktop platform", ()
     const config = mergeTauriConfig(base, overlay);
     assert.equal(assertSyncIdentifier(config, os), SYNC_IDENTIFIER);
     assert.throws(() => assertSyncIdentifier({ ...config, identifier: "wrong" }, os), /effective/);
+  }
+});
+
+test("no owned directory overlaps the installation directory either installer selects", () => {
+  const app = JSON.parse(readFileSync("src-tauri/tauri.conf.json", "utf8"));
+  const sync = JSON.parse(readFileSync("server/manager/gui/src-tauri/tauri.conf.json", "utf8"));
+  const syncHook = readFileSync("server/manager/install/windows.nsh", "utf8");
+  const appHook = readFileSync("src-tauri/windows.nsh", "utf8");
+
+  // The NSIS template derives $INSTDIR from PRODUCTNAME, under $LOCALAPPDATA
+  // for a currentUser install. The Sync hook then rewrites it to a name
+  // without spaces.
+  assert.notEqual(app.bundle.windows.nsis.installMode, "perMachine");
+  const bundled = JSON.parse(readFileSync("server/manager/gui/src-tauri/tauri.bundle.conf.json", "utf8"));
+  assert.equal(bundled.bundle.windows.nsis.installMode, "currentUser");
+  const forced = syncHook.match(/!define RISUNEST_SYNC_INSTALL_DIR "\$LOCALAPPDATA\\([^"]+)"/);
+  assert.ok(forced, "the Sync hook must define its installation directory");
+
+  const installs = {
+    app: `$LOCALAPPDATA\\${app.productName}`,
+    sync: `$LOCALAPPDATA\\${forced[1]}`,
+  };
+  const identifiers = { app: app.identifier, sync: sync.identifier };
+  const known = new Set(["$INSTDIR"]);
+  for (const product of ["app", "sync"]) {
+    const layout = windowsLayout(product);
+    // The manifest's record of the installation directory has to be the one
+    // the installer actually uses, or the overlap check proves nothing.
+    assert.equal(layout.install, installs[product]);
+    known.add(layout.install);
+    const owned = [...layout.roots, ...identifierDirectories(identifiers[product])];
+    for (const root of owned) {
+      assert.ok(
+        !overlaps(root, layout.install),
+        `${product}: ${root} overlaps ${layout.install}`,
+      );
+      known.add(root);
+    }
+    // The comparison is component-wise: RisuNestData shares a string prefix
+    // with RisuNest and must still read as a sibling.
+    assert.ok(overlaps(`${layout.install}\\nested`, layout.install));
+  }
+
+  // A delete-data branch may only remove a directory the manifest owns.
+  for (const hook of [appHook, syncHook]) {
+    for (const [, target] of hook.matchAll(/RmDir(?: \/r)? "([^"]+)"/g)) {
+      assert.ok(known.has(target), `unowned RmDir target: ${target}`);
+    }
   }
 });
 
