@@ -18,8 +18,8 @@ use crate::{
     server_sync::{
         cache::Cache,
         client::{
-            is_ambiguous_transient, response_error, Reply, RequestAttempt, RetryBudget,
-            ServerClient,
+            is_ambiguous_transient, response_code, response_error, Reply, RequestAttempt,
+            RetryBudget, ServerClient,
         },
         planner::{self, Decision},
         remote,
@@ -238,7 +238,7 @@ mod commit_retry_tests {
 pub(crate) struct CycleItemCounter {
     pub total: std::sync::atomic::AtomicU64,
     pub done: std::sync::atomic::AtomicU64,
-    pub activity: std::sync::atomic::AtomicU8,
+    pub activity: std::sync::Arc<std::sync::atomic::AtomicU8>,
     pub processed: std::sync::atomic::AtomicU64,
     pub expected: std::sync::atomic::AtomicU64,
 }
@@ -298,6 +298,10 @@ pub(crate) enum Preparation {
 }
 pub(crate) struct PreparedCycle {
     pub revision: i64,
+    /// True when preparation enumerated every key, not only the outbox. Its
+    /// activation is what releases the pending full comparison.
+    whole_set: bool,
+    applied_keys: Vec<String>,
     previous: Option<RemoteHead>,
     pub through: RemoteHead,
     records: ValidatedRecords,
@@ -334,6 +338,28 @@ impl PreparedCycle {
 
 /// A published embedding body is bounded by the store's own dimension limit.
 const MAX_SECTION_OBJECT_BYTES: usize = 1024 * 1024;
+
+/// The server grants a 24 hour object lease. A confirmation is reused for four
+/// hours less, covering clock skew between the two sides and the pass duration.
+const VERIFIED_OBJECT_WINDOW: i64 = 20 * 60 * 60;
+
+fn unix_seconds() -> Result<i64> {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| SyncError::new("invalid-device-clock", 500))?
+        .as_secs();
+    i64::try_from(seconds).map_err(|_| SyncError::new("invalid-device-clock", 500))
+}
+
+/// The two replies that mean the server no longer holds an object this device
+/// confirmed. Everything else is answered the same with or without a pass.
+fn verification_recoverable(reply: &Reply) -> bool {
+    let code = response_code(reply);
+    matches!(
+        (reply.status, code.as_deref()),
+        (409, Some("missing-dependency")) | (404, Some("object-not-found"))
+    )
+}
 
 fn json<T: Serialize>(value: &T) -> Result<String> {
     String::from_utf8(canonical::encode(value)?)
@@ -600,7 +626,6 @@ impl PersistentStore {
             )?;
         }
         builder.flush()?;
-        self.connection.execute("DELETE FROM server_sync_prepared", [])?;
         let changes_digest = digest.finish()?;
         let pages: i64 = self.connection.query_row(
             "SELECT count(*) FROM server_sync_operation_pages",
@@ -608,7 +633,7 @@ impl PersistentStore {
             |r| r.get(0),
         )?;
         if pages == 1 {
-            self.upload_pending_objects(transfer, cycle_items)?;
+            self.upload_pending_objects(transfer, cycle_items, None)?;
             let body: Vec<u8> = self.connection.query_row(
                 "SELECT body FROM server_sync_operation_pages WHERE page=0",
                 [],
@@ -723,6 +748,7 @@ impl PersistentStore {
             &[],
             MAX_METADATA_BYTES,
         )?;
+        let mut restaged = false;
         if [404, 410].contains(&progress.status) {
             #[derive(Deserialize)]
             #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -732,10 +758,34 @@ impl PersistentStore {
             let (_, stage): (_, Started) =
                 client.json(Method::POST, "staged-changes/start", &[], None::<&()>, &[])?;
             pending.intent = self.server_restage(stage.staged_changes_id)?;
+            restaged = true;
         } else if progress.status != 200 {
             return Err(response_error(progress));
         }
-        self.upload_pending_objects(transfer, cycle_items)?;
+        let stage_id = pending.intent.staged_changes_id.clone();
+        // Object leases last a day from the server clock. A pass that confirmed
+        // this stage recently cannot have lost them, so the retry goes straight
+        // to the request that failed instead of walking every record again.
+        let now = unix_seconds()?;
+        let mut skipped = !restaged
+            && pending.verified_stage.as_deref() == Some(stage_id.as_str())
+            && pending
+                .verified_at
+                .is_some_and(|at| (0..VERIFIED_OBJECT_WINDOW).contains(&(now - at)));
+        if !skipped {
+            self.upload_pending_objects(transfer, cycle_items, Some(&stage_id))?;
+        }
+        // A skipped pass is trusted once. If the server answers that an object
+        // it confirmed is gone, the pass runs and the same request is retried.
+        let mut recover = |store: &Self, reply: &Reply| -> Result<bool> {
+            if !skipped || !verification_recoverable(reply) {
+                return Ok(false);
+            }
+            skipped = false;
+            store.server_clear_verification()?;
+            store.upload_pending_objects(transfer, cycle_items, Some(&stage_id))?;
+            Ok(true)
+        };
         // Pages are idempotent by index and exact bytes. Replaying them is safe
         // after process death between a successful PUT and recording its response.
         let mut page_index = 0i64;
@@ -753,16 +803,16 @@ impl PersistentStore {
             };
             let reply = client.request(
                 Method::PUT,
-                &format!(
-                    "staged-changes/{}/pages/{page_index}",
-                    pending.intent.staged_changes_id
-                ),
+                &format!("staged-changes/{stage_id}/pages/{page_index}"),
                 &[],
                 Some(body),
                 &[],
                 MAX_METADATA_BYTES,
             )?;
             if reply.status != 204 {
+                if recover(self, &reply)? {
+                    continue;
+                }
                 return Err(response_error(reply));
             }
             client.progress();
@@ -774,13 +824,23 @@ impl PersistentStore {
             staged_changes_id: String,
             changes_digest: String,
         }
-        let (_, sealed): (_, Sealed) = client.json(
-            Method::POST,
-            &format!("staged-changes/{}/seal", pending.intent.staged_changes_id),
-            &[],
-            None::<&()>,
-            &[],
-        )?;
+        let sealed: Sealed = loop {
+            let reply = client.request(
+                Method::POST,
+                &format!("staged-changes/{stage_id}/seal"),
+                &[],
+                None,
+                &[],
+                MAX_METADATA_BYTES,
+            )?;
+            if !(200..300).contains(&reply.status) {
+                if recover(self, &reply)? {
+                    continue;
+                }
+                return Err(response_error(reply));
+            }
+            break canonical::decode(&reply.body, MAX_METADATA_BYTES)?;
+        };
         if sealed.staged_changes_id != pending.intent.staged_changes_id
             || sealed.changes_digest != pending.intent.changes_digest
         {
@@ -802,18 +862,23 @@ impl PersistentStore {
             Err(response_error(reply))
         }
     }
+    /// Confirms every object of the pending operation is present on the server,
+    /// uploading what is missing. With a stage id the completed pass is recorded
+    /// so a later resume against the same stage can skip it.
     fn upload_pending_objects(
         &self,
         transfer: &Transfer<'_>,
         cycle_items: Option<&CycleItemCounter>,
+        record_stage: Option<&str>,
     ) -> Result<()> {
+        let started_at = unix_seconds()?;
         let count: i64 = self.connection.query_row("SELECT count(*) FROM server_sync_operation_records", [], |row| row.get(0))?;
         if let Some(counter) = cycle_items {
             if counter.total.load(std::sync::atomic::Ordering::Relaxed) == 0 {
                 counter.total.store(count as u64, std::sync::atomic::Ordering::Relaxed);
             }
         }
-        CycleItemCounter::start(cycle_items, 4, count as u64);
+        CycleItemCounter::start(cycle_items, 6, count as u64);
         let mut remote_context = None;
         let mut pending = Vec::new();
         let mut pending_bytes = 0u64;
@@ -929,6 +994,11 @@ impl PersistentStore {
         }
         transfer.upload_targets(&pending)?;
         for _ in 0..pending_records { CycleItemCounter::advance(cycle_items); CycleItemCounter::processed(cycle_items); }
+        if let Some(stage) = record_stage {
+            if self.server_pending()?.is_some() {
+                self.server_record_verification(stage, started_at)?;
+            }
+        }
         CycleItemCounter::start(cycle_items, 5, 0);
         Ok(())
     }
@@ -961,6 +1031,7 @@ impl PersistentStore {
         };
         client.verified_bytes = options.verified_bytes.clone();
         client.retryable_failure = options.retryable_failure.clone();
+        client.activity = options.cycle_items.as_ref().map(|c| c.activity.clone());
         let identity_head = client.resolve_identity(false)?;
         self.server_cache_endpoint(&config, &client.config())?;
         let resume_may_commit = self
@@ -1027,7 +1098,8 @@ impl PersistentStore {
             options.cycle_items.as_deref(),
         );
         self.release_revision(&lease.lease)?;
-        prepared?;
+        let whole_set = prepared?;
+        let mut applied_keys = Vec::new();
         let mut conflicts = Vec::new();
         let mut conflict_count = 0;
         let mut after = String::new();
@@ -1380,6 +1452,7 @@ impl PersistentStore {
                             },
                         )?)?;
                         acknowledged.push(dirty);
+                        applied_keys.push(item.key.clone());
                         hash
                     }
                     "identical" => {
@@ -1421,6 +1494,8 @@ impl PersistentStore {
         )?;
         Ok(Preparation::Ready(PreparedCycle {
             revision,
+            whole_set,
+            applied_keys,
             previous: status.head,
             through,
             records,
@@ -1490,15 +1565,15 @@ impl PersistentStore {
             ReplicaAdvance {
                 scope_clears: ready.scope_clears.clone(),
                 publish_keys: ready.publish_keys.clone(),
+                applied_keys: ready.applied_keys.clone(),
                 bases,
                 finish_operation: ready.committed,
                 clear_revision: ready.clear_acknowledged.then_some(ready.revision),
                 applied_sections,
-                scanned_revision: if ready.proposals == 0 {
-                    Some(ready.revision)
-                } else {
-                    None
-                },
+                // Activation puts every published key into the outbox, so a
+                // publication that later fails re-proposes the same key set
+                // without another whole-library comparison.
+                scanned_revision: ready.whole_set.then_some(ready.revision),
             },
         )?;
         ready.activated = Some(revision);
@@ -1523,6 +1598,7 @@ impl PersistentStore {
         )?;
         client.verified_bytes = ready.verified_bytes.clone();
         client.retryable_failure = ready.retryable_failure.clone();
+        client.activity = ready.cycle_items.as_ref().map(|c| c.activity.clone());
         let cache = Cache::open(&self.repository_root.join("server-sync").join(
             risunest_sync_wire::hash(
                 format!("{}:{}", config.library_id, config.device_id).as_bytes(),
@@ -1553,7 +1629,6 @@ impl PersistentStore {
         }
         let applied_records = ready.applied + if ready.section_honored { ready.section_applied } else { 0 };
         if proposals == 0 && ready.scope_fences.is_empty() {
-            self.connection.execute("DELETE FROM server_sync_prepared", [])?;
             return Ok(CycleResult {
                 endpoint: client.config().endpoint.clone(),
                 phase: "idle".into(),
@@ -1875,6 +1950,37 @@ impl PersistentStore {
         // Missing local bases use the protocol's explicit full transfer path.
         Ok(cache.base_candidates(key, &base).unwrap_or_default())
     }
+    /// Whether an edit this key's acknowledgement would clear landed after the
+    /// given revision. The owner rows follow `acknowledge_keys` exactly, so a
+    /// prepared row is never reused across a change it would have consumed.
+    fn server_key_edited_after(
+        db: &Connection,
+        key: &outbox::ServerDirtyKey,
+        revision: i64,
+    ) -> Result<bool> {
+        let direct: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM server_sync_dirty WHERE kind=?1 AND key1=?2 AND key2=?3 AND revision>?4)",
+            params![key.kind, key.key1, key.key2, revision],
+            |r| r.get(0),
+        )?;
+        if direct {
+            return Ok(true);
+        }
+        Ok(match key.kind.as_str() {
+            "character" => db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM server_sync_dirty WHERE kind='owner' AND key1='character-additional-assets' AND key2=?1 AND revision>?2)",
+                params![key.key1, revision],
+                |r| r.get(0),
+            )?,
+            "root" => db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM server_sync_dirty WHERE kind='owner' AND key1<>'character-additional-assets' AND revision>?1)",
+                [revision],
+                |r| r.get(0),
+            )?,
+            _ => false,
+        })
+    }
+    /// Returns whether the prepared key set covers the whole library.
     fn prepare_server_cycle(
         &mut self,
         lease: &str,
@@ -1883,11 +1989,13 @@ impl PersistentStore {
         full_scan: bool,
         client: &ServerClient,
         counter: Option<&CycleItemCounter>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         CycleItemCounter::start(counter, 1, 0);
         self.connection.execute_batch("CREATE TEMP TABLE IF NOT EXISTS server_cycle_keys(key TEXT PRIMARY KEY); DELETE FROM server_cycle_keys; CREATE TEMP TABLE IF NOT EXISTS server_cycle_records(key TEXT PRIMARY KEY,version TEXT NOT NULL,local_hash TEXT,action TEXT NOT NULL DEFAULT '',remote TEXT NOT NULL DEFAULT ''); DELETE FROM server_cycle_records; CREATE TEMP TABLE IF NOT EXISTS server_cycle_objects(hash TEXT PRIMARY KEY); DELETE FROM server_cycle_objects;")?;
         let (db, target) = self.read_view(Some(lease))?;
-        self.connection.execute("DELETE FROM server_sync_prepared WHERE revision<>?1 OR generation<>?2", params![target.revision,target.generation])?;
+        // Restore and replacement change the generation and invalidate every
+        // projection. Within one generation a row is judged per key below.
+        self.connection.execute("DELETE FROM server_sync_prepared WHERE generation<>?1", params![target.generation])?;
         let cas = PayloadCas::new(&self.repository_root)?;
         let full_marker: bool = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM server_sync_dirty WHERE kind='full')",
@@ -1968,14 +2076,22 @@ impl PersistentStore {
             for key in keys {
                 client.ensure_active()?;
                 after = key.clone();
-                let cached: Option<(String, Option<String>)> = self.connection.query_row(
-                    "SELECT version,local_hash FROM server_sync_prepared WHERE key=?1", [&key], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
-                if let Some((version, local_hash)) = cached {
+                let dirty = key_parts(&key, target.revision)?;
+                let cached: Option<(String, Option<String>, i64)> = self.connection.query_row(
+                    "SELECT version,local_hash,revision FROM server_sync_prepared WHERE key=?1", [&key], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+                // A row outlives its cycle and is reused until a local edit this
+                // key would acknowledge lands after the revision it was read at.
+                let reusable = match &cached {
+                    Some((_, _, revision)) => {
+                        !Self::server_key_edited_after(db, &dirty, *revision)?
+                    }
+                    None => false,
+                };
+                if let (true, Some((version, local_hash, _))) = (reusable, cached) {
                     self.connection.execute("INSERT INTO server_cycle_records(key,version,local_hash) VALUES(?1,?2,?3)", params![key,version,local_hash])?;
                     CycleItemCounter::processed(counter);
                     continue;
                 }
-                let dirty = key_parts(&key, target.revision)?;
                 let (base, base_hash) = self.effective_server_base(Domain::Library, &key, committed)?;
                 let (version, local_hash) = if let Some(payload) =
                     projection::project(db, &cas, &target.generation, &dirty)?
@@ -2014,7 +2130,7 @@ impl PersistentStore {
                 } else {
                     (delete_version(&base), None)
                 };
-                self.connection.execute("INSERT INTO server_sync_prepared(key,version,local_hash,revision,generation) VALUES(?1,?2,?3,?4,?5)", params![key,json(&version)?,local_hash,target.revision,target.generation])?;
+                self.connection.execute("INSERT INTO server_sync_prepared(key,version,local_hash,revision,generation) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(key) DO UPDATE SET version=excluded.version,local_hash=excluded.local_hash,revision=excluded.revision,generation=excluded.generation", params![key,json(&version)?,local_hash,target.revision,target.generation])?;
                 self.connection.execute(
                     "INSERT INTO server_cycle_records(key,version,local_hash) VALUES(?1,?2,?3)",
                     params![key, json(&version)?, local_hash],
@@ -2022,7 +2138,7 @@ impl PersistentStore {
                 CycleItemCounter::processed(counter);
             }
         }
-        Ok(())
+        Ok(full_scan || full_marker)
     }
     fn server_order_conflicts(
         &self,

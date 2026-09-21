@@ -571,7 +571,10 @@ fn preparation_roots_survive_reopen_and_assets_never_enter_the_derived_cache() {
     assert!(first.collect_labelled_asset_gc_roots(false, true).unwrap().iter()
         .any(|(label, roots)| *label == "server-sync" && roots.object_hashes.contains(hash)));
     assert_eq!(settle(&mut first).phase, "idle");
-    assert_eq!(first.connection.query_row("SELECT count(*) FROM server_sync_prepared", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    // Projection rows outlive publication, so a later retry re-projects only the
+    // keys edited since. They remain cache roots and still hold no asset body.
+    assert!(first.connection.query_row("SELECT count(*) FROM server_sync_prepared", [], |r| r.get::<_, i64>(0)).unwrap() > 0);
+    assert!(first.server_cache().unwrap().cas.stat_object(hash).unwrap().is_none());
     let target = tempfile::tempdir().unwrap();
     let mut second = PersistentStore::open(target.path()).unwrap();
     fixture.bind(&mut second);

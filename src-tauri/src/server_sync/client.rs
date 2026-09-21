@@ -141,6 +141,24 @@ pub(crate) struct ServerClient {
     retry_budget: Arc<RetryBudget>,
     pub(crate) verified_bytes: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     pub(crate) retryable_failure: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
+    /// The cycle's activity slot. The transfer layer raises it while object
+    /// bytes are on the wire and restores what it replaced afterwards.
+    pub(crate) activity: Option<std::sync::Arc<std::sync::atomic::AtomicU8>>,
+}
+/// The activity id shown while frames or chunks are in flight.
+pub(crate) const ACTIVITY_UPLOADING: u8 = 4;
+/// Restores the activity the transfer replaced, on every exit path. Nested
+/// transfers restore in reverse order, so the outermost one ends the phase.
+pub(crate) struct TransferActivity<'a> {
+    activity: Option<&'a std::sync::atomic::AtomicU8>,
+    previous: u8,
+}
+impl Drop for TransferActivity<'_> {
+    fn drop(&mut self) {
+        if let Some(activity) = self.activity {
+            activity.store(self.previous, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 pub(crate) struct Reply {
     pub status: u16,
@@ -240,6 +258,7 @@ impl ServerClient {
         candidate.retry_budget = self.retry_budget.clone();
         candidate.verified_bytes = self.verified_bytes.clone();
         candidate.retryable_failure = self.retryable_failure.clone();
+        candidate.activity = self.activity.clone();
         let head = verify(&candidate)?;
         *self.url.write().unwrap_or_else(|error| error.into_inner()) = candidate
             .url
@@ -310,6 +329,7 @@ impl ServerClient {
             retry_budget,
             verified_bytes: None,
             retryable_failure: None,
+            activity: None,
         })
     }
     pub(crate) fn retry_budget(&self) -> Arc<RetryBudget> {
@@ -323,6 +343,19 @@ impl ServerClient {
         self.progress();
         if let Some(counter) = &self.verified_bytes {
             counter.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    pub(crate) fn transferring(&self) -> TransferActivity<'_> {
+        match self.activity.as_deref() {
+            Some(activity) => TransferActivity {
+                previous: activity
+                    .swap(ACTIVITY_UPLOADING, std::sync::atomic::Ordering::Relaxed),
+                activity: Some(activity),
+            },
+            None => TransferActivity {
+                activity: None,
+                previous: 0,
+            },
         }
     }
     pub fn report_retryable_failure(&self, code: Option<&str>) {
@@ -627,7 +660,7 @@ impl ServerClient {
     }
 }
 
-fn response_code(reply: &Reply) -> Option<String> {
+pub(crate) fn response_code(reply: &Reply) -> Option<String> {
     serde_json::from_slice::<serde_json::Value>(&reply.body)
         .ok()
         .and_then(|value| {

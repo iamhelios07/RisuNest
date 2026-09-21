@@ -403,6 +403,7 @@ impl<'a> Transfer<'a> {
         if frames.is_empty() {
             return Ok(());
         }
+        let _activity = self.client.transferring();
         // Two bounded requests run together; all other transfer requests run
         // on the coordinator only after both workers have joined.
         let mut remaining = frames;
@@ -913,6 +914,7 @@ impl<'a> Transfer<'a> {
     }
     fn upload_large(&self, hash: &str, size: u64, base_candidates: &[String]) -> Result<()> {
         self.ensure_active()?;
+        let _activity = self.client.transferring();
         let cached: Option<(String, String)> = self
             .db
             .query_row("SELECT id,size FROM uploads WHERE hash=?1", [hash], |r| {
