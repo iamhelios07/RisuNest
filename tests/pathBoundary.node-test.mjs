@@ -85,6 +85,32 @@ test('the manifests are the modules that do resolve roots', async () => {
     assert.match(sync, /"LOCALAPPDATA"/)
 })
 
+test('the iOS staging root is received from Rust rather than derived in Swift', async () => {
+    const swift = await readFile(
+        join(ROOT, 'crates', 'tauri-plugin-ios-native', 'ios', 'Sources', 'IosNativePlugin.swift'),
+        'utf8',
+    )
+    // Swift enforces file ownership against this root, so a derivation of its
+    // own would make the check verify nothing.
+    assert.doesNotMatch(swift, /applicationSupportDirectory/)
+    assert.match(swift, /private var dataRoot: URL\?/)
+    assert.match(swift, /func setDataRoot\(/)
+    // The sweep may only run once the root has arrived.
+    assert.doesNotMatch(swift, /webView = webview\s+sweepStaging\(/)
+
+    const plugin = await readFile(
+        join(ROOT, 'crates', 'tauri-plugin-ios-native', 'src', 'lib.rs'),
+        'utf8',
+    )
+    assert.match(plugin, /run_mobile_plugin_async::<\(\)>\(\s*"setDataRoot"/)
+    const entry = await readFile(join(ROOT, 'src-tauri', 'src', 'lib.rs'), 'utf8')
+    assert.match(entry, /set_data_root\(&root\)/)
+
+    // Both consumers name the same leaf inside that root.
+    const helper = await readFile(join(ROOT, 'src', 'ts', 'storage', 'nativePaths.ts'), 'utf8')
+    for (const source of [swift, helper]) assert.match(source, /'ios-file-staging'|"ios-file-staging"/)
+})
+
 test('orphan asset collection is left to the native repository', async () => {
     const bootstrap = await readFile(join(ROOT, 'src', 'ts', 'bootstrap.ts'), 'utf8')
     // The renderer enumerated a flat assets directory that the
