@@ -33,12 +33,11 @@ pub struct UpdateScheduleStatus {
     pub action_matches: bool,
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(unix)]
 fn user_service_directory() -> Result<PathBuf> {
-    Ok(paths::current()?
-        .config_home
-        .ok_or("absolute-config-path-required")?
-        .join("systemd/user"))
+    paths::current()?
+        .user_services
+        .ok_or_else(|| "absolute-config-path-required".into())
 }
 
 pub fn default_data_dir() -> Result<PathBuf> {
@@ -514,6 +513,7 @@ pub fn xml(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(windows))]
     use super::*;
 
     #[cfg(not(windows))]

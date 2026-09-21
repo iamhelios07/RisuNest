@@ -88,9 +88,9 @@ pub struct SyncPaths {
     pub tauri_derived: Vec<PathBuf>,
     /// The directory the installer selects by default.
     pub default_install: Option<PathBuf>,
-    /// `$XDG_CONFIG_HOME`, which holds the Linux user service units. `None`
-    /// where the platform has no such directory.
-    pub config_home: Option<PathBuf>,
+    /// The directory holding the user service unit for this platform. `None`
+    /// where startup registration is not a unit file.
+    pub user_services: Option<PathBuf>,
 }
 
 pub fn layout(platform: Platform, hives: &Hives) -> Result<SyncPaths> {
@@ -130,9 +130,19 @@ pub fn layout(platform: Platform, hives: &Hives) -> Result<SyncPaths> {
         webview,
         tauri_derived: tauri_derived(platform, hives),
         default_install,
-        config_home: match platform {
-            Platform::Linux => Some(hives.xdg(&hives.xdg_config, ".config").ok_or_else(missing)?),
-            Platform::Windows | Platform::MacOs => None,
+        user_services: match platform {
+            Platform::Linux => Some(
+                hives
+                    .xdg(&hives.xdg_config, ".config")
+                    .ok_or_else(missing)?
+                    .join("systemd/user"),
+            ),
+            Platform::MacOs => Some(
+                Hives::absolute(&hives.home)
+                    .ok_or_else(missing)?
+                    .join("Library/LaunchAgents"),
+            ),
+            Platform::Windows => None,
         },
     })
 }
@@ -234,9 +244,15 @@ mod tests {
             Some(base("home").join(".local/lib/risunest-sync"))
         );
 
-        assert_eq!(linux.config_home, Some(base("home").join(".config")));
-        assert_eq!(windows.config_home, None);
-        assert_eq!(macos.config_home, None);
+        assert_eq!(
+            linux.user_services,
+            Some(base("home").join(".config/systemd/user"))
+        );
+        assert_eq!(
+            macos.user_services,
+            Some(base("home").join("Library/LaunchAgents"))
+        );
+        assert_eq!(windows.user_services, None);
 
         let explicit = Hives {
             xdg_data: Some(base("xdg-data")),
@@ -245,7 +261,10 @@ mod tests {
         };
         let resolved = layout(Platform::Linux, &explicit).unwrap();
         assert_eq!(resolved.data, base("xdg-data").join("risunest-sync"));
-        assert_eq!(resolved.config_home, Some(base("xdg-config")));
+        assert_eq!(
+            resolved.user_services,
+            Some(base("xdg-config").join("systemd/user"))
+        );
 
         // An empty or relative value is not a hive; the absolute home takes over.
         for invalid in [PathBuf::new(), PathBuf::from("relative/config")] {
@@ -254,8 +273,8 @@ mod tests {
                 ..hives()
             };
             assert_eq!(
-                layout(Platform::Linux, &relative).unwrap().config_home,
-                Some(base("home").join(".config"))
+                layout(Platform::Linux, &relative).unwrap().user_services,
+                Some(base("home").join(".config/systemd/user"))
             );
         }
         assert!(layout(
