@@ -232,6 +232,18 @@ async fn native_request(url: String, body: String, header: String, method: Strin
 
 pub use app_paths::{AppPaths, Integration};
 
+/// Remembers the main window geometry beside the store. The plugin resolves its
+/// directory once at registration, so it is wired where the manifest is known.
+#[cfg(windows)]
+fn window_state_plugin(directory: &std::path::Path) -> tauri::plugin::TauriPlugin<tauri::Wry> {
+    use tauri_plugin_window_state::StateFlags;
+    tauri_plugin_window_state::Builder::default()
+        .with_state_flags(StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED)
+        .with_filter(|label| label == "main")
+        .with_directory(directory.to_path_buf())
+        .build()
+}
+
 /// Product initialization shared by native entry points. An alternative entry
 /// manages its own [`AppPaths`] before building.
 pub fn builder() -> tauri::Builder<tauri::Wry> {
@@ -275,17 +287,7 @@ fn builder_with_main_window(
     }
     #[cfg(windows)]
     {
-        use tauri_plugin_window_state::StateFlags;
-        builder = builder
-            .plugin(
-                tauri_plugin_window_state::Builder::default()
-                    .with_state_flags(
-                        StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED,
-                    )
-                    .with_filter(|label| label == "main")
-                    .build(),
-            )
-            .plugin(windows_appearance::init());
+        builder = builder.plugin(windows_appearance::init());
     }
     #[cfg(target_os = "macos")]
     {
@@ -855,6 +857,10 @@ pub fn run() {
     let main_window = None;
     #[allow(unused_mut)]
     let mut builder = builder_with_main_window(main_window);
+    #[cfg(windows)]
+    {
+        builder = builder.plugin(window_state_plugin(&paths.data));
+    }
     #[cfg(desktop)]
     {
         builder = builder.manage(paths.prepared().expect("application data root unavailable"));

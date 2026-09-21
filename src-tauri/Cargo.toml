@@ -147,3 +147,6 @@ regex = "1.13.1"
 [patch.crates-io]
 # Keep failed desktop updates from closing or discarding the installed app.
 tauri-plugin-updater = { path = "../crates/tauri-plugin-updater" }
+# Let the window state file follow the manifest root instead of the
+# identifier-derived configuration directory.
+tauri-plugin-window-state = { path = "../crates/tauri-plugin-window-state" }
