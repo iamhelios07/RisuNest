@@ -580,6 +580,21 @@ impl PersistentStore {
                     .map_err(|_| SyncError::new("invalid-receipt", 409))?],
             )?;
         } else {
+            if let Some(code) = &receipt.error {
+                crate::native_log::global_state().record(
+                    "error",
+                    "server-sync",
+                    format!(
+                        "server rejected the operation: status={:?} code={code} key={}",
+                        receipt.status,
+                        receipt
+                            .error_key
+                            .as_deref()
+                            .map(crate::server_sync::client::log_key)
+                            .unwrap_or_default()
+                    ),
+                );
+            }
             // Stale/failed is terminal for this sequence, while every local dirty
             // record and clear intent remains available for a new proposal.
             for table in [

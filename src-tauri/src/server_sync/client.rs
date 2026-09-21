@@ -788,7 +788,7 @@ pub(crate) fn response_error(reply: Reply) -> SyncError {
     SyncError::new(code, reply.status)
 }
 /// Bounds a reported key and drops control characters before it reaches a log line.
-fn log_key(value: &str) -> String {
+pub(crate) fn log_key(value: &str) -> String {
     value
         .chars()
         .filter(|c| !c.is_control())
