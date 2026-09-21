@@ -379,7 +379,10 @@ pub fn delete_registered_data(root: &Path, server: &Path) -> Result<()> {
     }
     safe_data_tree(root)?;
     if !shared_profile {
-        if let Some(profile) = platform::webview_data_dir()? {
+        let profiles = platform::webview_data_dir()?
+            .into_iter()
+            .chain(platform::identifier_directories()?);
+        for profile in profiles {
             safe_tree(&profile)?;
             if profile.exists() {
                 fs::remove_dir_all(&profile).map_err(|_| "removal-profile-failed")?;

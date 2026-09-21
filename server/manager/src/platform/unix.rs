@@ -1,11 +1,5 @@
 use super::*;
 
-fn home() -> Result<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .ok_or("home-unavailable".into())
-}
 fn checked(command: &mut Command) -> Result<()> {
     let output = command
         .stdin(Stdio::null())
@@ -34,8 +28,7 @@ fn systemd_arg(path: &Path) -> Result<String> {
 }
 #[cfg(not(target_os = "macos"))]
 pub(super) fn startup(root: &Path, executable: &Path, action: &str) -> Result<StartupStatus> {
-    let directory =
-        user_service_directory(std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from), home)?;
+    let directory = user_service_directory()?;
     let name = format!("{}.service", instance_name(root));
     let path = directory.join(&name);
     match action {
@@ -106,8 +99,7 @@ pub(super) fn update_schedule(
     policy: UpdatePolicy,
     action: &str,
 ) -> Result<UpdateScheduleStatus> {
-    let directory =
-        user_service_directory(std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from), home)?;
+    let directory = user_service_directory()?;
     let update_service = format!("{}-update.service", instance_name(root));
     let timer = format!("{}-update.timer", instance_name(root));
     let service_path = directory.join(&update_service);
@@ -206,7 +198,7 @@ fn startup_agent_body(name: &str, root: &Path, executable: &Path) -> String {
 
 #[cfg(target_os = "macos")]
 pub(super) fn startup(root: &Path, executable: &Path, action: &str) -> Result<StartupStatus> {
-    let directory = home()?.join("Library/LaunchAgents");
+    let directory = user_service_directory()?;
     let name = format!("io.github.rsyumi.{}", instance_name(root));
     let path = directory.join(format!("{name}.plist"));
     let uid = process("id")
@@ -259,7 +251,7 @@ pub(super) fn update_schedule(
     policy: UpdatePolicy,
     action: &str,
 ) -> Result<UpdateScheduleStatus> {
-    let directory = home()?.join("Library/LaunchAgents");
+    let directory = user_service_directory()?;
     let name = format!("io.github.rsyumi.{}-update", instance_name(root));
     let path = directory.join(format!("{name}.plist"));
     let uid = process("id")

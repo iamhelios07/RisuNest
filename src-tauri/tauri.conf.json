@@ -121,9 +121,6 @@
       "assetProtocol": {
         "scope": [
           "asset",
-          "$APPDATA",
-          "$APPDATA/*",
-          "$APPDATA/**/*",
           "/data/**/*"
         ],
         "enable": true

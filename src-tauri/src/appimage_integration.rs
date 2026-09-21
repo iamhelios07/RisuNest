@@ -56,7 +56,9 @@ mod linux {
         }
         let binary = tauri::utils::platform::current_exe().map_err(|error| error.to_string())?;
         let name = format!("{}-handler.desktop", binary.file_name().ok_or("AppImage executable is unavailable")?.to_string_lossy());
-        let target = app.path().data_dir().map_err(|error| error.to_string())?.join("applications").join(&name);
+        let manifest = crate::app_paths::manifest(app)?;
+        let integration = manifest.integration.as_ref().ok_or("desktop integration roots are unavailable")?;
+        let target = integration.data_home.join("applications").join(&name);
         Ok((target, name, format!("\"{image_text}\" %u")))
     }
 
@@ -182,13 +184,15 @@ fn remove_owned_at(image: &std::path::Path, name: &str, applications: &std::path
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn remove_owned(image: &std::path::Path) -> Result<(), String> {
+pub(crate) fn remove_owned(
+    image: &std::path::Path,
+    integration: &crate::app_paths::Integration,
+) -> Result<(), String> {
     let failure = || "app-cleanup-integration-failed".to_owned();
     let binary = tauri::utils::platform::current_exe().map_err(|_| failure())?;
     let name = format!("{}-handler.desktop", binary.file_name().ok_or_else(failure)?.to_string_lossy());
-    let applications = dirs::data_dir().ok_or_else(failure)?.join("applications");
-    let config = dirs::config_dir().ok_or_else(failure)?;
-    remove_owned_at(image, &name, &applications, &config)
+    let applications = integration.data_home.join("applications");
+    remove_owned_at(image, &name, &applications, &integration.config_home)
 }
 
 #[tauri::command]

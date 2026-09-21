@@ -1,7 +1,7 @@
 mod account_credential;
 #[cfg(any(test, target_os = "android"))]
 mod android_commit_transport;
-mod app_data_root;
+mod app_paths;
 mod cleanup_secrets;
 mod cleanup_webview;
 mod app_cleanup;
@@ -128,9 +128,7 @@ fn native_startup_status(state: tauri::State<'_, NativeStartupState>) -> Result<
 }
 
 fn boot_marker_root(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
-    app_data_root::resolve(app).map_err(|error| {
-        format!("failed to resolve application data directory: {error}")
-    })
+    app_paths::data_root(app)
 }
 
 fn boot_marker_now() -> i64 {
@@ -232,7 +230,22 @@ async fn native_request(url: String, body: String, header: String, method: Strin
     }
 }
 
-/// Product initialization shared by native entry points.
+pub use app_paths::{AppPaths, Integration};
+
+/// Remembers the main window geometry beside the store. The plugin resolves its
+/// directory once at registration, so it is wired where the manifest is known.
+#[cfg(windows)]
+fn window_state_plugin(directory: &std::path::Path) -> tauri::plugin::TauriPlugin<tauri::Wry> {
+    use tauri_plugin_window_state::StateFlags;
+    tauri_plugin_window_state::Builder::default()
+        .with_state_flags(StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED)
+        .with_filter(|label| label == "main")
+        .with_directory(directory.to_path_buf())
+        .build()
+}
+
+/// Product initialization shared by native entry points. An alternative entry
+/// manages its own [`AppPaths`] before building.
 pub fn builder() -> tauri::Builder<tauri::Wry> {
     builder_with_main_window(None)
 }
@@ -274,17 +287,7 @@ fn builder_with_main_window(
     }
     #[cfg(windows)]
     {
-        use tauri_plugin_window_state::StateFlags;
-        builder = builder
-            .plugin(
-                tauri_plugin_window_state::Builder::default()
-                    .with_state_flags(
-                        StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED,
-                    )
-                    .with_filter(|label| label == "main")
-                    .build(),
-            )
-            .plugin(windows_appearance::init());
+        builder = builder.plugin(windows_appearance::init());
     }
     #[cfg(target_os = "macos")]
     {
@@ -418,7 +421,26 @@ fn builder_with_main_window(
 
     builder
         .setup(move |app| {
+            #[cfg(mobile)]
+            app.manage(app_paths::AppPaths::resolve(app)?);
             app.manage(app_cleanup::CleanupState::initialize(app.handle())?);
+            // Before the WebView exists, so no renderer call can precede it.
+            app_paths::permit_renderer_access(app.handle())?;
+            #[cfg(target_os = "ios")]
+            {
+                use tauri_plugin_ios_native::IosNativeExt;
+                let root = app_paths::manifest(app)?
+                    .data
+                    .to_str()
+                    .ok_or("application data root is not valid UTF-8")?
+                    .to_owned();
+                let native = app.ios_native().clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) = native.set_data_root(&root).await {
+                        crate::nlog!("error", "native staging root unavailable: {error}");
+                    }
+                });
+            }
             if let Some((config, data_directory)) = &main_window {
                 tauri::WebviewWindowBuilder::from_config(app, config)?
                     .data_directory(data_directory.clone())
@@ -435,8 +457,7 @@ fn builder_with_main_window(
                 app.handle()
                     .plugin(tauri_plugin_ios_native::init())
                     .map_err(|error| format!("iOS native initialization failed: {error}"))?;
-                let app_data_dir = app_data_root::resolve(app)
-                    .map_err(|error| format!("application data root unavailable: {error}"))?;
+                let app_data_dir = app_paths::data_root(app)?;
                 app.state::<external_storage::job_store::JobCommandState>()
                     .root
                     .set(app_data_dir.clone())
@@ -544,6 +565,7 @@ fn builder_with_main_window(
 /// The product command router, reusable by alternative native entries.
 pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static {
     let handler: Box<dyn Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync> = Box::new(tauri::generate_handler![
+        app_paths::app_paths_roots,
         app_cleanup::app_cleanup_status,
         app_cleanup::app_cleanup_request,
         app_cleanup::app_cleanup_resume,
@@ -837,15 +859,28 @@ pub fn handle_run_event(_app: &tauri::AppHandle, _event: tauri::RunEvent) {
 pub fn run() {
     let mut context = tauri::generate_context!();
     #[cfg(desktop)]
-    if let Some(code) = app_cleanup::run_cli(context.config()) {
+    let paths = app_paths::AppPaths::desktop(context.config())
+        .expect("application data roots unavailable");
+    #[cfg(desktop)]
+    if let Some(code) = app_cleanup::run_cli(&paths) {
         std::process::exit(code);
     }
     #[cfg(desktop)]
-    let main_window = app_data_root::take_main_window_with_webview_root(&mut context)
+    let main_window = app_paths::take_main_window_with_webview_root(&mut context, &paths)
         .expect("desktop WebView data directory unavailable");
     #[cfg(not(desktop))]
     let main_window = None;
-    builder_with_main_window(main_window)
+    #[allow(unused_mut)]
+    let mut builder = builder_with_main_window(main_window);
+    #[cfg(windows)]
+    {
+        builder = builder.plugin(window_state_plugin(&paths.data));
+    }
+    #[cfg(desktop)]
+    {
+        builder = builder.manage(paths.prepared().expect("application data root unavailable"));
+    }
+    builder
         .build(context)
         .expect("error while building tauri application")
         .run(handle_run_event);

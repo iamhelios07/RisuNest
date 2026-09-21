@@ -9,7 +9,7 @@
     ${OrIf} $R6 != 0
       ; Keep the application and uninstaller available for another attempt.
       SetErrorLevel 1
-      Abort "RisuNest application data could not be fully removed. Close RisuNest and retry uninstalling."
+      Abort "RisuNest application data could not be removed. Nothing was uninstalled; run the uninstaller again to retry."
     ${EndIf}
   ${EndIf}
 !macroend

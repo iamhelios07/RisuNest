@@ -420,9 +420,7 @@ pub(crate) fn pds_open(
     state: State<'_, PersistentStoreState>,
 ) -> Result<PersistentStoreOpenResult, StoreError> {
     let operation_guard = state.admit_renderer_operation()?;
-    let app_data_dir = crate::app_data_root::resolve(&app).map_err(|error| StoreError::Store {
-        message: format!("failed to resolve application data directory: {error}"),
-    })?;
+    let app_data_dir = crate::app_paths::data_root(&app).map_err(|message| StoreError::Store { message })?;
     open_renderer_persistent_store_admitted(&state, &operation_guard, &app_data_dir)
 }
 

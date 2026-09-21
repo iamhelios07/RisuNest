@@ -139,7 +139,6 @@ vi.mock('@tauri-apps/api/core', () => ({
     convertFileSrc: (path: string) => `asset://${path}`,
 }))
 vi.mock('@tauri-apps/api/path', () => ({
-    appDataDir: vi.fn(async () => '/data'),
     join: vi.fn(async (...parts: string[]) => parts.join('/')),
 }))
 vi.mock('@tauri-apps/plugin-shell', () => ({ open: vi.fn() }))

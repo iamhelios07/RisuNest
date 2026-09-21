@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,8 +15,9 @@ import {
   inspectMacAppRoot,
   validateIosArchiveEntries,
 } from "../../scripts/release/package-app.mjs";
-import { assertAppIdentifier, assertSyncIdentifier, mergeTauriConfig, releaseTauriConfig } from "../../scripts/release/tauri-config.mjs";
+import { APP_IDENTIFIER, SYNC_IDENTIFIER, assertAppIdentifier, assertNoIdentifierOverride, assertSyncIdentifier, mergeTauriConfig, releaseTauriConfig } from "../../scripts/release/tauri-config.mjs";
 import { validateOwnedInventory } from "../../server/manager/install/package.mjs";
+import { identifierDirectories, overlaps, windowsLayout } from "../pathManifest.mjs";
 
 function pe(machine) {
   const bytes = Buffer.alloc(128);
@@ -285,17 +286,15 @@ test("iOS package proof requires imported and exported custom document types", (
 
 test("effective configuration preserves the approved desktop and mobile identities", () => {
   const base = JSON.parse(readFileSync("src-tauri/tauri.conf.json", "utf8"));
-  const expected = {
-    windows: "RisuNest",
-    linux: "risunest",
-    macos: "io.github.rsyumi.risunest",
-    android: "io.github.rsyumi.risunest",
-    ios: "io.github.rsyumi.risunest",
-  };
+  assert.equal(base.identifier, APP_IDENTIFIER);
   for (const os of ["windows", "linux", "macos", "android", "ios"]) {
-    const overlay = JSON.parse(readFileSync(`src-tauri/tauri.${os}.conf.json`, "utf8"));
+    const overlay = existsSync(`src-tauri/tauri.${os}.conf.json`)
+      ? JSON.parse(readFileSync(`src-tauri/tauri.${os}.conf.json`, "utf8"))
+      : null;
+    assertNoIdentifierOverride(overlay, `src-tauri/tauri.${os}.conf.json`);
+    assert.throws(() => assertNoIdentifierOverride({ identifier: "RisuNest" }, "synthetic"), /must not override/);
     const config = mergeTauriConfig(base, overlay, releaseTauriConfig({ product: "app", version: "1.2.3" }, "synthetic"));
-    assert.equal(assertAppIdentifier(config, os), expected[os]);
+    assert.equal(assertAppIdentifier(config, os), APP_IDENTIFIER);
     assert.equal(config.bundle.publisher, "Yumi");
     assert.equal(config.version, "1.2.3");
     if (os === "windows") assert.equal(config.bundle.windows.nsis.installerHooks, "windows.nsh");
@@ -317,19 +316,65 @@ test("RisuNest NSIS completes requested cleanup before removing its retry entry 
   assert.doesNotMatch(hook, /RmDir|NSIS_HOOK_POSTUNINSTALL/);
 });
 
-test("Sync GUI configuration follows each desktop platform identity", () => {
+test("Sync GUI configuration carries one identity on every desktop platform", () => {
   const root = "server/manager/gui/src-tauri";
   const base = JSON.parse(readFileSync(`${root}/tauri.conf.json`, "utf8"));
-  const expected = {
-    windows: "RisuNestSync",
-    linux: "risunest-sync",
-    macos: "io.github.rsyumi.risunest.sync-manager",
-  };
+  assert.equal(base.identifier, SYNC_IDENTIFIER);
   for (const os of ["windows", "linux", "macos"]) {
-    const overlay = JSON.parse(readFileSync(`${root}/tauri.${os}.conf.json`, "utf8"));
+    const path = `${root}/tauri.${os}.conf.json`;
+    const overlay = existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : null;
+    assertNoIdentifierOverride(overlay, path);
     const config = mergeTauriConfig(base, overlay);
-    assert.equal(assertSyncIdentifier(config, os), expected[os]);
+    assert.equal(assertSyncIdentifier(config, os), SYNC_IDENTIFIER);
     assert.throws(() => assertSyncIdentifier({ ...config, identifier: "wrong" }, os), /effective/);
+  }
+});
+
+test("no owned directory overlaps the installation directory either installer selects", () => {
+  const app = JSON.parse(readFileSync("src-tauri/tauri.conf.json", "utf8"));
+  const sync = JSON.parse(readFileSync("server/manager/gui/src-tauri/tauri.conf.json", "utf8"));
+  const syncHook = readFileSync("server/manager/install/windows.nsh", "utf8");
+  const appHook = readFileSync("src-tauri/windows.nsh", "utf8");
+
+  // The NSIS template derives $INSTDIR from PRODUCTNAME, under $LOCALAPPDATA
+  // for a currentUser install. The Sync hook then rewrites it to a name
+  // without spaces.
+  assert.notEqual(app.bundle.windows.nsis.installMode, "perMachine");
+  const bundled = JSON.parse(readFileSync("server/manager/gui/src-tauri/tauri.bundle.conf.json", "utf8"));
+  assert.equal(bundled.bundle.windows.nsis.installMode, "currentUser");
+  const forced = syncHook.match(/!define RISUNEST_SYNC_INSTALL_DIR "\$LOCALAPPDATA\\([^"]+)"/);
+  assert.ok(forced, "the Sync hook must define its installation directory");
+
+  const installs = {
+    app: `$LOCALAPPDATA\\${app.productName}`,
+    sync: `$LOCALAPPDATA\\${forced[1]}`,
+  };
+  const identifiers = { app: app.identifier, sync: sync.identifier };
+  const known = new Set(["$INSTDIR"]);
+  for (const product of ["app", "sync"]) {
+    const layout = windowsLayout(product);
+    // The manifest's record of the installation directory has to be the one
+    // the installer actually uses, or the overlap check proves nothing.
+    assert.equal(layout.install, installs[product]);
+    known.add(layout.install);
+    const owned = [...layout.roots, ...identifierDirectories(identifiers[product])];
+    for (const root of owned) {
+      assert.ok(
+        !overlaps(root, layout.install),
+        `${product}: ${root} overlaps ${layout.install}`,
+      );
+      known.add(root);
+    }
+    // The comparison is component-wise: RisuNestData shares a string prefix
+    // with RisuNest and must still read as a sibling.
+    assert.ok(overlaps(`${layout.install}\\nested`, layout.install));
+  }
+
+  // A delete-data branch may only remove a directory the manifest owns.
+  for (const hook of [appHook, syncHook]) {
+    for (const [, target] of hook.matchAll(/RmDir(?: \/r)? "([^"]+)"/g)) {
+      assert.ok(known.has(target), `unowned RmDir target: ${target}`);
+    }
   }
 });
 
