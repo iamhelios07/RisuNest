@@ -422,6 +422,8 @@ fn builder_with_main_window(
             #[cfg(mobile)]
             app.manage(app_paths::AppPaths::resolve(app)?);
             app.manage(app_cleanup::CleanupState::initialize(app.handle())?);
+            // Before the WebView exists, so no renderer call can precede it.
+            app_paths::permit_renderer_access(app.handle())?;
             if let Some((config, data_directory)) = &main_window {
                 tauri::WebviewWindowBuilder::from_config(app, config)?
                     .data_directory(data_directory.clone())
@@ -546,6 +548,7 @@ fn builder_with_main_window(
 /// The product command router, reusable by alternative native entries.
 pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static {
     let handler: Box<dyn Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync> = Box::new(tauri::generate_handler![
+        app_paths::app_paths_roots,
         app_cleanup::app_cleanup_status,
         app_cleanup::app_cleanup_request,
         app_cleanup::app_cleanup_resume,

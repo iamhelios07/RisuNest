@@ -9,7 +9,8 @@ import {
 import { changeFullscreen, sleep } from "./util"
 import { convertFileSrc } from "@tauri-apps/api/core"
 import { v4 as uuidv4, v4 } from 'uuid';
-import { appDataDir, join } from "@tauri-apps/api/path";
+import { join } from "@tauri-apps/api/path";
+import { nativeDataPath } from "./storage/nativePaths";
 import { get } from "svelte/store";
 import { open } from '@tauri-apps/plugin-shell'
 import { openUrl } from '@tauri-apps/plugin-opener'
@@ -325,8 +326,6 @@ export async function getFileSrc(loc: string) {
     }
 }
 
-let appDataDirPath = ''
-
 /**
  * Reads an image file and returns its data.
  * 
@@ -344,10 +343,7 @@ export async function readImage(data: string) {
     }
     if (isTauri) {
         if (data.startsWith('assets')) {
-            if (appDataDirPath === '') {
-                appDataDirPath = await appDataDir();
-            }
-            return await readFile(await join(appDataDirPath, data))
+            return await readFile(await nativeDataPath(data))
         }
         return await readFile(data)
     }

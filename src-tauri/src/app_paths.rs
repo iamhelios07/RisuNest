@@ -287,6 +287,40 @@ impl AppPaths {
     }
 }
 
+/// The roots the renderer is allowed to use. It takes them from here instead of
+/// deriving any of its own.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Roots {
+    data: String,
+}
+
+#[tauri::command]
+pub(crate) fn app_paths_roots(app: tauri::AppHandle) -> Result<Roots, String> {
+    let paths = manifest(&app)?;
+    Ok(Roots {
+        data: paths
+            .data
+            .to_str()
+            .ok_or("application data root is not valid UTF-8")?
+            .to_owned(),
+    })
+}
+
+/// Permit the renderer to reach the manifest roots. The static capability scope
+/// cannot name them, because an agent build uses distinct leaves.
+pub(crate) fn permit_renderer_access(app: &tauri::AppHandle) -> Result<(), String> {
+    use tauri::Manager;
+    use tauri_plugin_fs::FsExt;
+    let paths = manifest(app)?;
+    app.fs_scope()
+        .allow_directory(&paths.data, true)
+        .map_err(|error| format!("data root file permission unavailable: {error}"))?;
+    app.asset_protocol_scope()
+        .allow_directory(&paths.data, true)
+        .map_err(|error| format!("data root asset permission unavailable: {error}"))
+}
+
 /// The resolved manifest. It is managed before any plugin, command, or setup
 /// step can run, so an absent one is a programming error rather than a state.
 pub(crate) fn manifest<R: tauri::Runtime>(
