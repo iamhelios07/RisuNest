@@ -580,18 +580,14 @@ impl PersistentStore {
                     .map_err(|_| SyncError::new("invalid-receipt", 409))?],
             )?;
         } else {
-            if let Some(code) = &receipt.error {
+            if let (Some(code), Some(key)) = (&receipt.error, &receipt.error_key) {
                 crate::native_log::global_state().record(
                     "error",
                     "server-sync",
                     format!(
-                        "server rejected the operation: status={:?} code={code} key={}",
+                        "server rejected a record: status={:?} code={code} key={}",
                         receipt.status,
-                        receipt
-                            .error_key
-                            .as_deref()
-                            .map(crate::server_sync::client::log_key)
-                            .unwrap_or_default()
+                        crate::server_sync::client::log_key(key)
                     ),
                 );
             }

@@ -4,6 +4,7 @@ use crate::persistent_store::server_sync_engine::CycleItemCounter;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 const ACTIVITY_UPLOADING: u8 = 4;
+const REJECTED_KEY: &str = "synthetic-rejected-record";
 const ACTIVITY_VERIFYING: u8 = 6;
 
 #[derive(Default)]
@@ -51,10 +52,16 @@ struct Fixture {
 }
 
 fn fault(status: u16, code: &str) -> axum::response::Response {
+    body(status, format!("{{\"error\":\"{code}\"}}"))
+}
+fn rejected_record(status: u16, code: &str, key: &str) -> axum::response::Response {
+    body(status, format!("{{\"error\":\"{code}\",\"key\":\"{key}\"}}"))
+}
+fn body(status: u16, json: String) -> axum::response::Response {
     axum::response::Response::builder()
         .status(status)
         .header("content-type", "application/json")
-        .body(axum::body::Body::from(format!("{{\"error\":\"{code}\"}}")))
+        .body(axum::body::Body::from(json))
         .unwrap()
 }
 
@@ -124,7 +131,11 @@ impl Fixture {
                                 })
                                 .is_ok()
                             {
-                                return fault(409, "missing-dependency");
+                                return rejected_record(
+                                    409,
+                                    "missing-dependency",
+                                    REJECTED_KEY,
+                                );
                             }
                         }
                         next.run(request).await
@@ -312,6 +323,14 @@ fn a_skipped_pass_is_trusted_once_and_a_restage_clears_the_marker() {
     assert_eq!(fixture.traffic.page_faults.load(Ordering::Relaxed), 0);
     assert_eq!(fixture.traffic.page_puts.load(Ordering::Relaxed), 2);
     assert_eq!(fixture.traffic.missing.load(Ordering::Relaxed), 1);
+    // The refusal that stops the cycle names the record in this device's own log.
+    assert!(crate::native_log::global_state()
+        .tail(None)
+        .iter()
+        .any(|entry| entry.target == "server-sync"
+            && entry.message.contains(REJECTED_KEY)
+            && entry.message.contains("missing-dependency")
+            && entry.message.contains("status=409")));
 
     // The recovery pass records itself, so the resume after it skips again.
     fixture.traffic.reset();

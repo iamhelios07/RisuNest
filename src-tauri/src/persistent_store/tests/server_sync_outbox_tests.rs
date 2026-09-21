@@ -393,10 +393,8 @@ fn replacement_restore_preserves_server_replica_reconciliation() {
 #[test]
 fn the_replica_schema_requires_the_object_verification_columns() {
     let directory = tempfile::tempdir().unwrap();
-    let store = PersistentStore::open(directory.path()).unwrap();
-    drop(store);
-    PersistentStore::open(directory.path()).unwrap();
-
+    drop(PersistentStore::open(directory.path()).unwrap());
+    // What this version creates opens again unchanged.
     let store = PersistentStore::open(directory.path()).unwrap();
     store
         .connection
@@ -412,4 +410,20 @@ fn the_replica_schema_requires_the_object_verification_columns() {
         PersistentStore::open(directory.path()),
         Err(StoreError::Validation { .. })
     ));
+
+    // Adding the two columns to that table is all the old shape is missing.
+    let file = directory
+        .path()
+        .join("persistent")
+        .join(super::super::DATABASE_FILE);
+    let database = Connection::open(file).unwrap();
+    database
+        .execute_batch(
+            "ALTER TABLE server_sync_operation ADD COLUMN verified_at INTEGER;
+             ALTER TABLE server_sync_operation ADD COLUMN verified_stage TEXT;",
+        )
+        .unwrap();
+    drop(database);
+    let store = PersistentStore::open(directory.path()).unwrap();
+    assert!(store.server_pending().unwrap().is_none());
 }
