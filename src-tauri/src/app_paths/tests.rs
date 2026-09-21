@@ -184,12 +184,13 @@ fn an_agent_build_never_shares_a_desktop_root_with_the_installed_product() {
         if installed.webview.is_some() {
             assert_ne!(agent.webview, installed.webview);
         }
+        // The identifier-derived sweep roots carry no agent leaf, so an agent
+        // build claims none of them rather than deleting the product's.
+        assert!(agent.tauri_derived.is_empty());
+        assert!(!installed.tauri_derived.is_empty());
         for root in agent.owned_roots() {
-            // Only the identifier-derived sweep roots may coincide, because
-            // Tauri resolves those from the identifier either way.
             assert!(
-                !installed.owned_roots().contains(&root)
-                    || installed.tauri_derived.contains(&root),
+                !installed.owned_roots().contains(&root),
                 "{} is shared with the installed product",
                 root.display()
             );

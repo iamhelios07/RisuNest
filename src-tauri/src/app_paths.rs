@@ -260,7 +260,13 @@ impl AppPaths {
             webview,
             cache,
             cleanup_control,
-            tauri_derived: tauri_derived(platform, hives, identifier),
+            // An agent build writes to none of them and must not delete the
+            // installed product's, which are not leaf-suffixed.
+            tauri_derived: if agent && platform.is_desktop() {
+                Vec::new()
+            } else {
+                tauri_derived(platform, hives, identifier)
+            },
             install: None,
             integration,
         })
