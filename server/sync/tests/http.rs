@@ -258,7 +258,7 @@ async fn session_identity_and_previous_device_status_are_authenticated_and_revoc
         .unwrap();
     assert_eq!(
         session,
-        serde_json::json!({"head":server.store.head().unwrap(),"deviceId":server.a.device_id,"operationWatermark":"0","operationPending":false})
+        serde_json::json!({"head":server.store.head().unwrap(),"deviceId":server.a.device_id,"operationWatermark":"0","operationPending":false,"protocolId":risunest_sync_server::PROTOCOL_ID})
     );
     let scope: serde_json::Value = server
         .auth(

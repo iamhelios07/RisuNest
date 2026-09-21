@@ -280,6 +280,7 @@ describe("server sync controller", () => {
     await controller.initialize();
     facade.cycle.mockRejectedValueOnce({
       code: "epoch-reconciliation-required",
+      retryable: false,
     });
     await controller.synchronize();
     expect(controller.canAutoSync()).toBe(false);
@@ -297,6 +298,7 @@ describe("server sync controller", () => {
     await controller.initialize();
     facade.cycle.mockRejectedValueOnce({
       code: "device-credential-unavailable",
+      retryable: false,
     });
     await controller.synchronize();
     expect(controller.snapshot().status?.configured).toBe(true);

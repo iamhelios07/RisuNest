@@ -225,11 +225,15 @@ describe("progress view", () => {
       { key: "pending", label: text.pendingChanges, value: "37" },
     ]);
   });
-  it("names the first full comparison instead of a change count", () => {
+  it("counts the changes to send while the first full comparison is pending", () => {
     const snapshot = bound();
     snapshot.status!.fullScan = true;
     const view = serverSyncProgressView({ ...snapshot, running: true }, text, 0);
-    expect(view.counters[3].value).toBe(text.initialScan);
+    expect(view.counters[3].value).toBe("37");
     expect(view.elapsed).toBe("");
+    expect(serverSyncStatus(snapshot, text)).toEqual({
+      label: text.initialScan,
+      tone: "connected",
+    });
   });
 });

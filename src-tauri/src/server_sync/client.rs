@@ -181,6 +181,7 @@ struct Identity {
     device_id: String,
     operation_watermark: risunest_sync_wire::Sequence,
     operation_pending: bool,
+    protocol_id: String,
 }
 impl ServerClient {
     /// Resolve only at an identity GET boundary. Never replay a mutation on a new URL.
@@ -291,6 +292,11 @@ impl ServerClient {
             return Err(response_error(reply));
         }
         let identity: Identity = canonical::decode(&reply.body, MAX_METADATA_BYTES)?;
+        // Checked before anything else this cycle would attempt, so an
+        // incompatible peer is named instead of rejecting a later request.
+        if identity.protocol_id != risunest_sync_wire::PROTOCOL_ID {
+            return Err(SyncError::new("server-incompatible", 409));
+        }
         identity.head.validate()?;
         let config = self.config();
         if identity.head.library_id != config.library_id || identity.device_id != config.device_id {
@@ -766,7 +772,28 @@ pub(crate) fn response_error(reply: Reply) -> SyncError {
         .and_then(|v| v.as_str())
         .filter(|s| s.len() <= 64 && s.bytes().all(|b| b.is_ascii_lowercase() || b == b'-'))
         .unwrap_or("server-response-error");
+    // A rejection that names a record is the only one worth a log line. The key
+    // is a locator and stays in this device's own log.
+    if let Some(key) = value.as_ref().and_then(|v| v.get("key")).and_then(|v| v.as_str()) {
+        crate::native_log::global_state().record(
+            "error",
+            "server-sync",
+            format!(
+                "server rejected a record: status={} code={code} key={}",
+                reply.status,
+                log_key(key)
+            ),
+        );
+    }
     SyncError::new(code, reply.status)
+}
+/// Bounds a reported key and drops control characters before it reaches a log line.
+fn log_key(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(512)
+        .collect()
 }
 
 #[cfg(test)]

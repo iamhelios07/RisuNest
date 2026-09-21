@@ -35,9 +35,17 @@ export interface ServerSyncSnapshot {
   phaseStartedAt?: number;
   attemptIdentity?: ServerAttemptIdentity;
   initialSyncComplete?: boolean;
+  /** False when the same attempt would be rejected again, so automatic
+   * synchronization stops instead of backing off. */
+  errorRetryable?: boolean;
   refreshPending?: boolean;
   replacing?: boolean;
   connecting?: boolean;
+}
+/** The state an error leaves when repeating the same attempt cannot change its
+ * outcome. Automatic synchronization stops until an explicit action clears it. */
+export function serverSyncBlocked(snapshot: ServerSyncSnapshot): boolean {
+  return Boolean(snapshot.error) && snapshot.errorRetryable === false;
 }
 export function createServerSyncController(
   facade: ServerSyncFacade,
@@ -68,6 +76,15 @@ export function createServerSyncController(
     };
     for (const listener of listeners) listener(state);
   };
+  const recordError = (cause: unknown): void => {
+    const failure = serverSyncError(cause);
+    state.error = failure.code;
+    state.errorRetryable = failure.retryable;
+  };
+  const clearError = (): void => {
+    state.error = "";
+    state.errorRetryable = undefined;
+  };
   const refreshStatus = async (): Promise<void> => {
     const request = ++statusSequence;
     statusFresh = false;
@@ -92,7 +109,7 @@ export function createServerSyncController(
     state.bytesPerSecond = undefined;
     state.cycleItems = undefined;
     state.retryableFailure = undefined;
-    state.error = "";
+    clearError();
     byteSample = undefined;
     publish();
     try {
@@ -141,7 +158,7 @@ export function createServerSyncController(
       );
       if (state.initialSyncComplete) state.lastSuccessAt = Date.now();
     } catch (cause) {
-      state.error = serverSyncError(cause).code;
+      recordError(cause);
       state.initialSyncComplete = false;
     } finally {
       state.running = false;
@@ -221,7 +238,7 @@ export function createServerSyncController(
       try {
         await refreshStatus();
       } catch (cause) {
-        state.error = serverSyncError(cause).code;
+        recordError(cause);
       }
       state.replacing = false;
       publish();
@@ -258,11 +275,11 @@ export function createServerSyncController(
       state.lastSuccessAt = undefined;
       publish();
       await prepare?.();
-      state.error = "";
+      clearError();
       controllerOptions.onExplicitResume?.();
       state.paused = false;
     } catch (cause) {
-      state.error = serverSyncError(cause).code;
+      recordError(cause);
       state.paused = true;
       throw cause;
     } finally {
@@ -364,7 +381,7 @@ export function createServerSyncController(
       try {
         await refreshStatus();
       } catch (cause) {
-        state.error = serverSyncError(cause).code;
+        recordError(cause);
         publish();
       }
     },
@@ -388,7 +405,7 @@ export function createServerSyncController(
       const status = await facade.reconcile();
       state.status = status;
       state.result = undefined;
-      state.error = "";
+      clearError();
       controllerOptions.onExplicitResume?.();
       state.paused = false;
       publish();
@@ -439,7 +456,7 @@ export function createServerSyncController(
       try {
         await facade.cancel();
       } catch (cause) {
-        state.error = serverSyncError(cause).code;
+        recordError(cause);
         publish();
       }
     },
@@ -448,7 +465,7 @@ export function createServerSyncController(
       try {
         await facade.cancel();
       } catch (cause) {
-        state.error = serverSyncError(cause).code;
+        recordError(cause);
         publish();
       }
     },
@@ -461,12 +478,7 @@ export function createServerSyncController(
         !state.replacing &&
         !isLibraryFileOperationReserved() &&
         !state.paused &&
-        ![
-          "epoch-reconciliation-required",
-          "unauthorized",
-          "new-device-registration-required",
-          "device-credential-unavailable",
-        ].includes(state.error) &&
+        !serverSyncBlocked(state) &&
         state.result?.phase !== "conflict" &&
         !facade.needsRefresh(),
       ),

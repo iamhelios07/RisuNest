@@ -18,9 +18,11 @@ impl Store {
                 descriptor_hash: Some(digest),
             } = &change.after
             {
-                let descriptor = self.prepare_descriptor(digest)?;
+                let descriptor = self
+                    .prepare_descriptor(digest)
+                    .map_err(|error| error.for_key(&change.key))?;
                 if &descriptor.object_hash != object_hash {
-                    return Err(Error::new("descriptor-object-mismatch", 409));
+                    return Err(Error::new("descriptor-object-mismatch", 409).for_key(&change.key));
                 }
             }
         }

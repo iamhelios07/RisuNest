@@ -2063,7 +2063,7 @@ export const languageKorean = {
             elapsed: '경과',
             count: '{0}개',
             itemsCount: '{0}개 항목',
-            activity: { enumerating: '항목 확인 중', preparing: '자산 확인 및 변경 내용 준비 중', downloading: '다운로드 중', uploading: '업로드 중', confirming: '서버 확인 대기 중' },
+            activity: { enumerating: '항목 확인 중', preparing: '자산 확인 및 변경 내용 준비 중', downloading: '다운로드 중', verifying: '서버에 있는 항목 확인 중', uploading: '업로드 중', confirming: '서버 확인 대기 중' },
             progress: {
                 saving: '이 기기의 변경 저장 중',
                 preparing: '이 기기와 서버의 변경 내용 비교 중',
@@ -2075,7 +2075,13 @@ export const languageKorean = {
             pending: '동기화 완료 확인 중',
             registrationRequired: '새 등록 코드 필요',
             refreshPending: '화면 새로고침 필요',
-            initialScan: '서버와 처음 전체 비교 준비 중',
+            initialScan: '서버와 처음 전체 비교 대기 중',
+            blocked: '자동 동기화 중지됨',
+            blockedHelp:
+                '서버가 이 기기의 변경을 받지 않아 자동 동기화를 멈췄습니다. 이 기기에서 고친 내용은 그대로 있습니다. 동기화를 다시 시도해도 같은 오류가 반복될 경우 서버와 앱을 최신 버전으로 업데이트하세요.',
+            incompatible: '서버와 앱 버전 불일치',
+            incompatibleHelp:
+                '서버와 앱의 버전이 서로 맞지 않아 동기화할 수 없습니다. 서버와 앱을 모두 최신 버전으로 업데이트한 후 다시 시도하세요.',
             pendingHelp:
                 '진행 중이던 동기화를 마쳐야 연결을 해제할 수 있습니다. 지금 동기화를 누르세요.',
             conflict: '충돌 확인 필요',

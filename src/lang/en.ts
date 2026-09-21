@@ -2250,7 +2250,7 @@ export const languageEnglish = {
             elapsed: 'Elapsed',
             count: '{0}',
             itemsCount: '{0} items',
-            activity: { enumerating: 'Counting items', preparing: 'Checking assets and preparing changes', downloading: 'Downloading', uploading: 'Uploading', confirming: 'Waiting for server confirmation' },
+            activity: { enumerating: 'Counting items', preparing: 'Checking assets and preparing changes', downloading: 'Downloading', verifying: 'Checking items on the server', uploading: 'Uploading', confirming: 'Waiting for server confirmation' },
             progress: {
                 saving: 'Saving changes on this device',
                 preparing: 'Comparing changes on this device and the server',
@@ -2262,7 +2262,13 @@ export const languageEnglish = {
             pending: 'Finishing sync',
             registrationRequired: 'New registration code required',
             refreshPending: 'Screen refresh needed',
-            initialScan: 'Preparing the first full comparison with the server',
+            initialScan: 'Waiting for the first full comparison with the server',
+            blocked: 'Automatic sync stopped',
+            blockedHelp:
+                'The server is not accepting this device’s changes, so automatic sync has stopped. Your edits on this device are unchanged. If the same error repeats when you sync again, update the server and the app to the latest version.',
+            incompatible: 'Server and app versions do not match',
+            incompatibleHelp:
+                'The server and the app are different versions, so they cannot sync. Update both the server and the app to the latest version and try again.',
             pendingHelp:
                 'The sync in progress has to finish before disconnecting. Select Sync now.',
             conflict: 'Conflicts need attention',

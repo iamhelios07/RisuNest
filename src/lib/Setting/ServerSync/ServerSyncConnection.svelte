@@ -15,6 +15,7 @@
   import {
     connectServerSync,
     serverSyncErrorHelp,
+    serverSyncPendingChanges,
     serverSyncProgressView,
     serverSyncRefreshRequired,
     serverSyncStatus,
@@ -56,6 +57,9 @@
   let appliedNavigation: ServerSyncNavigation | undefined;
   const text = $derived(language.risuNest.serverSync);
   const error = $derived(actionError || snapshot.error);
+  const errorRetryable = $derived(
+    Boolean(actionError) || snapshot.errorRetryable !== false,
+  );
   const refreshRequired = $derived(serverSyncRefreshRequired(error));
   const configured = $derived(Boolean(snapshot.status?.configured));
   const conflict = $derived(
@@ -73,16 +77,7 @@
   const progress = $derived(
     snapshot.running ? serverSyncProgressView(snapshot, text, now) : undefined,
   );
-  const pendingChanges = $derived(
-    snapshot.status
-      ? snapshot.status.fullScan
-        ? text.initialScan
-        : text.count.replace(
-            "{0}",
-            snapshot.status.dirtyRecords.toLocaleString(),
-          )
-      : "",
-  );
+  const pendingChanges = $derived(serverSyncPendingChanges(snapshot, text));
   const backupsHelp = $derived(
     backupCount === undefined
       ? text.backupHelp
@@ -305,7 +300,8 @@
       {/if}
       {#if error && error !== "cancelled" && !replacingOpen}
         <p class="mt-2 text-sm text-danger-400" role="alert">
-          {serverSyncErrorHelp(error, text)} <span class="text-textcolor2">({error})</span>
+          {serverSyncErrorHelp(error, text, errorRetryable)}
+          <span class="text-textcolor2">({error})</span>
         </p>
       {/if}
     </div>

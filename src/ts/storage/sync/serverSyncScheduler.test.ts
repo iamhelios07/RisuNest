@@ -186,7 +186,7 @@ describe("server sync scheduler", () => {
     await f.controller.synchronize();
     await vi.advanceTimersByTimeAsync(1000);
     expect(f.cycle).toHaveBeenCalledTimes(5);
-    f.cycle.mockRejectedValue({ code: "unauthorized" });
+    f.cycle.mockRejectedValue({ code: "unauthorized", retryable: false });
     await f.controller.synchronize();
     await vi.advanceTimersByTimeAsync(300_000);
     expect(f.cycle).toHaveBeenCalledTimes(6);
