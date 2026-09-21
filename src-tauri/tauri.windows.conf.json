@@ -1,5 +1,4 @@
 {
-  "identifier": "RisuNest",
   "app": {
     "windows": [
       {
@@ -15,10 +14,5 @@
         "backgroundColor": "#21222c"
       }
     ]
-  },
-  "plugins": {
-    "risunest": {
-      "dataDirectoryName": "RisuNestData"
-    }
   }
 }

@@ -39,12 +39,13 @@ fn main() {
     assert_eq!(fs::read_to_string(root.join("boundary-owner")).unwrap(), id);
     let mut context = tauri::generate_context!();
     assert_eq!(context.config().identifier, "io.github.rsyumi.risunest.boundary");
-    assert!(context.config().plugins.0.get("risunest").unwrap().get("dataDirectoryName").is_none());
     assert!(matches!(context.config().build.frontend_dist, Some(tauri::utils::config::FrontendDist::Files(_))));
     context.config_mut().identifier = identifier;
     context.config_mut().app.windows[0].data_directory = Some(root.join("webview"));
     #[cfg(target_os = "macos")]
     { context.config_mut().app.windows[0].incognito = true; }
+    let paths = risunest_lib::AppPaths::isolated(root.clone()).expect("isolated boundary roots");
+    assert_eq!(paths.data, root);
     let product = risunest_lib::invoke_handler();
     let boundary = boundary_handler();
     let bootstrap = format!(r#"
@@ -55,7 +56,7 @@ fn main() {
             window.__TAURI_INTERNALS__.invoke('boundary_finish', {{ report: {{runId: {}, phase: {}, success: false, cases: [], error: String(event.reason)}} }});
         }});
     "#, serde_json::json!(id), serde_json::json!(value("RISUNEST_BOUNDARY_PHASE")), serde_json::json!(id), serde_json::json!(value("RISUNEST_BOUNDARY_PHASE")));
-    let app = risunest_lib::builder().append_invoke_initialization_script(&bootstrap).invoke_handler(move |invoke| {
+    let app = risunest_lib::builder().manage(paths).append_invoke_initialization_script(&bootstrap).invoke_handler(move |invoke| {
         if invoke.message.command().starts_with("boundary_") { boundary(invoke) } else { product(invoke) }
     }).build(context).expect("build isolated persistence boundary");
     assert_eq!(app.path().app_data_dir().unwrap(), root);

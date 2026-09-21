@@ -122,7 +122,7 @@ pub(crate) async fn app_cleanup_request(app: AppHandle, mode: Mode) -> Result<()
     #[cfg(mobile)]
     if mode == Mode::PrepareRemoval { return Err("cleanup-mode-unavailable".into()); }
     let state = app.state::<CleanupState>();
-    state.paths.validate()?;
+    state.paths.preflight()?;
     crate::cleanup_webview::preflight(&app).await?;
     if state.pending.swap(true, Ordering::AcqRel) { return Err("cleanup-already-pending".into()); }
     let request = Request {
@@ -198,7 +198,7 @@ async fn resume(app: &AppHandle, request: &mut Request) -> Result<()> {
 }
 
 fn erase(paths: &Paths) -> Result<()> {
-    paths.validate()?;
+    paths.preflight()?;
     crate::cleanup_secrets::remove_all(&paths.data)?;
     for root in &paths.roots { files::remove(root)?; }
     Ok(())
@@ -221,11 +221,11 @@ fn lock(paths: &Paths, timeout: Duration) -> Result<fs::File> {
 }
 
 #[cfg(desktop)]
-pub(crate) fn run_cli(config: &tauri::utils::config::Config) -> Option<i32> {
+pub(crate) fn run_cli(manifest: &crate::app_paths::AppPaths) -> Option<i32> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if !args.first().is_some_and(|arg| matches!(arg.as_str(), "--remove-local-data" | "--cleanup-worker")) { return None; }
     let result = (|| {
-        let paths = Paths::desktop(config)?;
+        let paths = Paths::from_manifest(manifest);
         match args.as_slice() {
             [command, yes] if command == "--remove-local-data" && yes == "--yes" => {
                 let owner = lock(&paths, Duration::from_secs(30))?;
@@ -245,7 +245,7 @@ pub(crate) fn run_cli(config: &tauri::utils::config::Config) -> Option<i32> {
                 let mut request = read_request(&paths)?.ok_or("cleanup-not-pending")?;
                 if request.token != *token || !request.webview_cleared { return Err("cleanup-request-mismatch".into()); }
                 let result = (|| {
-                    if request.mode == Mode::PrepareRemoval { remove_integration(&request)?; }
+                    if request.mode == Mode::PrepareRemoval { remove_integration(manifest, &request)?; }
                     let deadline = Instant::now() + Duration::from_secs(10);
                     loop {
                         match erase(&paths) {
@@ -290,10 +290,12 @@ fn relaunch(request: &Request) -> Result<()> {
 }
 
 #[cfg(desktop)]
-fn remove_integration(request: &Request) -> Result<()> {
+fn remove_integration(manifest: &crate::app_paths::AppPaths, request: &Request) -> Result<()> {
     #[cfg(target_os = "linux")]
-    if let Some(image) = &request.appimage { return crate::appimage_integration::remove_owned(image); }
-    let _ = request;
+    if let (Some(image), Some(integration)) = (&request.appimage, manifest.integration.as_ref()) {
+        return crate::appimage_integration::remove_owned(image, integration);
+    }
+    let _ = (manifest, request);
     Ok(())
 }
 
@@ -301,7 +303,7 @@ fn remove_integration(request: &Request) -> Result<()> {
 mod tests {
     use super::*;
     fn paths(root: &Path) -> Paths {
-        Paths { data: root.join("data"), roots: vec![root.join("data"), root.join("webview")], control: root.join("control") }
+        Paths { data: root.join("data"), roots: vec![root.join("data"), root.join("webview")], control: root.join("control"), install_conflict: None }
     }
     #[test]
     fn cold_cleanup_removes_all_owned_roots_but_preserves_exports_and_other_product() {
@@ -319,6 +321,22 @@ mod tests {
         assert!(root.path().join("backup.risunest").exists());
         assert!(root.path().join("sync/synthetic").exists());
     }
+    #[test]
+    fn a_root_overlapping_the_installation_directory_refuses_before_any_deletion() {
+        let root = tempfile::tempdir().unwrap();
+        let mut paths = paths(root.path());
+        paths.install_conflict = Some(paths.data.clone());
+        for path in [&paths.data, &paths.roots[1]] {
+            fs::create_dir_all(path).unwrap();
+            fs::write(path.join("synthetic"), b"fixture").unwrap();
+        }
+        // The refusal happens in the first statement of erase, so neither the
+        // OS secret entries nor the files are reached.
+        assert_eq!(erase(&paths), Err("cleanup-root-overlaps-install".to_owned()));
+        assert!(paths.data.join("synthetic").exists());
+        assert!(paths.roots[1].join("synthetic").exists());
+    }
+
     #[test]
     fn corrupt_request_never_becomes_a_normal_start() {
         let root = tempfile::tempdir().unwrap();

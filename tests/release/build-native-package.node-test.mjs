@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,7 +15,7 @@ import {
   inspectMacAppRoot,
   validateIosArchiveEntries,
 } from "../../scripts/release/package-app.mjs";
-import { assertAppIdentifier, assertSyncIdentifier, mergeTauriConfig, releaseTauriConfig } from "../../scripts/release/tauri-config.mjs";
+import { APP_IDENTIFIER, SYNC_IDENTIFIER, assertAppIdentifier, assertNoIdentifierOverride, assertSyncIdentifier, mergeTauriConfig, releaseTauriConfig } from "../../scripts/release/tauri-config.mjs";
 import { validateOwnedInventory } from "../../server/manager/install/package.mjs";
 
 function pe(machine) {
@@ -285,17 +285,15 @@ test("iOS package proof requires imported and exported custom document types", (
 
 test("effective configuration preserves the approved desktop and mobile identities", () => {
   const base = JSON.parse(readFileSync("src-tauri/tauri.conf.json", "utf8"));
-  const expected = {
-    windows: "RisuNest",
-    linux: "risunest",
-    macos: "io.github.rsyumi.risunest",
-    android: "io.github.rsyumi.risunest",
-    ios: "io.github.rsyumi.risunest",
-  };
+  assert.equal(base.identifier, APP_IDENTIFIER);
   for (const os of ["windows", "linux", "macos", "android", "ios"]) {
-    const overlay = JSON.parse(readFileSync(`src-tauri/tauri.${os}.conf.json`, "utf8"));
+    const overlay = existsSync(`src-tauri/tauri.${os}.conf.json`)
+      ? JSON.parse(readFileSync(`src-tauri/tauri.${os}.conf.json`, "utf8"))
+      : null;
+    assertNoIdentifierOverride(overlay, `src-tauri/tauri.${os}.conf.json`);
+    assert.throws(() => assertNoIdentifierOverride({ identifier: "RisuNest" }, "synthetic"), /must not override/);
     const config = mergeTauriConfig(base, overlay, releaseTauriConfig({ product: "app", version: "1.2.3" }, "synthetic"));
-    assert.equal(assertAppIdentifier(config, os), expected[os]);
+    assert.equal(assertAppIdentifier(config, os), APP_IDENTIFIER);
     assert.equal(config.bundle.publisher, "Yumi");
     assert.equal(config.version, "1.2.3");
     if (os === "windows") assert.equal(config.bundle.windows.nsis.installerHooks, "windows.nsh");
@@ -317,18 +315,16 @@ test("RisuNest NSIS completes requested cleanup before removing its retry entry 
   assert.doesNotMatch(hook, /RmDir|NSIS_HOOK_POSTUNINSTALL/);
 });
 
-test("Sync GUI configuration follows each desktop platform identity", () => {
+test("Sync GUI configuration carries one identity on every desktop platform", () => {
   const root = "server/manager/gui/src-tauri";
   const base = JSON.parse(readFileSync(`${root}/tauri.conf.json`, "utf8"));
-  const expected = {
-    windows: "RisuNestSync",
-    linux: "risunest-sync",
-    macos: "io.github.rsyumi.risunest.sync-manager",
-  };
+  assert.equal(base.identifier, SYNC_IDENTIFIER);
   for (const os of ["windows", "linux", "macos"]) {
-    const overlay = JSON.parse(readFileSync(`${root}/tauri.${os}.conf.json`, "utf8"));
+    const path = `${root}/tauri.${os}.conf.json`;
+    const overlay = existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : null;
+    assertNoIdentifierOverride(overlay, path);
     const config = mergeTauriConfig(base, overlay);
-    assert.equal(assertSyncIdentifier(config, os), expected[os]);
+    assert.equal(assertSyncIdentifier(config, os), SYNC_IDENTIFIER);
     assert.throws(() => assertSyncIdentifier({ ...config, identifier: "wrong" }, os), /effective/);
   }
 });
