@@ -888,4 +888,65 @@ mod tests {
             );
         });
     }
+
+    #[test]
+    fn c_a_cancelled_check_keeps_what_it_proved_and_carries_on_from_there() {
+        runtime().block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let root = published(directory.path(), &provider, &repository, 60, 1, None)
+                .await
+                .reference;
+            let job = directory.path().join("check-job");
+            let cache = directory.path().join("package-cache");
+            let packs = provider
+                .uploaded_ids()
+                .into_iter()
+                .filter(|id| id.starts_with("pack-"))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            assert!(packs.len() > 2, "the cut has to fall between two packs");
+            let cancel = Cancellation::default();
+            provider.cancel_after_read(&packs[1], 1, &cancel);
+            let error = check(
+                &root, &[9; 32], &job, &cache, &provider, &repository, &silent(), &cancel,
+            )
+            .await
+            .expect_err("the check was cancelled part way through");
+            assert_eq!(error.kind, ErrorKind::Cancelled);
+            let proved = fs::read_to_string(job.join(LEDGER_FILE))
+                .unwrap()
+                .lines()
+                .count();
+            assert!(
+                (1..packs.len()).contains(&proved),
+                "a cancelled check kept {proved} of {} packs",
+                packs.len()
+            );
+            let outcome = check(
+                &root,
+                &[9; 32],
+                &job,
+                &cache,
+                &provider,
+                &repository,
+                &silent(),
+                &Cancellation::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                outcome.verified_objects - outcome.metadata_objects,
+                packs.len() as u64
+            );
+            assert_eq!(outcome.damaged_objects, 0);
+            assert_eq!(
+                provider.read_attempts(&packs[0]),
+                1,
+                "the body proved before the cut was read again"
+            );
+        });
+    }
 }
