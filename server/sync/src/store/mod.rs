@@ -8,6 +8,7 @@ mod jobs;
 pub use jobs::CommitSubmission;
 mod checkpoints;
 mod descriptors;
+mod descriptors_index;
 mod journal;
 mod maintenance;
 mod media;
