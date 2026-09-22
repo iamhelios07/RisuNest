@@ -417,10 +417,12 @@ async fn revalidate_cached_object_at(
     // inventory above may have moved on from the one the caller held. A
     // reference already found unusable stays that way even though the cache
     // naming it can be rebuilt at any moment, so asking the provider again
-    // would only repeat an answer already paid for.
+    // would only repeat an answer already paid for. The record answers for
+    // inherited references; an object still held in this job's own spool is
+    // checked, because only that check can say whether its upload finished.
     let contacted = ObjectEvidence::identity(&verified, repository)?;
     let mut unusable = evidence.known(&contacted)?;
-    let current = if unusable {
+    let current = if unusable && record.is_none() {
         None
     } else {
         match transfer_job::verify_remote_receipt_at(
@@ -2931,6 +2933,30 @@ mod tests {
                 &repository, &Cancellation::default(),
             ).await.unwrap().is_some());
             assert!(provider.read_count() > reads);
+        });
+    }
+
+    /// The record answers for references this attempt inherited. An object
+    /// this job uploaded itself is still held in its own spool, and a crash
+    /// between a repair and its clear must not make the job publish it twice.
+    #[test]
+    fn a_record_left_by_a_crash_does_not_republish_this_job_s_own_object() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let (capture, _) = captured(root.path(), "evidence-capture", 1, b"record", b"asset");
+            let (object, mut cache, mut evidence, mut journal) =
+                inherited_object(root.path(), &provider, &repository, &capture).await;
+            let contacted = ObjectEvidence::identity(&object, &repository).unwrap();
+            evidence.record(&contacted, &object.object_id, UnusableReason::Missing).unwrap();
+            assert!(revalidate_cached_object(
+                &object, &mut cache, &mut evidence, &mut journal, &[41; 32], &provider, &repository,
+                &Cancellation::default(),
+            ).await.unwrap().is_some());
+            assert_eq!(provider.upload_attempts(&object.object_id), 1);
+            assert_eq!(provider.reconcile_attempts(&object.object_id), 0);
+            assert!(!evidence.known(&contacted).unwrap());
         });
     }
 
