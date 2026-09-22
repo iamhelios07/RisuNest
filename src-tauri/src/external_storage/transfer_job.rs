@@ -2,9 +2,10 @@
 //! uncertain results are reconciled before any subsequent payload request.
 use super::{
     contract::*,
-    journal::{validate_receipt, TransferJournal},
+    journal::{validate_receipt, TransferJournal, WaveMember},
     transfer::{SpoolSink, SpoolSource},
 };
+use std::collections::BTreeMap;
 use risunest_external_storage_format::{content_identity::hash, format::Descriptor};
 
 /// Reconcile answers identify an object, but not every provider supplies a
@@ -209,6 +210,103 @@ async fn upload_inner(
     }
 }
 
+/// Registers a wave of sealed objects under one inventory page and then
+/// uploads what that page covers. Roles the inventory does not carry travel on
+/// their own. Receipts come back in the order the members were given.
+pub(crate) async fn upload_wave(
+    journal: &mut TransferJournal,
+    members: &[WaveMember],
+    format_repository_id: &str,
+    root_key: &[u8; 32],
+    provider: &dyn Provider,
+    repository: &RepositoryHandle,
+    cancel: &Cancellation,
+) -> Result<Vec<ObjectReceipt>> {
+    let descriptor = Descriptor::new(format_repository_id.to_owned(), None)
+        .map_err(|_| ProviderError::new(ErrorKind::Corrupt))?;
+    // A wave gathered differently after a restart resumes the pages it
+    // started rather than reshaping one whose upload has already begun.
+    let mut waves: BTreeMap<Option<String>, Vec<(WaveMember, String)>> = BTreeMap::new();
+    for member in members {
+        let record = journal
+            .record(&member.object_id)?
+            .ok_or_else(|| ProviderError::new(ErrorKind::Corrupt))?;
+        if !matches!(
+            record.intent.role,
+            ObjectRole::Pack
+                | ObjectRole::Catalog
+                | ObjectRole::SyncState
+                | ObjectRole::BackupBundle
+                | ObjectRole::BackupPoint
+        ) {
+            continue;
+        }
+        let page = journal.covered_by(&member.object_id)?;
+        waves
+            .entry(page)
+            .or_default()
+            .push((member.clone(), record.intent.sha256.clone()));
+    }
+    for (page, group) in waves {
+        let page_object = match page {
+            Some(page) => page,
+            None => {
+                let mut identities = group
+                    .iter()
+                    .map(|(member, sha256)| (member.object_id.as_str(), sha256.as_str()))
+                    .collect::<Vec<_>>();
+                identities.sort_unstable();
+                let page_object =
+                    format!("inventory-page-{}", inventory_page_id(journal.job_id(), &identities));
+                let covered = group
+                    .into_iter()
+                    .map(|(member, _)| member)
+                    .collect::<Vec<_>>();
+                journal.cover(&page_object, &covered)?;
+                page_object
+            }
+        };
+        let page_id = page_object
+            .strip_prefix("inventory-page-")
+            .ok_or_else(|| ProviderError::new(ErrorKind::Corrupt))?
+            .to_owned();
+        let recorded = journal.page_members(&page_object)?;
+        let registrations = recorded
+            .iter()
+            .map(|(intent, plaintext_length, plaintext_sha256)| {
+                super::control::InventoryRegistration {
+                    intent,
+                    plaintext_length: *plaintext_length,
+                    plaintext_sha256,
+                }
+            })
+            .collect::<Vec<_>>();
+        let document = super::control::inventory_page_document(
+            &descriptor,
+            repository,
+            journal.job_id(),
+            &page_id,
+            &registrations,
+        )?;
+        Box::pin(super::control::upload_inventory_page(
+            &descriptor,
+            root_key,
+            document,
+            journal,
+            provider,
+            repository,
+            cancel,
+        ))
+        .await?;
+    }
+    let mut receipts = Vec::with_capacity(members.len());
+    for member in members {
+        receipts.push(upload(journal, &member.object_id, provider, repository, cancel).await?);
+    }
+    Ok(receipts)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn upload_registered(
     journal: &mut TransferJournal,
     object: &str,
@@ -220,53 +318,33 @@ pub(crate) async fn upload_registered(
     repository: &RepositoryHandle,
     cancel: &Cancellation,
 ) -> Result<ObjectReceipt> {
-    let descriptor = Descriptor::new(format_repository_id.to_owned(), None)
-        .map_err(|_| ProviderError::new(ErrorKind::Corrupt))?;
-    let record = journal
-        .record(object)?
-        .ok_or_else(|| ProviderError::new(ErrorKind::Corrupt))?;
-    if !matches!(
-        record.intent.role,
-        ObjectRole::Pack
-            | ObjectRole::Catalog
-            | ObjectRole::SyncState
-            | ObjectRole::BackupBundle
-            | ObjectRole::BackupPoint
-    ) {
-        return upload(journal, object, provider, repository, cancel).await;
-    }
-    let page_id = inventory_page_id(journal.job_id(), object, &record.intent.sha256);
-    let document = super::control::inventory_page_document(
-        &descriptor,
-        repository,
-        journal.job_id(),
-        &page_id,
-        &[super::control::InventoryRegistration {
-            intent: &record.intent,
-            plaintext_length,
-            plaintext_sha256,
-        }],
-    )?;
-    Box::pin(super::control::upload_inventory_page(
-        &descriptor,
-        root_key,
-        document,
+    upload_wave(
         journal,
+        &[WaveMember {
+            object_id: object.to_owned(),
+            plaintext_length,
+            plaintext_sha256: plaintext_sha256.to_owned(),
+        }],
+        format_repository_id,
+        root_key,
         provider,
         repository,
         cancel,
-    ))
-    .await?;
-    upload(journal, object, provider, repository, cancel).await
+    )
+    .await?
+    .pop()
+    .ok_or_else(|| ProviderError::new(ErrorKind::Corrupt))
 }
 
-fn inventory_page_id(job_id: &str, object: &str, sha256: &str) -> String {
-    let mut identity = Vec::with_capacity(job_id.len() + object.len() + 66);
+fn inventory_page_id(job_id: &str, members: &[(&str, &str)]) -> String {
+    let mut identity = Vec::with_capacity(job_id.len() + members.len() * 130);
     identity.extend_from_slice(job_id.as_bytes());
-    identity.push(0);
-    identity.extend_from_slice(object.as_bytes());
-    identity.push(0);
-    identity.extend_from_slice(sha256.as_bytes());
+    for (object, sha256) in members {
+        identity.push(0);
+        identity.extend_from_slice(object.as_bytes());
+        identity.push(0);
+        identity.extend_from_slice(sha256.as_bytes());
+    }
     hex::encode(hash(&identity))
 }
 
@@ -619,7 +697,7 @@ mod tests {
             .unwrap();
             let page = format!(
                 "inventory-page-{}",
-                inventory_page_id(&identity().job_id, &intent.object_id, &intent.sha256)
+                inventory_page_id(&identity().job_id, &[(&intent.object_id, &intent.sha256)])
             );
             assert!(provider.holds(&page));
             assert!(provider.holds(&intent.object_id));
@@ -649,7 +727,7 @@ mod tests {
             .unwrap();
             let page = format!(
                 "inventory-page-{}",
-                inventory_page_id(&identity().job_id, &intent.object_id, &intent.sha256)
+                inventory_page_id(&identity().job_id, &[(&intent.object_id, &intent.sha256)])
             );
             provider.forget(&page);
             drop(journal);
@@ -679,7 +757,7 @@ mod tests {
             let (mut journal, intent) = prepare(root.path());
             let provider = FakeProvider::new(false);
             let repository = fake::repository();
-            let page_id = inventory_page_id(journal.job_id(), &intent.object_id, &intent.sha256);
+            let page_id = inventory_page_id(journal.job_id(), &[(&intent.object_id, &intent.sha256)]);
             let document = super::super::control::inventory_page_document(
                 &Descriptor::new("format-repository".into(), None).unwrap(),
                 &repository, journal.job_id(), &page_id,
@@ -745,7 +823,7 @@ mod tests {
                     }
                     payload_requests += provider.upload_attempts(&intent.object_id);
                     inventory_requests += provider.upload_attempts(&format!("inventory-page-{}",
-                        inventory_page_id(&job.job_id, &intent.object_id, &intent.sha256)));
+                        inventory_page_id(&job.job_id, &[(&intent.object_id, &intent.sha256)])));
                 }
             }
             let state = provider.state.lock().unwrap();

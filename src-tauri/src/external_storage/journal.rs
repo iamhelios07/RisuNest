@@ -52,6 +52,15 @@ impl SealedResume {
     }
 }
 
+/// One object of a registration wave, with the plaintext identity its
+/// inventory entry carries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WaveMember {
+    pub object_id: String,
+    pub plaintext_length: u64,
+    pub plaintext_sha256: String,
+}
+
 pub(crate) struct TransferRecord {
     pub intent: ObjectIntent,
     pub attempted: bool,
@@ -271,7 +280,7 @@ impl TransferJournal {
         if fresh {
             db.execute_batch("BEGIN IMMEDIATE;
                 CREATE TABLE identity(singleton INTEGER PRIMARY KEY CHECK(singleton=1), value TEXT NOT NULL);
-                CREATE TABLE objects(id TEXT PRIMARY KEY,intent TEXT NOT NULL,attempted INTEGER NOT NULL CHECK(attempted IN (0,1)),resume TEXT,receipt TEXT);").map_err(storage)?;
+                CREATE TABLE objects(id TEXT PRIMARY KEY,intent TEXT NOT NULL,attempted INTEGER NOT NULL CHECK(attempted IN (0,1)),resume TEXT,receipt TEXT,page TEXT,plaintext_length INTEGER,plaintext_sha256 TEXT);").map_err(storage)?;
             db.execute(
                 "INSERT INTO identity VALUES(1,?1)",
                 [serde_json::to_string(&identity).map_err(storage)?],
@@ -331,7 +340,7 @@ impl TransferJournal {
         }
         self.db
             .execute(
-                "INSERT INTO objects VALUES(?1,?2,0,NULL,NULL)",
+                "INSERT INTO objects VALUES(?1,?2,0,NULL,NULL,NULL,NULL,NULL)",
                 params![
                     intent.object_id,
                     serde_json::to_string(intent).map_err(storage)?
@@ -339,6 +348,97 @@ impl TransferJournal {
             )
             .map_err(storage)?;
         Ok(())
+    }
+
+    /// Fixes which page covers which objects before that page is uploaded. A
+    /// resumed wave rebuilds its document from these rows rather than from
+    /// whatever the caller gathers the second time, because a page that
+    /// changed shape would upload different bytes under the same object id.
+    pub fn cover(&mut self, page_object: &str, members: &[WaveMember]) -> Result<()> {
+        if page_object.is_empty() || members.is_empty() {
+            return Err(corrupt());
+        }
+        let transaction = self.db.unchecked_transaction().map_err(storage)?;
+        for member in members {
+            let row: Option<(Option<String>, Option<i64>, Option<String>)> = transaction
+                .query_row(
+                    "SELECT page,plaintext_length,plaintext_sha256 FROM objects WHERE id=?1",
+                    params![member.object_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(storage)?;
+            let Some((page, length, digest)) = row else {
+                return Err(corrupt());
+            };
+            let plaintext_length =
+                i64::try_from(member.plaintext_length).map_err(|_| corrupt())?;
+            match page {
+                Some(existing)
+                    if existing == page_object
+                        && length == Some(plaintext_length)
+                        && digest.as_deref() == Some(member.plaintext_sha256.as_str()) => {}
+                Some(_) => return Err(corrupt()),
+                None => {
+                    transaction
+                        .execute(
+                            "UPDATE objects SET page=?2,plaintext_length=?3,plaintext_sha256=?4
+                             WHERE id=?1 AND page IS NULL",
+                            params![
+                                member.object_id,
+                                page_object,
+                                plaintext_length,
+                                member.plaintext_sha256
+                            ],
+                        )
+                        .map_err(storage)?;
+                }
+            }
+        }
+        transaction.commit().map_err(storage)
+    }
+
+    /// The exact membership a page was fixed with, in the order its document
+    /// lists it.
+    pub fn page_members(&self, page_object: &str) -> Result<Vec<(ObjectIntent, u64, String)>> {
+        let mut statement = self
+            .db
+            .prepare(
+                "SELECT intent,plaintext_length,plaintext_sha256 FROM objects
+                 WHERE page=?1 ORDER BY id",
+            )
+            .map_err(storage)?;
+        let rows = statement
+            .query_map(params![page_object], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(storage)?;
+        let mut members = Vec::new();
+        for row in rows {
+            let (intent, length, digest) = row.map_err(storage)?;
+            members.push((
+                serde_json::from_str(&intent).map_err(|_| corrupt())?,
+                u64::try_from(length).map_err(|_| corrupt())?,
+                digest,
+            ));
+        }
+        Ok(members)
+    }
+
+    pub fn covered_by(&self, object: &str) -> Result<Option<String>> {
+        self.db
+            .query_row(
+                "SELECT page FROM objects WHERE id=?1",
+                params![object],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(storage)
+            .map(Option::flatten)
     }
 
     pub fn record(&self, object: &str) -> Result<Option<TransferRecord>> {
