@@ -136,6 +136,10 @@ impl TransferJournal {
         &self.identity.job_id
     }
 
+    pub(crate) fn connection_id(&self) -> &str {
+        &self.identity.connection_id
+    }
+
     pub(crate) fn directory(&self) -> &Path {
         &self.directory
     }

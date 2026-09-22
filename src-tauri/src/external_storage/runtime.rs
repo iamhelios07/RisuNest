@@ -1488,6 +1488,7 @@ async fn run_backup(
     .await?;
     match super::packaging::verify_publication(
         &completed,
+        &root,
         &cache,
         &mut journal,
         &connected.root_key,

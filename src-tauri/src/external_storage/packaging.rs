@@ -7,6 +7,7 @@ use super::{
         Cancellation, ErrorKind, ObjectIntent, ObjectReceipt, ObjectRole, Provider, ProviderError,
         ReadReceipt, RemoteLocator, RepositoryHandle, Result,
     },
+    connection_store::{ConnectionStore, UnusableReason},
     journal::{validate_receipt, TransferJournal},
     package_cache::{kind_name, PackageCache},
     sections::CapturedSection,
@@ -215,6 +216,7 @@ pub(crate) enum PublicationReadiness {
 /// Only confirmed missing ciphertext is repaired, using the original sealed spool.
 pub(crate) async fn verify_publication(
     completed: &CompletedSnapshot,
+    repository_root: &Path,
     cache_root: &Path,
     journal: &mut TransferJournal,
     root_key: &[u8; 32],
@@ -228,6 +230,7 @@ pub(crate) async fn verify_publication(
         return Err(corrupt("publication root identity differs"));
     }
     let mut cache = PackageCache::open(cache_root)?;
+    let mut evidence = ObjectEvidence::open(repository_root, journal.connection_id())?;
     let mut catalogs = vec![completed.record_catalog.clone(), completed.asset_catalog.clone()];
     for section in completed.sections.values() {
         catalogs.push(RemoteObject::from_stored(&section.entries_root, repository)?);
@@ -235,7 +238,7 @@ pub(crate) async fn verify_publication(
     for catalog in catalogs {
         if catalog.repository_id != completed.repository_id { return Err(corrupt("publication repository differs")); }
         let Some(objects) = revalidate_cached_catalog(
-            &catalog, &mut cache, journal, root_key, provider, repository, cancel,
+            &catalog, &mut cache, &mut evidence, journal, root_key, provider, repository, cancel,
         ).await? else {
             return Ok(PublicationReadiness::Repackage);
         };
@@ -245,7 +248,7 @@ pub(crate) async fn verify_publication(
         }
     }
     let Some(root) = revalidate_cached_object(
-        &completed.reference, &mut cache, journal, root_key, provider, repository, cancel,
+        &completed.reference, &mut cache, &mut evidence, journal, root_key, provider, repository, cancel,
     ).await? else {
         return Ok(PublicationReadiness::Repackage);
     };
@@ -288,6 +291,43 @@ fn decode_hash(value: &str) -> Result<[u8; 32]> {
         .ok_or_else(|| corrupt("invalid sha256"))
 }
 
+/// What this connection already knows it cannot reference again. It lives
+/// beside the connection rather than in the package cache, so rebuilding the
+/// cache from authenticated metadata cannot bring a known failure back.
+pub(super) struct ObjectEvidence {
+    store: ConnectionStore,
+    connection: String,
+}
+
+impl ObjectEvidence {
+    pub(super) fn open(root: &Path, connection: &str) -> Result<Self> {
+        Ok(Self {
+            store: ConnectionStore::open(root)?,
+            connection: connection.to_owned(),
+        })
+    }
+    /// Everything that names one remote object: its locator, role, lengths and
+    /// both hashes. A repaired object published elsewhere is a different one.
+    fn identity(value: &RemoteObject, repository: &RepositoryHandle) -> Result<String> {
+        super::reachability::object_identity(value, repository)
+    }
+    fn known(&self, identity: &str) -> Result<bool> {
+        Ok(self
+            .store
+            .unusable_object(&self.connection, identity)?
+            .is_some())
+    }
+    fn record(&self, identity: &str, object_id: &str, reason: UnusableReason) -> Result<()> {
+        self.store
+            .record_unusable_object(&self.connection, identity, object_id, reason)
+    }
+    /// This exact object answered for itself, so whatever was remembered about
+    /// it no longer describes it.
+    fn clear(&self, identity: &str) -> Result<()> {
+        self.store.forget_unusable_object(&self.connection, identity)
+    }
+}
+
 #[derive(Default)]
 pub(super) struct AttemptVerification {
     receipts: BTreeMap<String, ObjectReceipt>,
@@ -309,6 +349,7 @@ fn verification_key(value: &RemoteObject) -> Result<String> {
 async fn revalidate_cached_object(
     value: &RemoteObject,
     cache: &mut PackageCache,
+    evidence: &mut ObjectEvidence,
     journal: &mut TransferJournal,
     root_key: &[u8; 32],
     provider: &dyn Provider,
@@ -316,7 +357,7 @@ async fn revalidate_cached_object(
     cancel: &Cancellation,
 ) -> Result<Option<RemoteObject>> {
     revalidate_cached_object_at(
-        value, cache, journal, root_key, provider, repository, cancel, None,
+        value, cache, evidence, journal, root_key, provider, repository, cancel, None,
     )
     .await
 }
@@ -324,6 +365,7 @@ async fn revalidate_cached_object(
 async fn revalidate_cached_object_at(
     value: &RemoteObject,
     cache: &mut PackageCache,
+    evidence: &mut ObjectEvidence,
     journal: &mut TransferJournal,
     root_key: &[u8; 32],
     provider: &dyn Provider,
@@ -371,12 +413,36 @@ async fn revalidate_cached_object_at(
     historical.checksum = None;
     // Only a version bound to bytes verified in this execution permits a conditional read.
     let unchanged = if output.is_none() { known.as_ref().and_then(|receipt| receipt.version.as_ref()) } else { None };
-    let current = transfer_job::verify_remote_receipt_at(
-        journal.directory(), &intent, provider, repository, historical, cancel, unchanged, output,
-    ).await?;
+    // Keyed to the reference this attempt is about to contact, which the
+    // inventory above may have moved on from the one the caller held. A
+    // reference already found unusable stays that way even though the cache
+    // naming it can be rebuilt at any moment, so asking the provider again
+    // would only repeat an answer already paid for.
+    let contacted = ObjectEvidence::identity(&verified, repository)?;
+    let mut unusable = evidence.known(&contacted)?;
+    let current = if unusable {
+        None
+    } else {
+        match transfer_job::verify_remote_receipt_at(
+            journal.directory(), &intent, provider, repository, historical, cancel, unchanged, output,
+        ).await {
+            Ok(current) => current,
+            // This reference failed verification. Authorization, quota and
+            // transient answers say nothing about the object itself.
+            Err(error) if error.kind == ErrorKind::Corrupt => {
+                evidence.record(&contacted, &value.object_id, UnusableReason::Damaged)?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        }
+    };
     verified.receipt = match current {
         Some(receipt) => receipt,
         None => {
+            if !unusable {
+                evidence.record(&contacted, &value.object_id, UnusableReason::Missing)?;
+                unusable = true;
+            }
             journal.verification.receipts.remove(&key);
             journal.verification.catalogs.remove(&key);
             if record.is_none() {
@@ -414,6 +480,12 @@ async fn revalidate_cached_object_at(
     {
         cache.put_object(repository, &verified)?;
     }
+    // The contacted reference answered in the end, so nothing about it is
+    // still open. A repair that moved the object keeps the old record, which
+    // now names a locator nothing reaches.
+    if unusable && ObjectEvidence::identity(&verified, repository)? == contacted {
+        evidence.clear(&contacted)?;
+    }
     Ok(Some(verified))
 }
 
@@ -422,6 +494,7 @@ async fn revalidate_cached_object_at(
 async fn revalidate_cached_catalog(
     root: &RemoteObject,
     cache: &mut PackageCache,
+    evidence: &mut ObjectEvidence,
     journal: &mut TransferJournal,
     root_key: &[u8; 32],
     provider: &dyn Provider,
@@ -454,7 +527,7 @@ async fn revalidate_cached_catalog(
         let decoded = journal.verification.catalogs.get(&key).cloned();
         let output = (object.role == ObjectRole::Catalog && decoded.is_none()).then_some(path.as_path());
         let Some(object) = revalidate_cached_object_at(
-            &object, cache, journal, root_key, provider, repository, cancel, output,
+            &object, cache, evidence, journal, root_key, provider, repository, cancel, output,
         ).await? else {
             return Ok(None);
         };
@@ -478,6 +551,11 @@ async fn revalidate_cached_catalog(
             if hex::encode(hash_reader(&mut input, object.receipt.byte_length).map_err(corrupt)?)
                 != object.ciphertext_sha256
             {
+                evidence.record(
+                    &ObjectEvidence::identity(&object, repository)?,
+                    &object.object_id,
+                    UnusableReason::Damaged,
+                )?;
                 return Err(corrupt("catalog ciphertext differs"));
             }
             input.seek(SeekFrom::Start(0)).map_err(transient)?;
@@ -489,6 +567,11 @@ async fn revalidate_cached_catalog(
                 || hex::encode(hash(&plaintext)) != object.plaintext_sha256
                 || plaintext.len() as u64 != object.plaintext_length
             {
+                evidence.record(
+                    &ObjectEvidence::identity(&object, repository)?,
+                    &object.object_id,
+                    UnusableReason::Damaged,
+                )?;
                 return Err(corrupt("catalog plaintext differs"));
             }
             let document = wire::CatalogDocument::decode(&plaintext, wire::MAX_METADATA_BYTES)
@@ -740,6 +823,7 @@ async fn build_entries(
     root_key: &[u8; 32],
     limits: PackageLimits,
     cache: &mut PackageCache,
+    evidence: &mut ObjectEvidence,
     journal: &mut TransferJournal,
     provider: &dyn Provider,
     repository: &RepositoryHandle,
@@ -774,6 +858,7 @@ async fn build_entries(
                 match revalidate_cached_object(
                     pack,
                     cache,
+                    evidence,
                     journal,
                     root_key,
                     provider,
@@ -838,6 +923,7 @@ async fn build_entries(
             &data_key,
             limits,
             cache,
+            evidence,
             journal,
             provider,
             repository,
@@ -1019,6 +1105,7 @@ async fn upload_plain_object(
     key: &[u8; 32],
     limits: PackageLimits,
     cache: &mut PackageCache,
+    evidence: &mut ObjectEvidence,
     journal: &mut TransferJournal,
     provider: &dyn Provider,
     repository: &RepositoryHandle,
@@ -1038,7 +1125,7 @@ async fn upload_plain_object(
             return Err(corrupt("cached plaintext identity differs"));
         }
         if let Some(current) = revalidate_cached_object(
-            &value, cache, journal, root_key, provider, repository, cancel,
+            &value, cache, evidence, journal, root_key, provider, repository, cancel,
         ).await? {
             return Ok(current);
         }
@@ -1310,6 +1397,7 @@ async fn build_catalog(
     root_key: &[u8; 32],
     limits: PackageLimits,
     cache: &mut PackageCache,
+    evidence: &mut ObjectEvidence,
     journal: &mut TransferJournal,
     provider: &dyn Provider,
     repository: &RepositoryHandle,
@@ -1318,7 +1406,7 @@ async fn build_catalog(
 ) -> Result<RemoteObject> {
     if let Some(root) = cache.catalog(format_repository_id, repository, kind, fingerprint)? {
         if let Some(objects) = revalidate_cached_catalog(
-            &root, cache, journal, root_key, provider, repository, cancel,
+            &root, cache, evidence, journal, root_key, provider, repository, cancel,
         ).await? {
             let current = objects.first().cloned().ok_or_else(|| corrupt("empty catalog closure"))?;
             referenced.extend(objects);
@@ -1368,6 +1456,7 @@ async fn build_catalog(
             limits,
             build_root,
             cache,
+            evidence,
             journal,
             provider,
             repository,
@@ -1399,6 +1488,7 @@ async fn build_catalog(
                 limits,
                 build_root,
                 cache,
+                evidence,
                 journal,
                 provider,
                 repository,
@@ -1442,6 +1532,7 @@ async fn upload_metadata_bytes(
     limits: PackageLimits,
     build_root: &Path,
     cache: &mut PackageCache,
+    evidence: &mut ObjectEvidence,
     journal: &mut TransferJournal,
     provider: &dyn Provider,
     repository: &RepositoryHandle,
@@ -1464,6 +1555,7 @@ async fn upload_metadata_bytes(
         key,
         limits,
         cache,
+        evidence,
         journal,
         provider,
         repository,
@@ -1500,6 +1592,7 @@ pub(crate) async fn package_and_upload(
     }
     let build_root = cache_root.join("build");
     let mut cache = PackageCache::open(cache_root)?;
+    let mut evidence = ObjectEvidence::open(repository_root, journal.connection_id())?;
     let external_root = repository_root.join("external-storage");
     let repository_root_owned = repository_root.to_path_buf();
     let library_domain = library_fingerprint_domain();
@@ -1530,6 +1623,7 @@ pub(crate) async fn package_and_upload(
         root_key,
         limits,
         &mut cache,
+        &mut evidence,
         journal,
         provider,
         repository,
@@ -1545,6 +1639,7 @@ pub(crate) async fn package_and_upload(
         root_key,
         limits,
         &mut cache,
+        &mut evidence,
         journal,
         provider,
         repository,
@@ -1559,7 +1654,7 @@ pub(crate) async fn package_and_upload(
         &asset_fingerprint,
     )? {
         Some(root) => revalidate_cached_catalog(
-            &root, &mut cache, journal, root_key, provider, repository, cancel,
+            &root, &mut cache, &mut evidence, journal, root_key, provider, repository, cancel,
         ).await?,
         None => None,
     };
@@ -1577,6 +1672,7 @@ pub(crate) async fn package_and_upload(
             root_key,
             limits,
             &mut cache,
+            &mut evidence,
             journal,
             provider,
             repository,
@@ -1593,6 +1689,7 @@ pub(crate) async fn package_and_upload(
             root_key,
             limits,
             &mut cache,
+            &mut evidence,
             journal,
             provider,
             repository,
@@ -1651,6 +1748,7 @@ pub(crate) async fn package_and_upload(
             root_key,
             limits,
             &mut cache,
+            &mut evidence,
             journal,
             provider,
             repository,
@@ -1667,6 +1765,7 @@ pub(crate) async fn package_and_upload(
             root_key,
             limits,
             &mut cache,
+            &mut evidence,
             journal,
             provider,
             repository,
@@ -1692,7 +1791,7 @@ pub(crate) async fn package_and_upload(
     for section in published_sections.values() {
         let root = RemoteObject::from_stored(&section.entries_root, repository)?;
         let objects = revalidate_cached_catalog(
-            &root, &mut cache, journal, root_key, provider, repository, cancel,
+            &root, &mut cache, &mut evidence, journal, root_key, provider, repository, cancel,
         ).await?.ok_or_else(|| ProviderError::new(ErrorKind::NotFound))?;
         referenced.extend(objects);
     }
@@ -1764,6 +1863,7 @@ pub(crate) async fn package_and_upload(
         &metadata_key,
         limits,
         &mut cache,
+        &mut evidence,
         journal,
         provider,
         repository,
@@ -2566,7 +2666,7 @@ mod tests {
                 // No in-memory receipt or protection survives reopening this journal.
                 drop(journal);
                 let mut journal = TransferJournal::open(&directory, identity).unwrap();
-                assert_eq!(verify_publication(&completed, &cache, &mut journal, &key,
+                assert_eq!(verify_publication(&completed, root.path(), &cache, &mut journal, &key,
                     &provider, &repository, &cancel).await.unwrap(), PublicationReadiness::Verified);
                 assert_eq!(provider.upload_attempts(&missing.object_id), 2);
                 assert_eq!(provider.state.lock().unwrap().objects[&missing.receipt.locator.object].0, ciphertext);
@@ -2596,7 +2696,7 @@ mod tests {
             let original = std::fs::read(journal.spool_path(&missing.object_id)).unwrap();
             provider.forget(&missing.receipt.locator.object);
             provider.set_upload_locator(&missing.object_id, "new-opaque-object");
-            assert_eq!(verify_publication(&completed, &cache, &mut journal, &key,
+            assert_eq!(verify_publication(&completed, root.path(), &cache, &mut journal, &key,
                 &provider, &repository, &cancel).await.unwrap(), PublicationReadiness::Repackage);
             assert_eq!(provider.state.lock().unwrap().objects["new-opaque-object"].0, original);
             assert_eq!(provider.upload_attempts(&missing.object_id), 2);
@@ -2614,7 +2714,7 @@ mod tests {
             for object in replacement.referenced_objects.iter().filter(|object| object.role == ObjectRole::Pack) {
                 assert!(completed.referenced_objects.iter().any(|previous| previous.object_id == object.object_id));
             }
-            assert_eq!(verify_publication(&replacement, &cache, &mut replacement_journal, &key,
+            assert_eq!(verify_publication(&replacement, root.path(), &cache, &mut replacement_journal, &key,
                 &provider, &repository, &cancel).await.unwrap(), PublicationReadiness::Verified);
             let restored = snapshot_restore::download_snapshot(&replacement.reference, &root.path().join("restored"),
                 &key, &provider, &repository, &cancel).await.unwrap();
@@ -2680,6 +2780,7 @@ mod tests {
             let (capture, _) = captured(root.path(), "stable-capture", 1, b"record", b"asset");
             let mut journal = journal(&root.path().join("stable-job"), "stable-job", &capture);
             let mut cache = PackageCache::open(&root.path().join("stable-cache")).unwrap();
+            let mut evidence = ObjectEvidence::open(root.path(), journal.connection_id()).unwrap();
             let build = root.path().join("stable-build");
             fs::create_dir(&build).unwrap();
             let first_path = build.join("first");
@@ -2698,6 +2799,7 @@ mod tests {
                 &key,
                 limits(128 * 1024),
                 &mut cache,
+                &mut evidence,
                 &mut journal,
                 &provider,
                 &repository,
@@ -2718,6 +2820,7 @@ mod tests {
                 &key,
                 limits(128 * 1024),
                 &mut cache,
+                &mut evidence,
                 &mut journal,
                 &provider,
                 &repository,
@@ -2726,6 +2829,171 @@ mod tests {
             .await
             .is_err());
             assert_eq!(provider.state.lock().unwrap().objects.len(), before);
+        });
+    }
+
+    /// Uploads one object and hands back everything needed to revalidate it
+    /// the way a later publication would.
+    async fn inherited_object(
+        root: &Path,
+        provider: &FakeProvider,
+        repository: &RepositoryHandle,
+        capture: &CapturedSnapshot,
+    ) -> (RemoteObject, PackageCache, ObjectEvidence, TransferJournal) {
+        let mut journal = journal(&root.join("evidence-job"), "evidence-job", capture);
+        let mut cache = PackageCache::open(&root.join("evidence-cache")).unwrap();
+        let mut evidence = ObjectEvidence::open(root, journal.connection_id()).unwrap();
+        let build = root.join("evidence-build");
+        fs::create_dir_all(&build).unwrap();
+        let path = build.join("body");
+        fs::write(&path, b"inherited snapshot body").unwrap();
+        let key = derive_key(&[41; 32], "format-repository", "metadata").unwrap();
+        let object = upload_plain_object(
+            &path,
+            23,
+            hash(b"inherited snapshot body"),
+            "snapshot-inherited".into(),
+            ObjectRole::SyncState,
+            "format-repository",
+            &[41; 32],
+            &key,
+            limits(128 * 1024),
+            &mut cache,
+            &mut evidence,
+            &mut journal,
+            provider,
+            repository,
+            &Cancellation::default(),
+        )
+        .await
+        .unwrap();
+        (object, cache, evidence, journal)
+    }
+
+    /// The package cache can be deleted or rebuilt from a parent's catalog at
+    /// any time, so a reference already found missing has to be remembered
+    /// somewhere the cache cannot speak for.
+    #[test]
+    fn a_rebuilt_cache_does_not_restore_trust_in_a_reference_found_missing() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let (capture, _) = captured(root.path(), "evidence-capture", 1, b"record", b"asset");
+            let (object, mut cache, mut evidence, _journal) =
+                inherited_object(root.path(), &provider, &repository, &capture).await;
+            let mut next = journal(&root.path().join("evidence-next"), "evidence-next", &capture);
+            provider.forget(&object.receipt.locator.object);
+            assert!(revalidate_cached_object(
+                &object, &mut cache, &mut evidence, &mut next, &[41; 32], &provider, &repository,
+                &Cancellation::default(),
+            ).await.unwrap().is_none());
+            assert!(cache.object(
+                "format-repository", &repository, &object.object_id, &object.plaintext_sha256,
+            ).unwrap().is_none());
+            assert!(evidence.known(&ObjectEvidence::identity(&object, &repository).unwrap()).unwrap());
+
+            cache.put_object(&repository, &object).unwrap();
+            let reads = provider.read_count();
+            assert!(revalidate_cached_object(
+                &object, &mut cache, &mut evidence, &mut next, &[41; 32], &provider, &repository,
+                &Cancellation::default(),
+            ).await.unwrap().is_none());
+            assert_eq!(provider.read_count(), reads);
+        });
+    }
+
+    /// The record answers for one exact remote object, so the object answering
+    /// for itself again has to end it.
+    #[test]
+    fn a_repaired_object_stops_answering_from_its_recorded_failure() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let (capture, _) = captured(root.path(), "evidence-capture", 1, b"record", b"asset");
+            let (object, mut cache, mut evidence, mut journal) =
+                inherited_object(root.path(), &provider, &repository, &capture).await;
+            provider.forget(&object.receipt.locator.object);
+            let repaired = revalidate_cached_object(
+                &object, &mut cache, &mut evidence, &mut journal, &[41; 32], &provider, &repository,
+                &Cancellation::default(),
+            ).await.unwrap().unwrap();
+            // The spool held the original ciphertext, so the repair restored
+            // the same identity rather than producing a second one.
+            assert_eq!(repaired.receipt.locator, object.receipt.locator);
+            assert_eq!(repaired.ciphertext_sha256, object.ciphertext_sha256);
+            assert!(!evidence.known(&ObjectEvidence::identity(&object, &repository).unwrap()).unwrap());
+
+            let reads = provider.read_count();
+            assert!(revalidate_cached_object(
+                &repaired, &mut cache, &mut evidence, &mut journal, &[41; 32], &provider,
+                &repository, &Cancellation::default(),
+            ).await.unwrap().is_some());
+            assert!(provider.read_count() > reads);
+        });
+    }
+
+    /// Bytes that fail their own verification are as unusable as bytes that
+    /// are not there, and the reason is kept apart because they are not the
+    /// same finding.
+    #[test]
+    fn bytes_that_fail_verification_are_remembered_as_damaged() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let (capture, _) = captured(root.path(), "evidence-capture", 1, b"record", b"asset");
+            let (object, mut cache, mut evidence, _journal) =
+                inherited_object(root.path(), &provider, &repository, &capture).await;
+            let mut next = journal(&root.path().join("evidence-next"), "evidence-next", &capture);
+            {
+                let mut state = provider.state.lock().unwrap();
+                let stored = state.objects.get_mut(&object.receipt.locator.object).unwrap();
+                let last = stored.0.len() - 1;
+                stored.0[last] ^= 0xff;
+            }
+            assert_eq!(revalidate_cached_object(
+                &object, &mut cache, &mut evidence, &mut next, &[41; 32], &provider, &repository,
+                &Cancellation::default(),
+            ).await.unwrap_err().kind, ErrorKind::Corrupt);
+            let store = ConnectionStore::open(root.path()).unwrap();
+            assert_eq!(
+                store.unusable_object("connection", &super::super::reachability::object_identity(&object, &repository).unwrap()).unwrap(),
+                Some(UnusableReason::Damaged),
+            );
+
+            let reads = provider.read_count();
+            assert!(revalidate_cached_object(
+                &object, &mut cache, &mut evidence, &mut next, &[41; 32], &provider, &repository,
+                &Cancellation::default(),
+            ).await.unwrap().is_none());
+            assert_eq!(provider.read_count(), reads);
+        });
+    }
+
+    #[test]
+    fn an_answer_about_the_provider_is_not_an_answer_about_the_object() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let (capture, _) = captured(root.path(), "evidence-capture", 1, b"record", b"asset");
+            let (object, mut cache, mut evidence, _journal) =
+                inherited_object(root.path(), &provider, &repository, &capture).await;
+            let mut next = journal(&root.path().join("evidence-next"), "evidence-next", &capture);
+            for kind in [ErrorKind::Transient, ErrorKind::Unauthorized, ErrorKind::RateLimited] {
+                provider.fail_read(&object.receipt.locator.object, kind);
+                assert_eq!(revalidate_cached_object(
+                    &object, &mut cache, &mut evidence, &mut next, &[41; 32], &provider,
+                    &repository, &Cancellation::default(),
+                ).await.unwrap_err().kind, kind);
+                assert!(!evidence.known(&ObjectEvidence::identity(&object, &repository).unwrap()).unwrap());
+            }
+            assert!(revalidate_cached_object(
+                &object, &mut cache, &mut evidence, &mut next, &[41; 32], &provider, &repository,
+                &Cancellation::default(),
+            ).await.unwrap().is_some());
         });
     }
 
@@ -3120,7 +3388,7 @@ mod tests {
             let mut second_journal = journal(&root.path().join("second-job"), "second-job", &capture);
             let second = package_and_upload(capture, vec![], root.path(), &cache, meta, &key,
                 limits(128 * 1024), &mut second_journal, &provider, &repository, &cancel).await.unwrap();
-            assert_eq!(verify_publication(&second, &cache, &mut second_journal, &key,
+            assert_eq!(verify_publication(&second, root.path(), &cache, &mut second_journal, &key,
                 &provider, &repository, &cancel).await.unwrap(), PublicationReadiness::Verified);
             let pack = second.referenced_objects.iter().find(|object| object.role == ObjectRole::Pack
                 && first.referenced_objects.iter().any(|prior| prior.object_id == object.object_id)).unwrap();
@@ -3130,19 +3398,19 @@ mod tests {
                 assert_eq!(count - before.get(name).copied().unwrap_or(0), object.receipt.byte_length as usize);
             }
             let bodies = provider.state.lock().unwrap().body_bytes.clone();
-            assert_eq!(verify_publication(&second, &cache, &mut second_journal, &key,
+            assert_eq!(verify_publication(&second, root.path(), &cache, &mut second_journal, &key,
                 &provider, &repository, &cancel).await.unwrap(), PublicationReadiness::Verified);
             assert_eq!(provider.state.lock().unwrap().body_bytes, bodies);
             provider.state.lock().unwrap().ignore_unchanged = true;
-            assert_eq!(verify_publication(&second, &cache, &mut second_journal, &key,
+            assert_eq!(verify_publication(&second, root.path(), &cache, &mut second_journal, &key,
                 &provider, &repository, &cancel).await.unwrap(), PublicationReadiness::Verified);
             let pack_name = &pack.receipt.locator.object;
             assert_eq!(provider.state.lock().unwrap().body_bytes[pack_name] - bodies[pack_name], pack.receipt.byte_length as usize);
             provider.seed(pack_name, ObjectRole::Pack, vec![0; pack.receipt.byte_length as usize]);
-            assert_eq!(verify_publication(&second, &cache, &mut second_journal, &key,
+            assert_eq!(verify_publication(&second, root.path(), &cache, &mut second_journal, &key,
                 &provider, &repository, &cancel).await.unwrap_err().kind, ErrorKind::Corrupt);
             provider.forget(&pack.receipt.locator.object);
-            assert_eq!(verify_publication(&second, &cache, &mut second_journal, &key,
+            assert_eq!(verify_publication(&second, root.path(), &cache, &mut second_journal, &key,
                 &provider, &repository, &cancel).await.unwrap(), PublicationReadiness::Repackage);
         });
     }
