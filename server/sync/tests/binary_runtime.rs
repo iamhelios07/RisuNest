@@ -309,8 +309,9 @@ async fn standalone_binary_serves_with_empty_path_and_resumes_after_process_kill
         .send().await.unwrap().error_for_status().unwrap()
         .bytes().await.unwrap();
     let frames = transfer::decode(&transfer).unwrap();
-    assert!(matches!(frames.as_slice(), [Frame::FullRequired { hash, size }]
-        if hash == &digest && *size == body.len() as u64));
+    // The resumed object is below the reply target, so it arrives inline. The
+    // direct object request below still covers the separate download path.
+    assert!(matches!(frames.as_slice(), [Frame::Full(bytes)] if bytes == &body));
     let received = daemon
         .request(
             &http,

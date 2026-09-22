@@ -230,6 +230,8 @@ impl Store {
         }
         let path = self.object_path(digest)?;
         let file = File::open(path)?;
+        #[cfg(test)]
+        frame_metrics::opened();
         use std::io::Read;
         let mut bytes = Vec::new();
         file.take(size + 1).read_to_end(&mut bytes)?;
@@ -244,6 +246,10 @@ impl Store {
 pub(super) mod frame_metrics {
     std::thread_local! {
         pub static SAMPLES: std::cell::RefCell<Option<[Vec<u128>; 8]>> = const { std::cell::RefCell::new(None) };
+        /// Counts the bodies a reply actually opened. A transfer reply is
+        /// planned from object metadata, so this must stay at the number of
+        /// bodies the reply carries.
+        pub static BODY_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
     pub fn record(stage: usize, started: std::time::Instant) {
         SAMPLES.with(|samples| {
@@ -251,6 +257,12 @@ pub(super) mod frame_metrics {
                 samples[stage].push(started.elapsed().as_micros());
             }
         });
+    }
+    pub fn opened() {
+        BODY_OPENS.with(|count| count.set(count.get() + 1));
+    }
+    pub fn take_opens() -> usize {
+        BODY_OPENS.with(|count| count.replace(0))
     }
 }
 

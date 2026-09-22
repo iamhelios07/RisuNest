@@ -13,7 +13,6 @@ CREATE TABLE objects (hash TEXT PRIMARY KEY, size INTEGER NOT NULL CHECK(size>=0
 CREATE TABLE object_leases(device TEXT NOT NULL REFERENCES devices(id),hash TEXT NOT NULL REFERENCES objects(hash),expires INTEGER NOT NULL,PRIMARY KEY(device,hash));
 CREATE TABLE object_custody(device TEXT NOT NULL REFERENCES devices(id),hash TEXT NOT NULL REFERENCES objects(hash),retention_id TEXT NOT NULL,PRIMARY KEY(device,hash));
 CREATE TABLE object_trash(hash TEXT PRIMARY KEY);
-CREATE TABLE transfer_recipes(id TEXT PRIMARY KEY,body BLOB NOT NULL,expires INTEGER NOT NULL);
 CREATE TABLE read_pins(id TEXT PRIMARY KEY,device TEXT NOT NULL REFERENCES devices(id),after_seq TEXT NOT NULL,through TEXT NOT NULL,domains TEXT NOT NULL,expires INTEGER NOT NULL);
 CREATE TABLE checkpoints(id TEXT PRIMARY KEY,device TEXT NOT NULL REFERENCES devices(id),head TEXT NOT NULL,domains TEXT NOT NULL,expires INTEGER NOT NULL);
 CREATE TABLE checkpoint_records(checkpoint TEXT NOT NULL REFERENCES checkpoints(id) ON DELETE CASCADE,domain TEXT NOT NULL,key TEXT NOT NULL,version TEXT NOT NULL,PRIMARY KEY(checkpoint,domain,key));

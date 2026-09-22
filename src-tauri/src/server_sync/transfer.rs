@@ -15,8 +15,9 @@ use std::{
     collections::BTreeSet,
     io::{Read, Seek, SeekFrom},
 };
-// Include the envelope for one 4 MiB full frame.
-const FRAME_TARGET_BYTES: usize = 4 * 1024 * 1024 + 53;
+// The upload side aims at the same reply target the download side plans
+// against, so one constant describes both directions.
+const FRAME_TARGET_BYTES: usize = transfer::PREFERRED_BATCH_BYTES;
 const CHUNK: usize = transfer::UPLOAD_CHUNK_BYTES;
 /// One regrouping round answers a reply the server filled. A second covers a
 /// bin the peer still declined; past that the single-object path is the
@@ -690,12 +691,12 @@ impl<'a> Transfer<'a> {
         let (mut bins, mut oversized) = (Vec::new(), Vec::new());
         let (mut bin, mut used) = (Vec::new(), 8usize);
         for (target, size) in declined {
-            // Above the delta target the server never answers inline, whatever
-            // the reply budget. Those keep the existing large-object path.
+            // A body that cannot fit an empty reply is never answered inline,
+            // whatever the budget. Those keep the existing large-object path.
             let Some(framed) = usize::try_from(size)
                 .ok()
-                .filter(|size| *size <= delta::MAX_TARGET_BYTES)
                 .and_then(|size| size.checked_add(45))
+                .filter(|framed| 8 + framed <= transfer::PREFERRED_BATCH_BYTES)
             else {
                 oversized.push((target, size));
                 continue;
