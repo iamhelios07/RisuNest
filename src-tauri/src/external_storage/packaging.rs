@@ -878,6 +878,8 @@ async fn build_entries(
     }
     let mut ready = Vec::new();
     let mut uncached = Vec::new();
+    // One answer per pack, not per entry that names it.
+    let mut settled: BTreeMap<String, bool> = BTreeMap::new();
     for source in sources {
         cancel.check()?;
         if let Some((mut cached, origin)) = cache.entry(
@@ -891,9 +893,27 @@ async fn build_entries(
             match parent {
                 // The packs this entry names are in the selected parent graph,
                 // which this job protects, so their existence is settled and
-                // nothing is asked about them. They are not verified here.
+                // nothing is asked about them. They are not verified here. What
+                // this connection already found unusable is not settled by any
+                // graph and never inherits.
                 Some(roots) => {
-                    if roots.contains(&origin) {
+                    let mut usable = roots.contains(&origin);
+                    for pack in &cached.packs {
+                        if !usable {
+                            break;
+                        }
+                        let known = match settled.get(&pack.object_id) {
+                            Some(known) => *known,
+                            None => {
+                                let known = evidence
+                                    .known(&ObjectEvidence::identity(pack, repository)?)?;
+                                settled.insert(pack.object_id.clone(), known);
+                                known
+                            }
+                        };
+                        usable = !known;
+                    }
+                    if usable {
                         ready.push(cached);
                         continue;
                     }
@@ -1460,6 +1480,7 @@ async fn build_catalog(
         ).await? {
             let current = objects.first().cloned().ok_or_else(|| corrupt("empty catalog closure"))?;
             referenced.extend(objects);
+            tag_published_entries(&entries, &current, kind, format_repository_id, cache, repository)?;
             return Ok(current);
         }
     }
@@ -1569,15 +1590,28 @@ async fn build_catalog(
         repository,
     )?;
     cache.put_catalog(repository, kind, fingerprint, &root)?;
+    tag_published_entries(&entries, &root, kind, format_repository_id, cache, repository)?;
+    Ok(root)
+}
+
+/// Whichever root this catalog ended up being, every entry it carries belongs
+/// to it now, so a reused one stops naming the publication before last.
+fn tag_published_entries(
+    entries: &[EntryPlan],
+    root: &RemoteObject,
+    kind: wire::CatalogKind,
+    format_repository_id: &str,
+    cache: &PackageCache,
+    repository: &RepositoryHandle,
+) -> Result<()> {
     let keys: Vec<String> = entries.iter().map(|entry| entry.key.clone()).collect();
     cache.tag_entries(
         format_repository_id,
         repository,
         kind,
         &keys,
-        &super::reachability::object_identity(&root, repository)?,
-    )?;
-    Ok(root)
+        &super::reachability::object_identity(root, repository)?,
+    )
 }
 
 async fn upload_metadata_bytes(
@@ -2833,6 +2867,112 @@ mod tests {
             }
             assert_eq!(reads[0], 0);
             assert!(reads[1] > 0, "{reads:?}");
+        });
+    }
+
+    /// Membership of the parent graph settles that nothing collected a pack.
+    /// It says nothing about a pack this connection already found unusable,
+    /// and that answer is not inherited by admitting the entry that names it.
+    #[test]
+    fn c_a_pack_already_found_unusable_is_not_admitted_by_its_tag() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let cache = root.path().join("cache");
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let key = [17; 32];
+            let cancel = Cancellation::default();
+            let capture = captured_asset_inventory(root.path(), "head", 1, 1, 0, 4);
+            let meta = metadata("head", &capture);
+            let mut transfer = journal(&root.path().join("head"), "head", &capture);
+            let head = package_and_upload(
+                capture, vec![], root.path(), &cache, meta, &key, limits(128 * 1024),
+                None, &mut transfer, &provider, &repository, &cancel,
+            ).await.unwrap();
+            let parent = parent_graph(&head, &repository).unwrap();
+            // An asset pack, which the next publication admits because only the
+            // asset inventory grows and the entries naming it do not change.
+            let lost = head.referenced_objects.iter()
+                .filter(|object| object.role == ObjectRole::Pack).next_back().unwrap().clone();
+            // What an earlier publication learned about this exact pack.
+            let evidence = ObjectEvidence::open(root.path(), transfer.connection_id()).unwrap();
+            evidence.record(
+                &ObjectEvidence::identity(&lost, &repository).unwrap(),
+                &lost.object_id,
+                UnusableReason::Missing,
+            ).unwrap();
+            provider.forget(&lost.receipt.locator.object);
+            drop(evidence);
+
+            let capture = captured_asset_inventory(root.path(), "next", 2, 1, 0, 5);
+            let meta = metadata("next", &capture);
+            let mut transfer = journal(&root.path().join("next"), "next", &capture);
+            let completed = package_and_upload(
+                capture, vec![], root.path(), &cache, meta, &key, limits(128 * 1024),
+                Some(&parent), &mut transfer, &provider, &repository, &cancel,
+            ).await.unwrap();
+            assert_eq!(
+                verify_publication(
+                    &completed, root.path(), &cache, &mut transfer, &key, &provider, &repository,
+                    &cancel,
+                ).await.unwrap(),
+                PublicationReadiness::Verified,
+            );
+            assert!(!completed.referenced_objects.iter()
+                .any(|object| object.object_id == lost.object_id));
+            for object in &completed.referenced_objects {
+                assert!(provider.holds(&object.receipt.locator.object), "{}", object.object_id);
+            }
+        });
+    }
+
+    /// A pack that went missing under the parent is found by the publication
+    /// check, and the attempt after it has to repack rather than admit the
+    /// same reference again on the strength of its tag.
+    #[test]
+    fn c_a_missing_pack_under_the_parent_does_not_repeat_forever() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let cache = root.path().join("cache");
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let key = [13; 32];
+            let cancel = Cancellation::default();
+            let capture = captured_asset_inventory(root.path(), "head", 1, 1, 1, 4);
+            let meta = metadata("head", &capture);
+            let mut transfer = journal(&root.path().join("head"), "head", &capture);
+            let head = package_and_upload(
+                capture, vec![], root.path(), &cache, meta, &key, limits(128 * 1024),
+                None, &mut transfer, &provider, &repository, &cancel,
+            ).await.unwrap();
+            let parent = parent_graph(&head, &repository).unwrap();
+            let lost = head.referenced_objects.iter()
+                .find(|object| object.role == ObjectRole::Pack).unwrap().clone();
+            provider.forget(&lost.receipt.locator.object);
+
+            let mut outcomes = Vec::new();
+            for attempt in 2..=3i64 {
+                let name = format!("attempt-{attempt}");
+                let capture = captured_asset_inventory(root.path(), &name, attempt, 1, 1, 5);
+                let meta = metadata(&name, &capture);
+                let mut transfer = journal(&root.path().join(&name), &name, &capture);
+                let completed = package_and_upload(
+                    capture, vec![], root.path(), &cache, meta, &key, limits(128 * 1024),
+                    Some(&parent), &mut transfer, &provider, &repository, &cancel,
+                ).await.unwrap();
+                outcomes.push((
+                    verify_publication(
+                        &completed, root.path(), &cache, &mut transfer, &key, &provider,
+                        &repository, &cancel,
+                    ).await.unwrap(),
+                    completed,
+                ));
+            }
+            assert_eq!(outcomes[0].0, PublicationReadiness::Repackage);
+            assert_eq!(outcomes[1].0, PublicationReadiness::Verified);
+            for object in &outcomes[1].1.referenced_objects {
+                assert!(provider.holds(&object.receipt.locator.object), "{}", object.object_id);
+            }
         });
     }
 
