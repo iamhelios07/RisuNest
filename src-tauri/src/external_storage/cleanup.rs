@@ -12,6 +12,7 @@ use super::{
     gc_store::{locator_key, GcStore},
     journal::TransferJournal,
     leases::{self, Admission, ClockReading, LeaseContext, LeaseOwner, PageTracker},
+    package_cache,
     packaging::{self, RemoteObject},
     reachability::{self, DocumentNode, DocumentSource, MarkRequest, RetiredPoint, Roots},
 };
@@ -756,13 +757,13 @@ impl RepositoryView for ConnectedRepositoryView<'_> {
     }
     fn job_roots(&self) -> Result<JobRoots> { job_roots_of(&self.unfinished) }
     fn confirmed_removed(&self, object: &RemoteObject) -> Result<()> {
-        packaging::forget_remote_object(self.cache_root, &self.connected.handle, object)
+        package_cache::forget_remote_object(self.cache_root, &self.connected.handle, object)
     }
     fn protected_jobs(&self) -> Vec<String> {
         self.unfinished.iter().map(|job| job.job_id.clone()).collect()
     }
     fn known_objects(&self) -> Result<Vec<RemoteObject>> {
-        packaging::known_remote_objects(
+        package_cache::known_remote_objects(
             self.cache_root, &self.connected.stored.descriptor.repository_id, &self.connected.handle,
         )
     }

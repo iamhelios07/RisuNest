@@ -8,6 +8,7 @@ use super::{
         ReadReceipt, RemoteLocator, RepositoryHandle, Result,
     },
     journal::{validate_receipt, TransferJournal},
+    package_cache::{kind_name, PackageCache},
     sections::CapturedSection,
     transfer::SpoolSink,
     transfer_job,
@@ -23,7 +24,6 @@ use risunest_external_storage_format::{
     snapshot as wire,
 };
 use risunest_sync_wire::head::Sequence;
-use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -40,10 +40,10 @@ const MIN_OBJECT_BYTES: u64 = 1024;
 static SNAPSHOT_CPU: LazyLock<Arc<tokio::sync::Semaphore>> =
     LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
 
-fn corrupt(_: impl std::fmt::Display) -> ProviderError {
+pub(super) fn corrupt(_: impl std::fmt::Display) -> ProviderError {
     ProviderError::new(ErrorKind::Corrupt)
 }
-fn transient(_: impl std::fmt::Display) -> ProviderError {
+pub(super) fn transient(_: impl std::fmt::Display) -> ProviderError {
     ProviderError::new(ErrorKind::Transient)
 }
 
@@ -288,233 +288,6 @@ fn decode_hash(value: &str) -> Result<[u8; 32]> {
         .ok_or_else(|| corrupt("invalid sha256"))
 }
 
-struct PackageCache {
-    db: Connection,
-}
-impl PackageCache {
-    fn open(root: &Path) -> Result<Self> {
-        fs::create_dir_all(root).map_err(transient)?;
-        if crate::trust_boundary::is_link_like(&fs::symlink_metadata(root).map_err(transient)?) {
-            return Err(corrupt("package cache is a link"));
-        }
-        let db_path = root.join("snapshot-cache.sqlite");
-        if db_path.exists()
-            && crate::trust_boundary::is_link_like(
-                &fs::symlink_metadata(&db_path).map_err(transient)?,
-            )
-        {
-            return Err(corrupt("package cache database is a link"));
-        }
-        let db = Connection::open(db_path).map_err(transient)?;
-        db.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
-             CREATE TABLE IF NOT EXISTS remote_objects(
-               repository_id TEXT NOT NULL, connection_identity TEXT NOT NULL,
-               object_id TEXT NOT NULL, plaintext_sha256 TEXT NOT NULL,
-               value TEXT NOT NULL,
-               PRIMARY KEY(repository_id,connection_identity,object_id));
-             CREATE TABLE IF NOT EXISTS entries(
-               repository_id TEXT NOT NULL, connection_identity TEXT NOT NULL,
-               catalog_kind TEXT NOT NULL, entry_key TEXT NOT NULL,
-               content_sha256 TEXT NOT NULL, byte_length INTEGER NOT NULL,
-               value TEXT NOT NULL,
-               PRIMARY KEY(repository_id,connection_identity,catalog_kind,entry_key));
-             CREATE TABLE IF NOT EXISTS catalogs(
-               repository_id TEXT NOT NULL, connection_identity TEXT NOT NULL,
-               catalog_kind TEXT NOT NULL, fingerprint TEXT NOT NULL,
-               value TEXT NOT NULL,
-               PRIMARY KEY(repository_id,connection_identity,catalog_kind,fingerprint));",
-        )
-        .map_err(transient)?;
-        Ok(Self { db })
-    }
-    fn object(
-        &self,
-        format_repository_id: &str,
-        repository: &RepositoryHandle,
-        id: &str,
-        plaintext: &str,
-    ) -> Result<Option<RemoteObject>> {
-        let encoded: Option<String> = self.db.query_row(
-            "SELECT value FROM remote_objects WHERE repository_id=?1 AND connection_identity=?2 AND object_id=?3 AND plaintext_sha256=?4",
-            params![format_repository_id,repository.connection_identity,id,plaintext], |row| row.get(0),
-        ).optional().map_err(transient)?;
-        let Some(encoded) = encoded else {
-            return Ok(None);
-        };
-        let value: RemoteObject = serde_json::from_str(&encoded).map_err(corrupt)?;
-        value.stored(repository)?;
-        if value.repository_id != format_repository_id || value.object_id != id
-            || value.plaintext_sha256 != plaintext
-        {
-            return Err(corrupt("cached object identity"));
-        }
-        Ok(Some(value))
-    }
-    fn forget_object(
-        &self,
-        format_repository_id: &str,
-        repository: &RepositoryHandle,
-        object_id: &str,
-    ) -> Result<()> {
-        let transaction = self.db.unchecked_transaction().map_err(transient)?;
-        transaction.execute(
-            "DELETE FROM remote_objects WHERE repository_id=?1 AND connection_identity=?2 AND object_id=?3",
-            params![format_repository_id, repository.connection_identity, object_id],
-        ).map_err(transient)?;
-        transaction.execute(
-            "DELETE FROM entries WHERE repository_id=?1 AND connection_identity=?2
-             AND EXISTS(SELECT 1 FROM json_each(entries.value,'$.packs') AS pack
-               WHERE json_extract(pack.value,'$.objectId')=?3)",
-            params![format_repository_id, repository.connection_identity, object_id],
-        ).map_err(transient)?;
-        // A changed child can change every parent hash. These roots are only
-        // an optimization; their source entries and sealed uploads stay intact.
-        transaction.execute(
-            "DELETE FROM catalogs WHERE repository_id=?1 AND connection_identity=?2",
-            params![format_repository_id, repository.connection_identity],
-        ).map_err(transient)?;
-        transaction.commit().map_err(transient)
-    }
-
-    fn put_object(&self, repository: &RepositoryHandle, value: &RemoteObject) -> Result<()> {
-        value.stored(repository)?;
-        self.db.execute(
-            "INSERT INTO remote_objects VALUES(?1,?2,?3,?4,?5)
-             ON CONFLICT(repository_id,connection_identity,object_id) DO UPDATE SET plaintext_sha256=excluded.plaintext_sha256,value=excluded.value",
-            params![value.repository_id,repository.connection_identity,value.object_id,value.plaintext_sha256,serde_json::to_string(value).map_err(corrupt)?],
-        ).map_err(transient)?;
-        Ok(())
-    }
-    fn entry(
-        &self,
-        format_repository_id: &str,
-        repository: &RepositoryHandle,
-        kind: wire::CatalogKind,
-        key: &str,
-        digest: &str,
-        length: u64,
-    ) -> Result<Option<EntryPlan>> {
-        let encoded: Option<String> = self.db.query_row(
-            "SELECT value FROM entries WHERE repository_id=?1 AND connection_identity=?2 AND catalog_kind=?3 AND entry_key=?4 AND content_sha256=?5 AND byte_length=?6",
-            params![format_repository_id,repository.connection_identity,kind_name(kind),key,digest,i64::try_from(length).map_err(corrupt)?], |row| row.get(0),
-        ).optional().map_err(transient)?;
-        let Some(encoded) = encoded else {
-            return Ok(None);
-        };
-        let value: EntryPlan = serde_json::from_str(&encoded).map_err(corrupt)?;
-        value.validate(format_repository_id, repository)?;
-        Ok(Some(value))
-    }
-    fn put_entries(
-        &self,
-        format_repository_id: &str,
-        repository: &RepositoryHandle,
-        kind: wire::CatalogKind,
-        values: &[EntryPlan],
-    ) -> Result<()> {
-        let transaction = self.db.unchecked_transaction().map_err(transient)?;
-        for value in values {
-            value.validate(format_repository_id, repository)?;
-            transaction.execute(
-                "INSERT INTO entries VALUES(?1,?2,?3,?4,?5,?6,?7)
-                 ON CONFLICT(repository_id,connection_identity,catalog_kind,entry_key) DO UPDATE SET content_sha256=excluded.content_sha256,byte_length=excluded.byte_length,value=excluded.value",
-                params![format_repository_id,repository.connection_identity,kind_name(kind),value.key,value.content_sha256,i64::try_from(value.byte_length).map_err(corrupt)?,serde_json::to_string(value).map_err(corrupt)?],
-            ).map_err(transient)?;
-        }
-        transaction.commit().map_err(transient)?;
-        Ok(())
-    }
-    fn catalog(
-        &self,
-        format_repository_id: &str,
-        repository: &RepositoryHandle,
-        kind: wire::CatalogKind,
-        fingerprint: &str,
-    ) -> Result<Option<RemoteObject>> {
-        let encoded: Option<String> = self.db.query_row(
-            "SELECT value FROM catalogs WHERE repository_id=?1 AND connection_identity=?2 AND catalog_kind=?3 AND fingerprint=?4",
-            params![format_repository_id,repository.connection_identity,kind_name(kind),fingerprint], |row| row.get(0),
-        ).optional().map_err(transient)?;
-        let Some(encoded) = encoded else {
-            return Ok(None);
-        };
-        let value: RemoteObject = serde_json::from_str(&encoded).map_err(corrupt)?;
-        value.stored(repository)?;
-        if value.role != ObjectRole::Catalog || value.repository_id != format_repository_id {
-            return Err(corrupt("cached catalog role"));
-        }
-        Ok(Some(value))
-    }
-    fn put_catalog(
-        &self,
-        repository: &RepositoryHandle,
-        kind: wire::CatalogKind,
-        fingerprint: &str,
-        value: &RemoteObject,
-    ) -> Result<()> {
-        value.stored(repository)?;
-        self.db
-            .execute(
-                "INSERT OR REPLACE INTO catalogs VALUES(?1,?2,?3,?4,?5)",
-                params![
-                    value.repository_id,
-                    repository.connection_identity,
-                    kind_name(kind),
-                    fingerprint,
-                    serde_json::to_string(value).map_err(corrupt)?
-                ],
-            )
-            .map_err(transient)?;
-        Ok(())
-    }
-}
-/// The existing upload inventory bounds collection ownership. Reading it never
-/// discovers foreign packs or treats historical receipts as current existence.
-pub(crate) fn forget_remote_object(root: &Path, repository: &RepositoryHandle, object: &RemoteObject) -> Result<()> {
-    PackageCache::open(root)?.forget_object(&object.repository_id, repository, &object.object_id)
-}
-
-pub(crate) fn known_remote_objects(
-    root: &Path,
-    format_repository_id: &str,
-    repository: &RepositoryHandle,
-) -> Result<Vec<RemoteObject>> {
-    let path = root.join("snapshot-cache.sqlite");
-    match fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(transient(error)),
-        Ok(_) => {}
-    }
-    if crate::trust_boundary::is_link_like(&fs::symlink_metadata(root).map_err(transient)?) {
-        return Err(corrupt("package cache root is a link"));
-    }
-    crate::trust_boundary::open_regular_source(&path).map_err(transient)?;
-    let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(transient)?;
-    let mut query = db.prepare(
-        "SELECT object_id,plaintext_sha256,value FROM remote_objects
-         WHERE repository_id=?1 AND connection_identity=?2 ORDER BY object_id",
-    ).map_err(transient)?;
-    let rows = query.query_map(params![format_repository_id, repository.connection_identity], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
-    }).map_err(transient)?;
-    let mut objects = Vec::new();
-    for row in rows {
-        let (id, digest, encoded) = row.map_err(transient)?;
-        if encoded.len() > 128 * 1024 { return Err(corrupt("inventory object exceeds limit")); }
-        let object: RemoteObject = serde_json::from_str(&encoded).map_err(corrupt)?;
-        object.stored(repository)?;
-        if object.repository_id != format_repository_id || object.object_id != id
-            || object.plaintext_sha256 != digest
-        {
-            return Err(corrupt("inventory object identity differs"));
-        }
-        objects.push(object);
-    }
-    Ok(objects)
-}
-
 #[derive(Default)]
 pub(super) struct AttemptVerification {
     receipts: BTreeMap<String, ObjectReceipt>,
@@ -738,25 +511,18 @@ async fn revalidate_cached_catalog(
     Ok(Some(verified))
 }
 
-fn kind_name(kind: wire::CatalogKind) -> &'static str {
-    match kind {
-        wire::CatalogKind::Records => "records",
-        wire::CatalogKind::Assets => "assets",
-        wire::CatalogKind::Section => "section",
-    }
-}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct EntryPlan {
-    kind: wire::CatalogEntryKind,
-    key: String,
-    content_sha256: String,
-    byte_length: u64,
-    chunks: Vec<wire::StoredChunk>,
-    packs: Vec<RemoteObject>,
+pub(super) struct EntryPlan {
+    pub(super) kind: wire::CatalogEntryKind,
+    pub(super) key: String,
+    pub(super) content_sha256: String,
+    pub(super) byte_length: u64,
+    pub(super) chunks: Vec<wire::StoredChunk>,
+    pub(super) packs: Vec<RemoteObject>,
 }
 impl EntryPlan {
-    fn validate(&self, format_repository_id: &str, repository: &RepositoryHandle) -> Result<()> {
+    pub(super) fn validate(&self, format_repository_id: &str, repository: &RepositoryHandle) -> Result<()> {
         if self.key.is_empty() || !crate::trust_boundary::is_lower_hex_256(&self.content_sha256) {
             return Err(corrupt("invalid cached entry"));
         }
@@ -2023,6 +1789,7 @@ pub(crate) async fn package_and_upload(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::params;
     use crate::{
         external_storage::{
             fake::{self, FakeProvider},
@@ -3163,6 +2930,77 @@ mod tests {
                 restore_elapsed.as_millis(),
             );
         });
+    }
+
+    /// The case external reuse has to move: an asset catalog that changes on
+    /// every publication, so every unchanged pack it still names has to be
+    /// admitted again.
+    #[test]
+    #[ignore = "explicit growing-inventory measurement"]
+    fn measures_publications_that_add_one_asset_to_a_large_inventory() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let key = [31; 32];
+            let cache = root.path().join("growing-cache");
+            let mut steady = Vec::new();
+            let mut packs = 0;
+            for revision in 1..=4i64 {
+                let capture_id = format!("growing-capture-{revision}");
+                let job_id = format!("growing-job-{revision}");
+                let capture = captured_asset_inventory(
+                    root.path(),
+                    &capture_id,
+                    revision,
+                    1,
+                    1,
+                    20_000 + revision as usize,
+                );
+                let snapshot_metadata = metadata(&format!("growing-snapshot-{revision}"), &capture);
+                let mut transfer = journal(&root.path().join(&job_id), &job_id, &capture);
+                let before = (
+                    provider.read_count(),
+                    provider.upload_count(),
+                    provider.state.lock().unwrap().objects.len(),
+                );
+                let started = std::time::Instant::now();
+                package_and_upload(
+                    capture,
+                    Vec::new(),
+                    root.path(),
+                    &cache,
+                    snapshot_metadata,
+                    &key,
+                    limits(512 * 1024),
+                    &mut transfer,
+                    &provider,
+                    &repository,
+                    &Cancellation::default(),
+                )
+                .await
+                .unwrap();
+                let state = provider.state.lock().unwrap();
+                packs = state.objects.keys().filter(|id| id.starts_with("pack-")).count();
+                steady.push((
+                    provider_reads_since(&provider, before.0),
+                    provider.upload_count() - before.1,
+                    state.objects.len() - before.2,
+                    started.elapsed().as_millis(),
+                ));
+            }
+            for (revision, (reads, uploads, objects, elapsed)) in steady.iter().enumerate() {
+                eprintln!(
+                    "revision={} assets={} packs={packs} provider_reads={reads} provider_uploads={uploads} new_objects={objects} publication_ms={elapsed}",
+                    revision + 1,
+                    20_001 + revision,
+                );
+            }
+        });
+    }
+
+    fn provider_reads_since(provider: &FakeProvider, before: usize) -> usize {
+        provider.read_count() - before
     }
 
     #[test]

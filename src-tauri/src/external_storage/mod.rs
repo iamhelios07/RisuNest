@@ -28,6 +28,7 @@ pub(crate) mod job_store;
 pub(crate) mod journal;
 pub(crate) mod leases;
 pub(crate) mod oauth;
+pub(crate) mod package_cache;
 pub(crate) mod packaging;
 pub(crate) mod providers;
 pub(crate) mod publication;
