@@ -164,7 +164,7 @@
 
     async function runJob(
         connection: ExternalConnectionSummary,
-        job: 'backup' | 'sync' | 'restore' | 'pin-history' | 'resolve-conflict' | 'cleanup',
+        job: 'backup' | 'sync' | 'restore' | 'pin-history' | 'resolve-conflict' | 'cleanup' | 'check-repository',
         details: {
             snapshotId?: string
             conflictId?: string
@@ -571,6 +571,11 @@
     }
 
     function jobSummary(job: ExternalJobSummary): string {
+        if (job.kind === 'check-repository' && job.state === 'succeeded' && job.result?.verifiedObjects !== undefined && job.result.verifiedBytes !== undefined) {
+            const summary = strings.checkSummary.replace('{0}', job.result.verifiedObjects).replace('{1}', bytes(job.result.verifiedBytes))
+            const damaged = Number(job.result.damagedObjects ?? '0')
+            return damaged > 0 ? `${summary} ${strings.checkDamaged.replace('{0}', String(damaged))}` : summary
+        }
         if (job.kind === 'cleanup' && job.state === 'succeeded' && job.result?.deletedObjects !== undefined && job.result.deletedBytes !== undefined) {
             const summary = strings.cleanupSummary.replace('{0}', job.result.deletedObjects).replace('{1}', bytes(job.result.deletedBytes))
             return job.result.stopReason === 'complete' ? summary : `${summary} ${strings.cleanupPartial}`
@@ -679,6 +684,7 @@
                     <SettingButton busy={activeAction === `backup:${connection.id}`} disabled={busy || (job && externalJobIsActive(job))} onclick={() => runJob(connection, 'backup')}>{strings.runBackup}</SettingButton>
                     {#if connection.purpose === 'sync'}<SettingButton busy={activeAction === `sync:${connection.id}`} disabled={busy || (job && externalJobIsActive(job))} onclick={() => runJob(connection, 'sync')}>{strings.runSync}</SettingButton>{/if}
                     {#if connection.purpose === 'sync' && !syncTarget}<SettingButton variant="secondary" disabled={busy} onclick={() => selectSyncTarget(connection)}>{strings.makeSyncTarget}</SettingButton>{/if}
+                    {#if connection.purpose === 'sync'}<SettingButton variant="secondary" busy={activeAction === `check-repository:${connection.id}`} disabled={busy || (job && externalJobIsActive(job))} onclick={() => runJob(connection, 'check-repository')}>{strings.checkRepository}</SettingButton>{/if}
                     {#if job && externalJobIsActive(job)}<SettingButton variant="secondary" onclick={async () => { await bridge.cancelJob(job.id); await refresh(true) }}>{strings.cancel}</SettingButton>{/if}
                 </div>
 
@@ -699,6 +705,7 @@
                                     <span class="item-actions">
                                         <SettingButton variant="secondary" disabled={!item.complete || !item.verified} onclick={() => beginRestore(connection, item)}>{strings.restore}</SettingButton>
                                         <SettingButton variant="secondary" disabled={!item.complete || !item.verified} onclick={() => exportSnapshot(connection.id, item.snapshotId ?? item.id)}>{strings.download}</SettingButton>
+                                        <SettingButton variant="secondary" disabled={busy || !item.complete || !item.verified} onclick={() => runJob(connection, 'check-repository', { snapshotId: item.snapshotId ?? item.id })}>{strings.check}</SettingButton>
                                         {#if item.pinned}<SettingButton variant="secondary" disabled>{strings.pinned}</SettingButton>
                                         {:else}<SettingButton variant="secondary" onclick={() => runJob(connection, 'pin-history', { snapshotId: item.snapshotId ?? item.id })}>{strings.pin}</SettingButton>{/if}
                                         {#if item.deletable}<SettingButton variant="danger" disabled={busy} onclick={() => deleteHistory(connection, item)}>{strings.deleteHistory}</SettingButton>{/if}

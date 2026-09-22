@@ -16,6 +16,7 @@ pub(crate) enum JobKind {
     DeleteHistory,
     ResolveConflict,
     Cleanup,
+    CheckRepository,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -53,6 +54,15 @@ impl StartJobRequest {
                 || self.confirm_other_device.is_some()
                 || self.confirm_last_retained.is_some()
                 || self.conflict_id.is_some()
+                || self.choice.is_some()
+                || self.restore_areas.is_some()
+                || self.target_revision.is_some())
+        {
+            return Err(ProviderError::new(ErrorKind::Corrupt));
+        }
+        // A check names at most the published state it reads.
+        if self.kind == JobKind::CheckRepository
+            && (self.conflict_id.is_some()
                 || self.choice.is_some()
                 || self.restore_areas.is_some()
                 || self.target_revision.is_some())

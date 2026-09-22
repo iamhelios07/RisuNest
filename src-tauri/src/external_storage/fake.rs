@@ -156,6 +156,11 @@ impl FakeProvider {
             .deletes
             .insert(object.to_owned(), fault);
     }
+    /// The body this repository holds, for the tests that damage one
+    /// without changing its size.
+    pub(crate) fn contents(&self, object: &str) -> Option<Vec<u8>> {
+        self.state.lock().unwrap().objects.get(object).map(|(bytes, _)| bytes.clone())
+    }
     pub(crate) fn holds(&self, object: &str) -> bool {
         self.state.lock().unwrap().objects.contains_key(object)
     }

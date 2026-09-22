@@ -185,6 +185,7 @@ export type ExternalJobKind =
     | 'delete-history'
     | 'cleanup'
     | 'resolve-conflict'
+    | 'check-repository'
 
 /** The areas beside the library that a backup can carry. */
 export type ExternalRestoreSection = 'hypa' | 'local-plugins' | 'local-settings'
@@ -248,6 +249,9 @@ export interface ExternalJobSummary {
         expectedRevision?: DecimalString
         deletedObjects?: DecimalString
         deletedBytes?: DecimalString
+        verifiedObjects?: DecimalString
+        verifiedBytes?: DecimalString
+        damagedObjects?: DecimalString
         stopReason?: string
     }
 }

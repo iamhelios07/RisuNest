@@ -508,6 +508,7 @@ fn same_requested_operation(existing: &StartJobRequest, incoming: &StartJobReque
             (existing.reason.as_deref() == Some("automatic"))
                 == (incoming.reason.as_deref() == Some("automatic"))
         }
+        JobKind::CheckRepository => existing.snapshot_id == incoming.snapshot_id,
         JobKind::Backup | JobKind::Cleanup => true,
     }
 }
@@ -1227,6 +1228,9 @@ async fn run_job(app: &AppHandle, id: &str, cancel: &Cancellation) -> Result<Val
             super::history_deletion::run_delete_history(app, &connected, &job, cancel).await
         }
         JobKind::Cleanup => run_cleanup(app, &connected, &job, cancel).await,
+        JobKind::CheckRepository => {
+            run_repository_check(app, &connected, &job, cancel).await
+        }
     }
 }
 
@@ -1343,6 +1347,126 @@ async fn run_cleanup(
     )
     .await?;
     Ok(outcome.summary())
+}
+/// Proves the selected published state can still be read. The result is a
+/// summary rather than transfer progress: a check writes no transfer journal,
+/// so the four progress fields stay as this job records them.
+async fn run_repository_check(
+    app: &AppHandle,
+    connected: &ConnectedRepository,
+    job: &DurableJob,
+    cancel: &Cancellation,
+) -> Result<Value> {
+    let root = root(app)?;
+    let directory = job_directory(&root, &job.request.connection_id, &job.id);
+    let cache_root = package_cache_root(&directory)?;
+    let selected = checked_root(connected, job, &root, &directory, cancel).await?;
+    let writer_id = native_store(app)?
+        .external_identity()
+        .map_err(local_error)?
+        .store_id;
+    let context = lease_context(&root, connected, &writer_id);
+    let _ = record_check_progress(&root, &job.id, "reading", None);
+    let progress = |items: u64, total_items: u64, bytes: u64, total_bytes: u64| {
+        let _ = record_check_progress(
+            &root,
+            &job.id,
+            "verifying",
+            Some((items, total_items, bytes, total_bytes)),
+        );
+    };
+    let run = async {
+        super::repository_check::check(
+            &selected,
+            &connected.root_key,
+            &directory,
+            &cache_root,
+            connected.provider.as_ref(),
+            &connected.handle,
+            &progress,
+            cancel,
+        )
+        .await
+        .map(|outcome| outcome.summary())
+    };
+    // A foreign removal yields to this one, so a check cannot report damage
+    // that is really a cleanup running beside it.
+    match leases::admit(&context, &job.id, LeaseKind::Work, cancel).await? {
+        leases::Admission::Admitted(owner) => owner.run(&context, cancel, run).await,
+        leases::Admission::Yield { .. } => Err(ProviderError::new(ErrorKind::Transient)),
+        leases::Admission::UnsupportedProtection => run.await,
+    }
+}
+
+/// The state this job reads, decided once and kept beside it. A check that
+/// resumes keeps counting the root it started on even after a newer one is
+/// published.
+async fn checked_root(
+    connected: &ConnectedRepository,
+    job: &DurableJob,
+    root: &std::path::Path,
+    directory: &std::path::Path,
+    cancel: &Cancellation,
+) -> Result<super::packaging::RemoteObject> {
+    if let Some(pinned) = super::repository_check::pinned_root(directory, &connected.handle)? {
+        return Ok(pinned);
+    }
+    let resolved = match job.request.snapshot_id.as_deref() {
+        Some(snapshot_id) => {
+            let known = match ConnectionStore::open(root)?
+                .discovery_snapshot(&job.request.connection_id, snapshot_id)
+            {
+                Ok(value) => Some(value),
+                Err(error) if error.kind == ErrorKind::NotFound => None,
+                Err(error) => return Err(error),
+            };
+            let store_root = root.to_path_buf();
+            let connection = job.request.connection_id.clone();
+            let id = snapshot_id.to_owned();
+            super::control::find_snapshot_with_locator_invalidation(
+                connected,
+                snapshot_id,
+                known.as_ref(),
+                move || ConnectionStore::open(&store_root)?.forget_discovery(&connection, &id),
+                cancel,
+            )
+            .await?
+        }
+        None => {
+            super::control::read_head(
+                connected.provider.as_ref(),
+                &connected.handle,
+                &connected.stored.descriptor,
+                &connected.root_key,
+                None,
+                cancel,
+            )
+            .await?
+            .ok_or_else(|| ProviderError::new(ErrorKind::NotFound))?
+            .document
+            .state
+        }
+    };
+    super::repository_check::pin_root(directory, &resolved, &connected.handle)
+}
+
+fn record_check_progress(
+    root: &std::path::Path,
+    job_id: &str,
+    phase: &str,
+    counters: Option<(u64, u64, u64, u64)>,
+) -> Result<()> {
+    let store = JobStore::open(root)?;
+    let mut job = store.read(job_id)?;
+    job.summary["phase"] = json!(phase);
+    if let Some((items, total_items, bytes, total_bytes)) = counters {
+        job.summary["completedItems"] = json!(items.to_string());
+        job.summary["totalItems"] = json!(total_items.to_string());
+        job.summary["completedBytes"] = json!(bytes.to_string());
+        job.summary["totalBytes"] = json!(total_bytes.to_string());
+    }
+    job.summary["updatedAtMs"] = json!(now_ms().to_string());
+    store.put(&job)
 }
 async fn run_backup(
     app: &AppHandle,

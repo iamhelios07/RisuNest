@@ -206,7 +206,7 @@ async fn download_ciphertext(
     Ok(destination)
 }
 
-async fn open_object(
+pub(super) async fn open_object(
     object: &RemoteObject,
     root_key: &[u8; 32],
     staging_root: &Path,
@@ -299,7 +299,19 @@ async fn open_object(
     Ok(destination)
 }
 
-fn read_bytes(path: &Path, max: usize) -> Result<Vec<u8>> {
+/// Removes what one opened object left behind. A check proves a body and has
+/// no use for it afterwards, so the staging directory never grows past the
+/// object being read.
+pub(super) fn discard_object(staging_root: &Path, object: &RemoteObject) {
+    let _ = fs::remove_file(staging_root.join("plaintext").join(&object.plaintext_sha256));
+    let _ = fs::remove_file(
+        staging_root
+            .join("downloads")
+            .join(format!("{}.cipher", object.ciphertext_sha256)),
+    );
+}
+
+pub(super) fn read_bytes(path: &Path, max: usize) -> Result<Vec<u8>> {
     let mut file = crate::trust_boundary::open_regular_source(path).map_err(corrupt)?;
     let length = file.metadata().map_err(corrupt)?.len();
     if length > max as u64 {

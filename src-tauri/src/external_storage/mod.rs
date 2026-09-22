@@ -40,6 +40,7 @@ pub(crate) mod recovery;
 #[cfg(test)]
 mod recovery_integration_tests;
 pub(crate) mod registry;
+pub(crate) mod repository_check;
 pub(crate) mod runtime;
 pub(crate) mod runtime_restore;
 pub(crate) mod secrets;
