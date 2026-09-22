@@ -37,6 +37,9 @@ const GROUP_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) enum ObjectSource {
     File(PathBuf),
     Captured(String),
+    /// A body the asset repository already holds under this content hash. It
+    /// is registered where it is rather than read out of a staging file.
+    Library(String),
 }
 
 impl ObjectSource {
@@ -44,7 +47,7 @@ impl ObjectSource {
     pub(crate) fn file(&self) -> Option<&Path> {
         match self {
             Self::File(path) => Some(path),
-            Self::Captured(_) => None,
+            Self::Captured(_) | Self::Library(_) => None,
         }
     }
 }
@@ -224,6 +227,9 @@ impl ContentStore {
                 crate::trust_boundary::open_regular_source(path)?,
             )),
             ObjectSource::Captured(digest) => self.open_body(digest),
+            // A library body belongs to the asset repository, which is the only
+            // store that may hand one out.
+            ObjectSource::Library(_) => Err(invalid("Capture source is not a capture body")),
         }
     }
 

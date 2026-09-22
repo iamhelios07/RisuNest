@@ -402,7 +402,7 @@ fn daily_download_resume_preserves_verified_packs_and_durable_budget() {
             &staging_root,
             &root_key,
             None,
-            &first,
+            snapshot_restore::SourceTrust::Proven, &first,
             &repository,
             &first_cancel,
         )
@@ -429,7 +429,7 @@ fn daily_download_resume_preserves_verified_packs_and_durable_budget() {
             &staging_root,
             &root_key,
             None,
-            &second,
+            snapshot_restore::SourceTrust::Proven, &second,
             &repository,
             &second_cancel,
         )
@@ -456,7 +456,7 @@ fn daily_download_resume_preserves_verified_packs_and_durable_budget() {
             &staging_root,
             &root_key,
             None,
-            &third,
+            snapshot_restore::SourceTrust::Proven, &third,
             &repository,
             &third_cancel,
         )

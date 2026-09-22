@@ -3352,6 +3352,7 @@ mod tests {
                     &root.path().join(format!("read-{marker}")),
                     &key,
                     None,
+                    snapshot_restore::SourceTrust::Proven,
                     &provider,
                     &repository,
                     &Cancellation::default(),
@@ -3488,7 +3489,7 @@ mod tests {
                 &staging,
                 &[8; 32],
                 None,
-                &provider,
+                snapshot_restore::SourceTrust::Proven, &provider,
                 &repository,
                 &Cancellation::default(),
             )
@@ -3499,7 +3500,7 @@ mod tests {
                 &staging,
                 &key,
                 None,
-                &provider,
+                snapshot_restore::SourceTrust::Proven, &provider,
                 &repository,
                 &Cancellation::default(),
             )
@@ -3536,7 +3537,7 @@ mod tests {
                 &staging,
                 &key,
                 None,
-                &provider,
+                snapshot_restore::SourceTrust::Proven, &provider,
                 &repository,
                 &Cancellation::default(),
             )
@@ -3603,7 +3604,7 @@ mod tests {
                 let second = package_and_upload(capture, Vec::new(), root.path(), &cache, meta, &key,
                     limits(128 * 1024), None, &mut second_journal, &provider, &repository, &cancel).await.unwrap();
                 let restored = snapshot_restore::download_snapshot(&second.reference, &root.path().join("restored"),
-                    &key, None, &provider, &repository, &cancel).await.unwrap();
+                    &key, None, snapshot_restore::SourceTrust::Proven, &provider, &repository, &cancel).await.unwrap();
                 assert_eq!(fs::read(restored.records[0].source.file().unwrap()).unwrap(), b"record");
                 assert!(restored.objects.iter().any(|object| fs::read(object.source.file().unwrap()).unwrap() == b"asset"));
                 assert_eq!(provider.upload_attempts(&retained.object_id), 1);
@@ -3635,7 +3636,7 @@ mod tests {
                 .await.unwrap();
             let restore_root = root.path().join("restored");
             let first = snapshot_restore::download_snapshot(&completed.reference, &restore_root,
-                &key, None, &provider, &repository, &cancel).await.unwrap();
+                &key, None, snapshot_restore::SourceTrust::Proven, &provider, &repository, &cancel).await.unwrap();
             let packs = completed.referenced_objects.iter()
                 .filter(|object| object.role == ObjectRole::Pack).collect::<Vec<_>>();
             assert!(!packs.is_empty());
@@ -3648,7 +3649,7 @@ mod tests {
             fs::remove_dir_all(restore_root.join("plaintext")).unwrap();
             fs::remove_dir_all(restore_root.join("downloads")).unwrap();
             let second = snapshot_restore::download_snapshot(&completed.reference, &restore_root,
-                &key, None, &provider, &repository, &cancel).await.unwrap();
+                &key, None, snapshot_restore::SourceTrust::Proven, &provider, &repository, &cancel).await.unwrap();
             for pack in &packs {
                 assert_eq!(provider.read_attempts(&pack.receipt.locator.object), 1);
             }
@@ -3657,6 +3658,96 @@ mod tests {
             assert_eq!(fs::read(second.records[0].source.file().unwrap()).unwrap(), b"record");
             assert!(second.objects.iter()
                 .any(|object| fs::read(object.source.file().unwrap()).unwrap() == b"asset"));
+        });
+    }
+
+    /// A normal receive whose library already holds an asset does not fetch the
+    /// pack that carries it. The record changed, so its pack is read; the asset
+    /// did not, and the repository that receives it already has the body.
+    #[test]
+    fn c_a_receive_reuses_an_asset_its_library_already_holds() {
+        runtime().block_on(async {
+            let sender = tempfile::tempdir().unwrap();
+            let receiver = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let key = [29; 32];
+            let cancel = Cancellation::default();
+            let (capture, _) = captured(sender.path(), "first", 1, b"record", b"asset");
+            let meta = metadata("first", &capture);
+            let mut first_journal = journal(&sender.path().join("first-job"), "first-job", &capture);
+            let first = package_and_upload(capture, vec![], sender.path(),
+                &sender.path().join("cache"), meta, &key, limits(128 * 1024), None,
+                &mut first_journal, &provider, &repository, &cancel).await.unwrap();
+            // The receiving library already holds the asset and has never seen
+            // the record, which is what a normal changed cycle looks like.
+            let held = PayloadCas::new(receiver.path()).unwrap().prepare_bytes(b"asset").unwrap();
+            let asset = asset_pack(&provider, &first, &key);
+
+            let (capture, _) = captured(sender.path(), "second", 2, b"record-v2", b"asset");
+            let meta = metadata("second", &capture);
+            let mut second_journal =
+                journal(&sender.path().join("second-job"), "second-job", &capture);
+            let second = package_and_upload(capture, vec![], sender.path(),
+                &sender.path().join("cache"), meta, &key, limits(128 * 1024), None,
+                &mut second_journal, &provider, &repository, &cancel).await.unwrap();
+            let published_reads = provider.read_attempts(&asset.receipt.locator.object);
+            let received = snapshot_restore::download_snapshot(&second.reference,
+                &receiver.path().join("receive"), &key, None,
+                snapshot_restore::SourceTrust::LibraryAdmitted(receiver.path()),
+                &provider, &repository, &cancel).await.unwrap();
+
+            // The asset pack is never read; the record had to come from its own.
+            assert_eq!(provider.read_attempts(&asset.receipt.locator.object), published_reads);
+            let object = received.objects.iter()
+                .find(|object| object.content_hash == held.content_hash).unwrap();
+            assert!(matches!(&object.source, ObjectSource::Library(digest) if *digest == held.content_hash));
+            assert_eq!(received.records.len(), 1);
+            assert_eq!(fs::read(received.records[0].source.file().unwrap()).unwrap(), b"record-v2");
+
+            // A restore proves everything it consumes, so the same snapshot read
+            // under that policy fetches the asset pack after all.
+            snapshot_restore::download_snapshot(&second.reference,
+                &receiver.path().join("restore"), &key, None,
+                snapshot_restore::SourceTrust::Proven, &provider, &repository, &cancel)
+                .await.unwrap();
+            assert_eq!(
+                provider.read_attempts(&asset.receipt.locator.object),
+                published_reads + 1,
+            );
+        });
+    }
+
+    /// A library body whose length no longer matches what the catalog names is
+    /// not a source. The publication it belongs to fetches the pack instead.
+    #[test]
+    fn c_a_truncated_library_body_is_not_reused() {
+        runtime().block_on(async {
+            let sender = tempfile::tempdir().unwrap();
+            let receiver = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let key = [31; 32];
+            let cancel = Cancellation::default();
+            let (capture, _) = captured(sender.path(), "capture", 1, b"record", b"asset-body");
+            let meta = metadata("snapshot", &capture);
+            let mut journal = journal(&sender.path().join("job"), "job", &capture);
+            let completed = package_and_upload(capture, vec![], sender.path(),
+                &sender.path().join("cache"), meta, &key, limits(128 * 1024), None,
+                &mut journal, &provider, &repository, &cancel).await.unwrap();
+            let cas = PayloadCas::new(receiver.path()).unwrap();
+            let held = cas.prepare_bytes(b"asset-body").unwrap();
+            fs::write(cas.object_path(&held.content_hash).unwrap().unwrap(), b"asset").unwrap();
+            let asset = asset_pack(&provider, &completed, &key);
+
+            let received = snapshot_restore::download_snapshot(&completed.reference,
+                &receiver.path().join("receive"), &key, None,
+                snapshot_restore::SourceTrust::LibraryAdmitted(receiver.path()),
+                &provider, &repository, &cancel).await.unwrap();
+            assert_eq!(provider.read_attempts(&asset.receipt.locator.object), 1);
+            let object = received.objects.iter()
+                .find(|object| object.content_hash == held.content_hash).unwrap();
+            assert_eq!(fs::read(object.source.file().unwrap()).unwrap(), b"asset-body");
         });
     }
 
@@ -3904,7 +3995,7 @@ mod tests {
             assert!(replacement.referenced_objects.iter()
                 .any(|object| object.object_id == retained.object_id));
             let restored = snapshot_restore::download_snapshot(&replacement.reference,
-                &root.path().join("restored"), &key, None, &provider, &repository, &cancel).await.unwrap();
+                &root.path().join("restored"), &key, None, snapshot_restore::SourceTrust::Proven, &provider, &repository, &cancel).await.unwrap();
             assert_eq!(fs::read(restored.records[0].source.file().unwrap()).unwrap(), b"record");
             assert!(restored.objects.iter().any(|object| fs::read(object.source.file().unwrap()).unwrap() == b"asset"));
         });
@@ -4368,7 +4459,7 @@ mod tests {
             // What it points at has to read back as the record it published.
             let restored = snapshot_restore::download_snapshot(
                 &published[1].reference, &root.path().join("restored"), &key, None,
-                &provider, &repository, &cancel,
+                snapshot_restore::SourceTrust::Proven, &provider, &repository, &cancel,
             ).await.unwrap();
             assert_eq!(
                 fs::read(restored.records[0].source.file().unwrap()).unwrap(),
@@ -4564,6 +4655,7 @@ mod tests {
                     &root.path().join(format!("receive-{name}")),
                     &key,
                     record_into.then(|| elsewhere.as_path()),
+                    snapshot_restore::SourceTrust::Proven,
                     &provider,
                     &repository,
                     &cancel,
@@ -5023,7 +5115,7 @@ mod tests {
                 &root.path().join("bounded-restore"),
                 &[4; 32],
                 None,
-                &provider,
+                snapshot_restore::SourceTrust::Proven, &provider,
                 &repository,
                 &Cancellation::default(),
             )
@@ -5168,7 +5260,7 @@ mod tests {
                 &restore_root,
                 &key,
                 None,
-                &provider,
+                snapshot_restore::SourceTrust::Proven, &provider,
                 &repository,
                 &Cancellation::default(),
             )
@@ -5477,7 +5569,7 @@ mod tests {
                 &restore_root,
                 &key,
                 None,
-                &provider,
+                snapshot_restore::SourceTrust::Proven, &provider,
                 &repository,
                 &Cancellation::default(),
             )

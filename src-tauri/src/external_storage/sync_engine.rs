@@ -737,8 +737,11 @@ async fn receive_remote(
     // What this receive reads is what the next publication would select as its
     // parent, so keep it rather than reading the same catalogs again.
     let cache = super::runtime::package_cache_root(&directory)?;
+    // A body the library already holds under the identity this snapshot names
+    // is the same body, so a normal receive does not fetch it again.
     let downloaded = super::snapshot_restore::download_snapshot(
         &remote.document.state, &staging, &connected.root_key, Some(&cache),
+        super::snapshot_restore::SourceTrust::LibraryAdmitted(&root),
         connected.provider.as_ref(), &connected.handle, cancel,
     ).await?;
     cancel.check()?;
@@ -2326,6 +2329,26 @@ mod receive_tests {
 
     fn rows(store: &mut PersistentStore) -> Vec<crate::persistent_store::device_store::sections::SectionRow> {
         store.device_store_mut().unwrap().read_section_rows(PdsSection::LocalPlugins).unwrap()
+    }
+
+    /// An object the repository already holds is registered where it is. The
+    /// staging directory never had it, so preparing it cannot have read it out
+    /// of one.
+    #[test]
+    fn a_library_object_is_registered_without_being_staged() {
+        let (directory, mut store, job, mut downloaded) = fixture();
+        let cas = crate::asset_repository::PayloadCas::new(directory.path()).unwrap();
+        let held = cas.prepare_bytes(b"asset").unwrap();
+        downloaded.objects.push(super::super::snapshot_restore::PreparedObject {
+            content_hash: held.content_hash.clone(),
+            byte_length: held.byte_size,
+            source: super::super::content_store::ObjectSource::Library(held.content_hash.clone()),
+        });
+        let prepared = prepare(&mut store, &job, downloaded);
+        assert_eq!(store.materialize_staging(prepared.commit.external_staging_id())
+            .unwrap()["marker"], "remote");
+        let path = cas.object_path(&held.content_hash).unwrap().unwrap();
+        assert_eq!(fs::read(path).unwrap(), b"asset");
     }
 
     #[test]

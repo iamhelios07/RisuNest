@@ -176,6 +176,11 @@ fn open_snapshot_input(
             return Ok(content.open_body(digest)?);
         }
         ObjectSource::File(path) => path,
+        // The library already holds this body; it is confirmed in place rather
+        // than read through here.
+        ObjectSource::Library(_) => {
+            return invalid("External snapshot library body is not an input");
+        }
     };
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_file() || crate::trust_boundary::is_link_like(&metadata) {
@@ -223,6 +228,22 @@ where
             .is_some()
         {
             return invalid("External snapshot contains a duplicate object hash");
+        }
+        if let ObjectSource::Library(digest) = &object.source {
+            // The repository already holds this body. Confirming that it is
+            // there under the identity and length the catalog names is the
+            // whole of the work; reading it back to write it again is not.
+            if digest != &object.content_hash {
+                return invalid("External snapshot library body is not the object it names");
+            }
+            let path = cas
+                .object_path(&object.content_hash)?
+                .ok_or_else(|| validation("External snapshot library body is missing"))?;
+            let file = crate::trust_boundary::open_regular_source(&path)?;
+            if file.metadata()?.len() != object.byte_length {
+                return invalid("External snapshot input size differs from its catalog");
+            }
+            continue;
         }
         let mut source =
             open_snapshot_input(staging_root, content, &object.source, object.byte_length)?;

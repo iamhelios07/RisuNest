@@ -12,6 +12,7 @@ use super::{
     sections::{CapturedSection, SectionSource},
     transfer::SpoolSink,
 };
+use crate::asset_repository::PayloadCas;
 use risunest_external_storage_format::{
     content_identity::hash_reader, crypto::derive_key, pack, snapshot as wire,
 };
@@ -516,6 +517,16 @@ async fn open_packs(
     Ok(paths)
 }
 
+/// What a resolver may accept as a source. A normal receive may reuse a body
+/// the library already holds under exactly the identity and length the catalog
+/// names; a restore, a verified export and a destructive conflict copy consume
+/// only what this job proved for itself.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SourceTrust<'a> {
+    Proven,
+    LibraryAdmitted(&'a Path),
+}
+
 /// One catalog entry and where its content is going to come from. An entry
 /// that is already here names its source; the rest name the chunks that have
 /// to be assembled, and only those decide which packs are opened.
@@ -531,8 +542,10 @@ struct ResolvedEntry {
 fn resolve_entries(
     entries: Vec<CompleteEntry>,
     staging_root: &Path,
+    library: Option<PathBuf>,
     cancel: &Cancellation,
 ) -> Result<Vec<ResolvedEntry>> {
+    let library = library.map(|root| PayloadCas::new(&root)).transpose().map_err(transient)?;
     let record_root = staging_root.join("records");
     let object_root = staging_root.join("objects");
     ensure_directory(&record_root)?;
@@ -548,8 +561,13 @@ fn resolve_entries(
                 return Err(corrupt("section entry in library catalog"));
             }
         };
-        let source = verify(&destination, entry.byte_length, &digest)?
+        let mut source = verify(&destination, entry.byte_length, &digest)?
             .then(|| ObjectSource::File(destination.clone()));
+        if source.is_none() && entry.kind == wire::CatalogEntryKind::Object {
+            if let Some(cas) = library.as_ref() {
+                source = library_body(cas, &digest, entry.byte_length)?;
+            }
+        }
         plan.push(ResolvedEntry {
             entry,
             digest,
@@ -558,6 +576,24 @@ fn resolve_entries(
         });
     }
     Ok(plan)
+}
+
+/// A body the library already holds under this exact identity and length. The
+/// length is asked for as well, because a truncated file carries the name of
+/// the content it no longer is.
+fn library_body(cas: &PayloadCas, digest: &str, byte_length: u64) -> Result<Option<ObjectSource>> {
+    let Some(path) = cas.object_path(digest).map_err(transient)? else {
+        return Ok(None);
+    };
+    let file = match crate::trust_boundary::open_regular_source(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(corrupt(error)),
+    };
+    if file.metadata().map_err(corrupt)?.len() != byte_length {
+        return Ok(None);
+    }
+    Ok(Some(ObjectSource::Library(digest.to_owned())))
 }
 
 /// The packs the plan still has to read from. A pack no remaining chunk names
@@ -849,6 +885,7 @@ pub(crate) async fn download_snapshot(
     staging_root: &Path,
     root_key: &[u8; 32],
     record_into: Option<&Path>,
+    trust: SourceTrust<'_>,
     provider: &dyn Provider,
     repository: &RepositoryHandle,
     cancel: &Cancellation,
@@ -935,9 +972,13 @@ pub(crate) async fn download_snapshot(
     library_entries.extend(asset_entries);
     let library_staging = staging_root.to_path_buf();
     let library_cancel = cancel.clone();
+    let library = match trust {
+        SourceTrust::Proven => None,
+        SourceTrust::LibraryAdmitted(root) => Some(root.to_path_buf()),
+    };
     let cpu = cpu_permit().await?;
     let plan = tokio::task::spawn_blocking(move || {
-        resolve_entries(library_entries, &library_staging, &library_cancel)
+        resolve_entries(library_entries, &library_staging, library, &library_cancel)
     })
     .await
     .map_err(transient)??;

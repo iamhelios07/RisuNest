@@ -317,6 +317,7 @@ pub(crate) async fn run_restore(
         &staging_root,
         &connected.root_key,
         None,
+        snapshot_restore::SourceTrust::Proven,
         connected.provider.as_ref(),
         &connected.handle,
         cancel,
