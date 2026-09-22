@@ -3616,6 +3616,50 @@ mod tests {
         });
     }
 
+    /// A restore whose staging directory already answers for every entry opens
+    /// no pack. The packs it would have opened are gone from the staging
+    /// directory, so opening one would cost a download, and it costs none.
+    #[test]
+    fn c_a_restore_opens_no_pack_for_entries_it_already_holds() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let key = [23; 32];
+            let cancel = Cancellation::default();
+            let (capture, _) = captured(root.path(), "capture", 1, b"record", b"asset");
+            let meta = metadata("snapshot", &capture);
+            let mut journal = journal(&root.path().join("job"), "job", &capture);
+            let completed = package_and_upload(capture, vec![], root.path(), &root.path().join("cache"),
+                meta, &key, limits(128 * 1024), None, &mut journal, &provider, &repository, &cancel)
+                .await.unwrap();
+            let restore_root = root.path().join("restored");
+            let first = snapshot_restore::download_snapshot(&completed.reference, &restore_root,
+                &key, None, &provider, &repository, &cancel).await.unwrap();
+            let packs = completed.referenced_objects.iter()
+                .filter(|object| object.role == ObjectRole::Pack).collect::<Vec<_>>();
+            assert!(!packs.is_empty());
+            for pack in &packs {
+                assert_eq!(provider.read_attempts(&pack.receipt.locator.object), 1);
+            }
+
+            // Everything a pack was decrypted into is discarded, so a pack that
+            // is still wanted has to be fetched again.
+            fs::remove_dir_all(restore_root.join("plaintext")).unwrap();
+            fs::remove_dir_all(restore_root.join("downloads")).unwrap();
+            let second = snapshot_restore::download_snapshot(&completed.reference, &restore_root,
+                &key, None, &provider, &repository, &cancel).await.unwrap();
+            for pack in &packs {
+                assert_eq!(provider.read_attempts(&pack.receipt.locator.object), 1);
+            }
+            assert_eq!(second.records.len(), first.records.len());
+            assert_eq!(second.objects.len(), first.objects.len());
+            assert_eq!(fs::read(second.records[0].source.file().unwrap()).unwrap(), b"record");
+            assert!(second.objects.iter()
+                .any(|object| fs::read(object.source.file().unwrap()).unwrap() == b"asset"));
+        });
+    }
+
     #[test]
     fn c_catalog_reuse_surfaces_authorization_errors_without_publishing() {
         runtime().block_on(async {

@@ -516,18 +516,28 @@ async fn open_packs(
     Ok(paths)
 }
 
-fn materialize_entries(
+/// One catalog entry and where its content is going to come from. An entry
+/// that is already here names its source; the rest name the chunks that have
+/// to be assembled, and only those decide which packs are opened.
+struct ResolvedEntry {
+    entry: CompleteEntry,
+    digest: String,
+    destination: PathBuf,
+    source: Option<ObjectSource>,
+}
+
+/// Decides per entry whether anything has to be read out of a pack. Content
+/// this staging directory already holds and can prove is not assembled again.
+fn resolve_entries(
     entries: Vec<CompleteEntry>,
-    packs: &BTreeMap<String, PathBuf>,
     staging_root: &Path,
     cancel: &Cancellation,
-    records: &mut BTreeMap<String, PreparedRecord>,
-    objects: &mut BTreeMap<String, PreparedObject>,
-) -> Result<()> {
+) -> Result<Vec<ResolvedEntry>> {
     let record_root = staging_root.join("records");
     let object_root = staging_root.join("objects");
     ensure_directory(&record_root)?;
     ensure_directory(&object_root)?;
+    let mut plan = Vec::with_capacity(entries.len());
     for entry in entries {
         cancel.check()?;
         let digest = hex::encode(entry.content_sha256);
@@ -538,7 +548,55 @@ fn materialize_entries(
                 return Err(corrupt("section entry in library catalog"));
             }
         };
-        if !verify(&destination, entry.byte_length, &digest)? {
+        let source = verify(&destination, entry.byte_length, &digest)?
+            .then(|| ObjectSource::File(destination.clone()));
+        plan.push(ResolvedEntry {
+            entry,
+            digest,
+            destination,
+            source,
+        });
+    }
+    Ok(plan)
+}
+
+/// The packs the plan still has to read from. A pack no remaining chunk names
+/// is never opened.
+fn required_packs(
+    plan: &[ResolvedEntry],
+    packs: &BTreeMap<String, RemoteObject>,
+) -> Result<BTreeMap<String, RemoteObject>> {
+    let mut required = BTreeMap::new();
+    for resolved in plan.iter().filter(|resolved| resolved.source.is_none()) {
+        for chunk in &resolved.entry.chunks {
+            if required.contains_key(&chunk.pack_id) {
+                continue;
+            }
+            let pack = packs
+                .get(&chunk.pack_id)
+                .ok_or_else(|| corrupt("catalog pack is missing"))?;
+            required.insert(chunk.pack_id.clone(), pack.clone());
+        }
+    }
+    Ok(required)
+}
+
+fn materialize_entries(
+    plan: Vec<ResolvedEntry>,
+    packs: &BTreeMap<String, PathBuf>,
+    cancel: &Cancellation,
+    records: &mut BTreeMap<String, PreparedRecord>,
+    objects: &mut BTreeMap<String, PreparedObject>,
+) -> Result<()> {
+    for resolved in plan {
+        cancel.check()?;
+        let ResolvedEntry {
+            entry,
+            digest,
+            destination,
+            source,
+        } = resolved;
+        if source.is_none() {
             if destination.exists() {
                 fs::remove_file(&destination).map_err(transient)?;
             }
@@ -587,6 +645,7 @@ fn materialize_entries(
             }
             publish_verified(&partial, &destination, entry.byte_length, &digest)?;
         }
+        let source = source.unwrap_or(ObjectSource::File(destination));
         match entry.kind {
             wire::CatalogEntryKind::Record => {
                 if records
@@ -596,7 +655,7 @@ fn materialize_entries(
                             key: entry.key,
                             content_hash: digest,
                             byte_length: entry.byte_length,
-                            source: ObjectSource::File(destination),
+                            source,
                         },
                     )
                     .is_some()
@@ -608,7 +667,7 @@ fn materialize_entries(
                 let prepared = PreparedObject {
                     content_hash: digest.clone(),
                     byte_length: entry.byte_length,
-                    source: ObjectSource::File(destination),
+                    source,
                 };
                 if let Some(old) = objects.insert(digest, prepared.clone()) {
                     if old.byte_length != prepared.byte_length {
@@ -872,8 +931,19 @@ pub(crate) async fn download_snapshot(
             }
         }
     }
-    let record_pack_paths = open_packs(
-        &record_packs,
+    let mut library_entries = record_entries;
+    library_entries.extend(asset_entries);
+    let library_staging = staging_root.to_path_buf();
+    let library_cancel = cancel.clone();
+    let cpu = cpu_permit().await?;
+    let plan = tokio::task::spawn_blocking(move || {
+        resolve_entries(library_entries, &library_staging, &library_cancel)
+    })
+    .await
+    .map_err(transient)??;
+    drop(cpu);
+    let pack_paths = open_packs(
+        &required_packs(&plan, &record_packs)?,
         root_key,
         staging_root,
         provider,
@@ -881,18 +951,14 @@ pub(crate) async fn download_snapshot(
         cancel,
     )
     .await?;
-    let mut library_entries = record_entries;
-    library_entries.extend(asset_entries);
-    let library_staging = staging_root.to_path_buf();
     let library_cancel = cancel.clone();
     let cpu = cpu_permit().await?;
     let (records, objects) = tokio::task::spawn_blocking(move || {
         let mut records = BTreeMap::new();
         let mut objects = BTreeMap::new();
         materialize_entries(
-            library_entries,
-            &record_pack_paths,
-            &library_staging,
+            plan,
+            &pack_paths,
             &library_cancel,
             &mut records,
             &mut objects,
