@@ -7,9 +7,9 @@ On Ubuntu with the Tauri dependencies, `WebKitWebDriver`, `xvfb`, and `dbus-run-
 ```sh
 export CARGO_TARGET_DIR=/absolute/path/to/RisuNest/src-tauri/target
 pnpm tauri build --target x86_64-unknown-linux-gnu --no-bundle --config benchmarks/linux/tauri.conf.json
-dbus-run-session -- xvfb-run -a python3 benchmarks/linux/run.py --binary "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/risunest" --output .tmp/linux-benchmark --phase persistence
-dbus-run-session -- xvfb-run -a python3 benchmarks/linux/run.py --binary "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/risunest" --output .tmp/linux-benchmark --phase reload
-dbus-run-session -- xvfb-run -a python3 benchmarks/linux/run.py --binary "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/risunest" --output .tmp/linux-benchmark --phase regex
+dbus-run-session -- xvfb-run -a python3 benchmarks/linux/run.py --binary "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/RisuNest" --output .tmp/linux-benchmark --phase persistence
+dbus-run-session -- xvfb-run -a python3 benchmarks/linux/run.py --binary "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/RisuNest" --output .tmp/linux-benchmark --phase reload
+dbus-run-session -- xvfb-run -a python3 benchmarks/linux/run.py --binary "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/RisuNest" --output .tmp/linux-benchmark --phase regex
 node benchmarks/linux/summarize.mjs .tmp/linux-benchmark
 ```
 
