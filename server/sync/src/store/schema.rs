@@ -9,7 +9,7 @@ CREATE TABLE devices (
  name TEXT NOT NULL DEFAULT '', registration_request TEXT UNIQUE
 );
 CREATE TABLE device_section_acks(device TEXT NOT NULL REFERENCES devices(id),domain TEXT NOT NULL,ack TEXT NOT NULL,PRIMARY KEY(device,domain));
-CREATE TABLE objects (hash TEXT PRIMARY KEY, size INTEGER NOT NULL CHECK(size>=0));
+CREATE TABLE objects (hash TEXT PRIMARY KEY, size INTEGER NOT NULL CHECK(size>=0), storage TEXT NOT NULL CHECK(storage IN ('file','inline')));
 CREATE TABLE object_leases(device TEXT NOT NULL REFERENCES devices(id),hash TEXT NOT NULL REFERENCES objects(hash),expires INTEGER NOT NULL,PRIMARY KEY(device,hash));
 CREATE TABLE object_custody(device TEXT NOT NULL REFERENCES devices(id),hash TEXT NOT NULL REFERENCES objects(hash),retention_id TEXT NOT NULL,PRIMARY KEY(device,hash));
 CREATE TABLE object_trash(hash TEXT PRIMARY KEY);

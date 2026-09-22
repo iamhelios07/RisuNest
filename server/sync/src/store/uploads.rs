@@ -304,7 +304,7 @@ impl Store {
             publish(temp.path(), &destination)?;
             let tx = db.transaction()?;
             tx.execute(
-                "INSERT INTO objects VALUES(?1,?2) ON CONFLICT DO NOTHING",
+                "INSERT INTO objects(hash,size,storage) VALUES(?1,?2,'file') ON CONFLICT DO NOTHING",
                 params![digest, size as i64],
             )?;
             tx.execute("UPDATE uploads SET state='complete' WHERE id=?1", [id])?;

@@ -1118,3 +1118,54 @@ async fn a_page_rejection_names_the_record_it_failed_on() {
         serde_json::json!({"error":"empty-staged-changes"})
     );
 }
+
+#[tokio::test]
+async fn an_inline_object_is_served_whole_and_by_range_without_a_file() {
+    let s = Server::start().await;
+    let bytes = b"0123456789".to_vec();
+    let digest = hash(&bytes);
+    let device = s.store.authenticate(&s.a.library_id, &s.a.token).unwrap();
+    s.store.put_object(&device, &digest, &bytes).unwrap();
+    assert!(!s
+        ._dir
+        .path()
+        .join("objects")
+        .join(&digest[..2])
+        .join(&digest)
+        .exists());
+    let url = format!("{}/objects/{digest}", s.base);
+    let whole = s.auth(s.client.get(&url), &s.b).send().await.unwrap();
+    assert_eq!(whole.status(), StatusCode::OK);
+    assert_eq!(whole.headers()["etag"], format!("\"{digest}\""));
+    assert_eq!(whole.headers()["accept-ranges"], "bytes");
+    assert_eq!(whole.bytes().await.unwrap().as_ref(), bytes);
+    for (range, expected) in [
+        ("bytes=2-5", b"2345".as_slice()),
+        ("bytes=-3", b"789"),
+        ("bytes=8-", b"89"),
+    ] {
+        let response = s
+            .auth(s.client.get(&url), &s.b)
+            .header("range", range)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.bytes().await.unwrap().as_ref(), expected);
+    }
+    let refused = s
+        .auth(s.client.get(&url), &s.b)
+        .header("range", "bytes=30-40")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(refused.headers()["content-range"], "bytes */10");
+    // Serving an inline body never writes it out first.
+    assert_eq!(
+        std::fs::read_dir(s._dir.path().join("staging"))
+            .unwrap()
+            .count(),
+        0
+    );
+}

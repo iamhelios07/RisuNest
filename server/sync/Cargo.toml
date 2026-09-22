@@ -12,6 +12,7 @@ windows-background = []
 risunest-release-update = { path = "../../crates/release-update" }
 risunest-sync-wire = { path = "../../crates/sync-wire" }
 risunest-sync-connect = { path = "../../crates/sync-connect" }
+risunest-small-object-store = { path = "../../crates/small-object-store" }
 async-trait = "0.1"
 axum = "0.8.9"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time", "io-util", "fs", "process", "sync"] }

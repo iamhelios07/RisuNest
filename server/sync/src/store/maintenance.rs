@@ -189,21 +189,49 @@ impl Store {
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             values
         };
-        let mut removed = 0;
+        let mut removed: u64 = 0;
+        let mut collected: Vec<String> = Vec::new();
         for digest in hashes {
             let exists: bool = db.query_row(
                 "SELECT EXISTS(SELECT 1 FROM objects WHERE hash=?1)",
                 [&digest],
                 |r| r.get(0),
             )?;
-            if !exists {
-                match std::fs::remove_file(self.object_path(&digest)?) {
-                    Ok(()) => removed += 1,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
-                    Err(_) => continue,
-                }
+            if exists {
+                db.execute("DELETE FROM object_trash WHERE hash=?1", [&digest])?;
+                continue;
+            }
+            // The row that said where the body lived is already gone, so the
+            // store that still holds it is the one that answers.
+            if risunest_small_object_store::size(&db, &digest)
+                .map_err(super::objects::body_error)?
+                .is_some()
+            {
+                collected.push(digest);
+                continue;
+            }
+            match std::fs::remove_file(self.object_path(&digest)?) {
+                Ok(()) => removed += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                Err(_) => continue,
             }
             db.execute("DELETE FROM object_trash WHERE hash=?1", [&digest])?;
+        }
+        if !collected.is_empty() {
+            // Body and entry leave together, so an interrupted sweep never
+            // strands a body that nothing remembers.
+            let hashes = collected.iter().map(String::as_str).collect::<Vec<_>>();
+            let tx = db.transaction()?;
+            risunest_small_object_store::delete_batch(&tx, &hashes)
+                .map_err(super::objects::body_error)?;
+            for digest in &hashes {
+                tx.execute("DELETE FROM object_trash WHERE hash=?1", [digest])?;
+            }
+            tx.commit()?;
+            removed += collected.len() as u64;
+            // Return the freed pages rather than leaving the file at its high
+            // water mark. Incremental, so a sweep never rewrites the database.
+            db.execute_batch("PRAGMA incremental_vacuum;")?;
         }
         // A write-ahead log that never folds back grows without bound. Its three
         // result values travel with the maintenance outcome so a checkpoint the
