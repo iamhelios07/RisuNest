@@ -2752,19 +2752,6 @@ mod tests {
         )
     }
 
-    /// What a job is holding in sealed ciphertext at one moment, which is the
-    /// cost a release bounds.
-    fn spool_bytes(directory: &Path) -> u64 {
-        let Ok(entries) = std::fs::read_dir(directory) else {
-            return 0;
-        };
-        entries
-            .flatten()
-            .filter(|entry| entry.path().extension().is_some_and(|value| value == "spool"))
-            .filter_map(|entry| entry.metadata().ok().map(|metadata| metadata.len()))
-            .sum()
-    }
-
     /// Samples a job directory from another thread while a publication runs.
     fn peak_spool_sampler(
         directory: std::path::PathBuf,
@@ -2780,7 +2767,10 @@ mod tests {
             let stop = stop.clone();
             std::thread::spawn(move || {
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    peak.fetch_max(spool_bytes(&directory), std::sync::atomic::Ordering::Relaxed);
+                    peak.fetch_max(
+                        super::super::journal::spool_bytes(&directory),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
             })
@@ -5059,7 +5049,7 @@ mod tests {
                     provider.read_count() - before.0,
                     provider.upload_count() - before.1,
                     peak.load(std::sync::atomic::Ordering::Relaxed),
-                    spool_bytes(&directory),
+                    super::super::journal::spool_bytes(&directory),
                 );
             }
         });

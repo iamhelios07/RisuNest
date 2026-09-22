@@ -18,6 +18,25 @@ fn storage(_: impl std::fmt::Display) -> ProviderError {
 /// state and is read by the same directory scan.
 const PARENT_FILE: &str = "parent.json";
 
+/// The application-wide ceiling on sealed ciphertext that unfinished jobs are
+/// holding. Paused and failed jobs keep theirs, so it is summed from the files
+/// each job left rather than counted as work is admitted.
+pub(crate) const TRANSFER_SPOOL_BUDGET: u64 = 512 * 1024 * 1024;
+
+/// What one job directory is holding, counting only what a transfer owns.
+pub(crate) fn spool_bytes(directory: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|value| value == "spool"))
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(|metadata| metadata.is_file())
+        .map(|metadata| metadata.len())
+        .sum()
+}
+
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct JobIdentity {

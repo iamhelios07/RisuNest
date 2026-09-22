@@ -295,6 +295,24 @@ impl JobStore {
             .collect()
     }
 
+
+    /// Jobs whose transfer material may still be on disk. A job that ended in
+    /// failure keeps its sealed ciphertext until a cleanup can release it.
+    pub fn list_retaining(&self) -> Result<Vec<DurableJob>> {
+        let mut statement = self
+            .0
+            .prepare(
+                "SELECT value FROM external_requests
+                 WHERE COALESCE(json_extract(value,'$.summary.state'),'')
+                    NOT IN ('succeeded','cancelled')",
+            )
+            .map_err(failure)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(failure)?;
+        rows.map(|row| Self::decode(row.map_err(failure)?))
+            .collect()
+    }
     /// Every live job plus a bounded recent terminal history for renderer state.
     pub fn list_for_state(&self) -> Result<Vec<DurableJob>> {
         let mut result = self.list_pending()?;

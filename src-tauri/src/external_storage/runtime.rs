@@ -1155,6 +1155,36 @@ pub(crate) fn job_directory(root: &std::path::Path, connection: &str, job: &str)
             risunest_external_storage_format::content_identity::hash(job.as_bytes()),
         ))
 }
+/// Sealed ciphertext the other unfinished jobs are holding. A job that would
+/// add to a budget somebody else already owns waits for it instead; nothing
+/// here removes what another job may still need.
+fn spool_budget_owner(
+    root: &std::path::Path,
+    store: &JobStore,
+    job: &DurableJob,
+) -> Result<Option<(String, u64)>> {
+    let mut total = 0u64;
+    let mut owner: Option<(String, u64)> = None;
+    for other in store.list_retaining()? {
+        if other.id == job.id {
+            continue;
+        }
+        let held = super::journal::spool_bytes(&job_directory(
+            root,
+            &other.request.connection_id,
+            &other.id,
+        ));
+        total = total.saturating_add(held);
+        if owner.as_ref().is_none_or(|(_, previous)| held > *previous) {
+            owner = Some((other.id.clone(), held));
+        }
+    }
+    if total < super::journal::TRANSFER_SPOOL_BUDGET {
+        return Ok(None);
+    }
+    Ok(owner)
+}
+
 async fn run_job(app: &AppHandle, id: &str, cancel: &Cancellation) -> Result<Value> {
     let store = JobStore::open(&root(app)?)?;
     let mut job = store.read(id)?;
@@ -1178,6 +1208,21 @@ async fn run_job(app: &AppHandle, id: &str, cancel: &Cancellation) -> Result<Val
                 .external_identity()
                 .map_err(local_error)?,
         )?;
+    }
+    // Work that seals ciphertext waits for the transfer spool the unfinished
+    // jobs are holding. A cleanup, a restore or a check is what frees it, so
+    // none of them are held back by it.
+    if matches!(
+        job.request.kind,
+        JobKind::Backup | JobKind::Sync | JobKind::ResolveConflict | JobKind::PinHistory
+    ) {
+        if let Some((owner, held)) = spool_budget_owner(&root(app)?, &store, &job)? {
+            crate::nlog!(
+                "warn",
+                "External job {id} waits for the transfer spool budget; job {owner} holds {held} bytes"
+            );
+            return Err(ProviderError::new(ErrorKind::Transient));
+        }
     }
     job.summary["state"] = json!("running");
     job.summary["phase"] = json!("opening");
@@ -1826,6 +1871,38 @@ mod tests {
             store_id: "store".into(), library_epoch: "library".into(), generation: "generation".into(),
             selection_epoch: "selection".into(), revision: 1,
         })
+    }
+
+    /// The budget is what other jobs are holding, so a job is never held back
+    /// by its own material and a job that ended still counts until a cleanup
+    /// releases it.
+    #[test]
+    fn a_producing_job_waits_for_the_spool_another_job_still_holds() {
+        let root = tempfile::tempdir().unwrap();
+        let store = JobStore::open(root.path()).unwrap();
+        let mut holder = automatic_job();
+        holder.request.connection_id = "holding-connection".into();
+        holder.summary["connectionId"] = json!("holding-connection");
+        store.put(&holder).unwrap();
+        let waiting = automatic_job();
+        store.put(&waiting).unwrap();
+        let directory = job_directory(root.path(), &holder.request.connection_id, &holder.id);
+        std::fs::create_dir_all(&directory).unwrap();
+        let held = std::fs::File::create(directory.join("held.spool")).unwrap();
+        held.set_len(super::super::journal::TRANSFER_SPOOL_BUDGET - 1).unwrap();
+        assert!(spool_budget_owner(root.path(), &store, &waiting).unwrap().is_none());
+        held.set_len(super::super::journal::TRANSFER_SPOOL_BUDGET).unwrap();
+        assert_eq!(
+            spool_budget_owner(root.path(), &store, &waiting).unwrap(),
+            Some((holder.id.clone(), super::super::journal::TRANSFER_SPOOL_BUDGET)),
+        );
+        assert!(spool_budget_owner(root.path(), &store, &holder).unwrap().is_none());
+        holder.summary["state"] = json!("failed");
+        store.put(&holder).unwrap();
+        assert!(spool_budget_owner(root.path(), &store, &waiting).unwrap().is_some());
+        holder.summary["state"] = json!("cancelled");
+        store.put(&holder).unwrap();
+        assert!(spool_budget_owner(root.path(), &store, &waiting).unwrap().is_none());
     }
     #[test]
     fn a_partial_restore_is_neither_a_failed_noop_nor_a_remote_publication() {
