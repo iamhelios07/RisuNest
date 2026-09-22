@@ -764,11 +764,6 @@ struct PendingPack {
     length: u64,
 }
 
-struct PreparedPacks {
-    entries: Vec<PendingEntry>,
-    packs: Vec<PendingPack>,
-}
-
 /// The same envelope and SDK calculation bounds packing, metadata and upload.
 /// Alignment of resumable non-final requests remains the provider's responsibility.
 struct StoredSize<'a> {
@@ -1087,9 +1082,12 @@ async fn build_entries(
     let build_root_owned = build_root.to_path_buf();
     let external_root_owned = external_root.to_path_buf();
     let cancel_owned = cancel.clone();
-    let cpu = cpu_permit().await?;
     let placed = placements;
-    let prepared = tokio::task::spawn_blocking(move || {
+    // One pack waiting to be taken and one being built, against the two
+    // ciphertexts a full family holds: four pack-sized files at the most.
+    let (built, mut arriving) = tokio::sync::mpsc::channel(1);
+    let handle = tokio::runtime::Handle::current();
+    let producer = tokio::task::spawn_blocking(move || {
         prepare_packs(
             uncached,
             &external_root_owned,
@@ -1098,30 +1096,29 @@ async fn build_entries(
             max_pack,
             chunk_bytes,
             &placed,
+            &built,
+            &handle,
             &cancel_owned,
         )
-    })
-    .await
-    .map_err(transient)??;
-    drop(cpu);
-    let PendingBuildParts { pending, packs } = PendingBuildParts::from(prepared);
+    });
     let data_key = derive_key(root_key, format_repository_id, "data").map_err(corrupt)?;
     let mut uploaded_packs = Vec::new();
     let mut family = Vec::new();
-    for mut pack in packs {
-        pack.file
-            .as_file_mut()
-            .seek(SeekFrom::Start(0))
-            .map_err(transient)?;
-        let plain_hash = hash_reader(pack.file.as_file_mut(), pack.length).map_err(corrupt)?;
-        let id = wire::keyed_object_id(
-            &data_key,
-            journal.job_id(),
-            wire::ObjectRole::Pack,
-            &plain_hash,
-        )
-        .map_err(corrupt)?;
-        family.push(
+    let mut failure = None;
+    while let Some(mut pack) = arriving.recv().await {
+        let sealed = async {
+            pack.file
+                .as_file_mut()
+                .seek(SeekFrom::Start(0))
+                .map_err(transient)?;
+            let plain_hash = hash_reader(pack.file.as_file_mut(), pack.length).map_err(corrupt)?;
+            let id = wire::keyed_object_id(
+                &data_key,
+                journal.job_id(),
+                wire::ObjectRole::Pack,
+                &plain_hash,
+            )
+            .map_err(corrupt)?;
             seal_plain_object(
                 pack.file.path(),
                 pack.length,
@@ -1139,26 +1136,52 @@ async fn build_entries(
                 repository,
                 cancel,
             )
-            .await?,
-        );
+            .await
+        }
+        .await;
+        match sealed {
+            Ok(object) => family.push(object),
+            Err(error) => {
+                failure = Some(error);
+                break;
+            }
+        }
+        // The plaintext has been sealed, so the ciphertext is the only copy
+        // this pack still needs while its wave fills.
+        drop(pack);
         // A pack that is sealed but not yet sent owns its ciphertext, so only
         // as many as the active family bound allows wait for a registration.
         if family.len() >= ACTIVE_PACK_FAMILIES {
-            uploaded_packs.extend(
-                upload_sealed_wave(
-                    std::mem::take(&mut family),
-                    format_repository_id,
-                    root_key,
-                    cache,
-                    journal,
-                    provider,
-                    repository,
-                    cancel,
-                )
-                .await?,
-            );
+            match upload_sealed_wave(
+                std::mem::take(&mut family),
+                format_repository_id,
+                root_key,
+                cache,
+                journal,
+                provider,
+                repository,
+                cancel,
+            )
+            .await
+            {
+                Ok(objects) => uploaded_packs.extend(objects),
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            }
         }
     }
+    // The producer is waiting to hand over its next pack, so it has to be let
+    // go before its own outcome can be read.
+    drop(arriving);
+    let produced = producer.await;
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    let pending = produced.map_err(transient)??;
+    // The last family is only worth sending once production has answered for
+    // every source, because a publication that cannot finish has no use for it.
     if !family.is_empty() {
         uploaded_packs.extend(
             upload_sealed_wave(
@@ -1231,20 +1254,11 @@ async fn build_entries(
     Ok((ready, referenced.into_values().collect()))
 }
 
-// Named separately so the CPU producer and all capture file I/O run on the
-// blocking pool. It emits plaintext pack files and bounded metadata only.
-struct PendingBuildParts {
-    pending: Vec<PendingEntry>,
-    packs: Vec<PendingPack>,
-}
-impl From<PreparedPacks> for PendingBuildParts {
-    fn from(value: PreparedPacks) -> Self {
-        Self {
-            pending: value.entries,
-            packs: value.packs,
-        }
-    }
-}
+/// Runs on the blocking pool, where the CPU work and all capture file I/O
+/// belong, and emits plaintext pack files and bounded metadata only. Each pack
+/// is handed over as soon as it is complete, and the CPU permit is held only
+/// while one is being built, so sending a finished pack and preparing the next
+/// one overlap.
 #[allow(clippy::too_many_arguments)]
 fn prepare_packs(
     sources: Vec<SourceEntry>,
@@ -1254,17 +1268,20 @@ fn prepare_packs(
     max_pack: u64,
     chunk_bytes: usize,
     placements: &ChunkPlacements,
+    built: &tokio::sync::mpsc::Sender<PendingPack>,
+    handle: &tokio::runtime::Handle,
     cancel: &Cancellation,
-) -> Result<PreparedPacks> {
+) -> Result<Vec<PendingEntry>> {
     fs::create_dir_all(build_root).map_err(transient)?;
     if crate::trust_boundary::is_link_like(&fs::symlink_metadata(build_root).map_err(transient)?) {
         return Err(corrupt("snapshot build directory is a link"));
     }
     let content = ContentStore::open(external_root).map_err(transient)?;
     let mut encoder = ChunkEncoder::new().map_err(corrupt)?;
-    let mut packs: Vec<PendingPack> = Vec::new();
+    let mut completed = 0usize;
     let mut current: Option<PendingPack> = None;
     let mut pending = Vec::new();
+    let mut cpu = Some(handle.block_on(cpu_permit())?);
     for source in sources {
         cancel.check()?;
         let mut input = content.open_source(&source.source).map_err(corrupt)?;
@@ -1303,7 +1320,8 @@ fn prepare_packs(
                     .as_ref()
                     .is_some_and(|pack| pack.length > 0 && pack.length + stored_length > target)
                 {
-                    packs.push(current.take().unwrap());
+                    send_pack(current.take().unwrap(), built, handle, &mut cpu)?;
+                    completed += 1;
                 }
                 if stored_length > max_pack {
                     return Err(ProviderError::new(ErrorKind::FileTooLarge));
@@ -1318,7 +1336,7 @@ fn prepare_packs(
                 if pack.length + stored_length > max_pack {
                     return Err(ProviderError::new(ErrorKind::FileTooLarge));
                 }
-                let pack_index = packs.len();
+                let pack_index = completed;
                 let offset = pack.length;
                 pack.file
                     .as_file_mut()
@@ -1348,15 +1366,24 @@ fn prepare_packs(
         pending.push(PendingEntry { source, chunks });
     }
     if let Some(pack) = current {
-        packs.push(pack);
+        send_pack(pack, built, handle, &mut cpu)?;
     }
-    for pack in &mut packs {
-        pack.file.as_file_mut().sync_all().map_err(transient)?;
-    }
-    Ok(PreparedPacks {
-        entries: pending,
-        packs,
-    })
+    Ok(pending)
+}
+
+/// The pack is durable before it is handed over, and the producer holds no CPU
+/// permit while it waits for the consumer to take it.
+fn send_pack(
+    mut pack: PendingPack,
+    built: &tokio::sync::mpsc::Sender<PendingPack>,
+    handle: &tokio::runtime::Handle,
+    cpu: &mut Option<tokio::sync::OwnedSemaphorePermit>,
+) -> Result<()> {
+    pack.file.as_file_mut().sync_all().map_err(transient)?;
+    cpu.take();
+    built.blocking_send(pack).map_err(transient)?;
+    *cpu = Some(handle.block_on(cpu_permit())?);
+    Ok(())
 }
 
 /// How many packs may own a ciphertext at once. A sealed pack waiting for its
@@ -2752,9 +2779,35 @@ mod tests {
         )
     }
 
+    /// How many plaintext files a publication is holding in the directory it
+    /// builds them in, which is what bounds the overlap between preparing a
+    /// pack and sending the one before it.
+    fn build_files(directory: &Path) -> u64 {
+        fs::read_dir(directory)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| entry.metadata().is_ok_and(|entry| entry.is_file()))
+                    .count() as u64
+            })
+            .unwrap_or_default()
+    }
+
     /// Samples a job directory from another thread while a publication runs.
     fn peak_spool_sampler(
         directory: std::path::PathBuf,
+    ) -> (
+        std::sync::Arc<std::sync::atomic::AtomicU64>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<()>,
+    ) {
+        peak_sampler(directory, super::super::journal::spool_bytes)
+    }
+
+    /// The same sampling for whatever a measurement wants to watch.
+    fn peak_sampler(
+        directory: std::path::PathBuf,
+        measure: fn(&Path) -> u64,
     ) -> (
         std::sync::Arc<std::sync::atomic::AtomicU64>,
         std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -2767,10 +2820,7 @@ mod tests {
             let stop = stop.clone();
             std::thread::spawn(move || {
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    peak.fetch_max(
-                        super::super::journal::spool_bytes(&directory),
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
+                    peak.fetch_max(measure(&directory), std::sync::atomic::Ordering::Relaxed);
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
             })
@@ -2804,6 +2854,78 @@ mod tests {
             .find(|object| object.receipt.locator.object == locator)
             .unwrap()
             .clone()
+    }
+
+    /// The packs the repository holds, which is what a publication actually
+    /// placed rather than what it attempted.
+    fn stored_packs(provider: &FakeProvider) -> Vec<String> {
+        provider
+            .state
+            .lock()
+            .unwrap()
+            .objects
+            .keys()
+            .filter(|id| id.starts_with("pack-"))
+            .cloned()
+            .collect()
+    }
+
+    /// A capture whose payloads are large enough that one publication has to
+    /// build several packs. The digests come back in the order the sources are
+    /// read, so a test can reach the payload a publication gets to last.
+    fn captured_packed_assets(
+        root: &Path,
+        capture_id: &str,
+        assets: usize,
+        size: usize,
+    ) -> (CapturedSnapshot, Vec<String>) {
+        let cas = PayloadCas::new(root).unwrap();
+        let directory = root
+            .join("external-storage")
+            .join("captures")
+            .join(capture_id);
+        let external = root.join("external-storage");
+        let mut catalog =
+            crate::external_storage::capture::CaptureCatalog::create(&directory, &external, None)
+                .unwrap();
+        let identity = CaptureIdentity {
+            store_id: "store".into(),
+            library_epoch: "epoch".into(),
+            generation: "generation".into(),
+            selection_epoch: "selection".into(),
+            revision: 1,
+        };
+        catalog.begin(&identity, None).unwrap();
+        catalog.record("root", b"record").unwrap();
+        let mut digests = Vec::new();
+        for index in 0..assets {
+            let mut bytes = vec![0u8; size];
+            let mut value = (index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+            for slot in bytes.chunks_mut(8) {
+                value ^= value << 13;
+                value ^= value >> 7;
+                value ^= value << 17;
+                let filled = slot.len();
+                slot.copy_from_slice(&value.to_le_bytes()[..filled]);
+            }
+            let stored = cas.prepare_bytes(&bytes).unwrap();
+            catalog
+                .reference("root", &stored.content_hash, stored.byte_size)
+                .unwrap();
+            digests.push(stored.content_hash);
+        }
+        catalog.finish().unwrap();
+        digests.sort();
+        (
+            CapturedSnapshot {
+                id: capture_id.into(),
+                identity,
+                catalog,
+                projected_records: 1,
+                shared: false,
+            },
+            digests,
+        )
     }
 
     fn captured_asset_inventory(
@@ -3607,6 +3729,87 @@ mod tests {
             }
         });
     }
+    /// A refused upload ends a publication that is still building packs. The
+    /// producer is let go rather than left waiting for a handover, and the
+    /// failure the caller sees is the one the provider gave.
+    #[test]
+    fn c_a_refused_upload_ends_a_publication_that_is_still_building_packs() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let key = [13; 32];
+            let cancel = Cancellation::default();
+            let (capture, _) = captured_packed_assets(root.path(), "capture", 80, 4096);
+            let meta = metadata("snapshot", &capture);
+            let mut journal = journal(&root.path().join("job"), "job", &capture);
+            // The refusal lands on the first body of the second pack wave,
+            // while the producer still has packs nobody has taken.
+            provider.fail_upload_number(9, ErrorKind::StorageFull);
+            let error = package_and_upload(capture, vec![], root.path(), &root.path().join("cache"),
+                meta, &key, limits(64 * 1024), None, &mut journal, &provider, &repository, &cancel)
+                .await.unwrap_err();
+            assert_eq!(error.kind, ErrorKind::StorageFull);
+            let placed = stored_packs(&provider);
+            assert_eq!(placed.len(), 3);
+            for object in &placed {
+                assert!(journal.record(object).unwrap().unwrap().released);
+                assert!(!journal.spool_path(object).exists());
+            }
+        });
+    }
+
+    /// A source the producer cannot answer for ends the publication too. What
+    /// the earlier waves already placed keeps its receipt and gives up its
+    /// ciphertext, and the publication that follows proves those bodies from
+    /// their registration instead of sending them again.
+    #[test]
+    fn c_a_source_that_fails_after_a_wave_keeps_what_the_wave_placed() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let key = [17; 32];
+            let cancel = Cancellation::default();
+            let (capture, digests) = captured_packed_assets(root.path(), "capture", 80, 4096);
+            let meta = metadata("snapshot", &capture);
+            let mut journal = journal(&root.path().join("job"), "job", &capture);
+            // The payload read last still has its recorded length, so the
+            // publication only learns of it once every earlier pack is out.
+            let cas = PayloadCas::new(root.path()).unwrap();
+            let last = cas.object_path(digests.last().unwrap()).unwrap().unwrap();
+            let original = fs::read(&last).unwrap();
+            fs::write(&last, vec![9u8; original.len()]).unwrap();
+            let error = package_and_upload(capture, vec![], root.path(), &root.path().join("cache"),
+                meta, &key, limits(64 * 1024), None, &mut journal, &provider, &repository, &cancel)
+                .await.unwrap_err();
+            assert_eq!(error.kind, ErrorKind::Corrupt);
+            // One record pack and two full asset waves. The asset pack the
+            // consumer had already sealed when production failed is not sent,
+            // because a publication that cannot finish has no use for it.
+            let placed = stored_packs(&provider);
+            assert_eq!(placed.len(), 5);
+            for object in &placed {
+                assert!(journal.record(object).unwrap().unwrap().released);
+                assert!(!journal.spool_path(object).exists());
+            }
+
+            fs::write(&last, &original).unwrap();
+            let (capture, _) = captured_packed_assets(root.path(), "retried-capture", 80, 4096);
+            let meta = metadata("snapshot", &capture);
+            let completed = package_and_upload(capture, vec![], root.path(),
+                &root.path().join("retried-cache"), meta, &key, limits(64 * 1024), None,
+                &mut journal, &provider, &repository, &cancel).await.unwrap();
+            for object in &placed {
+                assert_eq!(provider.upload_attempts(object), 1);
+                assert_eq!(provider.read_attempts(object), 1);
+            }
+            assert!(completed.referenced_objects.iter()
+                .filter(|object| object.role == ObjectRole::Pack)
+                .any(|object| placed.contains(&object.object_id)));
+        });
+    }
+
     /// The publication after that one rebuilds the body nobody holds any more
     /// and reuses everything the repository still answers for.
     #[test]
@@ -4842,7 +5045,6 @@ mod tests {
     #[ignore = "explicit large-inventory measurement"]
     fn measures_hundred_thousand_asset_package_and_restore() {
         runtime().block_on(async {
-            let started = std::time::Instant::now();
             let root = tempfile::tempdir().unwrap();
             let provider = FakeProvider::new(false);
             let repository = fake::repository();
@@ -4850,11 +5052,12 @@ mod tests {
             let first_capture =
                 captured_asset_inventory(root.path(), "inventory-1", 1, 300, 0, 100_000);
             let first_metadata = metadata("inventory-snapshot-1", &first_capture);
-            let mut first_journal = journal(
-                &root.path().join("inventory-job-1"),
-                "inventory-job-1",
-                &first_capture,
-            );
+            let directory = root.path().join("inventory-job-1");
+            let mut first_journal = journal(&directory, "inventory-job-1", &first_capture);
+            let (peak, stop, sampler) = peak_spool_sampler(directory.clone());
+            let (files, stop_files, files_sampler) =
+                peak_sampler(root.path().join("inventory-cache").join("build"), build_files);
+            let started = std::time::Instant::now();
             let completed = package_and_upload(
                 first_capture,
                 Vec::new(),
@@ -4872,6 +5075,12 @@ mod tests {
             .await
             .unwrap();
             let package_elapsed = started.elapsed();
+            let first_upload_ms = provider.first_upload()
+                .map(|at| at.duration_since(started).as_millis()).unwrap_or_default();
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            sampler.join().unwrap();
+            stop_files.store(true, std::sync::atomic::Ordering::Relaxed);
+            files_sampler.join().unwrap();
             let (remote_objects, packs, catalogs) = {
                 let state = provider.state.lock().unwrap();
                 (
@@ -4915,11 +5124,13 @@ mod tests {
                 .values()
                 .all(|(bytes, _)| bytes.len() <= 512 * 1024));
             eprintln!(
-                "assets=100000 remote_objects={} packs={} catalogs={} package_ms={} restore_reads={} restore_pack_reads={} restore_ms={}",
+                "assets=100000 remote_objects={} packs={} catalogs={} package_ms={} first_upload_ms={first_upload_ms} peak_spool_bytes={} peak_build_files={} restore_reads={} restore_pack_reads={} restore_ms={}",
                 remote_objects,
                 packs,
                 catalogs,
                 package_elapsed.as_millis(),
+                peak.load(std::sync::atomic::Ordering::Relaxed),
+                files.load(std::sync::atomic::Ordering::Relaxed),
                 network_reads,
                 pack_reads,
                 restore_elapsed.as_millis(),
@@ -5032,6 +5243,11 @@ mod tests {
                 let mut transfer = journal(&directory, &job_id, &capture);
                 let before = (provider.read_count(), provider.upload_count());
                 let (peak, stop, sampler) = peak_spool_sampler(directory.clone());
+                let (files, stop_files, files_sampler) = peak_sampler(
+                    root.path().join(format!("{name}-cache")).join("build"),
+                    build_files,
+                );
+                provider.reset_first_upload();
                 let started = std::time::Instant::now();
                 package_and_upload(
                     capture, Vec::new(), root.path(), &root.path().join(format!("{name}-cache")),
@@ -5039,16 +5255,21 @@ mod tests {
                     &provider, &repository, &Cancellation::default(),
                 ).await.unwrap();
                 let elapsed = started.elapsed().as_millis();
+                let first_upload_ms = provider.first_upload()
+                    .map(|at| at.duration_since(started).as_millis()).unwrap_or_default();
                 stop.store(true, std::sync::atomic::Ordering::Relaxed);
                 sampler.join().unwrap();
+                stop_files.store(true, std::sync::atomic::Ordering::Relaxed);
+                files_sampler.join().unwrap();
                 let stored: u64 = provider.state.lock().unwrap().objects.values()
                     .map(|(bytes, _)| bytes.len() as u64).sum();
                 eprintln!(
-                    "{name} assets={} provider_reads={} provider_uploads={} publication_ms={elapsed} peak_spool_bytes={} held_spool_bytes={} stored_bytes={stored}",
+                    "{name} assets={} provider_reads={} provider_uploads={} publication_ms={elapsed} first_upload_ms={first_upload_ms} peak_spool_bytes={} peak_build_files={} held_spool_bytes={} stored_bytes={stored}",
                     5_000 + REVISIONS,
                     provider.read_count() - before.0,
                     provider.upload_count() - before.1,
                     peak.load(std::sync::atomic::Ordering::Relaxed),
+                    files.load(std::sync::atomic::Ordering::Relaxed),
                     super::super::journal::spool_bytes(&directory),
                 );
             }
