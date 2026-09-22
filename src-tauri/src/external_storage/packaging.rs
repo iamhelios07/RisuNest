@@ -1083,8 +1083,9 @@ async fn build_entries(
     let external_root_owned = external_root.to_path_buf();
     let cancel_owned = cancel.clone();
     let placed = placements;
-    // One pack waiting to be taken and one being built, against the two
-    // ciphertexts a full family holds: four pack-sized files at the most.
+    // The pack being sealed, one waiting to be taken and one being built:
+    // three pack-sized plaintext files, against the two ciphertexts a full
+    // family holds.
     let (built, mut arriving) = tokio::sync::mpsc::channel(1);
     let handle = tokio::runtime::Handle::current();
     let producer = tokio::task::spawn_blocking(move || {
@@ -5039,6 +5040,24 @@ mod tests {
             .unwrap_err();
             assert_eq!(error.kind, ErrorKind::FileTooLarge);
         });
+    }
+
+    /// What a publication does before it can build its first pack. Every
+    /// dependency the capture names is looked up in the payload store, which is
+    /// what stands in front of the first upload at this library size.
+    #[test]
+    #[ignore = "explicit planning-pass measurement"]
+    fn measures_the_source_pass_that_precedes_the_first_pack() {
+        let root = tempfile::tempdir().unwrap();
+        let capture = captured_asset_inventory(root.path(), "planning", 1, 300, 0, 100_000);
+        let started = std::time::Instant::now();
+        let (records, assets) = capture_sources(&capture, root.path()).unwrap();
+        eprintln!(
+            "records={} assets={} source_pass_ms={}",
+            records.len(),
+            assets.len(),
+            started.elapsed().as_millis(),
+        );
     }
 
     #[test]
