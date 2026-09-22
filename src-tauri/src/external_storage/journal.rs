@@ -1,6 +1,7 @@
 //! Reconstructible transfer receipts. Publication and activation authority stays
 //! in PDS; reopening this journal requires its current PDS job identity.
 use super::{contract::*, transfer::SpoolSource};
+use risunest_external_storage_format::snapshot as wire;
 use crate::persistent_store::sync_selection::CaptureIdentity;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,10 @@ fn corrupt() -> ProviderError {
 fn storage(_: impl std::fmt::Display) -> ProviderError {
     ProviderError::new(ErrorKind::Transient)
 }
+
+/// Named beside the transfer receipts because it is the same job's durable
+/// state and is read by the same directory scan.
+const PARENT_FILE: &str = "parent.json";
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -158,6 +163,44 @@ impl TransferJournal {
     /// What one job has already put in the repository, read without taking the
     /// journal over. A cleanup needs this because an unfinished job's fragments
     /// are named by nothing else.
+    /// The selected parent graph, written before the first reuse decision so a
+    /// cleanup that finds this job stopped still protects what it is reusing.
+    pub(crate) fn record_parent(&self, roots: &[wire::StoredObject]) -> Result<()> {
+        for root in roots {
+            root.validate().map_err(|_| corrupt())?;
+        }
+        let encoded = serde_json::to_vec(roots).map_err(storage)?;
+        if encoded.len() > 256 * 1024 {
+            return Err(corrupt());
+        }
+        let mut file = tempfile::NamedTempFile::new_in(&self.directory).map_err(storage)?;
+        std::io::Write::write_all(file.as_file_mut(), &encoded).map_err(storage)?;
+        file.as_file_mut().sync_all().map_err(storage)?;
+        file.persist(self.directory.join(PARENT_FILE))
+            .map_err(storage)?
+            .sync_all()
+            .map_err(storage)?;
+        Ok(())
+    }
+
+    pub(crate) fn parent(directory: &Path) -> Result<Vec<wire::StoredObject>> {
+        let path = directory.join(PARENT_FILE);
+        let encoded = match std::fs::read(&path) {
+            Ok(value) => value,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(storage(error)),
+        };
+        if encoded.len() > 256 * 1024 {
+            return Err(corrupt());
+        }
+        let roots: Vec<wire::StoredObject> =
+            serde_json::from_slice(&encoded).map_err(|_| corrupt())?;
+        for root in &roots {
+            root.validate().map_err(|_| corrupt())?;
+        }
+        Ok(roots)
+    }
+
     pub(crate) fn uploaded(directory: &Path, job_id: &str) -> Result<Vec<ObjectReceipt>> {
         let path = directory.join("transfers.sqlite");
         crate::trust_boundary::open_regular_source(&path).map_err(storage)?;

@@ -137,6 +137,7 @@ fn repository_bootstrap_opens_and_applies_a_real_snapshot_without_the_source_vau
                     sdk_overhead_bytes: 0,
                     target_plaintext_bytes: 128 * 1024,
                 },
+                None,
                 &mut journal,
                 &provider,
                 &repository,

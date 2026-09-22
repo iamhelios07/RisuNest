@@ -328,6 +328,38 @@ impl ObjectEvidence {
     }
 }
 
+/// The authenticated graph a publication may reuse from without asking the
+/// provider about it again. Selected before the first reuse decision and
+/// recorded on the job, so a cleanup that finds the job stopped protects it.
+#[derive(Debug)]
+pub(crate) struct ParentGraph {
+    objects: Vec<wire::StoredObject>,
+    roots: BTreeSet<String>,
+}
+
+impl ParentGraph {
+    pub(crate) fn new(
+        objects: Vec<wire::StoredObject>,
+        repository: &RepositoryHandle,
+    ) -> Result<Self> {
+        if objects.is_empty() {
+            return Err(corrupt("parent graph has no roots"));
+        }
+        let mut roots = BTreeSet::new();
+        for object in &objects {
+            let remote = RemoteObject::from_stored(object, repository)?;
+            if remote.role != ObjectRole::Catalog {
+                return Err(corrupt("parent root is not a catalog"));
+            }
+            roots.insert(super::reachability::object_identity(&remote, repository)?);
+        }
+        Ok(Self { objects, roots })
+    }
+    pub(crate) fn stored(&self) -> &[wire::StoredObject] {
+        &self.objects
+    }
+}
+
 #[derive(Default)]
 pub(super) struct AttemptVerification {
     receipts: BTreeMap<String, ObjectReceipt>,
@@ -824,6 +856,7 @@ async fn build_entries(
     build_root: &Path,
     root_key: &[u8; 32],
     limits: PackageLimits,
+    parent: Option<&BTreeSet<String>>,
     cache: &mut PackageCache,
     evidence: &mut ObjectEvidence,
     journal: &mut TransferJournal,
@@ -847,7 +880,7 @@ async fn build_entries(
     let mut uncached = Vec::new();
     for source in sources {
         cancel.check()?;
-        if let Some(mut cached) = cache.entry(
+        if let Some((mut cached, origin)) = cache.entry(
             format_repository_id,
             repository,
             kind,
@@ -855,27 +888,42 @@ async fn build_entries(
             &source.content_sha256,
             source.byte_length,
         )? {
-            let mut exists = true;
-            for pack in &mut cached.packs {
-                match revalidate_cached_object(
-                    pack,
-                    cache,
-                    evidence,
-                    journal,
-                    root_key,
-                    provider,
-                    repository,
-                    cancel,
-                )
-                .await?
-                {
-                    Some(current) => *pack = current,
-                    None => { exists = false; break; }
+            match parent {
+                // The packs this entry names are in the selected parent graph,
+                // which this job protects, so their existence is settled and
+                // nothing is asked about them. They are not verified here.
+                Some(roots) => {
+                    if roots.contains(&origin) {
+                        ready.push(cached);
+                        continue;
+                    }
                 }
-            }
-            if exists {
-                ready.push(cached);
-                continue;
+                // Without a parent there is nothing to reuse under, so the
+                // entry is admitted only while its packs answer for themselves.
+                None => {
+                    let mut exists = true;
+                    for pack in &mut cached.packs {
+                        match revalidate_cached_object(
+                            pack,
+                            cache,
+                            evidence,
+                            journal,
+                            root_key,
+                            provider,
+                            repository,
+                            cancel,
+                        )
+                        .await?
+                        {
+                            Some(current) => *pack = current,
+                            None => { exists = false; break; }
+                        }
+                    }
+                    if exists {
+                        ready.push(cached);
+                        continue;
+                    }
+                }
             }
         }
         uncached.push(source);
@@ -1521,6 +1569,14 @@ async fn build_catalog(
         repository,
     )?;
     cache.put_catalog(repository, kind, fingerprint, &root)?;
+    let keys: Vec<String> = entries.iter().map(|entry| entry.key.clone()).collect();
+    cache.tag_entries(
+        format_repository_id,
+        repository,
+        kind,
+        &keys,
+        &super::reachability::object_identity(&root, repository)?,
+    )?;
     Ok(root)
 }
 
@@ -1575,6 +1631,7 @@ pub(crate) async fn package_and_upload(
     metadata: SnapshotMetadata,
     root_key: &[u8; 32],
     limits: PackageLimits,
+    parent: Option<&ParentGraph>,
     journal: &mut TransferJournal,
     provider: &dyn Provider,
     repository: &RepositoryHandle,
@@ -1624,6 +1681,7 @@ pub(crate) async fn package_and_upload(
         &build_root,
         root_key,
         limits,
+        parent.map(|graph| &graph.roots),
         &mut cache,
         &mut evidence,
         journal,
@@ -1673,6 +1731,7 @@ pub(crate) async fn package_and_upload(
             &build_root,
             root_key,
             limits,
+            parent.map(|graph| &graph.roots),
             &mut cache,
             &mut evidence,
             journal,
@@ -1749,6 +1808,7 @@ pub(crate) async fn package_and_upload(
             &build_root,
             root_key,
             limits,
+            parent.map(|graph| &graph.roots),
             &mut cache,
             &mut evidence,
             journal,
@@ -2066,6 +2126,20 @@ mod tests {
         .unwrap()
     }
 
+    /// What the next publication may reuse from, the way a sync publication
+    /// builds it out of the state it observed.
+    fn parent_graph(
+        previous: &CompletedSnapshot,
+        repository: &RepositoryHandle,
+    ) -> Result<ParentGraph> {
+        let mut roots = vec![
+            previous.record_catalog.stored(repository)?,
+            previous.asset_catalog.stored(repository)?,
+        ];
+        roots.extend(previous.sections.values().map(|section| section.entries_root.clone()));
+        ParentGraph::new(roots, repository)
+    }
+
     fn limits(max: u64) -> PackageLimits {
         PackageLimits {
             max_stored_bytes: max,
@@ -2214,6 +2288,7 @@ mod tests {
                         snapshot_metadata,
                         &key,
                         limits(256 * 1024),
+                        None,
                         &mut transfer,
                         provider,
                         repository,
@@ -2329,6 +2404,7 @@ mod tests {
                         snapshot_metadata,
                         &key,
                         limits(256 * 1024),
+                        None,
                         &mut transfer,
                         provider,
                         repository,
@@ -2425,6 +2501,7 @@ mod tests {
                 first_metadata,
                 &key,
                 limits(128 * 1024),
+                None,
                 &mut first_journal,
                 &provider,
                 &repository,
@@ -2466,6 +2543,7 @@ mod tests {
                 second_metadata,
                 &key,
                 limits(128 * 1024),
+                None,
                 &mut second_journal,
                 &provider,
                 &repository,
@@ -2579,7 +2657,7 @@ mod tests {
                 let meta = metadata("first", &capture);
                 let mut first_journal = journal(&root.path().join("first-job"), "first-job", &capture);
                 let first = package_and_upload(capture, Vec::new(), root.path(), &cache, meta, &key,
-                    limits(128 * 1024), &mut first_journal, &provider, &repository, &cancel).await.unwrap();
+                    limits(128 * 1024), None, &mut first_journal, &provider, &repository, &cancel).await.unwrap();
                 let bytes = provider.state.lock().unwrap().objects[&first.asset_catalog.receipt.locator.object].0.clone();
                 let metadata_key = derive_key(&key, &first.repository_id, "metadata").unwrap();
                 let mut plaintext = Vec::new();
@@ -2598,7 +2676,7 @@ mod tests {
                 let meta = metadata("second", &capture);
                 let mut second_journal = journal(&root.path().join("second-job"), "second-job", &capture);
                 let second = package_and_upload(capture, Vec::new(), root.path(), &cache, meta, &key,
-                    limits(128 * 1024), &mut second_journal, &provider, &repository, &cancel).await.unwrap();
+                    limits(128 * 1024), None, &mut second_journal, &provider, &repository, &cancel).await.unwrap();
                 let restored = snapshot_restore::download_snapshot(&second.reference, &root.path().join("restored"),
                     &key, &provider, &repository, &cancel).await.unwrap();
                 assert_eq!(fs::read(restored.records[0].source.file().unwrap()).unwrap(), b"record");
@@ -2626,13 +2704,13 @@ mod tests {
             let meta = metadata("first", &capture);
             let mut first_journal = journal(&root.path().join("first-job"), "first-job", &capture);
             let first = package_and_upload(capture, Vec::new(), root.path(), &cache, meta, &key,
-                limits(128 * 1024), &mut first_journal, &provider, &repository, &cancel).await.unwrap();
+                limits(128 * 1024), None, &mut first_journal, &provider, &repository, &cancel).await.unwrap();
             provider.fail_read(&first.asset_catalog.receipt.locator.object, ErrorKind::Unauthorized);
             let (capture, _) = captured(root.path(), "second", 2, b"record", b"asset");
             let meta = metadata("second", &capture);
             let mut second_journal = journal(&root.path().join("second-job"), "second-job", &capture);
             let error = package_and_upload(capture, Vec::new(), root.path(), &cache, meta, &key,
-                limits(128 * 1024), &mut second_journal, &provider, &repository, &cancel).await.unwrap_err();
+                limits(128 * 1024), None, &mut second_journal, &provider, &repository, &cancel).await.unwrap_err();
             assert_eq!(error.kind, ErrorKind::Unauthorized);
             assert!(!provider.holds("snapshot-second"));
             assert!(provider.holds(&first.asset_catalog.object_id));
@@ -2660,7 +2738,7 @@ mod tests {
                 };
                 let mut journal = TransferJournal::open(&directory, identity.clone()).unwrap();
                 let completed = package_and_upload(capture, vec![], root.path(), &cache, meta, &key,
-                    limits(128 * 1024), &mut journal, &provider, &repository, &cancel).await.unwrap();
+                    limits(128 * 1024), None, &mut journal, &provider, &repository, &cancel).await.unwrap();
                 let missing = std::iter::once(&completed.reference).chain(completed.referenced_objects.iter())
                     .find(|object| object.role == role).unwrap().clone();
                 let ciphertext = std::fs::read(journal.spool_path(&missing.object_id)).unwrap();
@@ -2680,6 +2758,110 @@ mod tests {
         });
     }
 
+    /// An entry whose packs belong to the selected parent is admitted on that
+    /// membership alone. The tag moves with each publication, so the test also
+    /// covers a reused entry still being admissible under the next parent.
+    #[test]
+    fn c_entries_of_the_selected_parent_are_admitted_without_asking_the_provider() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let cache = root.path().join("cache");
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let key = [11; 32];
+            let cancel = Cancellation::default();
+            let mut published: Vec<CompletedSnapshot> = Vec::new();
+            for revision in 1..=3i64 {
+                let name = format!("parent-{revision}");
+                // One added asset per revision, so the catalog is rebuilt and
+                // the unchanged entries are the ones under test.
+                let capture = captured_asset_inventory(
+                    root.path(), &name, revision, 1, 1, 3 + revision as usize,
+                );
+                let meta = metadata(&name, &capture);
+                let mut transfer = journal(&root.path().join(&name), &name, &capture);
+                let parent = published
+                    .last()
+                    .map(|previous| parent_graph(previous, &repository))
+                    .transpose()
+                    .unwrap();
+                let reads = provider.read_count();
+                let completed = package_and_upload(
+                    capture, vec![], root.path(), &cache, meta, &key, limits(128 * 1024),
+                    parent.as_ref(), &mut transfer, &provider, &repository, &cancel,
+                ).await.unwrap();
+                if revision > 1 {
+                    assert_eq!(provider.read_count(), reads);
+                }
+                published.push(completed);
+            }
+            let packs: Vec<Vec<String>> = published
+                .iter()
+                .map(|completed| {
+                    let mut ids: Vec<String> = completed.referenced_objects.iter()
+                        .filter(|object| object.role == ObjectRole::Pack)
+                        .map(|object| object.object_id.clone())
+                        .collect();
+                    ids.sort();
+                    ids
+                })
+                .collect();
+            let carried: Vec<&String> = packs[0]
+                .iter()
+                .filter(|id| packs[1].contains(id) && packs[2].contains(id))
+                .collect();
+            assert!(!carried.is_empty());
+            for id in carried {
+                assert_eq!(provider.upload_attempts(id), 1);
+            }
+
+            // The same growth published twice, once under the parent that owns
+            // those entries and once under one that no longer does. Only the
+            // second has to establish that their packs are still there.
+            let mut reads = Vec::new();
+            for (name, parent) in [("fresh", &published[2]), ("stale", &published[0])] {
+                let capture = captured_asset_inventory(root.path(), name, 4, 1, 1, 7);
+                let meta = metadata(name, &capture);
+                let mut transfer = journal(&root.path().join(name), name, &capture);
+                let graph = parent_graph(parent, &repository).unwrap();
+                let before = provider.read_count();
+                package_and_upload(
+                    capture, vec![], root.path(), &cache, meta, &key, limits(128 * 1024),
+                    Some(&graph), &mut transfer, &provider, &repository, &cancel,
+                ).await.unwrap();
+                reads.push(provider.read_count() - before);
+            }
+            assert_eq!(reads[0], 0);
+            assert!(reads[1] > 0, "{reads:?}");
+        });
+    }
+
+    /// The parent is durable on the job before anything reuses it, so a
+    /// cleanup that finds the job stopped protects what it is reading.
+    #[test]
+    fn c_a_selected_parent_is_recorded_on_the_job_for_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = fake::repository();
+        let (capture, _) = captured(root.path(), "recorded", 1, b"record", b"asset");
+        let directory = root.path().join("recorded-job");
+        let transfer = journal(&directory, "recorded-job", &capture);
+        assert!(TransferJournal::parent(&directory).unwrap().is_empty());
+        let first = super::super::reachability::tests::object("catalog-a", ObjectRole::Catalog).stored(&repository).unwrap();
+        let second = super::super::reachability::tests::object("catalog-b", ObjectRole::Catalog).stored(&repository).unwrap();
+        let graph = ParentGraph::new(vec![first.clone(), second.clone()], &repository).unwrap();
+        transfer.record_parent(graph.stored()).unwrap();
+        assert_eq!(TransferJournal::parent(&directory).unwrap(), vec![first, second]);
+        // A pack is never a parent root; only a catalog names a graph.
+        assert_eq!(
+            ParentGraph::new(
+                vec![super::super::reachability::tests::object("pack-a", ObjectRole::Pack).stored(&repository).unwrap()],
+                &repository,
+            ).unwrap_err().kind,
+            ErrorKind::Corrupt,
+        );
+        assert_eq!(ParentGraph::new(vec![], &repository).unwrap_err().kind, ErrorKind::Corrupt);
+    }
+
     #[test]
     fn c_changed_opaque_locator_requires_repackaging_instead_of_publishing_stale_parents() {
         runtime().block_on(async {
@@ -2693,7 +2875,7 @@ mod tests {
             let meta = metadata("snapshot", &capture);
             let mut journal = journal(&root.path().join("job"), "job", &capture);
             let completed = package_and_upload(capture, vec![], root.path(), &cache, meta, &key,
-                limits(128 * 1024), &mut journal, &provider, &repository, &cancel).await.unwrap();
+                limits(128 * 1024), None, &mut journal, &provider, &repository, &cancel).await.unwrap();
             let missing = completed.referenced_objects.iter().find(|object| object.role == ObjectRole::Pack).unwrap();
             let original = std::fs::read(journal.spool_path(&missing.object_id)).unwrap();
             provider.forget(&missing.receipt.locator.object);
@@ -2711,7 +2893,7 @@ mod tests {
             let meta = metadata("replacement-snapshot", &capture);
             let mut replacement_journal = self::journal(&root.path().join("replacement-job"), "replacement-job", &capture);
             let replacement = package_and_upload(capture, vec![], root.path(), &cache, meta, &key,
-                limits(128 * 1024), &mut replacement_journal, &provider, &repository, &cancel).await.unwrap();
+                limits(128 * 1024), None, &mut replacement_journal, &provider, &repository, &cancel).await.unwrap();
             assert_eq!(provider.upload_attempts(&missing.object_id), 2);
             for object in replacement.referenced_objects.iter().filter(|object| object.role == ObjectRole::Pack) {
                 assert!(completed.referenced_objects.iter().any(|previous| previous.object_id == object.object_id));
@@ -3049,6 +3231,7 @@ mod tests {
                 snapshot_metadata,
                 &[4; 32],
                 limits(8 * 1024),
+                None,
                 &mut journal,
                 &provider,
                 &repository,
@@ -3128,6 +3311,7 @@ mod tests {
                 snapshot_metadata,
                 &[4; 32],
                 limits(8 * 1024),
+                None,
                 &mut journal,
                 &FakeProvider::new(false),
                 &fake::repository(),
@@ -3164,6 +3348,7 @@ mod tests {
                 first_metadata,
                 &key,
                 limits(512 * 1024),
+                None,
                 &mut first_journal,
                 &provider,
                 &repository,
@@ -3240,6 +3425,7 @@ mod tests {
             let cache = root.path().join("growing-cache");
             let mut steady = Vec::new();
             let mut packs = 0;
+            let mut published: Option<CompletedSnapshot> = None;
             for revision in 1..=3i64 {
                 let capture_id = format!("growing-capture-{revision}");
                 let job_id = format!("growing-job-{revision}");
@@ -3258,8 +3444,13 @@ mod tests {
                     provider.upload_count(),
                     provider.state.lock().unwrap().objects.len(),
                 );
+                let parent = published
+                    .as_ref()
+                    .map(|previous| parent_graph(previous, &repository))
+                    .transpose()
+                    .unwrap();
                 let started = std::time::Instant::now();
-                package_and_upload(
+                let completed = package_and_upload(
                     capture,
                     Vec::new(),
                     root.path(),
@@ -3267,6 +3458,7 @@ mod tests {
                     snapshot_metadata,
                     &key,
                     limits(512 * 1024),
+                    parent.as_ref(),
                     &mut transfer,
                     &provider,
                     &repository,
@@ -3274,6 +3466,20 @@ mod tests {
                 )
                 .await
                 .unwrap();
+                let elapsed = started.elapsed().as_millis();
+                // What a publication actually costs includes its own check,
+                // which walks the published catalogs whether or not their
+                // entries were admitted.
+                let verify_before = provider.read_count();
+                assert_eq!(
+                    verify_publication(
+                        &completed, root.path(), &cache, &mut transfer, &key, &provider,
+                        &repository, &Cancellation::default(),
+                    ).await.unwrap(),
+                    PublicationReadiness::Verified,
+                );
+                let verified = provider.read_count() - verify_before;
+                published = Some(completed);
                 let (objects_now, packs_now) = {
                     let state = provider.state.lock().unwrap();
                     (
@@ -3283,15 +3489,16 @@ mod tests {
                 };
                 packs = packs_now;
                 steady.push((
-                    provider.read_count() - before.0,
+                    provider.read_count() - before.0 - verified,
                     provider.upload_count() - before.1,
                     objects_now - before.2,
-                    started.elapsed().as_millis(),
+                    elapsed,
+                    verified,
                 ));
             }
-            for (revision, (reads, uploads, objects, elapsed)) in steady.iter().enumerate() {
+            for (revision, (reads, uploads, objects, elapsed, verified)) in steady.iter().enumerate() {
                 eprintln!(
-                    "revision={} assets={} packs={packs} provider_reads={reads} provider_uploads={uploads} new_objects={objects} publication_ms={elapsed}",
+                    "revision={} assets={} packs={packs} provider_reads={reads} check_reads={verified} provider_uploads={uploads} new_objects={objects} publication_ms={elapsed}",
                     revision + 1,
                     5_001 + revision,
                 );
@@ -3338,6 +3545,7 @@ mod tests {
                     snapshot_metadata,
                     &key,
                     limits(128 * 1024),
+                    None,
                     &mut transfer,
                     &provider,
                     &repository,
@@ -3407,13 +3615,13 @@ mod tests {
             let meta = metadata("first", &capture);
             let mut first_journal = journal(&root.path().join("first-job"), "first-job", &capture);
             let first = package_and_upload(capture, vec![], root.path(), &cache, meta, &key,
-                limits(128 * 1024), &mut first_journal, &provider, &repository, &cancel).await.unwrap();
+                limits(128 * 1024), None, &mut first_journal, &provider, &repository, &cancel).await.unwrap();
             let before = provider.state.lock().unwrap().body_bytes.clone();
             let (capture, _) = captured(root.path(), "second", 2, b"changed record", b"asset");
             let meta = metadata("second", &capture);
             let mut second_journal = journal(&root.path().join("second-job"), "second-job", &capture);
             let second = package_and_upload(capture, vec![], root.path(), &cache, meta, &key,
-                limits(128 * 1024), &mut second_journal, &provider, &repository, &cancel).await.unwrap();
+                limits(128 * 1024), None, &mut second_journal, &provider, &repository, &cancel).await.unwrap();
             assert_eq!(verify_publication(&second, root.path(), &cache, &mut second_journal, &key,
                 &provider, &repository, &cancel).await.unwrap(), PublicationReadiness::Verified);
             let pack = second.referenced_objects.iter().find(|object| object.role == ObjectRole::Pack

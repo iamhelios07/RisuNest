@@ -566,6 +566,21 @@ async fn package_capture(
         ),
         None => None,
     };
+    // Selected and recorded before anything reuses it, so a cleanup that finds
+    // this job stopped still protects the graph it is reading from.
+    let parent_graph = match &parent {
+        Some(view) => {
+            let mut roots = vec![
+                view.library.record_catalog.clone(),
+                view.library.asset_catalog.clone(),
+            ];
+            roots.extend(view.sections.values().map(|section| section.entries_root.clone()));
+            let graph = super::packaging::ParentGraph::new(roots, &connected.handle)?;
+            journal.record_parent(graph.stored())?;
+            Some(graph)
+        }
+        None => None,
+    };
     let generation = match &parent {
         Some(view) => Sequence::try_from(view.revision.clone())
             .map_err(corrupt)?
@@ -633,6 +648,7 @@ async fn package_capture(
         metadata,
         &connected.root_key,
         PackageLimits::from_capabilities(&connected.stored.capabilities)?,
+        parent_graph.as_ref(),
         &mut journal,
         connected.provider.as_ref(),
         &connected.handle,

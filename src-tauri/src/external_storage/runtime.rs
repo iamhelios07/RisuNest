@@ -1480,6 +1480,9 @@ async fn run_backup(
         metadata,
         &connected.root_key,
         PackageLimits::from_capabilities(&connected.stored.capabilities)?,
+        // A backup selects no parent yet, so its cached entries are admitted
+        // only while their packs answer for themselves.
+        None,
         &mut journal,
         connected.provider.as_ref(),
         &connected.handle,

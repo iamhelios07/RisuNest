@@ -371,6 +371,7 @@ fn daily_download_resume_preserves_verified_packs_and_durable_budget() {
             metadata,
             &root_key,
             limits,
+            None,
             &mut journal,
             provider.as_ref(),
             &repository,

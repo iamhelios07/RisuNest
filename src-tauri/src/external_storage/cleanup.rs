@@ -541,7 +541,7 @@ pub(crate) struct UnfinishedJob {
     pub references: Vec<RemoteObject>,
 }
 
-fn job_roots_of(unfinished: &[UnfinishedJob]) -> Result<JobRoots> {
+fn job_roots_of(unfinished: &[UnfinishedJob], repository: &RepositoryHandle) -> Result<JobRoots> {
     let mut roots = JobRoots::default();
     for job in unfinished {
         roots.snapshot_ids.extend(job.snapshot_ids.iter().cloned());
@@ -551,6 +551,13 @@ fn job_roots_of(unfinished: &[UnfinishedJob]) -> Result<JobRoots> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(_) => return Err(ProviderError::new(ErrorKind::Transient)),
             Ok(_) => roots.objects.extend(TransferJournal::uploaded(&job.directory, &job.job_id)?),
+        }
+    }
+    // A stopped publication is still entitled to the parent it selected, and
+    // its own inventory does not name what it reused without uploading.
+    for job in unfinished {
+        for root in TransferJournal::parent(&job.directory)? {
+            roots.references.push(super::packaging::RemoteObject::from_stored(&root, repository)?);
         }
     }
     roots.objects.sort_by_key(|object| locator_key(&object.locator).unwrap_or_default());
@@ -755,7 +762,7 @@ impl RepositoryView for ConnectedRepositoryView<'_> {
             }
         })
     }
-    fn job_roots(&self) -> Result<JobRoots> { job_roots_of(&self.unfinished) }
+    fn job_roots(&self) -> Result<JobRoots> { job_roots_of(&self.unfinished, &self.connected.handle) }
     fn confirmed_removed(&self, object: &RemoteObject) -> Result<()> {
         package_cache::forget_remote_object(self.cache_root, &self.connected.handle, object)
     }
@@ -1367,6 +1374,27 @@ mod tests {
             assert_eq!(h.provider.delete_attempts("child-pack"), 0);
         });
     }
+    /// A publication that stopped still holds the parent it selected, and the
+    /// graph beneath that parent is what it is reusing.
+    #[test]
+    fn c_a_stopped_job_keeps_protecting_the_parent_it_recorded() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = fake::repository();
+        let jobs = vec![UnfinishedJob {
+            job_id: "job".into(), directory: directory.path().into(),
+            snapshot_ids: BTreeSet::new(), references: Vec::new(),
+        }];
+        assert!(job_roots_of(&jobs, &repository).unwrap().references.is_empty());
+        let parent = object("parent-catalog", ObjectRole::Catalog);
+        std::fs::write(
+            directory.path().join("parent.json"),
+            serde_json::to_vec(&vec![parent.stored(&repository).unwrap()]).unwrap(),
+        ).unwrap();
+        assert_eq!(job_roots_of(&jobs, &repository).unwrap().references, vec![parent]);
+        std::fs::write(directory.path().join("parent.json"), b"broken parent").unwrap();
+        assert!(job_roots_of(&jobs, &repository).is_err());
+    }
+
     #[test]
     fn c_corrupt_job_journal_is_not_silently_dropped_from_protected_roots() {
         let directory = tempfile::tempdir().unwrap();
@@ -1374,9 +1402,9 @@ mod tests {
             job_id: "job".into(), directory: directory.path().into(),
             snapshot_ids: BTreeSet::new(), references: Vec::new(),
         }];
-        assert!(job_roots_of(&jobs).unwrap().objects.is_empty());
+        assert!(job_roots_of(&jobs, &fake::repository()).unwrap().objects.is_empty());
         std::fs::write(directory.path().join("transfers.sqlite"), b"broken journal").unwrap();
-        assert!(job_roots_of(&jobs).is_err());
+        assert!(job_roots_of(&jobs, &fake::repository()).is_err());
     }
     #[test]
     fn c_root_identity_compares_bytes_and_locators_not_only_identifiers() {
