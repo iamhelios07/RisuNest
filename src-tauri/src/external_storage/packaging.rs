@@ -9,7 +9,7 @@ use super::{
     },
     connection_store::{ConnectionStore, UnusableReason},
     journal::{validate_receipt, TransferJournal},
-    package_cache::{kind_name, PackageCache},
+    package_cache::{kind_name, CatalogRange, PackageCache},
     sections::CapturedSection,
     transfer::SpoolSink,
     transfer_job,
@@ -339,6 +339,13 @@ pub(crate) enum CatalogRoot {
 }
 
 impl CatalogRoot {
+    pub(super) fn key(&self) -> String {
+        match self {
+            Self::Records => "records".into(),
+            Self::Assets => "assets".into(),
+            Self::Section(id) => format!("section/{id}"),
+        }
+    }
     pub(super) fn kind(&self) -> wire::CatalogKind {
         match self {
             Self::Records => wire::CatalogKind::Records,
@@ -1458,6 +1465,165 @@ fn unique_packs(
         .collect()
 }
 
+/// One published catalog by level: the key range each node covered, in the
+/// order that level was published in.
+#[derive(Debug, Default)]
+pub(super) struct CatalogShape {
+    levels: BTreeMap<u16, Vec<(String, String)>>,
+}
+
+impl CatalogShape {
+    fn of(ranges: Vec<CatalogRange>) -> Self {
+        let mut levels: BTreeMap<u16, Vec<(String, String)>> = BTreeMap::new();
+        for range in ranges {
+            levels
+                .entry(range.level)
+                .or_default()
+                .push((range.first_key, range.last_key));
+        }
+        Self { levels }
+    }
+    fn level(&self, level: u16) -> &[(String, String)] {
+        self.levels
+            .get(&level)
+            .map(|ranges| ranges.as_slice())
+            .unwrap_or_default()
+    }
+}
+
+/// Which node of the previous catalog a key belongs to. A key below every
+/// range joins the first node, a key above every range joins the last, and a
+/// key in a gap joins the node before it, so the same key lands in the same
+/// node every time.
+fn previous_node(ranges: &[(String, String)], key: &str) -> usize {
+    match ranges.binary_search_by(|(first, _)| first.as_str().cmp(key)) {
+        Ok(index) => index,
+        Err(0) => 0,
+        Err(index) => index - 1,
+    }
+}
+
+fn fits_under<T>(
+    items: &[T],
+    bucket: (usize, usize),
+    limit: u64,
+    size: &StoredSize<'_>,
+    document: &impl Fn(&[T]) -> Result<wire::CatalogDocument>,
+) -> Result<bool> {
+    Ok(
+        measure_catalog(document(&items[bucket.0..bucket.1])?, size)?
+            .is_some_and(|encoded| (encoded.bytes.len() as u64) < limit),
+    )
+}
+
+/// A node that no longer fits is split into even parts rather than filled to
+/// the brim and left with a stub, so the next entry that lands in it has room
+/// without splitting it again.
+fn even_split<T>(
+    items: &[T],
+    size: &StoredSize<'_>,
+    document: &impl Fn(&[T]) -> Result<wire::CatalogDocument>,
+) -> Result<Vec<EncodedCatalog>> {
+    let greedy = catalog_batches(items, size, document)?;
+    if greedy.len() < 2 {
+        return Ok(greedy);
+    }
+    for parts in greedy.len()..=greedy.len().saturating_add(2) {
+        if parts > items.len() {
+            break;
+        }
+        let mut even = Vec::with_capacity(parts);
+        let mut start = 0;
+        for part in 1..=parts {
+            let end = if part == parts {
+                items.len()
+            } else {
+                (items.len() * part / parts).max(start + 1).min(items.len())
+            };
+            match measure_catalog(document(&items[start..end])?, size)? {
+                Some(encoded) => even.push(encoded),
+                None => {
+                    even.clear();
+                    break;
+                }
+            }
+            start = end;
+        }
+        if even.len() == parts && start == items.len() {
+            return Ok(even);
+        }
+    }
+    Ok(greedy)
+}
+
+/// Build one level the way the last publication built it. Every item goes to
+/// the node whose range already covers its key, a node that no longer fits
+/// splits inside its own range, and a node left with nothing disappears, so
+/// only the nodes a change reached encode to new bytes. Without a previous
+/// shape this is the plain greedy fill.
+fn stable_batches<T>(
+    items: &[T],
+    ranges: &[(String, String)],
+    size: &StoredSize<'_>,
+    key_of: impl Fn(&T) -> &str,
+    document: impl Fn(&[T]) -> Result<wire::CatalogDocument>,
+) -> Result<Vec<EncodedCatalog>> {
+    if ranges.is_empty() || items.is_empty() {
+        return catalog_batches(items, size, document);
+    }
+    // The complete run of items sharing one key is the unit, so a key that
+    // spans nodes still has one place it belongs.
+    let mut buckets: Vec<(usize, usize)> = Vec::new();
+    let mut index = 0;
+    let mut current: Option<usize> = None;
+    let mut start = 0;
+    while index < items.len() {
+        let key = key_of(&items[index]);
+        let mut end = index + 1;
+        while end < items.len() && key_of(&items[end]) == key {
+            end += 1;
+        }
+        let node = previous_node(ranges, key);
+        match current {
+            Some(previous) if previous == node => {}
+            Some(_) => {
+                buckets.push((start, index));
+                start = index;
+                current = Some(node);
+            }
+            None => {
+                start = index;
+                current = Some(node);
+            }
+        }
+        index = end;
+    }
+    buckets.push((start, items.len()));
+    // Two nodes that have both shrunk are merged when the result still fits,
+    // so removals do not leave a catalog of stubs behind. Only the pair
+    // changes; nothing after them moves.
+    let half = size.limits.target_plaintext_bytes / 2;
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for bucket in buckets {
+        if let Some(previous) = merged.last().copied() {
+            if fits_under(items, previous, half, size, &document)?
+                && fits_under(items, bucket, half, size, &document)?
+                && measure_catalog(document(&items[previous.0..bucket.1])?, size)?.is_some()
+            {
+                merged.pop();
+                merged.push((previous.0, bucket.1));
+                continue;
+            }
+        }
+        merged.push(bucket);
+    }
+    let mut result = Vec::new();
+    for (start, end) in merged {
+        result.extend(even_split(&items[start..end], size, &document)?);
+    }
+    Ok(result)
+}
+
 const TARGET_CATALOG_FRAGMENTS: usize = 512;
 
 struct EncodedCatalog {
@@ -1525,6 +1691,7 @@ async fn build_catalog(
     root_key: &[u8; 32],
     limits: PackageLimits,
     parent: Option<&BTreeSet<String>>,
+    shape: Option<&CatalogShape>,
     cache: &mut PackageCache,
     evidence: &mut ObjectEvidence,
     journal: &mut TransferJournal,
@@ -1548,9 +1715,15 @@ async fn build_catalog(
         ).await? {
             let current = objects.first().cloned().ok_or_else(|| corrupt("empty catalog closure"))?;
             referenced.extend(objects);
-            record_published_graph(
-                &entries, &referenced[mark..], &current, kind, format_repository_id, cache,
+            // What the cached root covered is what the repaired one covers.
+            let carried = cache.shape_of(
+                format_repository_id,
                 repository,
+                &super::reachability::object_identity(&root, repository)?,
+            )?;
+            record_published_graph(
+                &entries, &referenced[mark..], &current, kind, format_repository_id, &carried,
+                cache, repository,
             )?;
             return Ok(current);
         }
@@ -1582,10 +1755,17 @@ async fn build_catalog(
             });
         }
     }
-    let leaves = catalog_batches(&fragments, &size, |leaf| {
-        wire::CatalogDocument::leaf(kind, leaf.to_vec(), unique_packs(leaf, &available_packs)?)
-            .map_err(corrupt)
-    })?;
+    let leaves = stable_batches(
+        &fragments,
+        shape.map(|shape| shape.level(0)).unwrap_or_default(),
+        &size,
+        |fragment| fragment.key.as_str(),
+        |leaf| {
+            wire::CatalogDocument::leaf(kind, leaf.to_vec(), unique_packs(leaf, &available_packs)?)
+                .map_err(corrupt)
+        },
+    )?;
+    let mut built: Vec<CatalogRange> = Vec::new();
     let mut nodes = Vec::new();
     for EncodedCatalog { document, bytes } in leaves {
         let remote = match admitted_node(
@@ -1613,6 +1793,11 @@ async fn build_catalog(
             }
         };
         referenced.push(remote.clone());
+        built.push(CatalogRange {
+            level: 0,
+            first_key: document.first_key.clone(),
+            last_key: document.last_key.clone(),
+        });
         nodes.push(wire::CatalogChild {
             first_key: document.first_key,
             last_key: document.last_key,
@@ -1623,9 +1808,13 @@ async fn build_catalog(
     while nodes.len() > 1 {
         let previous_count = nodes.len();
         let mut next = Vec::new();
-        let batches = catalog_batches(&nodes, &size, |children| {
-            wire::CatalogDocument::branch(kind, level, children.to_vec()).map_err(corrupt)
-        })?;
+        let batches = stable_batches(
+            &nodes,
+            shape.map(|shape| shape.level(level)).unwrap_or_default(),
+            &size,
+            |child| child.first_key.as_str(),
+            |children| wire::CatalogDocument::branch(kind, level, children.to_vec()).map_err(corrupt),
+        )?;
         for EncodedCatalog { document, bytes } in batches {
             let remote = match admitted_node(
                 &bytes, parent, format_repository_id, cache, evidence, repository,
@@ -1652,6 +1841,11 @@ async fn build_catalog(
                 }
             };
             referenced.push(remote.clone());
+            built.push(CatalogRange {
+                level,
+                first_key: document.first_key.clone(),
+                last_key: document.last_key.clone(),
+            });
             next.push(wire::CatalogChild {
                 first_key: document.first_key,
                 last_key: document.last_key,
@@ -1676,7 +1870,8 @@ async fn build_catalog(
     )?;
     cache.put_catalog(repository, kind, fingerprint, &root)?;
     record_published_graph(
-        &entries, &referenced[mark..], &root, kind, format_repository_id, cache, repository,
+        &entries, &referenced[mark..], &root, kind, format_repository_id, &built, cache,
+        repository,
     )?;
     Ok(root)
 }
@@ -1747,12 +1942,14 @@ fn admitted_node(
 /// nodes beneath it, each by the identity that names one exact remote object.
 /// A locator repaired since an entry was written produces a different identity
 /// and simply does not match, which is the conservative direction.
+#[allow(clippy::too_many_arguments)]
 fn record_published_graph(
     entries: &[EntryPlan],
     added: &[RemoteObject],
     root: &RemoteObject,
     kind: wire::CatalogKind,
     format_repository_id: &str,
+    shape: &[CatalogRange],
     cache: &PackageCache,
     repository: &RepositoryHandle,
 ) -> Result<()> {
@@ -1770,6 +1967,7 @@ fn record_published_graph(
         kind,
         &super::reachability::object_identity(root, repository)?,
         &members,
+        shape,
     )
 }
 
@@ -1847,6 +2045,7 @@ pub(crate) async fn package_and_upload(
     // Read once for the whole publication. Nothing known about the selected
     // parent means nothing is admitted on its account, so a cache that never
     // saw this parent rebuilds what it names before the first reuse decision.
+    let mut shapes: BTreeMap<String, CatalogShape> = BTreeMap::new();
     let members = match parent {
         Some(graph) => {
             super::cache_hydration::hydrate_parent(
@@ -1860,6 +2059,17 @@ pub(crate) async fn package_and_upload(
                 cancel,
             )
             .await?;
+            for (label, root) in graph.roots() {
+                let identity = super::reachability::object_identity(root, repository)?;
+                shapes.insert(
+                    label.key(),
+                    CatalogShape::of(cache.shape_of(
+                        &metadata.repository_id,
+                        repository,
+                        &identity,
+                    )?),
+                );
+            }
             Some(cache.members_of(&metadata.repository_id, repository, graph.identities())?)
         }
         None => None,
@@ -1912,6 +2122,7 @@ pub(crate) async fn package_and_upload(
         root_key,
         limits,
         members.as_ref(),
+        shapes.get("records"),
         &mut cache,
         &mut evidence,
         journal,
@@ -1979,6 +2190,7 @@ pub(crate) async fn package_and_upload(
             root_key,
             limits,
             members.as_ref(),
+            shapes.get("assets"),
             &mut cache,
             &mut evidence,
             journal,
@@ -2057,6 +2269,7 @@ pub(crate) async fn package_and_upload(
             root_key,
             limits,
             members.as_ref(),
+            shapes.get(&format!("section/{id}")),
             &mut cache,
             &mut evidence,
             journal,
@@ -3334,6 +3547,73 @@ mod tests {
         );
     }
 
+    /// Where a key belongs when the published ranges do not cover it. The
+    /// answer has to be the same every time, or the node it lands in is
+    /// rebuilt for nothing.
+    #[test]
+    fn c_a_key_outside_every_published_range_joins_the_node_next_to_it() {
+        let ranges = vec![
+            ("b".to_string(), "d".to_string()),
+            ("g".to_string(), "i".to_string()),
+        ];
+        assert_eq!(previous_node(&ranges, "a"), 0);
+        assert_eq!(previous_node(&ranges, "b"), 0);
+        assert_eq!(previous_node(&ranges, "c"), 0);
+        assert_eq!(previous_node(&ranges, "d"), 0);
+        // A key between two nodes joins the one before it rather than sitting
+        // between them.
+        assert_eq!(previous_node(&ranges, "e"), 0);
+        assert_eq!(previous_node(&ranges, "g"), 1);
+        assert_eq!(previous_node(&ranges, "z"), 1);
+    }
+
+    /// One entry changing used to move every node after it. The leaves are
+    /// filled from the front, and an entry that moves to a new pack makes its
+    /// leaf carry one more pack reference, which pushes an entry out of it and
+    /// every entry after that out of theirs.
+    #[test]
+    fn c_a_changed_entry_rebuilds_the_node_it_is_in_and_not_the_ones_after_it() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let key = [41; 32];
+            let cancel = Cancellation::default();
+            let cache = root.path().join("cache");
+            let mut published: Vec<CompletedSnapshot> = Vec::new();
+            let mut uploads = Vec::new();
+            for edited in [0usize, 1] {
+                let name = format!("stable-{edited}");
+                // The first record changes, so the node it is in is the first
+                // of many and everything after it used to follow.
+                let capture = captured_asset_inventory(
+                    root.path(), &name, published.len() as i64 + 1, 128, edited, 2,
+                );
+                let meta = metadata(&name, &capture);
+                let mut transfer = journal(&root.path().join(&name), &name, &capture);
+                let parent = published
+                    .last()
+                    .map(|previous| parent_graph(previous, &repository))
+                    .transpose()
+                    .unwrap();
+                let before = provider.upload_count();
+                published.push(package_and_upload(
+                    capture, vec![], root.path(), &cache, meta, &key, limits(8 * 1024),
+                    parent.as_ref(), &mut transfer, &provider, &repository, &cancel,
+                ).await.unwrap());
+                uploads.push(
+                    provider.uploaded_ids()[before..].iter()
+                        .filter(|id| id.starts_with("catalog-"))
+                        .count(),
+                );
+            }
+            assert!(uploads[0] > 8, "the record catalog has to have leaves: {uploads:?}");
+            assert!(uploads[1] * 2 <= uploads[0], "rebuilt {uploads:?}");
+            assert_ne!(published[1].record_catalog, published[0].record_catalog);
+            assert_eq!(published[1].asset_catalog, published[0].asset_catalog);
+        });
+    }
+
     /// A catalog that changes still holds nodes it held before. Uploading
     /// those again under this job's own identity publishes the same bytes
     /// twice for nothing.
@@ -4123,7 +4403,8 @@ mod tests {
             let mut steady = Vec::new();
             let mut packs = 0;
             let mut published: Option<CompletedSnapshot> = None;
-            for revision in 1..=6i64 {
+            const REVISIONS: i64 = 20;
+            for revision in 1..=REVISIONS {
                 let capture_id = format!("growing-capture-{revision}");
                 let job_id = format!("growing-job-{revision}");
                 let capture = captured_asset_inventory(
@@ -4136,11 +4417,7 @@ mod tests {
                 );
                 let snapshot_metadata = metadata(&format!("growing-snapshot-{revision}"), &capture);
                 let mut transfer = journal(&root.path().join(&job_id), &job_id, &capture);
-                let before = (
-                    provider.read_count(),
-                    provider.upload_count(),
-                    provider.state.lock().unwrap().objects.len(),
-                );
+                let before = (provider.read_count(), provider.upload_count());
                 let parent = published
                     .as_ref()
                     .map(|previous| parent_graph(previous, &repository))
@@ -4177,25 +4454,25 @@ mod tests {
                 );
                 let verified = provider.read_count() - verify_before;
                 published = Some(completed);
-                let (objects_now, packs_now) = {
-                    let state = provider.state.lock().unwrap();
-                    (
-                        state.objects.len(),
-                        state.objects.keys().filter(|id| id.starts_with("pack-")).count(),
-                    )
-                };
-                packs = packs_now;
+                packs = provider.state.lock().unwrap().objects.keys()
+                    .filter(|id| id.starts_with("pack-")).count();
+                let added = provider.uploaded_ids()[before.1..].to_vec();
+                let nodes = published.as_ref().map(|value: &CompletedSnapshot| {
+                    value.referenced_objects.iter()
+                        .filter(|object| object.role == ObjectRole::Catalog).count()
+                }).unwrap_or_default();
                 steady.push((
                     provider.read_count() - before.0 - verified,
                     provider.upload_count() - before.1,
-                    objects_now - before.2,
+                    added.iter().filter(|id| id.starts_with("catalog-")).count(),
                     elapsed,
                     verified,
+                    nodes,
                 ));
             }
-            for (revision, (reads, uploads, objects, elapsed, verified)) in steady.iter().enumerate() {
+            for (revision, (reads, uploads, objects, elapsed, verified, nodes)) in steady.iter().enumerate() {
                 eprintln!(
-                    "revision={} assets={} packs={packs} provider_reads={reads} check_reads={verified} provider_uploads={uploads} new_objects={objects} publication_ms={elapsed}",
+                    "revision={} assets={} packs={packs} provider_reads={reads} check_reads={verified} provider_uploads={uploads} catalog_uploads={objects} catalog_nodes={nodes} publication_ms={elapsed}",
                     revision + 1,
                     5_001 + revision,
                 );
@@ -4209,7 +4486,7 @@ mod tests {
                 let capture_id = format!("growing-capture-{name}");
                 let job_id = format!("growing-job-{name}");
                 let capture = captured_asset_inventory(
-                    root.path(), &capture_id, 3, 1, 1, 5_003,
+                    root.path(), &capture_id, REVISIONS, 1, 1, 5_000 + REVISIONS as usize,
                 );
                 let snapshot_metadata = metadata(&format!("growing-snapshot-{name}"), &capture);
                 let mut transfer = journal(&root.path().join(&job_id), &job_id, &capture);
@@ -4221,7 +4498,8 @@ mod tests {
                     &provider, &repository, &Cancellation::default(),
                 ).await.unwrap();
                 eprintln!(
-                    "{name} assets=5003 provider_reads={} provider_uploads={} publication_ms={}",
+                    "{name} assets={} provider_reads={} provider_uploads={} publication_ms={}",
+                    5_000 + REVISIONS,
                     provider.read_count() - before.0,
                     provider.upload_count() - before.1,
                     started.elapsed().as_millis(),

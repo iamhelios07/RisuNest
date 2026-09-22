@@ -7,7 +7,7 @@
 //! and would repackage and re-upload content the parent already carries.
 use super::{
     contract::{Cancellation, ErrorKind, Provider, RepositoryHandle, Result},
-    package_cache::PackageCache,
+    package_cache::{CatalogRange, PackageCache},
     packaging::{
         catalog_fingerprint_of, corrupt, section_fingerprint, transient, CatalogRoot, EntryPlan,
         ParentGraph, RemoteObject,
@@ -89,7 +89,7 @@ fn record_catalog(
     format_repository_id: &str,
     entries: Vec<snapshot_restore::CompleteEntry>,
     packs: &BTreeMap<String, RemoteObject>,
-    nodes: &[RemoteObject],
+    nodes: &[(RemoteObject, CatalogRange)],
     root: &RemoteObject,
     cache: &PackageCache,
     repository: &RepositoryHandle,
@@ -116,18 +116,26 @@ fn record_catalog(
         plans.push(plan);
     }
     cache.put_entries(format_repository_id, repository, kind, &plans)?;
-    for object in packs.values().chain(nodes) {
+    let objects = packs.values().chain(nodes.iter().map(|(object, _)| object));
+    for object in objects.clone() {
         cache.put_object(repository, object)?;
     }
     let mut members = BTreeMap::new();
-    for object in packs.values().chain(nodes) {
+    for object in objects {
         members.insert(
             super::reachability::object_identity(object, repository)?,
             object.stored(repository)?,
         );
     }
     let members: Vec<(String, wire::StoredObject)> = members.into_iter().collect();
-    cache.record_graph(format_repository_id, repository, kind, identity, &members)?;
+    // Depth-first order keeps the nodes of one level in the order that level
+    // was published in, which is the order the next publication assigns to.
+    let mut levels: BTreeMap<u16, Vec<CatalogRange>> = BTreeMap::new();
+    for (_, range) in nodes {
+        levels.entry(range.level).or_default().push(range.clone());
+    }
+    let shape: Vec<CatalogRange> = levels.into_values().flatten().collect();
+    cache.record_graph(format_repository_id, repository, kind, identity, &members, &shape)?;
     cache.put_catalog(repository, kind, &rebuilt_fingerprint(label, &plans), root)
 }
 

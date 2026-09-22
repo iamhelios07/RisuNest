@@ -3,6 +3,7 @@
 //! apply and eventual cleanup of this durable verified directory.
 use super::{
     content_store::ObjectSource,
+    package_cache::CatalogRange,
     contract::{
         Cancellation, ErrorKind, ObjectRole, Provider, ProviderError, ReadReceipt,
         RepositoryHandle, Result,
@@ -319,8 +320,10 @@ pub(super) struct CompleteEntry {
 }
 
 /// Everything one catalog names: its complete entries, the packs they point
-/// at, and the nodes the walk passed through. A restore only needs the first
-/// two, and rebuilding reuse metadata needs all three.
+/// at, and the nodes the walk passed through with the key range each covered.
+/// A restore only needs the first two, and rebuilding reuse metadata needs all
+/// three. Nodes arrive in depth-first order, which keeps the nodes of one
+/// level in the order that level was published in.
 pub(super) async fn read_catalog(
     root: &RemoteObject,
     expected_kind: wire::CatalogKind,
@@ -332,7 +335,7 @@ pub(super) async fn read_catalog(
 ) -> Result<(
     Vec<CompleteEntry>,
     BTreeMap<String, RemoteObject>,
-    Vec<RemoteObject>,
+    Vec<(RemoteObject, CatalogRange)>,
 )> {
     let mut stack = vec![root.clone()];
     let mut nodes = Vec::new();
@@ -365,7 +368,14 @@ pub(super) async fn read_catalog(
         if document.kind != expected_kind {
             return Err(corrupt("catalog kind differs"));
         }
-        nodes.push(object.clone());
+        nodes.push((
+            object.clone(),
+            CatalogRange {
+                level: document.level,
+                first_key: document.first_key.clone(),
+                last_key: document.last_key.clone(),
+            },
+        ));
         if document.level == 0 {
             for pack in document.packs {
                 let remote = RemoteObject::from_stored(&pack, repository)?;

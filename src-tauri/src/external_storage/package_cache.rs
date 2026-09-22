@@ -11,7 +11,21 @@ use super::{
 };
 use risunest_external_storage_format::snapshot as wire;
 use rusqlite::{params, Connection, OptionalExtension};
-use std::{collections::BTreeSet, fs, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+};
+
+/// One node of a published catalog, by the keys it covered. A later
+/// publication assigns its entries to these ranges so that a node nothing
+/// changed encodes to the bytes it encoded before.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CatalogRange {
+    pub(super) level: u16,
+    pub(super) first_key: String,
+    pub(super) last_key: String,
+}
 
 /// How many published graphs one connection keeps on hand, per catalog kind.
 const RETAINED_GRAPHS: i64 = 64;
@@ -62,6 +76,11 @@ impl PackageCache {
                catalog_kind TEXT NOT NULL, fingerprint TEXT NOT NULL,
                value TEXT NOT NULL,
                PRIMARY KEY(repository_id,connection_identity,catalog_kind,fingerprint));
+             CREATE TABLE IF NOT EXISTS catalog_shape(
+               repository_id TEXT NOT NULL, connection_identity TEXT NOT NULL,
+               root_identity TEXT NOT NULL, level INTEGER NOT NULL,
+               ordinal INTEGER NOT NULL, first_key TEXT NOT NULL, last_key TEXT NOT NULL,
+               PRIMARY KEY(repository_id,connection_identity,root_identity,level,ordinal));
              CREATE TABLE IF NOT EXISTS graph_members(
                repository_id TEXT NOT NULL, connection_identity TEXT NOT NULL,
                catalog_kind TEXT NOT NULL,
@@ -249,6 +268,7 @@ impl PackageCache {
         kind: wire::CatalogKind,
         root_identity: &str,
         members: &[(String, wire::StoredObject)],
+        shape: &[CatalogRange],
     ) -> Result<()> {
         if root_identity.is_empty() {
             return Err(corrupt("catalog root has no identity"));
@@ -263,6 +283,20 @@ impl PackageCache {
                     format_repository_id, repository.connection_identity, kind_name(kind),
                     root_identity, identity, serde_json::to_string(member).map_err(corrupt)?,
                 ]).map_err(transient)?;
+            }
+        }
+        {
+            let mut statement = transaction
+                .prepare("INSERT OR REPLACE INTO catalog_shape VALUES(?1,?2,?3,?4,?5,?6,?7)")
+                .map_err(transient)?;
+            let mut ordinal: BTreeMap<u16, i64> = BTreeMap::new();
+            for range in shape {
+                let next = ordinal.entry(range.level).or_default();
+                statement.execute(params![
+                    format_repository_id, repository.connection_identity, root_identity,
+                    i64::from(range.level), *next, range.first_key, range.last_key,
+                ]).map_err(transient)?;
+                *next += 1;
             }
         }
         // Only a recent root can still be selected as a parent, and a graph
@@ -280,8 +314,43 @@ impl PackageCache {
                 RETAINED_GRAPHS,
             ],
         ).map_err(transient)?;
+        transaction.execute(
+            "DELETE FROM catalog_shape WHERE repository_id=?1 AND connection_identity=?2
+             AND root_identity NOT IN (
+               SELECT root_identity FROM graph_members
+               WHERE repository_id=?1 AND connection_identity=?2)",
+            params![format_repository_id, repository.connection_identity],
+        ).map_err(transient)?;
         transaction.commit().map_err(transient)?;
         Ok(())
+    }
+
+    /// The key range each node of one published catalog covered, by level and
+    /// in order. Empty means this cache never recorded that root, so the next
+    /// catalog is built from scratch rather than assigned to its ranges.
+    pub(super) fn shape_of(
+        &self,
+        format_repository_id: &str,
+        repository: &RepositoryHandle,
+        root_identity: &str,
+    ) -> Result<Vec<CatalogRange>> {
+        let mut statement = self.db.prepare(
+            "SELECT level,first_key,last_key FROM catalog_shape WHERE repository_id=?1 AND connection_identity=?2 AND root_identity=?3 ORDER BY level,ordinal",
+        ).map_err(transient)?;
+        let rows = statement.query_map(
+            params![format_repository_id, repository.connection_identity, root_identity],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+        ).map_err(transient)?;
+        let mut ranges = Vec::new();
+        for row in rows {
+            let (level, first_key, last_key) = row.map_err(transient)?;
+            ranges.push(CatalogRange {
+                level: u16::try_from(level).map_err(corrupt)?,
+                first_key,
+                last_key,
+            });
+        }
+        Ok(ranges)
     }
 
     /// Whether this cache already holds what a root names, without reading
@@ -463,12 +532,12 @@ mod tests {
         };
         cache.record_graph(
             "format-repository", &repository, wire::CatalogKind::Assets, "asset-root",
-            &member("pack-assets"),
+            &member("pack-assets"), &[],
         ).unwrap();
         for index in 0..RETAINED_GRAPHS + 8 {
             cache.record_graph(
                 "format-repository", &repository, wire::CatalogKind::Records,
-                &format!("record-root-{index}"), &member(&format!("pack-records-{index}")),
+                &format!("record-root-{index}"), &member(&format!("pack-records-{index}")), &[],
             ).unwrap();
         }
         assert_eq!(
@@ -514,7 +583,7 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(
-            cache.record_graph("format-repository", &repository, wire::CatalogKind::Assets, "", &[])
+            cache.record_graph("format-repository", &repository, wire::CatalogKind::Assets, "", &[], &[])
                 .unwrap_err().kind,
             ErrorKind::Corrupt,
         );
