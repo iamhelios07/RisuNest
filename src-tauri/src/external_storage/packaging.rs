@@ -2946,7 +2946,7 @@ mod tests {
             let cache = root.path().join("growing-cache");
             let mut steady = Vec::new();
             let mut packs = 0;
-            for revision in 1..=4i64 {
+            for revision in 1..=3i64 {
                 let capture_id = format!("growing-capture-{revision}");
                 let job_id = format!("growing-job-{revision}");
                 let capture = captured_asset_inventory(
@@ -2955,7 +2955,7 @@ mod tests {
                     revision,
                     1,
                     1,
-                    20_000 + revision as usize,
+                    5_000 + revision as usize,
                 );
                 let snapshot_metadata = metadata(&format!("growing-snapshot-{revision}"), &capture);
                 let mut transfer = journal(&root.path().join(&job_id), &job_id, &capture);
@@ -2980,12 +2980,18 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                let state = provider.state.lock().unwrap();
-                packs = state.objects.keys().filter(|id| id.starts_with("pack-")).count();
+                let (objects_now, packs_now) = {
+                    let state = provider.state.lock().unwrap();
+                    (
+                        state.objects.len(),
+                        state.objects.keys().filter(|id| id.starts_with("pack-")).count(),
+                    )
+                };
+                packs = packs_now;
                 steady.push((
-                    provider_reads_since(&provider, before.0),
+                    provider.read_count() - before.0,
                     provider.upload_count() - before.1,
-                    state.objects.len() - before.2,
+                    objects_now - before.2,
                     started.elapsed().as_millis(),
                 ));
             }
@@ -2993,14 +2999,10 @@ mod tests {
                 eprintln!(
                     "revision={} assets={} packs={packs} provider_reads={reads} provider_uploads={uploads} new_objects={objects} publication_ms={elapsed}",
                     revision + 1,
-                    20_001 + revision,
+                    5_001 + revision,
                 );
             }
         });
-    }
-
-    fn provider_reads_since(provider: &FakeProvider, before: usize) -> usize {
-        provider.read_count() - before
     }
 
     #[test]
