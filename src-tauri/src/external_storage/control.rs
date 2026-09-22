@@ -904,24 +904,38 @@ async fn upload_control_object(
     if record.intent.role != role {
         return Err(corrupt("history journal role differs"));
     }
-    let mut recorded = crate::trust_boundary::open_regular_source(&spool).map_err(corrupt)?;
-    let mut recorded_bytes = Vec::new();
-    recorded.read_to_end(&mut recorded_bytes).map_err(corrupt)?;
-    if recorded_bytes.len() as u64 != record.intent.byte_length
-        || hex::encode(hash(&recorded_bytes)) != record.intent.sha256
-    {
-        return Err(corrupt("control journal bytes differ"));
-    }
-    let (recorded_plaintext, _, _, _) = open(
-        descriptor,
-        root_key,
-        Some(&object_id),
-        wire_role(role)?,
-        &recorded_bytes,
-        MAX_POINT_PLAINTEXT,
-    )?;
-    if recorded_plaintext != plaintext {
-        return Err(corrupt("control journal content differs"));
+    // A released object left no local bytes to compare. Every role the
+    // inventory carries was registered with its plaintext identity, which says
+    // the same thing, and a page is named by the members it covers.
+    if record.released {
+        if role != ObjectRole::InventoryPage {
+            let Some((length, digest)) = &record.plaintext else {
+                return Err(corrupt("released control object was never registered"));
+            };
+            if *length != plaintext.len() as u64 || digest != &plaintext_sha256 {
+                return Err(corrupt("control journal content differs"));
+            }
+        }
+    } else {
+        let mut recorded = crate::trust_boundary::open_regular_source(&spool).map_err(corrupt)?;
+        let mut recorded_bytes = Vec::new();
+        recorded.read_to_end(&mut recorded_bytes).map_err(corrupt)?;
+        if recorded_bytes.len() as u64 != record.intent.byte_length
+            || hex::encode(hash(&recorded_bytes)) != record.intent.sha256
+        {
+            return Err(corrupt("control journal bytes differ"));
+        }
+        let (recorded_plaintext, _, _, _) = open(
+            descriptor,
+            root_key,
+            Some(&object_id),
+            wire_role(role)?,
+            &recorded_bytes,
+            MAX_POINT_PLAINTEXT,
+        )?;
+        if recorded_plaintext != plaintext {
+            return Err(corrupt("control journal content differs"));
+        }
     }
     let receipt = if role == ObjectRole::InventoryPage {
         transfer_job::upload_inventory(journal, &object_id, provider, repository, cancel).await?

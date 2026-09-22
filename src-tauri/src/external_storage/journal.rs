@@ -66,6 +66,11 @@ pub(crate) struct TransferRecord {
     pub attempted: bool,
     pub resume: Option<ResumeState>,
     pub receipt: Option<ObjectReceipt>,
+    /// The ciphertext is durable remotely and no longer kept here.
+    pub released: bool,
+    /// What this object was registered as, for a caller that rebuilt the same
+    /// plaintext and needs no local ciphertext to prove it.
+    pub plaintext: Option<(u64, String)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,7 +166,7 @@ impl TransferJournal {
     /// A previous receipt is historical once a fresh remote observation says
     /// the object is missing. Keep its immutable source and upload session.
     pub(crate) fn reopen_object(&mut self, object: &str) -> Result<()> {
-        if self.db.execute("UPDATE objects SET receipt=NULL WHERE id=?1", [object])
+        if self.db.execute("UPDATE objects SET receipt=NULL WHERE id=?1 AND released=0", [object])
             .map_err(storage)? != 1
         {
             return Err(corrupt());
@@ -280,7 +285,7 @@ impl TransferJournal {
         if fresh {
             db.execute_batch("BEGIN IMMEDIATE;
                 CREATE TABLE identity(singleton INTEGER PRIMARY KEY CHECK(singleton=1), value TEXT NOT NULL);
-                CREATE TABLE objects(id TEXT PRIMARY KEY,intent TEXT NOT NULL,attempted INTEGER NOT NULL CHECK(attempted IN (0,1)),resume TEXT,receipt TEXT,page TEXT,plaintext_length INTEGER,plaintext_sha256 TEXT);").map_err(storage)?;
+                CREATE TABLE objects(id TEXT PRIMARY KEY,intent TEXT NOT NULL,attempted INTEGER NOT NULL CHECK(attempted IN (0,1)),resume TEXT,receipt TEXT,page TEXT,plaintext_length INTEGER,plaintext_sha256 TEXT,released INTEGER NOT NULL DEFAULT 0 CHECK(released IN (0,1)));").map_err(storage)?;
             db.execute(
                 "INSERT INTO identity VALUES(1,?1)",
                 [serde_json::to_string(&identity).map_err(storage)?],
@@ -299,12 +304,14 @@ impl TransferJournal {
         {
             return Err(corrupt());
         }
-        Ok(Self {
+        let journal = Self {
             db,
             directory: directory.into(),
             identity,
             verification: Default::default(),
-        })
+        };
+        journal.discard_released()?;
+        Ok(journal)
     }
 
     pub fn spool_path(&self, object_id: &str) -> PathBuf {
@@ -340,7 +347,7 @@ impl TransferJournal {
         }
         self.db
             .execute(
-                "INSERT INTO objects VALUES(?1,?2,0,NULL,NULL,NULL,NULL,NULL)",
+                "INSERT INTO objects VALUES(?1,?2,0,NULL,NULL,NULL,NULL,NULL,0)",
                 params![
                     intent.object_id,
                     serde_json::to_string(intent).map_err(storage)?
@@ -442,18 +449,42 @@ impl TransferJournal {
     }
 
     pub fn record(&self, object: &str) -> Result<Option<TransferRecord>> {
-        let row: Option<(String, bool, Option<String>, Option<String>)> = self
+        type Row = (
+            String,
+            bool,
+            Option<String>,
+            Option<String>,
+            bool,
+            Option<i64>,
+            Option<String>,
+        );
+        let row: Option<Row> = self
             .db
             .query_row(
-                "SELECT intent,attempted,resume,receipt FROM objects WHERE id=?1",
+                "SELECT intent,attempted,resume,receipt,released,plaintext_length,plaintext_sha256
+                 FROM objects WHERE id=?1",
                 [object],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
             )
             .optional()
             .map_err(storage)?;
-        let Some((intent, attempted, resume, receipt)) = row else {
+        let Some((intent, attempted, resume, receipt, released, length, digest)) = row else {
             return Ok(None);
         };
+        // Only a durable receipt can have released the ciphertext.
+        if released && receipt.is_none() {
+            return Err(corrupt());
+        }
         if intent.len() > 64 * 1024
             || resume.as_ref().is_some_and(|s| s.len() > 16 * 1024)
             || receipt.as_ref().is_some_and(|s| s.len() > 64 * 1024)
@@ -483,11 +514,20 @@ impl TransferJournal {
         let receipt = receipt
             .map(|s| serde_json::from_str(&s).map_err(|_| corrupt()))
             .transpose()?;
+        let plaintext = match (length, digest) {
+            (Some(length), Some(digest)) => {
+                Some((u64::try_from(length).map_err(|_| corrupt())?, digest))
+            }
+            (None, None) => None,
+            _ => return Err(corrupt()),
+        };
         Ok(Some(TransferRecord {
             intent,
             attempted,
             resume,
             receipt,
+            released,
+            plaintext,
         }))
     }
 
@@ -520,7 +560,7 @@ impl TransferJournal {
         if self
             .db
             .execute(
-                "UPDATE objects SET receipt=?2 WHERE id=?1 AND attempted=1",
+                "UPDATE objects SET receipt=?2,released=1 WHERE id=?1 AND attempted=1",
                 params![
                     intent.object_id,
                     serde_json::to_string(receipt).map_err(storage)?
@@ -530,6 +570,42 @@ impl TransferJournal {
             != 1
         {
             return Err(corrupt());
+        }
+        self.discard_spool(&intent.object_id)
+    }
+
+    /// Removing the file after its release is durable, so a crash between the
+    /// two leaves a file the next reopening sweeps rather than an object whose
+    /// receipt says nothing about what is still on disk.
+    fn discard_spool(&self, object: &str) -> Result<()> {
+        let path = self.spool_path(object);
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(storage(error)),
+            Ok(metadata) if crate::trust_boundary::is_link_like(&metadata) => {
+                return Err(corrupt())
+            }
+            Ok(_) => {}
+        }
+        std::fs::remove_file(&path).map_err(storage)?;
+        crate::trust_boundary::sync_directory(&self.directory).map_err(storage)?;
+        Ok(())
+    }
+
+    fn discard_released(&self) -> Result<()> {
+        let ids = {
+            let mut query = self
+                .db
+                .prepare("SELECT id FROM objects WHERE released=1 ORDER BY id")
+                .map_err(storage)?;
+            let rows = query
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(storage)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(storage)?
+        };
+        for id in ids {
+            self.discard_spool(&id)?;
         }
         Ok(())
     }
@@ -701,6 +777,48 @@ mod tests {
         ).unwrap(), SpoolCleanup::Retained);
     }
 
+
+    /// The receipt and the release are one durable step, so the file can only
+    /// outlive it by a crash, which the next reopening finishes.
+    #[test]
+    fn c_a_release_follows_its_receipt_and_is_finished_by_the_next_reopening() {
+        let (_root, mut store, identity, directory) = fixture();
+        let mut journal = TransferJournal::open(&directory, identity.clone()).unwrap();
+        let spool = journal.spool_path("pack");
+        let intent = journal.record("pack").unwrap().unwrap().intent;
+        journal.attempted("pack", None).unwrap();
+        let attempted = journal.record("pack").unwrap().unwrap();
+        assert!(attempted.attempted && attempted.receipt.is_none() && !attempted.released);
+        assert!(spool.is_file());
+        let receipt = ObjectReceipt {
+            locator: RemoteLocator {
+                connection_identity: fake::repository().connection_identity,
+                collection: None,
+                object: "pack".into(),
+            },
+            byte_length: intent.byte_length,
+            version: None,
+            checksum: None,
+            complete: true,
+        };
+        journal.complete(&intent, &fake::repository(), &receipt).unwrap();
+        let released = journal.record("pack").unwrap().unwrap();
+        assert!(released.released && released.receipt.is_some());
+        assert!(!spool.exists());
+        // Nothing may reopen an object whose ciphertext it no longer holds.
+        assert_eq!(journal.reopen_object("pack").unwrap_err().kind, ErrorKind::Corrupt);
+        assert!(journal.record("pack").unwrap().unwrap().receipt.is_some());
+
+        std::fs::write(&spool, b"synthetic sealed ciphertext").unwrap();
+        drop(journal);
+        let journal = TransferJournal::open(&directory, identity).unwrap();
+        assert!(!spool.exists());
+        store.external_finish_backup("job", "point", "bundle", "authenticated-synthetic-observation").unwrap();
+        assert_eq!(
+            journal.cleanup_terminal_spools(&mut store, "format-repository").unwrap(),
+            SpoolCleanup::Removed { objects: 0, bytes: 0 }
+        );
+    }
     #[test]
     fn c_only_authoritatively_cancelled_matching_jobs_can_discard_their_spools() {
         let (_root, mut store, identity, directory) = fixture();

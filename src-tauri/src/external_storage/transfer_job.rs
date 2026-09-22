@@ -139,6 +139,11 @@ async fn upload_inner(
                 return Err(ProviderError::new(ErrorKind::PreconditionFailed));
             }
         }
+        // A released ciphertext cannot be sent a second time. The object has to
+        // be produced again, which only a later job can do.
+        if record.released {
+            return Err(ProviderError::new(ErrorKind::NotFound));
+        }
         journal.reopen_object(object)?;
     }
     // Only missing objects need the original ciphertext, including its nonce.
@@ -456,8 +461,10 @@ mod tests {
             .build()
             .unwrap()
     }
+    /// A released object cannot be sent a second time, and an object the
+    /// repository still holds is confirmed without one.
     #[test]
-    fn c_reopened_complete_receipt_repairs_only_the_missing_object() {
+    fn c_a_lost_remote_object_is_not_repaired_from_a_released_ciphertext() {
         runtime().block_on(async {
             let root = tempfile::tempdir().unwrap();
             let (mut journal, first) = prepare(root.path());
@@ -470,18 +477,20 @@ mod tests {
             let cancel = Cancellation::default();
             for intent in [&first, &second] {
                 upload(&mut journal, &intent.object_id, &provider, &repository, &cancel).await.unwrap();
-                assert!(journal.spool_path(&intent.object_id).exists());
+                assert!(!journal.spool_path(&intent.object_id).exists());
             }
             provider.forget(&first.object_id);
             drop(journal);
             let mut journal = TransferJournal::open(root.path(), identity()).unwrap();
-            for intent in [&first, &second] {
-                upload(&mut journal, &intent.object_id, &provider, &repository, &cancel).await.unwrap();
-            }
-            assert!(provider.holds(&first.object_id));
-            assert_eq!(provider.upload_attempts(&first.object_id), 2);
+            let error = upload(&mut journal, &first.object_id, &provider, &repository, &cancel)
+                .await.unwrap_err();
+            assert_eq!(error.kind, ErrorKind::NotFound);
+            assert!(!provider.holds(&first.object_id));
+            assert_eq!(provider.upload_attempts(&first.object_id), 1);
+            let record = journal.record(&first.object_id).unwrap().unwrap();
+            assert!(record.released && record.receipt.is_some());
+            upload(&mut journal, &second.object_id, &provider, &repository, &cancel).await.unwrap();
             assert_eq!(provider.upload_attempts(&second.object_id), 1);
-            assert_eq!(provider.reconcile_attempts(&first.object_id), 1);
             assert_eq!(provider.reconcile_attempts(&second.object_id), 1);
             assert!(provider.read_attempts(&second.object_id) > 0);
         });
@@ -495,13 +504,12 @@ mod tests {
             let provider = FakeProvider::new(false);
             let repository = fake::repository();
             let cancel = Cancellation::default();
-            upload(&mut journal, &intent.object_id, &provider, &repository, &cancel).await.unwrap();
-            provider.forget(&intent.object_id);
             std::fs::remove_file(journal.spool_path(&intent.object_id)).unwrap();
             let error = upload(&mut journal, &intent.object_id, &provider, &repository, &cancel).await.unwrap_err();
             assert_eq!(error.kind, ErrorKind::NotFound);
-            assert!(journal.record(&intent.object_id).unwrap().unwrap().receipt.is_none());
-            assert_eq!(provider.upload_attempts(&intent.object_id), 1);
+            let record = journal.record(&intent.object_id).unwrap().unwrap();
+            assert!(!record.released && record.receipt.is_none());
+            assert_eq!(provider.upload_attempts(&intent.object_id), 0);
         });
     }
 
@@ -514,7 +522,7 @@ mod tests {
             let repository = fake::repository();
             let cancel = Cancellation::default();
             let original = upload(&mut journal, &intent.object_id, &provider, &repository, &cancel).await.unwrap();
-            std::fs::remove_file(journal.spool_path(&intent.object_id)).unwrap();
+            assert!(!journal.spool_path(&intent.object_id).exists());
             assert_eq!(upload(&mut journal, &intent.object_id, &provider, &repository, &cancel).await.unwrap(), original);
             assert_eq!(provider.upload_attempts(&intent.object_id), 1);
             assert_eq!(provider.read_attempts(&intent.object_id), 1);
@@ -535,14 +543,13 @@ mod tests {
                 let error = upload(&mut journal, &intent.object_id, &provider, &repository, &cancel).await.unwrap_err();
                 assert_eq!(error.kind, kind);
                 assert_eq!(provider.upload_attempts(&intent.object_id), 1);
-                assert!(journal.spool_path(&intent.object_id).exists());
                 assert!(journal.record(&intent.object_id).unwrap().unwrap().receipt.is_some());
             }
         });
     }
 
     #[test]
-    fn c_cancelled_completed_upload_does_not_send_a_new_request_or_discard_spool() {
+    fn c_cancelled_completed_upload_does_not_send_a_new_request() {
         runtime().block_on(async {
             let root = tempfile::tempdir().unwrap();
             let (mut journal, intent) = prepare(root.path());
@@ -553,7 +560,6 @@ mod tests {
             cancel.cancel();
             assert_eq!(upload(&mut journal, &intent.object_id, &provider, &repository, &cancel).await.unwrap_err().kind, ErrorKind::Cancelled);
             assert_eq!(provider.reconcile_attempts(&intent.object_id), 0);
-            assert!(journal.spool_path(&intent.object_id).exists());
         });
     }
 
@@ -807,7 +813,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_inventory_with_a_lost_confirmation_cannot_be_recreated() {
+    fn a_missing_inventory_page_cannot_be_recreated_for_a_new_payload() {
         runtime().block_on(async {
             let root = tempfile::tempdir().unwrap();
             let (mut journal, intent) = prepare(root.path());
@@ -828,9 +834,6 @@ mod tests {
                 &Cancellation::default(),
             ).await.unwrap();
             let page_object = format!("inventory-page-{page_id}");
-            // Model a crash after remote creation but before recording its response.
-            journal.reopen_object(&page_object).unwrap();
-            assert!(journal.record(&page_object).unwrap().unwrap().attempted);
             provider.forget(&page_object);
             drop(journal);
             let mut journal = TransferJournal::open(root.path(), identity()).unwrap();

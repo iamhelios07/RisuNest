@@ -525,6 +525,13 @@ async fn revalidate_cached_object_at(
                 cache.forget_object(&value.repository_id, repository, &value.object_id)?;
                 return Ok(None);
             }
+            // The repository lost an object this job already released. Its
+            // ciphertext exists nowhere, so this publication cannot repair it;
+            // the recorded evidence makes the next one rebuild this object
+            // alone.
+            if record.is_some_and(|record| record.released) {
+                return Err(ProviderError::new(ErrorKind::NotFound));
+            }
             let mut receipt = transfer_job::upload_registered(
                 journal,
                 &value.object_id,
@@ -1419,6 +1426,24 @@ async fn seal_plain_object(
     if let Some(record) = journal.record(&object_id)? {
         if record.intent.role != role || record.intent.byte_length != ciphertext_length {
             return Err(corrupt("journal role differs"));
+        }
+        // A released object is already durable under exactly these bytes, and
+        // the registration says which. Rebuilding the same plaintext is the
+        // whole proof, so nothing is read back.
+        if record.released {
+            let Some((length, digest)) = &record.plaintext else {
+                return Err(corrupt("released object was never registered"));
+            };
+            if *length != plaintext_length || digest != &plaintext_sha256 {
+                return Err(corrupt("journal plaintext differs"));
+            }
+            return Ok(SealedObject::Pending {
+                object_id,
+                role,
+                plaintext_length,
+                plaintext_sha256,
+                ciphertext_sha256: record.intent.sha256,
+            });
         }
         let spool = journal.spool_path(&object_id);
         let downloaded;
@@ -2727,6 +2752,70 @@ mod tests {
         )
     }
 
+    /// What a job is holding in sealed ciphertext at one moment, which is the
+    /// cost a release bounds.
+    fn spool_bytes(directory: &Path) -> u64 {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .filter(|entry| entry.path().extension().is_some_and(|value| value == "spool"))
+            .filter_map(|entry| entry.metadata().ok().map(|metadata| metadata.len()))
+            .sum()
+    }
+
+    /// Samples a job directory from another thread while a publication runs.
+    fn peak_spool_sampler(
+        directory: std::path::PathBuf,
+    ) -> (
+        std::sync::Arc<std::sync::atomic::AtomicU64>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = {
+            let peak = peak.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    peak.fetch_max(spool_bytes(&directory), std::sync::atomic::Ordering::Relaxed);
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            })
+        };
+        (peak, stop, handle)
+    }
+    /// The pack the asset catalog names. Its content does not move with the
+    /// revision, so a later publication of the same library reuses it.
+    fn asset_pack(
+        provider: &FakeProvider,
+        completed: &CompletedSnapshot,
+        key: &[u8; 32],
+    ) -> RemoteObject {
+        let bytes = provider
+            .contents(&completed.asset_catalog.receipt.locator.object)
+            .unwrap();
+        let metadata_key = derive_key(key, &completed.repository_id, "metadata").unwrap();
+        let mut plaintext = Vec::new();
+        wire::open_envelope(
+            &mut std::io::Cursor::new(bytes),
+            &mut plaintext,
+            &metadata_key,
+            wire::MAX_METADATA_BYTES as u64,
+        )
+        .unwrap();
+        let catalog = wire::CatalogDocument::decode(&plaintext, wire::MAX_METADATA_BYTES).unwrap();
+        let locator = catalog.packs[0].locator.object.clone();
+        completed
+            .referenced_objects
+            .iter()
+            .find(|object| object.receipt.locator.object == locator)
+            .unwrap()
+            .clone()
+    }
+
     fn captured_asset_inventory(
         root: &Path,
         capture_id: &str,
@@ -3405,8 +3494,8 @@ mod tests {
                 assert_eq!(fs::read(restored.records[0].source.file().unwrap()).unwrap(), b"record");
                 assert!(restored.objects.iter().any(|object| fs::read(object.source.file().unwrap()).unwrap() == b"asset"));
                 assert_eq!(provider.upload_attempts(&retained.object_id), 1);
-                assert!(first_journal.spool_path(&first.reference.object_id).exists());
-                assert!(second_journal.spool_path(&second.reference.object_id).exists());
+                assert!(!first_journal.spool_path(&first.reference.object_id).exists());
+                assert!(!second_journal.spool_path(&second.reference.object_id).exists());
                 if missing_role == ObjectRole::Pack {
                     assert_ne!(first.asset_catalog.object_id, second.asset_catalog.object_id);
                 }
@@ -3437,12 +3526,15 @@ mod tests {
             assert_eq!(error.kind, ErrorKind::Unauthorized);
             assert!(!provider.holds("snapshot-second"));
             assert!(provider.holds(&first.asset_catalog.object_id));
-            assert!(first_journal.spool_path(&first.reference.object_id).exists());
+            assert!(!first_journal.spool_path(&first.reference.object_id).exists());
         });
     }
 
+    /// Every source is rechecked before the root is published. A body the
+    /// repository lost exists nowhere once its ciphertext is released, so this
+    /// publication stops instead of publishing a root that names it.
     #[test]
-    fn c_publication_rechecks_every_source_and_repairs_only_the_missing_ciphertext() {
+    fn c_publication_rechecks_every_source_and_stops_at_a_body_it_cannot_reach() {
         runtime().block_on(async {
             for role in [ObjectRole::Pack, ObjectRole::Catalog, ObjectRole::SyncState] {
                 let root = tempfile::tempdir().unwrap();
@@ -3464,23 +3556,121 @@ mod tests {
                     limits(128 * 1024), None, &mut journal, &provider, &repository, &cancel).await.unwrap();
                 let missing = std::iter::once(&completed.reference).chain(completed.referenced_objects.iter())
                     .find(|object| object.role == role).unwrap().clone();
-                let ciphertext = std::fs::read(journal.spool_path(&missing.object_id)).unwrap();
                 provider.forget(&missing.receipt.locator.object);
                 // No in-memory receipt or protection survives reopening this journal.
                 drop(journal);
                 let mut journal = TransferJournal::open(&directory, identity).unwrap();
-                assert_eq!(verify_publication(&completed, root.path(), &cache, &mut journal, &key,
-                    &provider, &repository, &cancel).await.unwrap(), PublicationReadiness::Verified);
-                assert_eq!(provider.upload_attempts(&missing.object_id), 2);
-                assert_eq!(provider.state.lock().unwrap().objects[&missing.receipt.locator.object].0, ciphertext);
+                let error = verify_publication(&completed, root.path(), &cache, &mut journal, &key,
+                    &provider, &repository, &cancel).await.unwrap_err();
+                assert_eq!(error.kind, ErrorKind::NotFound);
+                let evidence = ObjectEvidence::open(root.path(), journal.connection_id()).unwrap();
+                assert!(evidence.known(&ObjectEvidence::identity(&missing, &repository).unwrap()).unwrap());
                 for object in std::iter::once(&completed.reference).chain(completed.referenced_objects.iter()) {
-                    if object.object_id != missing.object_id { assert_eq!(provider.upload_attempts(&object.object_id), 1); }
-                    assert!(journal.spool_path(&object.object_id).is_file());
+                    assert_eq!(provider.upload_attempts(&object.object_id), 1);
+                    assert!(!journal.spool_path(&object.object_id).exists());
                 }
             }
         });
     }
 
+
+    /// A resumed publication rebuilds the same bodies and proves them against
+    /// what it registered. Nothing it already released is fetched back.
+    #[test]
+    fn c_a_resumed_publication_proves_released_bodies_without_reading_them() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let key = [7; 32];
+            let cancel = Cancellation::default();
+            let (capture, _) = captured(root.path(), "capture", 1, b"record", b"asset");
+            let meta = metadata("snapshot", &capture);
+            let mut journal = journal(&root.path().join("job"), "job", &capture);
+            let completed = package_and_upload(capture, vec![], root.path(), &root.path().join("cache"),
+                meta, &key, limits(128 * 1024), None, &mut journal, &provider, &repository, &cancel)
+                .await.unwrap();
+            let uploads = provider.upload_count();
+            let reads = provider.read_count();
+            for object in std::iter::once(&completed.reference).chain(completed.referenced_objects.iter()) {
+                assert!(!journal.spool_path(&object.object_id).exists());
+            }
+
+            // The package cache this job wrote is gone, so every body is built
+            // again and answered for by its registration alone.
+            let (capture, _) = captured(root.path(), "resumed-capture", 1, b"record", b"asset");
+            let meta = metadata("snapshot", &capture);
+            let resumed = package_and_upload(capture, vec![], root.path(), &root.path().join("rebuilt-cache"),
+                meta, &key, limits(128 * 1024), None, &mut journal, &provider, &repository, &cancel)
+                .await.unwrap();
+            assert_eq!(resumed.reference.object_id, completed.reference.object_id);
+            assert_eq!(resumed.reference.receipt.locator, completed.reference.receipt.locator);
+            assert_eq!(provider.upload_count(), uploads);
+            // One confirming read for each body and each page that registered
+            // one. Nothing is fetched to be rebuilt from.
+            let pages = provider.state.lock().unwrap().objects.keys()
+                .filter(|id| id.starts_with("inventory-page-")).count();
+            assert_eq!(provider.read_count() - reads, resumed.referenced_objects.len() + 1 + pages);
+            for object in std::iter::once(&resumed.reference).chain(resumed.referenced_objects.iter()) {
+                assert_eq!(provider.read_attempts(&object.object_id), 1);
+                assert_eq!(provider.upload_attempts(&object.object_id), 1);
+            }
+        });
+    }
+    /// The publication after that one rebuilds the body nobody holds any more
+    /// and reuses everything the repository still answers for.
+    #[test]
+    fn c_the_publication_after_a_lost_body_rebuilds_only_that_body() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let cache = root.path().join("cache");
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let key = [7; 32];
+            let cancel = Cancellation::default();
+            let (capture, _) = captured(root.path(), "capture", 1, b"record", b"asset");
+            let meta = metadata("snapshot", &capture);
+            let mut journal = journal(&root.path().join("job"), "job", &capture);
+            let completed = package_and_upload(capture, vec![], root.path(), &cache, meta, &key,
+                limits(128 * 1024), None, &mut journal, &provider, &repository, &cancel).await.unwrap();
+            let missing = asset_pack(&provider, &completed, &key);
+            let retained = completed.referenced_objects.iter().find(|object| {
+                object.role == ObjectRole::Pack && object.object_id != missing.object_id
+            }).unwrap().clone();
+            provider.forget(&missing.receipt.locator.object);
+            assert_eq!(verify_publication(&completed, root.path(), &cache, &mut journal, &key,
+                &provider, &repository, &cancel).await.unwrap_err().kind, ErrorKind::NotFound);
+
+            let (capture, _) = captured(root.path(), "replacement-capture", 2, b"record", b"asset");
+            let meta = metadata("replacement-snapshot", &capture);
+            let mut replacement_journal =
+                self::journal(&root.path().join("replacement-job"), "replacement-job", &capture);
+            let replacement = package_and_upload(capture, vec![], root.path(), &cache, meta, &key,
+                limits(128 * 1024), None, &mut replacement_journal, &provider, &repository, &cancel)
+                .await.unwrap();
+            assert_eq!(verify_publication(&replacement, root.path(), &cache, &mut replacement_journal,
+                &key, &provider, &repository, &cancel).await.unwrap(), PublicationReadiness::Verified);
+            // The lost body is never sent again; the replacement rebuilds it.
+            assert_eq!(provider.upload_attempts(&missing.object_id), 1);
+            let rebuilt = replacement.referenced_objects.iter()
+                .filter(|object| object.role == ObjectRole::Pack)
+                .filter(|object| !completed.referenced_objects.iter()
+                    .any(|previous| previous.object_id == object.object_id))
+                .collect::<Vec<_>>();
+            assert_eq!(rebuilt.len(), 1);
+            assert_eq!(provider.upload_attempts(&rebuilt[0].object_id), 1);
+            // Everything the repository still holds is reused, not sent again.
+            for object in completed.referenced_objects.iter() {
+                assert_eq!(provider.upload_attempts(&object.object_id), 1);
+            }
+            assert!(replacement.referenced_objects.iter()
+                .any(|object| object.object_id == retained.object_id));
+            let restored = snapshot_restore::download_snapshot(&replacement.reference,
+                &root.path().join("restored"), &key, None, &provider, &repository, &cancel).await.unwrap();
+            assert_eq!(fs::read(restored.records[0].source.file().unwrap()).unwrap(), b"record");
+            assert!(restored.objects.iter().any(|object| fs::read(object.source.file().unwrap()).unwrap() == b"asset"));
+        });
+    }
     /// An entry whose packs belong to the selected parent is admitted on that
     /// membership alone. The tag moves with each publication, so the test also
     /// covers a reused entry still being admissible under the next parent.
@@ -4237,52 +4427,6 @@ mod tests {
     }
 
     #[test]
-    fn c_changed_opaque_locator_requires_repackaging_instead_of_publishing_stale_parents() {
-        runtime().block_on(async {
-            let root = tempfile::tempdir().unwrap();
-            let cache = root.path().join("cache");
-            let provider = FakeProvider::new(false);
-            let repository = fake::repository();
-            let key = [7; 32];
-            let cancel = Cancellation::default();
-            let (capture, _) = captured(root.path(), "capture", 1, b"record", b"asset");
-            let meta = metadata("snapshot", &capture);
-            let mut journal = journal(&root.path().join("job"), "job", &capture);
-            let completed = package_and_upload(capture, vec![], root.path(), &cache, meta, &key,
-                limits(128 * 1024), None, &mut journal, &provider, &repository, &cancel).await.unwrap();
-            let missing = completed.referenced_objects.iter().find(|object| object.role == ObjectRole::Pack).unwrap();
-            let original = std::fs::read(journal.spool_path(&missing.object_id)).unwrap();
-            provider.forget(&missing.receipt.locator.object);
-            provider.set_upload_locator(&missing.object_id, "new-opaque-object");
-            assert_eq!(verify_publication(&completed, root.path(), &cache, &mut journal, &key,
-                &provider, &repository, &cancel).await.unwrap(), PublicationReadiness::Repackage);
-            assert_eq!(provider.state.lock().unwrap().objects["new-opaque-object"].0, original);
-            assert_eq!(provider.upload_attempts(&missing.object_id), 2);
-            assert_eq!(provider.upload_attempts(&completed.reference.object_id), 1);
-            assert!(journal.spool_path(&completed.reference.object_id).exists());
-
-            // The coordinator prepares a new immutable publication identity while
-            // the shared capture and repaired inventory remain available.
-            let (capture, _) = captured(root.path(), "replacement-capture", 2, b"record", b"asset");
-            let meta = metadata("replacement-snapshot", &capture);
-            let mut replacement_journal = self::journal(&root.path().join("replacement-job"), "replacement-job", &capture);
-            let replacement = package_and_upload(capture, vec![], root.path(), &cache, meta, &key,
-                limits(128 * 1024), None, &mut replacement_journal, &provider, &repository, &cancel).await.unwrap();
-            assert_eq!(provider.upload_attempts(&missing.object_id), 2);
-            for object in replacement.referenced_objects.iter().filter(|object| object.role == ObjectRole::Pack) {
-                assert!(completed.referenced_objects.iter().any(|previous| previous.object_id == object.object_id));
-            }
-            assert_eq!(verify_publication(&replacement, root.path(), &cache, &mut replacement_journal, &key,
-                &provider, &repository, &cancel).await.unwrap(), PublicationReadiness::Verified);
-            let restored = snapshot_restore::download_snapshot(&replacement.reference, &root.path().join("restored"),
-                &key, None, &provider, &repository, &cancel).await.unwrap();
-            assert_eq!(std::fs::read(restored.records[0].source.file().unwrap()).unwrap(), b"record");
-            assert!(restored.objects.iter().any(|object| std::fs::read(object.source.file().unwrap()).unwrap() == b"asset"));
-            assert!(journal.spool_path(&completed.reference.object_id).exists());
-        });
-    }
-
-    #[test]
     fn c_actual_catalog_and_envelope_lengths_enforce_exact_boundaries() {
         let kind = wire::CatalogKind::Assets;
         let leaf = wire::CatalogDocument::leaf(kind, Vec::new(), Vec::new()).unwrap();
@@ -4330,7 +4474,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_job_object_id_rejects_changed_plaintext_while_retaining_completed_spool() {
+    fn stable_job_object_id_rejects_changed_plaintext_after_releasing_its_ciphertext() {
         runtime().block_on(async {
             let root = tempfile::tempdir().unwrap();
             let provider = FakeProvider::new(false);
@@ -4365,7 +4509,7 @@ mod tests {
             )
             .await
             .unwrap();
-            assert!(journal.spool_path(&first.object_id).exists());
+            assert!(!journal.spool_path(&first.object_id).exists());
             let before = provider.state.lock().unwrap().objects.len();
             assert!(upload_plain_object(
                 &second_path,
@@ -4464,7 +4608,7 @@ mod tests {
     /// The record answers for one exact remote object, so the object answering
     /// for itself again has to end it.
     #[test]
-    fn a_repaired_object_stops_answering_from_its_recorded_failure() {
+    fn an_object_that_answers_again_stops_answering_from_its_recorded_failure() {
         runtime().block_on(async {
             let root = tempfile::tempdir().unwrap();
             let provider = FakeProvider::new(false);
@@ -4472,26 +4616,32 @@ mod tests {
             let (capture, _) = captured(root.path(), "evidence-capture", 1, b"record", b"asset");
             let (object, mut cache, mut evidence, mut journal) =
                 inherited_object(root.path(), &provider, &repository, &capture).await;
+            let stored = provider.contents(&object.receipt.locator.object).unwrap();
             provider.forget(&object.receipt.locator.object);
-            let repaired = revalidate_cached_object(
+            // Its ciphertext was released, so this publication cannot send it again.
+            assert_eq!(revalidate_cached_object(
+                &object, &mut cache, &mut evidence, &mut journal, &[41; 32], &provider, &repository,
+                &Cancellation::default(),
+            ).await.unwrap_err().kind, ErrorKind::NotFound);
+            assert!(evidence.known(&ObjectEvidence::identity(&object, &repository).unwrap()).unwrap());
+
+            provider.seed(&object.receipt.locator.object, object.role, stored);
+            let answered = revalidate_cached_object(
                 &object, &mut cache, &mut evidence, &mut journal, &[41; 32], &provider, &repository,
                 &Cancellation::default(),
             ).await.unwrap().unwrap();
-            // The spool held the original ciphertext, so the repair restored
-            // the same identity rather than producing a second one.
-            assert_eq!(repaired.receipt.locator, object.receipt.locator);
-            assert_eq!(repaired.ciphertext_sha256, object.ciphertext_sha256);
+            assert_eq!(answered.receipt.locator, object.receipt.locator);
+            assert_eq!(answered.ciphertext_sha256, object.ciphertext_sha256);
             assert!(!evidence.known(&ObjectEvidence::identity(&object, &repository).unwrap()).unwrap());
 
             let reads = provider.read_count();
             assert!(revalidate_cached_object(
-                &repaired, &mut cache, &mut evidence, &mut journal, &[41; 32], &provider,
+                &answered, &mut cache, &mut evidence, &mut journal, &[41; 32], &provider,
                 &repository, &Cancellation::default(),
             ).await.unwrap().is_some());
             assert!(provider.read_count() > reads);
         });
     }
-
     /// The record answers for references this attempt inherited. An object
     /// this job uploaded itself is still held in its own spool, and a crash
     /// between a repair and its clear must not make the job publish it twice.
@@ -4888,20 +5038,28 @@ mod tests {
                     root.path(), &capture_id, REVISIONS, 1, 1, 5_000 + REVISIONS as usize,
                 );
                 let snapshot_metadata = metadata(&format!("growing-snapshot-{name}"), &capture);
-                let mut transfer = journal(&root.path().join(&job_id), &job_id, &capture);
+                let directory = root.path().join(&job_id);
+                let mut transfer = journal(&directory, &job_id, &capture);
                 let before = (provider.read_count(), provider.upload_count());
+                let (peak, stop, sampler) = peak_spool_sampler(directory.clone());
                 let started = std::time::Instant::now();
                 package_and_upload(
                     capture, Vec::new(), root.path(), &root.path().join(format!("{name}-cache")),
                     snapshot_metadata, &key, limits(512 * 1024), parent, &mut transfer,
                     &provider, &repository, &Cancellation::default(),
                 ).await.unwrap();
+                let elapsed = started.elapsed().as_millis();
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                sampler.join().unwrap();
+                let stored: u64 = provider.state.lock().unwrap().objects.values()
+                    .map(|(bytes, _)| bytes.len() as u64).sum();
                 eprintln!(
-                    "{name} assets={} provider_reads={} provider_uploads={} publication_ms={}",
+                    "{name} assets={} provider_reads={} provider_uploads={} publication_ms={elapsed} peak_spool_bytes={} held_spool_bytes={} stored_bytes={stored}",
                     5_000 + REVISIONS,
                     provider.read_count() - before.0,
                     provider.upload_count() - before.1,
-                    started.elapsed().as_millis(),
+                    peak.load(std::sync::atomic::Ordering::Relaxed),
+                    spool_bytes(&directory),
                 );
             }
         });
