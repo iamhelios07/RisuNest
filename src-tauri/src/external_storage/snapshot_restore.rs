@@ -517,14 +517,26 @@ async fn open_packs(
     Ok(paths)
 }
 
-/// What a resolver may accept as a source. A normal receive may reuse a body
-/// the library already holds under exactly the identity and length the catalog
-/// names; a restore, a verified export and a destructive conflict copy consume
-/// only what this job proved for itself.
+/// What a resolver may accept as a source, and what the consumer's repository
+/// is. A body is only offered as a library source when the job that receives
+/// the plan writes into that same repository, which a scratch store does not.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum SourceTrust<'a> {
-    Proven,
-    LibraryAdmitted(&'a Path),
+    /// Nothing local answers. Every body comes out of a pack.
+    Downloaded,
+    /// The repository at this root may answer, and each body it answers with
+    /// is read and proved against the identity the catalog names first.
+    ProvenLibrary(&'a Path),
+    /// The repository at this root may answer on identity and length alone,
+    /// which is what it was already admitted under.
+    AdmittedLibrary(&'a Path),
+}
+
+/// The repository a plan may take bodies from, and whether each one has to be
+/// read before it counts as a source.
+struct LocalLibrary {
+    root: PathBuf,
+    prove: bool,
 }
 
 /// One catalog entry and where its content is going to come from. An entry
@@ -542,10 +554,14 @@ struct ResolvedEntry {
 fn resolve_entries(
     entries: Vec<CompleteEntry>,
     staging_root: &Path,
-    library: Option<PathBuf>,
+    library: Option<LocalLibrary>,
     cancel: &Cancellation,
 ) -> Result<Vec<ResolvedEntry>> {
-    let library = library.map(|root| PayloadCas::new(&root)).transpose().map_err(transient)?;
+    let prove = library.as_ref().is_some_and(|library| library.prove);
+    let library = library
+        .map(|library| PayloadCas::new(&library.root))
+        .transpose()
+        .map_err(transient)?;
     let record_root = staging_root.join("records");
     let object_root = staging_root.join("objects");
     ensure_directory(&record_root)?;
@@ -565,7 +581,7 @@ fn resolve_entries(
             .then(|| ObjectSource::File(destination.clone()));
         if source.is_none() && entry.kind == wire::CatalogEntryKind::Object {
             if let Some(cas) = library.as_ref() {
-                source = library_body(cas, &digest, entry.byte_length)?;
+                source = library_body(cas, &digest, entry.byte_length, prove)?;
             }
         }
         plan.push(ResolvedEntry {
@@ -581,16 +597,27 @@ fn resolve_entries(
 /// A body the library already holds under this exact identity and length. The
 /// length is asked for as well, because a truncated file carries the name of
 /// the content it no longer is.
-fn library_body(cas: &PayloadCas, digest: &str, byte_length: u64) -> Result<Option<ObjectSource>> {
+fn library_body(
+    cas: &PayloadCas,
+    digest: &str,
+    byte_length: u64,
+    prove: bool,
+) -> Result<Option<ObjectSource>> {
     let Some(path) = cas.object_path(digest).map_err(transient)? else {
         return Ok(None);
     };
-    let file = match crate::trust_boundary::open_regular_source(&path) {
+    let mut file = match crate::trust_boundary::open_regular_source(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(corrupt(error)),
     };
     if file.metadata().map_err(corrupt)?.len() != byte_length {
+        return Ok(None);
+    }
+    // Proving it costs one read of a body that is going to be consumed anyway,
+    // which is what a job that answers for everything it consumes owes. A body
+    // that fails is not a source, so the pack that carries it is read instead.
+    if prove && hex::encode(hash_reader(&mut file, byte_length).map_err(corrupt)?) != digest {
         return Ok(None);
     }
     Ok(Some(ObjectSource::Library(digest.to_owned())))
@@ -646,6 +673,7 @@ fn materialize_entries(
                 .open(&partial)
                 .map_err(transient)?;
             let mut output_hash = Sha256::new();
+            let mut written = 0u64;
             for chunk in &entry.chunks {
                 let pack_path = packs
                     .get(&chunk.pack_id)
@@ -672,11 +700,17 @@ fn materialize_entries(
                 }
                 output.write_all(&decoded.bytes).map_err(transient)?;
                 output_hash.update(&decoded.bytes);
+                written = written
+                    .checked_add(decoded.bytes.len() as u64)
+                    .ok_or_else(|| corrupt("restored entry length overflow"))?;
             }
             output.sync_all().map_err(transient)?;
             drop(output);
+            // The bytes were hashed as they were written and the length is what
+            // was written, so reading the file back to learn the same two things
+            // is a pass with no evidence in it.
             let actual: [u8; 32] = output_hash.finalize().into();
-            if actual != entry.content_sha256 || !verify(&partial, entry.byte_length, &digest)? {
+            if actual != entry.content_sha256 || written != entry.byte_length {
                 return Err(corrupt("restored entry integrity failed"));
             }
             publish_verified(&partial, &destination, entry.byte_length, &digest)?;
@@ -973,8 +1007,15 @@ pub(crate) async fn download_snapshot(
     let library_staging = staging_root.to_path_buf();
     let library_cancel = cancel.clone();
     let library = match trust {
-        SourceTrust::Proven => None,
-        SourceTrust::LibraryAdmitted(root) => Some(root.to_path_buf()),
+        SourceTrust::Downloaded => None,
+        SourceTrust::ProvenLibrary(root) => Some(LocalLibrary {
+            root: root.to_path_buf(),
+            prove: true,
+        }),
+        SourceTrust::AdmittedLibrary(root) => Some(LocalLibrary {
+            root: root.to_path_buf(),
+            prove: false,
+        }),
     };
     let cpu = cpu_permit().await?;
     let plan = tokio::task::spawn_blocking(move || {

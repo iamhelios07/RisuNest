@@ -741,7 +741,7 @@ async fn receive_remote(
     // is the same body, so a normal receive does not fetch it again.
     let downloaded = super::snapshot_restore::download_snapshot(
         &remote.document.state, &staging, &connected.root_key, Some(&cache),
-        super::snapshot_restore::SourceTrust::LibraryAdmitted(&root),
+        super::snapshot_restore::SourceTrust::AdmittedLibrary(&root),
         connected.provider.as_ref(), &connected.handle, cancel,
     ).await?;
     cancel.check()?;

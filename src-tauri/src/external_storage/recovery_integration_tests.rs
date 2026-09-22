@@ -249,7 +249,7 @@ fn repository_bootstrap_opens_and_applies_a_real_snapshot_without_the_source_vau
                 &destination.path().join("download"),
                 &destination_key,
                 None,
-                snapshot_restore::SourceTrust::Proven, &provider,
+                snapshot_restore::SourceTrust::Downloaded, &provider,
                 &repository,
                 &cancel,
             )
