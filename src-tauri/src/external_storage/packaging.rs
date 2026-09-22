@@ -2802,6 +2802,7 @@ mod tests {
                 &BTreeSet::from(["local-plugins".to_owned()]),
                 &staging,
                 &key,
+                None,
                 &provider,
                 &repository,
                 &Cancellation::default(),
@@ -2880,6 +2881,7 @@ mod tests {
                     &completed.reference,
                     &root.path().join(format!("read-{marker}")),
                     &key,
+                    None,
                     &provider,
                     &repository,
                     &Cancellation::default(),
@@ -2892,6 +2894,7 @@ mod tests {
                     &BTreeSet::from(["local-plugins".to_owned()]),
                     &root.path().join(format!("receive-{marker}")),
                     &key,
+                    None,
                     &provider,
                     &repository,
                     &Cancellation::default(),
@@ -3014,6 +3017,7 @@ mod tests {
                 &second.reference,
                 &staging,
                 &[8; 32],
+                None,
                 &provider,
                 &repository,
                 &Cancellation::default(),
@@ -3024,6 +3028,7 @@ mod tests {
                 &second.reference,
                 &staging,
                 &key,
+                None,
                 &provider,
                 &repository,
                 &Cancellation::default(),
@@ -3060,6 +3065,7 @@ mod tests {
                 &second.reference,
                 &staging,
                 &key,
+                None,
                 &provider,
                 &repository,
                 &Cancellation::default(),
@@ -3127,7 +3133,7 @@ mod tests {
                 let second = package_and_upload(capture, Vec::new(), root.path(), &cache, meta, &key,
                     limits(128 * 1024), None, &mut second_journal, &provider, &repository, &cancel).await.unwrap();
                 let restored = snapshot_restore::download_snapshot(&second.reference, &root.path().join("restored"),
-                    &key, &provider, &repository, &cancel).await.unwrap();
+                    &key, None, &provider, &repository, &cancel).await.unwrap();
                 assert_eq!(fs::read(restored.records[0].source.file().unwrap()).unwrap(), b"record");
                 assert!(restored.objects.iter().any(|object| fs::read(object.source.file().unwrap()).unwrap() == b"asset"));
                 assert_eq!(provider.upload_attempts(&retained.object_id), 1);
@@ -3758,6 +3764,68 @@ mod tests {
         });
     }
 
+    /// A receive reads the catalogs of the snapshot it takes, which is the
+    /// same snapshot the publication after it selects as its parent. Keeping
+    /// what it read saves that publication from asking for it again.
+    #[test]
+    fn c_a_download_that_records_what_it_read_saves_the_next_publication_the_read() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let key = [43; 32];
+            let cancel = Cancellation::default();
+            #[allow(clippy::too_many_arguments)]
+            async fn published(
+                root: &Path,
+                name: &str,
+                cache: &Path,
+                parent: Option<&ParentGraph>,
+                key: &[u8; 32],
+                provider: &FakeProvider,
+                repository: &RepositoryHandle,
+                cancel: &Cancellation,
+            ) -> CompletedSnapshot {
+                let capture = captured_asset_inventory(root, name, 1, 2, 0, 6);
+                let meta = metadata(name, &capture);
+                let mut transfer = journal(&root.join(name), name, &capture);
+                package_and_upload(
+                    capture, vec![], root, cache, meta, key, limits(64 * 1024),
+                    parent, &mut transfer, provider, repository, cancel,
+                ).await.unwrap()
+            }
+            let first = published(
+                root.path(), "first-device", &root.path().join("cache-a"), None,
+                &key, &provider, &repository, &cancel,
+            ).await;
+            let parent = parent_graph(&first, &repository).unwrap();
+
+            for (name, record_into) in [("kept", true), ("discarded", false)] {
+                let elsewhere = root.path().join(format!("cache-{name}"));
+                snapshot_restore::download_snapshot(
+                    &first.reference,
+                    &root.path().join(format!("receive-{name}")),
+                    &key,
+                    record_into.then(|| elsewhere.as_path()),
+                    &provider,
+                    &repository,
+                    &cancel,
+                ).await.unwrap();
+                let reads = provider.read_count();
+                let second = published(
+                    root.path(), name, &elsewhere, Some(&parent),
+                    &key, &provider, &repository, &cancel,
+                ).await;
+                assert_eq!(second.record_catalog, first.record_catalog);
+                if record_into {
+                    assert_eq!(provider.read_count(), reads, "{name} asked again");
+                } else {
+                    assert!(provider.read_count() > reads, "{name} asked for nothing");
+                }
+            }
+        });
+    }
+
     /// A parent root this device cannot read leaves that catalog unknown.
     /// The publication then pays for it the way a cache miss already did,
     /// and the roots it could read are still reused.
@@ -3878,7 +3946,7 @@ mod tests {
             assert_eq!(verify_publication(&replacement, root.path(), &cache, &mut replacement_journal, &key,
                 &provider, &repository, &cancel).await.unwrap(), PublicationReadiness::Verified);
             let restored = snapshot_restore::download_snapshot(&replacement.reference, &root.path().join("restored"),
-                &key, &provider, &repository, &cancel).await.unwrap();
+                &key, None, &provider, &repository, &cancel).await.unwrap();
             assert_eq!(std::fs::read(restored.records[0].source.file().unwrap()).unwrap(), b"record");
             assert!(restored.objects.iter().any(|object| std::fs::read(object.source.file().unwrap()).unwrap() == b"asset"));
             assert!(journal.spool_path(&completed.reference.object_id).exists());
@@ -4237,6 +4305,7 @@ mod tests {
                 &completed.reference,
                 &root.path().join("bounded-restore"),
                 &[4; 32],
+                None,
                 &provider,
                 &repository,
                 &Cancellation::default(),
@@ -4357,6 +4426,7 @@ mod tests {
                 &completed.reference,
                 &restore_root,
                 &key,
+                None,
                 &provider,
                 &repository,
                 &Cancellation::default(),
@@ -4584,6 +4654,7 @@ mod tests {
                 &latest.reference,
                 &restore_root,
                 &key,
+                None,
                 &provider,
                 &repository,
                 &Cancellation::default(),

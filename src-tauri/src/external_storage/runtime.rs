@@ -1128,6 +1128,17 @@ impl crate::local_backup::CancellationProbe for CancelProbe {
         self.0.check().is_err()
     }
 }
+/// Where one connection keeps what it already knows about this repository.
+/// Shared by the job that publishes and the job that receives, so a receive
+/// teaches the next publication instead of only itself.
+pub(crate) fn package_cache_root(job_directory: &std::path::Path) -> Result<PathBuf> {
+    job_directory
+        .parent()
+        .and_then(|path| path.parent())
+        .map(|path| path.join("package-cache"))
+        .ok_or_else(|| ProviderError::new(ErrorKind::Corrupt))
+}
+
 pub(crate) fn job_directory(root: &std::path::Path, connection: &str, job: &str) -> PathBuf {
     root.join("external-storage")
         .join(hex::encode(
@@ -1507,11 +1518,7 @@ async fn run_backup(
             remote_generation: None,
         },
     };
-    let cache = directory
-        .parent()
-        .and_then(|path| path.parent())
-        .ok_or_else(|| ProviderError::new(ErrorKind::Corrupt))?
-        .join("package-cache");
+    let cache = package_cache_root(&directory)?;
     let completed = super::packaging::package_and_upload(
         capture,
         sections,

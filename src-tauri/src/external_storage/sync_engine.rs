@@ -642,11 +642,7 @@ async fn package_capture(
             parent_sections: parent.map(|view| view.sections).unwrap_or_default(),
         },
     };
-    let cache = directory
-        .parent()
-        .and_then(|path| path.parent())
-        .ok_or_else(|| corrupt("invalid external job directory"))?
-        .join("package-cache");
+    let cache = super::runtime::package_cache_root(&directory)?;
     let completed = super::snapshot::package_and_upload(
         capture,
         sections,
@@ -736,15 +732,20 @@ async fn receive_remote(
     // revalidate the downloaded files and build another inactive generation.
     discard_receive_preparation(app, &job.id)?;
     let root = super::runtime::root(app)?;
-    let staging = super::runtime::job_directory(&root, &job.request.connection_id, &job.id).join("receive");
+    let directory = super::runtime::job_directory(&root, &job.request.connection_id, &job.id);
+    let staging = directory.join("receive");
+    // What this receive reads is what the next publication would select as its
+    // parent, so keep it rather than reading the same catalogs again.
+    let cache = super::runtime::package_cache_root(&directory)?;
     let downloaded = super::snapshot_restore::download_snapshot(
-        &remote.document.state, &staging, &connected.root_key,
+        &remote.document.state, &staging, &connected.root_key, Some(&cache),
         connected.provider.as_ref(), &connected.handle, cancel,
     ).await?;
     cancel.check()?;
     let sections = super::snapshot_restore::download_sections(
         &remote.document.state, &wanted_receive_sections(&participation), &staging,
-        &connected.root_key, connected.provider.as_ref(), &connected.handle, cancel,
+        &connected.root_key, Some(&cache), connected.provider.as_ref(), &connected.handle,
+        cancel,
     ).await?;
     let worker_app = app.clone();
     let worker_job = job.clone();
@@ -927,17 +928,19 @@ async fn rejoin_sections(
     {
         return Ok(());
     }
-    let staging = super::runtime::job_directory(
+    let directory = super::runtime::job_directory(
         &super::runtime::root(app)?,
         &job.request.connection_id,
         &job.id,
-    )
-    .join("rejoin");
+    );
+    let staging = directory.join("rejoin");
+    let cache = super::runtime::package_cache_root(&directory)?;
     let received = super::snapshot_restore::download_sections(
         &remote.document.state,
         &wanted,
         &staging,
         &connected.root_key,
+        Some(&cache),
         connected.provider.as_ref(),
         &connected.handle,
         cancel,

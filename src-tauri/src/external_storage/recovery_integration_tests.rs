@@ -248,6 +248,7 @@ fn repository_bootstrap_opens_and_applies_a_real_snapshot_without_the_source_vau
                 &completed.reference,
                 &destination.path().join("download"),
                 &destination_key,
+                None,
                 &provider,
                 &repository,
                 &cancel,

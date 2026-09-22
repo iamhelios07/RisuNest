@@ -319,6 +319,26 @@ pub(super) struct CompleteEntry {
     pub(super) chunks: Vec<wire::StoredChunk>,
 }
 
+/// Keep what this download already read, so the publication that follows it
+/// does not ask the provider for the same catalog again. A cache that cannot
+/// be written costs that, and nothing else, so it does not fail the download.
+fn record_read(
+    record_into: Option<&Path>,
+    label: &super::packaging::CatalogRoot,
+    root: &RemoteObject,
+    entries: &[CompleteEntry],
+    packs: &BTreeMap<String, RemoteObject>,
+    nodes: &[(RemoteObject, CatalogRange)],
+    repository: &RepositoryHandle,
+) {
+    let Some(cache_root) = record_into else {
+        return;
+    };
+    let _ = super::cache_hydration::record_read_catalog(
+        cache_root, label, root, entries, packs, nodes, repository,
+    );
+}
+
 /// Everything one catalog names: its complete entries, the packs they point
 /// at, and the nodes the walk passed through with the key range each covered.
 /// A restore only needs the first two, and rebuilding reuse metadata needs all
@@ -676,6 +696,7 @@ pub(crate) async fn download_sections(
     wanted: &BTreeSet<String>,
     staging_root: &Path,
     root_key: &[u8; 32],
+    record_into: Option<&Path>,
     provider: &dyn Provider,
     repository: &RepositoryHandle,
     cancel: &Cancellation,
@@ -710,7 +731,7 @@ pub(crate) async fn download_sections(
         if entries_root.repository_id != snapshot.repository_id {
             return Err(corrupt("section catalog repository differs"));
         }
-        let (complete, packs, _) = read_catalog(
+        let (complete, packs, nodes) = read_catalog(
             &entries_root,
             wire::CatalogKind::Section,
             root_key,
@@ -720,6 +741,15 @@ pub(crate) async fn download_sections(
             cancel,
         )
         .await?;
+        record_read(
+            record_into,
+            &super::packaging::CatalogRoot::Section(id.clone()),
+            &entries_root,
+            &complete,
+            &packs,
+            &nodes,
+            repository,
+        );
         let pack_paths =
             open_packs(&packs, root_key, staging_root, provider, repository, cancel).await?;
         let cpu = cpu_permit().await?;
@@ -747,6 +777,7 @@ pub(crate) async fn download_snapshot(
     snapshot: &RemoteObject,
     staging_root: &Path,
     root_key: &[u8; 32],
+    record_into: Option<&Path>,
     provider: &dyn Provider,
     repository: &RepositoryHandle,
     cancel: &Cancellation,
@@ -784,7 +815,7 @@ pub(crate) async fn download_snapshot(
     {
         return Err(corrupt("snapshot catalog repository differs"));
     }
-    let (record_entries, mut record_packs, _) = read_catalog(
+    let (record_entries, mut record_packs, record_nodes) = read_catalog(
         &record_catalog,
         wire::CatalogKind::Records,
         root_key,
@@ -794,7 +825,16 @@ pub(crate) async fn download_snapshot(
         cancel,
     )
     .await?;
-    let (asset_entries, asset_packs, _) = read_catalog(
+    record_read(
+        record_into,
+        &super::packaging::CatalogRoot::Records,
+        &record_catalog,
+        &record_entries,
+        &record_packs,
+        &record_nodes,
+        repository,
+    );
+    let (asset_entries, asset_packs, asset_nodes) = read_catalog(
         &asset_catalog,
         wire::CatalogKind::Assets,
         root_key,
@@ -804,6 +844,15 @@ pub(crate) async fn download_snapshot(
         cancel,
     )
     .await?;
+    record_read(
+        record_into,
+        &super::packaging::CatalogRoot::Assets,
+        &asset_catalog,
+        &asset_entries,
+        &asset_packs,
+        &asset_nodes,
+        repository,
+    );
     for (id, object) in asset_packs {
         if let Some(old) = record_packs.insert(id, object.clone()) {
             if old != object {

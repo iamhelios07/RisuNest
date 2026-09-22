@@ -68,7 +68,7 @@ pub(super) async fn hydrate_parent(
             &label,
             &identity,
             format_repository_id,
-            entries,
+            &entries,
             &packs,
             &nodes,
             &root,
@@ -79,6 +79,33 @@ pub(super) async fn hydrate_parent(
     Ok(())
 }
 
+/// What a receive already read, kept for the publication that follows it.
+/// Recording what the provider has just answered costs nothing; reading the
+/// same catalog again to publish from it would.
+pub(super) fn record_read_catalog(
+    cache_root: &Path,
+    label: &CatalogRoot,
+    root: &RemoteObject,
+    entries: &[snapshot_restore::CompleteEntry],
+    packs: &BTreeMap<String, RemoteObject>,
+    nodes: &[(RemoteObject, CatalogRange)],
+    repository: &RepositoryHandle,
+) -> Result<()> {
+    let cache = PackageCache::open(cache_root)?;
+    let identity = super::reachability::object_identity(root, repository)?;
+    record_catalog(
+        label,
+        &identity,
+        &root.repository_id,
+        entries,
+        packs,
+        nodes,
+        root,
+        &cache,
+        repository,
+    )
+}
+
 /// One catalog's worth of rows, in the order that keeps a partial write safe:
 /// nothing is admitted until the graph naming it exists, and the shortcut that
 /// skips the catalog entirely is written last.
@@ -87,7 +114,7 @@ fn record_catalog(
     label: &CatalogRoot,
     identity: &str,
     format_repository_id: &str,
-    entries: Vec<snapshot_restore::CompleteEntry>,
+    entries: &[snapshot_restore::CompleteEntry],
     packs: &BTreeMap<String, RemoteObject>,
     nodes: &[(RemoteObject, CatalogRange)],
     root: &RemoteObject,
@@ -106,10 +133,10 @@ fn record_catalog(
         }
         let plan = EntryPlan {
             kind: entry.kind,
-            key: entry.key,
+            key: entry.key.clone(),
             content_sha256: hex::encode(entry.content_sha256),
             byte_length: entry.byte_length,
-            chunks: entry.chunks,
+            chunks: entry.chunks.clone(),
             packs: referenced.into_values().collect(),
         };
         plan.validate(format_repository_id, repository)?;
