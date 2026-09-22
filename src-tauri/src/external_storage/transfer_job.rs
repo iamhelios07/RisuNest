@@ -6,6 +6,11 @@ use super::{
     transfer::{SpoolSink, SpoolSource},
 };
 use std::collections::BTreeMap;
+
+/// How many ready intents one registration covers. The format allows more; the
+/// point of the bound is that a wave is registered while the next objects are
+/// still being produced, never after the whole library is spooled.
+const REGISTRATION_WAVE: usize = 64;
 use risunest_external_storage_format::{content_identity::hash, format::Descriptor};
 
 /// Reconcile answers identify an object, but not every provider supplies a
@@ -247,25 +252,33 @@ pub(crate) async fn upload_wave(
             .or_default()
             .push((member.clone(), record.intent.sha256.clone()));
     }
+    let mut pages = Vec::new();
     for (page, group) in waves {
-        let page_object = match page {
-            Some(page) => page,
+        match page {
+            Some(page) => pages.push(page),
             None => {
-                let mut identities = group
-                    .iter()
-                    .map(|(member, sha256)| (member.object_id.as_str(), sha256.as_str()))
-                    .collect::<Vec<_>>();
-                identities.sort_unstable();
-                let page_object =
-                    format!("inventory-page-{}", inventory_page_id(journal.job_id(), &identities));
-                let covered = group
-                    .into_iter()
-                    .map(|(member, _)| member)
-                    .collect::<Vec<_>>();
-                journal.cover(&page_object, &covered)?;
-                page_object
+                let mut group = group;
+                group.sort_unstable_by(|left, right| left.0.object_id.cmp(&right.0.object_id));
+                for slice in group.chunks(REGISTRATION_WAVE) {
+                    let identities = slice
+                        .iter()
+                        .map(|(member, sha256)| (member.object_id.as_str(), sha256.as_str()))
+                        .collect::<Vec<_>>();
+                    let page_object = format!(
+                        "inventory-page-{}",
+                        inventory_page_id(journal.job_id(), &identities)
+                    );
+                    let covered = slice
+                        .iter()
+                        .map(|(member, _)| member.clone())
+                        .collect::<Vec<_>>();
+                    journal.cover(&page_object, &covered)?;
+                    pages.push(page_object);
+                }
             }
-        };
+        }
+    }
+    for page_object in pages {
         let page_id = page_object
             .strip_prefix("inventory-page-")
             .ok_or_else(|| ProviderError::new(ErrorKind::Corrupt))?
@@ -394,6 +407,49 @@ mod tests {
         journal.register(&intent).unwrap();
         (journal, intent)
     }
+    /// A wave of sealed objects, registered together.
+    fn prepare_wave(root: &std::path::Path, count: usize) -> (TransferJournal, Vec<WaveMember>) {
+        let mut journal = TransferJournal::open(root, identity()).unwrap();
+        let mut members = Vec::new();
+        for index in 0..count {
+            let bytes = format!("synthetic immutable ciphertext {index}").into_bytes();
+            let intent = ObjectIntent {
+                repository_id: identity().repository_id,
+                job_id: identity().job_id,
+                object_id: format!("pack-wave-{index}"),
+                role: ObjectRole::Pack,
+                byte_length: bytes.len() as u64,
+                sha256: risunest_sync_wire::hash(&bytes),
+            };
+            let mut file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(journal.spool_path(&intent.object_id))
+                .unwrap();
+            file.write_all(&bytes).unwrap();
+            file.sync_all().unwrap();
+            journal.register(&intent).unwrap();
+            members.push(WaveMember {
+                object_id: intent.object_id.clone(),
+                plaintext_length: intent.byte_length,
+                plaintext_sha256: intent.sha256.clone(),
+            });
+        }
+        (journal, members)
+    }
+
+    fn covering_page(journal: &TransferJournal, members: &[WaveMember]) -> String {
+        let page = journal.covered_by(&members[0].object_id).unwrap().unwrap();
+        for member in members {
+            assert_eq!(
+                journal.covered_by(&member.object_id).unwrap().as_deref(),
+                Some(page.as_str()),
+                "a wave was split across pages"
+            );
+        }
+        page
+    }
+
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -803,6 +859,7 @@ mod tests {
                 job.job_id = format!("cycle-{cycle}");
                 let directory = root.path().join(&job.job_id);
                 let mut journal = TransferJournal::open(&directory, job.clone()).unwrap();
+                let mut members = Vec::new();
                 for index in 0..32 {
                     let bytes = format!("synthetic-{cycle}-{index}").into_bytes();
                     let intent = ObjectIntent {
@@ -815,23 +872,29 @@ mod tests {
                     };
                     std::fs::write(journal.spool_path(&intent.object_id), &bytes).unwrap();
                     journal.register(&intent).unwrap();
-                    for _ in 0..2 {
-                        upload_registered(
-                            &mut journal, &intent.object_id, "format-repository", &[7; 32],
-                            intent.byte_length, &intent.sha256, &provider, &repository, &cancel,
-                        ).await.unwrap();
-                    }
-                    payload_requests += provider.upload_attempts(&intent.object_id);
-                    inventory_requests += provider.upload_attempts(&format!("inventory-page-{}",
-                        inventory_page_id(&job.job_id, &[(&intent.object_id, &intent.sha256)])));
+                    members.push(WaveMember {
+                        object_id: intent.object_id.clone(),
+                        plaintext_length: intent.byte_length,
+                        plaintext_sha256: intent.sha256.clone(),
+                    });
                 }
+                for _ in 0..2 {
+                    upload_wave(
+                        &mut journal, &members, "format-repository", &[7; 32], &provider,
+                        &repository, &cancel,
+                    ).await.unwrap();
+                }
+                for member in &members {
+                    payload_requests += provider.upload_attempts(&member.object_id);
+                }
+                inventory_requests += provider.upload_attempts(&covering_page(&journal, &members));
             }
             let state = provider.state.lock().unwrap();
             let pages = state.objects.iter().filter(|(id, _)| id.starts_with("inventory-page-"))
                 .map(|(_, (bytes, _))| bytes.len()).collect::<Vec<_>>();
-            assert_eq!(pages.len(), 96);
+            assert_eq!(pages.len(), 3);
             assert_eq!(payload_requests, 96);
-            assert_eq!(inventory_requests, 96);
+            assert_eq!(inventory_requests, 3);
             let metadata_bytes: usize = pages.iter().sum();
             assert!(metadata_bytes < 96 * 2048);
             eprintln!("3 cycles, 96 payloads, 96 retries: {} inventory pages, {metadata_bytes} encrypted metadata bytes, {payload_requests} payload creates, {inventory_requests} inventory creates", pages.len());
@@ -864,5 +927,133 @@ mod tests {
         assert_eq!(representative_objects, 10_000);
         assert_eq!(representative_objects * 2, 20_000);
         assert!(page_bytes * representative_objects < 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn c_a_wave_registers_once_and_uploads_every_member() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let (mut journal, members) = prepare_wave(root.path(), 3);
+            let provider = FakeProvider::new(false);
+            let receipts = upload_wave(
+                &mut journal, &members, "format-repository", &[7; 32], &provider,
+                &fake::repository(), &Cancellation::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(receipts.len(), 3);
+            let page = covering_page(&journal, &members);
+            assert_eq!(provider.upload_attempts(&page), 1);
+            assert_eq!(
+                provider.uploaded_ids().iter()
+                    .filter(|id| id.starts_with("inventory-page-")).count(),
+                1,
+                "three objects cost three registrations"
+            );
+            for member in &members {
+                assert!(provider.holds(&member.object_id));
+                assert_eq!(provider.upload_attempts(&member.object_id), 1);
+            }
+        });
+    }
+
+    #[test]
+    fn c_a_lost_wave_response_is_resolved_without_a_second_page() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let (mut journal, members) = prepare_wave(root.path(), 2);
+            let provider = FakeProvider::new(false);
+            provider.state.lock().unwrap().lose_response = true;
+            upload_wave(
+                &mut journal, &members, "format-repository", &[7; 32], &provider,
+                &fake::repository(), &Cancellation::default(),
+            )
+            .await
+            .unwrap();
+            let page = covering_page(&journal, &members);
+            assert!(provider.holds(&page));
+            assert_eq!(provider.upload_attempts(&page), 1);
+            assert_eq!(
+                provider.uploaded_ids().iter()
+                    .filter(|id| id.starts_with("inventory-page-")).count(),
+                1,
+                "a lost response produced a second page for the same wave"
+            );
+            for member in &members {
+                assert!(provider.holds(&member.object_id));
+                assert_eq!(provider.upload_attempts(&member.object_id), 1);
+            }
+        });
+    }
+
+    #[test]
+    fn c_a_retired_wave_page_makes_every_member_non_resumable() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let (mut journal, members) = prepare_wave(root.path(), 2);
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            upload_wave(
+                &mut journal, &members, "format-repository", &[7; 32], &provider, &repository,
+                &Cancellation::default(),
+            )
+            .await
+            .unwrap();
+            let page = covering_page(&journal, &members);
+            provider.forget(&page);
+            for member in &members {
+                provider.forget(&member.object_id);
+            }
+            drop(journal);
+            let mut journal = TransferJournal::open(root.path(), identity()).unwrap();
+            for member in &members {
+                let error = upload_wave(
+                    &mut journal, std::slice::from_ref(member), "format-repository", &[7; 32],
+                    &provider, &repository, &Cancellation::default(),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(error.kind, ErrorKind::PreconditionFailed);
+                assert_eq!(provider.upload_attempts(&member.object_id), 1);
+            }
+            assert_eq!(provider.upload_attempts(&page), 1);
+        });
+    }
+
+    #[test]
+    fn c_a_resumed_wave_keeps_the_page_its_members_were_covered_by() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let (mut journal, members) = prepare_wave(root.path(), 3);
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            upload_wave(
+                &mut journal, &members[..2], "format-repository", &[7; 32], &provider, &repository,
+                &Cancellation::default(),
+            )
+            .await
+            .unwrap();
+            let first = covering_page(&journal, &members[..2]);
+            // The rest of the library became ready afterwards, so the second
+            // attempt gathers a wave the first one never had.
+            upload_wave(
+                &mut journal, &members, "format-repository", &[7; 32], &provider, &repository,
+                &Cancellation::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                journal.covered_by(&members[0].object_id).unwrap(),
+                Some(first.clone()),
+                "a member moved to another page after its own page was uploaded"
+            );
+            let second = journal.covered_by(&members[2].object_id).unwrap().unwrap();
+            assert_ne!(second, first);
+            assert_eq!(provider.upload_attempts(&first), 1);
+            assert_eq!(provider.upload_attempts(&second), 1);
+            for member in &members {
+                assert_eq!(provider.upload_attempts(&member.object_id), 1);
+            }
+        });
     }
 }

@@ -1100,6 +1100,7 @@ async fn build_entries(
     let PendingBuildParts { pending, packs } = PendingBuildParts::from(prepared);
     let data_key = derive_key(root_key, format_repository_id, "data").map_err(corrupt)?;
     let mut uploaded_packs = Vec::new();
+    let mut family = Vec::new();
     for mut pack in packs {
         pack.file
             .as_file_mut()
@@ -1113,25 +1114,58 @@ async fn build_entries(
             &plain_hash,
         )
         .map_err(corrupt)?;
-        let remote = upload_plain_object(
-            pack.file.path(),
-            pack.length,
-            plain_hash,
-            id,
-            ObjectRole::Pack,
-            format_repository_id,
-            root_key,
-            &data_key,
-            limits,
-            cache,
-            evidence,
-            journal,
-            provider,
-            repository,
-            cancel,
-        )
-        .await?;
-        uploaded_packs.push(remote);
+        family.push(
+            seal_plain_object(
+                pack.file.path(),
+                pack.length,
+                plain_hash,
+                id,
+                ObjectRole::Pack,
+                format_repository_id,
+                root_key,
+                &data_key,
+                limits,
+                cache,
+                evidence,
+                journal,
+                provider,
+                repository,
+                cancel,
+            )
+            .await?,
+        );
+        // A pack that is sealed but not yet sent owns its ciphertext, so only
+        // as many as the active family bound allows wait for a registration.
+        if family.len() >= ACTIVE_PACK_FAMILIES {
+            uploaded_packs.extend(
+                upload_sealed_wave(
+                    std::mem::take(&mut family),
+                    format_repository_id,
+                    root_key,
+                    cache,
+                    journal,
+                    provider,
+                    repository,
+                    cancel,
+                )
+                .await?,
+            );
+        }
+    }
+    if !family.is_empty() {
+        uploaded_packs.extend(
+            upload_sealed_wave(
+                family,
+                format_repository_id,
+                root_key,
+                cache,
+                journal,
+                provider,
+                repository,
+                cancel,
+            )
+            .await?,
+        );
     }
     let mut new_entries = Vec::with_capacity(pending.len());
     for entry in pending {
@@ -1318,7 +1352,25 @@ fn prepare_packs(
     })
 }
 
-async fn upload_plain_object(
+/// How many packs may own a ciphertext at once. A sealed pack waiting for its
+/// registration counts, which is why the wave that carries packs is this small
+/// while a metadata wave is not.
+const ACTIVE_PACK_FAMILIES: usize = 2;
+
+/// One object that either needs no upload or is sealed and registered,
+/// waiting for the wave it belongs to.
+enum SealedObject {
+    Ready(RemoteObject),
+    Pending {
+        object_id: String,
+        role: ObjectRole,
+        plaintext_length: u64,
+        plaintext_sha256: String,
+        ciphertext_sha256: String,
+    },
+}
+
+async fn seal_plain_object(
     path: &Path,
     plaintext_length: u64,
     plaintext_hash: [u8; 32],
@@ -1334,7 +1386,7 @@ async fn upload_plain_object(
     provider: &dyn Provider,
     repository: &RepositoryHandle,
     cancel: &Cancellation,
-) -> Result<RemoteObject> {
+) -> Result<SealedObject> {
     let plaintext_sha256 = hex::encode(plaintext_hash);
     if let Some(value) = cache.object(
         format_repository_id,
@@ -1351,7 +1403,7 @@ async fn upload_plain_object(
         if let Some(current) = revalidate_cached_object(
             &value, cache, evidence, journal, root_key, provider, repository, cancel,
         ).await? {
-            return Ok(current);
+            return Ok(SealedObject::Ready(current));
         }
     }
     let wire_role = wire_role(role)?;
@@ -1444,29 +1496,13 @@ async fn upload_plain_object(
         .await
         .map_err(transient)??;
         drop(cpu);
-        let receipt = transfer_job::upload_registered(
-            journal,
-            &object_id,
-            format_repository_id,
-            root_key,
-            plaintext_length,
-            &plaintext_sha256,
-            provider,
-            repository,
-            cancel,
-        )
-        .await?;
-        let value = RemoteObject {
-            repository_id: format_repository_id.into(),
+        return Ok(SealedObject::Pending {
             object_id,
             role,
-            receipt,
-            ciphertext_sha256: record.intent.sha256,
             plaintext_length,
             plaintext_sha256,
-        };
-        cache.put_object(repository, &value)?;
-        return Ok(value);
+            ciphertext_sha256: record.intent.sha256,
+        });
     }
     let spool = journal.spool_path(&object_id);
     let input_path = path.to_path_buf();
@@ -1511,29 +1547,134 @@ async fn upload_plain_object(
         sha256: ciphertext_sha256.clone(),
     };
     journal.register(&intent)?;
-    let receipt = transfer_job::upload_registered(
+    Ok(SealedObject::Pending {
+        object_id,
+        role,
+        plaintext_length,
+        plaintext_sha256,
+        ciphertext_sha256,
+    })
+}
+
+/// Registers everything this wave still owes under one page, uploads it, and
+/// returns the objects in the order they were sealed.
+async fn upload_sealed_wave(
+    sealed: Vec<SealedObject>,
+    format_repository_id: &str,
+    root_key: &[u8; 32],
+    cache: &mut PackageCache,
+    journal: &mut TransferJournal,
+    provider: &dyn Provider,
+    repository: &RepositoryHandle,
+    cancel: &Cancellation,
+) -> Result<Vec<RemoteObject>> {
+    let members = sealed
+        .iter()
+        .filter_map(|object| match object {
+            SealedObject::Ready(_) => None,
+            SealedObject::Pending {
+                object_id,
+                plaintext_length,
+                plaintext_sha256,
+                ..
+            } => Some(super::journal::WaveMember {
+                object_id: object_id.clone(),
+                plaintext_length: *plaintext_length,
+                plaintext_sha256: plaintext_sha256.clone(),
+            }),
+        })
+        .collect::<Vec<_>>();
+    let mut receipts = transfer_job::upload_wave(
         journal,
-        &object_id,
+        &members,
         format_repository_id,
         root_key,
+        provider,
+        repository,
+        cancel,
+    )
+    .await?
+    .into_iter();
+    let mut uploaded = Vec::with_capacity(sealed.len());
+    for object in sealed {
+        let value = match object {
+            SealedObject::Ready(value) => value,
+            SealedObject::Pending {
+                object_id,
+                role,
+                plaintext_length,
+                plaintext_sha256,
+                ciphertext_sha256,
+            } => {
+                let value = RemoteObject {
+                    repository_id: format_repository_id.into(),
+                    object_id,
+                    role,
+                    receipt: receipts
+                        .next()
+                        .ok_or_else(|| corrupt("registration wave receipt"))?,
+                    ciphertext_sha256,
+                    plaintext_length,
+                    plaintext_sha256,
+                };
+                cache.put_object(repository, &value)?;
+                value
+            }
+        };
+        uploaded.push(value);
+    }
+    Ok(uploaded)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upload_plain_object(
+    path: &Path,
+    plaintext_length: u64,
+    plaintext_hash: [u8; 32],
+    object_id: String,
+    role: ObjectRole,
+    format_repository_id: &str,
+    root_key: &[u8; 32],
+    key: &[u8; 32],
+    limits: PackageLimits,
+    cache: &mut PackageCache,
+    evidence: &mut ObjectEvidence,
+    journal: &mut TransferJournal,
+    provider: &dyn Provider,
+    repository: &RepositoryHandle,
+    cancel: &Cancellation,
+) -> Result<RemoteObject> {
+    let sealed = seal_plain_object(
+        path,
         plaintext_length,
-        &plaintext_sha256,
+        plaintext_hash,
+        object_id,
+        role,
+        format_repository_id,
+        root_key,
+        key,
+        limits,
+        cache,
+        evidence,
+        journal,
         provider,
         repository,
         cancel,
     )
     .await?;
-    let value = RemoteObject {
-        repository_id: format_repository_id.into(),
-        object_id,
-        role,
-        receipt,
-        ciphertext_sha256,
-        plaintext_length,
-        plaintext_sha256,
-    };
-    cache.put_object(repository, &value)?;
-    Ok(value)
+    upload_sealed_wave(
+        vec![sealed],
+        format_repository_id,
+        root_key,
+        cache,
+        journal,
+        provider,
+        repository,
+        cancel,
+    )
+    .await?
+    .pop()
+    .ok_or_else(|| corrupt("registration wave result"))
 }
 
 fn unique_packs(
@@ -1856,13 +1997,15 @@ async fn build_catalog(
     )?;
     let mut built: Vec<CatalogRange> = Vec::new();
     let mut nodes = Vec::new();
+    let mut level_documents = Vec::new();
+    let mut level_sealed = Vec::new();
     for EncodedCatalog { document, bytes } in leaves {
-        let remote = match admitted_node(
+        let sealed = match admitted_node(
             &bytes, parent, format_repository_id, cache, evidence, repository,
         )? {
-            Some(existing) => existing,
+            Some(existing) => SealedObject::Ready(existing),
             None => {
-                upload_metadata_bytes(
+                seal_metadata_bytes(
                     &bytes,
                     "catalog",
                     ObjectRole::Catalog,
@@ -1881,6 +2024,24 @@ async fn build_catalog(
                 .await?
             }
         };
+        level_documents.push(document);
+        level_sealed.push(sealed);
+    }
+    // One level registers together: its children are already confirmed, so
+    // every node of it is ready at the same moment.
+    for (document, remote) in level_documents.into_iter().zip(
+        upload_sealed_wave(
+            level_sealed,
+            format_repository_id,
+            root_key,
+            cache,
+            journal,
+            provider,
+            repository,
+            cancel,
+        )
+        .await?,
+    ) {
         referenced.push(remote.clone());
         built.push(CatalogRange {
             level: 0,
@@ -1904,13 +2065,15 @@ async fn build_catalog(
             |child| child.first_key.as_str(),
             |children| wire::CatalogDocument::branch(kind, level, children.to_vec()).map_err(corrupt),
         )?;
+        let mut level_documents = Vec::new();
+        let mut level_sealed = Vec::new();
         for EncodedCatalog { document, bytes } in batches {
-            let remote = match admitted_node(
+            let sealed = match admitted_node(
                 &bytes, parent, format_repository_id, cache, evidence, repository,
             )? {
-                Some(existing) => existing,
+                Some(existing) => SealedObject::Ready(existing),
                 None => {
-                    upload_metadata_bytes(
+                    seal_metadata_bytes(
                         &bytes,
                         "catalog",
                         ObjectRole::Catalog,
@@ -1929,6 +2092,22 @@ async fn build_catalog(
                     .await?
                 }
             };
+            level_documents.push(document);
+            level_sealed.push(sealed);
+        }
+        for (document, remote) in level_documents.into_iter().zip(
+            upload_sealed_wave(
+                level_sealed,
+                format_repository_id,
+                root_key,
+                cache,
+                journal,
+                provider,
+                repository,
+                cancel,
+            )
+            .await?,
+        ) {
             referenced.push(remote.clone());
             built.push(CatalogRange {
                 level,
@@ -2060,7 +2239,7 @@ fn record_published_graph(
     )
 }
 
-async fn upload_metadata_bytes(
+async fn seal_metadata_bytes(
     bytes: &[u8],
     _prefix: &str,
     role: ObjectRole,
@@ -2075,14 +2254,14 @@ async fn upload_metadata_bytes(
     provider: &dyn Provider,
     repository: &RepositoryHandle,
     cancel: &Cancellation,
-) -> Result<RemoteObject> {
+) -> Result<SealedObject> {
     let mut file = tempfile::NamedTempFile::new_in(build_root).map_err(transient)?;
     file.write_all(bytes).map_err(transient)?;
     file.as_file_mut().sync_all().map_err(transient)?;
     let digest = hash(bytes);
     let object_id =
         wire::keyed_object_id(key, journal.job_id(), wire_role(role)?, &digest).map_err(corrupt)?;
-    upload_plain_object(
+    seal_plain_object(
         file.path(),
         bytes.len() as u64,
         digest,
