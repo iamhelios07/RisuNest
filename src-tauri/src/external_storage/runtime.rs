@@ -236,6 +236,11 @@ fn job_summary(root: &std::path::Path, mut job: DurableJob) -> Value {
                 .unwrap_or_else(|| vec!["library".into(), "referencedAssets".into()]),
         });
     }
+    if job.request.kind == JobKind::CheckRepository {
+        // The scope a paused check resumes on, which its result no longer
+        // carries once the job is settled.
+        job.summary["checkRequest"] = json!({"snapshotId": job.request.snapshot_id});
+    }
     if let Ok((done, total, items, count)) = super::journal::TransferJournal::progress(
         &job_directory(root, &job.request.connection_id, &job.id),
         &job.id,

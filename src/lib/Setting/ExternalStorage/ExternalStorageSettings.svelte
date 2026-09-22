@@ -162,6 +162,16 @@
         }
     }
 
+    /** Re-enters the paused job instead of starting one beside it. */
+    async function resumeJob(connection: ExternalConnectionSummary, job: ExternalJobSummary): Promise<void> {
+        if (job.kind === 'check-repository') {
+            const snapshotId = job.checkRequest?.snapshotId
+            await runJob(connection, 'check-repository', snapshotId ? { snapshotId } : {})
+            return
+        }
+        await runJob(connection, job.kind === 'backup' ? 'backup' : 'sync')
+    }
+
     async function runJob(
         connection: ExternalConnectionSummary,
         job: 'backup' | 'sync' | 'restore' | 'pin-history' | 'resolve-conflict' | 'cleanup' | 'check-repository',
@@ -678,8 +688,8 @@
                 {/if}
 
                 <div class="actions">
-                    {#if job && job.state === 'waiting' && job.error?.action === 'retry' && (job.kind === 'backup' || job.kind === 'sync')}
-                        <SettingButton disabled={busy} onclick={() => runJob(connection, job.kind === 'backup' ? 'backup' : 'sync')}>{strings.retryAction}</SettingButton>
+                    {#if job && job.state === 'waiting' && job.error?.action === 'retry' && (job.kind === 'backup' || job.kind === 'sync' || job.kind === 'check-repository')}
+                        <SettingButton disabled={busy} onclick={() => resumeJob(connection, job)}>{strings.retryAction}</SettingButton>
                     {/if}
                     <SettingButton busy={activeAction === `backup:${connection.id}`} disabled={busy || (job && externalJobIsActive(job))} onclick={() => runJob(connection, 'backup')}>{strings.runBackup}</SettingButton>
                     {#if connection.purpose === 'sync'}<SettingButton busy={activeAction === `sync:${connection.id}`} disabled={busy || (job && externalJobIsActive(job))} onclick={() => runJob(connection, 'sync')}>{strings.runSync}</SettingButton>{/if}

@@ -220,6 +220,9 @@ export interface ExternalJobSummary {
         targetRevision: DecimalString
         restoreAreas: ExternalRestoreArea[]
     }
+    checkRequest?: {
+        snapshotId?: string
+    }
     connectionId: string
     kind: ExternalJobKind
     state:
