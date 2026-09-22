@@ -49,6 +49,8 @@ impl PackageCache {
                object_id TEXT NOT NULL, plaintext_sha256 TEXT NOT NULL,
                value TEXT NOT NULL,
                PRIMARY KEY(repository_id,connection_identity,object_id));
+             CREATE INDEX IF NOT EXISTS remote_objects_plaintext
+               ON remote_objects(repository_id,connection_identity,plaintext_sha256);
              CREATE TABLE IF NOT EXISTS entries(
                repository_id TEXT NOT NULL, connection_identity TEXT NOT NULL,
                catalog_kind TEXT NOT NULL, entry_key TEXT NOT NULL,
@@ -133,6 +135,35 @@ impl PackageCache {
         }
         Ok(Some(value))
     }
+    /// Every object this connection recorded with these exact bytes. A
+    /// publication that encodes something already published asks this before
+    /// uploading it again under an identity of its own.
+    pub(super) fn objects_by_plaintext(
+        &self,
+        format_repository_id: &str,
+        repository: &RepositoryHandle,
+        plaintext: &str,
+    ) -> Result<Vec<RemoteObject>> {
+        let mut statement = self.db.prepare(
+            "SELECT value FROM remote_objects WHERE repository_id=?1 AND connection_identity=?2 AND plaintext_sha256=?3",
+        ).map_err(transient)?;
+        let rows = statement.query_map(
+            params![format_repository_id, repository.connection_identity, plaintext],
+            |row| row.get::<_, String>(0),
+        ).map_err(transient)?;
+        let mut objects = Vec::new();
+        for row in rows {
+            let value: RemoteObject =
+                serde_json::from_str(&row.map_err(transient)?).map_err(corrupt)?;
+            value.stored(repository)?;
+            if value.repository_id != format_repository_id || value.plaintext_sha256 != plaintext {
+                return Err(corrupt("cached object identity"));
+            }
+            objects.push(value);
+        }
+        Ok(objects)
+    }
+
     pub(super) fn forget_object(
         &self,
         format_repository_id: &str,

@@ -1588,23 +1588,30 @@ async fn build_catalog(
     })?;
     let mut nodes = Vec::new();
     for EncodedCatalog { document, bytes } in leaves {
-        let remote = upload_metadata_bytes(
-            &bytes,
-            "catalog",
-            ObjectRole::Catalog,
-            format_repository_id,
-            root_key,
-            &metadata_key,
-            limits,
-            build_root,
-            cache,
-            evidence,
-            journal,
-            provider,
-            repository,
-            cancel,
-        )
-        .await?;
+        let remote = match admitted_node(
+            &bytes, parent, format_repository_id, cache, evidence, repository,
+        )? {
+            Some(existing) => existing,
+            None => {
+                upload_metadata_bytes(
+                    &bytes,
+                    "catalog",
+                    ObjectRole::Catalog,
+                    format_repository_id,
+                    root_key,
+                    &metadata_key,
+                    limits,
+                    build_root,
+                    cache,
+                    evidence,
+                    journal,
+                    provider,
+                    repository,
+                    cancel,
+                )
+                .await?
+            }
+        };
         referenced.push(remote.clone());
         nodes.push(wire::CatalogChild {
             first_key: document.first_key,
@@ -1620,23 +1627,30 @@ async fn build_catalog(
             wire::CatalogDocument::branch(kind, level, children.to_vec()).map_err(corrupt)
         })?;
         for EncodedCatalog { document, bytes } in batches {
-            let remote = upload_metadata_bytes(
-                &bytes,
-                "catalog",
-                ObjectRole::Catalog,
-                format_repository_id,
-                root_key,
-                &metadata_key,
-                limits,
-                build_root,
-                cache,
-                evidence,
-                journal,
-                provider,
-                repository,
-                cancel,
-            )
-            .await?;
+            let remote = match admitted_node(
+                &bytes, parent, format_repository_id, cache, evidence, repository,
+            )? {
+                Some(existing) => existing,
+                None => {
+                    upload_metadata_bytes(
+                        &bytes,
+                        "catalog",
+                        ObjectRole::Catalog,
+                        format_repository_id,
+                        root_key,
+                        &metadata_key,
+                        limits,
+                        build_root,
+                        cache,
+                        evidence,
+                        journal,
+                        provider,
+                        repository,
+                        cancel,
+                    )
+                    .await?
+                }
+            };
             referenced.push(remote.clone());
             next.push(wire::CatalogChild {
                 first_key: document.first_key,
@@ -1696,6 +1710,37 @@ fn admitted_catalog(
         }
     }
     Ok(Some(objects))
+}
+
+/// A catalog node whose bytes this connection already published under the
+/// selected parent, referenced again rather than uploaded under an object id
+/// of this job's own. Admitted the way a pack is: in the parent graph, and
+/// not something this connection found unusable.
+fn admitted_node(
+    bytes: &[u8],
+    members: Option<&BTreeSet<String>>,
+    format_repository_id: &str,
+    cache: &PackageCache,
+    evidence: &ObjectEvidence,
+    repository: &RepositoryHandle,
+) -> Result<Option<RemoteObject>> {
+    let Some(members) = members else {
+        return Ok(None);
+    };
+    let plaintext = hex::encode(hash(bytes));
+    for object in cache.objects_by_plaintext(format_repository_id, repository, &plaintext)? {
+        if object.role != ObjectRole::Catalog
+            || object.plaintext_length != bytes.len() as u64
+        {
+            continue;
+        }
+        let identity = ObjectEvidence::identity(&object, repository)?;
+        if !members.contains(&identity) || evidence.known(&identity)? {
+            continue;
+        }
+        return Ok(Some(object));
+    }
+    Ok(None)
 }
 
 /// What one catalog root names: the packs its entries point at and the catalog
@@ -3289,6 +3334,63 @@ mod tests {
         );
     }
 
+    /// A catalog that changes still holds nodes it held before. Uploading
+    /// those again under this job's own identity publishes the same bytes
+    /// twice for nothing.
+    #[test]
+    fn c_a_catalog_node_already_published_is_referenced_instead_of_uploaded() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let key = [37; 32];
+            let cancel = Cancellation::default();
+            let cache = root.path().join("cache");
+            let mut published: Vec<CompletedSnapshot> = Vec::new();
+            for records in [128usize, 129] {
+                let name = format!("node-{records}");
+                // One record appended past the last key, so the leaves before
+                // it hold exactly what they held before.
+                let capture = captured_asset_inventory(
+                    root.path(), &name, published.len() as i64 + 1, records, 0, 2,
+                );
+                let meta = metadata(&name, &capture);
+                let mut transfer = journal(&root.path().join(&name), &name, &capture);
+                let parent = published
+                    .last()
+                    .map(|previous| parent_graph(previous, &repository))
+                    .transpose()
+                    .unwrap();
+                published.push(package_and_upload(
+                    capture, vec![], root.path(), &cache, meta, &key, limits(8 * 1024),
+                    parent.as_ref(), &mut transfer, &provider, &repository, &cancel,
+                ).await.unwrap());
+            }
+            let first = &published[0];
+            let second = &published[1];
+            assert_ne!(second.record_catalog, first.record_catalog);
+            let identity =
+                super::super::reachability::object_identity(&first.record_catalog, &repository)
+                    .unwrap();
+            let nodes: Vec<String> = PackageCache::open(&cache).unwrap()
+                .graph_of("format-repository", &repository, &identity).unwrap()
+                .into_iter()
+                .filter(|object| object.role == ObjectRole::Catalog)
+                .map(|object| object.object_id)
+                .collect();
+            assert!(nodes.len() > 2, "the record catalog has to have leaves to reuse");
+            let reused: Vec<&String> = nodes.iter()
+                .filter(|id| {
+                    second.referenced_objects.iter().any(|object| &object.object_id == *id)
+                })
+                .collect();
+            assert!(reused.len() + 2 >= nodes.len(), "reused {} of {}", reused.len(), nodes.len());
+            for id in reused {
+                assert_eq!(provider.upload_attempts(id), 1);
+            }
+        });
+    }
+
     /// A device that has never published here holds nothing about the parent
     /// it selects. Reading what that parent names costs metadata and saves
     /// repackaging and re-uploading everything under it.
@@ -4021,7 +4123,7 @@ mod tests {
             let mut steady = Vec::new();
             let mut packs = 0;
             let mut published: Option<CompletedSnapshot> = None;
-            for revision in 1..=3i64 {
+            for revision in 1..=6i64 {
                 let capture_id = format!("growing-capture-{revision}");
                 let job_id = format!("growing-job-{revision}");
                 let capture = captured_asset_inventory(
