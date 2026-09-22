@@ -882,7 +882,7 @@ async fn build_entries(
     let mut settled: BTreeMap<String, bool> = BTreeMap::new();
     for source in sources {
         cancel.check()?;
-        if let Some((mut cached, origin)) = cache.entry(
+        if let Some(mut cached) = cache.entry(
             format_repository_id,
             repository,
             kind,
@@ -891,27 +891,31 @@ async fn build_entries(
             source.byte_length,
         )? {
             match parent {
-                // The packs this entry names are in the selected parent graph,
+                // Every pack this entry names is in the selected parent graph,
                 // which this job protects, so their existence is settled and
                 // nothing is asked about them. They are not verified here. What
-                // this connection already found unusable is not settled by any
-                // graph and never inherits.
-                Some(roots) => {
-                    let mut usable = roots.contains(&origin);
+                // this connection already found unusable is settled by no graph
+                // and never inherits.
+                Some(members) => {
+                    let mut usable = true;
                     for pack in &cached.packs {
-                        if !usable {
+                        let identity = ObjectEvidence::identity(pack, repository)?;
+                        if !members.contains(&identity) {
+                            usable = false;
                             break;
                         }
-                        let known = match settled.get(&pack.object_id) {
+                        let known = match settled.get(&identity) {
                             Some(known) => *known,
                             None => {
-                                let known = evidence
-                                    .known(&ObjectEvidence::identity(pack, repository)?)?;
-                                settled.insert(pack.object_id.clone(), known);
+                                let known = evidence.known(&identity)?;
+                                settled.insert(identity, known);
                                 known
                             }
                         };
-                        usable = !known;
+                        if known {
+                            usable = false;
+                            break;
+                        }
                     }
                     if usable {
                         ready.push(cached);
@@ -1474,13 +1478,18 @@ async fn build_catalog(
     cancel: &Cancellation,
     referenced: &mut Vec<RemoteObject>,
 ) -> Result<RemoteObject> {
+    // Everything this call adds to the publication's reference list is a node
+    // of the catalog it is about to name.
+    let mark = referenced.len();
     if let Some(root) = cache.catalog(format_repository_id, repository, kind, fingerprint)? {
         if let Some(objects) = revalidate_cached_catalog(
             &root, cache, evidence, journal, root_key, provider, repository, cancel,
         ).await? {
             let current = objects.first().cloned().ok_or_else(|| corrupt("empty catalog closure"))?;
             referenced.extend(objects);
-            tag_published_entries(&entries, &current, kind, format_repository_id, cache, repository)?;
+            record_published_graph(
+                &entries, &referenced[mark..], &current, format_repository_id, cache, repository,
+            )?;
             return Ok(current);
         }
     }
@@ -1590,27 +1599,37 @@ async fn build_catalog(
         repository,
     )?;
     cache.put_catalog(repository, kind, fingerprint, &root)?;
-    tag_published_entries(&entries, &root, kind, format_repository_id, cache, repository)?;
+    record_published_graph(
+        &entries, &referenced[mark..], &root, format_repository_id, cache, repository,
+    )?;
     Ok(root)
 }
 
-/// Whichever root this catalog ended up being, every entry it carries belongs
-/// to it now, so a reused one stops naming the publication before last.
-fn tag_published_entries(
+/// What one catalog root names: the packs its entries point at and the catalog
+/// nodes beneath it, each by the identity that names one exact remote object.
+/// A locator repaired since an entry was written produces a different identity
+/// and simply does not match, which is the conservative direction.
+fn record_published_graph(
     entries: &[EntryPlan],
+    added: &[RemoteObject],
     root: &RemoteObject,
-    kind: wire::CatalogKind,
     format_repository_id: &str,
     cache: &PackageCache,
     repository: &RepositoryHandle,
 ) -> Result<()> {
-    let keys: Vec<String> = entries.iter().map(|entry| entry.key.clone()).collect();
-    cache.tag_entries(
+    let mut members = BTreeMap::new();
+    for object in entries.iter().flat_map(|entry| entry.packs.iter()).chain(added) {
+        members.insert(
+            super::reachability::object_identity(object, repository)?,
+            object.stored(repository)?,
+        );
+    }
+    let members: Vec<(String, wire::StoredObject)> = members.into_iter().collect();
+    cache.record_graph(
         format_repository_id,
         repository,
-        kind,
-        &keys,
         &super::reachability::object_identity(root, repository)?,
+        &members,
     )
 }
 
@@ -1685,6 +1704,12 @@ pub(crate) async fn package_and_upload(
     }
     let build_root = cache_root.join("build");
     let mut cache = PackageCache::open(cache_root)?;
+    // Read once for the whole publication. Nothing known about the selected
+    // parent means nothing is admitted on its account.
+    let members = match parent {
+        Some(graph) => Some(cache.members_of(&metadata.repository_id, repository, &graph.roots)?),
+        None => None,
+    };
     let mut evidence = ObjectEvidence::open(repository_root, journal.connection_id())?;
     let external_root = repository_root.join("external-storage");
     let repository_root_owned = repository_root.to_path_buf();
@@ -1715,7 +1740,7 @@ pub(crate) async fn package_and_upload(
         &build_root,
         root_key,
         limits,
-        parent.map(|graph| &graph.roots),
+        members.as_ref(),
         &mut cache,
         &mut evidence,
         journal,
@@ -1765,7 +1790,7 @@ pub(crate) async fn package_and_upload(
             &build_root,
             root_key,
             limits,
-            parent.map(|graph| &graph.roots),
+            members.as_ref(),
             &mut cache,
             &mut evidence,
             journal,
@@ -1842,7 +1867,7 @@ pub(crate) async fn package_and_upload(
             &build_root,
             root_key,
             limits,
-            parent.map(|graph| &graph.roots),
+            members.as_ref(),
             &mut cache,
             &mut evidence,
             journal,
@@ -2871,10 +2896,10 @@ mod tests {
     }
 
     /// Membership of the parent graph settles that nothing collected a pack.
-    /// It says nothing about a pack this connection already found unusable,
-    /// and that answer is not inherited by admitting the entry that names it.
+    /// It says nothing about one this connection already found unusable, and
+    /// that answer is not inherited by admitting the entry that names it.
     #[test]
-    fn c_a_pack_already_found_unusable_is_not_admitted_by_its_tag() {
+    fn c_a_pack_already_found_unusable_is_not_admitted_by_its_graph() {
         runtime().block_on(async {
             let root = tempfile::tempdir().unwrap();
             let cache = root.path().join("cache");
@@ -2923,6 +2948,62 @@ mod tests {
             for object in &completed.referenced_objects {
                 assert!(provider.holds(&object.receipt.locator.object), "{}", object.object_id);
             }
+        });
+    }
+
+    /// A backup publishes into the same cache without selecting a parent. What
+    /// the sync before it published still has to be reusable by the sync after
+    /// it, so a publication records what its own graph holds and takes nothing
+    /// away from another. Measured against the same sequence without it.
+    #[test]
+    fn c_a_publication_without_a_parent_does_not_cost_the_next_one_its_reuse() {
+        runtime().block_on(async {
+            let mut measured = Vec::new();
+            for unparented in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let cache = root.path().join("cache");
+                let provider = FakeProvider::new(false);
+                let repository = fake::repository();
+                let key = [23; 32];
+                let cancel = Cancellation::default();
+                let mut head = None;
+                let mut reads = 0;
+                let sequence: Vec<(&str, usize, bool)> = if unparented {
+                    vec![("sync-1", 4, false), ("between", 4, false), ("sync-2", 5, true)]
+                } else {
+                    vec![("sync-1", 4, false), ("sync-2", 5, true)]
+                };
+                for (name, assets, parented) in sequence {
+                    let capture = captured_asset_inventory(root.path(), name, 1, 1, 1, assets);
+                    let meta = metadata(name, &capture);
+                    let mut transfer = journal(&root.path().join(name), name, &capture);
+                    let graph = parented
+                        .then(|| parent_graph(head.as_ref().unwrap(), &repository).unwrap());
+                    let before = provider.read_count();
+                    let completed = package_and_upload(
+                        capture, vec![], root.path(), &cache, meta, &key, limits(128 * 1024),
+                        graph.as_ref(), &mut transfer, &provider, &repository, &cancel,
+                    ).await.unwrap();
+                    reads = provider.read_count() - before;
+                    if head.is_none() {
+                        head = Some(completed);
+                    }
+                }
+                let head = head.unwrap();
+                for object in head.referenced_objects.iter()
+                    .filter(|object| object.role == ObjectRole::Pack)
+                {
+                    assert_eq!(provider.upload_attempts(&object.object_id), 1);
+                }
+                // What the first publication holds is still on record after
+                // everything published after it.
+                let graph = parent_graph(&head, &repository).unwrap();
+                assert!(!PackageCache::open(&cache).unwrap()
+                    .members_of("format-repository", &repository, &graph.roots).unwrap()
+                    .is_empty());
+                measured.push(reads);
+            }
+            assert_eq!(measured[0], measured[1], "{measured:?}");
         });
     }
 

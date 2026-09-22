@@ -11,7 +11,10 @@ use super::{
 };
 use risunest_external_storage_format::snapshot as wire;
 use rusqlite::{params, Connection, OptionalExtension};
-use std::{fs, path::Path};
+use std::{collections::BTreeSet, fs, path::Path};
+
+/// How many published graphs one connection keeps on hand.
+const RETAINED_GRAPHS: i64 = 32;
 
 pub(super) fn kind_name(kind: wire::CatalogKind) -> &'static str {
     match kind {
@@ -50,31 +53,36 @@ impl PackageCache {
                repository_id TEXT NOT NULL, connection_identity TEXT NOT NULL,
                catalog_kind TEXT NOT NULL, entry_key TEXT NOT NULL,
                content_sha256 TEXT NOT NULL, byte_length INTEGER NOT NULL,
-               value TEXT NOT NULL, source TEXT NOT NULL,
+               value TEXT NOT NULL,
                PRIMARY KEY(repository_id,connection_identity,catalog_kind,entry_key));
              CREATE TABLE IF NOT EXISTS catalogs(
                repository_id TEXT NOT NULL, connection_identity TEXT NOT NULL,
                catalog_kind TEXT NOT NULL, fingerprint TEXT NOT NULL,
                value TEXT NOT NULL,
-               PRIMARY KEY(repository_id,connection_identity,catalog_kind,fingerprint));",
+               PRIMARY KEY(repository_id,connection_identity,catalog_kind,fingerprint));
+             CREATE TABLE IF NOT EXISTS graph_members(
+               repository_id TEXT NOT NULL, connection_identity TEXT NOT NULL,
+               root_identity TEXT NOT NULL, member_identity TEXT NOT NULL,
+               member_stored TEXT NOT NULL,
+               PRIMARY KEY(repository_id,connection_identity,root_identity,member_identity));",
         )
         .map_err(transient)?;
-        // Rows without the publication they belong to can never be admitted,
-        // and everything here is rebuildable from authenticated metadata, so
-        // the table starts again rather than carrying a column it has to guess.
+        // Which publication an entry belonged to is no longer carried by the
+        // row, and everything here is rebuildable, so a table that still
+        // carries it starts again rather than being read two ways.
         let tagged: bool = db
             .prepare("SELECT 1 FROM pragma_table_info('entries') WHERE name='source'")
             .map_err(transient)?
             .exists([])
             .map_err(transient)?;
-        if !tagged {
+        if tagged {
             db.execute_batch(
                 "DROP TABLE entries;
                  CREATE TABLE entries(
                    repository_id TEXT NOT NULL, connection_identity TEXT NOT NULL,
                    catalog_kind TEXT NOT NULL, entry_key TEXT NOT NULL,
                    content_sha256 TEXT NOT NULL, byte_length INTEGER NOT NULL,
-                   value TEXT NOT NULL, source TEXT NOT NULL,
+                   value TEXT NOT NULL,
                    PRIMARY KEY(repository_id,connection_identity,catalog_kind,entry_key));",
             )
             .map_err(transient)?;
@@ -147,18 +155,17 @@ impl PackageCache {
         key: &str,
         digest: &str,
         length: u64,
-    ) -> Result<Option<(EntryPlan, String)>> {
-        let row: Option<(String, String)> = self.db.query_row(
-            "SELECT value,source FROM entries WHERE repository_id=?1 AND connection_identity=?2 AND catalog_kind=?3 AND entry_key=?4 AND content_sha256=?5 AND byte_length=?6",
-            params![format_repository_id,repository.connection_identity,kind_name(kind),key,digest,i64::try_from(length).map_err(corrupt)?],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+    ) -> Result<Option<EntryPlan>> {
+        let encoded: Option<String> = self.db.query_row(
+            "SELECT value FROM entries WHERE repository_id=?1 AND connection_identity=?2 AND catalog_kind=?3 AND entry_key=?4 AND content_sha256=?5 AND byte_length=?6",
+            params![format_repository_id,repository.connection_identity,kind_name(kind),key,digest,i64::try_from(length).map_err(corrupt)?], |row| row.get(0),
         ).optional().map_err(transient)?;
-        let Some((encoded, source)) = row else {
+        let Some(encoded) = encoded else {
             return Ok(None);
         };
         let value: EntryPlan = serde_json::from_str(&encoded).map_err(corrupt)?;
         value.validate(format_repository_id, repository)?;
-        Ok(Some((value, source)))
+        Ok(Some(value))
     }
     pub(super) fn put_entries(
         &self,
@@ -171,8 +178,8 @@ impl PackageCache {
         for value in values {
             value.validate(format_repository_id, repository)?;
             transaction.execute(
-                "INSERT INTO entries VALUES(?1,?2,?3,?4,?5,?6,?7,'')
-                 ON CONFLICT(repository_id,connection_identity,catalog_kind,entry_key) DO UPDATE SET content_sha256=excluded.content_sha256,byte_length=excluded.byte_length,value=excluded.value,source=''",
+                "INSERT INTO entries VALUES(?1,?2,?3,?4,?5,?6,?7)
+                 ON CONFLICT(repository_id,connection_identity,catalog_kind,entry_key) DO UPDATE SET content_sha256=excluded.content_sha256,byte_length=excluded.byte_length,value=excluded.value",
                 params![format_repository_id,repository.connection_identity,kind_name(kind),value.key,value.content_sha256,i64::try_from(value.byte_length).map_err(corrupt)?,serde_json::to_string(value).map_err(corrupt)?],
             ).map_err(transient)?;
         }
@@ -180,35 +187,70 @@ impl PackageCache {
         Ok(())
     }
 
-    /// The publication a row belongs to is only known once its catalog root
-    /// exists, so every entry the new catalog carries is tagged then, reused
-    /// ones included. A row left untagged by a stopped publication names no
-    /// root and is never admitted.
-    pub(super) fn tag_entries(
+    /// What one published catalog root names, so a later publication can see
+    /// that an object it holds belongs to the graph it selected as its parent
+    /// without asking the provider about it. Recorded once the root exists.
+    pub(super) fn record_graph(
         &self,
         format_repository_id: &str,
         repository: &RepositoryHandle,
-        kind: wire::CatalogKind,
-        keys: &[String],
-        source: &str,
+        root_identity: &str,
+        members: &[(String, wire::StoredObject)],
     ) -> Result<()> {
-        if source.is_empty() {
-            return Err(corrupt("untagged catalog root"));
+        if root_identity.is_empty() {
+            return Err(corrupt("catalog root has no identity"));
         }
         let transaction = self.db.unchecked_transaction().map_err(transient)?;
         {
-            let mut statement = transaction.prepare(
-                "UPDATE entries SET source=?5 WHERE repository_id=?1 AND connection_identity=?2 AND catalog_kind=?3 AND entry_key=?4",
-            ).map_err(transient)?;
-            for key in keys {
+            let mut statement = transaction
+                .prepare("INSERT OR REPLACE INTO graph_members VALUES(?1,?2,?3,?4,?5)")
+                .map_err(transient)?;
+            for (identity, member) in members {
                 statement.execute(params![
-                    format_repository_id, repository.connection_identity, kind_name(kind), key, source,
+                    format_repository_id, repository.connection_identity, root_identity, identity,
+                    serde_json::to_string(member).map_err(corrupt)?,
                 ]).map_err(transient)?;
             }
         }
+        // Only a recent root can still be selected as a parent, and a graph
+        // nothing names is taking space for nothing.
+        transaction.execute(
+            "DELETE FROM graph_members WHERE repository_id=?1 AND connection_identity=?2
+             AND root_identity NOT IN (
+               SELECT root_identity FROM graph_members
+               WHERE repository_id=?1 AND connection_identity=?2
+               GROUP BY root_identity ORDER BY MIN(rowid) DESC LIMIT ?3)",
+            params![format_repository_id, repository.connection_identity, RETAINED_GRAPHS],
+        ).map_err(transient)?;
         transaction.commit().map_err(transient)?;
         Ok(())
     }
+
+    /// Everything the selected parent graph holds, read once for a whole
+    /// publication. An empty answer means this cache knows nothing about that
+    /// parent, which admits nothing and asks about everything.
+    pub(super) fn members_of(
+        &self,
+        format_repository_id: &str,
+        repository: &RepositoryHandle,
+        roots: &BTreeSet<String>,
+    ) -> Result<BTreeSet<String>> {
+        let mut statement = self.db.prepare(
+            "SELECT member_identity FROM graph_members WHERE repository_id=?1 AND connection_identity=?2 AND root_identity=?3",
+        ).map_err(transient)?;
+        let mut members = BTreeSet::new();
+        for root in roots {
+            let rows = statement.query_map(
+                params![format_repository_id, repository.connection_identity, root],
+                |row| row.get::<_, String>(0),
+            ).map_err(transient)?;
+            for row in rows {
+                members.insert(row.map_err(transient)?);
+            }
+        }
+        Ok(members)
+    }
+
     pub(super) fn catalog(
         &self,
         format_repository_id: &str,
@@ -304,10 +346,10 @@ mod tests {
     use super::*;
     use crate::external_storage::{contract::ErrorKind, fake};
 
-    /// Nothing here is authoritative, so a cache without the publication its
-    /// rows belong to starts again instead of guessing one.
+    /// Nothing here is authoritative, so a cache that still names a row's
+    /// publication on the row starts again instead of being read two ways.
     #[test]
-    fn entries_without_their_publication_are_discarded_on_open() {
+    fn entries_naming_their_publication_are_discarded_on_open() {
         let root = tempfile::tempdir().unwrap();
         let repository = fake::repository();
         {
@@ -317,9 +359,9 @@ mod tests {
                    repository_id TEXT NOT NULL, connection_identity TEXT NOT NULL,
                    catalog_kind TEXT NOT NULL, entry_key TEXT NOT NULL,
                    content_sha256 TEXT NOT NULL, byte_length INTEGER NOT NULL,
-                   value TEXT NOT NULL,
+                   value TEXT NOT NULL, source TEXT NOT NULL,
                    PRIMARY KEY(repository_id,connection_identity,catalog_kind,entry_key));
-                 INSERT INTO entries VALUES('format-repository','synthetic-identity','assets','a','b',1,'{}');",
+                 INSERT INTO entries VALUES('format-repository','synthetic-identity','assets','a','b',1,'{}','root');",
             ).unwrap();
         }
         let cache = PackageCache::open(root.path()).unwrap();
@@ -330,10 +372,7 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(
-            cache
-                .tag_entries("format-repository", &repository, wire::CatalogKind::Assets, &[], "")
-                .unwrap_err()
-                .kind,
+            cache.record_graph("format-repository", &repository, "", &[]).unwrap_err().kind,
             ErrorKind::Corrupt,
         );
     }
