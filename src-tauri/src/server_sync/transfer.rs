@@ -279,6 +279,14 @@ impl<'a> Transfer<'a> {
         }
     }
     fn store_download(&self, hash: &str, bytes: &[u8]) -> Result<()> {
+        if self.destination.is_none() {
+            // The derived cache owns where a body of this size belongs, and
+            // collects the small ones so a page of them lands together.
+            if self.cache.put(bytes)? != hash {
+                return Err(SyncError::new("transfer-target-mismatch", 502));
+            }
+            return Ok(());
+        }
         prepare_checked(
             self.destination(hash, bytes.len() as u64)?,
             &mut std::io::Cursor::new(bytes),
@@ -721,6 +729,8 @@ impl<'a> Transfer<'a> {
             return Err(SyncError::new("transfer-count-mismatch", 502));
         }
         let mut declined = Vec::new();
+        // One reply's bodies become durable together.
+        let batch = self.cache.begin_batch()?;
         for (target, frame) in targets.iter().zip(frames) {
             self.ensure_active()?;
             match frame {
@@ -753,6 +763,7 @@ impl<'a> Transfer<'a> {
                 }
             }
         }
+        batch.commit()?;
         Ok(declined)
     }
 
@@ -899,10 +910,10 @@ impl<'a> Transfer<'a> {
         let identities = candidates
             .iter()
             .zip(&sources)
-            .map(|(hash, file)| {
+            .map(|(hash, body)| {
                 Ok(Base {
                     hash: hash.clone(),
-                    size: file.metadata()?.len(),
+                    size: body.len()?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;

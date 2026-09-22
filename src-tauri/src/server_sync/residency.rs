@@ -330,12 +330,11 @@ pub(crate) fn open_or_hydrate_with_check(
     super::transfer::Transfer::new(&client, &cache)?
         .with_check(check)
         .download(&[digest.to_owned()], &[])?;
-    let mut file = cache
-        .cas
-        .open_object(digest)?
+    let mut body = cache
+        .open_derived(digest)?
         .ok_or_else(|| SyncError::new("hydration-incomplete", 502))?;
     let _guard = crate::asset_repository::coordinator::lock_repository_mutation()?;
-    super::transfer::prepare_checked(&cas, &mut file, digest, proof.size, check)?;
+    super::transfer::prepare_checked(&cas, &mut body, digest, proof.size, check)?;
     Ok(cas.open_object(digest)?)
 }
 

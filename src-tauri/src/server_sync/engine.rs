@@ -1445,7 +1445,7 @@ impl PersistentStore {
                                             expected
                                                 .filter(|(candidate, _)| *candidate == hash)
                                                 .map(|(_, size)| size)
-                                                .or(cache.cas.stat_object(hash)?),
+                                                .or(cache.stat_derived(hash)?),
                                         ))
                                     })
                                     .collect::<Result<Vec<_>>>()?;
@@ -2863,7 +2863,7 @@ impl PersistentStore {
                 .map(|hash| {
                     let size = match native.stat_object(hash)? {
                         Some(size) => size,
-                        None => match cache.cas.stat_object(hash)? {
+                        None => match cache.stat_derived(hash)? {
                             Some(size) => size,
                             None => remote
                                 .and_then(|(residency, context)| {
@@ -2898,7 +2898,7 @@ impl PersistentStore {
             for object in &registrations {
                 check_active()?;
                 if native.stat_object(&object.object_hash)? != Some(object.byte_size) {
-                    if cache.cas.stat_object(&object.object_hash)?.is_none()
+                    if cache.stat_derived(&object.object_hash)?.is_none()
                         && remote.is_some_and(|(residency, context)| {
                             residency
                                 .confirms(&object.object_hash, Some(object.byte_size), context)
@@ -2908,8 +2908,7 @@ impl PersistentStore {
                         continue;
                     }
                     let mut source = cache
-                        .cas
-                        .open_object(&object.object_hash)?
+                        .open_derived(&object.object_hash)?
                         .ok_or_else(|| SyncError::new("missing-downloaded-payload", 409))?;
                     native.prepare_reader_expected(
                         &mut source,

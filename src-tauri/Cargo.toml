@@ -22,6 +22,7 @@ risunest-release-update = { path = "../crates/release-update" }
 risunest-sync-wire = { path = "../crates/sync-wire" }
 risunest-sync-connect = { path = "../crates/sync-connect" }
 risunest-external-storage-format = { path = "../crates/external-storage-format" }
+risunest-small-object-store = { path = "../crates/small-object-store" }
 zeroize = "1"
 tauri = { version = "2.11.5", features = ["protocol-asset", "devtools"] }
 rusqlite = { version = "0.40.2", features = ["bundled", "backup"] }
