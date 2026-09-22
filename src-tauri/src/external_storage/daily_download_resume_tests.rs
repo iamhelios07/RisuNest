@@ -246,8 +246,8 @@ fn captured(root: &Path, bytes: &[u8]) -> CapturedSnapshot {
         .join("external-storage")
         .join("captures")
         .join("capture-daily-resume");
-    let objects = root.join("external-storage").join("objects");
-    let mut catalog = CaptureCatalog::create(&directory, &objects, None).unwrap();
+    let external = root.join("external-storage");
+    let mut catalog = CaptureCatalog::create(&directory, &external, None).unwrap();
     let identity = CaptureIdentity {
         store_id: "device".into(),
         library_epoch: "library".into(),
@@ -464,7 +464,7 @@ fn daily_download_resume_preserves_verified_packs_and_durable_budget() {
         assert_eq!(prepared.records.len(), 1);
         assert_eq!(prepared.records[0].content_hash, source_hash);
         assert_eq!(prepared.records[0].byte_length, source.len() as u64);
-        let mut restored = File::open(&prepared.records[0].path).unwrap();
+        let mut restored = File::open(prepared.records[0].source.file().unwrap()).unwrap();
         assert_eq!(
             hex::encode(hash_reader(&mut restored, source.len() as u64).unwrap()),
             source_hash

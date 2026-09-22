@@ -178,10 +178,10 @@ fn prepare_receive_input(
     };
     let records = downloaded.records.into_iter().map(|record| Ok(ExternalSnapshotRecord {
         key: record.key, content_hash: record.content_hash,
-        byte_length: record.byte_length, path: record.path,
+        byte_length: record.byte_length, source: record.source,
     }));
     let objects = downloaded.objects.into_iter().map(|object| Ok(ExternalSnapshotObject {
-        content_hash: object.content_hash, byte_length: object.byte_length, path: object.path,
+        content_hash: object.content_hash, byte_length: object.byte_length, source: object.source,
     }));
     let commit = store.prepare_external_snapshot_application(&application, records, objects)
         .map_err(local_error)?;
@@ -2222,7 +2222,8 @@ mod receive_tests {
             fingerprint: library_fingerprint.clone(), library_fingerprint, logical_revision: 7,
             staging_root: staging, captured_by_device: None, objects: vec![],
             records: vec![super::super::snapshot_restore::PreparedRecord {
-                key, content_hash: record.hash, byte_length: record.size, path,
+                key, content_hash: record.hash, byte_length: record.size,
+                source: super::super::content_store::ObjectSource::File(path),
             }],
         };
         (directory, store, job, downloaded)
@@ -2595,7 +2596,7 @@ mod receive_tests {
                 "section" => fs::write(&section.sources[0].path, b"corrupt").unwrap(),
                 "snapshot" => downloaded.snapshot_id = "other-snapshot".into(),
                 "repository" => downloaded.repository_id = "other-repository".into(),
-                "record" => fs::write(&downloaded.records[0].path, b"corrupt").unwrap(),
+                "record" => fs::write(downloaded.records[0].source.file().unwrap(), b"corrupt").unwrap(),
                 _ => unreachable!(),
             }
             assert!(prepare_receive_input(&mut store, &job, job.admission_identity.clone(),

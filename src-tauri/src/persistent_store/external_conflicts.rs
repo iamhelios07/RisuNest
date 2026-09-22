@@ -390,6 +390,7 @@ pub(crate) fn registered_conflict_roots(db: &Connection, repository_root: &Path)
         roots.assets.object_hashes.extend(registered.assets.object_hashes);
         roots.catalogs.extend(registered.catalogs);
         roots.logical_records.extend(registered.logical_records);
+        roots.content_objects.extend(registered.content_objects);
     }
     Ok(roots)
 }
@@ -520,7 +521,7 @@ mod tests {
         let object_directory = external.join("objects");
         let mut catalog = crate::external_storage::capture::CaptureCatalog::create(
             &capture_directory,
-            &object_directory,
+            &external,
             None,
         )
         .unwrap();
@@ -558,7 +559,9 @@ mod tests {
         assert_eq!(restored.local.identity, identity);
         let roots = registered_conflict_roots(&reopened, root.path()).unwrap();
         assert_eq!(roots.catalogs.len(), 1);
-        assert_eq!(roots.logical_records.len(), 1);
+        // The capture's one record is small, so the content store holds it.
+        assert_eq!(roots.logical_records.len(), 0);
+        assert_eq!(roots.content_objects.len(), 1);
         assert!(conflict_source_descriptor(
             &reopened,
             root.path(),

@@ -118,6 +118,8 @@ export interface ServerSyncCacheUsage {
   totalBytes: number;
   protectedBytes: number;
   reclaimableBytes: number;
+  /** Part of totalBytes: what the cache's object database occupies on disk. */
+  databaseBytes: number;
   blockedReason: string | null;
 }
 export const getServerSyncBackupInventory = (before?: ServerSyncBackupCursor) =>

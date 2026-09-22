@@ -58,39 +58,7 @@ pub(crate) const SMALL_OBJECT_BYTES: usize = 64 * 1024;
 const BATCH_ROWS: usize = 256;
 const BATCH_BYTES: usize = 8 * 1024 * 1024;
 
-/// An owned file or a bounded body already in memory. A database body is never
-/// written out to a temporary file to satisfy a file-only reader.
-pub(crate) enum Body {
-    File(std::fs::File),
-    Bytes(Cursor<Vec<u8>>),
-}
-
-impl Body {
-    pub fn len(&self) -> Result<u64> {
-        Ok(match self {
-            Self::File(file) => file.metadata()?.len(),
-            Self::Bytes(bytes) => bytes.get_ref().len() as u64,
-        })
-    }
-}
-
-impl Read for Body {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            Self::File(file) => file.read(buffer),
-            Self::Bytes(bytes) => bytes.read(buffer),
-        }
-    }
-}
-
-impl std::io::Seek for Body {
-    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
-        match self {
-            Self::File(file) => file.seek(to),
-            Self::Bytes(bytes) => bytes.seek(to),
-        }
-    }
-}
+pub(crate) use small_object_store::Body;
 
 #[derive(Default)]
 struct Staged {
@@ -252,12 +220,12 @@ impl Cache {
     /// The derived cache only, matching `stat_derived`.
     pub fn open_derived(&self, hash: &str) -> Result<Option<Body>> {
         if let Some((_, bytes)) = self.staged()?.bodies.get(hash) {
-            return Ok(Some(Body::Bytes(Cursor::new(bytes.clone()))));
+            return Ok(Some(Body::bytes(bytes.clone())));
         }
         let stored = small_object_store::read(&*self.objects()?, hash, SMALL_OBJECT_BYTES)
             .map_err(|_| SyncError::new("cached-object-corrupt", 409))?;
         if let Some(bytes) = stored {
-            return Ok(Some(Body::Bytes(Cursor::new(bytes))));
+            return Ok(Some(Body::bytes(bytes)));
         }
         Ok(self.cas.open_object(hash)?.map(Body::File))
     }

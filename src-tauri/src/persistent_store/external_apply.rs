@@ -18,12 +18,13 @@ use crate::{
         encode_logical_record_key, LogicalRecordEnvelope, LogicalRecordLocator,
     },
 };
+use crate::external_storage::content_store::{Body, ContentStore, ObjectSource};
 use risunest_external_storage_format::format::{fingerprint, library_fingerprint_domain};
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    fs::{self, File},
+    fs,
     io::Read,
     path::{Path, PathBuf},
 };
@@ -33,14 +34,14 @@ pub(crate) struct ExternalSnapshotRecord {
     pub key: String,
     pub content_hash: String,
     pub byte_length: u64,
-    pub path: PathBuf,
+    pub source: ObjectSource,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct ExternalSnapshotObject {
     pub content_hash: String,
     pub byte_length: u64,
-    pub path: PathBuf,
+    pub source: ObjectSource,
 }
 
 pub(crate) struct ExternalSnapshotApplication<'a> {
@@ -100,15 +101,21 @@ impl PersistentStore {
         }
 
         let root = verified_staging_root(application.staging_root)?;
+        // A snapshot assembled from a local capture names bodies the capture
+        // store beside it holds. One that arrived over the wire stages only
+        // files, and its staging directory has no such store.
+        let content = ContentStore::open_existing(&root.join("external-storage"))?;
         let stage = self.replace_begin()?;
         let staged = (|| {
-            let object_sizes = stage_objects(&self.repository_root, &root, objects)?;
+            let object_sizes =
+                stage_objects(&self.repository_root, &root, content.as_ref(), objects)?;
             let record_hashes = stage_records(
                 &mut self.connection,
                 &self.repository_root,
                 &stage.staging_id,
                 application.expected_revision,
                 &root,
+                content.as_ref(),
                 &object_sizes,
                 records,
             )?;
@@ -150,7 +157,26 @@ fn verified_staging_root(root: &Path) -> StoreResult<PathBuf> {
     Ok(fs::canonicalize(root)?)
 }
 
-fn open_staged_file(root: &Path, path: &Path, expected_size: u64) -> StoreResult<File> {
+/// One snapshot input. A downloaded body is a file confined to the staging
+/// directory it arrived in; a captured body is asked for by identity, wherever
+/// the capture store put it.
+fn open_snapshot_input(
+    root: &Path,
+    content: Option<&ContentStore>,
+    source: &ObjectSource,
+    expected_size: u64,
+) -> StoreResult<Body> {
+    let path = match source {
+        ObjectSource::Captured(digest) => {
+            let content = content
+                .ok_or_else(|| validation("External snapshot capture store is unavailable"))?;
+            if content.stat(digest)? != Some(expected_size) {
+                return invalid("External snapshot input size differs from its catalog");
+            }
+            return Ok(content.open_body(digest)?);
+        }
+        ObjectSource::File(path) => path,
+    };
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_file() || crate::trust_boundary::is_link_like(&metadata) {
         return invalid("External snapshot input must be a regular file");
@@ -163,7 +189,7 @@ fn open_staged_file(root: &Path, path: &Path, expected_size: u64) -> StoreResult
     if file.metadata()?.len() != expected_size {
         return invalid("External snapshot input size differs from its catalog");
     }
-    Ok(file)
+    Ok(Body::File(file))
 }
 
 fn validate_hash(hash: &str, subject: &str) -> StoreResult<[u8; 32]> {
@@ -181,6 +207,7 @@ fn validate_hash(hash: &str, subject: &str) -> StoreResult<[u8; 32]> {
 fn stage_objects<O>(
     repository_root: &Path,
     staging_root: &Path,
+    content: Option<&ContentStore>,
     objects: O,
 ) -> StoreResult<BTreeMap<String, u64>>
 where
@@ -197,7 +224,8 @@ where
         {
             return invalid("External snapshot contains a duplicate object hash");
         }
-        let mut source = open_staged_file(staging_root, &object.path, object.byte_length)?;
+        let mut source =
+            open_snapshot_input(staging_root, content, &object.source, object.byte_length)?;
         let prepared =
             cas.prepare_reader_expected(&mut source, &object.content_hash, object.byte_length)?;
         if prepared.content_hash != object.content_hash || prepared.byte_size != object.byte_length
@@ -208,12 +236,14 @@ where
     Ok(sizes)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stage_records<R>(
     connection: &mut rusqlite::Connection,
     repository_root: &Path,
     generation: &str,
     expected_revision: i64,
     staging_root: &Path,
+    content: Option<&ContentStore>,
     objects: &BTreeMap<String, u64>,
     records: R,
 ) -> StoreResult<BTreeMap<String, [u8; 32]>>
@@ -263,6 +293,7 @@ where
                 &active,
                 generation,
                 staging_root,
+                content,
                 objects,
                 record,
                 locator,
@@ -280,6 +311,7 @@ where
             &active,
             generation,
             staging_root,
+            content,
             objects,
             record,
             locator,
@@ -318,6 +350,7 @@ fn apply_record(
     active: &str,
     generation: &str,
     staging_root: &Path,
+    content: Option<&ContentStore>,
     objects: &BTreeMap<String, u64>,
     record: ExternalSnapshotRecord,
     locator: LogicalRecordLocator,
@@ -329,7 +362,7 @@ fn apply_record(
     {
         return invalid("External snapshot logical key is not canonical");
     }
-    let bytes = read_verified_record(staging_root, &record)?;
+    let bytes = read_verified_record(staging_root, content, &record)?;
     let mut envelope = decode_logical_record(&bytes)
         .map_err(|_| validation("External snapshot logical record is invalid"))?;
     rows::validate_locator_envelope(&locator, &envelope)?;
@@ -366,8 +399,12 @@ fn apply_record(
     Ok(())
 }
 
-fn read_verified_record(root: &Path, record: &ExternalSnapshotRecord) -> StoreResult<Vec<u8>> {
-    let mut source = open_staged_file(root, &record.path, record.byte_length)?;
+fn read_verified_record(
+    root: &Path,
+    content: Option<&ContentStore>,
+    record: &ExternalSnapshotRecord,
+) -> StoreResult<Vec<u8>> {
+    let mut source = open_snapshot_input(root, content, &record.source, record.byte_length)?;
     let capacity = usize::try_from(record.byte_length)
         .map_err(|_| validation("External logical record is too large for this platform"))?;
     let mut bytes = Vec::with_capacity(capacity.min(1024 * 1024));
@@ -380,7 +417,7 @@ fn read_verified_record(root: &Path, record: &ExternalSnapshotRecord) -> StoreRe
     {
         return invalid("External logical record differs from its catalog hash and size");
     }
-    if source.metadata()?.len() != record.byte_length {
+    if source.len()? != record.byte_length {
         return invalid("External logical record changed while staging");
     }
     Ok(bytes)

@@ -1,3 +1,4 @@
+use crate::external_storage::content_store::ObjectSource;
 use super::*;
 use crate::{
     asset_repository::owner_manifest_codec::{encode_owner_manifest, OwnerManifestEntry},
@@ -57,7 +58,7 @@ fn write_record(
             key,
             content_hash: encoded.hash.clone(),
             byte_length: encoded.size,
-            path,
+            source: ObjectSource::File(path),
         },
         hex::decode(encoded.hash).unwrap().try_into().unwrap(),
     )
@@ -71,7 +72,7 @@ fn write_object(root: &Path, bytes: &[u8]) -> ExternalSnapshotObject {
     ExternalSnapshotObject {
         content_hash: object.hash,
         byte_length: object.size,
-        path,
+        source: ObjectSource::File(path),
     }
 }
 

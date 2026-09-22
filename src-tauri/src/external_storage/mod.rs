@@ -8,6 +8,7 @@ pub(crate) mod cleanup;
 pub(crate) mod connection;
 pub(crate) mod connection_commands;
 pub(crate) mod connection_store;
+pub(crate) mod content_store;
 pub(crate) mod contract;
 pub(crate) mod control;
 #[cfg(test)]

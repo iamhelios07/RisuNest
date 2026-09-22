@@ -47,6 +47,47 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 
 pub const TABLE: &str = "small_objects";
 
+/// What a reader receives for one object: the owner's file, or a body this
+/// store already holds in memory. An owner never writes a database body out to
+/// a temporary file to satisfy a caller that only accepts `File`.
+pub enum Body {
+    File(std::fs::File),
+    Bytes(std::io::Cursor<Vec<u8>>),
+}
+
+impl Body {
+    pub fn bytes(body: Vec<u8>) -> Self {
+        Self::Bytes(std::io::Cursor::new(body))
+    }
+    pub fn len(&self) -> std::io::Result<u64> {
+        Ok(match self {
+            Self::File(file) => file.metadata()?.len(),
+            Self::Bytes(body) => body.get_ref().len() as u64,
+        })
+    }
+    pub fn is_empty(&self) -> std::io::Result<bool> {
+        Ok(self.len()? == 0)
+    }
+}
+
+impl std::io::Read for Body {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::File(file) => std::io::Read::read(file, buffer),
+            Self::Bytes(body) => std::io::Read::read(body, buffer),
+        }
+    }
+}
+
+impl std::io::Seek for Body {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        match self {
+            Self::File(file) => std::io::Seek::seek(file, to),
+            Self::Bytes(body) => std::io::Seek::seek(body, to),
+        }
+    }
+}
+
 /// Lowercase hexadecimal SHA-256, the identity both owners already use.
 pub fn identity(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))

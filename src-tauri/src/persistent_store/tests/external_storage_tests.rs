@@ -789,12 +789,11 @@ fn external_capture_carries_archived_character_state_and_payload_dependencies() 
         .db
         .query_row("SELECT hash FROM records WHERE key=?1", [&key], |row| row.get(0))
         .unwrap();
-    let bytes = std::fs::read(
-        directory
-            .path()
-            .join("external-storage/objects")
-            .join(record_hash),
+    let bytes = crate::external_storage::content_store::ContentStore::open(
+        &directory.path().join("external-storage"),
     )
+    .unwrap()
+    .read_all(&record_hash)
     .unwrap();
     assert!(matches!(
         decode_logical_record(&bytes).unwrap(),
@@ -1044,10 +1043,10 @@ fn external_capture_projects_only_changed_records_at_the_pinned_snapshot() {
         }
     }
     let (directory, mut store, _) = capture_fixture();
-    let objects = directory.path().join("external-storage/objects");
+    let external = directory.path().join("external-storage");
     let mut full = CaptureCatalog::create(
         &directory.path().join("external-storage/full"),
-        &objects,
+        &external,
         None,
     )
     .unwrap();
@@ -1067,7 +1066,7 @@ fn external_capture_projects_only_changed_records_at_the_pinned_snapshot() {
     let (digest, path, _) = full.manifest().unwrap();
     let mut delta = CaptureCatalog::create(
         &directory.path().join("external-storage/delta"),
-        &objects,
+        &external,
         Some((path, &digest)),
     )
     .unwrap();
@@ -1092,8 +1091,12 @@ fn external_capture_projects_only_changed_records_at_the_pinned_snapshot() {
         .collect::<Result<_, _>>()
         .unwrap();
     let mut saw_root = false;
+    let content =
+        crate::external_storage::content_store::ContentStore::open(&external).unwrap();
     for (_, hash) in keys {
-        let bytes = fs::read(objects.join(hash)).unwrap();
+        let mut body = content.open_body(&hash).unwrap();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut body, &mut bytes).unwrap();
         if let LogicalRecordEnvelope::Root { value, .. } = decode_logical_record(&bytes).unwrap() {
             assert_eq!(value["synthetic"], json!(2));
             saw_root = true;
@@ -1166,7 +1169,7 @@ fn external_capture_registration_failure_does_not_advance_capture_or_cursor() {
     let (directory, mut store, _) = capture_fixture();
     let mut catalog = CaptureCatalog::create(
         &directory.path().join("external-storage/job"),
-        &directory.path().join("external-storage/objects"),
+        &directory.path().join("external-storage"),
         None,
     )
     .unwrap();
@@ -1235,7 +1238,7 @@ fn external_capture_keeps_deleted_source_payload_pinned_after_reopen() {
     store.commit_asset_alias(&alias, 1).unwrap();
     let mut catalog = CaptureCatalog::create(
         &directory.path().join("external-storage/job"),
-        &directory.path().join("external-storage/objects"),
+        &directory.path().join("external-storage"),
         None,
     )
     .unwrap();

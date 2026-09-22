@@ -2,6 +2,7 @@
 //! This layer starts only after the PDS read snapshot has closed.
 use super::{
     capabilities::Capabilities,
+    content_store::{ContentStore, ObjectSource},
     contract::{
         Cancellation, ErrorKind, ObjectIntent, ObjectReceipt, ObjectRole, Provider, ProviderError,
         ReadReceipt, RemoteLocator, RepositoryHandle, Result,
@@ -29,7 +30,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    path::{Path, PathBuf},
+    path::Path,
     sync::{Arc, LazyLock},
 };
 
@@ -793,7 +794,7 @@ struct SourceEntry {
     key: String,
     content_sha256: String,
     byte_length: u64,
-    path: PathBuf,
+    source: ObjectSource,
     compression: CompressionPolicy,
 }
 #[derive(Clone)]
@@ -865,7 +866,6 @@ fn capture_sources(
     capture: &CapturedSnapshot,
     repository_root: &Path,
 ) -> Result<(Vec<SourceEntry>, Vec<SourceEntry>)> {
-    let capture_objects = repository_root.join("external-storage").join("objects");
     let mut records = Vec::new();
     let mut query = capture
         .catalog
@@ -885,7 +885,7 @@ fn capture_sources(
             key,
             content_sha256: digest.clone(),
             byte_length: u64::try_from(bytes).map_err(corrupt)?,
-            path: capture_objects.join(digest),
+            source: ObjectSource::Captured(digest),
             compression: CompressionPolicy::Text,
         });
     }
@@ -909,7 +909,7 @@ fn capture_sources(
             key: format!("object/{digest}"),
             content_sha256: digest.clone(),
             byte_length: u64::try_from(bytes).map_err(corrupt)?,
-            path: capture_objects.join(digest),
+            source: ObjectSource::Captured(digest),
             compression: CompressionPolicy::Text,
         });
     }
@@ -936,7 +936,7 @@ fn capture_sources(
             key: format!("object/{digest}"),
             content_sha256: digest,
             byte_length: u64::try_from(bytes).map_err(corrupt)?,
-            path,
+            source: ObjectSource::File(path),
             compression: CompressionPolicy::AlreadyCompressed,
         });
     }
@@ -968,6 +968,7 @@ fn catalog_fingerprint(kind: wire::CatalogKind, sources: &[SourceEntry]) -> Stri
 async fn build_entries(
     kind: wire::CatalogKind,
     sources: Vec<SourceEntry>,
+    external_root: &Path,
     format_repository_id: &str,
     build_root: &Path,
     root_key: &[u8; 32],
@@ -1027,11 +1028,13 @@ async fn build_entries(
         uncached.push(source);
     }
     let build_root_owned = build_root.to_path_buf();
+    let external_root_owned = external_root.to_path_buf();
     let cancel_owned = cancel.clone();
     let cpu = cpu_permit().await?;
     let prepared = tokio::task::spawn_blocking(move || {
         prepare_packs(
             uncached,
+            &external_root_owned,
             &build_root_owned,
             target,
             max_pack,
@@ -1138,6 +1141,7 @@ impl From<PreparedPacks> for PendingBuildParts {
 }
 fn prepare_packs(
     sources: Vec<SourceEntry>,
+    external_root: &Path,
     build_root: &Path,
     target: u64,
     max_pack: u64,
@@ -1148,15 +1152,15 @@ fn prepare_packs(
     if crate::trust_boundary::is_link_like(&fs::symlink_metadata(build_root).map_err(transient)?) {
         return Err(corrupt("snapshot build directory is a link"));
     }
+    let content = ContentStore::open(external_root).map_err(transient)?;
     let mut encoder = ChunkEncoder::new().map_err(corrupt)?;
     let mut packs: Vec<PendingPack> = Vec::new();
     let mut current: Option<PendingPack> = None;
     let mut pending = Vec::new();
     for source in sources {
         cancel.check()?;
-        let mut input =
-            crate::trust_boundary::open_regular_source(&source.path).map_err(corrupt)?;
-        if input.metadata().map_err(corrupt)?.len() != source.byte_length {
+        let mut input = content.open_source(&source.source).map_err(corrupt)?;
+        if input.len().map_err(corrupt)? != source.byte_length {
             return Err(corrupt("capture source length differs"));
         }
         let mut remaining = source.byte_length;
@@ -1730,6 +1734,7 @@ pub(crate) async fn package_and_upload(
     }
     let build_root = cache_root.join("build");
     let mut cache = PackageCache::open(cache_root)?;
+    let external_root = repository_root.join("external-storage");
     let repository_root_owned = repository_root.to_path_buf();
     let library_domain = library_fingerprint_domain();
     let cpu = cpu_permit().await?;
@@ -1753,6 +1758,7 @@ pub(crate) async fn package_and_upload(
     let (record_entries, mut referenced) = build_entries(
         wire::CatalogKind::Records,
         record_sources,
+        &external_root,
         &metadata.repository_id,
         &build_root,
         root_key,
@@ -1799,6 +1805,7 @@ pub(crate) async fn package_and_upload(
         let (asset_entries, uploaded) = build_entries(
             wire::CatalogKind::Assets,
             asset_sources,
+            &external_root,
             &metadata.repository_id,
             &build_root,
             root_key,
@@ -1860,7 +1867,7 @@ pub(crate) async fn package_and_upload(
                 key: source.key.clone(),
                 content_sha256: source.content_sha256.clone(),
                 byte_length: source.byte_length,
-                path: source.path.clone(),
+                source: ObjectSource::File(source.path.clone()),
                 compression: match source.kind {
                     wire::CatalogEntryKind::SectionObject => CompressionPolicy::AlreadyCompressed,
                     _ => CompressionPolicy::Text,
@@ -1872,6 +1879,7 @@ pub(crate) async fn package_and_upload(
         let (section_entries, uploaded) = build_entries(
             wire::CatalogKind::Section,
             sources,
+            &external_root,
             &metadata.repository_id,
             &build_root,
             root_key,
@@ -2049,9 +2057,9 @@ mod tests {
             .join("external-storage")
             .join("captures")
             .join(capture_id);
-        let objects = root.join("external-storage").join("objects");
+        let external = root.join("external-storage");
         let mut catalog =
-            crate::external_storage::capture::CaptureCatalog::create(&directory, &objects, None)
+            crate::external_storage::capture::CaptureCatalog::create(&directory, &external, None)
                 .unwrap();
         let identity = CaptureIdentity {
             store_id: "store".into(),
@@ -2090,9 +2098,9 @@ mod tests {
             .join("external-storage")
             .join("captures")
             .join(capture_id);
-        let objects = root.join("external-storage").join("objects");
+        let external = root.join("external-storage");
         let mut catalog =
-            crate::external_storage::capture::CaptureCatalog::create(&directory, &objects, None)
+            crate::external_storage::capture::CaptureCatalog::create(&directory, &external, None)
                 .unwrap();
         let identity = CaptureIdentity {
             store_id: "store".into(),
@@ -2106,6 +2114,7 @@ mod tests {
         let changed = format!("{{\"value\":{revision}}}").into_bytes();
         let unchanged_hash = hex::encode(hash(&unchanged));
         let changed_hash = hex::encode(hash(&changed));
+        let objects = external.join("objects");
         fs::write(objects.join(&unchanged_hash), &unchanged).unwrap();
         fs::write(objects.join(&changed_hash), &changed).unwrap();
         {
@@ -2627,13 +2636,13 @@ mod tests {
             .unwrap();
             assert_eq!(restored.snapshot_id, "snapshot-2");
             assert_eq!(restored.records.len(), 1);
-            assert_eq!(fs::read(&restored.records[0].path).unwrap(), b"record two");
+            assert_eq!(fs::read(restored.records[0].source.file().unwrap()).unwrap(), b"record two");
             let asset = restored
                 .objects
                 .iter()
                 .find(|object| object.content_hash == asset_hash)
                 .unwrap();
-            assert_eq!(fs::read(&asset.path).unwrap(), asset_bytes);
+            assert_eq!(fs::read(asset.source.file().unwrap()).unwrap(), asset_bytes);
             let pack = second
                 .referenced_objects
                 .iter()
@@ -2646,10 +2655,10 @@ mod tests {
             fs::write(&pack_plaintext, vec![0; pack.plaintext_length as usize]).unwrap();
             fs::write(&pack_ciphertext, vec![0; pack.receipt.byte_length as usize]).unwrap();
             for record in &restored.records {
-                fs::remove_file(&record.path).unwrap();
+                fs::remove_file(record.source.file().unwrap()).unwrap();
             }
             for object in &restored.objects {
-                fs::remove_file(&object.path).unwrap();
+                fs::remove_file(object.source.file().unwrap()).unwrap();
             }
             let repaired = snapshot_restore::download_snapshot(
                 &second.reference,
@@ -2661,7 +2670,7 @@ mod tests {
             )
             .await
             .unwrap();
-            assert_eq!(fs::read(&repaired.records[0].path).unwrap(), b"record two");
+            assert_eq!(fs::read(repaired.records[0].source.file().unwrap()).unwrap(), b"record two");
             let mut repaired_plaintext =
                 crate::trust_boundary::open_regular_source(&pack_plaintext).unwrap();
             assert_eq!(
@@ -2723,8 +2732,8 @@ mod tests {
                     limits(128 * 1024), &mut second_journal, &provider, &repository, &cancel).await.unwrap();
                 let restored = snapshot_restore::download_snapshot(&second.reference, &root.path().join("restored"),
                     &key, &provider, &repository, &cancel).await.unwrap();
-                assert_eq!(fs::read(&restored.records[0].path).unwrap(), b"record");
-                assert!(restored.objects.iter().any(|object| fs::read(&object.path).unwrap() == b"asset"));
+                assert_eq!(fs::read(restored.records[0].source.file().unwrap()).unwrap(), b"record");
+                assert!(restored.objects.iter().any(|object| fs::read(object.source.file().unwrap()).unwrap() == b"asset"));
                 assert_eq!(provider.upload_attempts(&retained.object_id), 1);
                 assert!(first_journal.spool_path(&first.reference.object_id).exists());
                 assert!(second_journal.spool_path(&second.reference.object_id).exists());
@@ -2842,8 +2851,8 @@ mod tests {
                 &provider, &repository, &cancel).await.unwrap(), PublicationReadiness::Verified);
             let restored = snapshot_restore::download_snapshot(&replacement.reference, &root.path().join("restored"),
                 &key, &provider, &repository, &cancel).await.unwrap();
-            assert_eq!(std::fs::read(&restored.records[0].path).unwrap(), b"record");
-            assert!(restored.objects.iter().any(|object| std::fs::read(&object.path).unwrap() == b"asset"));
+            assert_eq!(std::fs::read(restored.records[0].source.file().unwrap()).unwrap(), b"record");
+            assert!(restored.objects.iter().any(|object| std::fs::read(object.source.file().unwrap()).unwrap() == b"asset"));
             assert!(journal.spool_path(&completed.reference.object_id).exists());
         });
     }
@@ -3013,7 +3022,7 @@ mod tests {
             )
             .await
             .unwrap();
-            assert_eq!(fs::read(&restored.records[0].path).unwrap(), record);
+            assert_eq!(fs::read(restored.records[0].source.file().unwrap()).unwrap(), record);
         });
     }
 
@@ -3026,9 +3035,9 @@ mod tests {
                 .join("external-storage")
                 .join("captures")
                 .join("oversized-entry");
-            let objects = root.path().join("external-storage").join("objects");
+            let external = root.path().join("external-storage");
             let mut catalog = crate::external_storage::capture::CaptureCatalog::create(
-                &directory, &objects, None,
+                &directory, &external, None,
             )
             .unwrap();
             let identity = CaptureIdentity {

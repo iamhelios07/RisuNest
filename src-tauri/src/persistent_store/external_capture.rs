@@ -165,8 +165,7 @@ impl PersistentStore {
         if !path.canonicalize()?.starts_with(&root) {
             return Err(invalid("Capture cache escaped its native directory"));
         }
-        let catalog =
-            CaptureCatalog::reopen(path, &root.join("objects"), &file_hash, &candidate.identity)?;
+        let catalog = CaptureCatalog::reopen(path, &root, &file_hash, &candidate.identity)?;
         if hex::encode(catalog.content_fingerprint(&scope)?) != candidate.manifest_hash {
             return Err(invalid("Capture cache content differs"));
         }
@@ -694,7 +693,6 @@ impl PersistentStore {
         self.cleanup_terminal_capture_references()?;
         let scope_hex = hex::encode(scope_id);
         let root = self.repository_root.join("external-storage");
-        let objects = root.join("objects");
         if let Some((candidate, catalog)) = self.validated_candidate(&identity, &scope_hex)? {
             let tx = self.connection.transaction()?;
             content_change_index::commit_cursor(
@@ -771,7 +769,7 @@ impl PersistentStore {
                     hash,
                 )
             });
-        let mut catalog = CaptureCatalog::create(&directory, &objects, prior)?;
+        let mut catalog = CaptureCatalog::create(&directory, &root, prior)?;
         let prepared = self.prepare_content_capture(&id, consumer, identity.revision)?;
         let projected_records = prepared.project(&mut catalog, probe)?;
         let capture_id = prepared.register(self, &catalog, &scope_id, CODEC)?;
@@ -957,7 +955,7 @@ mod conflict_cleanup_tests {
             revision: 7,
         };
         let mut catalog =
-            CaptureCatalog::create(&capture_directory, &object_directory, None).unwrap();
+            CaptureCatalog::create(&capture_directory, &external, None).unwrap();
         catalog.begin(&identity, None).unwrap();
         catalog.record("root", b"device-owned conflict source").unwrap();
         catalog.finish().unwrap();

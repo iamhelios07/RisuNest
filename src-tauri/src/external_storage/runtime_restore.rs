@@ -400,14 +400,14 @@ fn prepare_local_restore(
                 key: record.key,
                 content_hash: record.content_hash,
                 byte_length: record.byte_length,
-                path: record.path,
+                source: record.source,
             })
         });
         let objects = snapshot.objects.into_iter().map(|object| {
             Ok(ExternalSnapshotObject {
                 content_hash: object.content_hash,
                 byte_length: object.byte_length,
-                path: object.path,
+                source: object.source,
             })
         });
         Some(

@@ -2,6 +2,7 @@
 //! No PDS generation is activated here; the caller owns the subsequent staged
 //! apply and eventual cleanup of this durable verified directory.
 use super::{
+    content_store::ObjectSource,
     contract::{
         Cancellation, ErrorKind, ObjectRole, Provider, ProviderError, ReadReceipt,
         RepositoryHandle, Result,
@@ -69,13 +70,13 @@ pub(crate) struct PreparedRecord {
     pub key: String,
     pub content_hash: String,
     pub byte_length: u64,
-    pub path: PathBuf,
+    pub source: ObjectSource,
 }
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedObject {
     pub content_hash: String,
     pub byte_length: u64,
-    pub path: PathBuf,
+    pub source: ObjectSource,
 }
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedRemoteSnapshot {
@@ -544,7 +545,7 @@ fn materialize_entries(
                             key: entry.key,
                             content_hash: digest,
                             byte_length: entry.byte_length,
-                            path: destination,
+                            source: ObjectSource::File(destination),
                         },
                     )
                     .is_some()
@@ -556,10 +557,10 @@ fn materialize_entries(
                 let prepared = PreparedObject {
                     content_hash: digest.clone(),
                     byte_length: entry.byte_length,
-                    path: destination,
+                    source: ObjectSource::File(destination),
                 };
                 if let Some(old) = objects.insert(digest, prepared.clone()) {
-                    if old.byte_length != prepared.byte_length || old.path != prepared.path {
+                    if old.byte_length != prepared.byte_length {
                         return Err(corrupt("conflicting content object"));
                     }
                 }
