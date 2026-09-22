@@ -253,6 +253,23 @@ impl PackageCache {
         Ok(())
     }
 
+    /// Whether this cache already holds what a root names, without reading
+    /// the closure back. A publication asks before rebuilding it from the
+    /// provider, and a large graph answers in one row.
+    pub(super) fn knows_graph(
+        &self,
+        format_repository_id: &str,
+        repository: &RepositoryHandle,
+        root_identity: &str,
+    ) -> Result<bool> {
+        let found: Option<i64> = self.db.query_row(
+            "SELECT 1 FROM graph_members WHERE repository_id=?1 AND connection_identity=?2 AND root_identity=?3 LIMIT 1",
+            params![format_repository_id, repository.connection_identity, root_identity],
+            |row| row.get(0),
+        ).optional().map_err(transient)?;
+        Ok(found.is_some())
+    }
+
     /// Everything one published catalog root names, as the objects a
     /// publication can reference again. Empty means this cache never recorded
     /// that root, not that the root names nothing.

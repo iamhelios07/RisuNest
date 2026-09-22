@@ -310,15 +310,18 @@ fn read_bytes(path: &Path, max: usize) -> Result<Vec<u8>> {
 }
 
 #[derive(Clone)]
-struct CompleteEntry {
-    kind: wire::CatalogEntryKind,
-    key: String,
-    content_sha256: [u8; 32],
-    byte_length: u64,
-    chunks: Vec<wire::StoredChunk>,
+pub(super) struct CompleteEntry {
+    pub(super) kind: wire::CatalogEntryKind,
+    pub(super) key: String,
+    pub(super) content_sha256: [u8; 32],
+    pub(super) byte_length: u64,
+    pub(super) chunks: Vec<wire::StoredChunk>,
 }
 
-async fn read_catalog(
+/// Everything one catalog names: its complete entries, the packs they point
+/// at, and the nodes the walk passed through. A restore only needs the first
+/// two, and rebuilding reuse metadata needs all three.
+pub(super) async fn read_catalog(
     root: &RemoteObject,
     expected_kind: wire::CatalogKind,
     root_key: &[u8; 32],
@@ -326,8 +329,13 @@ async fn read_catalog(
     provider: &dyn Provider,
     repository: &RepositoryHandle,
     cancel: &Cancellation,
-) -> Result<(Vec<CompleteEntry>, BTreeMap<String, RemoteObject>)> {
+) -> Result<(
+    Vec<CompleteEntry>,
+    BTreeMap<String, RemoteObject>,
+    Vec<RemoteObject>,
+)> {
     let mut stack = vec![root.clone()];
+    let mut nodes = Vec::new();
     let mut visited = BTreeSet::new();
     let mut fragments: BTreeMap<(u8, String), Vec<wire::CatalogEntryFragment>> = BTreeMap::new();
     let mut packs = BTreeMap::new();
@@ -357,6 +365,7 @@ async fn read_catalog(
         if document.kind != expected_kind {
             return Err(corrupt("catalog kind differs"));
         }
+        nodes.push(object.clone());
         if document.level == 0 {
             for pack in document.packs {
                 let remote = RemoteObject::from_stored(&pack, repository)?;
@@ -443,7 +452,7 @@ async fn read_catalog(
             chunks,
         });
     }
-    Ok((result, packs))
+    Ok((result, packs, nodes))
 }
 
 async fn open_packs(
@@ -691,7 +700,7 @@ pub(crate) async fn download_sections(
         if entries_root.repository_id != snapshot.repository_id {
             return Err(corrupt("section catalog repository differs"));
         }
-        let (complete, packs) = read_catalog(
+        let (complete, packs, _) = read_catalog(
             &entries_root,
             wire::CatalogKind::Section,
             root_key,
@@ -765,7 +774,7 @@ pub(crate) async fn download_snapshot(
     {
         return Err(corrupt("snapshot catalog repository differs"));
     }
-    let (record_entries, mut record_packs) = read_catalog(
+    let (record_entries, mut record_packs, _) = read_catalog(
         &record_catalog,
         wire::CatalogKind::Records,
         root_key,
@@ -775,7 +784,7 @@ pub(crate) async fn download_snapshot(
         cancel,
     )
     .await?;
-    let (asset_entries, asset_packs) = read_catalog(
+    let (asset_entries, asset_packs, _) = read_catalog(
         &asset_catalog,
         wire::CatalogKind::Assets,
         root_key,

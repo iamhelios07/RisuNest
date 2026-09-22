@@ -328,35 +328,70 @@ impl ObjectEvidence {
     }
 }
 
+/// Which catalog of a publication one parent root is. A rebuilt cache has to
+/// key what it reads the way the next publication looks it up, and only the
+/// publishing side knows which section a section catalog belongs to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CatalogRoot {
+    Records,
+    Assets,
+    Section(String),
+}
+
+impl CatalogRoot {
+    pub(super) fn kind(&self) -> wire::CatalogKind {
+        match self {
+            Self::Records => wire::CatalogKind::Records,
+            Self::Assets => wire::CatalogKind::Assets,
+            Self::Section(_) => wire::CatalogKind::Section,
+        }
+    }
+}
+
 /// The authenticated graph a publication may reuse from without asking the
 /// provider about it again. Selected before the first reuse decision and
 /// recorded on the job, so a cleanup that finds the job stopped protects it.
 #[derive(Debug)]
 pub(crate) struct ParentGraph {
     objects: Vec<wire::StoredObject>,
-    roots: BTreeSet<String>,
+    roots: Vec<(CatalogRoot, RemoteObject)>,
+    identities: BTreeSet<String>,
 }
 
 impl ParentGraph {
     pub(crate) fn new(
-        objects: Vec<wire::StoredObject>,
+        roots: Vec<(CatalogRoot, wire::StoredObject)>,
         repository: &RepositoryHandle,
     ) -> Result<Self> {
-        if objects.is_empty() {
+        if roots.is_empty() {
             return Err(corrupt("parent graph has no roots"));
         }
-        let mut roots = BTreeSet::new();
-        for object in &objects {
-            let remote = RemoteObject::from_stored(object, repository)?;
+        let mut objects = Vec::new();
+        let mut labelled = Vec::new();
+        let mut identities = BTreeSet::new();
+        for (label, object) in roots {
+            let remote = RemoteObject::from_stored(&object, repository)?;
             if remote.role != ObjectRole::Catalog {
                 return Err(corrupt("parent root is not a catalog"));
             }
-            roots.insert(super::reachability::object_identity(&remote, repository)?);
+            identities.insert(super::reachability::object_identity(&remote, repository)?);
+            objects.push(object);
+            labelled.push((label, remote));
         }
-        Ok(Self { objects, roots })
+        Ok(Self {
+            objects,
+            roots: labelled,
+            identities,
+        })
     }
     pub(crate) fn stored(&self) -> &[wire::StoredObject] {
         &self.objects
+    }
+    pub(super) fn roots(&self) -> &[(CatalogRoot, RemoteObject)] {
+        &self.roots
+    }
+    pub(super) fn identities(&self) -> &BTreeSet<String> {
+        &self.identities
     }
 }
 
@@ -829,21 +864,40 @@ fn capture_sources(
 /// One section per catalog, so the package cache key names the section as well
 /// as its content. Two sections with the same entries are still two catalogs.
 fn section_catalog_fingerprint(id: &str, sources: &[SourceEntry]) -> String {
-    format!(
-        "{id}-{}",
-        catalog_fingerprint(wire::CatalogKind::Section, sources)
-    )
+    section_fingerprint(id, &catalog_fingerprint(wire::CatalogKind::Section, sources))
+}
+
+pub(super) fn section_fingerprint(id: &str, digest: &str) -> String {
+    format!("{id}-{digest}")
 }
 
 fn catalog_fingerprint(kind: wire::CatalogKind, sources: &[SourceEntry]) -> String {
+    catalog_fingerprint_of(
+        kind,
+        sources.iter().map(|source| {
+            (
+                source.key.as_str(),
+                source.byte_length,
+                source.content_sha256.as_str(),
+            )
+        }),
+    )
+}
+
+/// The same digest read off what a catalog already holds, so a cache rebuilt
+/// from the provider names a catalog the way the next publication will.
+pub(super) fn catalog_fingerprint_of<'a>(
+    kind: wire::CatalogKind,
+    sources: impl Iterator<Item = (&'a str, u64, &'a str)>,
+) -> String {
     let mut digest = Sha256::new();
     digest.update(b"risunest.external-catalog-fingerprint/v1\0");
     digest.update(kind_name(kind).as_bytes());
-    for source in sources {
-        digest.update((source.key.len() as u64).to_le_bytes());
-        digest.update(source.key.as_bytes());
-        digest.update(source.byte_length.to_le_bytes());
-        digest.update(source.content_sha256.as_bytes());
+    for (key, byte_length, content_sha256) in sources {
+        digest.update((key.len() as u64).to_le_bytes());
+        digest.update(key.as_bytes());
+        digest.update(byte_length.to_le_bytes());
+        digest.update(content_sha256.as_bytes());
     }
     hex::encode(digest.finalize())
 }
@@ -1746,9 +1800,23 @@ pub(crate) async fn package_and_upload(
     let build_root = cache_root.join("build");
     let mut cache = PackageCache::open(cache_root)?;
     // Read once for the whole publication. Nothing known about the selected
-    // parent means nothing is admitted on its account.
+    // parent means nothing is admitted on its account, so a cache that never
+    // saw this parent rebuilds what it names before the first reuse decision.
     let members = match parent {
-        Some(graph) => Some(cache.members_of(&metadata.repository_id, repository, &graph.roots)?),
+        Some(graph) => {
+            super::cache_hydration::hydrate_parent(
+                graph,
+                &metadata.repository_id,
+                cache_root,
+                root_key,
+                &mut cache,
+                provider,
+                repository,
+                cancel,
+            )
+            .await?;
+            Some(cache.members_of(&metadata.repository_id, repository, graph.identities())?)
+        }
         None => None,
     };
     let mut evidence = ObjectEvidence::open(repository_root, journal.connection_id())?;
@@ -2251,10 +2319,15 @@ mod tests {
         repository: &RepositoryHandle,
     ) -> Result<ParentGraph> {
         let mut roots = vec![
-            previous.record_catalog.stored(repository)?,
-            previous.asset_catalog.stored(repository)?,
+            (CatalogRoot::Records, previous.record_catalog.stored(repository)?),
+            (CatalogRoot::Assets, previous.asset_catalog.stored(repository)?),
         ];
-        roots.extend(previous.sections.values().map(|section| section.entries_root.clone()));
+        roots.extend(previous.sections.iter().map(|(id, section)| {
+            (
+                CatalogRoot::Section(id.clone()),
+                section.entries_root.clone(),
+            )
+        }));
         ParentGraph::new(roots, repository)
     }
 
@@ -3090,7 +3163,7 @@ mod tests {
                 // everything published after it.
                 let graph = parent_graph(&head, &repository).unwrap();
                 assert!(!PackageCache::open(&cache).unwrap()
-                    .members_of("format-repository", &repository, &graph.roots).unwrap()
+                    .members_of("format-repository", &repository, graph.identities()).unwrap()
                     .is_empty());
                 measured.push(reads);
             }
@@ -3148,6 +3221,206 @@ mod tests {
         });
     }
 
+    /// A rebuilt cache has to name a catalog the way the next publication
+    /// names it, and a catalog walk hands its entries back grouped by kind
+    /// rather than in the order the catalog was built from.
+    #[test]
+    fn c_a_rebuilt_catalog_is_named_the_way_the_next_publication_names_it() {
+        let source = |kind, key: &str, digest: &str| SourceEntry {
+            kind,
+            key: key.into(),
+            content_sha256: digest.into(),
+            byte_length: key.len() as u64,
+            source: ObjectSource::Captured(digest.into()),
+            compression: CompressionPolicy::Text,
+        };
+        let plan = |kind, key: &str, digest: &str| EntryPlan {
+            kind,
+            key: key.into(),
+            content_sha256: digest.into(),
+            byte_length: key.len() as u64,
+            chunks: Vec::new(),
+            packs: Vec::new(),
+        };
+        let first = "11".repeat(32);
+        let second = "22".repeat(32);
+        let third = "33".repeat(32);
+        // A record catalog is built from one list sorted by key alone, and a
+        // generated object sorts in among the records rather than after them.
+        let mut records = vec![
+            source(wire::CatalogEntryKind::Record, "record/000000", &first),
+            source(wire::CatalogEntryKind::Object, &format!("object/{second}"), &second),
+            source(wire::CatalogEntryKind::Record, "record/000001", &third),
+        ];
+        records.sort_by(|a, b| a.key.cmp(&b.key));
+        let walked = vec![
+            plan(wire::CatalogEntryKind::Record, "record/000000", &first),
+            plan(wire::CatalogEntryKind::Record, "record/000001", &third),
+            plan(wire::CatalogEntryKind::Object, &format!("object/{second}"), &second),
+        ];
+        assert_eq!(
+            super::super::cache_hydration::rebuilt_fingerprint(&CatalogRoot::Records, &walked),
+            catalog_fingerprint(wire::CatalogKind::Records, &records),
+        );
+        // A section catalog is built from a list sorted by kind and then key,
+        // and names the section as well as its content.
+        let mut section = vec![
+            source(wire::CatalogEntryKind::SectionObject, "b", &second),
+            source(wire::CatalogEntryKind::SectionEntry, "c", &third),
+        ];
+        section.sort_by(|a, b| (a.kind as u8, &a.key).cmp(&(b.kind as u8, &b.key)));
+        let walked = vec![
+            plan(wire::CatalogEntryKind::SectionEntry, "c", &third),
+            plan(wire::CatalogEntryKind::SectionObject, "b", &second),
+        ];
+        assert_eq!(
+            super::super::cache_hydration::rebuilt_fingerprint(
+                &CatalogRoot::Section("local-plugins".into()),
+                &walked,
+            ),
+            section_catalog_fingerprint("local-plugins", &section),
+        );
+        assert_ne!(
+            super::super::cache_hydration::rebuilt_fingerprint(
+                &CatalogRoot::Section("other".into()),
+                &walked,
+            ),
+            section_catalog_fingerprint("local-plugins", &section),
+        );
+    }
+
+    /// A device that has never published here holds nothing about the parent
+    /// it selects. Reading what that parent names costs metadata and saves
+    /// repackaging and re-uploading everything under it.
+    #[test]
+    fn c_a_cache_that_never_saw_the_parent_publishes_from_it_anyway() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let key = [23; 32];
+            let cancel = Cancellation::default();
+            #[allow(clippy::too_many_arguments)]
+            async fn published(
+                root: &Path,
+                name: &str,
+                cache: &Path,
+                parent: Option<&ParentGraph>,
+                assets: usize,
+                key: &[u8; 32],
+                provider: &FakeProvider,
+                repository: &RepositoryHandle,
+                cancel: &Cancellation,
+            ) -> CompletedSnapshot {
+                let capture = captured_asset_inventory(root, name, 1, 2, 0, assets);
+                let meta = metadata(name, &capture);
+                let mut transfer = journal(&root.join(name), name, &capture);
+                package_and_upload(
+                    capture, vec![], root, cache, meta, key, limits(64 * 1024),
+                    parent, &mut transfer, provider, repository, cancel,
+                ).await.unwrap()
+            }
+            let objects = |completed: &CompletedSnapshot| {
+                let mut ids: Vec<String> = completed.referenced_objects.iter()
+                    .filter(|object| {
+                        matches!(object.role, ObjectRole::Pack | ObjectRole::Catalog)
+                    })
+                    .map(|object| object.object_id.clone())
+                    .collect();
+                ids.sort();
+                ids
+            };
+
+            let first = published(root.path(), "first-device", &root.path().join("cache-a"), None, 6, &key, &provider, &repository, &cancel).await;
+            let parent = parent_graph(&first, &repository).unwrap();
+            let elsewhere = root.path().join("cache-b");
+
+            // The same library, from a cache holding nothing about that parent.
+            let uploads = provider.upload_count();
+            let reads = provider.read_count();
+            let second = published(root.path(), "second-device", &elsewhere, Some(&parent), 6, &key, &provider, &repository, &cancel).await;
+            assert_eq!(objects(&second), objects(&first));
+            for id in objects(&second) {
+                assert_eq!(provider.upload_attempts(&id), 1);
+            }
+            assert_eq!(second.record_catalog, first.record_catalog);
+            assert_eq!(second.asset_catalog, first.asset_catalog);
+            // Its own inventory page and snapshot document, and nothing the
+            // parent already holds.
+            let added: Vec<String> = provider.uploaded_ids()[uploads..].to_vec();
+            assert_eq!(added.len(), 2);
+            assert!(added.iter().any(|id| id.starts_with("inventory-page-")));
+            assert!(added.iter().any(|id| id == "snapshot-second-device"));
+            // Metadata is what it paid for that.
+            assert!(provider.read_count() > reads);
+
+            // What it learned is durable: the same parent is not read again.
+            let reads = provider.read_count();
+            let again = published(root.path(), "second-again", &elsewhere, Some(&parent), 6, &key, &provider, &repository, &cancel).await;
+            assert_eq!(provider.read_count(), reads);
+            assert_eq!(objects(&again), objects(&first));
+
+            // One asset more, from the same rebuilt cache. Everything the
+            // parent already carries stays where it is, and the catalog the
+            // growth did not reach is not rebuilt at all.
+            let grown = published(root.path(), "second-grown", &elsewhere, Some(&parent), 7, &key, &provider, &repository, &cancel).await;
+            let carried: Vec<String> = objects(&first).into_iter()
+                .filter(|id| objects(&grown).contains(id))
+                .collect();
+            assert!(!carried.is_empty());
+            for id in carried {
+                assert_eq!(provider.upload_attempts(&id), 1);
+            }
+            assert_eq!(grown.record_catalog, first.record_catalog);
+            assert_ne!(grown.asset_catalog, first.asset_catalog);
+        });
+    }
+
+    /// A parent root this device cannot read leaves that catalog unknown.
+    /// The publication then pays for it the way a cache miss already did,
+    /// and the roots it could read are still reused.
+    #[test]
+    fn c_a_parent_root_it_cannot_read_costs_reuse_and_not_the_publication() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let key = [29; 32];
+            let cancel = Cancellation::default();
+            #[allow(clippy::too_many_arguments)]
+            async fn published(
+                root: &Path,
+                name: &str,
+                cache: &Path,
+                parent: Option<&ParentGraph>,
+                key: &[u8; 32],
+                provider: &FakeProvider,
+                repository: &RepositoryHandle,
+                cancel: &Cancellation,
+            ) -> CompletedSnapshot {
+                let capture = captured_asset_inventory(root, name, 1, 2, 0, 6);
+                let meta = metadata(name, &capture);
+                let mut transfer = journal(&root.join(name), name, &capture);
+                package_and_upload(
+                    capture, vec![], root, cache, meta, key, limits(64 * 1024),
+                    parent, &mut transfer, provider, repository, cancel,
+                ).await.unwrap()
+            }
+            let first = published(
+                root.path(), "first-device", &root.path().join("cache-a"), None,
+                &key, &provider, &repository, &cancel,
+            ).await;
+            let parent = parent_graph(&first, &repository).unwrap();
+            provider.fail_read(&first.asset_catalog.object_id, ErrorKind::NotFound);
+            let second = published(
+                root.path(), "second-device", &root.path().join("cache-b"), Some(&parent),
+                &key, &provider, &repository, &cancel,
+            ).await;
+            assert_eq!(second.record_catalog, first.record_catalog);
+            assert_ne!(second.asset_catalog, first.asset_catalog);
+        });
+    }
+
     /// The parent is durable on the job before anything reuses it, so a
     /// cleanup that finds the job stopped protects what it is reading.
     #[test]
@@ -3160,13 +3433,23 @@ mod tests {
         assert!(TransferJournal::parent(&directory).unwrap().is_empty());
         let first = super::super::reachability::tests::object("catalog-a", ObjectRole::Catalog).stored(&repository).unwrap();
         let second = super::super::reachability::tests::object("catalog-b", ObjectRole::Catalog).stored(&repository).unwrap();
-        let graph = ParentGraph::new(vec![first.clone(), second.clone()], &repository).unwrap();
+        let graph = ParentGraph::new(
+            vec![
+                (CatalogRoot::Records, first.clone()),
+                (CatalogRoot::Assets, second.clone()),
+            ],
+            &repository,
+        )
+        .unwrap();
         transfer.record_parent(graph.stored()).unwrap();
         assert_eq!(TransferJournal::parent(&directory).unwrap(), vec![first, second]);
         // A pack is never a parent root; only a catalog names a graph.
         assert_eq!(
             ParentGraph::new(
-                vec![super::super::reachability::tests::object("pack-a", ObjectRole::Pack).stored(&repository).unwrap()],
+                vec![(
+                    CatalogRoot::Records,
+                    super::super::reachability::tests::object("pack-a", ObjectRole::Pack).stored(&repository).unwrap(),
+                )],
                 &repository,
             ).unwrap_err().kind,
             ErrorKind::Corrupt,
@@ -3813,6 +4096,33 @@ mod tests {
                     "revision={} assets={} packs={packs} provider_reads={reads} check_reads={verified} provider_uploads={uploads} new_objects={objects} publication_ms={elapsed}",
                     revision + 1,
                     5_001 + revision,
+                );
+            }
+
+            // The same library from a cache that holds nothing about it, with
+            // and without the published parent to rebuild from.
+            let previous = published.as_ref().unwrap();
+            let parent = parent_graph(previous, &repository).unwrap();
+            for (name, parent) in [("rebuilt", Some(&parent)), ("cold", None)] {
+                let capture_id = format!("growing-capture-{name}");
+                let job_id = format!("growing-job-{name}");
+                let capture = captured_asset_inventory(
+                    root.path(), &capture_id, 3, 1, 1, 5_003,
+                );
+                let snapshot_metadata = metadata(&format!("growing-snapshot-{name}"), &capture);
+                let mut transfer = journal(&root.path().join(&job_id), &job_id, &capture);
+                let before = (provider.read_count(), provider.upload_count());
+                let started = std::time::Instant::now();
+                package_and_upload(
+                    capture, Vec::new(), root.path(), &root.path().join(format!("{name}-cache")),
+                    snapshot_metadata, &key, limits(512 * 1024), parent, &mut transfer,
+                    &provider, &repository, &Cancellation::default(),
+                ).await.unwrap();
+                eprintln!(
+                    "{name} assets=5003 provider_reads={} provider_uploads={} publication_ms={}",
+                    provider.read_count() - before.0,
+                    provider.upload_count() - before.1,
+                    started.elapsed().as_millis(),
                 );
             }
         });

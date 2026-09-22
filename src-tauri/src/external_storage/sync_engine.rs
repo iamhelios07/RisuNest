@@ -9,7 +9,9 @@ use super::{
     control::{self, HeadDocument, ObservedHead, PublicationResult},
     job_store::{DurableJob, JobKind, JobStore},
     journal::{JobIdentity, TransferJournal},
-    packaging::{CompletedSnapshot, PackageLimits, SnapshotMetadata, SnapshotPurpose},
+    packaging::{
+        CatalogRoot, CompletedSnapshot, PackageLimits, SnapshotMetadata, SnapshotPurpose,
+    },
     publication::HeadObservation,
 };
 use crate::persistent_store::{
@@ -571,10 +573,15 @@ async fn package_capture(
     let parent_graph = match &parent {
         Some(view) => {
             let mut roots = vec![
-                view.library.record_catalog.clone(),
-                view.library.asset_catalog.clone(),
+                (CatalogRoot::Records, view.library.record_catalog.clone()),
+                (CatalogRoot::Assets, view.library.asset_catalog.clone()),
             ];
-            roots.extend(view.sections.values().map(|section| section.entries_root.clone()));
+            roots.extend(view.sections.iter().map(|(id, section)| {
+                (
+                    CatalogRoot::Section(id.clone()),
+                    section.entries_root.clone(),
+                )
+            }));
             let graph = super::packaging::ParentGraph::new(roots, &connected.handle)?;
             journal.record_parent(graph.stored())?;
             Some(graph)

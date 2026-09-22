@@ -2,6 +2,7 @@
 //! compiled into the product; unimplemented services remain absent from the UI.
 pub(crate) mod admission;
 pub(crate) mod auth;
+pub(crate) mod cache_hydration;
 pub(crate) mod capabilities;
 pub(crate) mod capture;
 pub(crate) mod cleanup;

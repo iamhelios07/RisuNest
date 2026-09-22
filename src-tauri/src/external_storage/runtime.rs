@@ -1466,8 +1466,22 @@ async fn run_backup(
             let view =
                 super::control::read_snapshot_document(connected, &head.document.state, cancel)
                     .await?;
-            let mut roots = vec![view.library.record_catalog, view.library.asset_catalog];
-            roots.extend(view.sections.into_values().map(|section| section.entries_root));
+            let mut roots = vec![
+                (
+                    super::packaging::CatalogRoot::Records,
+                    view.library.record_catalog,
+                ),
+                (
+                    super::packaging::CatalogRoot::Assets,
+                    view.library.asset_catalog,
+                ),
+            ];
+            roots.extend(view.sections.into_iter().map(|(id, section)| {
+                (
+                    super::packaging::CatalogRoot::Section(id),
+                    section.entries_root,
+                )
+            }));
             let graph = super::packaging::ParentGraph::new(roots, &connected.handle)?;
             journal.record_parent(graph.stored())?;
             Some(graph)
