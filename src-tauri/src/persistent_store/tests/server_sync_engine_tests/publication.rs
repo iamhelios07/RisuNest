@@ -571,3 +571,60 @@ fn a_receive_page_costs_its_own_requests_not_one_per_record() {
         );
     }
 }
+
+#[test]
+fn preparing_a_page_of_records_commits_per_page_not_per_record() {
+    const RECORDS: usize = 300;
+    let fixture = Fixture::new();
+    let (_source_dir, mut source) = prepared();
+    fixture.bind(&mut source);
+    assert_eq!(settle(&mut source).phase, "idle");
+    for index in 0..RECORDS {
+        put(
+            &mut source,
+            &format!("assets/synthetic-durable-{index:04}.png"),
+            &[(index % 251) as u8; 2048],
+        );
+    }
+
+    // Counted from outside the code under test: SQLite reports every
+    // transaction on this connection, and the database each statement wrote
+    // tells a durable one from scratch a cycle keeps in its temporary space.
+    let commits = Arc::new(AtomicU64::new(0));
+    let durable = Arc::new(AtomicBool::new(false));
+    let touched = Arc::clone(&durable);
+    source
+        .connection
+        .update_hook(Some(move |_action, database: &str, _table: &str, _row| {
+            if database == "main" {
+                touched.store(true, Ordering::Relaxed);
+            }
+        }));
+    let counted = Arc::clone(&commits);
+    let reached = Arc::clone(&durable);
+    source.connection.commit_hook(Some(move || {
+        if reached.swap(false, Ordering::Relaxed) {
+            counted.fetch_add(1, Ordering::Relaxed);
+        }
+        false
+    }));
+    assert_eq!(settle(&mut source).phase, "idle");
+    source.connection.commit_hook::<fn() -> bool>(None);
+    source
+        .connection
+        .update_hook::<fn(rusqlite::hooks::Action, &str, &str, i64)>(None);
+
+    let total = commits.load(Ordering::Relaxed);
+    eprintln!("publication of {RECORDS} records: {total} local commits");
+    assert!(
+        total < RECORDS as u64 / 8,
+        "a page of {RECORDS} records must cost transactions per page, not per record, saw {total}"
+    );
+    for index in 0..RECORDS {
+        let key = format!("assets/synthetic-durable-{index:04}.png");
+        assert!(
+            source.read_asset_alias("asset", &key, None).unwrap().is_some(),
+            "{key} did not survive publication"
+        );
+    }
+}
