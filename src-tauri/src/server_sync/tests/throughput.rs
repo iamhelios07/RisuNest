@@ -27,12 +27,11 @@ fn publish(server: &Observed, count: usize) -> Vec<String> {
         .collect()
 }
 
-/// Baseline for the small-object page. The server fills one reply up to its
-/// inline target and answers the rest as `FullRequired`; the client then
-/// fetches each of those on its own. The bodies all arrive intact, so this is a
-/// request-amplification cost, not a correctness defect.
+/// A full page of small objects must not degrade into one request per object
+/// once the first reply is full. Every body here fits the server's inline
+/// target, so every body must arrive inside a batched reply.
 #[test]
-fn small_object_page_currently_falls_back_to_one_request_per_object() {
+fn small_object_page_does_not_fall_back_to_one_request_per_object() {
     let server = Observed::start();
     let targets = publish(&server, risunest_sync_wire::transfer::MAX_BATCH_OBJECTS);
     let client = server.client();
@@ -60,12 +59,20 @@ fn small_object_page_currently_falls_back_to_one_request_per_object() {
         .get("GET objects/{hash}")
         .copied()
         .unwrap_or_default();
-    assert_eq!(batched, 1);
-    assert!(
-        per_object > 500,
-        "the page currently degrades into per-object requests, saw {per_object}"
+    assert_eq!(
+        per_object, 0,
+        "bodies that fit the reply target must arrive in a batched reply"
     );
-    assert_eq!(total, batched + per_object);
+    // Each reply carries at most the shared target, so a page this size needs
+    // the first request plus one regrouped request per further reply.
+    let framed = targets.len() * (SMALL_BODY_BYTES + 45) + 8;
+    let replies = framed.div_ceil(risunest_sync_wire::transfer::PREFERRED_BATCH_BYTES) as u64;
+    assert!(
+        batched <= replies + 1,
+        "expected at most {} batched requests, saw {batched}",
+        replies + 1
+    );
+    assert_eq!(total, batched);
 }
 
 /// Cached identities cost nothing. This is the A01 shape at transfer level: a

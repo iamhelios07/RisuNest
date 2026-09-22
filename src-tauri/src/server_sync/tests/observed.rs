@@ -51,6 +51,7 @@ fn category(path: &str) -> String {
 
 pub(super) struct Observed {
     pub store: Arc<Store>,
+    _directory: tempfile::TempDir,
     endpoint: String,
     requests: Arc<Requests>,
     runtime: Option<tokio::runtime::Runtime>,
@@ -60,7 +61,7 @@ pub(super) struct Observed {
 
 impl Observed {
     pub fn start() -> Self {
-        let directory = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        let directory = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::init(directory.path()).unwrap());
         let credential = store.add_device().unwrap();
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -89,6 +90,7 @@ impl Observed {
         });
         Self {
             store,
+            _directory: directory,
             endpoint,
             requests,
             runtime: Some(runtime),
