@@ -207,6 +207,14 @@ impl Store {
                 .map_err(super::objects::body_error)?
                 .is_some()
             {
+                // A file can survive under the same identity when an upload
+                // published one for a body the metadata files inline. The
+                // identity leaves both stores or neither.
+                match std::fs::remove_file(self.object_path(&digest)?) {
+                    Ok(()) => (),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                    Err(_) => continue,
+                }
                 collected.push(digest);
                 continue;
             }

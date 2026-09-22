@@ -301,7 +301,12 @@ impl Store {
                 .map_err(|_| Error::new("storage-unavailable", 503))?;
             let mut db = self.db()?;
             Self::upload_row(&db, device, id)?;
-            publish(temp.path(), &destination)?;
+            // An identity the metadata already files inline keeps its body
+            // there, so an upload of the same bytes does not leave a published
+            // file nothing accounts for.
+            if !matches!(super::objects::placement(&db, &digest)?, Some((_, true))) {
+                publish(temp.path(), &destination)?;
+            }
             let tx = db.transaction()?;
             tx.execute(
                 "INSERT INTO objects(hash,size,storage) VALUES(?1,?2,'file') ON CONFLICT DO NOTHING",
@@ -345,25 +350,14 @@ impl Store {
         if length > UPLOAD_CHUNK_BYTES {
             return Err(Error::new("range-too-large", 413));
         }
-        let _gate = self
-            .objects_gate
-            .lock()
-            .map_err(|_| Error::new("storage-unavailable", 503))?;
-        let size = self
-            .object_size(digest)?
-            .ok_or(Error::new("object-not-found", 404))?;
+        let (mut body, size) = self.open_object(digest)?;
         if start.checked_add(length).is_none_or(|v| v > size) {
             return Err(Error::new("invalid-range", 416));
         }
-        let mut file = File::open(self.object_path(digest)?)?;
-        drop(_gate);
-        if file.metadata()?.len() != size {
-            return Err(Error::new("corrupt-object", 503));
-        }
         use std::io::{Seek, SeekFrom};
-        file.seek(SeekFrom::Start(start))?;
+        body.seek(SeekFrom::Start(start))?;
         let mut bytes = vec![0; length as usize];
-        file.read_exact(&mut bytes)?;
+        body.read_exact(&mut bytes)?;
         Ok(bytes)
     }
 }

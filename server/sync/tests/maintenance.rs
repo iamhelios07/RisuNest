@@ -196,3 +196,22 @@ fn collection_removes_a_published_file_and_an_inline_body_together() {
     assert!(!path.exists());
     assert_eq!(inline_bodies(dir.path()), 0);
 }
+
+#[test]
+fn collection_removes_a_stray_file_under_an_inline_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::init(dir.path()).unwrap();
+    let a = device(&store);
+    let bytes = b"synthetic inline body".to_vec();
+    let digest = hash(&bytes);
+    store.put_object(&a, &digest, &bytes).unwrap();
+    // Model a store where a file was published under an identity the metadata
+    // files inline, which is what collection has to survive.
+    let path = dir.path().join("objects").join(&digest[..2]).join(&digest);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    expire_leases(dir.path());
+    assert_eq!(store.maintain().unwrap().objects_removed, 1);
+    assert!(!path.exists());
+    assert_eq!(inline_bodies(dir.path()), 0);
+}

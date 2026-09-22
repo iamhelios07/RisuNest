@@ -40,6 +40,15 @@ fn cold_backup_restores_exact_objects_under_a_new_epoch_and_rejects_corruption()
     let restored = Store::restore_backup(&backup, &restored).unwrap();
     assert_eq!(restored.get_object(&digest).unwrap(), bytes);
     assert_eq!(restored.get_object(&published_digest).unwrap(), published);
+    // The incremental setting travels with the metadata copy, so collection on
+    // a restored store can still return the pages it frees.
+    assert_eq!(
+        rusqlite::Connection::open(directory.path().join("restored").join("metadata.sqlite"))
+            .unwrap()
+            .query_row("PRAGMA auto_vacuum", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
     // The inline body travelled inside the metadata copy rather than as a file
     // the backup had to write out and read back.
     assert!(!backup

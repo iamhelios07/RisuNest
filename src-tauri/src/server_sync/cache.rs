@@ -81,7 +81,8 @@ pub(crate) struct Cache {
 
 /// Holds one group of small bodies open. Committing writes the group; dropping
 /// it without committing discards what is still pending, so no reference can
-/// be recorded against a body this cache never made durable.
+/// be recorded against a body this cache never made durable. Handles release
+/// in the order they were taken, innermost first.
 pub(crate) struct Batch<'a> {
     cache: &'a Cache,
     /// The scope depth this handle opened. Only bodies staged at or below it
