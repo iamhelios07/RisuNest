@@ -197,6 +197,14 @@ impl FakeProvider {
     pub(crate) fn uploaded_ids(&self) -> Vec<String> {
         self.state.lock().unwrap().upload_attempts.clone()
     }
+    /// Every body read this provider answered, for the measurements that count
+    /// provider requests rather than stored objects.
+    pub(crate) fn read_count(&self) -> usize {
+        self.state.lock().unwrap().read_attempts.len()
+    }
+    pub(crate) fn upload_count(&self) -> usize {
+        self.state.lock().unwrap().upload_attempts.len()
+    }
     pub(crate) fn listing_count(&self) -> usize {
         self.state.lock().unwrap().listings
     }

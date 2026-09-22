@@ -3177,6 +3177,8 @@ mod tests {
             let started = std::time::Instant::now();
             let mut asset_catalog_id = None;
             let mut latest = None;
+            let mut steady_reads = 0;
+            let mut steady_uploads = 0;
             for revision in 1..=300i64 {
                 let capture_id = format!("publication-capture-{revision}");
                 let snapshot_id = format!("publication-snapshot-{revision}");
@@ -3192,6 +3194,8 @@ mod tests {
                 let snapshot_metadata = metadata(&snapshot_id, &capture);
                 let mut transfer = journal(&root.path().join(&job_id), &job_id, &capture);
                 let before = provider.state.lock().unwrap().objects.len();
+                let before_reads = provider.read_count();
+                let before_uploads = provider.upload_count();
                 let completed = package_and_upload(
                     capture,
                     Vec::new(),
@@ -3208,8 +3212,14 @@ mod tests {
                 .await
                 .unwrap();
                 if let Some(expected) = &asset_catalog_id {
+                    // The asset side is unchanged, so a publication adds only
+                    // what its own revision produced: one record pack, the
+                    // record catalog naming it, the snapshot, and the three
+                    // inventory pages that register the job's objects.
                     assert_eq!(&completed.asset_catalog.object_id, expected);
-                    assert_eq!(provider.state.lock().unwrap().objects.len() - before, 3);
+                    assert_eq!(provider.state.lock().unwrap().objects.len() - before, 6);
+                    steady_reads = provider.read_count() - before_reads;
+                    steady_uploads = provider.upload_count() - before_uploads;
                 } else {
                     asset_catalog_id = Some(completed.asset_catalog.object_id.clone());
                 }
@@ -3239,8 +3249,10 @@ mod tests {
             assert!(network_reads < 50);
             assert!(pack_reads < 20);
             eprintln!(
-                "assets=1000 publications=300 physical_remote_objects={} publication_ms={} latest_restore_reads={} latest_reachable_packs={} latest_restore_ms={}",
+                "assets=1000 publications=300 physical_remote_objects={} steady_provider_reads={} steady_provider_uploads={} publication_ms={} latest_restore_reads={} latest_reachable_packs={} latest_restore_ms={}",
                 physical_remote_objects,
+                steady_reads,
+                steady_uploads,
                 publication_elapsed.as_millis(),
                 network_reads,
                 pack_reads,
