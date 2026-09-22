@@ -685,6 +685,8 @@ mod tests {
             )
             .unwrap();
         drop(store);
+        // The same length as the original, so only reading it can tell.
+        assert!(catalog.content.put(&record_hash, record).is_err());
         assert!(registered_capture_roots([&reference], root.path()).is_ok());
         assert!(validate_capture_sources([&reference], root.path()).is_err());
     }

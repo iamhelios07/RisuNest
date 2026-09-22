@@ -111,8 +111,11 @@ impl ContentStore {
         if bytes.len() > SMALL_OBJECT_BYTES {
             return self.write_file(expected, bytes);
         }
-        if let Some(size) = self.stat(expected)? {
-            if size != bytes.len() as u64 {
+        if self.stat(expected)?.is_some() {
+            // An identity already here keeps the body it already has, and that
+            // body is checked rather than assumed, exactly as the file path
+            // checks one it finds already published.
+            if self.read_all(expected)? != bytes {
                 return Err(invalid("Existing capture object differs"));
             }
             return Ok(());
