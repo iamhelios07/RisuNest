@@ -81,6 +81,79 @@ impl<'a> Transfer<'a> {
     ) -> Result<Vec<String>> {
         self.download_record_inner(version, bases, base_version, true)
     }
+    /// Fetch a whole page's record and descriptor identities in one request.
+    /// The per-record work that follows finds them cached and sends nothing,
+    /// so a page costs its own requests rather than one request per record.
+    pub(crate) fn prefetch_record_metadata(
+        &self,
+        records: &[(risunest_sync_wire::RecordVersion, Vec<String>)],
+    ) -> Result<()> {
+        let mut hashes = Vec::new();
+        let mut hints = std::collections::BTreeMap::new();
+        for (version, bases) in records {
+            let risunest_sync_wire::RecordVersion::Live {
+                object_hash,
+                descriptor_hash: Some(descriptor_hash),
+            } = version
+            else {
+                continue;
+            };
+            for digest in [object_hash, descriptor_hash] {
+                // Records sharing an identity belong in the request once. The
+                // first record's bases are kept; a base inventory is a delta
+                // hint, not part of the identity being requested.
+                if hints.insert(digest.clone(), bases.clone()).is_none() {
+                    hashes.push(digest.clone());
+                }
+            }
+        }
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        self.download_with_hints(&hashes, &[], &hints)
+    }
+    /// Fetch the bodies a page's records declare, in the same batched shape.
+    /// The set comes from each record's already cached descriptor, so no
+    /// payload is retained for the page to collect it. A descriptor that does
+    /// not read or validate here is left to the per-record path, which reports
+    /// it; a prefetch never decides an outcome.
+    pub(crate) fn prefetch_record_dependencies(
+        &self,
+        records: &[(risunest_sync_wire::RecordVersion, Vec<String>)],
+    ) -> Result<()> {
+        use risunest_sync_wire::descriptor::RecordDescriptor;
+        self.ensure_active()?;
+        let mut hashes = Vec::new();
+        let mut hints = std::collections::BTreeMap::new();
+        for (version, bases) in records {
+            let risunest_sync_wire::RecordVersion::Live {
+                descriptor_hash: Some(descriptor_hash),
+                ..
+            } = version
+            else {
+                continue;
+            };
+            let Ok(bytes) = self.cache.read(descriptor_hash, MAX_METADATA_BYTES) else {
+                continue;
+            };
+            let Ok(descriptor) = canonical::decode::<RecordDescriptor>(&bytes, MAX_METADATA_BYTES)
+            else {
+                continue;
+            };
+            if descriptor.validate().is_err() {
+                continue;
+            }
+            for digest in descriptor.dependencies {
+                if hints.insert(digest.clone(), bases.clone()).is_none() {
+                    hashes.push(digest);
+                }
+            }
+        }
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        self.download_with_hints(&hashes, &[], &hints)
+    }
     fn download_record_inner(
         &self,
         version: &risunest_sync_wire::RecordVersion,

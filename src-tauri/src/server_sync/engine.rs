@@ -1359,6 +1359,30 @@ impl PersistentStore {
             if page.is_empty() {
                 break;
             }
+            // One metadata request for the page. Each record's own base
+            // inventory is computed here and reused below, so the per-record
+            // work costs the same local queries it did before.
+            let mut candidates = BTreeMap::new();
+            for item in &page {
+                if item.action != "apply" {
+                    continue;
+                }
+                let remote: RecordVersion = parse(&item.remote)?;
+                if !matches!(remote, RecordVersion::Live { .. }) {
+                    continue;
+                }
+                let bases =
+                    self.server_base_candidates(Domain::Library, &item.key, &cache, committed)?;
+                candidates.insert(item.key.clone(), (remote, bases));
+            }
+            let prefetch = candidates.values().cloned().collect::<Vec<_>>();
+            transfer.prefetch_record_metadata(&prefetch)?;
+            if !remote_assets {
+                let native = PayloadCas::new(&self.repository_root)?;
+                Transfer::new(&client, &cache)?
+                    .with_destination(&native, &self.connection)
+                    .prefetch_record_dependencies(&prefetch)?;
+            }
             for item in page {
                 after = item.key.clone();
                 let applying = item.action == "apply";
@@ -1368,8 +1392,15 @@ impl PersistentStore {
                 let remote_hash = match item.action.as_str() {
                     "apply" => {
                         let (payload, hash) = if matches!(remote, RecordVersion::Live { .. }) {
-                            let base_candidates =
-                                self.server_base_candidates(Domain::Library, &item.key, &cache, committed)?;
+                            let base_candidates = match candidates.remove(&item.key) {
+                                Some((_, bases)) => bases,
+                                None => self.server_base_candidates(
+                                    Domain::Library,
+                                    &item.key,
+                                    &cache,
+                                    committed,
+                                )?,
+                            };
                             transfer.download_record_metadata(&remote, &base_candidates, &base_version)?;
                             let (payload, hash) = cache.restore(&remote)?;
                             let dependencies = cache.dependencies(&payload)?;
@@ -2227,6 +2258,25 @@ impl PersistentStore {
             if page.is_empty() {
                 break;
             }
+            let mut candidates = BTreeMap::new();
+            for item in &page {
+                if item.action != "apply"
+                    || !["plugin", "preset", "character", "conversation"]
+                        .contains(&key_parts(&item.key, revision)?.kind.as_str())
+                {
+                    continue;
+                }
+                let remote: RecordVersion = parse(&item.remote)?;
+                if !matches!(remote, RecordVersion::Live { .. }) {
+                    continue;
+                }
+                let bases =
+                    self.server_base_candidates(Domain::Library, &item.key, cache, false)?;
+                candidates.insert(item.key.clone(), (remote, bases));
+            }
+            transfer.prefetch_record_metadata(
+                &candidates.values().cloned().collect::<Vec<_>>(),
+            )?;
             for item in page {
                 after = item.key.clone();
                 if item.action != "apply" {
@@ -2241,9 +2291,15 @@ impl PersistentStore {
                 self.connection
                     .execute("DELETE FROM server_cycle_order WHERE key=?1", [&item.key])?;
                 if matches!(remote, RecordVersion::Live { .. }) {
+                    let base_candidates = match candidates.remove(&item.key) {
+                        Some((_, bases)) => bases,
+                        None => {
+                            self.server_base_candidates(Domain::Library, &item.key, cache, false)?
+                        }
+                    };
                     transfer.download_record_metadata(
                         &remote,
-                        &self.server_base_candidates(Domain::Library, &item.key, cache, false)?,
+                        &base_candidates,
                         &self.server_base(Domain::Library, &item.key)?.0,
                     )?;
                     let (payload, _) = cache.restore(&remote)?;
