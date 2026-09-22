@@ -13,8 +13,8 @@ use risunest_external_storage_format::snapshot as wire;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::{collections::BTreeSet, fs, path::Path};
 
-/// How many published graphs one connection keeps on hand.
-const RETAINED_GRAPHS: i64 = 32;
+/// How many published graphs one connection keeps on hand, per catalog kind.
+const RETAINED_GRAPHS: i64 = 64;
 
 pub(super) fn kind_name(kind: wire::CatalogKind) -> &'static str {
     match kind {
@@ -62,6 +62,7 @@ impl PackageCache {
                PRIMARY KEY(repository_id,connection_identity,catalog_kind,fingerprint));
              CREATE TABLE IF NOT EXISTS graph_members(
                repository_id TEXT NOT NULL, connection_identity TEXT NOT NULL,
+               catalog_kind TEXT NOT NULL,
                root_identity TEXT NOT NULL, member_identity TEXT NOT NULL,
                member_stored TEXT NOT NULL,
                PRIMARY KEY(repository_id,connection_identity,root_identity,member_identity));",
@@ -75,6 +76,26 @@ impl PackageCache {
             .map_err(transient)?
             .exists([])
             .map_err(transient)?;
+        // A catalog kind that changes every publication would otherwise crowd
+        // out one that never changes, so the bound is per kind and a table
+        // without it cannot be read the way this one is.
+        let scoped: bool = db
+            .prepare("SELECT 1 FROM pragma_table_info('graph_members') WHERE name='catalog_kind'")
+            .map_err(transient)?
+            .exists([])
+            .map_err(transient)?;
+        if !scoped {
+            db.execute_batch(
+                "DROP TABLE graph_members;
+                 CREATE TABLE graph_members(
+                   repository_id TEXT NOT NULL, connection_identity TEXT NOT NULL,
+                   catalog_kind TEXT NOT NULL,
+                   root_identity TEXT NOT NULL, member_identity TEXT NOT NULL,
+                   member_stored TEXT NOT NULL,
+                   PRIMARY KEY(repository_id,connection_identity,root_identity,member_identity));",
+            )
+            .map_err(transient)?;
+        }
         if tagged {
             db.execute_batch(
                 "DROP TABLE entries;
@@ -194,6 +215,7 @@ impl PackageCache {
         &self,
         format_repository_id: &str,
         repository: &RepositoryHandle,
+        kind: wire::CatalogKind,
         root_identity: &str,
         members: &[(String, wire::StoredObject)],
     ) -> Result<()> {
@@ -203,27 +225,61 @@ impl PackageCache {
         let transaction = self.db.unchecked_transaction().map_err(transient)?;
         {
             let mut statement = transaction
-                .prepare("INSERT OR REPLACE INTO graph_members VALUES(?1,?2,?3,?4,?5)")
+                .prepare("INSERT OR REPLACE INTO graph_members VALUES(?1,?2,?3,?4,?5,?6)")
                 .map_err(transient)?;
             for (identity, member) in members {
                 statement.execute(params![
-                    format_repository_id, repository.connection_identity, root_identity, identity,
-                    serde_json::to_string(member).map_err(corrupt)?,
+                    format_repository_id, repository.connection_identity, kind_name(kind),
+                    root_identity, identity, serde_json::to_string(member).map_err(corrupt)?,
                 ]).map_err(transient)?;
             }
         }
         // Only a recent root can still be selected as a parent, and a graph
-        // nothing names is taking space for nothing.
+        // nothing names is taking space for nothing. Counted within one kind,
+        // because a catalog that changes every publication would otherwise
+        // crowd out one that stands still.
         transaction.execute(
             "DELETE FROM graph_members WHERE repository_id=?1 AND connection_identity=?2
-             AND root_identity NOT IN (
+             AND catalog_kind=?3 AND root_identity NOT IN (
                SELECT root_identity FROM graph_members
-               WHERE repository_id=?1 AND connection_identity=?2
-               GROUP BY root_identity ORDER BY MIN(rowid) DESC LIMIT ?3)",
-            params![format_repository_id, repository.connection_identity, RETAINED_GRAPHS],
+               WHERE repository_id=?1 AND connection_identity=?2 AND catalog_kind=?3
+               GROUP BY root_identity ORDER BY MAX(rowid) DESC LIMIT ?4)",
+            params![
+                format_repository_id, repository.connection_identity, kind_name(kind),
+                RETAINED_GRAPHS,
+            ],
         ).map_err(transient)?;
         transaction.commit().map_err(transient)?;
         Ok(())
+    }
+
+    /// Everything one published catalog root names, as the objects a
+    /// publication can reference again. Empty means this cache never recorded
+    /// that root, not that the root names nothing.
+    pub(super) fn graph_of(
+        &self,
+        format_repository_id: &str,
+        repository: &RepositoryHandle,
+        root_identity: &str,
+    ) -> Result<Vec<RemoteObject>> {
+        let mut statement = self.db.prepare(
+            "SELECT member_stored FROM graph_members WHERE repository_id=?1 AND connection_identity=?2 AND root_identity=?3",
+        ).map_err(transient)?;
+        let rows = statement.query_map(
+            params![format_repository_id, repository.connection_identity, root_identity],
+            |row| row.get::<_, String>(0),
+        ).map_err(transient)?;
+        let mut objects = Vec::new();
+        for row in rows {
+            let encoded = row.map_err(transient)?;
+            let stored: wire::StoredObject = serde_json::from_str(&encoded).map_err(corrupt)?;
+            let object = RemoteObject::from_stored(&stored, repository)?;
+            if object.repository_id != format_repository_id {
+                return Err(corrupt("cached graph repository"));
+            }
+            objects.push(object);
+        }
+        Ok(objects)
     }
 
     /// Everything the selected parent graph holds, read once for a whole
@@ -346,6 +402,44 @@ mod tests {
     use super::*;
     use crate::external_storage::{contract::ErrorKind, fake};
 
+    /// A catalog kind republished every time must not evict one that never
+    /// changes, because the unchanging one is still what a parent names.
+    #[test]
+    fn a_kind_that_keeps_changing_does_not_crowd_out_one_that_stands_still() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = fake::repository();
+        let cache = PackageCache::open(root.path()).unwrap();
+        let member = |id: &str| {
+            let object = crate::external_storage::reachability::tests::object(id, ObjectRole::Pack);
+            vec![(id.to_owned(), object.stored(&repository).unwrap())]
+        };
+        cache.record_graph(
+            "format-repository", &repository, wire::CatalogKind::Assets, "asset-root",
+            &member("pack-assets"),
+        ).unwrap();
+        for index in 0..RETAINED_GRAPHS + 8 {
+            cache.record_graph(
+                "format-repository", &repository, wire::CatalogKind::Records,
+                &format!("record-root-{index}"), &member(&format!("pack-records-{index}")),
+            ).unwrap();
+        }
+        assert_eq!(
+            cache.graph_of("format-repository", &repository, "asset-root").unwrap().len(), 1,
+        );
+        assert!(cache.graph_of("format-repository", &repository, "record-root-0").unwrap().is_empty());
+        assert_eq!(
+            cache.graph_of(
+                "format-repository", &repository, &format!("record-root-{}", RETAINED_GRAPHS + 7),
+            ).unwrap().len(),
+            1,
+        );
+        let held: i64 = cache.db.query_row(
+            "SELECT count(DISTINCT root_identity) FROM graph_members WHERE catalog_kind='records'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(held, RETAINED_GRAPHS);
+    }
+
     /// Nothing here is authoritative, so a cache that still names a row's
     /// publication on the row starts again instead of being read two ways.
     #[test]
@@ -372,7 +466,8 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(
-            cache.record_graph("format-repository", &repository, "", &[]).unwrap_err().kind,
+            cache.record_graph("format-repository", &repository, wire::CatalogKind::Assets, "", &[])
+                .unwrap_err().kind,
             ErrorKind::Corrupt,
         );
     }

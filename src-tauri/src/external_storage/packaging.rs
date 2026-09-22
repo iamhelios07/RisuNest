@@ -1470,6 +1470,7 @@ async fn build_catalog(
     build_root: &Path,
     root_key: &[u8; 32],
     limits: PackageLimits,
+    parent: Option<&BTreeSet<String>>,
     cache: &mut PackageCache,
     evidence: &mut ObjectEvidence,
     journal: &mut TransferJournal,
@@ -1482,13 +1483,20 @@ async fn build_catalog(
     // of the catalog it is about to name.
     let mark = referenced.len();
     if let Some(root) = cache.catalog(format_repository_id, repository, kind, fingerprint)? {
+        if let Some(objects) =
+            admitted_catalog(&root, parent, format_repository_id, cache, evidence, repository)?
+        {
+            referenced.extend(objects);
+            return Ok(root);
+        }
         if let Some(objects) = revalidate_cached_catalog(
             &root, cache, evidence, journal, root_key, provider, repository, cancel,
         ).await? {
             let current = objects.first().cloned().ok_or_else(|| corrupt("empty catalog closure"))?;
             referenced.extend(objects);
             record_published_graph(
-                &entries, &referenced[mark..], &current, format_repository_id, cache, repository,
+                &entries, &referenced[mark..], &current, kind, format_repository_id, cache,
+                repository,
             )?;
             return Ok(current);
         }
@@ -1600,9 +1608,40 @@ async fn build_catalog(
     )?;
     cache.put_catalog(repository, kind, fingerprint, &root)?;
     record_published_graph(
-        &entries, &referenced[mark..], &root, format_repository_id, cache, repository,
+        &entries, &referenced[mark..], &root, kind, format_repository_id, cache, repository,
     )?;
     Ok(root)
+}
+
+/// A catalog whose root is in the selected parent graph is protected with it,
+/// down to every pack beneath it, so what it names is read from the cache
+/// rather than walked. A root the cache never recorded, or one naming
+/// something this connection found unusable, is not admitted.
+fn admitted_catalog(
+    root: &RemoteObject,
+    members: Option<&BTreeSet<String>>,
+    format_repository_id: &str,
+    cache: &PackageCache,
+    evidence: &ObjectEvidence,
+    repository: &RepositoryHandle,
+) -> Result<Option<Vec<RemoteObject>>> {
+    let Some(members) = members else {
+        return Ok(None);
+    };
+    let identity = ObjectEvidence::identity(root, repository)?;
+    if !members.contains(&identity) {
+        return Ok(None);
+    }
+    let objects = cache.graph_of(format_repository_id, repository, &identity)?;
+    if objects.is_empty() {
+        return Ok(None);
+    }
+    for object in &objects {
+        if evidence.known(&ObjectEvidence::identity(object, repository)?)? {
+            return Ok(None);
+        }
+    }
+    Ok(Some(objects))
 }
 
 /// What one catalog root names: the packs its entries point at and the catalog
@@ -1613,6 +1652,7 @@ fn record_published_graph(
     entries: &[EntryPlan],
     added: &[RemoteObject],
     root: &RemoteObject,
+    kind: wire::CatalogKind,
     format_repository_id: &str,
     cache: &PackageCache,
     repository: &RepositoryHandle,
@@ -1628,6 +1668,7 @@ fn record_published_graph(
     cache.record_graph(
         format_repository_id,
         repository,
+        kind,
         &super::reachability::object_identity(root, repository)?,
         &members,
     )
@@ -1757,6 +1798,7 @@ pub(crate) async fn package_and_upload(
         &build_root,
         root_key,
         limits,
+        members.as_ref(),
         &mut cache,
         &mut evidence,
         journal,
@@ -1772,13 +1814,28 @@ pub(crate) async fn package_and_upload(
         wire::CatalogKind::Assets,
         &asset_fingerprint,
     )? {
-        Some(root) => revalidate_cached_catalog(
-            &root, &mut cache, &mut evidence, journal, root_key, provider, repository, cancel,
-        ).await?,
+        Some(root) => match admitted_catalog(
+            &root, members.as_ref(), &metadata.repository_id, &cache, &evidence, repository,
+        )? {
+            Some(objects) => Some((root, objects)),
+            // A revalidated root may carry a locator repaired since it was
+            // cached, so the closure names the current one, not this.
+            None => match revalidate_cached_catalog(
+                &root, &mut cache, &mut evidence, journal, root_key, provider, repository, cancel,
+            ).await? {
+                Some(objects) => Some((
+                    objects.first().cloned().ok_or_else(|| corrupt("empty asset catalog closure"))?,
+                    objects,
+                )),
+                None => None,
+            },
+        },
         None => None,
     };
-    let asset_catalog = if let Some(objects) = cached_assets {
-        let root = objects.first().cloned().ok_or_else(|| corrupt("empty asset catalog closure"))?;
+    let asset_catalog = if let Some((root, objects)) = cached_assets {
+        if objects.is_empty() {
+            return Err(corrupt("empty asset catalog closure"));
+        }
         referenced.extend(objects);
         root
     } else {
@@ -1808,6 +1865,7 @@ pub(crate) async fn package_and_upload(
             &build_root,
             root_key,
             limits,
+            members.as_ref(),
             &mut cache,
             &mut evidence,
             journal,
@@ -1885,6 +1943,7 @@ pub(crate) async fn package_and_upload(
             &build_root,
             root_key,
             limits,
+            members.as_ref(),
             &mut cache,
             &mut evidence,
             journal,
@@ -2951,6 +3010,38 @@ mod tests {
         });
     }
 
+    /// A catalog whose root the parent already names is protected down to
+    /// every pack beneath it, so republishing the same library asks nothing.
+    #[test]
+    fn c_an_unchanged_catalog_under_the_parent_is_not_walked() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let cache = root.path().join("cache");
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let key = [29; 32];
+            let cancel = Cancellation::default();
+            let mut head = None;
+            let mut reads = 0;
+            for name in ["first", "second"] {
+                let capture = captured_asset_inventory(root.path(), name, 1, 1, 0, 4);
+                let meta = metadata(name, &capture);
+                let mut transfer = journal(&root.path().join(name), name, &capture);
+                let graph = head.as_ref().map(|previous| parent_graph(previous, &repository).unwrap());
+                let before = provider.read_count();
+                let completed = package_and_upload(
+                    capture, vec![], root.path(), &cache, meta, &key, limits(128 * 1024),
+                    graph.as_ref(), &mut transfer, &provider, &repository, &cancel,
+                ).await.unwrap();
+                reads = provider.read_count() - before;
+                if head.is_none() {
+                    head = Some(completed);
+                }
+            }
+            assert_eq!(reads, 0);
+        });
+    }
+
     /// A backup publishes into the same cache without selecting a parent. What
     /// the sync before it published still has to be reusable by the sync after
     /// it, so a publication records what its own graph holds and takes nothing
@@ -3758,6 +3849,11 @@ mod tests {
                 let before = provider.state.lock().unwrap().objects.len();
                 let before_reads = provider.read_count();
                 let before_uploads = provider.upload_count();
+                let parent = latest
+                    .as_ref()
+                    .map(|previous| parent_graph(previous, &repository))
+                    .transpose()
+                    .unwrap();
                 let completed = package_and_upload(
                     capture,
                     Vec::new(),
@@ -3766,7 +3862,7 @@ mod tests {
                     snapshot_metadata,
                     &key,
                     limits(128 * 1024),
-                    None,
+                    parent.as_ref(),
                     &mut transfer,
                     &provider,
                     &repository,
