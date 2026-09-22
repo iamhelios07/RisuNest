@@ -2,6 +2,7 @@ use super::{Result, SyncError};
 use crate::{
     asset_repository::PayloadCas, persistent_store::server_sync_projection::ServerPayload,
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use risunest_sync_wire::{
     canonical,
     descriptor::{build_reference_tree, visit_reference_tree, RecordDescriptor},
@@ -25,8 +26,27 @@ const INLINE_PAYLOAD_BYTES: usize = 16 * 1024;
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 enum RecordContent {
-    Inline { bytes: String },
-    Tree { value: payload::Payload },
+    Inline {
+        #[serde(rename = "bytesBase64url")]
+        bytes_base64url: String,
+    },
+    Tree {
+        value: payload::Payload,
+    },
+}
+
+/// Canonical unpadded base64url. Re-encoding equality rejects a non-canonical
+/// encoding of the same bytes, so one body has exactly one wrapper.
+fn decode_inline(encoded: &str) -> Result<Vec<u8>> {
+    let invalid = || SyncError::new("invalid-inline-payload", 409);
+    if encoded.len() > INLINE_PAYLOAD_BYTES.div_ceil(3) * 4 {
+        return Err(invalid());
+    }
+    let bytes = URL_SAFE_NO_PAD.decode(encoded).map_err(|_| invalid())?;
+    if bytes.len() > INLINE_PAYLOAD_BYTES || URL_SAFE_NO_PAD.encode(&bytes) != encoded {
+        return Err(invalid());
+    }
+    Ok(bytes)
 }
 
 pub(crate) struct Cache {
@@ -152,7 +172,7 @@ impl Cache {
         let mut objects = BTreeSet::new();
         let segmented = if bytes.len() <= INLINE_PAYLOAD_BYTES {
             RecordContent::Inline {
-                bytes: hex::encode(bytes),
+                bytes_base64url: URL_SAFE_NO_PAD.encode(bytes),
             }
         } else {
             RecordContent::Tree {
@@ -247,16 +267,8 @@ impl Cache {
             return Err(SyncError::new("unsupported-server-record", 409));
         }
         match object.payload {
-            RecordContent::Inline { bytes } => {
-                if bytes.len() > INLINE_PAYLOAD_BYTES * 2
-                    || bytes
-                        .bytes()
-                        .any(|b| !b.is_ascii_digit() && !(b'a'..=b'f').contains(&b))
-                {
-                    return Err(SyncError::new("invalid-inline-payload", 409));
-                }
-                let bytes = hex::decode(bytes)
-                    .map_err(|_| SyncError::new("invalid-inline-payload", 409))?;
+            RecordContent::Inline { bytes_base64url } => {
+                let bytes = decode_inline(&bytes_base64url)?;
                 let hash = risunest_sync_wire::hash(&bytes);
                 Ok((bytes, hash))
             }
@@ -391,11 +403,9 @@ impl Cache {
             return Err(SyncError::new("unsupported-server-record", 409));
         }
         let mut pending = match object.payload {
-            RecordContent::Inline { bytes } if bytes.len() <= INLINE_PAYLOAD_BYTES * 2 => {
+            RecordContent::Inline { bytes_base64url } => {
+                decode_inline(&bytes_base64url)?;
                 Vec::new()
-            }
-            RecordContent::Inline { .. } => {
-                return Err(SyncError::new("invalid-inline-payload", 409))
             }
             RecordContent::Tree { value } => vec![(value.root, 0)],
         };
@@ -452,6 +462,28 @@ impl Cache {
 mod tests {
     use super::*;
     use crate::logical_records::LogicalRecordEnvelope;
+
+    /// A10. The inline wrapper carries canonical unpadded base64url under its
+    /// own field name, and every boundary size round trips to the same bytes.
+    #[test]
+    fn inline_wrapper_is_canonical_base64url_at_its_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        for size in [0, 1, 2, 3, INLINE_PAYLOAD_BYTES - 1, INLINE_PAYLOAD_BYTES] {
+            let source = (0..size).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+            let projected = cache.project_bytes(&source, &[], &[], Vec::new()).unwrap();
+            let RecordVersion::Live { object_hash, .. } = &projected.version else {
+                panic!("a projected record is live");
+            };
+            let encoded = cache.read(object_hash, MAX_METADATA_BYTES).unwrap();
+            let wrapper: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+            let field = wrapper["payload"]["bytesBase64url"].as_str().unwrap();
+            assert!(wrapper["payload"]["bytes"].is_null());
+            assert!(!field.contains('=') && !field.contains('+') && !field.contains('/'));
+            assert_eq!(decode_inline(field).unwrap(), source);
+            assert_eq!(cache.restore_bytes(&projected.version).unwrap().0, source);
+        }
+    }
     #[test]
     fn small_records_use_two_objects_and_verified_cache_reuse() {
         let dir = tempfile::tempdir().unwrap();
@@ -541,16 +573,19 @@ mod tests {
                 );
             }
         });
-        for bytes in [
-            "GG".to_owned(),
-            "a".to_owned(),
-            "00".repeat(INLINE_PAYLOAD_BYTES + 1),
+        for bytes_base64url in [
+            // Outside the alphabet, padded, non-canonical trailing bits and a
+            // body above the inline cutoff. Each is a distinct wrapper defect.
+            "a+/b".to_owned(),
+            format!("{}==", URL_SAFE_NO_PAD.encode(b"synthetic")),
+            "YR".to_owned(),
+            URL_SAFE_NO_PAD.encode(vec![0_u8; INLINE_PAYLOAD_BYTES + 1]),
         ] {
             let object_hash = cache
                 .put(
                     &canonical::encode(&RecordObject {
                         schema: "risunest-server-record-v1".into(),
-                        payload: RecordContent::Inline { bytes },
+                        payload: RecordContent::Inline { bytes_base64url },
                     })
                     .unwrap(),
                 )
