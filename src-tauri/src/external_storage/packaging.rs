@@ -723,12 +723,30 @@ struct SourceEntry {
     compression: CompressionPolicy,
 }
 #[derive(Clone)]
-struct PendingChunk {
-    pack_index: usize,
-    offset: u64,
-    stored_length: u64,
-    plaintext_length: u64,
-    plaintext_sha256: [u8; 32],
+enum PendingChunk {
+    /// Written into a pack this publication is building.
+    Placed {
+        pack_index: usize,
+        offset: u64,
+        stored_length: u64,
+        plaintext_length: u64,
+        plaintext_sha256: [u8; 32],
+    },
+    /// Already stored under the selected parent, at the placement it has.
+    Carried(wire::StoredChunk),
+}
+
+/// Where the selected parent already stored one chunk of plaintext, by what
+/// the chunk is and how it was encoded. An entry that changed at one end is
+/// repackaged, and the part of it that did not change points at what is
+/// already there instead of being encoded and uploaded again.
+type ChunkPlacements = BTreeMap<(String, u64, u8), wire::StoredChunk>;
+
+fn compression_tag(policy: CompressionPolicy) -> u8 {
+    match policy {
+        CompressionPolicy::Text => 0,
+        CompressionPolicy::AlreadyCompressed => 1,
+    }
 }
 struct PendingEntry {
     source: SourceEntry,
@@ -941,6 +959,8 @@ async fn build_entries(
     let mut uncached = Vec::new();
     // One answer per pack, not per entry that names it.
     let mut settled: BTreeMap<String, bool> = BTreeMap::new();
+    let mut placements: ChunkPlacements = BTreeMap::new();
+    let mut carried_packs: BTreeMap<String, RemoteObject> = BTreeMap::new();
     for source in sources {
         cancel.check()?;
         if let Some(mut cached) = cache.entry(
@@ -1011,12 +1031,57 @@ async fn build_entries(
                 }
             }
         }
+        // A changed entry is repackaged, but a large one usually changed at
+        // one end. What the parent already placed for its previous version is
+        // what the part that did not change points at.
+        if let Some(members) = parent {
+            if let Some(previous) =
+                cache.entry_by_key(format_repository_id, repository, kind, &source.key)?
+            {
+                let mut usable = true;
+                for pack in &previous.packs {
+                    let identity = ObjectEvidence::identity(pack, repository)?;
+                    if !members.contains(&identity) {
+                        usable = false;
+                        break;
+                    }
+                    let known = match settled.get(&identity) {
+                        Some(known) => *known,
+                        None => {
+                            let known = evidence.known(&identity)?;
+                            settled.insert(identity, known);
+                            known
+                        }
+                    };
+                    if known {
+                        usable = false;
+                        break;
+                    }
+                }
+                if usable {
+                    for chunk in &previous.chunks {
+                        placements.insert(
+                            (
+                                hex::encode(chunk.plaintext_sha256),
+                                chunk.plaintext_length,
+                                compression_tag(source.compression),
+                            ),
+                            chunk.clone(),
+                        );
+                    }
+                    for pack in previous.packs {
+                        carried_packs.insert(pack.object_id.clone(), pack);
+                    }
+                }
+            }
+        }
         uncached.push(source);
     }
     let build_root_owned = build_root.to_path_buf();
     let external_root_owned = external_root.to_path_buf();
     let cancel_owned = cancel.clone();
     let cpu = cpu_permit().await?;
+    let placed = placements;
     let prepared = tokio::task::spawn_blocking(move || {
         prepare_packs(
             uncached,
@@ -1025,6 +1090,7 @@ async fn build_entries(
             target,
             max_pack,
             chunk_bytes,
+            &placed,
             &cancel_owned,
         )
     })
@@ -1069,22 +1135,37 @@ async fn build_entries(
     }
     let mut new_entries = Vec::with_capacity(pending.len());
     for entry in pending {
-        let mut used = BTreeSet::new();
+        let mut used: BTreeMap<String, RemoteObject> = BTreeMap::new();
         let chunks = entry
             .chunks
             .into_iter()
-            .map(|chunk| {
-                let pack = uploaded_packs
-                    .get(chunk.pack_index)
-                    .ok_or_else(|| corrupt("missing completed pack"))?;
-                used.insert(chunk.pack_index);
-                Ok(wire::StoredChunk {
-                    pack_id: pack.object_id.clone(),
-                    offset: chunk.offset,
-                    stored_length: chunk.stored_length,
-                    plaintext_length: chunk.plaintext_length,
-                    plaintext_sha256: chunk.plaintext_sha256,
-                })
+            .map(|chunk| match chunk {
+                PendingChunk::Placed {
+                    pack_index,
+                    offset,
+                    stored_length,
+                    plaintext_length,
+                    plaintext_sha256,
+                } => {
+                    let pack = uploaded_packs
+                        .get(pack_index)
+                        .ok_or_else(|| corrupt("missing completed pack"))?;
+                    used.insert(pack.object_id.clone(), pack.clone());
+                    Ok(wire::StoredChunk {
+                        pack_id: pack.object_id.clone(),
+                        offset,
+                        stored_length,
+                        plaintext_length,
+                        plaintext_sha256,
+                    })
+                }
+                PendingChunk::Carried(stored) => {
+                    let pack = carried_packs
+                        .get(&stored.pack_id)
+                        .ok_or_else(|| corrupt("missing carried pack"))?;
+                    used.insert(pack.object_id.clone(), pack.clone());
+                    Ok(stored)
+                }
             })
             .collect::<Result<Vec<_>>>()?;
         let plan = EntryPlan {
@@ -1093,10 +1174,7 @@ async fn build_entries(
             content_sha256: entry.source.content_sha256,
             byte_length: entry.source.byte_length,
             chunks,
-            packs: used
-                .into_iter()
-                .map(|index| uploaded_packs[index].clone())
-                .collect(),
+            packs: used.into_values().collect(),
         };
         new_entries.push(plan);
     }
@@ -1126,6 +1204,7 @@ impl From<PreparedPacks> for PendingBuildParts {
         }
     }
 }
+#[allow(clippy::too_many_arguments)]
 fn prepare_packs(
     sources: Vec<SourceEntry>,
     external_root: &Path,
@@ -1133,6 +1212,7 @@ fn prepare_packs(
     target: u64,
     max_pack: u64,
     chunk_bytes: usize,
+    placements: &ChunkPlacements,
     cancel: &Cancellation,
 ) -> Result<PreparedPacks> {
     fs::create_dir_all(build_root).map_err(transient)?;
@@ -1166,43 +1246,52 @@ fn prepare_packs(
                 hash: hash(&bytes),
                 bytes,
             };
-            let mut encoded = Vec::new();
-            let stored_length =
-                pack::write_entry_with(&mut encoded, &chunk, &mut encoder, source.compression)
-                    .map_err(corrupt)?;
-            if current
-                .as_ref()
-                .is_some_and(|pack| pack.length > 0 && pack.length + stored_length > target)
-            {
-                packs.push(current.take().unwrap());
-            }
-            if stored_length > max_pack {
-                return Err(ProviderError::new(ErrorKind::FileTooLarge));
-            }
-            if current.is_none() {
-                current = Some(PendingPack {
-                    file: tempfile::NamedTempFile::new_in(build_root).map_err(transient)?,
-                    length: 0,
+            let placement = placements.get(&(
+                hex::encode(chunk.hash),
+                count as u64,
+                compression_tag(source.compression),
+            ));
+            if let Some(stored) = placement {
+                chunks.push(PendingChunk::Carried(stored.clone()));
+            } else {
+                let mut encoded = Vec::new();
+                let stored_length =
+                    pack::write_entry_with(&mut encoded, &chunk, &mut encoder, source.compression)
+                        .map_err(corrupt)?;
+                if current
+                    .as_ref()
+                    .is_some_and(|pack| pack.length > 0 && pack.length + stored_length > target)
+                {
+                    packs.push(current.take().unwrap());
+                }
+                if stored_length > max_pack {
+                    return Err(ProviderError::new(ErrorKind::FileTooLarge));
+                }
+                if current.is_none() {
+                    current = Some(PendingPack {
+                        file: tempfile::NamedTempFile::new_in(build_root).map_err(transient)?,
+                        length: 0,
+                    });
+                }
+                let pack = current.as_mut().unwrap();
+                if pack.length + stored_length > max_pack {
+                    return Err(ProviderError::new(ErrorKind::FileTooLarge));
+                }
+                let pack_index = packs.len();
+                let offset = pack.length;
+                pack.file
+                    .as_file_mut()
+                    .write_all(&encoded)
+                    .map_err(transient)?;
+                pack.length += stored_length;
+                chunks.push(PendingChunk::Placed {
+                    pack_index,
+                    offset,
+                    stored_length,
+                    plaintext_length: count as u64,
+                    plaintext_sha256: chunk.hash,
                 });
             }
-            let pack = current.as_mut().unwrap();
-            if pack.length + stored_length > max_pack {
-                return Err(ProviderError::new(ErrorKind::FileTooLarge));
-            }
-            let pack_index = packs.len();
-            let offset = pack.length;
-            pack.file
-                .as_file_mut()
-                .write_all(&encoded)
-                .map_err(transient)?;
-            pack.length += stored_length;
-            chunks.push(PendingChunk {
-                pack_index,
-                offset,
-                stored_length,
-                plaintext_length: count as u64,
-                plaintext_sha256: chunk.hash,
-            });
             if remaining == 0 {
                 break;
             }
@@ -3620,6 +3709,67 @@ mod tests {
         });
     }
 
+    /// A record that grows is repackaged, but only the end of it is new.
+    /// What the parent already stored for the rest of it is pointed at rather
+    /// than encoded and uploaded again.
+    #[test]
+    fn c_a_changed_entry_points_at_the_chunks_the_parent_already_stored() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let key = [47; 32];
+            let cancel = Cancellation::default();
+            let cache = root.path().join("cache");
+            let body: Vec<u8> = (0..100_000u32).map(|index| (index % 251) as u8).collect();
+            let mut grown = body.clone();
+            grown.extend_from_slice(b"one more turn");
+
+            let mut published: Vec<CompletedSnapshot> = Vec::new();
+            for (name, record) in [("grown-1", &body), ("grown-2", &grown)] {
+                let (capture, _) =
+                    captured(root.path(), name, published.len() as i64 + 1, record, b"asset");
+                let meta = metadata(name, &capture);
+                let mut transfer = journal(&root.path().join(name), name, &capture);
+                let parent = published
+                    .last()
+                    .map(|previous| parent_graph(previous, &repository))
+                    .transpose()
+                    .unwrap();
+                published.push(package_and_upload(
+                    capture, vec![], root.path(), &cache, meta, &key, limits(16 * 1024),
+                    parent.as_ref(), &mut transfer, &provider, &repository, &cancel,
+                ).await.unwrap());
+            }
+            let carried: Vec<String> = published[0].referenced_objects.iter()
+                .filter(|object| object.role == ObjectRole::Pack)
+                .map(|object| object.object_id.clone())
+                .collect();
+            let plan = PackageCache::open(&cache).unwrap()
+                .entry_by_key("format-repository", &repository, wire::CatalogKind::Records, "root")
+                .unwrap()
+                .unwrap();
+            assert!(plan.chunks.len() > 4, "the record has to span chunks");
+            let reused = plan.chunks.iter()
+                .filter(|chunk| carried.contains(&chunk.pack_id))
+                .count();
+            assert!(reused + 1 >= plan.chunks.len(), "reused {reused} of {}", plan.chunks.len());
+            for id in &carried {
+                assert_eq!(provider.upload_attempts(id), 1);
+            }
+
+            // What it points at has to read back as the record it published.
+            let restored = snapshot_restore::download_snapshot(
+                &published[1].reference, &root.path().join("restored"), &key, None,
+                &provider, &repository, &cancel,
+            ).await.unwrap();
+            assert_eq!(
+                fs::read(restored.records[0].source.file().unwrap()).unwrap(),
+                grown,
+            );
+        });
+    }
+
     /// A catalog that changes still holds nodes it held before. Uploading
     /// those again under this job's own identity publishes the same bytes
     /// twice for nothing.
@@ -4574,6 +4724,67 @@ mod tests {
                     provider.upload_count() - before.1,
                     started.elapsed().as_millis(),
                 );
+            }
+        });
+    }
+
+    /// Records that grow rather than change: the case where repackaging an
+    /// entry costs the whole entry instead of the part of it that is new.
+    #[test]
+    #[ignore = "explicit growing-record measurement"]
+    fn measures_publications_that_append_to_a_large_record() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let key = [53; 32];
+            let cancel = Cancellation::default();
+            let cache = root.path().join("appending-cache");
+            // Content a compressor cannot fold away, so what a publication
+            // stores is what its chunks actually cost.
+            let mut seed = 0x243f_6a88u32;
+            let mut noise = move |count: usize| -> Vec<u8> {
+                (0..count)
+                    .map(|_| {
+                        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        (seed >> 24) as u8
+                    })
+                    .collect()
+            };
+            let mut record = noise(4_000_000);
+            let mut published: Option<CompletedSnapshot> = None;
+            for revision in 1..=5i64 {
+                let name = format!("appending-{revision}");
+                let (capture, _) = captured(root.path(), &name, revision, &record, b"asset");
+                let meta = metadata(&name, &capture);
+                let mut transfer = journal(&root.path().join(&name), &name, &capture);
+                let parent = published
+                    .as_ref()
+                    .map(|previous| parent_graph(previous, &repository))
+                    .transpose()
+                    .unwrap();
+                let before = {
+                    let state = provider.state.lock().unwrap();
+                    state.objects.values().map(|(bytes, _)| bytes.len()).sum::<usize>()
+                };
+                let started = std::time::Instant::now();
+                let completed = package_and_upload(
+                    capture, Vec::new(), root.path(), &cache, meta, &key,
+                    limits(800 * 1024), parent.as_ref(), &mut transfer, &provider,
+                    &repository, &cancel,
+                ).await.unwrap();
+                let elapsed = started.elapsed().as_millis();
+                let after = {
+                    let state = provider.state.lock().unwrap();
+                    state.objects.values().map(|(bytes, _)| bytes.len()).sum::<usize>()
+                };
+                eprintln!(
+                    "revision={revision} record_bytes={} stored_bytes_added={} publication_ms={elapsed}",
+                    record.len(),
+                    after - before,
+                );
+                published = Some(completed);
+                record.extend(noise(64));
             }
         });
     }

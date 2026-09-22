@@ -238,6 +238,29 @@ impl PackageCache {
         value.validate(format_repository_id, repository)?;
         Ok(Some(value))
     }
+    /// What this catalog last held under one key, whatever its content was.
+    /// An entry that changed is repackaged, and what its previous version
+    /// already placed is what the unchanged part of it can point at.
+    pub(super) fn entry_by_key(
+        &self,
+        format_repository_id: &str,
+        repository: &RepositoryHandle,
+        kind: wire::CatalogKind,
+        key: &str,
+    ) -> Result<Option<EntryPlan>> {
+        let encoded: Option<String> = self.db.query_row(
+            "SELECT value FROM entries WHERE repository_id=?1 AND connection_identity=?2 AND catalog_kind=?3 AND entry_key=?4",
+            params![format_repository_id, repository.connection_identity, kind_name(kind), key],
+            |row| row.get(0),
+        ).optional().map_err(transient)?;
+        let Some(encoded) = encoded else {
+            return Ok(None);
+        };
+        let value: EntryPlan = serde_json::from_str(&encoded).map_err(corrupt)?;
+        value.validate(format_repository_id, repository)?;
+        Ok(Some(value))
+    }
+
     pub(super) fn put_entries(
         &self,
         format_repository_id: &str,
