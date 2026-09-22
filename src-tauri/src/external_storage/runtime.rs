@@ -1448,6 +1448,32 @@ async fn run_backup(
             capture: identity.clone(),
         },
     )?;
+    // A backup wraps the library the published state already covers, so that
+    // state names the graph this capture can reuse from. Selected and recorded
+    // before anything reuses it. A connection that has never published one has
+    // nothing to select.
+    let parent_graph = match super::control::read_head(
+        connected.provider.as_ref(),
+        &connected.handle,
+        &connected.stored.descriptor,
+        &connected.root_key,
+        None,
+        cancel,
+    )
+    .await?
+    {
+        Some(head) => {
+            let view =
+                super::control::read_snapshot_document(connected, &head.document.state, cancel)
+                    .await?;
+            let mut roots = vec![view.library.record_catalog, view.library.asset_catalog];
+            roots.extend(view.sections.into_values().map(|section| section.entries_root));
+            let graph = super::packaging::ParentGraph::new(roots, &connected.handle)?;
+            journal.record_parent(graph.stored())?;
+            Some(graph)
+        }
+        None => None,
+    };
     let metadata = SnapshotMetadata {
         snapshot_id: job.snapshot_id.clone(),
         repository_id: connected.stored.descriptor.repository_id.clone(),
@@ -1480,9 +1506,7 @@ async fn run_backup(
         metadata,
         &connected.root_key,
         PackageLimits::from_capabilities(&connected.stored.capabilities)?,
-        // A backup selects no parent yet, so its cached entries are admitted
-        // only while their packs answer for themselves.
-        None,
+        parent_graph.as_ref(),
         &mut journal,
         connected.provider.as_ref(),
         &connected.handle,
