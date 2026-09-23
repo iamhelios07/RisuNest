@@ -346,6 +346,55 @@ fn external_snapshot_stage_feeds_atomic_normal_receive_activation() {
     );
 }
 
+/// A local body that was changed under its own name is not silently accepted
+/// and not silently replaced: the content store publishes without replacement,
+/// so the apply stops at the damaged file and the live library stays where it
+/// was.
+#[test]
+fn a_locally_corrupt_object_stops_the_apply_instead_of_activating() {
+    for corrupt in [false, true] {
+        let (directory, mut store) = open_store();
+        let staging = directory.path().join("download");
+        fs::create_dir(&staging).unwrap();
+        let object = write_object(&staging, b"asset-body");
+        let cas = crate::asset_repository::PayloadCas::new(directory.path()).unwrap();
+        let held = cas.prepare_bytes(b"asset-body").unwrap();
+        assert_eq!(held.content_hash, object.content_hash);
+        if corrupt {
+            // The same length under the same name, which is what the catalog's
+            // own length check cannot tell apart.
+            fs::write(
+                cas.object_path(&held.content_hash).unwrap().unwrap(),
+                b"asset-bodY",
+            )
+            .unwrap();
+        }
+        let (root, root_hash) = root_record(&staging, "remote");
+        let hashes = BTreeMap::from([(root.key.clone(), root_hash)]);
+        let scope_id = library_fingerprint_domain();
+        let fingerprint = fingerprint(&scope_id, &hashes);
+        let applied = store.prepare_external_snapshot_application(
+            &application(&staging, &scope_id, &fingerprint, 1),
+            [Ok(root)],
+            [Ok(object)],
+        );
+        if !corrupt {
+            let prepared = applied.unwrap();
+            assert_eq!(store.finish_prepared_replace(prepared).unwrap().revision, 2);
+            continue;
+        }
+        let error = applied.err().expect("a damaged body must not apply").to_string();
+        assert!(error.contains("collision or corruption"), "{error}");
+        assert_eq!(stage_count(&store), 0);
+        assert_eq!(store.revision().unwrap(), 1);
+        assert_eq!(store.materialize(None).unwrap()["marker"], "local");
+        assert_eq!(
+            fs::read(cas.object_path(&held.content_hash).unwrap().unwrap()).unwrap(),
+            b"asset-bodY",
+        );
+    }
+}
+
 #[test]
 fn rejected_record_stream_rolls_back_the_whole_stage_and_preserves_live_library() {
     let (directory, mut store) = open_store();
