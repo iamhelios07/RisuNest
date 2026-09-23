@@ -301,13 +301,24 @@ impl Store {
                 .map_err(|_| Error::new("storage-unavailable", 503))?;
             let mut db = self.db()?;
             Self::upload_row(&db, device, id)?;
+            let placed = super::objects::placement(&db, &digest)?;
+            if placed.is_some_and(|(recorded, _)| recorded != size) {
+                return Err(Error::new("corrupt-object", 503));
+            }
             // An identity the metadata already files inline keeps its body
             // there, so an upload of the same bytes does not leave a published
-            // file nothing accounts for.
-            if !matches!(super::objects::placement(&db, &digest)?, Some((_, true))) {
+            // file nothing accounts for. The verified upload restores a missing
+            // inline body, and one holding other bytes is refused.
+            let inline = matches!(placed, Some((_, true)));
+            if !inline {
                 publish(temp.path(), &destination)?;
             }
             let tx = db.transaction()?;
+            if inline {
+                let bytes = fs::read(temp.path())?;
+                risunest_small_object_store::insert_batch(&tx, &[(digest.as_str(), bytes.as_slice())])
+                    .map_err(super::objects::body_error)?;
+            }
             tx.execute(
                 "INSERT INTO objects(hash,size,storage) VALUES(?1,?2,'file') ON CONFLICT DO NOTHING",
                 params![digest, size as i64],

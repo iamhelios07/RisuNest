@@ -172,9 +172,28 @@ impl Store {
         }
         self.put_objects(device, &[(digest.to_owned(), bytes.to_vec())])
     }
+    /// Whether a small body the metadata files as a file has to be published
+    /// again: its file is absent or holds other bytes. A healthy file keeps
+    /// the object where the row puts it; a damaged one is replaced there, so an
+    /// upload never acknowledges a body nothing can read.
+    fn filed_body_needs_repair(&self, digest: &str, bytes: &[u8]) -> Result<bool> {
+        if !matches!(placement(&*self.reader()?, digest)?, Some((_, false))) {
+            return Ok(false);
+        }
+        let file = match File::open(self.object_path(digest)?) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(error) => return Err(error.into()),
+        };
+        use std::io::Read;
+        let mut stored = Vec::with_capacity(bytes.len());
+        file.take(bytes.len() as u64 + 1).read_to_end(&mut stored)?;
+        Ok(stored != bytes)
+    }
     /// Write a group of small bodies and the metadata naming them in one
     /// transaction. A body already published as a file stays a file; the row
-    /// decides where an object lives, so a group never moves one.
+    /// decides where an object lives, so a group never moves one. The caller
+    /// has already republished any such file that did not hold its body.
     fn put_inline(
         tx: &rusqlite::Transaction<'_>,
         device: &super::Device,
@@ -213,6 +232,7 @@ impl Store {
         let mut prepared = Vec::new();
         let mut directories = std::collections::BTreeSet::new();
         let mut inline: Vec<(&str, &[u8])> = Vec::new();
+        let mut filed: Vec<(&str, u64)> = Vec::new();
         for (digest, bytes) in objects {
             #[cfg(test)]
             let measured = std::time::Instant::now();
@@ -222,10 +242,11 @@ impl Store {
             }
             #[cfg(test)]
             frame_metrics::record(1, measured);
-            if bytes.len() <= SMALL_OBJECT_BYTES {
+            if bytes.len() <= SMALL_OBJECT_BYTES && !self.filed_body_needs_repair(digest, bytes)? {
                 inline.push((digest.as_str(), bytes.as_slice()));
                 continue;
             }
+            filed.push((digest.as_str(), bytes.len() as u64));
             #[cfg(test)]
             let measured = std::time::Instant::now();
             let destination = self.object_path(digest)?;
@@ -289,13 +310,10 @@ impl Store {
         let measured = std::time::Instant::now();
         Self::require_device(&db, device)?;
         let tx = db.transaction()?;
-        for (digest, bytes) in objects {
-            if bytes.len() <= SMALL_OBJECT_BYTES {
-                continue;
-            }
+        for (digest, size) in &filed {
             tx.execute(
                 "INSERT INTO objects(hash,size,storage) VALUES(?1,?2,'file') ON CONFLICT(hash) DO NOTHING",
-                params![digest, bytes.len() as i64],
+                params![digest, *size as i64],
             )?;
             Self::lease_object(&tx, device, digest)?;
         }
@@ -498,6 +516,191 @@ mod tests {
             503,
             "an absent inline body must report corruption"
         );
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Upload {
+        Frame,
+        Chunked,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Held {
+        Intact,
+        Missing,
+        Corrupt,
+    }
+
+    fn upload(
+        store: &Store,
+        device: &super::super::Device,
+        through: Upload,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let digest = hash(bytes);
+        match through {
+            Upload::Frame => store.put_object(device, &digest, bytes),
+            Upload::Chunked => {
+                let upload = store.begin_upload(
+                    device,
+                    &super::super::UploadManifest {
+                        hash: digest.clone(),
+                        size: (bytes.len() as u64).into(),
+                    },
+                )?;
+                store.put_upload_chunk(device, &upload, 0, &digest, bytes)?;
+                store.finish_upload(device, &upload).map(|_| ())
+            }
+        }
+    }
+
+    /// Leaves the body the metadata names the way `held` says, without
+    /// touching the row that decides where it lives.
+    fn damage(store: &Store, bytes: &[u8], held: Held) {
+        let digest = hash(bytes);
+        let mut altered = bytes.to_vec();
+        altered[0] ^= 0x01;
+        let (_, inline) = placement(&store.db().unwrap(), &digest).unwrap().unwrap();
+        match (held, inline) {
+            (Held::Intact, _) => (),
+            (Held::Missing, true) => {
+                store
+                    .db()
+                    .unwrap()
+                    .execute("DELETE FROM small_objects WHERE hash=?1", [&digest])
+                    .unwrap();
+            }
+            (Held::Corrupt, true) => {
+                store
+                    .db()
+                    .unwrap()
+                    .execute(
+                        "UPDATE small_objects SET body=?2 WHERE hash=?1",
+                        params![digest, altered],
+                    )
+                    .unwrap();
+            }
+            (Held::Missing, false) => fs::remove_file(store.object_path(&digest).unwrap()).unwrap(),
+            (Held::Corrupt, false) => {
+                fs::write(store.object_path(&digest).unwrap(), &altered).unwrap()
+            }
+        }
+    }
+
+    fn assert_readable(store: &Store, bytes: &[u8], case: &str) {
+        let digest = hash(bytes);
+        assert_eq!(store.get_object(&digest).expect(case), bytes, "{case}");
+        assert_eq!(
+            store
+                .read_object_range(&digest, 1, bytes.len() as u64 - 2)
+                .expect(case),
+            &bytes[1..bytes.len() - 1],
+            "{case}"
+        );
+        let (mut body, size) = store.open_object(&digest).expect(case);
+        let mut read = Vec::new();
+        std::io::Read::read_to_end(&mut body, &mut read).unwrap();
+        assert_eq!((size, read.as_slice()), (bytes.len() as u64, bytes), "{case}");
+    }
+
+    /// Every success an upload reports is a body the store can serve, whichever
+    /// of the two stores held the identity first and whatever became of it.
+    /// A file is replaced where it is; an inline body is restored when absent
+    /// and refused, never overwritten, when it holds other bytes.
+    #[test]
+    fn a_reupload_acknowledges_only_a_body_it_can_serve() {
+        let bytes = b"synthetic cross-placement upload";
+        let digest = hash(bytes);
+        for first in [Upload::Frame, Upload::Chunked] {
+            let inline = first == Upload::Frame;
+            for held in [Held::Intact, Held::Missing, Held::Corrupt] {
+                for again in [Upload::Frame, Upload::Chunked] {
+                    let case = format!("{first:?} then {held:?} then {again:?}");
+                    let directory = tempfile::tempdir().unwrap();
+                    let store = Store::init(directory.path()).unwrap();
+                    let device = super::super::Device {
+                        id: store.add_device().unwrap().device_id,
+                    };
+                    upload(&store, &device, first, bytes).unwrap();
+                    assert_readable(&store, bytes, &case);
+                    damage(&store, bytes, held);
+                    if let Err(error) = upload(&store, &device, again, bytes) {
+                        assert!(inline && held == Held::Corrupt, "{case}: {error:?}");
+                        assert_eq!(error.status, 503, "{case}");
+                        continue;
+                    }
+                    assert!(
+                        !(inline && held == Held::Corrupt),
+                        "{case} accepted bytes the stored body contradicts"
+                    );
+                    assert_readable(&store, bytes, &case);
+                    let (_, placed) = placement(&store.db().unwrap(), &digest).unwrap().unwrap();
+                    assert_eq!(placed, inline, "{case} moved the object");
+                    assert_eq!(
+                        fs::metadata(store.object_path(&digest).unwrap()).is_ok(),
+                        !inline,
+                        "{case} left a file the metadata does not name"
+                    );
+                    drop(store);
+                    let store = Store::open(directory.path()).unwrap();
+                    assert_readable(&store, bytes, &format!("{case} after reopen"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_repair_acknowledges_nothing_and_a_retry_completes_it() {
+        let bytes = b"synthetic interrupted repair";
+        let digest = hash(bytes);
+        // An inline body restored by a chunked upload whose completion fails.
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::init(directory.path()).unwrap();
+        let device = super::super::Device {
+            id: store.add_device().unwrap().device_id,
+        };
+        upload(&store, &device, Upload::Frame, bytes).unwrap();
+        damage(&store, bytes, Held::Missing);
+        let id = store
+            .begin_upload(
+                &device,
+                &super::super::UploadManifest {
+                    hash: digest.clone(),
+                    size: (bytes.len() as u64).into(),
+                },
+            )
+            .unwrap();
+        store.put_upload_chunk(&device, &id, 0, &digest, bytes).unwrap();
+        store.db().unwrap().execute_batch("CREATE TRIGGER synthetic_completion_failure BEFORE UPDATE OF state ON uploads WHEN NEW.state='complete' BEGIN SELECT RAISE(ABORT,'synthetic completion failure'); END").unwrap();
+        assert!(store.finish_upload(&device, &id).is_err());
+        assert!(
+            store.get_object(&digest).is_err(),
+            "a rolled back repair left its body behind"
+        );
+        store
+            .db()
+            .unwrap()
+            .execute_batch("DROP TRIGGER synthetic_completion_failure")
+            .unwrap();
+        store.finish_upload(&device, &id).unwrap();
+        assert_readable(&store, bytes, "inline repair after a failed completion");
+        // A file restored by a frame whose lease cannot be written.
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::init(directory.path()).unwrap();
+        let device = super::super::Device {
+            id: store.add_device().unwrap().device_id,
+        };
+        upload(&store, &device, Upload::Chunked, bytes).unwrap();
+        damage(&store, bytes, Held::Corrupt);
+        store.db().unwrap().execute_batch("CREATE TRIGGER synthetic_lease_insert BEFORE INSERT ON object_leases BEGIN SELECT RAISE(ABORT,'synthetic lease failure'); END; CREATE TRIGGER synthetic_lease_update BEFORE UPDATE ON object_leases BEGIN SELECT RAISE(ABORT,'synthetic lease failure'); END").unwrap();
+        assert!(store.put_object(&device, &digest, bytes).is_err());
+        store
+            .db()
+            .unwrap()
+            .execute_batch("DROP TRIGGER synthetic_lease_insert; DROP TRIGGER synthetic_lease_update")
+            .unwrap();
+        store.put_object(&device, &digest, bytes).unwrap();
+        assert_readable(&store, bytes, "file repair after a failed lease");
     }
 
     #[test]
