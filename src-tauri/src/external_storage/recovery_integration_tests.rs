@@ -141,7 +141,7 @@ fn repository_bootstrap_opens_and_applies_a_real_snapshot_without_the_source_vau
                 &mut journal,
                 &provider,
                 &repository,
-                &crate::external_storage::preparation_progress::PreparationProgress::silent(),
+                &crate::external_storage::phase_progress::PhaseProgress::silent(),
                 &cancel,
             )
             .await
@@ -252,6 +252,7 @@ fn repository_bootstrap_opens_and_applies_a_real_snapshot_without_the_source_vau
                 None,
                 snapshot_restore::SourceTrust::Downloaded, &provider,
                 &repository,
+                &crate::external_storage::phase_progress::PhaseProgress::silent(),
                 &cancel,
             )
             .await

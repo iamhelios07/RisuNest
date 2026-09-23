@@ -215,6 +215,7 @@ fn prepare_receive_input(
     downloaded: super::snapshot_restore::PreparedRemoteSnapshot,
     sections: Vec<super::sections::CapturedSection>,
     participation: ReceiveParticipation,
+    prepared: &super::phase_progress::PhaseProgress,
     cancel: &Cancellation,
 ) -> Result<PreparedReceive> {
     require_exact_receive_identity(&expected, &store.external_identity().map_err(local_error)?)?;
@@ -260,22 +261,42 @@ fn prepare_receive_input(
     let difference = receive_difference_plan(store, &job.request.connection_id, &downloaded)?;
     let apply = match difference {
         Some(difference) => {
-            let objects = downloaded.objects.into_iter().map(|object| Ok(ExternalSnapshotObject {
-                content_hash: object.content_hash, byte_length: object.byte_length,
-                source: object.source,
-            }));
-            let object_sizes = store
-                .stage_external_snapshot_objects(&downloaded.staging_root, objects)
-                .map_err(local_error)?;
+            let object_items = downloaded.objects.len() as u64;
+            let object_bytes: u64 =
+                downloaded.objects.iter().map(|object| object.byte_length).sum();
             let arriving: std::collections::BTreeSet<&str> = difference.added.iter()
                 .chain(difference.changed.iter()).map(String::as_str).collect();
-            let records = downloaded.records.into_iter()
+            let records: Vec<ExternalSnapshotRecord> = downloaded.records.into_iter()
                 .filter(|record| arriving.contains(record.key.as_str()))
                 .map(|record| ExternalSnapshotRecord {
                     key: record.key, content_hash: record.content_hash,
                     byte_length: record.byte_length, source: record.source,
                 })
                 .collect();
+            // What the receive moves: every body it has to stage, and the
+            // record rows the apply will write or drop. A body the library
+            // already holds is confirmed rather than written, which is why a
+            // difference plans so much less than a replacement.
+            prepared.plan(
+                object_items + records.len() as u64 + difference.removed.len() as u64,
+                object_bytes + records.iter().map(|record| record.byte_length).sum::<u64>(),
+            );
+            for record in &records {
+                prepared.completed(record.byte_length);
+            }
+            for _ in &difference.removed {
+                prepared.completed(0);
+            }
+            let objects = downloaded.objects.into_iter().map(|object| {
+                prepared.completed(object.byte_length);
+                Ok(ExternalSnapshotObject {
+                    content_hash: object.content_hash, byte_length: object.byte_length,
+                    source: object.source,
+                })
+            });
+            let object_sizes = store
+                .stage_external_snapshot_objects(&downloaded.staging_root, objects)
+                .map_err(local_error)?;
             PreparedApply::Difference(PreparedDifference {
                 expected_revision: expected.revision,
                 staging_root: downloaded.staging_root.clone(),
@@ -291,20 +312,34 @@ fn prepare_receive_input(
                 scope_id: &scope_id,
                 fingerprint: &expected_fingerprint,
             };
-            let records = downloaded.records.into_iter().map(|record| Ok(ExternalSnapshotRecord {
-                key: record.key, content_hash: record.content_hash,
-                byte_length: record.byte_length, source: record.source,
-            }));
-            let objects = downloaded.objects.into_iter().map(|object| Ok(ExternalSnapshotObject {
-                content_hash: object.content_hash, byte_length: object.byte_length,
-                source: object.source,
-            }));
+            // A replacement stages every record as well, which is the whole
+            // reason it costs what it does.
+            prepared.plan(
+                (downloaded.records.len() + downloaded.objects.len()) as u64,
+                downloaded.records.iter().map(|record| record.byte_length).sum::<u64>()
+                    + downloaded.objects.iter().map(|object| object.byte_length).sum::<u64>(),
+            );
+            let records = downloaded.records.into_iter().map(|record| {
+                prepared.completed(record.byte_length);
+                Ok(ExternalSnapshotRecord {
+                    key: record.key, content_hash: record.content_hash,
+                    byte_length: record.byte_length, source: record.source,
+                })
+            });
+            let objects = downloaded.objects.into_iter().map(|object| {
+                prepared.completed(object.byte_length);
+                Ok(ExternalSnapshotObject {
+                    content_hash: object.content_hash, byte_length: object.byte_length,
+                    source: object.source,
+                })
+            });
             PreparedApply::Replace(
                 store.prepare_external_snapshot_application(&application, records, objects)
                     .map_err(local_error)?,
             )
         }
     };
+    prepared.flush();
     Ok(PreparedReceive {
         job_id: job.id.clone(), connection_id: job.request.connection_id.clone(),
         snapshot_id: downloaded.snapshot_id, expected, authenticated_head, apply,
@@ -885,27 +920,30 @@ async fn receive_remote(
     let cache = super::runtime::package_cache_root(&directory)?;
     // A body the library already holds under the identity this snapshot names
     // is the same body, so a normal receive does not fetch it again.
+    let transferred = super::runtime::transfer_progress(&root, &job.id);
     let downloaded = super::snapshot_restore::download_snapshot(
         &remote.document.state, &staging, &connected.root_key, Some(&cache),
         super::snapshot_restore::SourceTrust::AdmittedLibrary(&root),
-        connected.provider.as_ref(), &connected.handle, cancel,
+        connected.provider.as_ref(), &connected.handle, &transferred, cancel,
     ).await?;
     cancel.check()?;
     let sections = super::snapshot_restore::download_sections(
         &remote.document.state, &wanted_receive_sections(&participation), &staging,
         &connected.root_key, Some(&cache), connected.provider.as_ref(), &connected.handle,
-        cancel,
+        &transferred, cancel,
     ).await?;
+    transferred.flush();
     let worker_app = app.clone();
     let worker_job = job.clone();
     let worker_identity = expected.clone();
     let worker_head = observation;
     let worker_cancel = cancel.clone();
+    let worker_staging = super::runtime::preparation_progress(&root, &job.id);
     let prepared = tokio::task::spawn_blocking(move || {
         worker_cancel.check()?;
         super::runtime::read_job_session(&worker_app, &worker_job.id)?;
         prepare_receive_input(&mut pds(&worker_app)?, &worker_job, worker_identity,
-            worker_head, downloaded, sections, participation, &worker_cancel)
+            worker_head, downloaded, sections, participation, &worker_staging, &worker_cancel)
     }).await.map_err(local_error)??;
     let recorded = (|| {
         let jobs = JobStore::open(&root)?;
@@ -1085,6 +1123,8 @@ async fn rejoin_sections(
     );
     let staging = directory.join("rejoin");
     let cache = super::runtime::package_cache_root(&directory)?;
+    let transferred =
+        super::runtime::transfer_progress(&super::runtime::root(app)?, &job.id);
     let received = super::snapshot_restore::download_sections(
         &remote.document.state,
         &wanted,
@@ -1093,9 +1133,11 @@ async fn rejoin_sections(
         Some(&cache),
         connected.provider.as_ref(),
         &connected.handle,
+        &transferred,
         cancel,
     )
     .await?;
+    transferred.flush();
     let mut store = pds(app)?;
     for prepared in &received {
         super::sections::apply_received_section(
@@ -2461,10 +2503,17 @@ mod receive_tests {
     fn prepare(store: &mut PersistentStore, job: &DurableJob,
         downloaded: super::super::snapshot_restore::PreparedRemoteSnapshot) -> PreparedReceive
     {
+        prepare_counted(store, job, downloaded, &crate::external_storage::phase_progress::PhaseProgress::silent())
+    }
+
+    fn prepare_counted(store: &mut PersistentStore, job: &DurableJob,
+        downloaded: super::super::snapshot_restore::PreparedRemoteSnapshot,
+        prepared: &crate::external_storage::phase_progress::PhaseProgress) -> PreparedReceive
+    {
         let participation = receive_participation(store).unwrap();
         let section = plugin_section(&downloaded.staging_root);
         prepare_receive_input(store, job, job.admission_identity.clone(), "authenticated-head".into(),
-            downloaded, vec![section], participation, &Cancellation::default()).unwrap()
+            downloaded, vec![section], participation, prepared, &Cancellation::default()).unwrap()
     }
 
     fn local_edit(store: &mut PersistentStore, revision: i64) {
@@ -2616,6 +2665,63 @@ mod receive_tests {
         rows.map(|row| row.unwrap()).collect()
     }
 
+
+    /// A23. A receive counts the staging it does, which is the part of a
+    /// receive that costs. A replacement stages every record the snapshot
+    /// names as well as every body; a difference stages the bodies and leaves
+    /// the record rows it is not moving alone, so the same snapshot plans
+    /// fewer items for it.
+    #[test]
+    fn c_a_receive_counts_what_it_stages_and_a_difference_stages_less() {
+        use crate::external_storage::phase_progress::PhaseProgress;
+        let (_directory, mut store, staging) = received_library();
+        let job = bind(&mut store, "second");
+        let identity = job.admission_identity.clone();
+        let prepared = prepare(&mut store, &job, second_snapshot(&staging));
+        activate_prepared_receive(&mut store, &prepared, &identity).unwrap();
+
+        // One conversation moved and everything else stayed where it was.
+        let third = |staging: &std::path::Path| staged_snapshot(staging, "third", vec![
+            conversation_at(staging, "added", "fresh", 30),
+            root_at(staging, "moved"),
+            character_at(staging, "kept", 0),
+            character_at(staging, "added", 2),
+            conversation_at(staging, "kept", "chat", 21),
+            preset_at(staging, "preset"),
+        ]);
+        let job = bind(&mut store, "third");
+        let readings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected = std::sync::Arc::clone(&readings);
+        let progress = PhaseProgress::new(move |reading| collected.lock().unwrap().push(reading));
+        let prepared = prepare_counted(&mut store, &job, third(&staging), &progress);
+        assert!(matches!(prepared.apply, PreparedApply::Difference(_)));
+        let difference = progress.read();
+        assert_eq!(difference.total_items, 1);
+        assert_eq!(difference.items, difference.total_items);
+        assert_eq!(difference.bytes, difference.total_bytes);
+        // The phase ends on a written reading rather than on whichever tick
+        // the report interval last allowed through.
+        assert_eq!(readings.lock().unwrap().last().copied().unwrap(), difference);
+
+        // The same snapshot arriving at a library with nothing to compare it
+        // against is a replacement, and a replacement stages every record.
+        let other = tempfile::tempdir().unwrap();
+        let mut fresh = PersistentStore::open(other.path()).unwrap();
+        let epoch = fresh.external_selection().unwrap().epoch;
+        fresh.external_select(
+            &epoch,
+            &crate::persistent_store::sync_selection::SyncTarget::External("connection".into()),
+        ).unwrap();
+        fresh.device_store_mut().unwrap()
+            .set_section_participating(PdsSection::LocalPlugins, true).unwrap();
+        let fresh_job = bind(&mut fresh, "third");
+        let replacement = PhaseProgress::silent();
+        let replaced = prepare_counted(&mut fresh, &fresh_job, third(&staging), &replacement);
+        assert!(matches!(replaced.apply, PreparedApply::Replace(_)));
+        let reading = replacement.read();
+        assert_eq!(reading.total_items, 6);
+        assert_eq!(reading.items, reading.total_items);
+    }
 
     /// A17. What the snapshot moved is what the library records as touched,
     /// and the generation the records live in does not change, so every row
@@ -3068,6 +3174,7 @@ mod receive_tests {
                 let section = plugin_section(&downloaded.staging_root);
                 assert!(prepare_receive_input(&mut store, &job, job.admission_identity.clone(),
                     "authenticated-head".into(), downloaded, vec![section], participation,
+                    &crate::external_storage::phase_progress::PhaseProgress::silent(),
                     &Cancellation::default()).is_err());
             } else {
                 let prepared = prepare(&mut store, &job, downloaded);
@@ -3123,6 +3230,7 @@ mod receive_tests {
             }
             assert!(prepare_receive_input(&mut store, &job, job.admission_identity.clone(),
                 "authenticated-head".into(), downloaded, vec![section], participation,
+                &crate::external_storage::phase_progress::PhaseProgress::silent(),
                 &Cancellation::default()).is_err(), "{case}");
             assert_eq!(store.revision().unwrap(), 0, "{case}");
             assert!(rows(&mut store).is_empty(), "{case}");

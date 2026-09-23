@@ -338,6 +338,9 @@ async fn download_remote_conflict_source(
                 snapshot_restore::SourceTrust::Downloaded,
                 connected.provider.as_ref(),
                 &connected.handle,
+                // An export is not a job in the external job store, so it has
+                // nothing to report counters to.
+                &crate::external_storage::phase_progress::PhaseProgress::silent(),
                 cancel,
             )
             .await?;
@@ -507,6 +510,9 @@ pub(crate) async fn external_storage_export_snapshot(
                 snapshot_restore::SourceTrust::Downloaded,
                 connected.provider.as_ref(),
                 &connected.handle,
+                // An export is not a job in the external job store, so it has
+                // nothing to report counters to.
+                &crate::external_storage::phase_progress::PhaseProgress::silent(),
                 &cancel,
             )
             .await?;

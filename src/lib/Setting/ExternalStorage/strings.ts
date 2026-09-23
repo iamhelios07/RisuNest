@@ -122,7 +122,7 @@ const english = {
     errorGeneric: 'Could not complete this. Try again.',
     jobKinds: { cleanup: 'Cleanup', backup: 'Backup', sync: 'Sync', restore: 'Restore', 'pin-history': 'Keep', 'delete-history': 'Delete backup', 'resolve-conflict': 'Resolve conflict', 'check-repository': 'Check' },
     jobActive: { cleanup: 'Cleaning up', backup: 'Backing up', sync: 'Syncing', restore: 'Restoring', 'pin-history': 'Keeping', 'delete-history': 'Deleting backup', 'resolve-conflict': 'Resolving conflict', 'check-repository': 'Checking' },
-    jobCounters: { prepared: 'Prepared', transferred: 'Sent' },
+    jobCounters: { prepared: 'Prepared', transferred: 'Transferred' },
     historyKinds: { snapshot: 'Sync', 'backup-point': 'Backup', conflict: 'Conflict backup', 'recovery-candidate': 'Recovery candidate' },
     endpointWarnings: {
         'github-dedicated-repository': 'Use a separate private repository. This connection is backup only.',

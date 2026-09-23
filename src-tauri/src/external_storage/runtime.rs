@@ -1506,37 +1506,55 @@ async fn checked_root(
     super::repository_check::pin_root(directory, &resolved, &connected.handle)
 }
 
-/// What a publication has placed against what it found to place. Written where
-/// the work happens, because a summary is only assembled when the renderer
-/// asks for one.
-fn record_preparation(
+/// What one phase has done against what it found to do, and which of the two
+/// readings the numbers are. Written where the work happens, because a summary
+/// is only assembled when the renderer asks for one.
+fn record_counters(
     root: &std::path::Path,
     job_id: &str,
-    prepared: super::preparation_progress::Prepared,
+    counters: &str,
+    reading: super::phase_progress::PhaseCounters,
 ) -> Result<()> {
     let store = JobStore::open(root)?;
     let mut job = store.read(job_id)?;
     if job.terminal() {
         return Err(ProviderError::new(ErrorKind::PreconditionFailed));
     }
-    job.summary["counters"] = json!("prepared");
-    job.summary["completedItems"] = json!(prepared.items.to_string());
-    job.summary["totalItems"] = json!(prepared.total_items.to_string());
-    job.summary["completedBytes"] = json!(prepared.bytes.to_string());
-    job.summary["totalBytes"] = json!(prepared.total_bytes.to_string());
+    job.summary["counters"] = json!(counters);
+    job.summary["completedItems"] = json!(reading.items.to_string());
+    job.summary["totalItems"] = json!(reading.total_items.to_string());
+    job.summary["completedBytes"] = json!(reading.bytes.to_string());
+    job.summary["totalBytes"] = json!(reading.total_bytes.to_string());
     job.summary["updatedAtMs"] = json!(now_ms().to_string());
     store.put(&job)
 }
 
+fn job_phase_progress(
+    root: &std::path::Path,
+    job_id: &str,
+    counters: &'static str,
+) -> std::sync::Arc<super::phase_progress::PhaseProgress> {
+    let root = root.to_path_buf();
+    let job_id = job_id.to_owned();
+    super::phase_progress::PhaseProgress::new(move |reading| {
+        let _ = record_counters(&root, &job_id, counters, reading);
+    })
+}
+
+/// What a job is reading, compressing, packing or staging.
 pub(crate) fn preparation_progress(
     root: &std::path::Path,
     job_id: &str,
-) -> std::sync::Arc<super::preparation_progress::PreparationProgress> {
-    let root = root.to_path_buf();
-    let job_id = job_id.to_owned();
-    super::preparation_progress::PreparationProgress::new(move |prepared| {
-        let _ = record_preparation(&root, &job_id, prepared);
-    })
+) -> std::sync::Arc<super::phase_progress::PhaseProgress> {
+    job_phase_progress(root, job_id, "prepared")
+}
+
+/// What a job has moved to or from the repository and had confirmed.
+pub(crate) fn transfer_progress(
+    root: &std::path::Path,
+    job_id: &str,
+) -> std::sync::Arc<super::phase_progress::PhaseProgress> {
+    job_phase_progress(root, job_id, "transferred")
 }
 
 fn record_check_progress(
@@ -1924,10 +1942,11 @@ mod tests {
         let store = JobStore::open(root.path()).unwrap();
         let job = automatic_job();
         store.put(&job).unwrap();
-        record_preparation(
+        record_counters(
             root.path(),
             &job.id,
-            super::super::preparation_progress::Prepared {
+            "prepared",
+            super::super::phase_progress::PhaseCounters {
                 items: 7,
                 total_items: 9,
                 bytes: 70,

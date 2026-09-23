@@ -537,7 +537,7 @@ mod tests {
             &mut journal,
             provider,
             repository,
-            &crate::external_storage::preparation_progress::PreparationProgress::silent(),
+            &crate::external_storage::phase_progress::PhaseProgress::silent(),
             &Cancellation::default(),
         )
         .await

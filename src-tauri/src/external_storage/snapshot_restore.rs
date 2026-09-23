@@ -9,6 +9,7 @@ use super::{
         RepositoryHandle, Result,
     },
     packaging::{cpu_permit, RemoteObject},
+    phase_progress::PhaseProgress,
     sections::{CapturedSection, SectionSource},
     transfer::SpoolSink,
 };
@@ -504,8 +505,15 @@ async fn open_packs(
     staging_root: &Path,
     provider: &dyn Provider,
     repository: &RepositoryHandle,
+    progress: &PhaseProgress,
     cancel: &Cancellation,
 ) -> Result<BTreeMap<String, PathBuf>> {
+    // What each catalog needs is known before any of it is fetched, and a
+    // later catalog adds to the same total rather than restarting it.
+    progress.plan(
+        packs.len() as u64,
+        packs.values().map(|pack| pack.receipt.byte_length).sum(),
+    );
     let mut paths = BTreeMap::new();
     for (id, pack) in packs {
         cancel.check()?;
@@ -513,6 +521,7 @@ async fn open_packs(
             id.clone(),
             open_object(pack, root_key, staging_root, provider, repository, cancel).await?,
         );
+        progress.completed(pack.receipt.byte_length);
     }
     Ok(paths)
 }
@@ -840,6 +849,7 @@ pub(crate) async fn download_sections(
     record_into: Option<&Path>,
     provider: &dyn Provider,
     repository: &RepositoryHandle,
+    progress: &PhaseProgress,
     cancel: &Cancellation,
 ) -> Result<Vec<CapturedSection>> {
     if wanted.is_empty() {
@@ -892,7 +902,8 @@ pub(crate) async fn download_sections(
             repository,
         );
         let pack_paths =
-            open_packs(&packs, root_key, staging_root, provider, repository, cancel).await?;
+            open_packs(&packs, root_key, staging_root, provider, repository, progress, cancel)
+                .await?;
         let cpu = cpu_permit().await?;
         let section_cancel = cancel.clone();
         let section_staging = staging_root.to_path_buf();
@@ -922,6 +933,7 @@ pub(crate) async fn download_snapshot(
     trust: SourceTrust<'_>,
     provider: &dyn Provider,
     repository: &RepositoryHandle,
+    progress: &PhaseProgress,
     cancel: &Cancellation,
 ) -> Result<PreparedRemoteSnapshot> {
     if !matches!(
@@ -1030,6 +1042,7 @@ pub(crate) async fn download_snapshot(
         staging_root,
         provider,
         repository,
+        progress,
         cancel,
     )
     .await?;

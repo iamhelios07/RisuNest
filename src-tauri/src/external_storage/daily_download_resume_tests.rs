@@ -375,7 +375,7 @@ fn daily_download_resume_preserves_verified_packs_and_durable_budget() {
             &mut journal,
             provider.as_ref(),
             &repository,
-            &crate::external_storage::preparation_progress::PreparationProgress::silent(),
+            &crate::external_storage::phase_progress::PhaseProgress::silent(),
             &Cancellation::default(),
         )
         .await
@@ -405,6 +405,7 @@ fn daily_download_resume_preserves_verified_packs_and_durable_budget() {
             None,
             snapshot_restore::SourceTrust::Downloaded, &first,
             &repository,
+            &crate::external_storage::phase_progress::PhaseProgress::silent(),
             &first_cancel,
         )
         .await
@@ -432,6 +433,7 @@ fn daily_download_resume_preserves_verified_packs_and_durable_budget() {
             None,
             snapshot_restore::SourceTrust::Downloaded, &second,
             &repository,
+            &crate::external_storage::phase_progress::PhaseProgress::silent(),
             &second_cancel,
         )
         .await
@@ -459,6 +461,7 @@ fn daily_download_resume_preserves_verified_packs_and_durable_budget() {
             None,
             snapshot_restore::SourceTrust::Downloaded, &third,
             &repository,
+            &crate::external_storage::phase_progress::PhaseProgress::silent(),
             &third_cancel,
         )
         .await

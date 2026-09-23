@@ -312,6 +312,7 @@ pub(crate) async fn run_restore(
     )?;
     let staging_root =
         runtime::job_directory(&root, &job.request.connection_id, &job.id).join("restore-snapshot");
+    let transferred = runtime::transfer_progress(&root, &job.id);
     let snapshot = snapshot_restore::download_snapshot(
         &remote,
         &staging_root,
@@ -320,6 +321,7 @@ pub(crate) async fn run_restore(
         snapshot_restore::SourceTrust::ProvenLibrary(&root),
         connected.provider.as_ref(),
         &connected.handle,
+        &transferred,
         cancel,
     )
     .await?;
@@ -335,9 +337,11 @@ pub(crate) async fn run_restore(
         None,
         connected.provider.as_ref(),
         &connected.handle,
+        &transferred,
         cancel,
     )
     .await?;
+    transferred.flush();
     if sections.len() != selection.sections.len() {
         return Err(ProviderError::new(ErrorKind::NotFound));
     }
