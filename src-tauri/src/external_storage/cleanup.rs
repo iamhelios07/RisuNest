@@ -554,11 +554,14 @@ fn job_roots_of(unfinished: &[UnfinishedJob], repository: &RepositoryHandle) -> 
         }
     }
     // A stopped publication is still entitled to the parent it selected, and
-    // its own inventory does not name what it reused without uploading.
+    // its own inventory does not name what it reused without uploading. A
+    // stopped check likewise still owns the root it resumes on, which may be
+    // a head that has since moved on.
     for job in unfinished {
         for root in TransferJournal::parent(&job.directory)? {
             roots.references.push(super::packaging::RemoteObject::from_stored(&root, repository)?);
         }
+        roots.references.extend(super::repository_check::pinned_root(&job.directory, repository)?);
     }
     roots.objects.sort_by_key(|object| locator_key(&object.locator).unwrap_or_default());
     roots.references.sort_by_key(|object| locator_key(&object.receipt.locator).unwrap_or_default());
@@ -1393,6 +1396,24 @@ mod tests {
         assert_eq!(job_roots_of(&jobs, &repository).unwrap().references, vec![parent]);
         std::fs::write(directory.path().join("parent.json"), b"broken parent").unwrap();
         assert!(job_roots_of(&jobs, &repository).is_err());
+    }
+
+    /// A check stopped part way keeps the root it started on, even when no
+    /// snapshot was named and the head it read has since moved on.
+    #[test]
+    fn c_a_stopped_check_keeps_protecting_the_root_it_pinned() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = fake::repository();
+        let jobs = vec![UnfinishedJob {
+            job_id: "check".into(), directory: directory.path().into(),
+            snapshot_ids: BTreeSet::new(), references: Vec::new(),
+        }];
+        assert!(job_roots_of(&jobs, &repository).unwrap().references.is_empty());
+        let checked = object("checked-state", ObjectRole::SyncState);
+        super::super::repository_check::pin_root(directory.path(), &checked, &repository).unwrap();
+        assert_eq!(job_roots_of(&jobs, &repository).unwrap().references, vec![checked]);
+        std::fs::write(directory.path().join("checked-root.json"), b"broken root").unwrap();
+        assert!(job_roots_of(&jobs, &repository).is_err(), "an unreadable pin became no root");
     }
 
     #[test]
