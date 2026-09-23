@@ -72,6 +72,23 @@ struct Staged {
     depth: usize,
 }
 
+/// What a projection does with the bodies it builds.
+#[derive(Clone, Copy)]
+enum Emission {
+    Persist,
+    Identity,
+}
+
+#[cfg(test)]
+thread_local! {
+    static PUT_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_put_calls() -> u64 {
+    PUT_CALLS.with(|calls| calls.replace(0))
+}
+
 pub(crate) struct Cache {
     pub cas: PayloadCas,
     library: Option<PayloadCas>,
@@ -259,7 +276,19 @@ impl Cache {
         }
         Ok(())
     }
+    /// Where a projection's objects go. Persisting is the cache itself; the
+    /// identity form names what the projection would hold without writing any
+    /// of it, and names it the same, because a stored body is its hash.
+    fn emit(&self, emission: Emission, bytes: &[u8]) -> Result<String> {
+        match emission {
+            Emission::Persist => self.put(bytes),
+            Emission::Identity => Ok(risunest_sync_wire::hash(bytes)),
+        }
+    }
+
     pub fn put(&self, bytes: &[u8]) -> Result<String> {
+        #[cfg(test)]
+        PUT_CALLS.with(|calls| calls.set(calls.get() + 1));
         let hash = risunest_sync_wire::hash(bytes);
         if bytes.len() > SMALL_OBJECT_BYTES {
             if self.cas.stat_object(&hash)?.is_some() {
@@ -327,10 +356,36 @@ impl Cache {
             serde_json::to_vec(payload).map_err(|_| SyncError::new("projection-encoding", 409))?;
         self.project_bytes(&bytes, dependencies, relations, scopes)
     }
+
+    /// What the record would be named if it were projected, for the paths that
+    /// project only to check what a received record says about itself. A body
+    /// that already arrived is not written back out to be compared against.
+    pub fn projected_identity(
+        &self,
+        payload: &ServerPayload,
+        dependencies: &[String],
+        relations: &[String],
+        scopes: Vec<String>,
+    ) -> Result<ProjectedRecord> {
+        let bytes =
+            serde_json::to_vec(payload).map_err(|_| SyncError::new("projection-encoding", 409))?;
+        self.project_into(Emission::Identity, &bytes, dependencies, relations, scopes)
+    }
     /// The same record container for a body the library projection does not own,
     /// such as a device section entry.
     pub fn project_bytes(
         &self,
+        bytes: &[u8],
+        dependencies: &[String],
+        relations: &[String],
+        scopes: Vec<String>,
+    ) -> Result<ProjectedRecord> {
+        self.project_into(Emission::Persist, bytes, dependencies, relations, scopes)
+    }
+
+    fn project_into(
+        &self,
+        emission: Emission,
         bytes: &[u8],
         dependencies: &[String],
         relations: &[String],
@@ -346,14 +401,14 @@ impl Cache {
             RecordContent::Tree {
                 value: payload::build(&mut Cursor::new(bytes), |bytes| {
                     let hash = self
-                        .put(bytes)
+                        .emit(emission, bytes)
                         .map_err(|_| WireError("cache-write-failed"))?;
                     objects.insert(hash);
                     Ok(())
                 })?,
             }
         };
-        let object_hash = self.put(&canonical::encode(&RecordObject {
+        let object_hash = self.emit(emission, &canonical::encode(&RecordObject {
             schema: "risunest-server-record-v1".into(),
             payload: segmented,
         })?)?;
@@ -366,7 +421,7 @@ impl Cache {
             build_reference_tree(&dependencies, false)?
         };
         for (hash, bytes) in pages {
-            self.put(&bytes)?;
+            self.emit(emission, &bytes)?;
             objects.insert(hash);
         }
         let relations = relations
@@ -382,7 +437,7 @@ impl Cache {
             build_reference_tree(&relations, true)?
         };
         for (hash, bytes) in pages {
-            self.put(&bytes)?;
+            self.emit(emission, &bytes)?;
             objects.insert(hash);
         }
         let descriptor = RecordDescriptor {
@@ -401,7 +456,7 @@ impl Cache {
             },
             scopes,
         };
-        let descriptor_hash = self.put(&descriptor.bytes()?)?;
+        let descriptor_hash = self.emit(emission, &descriptor.bytes()?)?;
         objects.insert(object_hash.clone());
         objects.insert(descriptor_hash.clone());
         Ok(ProjectedRecord {
@@ -755,6 +810,55 @@ mod tests {
         assert!(small_object_store::size(&*cache.objects().unwrap(), &alone)
             .unwrap()
             .is_some());
+    }
+
+    /// §9.4. Both sinks name the same record, object for object, and the
+    /// identity sink writes nothing. It exists so that projecting a received
+    /// record to check what it says about itself does not write that record
+    /// back out, which for a body that arrived as a tree is every chunk of it.
+    #[test]
+    fn projecting_for_identity_names_what_persisting_names_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        // Long enough to segment, with more references than either root can
+        // carry inline, so chunks, both reference trees and the descriptor are
+        // all emitted.
+        let payload = ServerPayload {
+            record: LogicalRecordEnvelope::Plugin {
+                owner: "synthetic-plugin".to_owned(),
+                ordinal: 0,
+                value: serde_json::Value::String("x".repeat(4 * INLINE_PAYLOAD_BYTES)),
+            },
+            messages: None,
+            derived_objects: Default::default(),
+        };
+        let dependencies = (0..400)
+            .map(|index| risunest_sync_wire::hash(format!("dependency {index}").as_bytes()))
+            .collect::<Vec<_>>();
+        let relations = (0..400)
+            .map(|index| risunest_sync_wire::hash(format!("relation {index}").as_bytes()))
+            .collect::<Vec<_>>();
+        let scopes = vec!["plugin-storage".to_owned()];
+
+        take_put_calls();
+        let named = cache
+            .projected_identity(&payload, &dependencies, &relations, scopes.clone())
+            .unwrap();
+        assert_eq!(take_put_calls(), 0);
+        for hash in &named.objects {
+            assert!(cache.stat_derived(hash).unwrap().is_none());
+        }
+
+        let stored = cache
+            .project(&payload, &dependencies, &relations, scopes)
+            .unwrap();
+        assert!(take_put_calls() > 0);
+        assert_eq!(named.version, stored.version);
+        assert_eq!(named.objects, stored.objects);
+        assert_eq!(named.local_hash, stored.local_hash);
+        // More than the record object and its descriptor, so the chunks and
+        // the reference pages were named by both.
+        assert!(named.objects.len() > 2);
     }
 
     #[test]
