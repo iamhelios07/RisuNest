@@ -2454,11 +2454,13 @@ pub(crate) async fn external_storage_delete_conflict(
         .map_err(|error| {
             crate::native_file_jobs::NativeJobError::new("store-error", error.to_string())
         })?;
-        if store.cleanup_deleted_conflict_capture(&record.local).is_err() {
-            crate::nlog!(
+        match store.cleanup_deleted_conflict_capture(&record.local) {
+            Ok(true) => store.collect_released_external_content(),
+            Ok(false) => {}
+            Err(_) => crate::nlog!(
                 "warn",
                 "Deleted external conflict capture could not be cleaned immediately"
-            );
+            ),
         }
         record
     };

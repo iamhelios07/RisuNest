@@ -509,6 +509,18 @@ pub(crate) fn registered_roots(
     db: &Connection,
     repository_root: &Path,
 ) -> Result<crate::asset_repository::migration_gc::AssetRootSet> {
+    let references = registered_references(db, repository_root)?;
+    if references.is_empty() {
+        return Ok(crate::asset_repository::migration_gc::AssetRootSet::default());
+    }
+    Ok(registered_capture_roots(&references, repository_root)?.assets)
+}
+
+/// Every registered capture catalog, whether or not a job still references it.
+pub(crate) fn registered_references(
+    db: &Connection,
+    repository_root: &Path,
+) -> Result<Vec<DurableCaptureReference>> {
     let mut references = Vec::new();
     let mut query=db.prepare("SELECT c.id,c.identity,f.catalog_path,f.file_hash FROM external_storage_capture_files f JOIN external_storage_captures c ON c.id=f.capture_id")?;
     let mut rows = query.query([])?;
@@ -539,10 +551,7 @@ pub(crate) fn registered_roots(
             catalog_hash: row.get(3)?,
         });
     }
-    if references.is_empty() {
-        return Ok(crate::asset_repository::migration_gc::AssetRootSet::default());
-    }
-    Ok(registered_capture_roots(&references, repository_root)?.assets)
+    Ok(references)
 }
 
 #[cfg(test)]

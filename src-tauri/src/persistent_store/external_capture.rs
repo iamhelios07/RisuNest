@@ -281,7 +281,9 @@ impl PersistentStore {
         Ok(())
     }
 
-    fn cleanup_capture_cache(&mut self, keep: &str) -> StoreResult<()> {
+    /// Whether a registration was removed, which is when bodies may have
+    /// become unreferenced.
+    fn cleanup_capture_cache(&mut self, keep: &str) -> StoreResult<bool> {
         self.cleanup_terminal_capture_references()?;
         let protected_catalogs = match self.device_store() {
             Ok(device) => match super::external_conflicts::registered_conflict_roots(
@@ -291,14 +293,15 @@ impl PersistentStore {
                 Ok(roots) => roots.catalogs,
                 Err(error) => {
                     crate::nlog!("warn", "external capture cleanup deferred: {error}");
-                    return Ok(());
+                    return Ok(false);
                 }
             },
             Err(error) => {
                 crate::nlog!("warn", "external capture cleanup deferred: {error}");
-                return Ok(());
+                return Ok(false);
             }
         };
+        let mut removed = false;
         let mut paths = Vec::new();
         {
             let tx = self.connection.transaction()?;
@@ -342,6 +345,7 @@ impl PersistentStore {
                     [&id],
                 )?;
                 tx.execute("DELETE FROM external_storage_captures WHERE id=?1", [&id])?;
+                removed = true;
                 if let Some(path) = path {
                     paths.push(PathBuf::from(path));
                 }
@@ -351,7 +355,7 @@ impl PersistentStore {
         for path in paths {
             self.remove_capture_file(&path);
         }
-        Ok(())
+        Ok(removed)
     }
 
     fn hydrate_hash(&self, hash: &str, probe: &dyn CancellationProbe) -> StoreResult<()> {
@@ -703,7 +707,9 @@ impl PersistentStore {
             )?;
             content_change_index::prune(&tx)?;
             tx.commit()?;
-            self.cleanup_capture_cache(&candidate.id)?;
+            if self.cleanup_capture_cache(&candidate.id)? {
+                self.collect_released_external_content();
+            }
             return Ok(CapturedSnapshot {
                 id: candidate.id,
                 identity,
@@ -773,7 +779,9 @@ impl PersistentStore {
         let prepared = self.prepare_content_capture(&id, consumer, identity.revision)?;
         let projected_records = prepared.project(&mut catalog, probe)?;
         let capture_id = prepared.register(self, &catalog, &scope_id, CODEC)?;
-        self.cleanup_capture_cache(&capture_id)?;
+        if self.cleanup_capture_cache(&capture_id)? {
+            self.collect_released_external_content();
+        }
         Ok(CapturedSnapshot {
             id: capture_id,
             identity,

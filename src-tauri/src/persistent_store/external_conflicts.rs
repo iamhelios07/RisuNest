@@ -373,11 +373,12 @@ pub(crate) fn external_conflicts_page(db: &Connection, after: Option<&ExternalCo
     Ok(ExternalConflictPage { conflicts, next })
 }
 
-/// Includes resolved conflicts because resolution changes display state only.
-pub(crate) fn registered_conflict_roots(db: &Connection, repository_root: &Path) -> StoreResult<RegisteredCaptureRoots> {
+/// Every conflict's local capture. Includes resolved conflicts because
+/// resolution changes display state only.
+pub(crate) fn conflict_capture_references(db: &Connection) -> StoreResult<Vec<DurableCaptureReference>> {
     let mut statement = db.prepare("SELECT local_identity,local_capture_id,local_catalog_path,local_catalog_hash FROM external_conflicts ORDER BY id")?;
     let mut rows = statement.query([])?;
-    let mut roots = RegisteredCaptureRoots::default();
+    let mut references = Vec::new();
     while let Some(row) = rows.next()? {
         let reference = DurableCaptureReference {
             identity: decode(&row.get::<_, String>(0)?, "External conflict local identity is invalid")?,
@@ -386,6 +387,15 @@ pub(crate) fn registered_conflict_roots(db: &Connection, repository_root: &Path)
             catalog_hash: row.get(3)?,
         };
         validate_capture(&reference)?;
+        references.push(reference);
+    }
+    Ok(references)
+}
+
+/// Includes resolved conflicts because resolution changes display state only.
+pub(crate) fn registered_conflict_roots(db: &Connection, repository_root: &Path) -> StoreResult<RegisteredCaptureRoots> {
+    let mut roots = RegisteredCaptureRoots::default();
+    for reference in conflict_capture_references(db)? {
         let registered = registered_capture_roots([&reference], repository_root)?;
         roots.assets.object_hashes.extend(registered.assets.object_hashes);
         roots.catalogs.extend(registered.catalogs);
