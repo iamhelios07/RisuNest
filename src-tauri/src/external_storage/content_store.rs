@@ -40,6 +40,10 @@ pub(crate) enum ObjectSource {
     /// A body the asset repository already holds under this content hash. It
     /// is registered where it is rather than read out of a staging file.
     Library(String),
+    /// A record the receiving library already holds under the same key and
+    /// identity. A difference leaves it alone, so its body was never fetched
+    /// and nothing may read it.
+    Unchanged,
 }
 
 impl ObjectSource {
@@ -47,7 +51,7 @@ impl ObjectSource {
     pub(crate) fn file(&self) -> Option<&Path> {
         match self {
             Self::File(path) => Some(path),
-            Self::Captured(_) | Self::Library(_) => None,
+            Self::Captured(_) | Self::Library(_) | Self::Unchanged => None,
         }
     }
 }
@@ -257,6 +261,7 @@ impl ContentStore {
             // A library body belongs to the asset repository, which is the only
             // store that may hand one out.
             ObjectSource::Library(_) => Err(invalid("Capture source is not a capture body")),
+            ObjectSource::Unchanged => Err(invalid("An unchanged record has no fetched body")),
         }
     }
 

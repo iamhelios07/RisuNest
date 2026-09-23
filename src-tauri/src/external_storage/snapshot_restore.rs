@@ -133,6 +133,7 @@ impl PreparedRemoteSnapshot {
                 .read_all(digest)
                 .expect("prepared record body"),
             ObjectSource::Library(_) => panic!("a library body is not read through here"),
+            ObjectSource::Unchanged => panic!("an unchanged record has no fetched body"),
         }
     }
     pub(super) fn record_body(&self, index: usize) -> Vec<u8> {
@@ -609,6 +610,15 @@ pub(crate) enum SourceTrust<'a> {
     /// The repository at this root may answer on identity and length alone,
     /// which is what it was already admitted under.
     AdmittedLibrary(&'a Path),
+    /// As `AdmittedLibrary`, for a receive whose library holds `records` (its
+    /// base record map, key to content hash). When the snapshot's records
+    /// differ from them by no more than `within`, a record they name with
+    /// the same identity is left `Unchanged` and its pack is not read.
+    AdmittedLibraryAt {
+        root: &'a Path,
+        records: &'a BTreeMap<String, String>,
+        within: super::receive_difference::DifferenceBudget,
+    },
 }
 
 /// The repository a plan may take bodies from, and whether each one has to be
@@ -637,6 +647,7 @@ fn resolve_entries(
     staging_root: &Path,
     content: &ContentStore,
     library: Option<LocalLibrary>,
+    unchanged: &BTreeSet<String>,
     cancel: &Cancellation,
 ) -> Result<Vec<ResolvedEntry>> {
     let prove = library.as_ref().is_some_and(|library| library.prove);
@@ -653,6 +664,9 @@ fn resolve_entries(
         let (destination, source) = match entry.kind {
             // A record already in the content store is proved the same way a
             // staging file was, by its length and then by its content.
+            wire::CatalogEntryKind::Record if unchanged.contains(&entry.key) => {
+                (None, Some(ObjectSource::Unchanged))
+            }
             wire::CatalogEntryKind::Record => {
                 let length = i64::try_from(entry.byte_length).map_err(corrupt)?;
                 let held = content.validate(&digest, length, true).is_ok();
@@ -681,6 +695,37 @@ fn resolve_entries(
         });
     }
     Ok(plan)
+}
+
+/// The record keys a receive against `base` would leave alone, when the
+/// difference is small enough to be applied in place. A difference too large
+/// for that is applied by replacing the library, which needs every body.
+fn unchanged_records(
+    entries: &[CompleteEntry],
+    base: &BTreeMap<String, String>,
+    within: super::receive_difference::DifferenceBudget,
+) -> Result<BTreeSet<String>> {
+    use super::receive_difference::{difference, LocalRecord, RemoteRecord};
+    let computed = difference(
+        entries.iter().map(|entry| RemoteRecord {
+            key: entry.key.clone(),
+            content_hash: hex::encode(entry.content_sha256),
+            byte_length: entry.byte_length,
+        }),
+        base.iter().map(|(key, content_hash)| LocalRecord {
+            key: key.clone(),
+            content_hash: content_hash.clone(),
+        }),
+    )?;
+    if !computed.within(within) {
+        return Ok(BTreeSet::new());
+    }
+    let moved: BTreeSet<&String> = computed.added.iter().chain(&computed.changed).collect();
+    Ok(entries
+        .iter()
+        .filter(|entry| !moved.contains(&entry.key))
+        .map(|entry| entry.key.clone())
+        .collect())
 }
 
 /// A body the library already holds under this exact identity and length. The
@@ -1126,6 +1171,14 @@ pub(crate) async fn download_snapshot(
             }
         }
     }
+    // The records a difference would leave alone are known from the catalog
+    // and the base alone, before any pack is chosen.
+    let unchanged = match trust {
+        SourceTrust::AdmittedLibraryAt {
+            records, within, ..
+        } => unchanged_records(&record_entries, records, within)?,
+        _ => BTreeSet::new(),
+    };
     let mut library_entries = record_entries;
     library_entries.extend(asset_entries);
     let library_staging = staging_root.to_path_buf();
@@ -1136,10 +1189,12 @@ pub(crate) async fn download_snapshot(
             root: root.to_path_buf(),
             prove: true,
         }),
-        SourceTrust::AdmittedLibrary(root) => Some(LocalLibrary {
-            root: root.to_path_buf(),
-            prove: false,
-        }),
+        SourceTrust::AdmittedLibrary(root) | SourceTrust::AdmittedLibraryAt { root, .. } => {
+            Some(LocalLibrary {
+                root: root.to_path_buf(),
+                prove: false,
+            })
+        }
     };
     let cpu = cpu_permit().await?;
     let plan = tokio::task::spawn_blocking(move || {
@@ -1149,6 +1204,7 @@ pub(crate) async fn download_snapshot(
             &library_staging,
             &content,
             library,
+            &unchanged,
             &library_cancel,
         )
     })

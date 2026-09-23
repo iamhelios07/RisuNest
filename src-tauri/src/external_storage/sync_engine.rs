@@ -221,9 +221,32 @@ fn prepare_receive_input(
     participation: ReceiveParticipation,
     prepared: &super::phase_progress::PhaseProgress,
     cancel: &Cancellation,
-) -> Result<PreparedReceive> {
+) -> Result<Preparation> {
     prepare_receive_within(store, job, expected, authenticated_head, downloaded, sections,
         participation, prepared, cancel, RECEIVE_DIFFERENCE_BUDGET)
+}
+
+fn unfetched(source: &super::content_store::ObjectSource) -> bool {
+    matches!(source, super::content_store::ObjectSource::Unchanged)
+}
+
+/// What preparing a downloaded receive produced.
+enum Preparation {
+    Ready(PreparedReceive),
+    /// The download left the records its base already holds unfetched, and
+    /// the receive turned out to need them. Nothing was staged; a download
+    /// that fetches every record has to come first.
+    NeedsRecords,
+}
+
+#[cfg(test)]
+impl Preparation {
+    fn ready(self) -> PreparedReceive {
+        match self {
+            Preparation::Ready(prepared) => prepared,
+            Preparation::NeedsRecords => panic!("the receive needs records it did not fetch"),
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -238,7 +261,7 @@ fn prepare_receive_within(
     prepared: &super::phase_progress::PhaseProgress,
     cancel: &Cancellation,
     budget: super::receive_difference::DifferenceBudget,
-) -> Result<PreparedReceive> {
+) -> Result<Preparation> {
     require_exact_receive_identity(&expected, &store.external_identity().map_err(local_error)?)?;
     store.external_validate_receive(&job.id, &job.request.connection_id, &expected, &authenticated_head)
         .map_err(|_| ProviderError::new(ErrorKind::PreconditionFailed))?;
@@ -252,13 +275,6 @@ fn prepare_receive_within(
     if sections.iter().any(|section| !wanted.contains(section.kind.id())) {
         return Err(corrupt("received section is not participating"));
     }
-    let sections = prepare_receive_sections(
-        &job.request.connection_id,
-        &expected.library_epoch,
-        &participation,
-        sections,
-        cancel,
-    )?;
     let scope_id = library_fingerprint_domain();
     let expected_fingerprint: [u8; 32] = hex::decode(&downloaded.library_fingerprint)
         .ok().and_then(|value| value.try_into().ok())
@@ -294,20 +310,39 @@ fn prepare_receive_within(
                     byte_length: record.byte_length, source: record.source.clone(),
                 })
                 .collect();
-            let catalog: BTreeMap<String, u64> = downloaded.objects.iter()
-                .map(|object| (object.content_hash.clone(), object.byte_length))
-                .collect();
-            let decoded = store
-                .decode_external_snapshot_difference(
-                    &downloaded.staging_root, &records, &difference.removed, &catalog,
-                )
-                .map_err(receive_validation_error)?;
-            budget
-                .admits_dependents(decoded.cost.bytes, decoded.cost.work)
-                .then_some((difference, records, decoded))
+            // A record the download left unfetched cannot arrive in place.
+            if records.iter().any(|record| unfetched(&record.source)) {
+                None
+            } else {
+                let catalog: BTreeMap<String, u64> = downloaded.objects.iter()
+                    .map(|object| (object.content_hash.clone(), object.byte_length))
+                    .collect();
+                let decoded = store
+                    .decode_external_snapshot_difference(
+                        &downloaded.staging_root, &records, &difference.removed, &catalog,
+                    )
+                    .map_err(receive_validation_error)?;
+                budget
+                    .admits_dependents(decoded.cost.bytes, decoded.cost.work)
+                    .then_some((difference, records, decoded))
+            }
         }
         None => None,
     };
+    // A replacement stages every record, including the ones the download
+    // skipped because a difference would not have needed them.
+    if decoded.is_none()
+        && downloaded.records.iter().any(|record| unfetched(&record.source))
+    {
+        return Ok(Preparation::NeedsRecords);
+    }
+    let sections = prepare_receive_sections(
+        &job.request.connection_id,
+        &expected.library_epoch,
+        &participation,
+        sections,
+        cancel,
+    )?;
     let apply = match decoded {
         Some((difference, records, decoded)) => {
             let object_items = downloaded.objects.len() as u64;
@@ -379,11 +414,11 @@ fn prepare_receive_within(
         }
     };
     prepared.flush();
-    Ok(PreparedReceive {
+    Ok(Preparation::Ready(PreparedReceive {
         job_id: job.id.clone(), connection_id: job.request.connection_id.clone(),
         snapshot_id: downloaded.snapshot_id, expected, authenticated_head, apply,
         records: record_map, participation, sections,
-    })
+    }))
 }
 
 fn receive_validation_error(error: crate::persistent_store::StoreError) -> ProviderError {
@@ -915,7 +950,7 @@ async fn receive_remote(
         .state::<crate::native_file_jobs::NativeFileJobState>()
         .admission
         .clone();
-    let (observation, participation) = {
+    let (observation, participation, base_records) = {
         let _admission = admission.file(false).map_err(local_error)?;
         let mut store = pds(app)?;
         require_exact_receive_identity(expected, &store.external_identity().map_err(local_error)?)?;
@@ -950,12 +985,16 @@ async fn receive_remote(
         store.external_validate_receive(&job.id, &job.request.connection_id, expected, &observation)
             .map_err(|_| ProviderError::new(ErrorKind::PreconditionFailed))?;
         let participation = receive_participation(&mut store)?;
+        // What a difference is taken against. A record it names under the
+        // identity the snapshot names is one the library already holds.
+        let base_records = store.external_base_records(&job.request.connection_id)
+            .map_err(local_error)?;
         drop(store);
         // A process restart loses the native commit handle. Only this worker
         // may revalidate the downloaded files and build another inactive
         // generation.
         discard_receive_preparation(app, &job.id)?;
-        (observation, participation)
+        (observation, participation, base_records)
     };
     let root = super::runtime::root(app)?;
     let directory = super::runtime::job_directory(&root, &job.request.connection_id, &job.id);
@@ -966,32 +1005,52 @@ async fn receive_remote(
     // A body the library already holds under the identity this snapshot names
     // is the same body, so a normal receive does not fetch it again.
     let transferred = super::runtime::transfer_progress(&root, &job.id);
-    let downloaded = super::snapshot_restore::download_snapshot(
-        &remote.document.state, &staging, &connected.root_key, Some(&cache),
-        super::snapshot_restore::SourceTrust::AdmittedLibrary(&root),
-        connected.provider.as_ref(), &connected.handle, &transferred, cancel,
-    ).await?;
-    cancel.check()?;
-    let sections = super::snapshot_restore::download_sections(
-        &remote.document.state, &wanted_receive_sections(&participation), &staging,
-        &connected.root_key, Some(&cache), connected.provider.as_ref(), &connected.handle,
-        &transferred, cancel,
-    ).await?;
-    transferred.flush();
-    let worker_app = app.clone();
-    let worker_job = job.clone();
-    let worker_identity = expected.clone();
-    let worker_head = observation;
-    let worker_cancel = cancel.clone();
-    let worker_staging = super::runtime::preparation_progress(&root, &job.id);
-    let worker_admission = admission.clone();
-    let prepared = tokio::task::spawn_blocking(move || {
-        worker_cancel.check()?;
-        let _admission = worker_admission.file(false).map_err(local_error)?;
-        super::runtime::read_job_session(&worker_app, &worker_job.id)?;
-        prepare_receive_input(&mut pds(&worker_app)?, &worker_job, worker_identity,
-            worker_head, downloaded, sections, participation, &worker_staging, &worker_cancel)
-    }).await.map_err(local_error)??;
+    let mut trust = match base_records.as_ref() {
+        Some(records) => super::snapshot_restore::SourceTrust::AdmittedLibraryAt {
+            root: &root, records, within: RECEIVE_DIFFERENCE_BUDGET,
+        },
+        None => super::snapshot_restore::SourceTrust::AdmittedLibrary(&root),
+    };
+    let prepared = loop {
+        let downloaded = super::snapshot_restore::download_snapshot(
+            &remote.document.state, &staging, &connected.root_key, Some(&cache), trust,
+            connected.provider.as_ref(), &connected.handle, &transferred, cancel,
+        ).await?;
+        cancel.check()?;
+        let sections = super::snapshot_restore::download_sections(
+            &remote.document.state, &wanted_receive_sections(&participation), &staging,
+            &connected.root_key, Some(&cache), connected.provider.as_ref(), &connected.handle,
+            &transferred, cancel,
+        ).await?;
+        transferred.flush();
+        let worker_app = app.clone();
+        let worker_job = job.clone();
+        let worker_identity = expected.clone();
+        let worker_head = observation.clone();
+        let worker_participation = participation.clone();
+        let worker_cancel = cancel.clone();
+        let worker_staging = super::runtime::preparation_progress(&root, &job.id);
+        let worker_admission = admission.clone();
+        let preparation = tokio::task::spawn_blocking(move || {
+            worker_cancel.check()?;
+            let _admission = worker_admission.file(false).map_err(local_error)?;
+            super::runtime::read_job_session(&worker_app, &worker_job.id)?;
+            prepare_receive_input(&mut pds(&worker_app)?, &worker_job, worker_identity,
+                worker_head, downloaded, sections, worker_participation, &worker_staging,
+                &worker_cancel)
+        }).await.map_err(local_error)??;
+        match preparation {
+            Preparation::Ready(prepared) => break prepared,
+            // Only a difference too heavy to apply in place gets here: the
+            // records it skipped are fetched now, next to the ones it has.
+            Preparation::NeedsRecords
+                if matches!(trust, super::snapshot_restore::SourceTrust::AdmittedLibraryAt { .. }) =>
+            {
+                trust = super::snapshot_restore::SourceTrust::AdmittedLibrary(&root);
+            }
+            Preparation::NeedsRecords => return Err(corrupt("received records are still unfetched")),
+        }
+    };
     let recorded = (|| {
         let jobs = JobStore::open(&root)?;
         let mut durable = jobs.read(&job.id)?;
@@ -2571,7 +2630,7 @@ mod receive_tests {
         let participation = receive_participation(store).unwrap();
         let section = plugin_section(&downloaded.staging_root);
         prepare_receive_input(store, job, job.admission_identity.clone(), "authenticated-head".into(),
-            downloaded, vec![section], participation, prepared, &Cancellation::default()).unwrap()
+            downloaded, vec![section], participation, prepared, &Cancellation::default()).unwrap().ready()
     }
 
     fn local_edit(store: &mut PersistentStore, revision: i64) {
@@ -2903,6 +2962,77 @@ mod receive_tests {
         );
     }
 
+    /// A snapshot downloaded against a base, with the records that base
+    /// already holds left unfetched.
+    fn withheld(store: &PersistentStore, mut snapshot: super::super::snapshot_restore::PreparedRemoteSnapshot,
+        also: &[&str]) -> super::super::snapshot_restore::PreparedRemoteSnapshot
+    {
+        let base = store.external_base_records("connection").unwrap().unwrap();
+        for record in &mut snapshot.records {
+            if base.get(&record.key) == Some(&record.content_hash)
+                || also.iter().any(|key| record.key.contains(key))
+            {
+                record.source = super::super::content_store::ObjectSource::Unchanged;
+            }
+        }
+        snapshot
+    }
+
+    fn preparation_within(store: &mut PersistentStore, job: &DurableJob,
+        downloaded: super::super::snapshot_restore::PreparedRemoteSnapshot,
+        budget: super::super::receive_difference::DifferenceBudget) -> Preparation
+    {
+        let participation = receive_participation(store).unwrap();
+        let section = plugin_section(&downloaded.staging_root);
+        prepare_receive_within(store, job, job.admission_identity.clone(), "authenticated-head".into(),
+            downloaded, vec![section], participation,
+            &crate::external_storage::phase_progress::PhaseProgress::silent(),
+            &Cancellation::default(), budget).unwrap()
+    }
+
+    /// R04. Records the base already holds are never fetched for a difference,
+    /// which applies without them. Every route that would need one of them
+    /// (too many records, too much dependent work, or a record that moved
+    /// after the download chose what to skip) hands the receive back before
+    /// staging anything, and the full download then lands the same library.
+    #[test]
+    fn c_a_receive_without_its_unchanged_records_applies_or_asks_for_them() {
+        let (_directory, mut store, staging) = received_library();
+        let revision = store.revision().unwrap();
+        let job = bind(&mut store, "second");
+        let skipped = withheld(&store, second_snapshot(&staging), &[]);
+        assert_eq!(skipped.records.iter()
+            .filter(|record| unfetched(&record.source)).count(), 2);
+        let refusing = [
+            ("records", super::super::receive_difference::DifferenceBudget {
+                records: 0, ..RECEIVE_DIFFERENCE_BUDGET
+            }, &[][..]),
+            ("dependents", budget(0, 0), &[][..]),
+            ("moved", RECEIVE_DIFFERENCE_BUDGET, &["root"][..]),
+        ];
+        for (case, within, also) in refusing {
+            let snapshot = withheld(&store, second_snapshot(&staging), also);
+            assert!(matches!(preparation_within(&mut store, &job, snapshot, within),
+                Preparation::NeedsRecords), "{case}");
+            assert_eq!(store.revision().unwrap(), revision, "{case}");
+            assert_eq!(store.external_job(&job.id).unwrap().unwrap().phase, "ready", "{case}");
+        }
+        let replaced = prepare_within(&mut store, &job, second_snapshot(&staging),
+            super::super::receive_difference::DifferenceBudget { records: 0, ..RECEIVE_DIFFERENCE_BUDGET });
+        assert!(matches!(replaced.apply, PreparedApply::Replace(_)));
+        let identity = job.admission_identity.clone();
+        activate_prepared_receive(&mut store, &replaced, &identity).unwrap();
+
+        let (_other, mut differing, other_staging) = received_library();
+        let job = bind(&mut differing, "second");
+        let snapshot = withheld(&differing, second_snapshot(&other_staging), &[]);
+        let prepared = prepare_within(&mut differing, &job, snapshot, RECEIVE_DIFFERENCE_BUDGET);
+        assert!(matches!(prepared.apply, PreparedApply::Difference(_)));
+        let identity = job.admission_identity.clone();
+        activate_prepared_receive(&mut differing, &prepared, &identity).unwrap();
+        assert_eq!(differing.materialize(None).unwrap(), store.materialize(None).unwrap());
+    }
+
     /// A18. A record that cannot be applied fails the whole transaction, so the
     /// revision, the base and the job's completion are all still the old ones.
     #[test]
@@ -2910,7 +3040,7 @@ mod receive_tests {
         let (_directory, mut store, staging) = received_library();
         let before = store.revision().unwrap();
         let job = bind(&mut store, "second");
-        let mut second = second_snapshot(&staging);
+        let second = second_snapshot(&staging);
         // The same length and a hash the catalog names, with other bytes behind
         // it, so only reading the record can tell.
         let poisoned = second.records.iter().find(|record| record.key.contains("root")).unwrap();
@@ -3078,7 +3208,7 @@ mod receive_tests {
         prepare_receive_within(store, job, job.admission_identity.clone(), "authenticated-head".into(),
             downloaded, vec![section], participation,
             &crate::external_storage::phase_progress::PhaseProgress::silent(),
-            &Cancellation::default(), budget).unwrap()
+            &Cancellation::default(), budget).unwrap().ready()
     }
 
     fn remove_from_cas(directory: &std::path::Path, hashes: &[String]) {
