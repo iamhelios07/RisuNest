@@ -1431,12 +1431,15 @@ async fn run_repository_check(
             Some((items, total_items, bytes, total_bytes)),
         );
     };
+    let mut evidence =
+        super::packaging::ObjectEvidence::open(&root, &job.request.connection_id)?;
     let run = async {
         super::repository_check::check(
             &selected,
             &connected.root_key,
             &directory,
             &cache_root,
+            &mut evidence,
             connected.provider.as_ref(),
             &connected.handle,
             &progress,

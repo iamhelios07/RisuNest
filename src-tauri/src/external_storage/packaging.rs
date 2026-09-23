@@ -392,6 +392,16 @@ impl ObjectEvidence {
         self.store
             .record_unusable_object(&self.connection, identity, object_id, reason)
     }
+    /// Remembers damage found outside a publication, such as by a check,
+    /// before the cache rows naming the object go.
+    pub(super) fn record_object(
+        &self,
+        value: &RemoteObject,
+        repository: &RepositoryHandle,
+        reason: UnusableReason,
+    ) -> Result<()> {
+        self.record(&Self::identity(value, repository)?, &value.object_id, reason)
+    }
     /// This exact object answered for itself, so whatever was remembered about
     /// it no longer describes it.
     fn clear(&self, identity: &str) -> Result<()> {

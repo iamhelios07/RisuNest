@@ -6,8 +6,9 @@ use super::{
     contract::{
         Cancellation, ErrorKind, ObjectRole, Provider, ProviderError, RepositoryHandle, Result,
     },
+    connection_store::UnusableReason,
     package_cache,
-    packaging::{cpu_permit, RemoteObject},
+    packaging::{cpu_permit, ObjectEvidence, RemoteObject},
     reachability, snapshot_restore,
 };
 use risunest_external_storage_format::{pack, snapshot as wire};
@@ -339,6 +340,7 @@ pub(crate) async fn check(
     root_key: &[u8; 32],
     directory: &Path,
     cache_root: &Path,
+    evidence: &mut ObjectEvidence,
     provider: &dyn Provider,
     repository: &RepositoryHandle,
     progress: &(dyn Fn(u64, u64, u64, u64) + Sync),
@@ -380,14 +382,17 @@ pub(crate) async fn check(
                 Err(error)
                     if matches!(error.kind, ErrorKind::Corrupt | ErrorKind::NotFound) =>
                 {
+                    let (damage, reason) = if error.kind == ErrorKind::NotFound {
+                        (Damage::Missing, UnusableReason::Missing)
+                    } else {
+                        (Damage::Corrupt, UnusableReason::Damaged)
+                    };
+                    // The cache can be rebuilt from the parent's metadata at
+                    // any time, so the finding has to outlive its rows.
+                    evidence.record_object(&pack.object, repository, reason)?;
                     package_cache::forget_remote_object(cache_root, repository, &pack.object)?;
                     outcome.damaged_objects += 1;
                     if outcome.damaged.len() < REPORTED_DAMAGE {
-                        let damage = if error.kind == ErrorKind::NotFound {
-                            Damage::Missing
-                        } else {
-                            Damage::Corrupt
-                        };
                         outcome.damaged.push((pack.object.object_id.clone(), damage));
                     }
                     continue;
@@ -596,6 +601,10 @@ mod tests {
             .expect("a publication of this size stores packs")
     }
 
+    fn evidence(root: &Path) -> ObjectEvidence {
+        ObjectEvidence::open(root, "check-connection").unwrap()
+    }
+
     fn silent() -> impl Fn(u64, u64, u64, u64) + Sync {
         |_, _, _, _| {}
     }
@@ -620,6 +629,7 @@ mod tests {
                 &[9; 32],
                 &job,
                 &directory.path().join("package-cache"),
+                &mut evidence(directory.path()),
                 &provider,
                 &repository,
                 &silent(),
@@ -656,15 +666,15 @@ mod tests {
             let cache = directory.path().join("package-cache");
             let pack = stored_pack(&provider);
             let first = check(
-                &root, &[9; 32], &job, &cache, &provider, &repository, &silent(),
-                &Cancellation::default(),
+                &root, &[9; 32], &job, &cache, &mut evidence(directory.path()),
+                &provider, &repository, &silent(), &Cancellation::default(),
             )
             .await
             .unwrap();
             assert_eq!(provider.read_attempts(&pack), 1);
             let second = check(
-                &root, &[9; 32], &job, &cache, &provider, &repository, &silent(),
-                &Cancellation::default(),
+                &root, &[9; 32], &job, &cache, &mut evidence(directory.path()),
+                &provider, &repository, &silent(), &Cancellation::default(),
             )
             .await
             .unwrap();
@@ -677,8 +687,8 @@ mod tests {
             );
             fs::remove_file(job.join(LEDGER_FILE)).unwrap();
             check(
-                &root, &[9; 32], &job, &cache, &provider, &repository, &silent(),
-                &Cancellation::default(),
+                &root, &[9; 32], &job, &cache, &mut evidence(directory.path()),
+                &provider, &repository, &silent(), &Cancellation::default(),
             )
             .await
             .unwrap();
@@ -717,6 +727,7 @@ mod tests {
                 &[9; 32],
                 &directory.path().join("check-job"),
                 &cache,
+                &mut evidence(directory.path()),
                 &provider,
                 &repository,
                 &silent(),
@@ -753,6 +764,7 @@ mod tests {
                 &[9; 32],
                 &directory.path().join("check-job"),
                 &directory.path().join("package-cache"),
+                &mut evidence(directory.path()),
                 &provider,
                 &repository,
                 &silent(),
@@ -782,6 +794,7 @@ mod tests {
                 &[9; 32],
                 &directory.path().join("check-job"),
                 &directory.path().join("package-cache"),
+                &mut evidence(directory.path()),
                 &provider,
                 &repository,
                 &silent(),
@@ -843,6 +856,7 @@ mod tests {
                 &[9; 32],
                 &directory.path().join("check-job"),
                 &directory.path().join("package-cache"),
+                &mut evidence(directory.path()),
                 &provider,
                 &repository,
                 &silent(),
@@ -863,6 +877,131 @@ mod tests {
                 after.len() >= before.len(),
                 "the entries of the damaged pack were dropped instead of stored again"
             );
+        });
+    }
+
+    /// The publication after a check that found `damaged` unusable, with the
+    /// package cache lost in between, so only the connection's own record of
+    /// the finding stands between the parent graph and that body.
+    async fn published_after_cache_loss(
+        directory: &Path,
+        first: &CompletedSnapshot,
+        damaged: &str,
+        provider: &FakeProvider,
+        repository: &RepositoryHandle,
+    ) {
+        let read = directory.join("read");
+        let before = record_packs(first, &read, provider, repository).await;
+        fs::remove_dir_all(directory.join("package-cache")).unwrap();
+        let parent = parent_graph(first, repository);
+        let second = published(directory, provider, repository, 60, 2, Some(&parent)).await;
+        let after = record_packs(&second, &read.join("second"), provider, repository).await;
+        assert!(
+            !after.contains(damaged),
+            "a publication inherited a body the check found unusable"
+        );
+        assert!(
+            after.len() >= before.len(),
+            "the entries of the damaged pack were dropped instead of stored again"
+        );
+    }
+
+    /// A record pack of `first` that is not the last pack a check reads, so a
+    /// cut after the next one falls after this body was judged.
+    async fn early_record_pack(
+        directory: &Path,
+        first: &CompletedSnapshot,
+        provider: &FakeProvider,
+        repository: &RepositoryHandle,
+    ) -> (String, String) {
+        let records = record_packs(first, &directory.join("early"), provider, repository).await;
+        let packs = provider
+            .uploaded_ids()
+            .into_iter()
+            .filter(|id| id.starts_with("pack-"))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let index = (0..packs.len() - 1)
+            .find(|index| records.contains(&packs[*index]))
+            .expect("a record pack read before another one");
+        (packs[index].clone(), packs[index + 1].clone())
+    }
+
+    #[test]
+    fn c_a_corrupt_body_found_by_a_check_stays_unusable_after_the_cache_is_lost() {
+        runtime().block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let first = published(directory.path(), &provider, &repository, 60, 1, None).await;
+            let (damaged, _) = early_record_pack(directory.path(), &first, &provider, &repository).await;
+            // Same length, so nothing but reading the body tells them apart.
+            let mut bytes = provider.contents(&damaged).expect("an uploaded body");
+            let last = bytes.len() - 1;
+            bytes[last] ^= 0x01;
+            provider.seed(&damaged, ObjectRole::Pack, bytes);
+            let outcome = check(
+                &first.reference, &[9; 32], &directory.path().join("check-job"),
+                &directory.path().join("package-cache"), &mut evidence(directory.path()),
+                &provider, &repository, &silent(), &Cancellation::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome.damaged, vec![(damaged.clone(), Damage::Corrupt)]);
+            published_after_cache_loss(directory.path(), &first, &damaged, &provider, &repository)
+                .await;
+        });
+    }
+
+    #[test]
+    fn c_a_missing_body_found_by_a_check_stays_unusable_after_the_cache_is_lost() {
+        runtime().block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let first = published(directory.path(), &provider, &repository, 60, 1, None).await;
+            let (damaged, _) = early_record_pack(directory.path(), &first, &provider, &repository).await;
+            provider.forget(&damaged);
+            let outcome = check(
+                &first.reference, &[9; 32], &directory.path().join("check-job"),
+                &directory.path().join("package-cache"), &mut evidence(directory.path()),
+                &provider, &repository, &silent(), &Cancellation::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome.damaged, vec![(damaged.clone(), Damage::Missing)]);
+            published_after_cache_loss(directory.path(), &first, &damaged, &provider, &repository)
+                .await;
+        });
+    }
+
+    #[test]
+    fn c_a_check_stopped_after_finding_damage_still_keeps_the_body_unusable() {
+        runtime().block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let first = published(directory.path(), &provider, &repository, 60, 1, None).await;
+            let (damaged, next) =
+                early_record_pack(directory.path(), &first, &provider, &repository).await;
+            let mut bytes = provider.contents(&damaged).expect("an uploaded body");
+            let last = bytes.len() - 1;
+            bytes[last] ^= 0x01;
+            provider.seed(&damaged, ObjectRole::Pack, bytes);
+            let cancel = Cancellation::default();
+            provider.cancel_after_read(&next, 1, &cancel);
+            let error = check(
+                &first.reference, &[9; 32], &directory.path().join("check-job"),
+                &directory.path().join("package-cache"), &mut evidence(directory.path()),
+                &provider, &repository, &silent(), &cancel,
+            )
+            .await
+            .expect_err("the check was cancelled part way through");
+            assert_eq!(error.kind, ErrorKind::Cancelled);
+            assert_eq!(provider.read_attempts(&damaged), 1, "the cut fell before the damage");
+            published_after_cache_loss(directory.path(), &first, &damaged, &provider, &repository)
+                .await;
         });
     }
 
@@ -913,7 +1052,8 @@ mod tests {
             let cancel = Cancellation::default();
             provider.cancel_after_read(&packs[1], 1, &cancel);
             let error = check(
-                &root, &[9; 32], &job, &cache, &provider, &repository, &silent(), &cancel,
+                &root, &[9; 32], &job, &cache, &mut evidence(directory.path()),
+                &provider, &repository, &silent(), &cancel,
             )
             .await
             .expect_err("the check was cancelled part way through");
@@ -932,6 +1072,7 @@ mod tests {
                 &[9; 32],
                 &job,
                 &cache,
+                &mut evidence(directory.path()),
                 &provider,
                 &repository,
                 &silent(),
