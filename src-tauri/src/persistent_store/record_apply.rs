@@ -418,13 +418,56 @@ pub(super) fn apply_materialized_record(
     envelope: LogicalRecordEnvelope,
     messages: Option<&[Value]>,
 ) -> Result<(), StoreError> {
-    let key = encode_logical_record_key(&locator).map_err(|e| record_validation(e.to_string()))?;
+    let messages = messages
+        .map(|messages| {
+            messages
+                .iter()
+                .map(SerializedMessage::of)
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
+    apply_serialized_record(
+        transaction,
+        generation,
+        &locator,
+        &envelope,
+        messages.as_deref(),
+    )
+}
+
+/// One message row as it is written, so a caller can do the encoding before
+/// it takes the writer.
+pub(super) struct SerializedMessage {
+    chat_id: Option<String>,
+    value: String,
+}
+
+impl SerializedMessage {
+    pub(super) fn of(message: &Value) -> Result<Self, StoreError> {
+        Ok(Self {
+            chat_id: message
+                .get("chatId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            value: serde_json::to_string(message).map_err(json_error)?,
+        })
+    }
+}
+
+pub(super) fn apply_serialized_record(
+    transaction: &Transaction<'_>,
+    generation: &str,
+    locator: &LogicalRecordLocator,
+    envelope: &LogicalRecordEnvelope,
+    messages: Option<&[SerializedMessage]>,
+) -> Result<(), StoreError> {
+    let key = encode_logical_record_key(locator).map_err(|e| record_validation(e.to_string()))?;
     apply_record_rows(
         transaction,
         generation,
         &key,
-        &locator,
-        &envelope,
+        locator,
+        envelope,
         messages.map_or(0, |m| m.len() as u64),
     )?;
     if let (
@@ -433,7 +476,7 @@ pub(super) fn apply_materialized_record(
             conversation_id,
         },
         Some(messages),
-    ) = (&locator, messages)
+    ) = (locator, messages)
     {
         let mut statement=transaction.prepare_cached("INSERT INTO messages(generation,character_id,conversation_id,message_index,message_id,value) VALUES(?1,?2,?3,?4,?5,?6)").map_err(sql_error)?;
         for (index, message) in messages.iter().enumerate() {
@@ -443,8 +486,8 @@ pub(super) fn apply_materialized_record(
                     character_id,
                     conversation_id,
                     index as i64,
-                    message.get("chatId").and_then(Value::as_str),
-                    serde_json::to_string(message).map_err(json_error)?
+                    message.chat_id,
+                    message.value
                 ])
                 .map_err(sql_error)?;
         }

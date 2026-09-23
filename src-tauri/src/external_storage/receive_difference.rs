@@ -34,11 +34,22 @@ pub(crate) struct ReceiveDifference {
 }
 
 /// The size past which a receive is no longer a normal small one and belongs in
-/// the staging and activation path instead.
+/// the staging and activation path instead. `records` and `bytes` bound the
+/// keys and their envelopes; `dependent_bytes` and `work` bound what those
+/// envelopes bring with them: the message pages and owner manifests behind
+/// them, and the rows written, rows deleted and bodies confirmed.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DifferenceBudget {
     pub records: usize,
     pub bytes: u64,
+    pub dependent_bytes: u64,
+    pub work: u64,
+}
+
+impl DifferenceBudget {
+    pub(crate) fn admits_dependents(&self, dependent_bytes: u64, work: u64) -> bool {
+        dependent_bytes <= self.dependent_bytes && work <= self.work
+    }
 }
 
 impl ReceiveDifference {
@@ -187,8 +198,11 @@ mod tests {
         .unwrap();
         // One added and two removed, against one record left alone.
         assert_eq!(result.written_records(), 3);
-        assert!(result.within(DifferenceBudget { records: 3, bytes: 20 }));
-        assert!(!result.within(DifferenceBudget { records: 2, bytes: 20 }));
-        assert!(!result.within(DifferenceBudget { records: 3, bytes: 19 }));
+        let budget = |records, bytes| DifferenceBudget {
+            records, bytes, dependent_bytes: 0, work: 0,
+        };
+        assert!(result.within(budget(3, 20)));
+        assert!(!result.within(budget(2, 20)));
+        assert!(!result.within(budget(3, 19)));
     }
 }

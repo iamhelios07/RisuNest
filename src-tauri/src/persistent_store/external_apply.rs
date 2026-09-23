@@ -20,7 +20,7 @@ use crate::{
 };
 use crate::external_storage::content_store::{Body, ContentStore, ObjectSource};
 use risunest_external_storage_format::format::{fingerprint, library_fingerprint_domain};
-use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
@@ -142,15 +142,50 @@ impl PersistentStore {
     }
 }
 
-/// A receive small enough to change the active generation in place: the records
-/// the snapshot moved, the keys it no longer names, and the object lengths its
-/// records refer to.
-pub(crate) struct ExternalSnapshotDifference<'a> {
-    pub expected_revision: i64,
-    pub staging_root: &'a Path,
-    pub records: &'a [ExternalSnapshotRecord],
-    pub removed: &'a [String],
-    pub object_sizes: &'a BTreeMap<String, u64>,
+/// One arriving record of a difference, read, checked against its catalog
+/// entry and decoded before any write transaction.
+pub(crate) struct DecodedRecord {
+    key: String,
+    content_hash: String,
+    locator: LogicalRecordLocator,
+    envelope: LogicalRecordEnvelope,
+}
+
+/// What applying a difference costs the active writer beyond its own
+/// envelopes: the page and manifest bytes behind them, and the rows written,
+/// rows deleted and bodies confirmed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DependentCost {
+    pub bytes: u64,
+    pub work: u64,
+}
+
+/// The records a difference moves, decoded, and what they would cost to apply
+/// against the library as it stands.
+pub(crate) struct DecodedDifference {
+    records: Vec<DecodedRecord>,
+    removed: Vec<(String, LogicalRecordLocator)>,
+    pub cost: DependentCost,
+}
+
+struct PreparedRecord {
+    locator: LogicalRecordLocator,
+    envelope: LogicalRecordEnvelope,
+    messages: Option<Vec<rows::SerializedMessage>>,
+    /// Bodies the written rows refer to, with the length each must have.
+    requires: std::collections::BTreeSet<(String, Option<u64>)>,
+}
+
+/// A receive small enough to change the active generation in place, with
+/// every body it needs already read and decoded, so applying it only writes.
+pub(crate) struct PreparedExternalDifference {
+    /// Conversations follow every other record, as a complete stage defers
+    /// one behind its parent.
+    records: Vec<PreparedRecord>,
+    removed: Vec<LogicalRecordLocator>,
+    removed_keys: Vec<String>,
+    arrived: Vec<(String, String)>,
+    object_sizes: BTreeMap<String, u64>,
 }
 
 impl PersistentStore {
@@ -171,47 +206,144 @@ impl PersistentStore {
         stage_objects(&self.repository_root, &root, content.as_ref(), objects)
     }
 
-    /// Applies what the snapshot changed to the generation the library is
-    /// already using, so the records it left alone are neither rewritten nor
-    /// read. Everything the receive owes - rows, revision, the change index the
-    /// other backup consumers read, the connection's base and its record map,
-    /// and the job's completion - is one transaction.
-    pub(crate) fn apply_external_snapshot_difference(
-        &mut self,
-        difference: &ExternalSnapshotDifference<'_>,
-        job: &str,
-    ) -> StoreResult<super::RevisionResult> {
-        let arrived: Vec<(String, String)> = difference
-            .records
-            .iter()
-            .map(|record| (record.key.clone(), record.content_hash.clone()))
-            .collect();
-        let root = verified_staging_root(difference.staging_root)?;
+    /// Reads the records a difference moves and measures what applying them
+    /// would cost, from the snapshot's catalog lengths and the rows the
+    /// library holds under each key. No page or manifest is read. The counts
+    /// describe the library as it is now; applying refuses any other revision.
+    pub(crate) fn decode_external_snapshot_difference(
+        &self,
+        staging_root: &Path,
+        records: &[ExternalSnapshotRecord],
+        removed: &[String],
+        catalog: &BTreeMap<String, u64>,
+    ) -> StoreResult<DecodedDifference> {
+        let root = verified_staging_root(staging_root)?;
         let content = ContentStore::open_existing(&root.join("external-storage"))?;
-        let cas = PayloadCas::new(&self.repository_root)?;
-        let mut removals = Vec::with_capacity(difference.removed.len());
-        for key in difference.removed {
+        let generation = active_generation(&self.connection)?;
+        let mut cost = DependentCost::default();
+        let mut removals = Vec::with_capacity(removed.len());
+        for key in removed {
             let locator = decode_logical_record_key(key)
                 .map_err(|_| validation("External snapshot logical key is invalid"))?;
             if matches!(locator, LogicalRecordLocator::Root) {
                 return invalid("External snapshot difference cannot remove the root record");
             }
-            removals.push(locator);
+            removals.push((key.clone(), locator));
         }
-        let mut arrivals = Vec::with_capacity(difference.records.len());
-        for record in difference.records {
+        let removed_characters: std::collections::BTreeSet<&str> = removals
+            .iter()
+            .filter_map(|(_, locator)| match locator {
+                LogicalRecordLocator::Character { character_id } => Some(character_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        for (_, locator) in &removals {
+            // A removed character's rows are counted once, with the character.
+            let beneath = match locator {
+                LogicalRecordLocator::Conversation { character_id, .. }
+                    if removed_characters.contains(character_id.as_str()) =>
+                {
+                    0
+                }
+                _ => rows_beneath(&self.connection, &generation, locator, true)?,
+            };
+            cost.work = cost.work.saturating_add(1 + beneath);
+        }
+        let mut decoded = Vec::with_capacity(records.len());
+        for record in records {
             let locator = decode_logical_record_key(&record.key)
                 .map_err(|_| validation("External snapshot logical key is invalid"))?;
-            arrivals.push(locator);
+            let envelope = read_record(&root, content.as_ref(), record, &locator)?;
+            let whole_character =
+                matches!(envelope, LogicalRecordEnvelope::ArchivedCharacter { .. });
+            let (bytes, work) = dependent_cost(catalog, &envelope)?;
+            cost.bytes = cost.bytes.saturating_add(bytes);
+            cost.work = cost.work.saturating_add(1 + work).saturating_add(rows_beneath(
+                &self.connection,
+                &generation,
+                &locator,
+                whole_character,
+            )?);
+            decoded.push(DecodedRecord {
+                key: record.key.clone(),
+                content_hash: record.content_hash.clone(),
+                locator,
+                envelope,
+            });
         }
+        Ok(DecodedDifference {
+            records: decoded,
+            removed: removals,
+            cost,
+        })
+    }
 
+    /// Resolves everything a decoded difference's rows are made from once its
+    /// objects are staged: owner manifests, message pages and the fields the
+    /// library keeps for itself. What it reads of the library is at the
+    /// revision the apply will require.
+    pub(crate) fn prepare_external_snapshot_difference(
+        &self,
+        decoded: DecodedDifference,
+        object_sizes: BTreeMap<String, u64>,
+    ) -> StoreResult<PreparedExternalDifference> {
+        let cas = PayloadCas::new(&self.repository_root)?;
+        let generation = active_generation(&self.connection)?;
+        let local_root = local_root(&self.connection, &generation)?;
+        let arrived = decoded
+            .records
+            .iter()
+            .map(|record| (record.key.clone(), record.content_hash.clone()))
+            .collect();
+        let (conversations, others): (Vec<_>, Vec<_>) = decoded
+            .records
+            .into_iter()
+            .partition(|record| matches!(record.locator, LogicalRecordLocator::Conversation { .. }));
+        let records = others
+            .into_iter()
+            .chain(conversations)
+            .map(|record| {
+                prepare_record(
+                    &self.connection,
+                    &cas,
+                    &generation,
+                    &object_sizes,
+                    record.locator,
+                    record.envelope,
+                    local_root.as_ref(),
+                )
+            })
+            .collect::<StoreResult<Vec<_>>>()?;
+        let (removed_keys, removed) = decoded.removed.into_iter().unzip();
+        Ok(PreparedExternalDifference {
+            records,
+            removed,
+            removed_keys,
+            arrived,
+            object_sizes,
+        })
+    }
+
+    /// Applies what the snapshot changed to the generation the library is
+    /// already using, so the records it left alone are neither rewritten nor
+    /// read. Everything the receive owes - rows, revision, the change index the
+    /// other backup consumers read, the connection's base and its record map,
+    /// and the job's completion - is one transaction, and nothing in it reads
+    /// or decodes a snapshot body.
+    pub(crate) fn apply_external_snapshot_difference(
+        &mut self,
+        expected_revision: i64,
+        difference: &PreparedExternalDifference,
+        job: &str,
+    ) -> StoreResult<super::RevisionResult> {
+        let cas = PayloadCas::new(&self.repository_root)?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let actual_revision = current_revision(&tx)?;
-        if actual_revision != difference.expected_revision {
+        if actual_revision != expected_revision {
             return Err(StoreError::RevisionConflict {
-                expected: difference.expected_revision,
+                expected: expected_revision,
                 actual: actual_revision,
             });
         }
@@ -221,52 +353,29 @@ impl PersistentStore {
         super::server_sync_outbox::begin_mutation(&tx, &generation, revision)?;
         super::content_change_index::begin_mutation(&tx, &generation, revision, "external")?;
 
-        let local_root = tx
-            .query_row(
-                "SELECT value FROM root WHERE generation=?1",
-                [&generation],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .map(|value| serde_json::from_str(&value))
-            .transpose()?;
         let mut touched = std::collections::BTreeSet::new();
-        // A conversation whose character arrives in the same difference has to
-        // follow it, exactly as a complete stage defers one behind its parent.
-        let ordered = arrivals
-            .iter()
-            .enumerate()
-            .filter(|(_, locator)| !matches!(locator, LogicalRecordLocator::Conversation { .. }))
-            .chain(
-                arrivals
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, locator)| {
-                        matches!(locator, LogicalRecordLocator::Conversation { .. })
-                    }),
-            )
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
+        let mut confirmed = std::collections::BTreeSet::new();
         // A character is removed with everything under it, so its conversations
         // need no separate removal and the order between them does not matter.
-        for locator in &removals {
+        for locator in &difference.removed {
             note_touched_character(&mut touched, locator);
             rows::apply_delete(&tx, &generation, locator)?;
         }
-        for index in ordered {
-            let locator = arrivals[index].clone();
-            note_touched_character(&mut touched, &locator);
-            apply_record(
+        for record in &difference.records {
+            note_touched_character(&mut touched, &record.locator);
+            // Staged bodies are confirmed rather than trusted: nothing may
+            // name one that is no longer there.
+            for required in &record.requires {
+                if confirmed.insert(required) {
+                    require_object(&cas, &difference.object_sizes, &required.0, required.1)?;
+                }
+            }
+            rows::apply_serialized_record(
                 &tx,
-                &cas,
                 &generation,
-                &generation,
-                &root,
-                content.as_ref(),
-                difference.object_sizes,
-                difference.records[index].clone(),
-                locator,
-                local_root.as_ref(),
+                &record.locator,
+                &record.envelope,
+                record.messages.as_deref(),
             )?;
         }
         for character in touched {
@@ -291,12 +400,104 @@ impl PersistentStore {
             &tx,
             job,
             super::external_storage_state::BaseRecords::Moved {
-                removed: difference.removed,
-                arrived: &arrived,
+                removed: &difference.removed_keys,
+                arrived: &difference.arrived,
             },
         )?;
         tx.commit()?;
         Ok(super::RevisionResult { revision })
+    }
+}
+
+/// The rows an apply deletes under a key besides the key's own: a
+/// conversation's messages, or, when the whole character goes, every message
+/// and conversation under it.
+fn rows_beneath(
+    connection: &rusqlite::Connection,
+    generation: &str,
+    locator: &LogicalRecordLocator,
+    whole_character: bool,
+) -> StoreResult<u64> {
+    let count: i64 = match locator {
+        LogicalRecordLocator::Character { character_id } if whole_character => connection
+            .query_row(
+                "SELECT (SELECT count(*) FROM messages WHERE generation=?1 AND character_id=?2)
+                      + (SELECT count(*) FROM conversations WHERE generation=?1 AND character_id=?2)",
+                params![generation, character_id],
+                |row| row.get(0),
+            )?,
+        LogicalRecordLocator::Conversation {
+            character_id,
+            conversation_id,
+        } => connection.query_row(
+            "SELECT count(*) FROM messages
+             WHERE generation=?1 AND character_id=?2 AND conversation_id=?3",
+            params![generation, character_id, conversation_id],
+            |row| row.get(0),
+        )?,
+        _ => 0,
+    };
+    Ok(count as u64)
+}
+
+/// What confirming one body inside the apply costs, in message rows: a checked
+/// `stat` of a library object against a row insert.
+pub(crate) const PRESENCE_CHECK_WORK: u64 = 128;
+
+/// The page and manifest bytes an envelope's rows are made from, and the
+/// message rows and body checks they add, from catalog lengths alone. A page
+/// holds at most `LOGICAL_MESSAGE_PAGE_SIZE` messages and a manifest names at
+/// most `entry_count` bodies, so both are counted at that bound.
+fn dependent_cost(
+    catalog: &BTreeMap<String, u64>,
+    envelope: &LogicalRecordEnvelope,
+) -> StoreResult<(u64, u64)> {
+    let length = |hash: &str| {
+        catalog
+            .get(hash)
+            .copied()
+            .ok_or_else(|| validation("External snapshot has an incomplete payload reference"))
+    };
+    let checks = |count: u64| count.saturating_mul(PRESENCE_CHECK_WORK);
+    let owners = |heads: &[crate::logical_records::LogicalOwnerHead]| -> StoreResult<(u64, u64)> {
+        let mut cost = (0u64, 0u64);
+        for head in heads {
+            if let Some(hash) = &head.manifest_hash {
+                cost.0 = cost.0.saturating_add(length(hash)?);
+                cost.1 = cost.1.saturating_add(checks(head.entry_count.saturating_add(1)));
+            }
+        }
+        Ok(cost)
+    };
+    match envelope {
+        LogicalRecordEnvelope::Root { owner_heads, .. }
+        | LogicalRecordEnvelope::Character { owner_heads, .. } => owners(owner_heads),
+        LogicalRecordEnvelope::ArchivedCharacter {
+            asset_hashes,
+            owner_heads,
+            ..
+        } => {
+            let (bytes, work) = owners(owner_heads)?;
+            Ok((bytes, work.saturating_add(checks(asset_hashes.len() as u64 + 1))))
+        }
+        LogicalRecordEnvelope::Conversation {
+            message_page_hashes,
+            ..
+        } => {
+            let mut bytes = 0u64;
+            for hash in message_page_hashes {
+                bytes = bytes.saturating_add(length(hash)?);
+            }
+            Ok((
+                bytes,
+                (message_page_hashes.len() as u64)
+                    .saturating_mul(crate::logical_records::LOGICAL_MESSAGE_PAGE_SIZE as u64),
+            ))
+        }
+        LogicalRecordEnvelope::Asset { .. } | LogicalRecordEnvelope::Inlay { .. } => {
+            Ok((0, checks(1)))
+        }
+        _ => Ok((0, 0)),
     }
 }
 
@@ -450,19 +651,30 @@ where
         });
     }
     let active = active_generation(&transaction)?;
-    let local_root = transaction
-        .query_row(
-            "SELECT value FROM root WHERE generation=?1",
-            [&active],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?
-        .map(|value| serde_json::from_str(&value))
-        .transpose()?;
+    let local_root = local_root(&transaction, &active)?;
 
     let mut hashes = BTreeMap::new();
     let mut deferred_conversations = Vec::new();
     let mut saw_root = false;
+    let stage = |record: ExternalSnapshotRecord, locator: LogicalRecordLocator| -> StoreResult<()> {
+        let envelope = read_record(staging_root, content, &record, &locator)?;
+        let prepared = prepare_record(
+            &transaction,
+            &cas,
+            &active,
+            objects,
+            locator,
+            envelope,
+            local_root.as_ref(),
+        )?;
+        rows::apply_serialized_record(
+            &transaction,
+            generation,
+            &prepared.locator,
+            &prepared.envelope,
+            prepared.messages.as_deref(),
+        )
+    };
     for record in records {
         let record = record?;
         let hash = validate_hash(&record.content_hash, "External logical record")?;
@@ -477,36 +689,14 @@ where
         if matches!(locator, LogicalRecordLocator::Conversation { .. }) {
             deferred_conversations.push((record, locator));
         } else {
-            apply_record(
-                &transaction,
-                &cas,
-                &active,
-                generation,
-                staging_root,
-                content,
-                objects,
-                record,
-                locator,
-                local_root.as_ref(),
-            )?;
+            stage(record, locator)?;
         }
     }
     if !saw_root {
         return invalid("External snapshot does not contain its root logical record");
     }
     for (record, locator) in deferred_conversations {
-        apply_record(
-            &transaction,
-            &cas,
-            &active,
-            generation,
-            staging_root,
-            content,
-            objects,
-            record,
-            locator,
-            local_root.as_ref(),
-        )?;
+        stage(record, locator)?;
     }
 
     transaction.execute(
@@ -533,32 +723,56 @@ where
     Ok(hashes)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn apply_record(
-    transaction: &Transaction<'_>,
-    cas: &PayloadCas,
-    active: &str,
+fn local_root(
+    connection: &rusqlite::Connection,
     generation: &str,
+) -> StoreResult<Option<serde_json::Value>> {
+    Ok(connection
+        .query_row(
+            "SELECT value FROM root WHERE generation=?1",
+            [generation],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|value| serde_json::from_str(&value))
+        .transpose()?)
+}
+
+/// Reads one record body, checks it against its catalog entry and key, and
+/// decodes it.
+fn read_record(
     staging_root: &Path,
     content: Option<&ContentStore>,
-    objects: &BTreeMap<String, u64>,
-    record: ExternalSnapshotRecord,
-    locator: LogicalRecordLocator,
-    local_root: Option<&serde_json::Value>,
-) -> StoreResult<()> {
-    if encode_logical_record_key(&locator)
+    record: &ExternalSnapshotRecord,
+    locator: &LogicalRecordLocator,
+) -> StoreResult<LogicalRecordEnvelope> {
+    if encode_logical_record_key(locator)
         .map_err(|_| validation("External snapshot logical key is invalid"))?
         != record.key
     {
         return invalid("External snapshot logical key is not canonical");
     }
-    let bytes = read_verified_record(staging_root, content, &record)?;
-    let mut envelope = decode_logical_record(&bytes)
+    let bytes = read_verified_record(staging_root, content, record)?;
+    let envelope = decode_logical_record(&bytes)
         .map_err(|_| validation("External snapshot logical record is invalid"))?;
-    rows::validate_locator_envelope(&locator, &envelope)?;
+    rows::validate_locator_envelope(locator, &envelope)?;
+    Ok(envelope)
+}
 
+/// Turns a decoded record into the rows it becomes: the fields this library
+/// keeps for itself carried over from `active`, owner data rehydrated, and
+/// message pages read and encoded as rows.
+fn prepare_record(
+    connection: &rusqlite::Connection,
+    cas: &PayloadCas,
+    active: &str,
+    objects: &BTreeMap<String, u64>,
+    locator: LogicalRecordLocator,
+    envelope: LogicalRecordEnvelope,
+    local_root: Option<&serde_json::Value>,
+) -> StoreResult<PreparedRecord> {
     let local_character = if let LogicalRecordLocator::Character { character_id } = &locator {
-        transaction
+        connection
             .query_row(
                 "SELECT detail FROM characters WHERE generation=?1 AND character_id=?2",
                 params![active, character_id],
@@ -576,17 +790,22 @@ fn apply_record(
         derived_objects: BTreeMap::new(),
     };
     preserve_local_view(&mut payload, local_character.as_ref(), local_root);
-    envelope = payload.record;
-
-    let messages = resolve_dependencies(cas, objects, &mut envelope)?;
-    rows::apply_materialized_record(
-        transaction,
-        generation,
+    let mut envelope = payload.record;
+    let mut requires = std::collections::BTreeSet::new();
+    let messages = resolve_dependencies(cas, objects, &mut envelope, &mut requires)?
+        .map(|messages| {
+            messages
+                .iter()
+                .map(rows::SerializedMessage::of)
+                .collect::<StoreResult<Vec<_>>>()
+        })
+        .transpose()?;
+    Ok(PreparedRecord {
         locator,
         envelope,
-        messages.as_deref(),
-    )?;
-    Ok(())
+        messages,
+        requires,
+    })
 }
 
 fn read_verified_record(
@@ -613,14 +832,17 @@ fn read_verified_record(
     Ok(bytes)
 }
 
+/// Reads and checks the bodies an envelope's rows are made from, and lists in
+/// `requires` the ones those rows go on referring to.
 fn resolve_dependencies(
     cas: &PayloadCas,
     objects: &BTreeMap<String, u64>,
     envelope: &mut LogicalRecordEnvelope,
+    requires: &mut std::collections::BTreeSet<(String, Option<u64>)>,
 ) -> StoreResult<Option<Vec<serde_json::Value>>> {
     match envelope {
         LogicalRecordEnvelope::Root { value, owner_heads } => {
-            let resolved = resolve_owner_heads(cas, objects, owner_heads)?;
+            let resolved = resolve_owner_heads(cas, objects, owner_heads, requires)?;
             rows::rehydrate_root_owners(value, &resolved)?;
             Ok(None)
         }
@@ -634,7 +856,7 @@ fn resolve_dependencies(
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| validation("External character ID is missing"))?
                 .to_owned();
-            let resolved = resolve_owner_heads(cas, objects, owner_heads)?;
+            let resolved = resolve_owner_heads(cas, objects, owner_heads, requires)?;
             rows::rehydrate_character_owner(detail, &character_id, &resolved)?;
             Ok(None)
         }
@@ -645,16 +867,17 @@ fn resolve_dependencies(
             owner_heads,
             ..
         } => {
-            require_object(
+            require(
                 cas,
                 objects,
+                requires,
                 archive_object_hash,
                 Some(*archive_object_size),
             )?;
             for hash in asset_hashes {
-                require_object(cas, objects, hash, None)?;
+                require(cas, objects, requires, hash, None)?;
             }
-            resolve_owner_heads(cas, objects, owner_heads)?;
+            resolve_owner_heads(cas, objects, owner_heads, requires)?;
             Ok(None)
         }
         LogicalRecordEnvelope::Conversation {
@@ -682,7 +905,7 @@ fn resolve_dependencies(
             let hash = object_hash
                 .as_deref()
                 .ok_or_else(|| validation("External alias is missing its complete payload"))?;
-            require_object(cas, objects, hash, Some(*size))?;
+            require(cas, objects, requires, hash, Some(*size))?;
             Ok(None)
         }
         // The store no longer holds cold payloads; the shared record format still carries the variant.
@@ -697,11 +920,12 @@ fn resolve_owner_heads(
     cas: &PayloadCas,
     objects: &BTreeMap<String, u64>,
     heads: &[crate::logical_records::LogicalOwnerHead],
+    requires: &mut std::collections::BTreeSet<(String, Option<u64>)>,
 ) -> StoreResult<Vec<rows::ResolvedOwnerHead>> {
     let mut resolved = Vec::with_capacity(heads.len());
     for head in heads {
         let tuples = if let Some(hash) = &head.manifest_hash {
-            require_object(cas, objects, hash, None)?;
+            require(cas, objects, requires, hash, None)?;
             let bytes = cas
                 .read_object(hash)?
                 .ok_or_else(|| validation("External owner manifest is missing from local CAS"))?;
@@ -717,7 +941,7 @@ fn resolve_owner_heads(
             let mut tuples = Vec::with_capacity(entries.len());
             for entry in entries {
                 if let Some(hash) = entry.payload_hash {
-                    require_object(cas, objects, &hex::encode(hash), None)?;
+                    require(cas, objects, requires, &hex::encode(hash), None)?;
                 }
                 tuples.push(serde_json::Value::Array(
                     entry
@@ -737,6 +961,22 @@ fn resolve_owner_heads(
         });
     }
     Ok(resolved)
+}
+
+fn require(
+    cas: &PayloadCas,
+    objects: &BTreeMap<String, u64>,
+    requires: &mut std::collections::BTreeSet<(String, Option<u64>)>,
+    hash: &str,
+    expected_size: Option<u64>,
+) -> StoreResult<()> {
+    // Owner entries often share a payload; each body is confirmed once.
+    let required = (hash.to_owned(), expected_size);
+    if !requires.contains(&required) {
+        require_object(cas, objects, hash, expected_size)?;
+        requires.insert(required);
+    }
+    Ok(())
 }
 
 fn require_object(
