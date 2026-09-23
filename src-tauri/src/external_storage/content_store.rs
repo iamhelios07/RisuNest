@@ -158,10 +158,10 @@ impl ContentStore {
         {
             None => (),
             Some(small_object_store::Pressure::Log) => {
-                return Err(invalid("Capture content store is waiting for its readers"))
+                return Err(invalid("Captured content could not be saved now"))
             }
             Some(small_object_store::Pressure::Space) => {
-                return Err(invalid("Not enough free space to store captured content"))
+                return Err(invalid("Not enough free space to save captured content"))
             }
         }
         let group = std::mem::take(&mut self.staged);
@@ -428,7 +428,7 @@ mod tests {
             match store.commit() {
                 Ok(()) => written.extend(group),
                 Err(error) => {
-                    assert!(error.to_string().contains("readers"), "{error}");
+                    assert!(error.to_string().contains("could not be saved now"), "{error}");
                     break group;
                 }
             }
