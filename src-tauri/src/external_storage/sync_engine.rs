@@ -872,9 +872,15 @@ async fn receive_remote(
         remote.document.state.object_id.trim_start_matches("snapshot-"),
         &remote.document.state,
     );
-    let _admission = app.state::<crate::native_file_jobs::NativeFileJobState>()
-        .admission.file(false).map_err(local_error)?;
+    // A download runs for as long as the provider takes, and nothing local
+    // may be held for that. The library is admitted for the reads and writes
+    // around it and released over the transfer itself.
+    let admission = app
+        .state::<crate::native_file_jobs::NativeFileJobState>()
+        .admission
+        .clone();
     let (observation, participation) = {
+        let _admission = admission.file(false).map_err(local_error)?;
         let mut store = pds(app)?;
         require_exact_receive_identity(expected, &store.external_identity().map_err(local_error)?)?;
         super::runtime::require_admitted_library(job, expected)?;
@@ -907,11 +913,14 @@ async fn receive_remote(
         }
         store.external_validate_receive(&job.id, &job.request.connection_id, expected, &observation)
             .map_err(|_| ProviderError::new(ErrorKind::PreconditionFailed))?;
-        (observation, receive_participation(&mut store)?)
+        let participation = receive_participation(&mut store)?;
+        drop(store);
+        // A process restart loses the native commit handle. Only this worker
+        // may revalidate the downloaded files and build another inactive
+        // generation.
+        discard_receive_preparation(app, &job.id)?;
+        (observation, participation)
     };
-    // A process restart loses the native commit handle. Only this worker may
-    // revalidate the downloaded files and build another inactive generation.
-    discard_receive_preparation(app, &job.id)?;
     let root = super::runtime::root(app)?;
     let directory = super::runtime::job_directory(&root, &job.request.connection_id, &job.id);
     let staging = directory.join("receive");
@@ -939,8 +948,10 @@ async fn receive_remote(
     let worker_head = observation;
     let worker_cancel = cancel.clone();
     let worker_staging = super::runtime::preparation_progress(&root, &job.id);
+    let worker_admission = admission.clone();
     let prepared = tokio::task::spawn_blocking(move || {
         worker_cancel.check()?;
+        let _admission = worker_admission.file(false).map_err(local_error)?;
         super::runtime::read_job_session(&worker_app, &worker_job.id)?;
         prepare_receive_input(&mut pds(&worker_app)?, &worker_job, worker_identity,
             worker_head, downloaded, sections, participation, &worker_staging, &worker_cancel)
@@ -968,6 +979,7 @@ async fn receive_remote(
         require_received_head(&prepared.authenticated_head,
             current.as_ref().map(|head| &head.observation))?;
         {
+            let _admission = admission.file(false).map_err(local_error)?;
             let mut store = pds(app)?;
             require_exact_receive_identity(&prepared.expected, &store.external_identity().map_err(local_error)?)?;
             store.external_validate_receive(&job.id, &job.request.connection_id,
@@ -994,7 +1006,12 @@ async fn receive_remote(
         Ok(result)
     }.await;
     if checked.is_err() {
-        if discard_receive_preparation(app, &job.id).is_err() {
+        let discarded = admission.file(false).map_err(local_error).and_then(|permit| {
+            let outcome = discard_receive_preparation(app, &job.id);
+            drop(permit);
+            outcome
+        });
+        if discarded.is_err() {
             crate::nlog!("error", "External receive preparation could not be discarded");
         }
     }
@@ -2626,20 +2643,26 @@ mod receive_tests {
         let staging = directory.path().join("received");
         fs::create_dir(&staging).unwrap();
         let job = bind(&mut store, "first");
-        let first = staged_snapshot(&staging, "first", vec![
-            root_at(&staging, "remote"),
-            character_at(&staging, "kept", 0),
-            character_at(&staging, "dropped", 1),
-            conversation_at(&staging, "kept", "chat", 10),
-            // The removed character takes this with it, without the snapshot
-            // having to name it.
-            conversation_at(&staging, "dropped", "gone", 5),
-            preset_at(&staging, "preset"),
-        ]);
+        let first = first_snapshot(&staging, "first");
         let prepared = prepare(&mut store, &job, first);
         let identity = job.admission_identity.clone();
         activate_prepared_receive(&mut store, &prepared, &identity).unwrap();
         (directory, store, staging)
+    }
+
+    fn first_snapshot(staging: &std::path::Path, id: &str)
+        -> super::super::snapshot_restore::PreparedRemoteSnapshot
+    {
+        staged_snapshot(staging, id, vec![
+            root_at(staging, "remote"),
+            character_at(staging, "kept", 0),
+            character_at(staging, "dropped", 1),
+            conversation_at(staging, "kept", "chat", 10),
+            // The removed character takes this with it, without the snapshot
+            // having to name it.
+            conversation_at(staging, "dropped", "gone", 5),
+            preset_at(staging, "preset"),
+        ])
     }
 
     fn second_snapshot(staging: &std::path::Path)
@@ -2665,6 +2688,31 @@ mod receive_tests {
         rows.map(|row| row.unwrap()).collect()
     }
 
+
+    /// A23 and §10.4's no-op. A snapshot that moves nothing has nothing to
+    /// stage, so the staging phase says nothing rather than replacing what the
+    /// download reported with a pair of zeroes.
+    #[test]
+    fn c_a_receive_with_nothing_to_move_leaves_the_reading_before_it() {
+        use crate::external_storage::phase_progress::PhaseProgress;
+        let (_directory, mut store, staging) = received_library();
+        let revision = store.revision().unwrap();
+        let job = bind(&mut store, "again");
+        let readings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected = std::sync::Arc::clone(&readings);
+        let progress = PhaseProgress::new(move |reading| collected.lock().unwrap().push(reading));
+        let prepared = prepare_counted(&mut store, &job, first_snapshot(&staging, "again"), &progress);
+        assert!(matches!(prepared.apply, PreparedApply::Difference(_)));
+        assert!(readings.lock().unwrap().is_empty());
+        assert_eq!(progress.read().total_items, 0);
+
+        // It is still a receive, so it still commits what the snapshot names.
+        let identity = job.admission_identity.clone();
+        assert_eq!(
+            activate_prepared_receive(&mut store, &prepared, &identity).unwrap(),
+            revision + 1,
+        );
+    }
 
     /// A23. A receive counts the staging it does, which is the part of a
     /// receive that costs. A replacement stages every record the snapshot
