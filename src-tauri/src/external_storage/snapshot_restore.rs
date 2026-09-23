@@ -2,7 +2,7 @@
 //! No PDS generation is activated here; the caller owns the subsequent staged
 //! apply and eventual cleanup of this durable verified directory.
 use super::{
-    content_store::ObjectSource,
+    content_store::{ContentStore, ObjectSource},
     package_cache::CatalogRange,
     contract::{
         Cancellation, ErrorKind, ObjectRole, Provider, ProviderError, ReadReceipt,
@@ -93,6 +93,52 @@ pub(crate) struct PreparedRemoteSnapshot {
     pub objects: Vec<PreparedObject>,
     /// The device whose own values the sections are, when there is one.
     pub captured_by_device: Option<String>,
+}
+
+/// Where a downloaded snapshot's record bodies live. The apply attaches to
+/// this same directory beside the staging root.
+fn content_store(staging_root: &Path) -> Result<ContentStore> {
+    ContentStore::open(&staging_root.join("external-storage")).map_err(transient)
+}
+
+#[cfg(test)]
+impl PreparedRemoteSnapshot {
+    /// A prepared body, wherever the plan put it: a record in the content store
+    /// beside the staging root, an asset in a staging file.
+    pub(super) fn body(&self, source: &ObjectSource) -> Vec<u8> {
+        match source {
+            ObjectSource::File(path) => fs::read(path).expect("prepared staging file"),
+            ObjectSource::Captured(digest) => content_store(&self.staging_root)
+                .expect("prepared content store")
+                .read_all(digest)
+                .expect("prepared record body"),
+            ObjectSource::Library(_) => panic!("a library body is not read through here"),
+        }
+    }
+    pub(super) fn record_body(&self, index: usize) -> Vec<u8> {
+        self.body(&self.records[index].source)
+    }
+    /// Drop every record body this plan prepared, so a run over the same
+    /// staging directory has to build them again.
+    pub(super) fn discard_record_bodies(&self) {
+        let mut content = content_store(&self.staging_root).expect("prepared content store");
+        for record in &self.records {
+            if let Some(path) = content
+                .file_path(&record.content_hash)
+                .expect("prepared record path")
+            {
+                fs::remove_file(path).expect("discard prepared record file");
+            }
+        }
+        let digests = self
+            .records
+            .iter()
+            .map(|record| record.content_hash.as_str())
+            .collect::<Vec<_>>();
+        content
+            .delete(&digests)
+            .expect("discard prepared record bodies");
+    }
 }
 
 fn ensure_directory(path: &Path) -> Result<()> {
@@ -554,7 +600,9 @@ struct LocalLibrary {
 struct ResolvedEntry {
     entry: CompleteEntry,
     digest: String,
-    destination: PathBuf,
+    /// Where an object's body is going to be written. A record has none,
+    /// because the content store decides where its body belongs.
+    destination: Option<PathBuf>,
     source: Option<ObjectSource>,
 }
 
@@ -563,6 +611,7 @@ struct ResolvedEntry {
 fn resolve_entries(
     entries: Vec<CompleteEntry>,
     staging_root: &Path,
+    content: &ContentStore,
     library: Option<LocalLibrary>,
     cancel: &Cancellation,
 ) -> Result<Vec<ResolvedEntry>> {
@@ -571,28 +620,35 @@ fn resolve_entries(
         .map(|library| PayloadCas::new(&library.root))
         .transpose()
         .map_err(transient)?;
-    let record_root = staging_root.join("records");
     let object_root = staging_root.join("objects");
-    ensure_directory(&record_root)?;
     ensure_directory(&object_root)?;
     let mut plan = Vec::with_capacity(entries.len());
     for entry in entries {
         cancel.check()?;
         let digest = hex::encode(entry.content_sha256);
-        let destination = match entry.kind {
-            wire::CatalogEntryKind::Record => record_root.join(&digest),
-            wire::CatalogEntryKind::Object => object_root.join(&digest),
+        let (destination, source) = match entry.kind {
+            // A record already in the content store is proved the same way a
+            // staging file was, by its length and then by its content.
+            wire::CatalogEntryKind::Record => {
+                let length = i64::try_from(entry.byte_length).map_err(corrupt)?;
+                let held = content.validate(&digest, length, true).is_ok();
+                (None, held.then(|| ObjectSource::Captured(digest.clone())))
+            }
+            wire::CatalogEntryKind::Object => {
+                let destination = object_root.join(&digest);
+                let mut source = verify(&destination, entry.byte_length, &digest)?
+                    .then(|| ObjectSource::File(destination.clone()));
+                if source.is_none() {
+                    if let Some(cas) = library.as_ref() {
+                        source = library_body(cas, &digest, entry.byte_length, prove)?;
+                    }
+                }
+                (Some(destination), source)
+            }
             wire::CatalogEntryKind::SectionEntry | wire::CatalogEntryKind::SectionObject => {
                 return Err(corrupt("section entry in library catalog"));
             }
         };
-        let mut source = verify(&destination, entry.byte_length, &digest)?
-            .then(|| ObjectSource::File(destination.clone()));
-        if source.is_none() && entry.kind == wire::CatalogEntryKind::Object {
-            if let Some(cas) = library.as_ref() {
-                source = library_body(cas, &digest, entry.byte_length, prove)?;
-            }
-        }
         plan.push(ResolvedEntry {
             entry,
             digest,
@@ -656,6 +712,7 @@ fn required_packs(
 fn materialize_entries(
     plan: Vec<ResolvedEntry>,
     packs: &BTreeMap<String, PathBuf>,
+    content: &mut ContentStore,
     cancel: &Cancellation,
     records: &mut BTreeMap<String, PreparedRecord>,
     objects: &mut BTreeMap<String, PreparedObject>,
@@ -668,6 +725,25 @@ fn materialize_entries(
             destination,
             source,
         } = resolved;
+        if source.is_none() && entry.kind == wire::CatalogEntryKind::Record {
+            // The store takes the body and decides where it belongs, so a
+            // record never becomes a plaintext file of its own that the apply
+            // has to copy into another store. The identity the catalog named
+            // is proved by the store, which is the check the file path wrote
+            // out by hand.
+            let bytes = assemble(&entry, packs)?;
+            content.put(&digest, &bytes).map_err(corrupt)?;
+            let source = ObjectSource::Captured(digest.clone());
+            insert_prepared(entry, digest, source, records, objects)?;
+            continue;
+        }
+        // A record the store already answers for has no file to write.
+        let Some(destination) = destination else {
+            let source =
+                source.ok_or_else(|| corrupt("restored record has neither source nor body"))?;
+            insert_prepared(entry, digest, source, records, objects)?;
+            continue;
+        };
         if source.is_none() {
             if destination.exists() {
                 fs::remove_file(&destination).map_err(transient)?;
@@ -725,38 +801,50 @@ fn materialize_entries(
             publish_verified(&partial, &destination, entry.byte_length, &digest)?;
         }
         let source = source.unwrap_or(ObjectSource::File(destination));
-        match entry.kind {
-            wire::CatalogEntryKind::Record => {
-                if records
-                    .insert(
-                        entry.key.clone(),
-                        PreparedRecord {
-                            key: entry.key,
-                            content_hash: digest,
-                            byte_length: entry.byte_length,
-                            source,
-                        },
-                    )
-                    .is_some()
-                {
-                    return Err(corrupt("duplicate logical record key"));
+        insert_prepared(entry, digest, source, records, objects)?;
+    }
+    Ok(())
+}
+
+/// File one materialized entry under the kind its catalog gave it.
+fn insert_prepared(
+    entry: CompleteEntry,
+    digest: String,
+    source: ObjectSource,
+    records: &mut BTreeMap<String, PreparedRecord>,
+    objects: &mut BTreeMap<String, PreparedObject>,
+) -> Result<()> {
+    match entry.kind {
+        wire::CatalogEntryKind::Record => {
+            if records
+                .insert(
+                    entry.key.clone(),
+                    PreparedRecord {
+                        key: entry.key,
+                        content_hash: digest,
+                        byte_length: entry.byte_length,
+                        source,
+                    },
+                )
+                .is_some()
+            {
+                return Err(corrupt("duplicate logical record key"));
+            }
+        }
+        wire::CatalogEntryKind::Object => {
+            let prepared = PreparedObject {
+                content_hash: digest.clone(),
+                byte_length: entry.byte_length,
+                source,
+            };
+            if let Some(old) = objects.insert(digest, prepared.clone()) {
+                if old.byte_length != prepared.byte_length {
+                    return Err(corrupt("conflicting content object"));
                 }
             }
-            wire::CatalogEntryKind::Object => {
-                let prepared = PreparedObject {
-                    content_hash: digest.clone(),
-                    byte_length: entry.byte_length,
-                    source,
-                };
-                if let Some(old) = objects.insert(digest, prepared.clone()) {
-                    if old.byte_length != prepared.byte_length {
-                        return Err(corrupt("conflicting content object"));
-                    }
-                }
-            }
-            wire::CatalogEntryKind::SectionEntry | wire::CatalogEntryKind::SectionObject => {
-                return Err(corrupt("section entry in library catalog"));
-            }
+        }
+        wire::CatalogEntryKind::SectionEntry | wire::CatalogEntryKind::SectionObject => {
+            return Err(corrupt("section entry in library catalog"));
         }
     }
     Ok(())
@@ -1031,7 +1119,14 @@ pub(crate) async fn download_snapshot(
     };
     let cpu = cpu_permit().await?;
     let plan = tokio::task::spawn_blocking(move || {
-        resolve_entries(library_entries, &library_staging, library, &library_cancel)
+        let content = content_store(&library_staging)?;
+        resolve_entries(
+            library_entries,
+            &library_staging,
+            &content,
+            library,
+            &library_cancel,
+        )
     })
     .await
     .map_err(transient)??;
@@ -1047,17 +1142,23 @@ pub(crate) async fn download_snapshot(
     )
     .await?;
     let library_cancel = cancel.clone();
+    let content_staging = staging_root.to_path_buf();
     let cpu = cpu_permit().await?;
     let (records, objects) = tokio::task::spawn_blocking(move || {
+        let mut content = content_store(&content_staging)?;
         let mut records = BTreeMap::new();
         let mut objects = BTreeMap::new();
         materialize_entries(
             plan,
             &pack_paths,
+            &mut content,
             &library_cancel,
             &mut records,
             &mut objects,
         )?;
+        // The apply reads this store on its own connection, so the last group
+        // has to be durable before a plan naming it leaves here.
+        content.commit().map_err(transient)?;
         Ok((records, objects))
     })
     .await

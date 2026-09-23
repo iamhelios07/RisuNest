@@ -3685,7 +3685,7 @@ mod tests {
             .unwrap();
             assert_eq!(restored.snapshot_id, "snapshot-2");
             assert_eq!(restored.records.len(), 1);
-            assert_eq!(fs::read(restored.records[0].source.file().unwrap()).unwrap(), b"record two");
+            assert_eq!(restored.record_body(0), b"record two");
             let asset = restored
                 .objects
                 .iter()
@@ -3703,9 +3703,7 @@ mod tests {
                 .join(format!("{}.cipher", pack.ciphertext_sha256));
             fs::write(&pack_plaintext, vec![0; pack.plaintext_length as usize]).unwrap();
             fs::write(&pack_ciphertext, vec![0; pack.receipt.byte_length as usize]).unwrap();
-            for record in &restored.records {
-                fs::remove_file(record.source.file().unwrap()).unwrap();
-            }
+            restored.discard_record_bodies();
             for object in &restored.objects {
                 fs::remove_file(object.source.file().unwrap()).unwrap();
             }
@@ -3721,7 +3719,7 @@ mod tests {
             )
             .await
             .unwrap();
-            assert_eq!(fs::read(repaired.records[0].source.file().unwrap()).unwrap(), b"record two");
+            assert_eq!(repaired.record_body(0), b"record two");
             let mut repaired_plaintext =
                 crate::trust_boundary::open_regular_source(&pack_plaintext).unwrap();
             assert_eq!(
@@ -3783,7 +3781,7 @@ mod tests {
                     limits(128 * 1024), None, &mut second_journal, &provider, &repository, &PhaseProgress::silent(), &cancel).await.unwrap();
                 let restored = snapshot_restore::download_snapshot(&second.reference, &root.path().join("restored"),
                     &key, None, snapshot_restore::SourceTrust::Downloaded, &provider, &repository, &crate::external_storage::phase_progress::PhaseProgress::silent(), &cancel).await.unwrap();
-                assert_eq!(fs::read(restored.records[0].source.file().unwrap()).unwrap(), b"record");
+                assert_eq!(restored.record_body(0), b"record");
                 assert!(restored.objects.iter().any(|object| fs::read(object.source.file().unwrap()).unwrap() == b"asset"));
                 assert_eq!(provider.upload_attempts(&retained.object_id), 1);
                 assert!(!first_journal.spool_path(&first.reference.object_id).exists());
@@ -3792,6 +3790,69 @@ mod tests {
                     assert_ne!(first.asset_catalog.object_id, second.asset_catalog.object_id);
                 }
             }
+        });
+    }
+
+    /// A received record is a body in the bounded content store beside the
+    /// staging root, not a plaintext file of its own that the apply then has
+    /// to copy into another store. The staging directory holds a file per
+    /// asset and none per record.
+    #[test]
+    fn c_a_receive_holds_records_in_its_store_and_not_in_staging_files() {
+        runtime().block_on(async {
+            const RECORDS: usize = 24;
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let key = [41; 32];
+            let cancel = Cancellation::default();
+            let cas = PayloadCas::new(root.path()).unwrap();
+            let asset = cas.prepare_bytes(b"asset").unwrap();
+            let external = root.path().join("external-storage");
+            let mut catalog = crate::external_storage::capture::CaptureCatalog::create(
+                &external.join("captures").join("capture"), &external, None).unwrap();
+            let identity = CaptureIdentity {
+                store_id: "store".into(),
+                library_epoch: "epoch".into(),
+                generation: "generation".into(),
+                selection_epoch: "selection".into(),
+                revision: 1,
+            };
+            catalog.begin(&identity, None).unwrap();
+            for index in 0..RECORDS {
+                catalog.record(&format!("record-{index:02}"), format!("body {index}").as_bytes()).unwrap();
+            }
+            catalog.reference("record-00", &asset.content_hash, asset.byte_size).unwrap();
+            catalog.finish().unwrap();
+            let capture = CapturedSnapshot {
+                id: "capture".into(),
+                identity,
+                catalog,
+                projected_records: RECORDS,
+                shared: false,
+            };
+            let meta = metadata("snapshot", &capture);
+            let mut journal = journal(&root.path().join("job"), "job", &capture);
+            let completed = package_and_upload(capture, vec![], root.path(), &root.path().join("cache"),
+                meta, &key, limits(128 * 1024), None, &mut journal, &provider, &repository,
+                &PhaseProgress::silent(), &cancel).await.unwrap();
+            let staging = root.path().join("restored");
+            let restored = snapshot_restore::download_snapshot(&completed.reference, &staging, &key,
+                None, snapshot_restore::SourceTrust::Downloaded, &provider, &repository,
+                &crate::external_storage::phase_progress::PhaseProgress::silent(), &cancel).await.unwrap();
+
+            assert_eq!(restored.records.len(), RECORDS);
+            assert!(!staging.join("records").exists());
+            let bodies = restored.records.iter().map(|record| {
+                assert!(matches!(record.source, ObjectSource::Captured(_)), "{}", record.key);
+                (record.key.clone(), restored.body(&record.source))
+            }).collect::<BTreeMap<_, _>>();
+            for index in 0..RECORDS {
+                assert_eq!(bodies[&format!("record-{index:02}")], format!("body {index}").into_bytes());
+            }
+            assert_eq!(restored.objects.len(), 1);
+            assert_eq!(restored.body(&restored.objects[0].source), b"asset");
+            assert_eq!(fs::read_dir(staging.join("objects")).unwrap().count(), 1);
         });
     }
 
@@ -3833,7 +3894,7 @@ mod tests {
             }
             assert_eq!(second.records.len(), first.records.len());
             assert_eq!(second.objects.len(), first.objects.len());
-            assert_eq!(fs::read(second.records[0].source.file().unwrap()).unwrap(), b"record");
+            assert_eq!(second.record_body(0), b"record");
             assert!(second.objects.iter()
                 .any(|object| fs::read(object.source.file().unwrap()).unwrap() == b"asset"));
         });
@@ -3881,7 +3942,7 @@ mod tests {
                 .find(|object| object.content_hash == held.content_hash).unwrap();
             assert!(matches!(&object.source, ObjectSource::Library(digest) if *digest == held.content_hash));
             assert_eq!(received.records.len(), 1);
-            assert_eq!(fs::read(received.records[0].source.file().unwrap()).unwrap(), b"record-v2");
+            assert_eq!(received.record_body(0), b"record-v2");
 
             // A restore proves everything it consumes, so the same snapshot read
             // under that policy fetches the asset pack after all.
@@ -4222,7 +4283,7 @@ mod tests {
                 .any(|object| object.object_id == retained.object_id));
             let restored = snapshot_restore::download_snapshot(&replacement.reference,
                 &root.path().join("restored"), &key, None, snapshot_restore::SourceTrust::Downloaded, &provider, &repository, &crate::external_storage::phase_progress::PhaseProgress::silent(), &cancel).await.unwrap();
-            assert_eq!(fs::read(restored.records[0].source.file().unwrap()).unwrap(), b"record");
+            assert_eq!(restored.record_body(0), b"record");
             assert!(restored.objects.iter().any(|object| fs::read(object.source.file().unwrap()).unwrap() == b"asset"));
         });
     }
@@ -4688,7 +4749,7 @@ mod tests {
                 snapshot_restore::SourceTrust::Downloaded, &provider, &repository, &crate::external_storage::phase_progress::PhaseProgress::silent(), &cancel,
             ).await.unwrap();
             assert_eq!(
-                fs::read(restored.records[0].source.file().unwrap()).unwrap(),
+                restored.record_body(0),
                 grown,
             );
         });
@@ -5350,7 +5411,7 @@ mod tests {
             )
             .await
             .unwrap();
-            assert_eq!(fs::read(restored.records[0].source.file().unwrap()).unwrap(), record);
+            assert_eq!(restored.record_body(0), record);
         });
     }
 

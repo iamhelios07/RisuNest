@@ -21,7 +21,6 @@ use risunest_external_storage_format::{
     snapshot as wire,
 };
 use std::{
-    fs::File,
     path::Path,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -472,9 +471,9 @@ fn daily_download_resume_preserves_verified_packs_and_durable_budget() {
         assert_eq!(prepared.records.len(), 1);
         assert_eq!(prepared.records[0].content_hash, source_hash);
         assert_eq!(prepared.records[0].byte_length, source.len() as u64);
-        let mut restored = File::open(prepared.records[0].source.file().unwrap()).unwrap();
+        let restored = prepared.record_body(0);
         assert_eq!(
-            hex::encode(hash_reader(&mut restored, source.len() as u64).unwrap()),
+            hex::encode(hash_reader(&mut restored.as_slice(), source.len() as u64).unwrap()),
             source_hash
         );
         assert_eq!(

@@ -101,9 +101,9 @@ impl PersistentStore {
         }
 
         let root = verified_staging_root(application.staging_root)?;
-        // A snapshot assembled from a local capture names bodies the capture
-        // store beside it holds. One that arrived over the wire stages only
-        // files, and its staging directory has no such store.
+        // Record bodies are asked for by identity, whether a local capture
+        // named them or a receive decoded them into the job's own store. Only
+        // a caller that offers neither leaves this directory absent.
         let content = ContentStore::open_existing(&root.join("external-storage"))?;
         let stage = self.replace_begin()?;
         let staged = (|| {
@@ -326,9 +326,9 @@ fn verified_staging_root(root: &Path) -> StoreResult<PathBuf> {
     Ok(fs::canonicalize(root)?)
 }
 
-/// One snapshot input. A downloaded body is a file confined to the staging
-/// directory it arrived in; a captured body is asked for by identity, wherever
-/// the capture store put it.
+/// One snapshot input. A downloaded asset is a file confined to the staging
+/// directory it arrived in; a record body is asked for by identity, wherever
+/// the content store beside it put it.
 fn open_snapshot_input(
     root: &Path,
     content: Option<&ContentStore>,
