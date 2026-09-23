@@ -1961,12 +1961,14 @@ impl PersistentStore {
         &mut self,
         prepared: PreparedReplaceCommit,
         job: &str,
+        records: &std::collections::BTreeMap<String, String>,
     ) -> StoreResult<RevisionResult> {
         commit::replace_commit_from_external(
             &mut self.connection,
             &prepared.staging_id,
             prepared.revision,
             job,
+            records,
         )
     }
 

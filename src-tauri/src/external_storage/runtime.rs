@@ -1964,7 +1964,7 @@ mod tests {
         let stage = store.replace_begin().unwrap();
         store.replace_put_root(&stage.staging_id, &json!({"marker":"synthetic-remote"})).unwrap();
         let prepared = store.prepare_replace_commit(&stage.staging_id, Some(0)).unwrap();
-        store.finish_external_receive(prepared, &job.id).unwrap();
+        store.finish_external_receive(prepared, &job.id, &Default::default()).unwrap();
         job.request.kind = JobKind::ResolveConflict;
         for _ in 0..2 {
             let result = completed_job_result(&mut store, &job).unwrap().unwrap();

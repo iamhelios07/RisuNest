@@ -42,6 +42,10 @@ pub(crate) struct PreparedReceive {
     expected: CaptureIdentity,
     authenticated_head: String,
     commit: PreparedReplaceCommit,
+    /// What the snapshot names under each logical key. The stage refuses a set
+    /// whose fingerprint is not the catalog's, so a prepared receive is what
+    /// makes this the snapshot's own record map rather than a copy of a plan.
+    records: std::collections::BTreeMap<String, String>,
     participation: ReceiveParticipation,
     sections: Vec<super::sections::PreparedSectionInput>,
 }
@@ -178,6 +182,11 @@ fn prepare_receive_input(
         scope_id: &scope_id,
         fingerprint: &fingerprint,
     };
+    let record_map = downloaded
+        .records
+        .iter()
+        .map(|record| (record.key.clone(), record.content_hash.clone()))
+        .collect();
     let records = downloaded.records.into_iter().map(|record| Ok(ExternalSnapshotRecord {
         key: record.key, content_hash: record.content_hash,
         byte_length: record.byte_length, source: record.source,
@@ -190,7 +199,7 @@ fn prepare_receive_input(
     Ok(PreparedReceive {
         job_id: job.id.clone(), connection_id: job.request.connection_id.clone(),
         snapshot_id: downloaded.snapshot_id, expected, authenticated_head, commit,
-        participation, sections,
+        records: record_map, participation, sections,
     })
 }
 
@@ -222,7 +231,7 @@ fn activate_prepared_receive(
         for section in &prepared.sections {
             super::sections::apply_prepared_section(store, section)?;
         }
-        store.finish_external_receive(commit, &prepared.job_id)
+        store.finish_external_receive(commit, &prepared.job_id, &prepared.records)
             .map(|result| result.revision).map_err(local_error)
     })();
     if let Err(error) = &result {
