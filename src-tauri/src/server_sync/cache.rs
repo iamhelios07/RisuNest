@@ -852,13 +852,32 @@ mod tests {
         let stored = cache
             .project(&payload, &dependencies, &relations, scopes)
             .unwrap();
-        assert!(take_put_calls() > 0);
+        let bodies = take_put_calls();
+        assert!(bodies > 0);
         assert_eq!(named.version, stored.version);
         assert_eq!(named.objects, stored.objects);
         assert_eq!(named.local_hash, stored.local_hash);
         // More than the record object and its descriptor, so the chunks and
         // the reference pages were named by both.
         assert!(named.objects.len() > 2);
+
+        // The saving is on a record the cache already holds, which is every
+        // record a validating caller is looking at: the persisting path still
+        // walks each body through `put` to stat it and read it back, and the
+        // identity path touches none of them.
+        take_put_calls();
+        assert_eq!(
+            cache
+                .projected_identity(&payload, &dependencies, &relations, vec!["plugin-storage".into()])
+                .unwrap()
+                .version,
+            stored.version,
+        );
+        assert_eq!(take_put_calls(), 0);
+        cache
+            .project(&payload, &dependencies, &relations, vec!["plugin-storage".into()])
+            .unwrap();
+        assert_eq!(take_put_calls(), bodies);
     }
 
     #[test]

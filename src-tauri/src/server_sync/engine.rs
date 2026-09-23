@@ -1423,7 +1423,10 @@ impl PersistentStore {
                                     .download(&dependencies, &base_candidates)?;
                             }
 
-                            let expected = cache.project(
+                            // The record this names arrived whole, so what it
+                            // says about itself is checked against what the
+                            // projection would name, not by writing it again.
+                            let expected = cache.projected_identity(
                                 &payload,
                                 &dependencies,
                                 &relations(&dirty)?,
@@ -2480,6 +2483,8 @@ impl PersistentStore {
                     let (payload, _) = cache.restore(&record.version)?;
                     let key = key_parts(&record.key, revision)?;
                     let dependencies = cache.dependencies(&payload)?;
+                    // The capture reads every object this names out of the
+                    // cache, so the projection stays on the persisting path.
                     let projected = cache.project(&payload, &dependencies, &relations(&key)?, scopes(&key))?;
                     if projected.version != record.version {
                         return Err(SyncError::new("server-descriptor-semantics-mismatch", 409));
@@ -2504,7 +2509,10 @@ impl PersistentStore {
                         .map_err(|_| SyncError::new("invalid-server-payload", 409))?;
                     let key = key_parts(&record.key, revision)?;
                     let dependencies = projection::dependencies(&payload, &cas)?;
-                    if cache.project(&payload, &dependencies, &relations(&key)?, scopes(&key))?.version != record.version {
+                    // Nothing past this reads the projected objects back, and
+                    // the conflict body it is checking is already durable in
+                    // the repository it was read from.
+                    if cache.projected_identity(&payload, &dependencies, &relations(&key)?, scopes(&key))?.version != record.version {
                         return Err(SyncError::new("server-descriptor-semantics-mismatch", 409));
                     }
                     Some(payload)
@@ -2738,6 +2746,8 @@ impl PersistentStore {
                 }
                 if let Some(payload) = record.payload.as_ref() {
                     let dirty = key_parts(&record.key, source.local_revision())?;
+                    // A restore builds the target cache as it goes, so this
+                    // projection is what puts the record's own objects there.
                     if cache.project(
                         payload,
                         &dependencies,
