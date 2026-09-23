@@ -59,6 +59,9 @@ pub(crate) struct ContentStore {
     /// on this store sees them exactly as it sees written ones.
     staged: BTreeMap<String, Vec<u8>>,
     staged_bytes: usize,
+    /// What the checkpoint after the last group left in the log.
+    checkpoint: small_object_store::Checkpoint,
+    wal_high_water: u64,
 }
 
 impl ContentStore {
@@ -87,6 +90,8 @@ impl ContentStore {
             db,
             staged: BTreeMap::new(),
             staged_bytes: 0,
+            checkpoint: small_object_store::Checkpoint::UNKNOWN,
+            wal_high_water: small_object_store::WAL_HIGH_WATER_BYTES,
         })
     }
 
@@ -134,10 +139,30 @@ impl ContentStore {
     }
 
     /// Make the staged group durable. Callers do this before recording the
-    /// references that name it.
+    /// references that name it. A log readers are holding or a volume without
+    /// room refuses the group and keeps it staged; groups already written stay
+    /// written.
     pub(crate) fn commit(&mut self) -> Result<()> {
         if self.staged.is_empty() {
             return Ok(());
+        }
+        let available = fs2::available_space(&self.objects)?;
+        match small_object_store::admit(
+            &self.db,
+            &mut self.checkpoint,
+            self.wal_high_water,
+            self.staged_bytes as u64,
+            available,
+        )
+        .map_err(|_| invalid("Capture content store is unavailable"))?
+        {
+            None => (),
+            Some(small_object_store::Pressure::Log) => {
+                return Err(invalid("Capture content store is waiting for its readers"))
+            }
+            Some(small_object_store::Pressure::Space) => {
+                return Err(invalid("Not enough free space to store captured content"))
+            }
         }
         let group = std::mem::take(&mut self.staged);
         self.staged_bytes = 0;
@@ -152,8 +177,10 @@ impl ContentStore {
         .map_err(|_| invalid("Existing capture object differs"))?;
         tx.commit()?;
         // Between groups, never inside one. A reader on another connection can
-        // leave the log where it is; this group is already durable.
-        let _ = self.db.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
+        // leave the log where it is; this group is already durable, and what
+        // the checkpoint leaves decides whether the next one is admitted.
+        self.checkpoint = small_object_store::checkpoint(&self.db)
+            .unwrap_or(small_object_store::Checkpoint::UNKNOWN);
         Ok(())
     }
 
@@ -275,6 +302,11 @@ impl ContentStore {
         Ok(removed)
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_wal_high_water(&mut self, bytes: u64) {
+        self.wal_high_water = bytes;
+    }
+
     /// Publish through the file layout whatever the size, so a measurement can
     /// compare the two placements over the same bodies.
     #[cfg(test)]
@@ -367,6 +399,55 @@ mod tests {
         // Offering one identity's bytes under another is never a placement.
         assert!(store.put(&digest(&large), &small).is_err());
         assert!(store.stat(&digest(&body(3, 8))).unwrap().is_none());
+    }
+
+    /// A reader holding the log stops a capture before its log passes the
+    /// mark by more than one group, keeps the refused group staged, and lets
+    /// the same group land once the reader is gone.
+    #[test]
+    fn a_held_reader_refuses_the_next_group_and_its_release_admits_it() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = ContentStore::open(root.path()).unwrap();
+        store.set_wal_high_water(512 * 1024);
+        let first = body(1, 4096);
+        store.put(&digest(&first), &first).unwrap();
+        store.commit().unwrap();
+        let reader = rusqlite::Connection::open(root.path().join("content.sqlite")).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let _: i64 = reader
+            .query_row("SELECT count(*) FROM small_objects", [], |r| r.get(0))
+            .unwrap();
+        let mut written = vec![first];
+        let refused = loop {
+            let group = (0..32)
+                .map(|index| body(1000 + written.len() * 32 + index, 4096))
+                .collect::<Vec<_>>();
+            for bytes in &group {
+                store.put(&digest(bytes), bytes).unwrap();
+            }
+            match store.commit() {
+                Ok(()) => written.extend(group),
+                Err(error) => {
+                    assert!(error.to_string().contains("readers"), "{error}");
+                    break group;
+                }
+            }
+            assert!(written.len() < 32 * 64, "the held reader never stopped the capture");
+        };
+        let log = std::fs::metadata(root.path().join("content.sqlite-wal")).unwrap().len();
+        assert!(log < 2 * 1024 * 1024, "the log reached {log} bytes");
+        // The refused group is still what the capture holds.
+        for bytes in &refused {
+            assert_eq!(&store.read_all(&digest(bytes)).unwrap(), bytes);
+        }
+        reader.execute_batch("COMMIT").unwrap();
+        drop(reader);
+        store.commit().unwrap();
+        drop(store);
+        let store = ContentStore::open(root.path()).unwrap();
+        for bytes in written.iter().chain(&refused) {
+            assert_eq!(&store.read_all(&digest(bytes)).unwrap(), bytes);
+        }
     }
 
     #[test]

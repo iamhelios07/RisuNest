@@ -7,7 +7,9 @@
 //!
 //! It owns no threads, locks, scheduler, encryption or collection policy. The
 //! caller supplies the connection or transaction, decides which objects are
-//! small enough to belong here, and keeps its own large-object path.
+//! small enough to belong here, and keeps its own large-object path. It does
+//! report when the owner's log or volume cannot take another bulk group, so
+//! every owner stops admitting groups by the same measure.
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use sha2::{Digest, Sha256};
@@ -189,6 +191,82 @@ pub fn page(db: &Connection, after: &str, limit: usize) -> Result<Vec<(String, u
     Ok(rows)
 }
 
+/// The committed log an owner lets bulk groups leave uncopied into its
+/// database before it stops admitting more.
+pub const WAL_HIGH_WATER_BYTES: u64 = 64 * 1024 * 1024;
+
+/// What a passive checkpoint left behind.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Checkpoint {
+    /// A reader kept some committed frames from being copied back.
+    pub busy: bool,
+    /// Committed log bytes the database file does not hold yet.
+    pub pending_bytes: u64,
+}
+
+impl Checkpoint {
+    /// Nothing is known about the log, so the next admission measures it.
+    pub const UNKNOWN: Self = Self {
+        busy: true,
+        pending_bytes: u64::MAX,
+    };
+}
+
+/// Copy what the log holds back into the database as far as readers allow,
+/// and report what is still pending. A log that was fully copied back is
+/// reused from its start even though its file keeps its length, so only
+/// pending frames count, never the file's size.
+pub fn checkpoint(db: &Connection) -> Result<Checkpoint> {
+    // The first column only reports a blocked RESTART, FULL or TRUNCATE; a
+    // passive checkpoint that a reader held back says so in the counts.
+    let (log, copied): (i64, i64) =
+        db.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| {
+            Ok((r.get(1)?, r.get(2)?))
+        })?;
+    let page: i64 = db.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+    // A frame is one page plus its 24-byte header. Outside WAL mode both
+    // counts are -1 and nothing is pending.
+    let frames = (log - copied).max(0) as u64;
+    Ok(Checkpoint {
+        busy: frames > 0,
+        pending_bytes: frames.saturating_mul(page.max(0) as u64 + 24),
+    })
+}
+
+/// Why an owner should not write another bulk group now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pressure {
+    /// Readers are holding more committed log than the owner allows.
+    Log,
+    /// The volume cannot take the group and the log it may still grow into.
+    Space,
+}
+
+/// Whether an owner may write a group of `group_bytes` now. `last` is the
+/// checkpoint the owner recorded after its previous group; when that left the
+/// log above `high_water` this checkpoints once more, since the reader that
+/// held it may be gone, and refuses rather than waiting. A group is written
+/// twice, into the log and then into the database, and the log may still grow
+/// to `high_water`, so `available` bytes on the volume must cover all of it.
+pub fn admit(
+    db: &Connection,
+    last: &mut Checkpoint,
+    high_water: u64,
+    group_bytes: u64,
+    available: u64,
+) -> Result<Option<Pressure>> {
+    if last.pending_bytes > high_water {
+        *last = checkpoint(db)?;
+        if last.pending_bytes > high_water {
+            return Ok(Some(Pressure::Log));
+        }
+    }
+    let needed = group_bytes
+        .saturating_mul(2)
+        .saturating_add(high_water.saturating_sub(last.pending_bytes));
+    Ok((available < needed).then_some(Pressure::Space))
+}
+
 /// Remove a group of bodies in the caller's transaction. The caller owns the
 /// decision that they are unreferenced; this returns how many rows it removed.
 pub fn delete_batch(tx: &Transaction<'_>, hashes: &[&str]) -> Result<usize> {
@@ -302,6 +380,112 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(read(&db, &hash, 1024), Err(StoreError::Corrupt)));
+    }
+
+    fn insert(db: &mut Connection, bodies: &[Vec<u8>]) {
+        let hashes = bodies.iter().map(|b| identity(b)).collect::<Vec<_>>();
+        let tx = db.transaction().unwrap();
+        insert_batch(
+            &tx,
+            &hashes
+                .iter()
+                .zip(bodies)
+                .map(|(hash, bytes)| (hash.as_str(), bytes.as_slice()))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    /// 64 distinct bodies of 4 KiB each.
+    fn group(first: usize) -> Vec<Vec<u8>> {
+        (first..first + 64)
+            .map(|index| {
+                let mut bytes = body(index);
+                bytes.resize(4096, (index % 251) as u8);
+                bytes
+            })
+            .collect()
+    }
+
+    /// A reader holding its snapshot keeps the log from being copied back, so
+    /// admission stops at the mark instead of letting the log grow, and
+    /// resumes once the reader lets go even though the log file kept its
+    /// length.
+    #[test]
+    fn a_held_reader_stops_admission_at_the_mark_and_its_release_resumes_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("objects.sqlite");
+        let log_path = directory.path().join("objects.sqlite-wal");
+        let mut db = open(&path);
+        db.execute_batch("PRAGMA wal_autocheckpoint=0;").unwrap();
+        insert(&mut db, &group(0));
+        let reader = Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let _: i64 = reader
+            .query_row(&format!("SELECT count(*) FROM {TABLE}"), [], |r| r.get(0))
+            .unwrap();
+        let high_water = 1024 * 1024;
+        let group_bytes = 64 * 4096;
+        let mut last = checkpoint(&db).unwrap();
+        let before = std::fs::metadata(&log_path).unwrap().len();
+        let mut largest = 0;
+        let mut written = 1;
+        while admit(&db, &mut last, high_water, group_bytes, u64::MAX)
+            .unwrap()
+            .is_none()
+        {
+            let length = std::fs::metadata(&log_path).unwrap().len();
+            insert(&mut db, &group(written * 64));
+            largest = largest.max(std::fs::metadata(&log_path).unwrap().len() - length);
+            written += 1;
+            last = checkpoint(&db).unwrap();
+            assert!(last.busy, "the held reader let the checkpoint finish");
+            assert!(written < 64, "admission never stopped");
+        }
+        assert_eq!(
+            admit(&db, &mut last, high_water, group_bytes, u64::MAX).unwrap(),
+            Some(Pressure::Log)
+        );
+        let held = std::fs::metadata(&log_path).unwrap().len();
+        // At most one group past the mark: the one admitted just below it.
+        assert!(
+            held - before <= high_water + largest,
+            "the log grew by {} past {before}",
+            held - before
+        );
+        reader.execute_batch("COMMIT").unwrap();
+        drop(reader);
+        assert_eq!(
+            admit(&db, &mut last, high_water, group_bytes, u64::MAX).unwrap(),
+            None
+        );
+        assert_eq!(last.pending_bytes, 0);
+        assert_eq!(
+            std::fs::metadata(&log_path).unwrap().len(),
+            held,
+            "a copied-back log is reused where it is, not shrunk first"
+        );
+        insert(&mut db, &group(written * 64));
+        assert_eq!(page(&db, "", 100_000).unwrap().len(), (written + 1) * 64);
+    }
+
+    #[test]
+    fn admission_leaves_room_for_the_group_and_the_log_it_may_still_grow_into() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = open(&directory.path().join("objects.sqlite"));
+        let mut last = checkpoint(&db).unwrap();
+        assert_eq!(last.pending_bytes, 0);
+        let high_water = 1000;
+        assert_eq!(admit(&db, &mut last, high_water, 100, 1200).unwrap(), None);
+        assert_eq!(
+            admit(&db, &mut last, high_water, 100, 1199).unwrap(),
+            Some(Pressure::Space)
+        );
+        // An unmeasured log is measured before anything is admitted.
+        let mut unknown = Checkpoint::UNKNOWN;
+        assert_eq!(admit(&db, &mut unknown, high_water, 100, 1200).unwrap(), None);
+        assert_eq!(unknown.pending_bytes, 0);
     }
 
     #[test]

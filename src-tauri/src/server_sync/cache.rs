@@ -94,6 +94,10 @@ pub(crate) struct Cache {
     library: Option<PayloadCas>,
     objects: std::sync::Mutex<rusqlite::Connection>,
     staged: std::sync::Mutex<Staged>,
+    root: std::path::PathBuf,
+    /// What the checkpoint after the last group left in the log.
+    checkpoint: std::sync::Mutex<small_object_store::Checkpoint>,
+    wal_high_water: u64,
 }
 
 /// Holds one group of small bodies open. Committing writes the group; dropping
@@ -153,7 +157,15 @@ impl Cache {
             library: None,
             objects: std::sync::Mutex::new(objects),
             staged: std::sync::Mutex::new(Staged::default()),
+            root: root.to_path_buf(),
+            checkpoint: std::sync::Mutex::new(small_object_store::Checkpoint::UNKNOWN),
+            wal_high_water: small_object_store::WAL_HIGH_WATER_BYTES,
         })
+    }
+    #[cfg(test)]
+    pub fn with_wal_high_water(mut self, bytes: u64) -> Self {
+        self.wal_high_water = bytes;
+        self
     }
     pub fn with_library(mut self, root: &Path) -> Result<Self> {
         self.library = Some(PayloadCas::new(root)?);
@@ -181,6 +193,8 @@ impl Cache {
     }
     /// Write every body staged at or below `depth`. Bodies the scopes around
     /// this one staged stay pending; their own scope decides when they land.
+    /// A log readers are holding or a volume without room refuses the group;
+    /// groups already written stay written.
     fn write_staged(&self, staged: &mut Staged, depth: usize) -> Result<()> {
         let group = staged
             .bodies
@@ -193,6 +207,29 @@ impl Cache {
         }
         {
             let mut objects = self.objects()?;
+            let mut checkpoint = self
+                .checkpoint
+                .lock()
+                .map_err(|_| SyncError::new("cache-store-unavailable", 503))?;
+            let bytes = group.iter().map(|(_, body)| body.len() as u64).sum();
+            let available = fs2::available_space(&self.root)?;
+            match small_object_store::admit(
+                &objects,
+                &mut checkpoint,
+                self.wal_high_water,
+                bytes,
+                available,
+            )
+            .map_err(|_| SyncError::new("cache-store-unavailable", 503))?
+            {
+                None => (),
+                Some(small_object_store::Pressure::Log) => {
+                    return Err(SyncError::new("cache-store-busy", 503))
+                }
+                Some(small_object_store::Pressure::Space) => {
+                    return Err(SyncError::new("local-storage-full", 507))
+                }
+            }
             let tx = objects.transaction()?;
             small_object_store::insert_batch(
                 &tx,
@@ -205,8 +242,10 @@ impl Cache {
             tx.commit()?;
             // Between groups, never inside one. A reader on another connection
             // can leave the log where it is; this group is already durable, so
-            // a refused checkpoint is not a reason to fail it.
-            let _ = objects.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
+            // a refused checkpoint is not a reason to fail it. What it leaves
+            // decides whether the next group is admitted.
+            *checkpoint = small_object_store::checkpoint(&objects)
+                .unwrap_or(small_object_store::Checkpoint::UNKNOWN);
         }
         for (hash, _) in &group {
             staged.bodies.remove(hash);
