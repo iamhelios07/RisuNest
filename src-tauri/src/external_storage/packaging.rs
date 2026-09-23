@@ -9,7 +9,7 @@ use super::{
     },
     connection_store::{ConnectionStore, UnusableReason},
     journal::{validate_receipt, TransferJournal},
-    package_cache::{kind_name, CatalogRange, LivePack, PackageCache},
+    package_cache::{kind_name, CatalogRange, PackageCache},
     phase_progress::PhaseProgress,
     sections::CapturedSection,
     transfer::SpoolSink,
@@ -74,6 +74,8 @@ const SMALL_PACK_CIPHERTEXT_BYTES: u64 = 256 * 1024;
 const COALESCE_TRIGGER_PACKS: usize = 32;
 const COALESCE_MAX_PACKS: usize = 16;
 const COALESCE_MAX_SOURCE_BYTES: u64 = 4 * 1024 * 1024;
+/// Previous record catalog leaves one cycle may change.
+const COALESCE_MAX_LEAVES: usize = 8;
 /// What the maintenance portion can spend at its cap: one pack upload and one
 /// registration page each. A remaining allowance below this declines it.
 pub(crate) const COALESCE_REQUEST_BUDGET: u64 = 2 * COALESCE_MAX_PACKS as u64;
@@ -85,29 +87,45 @@ pub(crate) struct MaintenanceReport {
     pub(crate) source_bytes: u64,
 }
 
+/// One record pack the entries this publication would reuse still name. The
+/// bytes are the live source bytes a cycle would write again, and for a small
+/// pack the keys and the previous catalog leaves they sit in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LivePack {
+    object_id: String,
+    ciphertext_length: u64,
+    bytes: u64,
+    first_key: String,
+    leaves: BTreeSet<usize>,
+    keys: Vec<(String, u64)>,
+    /// Every entry naming it can be written again from the capture.
+    rewritable: bool,
+}
+
 /// The adjacent run of small live packs one cycle repackages. Selection is by
 /// first live key, so a run covers neighbouring catalog ranges rather than
-/// scattered ones, and it stops at the pack, byte and trigger bounds.
-fn select_small_packs(mut live: Vec<LivePack>) -> BTreeSet<String> {
-    live.retain(|pack| {
-        pack.entries > 0 && pack.ciphertext_length <= SMALL_PACK_CIPHERTEXT_BYTES
-    });
+/// scattered ones, and it stops at the pack, byte, leaf and trigger bounds.
+fn select_small_packs(mut live: Vec<LivePack>) -> Vec<LivePack> {
+    live.retain(|pack| pack.rewritable && pack.ciphertext_length <= SMALL_PACK_CIPHERTEXT_BYTES);
     if live.len() < COALESCE_TRIGGER_PACKS {
-        return BTreeSet::new();
+        return Vec::new();
     }
     live.sort_by(|a, b| {
         (&a.first_key, &a.object_id).cmp(&(&b.first_key, &b.object_id))
     });
-    let mut selected = BTreeSet::new();
+    let mut selected = Vec::new();
     let mut bytes = 0u64;
+    let mut leaves = BTreeSet::new();
     for pack in live {
         if selected.len() >= COALESCE_MAX_PACKS
             || bytes.saturating_add(pack.bytes) > COALESCE_MAX_SOURCE_BYTES
+            || leaves.union(&pack.leaves).count() > COALESCE_MAX_LEAVES
         {
             break;
         }
         bytes = bytes.saturating_add(pack.bytes);
-        selected.insert(pack.object_id);
+        leaves.extend(pack.leaves.iter().copied());
+        selected.push(pack);
     }
     selected
 }
@@ -1010,6 +1028,35 @@ pub(super) fn catalog_fingerprint_of<'a>(
     hex::encode(digest.finalize())
 }
 
+/// Whether every pack an entry names is in the selected parent graph and is
+/// not something this connection found unusable.
+fn admitted_packs(
+    packs: &[RemoteObject],
+    members: &BTreeSet<String>,
+    evidence: &ObjectEvidence,
+    settled: &mut BTreeMap<String, bool>,
+    repository: &RepositoryHandle,
+) -> Result<bool> {
+    for pack in packs {
+        let identity = ObjectEvidence::identity(pack, repository)?;
+        if !members.contains(&identity) {
+            return Ok(false);
+        }
+        let known = match settled.get(&identity) {
+            Some(known) => *known,
+            None => {
+                let known = evidence.known(&identity)?;
+                settled.insert(identity, known);
+                known
+            }
+        };
+        if known {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 async fn build_entries(
     kind: wire::CatalogKind,
     sources: Vec<SourceEntry>,
@@ -1019,6 +1066,7 @@ async fn build_entries(
     root_key: &[u8; 32],
     limits: PackageLimits,
     parent: Option<&BTreeSet<String>>,
+    shape: Option<&CatalogShape>,
     cache: &mut PackageCache,
     evidence: &mut ObjectEvidence,
     journal: &mut TransferJournal,
@@ -1037,17 +1085,26 @@ async fn build_entries(
     // required was told it may also spend the maintenance portion. Decided
     // before anything is uploaded, because a body the capture store cannot
     // answer for has to keep the placement it has, and declining reuse for it
-    // would turn an optional cycle into a failed publication.
+    // would turn an optional cycle into a failed publication. A pack counts as
+    // live only through an entry of this capture that the parent graph still
+    // names, and a cycle is bounded by the leaves of the parent's catalog, so
+    // without one there is nothing to select.
     let mut drained: BTreeSet<String> = BTreeSet::new();
     let mut repackage: BTreeSet<String> = BTreeSet::new();
-    if kind == wire::CatalogKind::Records && limits.maintenance == Maintenance::Allowed {
-        if let Some(content) = ContentStore::open_existing(external_root).map_err(transient)? {
-            let selected =
-                select_small_packs(cache.live_packs(format_repository_id, repository, kind)?);
+    // One answer per pack, not per entry that names it.
+    let mut settled: BTreeMap<String, bool> = BTreeMap::new();
+    let ranges = shape.map(|shape| shape.level(0)).unwrap_or_default();
+    if kind == wire::CatalogKind::Records
+        && limits.maintenance == Maintenance::Allowed
+        && !ranges.is_empty()
+    {
+        if let (Some(members), Some(content)) = (
+            parent,
+            ContentStore::open_existing(external_root).map_err(transient)?,
+        ) {
+            let mut live: BTreeMap<String, LivePack> = BTreeMap::new();
             for source in &sources {
-                if selected.is_empty() {
-                    break;
-                }
+                cancel.check()?;
                 let Some(cached) = cache.entry(
                     format_repository_id,
                     repository,
@@ -1059,23 +1116,38 @@ async fn build_entries(
                 else {
                     continue;
                 };
-                if cached
-                    .packs
-                    .iter()
-                    .any(|pack| selected.contains(&pack.object_id))
-                    && content
-                        .stat(&source.content_sha256)
-                        .is_ok_and(|held| held == Some(source.byte_length))
-                {
-                    repackage.insert(source.key.clone());
-                    for pack in &cached.packs {
-                        if selected.contains(&pack.object_id) {
-                            drained.insert(pack.object_id.clone());
-                        }
-                    }
-                    maintenance.source_bytes =
-                        maintenance.source_bytes.saturating_add(source.byte_length);
+                if !admitted_packs(&cached.packs, members, evidence, &mut settled, repository)? {
+                    continue;
                 }
+                let held = content
+                    .stat(&source.content_sha256)
+                    .is_ok_and(|held| held == Some(source.byte_length));
+                let leaves = previous_leaves(ranges, &source.key);
+                for pack in &cached.packs {
+                    let named = live.entry(pack.object_id.clone()).or_insert_with(|| LivePack {
+                        object_id: pack.object_id.clone(),
+                        ciphertext_length: pack.receipt.byte_length,
+                        bytes: 0,
+                        first_key: source.key.clone(),
+                        leaves: BTreeSet::new(),
+                        keys: Vec::new(),
+                        rewritable: true,
+                    });
+                    named.bytes = named.bytes.saturating_add(source.byte_length);
+                    named.rewritable &= held;
+                    if named.ciphertext_length <= SMALL_PACK_CIPHERTEXT_BYTES {
+                        named.leaves.extend(leaves.clone());
+                        named.keys.push((source.key.clone(), source.byte_length));
+                    }
+                }
+            }
+            for pack in select_small_packs(live.into_values().collect()) {
+                for (key, bytes) in pack.keys {
+                    if repackage.insert(key) {
+                        maintenance.source_bytes = maintenance.source_bytes.saturating_add(bytes);
+                    }
+                }
+                drained.insert(pack.object_id);
             }
         }
     }
@@ -1094,8 +1166,6 @@ async fn build_entries(
     }
     let mut ready = Vec::new();
     let mut uncached = Vec::new();
-    // One answer per pack, not per entry that names it.
-    let mut settled: BTreeMap<String, bool> = BTreeMap::new();
     let mut placements: ChunkPlacements = BTreeMap::new();
     let mut carried_packs: BTreeMap<String, RemoteObject> = BTreeMap::new();
     for source in sources {
@@ -1122,27 +1192,7 @@ async fn build_entries(
                 // this connection already found unusable is settled by no graph
                 // and never inherits.
                 Some(members) => {
-                    let mut usable = true;
-                    for pack in &cached.packs {
-                        let identity = ObjectEvidence::identity(pack, repository)?;
-                        if !members.contains(&identity) {
-                            usable = false;
-                            break;
-                        }
-                        let known = match settled.get(&identity) {
-                            Some(known) => *known,
-                            None => {
-                                let known = evidence.known(&identity)?;
-                                settled.insert(identity, known);
-                                known
-                            }
-                        };
-                        if known {
-                            usable = false;
-                            break;
-                        }
-                    }
-                    if usable {
+                    if admitted_packs(&cached.packs, members, evidence, &mut settled, repository)? {
                         prepared.completed(source.byte_length);
                         ready.push(cached);
                         continue;
@@ -1184,27 +1234,9 @@ async fn build_entries(
             if let Some(previous) =
                 cache.entry_by_key(format_repository_id, repository, kind, &source.key)?
             {
-                let mut usable = true;
-                for pack in &previous.packs {
-                    let identity = ObjectEvidence::identity(pack, repository)?;
-                    if !members.contains(&identity) {
-                        usable = false;
-                        break;
-                    }
-                    let known = match settled.get(&identity) {
-                        Some(known) => *known,
-                        None => {
-                            let known = evidence.known(&identity)?;
-                            settled.insert(identity, known);
-                            known
-                        }
-                    };
-                    if known {
-                        usable = false;
-                        break;
-                    }
-                }
-                if usable && !repackage.contains(&source.key) {
+                if !repackage.contains(&source.key)
+                    && admitted_packs(&previous.packs, members, evidence, &mut settled, repository)?
+                {
                     for chunk in &previous.chunks {
                         placements.insert(
                             (
@@ -1938,6 +1970,21 @@ fn previous_node(ranges: &[(String, String)], key: &str) -> usize {
     }
 }
 
+/// The leaves of the previous catalog a key's fragments sit in: every leaf
+/// whose range covers it, or the one `previous_node` places it in.
+fn previous_leaves(ranges: &[(String, String)], key: &str) -> std::ops::RangeInclusive<usize> {
+    let at = previous_node(ranges, key);
+    let mut first = at;
+    while first > 0 && ranges[first - 1].1.as_str() >= key {
+        first -= 1;
+    }
+    let mut last = at;
+    while last + 1 < ranges.len() && ranges[last + 1].0.as_str() <= key {
+        last += 1;
+    }
+    first..=last
+}
+
 fn fits_under<T>(
     items: &[T],
     bucket: (usize, usize),
@@ -2127,6 +2174,7 @@ async fn build_catalog(
     limits: PackageLimits,
     parent: Option<&BTreeSet<String>>,
     shape: Option<&CatalogShape>,
+    placements_moved: bool,
     cache: &mut PackageCache,
     evidence: &mut ObjectEvidence,
     journal: &mut TransferJournal,
@@ -2138,7 +2186,14 @@ async fn build_catalog(
     // Everything this call adds to the publication's reference list is a node
     // of the catalog it is about to name.
     let mark = referenced.len();
-    if let Some(root) = cache.catalog(format_repository_id, repository, kind, fingerprint)? {
+    // The cached root is keyed by what the catalog holds, not where it holds
+    // it, so it cannot answer for entries this publication placed elsewhere.
+    let cached = if placements_moved {
+        None
+    } else {
+        cache.catalog(format_repository_id, repository, kind, fingerprint)?
+    };
+    if let Some(root) = cached {
         if let Some(objects) =
             admitted_catalog(&root, parent, format_repository_id, cache, evidence, repository)?
         {
@@ -2639,6 +2694,7 @@ pub(crate) async fn package_and_upload(
         root_key,
         limits,
         members.as_ref(),
+        shapes.get("records"),
         &mut cache,
         &mut evidence,
         journal,
@@ -2659,6 +2715,7 @@ pub(crate) async fn package_and_upload(
         limits,
         members.as_ref(),
         shapes.get("records"),
+        maintenance.packs > 0,
         &mut cache,
         &mut evidence,
         journal,
@@ -2708,6 +2765,7 @@ pub(crate) async fn package_and_upload(
             root_key,
             limits,
             members.as_ref(),
+            None,
             &mut cache,
             &mut evidence,
             journal,
@@ -2729,6 +2787,7 @@ pub(crate) async fn package_and_upload(
             limits,
             members.as_ref(),
             shapes.get("assets"),
+            false,
             &mut cache,
             &mut evidence,
             journal,
@@ -2789,6 +2848,7 @@ pub(crate) async fn package_and_upload(
             root_key,
             limits,
             members.as_ref(),
+            None,
             &mut cache,
             &mut evidence,
             journal,
@@ -2810,6 +2870,7 @@ pub(crate) async fn package_and_upload(
             limits,
             members.as_ref(),
             shapes.get(&format!("section/{id}")),
+            false,
             &mut cache,
             &mut evidence,
             journal,
@@ -3312,6 +3373,81 @@ mod tests {
         }
     }
 
+    /// A capture holding exactly the records at `keys`, those in `edited` at
+    /// this revision's value and the rest at their original bodies.
+    fn captured_records(
+        root: &Path,
+        capture_id: &str,
+        revision: i64,
+        keys: std::ops::Range<usize>,
+        edited: std::ops::Range<usize>,
+    ) -> CapturedSnapshot {
+        let external = root.join("external-storage");
+        let mut catalog = crate::external_storage::capture::CaptureCatalog::create(
+            &external.join("captures").join(capture_id),
+            &external,
+            None,
+        )
+        .unwrap();
+        let identity = CaptureIdentity {
+            store_id: "store".into(),
+            library_epoch: "epoch".into(),
+            generation: format!("generation-{revision}"),
+            selection_epoch: "selection".into(),
+            revision,
+        };
+        catalog.begin(&identity, None).unwrap();
+        let objects = external.join("objects");
+        {
+            let mut insert = catalog
+                .db
+                .prepare("INSERT INTO records VALUES(?1,?2,?3)")
+                .unwrap();
+            for index in keys {
+                let value = if edited.contains(&index) { revision } else { 0 };
+                let body = format!("{{\"record\":{index},\"value\":{value}}}").into_bytes();
+                let digest = hex::encode(hash(&body));
+                let path = objects.join(&digest);
+                if !path.exists() {
+                    fs::write(path, &body).unwrap();
+                }
+                insert
+                    .execute(params![format!("record/{index:06}"), digest, body.len() as i64])
+                    .unwrap();
+            }
+        }
+        catalog.finish().unwrap();
+        CapturedSnapshot {
+            id: capture_id.into(),
+            identity,
+            catalog,
+            projected_records: 0,
+            shared: false,
+        }
+    }
+
+    /// The packs a published record catalog names, read from what the cache
+    /// recorded for its root.
+    fn record_graph_packs(
+        cache_root: &Path,
+        completed: &CompletedSnapshot,
+        repository: &RepositoryHandle,
+    ) -> BTreeSet<String> {
+        let cache = PackageCache::open(cache_root).unwrap();
+        let identity =
+            super::super::reachability::object_identity(&completed.record_catalog, repository)
+                .unwrap();
+        let graph = cache
+            .graph_of(&completed.repository_id, repository, &identity)
+            .unwrap();
+        assert!(!graph.is_empty(), "the record catalog's graph was not recorded");
+        graph
+            .into_iter()
+            .filter(|object| object.role == ObjectRole::Pack)
+            .map(|object| object.object_id)
+            .collect()
+    }
+
     fn metadata(id: &str, capture: &CapturedSnapshot) -> SnapshotMetadata {
         SnapshotMetadata {
             snapshot_id: id.into(),
@@ -3363,40 +3499,69 @@ mod tests {
         ParentGraph::new(roots, repository)
     }
 
-    fn live_pack(id: &str, ciphertext: u64, entries: u64, bytes: u64, first: &str) -> LivePack {
+    fn live_pack(
+        id: &str,
+        ciphertext: u64,
+        bytes: u64,
+        first: &str,
+        leaves: impl IntoIterator<Item = usize>,
+    ) -> LivePack {
         LivePack {
             object_id: id.into(),
             ciphertext_length: ciphertext,
-            entries,
             bytes,
             first_key: first.into(),
+            leaves: leaves.into_iter().collect(),
+            keys: vec![(first.into(), bytes)],
+            rewritable: true,
         }
     }
 
-    /// The trigger, the pack cap, the byte cap and the size rule, each on its
-    /// own. Selection is by first live key, so what it takes is an adjacent run
-    /// rather than whichever packs happen to be cheapest.
+    /// The trigger, the pack cap, the byte cap, the leaf cap and the size
+    /// rule, each on its own. Selection is by first live key, so what it takes
+    /// is an adjacent run rather than whichever packs happen to be cheapest.
     #[test]
     fn small_live_packs_are_selected_as_one_adjacent_bounded_run() {
+        // Four neighbouring packs share a leaf.
         let small = |count: usize, bytes: u64| {
             (0..count)
                 .map(|index| {
-                    live_pack(&format!("pack-{index:03}"), 1024, 1, bytes, &format!("record/{index:06}"))
+                    live_pack(
+                        &format!("pack-{index:03}"), 1024, bytes,
+                        &format!("record/{index:06}"), [index / 4],
+                    )
                 })
                 .collect::<Vec<_>>()
         };
+        let ids = |selected: Vec<LivePack>| {
+            selected.into_iter().map(|pack| pack.object_id).collect::<Vec<_>>()
+        };
         assert!(select_small_packs(small(31, 16)).is_empty());
-        let selected = select_small_packs(small(32, 16));
+        let selected = ids(select_small_packs(small(32, 16)));
         assert_eq!(selected.len(), 16);
-        assert_eq!(
-            selected.iter().next_back().map(String::as_str),
-            Some("pack-015"),
-        );
+        assert_eq!(selected.last().map(String::as_str), Some("pack-015"));
         assert_eq!(select_small_packs(small(64, 16)).len(), 16);
 
         // Four packs of a mebibyte each fill the cycle's source budget before
         // the pack cap does.
         assert_eq!(select_small_packs(small(40, 1024 * 1024)).len(), 4);
+
+        // A pack to a leaf reaches the leaf cap first, and the run stops at the
+        // pack that would bring a ninth leaf.
+        let spread = (0..32)
+            .map(|index| {
+                live_pack(&format!("pack-{index:03}"), 1024, 16, &format!("record/{index:06}"), [index])
+            })
+            .collect::<Vec<_>>();
+        let selected = ids(select_small_packs(spread));
+        assert_eq!(selected.len(), COALESCE_MAX_LEAVES);
+        assert_eq!(selected.last().map(String::as_str), Some("pack-007"));
+
+        // A first pack whose keys sit in more leaves than a cycle may change
+        // stops the run before it starts.
+        let mut wide = small(32, 16);
+        wide[0].leaves = (0..=COALESCE_MAX_LEAVES).collect();
+        assert!(select_small_packs(wide).is_empty());
 
         // A pack over the small size is not eligible, and without 32 that are,
         // nothing is selected.
@@ -3405,19 +3570,17 @@ mod tests {
             live_pack(
                 &format!("pack-{index:03}"),
                 SMALL_PACK_CIPHERTEXT_BYTES + 1,
-                1,
                 16,
                 &format!("record/{index:06}"),
+                [index / 4],
             )
         }));
         assert!(select_small_packs(mixed).is_empty());
 
-        // A pack no current entry names is not live, whatever its size.
-        let mut dead = small(32, 16);
-        for pack in dead.iter_mut().take(8) {
-            pack.entries = 0;
-        }
-        assert!(select_small_packs(dead).is_empty());
+        // Nor is a pack with an entry the capture cannot write again.
+        let mut held = small(32, 16);
+        held[31].rewritable = false;
+        assert!(select_small_packs(held).is_empty());
     }
 
     fn limits(max: u64) -> PackageLimits {
@@ -4269,6 +4432,167 @@ mod tests {
             // anyway, so the cycle costs no object the plain run did not also
             // upload. What it buys is the sixteen packs above.
             assert_eq!(coalesced.4, plain.4);
+        });
+    }
+
+    /// Section 11.3's leaf bound, and a publication whose record catalog is
+    /// logically its parent's. The library grows one contiguous range per
+    /// publication, so every small pack covers about one catalog leaf and an
+    /// adjacent run of sixteen covers far more than eight. The last
+    /// publication changes only a device section, and what the maintenance
+    /// portion moves has to be what the published catalog names.
+    #[test]
+    fn c_a_coalescing_cycle_rewrites_at_most_eight_leaves_and_names_what_it_moved() {
+        runtime().block_on(async {
+            const RANGE: usize = 48;
+            const GROWN: usize = 36;
+            const LAST: i64 = GROWN as i64 + 1;
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let key = [53; 32];
+            let cache = root.path().join("cache");
+            let spool = root.path().join("sections");
+            let mut previous: Option<CompletedSnapshot> = None;
+            let mut latest: Option<CompletedSnapshot> = None;
+            let mut before_final = BTreeSet::new();
+            for revision in 1..=LAST {
+                let last = revision == LAST;
+                if last {
+                    before_final = provider.state.lock().unwrap()
+                        .objects.keys().cloned().collect();
+                }
+                let grown = (revision as usize).min(GROWN);
+                let capture = captured_records(
+                    root.path(), &format!("leaf-capture-{revision}"), grown as i64,
+                    0..grown * RANGE, 0..0);
+                let meta = metadata(&format!("leaf-snapshot-{revision}"), &capture);
+                let job = format!("leaf-job-{revision}");
+                let mut transfer = journal(&root.path().join(&job), &job, &capture);
+                let parent = latest.as_ref()
+                    .map(|completed| parent_graph(completed, &repository))
+                    .transpose().unwrap();
+                let sections = if last {
+                    vec![section(&spool, SectionKind::Hypa, "changed", 1)]
+                } else {
+                    Vec::new()
+                };
+                let completed = package_and_upload(
+                    capture, sections, root.path(), &cache, meta, &key,
+                    limits(16 * 1024).with_maintenance(last),
+                    parent.as_ref(), &mut transfer, &provider, &repository,
+                    &PhaseProgress::silent(), &Cancellation::default(),
+                ).await.unwrap();
+                previous = latest.replace(completed);
+            }
+            let (previous, completed) = (previous.unwrap(), latest.unwrap());
+            assert_eq!(previous.library_fingerprint, completed.library_fingerprint);
+
+            // What the cycle drained is what the new record catalog stopped
+            // naming, and nothing it reports is anything else.
+            assert!(completed.maintenance.packs > 0, "{:?}", completed.maintenance);
+            assert_ne!(
+                completed.record_catalog.object_id, previous.record_catalog.object_id,
+                "the published record catalog ignored the placements this cycle moved",
+            );
+            let before = record_graph_packs(&cache, &previous, &repository);
+            let after = record_graph_packs(&cache, &completed, &repository);
+            assert_eq!(
+                before.difference(&after).count() as u64,
+                completed.maintenance.packs,
+                "{:?}", completed.maintenance,
+            );
+
+            // Only the leaves the moved keys sat in were written again.
+            let metadata_key = derive_key(&key, &completed.repository_id, "metadata").unwrap();
+            let written_leaves = {
+                let state = provider.state.lock().unwrap();
+                state.objects.iter()
+                    .filter(|(id, _)| id.starts_with("catalog-") && !before_final.contains(*id))
+                    .filter(|(_, (bytes, _))| {
+                        let mut plaintext = Vec::new();
+                        wire::open_envelope(
+                            &mut std::io::Cursor::new(bytes.clone()), &mut plaintext,
+                            &metadata_key, wire::MAX_METADATA_BYTES as u64,
+                        ).unwrap();
+                        let document =
+                            wire::CatalogDocument::decode(&plaintext, wire::MAX_METADATA_BYTES)
+                                .unwrap();
+                        document.kind == wire::CatalogKind::Records && document.level == 0
+                    })
+                    .count()
+            };
+            assert!(
+                (1..=COALESCE_MAX_LEAVES).contains(&written_leaves),
+                "written_leaves={written_leaves} {:?}", completed.maintenance,
+            );
+
+            let restore_root = root.path().join("leaf-restore");
+            let restored = snapshot_restore::download_snapshot(
+                &completed.reference, &restore_root, &key, None,
+                snapshot_restore::SourceTrust::Downloaded, &provider, &repository,
+                &PhaseProgress::silent(), &Cancellation::default(),
+            ).await.unwrap();
+            assert_eq!(restored.records.len(), GROWN * RANGE);
+            for record in &restored.records {
+                let index: usize = record.key.trim_start_matches("record/").parse().unwrap();
+                assert_eq!(
+                    restored.body(&record.source),
+                    format!("{{\"record\":{index},\"value\":0}}").into_bytes(),
+                );
+            }
+        });
+    }
+
+    /// Keys the library deleted keep their cache rows. The packs only those
+    /// rows name are not live and take no place in the cycle's run.
+    #[test]
+    fn c_deleted_keys_take_no_place_in_a_coalescing_cycle() {
+        runtime().block_on(async {
+            const RECORDS: usize = 128;
+            const AGED: i64 = 40;
+            const DELETED: usize = 8;
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let key = [59; 32];
+            let cache = root.path().join("cache");
+            let mut previous: Option<CompletedSnapshot> = None;
+            let mut latest: Option<CompletedSnapshot> = None;
+            for revision in 1..=AGED + 1 {
+                let last = revision > AGED;
+                let window = (revision as usize - 1) * 2;
+                // Each publication edits the next two keys and puts the two it
+                // edited before back, so the pack it writes keeps those two
+                // live. The last one deletes the first keys.
+                let keys = if last { DELETED..RECORDS } else { 0..RECORDS };
+                let capture = captured_records(
+                    root.path(), &format!("stale-capture-{revision}"), revision,
+                    keys, window..window + 2);
+                let meta = metadata(&format!("stale-snapshot-{revision}"), &capture);
+                let job = format!("stale-job-{revision}");
+                let mut transfer = journal(&root.path().join(&job), &job, &capture);
+                let parent = latest.as_ref()
+                    .map(|completed| parent_graph(completed, &repository))
+                    .transpose().unwrap();
+                let completed = package_and_upload(
+                    capture, Vec::new(), root.path(), &cache, meta, &key,
+                    limits(128 * 1024).with_maintenance(last),
+                    parent.as_ref(), &mut transfer, &provider, &repository,
+                    &PhaseProgress::silent(), &Cancellation::default(),
+                ).await.unwrap();
+                previous = latest.replace(completed);
+            }
+            let (previous, completed) = (previous.unwrap(), latest.unwrap());
+            assert_eq!(completed.maintenance.packs, COALESCE_MAX_PACKS as u64);
+            let before = record_graph_packs(&cache, &previous, &repository);
+            let after = record_graph_packs(&cache, &completed, &repository);
+            // The packs of the deleted keys leave with the keys, and the run
+            // drains sixteen live ones besides.
+            assert_eq!(
+                before.difference(&after).count(),
+                COALESCE_MAX_PACKS + DELETED / 2,
+            );
         });
     }
 

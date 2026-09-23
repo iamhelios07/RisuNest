@@ -27,18 +27,6 @@ pub(super) struct CatalogRange {
     pub(super) last_key: String,
 }
 
-/// One live pack of a catalog, as the cache's own entries describe it. The
-/// bytes are the live source bytes its entries carry, which is what a
-/// repackaging cycle would have to write again.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct LivePack {
-    pub(super) object_id: String,
-    pub(super) ciphertext_length: u64,
-    pub(super) entries: u64,
-    pub(super) bytes: u64,
-    pub(super) first_key: String,
-}
-
 /// How many published graphs one connection keeps on hand, per catalog kind.
 const RETAINED_GRAPHS: i64 = 64;
 
@@ -463,42 +451,6 @@ impl PackageCache {
     /// entry count, live source bytes and first key of each. A pack named by no
     /// current entry is absent, so nothing here asks the provider anything or
     /// reaches a historical root.
-    pub(super) fn live_packs(
-        &self,
-        format_repository_id: &str,
-        repository: &RepositoryHandle,
-        kind: wire::CatalogKind,
-    ) -> Result<Vec<LivePack>> {
-        let mut statement = self.db.prepare(
-            "SELECT entry_key,value FROM entries WHERE repository_id=?1 AND connection_identity=?2 AND catalog_kind=?3 ORDER BY entry_key",
-        ).map_err(transient)?;
-        let rows = statement.query_map(
-            params![format_repository_id, repository.connection_identity, kind_name(kind)],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        ).map_err(transient)?;
-        let mut packs: BTreeMap<String, LivePack> = BTreeMap::new();
-        for row in rows {
-            let (entry_key, encoded) = row.map_err(transient)?;
-            let plan: EntryPlan = serde_json::from_str(&encoded).map_err(corrupt)?;
-            plan.validate(format_repository_id, repository)?;
-            for pack in &plan.packs {
-                let held = packs.entry(pack.object_id.clone()).or_insert_with(|| LivePack {
-                    object_id: pack.object_id.clone(),
-                    ciphertext_length: pack.receipt.byte_length,
-                    entries: 0,
-                    bytes: 0,
-                    first_key: entry_key.clone(),
-                });
-                if held.ciphertext_length != pack.receipt.byte_length {
-                    return Err(corrupt("cached pack length disagrees between entries"));
-                }
-                held.entries += 1;
-                held.bytes = held.bytes.saturating_add(plan.byte_length);
-            }
-        }
-        Ok(packs.into_values().collect())
-    }
-
     pub(super) fn catalog(
         &self,
         format_repository_id: &str,
