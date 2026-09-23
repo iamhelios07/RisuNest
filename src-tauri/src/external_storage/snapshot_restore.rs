@@ -1014,24 +1014,61 @@ fn place_whole(
     publish_verified(&partial, destination, entry.byte_length, digest)
 }
 
-/// Places everything one open pack carries for `users`, then marks the pack
-/// done. The marker is written only once the bytes it stands for are durable.
-/// A pack already fetched is placed whole; cancellation is honored between
-/// packs.
+/// Packs placed since the last flush. Their markers wait until what they
+/// placed is durable, so an interruption costs at most a group's packs read
+/// again, while small packs do not each pay for a sync and a commit.
+struct PlacedGroup {
+    packs: Vec<String>,
+    bytes: u64,
+    /// Assembly files written since the last flush, by content hash.
+    touched: BTreeSet<String>,
+}
+
+const PLACED_GROUP_PACKS: usize = 32;
+const PLACED_GROUP_BYTES: u64 = 64 * 1024 * 1024;
+
+impl PlacedGroup {
+    fn full(&self) -> bool {
+        self.packs.len() >= PLACED_GROUP_PACKS || self.bytes >= PLACED_GROUP_BYTES
+    }
+
+    /// Makes what the group placed durable, then marks its packs done. The
+    /// apply reads the content store on its own connection, and a marked pack
+    /// is not read again.
+    fn flush(&mut self, staging_root: &Path, content: &mut ContentStore) -> Result<()> {
+        for digest in std::mem::take(&mut self.touched) {
+            let file = OpenOptions::new()
+                .write(true)
+                .open(assembly_path(staging_root, &digest))
+                .map_err(transient)?;
+            file.sync_all().map_err(transient)?;
+        }
+        content.commit().map_err(transient)?;
+        for pack in self.packs.drain(..) {
+            fs::write(marker_path(staging_root, &pack)?, b"").map_err(transient)?;
+        }
+        self.bytes = 0;
+        Ok(())
+    }
+}
+
+/// Places everything one open pack carries for `users`. A pack already
+/// fetched is placed whole; cancellation is honored between packs.
 fn place_pack(
     staging_root: &Path,
     pack_id: &str,
     plaintext: &Path,
     pending: &[Pending],
     users: &[usize],
+    content: &mut ContentStore,
+    touched: &mut BTreeSet<String>,
 ) -> Result<()> {
     let mut input = crate::trust_boundary::open_regular_source(plaintext).map_err(corrupt)?;
     let input_length = input.metadata().map_err(corrupt)?.len();
-    let mut content = content_store(staging_root)?;
     for &index in users {
         let item = &pending[index];
         if !item.spread() {
-            place_whole(Some((&mut input, input_length)), item, &mut content)?;
+            place_whole(Some((&mut input, input_length)), item, content)?;
             continue;
         }
         let path = assembly_path(staging_root, &item.resolved.digest);
@@ -1051,12 +1088,8 @@ fn place_pack(
             output.seek(SeekFrom::Start(*offset)).map_err(transient)?;
             output.write_all(&bytes).map_err(transient)?;
         }
-        output.sync_all().map_err(transient)?;
+        touched.insert(item.resolved.digest.clone());
     }
-    // The apply reads this store on its own connection, and a marked pack is
-    // not read again, so what it placed has to be durable first.
-    content.commit().map_err(transient)?;
-    fs::write(marker_path(staging_root, pack_id)?, b"").map_err(transient)?;
     Ok(())
 }
 
@@ -1190,48 +1223,94 @@ async fn turn_over_packs(
         required.len() as u64,
         required.iter().map(|pack| pack.receipt.byte_length).sum(),
     );
-    for (id, pack) in order.iter().zip(&required) {
-        cancel.check()?;
-        if marker_path(staging_root, id)?.is_file() {
-            progress.completed(pack.receipt.byte_length);
-            continue;
-        }
-        let plaintext =
-            open_object(pack, root_key, staging_root, provider, repository, cancel).await?;
-        #[cfg(test)]
-        record_turnover(staging_root, &required);
-        // Decrypting was all the ciphertext was for.
-        match fs::remove_file(
-            staging_root
-                .join("downloads")
-                .join(format!("{}.cipher", pack.ciphertext_sha256)),
-        ) {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                return Err(transient(error));
+    let opened_root = staging_root.to_path_buf();
+    let mut content = Some(
+        tokio::task::spawn_blocking(move || content_store(&opened_root))
+            .await
+            .map_err(transient)??,
+    );
+    let mut group = Some(PlacedGroup {
+        packs: Vec::new(),
+        bytes: 0,
+        touched: BTreeSet::new(),
+    });
+    let turned = async {
+        for (id, pack) in order.iter().zip(&required) {
+            cancel.check()?;
+            if marker_path(staging_root, id)?.is_file() {
+                progress.completed(pack.receipt.byte_length);
+                continue;
             }
-            _ => {}
+            let plaintext =
+                open_object(pack, root_key, staging_root, provider, repository, cancel).await?;
+            #[cfg(test)]
+            record_turnover(staging_root, &required);
+            // Decrypting was all the ciphertext was for.
+            match fs::remove_file(
+                staging_root
+                    .join("downloads")
+                    .join(format!("{}.cipher", pack.ciphertext_sha256)),
+            ) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(transient(error));
+                }
+                _ => {}
+            }
+            let place_root = staging_root.to_path_buf();
+            let place_id = id.clone();
+            let place_pending = pending.clone();
+            let place_users = users.remove(id).unwrap_or_default();
+            let mut place_content = content.take().ok_or_else(|| transient("content store"))?;
+            let mut place_group = group.take().ok_or_else(|| transient("placed group"))?;
+            let plaintext_length = pack.plaintext_length;
+            let cpu = cpu_permit().await?;
+            let (returned_content, returned_group, placed) = tokio::task::spawn_blocking(move || {
+                let placed = place_pack(
+                    &place_root,
+                    &place_id,
+                    &plaintext,
+                    &place_pending,
+                    &place_users,
+                    &mut place_content,
+                    &mut place_group.touched,
+                )
+                .and_then(|()| {
+                    place_group.packs.push(place_id);
+                    place_group.bytes = place_group.bytes.saturating_add(plaintext_length);
+                    if place_group.full() {
+                        place_group.flush(&place_root, &mut place_content)?;
+                    }
+                    Ok(())
+                });
+                (place_content, place_group, placed)
+            })
+            .await
+            .map_err(transient)?;
+            drop(cpu);
+            content = Some(returned_content);
+            group = Some(returned_group);
+            placed?;
+            discard_object(staging_root, pack);
+            #[cfg(test)]
+            record_turnover(staging_root, &required);
+            progress.completed(pack.receipt.byte_length);
         }
-        let place_root = staging_root.to_path_buf();
-        let place_id = id.clone();
-        let place_pending = pending.clone();
-        let place_users = users.remove(id).unwrap_or_default();
-        let cpu = cpu_permit().await?;
-        tokio::task::spawn_blocking(move || {
-            place_pack(
-                &place_root,
-                &place_id,
-                &plaintext,
-                &place_pending,
-                &place_users,
-            )
+        Ok(())
+    }
+    .await;
+    // Packs placed before a cancellation or a failure are kept for the next
+    // attempt, which is what makes it resume rather than restart.
+    if let (Some(mut flush_content), Some(mut flush_group)) = (content.take(), group.take()) {
+        let flush_root = staging_root.to_path_buf();
+        let flushed = tokio::task::spawn_blocking(move || {
+            flush_group.flush(&flush_root, &mut flush_content)
         })
         .await
-        .map_err(transient)??;
-        drop(cpu);
-        discard_object(staging_root, pack);
-        #[cfg(test)]
-        record_turnover(staging_root, &required);
-        progress.completed(pack.receipt.byte_length);
+        .map_err(transient)?;
+        turned?;
+        flushed?;
+    } else {
+        turned?;
     }
     let finish_root = staging_root.to_path_buf();
     let finish_pending = pending.clone();
