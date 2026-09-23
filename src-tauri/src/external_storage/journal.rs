@@ -24,6 +24,7 @@ const PARENT_FILE: &str = "parent.json";
 pub(crate) const TRANSFER_SPOOL_BUDGET: u64 = 512 * 1024 * 1024;
 
 /// What one job directory is holding, counting only what a transfer owns.
+/// An unreadable directory reads as empty, so this is only for reporting.
 pub(crate) fn spool_bytes(directory: &Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return 0;
@@ -35,6 +36,113 @@ pub(crate) fn spool_bytes(directory: &Path) -> u64 {
         .filter(|metadata| metadata.is_file())
         .map(|metadata| metadata.len())
         .sum()
+}
+
+/// What one job directory is holding, for deciding whether more may be
+/// written. A directory that cannot be read is unknown usage, not none.
+pub(crate) fn held_spool_bytes(directory: &Path) -> Result<u64> {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(storage(error)),
+    };
+    let mut total = 0u64;
+    for entry in entries {
+        let entry = entry.map_err(storage)?;
+        if entry.path().extension().is_none_or(|value| value != "spool") {
+            continue;
+        }
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            // Released between listing and reading it.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(storage(error)),
+        };
+        if metadata.is_file() {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    Ok(total)
+}
+
+/// Sealed objects this process has admitted and is still writing, by job. Once
+/// a file is on disk its directory answers for it instead.
+static SPOOL_WRITES: std::sync::Mutex<std::collections::BTreeMap<String, u64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// The application-wide transfer spool as one job sees it: every job that is
+/// still holding sealed ciphertext, this one included, since what it already
+/// holds is on the same disk as what it is about to write.
+pub(crate) struct SpoolBudget {
+    job_id: String,
+    retaining: Box<dyn Fn() -> Result<Vec<(String, PathBuf)>> + Send + Sync>,
+    limit: u64,
+}
+
+/// One admitted write. Dropping it hands the bytes back to the directory that
+/// now holds them, or to nobody if the write failed.
+pub(crate) struct SpoolReservation {
+    job_id: String,
+}
+
+impl Drop for SpoolReservation {
+    fn drop(&mut self) {
+        if let Ok(mut writes) = SPOOL_WRITES.lock() {
+            writes.remove(&self.job_id);
+        }
+    }
+}
+
+impl SpoolBudget {
+    /// `retaining` names every job whose directory may still hold sealed
+    /// ciphertext, with that directory.
+    pub(crate) fn new(
+        job_id: String,
+        retaining: impl Fn() -> Result<Vec<(String, PathBuf)>> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            job_id,
+            retaining: Box::new(retaining),
+            limit: TRANSFER_SPOOL_BUDGET,
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn with_limit(mut self, limit: u64) -> Self {
+        self.limit = limit;
+        self
+    }
+    /// Admits one more sealed object of `bytes` or refuses it. A refusal is
+    /// transient: the job stops holding what it wrote, uploads it when it
+    /// resumes, and the budget is back when that or another job releases it.
+    pub(crate) fn reserve(&self, bytes: u64) -> Result<SpoolReservation> {
+        let mut writes = SPOOL_WRITES.lock().map_err(storage)?;
+        let mut used = 0u64;
+        let mut largest: Option<(String, u64)> = None;
+        for (job, directory) in (self.retaining)()? {
+            let mut held = held_spool_bytes(&directory)?;
+            if job != self.job_id {
+                held = held.saturating_add(writes.get(&job).copied().unwrap_or(0));
+            }
+            used = used.saturating_add(held);
+            if largest.as_ref().is_none_or(|(_, previous)| held > *previous) {
+                largest = Some((job, held));
+            }
+        }
+        if used.saturating_add(bytes) > self.limit {
+            if let Some((owner, held)) = largest {
+                crate::nlog!(
+                    "warn",
+                    "External job {} waits for the transfer spool budget; job {owner} holds {held} bytes",
+                    self.job_id
+                );
+            }
+            return Err(ProviderError::new(ErrorKind::Transient));
+        }
+        writes.insert(self.job_id.clone(), bytes);
+        Ok(SpoolReservation {
+            job_id: self.job_id.clone(),
+        })
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -103,8 +211,21 @@ pub(crate) struct TransferJournal {
     directory: PathBuf,
     identity: JobIdentity,
     pub(super) verification: super::packaging::AttemptVerification,
+    spool_budget: Option<SpoolBudget>,
 }
 impl TransferJournal {
+    /// Charges every sealed object this journal writes from now on to the
+    /// application-wide transfer spool.
+    pub(crate) fn set_spool_budget(&mut self, budget: SpoolBudget) {
+        self.spool_budget = Some(budget);
+    }
+    /// Admits a new sealed object of `bytes` before its file is created.
+    pub(crate) fn reserve_spool(&self, bytes: u64) -> Result<Option<SpoolReservation>> {
+        self.spool_budget
+            .as_ref()
+            .map(|budget| budget.reserve(bytes))
+            .transpose()
+    }
     /// Reopens an existing journal after its worker has exited, then removes
     /// terminal spools only when the authoritative PDS owner can be released.
     /// Jobs without a transfer journal have no registered spool to remove.
@@ -144,7 +265,7 @@ impl TransferJournal {
         if identity.job_id != job_id {
             return Err(corrupt());
         }
-        Self { db, directory: directory.into(), identity, verification: Default::default() }
+        Self { db, directory: directory.into(), identity, verification: Default::default(), spool_budget: None }
             .cleanup_terminal_spools(store, format_repository_id)
     }
 
@@ -328,6 +449,7 @@ impl TransferJournal {
             directory: directory.into(),
             identity,
             verification: Default::default(),
+            spool_budget: None,
         };
         journal.discard_released()?;
         Ok(journal)
@@ -760,6 +882,54 @@ mod tests {
         journal.register(&intent).unwrap();
         drop(journal);
         (root, store, identity, directory)
+    }
+
+    /// Every holder counts toward one budget: another job's retained spool,
+    /// the asking job's own, and what another job was admitted to write but
+    /// has not finished writing. A holder that cannot be read defers the
+    /// write rather than reading as empty.
+    #[test]
+    fn c_the_spool_budget_counts_every_holder_and_refuses_what_would_pass_it() {
+        let root = tempfile::tempdir().unwrap();
+        let own_id = format!("own-{}", uuid::Uuid::new_v4());
+        let other_id = format!("other-{}", uuid::Uuid::new_v4());
+        let own = root.path().join("own");
+        let other = root.path().join("other");
+        for directory in [&own, &other] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let retained = std::fs::File::create(other.join("retained.spool")).unwrap();
+        retained.set_len(300).unwrap();
+        let resumed = std::fs::File::create(own.join("resumed.spool")).unwrap();
+        resumed.set_len(100).unwrap();
+        std::fs::write(own.join("transfers.sqlite"), vec![0; 4096]).unwrap();
+        let holders = vec![(own_id.clone(), own.clone()), (other_id.clone(), other.clone())];
+        let budget = |job: &str| {
+            let holders = holders.clone();
+            SpoolBudget::new(job.into(), move || Ok(holders.clone())).with_limit(500)
+        };
+        let writing = budget(&own_id).reserve(100).unwrap();
+        assert!(
+            budget(&other_id).reserve(1).is_err(),
+            "a write another job was admitted to was not counted"
+        );
+        drop(writing);
+        drop(budget(&other_id).reserve(100).unwrap());
+        resumed.set_len(200).unwrap();
+        assert!(
+            budget(&own_id).reserve(1).is_err(),
+            "the asking job's own spool was not counted"
+        );
+        let unreadable = root.path().join("not-a-directory");
+        std::fs::write(&unreadable, b"synthetic").unwrap();
+        let broken = SpoolBudget::new(own_id.clone(), move || {
+            Ok(vec![("broken".into(), unreadable.clone())])
+        });
+        assert_eq!(
+            broken.reserve(1).err().map(|error| error.kind),
+            Some(ErrorKind::Transient)
+        );
+        assert!(held_spool_bytes(&root.path().join("absent")).unwrap() == 0);
     }
 
     #[test]

@@ -1161,6 +1161,22 @@ pub(crate) fn job_directory(root: &std::path::Path, connection: &str, job: &str)
             risunest_external_storage_format::content_identity::hash(job.as_bytes()),
         ))
 }
+/// The transfer spool as `job_id` sees it when it seals another object: every
+/// job that has not been swept, with the directory its spool lives in.
+pub(crate) fn spool_budget(root: &std::path::Path, job_id: &str) -> super::journal::SpoolBudget {
+    let root = root.to_path_buf();
+    super::journal::SpoolBudget::new(job_id.to_owned(), move || {
+        Ok(JobStore::open(&root)?
+            .list_retaining()?
+            .into_iter()
+            .map(|job| {
+                let directory = job_directory(&root, &job.request.connection_id, &job.id);
+                (job.id, directory)
+            })
+            .collect())
+    })
+}
+
 /// Sealed ciphertext the other unfinished jobs are holding. A job that would
 /// add to a budget somebody else already owns waits for it instead; nothing
 /// here removes what another job may still need.
@@ -1175,11 +1191,11 @@ fn spool_budget_owner(
         if other.id == job.id {
             continue;
         }
-        let held = super::journal::spool_bytes(&job_directory(
+        let held = super::journal::held_spool_bytes(&job_directory(
             root,
             &other.request.connection_id,
             &other.id,
-        ));
+        ))?;
         total = total.saturating_add(held);
         if owner.as_ref().is_none_or(|(_, previous)| held > *previous) {
             owner = Some((other.id.clone(), held));
@@ -1720,6 +1736,7 @@ async fn run_backup(
             capture: identity.clone(),
         },
     )?;
+    journal.set_spool_budget(spool_budget(&root, &job.id));
     // A backup wraps the library the published state already covers, so that
     // state names the graph this capture can reuse from. Selected and recorded
     // before anything reuses it. A connection that has never published one has

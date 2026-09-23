@@ -1705,6 +1705,9 @@ async fn seal_plain_object(
             ciphertext_sha256: record.intent.sha256,
         });
     }
+    // Held until the journal answers for the file, so another job always sees
+    // either the reservation or the bytes.
+    let reservation = journal.reserve_spool(ciphertext_length)?;
     let spool = journal.spool_path(&object_id);
     let input_path = path.to_path_buf();
     let spool_path = spool.clone();
@@ -1748,6 +1751,7 @@ async fn seal_plain_object(
         sha256: ciphertext_sha256.clone(),
     };
     journal.register(&intent)?;
+    drop(reservation);
     Ok(SealedObject::Pending {
         object_id,
         role,
@@ -2200,6 +2204,8 @@ async fn build_catalog(
     let mut nodes = Vec::new();
     let mut level_documents = Vec::new();
     let mut level_sealed = Vec::new();
+    let mut level_uploaded = Vec::new();
+    let mut wave_bytes = 0u64;
     for EncodedCatalog { document, bytes } in leaves {
         let sealed = match admitted_node(
             &bytes, parent, format_repository_id, cache, evidence, repository,
@@ -2225,12 +2231,31 @@ async fn build_catalog(
                 .await?
             }
         };
+        if matches!(sealed, SealedObject::Pending { .. }) {
+            wave_bytes += bytes.len() as u64;
+        }
         level_documents.push(document);
         level_sealed.push(sealed);
+        if metadata_wave_due(&level_sealed, wave_bytes) {
+            level_uploaded.extend(
+                upload_sealed_wave(
+                    std::mem::take(&mut level_sealed),
+                    format_repository_id,
+                    root_key,
+                    cache,
+                    journal,
+                    provider,
+                    repository,
+                    cancel,
+                )
+                .await?,
+            );
+            wave_bytes = 0;
+        }
     }
-    // One level registers together: its children are already confirmed, so
-    // every node of it is ready at the same moment.
-    for (document, remote) in level_documents.into_iter().zip(
+    // A level registers together where it fits one wave: its children are
+    // already confirmed, so every node of it is ready at the same moment.
+    level_uploaded.extend(
         upload_sealed_wave(
             level_sealed,
             format_repository_id,
@@ -2242,7 +2267,8 @@ async fn build_catalog(
             cancel,
         )
         .await?,
-    ) {
+    );
+    for (document, remote) in level_documents.into_iter().zip(level_uploaded) {
         referenced.push(remote.clone());
         built.push(CatalogRange {
             level: 0,
@@ -2268,6 +2294,8 @@ async fn build_catalog(
         )?;
         let mut level_documents = Vec::new();
         let mut level_sealed = Vec::new();
+        let mut level_uploaded = Vec::new();
+        let mut wave_bytes = 0u64;
         for EncodedCatalog { document, bytes } in batches {
             let sealed = match admitted_node(
                 &bytes, parent, format_repository_id, cache, evidence, repository,
@@ -2293,10 +2321,29 @@ async fn build_catalog(
                     .await?
                 }
             };
+            if matches!(sealed, SealedObject::Pending { .. }) {
+                wave_bytes += bytes.len() as u64;
+            }
             level_documents.push(document);
             level_sealed.push(sealed);
+            if metadata_wave_due(&level_sealed, wave_bytes) {
+                level_uploaded.extend(
+                    upload_sealed_wave(
+                        std::mem::take(&mut level_sealed),
+                        format_repository_id,
+                        root_key,
+                        cache,
+                        journal,
+                        provider,
+                        repository,
+                        cancel,
+                    )
+                    .await?,
+                );
+                wave_bytes = 0;
+            }
         }
-        for (document, remote) in level_documents.into_iter().zip(
+        level_uploaded.extend(
             upload_sealed_wave(
                 level_sealed,
                 format_repository_id,
@@ -2308,7 +2355,8 @@ async fn build_catalog(
                 cancel,
             )
             .await?,
-        ) {
+        );
+        for (document, remote) in level_documents.into_iter().zip(level_uploaded) {
             referenced.push(remote.clone());
             built.push(CatalogRange {
                 level,
@@ -2343,6 +2391,21 @@ async fn build_catalog(
         repository,
     )?;
     Ok(root)
+}
+
+/// How many newly sealed catalog nodes, and how many of their bytes, one wave
+/// holds before it is sent. A wide level is registered in several waves
+/// rather than sealed whole, so its ciphertext never outgrows the spool.
+const METADATA_WAVE_OBJECTS: usize = 64;
+const METADATA_WAVE_BYTES: u64 = 64 * 1024 * 1024;
+
+fn metadata_wave_due(sealed: &[SealedObject], bytes: u64) -> bool {
+    bytes >= METADATA_WAVE_BYTES
+        || sealed
+            .iter()
+            .filter(|object| matches!(object, SealedObject::Pending { .. }))
+            .count()
+            >= METADATA_WAVE_OBJECTS
 }
 
 /// A catalog whose root is in the selected parent graph is protected with it,
@@ -4787,6 +4850,46 @@ mod tests {
             for object in &completed.referenced_objects {
                 assert!(provider.holds(&object.receipt.locator.object), "{}", object.object_id);
             }
+        });
+    }
+
+    /// A catalog level far wider than one wave is sent in waves, so the
+    /// ciphertext it holds at once fits a spool that could not take the
+    /// whole level.
+    #[test]
+    fn c_a_wide_catalog_level_is_sent_in_waves_that_fit_the_spool() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let capture = captured_record_window(root.path(), "wide", 1, 2000, 0, 0, 0);
+            let meta = metadata("wide", &capture);
+            let directory = root.path().join("wide-job");
+            let job = format!("wide-{}", uuid::Uuid::new_v4());
+            let mut transfer = journal(&directory, &job, &capture);
+            let holder = (job.clone(), directory.clone());
+            transfer.set_spool_budget(
+                super::super::journal::SpoolBudget::new(job.clone(), move || {
+                    Ok(vec![holder.clone()])
+                })
+                .with_limit(400 * 1024),
+            );
+            let completed = package_and_upload(
+                capture, vec![], root.path(), &root.path().join("cache"), meta, &[5; 32],
+                limits(4096), None, &mut transfer, &provider, &repository,
+                &PhaseProgress::silent(), &Cancellation::default(),
+            )
+            .await
+            .unwrap();
+            let catalogs = completed
+                .referenced_objects
+                .iter()
+                .filter(|object| object.role == ObjectRole::Catalog)
+                .count();
+            assert!(
+                catalogs > 2 * METADATA_WAVE_OBJECTS,
+                "{catalogs} catalog nodes do not need more than one wave"
+            );
         });
     }
 

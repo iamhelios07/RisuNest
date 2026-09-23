@@ -740,6 +740,7 @@ async fn package_capture(
             capture: identity.clone(),
         },
     )?;
+    journal.set_spool_budget(super::runtime::spool_budget(&root, &job.id));
     // Step 4 of the publication contract needs the latest state, not just the
     // head: the new state inherits its sections and continues its commit order.
     let parent = match expected {
@@ -1583,7 +1584,7 @@ fn conflict_journal(
 ) -> Result<TransferJournal> {
     let root = super::runtime::root(app)?;
     let directory = super::runtime::job_directory(&root, &job.request.connection_id, &job.id);
-    TransferJournal::open(
+    let mut journal = TransferJournal::open(
         &directory,
         JobIdentity {
             job_id: job.id.clone(),
@@ -1592,7 +1593,9 @@ fn conflict_journal(
             capture_id: record.local.capture_id.clone(),
             capture: record.local.identity.clone(),
         },
-    )
+    )?;
+    journal.set_spool_budget(super::runtime::spool_budget(&root, &job.id));
+    Ok(journal)
 }
 
 async fn resume_conflict_preservation(
