@@ -25,21 +25,36 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// What one staging root had to fetch, and how much of it was packs.
 #[cfg(test)]
-static TEST_READ_COUNTS: std::sync::LazyLock<
-    std::sync::Mutex<BTreeMap<PathBuf, (u64, u64)>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct TestReads {
+    pub network: u64,
+    pub network_bytes: u64,
+    pub packs: u64,
+    pub pack_bytes: u64,
+    /// Packs whose stored ciphertext is at or below the small-pack size.
+    pub small_packs: u64,
+}
+
+/// The stored ciphertext length below which a pack counts as small.
+#[cfg(test)]
+pub(super) const SMALL_PACK_BYTES: u64 = 256 * 1024;
+
+#[cfg(test)]
+static TEST_READ_COUNTS: std::sync::LazyLock<std::sync::Mutex<BTreeMap<PathBuf, TestReads>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
 
 #[cfg(test)]
 pub(super) fn reset_test_read_counts(staging_root: &Path) {
     TEST_READ_COUNTS
         .lock()
         .unwrap()
-        .insert(staging_root.to_path_buf(), (0, 0));
+        .insert(staging_root.to_path_buf(), TestReads::default());
 }
 
 #[cfg(test)]
-pub(super) fn take_test_read_counts(staging_root: &Path) -> (u64, u64) {
+pub(super) fn take_test_read_counts(staging_root: &Path) -> TestReads {
     TEST_READ_COUNTS
         .lock()
         .unwrap()
@@ -48,15 +63,20 @@ pub(super) fn take_test_read_counts(staging_root: &Path) -> (u64, u64) {
 }
 
 #[cfg(test)]
-fn record_test_read(downloads: &Path, pack: bool) {
+fn record_test_read(downloads: &Path, pack: bool, byte_length: u64) {
     let staging_root = downloads
         .parent()
         .expect("snapshot downloads directory has a staging root");
     let mut reads = TEST_READ_COUNTS.lock().unwrap();
-    if let Some((network_reads, pack_reads)) = reads.get_mut(staging_root) {
-        *network_reads += 1;
+    if let Some(counts) = reads.get_mut(staging_root) {
+        counts.network += 1;
+        counts.network_bytes += byte_length;
         if pack {
-            *pack_reads += 1;
+            counts.packs += 1;
+            counts.pack_bytes += byte_length;
+            if byte_length <= SMALL_PACK_BYTES {
+                counts.small_packs += 1;
+            }
         }
     }
 }
@@ -227,7 +247,11 @@ async fn download_ciphertext(
     }
     let mut sink = SpoolSink::create(&partial, object.receipt.byte_length)?;
     #[cfg(test)]
-    record_test_read(downloads, object.role == ObjectRole::Pack);
+    record_test_read(
+        downloads,
+        object.role == ObjectRole::Pack,
+        object.receipt.byte_length,
+    );
     let receipt = provider
         .read_object(repository, &object.receipt.locator, None, &mut sink, cancel)
         .await?;
@@ -1187,10 +1211,21 @@ mod tests {
         let root_b = Path::new("snapshot-restore-read-count-root-b");
         reset_test_read_counts(root_a);
 
-        record_test_read(&root_a.join("downloads"), false);
-        record_test_read(&root_a.join("downloads"), true);
-        record_test_read(&root_b.join("downloads"), true);
+        record_test_read(&root_a.join("downloads"), false, 4);
+        record_test_read(&root_a.join("downloads"), true, SMALL_PACK_BYTES);
+        record_test_read(&root_a.join("downloads"), true, SMALL_PACK_BYTES + 1);
+        record_test_read(&root_b.join("downloads"), true, 8);
 
-        assert_eq!(take_test_read_counts(root_a), (2, 1));
+        let counts = take_test_read_counts(root_a);
+        assert_eq!(
+            counts,
+            TestReads {
+                network: 3,
+                network_bytes: SMALL_PACK_BYTES * 2 + 5,
+                packs: 2,
+                pack_bytes: SMALL_PACK_BYTES * 2 + 1,
+                small_packs: 1,
+            }
+        );
     }
 }

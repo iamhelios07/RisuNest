@@ -3024,6 +3024,90 @@ mod tests {
         }
     }
 
+    /// A library of `records` text records over `assets` shared assets, where
+    /// `edited` of them carry this revision's value starting at `offset` and
+    /// wrapping. Rotating the offset each revision is what spreads a library's
+    /// live records across the packs successive publications wrote.
+    fn captured_record_window(
+        root: &Path,
+        capture_id: &str,
+        revision: i64,
+        records: usize,
+        edited: usize,
+        offset: usize,
+        assets: usize,
+    ) -> CapturedSnapshot {
+        let directory = root
+            .join("external-storage")
+            .join("captures")
+            .join(capture_id);
+        let external = root.join("external-storage");
+        let mut catalog =
+            crate::external_storage::capture::CaptureCatalog::create(&directory, &external, None)
+                .unwrap();
+        let identity = CaptureIdentity {
+            store_id: "store".into(),
+            library_epoch: "epoch".into(),
+            generation: format!("generation-{revision}"),
+            selection_epoch: "selection".into(),
+            revision,
+        };
+        catalog.begin(&identity, None).unwrap();
+        let objects = external.join("objects");
+        {
+            let mut insert = catalog
+                .db
+                .prepare("INSERT INTO records VALUES(?1,?2,?3)")
+                .unwrap();
+            for index in 0..records {
+                let rotated = records.max(1);
+                let distance = (index + rotated - offset % rotated) % rotated;
+                // Every record carries its own body, so an edit produces content
+                // no other record shares. A fixture where a whole revision's
+                // edits are one body would pack into far fewer places than a
+                // library does.
+                let value = if distance < edited { revision } else { 0 };
+                let body = format!("{{\"record\":{index},\"value\":{value}}}").into_bytes();
+                let digest = hex::encode(hash(&body));
+                let path = objects.join(&digest);
+                if !path.exists() {
+                    fs::write(path, &body).unwrap();
+                }
+                insert
+                    .execute(params![format!("record/{index:06}"), digest, body.len() as i64])
+                    .unwrap();
+            }
+        }
+        let _cas = PayloadCas::new(root).unwrap();
+        let asset_root = root.join("assets").join("objects");
+        let mut insert_dependency = catalog
+            .db
+            .prepare("INSERT INTO dependencies VALUES(?1,?2,?3)")
+            .unwrap();
+        for index in 0..assets {
+            let bytes = (index as u64).to_le_bytes();
+            let digest = hex::encode(hash(&bytes));
+            let shard = asset_root.join(&digest[..2]);
+            fs::create_dir_all(&shard).unwrap();
+            let path = shard.join(&digest[2..]);
+            if !path.exists() {
+                fs::write(path, bytes).unwrap();
+            }
+            insert_dependency
+                .execute(params!["record/000000", digest, bytes.len() as i64])
+                .unwrap();
+        }
+        drop(insert_dependency);
+        catalog.finish().unwrap();
+        CapturedSnapshot {
+            id: capture_id.into(),
+            identity,
+            catalog,
+            projected_records: records,
+            shared: false,
+        }
+    }
+
     fn metadata(id: &str, capture: &CapturedSnapshot) -> SnapshotMetadata {
         SnapshotMetadata {
             snapshot_id: id.into(),
@@ -5560,8 +5644,8 @@ mod tests {
             .await
             .unwrap();
             let restore_elapsed = restore_started.elapsed();
-            let (network_reads, pack_reads) =
-                snapshot_restore::take_test_read_counts(&restore_root);
+            let reads = snapshot_restore::take_test_read_counts(&restore_root);
+            let (network_reads, pack_reads) = (reads.network, reads.packs);
             assert_eq!(restored.records.len(), 300);
             assert_eq!(restored.objects.len(), 100_000);
             assert!(provider
@@ -5786,6 +5870,84 @@ mod tests {
         });
     }
 
+    /// Section 11.3's question, answered on the aged repository rather than on
+    /// a fresh one: after a long sequence of edits, how much of a latest-state
+    /// restore's request budget is small record packs? Same-key, rotating-key
+    /// and mass-deletion edits age a library differently, so each is measured
+    /// on its own repository.
+    #[test]
+    #[ignore = "explicit aged-repository measurement"]
+    fn measures_an_aged_repository_across_edit_shapes() {
+        runtime().block_on(async {
+            const RECORDS: usize = 512;
+            const ASSETS: usize = 64;
+            const PUBLICATIONS: i64 = 120;
+            const WINDOW: usize = 4;
+            for shape in ["same-key", "rotating-key", "mass-deletion"] {
+                let root = tempfile::tempdir().unwrap();
+                let provider = FakeProvider::new(false);
+                let repository = fake::repository();
+                let key = [43; 32];
+                let cache = root.path().join("aged-cache");
+                let started = std::time::Instant::now();
+                let mut latest = None;
+                for revision in 1..=PUBLICATIONS {
+                    let step = (revision - 1) as usize;
+                    let (records, edited, offset) = match shape {
+                        "same-key" => (RECORDS, WINDOW, 0),
+                        "rotating-key" => (RECORDS, WINDOW, step * WINDOW),
+                        _ => (RECORDS - step * WINDOW, 0, 0),
+                    };
+                    let capture = captured_record_window(
+                        root.path(), &format!("aged-capture-{revision}"), revision,
+                        records, edited, offset, ASSETS);
+                    let snapshot_metadata = metadata(&format!("aged-snapshot-{revision}"), &capture);
+                    let job = format!("aged-job-{revision}");
+                    let mut transfer = journal(&root.path().join(&job), &job, &capture);
+                    let parent = latest.as_ref()
+                        .map(|previous| parent_graph(previous, &repository))
+                        .transpose().unwrap();
+                    latest = Some(package_and_upload(
+                        capture, Vec::new(), root.path(), &cache, snapshot_metadata, &key,
+                        limits(128 * 1024), parent.as_ref(), &mut transfer, &provider,
+                        &repository, &PhaseProgress::silent(), &Cancellation::default(),
+                    ).await.unwrap());
+                }
+                let publication_ms = started.elapsed().as_millis();
+                let (remote_objects, retained_bytes) = {
+                    let state = provider.state.lock().unwrap();
+                    (
+                        state.objects.len(),
+                        state.objects.values().map(|(bytes, _)| bytes.len() as u64).sum::<u64>(),
+                    )
+                };
+                let restore_root = root.path().join("aged-restore");
+                snapshot_restore::reset_test_read_counts(&restore_root);
+                let restore_started = std::time::Instant::now();
+                let restored = snapshot_restore::download_snapshot(
+                    &latest.unwrap().reference, &restore_root, &key, None,
+                    snapshot_restore::SourceTrust::Downloaded, &provider, &repository,
+                    &crate::external_storage::phase_progress::PhaseProgress::silent(),
+                    &Cancellation::default(),
+                ).await.unwrap();
+                let restore_ms = restore_started.elapsed().as_millis();
+                let reads = snapshot_restore::take_test_read_counts(&restore_root);
+                let live_bytes = restored.records.iter().map(|record| record.byte_length)
+                    .chain(restored.objects.iter().map(|object| object.byte_length))
+                    .sum::<u64>();
+                eprintln!(
+                    "shape={shape} records={} publications={PUBLICATIONS} live_records={} live_objects={} \
+                     live_bytes={live_bytes} remote_objects={remote_objects} retained_bytes={retained_bytes} \
+                     latest_requests={} downloaded_bytes={} live_packs={} small_live_packs={} pack_bytes={} \
+                     catalog_and_snapshot_bytes={} publication_ms={publication_ms} restore_ms={restore_ms}",
+                    RECORDS, restored.records.len(), restored.objects.len(),
+                    reads.network, reads.network_bytes, reads.packs, reads.small_packs,
+                    reads.pack_bytes, reads.network_bytes - reads.pack_bytes,
+                );
+            }
+        });
+    }
+
     #[test]
     #[ignore = "explicit publication-history measurement"]
     fn measures_three_hundred_small_publications_and_latest_restore() {
@@ -5872,8 +6034,8 @@ mod tests {
             .await
             .unwrap();
             let restore_elapsed = restore_started.elapsed();
-            let (network_reads, pack_reads) =
-                snapshot_restore::take_test_read_counts(&restore_root);
+            let reads = snapshot_restore::take_test_read_counts(&restore_root);
+            let (network_reads, pack_reads) = (reads.network, reads.packs);
             assert_eq!(restored.records.len(), 1);
             assert_eq!(restored.objects.len(), 1_000);
             assert!(network_reads < 50);

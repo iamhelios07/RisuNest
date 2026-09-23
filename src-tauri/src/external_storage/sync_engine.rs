@@ -3014,7 +3014,7 @@ mod receive_tests {
         assert_eq!(received_revision, 1);
         assert_eq!(
             super::super::snapshot_restore::take_test_read_counts(&source),
-            (0, 0)
+            Default::default()
         );
         assert_eq!(store.materialize(None).unwrap()["marker"], "remote");
         assert_eq!(rows(&mut store).len(), 1);
