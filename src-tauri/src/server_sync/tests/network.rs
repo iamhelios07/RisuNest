@@ -486,3 +486,80 @@ fn frame_sizing_measurement() {
     frame_case(&[256 * 1024, 1024 * 1024, 2 * 1024 * 1024, 3 * 1024 * 1024, 4 * 1024 * 1024, 8 * 1024 * 1024], 2, 0, 0, false);
     frame_case(&[1024 * 1024; 8], 2, 32 * 1024, 0, false);
 }
+
+/// §6.3 and U3. Two records that name the same references share the pages that
+/// describe them, so a receive that follows both roots in one walk downloads a
+/// shared subtree once instead of rejecting the second sight of it. The upload
+/// side's hint walk already skipped a page it had seen.
+#[test]
+fn one_walk_follows_two_roots_and_downloads_their_shared_pages_once() {
+    use crate::server_sync::{cache::Cache, transfer::Transfer};
+    use risunest_sync_wire::{descriptor::build_reference_tree, hash};
+    let root = tempfile::tempdir().unwrap();
+    let server = Arc::new(Store::init(root.path()).unwrap());
+    let credential = server.add_device().unwrap();
+    let device = server.authenticate(&credential.library_id, &credential.token).unwrap();
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    let listener = runtime.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let faults = Arc::new(Faults::default());
+    let served = server.clone();
+    let observed = faults.clone();
+    let task = runtime.spawn(async move {
+        let router = http::router(served).layer(axum::middleware::from_fn_with_state(observed, proxy));
+        axum::serve(Listener { listener, rate: 0, bytes: Arc::new(AtomicU64::new(0)) }, router).await.unwrap();
+    });
+    let client = ServerClient::new(ServerConfig {
+        directory: None, endpoint, library_id: credential.library_id,
+        device_id: credential.device_id, token: credential.token,
+    }).unwrap();
+
+    // Two dependency sets whose leading pages are identical, so their trees
+    // share every page below the one the differing tail lands in.
+    let mut shared: Vec<_> = (0..4_000u64)
+        .map(|index| hash(format!("shared dependency {index:016}").as_bytes()))
+        .collect();
+    shared.sort();
+    let mut tail = shared.clone();
+    tail.pop();
+    tail.push(hash(b"one dependency only the second record has"));
+    tail.sort();
+    let (first_root, first_pages) = build_reference_tree(&shared, false).unwrap();
+    let (second_root, second_pages) = build_reference_tree(&tail, false).unwrap();
+    let first_root = first_root.unwrap();
+    let second_root = second_root.unwrap();
+    assert_ne!(first_root, second_root);
+    for (digest, bytes) in first_pages.iter().chain(second_pages.iter()) {
+        server.put_object(&device, digest, bytes).unwrap();
+    }
+
+    let separate = tempfile::tempdir().unwrap();
+    let separate_cache = Cache::open(separate.path()).unwrap();
+    faults.requests.store(0, Ordering::Relaxed);
+    let transfer = Transfer::new(&client, &separate_cache).unwrap();
+    transfer.download_reference_tree(vec![(first_root.clone(), vec![])]).unwrap();
+    transfer.download_reference_tree(vec![(second_root.clone(), vec![])]).unwrap();
+    let apart = faults.requests.swap(0, Ordering::Relaxed);
+
+    let together = tempfile::tempdir().unwrap();
+    let together_cache = Cache::open(together.path()).unwrap();
+    let dependencies = Transfer::new(&client, &together_cache).unwrap()
+        .download_reference_tree(vec![
+            (first_root.clone(), vec![]),
+            (second_root.clone(), vec![]),
+            // A record naming a root another record already named is the same
+            // page twice, which is no longer a reason to refuse the walk.
+            (first_root, vec![]),
+        ])
+        .unwrap();
+    let joined = faults.requests.load(Ordering::Relaxed);
+    for (digest, bytes) in first_pages.iter().chain(second_pages.iter()) {
+        assert_eq!(together_cache.read(digest, risunest_sync_wire::MAX_METADATA_BYTES).unwrap(), *bytes);
+    }
+    // Both tails are there and the shared body is named once.
+    assert_eq!(dependencies.len(), shared.len() + 1);
+    eprintln!("reference_roots=3 separate_requests={apart} joined_requests={joined}");
+    assert!(joined < apart, "joined {joined} separate {apart}");
+    task.abort();
+    runtime.shutdown_timeout(Duration::from_secs(2));
+}
