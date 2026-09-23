@@ -173,13 +173,10 @@ impl Store {
         self.put_objects(device, &[(digest.to_owned(), bytes.to_vec())])
     }
     /// Whether a small body the metadata files as a file has to be published
-    /// again: its file is absent or holds other bytes. A healthy file keeps
-    /// the object where the row puts it; a damaged one is replaced there, so an
-    /// upload never acknowledges a body nothing can read.
-    fn filed_body_needs_repair(&self, digest: &str, bytes: &[u8]) -> Result<bool> {
-        if !matches!(placement(&*self.reader()?, digest)?, Some((_, false))) {
-            return Ok(false);
-        }
+    /// again because its file is absent or holds other bytes. A healthy file
+    /// keeps the object where the row puts it; a damaged one is replaced there,
+    /// so an upload never acknowledges a body nothing can read.
+    fn filed_body_differs(&self, digest: &str, bytes: &[u8]) -> Result<bool> {
         let file = match File::open(self.object_path(digest)?) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
@@ -233,6 +230,19 @@ impl Store {
         let mut directories = std::collections::BTreeSet::new();
         let mut inline: Vec<(&str, &[u8])> = Vec::new();
         let mut filed: Vec<(&str, u64)> = Vec::new();
+        // Small bodies an earlier upload published as files. Normally none.
+        let small_files = {
+            let reader = self.reader()?;
+            let mut found = std::collections::BTreeSet::new();
+            for (digest, bytes) in objects {
+                if bytes.len() <= SMALL_OBJECT_BYTES
+                    && matches!(placement(&reader, digest)?, Some((_, false)))
+                {
+                    found.insert(digest.as_str());
+                }
+            }
+            found
+        };
         for (digest, bytes) in objects {
             #[cfg(test)]
             let measured = std::time::Instant::now();
@@ -242,7 +252,9 @@ impl Store {
             }
             #[cfg(test)]
             frame_metrics::record(1, measured);
-            if bytes.len() <= SMALL_OBJECT_BYTES && !self.filed_body_needs_repair(digest, bytes)? {
+            if bytes.len() <= SMALL_OBJECT_BYTES
+                && !(small_files.contains(digest.as_str()) && self.filed_body_differs(digest, bytes)?)
+            {
                 inline.push((digest.as_str(), bytes.as_slice()));
                 continue;
             }
