@@ -2028,6 +2028,58 @@ mod tests {
         store.put(&holder).unwrap();
         assert!(spool_budget_owner(root.path(), &store, &waiting).unwrap().is_none());
     }
+    /// A13. The transfer spool is an app-wide budget, so what every unfinished
+    /// job holds counts together, whatever connection it belongs to and
+    /// whether it is working or waiting for its turn. A job's own spool is not
+    /// what holds it back, and a job stops counting when it is released rather
+    /// than when it stops.
+    #[test]
+    fn the_transfer_spool_budget_sums_what_every_unfinished_job_holds() {
+        use super::super::journal::TRANSFER_SPOOL_BUDGET;
+        let root = tempfile::tempdir().unwrap();
+        let store = JobStore::open(root.path()).unwrap();
+        let hold = |connection: &str, state: &str, bytes: u64| -> DurableJob {
+            let mut job = automatic_job();
+            job.request.connection_id = connection.into();
+            job.summary["connectionId"] = json!(connection);
+            job.summary["state"] = json!(state);
+            store.put(&job).unwrap();
+            if bytes > 0 {
+                let directory = job_directory(root.path(), connection, &job.id);
+                std::fs::create_dir_all(&directory).unwrap();
+                std::fs::File::create(directory.join("held.spool"))
+                    .unwrap()
+                    .set_len(bytes)
+                    .unwrap();
+            }
+            job
+        };
+        let requester = hold("connection-c", "queued", 0);
+        let smaller = hold("connection-a", "waiting", TRANSFER_SPOOL_BUDGET / 3);
+        assert!(spool_budget_owner(root.path(), &store, &requester).unwrap().is_none());
+
+        // Two connections together reach it, and the larger holder is the one
+        // the waiting job is told about.
+        let larger = hold("connection-b", "waiting", TRANSFER_SPOOL_BUDGET - TRANSFER_SPOOL_BUDGET / 3);
+        assert_eq!(
+            spool_budget_owner(root.path(), &store, &requester).unwrap(),
+            Some((larger.id.clone(), TRANSFER_SPOOL_BUDGET - TRANSFER_SPOOL_BUDGET / 3)),
+        );
+        // Without its own spool the smaller holder is under the budget, so it
+        // is never held back by what it is itself holding.
+        assert!(spool_budget_owner(root.path(), &store, &smaller).unwrap().is_none());
+
+        let mut released = larger.clone();
+        released.summary["state"] = json!("succeeded");
+        store.put(&released).unwrap();
+        assert!(spool_budget_owner(root.path(), &store, &requester).unwrap().is_none());
+
+        // A job that failed still owns its spool until a cleanup takes it.
+        released.summary["state"] = json!("failed");
+        store.put(&released).unwrap();
+        assert!(spool_budget_owner(root.path(), &store, &requester).unwrap().is_some());
+    }
+
     #[test]
     fn a_partial_restore_is_neither_a_failed_noop_nor_a_remote_publication() {
         let mut job = automatic_job();
