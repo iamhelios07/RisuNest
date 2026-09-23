@@ -1957,6 +1957,13 @@ impl PersistentStore {
     /// Normal external sync receive, after complete staged logical/payload
     /// validation and under the existing replacement fence and file(true).
     /// The remote base and activation are committed atomically.
+    /// The library rows themselves, for a test that has to look at what a
+    /// receive did rather than at what it reported.
+    #[cfg(test)]
+    pub(crate) fn library_rows(&self) -> &rusqlite::Connection {
+        &self.connection
+    }
+
     pub(crate) fn finish_external_receive(
         &mut self,
         prepared: PreparedReplaceCommit,

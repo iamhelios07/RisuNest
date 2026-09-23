@@ -36,8 +36,6 @@ pub(crate) mod publication;
 pub(crate) mod quota;
 pub(crate) mod quota_profiles;
 pub(crate) mod reachability;
-// The incremental receive that consumes this lands next.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod receive_difference;
 pub(crate) mod recovery;
 #[cfg(test)]

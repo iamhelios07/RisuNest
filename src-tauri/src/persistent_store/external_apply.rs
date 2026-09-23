@@ -142,6 +142,163 @@ impl PersistentStore {
     }
 }
 
+/// A receive small enough to change the active generation in place: the records
+/// the snapshot moved, the keys it no longer names, and the object lengths its
+/// records refer to.
+pub(crate) struct ExternalSnapshotDifference<'a> {
+    pub expected_revision: i64,
+    pub staging_root: &'a Path,
+    pub records: &'a [ExternalSnapshotRecord],
+    pub removed: &'a [String],
+    pub object_sizes: &'a BTreeMap<String, u64>,
+}
+
+impl PersistentStore {
+    /// Places the bodies a difference's records refer to and reports what every
+    /// object in the snapshot is long, which is what resolving a record's
+    /// dependencies needs. Writes into the content store rather than the
+    /// library, so it belongs outside the apply transaction.
+    pub(crate) fn stage_external_snapshot_objects<O>(
+        &self,
+        staging_root: &Path,
+        objects: O,
+    ) -> StoreResult<BTreeMap<String, u64>>
+    where
+        O: IntoIterator<Item = StoreResult<ExternalSnapshotObject>>,
+    {
+        let root = verified_staging_root(staging_root)?;
+        let content = ContentStore::open_existing(&root.join("external-storage"))?;
+        stage_objects(&self.repository_root, &root, content.as_ref(), objects)
+    }
+
+    /// Applies what the snapshot changed to the generation the library is
+    /// already using, so the records it left alone are neither rewritten nor
+    /// read. Everything the receive owes - rows, revision, the change index the
+    /// other backup consumers read, the connection's base and its record map,
+    /// and the job's completion - is one transaction.
+    pub(crate) fn apply_external_snapshot_difference(
+        &mut self,
+        difference: &ExternalSnapshotDifference<'_>,
+        job: &str,
+        base_records: &BTreeMap<String, String>,
+    ) -> StoreResult<super::RevisionResult> {
+        let root = verified_staging_root(difference.staging_root)?;
+        let content = ContentStore::open_existing(&root.join("external-storage"))?;
+        let cas = PayloadCas::new(&self.repository_root)?;
+        let mut removals = Vec::with_capacity(difference.removed.len());
+        for key in difference.removed {
+            let locator = decode_logical_record_key(key)
+                .map_err(|_| validation("External snapshot logical key is invalid"))?;
+            if matches!(locator, LogicalRecordLocator::Root) {
+                return invalid("External snapshot difference cannot remove the root record");
+            }
+            removals.push(locator);
+        }
+        let mut arrivals = Vec::with_capacity(difference.records.len());
+        for record in difference.records {
+            let locator = decode_logical_record_key(&record.key)
+                .map_err(|_| validation("External snapshot logical key is invalid"))?;
+            arrivals.push(locator);
+        }
+
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let actual_revision = current_revision(&tx)?;
+        if actual_revision != difference.expected_revision {
+            return Err(StoreError::RevisionConflict {
+                expected: difference.expected_revision,
+                actual: actual_revision,
+            });
+        }
+        super::external_storage_state::begin_receive_activation(&tx, job)?;
+        let generation = active_generation(&tx)?;
+        let revision = actual_revision + 1;
+        super::server_sync_outbox::begin_mutation(&tx, &generation, revision)?;
+        super::content_change_index::begin_mutation(&tx, &generation, revision, "external")?;
+
+        let local_root = tx
+            .query_row(
+                "SELECT value FROM root WHERE generation=?1",
+                [&generation],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|value| serde_json::from_str(&value))
+            .transpose()?;
+        let mut touched = std::collections::BTreeSet::new();
+        // A conversation whose character arrives in the same difference has to
+        // follow it, exactly as a complete stage defers one behind its parent.
+        let ordered = arrivals
+            .iter()
+            .enumerate()
+            .filter(|(_, locator)| !matches!(locator, LogicalRecordLocator::Conversation { .. }))
+            .chain(
+                arrivals
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, locator)| {
+                        matches!(locator, LogicalRecordLocator::Conversation { .. })
+                    }),
+            )
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        // A character is removed with everything under it, so its conversations
+        // need no separate removal and the order between them does not matter.
+        for locator in &removals {
+            note_touched_character(&mut touched, locator);
+            rows::apply_delete(&tx, &generation, locator)?;
+        }
+        for index in ordered {
+            let locator = arrivals[index].clone();
+            note_touched_character(&mut touched, &locator);
+            apply_record(
+                &tx,
+                &cas,
+                &generation,
+                &generation,
+                &root,
+                content.as_ref(),
+                difference.object_sizes,
+                difference.records[index].clone(),
+                locator,
+                local_root.as_ref(),
+            )?;
+        }
+        for character in touched {
+            tx.execute("UPDATE characters SET conversation_count=(SELECT count(*) FROM conversations WHERE generation=?1 AND character_id=?2) WHERE generation=?1 AND character_id=?2",params![generation,character])?;
+        }
+        rows::validate_configured_index_uniqueness(&tx, &generation)?;
+        let duplicate_plugin_ordinals: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM plugin_storage WHERE generation=?1 GROUP BY ordinal HAVING count(*)>1)",
+            [&generation], |row| row.get(0),
+        )?;
+        if duplicate_plugin_ordinals {
+            return invalid("External snapshot plugin records contain duplicate positions");
+        }
+        super::content_change_index::finish_mutation(&tx)?;
+        super::server_sync_outbox::finish_mutation(&tx)?;
+        super::commit::set_active(&tx, revision, &generation)?;
+        // Read after the revision moves, so the base names what the library
+        // now holds. The selected adapter is deliberately not marked dirty:
+        // this content came from it.
+        super::external_storage_state::finish_receive_activation(&tx, job, base_records)?;
+        tx.commit()?;
+        Ok(super::RevisionResult { revision })
+    }
+}
+
+fn note_touched_character(
+    touched: &mut std::collections::BTreeSet<String>,
+    locator: &LogicalRecordLocator,
+) {
+    if let LogicalRecordLocator::Character { character_id }
+    | LogicalRecordLocator::Conversation { character_id, .. } = locator
+    {
+        touched.insert(character_id.clone());
+    }
+}
+
 fn validate_application(application: &ExternalSnapshotApplication<'_>) -> StoreResult<()> {
     if *application.scope_id != library_fingerprint_domain() {
         return invalid("External snapshot fingerprint domain differs");

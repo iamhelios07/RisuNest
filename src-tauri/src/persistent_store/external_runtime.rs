@@ -248,7 +248,6 @@ impl PersistentStore {
     /// while the library still holds exactly that. The revision and identity
     /// are checked here rather than by the caller, so a view that no longer
     /// describes the library reads as absent instead of as empty.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn external_base_records(
         &self,
         connection: &str,

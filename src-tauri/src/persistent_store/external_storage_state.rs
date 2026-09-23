@@ -606,7 +606,6 @@ pub(crate) fn rebind_base_records(
     Ok(())
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn base_records(
     db: &Connection,
     connection: &str,
