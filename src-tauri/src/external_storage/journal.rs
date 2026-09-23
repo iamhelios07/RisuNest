@@ -25,6 +25,7 @@ pub(crate) const TRANSFER_SPOOL_BUDGET: u64 = 512 * 1024 * 1024;
 
 /// What one job directory is holding, counting only what a transfer owns.
 /// An unreadable directory reads as empty, so this is only for reporting.
+#[cfg(test)]
 pub(crate) fn spool_bytes(directory: &Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return 0;
