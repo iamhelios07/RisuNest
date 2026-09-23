@@ -1584,6 +1584,7 @@ async fn preserve_conflict(
         .durable_reference(&super::runtime::root(app)?)
         .map_err(local_error)?;
     let record = conflict_record_from_remote(connected, job, local, &remote, cancel).await?;
+    complete_local_conflict(app, &record, cancel).await?;
     let record = preserve_local_conflict(app, job, record)?;
     ensure_conflict_point(app, connected, job, record, false, protection, cancel).await
 }
@@ -1613,6 +1614,32 @@ async fn conflict_record_from_remote(
         },
         remote_point: None,
         resolved: false,
+    })
+}
+
+/// The conflict's local side is what the user recovers from, so every payload
+/// its capture names is held locally before the capture is kept for it.
+async fn complete_local_conflict(
+    app: &AppHandle,
+    record: &ExternalConflictRecord,
+    cancel: &Cancellation,
+) -> Result<()> {
+    let app = app.clone();
+    let capture_id = record.local.capture_id.clone();
+    let probe = super::runtime::CancelProbe(cancel.clone());
+    tokio::task::spawn_blocking(move || {
+        pds(&app)?
+            .complete_external_capture(&capture_id, &probe)
+            .map_err(local_error)
+    })
+    .await
+    .map_err(local_error)?
+    .map_err(|error| {
+        if cancel.check().is_err() {
+            ProviderError::new(ErrorKind::Cancelled)
+        } else {
+            error
+        }
     })
 }
 
@@ -2004,6 +2031,8 @@ async fn run_resolve_conflict(
                 "publishedRevision": stored.local.identity.revision.to_string(),
                 "maintenancePacks": completed.maintenance.packs.to_string(),
                 "maintenanceBytes": completed.maintenance.source_bytes.to_string(),
+                "sourceDownloadObjects": completed.hydration.objects.to_string(),
+                "sourceDownloadBytes": completed.hydration.bytes.to_string(),
             }))
         }
         PublicationResult::Conflict(_) => {
@@ -2306,6 +2335,7 @@ pub(crate) async fn run_sync(
                         cancel,
                     )
                     .await?;
+                    complete_local_conflict(app, &record, cancel).await?;
                     let record = preserve_local_conflict(app, job, record)?;
                     drop(journal);
                     ensure_conflict_point(app, connected, job, record, false, protection, cancel).await
@@ -2504,7 +2534,7 @@ pub(crate) async fn external_storage_recheck_conflict(
     let record = conflict_record(&app, &id)?
         .ok_or_else(|| ProviderError::new(ErrorKind::NotFound))?;
     let local_available =
-        super::capture::validate_capture_sources([&record.local], &root).is_ok();
+        super::capture::validate_recovery_sources([&record.local], &root).is_ok();
     Ok(conflict_summary(&record, local_available, true))
 }
 

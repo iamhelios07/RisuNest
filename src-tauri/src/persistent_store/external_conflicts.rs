@@ -2,7 +2,7 @@
 //! library database cannot discard a preserved source.
 use super::{sync_selection::CaptureIdentity, StoreError, StoreResult};
 use crate::external_storage::capture::{
-    registered_capture_roots, validate_capture_sources, DurableCaptureReference,
+    registered_capture_roots, validate_recovery_sources, DurableCaptureReference,
     RegisteredCaptureRoots,
 };
 use risunest_external_storage_format::snapshot::{ObjectRole, StoredObject};
@@ -409,7 +409,7 @@ pub(crate) fn conflict_source_descriptor(db: &Connection, repository_root: &Path
     let record = external_conflict(db, id)?.ok_or_else(|| invalid("External conflict does not exist"))?;
     match side {
         ConflictSide::Local => {
-            validate_capture_sources([&record.local], repository_root)?;
+            validate_recovery_sources([&record.local], repository_root)?;
             Ok(ConflictSourceDescriptor::Local {
                 conflict_id: record.id,
                 repository_id: record.repository_id,

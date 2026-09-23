@@ -1037,6 +1037,123 @@ fn external_capture_text_delta_does_not_hydrate_unchanged_remote_only_payloads()
     assert!(cas.stat_object(&payload.content_hash).unwrap().is_none());
 }
 
+/// An asset alias whose payload body this device no longer holds.
+fn released_payload_alias(
+    store: &mut PersistentStore,
+    root: &std::path::Path,
+    body: &[u8],
+) -> String {
+    let cas = crate::asset_repository::PayloadCas::new(root).unwrap();
+    let payload = cas.prepare_bytes(body).unwrap();
+    store
+        .commit_asset_alias(
+            &AssetAlias {
+                key: "assets/custody-only.bin".into(),
+                object_hash: Some(payload.content_hash.clone()),
+                kind: "asset".into(),
+                size: payload.byte_size as i64,
+                mime: "application/octet-stream".into(),
+                name: "custody-only".into(),
+                ext: "bin".into(),
+                inlay_type: None,
+                width: None,
+                height: None,
+                metadata: json!({}),
+            },
+            1,
+        )
+        .unwrap();
+    fs::remove_file(
+        cas.object_path(&payload.content_hash)
+            .unwrap()
+            .expect("payload path"),
+    )
+    .unwrap();
+    payload.content_hash
+}
+
+#[test]
+fn external_capture_sizes_a_custody_only_payload_without_fetching_it() {
+    struct Never;
+    impl crate::local_backup::CancellationProbe for Never {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+    let (directory, mut store, _) = capture_fixture();
+    let body = b"synthetic custody-only payload";
+    let hash = released_payload_alias(&mut store, directory.path(), body);
+    assert!(capture_library(&mut store, "destination", &Never).is_err());
+
+    crate::server_sync::residency::test_remote::hold(
+        directory.path(),
+        &[(&hash, body.len() as u64)],
+    );
+    let capture = capture_library(&mut store, "destination", &Never).unwrap();
+    let bytes: i64 = capture
+        .catalog
+        .db
+        .query_row("SELECT bytes FROM dependencies WHERE hash=?1", [&hash], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(bytes, body.len() as i64);
+    assert_eq!(
+        crate::server_sync::residency::test_remote::fetched(directory.path()),
+        0
+    );
+    assert!(crate::asset_repository::PayloadCas::new(directory.path())
+        .unwrap()
+        .stat_object(&hash)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn a_transfer_capture_serves_local_recovery_only_once_it_is_completed() {
+    struct Never;
+    impl crate::local_backup::CancellationProbe for Never {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+    let (directory, mut store, _) = capture_fixture();
+    let root = directory.path();
+    let body = b"synthetic custody-only payload";
+    let hash = released_payload_alias(&mut store, root, body);
+    crate::server_sync::residency::test_remote::hold(root, &[(&hash, body.len() as u64)]);
+    crate::server_sync::residency::test_remote::serve(root, &hash, body.to_vec());
+    let capture = capture_library(&mut store, "destination", &Never).unwrap();
+    // The publishing job owns it, as it does while a conflict is preserved.
+    store.retain_external_capture(&capture.id, "job").unwrap();
+    let reference = capture.durable_reference(root).unwrap();
+
+    assert!(crate::external_storage::capture::validate_recovery_sources([&reference], root)
+        .is_err());
+    assert!(
+        crate::external_storage::snapshot_export::prepare_local_conflict_snapshot(
+            root,
+            "format-repository",
+            &reference,
+        )
+        .is_err()
+    );
+    assert_eq!(crate::server_sync::residency::test_remote::fetched(root), 0);
+
+    store.complete_external_capture(&capture.id, &Never).unwrap();
+    assert_eq!(crate::server_sync::residency::test_remote::fetched(root), 1);
+    crate::external_storage::capture::validate_recovery_sources([&reference], root).unwrap();
+    crate::external_storage::snapshot_export::prepare_local_conflict_snapshot(
+        root,
+        "format-repository",
+        &reference,
+    )
+    .unwrap();
+    // A completed capture holds everything, so completing it again fetches nothing.
+    store.complete_external_capture(&capture.id, &Never).unwrap();
+    assert_eq!(crate::server_sync::residency::test_remote::fetched(root), 1);
+}
+
 #[test]
 fn external_capture_projects_only_changed_records_at_the_pinned_snapshot() {
     use super::super::content_capture::ContentCaptureSink;

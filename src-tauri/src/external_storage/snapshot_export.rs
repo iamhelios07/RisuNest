@@ -65,7 +65,7 @@ pub(crate) fn prepare_local_conflict_snapshot(
     if !bounded_identity(repository_id) {
         return Err(corrupt("conflict repository identity is invalid"));
     }
-    let roots = capture::validate_capture_sources([reference], repository_root).map_err(corrupt)?;
+    let roots = capture::validate_recovery_sources([reference], repository_root).map_err(corrupt)?;
     let mut catalogs = roots.catalogs.into_iter();
     let catalog_path = catalogs
         .next()

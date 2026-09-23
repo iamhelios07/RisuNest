@@ -2,7 +2,7 @@
 //! This layer starts only after the PDS read snapshot has closed.
 use super::{
     capabilities::Capabilities,
-    content_store::{ContentStore, ObjectSource},
+    content_store::{Body, ContentStore, ObjectSource},
     contract::{
         Cancellation, ErrorKind, ObjectIntent, ObjectReceipt, ObjectRole, Provider, ProviderError,
         ReadReceipt, RemoteLocator, RepositoryHandle, Result,
@@ -289,6 +289,16 @@ pub(crate) struct CompletedSnapshot {
     /// What the optional maintenance portion repackaged, reported apart from
     /// the publication's own work.
     pub maintenance: MaintenanceReport,
+    pub hydration: SourceHydration,
+}
+
+/// Library bodies this publication fetched through custody into the asset
+/// repository because the destination did not already hold them. They stay
+/// there afterwards as local data.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SourceHydration {
+    pub objects: u64,
+    pub bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -906,10 +916,7 @@ impl StoredSize<'_> {
     }
 }
 
-fn capture_sources(
-    capture: &CapturedSnapshot,
-    repository_root: &Path,
-) -> Result<(Vec<SourceEntry>, Vec<SourceEntry>)> {
+fn capture_sources(capture: &CapturedSnapshot) -> Result<(Vec<SourceEntry>, Vec<SourceEntry>)> {
     let mut records = Vec::new();
     let mut query = capture
         .catalog
@@ -958,7 +965,6 @@ fn capture_sources(
         });
     }
     records.sort_by(|a, b| a.key.cmp(&b.key));
-    let cas = PayloadCas::new(repository_root).map_err(transient)?;
     let mut assets = Vec::new();
     let mut query = capture.catalog.db.prepare("SELECT DISTINCT d.hash,d.bytes FROM dependencies d LEFT JOIN generated g ON g.hash=d.hash WHERE g.hash IS NULL ORDER BY d.hash").map_err(corrupt)?;
     for row in query
@@ -971,16 +977,12 @@ fn capture_sources(
         if !crate::trust_boundary::is_lower_hex_256(&digest) {
             return Err(corrupt("capture dependency hash is invalid"));
         }
-        let path = cas
-            .object_path(&digest)
-            .map_err(transient)?
-            .ok_or_else(|| corrupt("capture payload missing"))?;
         assets.push(SourceEntry {
             kind: wire::CatalogEntryKind::Object,
             key: format!("object/{digest}"),
-            content_sha256: digest,
+            content_sha256: digest.clone(),
             byte_length: u64::try_from(bytes).map_err(corrupt)?,
-            source: ObjectSource::File(path),
+            source: ObjectSource::Library(digest),
             compression: CompressionPolicy::AlreadyCompressed,
         });
     }
@@ -1074,6 +1076,7 @@ async fn build_entries(
     repository: &RepositoryHandle,
     prepared: &Arc<PhaseProgress>,
     maintenance: &mut MaintenanceReport,
+    hydration: &mut SourceHydration,
     cancel: &Cancellation,
 ) -> Result<(Vec<EntryPlan>, Vec<RemoteObject>)> {
     prepared.plan(
@@ -1257,6 +1260,10 @@ async fn build_entries(
     }
     let build_root_owned = build_root.to_path_buf();
     let external_root_owned = external_root.to_path_buf();
+    let repository_root_owned = external_root
+        .parent()
+        .ok_or_else(|| corrupt("external storage root has no repository"))?
+        .to_path_buf();
     let cancel_owned = cancel.clone();
     let producer_prepared = Arc::clone(prepared);
     let placed = placements;
@@ -1268,6 +1275,7 @@ async fn build_entries(
     let producer = tokio::task::spawn_blocking(move || {
         prepare_packs(
             uncached,
+            &repository_root_owned,
             &external_root_owned,
             &build_root_owned,
             target,
@@ -1358,7 +1366,9 @@ async fn build_entries(
     if let Some(error) = failure {
         return Err(error);
     }
-    let pending = produced.map_err(transient)??;
+    let (pending, fetched) = produced.map_err(transient)??;
+    hydration.objects += fetched.objects;
+    hydration.bytes += fetched.bytes;
     // The last family is only worth sending once production has answered for
     // every source, because a publication that cannot finish has no use for it.
     if !family.is_empty() {
@@ -1441,6 +1451,7 @@ async fn build_entries(
 #[allow(clippy::too_many_arguments)]
 fn prepare_packs(
     sources: Vec<SourceEntry>,
+    repository_root: &Path,
     external_root: &Path,
     build_root: &Path,
     target: u64,
@@ -1451,7 +1462,7 @@ fn prepare_packs(
     handle: &tokio::runtime::Handle,
     prepared: &PhaseProgress,
     cancel: &Cancellation,
-) -> Result<Vec<PendingEntry>> {
+) -> Result<(Vec<PendingEntry>, SourceHydration)> {
     fs::create_dir_all(build_root).map_err(transient)?;
     if crate::trust_boundary::is_link_like(&fs::symlink_metadata(build_root).map_err(transient)?) {
         return Err(corrupt("snapshot build directory is a link"));
@@ -1462,9 +1473,18 @@ fn prepare_packs(
     let mut current: Option<PendingPack> = None;
     let mut pending = Vec::new();
     let mut cpu = Some(handle.block_on(cpu_permit())?);
+    let mut hydration = SourceHydration::default();
     for source in sources {
         cancel.check()?;
-        let mut input = content.open_source(&source.source).map_err(corrupt)?;
+        let mut input = match &source.source {
+            ObjectSource::Library(digest) => Body::File(open_library_source(
+                repository_root,
+                digest,
+                &mut hydration,
+                cancel,
+            )?),
+            other => content.open_source(other).map_err(corrupt)?,
+        };
         if input.len().map_err(corrupt)? != source.byte_length {
             return Err(corrupt("capture source length differs"));
         }
@@ -1549,7 +1569,62 @@ fn prepare_packs(
     if let Some(pack) = current {
         send_pack(pack, built, handle, &mut cpu)?;
     }
-    Ok(pending)
+    Ok((pending, hydration))
+}
+
+/// A library body where the asset repository holds it, or fetched through its
+/// custody first. The fetch is verified against the body's hash and custody
+/// size before anything reads it, and needs that much free space on the
+/// repository volume.
+fn open_library_source(
+    repository_root: &Path,
+    digest: &str,
+    hydration: &mut SourceHydration,
+    cancel: &Cancellation,
+) -> Result<fs::File> {
+    use crate::server_sync::residency::{open_or_hydrate_with_check, Residency};
+    let custody = |error: crate::server_sync::SyncError| {
+        if cancel.check().is_err() {
+            ProviderError::new(ErrorKind::Cancelled)
+        } else {
+            transient(error.code)
+        }
+    };
+    let held = PayloadCas::new(repository_root)
+        .and_then(|cas| cas.stat_object(digest))
+        .map_err(transient)?
+        .is_some();
+    let mut fetched = 0;
+    if !held {
+        let custody_size = if Residency::exists(repository_root) {
+            Residency::open(repository_root)
+                .and_then(|residency| residency.object(digest, None))
+                .map_err(custody)?
+                .map(|object| object.size)
+        } else {
+            None
+        };
+        let Some(size) = custody_size else {
+            return Err(ProviderError::new(ErrorKind::NotFound));
+        };
+        if fs2::available_space(repository_root).map_err(transient)? < size {
+            return Err(ProviderError::new(ErrorKind::StorageFull));
+        }
+        fetched = size;
+    }
+    let check = || {
+        cancel
+            .check()
+            .map_err(|_| crate::server_sync::SyncError::new("cancelled", 409))
+    };
+    let file = open_or_hydrate_with_check(repository_root, digest, &check)
+        .map_err(custody)?
+        .ok_or_else(|| ProviderError::new(ErrorKind::NotFound))?;
+    if !held {
+        hydration.objects += 1;
+        hydration.bytes += fetched;
+    }
+    Ok(file)
 }
 
 /// The pack is durable before it is handed over, and the producer holds no CPU
@@ -2664,12 +2739,11 @@ pub(crate) async fn package_and_upload(
     };
     let mut evidence = ObjectEvidence::open(repository_root, journal.connection_id())?;
     let external_root = repository_root.join("external-storage");
-    let repository_root_owned = repository_root.to_path_buf();
     let library_domain = library_fingerprint_domain();
     let cpu = cpu_permit().await?;
     let (record_sources, asset_sources, observed_fingerprint) =
         tokio::task::spawn_blocking(move || {
-            let (records, assets) = capture_sources(&capture, &repository_root_owned)?;
+            let (records, assets) = capture_sources(&capture)?;
             let fingerprint = capture
                 .catalog
                 .content_fingerprint(&library_domain)
@@ -2683,6 +2757,7 @@ pub(crate) async fn package_and_upload(
         return Err(corrupt("snapshot library fingerprint differs"));
     }
     let mut maintenance = MaintenanceReport::default();
+    let mut hydration = SourceHydration::default();
     let record_fingerprint = catalog_fingerprint(wire::CatalogKind::Records, &record_sources);
     let asset_fingerprint = catalog_fingerprint(wire::CatalogKind::Assets, &asset_sources);
     let (record_entries, mut referenced) = build_entries(
@@ -2702,6 +2777,7 @@ pub(crate) async fn package_and_upload(
         repository,
         prepared,
         &mut maintenance,
+        &mut hydration,
         cancel,
     )
     .await?;
@@ -2773,6 +2849,7 @@ pub(crate) async fn package_and_upload(
             repository,
             prepared,
             &mut MaintenanceReport::default(),
+            &mut hydration,
             cancel,
         )
         .await?;
@@ -2856,6 +2933,7 @@ pub(crate) async fn package_and_upload(
             repository,
             prepared,
             &mut MaintenanceReport::default(),
+            &mut hydration,
             cancel,
         )
         .await?;
@@ -2981,6 +3059,7 @@ pub(crate) async fn package_and_upload(
     referenced.dedup_by(|a, b| a.object_id == b.object_id);
     Ok(CompletedSnapshot {
         maintenance,
+        hydration,
         reference,
         snapshot_id: metadata.snapshot_id,
         repository_id: metadata.repository_id,
@@ -5172,6 +5251,200 @@ mod tests {
             assert!(restored.objects.iter().any(|object| fs::read(object.source.file().unwrap()).unwrap() == b"asset"));
         });
     }
+    /// A capture of one record that names these payloads by hash and length,
+    /// whether or not the payload store holds their bodies.
+    fn captured_payloads(
+        root: &Path,
+        capture_id: &str,
+        revision: i64,
+        record: &[u8],
+        payloads: &[&[u8]],
+    ) -> (CapturedSnapshot, Vec<String>) {
+        let directory = root
+            .join("external-storage")
+            .join("captures")
+            .join(capture_id);
+        let external = root.join("external-storage");
+        let mut catalog =
+            crate::external_storage::capture::CaptureCatalog::create(&directory, &external, None)
+                .unwrap();
+        let identity = CaptureIdentity {
+            store_id: "store".into(),
+            library_epoch: "epoch".into(),
+            generation: "generation".into(),
+            selection_epoch: "selection".into(),
+            revision,
+        };
+        catalog.begin(&identity, None).unwrap();
+        catalog.record("root", record).unwrap();
+        let mut digests = Vec::new();
+        for payload in payloads {
+            let digest = hex::encode(hash(payload));
+            catalog.reference("root", &digest, payload.len() as u64).unwrap();
+            digests.push(digest);
+        }
+        catalog.finish().unwrap();
+        (
+            CapturedSnapshot {
+                id: capture_id.into(),
+                identity,
+                catalog,
+                projected_records: 1,
+                shared: false,
+            },
+            digests,
+        )
+    }
+
+    /// Leaves a payload only in custody, as a remote residency policy does.
+    fn release_to_custody(root: &Path, digest: &str, size: u64) {
+        let cas = PayloadCas::new(root).unwrap();
+        fs::remove_file(cas.object_path(digest).unwrap().unwrap()).unwrap();
+        crate::server_sync::residency::test_remote::hold(root, &[(digest, size)]);
+    }
+
+    /// A published asset held only in custody, and the parent that holds it.
+    async fn published_then_released(
+        root: &Path,
+        provider: &FakeProvider,
+        repository: &RepositoryHandle,
+        key: &[u8; 32],
+    ) -> (CompletedSnapshot, String) {
+        let (capture, asset) = captured(root, "capture-1", 1, b"record one", b"asset one");
+        let meta = metadata("snapshot-1", &capture);
+        let mut journal = journal(&root.join("job-1"), "job-1", &capture);
+        let first = package_and_upload(capture, vec![], root, &root.join("cache"), meta, key,
+            limits(128 * 1024), None, &mut journal, provider, repository, &PhaseProgress::silent(),
+            &Cancellation::default()).await.unwrap();
+        release_to_custody(root, &asset, b"asset one".len() as u64);
+        (first, asset)
+    }
+
+    /// The next publication, which names the released asset and `added`.
+    async fn publish_with(
+        root: &Path,
+        first: &CompletedSnapshot,
+        added: &[&[u8]],
+        provider: &FakeProvider,
+        repository: &RepositoryHandle,
+        key: &[u8; 32],
+    ) -> Result<CompletedSnapshot> {
+        let mut payloads: Vec<&[u8]> = vec![b"asset one"];
+        payloads.extend_from_slice(added);
+        let (capture, _) = captured_payloads(root, "capture-2", 2, b"record two", &payloads);
+        let meta = metadata("snapshot-2", &capture);
+        let mut journal = journal(&root.join("job-2"), "job-2", &capture);
+        let parent = parent_graph(first, repository).unwrap();
+        package_and_upload(capture, vec![], root, &root.join("cache"), meta, key,
+            limits(128 * 1024), Some(&parent), &mut journal, provider, repository,
+            &PhaseProgress::silent(), &Cancellation::default()).await
+    }
+
+    fn snapshots(provider: &FakeProvider) -> usize {
+        provider.state.lock().unwrap().objects.keys()
+            .filter(|id| id.starts_with("snapshot-")).count()
+    }
+
+    /// An asset the destination already holds is reused without a fetch, even
+    /// when only custody holds its body on this device.
+    #[test]
+    fn c_a_custody_only_asset_the_parent_holds_is_not_fetched() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let key = [7; 32];
+            let (first, asset) =
+                published_then_released(root.path(), &provider, &repository, &key).await;
+            let second = publish_with(root.path(), &first, &[], &provider, &repository, &key)
+                .await.unwrap();
+            assert_eq!(second.hydration, SourceHydration::default());
+            assert_eq!(crate::server_sync::residency::test_remote::fetched(root.path()), 0);
+            assert_ne!(second.record_catalog.object_id, first.record_catalog.object_id);
+            assert!(PayloadCas::new(root.path()).unwrap().stat_object(&asset).unwrap().is_none());
+        });
+    }
+
+    /// Of two custody-only assets, only the one the destination lacks is
+    /// fetched, and it is fetched once, checked, and restored intact.
+    #[test]
+    fn c_a_publication_fetches_only_the_custody_asset_its_destination_lacks() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let key = [7; 32];
+            let (first, held) =
+                published_then_released(root.path(), &provider, &repository, &key).await;
+            let missing = hex::encode(hash(b"asset two"));
+            crate::server_sync::residency::test_remote::hold(root.path(), &[(&missing, 9)]);
+            crate::server_sync::residency::test_remote::serve(
+                root.path(), &missing, b"asset two".to_vec(),
+            );
+            let second = publish_with(root.path(), &first, &[b"asset two"], &provider, &repository, &key)
+                .await.unwrap();
+            assert_eq!(second.hydration, SourceHydration { objects: 1, bytes: 9 });
+            assert_eq!(crate::server_sync::residency::test_remote::fetched(root.path()), 1);
+            let cas = PayloadCas::new(root.path()).unwrap();
+            assert_eq!(cas.stat_object(&missing).unwrap(), Some(9));
+            assert!(cas.stat_object(&held).unwrap().is_none());
+            let restored = snapshot_restore::download_snapshot(&second.reference,
+                &root.path().join("restored"), &key, None, snapshot_restore::SourceTrust::Downloaded,
+                &provider, &repository, &PhaseProgress::silent(), &Cancellation::default())
+                .await.unwrap();
+            for (digest, body) in [(&held, &b"asset one"[..]), (&missing, &b"asset two"[..])] {
+                let object = restored.objects.iter()
+                    .find(|object| &object.content_hash == digest).unwrap();
+                assert_eq!(fs::read(object.source.file().unwrap()).unwrap(), body);
+            }
+        });
+    }
+
+    /// A fetched body that differs from its identity is never packaged, and
+    /// the publication stops before it names a snapshot.
+    #[test]
+    fn c_a_fetched_asset_that_fails_its_check_publishes_nothing() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let key = [7; 32];
+            let (first, _) =
+                published_then_released(root.path(), &provider, &repository, &key).await;
+            let missing = hex::encode(hash(b"asset two"));
+            crate::server_sync::residency::test_remote::hold(root.path(), &[(&missing, 9)]);
+            crate::server_sync::residency::test_remote::serve(
+                root.path(), &missing, b"asset 2!!".to_vec(),
+            );
+            let before = snapshots(&provider);
+            let error = publish_with(root.path(), &first, &[b"asset two"], &provider, &repository, &key)
+                .await.unwrap_err();
+            assert_eq!(error.kind, ErrorKind::Transient);
+            assert_eq!(snapshots(&provider), before);
+            assert!(PayloadCas::new(root.path()).unwrap().stat_object(&missing).unwrap().is_none());
+        });
+    }
+
+    /// An asset neither held nor in custody ends the publication as not
+    /// found, before it names a snapshot.
+    #[test]
+    fn c_an_asset_without_custody_publishes_nothing() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let key = [7; 32];
+            let (first, _) =
+                published_then_released(root.path(), &provider, &repository, &key).await;
+            let before = snapshots(&provider);
+            let error = publish_with(root.path(), &first, &[b"asset two"], &provider, &repository, &key)
+                .await.unwrap_err();
+            assert_eq!(error.kind, ErrorKind::NotFound);
+            assert_eq!(snapshots(&provider), before);
+            assert_eq!(crate::server_sync::residency::test_remote::fetched(root.path()), 0);
+        });
+    }
+
     /// An entry whose packs belong to the selected parent is admitted on that
     /// membership alone. The tag moves with each publication, so the test also
     /// covers a reused entry still being admissible under the next parent.
@@ -6394,16 +6667,16 @@ mod tests {
         });
     }
 
-    /// What a publication does before it can build its first pack. Every
-    /// dependency the capture names is looked up in the payload store, which is
-    /// what stands in front of the first upload at this library size.
+    /// What a publication does before it can build its first pack: every
+    /// source the capture names is listed, which is what stands in front of
+    /// the first upload at this library size.
     #[test]
     #[ignore = "explicit planning-pass measurement"]
     fn measures_the_source_pass_that_precedes_the_first_pack() {
         let root = tempfile::tempdir().unwrap();
         let capture = captured_asset_inventory(root.path(), "planning", 1, 300, 0, 100_000);
         let started = std::time::Instant::now();
-        let (records, assets) = capture_sources(&capture, root.path()).unwrap();
+        let (records, assets) = capture_sources(&capture).unwrap();
         eprintln!(
             "records={} assets={} source_pass_ms={}",
             records.len(),

@@ -437,8 +437,14 @@ fn capture_roots<'a>(
     references: impl IntoIterator<Item = &'a DurableCaptureReference>,
     repository_root: &Path,
     verify_contents: bool,
+    recovery: bool,
 ) -> Result<RegisteredCaptureRoots> {
     let mut roots = RegisteredCaptureRoots::default();
+    let payloads = if recovery {
+        Some(crate::asset_repository::PayloadCas::new(repository_root)?)
+    } else {
+        None
+    };
     for reference in references {
         let (path, external_root) = resolve_registered_catalog(repository_root, reference)?;
         let expected: [u8; 32] = hex::decode(&reference.catalog_hash)
@@ -458,6 +464,19 @@ fn capture_roots<'a>(
                 return Err(invalid("Registered capture payload identity differs"));
             }
             roots.assets.object_hashes.insert(hash);
+        }
+        if let Some(payloads) = &payloads {
+            let mut held = catalog.db.prepare(
+                "SELECT DISTINCT d.hash,d.bytes FROM dependencies d LEFT JOIN generated g ON g.hash=d.hash WHERE g.hash IS NULL",
+            )?;
+            for payload in held.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })? {
+                let (hash, bytes) = payload?;
+                if payloads.stat_object(&hash)? != u64::try_from(bytes).ok() {
+                    return Err(invalid("Recovery capture payload is not held locally"));
+                }
+            }
         }
 
         let mut objects = catalog.db.prepare(
@@ -493,14 +512,25 @@ pub(crate) fn registered_capture_roots<'a>(
     references: impl IntoIterator<Item = &'a DurableCaptureReference>,
     repository_root: &Path,
 ) -> Result<RegisteredCaptureRoots> {
-    capture_roots(references, repository_root, false)
+    capture_roots(references, repository_root, false, false)
 }
 
+#[cfg(test)]
 pub(crate) fn validate_capture_sources<'a>(
     references: impl IntoIterator<Item = &'a DurableCaptureReference>,
     repository_root: &Path,
 ) -> Result<RegisteredCaptureRoots> {
-    capture_roots(references, repository_root, true)
+    capture_roots(references, repository_root, true, false)
+}
+
+/// What `validate_capture_sources` checks, and that every payload the capture
+/// names is held locally at its recorded length, so local recovery never has
+/// to reach custody.
+pub(crate) fn validate_recovery_sources<'a>(
+    references: impl IntoIterator<Item = &'a DurableCaptureReference>,
+    repository_root: &Path,
+) -> Result<RegisteredCaptureRoots> {
+    capture_roots(references, repository_root, true, true)
 }
 
 /// GC performs this inventory only when it actually needs roots. Every normal

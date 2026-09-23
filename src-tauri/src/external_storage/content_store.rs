@@ -37,8 +37,9 @@ const GROUP_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) enum ObjectSource {
     File(PathBuf),
     Captured(String),
-    /// A body the asset repository already holds under this content hash. It
-    /// is registered where it is rather than read out of a staging file.
+    /// A body the asset repository answers for under this content hash, held
+    /// locally or through its custody. It is registered where it is rather
+    /// than read out of a staging file, and only packaging resolves one.
     Library(String),
     /// A record the receiving library already holds under the same key and
     /// identity. A difference leaves it alone, so its body was never fetched

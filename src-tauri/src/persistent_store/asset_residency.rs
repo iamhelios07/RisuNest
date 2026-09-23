@@ -134,8 +134,9 @@ impl PersistentStore {
             local.extend(root.object_hashes);
             local.extend(root.manifest_hashes);
         }
-        // External captures require complete local payloads through publication,
-        // even when the source alias was removed by a later edit.
+        // External captures require their payloads, held locally or in custody,
+        // through publication, even when the source alias was removed by a
+        // later edit.
         local.extend(
             crate::external_storage::capture::registered_roots(
                 &self.connection,
