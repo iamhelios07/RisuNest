@@ -122,6 +122,7 @@ const english = {
     errorGeneric: 'Could not complete this. Try again.',
     jobKinds: { cleanup: 'Cleanup', backup: 'Backup', sync: 'Sync', restore: 'Restore', 'pin-history': 'Keep', 'delete-history': 'Delete backup', 'resolve-conflict': 'Resolve conflict', 'check-repository': 'Check' },
     jobActive: { cleanup: 'Cleaning up', backup: 'Backing up', sync: 'Syncing', restore: 'Restoring', 'pin-history': 'Keeping', 'delete-history': 'Deleting backup', 'resolve-conflict': 'Resolving conflict', 'check-repository': 'Checking' },
+    jobCounters: { prepared: 'Prepared', transferred: 'Sent' },
     historyKinds: { snapshot: 'Sync', 'backup-point': 'Backup', conflict: 'Conflict backup', 'recovery-candidate': 'Recovery candidate' },
     endpointWarnings: {
         'github-dedicated-repository': 'Use a separate private repository. This connection is backup only.',
@@ -282,6 +283,7 @@ const korean: typeof english = {
     errorGeneric: '작업을 마치지 못했습니다. 다시 시도하세요.',
     jobKinds: { cleanup: '정리', backup: '백업', sync: '동기화', restore: '복원', 'pin-history': '보관', 'delete-history': '백업 삭제', 'resolve-conflict': '충돌 해결', 'check-repository': '검증' },
     jobActive: { cleanup: '정리 중', backup: '백업 중', sync: '동기화 중', restore: '복원 중', 'pin-history': '보관 중', 'delete-history': '백업 삭제 중', 'resolve-conflict': '충돌 해결 중', 'check-repository': '검증 중' },
+    jobCounters: { prepared: '준비', transferred: '전송' },
     historyKinds: { snapshot: '동기화', 'backup-point': '백업', conflict: '충돌 백업', 'recovery-candidate': '복구 후보' },
     endpointWarnings: {
         'github-dedicated-repository': '백업 전용 비공개 저장소를 따로 쓰세요. 이 연결은 백업만 합니다.',

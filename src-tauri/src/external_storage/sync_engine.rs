@@ -800,6 +800,7 @@ async fn package_capture(
         &mut journal,
         connected.provider.as_ref(),
         &connected.handle,
+        &super::runtime::preparation_progress(&root, &job.id),
         cancel,
     )
     .await?;

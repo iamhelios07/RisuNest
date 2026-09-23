@@ -245,10 +245,16 @@ fn job_summary(root: &std::path::Path, mut job: DurableJob) -> Value {
         &job_directory(root, &job.request.connection_id, &job.id),
         &job.id,
     ) {
-        job.summary["completedBytes"] = json!(done.to_string());
-        job.summary["totalBytes"] = json!(total.to_string());
-        job.summary["completedItems"] = json!(items.to_string());
-        job.summary["totalItems"] = json!(count.to_string());
+        // An empty journal is a job that has registered nothing yet, and what
+        // it prepared is the only thing it knows. The first registration is
+        // what hands the counters over.
+        if count > 0 {
+            job.summary["counters"] = json!("transferred");
+            job.summary["completedBytes"] = json!(done.to_string());
+            job.summary["totalBytes"] = json!(total.to_string());
+            job.summary["completedItems"] = json!(items.to_string());
+            job.summary["totalItems"] = json!(count.to_string());
+        }
     }
     job.summary
 }
@@ -1500,6 +1506,39 @@ async fn checked_root(
     super::repository_check::pin_root(directory, &resolved, &connected.handle)
 }
 
+/// What a publication has placed against what it found to place. Written where
+/// the work happens, because a summary is only assembled when the renderer
+/// asks for one.
+fn record_preparation(
+    root: &std::path::Path,
+    job_id: &str,
+    prepared: super::preparation_progress::Prepared,
+) -> Result<()> {
+    let store = JobStore::open(root)?;
+    let mut job = store.read(job_id)?;
+    if job.terminal() {
+        return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+    }
+    job.summary["counters"] = json!("prepared");
+    job.summary["completedItems"] = json!(prepared.items.to_string());
+    job.summary["totalItems"] = json!(prepared.total_items.to_string());
+    job.summary["completedBytes"] = json!(prepared.bytes.to_string());
+    job.summary["totalBytes"] = json!(prepared.total_bytes.to_string());
+    job.summary["updatedAtMs"] = json!(now_ms().to_string());
+    store.put(&job)
+}
+
+pub(crate) fn preparation_progress(
+    root: &std::path::Path,
+    job_id: &str,
+) -> std::sync::Arc<super::preparation_progress::PreparationProgress> {
+    let root = root.to_path_buf();
+    let job_id = job_id.to_owned();
+    super::preparation_progress::PreparationProgress::new(move |prepared| {
+        let _ = record_preparation(&root, &job_id, prepared);
+    })
+}
+
 fn record_check_progress(
     root: &std::path::Path,
     job_id: &str,
@@ -1705,6 +1744,7 @@ async fn run_backup(
         &mut journal,
         connected.provider.as_ref(),
         &connected.handle,
+        &preparation_progress(&root, &job.id),
         cancel,
     )
     .await?;
@@ -1871,6 +1911,71 @@ mod tests {
             store_id: "store".into(), library_epoch: "library".into(), generation: "generation".into(),
             selection_epoch: "selection".into(), revision: 1,
         })
+    }
+
+    /// Invariant 23. A publication registers nothing for the longest part of
+    /// its own work, so an empty journal must not overwrite what preparation
+    /// counted. The first registration is what hands the counters over, and
+    /// the summary says which of the two the numbers are.
+    #[test]
+    fn a_summary_keeps_prepared_counters_until_the_journal_holds_a_transfer() {
+        use super::super::journal::{JobIdentity, TransferJournal};
+        let root = tempfile::tempdir().unwrap();
+        let store = JobStore::open(root.path()).unwrap();
+        let job = automatic_job();
+        store.put(&job).unwrap();
+        record_preparation(
+            root.path(),
+            &job.id,
+            super::super::preparation_progress::Prepared {
+                items: 7,
+                total_items: 9,
+                bytes: 70,
+                total_bytes: 90,
+            },
+        )
+        .unwrap();
+        let prepared = job_summary(root.path(), store.read(&job.id).unwrap());
+        assert_eq!(prepared["counters"], "prepared");
+        assert_eq!(prepared["completedItems"], "7");
+        assert_eq!(prepared["totalItems"], "9");
+        assert_eq!(prepared["completedBytes"], "70");
+        assert_eq!(prepared["totalBytes"], "90");
+
+        let directory = job_directory(root.path(), &job.request.connection_id, &job.id);
+        let identity = JobIdentity {
+            job_id: job.id.clone(),
+            connection_id: job.request.connection_id.clone(),
+            repository_id: super::super::fake::repository().repository_id,
+            capture_id: "capture".into(),
+            capture: job.admission_identity.clone(),
+        };
+        let mut journal = TransferJournal::open(&directory, identity.clone()).unwrap();
+        let empty = job_summary(root.path(), store.read(&job.id).unwrap());
+        assert_eq!(empty["counters"], "prepared");
+        assert_eq!(empty["totalItems"], "9");
+
+        let bytes = b"synthetic sealed ciphertext";
+        let intent = super::super::contract::ObjectIntent {
+            repository_id: identity.repository_id.clone(),
+            job_id: job.id.clone(),
+            object_id: "pack".into(),
+            role: super::super::contract::ObjectRole::Pack,
+            byte_length: bytes.len() as u64,
+            sha256: risunest_sync_wire::hash(bytes),
+        };
+        std::fs::write(journal.spool_path("pack"), bytes).unwrap();
+        journal.register(&intent).unwrap();
+        // A retry re-registers what it already placed, and the object it names
+        // is the one that was already counted.
+        journal.register(&intent).unwrap();
+        drop(journal);
+        let transferred = job_summary(root.path(), store.read(&job.id).unwrap());
+        assert_eq!(transferred["counters"], "transferred");
+        assert_eq!(transferred["totalItems"], "1");
+        assert_eq!(transferred["completedItems"], "0");
+        assert_eq!(transferred["totalBytes"], bytes.len().to_string());
+        assert_eq!(transferred["completedBytes"], "0");
     }
 
     /// The budget is what other jobs are holding, so a job is never held back

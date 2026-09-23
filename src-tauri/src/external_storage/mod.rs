@@ -31,6 +31,7 @@ pub(crate) mod leases;
 pub(crate) mod oauth;
 pub(crate) mod package_cache;
 pub(crate) mod packaging;
+pub(crate) mod preparation_progress;
 pub(crate) mod providers;
 pub(crate) mod publication;
 pub(crate) mod quota;

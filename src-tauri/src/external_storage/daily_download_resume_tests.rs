@@ -375,6 +375,7 @@ fn daily_download_resume_preserves_verified_packs_and_durable_budget() {
             &mut journal,
             provider.as_ref(),
             &repository,
+            &crate::external_storage::preparation_progress::PreparationProgress::silent(),
             &Cancellation::default(),
         )
         .await

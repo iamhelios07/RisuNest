@@ -235,6 +235,8 @@ export interface ExternalJobSummary {
         | 'uncertain'
         | 'conflict'
     phase: string
+    /** Which work the four counters below measure. */
+    counters?: 'prepared' | 'transferred'
     completedBytes: DecimalString
     totalBytes?: DecimalString
     completedItems: DecimalString

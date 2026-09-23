@@ -577,7 +577,8 @@
     }
 
     function jobSize(job: ExternalJobSummary): string {
-        return `${bytes(job.completedBytes)}${job.totalBytes ? ` / ${bytes(job.totalBytes)}` : ''}`
+        const size = `${bytes(job.completedBytes)}${job.totalBytes ? ` / ${bytes(job.totalBytes)}` : ''}`
+        return job.counters ? `${strings.jobCounters[job.counters]} ${size}` : size
     }
 
     function jobSummary(job: ExternalJobSummary): string {

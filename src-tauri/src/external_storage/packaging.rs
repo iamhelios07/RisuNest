@@ -10,6 +10,7 @@ use super::{
     connection_store::{ConnectionStore, UnusableReason},
     journal::{validate_receipt, TransferJournal},
     package_cache::{kind_name, CatalogRange, PackageCache},
+    preparation_progress::PreparationProgress,
     sections::CapturedSection,
     transfer::SpoolSink,
     transfer_job,
@@ -943,8 +944,13 @@ async fn build_entries(
     journal: &mut TransferJournal,
     provider: &dyn Provider,
     repository: &RepositoryHandle,
+    prepared: &Arc<PreparationProgress>,
     cancel: &Cancellation,
 ) -> Result<(Vec<EntryPlan>, Vec<RemoteObject>)> {
+    prepared.plan(
+        sources.len() as u64,
+        sources.iter().map(|source| source.byte_length).sum(),
+    );
     let max_pack = StoredSize { limits, repository_id: format_repository_id }
         .pack_capacity(&format!("pack-{}", "0".repeat(64)))?;
     let target = limits.target_plaintext_bytes.min(max_pack).max(1);
@@ -1001,6 +1007,7 @@ async fn build_entries(
                         }
                     }
                     if usable {
+                        prepared.placed(source.byte_length);
                         ready.push(cached);
                         continue;
                     }
@@ -1027,6 +1034,7 @@ async fn build_entries(
                         }
                     }
                     if exists {
+                        prepared.placed(source.byte_length);
                         ready.push(cached);
                         continue;
                     }
@@ -1082,6 +1090,7 @@ async fn build_entries(
     let build_root_owned = build_root.to_path_buf();
     let external_root_owned = external_root.to_path_buf();
     let cancel_owned = cancel.clone();
+    let producer_prepared = Arc::clone(prepared);
     let placed = placements;
     // The pack being sealed, one waiting to be taken and one being built:
     // three pack-sized plaintext files, against the two ciphertexts a full
@@ -1099,6 +1108,7 @@ async fn build_entries(
             &placed,
             &built,
             &handle,
+            &producer_prepared,
             &cancel_owned,
         )
     });
@@ -1271,6 +1281,7 @@ fn prepare_packs(
     placements: &ChunkPlacements,
     built: &tokio::sync::mpsc::Sender<PendingPack>,
     handle: &tokio::runtime::Handle,
+    prepared: &PreparationProgress,
     cancel: &Cancellation,
 ) -> Result<Vec<PendingEntry>> {
     fs::create_dir_all(build_root).map_err(transient)?;
@@ -1364,6 +1375,7 @@ fn prepare_packs(
         if actual != source.content_sha256 {
             return Err(corrupt("capture source hash differs"));
         }
+        prepared.placed(source.byte_length);
         pending.push(PendingEntry { source, chunks });
     }
     if let Some(pack) = current {
@@ -2347,6 +2359,7 @@ pub(crate) async fn package_and_upload(
     journal: &mut TransferJournal,
     provider: &dyn Provider,
     repository: &RepositoryHandle,
+    prepared: &Arc<PreparationProgress>,
     cancel: &Cancellation,
 ) -> Result<CompletedSnapshot> {
     cancel.check()?;
@@ -2431,6 +2444,7 @@ pub(crate) async fn package_and_upload(
         journal,
         provider,
         repository,
+        prepared,
         cancel,
     )
     .await?;
@@ -2498,6 +2512,7 @@ pub(crate) async fn package_and_upload(
             journal,
             provider,
             repository,
+            prepared,
             cancel,
         )
         .await?;
@@ -2577,6 +2592,7 @@ pub(crate) async fn package_and_upload(
             journal,
             provider,
             repository,
+            prepared,
             cancel,
         )
         .await?;
@@ -3167,6 +3183,86 @@ mod tests {
         .unwrap()
     }
 
+    /// Invariant 23. A publication reads, compresses and packs everything it
+    /// carries before it seals its first object, so a job that only counts
+    /// what the transfer journal holds reports nothing for the longest part of
+    /// its own work. Every domain the publication carries is counted, which is
+    /// why adding sections to the same library raises what it plans.
+    #[test]
+    fn a_publication_counts_every_domain_it_places_before_it_uploads_anything() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let spool = root.path().join("section-spool");
+            let carried = vec![
+                section(&spool, SectionKind::Hypa, "counted", 1),
+                section(&spool, SectionKind::LocalPlugins, "counted", 1),
+            ];
+            let section_sources: u64 =
+                carried.iter().map(|part| part.sources.len() as u64).sum();
+            let publish = |id: &'static str, sections: Vec<CapturedSection>| {
+                let root = root.path().to_path_buf();
+                async move {
+                    let provider = FakeProvider::new(false);
+                    let repository = fake::repository();
+                    let (capture, _) =
+                        captured(&root, &format!("capture-{id}"), 1, b"record", b"asset");
+                    let mut transfer = journal(&root.join(id), id, &capture);
+                    let snapshot_metadata = metadata(id, &capture);
+                    let reports: Arc<
+                        std::sync::Mutex<
+                            Vec<(
+                                crate::external_storage::preparation_progress::Prepared,
+                                std::time::Instant,
+                            )>,
+                        >,
+                    > = Arc::new(std::sync::Mutex::new(Vec::new()));
+                    let collected = Arc::clone(&reports);
+                    let prepared = PreparationProgress::new(move |reading| {
+                        collected
+                            .lock()
+                            .unwrap()
+                            .push((reading, std::time::Instant::now()));
+                    });
+                    package_and_upload(
+                        capture,
+                        sections,
+                        &root,
+                        &root.join(format!("{id}-cache")),
+                        snapshot_metadata,
+                        &[9; 32],
+                        limits(256 * 1024),
+                        None,
+                        &mut transfer,
+                        &provider,
+                        &repository,
+                        &prepared,
+                        &Cancellation::default(),
+                    )
+                    .await
+                    .unwrap();
+                    let first = reports.lock().unwrap().first().copied().unwrap();
+                    (prepared.read(), first, provider.first_upload().unwrap())
+                }
+            };
+            let (library, first_library, first_library_upload) = publish("counted-1", Vec::new()).await;
+
+            // Nothing is placed yet and the job already knows what it is
+            // working through, before anything reaches the repository.
+            assert_eq!(first_library.0.items, 0);
+            assert!(first_library.0.total_items > 0);
+            assert!(first_library.1 < first_library_upload);
+
+            // What was planned is what was placed.
+            assert_eq!(library.items, library.total_items);
+            assert_eq!(library.bytes, library.total_bytes);
+
+            let (everything, _, _) = publish("counted-2", carried).await;
+            assert_eq!(everything.items, everything.total_items);
+            assert_eq!(everything.total_items, library.total_items + section_sources);
+            assert!(everything.total_bytes > library.total_bytes);
+        });
+    }
+
     /// Invariants 17, 30 and 33. A publication that does not carry a section
     /// keeps the reference the observed state had, including the commit number
     /// that named the publication which last changed it, and that inherited
@@ -3211,6 +3307,7 @@ mod tests {
                         &mut transfer,
                         provider,
                         repository,
+                        &PreparationProgress::silent(),
                         &Cancellation::default(),
                     )
                     .await
@@ -3328,6 +3425,7 @@ mod tests {
                         &mut transfer,
                         provider,
                         repository,
+                        &PreparationProgress::silent(),
                         &Cancellation::default(),
                     )
                     .await
@@ -3428,6 +3526,7 @@ mod tests {
                 &mut first_journal,
                 &provider,
                 &repository,
+                &PreparationProgress::silent(),
                 &Cancellation::default(),
             )
             .await
@@ -3470,6 +3569,7 @@ mod tests {
                 &mut second_journal,
                 &provider,
                 &repository,
+                &PreparationProgress::silent(),
                 &Cancellation::default(),
             )
             .await
@@ -3583,7 +3683,7 @@ mod tests {
                 let meta = metadata("first", &capture);
                 let mut first_journal = journal(&root.path().join("first-job"), "first-job", &capture);
                 let first = package_and_upload(capture, Vec::new(), root.path(), &cache, meta, &key,
-                    limits(128 * 1024), None, &mut first_journal, &provider, &repository, &cancel).await.unwrap();
+                    limits(128 * 1024), None, &mut first_journal, &provider, &repository, &PreparationProgress::silent(), &cancel).await.unwrap();
                 let bytes = provider.state.lock().unwrap().objects[&first.asset_catalog.receipt.locator.object].0.clone();
                 let metadata_key = derive_key(&key, &first.repository_id, "metadata").unwrap();
                 let mut plaintext = Vec::new();
@@ -3602,7 +3702,7 @@ mod tests {
                 let meta = metadata("second", &capture);
                 let mut second_journal = journal(&root.path().join("second-job"), "second-job", &capture);
                 let second = package_and_upload(capture, Vec::new(), root.path(), &cache, meta, &key,
-                    limits(128 * 1024), None, &mut second_journal, &provider, &repository, &cancel).await.unwrap();
+                    limits(128 * 1024), None, &mut second_journal, &provider, &repository, &PreparationProgress::silent(), &cancel).await.unwrap();
                 let restored = snapshot_restore::download_snapshot(&second.reference, &root.path().join("restored"),
                     &key, None, snapshot_restore::SourceTrust::Downloaded, &provider, &repository, &cancel).await.unwrap();
                 assert_eq!(fs::read(restored.records[0].source.file().unwrap()).unwrap(), b"record");
@@ -3632,7 +3732,7 @@ mod tests {
             let meta = metadata("snapshot", &capture);
             let mut journal = journal(&root.path().join("job"), "job", &capture);
             let completed = package_and_upload(capture, vec![], root.path(), &root.path().join("cache"),
-                meta, &key, limits(128 * 1024), None, &mut journal, &provider, &repository, &cancel)
+                meta, &key, limits(128 * 1024), None, &mut journal, &provider, &repository, &PreparationProgress::silent(), &cancel)
                 .await.unwrap();
             let restore_root = root.path().join("restored");
             let first = snapshot_restore::download_snapshot(&completed.reference, &restore_root,
@@ -3678,7 +3778,7 @@ mod tests {
             let mut first_journal = journal(&sender.path().join("first-job"), "first-job", &capture);
             let first = package_and_upload(capture, vec![], sender.path(),
                 &sender.path().join("cache"), meta, &key, limits(128 * 1024), None,
-                &mut first_journal, &provider, &repository, &cancel).await.unwrap();
+                &mut first_journal, &provider, &repository, &PreparationProgress::silent(), &cancel).await.unwrap();
             // The receiving library already holds the asset and has never seen
             // the record, which is what a normal changed cycle looks like.
             let held = PayloadCas::new(receiver.path()).unwrap().prepare_bytes(b"asset").unwrap();
@@ -3690,7 +3790,7 @@ mod tests {
                 journal(&sender.path().join("second-job"), "second-job", &capture);
             let second = package_and_upload(capture, vec![], sender.path(),
                 &sender.path().join("cache"), meta, &key, limits(128 * 1024), None,
-                &mut second_journal, &provider, &repository, &cancel).await.unwrap();
+                &mut second_journal, &provider, &repository, &PreparationProgress::silent(), &cancel).await.unwrap();
             let published_reads = provider.read_attempts(&asset.receipt.locator.object);
             let received = snapshot_restore::download_snapshot(&second.reference,
                 &receiver.path().join("receive"), &key, None,
@@ -3737,7 +3837,7 @@ mod tests {
                 let mut journal = journal(&sender.path().join("job"), "job", &capture);
                 let completed = package_and_upload(capture, vec![], sender.path(),
                     &sender.path().join("cache"), meta, &key, limits(128 * 1024), None,
-                    &mut journal, &provider, &repository, &cancel).await.unwrap();
+                    &mut journal, &provider, &repository, &PreparationProgress::silent(), &cancel).await.unwrap();
                 let cas = PayloadCas::new(receiver.path()).unwrap();
                 let held = cas.prepare_bytes(b"asset").unwrap();
                 if corrupt_held {
@@ -3782,7 +3882,7 @@ mod tests {
             let mut journal = journal(&sender.path().join("job"), "job", &capture);
             let completed = package_and_upload(capture, vec![], sender.path(),
                 &sender.path().join("cache"), meta, &key, limits(128 * 1024), None,
-                &mut journal, &provider, &repository, &cancel).await.unwrap();
+                &mut journal, &provider, &repository, &PreparationProgress::silent(), &cancel).await.unwrap();
             let cas = PayloadCas::new(receiver.path()).unwrap();
             let held = cas.prepare_bytes(b"asset-body").unwrap();
             fs::write(cas.object_path(&held.content_hash).unwrap().unwrap(), b"asset").unwrap();
@@ -3812,13 +3912,13 @@ mod tests {
             let meta = metadata("first", &capture);
             let mut first_journal = journal(&root.path().join("first-job"), "first-job", &capture);
             let first = package_and_upload(capture, Vec::new(), root.path(), &cache, meta, &key,
-                limits(128 * 1024), None, &mut first_journal, &provider, &repository, &cancel).await.unwrap();
+                limits(128 * 1024), None, &mut first_journal, &provider, &repository, &PreparationProgress::silent(), &cancel).await.unwrap();
             provider.fail_read(&first.asset_catalog.receipt.locator.object, ErrorKind::Unauthorized);
             let (capture, _) = captured(root.path(), "second", 2, b"record", b"asset");
             let meta = metadata("second", &capture);
             let mut second_journal = journal(&root.path().join("second-job"), "second-job", &capture);
             let error = package_and_upload(capture, Vec::new(), root.path(), &cache, meta, &key,
-                limits(128 * 1024), None, &mut second_journal, &provider, &repository, &cancel).await.unwrap_err();
+                limits(128 * 1024), None, &mut second_journal, &provider, &repository, &PreparationProgress::silent(), &cancel).await.unwrap_err();
             assert_eq!(error.kind, ErrorKind::Unauthorized);
             assert!(!provider.holds("snapshot-second"));
             assert!(provider.holds(&first.asset_catalog.object_id));
@@ -3849,7 +3949,7 @@ mod tests {
                 };
                 let mut journal = TransferJournal::open(&directory, identity.clone()).unwrap();
                 let completed = package_and_upload(capture, vec![], root.path(), &cache, meta, &key,
-                    limits(128 * 1024), None, &mut journal, &provider, &repository, &cancel).await.unwrap();
+                    limits(128 * 1024), None, &mut journal, &provider, &repository, &PreparationProgress::silent(), &cancel).await.unwrap();
                 let missing = std::iter::once(&completed.reference).chain(completed.referenced_objects.iter())
                     .find(|object| object.role == role).unwrap().clone();
                 provider.forget(&missing.receipt.locator.object);
@@ -3884,7 +3984,7 @@ mod tests {
             let meta = metadata("snapshot", &capture);
             let mut journal = journal(&root.path().join("job"), "job", &capture);
             let completed = package_and_upload(capture, vec![], root.path(), &root.path().join("cache"),
-                meta, &key, limits(128 * 1024), None, &mut journal, &provider, &repository, &cancel)
+                meta, &key, limits(128 * 1024), None, &mut journal, &provider, &repository, &PreparationProgress::silent(), &cancel)
                 .await.unwrap();
             let uploads = provider.upload_count();
             let reads = provider.read_count();
@@ -3897,7 +3997,7 @@ mod tests {
             let (capture, _) = captured(root.path(), "resumed-capture", 1, b"record", b"asset");
             let meta = metadata("snapshot", &capture);
             let resumed = package_and_upload(capture, vec![], root.path(), &root.path().join("rebuilt-cache"),
-                meta, &key, limits(128 * 1024), None, &mut journal, &provider, &repository, &cancel)
+                meta, &key, limits(128 * 1024), None, &mut journal, &provider, &repository, &PreparationProgress::silent(), &cancel)
                 .await.unwrap();
             assert_eq!(resumed.reference.object_id, completed.reference.object_id);
             assert_eq!(resumed.reference.receipt.locator, completed.reference.receipt.locator);
@@ -3931,7 +4031,7 @@ mod tests {
             // while the producer still has packs nobody has taken.
             provider.fail_upload_number(9, ErrorKind::StorageFull);
             let error = package_and_upload(capture, vec![], root.path(), &root.path().join("cache"),
-                meta, &key, limits(64 * 1024), None, &mut journal, &provider, &repository, &cancel)
+                meta, &key, limits(64 * 1024), None, &mut journal, &provider, &repository, &PreparationProgress::silent(), &cancel)
                 .await.unwrap_err();
             assert_eq!(error.kind, ErrorKind::StorageFull);
             let placed = stored_packs(&provider);
@@ -3965,7 +4065,7 @@ mod tests {
             let original = fs::read(&last).unwrap();
             fs::write(&last, vec![9u8; original.len()]).unwrap();
             let error = package_and_upload(capture, vec![], root.path(), &root.path().join("cache"),
-                meta, &key, limits(64 * 1024), None, &mut journal, &provider, &repository, &cancel)
+                meta, &key, limits(64 * 1024), None, &mut journal, &provider, &repository, &PreparationProgress::silent(), &cancel)
                 .await.unwrap_err();
             assert_eq!(error.kind, ErrorKind::Corrupt);
             // One record pack and two full asset waves. The asset pack the
@@ -3983,7 +4083,7 @@ mod tests {
             let meta = metadata("snapshot", &capture);
             let completed = package_and_upload(capture, vec![], root.path(),
                 &root.path().join("retried-cache"), meta, &key, limits(64 * 1024), None,
-                &mut journal, &provider, &repository, &cancel).await.unwrap();
+                &mut journal, &provider, &repository, &PreparationProgress::silent(), &cancel).await.unwrap();
             for object in &placed {
                 assert_eq!(provider.upload_attempts(object), 1);
                 assert_eq!(provider.read_attempts(object), 1);
@@ -4009,7 +4109,7 @@ mod tests {
             let meta = metadata("snapshot", &capture);
             let mut journal = journal(&root.path().join("job"), "job", &capture);
             let completed = package_and_upload(capture, vec![], root.path(), &cache, meta, &key,
-                limits(128 * 1024), None, &mut journal, &provider, &repository, &cancel).await.unwrap();
+                limits(128 * 1024), None, &mut journal, &provider, &repository, &PreparationProgress::silent(), &cancel).await.unwrap();
             let missing = asset_pack(&provider, &completed, &key);
             let retained = completed.referenced_objects.iter().find(|object| {
                 object.role == ObjectRole::Pack && object.object_id != missing.object_id
@@ -4023,7 +4123,7 @@ mod tests {
             let mut replacement_journal =
                 self::journal(&root.path().join("replacement-job"), "replacement-job", &capture);
             let replacement = package_and_upload(capture, vec![], root.path(), &cache, meta, &key,
-                limits(128 * 1024), None, &mut replacement_journal, &provider, &repository, &cancel)
+                limits(128 * 1024), None, &mut replacement_journal, &provider, &repository, &PreparationProgress::silent(), &cancel)
                 .await.unwrap();
             assert_eq!(verify_publication(&replacement, root.path(), &cache, &mut replacement_journal,
                 &key, &provider, &repository, &cancel).await.unwrap(), PublicationReadiness::Verified);
@@ -4078,7 +4178,7 @@ mod tests {
                 let reads = provider.read_count();
                 let completed = package_and_upload(
                     capture, vec![], root.path(), &cache, meta, &key, limits(128 * 1024),
-                    parent.as_ref(), &mut transfer, &provider, &repository, &cancel,
+                    parent.as_ref(), &mut transfer, &provider, &repository, &PreparationProgress::silent(), &cancel,
                 ).await.unwrap();
                 if revision > 1 {
                     assert_eq!(provider.read_count(), reads);
@@ -4117,7 +4217,7 @@ mod tests {
                 let before = provider.read_count();
                 package_and_upload(
                     capture, vec![], root.path(), &cache, meta, &key, limits(128 * 1024),
-                    Some(&graph), &mut transfer, &provider, &repository, &cancel,
+                    Some(&graph), &mut transfer, &provider, &repository, &PreparationProgress::silent(), &cancel,
                 ).await.unwrap();
                 reads.push(provider.read_count() - before);
             }
@@ -4143,7 +4243,7 @@ mod tests {
             let mut transfer = journal(&root.path().join("head"), "head", &capture);
             let head = package_and_upload(
                 capture, vec![], root.path(), &cache, meta, &key, limits(128 * 1024),
-                None, &mut transfer, &provider, &repository, &cancel,
+                None, &mut transfer, &provider, &repository, &PreparationProgress::silent(), &cancel,
             ).await.unwrap();
             let parent = parent_graph(&head, &repository).unwrap();
             // An asset pack, which the next publication admits because only the
@@ -4165,7 +4265,7 @@ mod tests {
             let mut transfer = journal(&root.path().join("next"), "next", &capture);
             let completed = package_and_upload(
                 capture, vec![], root.path(), &cache, meta, &key, limits(128 * 1024),
-                Some(&parent), &mut transfer, &provider, &repository, &cancel,
+                Some(&parent), &mut transfer, &provider, &repository, &PreparationProgress::silent(), &cancel,
             ).await.unwrap();
             assert_eq!(
                 verify_publication(
@@ -4203,7 +4303,7 @@ mod tests {
                 let before = provider.read_count();
                 let completed = package_and_upload(
                     capture, vec![], root.path(), &cache, meta, &key, limits(128 * 1024),
-                    graph.as_ref(), &mut transfer, &provider, &repository, &cancel,
+                    graph.as_ref(), &mut transfer, &provider, &repository, &PreparationProgress::silent(), &cancel,
                 ).await.unwrap();
                 reads = provider.read_count() - before;
                 if head.is_none() {
@@ -4245,7 +4345,7 @@ mod tests {
                     let before = provider.read_count();
                     let completed = package_and_upload(
                         capture, vec![], root.path(), &cache, meta, &key, limits(128 * 1024),
-                        graph.as_ref(), &mut transfer, &provider, &repository, &cancel,
+                        graph.as_ref(), &mut transfer, &provider, &repository, &PreparationProgress::silent(), &cancel,
                     ).await.unwrap();
                     reads = provider.read_count() - before;
                     if head.is_none() {
@@ -4287,7 +4387,7 @@ mod tests {
             let mut transfer = journal(&root.path().join("head"), "head", &capture);
             let head = package_and_upload(
                 capture, vec![], root.path(), &cache, meta, &key, limits(128 * 1024),
-                None, &mut transfer, &provider, &repository, &cancel,
+                None, &mut transfer, &provider, &repository, &PreparationProgress::silent(), &cancel,
             ).await.unwrap();
             let parent = parent_graph(&head, &repository).unwrap();
             let lost = head.referenced_objects.iter()
@@ -4302,7 +4402,7 @@ mod tests {
                 let mut transfer = journal(&root.path().join(&name), &name, &capture);
                 let completed = package_and_upload(
                     capture, vec![], root.path(), &cache, meta, &key, limits(128 * 1024),
-                    Some(&parent), &mut transfer, &provider, &repository, &cancel,
+                    Some(&parent), &mut transfer, &provider, &repository, &PreparationProgress::silent(), &cancel,
                 ).await.unwrap();
                 outcomes.push((
                     verify_publication(
@@ -4440,7 +4540,7 @@ mod tests {
                 let before = provider.upload_count();
                 published.push(package_and_upload(
                     capture, vec![], root.path(), &cache, meta, &key, limits(8 * 1024),
-                    parent.as_ref(), &mut transfer, &provider, &repository, &cancel,
+                    parent.as_ref(), &mut transfer, &provider, &repository, &PreparationProgress::silent(), &cancel,
                 ).await.unwrap());
                 uploads.push(
                     provider.uploaded_ids()[before..].iter()
@@ -4484,7 +4584,7 @@ mod tests {
                     .unwrap();
                 published.push(package_and_upload(
                     capture, vec![], root.path(), &cache, meta, &key, limits(16 * 1024),
-                    parent.as_ref(), &mut transfer, &provider, &repository, &cancel,
+                    parent.as_ref(), &mut transfer, &provider, &repository, &PreparationProgress::silent(), &cancel,
                 ).await.unwrap());
             }
             let carried: Vec<String> = published[0].referenced_objects.iter()
@@ -4545,7 +4645,7 @@ mod tests {
                     .unwrap();
                 published.push(package_and_upload(
                     capture, vec![], root.path(), &cache, meta, &key, limits(8 * 1024),
-                    parent.as_ref(), &mut transfer, &provider, &repository, &cancel,
+                    parent.as_ref(), &mut transfer, &provider, &repository, &PreparationProgress::silent(), &cancel,
                 ).await.unwrap());
             }
             let first = &published[0];
@@ -4601,7 +4701,7 @@ mod tests {
                 let mut transfer = journal(&root.join(name), name, &capture);
                 package_and_upload(
                     capture, vec![], root, cache, meta, key, limits(64 * 1024),
-                    parent, &mut transfer, provider, repository, cancel,
+                    parent, &mut transfer, provider, repository, &PreparationProgress::silent(), cancel,
                 ).await.unwrap()
             }
             let objects = |completed: &CompletedSnapshot| {
@@ -4687,7 +4787,7 @@ mod tests {
                 let mut transfer = journal(&root.join(name), name, &capture);
                 package_and_upload(
                     capture, vec![], root, cache, meta, key, limits(64 * 1024),
-                    parent, &mut transfer, provider, repository, cancel,
+                    parent, &mut transfer, provider, repository, &PreparationProgress::silent(), cancel,
                 ).await.unwrap()
             }
             let first = published(
@@ -4750,7 +4850,7 @@ mod tests {
                 let mut transfer = journal(&root.join(name), name, &capture);
                 package_and_upload(
                     capture, vec![], root, cache, meta, key, limits(64 * 1024),
-                    parent, &mut transfer, provider, repository, cancel,
+                    parent, &mut transfer, provider, repository, &PreparationProgress::silent(), cancel,
                 ).await.unwrap()
             }
             let first = published(
@@ -5137,6 +5237,7 @@ mod tests {
                 &mut journal,
                 &provider,
                 &repository,
+                &PreparationProgress::silent(),
                 &Cancellation::default(),
             )
             .await
@@ -5218,6 +5319,7 @@ mod tests {
                 &mut journal,
                 &FakeProvider::new(false),
                 &fake::repository(),
+                &PreparationProgress::silent(),
                 &Cancellation::default(),
             )
             .await
@@ -5273,6 +5375,7 @@ mod tests {
                 &mut first_journal,
                 &provider,
                 &repository,
+                &PreparationProgress::silent(),
                 &Cancellation::default(),
             )
             .await
@@ -5389,6 +5492,7 @@ mod tests {
                     &mut transfer,
                     &provider,
                     &repository,
+                    &PreparationProgress::silent(),
                     &Cancellation::default(),
                 )
                 .await
@@ -5455,7 +5559,7 @@ mod tests {
                 package_and_upload(
                     capture, Vec::new(), root.path(), &root.path().join(format!("{name}-cache")),
                     snapshot_metadata, &key, limits(512 * 1024), parent, &mut transfer,
-                    &provider, &repository, &Cancellation::default(),
+                    &provider, &repository, &PreparationProgress::silent(), &Cancellation::default(),
                 ).await.unwrap();
                 let elapsed = started.elapsed().as_millis();
                 let first_upload_ms = provider.first_upload()
@@ -5522,7 +5626,7 @@ mod tests {
                 let completed = package_and_upload(
                     capture, Vec::new(), root.path(), &cache, meta, &key,
                     limits(800 * 1024), parent.as_ref(), &mut transfer, &provider,
-                    &repository, &cancel,
+                    &repository, &PreparationProgress::silent(), &cancel,
                 ).await.unwrap();
                 let elapsed = started.elapsed().as_millis();
                 let after = {
@@ -5588,6 +5692,7 @@ mod tests {
                     &mut transfer,
                     &provider,
                     &repository,
+                    &PreparationProgress::silent(),
                     &Cancellation::default(),
                 )
                 .await
@@ -5655,13 +5760,13 @@ mod tests {
             let meta = metadata("first", &capture);
             let mut first_journal = journal(&root.path().join("first-job"), "first-job", &capture);
             let first = package_and_upload(capture, vec![], root.path(), &cache, meta, &key,
-                limits(128 * 1024), None, &mut first_journal, &provider, &repository, &cancel).await.unwrap();
+                limits(128 * 1024), None, &mut first_journal, &provider, &repository, &PreparationProgress::silent(), &cancel).await.unwrap();
             let before = provider.state.lock().unwrap().body_bytes.clone();
             let (capture, _) = captured(root.path(), "second", 2, b"changed record", b"asset");
             let meta = metadata("second", &capture);
             let mut second_journal = journal(&root.path().join("second-job"), "second-job", &capture);
             let second = package_and_upload(capture, vec![], root.path(), &cache, meta, &key,
-                limits(128 * 1024), None, &mut second_journal, &provider, &repository, &cancel).await.unwrap();
+                limits(128 * 1024), None, &mut second_journal, &provider, &repository, &PreparationProgress::silent(), &cancel).await.unwrap();
             assert_eq!(verify_publication(&second, root.path(), &cache, &mut second_journal, &key,
                 &provider, &repository, &cancel).await.unwrap(), PublicationReadiness::Verified);
             let pack = second.referenced_objects.iter().find(|object| object.role == ObjectRole::Pack

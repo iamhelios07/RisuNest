@@ -141,6 +141,7 @@ fn repository_bootstrap_opens_and_applies_a_real_snapshot_without_the_source_vau
                 &mut journal,
                 &provider,
                 &repository,
+                &crate::external_storage::preparation_progress::PreparationProgress::silent(),
                 &cancel,
             )
             .await
