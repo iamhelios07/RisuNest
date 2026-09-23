@@ -180,8 +180,12 @@ impl PersistentStore {
         &mut self,
         difference: &ExternalSnapshotDifference<'_>,
         job: &str,
-        base_records: &BTreeMap<String, String>,
     ) -> StoreResult<super::RevisionResult> {
+        let arrived: Vec<(String, String)> = difference
+            .records
+            .iter()
+            .map(|record| (record.key.clone(), record.content_hash.clone()))
+            .collect();
         let root = verified_staging_root(difference.staging_root)?;
         let content = ContentStore::open_existing(&root.join("external-storage"))?;
         let cas = PayloadCas::new(&self.repository_root)?;
@@ -280,9 +284,17 @@ impl PersistentStore {
         super::server_sync_outbox::finish_mutation(&tx)?;
         super::commit::set_active(&tx, revision, &generation)?;
         // Read after the revision moves, so the base names what the library
-        // now holds. The selected adapter is deliberately not marked dirty:
-        // this content came from it.
-        super::external_storage_state::finish_receive_activation(&tx, job, base_records)?;
+        // now holds. The record map already describes the base this snapshot
+        // follows, so only the keys that moved are written. The selected
+        // adapter is deliberately not marked dirty: this content came from it.
+        super::external_storage_state::finish_receive_activation(
+            &tx,
+            job,
+            super::external_storage_state::BaseRecords::Moved {
+                removed: difference.removed,
+                arrived: &arrived,
+            },
+        )?;
         tx.commit()?;
         Ok(super::RevisionResult { revision })
     }

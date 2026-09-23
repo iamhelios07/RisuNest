@@ -553,7 +553,7 @@ impl PersistentStore {
             params![connection,snapshot,commit,observation,serde_json::to_string(identity)?])?;
         // This head was accepted because its content did not differ from the
         // one already recorded, so the records behind it are the same records.
-        jobs::rebind_base_records(&tx, connection, snapshot)?;
+        jobs::rebind_base_records(&tx, connection, snapshot).map(|_| ())?;
         tx.commit()?;
         Ok(())
     }

@@ -1429,7 +1429,11 @@ fn replace_commit_transaction(
     }
     set_active(&transaction, revision, &generation)?;
     if let Some((job, records)) = external_job {
-        super::external_storage_state::finish_receive_activation(&transaction, job, records)?;
+        super::external_storage_state::finish_receive_activation(
+            &transaction,
+            job,
+            super::external_storage_state::BaseRecords::Complete(records),
+        )?;
     }
     if let Some((key, value)) = serialized_app_kv {
         transaction.execute(

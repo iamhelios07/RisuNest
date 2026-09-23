@@ -157,7 +157,7 @@ pub(super) fn begin_receive_activation(tx: &Transaction<'_>, job: &str) -> Store
 pub(super) fn finish_receive_activation(
     tx: &Transaction<'_>,
     job: &str,
-    records: &BTreeMap<String, String>,
+    records: BaseRecords<'_>,
 ) -> StoreResult<()> {
     let (connection,repository,snapshot,commit,observation): (String,String,String,String,String) = tx.query_row(
         "SELECT connection_id,repository_id,capture_id,commit_id,expected_head FROM external_storage_jobs WHERE id=?1 AND role='restore' AND phase='applying'",
@@ -166,7 +166,14 @@ pub(super) fn finish_receive_activation(
     let identity = serde_json::to_string(&sync_selection::identity(tx)?)?;
     tx.execute("INSERT INTO external_storage_bases VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(connection_id) DO UPDATE SET repository_id=excluded.repository_id,snapshot_id=excluded.snapshot_id,commit_id=excluded.commit_id,head_observation=excluded.head_observation,identity=excluded.identity",
         params![connection,repository,snapshot,commit,observation,identity])?;
-    replace_base_records(tx, &connection, &snapshot, records)?;
+    match records {
+        BaseRecords::Complete(records) => {
+            replace_base_records(tx, &connection, &snapshot, records)?
+        }
+        BaseRecords::Moved { removed, arrived } => {
+            move_base_records(tx, &connection, &snapshot, removed, arrived)?
+        }
+    }
     tx.execute(
         "UPDATE external_storage_jobs SET phase='complete' WHERE id=?1",
         [job],
@@ -555,6 +562,16 @@ pub(crate) fn begin_publication(
     Ok(())
 }
 
+/// What a writer of a base knows about the records behind it: the whole map,
+/// or only what moved since the map already stored.
+pub(crate) enum BaseRecords<'a> {
+    Complete(&'a BTreeMap<String, String>),
+    Moved {
+        removed: &'a [String],
+        arrived: &'a [(String, String)],
+    },
+}
+
 /// What the snapshot behind a connection's base named under each logical key.
 /// The rows exist only while they describe `external_storage_bases.snapshot_id`,
 /// which is what lets a later receive read them as the content of the local
@@ -580,6 +597,35 @@ pub(crate) fn replace_base_records(
     Ok(())
 }
 
+/// The rows already describe the base this one follows, so only the keys that
+/// moved are written and the binding is carried to the new snapshot.
+pub(crate) fn move_base_records(
+    tx: &Transaction<'_>,
+    connection: &str,
+    snapshot: &str,
+    removed: &[String],
+    arrived: &[(String, String)],
+) -> StoreResult<()> {
+    {
+        let mut statement = tx.prepare(
+            "DELETE FROM external_storage_base_records WHERE connection_id=?1 AND key=?2",
+        )?;
+        for key in removed {
+            statement.execute(params![connection, key])?;
+        }
+    }
+    {
+        let mut statement = tx.prepare("INSERT INTO external_storage_base_records VALUES(?1,?2,?3) ON CONFLICT(connection_id,key) DO UPDATE SET content_hash=excluded.content_hash")?;
+        for (key, hash) in arrived {
+            statement.execute(params![connection, key, hash])?;
+        }
+    }
+    if rebind_base_records(tx, connection, snapshot)? == 0 {
+        return Err(invalid("External base has no record map to move"));
+    }
+    Ok(())
+}
+
 pub(crate) fn clear_base_records(tx: &Transaction<'_>, connection: &str) -> StoreResult<()> {
     tx.execute(
         "DELETE FROM external_storage_base_records WHERE connection_id=?1",
@@ -598,12 +644,11 @@ pub(crate) fn rebind_base_records(
     tx: &Transaction<'_>,
     connection: &str,
     snapshot: &str,
-) -> StoreResult<()> {
-    tx.execute(
+) -> StoreResult<usize> {
+    Ok(tx.execute(
         "UPDATE external_storage_base_record_state SET snapshot_id=?2 WHERE connection_id=?1",
         params![connection, snapshot],
-    )?;
-    Ok(())
+    )?)
 }
 
 pub(crate) fn base_records(

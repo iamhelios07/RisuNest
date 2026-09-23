@@ -360,7 +360,6 @@ fn activate_prepared_receive(
                         object_sizes: &difference.object_sizes,
                     },
                     &prepared.job_id,
-                    &prepared.records,
                 )
                 .map(|result| result.revision)
                 .map_err(receive_validation_error)
@@ -2582,6 +2581,9 @@ mod receive_tests {
             character_at(&staging, "kept", 0),
             character_at(&staging, "dropped", 1),
             conversation_at(&staging, "kept", "chat", 10),
+            // The removed character takes this with it, without the snapshot
+            // having to name it.
+            conversation_at(&staging, "dropped", "gone", 5),
             preset_at(&staging, "preset"),
         ]);
         let prepared = prepare(&mut store, &job, first);
@@ -2635,6 +2637,7 @@ mod receive_tests {
             ("character".to_owned(), "dropped".to_owned(), String::new()),
             ("character".to_owned(), "kept".to_owned(), String::new()),
             ("conversation".to_owned(), "added".to_owned(), "fresh".to_owned()),
+            ("conversation".to_owned(), "dropped".to_owned(), "gone".to_owned()),
             ("conversation".to_owned(), "kept".to_owned(), "chat".to_owned()),
             ("owner".to_owned(), "character-additional-assets".to_owned(), "added".to_owned()),
             ("owner".to_owned(), "character-additional-assets".to_owned(), "dropped".to_owned()),
@@ -2670,6 +2673,14 @@ mod receive_tests {
             store.external_base("connection").unwrap().unwrap().snapshot_id,
             "second"
         );
+        // The map is written key by key rather than rewritten, so this is what
+        // says the keys it wrote are exactly the ones that moved.
+        let named: std::collections::BTreeMap<String, String> = second_snapshot(&staging)
+            .records
+            .into_iter()
+            .map(|record| (record.key, record.content_hash))
+            .collect();
+        assert_eq!(store.external_base_records("connection").unwrap(), Some(named));
     }
 
     /// A16. The library moved under the prepared receive, so the difference it
