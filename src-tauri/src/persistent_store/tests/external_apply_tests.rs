@@ -395,6 +395,66 @@ fn a_locally_corrupt_object_stops_the_apply_instead_of_activating() {
     }
 }
 
+/// A record body now arrives through the content store rather than as a file
+/// confined to the staging directory, so the store is where the link rejection
+/// has to hold. A body replaced by a link to content outside is not an input,
+/// whatever that content is.
+#[test]
+fn a_linked_record_body_in_the_content_store_is_not_a_snapshot_input() {
+    let (directory, mut store) = open_store();
+    let staging = directory.path().join("download");
+    fs::create_dir(&staging).unwrap();
+    let outside = directory.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    // Over the small-object threshold, so the store publishes it as a file the
+    // fixture can replace.
+    let (record, root_hash) = root_record(&staging, &"x".repeat(70 * 1024));
+    let bytes = fs::read(record.source.file().unwrap()).unwrap();
+    let mut content = crate::external_storage::content_store::ContentStore::open(
+        &staging.join("external-storage"),
+    )
+    .unwrap();
+    content.put(&record.content_hash, &bytes).unwrap();
+    content.commit().unwrap();
+    let held = content
+        .file_path(&record.content_hash)
+        .unwrap()
+        .expect("a body this size is published as a file");
+    let target = outside.join("target.bin");
+    fs::write(&target, &bytes).unwrap();
+    fs::remove_file(&held).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &held).unwrap();
+    #[cfg(windows)]
+    if let Err(error) = std::os::windows::fs::symlink_file(&target, &held) {
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            return;
+        }
+        panic!("create reparse fixture: {error}");
+    }
+
+    let record = ExternalSnapshotRecord {
+        source: ObjectSource::Captured(record.content_hash.clone()),
+        ..record
+    };
+    let hashes = BTreeMap::from([(record.key.clone(), root_hash)]);
+    let scope_id = library_fingerprint_domain();
+    let fingerprint = fingerprint(&scope_id, &hashes);
+    let error = store
+        .prepare_external_snapshot_application(
+            &application(&staging, &scope_id, &fingerprint, 1),
+            [Ok(record)],
+            std::iter::empty(),
+        )
+        .err()
+        .expect("a linked body must not be an input")
+        .to_string();
+    assert!(error.contains("link"), "{error}");
+    assert_eq!(stage_count(&store), 0);
+    assert_eq!(store.revision().unwrap(), 1);
+    assert_eq!(store.materialize(None).unwrap()["marker"], "local");
+}
+
 #[test]
 fn rejected_record_stream_rolls_back_the_whole_stage_and_preserves_live_library() {
     let (directory, mut store) = open_store();

@@ -352,6 +352,7 @@ fn daily_download_resume_preserves_verified_packs_and_durable_budget() {
             max_stored_bytes: 8 * 1024,
             sdk_overhead_bytes: 0,
             target_plaintext_bytes: 8 * 1024,
+            maintenance: Default::default(),
         };
         let chunk_bytes = pack_plaintext_limit(limits) - ENTRY_OVERHEAD - 1;
         let source = incompressible_bytes(chunk_bytes as usize * PACKS);

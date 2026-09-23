@@ -532,6 +532,7 @@ mod tests {
                 max_stored_bytes: 64 * 1024,
                 sdk_overhead_bytes: 0,
                 target_plaintext_bytes: 64 * 1024,
+                maintenance: Default::default(),
             },
             parent,
             &mut journal,

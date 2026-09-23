@@ -1575,6 +1575,33 @@ fn record_check_progress(
     job.summary["updatedAtMs"] = json!(now_ms().to_string());
     store.put(&job)
 }
+/// Whether a publication that is already required may also spend the optional
+/// maintenance portion. A drain has to finish instead, and a daily allowance
+/// with less headroom than the portion can spend is not spent on it.
+pub(crate) fn maintenance_allowed(
+    app: &AppHandle,
+    connected: &super::connection_commands::ConnectedRepository,
+    job: &DurableJob,
+) -> bool {
+    if job.request.session.as_deref() == Some("exitDrain")
+        || job.request.reason.as_deref() == Some("exitDrain")
+    {
+        return false;
+    }
+    let Ok(budget) = super::connection_commands::budget(app) else {
+        return false;
+    };
+    let Ok(usage) =
+        super::quota_profiles::connection_usage(&budget, &connected.stored.config, now_ms())
+    else {
+        return false;
+    };
+    usage.iter().all(|counter| {
+        counter.limit.saturating_sub(counter.used)
+            >= super::packaging::COALESCE_REQUEST_BUDGET
+    })
+}
+
 async fn run_backup(
     app: &AppHandle,
     connected: &super::connection_commands::ConnectedRepository,
@@ -1757,7 +1784,8 @@ async fn run_backup(
         &cache,
         metadata,
         &connected.root_key,
-        PackageLimits::from_capabilities(&connected.stored.capabilities)?,
+        PackageLimits::from_capabilities(&connected.stored.capabilities)?
+            .with_maintenance(maintenance_allowed(app, connected, job)),
         parent_graph.as_ref(),
         &mut journal,
         connected.provider.as_ref(),
@@ -1839,7 +1867,12 @@ async fn run_backup(
         );
     }
     Ok(
-        json!({"snapshotId":completed.snapshot_id,"publishedRevision":identity.revision.to_string()}),
+        json!({
+            "snapshotId": completed.snapshot_id,
+            "publishedRevision": identity.revision.to_string(),
+            "maintenancePacks": completed.maintenance.packs.to_string(),
+            "maintenanceBytes": completed.maintenance.source_bytes.to_string(),
+        }),
     )
 }
 #[tauri::command]

@@ -9,7 +9,7 @@ use super::{
     },
     connection_store::{ConnectionStore, UnusableReason},
     journal::{validate_receipt, TransferJournal},
-    package_cache::{kind_name, CatalogRange, PackageCache},
+    package_cache::{kind_name, CatalogRange, LivePack, PackageCache},
     phase_progress::PhaseProgress,
     sections::CapturedSection,
     transfer::SpoolSink,
@@ -57,12 +57,78 @@ pub(super) async fn cpu_permit() -> Result<tokio::sync::OwnedSemaphorePermit> {
         .map_err(transient)
 }
 
+/// Whether a publication that is already required may also repackage the small
+/// live record packs a long edit history left behind.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Maintenance {
+    #[default]
+    Declined,
+    Allowed,
+}
+
+/// The stored ciphertext length at or below which a live record pack counts as
+/// small for repackaging. This is not the small-object storage threshold.
+const SMALL_PACK_CIPHERTEXT_BYTES: u64 = 256 * 1024;
+/// How many small live packs have to exist before repackaging is worth a
+/// publication's extra uploads.
+const COALESCE_TRIGGER_PACKS: usize = 32;
+const COALESCE_MAX_PACKS: usize = 16;
+const COALESCE_MAX_SOURCE_BYTES: u64 = 4 * 1024 * 1024;
+/// What the maintenance portion can spend at its cap: one pack upload and one
+/// registration page each. A remaining allowance below this declines it.
+pub(crate) const COALESCE_REQUEST_BUDGET: u64 = 2 * COALESCE_MAX_PACKS as u64;
+
+/// What one publication's maintenance portion actually repackaged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MaintenanceReport {
+    pub(crate) packs: u64,
+    pub(crate) source_bytes: u64,
+}
+
+/// The adjacent run of small live packs one cycle repackages. Selection is by
+/// first live key, so a run covers neighbouring catalog ranges rather than
+/// scattered ones, and it stops at the pack, byte and trigger bounds.
+fn select_small_packs(mut live: Vec<LivePack>) -> BTreeSet<String> {
+    live.retain(|pack| {
+        pack.entries > 0 && pack.ciphertext_length <= SMALL_PACK_CIPHERTEXT_BYTES
+    });
+    if live.len() < COALESCE_TRIGGER_PACKS {
+        return BTreeSet::new();
+    }
+    live.sort_by(|a, b| {
+        (&a.first_key, &a.object_id).cmp(&(&b.first_key, &b.object_id))
+    });
+    let mut selected = BTreeSet::new();
+    let mut bytes = 0u64;
+    for pack in live {
+        if selected.len() >= COALESCE_MAX_PACKS
+            || bytes.saturating_add(pack.bytes) > COALESCE_MAX_SOURCE_BYTES
+        {
+            break;
+        }
+        bytes = bytes.saturating_add(pack.bytes);
+        selected.insert(pack.object_id);
+    }
+    selected
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PackageLimits {
     /// Provider-side stored file limit, before provider SDK wrapping.
     pub max_stored_bytes: u64,
     pub sdk_overhead_bytes: u64,
     pub target_plaintext_bytes: u64,
+    pub maintenance: Maintenance,
+}
+impl PackageLimits {
+    pub(crate) fn with_maintenance(mut self, allowed: bool) -> Self {
+        self.maintenance = if allowed {
+            Maintenance::Allowed
+        } else {
+            Maintenance::Declined
+        };
+        self
+    }
 }
 impl PackageLimits {
     pub(crate) fn from_capabilities(capabilities: &Capabilities) -> Result<Self> {
@@ -78,6 +144,7 @@ impl PackageLimits {
             max_stored_bytes,
             sdk_overhead_bytes: capabilities.sdk_overhead_bytes,
             target_plaintext_bytes: DEFAULT_TARGET_BYTES,
+            maintenance: Maintenance::Declined,
         })
     }
 }
@@ -201,6 +268,9 @@ pub(crate) struct CompletedSnapshot {
     pub asset_catalog: RemoteObject,
     pub sections: BTreeMap<String, wire::SectionSnapshotRef>,
     pub referenced_objects: Vec<RemoteObject>,
+    /// What the optional maintenance portion repackaged, reported apart from
+    /// the publication's own work.
+    pub maintenance: MaintenanceReport,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -945,12 +1015,64 @@ async fn build_entries(
     provider: &dyn Provider,
     repository: &RepositoryHandle,
     prepared: &Arc<PhaseProgress>,
+    maintenance: &mut MaintenanceReport,
     cancel: &Cancellation,
 ) -> Result<(Vec<EntryPlan>, Vec<RemoteObject>)> {
     prepared.plan(
         sources.len() as u64,
         sources.iter().map(|source| source.byte_length).sum(),
     );
+    // Only the record catalog, and only where the publication that is already
+    // required was told it may also spend the maintenance portion. The capture
+    // store beside it is the only place a repackaged body may come from, so
+    // without one there is nothing eligible.
+    // Which keys this cycle writes again rather than points at where they are.
+    // Decided before anything is uploaded, and with the capture store closed
+    // again, because a body the capture cannot answer for has to keep the
+    // placement it has: declining reuse for it would turn an optional cycle
+    // into a failed publication.
+    let mut drained: BTreeSet<String> = BTreeSet::new();
+    let mut repackage: BTreeSet<String> = BTreeSet::new();
+    if kind == wire::CatalogKind::Records && limits.maintenance == Maintenance::Allowed {
+        if let Some(content) = ContentStore::open_existing(external_root).map_err(transient)? {
+            let selected =
+                select_small_packs(cache.live_packs(format_repository_id, repository, kind)?);
+            for source in &sources {
+                if selected.is_empty() {
+                    break;
+                }
+                let Some(cached) = cache.entry(
+                    format_repository_id,
+                    repository,
+                    kind,
+                    &source.key,
+                    &source.content_sha256,
+                    source.byte_length,
+                )?
+                else {
+                    continue;
+                };
+                if cached
+                    .packs
+                    .iter()
+                    .any(|pack| selected.contains(&pack.object_id))
+                    && content
+                        .stat(&source.content_sha256)
+                        .is_ok_and(|held| held == Some(source.byte_length))
+                {
+                    repackage.insert(source.key.clone());
+                    for pack in &cached.packs {
+                        if selected.contains(&pack.object_id) {
+                            drained.insert(pack.object_id.clone());
+                        }
+                    }
+                    maintenance.source_bytes =
+                        maintenance.source_bytes.saturating_add(source.byte_length);
+                }
+            }
+        }
+    }
+    maintenance.packs = drained.len() as u64;
     let max_pack = StoredSize { limits, repository_id: format_repository_id }
         .pack_capacity(&format!("pack-{}", "0".repeat(64)))?;
     let target = limits.target_plaintext_bytes.min(max_pack).max(1);
@@ -979,6 +1101,13 @@ async fn build_entries(
             &source.content_sha256,
             source.byte_length,
         )? {
+            // A body sitting in one of the small packs this cycle drains is
+            // written again from the capture beside it, rather than pointed at
+            // where it is. The old pack is left for the snapshots that name it.
+            if repackage.contains(&source.key) {
+                uncached.push(source);
+                continue;
+            }
             match parent {
                 // Every pack this entry names is in the selected parent graph,
                 // which this job protects, so their existence is settled and
@@ -1068,7 +1197,7 @@ async fn build_entries(
                         break;
                     }
                 }
-                if usable {
+                if usable && !repackage.contains(&source.key) {
                     for chunk in &previous.chunks {
                         placements.insert(
                             (
@@ -2428,6 +2557,7 @@ pub(crate) async fn package_and_upload(
     if observed_fingerprint != metadata.content_fingerprint {
         return Err(corrupt("snapshot library fingerprint differs"));
     }
+    let mut maintenance = MaintenanceReport::default();
     let record_fingerprint = catalog_fingerprint(wire::CatalogKind::Records, &record_sources);
     let asset_fingerprint = catalog_fingerprint(wire::CatalogKind::Assets, &asset_sources);
     let (record_entries, mut referenced) = build_entries(
@@ -2445,6 +2575,7 @@ pub(crate) async fn package_and_upload(
         provider,
         repository,
         prepared,
+        &mut maintenance,
         cancel,
     )
     .await?;
@@ -2513,6 +2644,7 @@ pub(crate) async fn package_and_upload(
             provider,
             repository,
             prepared,
+            &mut MaintenanceReport::default(),
             cancel,
         )
         .await?;
@@ -2593,6 +2725,7 @@ pub(crate) async fn package_and_upload(
             provider,
             repository,
             prepared,
+            &mut MaintenanceReport::default(),
             cancel,
         )
         .await?;
@@ -2716,6 +2849,7 @@ pub(crate) async fn package_and_upload(
     referenced.sort_by(|a, b| a.object_id.cmp(&b.object_id));
     referenced.dedup_by(|a, b| a.object_id == b.object_id);
     Ok(CompletedSnapshot {
+        maintenance,
         reference,
         snapshot_id: metadata.snapshot_id,
         repository_id: metadata.repository_id,
@@ -3159,11 +3293,69 @@ mod tests {
         ParentGraph::new(roots, repository)
     }
 
+    fn live_pack(id: &str, ciphertext: u64, entries: u64, bytes: u64, first: &str) -> LivePack {
+        LivePack {
+            object_id: id.into(),
+            ciphertext_length: ciphertext,
+            entries,
+            bytes,
+            first_key: first.into(),
+        }
+    }
+
+    /// The trigger, the pack cap, the byte cap and the size rule, each on its
+    /// own. Selection is by first live key, so what it takes is an adjacent run
+    /// rather than whichever packs happen to be cheapest.
+    #[test]
+    fn small_live_packs_are_selected_as_one_adjacent_bounded_run() {
+        let small = |count: usize, bytes: u64| {
+            (0..count)
+                .map(|index| {
+                    live_pack(&format!("pack-{index:03}"), 1024, 1, bytes, &format!("record/{index:06}"))
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(select_small_packs(small(31, 16)).is_empty());
+        let selected = select_small_packs(small(32, 16));
+        assert_eq!(selected.len(), 16);
+        assert_eq!(
+            selected.iter().next_back().map(String::as_str),
+            Some("pack-015"),
+        );
+        assert_eq!(select_small_packs(small(64, 16)).len(), 16);
+
+        // Four packs of a mebibyte each fill the cycle's source budget before
+        // the pack cap does.
+        assert_eq!(select_small_packs(small(40, 1024 * 1024)).len(), 4);
+
+        // A pack over the small size is not eligible, and without 32 that are,
+        // nothing is selected.
+        let mut mixed = small(20, 16);
+        mixed.extend((20..40).map(|index| {
+            live_pack(
+                &format!("pack-{index:03}"),
+                SMALL_PACK_CIPHERTEXT_BYTES + 1,
+                1,
+                16,
+                &format!("record/{index:06}"),
+            )
+        }));
+        assert!(select_small_packs(mixed).is_empty());
+
+        // A pack no current entry names is not live, whatever its size.
+        let mut dead = small(32, 16);
+        for pack in dead.iter_mut().take(8) {
+            pack.entries = 0;
+        }
+        assert!(select_small_packs(dead).is_empty());
+    }
+
     fn limits(max: u64) -> PackageLimits {
         PackageLimits {
             max_stored_bytes: max,
             sdk_overhead_bytes: 0,
             target_plaintext_bytes: max,
+            maintenance: Default::default(),
         }
     }
 
@@ -3937,6 +4129,92 @@ mod tests {
             assert_eq!(restored.objects.len(), 1);
             assert_eq!(restored.body(&restored.objects[0].source), b"asset");
             assert_eq!(fs::read_dir(staging.join("objects")).unwrap().count(), 1);
+        });
+    }
+
+    /// Section 11.3 on the repository the aged measurement described: once a
+    /// long rotation of edits has left more than the trigger's worth of small
+    /// live record packs, the next publication that was going to run anyway
+    /// also repackages a bounded run of them. Placement changes; the library
+    /// does not, and nothing old is deleted.
+    #[test]
+    fn c_an_aged_publication_repackages_a_bounded_run_of_small_live_packs() {
+        runtime().block_on(async {
+            const RECORDS: usize = 128;
+            const ASSETS: usize = 8;
+            const AGED: i64 = 36;
+            let mut outcomes = Vec::new();
+            for allowed in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let provider = FakeProvider::new(false);
+                let repository = fake::repository();
+                let key = [47; 32];
+                let cache = root.path().join("cache");
+                let mut latest = None;
+                let mut before_final = BTreeSet::new();
+                for revision in 1..=AGED + 1 {
+                    if revision > AGED {
+                        before_final = provider.state.lock().unwrap()
+                            .objects.keys().cloned().collect();
+                    }
+                    let step = (revision - 1) as usize;
+                    let capture = captured_record_window(
+                        root.path(), &format!("coalesce-capture-{revision}"), revision,
+                        RECORDS, 2, step * 2, ASSETS);
+                    let meta = metadata(&format!("coalesce-snapshot-{revision}"), &capture);
+                    let job = format!("coalesce-job-{revision}");
+                    let mut transfer = journal(&root.path().join(&job), &job, &capture);
+                    let parent = latest.as_ref()
+                        .map(|previous| parent_graph(previous, &repository))
+                        .transpose().unwrap();
+                    // Only the last publication is offered the maintenance
+                    // portion, so the aging itself is identical in both runs.
+                    let limits = limits(128 * 1024).with_maintenance(allowed && revision > AGED);
+                    latest = Some(package_and_upload(
+                        capture, Vec::new(), root.path(), &cache, meta, &key, limits,
+                        parent.as_ref(), &mut transfer, &provider, &repository,
+                        &PhaseProgress::silent(), &Cancellation::default(),
+                    ).await.unwrap());
+                }
+                let completed = latest.unwrap();
+                let restore_root = root.path().join("coalesce-restore");
+                snapshot_restore::reset_test_read_counts(&restore_root);
+                let restored = snapshot_restore::download_snapshot(
+                    &completed.reference, &restore_root, &key, None,
+                    snapshot_restore::SourceTrust::Downloaded, &provider, &repository,
+                    &crate::external_storage::phase_progress::PhaseProgress::silent(),
+                    &Cancellation::default(),
+                ).await.unwrap();
+                let reads = snapshot_restore::take_test_read_counts(&restore_root);
+                let bodies = restored.records.iter()
+                    .map(|record| (record.key.clone(), restored.body(&record.source)))
+                    .collect::<BTreeMap<_, _>>();
+                let after_final = provider.state.lock().unwrap()
+                    .objects.keys().cloned().collect::<BTreeSet<_>>();
+                // Repackaging adds; it never deletes what older snapshots name.
+                assert!(before_final.is_subset(&after_final), "an object went missing");
+                outcomes.push((completed.maintenance, completed.library_fingerprint.clone(),
+                    reads, bodies, after_final.len() - before_final.len()));
+            }
+            let (plain, coalesced) = (&outcomes[0], &outcomes[1]);
+            assert_eq!(plain.0, MaintenanceReport::default());
+            assert_eq!(coalesced.0.packs, COALESCE_MAX_PACKS as u64);
+            assert!(coalesced.0.source_bytes > 0);
+            assert!(coalesced.0.source_bytes <= COALESCE_MAX_SOURCE_BYTES);
+            // The library is the same library. Only where its bodies sit moved.
+            assert_eq!(plain.1, coalesced.1);
+            assert_eq!(plain.3.len(), RECORDS);
+            assert_eq!(plain.3, coalesced.3);
+            // The drained packs are packs the latest state no longer opens.
+            assert_eq!(
+                plain.2.packs - coalesced.2.packs,
+                COALESCE_MAX_PACKS as u64,
+                "plain={:?} coalesced={:?}", plain.2, coalesced.2,
+            );
+            // The repackaged bodies fit the pack this publication was writing
+            // anyway, so the cycle costs no object the plain run did not also
+            // upload. What it buys is the sixteen packs above.
+            assert_eq!(coalesced.4, plain.4);
         });
     }
 

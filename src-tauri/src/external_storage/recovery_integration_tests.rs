@@ -136,6 +136,7 @@ fn repository_bootstrap_opens_and_applies_a_real_snapshot_without_the_source_vau
                     max_stored_bytes: 128 * 1024,
                     sdk_overhead_bytes: 0,
                     target_plaintext_bytes: 128 * 1024,
+                    maintenance: Default::default(),
                 },
                 None,
                 &mut journal,

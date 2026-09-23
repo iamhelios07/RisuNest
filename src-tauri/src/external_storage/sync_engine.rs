@@ -830,7 +830,8 @@ async fn package_capture(
         &cache,
         metadata,
         &connected.root_key,
-        PackageLimits::from_capabilities(&connected.stored.capabilities)?,
+        PackageLimits::from_capabilities(&connected.stored.capabilities)?
+            .with_maintenance(super::runtime::maintenance_allowed(app, connected, job)),
         parent_graph.as_ref(),
         &mut journal,
         connected.provider.as_ref(),
@@ -1902,9 +1903,12 @@ async fn run_resolve_conflict(
                 &job.request.connection_id,
                 super::connection_store::CompletionKind::Sync,
             );
-            Ok(
-                json!({"snapshotId":completed.snapshot_id,"publishedRevision":stored.local.identity.revision.to_string()}),
-            )
+            Ok(json!({
+                "snapshotId": completed.snapshot_id,
+                "publishedRevision": stored.local.identity.revision.to_string(),
+                "maintenancePacks": completed.maintenance.packs.to_string(),
+                "maintenanceBytes": completed.maintenance.source_bytes.to_string(),
+            }))
         }
         PublicationResult::Conflict(_) => {
             pds(app)?
