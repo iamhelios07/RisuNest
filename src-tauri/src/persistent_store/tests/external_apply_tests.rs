@@ -626,3 +626,111 @@ fn connection_removal_detaches_unknown_publication_but_keeps_its_recovery_root()
     assert!(store.external_prepare_connection_removal("connection").is_err());
     assert_eq!(sync_selection::read(&store.connection).unwrap().epoch, selected.epoch);
 }
+
+struct NeverCancelled;
+impl crate::local_backup::CancellationProbe for NeverCancelled {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
+fn captured_record_hashes(store: &mut PersistentStore) -> BTreeMap<String, String> {
+    let hydration = store
+        .hydrate_external_capture_dependencies("synthetic-consumer", &NeverCancelled)
+        .unwrap();
+    let capture = store
+        .capture_external_library("synthetic-consumer", &hydration, &NeverCancelled)
+        .unwrap();
+    let mut query = capture
+        .catalog
+        .db
+        .prepare("SELECT key,hash FROM records")
+        .unwrap();
+    let rows = query
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap();
+    rows.map(|row| row.unwrap()).collect()
+}
+
+/// An apply keeps the local value of every field the local device owns, and a
+/// capture encodes what it finds, so the two hashes under one key are the
+/// publisher's bytes and this device's bytes. They agree only for a record kind
+/// that carries no such field. Comparing a capture against a remote catalog
+/// therefore reports a difference where there is no content to receive.
+#[test]
+fn a_capture_of_a_received_library_renames_every_record_holding_a_local_view_field() {
+    let (directory, mut store) = open_store();
+    let staging = directory.path().join("download");
+    fs::create_dir(&staging).unwrap();
+    let page = encode_message_page(&[json!({"chatId":"message","data":"remote"})]).unwrap();
+    let page_object = write_object(&staging, &page.bytes);
+    let (conversation, conversation_hash) = write_record(
+        &staging,
+        LogicalRecordLocator::Conversation {
+            character_id: "character".into(),
+            conversation_id: "conversation".into(),
+        },
+        LogicalRecordEnvelope::Conversation {
+            configured_index: 0,
+            recent_at: 20,
+            detail: json!({"id":"conversation","name":"Remote conversation"}),
+            message_page_hashes: vec![page.hash],
+        },
+    );
+    let (root, root_hash) = root_record(&staging, "remote");
+    let (character, character_hash) = write_record(
+        &staging,
+        LogicalRecordLocator::Character {
+            character_id: "character".into(),
+        },
+        LogicalRecordEnvelope::Character {
+            configured_index: 0,
+            detail: json!({
+                "chaId":"character",
+                "name":"Remote character",
+                "chatPage":1,
+                "lastInteraction":10
+            }),
+            owner_heads: vec![LogicalOwnerHead::absent(
+                LogicalOwnerLocator::CharacterAdditional {
+                    character_id: "character".into(),
+                },
+            )],
+        },
+    );
+    let records = vec![conversation, root, character];
+    let mut hashes = BTreeMap::new();
+    for (record, hash) in records
+        .iter()
+        .zip([conversation_hash, root_hash, character_hash])
+    {
+        hashes.insert(record.key.clone(), hash);
+    }
+    let scope_id = library_fingerprint_domain();
+    let expected = fingerprint(&scope_id, &hashes);
+    let prepared = store
+        .prepare_external_snapshot_application(
+            &application(&staging, &scope_id, &expected, 1),
+            records.into_iter().map(Ok),
+            [Ok(page_object)],
+        )
+        .unwrap();
+    store.finish_prepared_replace(prepared).unwrap();
+
+    let captured = captured_record_hashes(&mut store);
+    let named: BTreeMap<String, String> = hashes
+        .iter()
+        .map(|(key, hash)| (key.clone(), hex::encode(hash)))
+        .collect();
+    assert_eq!(
+        captured.keys().collect::<Vec<_>>(),
+        named.keys().collect::<Vec<_>>()
+    );
+    let conversation = "r1:conversation:WyJjaGFyYWN0ZXIiLCJjb252ZXJzYXRpb24iXQ";
+    assert_eq!(captured[conversation], named[conversation]);
+    // The root kept its local statics and the character kept its local chat
+    // page and last interaction, so neither encodes to the bytes that arrived.
+    let character = "r1:character:WyJjaGFyYWN0ZXIiXQ";
+    assert_ne!(captured["r1:root"], named["r1:root"]);
+    assert_ne!(captured[character], named[character]);
+}
