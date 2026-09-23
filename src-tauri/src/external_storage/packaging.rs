@@ -6161,7 +6161,12 @@ mod tests {
             const ASSETS: usize = 64;
             const PUBLICATIONS: i64 = 120;
             const WINDOW: usize = 4;
-            for shape in ["same-key", "rotating-key", "mass-deletion"] {
+            // The fourth shape ages exactly like the second and then lets the
+            // publications that follow spend the maintenance portion, so the
+            // two rows differ only in section 11.3.
+            for shape in ["same-key", "rotating-key", "mass-deletion", "rotating-key-11.3"] {
+                let coalescing = shape == "rotating-key-11.3";
+                let publications = if coalescing { PUBLICATIONS + 10 } else { PUBLICATIONS };
                 let root = tempfile::tempdir().unwrap();
                 let provider = FakeProvider::new(false);
                 let repository = fake::repository();
@@ -6169,12 +6174,12 @@ mod tests {
                 let cache = root.path().join("aged-cache");
                 let started = std::time::Instant::now();
                 let mut latest = None;
-                for revision in 1..=PUBLICATIONS {
+                for revision in 1..=publications {
                     let step = (revision - 1) as usize;
                     let (records, edited, offset) = match shape {
                         "same-key" => (RECORDS, WINDOW, 0),
-                        "rotating-key" => (RECORDS, WINDOW, step * WINDOW),
-                        _ => (RECORDS - step * WINDOW, 0, 0),
+                        "mass-deletion" => (RECORDS - step * WINDOW, 0, 0),
+                        _ => (RECORDS, WINDOW, step * WINDOW),
                     };
                     let capture = captured_record_window(
                         root.path(), &format!("aged-capture-{revision}"), revision,
@@ -6187,7 +6192,9 @@ mod tests {
                         .transpose().unwrap();
                     latest = Some(package_and_upload(
                         capture, Vec::new(), root.path(), &cache, snapshot_metadata, &key,
-                        limits(128 * 1024), parent.as_ref(), &mut transfer, &provider,
+                        limits(128 * 1024)
+                            .with_maintenance(coalescing && revision > PUBLICATIONS),
+                        parent.as_ref(), &mut transfer, &provider,
                         &repository, &PhaseProgress::silent(), &Cancellation::default(),
                     ).await.unwrap());
                 }
@@ -6214,7 +6221,7 @@ mod tests {
                     .chain(restored.objects.iter().map(|object| object.byte_length))
                     .sum::<u64>();
                 eprintln!(
-                    "shape={shape} records={} publications={PUBLICATIONS} live_records={} live_objects={} \
+                    "shape={shape} records={} publications={publications} live_records={} live_objects={} \
                      live_bytes={live_bytes} remote_objects={remote_objects} retained_bytes={retained_bytes} \
                      latest_requests={} downloaded_bytes={} live_packs={} small_live_packs={} pack_bytes={} \
                      catalog_and_snapshot_bytes={} publication_ms={publication_ms} restore_ms={restore_ms}",
