@@ -4049,6 +4049,7 @@ mod tests {
                 .join(format!("{}.cipher", pack.ciphertext_sha256));
             fs::write(&pack_plaintext, vec![0; pack.plaintext_length as usize]).unwrap();
             fs::write(&pack_ciphertext, vec![0; pack.receipt.byte_length as usize]).unwrap();
+            let pack_reads = provider.read_attempts(&pack.receipt.locator.object);
             restored.discard_record_bodies();
             for object in &restored.objects {
                 fs::remove_file(object.source.file().unwrap()).unwrap();
@@ -4066,28 +4067,11 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(repaired.record_body(0), b"record two");
-            let mut repaired_plaintext =
-                crate::trust_boundary::open_regular_source(&pack_plaintext).unwrap();
-            assert_eq!(
-                repaired_plaintext.metadata().unwrap().len(),
-                pack.plaintext_length
-            );
-            assert_eq!(
-                hex::encode(hash_reader(&mut repaired_plaintext, pack.plaintext_length).unwrap()),
-                pack.plaintext_sha256
-            );
-            let mut repaired_ciphertext =
-                crate::trust_boundary::open_regular_source(&pack_ciphertext).unwrap();
-            assert_eq!(
-                repaired_ciphertext.metadata().unwrap().len(),
-                pack.receipt.byte_length
-            );
-            assert_eq!(
-                hex::encode(
-                    hash_reader(&mut repaired_ciphertext, pack.receipt.byte_length).unwrap()
-                ),
-                pack.ciphertext_sha256
-            );
+            assert_eq!(provider.read_attempts(&pack.receipt.locator.object), pack_reads + 1);
+            // The damaged copies were replaced by a fetched pack, which was
+            // placed and released like any other.
+            assert!(!pack_plaintext.exists());
+            assert!(!pack_ciphertext.exists());
         });
     }
 
@@ -4460,11 +4444,15 @@ mod tests {
             assert_eq!(bodies[1], br#"{"record":1,"value":0}"#);
             let full = tempfile::tempdir().unwrap();
             snapshot_restore::reset_test_read_counts(full.path());
+            snapshot_restore::reset_test_turnover(full.path());
             snapshot_restore::download_snapshot(&second.reference, full.path(), &key, None,
                 snapshot_restore::SourceTrust::Downloaded, &provider, &repository,
                 &PhaseProgress::silent(), &cancel).await.unwrap();
             let everything = snapshot_restore::take_test_read_counts(full.path());
             assert!(everything.packs > 2, "{everything:?}");
+            // Each pack is placed and released before the next one arrives.
+            assert_eq!(snapshot_restore::take_test_turnover(full.path()),
+                snapshot_restore::TestTurnover { ciphertexts: 1, plaintexts: 1 });
             assert_eq!(skipping.packs + refetching.packs, everything.packs,
                 "skipping={skipping:?} refetching={refetching:?} everything={everything:?}");
 
@@ -4478,6 +4466,55 @@ mod tests {
                     },
                 }, &provider, &repository, &PhaseProgress::silent(), &cancel).await.unwrap();
             assert!(over.records.iter().all(|record| !matches!(record.source, ObjectSource::Unchanged)));
+        });
+    }
+
+    /// R04. A cold restore holds one pack at a time, including for a record
+    /// and an asset whose chunks lie in several packs each, and lands both
+    /// byte for byte with nothing left to resume from.
+    #[test]
+    fn c_a_restore_holds_one_pack_at_a_time_and_assembles_spread_entries() {
+        runtime().block_on(async {
+            let noise = |length: usize, mut state: u64| -> Vec<u8> {
+                (0..length).map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state as u8
+                }).collect()
+            };
+            let record = noise(400 * 1024, 0x9e37_79b9_7f4a_7c15);
+            let asset = noise(600 * 1024, 0x2545_f491_4f6c_dd1d);
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let key = [37; 32];
+            let cancel = Cancellation::default();
+            let (capture, _) = captured(root.path(), "spread", 1, &record, &asset);
+            let meta = metadata("spread", &capture);
+            let mut journal = journal(&root.path().join("job"), "job", &capture);
+            let completed = package_and_upload(capture, vec![], root.path(), &root.path().join("cache"),
+                meta, &key, limits(128 * 1024), None, &mut journal, &provider, &repository,
+                &PhaseProgress::silent(), &cancel).await.unwrap();
+            let packs = completed.referenced_objects.iter()
+                .filter(|object| object.role == ObjectRole::Pack).count() as u64;
+            assert!(packs >= 8, "{packs}");
+
+            let staging = root.path().join("restored");
+            snapshot_restore::reset_test_read_counts(&staging);
+            snapshot_restore::reset_test_turnover(&staging);
+            let restored = snapshot_restore::download_snapshot(&completed.reference, &staging,
+                &key, None, snapshot_restore::SourceTrust::Downloaded, &provider, &repository,
+                &PhaseProgress::silent(), &cancel).await.unwrap();
+            assert_eq!(snapshot_restore::take_test_read_counts(&staging).packs, packs);
+            assert_eq!(snapshot_restore::take_test_turnover(&staging),
+                snapshot_restore::TestTurnover { ciphertexts: 1, plaintexts: 1 });
+            assert_eq!(restored.record_body(0), record);
+            let object = restored.objects.iter()
+                .find(|object| object.content_hash == hex::encode(hash(&asset))).unwrap();
+            assert_eq!(fs::read(object.source.file().unwrap()).unwrap(), asset);
+            assert!(!staging.join("assembly").exists());
+            assert!(!staging.join("turnover").exists());
         });
     }
 

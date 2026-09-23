@@ -62,6 +62,64 @@ pub(super) fn take_test_read_counts(staging_root: &Path) -> TestReads {
         .expect("test read counter root was registered")
 }
 
+/// The most pack copies one staging root held at once while it turned packs
+/// over.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct TestTurnover {
+    pub ciphertexts: usize,
+    pub plaintexts: usize,
+}
+
+#[cfg(test)]
+static TEST_TURNOVER: std::sync::LazyLock<std::sync::Mutex<BTreeMap<PathBuf, TestTurnover>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
+
+#[cfg(test)]
+pub(super) fn reset_test_turnover(staging_root: &Path) {
+    TEST_TURNOVER
+        .lock()
+        .unwrap()
+        .insert(staging_root.to_path_buf(), TestTurnover::default());
+}
+
+#[cfg(test)]
+pub(super) fn take_test_turnover(staging_root: &Path) -> TestTurnover {
+    TEST_TURNOVER
+        .lock()
+        .unwrap()
+        .remove(staging_root)
+        .expect("test turnover root was registered")
+}
+
+#[cfg(test)]
+fn record_turnover(staging_root: &Path, packs: &[RemoteObject]) {
+    let mut turnover = TEST_TURNOVER.lock().unwrap();
+    let Some(counts) = turnover.get_mut(staging_root) else {
+        return;
+    };
+    let ciphertexts = packs
+        .iter()
+        .filter(|pack| {
+            staging_root
+                .join("downloads")
+                .join(format!("{}.cipher", pack.ciphertext_sha256))
+                .exists()
+        })
+        .count();
+    let plaintexts = packs
+        .iter()
+        .filter(|pack| {
+            staging_root
+                .join("plaintext")
+                .join(&pack.plaintext_sha256)
+                .exists()
+        })
+        .count();
+    counts.ciphertexts = counts.ciphertexts.max(ciphertexts);
+    counts.plaintexts = counts.plaintexts.max(plaintexts);
+}
+
 #[cfg(test)]
 fn record_test_read(downloads: &Path, pack: bool, byte_length: u64) {
     let staging_root = downloads
@@ -757,122 +815,451 @@ fn library_body(
     Ok(Some(ObjectSource::Library(digest.to_owned())))
 }
 
-/// The packs the plan still has to read from. A pack no remaining chunk names
-/// is never opened.
-fn required_packs(
-    plan: &[ResolvedEntry],
-    packs: &BTreeMap<String, RemoteObject>,
-) -> Result<BTreeMap<String, RemoteObject>> {
-    let mut required = BTreeMap::new();
-    for resolved in plan.iter().filter(|resolved| resolved.source.is_none()) {
-        for chunk in &resolved.entry.chunks {
-            if required.contains_key(&chunk.pack_id) {
-                continue;
-            }
-            let pack = packs
-                .get(&chunk.pack_id)
-                .ok_or_else(|| corrupt("catalog pack is missing"))?;
-            required.insert(chunk.pack_id.clone(), pack.clone());
-        }
-    }
-    Ok(required)
+/// One entry that still has to be put together out of packs.
+struct Pending {
+    resolved: ResolvedEntry,
+    /// Where each chunk starts in the assembled body.
+    offsets: Vec<u64>,
+    /// The packs its chunks lie in. An entry in one pack is put together while
+    /// that pack is open; one spread over several is written into its own
+    /// assembly file a chunk at a time, as each of its packs arrives.
+    packs: BTreeSet<String>,
 }
 
-fn materialize_entries(
-    plan: Vec<ResolvedEntry>,
-    packs: &BTreeMap<String, PathBuf>,
+impl Pending {
+    fn new(resolved: ResolvedEntry) -> Result<Self> {
+        let mut offsets = Vec::with_capacity(resolved.entry.chunks.len());
+        let mut length = 0u64;
+        for chunk in &resolved.entry.chunks {
+            offsets.push(length);
+            length = length
+                .checked_add(chunk.plaintext_length)
+                .ok_or_else(|| corrupt("restored entry length overflow"))?;
+        }
+        if length != resolved.entry.byte_length {
+            return Err(corrupt("restored entry length differs from its chunks"));
+        }
+        let packs = resolved
+            .entry
+            .chunks
+            .iter()
+            .map(|chunk| chunk.pack_id.clone())
+            .collect();
+        Ok(Self {
+            resolved,
+            offsets,
+            packs,
+        })
+    }
+
+    fn spread(&self) -> bool {
+        self.packs.len() > 1
+    }
+}
+
+/// What a pack's placement leaves in `turnover/`: its bytes are in the
+/// assembly files of the entries it carries, so it is not read again.
+fn marker_path(staging_root: &Path, pack_id: &str) -> Result<PathBuf> {
+    if pack_id.is_empty()
+        || !pack_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err(corrupt("catalog pack identity is not a file name"));
+    }
+    Ok(staging_root.join("turnover").join(pack_id))
+}
+
+fn remove_marker(staging_root: &Path, pack_id: &str) -> Result<()> {
+    match fs::remove_file(marker_path(staging_root, pack_id)?) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(transient(error)),
+        _ => Ok(()),
+    }
+}
+
+fn assembly_path(staging_root: &Path, digest: &str) -> PathBuf {
+    staging_root.join("assembly").join(digest)
+}
+
+/// Readies what an earlier attempt left for another pass. An assembly file
+/// that is not the length it was created at no longer holds what the markers
+/// of its packs say it does, and an entry placed whole out of one pack is
+/// only here once its pack is read again.
+fn prepare_turnover(staging_root: &Path, pending: &[Pending]) -> Result<()> {
+    ensure_directory(&staging_root.join("assembly"))?;
+    ensure_directory(&staging_root.join("turnover"))?;
+    for item in pending {
+        if !item.spread() {
+            for pack in &item.packs {
+                remove_marker(staging_root, pack)?;
+            }
+            continue;
+        }
+        let path = assembly_path(staging_root, &item.resolved.digest);
+        let intact = match fs::symlink_metadata(&path) {
+            Ok(metadata)
+                if metadata.is_file()
+                    && !crate::trust_boundary::is_link_like(&metadata)
+                    && metadata.len() == item.resolved.entry.byte_length =>
+            {
+                true
+            }
+            Ok(_) => {
+                fs::remove_file(&path).map_err(transient)?;
+                false
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(transient(error)),
+        };
+        if !intact {
+            for pack in &item.packs {
+                remove_marker(staging_root, pack)?;
+            }
+            let file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)
+                .map_err(transient)?;
+            file.set_len(item.resolved.entry.byte_length)
+                .map_err(transient)?;
+        }
+    }
+    Ok(())
+}
+
+fn read_chunk(
+    input: &mut fs::File,
+    input_length: u64,
+    chunk: &wire::StoredChunk,
+) -> Result<Vec<u8>> {
+    if chunk
+        .offset
+        .checked_add(chunk.stored_length)
+        .is_none_or(|end| end > input_length)
+    {
+        return Err(corrupt("chunk escaped pack"));
+    }
+    input.seek(SeekFrom::Start(chunk.offset)).map_err(corrupt)?;
+    let mut limited = input.take(chunk.stored_length);
+    let decoded = pack::read_entry(&mut limited, pack::MAX_CHUNK_BYTES).map_err(corrupt)?;
+    if limited.limit() != 0
+        || decoded.hash != chunk.plaintext_sha256
+        || decoded.bytes.len() as u64 != chunk.plaintext_length
+    {
+        return Err(corrupt("pack chunk differs"));
+    }
+    Ok(decoded.bytes)
+}
+
+/// Puts an entry that lies in one pack (or in none, when it is empty) where it
+/// belongs: a record into the content store, an object into its file.
+fn place_whole(
+    mut input: Option<(&mut fs::File, u64)>,
+    item: &Pending,
     content: &mut ContentStore,
-    cancel: &Cancellation,
-    records: &mut BTreeMap<String, PreparedRecord>,
-    objects: &mut BTreeMap<String, PreparedObject>,
 ) -> Result<()> {
-    for resolved in plan {
-        cancel.check()?;
+    let ResolvedEntry {
+        entry,
+        digest,
+        destination,
+        ..
+    } = &item.resolved;
+    let mut next = |chunk: &wire::StoredChunk| match input.as_mut() {
+        Some((file, length)) => read_chunk(file, *length, chunk),
+        None => Err(corrupt("catalog pack is missing")),
+    };
+    let Some(destination) = destination else {
+        // The store takes the body and decides where it belongs, so a record
+        // never becomes a plaintext file of its own that the apply has to
+        // copy into another store. The identity the catalog named is proved
+        // by the store.
+        let mut bytes =
+            Vec::with_capacity(usize::try_from(entry.byte_length).map_err(corrupt)?);
+        for chunk in &entry.chunks {
+            bytes.extend_from_slice(&next(chunk)?);
+        }
+        if bytes.len() as u64 != entry.byte_length {
+            return Err(corrupt("restored entry integrity failed"));
+        }
+        return content.put(digest, &bytes).map_err(corrupt);
+    };
+    let partial = destination.with_extension("partial");
+    if partial.exists() {
+        fs::remove_file(&partial).map_err(transient)?;
+    }
+    let mut output = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&partial)
+        .map_err(transient)?;
+    let mut output_hash = Sha256::new();
+    let mut written = 0u64;
+    for chunk in &entry.chunks {
+        let bytes = next(chunk)?;
+        output.write_all(&bytes).map_err(transient)?;
+        output_hash.update(&bytes);
+        written = written
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| corrupt("restored entry length overflow"))?;
+    }
+    output.sync_all().map_err(transient)?;
+    drop(output);
+    // The bytes were hashed as they were written and the length is what was
+    // written, so reading the file back to learn the same two things is a
+    // pass with no evidence in it.
+    let actual: [u8; 32] = output_hash.finalize().into();
+    if actual != entry.content_sha256 || written != entry.byte_length {
+        return Err(corrupt("restored entry integrity failed"));
+    }
+    publish_verified(&partial, destination, entry.byte_length, digest)
+}
+
+/// Places everything one open pack carries for `users`, then marks the pack
+/// done. The marker is written only once the bytes it stands for are durable.
+/// A pack already fetched is placed whole; cancellation is honored between
+/// packs.
+fn place_pack(
+    staging_root: &Path,
+    pack_id: &str,
+    plaintext: &Path,
+    pending: &[Pending],
+    users: &[usize],
+) -> Result<()> {
+    let mut input = crate::trust_boundary::open_regular_source(plaintext).map_err(corrupt)?;
+    let input_length = input.metadata().map_err(corrupt)?.len();
+    let mut content = content_store(staging_root)?;
+    for &index in users {
+        let item = &pending[index];
+        if !item.spread() {
+            place_whole(Some((&mut input, input_length)), item, &mut content)?;
+            continue;
+        }
+        let path = assembly_path(staging_root, &item.resolved.digest);
+        let metadata = fs::symlink_metadata(&path).map_err(transient)?;
+        if crate::trust_boundary::is_link_like(&metadata) || !metadata.is_file() {
+            return Err(corrupt("snapshot assembly file is not a regular file"));
+        }
+        let mut output = OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .map_err(transient)?;
+        for (chunk, offset) in item.resolved.entry.chunks.iter().zip(&item.offsets) {
+            if chunk.pack_id != pack_id {
+                continue;
+            }
+            let bytes = read_chunk(&mut input, input_length, chunk)?;
+            output.seek(SeekFrom::Start(*offset)).map_err(transient)?;
+            output.write_all(&bytes).map_err(transient)?;
+        }
+        output.sync_all().map_err(transient)?;
+    }
+    // The apply reads this store on its own connection, and a marked pack is
+    // not read again, so what it placed has to be durable first.
+    content.commit().map_err(transient)?;
+    fs::write(marker_path(staging_root, pack_id)?, b"").map_err(transient)?;
+    Ok(())
+}
+
+/// Proves every assembly file whole and moves it where its entry belongs. One
+/// that is not what its catalog names takes its packs' markers with it, so
+/// the next attempt reads exactly those packs again.
+fn finish_assemblies(staging_root: &Path, pending: &[Pending]) -> Result<()> {
+    let mut content = content_store(staging_root)?;
+    let mut finished = BTreeSet::new();
+    for item in pending {
+        if item.packs.is_empty() {
+            place_whole(None, item, &mut content)?;
+            continue;
+        }
+        if !item.spread() || !finished.insert(item.resolved.digest.as_str()) {
+            continue;
+        }
         let ResolvedEntry {
             entry,
             digest,
             destination,
-            source,
-        } = resolved;
-        if source.is_none() && entry.kind == wire::CatalogEntryKind::Record {
-            // The store takes the body and decides where it belongs, so a
-            // record never becomes a plaintext file of its own that the apply
-            // has to copy into another store. The identity the catalog named
-            // is proved by the store, which is the check the file path wrote
-            // out by hand.
-            let bytes = assemble(&entry, packs)?;
-            content.put(&digest, &bytes).map_err(corrupt)?;
-            let source = ObjectSource::Captured(digest.clone());
-            insert_prepared(entry, digest, source, records, objects)?;
-            continue;
-        }
-        // A record the store already answers for has no file to write.
-        let Some(destination) = destination else {
-            let source =
-                source.ok_or_else(|| corrupt("restored record has neither source nor body"))?;
-            insert_prepared(entry, digest, source, records, objects)?;
-            continue;
+            ..
+        } = &item.resolved;
+        let path = assembly_path(staging_root, digest);
+        let intact = match destination {
+            // A record goes into the store in memory, so it is proved from the
+            // same read.
+            None => {
+                let mut file =
+                    crate::trust_boundary::open_regular_source(&path).map_err(corrupt)?;
+                let mut bytes =
+                    Vec::with_capacity(usize::try_from(entry.byte_length).map_err(corrupt)?);
+                file.read_to_end(&mut bytes).map_err(transient)?;
+                let actual: [u8; 32] = Sha256::digest(&bytes).into();
+                (actual == entry.content_sha256 && bytes.len() as u64 == entry.byte_length)
+                    .then_some(Some(bytes))
+            }
+            Some(_) => verify(&path, entry.byte_length, digest)?.then_some(None),
         };
-        if source.is_none() {
-            if destination.exists() {
-                fs::remove_file(&destination).map_err(transient)?;
+        let Some(bytes) = intact else {
+            let _ = fs::remove_file(&path);
+            for pack in &item.packs {
+                remove_marker(staging_root, pack)?;
             }
-            let partial = destination.with_extension("partial");
-            if partial.exists() {
-                fs::remove_file(&partial).map_err(transient)?;
+            return Err(transient("restored entry integrity failed"));
+        };
+        match (destination, bytes) {
+            (Some(destination), _) => {
+                publish_verified(&path, destination, entry.byte_length, digest)?
             }
-            let mut output = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&partial)
-                .map_err(transient)?;
-            let mut output_hash = Sha256::new();
-            let mut written = 0u64;
-            for chunk in &entry.chunks {
-                let pack_path = packs
-                    .get(&chunk.pack_id)
-                    .ok_or_else(|| corrupt("catalog pack is missing"))?;
-                let mut input =
-                    crate::trust_boundary::open_regular_source(pack_path).map_err(corrupt)?;
-                let input_length = input.metadata().map_err(corrupt)?.len();
-                if chunk
-                    .offset
-                    .checked_add(chunk.stored_length)
-                    .is_none_or(|end| end > input_length)
-                {
-                    return Err(corrupt("chunk escaped pack"));
-                }
-                input.seek(SeekFrom::Start(chunk.offset)).map_err(corrupt)?;
-                let mut limited = input.take(chunk.stored_length);
-                let decoded =
-                    pack::read_entry(&mut limited, pack::MAX_CHUNK_BYTES).map_err(corrupt)?;
-                if limited.limit() != 0
-                    || decoded.hash != chunk.plaintext_sha256
-                    || decoded.bytes.len() as u64 != chunk.plaintext_length
-                {
-                    return Err(corrupt("pack chunk differs"));
-                }
-                output.write_all(&decoded.bytes).map_err(transient)?;
-                output_hash.update(&decoded.bytes);
-                written = written
-                    .checked_add(decoded.bytes.len() as u64)
-                    .ok_or_else(|| corrupt("restored entry length overflow"))?;
+            (None, Some(bytes)) => {
+                content.put(digest, &bytes).map_err(corrupt)?;
+                fs::remove_file(&path).map_err(transient)?;
             }
-            output.sync_all().map_err(transient)?;
-            drop(output);
-            // The bytes were hashed as they were written and the length is what
-            // was written, so reading the file back to learn the same two things
-            // is a pass with no evidence in it.
-            let actual: [u8; 32] = output_hash.finalize().into();
-            if actual != entry.content_sha256 || written != entry.byte_length {
-                return Err(corrupt("restored entry integrity failed"));
-            }
-            publish_verified(&partial, &destination, entry.byte_length, &digest)?;
+            (None, None) => return Err(corrupt("record assembly was not read")),
         }
-        let source = source.unwrap_or(ObjectSource::File(destination));
-        insert_prepared(entry, digest, source, records, objects)?;
     }
+    content.commit().map_err(transient)?;
     Ok(())
+}
+
+/// Reads the packs a plan still needs one at a time, placing what each one
+/// carries and releasing it before the next, so at most one pack's
+/// ciphertext and plaintext are on disk however many packs the snapshot has
+/// or one entry spans. A pack an interrupted attempt already placed is not
+/// read again.
+#[allow(clippy::too_many_arguments)]
+async fn turn_over_packs(
+    plan: Vec<ResolvedEntry>,
+    packs: &BTreeMap<String, RemoteObject>,
+    root_key: &[u8; 32],
+    staging_root: &Path,
+    provider: &dyn Provider,
+    repository: &RepositoryHandle,
+    progress: &PhaseProgress,
+    cancel: &Cancellation,
+) -> Result<(
+    BTreeMap<String, PreparedRecord>,
+    BTreeMap<String, PreparedObject>,
+)> {
+    let mut records = BTreeMap::new();
+    let mut objects = BTreeMap::new();
+    let mut pending = Vec::new();
+    for resolved in plan {
+        match resolved.source.clone() {
+            Some(source) => insert_prepared(
+                resolved.entry,
+                resolved.digest,
+                source,
+                &mut records,
+                &mut objects,
+            )?,
+            None => pending.push(Pending::new(resolved)?),
+        }
+    }
+    // Packs in the order the plan first needs them, each with the entries it
+    // carries. A pack no remaining chunk names is never opened.
+    let mut order: Vec<String> = Vec::new();
+    let mut users: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (index, item) in pending.iter().enumerate() {
+        for chunk in &item.resolved.entry.chunks {
+            let entries = users.entry(chunk.pack_id.clone()).or_insert_with(|| {
+                order.push(chunk.pack_id.clone());
+                Vec::new()
+            });
+            if entries.last() != Some(&index) {
+                entries.push(index);
+            }
+        }
+    }
+    let mut required = Vec::with_capacity(order.len());
+    for id in &order {
+        required.push(
+            packs
+                .get(id)
+                .cloned()
+                .ok_or_else(|| corrupt("catalog pack is missing"))?,
+        );
+    }
+    let pending = std::sync::Arc::new(pending);
+    let prepared_root = staging_root.to_path_buf();
+    let prepared_pending = pending.clone();
+    let cpu = cpu_permit().await?;
+    tokio::task::spawn_blocking(move || prepare_turnover(&prepared_root, &prepared_pending))
+        .await
+        .map_err(transient)??;
+    drop(cpu);
+    // What each catalog needs is known before any of it is fetched, and a
+    // later catalog adds to the same total rather than restarting it.
+    progress.plan(
+        required.len() as u64,
+        required.iter().map(|pack| pack.receipt.byte_length).sum(),
+    );
+    for (id, pack) in order.iter().zip(&required) {
+        cancel.check()?;
+        if marker_path(staging_root, id)?.is_file() {
+            progress.completed(pack.receipt.byte_length);
+            continue;
+        }
+        let plaintext =
+            open_object(pack, root_key, staging_root, provider, repository, cancel).await?;
+        #[cfg(test)]
+        record_turnover(staging_root, &required);
+        // Decrypting was all the ciphertext was for.
+        match fs::remove_file(
+            staging_root
+                .join("downloads")
+                .join(format!("{}.cipher", pack.ciphertext_sha256)),
+        ) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(transient(error));
+            }
+            _ => {}
+        }
+        let place_root = staging_root.to_path_buf();
+        let place_id = id.clone();
+        let place_pending = pending.clone();
+        let place_users = users.remove(id).unwrap_or_default();
+        let cpu = cpu_permit().await?;
+        tokio::task::spawn_blocking(move || {
+            place_pack(
+                &place_root,
+                &place_id,
+                &plaintext,
+                &place_pending,
+                &place_users,
+            )
+        })
+        .await
+        .map_err(transient)??;
+        drop(cpu);
+        discard_object(staging_root, pack);
+        #[cfg(test)]
+        record_turnover(staging_root, &required);
+        progress.completed(pack.receipt.byte_length);
+    }
+    let finish_root = staging_root.to_path_buf();
+    let finish_pending = pending.clone();
+    let cpu = cpu_permit().await?;
+    tokio::task::spawn_blocking(move || finish_assemblies(&finish_root, &finish_pending))
+        .await
+        .map_err(transient)??;
+    drop(cpu);
+    // Every entry is where it belongs, so nothing an interrupted attempt
+    // would resume from is left to keep.
+    let _ = fs::remove_dir_all(staging_root.join("assembly"));
+    let _ = fs::remove_dir_all(staging_root.join("turnover"));
+    let pending = std::sync::Arc::try_unwrap(pending)
+        .map_err(|_| transient("snapshot placement is still running"))?;
+    for item in pending {
+        let ResolvedEntry {
+            entry,
+            digest,
+            destination,
+            ..
+        } = item.resolved;
+        let source = match destination {
+            None => ObjectSource::Captured(digest.clone()),
+            Some(destination) => ObjectSource::File(destination),
+        };
+        insert_prepared(entry, digest, source, &mut records, &mut objects)?;
+    }
+    Ok((records, objects))
 }
 
 /// File one materialized entry under the kind its catalog gave it.
@@ -928,24 +1315,9 @@ fn assemble(entry: &CompleteEntry, packs: &BTreeMap<String, PathBuf>) -> Result<
             .ok_or_else(|| corrupt("catalog pack is missing"))?;
         let mut input = crate::trust_boundary::open_regular_source(pack_path).map_err(corrupt)?;
         let input_length = input.metadata().map_err(corrupt)?.len();
-        if chunk
-            .offset
-            .checked_add(chunk.stored_length)
-            .is_none_or(|end| end > input_length)
-        {
-            return Err(corrupt("chunk escaped pack"));
-        }
-        input.seek(SeekFrom::Start(chunk.offset)).map_err(corrupt)?;
-        let mut limited = input.take(chunk.stored_length);
-        let decoded = pack::read_entry(&mut limited, pack::MAX_CHUNK_BYTES).map_err(corrupt)?;
-        if limited.limit() != 0
-            || decoded.hash != chunk.plaintext_sha256
-            || decoded.bytes.len() as u64 != chunk.plaintext_length
-        {
-            return Err(corrupt("pack chunk differs"));
-        }
-        digest.update(&decoded.bytes);
-        bytes.extend_from_slice(&decoded.bytes);
+        let decoded = read_chunk(&mut input, input_length, chunk)?;
+        digest.update(&decoded);
+        bytes.extend_from_slice(&decoded);
     }
     let actual: [u8; 32] = digest.finalize().into();
     if actual != entry.content_sha256 || bytes.len() as u64 != entry.byte_length {
@@ -1211,8 +1583,9 @@ pub(crate) async fn download_snapshot(
     .await
     .map_err(transient)??;
     drop(cpu);
-    let pack_paths = open_packs(
-        &required_packs(&plan, &record_packs)?,
+    let (records, objects) = turn_over_packs(
+        plan,
+        &record_packs,
         root_key,
         staging_root,
         provider,
@@ -1221,29 +1594,6 @@ pub(crate) async fn download_snapshot(
         cancel,
     )
     .await?;
-    let library_cancel = cancel.clone();
-    let content_staging = staging_root.to_path_buf();
-    let cpu = cpu_permit().await?;
-    let (records, objects) = tokio::task::spawn_blocking(move || {
-        let mut content = content_store(&content_staging)?;
-        let mut records = BTreeMap::new();
-        let mut objects = BTreeMap::new();
-        materialize_entries(
-            plan,
-            &pack_paths,
-            &mut content,
-            &library_cancel,
-            &mut records,
-            &mut objects,
-        )?;
-        // The apply reads this store on its own connection, so the last group
-        // has to be durable before a plan naming it leaves here.
-        content.commit().map_err(transient)?;
-        Ok((records, objects))
-    })
-    .await
-    .map_err(transient)??;
-    drop(cpu);
     Ok(PreparedRemoteSnapshot {
         snapshot_id: document.snapshot_id,
         repository_id: snapshot.repository_id.clone(),
