@@ -724,7 +724,11 @@ impl<'a> Transfer<'a> {
         if reply.status != 200 {
             return Err(response_error(reply));
         }
+        // The encoded reply has no reader once its frames are owned, and
+        // holding both keeps two copies of a batch alive until the last
+        // body is stored.
         let frames = transfer::decode(&reply.body)?;
+        drop(reply);
         if frames.len() != targets.len() {
             return Err(SyncError::new("transfer-count-mismatch", 502));
         }
