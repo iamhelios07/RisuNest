@@ -923,3 +923,155 @@ fn a_local_edit_after_a_receive_leaves_no_view() {
     store.commit(&commit).unwrap();
     assert_eq!(store.external_base_records("connection").unwrap(), None);
 }
+
+/// A snapshot of `characters` characters, each with one conversation of one
+/// page, and optionally a conversation whose character it does not carry.
+fn wide_snapshot(
+    staging: &Path,
+    characters: usize,
+    orphan: bool,
+) -> (Vec<ExternalSnapshotRecord>, Vec<ExternalSnapshotObject>, [u8; 32]) {
+    let page = encode_message_page(&[json!({"chatId":"message","data":"remote"})]).unwrap();
+    let page_object = write_object(staging, &page.bytes);
+    let conversation = |character: &str| {
+        write_record(
+            staging,
+            LogicalRecordLocator::Conversation {
+                character_id: character.into(),
+                conversation_id: "chat".into(),
+            },
+            LogicalRecordEnvelope::Conversation {
+                configured_index: 0,
+                recent_at: 1,
+                detail: json!({"id":"chat","name":"chat"}),
+                message_page_hashes: vec![page.hash.clone()],
+            },
+        )
+    };
+    let mut records = vec![root_record(staging, "wide")];
+    for index in 0..characters {
+        let id = format!("character-{index:04}");
+        records.push(write_record(
+            staging,
+            LogicalRecordLocator::Character {
+                character_id: id.clone(),
+            },
+            LogicalRecordEnvelope::Character {
+                configured_index: index as u64,
+                detail: json!({"chaId": id, "name": id}),
+                owner_heads: vec![LogicalOwnerHead::absent(
+                    LogicalOwnerLocator::CharacterAdditional {
+                        character_id: id.clone(),
+                    },
+                )],
+            },
+        ));
+        records.push(conversation(&id));
+    }
+    if orphan {
+        records.push(conversation("absent"));
+    }
+    let hashes: BTreeMap<_, _> = records
+        .iter()
+        .map(|(record, hash)| (record.key.clone(), *hash))
+        .collect();
+    let fingerprint = fingerprint(&library_fingerprint_domain(), &hashes);
+    (
+        records.into_iter().map(|(record, _)| record).collect(),
+        vec![page_object],
+        fingerprint,
+    )
+}
+
+fn stage_wide(
+    store: &mut PersistentStore,
+    staging: &Path,
+    characters: usize,
+    orphan: bool,
+) -> StoreResult<PreparedReplaceCommit> {
+    let (records, objects, fingerprint) = wide_snapshot(staging, characters, orphan);
+    let scope_id = library_fingerprint_domain();
+    store.prepare_external_snapshot_application(
+        &application(staging, &scope_id, &fingerprint, 1),
+        records.into_iter().map(Ok),
+        objects.into_iter().map(Ok),
+    )
+}
+
+/// R05. A stage is written a bounded batch at a time, and what lands is the
+/// whole snapshot.
+#[test]
+fn a_stage_is_written_in_bounded_batches_and_lands_every_record() {
+    let (directory, mut store) = open_store();
+    let staging = directory.path().join("download");
+    fs::create_dir(&staging).unwrap();
+    let batches = std::rc::Rc::new(std::cell::Cell::new(0));
+    let seen = batches.clone();
+    super::after_stage_batch(Some(Box::new(move |written, _| seen.set(written))));
+    let staged = stage_wide(&mut store, &staging, 600, false);
+    super::after_stage_batch(None);
+    let prepared = staged.unwrap();
+    // A root and 600 characters, then 600 conversations, 512 records a batch.
+    assert_eq!(batches.get(), 3);
+    let library = store.materialize_staging(&prepared.staging_id).unwrap();
+    let characters = library["characters"].as_array().unwrap();
+    assert_eq!(characters.len(), 600);
+    for character in characters {
+        assert_eq!(
+            character["chats"][0]["message"],
+            json!([{"chatId":"message","data":"remote"}])
+        );
+    }
+    assert_eq!(store.finish_prepared_replace(prepared).unwrap().revision, 2);
+    assert_eq!(
+        store.materialize(None).unwrap()["characters"]
+            .as_array()
+            .unwrap()
+            .len(),
+        600
+    );
+}
+
+/// R05. A local edit between two batches ends the stage at the next one, and
+/// a record refused in a later batch takes the earlier batches with it.
+#[test]
+fn a_stage_stopped_between_batches_leaves_no_stage_behind() {
+    let (directory, mut store) = open_store();
+    let staging = directory.path().join("download");
+    fs::create_dir(&staging).unwrap();
+    // Another job's connection, as a local save would have.
+    let mut other = store.open_native_job_store().unwrap();
+    super::after_stage_batch(Some(Box::new(move |written, _| {
+        if written == 1 {
+            let commit = serde_json::from_value(json!({
+                "expectedRevision": 1, "root": {"marker":"newer-local"}
+            }))
+            .unwrap();
+            other.commit(&commit).unwrap();
+        }
+    })));
+    let staged = stage_wide(&mut store, &staging, 600, false);
+    super::after_stage_batch(None);
+    assert!(matches!(
+        staged,
+        Err(StoreError::RevisionConflict {
+            expected: 1,
+            actual: 2
+        })
+    ));
+    assert_eq!(stage_count(&store), 0);
+    assert_eq!(store.materialize(None).unwrap()["marker"], "newer-local");
+
+    let (directory, mut store) = open_store();
+    let staging = directory.path().join("download");
+    fs::create_dir(&staging).unwrap();
+    let batches = std::rc::Rc::new(std::cell::Cell::new(0));
+    let seen = batches.clone();
+    super::after_stage_batch(Some(Box::new(move |written, _| seen.set(written))));
+    let staged = stage_wide(&mut store, &staging, 600, true);
+    super::after_stage_batch(None);
+    assert!(staged.is_err());
+    assert!(batches.get() >= 2, "the refusal came after earlier batches committed");
+    assert_eq!(stage_count(&store), 0);
+    assert_eq!(store.materialize(None).unwrap()["marker"], "local");
+}

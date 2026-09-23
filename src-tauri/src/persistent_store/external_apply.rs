@@ -627,6 +627,100 @@ where
     Ok(sizes)
 }
 
+/// A stage is written a batch at a time, each batch its own transaction, so a
+/// database-sized snapshot never holds the writer for the whole library. A
+/// batch closes at whichever bound it reaches first. Staging 40,001 records
+/// of a 20,000-character library took 79 batches, the longest holding the
+/// writer 58 ms, where one transaction had held it for 14 s.
+const STAGE_BATCH_RECORDS: usize = 512;
+const STAGE_BATCH_WORK: u64 = 8_192;
+const STAGE_BATCH_BYTES: u64 = 8 * 1024 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    /// Runs after each stage batch commits, with the number of batches so far
+    /// and how long that batch held the writer.
+    static AFTER_STAGE_BATCH: std::cell::RefCell<Option<Box<dyn FnMut(usize, std::time::Duration)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn after_stage_batch(hook: Option<Box<dyn FnMut(usize, std::time::Duration)>>) {
+    AFTER_STAGE_BATCH.with(|slot| *slot.borrow_mut() = hook);
+}
+
+/// Records prepared outside any transaction and waiting to be written into
+/// the stage together.
+struct StageBatch {
+    records: Vec<PreparedRecord>,
+    work: u64,
+    bytes: u64,
+    written: usize,
+}
+
+impl StageBatch {
+    fn push(&mut self, record: PreparedRecord, bytes: u64) {
+        self.work = self.work.saturating_add(1).saturating_add(
+            record
+                .messages
+                .as_ref()
+                .map_or(0, |messages| messages.len() as u64),
+        );
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.records.push(record);
+    }
+
+    fn full(&self) -> bool {
+        self.records.len() >= STAGE_BATCH_RECORDS
+            || self.work >= STAGE_BATCH_WORK
+            || self.bytes >= STAGE_BATCH_BYTES
+    }
+
+    /// Writes the batch, provided the library is still at the revision the
+    /// stage was prepared against: a local edit ends the stage at the next
+    /// batch rather than at activation.
+    fn write(
+        &mut self,
+        connection: &mut rusqlite::Connection,
+        generation: &str,
+        expected_revision: i64,
+    ) -> StoreResult<()> {
+        if self.records.is_empty() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        let started = std::time::Instant::now();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let actual_revision = current_revision(&transaction)?;
+        if actual_revision != expected_revision {
+            return Err(StoreError::RevisionConflict {
+                expected: expected_revision,
+                actual: actual_revision,
+            });
+        }
+        for record in self.records.drain(..) {
+            rows::apply_serialized_record(
+                &transaction,
+                generation,
+                &record.locator,
+                &record.envelope,
+                record.messages.as_deref(),
+            )?;
+        }
+        transaction.commit()?;
+        self.work = 0;
+        self.bytes = 0;
+        self.written += 1;
+        #[cfg(test)]
+        AFTER_STAGE_BATCH.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().as_mut() {
+                hook(self.written, started.elapsed());
+            }
+        });
+        Ok(())
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn stage_records<R>(
     connection: &mut rusqlite::Connection,
@@ -642,24 +736,36 @@ where
     R: IntoIterator<Item = StoreResult<ExternalSnapshotRecord>>,
 {
     let cas = PayloadCas::new(repository_root)?;
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let actual_revision = current_revision(&transaction)?;
+    let actual_revision = current_revision(connection)?;
     if actual_revision != expected_revision {
         return Err(StoreError::RevisionConflict {
             expected: expected_revision,
             actual: actual_revision,
         });
     }
-    let active = active_generation(&transaction)?;
-    let local_root = local_root(&transaction, &active)?;
+    // Read once for the whole stage; every batch confirms the revision it
+    // was read at.
+    let active = active_generation(connection)?;
+    let local_root = local_root(connection, &active)?;
 
     let mut hashes = BTreeMap::new();
     let mut deferred_conversations = Vec::new();
     let mut saw_root = false;
-    let stage = |record: ExternalSnapshotRecord, locator: LogicalRecordLocator| -> StoreResult<()> {
+    let mut batch = StageBatch {
+        records: Vec::new(),
+        work: 0,
+        bytes: 0,
+        written: 0,
+    };
+    let stage = |connection: &mut rusqlite::Connection,
+                     batch: &mut StageBatch,
+                     record: ExternalSnapshotRecord,
+                     locator: LogicalRecordLocator|
+     -> StoreResult<()> {
         let envelope = read_record(staging_root, content, &record, &locator)?;
+        let (bytes, _) = dependent_cost(objects, &envelope)?;
         let prepared = prepare_record(
-            &transaction,
+            connection,
             &cas,
             &active,
             objects,
@@ -667,13 +773,11 @@ where
             envelope,
             local_root.as_ref(),
         )?;
-        rows::apply_serialized_record(
-            &transaction,
-            generation,
-            &prepared.locator,
-            &prepared.envelope,
-            prepared.messages.as_deref(),
-        )
+        batch.push(prepared, record.byte_length.saturating_add(bytes));
+        if batch.full() {
+            batch.write(connection, generation, expected_revision)?;
+        }
+        Ok(())
     };
     for record in records {
         let record = record?;
@@ -689,16 +793,25 @@ where
         if matches!(locator, LogicalRecordLocator::Conversation { .. }) {
             deferred_conversations.push((record, locator));
         } else {
-            stage(record, locator)?;
+            stage(connection, &mut batch, record, locator)?;
         }
     }
     if !saw_root {
         return invalid("External snapshot does not contain its root logical record");
     }
     for (record, locator) in deferred_conversations {
-        stage(record, locator)?;
+        stage(connection, &mut batch, record, locator)?;
     }
+    batch.write(connection, generation, expected_revision)?;
 
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let actual_revision = current_revision(&transaction)?;
+    if actual_revision != expected_revision {
+        return Err(StoreError::RevisionConflict {
+            expected: expected_revision,
+            actual: actual_revision,
+        });
+    }
     transaction.execute(
         "UPDATE characters SET conversation_count=(
             SELECT count(*) FROM conversations

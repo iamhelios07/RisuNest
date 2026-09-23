@@ -167,8 +167,8 @@ fn prepare_receive_sections(
 }
 
 /// Past this, a receive stops being the normal one-message case and holds the
-/// active database longer than a user would sit through, so it is staged and
-/// activated instead. Measured on a library of 20,000
+/// active database longer than a user would sit through, so it is staged in
+/// bounded batches and activated instead. Measured on a library of 20,000
 /// characters, the in-place hold is about 7 ms for one changed record and
 /// 74 ms for 1,000, about 7.5 us per message row written or deleted (247 ms
 /// for 32,768), and about 1 ms per body confirmed (`PRESENCE_CHECK_WORK` rows
@@ -3261,9 +3261,17 @@ mod receive_tests {
 
         let job = bind(&mut store, "first");
         let first = staged_snapshot(&staging, "first", library(0, 0));
+        let batches = std::rc::Rc::new(std::cell::RefCell::new((0usize, std::time::Duration::ZERO)));
+        let seen = batches.clone();
+        crate::persistent_store::external_apply::after_stage_batch(Some(Box::new(move |written, held| {
+            let mut seen = seen.borrow_mut();
+            *seen = (written, seen.1.max(held));
+        })));
         let started = std::time::Instant::now();
         let prepared = prepare(&mut store, &job, first);
         let staged_ms = started.elapsed().as_millis();
+        crate::persistent_store::external_apply::after_stage_batch(None);
+        let (stage_batches, longest_batch) = *batches.borrow();
         assert!(matches!(prepared.apply, PreparedApply::Replace(_)));
         let identity = job.admission_identity.clone();
         let started = std::time::Instant::now();
@@ -3285,8 +3293,8 @@ mod receive_tests {
             activate_prepared_receive(&mut store, &prepared, &identity).unwrap();
             holds.push((changed, prepare_ms, started.elapsed().as_millis()));
         }
-        println!("library={LIBRARY} records={} staged_ms={staged_ms} replace_hold_ms={replace_hold_ms}",
-            LIBRARY * 2 + 1);
+        println!("library={LIBRARY} records={} staged_ms={staged_ms} stage_batches={stage_batches} longest_batch_ms={} replace_hold_ms={replace_hold_ms}",
+            LIBRARY * 2 + 1, longest_batch.as_millis());
         for (changed, prepare_ms, hold_ms) in holds {
             println!("changed={changed} prepare_ms={prepare_ms} incremental_hold_ms={hold_ms}");
         }
