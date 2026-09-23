@@ -663,10 +663,10 @@ impl PersistentStore {
         }
     }
 
-    /// Call under file(true), using a hydration token prepared before admission.
-    /// Makes a capture serve local recovery: every payload it names is fetched
-    /// through custody when it is not held locally, and then held at its
-    /// recorded length.
+    /// Call before acquiring file(true), like the dependency hydration. Makes a
+    /// capture serve local recovery: every payload it names is fetched through
+    /// custody when it is not held locally, and then held at its recorded
+    /// length.
     pub(crate) fn complete_external_capture(
         &self,
         capture_id: &str,
@@ -695,6 +695,7 @@ impl PersistentStore {
         Ok(())
     }
 
+    /// Call under file(true), using a hydration token prepared before admission.
     pub(crate) fn capture_external_library(
         &mut self,
         consumer: &str,

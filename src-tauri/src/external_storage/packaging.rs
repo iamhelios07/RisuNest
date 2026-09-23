@@ -1474,15 +1474,18 @@ fn prepare_packs(
     let mut pending = Vec::new();
     let mut cpu = Some(handle.block_on(cpu_permit())?);
     let mut hydration = SourceHydration::default();
+    let mut payloads = None;
     for source in sources {
         cancel.check()?;
         let mut input = match &source.source {
-            ObjectSource::Library(digest) => Body::File(open_library_source(
-                repository_root,
-                digest,
-                &mut hydration,
-                cancel,
-            )?),
+            ObjectSource::Library(digest) => {
+                let payloads = match &mut payloads {
+                    Some(payloads) => payloads,
+                    None => payloads
+                        .insert(PayloadCas::new(repository_root).map_err(transient)?),
+                };
+                Body::File(open_library_source(payloads, digest, &mut hydration, cancel)?)
+            }
             other => content.open_source(other).map_err(corrupt)?,
         };
         if input.len().map_err(corrupt)? != source.byte_length {
@@ -1573,16 +1576,19 @@ fn prepare_packs(
 }
 
 /// A library body where the asset repository holds it, or fetched through its
-/// custody first. The fetch is verified against the body's hash and custody
-/// size before anything reads it, and needs that much free space on the
-/// repository volume.
+/// custody first. A held body is opened where it is, as any capture source is.
+/// A fetch is verified against the body's hash and custody size before
+/// anything reads it, and needs that much free space on the repository volume.
 fn open_library_source(
-    repository_root: &Path,
+    payloads: &PayloadCas,
     digest: &str,
     hydration: &mut SourceHydration,
     cancel: &Cancellation,
 ) -> Result<fs::File> {
     use crate::server_sync::residency::{open_or_hydrate_with_check, Residency};
+    if let Some(file) = payloads.open_object(digest).map_err(transient)? {
+        return Ok(file);
+    }
     let custody = |error: crate::server_sync::SyncError| {
         if cancel.check().is_err() {
             ProviderError::new(ErrorKind::Cancelled)
@@ -1590,27 +1596,20 @@ fn open_library_source(
             transient(error.code)
         }
     };
-    let held = PayloadCas::new(repository_root)
-        .and_then(|cas| cas.stat_object(digest))
-        .map_err(transient)?
-        .is_some();
-    let mut fetched = 0;
-    if !held {
-        let custody_size = if Residency::exists(repository_root) {
-            Residency::open(repository_root)
-                .and_then(|residency| residency.object(digest, None))
-                .map_err(custody)?
-                .map(|object| object.size)
-        } else {
-            None
-        };
-        let Some(size) = custody_size else {
-            return Err(ProviderError::new(ErrorKind::NotFound));
-        };
-        if fs2::available_space(repository_root).map_err(transient)? < size {
-            return Err(ProviderError::new(ErrorKind::StorageFull));
-        }
-        fetched = size;
+    let repository_root = payloads.repository_root();
+    let custody_size = if Residency::exists(repository_root) {
+        Residency::open(repository_root)
+            .and_then(|residency| residency.object(digest, None))
+            .map_err(custody)?
+            .map(|object| object.size)
+    } else {
+        None
+    };
+    let Some(size) = custody_size else {
+        return Err(ProviderError::new(ErrorKind::NotFound));
+    };
+    if fs2::available_space(repository_root).map_err(transient)? < size {
+        return Err(ProviderError::new(ErrorKind::StorageFull));
     }
     let check = || {
         cancel
@@ -1620,10 +1619,8 @@ fn open_library_source(
     let file = open_or_hydrate_with_check(repository_root, digest, &check)
         .map_err(custody)?
         .ok_or_else(|| ProviderError::new(ErrorKind::NotFound))?;
-    if !held {
-        hydration.objects += 1;
-        hydration.bytes += fetched;
-    }
+    hydration.objects += 1;
+    hydration.bytes += size;
     Ok(file)
 }
 
