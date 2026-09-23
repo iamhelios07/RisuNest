@@ -1022,15 +1022,12 @@ async fn build_entries(
         sources.len() as u64,
         sources.iter().map(|source| source.byte_length).sum(),
     );
-    // Only the record catalog, and only where the publication that is already
-    // required was told it may also spend the maintenance portion. The capture
-    // store beside it is the only place a repackaged body may come from, so
-    // without one there is nothing eligible.
-    // Which keys this cycle writes again rather than points at where they are.
-    // Decided before anything is uploaded, and with the capture store closed
-    // again, because a body the capture cannot answer for has to keep the
-    // placement it has: declining reuse for it would turn an optional cycle
-    // into a failed publication.
+    // Which keys this cycle writes again rather than points at where they are:
+    // the record catalog only, and only where a publication that is already
+    // required was told it may also spend the maintenance portion. Decided
+    // before anything is uploaded, because a body the capture store cannot
+    // answer for has to keep the placement it has, and declining reuse for it
+    // would turn an optional cycle into a failed publication.
     let mut drained: BTreeSet<String> = BTreeSet::new();
     let mut repackage: BTreeSet<String> = BTreeSet::new();
     if kind == wire::CatalogKind::Records && limits.maintenance == Maintenance::Allowed {
@@ -6083,6 +6080,94 @@ mod tests {
                     files.load(std::sync::atomic::Ordering::Relaxed),
                     super::super::journal::spool_bytes(&directory),
                 );
+            }
+        });
+    }
+
+    /// What a warm incremental publication costs on the record axis, which is
+    /// the axis the metadata budget is stated on. An asset-scaled fixture
+    /// measures the dependency pass instead.
+    #[test]
+    #[ignore = "explicit large record library measurement"]
+    fn measures_a_warm_incremental_publication_of_a_large_record_library() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let key = [59; 32];
+            let cache = root.path().join("library-cache");
+            const RECORDS: usize = 130_000;
+            const ASSETS: usize = 64;
+            let mut published: Option<CompletedSnapshot> = None;
+            for (revision, edited, name) in [(1i64, 0usize, "cold"), (2, 4, "warm")] {
+                let capture_id = format!("library-capture-{revision}");
+                let job_id = format!("library-job-{revision}");
+                let built = std::time::Instant::now();
+                let capture = captured_record_window(
+                    root.path(),
+                    &capture_id,
+                    revision,
+                    RECORDS,
+                    edited,
+                    0,
+                    ASSETS,
+                );
+                let capture_ms = built.elapsed().as_millis();
+                let snapshot_metadata =
+                    metadata(&format!("library-snapshot-{revision}"), &capture);
+                let directory = root.path().join(&job_id);
+                let mut transfer = journal(&directory, &job_id, &capture);
+                let parent = published
+                    .as_ref()
+                    .map(|previous| parent_graph(previous, &repository))
+                    .transpose()
+                    .unwrap();
+                let before = (provider.read_count(), provider.upload_count());
+                provider.reset_first_upload();
+                let started = std::time::Instant::now();
+                let completed = package_and_upload(
+                    capture,
+                    Vec::new(),
+                    root.path(),
+                    &cache,
+                    snapshot_metadata,
+                    &key,
+                    limits(512 * 1024),
+                    parent.as_ref(),
+                    &mut transfer,
+                    &provider,
+                    &repository,
+                    &PhaseProgress::silent(),
+                    &Cancellation::default(),
+                )
+                .await
+                .unwrap();
+                let elapsed = started.elapsed().as_millis();
+                let first_upload_ms = provider
+                    .first_upload()
+                    .map(|at| at.duration_since(started).as_millis())
+                    .unwrap_or_default();
+                let added = provider.uploaded_ids()[before.1..].to_vec();
+                let (pack_bytes, catalog_bytes) = {
+                    let state = provider.state.lock().unwrap();
+                    let bytes = |prefix: &str| -> u64 {
+                        added
+                            .iter()
+                            .filter(|id| id.starts_with(prefix))
+                            .filter_map(|id| state.objects.get(id.as_str()))
+                            .map(|(body, _)| body.len() as u64)
+                            .sum()
+                    };
+                    (bytes("pack-"), bytes("catalog-"))
+                };
+                eprintln!(
+                    "{name} records={RECORDS} assets={ASSETS} edited={edited} capture_ms={capture_ms} publication_ms={elapsed} first_upload_ms={first_upload_ms} provider_reads={} provider_uploads={} pack_uploads={} pack_bytes={pack_bytes} catalog_uploads={} catalog_bytes={catalog_bytes}",
+                    provider.read_count() - before.0,
+                    provider.upload_count() - before.1,
+                    added.iter().filter(|id| id.starts_with("pack-")).count(),
+                    added.iter().filter(|id| id.starts_with("catalog-")).count(),
+                );
+                published = Some(completed);
             }
         });
     }
