@@ -582,6 +582,7 @@
     }
 
     function jobSummary(job: ExternalJobSummary): string {
+        if (job.kind === 'check-repository' && job.state === 'succeeded' && job.result?.stopReason === 'expired') return strings.checkExpired
         if (job.kind === 'check-repository' && job.state === 'succeeded' && job.result?.verifiedObjects !== undefined && job.result.verifiedBytes !== undefined) {
             const summary = strings.checkSummary.replace('{0}', job.result.verifiedObjects).replace('{1}', bytes(job.result.verifiedBytes))
             const damaged = Number(job.result.damagedObjects ?? '0')

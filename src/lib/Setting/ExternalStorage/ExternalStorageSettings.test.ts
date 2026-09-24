@@ -346,4 +346,29 @@ describe('a running job', () => {
         expect(shown).not.toContain(strings.jobCounters.prepared)
         expect(shown).not.toContain(strings.jobCounters.transferred)
     })
+
+    it('reports a check that could not finish on its root without a verified count', async () => {
+        state.getState.mockResolvedValue({
+            supported: true,
+            selection: { kind: 'none', selectionEpoch: '0', paused: false, decisionRequired: false },
+            connections: [connection(10, 30)],
+            jobs: [{
+                ...job(),
+                kind: 'check-repository' as const,
+                state: 'succeeded' as const,
+                phase: 'complete',
+                result: { stopReason: 'expired' },
+            }],
+        })
+        state.getQuota.mockRejectedValue({ kind: 'transient', httpStatus: null, retryAtMs: null })
+        state.listHistory.mockResolvedValue({ items: [] })
+        target = document.createElement('div')
+        document.body.append(target)
+        component = mount(ExternalStorageSettings, { target })
+        await settle()
+        const shown = target.textContent ?? ''
+        expect(shown).toContain(strings.checkExpired)
+        expect(shown).not.toContain(strings.completed)
+        expect(shown).not.toContain(strings.checkSummary.split('{0}')[0])
+    })
 })

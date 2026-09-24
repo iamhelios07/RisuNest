@@ -3,10 +3,16 @@
 //! each body as soon as it is proved. Nothing is staged into the library and
 //! nothing outlives the job but the record of what it proved.
 use super::{
+    cleanup::{ConnectedRepositoryView, RepositoryView},
+    connection::RetentionPolicy,
+    connection_commands::ConnectedRepository,
     contract::{
-        Cancellation, ErrorKind, ObjectRole, Provider, ProviderError, RepositoryHandle, Result,
+        Cancellation, ErrorKind, LeaseKind, ObjectRole, Provider, ProviderError,
+        RepositoryHandle, Result,
     },
-    connection_store::UnusableReason,
+    connection_store::{ConnectionStore, UnusableReason},
+    control,
+    leases::{self, Admission, LeaseContext},
     package_cache,
     packaging::{cpu_permit, ObjectEvidence, RemoteObject},
     reachability, snapshot_restore,
@@ -413,6 +419,179 @@ pub(crate) async fn check(
     Ok(outcome)
 }
 
+/// One check job as its attempts see it. The selected root lives in the job
+/// directory, so every attempt reads the root the first one chose.
+pub(crate) struct CheckJob<'a> {
+    pub job_id: &'a str,
+    /// The state or backup the user chose, or none for the current head.
+    pub snapshot_id: Option<&'a str>,
+    pub directory: &'a Path,
+    pub cache_root: &'a Path,
+    pub policy: RetentionPolicy,
+    pub now_ms: u64,
+}
+
+/// What an attempt reports when the root it was resuming is no longer one the
+/// repository keeps. Nothing was read, so nothing is counted as damaged or as
+/// proved, and a new check has to select the current root.
+fn expired() -> Value {
+    json!({"stopReason":"expired"})
+}
+
+/// One attempt at a check job. The root is selected, or found still kept, only
+/// once the work lease is held, because a foreign cleanup yields to that lease
+/// and not to anything recorded on this device.
+pub(super) async fn run_job(
+    context: &LeaseContext<'_>,
+    connected: &ConnectedRepository,
+    job: &CheckJob<'_>,
+    evidence: &mut ObjectEvidence,
+    progress: &(dyn Fn(u64, u64, u64, u64) + Sync),
+    cancel: &Cancellation,
+) -> Result<Value> {
+    let attempt = attempt(context, connected, job, evidence, progress, cancel);
+    match leases::admit(context, job.job_id, LeaseKind::Work, cancel).await? {
+        Admission::Admitted(owner) => owner.run(context, cancel, attempt).await,
+        Admission::Yield { .. } => Err(ProviderError::new(ErrorKind::Transient)),
+        Admission::UnsupportedProtection => attempt.await,
+    }
+}
+
+async fn attempt(
+    context: &LeaseContext<'_>,
+    connected: &ConnectedRepository,
+    job: &CheckJob<'_>,
+    evidence: &mut ObjectEvidence,
+    progress: &(dyn Fn(u64, u64, u64, u64) + Sync),
+    cancel: &Cancellation,
+) -> Result<Value> {
+    let root = match pinned_root(job.directory, &connected.handle)? {
+        Some(pinned) => {
+            if !kept(connected, context.writer_id, job, &pinned, cancel).await? {
+                return Ok(expired());
+            }
+            begin_attempt(job.directory)?;
+            pinned
+        }
+        // An attempt already ran but its root is gone, so continuing would
+        // quietly check a different one under the same job.
+        None if job.directory.join(LEDGER_FILE).exists()
+            || job.directory.join(STAGING_DIRECTORY).exists() =>
+        {
+            return Ok(expired());
+        }
+        None => {
+            let selected = select(context.root, connected, job, cancel).await?;
+            pin_root(job.directory, &selected, &connected.handle)?
+        }
+    };
+    check(
+        &root,
+        &connected.root_key,
+        job.directory,
+        job.cache_root,
+        evidence,
+        connected.provider.as_ref(),
+        &connected.handle,
+        progress,
+        cancel,
+    )
+    .await
+    .map(|outcome| outcome.summary())
+}
+
+async fn select(
+    local_root: &Path,
+    connected: &ConnectedRepository,
+    job: &CheckJob<'_>,
+    cancel: &Cancellation,
+) -> Result<RemoteObject> {
+    let Some(snapshot_id) = job.snapshot_id else {
+        return Ok(control::read_head(
+            connected.provider.as_ref(),
+            &connected.handle,
+            &connected.stored.descriptor,
+            &connected.root_key,
+            None,
+            cancel,
+        )
+        .await?
+        .ok_or_else(|| ProviderError::new(ErrorKind::NotFound))?
+        .document
+        .state);
+    };
+    let connection = connected.stored.id.clone();
+    let known = match ConnectionStore::open(local_root)?.discovery_snapshot(&connection, snapshot_id)
+    {
+        Ok(value) => Some(value),
+        Err(error) if error.kind == ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let store_root = local_root.to_path_buf();
+    let id = snapshot_id.to_owned();
+    control::find_snapshot_with_locator_invalidation(
+        connected,
+        snapshot_id,
+        known.as_ref(),
+        move || ConnectionStore::open(&store_root)?.forget_discovery(&connection, &id),
+        cancel,
+    )
+    .await
+}
+
+/// Whether a resumed root is still one the repository keeps: the current head,
+/// or the bundle of a point the retention decision keeps. This is the same
+/// observation a cleanup reads its roots from. A root outside it may already
+/// have lost bodies to another device's cleanup, so what it lacks says nothing
+/// about damage. A failed observation is returned as the error it is.
+async fn kept(
+    connected: &ConnectedRepository,
+    writer_id: &str,
+    job: &CheckJob<'_>,
+    root: &RemoteObject,
+    cancel: &Cancellation,
+) -> Result<bool> {
+    let view = ConnectedRepositoryView {
+        connected,
+        writer_id,
+        policy: job.policy,
+        now_ms: job.now_ms,
+        unfinished: Vec::new(),
+        cache_root: job.cache_root,
+    };
+    let roots = view.roots(cancel).await?;
+    let identity = reachability::object_identity(root, &connected.handle)?;
+    for candidate in roots.head.iter().chain(roots.kept_bundles.iter()) {
+        if reachability::object_identity(candidate, &connected.handle)? == identity {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// A stop gives the work lease back, and whatever another device's cleanup did
+/// before the next admission cannot be ruled out, so an attempt that resumes
+/// proves every body again. Only the selected root carries over. Damage found
+/// earlier stays with the connection's evidence, which this does not touch.
+fn begin_attempt(directory: &Path) -> Result<()> {
+    match fs::remove_file(directory.join(LEDGER_FILE)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(transient(error)),
+    }
+    match fs::remove_dir_all(directory.join(STAGING_DIRECTORY)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(transient(error)),
+    }
+    crate::trust_boundary::sync_directory(directory).map_err(transient)?;
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "repository_check_resume_tests.rs"]
+mod resume_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,7 +667,7 @@ mod tests {
         }
     }
 
-    async fn published(
+    pub(super) async fn published(
         root: &Path,
         provider: &FakeProvider,
         repository: &RepositoryHandle,
@@ -571,7 +750,7 @@ mod tests {
     }
 
     /// Every pack the record catalog of a published state points at.
-    async fn record_packs(
+    pub(super) async fn record_packs(
         snapshot: &CompletedSnapshot,
         staging: &Path,
         provider: &FakeProvider,

@@ -1454,7 +1454,6 @@ async fn run_repository_check(
     let root = root(app)?;
     let directory = job_directory(&root, &job.request.connection_id, &job.id);
     let cache_root = package_cache_root(&directory)?;
-    let selected = checked_root(connected, job, &root, &directory, cancel).await?;
     let writer_id = native_store(app)?
         .external_identity()
         .map_err(local_error)?
@@ -1471,80 +1470,25 @@ async fn run_repository_check(
     };
     let mut evidence =
         super::packaging::ObjectEvidence::open(&root, &job.request.connection_id)?;
-    let run = async {
-        super::repository_check::check(
-            &selected,
-            &connected.root_key,
-            &directory,
-            &cache_root,
-            &mut evidence,
-            connected.provider.as_ref(),
-            &connected.handle,
-            &progress,
-            cancel,
-        )
-        .await
-        .map(|outcome| outcome.summary())
-    };
-    // A foreign removal yields to this one, so a check cannot report damage
-    // that is really a cleanup running beside it.
-    match leases::admit(&context, &job.id, LeaseKind::Work, cancel).await? {
-        leases::Admission::Admitted(owner) => owner.run(&context, cancel, run).await,
-        leases::Admission::Yield { .. } => Err(ProviderError::new(ErrorKind::Transient)),
-        leases::Admission::UnsupportedProtection => run.await,
-    }
-}
-
-/// The state this job reads, decided once and kept beside it. A check that
-/// resumes keeps counting the root it started on even after a newer one is
-/// published.
-async fn checked_root(
-    connected: &ConnectedRepository,
-    job: &DurableJob,
-    root: &std::path::Path,
-    directory: &std::path::Path,
-    cancel: &Cancellation,
-) -> Result<super::packaging::RemoteObject> {
-    if let Some(pinned) = super::repository_check::pinned_root(directory, &connected.handle)? {
-        return Ok(pinned);
-    }
-    let resolved = match job.request.snapshot_id.as_deref() {
-        Some(snapshot_id) => {
-            let known = match ConnectionStore::open(root)?
-                .discovery_snapshot(&job.request.connection_id, snapshot_id)
-            {
-                Ok(value) => Some(value),
-                Err(error) if error.kind == ErrorKind::NotFound => None,
-                Err(error) => return Err(error),
-            };
-            let store_root = root.to_path_buf();
-            let connection = job.request.connection_id.clone();
-            let id = snapshot_id.to_owned();
-            super::control::find_snapshot_with_locator_invalidation(
-                connected,
-                snapshot_id,
-                known.as_ref(),
-                move || ConnectionStore::open(&store_root)?.forget_discovery(&connection, &id),
-                cancel,
-            )
-            .await?
-        }
-        None => {
-            super::control::read_head(
-                connected.provider.as_ref(),
-                &connected.handle,
-                &connected.stored.descriptor,
-                &connected.root_key,
-                None,
-                cancel,
-            )
-            .await?
-            .ok_or_else(|| ProviderError::new(ErrorKind::NotFound))?
-            .document
-            .state
-        }
-    };
-    super::repository_check::pin_root(directory, &resolved, &connected.handle)
+    super::repository_check::run_job(
+        &context,
+        connected,
+        &super::repository_check::CheckJob {
+            job_id: &job.id,
+            snapshot_id: job.request.snapshot_id.as_deref(),
+            directory: &directory,
+            cache_root: &cache_root,
+            policy: connected
+                .stored
+                .retention_policy
+                .unwrap_or(super::connection::RetentionPolicy::DEFAULT),
+            now_ms: now_ms(),
+        },
+        &mut evidence,
+        &progress,
+        cancel,
+    )
+    .await
 }
 
 /// What one phase has done against what it found to do, and which of the two
