@@ -76,15 +76,20 @@ jobs:
         run: |
           set -euo pipefail
           source_commit=$(git rev-parse HEAD)
+          git merge-base --is-ancestor "$source_commit" refs/remotes/origin/main
           if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
             test "$GITHUB_REF_TYPE" = "tag"
             test "$TAG" = "$GITHUB_REF_NAME"
             test "$(git rev-parse "$TAG^{commit}")" = "$source_commit"
-            git merge-base --is-ancestor "$source_commit" refs/remotes/origin/main
+          elif tagged=$(git rev-parse -q --verify "refs/tags/$TAG^{commit}"); then
+            test "$tagged" = "$source_commit"
+          else
+            test "$PUBLISH" != "true"
           fi
           printf 'source_commit=%s\n' "$source_commit" >> "$GITHUB_OUTPUT"
         env:
           TAG: ${{ inputs.tag }}
+          PUBLISH: ${{ inputs.publish }}
       - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
         with:
           version: ${{ env.PNPM_VERSION }}

@@ -62,14 +62,12 @@ test the release build.
    Android release certificate. The workflow's signing preflight proves that
    the Secrets form a working key pair and keystore entry; it does not prove
    that they are the intended identity.
-3. Run a non-publishing rehearsal of the exact reviewed commit. Manual runs do
-   not check that `source_ref` is contained in `main`, so check it first:
+3. Run a non-publishing rehearsal of the exact reviewed commit. The workflow
+   rejects a `source_ref` that is not contained in `origin/main`, and a tag that
+   already exists on another commit:
 
    ```powershell
-   git fetch origin main
    $Sha = (git rev-parse HEAD).Trim()
-   git merge-base --is-ancestor $Sha origin/main
-   if ($LASTEXITCODE -ne 0) { throw "The commit is not on origin/main." }
    gh workflow run release.yml --ref main `
        -f product=app -f tag=app-v1.0.0 -f source_ref=$Sha `
        -f publish=false -f bootstrap=false
