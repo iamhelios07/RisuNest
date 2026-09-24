@@ -137,6 +137,14 @@ pub(crate) struct DurableJob {
     pub snapshot_id: String,
     pub admission_identity: CaptureIdentity,
     pub receive_staging_id: Option<String>,
+    /// Set before the job writes a downloaded remote body under its directory
+    /// and cleared only once those bodies are gone.
+    pub receive_artifacts: Option<ReceiveArtifacts>,
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ReceiveArtifacts {
+    Held,
 }
 impl DurableJob {
     pub fn new(
@@ -157,6 +165,7 @@ impl DurableJob {
             snapshot_id: uuid::Uuid::new_v4().to_string(),
             admission_identity,
             receive_staging_id: None,
+            receive_artifacts: None,
         }
     }
     pub fn with_restore_id(mut self, id: String) -> Result<Self> {
@@ -313,6 +322,22 @@ impl JobStore {
         rows.map(|row| Self::decode(row.map_err(failure)?))
             .collect()
     }
+    /// Jobs on one connection whose downloaded remote bodies may still be on disk.
+    pub fn list_holding_receive_artifacts(&self, connection_id: &str) -> Result<Vec<DurableJob>> {
+        let mut statement = self
+            .0
+            .prepare(
+                "SELECT value FROM external_requests
+                 WHERE connection_id=?1 AND json_extract(value,'$.receiveArtifacts')='held'
+                 ORDER BY rowid",
+            )
+            .map_err(failure)?;
+        let rows = statement
+            .query_map([connection_id], |row| row.get::<_, String>(0))
+            .map_err(failure)?;
+        rows.map(|row| Self::decode(row.map_err(failure)?))
+            .collect()
+    }
     /// Every live job plus a bounded recent terminal history for renderer state.
     pub fn list_for_state(&self) -> Result<Vec<DurableJob>> {
         let mut result = self.list_pending()?;
@@ -348,6 +373,18 @@ pub(crate) struct JobClaim {
 impl JobClaim {
     pub(super) fn require_job(&self, state: &JobCommandState, job: &DurableJob) -> Result<()> {
         if self._owner.id != job.id || !Arc::ptr_eq(&self._owner.active, &state.active) {
+            return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+        }
+        Ok(())
+    }
+    /// Whether this claim is the one excluding every other job on `connection`
+    /// in this runtime instance.
+    pub(super) fn require_connection(&self, state: &JobCommandState, connection: &str) -> Result<()> {
+        if !Arc::ptr_eq(&self._owner.active, &state.active) {
+            return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+        }
+        let active = state.active.lock().map_err(failure)?;
+        if active.get(&self._owner.id).is_none_or(|(owned, _)| owned != connection) {
             return Err(ProviderError::new(ErrorKind::PreconditionFailed));
         }
         Ok(())

@@ -999,6 +999,7 @@ async fn receive_remote(
     let root = super::runtime::root(app)?;
     let directory = super::runtime::job_directory(&root, &job.request.connection_id, &job.id);
     let staging = directory.join("receive");
+    super::receive_artifacts::hold(&root, &job.id)?;
     // What this receive reads is what the next publication would select as its
     // parent, so keep it rather than reading the same catalogs again.
     let cache = super::runtime::package_cache_root(&directory)?;
@@ -1234,6 +1235,7 @@ async fn rejoin_sections(
         &job.id,
     );
     let staging = directory.join("rejoin");
+    super::receive_artifacts::hold(&super::runtime::root(app)?, &job.id)?;
     let cache = super::runtime::package_cache_root(&directory)?;
     let transferred =
         super::runtime::transfer_progress(&super::runtime::root(app)?, &job.id);
@@ -1417,6 +1419,12 @@ fn apply_received(app: &AppHandle, request: &ApplyReceivedRequest) -> Result<Val
     }
     // Terminal leases are reconciled by the next repository worker. Activation
     // neither opens credentials nor starts a provider request, even for cleanup.
+    // The consumed handle and the permit are released; the claim still keeps
+    // every other job of the connection from starting while bodies move aside.
+    let detached =
+        super::receive_artifacts::detach_claimed(app, &claim, &job.request.connection_id);
+    drop(claim);
+    super::receive_artifacts::remove_detached_later(app, detached);
     Ok(result)
 }
 
@@ -2539,6 +2547,10 @@ pub(crate) async fn external_storage_recheck_conflict(
 }
 
 #[cfg(test)]
+#[path = "receive_artifact_tests.rs"]
+mod receive_artifact_tests;
+
+#[cfg(test)]
 mod receive_tests {
     use super::*;
     use crate::logical_records::{
@@ -2553,7 +2565,7 @@ mod receive_tests {
     };
     use std::{collections::BTreeMap, fs};
 
-    fn bind(store: &mut PersistentStore, snapshot: &str) -> DurableJob {
+    pub(super) fn bind(store: &mut PersistentStore, snapshot: &str) -> DurableJob {
         let identity = store.external_identity().unwrap();
         let request = serde_json::from_value(json!({
             "connectionId":"connection", "kind":"sync", "reason":"automatic",
@@ -2568,7 +2580,7 @@ mod receive_tests {
         job
     }
 
-    fn fixture() -> (tempfile::TempDir, PersistentStore, DurableJob, super::super::snapshot_restore::PreparedRemoteSnapshot) {
+    pub(super) fn fixture() -> (tempfile::TempDir, PersistentStore, DurableJob, super::super::snapshot_restore::PreparedRemoteSnapshot) {
         let directory = tempfile::tempdir().unwrap();
         let mut store = PersistentStore::open(directory.path()).unwrap();
         let epoch = store.external_selection().unwrap().epoch;
@@ -2649,7 +2661,7 @@ mod receive_tests {
         }
     }
 
-    fn prepare(store: &mut PersistentStore, job: &DurableJob,
+    pub(super) fn prepare(store: &mut PersistentStore, job: &DurableJob,
         downloaded: super::super::snapshot_restore::PreparedRemoteSnapshot) -> PreparedReceive
     {
         prepare_counted(store, job, downloaded, &crate::external_storage::phase_progress::PhaseProgress::silent())
@@ -2665,7 +2677,7 @@ mod receive_tests {
             downloaded, vec![section], participation, prepared, &Cancellation::default()).unwrap().ready()
     }
 
-    fn local_edit(store: &mut PersistentStore, revision: i64) {
+    pub(super) fn local_edit(store: &mut PersistentStore, revision: i64) {
         let commit = serde_json::from_value(json!({
             "expectedRevision": revision, "root": {"marker":"newer-local"}
         })).unwrap();

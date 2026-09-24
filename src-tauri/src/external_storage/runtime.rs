@@ -338,6 +338,14 @@ pub(crate) async fn external_storage_cancel_job(app: AppHandle, job_id: String) 
         job.summary["updatedAtMs"] = json!(now_ms().to_string());
         store.put(&job)?;
     }
+    let (pass_app, pass_claim) = (app.clone(), _claim.clone());
+    let connection = job.request.connection_id.clone();
+    let detached = tokio::task::spawn_blocking(move || {
+        super::receive_artifacts::detach_claimed(&pass_app, &pass_claim, &connection)
+    })
+    .await
+    .unwrap_or_default();
+    super::receive_artifacts::remove_detached_later(&app, detached);
     Ok(job.summary)
 }
 #[tauri::command]
@@ -997,7 +1005,21 @@ pub(crate) fn wake_job(app: AppHandle, id: String) -> Result<()> {
         if !outcome_persisted {
             crate::nlog!("error", "External job outcome could not be persisted");
         }
+        // The worker has returned and its outcome is settled. The claim keeps
+        // every job of this connection from starting while bodies move aside.
+        let detached = if outcome_persisted {
+            let (pass_app, pass_claim) = (app.clone(), claim.clone());
+            let connection = job.request.connection_id.clone();
+            tokio::task::spawn_blocking(move || {
+                super::receive_artifacts::detach_claimed(&pass_app, &pass_claim, &connection)
+            })
+            .await
+            .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         drop(claim);
+        super::receive_artifacts::remove_detached_later(&app, detached);
         if outcome_persisted {
             let cleaned = (|| -> Result<()> {
                 let root = root(&app)?;
