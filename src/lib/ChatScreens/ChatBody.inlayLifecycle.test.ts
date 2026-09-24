@@ -209,7 +209,9 @@ describe('ChatBody deferred inlay lifecycle', () => {
         details.open = true
         details.dispatchEvent(new Event('toggle'))
         await tick()
-        expect(details.textContent).toContain(body)
+        // The large body is mounted over animation frames.
+        expect(details.textContent).toContain(body.slice(0, 1024))
+        await vi.waitFor(() => expect(details.textContent).toContain(body))
         ;(mounted as { setMessage(value: string): void }).setMessage(
             `<Thoughts>${body}LATEST</Thoughts>Answer`,
         )

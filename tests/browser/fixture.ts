@@ -2,7 +2,8 @@ import { readFileSync } from 'node:fs'
 import { test as base, expect } from '@playwright/test'
 import { classifyTestRequest } from '../support/testNetwork'
 import type { BrowserDriver } from './main'
-declare global { interface Window { boundary: BrowserDriver } }
+import type { thoughtDriver } from './thoughtDriver'
+declare global { interface Window { boundary: BrowserDriver; thought: typeof thoughtDriver } }
 export const test = base.extend<{ guarded: void }>({
     guarded: [async ({ context }, use) => {
         const rejected: string[] = []
