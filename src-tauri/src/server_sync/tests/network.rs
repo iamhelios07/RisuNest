@@ -11,7 +11,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicU16, AtomicU64, Ordering},
-        Mutex,
+        mpsc, Mutex,
     },
     task::{Context, Poll},
     time::{Duration, Instant},
@@ -140,6 +140,85 @@ struct Faults {
     downloads_peak: AtomicU64,
     range_code: AtomicU16,
     ranges: Mutex<BTreeMap<String, usize>>,
+    upload_gate: Option<Rendezvous>,
+    download_gate: Option<Rendezvous>,
+}
+/// Holds the first two requests of one transfer phase until the test
+/// releases them, and records any further request admitted meanwhile.
+struct Rendezvous {
+    admitted: AtomicU64,
+    overlapping: AtomicU64,
+    entered: mpsc::Sender<u64>,
+    release: tokio::sync::Semaphore,
+}
+impl Rendezvous {
+    fn new() -> (Self, mpsc::Receiver<u64>) {
+        let (entered, entries) = mpsc::channel();
+        let gate = Self {
+            admitted: AtomicU64::new(0),
+            overlapping: AtomicU64::new(0),
+            entered,
+            release: tokio::sync::Semaphore::new(0),
+        };
+        (gate, entries)
+    }
+    async fn enter(&self) {
+        let order = self.admitted.fetch_add(1, Ordering::SeqCst);
+        if order < 2 {
+            let _ = self.entered.send(order);
+            // Closing the semaphore is the release; acquire then fails at once.
+            let _ = self.release.acquire().await;
+        } else if !self.release.is_closed() {
+            self.overlapping.fetch_add(1, Ordering::SeqCst);
+            let _ = self.entered.send(order);
+        }
+    }
+    fn release(&self) {
+        self.release.close();
+    }
+}
+/// Releases a held phase on every exit path, including a failed assertion.
+struct Release<'a>(&'a Rendezvous);
+impl Drop for Release<'_> {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+/// Only detects deadlock. It stays below the client's 30 s request timeout so
+/// a stuck phase fails here instead of as a transport error.
+const RENDEZVOUS_WATCHDOG: Duration = Duration::from_secs(20);
+/// Runs one transfer phase on a worker thread while two of its requests are
+/// held at the fixture, then releases them.
+fn held_phase(
+    phase: &str,
+    gate: &Rendezvous,
+    entries: &mpsc::Receiver<u64>,
+    work: impl FnOnce() + Send,
+) {
+    std::thread::scope(|scope| {
+        let release = Release(gate);
+        let worker = scope.spawn(work);
+        for held in 0..2 {
+            if entries.recv_timeout(RENDEZVOUS_WATCHDOG).is_err() {
+                panic!(
+                    "{phase}: only {held} of two concurrent requests reached the fixture within {RENDEZVOUS_WATCHDOG:?}"
+                );
+            }
+        }
+        // Both requests are now held open. A client that exceeded two in
+        // flight would issue its next request without waiting for them; a
+        // short window can only miss such a request, never fail a correct one.
+        if let Ok(order) = entries.recv_timeout(Duration::from_millis(100)) {
+            panic!("{phase}: request {order} was admitted while two were held");
+        }
+        drop(release);
+        worker.join().unwrap();
+    });
+    assert_eq!(
+        gate.overlapping.load(Ordering::SeqCst),
+        0,
+        "{phase}: a request was admitted while two were held"
+    );
 }
 struct InFlight<'a>(&'a AtomicU64);
 impl Drop for InFlight<'_> {
@@ -162,6 +241,19 @@ async fn proxy(State(state): State<Arc<Faults>>, request: Request, next: Next) -
         peak.fetch_max(count, Ordering::Relaxed);
         InFlight(active)
     });
+    let gate = if request.method().as_str() == "PUT" && request.uri().path().contains("/chunks/") {
+        state.upload_gate.as_ref()
+    } else if request.method().as_str() == "GET"
+        && request.uri().path().starts_with("/objects/")
+        && request.headers().contains_key("range")
+    {
+        state.download_gate.as_ref()
+    } else {
+        None
+    };
+    if let Some(gate) = gate {
+        gate.enter().await;
+    }
     tokio::time::sleep(state.latency).await;
     let path = request.uri().path();
     if path == "/uploads/frames" {
@@ -233,6 +325,7 @@ fn run_case(
     failure: u16,
     after_accept: bool,
     download_failure: u16,
+    hold_two: bool,
 ) -> (u64, u64, u128, u128, u64, u64) {
     let root = tempfile::tempdir().unwrap();
     let server = Arc::new(Store::init(root.path()).unwrap());
@@ -247,11 +340,20 @@ fn run_case(
         .unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let bytes = Arc::new(AtomicU64::new(0));
+    let (upload_gate, download_gate, entries) = if hold_two {
+        let (upload, upload_entries) = Rendezvous::new();
+        let (download, download_entries) = Rendezvous::new();
+        (Some(upload), Some(download), Some((upload_entries, download_entries)))
+    } else {
+        (None, None, None)
+    };
     let faults = Arc::new(Faults {
         code: AtomicU16::new(failure),
         after_accept,
         latency,
         range_code: AtomicU16::new(download_failure),
+        upload_gate,
+        download_gate,
         ..Default::default()
     });
     let faults_for_router = faults.clone();
@@ -289,7 +391,19 @@ fn run_case(
         .collect();
     let hash = source.put(&payload).unwrap();
     let started = Instant::now();
-    {
+    if let Some((upload_entries, _)) = &entries {
+        held_phase(
+            "upload",
+            faults.upload_gate.as_ref().unwrap(),
+            upload_entries,
+            || {
+                Transfer::new(&client, &source)
+                    .unwrap()
+                    .upload(std::slice::from_ref(&hash), &[])
+                    .unwrap()
+            },
+        );
+    } else {
         let transfer = Transfer::new(&client, &source).unwrap();
         if failure > 0 {
             let error = transfer
@@ -324,12 +438,34 @@ fn run_case(
             .unwrap_err();
         assert_eq!(error.status, download_failure);
     }
-    Transfer::new(&client, &target)
-        .unwrap()
-        .download(std::slice::from_ref(&hash), &[])
-        .unwrap();
+    let download = || {
+        Transfer::new(&client, &target)
+            .unwrap()
+            .download(std::slice::from_ref(&hash), &[])
+            .unwrap()
+    };
+    if let Some((_, download_entries)) = &entries {
+        held_phase(
+            "download",
+            faults.download_gate.as_ref().unwrap(),
+            download_entries,
+            download,
+        );
+    } else {
+        download();
+    }
     let download_ms = started.elapsed().as_millis();
     assert_eq!(target.read(&hash, payload.len()).unwrap(), payload);
+    if hold_two {
+        // Every full chunk and the tail passed through each phase's gate.
+        let chunks = payload
+            .len()
+            .div_ceil(risunest_sync_wire::transfer::UPLOAD_CHUNK_BYTES) as u64;
+        for (phase, gate) in [("upload", &faults.upload_gate), ("download", &faults.download_gate)] {
+            let admitted = gate.as_ref().unwrap().admitted.load(Ordering::SeqCst);
+            assert_eq!(admitted, chunks, "{phase} chunk requests");
+        }
+    }
     if download_failure > 0 {
         let ranges = faults.ranges.lock().unwrap();
         assert_eq!(ranges.get("bytes=0-1048575"), Some(&2));
@@ -352,28 +488,28 @@ fn run_case(
 }
 #[test]
 fn full_chunk_upload_and_download_overlap_exactly_two_requests() {
-    let result = run_case(0, Duration::from_millis(50), 0, false, 0);
+    let result = run_case(0, Duration::ZERO, 0, false, 0, true);
     assert_eq!(result.4, 2, "upload concurrency");
     assert_eq!(result.5, 2, "download concurrency");
 }
 #[test]
 fn proxy_413_429_524_resume_only_unverified_chunks_and_lost_accept_is_not_resent() {
     for code in [413, 429, 524] {
-        run_case(0, Duration::ZERO, code, false, 0);
+        run_case(0, Duration::ZERO, code, false, 0, false);
     }
-    run_case(0, Duration::ZERO, 524, true, 0);
+    run_case(0, Duration::ZERO, 524, true, 0, false);
 }
 #[test]
 fn failed_range_keeps_the_verified_parallel_response_across_reopen() {
     for code in [413, 429, 524] {
-        run_case(0, Duration::from_millis(20), 0, false, code);
+        run_case(0, Duration::from_millis(20), 0, false, code, false);
     }
 }
 #[test]
 #[ignore = "Explicit synthetic bandwidth and request latency measurement"]
 fn slow_network_full_transfer_gate() {
     for (bits, millis) in [(10_000_000, 80), (1_000_000, 200)] {
-        let result = run_case(bits / 8, Duration::from_millis(millis), 0, false, 0);
+        let result = run_case(bits / 8, Duration::from_millis(millis), 0, false, 0, false);
         eprintln!("synthetic bits/sec={bits}, request delay={millis}ms: (HTTP bytes, requests, upload ms, download ms, upload concurrency, download concurrency)={result:?}");
         assert!(result.0 < 8 * 1024 * 1024 + 64 * 1024);
     }
