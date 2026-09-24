@@ -241,6 +241,22 @@ fn eight_mime_variants_all_receive_grants_after_contended_admission() {
     finish(held);
 }
 
+/// Closing the last residency connection tears down its write-ahead log, and
+/// concurrent lookups racing that teardown fail. The provider keeps it open.
+#[test]
+fn media_lookups_keep_the_residency_log_open_between_requests() {
+    let (fixture, _state) = admission_fixture();
+    let remote = Remote::new(&fixture);
+    let log = format!(
+        "{}-wal",
+        crate::server_sync::residency::Residency::path(remote._store.repository_root()).display()
+    );
+    assert!(!std::path::Path::new(&log).exists());
+    remote.provider.url(&remote.object("image/png"), false).unwrap();
+    remote.provider.url(&remote.object("image/webp"), false).unwrap();
+    assert!(std::path::Path::new(&log).is_file());
+}
+
 #[test]
 fn exhausted_admission_is_retryable_and_leaves_no_grant_behind() {
     let (fixture, state) = admission_fixture();

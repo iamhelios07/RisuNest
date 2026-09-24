@@ -1,7 +1,7 @@
 //! Native control-plane only. Media bodies travel from the server to WebView.
 use super::{
     client::{AdmissionRetry, ServerClient},
-    residency::Residency,
+    residency::{RemoteObject, Residency},
     Result, SyncError,
 };
 use risunest_sync_connect::media::{
@@ -26,6 +26,9 @@ pub(crate) struct MediaProvider {
     signer: MediaSigner,
     grants: Mutex<VecDeque<(String, GrantSlot)>>,
     issuing: Mutex<()>,
+    // Held open so a burst of lookups does not repeatedly close the last
+    // connection, whose WAL teardown makes concurrent opens fail.
+    residency: Mutex<Option<Residency>>,
 }
 impl MediaProvider {
     pub fn new(root: PathBuf, origin: String) -> Result<Self> {
@@ -35,15 +38,34 @@ impl MediaProvider {
             signer: MediaSigner::new(&generate_key()?)?,
             grants: Mutex::new(VecDeque::new()),
             issuing: Mutex::new(()),
+            residency: Mutex::new(None),
         })
+    }
+    fn proof(&self, hash: &str) -> Result<Option<RemoteObject>> {
+        let mut residency = self
+            .residency
+            .lock()
+            .map_err(|_| SyncError::new("media-cache-unavailable", 503))?;
+        let result = match residency.as_ref() {
+            Some(residency) => residency.object(hash, None),
+            None => Residency::open(&self.root).and_then(|opened| {
+                let result = opened.object(hash, None);
+                *residency = Some(opened);
+                result
+            }),
+        };
+        if result.is_err() {
+            *residency = None;
+        }
+        result
     }
     pub fn verify_refresh(&self, token: &str) -> Result<MediaObject> {
         Ok(self.signer.verify_refresh(token)?)
     }
     pub fn url(&self, object: &MediaObject, refresh: bool) -> Result<String> {
         object.validate()?;
-        let proof = Residency::open(&self.root)?
-            .object(&object.hash, None)?
+        let proof = self
+            .proof(&object.hash)?
             .filter(|proof| object.size == proof.size.into())
             .ok_or_else(|| SyncError::new("remote-object-unavailable", 404))?;
         let key = format!(
