@@ -18,7 +18,8 @@ use crate::{
         encode_logical_record_key, LogicalRecordEnvelope, LogicalRecordLocator,
     },
 };
-use crate::external_storage::content_store::{Body, ContentStore, ObjectSource};
+use crate::external_storage::content_store::{Body, CancellableRead, ContentStore, ObjectSource};
+use crate::local_backup::CancellationProbe;
 use risunest_external_storage_format::format::{fingerprint, library_fingerprint_domain};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
@@ -49,6 +50,9 @@ pub(crate) struct ExternalSnapshotApplication<'a> {
     pub staging_root: &'a Path,
     pub scope_id: &'a [u8; 32],
     pub fingerprint: &'a [u8; 32],
+    /// Asked between objects, records, message runs and read chunks. A
+    /// cancelled stage is removed like any other rejected one.
+    pub probe: &'a dyn CancellationProbe,
 }
 
 impl PreparedReplaceCommit {
@@ -107,8 +111,13 @@ impl PersistentStore {
         let content = ContentStore::open_existing(&root.join("external-storage"))?;
         let stage = self.replace_begin()?;
         let staged = (|| {
-            let object_sizes =
-                stage_objects(&self.repository_root, &root, content.as_ref(), objects)?;
+            let object_sizes = stage_objects(
+                &self.repository_root,
+                &root,
+                content.as_ref(),
+                objects,
+                application.probe,
+            )?;
             let record_hashes = stage_records(
                 &mut self.connection,
                 &self.repository_root,
@@ -118,10 +127,12 @@ impl PersistentStore {
                 content.as_ref(),
                 &object_sizes,
                 records,
+                application.probe,
             )?;
             if fingerprint(application.scope_id, &record_hashes) != *application.fingerprint {
                 return invalid("External snapshot logical fingerprint differs from its catalog");
             }
+            check(application.probe)?;
 
             self.prepare_replace_commit(&stage.staging_id, Some(application.expected_revision))
         })();
@@ -197,13 +208,14 @@ impl PersistentStore {
         &self,
         staging_root: &Path,
         objects: O,
+        probe: &dyn CancellationProbe,
     ) -> StoreResult<BTreeMap<String, u64>>
     where
         O: IntoIterator<Item = StoreResult<ExternalSnapshotObject>>,
     {
         let root = verified_staging_root(staging_root)?;
         let content = ContentStore::open_existing(&root.join("external-storage"))?;
-        stage_objects(&self.repository_root, &root, content.as_ref(), objects)
+        stage_objects(&self.repository_root, &root, content.as_ref(), objects, probe)
     }
 
     /// Reads the records a difference moves and measures what applying them
@@ -216,6 +228,7 @@ impl PersistentStore {
         records: &[ExternalSnapshotRecord],
         removed: &[String],
         catalog: &BTreeMap<String, u64>,
+        probe: &dyn CancellationProbe,
     ) -> StoreResult<DecodedDifference> {
         let root = verified_staging_root(staging_root)?;
         let content = ContentStore::open_existing(&root.join("external-storage"))?;
@@ -238,6 +251,7 @@ impl PersistentStore {
             })
             .collect();
         for (_, locator) in &removals {
+            check(probe)?;
             // A removed character's rows are counted once, with the character.
             let beneath = match locator {
                 LogicalRecordLocator::Conversation { character_id, .. }
@@ -251,9 +265,10 @@ impl PersistentStore {
         }
         let mut decoded = Vec::with_capacity(records.len());
         for record in records {
+            check(probe)?;
             let locator = decode_logical_record_key(&record.key)
                 .map_err(|_| validation("External snapshot logical key is invalid"))?;
-            let envelope = read_record(&root, content.as_ref(), record, &locator)?;
+            let envelope = read_record(&root, content.as_ref(), record, &locator, probe)?;
             let whole_character =
                 matches!(envelope, LogicalRecordEnvelope::ArchivedCharacter { .. });
             let (bytes, work) = dependent_cost(catalog, &envelope)?;
@@ -286,6 +301,7 @@ impl PersistentStore {
         &self,
         decoded: DecodedDifference,
         object_sizes: BTreeMap<String, u64>,
+        probe: &dyn CancellationProbe,
     ) -> StoreResult<PreparedExternalDifference> {
         let cas = PayloadCas::new(&self.repository_root)?;
         let generation = active_generation(&self.connection)?;
@@ -303,6 +319,7 @@ impl PersistentStore {
             .into_iter()
             .chain(conversations)
             .map(|record| {
+                check(probe)?;
                 prepare_record(
                     &self.connection,
                     &cas,
@@ -311,6 +328,7 @@ impl PersistentStore {
                     record.locator,
                     record.envelope,
                     local_root.as_ref(),
+                    probe,
                 )
             })
             .collect::<StoreResult<Vec<_>>>()?;
@@ -587,13 +605,16 @@ fn stage_objects<O>(
     staging_root: &Path,
     content: Option<&ContentStore>,
     objects: O,
+    probe: &dyn CancellationProbe,
 ) -> StoreResult<BTreeMap<String, u64>>
 where
     O: IntoIterator<Item = StoreResult<ExternalSnapshotObject>>,
 {
     let cas = PayloadCas::new(repository_root)?;
+    let cancelled = || probe.is_cancelled();
     let mut sizes = BTreeMap::new();
     for object in objects {
+        check(probe)?;
         let object = object?;
         validate_hash(&object.content_hash, "External snapshot object")?;
         if sizes
@@ -618,8 +639,10 @@ where
             }
             continue;
         }
-        let mut source =
-            open_snapshot_input(staging_root, content, &object.source, object.byte_length)?;
+        let mut source = CancellableRead::new(
+            open_snapshot_input(staging_root, content, &object.source, object.byte_length)?,
+            &cancelled,
+        );
         let prepared =
             cas.prepare_reader_expected(&mut source, &object.content_hash, object.byte_length)?;
         if prepared.content_hash != object.content_hash || prepared.byte_size != object.byte_length
@@ -689,6 +712,7 @@ impl StageBatch {
         expected_revision: i64,
         mut record: PreparedRecord,
         bytes: u64,
+        probe: &dyn CancellationProbe,
     ) -> StoreResult<()> {
         let messages = record.messages.take();
         let conversation = match &record.locator {
@@ -710,7 +734,7 @@ impl StageBatch {
             let mut messages = messages.into_iter().peekable();
             while messages.peek().is_some() {
                 if self.full() {
-                    self.write(connection, generation, expected_revision)?;
+                    self.write(connection, generation, expected_revision, probe)?;
                 }
                 let mut run = Vec::new();
                 while !self.full() {
@@ -732,7 +756,7 @@ impl StageBatch {
             }
         }
         if self.full() {
-            self.write(connection, generation, expected_revision)?;
+            self.write(connection, generation, expected_revision, probe)?;
         }
         Ok(())
     }
@@ -745,16 +769,19 @@ impl StageBatch {
 
     /// Writes the batch, provided the library is still at the revision the
     /// stage was prepared against: a local edit ends the stage at the next
-    /// batch rather than at activation.
+    /// batch rather than at activation. Cancellation is only asked before the
+    /// transaction begins, never while it commits.
     fn write(
         &mut self,
         connection: &mut rusqlite::Connection,
         generation: &str,
         expected_revision: i64,
+        probe: &dyn CancellationProbe,
     ) -> StoreResult<()> {
         if self.writes.is_empty() {
             return Ok(());
         }
+        check(probe)?;
         #[cfg(test)]
         let started = std::time::Instant::now();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -817,6 +844,7 @@ fn stage_records<R>(
     content: Option<&ContentStore>,
     objects: &BTreeMap<String, u64>,
     records: R,
+    probe: &dyn CancellationProbe,
 ) -> StoreResult<BTreeMap<String, [u8; 32]>>
 where
     R: IntoIterator<Item = StoreResult<ExternalSnapshotRecord>>,
@@ -849,7 +877,8 @@ where
                      record: ExternalSnapshotRecord,
                      locator: LogicalRecordLocator|
      -> StoreResult<()> {
-        let envelope = read_record(staging_root, content, &record, &locator)?;
+        check(probe)?;
+        let envelope = read_record(staging_root, content, &record, &locator, probe)?;
         let (mut bytes, _) = dependent_cost(objects, &envelope)?;
         // A conversation's pages are counted message by message as they join
         // a batch.
@@ -864,6 +893,7 @@ where
             locator,
             envelope,
             local_root.as_ref(),
+            probe,
         )?;
         batch.push(
             connection,
@@ -871,9 +901,11 @@ where
             expected_revision,
             prepared,
             record.byte_length.saturating_add(bytes),
+            probe,
         )
     };
     for record in records {
+        check(probe)?;
         let record = record?;
         let hash = validate_hash(&record.content_hash, "External logical record")?;
         if hashes.insert(record.key.clone(), hash).is_some() {
@@ -896,7 +928,8 @@ where
     for (record, locator) in deferred_conversations {
         stage(connection, &mut batch, record, locator)?;
     }
-    batch.write(connection, generation, expected_revision)?;
+    batch.write(connection, generation, expected_revision, probe)?;
+    check(probe)?;
 
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let actual_revision = current_revision(&transaction)?;
@@ -952,6 +985,7 @@ fn read_record(
     content: Option<&ContentStore>,
     record: &ExternalSnapshotRecord,
     locator: &LogicalRecordLocator,
+    probe: &dyn CancellationProbe,
 ) -> StoreResult<LogicalRecordEnvelope> {
     if encode_logical_record_key(locator)
         .map_err(|_| validation("External snapshot logical key is invalid"))?
@@ -959,7 +993,7 @@ fn read_record(
     {
         return invalid("External snapshot logical key is not canonical");
     }
-    let bytes = read_verified_record(staging_root, content, record)?;
+    let bytes = read_verified_record(staging_root, content, record, probe)?;
     let envelope = decode_logical_record(&bytes)
         .map_err(|_| validation("External snapshot logical record is invalid"))?;
     rows::validate_locator_envelope(locator, &envelope)?;
@@ -977,6 +1011,7 @@ fn prepare_record(
     locator: LogicalRecordLocator,
     envelope: LogicalRecordEnvelope,
     local_root: Option<&serde_json::Value>,
+    probe: &dyn CancellationProbe,
 ) -> StoreResult<PreparedRecord> {
     let local_character = if let LogicalRecordLocator::Character { character_id } = &locator {
         connection
@@ -999,11 +1034,14 @@ fn prepare_record(
     preserve_local_view(&mut payload, local_character.as_ref(), local_root);
     let mut envelope = payload.record;
     let mut requires = std::collections::BTreeSet::new();
-    let messages = resolve_dependencies(cas, objects, &mut envelope, &mut requires)?
+    let messages = resolve_dependencies(cas, objects, &mut envelope, &mut requires, probe)?
         .map(|messages| {
             messages
                 .iter()
-                .map(rows::SerializedMessage::of)
+                .map(|message| {
+                    check(probe)?;
+                    rows::SerializedMessage::of(message)
+                })
                 .collect::<StoreResult<Vec<_>>>()
         })
         .transpose()?;
@@ -1019,13 +1057,14 @@ fn read_verified_record(
     root: &Path,
     content: Option<&ContentStore>,
     record: &ExternalSnapshotRecord,
+    probe: &dyn CancellationProbe,
 ) -> StoreResult<Vec<u8>> {
     let mut source = open_snapshot_input(root, content, &record.source, record.byte_length)?;
+    let cancelled = || probe.is_cancelled();
     let capacity = usize::try_from(record.byte_length)
         .map_err(|_| validation("External logical record is too large for this platform"))?;
     let mut bytes = Vec::with_capacity(capacity.min(1024 * 1024));
-    source
-        .by_ref()
+    CancellableRead::new(&mut source, &cancelled)
         .take(record.byte_length.saturating_add(1))
         .read_to_end(&mut bytes)?;
     if bytes.len() as u64 != record.byte_length
@@ -1046,10 +1085,11 @@ fn resolve_dependencies(
     objects: &BTreeMap<String, u64>,
     envelope: &mut LogicalRecordEnvelope,
     requires: &mut std::collections::BTreeSet<(String, Option<u64>)>,
+    probe: &dyn CancellationProbe,
 ) -> StoreResult<Option<Vec<serde_json::Value>>> {
     match envelope {
         LogicalRecordEnvelope::Root { value, owner_heads } => {
-            let resolved = resolve_owner_heads(cas, objects, owner_heads, requires)?;
+            let resolved = resolve_owner_heads(cas, objects, owner_heads, requires, probe)?;
             rows::rehydrate_root_owners(value, &resolved)?;
             Ok(None)
         }
@@ -1063,7 +1103,7 @@ fn resolve_dependencies(
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| validation("External character ID is missing"))?
                 .to_owned();
-            let resolved = resolve_owner_heads(cas, objects, owner_heads, requires)?;
+            let resolved = resolve_owner_heads(cas, objects, owner_heads, requires, probe)?;
             rows::rehydrate_character_owner(detail, &character_id, &resolved)?;
             Ok(None)
         }
@@ -1082,9 +1122,10 @@ fn resolve_dependencies(
                 Some(*archive_object_size),
             )?;
             for hash in asset_hashes {
+                check(probe)?;
                 require(cas, objects, requires, hash, None)?;
             }
-            resolve_owner_heads(cas, objects, owner_heads, requires)?;
+            resolve_owner_heads(cas, objects, owner_heads, requires, probe)?;
             Ok(None)
         }
         LogicalRecordEnvelope::Conversation {
@@ -1093,6 +1134,7 @@ fn resolve_dependencies(
         } => {
             let mut messages = Vec::new();
             for hash in message_page_hashes.iter() {
+                check(probe)?;
                 require_object(cas, objects, hash, None)?;
                 let bytes = cas
                     .read_object(hash)?
@@ -1128,9 +1170,11 @@ fn resolve_owner_heads(
     objects: &BTreeMap<String, u64>,
     heads: &[crate::logical_records::LogicalOwnerHead],
     requires: &mut std::collections::BTreeSet<(String, Option<u64>)>,
+    probe: &dyn CancellationProbe,
 ) -> StoreResult<Vec<rows::ResolvedOwnerHead>> {
     let mut resolved = Vec::with_capacity(heads.len());
     for head in heads {
+        check(probe)?;
         let tuples = if let Some(hash) = &head.manifest_hash {
             require(cas, objects, requires, hash, None)?;
             let bytes = cas
@@ -1147,6 +1191,7 @@ fn resolve_owner_heads(
             }
             let mut tuples = Vec::with_capacity(entries.len());
             for entry in entries {
+                check(probe)?;
                 if let Some(hash) = entry.payload_hash {
                     require(cas, objects, requires, &hex::encode(hash), None)?;
                 }
@@ -1200,6 +1245,13 @@ fn require_object(
         || cas.stat_object(hash)? != Some(catalog_size)
     {
         return invalid("External snapshot payload size differs from its logical reference");
+    }
+    Ok(())
+}
+
+fn check(probe: &dyn CancellationProbe) -> StoreResult<()> {
+    if probe.is_cancelled() {
+        return invalid("External snapshot staging cancelled");
     }
     Ok(())
 }

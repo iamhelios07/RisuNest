@@ -87,6 +87,7 @@ fn application<'a>(
         staging_root: root,
         scope_id,
         fingerprint,
+        probe: &crate::local_backup::NeverCancelled,
     }
 }
 
@@ -1144,6 +1145,7 @@ fn stage_long_conversation(
     store: &mut PersistentStore,
     messages: usize,
     padding: usize,
+    probe: &dyn crate::local_backup::CancellationProbe,
     after_batch: impl FnMut(usize) + 'static,
 ) -> (StoreResult<PreparedReplaceCommit>, Vec<(i64, i64)>) {
     let staging = directory.join("download");
@@ -1173,7 +1175,10 @@ fn stage_long_conversation(
     })));
     let scope_id = library_fingerprint_domain();
     let staged = store.prepare_external_snapshot_application(
-        &application(&staging, &scope_id, &fingerprint, 1),
+        &ExternalSnapshotApplication {
+            probe,
+            ..application(&staging, &scope_id, &fingerprint, 1)
+        },
         records.into_iter().map(Ok),
         objects.into_iter().map(Ok),
     );
@@ -1189,7 +1194,7 @@ fn one_long_conversation_is_staged_in_bounded_transactions() {
     const MESSAGES: usize = 20_000;
     let (directory, mut store) = open_store();
     let (staged, committed) =
-        stage_long_conversation(directory.path(), &mut store, MESSAGES, 0, |_| {});
+        stage_long_conversation(directory.path(), &mut store, MESSAGES, 0, &NeverCancelled, |_| {});
     let prepared = staged.unwrap();
     assert!(committed.len() >= 3, "{committed:?}");
     assert!(
@@ -1227,7 +1232,7 @@ fn a_conversation_of_heavy_messages_is_staged_within_the_byte_bound() {
     const PADDING: usize = 64 * 1024;
     let (directory, mut store) = open_store();
     let (staged, committed) =
-        stage_long_conversation(directory.path(), &mut store, 400, PADDING, |_| {});
+        stage_long_conversation(directory.path(), &mut store, 400, PADDING, &NeverCancelled, |_| {});
     staged.unwrap();
     assert!(committed.len() >= 3, "{committed:?}");
     assert!(
@@ -1245,7 +1250,7 @@ fn a_local_edit_between_the_batches_of_one_conversation_ends_the_stage() {
     let (directory, mut store) = open_store();
     let mut other = store.open_native_job_store().unwrap();
     let (staged, committed) =
-        stage_long_conversation(directory.path(), &mut store, 20_000, 0, move |written| {
+        stage_long_conversation(directory.path(), &mut store, 20_000, 0, &NeverCancelled, move |written| {
             if written == 2 {
                 let commit = serde_json::from_value(json!({
                     "expectedRevision": 1, "root": {"marker":"newer-local"}
@@ -1264,4 +1269,167 @@ fn a_local_edit_between_the_batches_of_one_conversation_ends_the_stage() {
     assert_eq!(committed.len(), 2);
     assert_eq!(stage_count(&store), 0);
     assert_eq!(store.materialize(None).unwrap()["marker"], "newer-local");
+}
+
+/// Answers "cancelled" once `fired` is set, or from its `at`th question on,
+/// and counts the questions it answered that way.
+#[derive(Default)]
+struct Cancel {
+    fired: std::rc::Rc<std::cell::Cell<bool>>,
+    at: Option<usize>,
+    asked: std::cell::Cell<usize>,
+    refused: std::cell::Cell<usize>,
+}
+
+impl crate::local_backup::CancellationProbe for Cancel {
+    fn is_cancelled(&self) -> bool {
+        self.asked.set(self.asked.get() + 1);
+        if self.at.is_some_and(|at| self.asked.get() >= at) {
+            self.fired.set(true);
+        }
+        if self.fired.get() {
+            self.refused.set(self.refused.get() + 1);
+        }
+        self.fired.get()
+    }
+}
+
+fn staged_rows(store: &PersistentStore) -> (i64, i64) {
+    store
+        .connection
+        .query_row(
+            "SELECT (SELECT count(*) FROM root WHERE generation LIKE 'staging-%'),
+                    (SELECT count(*) FROM messages WHERE generation LIKE 'staging-%')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+}
+
+/// A cancellation between two message batches of one conversation admits no
+/// further batch, and the stage it leaves is removed by its own owner.
+#[test]
+fn cancellation_between_the_batches_of_one_conversation_admits_no_later_batch() {
+    let (directory, mut store) = open_store();
+    let probe = Cancel::default();
+    let fired = probe.fired.clone();
+    let (staged, committed) =
+        stage_long_conversation(directory.path(), &mut store, 20_000, 0, &probe, move |written| {
+            if written == 2 {
+                fired.set(true);
+            }
+        });
+    assert!(matches!(staged, Err(StoreError::Validation { .. })));
+    assert_eq!(committed.len(), 2);
+    // The first question after the cancellation was the last one asked.
+    assert_eq!(probe.refused.get(), 1);
+    assert_eq!(staged_rows(&store), (0, 0));
+    assert_eq!(store.revision().unwrap(), 1);
+    assert_eq!(store.materialize(None).unwrap()["marker"], "local");
+}
+
+/// A cancellation while one long conversation's messages are being turned
+/// into rows stops inside that record, before any of it is written.
+#[test]
+fn cancellation_inside_one_long_record_stops_before_its_rows_are_written() {
+    let (directory, mut store) = open_store();
+    // Staging the pages and the two short records asks far fewer than 10,000
+    // times; each of the 20,000 messages then asks once.
+    let probe = Cancel {
+        at: Some(10_000),
+        ..Cancel::default()
+    };
+    let (staged, committed) =
+        stage_long_conversation(directory.path(), &mut store, 20_000, 0, &probe, |_| {});
+    assert!(staged.is_err());
+    assert!(committed.is_empty(), "{committed:?}");
+    assert_eq!(probe.asked.get(), 10_000);
+    assert_eq!(probe.refused.get(), 1);
+    assert_eq!(staged_rows(&store), (0, 0));
+    assert_eq!(store.materialize(None).unwrap()["marker"], "local");
+}
+
+/// A cancellation part way through reading one long object or one long record
+/// body stops at the next chunk: nothing is published and no stage is left.
+#[test]
+fn cancellation_stops_a_long_checked_read_between_chunks() {
+    for long_record in [false, true] {
+        let (directory, mut store) = open_store();
+        let staging = directory.path().join("download");
+        fs::create_dir(&staging).unwrap();
+        let object = write_object(&staging, &vec![7u8; 1024 * 1024]);
+        let (record, digest) = if long_record {
+            write_record(
+                &staging,
+                LogicalRecordLocator::Root,
+                LogicalRecordEnvelope::Root {
+                    value: json!({"marker": "x".repeat(1024 * 1024)}),
+                    owner_heads: vec![],
+                },
+            )
+        } else {
+            root_record(&staging, "remote")
+        };
+        let fingerprint = fingerprint(
+            &library_fingerprint_domain(),
+            &BTreeMap::from([(record.key.clone(), digest)]),
+        );
+        let scope_id = library_fingerprint_domain();
+        // Objects come first: one question before the object and one before
+        // each read of at most 64 KiB, the last of which finds its end. A long
+        // record is read after the whole object, with one question before the
+        // record, one as it is staged and one per read.
+        let at = if long_record { 1 + 17 + 2 + 3 } else { 1 + 3 };
+        let probe = Cancel {
+            at: Some(at),
+            ..Cancel::default()
+        };
+        let staged = store.prepare_external_snapshot_application(
+            &ExternalSnapshotApplication {
+                probe: &probe,
+                ..application(&staging, &scope_id, &fingerprint, 1)
+            },
+            [Ok(record)],
+            [Ok(object.clone())],
+        );
+        assert!(staged.is_err(), "{long_record}");
+        assert_eq!(probe.asked.get(), at, "{long_record}");
+        assert_eq!(probe.refused.get(), 1, "{long_record}");
+        let cas = crate::asset_repository::PayloadCas::new(directory.path()).unwrap();
+        let published = cas.stat_object(&object.content_hash).unwrap();
+        assert_eq!(published.is_some(), long_record, "{long_record}");
+        let leftovers = fs::read_dir(directory.path().join("assets").join("staging"))
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(leftovers, 0, "{long_record}");
+        assert_eq!(staged_rows(&store), (0, 0), "{long_record}");
+        assert_eq!(store.materialize(None).unwrap()["marker"], "local", "{long_record}");
+    }
+}
+
+/// One message larger than a whole batch is still staged, whole, under a
+/// probe that is asked throughout and never cancels.
+#[test]
+fn one_message_larger_than_a_batch_still_stages_under_a_live_probe() {
+    let padding = super::STAGE_BATCH_BYTES as usize + 1024 * 1024;
+    let (directory, mut store) = open_store();
+    let probe = Cancel::default();
+    let (staged, committed) =
+        stage_long_conversation(directory.path(), &mut store, 1, padding, &probe, |_| {});
+    let prepared = staged.unwrap();
+    assert!(committed.iter().any(|(_, bytes)| *bytes as usize > padding), "{committed:?}");
+    // The page holding it was read a bounded chunk at a time.
+    assert!(probe.asked.get() as usize > padding / (64 * 1024), "{}", probe.asked.get());
+    assert_eq!(probe.refused.get(), 0);
+    let library = store.materialize_staging(&prepared.staging_id).unwrap();
+    let character = library["characters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|character| character["chaId"] == "long")
+        .unwrap()
+        .clone();
+    let message = &character["chats"][0]["message"][0];
+    assert_eq!(message["data"].as_str().unwrap().len(), padding);
+    assert_eq!(store.finish_prepared_replace(prepared).unwrap().revision, 2);
 }

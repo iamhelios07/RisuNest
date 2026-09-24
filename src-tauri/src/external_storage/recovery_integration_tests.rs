@@ -291,6 +291,7 @@ fn repository_bootstrap_opens_and_applies_a_real_snapshot_without_the_source_vau
                 staging_root: &prepared.staging_root,
                 scope_id: &library_fingerprint_domain(),
                 fingerprint: &library_fingerprint,
+                probe: &crate::local_backup::NeverCancelled,
             };
             let replacement = destination_store
                 .prepare_external_snapshot_application(&application, records, objects)

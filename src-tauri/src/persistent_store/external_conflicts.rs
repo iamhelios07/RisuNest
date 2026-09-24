@@ -409,7 +409,7 @@ pub(crate) fn conflict_source_descriptor(db: &Connection, repository_root: &Path
     let record = external_conflict(db, id)?.ok_or_else(|| invalid("External conflict does not exist"))?;
     match side {
         ConflictSide::Local => {
-            validate_recovery_sources([&record.local], repository_root)?;
+            validate_recovery_sources([&record.local], repository_root, &crate::local_backup::NeverCancelled)?;
             Ok(ConflictSourceDescriptor::Local {
                 conflict_id: record.id,
                 repository_id: record.repository_id,

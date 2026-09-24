@@ -29,6 +29,41 @@ fn invalid(message: &str) -> StoreError {
 pub(crate) const SMALL_OBJECT_BYTES: usize = 64 * 1024;
 const GROUP_ROWS: usize = 256;
 const GROUP_BYTES: usize = 8 * 1024 * 1024;
+const CANCELLABLE_READ_BYTES: usize = 64 * 1024;
+
+/// Reads at most one bounded chunk at a time and asks `cancelled` before each,
+/// so a long body can be stopped between chunks rather than only after it.
+pub(crate) struct CancellableRead<'a, R> {
+    inner: R,
+    cancelled: &'a dyn Fn() -> bool,
+    refused: bool,
+}
+
+impl<'a, R> CancellableRead<'a, R> {
+    pub(crate) fn new(inner: R, cancelled: &'a dyn Fn() -> bool) -> Self {
+        Self {
+            inner,
+            cancelled,
+            refused: false,
+        }
+    }
+
+    /// Whether a read was refused because `cancelled` said so.
+    pub(crate) fn refused(&self) -> bool {
+        self.refused
+    }
+}
+
+impl<R: io::Read> io::Read for CancellableRead<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if (self.cancelled)() {
+            self.refused = true;
+            return Err(io::Error::other("read cancelled"));
+        }
+        let limit = buffer.len().min(CANCELLABLE_READ_BYTES);
+        self.inner.read(&mut buffer[..limit])
+    }
+}
 
 /// Which store a caller expects to read an object from. Section spool parts are
 /// files the caller produced itself and are read straight from disk; capture
@@ -269,6 +304,17 @@ impl ContentStore {
     /// Confirm one object is present at the stated length, and when asked, that
     /// what is stored still matches the identity it is filed under.
     pub(crate) fn validate(&self, digest: &str, bytes: i64, contents: bool) -> Result<()> {
+        self.validate_checked(digest, bytes, contents, &|| false)
+    }
+
+    /// `validate`, asking `cancelled` before every read of the body.
+    pub(crate) fn validate_checked(
+        &self,
+        digest: &str,
+        bytes: i64,
+        contents: bool,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<()> {
         let expected =
             u64::try_from(bytes).map_err(|_| invalid("Capture object length is invalid"))?;
         match self.stat(digest)? {
@@ -279,9 +325,14 @@ impl ContentStore {
         if !contents {
             return Ok(());
         }
-        let mut body = self.open_body(digest)?;
-        let actual = hash_reader(&mut body, expected)
-            .map_err(|_| invalid("Capture object body differs from its identity"))?;
+        let mut body = CancellableRead::new(self.open_body(digest)?, cancelled);
+        let actual = hash_reader(&mut body, expected).map_err(|_| {
+            if body.refused() {
+                invalid("Capture object check cancelled")
+            } else {
+                invalid("Capture object body differs from its identity")
+            }
+        })?;
         if hex::encode(actual) != digest {
             return Err(invalid("Capture object body differs from its identity"));
         }

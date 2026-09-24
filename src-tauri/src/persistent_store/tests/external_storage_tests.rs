@@ -1128,7 +1128,7 @@ fn a_transfer_capture_serves_local_recovery_only_once_it_is_completed() {
     store.retain_external_capture(&capture.id, "job").unwrap();
     let reference = capture.durable_reference(root).unwrap();
 
-    assert!(crate::external_storage::capture::validate_recovery_sources([&reference], root)
+    assert!(crate::external_storage::capture::validate_recovery_sources([&reference], root, &Never)
         .is_err());
     assert!(
         crate::external_storage::snapshot_export::prepare_local_conflict_snapshot(
@@ -1142,7 +1142,7 @@ fn a_transfer_capture_serves_local_recovery_only_once_it_is_completed() {
 
     store.complete_external_capture(&capture.id, &Never).unwrap();
     assert_eq!(crate::server_sync::residency::test_remote::fetched(root), 1);
-    crate::external_storage::capture::validate_recovery_sources([&reference], root).unwrap();
+    crate::external_storage::capture::validate_recovery_sources([&reference], root, &Never).unwrap();
     crate::external_storage::snapshot_export::prepare_local_conflict_snapshot(
         root,
         "format-repository",
@@ -1181,7 +1181,7 @@ fn recovery_accepted(
     let reference = capture.durable_reference(root).unwrap();
     [
         store.complete_external_capture(&capture.id, probe).is_ok(),
-        crate::external_storage::capture::validate_recovery_sources([&reference], root).is_ok(),
+        crate::external_storage::capture::validate_recovery_sources([&reference], root, probe).is_ok(),
         crate::external_storage::snapshot_export::prepare_local_conflict_snapshot(
             root,
             "format-repository",
@@ -1732,4 +1732,93 @@ fn removing_a_connection_removes_the_view_with_its_base() {
         .unwrap();
     assert_eq!(count(&store, "external_storage_base_records"), 0);
     assert_eq!(count(&store, "external_storage_base_record_state"), 0);
+}
+
+/// Says "cancelled" from its `at`th question on and counts the questions it
+/// answered that way.
+struct CancelAt {
+    at: usize,
+    asked: std::cell::Cell<usize>,
+    refused: std::cell::Cell<usize>,
+}
+
+impl CancelAt {
+    fn new(at: usize) -> Self {
+        Self {
+            at,
+            asked: std::cell::Cell::new(0),
+            refused: std::cell::Cell::new(0),
+        }
+    }
+}
+
+impl crate::local_backup::CancellationProbe for CancelAt {
+    fn is_cancelled(&self) -> bool {
+        self.asked.set(self.asked.get() + 1);
+        let cancelled = self.asked.get() >= self.at;
+        if cancelled {
+            self.refused.set(self.refused.get() + 1);
+        }
+        cancelled
+    }
+}
+
+/// Recovery validation stops at whichever question first finds it cancelled,
+/// between payloads, between records and inside one long payload, and the
+/// capture it was checking stays owned and completes afterwards.
+#[test]
+fn cancelling_recovery_validation_stops_at_the_next_object_or_chunk() {
+    let (directory, mut store, _) = capture_fixture();
+    let root = directory.path();
+    let cas = crate::asset_repository::PayloadCas::new(root).unwrap();
+    let bodies = [vec![3u8; 300 * 1024], b"second payload".to_vec(), b"third payload".to_vec()];
+    for (index, body) in bodies.iter().enumerate() {
+        let payload = cas.prepare_bytes(body).unwrap();
+        let revision = store.revision().unwrap();
+        store
+            .commit_asset_alias(
+                &AssetAlias {
+                    key: format!("assets/held-{index}.bin"),
+                    object_hash: Some(payload.content_hash.clone()),
+                    kind: "asset".into(),
+                    size: payload.byte_size as i64,
+                    mime: "application/octet-stream".into(),
+                    name: format!("held-{index}"),
+                    ext: "bin".into(),
+                    inlay_type: None,
+                    width: None,
+                    height: None,
+                    metadata: json!({}),
+                },
+                revision,
+            )
+            .unwrap();
+    }
+    let never = CancelAt::new(usize::MAX);
+    let capture = capture_library(&mut store, "destination", &never).unwrap();
+    store.retain_external_capture(&capture.id, "job").unwrap();
+    let reference = capture.durable_reference(root).unwrap();
+
+    let counted = CancelAt::new(usize::MAX);
+    crate::external_storage::capture::validate_recovery_sources([&reference], root, &counted)
+        .unwrap();
+    let questions = counted.asked.get();
+    // Three payloads, the long one in five reads, and the capture's records.
+    assert!(questions > 3 + 5, "{questions}");
+    for at in 1..=questions {
+        let probe = CancelAt::new(at);
+        assert!(
+            crate::external_storage::capture::validate_recovery_sources([&reference], root, &probe)
+                .is_err(),
+            "{at}"
+        );
+        assert_eq!((probe.asked.get(), probe.refused.get()), (at, 1), "{at}");
+    }
+
+    let probe = CancelAt::new(questions / 2);
+    assert!(store.complete_external_capture(&capture.id, &probe).is_err());
+    assert_eq!(probe.refused.get(), 1);
+    store.complete_external_capture(&capture.id, &never).unwrap();
+    crate::external_storage::capture::validate_recovery_sources([&reference], root, &never)
+        .unwrap();
 }

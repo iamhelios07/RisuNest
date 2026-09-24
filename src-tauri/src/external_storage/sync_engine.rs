@@ -279,6 +279,12 @@ fn prepare_receive_within(
     let expected_fingerprint: [u8; 32] = hex::decode(&downloaded.library_fingerprint)
         .ok().and_then(|value| value.try_into().ok())
         .ok_or_else(|| corrupt("invalid received fingerprint"))?;
+    let probe = super::runtime::CancelProbe(cancel.clone());
+    // A store helper stopped by the probe reports a validation failure; the
+    // job reports it as the cancellation it was.
+    let stopped = |error: ProviderError| {
+        if cancel.check().is_err() { ProviderError::new(ErrorKind::Cancelled) } else { error }
+    };
     let mut hashes = BTreeMap::new();
     let mut record_map = BTreeMap::new();
     for record in &downloaded.records {
@@ -295,6 +301,7 @@ fn prepare_receive_within(
     if fingerprint(&scope_id, &hashes) != expected_fingerprint {
         return Err(corrupt("received snapshot differs from its catalog fingerprint"));
     }
+    cancel.check()?;
     let difference = receive_difference_plan(store, &job.request.connection_id, &downloaded, budget)?;
     // A few small keys can stand for a great deal: a conversation's pages, an
     // owner's manifest, a character's whole history. What they bring is
@@ -319,9 +326,9 @@ fn prepare_receive_within(
                     .collect();
                 let decoded = store
                     .decode_external_snapshot_difference(
-                        &downloaded.staging_root, &records, &difference.removed, &catalog,
+                        &downloaded.staging_root, &records, &difference.removed, &catalog, &probe,
                     )
-                    .map_err(receive_validation_error)?;
+                    .map_err(|error| stopped(receive_validation_error(error)))?;
                 budget
                     .admits_dependents(decoded.cost.bytes, decoded.cost.work)
                     .then_some((difference, records, decoded))
@@ -370,13 +377,13 @@ fn prepare_receive_within(
                 })
             });
             let object_sizes = store
-                .stage_external_snapshot_objects(&downloaded.staging_root, objects)
-                .map_err(local_error)?;
+                .stage_external_snapshot_objects(&downloaded.staging_root, objects, &probe)
+                .map_err(|error| stopped(local_error(error)))?;
             PreparedApply::Difference(PreparedDifference {
                 expected_revision: expected.revision,
                 prepared: store
-                    .prepare_external_snapshot_difference(decoded, object_sizes)
-                    .map_err(receive_validation_error)?,
+                    .prepare_external_snapshot_difference(decoded, object_sizes, &probe)
+                    .map_err(|error| stopped(receive_validation_error(error)))?,
             })
         }
         None => {
@@ -385,6 +392,7 @@ fn prepare_receive_within(
                 staging_root: &downloaded.staging_root,
                 scope_id: &scope_id,
                 fingerprint: &expected_fingerprint,
+                probe: &probe,
             };
             // A replacement stages every record as well, which is the whole
             // reason it costs what it does.
@@ -409,7 +417,7 @@ fn prepare_receive_within(
             });
             PreparedApply::Replace(
                 store.prepare_external_snapshot_application(&application, records, objects)
-                    .map_err(local_error)?,
+                    .map_err(|error| stopped(local_error(error)))?,
             )
         }
     };
@@ -2542,7 +2550,9 @@ pub(crate) async fn external_storage_recheck_conflict(
     let record = conflict_record(&app, &id)?
         .ok_or_else(|| ProviderError::new(ErrorKind::NotFound))?;
     let local_available =
-        super::capture::validate_recovery_sources([&record.local], &root).is_ok();
+        super::capture::validate_recovery_sources(
+            [&record.local], &root, &crate::local_backup::NeverCancelled,
+        ).is_ok();
     Ok(conflict_summary(&record, local_available, true))
 }
 
@@ -3772,6 +3782,106 @@ mod receive_tests {
         assert_eq!(store.revision().unwrap(), 0);
         drop(claim);
         assert!(state.claim(&job).is_ok());
+    }
+
+    fn staged_generations(directory: &std::path::Path) -> i64 {
+        rusqlite::Connection::open_with_flags(
+            directory.join("persistent").join(crate::persistent_store::DATABASE_FILE),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap()
+        .query_row(
+            "SELECT (SELECT count(*) FROM root WHERE generation LIKE 'staging-%')
+                  + (SELECT count(*) FROM characters WHERE generation LIKE 'staging-%')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// A receive cancelled between the batches of its stage stops there,
+    /// reports a cancellation rather than a rejected snapshot, removes its
+    /// stage and leaves the job preparing, so the only next step is to
+    /// prepare the same download again.
+    #[test]
+    fn cancellation_during_receive_staging_leaves_one_resumable_preparation() {
+        let (directory, mut store, job, downloaded) = fixture();
+        let staging = downloaded.staging_root.clone();
+        let mut records = vec![root_at(&staging, "remote")];
+        for index in 0..600 {
+            let id = format!("character-{index:04}");
+            records.push(character_at(&staging, &id, index as u64));
+            records.push(conversation_at(&staging, &id, "chat", 0));
+        }
+        let downloaded = staged_snapshot(&staging, "snapshot", records);
+        let held = store.materialize(None).unwrap();
+        let phase = store.external_job(&job.id).unwrap().unwrap().phase;
+        let cancel = Cancellation::default();
+        let trigger = cancel.clone();
+        let batches = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = batches.clone();
+        crate::persistent_store::external_apply::after_stage_batch(Some(Box::new(move |written, _| {
+            seen.set(written);
+            trigger.cancel();
+        })));
+        let participation = receive_participation(&mut store).unwrap();
+        let section = plugin_section(&staging);
+        let outcome = prepare_receive_input(&mut store, &job, job.admission_identity.clone(),
+            "authenticated-head".into(), downloaded.clone(), vec![section], participation,
+            &crate::external_storage::phase_progress::PhaseProgress::silent(), &cancel);
+        crate::persistent_store::external_apply::after_stage_batch(None);
+        assert_eq!(outcome.err().unwrap().kind, ErrorKind::Cancelled);
+        assert_eq!(batches.get(), 1);
+        assert_eq!(staged_generations(directory.path()), 0);
+        assert_eq!(store.revision().unwrap(), 0);
+        assert_eq!(store.materialize(None).unwrap(), held);
+        assert_eq!(store.external_job(&job.id).unwrap().unwrap().phase, phase);
+        assert!(store.external_receive_completion(&job.id, "connection").unwrap().is_none());
+
+        let prepared = prepare(&mut store, &job, downloaded);
+        activate_prepared_receive(&mut store, &prepared, &job.admission_identity).unwrap();
+        assert_eq!(completed_receive_result(&store, &job, 0).unwrap().unwrap()["receivedRevision"], "1");
+        assert_eq!(store.materialize(None).unwrap()["characters"].as_array().unwrap().len(), 600);
+    }
+
+    /// Cancelled before its apply, a receive keeps its handle and the library;
+    /// cancelled as its apply commits, it keeps the completed outcome and has
+    /// nothing left that could be applied a second time.
+    #[test]
+    fn cancellation_around_activation_never_repeats_or_loses_the_apply() {
+        let (_directory, mut store, job, downloaded) = fixture();
+        let prepared = prepare(&mut store, &job, downloaded);
+        let stage = prepared.apply.staging_id().unwrap().to_owned();
+        let held = store.materialize(None).unwrap();
+        let state = super::super::job_store::JobCommandState::default();
+        state.prepared_receives.lock().unwrap().insert(job.id.clone(), prepared);
+        let current = store.external_identity().unwrap();
+
+        let (cancel, claim) = state.claim(&job).unwrap();
+        cancel.cancel();
+        assert_eq!(commit_prepared_receive(&mut store, &state, &claim, &job, 0, &current)
+            .unwrap_err().kind, ErrorKind::Cancelled);
+        assert_eq!(state.prepared_receives.lock().unwrap().len(), 1);
+        assert_eq!(store.revision().unwrap(), 0);
+        assert_eq!(store.materialize(None).unwrap(), held);
+        drop(claim);
+
+        let (cancel, claim) = state.claim(&job).unwrap();
+        let (_, revision) =
+            commit_prepared_receive(&mut store, &state, &claim, &job, 0, &current).unwrap();
+        cancel.cancel();
+        assert_eq!(revision, 1);
+        let applied = store.materialize(None).unwrap();
+        assert_eq!(applied["marker"], "remote");
+        assert!(state.prepared_receives.lock().unwrap().is_empty());
+        assert!(commit_prepared_receive(&mut store, &state, &claim, &job, 0, &current).is_err());
+        // What a cancellation discards afterwards is the stage the apply
+        // consumed, which no longer names any of the library.
+        store.replace_abort(&stage).unwrap();
+        drop(claim);
+        assert_eq!(completed_receive_result(&store, &job, 0).unwrap().unwrap()["receivedRevision"], "1");
+        assert_eq!(store.revision().unwrap(), 1);
+        assert_eq!(store.materialize(None).unwrap(), applied);
     }
 
     #[test]

@@ -692,6 +692,7 @@ impl PersistentStore {
         crate::external_storage::capture::validate_recovery_sources(
             [&reference],
             &self.repository_root,
+            probe,
         )?;
         Ok(())
     }

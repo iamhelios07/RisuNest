@@ -65,7 +65,12 @@ pub(crate) fn prepare_local_conflict_snapshot(
     if !bounded_identity(repository_id) {
         return Err(corrupt("conflict repository identity is invalid"));
     }
-    let roots = capture::validate_recovery_sources([reference], repository_root).map_err(corrupt)?;
+    let roots = capture::validate_recovery_sources(
+        [reference],
+        repository_root,
+        &crate::local_backup::NeverCancelled,
+    )
+    .map_err(corrupt)?;
     let mut catalogs = roots.catalogs.into_iter();
     let catalog_path = catalogs
         .next()
@@ -274,11 +279,13 @@ pub(crate) fn export_verified_snapshot_controlled(
         .tempdir_in(scratch_parent)
         .map_err(transient)?;
     let mut store = PersistentStore::open(&scratch.path().join("pds")).map_err(transient)?;
+    let probe = Probe(cancel);
     let application = ExternalSnapshotApplication {
         expected_revision: 0,
         staging_root: &snapshot.staging_root,
         scope_id: &library_fingerprint_domain(),
         fingerprint: &fingerprint,
+        probe: &probe,
     };
     let records = snapshot.records.into_iter().map(|value| {
         Ok(ExternalSnapshotRecord {
@@ -297,7 +304,13 @@ pub(crate) fn export_verified_snapshot_controlled(
     });
     let prepared = store
         .prepare_external_snapshot_application(&application, records, objects)
-        .map_err(transient)?;
+        .map_err(|error| {
+            if cancel.check().is_err() {
+                ProviderError::new(ErrorKind::Cancelled)
+            } else {
+                transient(error)
+            }
+        })?;
     let revision = store
         .finish_prepared_replace(prepared)
         .map_err(transient)?
@@ -312,7 +325,7 @@ pub(crate) fn export_verified_snapshot_controlled(
         revision,
         &candidate,
         &archive_scratch,
-        &Probe(cancel),
+        &probe,
     )
     .map_err(transient)?;
     crate::persistent_store::export::destination::write_portable_destination_controlled(

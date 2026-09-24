@@ -136,6 +136,14 @@ fn prepare_external_source(
     Ok(prepared.into_parts())
 }
 
+struct JobProbe<'a>(&'a JobControl);
+
+impl crate::local_backup::CancellationProbe for JobProbe<'_> {
+    fn is_cancelled(&self) -> bool {
+        self.0.is_cancel_requested()
+    }
+}
+
 fn finish_reference_restore(
     store: &mut crate::persistent_store::PersistentStore,
     prepared: crate::persistent_store::PreparedReplaceCommit,
@@ -230,6 +238,7 @@ pub(crate) fn restore_reference_source(
                 staging_root: &snapshot.staging_root,
                 scope_id: &scope,
                 fingerprint: &fingerprint,
+                probe: &JobProbe(job),
             };
             let records = snapshot.records.into_iter().map(|record| {
                 Ok(crate::persistent_store::external_apply::ExternalSnapshotRecord {
@@ -248,7 +257,13 @@ pub(crate) fn restore_reference_source(
             });
             let prepared = store
                 .prepare_external_snapshot_application(&application, records, objects)
-                .map_err(super::native_store_error)?;
+                .map_err(|error| {
+                    if job.is_cancel_requested() {
+                        NativeJobError::new("cancelled", "Native file job was cancelled")
+                    } else {
+                        super::native_store_error(error)
+                    }
+                })?;
             let outcome = finish_reference_restore(
                 &mut store,
                 prepared,

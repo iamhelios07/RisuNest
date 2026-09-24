@@ -417,6 +417,7 @@ fn prepare_local_restore(
                 source: object.source,
             })
         });
+        let probe = runtime::CancelProbe(cancel.clone());
         Some(
             store
                 .prepare_external_snapshot_application(
@@ -425,11 +426,18 @@ fn prepare_local_restore(
                         staging_root: &staging_root,
                         scope_id: &scope_id,
                         fingerprint: &fingerprint,
+                        probe: &probe,
                     },
                     records,
                     objects,
                 )
-                .map_err(pds_error)?,
+                .map_err(|error| {
+                    if cancel.check().is_err() {
+                        ProviderError::new(ErrorKind::Cancelled)
+                    } else {
+                        pds_error(error)
+                    }
+                })?,
         )
     } else {
         None

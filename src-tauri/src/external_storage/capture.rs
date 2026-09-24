@@ -2,6 +2,7 @@
 //! lengths; unchanged record bodies are immutable shared files, never copied as
 //! part of another small-edit capture. This module performs no remote requests.
 use crate::{
+    local_backup::{CancellationProbe, NeverCancelled},
     persistent_store::{
         content_capture::ContentCaptureSink, sync_selection::CaptureIdentity, StoreError,
     },
@@ -438,7 +439,16 @@ fn capture_roots<'a>(
     repository_root: &Path,
     verify_contents: bool,
     recovery: bool,
+    probe: &dyn CancellationProbe,
 ) -> Result<RegisteredCaptureRoots> {
+    let cancelled = || probe.is_cancelled();
+    let check = || {
+        if cancelled() {
+            Err(invalid("Capture validation cancelled"))
+        } else {
+            Ok(())
+        }
+    };
     let mut roots = RegisteredCaptureRoots::default();
     let payloads = if recovery {
         Some(crate::asset_repository::PayloadCas::new(repository_root)?)
@@ -446,6 +456,7 @@ fn capture_roots<'a>(
         None
     };
     for reference in references {
+        check()?;
         let (path, external_root) = resolve_registered_catalog(repository_root, reference)?;
         let expected: [u8; 32] = hex::decode(&reference.catalog_hash)
             .ok()
@@ -475,9 +486,10 @@ fn capture_roots<'a>(
                 let (hash, bytes) = payload?;
                 let bytes = u64::try_from(bytes)
                     .map_err(|_| invalid("Registered capture payload length is invalid"))?;
+                check()?;
                 // Recovery replaces a library with these bytes, so their
                 // length is not proof of them.
-                if !payloads.holds_exact_object(&hash, bytes)? {
+                if !payloads.holds_exact_object(&hash, bytes, &cancelled)? {
                     return Err(invalid("Recovery capture payload is not held locally"));
                 }
             }
@@ -493,7 +505,8 @@ fn capture_roots<'a>(
             if bytes < 0 || !crate::trust_boundary::is_lower_hex_256(&hash) {
                 return Err(invalid("Registered capture object identity differs"));
             }
-            catalog.content.validate(&hash, bytes, verify_contents)?;
+            check()?;
+            catalog.content.validate_checked(&hash, bytes, verify_contents, &cancelled)?;
             // Protected in whichever store holds it: a file by its path, a
             // database body by its identity.
             match catalog.content.file_path(&hash)? {
@@ -516,7 +529,7 @@ pub(crate) fn registered_capture_roots<'a>(
     references: impl IntoIterator<Item = &'a DurableCaptureReference>,
     repository_root: &Path,
 ) -> Result<RegisteredCaptureRoots> {
-    capture_roots(references, repository_root, false, false)
+    capture_roots(references, repository_root, false, false, &NeverCancelled)
 }
 
 #[cfg(test)]
@@ -524,17 +537,19 @@ pub(crate) fn validate_capture_sources<'a>(
     references: impl IntoIterator<Item = &'a DurableCaptureReference>,
     repository_root: &Path,
 ) -> Result<RegisteredCaptureRoots> {
-    capture_roots(references, repository_root, true, false)
+    capture_roots(references, repository_root, true, false, &NeverCancelled)
 }
 
 /// What `validate_capture_sources` checks, and that every payload the capture
 /// names is held locally at its recorded length and content, so local recovery
-/// never has to reach custody.
+/// never has to reach custody. Every body is read in bounded chunks, and
+/// `probe` is asked between objects and chunks.
 pub(crate) fn validate_recovery_sources<'a>(
     references: impl IntoIterator<Item = &'a DurableCaptureReference>,
     repository_root: &Path,
+    probe: &dyn CancellationProbe,
 ) -> Result<RegisteredCaptureRoots> {
-    capture_roots(references, repository_root, true, true)
+    capture_roots(references, repository_root, true, true, probe)
 }
 
 /// GC performs this inventory only when it actually needs roots. Every normal
