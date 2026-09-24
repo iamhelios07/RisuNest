@@ -1075,3 +1075,193 @@ fn a_stage_stopped_between_batches_leaves_no_stage_behind() {
     assert_eq!(stage_count(&store), 0);
     assert_eq!(store.materialize(None).unwrap()["marker"], "local");
 }
+
+/// A root, one character and one conversation of `messages` messages, each
+/// carrying `padding` bytes, in pages of at most 128.
+fn long_conversation_snapshot(
+    staging: &Path,
+    messages: usize,
+    padding: usize,
+) -> (Vec<ExternalSnapshotRecord>, Vec<ExternalSnapshotObject>, [u8; 32]) {
+    let filler = "x".repeat(padding);
+    let values = (0..messages)
+        .map(|index| json!({"chatId": format!("message-{index}"), "data": filler}))
+        .collect::<Vec<_>>();
+    let mut objects = Vec::new();
+    let mut page_hashes = Vec::new();
+    for page in values.chunks(128) {
+        let page = encode_message_page(page).unwrap();
+        objects.push(write_object(staging, &page.bytes));
+        page_hashes.push(page.hash);
+    }
+    let records = vec![
+        root_record(staging, "long"),
+        write_record(
+            staging,
+            LogicalRecordLocator::Character {
+                character_id: "long".into(),
+            },
+            LogicalRecordEnvelope::Character {
+                configured_index: 0,
+                detail: json!({"chaId": "long", "name": "long"}),
+                owner_heads: vec![LogicalOwnerHead::absent(
+                    LogicalOwnerLocator::CharacterAdditional {
+                        character_id: "long".into(),
+                    },
+                )],
+            },
+        ),
+        write_record(
+            staging,
+            LogicalRecordLocator::Conversation {
+                character_id: "long".into(),
+                conversation_id: "chat".into(),
+            },
+            LogicalRecordEnvelope::Conversation {
+                configured_index: 0,
+                recent_at: 1,
+                detail: json!({"id":"chat","name":"chat"}),
+                message_page_hashes: page_hashes,
+            },
+        ),
+    ];
+    let hashes: BTreeMap<_, _> = records
+        .iter()
+        .map(|(record, hash)| (record.key.clone(), *hash))
+        .collect();
+    let fingerprint = fingerprint(&library_fingerprint_domain(), &hashes);
+    (
+        records.into_iter().map(|(record, _)| record).collect(),
+        objects,
+        fingerprint,
+    )
+}
+
+/// The message rows and their bytes each stage transaction committed, read
+/// from another connection after every batch.
+fn stage_long_conversation(
+    directory: &Path,
+    store: &mut PersistentStore,
+    messages: usize,
+    padding: usize,
+    after_batch: impl FnMut(usize) + 'static,
+) -> (StoreResult<PreparedReplaceCommit>, Vec<(i64, i64)>) {
+    let staging = directory.join("download");
+    fs::create_dir(&staging).unwrap();
+    let (records, objects, fingerprint) = long_conversation_snapshot(&staging, messages, padding);
+    let observer = rusqlite::Connection::open_with_flags(
+        directory.join("persistent").join(super::super::DATABASE_FILE),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let committed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let seen = committed.clone();
+    let mut after_batch = after_batch;
+    let mut previous = (0i64, 0i64);
+    super::after_stage_batch(Some(Box::new(move |written, _| {
+        let now: (i64, i64) = observer
+            .query_row(
+                "SELECT count(*), coalesce(sum(length(value)),0) FROM messages",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        seen.borrow_mut()
+            .push((now.0 - previous.0, now.1 - previous.1));
+        previous = now;
+        after_batch(written);
+    })));
+    let scope_id = library_fingerprint_domain();
+    let staged = store.prepare_external_snapshot_application(
+        &application(&staging, &scope_id, &fingerprint, 1),
+        records.into_iter().map(Ok),
+        objects.into_iter().map(Ok),
+    );
+    super::after_stage_batch(None);
+    let committed = committed.borrow().clone();
+    (staged, committed)
+}
+
+/// F03. One conversation longer than a batch is staged over several bounded
+/// transactions, and what lands is every message in order.
+#[test]
+fn one_long_conversation_is_staged_in_bounded_transactions() {
+    const MESSAGES: usize = 20_000;
+    let (directory, mut store) = open_store();
+    let (staged, committed) =
+        stage_long_conversation(directory.path(), &mut store, MESSAGES, 0, |_| {});
+    let prepared = staged.unwrap();
+    assert!(committed.len() >= 3, "{committed:?}");
+    assert!(
+        committed
+            .iter()
+            .all(|(rows, _)| *rows as u64 <= super::STAGE_BATCH_WORK),
+        "{committed:?}"
+    );
+    assert_eq!(
+        committed.iter().map(|(rows, _)| rows).sum::<i64>(),
+        MESSAGES as i64
+    );
+    // Nothing of the stage is in the library until it is activated.
+    assert_eq!(store.materialize(None).unwrap()["marker"], "local");
+    let library = store.materialize_staging(&prepared.staging_id).unwrap();
+    let character = library["characters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|character| character["chaId"] == "long")
+        .unwrap()
+        .clone();
+    let landed = character["chats"][0]["message"].as_array().unwrap();
+    assert_eq!(landed.len(), MESSAGES);
+    for (index, message) in landed.iter().enumerate() {
+        assert_eq!(message["chatId"], format!("message-{index}"));
+    }
+    assert_eq!(store.finish_prepared_replace(prepared).unwrap().revision, 2);
+}
+
+/// F03. Heavy messages close a batch by their bytes, even inside one
+/// conversation.
+#[test]
+fn a_conversation_of_heavy_messages_is_staged_within_the_byte_bound() {
+    const PADDING: usize = 64 * 1024;
+    let (directory, mut store) = open_store();
+    let (staged, committed) =
+        stage_long_conversation(directory.path(), &mut store, 400, PADDING, |_| {});
+    staged.unwrap();
+    assert!(committed.len() >= 3, "{committed:?}");
+    assert!(
+        committed
+            .iter()
+            .all(|(_, bytes)| *bytes as u64 <= super::STAGE_BATCH_BYTES + 2 * PADDING as u64),
+        "{committed:?}"
+    );
+}
+
+/// F03. A local edit between two batches of one conversation ends the stage,
+/// and nothing of it is left behind.
+#[test]
+fn a_local_edit_between_the_batches_of_one_conversation_ends_the_stage() {
+    let (directory, mut store) = open_store();
+    let mut other = store.open_native_job_store().unwrap();
+    let (staged, committed) =
+        stage_long_conversation(directory.path(), &mut store, 20_000, 0, move |written| {
+            if written == 2 {
+                let commit = serde_json::from_value(json!({
+                    "expectedRevision": 1, "root": {"marker":"newer-local"}
+                }))
+                .unwrap();
+                other.commit(&commit).unwrap();
+            }
+        });
+    assert!(matches!(
+        staged,
+        Err(StoreError::RevisionConflict {
+            expected: 1,
+            actual: 2
+        })
+    ));
+    assert_eq!(committed.len(), 2);
+    assert_eq!(stage_count(&store), 0);
+    assert_eq!(store.materialize(None).unwrap()["marker"], "newer-local");
+}

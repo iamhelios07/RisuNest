@@ -652,29 +652,93 @@ pub(crate) fn after_stage_batch(hook: Option<Box<dyn FnMut(usize, std::time::Dur
     AFTER_STAGE_BATCH.with(|slot| *slot.borrow_mut() = hook);
 }
 
+/// One write a stage batch holds: a record's own rows, declaring how many
+/// messages it has, or a run of those messages.
+enum StageWrite {
+    Record {
+        record: PreparedRecord,
+        message_count: u64,
+    },
+    Messages {
+        character_id: String,
+        conversation_id: String,
+        first: usize,
+        messages: Vec<rows::SerializedMessage>,
+    },
+}
+
 /// Records prepared outside any transaction and waiting to be written into
 /// the stage together.
 struct StageBatch {
-    records: Vec<PreparedRecord>,
+    writes: Vec<StageWrite>,
+    records: usize,
     work: u64,
     bytes: u64,
     written: usize,
 }
 
 impl StageBatch {
-    fn push(&mut self, record: PreparedRecord, bytes: u64) {
-        self.work = self.work.saturating_add(1).saturating_add(
-            record
-                .messages
-                .as_ref()
-                .map_or(0, |messages| messages.len() as u64),
-        );
+    /// Adds one record, writing the batch whenever it fills. A conversation's
+    /// messages are spread over as many batches as the bounds need, since the
+    /// stage is invisible until activation and one long conversation would
+    /// otherwise be one transaction.
+    fn push(
+        &mut self,
+        connection: &mut rusqlite::Connection,
+        generation: &str,
+        expected_revision: i64,
+        mut record: PreparedRecord,
+        bytes: u64,
+    ) -> StoreResult<()> {
+        let messages = record.messages.take();
+        let conversation = match &record.locator {
+            LogicalRecordLocator::Conversation {
+                character_id,
+                conversation_id,
+            } => Some((character_id.clone(), conversation_id.clone())),
+            _ => None,
+        };
+        self.records += 1;
+        self.work = self.work.saturating_add(1);
         self.bytes = self.bytes.saturating_add(bytes);
-        self.records.push(record);
+        self.writes.push(StageWrite::Record {
+            record,
+            message_count: messages.as_ref().map_or(0, |messages| messages.len() as u64),
+        });
+        if let (Some((character_id, conversation_id)), Some(messages)) = (conversation, messages) {
+            let mut first = 0;
+            let mut messages = messages.into_iter().peekable();
+            while messages.peek().is_some() {
+                if self.full() {
+                    self.write(connection, generation, expected_revision)?;
+                }
+                let mut run = Vec::new();
+                while !self.full() {
+                    let Some(message) = messages.next() else {
+                        break;
+                    };
+                    self.work = self.work.saturating_add(1);
+                    self.bytes = self.bytes.saturating_add(message.byte_len());
+                    run.push(message);
+                }
+                let count = run.len();
+                self.writes.push(StageWrite::Messages {
+                    character_id: character_id.clone(),
+                    conversation_id: conversation_id.clone(),
+                    first,
+                    messages: run,
+                });
+                first += count;
+            }
+        }
+        if self.full() {
+            self.write(connection, generation, expected_revision)?;
+        }
+        Ok(())
     }
 
     fn full(&self) -> bool {
-        self.records.len() >= STAGE_BATCH_RECORDS
+        self.records >= STAGE_BATCH_RECORDS
             || self.work >= STAGE_BATCH_WORK
             || self.bytes >= STAGE_BATCH_BYTES
     }
@@ -688,7 +752,7 @@ impl StageBatch {
         generation: &str,
         expected_revision: i64,
     ) -> StoreResult<()> {
-        if self.records.is_empty() {
+        if self.writes.is_empty() {
             return Ok(());
         }
         #[cfg(test)]
@@ -701,16 +765,35 @@ impl StageBatch {
                 actual: actual_revision,
             });
         }
-        for record in self.records.drain(..) {
-            rows::apply_serialized_record(
-                &transaction,
-                generation,
-                &record.locator,
-                &record.envelope,
-                record.messages.as_deref(),
-            )?;
+        for write in self.writes.drain(..) {
+            match write {
+                StageWrite::Record {
+                    record,
+                    message_count,
+                } => rows::apply_serialized_record_rows(
+                    &transaction,
+                    generation,
+                    &record.locator,
+                    &record.envelope,
+                    message_count,
+                )?,
+                StageWrite::Messages {
+                    character_id,
+                    conversation_id,
+                    first,
+                    messages,
+                } => rows::insert_serialized_messages(
+                    &transaction,
+                    generation,
+                    &character_id,
+                    &conversation_id,
+                    first,
+                    &messages,
+                )?,
+            }
         }
         transaction.commit()?;
+        self.records = 0;
         self.work = 0;
         self.bytes = 0;
         self.written += 1;
@@ -755,7 +838,8 @@ where
     let mut deferred_conversations = Vec::new();
     let mut saw_root = false;
     let mut batch = StageBatch {
-        records: Vec::new(),
+        writes: Vec::new(),
+        records: 0,
         work: 0,
         bytes: 0,
         written: 0,
@@ -766,7 +850,12 @@ where
                      locator: LogicalRecordLocator|
      -> StoreResult<()> {
         let envelope = read_record(staging_root, content, &record, &locator)?;
-        let (bytes, _) = dependent_cost(objects, &envelope)?;
+        let (mut bytes, _) = dependent_cost(objects, &envelope)?;
+        // A conversation's pages are counted message by message as they join
+        // a batch.
+        if matches!(locator, LogicalRecordLocator::Conversation { .. }) {
+            bytes = 0;
+        }
         let prepared = prepare_record(
             connection,
             &cas,
@@ -776,11 +865,13 @@ where
             envelope,
             local_root.as_ref(),
         )?;
-        batch.push(prepared, record.byte_length.saturating_add(bytes));
-        if batch.full() {
-            batch.write(connection, generation, expected_revision)?;
-        }
-        Ok(())
+        batch.push(
+            connection,
+            generation,
+            expected_revision,
+            prepared,
+            record.byte_length.saturating_add(bytes),
+        )
     };
     for record in records {
         let record = record?;
