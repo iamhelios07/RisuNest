@@ -338,6 +338,18 @@ impl JobStore {
         rows.map(|row| Self::decode(row.map_err(failure)?))
             .collect()
     }
+    /// Forgets a job's receive hold without rewriting anything else in its row,
+    /// so a summary settled meanwhile stays as written.
+    pub fn release_receive_artifacts(&self, id: &str) -> Result<()> {
+        self.0
+            .execute(
+                "UPDATE external_requests SET value=json_set(value,'$.receiveArtifacts',NULL)
+                 WHERE id=?1 AND json_extract(value,'$.receiveArtifacts')='held'",
+                [id],
+            )
+            .map_err(failure)?;
+        Ok(())
+    }
     /// Every live job plus a bounded recent terminal history for renderer state.
     pub fn list_for_state(&self) -> Result<Vec<DurableJob>> {
         let mut result = self.list_pending()?;

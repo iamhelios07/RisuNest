@@ -7,7 +7,7 @@ use super::{
 use crate::external_storage::{
     content_store::{ContentStore, ObjectSource},
     job_store::{DurableJob, JobCommandState, JobStore, ReceiveArtifacts},
-    receive_artifacts::{self, Owners},
+    receive_artifacts::{self, Owners, SettlementPass},
     runtime::job_directory,
     snapshot_restore::PreparedRemoteSnapshot,
 };
@@ -468,15 +468,8 @@ fn a_link_in_a_receive_is_never_followed() {
     activate_prepared_receive(&mut store, &prepared, &job.admission_identity).unwrap();
     settle(&jobs, &job.id, "succeeded");
     let receive = receive_directory(root, &job.id);
-    let inner = receive.join("external-storage").join("linked");
-    link_directory(outside.path(), &inner);
-    assert!(pass(root, &store, &state, &admission, &job).is_empty());
-    assert!(receive.join("pack-synthetic").is_file());
-    assert!(marked(root, &job.id));
-    assert_eq!(fs::read(outside.path().join("keep")).unwrap(), b"outside the job");
-    remove_link(&inner);
 
-    // The receive directory itself redirected elsewhere.
+    // The receive directory itself redirected elsewhere stays where it is.
     let kept = receive.with_file_name("receive-kept");
     fs::rename(&receive, &kept).unwrap();
     link_directory(outside.path(), &receive);
@@ -486,7 +479,78 @@ fn a_link_in_a_receive_is_never_followed() {
     remove_link(&receive);
     fs::rename(&kept, &receive).unwrap();
 
+    // A link inside moves aside with the tree, and its removal stops there.
+    link_directory(outside.path(), &receive.join("external-storage").join("linked"));
+    let moved = receive.with_file_name(".reclaim-receive");
+    for _ in 0..2 {
+        assert_eq!(pass(root, &store, &state, &admission, &job), vec![job.id.clone()]);
+        assert!(!receive.exists());
+        assert!(moved.join("external-storage").join("linked").exists());
+        assert!(marked(root, &job.id));
+        assert_eq!(fs::read(outside.path().join("keep")).unwrap(), b"outside the job");
+    }
+    remove_link(&moved.join("external-storage").join("linked"));
+
     assert_eq!(pass(root, &store, &state, &admission, &job), vec![job.id.clone()]);
-    assert!(!receive.exists());
+    assert!(!job_directory(root, "connection", &job.id).exists());
+    assert!(!marked(root, &job.id));
     assert_eq!(fs::read(outside.path().join("keep")).unwrap(), b"outside the job");
+}
+
+#[test]
+fn releasing_a_hold_keeps_a_summary_settled_meanwhile() {
+    let (directory, mut store, job, template) = fixture();
+    let root = directory.path();
+    let jobs = JobStore::open(root).unwrap();
+    let state = JobCommandState::default();
+    let admission = Admission::default();
+    held(root, &jobs, &job);
+    let prepared = prepare(&mut store, &job, receive_input(root, &job, &template, "snapshot"));
+    activate_prepared_receive(&mut store, &prepared, &job.admission_identity).unwrap();
+    settle(&jobs, &job.id, "succeeded");
+    // The copy a removal starts from, then a reconciliation settling the row.
+    let (_, claim) = state.claim(&job).unwrap();
+    let detached = receive_artifacts::detach_connection(
+        &Owners { root, state: &state, store: &store, admission: &admission, repository_id: "repository" },
+        &claim,
+        "connection",
+    )
+    .unwrap();
+    drop(claim);
+    let mut reconciled = jobs.read(&job.id).unwrap();
+    reconciled.summary["result"] = json!({"snapshotId":"snapshot","receivedRevision":"1"});
+    reconciled.summary["updatedAtMs"] = json!("99");
+    jobs.put(&reconciled).unwrap();
+    receive_artifacts::remove_detached(root, &detached);
+
+    let released = jobs.read(&job.id).unwrap();
+    assert_eq!(released.receive_artifacts, None);
+    let mut expected = serde_json::to_value(&reconciled).unwrap();
+    expected["receiveArtifacts"] = serde_json::Value::Null;
+    assert_eq!(serde_json::to_value(&released).unwrap(), expected);
+    // Nothing is rewritten once the hold is gone.
+    let mut later = released.clone();
+    later.summary["updatedAtMs"] = json!("100");
+    jobs.put(&later).unwrap();
+    jobs.release_receive_artifacts(&job.id).unwrap();
+    assert_eq!(jobs.read(&job.id).unwrap().summary, later.summary);
+}
+
+#[test]
+fn only_an_outcome_that_releases_nothing_of_its_own_passes_before_it_is_published() {
+    let (_directory, _store, mut job, _template) = fixture();
+    for (state, phase, expected) in [
+        ("waiting", "remote-apply", SettlementPass::Skip),
+        ("succeeded", "complete", SettlementPass::AfterOutcome),
+        ("failed", "paused", SettlementPass::AfterOutcome),
+        ("cancelled", "cancelled", SettlementPass::AfterOutcome),
+        ("waiting", "paused", SettlementPass::BeforeOutcome),
+        ("waiting", "conflict-preservation-paused", SettlementPass::BeforeOutcome),
+        ("conflict", "conflict-choice", SettlementPass::BeforeOutcome),
+        ("uncertain", "publication-unknown", SettlementPass::BeforeOutcome),
+    ] {
+        job.summary["state"] = json!(state);
+        job.summary["phase"] = json!(phase);
+        assert_eq!(receive_artifacts::settlement_pass(&job), expected, "{state}/{phase}");
+    }
 }

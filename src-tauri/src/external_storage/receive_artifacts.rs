@@ -100,6 +100,30 @@ pub(crate) fn reclaimable(
     Ok(job.terminal() && matches!(intent.phase.as_str(), "complete" | "cancelled" | "stale"))
 }
 
+/// Where a worker's pass goes relative to publishing the outcome it settled
+/// on. Whoever reads that outcome may act on the job's connection at once,
+/// and the claim the pass holds would refuse them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SettlementPass {
+    /// A receive waiting for its apply, which runs a pass of its own.
+    Skip,
+    /// The job stays open, so the pass cannot release its own bodies and
+    /// nothing is lost by finishing it first.
+    BeforeOutcome,
+    /// Only the settled row releases the job's own bodies.
+    AfterOutcome,
+}
+
+pub(crate) fn settlement_pass(settled: &DurableJob) -> SettlementPass {
+    if settled.terminal() {
+        SettlementPass::AfterOutcome
+    } else if settled.summary["state"] == "waiting" && settled.summary["phase"] == "remote-apply" {
+        SettlementPass::Skip
+    } else {
+        SettlementPass::BeforeOutcome
+    }
+}
+
 pub(crate) struct Owners<'a> {
     pub root: &'a Path,
     pub state: &'a JobCommandState,
@@ -118,13 +142,19 @@ pub(crate) fn detach_connection(
     claim.require_connection(owners.state, connection_id)?;
     let jobs = JobStore::open(owners.root)?;
     let mut detached = Vec::new();
+    // Only a move counts, so jobs whose leftovers are kept for good never
+    // crowd the others out.
+    let mut moved = 0;
     for job in jobs.list_holding_receive_artifacts(connection_id)? {
-        if detached.len() == JOBS_PER_PASS {
+        if moved == JOBS_PER_PASS {
             break;
         }
         match detach(owners, &job) {
-            Ok(true) => detached.push(job.id),
-            Ok(false) => {}
+            Ok(Some(renamed)) => {
+                moved += usize::from(renamed);
+                detached.push(job.id);
+            }
+            Ok(None) => {}
             Err(error) => crate::nlog!(
                 "warn",
                 "External receive bodies were kept for a later pass: {error}"
@@ -134,7 +164,9 @@ pub(crate) fn detach_connection(
     Ok(detached)
 }
 
-fn detach(owners: &Owners<'_>, job: &DurableJob) -> Result<bool> {
+/// `None` while something still owns the job's bodies, otherwise whether any
+/// of them moved aside now.
+fn detach(owners: &Owners<'_>, job: &DurableJob) -> Result<Option<bool>> {
     let prepared = owners
         .state
         .prepared_receives
@@ -143,14 +175,13 @@ fn detach(owners: &Owners<'_>, job: &DurableJob) -> Result<bool> {
         .contains_key(&job.id);
     let _admission = owners.admission.file(false).map_err(local_error)?;
     if !reclaimable(owners.store, job, owners.repository_id, prepared)? {
-        return Ok(false);
+        return Ok(None);
     }
     let directory = job_directory(owners.root, &job.request.connection_id, &job.id);
     if !managed_directory(owners.root, &directory).map_err(io_error)? {
-        return Ok(true);
+        return Ok(Some(false));
     }
-    move_aside(&directory).map_err(io_error)?;
-    Ok(true)
+    move_aside(&directory).map(Some).map_err(io_error)
 }
 
 /// Every directory from the external storage root down to the job's own must
@@ -176,10 +207,12 @@ fn managed_directory(root: &Path, directory: &Path) -> io::Result<bool> {
     Ok(true)
 }
 
-/// Checks every artifact before moving any, so a redirected entry leaves the
-/// job's bodies exactly where they were. On Windows an open file inside one
+/// Checks each artifact itself before moving any, so a redirected one leaves
+/// the job's bodies where they were. A rename never follows a link inside the
+/// tree, and [`remove_tree`] stops at one. On Windows an open file inside one
 /// refuses the move, which postpones the whole job before anything is deleted.
-fn move_aside(directory: &Path) -> io::Result<()> {
+/// Returns whether anything was moved.
+fn move_aside(directory: &Path) -> io::Result<bool> {
     let mut present = Vec::new();
     for name in ARTIFACTS {
         let path = directory.join(name);
@@ -189,8 +222,10 @@ fn move_aside(directory: &Path) -> io::Result<()> {
             Ok(metadata) if is_link_like(&metadata) || !metadata.is_dir() => return Err(linked()),
             Ok(_) => {}
         }
-        check_tree(&path)?;
         present.push((path, directory.join(moved_name(name))));
+    }
+    if present.is_empty() {
+        return Ok(false);
     }
     for (path, moved) in present {
         // What an interrupted pass had already moved is garbage by now.
@@ -198,20 +233,7 @@ fn move_aside(directory: &Path) -> io::Result<()> {
         fs::rename(&path, &moved)?;
     }
     sync_directory(directory)?;
-    Ok(())
-}
-
-fn check_tree(path: &Path) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if is_link_like(&metadata) {
-        return Err(linked());
-    }
-    if metadata.is_dir() {
-        for entry in fs::read_dir(path)? {
-            check_tree(&entry?.path())?;
-        }
-    }
-    Ok(())
+    Ok(true)
 }
 
 /// Deletes without ever following a link; a link stops the removal instead.
@@ -264,11 +286,7 @@ fn remove_job(root: &Path, id: &str) -> Result<()> {
             sync_directory(&directory).map_err(local_error)?;
         }
     }
-    let mut job = jobs.read(id)?;
-    if job.receive_artifacts.take().is_some() {
-        jobs.put(&job)?;
-    }
-    Ok(())
+    jobs.release_receive_artifacts(id)
 }
 
 /// The pass for the connection `claim` holds, as the running application sees

@@ -6,6 +6,7 @@ use super::{
     job_store::{DurableJob, JobCommandState, JobKind, JobStore, Session, StartJobRequest},
     leases,
     publication::{PublicationMode, PublicationPermit},
+    receive_artifacts::{settlement_pass, SettlementPass},
 };
 use crate::persistent_store::{
     self,
@@ -418,6 +419,12 @@ pub(crate) async fn external_storage_start_job(
             let current = command_state.session.lock().map_err(local_error)?;
             require_session(&request, &current)?;
         }
+        // What was read before a settled job let go of the connection is stale.
+        if wait_for_settled_claim(&app, &pending.request.connection_id).await? {
+            pending = reconcile_job(&app, store.read(&pending.id)?)?;
+            let current = command_state.session.lock().map_err(local_error)?;
+            require_session(&request, &current)?;
+        }
         if pending.summary["state"] == "uncertain"
             && pending.summary["phase"] == "publication-unknown"
             && request.reason.as_deref() == Some("automatic")
@@ -469,6 +476,7 @@ pub(crate) async fn external_storage_start_job(
     // Section publication is not wired yet, so a backup captures the library
     // only and no device capture phase is scheduled.
     let device = false;
+    wait_for_settled_claim(&app, &request.connection_id).await?;
     let identity = native_store(&app)?
         .external_identity()
         .map_err(local_error)?;
@@ -547,6 +555,25 @@ pub(crate) async fn wait_for_job_release(app: &AppHandle, id: &str) -> Result<()
             return Err(ProviderError::new(ErrorKind::Transient));
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+/// Waits while a job of `connection` that has already settled still holds its
+/// claim, as its receive bodies move aside, and returns whether it waited. A
+/// job still running is left to the caller's own checks.
+async fn wait_for_settled_claim(app: &AppHandle, connection: &str) -> Result<bool> {
+    let holder = app
+        .state::<JobCommandState>()
+        .active
+        .lock()
+        .map_err(local_error)?
+        .iter()
+        .find(|(_, (owned, _))| owned == connection)
+        .map(|(id, _)| id.clone());
+    let Some(holder) = holder else { return Ok(false) };
+    match JobStore::open(&root(app)?)?.read(&holder) {
+        Ok(job) if job.terminal() => wait_for_job_release(app, &holder).await.map(|()| true),
+        _ => Ok(false),
     }
 }
 
@@ -886,7 +913,7 @@ pub(crate) fn wake_job(app: AppHandle, id: String) -> Result<()> {
         };
         let confirmed = result.as_ref().ok().and_then(completed_revision);
         let cancelled = cancel.check().is_err();
-        let persisted = (|| -> Result<()> {
+        let settled = (|| -> Result<DurableJob> {
             let store = JobStore::open(&root(&app)?)?;
             let mut job = store.read(&id)?;
             match result {
@@ -998,26 +1025,30 @@ pub(crate) fn wake_job(app: AppHandle, id: String) -> Result<()> {
                 }
             }
             job.summary["updatedAtMs"] = json!(now_ms().to_string());
-            store.put(&job)?;
-            Ok(())
+            Ok(job)
         })();
-        let outcome_persisted = persisted.is_ok();
-        if !outcome_persisted {
-            crate::nlog!("error", "External job outcome could not be persisted");
-        }
-        // The worker has returned and its outcome is settled. The claim keeps
-        // every job of this connection from starting while bodies move aside.
-        let detached = if outcome_persisted {
+        // The worker has returned. The claim keeps every job of this
+        // connection from starting while bodies move aside.
+        let pass = settled.as_ref().map_or(SettlementPass::Skip, settlement_pass);
+        let move_aside = || {
             let (pass_app, pass_claim) = (app.clone(), claim.clone());
             let connection = job.request.connection_id.clone();
             tokio::task::spawn_blocking(move || {
                 super::receive_artifacts::detach_claimed(&pass_app, &pass_claim, &connection)
             })
-            .await
-            .unwrap_or_default()
-        } else {
-            Vec::new()
         };
+        let mut detached = Vec::new();
+        if pass == SettlementPass::BeforeOutcome {
+            detached = move_aside().await.unwrap_or_default();
+        }
+        let outcome_persisted = settled
+            .and_then(|settled| JobStore::open(&root(&app)?)?.put(&settled))
+            .is_ok();
+        if !outcome_persisted {
+            crate::nlog!("error", "External job outcome could not be persisted");
+        } else if pass == SettlementPass::AfterOutcome {
+            detached = move_aside().await.unwrap_or_default();
+        }
         drop(claim);
         super::receive_artifacts::remove_detached_later(&app, detached);
         if outcome_persisted {
