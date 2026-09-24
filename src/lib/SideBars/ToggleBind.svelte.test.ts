@@ -80,6 +80,10 @@ it('binds the current toggle values, counts later changes and saves them', async
 it('unbinds only after confirmation and keeps the binding when declined', async () => {
     chat().savedToggleValues = { toggle_a: '1' }
     await tick()
+    const unbind = button(languageEnglish.unbindToggles)!
+    expect(unbind.classList).toContain('bg-primary-500')
+    expect(unbind.classList).toContain('text-primary-foreground')
+    expect(unbind.classList).not.toContain('text-white')
     mocks.confirm.mockResolvedValueOnce(false)
     button(languageEnglish.unbindToggles)!.click()
     await vi.waitFor(() => expect(mocks.confirm).toHaveBeenCalledWith(languageEnglish.unbindTogglesConfirm))
@@ -97,7 +101,10 @@ it('disables binding controls but keeps the preset popup reachable while binding
     chat().savedToggleValues = { toggle_a: '0' }
     DBState.db.disableToggleBinding = true
     await tick()
-    expect(button(languageEnglish.unbindToggles)!.disabled).toBe(true)
+    const unbind = button(languageEnglish.unbindToggles)!
+    expect(unbind.disabled).toBe(true)
+    expect(unbind.classList).toContain('text-primary-foreground')
+    expect(unbind.classList).toContain('disabled:opacity-40')
     const save = button(languageEnglish.saveToggleChanges)!
     expect(save.disabled).toBe(true)
     expect(save.textContent).toContain(languageEnglish.saveTogglesLabel)

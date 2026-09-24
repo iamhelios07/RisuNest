@@ -44,7 +44,7 @@
     <div class="flex gap-1 items-stretch">
         {#if bound}
             <button
-                class="{button} shrink-0 w-10 px-0 bg-primary-500 border-primary-500 text-white hover:bg-primary-600"
+                class="{button} shrink-0 w-10 px-0 bg-primary-500 border-primary-500 text-primary-foreground hover:bg-primary-600"
                 title={language.unbindToggles}
                 aria-pressed="true"
                 {disabled}
