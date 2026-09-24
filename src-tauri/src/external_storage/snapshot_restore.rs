@@ -1093,58 +1093,66 @@ fn place_pack(
     Ok(())
 }
 
-/// Proves every assembly file whole and moves it where its entry belongs. One
-/// that is not what its catalog names takes its packs' markers with it, so
-/// the next attempt reads exactly those packs again.
+/// Proves every assembly file whole and gives it to every entry that shares
+/// it: a record's store and an object's file are separate places even when
+/// the bytes are the same. One that is not what its catalog names takes the
+/// markers of all its entries' packs with it, so the next attempt reads
+/// exactly those packs again.
 fn finish_assemblies(staging_root: &Path, pending: &[Pending]) -> Result<()> {
     let mut content = content_store(staging_root)?;
-    let mut finished = BTreeSet::new();
+    let mut shared: BTreeMap<&str, Vec<&Pending>> = BTreeMap::new();
     for item in pending {
         if item.packs.is_empty() {
             place_whole(None, item, &mut content)?;
-            continue;
+        } else if item.spread() {
+            shared
+                .entry(item.resolved.digest.as_str())
+                .or_default()
+                .push(item);
         }
-        if !item.spread() || !finished.insert(item.resolved.digest.as_str()) {
-            continue;
+    }
+    for (digest, items) in shared {
+        let entry = &items[0].resolved.entry;
+        if items
+            .iter()
+            .any(|item| item.resolved.entry.byte_length != entry.byte_length)
+        {
+            return Err(corrupt("entries of one content hash differ in length"));
         }
-        let ResolvedEntry {
-            entry,
-            digest,
-            destination,
-            ..
-        } = &item.resolved;
+        let record = items.iter().any(|item| item.resolved.destination.is_none());
+        // Every object of one hash is written to the same file.
+        let file = items
+            .iter()
+            .find_map(|item| item.resolved.destination.as_deref());
         let path = assembly_path(staging_root, digest);
-        let intact = match destination {
-            // A record goes into the store in memory, so it is proved from the
-            // same read.
-            None => {
-                let mut file =
-                    crate::trust_boundary::open_regular_source(&path).map_err(corrupt)?;
-                let mut bytes =
-                    Vec::with_capacity(usize::try_from(entry.byte_length).map_err(corrupt)?);
-                file.read_to_end(&mut bytes).map_err(transient)?;
-                let actual: [u8; 32] = Sha256::digest(&bytes).into();
-                (actual == entry.content_sha256 && bytes.len() as u64 == entry.byte_length)
-                    .then_some(Some(bytes))
-            }
-            Some(_) => verify(&path, entry.byte_length, digest)?.then_some(None),
+        let intact = if record {
+            // A record goes into the store in memory, so it is proved from
+            // the same read.
+            let mut source = crate::trust_boundary::open_regular_source(&path).map_err(corrupt)?;
+            let mut bytes =
+                Vec::with_capacity(usize::try_from(entry.byte_length).map_err(corrupt)?);
+            source.read_to_end(&mut bytes).map_err(transient)?;
+            let actual: [u8; 32] = Sha256::digest(&bytes).into();
+            (actual == entry.content_sha256 && bytes.len() as u64 == entry.byte_length)
+                .then_some(Some(bytes))
+        } else {
+            verify(&path, entry.byte_length, digest)?.then_some(None)
         };
         let Some(bytes) = intact else {
             let _ = fs::remove_file(&path);
-            for pack in &item.packs {
+            for pack in items.iter().flat_map(|item| &item.packs) {
                 remove_marker(staging_root, pack)?;
             }
             return Err(transient("restored entry integrity failed"));
         };
-        match (destination, bytes) {
-            (Some(destination), _) => {
+        if let Some(bytes) = bytes {
+            content.put(digest, &bytes).map_err(corrupt)?;
+        }
+        match file {
+            Some(destination) => {
                 publish_verified(&path, destination, entry.byte_length, digest)?
             }
-            (None, Some(bytes)) => {
-                content.put(digest, &bytes).map_err(corrupt)?;
-                fs::remove_file(&path).map_err(transient)?;
-            }
-            (None, None) => return Err(corrupt("record assembly was not read")),
+            None => fs::remove_file(&path).map_err(transient)?,
         }
     }
     content.commit().map_err(transient)?;

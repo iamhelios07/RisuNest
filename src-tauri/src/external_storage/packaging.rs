@@ -5027,6 +5027,62 @@ mod tests {
         });
     }
 
+    /// A record and an asset with the same bytes go to two places, the record
+    /// store and the asset's file, whether those bytes lie in one pack or are
+    /// assembled from several, and a restore interrupted between packs still
+    /// fills both when it resumes.
+    #[test]
+    fn c_a_record_and_an_asset_with_the_same_bytes_both_arrive() {
+        runtime().block_on(async {
+            let noise = |length: usize, mut state: u64| -> Vec<u8> {
+                (0..length).map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state as u8
+                }).collect()
+            };
+            for (bytes, interrupted) in [
+                (b"one pack holds both".to_vec(), false),
+                (noise(400 * 1024, 0x9e37_79b9_7f4a_7c15), false),
+                (noise(400 * 1024, 0x2545_f491_4f6c_dd1d), true),
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let provider = FakeProvider::new(false);
+                let repository = fake::repository();
+                let key = [37; 32];
+                let cancel = Cancellation::default();
+                let (capture, _) = captured(root.path(), "shared", 1, &bytes, &bytes);
+                let meta = metadata("shared", &capture);
+                let mut journal = journal(&root.path().join("job"), "job", &capture);
+                let completed = package_and_upload(capture, vec![], root.path(),
+                    &root.path().join("cache"), meta, &key, limits(128 * 1024), None,
+                    &mut journal, &provider, &repository, &PhaseProgress::silent(), &cancel)
+                    .await.unwrap();
+                let staging = root.path().join("restored");
+                if interrupted {
+                    let packs = completed.referenced_objects.iter()
+                        .filter(|object| object.role == ObjectRole::Pack)
+                        .map(|object| object.receipt.locator.object.clone())
+                        .collect::<Vec<_>>();
+                    assert!(packs.len() >= 4, "{packs:?}");
+                    provider.fail_read(&packs[packs.len() / 2], ErrorKind::Transient);
+                    assert!(snapshot_restore::download_snapshot(&completed.reference, &staging,
+                        &key, None, snapshot_restore::SourceTrust::Downloaded, &provider,
+                        &repository, &PhaseProgress::silent(), &cancel).await.is_err());
+                }
+                let restored = snapshot_restore::download_snapshot(&completed.reference, &staging,
+                    &key, None, snapshot_restore::SourceTrust::Downloaded, &provider, &repository,
+                    &PhaseProgress::silent(), &cancel).await.unwrap();
+                assert_eq!(restored.record_body(0), bytes);
+                let object = restored.objects.iter()
+                    .find(|object| object.content_hash == hex::encode(hash(&bytes))).unwrap();
+                assert_eq!(fs::read(object.source.file().unwrap()).unwrap(), bytes);
+                assert!(!staging.join("assembly").exists());
+            }
+        });
+    }
+
     /// A restore proves every body it consumes, and a body the repository
     /// already holds is proved by reading it rather than by fetching the pack
     /// that carries it. One that has been changed under its own name fails that
