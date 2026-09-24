@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 /// How many ready intents one registration covers. The format allows more; the
 /// point of the bound is that a wave is registered while the next objects are
 /// still being produced, never after the whole library is spooled.
-const REGISTRATION_WAVE: usize = 64;
+pub(super) const REGISTRATION_WAVE: usize = 64;
 use risunest_external_storage_format::{content_identity::hash, format::Descriptor};
 
 /// Reconcile answers identify an object, but not every provider supplies a

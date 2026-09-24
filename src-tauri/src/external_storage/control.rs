@@ -656,6 +656,15 @@ pub(crate) async fn upload_backup_point(
     .await
 }
 
+/// Spool bytes the sealed inventory page registering `members` objects takes
+/// at most, for the object and job identities this app names. A wave admits
+/// each member with this room, so the page that registers the wave fits.
+pub(crate) fn inventory_page_headroom(members: usize) -> u64 {
+    const PAGE: u64 = 2 * 1024;
+    const ENTRY: u64 = 512;
+    PAGE.saturating_add(ENTRY.saturating_mul(members as u64))
+}
+
 pub(crate) async fn upload_inventory_page(
     descriptor: &Descriptor,
     root_key: &[u8; 32],
@@ -2377,6 +2386,65 @@ mod tests {
                 &Cancellation::default(),
             ).await.unwrap(), RemoteBackupPointDeleteOutcome::Deleted);
         });
+    }
+
+    /// A wave reserves spool room for the page that registers it, so the page
+    /// it seals has to fit that room from one member to a full wave.
+    #[test]
+    fn an_inventory_page_fits_the_room_its_wave_reserves() {
+        let connected = connected(Arc::new(fake::FakeProvider::new(false)));
+        let descriptor = Descriptor::new(uuid::Uuid::new_v4().to_string(), None).unwrap();
+        let job = uuid::Uuid::new_v4().to_string();
+        let key = [7u8; 32];
+        let intents = (0..super::super::transfer_job::REGISTRATION_WAVE)
+            .map(|index| ObjectIntent {
+                repository_id: connected.handle.repository_id.clone(),
+                job_id: job.clone(),
+                object_id: wire::keyed_object_id(
+                    &key,
+                    &job,
+                    wire::ObjectRole::Catalog,
+                    &[index as u8; 32],
+                )
+                .unwrap(),
+                role: ObjectRole::Catalog,
+                byte_length: 256 * 1024 * 1024,
+                sha256: "11".repeat(32),
+            })
+            .collect::<Vec<_>>();
+        let plaintext_sha256 = "22".repeat(32);
+        for members in [1, intents.len()] {
+            let registrations = intents[..members]
+                .iter()
+                .map(|intent| InventoryRegistration {
+                    intent,
+                    plaintext_length: 256 * 1024 * 1024,
+                    plaintext_sha256: &plaintext_sha256,
+                })
+                .collect::<Vec<_>>();
+            let page_id = "ab".repeat(32);
+            let document = inventory_page_document(
+                &descriptor,
+                &connected.handle,
+                &job,
+                &page_id,
+                &registrations,
+            )
+            .unwrap();
+            let sealed = seal(
+                &descriptor,
+                &connected.root_key,
+                &format!("inventory-page-{page_id}"),
+                wire::ObjectRole::InventoryPage,
+                &document.encode(MAX_POINT_PLAINTEXT).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                sealed.len() as u64 <= inventory_page_headroom(members),
+                "a page of {members} members seals to {} bytes",
+                sealed.len()
+            );
+        }
     }
 
     #[test]

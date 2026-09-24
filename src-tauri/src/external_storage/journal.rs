@@ -112,10 +112,14 @@ impl SpoolBudget {
         self.limit = limit;
         self
     }
-    /// Admits one more sealed object of `bytes` or refuses it. A refusal is
-    /// transient: the job stops holding what it wrote, uploads it when it
-    /// resumes, and the budget is back when that or another job releases it.
+    #[cfg(test)]
     pub(crate) fn reserve(&self, bytes: u64) -> Result<SpoolReservation> {
+        self.try_reserve(bytes)?
+            .ok_or_else(|| ProviderError::new(ErrorKind::Transient))
+    }
+    /// Admits one more sealed object of `bytes`, or answers `None` when the
+    /// spool has no room for it until something held there is released.
+    pub(crate) fn try_reserve(&self, bytes: u64) -> Result<Option<SpoolReservation>> {
         let mut writes = SPOOL_WRITES.lock().map_err(storage)?;
         let mut used = 0u64;
         let mut largest: Option<(String, u64)> = None;
@@ -137,13 +141,21 @@ impl SpoolBudget {
                     self.job_id
                 );
             }
-            return Err(ProviderError::new(ErrorKind::Transient));
+            return Ok(None);
         }
         writes.insert(self.job_id.clone(), bytes);
-        Ok(SpoolReservation {
+        Ok(Some(SpoolReservation {
             job_id: self.job_id.clone(),
-        })
+        }))
     }
+}
+
+/// Whether a new sealed object may be written now.
+pub(crate) enum SpoolAdmission {
+    /// Charged to the budget, or written with no budget to charge.
+    Admitted(Option<SpoolReservation>),
+    /// Refused until this job or another releases what the spool holds.
+    Full,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -221,11 +233,14 @@ impl TransferJournal {
         self.spool_budget = Some(budget);
     }
     /// Admits a new sealed object of `bytes` before its file is created.
-    pub(crate) fn reserve_spool(&self, bytes: u64) -> Result<Option<SpoolReservation>> {
-        self.spool_budget
-            .as_ref()
-            .map(|budget| budget.reserve(bytes))
-            .transpose()
+    pub(crate) fn reserve_spool(&self, bytes: u64) -> Result<SpoolAdmission> {
+        let Some(budget) = &self.spool_budget else {
+            return Ok(SpoolAdmission::Admitted(None));
+        };
+        Ok(match budget.try_reserve(bytes)? {
+            Some(reservation) => SpoolAdmission::Admitted(Some(reservation)),
+            None => SpoolAdmission::Full,
+        })
     }
     /// Reopens an existing journal after its worker has exited, then removes
     /// terminal spools only when the authoritative PDS owner can be released.

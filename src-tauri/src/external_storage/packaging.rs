@@ -8,7 +8,7 @@ use super::{
         ReadReceipt, RemoteLocator, RepositoryHandle, Result,
     },
     connection_store::{ConnectionStore, UnusableReason},
-    journal::{validate_receipt, TransferJournal},
+    journal::{validate_receipt, SpoolAdmission, TransferJournal},
     package_cache::{kind_name, CatalogRange, PackageCache},
     phase_progress::PhaseProgress,
     sections::CapturedSection,
@@ -1293,7 +1293,7 @@ async fn build_entries(
     let mut family = Vec::new();
     let mut failure = None;
     while let Some(mut pack) = arriving.recv().await {
-        let sealed = async {
+        let sealed: Result<SealedObject> = async {
             pack.file
                 .as_file_mut()
                 .seek(SeekFrom::Start(0))
@@ -1306,24 +1306,49 @@ async fn build_entries(
                 &plain_hash,
             )
             .map_err(corrupt)?;
-            seal_plain_object(
-                pack.file.path(),
-                pack.length,
-                plain_hash,
-                id,
-                ObjectRole::Pack,
-                format_repository_id,
-                root_key,
-                &data_key,
-                limits,
-                cache,
-                evidence,
-                journal,
-                provider,
-                repository,
-                cancel,
-            )
-            .await
+            loop {
+                let waiting_now = waiting(&family);
+                if let Some(sealed) = seal_plain_object(
+                    pack.file.path(),
+                    pack.length,
+                    plain_hash,
+                    id.clone(),
+                    ObjectRole::Pack,
+                    format_repository_id,
+                    root_key,
+                    &data_key,
+                    limits,
+                    waiting_now,
+                    cache,
+                    evidence,
+                    journal,
+                    provider,
+                    repository,
+                    cancel,
+                )
+                .await?
+                {
+                    return Ok(sealed);
+                }
+                // The packs already sealed hold the room this one needs, and
+                // sending them gives it back.
+                if waiting_now == 0 {
+                    return Err(ProviderError::new(ErrorKind::Transient));
+                }
+                uploaded_packs.extend(
+                    upload_sealed_wave(
+                        std::mem::take(&mut family),
+                        format_repository_id,
+                        root_key,
+                        cache,
+                        journal,
+                        provider,
+                        repository,
+                        cancel,
+                    )
+                    .await?,
+                );
+            }
         }
         .await;
         match sealed {
@@ -1657,6 +1682,18 @@ enum SealedObject {
     },
 }
 
+/// How many objects of `sealed` still wait for their registration.
+fn waiting(sealed: &[SealedObject]) -> usize {
+    sealed
+        .iter()
+        .filter(|object| matches!(object, SealedObject::Pending { .. }))
+        .count()
+}
+
+/// Seals one object to join a wave in which `wave` objects already wait.
+/// `None` means the spool has no room for it yet: the caller sends the wave
+/// it holds, which releases that room, and asks again.
+#[allow(clippy::too_many_arguments)]
 async fn seal_plain_object(
     path: &Path,
     plaintext_length: u64,
@@ -1667,13 +1704,14 @@ async fn seal_plain_object(
     root_key: &[u8; 32],
     key: &[u8; 32],
     limits: PackageLimits,
+    wave: usize,
     cache: &mut PackageCache,
     evidence: &mut ObjectEvidence,
     journal: &mut TransferJournal,
     provider: &dyn Provider,
     repository: &RepositoryHandle,
     cancel: &Cancellation,
-) -> Result<SealedObject> {
+) -> Result<Option<SealedObject>> {
     let plaintext_sha256 = hex::encode(plaintext_hash);
     if let Some(value) = cache.object(
         format_repository_id,
@@ -1690,7 +1728,7 @@ async fn seal_plain_object(
         if let Some(current) = revalidate_cached_object(
             &value, cache, evidence, journal, root_key, provider, repository, cancel,
         ).await? {
-            return Ok(SealedObject::Ready(current));
+            return Ok(Some(SealedObject::Ready(current)));
         }
     }
     let wire_role = wire_role(role)?;
@@ -1717,13 +1755,13 @@ async fn seal_plain_object(
             if *length != plaintext_length || digest != &plaintext_sha256 {
                 return Err(corrupt("journal plaintext differs"));
             }
-            return Ok(SealedObject::Pending {
+            return Ok(Some(SealedObject::Pending {
                 object_id,
                 role,
                 plaintext_length,
                 plaintext_sha256,
                 ciphertext_sha256: record.intent.sha256,
-            });
+            }));
         }
         let spool = journal.spool_path(&object_id);
         let downloaded;
@@ -1801,17 +1839,23 @@ async fn seal_plain_object(
         .await
         .map_err(transient)??;
         drop(cpu);
-        return Ok(SealedObject::Pending {
+        return Ok(Some(SealedObject::Pending {
             object_id,
             role,
             plaintext_length,
             plaintext_sha256,
             ciphertext_sha256: record.intent.sha256,
-        });
+        }));
     }
     // Held until the journal answers for the file, so another job always sees
-    // either the reservation or the bytes.
-    let reservation = journal.reserve_spool(ciphertext_length)?;
+    // either the reservation or the bytes. The room includes the page that
+    // registers this object with the `wave` already waiting beside it.
+    let reservation = match journal.reserve_spool(
+        ciphertext_length.saturating_add(super::control::inventory_page_headroom(wave + 1)),
+    )? {
+        SpoolAdmission::Admitted(reservation) => reservation,
+        SpoolAdmission::Full => return Ok(None),
+    };
     let spool = journal.spool_path(&object_id);
     let input_path = path.to_path_buf();
     let spool_path = spool.clone();
@@ -1856,13 +1900,13 @@ async fn seal_plain_object(
     };
     journal.register(&intent)?;
     drop(reservation);
-    Ok(SealedObject::Pending {
+    Ok(Some(SealedObject::Pending {
         object_id,
         role,
         plaintext_length,
         plaintext_sha256,
         ciphertext_sha256,
-    })
+    }))
 }
 
 /// Registers everything this wave still owes under one page, uploads it, and
@@ -1963,6 +2007,7 @@ async fn upload_plain_object(
         root_key,
         key,
         limits,
+        0,
         cache,
         evidence,
         journal,
@@ -1970,7 +2015,8 @@ async fn upload_plain_object(
         repository,
         cancel,
     )
-    .await?;
+    .await?
+    .ok_or_else(|| ProviderError::new(ErrorKind::Transient))?;
     upload_sealed_wave(
         vec![sealed],
         format_repository_id,
@@ -2339,10 +2385,11 @@ async fn build_catalog(
         )? {
             Some(existing) => SealedObject::Ready(existing),
             None => {
-                seal_metadata_bytes(
+                seal_catalog_node(
                     &bytes,
-                    "catalog",
-                    ObjectRole::Catalog,
+                    &mut level_sealed,
+                    &mut wave_bytes,
+                    &mut level_uploaded,
                     format_repository_id,
                     root_key,
                     &metadata_key,
@@ -2429,10 +2476,11 @@ async fn build_catalog(
             )? {
                 Some(existing) => SealedObject::Ready(existing),
                 None => {
-                    seal_metadata_bytes(
+                    seal_catalog_node(
                         &bytes,
-                        "catalog",
-                        ObjectRole::Catalog,
+                        &mut level_sealed,
+                        &mut wave_bytes,
+                        &mut level_uploaded,
                         format_repository_id,
                         root_key,
                         &metadata_key,
@@ -2527,12 +2575,7 @@ const METADATA_WAVE_OBJECTS: usize = 64;
 const METADATA_WAVE_BYTES: u64 = 64 * 1024 * 1024;
 
 fn metadata_wave_due(sealed: &[SealedObject], bytes: u64) -> bool {
-    bytes >= METADATA_WAVE_BYTES
-        || sealed
-            .iter()
-            .filter(|object| matches!(object, SealedObject::Pending { .. }))
-            .count()
-            >= METADATA_WAVE_OBJECTS
+    bytes >= METADATA_WAVE_BYTES || waiting(sealed) >= METADATA_WAVE_OBJECTS
 }
 
 /// A catalog whose root is in the selected parent graph is protected with it,
@@ -2639,13 +2682,14 @@ async fn seal_metadata_bytes(
     key: &[u8; 32],
     limits: PackageLimits,
     build_root: &Path,
+    wave: usize,
     cache: &mut PackageCache,
     evidence: &mut ObjectEvidence,
     journal: &mut TransferJournal,
     provider: &dyn Provider,
     repository: &RepositoryHandle,
     cancel: &Cancellation,
-) -> Result<SealedObject> {
+) -> Result<Option<SealedObject>> {
     let mut file = tempfile::NamedTempFile::new_in(build_root).map_err(transient)?;
     file.write_all(bytes).map_err(transient)?;
     file.as_file_mut().sync_all().map_err(transient)?;
@@ -2662,6 +2706,7 @@ async fn seal_metadata_bytes(
         root_key,
         key,
         limits,
+        wave,
         cache,
         evidence,
         journal,
@@ -2670,6 +2715,70 @@ async fn seal_metadata_bytes(
         cancel,
     )
     .await
+}
+
+/// Seals one catalog node to join `wave`. When the spool has no room for it,
+/// the nodes already waiting are sent first, which releases theirs, and the
+/// node is sealed once more; a spool still full then is held by other jobs.
+#[allow(clippy::too_many_arguments)]
+async fn seal_catalog_node(
+    bytes: &[u8],
+    wave: &mut Vec<SealedObject>,
+    wave_bytes: &mut u64,
+    uploaded: &mut Vec<RemoteObject>,
+    format_repository_id: &str,
+    root_key: &[u8; 32],
+    key: &[u8; 32],
+    limits: PackageLimits,
+    build_root: &Path,
+    cache: &mut PackageCache,
+    evidence: &mut ObjectEvidence,
+    journal: &mut TransferJournal,
+    provider: &dyn Provider,
+    repository: &RepositoryHandle,
+    cancel: &Cancellation,
+) -> Result<SealedObject> {
+    loop {
+        let waiting_now = waiting(wave);
+        if let Some(sealed) = seal_metadata_bytes(
+            bytes,
+            "catalog",
+            ObjectRole::Catalog,
+            format_repository_id,
+            root_key,
+            key,
+            limits,
+            build_root,
+            waiting_now,
+            cache,
+            evidence,
+            journal,
+            provider,
+            repository,
+            cancel,
+        )
+        .await?
+        {
+            return Ok(sealed);
+        }
+        if waiting_now == 0 {
+            return Err(ProviderError::new(ErrorKind::Transient));
+        }
+        uploaded.extend(
+            upload_sealed_wave(
+                std::mem::take(wave),
+                format_repository_id,
+                root_key,
+                cache,
+                journal,
+                provider,
+                repository,
+                cancel,
+            )
+            .await?,
+        );
+        *wave_bytes = 0;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5613,6 +5722,154 @@ mod tests {
                 catalogs > 2 * METADATA_WAVE_OBJECTS,
                 "{catalogs} catalog nodes do not need more than one wave"
             );
+        });
+    }
+
+    /// The capture a stopped job published from, reopened for its next attempt.
+    fn reopened(root: &Path, reference: &super::super::capture::DurableCaptureReference) -> CapturedSnapshot {
+        let external = root.join("external-storage");
+        let expected: [u8; 32] = hex::decode(&reference.catalog_hash).unwrap().try_into().unwrap();
+        CapturedSnapshot {
+            id: reference.capture_id.clone(),
+            identity: reference.identity.clone(),
+            catalog: super::super::capture::CaptureCatalog::reopen(
+                &external.join(&reference.catalog_path),
+                &external,
+                &expected,
+                &reference.identity,
+            )
+            .unwrap(),
+            projected_records: 0,
+            shared: false,
+        }
+    }
+
+    fn held_spool(directory: &Path) -> u64 {
+        super::super::journal::held_spool_bytes(directory).unwrap_or(0)
+    }
+
+    /// A spool with room for a couple of objects still carries a publication
+    /// to the end: what is already sealed is sent to make room for the next
+    /// pack or catalog node, and the spool never holds more than its budget.
+    #[test]
+    fn c_a_spool_with_room_for_two_objects_still_finishes_the_publication() {
+        for limit in [12 * 1024, 9 * 1024] {
+            runtime().block_on(async {
+                let root = tempfile::tempdir().unwrap();
+                let provider = FakeProvider::new(false);
+                let repository = fake::repository();
+                let capture = captured_record_window(root.path(), "tight", 1, 2000, 0, 0, 0);
+                let meta = metadata("tight", &capture);
+                let directory = root.path().join("tight-job");
+                let job = format!("tight-{}", uuid::Uuid::new_v4());
+                let mut transfer = journal(&directory, &job, &capture);
+                let holder = (job.clone(), directory.clone());
+                transfer.set_spool_budget(
+                    super::super::journal::SpoolBudget::new(job.clone(), move || {
+                        Ok(vec![holder.clone()])
+                    })
+                    .with_limit(limit),
+                );
+                let (peak, stop, sampler) = peak_sampler(directory.clone(), held_spool);
+                let completed = package_and_upload(
+                    capture, vec![], root.path(), &root.path().join("cache"), meta, &[5; 32],
+                    limits(4096), None, &mut transfer, &provider, &repository,
+                    &PhaseProgress::silent(), &Cancellation::default(),
+                )
+                .await;
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                sampler.join().unwrap();
+                let completed = completed.unwrap_or_else(|error| {
+                    panic!("a {limit}-byte spool stopped the publication: {:?}", error.kind)
+                });
+                assert!(
+                    completed
+                        .referenced_objects
+                        .iter()
+                        .filter(|object| object.role == ObjectRole::Pack)
+                        .count()
+                        > 2
+                );
+                let peak = peak.load(std::sync::atomic::Ordering::Relaxed);
+                assert!(peak <= limit, "{peak} bytes held against a {limit}-byte spool");
+            });
+        }
+    }
+
+    /// A job that another job crowds out of the spool stops without holding
+    /// more than the budget, and the same journal and capture resumed beside
+    /// a peer that still holds most of it finish one object at a time.
+    #[test]
+    fn c_a_job_crowded_out_of_the_spool_resumes_beside_the_job_that_holds_it() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let limit = 12 * 1024;
+            let capture = captured_record_window(root.path(), "crowded", 1, 2000, 0, 0, 0);
+            let reference = capture.durable_reference(root.path()).unwrap();
+            let directory = root.path().join("crowded-job");
+            let peer = root.path().join("peer-job");
+            fs::create_dir_all(&peer).unwrap();
+            let job = format!("crowded-{}", uuid::Uuid::new_v4());
+            // The peer takes the whole spool once this job has admitted a few
+            // objects.
+            let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let budget = |grow_after: Option<usize>| {
+                let holders = vec![
+                    (job.clone(), directory.clone()),
+                    ("peer".to_owned(), peer.clone()),
+                ];
+                let asked = asked.clone();
+                let peer = peer.clone();
+                super::super::journal::SpoolBudget::new(job.clone(), move || {
+                    let count = asked.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if grow_after.is_some_and(|after| count == after) {
+                        fs::write(peer.join("held.spool"), vec![0u8; limit as usize])
+                            .map_err(|_| ProviderError::new(ErrorKind::Transient))?;
+                    }
+                    Ok(holders.clone())
+                })
+                .with_limit(limit)
+            };
+
+            let meta = metadata("crowded", &capture);
+            let mut transfer = journal(&directory, &job, &capture);
+            transfer.set_spool_budget(budget(Some(8)));
+            let error = package_and_upload(
+                capture, vec![], root.path(), &root.path().join("cache"), meta, &[5; 32],
+                limits(4096), None, &mut transfer, &provider, &repository,
+                &PhaseProgress::silent(), &Cancellation::default(),
+            )
+            .await
+            .err()
+            .expect("a full spool stops the job");
+            assert_eq!(error.kind, ErrorKind::Transient);
+            drop(transfer);
+            let first = provider.uploaded_ids().len();
+            assert!(first > 0);
+            assert!(held_spool(&directory) <= limit);
+
+            // Most of the spool stays with the peer.
+            fs::write(peer.join("held.spool"), vec![0u8; 5 * 1024]).unwrap();
+            let capture = reopened(root.path(), &reference);
+            let meta = metadata("crowded", &capture);
+            let mut transfer = journal(&directory, &job, &capture);
+            transfer.set_spool_budget(budget(None));
+            let (peak, stop, sampler) = peak_sampler(directory.clone(), held_spool);
+            let completed = package_and_upload(
+                capture, vec![], root.path(), &root.path().join("cache"), meta, &[5; 32],
+                limits(4096), None, &mut transfer, &provider, &repository,
+                &PhaseProgress::silent(), &Cancellation::default(),
+            )
+            .await;
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            sampler.join().unwrap();
+            let completed = completed.unwrap();
+            assert!(provider.uploaded_ids().len() > first);
+            assert!(completed.referenced_objects.len() > 2);
+            let peak = peak.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(peak + 5 * 1024 <= limit, "{peak} bytes held beside the peer's 5 KiB");
         });
     }
 
