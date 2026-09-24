@@ -10,7 +10,7 @@ use super::{
         Cancellation, Collection, ErrorKind, HeadBytes, ObjectIntent, ObjectReceipt, ObjectRole,
         Provider, ProviderError, ReadReceipt, RemoteLocator, RepositoryHandle, Result,
     },
-    journal::TransferJournal,
+    journal::{SpoolAdmission, TransferJournal},
     packaging::{native_role, wire_role, RemoteObject},
     publication::{Attempt, HeadObservation, Outcome, PublicationMode, PublicationWrite},
     transfer::SpoolSink,
@@ -889,6 +889,19 @@ async fn upload_control_object(
         if ciphertext.len() as u64 > MAX_POINT_CIPHERTEXT {
             return Err(ProviderError::new(ErrorKind::FileTooLarge));
         }
+        // Charged to the transfer spool before the file exists, with room for
+        // the page that registers it. A page is what sends the wave it
+        // registers, so it is charged without ever being refused.
+        let _room = if role == ObjectRole::InventoryPage {
+            journal.charge_page(ciphertext.len() as u64)?
+        } else {
+            match journal.reserve_spool(
+                (ciphertext.len() as u64).saturating_add(inventory_page_headroom(1)),
+            )? {
+                SpoolAdmission::Admitted(room) => room,
+                SpoolAdmission::Full => return Err(ProviderError::new(ErrorKind::Transient)),
+            }
+        };
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -2385,6 +2398,88 @@ mod tests {
                 &stored,
                 &Cancellation::default(),
             ).await.unwrap(), RemoteBackupPointDeleteOutcome::Deleted);
+        });
+    }
+
+    /// A control object is charged to the transfer spool before its file is
+    /// written. While another job holds the spool, a point is refused without
+    /// leaving a file; once there is room it is sent with its page, and
+    /// neither is left behind.
+    #[test]
+    fn a_backup_point_waits_for_spool_room_before_it_is_written() {
+        runtime().block_on(async {
+            let provider = Arc::new(fake::FakeProvider::new(false));
+            let connected = connected(provider.clone());
+            let root = tempfile::tempdir().unwrap();
+            let peer = tempfile::tempdir().unwrap();
+            let job = format!("point-{}", uuid::Uuid::new_v4());
+            let identity = JobIdentity {
+                job_id: job.clone(),
+                connection_id: "connection".into(),
+                repository_id: connected.handle.repository_id.clone(),
+                capture_id: "capture".into(),
+                capture: CaptureIdentity {
+                    store_id: "store".into(),
+                    library_epoch: "epoch".into(),
+                    generation: "generation".into(),
+                    selection_epoch: "selection".into(),
+                    revision: 1,
+                },
+            };
+            let limit = 16 * 1024;
+            let held = peer.path().join("held.spool");
+            fs::write(&held, vec![0u8; limit as usize - 1024]).unwrap();
+            let mut journal = TransferJournal::open(root.path(), identity).unwrap();
+            let holders = vec![
+                (job.clone(), root.path().to_path_buf()),
+                ("peer".to_owned(), peer.path().to_path_buf()),
+            ];
+            journal.set_spool_budget(
+                super::super::journal::SpoolBudget::new(job, move || Ok(holders.clone()))
+                    .with_limit(limit),
+            );
+            let point = || {
+                BackupPointDocument::single(
+                    &connected.stored.descriptor,
+                    "charged".into(),
+                    BackupPointKind::Manual,
+                    1,
+                    bundle(&connected.handle, "bundle"),
+                )
+                .unwrap()
+            };
+            let error = upload_backup_point(
+                &connected.stored.descriptor,
+                &connected.root_key,
+                point(),
+                &mut journal,
+                connected.provider.as_ref(),
+                &connected.handle,
+                &Cancellation::default(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.kind, ErrorKind::Transient);
+            assert_eq!(super::super::journal::held_spool_bytes(root.path()).unwrap(), 0);
+            assert_eq!(journal.record("backup-point-charged").unwrap().map(|_| ()), None);
+            assert!(provider.uploaded_ids().is_empty());
+
+            fs::write(&held, b"").unwrap();
+            upload_backup_point(
+                &connected.stored.descriptor,
+                &connected.root_key,
+                point(),
+                &mut journal,
+                connected.provider.as_ref(),
+                &connected.handle,
+                &Cancellation::default(),
+            )
+            .await
+            .unwrap();
+            let uploaded = provider.uploaded_ids();
+            assert!(uploaded.iter().any(|id| id == "backup-point-charged"));
+            assert!(uploaded.iter().any(|id| id.starts_with("inventory-page-")));
+            assert_eq!(super::super::journal::held_spool_bytes(root.path()).unwrap(), 0);
         });
     }
 

@@ -8,7 +8,10 @@ use super::{
         ReadReceipt, RemoteLocator, RepositoryHandle, Result,
     },
     connection_store::{ConnectionStore, UnusableReason},
-    journal::{validate_receipt, SpoolAdmission, TransferJournal},
+    journal::{
+        validate_receipt, FamilyPermit, PackFamilies, SpoolAdmission, TransferJournal,
+        ACTIVE_PACK_FAMILIES,
+    },
     package_cache::{kind_name, CatalogRange, PackageCache},
     phase_progress::PhaseProgress,
     sections::CapturedSection,
@@ -1105,6 +1108,7 @@ struct PendingEntry {
 struct PendingPack {
     file: tempfile::NamedTempFile,
     length: u64,
+    family: FamilyPermit,
 }
 
 /// The same envelope and SDK calculation bounds packing, metadata and upload.
@@ -1535,11 +1539,13 @@ async fn build_entries(
     let cancel_owned = cancel.clone();
     let producer_prepared = Arc::clone(prepared);
     let placed = placements;
-    // The pack being sealed, one waiting to be taken and one being built:
-    // three pack-sized plaintext files, against the two ciphertexts a full
-    // family holds.
+    // Each pack is a family from the moment its plaintext file is allocated
+    // until its wave is sent: one being built and one being sealed or waiting
+    // for its wave, against the families the whole application allows.
     let (built, mut arriving) = tokio::sync::mpsc::channel(1);
     let handle = tokio::runtime::Handle::current();
+    let families = journal.families();
+    let producer_families = families.clone();
     let producer = tokio::task::spawn_blocking(move || {
         prepare_packs(
             uncached,
@@ -1552,6 +1558,7 @@ async fn build_entries(
             &placed,
             &built,
             &handle,
+            &producer_families,
             &producer_prepared,
             &cancel_owned,
         )
@@ -1559,8 +1566,47 @@ async fn build_entries(
     let data_key = derive_key(root_key, format_repository_id, "data").map_err(corrupt)?;
     let mut uploaded_packs = Vec::new();
     let mut family = Vec::new();
+    // The families of the packs in `family` that still wait for their wave.
+    let mut held: Vec<FamilyPermit> = Vec::new();
     let mut failure = None;
-    while let Some(mut pack) = arriving.recv().await {
+    loop {
+        let next = if held.is_empty() {
+            arriving.recv().await
+        } else {
+            tokio::select! {
+                biased;
+                next = arriving.recv() => next,
+                // A pack of this job or another waits for a family these
+                // sealed packs hold, and sending them ends those families.
+                _ = families.contended() => {
+                    match upload_sealed_wave(
+                        std::mem::take(&mut family),
+                        format_repository_id,
+                        root_key,
+                        cache,
+                        journal,
+                        provider,
+                        repository,
+                        cancel,
+                    )
+                    .await
+                    {
+                        Ok(objects) => {
+                            uploaded_packs.extend(objects);
+                            held.clear();
+                            continue;
+                        }
+                        Err(error) => {
+                            failure = Some(error);
+                            break;
+                        }
+                    }
+                }
+            }
+        };
+        let Some(mut pack) = next else {
+            break;
+        };
         let sealed: Result<SealedObject> = async {
             pack.file
                 .as_file_mut()
@@ -1616,19 +1662,28 @@ async fn build_entries(
                     )
                     .await?,
                 );
+                held.clear();
             }
         }
         .await;
+        let PendingPack { file, family: permit, .. } = pack;
+        // The plaintext has been sealed, so the ciphertext is the only copy
+        // this pack still needs while its wave fills.
+        drop(file);
         match sealed {
-            Ok(object) => family.push(object),
+            Ok(object) => {
+                // A pack the repository already holds under these bytes has
+                // nothing left to send, so its family ends here.
+                if matches!(object, SealedObject::Pending { .. }) {
+                    held.push(permit);
+                }
+                family.push(object);
+            }
             Err(error) => {
                 failure = Some(error);
                 break;
             }
         }
-        // The plaintext has been sealed, so the ciphertext is the only copy
-        // this pack still needs while its wave fills.
-        drop(pack);
         // A pack that is sealed but not yet sent owns its ciphertext, so only
         // as many as the active family bound allows wait for a registration.
         if family.len() >= ACTIVE_PACK_FAMILIES {
@@ -1644,7 +1699,10 @@ async fn build_entries(
             )
             .await
             {
-                Ok(objects) => uploaded_packs.extend(objects),
+                Ok(objects) => {
+                    uploaded_packs.extend(objects);
+                    held.clear();
+                }
                 Err(error) => {
                     failure = Some(error);
                     break;
@@ -1652,9 +1710,14 @@ async fn build_entries(
             }
         }
     }
-    // The producer is waiting to hand over its next pack, so it has to be let
-    // go before its own outcome can be read.
+    // The producer is waiting to hand over its next pack or for a family, so
+    // it has to be let go before its own outcome can be read.
     drop(arriving);
+    // A job that stops keeps what it sealed for its next attempt, but not the
+    // families, which other jobs may be waiting for.
+    if failure.is_some() {
+        held.clear();
+    }
     let produced = producer.await;
     if let Some(error) = failure {
         return Err(error);
@@ -1679,6 +1742,7 @@ async fn build_entries(
             .await?,
         );
     }
+    drop(held);
     let mut new_entries = Vec::with_capacity(pending.len());
     for entry in pending {
         let mut used: BTreeMap<String, RemoteObject> = BTreeMap::new();
@@ -1753,6 +1817,7 @@ fn prepare_packs(
     placements: &ChunkPlacements,
     built: &tokio::sync::mpsc::Sender<PendingPack>,
     handle: &tokio::runtime::Handle,
+    families: &Arc<PackFamilies>,
     prepared: &PhaseProgress,
     cancel: &Cancellation,
 ) -> Result<(Vec<PendingEntry>, SourceHydration)> {
@@ -1816,16 +1881,18 @@ fn prepare_packs(
                     .as_ref()
                     .is_some_and(|pack| pack_full(pack.length, stored_length, target))
                 {
-                    send_pack(current.take().unwrap(), built, handle, &mut cpu)?;
+                    send_pack(current.take().unwrap(), built, &mut cpu)?;
                     completed += 1;
                 }
                 if stored_length > max_pack {
                     return Err(ProviderError::new(ErrorKind::FileTooLarge));
                 }
                 if current.is_none() {
+                    let family = family_permit(families, built, handle, &mut cpu, cancel)?;
                     current = Some(PendingPack {
                         file: tempfile::NamedTempFile::new_in(build_root).map_err(transient)?,
                         length: 0,
+                        family,
                     });
                 }
                 let pack = current.as_mut().unwrap();
@@ -1863,7 +1930,7 @@ fn prepare_packs(
         pending.push(PendingEntry { source, chunks });
     }
     if let Some(pack) = current {
-        send_pack(pack, built, handle, &mut cpu)?;
+        send_pack(pack, built, &mut cpu)?;
     }
     Ok((pending, hydration))
 }
@@ -1918,24 +1985,47 @@ fn open_library_source(
 }
 
 /// The pack is durable before it is handed over, and the producer holds no CPU
-/// permit while it waits for the consumer to take it.
+/// permit while it waits for the consumer to take it. The permit is taken
+/// again with the family of the next pack.
 fn send_pack(
     mut pack: PendingPack,
     built: &tokio::sync::mpsc::Sender<PendingPack>,
-    handle: &tokio::runtime::Handle,
     cpu: &mut Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<()> {
     pack.file.as_file_mut().sync_all().map_err(transient)?;
     cpu.take();
     built.blocking_send(pack).map_err(transient)?;
-    *cpu = Some(handle.block_on(cpu_permit())?);
     Ok(())
 }
 
-/// How many packs may own a ciphertext at once. A sealed pack waiting for its
-/// registration counts, which is why the wave that carries packs is this small
-/// while a metadata wave is not.
-const ACTIVE_PACK_FAMILIES: usize = 2;
+/// Starts the family of the next pack before its plaintext file exists, then
+/// takes the CPU permit to build it. A producer that has to wait for a family
+/// holds no CPU permit meanwhile, so the packs already built can still be
+/// sealed and sent.
+fn family_permit(
+    families: &Arc<PackFamilies>,
+    built: &tokio::sync::mpsc::Sender<PendingPack>,
+    handle: &tokio::runtime::Handle,
+    cpu: &mut Option<tokio::sync::OwnedSemaphorePermit>,
+    cancel: &Cancellation,
+) -> Result<FamilyPermit> {
+    let permit = match families.try_acquire()? {
+        Some(permit) => permit,
+        None => {
+            cpu.take();
+            let permit = handle.block_on(families.acquire(cancel, built.closed()))?;
+            // A consumer that stopped may have released the family this took.
+            if built.is_closed() {
+                return Err(ProviderError::new(ErrorKind::Cancelled));
+            }
+            permit
+        }
+    };
+    if cpu.is_none() {
+        *cpu = Some(handle.block_on(cpu_permit())?);
+    }
+    Ok(permit)
+}
 
 /// One object that either needs no upload or is sealed and registered,
 /// waiting for the wave it belongs to.
@@ -2037,11 +2127,17 @@ async fn seal_plain_object(
             spool.clone()
         } else if let Some(receipt) = &record.receipt {
             validate_receipt(&record.intent, repository, receipt)?;
+            // The copy read back to prove the object is charged to the spool
+            // budget too, until the directory holding it is gone.
+            let room = match journal.reserve_spool(record.intent.byte_length)? {
+                SpoolAdmission::Admitted(reservation) => reservation,
+                SpoolAdmission::Full => return Ok(None),
+            };
             let parent = path
                 .parent()
                 .ok_or_else(|| corrupt("plaintext path has no parent"))?;
-            downloaded = tempfile::tempdir_in(parent).map_err(transient)?;
-            let downloaded_path = downloaded.path().join("ciphertext");
+            downloaded = (tempfile::tempdir_in(parent).map_err(transient)?, room);
+            let downloaded_path = downloaded.0.path().join("ciphertext");
             let mut sink = SpoolSink::create(&downloaded_path, record.intent.byte_length)?;
             let read = provider
                 .read_object(repository, &receipt.locator, None, &mut sink, cancel)
@@ -6574,6 +6670,330 @@ mod tests {
             assert!(completed.referenced_objects.len() > 2);
             let peak = peak.load(std::sync::atomic::Ordering::Relaxed);
             assert!(peak + 5 * 1024 <= limit, "{peak} bytes held beside the peer's 5 KiB");
+        });
+    }
+
+    /// The largest value `measure` gives while a publication runs.
+    fn peak_of(
+        measure: impl Fn() -> u64 + Send + 'static,
+    ) -> (
+        std::sync::Arc<std::sync::atomic::AtomicU64>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = {
+            let peak = peak.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    peak.fetch_max(measure(), std::sync::atomic::Ordering::Relaxed);
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        };
+        (peak, stop, handle)
+    }
+
+    fn packs_of(completed: &CompletedSnapshot) -> usize {
+        completed
+            .referenced_objects
+            .iter()
+            .filter(|object| object.role == ObjectRole::Pack)
+            .count()
+    }
+
+    /// A deadlock fails the test rather than hanging it.
+    const FAMILY_TEST_BOUND: std::time::Duration = std::time::Duration::from_secs(300);
+
+    /// Two jobs on separate connections share the application's two pack
+    /// families and its spool. Neither waits for a family that only its own
+    /// wait could release: both finish and every family ends. No more pack
+    /// plaintexts are on disk than there are families, beside the one
+    /// catalog node each job may be sealing and one more a listing can catch
+    /// while a node is replaced.
+    #[test]
+    fn c_two_jobs_share_the_pack_families_and_both_finish() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let families = PackFamilies::new(ACTIVE_PACK_FAMILIES);
+            let limit = 4 * 1024 * 1024;
+            let left_job = format!("left-{}", uuid::Uuid::new_v4());
+            let right_job = format!("right-{}", uuid::Uuid::new_v4());
+            let left_directory = root.path().join("left-job");
+            let right_directory = root.path().join("right-job");
+            let holders = vec![
+                (left_job.clone(), left_directory.clone()),
+                (right_job.clone(), right_directory.clone()),
+            ];
+            let budget = |job: &str| {
+                let holders = holders.clone();
+                super::super::journal::SpoolBudget::new(job.to_owned(), move || Ok(holders.clone()))
+                    .with_limit(limit)
+                    .with_families(families.clone())
+            };
+            let left_capture = captured_record_window(root.path(), "left", 1, 2000, 0, 0, 0);
+            let right_capture = captured_record_window(root.path(), "right", 1, 2000, 0, 0, 0);
+            let left_meta = metadata("left", &left_capture);
+            let right_meta = metadata("right", &right_capture);
+            let mut left = journal(&left_directory, &left_job, &left_capture);
+            let mut right = journal(&right_directory, &right_job, &right_capture);
+            left.set_spool_budget(budget(&left_job));
+            right.set_spool_budget(budget(&right_job));
+            let builds = [root.path().join("left-cache").join("build"), root.path().join("right-cache").join("build")];
+            let (plaintexts, stop, sampler) =
+                peak_of(move || builds.iter().map(|directory| build_files(directory)).sum());
+            let (left_spool, right_spool) = (left_directory.clone(), right_directory.clone());
+            let (spooled, spool_stop, spool_sampler) =
+                peak_of(move || held_spool(&left_spool) + held_spool(&right_spool));
+            let (left_cache, right_cache) = (root.path().join("left-cache"), root.path().join("right-cache"));
+            let (key, progress, cancel) = ([5; 32], PhaseProgress::silent(), Cancellation::default());
+            let (left_done, right_done) = tokio::time::timeout(FAMILY_TEST_BOUND, async {
+                tokio::join!(
+                    package_and_upload(
+                        left_capture, vec![], root.path(), &left_cache, left_meta, &key,
+                        limits(4096), None, &mut left, &provider, &repository, &progress, &cancel,
+                    ),
+                    package_and_upload(
+                        right_capture, vec![], root.path(), &right_cache, right_meta, &key,
+                        limits(4096), None, &mut right, &provider, &repository, &progress, &cancel,
+                    ),
+                )
+            })
+            .await
+            .expect("two jobs sharing the pack families stopped making progress");
+            for stopped in [&stop, &spool_stop] {
+                stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            sampler.join().unwrap();
+            spool_sampler.join().unwrap();
+            let (left_done, right_done) = (left_done.unwrap(), right_done.unwrap());
+            assert!(packs_of(&left_done) > 2 && packs_of(&right_done) > 2);
+            assert_eq!(families.counts(), (0, 0));
+            let plaintexts = plaintexts.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(
+                plaintexts <= ACTIVE_PACK_FAMILIES as u64 + 2,
+                "{plaintexts} plaintext files beside two pack families"
+            );
+            let spooled = spooled.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(spooled <= limit, "{spooled} bytes held against a {limit}-byte spool");
+            assert_eq!(held_spool(&left_directory) + held_spool(&right_directory), 0);
+        });
+    }
+
+    /// With every family but one active elsewhere, a job still finishes. Its
+    /// producer waits for the family its own sealed pack holds, and that wait
+    /// is what sends the pack, so only one pack plaintext is ever built at a
+    /// time and the family held elsewhere is left alone.
+    #[test]
+    fn c_a_job_left_one_family_sends_each_pack_before_building_the_next() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let families = PackFamilies::new(ACTIVE_PACK_FAMILIES);
+            let elsewhere = families.try_acquire().unwrap().unwrap();
+            let capture = captured_record_window(root.path(), "single", 1, 2000, 0, 0, 0);
+            let meta = metadata("single", &capture);
+            let directory = root.path().join("single-job");
+            let job = format!("single-{}", uuid::Uuid::new_v4());
+            let mut transfer = journal(&directory, &job, &capture);
+            let holder = (job.clone(), directory.clone());
+            transfer.set_spool_budget(
+                super::super::journal::SpoolBudget::new(job.clone(), move || Ok(vec![holder.clone()]))
+                    .with_limit(4 * 1024 * 1024)
+                    .with_families(families.clone()),
+            );
+            let (plaintexts, stop, sampler) =
+                peak_sampler(root.path().join("cache").join("build"), build_files);
+            let completed = tokio::time::timeout(
+                FAMILY_TEST_BOUND,
+                package_and_upload(
+                    capture, vec![], root.path(), &root.path().join("cache"), meta, &[5; 32],
+                    limits(4096), None, &mut transfer, &provider, &repository,
+                    &PhaseProgress::silent(), &Cancellation::default(),
+                ),
+            )
+            .await
+            .expect("a job left one family stopped making progress");
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            sampler.join().unwrap();
+            assert!(packs_of(&completed.unwrap()) > 2);
+            assert_eq!(families.counts(), (1, 0));
+            // One pack plaintext, or one catalog node and the next one a
+            // listing can catch beside it.
+            let plaintexts = plaintexts.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(plaintexts <= 2, "{plaintexts} plaintext files with one family");
+            drop(elsewhere);
+            assert_eq!(families.counts(), (0, 0));
+        });
+    }
+
+    /// A producer waiting for a family stops when its job is cancelled. It is
+    /// no longer counted as waiting, it wrote no spool, and the family active
+    /// elsewhere is untouched.
+    #[test]
+    fn c_a_producer_waiting_for_a_family_stops_at_cancellation() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let families = PackFamilies::new(1);
+            let _elsewhere = families.try_acquire().unwrap().unwrap();
+            let capture = captured_record_window(root.path(), "waiting", 1, 200, 0, 0, 0);
+            let meta = metadata("waiting", &capture);
+            let directory = root.path().join("waiting-job");
+            let job = format!("waiting-{}", uuid::Uuid::new_v4());
+            let mut transfer = journal(&directory, &job, &capture);
+            let holder = (job.clone(), directory.clone());
+            transfer.set_spool_budget(
+                super::super::journal::SpoolBudget::new(job.clone(), move || Ok(vec![holder.clone()]))
+                    .with_limit(4 * 1024 * 1024)
+                    .with_families(families.clone()),
+            );
+            let cancel = Cancellation::default();
+            let (cache, progress) = (root.path().join("cache"), PhaseProgress::silent());
+            let (outcome, ()) = tokio::time::timeout(FAMILY_TEST_BOUND, async {
+                tokio::join!(
+                    package_and_upload(
+                        capture, vec![], root.path(), &cache, meta, &[5; 32],
+                        limits(4096), None, &mut transfer, &provider, &repository,
+                        &progress, &cancel,
+                    ),
+                    async {
+                        families.contended().await;
+                        cancel.cancel();
+                    },
+                )
+            })
+            .await
+            .expect("a cancelled producer kept waiting for a family");
+            assert_eq!(outcome.err().map(|error| error.kind), Some(ErrorKind::Cancelled));
+            assert_eq!(families.counts(), (1, 0));
+            assert_eq!(held_spool(&directory), 0);
+            assert!(provider.uploaded_ids().is_empty());
+        });
+    }
+
+    /// A job stopped by an upload whose outcome it could not observe keeps
+    /// its sealed packs charged to the spool but gives up its families. A
+    /// restarted budget counts those files, a peer publishes beside them
+    /// without touching them, and the stopped job later sends exactly the
+    /// ciphertext it kept, releasing each file only after its receipt.
+    #[test]
+    fn c_a_stopped_job_keeps_its_spool_but_not_its_families() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let families = PackFamilies::new(ACTIVE_PACK_FAMILIES);
+            let stopped_job = format!("stopped-{}", uuid::Uuid::new_v4());
+            let peer_job = format!("peer-{}", uuid::Uuid::new_v4());
+            let stopped_directory = root.path().join("stopped-job");
+            let peer_directory = root.path().join("peer-job");
+            let holders = vec![
+                (stopped_job.clone(), stopped_directory.clone()),
+                (peer_job.clone(), peer_directory.clone()),
+            ];
+            let budget = |job: &str, limit: u64| {
+                let holders = holders.clone();
+                super::super::journal::SpoolBudget::new(job.to_owned(), move || Ok(holders.clone()))
+                    .with_limit(limit)
+                    .with_families(families.clone())
+            };
+            let capture = captured_record_window(root.path(), "stopped", 1, 2000, 0, 0, 0);
+            let reference = capture.durable_reference(root.path()).unwrap();
+            let meta = metadata("stopped", &capture);
+            let mut transfer = journal(&stopped_directory, &stopped_job, &capture);
+            transfer.set_spool_budget(budget(&stopped_job, 4 * 1024 * 1024));
+            // The second wave's first pack: its page is uploaded, the pack's
+            // outcome is left for a later session to observe.
+            provider.fail_upload_number(5, ErrorKind::RateLimited);
+            let error = package_and_upload(
+                capture, vec![], root.path(), &root.path().join("stopped-cache"), meta, &[5; 32],
+                limits(4096), None, &mut transfer, &provider, &repository,
+                &PhaseProgress::silent(), &Cancellation::default(),
+            )
+            .await
+            .err()
+            .expect("the refused upload stops the job");
+            assert_eq!(error.kind, ErrorKind::RateLimited);
+            drop(transfer);
+            assert_eq!(families.counts(), (0, 0));
+            let kept: BTreeMap<String, [u8; 32]> = fs::read_dir(&stopped_directory)
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry.path().extension().is_some_and(|value| value == "spool"))
+                .map(|entry| {
+                    (
+                        entry.path().file_stem().unwrap().to_string_lossy().into_owned(),
+                        hash(&fs::read(entry.path()).unwrap()),
+                    )
+                })
+                .collect();
+            assert!(!kept.is_empty());
+            let held = held_spool(&stopped_directory);
+
+            // A restarted application counts the files the stopped job left.
+            let stopped_only = (stopped_job.clone(), stopped_directory.clone());
+            let restarted = |limit: u64| {
+                let stopped_only = stopped_only.clone();
+                super::super::journal::SpoolBudget::new(peer_job.clone(), move || {
+                    Ok(vec![stopped_only.clone()])
+                })
+                .with_limit(limit)
+            };
+            assert!(restarted(held).reserve(1).is_err());
+            drop(restarted(held + 1).reserve(1).unwrap());
+
+            // A peer publishes in the room the stopped job leaves.
+            let room = 12 * 1024;
+            let limit = held + room;
+            let capture = captured_record_window(root.path(), "peer", 1, 2000, 0, 0, 0);
+            let meta = metadata("peer", &capture);
+            let mut transfer = journal(&peer_directory, &peer_job, &capture);
+            transfer.set_spool_budget(budget(&peer_job, limit));
+            let (peak, stop, sampler) = peak_sampler(peer_directory.clone(), held_spool);
+            let completed = package_and_upload(
+                capture, vec![], root.path(), &root.path().join("peer-cache"), meta, &[5; 32],
+                limits(4096), None, &mut transfer, &provider, &repository,
+                &PhaseProgress::silent(), &Cancellation::default(),
+            )
+            .await;
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            sampler.join().unwrap();
+            assert!(packs_of(&completed.unwrap()) > 2);
+            let peak = peak.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(peak + held <= limit, "{peak} bytes beside the stopped job's {held}");
+            assert_eq!(held_spool(&stopped_directory), held);
+            assert_eq!(families.counts(), (0, 0));
+
+            // The stopped job resumes and sends the bytes it kept.
+            let capture = reopened(root.path(), &reference);
+            let meta = metadata("stopped", &capture);
+            let mut transfer = journal(&stopped_directory, &stopped_job, &capture);
+            transfer.set_spool_budget(budget(&stopped_job, limit));
+            package_and_upload(
+                capture, vec![], root.path(), &root.path().join("stopped-cache"), meta, &[5; 32],
+                limits(4096), None, &mut transfer, &provider, &repository,
+                &PhaseProgress::silent(), &Cancellation::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(held_spool(&stopped_directory), 0);
+            assert_eq!(families.counts(), (0, 0));
+            let stored = provider.state.lock().unwrap().objects.clone();
+            for (name, digest) in &kept {
+                let (object, (bytes, _)) = stored
+                    .iter()
+                    .find(|(object, _)| &hex::encode(hash(object.as_bytes())) == name)
+                    .expect("a kept object was never sent");
+                assert_eq!(&hash(bytes), digest, "{object} was sent with other bytes than it kept");
+                assert!(transfer.record(object).unwrap().unwrap().released);
+            }
         });
     }
 

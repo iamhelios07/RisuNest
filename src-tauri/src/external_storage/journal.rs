@@ -6,6 +6,7 @@ use crate::persistent_store::sync_selection::CaptureIdentity;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 fn corrupt() -> ProviderError {
     ProviderError::new(ErrorKind::Corrupt)
@@ -66,10 +67,155 @@ pub(crate) fn held_spool_bytes(directory: &Path) -> Result<u64> {
     Ok(total)
 }
 
-/// Sealed objects this process has admitted and is still writing, by job. Once
-/// a file is on disk its directory answers for it instead.
+/// Transfer spool writes this process has admitted and not yet finished, by
+/// job. Once a file is on disk its directory answers for it instead.
 static SPOOL_WRITES: std::sync::Mutex<std::collections::BTreeMap<String, u64>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// How many pack families may be active at once in this application. A family
+/// is one pack from the moment its plaintext is allocated until its upload is
+/// settled or its job stops: the plaintext, the ciphertext sealed from it, and
+/// the wave that registers and sends it.
+pub(crate) const ACTIVE_PACK_FAMILIES: usize = 2;
+
+/// The admission every pack family of this application passes, whichever job
+/// or connection produces it. The desktop app runs as one process per app
+/// identifier and a mobile app as one process, so one value in this process
+/// is the whole application.
+static SHARED_FAMILIES: std::sync::LazyLock<Arc<PackFamilies>> =
+    std::sync::LazyLock::new(|| PackFamilies::new(ACTIVE_PACK_FAMILIES));
+
+#[derive(Default)]
+struct FamilyState {
+    active: usize,
+    waiting: usize,
+}
+
+pub(crate) struct PackFamilies {
+    limit: usize,
+    state: std::sync::Mutex<FamilyState>,
+    changed: tokio::sync::Notify,
+}
+
+/// One active pack family. Dropping it ends the family, whether its upload
+/// settled or its job stopped and left the sealed bytes for a later attempt.
+pub(crate) struct FamilyPermit(Arc<PackFamilies>);
+
+impl Drop for FamilyPermit {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.0.state.lock() {
+            state.active = state.active.saturating_sub(1);
+        }
+        self.0.changed.notify_waiters();
+    }
+}
+
+/// Counts a producer as waiting for as long as it does, including a wait
+/// that is abandoned.
+struct FamilyWaiter<'a>(&'a PackFamilies);
+
+impl Drop for FamilyWaiter<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.0.state.lock() {
+            state.waiting = state.waiting.saturating_sub(1);
+        }
+    }
+}
+
+impl PackFamilies {
+    pub(crate) fn new(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            limit: limit.max(1),
+            state: Default::default(),
+            changed: tokio::sync::Notify::new(),
+        })
+    }
+
+    pub(crate) fn shared() -> Arc<Self> {
+        SHARED_FAMILIES.clone()
+    }
+
+    /// Starts a family now, or answers `None` when every family is active.
+    pub(crate) fn try_acquire(self: &Arc<Self>) -> Result<Option<FamilyPermit>> {
+        let mut state = self.state.lock().map_err(storage)?;
+        if state.active >= self.limit {
+            return Ok(None);
+        }
+        state.active += 1;
+        Ok(Some(FamilyPermit(self.clone())))
+    }
+
+    /// Waits until a family can start. A job holding sealed packs sends them
+    /// as soon as anybody waits here, so every active family ends without
+    /// anything a waiter holds. At most one producer per running job waits.
+    /// The wait stops at cancellation or when `abandoned` resolves.
+    pub(crate) async fn acquire(
+        self: &Arc<Self>,
+        cancel: &Cancellation,
+        abandoned: impl std::future::Future<Output = ()>,
+    ) -> Result<FamilyPermit> {
+        if let Some(permit) = self.try_acquire()? {
+            return Ok(permit);
+        }
+        let waiter = {
+            let mut state = self.state.lock().map_err(storage)?;
+            state.waiting += 1;
+            // One job's producer waiting on its own sealed packs is the usual
+            // pace of a publication; several waiting at once is worth a line.
+            if state.waiting > 1 {
+                crate::nlog!(
+                    "info",
+                    "External packs wait for a family: {} active, {} waiting",
+                    state.active,
+                    state.waiting
+                );
+            }
+            FamilyWaiter(self)
+        };
+        self.changed.notify_waiters();
+        tokio::pin!(abandoned);
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let mut state = self.state.lock().map_err(storage)?;
+                if state.active < self.limit {
+                    state.active += 1;
+                    drop(state);
+                    drop(waiter);
+                    return Ok(FamilyPermit(self.clone()));
+                }
+            }
+            tokio::select! {
+                _ = &mut changed => {}
+                _ = cancel.cancelled() => return Err(ProviderError::new(ErrorKind::Cancelled)),
+                _ = &mut abandoned => return Err(ProviderError::new(ErrorKind::Cancelled)),
+            }
+        }
+    }
+
+    /// Resolves once some producer waits for a family: the signal for a job
+    /// holding sealed packs to send them rather than wait for more.
+    pub(crate) async fn contended(&self) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.state.lock().map_or(true, |state| state.waiting > 0) {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    /// Active families and producers waiting for one.
+    #[cfg(test)]
+    pub(crate) fn counts(&self) -> (usize, usize) {
+        let state = self.state.lock().unwrap();
+        (state.active, state.waiting)
+    }
+}
 
 /// The application-wide transfer spool as one job sees it: every job that is
 /// still holding sealed ciphertext, this one included, since what it already
@@ -78,18 +224,25 @@ pub(crate) struct SpoolBudget {
     job_id: String,
     retaining: Box<dyn Fn() -> Result<Vec<(String, PathBuf)>> + Send + Sync>,
     limit: u64,
+    families: Arc<PackFamilies>,
 }
 
 /// One admitted write. Dropping it hands the bytes back to the directory that
 /// now holds them, or to nobody if the write failed.
 pub(crate) struct SpoolReservation {
     job_id: String,
+    bytes: u64,
 }
 
 impl Drop for SpoolReservation {
     fn drop(&mut self) {
         if let Ok(mut writes) = SPOOL_WRITES.lock() {
-            writes.remove(&self.job_id);
+            if let Some(held) = writes.get_mut(&self.job_id) {
+                *held = held.saturating_sub(self.bytes);
+                if *held == 0 {
+                    writes.remove(&self.job_id);
+                }
+            }
         }
     }
 }
@@ -105,11 +258,20 @@ impl SpoolBudget {
             job_id,
             retaining: Box::new(retaining),
             limit: TRANSFER_SPOOL_BUDGET,
+            families: PackFamilies::shared(),
         }
     }
+    /// A budget of its own, with pack families of its own unless the test
+    /// shares them between the jobs it runs.
     #[cfg(test)]
     pub(crate) fn with_limit(mut self, limit: u64) -> Self {
         self.limit = limit;
+        self.families = PackFamilies::new(ACTIVE_PACK_FAMILIES);
+        self
+    }
+    #[cfg(test)]
+    pub(crate) fn with_families(mut self, families: Arc<PackFamilies>) -> Self {
+        self.families = families;
         self
     }
     #[cfg(test)]
@@ -117,17 +279,24 @@ impl SpoolBudget {
         self.try_reserve(bytes)?
             .ok_or_else(|| ProviderError::new(ErrorKind::Transient))
     }
-    /// Admits one more sealed object of `bytes`, or answers `None` when the
-    /// spool has no room for it until something held there is released.
+    /// Admits one more write of `bytes`, or answers `None` when the spool has
+    /// no room for it until something held there is released.
     pub(crate) fn try_reserve(&self, bytes: u64) -> Result<Option<SpoolReservation>> {
+        self.admit(bytes, false)
+    }
+    /// Charges a write that cannot wait for room because it is what lets
+    /// room be released: the page registering a wave that is already sealed.
+    fn charge(&self, bytes: u64) -> Result<SpoolReservation> {
+        self.admit(bytes, true)?
+            .ok_or_else(|| ProviderError::new(ErrorKind::Transient))
+    }
+    fn admit(&self, bytes: u64, always: bool) -> Result<Option<SpoolReservation>> {
         let mut writes = SPOOL_WRITES.lock().map_err(storage)?;
         let mut used = 0u64;
         let mut largest: Option<(String, u64)> = None;
         for (job, directory) in (self.retaining)()? {
-            let mut held = held_spool_bytes(&directory)?;
-            if job != self.job_id {
-                held = held.saturating_add(writes.get(&job).copied().unwrap_or(0));
-            }
+            let held = held_spool_bytes(&directory)?
+                .saturating_add(writes.get(&job).copied().unwrap_or(0));
             used = used.saturating_add(held);
             if largest.as_ref().is_none_or(|(_, previous)| held > *previous) {
                 largest = Some((job, held));
@@ -141,11 +310,15 @@ impl SpoolBudget {
                     self.job_id
                 );
             }
-            return Ok(None);
+            if !always {
+                return Ok(None);
+            }
         }
-        writes.insert(self.job_id.clone(), bytes);
+        let held = writes.entry(self.job_id.clone()).or_insert(0);
+        *held = held.saturating_add(bytes);
         Ok(Some(SpoolReservation {
             job_id: self.job_id.clone(),
+            bytes,
         }))
     }
 }
@@ -225,12 +398,20 @@ pub(crate) struct TransferJournal {
     identity: JobIdentity,
     pub(super) verification: super::packaging::AttemptVerification,
     spool_budget: Option<SpoolBudget>,
+    families: Arc<PackFamilies>,
 }
 impl TransferJournal {
     /// Charges every sealed object this journal writes from now on to the
-    /// application-wide transfer spool.
+    /// application-wide transfer spool, and admits its packs among the
+    /// application's active pack families.
     pub(crate) fn set_spool_budget(&mut self, budget: SpoolBudget) {
+        self.families = budget.families.clone();
         self.spool_budget = Some(budget);
+    }
+    /// The pack families this journal's packs are admitted among. A journal
+    /// without a budget still keeps its own packs to that many.
+    pub(crate) fn families(&self) -> Arc<PackFamilies> {
+        self.families.clone()
     }
     /// Admits a new sealed object of `bytes` before its file is created.
     pub(crate) fn reserve_spool(&self, bytes: u64) -> Result<SpoolAdmission> {
@@ -241,6 +422,15 @@ impl TransferJournal {
             Some(reservation) => SpoolAdmission::Admitted(Some(reservation)),
             None => SpoolAdmission::Full,
         })
+    }
+    /// Charges a page registering an already sealed wave. It is admitted even
+    /// past the budget, because sending that wave is what releases its room;
+    /// the members were admitted with room for it.
+    pub(crate) fn charge_page(&self, bytes: u64) -> Result<Option<SpoolReservation>> {
+        self.spool_budget
+            .as_ref()
+            .map(|budget| budget.charge(bytes))
+            .transpose()
     }
     /// Reopens an existing journal after its worker has exited, then removes
     /// terminal spools only when the authoritative PDS owner can be released.
@@ -281,7 +471,7 @@ impl TransferJournal {
         if identity.job_id != job_id {
             return Err(corrupt());
         }
-        Self { db, directory: directory.into(), identity, verification: Default::default(), spool_budget: None }
+        Self { db, directory: directory.into(), identity, verification: Default::default(), spool_budget: None, families: PackFamilies::new(ACTIVE_PACK_FAMILIES) }
             .cleanup_terminal_spools(store, format_repository_id)
     }
 
@@ -466,6 +656,7 @@ impl TransferJournal {
             identity,
             verification: Default::default(),
             spool_budget: None,
+            families: PackFamilies::new(ACTIVE_PACK_FAMILIES),
         };
         journal.discard_released()?;
         Ok(journal)
@@ -946,6 +1137,45 @@ mod tests {
             Some(ErrorKind::Transient)
         );
         assert!(held_spool_bytes(&root.path().join("absent")).unwrap() == 0);
+    }
+
+    /// Families past the limit wait rather than fail. A waiter is what
+    /// `contended` reports, a released family is what it receives, and a
+    /// wait that is abandoned or cancelled leaves nobody counted as waiting.
+    #[test]
+    fn c_pack_families_admit_up_to_their_limit_and_count_who_waits() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let families = PackFamilies::new(ACTIVE_PACK_FAMILIES);
+            let first = families.try_acquire().unwrap().unwrap();
+            let second = families.try_acquire().unwrap().unwrap();
+            assert!(families.try_acquire().unwrap().is_none());
+            assert_eq!(families.counts(), (2, 0));
+
+            let abandoned = families.acquire(&Cancellation::default(), async {}).await;
+            assert_eq!(abandoned.err().map(|error| error.kind), Some(ErrorKind::Cancelled));
+            let cancel = Cancellation::default();
+            cancel.cancel();
+            let cancelled = families.acquire(&cancel, std::future::pending()).await;
+            assert_eq!(cancelled.err().map(|error| error.kind), Some(ErrorKind::Cancelled));
+            assert_eq!(families.counts(), (2, 0));
+
+            let never = Cancellation::default();
+            let (third, ()) = tokio::join!(
+                families.acquire(&never, std::future::pending()),
+                async {
+                    families.contended().await;
+                    assert_eq!(families.counts(), (2, 1));
+                    drop(first);
+                },
+            );
+            assert_eq!(families.counts(), (2, 0));
+            drop((second, third.unwrap()));
+            assert_eq!(families.counts(), (0, 0));
+        });
     }
 
     #[test]
