@@ -48,6 +48,45 @@ releases. Never commit private keys, passwords, or keystores.
 except when publishing the first product into an empty release catalogue. Set it
 back to `false` immediately after that first publication succeeds.
 
+## Before the first publication
+
+Pushing an `app-v*` or `sync-v*` tag publishes a release. Never push a tag to
+test the release build.
+
+1. Review everything that becomes public. Changing the repository to public
+   also exposes existing Actions runs, logs, and artifacts, so review those as
+   well as every branch and tag that will be visible. A clean current snapshot
+   does not make older history or uploaded logs safe.
+2. Compare the configured signing identity with the intended one: the update
+   public key in `RISUNEST_UPDATE_PUBLIC_KEY` and the SHA-256 fingerprint of the
+   Android release certificate. The workflow's signing preflight proves that
+   the Secrets form a working key pair and keystore entry; it does not prove
+   that they are the intended identity.
+3. Run a non-publishing rehearsal of the exact reviewed commit. Manual runs do
+   not check that `source_ref` is contained in `main`, so check it first:
+
+   ```powershell
+   git fetch origin main
+   $Sha = (git rev-parse HEAD).Trim()
+   git merge-base --is-ancestor $Sha origin/main
+   if ($LASTEXITCODE -ne 0) { throw "The commit is not on origin/main." }
+   gh workflow run release.yml --ref main `
+       -f product=app -f tag=app-v1.0.0 -f source_ref=$Sha `
+       -f publish=false -f bootstrap=false
+   gh workflow run release.yml --ref main `
+       -f product=sync -f tag=sync-v1.0.0 -f source_ref=$Sha `
+       -f publish=false -f bootstrap=false
+   ```
+
+   `--ref` selects the workflow definition; `source_ref` selects the commit to
+   build. The tag may be unpushed for a rehearsal. A rehearsal still uses the
+   production signing Secrets.
+4. Check the rehearsal's `rehearsal-*` artifacts: every expected package and
+   signature is present, versions and the source commit match, and nothing
+   unexpected is included.
+
+Publish only after the rehearsal of that same commit succeeds.
+
 ## Publish
 
 Create the tag from the prepared release commit and push that exact tag:
