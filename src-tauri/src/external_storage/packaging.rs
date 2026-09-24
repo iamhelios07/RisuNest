@@ -74,17 +74,24 @@ const SMALL_PACK_CIPHERTEXT_BYTES: u64 = 256 * 1024;
 const COALESCE_TRIGGER_PACKS: usize = 32;
 const COALESCE_MAX_PACKS: usize = 16;
 const COALESCE_MAX_SOURCE_BYTES: u64 = 4 * 1024 * 1024;
-/// Previous record catalog leaves one cycle may change.
+/// Record catalog leaves one cycle may add to the ones the required changes
+/// write, counted on the layout the catalog writer produces, split leaves
+/// included. A run whose keys already sit in more previous leaves than this
+/// is cut before its layout is planned.
 const COALESCE_MAX_LEAVES: usize = 8;
 /// What the maintenance portion can spend at its cap: one pack upload and one
 /// registration page each. A remaining allowance below this declines it.
 pub(crate) const COALESCE_REQUEST_BUDGET: u64 = 2 * COALESCE_MAX_PACKS as u64;
 
-/// What one publication's maintenance portion actually repackaged.
+/// What one publication's maintenance portion actually repackaged, and the
+/// record catalog leaves its plan charged to it beside the ones the required
+/// changes write anyway. The leaf counts stay zero when no cycle ran.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct MaintenanceReport {
     pub(crate) packs: u64,
     pub(crate) source_bytes: u64,
+    pub(crate) leaves: u64,
+    pub(crate) required_leaves: u64,
 }
 
 /// One record pack the entries this publication would reuse still name. The
@@ -128,6 +135,233 @@ fn select_small_packs(mut live: Vec<LivePack>) -> Vec<LivePack> {
         selected.push(pack);
     }
     selected
+}
+
+/// Whether the pack being built is full: the next entry would take it past
+/// the target. The pack writer and the coalescing plan cut packs here.
+fn pack_full(length: u64, stored: u64, target: u64) -> bool {
+    length > 0 && length + stored > target
+}
+
+fn locator_length(object: &RemoteObject) -> usize {
+    object.receipt.locator.object.len()
+        + object.receipt.locator.collection.as_ref().map_or(0, String::len)
+}
+
+/// Stands in for the pack at `index` of the ones a publication is about to
+/// write, whose ID and locator do not exist yet.
+fn stand_in_pack_id(index: usize) -> String {
+    format!("pack-{index:064x}")
+}
+
+/// The record catalog a cycle would produce, laid out before any pack is
+/// built. Entries the publication writes have no placement yet, so each is
+/// placed where the pack writer would place it: in key order, cut where
+/// `pack_full` cuts, a moved body at the stored length its previous chunks
+/// had and a changed one at the most its encoding can take. What cannot be
+/// known before an upload, a new pack's hashes and locator, is given its
+/// longest form, with the longest locator this connection already holds.
+/// The leaves come from `catalog_leaves`, the function the writer lays them
+/// out with.
+struct CoalescingPlan<'a> {
+    kind: wire::CatalogKind,
+    sources: &'a [SourceEntry],
+    /// The parent placement of every source this publication can reuse.
+    reusable: &'a [Option<EntryPlan>],
+    template: &'a RemoteObject,
+    ranges: &'a [(String, String)],
+    size: &'a StoredSize<'a>,
+    target: u64,
+    chunk_bytes: u64,
+    format_repository_id: &'a str,
+    repository: &'a RepositoryHandle,
+    members: &'a BTreeSet<String>,
+    cache: &'a PackageCache,
+    evidence: &'a ObjectEvidence,
+}
+
+impl CoalescingPlan<'_> {
+    /// The entries a publication moving the bodies of `moved` would catalog,
+    /// and which of them it writes.
+    fn entries(&self, moved: &BTreeSet<String>) -> Result<(Vec<EntryPlan>, BTreeSet<String>)> {
+        let mut entries = Vec::with_capacity(self.sources.len());
+        let mut written = BTreeSet::new();
+        let mut packs: Vec<u64> = Vec::new();
+        for (source, reusable) in self.sources.iter().zip(self.reusable) {
+            if let Some(plan) = reusable.as_ref().filter(|plan| !moved.contains(&plan.key)) {
+                entries.push(plan.clone());
+                continue;
+            }
+            let pieces: Vec<(u64, [u8; 32], u64)> = match reusable {
+                Some(plan) => plan.chunks.iter()
+                    .map(|chunk| (chunk.plaintext_length, chunk.plaintext_sha256, chunk.stored_length))
+                    .collect(),
+                None => {
+                    let mut lengths = Vec::new();
+                    let mut remaining = source.byte_length;
+                    loop {
+                        let count = remaining.min(self.chunk_bytes);
+                        lengths.push(count);
+                        remaining -= count;
+                        if remaining == 0 {
+                            break;
+                        }
+                    }
+                    lengths.into_iter()
+                        .map(|length| (length, [u8::MAX; 32], length + 1 + ENTRY_OVERHEAD))
+                        .collect()
+                }
+            };
+            let mut chunks = Vec::with_capacity(pieces.len());
+            for (plaintext_length, plaintext_sha256, stored_length) in pieces {
+                if packs.last().is_none_or(|length| pack_full(*length, stored_length, self.target)) {
+                    packs.push(0);
+                }
+                let index = packs.len() - 1;
+                chunks.push(wire::StoredChunk {
+                    pack_id: stand_in_pack_id(index),
+                    offset: packs[index],
+                    stored_length,
+                    plaintext_length,
+                    plaintext_sha256,
+                });
+                packs[index] += stored_length;
+            }
+            written.insert(source.key.clone());
+            entries.push(EntryPlan {
+                kind: source.kind,
+                key: source.key.clone(),
+                content_sha256: source.content_sha256.clone(),
+                byte_length: source.byte_length,
+                chunks,
+                packs: Vec::new(),
+            });
+        }
+        let packs = packs.into_iter().enumerate()
+            .map(|(index, length)| self.stand_in(index, length))
+            .collect::<Result<Vec<_>>>()?;
+        for entry in entries.iter_mut().filter(|entry| written.contains(&entry.key)) {
+            let named: BTreeSet<&str> = entry.chunks.iter().map(|chunk| chunk.pack_id.as_str()).collect();
+            entry.packs = packs.iter()
+                .filter(|pack| named.contains(pack.object_id.as_str()))
+                .cloned()
+                .collect();
+        }
+        Ok((entries, written))
+    }
+
+    fn stand_in(&self, index: usize, length: u64) -> Result<RemoteObject> {
+        let object_id = stand_in_pack_id(index);
+        let mut receipt = self.template.receipt.clone();
+        receipt.byte_length = self.size.ciphertext(&object_id, wire::ObjectRole::Pack, length)?;
+        Ok(RemoteObject {
+            repository_id: self.format_repository_id.to_owned(),
+            object_id,
+            role: ObjectRole::Pack,
+            receipt,
+            ciphertext_sha256: "f".repeat(64),
+            plaintext_length: length,
+            plaintext_sha256: "f".repeat(64),
+        })
+    }
+
+    /// The leaves of `entries` that are written rather than referenced again,
+    /// each with the span of fragments it holds and whether it holds a key of
+    /// `moved`.
+    fn written_leaves(
+        &self,
+        entries: &[EntryPlan],
+        written: &BTreeSet<String>,
+        moved: &BTreeSet<String>,
+    ) -> Result<Vec<((usize, usize), bool)>> {
+        let fragments = catalog_fragments(entries)?;
+        let packs = pack_locators(entries, self.repository)?;
+        let mut start = 0;
+        let mut leaves = Vec::new();
+        for leaf in catalog_leaves(self.kind, &fragments, &packs, self.ranges, self.size)? {
+            let span = (start, start + leaf.document.entries.len());
+            start = span.1;
+            let holds_moved = leaf.document.entries.iter().any(|entry| moved.contains(&entry.key));
+            if holds_moved
+                || leaf.document.entries.iter().any(|entry| written.contains(&entry.key))
+                || admitted_node(
+                    &leaf.bytes, Some(self.members), self.format_repository_id, self.cache,
+                    self.evidence, self.repository,
+                )?
+                .is_none()
+            {
+                leaves.push((span, holds_moved));
+            }
+        }
+        Ok(leaves)
+    }
+
+    /// How many leaves a cycle moving `moved` adds: every leaf it writes that
+    /// holds a moved key, and every other leaf it writes that the required
+    /// changes alone would not have written the same way.
+    fn added_leaves(&self, moved: &BTreeSet<String>, required: &BTreeSet<(usize, usize)>) -> Result<usize> {
+        let (entries, written) = self.entries(moved)?;
+        Ok(self.written_leaves(&entries, &written, moved)?
+            .into_iter()
+            .filter(|(span, holds_moved)| *holds_moved || !required.contains(span))
+            .count())
+    }
+
+    /// The longest leading part of `run` whose cycle adds at most the leaf
+    /// bound, with the leaves it adds and the leaves the required changes
+    /// write without it. Nothing is built or uploaded to find it, and a run
+    /// of which no part fits is declined whole. When the catalog these
+    /// sources make already has a published root, the required changes write
+    /// no leaf of it. A layout the plan cannot fit, which its longest-form
+    /// stand-ins can cause where the actual objects would fit, costs the cycle
+    /// and never the publication.
+    fn bound(
+        &self,
+        mut run: Vec<LivePack>,
+        root_cached: bool,
+        cancel: &Cancellation,
+    ) -> Result<(Vec<LivePack>, usize, usize)> {
+        let unfit = |error: &ProviderError| error.kind == ErrorKind::FileTooLarge;
+        let required: BTreeSet<(usize, usize)> = if root_cached {
+            BTreeSet::new()
+        } else {
+            let (entries, written) = self.entries(&BTreeSet::new())?;
+            match self.written_leaves(&entries, &written, &BTreeSet::new()) {
+                Ok(leaves) => leaves.into_iter().map(|(span, _)| span).collect(),
+                Err(error) if unfit(&error) => return Ok((Vec::new(), 0, 0)),
+                Err(error) => return Err(error),
+            }
+        };
+        let moved = |count: usize| {
+            run[..count].iter()
+                .flat_map(|pack| pack.keys.iter().map(|(key, _)| key.clone()))
+                .collect::<BTreeSet<_>>()
+        };
+        let added_by = |count: usize| match self.added_leaves(&moved(count), &required) {
+            Err(error) if unfit(&error) => Ok(usize::MAX),
+            other => other,
+        };
+        cancel.check()?;
+        let mut added = added_by(run.len())?;
+        if added > COALESCE_MAX_LEAVES {
+            // The empty run adds nothing and the whole run adds too much.
+            let (mut fits, mut exceeds) = (0, run.len());
+            added = 0;
+            while exceeds - fits > 1 {
+                cancel.check()?;
+                let middle = fits + (exceeds - fits) / 2;
+                let count = added_by(middle)?;
+                if count <= COALESCE_MAX_LEAVES {
+                    fits = middle;
+                    added = count;
+                } else {
+                    exceeds = middle;
+                }
+            }
+            run.truncate(fits);
+        }
+        Ok((run, added, required.len()))
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1069,6 +1303,7 @@ async fn build_entries(
     limits: PackageLimits,
     parent: Option<&BTreeSet<String>>,
     shape: Option<&CatalogShape>,
+    root_cached: bool,
     cache: &mut PackageCache,
     evidence: &mut ObjectEvidence,
     journal: &mut TransferJournal,
@@ -1083,6 +1318,18 @@ async fn build_entries(
         sources.len() as u64,
         sources.iter().map(|source| source.byte_length).sum(),
     );
+    let size = StoredSize { limits, repository_id: format_repository_id };
+    let max_pack = size.pack_capacity(&format!("pack-{}", "0".repeat(64)))?;
+    let target = limits.target_plaintext_bytes.min(max_pack).max(1);
+    let chunk_bytes = usize::try_from(
+        max_pack
+            .saturating_sub(ENTRY_OVERHEAD + 1)
+            .min(MAX_CHUNK_BYTES as u64),
+    )
+    .map_err(corrupt)?;
+    if chunk_bytes == 0 {
+        return Err(ProviderError::new(ErrorKind::FileTooLarge));
+    }
     // Which keys this cycle writes again rather than points at where they are:
     // the record catalog only, and only where a publication that is already
     // required was told it may also spend the maintenance portion. Decided
@@ -1090,8 +1337,8 @@ async fn build_entries(
     // answer for has to keep the placement it has, and declining reuse for it
     // would turn an optional cycle into a failed publication. A pack counts as
     // live only through an entry of this capture that the parent graph still
-    // names, and a cycle is bounded by the leaves of the parent's catalog, so
-    // without one there is nothing to select.
+    // names, and a cycle is laid out against the leaves of the parent's
+    // catalog, so without one there is nothing to select.
     let mut drained: BTreeSet<String> = BTreeSet::new();
     let mut repackage: BTreeSet<String> = BTreeSet::new();
     // One answer per pack, not per entry that names it.
@@ -1106,6 +1353,8 @@ async fn build_entries(
             ContentStore::open_existing(external_root).map_err(transient)?,
         ) {
             let mut live: BTreeMap<String, LivePack> = BTreeMap::new();
+            let mut reusable: Vec<Option<EntryPlan>> = Vec::with_capacity(sources.len());
+            let mut template: Option<RemoteObject> = None;
             for source in &sources {
                 cancel.check()?;
                 let Some(cached) = cache.entry(
@@ -1117,9 +1366,11 @@ async fn build_entries(
                     source.byte_length,
                 )?
                 else {
+                    reusable.push(None);
                     continue;
                 };
                 if !admitted_packs(&cached.packs, members, evidence, &mut settled, repository)? {
+                    reusable.push(None);
                     continue;
                 }
                 let held = content
@@ -1142,31 +1393,48 @@ async fn build_entries(
                         named.leaves.extend(leaves.clone());
                         named.keys.push((source.key.clone(), source.byte_length));
                     }
-                }
-            }
-            for pack in select_small_packs(live.into_values().collect()) {
-                for (key, bytes) in pack.keys {
-                    if repackage.insert(key) {
-                        maintenance.source_bytes = maintenance.source_bytes.saturating_add(bytes);
+                    if template.as_ref().is_none_or(|kept| locator_length(kept) < locator_length(pack)) {
+                        template = Some(pack.clone());
                     }
                 }
-                drained.insert(pack.object_id);
+                reusable.push(Some(cached));
+            }
+            let run = select_small_packs(live.into_values().collect());
+            if let (false, Some(template)) = (run.is_empty(), template.as_ref()) {
+                // The run is cut to the leaves the catalog writer would
+                // produce for it before a single pack of it is built.
+                let plan = CoalescingPlan {
+                    kind,
+                    sources: &sources,
+                    reusable: &reusable,
+                    template,
+                    ranges,
+                    size: &size,
+                    target,
+                    chunk_bytes: chunk_bytes as u64,
+                    format_repository_id,
+                    repository,
+                    members,
+                    cache: &*cache,
+                    evidence: &*evidence,
+                };
+                let (run, added, required) = plan.bound(run, root_cached, cancel)?;
+                if !run.is_empty() {
+                    maintenance.leaves = added as u64;
+                    maintenance.required_leaves = required as u64;
+                }
+                for pack in run {
+                    for (key, bytes) in pack.keys {
+                        if repackage.insert(key) {
+                            maintenance.source_bytes = maintenance.source_bytes.saturating_add(bytes);
+                        }
+                    }
+                    drained.insert(pack.object_id);
+                }
             }
         }
     }
     maintenance.packs = drained.len() as u64;
-    let max_pack = StoredSize { limits, repository_id: format_repository_id }
-        .pack_capacity(&format!("pack-{}", "0".repeat(64)))?;
-    let target = limits.target_plaintext_bytes.min(max_pack).max(1);
-    let chunk_bytes = usize::try_from(
-        max_pack
-            .saturating_sub(ENTRY_OVERHEAD + 1)
-            .min(MAX_CHUNK_BYTES as u64),
-    )
-    .map_err(corrupt)?;
-    if chunk_bytes == 0 {
-        return Err(ProviderError::new(ErrorKind::FileTooLarge));
-    }
     let mut ready = Vec::new();
     let mut uncached = Vec::new();
     let mut placements: ChunkPlacements = BTreeMap::new();
@@ -1546,7 +1814,7 @@ fn prepare_packs(
                         .map_err(corrupt)?;
                 if current
                     .as_ref()
-                    .is_some_and(|pack| pack.length > 0 && pack.length + stored_length > target)
+                    .is_some_and(|pack| pack_full(pack.length, stored_length, target))
                 {
                     send_pack(current.take().unwrap(), built, handle, &mut cpu)?;
                     completed += 1;
@@ -2282,6 +2550,65 @@ fn catalog_batches<T>(
     Ok(result)
 }
 
+/// Every pack `entries` name, by object ID, the way a leaf names it.
+fn pack_locators(
+    entries: &[EntryPlan],
+    repository: &RepositoryHandle,
+) -> Result<BTreeMap<String, wire::StoredObject>> {
+    let mut available = BTreeMap::new();
+    for entry in entries {
+        for pack in &entry.packs {
+            let stored = pack.stored(repository)?;
+            if let Some(old) = available.insert(pack.object_id.clone(), stored.clone()) {
+                if old != stored {
+                    return Err(corrupt("conflicting pack locator"));
+                }
+            }
+        }
+    }
+    Ok(available)
+}
+
+fn catalog_fragments(entries: &[EntryPlan]) -> Result<Vec<wire::CatalogEntryFragment>> {
+    let mut fragments = Vec::new();
+    for entry in entries {
+        // Fixed chunk fragments make the final count known before sizing. A
+        // growing decimal count cannot make a previously accepted leaf overflow.
+        let count = u32::try_from(entry.chunks.len()).map_err(corrupt)?;
+        if count == 0 { return Err(corrupt("entry has no chunks")); }
+        for (index, chunk) in entry.chunks.iter().enumerate() {
+            fragments.push(wire::CatalogEntryFragment {
+                kind: entry.kind, key: entry.key.clone(),
+                content_sha256: decode_hash(&entry.content_sha256)?, byte_length: entry.byte_length,
+                fragment_index: index as u32, fragment_count: count, chunks: vec![chunk.clone()],
+            });
+        }
+    }
+    Ok(fragments)
+}
+
+/// The leaves `fragments` are written as, laid out against the previous
+/// catalog's leaf ranges. The writer and the coalescing plan both lay leaves
+/// out here, so the plan counts the leaves the writer produces.
+fn catalog_leaves(
+    kind: wire::CatalogKind,
+    fragments: &[wire::CatalogEntryFragment],
+    packs: &BTreeMap<String, wire::StoredObject>,
+    ranges: &[(String, String)],
+    size: &StoredSize<'_>,
+) -> Result<Vec<EncodedCatalog>> {
+    stable_batches(
+        fragments,
+        ranges,
+        size,
+        |fragment| fragment.key.as_str(),
+        |leaf| {
+            wire::CatalogDocument::leaf(kind, leaf.to_vec(), unique_packs(leaf, packs)?)
+                .map_err(corrupt)
+        },
+    )
+}
+
 async fn build_catalog(
     kind: wire::CatalogKind,
     entries: Vec<EntryPlan>,
@@ -2338,40 +2665,14 @@ async fn build_catalog(
     }
     let size = StoredSize { limits, repository_id: format_repository_id };
     let metadata_key = derive_key(root_key, format_repository_id, "metadata").map_err(corrupt)?;
-    let mut available_packs = BTreeMap::new();
-    for entry in &entries {
-        for pack in &entry.packs {
-            let stored = pack.stored(repository)?;
-            if let Some(old) = available_packs.insert(pack.object_id.clone(), stored.clone()) {
-                if old != stored {
-                    return Err(corrupt("conflicting pack locator"));
-                }
-            }
-        }
-    }
-    let mut fragments = Vec::new();
-    for entry in &entries {
-        // Fixed chunk fragments make the final count known before sizing. A
-        // growing decimal count cannot make a previously accepted leaf overflow.
-        let count = u32::try_from(entry.chunks.len()).map_err(corrupt)?;
-        if count == 0 { return Err(corrupt("entry has no chunks")); }
-        for (index, chunk) in entry.chunks.iter().enumerate() {
-            fragments.push(wire::CatalogEntryFragment {
-                kind: entry.kind, key: entry.key.clone(),
-                content_sha256: decode_hash(&entry.content_sha256)?, byte_length: entry.byte_length,
-                fragment_index: index as u32, fragment_count: count, chunks: vec![chunk.clone()],
-            });
-        }
-    }
-    let leaves = stable_batches(
+    let available_packs = pack_locators(&entries, repository)?;
+    let fragments = catalog_fragments(&entries)?;
+    let leaves = catalog_leaves(
+        kind,
         &fragments,
+        &available_packs,
         shape.map(|shape| shape.level(0)).unwrap_or_default(),
         &size,
-        |fragment| fragment.key.as_str(),
-        |leaf| {
-            wire::CatalogDocument::leaf(kind, leaf.to_vec(), unique_packs(leaf, &available_packs)?)
-                .map_err(corrupt)
-        },
     )?;
     let mut built: Vec<CatalogRange> = Vec::new();
     let mut nodes = Vec::new();
@@ -2866,6 +3167,11 @@ pub(crate) async fn package_and_upload(
     let mut hydration = SourceHydration::default();
     let record_fingerprint = catalog_fingerprint(wire::CatalogKind::Records, &record_sources);
     let asset_fingerprint = catalog_fingerprint(wire::CatalogKind::Assets, &asset_sources);
+    // Without a cycle, a record catalog whose root is already published is
+    // referenced again rather than written.
+    let record_root_cached = cache
+        .catalog(&metadata.repository_id, repository, wire::CatalogKind::Records, &record_fingerprint)?
+        .is_some();
     let (record_entries, mut referenced) = build_entries(
         wire::CatalogKind::Records,
         record_sources,
@@ -2876,6 +3182,7 @@ pub(crate) async fn package_and_upload(
         limits,
         members.as_ref(),
         shapes.get("records"),
+        record_root_cached,
         &mut cache,
         &mut evidence,
         journal,
@@ -2948,6 +3255,7 @@ pub(crate) async fn package_and_upload(
             limits,
             members.as_ref(),
             None,
+            false,
             &mut cache,
             &mut evidence,
             journal,
@@ -3032,6 +3340,7 @@ pub(crate) async fn package_and_upload(
             limits,
             members.as_ref(),
             None,
+            false,
             &mut cache,
             &mut evidence,
             journal,
@@ -4708,7 +5017,8 @@ mod tests {
                     .count()
             };
             assert!(
-                (1..=COALESCE_MAX_LEAVES).contains(&written_leaves),
+                written_leaves >= 1 && written_leaves as u64 <= completed.maintenance.leaves
+                    && completed.maintenance.leaves <= COALESCE_MAX_LEAVES as u64,
                 "written_leaves={written_leaves} {:?}", completed.maintenance,
             );
 
@@ -4777,6 +5087,344 @@ mod tests {
             assert_eq!(
                 before.difference(&after).count(),
                 COALESCE_MAX_PACKS + DELETED / 2,
+            );
+        });
+    }
+
+    /// Keys of uneven length, so leaves fill unevenly.
+    fn variable_key(index: usize) -> String {
+        format!("record/{index:06}{}", "~".repeat(index % 7))
+    }
+
+    fn library_body(index: usize, value: i64) -> Vec<u8> {
+        format!("{{\"record\":{index},\"value\":{value}}}").into_bytes()
+    }
+
+    /// A capture holding the records at `keys` under `variable_key`, each at
+    /// the value `value` gives it.
+    fn captured_library(
+        root: &Path,
+        capture_id: &str,
+        revision: i64,
+        keys: std::ops::Range<usize>,
+        value: &dyn Fn(usize) -> i64,
+    ) -> CapturedSnapshot {
+        let external = root.join("external-storage");
+        let mut catalog = crate::external_storage::capture::CaptureCatalog::create(
+            &external.join("captures").join(capture_id),
+            &external,
+            None,
+        )
+        .unwrap();
+        let identity = CaptureIdentity {
+            store_id: "store".into(),
+            library_epoch: "epoch".into(),
+            generation: format!("generation-{revision}"),
+            selection_epoch: "selection".into(),
+            revision,
+        };
+        catalog.begin(&identity, None).unwrap();
+        let objects = external.join("objects");
+        {
+            let mut insert = catalog
+                .db
+                .prepare("INSERT INTO records VALUES(?1,?2,?3)")
+                .unwrap();
+            for index in keys {
+                let body = library_body(index, value(index));
+                let digest = hex::encode(hash(&body));
+                let path = objects.join(&digest);
+                if !path.exists() {
+                    fs::write(path, &body).unwrap();
+                }
+                insert
+                    .execute(params![variable_key(index), digest, body.len() as i64])
+                    .unwrap();
+            }
+        }
+        catalog.finish().unwrap();
+        CapturedSnapshot {
+            id: capture_id.into(),
+            identity,
+            catalog,
+            projected_records: 0,
+            shared: false,
+        }
+    }
+
+    /// The leaves of a published record catalog in key order, each with the
+    /// object holding it, walked down from the root the provider stores.
+    fn record_leaves(
+        provider: &FakeProvider,
+        key: &[u8; 32],
+        completed: &CompletedSnapshot,
+    ) -> Vec<(String, wire::CatalogDocument)> {
+        let metadata_key = derive_key(key, &completed.repository_id, "metadata").unwrap();
+        let state = provider.state.lock().unwrap();
+        let open = |object: &str| {
+            let mut plaintext = Vec::new();
+            wire::open_envelope(
+                &mut std::io::Cursor::new(state.objects[object].0.clone()), &mut plaintext,
+                &metadata_key, wire::MAX_METADATA_BYTES as u64,
+            ).unwrap();
+            wire::CatalogDocument::decode(&plaintext, wire::MAX_METADATA_BYTES).unwrap()
+        };
+        let mut pending = vec![completed.record_catalog.receipt.locator.object.clone()];
+        let mut leaves = Vec::new();
+        while let Some(object) = pending.pop() {
+            let document = open(&object);
+            if document.level == 0 {
+                leaves.push((object, document));
+            } else {
+                pending.extend(
+                    document.children.iter().rev().map(|child| child.object.locator.object.clone()),
+                );
+            }
+        }
+        leaves
+    }
+
+    /// Where each key's chunks sit in a published record catalog.
+    fn record_placements(
+        leaves: &[(String, wire::CatalogDocument)],
+    ) -> BTreeMap<String, BTreeSet<String>> {
+        let mut placements: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (_, leaf) in leaves {
+            for entry in &leaf.entries {
+                placements.entry(entry.key.clone()).or_default()
+                    .extend(entry.chunks.iter().map(|chunk| chunk.pack_id.clone()));
+            }
+        }
+        placements
+    }
+
+    /// A library that grew by `range` keys a publication for `grown`
+    /// publications under `history`, each writing its keys into one pack, and
+    /// then one more publication under `last` of every key at the value
+    /// `value` gives it, with a device section changed when `section` says so.
+    /// Returns the last two publications and what the provider held before
+    /// the last one.
+    #[allow(clippy::too_many_arguments)]
+    async fn aged_library(
+        root: &Path,
+        provider: &FakeProvider,
+        key: &[u8; 32],
+        range: usize,
+        grown: usize,
+        history: PackageLimits,
+        last: PackageLimits,
+        section: bool,
+        value: &dyn Fn(usize) -> i64,
+    ) -> (CompletedSnapshot, CompletedSnapshot, BTreeSet<String>) {
+        let repository = fake::repository();
+        let cache = root.join("cache");
+        let spool = root.join("sections");
+        let mut previous: Option<CompletedSnapshot> = None;
+        let mut latest: Option<CompletedSnapshot> = None;
+        let mut before = BTreeSet::new();
+        for revision in 1..=grown as i64 + 1 {
+            let final_one = revision as usize > grown;
+            if final_one {
+                before = provider.state.lock().unwrap().objects.keys().cloned().collect();
+            }
+            let size = (revision as usize).min(grown) * range;
+            let capture = if final_one {
+                captured_library(root, &format!("aged-capture-{revision}"), revision, 0..size, value)
+            } else {
+                captured_library(root, &format!("aged-capture-{revision}"), revision, 0..size, &|_| 0)
+            };
+            let meta = metadata(&format!("aged-snapshot-{revision}"), &capture);
+            let job = format!("aged-job-{revision}");
+            let mut transfer = journal(&root.join(&job), &job, &capture);
+            let parent = latest.as_ref()
+                .map(|completed| parent_graph(completed, &repository))
+                .transpose().unwrap();
+            let sections = if final_one && section {
+                vec![section_of(&spool)]
+            } else {
+                Vec::new()
+            };
+            let completed = package_and_upload(
+                capture, sections, root, &cache, meta, key,
+                if final_one { last } else { history },
+                parent.as_ref(), &mut transfer, provider, &repository,
+                &PhaseProgress::silent(), &Cancellation::default(),
+            ).await.unwrap();
+            previous = latest.replace(completed);
+        }
+        (previous.unwrap(), latest.unwrap(), before)
+    }
+
+    fn section_of(spool: &Path) -> CapturedSection {
+        section(spool, SectionKind::Hypa, "changed", 1)
+    }
+
+    /// Restores `completed` and compares every body with the value `value`
+    /// gives its key.
+    async fn assert_restores(
+        root: &Path,
+        provider: &FakeProvider,
+        key: &[u8; 32],
+        completed: &CompletedSnapshot,
+        records: usize,
+        value: &dyn Fn(usize) -> i64,
+    ) {
+        let restore_root = root.join(format!("restore-{}", completed.snapshot_id));
+        let restored = snapshot_restore::download_snapshot(
+            &completed.reference, &restore_root, key, None,
+            snapshot_restore::SourceTrust::Downloaded, provider, &fake::repository(),
+            &PhaseProgress::silent(), &Cancellation::default(),
+        ).await.unwrap();
+        let actual = restored.records.iter()
+            .map(|record| (record.key.clone(), restored.body(&record.source)))
+            .collect::<BTreeMap<_, _>>();
+        let expected = (0..records)
+            .map(|index| (variable_key(index), library_body(index, value(index))))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(actual, expected);
+    }
+
+    /// The bound is on the leaves a cycle's rewrite produces, not on the
+    /// leaves its keys sat in before. This cycle writes smaller packs than the
+    /// history did, so a leaf it rewrites names more packs than it did and no
+    /// longer fits. A run whose keys sat in at most eight previous leaves then
+    /// splits them into more than eight, and the run is cut to what the
+    /// catalog writer's own layout keeps within the bound.
+    #[test]
+    fn c_a_coalescing_cycle_is_bounded_by_the_leaves_its_rewrite_produces() {
+        runtime().block_on(async {
+            const RANGE: usize = 48;
+            const GROWN: usize = 36;
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let key = [61; 32];
+            let mut last = limits(16 * 1024).with_maintenance(true);
+            last.target_plaintext_bytes = 128;
+            let (previous, completed, before) = aged_library(
+                root.path(), &provider, &key, RANGE, GROWN, limits(16 * 1024), last, true, &|_| 0,
+            ).await;
+            assert_eq!(previous.library_fingerprint, completed.library_fingerprint);
+            assert!(completed.maintenance.packs > 0, "{:?}", completed.maintenance);
+            assert!(completed.maintenance.packs <= COALESCE_MAX_PACKS as u64);
+            assert!(completed.maintenance.source_bytes <= COALESCE_MAX_SOURCE_BYTES);
+            let written = record_leaves(&provider, &key, &completed).into_iter()
+                .filter(|(object, _)| !before.contains(object))
+                .count();
+            // The record catalog is otherwise its parent's, so every leaf
+            // written is the cycle's, and its plan charged it at least that.
+            assert!(
+                written >= 1 && written as u64 <= completed.maintenance.leaves
+                    && completed.maintenance.leaves <= COALESCE_MAX_LEAVES as u64,
+                "written={written} {:?}", completed.maintenance,
+            );
+            assert_eq!(completed.maintenance.required_leaves, 0);
+            // The packs the cycle drained are the ones the catalog stopped
+            // naming, and every pack it names instead is one it wrote.
+            let cache = root.path().join("cache");
+            let packs_before = record_graph_packs(&cache, &previous, &repository);
+            let packs_after = record_graph_packs(&cache, &completed, &repository);
+            assert_eq!(
+                packs_before.difference(&packs_after).count() as u64,
+                completed.maintenance.packs,
+            );
+            assert!(packs_after.difference(&packs_before).all(|pack| !before.contains(pack)));
+            assert_restores(root.path(), &provider, &key, &completed, RANGE * GROWN, &|_| 0).await;
+        });
+    }
+
+    /// A publication with nothing to publish, whose every candidate run would
+    /// split more leaves than a cycle may produce, writes nothing at all: the
+    /// run is declined before any pack is built.
+    #[test]
+    fn c_a_no_op_publication_whose_every_run_exceeds_the_bound_writes_nothing() {
+        runtime().block_on(async {
+            const RANGE: usize = 150;
+            const GROWN: usize = 33;
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let key = [67; 32];
+            let mut last = limits(16 * 1024).with_maintenance(true);
+            last.target_plaintext_bytes = 128;
+            let (previous, completed, before) = aged_library(
+                root.path(), &provider, &key, RANGE, GROWN, limits(16 * 1024), last, false, &|_| 0,
+            ).await;
+            let written = provider.state.lock().unwrap().objects.keys()
+                .filter(|object| !before.contains(*object))
+                .filter(|object| object.starts_with("pack-") || object.starts_with("catalog-"))
+                .cloned()
+                .collect::<Vec<_>>();
+            assert!(written.is_empty(), "wrote {} objects: {:?}", written.len(), completed.maintenance);
+            assert_eq!(completed.maintenance, MaintenanceReport::default());
+            assert_eq!(completed.record_catalog, previous.record_catalog);
+            assert_eq!(completed.asset_catalog, previous.asset_catalog);
+            assert_restores(root.path(), &provider, &key, &completed, RANGE * GROWN, &|_| 0).await;
+        });
+    }
+
+    /// Required edits reach far more leaves than a cycle may add, and every
+    /// one of them is published. What the cycle adds on top of them stays
+    /// within the bound: a leaf counts when it holds a key the cycle moved, or
+    /// when the publication without the cycle would not have produced it.
+    #[test]
+    fn c_required_edits_beyond_the_bound_are_all_published_beside_a_bounded_cycle() {
+        runtime().block_on(async {
+            const RANGE: usize = 48;
+            const GROWN: usize = 36;
+            const EVERY: usize = 24;
+            let edited = |index: usize| index % EVERY == 5;
+            let value = |index: usize| if edited(index) { GROWN as i64 + 1 } else { 0 };
+            let mut runs = Vec::new();
+            for allowed in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let provider = FakeProvider::new(false);
+                let key = [71; 32];
+                let (previous, completed, before) = aged_library(
+                    root.path(), &provider, &key, RANGE, GROWN, limits(16 * 1024),
+                    limits(16 * 1024).with_maintenance(allowed), false, &value,
+                ).await;
+                assert_restores(root.path(), &provider, &key, &completed, RANGE * GROWN, &value)
+                    .await;
+                let parent = record_leaves(&provider, &key, &previous);
+                let leaves = record_leaves(&provider, &key, &completed);
+                let written = leaves.iter().filter(|(object, _)| !before.contains(object)).count();
+                runs.push((completed, parent, leaves, written, root, provider));
+            }
+            let (plain, coalesced) = (&runs[0], &runs[1]);
+            assert_eq!(plain.0.maintenance, MaintenanceReport::default());
+            // Without the cycle, the edits alone rewrite more leaves than a
+            // cycle may.
+            assert!(plain.3 > COALESCE_MAX_LEAVES, "plain wrote {}", plain.3);
+            assert!(coalesced.0.maintenance.packs > 0, "{:?}", coalesced.0.maintenance);
+            assert!(coalesced.0.maintenance.packs <= COALESCE_MAX_PACKS as u64);
+            assert!(coalesced.0.maintenance.source_bytes <= COALESCE_MAX_SOURCE_BYTES);
+            let before = record_placements(&coalesced.1);
+            let after = record_placements(&coalesced.2);
+            let moved = after.iter()
+                .filter(|(key, packs)| {
+                    let index: usize = key.trim_start_matches("record/")[..6].parse().unwrap();
+                    !edited(index) && before.get(*key) != Some(*packs)
+                })
+                .map(|(key, _)| key.clone())
+                .collect::<BTreeSet<_>>();
+            assert!(!moved.is_empty());
+            let required = plain.2.iter()
+                .map(|(_, leaf)| (leaf.first_key.clone(), leaf.last_key.clone()))
+                .collect::<BTreeSet<_>>();
+            let added = coalesced.2.iter()
+                .filter(|(_, leaf)| {
+                    leaf.entries.iter().any(|entry| moved.contains(&entry.key))
+                        || !required.contains(&(leaf.first_key.clone(), leaf.last_key.clone()))
+                })
+                .count();
+            assert!(
+                added as u64 <= coalesced.0.maintenance.leaves
+                    && coalesced.0.maintenance.leaves <= COALESCE_MAX_LEAVES as u64,
+                "added={added} {:?}", coalesced.0.maintenance,
+            );
+            assert!(
+                coalesced.0.maintenance.required_leaves > COALESCE_MAX_LEAVES as u64,
+                "{:?}", coalesced.0.maintenance,
             );
         });
     }

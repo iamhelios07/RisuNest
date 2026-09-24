@@ -1889,6 +1889,8 @@ async fn run_backup(
             "publishedRevision": identity.revision.to_string(),
             "maintenancePacks": completed.maintenance.packs.to_string(),
             "maintenanceBytes": completed.maintenance.source_bytes.to_string(),
+            "maintenanceLeaves": completed.maintenance.leaves.to_string(),
+            "maintenanceRequiredLeaves": completed.maintenance.required_leaves.to_string(),
             "sourceDownloadObjects": completed.hydration.objects.to_string(),
             "sourceDownloadBytes": completed.hydration.bytes.to_string(),
         }),
