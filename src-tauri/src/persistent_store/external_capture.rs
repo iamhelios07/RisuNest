@@ -666,7 +666,8 @@ impl PersistentStore {
     /// Call before acquiring file(true), like the dependency hydration. Makes a
     /// capture serve local recovery: every payload it names is fetched through
     /// custody when it is not held locally, and then held at its recorded
-    /// length.
+    /// length and content. A local body that differs is not replaced, so the
+    /// capture fails rather than serving it.
     pub(crate) fn complete_external_capture(
         &self,
         capture_id: &str,

@@ -1152,6 +1152,132 @@ fn a_transfer_capture_serves_local_recovery_only_once_it_is_completed() {
     // A completed capture holds everything, so completing it again fetches nothing.
     store.complete_external_capture(&capture.id, &Never).unwrap();
     assert_eq!(crate::server_sync::residency::test_remote::fetched(root), 1);
+    // The conflict store is the external root's own, not one nested in it.
+    let external = root.join("external-storage");
+    assert!(!external.join("objects").join("content.sqlite").exists());
+    assert!(!external.join("objects").join("objects").exists());
+}
+
+/// Flips one byte of a held payload, keeping its length.
+fn corrupt_payload_in_place(root: &std::path::Path, hash: &str) -> Vec<u8> {
+    let path = crate::asset_repository::PayloadCas::new(root)
+        .unwrap()
+        .object_path(hash)
+        .unwrap()
+        .expect("held payload");
+    let original = fs::read(&path).unwrap();
+    let mut changed = original.clone();
+    changed[0] ^= 0xff;
+    fs::write(&path, &changed).unwrap();
+    original
+}
+
+fn recovery_accepted(
+    store: &mut PersistentStore,
+    root: &std::path::Path,
+    capture: &super::super::external_capture::CapturedSnapshot,
+    probe: &dyn crate::local_backup::CancellationProbe,
+) -> [bool; 3] {
+    let reference = capture.durable_reference(root).unwrap();
+    [
+        store.complete_external_capture(&capture.id, probe).is_ok(),
+        crate::external_storage::capture::validate_recovery_sources([&reference], root).is_ok(),
+        crate::external_storage::snapshot_export::prepare_local_conflict_snapshot(
+            root,
+            "format-repository",
+            &reference,
+        )
+        .is_ok(),
+    ]
+}
+
+#[test]
+fn a_completed_recovery_capture_rejects_a_payload_changed_at_its_length() {
+    struct Never;
+    impl crate::local_backup::CancellationProbe for Never {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+    let (directory, mut store, _) = capture_fixture();
+    let root = directory.path();
+    let body = b"synthetic custody-only payload";
+    let hash = released_payload_alias(&mut store, root, body);
+    crate::server_sync::residency::test_remote::hold(root, &[(&hash, body.len() as u64)]);
+    crate::server_sync::residency::test_remote::serve(root, &hash, body.to_vec());
+    let capture = capture_library(&mut store, "destination", &Never).unwrap();
+    store.retain_external_capture(&capture.id, "job").unwrap();
+    assert_eq!(recovery_accepted(&mut store, root, &capture, &Never), [true; 3]);
+
+    let original = corrupt_payload_in_place(root, &hash);
+    assert_eq!(recovery_accepted(&mut store, root, &capture, &Never), [false; 3]);
+    // The differing body is not silently replaced from custody.
+    assert_eq!(crate::server_sync::residency::test_remote::fetched(root), 1);
+
+    let path = crate::asset_repository::PayloadCas::new(root)
+        .unwrap()
+        .object_path(&hash)
+        .unwrap()
+        .unwrap();
+    fs::write(path, original).unwrap();
+    assert_eq!(recovery_accepted(&mut store, root, &capture, &Never), [true; 3]);
+}
+
+#[test]
+fn completing_a_capture_rejects_a_held_payload_that_is_not_its_name() {
+    struct Never;
+    impl crate::local_backup::CancellationProbe for Never {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+    let (directory, mut store, _) = capture_fixture();
+    let root = directory.path();
+    let cas = crate::asset_repository::PayloadCas::new(root).unwrap();
+    let payload = cas.prepare_bytes(b"synthetic held payload").unwrap();
+    store
+        .commit_asset_alias(
+            &AssetAlias {
+                key: "assets/held.bin".into(),
+                object_hash: Some(payload.content_hash.clone()),
+                kind: "asset".into(),
+                size: payload.byte_size as i64,
+                mime: "application/octet-stream".into(),
+                name: "held".into(),
+                ext: "bin".into(),
+                inlay_type: None,
+                width: None,
+                height: None,
+                metadata: json!({}),
+            },
+            1,
+        )
+        .unwrap();
+    let capture = capture_library(&mut store, "destination", &Never).unwrap();
+    store.retain_external_capture(&capture.id, "job").unwrap();
+    corrupt_payload_in_place(root, &payload.content_hash);
+
+    assert_eq!(recovery_accepted(&mut store, root, &capture, &Never), [false; 3]);
+    assert_eq!(crate::server_sync::residency::test_remote::fetched(root), 0);
+}
+
+#[test]
+fn completing_a_capture_fails_for_a_payload_custody_cannot_serve() {
+    struct Never;
+    impl crate::local_backup::CancellationProbe for Never {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+    let (directory, mut store, _) = capture_fixture();
+    let root = directory.path();
+    let body = b"synthetic custody-only payload";
+    let hash = released_payload_alias(&mut store, root, body);
+    crate::server_sync::residency::test_remote::hold(root, &[(&hash, body.len() as u64)]);
+    let capture = capture_library(&mut store, "destination", &Never).unwrap();
+    store.retain_external_capture(&capture.id, "job").unwrap();
+
+    assert_eq!(recovery_accepted(&mut store, root, &capture, &Never), [false; 3]);
 }
 
 #[test]

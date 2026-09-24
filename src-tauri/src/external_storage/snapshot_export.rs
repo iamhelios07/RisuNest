@@ -78,10 +78,9 @@ pub(crate) fn prepare_local_conflict_snapshot(
         .join("external-storage")
         .canonicalize()
         .map_err(corrupt)?;
-    let object_directory = external_root.join("objects");
     let catalog = CaptureCatalog::reopen(
         &catalog_path,
-        &object_directory,
+        &external_root,
         &expected_hash,
         &reference.identity,
     )

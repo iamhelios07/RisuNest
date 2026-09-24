@@ -382,6 +382,23 @@ impl PayloadCas {
         self.existing_object_path(content_hash)
     }
 
+    /// Whether the object is held here at `expected_size` and its bytes hash
+    /// to its name. A missing object is not held.
+    pub(crate) fn holds_exact_object(
+        &self,
+        content_hash: &str,
+        expected_size: u64,
+    ) -> io::Result<bool> {
+        let Some(path) = self.existing_object_path(content_hash)? else {
+            return Ok(false);
+        };
+        let mut file = self.open_exact_owned_file(&path)?;
+        if file.metadata()?.len() != expected_size {
+            return Ok(false);
+        }
+        Ok(hash_open_file(&mut file)? == content_hash)
+    }
+
     pub(crate) fn unlink_exact_object(
         &self,
         content_hash: &str,

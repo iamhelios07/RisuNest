@@ -473,7 +473,11 @@ fn capture_roots<'a>(
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             })? {
                 let (hash, bytes) = payload?;
-                if payloads.stat_object(&hash)? != u64::try_from(bytes).ok() {
+                let bytes = u64::try_from(bytes)
+                    .map_err(|_| invalid("Registered capture payload length is invalid"))?;
+                // Recovery replaces a library with these bytes, so their
+                // length is not proof of them.
+                if !payloads.holds_exact_object(&hash, bytes)? {
                     return Err(invalid("Recovery capture payload is not held locally"));
                 }
             }
@@ -524,8 +528,8 @@ pub(crate) fn validate_capture_sources<'a>(
 }
 
 /// What `validate_capture_sources` checks, and that every payload the capture
-/// names is held locally at its recorded length, so local recovery never has
-/// to reach custody.
+/// names is held locally at its recorded length and content, so local recovery
+/// never has to reach custody.
 pub(crate) fn validate_recovery_sources<'a>(
     references: impl IntoIterator<Item = &'a DurableCaptureReference>,
     repository_root: &Path,
