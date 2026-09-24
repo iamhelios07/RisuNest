@@ -2,6 +2,7 @@ use super::*;
 use crate::asset_repository::PayloadCas;
 use crate::server_sync::residency::{open_or_hydrate, AssetPolicy, Residency};
 
+mod media_admission;
 mod regressions;
 mod references;
 
@@ -497,10 +498,12 @@ fn simultaneous_remote_media_grants_do_not_exhaust_device_request_slots() {
         })
         .collect::<Vec<_>>();
     for task in tasks {
-        assert!(
-            task.join().unwrap().is_ok(),
-            "visible media burst must not receive device-busy"
-        );
+        if let Err(error) = task.join().unwrap() {
+            panic!(
+                "visible media burst must not receive device-busy: code={} status={}",
+                error.code, error.status
+            );
+        }
     }
 }
 

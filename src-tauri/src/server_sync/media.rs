@@ -1,5 +1,9 @@
 //! Native control-plane only. Media bodies travel from the server to WebView.
-use super::{client::ServerClient, residency::Residency, Result, SyncError};
+use super::{
+    client::{AdmissionRetry, ServerClient},
+    residency::Residency,
+    Result, SyncError,
+};
 use risunest_sync_connect::media::{
     generate_key, MediaAccess, MediaObject, MediaRequest, MediaSigner,
 };
@@ -90,7 +94,11 @@ impl MediaProvider {
             .issuing
             .lock()
             .map_err(|_| SyncError::new("media-cache-unavailable", 503))?;
-        let client = ServerClient::new(proof.config.resolve(&self.root)?)?;
+        // Another request of this device, such as a Sync transfer, can hold both
+        // slots. A refusal before admission is retried briefly; exhaustion is a
+        // retryable failure and leaves no grant cached.
+        let client = ServerClient::new(proof.config.resolve(&self.root)?)?
+            .with_admission_retry(Arc::new(AdmissionRetry::new()));
         let head = client.resolve_identity(false)?;
         let request = MediaRequest {
             object: object.clone(),
