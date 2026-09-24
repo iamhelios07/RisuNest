@@ -643,7 +643,7 @@ fn preparation_full_cycle_measurement() {
         let total = started.elapsed().as_millis();
         let cache = store.server_cache().unwrap();
         let closure = store.server_cache_references(&cache).unwrap();
-        let derived_bytes: u64 = closure.iter().map(|hash| cache.cas.stat_object(hash).unwrap().unwrap_or(0)).sum();
+        let derived_bytes: u64 = closure.iter().map(|hash| cache.stat_derived(hash).unwrap().unwrap_or(0)).sum();
         let derived_disk = disk(cache.cas.repository_root());
         let first_upload = first_upload.lock().unwrap().unwrap().duration_since(started).as_millis();
         for hash in &closure { assert_eq!(risunest_sync_wire::hash(&fixture.server.get_object(hash).unwrap()), *hash); }

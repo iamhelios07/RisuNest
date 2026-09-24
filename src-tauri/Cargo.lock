@@ -4380,6 +4380,7 @@ dependencies = [
  "reqwest 0.12.28",
  "risunest-external-storage-format",
  "risunest-release-update",
+ "risunest-small-object-store",
  "risunest-sync-connect",
  "risunest-sync-server",
  "risunest-sync-wire",
@@ -4461,6 +4462,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "risunest-small-object-store"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "risunest-sync-connect"
 version = "0.1.0"
 dependencies = [
@@ -4485,6 +4494,7 @@ dependencies = [
  "qrcode",
  "reqwest 0.12.28",
  "risunest-release-update",
+ "risunest-small-object-store",
  "risunest-sync-connect",
  "risunest-sync-wire",
  "rusqlite",

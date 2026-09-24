@@ -52,6 +52,7 @@ const cacheUsage = (totalBytes: number) => ({
     totalBytes,
     protectedBytes: 0,
     reclaimableBytes: totalBytes,
+    databaseBytes: 0,
     blockedReason: null,
 })
 

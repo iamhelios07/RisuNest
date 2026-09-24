@@ -84,10 +84,7 @@ impl Store {
             {
                 return Err(Error::new("object-size-mismatch", 409));
             }
-            let metadata = std::fs::metadata(self.object_path(&object.hash)?)?;
-            if !metadata.is_file() || metadata.len() != size as u64 {
-                return Err(Error::new("corrupt-object", 503));
-            }
+            self.check_object_body(&tx, &object.hash, size as u64)?;
             let retention_id = random_id()?;
             tx.execute("INSERT INTO object_custody(device,hash,retention_id) VALUES(?1,?2,?3) ON CONFLICT(device,hash) DO UPDATE SET retention_id=excluded.retention_id",params![device.id,object.hash,retention_id])?;
             retained.push(RetainedObject {

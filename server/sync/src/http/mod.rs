@@ -536,9 +536,9 @@ async fn object(
     headers: HeaderMap,
 ) -> Result<Response> {
     let tag_digest = digest.clone();
-    let (file, total) = blocking(move || app.store.open_object(&digest)).await?;
+    let (body, total) = blocking(move || app.store.open_object(&digest)).await?;
     object_response(
-        file,
+        body,
         total,
         &tag_digest,
         "application/octet-stream",
@@ -548,7 +548,7 @@ async fn object(
 }
 
 async fn object_response(
-    file: std::fs::File,
+    body: crate::store::Body,
     total: u64,
     digest: &str,
     mime: &str,
@@ -572,14 +572,25 @@ async fn object_response(
                 Some((start, end)) => (start as u64, (end - start + 1) as u64),
                 None => (0, total),
             };
-            let mut file = tokio::fs::File::from_std(file);
-            use tokio::io::{AsyncReadExt, AsyncSeekExt};
-            file.seek(std::io::SeekFrom::Start(start)).await?;
-            response = axum::body::Body::from_stream(tokio_util::io::ReaderStream::with_capacity(
-                file.take(length),
-                64 * 1024,
-            ))
-            .into_response();
+            response = match body {
+                crate::store::Body::File(file) => {
+                    let mut file = tokio::fs::File::from_std(file);
+                    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+                    file.seek(std::io::SeekFrom::Start(start)).await?;
+                    axum::body::Body::from_stream(tokio_util::io::ReaderStream::with_capacity(
+                        file.take(length),
+                        64 * 1024,
+                    ))
+                    .into_response()
+                }
+                // Already in memory and bounded by the inline threshold, so a
+                // range is a slice rather than a seek.
+                crate::store::Body::Bytes(bytes) => {
+                    let bytes = bytes.into_inner();
+                    let end = (start + length).min(bytes.len() as u64) as usize;
+                    axum::body::Body::from(bytes[start as usize..end].to_vec()).into_response()
+                }
+            };
             response
                 .headers_mut()
                 .insert("content-length", length.to_string().parse().unwrap());

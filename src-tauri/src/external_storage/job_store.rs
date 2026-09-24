@@ -16,6 +16,7 @@ pub(crate) enum JobKind {
     DeleteHistory,
     ResolveConflict,
     Cleanup,
+    CheckRepository,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -53,6 +54,15 @@ impl StartJobRequest {
                 || self.confirm_other_device.is_some()
                 || self.confirm_last_retained.is_some()
                 || self.conflict_id.is_some()
+                || self.choice.is_some()
+                || self.restore_areas.is_some()
+                || self.target_revision.is_some())
+        {
+            return Err(ProviderError::new(ErrorKind::Corrupt));
+        }
+        // A check names at most the published state it reads.
+        if self.kind == JobKind::CheckRepository
+            && (self.conflict_id.is_some()
                 || self.choice.is_some()
                 || self.restore_areas.is_some()
                 || self.target_revision.is_some())
@@ -285,6 +295,24 @@ impl JobStore {
             .collect()
     }
 
+
+    /// Jobs whose transfer material may still be on disk. A job that ended in
+    /// failure keeps its sealed ciphertext until a cleanup can release it.
+    pub fn list_retaining(&self) -> Result<Vec<DurableJob>> {
+        let mut statement = self
+            .0
+            .prepare(
+                "SELECT value FROM external_requests
+                 WHERE COALESCE(json_extract(value,'$.summary.state'),'')
+                    NOT IN ('succeeded','cancelled')",
+            )
+            .map_err(failure)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(failure)?;
+        rows.map(|row| Self::decode(row.map_err(failure)?))
+            .collect()
+    }
     /// Every live job plus a bounded recent terminal history for renderer state.
     pub fn list_for_state(&self) -> Result<Vec<DurableJob>> {
         let mut result = self.list_pending()?;

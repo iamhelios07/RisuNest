@@ -1,3 +1,4 @@
+use crate::external_storage::content_store::ObjectSource;
 use super::*;
 use crate::{
     asset_repository::owner_manifest_codec::{encode_owner_manifest, OwnerManifestEntry},
@@ -57,7 +58,7 @@ fn write_record(
             key,
             content_hash: encoded.hash.clone(),
             byte_length: encoded.size,
-            path,
+            source: ObjectSource::File(path),
         },
         hex::decode(encoded.hash).unwrap().try_into().unwrap(),
     )
@@ -71,7 +72,7 @@ fn write_object(root: &Path, bytes: &[u8]) -> ExternalSnapshotObject {
     ExternalSnapshotObject {
         content_hash: object.hash,
         byte_length: object.size,
-        path,
+        source: ObjectSource::File(path),
     }
 }
 
@@ -321,7 +322,7 @@ fn external_snapshot_stage_feeds_atomic_normal_receive_activation() {
             std::iter::empty(),
         )
         .unwrap();
-    store.finish_external_receive(prepared, "receive").unwrap();
+    store.finish_external_receive(prepared, "receive", &Default::default()).unwrap();
 
     let after = sync_selection::identity(&store.connection).unwrap();
     assert_eq!(after.revision, identity.revision + 1);
@@ -343,6 +344,115 @@ fn external_snapshot_stage_feeds_atomic_normal_receive_activation() {
         (snapshot.as_str(), phase.as_str()),
         ("snapshot", "complete")
     );
+}
+
+/// A local body that was changed under its own name is not silently accepted
+/// and not silently replaced: the content store publishes without replacement,
+/// so the apply stops at the damaged file and the live library stays where it
+/// was.
+#[test]
+fn a_locally_corrupt_object_stops_the_apply_instead_of_activating() {
+    for corrupt in [false, true] {
+        let (directory, mut store) = open_store();
+        let staging = directory.path().join("download");
+        fs::create_dir(&staging).unwrap();
+        let object = write_object(&staging, b"asset-body");
+        let cas = crate::asset_repository::PayloadCas::new(directory.path()).unwrap();
+        let held = cas.prepare_bytes(b"asset-body").unwrap();
+        assert_eq!(held.content_hash, object.content_hash);
+        if corrupt {
+            // The same length under the same name, which is what the catalog's
+            // own length check cannot tell apart.
+            fs::write(
+                cas.object_path(&held.content_hash).unwrap().unwrap(),
+                b"asset-bodY",
+            )
+            .unwrap();
+        }
+        let (root, root_hash) = root_record(&staging, "remote");
+        let hashes = BTreeMap::from([(root.key.clone(), root_hash)]);
+        let scope_id = library_fingerprint_domain();
+        let fingerprint = fingerprint(&scope_id, &hashes);
+        let applied = store.prepare_external_snapshot_application(
+            &application(&staging, &scope_id, &fingerprint, 1),
+            [Ok(root)],
+            [Ok(object)],
+        );
+        if !corrupt {
+            let prepared = applied.unwrap();
+            assert_eq!(store.finish_prepared_replace(prepared).unwrap().revision, 2);
+            continue;
+        }
+        let error = applied.err().expect("a damaged body must not apply").to_string();
+        assert!(error.contains("collision or corruption"), "{error}");
+        assert_eq!(stage_count(&store), 0);
+        assert_eq!(store.revision().unwrap(), 1);
+        assert_eq!(store.materialize(None).unwrap()["marker"], "local");
+        assert_eq!(
+            fs::read(cas.object_path(&held.content_hash).unwrap().unwrap()).unwrap(),
+            b"asset-bodY",
+        );
+    }
+}
+
+/// A record body now arrives through the content store rather than as a file
+/// confined to the staging directory, so the store is where the link rejection
+/// has to hold. A body replaced by a link to content outside is not an input,
+/// whatever that content is.
+#[test]
+fn a_linked_record_body_in_the_content_store_is_not_a_snapshot_input() {
+    let (directory, mut store) = open_store();
+    let staging = directory.path().join("download");
+    fs::create_dir(&staging).unwrap();
+    let outside = directory.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    // Over the small-object threshold, so the store publishes it as a file the
+    // fixture can replace.
+    let (record, root_hash) = root_record(&staging, &"x".repeat(70 * 1024));
+    let bytes = fs::read(record.source.file().unwrap()).unwrap();
+    let mut content = crate::external_storage::content_store::ContentStore::open(
+        &staging.join("external-storage"),
+    )
+    .unwrap();
+    content.put(&record.content_hash, &bytes).unwrap();
+    content.commit().unwrap();
+    let held = content
+        .file_path(&record.content_hash)
+        .unwrap()
+        .expect("a body this size is published as a file");
+    let target = outside.join("target.bin");
+    fs::write(&target, &bytes).unwrap();
+    fs::remove_file(&held).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &held).unwrap();
+    #[cfg(windows)]
+    if let Err(error) = std::os::windows::fs::symlink_file(&target, &held) {
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            return;
+        }
+        panic!("create reparse fixture: {error}");
+    }
+
+    let record = ExternalSnapshotRecord {
+        source: ObjectSource::Captured(record.content_hash.clone()),
+        ..record
+    };
+    let hashes = BTreeMap::from([(record.key.clone(), root_hash)]);
+    let scope_id = library_fingerprint_domain();
+    let fingerprint = fingerprint(&scope_id, &hashes);
+    let error = store
+        .prepare_external_snapshot_application(
+            &application(&staging, &scope_id, &fingerprint, 1),
+            [Ok(record)],
+            std::iter::empty(),
+        )
+        .err()
+        .expect("a linked body must not be an input")
+        .to_string();
+    assert!(error.contains("link"), "{error}");
+    assert_eq!(stage_count(&store), 0);
+    assert_eq!(store.revision().unwrap(), 1);
+    assert_eq!(store.materialize(None).unwrap()["marker"], "local");
 }
 
 #[test]
@@ -624,4 +734,534 @@ fn connection_removal_detaches_unknown_publication_but_keeps_its_recovery_root()
     ).unwrap();
     assert!(store.external_prepare_connection_removal("connection").is_err());
     assert_eq!(sync_selection::read(&store.connection).unwrap().epoch, selected.epoch);
+}
+
+struct NeverCancelled;
+impl crate::local_backup::CancellationProbe for NeverCancelled {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
+fn captured_record_hashes(store: &mut PersistentStore) -> BTreeMap<String, String> {
+    let hydration = store
+        .hydrate_external_capture_dependencies("synthetic-consumer", &NeverCancelled)
+        .unwrap();
+    let capture = store
+        .capture_external_library("synthetic-consumer", &hydration, &NeverCancelled)
+        .unwrap();
+    let mut query = capture
+        .catalog
+        .db
+        .prepare("SELECT key,hash FROM records")
+        .unwrap();
+    let rows = query
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap();
+    rows.map(|row| row.unwrap()).collect()
+}
+
+/// An apply keeps the local value of every field the local device owns, and a
+/// capture encodes what it finds, so the two hashes under one key are the
+/// publisher's bytes and this device's bytes. They agree only for a record kind
+/// that carries no such field. Comparing a capture against a remote catalog
+/// therefore reports a difference where there is no content to receive.
+#[test]
+fn a_capture_of_a_received_library_renames_every_record_holding_a_local_view_field() {
+    let (directory, mut store) = open_store();
+    let staging = directory.path().join("download");
+    fs::create_dir(&staging).unwrap();
+    let page = encode_message_page(&[json!({"chatId":"message","data":"remote"})]).unwrap();
+    let page_object = write_object(&staging, &page.bytes);
+    let (conversation, conversation_hash) = write_record(
+        &staging,
+        LogicalRecordLocator::Conversation {
+            character_id: "character".into(),
+            conversation_id: "conversation".into(),
+        },
+        LogicalRecordEnvelope::Conversation {
+            configured_index: 0,
+            recent_at: 20,
+            detail: json!({"id":"conversation","name":"Remote conversation"}),
+            message_page_hashes: vec![page.hash],
+        },
+    );
+    let (root, root_hash) = root_record(&staging, "remote");
+    let (character, character_hash) = write_record(
+        &staging,
+        LogicalRecordLocator::Character {
+            character_id: "character".into(),
+        },
+        LogicalRecordEnvelope::Character {
+            configured_index: 0,
+            detail: json!({
+                "chaId":"character",
+                "name":"Remote character",
+                "chatPage":1,
+                "lastInteraction":10
+            }),
+            owner_heads: vec![LogicalOwnerHead::absent(
+                LogicalOwnerLocator::CharacterAdditional {
+                    character_id: "character".into(),
+                },
+            )],
+        },
+    );
+    let records = vec![conversation, root, character];
+    let mut hashes = BTreeMap::new();
+    for (record, hash) in records
+        .iter()
+        .zip([conversation_hash, root_hash, character_hash])
+    {
+        hashes.insert(record.key.clone(), hash);
+    }
+    let scope_id = library_fingerprint_domain();
+    let expected = fingerprint(&scope_id, &hashes);
+    let prepared = store
+        .prepare_external_snapshot_application(
+            &application(&staging, &scope_id, &expected, 1),
+            records.into_iter().map(Ok),
+            [Ok(page_object)],
+        )
+        .unwrap();
+    store.finish_prepared_replace(prepared).unwrap();
+
+    let captured = captured_record_hashes(&mut store);
+    let named: BTreeMap<String, String> = hashes
+        .iter()
+        .map(|(key, hash)| (key.clone(), hex::encode(hash)))
+        .collect();
+    assert_eq!(
+        captured.keys().collect::<Vec<_>>(),
+        named.keys().collect::<Vec<_>>()
+    );
+    let conversation = "r1:conversation:WyJjaGFyYWN0ZXIiLCJjb252ZXJzYXRpb24iXQ";
+    assert_eq!(captured[conversation], named[conversation]);
+    // The root kept its local statics and the character kept its local chat
+    // page and last interaction, so neither encodes to the bytes that arrived.
+    let character = "r1:character:WyJjaGFyYWN0ZXIiXQ";
+    assert_ne!(captured["r1:root"], named["r1:root"]);
+    assert_ne!(captured[character], named[character]);
+}
+
+fn prepare_receive_intent(store: &mut PersistentStore) -> sync_selection::CaptureIdentity {
+    let epoch = sync_selection::read(&store.connection).unwrap().epoch;
+    let tx = store.connection.transaction().unwrap();
+    sync_selection::select(
+        &tx,
+        &epoch,
+        &sync_selection::SyncTarget::External("connection".into()),
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    let identity = sync_selection::identity(&store.connection).unwrap();
+    let tx = store.connection.transaction().unwrap();
+    external_storage_state::prepare_receive(
+        &tx,
+        &external_storage_state::ReceiveIntent {
+            job_id: "receive",
+            connection_id: "connection",
+            repository_id: "repository",
+            snapshot_id: "snapshot",
+            commit_id: "commit",
+            authenticated_head: "head-token",
+            identity: &identity,
+        },
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    identity
+}
+
+fn receive_root(store: &mut PersistentStore, staging: &Path, marker: &str) -> BTreeMap<String, String> {
+    let identity = prepare_receive_intent(store);
+    let (root, root_hash) = root_record(staging, marker);
+    let hashes = BTreeMap::from([(root.key.clone(), root_hash)]);
+    let scope_id = library_fingerprint_domain();
+    let expected = fingerprint(&scope_id, &hashes);
+    let map: BTreeMap<String, String> = hashes
+        .iter()
+        .map(|(key, hash)| (key.clone(), hex::encode(hash)))
+        .collect();
+    let prepared = store
+        .prepare_external_snapshot_application(
+            &application(staging, &scope_id, &expected, identity.revision),
+            [Ok(root)],
+            std::iter::empty(),
+        )
+        .unwrap();
+    store
+        .finish_external_receive(prepared, "receive", &map)
+        .unwrap();
+    map
+}
+
+#[test]
+fn a_receive_leaves_behind_what_the_snapshot_named_under_each_key() {
+    let (directory, mut store) = open_store();
+    let staging = directory.path().join("download");
+    fs::create_dir(&staging).unwrap();
+    let map = receive_root(&mut store, &staging, "remote-sync");
+    assert_eq!(store.external_base_records("connection").unwrap(), Some(map));
+    // A view is a view of one connection's base, not of the library at large.
+    assert_eq!(store.external_base_records("other").unwrap(), None);
+}
+
+/// The library no longer holds what the base names once the user changes it,
+/// so the rows stop being a view of it and have to read as absent.
+#[test]
+fn a_local_edit_after_a_receive_leaves_no_view() {
+    let (directory, mut store) = open_store();
+    let staging = directory.path().join("download");
+    fs::create_dir(&staging).unwrap();
+    receive_root(&mut store, &staging, "remote-sync");
+    let revision = store.revision().unwrap();
+    let commit = serde_json::from_value(
+        json!({"expectedRevision": revision, "root": {"marker":"newer-local"}}),
+    )
+    .unwrap();
+    store.commit(&commit).unwrap();
+    assert_eq!(store.external_base_records("connection").unwrap(), None);
+}
+
+/// A snapshot of `characters` characters, each with one conversation of one
+/// page, and optionally a conversation whose character it does not carry.
+fn wide_snapshot(
+    staging: &Path,
+    characters: usize,
+    orphan: bool,
+) -> (Vec<ExternalSnapshotRecord>, Vec<ExternalSnapshotObject>, [u8; 32]) {
+    let page = encode_message_page(&[json!({"chatId":"message","data":"remote"})]).unwrap();
+    let page_object = write_object(staging, &page.bytes);
+    let conversation = |character: &str| {
+        write_record(
+            staging,
+            LogicalRecordLocator::Conversation {
+                character_id: character.into(),
+                conversation_id: "chat".into(),
+            },
+            LogicalRecordEnvelope::Conversation {
+                configured_index: 0,
+                recent_at: 1,
+                detail: json!({"id":"chat","name":"chat"}),
+                message_page_hashes: vec![page.hash.clone()],
+            },
+        )
+    };
+    let mut records = vec![root_record(staging, "wide")];
+    for index in 0..characters {
+        let id = format!("character-{index:04}");
+        records.push(write_record(
+            staging,
+            LogicalRecordLocator::Character {
+                character_id: id.clone(),
+            },
+            LogicalRecordEnvelope::Character {
+                configured_index: index as u64,
+                detail: json!({"chaId": id, "name": id}),
+                owner_heads: vec![LogicalOwnerHead::absent(
+                    LogicalOwnerLocator::CharacterAdditional {
+                        character_id: id.clone(),
+                    },
+                )],
+            },
+        ));
+        records.push(conversation(&id));
+    }
+    if orphan {
+        records.push(conversation("absent"));
+    }
+    let hashes: BTreeMap<_, _> = records
+        .iter()
+        .map(|(record, hash)| (record.key.clone(), *hash))
+        .collect();
+    let fingerprint = fingerprint(&library_fingerprint_domain(), &hashes);
+    (
+        records.into_iter().map(|(record, _)| record).collect(),
+        vec![page_object],
+        fingerprint,
+    )
+}
+
+fn stage_wide(
+    store: &mut PersistentStore,
+    staging: &Path,
+    characters: usize,
+    orphan: bool,
+) -> StoreResult<PreparedReplaceCommit> {
+    let (records, objects, fingerprint) = wide_snapshot(staging, characters, orphan);
+    let scope_id = library_fingerprint_domain();
+    store.prepare_external_snapshot_application(
+        &application(staging, &scope_id, &fingerprint, 1),
+        records.into_iter().map(Ok),
+        objects.into_iter().map(Ok),
+    )
+}
+
+/// R05. A stage is written a bounded batch at a time, and what lands is the
+/// whole snapshot.
+#[test]
+fn a_stage_is_written_in_bounded_batches_and_lands_every_record() {
+    let (directory, mut store) = open_store();
+    let staging = directory.path().join("download");
+    fs::create_dir(&staging).unwrap();
+    let batches = std::rc::Rc::new(std::cell::Cell::new(0));
+    let seen = batches.clone();
+    super::after_stage_batch(Some(Box::new(move |written, _| seen.set(written))));
+    let staged = stage_wide(&mut store, &staging, 600, false);
+    super::after_stage_batch(None);
+    let prepared = staged.unwrap();
+    // A root and 600 characters, then 600 conversations, 512 records a batch.
+    assert_eq!(batches.get(), 3);
+    let library = store.materialize_staging(&prepared.staging_id).unwrap();
+    let characters = library["characters"].as_array().unwrap();
+    assert_eq!(characters.len(), 600);
+    for character in characters {
+        assert_eq!(
+            character["chats"][0]["message"],
+            json!([{"chatId":"message","data":"remote"}])
+        );
+    }
+    assert_eq!(store.finish_prepared_replace(prepared).unwrap().revision, 2);
+    assert_eq!(
+        store.materialize(None).unwrap()["characters"]
+            .as_array()
+            .unwrap()
+            .len(),
+        600
+    );
+}
+
+/// R05. A local edit between two batches ends the stage at the next one, and
+/// a record refused in a later batch takes the earlier batches with it.
+#[test]
+fn a_stage_stopped_between_batches_leaves_no_stage_behind() {
+    let (directory, mut store) = open_store();
+    let staging = directory.path().join("download");
+    fs::create_dir(&staging).unwrap();
+    // Another job's connection, as a local save would have.
+    let mut other = store.open_native_job_store().unwrap();
+    super::after_stage_batch(Some(Box::new(move |written, _| {
+        if written == 1 {
+            let commit = serde_json::from_value(json!({
+                "expectedRevision": 1, "root": {"marker":"newer-local"}
+            }))
+            .unwrap();
+            other.commit(&commit).unwrap();
+        }
+    })));
+    let staged = stage_wide(&mut store, &staging, 600, false);
+    super::after_stage_batch(None);
+    assert!(matches!(
+        staged,
+        Err(StoreError::RevisionConflict {
+            expected: 1,
+            actual: 2
+        })
+    ));
+    assert_eq!(stage_count(&store), 0);
+    assert_eq!(store.materialize(None).unwrap()["marker"], "newer-local");
+
+    let (directory, mut store) = open_store();
+    let staging = directory.path().join("download");
+    fs::create_dir(&staging).unwrap();
+    let batches = std::rc::Rc::new(std::cell::Cell::new(0));
+    let seen = batches.clone();
+    super::after_stage_batch(Some(Box::new(move |written, _| seen.set(written))));
+    let staged = stage_wide(&mut store, &staging, 600, true);
+    super::after_stage_batch(None);
+    assert!(staged.is_err());
+    assert!(batches.get() >= 2, "the refusal came after earlier batches committed");
+    assert_eq!(stage_count(&store), 0);
+    assert_eq!(store.materialize(None).unwrap()["marker"], "local");
+}
+
+/// A root, one character and one conversation of `messages` messages, each
+/// carrying `padding` bytes, in pages of at most 128.
+fn long_conversation_snapshot(
+    staging: &Path,
+    messages: usize,
+    padding: usize,
+) -> (Vec<ExternalSnapshotRecord>, Vec<ExternalSnapshotObject>, [u8; 32]) {
+    let filler = "x".repeat(padding);
+    let values = (0..messages)
+        .map(|index| json!({"chatId": format!("message-{index}"), "data": filler}))
+        .collect::<Vec<_>>();
+    let mut objects = Vec::new();
+    let mut page_hashes = Vec::new();
+    for page in values.chunks(128) {
+        let page = encode_message_page(page).unwrap();
+        objects.push(write_object(staging, &page.bytes));
+        page_hashes.push(page.hash);
+    }
+    let records = vec![
+        root_record(staging, "long"),
+        write_record(
+            staging,
+            LogicalRecordLocator::Character {
+                character_id: "long".into(),
+            },
+            LogicalRecordEnvelope::Character {
+                configured_index: 0,
+                detail: json!({"chaId": "long", "name": "long"}),
+                owner_heads: vec![LogicalOwnerHead::absent(
+                    LogicalOwnerLocator::CharacterAdditional {
+                        character_id: "long".into(),
+                    },
+                )],
+            },
+        ),
+        write_record(
+            staging,
+            LogicalRecordLocator::Conversation {
+                character_id: "long".into(),
+                conversation_id: "chat".into(),
+            },
+            LogicalRecordEnvelope::Conversation {
+                configured_index: 0,
+                recent_at: 1,
+                detail: json!({"id":"chat","name":"chat"}),
+                message_page_hashes: page_hashes,
+            },
+        ),
+    ];
+    let hashes: BTreeMap<_, _> = records
+        .iter()
+        .map(|(record, hash)| (record.key.clone(), *hash))
+        .collect();
+    let fingerprint = fingerprint(&library_fingerprint_domain(), &hashes);
+    (
+        records.into_iter().map(|(record, _)| record).collect(),
+        objects,
+        fingerprint,
+    )
+}
+
+/// The message rows and their bytes each stage transaction committed, read
+/// from another connection after every batch.
+fn stage_long_conversation(
+    directory: &Path,
+    store: &mut PersistentStore,
+    messages: usize,
+    padding: usize,
+    after_batch: impl FnMut(usize) + 'static,
+) -> (StoreResult<PreparedReplaceCommit>, Vec<(i64, i64)>) {
+    let staging = directory.join("download");
+    fs::create_dir(&staging).unwrap();
+    let (records, objects, fingerprint) = long_conversation_snapshot(&staging, messages, padding);
+    let observer = rusqlite::Connection::open_with_flags(
+        directory.join("persistent").join(super::super::DATABASE_FILE),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let committed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let seen = committed.clone();
+    let mut after_batch = after_batch;
+    let mut previous = (0i64, 0i64);
+    super::after_stage_batch(Some(Box::new(move |written, _| {
+        let now: (i64, i64) = observer
+            .query_row(
+                "SELECT count(*), coalesce(sum(length(value)),0) FROM messages",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        seen.borrow_mut()
+            .push((now.0 - previous.0, now.1 - previous.1));
+        previous = now;
+        after_batch(written);
+    })));
+    let scope_id = library_fingerprint_domain();
+    let staged = store.prepare_external_snapshot_application(
+        &application(&staging, &scope_id, &fingerprint, 1),
+        records.into_iter().map(Ok),
+        objects.into_iter().map(Ok),
+    );
+    super::after_stage_batch(None);
+    let committed = committed.borrow().clone();
+    (staged, committed)
+}
+
+/// F03. One conversation longer than a batch is staged over several bounded
+/// transactions, and what lands is every message in order.
+#[test]
+fn one_long_conversation_is_staged_in_bounded_transactions() {
+    const MESSAGES: usize = 20_000;
+    let (directory, mut store) = open_store();
+    let (staged, committed) =
+        stage_long_conversation(directory.path(), &mut store, MESSAGES, 0, |_| {});
+    let prepared = staged.unwrap();
+    assert!(committed.len() >= 3, "{committed:?}");
+    assert!(
+        committed
+            .iter()
+            .all(|(rows, _)| *rows as u64 <= super::STAGE_BATCH_WORK),
+        "{committed:?}"
+    );
+    assert_eq!(
+        committed.iter().map(|(rows, _)| rows).sum::<i64>(),
+        MESSAGES as i64
+    );
+    // Nothing of the stage is in the library until it is activated.
+    assert_eq!(store.materialize(None).unwrap()["marker"], "local");
+    let library = store.materialize_staging(&prepared.staging_id).unwrap();
+    let character = library["characters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|character| character["chaId"] == "long")
+        .unwrap()
+        .clone();
+    let landed = character["chats"][0]["message"].as_array().unwrap();
+    assert_eq!(landed.len(), MESSAGES);
+    for (index, message) in landed.iter().enumerate() {
+        assert_eq!(message["chatId"], format!("message-{index}"));
+    }
+    assert_eq!(store.finish_prepared_replace(prepared).unwrap().revision, 2);
+}
+
+/// F03. Heavy messages close a batch by their bytes, even inside one
+/// conversation.
+#[test]
+fn a_conversation_of_heavy_messages_is_staged_within_the_byte_bound() {
+    const PADDING: usize = 64 * 1024;
+    let (directory, mut store) = open_store();
+    let (staged, committed) =
+        stage_long_conversation(directory.path(), &mut store, 400, PADDING, |_| {});
+    staged.unwrap();
+    assert!(committed.len() >= 3, "{committed:?}");
+    assert!(
+        committed
+            .iter()
+            .all(|(_, bytes)| *bytes as u64 <= super::STAGE_BATCH_BYTES + 2 * PADDING as u64),
+        "{committed:?}"
+    );
+}
+
+/// F03. A local edit between two batches of one conversation ends the stage,
+/// and nothing of it is left behind.
+#[test]
+fn a_local_edit_between_the_batches_of_one_conversation_ends_the_stage() {
+    let (directory, mut store) = open_store();
+    let mut other = store.open_native_job_store().unwrap();
+    let (staged, committed) =
+        stage_long_conversation(directory.path(), &mut store, 20_000, 0, move |written| {
+            if written == 2 {
+                let commit = serde_json::from_value(json!({
+                    "expectedRevision": 1, "root": {"marker":"newer-local"}
+                }))
+                .unwrap();
+                other.commit(&commit).unwrap();
+            }
+        });
+    assert!(matches!(
+        staged,
+        Err(StoreError::RevisionConflict {
+            expected: 1,
+            actual: 2
+        })
+    ));
+    assert_eq!(committed.len(), 2);
+    assert_eq!(stage_count(&store), 0);
+    assert_eq!(store.materialize(None).unwrap()["marker"], "newer-local");
 }

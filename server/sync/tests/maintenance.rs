@@ -3,6 +3,15 @@ use common::*;
 use risunest_sync_server::store::{ChangeCursor, Store};
 use risunest_sync_wire::{hash, Domain, RecordVersion};
 
+/// How many bodies the metadata database still holds, for the collection
+/// assertions that would otherwise only see metadata disappear.
+fn inline_bodies(dir: &std::path::Path) -> i64 {
+    rusqlite::Connection::open(dir.join("metadata.sqlite"))
+        .unwrap()
+        .query_row("SELECT count(*) FROM small_objects", [], |r| r.get(0))
+        .unwrap()
+}
+
 fn expire_leases(dir: &std::path::Path) {
     rusqlite::Connection::open(dir.join("metadata.sqlite"))
         .unwrap()
@@ -56,6 +65,7 @@ fn checkpoint_and_each_device_pin_survive_concurrent_commit_and_collection() {
         .unwrap();
     assert_eq!(store.maintain().unwrap().objects_removed, 1);
     assert!(store.object_size(&hash(b"old")).unwrap().is_none());
+    assert_eq!(inline_bodies(dir.path()), 1);
     assert_eq!(store.get_object(&hash(b"new")).unwrap(), b"new");
     assert_eq!(
         store
@@ -158,4 +168,50 @@ fn maintenance_folds_the_write_ahead_log_back_and_reports_a_blocked_checkpoint()
     assert!(blocked.incomplete());
     reader.execute_batch("COMMIT").unwrap();
     assert!(!store.checkpoint_wal().unwrap().incomplete());
+}
+
+#[test]
+fn collection_removes_a_published_file_and_an_inline_body_together() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::init(dir.path()).unwrap();
+    let a = device(&store);
+    let inline = b"synthetic inline body".to_vec();
+    let published = vec![b'p'; 128 * 1024];
+    for bytes in [&inline, &published] {
+        store.put_object(&a, &hash(bytes), bytes).unwrap();
+    }
+    let digest = hash(&published);
+    let path = dir
+        .path()
+        .join("objects")
+        .join(&digest[..2])
+        .join(&digest);
+    assert!(path.exists());
+    assert_eq!(inline_bodies(dir.path()), 1);
+    expire_leases(dir.path());
+    assert_eq!(store.maintain().unwrap().objects_removed, 2);
+    for bytes in [&inline, &published] {
+        assert!(store.object_size(&hash(bytes)).unwrap().is_none());
+    }
+    assert!(!path.exists());
+    assert_eq!(inline_bodies(dir.path()), 0);
+}
+
+#[test]
+fn collection_removes_a_stray_file_under_an_inline_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::init(dir.path()).unwrap();
+    let a = device(&store);
+    let bytes = b"synthetic inline body".to_vec();
+    let digest = hash(&bytes);
+    store.put_object(&a, &digest, &bytes).unwrap();
+    // Model a store where a file was published under an identity the metadata
+    // files inline, which is what collection has to survive.
+    let path = dir.path().join("objects").join(&digest[..2]).join(&digest);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    expire_leases(dir.path());
+    assert_eq!(store.maintain().unwrap().objects_removed, 1);
+    assert!(!path.exists());
+    assert_eq!(inline_bodies(dir.path()), 0);
 }

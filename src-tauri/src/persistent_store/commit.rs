@@ -5,7 +5,7 @@ use super::{
 };
 use super::plugin_owner;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 pub(super) fn incremental_commit<T>(
     connection: &mut Connection,
@@ -1378,13 +1378,14 @@ pub(super) fn replace_commit_from_external(
     staging_id: &str,
     expected_revision: i64,
     job: &str,
+    records: &BTreeMap<String, String>,
 ) -> StoreResult<RevisionResult> {
     replace_commit_transaction(
         connection,
         staging_id,
         Some(expected_revision),
         None,
-        Some(job),
+        Some((job, records)),
     )
 }
 
@@ -1393,7 +1394,7 @@ fn replace_commit_transaction(
     staging_id: &str,
     expected_revision: Option<i64>,
     app_kv: Option<(&str, &Value)>,
-    external_job: Option<&str>,
+    external_job: Option<(&str, &BTreeMap<String, String>)>,
 ) -> StoreResult<RevisionResult> {
     if let Some((key, _)) = app_kv {
         super::validate_app_kv_key(key)?;
@@ -1413,7 +1414,7 @@ fn replace_commit_transaction(
         }
     }
 
-    if let Some(job) = external_job {
+    if let Some((job, _)) = external_job {
         super::external_storage_state::begin_receive_activation(&transaction, job)?;
     }
     let active = active_generation(&transaction)?;
@@ -1427,8 +1428,12 @@ fn replace_commit_transaction(
         super::sync_selection::replaced(&transaction)?;
     }
     set_active(&transaction, revision, &generation)?;
-    if let Some(job) = external_job {
-        super::external_storage_state::finish_receive_activation(&transaction, job)?;
+    if let Some((job, records)) = external_job {
+        super::external_storage_state::finish_receive_activation(
+            &transaction,
+            job,
+            super::external_storage_state::BaseRecords::Complete(records),
+        )?;
     }
     if let Some((key, value)) = serialized_app_kv {
         transaction.execute(

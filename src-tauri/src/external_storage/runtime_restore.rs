@@ -312,12 +312,16 @@ pub(crate) async fn run_restore(
     )?;
     let staging_root =
         runtime::job_directory(&root, &job.request.connection_id, &job.id).join("restore-snapshot");
+    let transferred = runtime::transfer_progress(&root, &job.id);
     let snapshot = snapshot_restore::download_snapshot(
         &remote,
         &staging_root,
         &connected.root_key,
+        None,
+        snapshot_restore::SourceTrust::ProvenLibrary(&root),
         connected.provider.as_ref(),
         &connected.handle,
+        &transferred,
         cancel,
     )
     .await?;
@@ -330,11 +334,14 @@ pub(crate) async fn run_restore(
         &selection.sections,
         &staging_root,
         &connected.root_key,
+        None,
         connected.provider.as_ref(),
         &connected.handle,
+        &transferred,
         cancel,
     )
     .await?;
+    transferred.flush();
     if sections.len() != selection.sections.len() {
         return Err(ProviderError::new(ErrorKind::NotFound));
     }
@@ -400,14 +407,14 @@ fn prepare_local_restore(
                 key: record.key,
                 content_hash: record.content_hash,
                 byte_length: record.byte_length,
-                path: record.path,
+                source: record.source,
             })
         });
         let objects = snapshot.objects.into_iter().map(|object| {
             Ok(ExternalSnapshotObject {
                 content_hash: object.content_hash,
                 byte_length: object.byte_length,
-                path: object.path,
+                source: object.source,
             })
         });
         Some(

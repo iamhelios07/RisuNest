@@ -307,9 +307,9 @@ impl Capture {
     }
 
     pub(crate) fn cached_metadata(&mut self, side: Side, cache: &Cache, hash: &str) -> Result<()> {
-        let mut file = cache.cas.open_object(hash)?.ok_or_else(|| SyncError::new("conflict-metadata-missing", 409))?;
-        let size = file.metadata()?.len();
-        self.pins.prepare_reader_expected(&self.cas, &mut file, hash, size, CasObjectRole::DirectObject)?;
+        let mut body = cache.open_derived(hash)?.ok_or_else(|| SyncError::new("conflict-metadata-missing", 409))?;
+        let size = body.len()?;
+        self.pins.prepare_reader_expected(&self.cas, &mut body, hash, size, CasObjectRole::DirectObject)?;
         self.object(side, &Object { hash: hash.into(), byte_size: Some(size), metadata: true,
             context_id: None, local_required: true })
     }
