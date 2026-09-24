@@ -1673,9 +1673,12 @@ async fn build_entries(
         match sealed {
             Ok(object) => {
                 // A pack the repository already holds under these bytes has
-                // nothing left to send, so its family ends here.
+                // nothing left to send, so its family ends before any wave
+                // is sent.
                 if matches!(object, SealedObject::Pending { .. }) {
                     held.push(permit);
+                } else {
+                    drop(permit);
                 }
                 family.push(object);
             }
@@ -2009,6 +2012,10 @@ fn family_permit(
     cpu: &mut Option<tokio::sync::OwnedSemaphorePermit>,
     cancel: &Cancellation,
 ) -> Result<FamilyPermit> {
+    // A consumer that stopped takes no more packs, so none is started for it.
+    if built.is_closed() {
+        return Err(ProviderError::new(ErrorKind::Cancelled));
+    }
     let permit = match families.try_acquire()? {
         Some(permit) => permit,
         None => {
@@ -6994,6 +7001,314 @@ mod tests {
                 assert_eq!(&hash(bytes), digest, "{object} was sent with other bytes than it kept");
                 assert!(transfer.record(object).unwrap().unwrap().released);
             }
+        });
+    }
+
+    mod gated {
+        use super::FakeProvider;
+        use crate::external_storage::contract::*;
+
+        /// A fake repository that refuses one pack upload by its position and
+        /// holds the reconciliation of one named object until it is let go.
+        pub(super) struct GatedProvider {
+            inner: FakeProvider,
+            refuse_pack: Option<usize>,
+            pub(super) packs: std::sync::Mutex<Vec<String>>,
+            pub(super) gate: std::sync::Mutex<Option<String>>,
+            pub(super) arrived: tokio::sync::Semaphore,
+            pub(super) release: tokio::sync::Semaphore,
+        }
+
+        impl GatedProvider {
+            pub(super) fn new(refuse_pack: Option<usize>) -> Self {
+                Self {
+                    inner: FakeProvider::new(false),
+                    refuse_pack,
+                    packs: Default::default(),
+                    gate: Default::default(),
+                    arrived: tokio::sync::Semaphore::new(0),
+                    release: tokio::sync::Semaphore::new(0),
+                }
+            }
+        }
+
+        impl Provider for GatedProvider {
+            fn open_repository<'a>(
+                &'a self,
+                config: &'a ConnectionConfig,
+                secret: &'a SecretRef,
+                mode: OpenMode,
+                cancel: &'a Cancellation,
+            ) -> ProviderFuture<'a, (RepositoryHandle, crate::external_storage::capabilities::Capabilities)> {
+                self.inner.open_repository(config, secret, mode, cancel)
+            }
+            fn read_object<'a>(
+                &'a self,
+                repository: &'a RepositoryHandle,
+                locator: &'a RemoteLocator,
+                unchanged: Option<&'a VersionToken>,
+                sink: &'a mut dyn TransferSink,
+                cancel: &'a Cancellation,
+            ) -> ProviderFuture<'a, ReadReceipt> {
+                self.inner.read_object(repository, locator, unchanged, sink, cancel)
+            }
+            fn begin_upload<'a>(
+                &'a self,
+                repository: &'a RepositoryHandle,
+                intent: &'a ObjectIntent,
+                cancel: &'a Cancellation,
+            ) -> ProviderFuture<'a, Option<ResumeState>> {
+                self.inner.begin_upload(repository, intent, cancel)
+            }
+            fn create_object<'a>(
+                &'a self,
+                repository: &'a RepositoryHandle,
+                intent: &'a ObjectIntent,
+                source: &'a dyn TransferSource,
+                resume: Option<&'a ResumeState>,
+                cancel: &'a Cancellation,
+            ) -> ProviderFuture<'a, ObjectReceipt> {
+                if intent.role == ObjectRole::Pack {
+                    let mut packs = self.packs.lock().unwrap();
+                    packs.push(intent.object_id.clone());
+                    if self.refuse_pack == Some(packs.len()) {
+                        return Box::pin(async { Err(ProviderError::new(ErrorKind::RateLimited)) });
+                    }
+                }
+                self.inner.create_object(repository, intent, source, resume, cancel)
+            }
+            fn compare_exchange_head<'a>(
+                &'a self,
+                repository: &'a RepositoryHandle,
+                locator: &'a RemoteLocator,
+                expected: &'a ExpectedHead,
+                head: &'a HeadBytes,
+                cancel: &'a Cancellation,
+            ) -> ProviderFuture<'a, HeadReceipt> {
+                self.inner.compare_exchange_head(repository, locator, expected, head, cancel)
+            }
+            fn replace_head<'a>(
+                &'a self,
+                repository: &'a RepositoryHandle,
+                locator: &'a RemoteLocator,
+                head: &'a HeadBytes,
+                cancel: &'a Cancellation,
+            ) -> ProviderFuture<'a, HeadReceipt> {
+                self.inner.replace_head(repository, locator, head, cancel)
+            }
+            fn list_objects<'a>(
+                &'a self,
+                repository: &'a RepositoryHandle,
+                collection: Collection,
+                cursor: Option<&'a str>,
+                limit: u16,
+                cancel: &'a Cancellation,
+            ) -> ProviderFuture<'a, ObjectPage> {
+                self.inner.list_objects(repository, collection, cursor, limit, cancel)
+            }
+            fn delete_object<'a>(
+                &'a self,
+                repository: &'a RepositoryHandle,
+                locator: &'a RemoteLocator,
+                cancel: &'a Cancellation,
+            ) -> ProviderFuture<'a, ()> {
+                self.inner.delete_object(repository, locator, cancel)
+            }
+            fn reconcile_upload<'a>(
+                &'a self,
+                repository: &'a RepositoryHandle,
+                intent: &'a ObjectIntent,
+                resume: Option<&'a ResumeState>,
+                cancel: &'a Cancellation,
+            ) -> ProviderFuture<'a, UploadResolution> {
+                Box::pin(async move {
+                    let gated = {
+                        let mut gate = self.gate.lock().unwrap();
+                        gate.as_deref() == Some(intent.object_id.as_str()) && gate.take().is_some()
+                    };
+                    if gated {
+                        self.arrived.add_permits(1);
+                        self.release.acquire().await.unwrap().forget();
+                    }
+                    self.inner.reconcile_upload(repository, intent, resume, cancel).await
+                })
+            }
+            fn head_locator(&self, repository: &RepositoryHandle) -> Result<RemoteLocator> {
+                self.inner.head_locator(repository)
+            }
+        }
+    }
+    use gated::GatedProvider;
+
+    /// A pack the repository already holds ends its family as soon as it is
+    /// sealed. When it completes a wave whose other pack still has to be
+    /// sent, the producer starts the next pack while that upload is held,
+    /// rather than waiting for a family nothing is using.
+    #[test]
+    fn c_a_pack_already_held_ends_its_family_before_its_wave_is_sent() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let repository = fake::repository();
+            let families = PackFamilies::new(ACTIVE_PACK_FAMILIES);
+            let job = format!("held-{}", uuid::Uuid::new_v4());
+            let directory = root.path().join("held-job");
+            let cache = root.path().join("cache");
+            let budget = || {
+                let holder = (job.clone(), directory.clone());
+                super::super::journal::SpoolBudget::new(job.clone(), move || Ok(vec![holder.clone()]))
+                    .with_limit(4 * 1024 * 1024)
+                    .with_families(families.clone())
+            };
+            let capture = captured_record_window(root.path(), "held", 1, 2000, 0, 0, 0);
+            let reference = capture.durable_reference(root.path()).unwrap();
+            let meta = metadata("held", &capture);
+            // The first two waves are sent and their packs cached; the fifth
+            // pack stops the job.
+            let provider = GatedProvider::new(Some(5));
+            let mut transfer = journal(&directory, &job, &capture);
+            transfer.set_spool_budget(budget());
+            let error = package_and_upload(
+                capture, vec![], root.path(), &cache, meta, &[5; 32], limits(4096), None,
+                &mut transfer, &provider, &repository, &PhaseProgress::silent(),
+                &Cancellation::default(),
+            )
+            .await
+            .err()
+            .expect("the refused pack stops the job");
+            assert_eq!(error.kind, ErrorKind::RateLimited);
+            drop(transfer);
+            assert_eq!(families.counts(), (0, 0));
+            let packs = provider.packs.lock().unwrap().clone();
+            assert_eq!(packs.len(), 5);
+            // The second wave's first pack is sent again from its journal and
+            // its partner comes back from the cache as already held.
+            PackageCache::open(&cache)
+                .unwrap()
+                .forget_object("format-repository", &repository, &packs[2])
+                .unwrap();
+            *provider.gate.lock().unwrap() = Some(packs[2].clone());
+
+            let capture = reopened(root.path(), &reference);
+            let meta = metadata("held", &capture);
+            let mut transfer = journal(&directory, &job, &capture);
+            transfer.set_spool_budget(budget());
+            let build = cache.join("build");
+            let (progress, cancel) = (PhaseProgress::silent(), Cancellation::default());
+            let (completed, (files, counts)) = tokio::time::timeout(FAMILY_TEST_BOUND, async {
+                tokio::join!(
+                    package_and_upload(
+                        capture, vec![], root.path(), &cache, meta, &[5; 32], limits(4096), None,
+                        &mut transfer, &provider, &repository, &progress, &cancel,
+                    ),
+                    async {
+                        provider.arrived.acquire().await.unwrap().forget();
+                        // Either the producer starts the next pack, or it
+                        // waits while both families stay taken.
+                        let seen = loop {
+                            let (files, counts) = (build_files(&build), families.counts());
+                            if files > 0 || counts == (2, 1) {
+                                break (files, counts);
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        };
+                        provider.release.add_permits(1);
+                        seen
+                    },
+                )
+            })
+            .await
+            .expect("the held wave stopped making progress");
+            assert!(files > 0, "no next pack while a wave was held, families {counts:?}");
+            assert!(counts.0 <= ACTIVE_PACK_FAMILIES);
+            assert!(packs_of(&completed.unwrap()) > 5);
+            assert_eq!(families.counts(), (0, 0));
+            assert_eq!(held_spool(&directory), 0);
+        });
+    }
+
+    /// Two jobs sharing the pack families on a spool with room for only a
+    /// few packs. Each either finishes or stops as transient, and a stopped
+    /// one finishes when it runs again. Nothing either admitted stays
+    /// charged, every family ends, and no spool file is left behind.
+    #[test]
+    fn c_two_jobs_on_a_tight_spool_finish_or_stop_without_holding_anything() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let families = PackFamilies::new(ACTIVE_PACK_FAMILIES);
+            let left_job = format!("left-{}", uuid::Uuid::new_v4());
+            let right_job = format!("right-{}", uuid::Uuid::new_v4());
+            let left_directory = root.path().join("left-job");
+            let right_directory = root.path().join("right-job");
+            let holders = vec![
+                (left_job.clone(), left_directory.clone()),
+                (right_job.clone(), right_directory.clone()),
+            ];
+            let budget = |job: &str, limit: u64| {
+                let holders = holders.clone();
+                super::super::journal::SpoolBudget::new(job.to_owned(), move || Ok(holders.clone()))
+                    .with_limit(limit)
+                    .with_families(families.clone())
+            };
+            let tight = 24 * 1024;
+            let left_capture = captured_record_window(root.path(), "left", 1, 2000, 0, 0, 0);
+            let right_capture = captured_record_window(root.path(), "right", 1, 2000, 0, 0, 0);
+            let references = [
+                left_capture.durable_reference(root.path()).unwrap(),
+                right_capture.durable_reference(root.path()).unwrap(),
+            ];
+            let left_meta = metadata("left", &left_capture);
+            let right_meta = metadata("right", &right_capture);
+            let mut left = journal(&left_directory, &left_job, &left_capture);
+            let mut right = journal(&right_directory, &right_job, &right_capture);
+            left.set_spool_budget(budget(&left_job, tight));
+            right.set_spool_budget(budget(&right_job, tight));
+            let (left_cache, right_cache) = (root.path().join("left-cache"), root.path().join("right-cache"));
+            let (key, progress, cancel) = ([5; 32], PhaseProgress::silent(), Cancellation::default());
+            let (left_done, right_done) = tokio::time::timeout(FAMILY_TEST_BOUND, async {
+                tokio::join!(
+                    package_and_upload(
+                        left_capture, vec![], root.path(), &left_cache, left_meta, &key,
+                        limits(4096), None, &mut left, &provider, &repository, &progress, &cancel,
+                    ),
+                    package_and_upload(
+                        right_capture, vec![], root.path(), &right_cache, right_meta, &key,
+                        limits(4096), None, &mut right, &provider, &repository, &progress, &cancel,
+                    ),
+                )
+            })
+            .await
+            .expect("two jobs on a tight spool stopped making progress");
+            drop((left, right));
+            assert_eq!(families.counts(), (0, 0));
+            let runs = [
+                ("left", &left_job, &left_directory, &left_cache, left_done),
+                ("right", &right_job, &right_directory, &right_cache, right_done),
+            ];
+            for ((name, job, directory, cache, done), reference) in runs.into_iter().zip(&references) {
+                assert_eq!(super::super::journal::admitted_spool_writes(job), 0);
+                let done = match done {
+                    Ok(done) => done,
+                    Err(error) => {
+                        assert_eq!(error.kind, ErrorKind::Transient, "{name} stopped otherwise");
+                        let capture = reopened(root.path(), reference);
+                        let meta = metadata(name, &capture);
+                        let mut again = journal(directory, job, &capture);
+                        again.set_spool_budget(budget(job, 4 * 1024 * 1024));
+                        package_and_upload(
+                            capture, vec![], root.path(), cache, meta, &key, limits(4096), None,
+                            &mut again, &provider, &repository, &progress, &cancel,
+                        )
+                        .await
+                        .unwrap()
+                    }
+                };
+                assert!(packs_of(&done) > 2);
+                assert_eq!(super::super::journal::admitted_spool_writes(job), 0);
+                assert_eq!(held_spool(directory), 0);
+            }
+            assert_eq!(families.counts(), (0, 0));
         });
     }
 

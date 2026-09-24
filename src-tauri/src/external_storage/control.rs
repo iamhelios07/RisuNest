@@ -889,6 +889,16 @@ async fn upload_control_object(
         if ciphertext.len() as u64 > MAX_POINT_CIPHERTEXT {
             return Err(ProviderError::new(ErrorKind::FileTooLarge));
         }
+        // A file here that the journal never registered is a write that
+        // stopped before it was, so it is replaced rather than charged again.
+        match fs::symlink_metadata(&spool) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(transient(error)),
+            Ok(metadata) if crate::trust_boundary::is_link_like(&metadata) => {
+                return Err(corrupt("control spool is a link"));
+            }
+            Ok(_) => fs::remove_file(&spool).map_err(transient)?,
+        }
         // Charged to the transfer spool before the file exists, with room for
         // the page that registers it. A page is what sends the wave it
         // registers, so it is charged without ever being refused.
@@ -2479,6 +2489,63 @@ mod tests {
             let uploaded = provider.uploaded_ids();
             assert!(uploaded.iter().any(|id| id == "backup-point-charged"));
             assert!(uploaded.iter().any(|id| id.starts_with("inventory-page-")));
+            assert_eq!(super::super::journal::held_spool_bytes(root.path()).unwrap(), 0);
+        });
+    }
+
+    /// A control object whose file was written but never registered, as a
+    /// stopped write leaves it, is sealed again at the same path and sent with
+    /// the bytes the journal registers, not the ones left behind.
+    #[test]
+    fn a_control_object_replaces_a_spool_file_it_never_registered() {
+        runtime().block_on(async {
+            let provider = Arc::new(fake::FakeProvider::new(false));
+            let connected = connected(provider.clone());
+            let root = tempfile::tempdir().unwrap();
+            let mut journal = TransferJournal::open(
+                root.path(),
+                JobIdentity {
+                    job_id: format!("orphan-{}", uuid::Uuid::new_v4()),
+                    connection_id: "connection".into(),
+                    repository_id: connected.handle.repository_id.clone(),
+                    capture_id: "capture".into(),
+                    capture: CaptureIdentity {
+                        store_id: "store".into(),
+                        library_epoch: "epoch".into(),
+                        generation: "generation".into(),
+                        selection_epoch: "selection".into(),
+                        revision: 1,
+                    },
+                },
+            )
+            .unwrap();
+            let left = vec![7u8; 333];
+            fs::write(journal.spool_path("backup-point-orphan"), &left).unwrap();
+            let object = upload_backup_point(
+                &connected.stored.descriptor,
+                &connected.root_key,
+                BackupPointDocument::single(
+                    &connected.stored.descriptor,
+                    "orphan".into(),
+                    BackupPointKind::Manual,
+                    1,
+                    bundle(&connected.handle, "bundle"),
+                )
+                .unwrap(),
+                &mut journal,
+                connected.provider.as_ref(),
+                &connected.handle,
+                &Cancellation::default(),
+            )
+            .await
+            .unwrap();
+            let record = journal.record("backup-point-orphan").unwrap().unwrap();
+            let stored = provider.contents(&object.receipt.locator.object).unwrap();
+            assert_eq!(stored.len() as u64, record.intent.byte_length);
+            assert_eq!(hex::encode(hash(&stored)), record.intent.sha256);
+            assert_eq!(object.ciphertext_sha256, record.intent.sha256);
+            assert_ne!(hex::encode(hash(&left)), record.intent.sha256);
+            assert!(record.released);
             assert_eq!(super::super::journal::held_spool_bytes(root.path()).unwrap(), 0);
         });
     }

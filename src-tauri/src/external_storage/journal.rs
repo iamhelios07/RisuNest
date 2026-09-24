@@ -72,6 +72,17 @@ pub(crate) fn held_spool_bytes(directory: &Path) -> Result<u64> {
 static SPOOL_WRITES: std::sync::Mutex<std::collections::BTreeMap<String, u64>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// Bytes admitted for `job_id` whose writes have not finished.
+#[cfg(test)]
+pub(crate) fn admitted_spool_writes(job_id: &str) -> u64 {
+    SPOOL_WRITES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(job_id)
+        .copied()
+        .unwrap_or(0)
+}
+
 /// How many pack families may be active at once in this application. A family
 /// is one pack from the moment its plaintext is allocated until its upload is
 /// settled or its job stops: the plaintext, the ciphertext sealed from it, and
@@ -103,7 +114,8 @@ pub(crate) struct FamilyPermit(Arc<PackFamilies>);
 
 impl Drop for FamilyPermit {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.0.state.lock() {
+        {
+            let mut state = self.0.state();
             state.active = state.active.saturating_sub(1);
         }
         self.0.changed.notify_waiters();
@@ -116,9 +128,8 @@ struct FamilyWaiter<'a>(&'a PackFamilies);
 
 impl Drop for FamilyWaiter<'_> {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.0.state.lock() {
-            state.waiting = state.waiting.saturating_sub(1);
-        }
+        let mut state = self.0.state();
+        state.waiting = state.waiting.saturating_sub(1);
     }
 }
 
@@ -135,9 +146,15 @@ impl PackFamilies {
         SHARED_FAMILIES.clone()
     }
 
+    /// The counts are only ever changed whole, so a panic elsewhere while the
+    /// lock was held leaves them exact, and a family is never stranded by it.
+    fn state(&self) -> std::sync::MutexGuard<'_, FamilyState> {
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Starts a family now, or answers `None` when every family is active.
     pub(crate) fn try_acquire(self: &Arc<Self>) -> Result<Option<FamilyPermit>> {
-        let mut state = self.state.lock().map_err(storage)?;
+        let mut state = self.state();
         if state.active >= self.limit {
             return Ok(None);
         }
@@ -158,7 +175,7 @@ impl PackFamilies {
             return Ok(permit);
         }
         let waiter = {
-            let mut state = self.state.lock().map_err(storage)?;
+            let mut state = self.state();
             state.waiting += 1;
             // One job's producer waiting on its own sealed packs is the usual
             // pace of a publication; several waiting at once is worth a line.
@@ -179,7 +196,7 @@ impl PackFamilies {
             tokio::pin!(changed);
             changed.as_mut().enable();
             {
-                let mut state = self.state.lock().map_err(storage)?;
+                let mut state = self.state();
                 if state.active < self.limit {
                     state.active += 1;
                     drop(state);
@@ -202,7 +219,7 @@ impl PackFamilies {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            if self.state.lock().map_or(true, |state| state.waiting > 0) {
+            if self.state().waiting > 0 {
                 return;
             }
             changed.await;
@@ -212,7 +229,7 @@ impl PackFamilies {
     /// Active families and producers waiting for one.
     #[cfg(test)]
     pub(crate) fn counts(&self) -> (usize, usize) {
-        let state = self.state.lock().unwrap();
+        let state = self.state();
         (state.active, state.waiting)
     }
 }
@@ -236,12 +253,13 @@ pub(crate) struct SpoolReservation {
 
 impl Drop for SpoolReservation {
     fn drop(&mut self) {
-        if let Ok(mut writes) = SPOOL_WRITES.lock() {
-            if let Some(held) = writes.get_mut(&self.job_id) {
-                *held = held.saturating_sub(self.bytes);
-                if *held == 0 {
-                    writes.remove(&self.job_id);
-                }
+        let mut writes = SPOOL_WRITES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(held) = writes.get_mut(&self.job_id) {
+            *held = held.saturating_sub(self.bytes);
+            if *held == 0 {
+                writes.remove(&self.job_id);
             }
         }
     }
@@ -1176,6 +1194,37 @@ mod tests {
             drop((second, third.unwrap()));
             assert_eq!(families.counts(), (0, 0));
         });
+    }
+
+    /// A panic while the family counts were locked leaves them exact, so
+    /// every family and wait that ends is still counted out, and a new family
+    /// can still start.
+    #[test]
+    fn c_a_poisoned_family_lock_still_ends_every_family() {
+        let families = PackFamilies::new(1);
+        let permit = families.try_acquire().unwrap().unwrap();
+        let poisoner = families.clone();
+        std::thread::spawn(move || {
+            let _held = poisoner.state.lock().unwrap();
+            panic!("the family counts are poisoned on purpose");
+        })
+        .join()
+        .unwrap_err();
+        assert!(families.state.is_poisoned());
+        assert!(families.try_acquire().unwrap().is_none());
+        let abandoned = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(families.acquire(&Cancellation::default(), async {}));
+        assert_eq!(abandoned.err().map(|error| error.kind), Some(ErrorKind::Cancelled));
+        assert_eq!(families.counts(), (1, 0));
+        drop(permit);
+        assert_eq!(families.counts(), (0, 0));
+        let again = families.try_acquire().unwrap().unwrap();
+        assert_eq!(families.counts(), (1, 0));
+        drop(again);
+        assert_eq!(families.counts(), (0, 0));
     }
 
     #[test]
