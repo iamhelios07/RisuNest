@@ -316,8 +316,11 @@ impl Store {
             let tx = db.transaction()?;
             if inline {
                 let bytes = fs::read(temp.path())?;
-                risunest_small_object_store::insert_batch(&tx, &[(digest.as_str(), bytes.as_slice())])
-                    .map_err(super::objects::body_error)?;
+                risunest_small_object_store::insert_batch(
+                    &tx,
+                    &[(digest.as_str(), bytes.as_slice())],
+                )
+                .map_err(super::objects::body_error)?;
             }
             tx.execute(
                 "INSERT INTO objects(hash,size,storage) VALUES(?1,?2,'file') ON CONFLICT DO NOTHING",

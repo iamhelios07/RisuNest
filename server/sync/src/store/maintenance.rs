@@ -99,7 +99,7 @@ impl Store {
         let mut db = self.db()?;
         let tx = db.transaction()?;
         let current = now()?;
-            tx.execute("DELETE FROM download_deltas WHERE state!='working' AND (expires<=?1 OR device IN (SELECT id FROM devices WHERE revoked=1))", [current])?;
+        tx.execute("DELETE FROM download_deltas WHERE state!='working' AND (expires<=?1 OR device IN (SELECT id FROM devices WHERE revoked=1))", [current])?;
         tx.execute("DELETE FROM upload_deltas WHERE upload IN (SELECT id FROM uploads WHERE state='complete')", [])?;
         tx.execute("DELETE FROM upload_delta_bases WHERE upload IN (SELECT id FROM uploads WHERE state='complete')", [])?;
         tx.execute("INSERT OR IGNORE INTO staging_trash SELECT c.upload,c.ordinal FROM upload_chunks c JOIN uploads u ON c.upload=u.id WHERE u.state!='finalizing' AND (u.state='complete' OR u.expires<=?1 OR u.device IN (SELECT id FROM devices WHERE revoked=1))",[current])?;

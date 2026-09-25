@@ -61,7 +61,9 @@ impl Store {
             return Err(Error::new("missing-dependency", 409));
         }
         for hash in &descriptor.dependencies {
-            if self.object_size(hash)?.is_none() { return Err(Error::new("missing-dependency", 409)); }
+            if self.object_size(hash)?.is_none() {
+                return Err(Error::new("missing-dependency", 409));
+            }
         }
         if let Some(root) = &descriptor.dependency_root {
             self.prepare_reference_tree(root, false, pending)?;
@@ -371,7 +373,10 @@ mod tests {
             .unwrap();
         let db = store.db().unwrap();
         let count = |sql: &str| -> i64 { db.query_row(sql, [], |r| r.get(0)).unwrap() };
-        assert_eq!(count("SELECT count(*) FROM reference_nodes"), pages.len() as i64);
+        assert_eq!(
+            count("SELECT count(*) FROM reference_nodes"),
+            pages.len() as i64
+        );
         assert_eq!(
             count("SELECT count(*) FROM reference_objects"),
             REFERENCES as i64

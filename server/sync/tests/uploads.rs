@@ -278,9 +278,7 @@ fn an_upload_of_an_already_inline_body_publishes_no_second_copy() {
             },
         )
         .unwrap();
-    store
-        .put_upload_chunk(&a, &id, 0, &digest, &bytes)
-        .unwrap();
+    store.put_upload_chunk(&a, &id, 0, &digest, &bytes).unwrap();
     if store.submit_upload(&a, &id).unwrap().is_none() {
         while store.run_pending_upload().unwrap() {}
     }
@@ -294,7 +292,10 @@ fn an_upload_of_an_already_inline_body_publishes_no_second_copy() {
         .join(&digest)
         .exists());
     assert_eq!(store.get_object(&digest).unwrap(), bytes);
-    assert_eq!(store.read_object_range(&digest, 10, 7).unwrap(), bytes[10..17]);
+    assert_eq!(
+        store.read_object_range(&digest, 10, 7).unwrap(),
+        bytes[10..17]
+    );
     store.maintain().unwrap();
     assert_eq!(
         std::fs::read_dir(dir.path().join("staging"))

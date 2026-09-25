@@ -163,7 +163,9 @@ fn maintenance_folds_the_write_ahead_log_back_and_reports_a_blocked_checkpoint()
     // reports instead of leaving the growth unexplained.
     store.put_object(&a, &hash(b"new"), b"new").unwrap();
     let reader = rusqlite::Connection::open(dir.path().join("metadata.sqlite")).unwrap();
-    reader.execute_batch("BEGIN; SELECT count(*) FROM objects;").unwrap();
+    reader
+        .execute_batch("BEGIN; SELECT count(*) FROM objects;")
+        .unwrap();
     let blocked = store.checkpoint_wal().unwrap();
     assert!(blocked.incomplete());
     reader.execute_batch("COMMIT").unwrap();
@@ -181,11 +183,7 @@ fn collection_removes_a_published_file_and_an_inline_body_together() {
         store.put_object(&a, &hash(bytes), bytes).unwrap();
     }
     let digest = hash(&published);
-    let path = dir
-        .path()
-        .join("objects")
-        .join(&digest[..2])
-        .join(&digest);
+    let path = dir.path().join("objects").join(&digest[..2]).join(&digest);
     assert!(path.exists());
     assert_eq!(inline_bodies(dir.path()), 1);
     expire_leases(dir.path());

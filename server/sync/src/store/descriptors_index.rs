@@ -73,7 +73,11 @@ impl PendingIndex {
     ) {
         self.nodes.insert(
             hash.clone(),
-            (NodeStats { kind, count, depth }, first.clone(), last.clone()),
+            (
+                NodeStats { kind, count, depth },
+                first.clone(),
+                last.clone(),
+            ),
         );
         self.bytes += hash.len() + first.len() + last.len();
         self.rows.push(Row::Node {

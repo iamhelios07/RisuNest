@@ -6,7 +6,11 @@ use risunest_sync_server::{
     store::{DeviceCredential, Store},
     workload::Workload,
 };
-use risunest_sync_wire::{canonical, transfer::{self, Frame}, RemoteHead};
+use risunest_sync_wire::{
+    canonical,
+    transfer::{self, Frame},
+    RemoteHead,
+};
 use std::{sync::Arc, time::Duration};
 
 struct Server {
@@ -139,7 +143,9 @@ async fn a_committed_head_reaches_a_held_stream_and_an_unknown_client_is_refused
     let opened = next_announcement(&mut buffer, &mut stream).await;
     assert_eq!(opened, server.head().await.head_id);
 
-    server.commit("r1:character:synthetic", b"synthetic body").await;
+    server
+        .commit("r1:character:synthetic", b"synthetic body")
+        .await;
     let announced = next_announcement(&mut buffer, &mut stream).await;
     let head = server.head().await;
     assert_eq!(announced, head.head_id);

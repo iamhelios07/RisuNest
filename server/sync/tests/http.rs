@@ -607,7 +607,9 @@ async fn stalled_upload_does_not_hold_library_writer_or_another_device_slot() {
         s.upload(&s.a, b"partial synthetic bytes").await;
     }
     assert_eq!(
-        s.store.get_object(&hash(b"partial synthetic bytes")).unwrap(),
+        s.store
+            .get_object(&hash(b"partial synthetic bytes"))
+            .unwrap(),
         b"partial synthetic bytes"
     );
 }
@@ -718,7 +720,10 @@ async fn removed_batch_endpoints_have_no_post_alias() {
     let object = b"synthetic obsolete upload";
     for (path, body) in [
         ("/uploads/batch", full_frames(&[object])),
-        ("/objects/batch", serde_json::to_vec(&[hash(object)]).unwrap()),
+        (
+            "/objects/batch",
+            serde_json::to_vec(&[hash(object)]).unwrap(),
+        ),
     ] {
         let response = s
             .auth(s.client.post(format!("{}{path}", s.base)), &s.a)
@@ -752,8 +757,12 @@ async fn truncated_frames_never_publish_objects_or_allow_a_commit() {
     }
     let invalid_upload = transfer::encode(&[
         Frame::Full(first.to_vec()),
-        Frame::FullRequired { hash: hash(second), size: second.len() as u64 },
-    ]).unwrap();
+        Frame::FullRequired {
+            hash: hash(second),
+            size: second.len() as u64,
+        },
+    ])
+    .unwrap();
     let response = s
         .auth(s.client.post(format!("{}/uploads/frames", s.base)), &s.a)
         .body(invalid_upload)
@@ -761,7 +770,10 @@ async fn truncated_frames_never_publish_objects_or_allow_a_commit() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(response.json::<serde_json::Value>().await.unwrap()["error"], "invalid-upload-frame");
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap()["error"],
+        "invalid-upload-frame"
+    );
     assert!(s.store.object_size(&hash(first)).unwrap().is_none());
     let intent = s.stage(&s.a, head.clone(), 1, "incomplete", first).await;
     let response = s
@@ -772,7 +784,10 @@ async fn truncated_frames_never_publish_objects_or_allow_a_commit() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::CONFLICT);
-    assert_eq!(response.json::<serde_json::Value>().await.unwrap()["error"], "missing-dependency");
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap()["error"],
+        "missing-dependency"
+    );
     assert_eq!(s.head(&s.a).await, head);
 }
 
@@ -809,7 +824,8 @@ async fn transfer_and_full_required_get_reject_other_libraries_and_revoked_devic
     let digest = hash(&bytes);
     for credential in [None, Some(&foreign.a)] {
         let requests = [
-            s.client.post(format!("{}/objects/transfer", s.base))
+            s.client
+                .post(format!("{}/objects/transfer", s.base))
                 .json(&serde_json::json!([{"target":digest,"bases":[]}])),
             s.client.get(format!("{}/objects/{digest}", s.base)),
         ];
@@ -818,24 +834,35 @@ async fn transfer_and_full_required_get_reject_other_libraries_and_revoked_devic
                 Some(credential) => s.auth(request, credential),
                 None => request,
             };
-            assert_eq!(request.send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                request.send().await.unwrap().status(),
+                StatusCode::UNAUTHORIZED
+            );
         }
     }
     let denied = b"synthetic foreign upload";
-    let response = s.client.post(format!("{}/uploads/frames", s.base))
+    let response = s
+        .client
+        .post(format!("{}/uploads/frames", s.base))
         .bearer_auth(&s.a.token)
         .header("x-risu-library", &foreign.a.library_id)
         .body(full_frames(&[denied]))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert!(s.store.object_size(&hash(denied)).unwrap().is_none());
     s.store.revoke_device(&s.b.device_id).unwrap();
     for request in [
-        s.client.post(format!("{}/objects/transfer", s.base))
+        s.client
+            .post(format!("{}/objects/transfer", s.base))
             .json(&serde_json::json!([{"target":digest,"bases":[]}])),
         s.client.get(format!("{}/objects/{digest}", s.base)),
     ] {
-        assert_eq!(s.auth(request, &s.b).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            s.auth(request, &s.b).send().await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
     }
 }
 
@@ -1091,7 +1118,8 @@ async fn a_page_rejection_names_the_record_it_failed_on() {
     };
     let response = s
         .auth(
-            s.client.put(format!("{}/staged-changes/{id}/pages/0", s.base)),
+            s.client
+                .put(format!("{}/staged-changes/{id}/pages/0", s.base)),
             &s.a,
         )
         .json(&page)
@@ -1106,7 +1134,8 @@ async fn a_page_rejection_names_the_record_it_failed_on() {
     // A rejection with no single record keeps the body it always had.
     let response = s
         .auth(
-            s.client.post(format!("{}/staged-changes/{id}/seal", s.base)),
+            s.client
+                .post(format!("{}/staged-changes/{id}/seal", s.base)),
             &s.a,
         )
         .send()
@@ -1169,4 +1198,3 @@ async fn an_inline_object_is_served_whole_and_by_range_without_a_file() {
         0
     );
 }
-

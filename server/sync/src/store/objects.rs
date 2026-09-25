@@ -253,7 +253,8 @@ impl Store {
             #[cfg(test)]
             frame_metrics::record(1, measured);
             if bytes.len() <= SMALL_OBJECT_BYTES
-                && !(small_files.contains(digest.as_str()) && self.filed_body_differs(digest, bytes)?)
+                && !(small_files.contains(digest.as_str())
+                    && self.filed_body_differs(digest, bytes)?)
             {
                 inline.push((digest.as_str(), bytes.as_slice()));
                 continue;
@@ -612,7 +613,11 @@ mod tests {
         let (mut body, size) = store.open_object(&digest).expect(case);
         let mut read = Vec::new();
         std::io::Read::read_to_end(&mut body, &mut read).unwrap();
-        assert_eq!((size, read.as_slice()), (bytes.len() as u64, bytes), "{case}");
+        assert_eq!(
+            (size, read.as_slice()),
+            (bytes.len() as u64, bytes),
+            "{case}"
+        );
     }
 
     /// Every success an upload reports is a body the store can serve, whichever
@@ -682,7 +687,9 @@ mod tests {
                 },
             )
             .unwrap();
-        store.put_upload_chunk(&device, &id, 0, &digest, bytes).unwrap();
+        store
+            .put_upload_chunk(&device, &id, 0, &digest, bytes)
+            .unwrap();
         store.db().unwrap().execute_batch("CREATE TRIGGER synthetic_completion_failure BEFORE UPDATE OF state ON uploads WHEN NEW.state='complete' BEGIN SELECT RAISE(ABORT,'synthetic completion failure'); END").unwrap();
         assert!(store.finish_upload(&device, &id).is_err());
         assert!(
@@ -709,7 +716,9 @@ mod tests {
         store
             .db()
             .unwrap()
-            .execute_batch("DROP TRIGGER synthetic_lease_insert; DROP TRIGGER synthetic_lease_update")
+            .execute_batch(
+                "DROP TRIGGER synthetic_lease_insert; DROP TRIGGER synthetic_lease_update",
+            )
             .unwrap();
         store.put_object(&device, &digest, bytes).unwrap();
         assert_readable(&store, bytes, "file repair after a failed lease");

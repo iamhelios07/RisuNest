@@ -142,8 +142,8 @@ impl Store {
                     }
                 }
             }
-            let inlinable = size <= delta::MAX_TARGET_BYTES as u64
-                && materialized + size <= 32 * 1024 * 1024;
+            let inlinable =
+                size <= delta::MAX_TARGET_BYTES as u64 && materialized + size <= 32 * 1024 * 1024;
             let fits = used + size as usize + 45 <= transfer::PREFERRED_BATCH_BYTES;
             if inlinable && (fits || !selected.is_empty()) {
                 let target = self.get_object(&request.target)?;
@@ -228,7 +228,10 @@ mod tests {
             .filter(|frame| !matches!(frame, Frame::FullRequired { .. }))
             .count();
         let declined = frames.len() - carried;
-        assert!(carried > 0 && declined > 0, "{carried} carried {declined} declined");
+        assert!(
+            carried > 0 && declined > 0,
+            "{carried} carried {declined} declined"
+        );
         assert_eq!(
             opens, carried,
             "a declined target must not be opened, saw {opens} opens for {carried} carried frames"
@@ -259,7 +262,8 @@ mod tests {
                 bases: vec![absent],
             },
         ];
-        let frames = transfer::decode(&store.transfer_objects(&device, &requests).unwrap()).unwrap();
+        let frames =
+            transfer::decode(&store.transfer_objects(&device, &requests).unwrap()).unwrap();
         assert_eq!(frames.len(), 2);
         assert!(frames
             .iter()

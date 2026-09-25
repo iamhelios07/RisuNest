@@ -8,8 +8,8 @@ use axum::{
     extract::{DefaultBodyLimit, Path, Query, Request, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
     response::sse::{Event, KeepAlive, Sse},
+    response::{IntoResponse, Response},
     routing::{get, post, put},
     Extension, Json, Router,
 };
@@ -326,10 +326,8 @@ async fn authorize(State(app): State<App>, request: Request, next: Next) -> Resp
         // Reserve bounded body/response memory before consuming any bulk body.
         // A worker clone retains the reservation even if its HTTP future times out.
         let path = request.uri().path();
-        let buffered = if matches!(
-            path,
-            "/uploads/frames" | "/objects/transfer"
-        ) || path.contains("/chunks/")
+        let buffered = if matches!(path, "/uploads/frames" | "/objects/transfer")
+            || path.contains("/chunks/")
             || (path.starts_with("/uploads/") && path.ends_with("/delta"))
         {
             Some(BufferedRequest {
@@ -430,8 +428,7 @@ async fn events(State(app): State<App>, headers: HeaderMap) -> Result<Response> 
                         (app, announced, Some(head.head_id), permit),
                     ));
                 }
-                let _ =
-                    tokio::time::timeout(HEAD_NOTICE_INTERVAL, announced.changed()).await;
+                let _ = tokio::time::timeout(HEAD_NOTICE_INTERVAL, announced.changed()).await;
             }
         },
     );

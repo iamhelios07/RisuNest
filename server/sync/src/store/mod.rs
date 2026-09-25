@@ -267,7 +267,8 @@ impl Store {
         self.heads.subscribe()
     }
     pub(super) fn announce_head(&self) {
-        self.heads.send_modify(|value| *value = value.wrapping_add(1));
+        self.heads
+            .send_modify(|value| *value = value.wrapping_add(1));
     }
     pub fn device_session(&self, device: &Device) -> Result<DeviceSession> {
         let mut connection = self.reader()?;
