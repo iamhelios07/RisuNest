@@ -12,7 +12,7 @@
     import Button from "../UI/GUI/Button.svelte";
     import TextInput from "../UI/GUI/TextInput.svelte";
 
-    import { addNewChat, duplicateChat, exportChat, importChat, exportAllChats, removeChat } from "src/ts/characters";
+    import { addNewChat, duplicateChat, editSelectedChatList, exportChat, importChat, exportAllChats, removeChat } from "src/ts/characters";
     import { alertChatOptions, alertConfirm, alertError, alertNormal, alertSelect, alertStore } from "src/ts/alert";
     import { sortableOptions } from "src/ts/util";
     import { createMultiuserRoom } from "src/ts/sync/multiuser";
@@ -21,7 +21,7 @@
     import { bindPersona, saveChatBinding } from 'src/ts/chatBindings.svelte'
     import Toggles from "./Toggles.svelte";
     import { changeChatTo } from "src/ts/globalApi.svelte";
-    import { indexSideChatListRows } from "./sideChatListRows";
+    import { indexSideChatListRows, orderChatsByDroppedRows, orderFoldersByDroppedIds, type DroppedChatRow } from "./sideChatListRows";
 
     interface Props {
         chara: character|groupChat;
@@ -71,37 +71,37 @@
         for (let chat of listEle.querySelectorAll('.risu-chat')) {
             chatsStb.push(new Sortable(chat, {
                 group: 'chats',
-                onEnd: async (event) => {
-                    const selectedChatId = chara.chats[chara.chatPage]?.id
-                    const newChats: Chat[] = []
-
-                    // const chats: HTMLElement = event.to
-                    // chats.querySelectorAll()
-                    
+                onEnd: async () => {
+                    // Read the dropped order before re-rendering the list.
+                    const rows: DroppedChatRow[] = []
                     listEle.querySelectorAll('[data-risu-chat-folder-idx]').forEach(folder => {
                         const folderIdx = parseInt(folder.getAttribute('data-risu-chat-folder-idx'))
                         folder.querySelectorAll('[data-risu-chat-idx]').forEach(chatInFolder => {
                             const chatIdx = parseInt(chatInFolder.getAttribute('data-risu-chat-idx'))
-                            const newChat = chara.chats[chatIdx]
-                            newChat.folderId = chara.chatFolders[folderIdx].id
-                            newChats.push(newChat)
+                            rows.push({ id: chara.chats[chatIdx].id, folderId: chara.chatFolders[folderIdx].id })
                         })
                     })
 
+                    const placed = new Set(rows.map((row) => row.id))
                     listEle.querySelectorAll('[data-risu-chat-idx]').forEach(chatEle => {
-                        const idx = parseInt(chatEle.getAttribute('data-risu-chat-idx'))
-                        const newChat = chara.chats[idx]
-                        if (newChats.includes(newChat) == false) {
-                            if (newChat.folderId != null)
-                                newChat.folderId = null
-                            newChats.push(newChat)
+                        const id = chara.chats[parseInt(chatEle.getAttribute('data-risu-chat-idx'))].id
+                        if (!placed.has(id)) {
+                            placed.add(id)
+                            rows.push({ id, folderId: null })
                         }
                     })
 
-                    chara.chats = newChats
                     destroySortable()
-                    sorted += 1
-                    if(selectedChatId) await changeChatTo(selectedChatId)
+                    try {
+                        await editSelectedChatList(chara.chaId, 'reorder-chats', (character) => {
+                            const chats = orderChatsByDroppedRows(character.chats, rows)
+                            if (!chats) return false
+                            character.chats = chats
+                            return null
+                        })
+                    } finally {
+                        sorted += 1
+                    }
                 },
                 ...sortableOptions
             }))
@@ -109,34 +109,43 @@
         folderStb = Sortable.create(folderEles, {
             group: 'folders',
             onEnd: async (event) => {
-                const newFolders: ChatFolder[] = []
-                const newChats: Chat[] = []
+                // Read the dropped order before re-rendering the list.
+                const folderIds: string[] = []
+                const rows: DroppedChatRow[] = []
                 const folders: HTMLElement[] = Array.from<HTMLElement>(event.to.children)
-
-                const selectedChatId = chara.chats[chara.chatPage]?.id
 
                 folders.forEach(folder => {
                     const folderIdx = parseInt(folder.getAttribute('data-risu-chat-folder-idx'))
-                    newFolders.push(chara.chatFolders[folderIdx])
+                    folderIds.push(chara.chatFolders[folderIdx].id)
 
                     folder.querySelectorAll('[data-risu-chat-idx]').forEach(chatEle => {
                         const idx = parseInt(chatEle.getAttribute('data-risu-chat-idx'))
-                        newChats.push(chara.chats[idx])
+                        rows.push({ id: chara.chats[idx].id })
                     })
                 })
 
+                const placed = new Set(rows.map((row) => row.id))
                 listEle.querySelectorAll('[data-risu-chat-idx]').forEach(chatEle => {
-                    const idx = parseInt(chatEle.getAttribute('data-risu-chat-idx'))
-                    if (newChats.includes(chara.chats[idx]) == false) {
-                        newChats.push(chara.chats[idx])
+                    const id = chara.chats[parseInt(chatEle.getAttribute('data-risu-chat-idx'))].id
+                    if (!placed.has(id)) {
+                        placed.add(id)
+                        rows.push({ id })
                     }
                 })
-                
-                chara.chatFolders = newFolders
-                chara.chats = newChats
+
                 destroySortable()
-                sorted += 1
-                if (selectedChatId) await changeChatTo(selectedChatId)
+                try {
+                    await editSelectedChatList(chara.chaId, 'reorder-chat-folders', (character) => {
+                        const chatFolders = orderFoldersByDroppedIds(character.chatFolders, folderIds)
+                        const chats = orderChatsByDroppedRows(character.chats, rows)
+                        if (!chatFolders || !chats) return false
+                        character.chatFolders = chatFolders
+                        character.chats = chats
+                        return null
+                    })
+                } finally {
+                    sorted += 1
+                }
             },
             ...sortableOptions
         })

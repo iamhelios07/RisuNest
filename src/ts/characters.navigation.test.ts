@@ -26,6 +26,9 @@ const mocks = vi.hoisted(() => ({
     readPersistentConversation: vi.fn(),
     replacePersistentCompleteCharacter: vi.fn(),
     reconcilePersistentActiveCharacterIds: vi.fn(),
+    captureSelectedConversationTarget: vi.fn((): any => null),
+    acquireCompleteConversation: vi.fn(),
+    flushPendingData: vi.fn(async (_reason: string) => {}),
     alertConfirm: vi.fn(async () => true),
     alertSelect: vi.fn(async () => '0'),
     alertAddCharacter: vi.fn(async () => 'createfromScratch'),
@@ -119,6 +122,9 @@ vi.mock('./storage/persistentDataRuntime.svelte', () => ({
     readPersistentConversation: mocks.readPersistentConversation,
     replacePersistentCompleteCharacter: mocks.replacePersistentCompleteCharacter,
     reconcilePersistentActiveCharacterIds: mocks.reconcilePersistentActiveCharacterIds,
+    captureSelectedConversationTarget: mocks.captureSelectedConversationTarget,
+    acquireCompleteConversation: mocks.acquireCompleteConversation,
+    flushPendingData: mocks.flushPendingData,
 }))
 
 import {
@@ -130,12 +136,14 @@ import {
     createNewCharacter,
     createNewGroup,
     duplicateChat,
+    editSelectedChatList,
     exportAllChats,
     exportChat,
     removeChar,
     removeChat,
 } from './characters'
 import { createMetadataOnlySelectedConversation } from './storage/selectedConversationLifecycle'
+import { SelectedConversationPromotionStaleError } from './storage/activeWorkingSet.svelte'
 import { MobileGUIStack, OpenRealmStore, selectedCharID } from './stores.svelte'
 import { doingChat } from './process/index.svelte'
 import { createConversationSummaryStub } from './storage/conversationResidency'
@@ -788,6 +796,20 @@ describe('chat list operations', () => {
         character.chatPage = 1
         return character
     }
+    const buildSelectedCharacter = () => {
+        const character = buildCharacter()
+        mocks.database.characters.push(character)
+        selectedCharID.set(mocks.database.characters.length - 1)
+        return character
+    }
+    // Mirrors activation moving the selected page to the requested chat.
+    const selectChat = async (id?: string | number) => {
+        const character = mocks.database.characters[get(selectedCharID)]
+        const index = character?.chats.findIndex((chat: any) => chat.id === id) ?? -1
+        if (index === -1) return false
+        character.chatPage = index
+        return true
+    }
 
     beforeEach(() => {
         mocks.database.characters = []
@@ -796,51 +818,108 @@ describe('chat list operations', () => {
         vi.clearAllMocks()
         mocks.readPersistentConversation.mockReset()
         mocks.changeChatTo.mockReset()
-        mocks.changeChatTo.mockResolvedValue(true)
+        mocks.changeChatTo.mockImplementation(selectChat)
+        mocks.captureSelectedConversationTarget.mockReset()
+        mocks.captureSelectedConversationTarget.mockReturnValue(null)
+        mocks.acquireCompleteConversation.mockReset()
+        mocks.flushPendingData.mockReset()
     })
 
     it('keeps the selected chat when another chat is removed', async () => {
-        const character = buildCharacter()
+        const character = buildSelectedCharacter()
 
-        const removed = await removeChat(character, 'chat-c')
+        const removed = await removeChat(character, 'chat-a')
 
         expect(removed).toBe(true)
-        expect(character.chats.map((chat: any) => chat.id)).toEqual(['chat-a', 'chat-b'])
-        expect(character.chatPage).toBe(1)
-        expect(mocks.changeChatTo).toHaveBeenCalledWith('chat-b')
+        expect(character.chats.map((chat: any) => chat.id)).toEqual(['chat-b', 'chat-c'])
+        expect(character.chatPage).toBe(0)
+        expect(mocks.changeChatTo).not.toHaveBeenCalled()
     })
 
-    it('moves to a surviving chat when the selected chat is removed', async () => {
-        const character = buildCharacter()
+    it('moves to a surviving chat before removing the selected chat', async () => {
+        const character = buildSelectedCharacter()
 
         await removeChat(character, 'chat-b')
 
+        expect(mocks.changeChatTo).toHaveBeenCalledWith('chat-a')
         expect(character.chats.map((chat: any) => chat.id)).toEqual(['chat-a', 'chat-c'])
         expect(character.chatPage).toBe(0)
-        expect(mocks.changeChatTo).toHaveBeenCalledWith('chat-a')
     })
 
-    it('repairs the chat page synchronously even when activation fails twice', async () => {
-        const character = buildCharacter()
+    it('keeps the selected chat when activation of the survivor fails twice', async () => {
+        const character = buildSelectedCharacter()
         character.chatPage = 2
         mocks.changeChatTo.mockResolvedValue(false)
 
-        await removeChat(character, 'chat-c')
+        expect(await removeChat(character, 'chat-c')).toBe(false)
 
-        expect(character.chats).toHaveLength(2)
-        expect(character.chatPage).toBeLessThan(character.chats.length)
-        expect(character.chats[character.chatPage]).toBeTruthy()
+        expect(character.chats.map((chat: any) => chat.id)).toEqual(['chat-a', 'chat-b', 'chat-c'])
+        expect(character.chatPage).toBe(2)
         expect(mocks.changeChatTo).toHaveBeenCalledTimes(2)
     })
 
-    it('retries activation once before settling for the repaired page', async () => {
-        const character = buildCharacter()
-        mocks.changeChatTo.mockResolvedValueOnce(false).mockResolvedValueOnce(true)
+    it('retries activation once before removing the selected chat', async () => {
+        const character = buildSelectedCharacter()
+        mocks.changeChatTo.mockResolvedValueOnce(false).mockImplementationOnce(selectChat)
 
-        await removeChat(character, 'chat-b')
+        expect(await removeChat(character, 'chat-b')).toBe(true)
 
         expect(mocks.changeChatTo).toHaveBeenCalledTimes(2)
         expect(mocks.changeChatTo).toHaveBeenNthCalledWith(2, 'chat-a')
+        expect(character.chats.map((chat: any) => chat.id)).toEqual(['chat-a', 'chat-c'])
+    })
+
+    it('holds the selected conversation complete while the chat list changes', async () => {
+        const character = buildSelectedCharacter()
+        const target = { characterId: character.chaId, conversationId: 'chat-b' }
+        const events: string[] = []
+        const release = vi.fn(() => events.push('release'))
+        mocks.captureSelectedConversationTarget.mockReturnValue(target)
+        mocks.acquireCompleteConversation.mockImplementation(async () => {
+            events.push('acquire')
+            return { release }
+        })
+        mocks.flushPendingData.mockImplementation(async () => {
+            events.push(`flush:${character.chats[character.chatPage].id}`)
+        })
+        mocks.changeChatTo.mockImplementation(async (id?: string | number) => {
+            events.push(`navigate:${id}`)
+            return selectChat(id)
+        })
+
+        expect(await addNewChat(character)).toBe(true)
+
+        expect(mocks.acquireCompleteConversation).toHaveBeenCalledWith('add-chat', target)
+        expect(events).toEqual(['acquire', 'flush:chat-b', `navigate:${character.chats[0].id}`, 'release'])
+        expect(character.chatPage).toBe(0)
+    })
+
+    it('does not change the chat list when complete ownership is stale', async () => {
+        const character = buildSelectedCharacter()
+        mocks.captureSelectedConversationTarget.mockReturnValue({
+            characterId: character.chaId,
+            conversationId: 'chat-b',
+        })
+        mocks.acquireCompleteConversation.mockRejectedValue(new SelectedConversationPromotionStaleError())
+
+        expect(await addNewChat(character)).toBe(false)
+
+        expect(character.chats).toHaveLength(3)
+        expect(character.chatPage).toBe(1)
+        expect(mocks.changeChatTo).not.toHaveBeenCalled()
+    })
+
+    it('keeps the selected page on the same chat when chats are inserted in front', async () => {
+        const character = buildSelectedCharacter()
+
+        expect(await editSelectedChatList(character.chaId, 'import-chat', (current) => {
+            current.chats.unshift({ message: [], note: '', name: 'Imported', localLore: [], id: 'imported' })
+            return null
+        })).toBe(true)
+
+        expect(character.chatPage).toBe(2)
+        expect(character.chats[character.chatPage].id).toBe('chat-b')
+        expect(mocks.changeChatTo).not.toHaveBeenCalled()
     })
 
     it('does nothing for an unknown chat id', async () => {
@@ -855,7 +934,7 @@ describe('chat list operations', () => {
     })
 
     it('adds a new chat in front and activates it', async () => {
-        const character = buildCharacter()
+        const character = buildSelectedCharacter()
 
         const added = await addNewChat(character)
 
@@ -1020,7 +1099,7 @@ describe('chat list operations', () => {
     })
 
     it('seeds group chats with member first messages', async () => {
-        const character = buildCharacter() as any
+        const character = buildSelectedCharacter() as any
         character.type = 'group'
         character.characters = ['member-1']
         mocks.findCharacterbyId.mockReturnValue({ firstMessage: 'hello there' })

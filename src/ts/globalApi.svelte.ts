@@ -60,6 +60,7 @@ import {
     replacePersistentDatabase,
 } from "./storage/persistentDataRuntime.svelte";
 import * as persistentDataRuntime from "./storage/persistentDataRuntime.svelte";
+import { PersistentMutationFencedError } from "./storage/saveCoordinator";
 import {
     queryChatMessageTargetAt,
     queryChatMessageTargetById,
@@ -1715,6 +1716,10 @@ export async function changeChatTo(IdOrIndex: string | number): Promise<boolean>
             return false
         const activated = await activateConversation(chatId)
         return activity.isCurrent() ? activated : false
+    } catch (error) {
+        // A replacement or refresh holding storage refuses the switch like a stale click.
+        if (error instanceof PersistentMutationFencedError) return false
+        throw error
     } finally {
         activity.finish()
     }

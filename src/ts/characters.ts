@@ -18,11 +18,14 @@ import { doingChat } from "./process/index.svelte";
 import { importCharacter } from "./characterCards";
 import { PngChunk } from "./pngChunk";
 import {
+    acquireCompleteConversation,
     activateCharacter,
+    captureSelectedConversationTarget,
     commitCharacterAddition,
     deactivateActiveWorkingSet,
     deletePersistentCharacterWithGroupReferences,
     fencePersistentNavigation,
+    flushPendingData,
     getPersistentNavigationGeneration,
     mutatePersistentCharacterDetail,
     readPersistentCompleteCharacter,
@@ -42,6 +45,8 @@ import {
     selectCharacterImageFile,
 } from './storage/characterImageFileRoute'
 import { importNativeJpegAsset } from './storage/nativeJpegAssetImport'
+import { SelectedConversationPromotionStaleError } from './storage/activeWorkingSet.svelte'
+import { PersistentMutationFencedError } from './storage/saveCoordinator'
 import { beginNavigationActivity } from './ui/navigationActivity'
 import { yieldToUi } from './ui/yieldToUi'
 
@@ -426,6 +431,7 @@ export async function importChat(){
     }
     try {
         const selectedID = get(selectedCharID)
+        const characterId = DBState.db.characters[selectedID].chaId
 
         if(dat.name.endsWith('jsonl')){
             const lines = Buffer.from(dat.data).toString('utf-8').split('\n')
@@ -459,13 +465,15 @@ export async function importChat(){
                 return
             }
 
-            if(DBState.db.characters[selectedID].chatFolders
-                .filter(folder => folder.id === newChat.folderId).length === 0) {
-                newChat.folderId = null
-            }
-
-            DBState.db.characters[selectedID].chats.unshift(newChat)
-            if(await changeChatTo(newChat.id)){
+            const imported = await editSelectedChatList(characterId, 'import-chat', (character) => {
+                if(character.chatFolders
+                    .filter(folder => folder.id === newChat.folderId).length === 0) {
+                    newChat.folderId = null
+                }
+                character.chats.unshift(newChat)
+                return newChat.id
+            })
+            if(imported){
                 alertNormal(language.successImport)
             }
         }
@@ -474,48 +482,56 @@ export async function importChat(){
             if((json.type === 'risuAllChats' || json.type === 'risuChat') && json.ver === 2){
                 const folders = json.folders || []
                 const chats = Array.isArray(json.data) ? json.data : [json.data]
-                const selectedID = get(selectedCharID)
-                let db = getDatabase()
-                let folderIdMap = {}
-                folders.forEach(folder => {
-                    if(db.characters[selectedID].chatFolders?.some(f => f.id === folder.id)){
-                        const newId = uuidv4()
-                        folderIdMap[folder.id] = newId
-                        folder.id = newId
-                    } else {
-                        folderIdMap[folder.id] = folder.id
+                const imported = await editSelectedChatList(characterId, 'import-chat', (character) => {
+                    let folderIdMap = {}
+                    folders.forEach(folder => {
+                        if(character.chatFolders?.some(f => f.id === folder.id)){
+                            const newId = uuidv4()
+                            folderIdMap[folder.id] = newId
+                            folder.id = newId
+                        } else {
+                            folderIdMap[folder.id] = folder.id
+                        }
+                    })
+                    if(character.chatFolders === undefined){
+                        character.chatFolders = []
                     }
+                    character.chatFolders.push(...folders)
+                    chats.forEach(chat => {
+                        if(chat.folderId && folderIdMap[chat.folderId]){
+                            chat.folderId = folderIdMap[chat.folderId]
+                        }
+                        chat.id = v4()
+                    })
+                    character.chats.unshift(...chats)
+                    return null
                 })
-                if(db.characters[selectedID].chatFolders === undefined){
-                    db.characters[selectedID].chatFolders = []
+                if(imported){
+                    alertNormal(language.successImport)
                 }
-                db.characters[selectedID].chatFolders.push(...folders)
-                chats.forEach(chat => {
-                    if(chat.folderId && folderIdMap[chat.folderId]){
-                        chat.folderId = folderIdMap[chat.folderId]
-                    }
-                    chat.id = v4()
-                })
-                DBState.db.characters[selectedID].chats.unshift(...chats)
-                alertNormal(language.successImport)
                 return
             }
             if(json.type === 'risuAllChats' && json.ver === 1){
                 const chats = json.data
                 if(Array.isArray(chats) && chats.length > 0){
-                    const usedIds = new Set(DBState.db.characters[selectedID].chats.map((chat) => chat.id))
-                    DBState.db.characters[selectedID].chats.unshift(...(chats.map((v) => {
-                        if(!v.id || usedIds.has(v.id)){
-                            v.id = uuidv4()
-                        }
-                        usedIds.add(v.id)
-                        if(!v.localLore){
-                            v.localLore = []
-                        }
-                        v.fmIndex ??= -1
-                        return v
-                    })))
-                    alertNormal(language.successImport)
+                    const imported = await editSelectedChatList(characterId, 'import-chat', (character) => {
+                        const usedIds = new Set(character.chats.map((chat) => chat.id))
+                        character.chats.unshift(...(chats.map((v) => {
+                            if(!v.id || usedIds.has(v.id)){
+                                v.id = uuidv4()
+                            }
+                            usedIds.add(v.id)
+                            if(!v.localLore){
+                                v.localLore = []
+                            }
+                            v.fmIndex ??= -1
+                            return v
+                        })))
+                        return null
+                    })
+                    if(imported){
+                        alertNormal(language.successImport)
+                    }
                     return
                 } else {
                     alertError(language.errors.noData)
@@ -527,8 +543,13 @@ export async function importChat(){
                 if(!(checkNullish(das.message) || checkNullish(das.note) || checkNullish(das.name) || checkNullish(das.localLore))){
                     das.fmIndex ??= -1
                     das.id = v4()
-                    DBState.db.characters[selectedID].chats.unshift(das)
-                    alertNormal(language.successImport)
+                    const imported = await editSelectedChatList(characterId, 'import-chat', (character) => {
+                        character.chats.unshift(das)
+                        return null
+                    })
+                    if(imported){
+                        alertNormal(language.successImport)
+                    }
                     return
                 }
                 else{
@@ -547,8 +568,13 @@ export async function importChat(){
             const json = JSON.parse(chat)
             if(json.message && json.note && json.name && json.localLore){
                 json.id = v4()
-                DBState.db.characters[selectedID].chats.unshift(json)
-                alertNormal(language.successImport)
+                const imported = await editSelectedChatList(characterId, 'import-chat', (character) => {
+                    character.chats.unshift(json)
+                    return null
+                })
+                if(imported){
+                    alertNormal(language.successImport)
+                }
             }
             else{
                 alertError(language.errors.noData)
@@ -1081,29 +1107,83 @@ export async function changeChar(index: number, arg:{
     }
 }
 
-export async function addNewChat(character: character | groupChat): Promise<boolean> {
-    const chats = character.chats
-    const newChat: Chat = {
-        ...defaultChatToggleBinding(DBState.db),
-        message: [],
-        note: '',
-        name: `New Chat ${chats.length + 1}`,
-        localLore: [],
-        fmIndex: -1,
-        id: uuidv4(),
+/**
+ * Edits the selected character's chat list while the selected conversation is
+ * held complete, so a windowed selection never persists an unexplained list
+ * change. The previously selected chat stays selected unless `edit` returns the
+ * id of the chat to switch to. `edit` returns false to abandon the change.
+ */
+export async function editSelectedChatList(
+    characterId: string,
+    reason: string,
+    edit: (character: character | groupChat) => string | null | false,
+): Promise<boolean> {
+    const resolveCharacter = () => {
+        const current = DBState.db.characters[get(selectedCharID)]
+        return current?.chaId === characterId ? current : null
     }
-    if(character.type === 'group'){
-        for(const memberId of character.characters){
-            newChat.message.push({
-                saying: memberId,
-                role: 'char',
-                data: findCharacterbyId(memberId).firstMessage,
-            })
+    if (!resolveCharacter()) return false
+    const target = captureSelectedConversationTarget()
+    let lease: Awaited<ReturnType<typeof acquireCompleteConversation>> | null = null
+    if (target?.characterId === characterId) {
+        try {
+            lease = await acquireCompleteConversation(reason, target)
+        } catch (error) {
+            if (error instanceof SelectedConversationPromotionStaleError) return false
+            throw error
         }
     }
-    chats.unshift(newChat)
-    character.chats = chats
-    return await changeChatTo(newChat.id)
+    try {
+        const character = resolveCharacter()
+        if (!character) return false
+        const selectedId = character.chats[character.chatPage]?.id
+        if (lease && selectedId !== target?.conversationId) return false
+        const nextId = edit(character)
+        if (nextId === false) return false
+        const selectedIndex = character.chats.findIndex((chat) => chat.id === selectedId)
+        if (selectedIndex !== -1 && character.chatPage !== selectedIndex) {
+            character.chatPage = selectedIndex
+        }
+        if (lease) {
+            try {
+                await flushPendingData(reason)
+            } catch (error) {
+                // The edit stays in the working set and is saved once storage accepts input.
+                if (error instanceof PersistentMutationFencedError) return false
+                throw error
+            }
+        }
+        return nextId === null ? true : await changeChatTo(nextId)
+    } finally {
+        lease?.release()
+    }
+}
+
+export async function addNewChat(character: character | groupChat): Promise<boolean> {
+    return editSelectedChatList(character.chaId, 'add-chat', (current) => {
+        const chats = current.chats
+        const newChat: Chat = {
+            ...defaultChatToggleBinding(DBState.db),
+            message: [],
+            note: '',
+            name: `New Chat ${chats.length + 1}`,
+            localLore: [],
+            fmIndex: -1,
+            id: uuidv4(),
+        }
+        if(current.type === 'group'){
+            for(const memberId of current.characters){
+                newChat.message.push({
+                    saying: memberId,
+                    role: 'char',
+                    data: findCharacterbyId(memberId).firstMessage,
+                })
+            }
+        }
+        chats.unshift(newChat)
+        current.chats = chats
+        return newChat.id
+    })
 }
 
 export async function duplicateChat(characterId: string, chatId: string): Promise<boolean> {
@@ -1111,37 +1191,32 @@ export async function duplicateChat(characterId: string, chatId: string): Promis
     if (selectedBeforeRead !== characterId) return false
     const source = await readPersistentConversation(characterId, chatId, 'duplicate-chat')
     if (!source) return false
-    const database = getDatabase()
-    const selectedAfterRead = database.characters[get(selectedCharID)]
-    if (selectedAfterRead?.chaId !== characterId) return false
-    const character = database.characters.find((candidate) => candidate.chaId === characterId)
-    if (!character?.chats.some((conversation) => conversation.id === chatId)) return false
-    const duplicate = safeStructuredClone(source)
-    duplicate.name = createChatCopyName(duplicate.name, 'Copy')
-    duplicate.id = v4()
-    character.chats.unshift(duplicate)
-    character.chats = character.chats
-    return await changeChatTo(duplicate.id)
+    return editSelectedChatList(characterId, 'duplicate-chat', (character) => {
+        if (!character.chats.some((conversation) => conversation.id === chatId)) return false
+        const duplicate = safeStructuredClone(source)
+        duplicate.name = createChatCopyName(duplicate.name, 'Copy')
+        duplicate.id = v4()
+        character.chats.unshift(duplicate)
+        character.chats = character.chats
+        return duplicate.id
+    })
 }
 
 export async function removeChat(character: character | groupChat, chatId: string): Promise<boolean> {
     const chats = character.chats
-    const removeIndex = chats.findIndex((chat) => chat.id === chatId)
-    if(removeIndex === -1) return false
+    if(!chats.some((chat) => chat.id === chatId)) return false
     const selectedChatId = chats[character.chatPage]?.id
-    const survivingId = selectedChatId === chatId
-        ? chats.find((candidate) => candidate.id !== chatId)?.id
-        : selectedChatId
-    chats.splice(removeIndex, 1)
-    character.chats = chats
-    const survivingIndex = survivingId
-        ? chats.findIndex((chat) => chat.id === survivingId)
-        : -1
-    character.chatPage = survivingIndex !== -1
-        ? survivingIndex
-        : Math.max(0, Math.min(character.chatPage, chats.length - 1))
-    if(survivingId && !(await changeChatTo(survivingId))){
-        await changeChatTo(survivingId)
+    if (selectedChatId === chatId) {
+        // Leave the chat first so the removal never targets the selected conversation.
+        const survivingId = chats.find((candidate) => candidate.id !== chatId)?.id
+        if (!survivingId) return false
+        if (!(await changeChatTo(survivingId)) && !(await changeChatTo(survivingId))) return false
     }
-    return true
+    return editSelectedChatList(character.chaId, 'remove-chat', (current) => {
+        const removeIndex = current.chats.findIndex((chat) => chat.id === chatId)
+        if (removeIndex === -1 || removeIndex === current.chatPage) return false
+        current.chats.splice(removeIndex, 1)
+        current.chats = current.chats
+        return null
+    })
 }

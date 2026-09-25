@@ -144,6 +144,7 @@ async function bootProductionApp(indexedDB: IDBFactory, seed?: Database) {
     const mutations = await import('../conversationMutations')
     const { appendDefaultChatInput } = await import('../../lib/ChatScreens/defaultChatInput')
     const { default: Harness } = await import('../../lib/SideBars/BoundCharacterEditorHarness.test.svelte')
+    const chatListRows = await import('../../lib/SideBars/sideChatListRows')
 
     if (seed) {
         const raw = factory.getRawPersistentDataStore()
@@ -187,7 +188,7 @@ async function bootProductionApp(indexedDB: IDBFactory, seed?: Database) {
     stores.selectedCharID.set(-1)
     await globalApi.saveDb()
     return {
-        svelte, stores, runtime, characters, generation, mutations, residency, Harness,
+        svelte, stores, runtime, characters, generation, mutations, residency, Harness, chatListRows,
         getDatabase: databaseModule.getDatabase,
         appendDefaultChatInput, saveCapturedChatMessage, createSelectedConversationOperations,
     }
@@ -650,6 +651,99 @@ describe('windowed navigation integration', () => {
             ).toHaveLength(1)
         } finally {
             completeLease.release()
+        }
+    })
+})
+
+describe('selected chat list edits', () => {
+    it.each(['character', 'group'] as const)('adds, duplicates, reorders and removes %s chats beside the bound editor', async (type) => {
+        const indexedDB = new IDBFactory()
+        const previousGlobals = { indexedDB: globalThis.indexedDB, IDBKeyRange: globalThis.IDBKeyRange }
+        const ownerId = 'edited-owner'
+        const originalId = `${ownerId}-chat`
+        const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+        const target = document.createElement('div')
+        document.body.append(target)
+        let editor: ReturnType<ProductionApp['svelte']['mount']> | null = null
+        let app: ProductionApp | null = null
+        const reader = new IndexedDbPersistentDataStore('risuai-persistent-data', indexedDB, IDBKeyRange)
+        try {
+            app = await bootProductionApp(indexedDB, syntheticLibrary(type))
+            const { svelte, stores, runtime, characters, chatListRows } = app
+            const selected = () => stores.DBState.db.characters[get(stores.selectedCharID)]
+            const selectedChatId = () => selected().chats[selected().chatPage]?.id
+            const chatIds = () => selected().chats.map((chat) => chat.id)
+            editor = svelte.mount(app.Harness, { target })
+            svelte.flushSync()
+            expect(await characters.changeChar(
+                stores.DBState.db.characters.findIndex((candidate) => candidate.chaId === ownerId),
+            )).toBe(true)
+            await vi.waitFor(() => expect(target.querySelector('input')).not.toBeNull())
+
+            // Consecutive clicks land while the editor is still reacquiring the new selection.
+            expect(await characters.addNewChat(selected())).toBe(true)
+            const first = chatIds()[0]
+            expect(selectedChatId()).toBe(first)
+            expect(await characters.addNewChat(selected())).toBe(true)
+            const second = chatIds()[0]
+            expect(selectedChatId()).toBe(second)
+            expect(chatIds()).toEqual([second, first, originalId])
+
+            expect(await characters.duplicateChat(ownerId, originalId)).toBe(true)
+            const duplicate = chatIds()[0]
+            expect(selectedChatId()).toBe(duplicate)
+            expect(selected().chats[0].name).toBe('Synthetic chat (Copy)')
+
+            const reversed = [...chatIds()].reverse()
+            expect(await characters.editSelectedChatList(ownerId, 'reorder-chats', (character) => {
+                const chats = chatListRows.orderChatsByDroppedRows(
+                    character.chats,
+                    reversed.map((id) => ({ id, folderId: null })),
+                )
+                if (!chats) return false
+                character.chats = chats
+                return null
+            })).toBe(true)
+            expect(chatIds()).toEqual(reversed)
+            expect(selectedChatId()).toBe(duplicate)
+
+            expect(await characters.removeChat(selected(), duplicate)).toBe(true)
+            expect(chatIds()).not.toContain(duplicate)
+            expect(selectedChatId()).toBe(chatIds()[0])
+            expect(await characters.removeChat(selected(), second)).toBe(true)
+            expect(chatIds()).toEqual([originalId, first])
+            expect(selectedChatId()).toBe(originalId)
+
+            expect(runtime.pendingWorkingSetRefreshRevision).toBeNull()
+            expect(consoleError.mock.calls.map((args) => args.map((value) =>
+                value instanceof Error ? `${value.name}: ${value.message}` : String(value).slice(0, 200)))).toEqual([])
+
+            await svelte.unmount(editor)
+            editor = null
+            await runtime.flushPendingData('exit')
+            await reader.open()
+            expect((await reader.readRoot()).revision).toBe(runtime.revision)
+            const created = await reader.readConversation(ownerId, first)
+            expect(created?.value.name).toBe('New Chat 2')
+            expect(created?.value.message.map((message) => message.saying ?? null))
+                .toEqual(type === 'group' ? ['group-member'] : [])
+            expect(await reader.readConversation(ownerId, duplicate)).toBeNull()
+            expect(await reader.readConversation(ownerId, second)).toBeNull()
+
+            const rebooted = await bootProductionApp(indexedDB)
+            app = rebooted
+            expect(await rebooted.characters.changeChar(
+                rebooted.stores.DBState.db.characters.findIndex((candidate) => candidate.chaId === ownerId),
+            )).toBe(true)
+            const reopened = rebooted.stores.DBState.db.characters[get(rebooted.stores.selectedCharID)]
+            expect(reopened.chats.map((chat) => chat.id)).toEqual([originalId, first])
+            expect(reopened.chats[reopened.chatPage].id).toBe(originalId)
+            await rebooted.runtime.flushPendingData('exit')
+        } finally {
+            if (editor && app) await app.svelte.unmount(editor)
+            target.remove()
+            consoleError.mockRestore()
+            Object.assign(globalThis, previousGlobals)
         }
     })
 })
