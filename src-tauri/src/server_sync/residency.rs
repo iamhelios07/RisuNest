@@ -30,6 +30,7 @@ pub(crate) fn arm_anchor(root: &Path) {
     });
 }
 
+#[cfg(any(mobile, test))]
 pub(crate) fn release_anchor() {
     anchor().take();
 }
