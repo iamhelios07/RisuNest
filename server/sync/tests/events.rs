@@ -162,9 +162,16 @@ async fn held_streams_occupy_no_admission_slot_and_leave_the_server_drainable() 
     // Four streams exceed the two concurrent requests one device is admitted,
     // yet ordinary requests still pass and maintenance still sees a drain.
     server.head().await;
-    let status = server.workload.status().unwrap();
-    assert_eq!(status.active_requests, 0);
-    assert!(status.drained);
+    assert_eq!(server.workload.status().unwrap().active_requests, 0);
+    // Idle background passes briefly hold a slot every 250 ms, so the drain is
+    // observed between them rather than at one instant.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !server.workload.status().unwrap().drained {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("held streams must leave the server drainable");
     drop(streams);
     server.task.abort();
 }
