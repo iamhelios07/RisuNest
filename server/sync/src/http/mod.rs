@@ -798,7 +798,7 @@ async fn commit(
         .to_owned();
     blocking(
         move || match app.store.submit_commit(&device, &intent, &if_match)? {
-            CommitSubmission::Terminal(receipt) => Ok(receipt_response(receipt)),
+            CommitSubmission::Terminal(receipt) => Ok(receipt_response(*receipt)),
             pending => {
                 let small = app
                     .store
