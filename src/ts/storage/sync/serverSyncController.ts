@@ -427,6 +427,9 @@ export function createServerSyncController(
       try {
         while (true) {
           if (signal.aborted) throw new DOMException("Exit drain aborted", "AbortError");
+          // The exit edit fence refuses a new cycle's local flush, so an
+          // already synchronized revision must not start another cycle.
+          if (!state.running && completedRevision(targetRevision)) return { kind: "complete" };
           await startSynchronization({}, false);
           if (signal.aborted) throw new DOMException("Exit drain aborted", "AbortError");
           if (completedRevision(targetRevision)) return { kind: "complete" };

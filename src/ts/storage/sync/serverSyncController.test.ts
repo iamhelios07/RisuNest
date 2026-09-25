@@ -75,6 +75,19 @@ describe("server sync controller", () => {
     await expect(draining).resolves.toEqual({ kind: "complete" });
   });
 
+  it("completes an exit drain without a new cycle when the target revision is already synchronized", async () => {
+    const { controller, facade } = fixture();
+    await controller.synchronize();
+    expect(controller.snapshot().initialSyncComplete).toBe(true);
+    facade.cycle.mockRejectedValue(new Error("synthetic fenced flush"));
+
+    await expect(
+      controller.drainToRevision(3, new AbortController().signal),
+    ).resolves.toEqual({ kind: "complete" });
+    expect(facade.cycle).toHaveBeenCalledOnce();
+    expect(controller.snapshot().error).toBeFalsy();
+  });
+
   it("drains through a newer target revision and restores the prior manual pause", async () => {
     vi.useFakeTimers();
     const { controller, facade, status } = fixture();
