@@ -307,6 +307,75 @@ fn interrupted_deletions_still_use_a_bounded_cleanup_page() {
 }
 
 #[test]
+fn a_restarted_application_reclaims_every_settled_job_without_a_later_settlement() {
+    let (directory, mut store, open, _template) = fixture();
+    let root = directory.path();
+    let jobs = JobStore::open(root).unwrap();
+    let state = JobCommandState::default();
+    let admission = Admission::default();
+    // An open job may still read its bodies, and its claim is not one to borrow.
+    assert!(!open.terminal());
+    store.external_cancel_prepared(&open.id).unwrap();
+    held(root, &jobs, &open);
+    fs::create_dir_all(receive_directory(root, &open.id)).unwrap();
+    assert!(receive_artifacts::settled_holder(root, "connection").unwrap().is_none());
+    // Settled for now only so the later jobs can be recorded beside it.
+    let mut paused = jobs.read(&open.id).unwrap();
+    paused.summary["state"] = json!("cancelled");
+    jobs.put(&paused).unwrap();
+    let unknown = bind(&mut store, "unknown-snapshot");
+    held(root, &jobs, &unknown);
+    fs::create_dir_all(receive_directory(root, &unknown.id)).unwrap();
+    set_phase(root, &unknown.id, "publicationUnknown");
+    settle(&jobs, &unknown.id, "failed");
+    let mut settled = Vec::new();
+    for index in 0..12 {
+        let job = bind(&mut store, &format!("settled-{index}"));
+        held(root, &jobs, &job);
+        store.external_cancel_prepared(&job.id).unwrap();
+        settle(&jobs, &job.id, "cancelled");
+        fs::create_dir_all(receive_directory(root, &job.id)).unwrap();
+        fs::write(receive_directory(root, &job.id).join("body"), b"synthetic body").unwrap();
+        settled.push(job.id);
+    }
+    paused.summary["state"] = open.summary["state"].clone();
+    jobs.put(&paused).unwrap();
+    // An earlier pass stopped partway through the connection's jobs.
+    let (cursor, _) = jobs
+        .list_holding_receive_artifacts("connection", 0, 5)
+        .unwrap()
+        .pop()
+        .unwrap();
+    jobs.set_receive_cleanup_after("connection", cursor).unwrap();
+
+    let holder = receive_artifacts::settled_holder(root, "connection").unwrap().unwrap();
+    assert_eq!(holder.id, unknown.id);
+    let (_, claim) = state.claim(&holder).unwrap();
+    assert!(state.claim(&open).is_err());
+    let mut detached = receive_artifacts::detach_every_page(
+        &Owners { root, state: &state, store: &store, admission: &admission, repository_id: "repository" },
+        &claim,
+        "connection",
+    )
+    .unwrap();
+    drop(claim);
+    receive_artifacts::remove_detached(root, &detached);
+
+    detached.sort();
+    settled.sort();
+    assert_eq!(detached, settled);
+    for id in &settled {
+        assert!(!marked(root, id));
+        assert!(!job_directory(root, "connection", id).exists());
+    }
+    for owner in [&open.id, &unknown.id] {
+        assert!(marked(root, owner));
+        assert!(receive_directory(root, owner).is_dir());
+    }
+    assert_eq!(jobs.receive_cleanup_after("connection").unwrap(), 0);
+}
+
+#[test]
 fn retained_jobs_count_toward_the_page_without_starving_later_or_released_owners() {
     let (directory, mut store, claim_job, _template) = fixture();
     store.external_cancel_prepared(&claim_job.id).unwrap();

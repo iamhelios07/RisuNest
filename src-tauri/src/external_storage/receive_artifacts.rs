@@ -290,37 +290,115 @@ fn remove_job(root: &Path, id: &str) -> Result<()> {
     jobs.release_receive_artifacts(id)
 }
 
+/// A settled job on `connection_id` that still holds downloaded bodies. Its
+/// claim is the one its own settlement pass held, so a start on the
+/// connection waits for a pass run under it.
+pub(crate) fn settled_holder(root: &Path, connection_id: &str) -> Result<Option<DurableJob>> {
+    let jobs = JobStore::open(root)?;
+    let mut after = 0;
+    loop {
+        let page = jobs.list_holding_receive_artifacts(connection_id, after, JOBS_PER_PASS)?;
+        let Some((cursor, _)) = page.last() else {
+            return Ok(None);
+        };
+        after = *cursor;
+        if let Some((_, job)) = page.into_iter().find(|(_, job)| job.terminal()) {
+            return Ok(Some(job));
+        }
+    }
+}
+
+/// Every page of the pass on `connection_id`, from the first job on, for the
+/// bodies no later settlement on the connection will release.
+pub(crate) fn detach_every_page(
+    owners: &Owners<'_>,
+    claim: &JobClaim,
+    connection_id: &str,
+) -> Result<Vec<String>> {
+    let jobs = JobStore::open(owners.root)?;
+    jobs.set_receive_cleanup_after(connection_id, 0)?;
+    let mut detached = Vec::new();
+    loop {
+        detached.extend(detach_connection(owners, claim, connection_id)?);
+        if jobs.receive_cleanup_after(connection_id)? == 0 {
+            return Ok(detached);
+        }
+    }
+}
+
+fn with_owners<T>(
+    app: &AppHandle,
+    connection_id: &str,
+    pass: impl FnOnce(&Owners<'_>) -> Result<T>,
+) -> Result<T> {
+    let root = root(app)?;
+    let repository_id = ConnectionStore::open(&root)?
+        .read(connection_id)?
+        .descriptor
+        .repository_id;
+    let store = native_store(app)?;
+    let admission = app
+        .state::<crate::native_file_jobs::NativeFileJobState>()
+        .admission
+        .clone();
+    let state = app.state::<JobCommandState>();
+    pass(&Owners {
+        root: &root,
+        state: &state,
+        store: &store,
+        admission: &admission,
+        repository_id: &repository_id,
+    })
+}
+
 /// The pass for the connection `claim` holds, as the running application sees
 /// it. Nothing it finds is reported as the job's own outcome.
 pub(crate) fn detach_claimed(app: &AppHandle, claim: &JobClaim, connection_id: &str) -> Vec<String> {
-    let detached = (|| {
-        let root = root(app)?;
-        let repository_id = ConnectionStore::open(&root)?
-            .read(connection_id)?
-            .descriptor
-            .repository_id;
-        let store = native_store(app)?;
-        let admission = app
-            .state::<crate::native_file_jobs::NativeFileJobState>()
-            .admission
-            .clone();
-        let state = app.state::<JobCommandState>();
-        detach_connection(
-            &Owners {
-                root: &root,
-                state: &state,
-                store: &store,
-                admission: &admission,
-                repository_id: &repository_id,
-            },
-            claim,
-            connection_id,
-        )
-    })();
-    detached.unwrap_or_else(|error| {
-        crate::nlog!("warn", "External receive bodies were not examined: {error}");
-        Vec::new()
-    })
+    with_owners(app, connection_id, |owners| detach_connection(owners, claim, connection_id))
+        .unwrap_or_else(|error| {
+            crate::nlog!("warn", "External receive bodies were not examined: {error}");
+            Vec::new()
+        })
+}
+
+/// Runs the whole pass on every connection once the library store is open,
+/// for bodies whose job settled with no later settlement on its connection.
+/// A connection another job holds is left to that job's settlement.
+pub(crate) fn reclaim_settled_later(app: &AppHandle) {
+    let Ok(root) = root(app) else { return };
+    if !root.join("external-storage").is_dir() {
+        return;
+    }
+    let worker = app.state::<JobCommandState>().track_worker();
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _worker = worker;
+        let connections = match ConnectionStore::open(&root).and_then(|store| store.ids()) {
+            Ok(connections) => connections,
+            Err(error) => {
+                crate::nlog!("warn", "External receive bodies were not examined: {error}");
+                return;
+            }
+        };
+        for connection_id in connections {
+            let detached = (|| {
+                let Some(settled) = settled_holder(&root, &connection_id)? else {
+                    return Ok(Vec::new());
+                };
+                let Ok((_, claim)) = app.state::<JobCommandState>().claim(&settled) else {
+                    return Ok(Vec::new());
+                };
+                with_owners(&app, &connection_id, |owners| {
+                    detach_every_page(owners, &claim, &connection_id)
+                })
+            })()
+            .unwrap_or_else(|error: ProviderError| {
+                crate::nlog!("warn", "External receive bodies were not examined: {error}");
+                Vec::new()
+            });
+            remove_detached(&root, &detached);
+        }
+    });
 }
 
 /// Deletes moved bodies off the caller's path, as a worker application cleanup
