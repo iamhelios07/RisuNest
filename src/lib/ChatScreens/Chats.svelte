@@ -132,6 +132,7 @@
     let measuredHeightClock = 0
     let keyLookupScans = 0
     let pinReasons = new Map<string, Set<ChatViewportPinReason>>()
+    let blurredEditorPins = new Set<string>()
     let playingMedia = new Map<string, Set<EventTarget>>()
     let sourcePins = new Map<string, ConversationSourcePin>()
     let sourceLoads = new Map<string, AbortController>()
@@ -385,6 +386,7 @@
         measuredHeightClock = 0
         keyLookupScans = 0
         pinReasons = new Map()
+        blurredEditorPins = new Set()
         playingMedia = new Map()
         sourceHandoffRuntimeKeys = new Set()
         hasMountedUsableRow = false
@@ -824,6 +826,7 @@
                       pendingMissingRowsAnchor ??
                       viewportAnchor ??
                       captureDomAnchor())
+        releaseClosedEditorPins()
         const currentChat = currentCharacter.chats?.[currentCharacter.chatPage]
         const budget = getRuntimePerformanceBudgets().chatMountedMessageBudget
         const result = buildChatViewport({
@@ -1533,6 +1536,7 @@
         playingMedia.delete(key)
         // A remount can remove the focused control before focusout runs. Mirror
         // its released UI pin to the source even when no later input arrives.
+        blurredEditorPins.delete(key)
         if (pinReasons.delete(key)) queueProjectionReconcile()
         for (const target of media ?? []) {
             if (!(target instanceof HTMLMediaElement)) continue
@@ -1731,9 +1735,13 @@
         return target.closest<HTMLElement>('[data-chat-render-key]')?.dataset.chatRenderKey ?? null
     }
 
+    function hasActiveEditor(key: string): boolean {
+        return untrack(() => mountInstances.get(key)?.hasActiveEditor?.()) === true
+    }
+
     function hasFocusedEditor(key: string): boolean {
+        if (hasActiveEditor(key)) return true
         if (!pinReasons.get(key)?.has('editor')) return false
-        if (untrack(() => mountInstances.get(key)?.hasActiveEditor?.())) return true
         const focused = document.activeElement
         if (
             !(focused instanceof HTMLElement) ||
@@ -1767,7 +1775,9 @@
         // All focused controls keep their row resident. Only an actual editor
         // may postpone a changed message; a bot button must display its result.
         const key = rowKeyFromEvent(event)
-        if (key) addPin(key, 'editor')
+        if (!key) return
+        blurredEditorPins.delete(key)
+        addPin(key, 'editor')
     }
 
     function handleFocusOut(event: FocusEvent): void {
@@ -1777,8 +1787,26 @@
         if (event.relatedTarget instanceof Node && row?.contains(event.relatedTarget)) return
         queueMicrotask(() => {
             if (row && document.activeElement instanceof Node && row.contains(document.activeElement)) return
+            // An open editor keeps its row when focus leaves it, for example when an
+            // input fence makes the page inert, so its draft survives source handoffs.
+            if (hasActiveEditor(key)) {
+                blurredEditorPins.add(key)
+                return
+            }
             removePin(key, 'editor')
         })
+    }
+
+    function releaseClosedEditorPins(): void {
+        for (const key of blurredEditorPins) {
+            if (hasActiveEditor(key)) continue
+            blurredEditorPins.delete(key)
+            const row = mountedElements.get(key)
+            if (row && document.activeElement instanceof Node && row.contains(document.activeElement)) continue
+            const reasons = pinReasons.get(key)
+            if (!reasons?.delete('editor')) continue
+            if (reasons.size === 0) pinReasons.delete(key)
+        }
     }
 
     function handleMediaPlay(event: Event): void {
@@ -2327,6 +2355,7 @@
         measuredHeightIndexByKey.clear()
         measuredHeightRecency.clear()
         pinReasons.clear()
+        blurredEditorPins.clear()
         playingMedia.clear()
         sourceHandoffRuntimeKeys.clear()
         imageResolutionGeneration += 1

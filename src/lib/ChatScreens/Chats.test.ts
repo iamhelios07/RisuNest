@@ -1106,6 +1106,54 @@ describe('Chats imperative mount lifecycle', () => {
         expect(session.pinCount('streaming')).toBe(1)
     })
 
+    test('keeps an open editor pinned after it loses focus and across a source replacement', async () => {
+        const messages = [makeMessage(0), makeMessage(1)]
+        const firstCharacter = makeMetadataOnlyCharacter()
+        const firstSource = makePersistentViewportSource(messages)
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialCharacter: firstCharacter,
+                initialViewportSource: firstSource,
+            },
+        })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(2))
+        const editorRow = probeElements(target).find(
+            (element) => element.dataset.message === 'message-0',
+        )!
+        const editorInstance = Number(editorRow.dataset.chatProbe)
+        const editor = document.createElement('textarea')
+        editor.value = 'blurred draft'
+        editorRow.append(editor)
+        editor.focus()
+        chatMountProbe.activeEditors.add(editorInstance)
+        // An inert page moves focus to the body without a related target.
+        editor.blur()
+        await Promise.resolve()
+        await Promise.resolve()
+
+        const replacementCharacter = makeCharacter(structuredClone(messages), true)
+        const { session, source: replacementSource } = makeViewportSource(replacementCharacter)
+        firstSource.dispose()
+        ;(mounted as HarnessInstance).switchCharacterAndSource(
+            replacementCharacter,
+            replacementSource,
+        )
+
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(2))
+        expect(probeIdForMessage(target, 'message-0')).toBe(editorInstance)
+        expect(editor.isConnected).toBe(true)
+        expect(editor.value).toBe('blurred draft')
+        expect(session.pinCount('editor')).toBe(1)
+
+        chatMountProbe.activeEditors.delete(editorInstance)
+        ;(mounted as HarnessInstance).switchCharacterAndSource(
+            replacementCharacter,
+            replacementSource,
+        )
+        await vi.waitFor(() => expect(session.pinCount('editor')).toBe(0))
+    })
+
     test('does not preserve pinned runtime across a new navigation generation', async () => {
         const messages = [makeMessage(0), makeMessage(1)]
         const firstCharacter = makeCharacter(messages)
