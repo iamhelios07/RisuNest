@@ -18,7 +18,7 @@
     import { createMultiuserRoom } from "src/ts/sync/multiuser";
     import { bookmarkListOpen } from "src/ts/stores.svelte";
     import { language } from "src/lang";
-    import { bindPersona, saveChatBinding } from 'src/ts/chatBindings.svelte'
+    import { bindPersona, chatBindingBlockedByGeneration, saveChatBinding } from 'src/ts/chatBindings.svelte'
     import Toggles from "./Toggles.svelte";
     import { changeChatTo } from "src/ts/globalApi.svelte";
     import { indexSideChatListRows, orderChatsByDroppedRows, orderFoldersByDroppedIds, type DroppedChatRow } from "./sideChatListRows";
@@ -282,6 +282,7 @@
                                         break
                                     }
                                     case 1:{
+                                        if(chatBindingBlockedByGeneration()) break
                                         if(chat.bindedPersona){
                                             const confirm = await alertConfirm(language.doYouWantToUnbindCurrentPersona)
                                             if(confirm){
@@ -382,6 +383,7 @@
                             }
                             case 1:{
                                 const chat = chara.chats[i]
+                                if(chatBindingBlockedByGeneration()) break
                                 if(chat.bindedPersona){
                                     const confirm = await alertConfirm(language.doYouWantToUnbindCurrentPersona)
                                     if(confirm){

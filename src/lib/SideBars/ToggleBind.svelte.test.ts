@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
     error: vi.fn(),
     save: vi.fn(async () => {}),
     popup: vi.fn(),
+    blocked: vi.fn(() => false),
 }))
 vi.mock('src/lang', () => ({ language: languageEnglish }))
 vi.mock('src/ts/stores.svelte', () => {
@@ -29,6 +30,7 @@ vi.mock('src/ts/chatBindings.svelte', () => ({
     }),
     updateChatBinding: (conversation: object, patch: object) => Object.assign(conversation, patch),
     saveChatBinding: mocks.save,
+    chatBindingBlockedByGeneration: mocks.blocked,
 }))
 vi.mock('./TogglePresetPopup.svelte', () => ({
     default: (anchor: unknown, props: { close: () => void }) => mocks.popup(props),
@@ -75,6 +77,15 @@ it('binds the current toggle values, counts later changes and saves them', async
     expect(chat().savedToggleValues).toEqual({ toggle_a: '1', toggle_b: '1', toggle_c: 'x' })
     await tick()
     expect(button(languageEnglish.saveToggleChanges)!.disabled).toBe(true)
+})
+
+it('leaves the binding unchanged while a response is generating', async () => {
+    mocks.blocked.mockReturnValueOnce(true)
+    button(languageEnglish.bindToggles)!.click()
+    await tick()
+    expect(chat().savedToggleValues).toBeUndefined()
+    expect(mocks.save).not.toHaveBeenCalled()
+    expect(mocks.toast).not.toHaveBeenCalled()
 })
 
 it('unbinds only after confirmation and keeps the binding when declined', async () => {
