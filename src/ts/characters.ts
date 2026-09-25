@@ -1124,8 +1124,9 @@ export async function editSelectedChatList(
     }
     if (!resolveCharacter()) return false
     const target = captureSelectedConversationTarget()
+    if (target && target.characterId !== characterId) return false
     let lease: Awaited<ReturnType<typeof acquireCompleteConversation>> | null = null
-    if (target?.characterId === characterId) {
+    if (target) {
         try {
             lease = await acquireCompleteConversation(reason, target)
         } catch (error) {

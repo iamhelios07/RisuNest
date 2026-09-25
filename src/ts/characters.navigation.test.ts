@@ -909,6 +909,20 @@ describe('chat list operations', () => {
         expect(mocks.changeChatTo).not.toHaveBeenCalled()
     })
 
+    it('does not change the chat list while another character owns the selected conversation', async () => {
+        const character = buildSelectedCharacter()
+        mocks.captureSelectedConversationTarget.mockReturnValue({
+            characterId: 'previous-character',
+            conversationId: 'previous-chat',
+        })
+
+        expect(await addNewChat(character)).toBe(false)
+
+        expect(character.chats).toHaveLength(3)
+        expect(mocks.acquireCompleteConversation).not.toHaveBeenCalled()
+        expect(mocks.changeChatTo).not.toHaveBeenCalled()
+    })
+
     it('keeps the selected page on the same chat when chats are inserted in front', async () => {
         const character = buildSelectedCharacter()
 
