@@ -141,8 +141,7 @@ pub(crate) fn detach_connection(
 ) -> Result<Vec<String>> {
     claim.require_connection(owners.state, connection_id)?;
     let jobs = JobStore::open(owners.root)?;
-    let after = owners.state.receive_cleanup_after.lock().map_err(local_error)?
-        .get(connection_id).copied().unwrap_or(0);
+    let after = jobs.receive_cleanup_after(connection_id)?;
     let page = jobs.list_holding_receive_artifacts(connection_id, after, JOBS_PER_PASS)?;
     // Continue past retained owners as well, then revisit them after reaching
     // the end. A failed deletion cannot starve later jobs or grow this pass.
@@ -162,12 +161,7 @@ pub(crate) fn detach_connection(
             ),
         }
     }
-    let mut cursors = owners.state.receive_cleanup_after.lock().map_err(local_error)?;
-    if next == 0 {
-        cursors.remove(connection_id);
-    } else {
-        cursors.insert(connection_id.to_owned(), next);
-    }
+    jobs.set_receive_cleanup_after(connection_id, next)?;
     Ok(detached)
 }
 

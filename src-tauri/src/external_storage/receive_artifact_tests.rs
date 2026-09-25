@@ -297,7 +297,8 @@ fn interrupted_deletions_still_use_a_bounded_cleanup_page() {
     }
     let first = pass(root, &store, &state, &admission, &claim_job);
     assert_eq!(first.len(), 8, "already detached jobs must count toward the pass limit");
-    let second = pass(root, &store, &state, &admission, &claim_job);
+    let restarted = JobCommandState::default();
+    let second = pass(root, &store, &restarted, &admission, &claim_job);
     assert_eq!(second.len(), 4);
     for id in queued {
         assert!(!marked(root, &id));
@@ -332,7 +333,9 @@ fn retained_jobs_count_toward_the_page_without_starving_later_or_released_owners
 
     assert!(pass(root, &store, &state, &admission, &claim_job).is_empty());
     assert!(receive.is_dir());
-    assert_eq!(pass(root, &store, &state, &admission, &claim_job), vec![later.id.clone()]);
+    // Reopening the application must not start on the same eight owners again.
+    let restarted = JobCommandState::default();
+    assert_eq!(pass(root, &store, &restarted, &admission, &claim_job), vec![later.id.clone()]);
     for job in &retained {
         assert!(marked(root, &job.id));
     }
@@ -343,7 +346,7 @@ fn retained_jobs_count_toward_the_page_without_starving_later_or_released_owners
     external_conflicts::mark_external_conflict_resolved(
         store.device_store().unwrap().connection(), &retained[0].id,
     ).unwrap();
-    assert_eq!(pass(root, &store, &state, &admission, &claim_job), vec![retained[0].id.clone()]);
+    assert_eq!(pass(root, &store, &restarted, &admission, &claim_job), vec![retained[0].id.clone()]);
     assert!(!marked(root, &retained[0].id));
 }
 

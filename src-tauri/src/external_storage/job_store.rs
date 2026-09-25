@@ -215,7 +215,11 @@ impl JobStore {
                  NOT IN ('succeeded','failed','cancelled');
              CREATE INDEX IF NOT EXISTS external_requests_receive_artifacts
              ON external_requests(connection_id)
-             WHERE json_extract(value,'$.receiveArtifacts')='held';",
+             WHERE json_extract(value,'$.receiveArtifacts')='held';
+             CREATE TABLE IF NOT EXISTS external_receive_cleanup(
+                 connection_id TEXT PRIMARY KEY,
+                 after_rowid INTEGER NOT NULL CHECK(after_rowid>=0)
+             );",
         )
         .map_err(failure)?;
         Ok(Self(db))
@@ -329,6 +333,28 @@ impl JobStore {
             .map_err(failure)?;
         rows.map(|row| Self::decode(row.map_err(failure)?))
             .collect()
+    }
+    /// Resuming the scan after restart also advances past long-lived owners.
+    pub fn receive_cleanup_after(&self, connection_id: &str) -> Result<i64> {
+        Ok(self.0.query_row(
+            "SELECT after_rowid FROM external_receive_cleanup WHERE connection_id=?1",
+            [connection_id], |row| row.get(0),
+        ).optional().map_err(failure)?.unwrap_or(0))
+    }
+    pub fn set_receive_cleanup_after(&self, connection_id: &str, after: i64) -> Result<()> {
+        if after == 0 {
+            self.0.execute(
+                "DELETE FROM external_receive_cleanup WHERE connection_id=?1",
+                [connection_id],
+            ).map_err(failure)?;
+        } else {
+            self.0.execute(
+                "INSERT INTO external_receive_cleanup(connection_id,after_rowid) VALUES(?1,?2)
+                 ON CONFLICT(connection_id) DO UPDATE SET after_rowid=excluded.after_rowid",
+                rusqlite::params![connection_id, after],
+            ).map_err(failure)?;
+        }
+        Ok(())
     }
     /// One indexed page of jobs that may still hold downloaded remote bodies.
     pub fn list_holding_receive_artifacts(
@@ -445,7 +471,6 @@ pub(crate) struct JobCommandState {
     pub session: Mutex<Session>,
     pub automatic_targets: Mutex<HashMap<String, AutomaticTarget>>,
     pub prepared_receives: Mutex<HashMap<String, super::sync_engine::PreparedReceive>>,
-    pub(super) receive_cleanup_after: Mutex<HashMap<String, i64>>,
 }
 pub(crate) struct BackgroundWorker(Arc<std::sync::atomic::AtomicUsize>);
 impl Drop for BackgroundWorker {
@@ -472,7 +497,6 @@ impl JobCommandState {
             return Ok(false);
         }
         self.prepared_receives.lock().map_err(failure)?.clear();
-        self.receive_cleanup_after.lock().map_err(failure)?.clear();
         *self.session.lock().map_err(failure)? = Session::default();
         Ok(true)
     }
@@ -846,7 +870,7 @@ mod tests {
     }
 
     #[test]
-    fn receive_artifact_pages_use_the_connection_index_and_clear_cleanup_cursors() {
+    fn receive_artifact_pages_use_the_connection_index_and_resume_after_reopening() {
         let root = tempfile::tempdir().unwrap();
         let db = JobStore::open(root.path()).unwrap();
         let mut ids = Vec::new();
@@ -877,11 +901,16 @@ mod tests {
         assert!(!detail.iter().any(|step| step.contains("USE TEMP B-TREE")),
             "receive page must not sort the entire history: {detail:?}");
 
-        let state = JobCommandState::default();
-        state.receive_cleanup_after.lock().unwrap().insert("synthetic".into(), after);
-        state.begin_cleanup().unwrap();
-        state.finish_cleanup().unwrap();
-        assert!(state.receive_cleanup_after.lock().unwrap().is_empty());
+        db.set_receive_cleanup_after("synthetic", after).unwrap();
+        drop(db);
+        let reopened = JobStore::open(root.path()).unwrap();
+        assert_eq!(reopened.receive_cleanup_after("synthetic").unwrap(), after);
+        assert_eq!(reopened.receive_cleanup_after("another").unwrap(), 0);
+        reopened.set_receive_cleanup_after("synthetic", 0).unwrap();
+        assert_eq!(reopened.receive_cleanup_after("synthetic").unwrap(), 0);
+        assert_eq!(reopened.0.query_row(
+            "SELECT count(*) FROM external_receive_cleanup", [], |row| row.get::<_, i64>(0),
+        ).unwrap(), 0);
     }
 
     #[test]
