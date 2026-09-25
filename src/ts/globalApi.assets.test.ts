@@ -72,6 +72,7 @@ vi.mock('./alert', () => ({
     alertNormal: vi.fn(),
     alertNormalWait: vi.fn(),
     alertSelect: vi.fn(),
+    alertToast: vi.fn(),
     alertTOS: vi.fn(), alertRisuServiceTOS: vi.fn(),
     waitAlert: vi.fn(),
 }))
@@ -137,6 +138,8 @@ import {
     TauriWriter,
 } from './globalApi.svelte'
 import { remove, writeFile } from '@tauri-apps/plugin-fs'
+import { alertToast } from './alert'
+import { doingChat } from './process/generationState'
 import { save } from '@tauri-apps/plugin-dialog'
 import { navigationActivity } from './ui/navigationActivity'
 import { get } from 'svelte/store'
@@ -191,6 +194,20 @@ describe('conversation navigation', () => {
 
         expect(state.fencePersistentNavigation).not.toHaveBeenCalled()
         expect(state.yieldToUi).not.toHaveBeenCalled()
+        expect(get(navigationActivity)).toBeNull()
+    })
+
+    test('refuses a chat switch during generation without fencing the running response', async () => {
+        doingChat.set(true)
+        try {
+            await expect(changeChatTo('chat-b')).resolves.toBe(false)
+        } finally {
+            doingChat.set(false)
+        }
+
+        expect(state.fencePersistentNavigation).not.toHaveBeenCalled()
+        expect(state.activateConversation).not.toHaveBeenCalled()
+        expect(alertToast).toHaveBeenCalledOnce()
         expect(get(navigationActivity)).toBeNull()
     })
 

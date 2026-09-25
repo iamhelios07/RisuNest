@@ -20,7 +20,8 @@ import versionData from "../../version.json";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { MobileGUI, botMakerMode, selectedCharID, loadedStore, DBState, LoadingStatusState, selIdState, ReloadGUIPointer, bodyIntercepterStore } from "./stores.svelte";
 import { loadPlugins } from "./plugins/plugins.svelte";
-import { alertConfirm, alertError, alertMd, alertNormal, alertNormalWait, alertSelect, alertTOS, waitAlert } from "./alert";
+import { alertConfirm, alertError, alertMd, alertNormal, alertNormalWait, alertSelect, alertToast, alertTOS, waitAlert } from "./alert";
+import { doingChat } from "./process/generationState";
 import { hasher } from "./parser/parser.svelte";
 import { characterURLImport, hubURL, realmHubURL } from "./characterCards";
 import { defaultJailbreak, defaultMainPrompt, oldJailbreak, oldMainPrompt } from "./storage/defaultPrompts";
@@ -1701,6 +1702,11 @@ export async function changeChatTo(IdOrIndex: string | number): Promise<boolean>
         ? chats[IdOrIndex]?.id
         : IdOrIndex
     if(!chatId || !chats.some((chat) => chat.id === chatId)) return false
+    // The navigation fence would orphan the running response, so refuse first.
+    if(get(doingChat)){
+        alertToast(language.navigationBlockedWhileGenerating)
+        return false
+    }
 
     fencePersistentNavigation()
     const activity = beginNavigationActivity('conversation')
