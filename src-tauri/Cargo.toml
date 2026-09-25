@@ -47,7 +47,7 @@ tauri-plugin-process = "2.3.1"
 tauri-plugin-shell = "2.3.5"
 tauri-plugin-opener = "2.5.5"
 # Native callers may supply Cookie, Origin, Referer and other HTTP headers.
-tauri-plugin-http = { version = "2.5.9", features = ["unsafe-headers"] }
+tauri-plugin-http = { version = "2.6.1", features = ["unsafe-headers"] }
 oauth2 = "5.0.0"
 # External storage adapters: request signing, DAV/S3 XML, path escaping, Retry-After dates.
 hmac = "0.12"
@@ -101,7 +101,7 @@ webview2-com = "0.38.2"
 windows = { version = "0.61.3", features = ["Win32_System_Com", "Win32_Graphics_Dwm", "Win32_UI_Accessibility", "Win32_UI_WindowsAndMessaging"] }
 # Trust internal HTTPS endpoints whose CA is installed in the Windows store.
 # Keep the default public roots and certificate/hostname verification enabled.
-tauri-plugin-http = { version = "2.5.9", features = ["rustls-tls-native-roots"] }
+tauri-plugin-http = { version = "2.6.1", features = ["rustls-tls-native-roots"] }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",

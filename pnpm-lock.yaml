@@ -66,8 +66,8 @@ importers:
         specifier: 2.5.1
         version: 2.5.1
       '@tauri-apps/plugin-http':
-        specifier: 2.5.9
-        version: 2.5.9
+        specifier: 2.6.1
+        version: 2.6.1
       '@tauri-apps/plugin-opener':
         specifier: ^2.5.5
         version: 2.5.5
@@ -305,7 +305,7 @@ importers:
         version: 5.57.1(@typescript-eslint/types@8.58.0)
       svelte-check:
         specifier: ^4.3.5
-        version: 4.3.5(picomatch@4.0.7)(svelte@5.57.1(@typescript-eslint/types@8.58.0))(typescript@5.9.3)
+        version: 4.3.5(picomatch@4.0.3)(svelte@5.57.1(@typescript-eslint/types@8.58.0))(typescript@5.9.3)
       tailwindcss:
         specifier: ^4.2.2
         version: 4.2.2
@@ -1540,8 +1540,8 @@ packages:
   '@tauri-apps/plugin-fs@2.5.1':
     resolution: {integrity: sha512-9Lz+Jopp6QyeEWhlpkMx4R/+P9HgR+AVAI4vOZhlT8Xaymtz8iVI/Ov984/XTqgJz/5gz5NretqPB/XEMS3NhQ==}
 
-  '@tauri-apps/plugin-http@2.5.9':
-    resolution: {integrity: sha512-lCiY0+vs4HvIUSvZrBs8TC3TiCB0MOPRmiUjTq4prW7SlcJE2jdLeT6KBsJrT9Tlplufl7W1pY6SFAO3gCWxDA==}
+  '@tauri-apps/plugin-http@2.6.1':
+    resolution: {integrity: sha512-9gtfe6eOaVKofASoMZ4Ph8E6vDYnpUTbMXrLt4FkXPzC5+O+wnGqJ9fz2koSPYcQt10bb3cx5qHkU0AU1l8tcQ==}
 
   '@tauri-apps/plugin-opener@2.5.5':
     resolution: {integrity: sha512-xvzGai5aQds8j8R8RsUK/lW6pGG50YgOYIPLzvkqmkwAj7dfySOD7sGtejRzvVdMmv1EQfKVEFh1MvmDp8QR0g==}
@@ -4017,7 +4017,7 @@ snapshots:
     dependencies:
       '@tauri-apps/api': 2.11.1
 
-  '@tauri-apps/plugin-http@2.5.9':
+  '@tauri-apps/plugin-http@2.6.1':
     dependencies:
       '@tauri-apps/api': 2.11.1
 
@@ -5321,11 +5321,11 @@ snapshots:
     dependencies:
       svelte: 5.57.1(@typescript-eslint/types@8.58.0)
 
-  svelte-check@4.3.5(picomatch@4.0.7)(svelte@5.57.1(@typescript-eslint/types@8.58.0))(typescript@5.9.3):
+  svelte-check@4.3.5(picomatch@4.0.3)(svelte@5.57.1(@typescript-eslint/types@8.58.0))(typescript@5.9.3):
     dependencies:
       '@jridgewell/trace-mapping': 0.3.31
       chokidar: 4.0.3
-      fdir: 6.5.0(picomatch@4.0.7)
+      fdir: 6.5.0(picomatch@4.0.3)
       picocolors: 1.1.1
       sade: 1.8.1
       svelte: 5.57.1(@typescript-eslint/types@8.58.0)
