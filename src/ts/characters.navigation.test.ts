@@ -29,6 +29,8 @@ const mocks = vi.hoisted(() => ({
     captureSelectedConversationTarget: vi.fn((): any => null),
     acquireCompleteConversation: vi.fn(),
     flushPendingData: vi.fn(async (_reason: string) => {}),
+    getSelectedConversationMode: vi.fn((): 'complete' | 'windowed' | null => null),
+    editWindowedChatList: vi.fn(),
     alertConfirm: vi.fn(async () => true),
     alertSelect: vi.fn(async () => '0'),
     alertAddCharacter: vi.fn(async () => 'createfromScratch'),
@@ -125,6 +127,8 @@ vi.mock('./storage/persistentDataRuntime.svelte', () => ({
     captureSelectedConversationTarget: mocks.captureSelectedConversationTarget,
     acquireCompleteConversation: mocks.acquireCompleteConversation,
     flushPendingData: mocks.flushPendingData,
+    getSelectedConversationMode: mocks.getSelectedConversationMode,
+    editWindowedChatList: mocks.editWindowedChatList,
 }))
 
 import {
@@ -823,6 +827,9 @@ describe('chat list operations', () => {
         mocks.captureSelectedConversationTarget.mockReturnValue(null)
         mocks.acquireCompleteConversation.mockReset()
         mocks.flushPendingData.mockReset()
+        mocks.getSelectedConversationMode.mockReset()
+        mocks.getSelectedConversationMode.mockReturnValue(null)
+        mocks.editWindowedChatList.mockReset()
     })
 
     it('keeps the selected chat when another chat is removed', async () => {
@@ -892,6 +899,66 @@ describe('chat list operations', () => {
         expect(mocks.acquireCompleteConversation).toHaveBeenCalledWith('add-chat', target)
         expect(events).toEqual(['acquire', 'flush:chat-b', `navigate:${character.chats[0].id}`, 'release'])
         expect(character.chatPage).toBe(0)
+    })
+
+    it('edits a windowed selection without holding the conversation complete', async () => {
+        const character = buildSelectedCharacter()
+        const target = { characterId: character.chaId, conversationId: 'chat-b' }
+        const events: string[] = []
+        mocks.captureSelectedConversationTarget.mockReturnValue(target)
+        mocks.getSelectedConversationMode.mockReturnValue('windowed')
+        mocks.flushPendingData.mockImplementation(async () => {
+            events.push(`flush:${character.chats.length}`)
+        })
+        mocks.editWindowedChatList.mockImplementation((captured, edit) => {
+            events.push('edit')
+            expect(captured).toBe(target)
+            const nextId = edit(character)
+            return { kind: 'applied', nextId }
+        })
+        mocks.changeChatTo.mockImplementation(async (id?: string | number) => {
+            events.push(`navigate:${id}`)
+            return selectChat(id)
+        })
+
+        expect(await addNewChat(character)).toBe(true)
+
+        expect(mocks.acquireCompleteConversation).not.toHaveBeenCalled()
+        expect(events).toEqual(['flush:3', 'edit', 'flush:4', `navigate:${character.chats[0].id}`])
+        expect(mocks.flushPendingData).toHaveBeenCalledWith('add-chat')
+    })
+
+    it('does not save or navigate when the windowed edit is refused', async () => {
+        const character = buildSelectedCharacter()
+        mocks.captureSelectedConversationTarget.mockReturnValue({
+            characterId: character.chaId,
+            conversationId: 'chat-b',
+        })
+        mocks.getSelectedConversationMode.mockReturnValue('windowed')
+        mocks.editWindowedChatList.mockReturnValue({ kind: 'refused' })
+
+        expect(await addNewChat(character)).toBe(false)
+
+        expect(mocks.flushPendingData).toHaveBeenCalledTimes(1)
+        expect(mocks.acquireCompleteConversation).not.toHaveBeenCalled()
+        expect(mocks.changeChatTo).not.toHaveBeenCalled()
+    })
+
+    it('falls back to complete ownership when the windowed edit cannot be described', async () => {
+        const character = buildSelectedCharacter()
+        const target = { characterId: character.chaId, conversationId: 'chat-b' }
+        const release = vi.fn()
+        mocks.captureSelectedConversationTarget.mockReturnValue(target)
+        mocks.getSelectedConversationMode.mockReturnValue('windowed')
+        mocks.editWindowedChatList.mockReturnValue({ kind: 'unsupported' })
+        mocks.acquireCompleteConversation.mockResolvedValue({ release })
+
+        expect(await addNewChat(character)).toBe(true)
+
+        expect(mocks.acquireCompleteConversation).toHaveBeenCalledWith('add-chat', target)
+        expect(character.chats).toHaveLength(4)
+        expect(character.chats[character.chatPage].id).toBe(character.chats[0].id)
+        expect(release).toHaveBeenCalledTimes(1)
     })
 
     it('does not change the chat list when complete ownership is stale', async () => {

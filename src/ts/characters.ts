@@ -24,9 +24,11 @@ import {
     commitCharacterAddition,
     deactivateActiveWorkingSet,
     deletePersistentCharacterWithGroupReferences,
+    editWindowedChatList,
     fencePersistentNavigation,
     flushPendingData,
     getPersistentNavigationGeneration,
+    getSelectedConversationMode,
     mutatePersistentCharacterDetail,
     readPersistentCompleteCharacter,
     readPersistentConversation,
@@ -1108,10 +1110,11 @@ export async function changeChar(index: number, arg:{
 }
 
 /**
- * Edits the selected character's chat list while the selected conversation is
- * held complete, so a windowed selection never persists an unexplained list
- * change. The previously selected chat stays selected unless `edit` returns the
- * id of the chat to switch to. `edit` returns false to abandon the change.
+ * Edits the selected character's chat list. A windowed selection records the
+ * edit as evidence against the saved list; otherwise the selected conversation
+ * is held complete, so neither path persists an unexplained list change. The
+ * previously selected chat stays selected unless `edit` returns the id of the
+ * chat to switch to. `edit` returns false to abandon the change.
  */
 export async function editSelectedChatList(
     characterId: string,
@@ -1123,6 +1126,8 @@ export async function editSelectedChatList(
         return current?.chaId === characterId ? current : null
     }
     if (!resolveCharacter()) return false
+    const windowed = await editWindowedSelectedChatList(characterId, reason, resolveCharacter, edit)
+    if (windowed !== 'unsupported') return windowed
     const target = captureSelectedConversationTarget()
     if (target && target.characterId !== characterId) return false
     let lease: Awaited<ReturnType<typeof acquireCompleteConversation>> | null = null
@@ -1158,6 +1163,44 @@ export async function editSelectedChatList(
     } finally {
         lease?.release()
     }
+}
+
+async function editWindowedSelectedChatList(
+    characterId: string,
+    reason: string,
+    resolveCharacter: () => character | groupChat | null,
+    edit: (character: character | groupChat) => string | null | false,
+): Promise<boolean | 'unsupported'> {
+    const initial = captureSelectedConversationTarget()
+    if (
+        !initial ||
+        initial.characterId !== characterId ||
+        getSelectedConversationMode() !== 'windowed'
+    ) return 'unsupported'
+    const flush = async () => {
+        try {
+            await flushPendingData(reason)
+            return true
+        } catch (error) {
+            // The edit stays in the working set and is saved once storage accepts input.
+            if (error instanceof PersistentMutationFencedError) return false
+            throw error
+        }
+    }
+    // The edit is described against the saved list, so earlier changes go first.
+    if (!(await flush())) return false
+    const target = captureSelectedConversationTarget()
+    if (
+        !target ||
+        target.characterId !== characterId ||
+        target.conversationId !== initial.conversationId ||
+        !resolveCharacter()
+    ) return false
+    const result = editWindowedChatList(target, edit)
+    if (result.kind === 'unsupported') return 'unsupported'
+    if (result.kind === 'refused') return false
+    if (!(await flush())) return false
+    return result.nextId === null ? true : await changeChatTo(result.nextId)
 }
 
 export async function addNewChat(character: character | groupChat): Promise<boolean> {

@@ -691,6 +691,11 @@ pub(crate) enum ConversationMutation {
         character_id: String,
         conversation_id: String,
     },
+    /// Lists every conversation of the character in its new order.
+    Reorder {
+        character_id: String,
+        conversation_ids: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

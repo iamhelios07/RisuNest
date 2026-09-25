@@ -8,6 +8,7 @@ import type {
     CompleteConversationLease,
     ConversationPublicationOptions,
     SelectedConversationTarget,
+    WindowedChatListEditResult,
     WindowedConversationMutationController,
 } from './activeWorkingSet.svelte'
 import type { ConversationViewportSource } from '../conversationViewportSource'
@@ -534,6 +535,11 @@ export const captureWindowedConversationMutationController = (
         chat,
         absoluteStartIndex,
     )
+export const editWindowedChatList = (
+    target: SelectedConversationTarget,
+    edit: (character: character | groupChat) => string | null | false,
+): WindowedChatListEditResult =>
+    getPersistentDataRuntime().editWindowedChatList(target, edit)
 export const tryDemoteSelectedConversation = (
     target?: SelectedConversationTarget | null,
 ): boolean => getPersistentDataRuntime().tryDemoteSelectedConversation(target)

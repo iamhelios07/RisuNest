@@ -208,6 +208,7 @@ fn reject_archived_targets(
         targets.push(match mutation {
             ConversationMutation::ReplaceRange { character_id, .. } => character_id,
             ConversationMutation::Delete { character_id, .. } => character_id,
+            ConversationMutation::Reorder { character_id, .. } => character_id,
         });
     }
     for character_id in targets {
@@ -2000,6 +2001,42 @@ fn apply_conversation_mutation(
                 params![generation, character_id, conversation_id],
             )?;
             refresh_character_summary(transaction, generation, character_id)?;
+            Ok(())
+        }
+        ConversationMutation::Reorder {
+            character_id,
+            conversation_ids,
+        } => {
+            let existing = {
+                let mut statement = transaction.prepare(
+                    "SELECT conversation_id, configured_index FROM conversations
+                     WHERE generation = ?1 AND character_id = ?2",
+                )?;
+                let rows = statement.query_map(params![generation, character_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })?;
+                rows.collect::<Result<HashMap<_, _>, _>>()?
+            };
+            let requested: HashSet<&str> = conversation_ids.iter().map(String::as_str).collect();
+            if requested.len() != conversation_ids.len()
+                || conversation_ids.len() != existing.len()
+                || conversation_ids.iter().any(|id| !existing.contains_key(id))
+            {
+                return Err(validation(format!(
+                    "Conversation order for {character_id} must list each conversation once"
+                )));
+            }
+            for (configured_index, conversation_id) in conversation_ids.iter().enumerate() {
+                let configured_index = configured_index as i64;
+                if existing[conversation_id] == configured_index {
+                    continue;
+                }
+                transaction.execute(
+                    "UPDATE conversations SET configured_index = ?4
+                     WHERE generation = ?1 AND character_id = ?2 AND conversation_id = ?3",
+                    params![generation, character_id, conversation_id, configured_index],
+                )?;
+            }
             Ok(())
         }
         ConversationMutation::ReplaceRange {

@@ -746,4 +746,169 @@ describe('selected chat list edits', () => {
             Object.assign(globalThis, previousGlobals)
         }
     })
+
+    it('edits the list around a windowed selection without loading the selected conversation', async () => {
+        const indexedDB = new IDBFactory()
+        const previousGlobals = { indexedDB: globalThis.indexedDB, IDBKeyRange: globalThis.IDBKeyRange }
+        const ownerId = 'edited-owner'
+        const selectedId = `${ownerId}-chat`
+        const otherId = `${ownerId}-other`
+        const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+        const reader = new IndexedDbPersistentDataStore('risuai-persistent-data', indexedDB, IDBKeyRange)
+        const history = Array.from({ length: 300 }, (_, index) => ({
+            role: index % 2 === 0 ? 'user' : 'char',
+            data: `Synthetic windowed message ${index}`,
+            chatId: `synthetic-windowed-${index}`,
+        })) as Message[]
+        const library = syntheticLibrary('character')
+        const owner = library.characters[0] as character
+        owner.chats[0].message = history
+        owner.chats.push({
+            id: otherId,
+            name: 'Other chat',
+            note: 'Other note',
+            localLore: [{ key: 'other', comment: 'Other lore', content: 'kept', mode: 'normal', insertorder: 100, alwaysActive: false, secondkey: '', selective: false }],
+            message: [{ role: 'user', data: 'Other history' }],
+        } as unknown as Chat)
+        owner.chatFolders = [{ id: 'folder-a', name: 'Folder A', folded: false }] as character['chatFolders']
+        let app: ProductionApp | null = null
+        try {
+            app = await bootProductionApp(indexedDB, library)
+            const { stores, runtime, characters, chatListRows } = app
+            const selected = () => stores.DBState.db.characters[get(stores.selectedCharID)] as character
+            const chatIds = () => selected().chats.map((chat) => chat.id)
+            expect(await characters.changeChar(
+                stores.DBState.db.characters.findIndex((candidate) => candidate.chaId === ownerId),
+            )).toBe(true)
+            expect(runtime.getSelectedConversationMode()).toBe('windowed')
+            expect(selected().chats[selected().chatPage].id).toBe(selectedId)
+            // Activation changes are saved separately from the list edits below.
+            await runtime.flushPendingData('activation')
+
+            const readConversation = vi.spyOn(runtime.store, 'readConversation')
+            const committed: string[][] = []
+            const commit = runtime.store.commit.bind(runtime.store)
+            vi.spyOn(runtime.store, 'commit').mockImplementation(async (request) => {
+                committed.push((request.conversations ?? []).map((mutation) =>
+                    `${mutation.type}:${mutation.type === 'reorder' ? mutation.conversationIds.join(',') : mutation.conversationId}`))
+                return commit(request)
+            })
+
+            // Moving the other chat into a folder only changes its folder on disk.
+            expect(await characters.editSelectedChatList(ownerId, 'reorder-chats', (character) => {
+                const chats = chatListRows.orderChatsByDroppedRows(character.chats, [
+                    { id: otherId, folderId: 'folder-a' },
+                    { id: selectedId, folderId: null },
+                ])
+                if (!chats) return false
+                character.chats = chats
+                return null
+            })).toBe(true)
+            expect(chatIds()).toEqual([otherId, selectedId])
+            expect(selected().chatPage).toBe(1)
+
+            const imported: Chat = {
+                id: `${ownerId}-imported`,
+                name: 'Imported chat',
+                note: 'Imported note',
+                localLore: [],
+                message: [{ role: 'user', data: 'Imported history' }],
+            }
+            expect(await characters.editSelectedChatList(ownerId, 'import-chat', (character) => {
+                character.chats.unshift(imported)
+                return null
+            })).toBe(true)
+            expect(chatIds()).toEqual([imported.id, otherId, selectedId])
+
+            expect(await characters.removeChat(selected(), otherId)).toBe(true)
+            expect(chatIds()).toEqual([imported.id, selectedId])
+            expect(selected().chats[selected().chatPage].id).toBe(selectedId)
+            expect(runtime.getSelectedConversationMode()).toBe('windowed')
+
+            expect(await characters.addNewChat(selected())).toBe(true)
+            const added = chatIds()[0]
+            expect(chatIds()).toEqual([added, imported.id, selectedId])
+            expect(selected().chats[selected().chatPage].id).toBe(added)
+
+            expect(readConversation.mock.calls.filter(([, id]) => id === selectedId)).toEqual([])
+            expect(committed.slice(0, 4)).toEqual([
+                [`replace-range:${otherId}`, `reorder:${otherId},${selectedId}`],
+                [`replace-range:${imported.id}`, `reorder:${imported.id},${otherId},${selectedId}`],
+                [`delete:${otherId}`],
+                [`replace-range:${added}`, `reorder:${added},${imported.id},${selectedId}`],
+            ])
+            expect(runtime.pendingWorkingSetRefreshRevision).toBeNull()
+            expect(consoleError.mock.calls.map((args) => args.map((value) =>
+                value instanceof Error ? `${value.name}: ${value.message}` : String(value).slice(0, 200)))).toEqual([])
+
+            await runtime.flushPendingData('exit')
+            await reader.open()
+            expect((await reader.readRoot()).revision).toBe(runtime.revision)
+            const order = await reader.queryConversations({ characterId: ownerId, order: 'configured', limit: 10 })
+            expect(order.items.map((item) => item.id)).toEqual([added, imported.id, selectedId])
+            expect((await reader.readConversation(ownerId, selectedId))?.value.message).toEqual(history)
+            expect((await reader.readConversation(ownerId, imported.id!))?.value).toMatchObject({
+                note: 'Imported note',
+                message: imported.message,
+            })
+            expect(await reader.readConversation(ownerId, otherId)).toBeNull()
+        } finally {
+            consoleError.mockRestore()
+            Object.assign(globalThis, previousGlobals)
+        }
+    })
+
+    it('keeps the saved body of a summarized chat when it moves into a folder', async () => {
+        const indexedDB = new IDBFactory()
+        const previousGlobals = { indexedDB: globalThis.indexedDB, IDBKeyRange: globalThis.IDBKeyRange }
+        const ownerId = 'edited-owner'
+        const selectedId = `${ownerId}-chat`
+        const otherId = `${ownerId}-other`
+        const reader = new IndexedDbPersistentDataStore('risuai-persistent-data', indexedDB, IDBKeyRange)
+        const library = syntheticLibrary('character')
+        const owner = library.characters[0] as character
+        const otherLore = [{ key: 'other', comment: 'Other lore', content: 'kept', mode: 'normal', insertorder: 100, alwaysActive: false, secondkey: '', selective: false }]
+        owner.chats.push({
+            id: otherId,
+            name: 'Other chat',
+            note: 'Other note',
+            localLore: otherLore,
+            message: [{ role: 'user', data: 'Other history' }],
+        } as unknown as Chat)
+        owner.chatFolders = [{ id: 'folder-a', name: 'Folder A', folded: false }] as character['chatFolders']
+        try {
+            const { stores, runtime, characters, chatListRows } = await bootProductionApp(indexedDB, library)
+            const selected = () => stores.DBState.db.characters[get(stores.selectedCharID)] as character
+            expect(await characters.changeChar(
+                stores.DBState.db.characters.findIndex((candidate) => candidate.chaId === ownerId),
+            )).toBe(true)
+            expect(runtime.getSelectedConversationMode()).toBe('windowed')
+            const other = selected().chats.find((chat) => chat.id === otherId)!
+            // The resident copy is a summary without the saved note, lore or messages.
+            expect(other).toMatchObject({ note: '', localLore: [], message: [] })
+            const readConversation = vi.spyOn(runtime.store, 'readConversation')
+
+            expect(await characters.editSelectedChatList(ownerId, 'reorder-chats', (character) => {
+                const chats = chatListRows.orderChatsByDroppedRows(character.chats, [
+                    { id: selectedId, folderId: null },
+                    { id: otherId, folderId: 'folder-a' },
+                ])
+                if (!chats) return false
+                character.chats = chats
+                return null
+            })).toBe(true)
+            await runtime.flushPendingData('exit')
+            expect(readConversation).not.toHaveBeenCalled()
+
+            await reader.open()
+            expect((await reader.readConversation(ownerId, otherId))?.value).toMatchObject({
+                folderId: 'folder-a',
+                note: 'Other note',
+                localLore: otherLore,
+                message: [{ role: 'user', data: 'Other history' }],
+            })
+        } finally {
+            Object.assign(globalThis, previousGlobals)
+        }
+    })
 })
