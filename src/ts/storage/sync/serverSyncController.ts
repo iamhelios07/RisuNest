@@ -32,7 +32,6 @@ export interface ServerSyncSnapshot {
   attemptId?: number;
   /** Wall-clock start of the current attempt, for the elapsed time. */
   attemptStartedAt?: number;
-  phaseStartedAt?: number;
   attemptIdentity?: ServerAttemptIdentity;
   initialSyncComplete?: boolean;
   /** False when the same attempt would be rejected again, so automatic
@@ -344,7 +343,6 @@ export function createServerSyncController(
     },
     reportCycleItems(items: ServerCycleItems): void {
       if (!state.running) return;
-      if (state.cycleItems?.activity !== items.activity) state.phaseStartedAt = Date.now();
       state.cycleItems = items;
       publish();
     },
@@ -355,7 +353,6 @@ export function createServerSyncController(
     },
     reportProgress(progress: ServerSyncProgress): void {
       if (!state.running) return;
-      if (state.progress !== progress) state.phaseStartedAt = Date.now();
       state.progress = progress;
       publish();
     },

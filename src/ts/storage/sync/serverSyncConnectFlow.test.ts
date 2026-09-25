@@ -194,11 +194,11 @@ describe("status and error copy", () => {
 describe("progress view", () => {
   it("shows backend preparation counts and server waiting without claiming completion", () => {
     const snapshot = { ...bound(), running: true, progress: "preparing" as const,
-      attemptStartedAt: 0, phaseStartedAt: 10_000,
+      attemptStartedAt: 0,
       cycleItems: { done: 0, total: 0, activity: "preparing" as const, processed: 17, expected: 100 } };
     const view = serverSyncProgressView(snapshot, text, 15_000);
     expect(view.current).toBe(`${text.activity.preparing} · 17 / 100`);
-    expect(view.elapsed).toBe(`${text.elapsed} 00:05`);
+    expect(view.elapsed).toBe(`${text.elapsed} 00:15`);
     expect(view.percent).toBeNull();
     const waiting = serverSyncProgressView({ ...snapshot, progress: "publishing",
       cycleItems: { done: 100, total: 100, activity: "confirming", processed: 0, expected: 0 } }, text, 15_000);

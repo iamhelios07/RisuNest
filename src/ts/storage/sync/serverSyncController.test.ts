@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { languageEnglish } from "src/lang/en";
 import { createServerSyncController } from "./serverSyncController";
+import { serverSyncProgressView } from "./serverSyncConnectFlow";
 import type { ServerSyncFacade, ServerStatus } from "./serverSync";
 
 function fixture() {
@@ -191,6 +193,32 @@ describe("server sync controller", () => {
     await controller.synchronize();
     expect(controller.snapshot().progress).toBeUndefined();
     expect(controller.snapshot().error).toBe("server-timeout");
+  });
+  it("counts elapsed time from the attempt start across stage and upload activity changes", async () => {
+    vi.useFakeTimers();
+    const { controller, facade } = fixture();
+    const text = languageEnglish.risuNest.serverSync;
+    const elapsed = () =>
+      serverSyncProgressView(controller.snapshot(), text, Date.now()).elapsed;
+    facade.cycle.mockImplementationOnce(async () => {
+      controller.reportProgress("preparing");
+      await vi.advanceTimersByTimeAsync(1000);
+      controller.reportProgress("publishing");
+      const activities = ["verifying", "uploading", "verifying", "uploading", "confirming"] as const;
+      for (const [index, activity] of activities.entries()) {
+        await vi.advanceTimersByTimeAsync(1000);
+        controller.reportCycleItems({ done: 0, total: 2, activity });
+        expect(elapsed()).toBe(`${text.elapsed} 00:0${index + 2}`);
+      }
+      return {
+        phase: "idle",
+        conflictCount: 0,
+        localRevision: 3,
+        head: controller.snapshot().status!.head!,
+      };
+    });
+    await controller.synchronize();
+    expect(controller.snapshot().attemptStartedAt).toBeUndefined();
   });
   it("shows the latest retryable failure only during the active synchronization", async () => {
     const { controller, facade } = fixture();

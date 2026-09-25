@@ -198,7 +198,7 @@ export function serverSyncProgressView(
     elapsed:
       snapshot.attemptStartedAt === undefined
         ? ""
-        : `${text.elapsed} ${formatElapsed(now - (snapshot.phaseStartedAt ?? snapshot.attemptStartedAt))}`,
+        : `${text.elapsed} ${formatElapsed(now - snapshot.attemptStartedAt)}`,
     stages,
     counters: [
       { key: "bytes", label: text.verifiedBytes, value: bytes },
