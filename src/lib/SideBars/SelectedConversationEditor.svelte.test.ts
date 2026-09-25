@@ -119,6 +119,85 @@ it('keeps the mounted editor and its lease across saves of the same session', as
     expect(document.activeElement).toBe(input)
 })
 
+it('keeps the mounted editor inert while another chat of the same character loads', async () => {
+    const first = { session: {}, release: vi.fn() }
+    const second = deferred()
+    mocks.session.mockReturnValue(first.session)
+    mocks.acquire
+        .mockResolvedValueOnce(first)
+        .mockReturnValueOnce(second.promise)
+    DBState.db.characters[0].chats.push({ id: 'chat-b', message: [] } as any)
+    show()
+    await vi.waitFor(() => expect(mounted).toHaveBeenCalledOnce())
+    const input = document.querySelector('input')!
+    expect(input.closest('[inert]')).toBeNull()
+
+    DBState.db.characters[0].chatPage = 1
+    mocks.capture.mockReturnValue({
+        characterId: 'char-a',
+        conversationId: 'chat-b',
+    })
+    mocks.session.mockReturnValue({})
+    mocks.changed()
+    await tick()
+    expect(mocks.acquire).toHaveBeenCalledTimes(2)
+    expect(first.release).toHaveBeenCalledOnce()
+    expect(document.querySelector('input')).toBe(input)
+    expect(input.closest('[inert]')).not.toBeNull()
+    expect(document.querySelector('[role="alert"]')).toBeNull()
+
+    second.resolve({ release: vi.fn() })
+    await vi.waitFor(() => expect(input.closest('[inert]')).toBeNull())
+    expect(document.querySelector('input')).toBe(input)
+    expect(mounted).toHaveBeenCalledOnce()
+})
+
+it('keeps the editor and its lease when the selection is republished with the same ids', async () => {
+    const session = {}
+    const release = vi.fn()
+    mocks.session.mockReturnValue(session)
+    mocks.acquire.mockResolvedValue({ session, release })
+    show()
+    await vi.waitFor(() => expect(mounted).toHaveBeenCalledOnce())
+    const input = document.querySelector('input')!
+    input.focus()
+    DBState.db.characters[0] = {
+        chaId: 'char-a',
+        chatPage: 0,
+        chats: [{ id: 'chat-a', message: [] }],
+    } as any
+    await tick()
+    await tick()
+    expect(mocks.acquire).toHaveBeenCalledOnce()
+    expect(release).not.toHaveBeenCalled()
+    expect(mounted).toHaveBeenCalledOnce()
+    expect(document.activeElement).toBe(input)
+})
+
+it('remounts the editor when the selected character changes', async () => {
+    const second = deferred()
+    mocks.session.mockReturnValue({})
+    mocks.acquire
+        .mockResolvedValueOnce({ session: {}, release: vi.fn() })
+        .mockReturnValueOnce(second.promise)
+    show()
+    await vi.waitFor(() => expect(mounted).toHaveBeenCalledOnce())
+    DBState.db.characters[0] = {
+        chaId: 'char-b',
+        chatPage: 0,
+        chats: [{ id: 'chat-c', message: [] }],
+    } as any
+    mocks.capture.mockReturnValue({
+        characterId: 'char-b',
+        conversationId: 'chat-c',
+    })
+    mocks.changed()
+    await tick()
+    expect(document.querySelector('input')).toBeNull()
+    second.resolve({ release: vi.fn() })
+    await vi.waitFor(() => expect(mounted).toHaveBeenCalledTimes(2))
+})
+
 it('releases promotion that finishes after the panel closes', async () => {
     const pending = deferred()
     const release = vi.fn()
