@@ -339,6 +339,7 @@ pub(crate) async fn external_storage_cancel_job(app: AppHandle, job_id: String) 
         job.summary["updatedAtMs"] = json!(now_ms().to_string());
         store.put(&job)?;
     }
+    super::runtime_restore::discard_finished_staging(&root(&app)?, &job);
     let (pass_app, pass_claim) = (app.clone(), _claim.clone());
     let connection = job.request.connection_id.clone();
     let detached = tokio::task::spawn_blocking(move || {
@@ -1068,6 +1069,11 @@ pub(crate) fn wake_job(app: AppHandle, id: String) -> Result<()> {
             if let Err(error) = cleaned {
                 crate::nlog!("error", "External terminal spool cleanup failed: {error}");
             }
+            if let Ok(root) = root(&app) {
+                if let Ok(settled) = JobStore::open(&root).and_then(|store| store.read(&job.id)) {
+                    super::runtime_restore::discard_finished_staging(&root, &settled);
+                }
+            }
         }
         if let Some(revision) = confirmed.filter(|_| !cancelled) {
             if let Err(error) = start_queued_automatic(&app, &job, revision) {
@@ -1204,11 +1210,13 @@ pub(crate) fn package_cache_root(job_directory: &std::path::Path) -> Result<Path
         .ok_or_else(|| ProviderError::new(ErrorKind::Corrupt))
 }
 
+pub(crate) fn connection_directory(root: &std::path::Path, connection: &str) -> PathBuf {
+    root.join("external-storage").join(hex::encode(
+        risunest_external_storage_format::content_identity::hash(connection.as_bytes()),
+    ))
+}
 pub(crate) fn job_directory(root: &std::path::Path, connection: &str, job: &str) -> PathBuf {
-    root.join("external-storage")
-        .join(hex::encode(
-            risunest_external_storage_format::content_identity::hash(connection.as_bytes()),
-        ))
+    connection_directory(root, connection)
         .join("jobs")
         .join(hex::encode(
             risunest_external_storage_format::content_identity::hash(job.as_bytes()),

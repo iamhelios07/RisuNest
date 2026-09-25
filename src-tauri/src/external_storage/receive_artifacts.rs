@@ -187,7 +187,7 @@ fn detach(owners: &Owners<'_>, job: &DurableJob) -> Result<Option<bool>> {
 
 /// Every directory from the external storage root down to the job's own must
 /// be a real directory. `false` when the job never created one.
-fn managed_directory(root: &Path, directory: &Path) -> io::Result<bool> {
+pub(super) fn managed_directory(root: &Path, directory: &Path) -> io::Result<bool> {
     let base = root.join("external-storage");
     if !directory.starts_with(&base) {
         return Err(linked());
@@ -238,7 +238,7 @@ fn move_aside(directory: &Path) -> io::Result<bool> {
 }
 
 /// Deletes without ever following a link; a link stops the removal instead.
-fn remove_tree(path: &Path) -> io::Result<()> {
+pub(super) fn remove_tree(path: &Path) -> io::Result<()> {
     let metadata = match fs::symlink_metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         other => other?,

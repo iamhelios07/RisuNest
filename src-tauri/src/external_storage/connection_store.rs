@@ -125,6 +125,17 @@ impl ConnectionStore {
         }
         Ok(result)
     }
+    /// Every stored connection, including one still being created.
+    pub fn ids(&self) -> Result<Vec<String>> {
+        let mut query = self
+            .0
+            .prepare("SELECT id FROM connections UNION SELECT id FROM pending_connections")
+            .map_err(storage)?;
+        let rows = query
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(storage)?;
+        rows.map(|row| row.map_err(storage)).collect()
+    }
     pub fn read(&self, id: &str) -> Result<StoredConnection> {
         let encoded: Option<String> = self
             .0

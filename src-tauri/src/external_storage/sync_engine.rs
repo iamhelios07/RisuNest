@@ -2514,6 +2514,7 @@ pub(crate) async fn external_storage_delete_conflict(
     };
     drop(mutation);
     drop(state);
+    release_deleted_conflict_bodies(&app, &record.id).await;
     if !delete_remote_point || record.remote_point.is_none() {
         return Ok(json!({"localDeleted":true,"remotePoint":"left-remote"}));
     }
@@ -2537,6 +2538,26 @@ pub(crate) async fn external_storage_delete_conflict(
         Err(_) => "left-remote",
     };
     Ok(json!({"localDeleted":true,"remotePoint":remote_point}))
+}
+
+/// The deleted conflict no longer holds its job's downloaded bodies. While
+/// another job holds the connection, that job's settlement runs the pass.
+async fn release_deleted_conflict_bodies(app: &AppHandle, job_id: &str) {
+    let Ok(job) =
+        super::runtime::root(app).and_then(|root| JobStore::open(&root)?.read(job_id))
+    else {
+        return;
+    };
+    let Ok((_, claim)) = app.state::<super::job_store::JobCommandState>().claim(&job) else {
+        return;
+    };
+    let (pass_app, connection) = (app.clone(), job.request.connection_id);
+    let detached = tokio::task::spawn_blocking(move || {
+        super::receive_artifacts::detach_claimed(&pass_app, &claim, &connection)
+    })
+    .await
+    .unwrap_or_default();
+    super::receive_artifacts::remove_detached_later(app, detached);
 }
 
 #[tauri::command]

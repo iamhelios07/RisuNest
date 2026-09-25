@@ -310,8 +310,7 @@ pub(crate) async fn run_restore(
         snapshot_id,
         &remote,
     )?;
-    let staging_root =
-        runtime::job_directory(&root, &job.request.connection_id, &job.id).join("restore-snapshot");
+    let staging_root = staging_directory(&root, job);
     let transferred = runtime::transfer_progress(&root, &job.id);
     let snapshot = snapshot_restore::download_snapshot(
         &remote,
@@ -473,6 +472,18 @@ fn prepare_local_restore(
         "snapshotId": snapshot_id,
         "receivedRevision": revision.revision.to_string()
     }))
+}
+
+fn staging_directory(root: &Path, job: &DurableJob) -> std::path::PathBuf {
+    runtime::job_directory(root, &job.request.connection_id, &job.id).join("restore-snapshot")
+}
+
+/// A finished restore never reads its download again, whether it succeeded,
+/// failed or was cancelled.
+pub(crate) fn discard_finished_staging(root: &Path, job: &DurableJob) {
+    if job.request.kind == JobKind::Restore && job.terminal() {
+        cleanup_staging(&staging_directory(root, job));
+    }
 }
 
 fn cleanup_staging(path: &Path) {

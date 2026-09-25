@@ -461,6 +461,7 @@ fn builder_with_main_window(
                     .root
                     .set(app_data_dir.clone())
                     .map_err(|_| "external storage root is already configured".to_string())?;
+                external_storage::leftovers::remove_at_startup(&app_data_dir);
                 let agent_build = app
                     .config()
                     .plugins

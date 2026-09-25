@@ -26,6 +26,7 @@ pub(crate) mod http;
 #[cfg(test)]
 mod http_tests;
 pub(crate) mod job_store;
+pub(crate) mod leftovers;
 pub(crate) mod journal;
 pub(crate) mod leases;
 pub(crate) mod oauth;
