@@ -1114,7 +1114,9 @@ export async function changeChar(index: number, arg:{
  * edit as evidence against the saved list; otherwise the selected conversation
  * is held complete, so neither path persists an unexplained list change. The
  * previously selected chat stays selected unless `edit` returns the id of the
- * chat to switch to. `edit` returns false to abandon the change.
+ * chat to switch to. `edit` returns false to abandon the change. It may run
+ * twice, first on a draft and again on the complete path when the draft edit
+ * cannot be recorded.
  */
 export async function editSelectedChatList(
     characterId: string,

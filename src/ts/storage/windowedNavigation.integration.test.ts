@@ -747,7 +747,7 @@ describe('selected chat list edits', () => {
         }
     })
 
-    it('edits the list around a windowed selection without loading the selected conversation', async () => {
+    it.each(['character', 'group'] as const)('edits the %s list around a windowed selection without loading the selected conversation', async (type) => {
         const indexedDB = new IDBFactory()
         const previousGlobals = { indexedDB: globalThis.indexedDB, IDBKeyRange: globalThis.IDBKeyRange }
         const ownerId = 'edited-owner'
@@ -759,8 +759,9 @@ describe('selected chat list edits', () => {
             role: index % 2 === 0 ? 'user' : 'char',
             data: `Synthetic windowed message ${index}`,
             chatId: `synthetic-windowed-${index}`,
+            ...(type === 'group' && index % 2 === 1 ? { saying: 'group-member' } : {}),
         })) as Message[]
-        const library = syntheticLibrary('character')
+        const library = syntheticLibrary(type)
         const owner = library.characters[0] as character
         owner.chats[0].message = history
         owner.chats.push({
@@ -852,6 +853,9 @@ describe('selected chat list edits', () => {
                 message: imported.message,
             })
             expect(await reader.readConversation(ownerId, otherId)).toBeNull()
+            expect((await reader.readConversation(ownerId, added))?.value.message
+                .map((message) => message.saying ?? null))
+                .toEqual(type === 'group' ? ['group-member'] : [])
         } finally {
             consoleError.mockRestore()
             Object.assign(globalThis, previousGlobals)
@@ -907,6 +911,18 @@ describe('selected chat list edits', () => {
                 localLore: otherLore,
                 message: [{ role: 'user', data: 'Other history' }],
             })
+
+            // The sidebar summary read after a restart shows the chat in its folder.
+            const rebooted = await bootProductionApp(indexedDB)
+            expect(await rebooted.characters.changeChar(
+                rebooted.stores.DBState.db.characters.findIndex((candidate) => candidate.chaId === ownerId),
+            )).toBe(true)
+            const reopened = rebooted.stores.DBState.db.characters[get(rebooted.stores.selectedCharID)] as character
+            expect(reopened.chats.map((chat) => [chat.id, chat.folderId ?? null])).toEqual([
+                [selectedId, null],
+                [otherId, 'folder-a'],
+            ])
+            await rebooted.runtime.flushPendingData('exit')
         } finally {
             Object.assign(globalThis, previousGlobals)
         }
