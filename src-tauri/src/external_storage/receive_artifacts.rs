@@ -26,7 +26,7 @@ use tauri::{AppHandle, Manager};
 /// What a receive and a section rejoin download into. The transfer journal,
 /// its spools and the connection's package cache belong to other owners.
 const ARTIFACTS: [&str; 2] = ["receive", "rejoin"];
-/// Jobs one pass moves aside, so a pass beside a job's own settlement stays short.
+/// Every examined job counts, including retained owners and interrupted removals.
 const JOBS_PER_PASS: usize = 8;
 
 fn moved_name(name: &str) -> String {
@@ -141,25 +141,32 @@ pub(crate) fn detach_connection(
 ) -> Result<Vec<String>> {
     claim.require_connection(owners.state, connection_id)?;
     let jobs = JobStore::open(owners.root)?;
+    let after = owners.state.receive_cleanup_after.lock().map_err(local_error)?
+        .get(connection_id).copied().unwrap_or(0);
+    let page = jobs.list_holding_receive_artifacts(connection_id, after, JOBS_PER_PASS)?;
+    // Continue past retained owners as well, then revisit them after reaching
+    // the end. A failed deletion cannot starve later jobs or grow this pass.
+    let next = if page.len() == JOBS_PER_PASS {
+        page.last().map_or(0, |(cursor, _)| *cursor)
+    } else {
+        0
+    };
     let mut detached = Vec::new();
-    // Only a move counts, so jobs whose leftovers are kept for good never
-    // crowd the others out.
-    let mut moved = 0;
-    for job in jobs.list_holding_receive_artifacts(connection_id)? {
-        if moved == JOBS_PER_PASS {
-            break;
-        }
+    for (_, job) in page {
         match detach(owners, &job) {
-            Ok(Some(renamed)) => {
-                moved += usize::from(renamed);
-                detached.push(job.id);
-            }
+            Ok(Some(_)) => detached.push(job.id),
             Ok(None) => {}
             Err(error) => crate::nlog!(
                 "warn",
                 "External receive bodies were kept for a later pass: {error}"
             ),
         }
+    }
+    let mut cursors = owners.state.receive_cleanup_after.lock().map_err(local_error)?;
+    if next == 0 {
+        cursors.remove(connection_id);
+    } else {
+        cursors.insert(connection_id.to_owned(), next);
     }
     Ok(detached)
 }

@@ -277,6 +277,77 @@ fn repeated_receives_reclaim_their_bodies_and_keep_the_library_and_other_owners(
 }
 
 #[test]
+fn interrupted_deletions_still_use_a_bounded_cleanup_page() {
+    let (directory, mut store, claim_job, _template) = fixture();
+    store.external_cancel_prepared(&claim_job.id).unwrap();
+    let root = directory.path();
+    let jobs = JobStore::open(root).unwrap();
+    let state = JobCommandState::default();
+    let admission = Admission::default();
+    let mut queued = Vec::new();
+    for index in 0..12 {
+        let job = bind(&mut store, &format!("interrupted-{index}"));
+        held(root, &jobs, &job);
+        store.external_cancel_prepared(&job.id).unwrap();
+        settle(&jobs, &job.id, "cancelled");
+        let moved = job_directory(root, "connection", &job.id).join(".reclaim-receive");
+        fs::create_dir_all(&moved).unwrap();
+        fs::write(moved.join("body"), b"synthetic interrupted deletion").unwrap();
+        queued.push(job.id);
+    }
+    let first = pass(root, &store, &state, &admission, &claim_job);
+    assert_eq!(first.len(), 8, "already detached jobs must count toward the pass limit");
+    let second = pass(root, &store, &state, &admission, &claim_job);
+    assert_eq!(second.len(), 4);
+    for id in queued {
+        assert!(!marked(root, &id));
+        assert!(!job_directory(root, "connection", &id).exists());
+    }
+}
+
+#[test]
+fn retained_jobs_count_toward_the_page_without_starving_later_or_released_owners() {
+    let (directory, mut store, claim_job, _template) = fixture();
+    store.external_cancel_prepared(&claim_job.id).unwrap();
+    let root = directory.path();
+    let jobs = JobStore::open(root).unwrap();
+    let state = JobCommandState::default();
+    let admission = Admission::default();
+    let mut retained = Vec::new();
+    for index in 0..8 {
+        let job = bind(&mut store, &format!("retained-{index}"));
+        held(root, &jobs, &job);
+        store.external_cancel_prepared(&job.id).unwrap();
+        preserve_conflict(&store, &job);
+        settle(&jobs, &job.id, "cancelled");
+        retained.push(job);
+    }
+    let later = bind(&mut store, "later-completion");
+    held(root, &jobs, &later);
+    store.external_cancel_prepared(&later.id).unwrap();
+    settle(&jobs, &later.id, "cancelled");
+    let receive = receive_directory(root, &later.id);
+    fs::create_dir_all(&receive).unwrap();
+    fs::write(receive.join("body"), b"synthetic completed body").unwrap();
+
+    assert!(pass(root, &store, &state, &admission, &claim_job).is_empty());
+    assert!(receive.is_dir());
+    assert_eq!(pass(root, &store, &state, &admission, &claim_job), vec![later.id.clone()]);
+    for job in &retained {
+        assert!(marked(root, &job.id));
+    }
+    external_conflicts::confirm_external_conflict_point(
+        store.device_store().unwrap().connection(), &retained[0].id,
+        &stored(&format!("backup-point-{}", retained[0].id), ObjectRole::BackupPoint),
+    ).unwrap();
+    external_conflicts::mark_external_conflict_resolved(
+        store.device_store().unwrap().connection(), &retained[0].id,
+    ).unwrap();
+    assert_eq!(pass(root, &store, &state, &admission, &claim_job), vec![retained[0].id.clone()]);
+    assert!(!marked(root, &retained[0].id));
+}
+
+#[test]
 fn only_the_authoritative_row_releases_bodies_whatever_the_summary_says() {
     let (directory, mut store, job, template) = fixture();
     let root = directory.path();

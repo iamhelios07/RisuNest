@@ -190,6 +190,11 @@ fn failure(_: impl std::fmt::Display) -> ProviderError {
 }
 pub(crate) struct JobStore(Connection);
 const STATE_TERMINAL_LIMIT: i64 = 32;
+const RECEIVE_ARTIFACT_PAGE_SQL: &str =
+    "SELECT rowid,value FROM external_requests
+     WHERE connection_id=?1 AND rowid>?2
+       AND json_extract(value,'$.receiveArtifacts')='held'
+     ORDER BY rowid LIMIT ?3";
 impl JobStore {
     pub fn open(root: &Path) -> Result<Self> {
         std::fs::create_dir_all(root).map_err(failure)?;
@@ -207,7 +212,10 @@ impl JobStore {
              CREATE INDEX IF NOT EXISTS external_requests_pending
              ON external_requests(connection_id)
              WHERE COALESCE(json_extract(value,'$.summary.state'),'')
-                 NOT IN ('succeeded','failed','cancelled');",
+                 NOT IN ('succeeded','failed','cancelled');
+             CREATE INDEX IF NOT EXISTS external_requests_receive_artifacts
+             ON external_requests(connection_id)
+             WHERE json_extract(value,'$.receiveArtifacts')='held';",
         )
         .map_err(failure)?;
         Ok(Self(db))
@@ -322,21 +330,27 @@ impl JobStore {
         rows.map(|row| Self::decode(row.map_err(failure)?))
             .collect()
     }
-    /// Jobs on one connection whose downloaded remote bodies may still be on disk.
-    pub fn list_holding_receive_artifacts(&self, connection_id: &str) -> Result<Vec<DurableJob>> {
+    /// One indexed page of jobs that may still hold downloaded remote bodies.
+    pub fn list_holding_receive_artifacts(
+        &self,
+        connection_id: &str,
+        after: i64,
+        limit: usize,
+    ) -> Result<Vec<(i64, DurableJob)>> {
         let mut statement = self
             .0
-            .prepare(
-                "SELECT value FROM external_requests
-                 WHERE connection_id=?1 AND json_extract(value,'$.receiveArtifacts')='held'
-                 ORDER BY rowid",
-            )
+            .prepare(RECEIVE_ARTIFACT_PAGE_SQL)
             .map_err(failure)?;
         let rows = statement
-            .query_map([connection_id], |row| row.get::<_, String>(0))
+            .query_map(rusqlite::params![connection_id, after, limit as i64], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
             .map_err(failure)?;
-        rows.map(|row| Self::decode(row.map_err(failure)?))
-            .collect()
+        rows.map(|row| {
+            let (cursor, value) = row.map_err(failure)?;
+            Ok((cursor, Self::decode(value)?))
+        })
+        .collect()
     }
     /// Forgets a job's receive hold without rewriting anything else in its row,
     /// so a summary settled meanwhile stays as written.
@@ -431,6 +445,7 @@ pub(crate) struct JobCommandState {
     pub session: Mutex<Session>,
     pub automatic_targets: Mutex<HashMap<String, AutomaticTarget>>,
     pub prepared_receives: Mutex<HashMap<String, super::sync_engine::PreparedReceive>>,
+    pub(super) receive_cleanup_after: Mutex<HashMap<String, i64>>,
 }
 pub(crate) struct BackgroundWorker(Arc<std::sync::atomic::AtomicUsize>);
 impl Drop for BackgroundWorker {
@@ -457,6 +472,7 @@ impl JobCommandState {
             return Ok(false);
         }
         self.prepared_receives.lock().map_err(failure)?.clear();
+        self.receive_cleanup_after.lock().map_err(failure)?.clear();
         *self.session.lock().map_err(failure)? = Session::default();
         Ok(true)
     }
@@ -827,6 +843,45 @@ mod tests {
         automatic.connection_id = "another".into();
         assert!(!state.coalesce_automatic(&job, &automatic, &identity()).unwrap());
         assert!(state.automatic_targets.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn receive_artifact_pages_use_the_connection_index_and_clear_cleanup_cursors() {
+        let root = tempfile::tempdir().unwrap();
+        let db = JobStore::open(root.path()).unwrap();
+        let mut ids = Vec::new();
+        for index in 0..24 {
+            let mut job = DurableJob::new(request(), false, 1, identity());
+            job.summary["state"] = json!("succeeded");
+            if index % 2 == 0 {
+                job.receive_artifacts = Some(ReceiveArtifacts::Held);
+                ids.push(job.id.clone());
+            }
+            db.put(&job).unwrap();
+        }
+        let first = db.list_holding_receive_artifacts("synthetic", 0, 8).unwrap();
+        assert_eq!(first.iter().map(|(_, job)| &job.id).collect::<Vec<_>>(),
+            ids[..8].iter().collect::<Vec<_>>());
+        let after = first.last().unwrap().0;
+        let second = db.list_holding_receive_artifacts("synthetic", after, 8).unwrap();
+        assert_eq!(second.iter().map(|(_, job)| &job.id).collect::<Vec<_>>(),
+            ids[8..].iter().collect::<Vec<_>>());
+        assert!(db.list_holding_receive_artifacts("another", 0, 8).unwrap().is_empty());
+        let detail: Vec<String> = db.0
+            .prepare(&format!("EXPLAIN QUERY PLAN {RECEIVE_ARTIFACT_PAGE_SQL}"))
+            .unwrap()
+            .query_map(rusqlite::params!["synthetic", after, 8], |row| row.get(3))
+            .unwrap().map(|row| row.unwrap()).collect();
+        assert!(detail.iter().any(|step| step.contains("external_requests_receive_artifacts")),
+            "receive page must use its partial index: {detail:?}");
+        assert!(!detail.iter().any(|step| step.contains("USE TEMP B-TREE")),
+            "receive page must not sort the entire history: {detail:?}");
+
+        let state = JobCommandState::default();
+        state.receive_cleanup_after.lock().unwrap().insert("synthetic".into(), after);
+        state.begin_cleanup().unwrap();
+        state.finish_cleanup().unwrap();
+        assert!(state.receive_cleanup_after.lock().unwrap().is_empty());
     }
 
     #[test]
