@@ -508,6 +508,7 @@ fn builder_with_main_window(
                 }
                 app.state::<native_media::ipc::NativeMediaIpcState>()
                     .configure(app_data_dir.join("native-media-ipc"))?;
+                server_sync::residency::arm_anchor(&app_data_dir);
                 app.manage(native_media::streaming::MediaServerState::initialize(
                     app_data_dir.clone(),
                 ));

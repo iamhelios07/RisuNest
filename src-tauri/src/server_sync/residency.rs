@@ -5,6 +5,52 @@ use risunest_sync_wire::{hash, validate_hash, RemoteHead, Sequence};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
+
+// Closing the last connection tears down the write-ahead log, and opens that
+// race the teardown fail with SQLITE_PROTOCOL. While armed, one idle
+// connection stays open so per-use connections are never the last one.
+struct Anchor {
+    root: PathBuf,
+    db: Option<Connection>,
+}
+
+static ANCHOR: Mutex<Option<Anchor>> = Mutex::new(None);
+
+fn anchor() -> MutexGuard<'static, Option<Anchor>> {
+    ANCHOR.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Keeps a connection to `root`'s store open after it next opens. Arming does
+/// not create the store.
+pub(crate) fn arm_anchor(root: &Path) {
+    *anchor() = Some(Anchor {
+        root: root.to_path_buf(),
+        db: None,
+    });
+}
+
+pub(crate) fn release_anchor() {
+    anchor().take();
+}
+
+fn hold_anchor(root: &Path, path: &Path) {
+    let mut anchor = anchor();
+    let Some(anchor) = anchor.as_mut().filter(|anchor| anchor.root == root) else {
+        return;
+    };
+    if anchor.db.is_some() {
+        return;
+    }
+    // Only a connection that has read holds the shared lock that keeps the
+    // log alive. Failure leaves the next open to retry.
+    anchor.db = Connection::open(path)
+        .and_then(|db| {
+            db.query_row("PRAGMA user_version", [], |_| Ok(()))?;
+            Ok(db)
+        })
+        .ok();
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -62,7 +108,7 @@ impl Residency {
                 Err(error) => return Err(error.into()),
             }
         }
-        let mut db = Connection::open(path)?;
+        let mut db = Connection::open(&path)?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version == 0 {
@@ -80,6 +126,7 @@ impl Residency {
         } else if version != 1 {
             return Err(SyncError::new("incompatible-residency-store", 409));
         }
+        hold_anchor(root, &path);
         Ok(Self { db })
     }
     /// A fresh registration restores access to the same library's historical
