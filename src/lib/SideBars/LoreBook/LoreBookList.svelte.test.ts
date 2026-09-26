@@ -36,6 +36,16 @@ function row(name: string) {
     const label = [...document.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent?.trim() === name)!
     return label.parentElement!
 }
+async function drag(name: string, target: HTMLElement, before: Element | null = null) {
+    const item = row(name).parentElement!
+    const from = item.parentElement!
+    const options = mocks.create.mock.calls.findLast(([element]) => element === from)![1]
+    const oldIndex = [...from.children].indexOf(item)
+    options.onStart?.({ item, from })
+    target.insertBefore(item, before)
+    await options.onEnd({ item, from, to: target, oldIndex, newIndex: [...target.children].indexOf(item) })
+    await tick()
+}
 async function remove(name: string) {
     row(name).querySelectorAll<HTMLButtonElement>(':scope > button')[2].click()
     await vi.waitFor(() => expect(document.body.textContent).not.toContain(name))
@@ -59,6 +69,87 @@ afterEach(async () => {
 })
 
 describe('lorebook editing', () => {
+    it('reorders a later page using backing indices and preserves hidden entries', async () => {
+        const lore = Array.from({ length: 65 }, (_, i) => book(`Entry ${i}`))
+        DBState.db.characters[0].globalLore = lore
+        instance = mount(LoreBookList, { target: document.body })
+        await tick()
+        document.querySelector<HTMLButtonElement>(`button[aria-label="${languageEnglish.risuNest.pager.next}"]`)!.click()
+        await tick()
+        await drag('Entry 64', row('Entry 60').parentElement!.parentElement!, row('Entry 60').parentElement)
+        expect(DBState.db.characters[0].globalLore.map(item => item.comment)).toEqual([
+            ...lore.slice(0, 60).map(item => item.comment), 'Entry 64', 'Entry 60', 'Entry 61', 'Entry 62', 'Entry 63',
+        ])
+        expect(document.querySelectorAll('[data-risu-idx]')).toHaveLength(5)
+    })
+
+    it('persists module reordering through the owning array and store reopen', async () => {
+        DBState.db.modules = [{ id: 'module', name: 'Module', description: '', lorebook: [book('First'), book('Last')] }]
+        const indexedDB = new IDBFactory()
+        const store = new IndexedDbPersistentDataStore('module-lore-drag', indexedDB, IDBKeyRange)
+        await store.open()
+        const { revision } = await store.replaceFromDatabase({ ...$state.snapshot(DBState.db), characters: [], botPresets: [] })
+        const coordinator = new SaveCoordinator({
+            store, captureRoot: () => capturePersistentRoot(DBState.db), captureCharacter: () => null,
+            captureSelectedCharacter: () => null, replaceDatabase: () => {},
+        })
+        coordinator.initialize(revision)
+        const lore = DBState.db.modules[0].lorebook!
+        instance = mount(LoreBookList, { target: document.body, props: { externalLoreBooks: lore } })
+        await tick()
+        await drag('Last', row('First').parentElement!.parentElement!, row('First').parentElement)
+        expect(DBState.db.modules[0].lorebook).toBe(lore)
+        coordinator.markPersistentDataDirty(0)
+        await coordinator.flushPendingDataLocally('module-lore-drag-test')
+        const reopened = new IndexedDbPersistentDataStore('module-lore-drag', indexedDB, IDBKeyRange)
+        await reopened.open()
+        expect((await reopened.readRoot()).value.modules[0].lorebook?.map(item => item.comment)).toEqual(['Last', 'First'])
+    })
+
+    it('keeps expanded folders and child editors mounted when reordering root entries', async () => {
+        DBState.db.characters[0].globalLore = [book('Folder', { mode: 'folder', key: 'folder' }),
+            book('Child', { folder: 'folder' }), book('First'), book('Last')]
+        instance = mount(LoreBookList, { target: document.body })
+        await tick()
+        row('Folder').querySelector('button')!.click()
+        await tick()
+        row('Child').querySelector('button')!.click()
+        await tick()
+        const folderInput = row('Folder').parentElement!.querySelector('input')
+        const childInput = row('Child').parentElement!.querySelector('input')
+        await drag('Last', row('First').parentElement!.parentElement!, row('First').parentElement)
+        expect(DBState.db.characters[0].globalLore.map(item => item.comment)).toEqual(['Folder', 'Child', 'Last', 'First'])
+        expect(row('Folder').parentElement!.querySelector('input')).toBe(folderInput)
+        expect(row('Child').parentElement!.querySelector('input')).toBe(childInput)
+    })
+
+    it('moves entries into and out of an empty folder without closing it', async () => {
+        DBState.db.characters[0].globalLore = [book('Folder', { mode: 'folder', key: 'folder' }), book('Move'), book('Keep')]
+        instance = mount(LoreBookList, { target: document.body })
+        await tick()
+        row('Folder').querySelector('button')!.click()
+        await tick()
+        const root = document.querySelector<HTMLElement>('[data-show-folder=""]')!
+        const folder = document.querySelector<HTMLElement>('[data-show-folder="folder"]')!
+        await drag('Move', folder)
+        expect(row('Move').parentElement!.parentElement).toBe(folder)
+        expect(DBState.db.characters[0].globalLore.find(item => item.comment === 'Move')!.folder).toBe('folder')
+        await drag('Move', root, row('Keep').parentElement)
+        expect(row('Move').parentElement!.parentElement).toBe(root)
+        expect(DBState.db.characters[0].globalLore.find(item => item.comment === 'Move')!.folder).toBeUndefined()
+        expect(document.querySelector('[data-show-folder="folder"]')).toBe(folder)
+    })
+
+    it('keeps the same list and rows after a cancelled drag', async () => {
+        DBState.db.characters[0].globalLore = [book('First'), book('Last')]
+        instance = mount(LoreBookList, { target: document.body })
+        await tick()
+        const first = row('First').parentElement!
+        await drag('First', first.parentElement!, first.nextElementSibling)
+        expect(row('First').parentElement).toBe(first)
+        expect(mocks.create).toHaveBeenCalledTimes(1)
+    })
+
     it('removes a module folder and its children from the owning array', async () => {
         DBState.db.modules = [{ id: 'module', name: 'Module', description: '', lorebook: [
             book('Folder', { mode: 'folder', key: 'folder' }), book('Child', { folder: 'folder' }), book('Keep'),

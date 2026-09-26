@@ -193,7 +193,7 @@
             <TextInput size="sm" bind:value={value.comment}/>
 
             <div class="mt-4">
-                <LoreBookList externalLoreBooks={externalLoreBooks} showFolder={value.key} />
+                <LoreBookList externalLoreBooks={externalLoreBooks} showFolder={value.key} dragGroup={idgroup} />
             </div>
             
             <div class="mt-2 flex gap-1">

@@ -37,6 +37,7 @@ export function loreDropIndex(
 
 export function groupLoreFolders(items: loreBook[]): loreBook[] {
     const children = new Map<string, loreBook[]>()
+    const folders = new Set(items.filter(item => item.mode === 'folder').map(item => item.key))
     for (const item of items) {
         if (item.folder) {
             const bucket = children.get(item.folder) ?? []
@@ -47,6 +48,7 @@ export function groupLoreFolders(items: loreBook[]): loreBook[] {
     const seen = new Set<loreBook>()
     const result: loreBook[] = []
     for (const item of items) {
+        if (item.folder && folders.has(item.folder)) continue
         if (seen.has(item)) continue
         seen.add(item)
         result.push(item)
@@ -57,6 +59,13 @@ export function groupLoreFolders(items: loreBook[]): loreBook[] {
                     result.push(child)
                 }
             }
+        }
+    }
+    // Keep malformed or nested imported entries rather than dropping them.
+    for (const item of items) {
+        if (!seen.has(item)) {
+            seen.add(item)
+            result.push(item)
         }
     }
     return result

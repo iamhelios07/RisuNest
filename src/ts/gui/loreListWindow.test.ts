@@ -38,3 +38,11 @@ it('moves backing rows correctly in both directions and across a filtered folder
         other,
     ])
 })
+
+it('keeps a moved folder together with children that precede its new position', () => {
+    const folder = { mode: 'folder', key: 'f' } as loreBook
+    const child = { folder: 'f' } as loreBook
+    const orphan = { folder: 'missing' } as loreBook
+    const other = {} as loreBook
+    expect(groupLoreFolders([child, other, folder, orphan])).toEqual([other, folder, child, orphan])
+})
