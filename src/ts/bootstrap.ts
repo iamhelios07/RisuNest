@@ -692,7 +692,10 @@ export async function loadData() {
                         './storage/sync/external/production'
                     )
                     await installExternalStorageProduction()
-                    selectedExitDrain = getExternalStorageSyncExitDrainAdapter(capture)
+                    selectedExitDrain = getExternalStorageSyncExitDrainAdapter(
+                        capture,
+                        heldExitFence,
+                    )
                     if (!selectedExitDrain || selectedExitDrain.id !== selectionId) {
                         throw new Error('Selected external synchronization target is unavailable')
                     }

@@ -245,6 +245,74 @@ describe('external storage production integration', () => {
         }))
     })
 
+    it('applies receives during an exit drain under the held exit fence', async () => {
+        const { retainableReplacementFence } = await import('../../retainableReplacementFence')
+        const persistent = await import('../../persistentDataRuntime.svelte')
+        const {
+            getExternalStorageSyncExitDrainAdapter,
+            installExternalStorageProduction,
+        } = await import('./production')
+        await installExternalStorageProduction()
+        vi.mocked(persistent.capturePersistentMutationToken).mockClear()
+        const runtimeState = mocks.persistentRuntime as { revision?: number }
+        runtimeState.revision = 12
+        mocks.flush.mockRejectedValue(new Error('synthetic fenced flush'))
+        mocks.refreshWorkingSet.mockImplementation(async revision => {
+            runtimeState.revision = revision
+            return { kind: 'committed', revision, projection: 'applied' }
+        })
+        const physicalRelease = vi.fn()
+        const exitFence = retainableReplacementFence({
+            revision: 12,
+            refreshCommittedWorkingSet: mocks.refreshWorkingSet,
+            release: physicalRelease,
+        })
+        const ready = (expectedRevision: `${number}`): ExternalJobSummary => ({
+            ...succeeded('old-sync', '0'),
+            id: `receive-${expectedRevision}`,
+            state: 'waiting',
+            phase: 'remote-apply',
+            result: { receiveReady: true, snapshotId: 'remote', expectedRevision },
+        })
+        mocks.bridge.startJob
+            .mockResolvedValueOnce(ready('12'))
+            .mockResolvedValueOnce(ready('13'))
+            .mockResolvedValueOnce(succeeded('old-sync', '14'))
+        mocks.bridge.applyReceived.mockImplementation(async (_id: string, expected: string) => ({
+            snapshotId: 'remote', receivedRevision: String(Number(expected) + 1),
+        }))
+        mocks.bridge.getJob.mockImplementation(async (id: string) => ({
+            ...succeeded('old-sync', '0'),
+            id,
+            result: { snapshotId: 'remote', receivedRevision: String(Number(id.slice(8)) + 1) },
+        }))
+        const adapter = getExternalStorageSyncExitDrainAdapter({
+            selection: {
+                kind: 'external', id: 'old-sync', selectionEpoch: 'old-epoch',
+                paused: false, decisionRequired: false,
+            },
+        }, exitFence)!
+
+        await expect(adapter.drain({
+            revision: 12,
+            libraryEpoch: 'library-epoch',
+            selectionEpoch: 'old-epoch',
+            selectionId: 'external:old-sync:old-epoch',
+        }, new AbortController().signal)).resolves.toEqual({ kind: 'complete' })
+        expect(mocks.flush).not.toHaveBeenCalled()
+        expect(persistent.capturePersistentMutationToken).not.toHaveBeenCalled()
+        expect(persistent.acquireDestructiveReplacementFence).not.toHaveBeenCalled()
+        expect(mocks.bridge.applyReceived.mock.calls).toEqual([
+            ['receive-12', '12'],
+            ['receive-13', '13'],
+        ])
+        expect(mocks.refreshWorkingSet.mock.calls.map(([revision]) => revision)).toEqual([13, 14])
+        expect(physicalRelease).not.toHaveBeenCalled()
+        exitFence.release()
+        expect(physicalRelease).toHaveBeenCalledOnce()
+        delete runtimeState.revision
+    })
+
     it('flushes locally before fixing the manual goal revision', async () => {
         const { installExternalStorageProduction, requestExternalStorageNow } = await import('./production')
         await installExternalStorageProduction()

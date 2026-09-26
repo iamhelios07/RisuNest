@@ -109,6 +109,17 @@ function throwIfAborted(signal?: AbortSignal): void {
     if (signal?.aborted) throw signal.reason
 }
 
+/** Waits before each automatic retry of a failed exit drain. */
+const exitDrainRetryDelays = [1000, 2000, 4000]
+
+/** A transient failure the exit retries itself. Anything that needs the user is reported. */
+function retryableExitFailure(result: ExternalControllerResult): boolean {
+    return result.kind === 'blocked'
+        && result.error?.retryable === true
+        && result.error.action === 'retry'
+        && result.reason !== 'publication-unknown'
+}
+
 export function createExternalStorageController(
     bridge: ExternalStorageJobBridge,
     initialState: ExternalStorageState,
@@ -363,17 +374,26 @@ export function createExternalStorageController(
             sessionId: string,
             signal: AbortSignal,
         ): Promise<SyncExitDrainResult> {
-            const result = await request({
-                connectionId,
-                kind: 'sync',
-                targetRevision: String(target.revision) as DecimalString,
-                reason: 'exitDrain',
-                session: { kind: 'exitDrain', id: sessionId },
-                signal,
-            })
-            if (result.kind === 'complete') return { kind: 'complete' }
-            if (result.kind === 'cancelled') return { kind: 'blocked', reason: 'cancelled' }
-            return { kind: 'blocked', reason: result.reason }
+            for (let retries = 0; ; retries += 1) {
+                const result = await request({
+                    connectionId,
+                    kind: 'sync',
+                    targetRevision: String(target.revision) as DecimalString,
+                    reason: 'exitDrain',
+                    session: { kind: 'exitDrain', id: sessionId },
+                    signal,
+                })
+                if (result.kind === 'complete') return { kind: 'complete' }
+                if (result.kind === 'cancelled') return { kind: 'blocked', reason: 'cancelled' }
+                if (!retryableExitFailure(result) || retries >= exitDrainRetryDelays.length) {
+                    return { kind: 'blocked', reason: result.reason }
+                }
+                try {
+                    await pause(exitDrainRetryDelays[retries], signal)
+                } catch {
+                    return { kind: 'blocked', reason: 'cancelled' }
+                }
+            }
         },
         subscribe(listener: (snapshot: ExternalStorageControllerSnapshot) => void): () => void {
             listeners.add(listener)
