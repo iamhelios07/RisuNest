@@ -42,15 +42,18 @@ fn checkpoint_pages_keep_the_original_head_when_a_later_commit_changes_unread_re
     trace.armed.store(true, Ordering::SeqCst);
     let read = references::RemoteRead::begin(&client, &expected).unwrap();
     let mut visited = Vec::new();
-    read.visit(|record| {
+    read.visit_pages(|page| {
         if visited.is_empty() {
             commit_records(&fixture.server, &device, 2, vec![RecordChange {
                 domain: Domain::Library, key: keys.last().unwrap().clone(), before: before.clone(),
                 after: RecordVersion::Tombstone { deletion_id: "later-deletion".into() },
             }]);
         }
-        assert_eq!(record.version, before, "a checkpoint must not follow the live head between pages");
-        visited.push(record.key);
+        assert!(!page.is_empty() && page.len() <= references::PAGE);
+        for record in page {
+            assert_eq!(record.version, before, "a checkpoint must not follow the live head between pages");
+            visited.push(record.key);
+        }
         Ok(())
     }).unwrap();
     assert_eq!(visited, keys);

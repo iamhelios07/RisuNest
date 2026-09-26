@@ -92,6 +92,33 @@ function fixture(
   return { facade, native, runtime, fence, trace, progress };
 }
 describe("server sync activation boundary", () => {
+  it("forwards native backup metadata counts while preparation is still running", async () => {
+    vi.useFakeTimers();
+    const { runtime } = fixture();
+    const items = { done: 0, total: 230, activity: "downloadingBackupMetadata", processed: 1200, expected: 0 };
+    const onCycleItems = vi.fn();
+    let finish!: () => void;
+    const pending = new Promise<void>((resolve) => { finish = resolve; });
+    const native = vi.fn(async (command: string) => {
+      if (command === "server_sync_progress_counts") return items;
+      if (command === "server_sync_prepare") {
+        await pending;
+        return { kind: "report", result };
+      }
+      throw new Error(`Unexpected command: ${command}`);
+    });
+    const facade = createServerSyncFacade({ runtime, invoke: native as never, onCycleItems });
+    const cycle = facade.cycle();
+    try {
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(onCycleItems).toHaveBeenCalledWith(items);
+    } finally {
+      finish();
+      await cycle;
+      vi.useRealTimers();
+    }
+  });
+
   it('refreshes chat changes without restarting unrelated plugins', async () => {
     const { runtime, native, fence } = fixture();
     const original = native.getMockImplementation()!;

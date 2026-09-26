@@ -222,21 +222,19 @@ impl Capture {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
             Err(error) => return Err(error.into()),
         }
-        let previous = index(&path)?;
+        let db = index_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         let (stored_id, stored_head, stored_revision, created_at_ms, stored_generation): (String, String, i64, i64, String) =
-            previous.query_row("SELECT id,head_json,local_revision,created_at_ms,local_generation FROM capture_identity", [],
+            db.query_row("SELECT id,head_json,local_revision,created_at_ms,local_generation FROM capture_identity", [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
         if stored_id != id || stored_head.as_bytes() != canonical::encode(head)? || stored_revision != revision
             || revision < 0 || created_at_ms < 0 || generation.is_empty() || stored_generation != generation {
             return Err(SyncError::new("conflict-repreparation-required", 409));
         }
-        drop(previous);
         let original = crate::trust_boundary::open_regular_source(&path.join("index.sqlite"))?;
         let index_file = std::fs::OpenOptions::new().read(true).write(true).open(path.join("index.sqlite"))?;
         if crate::asset_repository::exact_file_identity(&original)? != crate::asset_repository::exact_file_identity(&index_file)? {
             return Err(SyncError::new("invalid-backup-path", 409));
         }
-        let db = Connection::open_with_flags(path.join("index.sqlite"), OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;")?;
         let pins = DurableCasJob::open(root, id)?;
         if pins.is_released() { return Err(SyncError::new("conflict-repreparation-required", 409)); }
@@ -247,6 +245,19 @@ impl Capture {
     pub(crate) fn side_complete(&self, side: Side) -> Result<bool> {
         Ok(self.db.query_row("SELECT CASE ?1 WHEN 'local' THEN local_complete ELSE remote_complete END
             FROM capture_identity WHERE id=?2", params![side_name(side), self.id], |r| r.get(0))?)
+    }
+
+    pub(crate) fn write_page(&mut self, write: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
+        self.db.execute_batch("BEGIN IMMEDIATE")?;
+        let result = write(self).and_then(|()| {
+            self.db.execute_batch("COMMIT")?;
+            Ok(())
+        });
+        if result.is_err() && !self.db.is_autocommit() {
+            self.db.execute_batch("ROLLBACK")?;
+        }
+        // CAS job pins survive a rolled-back index page and protect retry inputs.
+        result
     }
 
     pub(crate) fn complete_side(&self, side: Side) -> Result<()> {
@@ -403,6 +414,7 @@ impl Capture {
             let page = page.into_iter().map(|(hash, size)| Ok((hash, unsigned_size(size)?)))
                 .collect::<Result<Vec<_>>>()?;
             residency.retain(client, config, &self.head, &page)?;
+            let transaction = self.db.unchecked_transaction()?;
             for (hash, expected) in &page {
                 let object = residency.object(hash, Some(&context))?
                     .ok_or_else(|| SyncError::new("conflict-custody-unconfirmed", 409))?;
@@ -412,6 +424,7 @@ impl Capture {
                 self.db.execute("UPDATE objects SET byte_size=?2 WHERE hash=?1 AND byte_size IS NULL",
                     params![hash, object.size as i64])?;
             }
+            transaction.commit()?;
             after = page.last().unwrap().0.clone();
         }
         Ok(())
@@ -503,6 +516,10 @@ fn verify_file(mut file: File, expected: Option<(&str, u64)>, check: &impl Fn() 
 }
 
 fn index(path: &Path) -> Result<Connection> {
+    index_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+}
+
+fn index_with_flags(path: &Path, flags: OpenFlags) -> Result<Connection> {
     crate::trust_boundary::open_regular_source(&path.join("index.sqlite"))?;
     for suffix in ["-wal", "-shm", "-journal"] {
         match std::fs::symlink_metadata(path.join(format!("index.sqlite{suffix}"))) {
@@ -513,7 +530,7 @@ fn index(path: &Path) -> Result<Connection> {
             Err(error) => return Err(error.into()),
         }
     }
-    let db = Connection::open_with_flags(path.join("index.sqlite"), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let db = Connection::open_with_flags(path.join("index.sqlite"), flags)?;
     let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version != 1 { return Err(SyncError::new("invalid-conflict-index", 409)); }
     Ok(db)
@@ -821,7 +838,7 @@ impl<'a> RemoteRead<'a> {
             Err(error) => Err(error),
         }
     }
-    pub(crate) fn visit(&self, mut visit: impl FnMut(RemoteRecord) -> Result<()>) -> Result<()> {
+    pub(crate) fn visit_pages(&self, mut visit: impl FnMut(Vec<RemoteRecord>) -> Result<()>) -> Result<()> {
         let mut after: Option<Cursor> = None;
         loop {
             let mut query = vec![("limit", PAGE.to_string())];
@@ -848,7 +865,8 @@ impl<'a> RemoteRead<'a> {
                 || page.records.last().map(|record| record.key.as_str()) != Some(next.key.as_str())) {
                 return Err(SyncError::new("invalid-checkpoint-cursor", 502));
             }
-            for record in page.records { self.client.ensure_active()?; visit(record)?; }
+            self.client.ensure_active()?;
+            visit(page.records)?;
             after = page.next;
             if after.is_none() { return Ok(()); }
         }

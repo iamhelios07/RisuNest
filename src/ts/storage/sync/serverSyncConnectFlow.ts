@@ -120,16 +120,18 @@ export function serverSyncPendingChanges(
     : "";
 }
 
-export const SERVER_SYNC_STAGES: readonly ServerSyncProgress[] = [
+export type ServerSyncStage = ServerSyncProgress | "downloading";
+export const SERVER_SYNC_STAGES: readonly ServerSyncStage[] = [
   "saving",
   "preparing",
+  "downloading",
   "applying",
   "refreshing",
   "publishing",
 ];
 export type ServerSyncStageState = "done" | "active" | "pending";
 export interface ServerSyncStageView {
-  stage: ServerSyncProgress;
+  stage: ServerSyncStage;
   label: string;
   state: ServerSyncStageState;
   detail: string;
@@ -162,9 +164,12 @@ export function serverSyncProgressView(
 ): ServerSyncProgressView {
   const items = snapshot.cycleItems;
   const counted = items !== undefined && items.total > 0;
-  const activeIndex = snapshot.progress
-    ? SERVER_SYNC_STAGES.indexOf(snapshot.progress)
-    : 0;
+  const activity = snapshot.progress === "preparing" || snapshot.progress === "publishing" ? items?.activity : undefined;
+  const receiving = activity === "downloading" || activity === "downloadingMetadata"
+    || activity === "downloadingBackupMetadata" || activity === "syncingSections";
+  const stage = snapshot.progress === "preparing" && (receiving || activity === "preserving")
+    ? "downloading" : snapshot.progress ?? "saving";
+  const activeIndex = SERVER_SYNC_STAGES.indexOf(stage);
   const ratio = counted ? `${formatCount(items.done)} / ${formatCount(items.total)}` : "";
   const stages = SERVER_SYNC_STAGES.map((stage, index): ServerSyncStageView => {
     const state: ServerSyncStageState =
@@ -181,9 +186,7 @@ export function serverSyncProgressView(
     return { stage, label: text.progress[stage], state, detail };
   });
   const active = stages[activeIndex];
-  const activity = snapshot.progress === "preparing" || snapshot.progress === "publishing" ? items?.activity : undefined;
   const activityCount = items?.expected ? `${formatCount(items.processed ?? 0)} / ${formatCount(items.expected)}` : formatCount(items?.processed ?? 0);
-  const receiving = activity === "downloading" || activity === "downloadingMetadata" || activity === "syncingSections";
   const bytes =
     snapshot.verifiedBytes === undefined
       ? NO_VALUE

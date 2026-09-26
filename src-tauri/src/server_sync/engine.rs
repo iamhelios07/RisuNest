@@ -2452,19 +2452,22 @@ impl PersistentStore {
                     )?;
                     if page.is_empty() { break; }
                     after = page.last().cloned();
-                    for key in page {
-                        client.ensure_active()?;
-                        let Some(payload) = projection::project(db, &cas, &target.generation, &key)? else { continue; };
-                        for bytes in payload.derived_objects.values() { cache.put(bytes)?; }
-                        let dependencies = projection::dependencies(&payload, &cas)?;
-                        let projected = cache.project(&payload, &dependencies, &relations(&key)?, scopes(&key))?;
-                        self.capture_server_reference_record(
-                            &mut capture, Side::Local, cache, &residency, &context,
-                            &projection::wire_key(&key)?, &projected.version,
-                            &payload, &dependencies, &projected.objects, client,
-                        )?;
-                        CycleItemCounter::processed(counter);
-                    }
+                    capture.write_page(|capture| {
+                        for key in page {
+                            client.ensure_active()?;
+                            let Some(payload) = projection::project(db, &cas, &target.generation, &key)? else { continue; };
+                            for bytes in payload.derived_objects.values() { cache.put(bytes)?; }
+                            let dependencies = projection::dependencies(&payload, &cas)?;
+                            let projected = cache.project(&payload, &dependencies, &relations(&key)?, scopes(&key))?;
+                            self.capture_server_reference_record(
+                                capture, Side::Local, cache, &residency, &context,
+                                &projection::wire_key(&key)?, &projected.version,
+                                &payload, &dependencies, &projected.objects, client,
+                            )?;
+                            CycleItemCounter::processed(counter);
+                        }
+                        client.ensure_active()
+                    })?;
                 }
                 let mut after = String::new();
                 loop {
@@ -2476,40 +2479,51 @@ impl PersistentStore {
                         rows
                     };
                     if page.is_empty() { break; }
-                    for (key, base) in page {
-                        client.ensure_active()?;
-                        after = key.clone();
-                        if !capture.has_record(Side::Local, &key)? {
-                            capture.record(Side::Local, &key, &delete_version(&parse(&base)?), None)?;
+                    capture.write_page(|capture| {
+                        for (key, base) in page {
+                            client.ensure_active()?;
+                            after = key.clone();
+                            if !capture.has_record(Side::Local, &key)? {
+                                capture.record(Side::Local, &key, &delete_version(&parse(&base)?), None)?;
+                            }
                         }
-                    }
+                        client.ensure_active()
+                    })?;
                 }
                 capture.complete_side(Side::Local)?;
             }
             if !capture.side_complete(Side::Remote)? {
-                CycleItemCounter::start(counter, 7, 0);
-                remote.as_ref().unwrap().visit(|record| {
-                    if !matches!(record.version, RecordVersion::Live { .. }) {
-                        capture.record(Side::Remote, &record.key, &record.version, None)?;
-                        CycleItemCounter::processed(counter);
-                        return Ok(());
-                    }
-                    transfer.download_record_metadata(&record.version, &[], &RecordVersion::Absent)?;
-                    let (payload, _) = cache.restore(&record.version)?;
-                    let key = key_parts(&record.key, revision)?;
-                    let dependencies = cache.dependencies(&payload)?;
-                    // The capture reads every object this names out of the
-                    // cache, so the projection stays on the persisting path.
-                    let projected = cache.project(&payload, &dependencies, &relations(&key)?, scopes(&key))?;
-                    if projected.version != record.version {
-                        return Err(SyncError::new("server-descriptor-semantics-mismatch", 409));
-                    }
-                    self.capture_server_reference_record(
-                        &mut capture, Side::Remote, cache, &residency, &context,
-                        &record.key, &record.version, &payload, &dependencies, &projected.objects, client,
-                    )?;
-                    CycleItemCounter::processed(counter);
-                    Ok(())
+                CycleItemCounter::start(counter, 10, 0);
+                remote.as_ref().unwrap().visit_pages(|page| {
+                    let versions = page.iter().filter(|record| matches!(record.version, RecordVersion::Live { .. }))
+                        .map(|record| (record.version.clone(), Vec::new())).collect::<Vec<_>>();
+                    transfer.prefetch_record_metadata(&versions)?;
+                    capture.write_page(|capture| {
+                        for record in page {
+                            client.ensure_active()?;
+                            if !matches!(record.version, RecordVersion::Live { .. }) {
+                                capture.record(Side::Remote, &record.key, &record.version, None)?;
+                                CycleItemCounter::processed(counter);
+                                continue;
+                            }
+                            transfer.download_record_metadata(&record.version, &[], &RecordVersion::Absent)?;
+                            let (payload, _) = cache.restore(&record.version)?;
+                            let key = key_parts(&record.key, revision)?;
+                            let dependencies = cache.dependencies(&payload)?;
+                            // The capture reads every object this names out of the
+                            // cache, so the projection stays on the persisting path.
+                            let projected = cache.project(&payload, &dependencies, &relations(&key)?, scopes(&key))?;
+                            if projected.version != record.version {
+                                return Err(SyncError::new("server-descriptor-semantics-mismatch", 409));
+                            }
+                            self.capture_server_reference_record(
+                                capture, Side::Remote, cache, &residency, &context,
+                                &record.key, &record.version, &payload, &dependencies, &projected.objects, client,
+                            )?;
+                            CycleItemCounter::processed(counter);
+                        }
+                        client.ensure_active()
+                    })
                 })?;
                 capture.complete_side(Side::Remote)?;
             }

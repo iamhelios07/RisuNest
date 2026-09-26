@@ -529,7 +529,7 @@ pub(crate) fn server_sync_progress_counts(app: AppHandle) -> Result<CycleItemCou
         done: counter.done.load(Ordering::Relaxed),
         total: counter.total.load(Ordering::Relaxed),
         activity: match counter.activity.load(Ordering::Relaxed) {
-            1 => "enumerating", 2 => "preparing", 3 => "downloading", 4 => "uploading", 5 => "confirming", 6 => "verifying", 7 => "downloadingMetadata", 8 => "preserving", 9 => "syncingSections", _ => "enumerating",
+            1 => "enumerating", 2 => "preparing", 3 => "downloading", 4 => "uploading", 5 => "confirming", 6 => "verifying", 7 => "downloadingMetadata", 8 => "preserving", 9 => "syncingSections", 10 => "downloadingBackupMetadata", _ => "enumerating",
         },
         processed: counter.processed.load(Ordering::Relaxed),
         expected: counter.expected.load(Ordering::Relaxed),

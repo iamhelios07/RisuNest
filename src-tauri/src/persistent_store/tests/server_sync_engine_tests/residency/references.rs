@@ -26,6 +26,8 @@ struct Trace {
     corrupt_retention: AtomicBool,
     retention_pages: AtomicU64,
     fail_retention_page: AtomicU64,
+    metadata_pages: AtomicU64,
+    fail_metadata_page: AtomicU64,
     fail_release_once: AtomicBool,
     expire_checkpoint: AtomicBool,
     released_before_marker: AtomicBool,
@@ -74,6 +76,13 @@ async fn observe(
             if trace.fail_retention_page.load(Ordering::SeqCst) == page {
                 return (axum::http::StatusCode::BAD_REQUEST,
                     axum::Json(json!({"error":"synthetic-retention-failure"}))).into_response();
+            }
+        }
+        if method == "POST" && path == "/objects/transfer" {
+            let page = trace.metadata_pages.fetch_add(1, Ordering::SeqCst) + 1;
+            if trace.fail_metadata_page.load(Ordering::SeqCst) == page {
+                return (axum::http::StatusCode::BAD_REQUEST,
+                    axum::Json(json!({"error":"synthetic-transfer-failure"}))).into_response();
             }
         }
         if method == "POST" && path == "/objects/retention/release"
@@ -189,6 +198,66 @@ impl Scenario {
             .collect::<std::io::Result<Vec<_>>>().unwrap();
         assert_eq!(entries.len(), 1);
         entries[0].file_name().into_string().unwrap()
+    }
+}
+
+#[test]
+fn reference_capture_batches_metadata_across_checkpoint_pages_without_asset_downloads() {
+    use std::collections::BTreeSet;
+    let (fixture, trace) = measured_fixture();
+    let (_source_root, mut source) = prepared();
+    fixture.bind(&mut source);
+    let mut payloads = BTreeSet::new();
+    for number in 0..references::PAGE + 1 {
+        let mut bytes = vec![127; 1024];
+        bytes[..8].copy_from_slice(&(number as u64).to_le_bytes());
+        payloads.insert(put(&mut source, &format!("assets/batched-{number:04}.png"), &bytes).object_hash.unwrap());
+    }
+    assert_eq!(settle(&mut source).phase, "idle");
+    for fail_second_page in [false, true] {
+        trace.armed.store(false, Ordering::SeqCst);
+        let root = tempfile::tempdir().unwrap();
+        let mut local = PersistentStore::open(root.path()).unwrap();
+        fixture.bind(&mut local);
+        local.asset_residency_set_policy(AssetPolicy::Remote, || Ok(())).unwrap();
+        let client = ServerClient::new(local.server_config().unwrap().unwrap()).unwrap();
+        let cache = Cache::open(&root.path().join("server-sync/reference-test-cache")).unwrap();
+        let transfer = Transfer::new(&client, &cache).unwrap();
+        *trace.root.lock().unwrap() = Some(root.path().to_path_buf());
+        trace.requests.lock().unwrap().clear();
+        trace.metadata_pages.store(0, Ordering::SeqCst);
+        trace.fail_metadata_page.store(if fail_second_page { 2 } else { 0 }, Ordering::SeqCst);
+        trace.armed.store(true, Ordering::SeqCst);
+        let revision = local.revision().unwrap();
+        let head = fixture.server.head().unwrap();
+        if fail_second_page {
+            let error = local.server_conflict_references(&cache, &transfer, &client, revision, &head, None).unwrap_err();
+            assert_eq!(error.code, "synthetic-transfer-failure");
+            let directory = fs::read_dir(root.path().join("server-sync/backups")).unwrap().next().unwrap().unwrap().path();
+            assert!(!directory.join("complete.json").exists());
+            let index = rusqlite::Connection::open(directory.join("index.sqlite")).unwrap();
+            let records: i64 = index.query_row("SELECT count(*) FROM records WHERE side='remote'", [], |r| r.get(0)).unwrap();
+            assert_eq!(records as usize, references::PAGE, "only the first page was committed");
+            assert!(!trace.requests.lock().unwrap().iter().any(|request| request.method == "DELETE"));
+        }
+        let receipt = local.server_conflict_references(&cache, &transfer, &client, revision, &head, None).unwrap();
+        let index = references::open(root.path(), &receipt.id, &|| Ok(())).unwrap();
+        let records = index.query_row("SELECT count(*) FROM records WHERE side='remote'", [], |r| r.get::<_, i64>(0)).unwrap() as usize;
+        assert!(records > references::PAGE);
+        let requests = trace.requests.lock().unwrap();
+        let transfers = requests.iter().filter(|request| request.path == "/objects/transfer").collect::<Vec<_>>();
+        assert_eq!(transfers.len(), records.div_ceil(references::PAGE) + usize::from(fail_second_page),
+            "retry must reuse cached pages; small metadata must transfer once per checkpoint page");
+        for request in transfers {
+            let targets = request.body.as_array().unwrap();
+            assert!(targets.len() <= references::PAGE * 2);
+            assert!(targets.iter().all(|target| !payloads.contains(target["target"].as_str().unwrap())));
+        }
+        assert_eq!(requests.iter().filter(|request| request.method == "POST" && request.path == "/checkpoints").count(), 1);
+        assert!(!requests.iter().any(|request| request.method == "GET" && request.path.starts_with("/objects/")));
+        assert!(!trace.released_before_marker.load(Ordering::SeqCst));
+        let cas = PayloadCas::new(root.path()).unwrap();
+        assert!(payloads.iter().all(|hash| cas.stat_object(hash).unwrap().is_none()));
     }
 }
 

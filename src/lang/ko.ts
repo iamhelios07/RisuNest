@@ -2063,10 +2063,11 @@ export const languageKorean = {
             elapsed: '경과',
             count: '{0}개',
             itemsCount: '{0}개 항목',
-            activity: { enumerating: '항목 확인 중', preparing: '이 기기의 변경 내용 준비 중', downloadingMetadata: '캐릭터·채팅 등 라이브러리 데이터 다운로드 중', downloading: '받을 데이터 다운로드 및 확인 중', preserving: '충돌 백업 준비 중', syncingSections: '하이파·플러그인 데이터 비교 및 다운로드 중', verifying: '서버에 있는 항목 확인 중', uploading: '업로드 중', confirming: '서버 확인 대기 중' },
+            activity: { enumerating: '항목 확인 중', preparing: '이 기기의 변경 내용 준비 중', downloadingMetadata: '캐릭터·채팅 등 라이브러리 데이터 다운로드 중', downloadingBackupMetadata: '충돌 백업용 라이브러리·에셋 정보 다운로드 중', downloading: '받을 데이터 다운로드 및 확인 중', preserving: '충돌 백업 저장 및 확인 중', syncingSections: '하이파·플러그인 데이터 다운로드 및 확인 중', verifying: '서버에 있는 항목 확인 중', uploading: '업로드 중', confirming: '서버 확인 대기 중' },
             progress: {
                 saving: '이 기기의 변경 저장 중',
                 preparing: '이 기기와 서버의 변경 내용 비교 중',
+                downloading: '서버 내용 받는 중',
                 applying: '받은 내용 적용 중',
                 refreshing: '화면에 반영하는 중',
                 publishing: '이 기기의 변경 서버에 올리는 중',

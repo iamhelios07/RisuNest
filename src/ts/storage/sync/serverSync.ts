@@ -70,6 +70,7 @@ export interface ServerCycleItems {
     | "preparing"
     | "downloading"
     | "downloadingMetadata"
+    | "downloadingBackupMetadata"
     | "preserving"
     | "syncingSections"
     | "verifying"
@@ -112,7 +113,7 @@ function isCycleItems(value: unknown): value is ServerCycleItems {
   const { done, total, activity, processed, expected } = value as Record<string, unknown>;
   if (activity !== undefined && (
     typeof activity !== "string" ||
-    !["enumerating", "preparing", "downloading", "downloadingMetadata", "preserving", "syncingSections", "verifying", "uploading", "confirming"].includes(activity) ||
+    !["enumerating", "preparing", "downloading", "downloadingMetadata", "downloadingBackupMetadata", "preserving", "syncingSections", "verifying", "uploading", "confirming"].includes(activity) ||
     !Number.isSafeInteger(processed) || Number(processed) < 0 ||
     !Number.isSafeInteger(expected) || Number(expected) < 0
   )) return false;

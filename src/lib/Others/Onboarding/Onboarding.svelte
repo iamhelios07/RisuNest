@@ -84,6 +84,7 @@
         externalStorageStrings,
     } from 'src/lib/Setting/ExternalStorage/strings'
     import ServerSyncConnect from 'src/lib/Setting/ServerSync/ServerSyncConnect.svelte'
+    import ServerSyncStages from 'src/lib/Setting/ServerSync/ServerSyncStages.svelte'
     import { DBState } from 'src/ts/stores.svelte'
 
     import {
@@ -1125,7 +1126,7 @@
                                     <span class="dim">{hubView?.elapsed ?? ''}</span>
                                 </p>
                                 {#if hubView}
-                                    {@render stageList(hubView.stages)}
+                                    <ServerSyncStages stages={hubView.stages} />
                                     <dl
                                         class="counts"
                                         style:--cards={hubView.counters.length}
