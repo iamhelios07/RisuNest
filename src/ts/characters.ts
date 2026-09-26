@@ -157,10 +157,10 @@ export async function selectCharImg(charIndex:number) {
         chooseLegacyFile: async () => selectSingleFile(['png', 'webp', 'gif', 'jpg', 'jpeg']),
         nativeImport: importNativeJpegAsset,
         legacyImport: async (img) => {
-            const db = DBState.db
             const type = getImageType(img)
+            const pngExif: Record<string, string> = {}
             try {
-                if(type === 'PNG' && db.characters[charIndex].type === 'character'){
+                if(type === 'PNG'){
                     const gen = PngChunk.readGenerator(img)
                     const allowedChunk = [
                         'parameters', 'Comment', 'Title', 'Description', 'Author', 'Software', 'Source', 'Disclaimer', 'Warning', 'Copyright',
@@ -176,20 +176,22 @@ export async function selectCharImg(charIndex:number) {
                             continue
                         }
                         if(allowedChunk.includes(chunk.key)){
-                            console.log(chunk.key, chunk.value)
-                            db.characters[charIndex].extentions ??= {}
-                            db.characters[charIndex].extentions.pngExif ??= {}
-                            db.characters[charIndex].extentions.pngExif[chunk.key] = chunk.value
+                            pngExif[chunk.key] = chunk.value
                         }
                     }
-                    console.log(db.characters[charIndex].extentions)
                 }
             } catch (error) {
                 console.error(error)
             }
             const imgp = await saveImage(img)
-            dumpCharImage(charIndex)
-            DBState.db.characters[charIndex].image = imgp
+            await mutatePersistentCharacterDetail(characterId, 'select-character-image', ({ character }) => {
+                archiveCurrentCharacterImage(character)
+                character.image = imgp
+                if (character.type === 'character' && Object.keys(pngExif).length > 0) {
+                    character.extentions ??= {}
+                    character.extentions.pngExif = { ...character.extentions.pngExif, ...pngExif }
+                }
+            })
             return imgp
         },
     })
@@ -217,24 +219,23 @@ export function changeCharImage(charIndex:number,changeIndex:number) {
 export const addingEmotion = writable(false)
 
 export async function addCharEmotion(charId:number) {
+    const characterId = DBState.db.characters[charId]?.chaId
+    if (!characterId || get(addingEmotion)) return
     addingEmotion.set(true)
-    const selected = await selectMultipleFile(['png', 'webp', 'gif'])
-    if(!selected){
-        addingEmotion.set(false)
-        return
-    }
-    let db = DBState.db
-    for(const f of selected){
-        const img = f.data
-        const imgp = await saveImage(img)
-        const name = f.name.replace('.png','').replace('.webp','')
-        let dbChar = db.characters[charId]
-        if(dbChar.type !== 'group'){
-            dbChar.emotionImages.push([name,imgp])
-            DBState.db.characters[charId] = dbChar
+    try {
+        const selected = await selectMultipleFile(['png', 'webp', 'gif'])
+        if (!selected?.length) return
+        const images: [string, string][] = []
+        for (const f of selected) {
+            const imgp = await saveImage(f.data)
+            images.push([f.name.replace('.png', '').replace('.webp', ''), imgp])
         }
+        await mutatePersistentCharacterDetail(characterId, 'add-character-emotions', ({ character }) => {
+            if (character.type === 'character') character.emotionImages.push(...images)
+        })
+    } finally {
+        addingEmotion.set(false)
     }
-    addingEmotion.set(false)
 }
 
 export function rmCharEmotion(charId:number, emotionId:number) {

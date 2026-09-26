@@ -40,12 +40,16 @@ const mocks = vi.hoisted(() => ({
     downloadFile: vi.fn(),
     findCharacterbyId: vi.fn(),
     yieldToUi: vi.fn(async () => {}),
+    saveImage: vi.fn(async () => 'assets/synthetic.png'),
+    selectSingleFile: vi.fn(),
+    selectMultipleFile: vi.fn(),
 }))
 
 vi.mock('uuid', () => ({
     v4: () => `generated-${++mocks.nextId}`,
 }))
 vi.mock('./storage/database.svelte', () => ({
+    saveImage: mocks.saveImage,
     defaultSdDataFunc: () => ({}),
     getDatabase: (options?: { snapshot?: boolean }) => options?.snapshot
         ? structuredClone(mocks.database)
@@ -74,8 +78,8 @@ vi.mock('./util', () => ({
     findCharacterbyId: mocks.findCharacterbyId,
     findCharacterIndexbyId: vi.fn(),
     getUserName: vi.fn(),
-    selectMultipleFile: vi.fn(),
-    selectSingleFile: vi.fn(),
+    selectMultipleFile: mocks.selectMultipleFile,
+    selectSingleFile: mocks.selectSingleFile,
 }))
 vi.mock('./media', () => ({ getImageType: vi.fn() }))
 vi.mock('./stores.svelte', async () => {
@@ -147,6 +151,9 @@ import {
     exportChat,
     removeChar,
     removeChat,
+    selectCharImg,
+    addCharEmotion,
+    addingEmotion,
 } from './characters'
 import { createMetadataOnlySelectedConversation } from './storage/selectedConversationLifecycle'
 import { SelectedConversationPromotionStaleError } from './storage/activeWorkingSet.svelte'
@@ -167,6 +174,33 @@ function deferred<T>() {
 }
 
 describe('runtime chat identity', () => {
+    it.each(['portrait', 'emotion'] as const)('applies a pending %s import to its original character after reordering', async (kind) => {
+        const first = { type: 'character', chaId: 'first', image: 'assets/old.png', emotionImages: [], chats: [] }
+        const second = { type: 'character', chaId: 'second', image: '', emotionImages: [], chats: [] }
+        mocks.database.characters = [first, second]
+        const chosen = deferred<any>()
+        if (kind === 'portrait') mocks.selectSingleFile.mockReturnValueOnce(chosen.promise)
+        else mocks.selectMultipleFile.mockReturnValueOnce(chosen.promise)
+        const pending = kind === 'portrait' ? selectCharImg(0) : addCharEmotion(0)
+        mocks.database.characters.reverse()
+        const file = { name: 'synthetic.png', data: new Uint8Array([1]) }
+        chosen.resolve(kind === 'portrait' ? file : [file])
+        await pending
+        expect(second).toMatchObject({ image: '', emotionImages: [] })
+        if (kind === 'portrait') {
+            expect(first.image).toBe('assets/synthetic.png')
+            expect((first as any).ccAssets[0].uri).toBe('assets/old.png')
+        } else expect(first.emotionImages).toEqual([['synthetic', 'assets/synthetic.png']])
+    })
+
+    it('releases emotion import state after a failed asset save', async () => {
+        mocks.database.characters = [{ type: 'character', chaId: 'first', emotionImages: [], chats: [] }]
+        mocks.selectMultipleFile.mockResolvedValueOnce([{ name: 'synthetic.png', data: new Uint8Array([1]) }])
+        mocks.saveImage.mockRejectedValueOnce(new Error('Synthetic save failure'))
+        await expect(addCharEmotion(0)).rejects.toThrow('Synthetic save failure')
+        expect(get(addingEmotion)).toBe(false)
+    })
+
     beforeEach(() => {
         mocks.database.characters = []
         mocks.nextId = 0
