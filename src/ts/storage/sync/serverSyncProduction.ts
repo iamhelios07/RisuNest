@@ -1,3 +1,4 @@
+import { hasMobileBackgroundTasks, subscribeMobileBackgroundTasks } from "../../mobileBackgroundTask";
 import { isTauri } from "../../platform";
 import { invalidatePluginDeviceKeyspaces } from "../../plugins/pluginDeviceKeyspace";
 import { subscribeLibraryFileOperationReleased } from "../libraryFileOperation";
@@ -208,8 +209,9 @@ export async function exportServerSyncBackup(
  * in a state to act on them. */
 function suspendServerSync(
   scheduler: ReturnType<typeof createServerSyncScheduler>,
+  preserveActive = false,
 ): void {
-  scheduler.suspend();
+  scheduler.suspend(preserveActive);
   void invoke("server_sync_events_stop").catch(() => {});
 }
 export function startServerSync(): void {
@@ -253,8 +255,11 @@ export function startServerSync(): void {
   void controller.initialize().then(() => resumeServerSyncAfterBackup());
   window.addEventListener("online", () => resumeServerSyncAfterBackup());
   window.addEventListener("offline", () => suspendServerSync(scheduler));
+  subscribeMobileBackgroundTasks(() => {
+    if (document.visibilityState === "hidden" && !hasMobileBackgroundTasks()) suspendServerSync(scheduler);
+  });
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "hidden") suspendServerSync(scheduler);
+    if (document.visibilityState === "hidden") suspendServerSync(scheduler, hasMobileBackgroundTasks());
     else resumeServerSyncAfterBackup();
   });
 }
