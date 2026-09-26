@@ -14,15 +14,15 @@
     import { convertModuleToCharacter } from "src/ts/interchangeability";
     import { commitDetachedCharacter } from "src/ts/characters";
     import { commitModuleCharacterConversion } from "./moduleCharacterConversion";
-    let tempModule:RisuModule = $state({
-        name: '',
-        description: '',
-        id: v4(),
-    })
     let mode = $state(0)
-    let editModuleIndex = $state(-1)
+    let editModuleId = $state('')
+    const currentModule = $derived(DBState.db.modules.find(module => module.id === editModuleId))
     let moduleSearch = $state('')
     let charConversionMode = $state(false)
+
+    $effect(() => {
+        if (mode !== 0 && !currentModule) mode = 0
+    })
 
     function sortModules(modules:RisuModule[], search:string){
         return modules.filter((v) => {
@@ -45,7 +45,7 @@
         {#if DBState.db.modules.length === 0}
             <div class="text-textcolor2 p-3">{language.noModules}</div>
         {:else}
-            {#each sortModules(DBState.db.modules, moduleSearch) as rmodule, i}
+            {#each sortModules(DBState.db.modules, moduleSearch) as rmodule, i (rmodule.id)}
                 {#if i !== 0}
                     <div class="border-t-1 border-selected"></div>
                 {/if}
@@ -105,9 +105,7 @@
                                 </button>
                                 <button class="text-textcolor2 hover:text-green-500 mr-2 cursor-pointer" use:tooltip={language.edit} onclick={async (e) => {
                                     e.stopPropagation()
-                                    const index = DBState.db.modules.findIndex((v) => v.id === rmodule.id)
-                                    tempModule = rmodule
-                                    editModuleIndex = index
+                                    editModuleId = rmodule.id
                                     mode = 2
                                 }}>
                                     <SquarePen size={18}/>
@@ -124,11 +122,12 @@
                                 e.stopPropagation()
                                 const d = await alertConfirm(`${language.removeConfirm}` + rmodule.name)
                                 if(d){
+                                    const index = DBState.db.modules.findIndex((v) => v.id === rmodule.id)
+                                    if (index < 0) return
                                     if(DBState.db.enabledModules.includes(rmodule.id)){
                                         DBState.db.enabledModules.splice(DBState.db.enabledModules.indexOf(rmodule.id), 1)
                                         DBState.db.enabledModules = DBState.db.enabledModules
                                     }
-                                    const index = DBState.db.modules.findIndex((v) => v.id === rmodule.id)
                                     DBState.db.modules.splice(index, 1)
                                     DBState.db.modules = DBState.db.modules
                                 }
@@ -148,12 +147,13 @@
 
     <div class="flex mr-2 mt-4">
         <button class="text-textcolor2 hover:text-blue-500 mr-2 cursor-pointer" onclick={async () => {
-            tempModule = {
+            const tempModule = {
                 name: '',
                 description: '',
                 id: v4(),
             }
             DBState.db.modules.push(tempModule)
+            editModuleId = tempModule.id
             mode = 1
         }}>
             <PlusIcon />
@@ -174,18 +174,17 @@
             <HardDriveUpload  />
         </button>
     </div>
-{:else if mode === 1}
+{:else if mode === 1 && currentModule}
     <h2 class="mb-2 text-2xl font-bold mt-2">{language.createModule}</h2>
-    <ModuleMenu bind:currentModule={tempModule}/>
+    <ModuleMenu {currentModule}/>
     <Button className="mt-6" onclick={() => {
         mode = 0
     }}>{language.createModule}</Button>
-{:else if mode === 2}
+{:else if mode === 2 && currentModule}
     <h2 class="mb-2 text-2xl font-bold mt-2">{language.editModule}</h2>
-    <ModuleMenu bind:currentModule={tempModule}/>
-    {#if tempModule.name !== ''}
+    <ModuleMenu {currentModule}/>
+    {#if currentModule.name !== ''}
         <Button className="mt-6" onclick={() => {
-            DBState.db.modules[editModuleIndex] = tempModule
             mode = 0
         }}>{language.editModule}</Button>
     {/if}
