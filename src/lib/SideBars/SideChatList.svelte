@@ -5,7 +5,7 @@
     import { DownloadIcon, PencilIcon, HardDriveUploadIcon, MenuIcon, TrashIcon, SplitIcon, FolderPlusIcon, BookmarkCheckIcon } from "@lucide/svelte";
 
     import type { character, groupChat } from "src/ts/storage/database.svelte";
-    import { DBState, ReloadGUIPointer } from 'src/ts/stores.svelte';
+    import { DBState } from 'src/ts/stores.svelte';
     import { selectedCharID } from "src/ts/stores.svelte";
 
     import CheckInput from "../UI/GUI/CheckInput.svelte";
@@ -181,7 +181,6 @@
                     onclick={() => {
                         if(!editMode) {
                             chara.chatFolders[i].folded = !folder.folded
-                            $ReloadGUIPointer += 1
                         }
                     }}
                     class="flex items-center text-textcolor border-solid border-0 border-darkborderc p-2 cursor-pointer rounded-md"
@@ -220,7 +219,8 @@
                             if(e.key === 'Enter'){
                                 e.currentTarget.click()
                             }
-                        }} class="text-textcolor2 hover:text-green-500 mr-1 cursor-pointer" onclick={() => {
+                        }} class="text-textcolor2 hover:text-green-500 mr-1 cursor-pointer" onclick={(e) => {
+                            e.stopPropagation()
                             editMode = !editMode
                         }}>
                             <PencilIcon size={18}/>
@@ -233,7 +233,6 @@
                             e.stopPropagation()
                             const d = await alertConfirm(`${language.removeConfirm}${folder.name}`)
                             if (d) {
-                                $ReloadGUIPointer += 1
                                 const folders = chara.chatFolders
                                 folders.splice(i, 1)
                                 chara.chats.forEach(chat => {
@@ -272,7 +271,8 @@
                                 if(e.key === 'Enter'){
                                     e.currentTarget.click()
                                 }
-                            }} class="text-textcolor2 hover:text-green-500 mr-1 cursor-pointer" onclick={async () => {
+                            }} class="text-textcolor2 hover:text-green-500 mr-1 cursor-pointer" onclick={async (e) => {
+                                e.stopPropagation()
                                 const option = await alertChatOptions()
                                 switch(option){
                                     case 0:{
@@ -310,7 +310,8 @@
                                 if(e.key === 'Enter'){
                                     e.currentTarget.click()
                                 }
-                            }} class="text-textcolor2 hover:text-green-500 mr-1 cursor-pointer" onclick={() => {
+                            }} class="text-textcolor2 hover:text-green-500 mr-1 cursor-pointer" onclick={(e) => {
+                                e.stopPropagation()
                                 editMode = !editMode
                             }}>
                                 <PencilIcon size={18}/>
@@ -372,7 +373,8 @@
                         if(e.key === 'Enter'){
                             e.currentTarget.click()
                         }
-                    }} class="text-textcolor2 hover:text-green-500 mr-1 cursor-pointer" onclick={async () => {
+                    }} class="text-textcolor2 hover:text-green-500 mr-1 cursor-pointer" onclick={async (e) => {
+                        e.stopPropagation()
                         const option = await alertChatOptions()
                         switch(option){
                             case 0:{
@@ -411,7 +413,8 @@
                         if(e.key === 'Enter'){
                             e.currentTarget.click()
                         }
-                    }} class="text-textcolor2 hover:text-green-500 mr-1 cursor-pointer" onclick={() => {
+                    }} class="text-textcolor2 hover:text-green-500 mr-1 cursor-pointer" onclick={(e) => {
+                        e.stopPropagation()
                         editMode = !editMode
                     }}>
                         <PencilIcon size={18}/>
@@ -492,7 +495,6 @@
                     folded: false,
                 })
                 chara.chatFolders = folders
-                $ReloadGUIPointer += 1
             }}>
                 <FolderPlusIcon size={18}/>
             </button>
