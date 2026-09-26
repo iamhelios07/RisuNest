@@ -152,9 +152,19 @@ describe('external storage production integration', () => {
         dispose()
     })
 
-    beforeEach(() => {
+    beforeEach(async () => {
         vi.resetModules()
         vi.clearAllMocks()
+        const persistent = await import('../../persistentDataRuntime.svelte')
+        vi.mocked(persistent.capturePersistentMutationToken).mockReset().mockImplementation(async () => ({
+            revision: mocks.revision, mutationGeneration: 1,
+        }))
+        vi.mocked(persistent.acquireDestructiveReplacementFence).mockReset().mockImplementation(async () => ({
+            revision: mocks.revision,
+            refreshCommittedWorkingSet: mocks.refreshWorkingSet,
+            release: mocks.releaseFence,
+        }))
+        delete (mocks.persistentRuntime as { revision?: number }).revision
         mocks.releaseFence.mockReset()
         mocks.flush.mockReset().mockResolvedValue(undefined)
         mocks.reloadPlugins.mockReset().mockResolvedValue(undefined)
@@ -183,7 +193,7 @@ describe('external storage production integration', () => {
         mocks.bridge.releaseConflictSource.mockResolvedValue(undefined)
         mocks.revision = 8
         mocks.bridge.getState.mockResolvedValue(initialState)
-        mocks.bridge.startJob.mockImplementation(async request =>
+        mocks.bridge.startJob.mockReset().mockImplementation(async request =>
             succeeded(request.connectionId, request.targetRevision ?? '0'))
     })
     afterEach(async () => {
@@ -243,6 +253,85 @@ describe('external storage production integration', () => {
         expect(mocks.bridge.setExecutionSession).toHaveBeenLastCalledWith(expect.objectContaining({
             kind: 'foreground',
         }))
+    })
+
+    it.each([
+        ['flush', 'complete'], ['capture', 'complete'], ['acquire', 'complete'],
+        ['flush', 'stale'], ['flush', 'failure'],
+    ] as const)(
+        'handles a foreground receive meeting the exit fence during %s (%s)', async (phase, outcome) => {
+        const { PersistentMutationFencedError } = await import('../../saveCoordinator')
+        const { retainableReplacementFence } = await import('../../retainableReplacementFence')
+        const persistent = await import('../../persistentDataRuntime.svelte')
+        const {
+            getExternalStorageSyncExitDrainAdapter,
+            installExternalStorageProduction,
+            requestExternalStorageNow,
+        } = await import('./production')
+        await installExternalStorageProduction()
+        const runtimeState = mocks.persistentRuntime as { revision?: number }
+        runtimeState.revision = 8
+        let rejectPreparation!: (error: Error) => void
+        const preparing = new Promise<never>((_resolve, reject) => { rejectPreparation = reject })
+        let entered = false
+        const blockPreparation = () => { entered = true; return preparing }
+        if (phase === 'flush') {
+            mocks.flush.mockImplementation(reason => reason === 'external-storage-sync-receive'
+                ? blockPreparation() : Promise.resolve())
+        } else if (phase === 'capture') {
+            vi.mocked(persistent.capturePersistentMutationToken).mockImplementationOnce(async () => ({
+                revision: 8, mutationGeneration: 1,
+            })).mockImplementationOnce(blockPreparation)
+        } else {
+            vi.mocked(persistent.acquireDestructiveReplacementFence).mockImplementationOnce(blockPreparation)
+        }
+        const physicalRelease = vi.fn()
+        const exitFence = retainableReplacementFence({
+            revision: 8,
+            refreshCommittedWorkingSet: mocks.refreshWorkingSet,
+            release: physicalRelease,
+        })
+        mocks.bridge.startJob
+            .mockResolvedValueOnce({
+                ...succeeded('old-sync', '0'), state: 'waiting', phase: 'remote-apply',
+                result: { receiveReady: true, snapshotId: 'remote', expectedRevision: outcome === 'stale' ? '7' : '8' },
+            })
+            .mockResolvedValueOnce(succeeded('old-sync', '9'))
+        mocks.bridge.applyReceived.mockResolvedValue({ snapshotId: 'remote', receivedRevision: '9' })
+        mocks.bridge.getJob.mockResolvedValue({
+            ...succeeded('old-sync', '0'), result: { snapshotId: 'remote', receivedRevision: '9' },
+        })
+        const foreground = requestExternalStorageNow('old-sync', 'sync')
+        await vi.waitFor(() => expect(entered).toBe(true))
+        const adapter = getExternalStorageSyncExitDrainAdapter(undefined, exitFence)!
+        const draining = adapter.drain({
+            revision: 8, libraryEpoch: 'library', selectionEpoch: 'old-epoch',
+            selectionId: adapter.id,
+        }, new AbortController().signal)
+        await vi.waitFor(() => expect(mocks.bridge.setExecutionSession).toHaveBeenCalledWith(
+            expect.objectContaining({ kind: 'exitDrain' }),
+        ))
+        rejectPreparation(outcome === 'failure' ? new Error('synthetic I/O failure') : new PersistentMutationFencedError())
+        if (outcome === 'complete') {
+            await expect(draining).resolves.toEqual({ kind: 'complete' })
+            await expect(foreground).resolves.toMatchObject({ kind: 'complete' })
+            expect(mocks.bridge.applyReceived).toHaveBeenCalledWith('job-old-sync', '8')
+            expect(mocks.refreshWorkingSet).toHaveBeenCalledWith(9, undefined)
+        } else {
+            const reason = outcome === 'stale'
+                ? 'Local data changed while external sync receive was prepared'
+                : 'synthetic I/O failure'
+            await expect(draining).resolves.toEqual({ kind: 'blocked', reason })
+            await expect(foreground).resolves.toMatchObject({ kind: 'blocked', reason })
+            expect(mocks.bridge.applyReceived).not.toHaveBeenCalled()
+            expect(mocks.refreshWorkingSet).not.toHaveBeenCalled()
+            if (outcome === 'stale') expect(mocks.bridge.cancelJob).toHaveBeenCalledWith('job-old-sync')
+            else expect(mocks.bridge.cancelJob).not.toHaveBeenCalled()
+        }
+        expect(physicalRelease).not.toHaveBeenCalled()
+        exitFence.release()
+        expect(physicalRelease).toHaveBeenCalledOnce()
+        delete runtimeState.revision
     })
 
     it('applies receives during an exit drain under the held exit fence', async () => {

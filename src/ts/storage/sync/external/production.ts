@@ -5,7 +5,8 @@ import {
     getPersistentDataRuntime,
     refreshActiveWorkingSetFromStore,
 } from '../../persistentDataRuntime.svelte'
-import type { PersistentMutationToken } from '../../saveCoordinator'
+import { PersistentMutationFencedError } from '../../saveCoordinator'
+import type { PersistentDestructiveReplacementFence } from '../../persistentDataRuntime'
 import type { RetainableReplacementFence } from '../../retainableReplacementFence'
 import { subscribeLocalPersistentRevision } from '../../persistentRevisionEvents'
 import type { SyncExitDrainAdapter } from '../../syncExitCoordinator'
@@ -107,21 +108,31 @@ async function applyReceivedSync(
     ) {
         throw new Error('External sync receive readiness is incomplete')
     }
-    // The exit has already saved local data, and its fence refuses more writes.
-    const held = exitDrainFence
-    let token: PersistentMutationToken | undefined
-    if (!held) {
-        await flushPendingDataLocally('external-storage-sync-receive')
-        token = await capturePersistentMutationToken(
-            'external-storage-sync-receive', { publishOfficial: false },
-        )
+    let fence: PersistentDestructiveReplacementFence
+    let expected: number
+    try {
+        if (exitDrainFence) {
+            fence = exitDrainFence.retain()
+            expected = getPersistentDataRuntime().revision
+        } else {
+            await flushPendingDataLocally('external-storage-sync-receive')
+            const token = await capturePersistentMutationToken(
+                'external-storage-sync-receive', { publishOfficial: false },
+            )
+            fence = await acquireDestructiveReplacementFence(token)
+            expected = token.revision
+        }
+    } catch (error) {
+        // An already-running foreground receive may meet the newly acquired exit fence.
+        if (!(error instanceof PersistentMutationFencedError) || !exitDrainFence) throw error
+        fence = exitDrainFence.retain()
+        expected = getPersistentDataRuntime().revision
     }
-    const expected = token ? token.revision : getPersistentDataRuntime().revision
     if (String(expected) !== job.result.expectedRevision) {
+        fence.release()
         await getExternalStorageBridge().cancelJob(job.id)
         throw new Error('Local data changed while external sync receive was prepared')
     }
-    const fence = token ? await acquireDestructiveReplacementFence(token) : held!.retain()
     await runExternalApplication({
         jobId: job.id,
         fence,

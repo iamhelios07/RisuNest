@@ -7,6 +7,7 @@
     import { isMetadataOnlySelectedConversation } from 'src/ts/storage/selectedConversationLifecycle'
     import { isCatalogCharacterStub } from 'src/ts/storage/workingSetCatalog'
     import { isConversationSummaryStub } from 'src/ts/storage/conversationResidency'
+    import { doingChat } from 'src/ts/process/generationState'
     import LoadingIndicator from '../UI/GUI/LoadingIndicator.svelte'
 
     let {
@@ -39,6 +40,12 @@
             !!conversation && isMetadataOnlySelectedConversation(conversation),
         ])
     })
+    const waitingForGeneration = $derived.by(() => {
+        if (!active || !$doingChat) return false
+        const character = DBState.db.characters[$selectedCharID]
+        const conversation = character?.chats[character.chatPage]
+        return !!conversation && isMetadataOnlySelectedConversation(conversation)
+    })
 
     onMount(() =>
         runtime.subscribeActiveConversationViewportSource(() => {
@@ -58,6 +65,7 @@
     $effect(() => {
         sourceVersion
         selectionKey
+        const waiting = waitingForGeneration
         let disposed = false
         let lease: CompleteConversationLease | undefined
         untrack(() => {
@@ -72,7 +80,7 @@
                 character.chaId === mountedCharacterId
             ready = false
             failed = false
-            if (!character) return
+            if (!character || waiting) return
             const settle = (complete: boolean) => {
                 ready = complete
                 failed = !complete
@@ -146,6 +154,8 @@
                         >{language.hypaV3Modal.retry}</button
                     >
                 </div>
+            {:else if waitingForGeneration}
+                <span>{language.navigationBlockedWhileGenerating}</span>
             {:else}
                 <LoadingIndicator label={language.loadingChatData} compact />
             {/if}

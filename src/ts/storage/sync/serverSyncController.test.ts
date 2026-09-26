@@ -89,6 +89,23 @@ describe("server sync controller", () => {
     expect(controller.snapshot().error).toBeFalsy();
   });
 
+  it("checks device section writes that did not advance the library revision before completing an exit", async () => {
+    const { controller, facade, status } = fixture();
+    facade.status.mockImplementation(async () => ({ ...status }));
+    await controller.synchronize();
+    expect(controller.snapshot().initialSyncComplete).toBe(true);
+    status.pendingDeviceSections = true;
+    facade.cycle.mockImplementationOnce(async () => {
+      status.pendingDeviceSections = false;
+      return { phase: "idle", conflictCount: 0, localRevision: 3, head: status.head };
+    });
+
+    await expect(controller.drainToRevision(3, new AbortController().signal))
+      .resolves.toEqual({ kind: "complete" });
+    expect(facade.cycle).toHaveBeenCalledTimes(2);
+    expect(status.pendingDeviceSections).toBe(false);
+  });
+
   it("runs every exit drain cycle under the exit fence and later cycles without it", async () => {
     vi.useFakeTimers();
     const { controller, facade, status } = fixture();

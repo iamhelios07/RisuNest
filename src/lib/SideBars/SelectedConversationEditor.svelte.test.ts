@@ -5,6 +5,7 @@ import { languageEnglish } from '../../lang/en'
 import { DBState } from 'src/ts/stores.svelte'
 import { createMetadataOnlySelectedConversation } from 'src/ts/storage/selectedConversationLifecycle'
 import SelectedConversationEditor from './SelectedConversationEditor.svelte'
+import { doingChat } from 'src/ts/process/generationState'
 
 const mocks = vi.hoisted(() => ({
     acquire: vi.fn(),
@@ -54,6 +55,7 @@ function deferred() {
 }
 
 beforeEach(() => {
+    doingChat.set(false)
     vi.clearAllMocks()
     DBState.db = {
         characters: [
@@ -72,6 +74,7 @@ beforeEach(() => {
     mocks.session.mockReturnValue(null)
 })
 afterEach(async () => {
+    doingChat.set(false)
     if (editor) await unmount(editor)
     editor = undefined
     document.body.replaceChildren()
@@ -99,6 +102,41 @@ it('does not load history for a hidden desktop sidebar', async () => {
     await tick()
     expect(mocks.acquire).not.toHaveBeenCalled()
     expect(mounted).not.toHaveBeenCalled()
+})
+
+it('waits for a windowed response to finish before promoting a newly opened editor', async () => {
+    DBState.db.characters[0].chats[0] = createMetadataOnlySelectedConversation({
+        id: 'chat-a', name: '', note: '', localLore: [],
+    })
+    doingChat.set(true)
+    const close = vi.fn()
+    mocks.acquire.mockResolvedValue({ release: vi.fn() })
+    show(true, close)
+    await tick()
+    expect(mocks.acquire).not.toHaveBeenCalled()
+    expect(mounted).not.toHaveBeenCalled()
+    expect(document.body.textContent).toContain(languageEnglish.navigationBlockedWhileGenerating)
+    expect(document.querySelector('button')?.textContent).toContain(languageEnglish.cancel)
+    doingChat.set(false)
+    await vi.waitFor(() => expect(mounted).toHaveBeenCalledOnce())
+    expect(mocks.acquire).toHaveBeenCalledOnce()
+})
+
+it('keeps a complete editor mounted when generation starts and finishes', async () => {
+    const session = {}
+    const release = vi.fn()
+    mocks.session.mockReturnValue(session)
+    mocks.acquire.mockResolvedValue({ session, release })
+    show()
+    await vi.waitFor(() => expect(mounted).toHaveBeenCalledOnce())
+    const input = document.querySelector('input')!
+    doingChat.set(true)
+    await tick()
+    doingChat.set(false)
+    await tick()
+    expect(document.querySelector('input')).toBe(input)
+    expect(mocks.acquire).toHaveBeenCalledOnce()
+    expect(release).not.toHaveBeenCalled()
 })
 
 it('keeps the mounted editor and its lease across saves of the same session', async () => {

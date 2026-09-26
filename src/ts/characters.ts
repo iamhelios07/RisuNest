@@ -1132,13 +1132,19 @@ export async function editSelectedChatList(
     reason: string,
     edit: (character: character | groupChat) => string | null | false,
 ): Promise<boolean> {
+    const blockedByGeneration = () => {
+        if (!get(doingChat)) return false
+        alertToast(language.navigationBlockedWhileGenerating)
+        return true
+    }
     const resolveCharacter = () => {
         const current = DBState.db.characters[get(selectedCharID)]
         return current?.chaId === characterId ? current : null
     }
-    if (!resolveCharacter()) return false
+    if (!resolveCharacter() || blockedByGeneration()) return false
     const windowed = await editWindowedSelectedChatList(characterId, reason, resolveCharacter, edit)
     if (windowed !== 'unsupported') return windowed
+    if (blockedByGeneration()) return false
     const target = captureSelectedConversationTarget()
     if (target && target.characterId !== characterId) return false
     let lease: Awaited<ReturnType<typeof acquireCompleteConversation>> | null = null
@@ -1151,6 +1157,7 @@ export async function editSelectedChatList(
         }
     }
     try {
+        if (blockedByGeneration()) return false
         const character = resolveCharacter()
         if (!character) return false
         const selectedId = character.chats[character.chatPage]?.id

@@ -35,6 +35,7 @@ const mocks = vi.hoisted(() => ({
     alertSelect: vi.fn(async () => '0'),
     alertAddCharacter: vi.fn(async () => 'createfromScratch'),
     alertError: vi.fn(),
+    alertToast: vi.fn(),
     changeChatTo: vi.fn(async (_idOrIndex?: string | number) => true),
     downloadFile: vi.fn(),
     findCharacterbyId: vi.fn(),
@@ -60,6 +61,7 @@ vi.mock('./alert', async () => {
         alertAddCharacter: mocks.alertAddCharacter,
         alertConfirm: mocks.alertConfirm,
         alertError: mocks.alertError,
+        alertToast: mocks.alertToast,
         alertNormal: vi.fn(),
         alertSelect: mocks.alertSelect,
         alertStore: writable({ type: 'none', msg: '' }),
@@ -855,6 +857,7 @@ describe('chat list operations', () => {
     }
 
     beforeEach(() => {
+        doingChat.set(false)
         mocks.database.characters = []
         mocks.nextId = 0
         selectedCharID.set(-1)
@@ -869,6 +872,44 @@ describe('chat list operations', () => {
         mocks.getSelectedConversationMode.mockReset()
         mocks.getSelectedConversationMode.mockReturnValue(null)
         mocks.editWindowedChatList.mockReset()
+    })
+
+    it('refuses list edits during generation before promoting or changing the selected chat', async () => {
+        const character = buildSelectedCharacter()
+        mocks.captureSelectedConversationTarget.mockReturnValue({
+            characterId: character.chaId, conversationId: 'chat-b',
+        })
+        mocks.getSelectedConversationMode.mockReturnValue('windowed')
+        const edit = vi.fn(() => null)
+        doingChat.set(true)
+        try {
+            expect(await editSelectedChatList(character.chaId, 'reorder-chats', edit)).toBe(false)
+        } finally {
+            doingChat.set(false)
+        }
+        expect(edit).not.toHaveBeenCalled()
+        expect(mocks.flushPendingData).not.toHaveBeenCalled()
+        expect(mocks.editWindowedChatList).not.toHaveBeenCalled()
+        expect(mocks.acquireCompleteConversation).not.toHaveBeenCalled()
+        expect(character.chats.map(chat => chat.id)).toEqual(['chat-a', 'chat-b', 'chat-c'])
+    })
+
+    it('refuses the complete fallback when generation starts during the windowed flush', async () => {
+        const character = buildSelectedCharacter()
+        mocks.captureSelectedConversationTarget.mockReturnValue({
+            characterId: character.chaId, conversationId: 'chat-b',
+        })
+        mocks.getSelectedConversationMode.mockReturnValue('windowed')
+        mocks.flushPendingData.mockImplementation(async () => { doingChat.set(true) })
+        mocks.editWindowedChatList.mockReturnValue({ kind: 'unsupported' })
+        const edit = vi.fn(() => null)
+        try {
+            expect(await editSelectedChatList(character.chaId, 'reorder-chats', edit)).toBe(false)
+        } finally {
+            doingChat.set(false)
+        }
+        expect(edit).not.toHaveBeenCalled()
+        expect(mocks.acquireCompleteConversation).not.toHaveBeenCalled()
     })
 
     it('keeps the selected chat when another chat is removed', async () => {

@@ -224,6 +224,7 @@ export function createServerSyncController(
   const completedRevision = (targetRevision: number): boolean =>
     Boolean(
       state.initialSyncComplete &&
+        matchesCompletedServerCycle(state.status, state.result, state.attemptIdentity) &&
         state.status &&
         state.result &&
         state.status.localRevision >= targetRevision &&
@@ -447,7 +448,19 @@ export function createServerSyncController(
       try {
         while (true) {
           if (signal.aborted) throw new DOMException("Exit drain aborted", "AbortError");
-          if (!state.running && completedRevision(targetRevision)) return { kind: "complete" };
+          if (!state.running && completedRevision(targetRevision)) {
+            // Device sections can change without advancing the library revision or
+            // delivering their renderer notification before the window closes.
+            try {
+              await refreshStatus();
+            } catch (cause) {
+              recordError(cause);
+              state.initialSyncComplete = false;
+              publish();
+            }
+            if (signal.aborted) throw new DOMException("Exit drain aborted", "AbortError");
+            if (!state.running && completedRevision(targetRevision)) return { kind: "complete" };
+          }
           await startSynchronization({}, false);
           if (signal.aborted) throw new DOMException("Exit drain aborted", "AbortError");
           if (completedRevision(targetRevision)) return { kind: "complete" };
