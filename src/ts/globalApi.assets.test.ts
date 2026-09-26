@@ -7,6 +7,7 @@ const state = vi.hoisted(() => ({
     blobStore: null as any,
     database: { characters: [] as any[] },
     activateConversation: vi.fn(async (_id: string) => true),
+    captureSelectedConversationTarget: vi.fn((): any => null),
     fencePersistentNavigation: vi.fn(),
     yieldToUi: vi.fn(async () => {}),
 }))
@@ -78,6 +79,7 @@ vi.mock('./alert', () => ({
 }))
 vi.mock('./storage/persistentDataRuntime.svelte', () => ({
     activateConversation: state.activateConversation,
+    captureSelectedConversationTarget: state.captureSelectedConversationTarget,
     fencePersistentNavigation: state.fencePersistentNavigation,
     configurePersistentDataRuntime: vi.fn(),
     markPersistentDataDirty: vi.fn(),
@@ -195,6 +197,39 @@ describe('conversation navigation', () => {
         expect(state.fencePersistentNavigation).not.toHaveBeenCalled()
         expect(state.yieldToUi).not.toHaveBeenCalled()
         expect(get(navigationActivity)).toBeNull()
+    })
+
+    test('keeps the open conversation without reloading it', async () => {
+        state.database.characters[0].chatPage = 1
+        state.captureSelectedConversationTarget.mockReturnValueOnce({
+            characterId: 'character-a',
+            conversationId: 'chat-b',
+        })
+        doingChat.set(true)
+        try {
+            await expect(changeChatTo('chat-b')).resolves.toBe(true)
+        } finally {
+            doingChat.set(false)
+        }
+
+        expect(state.fencePersistentNavigation).not.toHaveBeenCalled()
+        expect(state.yieldToUi).not.toHaveBeenCalled()
+        expect(state.activateConversation).not.toHaveBeenCalled()
+        expect(alertToast).not.toHaveBeenCalled()
+        expect(get(navigationActivity)).toBeNull()
+    })
+
+    test('activates the selected row when the open conversation differs', async () => {
+        state.database.characters[0].chatPage = 0
+        state.captureSelectedConversationTarget.mockReturnValueOnce({
+            characterId: 'character-a',
+            conversationId: 'chat-b',
+        })
+
+        await expect(changeChatTo('chat-b')).resolves.toBe(true)
+
+        expect(state.fencePersistentNavigation).toHaveBeenCalledOnce()
+        expect(state.activateConversation).toHaveBeenCalledWith('chat-b')
     })
 
     test('refuses a chat switch during generation without fencing the running response', async () => {

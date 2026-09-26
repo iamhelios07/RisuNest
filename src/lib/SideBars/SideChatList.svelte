@@ -60,12 +60,11 @@
     const createStb = async () => {
         const loadId = ++sortableLoadId
         destroySortable()
-        if (!editMode) return
 
         await tick()
         const { default: Sortable } =
             await import('sortablejs/modular/sortable.core.esm.js')
-        if (!editMode || loadId !== sortableLoadId || !listEle || !folderEles)
+        if (loadId !== sortableLoadId || !listEle || !folderEles)
             return
 
         for (let chat of listEle.querySelectorAll('.risu-chat')) {
@@ -152,7 +151,6 @@
     }
 
     $effect(() => {
-        editMode
         sorted
         chara.chatFolders.length
         chara.chats.length

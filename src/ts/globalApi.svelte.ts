@@ -55,6 +55,7 @@ import { getRuntimePerformanceBudgets, subscribeRuntimePerformanceProfile } from
 import { checkCharOrder as repairDatabaseCharacterOrder } from "./storage/databasePreparation";
 import {
     activateConversation,
+    captureSelectedConversationTarget,
     configurePersistentDataRuntime,
     fencePersistentNavigation,
     markPersistentDataDirty,
@@ -1702,6 +1703,13 @@ export async function changeChatTo(IdOrIndex: string | number): Promise<boolean>
         ? chats[IdOrIndex]?.id
         : IdOrIndex
     if(!chatId || !chats.some((chat) => chat.id === chatId)) return false
+    // Reactivating the open conversation would reload it and reset the chat view.
+    const selected = captureSelectedConversationTarget()
+    if(
+        selected?.characterId === characterId &&
+        selected.conversationId === chatId &&
+        chats[character.chatPage]?.id === chatId
+    ) return true
     // The navigation fence would orphan the running response, so refuse first.
     if(get(doingChat)){
         alertToast(language.navigationBlockedWhileGenerating)
