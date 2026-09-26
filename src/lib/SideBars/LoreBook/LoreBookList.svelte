@@ -350,12 +350,7 @@
                         openFolders={openFolders()}
                         isLastInContainer={book === lastVisibleItem}
                         onRemove={() => {
-                            if (openedRefs.has(book) && !book.folder) {
-                                onClose(true, book)
-                            }
-                            else if(openedRefs.has(book) && book.folder){
-                                onClose(false, book)
-                            }
+                            if (openedRefs.has(book)) onClose(book.mode !== 'folder', book)
                             
                             let lore = externalLoreBooks
                             
@@ -377,7 +372,9 @@
                                 lore.splice(i, 1)
                             }
                             
-                            externalLoreBooks = lore
+                            if (lore !== externalLoreBooks) {
+                                externalLoreBooks.splice(0, externalLoreBooks.length, ...lore)
+                            }
                         }} 
                         onOpen={(isDetail = true) => onOpen(isDetail, book)}
                         onClose={(isDetail = true) => onClose(isDetail, book)}
@@ -397,12 +394,7 @@
                         openFolders={openFolders()}
                         isLastInContainer={book === lastVisibleItem}
                         onRemove={() => {
-                            if (openedRefs.has(book) && !book.folder) {
-                                onClose(true, book)
-                            }
-                            else if(openedRefs.has(book) && book.folder){
-                                onClose(false, book)
-                            }
+                            if (openedRefs.has(book)) onClose(book.mode !== 'folder', book)
                             
                             let lore  = DBState.db.characters[$selectedCharID].globalLore
                             
@@ -444,12 +436,7 @@
                         openFolders={openFolders()}
                         isLastInContainer={book === lastVisibleItem}
                         onRemove={() => {
-                            if (openedRefs.has(book) && !book.folder) {
-                                onClose(true, book)
-                            }
-                            else if(openedRefs.has(book) && book.folder){
-                                onClose(false, book)
-                            }
+                            if (openedRefs.has(book)) onClose(book.mode !== 'folder', book)
                             
                             let lore  = DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].localLore
                             
