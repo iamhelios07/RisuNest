@@ -19,7 +19,6 @@
     import {defaultAutoSuggestPrompt} from "../../../ts/storage/defaultPrompts";
     import AuxModelSelectors from './Model/AuxModelSelectors.svelte'
 
-    let sorted = 0
     let warns: string[] = $state([])
     let tokens = $state(0)
     let extokens = $state(0)
@@ -52,23 +51,6 @@
       item,
       originalIndex: i,
       displayIndex: i
-    }))
-  }
-
-  function getReorderedTemplate() {
-    if (draggedIndex === -1 || dragOverIndex === -1 || draggedIndex === dragOverIndex) {
-      return getDisplayTemplate()
-    }
-
-    const items = getDisplayTemplate()
-    const [movedItem] = items.splice(draggedIndex, 1)
-
-    const adjustedDropIndex = draggedIndex < dragOverIndex ? dragOverIndex - 1 : dragOverIndex
-    items.splice(adjustedDropIndex, 0, movedItem)
-
-    return items.map((item, displayIndex) => ({
-      ...item,
-      displayIndex
     }))
   }
 
@@ -162,8 +144,7 @@
         {#if DBState.db.promptTemplate.length === 0}
                 <div class="text-textcolor2">No Format</div>
         {/if}
-        {#key sorted}
-            {#each getReorderedTemplate() as { item: prompt, originalIndex, displayIndex }}
+            {#each getDisplayTemplate() as { item: prompt, originalIndex, displayIndex } (prompt)}
                 <PromptDataItem
                     bind:promptItem={DBState.db.promptTemplate[originalIndex]}
                     isDragging={draggedIndex === originalIndex}
@@ -239,7 +220,6 @@
                         openedItemIndices = newOpenedIndices
                     }} />
             {/each}
-        {/key}
     </div>
 
     <button class="font-medium cursor-pointer hover:text-green-500" onclick={() => {
