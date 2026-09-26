@@ -1065,12 +1065,21 @@ export async function changeChar(index: number, arg:{
     reseter?:()=>any,
 } = {}): Promise<boolean> {
     const reseter = arg.reseter ?? (() => {})
+    const target = DBState.db.characters?.[index]
+    const chaId = target?.chaId
+    // Reactivating the open character would reload it and reset the chat view.
+    if(
+        chaId &&
+        get(selectedCharID) === index &&
+        captureSelectedConversationTarget()?.characterId === chaId
+    ){
+        reseter()
+        return true
+    }
     if(get(doingChat)){
       alertToast(language.navigationBlockedWhileGenerating)
       return false
     }
-    const target = DBState.db.characters?.[index]
-    const chaId = target?.chaId
     if(!chaId) return false
     if(isArchivedCharacter(target)){
         await restoreArchivedCharacterWithConfirmation(chaId)

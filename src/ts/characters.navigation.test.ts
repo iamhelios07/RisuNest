@@ -267,6 +267,45 @@ describe('runtime chat identity', () => {
         expect(get(navigationActivity)).toBeNull()
     })
 
+    it('keeps the open character without reloading it', async () => {
+        const character = createBlankChar()
+        mocks.database.characters.push(character)
+        selectedCharID.set(0)
+        mocks.captureSelectedConversationTarget.mockReturnValueOnce({
+            characterId: character.chaId,
+        })
+        const reseter = vi.fn()
+        doingChat.set(true)
+        try {
+            await expect(changeChar(0, { reseter })).resolves.toBe(true)
+        } finally {
+            doingChat.set(false)
+            selectedCharID.set(-1)
+        }
+
+        expect(reseter).toHaveBeenCalledOnce()
+        expect(mocks.fencePersistentNavigation).not.toHaveBeenCalled()
+        expect(mocks.activateCharacter).not.toHaveBeenCalled()
+        expect(get(navigationActivity)).toBeNull()
+    })
+
+    it('activates the selected index when another character is open', async () => {
+        const character = createBlankChar()
+        mocks.database.characters.push(character)
+        selectedCharID.set(0)
+        mocks.captureSelectedConversationTarget.mockReturnValueOnce({
+            characterId: 'another-character',
+        })
+        try {
+            await expect(changeChar(0)).resolves.toBe(true)
+        } finally {
+            selectedCharID.set(-1)
+        }
+
+        expect(mocks.fencePersistentNavigation).toHaveBeenCalledOnce()
+        expect(mocks.activateCharacter).toHaveBeenCalledOnce()
+    })
+
     it('clears character navigation when the screen reset fails', async () => {
         const character = createBlankChar()
         mocks.database.characters.push(character)
