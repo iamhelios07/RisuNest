@@ -131,13 +131,22 @@
     </div>
     <div class="flex grow flex-col p-2 max-w-full">
         <span class="text-sm text-textcolor2">{language.name}</span>
-        <TextInput marginBottom size="lg" placeholder="User" bind:value={DBState.db.username}/>
+        <TextInput marginBottom size="lg" placeholder="User" bind:value={() => DBState.db.username, (value) => {
+            DBState.db.username = value
+            saveUserPersona()
+        }}/>
         <span class="text-sm text-textcolor2">{language.note}</span>
         {#if DBState.db.personaNote}
-            <TextInput marginBottom size="lg" bind:value={DBState.db.userNote} placeholder={`Put a unique identifier for this persona here.\nExample: [Alternate Hunters persona]`} />
+            <TextInput marginBottom size="lg" bind:value={() => DBState.db.userNote, (value) => {
+                DBState.db.userNote = value
+                saveUserPersona()
+            }} placeholder={`Put a unique identifier for this persona here.\nExample: [Alternate Hunters persona]`} />
         {/if}
         <span class="text-sm text-textcolor2">{language.description}</span>
-        <TextAreaInput autocomplete="off" bind:value={DBState.db.personaPrompt} placeholder={`Put the description of this persona here.\nExample: [<user> is a 20 year old girl.]`} />
+        <TextAreaInput autocomplete="off" bind:value={() => DBState.db.personaPrompt, (value) => {
+            DBState.db.personaPrompt = value
+            saveUserPersona()
+        }} placeholder={`Put the description of this persona here.\nExample: [<user> is a 20 year old girl.]`} />
         <div class="flex gap-2 mt-4 max-w-full flex-wrap">
             <Button onclick={exportUserPersona}>{language.export}</Button>
             <Button onclick={importUserPersona}>{language.import}</Button>
