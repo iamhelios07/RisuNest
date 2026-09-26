@@ -2,7 +2,7 @@
   import { PlusIcon } from '@lucide/svelte'
   import Sortable from 'sortablejs'
   import type { triggerscript } from 'src/ts/storage/database.svelte'
-  import { sleep, sortableOptions } from 'src/ts/util'
+  import { sortableOptions } from 'src/ts/util'
   import { onDestroy, onMount } from 'svelte'
   import TriggerData from './TriggerV1Data.svelte'
 
@@ -14,7 +14,7 @@
   let { value = $bindable([]), lowLevelAble = false }: Props = $props()
   let stb: Sortable = null
   let ele: HTMLDivElement = $state()
-  let sorted = $state(0)
+  let originalNextSibling: Node | null = null
   let opened = 0
 
   const createStb = () => {
@@ -22,22 +22,17 @@
       return
     }
     stb = Sortable.create(ele, {
-      onEnd: async () => {
-        let idx: number[] = []
-        ele.querySelectorAll('[data-risu-idx2]').forEach((e, i) => {
-          idx.push(parseInt(e.getAttribute('data-risu-idx2')))
-        })
-        let newValue: triggerscript[] = []
-        idx.forEach((i) => {
-          newValue.push(value[i])
-        })
-        value = newValue
-        try {
-          stb.destroy()
-        } catch (error) {}
-        sorted += 1
-        await sleep(1)
-        createStb()
+      draggable: '> [data-risu-idx2]',
+      onStart: (event) => {
+          originalNextSibling = event.item.nextSibling
+      },
+      onEnd: (event) => {
+          const newValue = Array.from(ele.children)
+              .filter(row => row.hasAttribute('data-risu-idx2'))
+              .map(row => value[Number(row.getAttribute('data-risu-idx2'))])
+          // Restore Svelte's DOM before applying the new order.
+          event.from.insertBefore(event.item, originalNextSibling)
+          value = newValue
       },
       ...sortableOptions,
     })
@@ -69,7 +64,6 @@
   })
 </script>
 
-{#key sorted}
   <div
     class="contain w-full max-w-full mt-2 flex flex-col border-selected border-1 bg-darkbg rounded-md p-3"
     bind:this={ele}
@@ -77,7 +71,7 @@
     {#if value.length === 0}
       <div class="text-textcolor2">No Scripts</div>
     {/if}
-    {#each value as triggerscript, i}
+    {#each value as triggerscript, i (triggerscript)}
       <TriggerData
         idx={i}
         bind:value={value[i]}
@@ -106,4 +100,3 @@
   >
     <PlusIcon />
   </button>
-{/key}
