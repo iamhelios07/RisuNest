@@ -104,7 +104,7 @@
         refreshMessageDisplay?: (state: ChatDisplayRefresh) => void
         hasActiveEditor?: () => boolean
         refreshParserProjection?: (projection?: BoundedLiveChatParserProjection) => void
-        refreshConversationStartParser?: () => void
+        refreshConversationStartParser?: (totalMessages?: number) => void
         updateConversationStartPresentation?: (state: { resolvedImage: string }) => void
         updateStreamingDisplay?: (state: {
             isOptimizedStreamingMessage: boolean
@@ -1471,11 +1471,12 @@
         if (previousSignature && previousSignature !== signature && mountInstances.has(key)) {
             const previousInputs = JSON.parse(previousSignature)
             const nextInputs = JSON.parse(signature)
-            // Recheck history admission on reload without discarding the greeting.
+            // Recheck history admission on reload or a new message count without discarding the greeting.
+            previousInputs[9] = nextInputs[9]
             previousInputs[11] = nextInputs[11]
             if (JSON.stringify(previousInputs) === signature) {
                 element.dataset.chatConversationStartSignature = signature
-                untrack(() => mountInstances.get(key)?.refreshConversationStartParser?.())
+                untrack(() => mountInstances.get(key)?.refreshConversationStartParser?.(totalMessages))
                 return
             }
         }

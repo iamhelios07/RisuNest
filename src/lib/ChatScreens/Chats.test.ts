@@ -2516,6 +2516,28 @@ describe('Chats imperative mount lifecycle', () => {
         expect(chatMountProbe.unmounts).toHaveLength(unmounts)
     })
 
+    test('keeps the greeting mounted when a new message changes the chat length', async () => {
+        const messages = [makeMessage(0)]
+        const acquireGreeting = vi.fn(async (_request: { totalMessages: number }) => null)
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialMessages: messages,
+                initialCharacter: makeCharacter(messages),
+                acquireConversationStartParserLease: acquireGreeting,
+            },
+        })
+        await vi.waitFor(() => expect(acquireGreeting).toHaveBeenCalledOnce())
+        await vi.waitFor(() => expect(conversationStartProbe(target)).not.toBeNull())
+        const greeting = conversationStartProbe(target)
+        const unmounts = chatMountProbe.unmounts.length
+        ;(mounted as HarnessInstance).setMessages([...messages, makeMessage(1)])
+        await vi.waitFor(() => expect(acquireGreeting).toHaveBeenCalledTimes(2))
+        expect(acquireGreeting.mock.calls[1][0].totalMessages).toBe(2)
+        expect(conversationStartProbe(target)).toBe(greeting)
+        expect(chatMountProbe.unmounts).toHaveLength(unmounts)
+    })
+
     test('rechecks greeting admission when in-place parser scripts or global modules reload', async () => {
         const messages = [makeMessage(0)]
         const currentCharacter = makeCharacter(messages)
