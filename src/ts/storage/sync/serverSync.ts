@@ -1,6 +1,7 @@
 import type { SyncMutationRuntime } from "./syncMutationRuntime";
 import { invoke } from "@tauri-apps/api/core";
 import type { PersistentDestructiveReplacementFence } from "../persistentDataRuntime";
+import type { RetainableReplacementFence } from "../retainableReplacementFence";
 
 /** Ledger sections. Device-fixed data is never addressable on the server. */
 export type ServerSection = "library" | "hypa" | "local-plugins";
@@ -312,6 +313,7 @@ export function createServerSyncFacade(options: {
   };
   const run = async (
     cycleOptions: ServerCycleOptions,
+    held: RetainableReplacementFence | undefined,
   ): Promise<ServerCycle> => {
     cancelled = false;
     if (pendingActivation) {
@@ -324,8 +326,11 @@ export function createServerSyncFacade(options: {
       options.onProgress?.("publishing");
       return transfer<ServerCycle>("server_sync_publish", { preparationId });
     }
-    options.onProgress?.("saving");
-    await options.runtime.flushPendingData("server-sync-prepare");
+    // A held fence has already saved local data and refuses further writes.
+    if (!held) {
+      options.onProgress?.("saving");
+      await options.runtime.flushPendingData("server-sync-prepare");
+    }
     options.onProgress?.("preparing");
     const prepared = await transfer<Prepared>("server_sync_prepare", {
       options: cycleOptions,
@@ -335,11 +340,15 @@ export function createServerSyncFacade(options: {
     let ownsPreparation = true;
     try {
       if (cancelled) throw new ServerSyncError("cancelled");
-      await options.runtime.flushPendingData("server-sync-activate");
-      const token = await options.runtime.capturePersistentMutationToken(
-        "server-sync-activate",
-      );
-      fence = await options.runtime.acquireDestructiveReplacementFence(token);
+      if (held) {
+        fence = held.retain();
+      } else {
+        await options.runtime.flushPendingData("server-sync-activate");
+        const token = await options.runtime.capturePersistentMutationToken(
+          "server-sync-activate",
+        );
+        fence = await options.runtime.acquireDestructiveReplacementFence(token);
+      }
       if (cancelled) throw new ServerSyncError("cancelled");
       pendingActivation = { prepared, fence };
       ownsPreparation = false;
@@ -384,9 +393,14 @@ export function createServerSyncFacade(options: {
     reconcile: () => recover("server_sync_reconcile"),
     needsRefresh: () =>
       pendingRefresh !== undefined || pendingActivation !== undefined,
-    cycle(cycleOptions: ServerCycleOptions = {}): Promise<ServerCycle> {
+    /** A cycle given a held fence runs under it instead of saving and fencing
+     * again, and keeps its own hold while an activation or refresh is pending. */
+    cycle(
+      cycleOptions: ServerCycleOptions = {},
+      held?: RetainableReplacementFence,
+    ): Promise<ServerCycle> {
       if (active) return active;
-      active = run(cycleOptions)
+      active = run(cycleOptions, held)
         .catch((cause) => {
           throw serverSyncError(cause);
         })

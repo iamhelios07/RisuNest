@@ -744,7 +744,9 @@ export class SaveCoordinator {
         this.pendingWindowedChatListChange = null
         this.persistenceWasBusy = false
         this.lastBackgroundErrorMessage = null
-        if (this.destructiveReplacementFence?.state === 'held') {
+        // A destructive fence compares against the baselines reset above, so a
+        // later refresh under the same fence sees the installed state as clean.
+        if (this.destructiveReplacementFence?.state === 'held' && this.destructiveReplacementFence.refreshBaseline) {
             this.destructiveReplacementFence.refreshBaseline = captured
         }
         if (this.committedRefreshRevision !== null) {

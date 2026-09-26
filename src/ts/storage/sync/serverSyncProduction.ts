@@ -15,6 +15,7 @@ import { createServerSyncScheduler } from "./serverSyncScheduler";
 import { subscribeLocalPersistentRevision } from "../persistentRevisionEvents";
 import { subscribeNativeServerSyncSignals } from "./serverSyncNativeSignals";
 import type { SyncExitDrainAdapter } from "../syncExitCoordinator";
+import type { RetainableReplacementFence } from "../retainableReplacementFence";
 
 let controller: ReturnType<typeof createServerSyncController> | undefined;
 export function getServerSyncController() {
@@ -47,13 +48,14 @@ export function getServerSyncController() {
 }
 export function createServerSyncExitDrainAdapter(
   id = "server",
+  fence?: RetainableReplacementFence,
   syncController = getServerSyncController(),
 ): SyncExitDrainAdapter {
   return {
     id,
     drain: (target, signal) =>
       target.selectionId === id
-        ? syncController.drainToRevision(target.revision, signal)
+        ? syncController.drainToRevision(target.revision, signal, fence)
         : Promise.resolve({
             kind: "blocked",
             reason: "server-sync-selection-changed",

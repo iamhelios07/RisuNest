@@ -2,7 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { languageEnglish } from "src/lang/en";
 import { createServerSyncController } from "./serverSyncController";
 import { serverSyncProgressView } from "./serverSyncConnectFlow";
-import type { ServerSyncFacade, ServerStatus } from "./serverSync";
+import { ServerSyncError, type ServerSyncFacade, type ServerStatus } from "./serverSync";
+import type { RetainableReplacementFence } from "../retainableReplacementFence";
 
 function fixture() {
   const status: ServerStatus = {
@@ -86,6 +87,69 @@ describe("server sync controller", () => {
     ).resolves.toEqual({ kind: "complete" });
     expect(facade.cycle).toHaveBeenCalledOnce();
     expect(controller.snapshot().error).toBeFalsy();
+  });
+
+  it("runs every exit drain cycle under the exit fence and later cycles without it", async () => {
+    vi.useFakeTimers();
+    const { controller, facade, status } = fixture();
+    const fence = {} as RetainableReplacementFence;
+    facade.cycle.mockResolvedValueOnce({
+      phase: "pending",
+      conflictCount: 0,
+      localRevision: 3,
+      head: status.head,
+    });
+    const draining = controller.drainToRevision(3, new AbortController().signal, fence);
+    await vi.advanceTimersByTimeAsync(300);
+    await expect(draining).resolves.toEqual({ kind: "complete" });
+    expect(facade.cycle.mock.calls).toEqual([[{}, fence], [{}, fence]]);
+
+    await controller.synchronize();
+    expect(facade.cycle).toHaveBeenLastCalledWith({}, undefined);
+  });
+
+  it("retries a failed exit drain cycle before reporting it", async () => {
+    vi.useFakeTimers();
+    const { controller, facade } = fixture();
+    facade.cycle.mockRejectedValueOnce(new Error("synthetic fenced flush"));
+    const draining = controller.drainToRevision(3, new AbortController().signal);
+    await vi.advanceTimersByTimeAsync(1000);
+    await expect(draining).resolves.toEqual({ kind: "complete" });
+    expect(facade.cycle).toHaveBeenCalledTimes(2);
+    expect(controller.snapshot().error).toBeFalsy();
+  });
+
+  it("reports a failure the same cycle would receive again without retrying", async () => {
+    const { controller, facade } = fixture();
+    facade.cycle.mockRejectedValue(new ServerSyncError("synthetic-rejected", false));
+    await expect(
+      controller.drainToRevision(3, new AbortController().signal),
+    ).resolves.toEqual({ kind: "blocked", reason: "synthetic-rejected" });
+    expect(facade.cycle).toHaveBeenCalledOnce();
+  });
+
+  it("reports a failure after the bounded exit drain retries", async () => {
+    vi.useFakeTimers();
+    const { controller, facade } = fixture();
+    facade.cycle.mockRejectedValue(new ServerSyncError("synthetic-offline"));
+    const draining = controller.drainToRevision(3, new AbortController().signal);
+    await vi.advanceTimersByTimeAsync(7000);
+    await expect(draining).resolves.toEqual({
+      kind: "blocked",
+      reason: "synthetic-offline",
+    });
+    expect(facade.cycle).toHaveBeenCalledTimes(4);
+  });
+
+  it("stops waiting for an exit drain retry when the drain is aborted", async () => {
+    const { controller, facade } = fixture();
+    facade.cycle.mockRejectedValue(new ServerSyncError("synthetic-offline"));
+    const abort = new AbortController();
+    const draining = controller.drainToRevision(3, abort.signal);
+    await vi.waitFor(() => expect(controller.snapshot().error).toBe("synthetic-offline"));
+    abort.abort();
+    await expect(draining).rejects.toMatchObject({ name: "AbortError" });
+    expect(facade.cycle).toHaveBeenCalledOnce();
   });
 
   it("drains through a newer target revision and restores the prior manual pause", async () => {
@@ -287,7 +351,7 @@ describe("server sync controller", () => {
     expect(controller.canAutoSync()).toBe(false);
     const options = { resolution: "keep-local" as const, expectedRevision: 3 };
     await controller.synchronize(options);
-    expect(facade.cycle).toHaveBeenLastCalledWith(options);
+    expect(facade.cycle).toHaveBeenLastCalledWith(options, undefined);
     expect(controller.canAutoSync()).toBe(true);
   });
   it("bounds polling and coalesces concurrent foreground requests", async () => {

@@ -143,6 +143,10 @@ import {
 } from './storage/syncExitProduction'
 import { getExternalStorageBridge } from './storage/sync/external/bridge'
 import { createServerSyncExitDrainAdapter } from './storage/sync/serverSyncProduction'
+import {
+    retainableReplacementFence,
+    type RetainableReplacementFence,
+} from './storage/retainableReplacementFence'
 
 const appWindow = isTauri ? getCurrentWebviewWindow() : null
 let disposeLifecycleCommitListeners: (() => void) | undefined
@@ -624,6 +628,7 @@ export async function loadData() {
             }
         }
         let heldExitRevision: number | undefined
+        let heldExitFence: RetainableReplacementFence | undefined
         let selectedExitDrain: SyncExitDrainAdapter | null = null
         const syncExitCoordinator = createSyncExitCoordinator({
             async acquireEditFence() {
@@ -631,8 +636,11 @@ export async function loadData() {
                     'normal-exit-fence',
                     { publishOfficial: false },
                 )
-                const fence = await runtime.acquireDestructiveReplacementFence(token)
+                const fence = retainableReplacementFence(
+                    await runtime.acquireDestructiveReplacementFence(token),
+                )
                 heldExitRevision = fence.revision
+                heldExitFence = fence
                 return fence
             },
             flushLocal: () => runtime.flushPendingDataLocally('normal-exit'),
@@ -667,7 +675,10 @@ export async function loadData() {
                     && selection.connectionId
                 ) {
                     selectionId = `server:${selection.connectionId}:${selection.selectionEpoch}`
-                    selectedExitDrain = createServerSyncExitDrainAdapter(selectionId)
+                    selectedExitDrain = createServerSyncExitDrainAdapter(
+                        selectionId,
+                        heldExitFence,
+                    )
                 } else if (
                     !selection.decisionRequired
                     && selection.kind === 'external'

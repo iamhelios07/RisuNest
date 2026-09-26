@@ -143,7 +143,8 @@ describe("native server synchronization scheduling", () => {
     const { createServerSyncExitDrainAdapter } = await import(
       "./serverSyncProduction"
     );
-    const adapter = createServerSyncExitDrainAdapter("server:selected:selection");
+    const fence = { retain: vi.fn() } as never;
+    const adapter = createServerSyncExitDrainAdapter("server:selected:selection", fence);
     const abort = new AbortController();
     const target = {
       revision: 17,
@@ -158,6 +159,7 @@ describe("native server synchronization scheduling", () => {
     expect(state.controller.drainToRevision).toHaveBeenCalledWith(
       17,
       abort.signal,
+      fence,
     );
     await adapter.cancel("cancel-exit");
     expect(state.controller.cancelExitDrain).toHaveBeenCalledOnce();

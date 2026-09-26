@@ -11,6 +11,7 @@ import {
   type ServerSyncProgress,
 } from "./serverSync";
 import type { SyncExitDrainResult } from "../syncExitCoordinator";
+import type { RetainableReplacementFence } from "../retainableReplacementFence";
 import {
   matchesCompletedServerCycle,
   type ServerAttemptIdentity,
@@ -46,6 +47,18 @@ export interface ServerSyncSnapshot {
 export function serverSyncBlocked(snapshot: ServerSyncSnapshot): boolean {
   return Boolean(snapshot.error) && snapshot.errorRetryable === false;
 }
+/** Waits before each automatic retry of a failed exit drain cycle. */
+const exitDrainRetryDelays = [1000, 2000, 4000];
+const abortableDelay = (millis: number, signal: AbortSignal): Promise<void> =>
+  new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, millis);
+    signal.addEventListener("abort", done, { once: true });
+  });
 export function createServerSyncController(
   facade: ServerSyncFacade,
   controllerOptions: {
@@ -64,6 +77,8 @@ export function createServerSyncController(
   let statusSequence = 0;
   let byteSample: { at: number; bytes: bigint } | undefined;
   let exitDrainActive = 0;
+  // Every cycle during an exit drain runs under the fence the exit holds.
+  let exitFence: RetainableReplacementFence | undefined;
   const listeners = new Set<(snapshot: ServerSyncSnapshot) => void>();
   const publish = (): void => {
     state = {
@@ -127,7 +142,7 @@ export function createServerSyncController(
         // Progress publishes replace the snapshot while this promise is pending.
         // Resolve first, then assign to the current snapshot, not the old object
         // captured by the left-hand side of an assignment containing await.
-        const result = await facade.cycle(attempt === 0 ? options : {});
+        const result = await facade.cycle(attempt === 0 ? options : {}, exitFence);
         state.result = result;
         publish();
         if (result.phase !== "pending" || state.paused) break;
@@ -214,8 +229,9 @@ export function createServerSyncController(
         state.status.localRevision >= targetRevision &&
         state.result.localRevision >= targetRevision,
     );
-  const exitDrainBlock = (): string | undefined => {
-    if (state.error) return state.error;
+  const exitDrainBlock = (): string | undefined =>
+    state.error || exitDrainStateBlock();
+  const exitDrainStateBlock = (): string | undefined => {
     if (!state.status?.configured) return "server-not-configured";
     if (state.status.registrationRequired)
       return "new-device-registration-required";
@@ -413,10 +429,13 @@ export function createServerSyncController(
     async drainToRevision(
       targetRevision: number,
       signal: AbortSignal,
+      fence?: RetainableReplacementFence,
     ): Promise<SyncExitDrainResult> {
       if (!Number.isSafeInteger(targetRevision) || targetRevision < 0)
         throw new RangeError("Exit drain revision must be a nonnegative safe integer");
       const pausedBeforeDrain = state.paused;
+      const fenceBeforeDrain = exitFence;
+      if (fence) exitFence = fence;
       exitDrainActive += 1;
       state.paused = false;
       publish();
@@ -424,21 +443,30 @@ export function createServerSyncController(
         void facade.cancel();
       };
       signal.addEventListener("abort", cancelOnAbort, { once: true });
+      let retries = 0;
       try {
         while (true) {
           if (signal.aborted) throw new DOMException("Exit drain aborted", "AbortError");
-          // The exit edit fence refuses a new cycle's local flush, so an
-          // already synchronized revision must not start another cycle.
           if (!state.running && completedRevision(targetRevision)) return { kind: "complete" };
           await startSynchronization({}, false);
           if (signal.aborted) throw new DOMException("Exit drain aborted", "AbortError");
           if (completedRevision(targetRevision)) return { kind: "complete" };
           const reason = exitDrainBlock();
-          if (reason) return { kind: "blocked", reason };
+          if (reason) {
+            // A cycle that started before the exit fence, or a transient
+            // failure, is retried before the exit asks for a decision.
+            const retryable =
+              state.errorRetryable !== false && !exitDrainStateBlock();
+            if (!state.error || !retryable || retries >= exitDrainRetryDelays.length)
+              return { kind: "blocked", reason };
+            await abortableDelay(exitDrainRetryDelays[retries++], signal);
+            continue;
+          }
           await new Promise<void>((resolve) => setTimeout(resolve, 300));
         }
       } finally {
         signal.removeEventListener("abort", cancelOnAbort);
+        exitFence = fenceBeforeDrain;
         exitDrainActive -= 1;
         if (exitDrainActive === 0) {
           state.paused = pausedBeforeDrain;
