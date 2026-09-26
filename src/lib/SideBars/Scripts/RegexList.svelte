@@ -15,7 +15,7 @@
     let stb: Sortable = null
     let ele: HTMLDivElement = $state()
     let originalNextSibling: Node | null = null
-    let opened = 0
+    let opened = $state(new Set<customscript>())
     const createStb = () => {
         stb = Sortable.create(ele, {
             draggable: '> [data-risu-idx]',
@@ -34,20 +34,26 @@
         })
     }
 
-    const onOpen = () => {
-        opened += 1
-        if(stb){
-            try {
-                stb.destroy()
-            } catch (error) {}
+    const onOpen = (item: customscript) => {
+        if (opened.has(item)) return
+        opened = new Set([...opened, item])
+        if (stb) {
+            stb.destroy()
+            stb = null
         }
     }
-    const onClose = () => {
-        opened -= 1
-        if(opened === 0){
-            createStb()
-        }
+    const onClose = (item: customscript) => {
+        if (!opened.has(item)) return
+        opened.delete(item)
+        opened = new Set(opened)
+        if (opened.size === 0) createStb()
     }
+
+    $effect(() => {
+        for (const item of opened) {
+            if (!value.includes(item)) onClose(item)
+        }
+    })
 
     onMount(createStb)
 
@@ -64,7 +70,7 @@
                 <div class="text-textcolor2">No Scripts</div>
         {/if}
         {#each value as customscript, i (customscript)}
-            <RegexData idx={i} bind:value={value[i]} onOpen={onOpen} onClose={onClose} onRemove={() => {
+            <RegexData idx={i} bind:value={value[i]} onOpen={() => onOpen(customscript)} onClose={() => onClose(customscript)} onRemove={() => {
                 let customscript = value
                 customscript.splice(i, 1)
                 value = customscript

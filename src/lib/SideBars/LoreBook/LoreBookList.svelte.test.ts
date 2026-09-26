@@ -69,6 +69,23 @@ afterEach(async () => {
 })
 
 describe('lorebook editing', () => {
+    it('restores dragging and paging after replacing a list with an open entry', async () => {
+        DBState.db.characters[0].globalLore = [book('Old')]
+        instance = mount(LoreBookList, { target: document.body })
+        await tick()
+        row('Old').querySelector('button')!.click()
+        await tick()
+        const creations = mocks.create.mock.calls.length
+        DBState.db.characters[0].globalLore = Array.from({ length: 65 }, (_, i) => book(`New ${i}`))
+        await tick()
+        expect(mocks.create).toHaveBeenCalledTimes(creations + 1)
+        const next = document.querySelector<HTMLButtonElement>(`button[aria-label="${languageEnglish.risuNest.pager.next}"]`)!
+        expect(next.disabled).toBe(false)
+        next.click()
+        await tick()
+        expect(document.querySelectorAll('[data-risu-idx]')).toHaveLength(5)
+    })
+
     it('reorders a later page using backing indices and preserves hidden entries', async () => {
         const lore = Array.from({ length: 65 }, (_, i) => book(`Entry ${i}`))
         DBState.db.characters[0].globalLore = lore

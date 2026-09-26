@@ -46,6 +46,15 @@ afterEach(async () => {
 })
 
 describe('prompt drag ordering', () => {
+    it('keeps the same prompt open when another operation inserts an earlier item', async () => {
+        header('Second').click()
+        await tick()
+        const input = header('Second').parentElement!.querySelector('input')!
+        DBState.db.promptTemplate.unshift({ type: 'plain', name: 'Inserted', text: '', role: 'system', type2: 'normal' })
+        await tick()
+        expect(header('Second').parentElement!.querySelector('input')).toBe(input)
+        expect(header('First').parentElement!.querySelector('input')).toBeNull()
+    })
     it('drops before the gap being hovered, independent of the previous card hover', async () => {
         const data = transfer()
         await dragEvent(header('Last'), 'dragstart', data)

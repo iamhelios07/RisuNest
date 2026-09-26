@@ -21,7 +21,7 @@
         isOpened?: boolean;
         draggedIndex?: number;
         dragOverIndex?: number;
-        openedItemIndices?: Set<number>;
+        openedItems?: Set<PromptItem>;
         currentIndex?: number;
         displayIndex?: number;
     }
@@ -36,7 +36,7 @@
         isOpened = false,
         draggedIndex = $bindable(-1),
         dragOverIndex = $bindable(-1),
-        openedItemIndices = $bindable(new Set<number>()),
+        openedItems = $bindable(new Set<PromptItem>()),
         currentIndex = -1,
         displayIndex = -1
     }: Props = $props();
@@ -202,13 +202,13 @@
             dragOverIndex = -1
         }}
         onclick={() => {
-            const newIndices = new Set(openedItemIndices)
+            const next = new Set(openedItems)
             if (isOpened) {
-                newIndices.delete(currentIndex)
+                next.delete(promptItem)
             } else {
-                newIndices.add(currentIndex)
+                next.add(promptItem)
             }
-            openedItemIndices = newIndices
+            openedItems = next
         }}
     >
         <span>{getName(promptItem)}</span>

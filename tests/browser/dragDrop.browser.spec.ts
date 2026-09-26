@@ -31,6 +31,19 @@ async function drag(source: Locator, target: Locator, bottom = false) {
 }
 
 for (const kind of ['regex', 'trigger']) {
+    test(`${kind}: restores dragging after replacing an open list`, async ({ page }) => {
+        await open(page, kind)
+        await page.getByRole('button', { name: 'First', exact: true }).click()
+        await page.evaluate(kind => {
+            const db = (window as any).dragState.db
+            if (kind === 'regex') db.globalscript = db.globalscript.slice(1)
+            else db.characters[0].triggerscript = db.characters[0].triggerscript.slice(1)
+        }, kind)
+        await expect(page.getByRole('button', { name: 'First', exact: true })).toHaveCount(0)
+        await drag(page.getByRole('button', { name: 'Last', exact: true }), page.getByRole('button', { name: 'Second', exact: true }))
+        await expect.poll(() => order(page, kind)).toEqual(['Last', 'Second'])
+    })
+
     test(`${kind}: delete, edit, and repeatedly reorder with the real Sortable library`, async ({ page }) => {
         const errors: string[] = []
         page.on('pageerror', error => errors.push(error.message))

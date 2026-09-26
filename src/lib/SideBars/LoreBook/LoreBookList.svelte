@@ -80,8 +80,7 @@
 
     onMount(createStb)
 
-    let openedDetails = 0  // Count only lorebook details (for drag deactivation)
-    let openedRefs = $state(new Set()) // Track both folders + lorebooks (for UI state)
+    let openedRefs = $state(new Set<loreBook>())
     
     // Derived state to calculate number of open folders
     let openFolders = $derived(() => {
@@ -94,34 +93,26 @@
         return count
     })
     
-    const onOpen = (isDetail: boolean = true, bookRef?: any) => {
-        if (isDetail) {
-            // Disable drag only when lorebook detail opens
-            openedDetails += 1
-            if(stb){
-                try {
-                    stb.destroy()
-                } catch (error) {}
-            }
-    }
-        if (bookRef) {
-            openedRefs.add(bookRef)
-            openedRefs = new Set(openedRefs) // Trigger reactivity
+    const onOpen = (isDetail: boolean = true, bookRef?: loreBook) => {
+        if (!bookRef || openedRefs.has(bookRef)) return
+        if (isDetail && stb) {
+            stb.destroy()
+            stb = null
         }
+        openedRefs = new Set([...openedRefs, bookRef])
     }
-    const onClose = (isDetail: boolean = true, bookRef?: any) => {
-        if (isDetail) {
-            // Consider reactivating drag only when lorebook detail closes
-            openedDetails -= 1
-            if(openedDetails === 0){
-                createStb()
-            }
-        }
-        if (bookRef) {
-            openedRefs.delete(bookRef)
-            openedRefs = new Set(openedRefs) // Trigger reactivity
-        }
+    const onClose = (isDetail: boolean = true, bookRef?: loreBook) => {
+        if (!openedRefs.has(bookRef)) return
+        openedRefs.delete(bookRef)
+        openedRefs = new Set(openedRefs)
+        if (isDetail && ![...openedRefs].some(book => book.mode !== 'folder')) createStb()
     }
+
+    $effect(() => {
+        for (const book of openedRefs) {
+            if (!pageRows.some(row => row.book === book)) onClose(book.mode !== 'folder', book)
+        }
+    })
 
     onDestroy(() => {
         if(stb){

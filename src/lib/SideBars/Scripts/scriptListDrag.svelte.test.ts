@@ -96,4 +96,15 @@ describe.each([
             .map(row => row.querySelector('button')!.textContent!.trim())).toEqual(['First', 'Third', 'Second'])
         expect(sortable.create).toHaveBeenCalledTimes(1)
     })
+    it('restores dragging when an open row is replaced externally', async () => {
+        await setup()
+        await toggle('First')
+        const creations = sortable.create.mock.calls.length
+        value = value.slice(1)
+        await tick()
+        expect(sortable.create).toHaveBeenCalledTimes(creations + 1)
+        await toggle('Second')
+        await toggle('Second')
+        expect(sortable.create).toHaveBeenCalledTimes(creations + 2)
+    })
 })

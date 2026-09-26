@@ -15,7 +15,7 @@
   let stb: Sortable = null
   let ele: HTMLDivElement = $state()
   let originalNextSibling: Node | null = null
-  let opened = 0
+  let opened = $state(new Set<triggerscript>())
 
   const createStb = () => {
     if (!ele) {
@@ -38,20 +38,26 @@
     })
   }
 
-  const onOpen = () => {
-    opened += 1
-    if (stb) {
-      try {
-        stb.destroy()
-      } catch (error) {}
-    }
+  const onOpen = (item: triggerscript) => {
+      if (opened.has(item)) return
+      opened = new Set([...opened, item])
+      if (stb) {
+          stb.destroy()
+          stb = null
+      }
   }
-  const onClose = () => {
-    opened -= 1
-    if (opened === 0) {
-      createStb()
-    }
+  const onClose = (item: triggerscript) => {
+      if (!opened.has(item)) return
+      opened.delete(item)
+      opened = new Set(opened)
+      if (opened.size === 0) createStb()
   }
+
+  $effect(() => {
+      for (const item of opened) {
+          if (!value.includes(item)) onClose(item)
+      }
+  })
 
   onMount(createStb)
 
@@ -76,8 +82,8 @@
         idx={i}
         bind:value={value[i]}
         {lowLevelAble}
-        {onOpen}
-        {onClose}
+        onOpen={() => onOpen(triggerscript)}
+        onClose={() => onClose(triggerscript)}
         onRemove={() => {
           let triggerscript = value
           triggerscript.splice(i, 1)
