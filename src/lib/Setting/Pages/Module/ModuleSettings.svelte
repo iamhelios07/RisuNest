@@ -4,13 +4,12 @@
     import { DBState } from 'src/ts/stores.svelte';
     import Button from "src/lib/UI/GUI/Button.svelte";
     import ModuleMenu from "src/lib/Setting/Pages/Module/ModuleMenu.svelte";
-    import { exportModule, exportModuleLegacy, importModule, refreshModules, type RisuModule } from "src/ts/process/modules";
+    import { exportModule, exportModuleLegacy, importModule, type RisuModule } from "src/ts/process/modules";
     import { SquarePen, TrashIcon, Globe, Share2Icon, PlusIcon, HardDriveUpload, Waypoints, UserIcon } from "@lucide/svelte";
     import { v4 } from "uuid";
     import { tooltip } from "src/ts/gui/tooltip";
     import { alertConfirm, alertError, alertNormal, alertSelect } from "src/ts/alert";
     import TextInput from "src/lib/UI/GUI/TextInput.svelte";
-    import { onDestroy } from "svelte";
     import { importMCPModule } from "src/ts/process/mcp/mcp";
     import { convertModuleToCharacter } from "src/ts/interchangeability";
     import { commitDetachedCharacter } from "src/ts/characters";
@@ -36,9 +35,6 @@
         })
     }
 
-    onDestroy(() => {
-        refreshModules()
-    })
 </script>
 {#if mode === 0}
     <h2 class="mb-2 text-2xl font-bold mt-2">{language.modules}</h2>
@@ -182,7 +178,6 @@
     <h2 class="mb-2 text-2xl font-bold mt-2">{language.createModule}</h2>
     <ModuleMenu bind:currentModule={tempModule}/>
     <Button className="mt-6" onclick={() => {
-        DBState.db.modules.push(tempModule)
         mode = 0
     }}>{language.createModule}</Button>
 {:else if mode === 2}
