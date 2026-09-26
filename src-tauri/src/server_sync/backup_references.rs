@@ -460,7 +460,7 @@ fn verify_file(mut file: File, expected: Option<(&str, u64)>, check: &impl Fn() 
         hash.update(&buffer[..count]);
         length += count as u64;
     }
-    let hash = format!("{:x}", hash.finalize());
+    let hash = hex::encode(hash.finalize());
     if expected.is_some_and(|(digest, bytes)| digest != hash || bytes != length) {
         return Err(SyncError::new("conflict-object-hash-mismatch", 409));
     }
@@ -714,7 +714,7 @@ fn read_verified_file(
         bytes.extend_from_slice(&buffer[..count]);
         if bytes.len() as u64 > expected_bytes { break; }
     }
-    if bytes.len() as u64 != expected_bytes || format!("{:x}", hash.finalize()) != expected_hash {
+    if bytes.len() as u64 != expected_bytes || hex::encode(hash.finalize()) != expected_hash {
         return Err(SyncError::new("conflict-object-hash-mismatch", 409));
     }
     Ok(bytes)

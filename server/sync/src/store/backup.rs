@@ -45,7 +45,7 @@ fn copy_exact(source: &Path, target: &Path, expected: Option<&str>) -> Result<St
         output.write_all(&buffer[..n])?;
         digest.update(&buffer[..n]);
     }
-    let digest = format!("{:x}", digest.finalize());
+    let digest = hex::encode(digest.finalize());
     if expected.is_some_and(|hash| hash != digest) {
         return Err(Error::new("corrupt-backup-object", 409));
     }
@@ -64,7 +64,7 @@ fn file_hash(path: &Path) -> Result<String> {
         }
         digest.update(&buffer[..n]);
     }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(hex::encode(digest.finalize()))
 }
 fn copy_objects(db: &Connection, source: &Path, target: &Path) -> Result<u64> {
     let mut statement = db.prepare("SELECT hash,size,storage FROM objects ORDER BY hash")?;

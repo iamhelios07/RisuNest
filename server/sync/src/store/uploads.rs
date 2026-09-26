@@ -281,13 +281,13 @@ impl Store {
                         temp.write_all(&buffer[..n])?;
                     }
                     if length != expected_size as u64
-                        || format!("{:x}", chunk.finalize()) != expected
+                        || hex::encode(chunk.finalize()) != expected
                     {
                         return Err(Error::new("corrupt-chunk", 503));
                     }
                     total += length;
                 }
-                if total != size || format!("{:x}", full.finalize()) != digest {
+                if total != size || hex::encode(full.finalize()) != digest {
                     return Err(Error::new("hash-mismatch", 400));
                 }
             }
