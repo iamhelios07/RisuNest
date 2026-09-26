@@ -12,7 +12,8 @@ import { changeFullscreen, sleep } from "./util"
 import { get } from "svelte/store";
 import { setDatabase, getDatabase, type Database } from "./storage/database.svelte";
 import { getDeviceSettings, loadDeviceSettings } from "./storage/deviceSettings";
-import { setNativeLogFileEnabled } from "./nativeLog";
+import { recordNativeLogError, setNativeLogFileEnabled } from "./nativeLog";
+import { registerRuntimeErrorHandlers } from "./runtimeErrors";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { MobileGUI, botMakerMode, selectedCharID, loadedStore, LoadingStatusState, bootFailure, type BootFailure } from "./stores.svelte";
 import { loadPlugins, loadPluginsAfterAuthoritativeRestore } from "./plugins/plugins.svelte";
@@ -886,19 +887,13 @@ async function registerSw() {
 /**
  * Updates the error handling by adding custom handlers for errors and unhandled promise rejections.
  */
+let disposeRuntimeErrors: (() => void) | undefined
 function updateErrorHandling() {
-    const errorHandler = (event: ErrorEvent) => {
-        console.error(event.error);
-        if(!(event.error.target instanceof Worker)){
-            alertError(event.error);            
-        }
-    };
-    const rejectHandler = (event: PromiseRejectionEvent) => {
-        console.error(event.reason);
-        alertError(event.reason);
-    };
-    window.addEventListener('error', errorHandler);
-    window.addEventListener('unhandledrejection', rejectHandler);
+    disposeRuntimeErrors ??= registerRuntimeErrorHandlers(
+        window,
+        alertError,
+        isTauri ? recordNativeLogError : undefined,
+    )
 }
 
 /**

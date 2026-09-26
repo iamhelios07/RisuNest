@@ -53,6 +53,8 @@ mod trust_boundary;
 mod test_memory;
 #[cfg(windows)]
 mod windows_appearance;
+#[cfg(windows)]
+mod windows_webview;
 
 use base64::{engine::general_purpose, Engine as _};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -287,7 +289,9 @@ fn builder_with_main_window(
     }
     #[cfg(windows)]
     {
-        builder = builder.plugin(windows_appearance::init());
+        builder = builder
+            .plugin(windows_appearance::init())
+            .plugin(windows_webview::init());
     }
     #[cfg(target_os = "macos")]
     {
