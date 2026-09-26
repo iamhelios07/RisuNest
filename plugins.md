@@ -1251,10 +1251,19 @@ if (logs) {
 
 ```javascript
 const info = await Risuai.getRuntimeInfo();
+console.log(info.app.id);      // 'risunest'
+console.log(info.app.version); // App version from version.json, e.g., '1.0.0'
 console.log(info.apiVersion);  // e.g., '3.0'
-console.log(info.platform);    // e.g., 'web', 'electron'
-console.log(info.saveMethod);  // e.g., 'indexeddb', 'filesystem'
+console.log(info.platform);    // 'web' or 'tauri'
+console.log(info.saveMethod);  // 'local', 'account', or 'tauri'
+
+// Plugins shared with other RisuAI hosts can check the optional app metadata.
+if (info.app?.id === 'risunest') {
+    // RisuNest-specific behavior
+}
 ```
+
+`app.id` identifies the host application, and `app.version` is its application version, separate from `apiVersion`. Other RisuAI hosts may omit `app`. App identity does not guarantee support for individual API features.
 
 #### Unwrap SafeClassArray
 
