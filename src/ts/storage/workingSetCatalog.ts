@@ -1,3 +1,4 @@
+import isEqual from 'lodash/isEqual'
 import type { Chat, Database, character, groupChat } from './database.svelte'
 import {
     createConversationSummaryStub,
@@ -142,7 +143,10 @@ export function patchWorkingSetCharacterDetail(
     for (const key of Object.keys(targetRecord)) {
         if (key !== 'chats' && !Object.hasOwn(detailRecord, key)) delete targetRecord[key]
     }
-    Object.assign(targetRecord, detailRecord)
+    // Keep unchanged values so views holding them are not rebuilt.
+    for (const key of Object.keys(detailRecord)) {
+        if (!isEqual(targetRecord[key], detailRecord[key])) targetRecord[key] = detailRecord[key]
+    }
 }
 
 export function hydrateWorkingSetCharacterDetail(
