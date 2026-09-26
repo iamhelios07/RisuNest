@@ -8,6 +8,7 @@ import PersonaSettings from './PersonaSettings.svelte'
 import { IndexedDbPersistentDataStore } from 'src/ts/storage/indexedDbPersistentDataStore'
 import { SaveCoordinator } from 'src/ts/storage/saveCoordinator'
 import { capturePersistentRoot } from 'src/ts/storage/persistentDataRuntime'
+import { alertConfirm } from 'src/ts/alert'
 
 vi.mock('src/lang', () => ({ language: languageEnglish }))
 vi.mock('src/ts/stores.svelte', () => {
@@ -16,7 +17,7 @@ vi.mock('src/ts/stores.svelte', () => {
 })
 vi.mock('sortablejs/modular/sortable.core.esm.js', () => ({ default: { create: () => ({ destroy() {} }) } }))
 vi.mock('src/ts/util', () => ({ sortableOptions: {}, sleep: async () => {} }))
-vi.mock('src/ts/alert', () => ({}))
+vi.mock('src/ts/alert', () => ({ alertConfirm: vi.fn() }))
 vi.mock('src/ts/characters', () => ({ getCharImage: vi.fn(async () => '') }))
 vi.mock('src/ts/storage/database.svelte', () => ({}))
 vi.mock('src/ts/globalApi.svelte', () => ({}))
@@ -30,6 +31,26 @@ let instance: ReturnType<typeof mount>
 afterEach(async () => {
     if (instance) await unmount(instance)
     document.body.replaceChildren()
+})
+
+it('removes the confirmed persona after the active selection changes', async () => {
+    DBState.db = {
+        personas: ['First', 'Second', 'Third'].map(id => ({ id, name: id, icon: '', personaPrompt: '', note: '' })),
+        selectedPersona: 0, username: 'First', userIcon: '', personaPrompt: '', userNote: '', hotkeys: [],
+    } as any
+    let confirm!: (value: boolean) => void
+    vi.mocked(alertConfirm).mockReturnValueOnce(new Promise(resolve => { confirm = resolve }))
+    instance = mount(PersonaSettings, { target: document.body })
+    await tick()
+    const remove = [...document.querySelectorAll('button')].find(button => button.textContent === languageEnglish.remove)!
+    remove.click()
+    DBState.db.selectedPersona = 1
+    DBState.db.username = 'Second'
+    await tick()
+    confirm(true)
+    await vi.waitFor(() => expect(DBState.db.personas).toHaveLength(2))
+    expect(DBState.db.personas.map(persona => persona.id)).toEqual(['Second', 'Third'])
+    expect(DBState.db.personas[DBState.db.selectedPersona].id).toBe('Second')
 })
 
 it('updates the persona used by bound chats while editing its current name, note and prompt', async () => {

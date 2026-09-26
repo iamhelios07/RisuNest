@@ -155,13 +155,19 @@
                 if(DBState.db.personas.length === 1){
                     return
                 }
-                const d = await alertConfirm(`${language.removeConfirm}${DBState.db.personas[DBState.db.selectedPersona].name}`)
+                const persona = DBState.db.personas[DBState.db.selectedPersona]
+                persona.id ??= v4()
+                const personaId = persona.id
+                const d = await alertConfirm(`${language.removeConfirm}${persona.name}`)
                 if(d){
+                    const index = DBState.db.personas.findIndex(persona => persona.id === personaId)
+                    if (index < 0 || DBState.db.personas.length <= 1) return
                     saveUserPersona()
+                    const selectedId = DBState.db.personas[DBState.db.selectedPersona]?.id
                     let personas = DBState.db.personas
-                    personas.splice(DBState.db.selectedPersona, 1)
+                    personas.splice(index, 1)
                     DBState.db.personas = personas
-                    changeUserPersona(0, 'noSave')
+                    changeUserPersona(Math.max(0, personas.findIndex(persona => persona.id === selectedId)), 'noSave')
                 }
             }}>{language.remove}</Button>
             <Check bind:check={DBState.db.personas[DBState.db.selectedPersona].largePortrait}>{language.largePortrait}</Check>
