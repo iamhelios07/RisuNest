@@ -56,6 +56,7 @@ import {
     isWorkingSetCharacterStub,
     isCatalogPresetWorkingSet,
     patchWorkingSetCharacterDetail,
+    patchWorkingSetRoot,
     projectPinnedScalableWorkingSet,
     projectScalableWorkingSetAtRevision,
 } from './workingSetCatalog'
@@ -195,7 +196,7 @@ export function publishPersistentCharacterMutationToWorkingSet(
     selectedIndex: number,
     selectCharacterIndex: (index: number) => void,
 ): void {
-    Object.assign(database, state.root)
+    patchWorkingSetRoot(database, state.root)
     for (const detail of state.relatedCharacters ?? []) {
         const relatedIndex = database.characters.findIndex(
             (candidate) => candidate.chaId === detail.chaId,

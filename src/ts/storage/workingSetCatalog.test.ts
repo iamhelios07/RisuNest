@@ -12,6 +12,7 @@ import {
     isCatalogPresetWorkingSet,
     isWorkingSetCharacterStub,
     patchWorkingSetCharacterDetail,
+    patchWorkingSetRoot,
     projectCatalogWorkingSet,
     projectCompleteScalableWorkingSet,
 } from './workingSetCatalog'
@@ -31,6 +32,25 @@ const summary: CharacterSummary = {
 }
 
 describe('working-set catalog', () => {
+    it('publishes changed and removed root fields without disturbing separately owned data', () => {
+        const database = {
+            username: 'Before', userNote: 'Removed',
+            promptTemplate: [{ type: 'plain', text: 'Before' }],
+            characters: [], botPresets: [], pluginCustomStorage: { synthetic: true }, pluginStorageMeta: {},
+        } as unknown as Database
+        const { characters, botPresets, pluginCustomStorage, pluginStorageMeta } = database
+        patchWorkingSetRoot(database, {
+            username: 'After', promptTemplate: [{ type: 'plain', text: 'After' }],
+        } as any)
+        expect(database.username).toBe('After')
+        expect(database.promptTemplate[0]).toMatchObject({ text: 'After' })
+        expect(Object.hasOwn(database, 'userNote')).toBe(false)
+        expect(database.characters).toBe(characters)
+        expect(database.botPresets).toBe(botPresets)
+        expect(database.pluginCustomStorage).toBe(pluginCustomStorage)
+        expect(database.pluginStorageMeta).toBe(pluginStorageMeta)
+    })
+
     it('marks an archived summary as archived residency and never as a catalog stub', () => {
         const stub = createCatalogCharacterStub({
             ...summary,

@@ -58,6 +58,7 @@ import { workingSetResidency } from './workingSetResidency'
 import {
     createPresetCatalogWorkingSetFromValues,
     hydrateWorkingSetCharacterDetail,
+    patchWorkingSetRoot,
     isArchivedCharacter,
     isCatalogCharacterStub,
     isCatalogPresetWorkingSet,
@@ -169,7 +170,7 @@ export function createProductionStateAdapter(): PersistentDataRuntimeStateAdapte
         publishPresetWorkingSet({ revision, root, presets }) {
             const database = getDatabase()
             const scalable = isCatalogPresetWorkingSet(database.botPresets)
-            Object.assign(database, root)
+            patchWorkingSetRoot(database, root)
             if (!scalable) {
                 database.botPresets = presets
                 return
@@ -181,7 +182,7 @@ export function createProductionStateAdapter(): PersistentDataRuntimeStateAdapte
             )
         },
         publishRootWorkingSet(root) {
-            Object.assign(getDatabase(), root)
+            patchWorkingSetRoot(getDatabase(), root)
         },
         publishCharacterMutation(state) {
             const target = productionRuntime?.captureSelectedConversationTarget()
