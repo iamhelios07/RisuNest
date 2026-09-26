@@ -117,6 +117,13 @@ pub(crate) struct Capture {
 
 impl Capture {
     pub(crate) fn begin_or_resume(root: &Path, revision: i64, generation: &str, head: &RemoteHead) -> Result<Self> {
+        match Self::find_pending(root, revision, generation, head)? {
+            Some(capture) => Ok(capture),
+            None => Self::begin(root, revision, generation, head),
+        }
+    }
+
+    fn find_pending(root: &Path, revision: i64, generation: &str, head: &RemoteHead) -> Result<Option<Self>> {
         if let Some(parent) = reference_parent(root, false)? {
             for entry in std::fs::read_dir(parent)? {
                 let entry = entry?;
@@ -124,13 +131,41 @@ impl Capture {
                 if entry.path().join("complete.json").try_exists()? { continue; }
                 if !entry.path().join("index.sqlite").try_exists()? { continue; }
                 if let Ok(capture) = Self::resume(root, &id, revision, generation, head) {
-                    return Ok(capture);
+                    return Ok(Some(capture));
                 }
                 // A mismatched or damaged preparation remains protected,
                 // but cannot become a snapshot of a different revision.
             }
         }
-        Self::begin(root, revision, generation, head)
+        Ok(None)
+    }
+
+    pub(crate) fn prepare_remote<'a>(root: &Path, revision: i64, generation: &str,
+        head: &RemoteHead, client: &'a ServerClient) -> Result<(Self, RemoteRead<'a>)> {
+        let (capture, previous_id, remote) = if let Some(capture) = Self::find_pending(root, revision, generation, head)? {
+            let id: Option<String> = capture.db.query_row(
+                "SELECT checkpoint_id FROM capture_identity WHERE id=?1", [&capture.id], |r| r.get(0))?;
+            let remote = match &id {
+                Some(id) => RemoteRead::resume(client, head, id.clone())?,
+                None => RemoteRead::begin(client, head)?,
+            };
+            (capture, id, remote)
+        } else {
+            let remote = RemoteRead::begin(client, head)?;
+            let capture = match Self::begin(root, revision, generation, head) {
+                Ok(capture) => capture,
+                Err(error) => { let _ = remote.release(); return Err(error); }
+            };
+            (capture, None, remote)
+        };
+        if previous_id.as_deref() != Some(remote.checkpoint.checkpoint_id.as_str()) {
+            if let Err(error) = capture.db.execute("UPDATE capture_identity SET checkpoint_id=?1 WHERE id=?2",
+                params![remote.checkpoint.checkpoint_id, capture.id]) {
+                let _ = remote.release();
+                return Err(error.into());
+            }
+        }
+        Ok((capture, remote))
     }
 
     pub(crate) fn begin(root: &Path, revision: i64, generation: &str, head: &RemoteHead) -> Result<Self> {
@@ -169,9 +204,9 @@ impl Capture {
             CREATE TABLE capture_identity(id TEXT PRIMARY KEY, head_json TEXT NOT NULL,
                 local_revision INTEGER NOT NULL, created_at_ms INTEGER NOT NULL, local_generation TEXT NOT NULL,
                 local_complete INTEGER NOT NULL CHECK(local_complete IN (0,1)),
-                remote_complete INTEGER NOT NULL CHECK(remote_complete IN (0,1)));
+                remote_complete INTEGER NOT NULL CHECK(remote_complete IN (0,1)), checkpoint_id TEXT);
             PRAGMA user_version=1;")?;
-        db.execute("INSERT INTO capture_identity VALUES(?1,?2,?3,?4,?5,0,0)", params![
+        db.execute("INSERT INTO capture_identity VALUES(?1,?2,?3,?4,?5,0,0,NULL)", params![
             id, String::from_utf8(canonical::encode(head)?).map_err(|_| SyncError::new("conflict-encoding", 409))?,
             revision, created_at_ms as i64, generation])?;
         crate::trust_boundary::sync_directory(&path)?;
@@ -763,9 +798,28 @@ impl<'a> RemoteRead<'a> {
         risunest_sync_wire::validate_id(&checkpoint.checkpoint_id)?;
         checkpoint.head.validate()?;
         if checkpoint.head != *head || checkpoint.domains != [Domain::Library] {
+            // No reference has adopted this checkpoint, so it owns no recovery work.
+            let _ = Self { client, checkpoint }.release();
             return Err(SyncError::new("conflict-preview-stale", 409));
         }
         Ok(Self { client, checkpoint })
+    }
+    fn resume(client: &'a ServerClient, head: &RemoteHead, id: String) -> Result<Self> {
+        risunest_sync_wire::validate_id(&id)?;
+        let page: Result<(_, CheckpointPage)> = client.json(reqwest::Method::GET,
+            &format!("checkpoints/{id}"), &[("limit", "1".into())], None::<&()>, &[]);
+        match page {
+            Ok((_, page)) => {
+                if page.checkpoint.checkpoint_id != id || page.checkpoint.head != *head
+                    || page.checkpoint.domains != [Domain::Library] {
+                    return Err(SyncError::new("checkpoint-identity-mismatch", 502));
+                }
+                Ok(Self { client, checkpoint: page.checkpoint })
+            }
+            Err(error) if error.status == 410 || (error.status == 404 && error.code == "checkpoint-not-found") =>
+                Self::begin(client, head),
+            Err(error) => Err(error),
+        }
     }
     pub(crate) fn visit(&self, mut visit: impl FnMut(RemoteRecord) -> Result<()>) -> Result<()> {
         let mut after: Option<Cursor> = None;

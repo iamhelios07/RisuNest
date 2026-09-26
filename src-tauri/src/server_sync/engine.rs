@@ -1285,7 +1285,7 @@ impl PersistentStore {
             }
             scope_versions.push((scope.scope, scope.version));
         }
-        required_groups.extend(self.server_order_conflicts(&cache, &transfer, revision)?);
+        required_groups.extend(self.server_order_conflicts(&cache, &transfer, revision, options.cycle_items.as_deref())?);
         if required_groups != options.groups {
             return self.server_prepare_cycle(&CycleOptions {
                 resolution: options.resolution,
@@ -1320,7 +1320,7 @@ impl PersistentStore {
             {
                 return Err(SyncError::new("conflict-preview-stale", 409));
             }
-            self.server_conflict_references(&cache, &transfer, &client, revision, &through)?;
+            self.server_conflict_references(&cache, &transfer, &client, revision, &through, options.cycle_items.as_deref())?;
         }
         if !scope_fences.is_empty() {
             let mut after = String::new();
@@ -1365,7 +1365,9 @@ impl PersistentStore {
                 .store(total.max(0) as u64, std::sync::atomic::Ordering::Relaxed);
             counter.done.store(0, std::sync::atomic::Ordering::Relaxed);
         }
-        CycleItemCounter::start(options.cycle_items.as_deref(), 3, 0);
+        let downloads: i64 = self.connection.query_row(
+            "SELECT count(*) FROM server_cycle_records WHERE action='apply'", [], |r| r.get(0))?;
+        CycleItemCounter::start(options.cycle_items.as_deref(), 3, downloads as u64);
         after.clear();
         loop {
             let page = cycle_page(&self.connection, &after)?;
@@ -1771,7 +1773,6 @@ impl PersistentStore {
         if participation.is_empty() {
             return Ok((0, 0));
         }
-        CycleItemCounter::start(counter, 1, 0);
         let now_ms = u64::try_from(
             crate::persistent_store::device_store::now_ms()
                 .map_err(|_| SyncError::new("invalid-device-clock", 500))?,
@@ -1800,7 +1801,8 @@ impl PersistentStore {
             self.connection.execute("INSERT OR IGNORE INTO server_section_keys SELECT domain,key FROM server_sync_remote_dirty WHERE domain=?1",[domain.as_str()])?;
         }
         let count: i64 = self.connection.query_row("SELECT count(*) FROM server_section_keys", [], |row| row.get(0))?;
-        CycleItemCounter::start(counter, 2, count as u64);
+        if count == 0 { return Ok((0, 0)); }
+        CycleItemCounter::start(counter, 9, count as u64);
         let mut applied = 0usize;
         let mut proposals = 0usize;
         let mut after = (String::new(), String::new());
@@ -2212,6 +2214,7 @@ impl PersistentStore {
         cache: &Cache,
         transfer: &Transfer<'_>,
         revision: i64,
+        counter: Option<&CycleItemCounter>,
     ) -> Result<BTreeSet<String>> {
         use crate::logical_records::LogicalRecordEnvelope as Envelope;
         let mut groups = BTreeSet::new();
@@ -2219,6 +2222,10 @@ impl PersistentStore {
         if !incoming_ordered {
             return Ok(groups);
         }
+        let count: i64 = self.connection.query_row(
+            "SELECT count(*) FROM server_cycle_records WHERE action='apply' AND (key GLOB 'r1:plugin:*' OR key GLOB 'r1:preset:*' OR key GLOB 'r1:character:*' OR key GLOB 'r1:conversation:*')",
+            [], |r| r.get(0))?;
+        CycleItemCounter::start(counter, 7, count as u64);
         let generation = super::active_generation(&self.connection)?;
         let mut characters = {
             let mut stmt = self
@@ -2381,6 +2388,7 @@ impl PersistentStore {
                         groups.insert(format!("family:{}", dirty.key1));
                     }
                 }
+                CycleItemCounter::processed(counter);
             }
         }
         groups.retain(|group| {
@@ -2415,20 +2423,23 @@ impl PersistentStore {
         client: &ServerClient,
         revision: i64,
         head: &RemoteHead,
+        counter: Option<&CycleItemCounter>,
     ) -> Result<crate::server_sync::backups::references::Receipt> {
-        use crate::server_sync::backups::{references::{Capture, RemoteRead, PAGE}, Side};
+        use crate::server_sync::backups::{references::{Capture, PAGE}, Side};
         use crate::server_sync::residency::Residency;
         let config = self.server_stored_config()?
             .ok_or_else(|| SyncError::new("server-not-bound", 409))?;
-        let remote = RemoteRead::begin(client, head)?;
         let lease = self.acquire_revision(revision)?;
+        let mut remote = None;
         let result = (|| {
             let (_, target) = self.read_view(Some(&lease.lease))?;
-            let mut capture = Capture::begin_or_resume(&self.repository_root, revision, &target.generation, head)?;
+            let (mut capture, read) = Capture::prepare_remote(&self.repository_root, revision, &target.generation, head, client)?;
+            remote = Some(read);
             let mut residency = Residency::open(&self.repository_root)?;
             let context = Residency::context_id(&config, &head.epoch);
             let cas = PayloadCas::new(&self.repository_root)?;
             let (db, target) = self.read_view(Some(&lease.lease))?;
+            CycleItemCounter::start(counter, 8, 0);
             if !capture.side_complete(Side::Local)? {
                 let mut after = None;
                 loop {
@@ -2452,6 +2463,7 @@ impl PersistentStore {
                             &projection::wire_key(&key)?, &projected.version,
                             &payload, &dependencies, &projected.objects, client,
                         )?;
+                        CycleItemCounter::processed(counter);
                     }
                 }
                 let mut after = String::new();
@@ -2475,9 +2487,12 @@ impl PersistentStore {
                 capture.complete_side(Side::Local)?;
             }
             if !capture.side_complete(Side::Remote)? {
-                remote.visit(|record| {
+                CycleItemCounter::start(counter, 7, 0);
+                remote.as_ref().unwrap().visit(|record| {
                     if !matches!(record.version, RecordVersion::Live { .. }) {
-                        return capture.record(Side::Remote, &record.key, &record.version, None);
+                        capture.record(Side::Remote, &record.key, &record.version, None)?;
+                        CycleItemCounter::processed(counter);
+                        return Ok(());
                     }
                     transfer.download_record_metadata(&record.version, &[], &RecordVersion::Absent)?;
                     let (payload, _) = cache.restore(&record.version)?;
@@ -2492,10 +2507,13 @@ impl PersistentStore {
                     self.capture_server_reference_record(
                         &mut capture, Side::Remote, cache, &residency, &context,
                         &record.key, &record.version, &payload, &dependencies, &projected.objects, client,
-                    )
+                    )?;
+                    CycleItemCounter::processed(counter);
+                    Ok(())
                 })?;
                 capture.complete_side(Side::Remote)?;
             }
+            CycleItemCounter::start(counter, 8, 0);
             capture.retain(client, &config, &mut residency)?;
             capture.visit_records(|record| {
                 client.ensure_active()?;
@@ -2522,6 +2540,7 @@ impl PersistentStore {
                     capture.confirms(&residency, record.side, hash, size)
                         .map_err(|_| super::StoreError::Validation { message: "Conflict custody unavailable".into() })
                 })?;
+                CycleItemCounter::processed(counter);
                 Ok(())
             })?;
             client.ensure_active()?;
@@ -2534,7 +2553,7 @@ impl PersistentStore {
         match result {
             Ok(receipt) => {
                 // An expired/rejected release cannot undo the durable receipt.
-                let _ = remote.release();
+                if let Some(remote) = remote { let _ = remote.release(); }
                 released?;
                 Ok(receipt)
             }

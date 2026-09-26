@@ -2250,7 +2250,7 @@ export const languageEnglish = {
             elapsed: 'Elapsed',
             count: '{0}',
             itemsCount: '{0} items',
-            activity: { enumerating: 'Counting items', preparing: 'Checking assets and preparing changes', downloading: 'Downloading', verifying: 'Checking items on the server', uploading: 'Uploading', confirming: 'Waiting for server confirmation' },
+            activity: { enumerating: 'Counting items', preparing: 'Preparing changes on this device', downloadingMetadata: 'Downloading library data, including characters and chats', downloading: 'Downloading and checking incoming data', preserving: 'Preparing conflict backups', syncingSections: 'Comparing and downloading Hypa and plugin data', verifying: 'Checking items on the server', uploading: 'Uploading', confirming: 'Waiting for server confirmation' },
             progress: {
                 saving: 'Saving changes on this device',
                 preparing: 'Comparing changes on this device and the server',

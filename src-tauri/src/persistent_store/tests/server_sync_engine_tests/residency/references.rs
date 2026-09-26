@@ -61,9 +61,13 @@ async fn observe(
         }
         if method == "DELETE" && path.starts_with("/checkpoints/") {
             let root = trace.root.lock().unwrap().clone().unwrap();
-            let complete = fs::read_dir(root.join("server-sync/backups")).ok().is_some_and(|entries|
-                entries.filter_map(std::result::Result::ok).any(|entry| entry.path().join("complete.json").is_file()));
-            if !complete { trace.released_before_marker.store(true, Ordering::SeqCst); }
+            let captures = fs::read_dir(root.join("server-sync/backups")).ok().map(|entries|
+                entries.filter_map(std::result::Result::ok).map(|entry| entry.path()).collect::<Vec<_>>()).unwrap_or_default();
+            let complete = captures.iter().any(|path| path.join("complete.json").is_file());
+            // A rejected checkpoint has never been adopted by a capture.
+            if !complete && captures.iter().any(|path| path.join("index.sqlite").is_file()) {
+                trace.released_before_marker.store(true, Ordering::SeqCst);
+            }
         }
         if method == "POST" && path == "/objects/retention" {
             let page = trace.retention_pages.fetch_add(1, Ordering::SeqCst) + 1;
@@ -158,7 +162,7 @@ impl Scenario {
         let cache = Cache::open(&self.local.repository_root().join("server-sync/reference-test-cache"))?;
         let transfer = Transfer::new(&client, &cache)?;
         let revision = self.local.revision()?;
-        let receipt = self.local.server_conflict_references(&cache, &transfer, &client, revision, head)?;
+        let receipt = self.local.server_conflict_references(&cache, &transfer, &client, revision, head, None)?;
         Ok((receipt, bytes.load(Ordering::SeqCst)))
     }
 
@@ -511,13 +515,17 @@ fn wrong_retention_size_leaves_live_data_untouched_and_exact_retry_reuses_the_id
     let head = scenario.fixture.server.head().unwrap();
     let revision = scenario.local.revision().unwrap();
     scenario.trace.corrupt_retention.store(true, Ordering::SeqCst);
-    assert_eq!(scenario.capture(&head).unwrap_err().code, "invalid-retention-response");
+    for _ in 0..3 {
+        assert_eq!(scenario.capture(&head).unwrap_err().code, "invalid-retention-response");
+    }
     let id = scenario.index_id();
     assert!(references::inspect(scenario.local.repository_root(), &id).is_err());
     assert!(!DurableCasJob::open(scenario.local.repository_root(), &id).unwrap().is_released());
     assert_eq!(scenario.local.revision().unwrap(), revision);
     assert_eq!(scenario.fixture.server.head().unwrap(), head);
     assert!(!scenario.trace.requests.lock().unwrap().iter().any(|request| request.method == "DELETE"));
+    assert_eq!(scenario.trace.requests.lock().unwrap().iter().filter(|request|
+        request.method == "POST" && request.path == "/checkpoints").count(), 1);
     scenario.assert_no_payload_transfers();
     scenario.trace.corrupt_retention.store(false, Ordering::SeqCst);
     let (receipt, _) = scenario.capture(&head).unwrap();
@@ -533,10 +541,14 @@ fn changed_remote_head_is_not_recaptured_under_the_old_preview() {
     let revision = scenario.local.revision().unwrap();
     let head = scenario.fixture.server.head().unwrap();
     let older_head = scenario.older_head.clone();
-    assert_eq!(scenario.capture(&older_head).unwrap_err().code, "conflict-preview-stale");
+    for _ in 0..3 {
+        assert_eq!(scenario.capture(&older_head).unwrap_err().code, "conflict-preview-stale");
+    }
     assert_eq!(scenario.local.revision().unwrap(), revision);
     assert_eq!(scenario.fixture.server.head().unwrap(), head);
     assert!(!scenario.local.repository_root().join("server-sync/backups").exists());
+    assert_eq!(scenario.trace.requests.lock().unwrap().iter().filter(|request|
+        request.method == "DELETE" && request.path.starts_with("/checkpoints/")).count(), 3);
     scenario.assert_no_payload_transfers();
 }
 
@@ -558,6 +570,28 @@ fn expired_checkpoint_keeps_known_local_roots_without_restarting_the_remote_scan
     assert_eq!(requests.iter().filter(|request| request.method == "POST" && request.path == "/checkpoints").count(), 1);
     assert!(!requests.iter().any(|request| request.method == "DELETE"));
     drop(requests);
+    scenario.assert_no_payload_transfers();
+}
+
+#[test]
+fn retry_replaces_a_missing_checkpoint_without_losing_the_pending_capture() {
+    let mut scenario = Scenario::new();
+    let head = scenario.fixture.server.head().unwrap();
+    scenario.trace.expire_checkpoint.store(true, Ordering::SeqCst);
+    assert_eq!(scenario.capture(&head).unwrap_err().code, "checkpoint-expired");
+    let id = scenario.index_id();
+    let checkpoint: String = rusqlite::Connection::open(scenario.local.repository_root()
+        .join("server-sync/backups").join(&id).join("index.sqlite")).unwrap()
+        .query_row("SELECT checkpoint_id FROM capture_identity", [], |row| row.get(0)).unwrap();
+    let config = scenario.local.server_config().unwrap().unwrap();
+    let device = scenario.fixture.server.authenticate(&config.library_id, &config.token).unwrap();
+    scenario.fixture.server.release_checkpoint(&device, &checkpoint).unwrap();
+    scenario.trace.expire_checkpoint.store(false, Ordering::SeqCst);
+    let (receipt, _) = scenario.capture(&head).unwrap();
+    assert_eq!(receipt.id, id);
+    assert_eq!(scenario.trace.requests.lock().unwrap().iter().filter(|request|
+        request.method == "POST" && request.path == "/checkpoints").count(), 2);
+    assert!(!scenario.trace.released_before_marker.load(Ordering::SeqCst));
     scenario.assert_no_payload_transfers();
 }
 

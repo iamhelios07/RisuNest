@@ -183,6 +183,7 @@ export function serverSyncProgressView(
   const active = stages[activeIndex];
   const activity = snapshot.progress === "preparing" || snapshot.progress === "publishing" ? items?.activity : undefined;
   const activityCount = items?.expected ? `${formatCount(items.processed ?? 0)} / ${formatCount(items.expected)}` : formatCount(items?.processed ?? 0);
+  const receiving = activity === "downloading" || activity === "downloadingMetadata" || activity === "syncingSections";
   const bytes =
     snapshot.verifiedBytes === undefined
       ? NO_VALUE
@@ -193,7 +194,9 @@ export function serverSyncProgressView(
       : `${formatRisuNestStorageBytes(snapshot.bytesPerSecond)}/s`;
   const pending = serverSyncPendingChanges(snapshot, text) || NO_VALUE;
   return {
-    percent: counted && activity !== "confirming" ? Math.min(100, Math.round((items.done / items.total) * 100)) : null,
+    percent: receiving
+      ? items?.expected ? Math.min(100, Math.round(((items.processed ?? 0) / items.expected) * 100)) : null
+      : counted && activity !== "confirming" && activity !== "preserving" ? Math.min(100, Math.round((items.done / items.total) * 100)) : null,
     current: activity ? `${text.activity[activity]}${activity === "confirming" ? "" : ` · ${activityCount}`}` : active.detail ? `${active.label} · ${active.detail}` : active.label,
     elapsed:
       snapshot.attemptStartedAt === undefined
@@ -203,7 +206,7 @@ export function serverSyncProgressView(
     counters: [
       { key: "bytes", label: text.verifiedBytes, value: bytes },
       { key: "rate", label: text.transferRate, value: rate },
-      { key: "items", label: text.progressItems, value: counted ? ratio : NO_VALUE },
+      { key: "items", label: text.progressItems, value: activity && activity !== "confirming" ? activityCount : counted ? ratio : NO_VALUE },
       { key: "pending", label: text.pendingChanges, value: pending },
     ],
   };

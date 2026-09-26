@@ -130,7 +130,11 @@ function outcomeError(kind: NativeFileOperationKind, error: unknown): NativeFile
             recoveryRequired: true,
         }
     }
-    if (error instanceof NativeFileJobError) {
+    if (
+        error !== null && typeof error === 'object' &&
+        'code' in error && typeof error.code === 'string' &&
+        'message' in error && typeof error.message === 'string'
+    ) {
         return { code: error.code, message: error.message, recoveryRequired: false }
     }
     return {

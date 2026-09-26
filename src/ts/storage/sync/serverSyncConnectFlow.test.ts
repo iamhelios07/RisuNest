@@ -192,6 +192,17 @@ describe("status and error copy", () => {
 });
 
 describe("progress view", () => {
+  it.each(["downloadingMetadata", "downloading", "syncingSections"] as const)("shows %s counts independently of upload work", (activity) => {
+    const view = serverSyncProgressView({ ...bound(), running: true, progress: "preparing",
+      cycleItems: { done: 0, total: 200, activity, processed: 25, expected: 100 } }, text, 0);
+    expect(view.current).toBe(`${text.activity[activity]} · 25 / 100`);
+    expect(view.percent).toBe(25);
+    expect(view.counters.find((counter) => counter.key === "items")?.value).toBe("25 / 100");
+    const unknown = serverSyncProgressView({ ...bound(), running: true, progress: "preparing",
+      cycleItems: { done: 200, total: 200, activity, processed: 25, expected: 0 } }, text, 0);
+    expect(unknown.current).toBe(`${text.activity[activity]} · 25`);
+    expect(unknown.percent).toBeNull();
+  });
   it("shows backend preparation counts and server waiting without claiming completion", () => {
     const snapshot = { ...bound(), running: true, progress: "preparing" as const,
       attemptStartedAt: 0,
