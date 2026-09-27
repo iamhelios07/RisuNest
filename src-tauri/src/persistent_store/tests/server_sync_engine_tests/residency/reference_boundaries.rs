@@ -257,3 +257,33 @@ fn remote_policy_receive_requests_custody_once_per_page() {
         [&generation], |r| r.get(0)).unwrap();
     assert_eq!(aliases, 41);
 }
+
+#[test]
+fn releasing_unused_custody_contacts_no_server_while_the_library_uses_every_object() {
+    let (fixture, trace) = measured_fixture();
+    let (_first_root, mut first) = prepared();
+    fixture.bind(&mut first);
+    assert_eq!(settle(&mut first).phase, "idle");
+    let mut hashes = std::collections::BTreeSet::new();
+    for number in 0..40 {
+        let alias = put(&mut first, &format!("assets/kept-{number:02}.png"),
+            format!("synthetic kept asset body {number:04}").as_bytes());
+        hashes.insert(alias.object_hash.unwrap());
+    }
+    assert_eq!(settle(&mut first).phase, "idle");
+
+    let directory = tempfile::tempdir().unwrap();
+    let mut second = PersistentStore::open(directory.path()).unwrap();
+    fixture.bind(&mut second);
+    second.asset_residency_set_policy(AssetPolicy::Remote, || Ok(())).unwrap();
+    assert_eq!(settle(&mut second).phase, "idle");
+    let residency = Residency::open(directory.path()).unwrap();
+    assert!(hashes.iter().all(|hash| residency.object(hash, None).unwrap().is_some()));
+
+    trace.armed.store(true, Ordering::SeqCst);
+    second.asset_residency_release_unused(|| Ok(())).unwrap();
+    trace.armed.store(false, Ordering::SeqCst);
+    assert!(trace.requests.lock().unwrap().is_empty(),
+        "custody the library still uses is kept without asking the server");
+    assert!(hashes.iter().all(|hash| residency.object(hash, None).unwrap().is_some()));
+}

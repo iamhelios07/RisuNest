@@ -341,6 +341,12 @@ impl PersistentStore {
     ) -> Result<()> {
         let mut residency = Residency::open(&self.repository_root)?;
         let cas = PayloadCas::new(&self.repository_root)?;
+        // Custody the library still uses is kept without asking the server.
+        // What remains is decided again under the mutation lock below.
+        let used = self.residency_inventory(false)?;
+        if used.release_blocked {
+            return Ok(());
+        }
         let mut after = String::new();
         loop {
             let page = residency.page(&after)?;
@@ -351,6 +357,9 @@ impl PersistentStore {
             for (cursor, hash, _) in page {
                 check()?;
                 after = cursor.clone();
+                if used.referenced.contains(&hash) || used.local.contains(&hash) {
+                    continue;
+                }
                 let context = cursor
                     .split_once('/')
                     .ok_or_else(|| SyncError::new("invalid-custody-cursor", 409))?
