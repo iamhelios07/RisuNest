@@ -84,6 +84,7 @@ export function createServerSyncController(
   facade: ServerSyncFacade,
   controllerOptions: {
     initiallyPaused?: boolean;
+    onPause?(): void;
     onExplicitResume?(): void;
   } = {},
 ) {
@@ -524,6 +525,7 @@ export function createServerSyncController(
     },
     async pause(): Promise<void> {
       state.paused = true;
+      controllerOptions.onPause?.();
       publish();
       try {
         await facade.cancel();

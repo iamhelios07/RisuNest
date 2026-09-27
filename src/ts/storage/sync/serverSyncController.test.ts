@@ -258,6 +258,24 @@ describe("server sync controller", () => {
     controller.holdAutomaticSync();
     expect(controller.canAutoSync()).toBe(false);
   });
+  it("records a manual pause so the next start keeps it until an explicit sync action", async () => {
+    const { facade } = fixture();
+    const paused = vi.fn();
+    const resumed = vi.fn();
+    const controller = createServerSyncController(
+      facade as unknown as ServerSyncFacade,
+      { onPause: paused, onExplicitResume: resumed },
+    );
+    await controller.initialize();
+    expect(controller.canAutoSync()).toBe(true);
+    await controller.pause();
+    expect(paused).toHaveBeenCalledOnce();
+    expect(controller.canAutoSync()).toBe(false);
+    expect(resumed).not.toHaveBeenCalled();
+    await controller.synchronize();
+    expect(resumed).toHaveBeenCalledOnce();
+    expect(controller.snapshot().paused).toBe(false);
+  });
   it.each(["idle", "conflict"])(
     "keeps the %s result when progress publishes while the cycle awaits",
     async (phase) => {

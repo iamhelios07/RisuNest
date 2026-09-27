@@ -16,6 +16,9 @@ const state = vi.hoisted(() => ({
     remoteHint: vi.fn(),
   },
   controllerListener: undefined as undefined | ((state: unknown) => void),
+  controllerOptions: undefined as
+    | undefined
+    | { initiallyPaused?: boolean; onPause?(): void; onExplicitResume?(): void },
   nativeListeners: new Map<string, () => void>(),
   listen: vi.fn(async (event: string, handler: () => void) => {
     return (
@@ -84,7 +87,13 @@ vi.mock("./serverSync", async (original) => ({
   createServerSyncFacade: vi.fn(() => ({})),
 }));
 vi.mock("./serverSyncController", () => ({
-  createServerSyncController: () => state.controller,
+  createServerSyncController: (
+    _facade: unknown,
+    options: typeof state.controllerOptions,
+  ) => {
+    state.controllerOptions = options;
+    return state.controller;
+  },
 }));
 vi.mock("./serverSyncScheduler", () => ({
   createServerSyncScheduler: (
@@ -335,6 +344,26 @@ describe("native server synchronization scheduling", () => {
     resumeServerSyncAfterBackup();
     expect(cleanups()).toBe(2);
     expect(state.controller.pause).not.toHaveBeenCalled();
+  });
+  it("keeps a manual pause for the next start until an explicit sync action", async () => {
+    const start = async () => {
+      vi.resetModules();
+      const { getServerSyncController } = await import("./serverSyncProduction");
+      getServerSyncController();
+      return state.controllerOptions!;
+    };
+    localStorage.clear();
+    try {
+      const first = await start();
+      expect(first.initiallyPaused).toBe(false);
+      first.onPause!();
+      const paused = await start();
+      expect(paused.initiallyPaused).toBe(true);
+      paused.onExplicitResume!();
+      expect((await start()).initiallyPaused).toBe(false);
+    } finally {
+      localStorage.clear();
+    }
   });
   it("cleans after the attempt in flight and holds the next library claim until cleanup ends", async () => {
     const { startServerSync, resumeServerSyncAfterBackup } = await import(

@@ -19,6 +19,9 @@ import type { SyncExitDrainAdapter } from "../syncExitCoordinator";
 import type { RetainableReplacementFence } from "../retainableReplacementFence";
 
 let controller: ReturnType<typeof createServerSyncController> | undefined;
+// A restored library and a manual pause both wait for an explicit sync action,
+// including across restarts.
+const syncHold = "risuNestServerSyncRestoreHold";
 export function getServerSyncController() {
   return (controller ??= createServerSyncController(
     createServerSyncFacade({
@@ -41,10 +44,9 @@ export function getServerSyncController() {
       },
     }),
     {
-      initiallyPaused:
-        localStorage.getItem("risuNestServerSyncRestoreHold") === "true",
-      onExplicitResume: () =>
-        localStorage.removeItem("risuNestServerSyncRestoreHold"),
+      initiallyPaused: localStorage.getItem(syncHold) === "true",
+      onPause: () => localStorage.setItem(syncHold, "true"),
+      onExplicitResume: () => localStorage.removeItem(syncHold),
     },
   ));
 }
@@ -67,7 +69,7 @@ export function createServerSyncExitDrainAdapter(
 }
 /** A restored library waits for an explicit sync action, including across maintenance reloads. */
 export function holdServerSyncAfterRestore(): void {
-  localStorage.setItem("risuNestServerSyncRestoreHold", "true");
+  localStorage.setItem(syncHold, "true");
   getServerSyncController().holdAutomaticSync();
 }
 let started = false;
