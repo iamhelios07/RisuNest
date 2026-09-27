@@ -1,6 +1,6 @@
-neverBuiltDependencies:
-  - sharp
 overrides:
+  '@huggingface/transformers>onnxruntime-node': '-'
+  '@huggingface/transformers>sharp': '-'
   'monaco-editor>dompurify': 3.4.15
   'rollup@>=4.0.0 <4.59.0': ^4.59.0
   'yaml@>=2.0.0 <2.8.3': ^2.8.3
