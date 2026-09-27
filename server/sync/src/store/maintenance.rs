@@ -88,6 +88,29 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+    /// A revoked device cannot authenticate again, so its acknowledgements and
+    /// receipts are unreadable once no commit job of its own is pending. The row
+    /// itself leaves only when nothing else still names it, which keeps custody
+    /// held for a replacement registration and work that is still finishing.
+    fn purge_revoked_devices(tx: &Connection) -> Result<()> {
+        tx.execute("DELETE FROM device_section_acks WHERE device IN (SELECT id FROM devices WHERE revoked=1)",[])?;
+        tx.execute("DELETE FROM receipts WHERE device IN (SELECT id FROM devices WHERE revoked=1 AND NOT EXISTS(SELECT 1 FROM commit_jobs WHERE device=devices.id))",[])?;
+        tx.execute(
+            "DELETE FROM devices WHERE revoked=1
+             AND NOT EXISTS(SELECT 1 FROM device_section_acks WHERE device=devices.id)
+             AND NOT EXISTS(SELECT 1 FROM object_leases WHERE device=devices.id)
+             AND NOT EXISTS(SELECT 1 FROM object_custody WHERE device=devices.id)
+             AND NOT EXISTS(SELECT 1 FROM read_pins WHERE device=devices.id)
+             AND NOT EXISTS(SELECT 1 FROM checkpoints WHERE device=devices.id)
+             AND NOT EXISTS(SELECT 1 FROM uploads WHERE device=devices.id)
+             AND NOT EXISTS(SELECT 1 FROM download_deltas WHERE device=devices.id)
+             AND NOT EXISTS(SELECT 1 FROM staged_changes WHERE device=devices.id)
+             AND NOT EXISTS(SELECT 1 FROM receipts WHERE device=devices.id)
+             AND NOT EXISTS(SELECT 1 FROM commit_jobs WHERE device=devices.id)",
+            [],
+        )?;
+        Ok(())
+    }
     /// Explicit maintenance uses every active device acknowledgement and read pin.
     /// Offline devices are never silently forgotten. Tombstones stay as identity
     /// fences; payloads and acknowledged journal bodies can be reclaimed.
@@ -109,6 +132,7 @@ impl Store {
         tx.execute("DELETE FROM checkpoints WHERE expires<=?1 OR device IN (SELECT id FROM devices WHERE revoked=1)",[current])?;
         tx.execute("DELETE FROM object_leases WHERE expires<=?1 OR device IN (SELECT id FROM devices WHERE revoked=1)",[current])?;
         tx.execute("DELETE FROM staged_changes WHERE (expires<=?1 OR device IN (SELECT id FROM devices WHERE revoked=1)) AND id NOT IN (SELECT stage FROM commit_jobs)",[current])?;
+        Self::purge_revoked_devices(&tx)?;
         let mut head = Self::read_head(&tx)?;
         let mut pinned = head.seq.clone();
         {

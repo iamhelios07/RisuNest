@@ -83,7 +83,7 @@ restore-epoch
 
 The daemon uses an exclusive owner lock. A second daemon or administrative process fails rather than replacing live data.
 
-Run `maintain` to collect history and objects that are no longer retained by active devices. Offline devices remain active until explicitly revoked.
+Run `maintain` to collect history and objects that are no longer retained by active devices. Offline devices remain active until explicitly revoked. A revoked device leaves the device list once maintenance finds nothing it still holds; the daemon runs maintenance every 15 minutes.
 
 ## Backup and restore
 
