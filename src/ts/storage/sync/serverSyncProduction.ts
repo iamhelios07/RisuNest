@@ -33,6 +33,7 @@ export function getServerSyncController() {
         refreshActiveWorkingSetFromStore,
       },
       invalidateDevicePlugins: invalidatePluginDeviceKeyspaces,
+      awaitLibrary: () => deletionCleanup ?? Promise.resolve(),
       restorePlugins: async () => {
         await (
           await import("../../plugins/plugins.svelte")
@@ -130,8 +131,25 @@ export const getServerSyncBackupInventory = (before?: ServerSyncBackupCursor) =>
     before: before ?? null,
   });
 let deletionCleanup: Promise<void> | undefined;
+let cleanupAfterAttempt = false;
 function cleanupDeletedBackups(): void {
-  if (!isTauri || deletionCleanup || getServerSyncController().snapshot().connecting) return;
+  if (!isTauri || deletionCleanup || cleanupAfterAttempt) return;
+  const controller = getServerSyncController();
+  const { connecting, running } = controller.snapshot();
+  if (connecting) return;
+  // An attempt holds the library from preparation to publication, so cleanup
+  // follows it, and the next attempt waits for cleanup through awaitLibrary.
+  if (running) {
+    cleanupAfterAttempt = true;
+    void controller
+      .waitForIdle()
+      .catch(() => {})
+      .then(() => {
+        cleanupAfterAttempt = false;
+        cleanupDeletedBackups();
+      });
+    return;
+  }
   // Native admission rejects busy attempts. Retry on the next safe lifecycle
   // signal, without cancelling work or making startup depend on cleanup.
   deletionCleanup = invoke("server_sync_backup_cleanup")

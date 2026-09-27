@@ -395,6 +395,47 @@ describe("server sync activation boundary", () => {
     expect(fence.refreshCommittedWorkingSet).toHaveBeenCalledOnce();
     expect(fence.release).toHaveBeenCalledOnce();
   });
+  it("claims the library only after library work outside the facade settles", async () => {
+    const { runtime, native, trace } = fixture();
+    const original = native.getMockImplementation()!;
+    native.mockImplementation(async (command) =>
+      command === "server_sync_status" ? ({ localRevision: 7 } as never) : original(command));
+    let settle!: () => void;
+    const awaitLibrary = vi.fn(() => new Promise<void>((resolve) => { settle = resolve; }));
+    const facade = createServerSyncFacade({ runtime, invoke: native as never, awaitLibrary });
+    const idle = () => new Promise((resolve) => setTimeout(resolve, 0));
+    const config = { endpoint: "http://localhost", libraryId: "library", deviceId: "device", token: "token" };
+    const claims = [
+      [() => facade.cycle(), "server_sync_prepare"],
+      [() => facade.bind(config), "server_sync_bind"],
+      [() => facade.unbind(), "server_sync_unbind"],
+      [() => facade.reconcile(), "server_sync_reconcile"],
+    ] as const;
+    for (const [claim, command] of claims) {
+      const pending = claim();
+      await idle();
+      expect(trace).not.toContain(command);
+      settle();
+      await pending;
+      expect(trace).toContain(command);
+    }
+    expect(awaitLibrary).toHaveBeenCalledTimes(claims.length);
+  });
+  it("stops a cycle cancelled while it waits for the library", async () => {
+    const { runtime, native, trace } = fixture();
+    let settle!: () => void;
+    const facade = createServerSyncFacade({
+      runtime,
+      invoke: native as never,
+      awaitLibrary: () => new Promise<void>((resolve) => { settle = resolve; }),
+    });
+    const cycle = facade.cycle();
+    await facade.cancel();
+    settle();
+    await expect(cycle).rejects.toMatchObject({ code: "cancelled" });
+    expect(trace).toEqual(["server_sync_cancel"]);
+    expect(runtime.flushPendingData).not.toHaveBeenCalled();
+  });
 });
 
 function heldFixture() {

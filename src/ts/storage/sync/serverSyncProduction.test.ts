@@ -336,6 +336,51 @@ describe("native server synchronization scheduling", () => {
     expect(cleanups()).toBe(2);
     expect(state.controller.pause).not.toHaveBeenCalled();
   });
+  it("cleans after the attempt in flight and holds the next library claim until cleanup ends", async () => {
+    const { startServerSync, resumeServerSyncAfterBackup } = await import(
+      "./serverSyncProduction"
+    );
+    const { createServerSyncFacade } = await import("./serverSync");
+    const cleanups = () =>
+      state.invoke.mock.calls.filter(
+        ([command]) => command === "server_sync_backup_cleanup",
+      ).length;
+    let idle!: () => void;
+    state.controller.waitForIdle.mockImplementationOnce(
+      () => new Promise<void>((resolve) => { idle = resolve; }),
+    );
+    let cleaned!: () => void;
+    const original = state.invoke.getMockImplementation()!;
+    state.invoke.mockImplementation(async (command: string) => {
+      if (command !== "server_sync_backup_cleanup") return original(command);
+      await new Promise<void>((resolve) => { cleaned = resolve; });
+      return undefined;
+    });
+    try {
+      state.running = true;
+      startServerSync();
+      await vi.waitFor(() =>
+        expect(state.controller.waitForIdle).toHaveBeenCalledOnce(),
+      );
+      resumeServerSyncAfterBackup();
+      expect(state.controller.waitForIdle).toHaveBeenCalledOnce();
+      expect(cleanups()).toBe(0);
+
+      state.running = false;
+      idle();
+      await vi.waitFor(() => expect(cleanups()).toBe(1));
+      const { awaitLibrary } = vi.mocked(createServerSyncFacade).mock.calls[0][0];
+      let claimed = false;
+      const claim = awaitLibrary!().then(() => { claimed = true; });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(claimed).toBe(false);
+      cleaned();
+      await claim;
+      expect(cleanups()).toBe(1);
+    } finally {
+      state.invoke.mockImplementation(original);
+    }
+  });
   it("holds and releases notifications with the rest of foreground synchronization", async () => {
     const { startServerSync } = await import("./serverSyncProduction");
     const listeners = new Map<string, (event: Event) => void>();

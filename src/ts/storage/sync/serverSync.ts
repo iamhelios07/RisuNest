@@ -153,6 +153,9 @@ export function createServerSyncFacade(options: {
   onVerifiedBytes?: (bytes: string) => void;
   onRetryableFailure?: (code: string | undefined) => void;
   onCycleItems?: (items: ServerCycleItems) => void;
+  /** Settles once library work outside this facade has released the library,
+   * so native admission does not turn the next claim away as busy. */
+  awaitLibrary?: () => Promise<void>;
 }) {
   const native = options.invoke ?? invoke;
   const transfer = async <T>(
@@ -320,6 +323,8 @@ export function createServerSyncFacade(options: {
     held: RetainableReplacementFence | undefined,
   ): Promise<ServerCycle> => {
     cancelled = false;
+    await options.awaitLibrary?.();
+    if (cancelled) throw new ServerSyncError("cancelled");
     if (pendingActivation) {
       const preparationId = await activate();
       options.onProgress?.("publishing");
@@ -376,6 +381,7 @@ export function createServerSyncFacade(options: {
     command: string,
     config?: ServerConfig,
   ): Promise<ServerStatus> => {
+    await options.awaitLibrary?.();
     if (pendingRefresh) throw new ServerSyncError("committed-refresh-pending");
     if (pendingActivation)
       throw new ServerSyncError("activation-confirmation-pending");
@@ -389,9 +395,14 @@ export function createServerSyncFacade(options: {
   };
   return {
     status: () => native<ServerStatus>("server_sync_status"),
-    bind: (config: ServerConfig) =>
-      native<ServerStatus>("server_sync_bind", { config }),
-    unbind: () => native<void>("server_sync_unbind"),
+    bind: async (config: ServerConfig) => {
+      await options.awaitLibrary?.();
+      return native<ServerStatus>("server_sync_bind", { config });
+    },
+    unbind: async () => {
+      await options.awaitLibrary?.();
+      await native<void>("server_sync_unbind");
+    },
     reregister: (config: ServerConfig) =>
       recover("server_sync_reregister", config),
     reconcile: () => recover("server_sync_reconcile"),
