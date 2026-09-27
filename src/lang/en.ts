@@ -2169,8 +2169,6 @@ export const languageEnglish = {
                 remote: 'Load from the server when needed',
                 local: 'Files on this device',
                 remoteOnly: 'Files only on the server',
-                offlineReady: 'Every file is on this device, so it works without internet.',
-                onlineNeeded: 'Opening a file that is only on the server needs an internet connection.',
                 unavailable: 'Files on neither this device nor the server',
                 cleanupNote:
                     'Switching to loading from the server keeps the files already on this device. Clearing copies checks that a file is on the server before removing the copy here. Files a local snapshot needs stay on the server until that snapshot is deleted and cleanup runs. Attachments used for export or AI requests are downloaded again and can be cleared later.',
