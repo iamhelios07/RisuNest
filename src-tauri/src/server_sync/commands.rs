@@ -137,6 +137,27 @@ impl ServerSyncCommandState {
         *cancelled = flag.clone();
         Ok((running, flag))
     }
+    /// Cancels the work in flight and drops a preparation nothing runs on.
+    /// A page that starts again knows nothing of what the previous one began.
+    pub(crate) fn cancel(&self) -> Result<()> {
+        let cancelled = self
+            .cancelled
+            .lock()
+            .map_err(|_| SyncError::new("server-sync-state-unavailable", 503))?;
+        cancelled.store(true, Ordering::Release);
+        self.discard_idle_preparation()
+    }
+    fn discard_idle_preparation(&self) -> Result<()> {
+        if !self.running.load(Ordering::Acquire) {
+            let stale = self
+                .prepared
+                .lock()
+                .map_err(|_| SyncError::new("server-sync-state-unavailable", 503))?
+                .take();
+            drop(stale);
+        }
+        Ok(())
+    }
     fn require_no_preparation(&self) -> Result<()> {
         if self
             .prepared
@@ -518,6 +539,38 @@ pub(crate) fn server_sync_verified_bytes(app: AppHandle) -> Result<String> {
         .map_err(|_| SyncError::new("server-sync-state-unavailable", 503))?;
     Ok(counter.load(Ordering::Relaxed).to_string())
 }
+fn activity_name(activity: u8) -> &'static str {
+    match activity {
+        1 => "enumerating", 2 => "preparing", 3 => "downloading", 4 => "uploading", 5 => "confirming", 6 => "verifying", 7 => "downloadingMetadata", 8 => "preserving", 9 => "syncingSections", 10 => "downloadingBackupMetadata", _ => "enumerating",
+    }
+}
+/// A failed stage leaves one line in this device's log with its code and how
+/// far the cycle had come, so an attempt that stopped can be traced later.
+fn logged<T>(app: &AppHandle, stage: &str, result: Result<T>) -> Result<T> {
+    if let Err(error) = &result {
+        let progress = app
+            .state::<ServerSyncCommandState>()
+            .cycle_items
+            .lock()
+            .map(|items| {
+                format!(
+                    " activity={} processed={}/{} done={}/{}",
+                    activity_name(items.activity.load(Ordering::Relaxed)),
+                    items.processed.load(Ordering::Relaxed),
+                    items.expected.load(Ordering::Relaxed),
+                    items.done.load(Ordering::Relaxed),
+                    items.total.load(Ordering::Relaxed),
+                )
+            })
+            .unwrap_or_default();
+        crate::native_log::global_state().record(
+            if error.code == "cancelled" { "warn" } else { "error" },
+            "server-sync",
+            format!("{stage} failed: code={}{progress}", error.code),
+        );
+    }
+    result
+}
 #[tauri::command]
 pub(crate) fn server_sync_progress_counts(app: AppHandle) -> Result<CycleItemCounts> {
     let state = app.state::<ServerSyncCommandState>();
@@ -528,9 +581,7 @@ pub(crate) fn server_sync_progress_counts(app: AppHandle) -> Result<CycleItemCou
     Ok(CycleItemCounts {
         done: counter.done.load(Ordering::Relaxed),
         total: counter.total.load(Ordering::Relaxed),
-        activity: match counter.activity.load(Ordering::Relaxed) {
-            1 => "enumerating", 2 => "preparing", 3 => "downloading", 4 => "uploading", 5 => "confirming", 6 => "verifying", 7 => "downloadingMetadata", 8 => "preserving", 9 => "syncingSections", 10 => "downloadingBackupMetadata", _ => "enumerating",
-        },
+        activity: activity_name(counter.activity.load(Ordering::Relaxed)),
         processed: counter.processed.load(Ordering::Relaxed),
         expected: counter.expected.load(Ordering::Relaxed),
     })
@@ -644,11 +695,14 @@ pub(crate) async fn server_sync_prepare(
     app: AppHandle,
     mut options: CycleOptions,
 ) -> Result<PreparedReply> {
-    blocking(move || {
-        let admission = claim_library(&app)?;
+    let log = app.clone();
+    let result = blocking(move || {
         let state = app.state::<ServerSyncCommandState>();
+        // The renderer asks for a preparation only while it holds none, so one
+        // stored here belongs to no one and would keep the library claimed.
+        state.discard_idle_preparation()?;
+        let admission = claim_library(&app)?;
         let (_running, flag) = state.claim_preparation()?;
-        state.require_no_preparation()?;
         options.cancellation = Some(flag);
         let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
         *state
@@ -699,7 +753,8 @@ pub(crate) async fn server_sync_prepare(
             }
         }
     })
-    .await
+    .await;
+    logged(&log, "prepare", result)
 }
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -711,7 +766,8 @@ pub(crate) struct ActivationReply {
 
 #[tauri::command]
 pub(crate) async fn server_sync_activate(app: AppHandle, preparation_id: String) -> Result<ActivationReply> {
-    blocking(move || {
+    let log = app.clone();
+    let result = blocking(move || {
         let state = app.state::<ServerSyncCommandState>();
         let _running = state.claim()?;
         let mut slot = state
@@ -726,14 +782,16 @@ pub(crate) async fn server_sync_activate(app: AppHandle, preparation_id: String)
         let (plugins_changed, device_plugins_changed) = job.cycle.plugin_changes();
         Ok(ActivationReply { revision, plugins_changed, device_plugins_changed })
     })
-    .await
+    .await;
+    logged(&log, "activate", result)
 }
 #[tauri::command]
 pub(crate) async fn server_sync_publish(
     app: AppHandle,
     preparation_id: String,
 ) -> Result<CycleResult> {
-    blocking(move || {
+    let log = app.clone();
+    let result = blocking(move || {
         let state = app.state::<ServerSyncCommandState>();
         let _running = state.claim()?;
         let mut slot = state
@@ -747,24 +805,12 @@ pub(crate) async fn server_sync_publish(
         drop(slot);
         job.store.server_publish_cycle(&job.cycle)
     })
-    .await
+    .await;
+    logged(&log, "publish", result)
 }
 #[tauri::command]
 pub(crate) fn server_sync_cancel(app: AppHandle) -> Result<()> {
-    let state = app.state::<ServerSyncCommandState>();
-    let cancelled = state
-        .cancelled
-        .lock()
-        .map_err(|_| SyncError::new("server-sync-state-unavailable", 503))?;
-    cancelled.store(true, Ordering::Release);
-    if !state.running.load(Ordering::Acquire) {
-        state
-            .prepared
-            .lock()
-            .map_err(|_| SyncError::new("server-sync-state-unavailable", 503))?
-            .take();
-    }
-    Ok(())
+    app.state::<ServerSyncCommandState>().cancel()
 }
 
 #[cfg(test)]
@@ -839,5 +885,68 @@ mod backup_source_tests {
         state.finish_reference_source(&token);
         assert!(pinned_backups(&state).unwrap().is_empty());
         state.release_reference_source(&token).unwrap();
+    }
+}
+#[cfg(test)]
+mod preparation_tests {
+    use super::*;
+    use crate::native_file_jobs::admission::Admission;
+    use risunest_sync_server::{http, store::Store};
+
+    /// A preparation stays with the page that asked for it while a command
+    /// runs, and one left by a page that is gone gives the library back.
+    #[test]
+    fn a_preparation_nothing_runs_on_releases_the_library_when_dropped() {
+        let server_dir = tempfile::tempdir().unwrap();
+        let server = Arc::new(Store::init(server_dir.path()).unwrap());
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let serving = server.clone();
+        let task = runtime.spawn(async move {
+            axum::serve(listener, http::router(serving)).await.unwrap();
+        });
+        let device = server.add_device().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        store
+            .server_bind(&ServerConfig {
+                directory: None,
+                endpoint,
+                library_id: device.library_id,
+                device_id: device.device_id,
+                token: device.token,
+            })
+            .unwrap();
+        let Preparation::Ready(cycle) = store.server_prepare_cycle(&CycleOptions::default()).unwrap() else {
+            panic!("an empty library prepares a cycle");
+        };
+        let admission = Arc::new(Admission::default());
+        let state = ServerSyncCommandState::default();
+        *state.prepared.lock().unwrap() = Some(PreparedJob {
+            id: "synthetic-preparation".into(),
+            store,
+            cycle,
+            _admission: admission.server().unwrap(),
+        });
+        assert!(admission.server().is_err());
+        {
+            let _running = state.claim().unwrap();
+            state.discard_idle_preparation().unwrap();
+            assert!(state.prepared.lock().unwrap().is_some());
+            assert!(admission.server().is_err());
+        }
+        state.cancel().unwrap();
+        assert!(state.cancelled.lock().unwrap().load(Ordering::Acquire));
+        assert!(state.prepared.lock().unwrap().is_none());
+        drop(admission.server().unwrap());
+        task.abort();
+        runtime.shutdown_timeout(std::time::Duration::from_secs(2));
     }
 }

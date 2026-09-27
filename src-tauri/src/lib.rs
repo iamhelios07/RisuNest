@@ -335,6 +335,17 @@ fn builder_with_main_window(
                             );
                         }
                     }
+                    if let Some(state) =
+                        webview.try_state::<server_sync::commands::ServerSyncCommandState>()
+                    {
+                        if let Err(error) = state.cancel() {
+                            crate::nlog!(
+                                "error",
+                                "failed to reset server sync renderer session: {}",
+                                error.code
+                            );
+                        }
+                    }
                     webview
                         .state::<android_commit_transport::AndroidCommitState>()
                         .reset();
@@ -370,6 +381,17 @@ fn builder_with_main_window(
                         crate::nlog!(
                             "error",
                             "failed to reset native media renderer session: {error}"
+                        );
+                    }
+                }
+                if let Some(state) =
+                    webview.try_state::<server_sync::commands::ServerSyncCommandState>()
+                {
+                    if let Err(error) = state.cancel() {
+                        crate::nlog!(
+                            "error",
+                            "failed to reset server sync renderer session: {}",
+                            error.code
                         );
                     }
                 }
@@ -411,6 +433,17 @@ fn builder_with_main_window(
                         crate::nlog!(
                             "error",
                             "failed to reset native media renderer session: {error}"
+                        );
+                    }
+                }
+                if let Some(state) =
+                    webview.try_state::<server_sync::commands::ServerSyncCommandState>()
+                {
+                    if let Err(error) = state.cancel() {
+                        crate::nlog!(
+                            "error",
+                            "failed to reset server sync renderer session: {}",
+                            error.code
                         );
                     }
                 }
