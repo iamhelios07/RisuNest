@@ -88,7 +88,7 @@
   );
   const storageHelp = $derived(
     cacheUsage
-      ? `${text.management.cache} ${bytes(cacheUsage.totalBytes)} · ${text.management.reclaimable} ${bytes(cacheUsage.reclaimableBytes)}`
+      ? `${text.management.cache} ${bytes(cacheUsage.cacheBytes)} · ${text.management.reclaimable} ${bytes(cacheUsage.reclaimableBytes)}`
       : undefined,
   );
   $effect(() => {

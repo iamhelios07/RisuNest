@@ -121,10 +121,15 @@ export interface ServerSyncBackupInventory {
   diskBytes: number;
 }
 export interface ServerSyncCacheUsage {
+  /** cacheBytes plus ledgerBytes. */
   totalBytes: number;
+  /** The temporary files: protectedBytes plus reclaimableBytes. */
+  cacheBytes: number;
   protectedBytes: number;
   reclaimableBytes: number;
-  /** Part of totalBytes: what the cache's object database occupies on disk. */
+  /** The asset residency ledger kept beside the temporary files. */
+  ledgerBytes: number;
+  /** Part of cacheBytes: what the cache's object database occupies on disk. */
   databaseBytes: number;
   blockedReason: string | null;
 }

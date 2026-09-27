@@ -2187,6 +2187,8 @@ export const languageEnglish = {
                 protected: 'Still needed',
                 reclaimable: 'Can be cleared',
                 clean: 'Clear unneeded temporary files',
+                ledger: 'Asset storage records',
+                ledgerHelp: 'Needed for asset storage and never cleared.',
                 more: 'Older backups',
                 refresh: 'Refresh list',
                 blockedReasons: {

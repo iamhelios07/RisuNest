@@ -41,12 +41,18 @@ pub(crate) struct BackupInventory {
 #[derive(Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CacheUsage {
+    /// `cache_bytes` plus `ledger_bytes`.
     pub total_bytes: u64,
+    /// What the per-connection caches occupy: body files and object databases.
+    pub cache_bytes: u64,
+    /// The part of `cache_bytes` a cleanup keeps.
     pub protected_bytes: u64,
+    /// The part of `cache_bytes` a cleanup removes, counted as body bytes.
     pub reclaimable_bytes: u64,
-    /// What the object databases and their write-ahead logs allocate on disk.
-    /// Deleting a body makes its pages reusable inside that allocation, so this
-    /// is reported apart from the body bytes counted above it.
+    /// Files kept beside the caches, such as the asset residency ledger.
+    pub ledger_bytes: u64,
+    /// What the object databases and their write-ahead logs allocate on disk,
+    /// as part of `cache_bytes`.
     pub database_bytes: u64,
     pub blocked_reason: Option<String>,
 }
@@ -303,14 +309,13 @@ pub(crate) fn cache_usage(
         if metadata.is_file() {
             // A file beside the per-connection caches, such as the asset
             // residency ledger, is kept and has no object database.
-            usage.total_bytes += metadata.len();
-            usage.protected_bytes += metadata.len();
+            usage.ledger_bytes += metadata.len();
             continue;
         }
         visit_files(&cache, &mut |file, bytes| {
             if is_object_database(&cache, file) {
-                // An allocation, counted once below, whose contents are
-                // accounted row by row rather than as bytes on disk.
+                // An allocation, counted once below. The bodies a cleanup
+                // would delete from it are counted row by row.
                 return Ok(());
             }
             let reclaimable = blocked.is_none()
@@ -322,11 +327,9 @@ pub(crate) fn cache_usage(
                 fs::remove_file(file)?;
                 return Ok(());
             }
-            usage.total_bytes += bytes;
+            usage.cache_bytes += bytes;
             if reclaimable {
                 usage.reclaimable_bytes += bytes;
-            } else {
-                usage.protected_bytes += bytes;
             }
             Ok(())
         })?;
@@ -339,9 +342,11 @@ pub(crate) fn cache_usage(
         )?;
         // Measured after the sweep, so a cleanup reports what it left behind.
         let allocated = database_bytes(&cache)?;
-        usage.total_bytes += allocated;
+        usage.cache_bytes += allocated;
         usage.database_bytes += allocated;
     }
+    usage.protected_bytes = usage.cache_bytes.saturating_sub(usage.reclaimable_bytes);
+    usage.total_bytes = usage.cache_bytes + usage.ledger_bytes;
     Ok(usage)
 }
 
@@ -400,8 +405,9 @@ fn sweep_object_database(
         let mut group = Vec::new();
         for (hash, bytes) in &page {
             if !collectable || !reclaimable(hash) {
-                usage.protected_bytes += bytes;
-            } else if clean {
+                continue;
+            }
+            if clean {
                 group.push(hash.as_str());
             } else {
                 usage.reclaimable_bytes += bytes;

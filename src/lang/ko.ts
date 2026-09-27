@@ -2000,6 +2000,8 @@ export const languageKorean = {
                 protected: '아직 필요한 파일',
                 reclaimable: '정리 가능',
                 clean: '필요 없는 임시 파일 정리',
+                ledger: '에셋 보관 기록',
+                ledgerHelp: '에셋 보관 방식에 필요한 기록이며 정리되지 않습니다.',
                 more: '이전 백업',
                 refresh: '목록 새로고침',
                 blockedReasons: {

@@ -47,8 +47,11 @@ vi.mock("src/ts/storage/sync/serverSyncProduction", () => ({
   })),
   getServerSyncCacheUsage: vi.fn(async () => ({
     totalBytes: 0,
+    cacheBytes: 0,
     protectedBytes: 0,
     reclaimableBytes: 0,
+    ledgerBytes: 0,
+    databaseBytes: 0,
     blockedReason: null,
   })),
   cleanupServerSyncCache: vi.fn(),

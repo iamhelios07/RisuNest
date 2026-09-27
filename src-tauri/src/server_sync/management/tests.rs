@@ -164,10 +164,11 @@ fn cache_cleanup_keeps_referenced_objects_metadata_and_local_cas() {
     // allocation are reported as their own bytes, not as the pages holding them.
     let in_database = ((unused.len() + 1) * small(0).len()) as u64;
     assert!(usage.database_bytes >= in_database);
-    assert_eq!(
-        usage.total_bytes,
-        usage.protected_bytes + usage.reclaimable_bytes - in_database + usage.database_bytes
-    );
+    assert!(usage.cache_bytes >= usage.database_bytes + (2 * large(0).len()) as u64);
+    // Still needed and clearable split the temporary files between them.
+    assert_eq!(usage.protected_bytes + usage.reclaimable_bytes, usage.cache_bytes);
+    assert_eq!(usage.ledger_bytes, 0);
+    assert_eq!(usage.total_bytes, usage.cache_bytes);
     assert!(cache_usage(
         root.path(),
         Some(&identity),
@@ -182,6 +183,8 @@ fn cache_cleanup_keeps_referenced_objects_metadata_and_local_cas() {
     drop(cache);
     let cleaned = cache_usage(root.path(), Some(&identity), &hashes, None, true).unwrap();
     assert_eq!(cleaned.reclaimable_bytes, 0);
+    assert_eq!(cleaned.protected_bytes, cleaned.cache_bytes);
+    assert_eq!(cleaned.total_bytes, cleaned.cache_bytes);
     let cache = open();
     for hash in unused.iter().chain([&unused_file]) {
         assert!(cache.stat_derived(hash).unwrap().is_none());
@@ -210,10 +213,14 @@ fn cache_usage_counts_files_beside_the_caches_without_opening_them_as_caches() {
     fs::write(&ledger, b"ledger").unwrap();
     let with = usage().unwrap();
     assert_eq!(with.total_bytes, without.total_bytes + 6);
-    assert_eq!(with.protected_bytes, without.protected_bytes + 6);
+    assert_eq!(with.ledger_bytes, 6);
+    assert_eq!(with.total_bytes, with.cache_bytes + with.ledger_bytes);
+    assert_eq!(with.cache_bytes, without.cache_bytes);
+    assert_eq!(with.protected_bytes, without.protected_bytes);
     assert_eq!(with.reclaimable_bytes, without.reclaimable_bytes);
     assert_eq!(with.database_bytes, without.database_bytes);
-    cache_usage(root.path(), Some(&identity), &BTreeSet::new(), None, true).unwrap();
+    let cleaned = cache_usage(root.path(), Some(&identity), &BTreeSet::new(), None, true).unwrap();
+    assert_eq!(cleaned.ledger_bytes, 6);
     assert_eq!(fs::read(&ledger).unwrap(), b"ledger");
 }
 
