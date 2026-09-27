@@ -195,3 +195,65 @@ fn partial_retention_and_failed_confirmation_keep_roots_and_resume_the_same_capt
     assert!(!root.path().join("server-sync/backups").join(&id).join("local.risunest").exists());
     assert!(!root.path().join("server-sync/backups").join(&id).join("remote.risunest").exists());
 }
+
+#[test]
+fn remote_policy_receive_requests_custody_once_per_page() {
+    let (fixture, trace) = measured_fixture();
+    let (_first_root, mut first) = prepared();
+    fixture.bind(&mut first);
+    assert_eq!(settle(&mut first).phase, "idle");
+    let mut hashes = std::collections::BTreeSet::new();
+    for number in 0..40 {
+        let alias = put(&mut first, &format!("assets/received-{number:02}.png"),
+            format!("synthetic received asset body {number:04}").as_bytes());
+        hashes.insert(alias.object_hash.unwrap());
+    }
+    // Two records naming one body must not name it twice in one request.
+    let shared = put(&mut first, "assets/received-shared.png", b"synthetic received asset body 0000");
+    assert!(hashes.contains(shared.object_hash.as_ref().unwrap()));
+    assert_eq!(settle(&mut first).phase, "idle");
+
+    let directory = tempfile::tempdir().unwrap();
+    let mut second = PersistentStore::open(directory.path()).unwrap();
+    fixture.bind(&mut second);
+    second.asset_residency_set_policy(AssetPolicy::Remote, || Ok(())).unwrap();
+    *trace.root.lock().unwrap() = Some(directory.path().to_path_buf());
+    trace.armed.store(true, Ordering::SeqCst);
+    let counter = Arc::new(crate::persistent_store::server_sync_engine::CycleItemCounter::default());
+    let crate::persistent_store::server_sync_engine::Preparation::Ready(mut ready) = second
+        .server_prepare_cycle(&CycleOptions { cycle_items: Some(counter.clone()), ..Default::default() })
+        .unwrap() else { panic!("an empty replica receives without a conflict") };
+    assert_eq!(counter.processed.load(Ordering::Relaxed), counter.expected.load(Ordering::Relaxed));
+    second.server_activate_cycle(&mut ready).unwrap();
+    assert_eq!(second.server_publish_cycle(&ready).unwrap().phase, "idle");
+    trace.armed.store(false, Ordering::SeqCst);
+
+    let requests = trace.requests.lock().unwrap();
+    let retention = requests.iter()
+        .filter(|request| request.method == "POST" && request.path == "/objects/retention")
+        .collect::<Vec<_>>();
+    assert_eq!(retention.len(), 1, "custody is requested per page, not per record");
+    let requested = retention[0].body["objects"].as_array().unwrap().iter()
+        .map(|object| object["hash"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(requested.len(), requested.iter().collect::<std::collections::BTreeSet<_>>().len());
+    assert!(hashes.iter().all(|hash| requested.contains(hash)));
+    for request in requests.iter().filter(|request| request.path == "/objects/transfer") {
+        for target in request.body.as_array().unwrap() {
+            assert!(!hashes.contains(target["target"].as_str().unwrap()),
+                "a remote replica must not download asset bodies to receive them");
+        }
+    }
+    drop(requests);
+    let residency = Residency::open(directory.path()).unwrap();
+    let cas = PayloadCas::new(directory.path()).unwrap();
+    for hash in &hashes {
+        assert!(residency.object(hash, None).unwrap().is_some());
+        assert!(cas.stat_object(hash).unwrap().is_none());
+    }
+    let generation = active_generation(&second.connection).unwrap();
+    let aliases: i64 = second.connection.query_row(
+        "SELECT count(*) FROM asset_aliases WHERE generation=?1 AND logical_key GLOB 'assets/received-*'",
+        [&generation], |r| r.get(0)).unwrap();
+    assert_eq!(aliases, 41);
+}

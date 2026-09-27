@@ -1392,89 +1392,123 @@ impl PersistentStore {
             }
             let prefetch = candidates.values().cloned().collect::<Vec<_>>();
             transfer.prefetch_record_metadata(&prefetch)?;
-            if !remote_assets {
-                let native = PayloadCas::new(&self.repository_root)?;
-                Transfer::new(&client, &cache)?
-                    .with_destination(&native, &self.connection)
-                    .prefetch_record_dependencies(&prefetch)?;
+            let native = PayloadCas::new(&self.repository_root)?;
+            // The page's records are fetched and checked first, so custody is
+            // requested and dependencies are promoted once per page rather
+            // than once per record. Payloads are read back from the cache
+            // below instead of being held for the page.
+            let mut custody = BTreeMap::<String, Option<u64>>::new();
+            let mut dependencies = BTreeSet::new();
+            {
+                let destination = if remote_assets {
+                    None
+                } else {
+                    let destination = Transfer::new(&client, &cache)?
+                        .with_destination(&native, &self.connection);
+                    destination.prefetch_record_dependencies(&prefetch)?;
+                    Some(destination)
+                };
+                for item in &page {
+                    if item.action != "apply" {
+                        continue;
+                    }
+                    let remote: RecordVersion = parse(&item.remote)?;
+                    if matches!(remote, RecordVersion::Live { .. }) {
+                        let dirty = key_parts(&item.key, revision)?;
+                        let (base_version, _) =
+                            self.effective_server_base(Domain::Library, &item.key, committed)?;
+                        let base_candidates = match candidates.remove(&item.key) {
+                            Some((_, bases)) => bases,
+                            None => self.server_base_candidates(
+                                Domain::Library,
+                                &item.key,
+                                &cache,
+                                committed,
+                            )?,
+                        };
+                        transfer.download_record_metadata(&remote, &base_candidates, &base_version)?;
+                        let (payload, _) = cache.restore(&remote)?;
+                        let record_dependencies = cache.dependencies(&payload)?;
+                        if let Some(destination) = &destination {
+                            destination.download(&record_dependencies, &base_candidates)?;
+                        }
+
+                        // The record this names arrived whole, so what it
+                        // says about itself is checked against what the
+                        // projection would name, not by writing it again.
+                        let expected = cache.projected_identity(
+                            &payload,
+                            &record_dependencies,
+                            &relations(&dirty)?,
+                            scopes(&dirty),
+                        )?;
+                        if expected.version != remote {
+                            return Err(SyncError::new(
+                                "server-descriptor-semantics-mismatch",
+                                409,
+                            ));
+                        }
+                        if remote_assets {
+                            use crate::logical_records::LogicalRecordEnvelope as Envelope;
+                            let expected = match &payload.record {
+                                Envelope::Asset {
+                                    object_hash: Some(hash),
+                                    size,
+                                    ..
+                                }
+                                | Envelope::Inlay {
+                                    object_hash: Some(hash),
+                                    size,
+                                    ..
+                                } => Some((hash, *size)),
+                                _ => None,
+                            };
+                            for hash in &record_dependencies {
+                                let size = expected
+                                    .filter(|(candidate, _)| *candidate == hash)
+                                    .map(|(_, size)| size)
+                                    .or(cache.stat_derived(hash)?);
+                                // The server refuses a hash named twice in one
+                                // request, and two records must agree on its size.
+                                let known = custody.entry(hash.clone()).or_insert(size);
+                                match (*known, size) {
+                                    (Some(known), Some(size)) if known != size => {
+                                        return Err(SyncError::new("object-size-mismatch", 409));
+                                    }
+                                    (None, Some(_)) => *known = size,
+                                    _ => {}
+                                }
+                            }
+                        }
+                        dependencies.extend(record_dependencies);
+                    }
+                    CycleItemCounter::advance(options.cycle_items.as_deref());
+                    CycleItemCounter::processed(options.cycle_items.as_deref());
+                }
             }
+            if !custody.is_empty() {
+                residency.retain(
+                    &client,
+                    &stored_config,
+                    &through,
+                    &custody.into_iter().collect::<Vec<_>>(),
+                )?;
+            }
+            self.promote_server_dependencies_with_residency(
+                &cache,
+                &dependencies.into_iter().collect::<Vec<_>>(),
+                remote_assets.then_some((&residency, custody_context.as_str())),
+                || client.ensure_active(),
+            )?;
             for item in page {
                 after = item.key.clone();
-                let applying = item.action == "apply";
                 let remote: RecordVersion = parse(&item.remote)?;
                 let dirty = key_parts(&item.key, revision)?;
                 let (base_version, base_hash) = self.effective_server_base(Domain::Library, &item.key, committed)?;
                 let remote_hash = match item.action.as_str() {
                     "apply" => {
                         let (payload, hash) = if matches!(remote, RecordVersion::Live { .. }) {
-                            let base_candidates = match candidates.remove(&item.key) {
-                                Some((_, bases)) => bases,
-                                None => self.server_base_candidates(
-                                    Domain::Library,
-                                    &item.key,
-                                    &cache,
-                                    committed,
-                                )?,
-                            };
-                            transfer.download_record_metadata(&remote, &base_candidates, &base_version)?;
                             let (payload, hash) = cache.restore(&remote)?;
-                            let dependencies = cache.dependencies(&payload)?;
-                            if !remote_assets {
-                                let native = PayloadCas::new(&self.repository_root)?;
-                                Transfer::new(&client, &cache)?.with_destination(&native, &self.connection)
-                                    .download(&dependencies, &base_candidates)?;
-                            }
-
-                            // The record this names arrived whole, so what it
-                            // says about itself is checked against what the
-                            // projection would name, not by writing it again.
-                            let expected = cache.projected_identity(
-                                &payload,
-                                &dependencies,
-                                &relations(&dirty)?,
-                                scopes(&dirty),
-                            )?;
-                            if expected.version != remote {
-                                return Err(SyncError::new(
-                                    "server-descriptor-semantics-mismatch",
-                                    409,
-                                ));
-                            }
-                            if remote_assets {
-                                use crate::logical_records::LogicalRecordEnvelope as Envelope;
-                                let expected = match &payload.record {
-                                    Envelope::Asset {
-                                        object_hash: Some(hash),
-                                        size,
-                                        ..
-                                    }
-                                    | Envelope::Inlay {
-                                        object_hash: Some(hash),
-                                        size,
-                                        ..
-                                    } => Some((hash, *size)),
-                                    _ => None,
-                                };
-                                let identities = dependencies
-                                    .iter()
-                                    .map(|hash| {
-                                        Ok((
-                                            hash.clone(),
-                                            expected
-                                                .filter(|(candidate, _)| *candidate == hash)
-                                                .map(|(_, size)| size)
-                                                .or(cache.stat_derived(hash)?),
-                                        ))
-                                    })
-                                    .collect::<Result<Vec<_>>>()?;
-                                residency.retain(&client, &stored_config, &through, &identities)?;
-                            }
-                            self.promote_server_dependencies_with_residency(
-                                &cache,
-                                &dependencies,
-                                remote_assets.then_some((&residency, custody_context.as_str())),
-                                || client.ensure_active(),
-                            )?;
                             (Some(payload), Some(hash))
                         } else {
                             (None, None)
@@ -1523,10 +1557,6 @@ impl PersistentStore {
                     _ => return Err(SyncError::new("unresolved-conflict", 409)),
                 };
                 bases.push((Domain::Library, item.key, remote, remote_hash));
-                if applying {
-                    CycleItemCounter::advance(options.cycle_items.as_deref());
-                    CycleItemCounter::processed(options.cycle_items.as_deref());
-                }
             }
         }
         let (section_applied, section_proposals) =
