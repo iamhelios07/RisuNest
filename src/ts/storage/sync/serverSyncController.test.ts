@@ -5,6 +5,18 @@ import { serverSyncProgressView } from "./serverSyncConnectFlow";
 import { ServerSyncError, type ServerSyncFacade, type ServerStatus } from "./serverSync";
 import type { RetainableReplacementFence } from "../retainableReplacementFence";
 
+const mobile = vi.hoisted(() => ({
+  tasks: [] as { progress: ReturnType<typeof vi.fn>; dispose: ReturnType<typeof vi.fn> }[],
+}));
+vi.mock("../../mobileBackgroundTask", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  beginMobileBackgroundTask: () => {
+    const task = { signal: undefined, progress: vi.fn(), dispose: vi.fn(async () => {}) };
+    mobile.tasks.push(task);
+    return task;
+  },
+}));
+
 function fixture() {
   const status: ServerStatus = {
     localRevision: 3,
@@ -287,6 +299,36 @@ describe("server sync controller", () => {
     await controller.synchronize();
     expect(controller.snapshot().progress).toBeUndefined();
     expect(controller.snapshot().error).toBe("server-timeout");
+  });
+  it("reports the percent the progress panel shows to the mobile background task", async () => {
+    const { controller, facade, status } = fixture();
+    mobile.tasks.length = 0;
+    const text = languageEnglish.risuNest.serverSync;
+    const shown: (number | null)[] = [];
+    facade.cycle.mockImplementationOnce(async () => {
+      const report = (items: Parameters<typeof controller.reportCycleItems>[0]) => {
+        controller.reportCycleItems(items);
+        shown.push(serverSyncProgressView(controller.snapshot(), text, Date.now()).percent);
+      };
+      controller.reportProgress("preparing");
+      report({ done: 0, total: 0, activity: "downloading", processed: 25, expected: 100 });
+      report({ done: 0, total: 0, activity: "downloading", processed: 100, expected: 100 });
+      controller.reportProgress("publishing");
+      report({ done: 1, total: 4, activity: "uploading" });
+      report({ done: 4, total: 4, activity: "confirming" });
+      return { phase: "idle", conflictCount: 0, localRevision: 3, head: status.head };
+    });
+    await controller.synchronize();
+    const [task] = mobile.tasks;
+    const reported = task.progress.mock.calls.map(([percent]) => percent);
+    expect(shown).toEqual([25, 100, 25, null]);
+    expect(reported.filter((percent, index) => index === 0 || percent !== reported[index - 1]))
+      .toEqual([null, 25, 100, 25, null]);
+    expect(task.dispose).toHaveBeenCalledOnce();
+    expect(Math.max(...task.progress.mock.invocationCallOrder))
+      .toBeLessThan(task.dispose.mock.invocationCallOrder[0]);
+    controller.invalidateCompletion();
+    expect(task.progress).toHaveBeenCalledTimes(reported.length);
   });
   it("counts elapsed time from the attempt start across stage and upload activity changes", async () => {
     vi.useFakeTimers();

@@ -3,7 +3,13 @@ import { formatElapsed } from "../../gui/nativeFileJobDialogModel";
 import { formatRisuNestStorageBytes } from "../risuNestStorageDashboard";
 import type { AssetResidencyPolicy } from "./serverAssetResidency";
 import type { ServerConfig, ServerSyncProgress } from "./serverSync";
-import { serverSyncBlocked, type ServerSyncSnapshot } from "./serverSyncController";
+import {
+  serverSyncActivity,
+  serverSyncBlocked,
+  serverSyncProgressPercent,
+  serverSyncReceiving,
+  type ServerSyncSnapshot,
+} from "./serverSyncController";
 
 /** The strings both connection screens draw from. */
 export type ServerSyncText = (typeof languageEnglish)["risuNest"]["serverSync"];
@@ -164,9 +170,8 @@ export function serverSyncProgressView(
 ): ServerSyncProgressView {
   const items = snapshot.cycleItems;
   const counted = items !== undefined && items.total > 0;
-  const activity = snapshot.progress === "preparing" || snapshot.progress === "publishing" ? items?.activity : undefined;
-  const receiving = activity === "downloading" || activity === "downloadingMetadata"
-    || activity === "downloadingBackupMetadata" || activity === "syncingSections";
+  const activity = serverSyncActivity(snapshot);
+  const receiving = serverSyncReceiving(activity);
   const stage = snapshot.progress === "preparing" && (receiving || activity === "preserving")
     ? "downloading" : snapshot.progress ?? "saving";
   const activeIndex = SERVER_SYNC_STAGES.indexOf(stage);
@@ -197,9 +202,7 @@ export function serverSyncProgressView(
       : `${formatRisuNestStorageBytes(snapshot.bytesPerSecond)}/s`;
   const pending = serverSyncPendingChanges(snapshot, text) || NO_VALUE;
   return {
-    percent: receiving
-      ? items?.expected ? Math.min(100, Math.round(((items.processed ?? 0) / items.expected) * 100)) : null
-      : counted && activity !== "confirming" && activity !== "preserving" ? Math.min(100, Math.round((items.done / items.total) * 100)) : null,
+    percent: serverSyncProgressPercent(snapshot),
     current: activity ? `${text.activity[activity]}${activity === "confirming" ? "" : ` · ${activityCount}`}` : active.detail ? `${active.label} · ${active.detail}` : active.label,
     elapsed:
       snapshot.attemptStartedAt === undefined

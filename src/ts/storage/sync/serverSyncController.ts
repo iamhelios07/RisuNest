@@ -1,4 +1,4 @@
-import { beginMobileBackgroundTask } from "../../mobileBackgroundTask";
+import { beginMobileBackgroundTask, type MobileBackgroundTask } from "../../mobileBackgroundTask";
 import { isLibraryFileOperationReserved } from "../libraryFileOperation";
 import {
   serverSyncError,
@@ -48,6 +48,26 @@ export interface ServerSyncSnapshot {
 export function serverSyncBlocked(snapshot: ServerSyncSnapshot): boolean {
   return Boolean(snapshot.error) && snapshot.errorRetryable === false;
 }
+export type ServerSyncActivity = NonNullable<ServerCycleItems["activity"]>;
+/** Only preparation and publication report what native work is running. */
+export function serverSyncActivity(snapshot: ServerSyncSnapshot): ServerSyncActivity | undefined {
+  return snapshot.progress === "preparing" || snapshot.progress === "publishing"
+    ? snapshot.cycleItems?.activity
+    : undefined;
+}
+export const serverSyncReceiving = (activity: ServerSyncActivity | undefined): boolean =>
+  activity === "downloading" || activity === "downloadingMetadata"
+    || activity === "downloadingBackupMetadata" || activity === "syncingSections";
+/** How much of the current step is done, or null while it cannot be measured. */
+export function serverSyncProgressPercent(snapshot: ServerSyncSnapshot): number | null {
+  const items = snapshot.cycleItems;
+  const activity = serverSyncActivity(snapshot);
+  if (serverSyncReceiving(activity))
+    return items?.expected ? Math.min(100, Math.round(((items.processed ?? 0) / items.expected) * 100)) : null;
+  return items !== undefined && items.total > 0 && activity !== "confirming" && activity !== "preserving"
+    ? Math.min(100, Math.round((items.done / items.total) * 100))
+    : null;
+}
 /** Waits before each automatic retry of a failed exit drain cycle. */
 const exitDrainRetryDelays = [1000, 2000, 4000];
 const abortableDelay = (millis: number, signal: AbortSignal): Promise<void> =>
@@ -80,6 +100,7 @@ export function createServerSyncController(
   let exitDrainActive = 0;
   // Every cycle during an exit drain runs under the fence the exit holds.
   let exitFence: RetainableReplacementFence | undefined;
+  let attemptTask: MobileBackgroundTask | undefined;
   const listeners = new Set<(snapshot: ServerSyncSnapshot) => void>();
   const publish = (): void => {
     state = {
@@ -89,6 +110,7 @@ export function createServerSyncController(
         state.initialSyncComplete && !state.error && !facade.needsRefresh(),
       ),
     };
+    if (state.running) attemptTask?.progress(serverSyncProgressPercent(state));
     for (const listener of listeners) listener(state);
   };
   const recordError = (cause: unknown): void => {
@@ -128,6 +150,7 @@ export function createServerSyncController(
     byteSample = undefined;
     publish();
     const background = await beginMobileBackgroundTask("sync");
+    attemptTask = background;
     const expired = () => { void facade.cancel().catch(() => {}); };
     background.signal?.addEventListener("abort", expired, { once: true });
     try {
@@ -181,6 +204,7 @@ export function createServerSyncController(
       state.initialSyncComplete = false;
     } finally {
       background.signal?.removeEventListener("abort", expired);
+      attemptTask = undefined;
       state.running = false;
       await background.dispose(!state.error);
       state.progress = undefined;
