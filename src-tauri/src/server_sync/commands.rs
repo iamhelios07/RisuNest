@@ -233,6 +233,12 @@ async fn blocking<T: Send + 'static>(
         .await
         .map_err(|_| SyncError::new("server-sync-worker-unavailable", 503))?
 }
+async fn logged_blocking<T: Send + 'static>(
+    stage: &str,
+    operation: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    recorded(stage, blocking(operation).await)
+}
 
 fn pinned_backups(state: &ServerSyncCommandState) -> Result<BTreeSet<String>> {
     Ok(state
@@ -254,7 +260,7 @@ pub(crate) async fn server_sync_backup_inventory(
     app: AppHandle,
     before: Option<super::management::BackupCursor>,
 ) -> Result<super::management::BackupInventory> {
-    blocking(move || {
+    logged_blocking("backup-inventory", move || {
         let state = app.state::<ServerSyncCommandState>();
         let store = job_store(&app)?;
         let block =
@@ -276,7 +282,7 @@ pub(crate) async fn server_sync_backup_inventory(
 pub(crate) async fn server_sync_backup_cleanup(
     app: AppHandle,
 ) -> Result<super::management::DeletionCleanup> {
-    blocking(move || {
+    logged_blocking("backup-cleanup", move || {
         let _admission = claim_library(&app)?;
         let state = app.state::<ServerSyncCommandState>();
         let _running = state.claim()?;
@@ -297,7 +303,7 @@ pub(crate) async fn server_sync_backup_delete(
     app: AppHandle,
     id: String,
 ) -> Result<BackupDeleteResult> {
-    blocking(move || {
+    logged_blocking("backup-delete", move || {
         let _admission = claim_library(&app)?;
         let state = app.state::<ServerSyncCommandState>();
         let _running = state.claim()?;
@@ -372,20 +378,20 @@ fn manage_cache(app: &AppHandle, clean: bool) -> Result<super::management::Cache
 pub(crate) async fn server_sync_cache_usage(
     app: AppHandle,
 ) -> Result<super::management::CacheUsage> {
-    blocking(move || manage_cache(&app, false)).await
+    logged_blocking("cache-usage", move || manage_cache(&app, false)).await
 }
 #[tauri::command]
 pub(crate) async fn server_sync_cache_cleanup(
     app: AppHandle,
 ) -> Result<super::management::CacheUsage> {
-    blocking(move || manage_cache(&app, true)).await
+    logged_blocking("cache-cleanup", move || manage_cache(&app, true)).await
 }
 #[tauri::command]
 pub(crate) async fn server_sync_backups(
     app: AppHandle,
     before: Option<super::backups::BackupCursor>,
 ) -> Result<super::backups::BackupList> {
-    blocking(move || {
+    logged_blocking("backups", move || {
         let store = job_store(&app)?;
         super::backups::list(store.repository_root(), before.as_ref())
     })
@@ -397,7 +403,7 @@ pub(crate) async fn server_sync_backup_source(
     id: String,
     side: super::backups::Side,
 ) -> Result<BackupSource> {
-    blocking(move || {
+    logged_blocking("backup-source", move || {
         let _admission = claim_library(&app)?;
         let state = app.state::<ServerSyncCommandState>();
         let (_running, cancelled) = state.claim_preparation()?;
@@ -464,7 +470,10 @@ pub(crate) fn claim_reference_source(app: &AppHandle, token: &str) -> Result<Ref
 
 #[tauri::command]
 pub(crate) fn server_sync_backup_release(app: AppHandle, lease: String) -> Result<()> {
-    app.state::<ServerSyncCommandState>().release_reference_source(&lease)
+    recorded(
+        "backup-release",
+        app.state::<ServerSyncCommandState>().release_reference_source(&lease),
+    )
 }
 
 #[derive(Serialize)]
@@ -485,20 +494,20 @@ pub(crate) enum PreparedReply {
 }
 #[tauri::command]
 pub(crate) async fn server_sync_status(app: AppHandle) -> Result<ReplicaStatus> {
-    blocking(move || job_store(&app)?.server_status()).await
+    logged_blocking("status", move || job_store(&app)?.server_status()).await
 }
 #[tauri::command]
 pub(crate) async fn server_sync_asset_status(
     app: AppHandle,
 ) -> Result<crate::persistent_store::asset_residency::ResidencyStatus> {
-    blocking(move || job_store(&app)?.asset_residency_status()).await
+    logged_blocking("asset-status", move || job_store(&app)?.asset_residency_status()).await
 }
 #[tauri::command]
 pub(crate) async fn server_sync_asset_policy(
     app: AppHandle,
     policy: super::residency::AssetPolicy,
 ) -> Result<crate::persistent_store::asset_residency::ResidencyStatus> {
-    blocking(move || {
+    logged_blocking("asset-policy", move || {
         let _admission = claim_library(&app)?;
         let state = app.state::<ServerSyncCommandState>();
         let (_running, cancelled) = state.claim_preparation()?;
@@ -516,7 +525,7 @@ pub(crate) async fn server_sync_asset_policy(
 pub(crate) async fn server_sync_asset_evict(
     app: AppHandle,
 ) -> Result<crate::persistent_store::asset_residency::ResidencyStatus> {
-    blocking(move || {
+    logged_blocking("asset-evict", move || {
         let _admission = claim_library(&app)?;
         let state = app.state::<ServerSyncCommandState>();
         let (_running, cancelled) = state.claim_preparation()?;
@@ -544,8 +553,51 @@ fn activity_name(activity: u8) -> &'static str {
         1 => "enumerating", 2 => "preparing", 3 => "downloading", 4 => "uploading", 5 => "confirming", 6 => "verifying", 7 => "downloadingMetadata", 8 => "preserving", 9 => "syncingSections", 10 => "downloadingBackupMetadata", _ => "enumerating",
     }
 }
-/// A failed stage leaves one line in this device's log with its code and how
-/// far the cycle had come, so an attempt that stopped can be traced later.
+/// Refusals a caller meets in normal use, such as another operation holding
+/// the library. They are logged as warnings rather than failures.
+const EXPECTED_REFUSALS: [&str; 9] = [
+    "cancelled",
+    "server-sync-busy",
+    "library-operation-busy",
+    "cleanup-pending",
+    "server-sync-preparation-pending",
+    "server-not-bound",
+    "stale-server-preparation",
+    "resolve-pending-operation-first",
+    "local-revision-changed",
+];
+fn record_failure(stage: &str, error: &SyncError, progress: &str) {
+    let cause = error
+        .cause
+        .as_deref()
+        .map(|cause| format!(" cause={cause}"))
+        .unwrap_or_default();
+    crate::native_log::global_state().record(
+        if EXPECTED_REFUSALS.contains(&error.code.as_str()) {
+            "warn"
+        } else {
+            "error"
+        },
+        "server-sync",
+        format!(
+            "{stage} failed: code={} status={}{cause} at={}:{}{progress}",
+            error.code,
+            error.status,
+            error.at.file(),
+            error.at.line(),
+        ),
+    );
+}
+/// A failed command leaves one line in this device's log with its code, the
+/// failure behind it and where it was raised.
+fn recorded<T>(stage: &str, result: Result<T>) -> Result<T> {
+    if let Err(error) = &result {
+        record_failure(stage, error, "");
+    }
+    result
+}
+/// A failed stage also records how far the cycle had come, so an attempt that
+/// stopped can be traced later.
 fn logged<T>(app: &AppHandle, stage: &str, result: Result<T>) -> Result<T> {
     if let Err(error) = &result {
         let progress = app
@@ -563,11 +615,7 @@ fn logged<T>(app: &AppHandle, stage: &str, result: Result<T>) -> Result<T> {
                 )
             })
             .unwrap_or_default();
-        crate::native_log::global_state().record(
-            if error.code == "cancelled" { "warn" } else { "error" },
-            "server-sync",
-            format!("{stage} failed: code={}{progress}", error.code),
-        );
+        record_failure(stage, error, &progress);
     }
     result
 }
@@ -600,7 +648,7 @@ pub(crate) async fn server_sync_bind(
     app: AppHandle,
     config: ServerConfig,
 ) -> Result<ReplicaStatus> {
-    blocking(move || {
+    logged_blocking("bind", move || {
         let _admission = claim_library(&app)?;
         let state = app.state::<ServerSyncCommandState>();
         let _running = state.claim()?;
@@ -615,7 +663,7 @@ pub(crate) async fn server_sync_bind(
 }
 #[tauri::command]
 pub(crate) async fn server_sync_unbind(app: AppHandle) -> Result<()> {
-    blocking(move || {
+    logged_blocking("unbind", move || {
         let _admission = claim_library(&app)?;
         let state = app.state::<ServerSyncCommandState>();
         let _running = state.claim()?;
@@ -630,7 +678,7 @@ pub(crate) async fn server_sync_reregister(
     config: ServerConfig,
     expected_revision: i64,
 ) -> Result<ReplicaStatus> {
-    blocking(move || {
+    logged_blocking("reregister", move || {
         let _admission = claim_library(&app)?;
         let state = app.state::<ServerSyncCommandState>();
         let _running = state.claim()?;
@@ -673,7 +721,7 @@ pub(crate) async fn server_sync_reconcile(
     app: AppHandle,
     expected_revision: i64,
 ) -> Result<ReplicaStatus> {
-    blocking(move || {
+    logged_blocking("reconcile", move || {
         let _admission = claim_library(&app)?;
         let state = app.state::<ServerSyncCommandState>();
         let _running = state.claim()?;
@@ -810,7 +858,7 @@ pub(crate) async fn server_sync_publish(
 }
 #[tauri::command]
 pub(crate) fn server_sync_cancel(app: AppHandle) -> Result<()> {
-    app.state::<ServerSyncCommandState>().cancel()
+    recorded("cancel", app.state::<ServerSyncCommandState>().cancel())
 }
 
 #[cfg(test)]
@@ -948,5 +996,48 @@ mod preparation_tests {
         drop(admission.server().unwrap());
         task.abort();
         runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+    }
+}
+
+#[cfg(test)]
+mod failure_log_tests {
+    use super::*;
+
+    fn logged(stage: &str) -> crate::native_log::LogEntry {
+        let prefix = format!("{stage} failed: ");
+        crate::native_log::global_state()
+            .tail(None)
+            .into_iter()
+            .rev()
+            .find(|entry| entry.target == "server-sync" && entry.message.starts_with(&prefix))
+            .expect("the failure is logged")
+    }
+
+    #[test]
+    fn a_failure_logs_its_cause_and_origin_and_a_refusal_is_a_warning() {
+        let io = std::io::Error::from(std::io::ErrorKind::InvalidData);
+        let line = line!() + 1;
+        let failure = recorded("synthetic-storage-stage", Err::<(), _>(SyncError::from(io)));
+        assert_eq!(failure.unwrap_err().code, "local-storage");
+        let entry = logged("synthetic-storage-stage");
+        assert_eq!(entry.level, "error");
+        assert!(entry
+            .message
+            .contains("code=local-storage status=503 cause=InvalidData: "));
+        assert!(entry.message.ends_with(&format!("commands.rs:{line}")));
+
+        let _ = recorded(
+            "synthetic-busy-stage",
+            Err::<(), _>(SyncError::new("server-sync-busy", 409)),
+        );
+        let entry = logged("synthetic-busy-stage");
+        assert_eq!(entry.level, "warn");
+        assert!(!entry.message.contains("cause="));
+
+        assert!(recorded("synthetic-quiet-stage", Ok(())).is_ok());
+        assert!(crate::native_log::global_state()
+            .tail(None)
+            .iter()
+            .all(|entry| !entry.message.starts_with("synthetic-quiet-stage")));
     }
 }

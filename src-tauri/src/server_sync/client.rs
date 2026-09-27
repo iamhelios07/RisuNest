@@ -853,6 +853,7 @@ mod progress_tests {
         assert_eq!(sanitize_retryable_failure(None), None);
     }
 }
+#[track_caller]
 pub(crate) fn response_error(reply: Reply) -> SyncError {
     let value: Option<serde_json::Value> = serde_json::from_slice(&reply.body).ok();
     let code = value
