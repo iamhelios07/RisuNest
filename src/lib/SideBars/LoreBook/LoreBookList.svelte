@@ -1,12 +1,36 @@
+<script module lang="ts">
+    import type { loreBook as LoreBookEntry } from "src/ts/storage/database.svelte";
+
+    interface LoreDragSession {
+        group: string
+        book: LoreBookEntry
+        /** The folder row that owns the list the drag started in. */
+        folderRow: LoreBookEntry | null
+        flipped: boolean
+        /** Puts the dragged row back where its list rendered it. */
+        restore: () => void
+        /** Records the dragged row's position after its list renders a new page. */
+        reanchor: () => void
+    }
+
+    const pageSize = 60
+    const pageFlipDelayMs = 500
+    const pageFlipRepeatMs = 700
+    let dragSession = $state.raw<LoreDragSession | null>(null)
+    let revealRequest = $state.raw<{ group: string; book: LoreBookEntry } | null>(null)
+</script>
+
 <script lang="ts">
+    import { ChevronDownIcon, ChevronUpIcon } from '@lucide/svelte'
+    import { language } from "src/lang"
     import ListPager from "src/lib/UI/GUI/ListPager.svelte"
-    import { loreListWindow, loreDropIndex, groupLoreFolders } from "src/ts/gui/loreListWindow"
+    import { loreListWindow, loreDropIndex, groupLoreFolders, lorePageOf } from "src/ts/gui/loreListWindow"
     import { type loreBook } from "src/ts/storage/database.svelte";
     import { DBState } from 'src/ts/stores.svelte';
     import LoreBookData from "./LoreBookData.svelte";
     import { selectedCharID } from "src/ts/stores.svelte";
     import Sortable from 'sortablejs/modular/sortable.core.esm.js';
-    import { onDestroy, onMount } from "svelte";
+    import { onDestroy, onMount, tick } from "svelte";
     import { sortableOptions } from "src/ts/util";
     import { v4 } from "uuid";
 
@@ -26,12 +50,19 @@
         : submenu === 1
             ? DBState.db.characters[$selectedCharID]?.chats[DBState.db.characters[$selectedCharID].chatPage]?.localLore ?? []
             : DBState.db.characters[$selectedCharID]?.globalLore ?? []))
-    const windowed = $derived(loreListWindow(currentItems, showFolder, page))
+    const idgroup = $derived(dragGroup)
+    let pinEdge: 'start' | 'end' = $state('start')
+    const pinned = $derived(dragSession?.group === idgroup
+        ? [dragSession.book, dragSession.folderRow].filter(book => book !== null)
+        : [])
+    const windowed = $derived(loreListWindow(currentItems, showFolder, page, pageSize, pinned, pinEdge))
     const pageRows = $derived(windowed.rows)
+    const pageCount = $derived(Math.max(1, Math.ceil(windowed.total / pageSize)))
+    const currentPage = $derived(Math.min(page, pageCount - 1))
     let stb: Sortable = null
     let ele: HTMLDivElement = $state()
-    const idgroup = $derived(dragGroup)
     let originalNextSibling: Node | null = null
+    let ownSession: LoreDragSession | null = null
 
     const createStb = () => {
         stb = Sortable.create(ele, {
@@ -50,8 +81,26 @@
             },
             onStart: (event) => {
                 originalNextSibling = event.item.nextSibling
+                revealRequest = null
+                const book = currentItems[Number(event.item.getAttribute('data-risu-idx'))]
+                if (!book) return
+                const { item, from } = event
+                ownSession = {
+                    group: idgroup,
+                    book,
+                    folderRow: showFolder
+                        ? currentItems.find(row => row.mode === 'folder' && row.key === showFolder) ?? null
+                        : null,
+                    flipped: false,
+                    restore: () => from.insertBefore(item, originalNextSibling),
+                    reanchor: () => { originalNextSibling = item.nextSibling },
+                }
+                dragSession = ownSession
             },
             onEnd: (event) => {
+                const session = ownSession
+                ownSession = null
+                if (session && dragSession === session) dragSession = null
                 const indexOfRow = (node: Element | null): number | null => {
                     const value = node?.getAttribute('data-risu-idx')
                     return value === null || value === undefined ? null : Number(value)
@@ -61,7 +110,8 @@
                 const previous = indexOfRow(event.item.previousElementSibling)
                 // Restore Svelte's DOM before changing either folder's keyed list.
                 event.from.insertBefore(event.item, originalNextSibling)
-                if (source === null || (event.from === event.to && event.oldIndex === event.newIndex)) return
+                if (source === null) return
+                if (!session?.flipped && event.from === event.to && event.oldIndex === event.newIndex) return
 
                 const moved = currentItems[source]
                 if (!moved) return
@@ -74,6 +124,8 @@
                 reordered.splice(source, 1)
                 reordered.splice(destination, 0, moved)
                 currentItems.splice(0, currentItems.length, ...groupLoreFolders(reordered))
+                // A move across a page boundary can shift the row onto a neighbouring page.
+                revealRequest = { group: idgroup, book: moved }
             },
         })
     }
@@ -114,7 +166,80 @@
         }
     })
 
+    const hasOpenDetail = $derived([...openedRefs].some(book => book.mode !== 'folder'))
+    const dragging = $derived(dragSession?.group === idgroup && !hasOpenDetail && pageCount > 1)
+    let previousZone: HTMLDivElement | undefined = $state()
+    let nextZone: HTMLDivElement | undefined = $state()
+    let hoveredZone: -1 | 0 | 1 = $state(0)
+    let flipTimer: ReturnType<typeof setTimeout> | undefined
+
+    async function flipPage(direction: -1 | 1) {
+        const session = dragSession
+        const target = currentPage + direction
+        if (session?.group !== idgroup || target < 0 || target >= pageCount) return
+        session.restore()
+        session.flipped = true
+        pinEdge = direction > 0 ? 'start' : 'end'
+        page = target
+        await tick()
+        if (dragSession === session) session.reanchor()
+    }
+
+    function zoneAt(x: number, y: number): -1 | 0 | 1 {
+        for (const [zone, direction] of [[previousZone, -1], [nextZone, 1]] as const) {
+            const rect = zone?.getBoundingClientRect()
+            if (rect && x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) return direction
+        }
+        return 0
+    }
+
+    function trackPointer(x: number, y: number) {
+        const zone = zoneAt(x, y)
+        if (zone === hoveredZone) return
+        hoveredZone = zone
+        clearTimeout(flipTimer)
+        if (zone === 0) return
+        const flip = () => {
+            void flipPage(zone)
+            flipTimer = setTimeout(flip, pageFlipRepeatMs)
+        }
+        flipTimer = setTimeout(flip, pageFlipDelayMs)
+    }
+
+    $effect(() => {
+        if (!dragging) return
+        // Native drags report drag events and touch drags report touch events. Sortable
+        // stops dragover over its rows, so listen before the event reaches them.
+        const onPointer = (event: DragEvent | PointerEvent) => trackPointer(event.clientX, event.clientY)
+        const onTouch = (event: TouchEvent) => {
+            const touch = event.touches[0]
+            if (touch) trackPointer(touch.clientX, touch.clientY)
+        }
+        document.addEventListener('dragenter', onPointer, true)
+        document.addEventListener('dragover', onPointer, true)
+        document.addEventListener('pointermove', onPointer, true)
+        document.addEventListener('touchmove', onTouch, { capture: true, passive: true })
+        return () => {
+            document.removeEventListener('dragenter', onPointer, true)
+            document.removeEventListener('dragover', onPointer, true)
+            document.removeEventListener('pointermove', onPointer, true)
+            document.removeEventListener('touchmove', onTouch, true)
+            clearTimeout(flipTimer)
+            hoveredZone = 0
+        }
+    })
+
+    $effect(() => {
+        const request = revealRequest
+        if (request?.group !== idgroup) return
+        const target = lorePageOf(currentItems, showFolder, request.book, pageSize)
+        if (target === null) return
+        page = target
+        revealRequest = null
+    })
+
     onDestroy(() => {
+        if (ownSession && dragSession === ownSession) dragSession = null
         if(stb){
             try {
                 stb.destroy()
@@ -123,7 +248,21 @@
     })
 </script>
 
-<ListPager bind:page total={windowed.total} disabled={openedRefs.size > 0} />
+<div class="relative">
+    <ListPager bind:page total={windowed.total} disabled={openedRefs.size > 0} />
+    {#if dragging && currentPage > 0}
+        <div
+            bind:this={previousZone}
+            aria-hidden="true"
+            data-lore-page-zone="previous"
+            class="absolute inset-0 flex items-center justify-center gap-2 rounded-md border text-sm transition-colors {hoveredZone === -1 ? 'border-selected bg-selected text-textcolor' : 'border-dashed border-darkborderc bg-darkbg text-textcolor2'}"
+        >
+            <ChevronUpIcon size={16} />
+            <span>{language.risuNest.pager.previous}</span>
+            <span class="tabular-nums">{currentPage + 1} / {pageCount}</span>
+        </div>
+    {/if}
+</div>
     <div class="border-solid border-selected p-2 flex flex-col border-1 rounded-md" 
          bind:this={ele} 
          data-show-folder={showFolder || ''}>
@@ -261,3 +400,15 @@
             {/if}
         {/if}
     </div>
+{#if dragging && currentPage + 1 < pageCount}
+    <div
+        bind:this={nextZone}
+        aria-hidden="true"
+        data-lore-page-zone="next"
+        class="mt-2 h-10 flex items-center justify-center gap-2 rounded-md border text-sm transition-colors {hoveredZone === 1 ? 'border-selected bg-selected text-textcolor' : 'border-dashed border-darkborderc bg-darkbg text-textcolor2'}"
+    >
+        <ChevronDownIcon size={16} />
+        <span>{language.risuNest.pager.next}</span>
+        <span class="tabular-nums">{currentPage + 1} / {pageCount}</span>
+    </div>
+{/if}

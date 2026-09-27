@@ -11,9 +11,13 @@
         return { comment, key: comment, content: '', mode: 'normal', insertorder: 100,
             alwaysActive: false, secondkey: '', selective: false, ...extra }
     }
+    // svelte-ignore state_referenced_locally
+    const globalLore = kind === 'lore-pages'
+        ? [book('Folder', { mode: 'folder', key: 'folder' }), book('Child', { folder: 'folder' }),
+            ...Array.from({ length: 130 }, (_, i) => book(`Item ${i}`))]
+        : [book('Folder', { mode: 'folder', key: 'folder' }), book('Child', { folder: 'folder' }), book('First'), book('Last')]
     DBState.db = {
-        characters: [{ globalLore: [book('Folder', { mode: 'folder', key: 'folder' }),
-            book('Child', { folder: 'folder' }), book('First'), book('Last')], chats: [{ localLore: [] }], chatPage: 0,
+        characters: [{ globalLore, chats: [{ localLore: [] }], chatPage: 0,
             triggerscript: ['First', 'Second', 'Last'].map(comment => ({ comment, type: 'start', conditions: [], effect: [] })) }],
         globalscript: ['First', 'Second', 'Last'].map(comment => ({ comment, in: '', out: '', type: 'editinput' })),
         promptTemplate: ['First', 'Second', 'Last'].map(name => ({ name, type: 'plain', text: '', role: 'system', type2: 'normal' })),
@@ -22,7 +26,7 @@
 </script>
 
 <main id="drag-fixture">
-    {#if kind === 'lore'}
+    {#if kind === 'lore' || kind === 'lore-pages'}
         <LoreBookList />
     {:else if kind === 'regex'}
         <RegexList bind:value={DBState.db.globalscript} />

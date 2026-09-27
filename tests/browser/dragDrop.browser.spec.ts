@@ -4,7 +4,7 @@ import type { Locator, Page } from '@playwright/test'
 async function order(page: Page, kind: string) {
     return page.evaluate(kind => {
         const db = (window as any).dragState.db
-        const items = kind === 'lore' ? db.characters[0].globalLore
+        const items = kind.startsWith('lore') ? db.characters[0].globalLore
             : kind === 'regex' ? db.globalscript : kind === 'trigger' ? db.characters[0].triggerscript : db.promptTemplate
         return items.map((item: any) => item.comment ?? item.name)
     }, kind)
@@ -124,5 +124,128 @@ test.describe('touch dragging', () => {
         }
         await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] })
         await expect.poll(() => order(page, 'regex')).toEqual(['Last', 'First', 'Second'])
+    })
+})
+
+async function center(locator: Locator) {
+    await expect(locator).toBeVisible()
+    const box = await locator.boundingBox()
+    return { x: box!.x + box!.width / 2, y: box!.y + box!.height / 2, top: box!.y + 3 }
+}
+const zone = (page: Page, direction: 'previous' | 'next') => page.locator(`[data-lore-page-zone="${direction}"]`)
+const pagerText = (page: Page) => page.getByRole('navigation', { name: 'Pages' }).first()
+const itemButton = (page: Page, name: string) => page.getByRole('button', { name, exact: true })
+async function position(page: Page, name: string) {
+    return (await order(page, 'lore')).indexOf(name)
+}
+
+/** Hovers the top edge of a row at a pace Sortable's move animation keeps up with. */
+async function settleOn(page: Page, target: string, via?: string) {
+    await page.waitForTimeout(250)
+    // Rows shift once the dragged row leaves its pinned edge, so measure the target after that.
+    if (via) {
+        const pass = await center(itemButton(page, via).locator('..'))
+        await page.mouse.move(pass.x, pass.y, { steps: 6 })
+        await page.waitForTimeout(250)
+    }
+    const drop = await center(itemButton(page, target).locator('..'))
+    await page.mouse.move(drop.x, drop.top, { steps: 6 })
+    await page.waitForTimeout(250)
+    await page.mouse.move(drop.x, drop.top)
+}
+
+test.describe('lore pages', () => {
+    test.use({ viewport: { width: 800, height: 6400 } })
+
+    async function dragThroughZone(page: Page, source: string, direction: 'previous' | 'next', expected: string, target: string, via?: string) {
+        const start = await center(itemButton(page, source).locator('..'))
+        const mouse = page.mouse
+        await mouse.move(start.x, start.y)
+        await mouse.down()
+        await mouse.move(start.x + 8, start.y, { steps: 3 })
+        // The zone moves when the dragged row enters this list, so aim again once it settles.
+        for (let attempt = 0; attempt < 2; attempt++) {
+            const edge = await center(zone(page, direction))
+            await mouse.move(edge.x, edge.y, { steps: 8 })
+            await page.waitForTimeout(200)
+        }
+        await expect(pagerText(page)).toContainText(expected)
+        await settleOn(page, target, via)
+        await mouse.up()
+    }
+
+    test('hovering the next-page zone carries a row to a later page', async ({ page }) => {
+        const errors: string[] = []
+        page.on('pageerror', error => errors.push(error.message))
+        await open(page, 'lore-pages')
+        await expect(zone(page, 'next')).toHaveCount(0)
+        await dragThroughZone(page, 'Item 0', 'next', '2 / 3', 'Item 70', 'Item 100')
+        await expect.poll(async () => (await position(page, 'Item 70')) - (await position(page, 'Item 0'))).toBe(1)
+        await expect(itemButton(page, 'Item 0')).toBeVisible()
+        await expect(zone(page, 'next')).toHaveCount(0)
+        expect(errors).toEqual([])
+    })
+
+    test('hovering the previous-page zone carries a row to an earlier page', async ({ page }) => {
+        const errors: string[] = []
+        page.on('pageerror', error => errors.push(error.message))
+        await open(page, 'lore-pages')
+        await page.getByRole('button', { name: 'Next page' }).first().click()
+        await dragThroughZone(page, 'Item 100', 'previous', '1 / 3', 'Item 5')
+        await expect.poll(async () => (await position(page, 'Item 5')) - (await position(page, 'Item 100'))).toBe(1)
+        await expect(itemButton(page, 'Item 100')).toBeVisible()
+        expect(errors).toEqual([])
+    })
+
+    test('a row dragged out of a folder survives the root page change', async ({ page }) => {
+        const errors: string[] = []
+        page.on('pageerror', error => errors.push(error.message))
+        await open(page, 'lore-pages')
+        await itemButton(page, 'Folder').click()
+        await dragThroughZone(page, 'Child', 'next', '2 / 3', 'Item 70', 'Item 100')
+        const child = () => page.evaluate(() => (window as any).dragState.db.characters[0].globalLore.find((item: any) => item.comment === 'Child').folder)
+        await expect.poll(child).toBeUndefined()
+        await expect.poll(async () => (await position(page, 'Item 70')) - (await position(page, 'Child'))).toBe(1)
+        await expect(itemButton(page, 'Child')).toBeVisible()
+        expect(errors).toEqual([])
+    })
+})
+
+test.describe('lore pages by touch', () => {
+    test.use({ hasTouch: true, isMobile: true, viewport: { width: 393, height: 6400 } })
+    test('holding a touch drag on the next-page zone carries a row to a later page', async ({ page, context }) => {
+        const errors: string[] = []
+        page.on('pageerror', error => errors.push(error.message))
+        await open(page, 'lore-pages')
+        const start = await center(itemButton(page, 'Item 0'))
+        const cdp = await context.newCDPSession(page)
+        const touch = (type: string, x: number, y: number) =>
+            cdp.send('Input.dispatchTouchEvent', { type, touchPoints: type === 'touchEnd' ? [] : [{ x, y }] })
+        await touch('touchStart', start.x, start.y)
+        await page.waitForTimeout(350)
+        await touch('touchMove', start.x, start.y + 10)
+        await expect(zone(page, 'next')).toHaveCount(1)
+        const edge = await center(zone(page, 'next'))
+        for (let step = 1; step <= 6; step++) {
+            await touch('touchMove', edge.x, start.y + (edge.y - start.y) * step / 6)
+            await page.waitForTimeout(40)
+        }
+        await expect(pagerText(page)).toContainText('2 / 3')
+        await page.waitForTimeout(250)
+        const pass = await center(itemButton(page, 'Item 100'))
+        for (let step = 1; step <= 6; step++) {
+            await touch('touchMove', pass.x, edge.y + (pass.y - edge.y) * step / 6)
+            await page.waitForTimeout(60)
+        }
+        await page.waitForTimeout(250)
+        const drop = await center(itemButton(page, 'Item 70'))
+        for (let step = 1; step <= 6; step++) {
+            await touch('touchMove', drop.x, pass.y + (drop.top - pass.y) * step / 6)
+            await page.waitForTimeout(60)
+        }
+        await page.waitForTimeout(250)
+        await touch('touchEnd', 0, 0)
+        await expect.poll(async () => (await position(page, 'Item 70')) - (await position(page, 'Item 0'))).toBe(1)
+        expect(errors).toEqual([])
     })
 })
