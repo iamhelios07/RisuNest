@@ -1,3 +1,4 @@
+import { beginMobileBackgroundTask } from "../../mobileBackgroundTask";
 import { isLibraryFileOperationReserved } from "../libraryFileOperation";
 import {
   serverSyncError,
@@ -126,6 +127,9 @@ export function createServerSyncController(
     clearError();
     byteSample = undefined;
     publish();
+    const background = await beginMobileBackgroundTask("sync");
+    const expired = () => { void facade.cancel().catch(() => {}); };
+    background.signal?.addEventListener("abort", expired, { once: true });
     try {
       await refreshStatus();
       const identity = state.status;
@@ -139,6 +143,7 @@ export function createServerSyncController(
       // Bound each foreground invocation. The next scheduled run resumes
       // a persisted server job without creating a new logical operation.
       for (let attempt = 0; attempt < 4; attempt += 1) {
+        background.signal?.throwIfAborted();
         // Progress publishes replace the snapshot while this promise is pending.
         // Resolve first, then assign to the current snapshot, not the old object
         // captured by the left-hand side of an assignment containing await.
@@ -175,7 +180,9 @@ export function createServerSyncController(
       recordError(cause);
       state.initialSyncComplete = false;
     } finally {
+      background.signal?.removeEventListener("abort", expired);
       state.running = false;
+      await background.dispose(!state.error);
       state.progress = undefined;
       state.bytesPerSecond = undefined;
       state.cycleItems = undefined;

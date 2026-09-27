@@ -1,3 +1,4 @@
+import { beginMobileBackgroundTask, measuredTaskPercent, type MobileBackgroundTask } from '../../../mobileBackgroundTask'
 import type { SyncExitDrainResult, SyncExitTarget } from '../../syncExitCoordinator'
 import type {
     DecimalString,
@@ -32,6 +33,7 @@ export interface ExternalControllerRequest {
     reason: ExternalJobReason
     session: ExternalExecutionSession
     signal?: AbortSignal
+    backgroundTask?: MobileBackgroundTask
 }
 
 export type ExternalControllerResult =
@@ -178,10 +180,12 @@ export function createExternalStorageController(
     const poll = async (
         initial: ExternalJobSummary,
         signal?: AbortSignal,
+        background?: MobileBackgroundTask,
     ): Promise<ExternalJobSummary> => {
         let job = initial
         throwIfAborted(signal)
         while (!terminalStates.has(job.state)) {
+            background?.progress(measuredTaskPercent(Number(job.completedBytes), Number(job.totalBytes)))
             throwIfAborted(signal)
             if (job.state === 'waiting' && job.phase === 'remote-apply') {
                 throwIfAborted(signal)
@@ -218,7 +222,18 @@ export function createExternalStorageController(
             const request = selectedGoal.request
             run.activeGoal = selectedGoal
             if (run.abort.signal.aborted) run.abort = new AbortController()
+            const acquisition = request.backgroundTask ?? beginMobileBackgroundTask(
+                request.kind === 'cleanup' ? 'maintenance' : request.kind, run.abort.signal,
+            )
+            const background = acquisition instanceof Promise ? await acquisition : acquisition
+            const expired = () => {
+                run.abort.abort(background.signal?.reason)
+                if (run.active) void bridge.cancelJob(run.active.id).catch(() => {})
+            }
+            background.signal?.addEventListener('abort', expired, { once: true })
+            let success = false
             try {
+                throwIfAborted(background.signal)
                 const started = await bridge.startJob({
                     connectionId,
                     kind: request.kind,
@@ -240,7 +255,8 @@ export function createExternalStorageController(
                     run.cancelling = undefined
                     throw run.abort.signal.reason ?? request.signal?.reason
                 }
-                const completed = await poll(started, run.abort.signal)
+                const completed = await poll(started, run.abort.signal, background)
+                success = completed.state === 'succeeded'
                 run.active = completed
                 if (completed.state !== 'succeeded') {
                     const reason = blockedReason(completed)
@@ -286,6 +302,8 @@ export function createExternalStorageController(
                     continue
                 }
             } finally {
+                background.signal?.removeEventListener('abort', expired)
+                if (!request.backgroundTask) await background.dispose(success)
                 run.active = undefined
                 run.activeGoal = undefined
                 publish()

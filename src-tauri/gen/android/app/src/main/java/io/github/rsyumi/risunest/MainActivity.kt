@@ -879,6 +879,13 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       "lifecycle.onFlushHold" -> lifecycleCommands.onFlushHold(args[0])
       "lifecycle.requestExit" -> lifecycleCommands.requestExit()
       "lifecycle.requestRestart" -> lifecycleCommands.requestRestart()
+      "background.begin" -> GenerationForegroundService.beginTask(this, args[0]) { id ->
+        lifecycleWebView?.evaluateJavascript(
+          "window.dispatchEvent(new CustomEvent('risunest-background-expired',{detail:'$id'}));", null,
+        )
+      }
+      "background.progress" -> GenerationForegroundService.taskProgress(args[0], args[1].toInt())
+      "background.end" -> GenerationForegroundService.endTask(this, args[0])
       "generation.begin" -> generationCommands.begin()
       "generation.end" -> generationCommands.end()
       "generation.notificationsEnabled" -> generationCommands.notificationsEnabled()

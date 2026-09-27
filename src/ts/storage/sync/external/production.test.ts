@@ -1,8 +1,13 @@
+import type { MobileBackgroundTask, MobileTaskKind } from '../../../mobileBackgroundTask'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ExternalJobSummary, ExternalStorageState } from './types'
 import type { CommittedApplyOutcome } from '../../persistentDataRuntime'
 
 const mocks = vi.hoisted(() => ({
+    protected: false,
+    protectScopes: false,
+    scopes: 0,
+    backgroundChanged: undefined as (() => void) | undefined,
     persistentRuntime: {},
     revision: 8,
     listener: undefined as ((revision: number) => void) | undefined,
@@ -34,6 +39,25 @@ const mocks = vi.hoisted(() => ({
     pendingContinuation: undefined as undefined | (() => void | Promise<void>),
     registerContinuation: vi.fn(),
 }))
+
+vi.mock('../../../mobileBackgroundTask', async original => {
+    const actual = await original<typeof import('../../../mobileBackgroundTask')>()
+    return {
+        ...actual,
+        hasMobileBackgroundTasks: () => mocks.protected || (mocks.protectScopes && mocks.scopes > 0),
+        runWithMobileBackgroundTask<T>(kind: MobileTaskKind, operation: (task: MobileBackgroundTask) => Promise<T>, signal?: AbortSignal) {
+            mocks.scopes++
+            return actual.runWithMobileBackgroundTask(kind, operation, signal).finally(() => {
+                mocks.scopes--
+                mocks.backgroundChanged?.()
+            })
+        },
+        subscribeMobileBackgroundTasks: (listener: () => void) => {
+            mocks.backgroundChanged = listener
+            return () => { mocks.backgroundChanged = undefined }
+        },
+    }
+})
 
 vi.mock('./bridge', () => ({
     getExternalStorageBridge: () => mocks.bridge,
@@ -153,6 +177,10 @@ describe('external storage production integration', () => {
     })
 
     beforeEach(async () => {
+        mocks.protected = false
+        mocks.protectScopes = false
+        mocks.scopes = 0
+        mocks.backgroundChanged = undefined
         vi.resetModules()
         vi.clearAllMocks()
         const persistent = await import('../../persistentDataRuntime.svelte')
@@ -413,6 +441,57 @@ describe('external storage production integration', () => {
         expect(mocks.bridge.startJob).toHaveBeenCalledWith(expect.objectContaining({
             targetRevision: '17', reason: 'manual',
         }))
+    })
+
+    it('protects manual synchronization while local saving is still pending', async () => {
+        let visibility: DocumentVisibilityState = 'visible'
+        const visible = vi.spyOn(document, 'visibilityState', 'get').mockImplementation(() => visibility)
+        let finish!: () => void
+        try {
+            const { installExternalStorageProduction, requestExternalStorageNow } = await import('./production')
+            await installExternalStorageProduction()
+            mocks.protectScopes = true
+            mocks.flush.mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve }))
+            const result = requestExternalStorageNow('old-sync', 'sync')
+            expect(mocks.scopes).toBe(1)
+            visibility = 'hidden'
+            document.dispatchEvent(new Event('visibilitychange'))
+            await Promise.resolve()
+            expect(mocks.bridge.setExecutionSession).toHaveBeenCalledTimes(1)
+            expect(mocks.bridge.startJob).not.toHaveBeenCalled()
+            finish()
+            await expect(result).resolves.toMatchObject({ kind: 'complete' })
+            expect(mocks.bridge.startJob).toHaveBeenCalledWith(expect.objectContaining({ session: 'foreground' }))
+            await vi.waitFor(() => expect(mocks.bridge.setExecutionSession.mock.lastCall?.[0].kind).toBe('hidden'))
+        } finally { visible.mockRestore() }
+    })
+
+    it('keeps the same protected execution session through Home and foreground return', async () => {
+        let visibility: DocumentVisibilityState = 'visible'
+        const visible = vi.spyOn(document, 'visibilityState', 'get').mockImplementation(() => visibility)
+        try {
+            const { installExternalStorageProduction } = await import('./production')
+            await installExternalStorageProduction()
+            const session = mocks.bridge.setExecutionSession.mock.calls[0][0]
+            mocks.protected = true
+            visibility = 'hidden'
+            document.dispatchEvent(new Event('visibilitychange'))
+            await Promise.resolve()
+            await Promise.resolve()
+            expect(mocks.bridge.setExecutionSession).toHaveBeenCalledExactlyOnceWith(session)
+            expect(mocks.bridge.cancelJob).not.toHaveBeenCalled()
+            visibility = 'visible'
+            document.dispatchEvent(new Event('visibilitychange'))
+            await vi.waitFor(() => expect(mocks.bridge.getState).toHaveBeenCalledTimes(2))
+            expect(mocks.bridge.setExecutionSession).toHaveBeenCalledExactlyOnceWith(session)
+            visibility = 'hidden'
+            document.dispatchEvent(new Event('visibilitychange'))
+            await Promise.resolve()
+            mocks.protected = false
+            mocks.backgroundChanged?.()
+            await vi.waitFor(() => expect(mocks.bridge.setExecutionSession).toHaveBeenCalledTimes(2))
+            expect(mocks.bridge.setExecutionSession.mock.lastCall?.[0].kind).toBe('hidden')
+        } finally { visible.mockRestore() }
     })
 
     it('serializes hidden invalidation before a new foreground inspection', async () => {
