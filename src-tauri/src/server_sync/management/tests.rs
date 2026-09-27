@@ -194,6 +194,30 @@ fn cache_cleanup_keeps_referenced_objects_metadata_and_local_cas() {
 }
 
 #[test]
+fn cache_usage_counts_files_beside_the_caches_without_opening_them_as_caches() {
+    let root = tempfile::tempdir().unwrap();
+    let server = root.path().join("server-sync");
+    let identity = "a".repeat(64);
+    let cache = super::super::cache::Cache::open(&server.join(&identity)).unwrap();
+    cache
+        .put(&vec![7; super::super::cache::SMALL_OBJECT_BYTES + 1])
+        .unwrap();
+    drop(cache);
+    let usage = || cache_usage(root.path(), Some(&identity), &BTreeSet::new(), None, false);
+    let without = usage().unwrap();
+    // The asset residency ledger is a file beside the per-connection caches.
+    let ledger = server.join("asset-residency.sqlite");
+    fs::write(&ledger, b"ledger").unwrap();
+    let with = usage().unwrap();
+    assert_eq!(with.total_bytes, without.total_bytes + 6);
+    assert_eq!(with.protected_bytes, without.protected_bytes + 6);
+    assert_eq!(with.reclaimable_bytes, without.reclaimable_bytes);
+    assert_eq!(with.database_bytes, without.database_bytes);
+    cache_usage(root.path(), Some(&identity), &BTreeSet::new(), None, true).unwrap();
+    assert_eq!(fs::read(&ledger).unwrap(), b"ledger");
+}
+
+#[test]
 fn linked_backup_and_cache_paths_are_rejected_without_following_them() {
     let root = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();

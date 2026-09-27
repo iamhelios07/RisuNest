@@ -299,6 +299,14 @@ pub(crate) fn cache_usage(
             continue;
         }
         let cache = entry.path();
+        let metadata = checked_metadata(&cache)?;
+        if metadata.is_file() {
+            // A file beside the per-connection caches, such as the asset
+            // residency ledger, is kept and has no object database.
+            usage.total_bytes += metadata.len();
+            usage.protected_bytes += metadata.len();
+            continue;
+        }
         visit_files(&cache, &mut |file, bytes| {
             if is_object_database(&cache, file) {
                 // An allocation, counted once below, whose contents are
