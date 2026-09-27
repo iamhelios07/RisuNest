@@ -1121,6 +1121,11 @@ impl PersistentStore {
         let mut any_plugin = false;
         let mut local_plugin_change = false;
         let mut required_groups = options.groups.clone();
+        let independent_library =
+            status.head.is_none() && observed.seq != 0.into() && revision > 0;
+        // A library holding only what a new install creates is replaced by the
+        // server's without asking, so there is nothing to compare or back up.
+        let receive_library = independent_library && self.library_holds_only_defaults()?;
         loop {
             let page = cycle_page(&self.connection, &after)?;
             if page.is_empty() {
@@ -1144,12 +1149,13 @@ impl PersistentStore {
                 if forced_group && local != remote {
                     decision = Decision::Conflict;
                 }
-                let independent_library =
-                    status.head.is_none() && observed.seq != 0.into() && revision > 0;
                 if (status.reconciling || independent_library)
                     && matches!(decision, Decision::AcceptRemote | Decision::PublishLocal)
                 {
                     decision = Decision::Conflict;
+                }
+                if receive_library && decision == Decision::Conflict {
+                    decision = Decision::AcceptRemote;
                 }
                 if matches!(decision, Decision::PublishLocal | Decision::Conflict) {
                     for parent in relations(&key)? {
@@ -1267,7 +1273,7 @@ impl PersistentStore {
                 for row in stmt.query_map(params![revision, clear_after], |r| {
                     r.get::<_, Option<String>>(0)
                 })? {
-                    if planner::clear_conflicts(row?.as_deref(), &scope.version) {
+                    if planner::clear_conflicts(row?.as_deref(), &scope.version) && !receive_library {
                         required_groups.insert("plugin".into());
                         conflict_count += 1;
                         if conflicts.len() < 100 {
@@ -1275,7 +1281,7 @@ impl PersistentStore {
                         }
                     }
                 }
-                if !matches!(options.resolution, Some(Resolution::KeepRemote)) {
+                if !receive_library && !matches!(options.resolution, Some(Resolution::KeepRemote)) {
                     scope_fences.push(ScopeFence {
                         scope: scope.scope.clone(),
                         expected_version: scope.version.clone(),
@@ -2238,6 +2244,20 @@ impl PersistentStore {
             tx.commit()?;
         }
         Ok(full_scan || full_marker)
+    }
+    fn library_holds_only_defaults(&self) -> Result<bool> {
+        let generation = super::active_generation(&self.connection)?;
+        let held: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM characters WHERE generation=?1)
+                OR EXISTS(SELECT 1 FROM conversations WHERE generation=?1)
+                OR EXISTS(SELECT 1 FROM messages WHERE generation=?1)
+                OR EXISTS(SELECT 1 FROM asset_aliases WHERE generation=?1)
+                OR EXISTS(SELECT 1 FROM plugin_storage WHERE generation=?1)
+                OR (SELECT count(*) FROM bot_presets WHERE generation=?1) > 1",
+            [&generation],
+            |r| r.get(0),
+        )?;
+        Ok(!held)
     }
     fn server_order_conflicts(
         &self,

@@ -102,6 +102,31 @@ fn empty_replicas_seed_and_receive_while_independent_libraries_require_compariso
     assert_eq!(server.head().unwrap(), seeded_head);
     initialized.asset_residency_set_policy(crate::server_sync::residency::AssetPolicy::Remote, || Ok(())).unwrap();
 
+    // A new install holds its defaults and one preset of its own; the server's
+    // library replaces them without a comparison or a backup.
+    let fresh_dir = tempfile::tempdir().unwrap();
+    let mut fresh = PersistentStore::open(fresh_dir.path()).unwrap();
+    let mut fresh_root = source.read_root(None).unwrap().value;
+    fresh_root["username"] = json!("synthetic new install");
+    let mut own_preset = fixture()["botPresets"][0].clone();
+    own_preset["name"] = json!("Synthetic default preset");
+    let staging = fresh.replace_begin().unwrap();
+    fresh.replace_put_root(&staging.staging_id, &fresh_root).unwrap();
+    fresh.replace_put_presets(&staging.staging_id, &[own_preset]).unwrap();
+    fresh.replace_commit(&staging.staging_id, Some(0)).unwrap();
+    assert!(fresh.revision().unwrap() > 0);
+    bind(&mut fresh);
+    fresh.asset_residency_set_policy(crate::server_sync::residency::AssetPolicy::Remote, || Ok(())).unwrap();
+    assert_eq!(settle(&mut fresh).phase, "idle");
+    assert_eq!(server.head().unwrap(), seeded_head);
+    assert_eq!(fresh.server_status().unwrap().head, Some(seeded_head.clone()));
+    assert_eq!(fresh.read_root(None).unwrap().value, source.read_root(None).unwrap().value);
+    let materialized = fresh.materialize(None).unwrap();
+    assert_eq!(materialized["botPresets"], source.materialize(None).unwrap()["botPresets"]);
+    assert_eq!(materialized["characters"], expected);
+    let backups = fresh_dir.path().join("server-sync/backups");
+    assert!(!backups.exists() || std::fs::read_dir(&backups).unwrap().next().is_none());
+
     let (_independent_dir, mut independent) = prepared();
     let mut root = independent.read_root(None).unwrap().value;
     root["username"] = json!("synthetic independent library");
