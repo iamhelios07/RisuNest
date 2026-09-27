@@ -33,12 +33,15 @@ impl SyncError {
         }
     }
 }
-/// Transport failures, client-side waits, server load and ordering outcomes are
-/// worth another attempt. Every validation reply and local invariant failure is
-/// not, including a reply this client rejected as invalid.
+/// Transport failures, client-side waits, server load, another library
+/// operation that has not finished yet and ordering outcomes are worth another
+/// attempt. Every validation reply and local invariant failure is not,
+/// including a reply this client rejected as invalid.
 fn retryable(code: &str, status: u16) -> bool {
     match code {
         "cancelled"
+        | "library-operation-busy"
+        | "server-sync-busy"
         | "stale-head"
         | "operation-already-pending"
         | "local-revision-changed"
@@ -104,6 +107,8 @@ mod classification_tests {
             ("directory-unreachable", 503),
             ("sync-retry-budget-exhausted", 503),
             ("cancelled", 409),
+            ("library-operation-busy", 409),
+            ("server-sync-busy", 409),
             ("device-busy", 429),
             ("server-busy", 429),
             ("server-updating", 503),
