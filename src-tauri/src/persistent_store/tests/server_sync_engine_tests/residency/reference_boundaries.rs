@@ -42,11 +42,18 @@ fn checkpoint_pages_keep_the_original_head_when_a_later_commit_changes_unread_re
     trace.armed.store(true, Ordering::SeqCst);
     let read = references::RemoteRead::begin(&client, &expected).unwrap();
     let mut visited = Vec::new();
-    read.visit_pages(|page| {
+    read.visit_pages(|page, total| {
+        assert_eq!(total, keys.len() as u64);
         if visited.is_empty() {
             commit_records(&fixture.server, &device, 2, vec![RecordChange {
                 domain: Domain::Library, key: keys.last().unwrap().clone(), before: before.clone(),
                 after: RecordVersion::Tombstone { deletion_id: "later-deletion".into() },
+            }, RecordChange {
+                domain: Domain::Library,
+                key: crate::logical_records::encode_logical_record_key(&crate::logical_records::LogicalRecordLocator::Asset {
+                    logical_key: "assets/created-after-checkpoint.png".into(),
+                }).unwrap(),
+                before: RecordVersion::Absent, after: before.clone(),
             }]);
         }
         assert!(!page.is_empty() && page.len() <= references::PAGE);
@@ -65,6 +72,40 @@ fn checkpoint_pages_keep_the_original_head_when_a_later_commit_changes_unread_re
         && request.query.as_ref().unwrap().split('&').any(|part| part == "limit=256")));
     assert_eq!(requests.iter().filter(|request| request.method == "POST" && request.path == "/checkpoints").count(), 1);
     drop(requests);
+    trace.armed.store(false, Ordering::SeqCst);
+    read.release().unwrap();
+}
+
+#[test]
+fn checkpoint_totals_reject_missing_or_inconsistent_counts_before_visiting_records() {
+    let (fixture, trace) = measured_fixture();
+    let (_root, mut local) = prepared();
+    fixture.bind(&mut local);
+    let config = local.server_config().unwrap().unwrap();
+    let device = fixture.server.authenticate(&config.library_id, &config.token).unwrap();
+    let key = crate::logical_records::encode_logical_record_key(&crate::logical_records::LogicalRecordLocator::Asset {
+        logical_key: "assets/counted.png".into(),
+    }).unwrap();
+    let head = commit_records(&fixture.server, &device, 1, vec![RecordChange {
+        domain: Domain::Library, key, before: RecordVersion::Absent,
+        after: RecordVersion::Tombstone { deletion_id: "counted-deletion".into() },
+    }]);
+    let client = ServerClient::new(config).unwrap();
+    let read = references::RemoteRead::begin(&client, &head).unwrap();
+    trace.armed.store(true, Ordering::SeqCst);
+    for total in [Value::Null, json!("0"), json!("2"), json!("18446744073709551616")] {
+        *trace.checkpoint_total_override.lock().unwrap() = Some(total);
+        let error = read.visit_pages(|_, _| panic!("an inconsistent count must fail before record processing")).unwrap_err();
+        assert_eq!(error.code, "invalid-checkpoint-count");
+    }
+    *trace.checkpoint_total_override.lock().unwrap() = None;
+    let mut visited = 0;
+    read.visit_pages(|page, total| {
+        assert_eq!(total, 1);
+        visited += page.len();
+        Ok(())
+    }).unwrap();
+    assert_eq!(visited, 1);
     trace.armed.store(false, Ordering::SeqCst);
     read.release().unwrap();
 }

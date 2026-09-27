@@ -192,6 +192,14 @@ describe("status and error copy", () => {
 });
 
 describe("progress view", () => {
+  it("shows the checkpoint total for backup metadata before the next batch finishes", () => {
+    const view = serverSyncProgressView({ ...bound(), running: true, progress: "preparing",
+      cycleItems: { done: 0, total: 230, activity: "downloadingBackupMetadata", processed: 256, expected: 267 } }, text, 0);
+    expect(view.current).toBe(`${text.activity.downloadingBackupMetadata} · 256 / 267`);
+    expect(view.percent).toBe(96);
+    expect(view.counters.find((counter) => counter.key === "items")?.value).toBe("256 / 267");
+    expect(view.stages.find((stage) => stage.state === "active")?.stage).toBe("downloading");
+  });
   it.each(["downloadingMetadata", "downloadingBackupMetadata", "downloading", "syncingSections"] as const)("shows %s counts independently of upload work", (activity) => {
     const view = serverSyncProgressView({ ...bound(), running: true, progress: "preparing",
       cycleItems: { done: 0, total: 200, activity, processed: 25, expected: 100 } }, text, 0);

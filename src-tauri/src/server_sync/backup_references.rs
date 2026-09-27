@@ -796,7 +796,10 @@ pub(crate) fn visit_roots(root: &Path, mut visit: impl FnMut(Object) -> Result<(
 struct Checkpoint { checkpoint_id: String, head: RemoteHead, domains: Vec<Domain> }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct CheckpointPage { checkpoint: Checkpoint, records: Vec<RemoteRecord>, next: Option<Cursor> }
+struct CheckpointPage {
+    checkpoint: Checkpoint, records: Vec<RemoteRecord>, next: Option<Cursor>,
+    total_records: Option<risunest_sync_wire::Sequence>,
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Cursor { domain: Domain, key: String }
@@ -838,8 +841,10 @@ impl<'a> RemoteRead<'a> {
             Err(error) => Err(error),
         }
     }
-    pub(crate) fn visit_pages(&self, mut visit: impl FnMut(Vec<RemoteRecord>) -> Result<()>) -> Result<()> {
+    pub(crate) fn visit_pages(&self, mut visit: impl FnMut(Vec<RemoteRecord>, u64) -> Result<()>) -> Result<()> {
         let mut after: Option<Cursor> = None;
+        let mut total = None;
+        let mut visited = 0u64;
         loop {
             let mut query = vec![("limit", PAGE.to_string())];
             if let Some(cursor) = &after {
@@ -865,8 +870,21 @@ impl<'a> RemoteRead<'a> {
                 || page.records.last().map(|record| record.key.as_str()) != Some(next.key.as_str())) {
                 return Err(SyncError::new("invalid-checkpoint-cursor", 502));
             }
+            if after.is_none() {
+                total = Some(page.total_records.ok_or_else(|| SyncError::new("invalid-checkpoint-count", 502))?
+                    .as_str().parse::<u64>().map_err(|_| SyncError::new("invalid-checkpoint-count", 502))?);
+            } else if page.total_records.is_some() {
+                return Err(SyncError::new("invalid-checkpoint-count", 502));
+            }
+            let total = total.unwrap();
+            visited = visited.checked_add(page.records.len() as u64)
+                .ok_or_else(|| SyncError::new("invalid-checkpoint-count", 502))?;
+            if visited > total || (page.next.is_none() && visited != total)
+                || (page.next.is_some() && visited >= total) {
+                return Err(SyncError::new("invalid-checkpoint-count", 502));
+            }
             self.client.ensure_active()?;
-            visit(page.records)?;
+            visit(page.records, total)?;
             after = page.next;
             if after.is_none() { return Ok(()); }
         }

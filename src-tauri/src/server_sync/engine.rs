@@ -2494,7 +2494,10 @@ impl PersistentStore {
             }
             if !capture.side_complete(Side::Remote)? {
                 CycleItemCounter::start(counter, 10, 0);
-                remote.as_ref().unwrap().visit_pages(|page| {
+                remote.as_ref().unwrap().visit_pages(|page, total| {
+                    if let Some(counter) = counter {
+                        counter.expected.store(total, std::sync::atomic::Ordering::Relaxed);
+                    }
                     let versions = page.iter().filter(|record| matches!(record.version, RecordVersion::Live { .. }))
                         .map(|record| (record.version.clone(), Vec::new())).collect::<Vec<_>>();
                     transfer.prefetch_record_metadata(&versions)?;

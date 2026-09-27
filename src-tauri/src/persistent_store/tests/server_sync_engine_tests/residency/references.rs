@@ -28,6 +28,7 @@ struct Trace {
     fail_retention_page: AtomicU64,
     metadata_pages: AtomicU64,
     fail_metadata_page: AtomicU64,
+    checkpoint_total_override: Mutex<Option<Value>>,
     fail_release_once: AtomicBool,
     expire_checkpoint: AtomicBool,
     released_before_marker: AtomicBool,
@@ -95,6 +96,17 @@ async fn observe(
         }
     }
     let response = next.run(axum::extract::Request::from_parts(parts, Body::from(bytes))).await;
+    let total_override = trace.checkpoint_total_override.lock().unwrap().clone();
+    if armed && method == "GET" && path.starts_with("/checkpoints/") && response.status().is_success() {
+        if let Some(total) = total_override {
+            let (mut parts, body) = response.into_parts();
+            let bytes = to_bytes(body, 1024 * 1024).await.unwrap();
+            let mut page: Value = serde_json::from_slice(&bytes).unwrap();
+            page["totalRecords"] = total;
+            parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+            return axum::response::Response::from_parts(parts, Body::from(serde_json::to_vec(&page).unwrap()));
+        }
+    }
     if armed && method == "POST" && path == "/objects/retention"
         && trace.corrupt_retention.load(Ordering::SeqCst) && response.status().is_success() {
         let (mut parts, body) = response.into_parts();
@@ -230,9 +242,13 @@ fn reference_capture_batches_metadata_across_checkpoint_pages_without_asset_down
         trace.armed.store(true, Ordering::SeqCst);
         let revision = local.revision().unwrap();
         let head = fixture.server.head().unwrap();
+        let counter = crate::persistent_store::server_sync_engine::CycleItemCounter::default();
         if fail_second_page {
-            let error = local.server_conflict_references(&cache, &transfer, &client, revision, &head, None).unwrap_err();
+            let error = local.server_conflict_references(&cache, &transfer, &client, revision, &head, Some(&counter)).unwrap_err();
             assert_eq!(error.code, "synthetic-transfer-failure");
+            assert_eq!(counter.activity.load(Ordering::Relaxed), 10);
+            assert_eq!(counter.processed.load(Ordering::Relaxed), references::PAGE as u64);
+            assert_eq!(counter.expected.load(Ordering::Relaxed), references::PAGE as u64 + 11);
             let directory = fs::read_dir(root.path().join("server-sync/backups")).unwrap().next().unwrap().unwrap().path();
             assert!(!directory.join("complete.json").exists());
             let index = rusqlite::Connection::open(directory.join("index.sqlite")).unwrap();
