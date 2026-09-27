@@ -863,6 +863,9 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   private fun onFrontendReady() {
     val webView = lifecycleWebView ?: return
     if (!frontendReady.markReady()) return
+    // Asked at startup so sync and backups started later, onboarding included,
+    // keep their progress notification while the app is in the background.
+    requestPostNotificationsForForegroundService()
     if (BuildConfig.ENABLE_EXPERIMENTAL_SAF_FILE_JOBS) {
       replayReadySpools(webView)
       replaySafDestinationResult(webView)
