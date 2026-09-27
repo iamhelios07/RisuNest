@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import type { ServerSyncSnapshot } from 'src/ts/storage/sync/serverSyncController'
-import { serverSyncOnboardingOutcome } from './serverSyncOnboardingFlow'
+import { serverSyncOnboardingOutcome, serverSyncOnboardingResume } from './serverSyncOnboardingFlow'
 
 const head = {
     libraryId: 'library',
@@ -87,5 +87,29 @@ describe('sync server onboarding outcome', () => {
         expect(
             serverSyncOnboardingOutcome({ ...finished('pending'), error: 'server-unreachable' }),
         ).toBe('error')
+    })
+})
+
+describe('sync server onboarding on a connected device', () => {
+    it('continues the connection instead of asking for a code again', () => {
+        expect(serverSyncOnboardingResume({ ...finished('pending'), running: true })).toBe('show')
+        // A held library waits for the settings to continue it.
+        expect(serverSyncOnboardingResume({ ...finished('pending'), paused: true })).toBe('show')
+        expect(serverSyncOnboardingResume({ ...finished('pending'), result: undefined })).toBe('retry')
+        expect(
+            serverSyncOnboardingResume({ ...finished('idle'), error: 'library-operation-busy' }),
+        ).toBe('retry')
+    })
+
+    it('asks for a code while the device is not connected', () => {
+        expect(serverSyncOnboardingResume(undefined)).toBeUndefined()
+        expect(serverSyncOnboardingResume({ running: false, paused: false, error: '' })).toBeUndefined()
+        const disconnected = finished('idle')
+        expect(
+            serverSyncOnboardingResume({
+                ...disconnected,
+                status: { ...disconnected.status!, configured: false },
+            }),
+        ).toBeUndefined()
     })
 })

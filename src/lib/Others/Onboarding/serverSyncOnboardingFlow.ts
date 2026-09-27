@@ -34,3 +34,16 @@ export function serverSyncOnboardingOutcome(
     if (!snapshot.error && snapshot.result?.phase === 'pending') return 'pending'
     return 'error'
 }
+
+/**
+ * What the screen does when it opens on a device that is already connected,
+ * where a registration code would be refused: draw the attempt that is
+ * running or paused, or start another one. Nothing for a device that is not
+ * connected.
+ */
+export function serverSyncOnboardingResume(
+    snapshot: ServerSyncSnapshot | undefined,
+): 'show' | 'retry' | undefined {
+    if (!snapshot?.status?.configured) return undefined
+    return snapshot.running || snapshot.paused ? 'show' : 'retry'
+}
