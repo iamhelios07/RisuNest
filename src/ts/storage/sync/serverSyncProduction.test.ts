@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const state = vi.hoisted(() => ({
   native: true,
+  desktop: false,
   ready: true,
   running: false,
   restoredSource: undefined as unknown,
@@ -62,6 +63,9 @@ vi.mock("../../platform", () => ({
   get isTauri() {
     return state.native;
   },
+  get isTauriDesktop() {
+    return state.native && state.desktop;
+  },
 }));
 vi.mock("../persistentDataRuntime.svelte", () => ({
   flushPendingData: vi.fn(),
@@ -102,6 +106,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   vi.useFakeTimers();
   state.native = true;
+  state.desktop = false;
   state.available = undefined;
   state.revisionListener = undefined;
   state.nativeListeners.clear();
@@ -283,6 +288,7 @@ describe("native server synchronization scheduling", () => {
     visibility.mockReturnValue("hidden");
     listeners.get("visibilitychange")!(new Event("visibilitychange"));
     expect(state.scheduler.suspend).toHaveBeenCalledTimes(1);
+    expect(state.scheduler.suspend).toHaveBeenLastCalledWith(false);
     expect(state.available!()).toBe(false);
     visibility.mockReturnValue("visible");
     listeners.get("visibilitychange")!(new Event("visibilitychange"));
@@ -290,6 +296,8 @@ describe("native server synchronization scheduling", () => {
     listeners.get("offline")!(new Event("offline"));
     expect(state.available!()).toBe(false);
     expect(state.scheduler.suspend).toHaveBeenCalledTimes(2);
+    // Losing the network stops new attempts; the one in flight retries itself.
+    expect(state.scheduler.suspend).toHaveBeenLastCalledWith(true);
     online.mockReturnValue(true);
     listeners.get("online")!(new Event("online"));
     expect(state.scheduler.resume).toHaveBeenCalledTimes(3);
@@ -368,6 +376,24 @@ describe("native server synchronization scheduling", () => {
     state.controllerListener!({ status: { configured: true }, connecting: false });
     expect(state.invoke).not.toHaveBeenCalledWith("server_sync_backup_cleanup");
     expect(state.invoke).toHaveBeenCalledWith("server_sync_events_start");
+  });
+  it("keeps a hidden desktop window's attempt running", async () => {
+    state.desktop = true;
+    const listeners = new Map<string, (event: Event) => void>();
+    vi.spyOn(document, "addEventListener").mockImplementation(
+      (type, listener) =>
+        void listeners.set(type, listener as (event: Event) => void),
+    );
+    const visibility = vi
+      .spyOn(document, "visibilityState", "get")
+      .mockReturnValue("visible");
+    const { startServerSync } = await import("./serverSyncProduction");
+    startServerSync();
+    await Promise.resolve();
+    visibility.mockReturnValue("hidden");
+    listeners.get("visibilitychange")!(new Event("visibilitychange"));
+    expect(state.scheduler.suspend).toHaveBeenCalledWith(true);
+    expect(state.invoke).toHaveBeenCalledWith("server_sync_events_stop");
   });
   it("does not install a native scheduler in the browser build", async () => {
     state.native = false;

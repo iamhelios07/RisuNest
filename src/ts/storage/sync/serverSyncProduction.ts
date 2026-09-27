@@ -1,5 +1,5 @@
 import { hasMobileBackgroundTasks, subscribeMobileBackgroundTasks } from "../../mobileBackgroundTask";
-import { isTauri } from "../../platform";
+import { isTauri, isTauriDesktop } from "../../platform";
 import { invalidatePluginDeviceKeyspaces } from "../../plugins/pluginDeviceKeyspace";
 import { subscribeLibraryFileOperationReleased } from "../libraryFileOperation";
 import { invoke } from "@tauri-apps/api/core";
@@ -253,13 +253,16 @@ export function startServerSync(): void {
     configured = bound;
   });
   void controller.initialize().then(() => resumeServerSyncAfterBackup());
+  // A desktop window keeps running while hidden, and an attempt that loses
+  // the network retries on its own, so neither stops the attempt in flight.
+  const keepActive = () => isTauriDesktop || hasMobileBackgroundTasks();
   window.addEventListener("online", () => resumeServerSyncAfterBackup());
-  window.addEventListener("offline", () => suspendServerSync(scheduler));
+  window.addEventListener("offline", () => suspendServerSync(scheduler, true));
   subscribeMobileBackgroundTasks(() => {
-    if (document.visibilityState === "hidden" && !hasMobileBackgroundTasks()) suspendServerSync(scheduler);
+    if (document.visibilityState === "hidden" && !keepActive()) suspendServerSync(scheduler);
   });
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "hidden") suspendServerSync(scheduler, hasMobileBackgroundTasks());
+    if (document.visibilityState === "hidden") suspendServerSync(scheduler, keepActive());
     else resumeServerSyncAfterBackup();
   });
 }
