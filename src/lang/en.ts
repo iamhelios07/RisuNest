@@ -2304,6 +2304,11 @@ export const languageEnglish = {
             profileLowSpec: 'Low-spec',
             profileHelp:
                 'Low-spec uses less memory, but scrolling long chats may be slightly slower.',
+            overflowScope: 'Chat message render isolation',
+            overflowScopeLatest: 'Latest message',
+            overflowScopeAll: 'All',
+            overflowScopeHelp:
+                'Choose whether UI elements that extend beyond a chat message (setting buttons, overlays, and so on) render only on the latest message or on every message. Choose All if a character you use does not display correctly. All may make scrolling long chats slightly slower.',
         },
         inlay: {
             animationPreserved: 'Animation conversion was skipped. The original was saved.',

@@ -2404,4 +2404,8 @@
         </button>
     </div>
 {/if}
-<div class="flex flex-col-reverse" bind:this={chatBody}></div>
+<div
+    class="flex flex-col-reverse"
+    class:chat-history-isolated={(DBState.db.chatMessageOverflowScope ?? 'latest') !== 'all'}
+    bind:this={chatBody}
+></div>

@@ -2117,6 +2117,11 @@ export const languageKorean = {
             profileLowSpec: '저사양',
             profileHelp:
                 '저사양은 메모리 사용량을 줄이는 대신 긴 대화에서 스크롤이 조금 느려질 수 있습니다.',
+            overflowScope: '채팅 메시지 렌더링 격리',
+            overflowScopeLatest: '최신 메시지',
+            overflowScopeAll: '전체',
+            overflowScopeHelp:
+                '채팅 메시지 영역을 벗어나는 UI 요소(설정 버튼, 오버레이 등)의 렌더링을 최신 메시지 1개에만 허용할지, 전체 메시지에서 허용할지 선택할 수 있습니다. 사용하는 캐릭터와 호환되지 않는 경우 전체를 선택해주세요. 전체는 긴 대화에서 스크롤이 조금 느려질 수 있습니다.',
         },
         inlay: {
             animationPreserved: '애니메이션 변환을 건너뛰고 원본으로 저장했습니다.',
