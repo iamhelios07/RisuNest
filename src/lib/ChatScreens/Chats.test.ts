@@ -1723,6 +1723,79 @@ describe('Chats imperative mount lifecycle', () => {
         )?.dataset.bookmarked).toBe('true')
     })
 
+    test('defers a character image remount until the source row editor closes', async () => {
+        const messages = Array.from({ length: 8 }, (_, index) => makeMessage(index))
+        const currentCharacter = makeCharacter(messages)
+        const { session, source } = makeViewportSource(currentCharacter)
+        const resolver: LiveChatParserProjectionResolver = {
+            resolve: vi.fn(async ({ row }) => boundedProjection(currentCharacter, row.absoluteIndex)),
+        }
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialMessages: messages,
+                initialCharacter: currentCharacter,
+                initialViewportSource: source,
+                parserProjectionResolver: resolver,
+            },
+        })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(8))
+        const editorRow = probeElements(target).find(
+            (element) => element.dataset.message === 'message-6',
+        )!
+        const editorInstance = Number(editorRow.dataset.chatProbe)
+        const editor = document.createElement('textarea')
+        editor.value = 'image draft'
+        editorRow.append(editor)
+        chatMountProbe.activeEditors.add(editorInstance)
+
+        ;(mounted as HarnessInstance).setImage('replacement.png')
+
+        // The retained editor receives the replacement parser lease instead of a remount.
+        await vi.waitFor(() => expect(chatMountProbe.displayUpdates.some((update) =>
+            update.instanceId === editorInstance && update.signal?.aborted === false,
+        )).toBe(true))
+        expect(probeIdForMessage(target, 'message-6')).toBe(editorInstance)
+        expect(chatMountProbe.unmounts).not.toContain(editorInstance)
+        expect(editor.isConnected).toBe(true)
+        expect(editor.value).toBe('image draft')
+
+        chatMountProbe.activeEditors.delete(editorInstance)
+        session.edit(session.locate(6), { ...messages[6], data: 'image draft' })
+
+        await vi.waitFor(() => expect(probeIdForMessage(target, 'image draft')).not.toBe(editorInstance))
+        expect(chatMountProbe.unmounts).toContain(editorInstance)
+        expect(probeElements(target).find(
+            (element) => element.dataset.message === 'image draft',
+        )?.dataset.image).toBe('normal:replacement.png')
+    })
+
+    test('defers a parser dependency remount until the row editor closes', async () => {
+        const messages = Array.from({ length: 8 }, (_, index) => makeMessage(index, { role: 'char' }))
+        mounted = mount(ChatsHarness, {
+            target,
+            props: { initialMessages: messages, initialCharacter: makeCharacter(messages) },
+        })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(8))
+        const editorInstance = probeIdForMessage(target, 'message-0')
+        const neighborInstance = probeIdForMessage(target, 'message-1')
+        chatMountProbe.activeEditors.add(editorInstance)
+
+        ;(mounted as HarnessInstance).replaceParserDependencies()
+        await tick()
+
+        await vi.waitFor(() => expect(probeIdForMessage(target, 'message-1')).not.toBe(neighborInstance))
+        expect(probeIdForMessage(target, 'message-0')).toBe(editorInstance)
+        expect(chatMountProbe.unmounts).not.toContain(editorInstance)
+
+        chatMountProbe.activeEditors.delete(editorInstance)
+        ;(mounted as HarnessInstance).updateMessage(0, 'saved draft')
+        await tick()
+
+        await vi.waitFor(() => expect(probeIdForMessage(target, 'saved draft')).not.toBe(editorInstance))
+        expect(chatMountProbe.unmounts).toContain(editorInstance)
+    })
+
     test('keeps the source-key wrapper when an insertion shifts its absolute index', async () => {
         const messages = Array.from({ length: 100 }, (_, index) => makeMessage(index))
         const currentCharacter = makeCharacter(messages)

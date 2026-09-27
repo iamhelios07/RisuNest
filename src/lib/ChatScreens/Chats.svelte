@@ -1011,12 +1011,21 @@
                 ) &&
                 typeof mountInstances.get(key)?.refreshMessageDisplay === 'function'
 
-            const preserveMountedRuntime =
-                (sourceHandoff || parserProjectionState?.preserveMountedRuntime === true) &&
+            // An open editor holds an unsaved draft, so any remount waits until it
+            // closes. A shifted row still remounts so its actions keep the right index.
+            const deferRemountForEditor =
+                requiresRemount &&
+                !refreshMountedDisplay &&
+                previousSignature?.index === index &&
                 mountInstances.has(key) &&
-                (activeStreamingMessage ||
-                    hasFocusedEditor(key) ||
-                    pinReasons.get(key)?.has('playing-media') === true)
+                hasActiveEditor(key)
+            const preserveMountedRuntime =
+                deferRemountForEditor ||
+                ((sourceHandoff || parserProjectionState?.preserveMountedRuntime === true) &&
+                    mountInstances.has(key) &&
+                    (activeStreamingMessage ||
+                        hasFocusedEditor(key) ||
+                        pinReasons.get(key)?.has('playing-media') === true))
             if (requiresRemount && !preserveMountedRuntime) {
                 const source = activeViewportSource
                 const sourceToken = sourceSnapshot?.sourceToken
@@ -1197,6 +1206,19 @@
                         }),
                     )
                     renderSignatures.set(key, renderSignature)
+                    parserProjectionState.needsRemount = false
+                }
+                if (deferRemountForEditor && parserProjectionState?.needsRemount) {
+                    // The replacement projection aborted the retained lease. Keep the
+                    // previous signature so the row still remounts after the editor closes.
+                    untrack(() =>
+                        instance?.refreshMessageDisplay?.({
+                            message: message.data,
+                            totalMessages,
+                            parserProjection,
+                            parserAbortSignal: parserProjectionState.controller.signal,
+                        }),
+                    )
                     parserProjectionState.needsRemount = false
                 }
             }
