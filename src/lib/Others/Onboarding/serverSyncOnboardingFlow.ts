@@ -20,10 +20,9 @@ export type ServerSyncOnboardingOutcome =
     | 'error'
 
 /**
- * Reads the attempt that the reader started from this screen. `complete`
- * leads to the last onboarding screen; `paused` does too, because the reader
- * stopped it and the settings can continue it. `pending` is a server job
- * that has not finished yet and can simply be retried.
+ * Reads the attempt that the reader started from this screen. `paused` is a
+ * stop the reader asked for, not a failure. `pending` is a server job that
+ * has not finished yet and can simply be retried.
  */
 export function serverSyncOnboardingOutcome(
     snapshot: ServerSyncSnapshot,
@@ -34,6 +33,18 @@ export function serverSyncOnboardingOutcome(
     if (snapshot.paused) return 'paused'
     if (!snapshot.error && snapshot.result?.phase === 'pending') return 'pending'
     return 'error'
+}
+
+/**
+ * Only a completed attempt leads to the last onboarding screen. A paused one
+ * stays on the sync screen, where the reader continues it or starts the app
+ * and continues it from the settings; the pause lasts across restarts until
+ * then.
+ */
+export function serverSyncOnboardingNext(
+    outcome: ServerSyncOnboardingOutcome | undefined,
+): 'done' | undefined {
+    return outcome === 'complete' ? 'done' : undefined
 }
 
 /**

@@ -2818,6 +2818,10 @@ export const languageEnglish = {
                 serverTag: 'Sync server',
                 syncingLead: 'Do not close the app until it finishes.',
                 pauseNote: 'If you stop, you can continue syncing later from the settings.',
+                pausedSummary: 'Sync is paused.',
+                pausedReason:
+                    'You can continue now, or start RisuNest and continue syncing later from the settings.',
+                resume: 'Continue',
                 errorSummary: 'Sync could not finish.',
                 errorReason:
                     'The data on this device is unchanged. Check your internet connection and try again.',

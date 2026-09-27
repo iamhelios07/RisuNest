@@ -2630,6 +2630,10 @@ export const languageKorean = {
                 serverTag: '동기화 서버',
                 syncingLead: '끝날 때까지 앱을 닫지 말아주세요.',
                 pauseNote: '멈춰도 나중에 설정에서 이어서 동기화할 수 있습니다.',
+                pausedSummary: '동기화를 일시 중지했습니다.',
+                pausedReason:
+                    '지금 이어서 할 수 있으며, RisuNest를 시작한 뒤 설정에서 이어서 동기화할 수도 있습니다.',
+                resume: '이어서 하기',
                 errorSummary: '동기화를 마치지 못했습니다.',
                 errorReason:
                     '이 기기의 데이터는 그대로입니다. 인터넷 연결을 확인하고 다시 시도해주세요.',

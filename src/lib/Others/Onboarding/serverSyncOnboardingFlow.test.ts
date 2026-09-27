@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import type { ServerSyncSnapshot } from 'src/ts/storage/sync/serverSyncController'
 import {
+    serverSyncOnboardingNext,
     serverSyncOnboardingOpening,
     serverSyncOnboardingOutcome,
     serverSyncOnboardingResume,
@@ -75,7 +76,7 @@ describe('sync server onboarding outcome', () => {
         expect(serverSyncOnboardingOutcome(finished('conflict'))).toBe('conflict')
     })
 
-    it('treats a stop the reader asked for as done, not as a failure', () => {
+    it('treats a stop the reader asked for as paused, not as a failure', () => {
         expect(
             serverSyncOnboardingOutcome({
                 ...finished('idle'),
@@ -84,6 +85,13 @@ describe('sync server onboarding outcome', () => {
                 initialSyncComplete: false,
             }),
         ).toBe('paused')
+    })
+
+    it('leaves the sync screen only for a completed attempt', () => {
+        expect(serverSyncOnboardingNext('complete')).toBe('done')
+        // A paused attempt stays on the screen so it can be continued there.
+        for (const outcome of ['syncing', 'paused', 'conflict', 'pending', 'error', undefined] as const)
+            expect(serverSyncOnboardingNext(outcome)).toBeUndefined()
     })
 
     it('separates an unfinished server job from a failure', () => {

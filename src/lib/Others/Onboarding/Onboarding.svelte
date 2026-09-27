@@ -106,6 +106,7 @@
     import { onboardingHold } from './onboardingGate'
     import { observeOnboardingWeave } from './onboardingWeave'
     import {
+        serverSyncOnboardingNext,
         serverSyncOnboardingOpening,
         serverSyncOnboardingOutcome,
         serverSyncOnboardingResume,
@@ -236,7 +237,7 @@
 
     $effect(() => {
         if (!hubStarted || hubConnecting || !hubOutcome) return
-        if (hubOutcome === 'complete' || hubOutcome === 'paused') {
+        if (serverSyncOnboardingNext(hubOutcome) === 'done') {
             resetHub()
             goTo('done')
         }
@@ -1200,6 +1201,25 @@
                                         onclick={() => void resolveHub('keep-remote')}
                                     >
                                         {s.keepRemote}
+                                    </button>
+                                </div>
+                            {:else if hubStarted && hubOutcome === 'paused'}
+                                <h1>{t.hub.title}</h1>
+                                {@render hubServerChip()}
+                                <p class="result cancelled" role="status">
+                                    {t.hub.pausedSummary}
+                                </p>
+                                <p class="reason">{t.hub.pausedReason}</p>
+                                <div class="actions">
+                                    <button
+                                        class="btn primary"
+                                        type="button"
+                                        onclick={() => void retryHub()}
+                                    >
+                                        {t.hub.resume}
+                                    </button>
+                                    <button class="btn ghost" type="button" onclick={finish}>
+                                        {t.done.start}
                                     </button>
                                 </div>
                             {:else if hubStarted}
