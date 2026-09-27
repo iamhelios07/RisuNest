@@ -105,7 +105,11 @@
     } from './externalStorageOnboardingFlow'
     import { onboardingHold } from './onboardingGate'
     import { observeOnboardingWeave } from './onboardingWeave'
-    import { serverSyncOnboardingOutcome, serverSyncOnboardingResume } from './serverSyncOnboardingFlow'
+    import {
+        serverSyncOnboardingOpening,
+        serverSyncOnboardingOutcome,
+        serverSyncOnboardingResume,
+    } from './serverSyncOnboardingFlow'
 
     const UI_LANGUAGES = [
         { value: 'de', label: 'Deutsch' },
@@ -236,6 +240,16 @@
             resetHub()
             goTo('done')
         }
+    })
+
+    // Decided once, when the status first arrives, so going back to the first
+    // screen afterwards stays possible.
+    let openingDecided = false
+    $effect(() => {
+        if (openingDecided || !syncSnapshot?.status) return
+        openingDecided = true
+        const opening = serverSyncOnboardingOpening(untrack(() => flow.state), syncSnapshot)
+        if (opening) flow = goToOnboardingState(untrack(() => flow), opening)
     })
 
     // A device connected before the app started again continues here; its

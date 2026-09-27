@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest'
 
 import type { ServerSyncSnapshot } from 'src/ts/storage/sync/serverSyncController'
-import { serverSyncOnboardingOutcome, serverSyncOnboardingResume } from './serverSyncOnboardingFlow'
+import {
+    serverSyncOnboardingOpening,
+    serverSyncOnboardingOutcome,
+    serverSyncOnboardingResume,
+} from './serverSyncOnboardingFlow'
 
 const head = {
     libraryId: 'library',
@@ -107,6 +111,22 @@ describe('sync server onboarding on a connected device', () => {
         const disconnected = finished('idle')
         expect(
             serverSyncOnboardingResume({
+                ...disconnected,
+                status: { ...disconnected.status!, configured: false },
+            }),
+        ).toBeUndefined()
+    })
+
+    it('opens on the sync screen only from the first screen of a connected device', () => {
+        const running = { ...finished('pending'), running: true }
+        expect(serverSyncOnboardingOpening('home', running)).toBe('sync-hub')
+        expect(serverSyncOnboardingOpening('home', finished('idle'))).toBe('sync-hub')
+        expect(serverSyncOnboardingOpening('import', running)).toBeUndefined()
+        expect(serverSyncOnboardingOpening('sync-hub', running)).toBeUndefined()
+        expect(serverSyncOnboardingOpening('home', undefined)).toBeUndefined()
+        const disconnected = finished('idle')
+        expect(
+            serverSyncOnboardingOpening('home', {
                 ...disconnected,
                 status: { ...disconnected.status!, configured: false },
             }),

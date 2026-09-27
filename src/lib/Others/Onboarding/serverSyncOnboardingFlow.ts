@@ -6,6 +6,7 @@
 
 import type { ServerSyncSnapshot } from 'src/ts/storage/sync/serverSyncController'
 import { completedServerSyncAttempt } from 'src/ts/storage/sync/serverSyncPresenter'
+import type { OnboardingState } from './onboardingFlow'
 
 /** The screen before a connection starts: the code box, then the server check. */
 export type ServerSyncOnboardingStage = 'code' | 'review' | 'syncing'
@@ -46,4 +47,16 @@ export function serverSyncOnboardingResume(
 ): 'show' | 'retry' | undefined {
     if (!snapshot?.status?.configured) return undefined
     return snapshot.running || snapshot.paused ? 'show' : 'retry'
+}
+
+/**
+ * Where the first screen moves once it learns the device is connected, so a
+ * device connected before the app started again opens on its sync instead of
+ * offering to start another setup over the library it receives.
+ */
+export function serverSyncOnboardingOpening(
+    state: OnboardingState,
+    snapshot: ServerSyncSnapshot | undefined,
+): 'sync-hub' | undefined {
+    return state === 'home' && serverSyncOnboardingResume(snapshot) ? 'sync-hub' : undefined
 }
