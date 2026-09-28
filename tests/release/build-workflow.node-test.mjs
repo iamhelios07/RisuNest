@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import test from "node:test";
 import { runInNewContext } from "node:vm";
 
@@ -347,4 +347,34 @@ test("Windows release gates run every detached update helper lifecycle test exac
   ]) assert.match(workflow, new RegExp(`'${name}'`));
   assert.match(workflow, /--test update_helper \$test -- --ignored --exact --nocapture/);
   assert.match(workflow, /test result: ok\\\. 1 passed; 0 failed; 0 ignored;/);
+});
+
+function assertPnpmSetup(contents) {
+  for (const job of contents.split(/^  [\w-]+:\s*$/m)) {
+    for (const match of job.matchAll(/uses: pnpm\/action-setup@[^\n]+([\s\S]*?)(?=\n      -|$)/g)) {
+      assert.doesNotMatch(match[1], /\bversion:/, "pnpm setup must use packageManager");
+      assert.match(job.slice(0, match.index), /uses: actions\/checkout@/, "checkout must precede pnpm setup");
+    }
+  }
+}
+
+test("all workflow pnpm setups use the checked-out packageManager", () => {
+  for (const name of readdirSync(new URL("../../.github/workflows/", import.meta.url))) {
+    if (/\.ya?ml$/.test(name)) assertPnpmSetup(readFileSync(new URL(`../../.github/workflows/${name}`, import.meta.url), "utf8"));
+  }
+  assert.throws(() => assertPnpmSetup("      - uses: actions/checkout@v4\n      - uses: pnpm/action-setup@v5\n        with: { version: 1 }"), /packageManager/);
+  assert.throws(() => assertPnpmSetup("      - uses: pnpm/action-setup@v5"), /checkout/);
+  const manager = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url))).packageManager;
+  for (const path of ["server/manager/gui/package.json", "server/endpoint-registry/package.json"]) {
+    const value = JSON.parse(readFileSync(new URL(`../../${path}`, import.meta.url))).packageManager;
+    if (value) assert.equal(value, manager);
+  }
+});
+
+test("Linux app native release tests retain all targets in the maintained credential environment", () => {
+  const native = workflow.slice(workflow.indexOf("\n  app-native-tests:"), workflow.indexOf("\n  app-android-tests:"));
+  assert.match(native, /gnome-keyring dbus-x11/);
+  assert.match(native, /if: runner.os == 'Linux'\n\s+run: dbus-run-session -- bash scripts\/linux-native-tests.sh --release --target/);
+  assert.doesNotMatch(native, /linux-native-tests.sh[^\n]*--lib/);
+  assert.match(native, /if: runner.os != 'Linux'\n\s+run: cargo test --manifest-path src-tauri\/Cargo.toml --release --locked --target/);
 });
