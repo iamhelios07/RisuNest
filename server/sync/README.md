@@ -36,7 +36,7 @@ data="${XDG_DATA_HOME:-$HOME/.local/share}/risunest-sync"
 ### macOS
 
 ```sh
-data="$HOME/Library/Application Support/io.github.rsyumi.risunest.sync-manager"
+data="$HOME/Library/Application Support/RisuNest Sync"
 ./risunest-sync-server init --data-dir "$data"
 ./risunest-sync-server device add --data-dir "$data"
 ./risunest-sync-server serve --data-dir "$data"

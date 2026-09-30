@@ -1,0 +1,39 @@
+name: Native regression check
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'src-tauri/**'
+      - 'crates/**'
+      - 'scripts/linux-native-tests.sh'
+      - '.github/workflows/native-check.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src-tauri/**'
+      - 'crates/**'
+      - 'scripts/linux-native-tests.sh'
+      - '.github/workflows/native-check.yml'
+
+permissions:
+  contents: read
+concurrency:
+  group: native-check-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TARGET_DIR: ${{ github.workspace }}/src-tauri/target
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with: { persist-credentials: false }
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+      - run: sudo apt-get update && sudo apt-get install -y pkg-config libwebkit2gtk-4.1-dev libssl-dev libdbus-1-dev libayatana-appindicator3-dev librsvg2-dev gnome-keyring dbus-x11
+      - run: dbus-run-session -- bash scripts/linux-native-tests.sh --release
+      - run: dbus-run-session -- bash scripts/linux-native-tests.sh --package tauri-plugin-window-state --release --lib
+      - run: dbus-run-session -- cargo test --manifest-path crates/wry/Cargo.toml --package wry --release --locked --lib

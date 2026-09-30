@@ -2,6 +2,12 @@ name: Android debug APK check
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'src-tauri/**'
+      - 'crates/**'
+      - '.github/workflows/android-check.yml'
 
 permissions:
   contents: read
@@ -55,12 +61,12 @@ jobs:
         shell: bash
         run: git status --short --untracked-files=all -- src-tauri/gen/android > "$RUNNER_TEMP/android-gen.status.before"
 
+      - name: Build arm64 debug APK
+        run: pnpm android:build:arm64
+
       - name: Run Android Kotlin unit tests
         working-directory: src-tauri/gen/android
         run: ./gradlew :app:testArmDebugUnitTest :app:testLowMemorySafCopy :tauri-plugin-barcode-scanner:testDebugUnitTest --no-daemon
-
-      - name: Build arm64 debug APK
-        run: pnpm android:build:arm64
 
       - name: Verify APK alignment
         shell: pwsh
