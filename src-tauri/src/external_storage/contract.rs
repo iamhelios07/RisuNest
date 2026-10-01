@@ -270,6 +270,16 @@ fn segment_names_keep_complete_identity_and_reject_noncanonical_names() {
     let hash = "a".repeat(64);
     let name = segment_object_id(writer, u64::MAX, &hash).unwrap();
     assert_eq!(name.len(), MAX_SEGMENT_NAME_BYTES);
+    for invalid_writer in [
+        "00000000-0000-1000-8000-000000000001",
+        "00000000-0000-0000-0000-000000000000",
+        "00000000-0000-4000-7000-000000000001",
+        "00000000-0000-4000-c000-000000000001",
+    ] {
+        assert!(segment_object_id(invalid_writer, 1, &hash).is_err(), "{invalid_writer}");
+        assert!(parse_segment_object_id(&format!("{invalid_writer}-1-{hash}")).is_err(), "{invalid_writer}");
+    }
+
     assert_eq!(parse_segment_object_id(&name).unwrap(), (writer, u64::MAX, hash.as_str()));
     for name in [format!("{writer}-01-{hash}"), format!("{writer}-0-{hash}"),
         format!("{writer}-18446744073709551616-{hash}"), format!("{writer}-1-{}", "A".repeat(64)),
@@ -279,8 +289,9 @@ fn segment_names_keep_complete_identity_and_reject_noncanonical_names() {
 }
 
 pub(crate) fn segment_object_id(writer: &str, seq: u64, sha256: &str) -> Result<String> {
-    let id = uuid::Uuid::parse_str(writer).map_err(|_| ProviderError::new(ErrorKind::Corrupt))?;
-    if id.to_string() != writer || seq == 0 || !crate::trust_boundary::is_lower_hex_256(sha256) {
+    risunest_sync_wire::stamp::validate_writer_id(writer)
+        .map_err(|_| ProviderError::new(ErrorKind::Corrupt))?;
+    if seq == 0 || !crate::trust_boundary::is_lower_hex_256(sha256) {
         return Err(ProviderError::new(ErrorKind::Corrupt));
     }
     Ok(format!("{writer}-{seq}-{sha256}"))
