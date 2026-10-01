@@ -549,11 +549,13 @@ pub fn encode_message_page(messages: &[Value]) -> Result<EncodedLogicalObject, L
     if messages.len() > LOGICAL_MESSAGE_PAGE_SIZE {
         return Err(invalid("logical message page exceeds 128 messages"));
     }
-    let bytes = serde_json::to_vec(&LogicalMessagePageDocument {
-        schema: LOGICAL_MESSAGE_PAGE_SCHEMA.to_owned(),
-        messages: messages.to_vec(),
-    })
-    .map_err(|error| invalid(format!("logical message page encoding failed: {error}")))?;
+    let mut bytes = b"{\"schema\":\"risunest.logical-message-page/v1\",\"messages\":[".to_vec();
+    for (index, message) in messages.iter().enumerate() {
+        if index > 0 { bytes.push(b','); }
+        bytes.extend(risunest_sync_wire::payload_value::encode(message)
+            .map_err(|error| invalid(error.to_string()))?);
+    }
+    bytes.extend(b"]}");
     encoded_object(bytes)
 }
 
