@@ -50,7 +50,6 @@ pub(crate) mod runtime;
 pub(crate) mod runtime_restore;
 pub(crate) mod secrets;
 pub(crate) mod sections;
-pub(crate) mod snapshot;
 pub(crate) mod snapshot_export;
 pub(crate) mod snapshot_export_commands;
 pub(crate) mod snapshot_restore;
