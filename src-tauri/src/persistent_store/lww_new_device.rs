@@ -237,6 +237,7 @@ impl PersistentStore {
         }
         super::super::sync_selection::validate_binding_stage_content(&self.connection, staging_id)?;
         let changes: Vec<Change> = serde_json::from_str(&encoded)?;
+        validate_binding_source(&self.connection, staging_id, header, &changes)?;
         let mut keys = BTreeSet::new();
         for change in &changes {
             if !keys.insert(change.key.clone()) {

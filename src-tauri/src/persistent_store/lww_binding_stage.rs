@@ -137,6 +137,10 @@ impl PersistentStore {
             "SELECT staging_id,authority,inspection_id,source_digest,admitted_upper_ms FROM lww_binding_sources WHERE request_id=?1",
             [&header.request_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
         ).optional()?;
+        if existing.is_none() && self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM lww_binding_stages WHERE receive_id=?1)",
+            [&header.request_id], |row| row.get::<_,bool>(0),
+        )? { return Err(error("binding-source-missing")); }
         let staging_id = if let Some((id, authority, inspection, old_digest, upper)) = existing {
             if authority != header.binding_authority.0.to_string() || inspection != inspection_id
                 || old_digest != digest || upper != admitted_upper_ms.0.to_string()
@@ -290,8 +294,15 @@ fn copy_reference_tree(
 }
 
 pub(in crate::persistent_store) fn validate_binding_source(db: &Connection, staging_id: &str, header: &Header, received: &[Change]) -> StoreResult<()> {
-    let source: Option<(String, String, String, String)> = db.query_row("SELECT request_id,source_digest,status_digest,catalog_digest FROM lww_binding_sources WHERE staging_id=?1", [staging_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).optional()?;
-    let Some((request_id, digest, expected_status, expected_catalog)) = source else { return Ok(()); };
+    let source: Option<(String, String, String, String, String, String)> = db.query_row("SELECT request_id,source_digest,status_digest,catalog_digest,authority,inspection_id FROM lww_binding_sources WHERE staging_id=?1", [staging_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?))).optional()?;
+    let (request_id, digest, expected_status, expected_catalog, authority, inspection) = source.ok_or_else(|| error("binding-source-missing"))?;
+    let receipt: Option<(String,String,String,String)> = db.query_row("SELECT s.receive_id,s.inspection_id,i.source_authority,s.changes FROM lww_binding_stages s JOIN lww_binding_inspections i USING(inspection_id) WHERE s.staging_id=?1", [staging_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).optional()?;
+    let (receive_id, receipt_inspection, source_authority, encoded) = receipt.ok_or_else(|| error("binding-source-association"))?;
+    let original_authority: DecimalU64 = wire(authority.clone().try_into())?;
+    if receive_id != request_id || receipt_inspection != inspection || source_authority != authority
+        || (header.binding_authority != original_authority && original_authority.0.checked_add(1) != Some(header.binding_authority.0))
+        || source_digest(&sorted_source(&serde_json::from_str::<Vec<Change>>(&encoded)?)?)? != digest
+    { return Err(error("binding-source-association")); }
     if request_id != header.request_id || source_digest(&sorted_source(received)?)? != digest {
         return Err(error("binding-source-integrity"));
     }
