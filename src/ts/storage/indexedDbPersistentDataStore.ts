@@ -943,11 +943,11 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             if (input.addCharacter) {
                 await this.addCharacter(transaction, generation, input.addCharacter)
             }
-            for (const mutation of input.conversations ?? []) {
-                await this.applyConversationMutation(transaction, generation, mutation)
-            }
             for (const mutation of input.unitMutations ?? []) {
                 await this.applyUnitMutation(transaction, generation, mutation)
+            }
+            for (const mutation of input.conversations ?? []) {
+                await this.applyConversationMutation(transaction, generation, mutation)
             }
             for (const mutation of input.pluginStorage ?? []) {
                 await this.applyPluginStorageMutation(transaction, generation, mutation)
@@ -2436,6 +2436,32 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             const value = object as Record<string, unknown>
             if (mutation.type === 'delete') delete value[key]
             else Object.defineProperty(value, key, { value: structuredClone(mutation.value), enumerable: true, writable: true, configurable: true })
+        }
+        if (kind === 'exists' && id === 'character') {
+            if (mutation.type === 'delete') await this.deleteCharacter(transaction, generation, field)
+            else {
+                const existing = await requestResult(transaction.objectStore('characters').get(this.characterKey(generation, field)))
+                if (!existing) {
+                    const type = (mutation.value as {type?: string})?.type
+                    if (type !== 'character' && type !== 'group') throw new TypeError('Character existence requires its structural type')
+                    await this.putCharacter(transaction, generation, {chaId:field, type, name:''} as CharacterDetail)
+                }
+            }
+            return
+        }
+        if (kind === 'exists' && id === 'conversation') {
+            if (mutation.type === 'delete') await this.applyConversationMutation(transaction, generation, {type:'delete',characterId:field,conversationId:conversationField})
+            else {
+                const parent = await requestResult(transaction.objectStore('characters').get(this.characterKey(generation, field)))
+                if (!parent) throw new TypeError('Missing character parent')
+                const existing = await requestResult(transaction.objectStore('conversations').get(this.conversationKey(generation, field, conversationField)))
+                if (!existing) {
+                    const index = await this.conversationCount(transaction, generation, field)
+                    this.putConversation(transaction, generation, field, {id:conversationField,name:'',note:'',localLore:[],message:[]} as Chat, index)
+                    await this.refreshCharacterSummary(transaction, generation, field)
+                }
+            }
+            return
         }
         if (kind === 'character' || kind === 'group-members') {
             const detail = await requestResult<StoredRecord<CharacterDetail> | undefined>(transaction.objectStore('characters').get(this.characterKey(generation, id)))

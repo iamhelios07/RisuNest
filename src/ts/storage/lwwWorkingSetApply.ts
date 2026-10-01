@@ -37,6 +37,7 @@ export async function applyLwwWorkingSetUnits(
     const charactersById = liveIndex ?? new Map(database.characters.map((value) => [value.chaId,value]))
     const baselineById = new Map(baseline.characters.map((value) => [value.chaId,value]))
     const keys = affectedKeys.map((key) => JSON.parse(key) as string[])
+        .sort((a, b) => Number(a[0] === 'root' && ['botPresetsId', 'selectedPersona'].includes(a[1])) - Number(b[0] === 'root' && ['botPresetsId', 'selectedPersona'].includes(b[1])))
     const root = keys.some(([kind]) => ['root', 'variable', 'toggle', 'record', 'order', 'persona', 'preset-protected', 'exists'].includes(kind))
         ? (await store.readRoot()).value : null
     const details = new Map<string, CompleteCharacter | null>()
@@ -102,7 +103,11 @@ export async function applyLwwWorkingSetUnits(
             const before = baseline.root.personas ?? [], live = database.personas ?? []
             const previous = before.find((value) => value.id === field), current = live.find((value) => value.id === field), remote = root.personas?.find((value) => value.id === field)
             const replace = (values: typeof live) => remote ? [...values.filter((value) => value.id !== field), canonicalClone(remote)] : values.filter((value) => value.id !== field)
-            if (canonicalJson(previous ?? null) === canonicalJson(current ?? null)) database.personas = replace(live)
+            if (canonicalJson(previous ?? null) === canonicalJson(current ?? null)) {
+                const selectedId = live[database.selectedPersona]?.id
+                database.personas = replace(live)
+                database.selectedPersona = Math.max(0, database.personas.findIndex((value) => value.id === selectedId))
+            }
             baseline.root.personas = replace(before)
         } else if (root && kind === 'persona') {
             const live = database.personas?.find((value) => value.id === id)
@@ -148,14 +153,20 @@ export async function applyLwwWorkingSetUnits(
             const order = new Map((remote[id] ?? []).map((item, index) => [item[identity], index]))
             const sort = (values: Record<string, unknown>[] = []) => [...values].sort((a,b) => (order.get(a[identity]) ?? Infinity) - (order.get(b[identity]) ?? Infinity))
             const live = database as unknown as Record<string, Record<string, unknown>[]>, before = baseline.root as unknown as Record<string, Record<string, unknown>[]>
-            if (canonicalJson((live[id] ?? []).map((value) => value[identity])) === canonicalJson((before[id] ?? []).map((value) => value[identity]))) live[id] = sort(live[id])
+            if (canonicalJson((live[id] ?? []).map((value) => value[identity])) === canonicalJson((before[id] ?? []).map((value) => value[identity]))) {
+                const selectedId = id === 'personas' ? database.personas?.[database.selectedPersona]?.id : undefined
+                live[id] = sort(live[id])
+                if (id === 'personas') database.selectedPersona = Math.max(0, database.personas?.findIndex((value) => value.id === selectedId) ?? 0)
+            }
             before[id] = sort(before[id])
         } else if (root && kind === 'order' && id === 'characters') {
             patchField(database, baseline.root, root, 'characterOrder')
         } else if ((kind === 'order' && id === 'presets') || (kind === 'exists' && id === 'preset')) {
+            const selectedId = database.botPresets[database.botPresetsId]?.['id']
             const catalog = await store.queryPresets()
             const byId = new Map(database.botPresets.filter(Boolean).map((value) => [value['id'], value]))
             database.botPresets = catalog.items.map((summary) => byId.get(summary.id) ?? { id: summary.id, name: summary.name, image: summary.image } as unknown as botPreset)
+            database.botPresetsId = Math.max(0, database.botPresets.findIndex((value) => value['id'] === selectedId))
             if (baseline.presets) baseline.presets = catalog.items.map((summary) => baseline.presets!.find((value) => value['id'] === summary.id) ?? byId.get(summary.id)!).filter(Boolean)
         } else if (kind === 'exists' && id === 'character') {
             const summary = await store.readCharacterSummary(field)

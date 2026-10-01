@@ -116,6 +116,7 @@ export interface SaveCoordinatorDependencies {
     officialPublisher?: OfficialRevisionPublisher
     clock?: SaveCoordinatorClock
     now?(): number
+    onRoutineUnitsCommitted?(revision: DataRevision, keys: readonly string[]): Promise<void>
     onLocalRevision?(revision: DataRevision): void
     /** Advances revision-only working-set state synchronously and must not throw. */
     onStorageOnlyRevision?(revision: DataRevision): void
@@ -1372,6 +1373,15 @@ export class SaveCoordinator {
                 rootMutations: presetRootMutations,
                 ...(presetUnits ? { unitMutations: presetUnits } : { replacePresets: committedPresets }),
             })
+            if (presetUnits && this.dependencies.onRoutineUnitsCommitted) {
+                this.currentRevision = committed.revision
+                const keys = [...presetUnits.map((value) => value.key), ...presetRootMutations.map((value) => JSON.stringify(['root', value.key]))]
+                try { await this.dependencies.onRoutineUnitsCommitted(committed.revision, keys) }
+                catch (error) { this.markCommittedWorkingSetRefreshRequired(committed.revision, error); throw error }
+                this.dependencies.onLocalRevision?.(committed.revision)
+                await this.finishExplicitCommit(committed.revision)
+                return
+            }
             const liveAfterCommit = this.capture()
             if (
                 livePresetsBefore !== null &&
@@ -1426,7 +1436,6 @@ export class SaveCoordinator {
             await this.flushIterations(reason, true)
             signal?.throwIfAborted()
             const revision = this.revision
-            const operationStart = this.capture()
             const lease = await this.dependencies.store.acquireRevision(revision)
             const snapshot = await withPersistentRevisionLease(lease, async (reader) => {
                 signal?.throwIfAborted()
@@ -1435,7 +1444,6 @@ export class SaveCoordinator {
                 signal?.throwIfAborted()
                 this.assertReadRevision(revision, rootValue.revision)
                 const root = canonicalClone(rootValue.value)
-                const ownerHeads: AssetOwnerHead[] = []
                 const aliases: Extract<AssetAlias, { kind: 'asset' }>[] = []
                 const uniqueAliases = new Map<string, Extract<AssetAlias, { kind: 'asset' }>>()
                 for (const alias of input.assetAliases) {
@@ -1474,42 +1482,11 @@ export class SaveCoordinator {
                         }
                     }
                 }
-                const modules = Array.isArray(root.modules) ? root.modules : []
-                for (let index = 0; index < modules.length; index++) {
-                    signal?.throwIfAborted()
-                    const value = await reader.readAssetOwnerHead({
-                        kind: 'root-module-assets',
-                        moduleId: modules[index].id,
-                    })
-                    signal?.throwIfAborted()
-                    if (!value) continue
-                    this.assertReadRevision(revision, value.revision)
-                    ownerHeads.push(canonicalClone(value.value))
-                }
-                const personas = Array.isArray(root.personas) ? root.personas : []
-                for (let index = 0; index < personas.length; index++) {
-                    signal?.throwIfAborted()
-                    if (!personas[index]?.embeddedModule) continue
-                    const value = await reader.readAssetOwnerHead({
-                        kind: 'persona-embedded-module-assets',
-                        personaId: personas[index].id!,
-                        moduleId: personas[index].embeddedModule!.id,
-                    })
-                    signal?.throwIfAborted()
-                    if (!value) continue
-                    this.assertReadRevision(revision, value.revision)
-                    ownerHeads.push(canonicalClone(value.value))
-                }
-                return { root, ownerHeads, aliases }
+                if (!input.module.id || root.modules?.some((value) => value.id === input.module.id)) throw new PersistentRootModuleAppendRejectedError('Imported module requires a new stable ID')
+                return { root, aliases }
             })
             signal?.throwIfAborted()
-            if (this.capture().rootCanonical !== operationStart.rootCanonical) {
-                throw new PersistentRootModuleAppendRejectedError(
-                    'Persistent root changed during module import',
-                )
-            }
             const modules = Array.isArray(snapshot.root.modules) ? snapshot.root.modules : []
-            const moduleIndex = modules.length
             snapshot.root.modules = [...modules, input.module]
             const ownerHead: AssetOwnerHead = {
                 owner: { kind: 'root-module-assets', moduleId: input.module.id },
@@ -1520,11 +1497,15 @@ export class SaveCoordinator {
             commitStarted = true
             let committed: { revision: DataRevision }
             try {
-                committed = await this.dependencies.store.commit({
+                committed = await this.commitRoutine({
                     expectedRevision: revision,
-                    root: snapshot.root,
+                    unitMutations: [
+                        {key: JSON.stringify(['exists', 'modules', input.module.id]), type: 'set', value: true},
+                        {key: JSON.stringify(['record', 'modules', input.module.id]), type: 'set', value: input.module},
+                        {key: JSON.stringify(['order', 'modules']), type: 'set', value: snapshot.root.modules!.map((value) => value.id)},
+                    ],
                     assetAliases: snapshot.aliases,
-                    assetOwnerHeads: [...snapshot.ownerHeads, ownerHead],
+                    assetOwnerHeads: [ownerHead],
                 })
             } catch (error) {
                 if (error instanceof RevisionConflictError) {
@@ -1540,8 +1521,13 @@ export class SaveCoordinator {
             )
             this.currentRevision = committed.revision
             this.dirtyGeneration++
-            this.rootBaseline = canonicalJson(snapshot.root)
-            this.dependencies.publishRootWorkingSet?.(publishedRoot)
+            if (this.dependencies.onRoutineUnitsCommitted) {
+                try { await this.dependencies.onRoutineUnitsCommitted(committed.revision, [JSON.stringify(['record', 'modules', input.module.id]), JSON.stringify(['order', 'modules'])]) }
+                catch (error) { this.markCommittedWorkingSetRefreshRequired(committed.revision, error); throw error }
+            } else {
+                this.rootBaseline = canonicalJson(snapshot.root)
+                this.dependencies.publishRootWorkingSet?.(publishedRoot)
+            }
             this.dependencies.onLocalRevision?.(committed.revision)
             this.pendingByteCount = 0
             this.lastBackgroundErrorMessage = null
@@ -1709,7 +1695,6 @@ export class SaveCoordinator {
                 character: canonicalClone(characterValue.value),
             }
             const outcome = await mutate(state)
-            this.assertResidentCharacterUnchanged(characterId, residentBefore)
             const deleting = typeof outcome === 'object' && outcome?.delete === true
             const liveBeforeCommit = this.capture()
             const committedRoot = rebaseRootMutation(
@@ -1726,6 +1711,10 @@ export class SaveCoordinator {
             if (commit.root) { commit.rootMutations = diffRootMutations(rootValue.value, commit.root); delete commit.root }
             if (!commit.deleteCharacterIds?.length && !commit.unitMutations?.length && !commit.rootMutations?.length) return true
             const committed = await this.commitRoutine(commit)
+            if (!deleting && (this.dependencies.onRoutineUnitsCommitted || !this.residentCharactersMatch(residentBefore, this.captureResidentCharacter(characterId)))) {
+                await this.finishRoutineCharacterIntent(committed.revision, commit, characterId, residentBefore)
+                return true
+            }
             const residentAfterCommit = this.captureResidentCharacter(characterId)
             if (!this.residentCharactersMatch(residentBefore, residentAfterCommit)) {
                 const committedCharacter = committedDetail === null
@@ -2003,7 +1992,7 @@ export class SaveCoordinator {
             )
             const beforeCanonical = canonicalJson(current)
             const replacement = canonicalClone(await mutate(current))
-            this.assertResidentCharacterUnchanged(characterId, residentBefore)
+            if (expectedRevision !== undefined) this.assertResidentCharacterUnchanged(characterId, residentBefore)
             if (replacement.chaId !== characterId) {
                 throw new Error(`Replacement character ID must remain ${characterId}`)
             }
@@ -2013,6 +2002,10 @@ export class SaveCoordinator {
             const committed = expectedRevision === undefined
                 ? await this.commitRoutine({ expectedRevision: revision, ...changed })
                 : await this.dependencies.store.commit({ expectedRevision: revision, replaceCharacter: replacement })
+            if (expectedRevision === undefined && (this.dependencies.onRoutineUnitsCommitted || !this.residentCharactersMatch(residentBefore, this.captureResidentCharacter(characterId)))) {
+                await this.finishRoutineCharacterIntent(committed.revision, { expectedRevision: revision, ...changed }, characterId, residentBefore)
+                return true
+            }
             const residentAfterCommit = this.captureResidentCharacter(characterId)
             if (!this.residentCharactersMatch(residentBefore, residentAfterCommit)) {
                 this.finishCharacterMutation(
@@ -2191,7 +2184,6 @@ export class SaveCoordinator {
                 : null
             const beforeCanonical = current ? canonicalJson(current) : null
             const replacement = canonicalClone(await createOrMutate(current))
-            this.assertResidentCharacterUnchanged(characterId, residentBefore)
             if (replacement.chaId !== characterId) {
                 throw new Error(`Upserted character ID must remain ${characterId}`)
             }
@@ -2239,6 +2231,10 @@ export class SaveCoordinator {
             }
             if (commit.root) { commit.rootMutations = diffRootMutations(rootValue.value, commit.root); delete commit.root }
             const committed = await this.commitRoutine(commit)
+            if (current && (this.dependencies.onRoutineUnitsCommitted || !this.residentCharactersMatch(residentBefore, this.captureResidentCharacter(characterId)))) {
+                await this.finishRoutineCharacterIntent(committed.revision, commit, characterId, residentBefore)
+                return true
+            }
             const residentAfterCommit = this.captureResidentCharacter(characterId)
             if (!this.residentCharactersMatch(residentBefore, residentAfterCommit)) {
                 this.finishCharacterMutation(
@@ -4413,6 +4409,51 @@ export class SaveCoordinator {
             canonicalJson(captureMaterializedCharacter(value)) === canonicalJson(this.materializedBaselines.get(value.chaId) ?? null))
     }
 
+    capturePersistentBaselineRoot(): RootDatabase {
+        return JSON.parse(this.rootBaseline ?? canonicalJson(this.dependencies.captureRoot()))
+    }
+
+    private async finishRoutineCharacterIntent(revision: DataRevision, commit: WorkingSetCommit, characterId: string,
+        before: { character: CompleteCharacter; canonical: string } | null): Promise<void> {
+        this.currentRevision = revision
+        const keys = (commit.unitMutations ?? []).map((value) => value.key)
+        for (const value of commit.rootMutations ?? []) keys.push(JSON.stringify(['root', value.key]))
+        for (const value of commit.conversations ?? []) {
+            keys.push(JSON.stringify([value.type === 'delete' ? 'exists' : 'messages', ...(value.type === 'delete' ? ['conversation'] : []), value.characterId, 'conversationId' in value ? value.conversationId : '']))
+        }
+        if (this.dependencies.onRoutineUnitsCommitted) {
+            try { await this.dependencies.onRoutineUnitsCommitted(revision, keys) }
+            catch (error) { this.markCommittedWorkingSetRefreshRequired(revision, error); throw error }
+        } else {
+            const live = this.dependencies.captureCharacter(characterId)
+            const baseline = this.materializedBaselines.get(characterId) ?? before?.character
+            const patch = (target: object, mutation: PersistentUnitMutation, field: string) => {
+                const value = target as Record<string, unknown>
+                if (mutation.type === 'delete') delete value[field]
+                else value[field] = canonicalClone(mutation.value)
+            }
+            for (const mutation of commit.unitMutations ?? []) {
+                const [kind, id, field] = JSON.parse(mutation.key)
+                if (kind !== 'character' || id !== characterId || !live || !baseline) continue
+                if (canonicalJson({value:(live as unknown as Record<string,unknown>)[field]}) === canonicalJson({value:(before?.character as unknown as Record<string,unknown>)?.[field]})) patch(live, mutation, field)
+                patch(baseline, mutation, field)
+            }
+            if (baseline) {
+                this.materializedBaselines.set(characterId, baseline)
+                if (this.characterBaselineId === characterId) this.characterBaseline = canonicalJson(baseline)
+            }
+            const root = this.capturePersistentBaselineRoot()
+            for (const mutation of commit.rootMutations ?? []) {
+                const value = root as unknown as Record<string, unknown>
+                if (mutation.type === 'delete') delete value[mutation.key]
+                else value[mutation.key] = canonicalClone(mutation.value)
+            }
+            this.rootBaseline = canonicalJson(root)
+        }
+        this.dependencies.onLocalRevision?.(revision)
+        await this.finishExplicitCommit(revision)
+    }
+
     private async commitRoutine(input: WorkingSetCommit): Promise<{ revision: DataRevision }> {
         const captured = canonicalClone(input)
         while (true) {
@@ -4470,9 +4511,9 @@ export class SaveCoordinator {
                 const replacements: ConversationMutation[] = []
                 for (const target of messages) {
                     const metadata = await this.dependencies.store.readConversationMetadata(target.characterId, target.conversationId)
-                    if (!metadata) throw new TypeError('Missing conversation parent')
+                    if (!metadata && !mutations.some((value) => value.key === JSON.stringify(['exists', 'conversation', target.characterId, target.conversationId]) && value.type === 'set')) throw new TypeError('Missing conversation parent')
                     replacements.push({ type: 'replace-range', characterId: target.characterId, conversationId: target.conversationId,
-                        start: 0, deleteCount: metadata.value.totalMessages, messages: target.messages })
+                        start: 0, deleteCount: metadata?.value.totalMessages ?? 0, messages: target.messages })
                 }
                 let committedRevision: DataRevision | undefined
                 try {

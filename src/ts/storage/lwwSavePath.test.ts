@@ -4,6 +4,7 @@ import { IndexedDbPersistentDataStore } from './indexedDbPersistentDataStore'
 import { fixtureDatabase } from './tests/persistentDataFixtures'
 import { SaveCoordinator } from './saveCoordinator'
 import { capturePersistentRoot, createPersistentDataRuntime } from './persistentDataRuntime'
+import { applyLwwWorkingSetUnits, captureLwwWorkingSetBaseline } from './lwwWorkingSetApply'
 import { createGeneratingConversationRegistry } from './generatingConversationRegistry'
 import { diffMaterializedCharacter, diffRecordCollection } from './persistentUnitCapture'
 import { createConversationSummaryStubFromChat } from './conversationResidency'
@@ -29,13 +30,14 @@ async function harness() {
     return { database, store, commit, coordinator }
 }
 
-async function runtimeHarness() {
+async function runtimeHarness(registry?: ReturnType<typeof createGeneratingConversationRegistry>) {
     const values = await harness()
     const {database,store} = values
     const runtime = createPersistentDataRuntime({store,state:{
         captureRoot:()=>capturePersistentRoot(database), capturePresets:()=>database.botPresets,
         captureCharacters:()=>database.characters, captureWorkingSetDatabase:()=>database,
         captureSelectedCharacter:()=>database.characters[0], captureCharacter:(id)=>database.characters.find((value)=>value.chaId===id)??null,
+        getGeneratingConversations:()=>registry?.snapshot() ?? [],
         getSelectedCharacterId:()=>database.characters[0]?.chaId,replaceDatabase:()=>undefined,publishCharacter:()=>undefined,publishConversation:()=>undefined,
     },prepareDatabase:async(value)=>value})
     await runtime.initializeActiveWorkingSet(database)
@@ -57,6 +59,23 @@ describe('LWW renderer save path', () => {
         commit.mockClear()
         await runtime.flushPendingDataLocally('after-remote')
         expect(commit).not.toHaveBeenCalled()
+    })
+
+    it('preserves stable preset and persona selections when remote catalogs reorder', async () => {
+        const { database } = await harness()
+        database.personas = [{ id: 'one', name: 'One' }, { id: 'two', name: 'Two' }] as Database['personas']
+        database.selectedPersona = 1
+        const selectedPreset = database.botPresets[0]['id']
+        const baseline = captureLwwWorkingSetBaseline(database, capturePersistentRoot(database), database.botPresets)
+        const root = { ...capturePersistentRoot(database), personas: [...database.personas].reverse() }
+        const presets = [...database.botPresets].reverse()
+        const reader = { readRoot: async () => ({ revision: 2, value: root }),
+            queryPresets: async () => ({ revision: 2, items: presets.map((preset, configuredIndex) => ({ id: preset['id'], name: preset.name, configuredIndex })) }),
+        } as unknown as import('./persistentDataStore').PersistentRevisionReader
+        await applyLwwWorkingSetUnits(database, baseline, reader, ['["order","presets"]', '["order","personas"]'])
+        expect(database.botPresets[database.botPresetsId]['id']).toBe(selectedPreset)
+        expect(database.personas[database.selectedPersona].id).toBe('two')
+        expect(baseline.root.selectedPersona).toBe('two')
     })
 
     it('finishes durable receive progress when renderer projection fails and requires refresh', async () => {
@@ -123,6 +142,16 @@ describe('LWW renderer save path', () => {
         expect((await store.readConversation('char-a', 'conv-long'))?.value.message).toHaveLength(130)
     })
 
+    it('creates a conversation parent before committing its complete message list', async () => {
+        const {store,coordinator} = await harness()
+        await coordinator.commitPersistentUnitIntent('create-chat', [
+            {key:'["exists","conversation","char-a","new-chat"]',type:'set',value:true},
+            {key:'["conversation","char-a","new-chat","name"]',type:'set',value:'New'},
+        ], [], [{characterId:'char-a',conversationId:'new-chat',messages:[{role:'char',data:'first',chatId:'untouched-message-id'}]}])
+        expect((await store.readConversation('char-a','new-chat'))?.value).toMatchObject({name:'New',message:[{chatId:'untouched-message-id',data:'first'}]})
+        await expect(coordinator.commitPersistentUnitIntent('missing-chat', [], [], [{characterId:'char-a',conversationId:'missing',messages:[]}])).rejects.toThrow('Missing conversation parent')
+    })
+
     it('emits only one changed generic record and permits plugin reinstall', async () => {
         expect(diffRecordCollection('plugins', [{ name: 'a', source: 'old' }, { name: 'b', source: 'untouched' }],
             [{ name: 'a', source: 'new' }, { name: 'b', source: 'untouched' }])).toEqual([
@@ -159,6 +188,32 @@ describe('LWW renderer save path', () => {
         await exportJob
         await save
         expect(commit).toHaveBeenCalledOnce()
+    })
+
+    it('drains completion immediately while another conversation keeps generating', async () => {
+        const registry = createGeneratingConversationRegistry()
+        const completeA = registry.register({characterId:'char-a',conversationId:'conv-long'})
+        const completeB = registry.register({characterId:'char-b',conversationId:'conv-beta'})
+        const {database,store,runtime,commit} = await runtimeHarness(registry)
+        store.lwwStageReceive = async () => undefined
+        store.lwwApplyReceive = async () => ({revision:runtime.revision,affectedKeys:[],heldKeys:[],deferredKeys:['["messages","char-a","conv-long"]','["messages","char-b","conv-beta"]']})
+        store.lwwFinishReceive = async () => undefined
+        store.lwwDrainDeferred = vi.fn(async (request) => {
+            expect(request.generating).toEqual([{characterId:'char-b',conversationId:'conv-beta'}])
+            const current = (await store.readConversation('char-a','conv-long'))!
+            const result = await store.commit({expectedRevision:runtime.revision,conversations:[{type:'replace-range',characterId:'char-a',conversationId:'conv-long',start:current.value.message.length,deleteCount:0,messages:[{role:'char',data:'deferred remote',chatId:'remote-message-id'}]}]})
+            return {...result,affectedKeys:['["messages","char-a","conv-long"]'],heldKeys:[],deferredKeys:['["messages","char-b","conv-beta"]']}
+        })
+        await runtime.applyLwwReceive({bindingAuthority:'a',requestId:'receive',changes:[],progress:{kind:'server',cursor:'1'},admittedTimeUpperMs:'100'})
+        completeA()
+        await runtime.acknowledgeGenerationCompletion()
+        expect(store.lwwDrainDeferred).toHaveBeenCalledOnce()
+        expect(database.characters[1].chats[0].message.at(-1)?.chatId).toBe('remote-message-id')
+        expect(database.characters[0].chats[0].message).toHaveLength(3)
+        commit.mockClear()
+        await runtime.flushPendingDataLocally('after-completion-drain')
+        expect(commit).not.toHaveBeenCalled()
+        completeB()
     })
 
     it('registers all generating conversations using both stable IDs', () => {

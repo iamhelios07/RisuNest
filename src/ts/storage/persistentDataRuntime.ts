@@ -584,6 +584,9 @@ export function createPersistentDataRuntime(
         }
     }
     const coordinator = new SaveCoordinator({
+        onRoutineUnitsCommitted: dependencies.state.captureWorkingSetDatabase ? async (revision, affectedKeys) => {
+            await projectAppliedUnits({revision, affectedKeys: [...affectedKeys], heldKeys: [], deferredKeys: []})
+        } : undefined,
         canonicalCapture: dependencies.state.canonicalCapture,
         store: dependencies.store,
         captureCharacters: dependencies.state.captureCharacters,
@@ -968,7 +971,7 @@ export function createPersistentDataRuntime(
     const projectAppliedUnits = async (result: LwwApplyResult, baseline?: ReturnType<typeof captureLwwWorkingSetBaseline>): Promise<void> => {
         const database = dependencies.state.captureWorkingSetDatabase?.()
         if (!database) { coordinator.adoptAppliedUnitState(result.revision, null, null, []); return }
-        baseline ??= captureLwwWorkingSetBaseline(database, dependencies.state.captureRoot(), dependencies.state.capturePresets?.() ?? null, coordinator.captureMaterializedBaseline())
+        baseline ??= captureLwwWorkingSetBaseline(database, coordinator.capturePersistentBaselineRoot(), dependencies.state.capturePresets?.() ?? null, coordinator.captureMaterializedBaseline())
         const selectedTarget = workingSet.captureSelectedConversationTarget()
         const selectedSession = workingSet.activeConversationSession
         const lease = await dependencies.store.acquireRevision(result.revision)

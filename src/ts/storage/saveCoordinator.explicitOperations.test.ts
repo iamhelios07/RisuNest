@@ -737,7 +737,11 @@ describe('SaveCoordinator', () => {
 
         expect(store.commit).toHaveBeenCalledExactlyOnceWith({
             expectedRevision: 7,
-            root: expect.objectContaining({ modules: [captured.module] }),
+            unitMutations: [
+                { key: JSON.stringify(['exists', 'modules', captured.module.id]), type: 'set', value: true },
+                { key: JSON.stringify(['record', 'modules', captured.module.id]), type: 'set', value: captured.module },
+                { key: '["order","modules"]', type: 'set', value: [captured.module.id] },
+            ],
             assetAliases: captured.assetAliases,
             assetOwnerHeads: [{
                 owner: { kind: 'root-module-assets', moduleId: database.modules?.[0]?.id ?? 'new-id' }, ...captured.ownerHead,
@@ -749,7 +753,7 @@ describe('SaveCoordinator', () => {
         expect(store.commit).toHaveBeenCalledOnce()
     })
 
-    it('atomically appends a root module while carrying every occurrence owner head', async () => {
+    it('atomically appends a root module without rewriting unrelated stable owner heads', async () => {
         const database = makeDatabase()
         database.modules = [
             { id: 'first', name: 'First', description: '', assets: [] },
@@ -829,37 +833,16 @@ describe('SaveCoordinator', () => {
             },
         })
 
-        expect(readAssetOwnerHead.mock.calls.map(([owner]) => owner)).toEqual([
-            { kind: 'root-module-assets', moduleId: database.modules?.[0]?.id ?? 'new-id' },
-            { kind: 'root-module-assets', moduleId: database.modules?.[1]?.id ?? 'new-id' },
-            { kind: 'persona-embedded-module-assets', personaId: database.personas[0]?.id ?? 'persona-0', moduleId: database.personas[0]?.embeddedModule?.id ?? 'embedded' },
-        ])
+        expect(readAssetOwnerHead).not.toHaveBeenCalled()
         expect(commit).toHaveBeenCalledWith({
             expectedRevision: 7,
-            root: expect.objectContaining({
-                modules: [
-                    { id: 'first', name: 'First', description: '', assets: [] },
-                    { id: 'second', name: 'Second', description: '' },
-                    {
-                        id: 'new-id',
-                        name: 'Imported',
-                        description: '',
-                        assets: [['same', alias.key, 'PNG']],
-                    },
-                ],
-            }),
-            assetAliases: [alias],
-            assetOwnerHeads: [
-                existingHeads.get('root-module-assets:first'),
-                existingHeads.get('root-module-assets:second'),
-                existingHeads.get('persona-embedded-module-assets:["persona-0","embedded"]'),
-                {
-                    owner: { kind: 'root-module-assets', moduleId: database.modules?.[2]?.id ?? 'new-id' },
-                    present: true,
-                    manifestHash: '3'.repeat(64),
-                    entryCount: 1,
-                },
+            unitMutations: [
+                { key: '["exists","modules","new-id"]', type: 'set', value: true },
+                { key: '["record","modules","new-id"]', type: 'set', value: {id:'new-id',name:'Imported',description:'',assets:[['same',alias.key,'PNG']]} },
+                { key: '["order","modules"]', type: 'set', value: ['first','second','new-id'] },
             ],
+            assetAliases: [alias],
+            assetOwnerHeads: [{owner:{kind:'root-module-assets',moduleId:'new-id'},present:true,manifestHash:'3'.repeat(64),entryCount:1}],
         })
         expect(release).toHaveBeenCalledOnce()
         expect(publishRootWorkingSet).toHaveBeenCalledOnce()
@@ -1024,7 +1007,7 @@ describe('SaveCoordinator', () => {
         })).toThrow(PersistentRootModuleAppendRejectedError)
     })
 
-    it('classifies a revision conflict from commit as a rejected module append', async () => {
+    it('rejects a module append after a revision conflict stops making progress', async () => {
         const database = makeDatabase()
         database.modules = []
         const commitError = new RevisionConflictError(7, 8)
@@ -1055,7 +1038,8 @@ describe('SaveCoordinator', () => {
             message: commitError.message,
         })
 
-        expect(coordinator.revision).toBe(7)
+        expect(coordinator.revision).toBe(8)
+        expect(store.commit).toHaveBeenCalledTimes(2)
         expect(database.modules).toEqual([])
     })
 
@@ -3113,13 +3097,13 @@ describe('SaveCoordinator', () => {
     })
 
     it.each(['detail', 'replace', 'upsert'] as const)(
-        'rejects an async %s mutation when its resident character changes before commit',
+        'rebases an async %s mutation while preserving a later resident edit',
         async (operation) => {
             const database = makeDatabase()
             const mutationStarted = deferred<void>()
             const mutationGate = deferred<void>()
             const store = {
-                commit: vi.fn(),
+                commit: vi.fn(async () => ({ revision: 11 })),
                 readRoot: vi.fn(async () => ({ revision: 10, value: captureRoot(database) })),
                 readCharacter: vi.fn(async () => ({
                     revision: 10,
@@ -3174,13 +3158,16 @@ describe('SaveCoordinator', () => {
             coordinator.markPersistentDataDirty(1)
             mutationGate.resolve()
 
-            await expect(mutation).rejects.toThrow('Resident character changed')
-            expect(store.commit).not.toHaveBeenCalled()
+            await expect(mutation).resolves.toBe(true)
+            expect(store.commit).toHaveBeenCalledOnce()
+            expect(store.commit).toHaveBeenCalledWith(expect.objectContaining({ unitMutations: [{ key: '["character","char-a","name"]', type: 'set', value: operation === 'detail' ? 'Explicit detail' : operation === 'replace' ? 'Explicit replacement' : 'Explicit upsert' }] }))
+            expect((database.characters[0] as character).desc).toMatch(/edit/i)
+            expect(database.characters[0].name).toBe(operation === 'detail' ? 'Explicit detail' : operation === 'replace' ? 'Explicit replacement' : 'Explicit upsert')
         },
     )
 
     it.each(['detail', 'replace', 'upsert'] as const)(
-        'rejects a %s mutation when its resident character changes during authoritative reads',
+        'rebases a %s mutation while preserving an edit during authoritative reads',
         async (operation) => {
             const database = makeDatabase()
             const characterRead = deferred<{
@@ -3188,7 +3175,7 @@ describe('SaveCoordinator', () => {
                 value: { type: 'character'; chaId: string; name: string }
             }>()
             const store = {
-                commit: vi.fn(),
+                commit: vi.fn(async () => ({ revision: 11 })),
                 readRoot: vi.fn(async () => ({ revision: 10, value: captureRoot(database) })),
                 readCharacter: vi.fn(() => characterRead.promise),
                 queryConversations: vi.fn(async () => ({ revision: 10, items: [] })),
@@ -3233,8 +3220,11 @@ describe('SaveCoordinator', () => {
                 value: { type: 'character', chaId: 'char-a', name: 'Alpha' },
             })
 
-            await expect(mutation).rejects.toThrow('Resident character changed')
-            expect(store.commit).not.toHaveBeenCalled()
+            await expect(mutation).resolves.toBe(true)
+            expect(store.commit).toHaveBeenCalledOnce()
+            expect(store.commit).toHaveBeenCalledWith(expect.objectContaining({ unitMutations: [{ key: '["character","char-a","name"]', type: 'set', value: operation === 'detail' ? 'Explicit detail' : operation === 'replace' ? 'Explicit replacement' : 'Explicit upsert' }] }))
+            expect((database.characters[0] as character).desc).toMatch(/edit/i)
+            expect(database.characters[0].name).toBe(operation === 'detail' ? 'Explicit detail' : operation === 'replace' ? 'Explicit replacement' : 'Explicit upsert')
         },
     )
 
@@ -3295,7 +3285,7 @@ describe('SaveCoordinator', () => {
             expectedRevision: 11,
             replaceCharacter: expect.objectContaining({
                 chaId: 'char-a',
-                name: 'Alpha',
+                name: 'Explicit replacement',
                 desc: 'Later resident edit',
             }),
         })
