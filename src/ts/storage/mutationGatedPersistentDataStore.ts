@@ -25,6 +25,16 @@ export function createMutationGatedPersistentDataStore(
 ): PersistentDataStore {
     const gated = {
         open: () => store.open(),
+        lwwReadOutbox: store.lwwReadOutbox ? (request) => store.lwwReadOutbox!(request) : undefined,
+        lwwClockState: store.lwwClockState ? (request) => store.lwwClockState!(request) : undefined,
+        lwwAckOutbox: store.lwwAckOutbox ? (request) => gate.runWrite(() => store.lwwAckOutbox!(request)) : undefined,
+        lwwRetryUnpublished: store.lwwRetryUnpublished ? (request) => gate.runWrite(() => store.lwwRetryUnpublished!(request)) : undefined,
+        lwwCommitReplacement: store.lwwCommitReplacement ? (request) => gate.runTransition(() => store.lwwCommitReplacement!(request)) : undefined,
+        lwwStageReceive: store.lwwStageReceive ? (request) => gate.runWrite(() => store.lwwStageReceive!(request)) : undefined,
+        lwwApplyReceive: store.lwwApplyReceive ? (request) => gate.runWrite(() => store.lwwApplyReceive!(request)) : undefined,
+        lwwFinishReceive: store.lwwFinishReceive ? (request) => gate.runWrite(() => store.lwwFinishReceive!(request)) : undefined,
+        lwwDrainDeferred: store.lwwDrainDeferred ? (request) => gate.runWrite(() => store.lwwDrainDeferred!(request)) : undefined,
+
         readRoot: () => store.readRoot(),
         queryPresets: () => store.queryPresets(),
         readPreset: (id: string) => store.readPreset(id),

@@ -135,6 +135,7 @@ export async function* streamRisuSaveFromLease(
             ? { pluginStorageMeta: storedPluginStorage.meta }
             : {}),
     } as Database
+    adaptStableSelectionsForExport(rootWithPresets, storedRoot, storedPresets)
     const root = options?.replaceResources
         ? replaceDatabaseRootResources(rootWithPresets, options.replaceResources)
         : rootWithPresets
@@ -216,6 +217,7 @@ export async function* streamRisuSaveFromLease(
 
 export interface RisuSaveExportRuntime {
     readonly store: PersistentDataStore
+    withPausedPersistentWrites?<T>(reason: string, operation: (token: {revision: DataRevision; mutationGeneration: number}) => Promise<T>): Promise<T>
     capturePersistentMutationToken(reason: string): Promise<{
         revision: DataRevision
         mutationGeneration: number
@@ -236,6 +238,11 @@ export interface PinnedRisuSaveExport {
     ): Promise<T>
 }
 
+function adaptStableSelectionsForExport(database: Database, root: import('./persistentDataStore').PersistentRoot, presets: Database['botPresets']): void {
+    if (typeof root.botPresetsId === 'string') database.botPresetsId = Math.max(0, presets.findIndex((preset) => preset['id'] === root.botPresetsId))
+    if (typeof root.selectedPersona === 'string') database.selectedPersona = Math.max(0, database.personas?.findIndex((persona) => persona.id === root.selectedPersona) ?? 0)
+}
+
 async function materializeDatabaseFromLease(
     reader: PersistentRevisionReader,
 ): Promise<Database> {
@@ -248,7 +255,9 @@ async function materializeDatabaseFromLease(
     for await (const character of characterValues(reader)) {
         characters.push(character)
     }
-    return { ...root, characters, botPresets, pluginCustomStorage } as Database
+    const database = { ...root, characters, botPresets, pluginCustomStorage } as Database
+    adaptStableSelectionsForExport(database, root, botPresets)
+    return database
 }
 
 async function collectChunks(chunks: AsyncIterable<Uint8Array>): Promise<Uint8Array> {
@@ -272,6 +281,7 @@ export async function withFlushedRisuSaveExport<T>(
     reason: string,
     callback: (pinned: PinnedRisuSaveExport) => Promise<T>,
 ): Promise<T> {
+    if (runtime.withPausedPersistentWrites) return runtime.withPausedPersistentWrites(reason, (token) => withPinnedRisuSaveExport(runtime.store, token, callback))
     const token = await runtime.capturePersistentMutationToken(reason)
     return withPinnedRisuSaveExport(runtime.store, token, callback)
 }

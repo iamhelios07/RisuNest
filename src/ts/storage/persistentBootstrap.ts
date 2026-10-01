@@ -161,8 +161,8 @@ async function canonicalizePresetSelection(
     const catalog = await store.queryPresets()
     assertRevision(revision, catalog.revision)
     if (
-        root.botPresetsId < 0 ||
-        catalog.items.some((item) => item.configuredIndex === root.botPresetsId)
+        (typeof root.botPresetsId === 'number' && root.botPresetsId < 0) ||
+        catalog.items.some((item) => typeof root.botPresetsId === 'string' ? item.id === root.botPresetsId : item.configuredIndex === root.botPresetsId)
     ) {
         return root
     }
@@ -171,7 +171,7 @@ async function canonicalizePresetSelection(
     )[0]
     return {
         ...root,
-        botPresetsId: first?.configuredIndex ?? 0,
+        botPresetsId: first?.id ?? '',
     }
 }
 
@@ -228,14 +228,14 @@ async function queryAllCharacterSummaries(
 async function readSelectedPreset(
     store: PersistentDataStore,
     revision: DataRevision,
-    configuredIndex: number,
+    configuredIndex: number | string,
 ): Promise<{
     catalog: PresetCatalog
     active: ScalableBootstrapProjection['activePreset']
 }> {
     const catalog = await store.queryPresets()
     assertRevision(revision, catalog.revision)
-    const summary = catalog.items.find((item) => item.configuredIndex === configuredIndex)
+    const summary = catalog.items.find((item) => typeof configuredIndex === 'string' ? item.id === configuredIndex : item.configuredIndex === configuredIndex)
     if (!summary) return { catalog, active: null }
     const preset = await store.readPreset(summary.id)
     if (!preset) throw new Error(`Preset ${summary.id} was not found`)
