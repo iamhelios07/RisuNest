@@ -1,5 +1,7 @@
+import { isConversationSummaryStub } from './conversationResidency'
 import { isTauri } from '../platform'
 import { untrack } from 'svelte'
+import type { Chat, character, groupChat } from './database.svelte'
 import type { RootMutation } from './persistentDataStore'
 import {
     canonicalJson,
@@ -11,6 +13,8 @@ import { diffRootMutations } from './rootMutation'
 
 /** Production-only: read closures must expose the deeply reactive DBState working set. */
 export interface PersistenceCanonicalCapture {
+    materializedCharacters?(): ReadonlyMap<string, character | groupChat>
+    characters?(): ReadonlyMap<string, string>
     root(): string
     diffRoot(before: string, after: string): RootMutation[]
     presets(): string | null
@@ -81,6 +85,7 @@ function objectCapture(
     omit: ReadonlySet<string>,
     ordered: boolean,
     stringSeeds?: Map<string, readonly [string, string]>,
+    transform?: (key: string, value: unknown) => unknown,
 ) {
     const fields = new Map<string, ReturnType<typeof fieldCapture>>()
     let previous:
@@ -120,7 +125,7 @@ function objectCapture(
                             // Do not evaluate an external getter inside a cached derived.
                             if (value && Object.getOwnPropertyDescriptor(value, key)?.get)
                                 throw volatileValue
-                            return value?.[key]
+                            return transform ? transform(key, value?.[key]) : value?.[key]
                         },
                         () => {
                             const seed = stringSeeds?.get(key)
@@ -169,7 +174,7 @@ function objectCapture(
         if (source === null) return null
         const value: Record<string, unknown> = {}
         for (const key of Object.keys(source))
-            if (!omit.has(key)) defineOwnEnumerableProperty(value, key, source[key])
+            if (!omit.has(key)) defineOwnEnumerableProperty(value, key, transform ? transform(key, source[key]) : source[key])
         return { json: ordered ? pluginStorageJson(value) : canonicalJson(value), entries: null }
     }
 }
@@ -179,18 +184,71 @@ export function createPersistenceCanonicalCapture(read: {
     pluginStorage(): Record<string, unknown> | null
     presets(): unknown
     character(): unknown
+    characters?(): readonly (character | groupChat)[]
+    rootField?(key: string, value: unknown): unknown
 }): PersistenceCanonicalCapture {
     const captureRoot = objectCapture(
         () => read.root() as Record<string, unknown>,
         new Set(['characters', 'botPresets', 'pluginCustomStorage', 'pluginStorageMeta', ...(isTauri ? ['account'] : [])]),
         false,
+        undefined,
+        read.rootField,
     )
+    const characterCaptures = new Map<string, { value: character | groupChat; capture: () => {json:string; value:character | groupChat} }>()
+    const captureCharacters = () => {
+        const result = new Map<string, {json:string; value:character | groupChat}>()
+        for (const value of read.characters?.() ?? []) {
+            let entry = characterCaptures.get(value.chaId)
+            if (!entry || entry.value !== value) {
+                const detail = untrack(() => objectCapture(() => value as unknown as Record<string, unknown>, new Set(['chats']), false))
+                const chats = new Map<Chat, ReturnType<typeof objectCapture>>()
+                const decoded = new Map<string, {json:string; value:unknown}>()
+                const decode = (key: string, json: string) => {
+                    let previous = decoded.get(key)
+                    if (previous?.json !== json) { previous = {json, value: JSON.parse(json)}; decoded.set(key, previous) }
+                    return previous!.value
+                }
+                let previous: {json:string; value:character | groupChat} | undefined
+                const capture = () => {
+                    const capturedDetail = detail()!
+                    const details = Object.fromEntries((capturedDetail.entries ?? Object.entries(JSON.parse(capturedDetail.json)).map(([key,value]) => [key, canonicalJson(value)] as const))
+                        .map(([key,json]) => [key, decode('detail:' + key, json)]))
+                    const serializedChats: string[] = []
+                    const chatValues: Chat[] = []
+                    const active = new Set(value.chats)
+                    for (const chat of chats.keys()) if (!active.has(chat)) chats.delete(chat)
+                    for (const chat of value.chats) {
+                        let capturedChat = chats.get(chat)
+                        if (!capturedChat) {
+                            const omit = isConversationSummaryStub(chat) || !Object.prototype.propertyIsEnumerable.call(chat, 'message') ? new Set(['message']) : new Set<string>()
+                            capturedChat = untrack(() => objectCapture(() => chat as unknown as Record<string, unknown>, omit, false))
+                            chats.set(chat, capturedChat)
+                        }
+                        const captured = capturedChat()!
+                        serializedChats.push(captured.json)
+                        chatValues.push(Object.fromEntries((captured.entries ?? Object.entries(JSON.parse(captured.json)).map(([key,value]) => [key,canonicalJson(value)] as const))
+                            .map(([key,json]) => [key, decode('chat:' + chat.id + ':' + key, json)])) as Chat)
+                    }
+                    const json = capturedDetail.json.slice(0, -1) + ',"chats":[' + serializedChats.join(',') + ']}'
+                    if (previous?.json === json) return previous
+                    return previous = {json, value: {...details, chats:chatValues} as unknown as character | groupChat}
+                }
+                entry = {value, capture}
+                characterCaptures.set(value.chaId, entry)
+            }
+            result.set(value.chaId, entry.capture())
+        }
+        for (const id of characterCaptures.keys()) if (!result.has(id)) characterCaptures.delete(id)
+        return result
+    }
     const storageStringSeeds = new Map<string, readonly [string, string]>()
     const captureStorage = objectCapture(read.pluginStorage, new Set(), true, storageStringSeeds)
     const presets = fieldCapture(read.presets)
     const character = fieldCapture(read.character)
     const roots = new Map<string, ReadonlyMap<string, string>>()
     return {
+        characters: () => new Map([...captureCharacters()].map(([id,value]) => [id,value.json])),
+        materializedCharacters: () => new Map([...captureCharacters()].map(([id,value]) => [id,value.value])),
         seedPluginStorage(capture) {
             storageStringSeeds.clear()
             for (const [key, value, json] of capture.encodedStrings ?? []) {
@@ -228,6 +286,8 @@ export function createPersistenceCanonicalCapture(read: {
             return json === 'null' || json === undefined ? null : json
         },
         character: () => {
+            const selected = read.character() as character | groupChat | null
+            if (selected && read.characters) return captureCharacters().get(selected.chaId)?.json ?? canonicalJson(selected)
             const result = character()
             const json = result.volatile ? canonicalJson(read.character()) : result.json
             return json === 'null' || json === undefined ? null : json

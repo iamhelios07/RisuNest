@@ -1,0 +1,313 @@
+import { describe, expect, it, vi } from 'vitest'
+import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
+import { IndexedDbPersistentDataStore } from './indexedDbPersistentDataStore'
+import { fixtureDatabase } from './tests/persistentDataFixtures'
+import { SaveCoordinator } from './saveCoordinator'
+import { capturePersistentRoot, createPersistentDataRuntime } from './persistentDataRuntime'
+import { applyLwwWorkingSetUnits, captureLwwWorkingSetBaseline } from './lwwWorkingSetApply'
+import { createGeneratingConversationRegistry } from './generatingConversationRegistry'
+import { diffMaterializedCharacter, diffRecordCollection } from './persistentUnitCapture'
+import { createConversationSummaryStubFromChat } from './conversationResidency'
+import type { Database, character } from './database.svelte'
+import type { LwwStageReceive, PersistentDataStore, WorkingSetCommit } from './persistentDataStore'
+
+async function harness() {
+    const database = structuredClone(fixtureDatabase)
+    database.modules = []
+    database.personas = []
+    database.botPresetsId = 0
+    database.selectedPersona = 0
+    const store = new IndexedDbPersistentDataStore(crypto.randomUUID(), new IDBFactory(), IDBKeyRange)
+    await store.open()
+    const imported = await store.replaceFromDatabase(database)
+    const commit = vi.spyOn(store, 'commit')
+    const coordinator = new SaveCoordinator({ store,
+        captureRoot: () => capturePersistentRoot(database), capturePresets: () => database.botPresets,
+        captureCharacters: () => database.characters, captureSelectedCharacter: () => database.characters[0],
+        captureCharacter: (id) => database.characters.find((value) => value.chaId === id) ?? null,
+        replaceDatabase: () => undefined })
+    coordinator.initialize(imported.revision, { ...database, ...capturePersistentRoot(database) } as unknown as Database)
+    return { database, store, commit, coordinator }
+}
+
+async function runtimeHarness(registry?: ReturnType<typeof createGeneratingConversationRegistry>) {
+    const values = await harness()
+    const {database,store} = values
+    const runtime = createPersistentDataRuntime({store,state:{
+        captureRoot:()=>capturePersistentRoot(database), capturePresets:()=>database.botPresets,
+        captureCharacters:()=>database.characters, captureWorkingSetDatabase:()=>database,
+        captureSelectedCharacter:()=>database.characters[0], captureCharacter:(id)=>database.characters.find((value)=>value.chaId===id)??null,
+        getGeneratingConversations:()=>registry?.snapshot() ?? [],
+        getSelectedCharacterId:()=>database.characters[0]?.chaId,replaceDatabase:()=>undefined,publishCharacter:()=>undefined,publishConversation:()=>undefined,
+    },prepareDatabase:async(value)=>value})
+    await runtime.initializeActiveWorkingSet(database)
+    return {...values,store:store as PersistentDataStore,runtime}
+}
+
+describe('LWW renderer save path', () => {
+    it('adopts accepted remote units without re-emitting them or resetting unrelated local edits', async () => {
+        const {database,store,runtime,commit} = await runtimeHarness()
+        store.lwwStageReceive = async()=>undefined
+        store.lwwApplyReceive = async()=>{
+            const revision=(await store.readRoot()).revision
+            const result=await store.commit({expectedRevision:revision,unitMutations:[{key:'["character","char-a","notes"]',type:'set',value:'remote'}]})
+            return {...result,affectedKeys:['["character","char-a","notes"]'],heldKeys:[],deferredKeys:[]}
+        }
+        store.lwwFinishReceive=async()=>undefined
+        await runtime.applyLwwReceive({bindingAuthority:'a',requestId:'r',changes:[],progress:{kind:'server',cursor:'1'},admittedTimeUpperMs:'100'})
+        expect((database.characters[1] as character).notes).toBe('remote')
+        commit.mockClear()
+        await runtime.flushPendingDataLocally('after-remote')
+        expect(commit).not.toHaveBeenCalled()
+    })
+
+    it('preserves stable preset and persona selections when remote catalogs reorder', async () => {
+        const { database } = await harness()
+        database.personas = [{ id: 'one', name: 'One' }, { id: 'two', name: 'Two' }] as Database['personas']
+        database.selectedPersona = 1
+        const selectedPreset = database.botPresets[0]['id']
+        const baseline = captureLwwWorkingSetBaseline(database, capturePersistentRoot(database), database.botPresets)
+        const root = { ...capturePersistentRoot(database), personas: [...database.personas].reverse() }
+        const presets = [...database.botPresets].reverse()
+        const reader = { readRoot: async () => ({ revision: 2, value: root }),
+            queryPresets: async () => ({ revision: 2, items: presets.map((preset, configuredIndex) => ({ id: preset['id'], name: preset.name, configuredIndex })) }),
+        } as unknown as import('./persistentDataStore').PersistentRevisionReader
+        await applyLwwWorkingSetUnits(database, baseline, reader, ['["order","presets"]', '["order","personas"]'])
+        expect(database.botPresets[database.botPresetsId]['id']).toBe(selectedPreset)
+        expect(database.personas[database.selectedPersona].id).toBe('two')
+        expect(baseline.root.selectedPersona).toBe('two')
+    })
+
+    it('finishes durable receive progress when renderer projection fails and requires refresh', async () => {
+        const {store,runtime}=await runtimeHarness()
+        store.lwwStageReceive=async()=>undefined
+        store.lwwApplyReceive=async()=>({revision:runtime.revision,affectedKeys:['["character","char-a","notes"]'],heldKeys:[],deferredKeys:[]})
+        store.lwwFinishReceive=vi.fn(async()=>undefined)
+        vi.spyOn(store,'acquireRevision').mockRejectedValueOnce(new Error('projection unavailable'))
+        await expect(runtime.applyLwwReceive({bindingAuthority:'a',requestId:'r',changes:[],progress:{kind:'server',cursor:'1'},admittedTimeUpperMs:'100'})).rejects.toThrow('projection unavailable')
+        expect(store.lwwFinishReceive).toHaveBeenCalledOnce()
+        expect(runtime.pendingWorkingSetRefreshRevision).toBe(runtime.revision)
+    })
+
+    it('adopts an explicit opaque local root edit without exposing an unknown received root unit', async () => {
+        const {database,runtime,store} = await runtimeHarness()
+        await runtime.commitPersistentUnitIntent('opaque-local',[{key:'["root","opaqueFutureField"]',type:'set',value:{local:true}}])
+        expect((database as unknown as Record<string,unknown>).opaqueFutureField).toEqual({local:true})
+        const baseline = captureLwwWorkingSetBaseline(database,capturePersistentRoot(database),database.botPresets)
+        const reader = {readRoot:async()=>({revision:runtime.revision,value:{...capturePersistentRoot(database),unknownReceived:'opaque',vertexAccessToken:'remote token',loreBookPage:99}})} as unknown as import('./persistentDataStore').PersistentRevisionReader
+        await applyLwwWorkingSetUnits(database,baseline,reader,['["root","unknownReceived"]','["root","vertexAccessToken"]','["root","loreBookPage"]'])
+        expect(database).not.toHaveProperty('unknownReceived')
+        expect(database.vertexAccessToken).not.toBe('remote token')
+        expect(database.loreBookPage).not.toBe(99)
+        expect((await store.readRoot()).value).toHaveProperty('opaqueFutureField',{local:true})
+    })
+
+    it('commits plugin units once if their pinned projection loses its revision', async () => {
+        const {store,runtime,commit}=await runtimeHarness()
+        vi.spyOn(store,'acquireRevision').mockRejectedValueOnce(new Error('pin lost'))
+        await expect(runtime.commitPersistentUnitIntent('plugin',[{key:'["character","char-a","notes"]',type:'set',value:'durable'}])).rejects.toThrow('pin lost')
+        expect(commit).toHaveBeenCalledOnce()
+        expect((await store.readCharacter('char-a'))?.value['notes']).toBe('durable')
+        expect(runtime.pendingWorkingSetRefreshRevision).toBe(runtime.revision)
+    })
+
+    it('captures fields and conversations of two characters independently of selection', async () => {
+        const { database, store, commit, coordinator } = await harness()
+        ;(database.characters[0] as character).notes = 'first field'
+        ;(database.characters[1] as character).notes = 'second field'
+        database.characters[0].chats[0].note = 'first metadata'
+        database.characters[1].chats[0].message.push({ role: 'char', data: 'second reply', chatId: 'kept-message-id' })
+        coordinator.markPersistentDataDirty(0)
+        await coordinator.flushPendingDataLocally('two-characters')
+        expect(((await store.readCharacter('char-b'))?.value as character).notes).toBe('first field')
+        expect(((await store.readCharacter('char-a'))?.value as character).notes).toBe('second field')
+        expect((await store.readConversation('char-b', 'conv-beta'))?.value.note).toBe('first metadata')
+        expect((await store.readConversation('char-a', 'conv-long'))?.value.message.at(-1)?.chatId).toBe('kept-message-id')
+        expect(commit.mock.calls[0][0]).not.toHaveProperty('replaceCharacter')
+        expect(commit.mock.calls[0][0].unitMutations?.map((value) => value.key)).toEqual(expect.arrayContaining([
+            '["character","char-b","notes"]', '["character","char-a","notes"]', '["conversation","char-b","conv-beta","note"]',
+        ]))
+        commit.mockClear()
+        coordinator.markPersistentDataDirty(0)
+        await coordinator.flushPendingDataLocally('unchanged')
+        expect(commit).not.toHaveBeenCalled()
+    })
+
+    it('persists changed opaque and device-local working-set fields and suppresses unchanged values', async () => {
+        const {database,store,coordinator,commit} = await harness()
+        const owner = database.characters[1] as character
+        const chat = owner.chats[0]
+        Object.assign(owner,{opaqueOwn:{local:'character'},chatPage:1,lastInteraction:123,statics:{messages:44}})
+        Object.assign(chat,{opaqueOwn:{local:'chat'},isStreaming:true})
+        Object.assign(database,{opaqueOwn:{local:'root'}})
+        await coordinator.flushPendingDataLocally('opaque-local-observer')
+        expect((await store.readCharacter(owner.chaId))?.value).toMatchObject({opaqueOwn:{local:'character'},chatPage:1,lastInteraction:123,statics:{messages:44}})
+        expect((await store.readConversation(owner.chaId,chat.id!))?.value).toMatchObject({opaqueOwn:{local:'chat'},isStreaming:true})
+        expect((await store.readRoot()).value).toHaveProperty('opaqueOwn',{local:'root'})
+        commit.mockClear()
+        await coordinator.flushPendingDataLocally('unchanged-local-opaque')
+        expect(commit).not.toHaveBeenCalled()
+    })
+
+    it('projects shared remote fields while preserving opaque and local character/chat state', async () => {
+        const {database} = await harness()
+        const live = database.characters[1] as character
+        Object.assign(live,{opaqueOwn:'local',lastInteraction:7,statics:{messages:4}})
+        Object.assign(live.chats[0],{opaqueOwn:'local-chat',isStreaming:true})
+        const baseline = captureLwwWorkingSetBaseline(database,capturePersistentRoot(database),database.botPresets)
+        live['statics'].messages = 5
+        const reader = {
+            readCharacter:async()=>({revision:2,value:{...live,opaqueOwn:'remote',lastInteraction:99,statics:{messages:100,shared:42}}}),
+            readConversationMetadata:async()=>({revision:2,value:{conversation:{...live.chats[0],opaqueOwn:'remote-chat',isStreaming:false,note:'shared note'}}}),
+        } as unknown as import('./persistentDataStore').PersistentRevisionReader
+        await applyLwwWorkingSetUnits(database,baseline,reader,['["character","char-a","opaqueOwn"]','["character","char-a","lastInteraction"]','["character","char-a","statics"]','["conversation","char-a","conv-long","opaqueOwn"]','["conversation","char-a","conv-long","isStreaming"]','["conversation","char-a","conv-long","note"]'])
+        expect(live).toMatchObject({opaqueOwn:'local',lastInteraction:7,statics:{messages:5,shared:42}})
+        expect(live.chats[0]).toMatchObject({opaqueOwn:'local-chat',isStreaming:true,note:'shared note'})
+    })
+
+    it('retries changed units onto a newer revision without replacing unrelated values', async () => {
+        const { database, store, coordinator } = await harness()
+        await store.commit({ expectedRevision: coordinator.revision, unitMutations: [
+            { key: '["character","char-a","desc"]', type: 'set', value: 'intervening description' },
+        ] })
+        ;(database.characters[1] as character).notes = 'intentional note'
+        await coordinator.flushPendingDataLocally('revision-race')
+        const current = (await store.readCharacter('char-a'))!.value as character
+        expect(current.notes).toBe('intentional note')
+        expect(current.desc).toBe('intervening description')
+    })
+
+    it('does not replace unloaded conversation bodies with empty catalog placeholders', async () => {
+        const { database, store, coordinator } = await harness()
+        const original = database.characters[1].chats[0]
+        database.characters[1].chats[0] = createConversationSummaryStubFromChat('char-a', original, 0)
+        coordinator.initialize(coordinator.revision, database)
+        ;(database.characters[1] as character).notes = 'detail only'
+        await coordinator.flushPendingDataLocally('catalog-shell')
+        expect((await store.readConversation('char-a', 'conv-long'))?.value.message).toHaveLength(130)
+    })
+
+    it('creates a conversation parent before committing its complete message list', async () => {
+        const {store,coordinator} = await harness()
+        await coordinator.commitPersistentUnitIntent('create-chat', [
+            {key:'["exists","conversation","char-a","new-chat"]',type:'set',value:true},
+            {key:'["conversation","char-a","new-chat","name"]',type:'set',value:'New'},
+        ], [], [{characterId:'char-a',conversationId:'new-chat',messages:[{role:'char',data:'first',chatId:'untouched-message-id'}]}])
+        expect((await store.readConversation('char-a','new-chat'))?.value).toMatchObject({name:'New',message:[{chatId:'untouched-message-id',data:'first'}]})
+        await expect(coordinator.commitPersistentUnitIntent('missing-chat', [], [], [{characterId:'char-a',conversationId:'missing',messages:[]}])).rejects.toThrow('Missing conversation parent')
+    })
+
+    it('emits only one changed generic record and permits plugin reinstall', async () => {
+        expect(diffRecordCollection('plugins', [{ name: 'a', source: 'old' }, { name: 'b', source: 'untouched' }],
+            [{ name: 'a', source: 'new' }, { name: 'b', source: 'untouched' }])).toEqual([
+            { key: '["record","plugins","a"]', type: 'set', value: { name: 'a', source: 'new' } },
+        ])
+        const { store, coordinator } = await harness()
+        await coordinator.commitPersistentUnitIntent('install', [{ key: '["record","plugins","owner"]', type: 'set', value: { name: 'owner', source: 'first' } }])
+        await coordinator.commitPersistentUnitIntent('remove', [{ key: '["record","plugins","owner"]', type: 'delete' }])
+        await coordinator.commitPersistentUnitIntent('reinstall', [{ key: '["record","plugins","owner"]', type: 'set', value: { name: 'owner', source: 'second' } }])
+        expect((await store.readRoot()).value.plugins).toEqual([{ name: 'owner', source: 'second' }])
+    })
+
+    it('keeps group membership atomic and excludes unchanged fields', () => {
+        const before = { ...fixtureDatabase.characters[0], type: 'group', characters: ['a'], characterTalks: [1], characterActive: [true] } as unknown as Database['characters'][number]
+        const after = structuredClone(before)
+        Object.assign(after, { characters: ['b'], characterTalks: [2], characterActive: [false] })
+        expect(diffMaterializedCharacter(before, after).unitMutations).toEqual([
+            { key: '["group-members","char-b"]', type: 'set', value: { characters: ['b'], characterTalks: [2], characterActive: [false] } },
+        ])
+    })
+
+    it('pins export under paused writes while later saves wait', async () => {
+        const { database, coordinator, commit } = await harness()
+        let release!: () => void
+        let entered!: () => void
+        const waiting = new Promise<void>((resolve) => { release = resolve })
+        const started = new Promise<void>((resolve) => { entered = resolve })
+        const exportJob = coordinator.withPausedPersistentWrites('export', async (token) => { entered(); await waiting; return token.revision })
+        await started
+        database.username = 'later'
+        const save = coordinator.flushPendingDataLocally('later-save')
+        expect(commit).not.toHaveBeenCalled()
+        release()
+        await exportJob
+        await save
+        expect(commit).toHaveBeenCalledOnce()
+    })
+
+    it('drains completion immediately while another conversation keeps generating', async () => {
+        const registry = createGeneratingConversationRegistry()
+        const completeA = registry.register({characterId:'char-a',conversationId:'conv-long'})
+        const completeB = registry.register({characterId:'char-b',conversationId:'conv-beta'})
+        const {database,store,runtime,commit} = await runtimeHarness(registry)
+        store.lwwStageReceive = async () => undefined
+        store.lwwApplyReceive = async () => ({revision:runtime.revision,affectedKeys:[],heldKeys:[],deferredKeys:['["messages","char-a","conv-long"]','["messages","char-b","conv-beta"]']})
+        store.lwwFinishReceive = async () => undefined
+        store.lwwDrainDeferred = vi.fn(async (request) => {
+            expect(request.generating).toEqual([{characterId:'char-b',conversationId:'conv-beta'}])
+            const current = (await store.readConversation('char-a','conv-long'))!
+            const result = await store.commit({expectedRevision:runtime.revision,conversations:[{type:'replace-range',characterId:'char-a',conversationId:'conv-long',start:current.value.message.length,deleteCount:0,messages:[{role:'char',data:'deferred remote',chatId:'remote-message-id'}]}]})
+            return {...result,affectedKeys:['["messages","char-a","conv-long"]'],heldKeys:[],deferredKeys:['["messages","char-b","conv-beta"]']}
+        })
+        await runtime.applyLwwReceive({bindingAuthority:'a',requestId:'receive',changes:[],progress:{kind:'server',cursor:'1'},admittedTimeUpperMs:'100'})
+        completeA()
+        await runtime.acknowledgeGenerationCompletion()
+        expect(store.lwwDrainDeferred).toHaveBeenCalledOnce()
+        expect(database.characters[1].chats[0].message.at(-1)?.chatId).toBe('remote-message-id')
+        expect(database.characters[0].chats[0].message).toHaveLength(3)
+        commit.mockClear()
+        await runtime.flushPendingDataLocally('after-completion-drain')
+        expect(commit).not.toHaveBeenCalled()
+        completeB()
+    })
+
+    it('registers all generating conversations using both stable IDs', () => {
+        const registry = createGeneratingConversationRegistry()
+        const releaseA = registry.register({ characterId: 'a', conversationId: 'same' })
+        const releaseB = registry.register({ characterId: 'b', conversationId: 'same' })
+        const secondA = registry.register({ characterId: 'a', conversationId: 'same' })
+        releaseA()
+        expect(registry.snapshot()).toHaveLength(2)
+        secondA()
+        expect(registry.snapshot()).toEqual([{ characterId: 'b', conversationId: 'same' }])
+        releaseB()
+        expect(registry.snapshot()).toEqual([])
+    })
+
+    it('flushes capture before native apply and refreshes unselected fields without initializing again', async () => {
+        const { database, store, coordinator } = await harness()
+        const registry = createGeneratingConversationRegistry()
+        registry.register({ characterId: 'char-a', conversationId: 'conv-long' })
+        const stage = vi.fn(async () => {
+            expect(((await store.readCharacter('char-b'))?.value as character).notes).toBe('uncaptured local')
+        })
+        const apply = vi.fn(async () => {
+            const revision = (await store.readRoot()).revision
+            const result = await store.commit({ expectedRevision: revision, unitMutations: [{ key: '["character","char-a","desc"]', type: 'set', value: 'remote field' }] })
+            return { revision: result.revision, affectedKeys: ['["character","char-a","desc"]'], heldKeys: [], deferredKeys: ['["messages","char-a","conv-long"]'] }
+        })
+        const finish = vi.fn(async () => undefined)
+        const native = store as PersistentDataStore
+        native.lwwStageReceive = stage
+        native.lwwApplyReceive = apply
+        native.lwwFinishReceive = finish
+        const runtime = createPersistentDataRuntime({ store: native, state: {
+            captureRoot: () => capturePersistentRoot(database), capturePresets: () => database.botPresets,
+            captureCharacters: () => database.characters, captureSelectedCharacter: () => database.characters[0],
+            captureCharacter: (id) => database.characters.find((value) => value.chaId === id) ?? null,
+            captureWorkingSetDatabase: () => database, getSelectedCharacterId: () => 'char-b',
+            getGeneratingConversations: () => registry.snapshot(), replaceDatabase: () => undefined,
+            publishCharacter: () => undefined, publishConversation: () => undefined,
+        }, prepareDatabase: async (value) => value })
+        await runtime.initializeActiveWorkingSet(database)
+        const initialize = vi.spyOn(SaveCoordinator.prototype, 'initialize')
+        ;(database.characters[0] as character).notes = 'uncaptured local'
+        await runtime.applyLwwReceive({ bindingAuthority: '1', requestId: 'receive', changes: [], progress: { kind: 'server', cursor: '1' }, admittedTimeUpperMs: '100' } as LwwStageReceive)
+        expect(apply).toHaveBeenCalledWith({ bindingAuthority: '1', requestId: 'receive', generating: [{ characterId: 'char-a', conversationId: 'conv-long' }] })
+        expect((database.characters[1] as character).desc).toBe('remote field')
+        expect((database.characters[0] as character).notes).toBe('uncaptured local')
+        expect(finish).toHaveBeenCalledOnce()
+        expect(initialize).not.toHaveBeenCalled()
+        initialize.mockRestore()
+    })
+})
