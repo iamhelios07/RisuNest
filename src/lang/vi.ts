@@ -1,4 +1,25 @@
 export const languageVietnamese = {
+    risuNest: {
+        plugins: {
+            "removeTitle": "Xóa plugin này?",
+            "removeDescription": "Nếu xóa dữ liệu plugin, cài đặt và nội dung đã lưu sẽ không được khôi phục khi cài lại. Giữ dữ liệu cho phép tiếp tục sử dụng sau khi cài lại.",
+            "removeDataOption": "Xóa cả dữ liệu plugin",
+            "removeAction": "Xóa"
+        },
+    },
+
+    checkboxConfirmation: {
+        "characterDeletion": "Xóa nhân vật",
+        "dataReplacement": "Thay thế dữ liệu hiện tại",
+        "hypaReset": "Đặt lại dữ liệu HypaV3",
+        "hypaDeletion": "Xóa các bản tóm tắt tiếp theo",
+        "pluginDataDeletion": "Xóa dữ liệu plugin",
+        "lorebookDeletion": "Xóa thư mục và mục lorebook",
+        "partialBackup": "Sao lưu không gồm tài nguyên khác",
+        "incompleteRestore": "Khôi phục không gồm dữ liệu thiếu",
+        "onlySelectedMessage": "Chỉ xóa tin nhắn này"
+    },
+
     "formating": {
         "main": "Lời nhắc chính",
         "jailbreak": "Lời nhắc bẻ khóa",

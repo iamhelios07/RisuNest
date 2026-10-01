@@ -1,7 +1,7 @@
 import { runWithMobileBackgroundTask } from '../mobileBackgroundTask'
 import { BaseDirectory, open, writeFile } from "@tauri-apps/plugin-fs";
 import localforage from "localforage";
-import { alertError, alertNormal, alertWait, alertMd, alertConfirm } from "../alert";
+import { alertError, alertNormal, alertWait, alertMd, alertCheckboxConfirm } from "../alert";
 import { LocalWriter, forageStorage } from "../globalApi.svelte";
 import { resolveBlobStore } from "../storage/platformBlobStore";
 import type { BlobStore } from "../storage/blobStore";
@@ -242,19 +242,14 @@ async function saveLocalBackupSnapshot(blobStore: BlobStore, pinned: PinnedRisuS
 export async function SavePartialLocalBackup(){
     if (!isTauri) await forageStorage.Init()
     const blobStore = await resolveBlobStore()
-    // First confirmation: Explain the difference from regular backup
-    const firstConfirm = await alertConfirm(language.partialBackupFirstConfirm)
-
-    if (!firstConfirm) {
-        return
-    }
-
-    // Second confirmation: Final warning about not saving assets
-    const secondConfirm = await alertConfirm(language.partialBackupSecondConfirm)
-
-    if (!secondConfirm) {
-        return
-    }
+    if (!(await alertCheckboxConfirm({
+        title: language.partialBackupFirstConfirm,
+        description: language.partialBackupSecondConfirm,
+        checkboxLabel: language.checkboxConfirmation.partialBackup,
+        actionLabel: language.confirm,
+        cancelLabel: language.cancel,
+        requireChecked: true,
+    })).confirmed) return
 
     alertWait("Saving partial local backup...")
     return runWithMobileBackgroundTask('backup', () => withFlushedRisuSaveExport(

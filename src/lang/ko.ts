@@ -1,4 +1,16 @@
 export const languageKorean = {
+    checkboxConfirmation: {
+        "characterDeletion": "캐릭터 삭제",
+        "dataReplacement": "현재 데이터 초기화",
+        "hypaReset": "HypaV3 데이터 초기화",
+        "hypaDeletion": "이후 요약 삭제",
+        "pluginDataDeletion": "플러그인 데이터 삭제",
+        "lorebookDeletion": "로어북 폴더와 항목 삭제",
+        "partialBackup": "다른 에셋을 제외한 백업",
+        "incompleteRestore": "누락된 데이터를 제외한 복원",
+        "onlySelectedMessage": "이 메시지만 삭제"
+    },
+
     close: "닫기",
     retry: "다시 시도",
     contentRenderFailed: "내용을 표시하지 못했습니다.",
@@ -1942,8 +1954,11 @@ export const languageKorean = {
                 '플러그인 API {version} 버전은 지원하지 않습니다. API 3.0으로 업데이트된 버전을 설치하세요.',
             unsupportedApiVersionLoad:
                 '다음 플러그인은 지원하지 않는 플러그인 API 버전을 사용하므로 실행되지 않았습니다. API 3.0으로 업데이트된 버전을 설치하세요.\n\n{plugins}',
-        
-            "removeRetainedDataNotice": '플러그인 값과 권한은 유지됩니다. 값은 RisuNest 설정의 플러그인 데이터에서 관리할 수 있으며, 권한은 플러그인 설정에서 초기화할 수 있습니다.',
+
+            "removeTitle": "플러그인을 삭제하시겠습니까?",
+            "removeDescription": "플러그인 데이터를 함께 삭제할 경우 플러그인을 다시 설치해도 설정과 저장된 내용이 복원되지 않습니다. 플러그인 데이터를 유지하면 다시 설치했을 때 기존 내용을 그대로 사용할 수 있습니다.",
+            "removeDataOption": "플러그인 데이터도 삭제",
+            "removeAction": "삭제",
         },
         exitDrain: {
             title: '동기화를 마치는 중',

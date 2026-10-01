@@ -7,7 +7,7 @@
 
     import { DBState } from "src/ts/stores.svelte";
     import Check from "src/lib/UI/GUI/CheckInput.svelte";
-    import { alertConfirm, alertError, alertNormal, openRisuAccountLogin } from "src/ts/alert";
+    import { alertCheckboxConfirm, alertConfirm, alertError, alertNormal, openRisuAccountLogin } from "src/ts/alert";
     import { forageStorage } from "src/ts/globalApi.svelte";
     import { isTauri } from "src/ts/platform";
     import { openDataHealthScreen } from "src/ts/storage/dataHealthNavigation";
@@ -243,9 +243,7 @@
 {/if}
 <Button
     onclick={async () => {
-        if (await alertConfirm(language.backupConfirm)) {
-            SavePartialLocalBackup();
-        }
+        await SavePartialLocalBackup();
     }}
     className="mt-2"
 >
@@ -257,8 +255,14 @@
     onclick={async () => {
         if (
             isTauri ||
-            ((await alertConfirm(language.backupLoadConfirm)) &&
-                (await alertConfirm(language.backupLoadConfirm2)))
+            (await alertCheckboxConfirm({
+                title: language.backupLoadConfirm,
+                description: language.backupLoadConfirm2,
+                checkboxLabel: language.checkboxConfirmation.dataReplacement,
+                actionLabel: language.confirm,
+                cancelLabel: language.cancel,
+                requireChecked: true,
+            })).confirmed
         ) {
             await runLocalBackupOperation("import");
         }

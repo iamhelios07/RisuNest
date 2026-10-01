@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
+const restoreAlerts = vi.hoisted(() => ({ confirm: vi.fn(), checkbox: vi.fn() }))
+vi.mock('../alert', () => ({ alertConfirm: restoreAlerts.confirm, alertCheckboxConfirm: restoreAlerts.checkbox }))
 const deviceRestore = vi.hoisted(() => ({ flushDeviceStateBeforeRestore: vi.fn(async () => {}), refreshDeviceStateAfterRestore: vi.fn(async () => {}) }))
 vi.mock('./deviceStateRestore', () => deviceRestore)
 
@@ -4524,4 +4526,24 @@ it('cancels an incomplete legacy restore before acquiring the replacement fence'
     expect(acquire).not.toHaveBeenCalled()
     expect(commands).toContain('native_file_job_cancel')
     expect(commands).not.toContain('native_file_job_finalize')
+})
+
+it.each(['both', 'cold', 'inlay'] as const)('cancels default incomplete restore warnings in one dialog: %s', async kind => {
+    restoreAlerts.confirm.mockReset().mockResolvedValue(false)
+    restoreAlerts.checkbox.mockReset().mockResolvedValue({ confirmed: false, checked: false })
+    const preview = { unavailableColdKeys: kind === 'inlay' ? [] : ['missing'], characterNames: ['Synthetic'], invalidInlays: kind === 'cold' ? [] : ['inlay_aa.risuinlay'] }
+    const states = [{ ...status('waitingForInput'), phase: 'awaiting-activation', incompleteRestorePreview: preview }, status('cancelled')]
+    const acquire = vi.fn()
+    await expect(runNativeLegacyLocalBackupRestore(
+        restoreRuntime(17, { acquire }), { type: 'desktopPath', path: 'synthetic.bin' }, {},
+        { isTauri: () => true, wait: async () => undefined, invoke: async command => {
+            if (command === 'native_file_job_start') return { jobId: 'job-1' }
+            if (command === 'native_file_job_status') return states.shift()
+            return true
+        } },
+    )).rejects.toMatchObject({ name: 'AbortError' })
+    expect(acquire).not.toHaveBeenCalled()
+    expect(restoreAlerts.checkbox).toHaveBeenCalledTimes(kind === 'both' ? 1 : 0)
+    expect(restoreAlerts.confirm).toHaveBeenCalledTimes(kind === 'both' ? 0 : 1)
+    if (kind === 'both') expect(restoreAlerts.checkbox).toHaveBeenCalledWith(expect.objectContaining({ requireChecked: true }))
 })

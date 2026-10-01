@@ -1,4 +1,25 @@
 export const languageSpanish = {
+    risuNest: {
+        plugins: {
+            "removeTitle": "¿Eliminar este plugin?",
+            "removeDescription": "Si eliminas los datos del plugin, sus ajustes y contenido guardado no se recuperarán al reinstalarlo. Si conservas los datos, podrás usarlos tras reinstalarlo.",
+            "removeDataOption": "Eliminar también los datos del plugin",
+            "removeAction": "Eliminar"
+        },
+    },
+
+    checkboxConfirmation: {
+        "characterDeletion": "Eliminar personaje",
+        "dataReplacement": "Reemplazar los datos actuales",
+        "hypaReset": "Restablecer datos de HypaV3",
+        "hypaDeletion": "Eliminar resúmenes siguientes",
+        "pluginDataDeletion": "Eliminar datos del plugin",
+        "lorebookDeletion": "Eliminar carpeta y entradas del lorebook",
+        "partialBackup": "Copia sin otros recursos",
+        "incompleteRestore": "Restaurar sin los datos ausentes",
+        "onlySelectedMessage": "Eliminar solo este mensaje"
+    },
+
     "formating": {
         "main": "Prompt Principal",
         "jailbreak": "Prompt Jailbreak",

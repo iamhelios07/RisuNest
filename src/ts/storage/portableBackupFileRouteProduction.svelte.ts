@@ -2,7 +2,7 @@ import { portableBackupSuggestedName } from './portableBackupName'
 import { invoke } from '@tauri-apps/api/core'
 import { open, save } from '@tauri-apps/plugin-dialog'
 import { language } from 'src/lang'
-import { alertConfirm, alertNormal } from '../alert'
+import { alertCheckboxConfirm, alertConfirm, alertNormal } from '../alert'
 import { pickIOSFile, discardIOSFile } from './iosFiles'
 import { isTauriIOS, isTauri, isTauriAndroid } from '../platform'
 import { loadPluginsAfterAuthoritativeRestore } from '../plugins/plugins.svelte'
@@ -296,8 +296,14 @@ export async function restoreBackupFromNativeSource(
                 if (
                     format !== 'portable' &&
                     !options.firstRun &&
-                    (!(await alertConfirm(language.backupLoadConfirm)) ||
-                        !(await alertConfirm(language.backupLoadConfirm2)))
+                    !(await alertCheckboxConfirm({
+                        title: language.backupLoadConfirm,
+                        description: language.backupLoadConfirm2,
+                        checkboxLabel: language.checkboxConfirmation.dataReplacement,
+                        actionLabel: language.confirm,
+                        cancelLabel: language.cancel,
+                        requireChecked: true,
+                    })).confirmed
                 )
                     return null
                 checkSignal(joined.signal)

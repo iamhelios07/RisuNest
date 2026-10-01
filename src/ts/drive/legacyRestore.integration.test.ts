@@ -16,7 +16,7 @@ const state = vi.hoisted(() => ({
     } as const)),
 }))
 vi.mock('src/ts/alert', () => ({
-    alertConfirm: vi.fn(async () => true), alertError: vi.fn(), alertMd: vi.fn(),
+    alertConfirm: vi.fn(async () => true), alertCheckboxConfirm: vi.fn(async () => ({ confirmed: true, checked: true })), alertError: vi.fn(), alertMd: vi.fn(),
     alertNormal: vi.fn(), alertStore: { set: vi.fn() }, alertWait: vi.fn(),
 }))
 vi.mock('src/ts/nativeLog', () => ({ recordNativeLogError: vi.fn(async () => undefined) }))
