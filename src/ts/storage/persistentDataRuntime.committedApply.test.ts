@@ -1,3 +1,4 @@
+import { applyRootMutations } from './rootMutation'
 import { describe, expect, it, vi } from 'vitest'
 import type { Database } from './database.svelte'
 import type { PersistentDataStore, PersistentRevisionLease } from './persistentDataStore'
@@ -168,9 +169,10 @@ describe('committed apply outcomes', () => {
         vi.mocked(harness.store.commit).mockImplementation(async (batch) => ({
             revision: harness.nativeCommit({
                 ...harness.durable,
+                ...applyRootMutations(harness.durable, batch.rootMutations ?? []),
                 ...batch.root,
                 botPresets: batch.replacePresets ?? [],
-            }),
+            } as Database),
         }))
 
         await expect(harness.runtime.mutatePersistentPresets('preset-settings', (state) => {

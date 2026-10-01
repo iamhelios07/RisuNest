@@ -1,3 +1,9 @@
+import { canonicalJson, canonicalClone } from './saveCoordinatorHelpers'
+import { diffRootMutations } from './rootMutation'
+import { generatingConversations } from './generatingConversationRegistry'
+import { captureLwwWorkingSetBaseline, applyLwwWorkingSetUnits } from './lwwWorkingSetApply'
+import { translatePersistentRootUnitIntents } from './persistentIdentityHooks'
+import type { LwwStageReceive, LwwReceiveHeader, LwwApplyResult, PersistentUnitMutation, ConversationMutation, WholeMessageIntent, GeneratingConversation } from './persistentDataStore'
 import { isTauri } from '../platform'
 import type { PersistenceCanonicalCapture } from './reactivePersistenceCapture.svelte'
 import type { Chat, Database, Message, botPreset, character, groupChat } from './database.svelte'
@@ -104,7 +110,10 @@ export function capturePersistentRoot(database: Database): RootDatabase {
         ...root
     } = database
     if (isTauri) delete root.account
-    return root
+    const presetId = database.botPresets?.[database.botPresetsId]?.['id']
+    const personaId = database.personas?.[database.selectedPersona]?.id
+    return { ...root, botPresetsId: typeof presetId === 'string' ? presetId : root.botPresetsId,
+        selectedPersona: typeof personaId === 'string' ? personaId : root.selectedPersona }
 }
 
 export function capturePersistentPluginStorage(
@@ -273,6 +282,10 @@ export function publishPersistentCharacterMutationToWorkingSet(
 }
 
 export interface PersistentDataRuntimeStateAdapter {
+    captureCharacters?(): readonly CompleteCharacter[]
+    captureCharacterIndex?(): ReadonlyMap<string, CompleteCharacter>
+    beforeCapture?(): void
+    afterRemoteApply?(): void
     canonicalCapture?: PersistenceCanonicalCapture
     captureRoot(): RootDatabase
     capturePluginStorage?(): Database['pluginCustomStorage'] | null
@@ -281,6 +294,7 @@ export interface PersistentDataRuntimeStateAdapter {
         mutations: readonly PluginStorageMutation[],
         keys: readonly string[],
     ): void
+    capturePresetRecords?(): readonly botPreset[]
     capturePresets?(): botPreset[] | null
     captureSelectedCharacter(): CompleteCharacter | null
     captureCharacter(id: string): CompleteCharacter | null
@@ -319,6 +333,7 @@ export interface PersistentDataRuntimeStateAdapter {
     captureWorkingSetDatabase?(): Database | null
     /** Host caches outside the working set that a remote change invalidates. */
     onPluginStorageChanged?(owner: string, key: string): void
+    getGeneratingConversations?(): readonly GeneratingConversation[]
     getGeneratingConversation?(): { characterId: string; conversationId: string } | null
     conversationViewportRowBudget?: number
     canActivateWorkingSet?(): boolean
@@ -345,6 +360,12 @@ export interface PersistentDataRuntimeDependencies {
 }
 
 export interface PersistentDataRuntime {
+    withPausedPersistentWrites<T>(reason: string, operation: (token: PersistentMutationToken) => Promise<T>): Promise<T>
+    refreshActivatedLibraryUnderPause(token: PersistentMutationToken): Promise<CommittedApplyOutcome>
+    applyLwwReceive(request: LwwStageReceive): Promise<LwwApplyResult>
+    drainLwwDeferred(request: LwwReceiveHeader): Promise<LwwApplyResult>
+    commitPersistentUnitIntent(reason: string, mutations: readonly PersistentUnitMutation[], conversations?: readonly ConversationMutation[], wholeMessages?: readonly WholeMessageIntent[]): Promise<void>
+
     readonly store: PersistentDataStore
     readonly revision: DataRevision
     getStorageAuthorityEpoch(): number
@@ -563,8 +584,13 @@ export function createPersistentDataRuntime(
         }
     }
     const coordinator = new SaveCoordinator({
+        onRoutineUnitsCommitted: dependencies.state.captureWorkingSetDatabase ? async (revision, affectedKeys) => {
+            await projectAppliedUnits({revision, affectedKeys: [...affectedKeys], heldKeys: [], deferredKeys: []})
+        } : undefined,
         canonicalCapture: dependencies.state.canonicalCapture,
         store: dependencies.store,
+        captureCharacters: dependencies.state.captureCharacters,
+        beforeCapture: dependencies.state.beforeCapture,
         captureRoot: dependencies.state.captureRoot,
         capturePluginStorage: dependencies.state.capturePluginStorage,
         publishPluginStorageWorkingSet: dependencies.state.publishPluginStorageWorkingSet
@@ -576,6 +602,7 @@ export function createPersistentDataRuntime(
                 dependencies.state.publishPluginStorageMutations!(mutations, keys))
             : undefined,
         capturePresets: dependencies.state.capturePresets,
+        capturePresetRecords: dependencies.state.capturePresetRecords,
         captureSelectedCharacter: dependencies.state.captureSelectedCharacter,
         captureSelectedConversationAuthority: () =>
             workingSet.captureSelectedConversationAuthority(),
@@ -939,8 +966,91 @@ export function createPersistentDataRuntime(
             lease?.release()
         }
     }
+    let activeReceiveHeader: LwwReceiveHeader | null = null
+    const generating = () => [...(dependencies.state.getGeneratingConversations?.() ?? generatingConversations.snapshot())]
+    const projectAppliedUnits = async (result: LwwApplyResult, baseline?: ReturnType<typeof captureLwwWorkingSetBaseline>): Promise<void> => {
+        const database = dependencies.state.captureWorkingSetDatabase?.()
+        if (!database) { coordinator.adoptAppliedUnitState(result.revision, null, null, []); return }
+        baseline ??= captureLwwWorkingSetBaseline(database, coordinator.capturePersistentBaselineRoot(), dependencies.state.capturePresets?.() ?? null, coordinator.captureMaterializedBaseline())
+        const selectedTarget = workingSet.captureSelectedConversationTarget()
+        const selectedSession = workingSet.activeConversationSession
+        const lease = await dependencies.store.acquireRevision(result.revision)
+        let applied: ReturnType<typeof captureLwwWorkingSetBaseline>
+        try { applied = await applyLwwWorkingSetUnits(database, baseline, lease, result.affectedKeys, dependencies.state.captureCharacterIndex?.()) }
+        finally { await releasePersistentRevisionLease(lease) }
+        const beforeDerive = canonicalJson(dependencies.state.captureRoot())
+        dependencies.state.afterRemoteApply?.()
+        const afterDerive = dependencies.state.captureRoot()
+        for (const mutation of diffRootMutations(JSON.parse(beforeDerive), afterDerive)) {
+            const root = applied.root as unknown as Record<string, unknown>
+            if (mutation.type === 'set') root[mutation.key] = canonicalClone(mutation.value)
+            else delete root[mutation.key]
+        }
+        coordinator.adoptAppliedUnitState(result.revision, applied.root, applied.presets, applied.characters)
+        if (selectedTarget && selectedSession) workingSet.refreshSelectedConversationAfterReplacement(selectedTarget, selectedSession)
+        for (const key of result.affectedKeys) {
+            const [kind, owner, name] = JSON.parse(key)
+            if (kind === 'plugin') dependencies.state.onPluginStorageChanged?.(owner, name)
+            else if (kind === 'order' && owner === 'plugin-storage') {
+                dependencies.state.onPluginStorageChanged?.(name, '')
+            }
+        }
+        await commitContentCursor(result.revision)
+    }
+    const drainLwwDeferred = (request: LwwReceiveHeader): Promise<LwwApplyResult> => coordinator.withPausedPersistentWrites('generation-deferred-drain', async () => {
+        if (!dependencies.store.lwwDrainDeferred) throw new Error('LWW receive is unavailable')
+        const database = dependencies.state.captureWorkingSetDatabase?.()
+        const baseline = database ? captureLwwWorkingSetBaseline(database, dependencies.state.captureRoot(), dependencies.state.capturePresets?.() ?? null, coordinator.captureMaterializedBaseline()) : undefined
+        const result = await dependencies.store.lwwDrainDeferred({ ...request, generating: generating() })
+        await projectAppliedUnits(result, baseline)
+        return result
+    })
     return {
         store: dependencies.store,
+        withPausedPersistentWrites: (reason, operation) => coordinator.withPausedPersistentWrites(reason, operation),
+        async refreshActivatedLibraryUnderPause(token) {
+            if (coordinator.revision !== token.revision) throw new PersistentMutationFencedError()
+            const latest = await dependencies.store.readRoot()
+            const projected = await projectRefreshedWorkingSet(latest.revision, {selectedCharacterId:null, selectedConversationId:null, activeCharacterIds:new Set()}, {wholeLibrary:true, root:true, presets:true, pluginStorage:true, characterIds:[], conversations:[]})
+            workingSet.invalidateNavigation()
+            dependencies.state.replaceDatabase(projected.database, new Set(), true)
+            dependencies.state.afterRemoteApply?.()
+            workingSet.installCommittedWorkingSet(projected.database, latest.revision, projected.windowedMetadata)
+            await commitContentCursor(latest.revision)
+            return {kind:'committed', revision:latest.revision, projection:'applied'}
+        },
+        async applyLwwReceive(request) {
+            const staged = canonicalClone(request)
+            return coordinator.withPausedPersistentWrites('lww-receive', async () => {
+                const store = dependencies.store
+                if (!store.lwwStageReceive || !store.lwwApplyReceive || !store.lwwFinishReceive) throw new Error('LWW receive is unavailable')
+                const database = dependencies.state.captureWorkingSetDatabase?.()
+                const baseline = database ? captureLwwWorkingSetBaseline(database, dependencies.state.captureRoot(), dependencies.state.capturePresets?.() ?? null, coordinator.captureMaterializedBaseline()) : undefined
+                await store.lwwStageReceive(staged)
+                const header = { bindingAuthority: staged.bindingAuthority, requestId: staged.requestId }
+                const result = await store.lwwApplyReceive({ ...header, generating: generating() })
+                activeReceiveHeader = header
+                try { await projectAppliedUnits(result, baseline) }
+                catch (error) { coordinator.markCommittedWorkingSetRefreshRequired(result.revision, error); throw error }
+                finally { await store.lwwFinishReceive(header) }
+                return result
+            })
+        },
+        drainLwwDeferred,
+        async commitPersistentUnitIntent(reason, mutations, conversations, wholeMessages) {
+            const translated = translatePersistentRootUnitIntents(mutations)
+            const affectedKeys = translated.map((value) => value.key)
+            for (const value of wholeMessages ?? []) affectedKeys.push(JSON.stringify(['messages', value.characterId, value.conversationId]))
+            for (const value of conversations ?? []) {
+                if (value.type === 'delete') affectedKeys.push(JSON.stringify(['exists', 'conversation', value.characterId, value.conversationId]))
+                else if (value.type === 'reorder') affectedKeys.push(JSON.stringify(['order', 'conversations', value.characterId]))
+                else affectedKeys.push(JSON.stringify(['messages', value.characterId, value.conversationId]))
+            }
+            await coordinator.commitPersistentUnitIntent(reason, translated, conversations, wholeMessages, async (revision) => {
+                try { await projectAppliedUnits({ revision, affectedKeys, heldKeys: [], deferredKeys: [] }) }
+                catch (error) { coordinator.markCommittedWorkingSetRefreshRequired(revision, error); throw error }
+            })
+        },
         get revision() {
             return coordinator.revision
         },
@@ -953,6 +1063,7 @@ export function createPersistentDataRuntime(
             return coordinator.pendingWorkingSetRefreshRevision
         },
         async initializeActiveWorkingSet(database) {
+            dependencies.state.afterRemoteApply?.()
             const result = await workingSet.initializeActiveWorkingSet(database)
             // A recreated WebView starts from a projection of the current
             // revision, so the cursor is realigned with it.
@@ -991,6 +1102,7 @@ export function createPersistentDataRuntime(
             coordinator.assertPersistentMutationAllowed(expectedAuthorityEpoch)
             await coordinator.flushPendingDataLocally('generation-completion')
             coordinator.assertPersistentMutationAllowed(expectedAuthorityEpoch)
+            if (activeReceiveHeader && dependencies.store.lwwDrainDeferred) await drainLwwDeferred({ ...activeReceiveHeader, requestId: crypto.randomUUID() })
         },
         commitCharacterAddition: (request, reason) =>
             coordinator.commitCharacterAddition(request, reason),

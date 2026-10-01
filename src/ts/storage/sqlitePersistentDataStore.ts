@@ -1,3 +1,4 @@
+import { stableSelectionRoot, projectSelectionIndexes } from './persistentSelectionBoundary'
 import { prepareNativePersistenceValue } from './nativePersistenceValue'
 import { invoke } from '@tauri-apps/api/core'
 import { nativeCommitTransport } from './nativeCommitTransport'
@@ -44,6 +45,11 @@ import {
     type PresetCatalog,
     type Versioned,
     type WorkingSetCommit,
+    type LwwStageReceive,
+    type LwwOutboxRequest, type LwwOutboxPage, type LwwAcknowledgeRequest, type LwwClockState, type LwwRetryRequest, type LwwReplacementRequest,
+    type LwwApplyReceive,
+    type LwwApplyResult,
+    type LwwReceiveHeader,
 } from './persistentDataStore'
 
 const MAX_STAGED_CHARACTER_COUNT = 16
@@ -297,6 +303,28 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
         })
     }
 
+    lwwReadOutbox(request: LwwOutboxRequest): Promise<LwwOutboxPage> { return invokeStore('pds_lww_read_outbox', { request }) }
+    lwwAckOutbox(request: LwwAcknowledgeRequest): Promise<void> { return invokeStore('pds_lww_ack_outbox', { request }) }
+    lwwClockState(request: LwwReceiveHeader): Promise<LwwClockState> { return invokeStore('pds_lww_clock_state', { request }) }
+    lwwRetryUnpublished(request: LwwRetryRequest): Promise<{ revision: DataRevision }> { return invokeStore('pds_lww_retry_unpublished', { request }) }
+    lwwCommitReplacement(request: LwwReplacementRequest): Promise<{ revision: DataRevision }> { return invokeStore('pds_lww_commit_replacement', { request }) }
+
+    lwwStageReceive(request: LwwStageReceive): Promise<void> {
+        return invokeStore('pds_lww_stage_receive', { request })
+    }
+
+    lwwApplyReceive(request: LwwApplyReceive): Promise<LwwApplyResult> {
+        return invokeStore('pds_lww_apply_receive', { request })
+    }
+
+    lwwFinishReceive(request: LwwReceiveHeader): Promise<void> {
+        return invokeStore('pds_lww_finish_receive', { request })
+    }
+
+    lwwDrainDeferred(request: LwwApplyReceive): Promise<LwwApplyResult> {
+        return invokeStore('pds_lww_drain_deferred', { request })
+    }
+
     archivePreview(characterId: string): Promise<ArchivePreview> {
         return invokeStore('pds_archive_preview', { characterId })
     }
@@ -336,7 +364,8 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
         pluginStorageValues = prepareNativePersistenceValue(pluginStorageValues, 'plugin storage')
         const { stagingId } = await invokeStore<{ stagingId: string }>('pds_replace_begin')
         try {
-            const { characters, botPresets, ...root } = database
+            const { characters, botPresets } = database
+            const root = stableSelectionRoot(database)
             await invokeStore<void>('pds_replace_put_root', {
                 stagingId,
                 root,
@@ -378,9 +407,9 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
     }
 
     materializeDatabase(revision?: DataRevision): Promise<Database> {
-        return revision === undefined
-            ? invokeStore('pds_materialize', {})
-            : invokeStore('pds_materialize', { revision })
+        return (revision === undefined
+            ? invokeStore<Database>('pds_materialize', {})
+            : invokeStore<Database>('pds_materialize', { revision })).then(projectSelectionIndexes)
     }
 
     async acquireRevision(revision: DataRevision): Promise<PersistentRevisionLease> {
