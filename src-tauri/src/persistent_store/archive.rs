@@ -63,15 +63,17 @@ impl<T: Write> Write for CancellationAwareIo<'_, T> {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ArchivedObject {
     pub(crate) object_hash: String,
+    pub(crate) shared_object_hash: String,
     pub(crate) archived_at: i64,
     pub(crate) conversation_count: i64,
     pub(crate) message_count: i64,
     pub(crate) asset_hashes: Vec<String>,
+    pub(crate) shared_asset_hashes: Vec<String>,
 }
 
 impl ArchivedObject {
     pub(crate) fn object_roots(&self) -> impl Iterator<Item = &str> {
-        std::iter::once(self.object_hash.as_str()).chain(self.asset_hashes.iter().map(String::as_str))
+        std::iter::once(self.object_hash.as_str()).chain(std::iter::once(self.shared_object_hash.as_str())).chain(self.asset_hashes.iter().map(String::as_str)).chain(self.shared_asset_hashes.iter().map(String::as_str))
     }
 }
 
@@ -252,6 +254,7 @@ fn write_payload_to(
     character_id: &str,
     mut writer: impl Write,
     is_cancelled: &dyn Fn() -> bool,
+    shared: bool,
 ) -> StoreResult<ArchivePayloadMetadata> {
     ensure_not_cancelled(is_cancelled)?;
     let row: Option<(String, String, Option<String>)> = connection
@@ -269,6 +272,7 @@ fn write_payload_to(
         return Err(archived_error(character_id));
     }
     let detail_value: Value = serde_json::from_str(&detail)?;
+    let detail_value=if shared{super::lww::shared_archive_character(detail_value)}else{detail_value};
     let name = detail_value
         .get("name")
         .and_then(Value::as_str)
@@ -294,12 +298,13 @@ fn write_payload_to(
     while let Some(row) = rows.next()? {
         ensure_not_cancelled(is_cancelled)?;
         let conversation_id = row.get::<_, String>(0)?;
-        let configured_index = row.get::<_, i64>(1)?;
-        let recent_at = row.get::<_, i64>(2)?;
+        let configured_index = if shared{0}else{row.get::<_, i64>(1)?};
+        let recent_at = if shared{0}else{row.get::<_, i64>(2)?};
         let conversation_name = row.get::<_, String>(3)?;
         let message_count = row.get::<_, i64>(4)?;
         let conversation_detail = row.get::<_, String>(5)?;
         let conversation_detail: Value = serde_json::from_str(&conversation_detail)?;
+        let conversation_detail=if shared{super::lww::shared_archive_conversation(conversation_detail)}else{conversation_detail};
 
         if conversation_count != 0 {
             writer.write_all(b",")?;
@@ -864,31 +869,16 @@ mod decoding_tests {
 
 /// Writes the payload object first and commits the row change afterwards, so a
 /// failure leaves an unreferenced object for the next sweep and no DB change.
-pub(super) fn archive_character(
-    connection: &mut Connection,
-    cas: &PayloadCas,
-    character_id: &str,
-    expected_revision: i64,
-    now_ms: i64,
-) -> StoreResult<RevisionResult> {
-    archive_character_with_cancellation(
-        connection,
-        cas,
-        character_id,
-        expected_revision,
-        now_ms,
-        &|| false,
-    )
-}
-
-pub(super) fn archive_character_with_cancellation(
+pub(super) fn archive_character_with_cancellation_lww(
     connection: &mut Connection,
     cas: &PayloadCas,
     character_id: &str,
     expected_revision: i64,
     now_ms: i64,
     is_cancelled: &dyn Fn() -> bool,
+    context: Option<&super::lww::ArchiveContext<'_>>,
 ) -> StoreResult<RevisionResult> {
+    if let Some(result)=super::lww::archive_request_result(connection,context)?{return Ok(result);}
     ensure_not_cancelled(is_cancelled)?;
     if now_ms < 0 {
         return validation("archive timestamp must be nonnegative");
@@ -907,6 +897,7 @@ pub(super) fn archive_character_with_cancellation(
         &generation,
         character_id,
     )?;
+    let shared_asset_hashes=if let Some(incoming)=context.and_then(|c|c.incoming){super::lww::archive_metadata(connection,&incoming.value)?.shared_asset_hashes}else{super::snapshot::collect_shared_character_asset_hashes(connection,cas,&generation,character_id)?};
     let mut staging = cas.create_ipc_staging_file()?;
     let metadata = {
         let mut encoder = GzEncoder::new(
@@ -919,6 +910,7 @@ pub(super) fn archive_character_with_cancellation(
             character_id,
             &mut encoder,
             is_cancelled,
+            false,
         )?;
         encoder.finish()?;
         metadata
@@ -935,12 +927,18 @@ pub(super) fn archive_character_with_cancellation(
         }],
         now_ms,
     )?;
+    let shared_object_hash=if let Some(incoming)=context.and_then(|c|c.incoming){super::lww::archive_metadata(connection,&incoming.value)?.object_hash}else{
+        let mut shared=cas.create_ipc_staging_file()?;let mut encoder=GzEncoder::new(CancellationAwareIo::new(shared.as_file_mut(),is_cancelled),Compression::default());write_payload_to(connection,&generation,character_id,&mut encoder,is_cancelled,true)?;encoder.finish()?;shared.as_file_mut().seek(SeekFrom::Start(0))?;let object=cas.prepare_reader(&mut CancellationAwareIo::new(shared.as_file_mut(),is_cancelled))?;
+        super::AssetObjectCatalog::new(connection).register(&[super::asset_object_catalog::AssetObjectRegistration{object_hash:object.content_hash.clone(),byte_size:object.byte_size}],now_ms)?;object.content_hash
+    };
     let archived = ArchivedObject {
         object_hash: prepared.content_hash,
+        shared_object_hash,
         archived_at: now_ms,
         conversation_count: metadata.conversation_count,
         message_count: metadata.message_count,
         asset_hashes,
+        shared_asset_hashes,
     };
     let encoded = serde_json::to_string(&archived)?;
     let marker = serde_json::to_string(&marker_detail(
@@ -978,33 +976,21 @@ pub(super) fn archive_character_with_cancellation(
             if updated != 1 {
                 return validation(format!("Character {character_id} does not exist"));
             }
+            super::lww::record_archive_state(transaction,generation,character_id,context,false)?;
             Ok(())
         },
     )
 }
 
-pub(super) fn restore_character(
-    connection: &mut Connection,
-    cas: &PayloadCas,
-    character_id: &str,
-    expected_revision: i64,
-) -> StoreResult<RevisionResult> {
-    restore_character_with_cancellation(
-        connection,
-        cas,
-        character_id,
-        expected_revision,
-        &|| false,
-    )
-}
-
-pub(super) fn restore_character_with_cancellation(
+pub(super) fn restore_character_with_cancellation_lww(
     connection: &mut Connection,
     cas: &PayloadCas,
     character_id: &str,
     expected_revision: i64,
     is_cancelled: &dyn Fn() -> bool,
+    context: Option<&super::lww::ArchiveContext<'_>>,
 ) -> StoreResult<RevisionResult> {
+    if let Some(result)=super::lww::archive_request_result(connection,context)?{return Ok(result);}
     ensure_not_cancelled(is_cancelled)?;
     let generation = super::active_generation(connection)?;
     let actual_revision = super::current_revision(connection)?;
@@ -1111,6 +1097,7 @@ pub(super) fn restore_character_with_cancellation(
                     "DROP TABLE archive_restore.archive_restore_messages;
                      DROP TABLE archive_restore.archive_restore_conversations;",
                 )?;
+                super::lww::record_archive_state(transaction,generation,character_id,context,true)?;
                 Ok(())
             },
         )

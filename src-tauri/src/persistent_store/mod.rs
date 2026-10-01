@@ -6,6 +6,9 @@ pub(crate) mod commit;
 pub(crate) mod content_capture;
 mod message_pages;
 pub(crate) mod content_change_index;
+pub(crate) mod lww;
+mod upstream_identity;
+pub(crate) mod lww_commands;
 mod content_locators;
 pub(crate) mod device_store;
 pub(crate) mod export;
@@ -78,7 +81,7 @@ pub(super) const GENERATION_TABLES: &[(&str, &str)] = &[
     ),
     (
         "messages",
-        "character_id, conversation_id, message_index, message_id, value",
+        "character_id, conversation_id, message_index, message_id, value, canonical_hash, canonical_size",
     ),
     (
         "plugin_storage",
@@ -96,6 +99,8 @@ pub(super) const GENERATION_TABLES: &[(&str, &str)] = &[
         "asset_owner_heads",
         "owner_kind, owner_locator, present, manifest_hash, entry_count",
     ),
+    ("message_page_indexes", "character_id, conversation_id, page_start, message_count, hash, byte_length"),
+    ("message_page_manifests", "character_id, conversation_id, body"),
 ];
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -431,8 +436,8 @@ impl AssetAlias {
 )]
 pub(crate) enum AssetOwnerLocator {
     CharacterAdditionalAssets { character_id: String },
-    RootModuleAssets { index: i64 },
-    PersonaEmbeddedModuleAssets { index: i64 },
+    RootModuleAssets { module_id: String },
+    PersonaEmbeddedModuleAssets { persona_id: String, module_id: String },
 }
 
 impl AssetOwnerLocator {
@@ -443,13 +448,16 @@ impl AssetOwnerLocator {
                     message: "Character asset owner requires a nonempty characterId".to_owned(),
                 })
             }
-            Self::RootModuleAssets { index } | Self::PersonaEmbeddedModuleAssets { index }
-                if !(0..=JAVASCRIPT_MAX_SAFE_INTEGER).contains(index) =>
+            Self::RootModuleAssets { module_id }
+                if module_id.is_empty() =>
             {
                 Err(StoreError::Validation {
-                    message: "Asset owner occurrence index must be a nonnegative safe integer"
+                    message: "Asset owner requires a nonempty moduleId"
                         .to_owned(),
                 })
+            }
+            Self::PersonaEmbeddedModuleAssets { persona_id, module_id } if persona_id.is_empty() || module_id.is_empty() => {
+                Err(StoreError::Validation {message:"Asset owner requires nonempty personaId and moduleId".to_owned()})
             }
             _ => Ok(()),
         }
@@ -460,10 +468,36 @@ impl AssetOwnerLocator {
             Self::CharacterAdditionalAssets { character_id } => {
                 ("character-additional-assets", character_id.clone())
             }
-            Self::RootModuleAssets { index } => ("root-module-assets", index.to_string()),
-            Self::PersonaEmbeddedModuleAssets { index } => {
-                ("persona-embedded-module-assets", index.to_string())
+            Self::RootModuleAssets { module_id } => ("root-module-assets", module_id.clone()),
+            Self::PersonaEmbeddedModuleAssets { persona_id, module_id } => {
+                ("persona-embedded-module-assets", serde_json::to_string(&[persona_id,module_id]).expect("string owner identity"))
             }
+        }
+    }
+
+    pub(crate) fn from_storage(kind:&str,locator:&str)->StoreResult<Self> {
+        let owner=match kind {
+            "character-additional-assets"=>Self::CharacterAdditionalAssets{character_id:locator.to_owned()},
+            "root-module-assets"=>Self::RootModuleAssets{module_id:locator.to_owned()},
+            "persona-embedded-module-assets"=>{let [persona_id,module_id]:[String;2]=serde_json::from_str(locator)?;
+                if serde_json::to_string(&[&persona_id,&module_id])?!=locator {return Err(StoreError::Validation{message:"Asset owner identity is not canonical".into()});}
+                Self::PersonaEmbeddedModuleAssets{persona_id,module_id}},
+            _=>return Err(StoreError::Validation{message:"Stored asset owner kind is invalid".into()}),
+        };owner.validate()?;Ok(owner)
+    }
+    pub(crate) fn root_parent<'a>(&self,root:&'a Value)->Option<&'a Value> {
+        match self {
+            Self::RootModuleAssets{module_id}=>root.get("modules")?.as_array()?.iter().find(|m|m.get("id").and_then(Value::as_str)==Some(module_id)),
+            Self::PersonaEmbeddedModuleAssets{persona_id,module_id}=>root.get("personas")?.as_array()?.iter().find(|p|p.get("id").and_then(Value::as_str)==Some(persona_id))?.get("embeddedModule").filter(|m|m.get("id").and_then(Value::as_str)==Some(module_id)),
+            Self::CharacterAdditionalAssets{..}=>None,
+        }
+    }
+    pub(super) fn logical(&self)->crate::logical_records::LogicalOwnerLocator {
+        use crate::logical_records::LogicalOwnerLocator;
+        match self {
+            Self::CharacterAdditionalAssets{character_id}=>LogicalOwnerLocator::CharacterAdditional{character_id:character_id.clone()},
+            Self::RootModuleAssets{module_id}=>LogicalOwnerLocator::RootModule{module_id:module_id.clone()},
+            Self::PersonaEmbeddedModuleAssets{persona_id,module_id}=>LogicalOwnerLocator::PersonaEmbeddedModule{persona_id:persona_id.clone(),module_id:module_id.clone()},
         }
     }
 }
@@ -745,7 +779,7 @@ pub(crate) enum PluginStorageMutation {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct WorkingSetCommit {
     pub(crate) expected_revision: i64,
@@ -771,6 +805,14 @@ pub(crate) struct WorkingSetCommit {
     pub(crate) plugin_storage: Option<Vec<PluginStorageMutation>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) asset_owner_heads: Option<Vec<AssetOwnerHead>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) unit_mutations: Option<Vec<lww::UnitMutation>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) messages_changed: Option<Vec<lww::MessageLocator>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) binding_authority: Option<risunest_sync_wire::stamp::DecimalU64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1325,12 +1367,10 @@ impl PersistentStore {
         export::sweep_abandoned(&snapshots_dir)?;
         #[cfg(feature = "native-kei-upload-pilot")]
         kei::sweep_abandoned(&snapshots_dir);
-        snapshot::sweep_temporary_generations(&mut connection, retained_stage.as_deref())?;
-        snapshot::checkpoint(&connection, CheckpointMode::Truncate)?;
 
         let active_readers = Arc::new(snapshot::ActiveReaderRegistry::default());
         let device_store = open_device_store(&persistent_dir);
-        let store = Self {
+        let mut store = Self {
             revision_leases: HashMap::new(),
             active_readers,
             connection,
@@ -1340,6 +1380,9 @@ impl PersistentStore {
             pending_restore_failure,
             device_store,
         };
+        store.lww_recover_intents()?;
+        snapshot::sweep_temporary_generations(&mut store.connection, retained_stage.as_deref())?;
+        snapshot::checkpoint(&store.connection, CheckpointMode::Truncate)?;
         if let Err(error) = store.server_repair_residency_access() {
             crate::nlog!("warn", "server sync residency repair pending: {}", error.code);
         }
@@ -1723,7 +1766,7 @@ impl PersistentStore {
         } else {
             commit
         };
-        commit::commit(&mut self.connection, commit, asset_aliases)
+        self.lww_commit(commit, asset_aliases)
     }
 
     pub(crate) fn commit_asset_alias(
@@ -1731,7 +1774,7 @@ impl PersistentStore {
         alias: &AssetAlias,
         expected_revision: i64,
     ) -> StoreResult<RevisionResult> {
-        commit::commit_asset_alias(&mut self.connection, alias, expected_revision)
+        self.lww_commit(&WorkingSetCommit{expected_revision,..Default::default()}, &[alias.clone()])
     }
 
     pub(crate) fn delete_asset_alias(
@@ -1740,7 +1783,7 @@ impl PersistentStore {
         key: &str,
         expected_revision: i64,
     ) -> StoreResult<RevisionResult> {
-        commit::delete_asset_alias(&mut self.connection, kind, key, expected_revision)
+        self.lww_commit(&WorkingSetCommit{expected_revision,unit_mutations:Some(vec![lww::UnitMutation::Delete{key:lww::unit_key(&[kind,key])?}]),..Default::default()}, &[])
     }
 
     pub(crate) fn archive_preview(
@@ -1752,64 +1795,10 @@ impl PersistentStore {
         archive::preview(connection, &target.generation, character_id)
     }
 
-    pub(crate) fn archive_character(
-        &mut self,
-        character_id: &str,
-        expected_revision: i64,
-        now_ms: i64,
-    ) -> StoreResult<RevisionResult> {
-        let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
-        archive::archive_character(
-            &mut self.connection,
-            &cas,
-            character_id,
-            expected_revision,
-            now_ms,
-        )
-    }
-
-    pub(crate) fn archive_character_with_cancellation(
-        &mut self,
-        character_id: &str,
-        expected_revision: i64,
-        now_ms: i64,
-        is_cancelled: &dyn Fn() -> bool,
-    ) -> StoreResult<RevisionResult> {
-        let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
-        archive::archive_character_with_cancellation(
-            &mut self.connection,
-            &cas,
-            character_id,
-            expected_revision,
-            now_ms,
-            is_cancelled,
-        )
-    }
-
-    pub(crate) fn restore_character(
-        &mut self,
-        character_id: &str,
-        expected_revision: i64,
-    ) -> StoreResult<RevisionResult> {
-        let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
-        archive::restore_character(&mut self.connection, &cas, character_id, expected_revision)
-    }
-
-    pub(crate) fn restore_character_with_cancellation(
-        &mut self,
-        character_id: &str,
-        expected_revision: i64,
-        is_cancelled: &dyn Fn() -> bool,
-    ) -> StoreResult<RevisionResult> {
-        let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
-        archive::restore_character_with_cancellation(
-            &mut self.connection,
-            &cas,
-            character_id,
-            expected_revision,
-            is_cancelled,
-        )
-    }
+    pub(crate) fn archive_character(&mut self,character_id:&str,expected_revision:i64,now_ms:i64)->StoreResult<RevisionResult> {self.lww_archive(character_id,expected_revision,now_ms,false,&||false)}
+    pub(crate) fn archive_character_with_cancellation(&mut self,character_id:&str,expected_revision:i64,now_ms:i64,is_cancelled:&dyn Fn()->bool)->StoreResult<RevisionResult> {self.lww_archive(character_id,expected_revision,now_ms,false,is_cancelled)}
+    pub(crate) fn restore_character(&mut self,character_id:&str,expected_revision:i64)->StoreResult<RevisionResult> {self.lww_archive(character_id,expected_revision,0,true,&||false)}
+    pub(crate) fn restore_character_with_cancellation(&mut self,character_id:&str,expected_revision:i64,is_cancelled:&dyn Fn()->bool)->StoreResult<RevisionResult> {self.lww_archive(character_id,expected_revision,0,true,is_cancelled)}
 
     pub(crate) fn replace_begin(&mut self) -> StoreResult<StagingResult> {
         commit::replace_begin(&mut self.connection)
@@ -1990,11 +1979,9 @@ impl PersistentStore {
         &mut self,
         prepared: PreparedReplaceCommit,
     ) -> StoreResult<RevisionResult> {
-        commit::replace_commit(
-            &mut self.connection,
-            &prepared.staging_id,
-            Some(prepared.revision),
-        )
+        commit::validate_replace_commit(&self.connection,&prepared.staging_id,Some(prepared.revision))?;
+        let header=lww::Header{binding_authority:self.lww_binding_authority()?,request_id:uuid::Uuid::new_v4().to_string()};
+        self.lww_commit_replacement(&header,&prepared.staging_id)
     }
 
     pub(crate) fn finish_prepared_replace_with_app_kv(

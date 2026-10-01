@@ -448,24 +448,7 @@ pub(super) fn list_asset_owner_heads(
         .into_iter()
         .map(
             |(owner_kind, owner_locator, present, manifest_hash, entry_count)| {
-                let owner = match owner_kind.as_str() {
-                    "character-additional-assets" => AssetOwnerLocator::CharacterAdditionalAssets {
-                        character_id: owner_locator,
-                    },
-                    "root-module-assets" => AssetOwnerLocator::RootModuleAssets {
-                        index: stored_asset_owner_index(&owner_locator, "root module")?,
-                    },
-                    "persona-embedded-module-assets" => {
-                        AssetOwnerLocator::PersonaEmbeddedModuleAssets {
-                            index: stored_asset_owner_index(&owner_locator, "persona module")?,
-                        }
-                    }
-                    _ => {
-                        return Err(StoreError::Validation {
-                            message: "Stored asset owner kind is invalid".to_owned(),
-                        })
-                    }
-                };
+                let owner = AssetOwnerLocator::from_storage(&owner_kind,&owner_locator)?;
                 let value = AssetOwnerHead {
                     owner,
                     present,
@@ -481,18 +464,6 @@ pub(super) fn list_asset_owner_heads(
         revision: target.revision,
         value: values,
     })
-}
-
-fn stored_asset_owner_index(value: &str, subject: &str) -> StoreResult<i64> {
-    let index = value.parse::<i64>().map_err(|_| StoreError::Validation {
-        message: format!("Stored {subject} asset owner locator is invalid"),
-    })?;
-    if index.to_string() != value {
-        return Err(StoreError::Validation {
-            message: format!("Stored {subject} asset owner locator is noncanonical"),
-        });
-    }
-    Ok(index)
 }
 
 fn asset_alias_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetAlias> {

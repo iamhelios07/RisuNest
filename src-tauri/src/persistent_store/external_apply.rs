@@ -1107,8 +1107,10 @@ fn resolve_dependencies(
         }
         LogicalRecordEnvelope::ArchivedCharacter {
             archive_object_hash,
+            shared_archive_object_hash,
             archive_object_size,
             asset_hashes,
+            shared_asset_hashes,
             owner_heads,
             ..
         } => {
@@ -1119,7 +1121,8 @@ fn resolve_dependencies(
                 archive_object_hash,
                 Some(*archive_object_size),
             )?;
-            for hash in asset_hashes {
+            require(cas,objects,requires,shared_archive_object_hash,None)?;
+            for hash in asset_hashes.iter().chain(shared_asset_hashes.iter()) {
                 check(probe)?;
                 require(cas, objects, requires, hash, None)?;
             }

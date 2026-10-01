@@ -158,6 +158,8 @@ fn create_schema(connection: &mut Connection) -> StoreResult<()> {
             message_index INTEGER NOT NULL,
             message_id TEXT,
             value TEXT NOT NULL,
+            canonical_hash TEXT NOT NULL DEFAULT '',
+            canonical_size INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (generation, character_id, conversation_id, message_index)
         );
         CREATE INDEX messages_by_id
@@ -236,6 +238,8 @@ fn create_schema(connection: &mut Connection) -> StoreResult<()> {
     super::content_change_index::create_schema(&transaction)?;
     super::sync_selection::create_schema(&transaction)?;
     super::external_storage_state::create_schema(&transaction)?;
+    transaction.execute_batch(super::lww::UNIT_SCHEMA)?;
+    transaction.execute_batch(super::message_pages::SCHEMA)?;
     transaction.execute_batch(PLUGIN_CLAIM_ELIGIBILITY_TABLE_SQL)?;
     validate_schema(&transaction)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -244,6 +248,7 @@ fn create_schema(connection: &mut Connection) -> StoreResult<()> {
 }
 
 fn validate_schema(connection: &Connection) -> StoreResult<()> {
+    super::lww::validate_schema(connection)?;
     validate_object_sql(connection, "table", "plugin_claim_eligibility",
         PLUGIN_CLAIM_ELIGIBILITY_TABLE_SQL, "plugin claim eligibility table definition is invalid")?;
     super::server_sync_journal::validate_schema(connection)?;
