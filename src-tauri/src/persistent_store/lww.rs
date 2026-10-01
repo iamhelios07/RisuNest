@@ -1749,6 +1749,7 @@ impl PersistentStore {
             wire(c.stamp.validate())?;
             projection::validate_received(&self.connection, &c.key, &c.value)?;
         }
+        validate_binding_source(&self.connection, staging_id, header, changes)?;
         let (stamp, digest) = self.reserve_intent(header, &intent)?;
         let result =
             self.finish_lww_replacement(header, staging_id, &[], &stamp, &digest, true, changes)?;

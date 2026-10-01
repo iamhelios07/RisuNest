@@ -1559,15 +1559,10 @@ fn new_device_stage(store: &mut PersistentStore) -> (Header, String, Vec<Change>
     let inspection = store
         .register_lww_binding_inspection(state.target_authority, &target, "target", "library")
         .unwrap();
-    let staging = store.replace_begin().unwrap().staging_id;
-    store
-        .replace_put_root(&staging, &serde_json::json!({"language":"en"}))
-        .unwrap();
     let changes = vec![change(&["root", "language"], 10, serde_json::json!("en"))];
     let request_id = Uuid::new_v4().to_string();
-    store
-        .register_lww_binding_stage(&inspection, &staging, &request_id, &changes)
-        .unwrap();
+    let header = Header { binding_authority:state.target_authority,request_id:request_id.clone() };
+    let staging = store.lww_stage_binding_units(&header,&inspection,&changes,10.into()).unwrap().staging_id;
     (
         Header {
             binding_authority: state.target_authority,
@@ -1858,17 +1853,11 @@ fn explicit_new_device_empty_target_activates_empty_stage_without_republishing_l
     let inspection = store
         .register_lww_binding_inspection(state.target_authority, &target, "target", "empty-library")
         .unwrap();
-    let staging = store.replace_begin().unwrap().staging_id;
-    store
-        .replace_put_root(&staging, &serde_json::json!({}))
-        .unwrap();
     let header = Header {
         binding_authority: state.target_authority,
         request_id: Uuid::new_v4().to_string(),
     };
-    store
-        .register_lww_binding_stage(&inspection, &staging, &header.request_id, &[])
-        .unwrap();
+    let staging = store.lww_stage_binding_units(&header,&inspection,&[],0.into()).unwrap().staging_id;
     let preparation = store.prepare_lww_new_device(&header, &staging).unwrap();
     assert_eq!(
         store.lww_binding_state().unwrap().target_authority,
