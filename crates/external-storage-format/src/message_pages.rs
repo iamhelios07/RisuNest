@@ -140,20 +140,9 @@ impl PageIndex {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct PageWork {
-    pub messages_read: usize,
-    pub hash_rows_read: usize,
-    pub bytes_read: u64,
-    pub pages_written: usize,
-    pub prefix_reused: usize,
-    pub suffix_reused: usize,
-}
-
 pub struct Repaged {
     pub index: PageIndex,
     pub objects: Vec<EncodedLogicalObject>,
-    pub work: PageWork,
 }
 
 /// The caller supplies hashes for the new list and the exact replaced old range.
@@ -175,14 +164,12 @@ pub fn repage<E: From<LogicalRecordError>>(
     {
         return Err(invalid("message page affected range does not match unchanged regions").into());
     }
-    let mut work = PageWork::default();
     // A size cut depends on the following message, so restart before an exact boundary too.
     let prefix = previous
         .pages
         .partition_point(|p| p.start < replaced.start)
         .saturating_sub(1);
     let mut pages = previous.pages[..prefix].to_vec();
-    work.prefix_reused = pages.len();
     let mut position = previous.pages.get(prefix).map_or(0, |p| p.start);
     let mut objects = Vec::new();
     while position < messages.len() {
@@ -196,7 +183,6 @@ pub fn repage<E: From<LogicalRecordError>>(
                     let mut boundary = boundary.clone();
                     boundary.start = replacement_end + (boundary.start - replaced.end);
                     pages.push(boundary);
-                    work.suffix_reused += 1;
                 }
                 break;
             }
@@ -212,8 +198,6 @@ pub fn repage<E: From<LogicalRecordError>>(
                 bytes.push(b',');
             }
             bytes.extend(&body);
-            work.messages_read += 1;
-            work.bytes_read += body.len() as u64;
             position += 1;
             let count = position - start;
             let cut = count == LOGICAL_MESSAGE_PAGE_SIZE
@@ -241,14 +225,9 @@ pub fn repage<E: From<LogicalRecordError>>(
         });
         objects.push(object);
     }
-    work.pages_written = objects.len();
     let index = PageIndex { messages, pages };
     index.validate()?;
-    Ok(Repaged {
-        index,
-        objects,
-        work,
-    })
+    Ok(Repaged { index, objects })
 }
 
 #[cfg(test)]
@@ -257,13 +236,52 @@ mod tests {
     use crate::logical_records::{decode_message_page, encode_message_page};
     use serde_json::{json, Value};
 
+    #[derive(Debug, Default)]
+    struct PageWork {
+        messages_read: usize,
+        bytes_read: u64,
+        pages_written: usize,
+        prefix_reused: usize,
+        suffix_reused: usize,
+    }
+    struct Measured {
+        index: PageIndex,
+        objects: Vec<EncodedLogicalObject>,
+        work: PageWork,
+    }
+    fn repage<E: From<LogicalRecordError>>(
+        previous: &PageIndex,
+        messages: Vec<MessageHash>,
+        replaced: Range<usize>,
+        replacement_end: usize,
+        mut read: impl FnMut(usize) -> Result<Vec<u8>, E>,
+    ) -> Result<Measured, E> {
+        let mut work = PageWork::default();
+        work.prefix_reused = previous
+            .pages
+            .partition_point(|p| p.start < replaced.start)
+            .saturating_sub(1);
+        let result = super::repage::<E>(previous, messages, replaced, replacement_end, |i| {
+            let body = read(i)?;
+            work.messages_read += 1;
+            work.bytes_read += body.len() as u64;
+            Ok(body)
+        })?;
+        work.pages_written = result.objects.len();
+        work.suffix_reused = result.index.pages.len() - work.prefix_reused - work.pages_written;
+        Ok(Measured {
+            index: result.index,
+            objects: result.objects,
+            work,
+        })
+    }
     fn bodies(messages: &[Value]) -> Vec<Vec<u8>> {
         messages
             .iter()
             .map(|m| payload_value::encode(m).unwrap())
             .collect()
     }
-    fn initial(messages: &[Vec<u8>]) -> Repaged {
+    fn initial(messages: &[Vec<u8>]) -> Measured {
         repage::<LogicalRecordError>(
             &PageIndex::default(),
             messages

@@ -2,8 +2,8 @@ use super::{record_projection::codec_error, StoreError, StoreResult};
 use risunest_external_storage_format::{
     logical_records::{decode_message_page, encoded_object, LOGICAL_MESSAGE_PAGE_SIZE},
     message_pages::{
-        ManifestPage, MessageHash, MessageManifest, PageBoundary, PageWork, MANIFEST_SCHEMA,
-        MAX_PAGE_BYTES, MIN_PAGE_MESSAGES, PAGE_PREFIX, PAGE_SUFFIX,
+        ManifestPage, MessageHash, MessageManifest, PageBoundary, MANIFEST_SCHEMA, MAX_PAGE_BYTES,
+        MIN_PAGE_MESSAGES, PAGE_PREFIX, PAGE_SUFFIX,
     },
 };
 use risunest_sync_wire::{
@@ -137,7 +137,45 @@ pub(super) fn capture_manifest(
     conversation: &str,
     edit: Option<MessageEdit>,
 ) -> StoreResult<UnitValue> {
-    capture_with_work(tx, generation, character, conversation, edit).map(|(value, _)| value)
+    #[cfg(not(test))]
+    {
+        capture(tx, generation, character, conversation, edit)
+    }
+    #[cfg(test)]
+    {
+        capture(
+            tx,
+            generation,
+            character,
+            conversation,
+            edit,
+            &mut PageWork::default(),
+        )
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(super) struct PageWork {
+    pub messages_read: usize,
+    pub hash_rows_read: usize,
+    pub bytes_read: u64,
+    pub pages_written: usize,
+    pub prefix_reused: usize,
+    pub suffix_reused: usize,
+}
+
+#[cfg(test)]
+pub(super) fn capture_with_work(
+    tx: &Transaction<'_>,
+    generation: &str,
+    character: &str,
+    conversation: &str,
+    edit: Option<MessageEdit>,
+) -> StoreResult<(UnitValue, PageWork)> {
+    let mut work = PageWork::default();
+    let value = capture(tx, generation, character, conversation, edit, &mut work)?;
+    Ok((value, work))
 }
 
 pub(super) fn current_manifest(
@@ -160,13 +198,14 @@ pub(super) fn current_manifest(
     }
 }
 
-pub(super) fn capture_with_work(
+fn capture(
     tx: &Transaction<'_>,
     generation: &str,
     character: &str,
     conversation: &str,
     edit: Option<MessageEdit>,
-) -> StoreResult<(UnitValue, PageWork)> {
+    #[cfg(test)] work: &mut PageWork,
+) -> StoreResult<UnitValue> {
     let count: Option<i64> = tx
         .query_row(
             "SELECT message_count FROM conversations WHERE generation=?1 AND character_id=?2
@@ -178,14 +217,13 @@ pub(super) fn capture_with_work(
     let Some(count) = count else {
         tx.execute("DELETE FROM message_page_indexes WHERE generation=?1 AND character_id=?2 AND conversation_id=?3",params![generation,character,conversation])?;
         tx.execute("DELETE FROM message_page_manifests WHERE generation=?1 AND character_id=?2 AND conversation_id=?3",params![generation,character,conversation])?;
-        return Ok((UnitValue::Deleted, PageWork::default()));
+        return Ok(UnitValue::Deleted);
     };
     if count < 0 {
         return Err(codec_error("negative conversation message count"));
     }
     let count_usize = usize::try_from(count).map_err(codec_error)?;
     let previous = load_pages(tx, generation, character, conversation)?;
-    let mut work = PageWork::default();
     let edit = edit.filter(|_| !previous.is_empty());
     if let Some(edit) = edit {
         let old_count = previous
@@ -213,7 +251,10 @@ pub(super) fn capture_with_work(
             .saturating_sub(1)
     });
     let mut pages = previous[..prefix].to_vec();
-    work.prefix_reused = prefix;
+    #[cfg(test)]
+    {
+        work.prefix_reused = prefix;
+    }
     let mut position = if edit.is_some() {
         previous.get(prefix).map_or(0, |p| p.start)
     } else {
@@ -228,7 +269,10 @@ pub(super) fn capture_with_work(
         position as i64
     ])?;
     let mut next = next_hash(tx, &mut rows, generation, character, conversation)?;
-    work.hash_rows_read += usize::from(next.is_some());
+    #[cfg(test)]
+    {
+        work.hash_rows_read += usize::from(next.is_some());
+    }
     while let Some((_, _)) = &next {
         let start = position;
         let mut bytes = PAGE_PREFIX.to_vec();
@@ -253,11 +297,20 @@ pub(super) fn capture_with_work(
                 bytes.push(b',');
             }
             bytes.extend(&body);
-            work.messages_read += 1;
-            work.bytes_read += body.len() as u64;
+            #[cfg(test)]
+            {
+                work.messages_read += 1;
+            }
+            #[cfg(test)]
+            {
+                work.bytes_read += body.len() as u64;
+            }
             position += 1;
             next = next_hash(tx, &mut rows, generation, character, conversation)?;
-            work.hash_rows_read += usize::from(next.is_some());
+            #[cfg(test)]
+            {
+                work.hash_rows_read += usize::from(next.is_some());
+            }
             let page_count = position - start;
             if page_count == LOGICAL_MESSAGE_PAGE_SIZE
                 || (page_count >= MIN_PAGE_MESSAGES && hash.boundary().map_err(codec_error)?)
@@ -292,7 +345,10 @@ pub(super) fn capture_with_work(
                             page.start = (page.start as i64 + edit.insert_count - edit.delete_count)
                                 as usize;
                             pages.push(page);
-                            work.suffix_reused += 1;
+                            #[cfg(test)]
+                            {
+                                work.suffix_reused += 1;
+                            }
                         }
                         position = count_usize;
                         break;
@@ -302,7 +358,10 @@ pub(super) fn capture_with_work(
         }
         put_object(tx, &object.hash, &object.bytes)?;
         pages.push(boundary);
-        work.pages_written += 1;
+        #[cfg(test)]
+        {
+            work.pages_written += 1;
+        }
     }
     if position != count_usize {
         return Err(codec_error("conversation message count mismatch"));
@@ -313,7 +372,7 @@ pub(super) fn capture_with_work(
         pages: pages.iter().map(|p| p.page.clone()).collect(),
     };
     save_index(tx, generation, character, conversation, &pages, &manifest)?;
-    Ok((unit_value(tx, &manifest)?, work))
+    unit_value(tx, &manifest)
 }
 
 fn next_hash(
