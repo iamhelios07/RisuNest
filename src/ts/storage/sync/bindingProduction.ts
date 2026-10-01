@@ -1,5 +1,5 @@
 import { createStorageMutationGate } from '../storageMutationGate'
-import { createSyncBindingFlow, type BindingPluginLifecycle, type SyncBindingNative } from './bindingFlow'
+import { createSyncBindingFlow, type BindingActivationGuard, type BindingPluginLifecycle, type SyncBindingNative } from './bindingFlow'
 import { confirmSyncBindingReplacement } from './bindingDialog'
 import { hasLocalBindingData, hasLocalSharedBindingData } from './bindingLocalData'
 import { createNativeSyncBindingBridge } from './bindingNative'
@@ -10,6 +10,7 @@ export function installSyncBindingFlow(dependencies: {
     plugins: BindingPluginLifecycle
     withPausedWrites<T>(operation: () => Promise<T>): Promise<T>
     refreshActivatedLibrary(): Promise<void>
+    beginActivatedLibraryGuard(): BindingActivationGuard
 }) {
     const flow = createSyncBindingFlow({
         ...dependencies,

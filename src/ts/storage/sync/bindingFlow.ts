@@ -60,6 +60,10 @@ export interface BindingPluginLifecycle {
     invalidateCaches(): Promise<void>
     restart(): Promise<void>
 }
+export interface BindingActivationGuard {
+    complete(): void
+    abortUnchanged(): Promise<void>
+}
 export interface SyncBindingDependencies {
     native: SyncBindingNative
     gate: StorageMutationGate
@@ -69,6 +73,7 @@ export interface SyncBindingDependencies {
     hasNonDefaultSharedData(): Promise<boolean>
     confirmReplacement(): Promise<boolean>
     refreshActivatedLibrary(): Promise<void>
+    beginActivatedLibraryGuard(): BindingActivationGuard
 }
 export type BindingOutcome = { kind: 'cancelled' } | { kind: 'bound'; action: 'initialized' | 'replaced' | 'resumed' | 'new-device'; state: SyncBindingState; newDevice?: NewDeviceBindingResult }
 
@@ -93,6 +98,7 @@ export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
     }
     const resumeOld = async () => {
         if (!active) return
+        await dependencies.native.assertAuthority(active.context.state)
         const controller = new AbortController()
         active = { ...active, controller, context: { state: active.context.state, signal: controller.signal } }
         await active.transport.resumeBinding(active.context)
@@ -106,8 +112,13 @@ export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
             }
             running = true
             const controller = new AbortController()
+            let originalState: SyncBindingState | undefined
+            let jobsFenced = false
+            let pluginsFenced = false
+            let activationGuard: BindingActivationGuard | undefined
             try {
                 const state = await dependencies.native.state()
+                originalState = state
                 const context = { state, signal: controller.signal }
                 const inspected = await transport.inspectTarget(context)
                 await check(context)
@@ -122,20 +133,26 @@ export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
                 if (staged && (staged.targetId !== inspected.targetId || staged.libraryId !== inspected.libraryId)) {
                     throw new Error('Sync target changed during binding')
                 }
+                jobsFenced = true
                 await fenceOld(transport, context)
                 const preparation = newDevice ? await transport.prepareNewDeviceBinding!(staged!, context) : undefined
                 await check(context)
-                if (replace) await dependencies.plugins.fenceExecution()
+                if (replace) {
+                    pluginsFenced = true
+                    await dependencies.plugins.fenceExecution()
+                }
                 let newDeviceResult: NewDeviceBindingResult | undefined
                 const result: BindingOutcome = await dependencies.withPausedWrites(async () => {
                     await check(context)
                     if (replace && !acknowledged && await dependencies.hasNonDefaultData()) {
                         if (!await dependencies.confirmReplacement()) {
+                            pluginsFenced = false
                             await dependencies.plugins.restart()
                             return { kind: 'cancelled' }
                         }
                         acknowledged = true
                     }
+                    if (staged) activationGuard = dependencies.beginActivatedLibraryGuard()
                     const next = await dependencies.gate.runTransition(async () => {
                         await check(context)
                         if (preparation) {
@@ -161,17 +178,22 @@ export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
                         await dependencies.plugins.invalidateCaches()
                         await dependencies.refreshActivatedLibrary()
                         await check(nextContext)
+                        activationGuard!.complete()
+                        activationGuard = undefined
+                        pluginsFenced = false
                         await dependencies.plugins.restart()
                     }
                     await check(nextContext)
                     return { kind: 'bound', action: newDevice ? 'new-device' : staged ? 'replaced' : inspected.empty ? 'initialized' : 'resumed', state: next, ...(newDeviceResult ? { newDevice: newDeviceResult } : {}) }
                 })
                 if (result.kind === 'cancelled') {
+                    jobsFenced = false
                     await resumeOld()
                     return result
                 }
                 const activatedContext = { state: result.state, signal: controller.signal }
                 active = { transport, context: activatedContext, controller }
+                jobsFenced = false
                 if (result.action === 'new-device') {
                     await transport.resumeNewDeviceBinding!(preparation!, result.newDevice!, activatedContext)
                 } else if (result.action === 'initialized') {
@@ -179,6 +201,25 @@ export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
                 } else if (result.action === 'resumed') await transport.resumeBinding(activatedContext)
                 await check(activatedContext)
                 return result
+            } catch (error) {
+                let unchanged = false
+                if (originalState && (jobsFenced || pluginsFenced)) {
+                    try {
+                        const current = await dependencies.native.state()
+                        unchanged = current.targetAuthority === originalState.targetAuthority && current.selectionEpoch === originalState.selectionEpoch &&
+                            sameTarget(current.target, originalState.target) && current.libraryId === originalState.libraryId
+                    } catch { /* Recovery requires a verified unchanged native binding. */ }
+                }
+                if (unchanged) {
+                    try {
+                        if (activationGuard) { await activationGuard.abortUnchanged(); activationGuard = undefined }
+                        if (pluginsFenced) { pluginsFenced = false; await dependencies.plugins.restart() }
+                        if (jobsFenced) { jobsFenced = false; await resumeOld() }
+                    } catch (recoveryError) {
+                        throw new AggregateError([error, recoveryError], 'Sync binding failed while resuming local state')
+                    }
+                }
+                throw error
             } finally { running = false }
         },
         async unbind(): Promise<SyncBindingState> {
