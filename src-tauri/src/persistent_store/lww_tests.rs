@@ -1551,3 +1551,352 @@ fn future_clock_admission_blocks_transport_but_local_messages_keep_committing() 
         .any(|entry| entry.key.components()[0] == "messages"
             && entry.stamp.physical_ms.0 >= future.physical_ms.0));
 }
+
+fn new_device_stage(store: &mut PersistentStore) -> (Header, String, Vec<Change>) {
+    use super::super::sync_selection::SyncTarget;
+    let target = SyncTarget::Server("fresh-connection".into());
+    let state = store.lww_binding_state().unwrap();
+    let inspection = store
+        .register_lww_binding_inspection(state.target_authority, &target, "target", "library")
+        .unwrap();
+    let staging = store.replace_begin().unwrap().staging_id;
+    store
+        .replace_put_root(&staging, &serde_json::json!({"language":"en"}))
+        .unwrap();
+    let changes = vec![change(&["root", "language"], 10, serde_json::json!("en"))];
+    let request_id = Uuid::new_v4().to_string();
+    store
+        .register_lww_binding_stage(&inspection, &staging, &request_id, &changes)
+        .unwrap();
+    (
+        Header {
+            binding_authority: state.target_authority,
+            request_id,
+        },
+        staging,
+        changes,
+    )
+}
+#[test]
+fn explicit_new_device_replaces_before_identity_reset_and_completed_retry_preserves_later_edits() {
+    use super::super::device_store::plugin_values::PluginDeviceMutation;
+    let (_, mut store) = store();
+    save(
+        &mut store,
+        vec![mutation(&["root", "language"], serde_json::json!("old"))],
+    );
+    let (header, staging, _) = new_device_stage(&mut store);
+    let before = store.lww_clock_state().unwrap();
+    let accepted = stamp(500);
+    let db = store.device_store().unwrap().connection();
+    db.execute(
+        "UPDATE lww_clock SET accepted=?1",
+        [serde_json::to_string(&accepted).unwrap()],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO lww_unpublished_proofs VALUES('old-publication',?1,'[]')",
+        [header.binding_authority.0.to_string()],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO lww_progress VALUES('external','','9',?1)",
+        [header.binding_authority.0.to_string()],
+    )
+    .unwrap();
+    store
+        .device_store_mut()
+        .unwrap()
+        .write_setting("hub", &serde_json::json!("local-setting"))
+        .unwrap();
+    store
+        .device_store_mut()
+        .unwrap()
+        .write_plugin_device_values(
+            "orphan",
+            &[
+                PluginDeviceMutation::Set {
+                    space: "json".into(),
+                    key: "old".into(),
+                    value: "null".into(),
+                },
+                PluginDeviceMutation::Set {
+                    space: "string".into(),
+                    key: "old".into(),
+                    value: "old".into(),
+                },
+            ],
+        )
+        .unwrap();
+    let preparation = store.prepare_lww_new_device(&header, &staging).unwrap();
+    assert_eq!(
+        store.prepare_lww_new_device(&header, &staging).unwrap(),
+        preparation
+    );
+    assert!(store
+        .lww_replace_target_as_new_device(&header, &staging, &preparation.authorization_id)
+        .is_err());
+    assert_eq!(store.lww_clock_state().unwrap().writer_id, before.writer_id);
+    store
+        .authorize_lww_new_device(&preparation.authorization_id)
+        .unwrap();
+    let result = store
+        .lww_replace_target_as_new_device(&header, &staging, &preparation.authorization_id)
+        .unwrap();
+    assert_ne!(result.writer_id, before.writer_id);
+    assert_eq!(result.writer_id, preparation.writer_id);
+    assert_eq!(result.binding_authority.0, header.binding_authority.0 + 1);
+    let after = store.lww_clock_state().unwrap();
+    assert_eq!(after.writer_id, result.writer_id);
+    assert_eq!(after.accepted, Some(accepted));
+    assert!(after.issued.is_none());
+    assert_eq!(store.read_root(None).unwrap().value["language"], "en");
+    assert_eq!(
+        store.lww_binding_state().unwrap().target_authority,
+        result.binding_authority
+    );
+    assert_eq!(
+        store.lww_binding_state().unwrap().library_id,
+        Some("library".into())
+    );
+    assert_eq!(
+        store.device_store().unwrap().read_setting("hub").unwrap(),
+        Some(serde_json::json!("local-setting"))
+    );
+    assert_eq!(
+        store
+            .device_store()
+            .unwrap()
+            .connection()
+            .query_row("SELECT count(*) FROM plugin_device_storage", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store
+            .device_store()
+            .unwrap()
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM lww_unpublished_proofs WHERE proof_id='old-publication'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    assert!(store
+        .lww_receive_progress(result.binding_authority)
+        .unwrap()
+        .is_empty());
+    assert!(store.lww_read_outbox(header.binding_authority, 10).is_err());
+    store
+        .device_store_mut()
+        .unwrap()
+        .write_plugin_device_values(
+            "orphan",
+            &[PluginDeviceMutation::Set {
+                space: "string".into(),
+                key: "later".into(),
+                value: "kept".into(),
+            }],
+        )
+        .unwrap();
+    save(
+        &mut store,
+        vec![mutation(&["root", "language"], serde_json::json!("later"))],
+    );
+    let current = store.lww_clock_state().unwrap();
+    let revision = store.revision().unwrap();
+    assert_eq!(
+        store
+            .lww_replace_target_as_new_device(&header, &staging, &preparation.authorization_id)
+            .unwrap(),
+        result
+    );
+    assert_eq!(store.revision().unwrap(), revision);
+    assert_eq!(store.lww_clock_state().unwrap().issued, current.issued);
+    assert_eq!(store.read_root(None).unwrap().value["language"], "later");
+    assert_eq!(
+        store
+            .device_store()
+            .unwrap()
+            .connection()
+            .query_row(
+                "SELECT value FROM plugin_device_storage WHERE key='later'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "kept"
+    );
+    assert!(store
+        .lww_replace_target_as_new_device(&header, "different-stage", &preparation.authorization_id)
+        .is_err());
+}
+#[test]
+fn explicit_new_device_recovery_finishes_after_library_activation_without_exposing_old_edits() {
+    let (directory, mut store) = store();
+    save(
+        &mut store,
+        vec![mutation(&["root", "language"], serde_json::json!("old"))],
+    );
+    let (header, staging, changes) = new_device_stage(&mut store);
+    let preparation = store.prepare_lww_new_device(&header, &staging).unwrap();
+    store
+        .authorize_lww_new_device(&preparation.authorization_id)
+        .unwrap();
+    let state = store.lww_clock_state().unwrap();
+    let writer_id = preparation.writer_id.clone();
+    let selection_change=serde_json::from_str::<super::super::sync_selection::BindingSelectionChange>(&store.device_store().unwrap().connection().query_row("SELECT selection_change FROM lww_new_device_authorizations WHERE authorization_id=?1",[&preparation.authorization_id],|r|r.get::<_,String>(0)).unwrap()).unwrap();
+    let new_authority = DecimalU64(header.binding_authority.0 + 1);
+    let intent = Intent::NewDevice {
+        authorization_id: preparation.authorization_id.clone(),
+        selection_change: selection_change.clone(),
+        staging_id: staging.clone(),
+        changes: changes.clone(),
+        old_writer_id: state.writer_id.clone(),
+        writer_id: writer_id.clone(),
+        new_authority,
+    };
+    let body = serde_json::to_string(&intent).unwrap();
+    let digest = risunest_sync_wire::hash(body.as_bytes());
+    let stamp = state.issued.unwrap();
+    store
+        .device_store()
+        .unwrap()
+        .connection()
+        .execute(
+            "INSERT INTO lww_intents VALUES(?1,?2,?3,?4,?5,0)",
+            params![
+                header.request_id,
+                header.binding_authority.0.to_string(),
+                serde_json::to_string(&stamp).unwrap(),
+                body,
+                digest
+            ],
+        )
+        .unwrap();
+    let activation = commit::replace_commit_lww(
+        &mut store.connection,
+        &staging,
+        &header,
+        &stamp,
+        &digest,
+        &[],
+        true,
+        &changes,
+        Some(new_authority),
+        Some(&selection_change),
+    )
+    .unwrap();
+    assert_eq!(store.lww_clock_state().unwrap().writer_id, state.writer_id);
+    drop(store);
+    let mut store = PersistentStore::open(directory.path()).unwrap();
+    let result = store
+        .lww_replace_target_as_new_device(&header, &staging, &preparation.authorization_id)
+        .unwrap();
+    assert_eq!(result.revision, activation.revision);
+    assert_eq!(result.writer_id, writer_id);
+    assert_eq!(result.binding_authority, new_authority);
+    assert_eq!(store.lww_clock_state().unwrap().writer_id, writer_id);
+    assert_eq!(store.read_root(None).unwrap().value["language"], "en");
+    assert!(store
+        .lww_read_outbox(new_authority, 100)
+        .unwrap()
+        .entries
+        .is_empty());
+}
+#[test]
+fn explicit_new_device_rejects_mutated_or_unattested_stage_without_identity_change() {
+    let (_, mut store) = store();
+    let stage = store.replace_begin().unwrap().staging_id;
+    store
+        .replace_put_root(&stage, &serde_json::json!({}))
+        .unwrap();
+    let before = store.lww_clock_state().unwrap();
+    assert!(store
+        .lww_replace_target_as_new_device(
+            &Header {
+                binding_authority: before.binding_authority,
+                request_id: "unattested".into()
+            },
+            &stage,
+            "missing"
+        )
+        .is_err());
+    assert_eq!(store.lww_clock_state().unwrap().writer_id, before.writer_id);
+    let (header, staging, _) = new_device_stage(&mut store);
+    let preparation = store.prepare_lww_new_device(&header, &staging).unwrap();
+    store
+        .authorize_lww_new_device(&preparation.authorization_id)
+        .unwrap();
+    store
+        .replace_put_root(&staging, &serde_json::json!({"language":"changed"}))
+        .unwrap();
+    let before = store.lww_clock_state().unwrap();
+    assert!(store
+        .lww_replace_target_as_new_device(&header, &staging, &preparation.authorization_id)
+        .is_err());
+    let after = store.lww_clock_state().unwrap();
+    assert_eq!(after.writer_id, before.writer_id);
+    assert_eq!(after.binding_authority, before.binding_authority);
+    assert_eq!(after.issued, before.issued);
+}
+
+#[test]
+fn explicit_new_device_empty_target_activates_empty_stage_without_republishing_local_units() {
+    use super::super::sync_selection::SyncTarget;
+    let (_, mut store) = store();
+    save(
+        &mut store,
+        vec![mutation(&["root", "language"], serde_json::json!("local"))],
+    );
+    let state = store.lww_binding_state().unwrap();
+    let target = SyncTarget::Server("empty-target".into());
+    let inspection = store
+        .register_lww_binding_inspection(state.target_authority, &target, "target", "empty-library")
+        .unwrap();
+    let staging = store.replace_begin().unwrap().staging_id;
+    store
+        .replace_put_root(&staging, &serde_json::json!({}))
+        .unwrap();
+    let header = Header {
+        binding_authority: state.target_authority,
+        request_id: Uuid::new_v4().to_string(),
+    };
+    store
+        .register_lww_binding_stage(&inspection, &staging, &header.request_id, &[])
+        .unwrap();
+    let preparation = store.prepare_lww_new_device(&header, &staging).unwrap();
+    assert_eq!(
+        store.lww_binding_state().unwrap().target_authority,
+        state.target_authority
+    );
+    assert_eq!(store.read_root(None).unwrap().value["language"], "local");
+    store
+        .authorize_lww_new_device(&preparation.authorization_id)
+        .unwrap();
+    let result = store
+        .lww_replace_target_as_new_device(&header, &staging, &preparation.authorization_id)
+        .unwrap();
+    assert_eq!(result.writer_id, preparation.writer_id);
+    assert!(store
+        .read_root(None)
+        .unwrap()
+        .value
+        .get("language")
+        .is_none());
+    assert_eq!(store.lww_binding_state().unwrap().target, target);
+    assert!(store
+        .lww_read_outbox(result.binding_authority, 100)
+        .unwrap()
+        .entries
+        .is_empty());
+    assert!(store
+        .lww_read_unit_state(result.binding_authority, None, 100)
+        .unwrap()
+        .entries
+        .is_empty());
+}

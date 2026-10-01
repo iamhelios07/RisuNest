@@ -1295,6 +1295,8 @@ pub(super) fn replace_commit_lww(
     changes: &[(risunest_sync_wire::unit::UnitKey, risunest_sync_wire::unit::UnitValue)],
     target: bool,
     received: &[super::lww::Change],
+    received_authority: Option<risunest_sync_wire::stamp::DecimalU64>,
+    selection_change: Option<&super::sync_selection::BindingSelectionChange>,
 ) -> StoreResult<RevisionResult> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let completed: Option<(String,i64)> = transaction.query_row(
@@ -1305,6 +1307,7 @@ pub(super) fn replace_commit_lww(
         if old!=digest {return Err(validation("request-id-integrity"));}
         return Ok(RevisionResult {revision});
     }
+    if let Some(change)=selection_change {super::sync_selection::apply_binding_selection(&transaction,change)?;}
     require_staging(&transaction, staging_id)?;
     if target {super::sync_selection::validate_binding_stage_content(&transaction,staging_id)?;}
     let active=active_generation(&transaction)?;
@@ -1322,7 +1325,7 @@ pub(super) fn replace_commit_lww(
         transaction.execute("DELETE FROM lww_receive_rows",[])?;
         for change in received {if !super::lww::is_device(&change.key) {
             super::lww::put_unit(&transaction,&change.key,&change.stamp,&change.value,&header.request_id,None)?;
-            super::lww::witness_received(&transaction,change,header.binding_authority)?;
+            super::lww::witness_received(&transaction,change,received_authority.unwrap_or(header.binding_authority))?;
         }}
     } else {
         for (key,value) in changes {
