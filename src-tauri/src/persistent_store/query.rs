@@ -502,7 +502,14 @@ const CHARACTER_SUMMARY_COLUMNS: &str =
     "character_id, name, image, configured_index, recent_at, trashed, conversation_count,
      type, creator_notes, trash_time, archived_object";
 
-fn character_summary_from_row(row: &rusqlite::Row<'_>) -> StoreResult<CharacterSummary> {
+fn character_summary_from_row(connection: &Connection, row: &rusqlite::Row<'_>) -> StoreResult<CharacterSummary> {
+    let id: String = row.get(0)?;
+    let key = risunest_sync_wire::unit::UnitKey::new(&["character", &id, "trashTime"])
+        .map_err(|e| StoreError::Validation {message:e.to_string()})?;
+    let stamp: Option<String> = if row.get::<_, i64>(5)? != 0 {
+        connection.query_row("SELECT stamp FROM lww_units WHERE key=?1 AND json_extract(value,'$.kind')!='deleted'",[key.as_str()],|r|r.get(0)).optional()?
+    } else { None };
+    let trash_stamp_ms = stamp.map(|stamp| serde_json::from_str::<risunest_sync_wire::stamp::Stamp>(&stamp).map(|stamp| stamp.physical_ms.0.to_string())).transpose()?;
     let archived = row
         .get::<_, Option<String>>(10)?
         .map(|stored| {
@@ -526,6 +533,7 @@ fn character_summary_from_row(row: &rusqlite::Row<'_>) -> StoreResult<CharacterS
         r#type: row.get(7)?,
         creator_notes: row.get(8)?,
         trash_time: row.get(9)?,
+        trash_stamp_ms,
         archived,
     })
 }
@@ -579,7 +587,7 @@ pub(super) fn query_characters(
             if !name.to_lowercase().contains(search) { continue; }
         }
         if items.len() as i64 == limit { has_more = true; break; }
-        items.push(character_summary_from_row(row)?);
+        items.push(character_summary_from_row(connection, row)?);
     }
     let next_cursor = if has_more {
         let last = items.last().expect("positive page limit");
@@ -618,7 +626,7 @@ fn query_configured_characters(
             has_more = true;
             break;
         }
-        items.push(character_summary_from_row(row)?);
+        items.push(character_summary_from_row(connection, row)?);
     }
     let next_cursor = if has_more {
         let last = items.last().expect("positive page limit");
@@ -642,7 +650,7 @@ pub(super) fn read_character_summary(
     ))?;
     let mut rows = statement.query(params![target.generation, id])?;
     match rows.next()? {
-        Some(row) => Ok(Some(character_summary_from_row(row)?)),
+        Some(row) => Ok(Some(character_summary_from_row(connection, row)?)),
         None => Ok(None),
     }
 }

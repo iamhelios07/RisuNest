@@ -2649,29 +2649,24 @@ describe('SaveCoordinator', () => {
         expect(commit).toHaveBeenCalledOnce()
         expect(commit).toHaveBeenCalledWith({
             expectedRevision: 1,
-            root: expect.objectContaining({
-                characterOrder: ['group-a', 'group-b', 'group-trash'],
-            }),
-            deleteCharacterIds: ['char-a'],
-            characterDetails: [
-                expect.objectContaining({
-                    chaId: 'group-a',
+            unitMutations: [
+                {type:'delete',key:'["exists","character","char-a"]'},
+                {type:'set',key:'["group-members","group-a"]',value:{
                     characters: ['char-b'],
                     characterTalks: [0.75],
                     characterActive: [true],
-                }),
-                expect.objectContaining({
-                    chaId: 'group-b',
+                }},
+                {type:'set',key:'["group-members","group-b"]',value:{
                     characters: ['char-b'],
                     characterTalks: [0.4],
                     characterActive: [true],
-                }),
-                expect.objectContaining({
-                    chaId: 'group-trash',
+                }},
+                {type:'set',key:'["group-members","group-trash"]',value:{
                     characters: [],
                     characterTalks: [],
                     characterActive: [],
-                }),
+                }},
+                {type:'set',key:'["order","characters"]',value:['group-a','group-b','group-trash']},
             ],
         })
         expect(publishCharacterMutation).toHaveBeenCalledWith(expect.objectContaining({
@@ -2739,11 +2734,11 @@ describe('SaveCoordinator', () => {
         expect(commit).toHaveBeenCalledOnce()
         expect(commit.mock.calls[0][0]).toMatchObject({
             expectedRevision: 1,
-            deleteCharacterIds: ['char-a'],
-            characterDetails: [expect.objectContaining({
-                chaId: 'group-a',
-                characters: ['char-b'],
-            })],
+            unitMutations: [
+                {type:'delete',key:'["exists","character","char-a"]'},
+                {type:'set',key:'["group-members","group-a"]',value:expect.objectContaining({characters:['char-b']})},
+                {type:'set',key:'["order","characters"]',value:['group-a']},
+            ],
         })
         expect(group.characters).toEqual(['char-b'])
         expect(coordinator.revision).toBe(2)
@@ -2763,7 +2758,7 @@ describe('SaveCoordinator', () => {
         let durable: character | groupChat | null = structuredClone(target)
         const commit = vi.fn(async (input: WorkingSetCommit) => {
             if (commit.mock.calls.length === 1) await firstCommit.promise
-            if (input.deleteCharacterIds?.includes('char-a')) durable = null
+            if (input.unitMutations?.some(item => item.type === 'delete' && item.key === '["exists","character","char-a"]')) durable = null
             if (input.addCharacter) durable = structuredClone(input.addCharacter)
             return { revision: ++revision }
         })
@@ -2812,7 +2807,7 @@ describe('SaveCoordinator', () => {
         expect(commit).toHaveBeenCalledTimes(2)
         expect(commit.mock.calls[0][0]).toMatchObject({
             expectedRevision: 1,
-            deleteCharacterIds: ['char-a'],
+            unitMutations:expect.arrayContaining([{type:'delete',key:'["exists","character","char-a"]'}]),
         })
         expect(commit.mock.calls[1][0]).toMatchObject({
             expectedRevision: 2,

@@ -482,6 +482,9 @@ export type NativeBlockRestoreRuntime = Pick<
     | 'acquireDestructiveReplacementFence'
     | 'markCommittedWorkingSetRefreshRequired'
     | 'getStorageAuthorityEpoch'
+    | 'withPausedPersistentWrites'
+    | 'beginActivatedLibraryGuard'
+    | 'refreshActivatedLibraryUnderPause'
 >
 
 export interface NativeFileJobOptions {
@@ -1296,6 +1299,10 @@ async function runNativeReplacementRestore(
     let terminal: NativeFileJobStatus | undefined
     let mutationConflict: NativeFileJobError | undefined
     let incompleteConfirmed = false
+    let upstreamPause: Awaited<ReturnType<typeof import('./upstreamReplacement')['acquireUpstreamImportPause']>> | undefined
+    let upstreamBinding: Awaited<ReturnType<typeof import('./sync/bindingRegistry')['prepareBoundLibraryReplacement']>> | undefined
+    let activationSubmitted = false
+    let upstreamFenced = false
     let assignedPreview: NativeStagedPluginPreview | undefined
     let replacementFence:
         | Awaited<
@@ -1383,7 +1390,7 @@ async function runNativeReplacementRestore(
                 startUiBlocking()
             }
             if (status.state === 'waitingForInput' && status.phase === 'awaiting-activation' &&
-                !cancellationRequested && !incompleteConfirmed && status.incompleteRestorePreview) {
+                kind === 'restore-portable-backup' && !cancellationRequested && !incompleteConfirmed && status.incompleteRestorePreview) {
                 const confirmed = await (options.confirmIncompleteRestore ?? confirmIncompleteNativeRestore)(status.incompleteRestorePreview)
                 if (!confirmed || options.signal?.aborted) {
                     cancellationRequested = true
@@ -1433,13 +1440,41 @@ async function runNativeReplacementRestore(
             ) {
                 try {
                     startUiBlocking()
-                    await options.beforeActivation?.()
-                    // Explicit restores accept a fresh token after preparation and choices.
-                    const activationToken = await runtime.capturePersistentMutationToken(
-                        `${mutationReason}-activation`, { publishOfficial: false },
-                    )
-                    replacementFence = await runtime.acquireDestructiveReplacementFence(activationToken)
-                    if (kind === 'restore-portable-backup') {
+                    if (kind !== 'restore-portable-backup') {
+                        if (status.incompleteRestorePreview && options.confirmIncompleteRestore &&
+                            !(await options.confirmIncompleteRestore(status.incompleteRestorePreview))) {
+                            cancellationRequested = true
+                            await invokeNative(dependencies, 'native_file_job_cancel', {jobId:started.jobId})
+                            continue
+                        }
+                        const {prepareBoundLibraryReplacement} = await import('./sync/bindingRegistry')
+                        upstreamBinding = await prepareBoundLibraryReplacement()
+                        const {acquireUpstreamImportPause, confirmUpstreamLibraryReplacement} = await import('./upstreamReplacement')
+                        const {language} = await import('../../lang')
+                        const warnings: string[] = []
+                        const preview = status.incompleteRestorePreview
+                        if (preview?.unavailableColdKeys.length) warnings.push(language.errors.coldStorageIncompleteRestoreConfirm(preview.characterNames.join(', '), preview.unavailableColdKeys.length, 0))
+                        if (preview?.invalidInlays.length) warnings.push(language.portableBackup.invalidInlaysConfirm(preview.invalidInlays.length))
+                        if (!(await confirmUpstreamLibraryReplacement(upstreamBinding.bound, warnings))) {
+                            cancellationRequested = true
+                            await invokeNative(dependencies, 'native_file_job_cancel', {jobId:started.jobId})
+                            continue
+                        }
+                        await upstreamBinding.fence()
+                        upstreamFenced = true
+                        const plugins = await import('../plugins/apiV3/v3.svelte')
+                        await plugins.fencePluginExecutionForAuthorityReplacement()
+                        await options.beforeActivation?.()
+                        upstreamPause = await acquireUpstreamImportPause(runtime, `${mutationReason}-activation`)
+                        replacementFence = upstreamPause.fence
+                        await upstreamBinding.assertAuthority()
+                    } else {
+                        await options.beforeActivation?.()
+                        // Explicit restores accept a fresh token after preparation and choices.
+                        const activationToken = await runtime.capturePersistentMutationToken(
+                            `${mutationReason}-activation`, { publishOfficial: false },
+                        )
+                        replacementFence = await runtime.acquireDestructiveReplacementFence(activationToken)
                         const { flushDeviceStateBeforeRestore } = await import('./deviceStateRestore')
                         try {
                             await flushDeviceStateBeforeRestore()
@@ -1471,6 +1506,7 @@ async function runNativeReplacementRestore(
                     continue
                 }
                 // Finalization uses the exact token captured after preparation and choices.
+                activationSubmitted = true
                 await invokeNative(dependencies, 'native_file_job_finalize', {
                     jobId: started.jobId,
                     expectedRevision: replacementFence.revision,
@@ -1590,6 +1626,12 @@ async function runNativeReplacementRestore(
                 const outcome = await replacementFence.refreshCommittedWorkingSet(
                     terminal.result.revision,
                 )
+                await upstreamPause?.finish()
+                if (upstreamBinding) {
+                    const plugins = await import('../plugins/apiV3/v3.svelte')
+                    await plugins.invalidatePluginCachesAfterAuthorityReplacement()
+                    await upstreamBinding.resume()
+                }
                 replacementFence.release()
                 replacementFence = undefined
                 if (outcome.projection === 'refresh-required') {
@@ -1603,6 +1645,16 @@ async function runNativeReplacementRestore(
                 }
                 await continueAfterRefresh()
             } catch (error) {
+                if (upstreamPause) {
+                    runtime.markCommittedWorkingSetRefreshRequired(terminal.result.revision, error)
+                    registerCommittedWorkingSetContinuation(terminal.result.revision, runtime,
+                        runtime.getStorageAuthorityEpoch(), async () => {
+                            const plugins = await import('../plugins/apiV3/v3.svelte')
+                            await plugins.invalidatePluginCachesAfterAuthorityReplacement()
+                            await upstreamBinding?.resume()
+                            await continueAfterRefresh()
+                        })
+                }
                 throw new NativeFileJobActivationCommittedError(
                     terminal.result.revision,
                     error,
@@ -1635,6 +1687,23 @@ async function runNativeReplacementRestore(
         }
         throw error
     } finally {
+        if (upstreamPause) {
+            if (!activationSubmitted || terminal?.state === 'cancelled' || terminal?.state === 'failed') {
+                try {
+                    await upstreamPause.abortUnchanged(async () => { await upstreamBinding?.assertAuthority() })
+                    const plugins = await import('../plugins/apiV3/v3.svelte')
+                    await plugins.restartPluginsAfterAuthorityReplacement()
+                    await upstreamBinding?.resume()
+                } catch { await upstreamPause.finish() }
+            } else await upstreamPause.finish()
+        } else if (upstreamFenced && !activationSubmitted) {
+            try {
+                await upstreamBinding!.assertAuthority()
+                const plugins = await import('../plugins/apiV3/v3.svelte')
+                await plugins.restartPluginsAfterAuthorityReplacement()
+                await upstreamBinding!.resume()
+            } catch {}
+        }
         replacementFence?.release()
         if (uiBlocking) options.onBlockingChange?.(false)
     }

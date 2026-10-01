@@ -12,6 +12,25 @@ import { RevisionConflictError, SnapshotReleasedError } from './persistentDataSt
 import { fixtureDatabase } from './tests/persistentDataFixtures'
 
 describe('SqlitePersistentDataStore', () => {
+    it('activates a bound upstream staging generation through an immutable LWW replacement request', async () => {
+        const header={bindingAuthority:'9007199254740993',requestId:'synthetic-import'}
+        mocks.invoke.mockImplementation(async (command: string) => {
+            if(command==='pds_replace_begin') return {stagingId:'upstream-stage'}
+            if(command==='pds_replace_preserve_repositories') return {revision:7}
+            if(command==='pds_lww_commit_replacement') return {revision:8}
+            return undefined
+        })
+        await expect(new SqlitePersistentDataStore().replaceFromDatabase(structuredClone(fixtureDatabase),7,[],undefined,header)).resolves.toEqual({revision:8})
+        expect(mocks.invoke).toHaveBeenLastCalledWith('pds_lww_commit_replacement',{request:{...header,stagingId:'upstream-stage'}})
+        expect(mocks.invoke.mock.calls.some(([command])=>command==='pds_replace_commit')).toBe(false)
+        expect(mocks.invoke).toHaveBeenCalledWith('pds_replace_preserve_repositories',{stagingId:'upstream-stage',expectedRevision:7})
+    })
+
+    it('preserves the canonical native trash stamp beyond the safe integer range', async () => {
+        const summary={id:'synthetic',name:'Synthetic',trashed:true,trashTime:1,trashStampMs:'9007199254740993'}
+        mocks.invoke.mockResolvedValueOnce({revision:7,items:[summary]})
+        await expect(new SqlitePersistentDataStore().queryCharacters({trash:true,order:'configured',limit:200})).resolves.toEqual({revision:7,items:[summary]})
+    })
     beforeEach(() => {
         mocks.invoke.mockReset()
     })

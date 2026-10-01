@@ -1,4 +1,5 @@
 import { canonicalJson, canonicalClone } from './saveCoordinatorHelpers'
+import {registerCommittedWorkingSetContinuation} from './committedWorkingSetContinuation'
 import { diffRootMutations } from './rootMutation'
 import { generatingConversations } from './generatingConversationRegistry'
 import { captureLwwWorkingSetBaseline, applyLwwWorkingSetUnits } from './lwwWorkingSetApply'
@@ -1021,7 +1022,7 @@ export function createPersistentDataRuntime(
         await projectAppliedUnits(result, baseline)
         return result
     })
-    return {
+    const runtime: PersistentDataRuntime = {
         store: dependencies.store,
         withPausedPersistentWrites: (reason, operation) => coordinator.withPausedPersistentWrites(reason, operation),
         beginActivatedLibraryGuard(token) {
@@ -1195,7 +1196,7 @@ export function createPersistentDataRuntime(
         getNavigationGeneration: () => workingSet.navigationGenerationToken,
         fenceNavigation: () => workingSet.fenceNavigation(),
         invalidateNavigation: () => workingSet.invalidateNavigation(),
-        replacePersistentDatabase: (database, reason, options) => {
+        replacePersistentDatabase: async (database, reason, options) => {
             if (
                 !options?.authoritative &&
                 hasIncompletePersistentWorkingSet(database, workingSetResidency)
@@ -1205,6 +1206,67 @@ export function createPersistentDataRuntime(
                         'Cannot replace persistent data from an incomplete persistent working set',
                     ),
                 )
+            }
+            if (isTauri && options?.upstreamImport) {
+                const {prepareUpstreamImport} = await import('./importedIdentity')
+                const candidate = await dependencies.prepareDatabase(prepareUpstreamImport(database))
+                const {prepareBoundLibraryReplacement} = await import('./sync/bindingRegistry')
+                const binding = await prepareBoundLibraryReplacement()
+                const {acquireUpstreamImportPause, confirmUpstreamLibraryReplacement} = await import('./upstreamReplacement')
+                if (!(await confirmUpstreamLibraryReplacement(binding.bound, options.upstreamImportWarnings))) throw new Error('Import cancelled')
+                const plugins = await import('../plugins/apiV3/v3.svelte')
+                let pause: Awaited<ReturnType<typeof acquireUpstreamImportPause>>
+                try {
+                    await binding.fence()
+                    await plugins.fencePluginExecutionForAuthorityReplacement()
+                    pause = await acquireUpstreamImportPause(runtime, reason)
+                } catch (error) {
+                    try {
+                        await binding.assertAuthority()
+                        await plugins.restartPluginsAfterAuthorityReplacement()
+                        await binding.resume()
+                    } catch {}
+                    throw error
+                }
+                let committed = false
+                let acceptedRevision = pause.fence.revision
+                try {
+                    if ((options.expectedRevision !== undefined && options.expectedRevision !== pause.fence.revision) ||
+                        (options.expectedMutationGeneration !== undefined && options.expectedMutationGeneration !== pause.token.mutationGeneration)) {
+                        throw new PersistentMutationFencedError()
+                    }
+                    await binding?.assertAuthority()
+                    const result = await dependencies.store.replaceFromDatabase(candidate, pause.fence.revision, [], options.pluginStorageValues,
+                        binding.bound ? {bindingAuthority:binding.state.targetAuthority,requestId:crypto.randomUUID()} : undefined)
+                    committed = true
+                    acceptedRevision = result.revision
+                    const outcome = await pause.fence.refreshCommittedWorkingSet(result.revision)
+                    await pause.finish()
+                    await coordinator.finishUpstreamReplacementPublication(outcome.revision, options.publishOfficial)
+                    await plugins.invalidatePluginCachesAfterAuthorityReplacement()
+                    await binding?.resume()
+                    return outcome
+                } catch (error) {
+                    let abortedUnchanged = false
+                    if (!committed) {
+                        try {
+                            await pause.abortUnchanged(async () => { await binding.assertAuthority() })
+                            abortedUnchanged = true
+                            await plugins.restartPluginsAfterAuthorityReplacement()
+                            await binding.resume()
+                        } catch { await pause.finish() }
+                    } else await pause.finish()
+                    if (!abortedUnchanged && coordinator.pendingWorkingSetRefreshRevision !== null) {
+                        registerCommittedWorkingSetContinuation(acceptedRevision, runtime, runtime.getStorageAuthorityEpoch(), async () => {
+                            await binding.assertAuthority()
+                            await coordinator.finishUpstreamReplacementPublication(coordinator.revision, options.publishOfficial)
+                            await plugins.invalidatePluginCachesAfterAuthorityReplacement()
+                            await plugins.restartPluginsAfterAuthorityReplacement()
+                            await binding.resume()
+                        })
+                    }
+                    throw error
+                }
             }
             return coordinator.replacePreparedPersistentDatabase(
                 () => dependencies.prepareDatabase(database),
@@ -1402,4 +1464,5 @@ export function createPersistentDataRuntime(
         hasPendingOfficialPublication: () =>
             coordinator.hasPendingOfficialPublication,
     }
+    return runtime
 }

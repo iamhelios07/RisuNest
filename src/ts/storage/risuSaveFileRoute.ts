@@ -40,6 +40,9 @@ type FileRouteRuntime = Pick<
     | 'markCommittedWorkingSetRefreshRequired'
     | 'getStorageAuthorityEpoch'
     | 'replacePersistentDatabase'
+    | 'withPausedPersistentWrites'
+    | 'beginActivatedLibraryGuard'
+    | 'refreshActivatedLibraryUnderPause'
 >
 
 export interface RisuSaveFileRouteDependencies {
@@ -362,12 +365,13 @@ async function importWithBytes(
     dependencies: RisuSaveFileRouteDependencies,
 ): Promise<RisuSaveFileRouteResult> {
     webImportStatus(options, 'decoding-database', bytes.byteLength, bytes.byteLength)
-    const database = await dependencies.decodeRisuSave(bytes) as Database
+    const { prepareUpstreamImport } = await import('./importedIdentity')
+    const database = prepareUpstreamImport(await dependencies.decodeRisuSave(bytes) as Database)
     webImportStatus(options, 'activating', bytes.byteLength, bytes.byteLength)
     await runtime.replacePersistentDatabase(
         database,
         'risu-save-file-import',
-        { authoritative: true },
+        { authoritative: true, upstreamImport: true },
     )
     webImportStatus(options, 'reloading-plugins', bytes.byteLength, bytes.byteLength)
     await dependencies.reloadPlugins()

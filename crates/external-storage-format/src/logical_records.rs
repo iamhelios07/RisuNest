@@ -278,6 +278,8 @@ pub enum LogicalRecordEnvelope {
         asset_hashes: Vec<String>,
         #[serde(rename = "sharedAssetHashes")]
         shared_asset_hashes: Vec<String>,
+        #[serde(rename = "identityRemap")]
+        identity_remap: Vec<Value>,
         #[serde(rename = "ownerHeads")]
         owner_heads: Vec<LogicalOwnerHead>,
     },
@@ -868,6 +870,7 @@ mod tests {
                 message_count: 7,
                 asset_hashes: vec!["5".repeat(64)],
                 shared_asset_hashes: vec!["5".repeat(64)],
+                identity_remap: vec![],
                 owner_heads: vec![LogicalOwnerHead::unpositioned_present(
                     LogicalOwnerLocator::CharacterAdditional {
                         character_id: "archived-1".to_owned(),
@@ -929,6 +932,12 @@ mod tests {
             assert_eq!(json["kind"], expected_kind);
             if expected_kind == "root" {
                 assert!(json["ownerHeads"][0].get("manifestSize").is_none());
+            }
+            if expected_kind == "archived-character" {
+                assert_eq!(json["identityRemap"], json!([]));
+                let mut missing = json.clone();
+                missing.as_object_mut().unwrap().remove("identityRemap");
+                assert!(decode_logical_record(&serde_json::to_vec(&missing).unwrap()).is_err());
             }
             assert_eq!(encoded.size, encoded.bytes.len() as u64);
             assert_eq!(decode_logical_record(&encoded.bytes).unwrap(), record);

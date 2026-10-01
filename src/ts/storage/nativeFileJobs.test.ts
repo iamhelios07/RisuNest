@@ -1,8 +1,11 @@
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 const restoreAlerts = vi.hoisted(() => ({ confirm: vi.fn(), checkbox: vi.fn() }))
 vi.mock('../alert', () => ({ alertConfirm: restoreAlerts.confirm, alertCheckboxConfirm: restoreAlerts.checkbox }))
 const deviceRestore = vi.hoisted(() => ({ flushDeviceStateBeforeRestore: vi.fn(async () => {}), refreshDeviceStateAfterRestore: vi.fn(async () => {}) }))
 vi.mock('./deviceStateRestore', () => deviceRestore)
+vi.mock('./sync/bindingRegistry', () => ({prepareBoundLibraryReplacement: async () => ({bound:false,state:{targetAuthority:'1'},fence:async()=>{},assertAuthority:async()=>{},resume:async()=>{}})}))
+vi.mock('../plugins/apiV3/v3.svelte', () => ({fencePluginExecutionForAuthorityReplacement:async()=>{},invalidatePluginCachesAfterAuthorityReplacement:async()=>{},restartPluginsAfterAuthorityReplacement:async()=>{}}))
+beforeEach(() => { restoreAlerts.checkbox.mockReset().mockResolvedValue({confirmed:true,checked:true}) })
 
 describe('local source preservation consent', () => {
     it.each(['accept', 'refuse', 'cancel'] as const)('requires explicit %s before retrying damaged source export', async (decision) => {
@@ -132,6 +135,18 @@ function restoreRuntime(
     let captures = 0
     return {
         getStorageAuthorityEpoch: () => 2,
+        withPausedPersistentWrites: async <T>(reason: string, operation: (token: import('./saveCoordinator').PersistentMutationToken) => Promise<T>) => {
+            await options.capture?.(reason)
+            await options.acquire?.()
+            try { return await operation({revision:options.fencedRevision ?? revision,mutationGeneration:1} as import('./saveCoordinator').PersistentMutationToken) }
+            finally { options.release?.() }
+        },
+        beginActivatedLibraryGuard: () => ({complete(){},abortUnchanged:async()=>{}}),
+        refreshActivatedLibraryUnderPause: async () => {
+            await options.refresh?.((options.fencedRevision ?? revision) + 1)
+            if (options.projection === 'refresh-required') throw new Error('Activated library projection is incomplete')
+            return {kind:'committed' as const, revision:(options.fencedRevision ?? revision) + 1, projection:'applied' as const}
+        },
         retryCommittedWorkingSetRefresh: async () => {
             await options.refresh?.(revision + 1)
             return {
@@ -4495,7 +4510,7 @@ it.each(['both', 'cold', 'inlay'] as const)('cancels default incomplete restore 
         } },
     )).rejects.toMatchObject({ name: 'AbortError' })
     expect(acquire).not.toHaveBeenCalled()
-    expect(restoreAlerts.checkbox).toHaveBeenCalledTimes(kind === 'both' ? 1 : 0)
-    expect(restoreAlerts.confirm).toHaveBeenCalledTimes(kind === 'both' ? 0 : 1)
-    if (kind === 'both') expect(restoreAlerts.checkbox).toHaveBeenCalledWith(expect.objectContaining({ requireChecked: true }))
+    expect(restoreAlerts.checkbox).toHaveBeenCalledTimes(1)
+    expect(restoreAlerts.confirm).not.toHaveBeenCalled()
+    expect(restoreAlerts.checkbox).toHaveBeenCalledWith(expect.objectContaining({ requireChecked: true }))
 })

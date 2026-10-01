@@ -49,6 +49,9 @@ it('clears cached update and device preferences through an empty native settings
     ]
     const runtime: Parameters<typeof runNativeArchiveRestore>[0] = {
         getStorageAuthorityEpoch: () => 1,
+        withPausedPersistentWrites: async () => { throw new Error('Unexpected upstream pause') },
+        beginActivatedLibraryGuard: () => { throw new Error('Unexpected upstream guard') },
+        refreshActivatedLibraryUnderPause: async () => { throw new Error('Unexpected upstream refresh') },
         capturePersistentMutationToken: async () => ({ revision: 3, mutationGeneration: 1 }),
         acquireDestructiveReplacementFence: async () => {
             fenced = true

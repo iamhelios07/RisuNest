@@ -285,6 +285,7 @@ export interface CharacterSummary {
     type: CharacterDetail['type']
     creatorNotes?: string
     trashTime?: number
+    trashStampMs?: string
     archived?: ArchivedCharacterSummary
 }
 
@@ -679,6 +680,7 @@ export interface PersistentDataStore {
         expectedRevision?: DataRevision,
         assetAliases?: AssetAlias[],
         pluginStorageValues?: PluginStorageValue[],
+        replacementHeader?: LwwReceiveHeader,
     ): Promise<{ revision: DataRevision }>
     materializeDatabase(revision?: DataRevision): Promise<Database>
     acquireRevision(revision: DataRevision): Promise<PersistentRevisionLease>

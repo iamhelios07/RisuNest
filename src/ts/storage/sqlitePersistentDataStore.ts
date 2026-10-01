@@ -358,6 +358,7 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
         expectedRevision?: DataRevision,
         assetAliases: AssetAlias[] = [],
         pluginStorageValues?: PluginStorageValue[],
+        replacementHeader?: import('./persistentDataStore').LwwReceiveHeader,
     ): Promise<{ revision: DataRevision }> {
         database = prepareNativePersistenceValue(database, 'replacement database')
         assetAliases = prepareNativePersistenceValue(assetAliases, 'asset aliases')
@@ -394,6 +395,9 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
                     aliases,
                 })
             }
+            if (replacementHeader) return await invokeStore('pds_lww_commit_replacement', {
+                request: { ...replacementHeader, stagingId },
+            })
             return await invokeStore('pds_replace_commit', {
                 stagingId,
                 expectedRevision: preserved.revision,

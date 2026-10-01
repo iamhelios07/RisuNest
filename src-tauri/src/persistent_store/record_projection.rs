@@ -611,6 +611,7 @@ pub(super) fn reconstruct_record_with_owner_objects(
                     )?,
                     asset_hashes: archived.asset_hashes,
                     shared_asset_hashes: archived.shared_asset_hashes,
+                    identity_remap: archived.identity_remap.iter().map(serde_json::to_value).collect::<Result<_,_>>()?,
                     owner_heads: logical_owner_heads(&owner_heads),
                 })
                 .map_err(codec_error)?
