@@ -3100,6 +3100,7 @@ export const languageEnglish = {
         cancelAction: "Cancel",
         clockBlocked: "Sync stopped because the device and remote times differ. Correct the time and try again.",
         writerCollision: "Sync stopped because another device uses the same identity. Reconnect as a new device.",
+        newDeviceAction: "Connect as new device",
         restoreTitle: "Restore the backup?",
         restoreDescriptionBound: "The current data will be cleared and replaced with the selected backup, and the restored data will sync remotely. Make a manual backup if needed.",
         restoreDescription: "The current data will be cleared and replaced with the selected backup. Make a manual backup if needed.",

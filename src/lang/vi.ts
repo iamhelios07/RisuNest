@@ -1498,6 +1498,7 @@ export const languageVietnamese = {
         cancelAction: "Hủy",
         clockBlocked: "Đồng bộ đã dừng do thời gian thiết bị và từ xa khác nhau. Hãy chỉnh lại thời gian và thử lại.",
         writerCollision: "Đồng bộ đã dừng do trùng danh tính thiết bị. Hãy kết nối lại dưới dạng thiết bị mới.",
+        newDeviceAction: "Kết nối dưới dạng thiết bị mới",
         restoreTitle: "Khôi phục bản sao lưu?",
         restoreDescriptionBound: "Dữ liệu hiện tại sẽ bị xóa và thay thế bằng bản sao lưu đã chọn. Dữ liệu khôi phục sẽ được đồng bộ từ xa. Hãy sao lưu thủ công nếu cần.",
         restoreDescription: "Dữ liệu hiện tại sẽ bị xóa và thay thế bằng bản sao lưu đã chọn. Hãy sao lưu thủ công nếu cần.",
