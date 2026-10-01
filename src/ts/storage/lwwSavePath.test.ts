@@ -89,6 +89,17 @@ describe('LWW renderer save path', () => {
         expect(runtime.pendingWorkingSetRefreshRevision).toBe(runtime.revision)
     })
 
+    it('adopts an explicit opaque local root edit without exposing an unknown received root unit', async () => {
+        const {database,runtime,store} = await runtimeHarness()
+        await runtime.commitPersistentUnitIntent('opaque-local',[{key:'["root","opaqueFutureField"]',type:'set',value:{local:true}}])
+        expect((database as unknown as Record<string,unknown>).opaqueFutureField).toEqual({local:true})
+        const baseline = captureLwwWorkingSetBaseline(database,capturePersistentRoot(database),database.botPresets)
+        const reader = {readRoot:async()=>({revision:runtime.revision,value:{...capturePersistentRoot(database),unknownReceived:'opaque'}})} as unknown as import('./persistentDataStore').PersistentRevisionReader
+        await applyLwwWorkingSetUnits(database,baseline,reader,['["root","unknownReceived"]'])
+        expect(database).not.toHaveProperty('unknownReceived')
+        expect((await store.readRoot()).value).toHaveProperty('opaqueFutureField',{local:true})
+    })
+
     it('commits plugin units once if their pinned projection loses its revision', async () => {
         const {store,runtime,commit}=await runtimeHarness()
         vi.spyOn(store,'acquireRevision').mockRejectedValueOnce(new Error('pin lost'))

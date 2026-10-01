@@ -32,7 +32,7 @@ function patchField(live: object, baseline: object, remote: object, field: strin
 }
 
 export async function applyLwwWorkingSetUnits(
-    database: Database, baseline: LwwWorkingSetBaseline, store: PersistentRevisionReader, affectedKeys: readonly string[], liveIndex?: ReadonlyMap<string, CompleteCharacter>,
+    database: Database, baseline: LwwWorkingSetBaseline, store: PersistentRevisionReader, affectedKeys: readonly string[], liveIndex?: ReadonlyMap<string, CompleteCharacter>, allowLocalFields = false,
 ): Promise<LwwWorkingSetBaseline> {
     const charactersById = liveIndex ?? new Map(database.characters.map((value) => [value.chaId,value]))
     const baselineById = new Map(baseline.characters.map((value) => [value.chaId,value]))
@@ -48,7 +48,7 @@ export async function applyLwwWorkingSetUnits(
         }
     }
     for (const [kind, id, field, metadataField] of keys) {
-        if (kind === 'root' && root && persistentRootFields.has(id)) {
+        if (kind === 'root' && root && (allowLocalFields || persistentRootFields.has(id))) {
             if (id === 'botPresetsId' && typeof root.botPresetsId === 'string') {
                 const preset = await store.readPreset(root.botPresetsId)
                 if (preset) {

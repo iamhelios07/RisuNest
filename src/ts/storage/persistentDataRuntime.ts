@@ -585,7 +585,7 @@ export function createPersistentDataRuntime(
     }
     const coordinator = new SaveCoordinator({
         onRoutineUnitsCommitted: dependencies.state.captureWorkingSetDatabase ? async (revision, affectedKeys) => {
-            await projectAppliedUnits({revision, affectedKeys: [...affectedKeys], heldKeys: [], deferredKeys: []})
+            await projectAppliedUnits({revision, affectedKeys: [...affectedKeys], heldKeys: [], deferredKeys: []}, undefined, true)
         } : undefined,
         canonicalCapture: dependencies.state.canonicalCapture,
         store: dependencies.store,
@@ -968,7 +968,7 @@ export function createPersistentDataRuntime(
     }
     let activeReceiveHeader: LwwReceiveHeader | null = null
     const generating = () => [...(dependencies.state.getGeneratingConversations?.() ?? generatingConversations.snapshot())]
-    const projectAppliedUnits = async (result: LwwApplyResult, baseline?: ReturnType<typeof captureLwwWorkingSetBaseline>): Promise<void> => {
+    const projectAppliedUnits = async (result: LwwApplyResult, baseline?: ReturnType<typeof captureLwwWorkingSetBaseline>, localIntent = false): Promise<void> => {
         const database = dependencies.state.captureWorkingSetDatabase?.()
         if (!database) { coordinator.adoptAppliedUnitState(result.revision, null, null, []); return }
         baseline ??= captureLwwWorkingSetBaseline(database, coordinator.capturePersistentBaselineRoot(), dependencies.state.capturePresets?.() ?? null, coordinator.captureMaterializedBaseline())
@@ -976,7 +976,7 @@ export function createPersistentDataRuntime(
         const selectedSession = workingSet.activeConversationSession
         const lease = await dependencies.store.acquireRevision(result.revision)
         let applied: ReturnType<typeof captureLwwWorkingSetBaseline>
-        try { applied = await applyLwwWorkingSetUnits(database, baseline, lease, result.affectedKeys, dependencies.state.captureCharacterIndex?.()) }
+        try { applied = await applyLwwWorkingSetUnits(database, baseline, lease, result.affectedKeys, dependencies.state.captureCharacterIndex?.(), localIntent) }
         finally { await releasePersistentRevisionLease(lease) }
         const beforeDerive = canonicalJson(dependencies.state.captureRoot())
         dependencies.state.afterRemoteApply?.()
@@ -1047,7 +1047,7 @@ export function createPersistentDataRuntime(
                 else affectedKeys.push(JSON.stringify(['messages', value.characterId, value.conversationId]))
             }
             await coordinator.commitPersistentUnitIntent(reason, translated, conversations, wholeMessages, async (revision) => {
-                try { await projectAppliedUnits({ revision, affectedKeys, heldKeys: [], deferredKeys: [] }) }
+                try { await projectAppliedUnits({ revision, affectedKeys, heldKeys: [], deferredKeys: [] }, undefined, true) }
                 catch (error) { coordinator.markCommittedWorkingSetRefreshRequired(revision, error); throw error }
             })
         },
