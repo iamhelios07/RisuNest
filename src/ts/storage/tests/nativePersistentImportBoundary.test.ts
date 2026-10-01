@@ -149,6 +149,36 @@ describe('simulated native persistent local backup boundary', () => {
         vi.clearAllMocks()
     })
 
+    test('converts upstream character formats at explicit import without migrating an active store', async () => {
+        const upstream = structuredClone(fixtureDatabase)
+        delete (upstream as Partial<Database>).formatversion
+        upstream.characters[0].image = 'C:\\synthetic\\assets\\avatar.png'
+        upstream.characters[0].emotionImages = [['happy','C:\\synthetic\\assets\\happy.png']]
+        native.boundary.database = structuredClone(upstream)
+        native.boundary.revision = 1
+        const prepareDatabase = vi.fn(async(input:Database)=>{
+            const database = structuredClone(input)
+            database.formatversion = 5
+            database.characters[0].image = 'assets/avatar.png'
+            database.characters[0].emotionImages = [['happy','assets/happy.png']]
+            return database
+        })
+        const store = createPersistentDataStore()
+        const replacement = vi.spyOn(store,'replaceFromDatabase')
+        const boot = await bootstrapPersistentDatabase({store,prepareDatabase:async(input)=>({database:await prepareDatabase(input),changed:true})})
+        expect(boot.revision).toBe(1)
+        expect(replacement).not.toHaveBeenCalled()
+        expect((await store.materializeDatabase()).characters[0].image).toBe(upstream.characters[0].image)
+        const runtime = createPersistentDataRuntime({store,state:createStateAdapter(boot.database),prepareDatabase})
+        await runtime.initializeActiveWorkingSet(boot.database)
+        await installLocalBackup(upstream,{replaceDatabase:runtime.replacePersistentDatabase,publishAcceptedRevision:async()=>undefined,relaunch:async()=>undefined})
+        const imported = await store.materializeDatabase()
+        expect(imported.formatversion).toBe(5)
+        expect(imported.characters[0]).toMatchObject({image:'assets/avatar.png',emotionImages:[['happy','assets/happy.png']]})
+        expect(replacement).toHaveBeenCalledOnce()
+        expect(native.boundary.revision).toBe(2)
+    })
+
     test('bootstraps a fresh Tauri store, imports a local backup, and preserves it on failure', async () => {
         const preparedDefault = { characters: [], botPresets: [] } as unknown as Database
         const prepareDatabase = async (database: Database) => database.characters
