@@ -415,6 +415,23 @@ describe('plugin unit writes with read provenance', () => {
         expect(harness.replacePersistentCompleteCharacter).not.toHaveBeenCalled()
     })
 
+    it('passes only explicit opaque edits from public character and chat setters to local unit commit', async () => {
+        const harness = createHarness({ unitIntent: true })
+        const database = makeFullObjectDatabase()
+        Object.assign(database.characters[0], { opaqueRetained: 'Imported', opaqueEdited: 'Before' })
+        Object.assign(database.characters[0].chats[0], { opaqueRetained: 'Imported', opaqueEdited: 'Before' })
+        harness.pinnedDatabases.push(database, database, database)
+        const read: any = await harness.access.getCharacterFromIndex(0, callContext())
+        read.opaqueEdited = 'Edited character'
+        await harness.access.setCharacterToIndex(0, read, callContext())
+        expect(harness.commitPersistentUnitIntent).toHaveBeenLastCalledWith('plugin-setCharacterToIndex', [{ key: '["character","active","opaqueEdited"]', type: 'set', value: 'Edited character' }], [], [])
+        read.chats[0].opaqueEdited = 'Edited chat'
+        await harness.access.setChatToIndex(0, 0, read.chats[0], callContext())
+        expect(harness.commitPersistentUnitIntent).toHaveBeenLastCalledWith('plugin-setChatToIndex', [{ key: '["conversation","active","active-chat-a","opaqueEdited"]', type: 'set', value: 'Edited chat' }], [], [])
+        expect(harness.replacePersistentCompleteCharacter).not.toHaveBeenCalled()
+        expect(harness.replacePersistentConversation).not.toHaveBeenCalled()
+    })
+
     it('uses nested chat provenance from a character read without replacing messages', async () => {
         const harness = createHarness({ unitIntent: true })
         const database = makeFullObjectDatabase()
@@ -1679,6 +1696,7 @@ describe('plugin database access', () => {
         resultPresets[0].mainPrompt = 'mutated snapshot'
         expect(durablePresets[0].mainPrompt).toBe('full first body')
         expect(harness.compatibilityDatabase.botPresets[0]).toEqual({
+            id: '0',
             name: 'First',
             image: 'first.png',
         })
