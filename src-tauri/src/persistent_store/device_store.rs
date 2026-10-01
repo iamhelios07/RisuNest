@@ -267,7 +267,7 @@ fn sequence(value: &str) -> StoreResult<Sequence> {
 }
 
 pub(crate) struct DeviceStore {
-    connection: Connection,
+    pub(super) connection: Connection,
 }
 
 impl DeviceStore {
@@ -468,6 +468,9 @@ fn create_schema(connection: &mut Connection) -> StoreResult<()> {
         });
     }
     transaction.execute_batch(SCHEMA)?;
+    transaction.execute_batch(super::lww::UNIT_SCHEMA)?;
+    transaction.execute_batch(super::lww::DEVICE_SCHEMA)?;
+    transaction.execute("INSERT INTO lww_clock VALUES(1,NULL,NULL,'0')", [])?;
     create_triggers(&transaction)?;
     transaction.execute(
         "INSERT INTO device_meta (singleton, writer_id, created_at, revision) VALUES (1,?1,?2,0)",
@@ -495,6 +498,8 @@ fn validate_schema(db: &Connection) -> StoreResult<()> {
     // Compare the complete definitions, including constraints and tracking expressions.
     let reference = Connection::open_in_memory()?;
     reference.execute_batch(SCHEMA)?;
+    reference.execute_batch(super::lww::UNIT_SCHEMA)?;
+    reference.execute_batch(super::lww::DEVICE_SCHEMA)?;
     create_triggers(&reference)?;
     if definitions(db)? != definitions(&reference)? {
         return Err(invalid("Device schema is incompatible"));
@@ -520,6 +525,14 @@ fn validate_schema(db: &Connection) -> StoreResult<()> {
 /// triggers stamp. Staging and copy work runs outside a context and stays
 /// invisible to the change index.
 pub(crate) fn begin_mutation(tx: &Transaction<'_>) -> StoreResult<i64> {
+    let stamp=super::lww::reserve_stamp(tx)?;
+    let previous: String=tx.query_row("SELECT max_write_clock FROM device_sections ORDER BY length(max_write_clock) DESC,max_write_clock DESC LIMIT 1",[],|row|row.get(0))?;
+    let legacy=sequence(&previous)?.next().map_err(|_| invalid("device write clock is exhausted"))?;
+    tx.execute("INSERT INTO lww_device_context VALUES(1,?1,?2)",params![serde_json::to_string(&stamp)?,legacy.as_str()])?;
+    begin_mutation_remote(tx)
+}
+
+pub(crate) fn begin_mutation_remote(tx: &Transaction<'_>) -> StoreResult<i64> {
     tx.execute(
         "UPDATE device_meta SET revision=revision+1 WHERE singleton=1",
         [],
@@ -537,6 +550,13 @@ pub(crate) fn begin_mutation(tx: &Transaction<'_>) -> StoreResult<i64> {
 }
 
 pub(crate) fn finish_mutation(tx: &Transaction<'_>) -> StoreResult<()> {
+    let stamp: String=tx.query_row("SELECT stamp FROM lww_device_context WHERE singleton=1",[],|row|row.get(0))?;
+    super::lww::capture_device_changes(tx,&serde_json::from_str(&stamp)?)?;
+    tx.execute("DELETE FROM lww_device_context",[])?;
+    finish_mutation_remote(tx)
+}
+
+pub(crate) fn finish_mutation_remote(tx: &Transaction<'_>) -> StoreResult<()> {
     tx.execute("DELETE FROM device_change_context", [])?;
     Ok(())
 }
@@ -544,6 +564,11 @@ pub(crate) fn finish_mutation(tx: &Transaction<'_>) -> StoreResult<()> {
 /// Issues the next write clock for a section. The caller commits the value, the
 /// writer identity and the change index in this same transaction.
 pub(crate) fn issue_write_clock(tx: &Transaction<'_>, section: Section) -> StoreResult<Sequence> {
+    let reserved: Option<String>=tx.query_row("SELECT legacy_clock FROM lww_device_context WHERE singleton=1",[],|row|row.get(0)).optional()?;
+    if let Some(reserved)=reserved {
+        tx.execute("UPDATE device_sections SET max_write_clock=?1 WHERE section=?2",params![reserved,section.as_str()])?;
+        return sequence(&reserved);
+    }
     let current: String = tx.query_row(
         "SELECT max_write_clock FROM device_sections WHERE section=?1",
         [section.as_str()],

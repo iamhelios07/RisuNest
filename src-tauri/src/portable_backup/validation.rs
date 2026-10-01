@@ -790,23 +790,11 @@ impl LibraryView<'_> {
         } else {
             None
         };
-        let index = locator.parse::<usize>().ok();
-        let (parent, property) = match kind {
-            "character-additional-assets" => (character.as_ref(), "additionalAssets"),
-            "root-module-assets" => (
-                index.and_then(|i| root.get("modules")?.as_array()?.get(i)),
-                "assets",
-            ),
-            "persona-embedded-module-assets" => (
-                index.and_then(|i| {
-                    root.get("personas")?
-                        .as_array()?
-                        .get(i)?
-                        .get("embeddedModule")
-                }),
-                "assets",
-            ),
-            _ => return Err(Error::Invalid("invalid owner kind")),
+        let owner = crate::persistent_store::AssetOwnerLocator::from_storage(kind, locator)
+            .map_err(|_| Error::Invalid("invalid owner identity"))?;
+        let (parent, property) = match &owner {
+            crate::persistent_store::AssetOwnerLocator::CharacterAdditionalAssets { .. } => (character.as_ref(), "additionalAssets"),
+            _ => (owner.root_parent(root), "assets"),
         };
         let parent = parent
             .and_then(Value::as_object)
