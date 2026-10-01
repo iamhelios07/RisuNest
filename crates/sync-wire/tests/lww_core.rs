@@ -95,3 +95,8 @@ fn user_key_components_can_be_empty_without_weakening_structural_ids() {
     assert!(UnitKey::new(&["character", "", "name"]).is_err());
     assert!(UnitKey::new(&["", "field"]).is_err());
 }
+
+#[test]
+fn decimal_parsing_rounds_to_the_same_ieee_value_as_javascript() {
+    assert_eq!(payload_value::canonicalize(b"3.08984926168550152811e-32").unwrap(), b"3.089849261685502e-32");
+}
