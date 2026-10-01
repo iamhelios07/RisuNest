@@ -212,6 +212,7 @@ pub fn router_with_shutdown(
     };
     Router::new()
         .route("/session", get(session))
+        .route("/session/claim-writer", post(lww::claim_writer))
         .route("/devices/{id}/status", get(device_status))
         .route("/head", get(head))
         .route("/time", get(lww::time))

@@ -142,3 +142,65 @@ fn push_decode_rejects_unknown_deleted_value_fields() {
     let encoded = serde_json::to_vec(&json).unwrap();
     assert!(canonical::decode::<PushRequest>(&encoded, 4096).is_err());
 }
+
+#[test]
+fn new_device_claim_binds_exact_intent_and_strict_receipt_shape() {
+    let request = NewDeviceClaimRequest {
+        writer_id: "00000000-0000-4000-8000-000000000001".into(),
+        authorization_id: "native-authorization".into(),
+        former_token: Some("a".repeat(64)),
+    };
+    request.validate().unwrap();
+    let encoded = canonical::encode(&request).unwrap();
+    assert_eq!(
+        canonical::decode::<NewDeviceClaimRequest>(&encoded, 4096).unwrap(),
+        request
+    );
+    assert_eq!(request.digest().unwrap(), hash(&encoded));
+    let altered = NewDeviceClaimRequest {
+        former_token: None,
+        ..request.clone()
+    };
+    assert_ne!(request.digest().unwrap(), altered.digest().unwrap());
+    for invalid in [
+        NewDeviceClaimRequest {
+            writer_id: "invalid".into(),
+            ..request.clone()
+        },
+        NewDeviceClaimRequest {
+            authorization_id: "".into(),
+            ..request.clone()
+        },
+        NewDeviceClaimRequest {
+            former_token: Some("invalid".into()),
+            ..request.clone()
+        },
+    ] {
+        assert!(invalid.validate().is_err());
+    }
+    let mut json = serde_json::to_value(&request).unwrap();
+    json["rendererFreshnessProof"] = serde_json::json!(true);
+    assert!(
+        canonical::decode::<NewDeviceClaimRequest>(&serde_json::to_vec(&json).unwrap(), 4096)
+            .is_err()
+    );
+    let receipt = NewDeviceClaimReceipt {
+        authorization_id: request.authorization_id,
+        writer_id: request.writer_id,
+        device_id: "device".into(),
+        library_id: "library".into(),
+        epoch: "epoch".into(),
+        former_credential_inactive: true,
+    };
+    let encoded = canonical::encode(&receipt).unwrap();
+    assert_eq!(
+        canonical::decode::<NewDeviceClaimReceipt>(&encoded, 4096).unwrap(),
+        receipt
+    );
+    let mut json = serde_json::to_value(receipt).unwrap();
+    json["fresh"] = serde_json::json!(true);
+    assert!(
+        canonical::decode::<NewDeviceClaimReceipt>(&serde_json::to_vec(&json).unwrap(), 4096)
+            .is_err()
+    );
+}

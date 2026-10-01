@@ -1,13 +1,26 @@
 use super::*;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use risunest_sync_wire::{
-    lww::{AckRequest, CancelOperationRequest, PushRequest, SeqNotification},
+    lww::{
+        AckRequest, CancelOperationRequest, NewDeviceClaimRequest, PushRequest, SeqNotification,
+    },
     stamp::DecimalU64,
     unit::UnitKey,
 };
 
 pub(super) async fn time(State(app): State<App>) -> Result<Response> {
     blocking(move || Ok(Json(app.store.time_sample()?).into_response())).await
+}
+pub(super) async fn claim_writer(
+    State(app): State<App>,
+    Extension(device): Extension<Device>,
+    body: Bytes,
+) -> Result<Response> {
+    let request: NewDeviceClaimRequest = canonical::decode(&body, MAX_METADATA_BYTES)?;
+    blocking(
+        move || Ok(Json(app.store.claim_new_device_writer(&device, &request)?).into_response()),
+    )
+    .await
 }
 pub(super) async fn push(
     State(app): State<App>,
