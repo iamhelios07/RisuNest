@@ -386,31 +386,40 @@ fn project_record(
         conversation_id,
     } = &locator
     {
-        let mut query = db.prepare("SELECT value FROM messages WHERE generation=?1 AND character_id=?2 AND conversation_id=?3 ORDER BY message_index")?;
-        let mut rows = query.query(params![generation, character_id, conversation_id])?;
-        let mut messages = Vec::new();
-        let mut bytes = 0usize;
-        while let Some(row) = rows.next()? {
-            check(probe)?;
-            let value: String = row.get(0)?;
-            if !messages.is_empty()
-                && (messages.len() == LOGICAL_MESSAGE_PAGE_SIZE || bytes + value.len() > 256 * 1024)
-            {
-                let page = encode_message_page(&messages).map_err(codec_error)?;
+        let cached = super::message_pages::load_pages(db, generation, character_id, conversation_id)?;
+        if cached.is_empty() {
+            let mut query = db.prepare("SELECT value FROM messages WHERE generation=?1 AND character_id=?2 AND conversation_id=?3 ORDER BY message_index")?;
+            let mut rows = query.query(params![generation, character_id, conversation_id])?;
+            let mut bodies = Vec::new();
+            while let Some(row) = rows.next()? {
+                check(probe)?;
+                let value: String = row.get(0)?;
+                bodies.push(risunest_sync_wire::payload_value::canonicalize(value.as_bytes()).map_err(codec_error)?);
+            }
+            let hashes = bodies.iter().map(|body| risunest_external_storage_format::message_pages::MessageHash::from_bytes(body)).collect();
+            let result = risunest_external_storage_format::message_pages::repage::<StoreError>(
+                &Default::default(), hashes, 0..0, bodies.len(), |index| {
+                    check(probe)?;
+                    Ok(bodies[index].clone())
+                })?;
+            for page in result.objects {
                 sink.object(&page.hash, &page.bytes)?;
                 sink.reference(&wire_key, &page.hash, page.size)?;
                 pages.push(page.hash);
-                messages.clear();
-                bytes = 0;
             }
-            bytes += value.len();
-            messages.push(serde_json::from_str(&value)?);
-        }
-        if !messages.is_empty() {
-            let page = encode_message_page(&messages).map_err(codec_error)?;
-            sink.object(&page.hash, &page.bytes)?;
-            sink.reference(&wire_key, &page.hash, page.size)?;
-            pages.push(page.hash);
+        } else {
+            for boundary in cached {
+                check(probe)?;
+                let page = boundary.page;
+                let bytes = super::message_pages::object_body(db, &page.hash)?
+                    .ok_or_else(|| missing_source("cached message page"))?;
+                if bytes.len() as u64 != page.byte_length.0 {
+                    return Err(missing_source("cached message page length"));
+                }
+                sink.object(&page.hash, &bytes)?;
+                sink.reference(&wire_key, &page.hash, page.byte_length.0)?;
+                pages.push(page.hash);
+            }
         }
     }
     let record = super::record_projection::reconstruct_record_with_owner_objects(

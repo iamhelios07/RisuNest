@@ -4,6 +4,7 @@ pub(crate) mod asset_residency;
 pub(crate) mod commands;
 pub(crate) mod commit;
 pub(crate) mod content_capture;
+mod message_pages;
 pub(crate) mod content_change_index;
 mod content_locators;
 pub(crate) mod device_store;
