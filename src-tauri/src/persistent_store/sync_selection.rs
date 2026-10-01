@@ -673,7 +673,7 @@ pub(crate) fn pds_lww_replace_from_target(state: tauri::State<'_, super::command
     super::commands::with_store_mut(state, |store| store.replace_lww_binding(&request))
 }
 
-fn binding_stage_digest(db: &Connection, staging_id: &str) -> StoreResult<String> {
+pub(crate) fn binding_stage_digest(db: &Connection, staging_id: &str) -> StoreResult<String> {
     use sha2::{Digest, Sha256};
     let target = super::ReadTarget { generation: staging_id.into(), revision: current_revision(db)? };
     let value = super::query::materialize_target(db, &target)?;

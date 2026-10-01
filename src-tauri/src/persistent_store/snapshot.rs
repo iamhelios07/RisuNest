@@ -317,7 +317,13 @@ pub(super) fn sweep_temporary_generations(
     stale.sort();
     stale.dedup();
     for generation in stale {
-        if generation != active && retained_stage != Some(generation.as_str()) {
+        let binding_stage: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM lww_binding_sources s JOIN lww_binding_stages b
+             ON b.staging_id=s.staging_id AND b.receive_id=s.request_id AND b.inspection_id=s.inspection_id
+             WHERE s.staging_id=?1)",
+            [&generation], |row| row.get(0),
+        )?;
+        if generation != active && retained_stage != Some(generation.as_str()) && !binding_stage {
             delete_generation(&transaction, &generation)?;
         }
     }
