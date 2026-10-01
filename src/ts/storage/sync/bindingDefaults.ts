@@ -54,22 +54,36 @@ export interface BindingLocalContent {
     factoryLibrary: JsonRecord
     sharedVariables?: JsonRecord
     factorySharedVariables?: JsonRecord
-    opaqueSharedUnitCount?: number
+    opaqueSharedUnitCount: string
     protectedValues?: JsonRecord
-    managedAliasCount: number
-    factoryManagedAliasCount: number
-    ordinaryPluginValueCount: number
-    hypaValueCount: number
-    pluginLocalValueCount: number
+    managedAliasCount: string
+    factoryManagedAliasCount: string
+    ordinaryPluginValueCount: string
+    hypaValueCount: string
+    pluginLocalValueCount: string
+}
+
+export function validateBindingCount(value: unknown): string {
+    if (typeof value !== 'string' || !/^(0|[1-9][0-9]*)$/.test(value) ||
+        value.length > 20 || (value.length === 20 && value > '18446744073709551615')) {
+        throw new Error('Invalid binding content count')
+    }
+    return value
 }
 
 export function hasNonDefaultBindingData(content: BindingLocalContent): boolean {
-    if (content.opaqueSharedUnitCount) return true
+    const opaque = validateBindingCount(content.opaqueSharedUnitCount)
+    const ordinary = validateBindingCount(content.ordinaryPluginValueCount)
+    const hypa = validateBindingCount(content.hypaValueCount)
+    const pluginLocal = validateBindingCount(content.pluginLocalValueCount)
+    const aliases = validateBindingCount(content.managedAliasCount)
+    const factoryAliases = validateBindingCount(content.factoryManagedAliasCount)
+    if (opaque !== '0') return true
     for (const [key,value] of Object.entries(content.protectedValues ?? {})) {
         if (JSON.stringify(canonical(value)) !== JSON.stringify(canonical(content.factoryLibrary[key]))) return true
     }
     if (JSON.stringify(canonical(content.sharedVariables ?? {})) !== JSON.stringify(canonical(content.factorySharedVariables ?? {}))) return true
-    if (content.ordinaryPluginValueCount || content.hypaValueCount || content.pluginLocalValueCount) return true
-    if (content.managedAliasCount !== content.factoryManagedAliasCount) return true
+    if (ordinary !== '0' || hypa !== '0' || pluginLocal !== '0') return true
+    if (aliases !== factoryAliases) return true
     return JSON.stringify(libraryProjection(content.library)) !== JSON.stringify(libraryProjection(content.factoryLibrary))
 }
