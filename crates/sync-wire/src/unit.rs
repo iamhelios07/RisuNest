@@ -59,12 +59,28 @@ impl TryFrom<String> for UnitKey {
 }
 impl From<UnitKey> for String { fn from(value: UnitKey) -> Self { value.0 } }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum UnitValue {
     Inline { bytes: String },
     Object { #[serde(rename = "descriptorHash")] descriptor_hash: String, descriptor: RecordDescriptor },
     Deleted,
+}
+impl<'de> Deserialize<'de> for UnitValue {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+        enum Input {
+            Inline { bytes: String },
+            Object { #[serde(rename = "descriptorHash")] descriptor_hash: String, descriptor: RecordDescriptor },
+            Deleted {},
+        }
+        Ok(match Input::deserialize(d)? {
+            Input::Inline { bytes } => Self::Inline { bytes },
+            Input::Object { descriptor_hash, descriptor } => Self::Object { descriptor_hash, descriptor },
+            Input::Deleted {} => Self::Deleted,
+        })
+    }
 }
 impl UnitValue {
     pub fn inline(bytes: &[u8]) -> Result<Self> {
