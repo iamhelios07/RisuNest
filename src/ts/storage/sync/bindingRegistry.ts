@@ -1,4 +1,4 @@
-import type { BindingTarget, SyncBindingTransport } from './bindingFlow'
+import type { BindingTarget, SyncBindingOptions, SyncBindingTransport } from './bindingFlow'
 import { createSyncBindingFlow } from './bindingFlow'
 
 type Flow = ReturnType<typeof createSyncBindingFlow>
@@ -19,10 +19,14 @@ export function registerSyncBindingTransport(target: Exclude<BindingTarget, { ki
     return () => { if (transports.get(id) === transport) transports.delete(id) }
 }
 
-export async function bindSyncTarget(target: Exclude<BindingTarget, { kind: 'none' }>) {
+export async function bindSyncTarget(target: Exclude<BindingTarget, { kind: 'none' }>, options: SyncBindingOptions = {}) {
     const transport = transports.get(key(target))
     if (!bindingFlow || !transport) throw new Error('Sync binding transport is unavailable')
-    return bindingFlow.bind(target, transport)
+    return bindingFlow.bind(target, transport, options)
+}
+
+export function bindSyncTargetAsNewDevice(target: Exclude<BindingTarget, { kind: 'none' }>) {
+    return bindSyncTarget(target, { mode: 'new-device' })
 }
 
 export async function unbindSyncTarget() {

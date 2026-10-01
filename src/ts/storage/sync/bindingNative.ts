@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
-import type { SyncBindingNative, SyncBindingState, StagedSyncTarget, BindingContext } from './bindingFlow'
+import type { SyncBindingNative, SyncBindingState, StagedSyncTarget, BindingContext, NewDeviceBindingPreparation, NewDeviceBindingResult } from './bindingFlow'
 
 export function createNativeSyncBindingBridge(): SyncBindingNative {
     const state = () => invoke<SyncBindingState>('pds_lww_binding_state')
@@ -29,4 +29,16 @@ export async function replaceNativeSyncBinding(staged: StagedSyncTarget, context
         libraryId: staged.libraryId,
     } })
     context.signal.throwIfAborted()
+}
+
+export async function replaceNativeSyncBindingAsNewDevice(staged: StagedSyncTarget, preparation: NewDeviceBindingPreparation, context: BindingContext): Promise<NewDeviceBindingResult> {
+    context.signal.throwIfAborted()
+    const result = await invoke<NewDeviceBindingResult>('pds_lww_replace_target_as_new_device', { request: {
+        bindingAuthority: context.state.targetAuthority,
+        requestId: staged.receiveId,
+        stagingId: staged.stagingId,
+        authorizationId: preparation.authorizationId,
+    } })
+    context.signal.throwIfAborted()
+    return result
 }

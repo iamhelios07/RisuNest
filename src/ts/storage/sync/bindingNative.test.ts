@@ -1,7 +1,7 @@
 import { beforeEach, expect, it, vi } from 'vitest'
 const invoke = vi.hoisted(() => vi.fn())
 vi.mock('@tauri-apps/api/core', () => ({ invoke }))
-import { createNativeSyncBindingBridge, replaceNativeSyncBinding } from './bindingNative'
+import { createNativeSyncBindingBridge, replaceNativeSyncBinding, replaceNativeSyncBindingAsNewDevice } from './bindingNative'
 const state = { target: { kind: 'none' } as const, targetAuthority: '3', selectionEpoch: 'epoch', libraryId: null, progress: [] }
 beforeEach(() => invoke.mockReset())
 it('switches only using the native inspection token and exact previous authority', async () => {
@@ -23,4 +23,17 @@ it('an aborted old transport cannot invoke replacement', async () => {
     const controller = new AbortController(); controller.abort()
     await expect(replaceNativeSyncBinding({ targetId: 'target', libraryId: 'library', stagingId: 'stage', receiveId: 'receive' }, { state, signal: controller.signal })).rejects.toThrow()
     expect(invoke).not.toHaveBeenCalled()
+})
+it('new device completion uses original authority and only a native authorization token', async () => {
+    const result = { revision: 42, writerId: 'reserved-writer', bindingAuthority: '4' }
+    invoke.mockResolvedValue(result)
+    expect(await replaceNativeSyncBindingAsNewDevice(
+        { targetId: 'target', libraryId: 'library', stagingId: 'stage', receiveId: 'receive' },
+        { authorizationId: 'native-authorization', writerId: 'reserved-writer' },
+        { state, signal: new AbortController().signal },
+    )).toEqual(result)
+    expect(invoke).toHaveBeenCalledWith('pds_lww_replace_target_as_new_device', { request: {
+        bindingAuthority: '3', requestId: 'receive', stagingId: 'stage', authorizationId: 'native-authorization',
+    } })
+    expect(invoke.mock.calls[0][1].request).not.toHaveProperty('writerId')
 })
