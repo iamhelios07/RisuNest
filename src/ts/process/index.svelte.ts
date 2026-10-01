@@ -1,6 +1,6 @@
 import { boundedGenerationFallbackReason } from './boundedGenerationAdmission'
 import { get, writable } from "svelte/store";
-import { type character, type groupChat, type MessageGenerationInfo, type Chat, type MessagePresetInfo, changeToPreset, setCurrentChat, type Message } from "../storage/database.svelte";
+import { type character, type groupChat, type MessageGenerationInfo, type Chat, type MessagePresetInfo, activatePresetOverride, setCurrentChat, type Message } from "../storage/database.svelte";
 import { DBState } from '../stores.svelte';
 import { CharEmotion, selectedCharID } from "../stores.svelte";
 import { ChatTokenizer, tokenize, tokenizeNum } from "../tokenizer";
@@ -556,7 +556,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
     if (chatProcessIndex === -1) {
         await activatePresetChainForRequest(
             DBState.db,
-            changeToPreset,
+            activatePresetOverride,
             Math.random,
             (name) => alertToast(`Cannot find preset: ${name}`),
         )
