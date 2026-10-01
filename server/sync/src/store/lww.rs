@@ -154,6 +154,19 @@ impl Store {
         }
         let validation = (|| -> Result<Vec<UnitChange>> {
             preparation?;
+            let claimed_writer: Option<String> = tx
+                .query_row(
+                    "SELECT writer FROM device_writer_claims WHERE device=?1",
+                    [&device.id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if claimed_writer
+                .as_ref()
+                .is_some_and(|writer| writer != &request.writer_id)
+            {
+                return Err(Error::new("writer-collision", 409));
+            }
             let writer: Option<String> = tx
                 .query_row(
                     "SELECT device FROM writers WHERE writer=?1",

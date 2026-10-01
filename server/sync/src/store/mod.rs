@@ -4,6 +4,7 @@ mod lww;
 #[cfg(test)]
 mod lww_tests;
 pub(crate) mod management;
+mod registration_claims;
 pub use backup::BackupManifest;
 pub use management::{ManagedDevice, ManagementConnection};
 mod descriptors;
