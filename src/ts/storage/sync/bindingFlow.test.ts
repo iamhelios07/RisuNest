@@ -35,7 +35,7 @@ describe('transport-neutral first binding', () => {
     it('acknowledges, validates, fences and activates database before refreshing and restarting plugins', async () => {
         const s = setup()
         expect(await s.flow.bind(target, s.transport)).toMatchObject({ kind: 'bound', action: 'replaced' })
-        expect(s.events).toEqual(['inspect', 'confirm', 'stage', 'pause-flush', 'gate', 'jobs-fence', 'plugin-fence', 'switch', 'activate-database', 'invalidate', 'refresh', 'restart'])
+        expect(s.events).toEqual(['inspect', 'confirm', 'stage', 'jobs-fence', 'plugin-fence', 'pause-flush', 'gate', 'switch', 'activate-database', 'invalidate', 'refresh', 'restart'])
     })
     it('cancellation leaves original authority, plugin execution and contents intact', async () => {
         const s = setup({ confirm: false })
@@ -58,7 +58,7 @@ describe('transport-neutral first binding', () => {
     })
     it('empty targets initialize without resetting plugin values', async () => {
         const s = setup({ empty: true }); await s.flow.bind(target, s.transport)
-        expect(s.events).toEqual(['inspect', 'pause-flush', 'gate', 'jobs-fence', 'switch', 'publish'])
+        expect(s.events).toEqual(['inspect', 'jobs-fence', 'pause-flush', 'gate', 'switch', 'publish'])
     })
     it('default shared state needs no transfer even with plugin-local-only data', async () => {
         const s = setup({ empty: true }); s.deps.hasNonDefaultSharedData = async () => false
@@ -67,7 +67,7 @@ describe('transport-neutral first binding', () => {
     })
     it('same-library recovery resumes without staging or resetting namespaces', async () => {
         const s = setup({ previouslyBoundLibrary: true }); await s.flow.bind(target, s.transport)
-        expect(s.events).toEqual(['inspect', 'pause-flush', 'gate', 'jobs-fence', 'switch', 'resume'])
+        expect(s.events).toEqual(['inspect', 'jobs-fence', 'pause-flush', 'gate', 'switch', 'resume'])
     })
     it('stale state stops before activation', async () => {
         const s = setup(); s.transport.pullAvailableState = async () => { s.changeAuthority(); return { targetId: 'target', libraryId: 'library', stagingId: 'stage', receiveId: 'receive' } }
@@ -136,4 +136,65 @@ it('cancellation and activation failure release the real pause and storage gate'
         expect(paused).toBe(false)
         await gate.runWrite(async () => {})
     }
+})
+
+it('acknowledges plugin-local writes that finish while plugin execution is draining', async () => {
+    const s = setup({ nonDefault: false })
+    let data = false
+    s.deps.hasNonDefaultData = async () => data
+    s.deps.plugins.fenceExecution = async () => { s.events.push('plugin-fence'); data = true }
+    s.deps.confirmReplacement = async () => { s.events.push('confirm'); return false }
+    expect(await s.flow.bind(target, s.transport)).toEqual({ kind: 'cancelled' })
+    expect(s.events).toContain('restart')
+    expect(s.events).not.toContain('switch')
+    expect(s.events).not.toContain('activate-database')
+    expect(s.events.indexOf('confirm')).toBeGreaterThan(s.events.indexOf('plugin-fence'))
+})
+
+it('drains a plugin mutation using the same gate before entering exclusive activation', async () => {
+    const s = setup({ nonDefault: false })
+    const gate = createStorageMutationGate({ locks: createInRealmStorageLockManager() })
+    s.deps.gate = gate
+    let release!: () => void
+    const drain = new Promise<void>(resolve => { release = resolve })
+    let mutation: Promise<void> | undefined
+    s.transport.pullAvailableState = async () => {
+        mutation = gate.runWrite(async () => { await drain; s.events.push('plugin-mutation') })
+        return { targetId: 'target', libraryId: 'library', stagingId: 'validated', receiveId: 'receive' }
+    }
+    s.deps.plugins.fenceExecution = async () => { release(); await mutation; s.events.push('plugin-fence') }
+    await s.flow.bind(target, s.transport)
+    expect(s.events.indexOf('plugin-mutation')).toBeLessThan(s.events.indexOf('activate-database'))
+})
+it('late cancellation restarts plugins through the same gate after draining without clearing data', async () => {
+    const s = setup({ nonDefault: false })
+    const gate = createStorageMutationGate({ locks: createInRealmStorageLockManager() })
+    s.deps.gate = gate
+    let changed = false
+    s.deps.hasNonDefaultData = async () => changed
+    s.deps.plugins.fenceExecution = async () => { changed = true }
+    s.deps.plugins.restart = () => gate.runWrite(async () => { s.events.push('gated-restart') })
+    s.deps.confirmReplacement = async () => false
+    expect(await s.flow.bind(target, s.transport)).toEqual({ kind: 'cancelled' })
+    expect(s.events).toContain('gated-restart')
+    expect(s.events).not.toContain('switch')
+})
+it('resume and initial publish callbacks may use the same renderer gate', async () => {
+    for (const empty of [false,true]) {
+        const s = setup({ empty, previouslyBoundLibrary: !empty })
+        const gate = createStorageMutationGate({ locks: createInRealmStorageLockManager() }); s.deps.gate = gate
+        s.transport.resumeBinding = () => gate.runWrite(async () => { s.events.push('gated-resume') })
+        s.transport.publishInitialSharedState = () => gate.runWrite(async () => { s.events.push('gated-publish') })
+        await s.flow.bind(target,s.transport)
+        expect(s.events).toContain(empty ? 'gated-publish' : 'gated-resume')
+    }
+})
+
+it('drains coordinator-queued plugin mutations before acquiring pause', async () => {
+    const s = setup({ nonDefault: false })
+    let paused = false
+    const queuedSetter = Promise.resolve().then(() => { if (paused) throw Error('setter blocked behind pause') })
+    s.deps.plugins.fenceExecution = async () => { await queuedSetter; expect(paused).toBe(false) }
+    s.deps.withPausedWrites = async operation => { paused = true; try { return await operation() } finally { paused = false } }
+    await s.flow.bind(target,s.transport)
 })

@@ -1,0 +1,26 @@
+import { beforeEach, expect, it, vi } from 'vitest'
+const invoke = vi.hoisted(() => vi.fn())
+vi.mock('@tauri-apps/api/core', () => ({ invoke }))
+import { createNativeSyncBindingBridge, replaceNativeSyncBinding } from './bindingNative'
+const state = { target: { kind: 'none' } as const, targetAuthority: '3', selectionEpoch: 'epoch', libraryId: null, progress: [] }
+beforeEach(() => invoke.mockReset())
+it('switches only using the native inspection token and exact previous authority', async () => {
+    invoke.mockResolvedValue(state)
+    await createNativeSyncBindingBridge().switchTarget(state, { kind: 'server', connectionId: 'connection' }, { inspectionId: 'native-receipt', targetId: 'target', libraryId: 'library', empty: false, previouslyBoundLibrary: false })
+    expect(invoke).toHaveBeenCalledWith('pds_lww_switch_target', { request: expect.objectContaining({ bindingAuthority: '3', expectedSelectionEpoch: 'epoch', inspectionId: 'native-receipt', target: { kind: 'server', connectionId: 'connection' } }) })
+    expect(invoke.mock.calls[0][1].request).not.toHaveProperty('libraryId')
+})
+it('rejects stale native authority and selection epochs', async () => {
+    invoke.mockResolvedValue({ ...state, selectionEpoch: 'changed' })
+    await expect(createNativeSyncBindingBridge().assertAuthority(state)).rejects.toThrow('Sync binding changed')
+})
+it('uses the staged receive identity for replacement retries', async () => {
+    invoke.mockResolvedValue(undefined)
+    await replaceNativeSyncBinding({ targetId: 'target', libraryId: 'library', stagingId: 'stage', receiveId: 'immutable-operation' }, { state, signal: new AbortController().signal })
+    expect(invoke).toHaveBeenCalledWith('pds_lww_replace_from_target', { request: { bindingAuthority: '3', requestId: 'immutable-operation', expectedSelectionEpoch: 'epoch', targetId: 'target', libraryId: 'library', stagingId: 'stage', receiveId: 'immutable-operation' } })
+})
+it('an aborted old transport cannot invoke replacement', async () => {
+    const controller = new AbortController(); controller.abort()
+    await expect(replaceNativeSyncBinding({ targetId: 'target', libraryId: 'library', stagingId: 'stage', receiveId: 'receive' }, { state, signal: controller.signal })).rejects.toThrow()
+    expect(invoke).not.toHaveBeenCalled()
+})

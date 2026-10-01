@@ -54,6 +54,7 @@ export interface BindingLocalContent {
     sharedVariables?: JsonRecord
     factorySharedVariables?: JsonRecord
     opaqueSharedUnitCount?: number
+    protectedValues?: JsonRecord
     managedAliasCount: number
     factoryManagedAliasCount: number
     ordinaryPluginValueCount: number
@@ -63,6 +64,9 @@ export interface BindingLocalContent {
 
 export function hasNonDefaultBindingData(content: BindingLocalContent): boolean {
     if (content.opaqueSharedUnitCount) return true
+    for (const [key,value] of Object.entries(content.protectedValues ?? {})) {
+        if (JSON.stringify(canonical(value)) !== JSON.stringify(canonical(content.factoryLibrary[key]))) return true
+    }
     if (JSON.stringify(canonical(content.sharedVariables ?? {})) !== JSON.stringify(canonical(content.factorySharedVariables ?? {}))) return true
     if (content.ordinaryPluginValueCount || content.hypaValueCount || content.pluginLocalValueCount) return true
     if (content.managedAliasCount !== content.factoryManagedAliasCount) return true

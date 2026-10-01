@@ -9,6 +9,7 @@ interface NativeBindingContent {
     hypaValueCount: number
     pluginLocalValueCount: number
     opaqueSharedUnitCount?: number
+    protectedValues?: Record<string, unknown>
     sharedVariables?: Record<string, unknown>
 }
 

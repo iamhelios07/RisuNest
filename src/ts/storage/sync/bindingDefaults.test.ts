@@ -61,3 +61,11 @@ it('does not normalize arbitrary content just because it matches a generated ID'
     ;(data.library.characters as any[])[0].chaId = 'other'
     expect(hasNonDefaultBindingData(data)).toBe(true)
 })
+
+it('counts modified protected preset settings and ignores identical protected defaults', () => {
+    const data = defaults(); data.factoryLibrary.seperateModels = { model: 'factory' }
+    data.protectedValues = { seperateModels: { model: 'factory' } }
+    expect(hasNonDefaultBindingData(data)).toBe(false)
+    data.protectedValues = { seperateModels: { model: 'custom' } }
+    expect(hasNonDefaultBindingData(data)).toBe(true)
+})
