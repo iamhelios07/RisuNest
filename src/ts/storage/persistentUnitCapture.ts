@@ -12,7 +12,7 @@ export function diffFields(
     const before = beforeValue as Record<string, unknown>, after = afterValue as Record<string, unknown>
     const mutations: PersistentUnitMutation[] = []
     for (const field of new Set([...Object.keys(before), ...Object.keys(after)])) {
-        if (excluded.has(field)) continue
+        if (excluded.has(field) || before[field] === after[field]) continue
         if (canonicalJson({ value: before[field] }) === canonicalJson({ value: after[field] })) continue
         const key = JSON.stringify([...components, field])
         mutations.push(!Object.hasOwn(after, field) || after[field] === undefined
@@ -54,7 +54,7 @@ export function diffMaterializedCharacter(before: CompleteCharacter, after: Comp
             continue
         }
         unitMutations.push(...diffFields(['conversation', after.chaId, chat.id], old, chat, new Set(['message', 'id'])))
-        if (Object.hasOwn(chat, 'message') && Object.hasOwn(old, 'message')
+        if (chat.message !== old.message && Object.hasOwn(chat, 'message') && Object.hasOwn(old, 'message')
             && canonicalJson(chat.message) !== canonicalJson(old.message)) {
             conversations.push({ type: 'replace-range', characterId: after.chaId, conversationId: chat.id,
                 ...messageReplaceRange(old.message, chat.message) })

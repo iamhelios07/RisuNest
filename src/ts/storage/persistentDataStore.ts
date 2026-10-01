@@ -497,9 +497,9 @@ export interface LwwStamp {
     writerId: string
 }
 
-export type LwwUnitValue = { type: 'inline'; bytes: string }
-    | { type: 'object'; descriptorHash: string; descriptor: unknown }
-    | { type: 'deleted' }
+export type LwwUnitValue = { kind: 'inline'; bytes: string }
+    | { kind: 'object'; descriptorHash: string; descriptor: unknown }
+    | { kind: 'deleted' }
 
 export interface LwwRemoteChange {
     key: string

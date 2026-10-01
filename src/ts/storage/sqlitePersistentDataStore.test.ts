@@ -16,6 +16,27 @@ describe('SqlitePersistentDataStore', () => {
         mocks.invoke.mockReset()
     })
 
+    it('forwards LWW commands with decimal controls and the exact shared request envelope', async () => {
+        const store = new SqlitePersistentDataStore()
+        const header = {bindingAuthority:'authority', requestId:'request'}
+        mocks.invoke.mockResolvedValue(undefined)
+        await store.lwwReadOutbox({...header, limit:'64'})
+        await store.lwwAckOutbox({...header, entries:[]})
+        await store.lwwClockState(header)
+        await store.lwwRetryUnpublished({...header, proofId:'native-proof', correctedTimeMs:'9007199254740993'})
+        await store.lwwStageReceive({...header, changes:[], progress:{kind:'external',cursor:'9007199254740993',writerId:'writer'}, admittedTimeUpperMs:'9007199254740993'})
+        await store.lwwApplyReceive({...header, generating:[{characterId:'a',conversationId:'same'},{characterId:'b',conversationId:'same'}]})
+        await store.lwwFinishReceive(header)
+        await store.lwwDrainDeferred({...header,generating:[]})
+        await store.lwwCommitReplacement({...header,stagingId:'staged'})
+        expect(mocks.invoke.mock.calls.map(([command,args]) => [command,Object.keys(args)])).toEqual([
+            'pds_lww_read_outbox','pds_lww_ack_outbox','pds_lww_clock_state','pds_lww_retry_unpublished','pds_lww_stage_receive',
+            'pds_lww_apply_receive','pds_lww_finish_receive','pds_lww_drain_deferred','pds_lww_commit_replacement',
+        ].map((command) => [command,['request']]))
+        expect(mocks.invoke.mock.calls[3][1]).toEqual({request:{...header,proofId:'native-proof',correctedTimeMs:'9007199254740993'}})
+        expect(mocks.invoke.mock.calls[5][1]).toEqual({request:{...header,generating:[{characterId:'a',conversationId:'same'},{characterId:'b',conversationId:'same'}]}})
+    })
+
     it('reads owner pages with one native call per page and a pinned lease', async () => {
         mocks.invoke.mockResolvedValueOnce({ lease: 'plugin-page-lease' })
         const store = new SqlitePersistentDataStore()
@@ -76,7 +97,7 @@ describe('SqlitePersistentDataStore', () => {
             characterDetails: [characterDetail],
             assetAliases: [alias],
         }
-        const owner = { kind: 'root-module-assets' as const, index: 0 }
+        const owner = { kind: 'root-module-assets' as const, moduleId: 'module-0' }
 
         await store.open()
         await store.readRoot()
@@ -478,7 +499,7 @@ describe('SqlitePersistentDataStore', () => {
         await lease.readPluginStorage('test-plugin', 'memory')
         await lease.readAssetAlias({ kind: 'asset', key: 'assets/pinned.bin' })
         await lease.listAssetAliases({ kind: 'asset', limit: 2 })
-        await lease.readAssetOwnerHead({ kind: 'root-module-assets', index: 0 })
+        await lease.readAssetOwnerHead({ kind: 'root-module-assets', moduleId: 'module-0' })
         await lease.release()
         await lease.release()
 
@@ -526,7 +547,7 @@ describe('SqlitePersistentDataStore', () => {
             ],
             [
                 'pds_read_asset_owner_head',
-                { owner: { kind: 'root-module-assets', index: 0 }, lease: 'lease-7' },
+                { owner: { kind: 'root-module-assets', moduleId: 'module-0' }, lease: 'lease-7' },
             ],
             ['pds_release_revision', { lease: 'lease-7' }],
         ])

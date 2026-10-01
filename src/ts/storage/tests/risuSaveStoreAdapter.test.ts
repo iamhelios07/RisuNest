@@ -16,7 +16,13 @@ import {
     withFlushedRisuSaveExport,
 } from '../risuSaveStoreAdapter'
 import { iteratePinnedCharacters } from '../persistentRecordIterator'
-import { risuSaveFixtureDatabase, risuSaveFixtures } from './risuSaveFixtures'
+import { risuSaveFixtureDatabase as upstreamFixtureDatabase, risuSaveFixtures } from './risuSaveFixtures'
+
+function nativeIdentityFixture<T extends typeof upstreamFixtureDatabase>(database: T): T {
+    database.botPresets.forEach((preset, index) => preset['id'] = 'fixture-preset-' + index)
+    return database
+}
+const risuSaveFixtureDatabase = nativeIdentityFixture(structuredClone(upstreamFixtureDatabase))
 
 vi.mock('../database.svelte', () => ({
     getDatabase: () => {
@@ -104,7 +110,7 @@ describe('RisuSave persistent store adapter', () => {
         await store.open()
 
         const imported = await store.replaceFromDatabase(
-            (await decodeRisuSave(fixture)) as typeof risuSaveFixtureDatabase,
+            nativeIdentityFixture((await decodeRisuSave(fixture)) as typeof risuSaveFixtureDatabase),
         )
         await localforage.dropInstance({ name: 'risuSaveCache' })
         const exported = await concatenate(streamRisuSaveFromStore(store, imported.revision))

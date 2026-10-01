@@ -33,7 +33,7 @@ export function assertPresetNames(presets: readonly Pick<botPreset, 'name'>[], e
 }
 
 export interface PresetWorkingSetMutationState {
-    root: PersistentRoot
+    root: Omit<PersistentRoot, 'botPresetsId' | 'selectedPersona'> & Pick<Database, 'botPresetsId' | 'selectedPersona'>
     presets: botPreset[]
 }
 

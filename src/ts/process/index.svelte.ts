@@ -1,3 +1,4 @@
+import { registerGeneratingConversation } from '../storage/generatingConversationRegistry'
 import { boundedGenerationFallbackReason } from './boundedGenerationAdmission'
 import { get, writable } from "svelte/store";
 import { type character, type groupChat, type MessageGenerationInfo, type Chat, type MessagePresetInfo, changeToPreset, setCurrentChat, type Message } from "../storage/database.svelte";
@@ -171,6 +172,8 @@ function hasMismatchedActiveConversationSession(): boolean {
 }
 
 interface GenerationCompletionLifecycle {
+    releaseGeneration?: () => void
+    generationTarget?: { characterId: string; conversationId: string }
     authorityEpoch: number
     isTargetCurrent(): boolean
     onProgress?(completed: number): void
@@ -312,6 +315,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         unbindWindowedController: null,
     }
     const lifecycle: GenerationCompletionLifecycle = {
+        generationTarget: characterId && conversationId ? { characterId, conversationId } : undefined,
         authorityEpoch,
         isTargetCurrent,
         responseCompleted: false,
@@ -321,6 +325,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         responseApplied: false,
         acknowledgementAttempted: false,
     }
+    let releaseGeneration: (() => void) | null = null
     let enteredGeneration = false
     let generationReturned = false
     let generationKeepAliveAcquired = false
@@ -346,6 +351,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
         if (!lifecycle.isTargetCurrent()) return false
         enteredGeneration = true
+        if (lifecycle.generationTarget) lifecycle.releaseGeneration = releaseGeneration = registerGeneratingConversation(lifecycle.generationTarget)
         generationKeepAliveAcquired = await beginAndroidGenerationKeepAlive()
         iosGeneration = await beginIOSGeneration(arg.signal)
         lifecycle.onProgress = iosGeneration.progress;
@@ -373,7 +379,8 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
         throw error
     } finally {
-        if (!lifecycle.reroll && lifecycle.responseApplied && !lifecycle.acknowledgementAttempted &&
+        releaseGeneration?.()
+        if (lifecycle.generationTarget && !lifecycle.acknowledgementAttempted &&
             lifecycle.isTargetCurrent()) {
             lifecycle.acknowledgementAttempted = true
             try {
@@ -2159,6 +2166,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
         if (lifecycle.reroll) return
         if (!lifecycle.isTargetCurrent()) throw new PersistentMutationFencedError()
         lifecycle.acknowledgementAttempted = true
+        lifecycle.releaseGeneration?.()
         await acknowledgeGenerationCompletion(lifecycle.authorityEpoch)
         lifecycle.onProgress?.(3)
     }
