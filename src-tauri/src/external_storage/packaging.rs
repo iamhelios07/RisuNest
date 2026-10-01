@@ -614,6 +614,7 @@ pub(crate) async fn verify_publication(
 
 pub(crate) fn wire_role(role: ObjectRole) -> Result<wire::ObjectRole> {
     match role {
+        ObjectRole::Segment | ObjectRole::Snapshot => Err(ProviderError::new(ErrorKind::Unsupported)),
         ObjectRole::Pack => Ok(wire::ObjectRole::Pack),
         ObjectRole::Catalog => Ok(wire::ObjectRole::Catalog),
         ObjectRole::SyncState => Ok(wire::ObjectRole::SyncState),
