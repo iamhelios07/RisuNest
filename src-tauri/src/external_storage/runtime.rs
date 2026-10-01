@@ -1963,20 +1963,7 @@ mod tests {
         assert!(!pending_matches_request(&unknown, &restore));
     }
 
-    fn receive_job_fixture() -> (tempfile::TempDir, PersistentStore, DurableJob) {
-        let directory = tempfile::tempdir().unwrap();
-        let mut store = PersistentStore::open(directory.path()).unwrap();
-        let epoch = store.external_selection().unwrap().epoch;
-        store.external_select(&epoch, &SyncTarget::External("x".into())).unwrap();
-        let mut job = automatic_job();
-        job.admission_identity = store.external_identity().unwrap();
-        store.external_prepare_receive(&persistent_store::external_storage_state::ReceiveIntent {
-            job_id: &job.id, connection_id: "x", repository_id: "synthetic-repository",
-            snapshot_id: &job.snapshot_id, commit_id: "synthetic-commit",
-            authenticated_head: "authenticated-head", identity: &job.admission_identity,
-        }).unwrap();
-        (directory, store, job)
-    }
+
 
     #[test]
     fn automatic_sync_does_not_absorb_a_manual_sync_request() {
