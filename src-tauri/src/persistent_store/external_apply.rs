@@ -368,7 +368,6 @@ impl PersistentStore {
         super::external_storage_state::begin_receive_activation(&tx, job)?;
         let generation = active_generation(&tx)?;
         let revision = actual_revision + 1;
-        super::server_sync_outbox::begin_mutation(&tx, &generation, revision)?;
         super::content_change_index::begin_mutation(&tx, &generation, revision, "external")?;
 
         let mut touched = std::collections::BTreeSet::new();
@@ -408,7 +407,6 @@ impl PersistentStore {
             return invalid("External snapshot plugin records contain duplicate positions");
         }
         super::content_change_index::finish_mutation(&tx)?;
-        super::server_sync_outbox::finish_mutation(&tx)?;
         super::commit::set_active(&tx, revision, &generation)?;
         // Read after the revision moves, so the base names what the library
         // now holds. The record map already describes the base this snapshot

@@ -665,18 +665,6 @@ pub(crate) fn restore_portable(
                         "Portable restore cancelled before activation",
                     ));
                 }
-                let status = store.server_status().map_err(|_| {
-                    NativeJobError::new(
-                        "server-status-unavailable",
-                        "Cannot verify server operation state",
-                    )
-                })?;
-                if status.operation_pending {
-                    return Err(NativeJobError::new(
-                        "resolve-pending-operation-first",
-                        "Resolve the pending server operation before restoring",
-                    ));
-                }
             }
             probe.result()?;
             let warning_codes = vec![];

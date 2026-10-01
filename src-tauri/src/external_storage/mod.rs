@@ -54,7 +54,7 @@ pub(crate) mod snapshot;
 pub(crate) mod snapshot_export;
 pub(crate) mod snapshot_export_commands;
 pub(crate) mod snapshot_restore;
-pub(crate) mod sync_engine;
+pub(crate) mod head_observation;
 #[cfg(test)]
 mod tests;
 pub(crate) mod transfer;

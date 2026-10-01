@@ -30,7 +30,6 @@ import type { NativePortableDeviceSection } from './deviceBackup/selection'
 export type NativeFileJobSource =
     | { type: 'desktopPath'; path: string }
     | { type: 'androidSpool'; token: string }
-    | { type: 'conflictReference'; token: string }
 
 export type NativeFileJobState =
     | 'queued'
@@ -249,7 +248,6 @@ export type NativeFileOperationFormat =
     | 'risu-save'
     | 'local-backup'
     | 'library-backup'
-    | 'conflict-reference'
     | 'content'
     | 'raw-recovery'
 
@@ -1284,8 +1282,7 @@ async function runNativeReplacementRestore(
     let cancellationRequested = false
     let uiBlocking = false
     let portableSelectionMade =
-        kind !== 'restore-portable-backup' ||
-        ('type' in source && source.type === 'conflictReference')
+        kind !== 'restore-portable-backup'
     let terminal: NativeFileJobStatus | undefined
     let mutationConflict: NativeFileJobError | undefined
     let incompleteConfirmed = false
@@ -2151,33 +2148,6 @@ function runNativePortableBackupExport(
     )
 }
 
-
-export function runNativeArchiveReferenceExport(
-    source: NativeFileJobSource,
-    destination: NativeBackupDestination,
-    options: NativeFileJobOptions = {},
-    dependencies: NativeBackupExportDependencies = productionBackupExportDependencies,
-): Promise<NativeFileJobResult> {
-    return runNativeManagedExport(
-        {
-            operation: 'RisuNest backup',
-            safLengthMismatchLabel: 'RisuNest backup',
-            handoffCleanupCommand: 'native_portable_handoff_cleanup',
-            destination,
-            relaySafCopyProgress: true,
-            prepareRequest: () => ({
-                kind: 'export-portable-backup',
-                source,
-                selection: { library: true, deviceSections: [] },
-                ...(destination.type === 'desktopPath'
-                    ? { destination: destination.path }
-                    : {}),
-            }),
-        },
-        options,
-        dependencies,
-    )
-}
 
 export async function runNativeArchiveExport(
     runtime: NativeBlockRestoreRuntime & {

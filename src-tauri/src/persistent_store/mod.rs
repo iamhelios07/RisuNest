@@ -11,7 +11,6 @@ pub(crate) mod export;
 pub(crate) mod external_apply;
 pub(crate) mod external_capture;
 pub(crate) mod external_content_gc;
-pub(crate) mod external_conflicts;
 pub(crate) mod external_runtime;
 pub(crate) mod external_storage_state;
 #[cfg(feature = "native-kei-upload-pilot")]
@@ -28,13 +27,8 @@ mod record_projection;
 mod schema;
 #[cfg(test)]
 mod schema_contract_tests;
-pub(crate) mod server_sync_apply;
-#[path = "../server_sync/engine.rs"]
-pub(crate) mod server_sync_engine;
 pub(crate) mod server_sync_journal;
-pub(crate) mod server_sync_outbox;
 pub(crate) mod server_sync_projection;
-pub(crate) mod server_sync_sections;
 mod repair;
 mod snapshot;
 mod snapshot_archive;
@@ -2932,7 +2926,7 @@ impl PersistentStore {
         &self,
         repository_guard_held: bool,
         read_only: bool,
-        mut backup_references: Option<&mut std::collections::BTreeSet<String>>,
+        _backup_references: Option<&mut std::collections::BTreeSet<String>>,
     ) -> StoreResult<Vec<(&'static str, crate::asset_repository::migration_gc::AssetRootSet)>> {
         use crate::asset_repository::job_pins::{
             collect_durable_cas_job_roots, collect_durable_cas_job_roots_already_guarded,
@@ -2965,41 +2959,6 @@ impl PersistentStore {
                 &self.repository_root,
             )?,
         ));
-        roots.push((
-            "external-conflict",
-            external_conflicts::registered_conflict_roots(
-                self.device_store()?.connection(),
-                &self.repository_root,
-            )?
-            .assets,
-        ));
-        if self.server_stored_config().map_err(|e| StoreError::Store { message: e.code })?.is_some() {
-            let cache = self.server_cache().map_err(|e| StoreError::Store { message: e.code })?;
-            let mut set = crate::asset_repository::migration_gc::AssetRootSet::default();
-            let native = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
-            for hash in self.server_cache_references(&cache).map_err(|e| StoreError::Store { message: e.code })? {
-                if native.stat_object(&hash)?.is_some() { set.object_hashes.insert(hash); }
-            }
-            roots.push(("server-sync", set));
-        }
-        let mut server_conflicts =
-            crate::asset_repository::migration_gc::AssetRootSet::default();
-        crate::server_sync::backups::references::visit_roots(
-            &self.repository_root,
-            |object| {
-                if let Some(references) = backup_references.as_deref_mut() {
-                    references.insert(object.hash.clone());
-                }
-                if object.metadata || object.local_required {
-                    server_conflicts.object_hashes.insert(object.hash);
-                }
-                Ok(())
-            },
-        )
-        .map_err(|error| StoreError::Store {
-            message: format!("server conflict roots are unavailable: {}", error.code),
-        })?;
-        roots.push(("server-conflict", server_conflicts));
         roots.extend(
             snapshot_archive::Archive::open(&self.snapshots_dir)?
                 .roots()?

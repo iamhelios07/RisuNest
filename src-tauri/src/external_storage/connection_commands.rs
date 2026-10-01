@@ -2121,7 +2121,7 @@ pub(crate) async fn external_storage_probe_head(
     let operation = async {
         let connected = open_connected_with_cancel(&app, &connection_id, &cancel).await?;
         let base = runtime::native_store(&app)?.external_base(&connection_id).map_err(runtime::local_error)?;
-        let known = base.as_ref().map(|base| super::sync_engine::head_observation(&base.head_observation)).transpose()?;
+        let known = base.as_ref().map(|base| super::head_observation::head_observation(&base.head_observation)).transpose()?;
         super::control::head_changed(connected.provider.as_ref(), &connected.handle,
             &connected.stored.descriptor, &connected.root_key, known.as_ref(), &cancel).await
     };

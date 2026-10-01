@@ -256,9 +256,7 @@ impl PersistentStore {
         if self.device_store()?.asset_residency_policy()? != AssetPolicy::Remote {
             return Err(SyncError::new("remote-asset-policy-required", 409));
         }
-        if self.server_status()?.operation_pending {
-            return Err(SyncError::new("resolve-pending-operation-first", 409));
-        }
+
         let mut config = self
             .server_stored_config()?
             .ok_or_else(|| SyncError::new("server-not-bound", 409))?;

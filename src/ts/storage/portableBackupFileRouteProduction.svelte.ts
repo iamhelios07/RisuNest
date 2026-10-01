@@ -19,7 +19,6 @@ import { runSharedNativeFileOperation } from './nativeFileJobManager'
 import {
     NativeFileJobError,
     runNativeArchiveExport,
-    runNativeArchiveReferenceExport,
     runNativeArchiveRestore,
     runNativeBlockRisuSaveRestore,
     runNativeLegacyLocalBackupRestore,
@@ -48,7 +47,6 @@ export type BackupSourceFactory = (
     context: BackupPickerContext,
 ) => Promise<NativeFileJobSource | null>
 export type BackupRestoreResult = NativeFileJobResult | { warningCodes: string[] }
-export type BackupReferenceSourceFactory = () => Promise<NativeFileJobSource>
 export interface BackupRestoreOptions extends NativeFileRestoreJobOptions {
     onSource?(source: SourceInfo): void
     /**
@@ -124,58 +122,6 @@ export async function exportPortableBackupFromSystemPicker(
                         ...options,
                         signal: joined.signal,
                         confirmSourcePreservation: () => alertConfirm(language.risuNest.backup.sourcePreservationConfirm),
-                        onStatus(status) {
-                            onStatus(status)
-                            options.onStatus?.(status)
-                        },
-                    },
-                )
-            } finally {
-                joined.dispose()
-            }
-        },
-        { presentation: 'dialog', format: 'library-backup' },
-    ).finally(resumeServerSyncAfterBackup)
-}
-
-export async function exportPortableBackupFromReferenceSource(
-    source: BackupReferenceSourceFactory,
-    options: NativeFileJobOptions = {},
-): Promise<NativeFileJobResult | null> {
-    if (!isTauri)
-        throw new NativeFileJobError(
-            'native-required',
-            'RisuNest backup requires the native app',
-        )
-    getServerSyncController().assertFileOperationAvailable()
-    return runSharedNativeFileOperation(
-        'export',
-        'portable-reference-export',
-        async ({ signal, onStatus }) => {
-            const joined = combineSignals(signal, options.signal)
-            try {
-                const suggestedName = portableBackupSuggestedName()
-                const path =
-                    isTauriAndroid || isTauriIOS
-                        ? null
-                        : await save({
-                              defaultPath: suggestedName,
-                              filters: [{ name: 'RisuNest Backup', extensions: ['risunest'] }],
-                          })
-                if (!isTauriAndroid && !isTauriIOS && !path) return null
-                checkSignal(joined.signal)
-                const input = await source()
-                checkSignal(joined.signal)
-                return runNativeArchiveReferenceExport(
-                    input,
-                    isTauriIOS
-                        ? { type: 'iosFiles', suggestedName }
-                        : isTauriAndroid
-                          ? { type: 'androidSaf', suggestedName }
-                          : { type: 'desktopPath', path: path! },
-                    {
-                        ...options,
-                        signal: joined.signal,
                         onStatus(status) {
                             onStatus(status)
                             options.onStatus?.(status)
@@ -291,7 +237,6 @@ export async function restoreBackupFromNativeSource(
                     | 'portable'
                     | 'block-risu-save'
                     | 'local-backup'
-                    | 'conflict-reference'
                 >('native_backup_source_format', { source: input })
                 if (
                     format !== 'portable' &&
@@ -342,8 +287,7 @@ export async function restoreBackupFromNativeSource(
                 try {
                     const result = await (async () => {
                         if (
-                            format === 'portable' ||
-                            format === 'conflict-reference'
+                            format === 'portable'
                         )
                             return runNativeArchiveRestore(
                                 runtime,

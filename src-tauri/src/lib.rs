@@ -615,7 +615,6 @@ fn builder_with_main_window(
         .manage(persistent_store::PersistentStoreState::default())
         .manage(persistent_store::commands::data_health::DataHealthState::default())
         .manage(server_sync::commands::ServerSyncCommandState::default())
-        .manage(server_sync::events::ServerSyncEventsState::default())
         .manage(external_storage::connection_commands::ConnectionCommandState::default())
         .manage(external_storage::job_store::JobCommandState::default())
         .plugin(tauri_plugin_http::init())
@@ -657,8 +656,6 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         external_storage::runtime::external_storage_capture_exit_target,
         external_storage::runtime::external_storage_set_execution_session,
         external_storage::snapshot_export_commands::external_storage_cancel_export,
-        external_storage::snapshot_export_commands::external_storage_export_retained_publication,
-        external_storage::runtime::external_storage_remove_retained_publication,
         external_storage::runtime::external_storage_set_sync_target,
         external_storage::runtime::external_storage_set_sync_paused,
         external_storage::runtime::external_storage_set_automatic_backup_paused,
@@ -668,12 +665,6 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         external_storage::runtime::external_storage_get_quota,
         external_storage::history::external_storage_list_history,
         external_storage::history_deletion::external_storage_prepare_history_delete,
-        external_storage::sync_engine::external_storage_list_conflicts,
-        external_storage::sync_engine::external_storage_delete_conflict,
-        external_storage::sync_engine::external_storage_recheck_conflict,
-        native_file_jobs::reference_source::external_storage_open_conflict_source,
-        native_file_jobs::reference_source::external_storage_release_conflict_source,
-        external_storage::sync_engine::external_storage_apply_received,
         external_storage::snapshot_export_commands::external_storage_export_snapshot,
         #[cfg(target_os = "ios")]
         ios_lifecycle::ios_prepare_restart,
@@ -693,29 +684,11 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         app_update::commands::app_update_stage_deb,
         native_media::streaming::native_media_base_url,
         native_media::streaming::native_media_ensure,
-        server_sync::commands::server_sync_status,
         server_sync::commands::server_sync_asset_status,
         server_sync::commands::server_sync_asset_policy,
         server_sync::commands::server_sync_asset_evict,
-        server_sync::commands::server_sync_verified_bytes,
-        server_sync::commands::server_sync_progress_counts,
-        server_sync::commands::server_sync_retryable_failure,
-        server_sync::commands::server_sync_backups,
-        server_sync::commands::server_sync_backup_inventory,
-        server_sync::commands::server_sync_backup_delete,
-        server_sync::commands::server_sync_backup_cleanup,
-        server_sync::commands::server_sync_backup_release,
         server_sync::commands::server_sync_cache_usage,
         server_sync::commands::server_sync_cache_cleanup,
-        server_sync::commands::server_sync_backup_source,
-        server_sync::commands::server_sync_bind,
-        server_sync::commands::server_sync_reregister,
-        server_sync::commands::server_sync_reconcile,
-        server_sync::commands::server_sync_unbind,
-        server_sync::commands::server_sync_prepare,
-        server_sync::commands::server_sync_activate,
-        server_sync::commands::server_sync_publish,
-        server_sync::commands::server_sync_cancel,
         greet,
         boot_attempt_begin,
         boot_attempt_complete,
@@ -908,8 +881,6 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         persistent_store::commands::pds_working_set_change_window,
         persistent_store::commands::pds_working_set_change_page,
         persistent_store::commands::pds_commit_working_set_change_cursor,
-        server_sync::events::server_sync_events_start,
-        server_sync::events::server_sync_events_stop,
     ]);
     move |invoke: tauri::ipc::Invoke<tauri::Wry>| {
         if app_cleanup::pending(invoke.message.webview_ref().app_handle())

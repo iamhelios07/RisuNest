@@ -663,8 +663,6 @@ fn validate_live_columns(source: &Connection) -> StoreResult<()> {
                 name.as_str(),
                 "asset_alias_replacement_candidates"
                     | "snapshot_leases"
-                    | "server_sync_context"
-                    | "server_sync_prepared"
                     | "content_change_context"
                     | "content_changes"
                     | "content_change_consumers"

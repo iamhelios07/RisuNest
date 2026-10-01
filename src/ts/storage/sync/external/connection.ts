@@ -2,7 +2,6 @@ import type {
     ExternalConnectionPurpose,
     ExternalJobSummary,
     ExternalHistoryItem,
-    ExternalConflictSummary,
     ExternalOpenMode,
     ExternalCapturePolicy,
     ExternalProviderId,
@@ -121,18 +120,6 @@ export function restorableExternalHistoryItems(
     return items.filter(item => item.complete && item.verified)
 }
 
-export type ExternalConflictAction = 'retry-sync' | 'keep-local' | 'use-remote'
-
-export function externalConflictActions(
-    conflict: ExternalConflictSummary,
-): ExternalConflictAction[] {
-    if (conflict.resolved) return []
-    if (!conflict.remotePointConfirmed) return ['retry-sync']
-    const actions: ExternalConflictAction[] = []
-    if (conflict.localAvailable) actions.push('keep-local')
-    if (conflict.remoteAvailable) actions.push('use-remote')
-    return actions
-}
 
 /** Native failure kind of a rejected command (`kind`) or of a job error DTO (`code`). */
 export function externalErrorKind(value: unknown): string | undefined {
@@ -144,5 +131,5 @@ export function externalErrorKind(value: unknown): string | undefined {
 
 export function externalJobIsPaused(job: ExternalJobSummary): boolean {
     return job.state === 'waiting'
-        && (job.phase === 'paused' || job.phase === 'conflict-preservation-paused')
+        && job.phase === 'paused'
 }

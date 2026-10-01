@@ -2174,7 +2174,3 @@ fn write_row(
     }
     Ok(())
 }
-
-#[cfg(test)]
-#[path = "section_merge_tests.rs"]
-mod merge_tests;

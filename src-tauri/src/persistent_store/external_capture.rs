@@ -294,22 +294,6 @@ impl PersistentStore {
     /// become unreferenced.
     fn cleanup_capture_cache(&mut self, keep: &str) -> StoreResult<bool> {
         self.cleanup_terminal_capture_references()?;
-        let protected_catalogs = match self.device_store() {
-            Ok(device) => match super::external_conflicts::registered_conflict_roots(
-                device.connection(),
-                &self.repository_root,
-            ) {
-                Ok(roots) => roots.catalogs,
-                Err(error) => {
-                    crate::nlog!("warn", "external capture cleanup deferred: {error}");
-                    return Ok(false);
-                }
-            },
-            Err(error) => {
-                crate::nlog!("warn", "external capture cleanup deferred: {error}");
-                return Ok(false);
-            }
-        };
         let mut removed = false;
         let mut paths = Vec::new();
         {
@@ -330,13 +314,6 @@ impl PersistentStore {
             for (id, encoded, path) in candidates {
                 if paths.len() == GC_DELETE_LIMIT {
                     break;
-                }
-                if path
-                    .as_deref()
-                    .and_then(|value| Path::new(value).canonicalize().ok())
-                    .is_some_and(|value| protected_catalogs.contains(&value))
-                {
-                    continue;
                 }
                 let needed = match serde_json::from_str::<sync_selection::CaptureIdentity>(&encoded) {
                     Ok(identity) => tx.query_row(
@@ -874,113 +851,13 @@ impl PersistentStore {
         Ok(!remaining)
     }
 
-    pub(crate) fn cleanup_deleted_conflict_capture(
-        &mut self,
-        reference: &DurableCaptureReference,
-    ) -> StoreResult<bool> {
-        let remaining = super::external_conflicts::registered_conflict_roots(
-            self.device_store()?.connection(),
-            &self.repository_root,
-        )?;
-        let roots = crate::external_storage::capture::registered_capture_roots(
-            [reference],
-            &self.repository_root,
-        )?;
-        let path = roots
-            .catalogs
-            .into_iter()
-            .next()
-            .ok_or_else(|| invalid("Conflict capture catalog is unavailable"))?;
-        if remaining.catalogs.contains(&path) {
-            return Ok(false);
-        }
 
-        let tx = self.connection.transaction()?;
-        let mut rows = {
-            let mut query = tx.prepare(
-                "SELECT c.id,c.identity,f.catalog_path,f.file_hash FROM external_storage_capture_files f JOIN external_storage_captures c ON c.id=f.capture_id",
-            )?;
-            let rows = query
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                    ))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            rows
-        };
-        rows.retain(|(_, _, candidate, _)| {
-            Path::new(candidate)
-                .canonicalize()
-                .is_ok_and(|candidate| candidate == path)
-        });
-        for (capture_id, encoded_identity, _, file_hash) in &rows {
-            if capture_id != &reference.capture_id
-                || file_hash != &reference.catalog_hash
-                || serde_json::from_str::<sync_selection::CaptureIdentity>(encoded_identity)?
-                    != reference.identity
-            {
-                return Err(invalid("Conflict capture owner differs"));
-            }
-            let active: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM external_storage_capture_refs WHERE capture_id=?1)",
-                [capture_id],
-                |row| row.get(0),
-            )?;
-            let needed: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM content_change_consumers WHERE generation=?1 AND revision=?2 AND rebuild_required=0)",
-                params![reference.identity.generation, reference.identity.revision],
-                |row| row.get(0),
-            )?;
-            if active || needed {
-                return Ok(false);
-            }
-        }
-        for (capture_id, _, _, _) in rows {
-            tx.execute(
-                "DELETE FROM external_storage_capture_files WHERE capture_id=?1",
-                [&capture_id],
-            )?;
-            tx.execute(
-                "DELETE FROM external_storage_captures WHERE id=?1",
-                [&capture_id],
-            )?;
-        }
-        tx.commit()?;
-        self.remove_capture_file(&path);
-        Ok(!path.exists())
-    }
 }
 
 #[cfg(test)]
-mod conflict_cleanup_tests {
+mod hydration_tests {
     use super::*;
-    use crate::persistent_store::external_conflicts::{
-        delete_external_conflict, preserve_local_conflict, ExternalConflictRecord,
-        PreservedHeadObservation, PreservedRemoteState,
-    };
-    use risunest_external_storage_format::snapshot::{
-        envelope_length, ObjectRole, PublicObjectHeader, StoredObject, WireLocator,
-    };
 
-    fn stored(repository: &str, id: &str, role: ObjectRole) -> StoredObject {
-        let header = PublicObjectHeader::new(repository.into(), id.into(), role, 1).unwrap();
-        StoredObject {
-            ciphertext_length: envelope_length(&header).unwrap(),
-            header,
-            locator: WireLocator {
-                connection_identity: "synthetic/root".into(),
-                collection: None,
-                object: id.into(),
-            },
-            ciphertext_sha256: [2; 32],
-            plaintext_length: 1,
-            plaintext_sha256: [1; 32],
-        }
-    }
 
     #[test]
     fn grouped_manifest_hydration_preserves_scope_unavailability_and_cancellation() {
@@ -1018,113 +895,5 @@ mod conflict_cleanup_tests {
             if message == "External capture cancelled"));
     }
 
-    #[test]
-    fn restored_old_capture_index_cannot_delete_a_device_owned_conflict_catalog() {
-        use crate::persistent_store::content_capture::ContentCaptureSink;
 
-        let directory = tempfile::tempdir().unwrap();
-        let mut store = PersistentStore::open(directory.path()).unwrap();
-        let external = store.repository_root.join("external-storage");
-        let capture_directory = external.join("captures/restored-old-index");
-        let object_directory = external.join("objects");
-        let identity = sync_selection::CaptureIdentity {
-            store_id: "store".into(),
-            library_epoch: "library".into(),
-            generation: "generation".into(),
-            selection_epoch: "selection".into(),
-            revision: 7,
-        };
-        let mut catalog =
-            CaptureCatalog::create(&capture_directory, &external, None).unwrap();
-        catalog.begin(&identity, None).unwrap();
-        catalog.record("root", b"device-owned conflict source").unwrap();
-        catalog.finish().unwrap();
-        let reference = catalog
-            .durable_reference("capture-conflict", &store.repository_root)
-            .unwrap();
-        let catalog_path = catalog.manifest().unwrap().1.to_path_buf();
-        drop(catalog);
-
-        let device = store.device_store().unwrap().connection();
-        preserve_local_conflict(
-            device,
-            &ExternalConflictRecord {
-                id: "conflict".into(),
-                created_at_ms: 1,
-                connection_id: "connection".into(),
-                repository_id: "repository".into(),
-                local: reference.clone(),
-                remote: PreservedRemoteState {
-                    snapshot: stored("repository", "snapshot-remote", ObjectRole::SyncState),
-                    logical_revision: 8,
-                    commit_id: "remote-commit".into(),
-                    head: PreservedHeadObservation {
-                        commit_id: "remote-commit".into(),
-                        authenticated_body_hash: "02".repeat(32),
-                    },
-                },
-                remote_point: None,
-                resolved: false,
-            },
-        )
-        .unwrap();
-
-        store
-            .connection
-            .execute(
-                "INSERT INTO external_storage_captures VALUES(?1,?2,?3,?4,?5,?6)",
-                params![
-                    reference.capture_id,
-                    serde_json::to_string(&identity).unwrap(),
-                    "restored-scope",
-                    CODEC,
-                    "restored-device-capture",
-                    reference.catalog_hash,
-                ],
-            )
-            .unwrap();
-        store
-            .connection
-            .execute(
-                "INSERT INTO external_storage_capture_files VALUES(?1,?2,?3)",
-                params![
-                    reference.capture_id,
-                    catalog_path.to_string_lossy().into_owned(),
-                    reference.catalog_hash,
-                ],
-            )
-            .unwrap();
-
-        store.cleanup_capture_cache("new-capture").unwrap();
-        assert!(catalog_path.exists());
-        let retained: bool = store
-            .connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM external_storage_captures WHERE id=?1)",
-                [&reference.capture_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(retained);
-
-        store
-            .connection
-            .execute(
-                "DELETE FROM external_storage_capture_files WHERE capture_id=?1",
-                [&reference.capture_id],
-            )
-            .unwrap();
-        store
-            .connection
-            .execute(
-                "DELETE FROM external_storage_captures WHERE id=?1",
-                [&reference.capture_id],
-            )
-            .unwrap();
-        delete_external_conflict(store.device_store().unwrap().connection(), "conflict").unwrap();
-        assert!(store
-            .cleanup_deleted_conflict_capture(&reference)
-            .unwrap());
-        assert!(!catalog_path.exists());
-    }
 }

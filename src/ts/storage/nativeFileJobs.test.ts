@@ -76,7 +76,6 @@ import {
     runNativeBlockRisuSaveRestore,
     runNativeArchiveExport,
     runNativeArchiveRestore,
-    runNativeArchiveReferenceExport,
     runNativeBlockRisuSaveExport,
     runNativeRawRecoveryExport,
     runNativeCompatibleLocalBackupExport,
@@ -330,53 +329,6 @@ describe('native file jobs', () => {
             'native_device_backup_bootstrap',
         )
         expect(localStorage.getItem('risuNestPortableExportIntent')).toBeNull()
-    })
-
-    it('starts a library-only portable export from an opaque conflict source', async () => {
-        const calls: Array<[string, Record<string, unknown> | undefined]> = []
-        const result = {
-            revision: 0,
-            sourceBytes: 128,
-            sourceSha256: 'a'.repeat(64),
-            characterCount: 1,
-            presetCount: 0,
-            warningCodes: [],
-        }
-
-        await expect(runNativeArchiveReferenceExport(
-            { type: 'conflictReference', token: 'external:source-token' },
-            { type: 'desktopPath', path: 'C:\\chosen\\conflict.risunest' },
-            {},
-            {
-                isTauri: () => true,
-                invoke: async (command, args) => {
-                    calls.push([command, args])
-                    if (command === 'native_file_job_start') return { jobId: 'export-1' }
-                    if (command === 'native_file_job_status') return {
-                        ...status('succeeded', result),
-                        jobId: 'export-1',
-                        kind: 'export-portable-backup',
-                    }
-                    if (command === 'native_file_job_forget') return true
-                    throw new Error(`Unexpected command: ${command}`)
-                },
-                wait: async () => undefined,
-                copyToAndroidSaf: async () => ({ bytes: 0, warningCodes: [] }),
-            },
-        )).resolves.toEqual(result)
-
-        expect(calls[0]).toEqual([
-            'native_file_job_start',
-            {
-                request: {
-                    kind: 'export-portable-backup',
-                    source: { type: 'conflictReference', token: 'external:source-token' },
-                    selection: { library: true, deviceSections: [] },
-                    destination: 'C:\\chosen\\conflict.risunest',
-                },
-            },
-        ])
-        expect(JSON.stringify(calls[0])).not.toContain('expectedRevision')
     })
 
     it.each(['none', 'ack', 'open', 'cache'] as const)(
