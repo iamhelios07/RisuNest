@@ -14,6 +14,10 @@ use uuid::Uuid;
 
 #[path = "lww_classification.rs"]
 mod classification;
+#[path = "lww_binding_stage.rs"]
+mod binding_stage;
+pub(crate) use binding_stage::BindingUnitStage;
+pub(super) use binding_stage::{seed_binding_holds, validate_binding_source, BINDING_STAGE_SCHEMA};
 #[path = "lww_new_device.rs"]
 mod new_device;
 #[path = "lww_projection.rs"]
@@ -1258,19 +1262,20 @@ impl PersistentStore {
             } else {
                 active_generation(&tx)?
             };
-            let mut changes: Vec<(String, Change)> = {
-                let mut s=tx.prepare(if drain {"SELECT request_id,key,stamp,value FROM lww_receive_rows WHERE status<>'done' ORDER BY key"}else{"SELECT request_id,key,stamp,value FROM lww_receive_rows WHERE status IN ('staged','held') ORDER BY key"})?;
+            let mut changes: Vec<(String, Change, bool)> = {
+                let mut s=tx.prepare(if drain {"SELECT request_id,key,stamp,value,status FROM lww_receive_rows WHERE status<>'done' ORDER BY key"}else{"SELECT request_id,key,stamp,value,status FROM lww_receive_rows WHERE status IN ('staged','held') ORDER BY key"})?;
                 let rows = s.query_map([], |r| {
                     Ok((
                         r.get::<_, String>(0)?,
                         r.get::<_, String>(1)?,
                         r.get::<_, String>(2)?,
                         r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
                     ))
                 })?;
                 let mut v = Vec::new();
                 for row in rows {
-                    let (id, key, stamp, value) = row?;
+                    let (id, key, stamp, value, status) = row?;
                     v.push((
                         id,
                         Change {
@@ -1278,11 +1283,12 @@ impl PersistentStore {
                             stamp: serde_json::from_str(&stamp)?,
                             value: serde_json::from_str(&value)?,
                         },
+                        status == "held",
                     ));
                 }
                 v
             };
-            changes.sort_by_key(|(_, c)| {
+            changes.sort_by_key(|(_, c, _)| {
                 if c.key.components()[0] == "exists" {
                     0
                 } else {
@@ -1296,7 +1302,7 @@ impl PersistentStore {
                 super::content_change_index::begin_mutation(&tx, &generation, revision, "server")?;
                 revision
             };
-            for (id, change) in changes {
+            for (id, change, was_held) in changes {
                 let c = change.key.components();
                 let retired = parent_status(&tx, &change.key)? == "retired";
                 let status = if retired {
@@ -1337,6 +1343,9 @@ impl PersistentStore {
                             &format!("receive:{id}"),
                             None,
                         )?;
+                        result.affected_keys.push(change.key.clone());
+                    } else if was_held && decision == LwwDecision::Identical {
+                        projection::apply(&tx, &generation, &change.key, &change.value)?;
                         result.affected_keys.push(change.key.clone());
                     }
                     witness_received(&tx, &change, current_authority)?;
@@ -1871,6 +1880,7 @@ pub(super) fn validate_local_targets(db: &Connection, input: &WorkingSetCommit) 
 pub(super) fn validate_schema(db: &Connection) -> StoreResult<()> {
     let reference = Connection::open_in_memory()?;
     reference.execute_batch(UNIT_SCHEMA)?;
+    reference.execute_batch(BINDING_STAGE_SCHEMA)?;
     reference.execute_batch(super::message_pages::SCHEMA)?;
     let mut stmt =
         reference.prepare("SELECT type,name,sql FROM sqlite_master WHERE sql IS NOT NULL")?;

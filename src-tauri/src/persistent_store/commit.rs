@@ -1309,7 +1309,10 @@ pub(super) fn replace_commit_lww(
     }
     if let Some(change)=selection_change {super::sync_selection::apply_binding_selection(&transaction,change)?;}
     require_staging(&transaction, staging_id)?;
-    if target {super::sync_selection::validate_binding_stage_content(&transaction,staging_id)?;}
+    if target {
+        super::sync_selection::validate_binding_stage_content(&transaction,staging_id)?;
+        super::lww::validate_binding_source(&transaction,staging_id,header,received)?;
+    }
     let active=active_generation(&transaction)?;
     if target {super::lww::preserve_local_root(&transaction,&active,staging_id)?;}
     let revision=current_revision(&transaction)?+1;
@@ -1327,6 +1330,7 @@ pub(super) fn replace_commit_lww(
             super::lww::put_unit(&transaction,&change.key,&change.stamp,&change.value,&header.request_id,None)?;
             super::lww::witness_received(&transaction,change,received_authority.unwrap_or(header.binding_authority))?;
         }}
+        super::lww::seed_binding_holds(&transaction,staging_id,header)?;
     } else {
         for (key,value) in changes {
             if super::lww::parent_status(&transaction,key)?=="retired"&&!(key.components()[0]=="exists"&&matches!(value,risunest_sync_wire::unit::UnitValue::Deleted)){continue;}

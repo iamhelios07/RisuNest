@@ -239,6 +239,7 @@ fn create_schema(connection: &mut Connection) -> StoreResult<()> {
     super::sync_selection::create_schema(&transaction)?;
     super::external_storage_state::create_schema(&transaction)?;
     transaction.execute_batch(super::lww::UNIT_SCHEMA)?;
+    transaction.execute_batch(super::lww::BINDING_STAGE_SCHEMA)?;
     transaction.execute_batch(super::message_pages::SCHEMA)?;
     transaction.execute_batch(PLUGIN_CLAIM_ELIGIBILITY_TABLE_SQL)?;
     validate_schema(&transaction)?;
