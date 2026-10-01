@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
 import { createSyncBindingFlow, type InspectedSyncTarget, type SyncBindingDependencies, type SyncBindingState, type SyncBindingTransport } from './bindingFlow'
+import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
+import { IndexedDbPersistentDataStore } from '../indexedDbPersistentDataStore'
+import { createMutationGatedPersistentDataStore } from '../mutationGatedPersistentDataStore'
 
 function setup(options: Partial<InspectedSyncTarget> & { nonDefault?: boolean; confirm?: boolean } = {}) {
     const events: string[] = []
@@ -95,13 +98,19 @@ import { createStorageMutationGate, createInRealmStorageLockManager } from '../s
 it('flushes actual gated commits before transition and refreshes after exclusive release', async () => {
     const s = setup()
     const gate = createStorageMutationGate({ locks: createInRealmStorageLockManager() })
+    const store = createMutationGatedPersistentDataStore(
+        new IndexedDbPersistentDataStore('binding-gated-flush', new IDBFactory(), IDBKeyRange), gate,
+    )
+    await store.open()
     let paused = false
     s.deps.gate = gate
     s.deps.withPausedWrites = async operation => {
         if (paused) throw Error('already paused')
         paused = true
         try {
-            await gate.runWrite(async () => { s.events.push('gated-flush') })
+            const root = await store.readRoot()
+            await store.commit({ expectedRevision: root.revision, root: { ...root.value, username: 'Synthetic flush' } })
+            s.events.push('gated-flush')
             return await operation()
         } finally { paused = false }
     }
@@ -113,6 +122,7 @@ it('flushes actual gated commits before transition and refreshes after exclusive
     expect(s.events).toContain('gated-flush')
     expect(s.events).toContain('gated-refresh')
     expect(paused).toBe(false)
+    expect((await store.readRoot()).value.username).toBe('Synthetic flush')
     await gate.runWrite(async () => {})
 })
 it('cancellation and activation failure release the real pause and storage gate', async () => {
