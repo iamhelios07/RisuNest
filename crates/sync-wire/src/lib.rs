@@ -1,6 +1,5 @@
 //! Format-independent sync protocol. Content bytes are never JSON-normalized.
 pub mod canonical;
-pub mod change_digest;
 pub mod changes;
 pub mod delta;
 pub mod descriptor;
@@ -12,6 +11,7 @@ pub mod stamp;
 pub mod unit;
 pub mod order;
 pub mod payload_value;
+pub mod lww;
 
 pub use changes::*;
 pub use head::*;
