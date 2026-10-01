@@ -85,3 +85,13 @@ fn payload_matches_javascript_keys_numbers_escaping_and_rejects_invalid_json() {
     for bytes in [br#"{"a":1,"a":2}"#.as_slice(), b"NaN", b"1e400", b"undefined", b"[1,]"] { assert!(payload_value::canonicalize(bytes).is_err()); }
     assert!(canonical::encode(&json!({"n":1})).is_err());
 }
+
+#[test]
+fn user_key_components_can_be_empty_without_weakening_structural_ids() {
+    for components in [vec!["variable", ""], vec!["toggle", ""], vec!["plugin", "", ""], vec!["plugin-local", "", "v3", ""], vec!["order", "plugin-storage", ""], vec!["record", "plugins", ""]] {
+        let key = UnitKey::new(&components).unwrap();
+        assert_eq!(UnitKey::try_from(key.as_str().to_owned()).unwrap(), key);
+    }
+    assert!(UnitKey::new(&["character", "", "name"]).is_err());
+    assert!(UnitKey::new(&["", "field"]).is_err());
+}

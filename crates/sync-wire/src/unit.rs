@@ -20,7 +20,7 @@ impl TryFrom<String> for UnitKey {
     fn try_from(value: String) -> Result<Self> {
         if value.len() > MAX_UNIT_KEY_BYTES { return Err(WireError("unit-key-too-large")); }
         let components: Vec<String> = serde_json::from_str(&value).map_err(|_| WireError("invalid-unit-key"))?;
-        if components.is_empty() || components.iter().any(|v| v.is_empty())
+        if components.is_empty() || components[0].is_empty()
             || serde_json::to_string(&components).map_err(|_| WireError("invalid-unit-key"))? != value {
             return Err(WireError("invalid-unit-key"));
         }
@@ -45,6 +45,15 @@ impl TryFrom<String> for UnitKey {
         if !valid || (kind == "record" && !matches!(components[1].as_str(), "modules" | "plugins" | "loadouts" | "customModels")) {
             return Err(WireError("invalid-unit-key-shape"));
         }
+        let structural_ids = match kind {
+            "character" | "preset" | "persona" | "group-members" | "archive" => &components[1..2],
+            "conversation" | "messages" => &components[1..3],
+            "exists" => &components[2..],
+            "record" if components[1] != "plugins" => &components[2..3],
+            "order" if components[1] == "conversations" => &components[2..3],
+            _ => &components[0..0],
+        };
+        if structural_ids.iter().any(String::is_empty) { return Err(WireError("invalid-unit-key-shape")); }
         Ok(Self(value))
     }
 }
