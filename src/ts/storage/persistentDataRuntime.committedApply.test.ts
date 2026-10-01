@@ -15,7 +15,7 @@ import {
     retryCommittedWorkingSetRefreshWithContinuation,
 } from './committedWorkingSetContinuation'
 
-async function createHarness(officialPublisher?: OfficialRevisionPublisher) {
+async function createHarness(officialPublisher?: OfficialRevisionPublisher, captureWorkingSet = false) {
     let database = makeDatabase()
     let durable = structuredClone(database)
     let revision = 1
@@ -81,6 +81,7 @@ async function createHarness(officialPublisher?: OfficialRevisionPublisher) {
     const runtime = createPersistentDataRuntime({
         store,
         state: {
+            captureWorkingSetDatabase: captureWorkingSet ? () => database : undefined,
             captureRoot: () => capturePersistentRoot(database),
             capturePluginStorage: () => capturePersistentPluginStorage(database),
             capturePresets: () => capturePersistentPresets(database),
@@ -549,6 +550,30 @@ describe('activated-library guards', () => {
         expect(() => guard.complete()).toThrow(PersistentMutationFencedError)
         expect(() => harness.runtime.assertPersistentMutationAllowed()).toThrow(PersistentMutationFencedError)
         await expect(harness.runtime.retryCommittedWorkingSetRefresh()).resolves.toEqual({kind: 'committed', revision: 2, projection: 'applied'})
+        expect(harness.runtime.pendingWorkingSetRefreshRevision).toBeNull()
+        expect(harness.store.commit).not.toHaveBeenCalled()
+    })
+
+
+    it('fully adopts and acknowledges guarded recovery while the previous projected working set reports generation', async () => {
+        const harness = await createHarness(undefined, true)
+        const cursor = vi.fn(async (_revision: number) => undefined)
+        harness.store.commitWorkingSetChangeCursor = cursor
+        await harness.runtime.withPausedPersistentWrites('initial-activation', async (token) => {
+            const guard = harness.runtime.beginActivatedLibraryGuard(token)
+            harness.nativeCommit(replacement('First activated projection'))
+            await harness.runtime.refreshActivatedLibraryUnderPause(token)
+            guard.complete()
+        })
+        harness.generating = true
+        await expect(harness.runtime.withPausedPersistentWrites('next-activation', async (token) => {
+            harness.runtime.beginActivatedLibraryGuard(token)
+            harness.nativeCommit(replacement('New complete projection'))
+            throw new Error('activation result unavailable')
+        })).rejects.toThrow('activation result unavailable')
+        await expect(harness.runtime.retryCommittedWorkingSetRefresh()).resolves.toEqual({kind: 'committed', revision: 3, projection: 'applied'})
+        expect(harness.database.username).toBe('New complete projection')
+        expect(cursor.mock.calls).toEqual([[2], [3]])
         expect(harness.runtime.pendingWorkingSetRefreshRevision).toBeNull()
         expect(harness.store.commit).not.toHaveBeenCalled()
     })
