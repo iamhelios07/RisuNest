@@ -94,9 +94,11 @@ describe('LWW renderer save path', () => {
         await runtime.commitPersistentUnitIntent('opaque-local',[{key:'["root","opaqueFutureField"]',type:'set',value:{local:true}}])
         expect((database as unknown as Record<string,unknown>).opaqueFutureField).toEqual({local:true})
         const baseline = captureLwwWorkingSetBaseline(database,capturePersistentRoot(database),database.botPresets)
-        const reader = {readRoot:async()=>({revision:runtime.revision,value:{...capturePersistentRoot(database),unknownReceived:'opaque'}})} as unknown as import('./persistentDataStore').PersistentRevisionReader
-        await applyLwwWorkingSetUnits(database,baseline,reader,['["root","unknownReceived"]'])
+        const reader = {readRoot:async()=>({revision:runtime.revision,value:{...capturePersistentRoot(database),unknownReceived:'opaque',vertexAccessToken:'remote token',loreBookPage:99}})} as unknown as import('./persistentDataStore').PersistentRevisionReader
+        await applyLwwWorkingSetUnits(database,baseline,reader,['["root","unknownReceived"]','["root","vertexAccessToken"]','["root","loreBookPage"]'])
         expect(database).not.toHaveProperty('unknownReceived')
+        expect(database.vertexAccessToken).not.toBe('remote token')
+        expect(database.loreBookPage).not.toBe(99)
         expect((await store.readRoot()).value).toHaveProperty('opaqueFutureField',{local:true})
     })
 
@@ -129,6 +131,38 @@ describe('LWW renderer save path', () => {
         coordinator.markPersistentDataDirty(0)
         await coordinator.flushPendingDataLocally('unchanged')
         expect(commit).not.toHaveBeenCalled()
+    })
+
+    it('persists changed opaque and device-local working-set fields and suppresses unchanged values', async () => {
+        const {database,store,coordinator,commit} = await harness()
+        const owner = database.characters[1] as character
+        const chat = owner.chats[0]
+        Object.assign(owner,{opaqueOwn:{local:'character'},chatPage:1,lastInteraction:123,statics:{messages:44}})
+        Object.assign(chat,{opaqueOwn:{local:'chat'},isStreaming:true})
+        Object.assign(database,{opaqueOwn:{local:'root'}})
+        await coordinator.flushPendingDataLocally('opaque-local-observer')
+        expect((await store.readCharacter(owner.chaId))?.value).toMatchObject({opaqueOwn:{local:'character'},chatPage:1,lastInteraction:123,statics:{messages:44}})
+        expect((await store.readConversation(owner.chaId,chat.id!))?.value).toMatchObject({opaqueOwn:{local:'chat'},isStreaming:true})
+        expect((await store.readRoot()).value).toHaveProperty('opaqueOwn',{local:'root'})
+        commit.mockClear()
+        await coordinator.flushPendingDataLocally('unchanged-local-opaque')
+        expect(commit).not.toHaveBeenCalled()
+    })
+
+    it('projects shared remote fields while preserving opaque and local character/chat state', async () => {
+        const {database} = await harness()
+        const live = database.characters[1] as character
+        Object.assign(live,{opaqueOwn:'local',lastInteraction:7,statics:{messages:4}})
+        Object.assign(live.chats[0],{opaqueOwn:'local-chat',isStreaming:true})
+        const baseline = captureLwwWorkingSetBaseline(database,capturePersistentRoot(database),database.botPresets)
+        live['statics'].messages = 5
+        const reader = {
+            readCharacter:async()=>({revision:2,value:{...live,opaqueOwn:'remote',lastInteraction:99,statics:{messages:100,shared:42}}}),
+            readConversationMetadata:async()=>({revision:2,value:{conversation:{...live.chats[0],opaqueOwn:'remote-chat',isStreaming:false,note:'shared note'}}}),
+        } as unknown as import('./persistentDataStore').PersistentRevisionReader
+        await applyLwwWorkingSetUnits(database,baseline,reader,['["character","char-a","opaqueOwn"]','["character","char-a","lastInteraction"]','["character","char-a","statics"]','["conversation","char-a","conv-long","opaqueOwn"]','["conversation","char-a","conv-long","isStreaming"]','["conversation","char-a","conv-long","note"]'])
+        expect(live).toMatchObject({opaqueOwn:'local',lastInteraction:7,statics:{messages:5,shared:42}})
+        expect(live.chats[0]).toMatchObject({opaqueOwn:'local-chat',isStreaming:true,note:'shared note'})
     })
 
     it('retries changed units onto a newer revision without replacing unrelated values', async () => {

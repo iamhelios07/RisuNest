@@ -1,10 +1,10 @@
-import { persistentRootFields } from './persistentRootFields'
+import { sharedRootFields } from './persistentRootFields'
 import { createCatalogCharacterStub } from './workingSetCatalog'
 import { createConversationSummaryStub, createConversationSummaryFromMetadata } from './conversationResidency'
 import type { Chat, Database, botPreset, character, groupChat } from './database.svelte'
 import type { PersistentRevisionReader, PersistentRoot } from './persistentDataStore'
 import { canonicalClone, canonicalJson } from './saveCoordinatorHelpers'
-import { captureMaterializedCharacter } from './persistentUnitCapture'
+import { captureMaterializedCharacter, CHARACTER_SHARED_FIELDS, CONVERSATION_SHARED_FIELDS } from './persistentUnitCapture'
 import { isWorkingSetCharacterStub } from './workingSetCatalog'
 
 type CompleteCharacter = character | groupChat
@@ -37,6 +37,7 @@ export async function applyLwwWorkingSetUnits(
     const charactersById = liveIndex ?? new Map(database.characters.map((value) => [value.chaId,value]))
     const baselineById = new Map(baseline.characters.map((value) => [value.chaId,value]))
     const keys = affectedKeys.map((key) => JSON.parse(key) as string[])
+        .filter(([kind, , field, metadataField]) => allowLocalFields || (kind !== 'character' || CHARACTER_SHARED_FIELDS.has(field)) && (kind !== 'conversation' || CONVERSATION_SHARED_FIELDS.has(metadataField)))
         .sort((a, b) => Number(a[0] === 'root' && ['botPresetsId', 'selectedPersona'].includes(a[1])) - Number(b[0] === 'root' && ['botPresetsId', 'selectedPersona'].includes(b[1])))
     const root = keys.some(([kind]) => ['root', 'variable', 'toggle', 'record', 'order', 'persona', 'preset-protected', 'exists'].includes(kind))
         ? (await store.readRoot()).value : null
@@ -48,7 +49,7 @@ export async function applyLwwWorkingSetUnits(
         }
     }
     for (const [kind, id, field, metadataField] of keys) {
-        if (kind === 'root' && root && (allowLocalFields || persistentRootFields.has(id))) {
+        if (kind === 'root' && root && (allowLocalFields || sharedRootFields.has(id))) {
             if (id === 'botPresetsId' && typeof root.botPresetsId === 'string') {
                 const preset = await store.readPreset(root.botPresetsId)
                 if (preset) {
@@ -70,7 +71,17 @@ export async function applyLwwWorkingSetUnits(
             const before = baselineById.get(id)
             const remote = details.get(id)
             if (!live || !before || !remote) continue
-            for (const key of kind === 'group-members' ? ['characters', 'characterTalks', 'characterActive'] : [field]) patchField(live, before, remote, key)
+            for (const key of kind === 'group-members' ? ['characters', 'characterTalks', 'characterActive'] : [field]) {
+                if (key !== 'statics' || allowLocalFields) { patchField(live, before, remote, key); continue }
+                const sharedStatics = (value: unknown) => value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).filter(([key]) => key !== 'messages')) : value
+                const liveView = {statics:sharedStatics(live['statics'])}, beforeView = {statics:sharedStatics(before['statics'])}
+                patchField(liveView, beforeView, {statics:sharedStatics(remote['statics'])}, 'statics')
+                for (const [target, view] of [[live,liveView],[before,beforeView]] as const) {
+                    const local = target['statics'] as Record<string, unknown> | undefined
+                    if (view.statics === undefined && !local?.messages) delete target['statics']
+                    else target['statics'] = {...view.statics as object, ...(local && Object.hasOwn(local, 'messages') ? {messages:local.messages} : {})}
+                }
+            }
         } else if (kind === 'conversation' || kind === 'messages') {
             const liveCharacter = charactersById.get(id)
             const beforeCharacter = baselineById.get(id)
