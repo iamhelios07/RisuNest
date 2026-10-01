@@ -91,6 +91,7 @@ export function flushEffectivePresetEdits(db: Database): void {
 
 export function deriveEffectivePresetMirrors(db: Database, apply: (db: Database, preset: botPreset) => void): void {
     const current = state(db)
+    if (current.override && !db.botPresets?.some(preset => preset.id === current.override)) current.override = null
     const id = getEffectivePresetId(db)
     const preset = id ? db.botPresets?.find(preset => preset.id === id) : undefined
     if (preset) apply(db, preset)

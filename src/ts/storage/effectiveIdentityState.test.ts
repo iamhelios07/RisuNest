@@ -80,6 +80,22 @@ describe('authoritative identity records and mirrors', () => {
         expect(getEffectivePresetId(db)).toBe('preset-a')
         expect(db.mainPrompt).toBe('A')
     })
+    it('clears a deleted chain override and derives the remaining explicit selection', () => {
+        const db = database()
+        derive(db)
+        setEffectivePresetOverride(db, 'preset-b', apply)
+        db.botPresets.splice(1, 1)
+        const remaining = structuredClone(db.botPresets)
+        deriveEffectivePresetMirrors(db, apply)
+        expect(getEffectivePresetId(db)).toBe('preset-a')
+        expect(db.botPresetsId).toBe(0)
+        expect(db.mainPrompt).toBe('A')
+        flushEffectivePresetEdits(db)
+        expect(db.botPresets).toEqual(remaining)
+        db.mainPrompt = 'remaining edit'
+        flushEffectivePresetEdits(db)
+        expect(db.botPresets[0].mainPrompt).toBe('remaining edit')
+    })
     it('uses the coherent renamed and suggestion fields without maintaining opaque preset keys', () => {
         const db = database()
         derive(db)
