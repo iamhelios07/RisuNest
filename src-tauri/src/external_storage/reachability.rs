@@ -173,7 +173,7 @@ async fn walk(
             }
             ObjectRole::Catalog => source.catalog(&object).await,
             ObjectRole::Pack | ObjectRole::BackupPoint => Ok(Vec::new()),
-            ObjectRole::Descriptor | ObjectRole::InventoryPage | ObjectRole::Lease => {
+            ObjectRole::Segment | ObjectRole::Snapshot | ObjectRole::Descriptor | ObjectRole::InventoryPage | ObjectRole::Lease => {
                 return Err(corrupt())
             }
         };
