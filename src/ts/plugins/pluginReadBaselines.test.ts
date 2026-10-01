@@ -57,6 +57,17 @@ describe('plugin immutable read baselines', () => {
         expect(fresh.intent({ characters: [child] }, 'database', 'database', { characters: [latest] })).toEqual([{ path: ['characters', character.chaId, 'name'], type: 'set', value: 'Edited' }])
     })
 
+    it('retains nested copy history even when no database getter was called', () => {
+        const { registry, character, replaceAuthority } = fixture()
+        const child = registry.track(structuredClone(character), 'character', character.chaId, 1)
+        const copy = JSON.parse(JSON.stringify(child))
+        copy.name = 'Edited'
+        const admission = { characters: [{ ...character, desc: 'Remote' }] }
+        expect(registry.intent({ characters: [copy] }, 'database', 'database', admission)).toEqual([{ path: ['characters', character.chaId, 'name'], type: 'set', value: 'Edited' }])
+        replaceAuthority()
+        expect(() => registry.intent({ characters: [copy] }, 'database', 'database', admission)).toThrow('stale read baseline')
+    })
+
     it('carries provenance separately through RPC without changing product keys', () => {
         const { registry, character } = fixture()
         registry.track(character, 'character', character.chaId, 2)

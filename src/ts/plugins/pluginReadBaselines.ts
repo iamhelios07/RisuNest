@@ -175,6 +175,12 @@ export class PluginReadBaselines {
                 if (!read || read.authority !== this.authority()) throw new PluginReadBaselineError('stale')
                 if (read.kind !== childKind || read.target !== childTarget) throw new PluginReadBaselineError('target')
                 before = structuredClone(read.value)
+            } else if (this.hasRead(childKind, childTarget)) {
+                const compatible = [...this.baselines.values()].filter(read => read.kind === childKind && read.target === childTarget && read.authority === this.authority())
+                if (!compatible.length) throw new PluginReadBaselineError('stale')
+                const candidates = compatible.map(read => diffPluginReadBaseline(this.withNestedBaselines(read.value, after, childKind, childTarget), after, childKind))
+                if (candidates.some(candidate => canonical(candidate) !== canonical(candidates[0]))) throw new PluginReadBaselineError('ambiguous')
+                before = structuredClone(compatible[0].value)
             }
             return this.withNestedBaselines(before, after, childKind, childTarget)
         }
