@@ -39,7 +39,7 @@ fn push_control_round_trip_uses_decimal_strings_and_base64_payload() {
     assert_eq!(request.digest().unwrap(), hash(&encoded));
 }
 #[test]
-fn altered_operation_body_changes_digest_and_duplicate_units_or_writers_fail() {
+fn altered_operation_body_changes_digest_and_duplicate_units_or_invalid_issuers_fail() {
     let request = request();
     let mut altered = request.clone();
     altered.changes[0].value = UnitValue::Deleted;
@@ -47,8 +47,30 @@ fn altered_operation_body_changes_digest_and_duplicate_units_or_writers_fail() {
     altered.changes.push(altered.changes[0].clone());
     assert_eq!(altered.validate().unwrap_err().0, "duplicate-unit-key");
     let mut altered = request;
-    altered.changes[0].stamp.writer_id = "00000000-0000-4000-8000-000000000002".into();
-    assert_eq!(altered.validate().unwrap_err().0, "writer-mismatch");
+    altered.changes[0].stamp.writer_id = "invalid-issuer".into();
+    assert_eq!(altered.validate().unwrap_err().0, "invalid-writer-id");
+}
+
+#[test]
+fn forwarded_unit_stamps_round_trip_without_publisher_restamping() {
+    let mut forwarded = request();
+    let own = forwarded.changes[0].clone();
+    forwarded.changes[0].stamp.writer_id = "00000000-0000-4000-8000-000000000002".into();
+    let mut own = own;
+    own.key = UnitKey::new(&["root", "own"]).unwrap();
+    forwarded.changes.push(own);
+    forwarded.validate().unwrap();
+    let encoded = canonical::encode(&forwarded).unwrap();
+    let decoded = canonical::decode::<PushRequest>(&encoded, 4096).unwrap();
+    assert_eq!(decoded, forwarded);
+    assert_eq!(
+        decoded.changes[0].stamp.physical_ms.0,
+        9_007_199_254_740_993
+    );
+    assert_ne!(decoded.writer_id, decoded.changes[0].stamp.writer_id);
+    let mut restamped = forwarded.clone();
+    restamped.changes[0].stamp.writer_id = restamped.writer_id.clone();
+    assert_ne!(forwarded.digest().unwrap(), restamped.digest().unwrap());
 }
 #[test]
 fn terminal_receipts_and_cancellation_round_trip_without_number_controls() {

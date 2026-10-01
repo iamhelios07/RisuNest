@@ -25,6 +25,7 @@ impl UnitChange {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PushRequest {
     pub library_id: String,
+    /// Authenticated publisher identity; unit stamps retain their original issuers.
     pub writer_id: String,
     pub operation_id: String,
     pub changes: Vec<UnitChange>,
@@ -40,9 +41,6 @@ impl PushRequest {
         let mut keys = BTreeSet::new();
         for change in &self.changes {
             change.validate()?;
-            if change.stamp.writer_id != self.writer_id {
-                return Err(WireError("writer-mismatch"));
-            }
             if !keys.insert(change.key.as_str()) {
                 return Err(WireError("duplicate-unit-key"));
             }

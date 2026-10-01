@@ -181,7 +181,7 @@ impl Store {
                 }
                 let identity = change.value.identity()?;
                 let prior: Option<String> = tx.query_row("SELECT identity FROM writer_versions WHERE writer=?1 AND key=?2 AND physical=?3 AND logical=?4",
-                    params![request.writer_id,change.key.as_str(),change.stamp.physical_ms.0.to_string(),change.stamp.logical.to_string()], |r| r.get(0)).optional()?;
+                    params![change.stamp.writer_id,change.key.as_str(),change.stamp.physical_ms.0.to_string(),change.stamp.logical.to_string()], |r| r.get(0)).optional()?;
                 if prior.is_some_and(|old| old != identity) {
                     return Err(
                         Error::new("equal-stamp-integrity", 409).for_key(change.key.as_str())
@@ -244,7 +244,7 @@ impl Store {
             tx.execute(
                 "INSERT OR IGNORE INTO writer_versions VALUES(?1,?2,?3,?4,?5)",
                 params![
-                    request.writer_id,
+                    change.stamp.writer_id,
                     change.key.as_str(),
                     change.stamp.physical_ms.0.to_string(),
                     change.stamp.logical.to_string(),
