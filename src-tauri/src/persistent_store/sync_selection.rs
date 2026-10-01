@@ -186,6 +186,7 @@ fn require_publish_with_pause(
 
 pub(super) fn replaced(tx: &Transaction<'_>) -> StoreResult<()> {
     require_no_pending_publication(tx)?;
+    tx.execute("UPDATE lww_binding_identity SET library_id=NULL,target_id=NULL WHERE EXISTS(SELECT 1 FROM library_sync_selection WHERE target='none')", [])?;
     tx.execute(
         "UPDATE local_library_identity SET library_epoch=?1 WHERE singleton=1",
         [uuid::Uuid::new_v4().to_string()],
@@ -358,6 +359,120 @@ mod binding_tests {
         assert_eq!(content.hypa_value_count, 0);
         assert_eq!(content.ordinary_plugin_value_count, 0);
     }
+    fn staged(store: &mut super::super::PersistentStore, inspection: &str, changes: &[super::super::lww::Change]) -> (String,String) {
+        let staging = store.replace_begin().unwrap().staging_id;
+        store.replace_put_root(&staging,&serde_json::json!({"language":"en","statics":{"messages":0}})).unwrap();
+        let receive = uuid::Uuid::new_v4().to_string();
+        store.register_lww_binding_stage(inspection,&staging,&receive,changes).unwrap();
+        (staging,receive)
+    }
+    fn inspect(store: &super::super::PersistentStore, target: &SyncTarget) -> String {
+        store.register_lww_binding_inspection(store.lww_binding_authority().unwrap(),target,"remote-target","remote-library").unwrap()
+    }
+    fn switch(store: &mut super::super::PersistentStore, inspection: &str, target: &SyncTarget) -> BindingState {
+        let before = store.lww_binding_state().unwrap();
+        store.switch_lww_binding(&SwitchBindingRequest { header:super::super::lww::Header{binding_authority:before.target_authority,request_id:uuid::Uuid::new_v4().to_string()},expected_selection_epoch:before.selection_epoch,target:target.clone(),inspection_id:Some(inspection.into()) }).unwrap()
+    }
+    fn replacement(state: &BindingState, staging: &str, receive: &str) -> ReplaceBindingRequest {
+        ReplaceBindingRequest { header:super::super::lww::Header{binding_authority:state.target_authority,request_id:receive.into()},expected_selection_epoch:state.selection_epoch.clone(),staging_id:staging.into(),receive_id:receive.into(),target_id:"remote-target".into(),library_id:"remote-library".into() }
+    }
+    #[test]
+    fn binding_rejects_stale_or_wrong_target_inspection_before_switching() {
+        let dir=tempfile::tempdir().unwrap();let mut store=super::super::PersistentStore::open(dir.path()).unwrap();
+        let target=SyncTarget::Server("server".into());let inspection=inspect(&store,&target);
+        let before=store.lww_binding_state().unwrap();
+        let request=SwitchBindingRequest { header:super::super::lww::Header{binding_authority:before.target_authority,request_id:uuid::Uuid::new_v4().to_string()},expected_selection_epoch:before.selection_epoch.clone(),target:SyncTarget::External("other".into()),inspection_id:Some(inspection) };
+        assert!(store.switch_lww_binding(&request).is_err());
+        assert_eq!(store.lww_binding_state().unwrap().target_authority,before.target_authority);
+        assert_eq!(store.lww_binding_state().unwrap().selection_epoch,before.selection_epoch);
+    }
+    #[test]
+    fn binding_rejects_mutated_stage_before_authority_or_values_change() {
+        let dir=tempfile::tempdir().unwrap();let mut store=super::super::PersistentStore::open(dir.path()).unwrap();
+        let target=SyncTarget::Server("server".into());let inspection=inspect(&store,&target);
+        let (staging,receive)=staged(&mut store,&inspection,&[]);
+        store.replace_put_root(&staging,&serde_json::json!({"language":"changed"})).unwrap();
+        assert!(store.register_lww_binding_stage(&inspection,&staging,&receive,&[]).is_err());
+        let before=store.lww_binding_state().unwrap();
+        let request=SwitchBindingRequest { header:super::super::lww::Header{binding_authority:before.target_authority,request_id:uuid::Uuid::new_v4().to_string()},expected_selection_epoch:before.selection_epoch.clone(),target,inspection_id:Some(inspection) };
+        assert!(store.switch_lww_binding(&request).is_err());
+        assert_eq!(store.lww_binding_state().unwrap().target_authority,before.target_authority);
+    }
+    #[test]
+    fn binding_replacement_resets_all_owners_without_deletions_and_preserves_operational_state() {
+        use super::super::device_store::plugin_values::PluginDeviceMutation;
+        let dir=tempfile::tempdir().unwrap();let mut store=super::super::PersistentStore::open(dir.path()).unwrap();
+        let writer=store.device_store().unwrap().writer_id().unwrap();
+        store.device_store_mut().unwrap().write_setting("risuNestDeviceSettings",&serde_json::json!({"synthetic":true})).unwrap();
+        let old:super::super::WorkingSetCommit=serde_json::from_value(serde_json::json!({
+            "expectedRevision":current_revision(&store.connection).unwrap(),
+            "root":{"statics":{"messages":7},"loreBookPage":3,"vertexAccessToken":"synthetic"},
+            "pluginStorage":[{"type":"set","owner":"orphan","key":"ordinary","value":"old-value"}]
+        })).unwrap();
+        store.commit(&old).unwrap();
+        store.device_store_mut().unwrap().write_hypa_embeddings(&[super::super::device_store::hypa::HypaEmbeddingWrite {
+            cache_key:"synthetic-hypa".into(),producer:"test".into(),model:"test".into(),endpoint:None,
+            preprocess_version:0,dimensions:1,vector:1.0f32.to_le_bytes().to_vec(),metadata:None,
+        }]).unwrap();
+        let prior_clock=store.lww_clock_state().unwrap();
+        for owner in ["installed","orphan"] {
+            store.device_store_mut().unwrap().write_plugin_device_values(owner,&[
+                PluginDeviceMutation::Set{space:"json".into(),key:"json".into(),value:"null".into()},
+                PluginDeviceMutation::Set{space:"string".into(),key:"string".into(),value:"synthetic".into()},
+            ]).unwrap();
+        }
+        let target=SyncTarget::Server("server".into());let inspection=inspect(&store,&target);
+        let (staging,receive)=staged(&mut store,&inspection,&[]);let state=switch(&mut store,&inspection,&target);
+        let request=replacement(&state,&staging,&receive);
+        store.replace_lww_binding(&request).unwrap();
+        let content=store.lww_binding_content().unwrap();
+        assert_eq!(content.plugin_local_value_count,0);
+        assert_eq!(content.hypa_value_count,0);
+        assert_eq!(content.ordinary_plugin_value_count,0);
+        assert_eq!(store.read_root(None).unwrap().value["statics"],serde_json::json!({"messages":7}));
+        assert_eq!(store.read_root(None).unwrap().value["loreBookPage"],3);
+        assert_eq!(store.read_root(None).unwrap().value["vertexAccessToken"],"synthetic");
+        assert!(store.lww_clock_state().unwrap().issued >= prior_clock.issued);
+        assert_eq!(store.device_store().unwrap().writer_id().unwrap(),writer);
+        assert_eq!(store.device_store().unwrap().read_setting("risuNestDeviceSettings").unwrap(),Some(serde_json::json!({"synthetic":true})));
+        assert_eq!(store.lww_binding_authority().unwrap(),state.target_authority);
+        assert!(store.lww_read_outbox(state.target_authority,100).unwrap().entries.is_empty());
+        store.device_store_mut().unwrap().write_plugin_device_values("orphan",&[PluginDeviceMutation::Set{space:"string".into(),key:"after".into(),value:"kept".into()}]).unwrap();
+        store.replace_lww_binding(&request).unwrap();
+        assert_eq!(store.lww_binding_content().unwrap().plugin_local_value_count,1);
+    }
+    #[test]
+    fn binding_target_plugin_values_are_active_only_with_participation() {
+        for enabled in [false,true] {
+            let dir=tempfile::tempdir().unwrap();let mut store=super::super::PersistentStore::open(dir.path()).unwrap();
+            store.device_store().unwrap().connection().execute("UPDATE device_sections SET participating=?1 WHERE section='local-plugins'",[enabled]).unwrap();
+            let value=risunest_sync_wire::unit::UnitValue::inline(&serde_json::to_vec(&serde_json::json!("remote-value")).unwrap()).unwrap();
+            let changes=[super::super::lww::Change{ key:risunest_sync_wire::unit::UnitKey::new(&["plugin-local","remote-owner","string","remote"]).unwrap(), stamp:risunest_sync_wire::stamp::Stamp{physical_ms:risunest_sync_wire::stamp::DecimalU64(1),logical:0,writer_id:uuid::Uuid::new_v4().to_string()},value }];
+            let target=SyncTarget::Server("server".into());let inspection=inspect(&store,&target);
+            let (staging,receive)=staged(&mut store,&inspection,&changes);let state=switch(&mut store,&inspection,&target);
+            store.replace_lww_binding(&replacement(&state,&staging,&receive)).unwrap();
+            let active:i64=store.device_store().unwrap().connection().query_row("SELECT COUNT(*) FROM plugin_device_storage WHERE tombstone=0",[],|r|r.get(0)).unwrap();
+            assert_eq!(active,i64::from(enabled));
+            let opaque:i64=store.device_store().unwrap().connection().query_row("SELECT COUNT(*) FROM lww_units",[],|r|r.get(0)).unwrap();
+            assert_eq!(opaque,1);
+            assert_eq!(store.lww_binding_content().unwrap().plugin_local_value_count,1);
+        }
+    }
+
+    #[test]
+    fn unbinding_retains_library_for_rebind_but_unbound_replacement_clears_association() {
+        let mut db=database();let initial=change(&db);let tx=db.transaction().unwrap();
+        apply_binding_selection(&tx,&initial).unwrap();
+        let unbind=BindingSelectionChange {expected_epoch:initial.new_epoch,new_epoch:"unbound".into(),target:SyncTarget::None,library_id:None,target_id:None,inspection_id:None};
+        apply_binding_selection(&tx,&unbind).unwrap();
+        apply_binding_selection(&tx,&unbind).unwrap();
+        let library:Option<String>=tx.query_row("SELECT library_id FROM lww_binding_identity WHERE singleton=1",[],|r|r.get(0)).unwrap();
+        assert_eq!(library,Some("library".into()));
+        replaced(&tx).unwrap();
+        let library:Option<String>=tx.query_row("SELECT library_id FROM lww_binding_identity WHERE singleton=1",[],|r|r.get(0)).unwrap();
+        assert_eq!(library,None);
+    }
+
     #[test]
     fn binding_selection_replays_exactly_and_preserves_backup_jobs() {
         let mut db = database(); let change = change(&db);
@@ -451,6 +566,7 @@ impl super::PersistentStore {
         let existing: Option<(String,String,String)> = self.connection.query_row("SELECT inspection_id,receive_id,changes FROM lww_binding_stages WHERE staging_id=?1", [staging_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
         if let Some(existing) = existing {
             if existing != (inspection_id.into(),receive_id.into(),encoded) { return Err(invalid("Binding stage identity changed")); }
+            validate_binding_stage_content(&self.connection,staging_id)?;
             return Ok(());
         }
         let digest = binding_stage_digest(&self.connection, staging_id)?;
@@ -464,6 +580,10 @@ impl super::PersistentStore {
         if let Some((original,encoded)) = existing {
             if original != body { return Err(invalid("Binding switch request identity changed")); }
             let change:BindingSelectionChange = serde_json::from_str(&encoded)?;
+            let current = self.lww_binding_state()?;
+            if current.selection_epoch != change.expected_epoch && current.selection_epoch != change.new_epoch {
+                return Err(invalid("Stale binding switch completion"));
+            }
             self.lww_switch_target(&request.header,&change)?;
             return self.lww_binding_state();
         }
@@ -476,6 +596,12 @@ impl super::PersistentStore {
             let inspection = request.inspection_id.as_deref().ok_or_else(|| invalid("Missing binding inspection"))?;
             let (target,library,target_id,authority,epoch):(String,String,String,String,String) = self.connection.query_row("SELECT target,library_id,target_id,source_authority,source_epoch FROM lww_binding_inspections WHERE inspection_id=?1", [inspection], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
             if serde_json::from_str::<SyncTarget>(&target)? != request.target || authority != request.header.binding_authority.0.to_string() || epoch != request.expected_selection_epoch { return Err(invalid("Wrong target binding inspection")); }
+            let mut stages = self.connection.prepare("SELECT staging_id FROM lww_binding_stages WHERE inspection_id=?1")?;
+            for staging in stages.query_map([inspection], |r| r.get::<_,String>(0))? {
+                let staging = staging?;
+                self.prepare_replace_commit(&staging,None)?;
+                validate_binding_stage_content(&self.connection,&staging)?;
+            }
             (Some(library),Some(target_id))
         };
         let change = BindingSelectionChange { expected_epoch: request.expected_selection_epoch.clone(),new_epoch:uuid::Uuid::new_v4().to_string(),target:request.target.clone(),library_id,target_id,inspection_id:request.inspection_id.clone() };
@@ -519,7 +645,7 @@ fn binding_stage_digest(db: &Connection, staging_id: &str) -> StoreResult<String
     let value = super::query::materialize_target(db, &target)?;
     let aliases = super::query::list_asset_aliases(db, &target)?.value;
     let owners = super::query::list_asset_owner_heads(db, &target)?.value;
-    Ok(format!("{:x}",Sha256::digest(serde_json::to_vec(&(value,aliases,owners))?)))
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&(value,aliases,owners))?)))
 }
 
 pub(crate) fn validate_binding_stage_content(db: &Connection, staging_id: &str) -> StoreResult<()> {

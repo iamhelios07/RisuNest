@@ -26,3 +26,11 @@ it('counts Hypa memo content stored in the materialized library', async () => {
     invoke.mockResolvedValue(content)
     expect(await hasLocalBindingData()).toBe(true)
 })
+
+it('generated IDs assigned to factory presets and personas are not user edits', async () => {
+    const content = native()
+    Object.assign(content.library.botPresets[0], { id: 'generated-preset' })
+    Object.assign(content.library.personas[0], { id: 'generated-persona' })
+    invoke.mockResolvedValue(content)
+    expect(await hasLocalBindingData()).toBe(false)
+})
