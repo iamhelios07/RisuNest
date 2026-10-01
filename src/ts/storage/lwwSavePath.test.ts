@@ -1,3 +1,4 @@
+import {deriveEffectivePresetMirrors, deriveEffectivePersonaMirrors, deriveEffectiveToggleVariables, flushEffectivePresetEdits, flushEffectivePersonaEdits, flushEffectiveToggleEdits, presetMirrorMap, getExplicitGlobalChatVariables} from './effectiveIdentityState'
 import { describe, expect, it, vi } from 'vitest'
 import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
 import { IndexedDbPersistentDataStore } from './indexedDbPersistentDataStore'
@@ -44,7 +45,81 @@ async function runtimeHarness(registry?: ReturnType<typeof createGeneratingConve
     return {...values,store:store as PersistentDataStore,runtime}
 }
 
+async function identityRuntimeHarness() {
+    const {database,store,commit} = await harness()
+    Object.assign(database.botPresets[0],{mainPrompt:'First prompt',temperature:11})
+    Object.assign(database.botPresets[1],{mainPrompt:'Second prompt',temperature:22})
+    database.personas = [{id:'persona-first',name:'First persona',icon:'first.png',personaPrompt:'First persona prompt',note:'First note'},
+        {id:'persona-second',name:'Second persona',icon:'second.png',personaPrompt:'Second persona prompt',note:'Second note'}]
+    database.globalChatVariables = {toggle_mode:'explicit',other:'shared'}
+    database.characters[0].chatPage = 0
+    database.characters[0].chats[0].savedToggleValues = {toggle_mode:'initial bound'}
+    const derive = () => {
+        deriveEffectivePresetMirrors(database,(db,preset)=>{
+            for (const [key,field] of Object.entries(presetMirrorMap)) {
+                if (Object.hasOwn(preset,field)) (db as unknown as Record<string,unknown>)[key] = structuredClone(preset[field])
+            }
+        })
+        deriveEffectivePersonaMirrors(database)
+        deriveEffectiveToggleVariables(database,database.characters[0].chats[database.characters[0].chatPage])
+    }
+    derive()
+    await store.replaceFromDatabase(database,(await store.readRoot()).revision)
+    const runtime = createPersistentDataRuntime({store,state:{
+        captureRoot:()=>capturePersistentRoot(database),capturePresets:()=>database.botPresets,captureCharacters:()=>database.characters,
+        captureWorkingSetDatabase:()=>database,captureSelectedCharacter:()=>database.characters[0],captureCharacter:(id)=>database.characters.find((value)=>value.chaId===id)??null,
+        getSelectedCharacterId:()=>database.characters[0].chaId,replaceDatabase:()=>undefined,publishCharacter:()=>undefined,publishConversation:()=>undefined,
+        beforeCapture:()=>{flushEffectivePresetEdits(database);flushEffectivePersonaEdits(database);flushEffectiveToggleEdits(database)},
+        afterRemoteApply:derive,
+    },prepareDatabase:async(value)=>value})
+    await runtime.initializeActiveWorkingSet(database)
+    const native = store as PersistentDataStore
+    const receive = async (mutations: WorkingSetCommit['unitMutations']) => {
+        native.lwwStageReceive = async()=>undefined
+        native.lwwApplyReceive = async()=>{
+            const result = await store.commit({expectedRevision:runtime.revision,unitMutations:mutations})
+            return {...result,affectedKeys:mutations!.map((value)=>value.key),heldKeys:[],deferredKeys:[]}
+        }
+        native.lwwFinishReceive = async()=>undefined
+        await runtime.applyLwwReceive({bindingAuthority:'identity',requestId:crypto.randomUUID(),changes:[],progress:{kind:'server',cursor:'1'},admittedTimeUpperMs:'100'})
+    }
+    return {database,store,commit,runtime,receive}
+}
+
 describe('LWW renderer save path', () => {
+    it('derives received preset/persona selection and record changes then flushes without echo', async () => {
+        const {database,store,commit,runtime,receive} = await identityRuntimeHarness()
+        await receive([
+            {key:'["root","botPresetsId"]',type:'set',value:'preset-alpha'},
+            {key:'["root","selectedPersona"]',type:'set',value:'persona-second'},
+            {key:'["preset","preset-alpha","mainPrompt"]',type:'set',value:'Received prompt'},
+            {key:'["preset","preset-alpha","temperature"]',type:'set',value:42},
+            {key:'["persona","persona-second","name"]',type:'set',value:'Received persona'},
+        ])
+        expect(database).toMatchObject({botPresetsId:1,selectedPersona:1,mainPrompt:'Received prompt',temperature:42,username:'Received persona',personaPrompt:'Second persona prompt'})
+        expect(database.botPresets[0].mainPrompt).toBe('First prompt')
+        commit.mockClear()
+        await runtime.flushPendingDataLocally('after-received-identity')
+        expect(commit).not.toHaveBeenCalled()
+        expect((await store.readPreset('preset-alpha'))?.value.mainPrompt).toBe('Received prompt')
+        await receive([{key:'["preset","preset-alpha","mainPrompt"]',type:'set',value:'Updated selected record'}])
+        expect(database.mainPrompt).toBe('Updated selected record')
+        commit.mockClear()
+        await runtime.flushPendingDataLocally('after-received-selected-record')
+        expect(commit).not.toHaveBeenCalled()
+    })
+
+    it('derives received saved toggles without publishing explicit toggle changes on the next flush', async () => {
+        const {database,store,commit,runtime,receive} = await identityRuntimeHarness()
+        await receive([{key:'["conversation","char-b","conv-beta","savedToggleValues"]',type:'set',value:{toggle_mode:'received bound',toggle_new:'received new'}}])
+        expect(database.globalChatVariables).toEqual({toggle_mode:'received bound',toggle_new:'received new',other:'shared'})
+        expect(getExplicitGlobalChatVariables(database)).toEqual({toggle_mode:'explicit',other:'shared'})
+        commit.mockClear()
+        await runtime.flushPendingDataLocally('after-received-binding')
+        expect(commit).not.toHaveBeenCalled()
+        expect((await store.readRoot()).value.explicitGlobalChatVariables).toEqual({toggle_mode:'explicit',other:'shared'})
+    })
+
     it('adopts accepted remote units without re-emitting them or resetting unrelated local edits', async () => {
         const {database,store,runtime,commit} = await runtimeHarness()
         store.lwwStageReceive = async()=>undefined
