@@ -359,8 +359,14 @@ export interface PersistentDataRuntimeDependencies {
     prepareDatabase(database: Database): Promise<Database>
 }
 
+export interface PersistentActivatedLibraryGuard {
+    complete(): void
+    abortUnchanged(): Promise<void>
+}
+
 export interface PersistentDataRuntime {
     withPausedPersistentWrites<T>(reason: string, operation: (token: PersistentMutationToken) => Promise<T>): Promise<T>
+    beginActivatedLibraryGuard(token: PersistentMutationToken): PersistentActivatedLibraryGuard
     refreshActivatedLibraryUnderPause(token: PersistentMutationToken): Promise<CommittedApplyOutcome>
     applyLwwReceive(request: LwwStageReceive): Promise<LwwApplyResult>
     drainLwwDeferred(request: LwwReceiveHeader): Promise<LwwApplyResult>
@@ -561,6 +567,7 @@ export function createPersistentDataRuntime(
     dependencies: PersistentDataRuntimeDependencies,
 ): PersistentDataRuntime {
     let workingSet: ActiveWorkingSet
+    let activatedLibraryGuard: { owner: symbol; ready: boolean } | null = null
     let pendingRefreshChangeSet: ReplacementChangeSet | null = null
     const captureChanges = (changes: Partial<ReplacementChangeSet>): ReplacementChangeSet => ({
         root: changes.root ?? false,
@@ -740,12 +747,13 @@ export function createPersistentDataRuntime(
         })
     }
     let deferredContentPending = false
-    const commitContentCursor = async (revision: DataRevision): Promise<void> => {
+    const commitContentCursor = async (revision: DataRevision, strict = false): Promise<void> => {
         const commit = dependencies.store.commitWorkingSetChangeCursor
         if (!commit) return
         try {
             await commit.call(dependencies.store, revision)
         } catch (error) {
+            if (strict) throw error
             // The projection is installed either way; a stale cursor only costs
             // the next window an idempotent replay.
             dependencies.onBackgroundError?.(error)
@@ -851,12 +859,12 @@ export function createPersistentDataRuntime(
                 dependencies.state.getSelectedCharacterId() ?? null
             const selectedConversationId =
                 dependencies.state.getSelectedConversationId?.() ?? null
-            const activeCharacterIds = workingSet.activeCharacterIds
+            const activeCharacterIds = activatedLibraryGuard ? new Set<string>() : workingSet.activeCharacterIds
             const projected = await projectRefreshedWorkingSet(revision, {
-                selectedCharacterId,
-                selectedConversationId,
+                selectedCharacterId: activatedLibraryGuard ? null : selectedCharacterId,
+                selectedConversationId: activatedLibraryGuard ? null : selectedConversationId,
                 activeCharacterIds,
-            }, options?.changeSet)
+            }, activatedLibraryGuard ? captureChanges({wholeLibrary: true}) : options?.changeSet)
             coordinator.assertDestructiveReplacementFence(fenceOwner)
             if (
                 navigationGeneration !== workingSet.navigationGenerationToken ||
@@ -871,9 +879,14 @@ export function createPersistentDataRuntime(
                 activeCharacterIds,
                 options?.forceScalableProjection ?? true,
             )
+            if (activatedLibraryGuard) dependencies.state.afterRemoteApply?.()
             workingSet.installCommittedWorkingSet(projected.database, revision, projected.windowedMetadata)
             deferredContentPending = projected.deferred
-            if (!projected.deferred) await commitContentCursor(revision)
+            if (!projected.deferred) await commitContentCursor(revision, activatedLibraryGuard !== null)
+            if (activatedLibraryGuard) {
+                coordinator.finishActivatedLibraryGuard(activatedLibraryGuard.owner)
+                activatedLibraryGuard = null
+            }
             return { kind: 'committed', revision, projection: 'applied' }
         } catch (error) {
             return requireCommittedRefresh(revision, error)
@@ -1008,15 +1021,41 @@ export function createPersistentDataRuntime(
     return {
         store: dependencies.store,
         withPausedPersistentWrites: (reason, operation) => coordinator.withPausedPersistentWrites(reason, operation),
+        beginActivatedLibraryGuard(token) {
+            const owner = coordinator.beginActivatedLibraryGuard(token)
+            const guard = {owner, ready: false}
+            activatedLibraryGuard = guard
+            return {
+                complete() {
+                    if (activatedLibraryGuard !== guard || !guard.ready) throw new PersistentMutationFencedError()
+                    coordinator.assertActivatedLibraryGuard(owner, token, false)
+                    coordinator.finishActivatedLibraryGuard(owner)
+                    activatedLibraryGuard = null
+                },
+                async abortUnchanged() {
+                    if (activatedLibraryGuard !== guard || guard.ready) throw new PersistentMutationFencedError()
+                    const latest = await dependencies.store.readRoot()
+                    if (latest.revision !== token.revision || coordinator.revision !== token.revision) {
+                        throw new PersistentMutationFencedError()
+                    }
+                    coordinator.finishActivatedLibraryGuard(owner)
+                    activatedLibraryGuard = null
+                },
+            }
+        },
         async refreshActivatedLibraryUnderPause(token) {
-            if (coordinator.revision !== token.revision) throw new PersistentMutationFencedError()
+            const guard = activatedLibraryGuard
+            if (!guard) throw new PersistentMutationFencedError()
+            coordinator.assertActivatedLibraryGuard(guard.owner, token)
             const latest = await dependencies.store.readRoot()
             const projected = await projectRefreshedWorkingSet(latest.revision, {selectedCharacterId:null, selectedConversationId:null, activeCharacterIds:new Set()}, {wholeLibrary:true, root:true, presets:true, pluginStorage:true, characterIds:[], conversations:[]})
+            coordinator.assertActivatedLibraryGuard(guard.owner, token)
             workingSet.invalidateNavigation()
             dependencies.state.replaceDatabase(projected.database, new Set(), true)
             dependencies.state.afterRemoteApply?.()
             workingSet.installCommittedWorkingSet(projected.database, latest.revision, projected.windowedMetadata)
-            await commitContentCursor(latest.revision)
+            await commitContentCursor(latest.revision, true)
+            guard.ready = true
             return {kind:'committed', revision:latest.revision, projection:'applied'}
         },
         async applyLwwReceive(request) {
@@ -1063,6 +1102,7 @@ export function createPersistentDataRuntime(
             return coordinator.pendingWorkingSetRefreshRevision
         },
         async initializeActiveWorkingSet(database) {
+            if (activatedLibraryGuard) throw new PersistentMutationFencedError()
             dependencies.state.afterRemoteApply?.()
             const result = await workingSet.initializeActiveWorkingSet(database)
             // A recreated WebView starts from a projection of the current
