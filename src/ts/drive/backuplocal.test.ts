@@ -35,7 +35,7 @@ const state = vi.hoisted(() => ({
 }))
 
 vi.mock('../alert', () => ({
-    alertConfirm: vi.fn(async () => true),
+    alertConfirm: vi.fn(async () => true), alertCheckboxConfirm: vi.fn(async () => ({ confirmed: true, checked: true })),
     alertError: vi.fn(),
     alertMd: vi.fn(),
     alertNormal: vi.fn(),
@@ -134,7 +134,7 @@ vi.mock('../util', () => ({
     sleep: vi.fn(async () => undefined),
 }))
 vi.mock('../characterCards', () => ({ hubURL: 'https://hub.invalid' }))
-vi.mock('src/lang', () => ({ language: {} }))
+vi.mock('src/lang', () => ({ language: { checkboxConfirmation: { partialBackup: "Backup without other assets" } } }))
 
 function emptyBlobStore(): BlobStore {
     return {

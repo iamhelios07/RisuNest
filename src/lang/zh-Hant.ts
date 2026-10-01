@@ -1,4 +1,25 @@
 export const languageChineseTraditional = {
+    risuNest: {
+        plugins: {
+            "removeTitle": "刪除此外掛嗎？",
+            "removeDescription": "一併刪除外掛資料後，即使重新安裝也無法還原設定與儲存內容。保留外掛資料可在重新安裝後繼續使用。",
+            "removeDataOption": "一併刪除外掛資料",
+            "removeAction": "刪除"
+        },
+    },
+
+    checkboxConfirmation: {
+        "characterDeletion": "刪除角色",
+        "dataReplacement": "取代目前資料",
+        "hypaReset": "重置 HypaV3 資料",
+        "hypaDeletion": "刪除後續摘要",
+        "pluginDataDeletion": "刪除外掛資料",
+        "lorebookDeletion": "刪除世界書資料夾及項目",
+        "partialBackup": "備份不包含其他資源",
+        "incompleteRestore": "還原不包含缺失資料",
+        "onlySelectedMessage": "僅刪除此訊息"
+    },
+
     "formating": {
         "main": "主要提示詞",
         "jailbreak": "越獄提示詞",

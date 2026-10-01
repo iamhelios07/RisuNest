@@ -1,4 +1,16 @@
 export const languageEnglish = {
+    checkboxConfirmation: {
+        "characterDeletion": "Delete character",
+        "dataReplacement": "Replace current data",
+        "hypaReset": "Reset HypaV3 data",
+        "hypaDeletion": "Delete following summaries",
+        "pluginDataDeletion": "Delete plugin data",
+        "lorebookDeletion": "Delete lorebook folder and entries",
+        "partialBackup": "Backup without other assets",
+        "incompleteRestore": "Restore without unavailable data",
+        "onlySelectedMessage": "Delete only this message"
+    },
+
     close: "Close",
     retry: "Retry",
     contentRenderFailed: "Could not display this content.",
@@ -2127,8 +2139,11 @@ export const languageEnglish = {
                 'Plugin API {version} is not supported. Install a version updated to API 3.0.',
             unsupportedApiVersionLoad:
                 'These plugins use an unsupported Plugin API version and did not run. Install versions updated to API 3.0.\n\n{plugins}',
-        
-            "removeRetainedDataNotice": 'Plugin values and permissions are retained. Manage values in RisuNest settings → Plugin Data, and reset permissions in Plugin settings.',
+
+            "removeTitle": "Remove this plugin?",
+            "removeDescription": "Deleting plugin data also removes its settings and saved content, even if you reinstall the plugin. Keeping plugin data lets you use it again after reinstalling.",
+            "removeDataOption": "Also delete plugin data",
+            "removeAction": "Delete",
         },
         exitDrain: {
             title: 'Finishing synchronization',

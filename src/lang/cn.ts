@@ -1,4 +1,25 @@
 export const languageChinese = {
+    risuNest: {
+        plugins: {
+            "removeTitle": "删除此插件吗？",
+            "removeDescription": "同时删除插件数据后，即使重新安装插件也无法恢复设置和保存的内容。保留插件数据可在重新安装后继续使用。",
+            "removeDataOption": "同时删除插件数据",
+            "removeAction": "删除"
+        },
+    },
+
+    checkboxConfirmation: {
+        "characterDeletion": "删除角色",
+        "dataReplacement": "替换当前数据",
+        "hypaReset": "重置 HypaV3 数据",
+        "hypaDeletion": "删除后续摘要",
+        "pluginDataDeletion": "删除插件数据",
+        "lorebookDeletion": "删除世界书文件夹及条目",
+        "partialBackup": "备份不包含其他资源",
+        "incompleteRestore": "恢复不包含缺失数据",
+        "onlySelectedMessage": "仅删除此消息"
+    },
+
     "formating": {
         "main": "主提示词",
         "jailbreak": "越狱提示词",
