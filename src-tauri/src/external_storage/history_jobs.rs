@@ -432,7 +432,7 @@ mod tests {
                 delete_character_ids: None,
                 plugin_storage: None,
                 asset_owner_heads: None,
-            })
+            ..Default::default()})
             .unwrap();
     }
 

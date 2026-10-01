@@ -576,7 +576,8 @@ impl Provider for FakeProvider {
             // A published state and a backup bundle share the snapshot listing,
             // which is what every adapter answers.
             let roles: &[ObjectRole] = match collection {
-                Collection::Snapshots => &[ObjectRole::SyncState, ObjectRole::BackupBundle],
+                Collection::Segments => &[ObjectRole::Segment],
+                Collection::Snapshots => &[ObjectRole::Snapshot, ObjectRole::SyncState, ObjectRole::BackupBundle],
                 Collection::BackupPoints => &[ObjectRole::BackupPoint],
                 Collection::InventoryPages => &[ObjectRole::InventoryPage],
                 Collection::Descriptors => &[ObjectRole::Descriptor],

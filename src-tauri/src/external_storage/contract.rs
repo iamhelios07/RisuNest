@@ -147,6 +147,8 @@ pub(crate) enum ObjectRole {
     Pack,
     Catalog,
     SyncState,
+    Segment,
+    Snapshot,
     BackupBundle,
     BackupPoint,
     InventoryPage,
@@ -244,7 +246,110 @@ impl ObjectIntent {
         {
             return Err(ProviderError::new(ErrorKind::Corrupt));
         }
+        if self.role == ObjectRole::Segment {
+            let (writer, seq, digest) = parse_segment_object_id(&self.object_id)?;
+            if segment_object_id(writer, seq, digest)? != self.object_id || digest != self.sha256 {
+                return Err(ProviderError::new(ErrorKind::Corrupt));
+            }
+        }
+        if self.role == ObjectRole::Snapshot {
+            let id = uuid::Uuid::parse_str(&self.object_id).map_err(|_| ProviderError::new(ErrorKind::Corrupt))?;
+            if id.to_string() != self.object_id { return Err(ProviderError::new(ErrorKind::Corrupt)); }
+        }
         Ok(())
+    }
+}
+
+pub(crate) const MAX_SEGMENT_NAME_BYTES: usize = 122;
+pub(crate) const MAX_SNAPSHOT_NAME_BYTES: usize = 36;
+
+#[cfg(test)]
+#[test]
+fn segment_names_keep_complete_identity_and_reject_noncanonical_names() {
+    let writer = "aaaaaaaa-aaaa-4000-8000-aaaaaaaaaaaa";
+    let hash = "a".repeat(64);
+    let name = segment_object_id(writer, u64::MAX, &hash).unwrap();
+    assert_eq!(name.len(), MAX_SEGMENT_NAME_BYTES);
+    for invalid_writer in [
+        "00000000-0000-1000-8000-000000000001",
+        "00000000-0000-0000-0000-000000000000",
+        "00000000-0000-4000-7000-000000000001",
+        "00000000-0000-4000-c000-000000000001",
+    ] {
+        assert!(segment_object_id(invalid_writer, 1, &hash).is_err(), "{invalid_writer}");
+        assert!(parse_segment_object_id(&format!("{invalid_writer}-1-{hash}")).is_err(), "{invalid_writer}");
+    }
+
+    assert_eq!(parse_segment_object_id(&name).unwrap(), (writer, u64::MAX, hash.as_str()));
+    for name in [format!("{writer}-01-{hash}"), format!("{writer}-0-{hash}"),
+        format!("{writer}-18446744073709551616-{hash}"), format!("{writer}-1-{}", "A".repeat(64)),
+        format!("{}-1-{hash}", writer.replace('a', "A")), format!("{writer}-1-{}", "a".repeat(63))] {
+        assert!(parse_segment_object_id(&name).is_err(), "{name}");
+    }
+}
+
+pub(crate) fn segment_object_id(writer: &str, seq: u64, sha256: &str) -> Result<String> {
+    risunest_sync_wire::stamp::validate_writer_id(writer)
+        .map_err(|_| ProviderError::new(ErrorKind::Corrupt))?;
+    if seq == 0 || !crate::trust_boundary::is_lower_hex_256(sha256) {
+        return Err(ProviderError::new(ErrorKind::Corrupt));
+    }
+    Ok(format!("{writer}-{seq}-{sha256}"))
+}
+
+pub(crate) fn parse_segment_object_id(name: &str) -> Result<(&str, u64, &str)> {
+    let bad = || ProviderError::new(ErrorKind::Corrupt);
+    let writer = name.get(..36).ok_or_else(bad)?;
+    let suffix = name.get(37..).filter(|_| name.as_bytes().get(36) == Some(&b'-')).ok_or_else(bad)?;
+    let (seq, digest) = suffix.split_once('-').ok_or_else(bad)?;
+    let seq = seq.parse::<u64>().map_err(|_| bad())?;
+    if segment_object_id(writer, seq, digest)? != name { return Err(bad()); }
+    Ok((writer, seq, digest))
+}
+
+pub(crate) struct IdentitySink<'a> { pub intent: &'a ObjectIntent }
+
+pub(crate) async fn verify_source(source: &dyn TransferSource, intent: &ObjectIntent, cancel: &Cancellation) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncReadExt;
+    if source.byte_length() != intent.byte_length { return Err(ProviderError::new(ErrorKind::Corrupt)); }
+    let mut reader = source.open(0, intent.byte_length, cancel).await?;
+    let mut hash = Sha256::new();
+    let mut length = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        cancel.check()?;
+        let read = reader.read(&mut buffer).await.map_err(|_| ProviderError::new(ErrorKind::Transient))?;
+        if read == 0 { break; }
+        length = length.checked_add(read as u64).ok_or_else(|| ProviderError::new(ErrorKind::Corrupt))?;
+        if length > intent.byte_length { return Err(ProviderError::new(ErrorKind::Corrupt)); }
+        hash.update(&buffer[..read]);
+    }
+    let digest: String = hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
+    if length != intent.byte_length || digest != intent.sha256 {
+        return Err(ProviderError::new(ErrorKind::Corrupt));
+    }
+    Ok(())
+}
+
+impl TransferSink for IdentitySink<'_> {
+    fn open<'a>(&'a mut self, offset: u64, max_length: u64, cancel: &'a Cancellation)
+        -> ProviderFuture<'a, Pin<Box<dyn AsyncWrite + Send>>> {
+        Box::pin(async move {
+            cancel.check()?;
+            if offset != 0 || max_length != self.intent.byte_length {
+                return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+            }
+            Ok(Box::pin(tokio::io::sink()) as Pin<Box<dyn AsyncWrite + Send>>)
+        })
+    }
+    fn finish<'a>(&'a mut self, length: u64, sha256: &'a str) -> ProviderFuture<'a, ()> {
+        Box::pin(async move {
+            if length != self.intent.byte_length || sha256 != self.intent.sha256 {
+                return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+            }
+            Ok(())
+        })
     }
 }
 
@@ -348,6 +453,7 @@ pub(crate) struct ObjectPage {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Collection {
+    Segments,
     Snapshots,
     BackupPoints,
     InventoryPages,

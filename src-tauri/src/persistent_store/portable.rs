@@ -818,7 +818,7 @@ mod tests {
             .unwrap();
         source
             .execute(
-                "INSERT INTO messages VALUES('chosen','orphan','chat',9,NULL,?1)",
+                "INSERT INTO messages VALUES('chosen','orphan','chat',9,NULL,?1,'',0)",
                 ["{\"data\":\"合成\"}"],
             )
             .unwrap();

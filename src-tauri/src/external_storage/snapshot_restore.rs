@@ -391,6 +391,7 @@ pub(super) async fn open_object(
         output.sync_all().map_err(transient)?;
         drop(output);
         let expected_role = match object_copy.role {
+            ObjectRole::Segment | ObjectRole::Snapshot => return Err(ProviderError::new(ErrorKind::Unsupported)),
             ObjectRole::Descriptor => wire::ObjectRole::Descriptor,
             ObjectRole::Pack => wire::ObjectRole::Pack,
             ObjectRole::Catalog => wire::ObjectRole::Catalog,

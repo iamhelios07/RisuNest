@@ -1108,7 +1108,7 @@ mod tests {
                         },
                     ]),
                     asset_owner_heads: None,
-                })
+                ..Default::default()})
                 .unwrap()
                 .revision;
             let owned = directory.path().join("owned");

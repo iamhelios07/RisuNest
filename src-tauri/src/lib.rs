@@ -764,6 +764,10 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         native_file_jobs::screenshot_output::native_file_job_screenshot_output_publish,
         native_file_jobs::screenshot_output::native_file_job_screenshot_output_cancel,
         native_file_jobs::screenshot_output::native_file_job_screenshot_output_release,
+        persistent_store::sync_selection::pds_lww_binding_content,
+        persistent_store::sync_selection::pds_lww_binding_state,
+        persistent_store::sync_selection::pds_lww_switch_target,
+        persistent_store::sync_selection::pds_lww_replace_from_target,
         persistent_store::commands::pds_open,
         persistent_store::commands::pds_asset_gc_maintenance,
         persistent_store::commands::pds_read_root,
@@ -801,6 +805,17 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         android_commit_transport::pds_commit_android_cancel,
         #[cfg(any(windows, target_os = "linux", target_os = "ios", target_os = "macos"))]
         persistent_commit_raw::pds_commit_raw,
+        persistent_store::lww_commands::pds_lww_read_outbox,
+        persistent_store::lww_commands::pds_lww_read_unit_state,
+        persistent_store::lww_commands::pds_lww_queue_unit_state_page,
+        persistent_store::lww_commands::pds_lww_ack_outbox,
+        persistent_store::lww_commands::pds_lww_stage_receive,
+        persistent_store::lww_commands::pds_lww_apply_receive,
+        persistent_store::lww_commands::pds_lww_finish_receive,
+        persistent_store::lww_commands::pds_lww_drain_deferred,
+        persistent_store::lww_commands::pds_lww_clock_state,
+        persistent_store::lww_commands::pds_lww_retry_unpublished,
+        persistent_store::lww_commands::pds_lww_commit_replacement,
         #[cfg(windows)]
         persistent_commit_transport::pds_commit_shared_open,
         #[cfg(windows)]

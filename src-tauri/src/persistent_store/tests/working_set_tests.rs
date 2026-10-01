@@ -1753,7 +1753,7 @@ fn ordinary_commit_during_a_lease_does_not_copy_any_generation_family() {
 }
 
 fn leased_family_canonical(store: &PersistentStore, lease: &str) -> Vec<u8> {
-    let owner = AssetOwnerLocator::RootModuleAssets { index: 0 };
+    let owner = AssetOwnerLocator::RootModuleAssets { module_id: "module-0".to_owned() };
     serde_json::to_vec(&json!({
         "root": store.read_root(Some(lease)).expect("read leased root"),
         "presetCatalog": store.query_presets(Some(lease)).expect("query leased presets"),
@@ -1860,13 +1860,13 @@ fn wal_lease_keeps_every_final_record_family_and_native_export_canonical() {
         )
         .expect("prepare owner manifest");
     let owner = AssetOwnerHead::present(
-        AssetOwnerLocator::RootModuleAssets { index: 0 },
+        AssetOwnerLocator::RootModuleAssets { module_id: "module-0".to_owned() },
         manifest.content_hash,
         1,
     );
     let mut final_root = staged_root(&database);
     final_root["modules"] = json!([{
-        "id": "lease-module",
+        "id": "module-0",
         "assets": [["lease", "assets/lease.bin", "BIN"]]
     }]);
     let staging = store.replace_begin().expect("begin final-family staging");
@@ -1921,7 +1921,7 @@ fn wal_lease_keeps_every_final_record_family_and_native_export_canonical() {
         .commit(&WorkingSetCommit {
             root: Some(json!({
                 "username": "Writer root",
-                "modules": [{ "id": "writer-module" }]
+                "modules": [{ "id": "module-0" }]
             })),
             replace_presets: Some(vec![json!({ "name": "Writer preset" })]),
             character: Some(changed_character),
@@ -1936,7 +1936,7 @@ fn wal_lease_keeps_every_final_record_family_and_native_export_canonical() {
             }]),
             delete_character_ids: Some(vec!["char-b".to_owned()]),
             asset_owner_heads: Some(vec![AssetOwnerHead::absent(
-                AssetOwnerLocator::RootModuleAssets { index: 0 },
+                AssetOwnerLocator::RootModuleAssets { module_id: "module-0".to_owned() },
             )]),
             plugin_storage: Some(vec![PluginStorageMutation::Set {
                 owner: UNOWNED_OWNER.to_owned(),

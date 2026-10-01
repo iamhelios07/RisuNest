@@ -403,6 +403,7 @@ fn with_store_mutex_mut_admitted<T>(
     let store = store.as_mut().ok_or_else(|| StoreError::Validation {
         message: "persistent store has not been opened".to_owned(),
     })?;
+    store.lww_recover_intents()?;
     operation(store)
 }
 

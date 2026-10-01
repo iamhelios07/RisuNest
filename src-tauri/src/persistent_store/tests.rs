@@ -88,6 +88,7 @@ fn empty_working_set_commit(expected_revision: i64) -> WorkingSetCommit {
         delete_character_ids: None,
         plugin_storage: None,
         asset_owner_heads: None,
+    ..Default::default()
     }
 }
 

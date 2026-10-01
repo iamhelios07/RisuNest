@@ -84,6 +84,7 @@
         type OnboardingState,
     } from './onboardingFlow'
     import {
+        bindExternalOnboardingTarget,
         externalOnboardingRestorable,
         externalOnboardingRestoreAreas,
         externalOnboardingRestoreRestarts,
@@ -339,6 +340,17 @@
             await refreshExternalStorageProductionState()
         } catch (cause) {
             externalFailure(cause)
+            return
+        }
+        if (result.connection.purpose === 'sync') {
+            externalWorking = true
+            externalStage = 'working'
+            try {
+                const outcome = await bindExternalOnboardingTarget(result.connection.id)
+                if (outcome.kind === 'bound') flow = goToOnboardingState(flow, 'done', 'external')
+                else externalStage = 'connect'
+            } catch (cause) { externalFailure(cause) }
+            finally { externalWorking = false }
             return
         }
         await loadExternalHistory(false)

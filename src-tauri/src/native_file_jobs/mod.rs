@@ -2853,7 +2853,7 @@ impl restore::ReplacementSink for PersistentReplacementSink {
         root: &serde_json::Value,
     ) -> crate::persistent_store::StoreResult<()> {
         crate::persistent_store::commands::with_store_mut(self.app.state(), |store| {
-            store.replace_put_root(staging_id, root)
+            store.replace_put_upstream_root(staging_id, root)
         })
     }
 
@@ -2873,7 +2873,7 @@ impl restore::ReplacementSink for PersistentReplacementSink {
         presets: &[serde_json::Value],
     ) -> crate::persistent_store::StoreResult<()> {
         crate::persistent_store::commands::with_store_mut(self.app.state(), |store| {
-            store.replace_put_presets(staging_id, presets)
+            store.replace_put_upstream_presets(staging_id, presets)
         })
     }
 

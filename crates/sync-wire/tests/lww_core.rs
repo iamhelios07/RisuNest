@@ -100,3 +100,38 @@ fn user_key_components_can_be_empty_without_weakening_structural_ids() {
 fn decimal_parsing_rounds_to_the_same_ieee_value_as_javascript() {
     assert_eq!(payload_value::canonicalize(b"3.08984926168550152811e-32").unwrap(), b"3.089849261685502e-32");
 }
+
+#[test]
+fn unit_value_decode_rejects_unknown_fields_for_every_shape() {
+    let deleted_with_bytes = br#"{"kind":"deleted","bytes":"ignored"}"#;
+    assert!(serde_json::from_slice::<UnitValue>(deleted_with_bytes).is_err());
+    assert!(canonical::decode::<UnitValue>(deleted_with_bytes, 4096).is_err());
+    for value in [
+        UnitValue::Deleted,
+        UnitValue::inline(b"null").unwrap(),
+        UnitValue::object(risunest_sync_wire::descriptor::RecordDescriptor::content("a".repeat(64))).unwrap(),
+    ] {
+        let mut input = serde_json::to_value(value).unwrap();
+        input.as_object_mut().unwrap().insert("unexpected".into(), json!(true));
+        assert!(serde_json::from_value::<UnitValue>(input.clone()).is_err(), "{input}");
+        let bytes = serde_json::to_vec(&input).unwrap();
+        assert!(canonical::decode::<UnitValue>(&bytes, 4096).is_err(), "{input}");
+    }
+}
+
+#[test]
+fn unit_value_strict_decode_preserves_canonical_wire_roundtrips() {
+    assert_eq!(canonical::encode(&UnitValue::Deleted).unwrap(), br#"{"kind":"deleted"}"#);
+    assert_eq!(canonical::encode(&UnitValue::inline(b"null").unwrap()).unwrap(), br#"{"bytes":"bnVsbA","kind":"inline"}"#);
+    for value in [
+        UnitValue::Deleted,
+        UnitValue::inline(br#"{"a":1}"#).unwrap(),
+        UnitValue::object(risunest_sync_wire::descriptor::RecordDescriptor::content("a".repeat(64))).unwrap(),
+    ] {
+        let bytes = canonical::encode(&value).unwrap();
+        let decoded: UnitValue = canonical::decode(&bytes, 4096).unwrap();
+        assert_eq!(decoded, value);
+        assert_eq!(decoded.identity().unwrap(), value.identity().unwrap());
+        assert_eq!(canonical::encode(&decoded).unwrap(), bytes);
+    }
+}

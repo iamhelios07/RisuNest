@@ -716,10 +716,16 @@ impl Cache {
                 }
                 Envelope::ArchivedCharacter {
                     archive_object_hash,
+                    shared_archive_object_hash,
+                    asset_hashes,
+                    shared_asset_hashes,
                     owner_heads,
                     ..
                 } => {
                     hashes.insert(archive_object_hash);
+                    hashes.insert(shared_archive_object_hash);
+                    hashes.extend(asset_hashes);
+                    hashes.extend(shared_asset_hashes);
                     hashes.extend(owner_heads.into_iter().filter_map(|h| h.manifest_hash));
                 }
                 Envelope::Asset { object_hash, .. }

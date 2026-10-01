@@ -733,11 +733,14 @@ fn collect_asset_roots_scoped(
 
 /// Every CAS object one character's records reach, so archiving can record them
 /// and keep them out of the sweep while the character has no scannable detail.
-pub(super) fn collect_character_asset_hashes(
+pub(super) fn collect_character_asset_hashes(connection:&Connection,cas:&PayloadCas,generation:&str,character_id:&str)->StoreResult<Vec<String>> {collect_character_asset_hashes_inner(connection,cas,generation,character_id,false)}
+pub(super) fn collect_shared_character_asset_hashes(connection:&Connection,cas:&PayloadCas,generation:&str,character_id:&str)->StoreResult<Vec<String>> {collect_character_asset_hashes_inner(connection,cas,generation,character_id,true)}
+fn collect_character_asset_hashes_inner(
     connection: &Connection,
     cas: &PayloadCas,
     generation: &str,
     character_id: &str,
+    shared: bool,
 ) -> StoreResult<Vec<String>> {
     let mut roots = AssetRootSet::default();
     let scope: [&dyn rusqlite::ToSql; 2] = [&generation, &character_id];
@@ -746,7 +749,8 @@ pub(super) fn collect_character_asset_hashes(
         "SELECT detail FROM conversations WHERE generation = ?1 AND character_id = ?2",
         "SELECT value FROM messages WHERE generation = ?1 AND character_id = ?2",
     ] {
-        scan_json_column(connection, query, scope.as_slice(), &mut roots)?;
+        if shared {let mut statement=connection.prepare(query)?;let mut rows=statement.query(scope.as_slice())?;while let Some(row)=rows.next()?{let raw:String=row.get(0)?;let value=serde_json::from_str(&raw)?;let value=if query.contains("FROM characters"){super::lww::shared_archive_character(value)}else if query.contains("FROM conversations"){super::lww::shared_archive_conversation(value)}else{value};observe_json_value(&value,None,&mut roots);}}else{scan_json_column(connection, query, scope.as_slice(), &mut roots)?;}
+
     }
     scan_text_column(
         connection,
@@ -788,7 +792,7 @@ pub(super) fn collect_character_asset_hashes(
         .chain(&roots.inlay_ids)
         .cloned()
         .collect();
-    collect_alias_key_candidates(connection, generation, character_id, &mut candidates)?;
+    collect_alias_key_candidates(connection, generation, character_id, &mut candidates,shared)?;
     for candidate in candidates {
         let mut statement = connection.prepare_cached(
             "SELECT object_hash FROM asset_aliases
@@ -811,6 +815,7 @@ fn collect_alias_key_candidates(
     generation: &str,
     character_id: &str,
     candidates: &mut BTreeSet<String>,
+    shared: bool,
 ) -> StoreResult<()> {
     const MAX_CANDIDATE_BYTES: usize = 512;
     let detail: Option<String> = connection
@@ -826,6 +831,7 @@ fn collect_alias_key_candidates(
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&detail) else {
         return Ok(());
     };
+    let value=if shared{super::lww::shared_archive_character(value)}else{value};
     let mut pending = vec![value];
     while let Some(value) = pending.pop() {
         match value {
