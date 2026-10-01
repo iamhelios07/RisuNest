@@ -1120,25 +1120,6 @@ fn delete_current_row(tx: &Transaction<'_>, section: Section, row: &SectionRow) 
     Ok(())
 }
 
-fn reclaim_prepared(tx: &Transaction<'_>, prepared: &PreparedSectionRows, floor: &Sequence) -> StoreResult<()> {
-    if *floor == Sequence::from(0u64) { return Ok(()); }
-    let section = prepared.synchronized_section()?;
-    let mut after = (String::new(), String::new(), String::new());
-    loop {
-        let page = local_key_page(tx, section, &after, true)?;
-        if page.is_empty() { break; }
-        for key in page {
-            let (row, _) = read_row(tx, section, &key)?.ok_or_else(|| invalid("Section row disappeared"))?;
-            if row.value.first_published().is_some_and(|marker| marker.generation <= *floor)
-                && !prepared.contains(&key, true)? {
-                delete_current_row(tx, section, &row)?;
-            }
-            after = key;
-        }
-    }
-    Ok(())
-}
-
 fn rejoin_prepared(tx: &Transaction<'_>, prepared: &PreparedSectionRows, observed: &Sequence, behind_floor: bool) -> StoreResult<()> {
     let section = prepared.synchronized_section()?;
     let writer_id: String = tx.query_row("SELECT writer_id FROM device_meta WHERE singleton=1", [], |row| row.get(0))?;
@@ -1351,7 +1332,7 @@ impl DeviceStore {
         let floor = if current.is_some() { cursor.applied_gc_floor.clone() } else { Sequence::from(0u64) };
         observe_remote_clock(&tx, section, &cursor.observed_max_write_clock)?;
         if rejoining {
-            reclaim_prepared(&tx, prepared, &floor)?;
+
             rejoin_prepared(&tx, prepared, &cursor.observed_max_write_clock, behind_floor)?;
         }
         let mut outcome = SectionApplyOutcome::default();
@@ -1360,7 +1341,7 @@ impl DeviceStore {
             else { outcome.kept += 1; }
             Ok(())
         })?;
-        if !rejoining { reclaim_prepared(&tx, prepared, &floor)?; }
+
         record_cursor(&tx, connection_id, library_lineage, section, cursor)?;
         tx.commit()?;
         Ok(outcome)
@@ -1486,6 +1467,7 @@ impl DeviceStore {
         section: Section,
         participating: bool,
     ) -> StoreResult<()> {
+        if section==Section::Hypa&&!participating {return Err(invalid("Hypa participation is required"));}
         let transaction = self.transaction()?;
         let current: i64 = transaction.query_row(
             "SELECT participating FROM device_sections WHERE section=?1",
@@ -1510,6 +1492,9 @@ impl DeviceStore {
                 ],
             )?;
             if participating {
+                super::begin_mutation_remote(&transaction)?;
+                super::super::lww::activate_plugin_local_units(&transaction)?;
+                super::finish_mutation_remote(&transaction)?;
                 // Keep lineage identity for removal markers, but require a
                 // rejoin before exchanging values again after a pause.
                 transaction.execute(
@@ -1523,8 +1508,7 @@ impl DeviceStore {
         Ok(())
     }
 
-    /// Every row of a synchronized section, tombstones included. A removal only
-    /// travels while its tombstone does.
+    /// Every section value, including permanent removal markers.
     pub(crate) fn read_section_rows(&mut self, section: Section) -> StoreResult<Vec<SectionRow>> {
         let transaction = self.transaction()?;
         let rows = read_rows(&transaction, section)?;
@@ -1635,7 +1619,7 @@ impl DeviceStore {
         published: &[(SectionKey, SectionEntryVersion)],
         stamped: &[(SectionKey, SectionEntryVersion)],
         first_published: &TombstonePublication,
-        reclaimed: &ReclaimedRows,
+        _reclaimed: &ReclaimedRows,
         gc_floor: &Sequence,
         cursor: Option<(&str, &str, &Sequence, &SectionCursor)>,
     ) -> StoreResult<bool> {
@@ -1649,34 +1633,6 @@ impl DeviceStore {
             if !participating || sequence(&generation)? != *expected_generation {
                 transaction.commit()?;
                 return Ok(false);
-            }
-        }
-        // The removals this publication stopped carrying go with the floor it
-        // published, in the transaction that records the publication, so a
-        // publication that never finished reclaims nothing.
-        for ((key1, key2, key3), version) in reclaimed {
-            let at_ms = i64::try_from(version.first_published.at_ms)
-                .map_err(|_| invalid("device removal marker time is out of range"))?;
-            match section {
-                Section::Hypa => {
-                    transaction.execute(
-                        "DELETE FROM hypa_embeddings WHERE cache_key=?1 AND tombstone=1
-                            AND write_clock=?2 AND writer_id=?3
-                            AND first_published_generation=?4 AND first_published_at_ms=?5",
-                        params![key1, version.write_clock.as_str(), version.writer_id,
-                            version.first_published.generation.as_str(), at_ms],
-                    )?;
-                }
-                Section::LocalPlugins => {
-                    transaction.execute(
-                        "DELETE FROM plugin_device_storage
-                            WHERE owner=?1 AND space=?2 AND key=?3 AND tombstone=1
-                              AND write_clock=?4 AND writer_id=?5
-                              AND first_published_generation=?6 AND first_published_at_ms=?7",
-                        params![key1, key2, key3, version.write_clock.as_str(), version.writer_id,
-                            version.first_published.generation.as_str(), at_ms],
-                    )?;
-                }
             }
         }
         let current = sequence(&transaction.query_row(
@@ -1782,27 +1738,7 @@ impl DeviceStore {
             let evidence = evidence?;
             let (key1, key2, key3) = evidence.key;
             match evidence.disposition {
-                SectionPublicationDisposition::Reclaimed { first_published } => {
-                    let at_ms = i64::try_from(first_published.at_ms)
-                        .map_err(|_| invalid("device removal marker time is out of range"))?;
-                    match section {
-                        Section::Hypa => transaction.execute(
-                            "DELETE FROM hypa_embeddings WHERE cache_key=?1 AND tombstone=1
-                                AND write_clock=?2 AND writer_id=?3
-                                AND first_published_generation=?4 AND first_published_at_ms=?5",
-                            params![key1, evidence.version.write_clock.as_str(), evidence.version.writer_id,
-                                first_published.generation.as_str(), at_ms],
-                        )?,
-                        Section::LocalPlugins => transaction.execute(
-                            "DELETE FROM plugin_device_storage
-                                WHERE owner=?1 AND space=?2 AND key=?3 AND tombstone=1
-                                  AND write_clock=?4 AND writer_id=?5
-                                  AND first_published_generation=?6 AND first_published_at_ms=?7",
-                            params![key1, key2, key3, evidence.version.write_clock.as_str(),
-                                evidence.version.writer_id, first_published.generation.as_str(), at_ms],
-                        )?,
-                    };
-                }
+                SectionPublicationDisposition::Reclaimed { .. } => {}
                 SectionPublicationDisposition::Published { first_published: stamp } => {
                     if let Some(stamp) = stamp {
                         if stamp != *first_published {

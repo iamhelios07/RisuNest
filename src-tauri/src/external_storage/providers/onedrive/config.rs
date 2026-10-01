@@ -89,11 +89,12 @@ impl AccountType {
 pub(super) fn role_folder(role: ObjectRole) -> &'static str {
     match role {
         ObjectRole::Descriptor => "descriptors",
+        ObjectRole::Segment => "segments",
         ObjectRole::Pack => "packs",
         ObjectRole::Catalog => "catalogs",
         // A published state and a backup bundle share one collection. The
         // authenticated envelope header, not the path, tells them apart.
-        ObjectRole::SyncState | ObjectRole::BackupBundle => "snapshots",
+        ObjectRole::SyncState | ObjectRole::Snapshot | ObjectRole::BackupBundle => "snapshots",
         ObjectRole::BackupPoint => "points",
         ObjectRole::InventoryPage => "inventory",
         ObjectRole::Lease => "leases",
@@ -102,6 +103,7 @@ pub(super) fn role_folder(role: ObjectRole) -> &'static str {
 
 pub(super) fn collection_folder(collection: Collection) -> &'static str {
     match collection {
+        Collection::Segments => "segments",
         Collection::Snapshots => role_folder(ObjectRole::SyncState),
         Collection::BackupPoints => role_folder(ObjectRole::BackupPoint),
         Collection::InventoryPages => role_folder(ObjectRole::InventoryPage),
@@ -117,6 +119,7 @@ pub(super) fn removable_path(locator: &RemoteLocator) -> Result<String> {
     let unsupported = || ProviderError::new(ErrorKind::Unsupported);
     let (folder, name) = locator.object.split_once('/').ok_or_else(unsupported)?;
     let known = [
+        ObjectRole::Segment,
         ObjectRole::Pack,
         ObjectRole::Catalog,
         ObjectRole::SyncState,
@@ -149,6 +152,7 @@ pub(super) const REPOSITORY_FOLDERS: &[&str] = &[
     "points",
     "inventory",
     "leases",
+    "segments",
 ];
 
 pub(super) struct Settings {

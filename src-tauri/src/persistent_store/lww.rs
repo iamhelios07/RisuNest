@@ -1,0 +1,2168 @@
+use super::{
+    active_generation, commit, current_revision, device_store, PersistentStore, RevisionResult,
+    StoreError, StoreResult, WorkingSetCommit,
+};
+use risunest_sync_wire::{
+    stamp::{issue_stamp, DecimalU64, Stamp},
+    unit::{compare_version, LwwDecision, UnitKey, UnitValue},
+};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
+use uuid::Uuid;
+
+#[path = "lww_classification.rs"]
+mod classification;
+#[path = "lww_projection.rs"]
+mod projection;
+pub(super) use projection::{
+    apply_mutation, capture_device_changes, capture_targets, is_device, preserve_local_root,
+    refresh_orders,
+};
+
+pub(super) const UNIT_SCHEMA: &str = r#"CREATE TABLE lww_units(key TEXT PRIMARY KEY,stamp TEXT NOT NULL,value TEXT NOT NULL,version TEXT NOT NULL,identity TEXT NOT NULL);
+CREATE TABLE lww_outbox(key TEXT PRIMARY KEY,stamp TEXT NOT NULL,value TEXT NOT NULL,version TEXT NOT NULL,identity TEXT NOT NULL,authority TEXT NOT NULL);
+CREATE TABLE lww_retired(key TEXT PRIMARY KEY,stamp TEXT NOT NULL);
+CREATE TABLE lww_publications(key TEXT NOT NULL,authority TEXT NOT NULL,version TEXT NOT NULL,stamp TEXT NOT NULL,identity TEXT NOT NULL,PRIMARY KEY(key,authority));
+CREATE TABLE lww_initialization_scopes(scope TEXT NOT NULL,authority TEXT NOT NULL,PRIMARY KEY(scope,authority));
+CREATE TABLE lww_requests(request_id TEXT PRIMARY KEY,digest TEXT NOT NULL,revision INTEGER NOT NULL);
+CREATE TABLE lww_receive_rows(request_id TEXT NOT NULL,key TEXT NOT NULL,stamp TEXT NOT NULL,value TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('staged','held','deferred','done')),PRIMARY KEY(request_id,key));
+CREATE INDEX lww_receive_status ON lww_receive_rows(status,key);
+CREATE INDEX lww_units_scope ON lww_units(json_extract(key,'$[0]'),json_extract(key,'$[1]'),json_extract(key,'$[2]'),json_extract(key,'$[3]'));
+CREATE INDEX lww_receive_scope ON lww_receive_rows(json_extract(key,'$[0]'),json_extract(key,'$[1]'),json_extract(key,'$[2]'),json_extract(key,'$[3]'));
+"#;
+pub(super) const DEVICE_SCHEMA: &str = r#"CREATE TABLE lww_clock(singleton INTEGER PRIMARY KEY CHECK(singleton=1),issued TEXT,accepted TEXT,binding_authority TEXT NOT NULL);
+CREATE TABLE lww_intents(request_id TEXT PRIMARY KEY,authority TEXT NOT NULL,stamp TEXT NOT NULL,body TEXT NOT NULL,digest TEXT NOT NULL,complete INTEGER NOT NULL CHECK(complete IN (0,1)));
+CREATE TABLE lww_receive(request_id TEXT PRIMARY KEY,authority TEXT NOT NULL,digest TEXT NOT NULL,body TEXT NOT NULL,applied INTEGER NOT NULL CHECK(applied IN (0,1)),finished INTEGER NOT NULL CHECK(finished IN (0,1)));
+CREATE TABLE lww_progress(kind TEXT NOT NULL,writer_id TEXT NOT NULL,cursor TEXT NOT NULL,authority TEXT NOT NULL,PRIMARY KEY(kind,writer_id));
+CREATE TABLE lww_device_context(singleton INTEGER PRIMARY KEY CHECK(singleton=1),stamp TEXT NOT NULL,legacy_clock TEXT NOT NULL);
+CREATE TABLE lww_unpublished_proofs(proof_id TEXT PRIMARY KEY,authority TEXT NOT NULL,entries TEXT NOT NULL);
+"#;
+
+pub(super) fn error(message: impl ToString) -> StoreError {
+    StoreError::Validation {
+        message: message.to_string(),
+    }
+}
+fn wire<T>(result: risunest_sync_wire::Result<T>) -> StoreResult<T> {
+    result.map_err(error)
+}
+pub(super) fn inline(value: &Value) -> StoreResult<UnitValue> {
+    wire(UnitValue::inline(&serde_json::to_vec(value)?))
+}
+pub(super) fn unit_key(parts: &[&str]) -> StoreResult<UnitKey> {
+    wire(UnitKey::new(parts))
+}
+pub(super) fn json_value(value: &UnitValue) -> StoreResult<Option<Value>> {
+    use base64::Engine;
+    match value {
+        UnitValue::Inline { bytes } => Ok(Some(serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(bytes)
+                .map_err(error)?,
+        )?)),
+        UnitValue::Deleted => Ok(None),
+        UnitValue::Object { .. } => Err(error("unit-object-body-required")),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub(crate) enum UnitMutation {
+    Set { key: UnitKey, value: Value },
+    Delete { key: UnitKey },
+}
+impl UnitMutation {
+    pub(super) fn key(&self) -> &UnitKey {
+        match self {
+            Self::Set { key, .. } | Self::Delete { key } => key,
+        }
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MessageLocator {
+    pub character_id: String,
+    pub conversation_id: String,
+    pub start: Option<i64>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Header {
+    pub binding_authority: DecimalU64,
+    pub request_id: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Change {
+    pub key: UnitKey,
+    pub stamp: Stamp,
+    pub value: UnitValue,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OutboxEntry {
+    pub key: UnitKey,
+    pub stamp: Stamp,
+    pub value: UnitValue,
+    pub version: String,
+    pub target_authority: DecimalU64,
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OutboxPage {
+    pub revision: i64,
+    pub entries: Vec<OutboxEntry>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AckEntry {
+    pub key: UnitKey,
+    pub version: String,
+    pub stamp: Stamp,
+    pub value_identity: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Progress {
+    pub kind: String,
+    pub cursor: DecimalU64,
+    pub writer_id: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StageReceive {
+    #[serde(flatten)]
+    pub header: Header,
+    pub changes: Vec<Change>,
+    pub progress: Progress,
+    pub admitted_time_upper_ms: DecimalU64,
+}
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ApplyReceive {
+    #[serde(flatten)]
+    pub header: Header,
+    #[serde(default)]
+    pub generating: Vec<MessageLocator>,
+}
+#[derive(Debug, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ApplyResult {
+    pub revision: i64,
+    pub affected_keys: Vec<UnitKey>,
+    pub held_keys: Vec<UnitKey>,
+    pub deferred_keys: Vec<UnitKey>,
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ClockState {
+    pub writer_id: String,
+    pub issued: Option<Stamp>,
+    pub accepted: Option<Stamp>,
+    pub binding_authority: DecimalU64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum Intent {
+    Commit {
+        commit: WorkingSetCommit,
+        aliases: Vec<super::AssetAlias>,
+    },
+    Replacement {
+        staging_id: String,
+        changes: Vec<(UnitKey, UnitValue)>,
+        source_units: Option<BTreeMap<UnitKey, UnitValue>>,
+    },
+    Target {
+        staging_id: String,
+        changes: Vec<Change>,
+    },
+    Repair {
+        entries: Vec<OutboxEntry>,
+    },
+    Archive {
+        character_id: String,
+        expected_revision: i64,
+        at_ms: i64,
+        restore: bool,
+        incoming: Option<Change>,
+    },
+    Switch {
+        change: super::sync_selection::BindingSelectionChange,
+        new_authority: DecimalU64,
+    },
+}
+
+pub(super) fn authority(db: &Connection) -> StoreResult<DecimalU64> {
+    let value: String = db.query_row(
+        "SELECT binding_authority FROM lww_clock WHERE singleton=1",
+        [],
+        |r| r.get(0),
+    )?;
+    wire(value.try_into())
+}
+fn verify(db: &Connection, expected: DecimalU64) -> StoreResult<()> {
+    if authority(db)? != expected {
+        return Err(error("binding-authority-changed"));
+    }
+    Ok(())
+}
+fn validate_header(header: &Header) -> StoreResult<()> {
+    if header.request_id.is_empty() {
+        return Err(error("request-id-required"));
+    }
+    Ok(())
+}
+fn clock_state(db: &Connection) -> StoreResult<ClockState> {
+    let (writer_id, issued, accepted, binding): (String, Option<String>, Option<String>, String) = db.query_row(
+        "SELECT writer_id,issued,accepted,binding_authority FROM device_meta,lww_clock WHERE device_meta.singleton=1 AND lww_clock.singleton=1", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+    Ok(ClockState {
+        writer_id,
+        issued: issued.map(|s| serde_json::from_str(&s)).transpose()?,
+        accepted: accepted.map(|s| serde_json::from_str(&s)).transpose()?,
+        binding_authority: wire(binding.try_into())?,
+    })
+}
+pub(super) fn reserve_stamp(db: &Connection) -> StoreResult<Stamp> {
+    let state = clock_state(db)?;
+    let stamp = wire(issue_stamp(
+        device_store::now_ms()?.try_into().map_err(error)?,
+        &state.writer_id,
+        state.issued.as_ref(),
+        state.accepted.as_ref(),
+    ))?;
+    db.execute(
+        "UPDATE lww_clock SET issued=?1 WHERE singleton=1",
+        [serde_json::to_string(&stamp)?],
+    )?;
+    Ok(stamp)
+}
+fn observe(db: &Connection, stamp: &Stamp) -> StoreResult<()> {
+    let state = clock_state(db)?;
+    if state.accepted.as_ref().is_none_or(|old| old < stamp) {
+        db.execute(
+            "UPDATE lww_clock SET accepted=?1 WHERE singleton=1",
+            [serde_json::to_string(stamp)?],
+        )?;
+    }
+    Ok(())
+}
+pub(super) fn read_unit(db: &Connection, key: &UnitKey) -> StoreResult<Option<(Stamp, UnitValue)>> {
+    let row: Option<(String, String)> = db
+        .query_row(
+            "SELECT stamp,value FROM lww_units WHERE key=?1",
+            [key.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    row.map(|(stamp, value)| Ok((serde_json::from_str(&stamp)?, serde_json::from_str(&value)?)))
+        .transpose()
+}
+pub(super) fn put_unit(
+    db: &Connection,
+    key: &UnitKey,
+    stamp: &Stamp,
+    value: &UnitValue,
+    version: &str,
+    publish: Option<DecimalU64>,
+) -> StoreResult<()> {
+    let identity = value_identity(value)?;
+    let stamp = serde_json::to_string(stamp)?;
+    let value = serde_json::to_string(value)?;
+    db.execute("INSERT INTO lww_units VALUES(?1,?2,?3,?4,?5) ON CONFLICT(key) DO UPDATE SET stamp=excluded.stamp,value=excluded.value,version=excluded.version,identity=excluded.identity",params![key.as_str(),stamp,value,version,identity])?;
+    if let Some(authority) = publish {
+        db.execute("INSERT INTO lww_outbox VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(key) DO UPDATE SET stamp=excluded.stamp,value=excluded.value,version=excluded.version,identity=excluded.identity,authority=excluded.authority",params![key.as_str(),stamp,value,version,identity,authority.0.to_string()])?;
+    } else {
+        db.execute("DELETE FROM lww_outbox WHERE key=?1", [key.as_str()])?;
+    }
+    if key.components()[0] == "exists"
+        && matches!(
+            serde_json::from_str::<UnitValue>(&value)?,
+            UnitValue::Deleted
+        )
+    {
+        db.execute(
+            "INSERT OR IGNORE INTO lww_retired VALUES(?1,?2)",
+            params![key.as_str(), stamp],
+        )?;
+        suppress_retired(db, key)?;
+    }
+    Ok(())
+}
+fn parent_keys(key: &UnitKey) -> StoreResult<Vec<UnitKey>> {
+    let c = key.components();
+    let p: Vec<&str> = c.iter().map(String::as_str).collect();
+    match p[0] {
+        "character" | "group-members" | "archive" => {
+            Ok(vec![unit_key(&["exists", "character", p[1]])?])
+        }
+        "conversation" | "messages" => Ok(vec![
+            unit_key(&["exists", "character", p[1]])?,
+            unit_key(&["exists", "conversation", p[1], p[2]])?,
+        ]),
+        "exists" if p[1] == "conversation" => Ok(vec![unit_key(&["exists", "character", p[2]])?]),
+        "preset" | "persona" => Ok(vec![unit_key(&["exists", p[0], p[1]])?]),
+        "record" if p[1] != "plugins" => Ok(vec![unit_key(&["exists", p[1], p[2]])?]),
+        "order" if p[1] == "conversations" => Ok(vec![unit_key(&["exists", "character", p[2]])?]),
+        _ => Ok(vec![]),
+    }
+}
+fn is_retired(db: &Connection, key: &UnitKey) -> StoreResult<bool> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM lww_retired WHERE key=?1)",
+        [key.as_str()],
+        |r| r.get(0),
+    )?)
+}
+pub(super) fn parent_status(db: &Connection, key: &UnitKey) -> StoreResult<&'static str> {
+    if is_retired(db, key)? {
+        return Ok("retired");
+    }
+    let mut missing = false;
+    let archived_hold = key.components()[0] != "archive";
+    for parent in parent_keys(key)? {
+        if is_retired(db, &parent)? {
+            return Ok("retired");
+        }
+        if read_unit(db, &parent)?.is_none() {
+            missing = true;
+        }
+        if archived_hold && parent.components()[1] == "character" {
+            let generation = active_generation(db)?;
+            let archived:Option<bool>=db.query_row("SELECT archived_object IS NOT NULL FROM characters WHERE generation=?1 AND character_id=?2",params![generation,parent.components()[2]],|r|r.get(0)).optional()?;
+            if archived == Some(true) {
+                missing = true;
+            }
+        }
+    }
+    Ok(if missing { "held" } else { "ready" })
+}
+fn suppress_retired(db: &Connection, parent: &UnitKey) -> StoreResult<()> {
+    let p = parent.components();
+    let (condition,first,second)=match p[1].as_str(){
+        "character"=>("((json_extract(key,'$[0]') IN ('character','group-members','archive','conversation','messages') AND json_extract(key,'$[1]')=?1) OR (json_extract(key,'$[0]')='exists' AND json_extract(key,'$[1]')='conversation' AND json_extract(key,'$[2]')=?1) OR (json_extract(key,'$[0]')='order' AND json_extract(key,'$[1]')='conversations' AND json_extract(key,'$[2]')=?1))",p[2].as_str(),None),
+        "conversation"=>("json_extract(key,'$[0]') IN ('conversation','messages') AND json_extract(key,'$[1]')=?1 AND json_extract(key,'$[2]')=?2",p[2].as_str(),Some(p[3].as_str())),
+        "preset"|"persona"=>("json_extract(key,'$[0]')=?2 AND json_extract(key,'$[1]')=?1",p[2].as_str(),Some(p[1].as_str())),
+        other=>("json_extract(key,'$[0]')='record' AND json_extract(key,'$[1]')=?2 AND json_extract(key,'$[2]')=?1",p[2].as_str(),Some(other)),
+    };
+    for (table, action) in [
+        ("lww_outbox", "DELETE FROM lww_outbox"),
+        (
+            "lww_receive_rows",
+            "UPDATE lww_receive_rows SET status='done'",
+        ),
+    ] {
+        let _ = table;
+        let sql = format!("{action} WHERE {condition}");
+        if second.is_some() {
+            db.execute(&sql, params![first, second])?;
+        } else {
+            db.execute(&sql, [first])?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! { static WORK: std::cell::Cell<(u64,u64)> = const { std::cell::Cell::new((0,0)) }; }
+#[cfg(test)]
+pub(crate) fn reset_work_metrics() {
+    WORK.with(|v| v.set((0, 0)));
+}
+#[cfg(test)]
+pub(crate) fn take_work_metrics() -> (u64, u64) {
+    WORK.with(|v| v.replace((0, 0)))
+}
+fn count_work(_value: &UnitValue) {
+    #[cfg(test)]
+    WORK.with(|v| {
+        let (u, b) = v.get();
+        v.set((u + 1, b));
+    });
+}
+fn value_identity(value: &UnitValue) -> StoreResult<String> {
+    #[cfg(test)]
+    WORK.with(|v| {
+        let (u, b) = v.get();
+        let size = risunest_sync_wire::canonical::encode(value)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        v.set((u, b + size as u64));
+    });
+    wire(value.identity())
+}
+pub(super) fn record_changes(
+    tx: &Transaction<'_>,
+    before: BTreeMap<UnitKey, UnitValue>,
+    after: BTreeMap<UnitKey, UnitValue>,
+    stamp: &Stamp,
+    authority: DecimalU64,
+    version: &str,
+) -> StoreResult<()> {
+    let keys: BTreeSet<_> = before.keys().chain(after.keys()).cloned().collect();
+    for key in keys {
+        let value = after.get(&key).cloned().unwrap_or(UnitValue::Deleted);
+        count_work(&value);
+        if parent_status(tx, &key)? == "retired" {
+            continue;
+        }
+        let prior = read_unit(tx, &key)?
+            .map(|(_, v)| v)
+            .or_else(|| before.get(&key).cloned())
+            .unwrap_or(UnitValue::Deleted);
+        if value_identity(&prior)? == value_identity(&value)? {
+            continue;
+        }
+        put_unit(tx, &key, stamp, &value, version, Some(authority))?;
+        ensure_publishable_parents(tx, &key, authority)?;
+    }
+    Ok(())
+}
+
+impl PersistentStore {
+    pub(crate) fn lww_object_body(&self, hash: &str) -> StoreResult<Option<Vec<u8>>> {
+        if let Some(body) = super::message_pages::object_body(&self.connection, hash)? {
+            return Ok(Some(body));
+        }
+        use std::io::Read;
+        let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
+        let Some(mut file) = cas.open_object(hash)? else {
+            return Ok(None);
+        };
+        let mut body = Vec::new();
+        file.read_to_end(&mut body)?;
+        if risunest_sync_wire::hash(&body) != hash {
+            return Err(error("object-hash-mismatch"));
+        }
+        Ok(Some(body))
+    }
+    pub(crate) fn lww_put_object(&self, hash: &str, body: &[u8]) -> StoreResult<()> {
+        super::message_pages::put_object(&self.connection, hash, body)
+    }
+    pub(crate) fn lww_put_managed_object(&mut self, hash: &str, body: &[u8]) -> StoreResult<()> {
+        if risunest_sync_wire::hash(body) != hash {
+            return Err(error("object-hash-mismatch"));
+        }
+        let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
+        let prepared = cas.prepare_bytes(body)?;
+        super::AssetObjectCatalog::new(&mut self.connection).register(
+            &[super::asset_object_catalog::AssetObjectRegistration {
+                object_hash: prepared.content_hash,
+                byte_size: prepared.byte_size,
+            }],
+            device_store::now_ms()?,
+        )
+    }
+    pub(crate) fn lww_receive_progress(&self, expected: DecimalU64) -> StoreResult<Vec<Progress>> {
+        verify(self.device_store()?.connection(), expected)?;
+        let db = self.device_store()?.connection();
+        let mut s=db.prepare("SELECT kind,writer_id,cursor FROM lww_progress WHERE authority=?1 ORDER BY kind,writer_id")?;
+        let rows = s.query_map([expected.0.to_string()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (kind, writer, cursor) = row?;
+            out.push(Progress {
+                kind,
+                cursor: wire(cursor.try_into())?,
+                writer_id: if writer.is_empty() {
+                    None
+                } else {
+                    Some(writer)
+                },
+            });
+        }
+        Ok(out)
+    }
+    pub(crate) fn lww_binding_authority(&self) -> StoreResult<DecimalU64> {
+        authority(self.device_store()?.connection())
+    }
+    pub(crate) fn lww_clock_state(&self) -> StoreResult<ClockState> {
+        clock_state(self.device_store()?.connection())
+    }
+    fn reserve_intent(&mut self, header: &Header, intent: &Intent) -> StoreResult<(Stamp, String)> {
+        validate_header(header)?;
+        let body = serde_json::to_string(intent)?;
+        let digest = risunest_sync_wire::hash(body.as_bytes());
+        let tx = self.device_store_mut()?.transaction()?;
+        verify(&tx, header.binding_authority)?;
+        let previous: Option<(String, String)> = tx
+            .query_row(
+                "SELECT stamp,digest FROM lww_intents WHERE request_id=?1",
+                [&header.request_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let stamp = if let Some((stamp, old)) = previous {
+            if old != digest {
+                return Err(error("request-id-integrity"));
+            }
+            serde_json::from_str(&stamp)?
+        } else {
+            let stamp = reserve_stamp(&tx)?;
+            tx.execute(
+                "INSERT INTO lww_intents VALUES(?1,?2,?3,?4,?5,0)",
+                params![
+                    header.request_id,
+                    header.binding_authority.0.to_string(),
+                    serde_json::to_string(&stamp)?,
+                    body,
+                    digest
+                ],
+            )?;
+            stamp
+        };
+        tx.commit()?;
+        Ok((stamp, digest))
+    }
+    fn complete_intent(&mut self, header: &Header) -> StoreResult<()> {
+        let tx = self.device_store_mut()?.transaction()?;
+        verify(&tx, header.binding_authority)?;
+        tx.execute(
+            "UPDATE lww_intents SET complete=1 WHERE request_id=?1",
+            [&header.request_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+    fn completed_intent(
+        &self,
+        header: &Header,
+        intent: &Intent,
+    ) -> StoreResult<Option<RevisionResult>> {
+        let digest = risunest_sync_wire::hash(serde_json::to_string(intent)?.as_bytes());
+        let row: Option<(String, String, bool)> = self
+            .device_store()?
+            .connection()
+            .query_row(
+                "SELECT authority,digest,complete FROM lww_intents WHERE request_id=?1",
+                [&header.request_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        if let Some((authority, old, complete)) = row {
+            if authority != header.binding_authority.0.to_string() || old != digest {
+                return Err(error("request-id-integrity"));
+            }
+            if complete {
+                let revision = self.connection.query_row(
+                    "SELECT revision FROM lww_requests WHERE request_id=?1",
+                    [&header.request_id],
+                    |r| r.get(0),
+                )?;
+                return Ok(Some(RevisionResult { revision }));
+            }
+        }
+        Ok(None)
+    }
+    pub(super) fn lww_commit(
+        &mut self,
+        input: &WorkingSetCommit,
+        aliases: &[super::AssetAlias],
+    ) -> StoreResult<RevisionResult> {
+        self.lww_recover_intents()?;
+        let header = Header {
+            binding_authority: input
+                .binding_authority
+                .unwrap_or(self.lww_binding_authority()?),
+            request_id: input
+                .request_id
+                .clone()
+                .unwrap_or_else(|| Uuid::new_v4().to_string()),
+        };
+        let intent = Intent::Commit {
+            commit: input.clone(),
+            aliases: aliases.to_vec(),
+        };
+        let (stamp, digest) = self.reserve_intent(&header, &intent)?;
+        let result = commit::commit_lww(
+            &mut self.connection,
+            input,
+            aliases,
+            &header,
+            &stamp,
+            &digest,
+        );
+        if result.is_ok()
+            || matches!(
+                result,
+                Err(StoreError::RevisionConflict { .. }) | Err(StoreError::Validation { .. })
+            )
+        {
+            self.complete_intent(&header)?;
+        }
+        result
+    }
+    pub(crate) fn lww_recover_intents(&mut self) -> StoreResult<()> {
+        let authority = self.lww_binding_authority()?;
+        let rows: Vec<(String, String, String, String, String)> = {
+            let db = self.device_store()?.connection();
+            let mut s=db.prepare("SELECT request_id,authority,stamp,body,digest FROM lww_intents WHERE complete=0 ORDER BY rowid")?;
+            let v = s
+                .query_map([], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                })?
+                .collect::<Result<_, _>>()?;
+            v
+        };
+        for (request_id, expected, stamp, body, digest) in rows {
+            let header = Header {
+                binding_authority: wire(expected.try_into())?,
+                request_id,
+            };
+            let stamp = serde_json::from_str(&stamp)?;
+            let intent = serde_json::from_str::<Intent>(&body)?;
+            if let Intent::Switch {
+                change,
+                new_authority,
+            } = intent
+            {
+                self.finish_lww_switch(&header, &change, new_authority, &digest)?;
+                continue;
+            }
+            if header.binding_authority != authority {
+                return Err(error("unfinished-intent-authority-changed"));
+            }
+            match intent {
+                Intent::Commit {
+                    commit: input,
+                    aliases,
+                } => {
+                    commit::commit_lww(
+                        &mut self.connection,
+                        &input,
+                        &aliases,
+                        &header,
+                        &stamp,
+                        &digest,
+                    )?;
+                }
+                Intent::Replacement {
+                    staging_id,
+                    changes,
+                    ..
+                } => {
+                    self.finish_lww_replacement(
+                        &header,
+                        &staging_id,
+                        &changes,
+                        &stamp,
+                        &digest,
+                        false,
+                        &[],
+                    )?;
+                }
+                Intent::Target {
+                    staging_id,
+                    changes,
+                } => {
+                    self.finish_lww_replacement(
+                        &header,
+                        &staging_id,
+                        &[],
+                        &stamp,
+                        &digest,
+                        true,
+                        &changes,
+                    )?;
+                }
+                Intent::Archive {
+                    character_id,
+                    expected_revision,
+                    at_ms,
+                    restore,
+                    incoming,
+                } => {
+                    self.finish_lww_archive(
+                        &header,
+                        &stamp,
+                        &digest,
+                        &character_id,
+                        expected_revision,
+                        at_ms,
+                        restore,
+                        incoming.as_ref(),
+                        &|| false,
+                    )?;
+                }
+                Intent::Repair { entries } => {
+                    self.finish_lww_repair(&header, &stamp, &entries)?;
+                }
+                Intent::Switch { .. } => unreachable!(),
+            }
+            self.complete_intent(&header)?;
+        }
+        Ok(())
+    }
+    pub(super) fn lww_archive(
+        &mut self,
+        char_id: &str,
+        expected_revision: i64,
+        at_ms: i64,
+        restore: bool,
+        cancel: &dyn Fn() -> bool,
+    ) -> StoreResult<RevisionResult> {
+        self.lww_recover_intents()?;
+        let header = Header {
+            binding_authority: self.lww_binding_authority()?,
+            request_id: Uuid::new_v4().to_string(),
+        };
+        let intent = Intent::Archive {
+            character_id: char_id.into(),
+            expected_revision,
+            at_ms,
+            restore,
+            incoming: None,
+        };
+        let (stamp, digest) = self.reserve_intent(&header, &intent)?;
+        let result = self.finish_lww_archive(
+            &header,
+            &stamp,
+            &digest,
+            char_id,
+            expected_revision,
+            at_ms,
+            restore,
+            None,
+            cancel,
+        );
+        if result.as_ref().is_err_and(|error| {
+            error
+                .to_string()
+                .contains("character archive operation cancelled")
+        }) || result.is_ok()
+            || matches!(
+                result,
+                Err(StoreError::Validation { .. }) | Err(StoreError::RevisionConflict { .. })
+            )
+        {
+            self.complete_intent(&header)?;
+        }
+        result
+    }
+    fn finish_lww_archive(
+        &mut self,
+        header: &Header,
+        stamp: &Stamp,
+        digest: &str,
+        char_id: &str,
+        revision: i64,
+        at_ms: i64,
+        restore: bool,
+        incoming: Option<&Change>,
+        cancel: &dyn Fn() -> bool,
+    ) -> StoreResult<RevisionResult> {
+        let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
+        let context = ArchiveContext {
+            header,
+            stamp: incoming.map(|c| &c.stamp).unwrap_or(stamp),
+            digest,
+            incoming,
+        };
+        let result = if restore {
+            super::archive::restore_character_with_cancellation_lww(
+                &mut self.connection,
+                &cas,
+                char_id,
+                revision,
+                cancel,
+                Some(&context),
+            )
+        } else {
+            super::archive::archive_character_with_cancellation_lww(
+                &mut self.connection,
+                &cas,
+                char_id,
+                revision,
+                at_ms,
+                cancel,
+                Some(&context),
+            )
+        };
+        if result.is_ok() {
+            if let Some(incoming) = incoming {
+                let tx = self.device_store_mut()?.transaction()?;
+                observe(&tx, &incoming.stamp)?;
+                tx.commit()?;
+            }
+        }
+        result
+    }
+    pub(crate) fn lww_switch_target(
+        &mut self,
+        header: &Header,
+        change: &super::sync_selection::BindingSelectionChange,
+    ) -> StoreResult<DecimalU64> {
+        let new_authority = DecimalU64(
+            header
+                .binding_authority
+                .0
+                .checked_add(1)
+                .ok_or_else(|| error("binding-authority-exhausted"))?,
+        );
+        let intent = Intent::Switch {
+            change: change.clone(),
+            new_authority,
+        };
+        if self.completed_intent(header, &intent)?.is_some() {
+            return Ok(new_authority);
+        }
+        self.lww_recover_intents()?;
+        if self.completed_intent(header, &intent)?.is_some() {
+            return Ok(new_authority);
+        }
+        let (_, digest) = self.reserve_intent(header, &intent)?;
+        self.finish_lww_switch(header, change, new_authority, &digest)?;
+        Ok(new_authority)
+    }
+    fn finish_lww_switch(
+        &mut self,
+        header: &Header,
+        change: &super::sync_selection::BindingSelectionChange,
+        new: DecimalU64,
+        digest: &str,
+    ) -> StoreResult<()> {
+        let current = self.lww_binding_authority()?;
+        if current != header.binding_authority && current != new {
+            return Err(error("binding-authority-changed"));
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        super::sync_selection::apply_binding_selection(&tx, change)?;
+        tx.execute("DELETE FROM lww_outbox", [])?;
+        tx.execute("DELETE FROM lww_receive_rows", [])?;
+        tx.execute(
+            "INSERT OR IGNORE INTO lww_requests VALUES(?1,?2,?3)",
+            params![header.request_id, digest, current_revision(&tx)?],
+        )?;
+        tx.commit()?;
+        let tx = self.device_store_mut()?.transaction()?;
+        let active = authority(&tx)?;
+        if active != header.binding_authority && active != new {
+            return Err(error("binding-authority-changed"));
+        }
+        tx.execute(
+            "UPDATE lww_clock SET binding_authority=?1 WHERE singleton=1",
+            [new.0.to_string()],
+        )?;
+        tx.execute("DELETE FROM lww_outbox", [])?;
+        tx.execute("DELETE FROM lww_receive", [])?;
+        tx.execute("DELETE FROM lww_receive_rows", [])?;
+        tx.execute("DELETE FROM lww_progress", [])?;
+        tx.execute("DELETE FROM lww_unpublished_proofs", [])?;
+        tx.execute(
+            "UPDATE lww_intents SET complete=1 WHERE request_id=?1",
+            [&header.request_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub(crate) fn lww_binding_extra_content(&self) -> StoreResult<(u64, Value)> {
+        let mut count = 0u64;
+        let mut vars = serde_json::Map::new();
+        let mut s = self.connection.prepare("SELECT key,value FROM lww_units")?;
+        let rows = s.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        for row in rows {
+            let (key, value) = row?;
+            let key: UnitKey = wire(key.try_into())?;
+            let value: UnitValue = serde_json::from_str(&value)?;
+            if matches!(value, UnitValue::Deleted) {
+                continue;
+            }
+            let p = key.components();
+            if matches!(p[0].as_str(), "toggle" | "variable") {
+                if let Some(value) = json_value(&value)? {
+                    vars.insert(p[1].clone(), value);
+                }
+            }
+            if !projection::known(&key) && !projection::is_device(&key) {
+                count += 1;
+            }
+        }
+        Ok((count, Value::Object(vars)))
+    }
+    pub(crate) fn lww_read_outbox(
+        &self,
+        expected: DecimalU64,
+        limit: usize,
+    ) -> StoreResult<OutboxPage> {
+        self.lww_read_outbox_generating(expected, limit, &[])
+    }
+    pub(crate) fn lww_read_outbox_generating(
+        &self,
+        expected: DecimalU64,
+        limit: usize,
+        generating: &[MessageLocator],
+    ) -> StoreResult<OutboxPage> {
+        verify(self.device_store()?.connection(), expected)?;
+        let mut entries = Vec::new();
+        for db in [&self.connection, self.device_store()?.connection()] {
+            let mut s=db.prepare("SELECT key,stamp,value,version,authority FROM lww_outbox o WHERE authority=?1 AND (?3 OR json_extract(o.key,'$[0]')<>'plugin-local') AND (json_extract(o.key,'$[0]')<>'messages' OR NOT EXISTS(SELECT 1 FROM json_each(?4) g WHERE json_extract(g.value,'$.characterId')=json_extract(o.key,'$[1]') AND json_extract(g.value,'$.conversationId')=json_extract(o.key,'$[2]'))) ORDER BY key LIMIT ?2")?;
+            let rows = s.query_map(
+                params![
+                    expected.0.to_string(),
+                    i64::try_from(limit).map_err(error)?,
+                    projection::plugin_participates(self.device_store()?.connection())?,
+                    serde_json::to_string(generating)?
+                ],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                    ))
+                },
+            )?;
+            for row in rows {
+                let (key, stamp, value, version, authority) = row?;
+                let key: UnitKey = wire(key.try_into())?;
+                if key.components()[0] == "plugin-local"
+                    && !projection::plugin_participates(self.device_store()?.connection())?
+                {
+                    continue;
+                }
+                entries.push(OutboxEntry {
+                    key,
+                    stamp: serde_json::from_str(&stamp)?,
+                    value: serde_json::from_str(&value)?,
+                    version,
+                    target_authority: wire(authority.try_into())?,
+                });
+            }
+        }
+        entries.sort_by(|a, b| a.key.cmp(&b.key));
+        entries.truncate(limit);
+        Ok(OutboxPage {
+            revision: self.revision()?,
+            entries,
+        })
+    }
+    pub(crate) fn lww_ack_outbox(
+        &mut self,
+        header: &Header,
+        entries: &[AckEntry],
+    ) -> StoreResult<()> {
+        validate_header(header)?;
+        verify(self.device_store()?.connection(), header.binding_authority)?;
+        for db in [
+            &mut self.connection,
+            &mut self.device_store.as_mut().map_err(|e| error(e))?.connection,
+        ] {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            for entry in entries {
+                tx.execute("DELETE FROM lww_outbox WHERE key=?1 AND version=?2 AND stamp=?3 AND identity=?4 AND authority=?5",params![entry.key.as_str(),entry.version,serde_json::to_string(&entry.stamp)?,entry.value_identity,header.binding_authority.0.to_string()])?;
+                witness_exact(
+                    &tx,
+                    &entry.key,
+                    header.binding_authority,
+                    &entry.version,
+                    &entry.stamp,
+                    &entry.value_identity,
+                )?;
+            }
+            tx.commit()?;
+        }
+        let tx = self.device_store_mut()?.transaction()?;
+        verify(&tx, header.binding_authority)?;
+        for entry in entries {
+            observe(&tx, &entry.stamp)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    pub(crate) fn lww_stage_receive(&mut self, request: &StageReceive) -> StoreResult<()> {
+        validate_header(&request.header)?;
+        verify(
+            self.device_store()?.connection(),
+            request.header.binding_authority,
+        )?;
+        if !matches!(request.progress.kind.as_str(), "server" | "external") {
+            return Err(error("receive-progress-kind"));
+        }
+        if request.progress.kind == "external" {
+            wire(risunest_sync_wire::stamp::validate_writer_id(
+                request
+                    .progress
+                    .writer_id
+                    .as_deref()
+                    .ok_or_else(|| error("receive-writer-required"))?,
+            ))?;
+        }
+        let mut keys = BTreeSet::new();
+        for change in &request.changes {
+            wire(change.stamp.validate())?;
+            wire(change.value.validate())?;
+            if !keys.insert(&change.key) {
+                return Err(error("duplicate-receive-key"));
+            }
+            if change.stamp.physical_ms > request.admitted_time_upper_ms {
+                return Err(error("incoming-clock-skew"));
+            }
+            if let Some((stamp, value)) = read_unit(
+                if projection::is_device(&change.key) {
+                    self.device_store()?.connection()
+                } else {
+                    &self.connection
+                },
+                &change.key,
+            )? {
+                wire(compare_version(
+                    &stamp,
+                    &value,
+                    &change.stamp,
+                    &change.value,
+                ))?;
+            }
+            projection::validate_received(&self.connection, &change.key, &change.value)?;
+        }
+        let body = serde_json::to_string(request)?;
+        let digest = risunest_sync_wire::hash(body.as_bytes());
+        let tx = self.device_store_mut()?.transaction()?;
+        verify(&tx, request.header.binding_authority)?;
+        let old: Option<String> = tx
+            .query_row(
+                "SELECT digest FROM lww_receive WHERE request_id=?1",
+                [&request.header.request_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if old.as_ref().is_some_and(|old| old != &digest) {
+            return Err(error("request-id-integrity"));
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO lww_receive VALUES(?1,?2,?3,?4,0,0)",
+            params![
+                request.header.request_id,
+                request.header.binding_authority.0.to_string(),
+                digest,
+                body
+            ],
+        )?;
+        tx.commit()?;
+        self.stage_receive_rows(request)?;
+        Ok(())
+    }
+    fn stage_receive_rows(&mut self, request: &StageReceive) -> StoreResult<()> {
+        for db in [
+            &mut self.connection,
+            &mut self.device_store.as_mut().map_err(|e| error(e))?.connection,
+        ] {
+            let device = db
+                .path()
+                .is_some_and(|p| p.ends_with(device_store::DEVICE_DATABASE_FILE));
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            for change in &request.changes {
+                if projection::is_device(&change.key) != device {
+                    continue;
+                }
+                tx.execute(
+                    "INSERT OR IGNORE INTO lww_receive_rows VALUES(?1,?2,?3,?4,'staged')",
+                    params![
+                        request.header.request_id,
+                        change.key.as_str(),
+                        serde_json::to_string(&change.stamp)?,
+                        serde_json::to_string(&change.value)?
+                    ],
+                )?;
+            }
+            tx.commit()?;
+        }
+        Ok(())
+    }
+    pub(crate) fn lww_apply_receive(&mut self, request: &ApplyReceive) -> StoreResult<ApplyResult> {
+        verify(
+            self.device_store()?.connection(),
+            request.header.binding_authority,
+        )?;
+        let (body, finished): (String, bool) = self.device_store()?.connection().query_row(
+            "SELECT body,finished FROM lww_receive WHERE request_id=?1 AND authority=?2",
+            params![
+                request.header.request_id,
+                request.header.binding_authority.0.to_string()
+            ],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let staged: StageReceive = serde_json::from_str(&body)?;
+        if finished {
+            return Ok(ApplyResult {
+                revision: self.revision()?,
+                ..Default::default()
+            });
+        }
+        self.stage_receive_rows(&staged)?;
+        let archived = self.restore_incoming_archives(&staged)?;
+        let mut result = self.apply_receive_rows(&request.generating, false)?;
+        result.affected_keys.extend(archived);
+        let tx = self.device_store_mut()?.transaction()?;
+        verify(&tx, request.header.binding_authority)?;
+        for change in staged.changes {
+            observe(&tx, &change.stamp)?;
+        }
+        tx.execute(
+            "UPDATE lww_receive SET applied=1 WHERE request_id=?1",
+            [&request.header.request_id],
+        )?;
+        tx.commit()?;
+        if finished {
+            result.revision = self.revision()?;
+        }
+        Ok(result)
+    }
+    fn restore_incoming_archives(&mut self, staged: &StageReceive) -> StoreResult<Vec<UnitKey>> {
+        self.lww_recover_intents()?;
+        let mut affected = Vec::new();
+        for change in &staged.changes {
+            let p = change.key.components();
+            if p[0] != "archive" || parent_status(&self.connection, &change.key)? != "ready" {
+                continue;
+            }
+            if let Some((stamp, value)) = read_unit(&self.connection, &change.key)? {
+                if wire(compare_version(
+                    &stamp,
+                    &value,
+                    &change.stamp,
+                    &change.value,
+                ))? != LwwDecision::ApplyRemote
+                {
+                    continue;
+                }
+            }
+            let generation = active_generation(&self.connection)?;
+            let archived =
+                super::archive::read_archived_object(&self.connection, &generation, &p[1])?;
+            let restore = matches!(change.value, UnitValue::Deleted);
+            if restore == archived.is_none() {
+                continue;
+            }
+            if let Some(archived) = archived {
+                let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
+                if cas.open_object(&archived.object_hash)?.is_none() {
+                    return Err(error("archive-object-missing"));
+                }
+            }
+            let header = Header {
+                binding_authority: staged.header.binding_authority,
+                request_id: format!(
+                    "archive-transition:{}:{}",
+                    staged.header.request_id,
+                    risunest_sync_wire::hash(change.key.as_str().as_bytes())
+                ),
+            };
+            let expected_revision = self.revision()?;
+            let at_ms = if restore {
+                0
+            } else {
+                projection::archive_metadata(&self.connection, &change.value)?.archived_at
+            };
+            let intent = Intent::Archive {
+                character_id: p[1].clone(),
+                expected_revision,
+                at_ms,
+                restore,
+                incoming: Some(change.clone()),
+            };
+            let (stamp, digest) = self.reserve_intent(&header, &intent)?;
+            self.finish_lww_archive(
+                &header,
+                &stamp,
+                &digest,
+                &p[1],
+                expected_revision,
+                at_ms,
+                restore,
+                Some(change),
+                &|| false,
+            )?;
+            self.complete_intent(&header)?;
+            affected.push(change.key.clone());
+        }
+        Ok(affected)
+    }
+
+    fn apply_receive_rows(
+        &mut self,
+        generating: &[MessageLocator],
+        drain: bool,
+    ) -> StoreResult<ApplyResult> {
+        let current_authority = self.lww_binding_authority()?;
+        let mut result = ApplyResult::default();
+        for db in [
+            &mut self.connection,
+            &mut self.device_store.as_mut().map_err(|e| error(e))?.connection,
+        ] {
+            let device = db
+                .path()
+                .is_some_and(|p| p.ends_with(device_store::DEVICE_DATABASE_FILE));
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let generation = if device {
+                String::new()
+            } else {
+                active_generation(&tx)?
+            };
+            let mut changes: Vec<(String, Change)> = {
+                let mut s=tx.prepare(if drain {"SELECT request_id,key,stamp,value FROM lww_receive_rows WHERE status<>'done' ORDER BY key"}else{"SELECT request_id,key,stamp,value FROM lww_receive_rows WHERE status IN ('staged','held') ORDER BY key"})?;
+                let rows = s.query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                    ))
+                })?;
+                let mut v = Vec::new();
+                for row in rows {
+                    let (id, key, stamp, value) = row?;
+                    v.push((
+                        id,
+                        Change {
+                            key: wire(key.try_into())?,
+                            stamp: serde_json::from_str(&stamp)?,
+                            value: serde_json::from_str(&value)?,
+                        },
+                    ));
+                }
+                v
+            };
+            changes.sort_by_key(|(_, c)| {
+                if c.key.components()[0] == "exists" {
+                    0
+                } else {
+                    1
+                }
+            });
+            let revision = if device {
+                device_store::begin_mutation_remote(&tx)?
+            } else {
+                let revision = current_revision(&tx)? + 1;
+                super::content_change_index::begin_mutation(&tx, &generation, revision, "server")?;
+                revision
+            };
+            for (id, change) in changes {
+                let c = change.key.components();
+                let retired = parent_status(&tx, &change.key)? == "retired";
+                let status = if retired {
+                    "done"
+                } else if !device && parent_status(&tx, &change.key)? == "held" {
+                    "held"
+                } else if c[0] == "messages"
+                    && generating
+                        .iter()
+                        .any(|g| g.character_id == c[1] && g.conversation_id == c[2])
+                {
+                    "deferred"
+                } else {
+                    "done"
+                };
+                let hard_delete = c[0] == "exists" && matches!(change.value, UnitValue::Deleted);
+                if status == "done" && (!retired || hard_delete) {
+                    let decision = if let Some((stamp, value)) = read_unit(&tx, &change.key)? {
+                        wire(compare_version(
+                            &stamp,
+                            &value,
+                            &change.stamp,
+                            &change.value,
+                        ))?
+                    } else {
+                        LwwDecision::ApplyRemote
+                    };
+                    let new_retirement = hard_delete
+                        && read_unit(&tx, &change.key)?
+                            .is_none_or(|(_, v)| !matches!(v, UnitValue::Deleted));
+                    if decision == LwwDecision::ApplyRemote || new_retirement {
+                        projection::apply(&tx, &generation, &change.key, &change.value)?;
+                        put_unit(
+                            &tx,
+                            &change.key,
+                            &change.stamp,
+                            &change.value,
+                            &format!("receive:{id}"),
+                            None,
+                        )?;
+                        result.affected_keys.push(change.key.clone());
+                    }
+                    witness_received(&tx, &change, current_authority)?;
+                }
+                tx.execute(
+                    "UPDATE lww_receive_rows SET status=?3 WHERE request_id=?1 AND key=?2",
+                    params![id, change.key.as_str(), status],
+                )?;
+                if status == "held" {
+                    result.held_keys.push(change.key);
+                } else if status == "deferred" {
+                    result.deferred_keys.push(change.key);
+                }
+            }
+            if device {
+                device_store::finish_mutation_remote(&tx)?;
+            } else {
+                projection::refresh_orders(&tx, &generation, &result.affected_keys)?;
+                super::content_change_index::finish_mutation(&tx)?;
+                commit::set_active(&tx, revision, &generation)?;
+            }
+            tx.commit()?;
+        }
+        result.revision = self.revision()?;
+        Ok(result)
+    }
+    pub(crate) fn lww_finish_receive(&mut self, header: &Header) -> StoreResult<()> {
+        let tx = self.device_store_mut()?.transaction()?;
+        verify(&tx, header.binding_authority)?;
+        let (body, applied): (String, bool) = tx.query_row(
+            "SELECT body,applied FROM lww_receive WHERE request_id=?1",
+            [&header.request_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if !applied {
+            return Err(error("receive-not-applied"));
+        }
+        let request: StageReceive = serde_json::from_str(&body)?;
+        let writer = request.progress.writer_id.unwrap_or_default();
+        let old: Option<String> = tx
+            .query_row(
+                "SELECT cursor FROM lww_progress WHERE kind=?1 AND writer_id=?2",
+                params![request.progress.kind, writer],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if old
+            .map(|c| wire(c.try_into()))
+            .transpose()?
+            .is_none_or(|old: DecimalU64| old < request.progress.cursor)
+        {
+            tx.execute("INSERT INTO lww_progress VALUES(?1,?2,?3,?4) ON CONFLICT(kind,writer_id) DO UPDATE SET cursor=excluded.cursor,authority=excluded.authority",params![request.progress.kind,writer,request.progress.cursor.0.to_string(),header.binding_authority.0.to_string()])?;
+        }
+        tx.execute(
+            "UPDATE lww_receive SET finished=1 WHERE request_id=?1",
+            [&header.request_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub(crate) fn lww_drain_deferred(
+        &mut self,
+        request: &ApplyReceive,
+    ) -> StoreResult<ApplyResult> {
+        verify(
+            self.device_store()?.connection(),
+            request.header.binding_authority,
+        )?;
+        self.apply_receive_rows(&request.generating, true)
+    }
+    pub(crate) fn lww_record_unpublished_proof(
+        &mut self,
+        header: &Header,
+        proof_id: &str,
+        entries: &[AckEntry],
+    ) -> StoreResult<()> {
+        let tx = self.device_store_mut()?.transaction()?;
+        verify(&tx, header.binding_authority)?;
+        let body = serde_json::to_string(entries)?;
+        let old: Option<String> = tx
+            .query_row(
+                "SELECT entries FROM lww_unpublished_proofs WHERE proof_id=?1",
+                [proof_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if old.as_ref().is_some_and(|old| old != &body) {
+            return Err(error("unpublished-proof-integrity"));
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO lww_unpublished_proofs VALUES(?1,?2,?3)",
+            params![proof_id, header.binding_authority.0.to_string(), body],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub(crate) fn lww_retry_unpublished(
+        &mut self,
+        header: &Header,
+        proof_id: &str,
+        corrected: DecimalU64,
+    ) -> StoreResult<ApplyResult> {
+        let existing: Option<(String, String, bool)> = self
+            .device_store()?
+            .connection()
+            .query_row(
+                "SELECT authority,body,complete FROM lww_intents WHERE request_id=?1",
+                [&header.request_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        if let Some((authority, body, complete)) = existing {
+            if authority != header.binding_authority.0.to_string() {
+                return Err(error("request-id-integrity"));
+            }
+            let intent: Intent = serde_json::from_str(&body)?;
+            let Intent::Repair { entries } = intent else {
+                return Err(error("request-id-integrity"));
+            };
+            if !complete {
+                self.lww_recover_intents()?;
+            }
+            return Ok(ApplyResult {
+                revision: self.revision()?,
+                affected_keys: entries.into_iter().map(|e| e.key).collect(),
+                ..Default::default()
+            });
+        }
+        self.lww_recover_intents()?;
+        verify(self.device_store()?.connection(), header.binding_authority)?;
+        validate_header(header)?;
+        let body: String = self.device_store()?.connection().query_row(
+            "SELECT entries FROM lww_unpublished_proofs WHERE proof_id=?1 AND authority=?2",
+            params![proof_id, header.binding_authority.0.to_string()],
+            |r| r.get(0),
+        )?;
+        let proof: Vec<AckEntry> = serde_json::from_str(&body)?;
+        let state = self.lww_clock_state()?;
+        let upper = corrected
+            .0
+            .checked_add(risunest_sync_wire::stamp::MAX_CLOCK_SKEW_MS)
+            .ok_or_else(|| error("clock-overflow"))?;
+        if state
+            .accepted
+            .as_ref()
+            .is_some_and(|s| s.physical_ms.0 > upper)
+        {
+            return Err(error("accepted-clock-correction-required"));
+        }
+        let entries = self
+            .lww_read_all_outbox(header.binding_authority)?
+            .into_iter()
+            .filter(|e| e.stamp.physical_ms.0 > upper)
+            .collect::<Vec<_>>();
+        for entry in &entries {
+            if !proof.iter().any(|p| {
+                p.key == entry.key
+                    && p.version == entry.version
+                    && p.stamp == entry.stamp
+                    && entry.value.identity().ok().as_ref() == Some(&p.value_identity)
+            }) {
+                return Err(error("unpublished-proof-incomplete"));
+            }
+        }
+        let intent = Intent::Repair {
+            entries: entries.clone(),
+        };
+        let body = serde_json::to_string(&intent)?;
+        let digest = risunest_sync_wire::hash(body.as_bytes());
+        let tx = self.device_store_mut()?.transaction()?;
+        verify(&tx, header.binding_authority)?;
+        let stamp = wire(issue_stamp(
+            corrected.0,
+            &state.writer_id,
+            None,
+            state.accepted.as_ref(),
+        ))?;
+        tx.execute(
+            "UPDATE lww_clock SET issued=?1 WHERE singleton=1",
+            [serde_json::to_string(&stamp)?],
+        )?;
+        tx.execute(
+            "INSERT INTO lww_intents VALUES(?1,?2,?3,?4,?5,0)",
+            params![
+                header.request_id,
+                header.binding_authority.0.to_string(),
+                serde_json::to_string(&stamp)?,
+                body,
+                digest
+            ],
+        )?;
+        tx.commit()?;
+        self.finish_lww_repair(header, &stamp, &entries)?;
+        self.complete_intent(header)?;
+        Ok(ApplyResult {
+            revision: self.revision()?,
+            affected_keys: entries.into_iter().map(|e| e.key).collect(),
+            ..Default::default()
+        })
+    }
+    fn lww_read_all_outbox(&self, expected: DecimalU64) -> StoreResult<Vec<OutboxEntry>> {
+        let mut entries = Vec::new();
+        for db in [&self.connection, self.device_store()?.connection()] {
+            let mut s =
+                db.prepare("SELECT key,stamp,value,version FROM lww_outbox WHERE authority=?1")?;
+            let rows = s.query_map([expected.0.to_string()], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (key, stamp, value, version) = row?;
+                entries.push(OutboxEntry {
+                    key: wire(key.try_into())?,
+                    stamp: serde_json::from_str(&stamp)?,
+                    value: serde_json::from_str(&value)?,
+                    version,
+                    target_authority: expected,
+                });
+            }
+        }
+        Ok(entries)
+    }
+    fn finish_lww_repair(
+        &mut self,
+        header: &Header,
+        stamp: &Stamp,
+        entries: &[OutboxEntry],
+    ) -> StoreResult<()> {
+        for db in [
+            &mut self.connection,
+            &mut self.device_store.as_mut().map_err(|e| error(e))?.connection,
+        ] {
+            let device = db
+                .path()
+                .is_some_and(|p| p.ends_with(device_store::DEVICE_DATABASE_FILE));
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            for entry in entries {
+                if projection::is_device(&entry.key) != device {
+                    continue;
+                }
+                let row: Option<(String, String)> = tx
+                    .query_row(
+                        "SELECT version,stamp FROM lww_outbox WHERE key=?1",
+                        [entry.key.as_str()],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                if row == Some((header.request_id.clone(), serde_json::to_string(stamp)?)) {
+                    continue;
+                }
+                if row != Some((entry.version.clone(), serde_json::to_string(&entry.stamp)?)) {
+                    return Err(error("unpublished-version-changed"));
+                }
+                put_unit(
+                    &tx,
+                    &entry.key,
+                    stamp,
+                    &entry.value,
+                    &header.request_id,
+                    Some(header.binding_authority),
+                )?;
+            }
+            tx.commit()?;
+        }
+        Ok(())
+    }
+    pub(crate) fn lww_commit_replacement(
+        &mut self,
+        header: &Header,
+        staging_id: &str,
+    ) -> StoreResult<RevisionResult> {
+        self.lww_commit_replacement_units(header, staging_id, None)
+    }
+    pub(crate) fn lww_commit_replacement_units(
+        &mut self,
+        header: &Header,
+        staging_id: &str,
+        source_units: Option<&BTreeMap<UnitKey, UnitValue>>,
+    ) -> StoreResult<RevisionResult> {
+        let existing: Option<(String, String, bool)> = self
+            .device_store()?
+            .connection()
+            .query_row(
+                "SELECT authority,body,complete FROM lww_intents WHERE request_id=?1",
+                [&header.request_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        if let Some((authority, body, complete)) = existing {
+            if authority != header.binding_authority.0.to_string() {
+                return Err(error("request-id-integrity"));
+            }
+            let intent: Intent = serde_json::from_str(&body)?;
+            if !matches!(&intent,Intent::Replacement{staging_id:old,source_units:old_units,..} if old==staging_id&&old_units.as_ref()==source_units)
+            {
+                return Err(error("request-id-integrity"));
+            }
+            if !complete {
+                self.lww_recover_intents()?;
+            }
+            return self
+                .completed_intent(header, &intent)?
+                .ok_or_else(|| error("replacement-intent-incomplete"));
+        }
+        self.lww_recover_intents()?;
+        verify(self.device_store()?.connection(), header.binding_authority)?;
+        let generation = active_generation(&self.connection)?;
+        let before = projection::capture_all(&mut self.connection, &generation)?;
+        let mut after = projection::capture_all(&mut self.connection, staging_id)?;
+        if let Some(units) = source_units {
+            for (key, value) in units {
+                wire(value.validate())?;
+                projection::validate_received(&self.connection, key, value)?;
+                after.insert(key.clone(), value.clone());
+            }
+        }
+        let mut keys = before
+            .keys()
+            .chain(after.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let stored: Vec<String> = {
+            let mut s = self.connection.prepare("SELECT key FROM lww_units")?;
+            let v = s.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+            v
+        };
+        for raw in stored {
+            let key: UnitKey = wire(raw.try_into())?;
+            if projection::known(&key) {
+                keys.insert(key);
+            }
+        }
+        let mut changes = Vec::new();
+        for key in keys {
+            let p = key.components();
+            let character = match p[0].as_str() {
+                "character" | "group-members" | "conversation" | "messages" => Some(p[1].as_str()),
+                "exists" if p[1] == "conversation" => Some(p[2].as_str()),
+                "order" if p[1] == "conversations" => Some(p[2].as_str()),
+                _ => None,
+            };
+            if character.is_some_and(|id| {
+                after
+                    .get(&unit_key(&["archive", id]).unwrap())
+                    .is_some_and(|value| matches!(value, UnitValue::Object { .. }))
+            }) && source_units.is_none_or(|units| !units.contains_key(&key))
+            {
+                continue;
+            }
+            let value = after.get(&key).cloned().unwrap_or(UnitValue::Deleted);
+            if !matches!(value, UnitValue::Deleted)
+                && parent_status(&self.connection, &key)? == "retired"
+            {
+                return Err(error("retired-record-id"));
+            }
+            let prior = read_unit(&self.connection, &key)?
+                .map(|(_, v)| v)
+                .or_else(|| before.get(&key).cloned())
+                .unwrap_or(UnitValue::Deleted);
+            if prior != value {
+                changes.push((key, value));
+            }
+        }
+        let (stamp, digest) = self.reserve_intent(
+            header,
+            &Intent::Replacement {
+                staging_id: staging_id.into(),
+                changes: changes.clone(),
+                source_units: source_units.cloned(),
+            },
+        )?;
+        let result =
+            self.finish_lww_replacement(header, staging_id, &changes, &stamp, &digest, false, &[])?;
+        self.complete_intent(header)?;
+        Ok(result)
+    }
+    pub(crate) fn lww_replace_target(
+        &mut self,
+        header: &Header,
+        staging_id: &str,
+        changes: &[Change],
+    ) -> StoreResult<RevisionResult> {
+        let intent = Intent::Target {
+            staging_id: staging_id.into(),
+            changes: changes.to_vec(),
+        };
+        if let Some(result) = self.completed_intent(header, &intent)? {
+            return Ok(result);
+        }
+        self.lww_recover_intents()?;
+        if let Some(result) = self.completed_intent(header, &intent)? {
+            return Ok(result);
+        }
+        verify(self.device_store()?.connection(), header.binding_authority)?;
+        for c in changes {
+            wire(c.value.validate())?;
+            wire(c.stamp.validate())?;
+            projection::validate_received(&self.connection, &c.key, &c.value)?;
+        }
+        let (stamp, digest) = self.reserve_intent(header, &intent)?;
+        let result =
+            self.finish_lww_replacement(header, staging_id, &[], &stamp, &digest, true, changes)?;
+        self.complete_intent(header)?;
+        Ok(result)
+    }
+    fn finish_lww_replacement(
+        &mut self,
+        header: &Header,
+        staging_id: &str,
+        changes: &[(UnitKey, UnitValue)],
+        stamp: &Stamp,
+        digest: &str,
+        target: bool,
+        received: &[Change],
+    ) -> StoreResult<RevisionResult> {
+        let result = commit::replace_commit_lww(
+            &mut self.connection,
+            staging_id,
+            header,
+            stamp,
+            digest,
+            changes,
+            target,
+            received,
+        )?;
+        if target {
+            let tx = self.device_store_mut()?.transaction()?;
+            verify(&tx, header.binding_authority)?;
+            tx.execute("DELETE FROM hypa_embeddings", [])?;
+            tx.execute("DELETE FROM plugin_device_storage", [])?;
+            tx.execute("DELETE FROM lww_units", [])?;
+            tx.execute("DELETE FROM lww_outbox", [])?;
+            tx.execute("DELETE FROM lww_receive_rows", [])?;
+            for c in received {
+                observe(&tx, &c.stamp)?;
+                if projection::is_device(&c.key) {
+                    projection::apply(&tx, "", &c.key, &c.value)?;
+                    put_unit(&tx, &c.key, &c.stamp, &c.value, &header.request_id, None)?;
+                    witness_received(&tx, c, header.binding_authority)?;
+                }
+            }
+            tx.commit()?;
+        }
+        Ok(result)
+    }
+}
+
+#[cfg(test)]
+#[path = "lww_tests.rs"]
+mod tests;
+
+pub(super) fn validate_local_targets(db: &Connection, input: &WorkingSetCommit) -> StoreResult<()> {
+    for value in input
+        .character
+        .iter()
+        .chain(input.character_details.iter().flatten())
+        .chain(input.replace_character.iter())
+        .chain(input.add_character.iter())
+    {
+        if let Some(id) = value.get("chaId").and_then(Value::as_str) {
+            if is_retired(db, &unit_key(&["exists", "character", id])?)? {
+                return Err(error("retired-record-id"));
+            }
+        }
+    }
+    for value in input.root.iter() {
+        for collection in ["modules", "loadouts", "customModels", "personas"] {
+            for record in value
+                .get(collection)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(id) = record.get("id").and_then(Value::as_str) {
+                    if is_retired(
+                        db,
+                        &unit_key(&[
+                            "exists",
+                            if collection == "personas" {
+                                "persona"
+                            } else {
+                                collection
+                            },
+                            id,
+                        ])?,
+                    )? {
+                        return Err(error("retired-record-id"));
+                    }
+                }
+            }
+        }
+    }
+    for preset in input.replace_presets.iter().flatten() {
+        if let Some(id) = preset.get("id").and_then(Value::as_str) {
+            if is_retired(db, &unit_key(&["exists", "preset", id])?)? {
+                return Err(error("retired-record-id"));
+            }
+        }
+    }
+    for mutation in input.conversations.iter().flatten() {
+        if let super::ConversationMutation::ReplaceRange {
+            character_id,
+            conversation_id,
+            ..
+        } = mutation
+        {
+            if parent_status(db, &unit_key(&["messages", character_id, conversation_id])?)?
+                == "retired"
+            {
+                return Err(error("retired-record-id"));
+            }
+        }
+    }
+    Ok(())
+}
+pub(super) fn validate_schema(db: &Connection) -> StoreResult<()> {
+    let reference = Connection::open_in_memory()?;
+    reference.execute_batch(UNIT_SCHEMA)?;
+    reference.execute_batch(super::message_pages::SCHEMA)?;
+    let mut stmt =
+        reference.prepare("SELECT type,name,sql FROM sqlite_master WHERE sql IS NOT NULL")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (kind, name, sql) = row?;
+        let actual: Option<String> = db
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type=?1 AND name=?2",
+                params![kind, name],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let normalize = |s: &str| {
+            s.split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .trim_end_matches(';')
+                .to_owned()
+        };
+        if actual.as_deref().map(normalize) != Some(normalize(&sql)) {
+            return Err(error("invalid-lww-schema"));
+        }
+    }
+    let columns: Vec<String> = {
+        let mut s = db.prepare("PRAGMA table_info(messages)")?;
+        let v = s.query_map([], |r| r.get(1))?.collect::<Result<_, _>>()?;
+        v
+    };
+    if !columns.iter().any(|c| c == "canonical_hash")
+        || !columns.iter().any(|c| c == "canonical_size")
+    {
+        return Err(error("invalid-message-hash-schema"));
+    }
+    Ok(())
+}
+
+pub(super) struct ArchiveContext<'a> {
+    pub header: &'a Header,
+    pub stamp: &'a Stamp,
+    pub digest: &'a str,
+    pub incoming: Option<&'a Change>,
+}
+pub(super) use projection::{
+    archive_metadata, shared_archive_character, shared_archive_conversation,
+};
+pub(super) fn activate_plugin_local_units(tx: &Transaction<'_>) -> StoreResult<()> {
+    let rows: Vec<(String, String)> = {
+        let mut q = tx.prepare(
+            "SELECT key,value FROM lww_units WHERE json_extract(key,'$[0]')='plugin-local'",
+        )?;
+        let rows = q
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        rows
+    };
+    for (key, value) in rows {
+        let key = wire(key.try_into())?;
+        let value = serde_json::from_str(&value)?;
+        projection::apply(tx, "", &key, &value)?;
+    }
+    Ok(())
+}
+pub(super) fn archive_request_result(
+    db: &Connection,
+    context: Option<&ArchiveContext<'_>>,
+) -> StoreResult<Option<RevisionResult>> {
+    let Some(context) = context else {
+        return Ok(None);
+    };
+    let result: Option<(String, i64)> = db
+        .query_row(
+            "SELECT digest,revision FROM lww_requests WHERE request_id=?1",
+            [&context.header.request_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    result
+        .map(|(digest, revision)| {
+            if digest == context.digest {
+                Ok(RevisionResult { revision })
+            } else {
+                Err(error("request-id-integrity"))
+            }
+        })
+        .transpose()
+}
+pub(super) fn record_archive_state(
+    tx: &Transaction<'_>,
+    generation: &str,
+    char_id: &str,
+    context: Option<&ArchiveContext<'_>>,
+    restore: bool,
+) -> StoreResult<()> {
+    let Some(context) = context else {
+        return Ok(());
+    };
+    if restore {
+        projection::reproject_archived_children(tx, generation, char_id)?;
+    }
+    let value = if let Some(incoming) = context.incoming {
+        incoming.value.clone()
+    } else if let Some(archived) = super::archive::read_archived_object(tx, generation, char_id)? {
+        projection::archive_value(tx, &archived)?
+    } else {
+        UnitValue::Deleted
+    };
+    let key = unit_key(&["archive", char_id])?;
+    put_unit(
+        tx,
+        &key,
+        context.stamp,
+        &value,
+        &context.header.request_id,
+        if context.incoming.is_some() {
+            None
+        } else {
+            Some(context.header.binding_authority)
+        },
+    )?;
+    if context.incoming.is_none() {
+        ensure_publishable_parents(tx, &key, context.header.binding_authority)?;
+    } else if let Some(incoming) = context.incoming {
+        witness_received(tx, incoming, context.header.binding_authority)?;
+    }
+    tx.execute(
+        "INSERT INTO lww_requests VALUES(?1,?2,?3)",
+        params![
+            context.header.request_id,
+            context.digest,
+            current_revision(tx)? + 1
+        ],
+    )?;
+    Ok(())
+}
+
+fn witness_exact(
+    db: &Connection,
+    key: &UnitKey,
+    binding: DecimalU64,
+    version: &str,
+    stamp: &Stamp,
+    identity: &str,
+) -> StoreResult<()> {
+    db.execute("INSERT INTO lww_publications SELECT key,?1,version,stamp,identity FROM lww_units WHERE key=?2 AND version=?3 AND stamp=?4 AND identity=?5 ON CONFLICT(key,authority) DO UPDATE SET version=excluded.version,stamp=excluded.stamp,identity=excluded.identity",params![binding.0.to_string(),key.as_str(),version,serde_json::to_string(stamp)?,identity])?;
+    Ok(())
+}
+pub(super) fn witness_received(
+    db: &Connection,
+    change: &Change,
+    binding: DecimalU64,
+) -> StoreResult<()> {
+    let row: Option<(String, String)> = db
+        .query_row(
+            "SELECT version,identity FROM lww_units WHERE key=?1 AND stamp=?2",
+            params![change.key.as_str(), serde_json::to_string(&change.stamp)?],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    if let Some((version, identity)) = row {
+        if identity == value_identity(&change.value)? {
+            witness_exact(db, &change.key, binding, &version, &change.stamp, &identity)?;
+            db.execute("DELETE FROM lww_outbox WHERE key=?1 AND version=?2 AND stamp=?3 AND identity=?4 AND authority=?5",params![change.key.as_str(),version,serde_json::to_string(&change.stamp)?,identity,binding.0.to_string()])?;
+        }
+    }
+    Ok(())
+}
+fn enqueue_existing(db: &Connection, key: &UnitKey, binding: DecimalU64) -> StoreResult<()> {
+    if parent_status(db, key)? == "retired" && !is_deleted_existence(db, key)? {
+        return Ok(());
+    }
+    db.execute("INSERT INTO lww_outbox SELECT u.key,u.stamp,u.value,u.version,u.identity,?1 FROM lww_units u WHERE u.key=?2 AND NOT EXISTS(SELECT 1 FROM lww_publications p WHERE p.key=u.key AND p.authority=?1 AND p.version=u.version AND p.stamp=u.stamp AND p.identity=u.identity) ON CONFLICT(key) DO UPDATE SET stamp=excluded.stamp,value=excluded.value,version=excluded.version,identity=excluded.identity,authority=excluded.authority",params![binding.0.to_string(),key.as_str()])?;
+    Ok(())
+}
+fn is_deleted_existence(db: &Connection, key: &UnitKey) -> StoreResult<bool> {
+    Ok(key.components()[0] == "exists"
+        && read_unit(db, key)?.is_some_and(|(_, value)| matches!(value, UnitValue::Deleted)))
+}
+fn initialize_owner(
+    db: &Connection,
+    kind: &str,
+    first: &str,
+    second: Option<&str>,
+    binding: DecimalU64,
+) -> StoreResult<()> {
+    let parent = if kind == "conversation" {
+        unit_key(&["exists", kind, first, second.unwrap()])?
+    } else {
+        unit_key(&["exists", kind, first])?
+    };
+    if read_unit(db, &parent)?.is_none() || is_retired(db, &parent)? {
+        return Ok(());
+    }
+    enqueue_existing(db, &parent, binding)?;
+    let scope = serde_json::to_string(&(kind, first, second))?;
+    let initialized: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM lww_initialization_scopes WHERE scope=?1 AND authority=?2)",
+        params![scope, binding.0.to_string()],
+        |r| r.get(0),
+    )?;
+    if initialized {
+        return Ok(());
+    }
+    let (sql,parameters):(String,Vec<String>)=match kind {
+        "character"=>("SELECT key FROM lww_units WHERE json_extract(key,'$[0]') IN ('character','group-members','archive') AND json_extract(key,'$[1]')=?1 UNION ALL SELECT key FROM lww_units WHERE json_extract(key,'$[0]')='order' AND json_extract(key,'$[1]')='conversations' AND json_extract(key,'$[2]')=?1".into(),vec![first.into()]),
+        "conversation"=>("SELECT key FROM lww_units WHERE json_extract(key,'$[0]') IN ('conversation','messages') AND json_extract(key,'$[1]')=?1 AND json_extract(key,'$[2]')=?2".into(),vec![first.into(),second.unwrap().into()]),
+        "preset"|"persona"=>("SELECT key FROM lww_units WHERE json_extract(key,'$[0]')=?1 AND json_extract(key,'$[1]')=?2".into(),vec![kind.into(),first.into()]),
+        _=>("SELECT key FROM lww_units WHERE json_extract(key,'$[0]')='record' AND json_extract(key,'$[1]')=?1 AND json_extract(key,'$[2]')=?2".into(),vec![kind.into(),first.into()]),
+    };
+    let keys: Vec<String> = {
+        let mut query = db.prepare(&sql)?;
+        let rows = query
+            .query_map(rusqlite::params_from_iter(parameters.iter()), |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        rows
+    };
+    for key in keys {
+        enqueue_existing(db, &wire(key.try_into())?, binding)?;
+    }
+    db.execute(
+        "INSERT INTO lww_initialization_scopes VALUES(?1,?2)",
+        params![scope, binding.0.to_string()],
+    )?;
+    Ok(())
+}
+pub(super) fn ensure_publishable_parents(
+    db: &Connection,
+    key: &UnitKey,
+    binding: DecimalU64,
+) -> StoreResult<()> {
+    for parent in parent_keys(key)? {
+        let p = parent.components();
+        initialize_owner(db, &p[1], &p[2], p.get(3).map(String::as_str), binding)?;
+    }
+    let p = key.components();
+    if p[0] == "root" && matches!(p[1].as_str(), "botPresetsId" | "selectedPersona") {
+        if let Some((_, value)) = read_unit(db, key)? {
+            if let Some(id) = json_value(&value)?.and_then(|v| v.as_str().map(str::to_owned)) {
+                initialize_owner(
+                    db,
+                    if p[1] == "botPresetsId" {
+                        "preset"
+                    } else {
+                        "persona"
+                    },
+                    &id,
+                    None,
+                    binding,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UnitStatePage {
+    pub entries: Vec<OutboxEntry>,
+    pub after_key: Option<UnitKey>,
+    pub has_more: bool,
+}
+impl PersistentStore {
+    pub(crate) fn lww_read_unit_state(
+        &self,
+        binding: DecimalU64,
+        after: Option<&UnitKey>,
+        limit: usize,
+    ) -> StoreResult<UnitStatePage> {
+        verify(self.device_store()?.connection(), binding)?;
+        if limit == 0 || limit > 4096 {
+            return Err(error("invalid-unit-state-page-limit"));
+        }
+        let mut entries = Vec::new();
+        let participating = projection::plugin_participates(self.device_store()?.connection())?;
+        for db in [&self.connection, self.device_store()?.connection()] {
+            let mut cursor = after.map(UnitKey::as_str).unwrap_or("").to_owned();
+            let mut emitted = 0;
+            while emitted <= limit {
+                let rows: Vec<(String, String, String, String)> = {
+                    let mut query=db.prepare("SELECT key,stamp,value,version FROM lww_units WHERE key>?1 AND (?3 OR json_extract(key,'$[0]')<>'plugin-local') ORDER BY key LIMIT ?2")?;
+                    let rows = query
+                        .query_map(params![cursor, (limit + 1) as i64, participating], |r| {
+                            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                        })?
+                        .collect::<Result<_, _>>()?;
+                    rows
+                };
+                let exhausted = rows.len() < limit + 1;
+                for (key, stamp, value, version) in rows {
+                    cursor = key.clone();
+                    let key = wire(key.try_into())?;
+                    if parent_status(db, &key)? == "retired" && !is_deleted_existence(db, &key)? {
+                        continue;
+                    }
+                    entries.push(OutboxEntry {
+                        key,
+                        stamp: serde_json::from_str(&stamp)?,
+                        value: serde_json::from_str(&value)?,
+                        version,
+                        target_authority: binding,
+                    });
+                    emitted += 1;
+                    if emitted > limit {
+                        break;
+                    }
+                }
+                if exhausted || emitted > limit {
+                    break;
+                }
+            }
+        }
+        entries.sort_by(|a, b| a.key.cmp(&b.key));
+        let has_more = entries.len() > limit;
+        entries.truncate(limit);
+        let after_key = entries.last().map(|entry| entry.key.clone());
+        Ok(UnitStatePage {
+            entries,
+            after_key,
+            has_more,
+        })
+    }
+    pub(crate) fn lww_queue_unit_state_page(
+        &mut self,
+        header: &Header,
+        after: Option<&UnitKey>,
+        limit: usize,
+    ) -> StoreResult<UnitStatePage> {
+        validate_header(header)?;
+        let page = self.lww_read_unit_state(header.binding_authority, after, limit)?;
+        for db in [
+            &mut self.connection,
+            &mut self.device_store.as_mut().map_err(error)?.connection,
+        ] {
+            let device = db
+                .path()
+                .is_some_and(|p| p.ends_with(device_store::DEVICE_DATABASE_FILE));
+            let tx = db.transaction()?;
+            for entry in &page.entries {
+                if projection::is_device(&entry.key) == device {
+                    enqueue_existing(&tx, &entry.key, header.binding_authority)?;
+                    if !device {
+                        ensure_publishable_parents(&tx, &entry.key, header.binding_authority)?;
+                    }
+                }
+            }
+            tx.commit()?;
+        }
+        Ok(page)
+    }
+}

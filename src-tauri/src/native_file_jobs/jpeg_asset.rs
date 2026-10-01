@@ -346,7 +346,7 @@ fn import_jpeg_asset_with_before_commit(
                     delete_character_ids: None,
                     plugin_storage: None,
                     asset_owner_heads: owner_head.map(|head| vec![head]),
-                },
+                ..Default::default()},
                 &[alias],
             )
             .map_err(super::native_store_error)?;
@@ -535,7 +535,7 @@ mod tests {
                 delete_character_ids: None,
                 plugin_storage: None,
                 asset_owner_heads: Some(vec![owner_head.clone()]),
-            })
+            ..Default::default()})
             .expect("seed owner head");
         (directory, store, character_id, owner_head)
     }
@@ -901,7 +901,7 @@ mod tests {
                         delete_character_ids: None,
                         plugin_storage: None,
                         asset_owner_heads: None,
-                    })
+                    ..Default::default()})
                     .expect("win final revision race");
                 Ok(())
             },

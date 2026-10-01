@@ -1474,7 +1474,7 @@ mod tests {
                 delete_character_ids: None,
                 asset_owner_heads: None,
                 plugin_storage: None,
-            })
+            ..Default::default()})
             .expect("commit later revision");
 
         let prepared = store
@@ -1640,7 +1640,7 @@ mod tests {
                 delete_character_ids: None,
                 asset_owner_heads: None,
                 plugin_storage: None,
-            })
+            ..Default::default()})
             .expect("advance live revision");
         let registry = JobRegistry::default();
         let job = registry
