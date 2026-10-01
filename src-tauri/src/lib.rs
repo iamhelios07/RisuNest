@@ -816,6 +816,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         persistent_store::lww_commands::pds_lww_clock_state,
         persistent_store::lww_commands::pds_lww_retry_unpublished,
         persistent_store::lww_commands::pds_lww_commit_replacement,
+        persistent_store::lww_commands::pds_lww_replace_target_as_new_device,
         #[cfg(windows)]
         persistent_commit_transport::pds_commit_shared_open,
         #[cfg(windows)]

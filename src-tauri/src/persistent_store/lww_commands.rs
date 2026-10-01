@@ -31,6 +31,28 @@ pub(crate) struct Replacement {
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct NewDeviceReplacement {
+    #[serde(flatten)]
+    header: Header,
+    staging_id: String,
+    authorization_id: String,
+}
+
+#[tauri::command]
+pub(crate) fn pds_lww_replace_target_as_new_device(
+    state: State<'_, PersistentStoreState>,
+    request: NewDeviceReplacement,
+) -> Result<lww::NewDeviceResult, StoreError> {
+    with_store_mut(state, |store| {
+        store.lww_replace_target_as_new_device(
+            &request.header,
+            &request.staging_id,
+            &request.authorization_id,
+        )
+    })
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct RetryUnpublished {
     #[serde(flatten)]
     header: Header,
