@@ -1202,7 +1202,8 @@ pub(in crate::persistent_store) fn capture_device_changes(
             };
             (unit_key(&["plugin-local", &k1, &k2, &k3])?, value)
         };
-        count_work(&value);
+        #[cfg(test)]
+        count_work();
         if read_unit(tx, &key)?.is_some_and(|(_, old)| old == value) {
             continue;
         }

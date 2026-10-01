@@ -622,6 +622,8 @@ export class SaveCoordinator {
             this.reportBackgroundError(error)
         }
     }
+    private activePausedWriteToken: PersistentMutationToken | null = null
+    private activatedLibraryGuardOwner: symbol | null = null
     private selectedConversationTransitionActive = false
     private persistenceWasBusy = false
 
@@ -785,7 +787,7 @@ export class SaveCoordinator {
         if (this.destructiveReplacementFence?.state === 'held' && this.destructiveReplacementFence.refreshBaseline) {
             this.destructiveReplacementFence.refreshBaseline = captured
         }
-        if (this.committedRefreshRevision !== null) {
+        if (this.committedRefreshRevision !== null && !this.activatedLibraryGuardOwner) {
             this.committedRefreshRevision = null
             try {
                 this.dependencies.onWorkingSetRefreshRequired?.(null)
@@ -4466,11 +4468,57 @@ export class SaveCoordinator {
         }
     }
 
+    beginActivatedLibraryGuard(token: PersistentMutationToken): symbol {
+        if (this.activePausedWriteToken !== token || this.activatedLibraryGuardOwner ||
+            this.destructiveReplacementFence || token.revision !== this.revision) {
+            throw new PersistentMutationFencedError()
+        }
+        const baseline = this.capture()
+        const owner = Symbol('activated-library')
+        this.activatedLibraryGuardOwner = owner
+        this.destructiveReplacementFence = {
+            owner, state: 'held', blockedPrePublicationDirty: false,
+            refreshBaseline: baseline,
+        }
+        this.cancelDebounce()
+        return owner
+    }
+
+    assertActivatedLibraryGuard(owner: symbol, token: PersistentMutationToken, validateCapture = true): void {
+        if (this.activatedLibraryGuardOwner !== owner || this.activePausedWriteToken !== token ||
+            this.destructiveReplacementFence?.owner !== owner || this.destructiveReplacementFence.state !== 'held') {
+            throw new PersistentMutationFencedError()
+        }
+        if (validateCapture) this.assertDestructiveReplacementFence(owner)
+    }
+
+    finishActivatedLibraryGuard(owner: symbol): void {
+        if (this.activatedLibraryGuardOwner !== owner) throw new PersistentMutationFencedError()
+        this.activatedLibraryGuardOwner = null
+        this.committedRefreshRevision = null
+        try { this.dependencies.onWorkingSetRefreshRequired?.(null) }
+        catch (error) { this.reportBackgroundError(error) }
+        if (this.destructiveReplacementFence?.owner === owner) this.releaseDestructiveReplacementFence(owner)
+    }
+
     withPausedPersistentWrites<T>(reason: string, operation: (token: PersistentMutationToken) => Promise<T>): Promise<T> {
         this.assertPersistentMutationAllowed()
         return this.enqueue(async () => {
             await this.flushIterations(reason, false)
-            return operation({ revision: this.revision, mutationGeneration: this.dirtyGeneration })
+            const token = { revision: this.revision, mutationGeneration: this.dirtyGeneration }
+            this.activePausedWriteToken = token
+            try {
+                return await operation(token)
+            } finally {
+                // Fence the queue before releasing the pause, even when activation's
+                // outcome could not be read. Recovery must never flush the old view.
+                const owner = this.activatedLibraryGuardOwner
+                if (owner && this.destructiveReplacementFence?.owner === owner) {
+                    this.markCommittedWorkingSetRefreshRequired(this.revision, new PersistentMutationFencedError())
+                    this.releaseDestructiveReplacementFence(owner)
+                }
+                this.activePausedWriteToken = null
+            }
         })
     }
 

@@ -14,6 +14,8 @@ use uuid::Uuid;
 
 #[path = "lww_classification.rs"]
 mod classification;
+#[path = "lww_new_device.rs"]
+mod new_device;
 #[path = "lww_projection.rs"]
 mod projection;
 pub(super) use projection::{
@@ -38,6 +40,7 @@ CREATE TABLE lww_receive(request_id TEXT PRIMARY KEY,authority TEXT NOT NULL,dig
 CREATE TABLE lww_progress(kind TEXT NOT NULL,writer_id TEXT NOT NULL,cursor TEXT NOT NULL,authority TEXT NOT NULL,PRIMARY KEY(kind,writer_id));
 CREATE TABLE lww_device_context(singleton INTEGER PRIMARY KEY CHECK(singleton=1),stamp TEXT NOT NULL,legacy_clock TEXT NOT NULL);
 CREATE TABLE lww_unpublished_proofs(proof_id TEXT PRIMARY KEY,authority TEXT NOT NULL,entries TEXT NOT NULL);
+CREATE TABLE lww_new_device_authorizations(authorization_id TEXT PRIMARY KEY,request_id TEXT NOT NULL UNIQUE,authority TEXT NOT NULL,staging_id TEXT NOT NULL,old_writer_id TEXT NOT NULL,writer_id TEXT NOT NULL,selection_change TEXT NOT NULL,authorized INTEGER NOT NULL CHECK(authorized IN (0,1)));
 "#;
 
 pub(super) fn error(message: impl ToString) -> StoreError {
@@ -163,6 +166,19 @@ pub(crate) struct ClockState {
     pub accepted: Option<Stamp>,
     pub binding_authority: DecimalU64,
 }
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NewDeviceResult {
+    pub revision: i64,
+    pub writer_id: String,
+    pub binding_authority: DecimalU64,
+}
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NewDevicePreparation {
+    pub authorization_id: String,
+    pub writer_id: String,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 enum Intent {
@@ -178,6 +194,15 @@ enum Intent {
     Target {
         staging_id: String,
         changes: Vec<Change>,
+    },
+    NewDevice {
+        authorization_id: String,
+        staging_id: String,
+        changes: Vec<Change>,
+        old_writer_id: String,
+        writer_id: String,
+        new_authority: DecimalU64,
+        selection_change: super::sync_selection::BindingSelectionChange,
     },
     Repair {
         entries: Vec<OutboxEntry>,
@@ -375,23 +400,22 @@ pub(crate) fn reset_work_metrics() {
 pub(crate) fn take_work_metrics() -> (u64, u64) {
     WORK.with(|v| v.replace((0, 0)))
 }
-fn count_work(_value: &UnitValue) {
-    #[cfg(test)]
+#[cfg(test)]
+fn count_work() {
     WORK.with(|v| {
         let (u, b) = v.get();
         v.set((u + 1, b));
     });
 }
 fn value_identity(value: &UnitValue) -> StoreResult<String> {
+    wire(value.validate())?;
+    let bytes = wire(risunest_sync_wire::canonical::encode(value))?;
     #[cfg(test)]
     WORK.with(|v| {
         let (u, b) = v.get();
-        let size = risunest_sync_wire::canonical::encode(value)
-            .map(|v| v.len())
-            .unwrap_or(0);
-        v.set((u, b + size as u64));
+        v.set((u, b + bytes.len() as u64));
     });
-    wire(value.identity())
+    Ok(risunest_sync_wire::hash(&bytes))
 }
 pub(super) fn record_changes(
     tx: &Transaction<'_>,
@@ -404,7 +428,8 @@ pub(super) fn record_changes(
     let keys: BTreeSet<_> = before.keys().chain(after.keys()).cloned().collect();
     for key in keys {
         let value = after.get(&key).cloned().unwrap_or(UnitValue::Deleted);
-        count_work(&value);
+        #[cfg(test)]
+        count_work();
         if parent_status(tx, &key)? == "retired" {
             continue;
         }
@@ -619,6 +644,29 @@ impl PersistentStore {
             };
             let stamp = serde_json::from_str(&stamp)?;
             let intent = serde_json::from_str::<Intent>(&body)?;
+            if let Intent::NewDevice {
+                staging_id,
+                changes,
+                old_writer_id,
+                writer_id,
+                new_authority,
+                selection_change,
+                ..
+            } = &intent
+            {
+                self.finish_lww_new_device(
+                    &header,
+                    staging_id,
+                    changes,
+                    old_writer_id,
+                    writer_id,
+                    *new_authority,
+                    &stamp,
+                    &digest,
+                    selection_change,
+                )?;
+                continue;
+            }
             if let Intent::Switch {
                 change,
                 new_authority,
@@ -696,6 +744,7 @@ impl PersistentStore {
                     self.finish_lww_repair(&header, &stamp, &entries)?;
                 }
                 Intent::Switch { .. } => unreachable!(),
+                Intent::NewDevice { .. } => unreachable!(),
             }
             self.complete_intent(&header)?;
         }
@@ -1716,27 +1765,39 @@ impl PersistentStore {
             changes,
             target,
             received,
+            None,
+            None,
         )?;
         if target {
             let tx = self.device_store_mut()?.transaction()?;
             verify(&tx, header.binding_authority)?;
-            tx.execute("DELETE FROM hypa_embeddings", [])?;
-            tx.execute("DELETE FROM plugin_device_storage", [])?;
-            tx.execute("DELETE FROM lww_units", [])?;
-            tx.execute("DELETE FROM lww_outbox", [])?;
-            tx.execute("DELETE FROM lww_receive_rows", [])?;
-            for c in received {
-                observe(&tx, &c.stamp)?;
-                if projection::is_device(&c.key) {
-                    projection::apply(&tx, "", &c.key, &c.value)?;
-                    put_unit(&tx, &c.key, &c.stamp, &c.value, &header.request_id, None)?;
-                    witness_received(&tx, c, header.binding_authority)?;
-                }
-            }
+            reset_target_device(&tx, header, received, header.binding_authority)?;
             tx.commit()?;
         }
         Ok(result)
     }
+}
+
+fn reset_target_device(
+    tx: &Transaction<'_>,
+    header: &Header,
+    received: &[Change],
+    binding: DecimalU64,
+) -> StoreResult<()> {
+    tx.execute("DELETE FROM hypa_embeddings", [])?;
+    tx.execute("DELETE FROM plugin_device_storage", [])?;
+    tx.execute("DELETE FROM lww_units", [])?;
+    tx.execute("DELETE FROM lww_outbox", [])?;
+    tx.execute("DELETE FROM lww_receive_rows", [])?;
+    for c in received {
+        observe(tx, &c.stamp)?;
+        if projection::is_device(&c.key) {
+            projection::apply(tx, "", &c.key, &c.value)?;
+            put_unit(tx, &c.key, &c.stamp, &c.value, &header.request_id, None)?;
+            witness_received(tx, c, binding)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

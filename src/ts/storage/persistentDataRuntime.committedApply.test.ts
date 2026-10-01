@@ -393,3 +393,164 @@ describe('committed apply outcomes', () => {
         expect(harness.store.replaceFromDatabase).not.toHaveBeenCalled()
     })
 })
+
+
+describe('activated-library guards', () => {
+    it('fences queued explicit and observer writes before a failed activation pause releases', async () => {
+        const harness = await createHarness()
+        const entered = deferred<void>()
+        const activate = deferred<void>()
+        const queuedMutation = vi.fn(async () => (await harness.store.commit({expectedRevision: 2})).revision)
+        const pause = harness.runtime.withPausedPersistentWrites('activate', async (token) => {
+            entered.resolve()
+            await activate.promise
+            harness.runtime.beginActivatedLibraryGuard(token)
+            harness.nativeCommit(replacement('Activated library'))
+            harness.replaceDatabase.mockImplementationOnce(() => { throw new Error('refresh failed') })
+            await harness.runtime.refreshActivatedLibraryUnderPause(token)
+        })
+        await entered.promise
+        harness.database.username = 'Stale observer edit'
+        const explicit = harness.runtime.runStorageOnlyMutation(queuedMutation).catch((error: unknown) => error)
+        const observer = harness.runtime.flushPendingDataLocally('queued-observer').catch((error: unknown) => error)
+        activate.resolve()
+        await expect(pause).rejects.toThrow('refresh failed')
+        expect(await explicit).toBeInstanceOf(PersistentMutationFencedError)
+        expect(await observer).toBeInstanceOf(PersistentMutationFencedError)
+        expect(queuedMutation).not.toHaveBeenCalled()
+        expect(() => harness.runtime.markPersistentDataDirty(1)).toThrow(PersistentMutationFencedError)
+        await expect(harness.runtime.commitPersistentUnitIntent('stale', [{key: JSON.stringify(['root', 'username']), type: 'set', value: 'Stale explicit edit'}])).rejects.toThrow(PersistentMutationFencedError)
+        await expect(harness.runtime.initializeActiveWorkingSet(harness.database)).rejects.toThrow(PersistentMutationFencedError)
+        expect(harness.store.commit).not.toHaveBeenCalled()
+        expect(harness.runtime.pendingWorkingSetRefreshRevision).toBe(1)
+
+        await expect(harness.runtime.retryCommittedWorkingSetRefresh()).resolves.toEqual({kind: 'committed', revision: 2, projection: 'applied'})
+        expect(harness.database.username).toBe('Activated library')
+        expect(harness.runtime.pendingWorkingSetRefreshRevision).toBeNull()
+        await harness.runtime.flushPendingDataLocally('recovery-baseline')
+        expect(harness.store.commit).not.toHaveBeenCalled()
+        vi.mocked(harness.store.commit).mockImplementation(async (batch) => {
+            const root = applyRootMutations(harness.durable, batch.rootMutations ?? [])
+            for (const mutation of batch.unitMutations ?? []) {
+                const path = JSON.parse(mutation.key) as string[]
+                if (path[0] === 'root' && mutation.type === 'set') Object.assign(root, {[path[1]]: mutation.value})
+            }
+            return {revision: harness.nativeCommit({...harness.durable, ...root} as Database)}
+        })
+        harness.database.username = 'Fresh edit'
+        harness.runtime.markPersistentDataDirty(1)
+        await harness.runtime.flushPendingDataLocally('fresh')
+        expect(harness.store.commit).toHaveBeenCalledOnce()
+        expect(harness.durable.username).toBe('Fresh edit')
+    })
+
+    it('retains the guard when activation or its resulting revision is uncertain', async () => {
+        const harness = await createHarness()
+        await expect(harness.runtime.withPausedPersistentWrites('uncertain', async (token) => {
+            harness.runtime.beginActivatedLibraryGuard(token)
+            harness.nativeCommit(replacement('Native activation succeeded'))
+            throw new Error('native result lost')
+        })).rejects.toThrow('native result lost')
+        expect(() => harness.runtime.assertPersistentMutationAllowed()).toThrow(PersistentMutationFencedError)
+        expect(harness.store.commit).not.toHaveBeenCalled()
+        await harness.runtime.retryCommittedWorkingSetRefresh()
+        expect(harness.database.username).toBe('Native activation succeeded')
+        expect(() => harness.runtime.assertPersistentMutationAllowed()).not.toThrow()
+    })
+
+    it('releases an unchanged preactivation failure only after checking the admission revision', async () => {
+        const harness = await createHarness()
+        let guard!: ReturnType<typeof harness.runtime.beginActivatedLibraryGuard>
+        await expect(harness.runtime.withPausedPersistentWrites('preactivation', async (token) => {
+            guard = harness.runtime.beginActivatedLibraryGuard(token)
+            throw new Error('not activated')
+        })).rejects.toThrow('not activated')
+        expect(() => harness.runtime.assertPersistentMutationAllowed()).toThrow(PersistentMutationFencedError)
+        await guard.abortUnchanged()
+        expect(harness.runtime.pendingWorkingSetRefreshRevision).toBeNull()
+        expect(() => harness.runtime.assertPersistentMutationAllowed()).not.toThrow()
+        await harness.runtime.flushPendingDataLocally('unchanged-baseline')
+        expect(harness.store.commit).not.toHaveBeenCalled()
+    })
+
+    it('rejects unchanged abort when the native revision advanced under the same writer', async () => {
+        const harness = await createHarness()
+        let guard!: ReturnType<typeof harness.runtime.beginActivatedLibraryGuard>
+        await expect(harness.runtime.withPausedPersistentWrites('bound-restore', async (token) => {
+            guard = harness.runtime.beginActivatedLibraryGuard(token)
+            harness.nativeCommit(replacement('Restored library'))
+            throw new Error('restore result unavailable')
+        })).rejects.toThrow('restore result unavailable')
+        await expect(guard.abortUnchanged()).rejects.toThrow(PersistentMutationFencedError)
+        expect(() => harness.runtime.assertPersistentMutationAllowed()).toThrow(PersistentMutationFencedError)
+        expect(harness.store.commit).not.toHaveBeenCalled()
+    })
+
+    it('keeps partial projection adoption fenced until a strict cursor acknowledgement succeeds', async () => {
+        const harness = await createHarness()
+        const cursor = vi.fn().mockRejectedValueOnce(new Error('cursor failed')).mockRejectedValueOnce(new Error('retry cursor failed')).mockResolvedValue(undefined)
+        harness.store.commitWorkingSetChangeCursor = cursor
+        let guard!: ReturnType<typeof harness.runtime.beginActivatedLibraryGuard>
+        await expect(harness.runtime.withPausedPersistentWrites('cursor', async (token) => {
+            guard = harness.runtime.beginActivatedLibraryGuard(token)
+            harness.nativeCommit(replacement('Activated projection'))
+            await harness.runtime.refreshActivatedLibraryUnderPause(token)
+            guard.complete()
+        })).rejects.toThrow('cursor failed')
+        expect(harness.database.username).toBe('Activated projection')
+        expect(harness.runtime.pendingWorkingSetRefreshRevision).toBe(2)
+        expect(() => guard.complete()).toThrow(PersistentMutationFencedError)
+        expect(() => harness.runtime.markPersistentDataDirty(1)).toThrow(PersistentMutationFencedError)
+        await expect(harness.runtime.retryCommittedWorkingSetRefresh()).resolves.toEqual({kind: 'committed', revision: 2, projection: 'refresh-required'})
+        expect(harness.runtime.pendingWorkingSetRefreshRevision).toBe(2)
+        expect(() => harness.runtime.assertPersistentMutationAllowed()).toThrow(PersistentMutationFencedError)
+        await expect(harness.runtime.retryCommittedWorkingSetRefresh()).resolves.toEqual({kind: 'committed', revision: 2, projection: 'applied'})
+        expect(cursor).toHaveBeenCalledTimes(3)
+        expect(harness.runtime.pendingWorkingSetRefreshRevision).toBeNull()
+        expect(harness.store.commit).not.toHaveBeenCalled()
+    })
+
+    it('requires the exact active pause token and completes only after projection adoption', async () => {
+        const harness = await createHarness()
+        await harness.runtime.withPausedPersistentWrites('successful', async (token) => {
+            expect(() => harness.runtime.beginActivatedLibraryGuard({...token})).toThrow(PersistentMutationFencedError)
+            const guard = harness.runtime.beginActivatedLibraryGuard(token)
+            expect(() => guard.complete()).toThrow(PersistentMutationFencedError)
+            harness.nativeCommit(replacement('New library'))
+            await harness.runtime.refreshActivatedLibraryUnderPause(token)
+            guard.complete()
+        })
+        expect(harness.runtime.pendingWorkingSetRefreshRevision).toBeNull()
+        expect(harness.database.username).toBe('New library')
+        expect(() => harness.runtime.assertPersistentMutationAllowed()).not.toThrow()
+        await harness.runtime.flushPendingDataLocally('new-baseline')
+        expect(harness.store.commit).not.toHaveBeenCalled()
+    })
+
+    it('does not fence an ordinary paused operation failure without library activation', async () => {
+        const harness = await createHarness()
+        await expect(harness.runtime.withPausedPersistentWrites('ordinary-clock-error', async () => {
+            throw new Error('clock admission failed')
+        })).rejects.toThrow('clock admission failed')
+        expect(harness.runtime.pendingWorkingSetRefreshRevision).toBeNull()
+        expect(() => harness.runtime.assertPersistentMutationAllowed()).not.toThrow()
+        await harness.runtime.flushPendingDataLocally('ordinary-retry')
+        expect(harness.store.commit).not.toHaveBeenCalled()
+    })
+
+    it('retains an adopted projection guard when the owner did not complete inside the pause', async () => {
+        const harness = await createHarness()
+        let guard!: ReturnType<typeof harness.runtime.beginActivatedLibraryGuard>
+        await harness.runtime.withPausedPersistentWrites('validation-incomplete', async (token) => {
+            guard = harness.runtime.beginActivatedLibraryGuard(token)
+            harness.nativeCommit(replacement('Adopted but unvalidated'))
+            await harness.runtime.refreshActivatedLibraryUnderPause(token)
+        })
+        expect(() => guard.complete()).toThrow(PersistentMutationFencedError)
+        expect(() => harness.runtime.assertPersistentMutationAllowed()).toThrow(PersistentMutationFencedError)
+        await expect(harness.runtime.retryCommittedWorkingSetRefresh()).resolves.toEqual({kind: 'committed', revision: 2, projection: 'applied'})
+        expect(harness.runtime.pendingWorkingSetRefreshRevision).toBeNull()
+        expect(harness.store.commit).not.toHaveBeenCalled()
+    })
+
+})
