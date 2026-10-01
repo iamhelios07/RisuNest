@@ -321,38 +321,6 @@ export interface ExternalHistoryPage {
     nextCursor?: string
 }
 
-export interface ExternalConflictSummary {
-    id: string
-    connectionId: string
-    detectedAtMs: DecimalString
-    localRevision: DecimalString
-    remoteRevision: DecimalString
-    localAvailable: boolean
-    remoteAvailable: boolean
-    remotePointConfirmed: boolean
-    resolved: boolean
-}
-
-export interface ExternalConflictCursor {
-    createdAtMs: number
-    id: string
-}
-
-export interface ExternalConflictPage {
-    conflicts: ExternalConflictSummary[]
-    nextCursor?: ExternalConflictCursor
-}
-
-export interface ExternalConflictSource {
-    type: 'conflictReference'
-    token: string
-}
-
-export interface ExternalConflictDeleteResult {
-    localDeleted: true
-    remotePoint: 'deleted' | 'not-found' | 'left-remote'
-}
-
 export interface ExternalQuotaBucket {
     id: string
     used: DecimalString

@@ -125,7 +125,7 @@ pub(crate) fn set_paused(tx: &Transaction<'_>, expected_epoch: &str, paused: boo
 }
 
 pub(crate) fn require_no_pending_publication(db: &Connection) -> StoreResult<()> {
-    let pending:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM external_storage_jobs WHERE phase='applying') OR EXISTS(SELECT 1 FROM server_sync_operation)",[],|r|r.get(0))?;
+    let pending:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM external_storage_jobs WHERE phase='applying')",[],|r|r.get(0))?;
     if pending {
         return Err(invalid(
             "Unsettled sync operation blocks library replacement",

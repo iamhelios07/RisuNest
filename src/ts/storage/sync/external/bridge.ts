@@ -22,11 +22,6 @@ import type {
     PreparedExternalConnection,
     PrepareExternalConnectionRequest,
     StartExternalJobRequest,
-    ExternalConflictSummary,
-    ExternalConflictCursor,
-    ExternalConflictDeleteResult,
-    ExternalConflictPage,
-    ExternalConflictSource,
     ExternalExitCapture,
     ExternalAuthorizationOutcome,
     ExternalFolderPage,
@@ -206,14 +201,6 @@ export class ExternalStorageBridge {
         return this.native('external_storage_get_job', { jobId })
     }
 
-    applyReceived(
-        jobId: string,
-        expectedRevision: DecimalString,
-    ): Promise<ExternalReceivedApplicationResult> {
-        return this.native('external_storage_apply_received', {
-            request: { jobId, expectedRevision },
-        })
-    }
 
     setExecutionSession(request: {
         kind: 'foreground' | 'hidden' | 'exitDrain'
@@ -240,41 +227,6 @@ export class ExternalStorageBridge {
         })
     }
 
-    listConflicts(
-        cursor?: ExternalConflictCursor,
-        limit?: number,
-    ): Promise<ExternalConflictPage> {
-        return this.native('external_storage_list_conflicts', {
-            ...(cursor ? { cursor } : {}),
-            ...(limit === undefined ? {} : { limit }),
-        })
-    }
-
-    openConflictSource(
-        id: string,
-        side: 'local' | 'remote',
-    ): Promise<{ source: ExternalConflictSource }> {
-        return this.native('external_storage_open_conflict_source', { id, side })
-    }
-
-    releaseConflictSource(token: string): Promise<void> {
-        return this.native('external_storage_release_conflict_source', { token })
-    }
-
-    deleteConflict(
-        id: string,
-        deleteRemotePoint: boolean,
-    ): Promise<ExternalConflictDeleteResult> {
-        return this.native('external_storage_delete_conflict', {
-            id,
-            deleteRemotePoint,
-        })
-    }
-
-    recheckConflict(id: string): Promise<ExternalConflictSummary> {
-        return this.native('external_storage_recheck_conflict', { id })
-    }
-
     getQuota(connectionId: string): Promise<ExternalQuotaSummary> {
         return this.native('external_storage_get_quota', { connectionId })
     }
@@ -299,13 +251,6 @@ export class ExternalStorageBridge {
         return this.native('external_storage_cancel_export', { exportId })
     }
 
-    exportRetainedPublication(jobId: string): Promise<ExternalSnapshotExportResult> {
-        return this.native('external_storage_export_retained_publication', { jobId })
-    }
-
-    removeRetainedPublication(jobId: string): Promise<void> {
-        return this.native('external_storage_remove_retained_publication', { jobId })
-    }
 
     prepareConnectionSettingsImport(payload: string, recoveryKey: string): Promise<PreparedExternalConnection> {
         return this.native('external_storage_prepare_connection_settings_import', {

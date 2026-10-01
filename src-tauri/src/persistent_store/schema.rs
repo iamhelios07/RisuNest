@@ -232,7 +232,7 @@ fn create_schema(connection: &mut Connection) -> StoreResult<()> {
         "INSERT INTO asset_gc_maintenance_state (singleton, catalog_cursor) VALUES (1, NULL)",
         [],
     )?;
-    super::server_sync_outbox::create_schema(&transaction)?;
+    super::server_sync_journal::create_schema(&transaction)?;
     super::content_change_index::create_schema(&transaction)?;
     super::sync_selection::create_schema(&transaction)?;
     super::external_storage_state::create_schema(&transaction)?;
@@ -246,7 +246,7 @@ fn create_schema(connection: &mut Connection) -> StoreResult<()> {
 fn validate_schema(connection: &Connection) -> StoreResult<()> {
     validate_object_sql(connection, "table", "plugin_claim_eligibility",
         PLUGIN_CLAIM_ELIGIBILITY_TABLE_SQL, "plugin claim eligibility table definition is invalid")?;
-    super::server_sync_outbox::validate_schema(connection)?;
+    super::server_sync_journal::validate_schema(connection)?;
     super::content_change_index::validate_schema(connection)?;
     super::external_storage_state::validate_schema(connection)?;
     validate_object_sql(

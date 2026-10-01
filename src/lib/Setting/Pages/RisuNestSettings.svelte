@@ -20,7 +20,6 @@
     import RisuNestIOSPlatform from './RisuNestIOSPlatform.svelte'
     import RisuNestAndroidPlatform from './RisuNestAndroidPlatform.svelte'
     import RisuNestLogViewer from './RisuNestLogViewer.svelte'
-    import ServerSyncSettings from './ServerSyncSettings.svelte'
     import RisuNestUpdateSettings from './RisuNestUpdateSettings.svelte'
     import ExternalStorageSettings from '../ExternalStorage/ExternalStorageSettings.svelte'
     import LocalDataReset from '../RisuNest/LocalDataReset.svelte'
@@ -116,9 +115,6 @@
             <RisuNestBackupRestore />
             <LocalDataReset />
         {:else if activeTab === 'sync'}
-            {#if isTauri}
-                <ServerSyncSettings />
-            {/if}
             <ExternalStorageSettings />
             {#if isTauri}
                 <RisuNestLocalData />

@@ -355,7 +355,6 @@ impl JobStore {
             .collect()
     }
 
-
     /// Jobs whose transfer material may still be on disk. A job that ended in
     /// failure keeps its sealed ciphertext until a cleanup can release it.
     pub fn list_retaining(&self) -> Result<Vec<DurableJob>> {
@@ -580,13 +579,6 @@ impl Drop for JobClaimOwner {
     }
 }
 
-#[derive(Clone)]
-pub(crate) struct AutomaticTarget {
-    pub owner_job_id: String,
-    pub request: StartJobRequest,
-    pub identity: CaptureIdentity,
-}
-
 #[derive(Default)]
 pub(crate) struct JobCommandState {
     cleanup_closed: std::sync::atomic::AtomicBool,
@@ -595,8 +587,6 @@ pub(crate) struct JobCommandState {
     lease_ledger: Mutex<Option<Arc<super::lease_ledger::LocalLeaseLedger>>>,
     pub active: ActiveJobs,
     pub session: Mutex<Session>,
-    pub automatic_targets: Mutex<HashMap<String, AutomaticTarget>>,
-    pub prepared_receives: Mutex<HashMap<String, super::sync_engine::PreparedReceive>>,
     blocking_tasks: Mutex<HashMap<String, Vec<tokio::sync::oneshot::Receiver<()>>>>,
 }
 pub(crate) struct BackgroundWorker(Arc<std::sync::atomic::AtomicUsize>);
@@ -652,7 +642,6 @@ impl JobCommandState {
         let active = self.active.lock().map_err(failure)?;
         self.cleanup_closed.store(true, std::sync::atomic::Ordering::Release);
         for (_, cancel) in active.values() { cancel.cancel(); }
-        self.automatic_targets.lock().map_err(failure)?.clear();
         Ok(())
     }
 
@@ -661,7 +650,6 @@ impl JobCommandState {
         if !active.is_empty() || self.background_workers.load(std::sync::atomic::Ordering::Acquire) != 0 {
             return Ok(false);
         }
-        self.prepared_receives.lock().map_err(failure)?.clear();
         *self.session.lock().map_err(failure)? = Session::default();
         Ok(true)
     }
@@ -689,61 +677,9 @@ impl JobCommandState {
         }) }))
     }
 
-    pub fn coalesce_automatic(
-        &self,
-        running: &DurableJob,
-        request: &StartJobRequest,
-        identity: &CaptureIdentity,
-    ) -> Result<bool> {
-        if running.request.kind != JobKind::Sync
-            || request.kind != JobKind::Sync
-            || running.request.reason.as_deref() != Some("automatic")
-            || request.reason.as_deref() != Some("automatic")
-            || running.request.connection_id != request.connection_id
-        {
-            return Ok(false);
-        }
-        super::runtime::require_admitted_library(running, identity)?;
-        let target = requested_revision(request, identity.revision)?;
-        if target <= requested_revision(&running.request, running.admission_identity.revision)? {
-            return Ok(true);
-        }
-        let mut queued = self.automatic_targets.lock().map_err(failure)?;
-        if self.cleanup_closed.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(ProviderError::new(ErrorKind::Cancelled));
-        }
-        if queued.get(&request.connection_id).is_some_and(|held| {
-            held.owner_job_id == running.id && requested_revision(&held.request, held.identity.revision)
-                .is_ok_and(|revision| revision >= target)
-        }) {
-            return Ok(true);
-        }
-        let mut request = request.clone();
-        request.target_revision = Some(target.to_string());
-        queued.insert(request.connection_id.clone(), AutomaticTarget {
-            owner_job_id: running.id.clone(),
-            request,
-            identity: identity.clone(),
-        });
-        Ok(true)
-    }
-
-    pub fn cancel_automatic_target(&self, job: &DurableJob) -> Result<()> {
-        let mut queued = self.automatic_targets.lock().map_err(failure)?;
-        if queued.get(&job.request.connection_id)
-            .is_some_and(|target| target.owner_job_id == job.id)
-        {
-            queued.remove(&job.request.connection_id);
-        }
-        Ok(())
-    }
 }
 
-pub(crate) fn requested_revision(request: &StartJobRequest, fallback: i64) -> Result<i64> {
-    request.target_revision.as_deref().map_or(Ok(fallback), |value| {
-        value.parse().map_err(|_| ProviderError::new(ErrorKind::Corrupt))
-    })
-}
+
 
 #[cfg(test)]
 mod tests {
@@ -1036,45 +972,6 @@ mod tests {
         assert_eq!(state.active.lock().unwrap().len(), 1);
         drop(claim);
         assert!(state.active.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn automatic_requests_keep_one_latest_target_without_changing_the_capture() {
-        let state = JobCommandState::default();
-        let mut request = request();
-        request.kind = JobKind::Sync;
-        request.reason = Some("automatic".into());
-        request.target_revision = Some("1".into());
-        let job = DurableJob::new(request.clone(), false, 1, identity());
-        for revision in [2, 7, 3, 6] {
-            request.target_revision = Some(revision.to_string());
-            let mut current = identity();
-            current.revision = revision;
-            assert!(state.coalesce_automatic(&job, &request, &current).unwrap());
-        }
-        let queued = state.automatic_targets.lock().unwrap();
-        assert_eq!(queued.len(), 1);
-        assert_eq!(queued["synthetic"].request.target_revision.as_deref(), Some("7"));
-        assert_eq!(job.request.target_revision.as_deref(), Some("1"));
-        assert_eq!(job.admission_identity.revision, 1);
-    }
-
-    #[test]
-    fn automatic_targets_do_not_absorb_explicit_operations_or_other_connections() {
-        let state = JobCommandState::default();
-        let mut automatic = request();
-        automatic.kind = JobKind::Sync;
-        automatic.reason = Some("automatic".into());
-        let job = DurableJob::new(automatic.clone(), false, 1, identity());
-        let mut explicit = automatic.clone();
-        explicit.reason = Some("manual".into());
-        for kind in [JobKind::Sync, JobKind::Backup, JobKind::Restore, JobKind::ResolveConflict] {
-            explicit.kind = kind;
-            assert!(!state.coalesce_automatic(&job, &explicit, &identity()).unwrap());
-        }
-        automatic.connection_id = "another".into();
-        assert!(!state.coalesce_automatic(&job, &automatic, &identity()).unwrap());
-        assert!(state.automatic_targets.lock().unwrap().is_empty());
     }
 
     #[test]

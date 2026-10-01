@@ -7,7 +7,7 @@ import type {
 
 const english = {
     title: 'External storage',
-    help: 'Upload backups to a cloud service or your own server and sync with other devices. All data is encrypted on this device before it is uploaded.',
+    help: 'Upload backups to a cloud service or your own server. All data is encrypted on this device before it is uploaded.',
     unsupported: 'External storage is available in the Android and desktop apps.',
     add: 'Connect storage', cancel: 'Cancel', refresh: 'Refresh', loading: 'Loading…', back: 'Back to the form',
     provider: 'Service', mode: 'Repository', create: 'Create new', existing: 'Connect existing repository',
@@ -185,7 +185,7 @@ const english = {
 
 const korean: typeof english = {
     title: '외부 저장소',
-    help: '클라우드나 개인 서버에 백업을 올리고 다른 기기와 동기화할 수 있습니다. 모든 데이터는 업로드 하기 전 이 기기에서 암호화 됩니다.',
+    help: '클라우드나 개인 서버에 백업을 올릴 수 있습니다. 모든 데이터는 업로드 하기 전 이 기기에서 암호화 됩니다.',
     unsupported: '외부 저장소는 Android 및 데스크톱 앱에서 사용할 수 있습니다.',
     add: '저장소 연결', cancel: '취소', refresh: '새로 고침', loading: '불러오는 중…', back: '입력으로 돌아가기',
     provider: '서비스', mode: '저장소', create: '새로 만들기', existing: '이미 있는 저장소 연결',

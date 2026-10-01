@@ -4,7 +4,6 @@ import {
     defaultExternalCapturePolicy,
     mergeExternalHistoryItems,
     restorableExternalHistoryItems,
-    externalConflictActions,
 } from './connection'
 import { buildConnectionConfig, buildProviderSecret, externalProviderDefinitions } from './providerRegistry'
 
@@ -190,27 +189,4 @@ describe('external storage connection request', () => {
         }])
     })
 
-    it('gates conflict resolution on durable remote confirmation and side availability', () => {
-        const unconfirmed = {
-            id: 'conflict-1', connectionId: 'connection', detectedAtMs: '1' as const,
-            localRevision: '8' as const, remoteRevision: '7' as const,
-            localAvailable: true, remoteAvailable: true,
-            remotePointConfirmed: false, resolved: false,
-        }
-
-        expect(externalConflictActions(unconfirmed)).toEqual(['retry-sync'])
-        expect(externalConflictActions({
-            ...unconfirmed,
-            remotePointConfirmed: true,
-        })).toEqual(['keep-local', 'use-remote'])
-        expect(externalConflictActions({
-            ...unconfirmed,
-            remotePointConfirmed: true,
-            localAvailable: false,
-        })).toEqual(['use-remote'])
-        expect(externalConflictActions({
-            ...unconfirmed,
-            resolved: true,
-        })).toEqual([])
-    })
 })

@@ -145,10 +145,6 @@
         label: externalProviderName(strings, provider.id),
         disabled: providerDescriptors.find(item => item.id === provider.id)?.authorizationAvailable === false,
     })))
-    const purposeOptions = $derived([
-        { value: 'backup' as const, label: strings.backup },
-        ...(supportsSync ? [{ value: 'sync' as const, label: strings.sync }] : []),
-    ])
     const scopeSummary = $derived([
         strings.library,
         ...(hypa ? [strings.hypa] : []),
@@ -657,22 +653,6 @@
         {#if isTauriIOS && providerId === 'onedrive'}<p class="note"><span>{strings.oneDriveIOSSetup}</span></p>{/if}
     </section>
 
-    {#if mode === 'create'}
-    <section class="sub">
-        <h3 class="sub-title">{strings.purpose}</h3>
-        <div class="field">
-            <SegmentedButtons value={purpose} label={strings.purpose} role="radiogroup" disabled={prepared !== null} onchange={selectPurpose} options={purposeOptions} />
-            {#if !supportsSync}<small>{strings.backupOnlyProvider}</small>{/if}
-            <small>{strings.purposeHelp}</small>
-        </div>
-        {#if purpose === 'sync'}
-            <div class="field">
-                <small>{strings.sequentialWarning}</small>
-            </div>
-        {/if}
-    </section>
-    {/if}
-
     {#if providerWarning}
         <div class="warning">
             <strong>{providerWarning.title}</strong>
@@ -789,9 +769,6 @@
                 {/if}
                 {#if prepared.requiresPlatformOAuthClient && prepared.oauthProjectHint}<dt>{strings.oauthProjectHint}</dt><dd>{prepared.oauthProjectHint}</dd>{/if}
             </dl>
-            {#if mode === 'create' && purpose === 'sync'}
-                <p class="note"><span>{strings.syncPurposeLocalDataNotice}</span></p>
-            {/if}
             {#each prepared.endpoint.warnings as warning (warning)}<p class="note"><span>{externalEndpointWarning(strings, warning)}</span></p>{/each}
 
             {#if folderSelection}
@@ -1044,7 +1021,8 @@
         min-width: 0;
         font: inherit;
     }
-    .textarea {
+    .textarea,
+    .datetime {
         min-height: 6rem;
         resize: vertical;
     }

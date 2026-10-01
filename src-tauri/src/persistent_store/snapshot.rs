@@ -245,7 +245,6 @@ fn prepare_restore_candidate(persistent_dir: &Path, target: &Path) -> StoreResul
         let mut connection = Connection::open(&candidate)?;
         super::schema::initialize(&mut connection)?;
         let transaction = connection.transaction()?;
-        super::server_sync_outbox::restored_copy(&transaction)?;
         super::sync_selection::restored_copy(&transaction)?;
         transaction.commit()?;
         let generation = active_generation(&connection)?;

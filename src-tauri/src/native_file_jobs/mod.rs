@@ -12,7 +12,6 @@ mod backup_source;
 mod legacy_backup;
 mod portable;
 pub(crate) mod raw_recovery;
-pub(crate) mod reference_source;
 pub(crate) use backup_source::*;
 mod official_snapshot;
 mod risum_export;
@@ -81,7 +80,6 @@ impl std::error::Error for NativeJobError {}
 pub(crate) enum JobSource {
     DesktopPath { path: String },
     AndroidSpool { token: String },
-    ConflictReference { token: String },
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -313,43 +311,11 @@ pub(crate) enum NativeFileJobStartRequest {
     },
 }
 
-fn portable_export_uses_reference_source(
-    source: &Option<JobSource>,
-    expected_revision: Option<i64>,
-    selection: &portable::PortableSelection,
-) -> Result<bool, NativeJobError> {
-    match (source, expected_revision) {
-        (None, Some(_)) => Ok(false),
-        (Some(JobSource::ConflictReference { .. }), None)
-            if selection.library
-                && selection.device_sections.is_empty()
-                && selection.items.is_none() =>
-        {
-            Ok(true)
-        }
-        (Some(JobSource::ConflictReference { .. }), None) => Err(NativeJobError::new(
-            "invalid-input",
-            "Conflict source export must include the complete library only",
-        )),
-        _ => Err(NativeJobError::new(
-            "invalid-input",
-            "Portable export requires either a revision or a conflict source",
-        )),
-    }
+fn portable_export_requires_revision(source: &Option<JobSource>, expected_revision: Option<i64>, _selection: &portable::PortableSelection) -> Result<bool, NativeJobError> {
+    if source.is_none() && expected_revision.is_some() { Ok(false) }
+    else { Err(NativeJobError::new("invalid-input", "Portable export requires an active revision")) }
 }
 
-fn validate_portable_restore_selection(
-    source: &JobSource,
-    selection: &Option<portable::PortableSelection>,
-) -> Result<(), NativeJobError> {
-    if matches!(source, JobSource::ConflictReference { .. }) && selection.is_some() {
-        return Err(NativeJobError::new(
-            "invalid-input",
-            "Conflict source restore always replaces the complete library",
-        ));
-    }
-    Ok(())
-}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -500,9 +466,6 @@ pub(crate) fn open_job_source(
             let path = resolve_spool_source(job_root, token)?;
             open_regular_file_no_follow(&path)
         }
-        JobSource::ConflictReference { .. } => Err(invalid_source_error(
-            "conflict references are not filesystem sources",
-        )),
     }
 }
 
@@ -527,9 +490,6 @@ fn resolve_source(job_root: &Path, source: &JobSource) -> Result<PathBuf, Native
     match source {
         JobSource::DesktopPath { path } => resolve_desktop_source(path),
         JobSource::AndroidSpool { token } => resolve_spool_source(job_root, token),
-        JobSource::ConflictReference { .. } => Err(invalid_source_error(
-            "conflict references are not filesystem sources",
-        )),
     }
 }
 
@@ -1245,7 +1205,6 @@ pub(crate) struct NativeFileJobState {
     max_concurrent_jobs: usize,
     startup_warnings: Vec<NativeJobError>,
     capability_error: Arc<Mutex<Option<NativeJobError>>>,
-    external_reference_sources: Arc<reference_source::ExternalReferenceSources>,
 }
 
 impl NativeFileJobState {
@@ -1272,7 +1231,6 @@ impl NativeFileJobState {
 
     pub(crate) fn close_for_cleanup(&self) -> Result<(), String> {
         if self.active_workers.load(Ordering::Acquire) != 0 { return Err("cleanup-native-jobs-busy".into()); }
-        self.external_reference_sources.clear_for_cleanup()?;
         self.registry.jobs.lock().map_err(|_| "cleanup-native-jobs-busy")?.clear();
         Ok(())
     }
@@ -1334,7 +1292,6 @@ impl NativeFileJobState {
             max_concurrent_jobs,
             startup_warnings,
             capability_error: Arc::new(Mutex::new(capability_error)),
-            external_reference_sources: Arc::new(reference_source::ExternalReferenceSources::default()),
         }
     }
 
@@ -1358,11 +1315,7 @@ impl NativeFileJobState {
                         parse_android_spool_token(token)?;
                         None
                     }
-                    JobSource::ConflictReference { .. } => {
-                        return Err(invalid_source_error(
-                            "conflict references require portable restore",
-                        ));
-                    }
+
                 };
                 NativeFileJobTask::Restore {
                     opened_source,
@@ -1418,11 +1371,7 @@ impl NativeFileJobState {
                         parse_android_spool_token(token)?;
                         None
                     }
-                    JobSource::ConflictReference { .. } => {
-                        return Err(invalid_source_error(
-                            "conflict references require portable restore",
-                        ));
-                    }
+
                 };
                 let repository_root =
                     crate::persistent_store::commands::with_store_mut(app.state(), |store| {
@@ -1447,7 +1396,7 @@ impl NativeFileJobState {
                 if let Some(path) = destination.as_deref() {
                     validate_desktop_destination(path)?;
                 }
-                let store = if portable_export_uses_reference_source(
+                let store = if portable_export_requires_revision(
                     &source,
                     expected_revision,
                     &selection,
@@ -1467,7 +1416,6 @@ impl NativeFileJobState {
                     expected_revision,
                     store,
                     source,
-                    claimed_source: None,
                     selection,
                     app,
                 }
@@ -1496,14 +1444,12 @@ impl NativeFileJobState {
                 expected_revision,
                 selection,
             } => {
-                validate_portable_restore_selection(&source, &selection)?;
                 let opened_source = match &source {
                     JobSource::DesktopPath { .. } => Some(open_job_source(&self.root, &source)?),
                     JobSource::AndroidSpool { token } => {
                         parse_android_spool_token(token)?;
                         None
                     }
-                    JobSource::ConflictReference { .. } => None,
                 };
                 let store =
                     crate::persistent_store::commands::with_store_mut(app.state(), |store| {
@@ -1516,7 +1462,6 @@ impl NativeFileJobState {
                     expected_revision,
                     store,
                     selection,
-                    claimed_source: None,
                     app,
                 }
             }
@@ -1672,11 +1617,7 @@ impl NativeFileJobState {
                         parse_android_spool_token(token)?;
                         None
                     }
-                    JobSource::ConflictReference { .. } => {
-                        return Err(invalid_source_error(
-                            "conflict references cannot import JPEG assets",
-                        ));
-                    }
+
                 };
                 let store =
                     crate::persistent_store::commands::with_store_mut(app.state(), |store| {
@@ -1844,9 +1785,6 @@ impl NativeFileJobState {
                 claim_spool_content_source(&self.root, token, &owned_directory, &display_name)
                     .map(|source| source.opened)
             }
-            JobSource::ConflictReference { .. } => Err(invalid_source_error(
-                "conflict references cannot import content",
-            )),
         };
         let opened_source = match opened_source {
             Ok(source) => source,
@@ -1923,11 +1861,7 @@ impl NativeFileJobState {
                 parse_android_spool_token(token)?;
                 None
             }
-            JobSource::ConflictReference { .. } => {
-                return Err(invalid_source_error(
-                    "conflict references require portable restore",
-                ));
-            }
+
         };
         self.spawn(
             NativeFileJobTask::Restore {
@@ -1973,21 +1907,6 @@ impl NativeFileJobState {
                 *slot = Some(capture_guard);
             }
         }
-        // Admission prevents a new server operation between this check and activation.
-        if let NativeFileJobTask::RestorePortable { store, .. } = &task {
-            let status = store.server_status().map_err(|_| {
-                NativeJobError::new(
-                    "server-status-unavailable",
-                    "Cannot verify server operation state",
-                )
-            })?;
-            if status.operation_pending {
-                return Err(NativeJobError::new(
-                    "resolve-pending-operation-first",
-                    "Resolve the pending server operation before restoring",
-                ));
-            }
-        }
         let worker_permit =
             WorkerPermit::acquire(Arc::clone(&self.active_workers), self.max_concurrent_jobs)?;
         let kind = task.kind();
@@ -2022,26 +1941,7 @@ impl NativeFileJobState {
             }
         };
         let source_preparation = (|| -> Result<(), NativeJobError> {
-            match &mut task {
-                NativeFileJobTask::ExportPortable {
-                    source: Some(JobSource::ConflictReference { token }),
-                    claimed_source,
-                    app,
-                    ..
-                }
-                | NativeFileJobTask::RestorePortable {
-                    source: JobSource::ConflictReference { token },
-                    claimed_source,
-                    app,
-                    ..
-                } => {
-                    *claimed_source = Some(reference_source::claim_reference_source(
-                        app, self, token,
-                    )?);
-                    return Ok(());
-                }
-                _ => {}
-            }
+
             let (opened_source, source, expected_display_name) = match &mut task {
                 NativeFileJobTask::Restore {
                     opened_source,
@@ -2078,10 +1978,6 @@ impl NativeFileJobState {
                     *opened_source = Some(source.opened);
                     Ok(())
                 }
-                JobSource::ConflictReference { .. } => Err(NativeJobError::new(
-                    "store-error",
-                    "conflict source claim was not retained by the native job",
-                )),
                 _ => Err(NativeJobError::new(
                     "store-error",
                     "native job source resolution is inconsistent",
@@ -2101,13 +1997,7 @@ impl NativeFileJobState {
                 )),
             };
         };
-        let terminal_reference_source = match &task {
-            NativeFileJobTask::ExportPortable { claimed_source, .. }
-            | NativeFileJobTask::RestorePortable { claimed_source, .. } => {
-                claimed_source.clone()
-            }
-            _ => None,
-        };
+
         let root = self.root.clone();
         let registry = Arc::clone(&self.registry);
         std::thread::spawn(move || {
@@ -2119,20 +2009,11 @@ impl NativeFileJobState {
                         destination,
                         expected_revision,
                         store,
-                        claimed_source,
                         selection,
                         app,
                         ..
-                    } => match (claimed_source, expected_revision, store) {
-                        (Some(source), None, None) => reference_source::export_reference_source(
-                            source,
-                            destination.as_deref(),
-                            &owned_directory,
-                            &root.join("handoffs"),
-                            &job,
-                            &app,
-                        ),
-                        (None, Some(revision), Some(store)) => portable::export_portable(
+                    } => match (expected_revision, store) {
+                        (Some(revision), Some(store)) => portable::export_portable(
                             destination.as_deref(),
                             revision,
                             &owned_directory,
@@ -2178,18 +2059,9 @@ impl NativeFileJobState {
                         expected_revision,
                         store,
                         selection,
-                        claimed_source,
                         app,
-                    } => match (claimed_source, opened_source) {
-                        (Some(source), None) => reference_source::restore_reference_source(
-                            source,
-                            expected_revision,
-                            &owned_directory,
-                            store,
-                            &job,
-                            &app,
-                        ),
-                        (None, Some(input)) => portable::restore_portable(
+                    } => match opened_source {
+                        Some(input) => portable::restore_portable(
                             input,
                             matches!(source, JobSource::AndroidSpool { .. }),
                             expected_revision,
@@ -2393,7 +2265,6 @@ impl NativeFileJobState {
             }
             finish_worker_outcome(&job, kind, outcome, cleanup_errors);
             let _ = registry.prune();
-            drop(terminal_reference_source);
         });
         Ok(NativeFileJobStarted {
             job_id,
@@ -2648,7 +2519,6 @@ enum NativeFileJobTask {
         expected_revision: Option<i64>,
         store: Option<crate::persistent_store::PersistentStore>,
         source: Option<JobSource>,
-        claimed_source: Option<reference_source::ClaimedReferenceSource>,
         selection: portable::PortableSelection,
         app: AppHandle,
     },
@@ -2665,7 +2535,6 @@ enum NativeFileJobTask {
         expected_revision: i64,
         store: crate::persistent_store::PersistentStore,
         selection: Option<portable::PortableSelection>,
-        claimed_source: Option<reference_source::ClaimedReferenceSource>,
         app: AppHandle,
     },
     Restore {
@@ -7010,79 +6879,13 @@ mod tests {
     }
 
     #[test]
-    fn portable_export_requires_exactly_one_active_or_reference_source() {
+    fn portable_export_requires_an_active_revision() {
         let selection = portable::PortableSelection::default();
-        assert!(!portable_export_uses_reference_source(&None, Some(7), &selection).unwrap());
-
-        let reference = Some(JobSource::ConflictReference {
-            token: "server:00000000-0000-4000-8000-000000000000".into(),
-        });
-        assert!(portable_export_uses_reference_source(&reference, None, &selection).unwrap());
-        assert_eq!(
-            portable_export_uses_reference_source(&reference, Some(7), &selection)
-                .unwrap_err()
-                .code,
-            "invalid-input"
-        );
-        assert_eq!(
-            portable_export_uses_reference_source(&None, None, &selection)
-                .unwrap_err()
-                .code,
-            "invalid-input"
-        );
-
-        let with_device_section = portable::PortableSelection {
-            library: true,
-            device_sections: vec!["hypa".into()],
-            items: None,
-            allow_source_preservation: false,
-        };
-        assert_eq!(
-            portable_export_uses_reference_source(&reference, None, &with_device_section)
-                .unwrap_err()
-                .code,
-            "invalid-input"
-        );
-
-        let request: NativeFileJobStartRequest = serde_json::from_value(json!({
-            "kind": "export-portable-backup",
-            "source": {
-                "type": "conflictReference",
-                "token": "external:00000000-0000-4000-8000-000000000000"
-            },
-            "selection": {"library": true, "deviceSections": []},
-            "destination": null
-        }))
-        .unwrap();
-        assert!(matches!(
-            request,
-            NativeFileJobStartRequest::ExportPortableBackup {
-                expected_revision: None,
-                source: Some(JobSource::ConflictReference { token }),
-                ..
-            } if token == "external:00000000-0000-4000-8000-000000000000"
-        ));
+        assert!(!portable_export_requires_revision(&None, Some(7), &selection).unwrap());
+        assert!(portable_export_requires_revision(&None, None, &selection).is_err());
+        assert!(portable_export_requires_revision(&Some(JobSource::DesktopPath { path: "synthetic".into() }), Some(7), &selection).is_err());
     }
 
-    #[test]
-    fn conflict_reference_restore_rejects_partial_or_device_selection() {
-        let source = JobSource::ConflictReference {
-            token: "server:00000000-0000-4000-8000-000000000000".into(),
-        };
-        assert!(validate_portable_restore_selection(&source, &None).is_ok());
-        let selected = Some(portable::PortableSelection {
-            library: true,
-            device_sections: vec!["hypa".into()],
-            items: None,
-            allow_source_preservation: false,
-        });
-        assert_eq!(
-            validate_portable_restore_selection(&source, &selected)
-                .unwrap_err()
-                .code,
-            "invalid-input"
-        );
-    }
 
     #[test]
     fn native_content_export_requests_are_descriptor_only_and_recovery_kinds_stay_exact() {

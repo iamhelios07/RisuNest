@@ -17,10 +17,6 @@ import type { RetainableReplacementFence } from '../../retainableReplacementFenc
 import { subscribeLocalPersistentRevision } from '../../persistentRevisionEvents'
 import type { SyncExitDrainAdapter } from '../../syncExitCoordinator'
 import { hasPendingExternalApplication, runExternalApplication } from './applicationRecovery'
-import {
-    exportPortableBackupFromReferenceSource,
-    restoreBackupFromNativeSource,
-} from '../../portableBackupFileRouteProduction.svelte'
 import { getExternalStorageBridge } from './bridge'
 import {
     createExternalStorageController,
@@ -54,7 +50,6 @@ interface ProductionRuntime {
 let runtime: ProductionRuntime | undefined
 let installation: Promise<() => void> | undefined
 // A receive during an exit drain applies under the fence the exit holds.
-let exitDrainFence: RetainableReplacementFence | undefined
 
 function assertNoPendingApplication(): void {
     if (hasPendingExternalApplication()) {
@@ -70,13 +65,6 @@ function destinations(state: ExternalStorageState): ExternalScheduledDestination
     const result: ExternalScheduledDestination[] = state.connections
         .filter(connection => connection.purpose === 'backup' && !connection.automaticBackupPaused && connection.status === 'ready')
         .map(connection => ({ connectionId: connection.id, kind: 'backup' as const }))
-    const selected = state.selection
-    if (selected.kind !== 'external' || selected.paused || selected.decisionRequired) return result
-    const connection = state.connections.find(item =>
-        item.id === selected.connectionId
-        && item.purpose === 'sync'
-        && item.status === 'ready')
-    if (connection) result.push({ connectionId: connection.id, kind: 'sync' })
     return result
 }
 
@@ -105,104 +93,6 @@ function parseExternalLocalRevision(value: string | number): number {
     return revision
 }
 
-async function applyReceivedSync(
-    current: ProductionRuntime,
-    job: ExternalJobSummary,
-): Promise<void> {
-    assertNoPendingApplication()
-    if (
-        job.result?.receiveReady !== true
-        || job.result.expectedRevision === undefined
-        || !/^(0|[1-9]\d*)$/.test(job.result.expectedRevision)
-    ) {
-        throw new Error('External sync receive readiness is incomplete')
-    }
-    let fence: PersistentDestructiveReplacementFence
-    let expected: number
-    try {
-        if (exitDrainFence) {
-            fence = exitDrainFence.retain()
-            expected = getPersistentDataRuntime().revision
-        } else {
-            await flushPendingDataLocally('external-storage-sync-receive')
-            const token = await capturePersistentMutationToken(
-                'external-storage-sync-receive', { publishOfficial: false },
-            )
-            fence = await acquireDestructiveReplacementFence(token)
-            expected = token.revision
-        }
-    } catch (error) {
-        // An already-running foreground receive may meet the newly acquired exit fence.
-        if (!(error instanceof PersistentMutationFencedError) || !exitDrainFence) throw error
-        fence = exitDrainFence.retain()
-        expected = getPersistentDataRuntime().revision
-    }
-    if (String(expected) !== job.result.expectedRevision) {
-        fence.release()
-        await getExternalStorageBridge().cancelJob(job.id)
-        throw new Error('Local data changed while external sync receive was prepared')
-    }
-    await runExternalApplication({
-        jobId: job.id,
-        fence,
-        confirm: async () => {
-            try {
-                const result = await getExternalStorageBridge().applyReceived(
-                    job.id, String(expected) as DecimalString,
-                )
-                return { kind: 'committed', revision: parseExternalLocalRevision(result.receivedRevision) }
-            } catch (error) {
-                const observed = await getExternalStorageBridge().getJob(job.id)
-                if (observed.state === 'succeeded' && observed.result?.receivedRevision !== undefined) {
-                    return { kind: 'committed', revision: parseExternalLocalRevision(observed.result.receivedRevision) }
-                }
-                throw error
-            }
-        },
-        refreshReleased: refreshActiveWorkingSetFromStore,
-        afterRefresh: async () => {
-            await (await import('../../../plugins/plugins.svelte')).loadPluginsAfterAuthoritativeRestore()
-            const state = await getExternalStorageBridge().getState()
-            current.state = state
-            current.controller.replaceState(state)
-        },
-        settled: () => current.scheduler.resume(),
-    })
-}
-
-export async function requestExternalConflictRestore(
-    conflictId: string,
-    side: 'local' | 'remote',
-): Promise<void> {
-    const bridge = getExternalStorageBridge()
-    let token: string | undefined
-    try {
-        await restoreBackupFromNativeSource(async () => {
-            const result = await bridge.openConflictSource(conflictId, side)
-            token = result.source.token
-            return result.source
-        })
-    } finally {
-        if (token) await bridge.releaseConflictSource(token)
-    }
-}
-
-export async function requestExternalConflictExport(
-    conflictId: string,
-    side: 'local' | 'remote',
-): Promise<void> {
-    const bridge = getExternalStorageBridge()
-    let token: string | undefined
-    try {
-        await exportPortableBackupFromReferenceSource(async () => {
-            const result = await bridge.openConflictSource(conflictId, side)
-            token = result.source.token
-            return result.source
-        })
-    } finally {
-        if (token) await bridge.releaseConflictSource(token)
-    }
-}
 
 /** Installs one lightweight native state read and durable-revision scheduling. */
 export function installExternalStorageProduction(): Promise<() => void> {
@@ -214,13 +104,7 @@ export function installExternalStorageProduction(): Promise<() => void> {
         await bridge.setExecutionSession(session)
         const state = await bridge.getState()
         const holder: { current?: ProductionRuntime } = {}
-        const controller = createExternalStorageController(bridge, state, {
-            applyReceived: async job => {
-                const current = holder.current
-                if (!current) throw new Error('External storage production is not installed')
-                await applyReceivedSync(current, job)
-            },
-        })
+        const controller = createExternalStorageController(bridge, state)
         const scheduler = createExternalStorageScheduler(controller, {
             available: () => !hasPendingExternalApplication()
                 && document.visibilityState !== 'hidden' && navigator.onLine,
@@ -342,11 +226,11 @@ export async function refreshExternalStorageProductionState(): Promise<void> {
 /** Flushes local state, captures its durable revision, then waits for that goal. */
 export async function requestExternalStorageNow(
     connectionId: string,
-    kind: 'sync' | 'backup' | 'cleanup',
+    kind: 'backup' | 'cleanup',
 ): Promise<ExternalControllerResult> {
     return runWithMobileBackgroundTask(kind === 'cleanup' ? 'maintenance' : kind, async background => {
         assertNoPendingApplication()
-        if (kind !== 'cleanup') await flushPendingDataLocally(kind === 'sync' ? 'external-sync-now' : 'external-backup-now')
+        if (kind !== 'cleanup') await flushPendingDataLocally('external-backup-now')
         const token = await capturePersistentMutationToken('external-storage-manual')
         const current = runtime
         if (!current) throw new Error('External storage production is not installed')
@@ -386,16 +270,16 @@ export async function resumeExternalStorageJob(job: ExternalJobSummary): Promise
                 error: resumed.error, job: resumed }
         }, undefined, true)
     }
-    if (!['sync', 'backup', 'cleanup'].includes(job.kind)) throw new Error('Unsupported resume operation')
+    if (!['backup', 'cleanup'].includes(job.kind)) throw new Error('Unsupported resume operation')
     if (!job.reason || (job.kind !== 'cleanup' && job.targetRevision === undefined)) {
         throw new Error('The pending operation has no admission request')
     }
     const current = runtime
     if (!current) throw new Error('External storage production is not installed')
-    return runWithMobileBackgroundTask(job.kind === 'cleanup' ? 'maintenance' : job.kind as 'sync' | 'backup', async background => {
+    return runWithMobileBackgroundTask(job.kind === 'cleanup' ? 'maintenance' : job.kind as 'backup', async background => {
         assertNoPendingApplication()
         const result = await current.controller.request({
-            connectionId: job.connectionId, kind: job.kind as 'sync' | 'backup' | 'cleanup',
+            connectionId: job.connectionId, kind: job.kind as 'backup' | 'cleanup',
             targetRevision: job.targetRevision ?? '0', reason: job.state === 'uncertain' ? 'manual' : job.reason!,
             session: current.session, backgroundTask: background, jobId: job.id,
         })
@@ -449,61 +333,7 @@ export async function requestExternalStorageDeleteHistory(
  * repository side with `remote-apply`, which only this layer can activate, so
  * starting the job through the bridge alone would leave it waiting.
  */
-export async function requestExternalStorageResolveConflict(
-    connectionId: string,
-    conflictId: string,
-    choice: 'local' | 'remote',
-    jobId?: string,
-): Promise<ExternalJobSummary> {
-    return runWithMobileBackgroundTask('sync', async (background) => {
-        assertNoPendingApplication()
-        const current = runtime
-        if (!current) throw new Error('External storage production is not installed')
-        await flushPendingDataLocally('external-storage-resolve-conflict')
-        await current.scheduler.suspend(destination =>
-            destination.kind === 'sync' && destination.connectionId === connectionId)
-        try {
-            const request: StartExternalJobRequest = {
-                connectionId,
-                kind: 'resolve-conflict',
-                conflictId,
-                choice,
-                reason: 'manual',
-                session: current.session.kind,
-                sessionId: current.session.id,
-            }
-            let job = await getExternalStorageBridge().startJob(request, ...(jobId ? [jobId] as const : [] as const))
-            let retries = 0
-            while (true) {
-                if (externalJobIsPaused(job)) {
-                    const resumed = await retryPausedJob(job, request, retries++, background)
-                    if (!resumed) throw restoreFailure(job)
-                    job = resumed
-                    continue
-                }
-                if (job.state === 'waiting' && job.phase === 'remote-apply') {
-                    await applyReceivedSync(current, job)
-                    job = await readBackgroundJob(job.id, background)
-                    background.progress(measuredTaskPercent(Number(job.completedBytes), Number(job.totalBytes)))
-                    continue
-                }
-                if (job.state === 'succeeded') break
-                if (['failed', 'cancelled', 'uncertain', 'conflict'].includes(job.state)) {
-                    throw restoreFailure(job)
-                }
-                await new Promise(resolve => setTimeout(resolve, job.state === 'waiting' ? 5_000 : 500))
-                job = await readBackgroundJob(job.id, background)
-                background.progress(measuredTaskPercent(Number(job.completedBytes), Number(job.totalBytes)))
-            }
-            const state = await getExternalStorageBridge().getState()
-            current.state = state
-            current.controller.replaceState(state)
-            return job
-        } finally {
-            current.scheduler.resume()
-        }
-    }, undefined, true)
-}
+
 
 async function retryPausedJob(
     job: ExternalJobSummary,
@@ -645,62 +475,8 @@ export interface ExternalExitSelectionCapture {
     }
 }
 
+
 export function getExternalStorageSyncExitDrainAdapter(
-    capture?: ExternalExitSelectionCapture,
-    fence?: RetainableReplacementFence,
-): SyncExitDrainAdapter | null {
-    const current = runtime
-    if (!current) return null
-    const selection = capture?.selection ?? current.state.selection
-    const connectionId = 'id' in selection && typeof selection.id === 'string'
-        ? selection.id
-        : 'connectionId' in selection && typeof selection.connectionId === 'string'
-            ? selection.connectionId
-            : undefined
-    if (selection.kind !== 'external' || !connectionId || selection.decisionRequired) return null
-    const id = `external:${connectionId}:${selection.selectionEpoch}`
-    let drainSession: ExternalExecutionSession | undefined
-    let refreshOwed = false
-    return {
-        id,
-        async drain(target, signal) {
-            if (hasPendingExternalApplication()) {
-                return { kind: 'blocked', reason: 'external-application-confirmation-pending' }
-            }
-            if (target.selectionId !== id || target.selectionEpoch !== selection.selectionEpoch) {
-                return { kind: 'blocked', reason: 'external-storage-selection-changed' }
-            }
-            const bridge = getExternalStorageBridge()
-            drainSession = newSession('exitDrain')
-            await current.lifecycle
-            await bridge.setExecutionSession(drainSession)
-            exitDrainFence = fence
-            try {
-                return await current.controller.drainToRevision(
-                    connectionId,
-                    target,
-                    drainSession.id,
-                    signal,
-                )
-            } finally {
-                if (exitDrainFence === fence) exitDrainFence = undefined
-            }
-        },
-        async cancel(reason) {
-            try {
-                await current.controller.cancel(connectionId)
-            } finally {
-                refreshOwed ||= !!drainSession && reason === 'cancel-exit'
-                drainSession = undefined
-            }
-        },
-        async resumeAfterExitCancel() {
-            if (!refreshOwed) return
-            refreshOwed = false
-            current.lifecycle = current.lifecycle.then(async () => {
-                if (runtime === current) await refreshForeground(current)
-            })
-            await current.lifecycle
-        },
-    }
-}
+    _capture?: ExternalExitSelectionCapture,
+    _fence?: RetainableReplacementFence,
+): SyncExitDrainAdapter | null { return null }

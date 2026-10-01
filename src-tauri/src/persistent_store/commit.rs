@@ -25,11 +25,9 @@ pub(super) fn incremental_commit<T>(
     let prepared = prepare(&transaction, &active)?;
     let revision = actual_revision + 1;
     let generation = active;
-    super::server_sync_outbox::begin_mutation(&transaction, &generation, revision)?;
     super::content_change_index::begin_mutation(&transaction, &generation, revision, "local")?;
     body(&transaction, &generation, prepared)?;
     super::content_change_index::finish_mutation(&transaction)?;
-    super::server_sync_outbox::finish_mutation(&transaction)?;
     set_active(&transaction, revision, &generation)?;
     transaction.commit()?;
     Ok(RevisionResult { revision })
@@ -1467,7 +1465,6 @@ fn replace_commit_transaction(
     super::plugin_claim_eligibility::capture(&transaction, staging_id)?;
     delete_generation(&transaction, &active)?;
     move_generation(&transaction, staging_id, &generation)?;
-    super::server_sync_outbox::full_replacement(&transaction)?;
     super::content_change_index::full_replacement(&transaction, &generation, revision)?;
     if external_job.is_none() {
         super::sync_selection::replaced(&transaction)?;
@@ -1655,7 +1652,6 @@ fn apply_plugin_storage_mutation(
             Ok(())
         }
         PluginStorageMutation::Clear { owner } => {
-            super::server_sync_outbox::capture_clear(transaction, generation, owner)?;
             transaction.execute(
                 "DELETE FROM plugin_storage WHERE generation = ?1 AND owner = ?2",
                 params![generation, owner],
@@ -2489,7 +2485,6 @@ pub(super) fn claim_unowned_plugin_value(
     };
     let value: Value = serde_json::from_str(&serialized)?;
     let revision = actual_revision + 1;
-    super::server_sync_outbox::begin_mutation(&transaction, &generation, revision)?;
     super::content_change_index::begin_mutation(&transaction, &generation, revision, "local")?;
     // A delete and an insert, so both sides of the move reach the change index.
     transaction.execute(
@@ -2515,7 +2510,6 @@ pub(super) fn claim_unowned_plugin_value(
         ],
     )?;
     super::content_change_index::finish_mutation(&transaction)?;
-    super::server_sync_outbox::finish_mutation(&transaction)?;
     set_active(&transaction, revision, &generation)?;
     transaction.commit()?;
     Ok((Some(value), revision))
@@ -2590,7 +2584,6 @@ pub(super) fn assign_plugin_storage(
     }
     let generation = active_generation(&transaction)?;
     let revision = actual_revision + 1;
-    super::server_sync_outbox::begin_mutation(&transaction, &generation, revision)?;
     super::content_change_index::begin_mutation(&transaction, &generation, revision, "local")?;
     for (from_owner, key) in sources {
         if from_owner == to_owner {
@@ -2653,7 +2646,6 @@ pub(super) fn assign_plugin_storage(
         outcome.moved += 1;
     }
     super::content_change_index::finish_mutation(&transaction)?;
-    super::server_sync_outbox::finish_mutation(&transaction)?;
     set_active(&transaction, revision, &generation)?;
     transaction.commit()?;
     Ok((outcome, revision))

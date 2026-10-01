@@ -14,47 +14,6 @@ pub(crate) enum PublicationMode {
     ExitDrain,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PublicationPermit {
-    job_id: String,
-    selection_epoch: String,
-    mode: PublicationMode,
-}
-impl PublicationPermit {
-    pub(super) fn new(
-        job_id: String,
-        selection_epoch: String,
-        mode: PublicationMode,
-    ) -> Result<Self> {
-        if job_id.is_empty() || selection_epoch.is_empty() {
-            return Err(ProviderError::new(ErrorKind::Corrupt));
-        }
-        Ok(Self {
-            job_id,
-            selection_epoch,
-            mode,
-        })
-    }
-    pub(crate) fn job_id(&self) -> &str {
-        &self.job_id
-    }
-    pub(crate) fn selection_epoch(&self) -> &str {
-        &self.selection_epoch
-    }
-    pub(crate) fn mode(&self) -> PublicationMode {
-        self.mode
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn test_publication_permit(
-    job_id: &str,
-    selection_epoch: &str,
-    mode: PublicationMode,
-) -> PublicationPermit {
-    PublicationPermit::new(job_id.into(), selection_epoch.into(), mode).unwrap()
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PublicationObservation {
     Confirmed,
