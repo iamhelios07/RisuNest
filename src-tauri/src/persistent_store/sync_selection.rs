@@ -474,6 +474,21 @@ mod binding_tests {
     }
 
     #[test]
+    fn binding_switch_fences_old_mutations_and_never_relays_pending_versions() {
+        use super::super::device_store::plugin_values::PluginDeviceMutation;
+        let dir=tempfile::tempdir().unwrap();let mut store=super::super::PersistentStore::open(dir.path()).unwrap();
+        store.device_store().unwrap().connection().execute("UPDATE device_sections SET participating=1 WHERE section='local-plugins'",[]).unwrap();
+        let first=SyncTarget::Server("first".into());let first_inspection=inspect(&store,&first);let old=switch(&mut store,&first_inspection,&first);
+        store.device_store_mut().unwrap().write_plugin_device_values("owner",&[PluginDeviceMutation::Set{space:"string".into(),key:"pending".into(),value:"local".into()}]).unwrap();
+        assert!(!store.lww_read_outbox(old.target_authority,100).unwrap().entries.is_empty());
+        let second=SyncTarget::External("second".into());let second_inspection=inspect(&store,&second);let next=switch(&mut store,&second_inspection,&second);
+        assert!(store.lww_read_outbox(old.target_authority,100).is_err());
+        assert!(store.lww_read_outbox(next.target_authority,100).unwrap().entries.is_empty());
+        let device_value=store.device_store().unwrap().read_plugin_device_value("owner","string","pending").unwrap();
+        assert_eq!(device_value,Some("local".into()));
+    }
+
+    #[test]
     fn binding_selection_replays_exactly_and_preserves_backup_jobs() {
         let mut db = database(); let change = change(&db);
         let tx = db.transaction().unwrap();
@@ -614,11 +629,12 @@ impl super::PersistentStore {
         let state = self.lww_binding_state()?;
         if state.target_authority != request.header.binding_authority || state.selection_epoch != request.expected_selection_epoch || matches!(state.target,SyncTarget::None) { return Err(invalid("Sync binding changed")); }
         let (library,target):(Option<String>,Option<String>) = self.connection.query_row("SELECT library_id,target_id FROM lww_binding_identity WHERE singleton=1", [], |r| Ok((r.get(0)?,r.get(1)?)))?;
-        if library.as_deref() != Some(&request.library_id) || target.as_deref() != Some(&request.target_id) { return Err(invalid("Wrong replacement target")); }
+        if library.as_deref() != Some(request.library_id.as_str()) || target.as_deref() != Some(request.target_id.as_str()) { return Err(invalid("Wrong replacement target")); }
         let (receive,encoded,epoch,stage_library,stage_target):(String,String,Option<String>,String,String) = self.connection.query_row("SELECT s.receive_id,s.changes,s.activation_epoch,i.library_id,i.target_id FROM lww_binding_stages s JOIN lww_binding_inspections i USING(inspection_id) WHERE s.staging_id=?1", [&request.staging_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
-        if receive != request.receive_id || epoch.as_deref() != Some(&request.expected_selection_epoch) || stage_library != request.library_id || stage_target != request.target_id { return Err(invalid("Stale or wrong-target replacement stage")); }
+        if receive != request.receive_id || epoch.as_deref() != Some(request.expected_selection_epoch.as_str()) || stage_library != request.library_id || stage_target != request.target_id { return Err(invalid("Stale or wrong-target replacement stage")); }
         if request.header.request_id != request.receive_id { return Err(invalid("Binding receive request identity changed")); }
-        if active_generation(&self.connection)? != request.staging_id {
+        let library_committed:bool = self.connection.query_row("SELECT EXISTS(SELECT 1 FROM lww_requests WHERE request_id=?1)", [&request.header.request_id], |r| r.get(0))?;
+        if !library_committed {
             validate_binding_stage_content(&self.connection,&request.staging_id)?;
         }
         let changes:Vec<super::lww::Change> = serde_json::from_str(&encoded)?;
