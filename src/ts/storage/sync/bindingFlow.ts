@@ -24,6 +24,7 @@ export interface StagedSyncTarget {
 export interface BindingContext {
     state: SyncBindingState
     signal: AbortSignal
+    mode?: SyncBindingOptions['mode']
 }
 export interface NewDeviceBindingPreparation {
     authorizationId: string
@@ -81,6 +82,10 @@ function sameTarget(a: BindingTarget, b: BindingTarget): boolean {
     return a.kind === b.kind && (a.kind === 'none' || (b.kind !== 'none' && a.connectionId === b.connectionId))
 }
 
+function bindingContext(state: SyncBindingState, signal: AbortSignal, mode?: SyncBindingOptions['mode']): BindingContext {
+    return { state, signal, ...(mode === 'new-device' ? { mode } : {}) }
+}
+
 export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
     let running = false
     let active: { transport: SyncBindingTransport; context: BindingContext; controller: AbortController } | undefined
@@ -92,21 +97,22 @@ export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
     const fenceOld = async (transport: SyncBindingTransport, context: BindingContext) => {
         if (active) {
             active.controller.abort()
-            await active.transport.fenceOldJobs(active.context)
+            await active.transport.fenceOldJobs(bindingContext(active.context.state, active.context.signal, context.mode))
         } else await transport.fenceOldJobs(context)
         await check(context)
     }
-    const resumeOld = async () => {
+    const resumeOld = async (mode?: SyncBindingOptions['mode']) => {
         if (!active) return
         await dependencies.native.assertAuthority(active.context.state)
         const controller = new AbortController()
-        active = { ...active, controller, context: { state: active.context.state, signal: controller.signal } }
-        await active.transport.resumeBinding(active.context)
+        active = { ...active, controller, context: bindingContext(active.context.state, controller.signal) }
+        await active.transport.resumeBinding(bindingContext(active.context.state, controller.signal, mode))
     }
     return {
         async bind(target: Exclude<BindingTarget, { kind: 'none' }>, transport: SyncBindingTransport, options: SyncBindingOptions = {}): Promise<BindingOutcome> {
             if (running) throw new Error('A sync binding change is already running')
-            const newDevice = options.mode === 'new-device'
+            const mode = options.mode === 'new-device' ? 'new-device' : undefined
+            const newDevice = mode === 'new-device'
             if (newDevice && (!transport.prepareNewDeviceBinding || !transport.replaceAsNewDevice || !transport.resumeNewDeviceBinding)) {
                 throw new Error('New device sync binding is unavailable')
             }
@@ -119,7 +125,7 @@ export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
             try {
                 const state = await dependencies.native.state()
                 originalState = state
-                const context = { state, signal: controller.signal }
+                const context = bindingContext(state, controller.signal, mode)
                 const inspected = await transport.inspectTarget(context)
                 await check(context)
                 const replace = newDevice || (!inspected.empty && !inspected.previouslyBoundLibrary)
@@ -162,18 +168,18 @@ export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
                                 !sameTarget(activated.target, target) || activated.libraryId !== staged!.libraryId) {
                                 throw new Error('New device sync binding changed')
                             }
-                            await check({ state: activated, signal: controller.signal })
+                            await check(bindingContext(activated, controller.signal, mode))
                             return activated
                         }
                         const next = !replace && sameTarget(state.target, target) && state.libraryId === inspected.libraryId
                             ? state : await dependencies.native.switchTarget(state, target, inspected)
-                        const nextContext = { state: next, signal: controller.signal }
+                        const nextContext = bindingContext(next, controller.signal, mode)
                         await check(nextContext)
                         if (staged) await transport.replaceFromTarget(staged, nextContext)
                         await check(nextContext)
                         return next
                     })
-                    const nextContext = { state: next, signal: controller.signal }
+                    const nextContext = bindingContext(next, controller.signal, mode)
                     if (staged) {
                         await dependencies.plugins.invalidateCaches()
                         await dependencies.refreshActivatedLibrary()
@@ -188,11 +194,11 @@ export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
                 })
                 if (result.kind === 'cancelled') {
                     jobsFenced = false
-                    await resumeOld()
+                    await resumeOld(mode)
                     return result
                 }
-                const activatedContext = { state: result.state, signal: controller.signal }
-                active = { transport, context: activatedContext, controller }
+                const activatedContext = bindingContext(result.state, controller.signal, mode)
+                active = { transport, context: bindingContext(result.state, controller.signal), controller }
                 jobsFenced = false
                 if (result.action === 'new-device') {
                     await transport.resumeNewDeviceBinding!(preparation!, result.newDevice!, activatedContext)
@@ -214,7 +220,7 @@ export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
                     try {
                         if (activationGuard) { await activationGuard.abortUnchanged(); activationGuard = undefined }
                         if (pluginsFenced) { pluginsFenced = false; await dependencies.plugins.restart() }
-                        if (jobsFenced) { jobsFenced = false; await resumeOld() }
+                        if (jobsFenced) { jobsFenced = false; await resumeOld(mode) }
                     } catch (recoveryError) {
                         throw new AggregateError([error, recoveryError], 'Sync binding failed while resuming local state')
                     }
@@ -229,7 +235,7 @@ export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
                 const state = await dependencies.native.state()
                 if (active) {
                     active.controller.abort()
-                    await active.transport.fenceOldJobs(active.context)
+                    await active.transport.fenceOldJobs(bindingContext(active.context.state, active.context.signal))
                 }
                 return await dependencies.withPausedWrites(async () => {
                     const next = await dependencies.gate.runTransition(() => dependencies.native.switchTarget(state, { kind: 'none' }, null))

@@ -55,6 +55,57 @@ function newDeviceTransport(s: ReturnType<typeof setup>) {
     }
 }
 
+it('passes explicit new-device context mode through inspection, staging, fencing, preparation, activation and resume', async () => {
+    const s = setup(); newDeviceTransport(s)
+    const phases = [
+        vi.spyOn(s.transport, 'inspectTarget'), vi.spyOn(s.transport, 'pullAvailableState'),
+        vi.spyOn(s.transport, 'fenceOldJobs'), vi.spyOn(s.transport, 'prepareNewDeviceBinding'),
+        vi.spyOn(s.transport, 'replaceAsNewDevice'), vi.spyOn(s.transport, 'resumeNewDeviceBinding'),
+    ]
+    await s.flow.bind(target, s.transport, { mode: 'new-device' })
+    for (const phase of phases) {
+        expect(phase).toHaveBeenCalledOnce()
+        expect(phase.mock.calls[0].at(-1)).toHaveProperty('mode', 'new-device')
+    }
+})
+it.each([{}, { empty: true }, { previouslyBoundLibrary: true }])('ordinary binding omits context mode in every callback for %s', async inspected => {
+    const s = setup(inspected)
+    const phases = [
+        vi.spyOn(s.transport, 'inspectTarget'), vi.spyOn(s.transport, 'pullAvailableState'),
+        vi.spyOn(s.transport, 'fenceOldJobs'), vi.spyOn(s.transport, 'replaceFromTarget'),
+        vi.spyOn(s.transport, 'publishInitialSharedState'), vi.spyOn(s.transport, 'resumeBinding'),
+    ]
+    await s.flow.bind(target, s.transport)
+    for (const phase of phases) for (const args of phase.mock.calls) expect(args.at(-1)).not.toHaveProperty('mode')
+})
+it('explicit new-device operation passes mode when fencing and recovering an already active ordinary binding', async () => {
+    const s = setup({ empty: true }); await s.flow.bind(target, s.transport)
+    const fence = vi.spyOn(s.transport, 'fenceOldJobs')
+    const resume = vi.spyOn(s.transport, 'resumeBinding')
+    const prepare = vi.fn<NonNullable<SyncBindingTransport['prepareNewDeviceBinding']>>(async () => { throw new Error('prepare stopped') })
+    s.transport.prepareNewDeviceBinding = prepare
+    s.transport.replaceAsNewDevice = vi.fn()
+    s.transport.resumeNewDeviceBinding = vi.fn()
+    await expect(s.flow.bind(target, s.transport, { mode: 'new-device' })).rejects.toThrow('prepare stopped')
+    expect(fence.mock.calls[0][0]).toMatchObject({ mode: 'new-device', state: { targetAuthority: '1' } })
+    expect(fence.mock.calls[0][0].signal.aborted).toBe(true)
+    expect(prepare.mock.calls[0][1]).toHaveProperty('mode', 'new-device')
+    expect(resume.mock.calls[0][0]).toHaveProperty('mode', 'new-device')
+    expect(resume.mock.calls[0][0].signal.aborted).toBe(false)
+})
+it('new-device context mode does not leak into later ordinary binding or unbind', async () => {
+    const s = setup(); newDeviceTransport(s)
+    await s.flow.bind(target, s.transport, { mode: 'new-device' })
+    s.transport.inspectTarget = async () => ({ inspectionId: 'inspected', targetId: 'target', libraryId: 'library', empty: false, previouslyBoundLibrary: true })
+    const fence = vi.spyOn(s.transport, 'fenceOldJobs')
+    const resume = vi.spyOn(s.transport, 'resumeBinding')
+    await s.flow.bind(target, s.transport)
+    await s.flow.unbind()
+    expect(fence).toHaveBeenCalledTimes(2)
+    for (const args of fence.mock.calls) expect(args[0]).not.toHaveProperty('mode')
+    expect(resume.mock.calls[0][0]).not.toHaveProperty('mode')
+})
+
 it.each([{ empty: true }, { previouslyBoundLibrary: true }])('explicit new device stages and replaces even when %s', async inspected => {
     const s = setup({ ...inspected, nonDefault: false })
     newDeviceTransport(s)
