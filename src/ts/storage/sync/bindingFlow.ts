@@ -28,6 +28,7 @@ export interface BindingContext {
 export interface SyncBindingTransport {
     inspectTarget(context: BindingContext): Promise<InspectedSyncTarget>
     pullAvailableState(target: InspectedSyncTarget, context: BindingContext): Promise<StagedSyncTarget>
+    // Native activation only, called under the exclusive gate. It must not acquire a renderer gate.
     replaceFromTarget(staged: StagedSyncTarget, context: BindingContext): Promise<void>
     publishInitialSharedState(context: BindingContext): Promise<void>
     resumeBinding(context: BindingContext): Promise<void>
@@ -67,6 +68,19 @@ export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
         await dependencies.native.assertAuthority(context.state)
         context.signal.throwIfAborted()
     }
+    const fenceOld = async (transport: SyncBindingTransport, context: BindingContext) => {
+        if (active) {
+            active.controller.abort()
+            await active.transport.fenceOldJobs(active.context)
+        } else await transport.fenceOldJobs(context)
+        await check(context)
+    }
+    const resumeOld = async () => {
+        if (!active) return
+        const controller = new AbortController()
+        active = { ...active, controller, context: { state: active.context.state, signal: controller.signal } }
+        await active.transport.resumeBinding(active.context)
+    }
     return {
         async bind(target: Exclude<BindingTarget, { kind: 'none' }>, transport: SyncBindingTransport): Promise<BindingOutcome> {
             if (running) throw new Error('A sync binding change is already running')
@@ -83,72 +97,69 @@ export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
                     if (!await dependencies.confirmReplacement()) return { kind: 'cancelled' }
                     acknowledged = true
                 }
-                // Staging is validated while the original library and jobs are still intact.
                 const staged = replace ? await transport.pullAvailableState(inspected, context) : undefined
                 await check(context)
                 if (staged && (staged.targetId !== inspected.targetId || staged.libraryId !== inspected.libraryId)) {
                     throw new Error('Sync target changed during binding')
                 }
-                return await dependencies.withPausedWrites(async () => {
-                const result: BindingOutcome = await dependencies.gate.runTransition(async () => {
+                await fenceOld(transport, context)
+                if (replace) await dependencies.plugins.fenceExecution()
+                const result: BindingOutcome = await dependencies.withPausedWrites(async () => {
                     await check(context)
                     if (replace && !acknowledged && await dependencies.hasNonDefaultData()) {
-                        if (!await dependencies.confirmReplacement()) return { kind: 'cancelled' } as const
+                        if (!await dependencies.confirmReplacement()) {
+                            await dependencies.plugins.restart()
+                            return { kind: 'cancelled' }
+                        }
+                        acknowledged = true
                     }
-                    if (active) {
-                        active.controller.abort()
-                        await active.transport.fenceOldJobs(active.context)
+                    const next = await dependencies.gate.runTransition(async () => {
                         await check(context)
-                    } else {
-                        await transport.fenceOldJobs(context)
-                        await check(context)
-                    }
-                    if (replace) await dependencies.plugins.fenceExecution()
-                    const next = !replace && sameTarget(state.target, target) && state.libraryId === inspected.libraryId
-                        ? state : await dependencies.native.switchTarget(state, target, inspected)
-                    const nextContext = { state: next, signal: controller.signal }
-                    await check(nextContext)
-                    if (staged) {
-                        await transport.replaceFromTarget(staged, nextContext)
+                        const next = !replace && sameTarget(state.target, target) && state.libraryId === inspected.libraryId
+                            ? state : await dependencies.native.switchTarget(state, target, inspected)
+                        const nextContext = { state: next, signal: controller.signal }
                         await check(nextContext)
-
-                    } else if (inspected.empty) {
-                        // Default-only shared state needs no transfer; local plugin values stay intact.
-                        if (await dependencies.hasNonDefaultSharedData()) await transport.publishInitialSharedState(nextContext)
-                    } else {
-                        await transport.resumeBinding(nextContext)
+                        if (staged) await transport.replaceFromTarget(staged, nextContext)
+                        await check(nextContext)
+                        return next
+                    })
+                    const nextContext = { state: next, signal: controller.signal }
+                    if (staged) {
+                        await dependencies.plugins.invalidateCaches()
+                        await dependencies.refreshActivatedLibrary()
+                        await check(nextContext)
+                        await dependencies.plugins.restart()
                     }
                     await check(nextContext)
-                    active = { transport, context: nextContext, controller }
                     return { kind: 'bound', action: staged ? 'replaced' : inspected.empty ? 'initialized' : 'resumed', state: next }
                 })
-                if (result.kind === 'bound' && result.action === 'replaced') {
-                    const activatedContext = { state: result.state, signal: controller.signal }
-                    await dependencies.plugins.invalidateCaches()
-                    await dependencies.refreshActivatedLibrary()
-                    await check(activatedContext)
-                    await dependencies.plugins.restart()
+                if (result.kind === 'cancelled') {
+                    await resumeOld()
+                    return result
                 }
+                const activatedContext = { state: result.state, signal: controller.signal }
+                active = { transport, context: activatedContext, controller }
+                if (result.action === 'initialized') {
+                    if (await dependencies.hasNonDefaultSharedData()) await transport.publishInitialSharedState(activatedContext)
+                } else if (result.action === 'resumed') await transport.resumeBinding(activatedContext)
+                await check(activatedContext)
                 return result
-                })
-            } finally {
-                running = false
-            }
+            } finally { running = false }
         },
         async unbind(): Promise<SyncBindingState> {
             if (running) throw new Error('A sync binding change is already running')
             running = true
             try {
-                return await dependencies.withPausedWrites(() => dependencies.gate.runTransition(async () => {
-                    const state = await dependencies.native.state()
-                    if (active) {
-                        active.controller.abort()
-                        await active.transport.fenceOldJobs(active.context)
-                    }
-                    const next = await dependencies.native.switchTarget(state, { kind: 'none' }, null)
+                const state = await dependencies.native.state()
+                if (active) {
+                    active.controller.abort()
+                    await active.transport.fenceOldJobs(active.context)
+                }
+                return await dependencies.withPausedWrites(async () => {
+                    const next = await dependencies.gate.runTransition(() => dependencies.native.switchTarget(state, { kind: 'none' }, null))
                     active = undefined
                     return next
-                }))
+                })
             } finally { running = false }
         },
     }
