@@ -1,7 +1,6 @@
 //! Portable ZIP64/SQLite archive primitives. File jobs own capture, publication and activation.
 mod capture;
 mod catalog;
-#[cfg(test)]
 mod inventory;
 mod reader;
 mod restore_inventory;
@@ -10,7 +9,6 @@ mod writer;
 
 pub(crate) use capture::{capture_library, CapturedLibrary};
 pub(crate) use catalog::Catalog;
-#[cfg(test)]
 pub(crate) use reader::VerifiedArchive;
 pub(crate) use validation::{
     registered_object_totals, scan_live_library, scan_registered_objects, validate_live_library,
