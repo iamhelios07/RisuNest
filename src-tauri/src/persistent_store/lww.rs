@@ -1283,7 +1283,7 @@ impl PersistentStore {
                             stamp: serde_json::from_str(&stamp)?,
                             value: serde_json::from_str(&value)?,
                         },
-                        status == "held",
+                        matches!(status.as_str(), "held" | "deferred"),
                     ));
                 }
                 v
@@ -1302,7 +1302,7 @@ impl PersistentStore {
                 super::content_change_index::begin_mutation(&tx, &generation, revision, "server")?;
                 revision
             };
-            for (id, change, was_held) in changes {
+            for (id, change, was_unprojected) in changes {
                 let c = change.key.components();
                 let retired = parent_status(&tx, &change.key)? == "retired";
                 let status = if retired {
@@ -1344,7 +1344,7 @@ impl PersistentStore {
                             None,
                         )?;
                         result.affected_keys.push(change.key.clone());
-                    } else if was_held && decision == LwwDecision::Identical {
+                    } else if was_unprojected && decision == LwwDecision::Identical {
                         projection::apply(&tx, &generation, &change.key, &change.value)?;
                         result.affected_keys.push(change.key.clone());
                     }

@@ -96,6 +96,31 @@ fn held_children_survive_activation_restart_and_project_on_parent_arrival_withou
 }
 
 #[test]
+fn held_message_deferred_during_generation_projects_after_restart_and_drain_without_restamping() {
+    let dir=tempfile::tempdir().unwrap(); let mut store=PersistentStore::open(dir.path()).unwrap();
+    let mut messages=change(&["messages","missing","chat"],Value::Null);
+    messages.value=message_value(&store,&[json!({"data":"deferred-held-message","chatId":"m"})]);
+    let incoming=vec![change(&["exists","conversation","missing","chat"],json!(true)),messages.clone()];
+    let (header,inspection)=context(&store); let stage=store.lww_stage_binding_units(&header,&inspection,&incoming,7.into()).unwrap();
+    activate(&mut store,&header,&inspection,&stage);
+    let receive=Header{binding_authority:store.lww_binding_authority().unwrap(),request_id:uuid::Uuid::new_v4().to_string()};
+    store.lww_stage_receive(&StageReceive{header:receive.clone(),changes:vec![change(&["exists","character","missing"],json!(true))],progress:Progress{kind:"server".into(),cursor:1.into(),writer_id:None},admitted_time_upper_ms:7.into()}).unwrap();
+    let applied=store.lww_apply_receive(&ApplyReceive{header:receive.clone(),generating:vec![super::super::MessageLocator{character_id:"missing".into(),conversation_id:"chat".into(),start:None}]}).unwrap();
+    assert_eq!(applied.deferred_keys,vec![messages.key.clone()]);
+    assert_eq!(store.connection.query_row("SELECT count(*) FROM messages",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    store.lww_finish_receive(&receive).unwrap();
+    drop(store); let mut store=PersistentStore::open(dir.path()).unwrap();
+    let drained=store.lww_drain_deferred(&ApplyReceive{header:Header{binding_authority:store.lww_binding_authority().unwrap(),request_id:uuid::Uuid::new_v4().to_string()},generating:vec![]}).unwrap();
+    assert!(drained.deferred_keys.is_empty()); assert!(drained.affected_keys.contains(&messages.key));
+    let value=catalog(&store,&active_generation(&store.connection).unwrap());
+    assert_eq!(value["characters"][0]["chats"][0]["message"][0]["data"],"deferred-held-message");
+    assert_eq!(read_unit(&store.connection,&messages.key).unwrap(),Some((messages.stamp.clone(),messages.value.clone())));
+    assert_eq!(store.connection.query_row("SELECT version FROM lww_units WHERE key=?1",[messages.key.as_str()],|r|r.get::<_,String>(0)).unwrap(),header.request_id);
+    assert_eq!(store.connection.query_row("SELECT status FROM lww_receive_rows WHERE request_id=?1 AND key=?2",params![header.request_id,messages.key.as_str()],|r|r.get::<_,String>(0)).unwrap(),"done");
+    assert!(store.lww_read_outbox(store.lww_binding_authority().unwrap(),100).unwrap().entries.is_empty());
+}
+
+#[test]
 fn source_retirement_suppresses_descendants_and_order_uses_creation_stamps() {
     let dir = tempfile::tempdir().unwrap(); let mut store = PersistentStore::open(dir.path()).unwrap();
     let mut retired = change(&["exists","character","retired"], json!(true)); retired.value = UnitValue::Deleted;
