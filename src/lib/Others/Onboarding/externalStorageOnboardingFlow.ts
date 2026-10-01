@@ -4,6 +4,8 @@
  * checked without a DOM.
  */
 
+import { bindSyncTarget } from 'src/ts/storage/sync/bindingRegistry'
+import type { BindingOutcome } from 'src/ts/storage/sync/bindingFlow'
 import { restorableExternalHistoryItems } from 'src/ts/storage/sync/external/connection'
 import {
     externalRestorableSections,
@@ -52,4 +54,12 @@ export function externalOnboardingRestoreAreas(
 /** True when a restore replaces device sections, which restarts the app. */
 export function externalOnboardingRestoreRestarts(): boolean {
     return false
+}
+
+export function bindExternalOnboardingTarget(connectionId: string): Promise<BindingOutcome> {
+    return bindSyncTarget({ kind: 'external', connectionId })
+}
+
+export function bindServerOnboardingTarget(connectionId: string): Promise<BindingOutcome> {
+    return bindSyncTarget({ kind: 'server', connectionId })
 }
