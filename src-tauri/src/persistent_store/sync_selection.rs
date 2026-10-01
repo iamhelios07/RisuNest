@@ -225,17 +225,17 @@ pub(super) fn restored_copy(tx: &Transaction<'_>) -> StoreResult<()> {
     Ok(())
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BindingContent {
     pub library: serde_json::Value,
-    pub opaque_shared_unit_count: u64,
+    pub opaque_shared_unit_count: risunest_sync_wire::stamp::DecimalU64,
     pub shared_variables: serde_json::Value,
     pub protected_values: serde_json::Value,
-    pub managed_alias_count: u64,
-    pub ordinary_plugin_value_count: u64,
-    pub hypa_value_count: u64,
-    pub plugin_local_value_count: u64,
+    pub managed_alias_count: risunest_sync_wire::stamp::DecimalU64,
+    pub ordinary_plugin_value_count: risunest_sync_wire::stamp::DecimalU64,
+    pub hypa_value_count: risunest_sync_wire::stamp::DecimalU64,
+    pub plugin_local_value_count: risunest_sync_wire::stamp::DecimalU64,
 }
 
 impl super::PersistentStore {
@@ -272,13 +272,13 @@ impl super::PersistentStore {
         }
         Ok(BindingContent {
             library: self.materialize(None)?,
-            opaque_shared_unit_count,
+            opaque_shared_unit_count: opaque_shared_unit_count.into(),
             shared_variables,
             protected_values:serde_json::Value::Object(protected),
-            managed_alias_count: aliases as u64,
-            ordinary_plugin_value_count: ordinary as u64,
-            hypa_value_count: device.hypa_embedding_usage()?.0,
-            plugin_local_value_count: plugin_local as u64,
+            managed_alias_count: (aliases as u64).into(),
+            ordinary_plugin_value_count: (ordinary as u64).into(),
+            hypa_value_count: device.hypa_embedding_usage()?.0.into(),
+            plugin_local_value_count: (plugin_local as u64).into(),
         })
     }
 }
@@ -333,6 +333,24 @@ pub(crate) fn apply_binding_selection(tx: &Transaction<'_>, change: &BindingSele
 #[cfg(test)]
 mod binding_tests {
     use super::*;
+
+    #[test]
+    fn binding_content_count_dto_uses_only_canonical_decimal_strings() {
+        let encoded = serde_json::json!({
+            "library":{},"sharedVariables":{},"protectedValues":{},
+            "opaqueSharedUnitCount":"0","managedAliasCount":"18446744073709551615",
+            "ordinaryPluginValueCount":"9007199254740993","hypaValueCount":"1","pluginLocalValueCount":"2"
+        });
+        let decoded:BindingContent = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(decoded.managed_alias_count.0,u64::MAX);
+        assert_eq!(serde_json::to_value(decoded).unwrap(),encoded);
+        for key in ["opaqueSharedUnitCount","managedAliasCount","ordinaryPluginValueCount","hypaValueCount","pluginLocalValueCount"] {
+            for invalid in [serde_json::json!(0),serde_json::Value::Null,serde_json::json!(""),serde_json::json!("00"),serde_json::json!("01"),serde_json::json!("+1"),serde_json::json!("-1"),serde_json::json!("1.0"),serde_json::json!("1e3"),serde_json::json!(" 1"),serde_json::json!("18446744073709551616")] {
+                let mut input=encoded.clone();input[key]=invalid;
+                assert!(serde_json::from_value::<BindingContent>(input).is_err(),"accepted invalid {key}");
+            }
+        }
+    }
     fn database() -> Connection {
         let db = Connection::open_in_memory().unwrap();
         create_schema(&db).unwrap();
@@ -355,9 +373,9 @@ mod binding_tests {
         let participation: bool = device.connection().query_row("SELECT participating FROM device_sections WHERE section='local-plugins'", [], |r| r.get(0)).unwrap();
         assert!(!participation);
         let content = store.lww_binding_content().unwrap();
-        assert_eq!(content.plugin_local_value_count, 2);
-        assert_eq!(content.hypa_value_count, 0);
-        assert_eq!(content.ordinary_plugin_value_count, 0);
+        assert_eq!(content.plugin_local_value_count.0, 2);
+        assert_eq!(content.hypa_value_count.0, 0);
+        assert_eq!(content.ordinary_plugin_value_count.0, 0);
     }
     fn staged(store: &mut super::super::PersistentStore, inspection: &str, changes: &[super::super::lww::Change]) -> (String,String) {
         let staging = store.replace_begin().unwrap().staging_id;
@@ -426,9 +444,9 @@ mod binding_tests {
         let request=replacement(&state,&staging,&receive);
         store.replace_lww_binding(&request).unwrap();
         let content=store.lww_binding_content().unwrap();
-        assert_eq!(content.plugin_local_value_count,0);
-        assert_eq!(content.hypa_value_count,0);
-        assert_eq!(content.ordinary_plugin_value_count,0);
+        assert_eq!(content.plugin_local_value_count.0,0);
+        assert_eq!(content.hypa_value_count.0,0);
+        assert_eq!(content.ordinary_plugin_value_count.0,0);
         assert_eq!(store.read_root(None).unwrap().value["statics"],serde_json::json!({"messages":7}));
         assert_eq!(store.read_root(None).unwrap().value["loreBookPage"],3);
         assert_eq!(store.read_root(None).unwrap().value["vertexAccessToken"],"synthetic");
@@ -439,7 +457,7 @@ mod binding_tests {
         assert!(store.lww_read_outbox(state.target_authority,100).unwrap().entries.is_empty());
         store.device_store_mut().unwrap().write_plugin_device_values("orphan",&[PluginDeviceMutation::Set{space:"string".into(),key:"after".into(),value:"kept".into()}]).unwrap();
         store.replace_lww_binding(&request).unwrap();
-        assert_eq!(store.lww_binding_content().unwrap().plugin_local_value_count,1);
+        assert_eq!(store.lww_binding_content().unwrap().plugin_local_value_count.0,1);
     }
     #[test]
     fn binding_target_plugin_values_are_active_only_with_participation() {
@@ -455,7 +473,7 @@ mod binding_tests {
             assert_eq!(active,i64::from(enabled));
             let opaque:i64=store.device_store().unwrap().connection().query_row("SELECT COUNT(*) FROM lww_units",[],|r|r.get(0)).unwrap();
             assert_eq!(opaque,1);
-            assert_eq!(store.lww_binding_content().unwrap().plugin_local_value_count,1);
+            assert_eq!(store.lww_binding_content().unwrap().plugin_local_value_count.0,1);
         }
     }
 

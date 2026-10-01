@@ -1,10 +1,20 @@
 import { describe, expect, it } from 'vitest'
-import { hasNonDefaultBindingData, type BindingLocalContent } from './bindingDefaults'
+import { hasNonDefaultBindingData, validateBindingCount, type BindingLocalContent } from './bindingDefaults'
 
 function defaults(): BindingLocalContent {
     const library = { characters: [{ chaId: 'fresh-id', name: 'Factory', chats: [{ id: 'chat-id', message: [] }], chatPage: 0 }], botPresets: [{ id: 'preset-id', name: 'Default' }], personas: [{ id: 'persona-id', name: 'User' }], jailbreakToggle: false }
-    return { library: structuredClone(library), factoryLibrary: library, managedAliasCount: 0, factoryManagedAliasCount: 0, ordinaryPluginValueCount: 0, hypaValueCount: 0, pluginLocalValueCount: 0 }
+    return { library: structuredClone(library), factoryLibrary: library, opaqueSharedUnitCount: '0', managedAliasCount: '0', factoryManagedAliasCount: '0', ordinaryPluginValueCount: '0', hypaValueCount: '0', pluginLocalValueCount: '0' }
 }
+
+it('preserves exact canonical decimal count strings beyond Number precision', () => {
+    for (const value of ['0', '9007199254740993', '18446744073709551615']) {
+        expect(validateBindingCount(value)).toBe(value)
+        expect(typeof validateBindingCount(value)).toBe('string')
+    }
+})
+it.each([0, null, undefined, '', '00', '01', '+1', '-1', '1.0', '1e3', ' 1', '18446744073709551616'])('rejects a noncanonical count %s', value => {
+    expect(() => validateBindingCount(value)).toThrow('Invalid binding content count')
+})
 
 describe('first binding non-default data', () => {
     it('accepts current factory defaults', () => expect(hasNonDefaultBindingData(defaults())).toBe(false))
@@ -35,7 +45,7 @@ describe('first binding non-default data', () => {
         expect(hasNonDefaultBindingData(data)).toBe(true)
     })
     it.each(['ordinaryPluginValueCount', 'hypaValueCount', 'pluginLocalValueCount', 'managedAliasCount'] as const)('counts %s independently of participation', key => {
-        const data = defaults(); data[key] = 1
+        const data = defaults(); data[key] = '1'
         expect(hasNonDefaultBindingData(data)).toBe(true)
     })
     it('ignores other device-local settings, credentials and derived mirrors', () => {
@@ -51,7 +61,7 @@ describe('first binding non-default data', () => {
 })
 
 it('counts opaque stored shared units without a factory counterpart', () => {
-    const data = defaults(); data.opaqueSharedUnitCount = 1
+    const data = defaults(); data.opaqueSharedUnitCount = '1'
     expect(hasNonDefaultBindingData(data)).toBe(true)
 })
 it('does not normalize arbitrary content just because it matches a generated ID', () => {
