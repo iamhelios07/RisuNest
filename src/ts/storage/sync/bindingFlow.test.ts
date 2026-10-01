@@ -23,6 +23,7 @@ function setup(options: Partial<InspectedSyncTarget> & { nonDefault?: boolean; c
         hasNonDefaultSharedData: async () => options.nonDefault ?? true,
         confirmReplacement: async () => { events.push('confirm'); return options.confirm ?? true },
         refreshActivatedLibrary: record('refresh'),
+        beginActivatedLibraryGuard: () => ({ complete() {}, async abortUnchanged() {} }),
     }
     const target: InspectedSyncTarget = { inspectionId: 'inspected', targetId: 'target', libraryId: 'library', empty: false, previouslyBoundLibrary: false, ...options }
     const transport: SyncBindingTransport = {
@@ -97,6 +98,96 @@ it('unsettled old publication cannot enter new device activation or plugin reset
     await expect(s.flow.bind(target, s.transport, { mode: 'new-device' })).rejects.toThrow('publication outcome unresolved')
     expect(s.events).toEqual(['inspect', 'confirm', 'stage', 'jobs-fence'])
     expect((await s.deps.native.state()).targetAuthority).toBe('0')
+})
+it.each(['prepare', 'activate'])('resumes unchanged active binding after new device %s failure outside pause and gate', async failure => {
+    const s = setup({ empty: true })
+    await s.flow.bind(target, s.transport)
+    s.events.length = 0
+    const gate = createStorageMutationGate({ locks: createInRealmStorageLockManager() }); s.deps.gate = gate
+    let paused = false
+    s.deps.withPausedWrites = async operation => { paused = true; try { return await operation() } finally { paused = false } }
+    s.deps.plugins.restart = async () => { expect(paused).toBe(false); await gate.runWrite(async () => { s.events.push('restart-old') }) }
+    s.transport.resumeBinding = async context => { expect(paused).toBe(false); expect(context.signal.aborted).toBe(false); expect(context.state.targetAuthority).toBe('1'); await gate.runWrite(async () => { s.events.push('resume-old') }) }
+    s.transport.prepareNewDeviceBinding = async () => {
+        if (failure === 'prepare') throw new Error('new device failed')
+        return { authorizationId: 'native', writerId: 'reserved' }
+    }
+    s.transport.replaceAsNewDevice = async () => { throw new Error('new device failed') }
+    s.transport.resumeNewDeviceBinding = async () => { throw new Error('unexpected new device resume') }
+    await expect(s.flow.bind(target, s.transport, { mode: 'new-device' })).rejects.toThrow('new device failed')
+    expect((await s.deps.native.state()).targetAuthority).toBe('1')
+    expect(s.events).toContain('resume-old')
+    if (failure === 'activate') expect(s.events).toContain('restart-old')
+    else expect(s.events).not.toContain('restart-old')
+    expect(paused).toBe(false)
+})
+it('ordinary replacement switch failure restores unchanged plugins and active adapter', async () => {
+    const s = setup({ empty: true }); await s.flow.bind(target, s.transport); s.events.length = 0
+    s.transport.inspectTarget = async () => ({ inspectionId: 'new', targetId: 'target', libraryId: 'library', empty: false, previouslyBoundLibrary: false })
+    s.deps.native.switchTarget = async () => { throw new Error('native switch failed') }
+    await expect(s.flow.bind(target, s.transport)).rejects.toThrow('native switch failed')
+    expect(s.events).toContain('restart')
+    expect(s.events).toContain('resume')
+    expect((await s.deps.native.state()).targetAuthority).toBe('1')
+})
+it.each(['result', 'cache', 'refresh', 'state'])('postactivation %s failure keeps stale captures fenced and never resumes or publishes', async failure => {
+    const s = setup(); newDeviceTransport(s)
+    let guarded = false
+    let staleWrites = 0
+    const complete = vi.fn(() => { guarded = false })
+    const abortUnchanged = vi.fn(async () => { guarded = false })
+    s.deps.beginActivatedLibraryGuard = () => { guarded = true; return { complete, abortUnchanged } }
+    s.deps.withPausedWrites = async operation => { try { return await operation() } finally { if (!guarded) staleWrites++ } }
+    if (failure === 'result') {
+        const activate = s.transport.replaceAsNewDevice!
+        s.transport.replaceAsNewDevice = async (...args) => ({ ...await activate(...args), writerId: 'different' })
+    } else if (failure === 'cache') s.deps.plugins.invalidateCaches = async () => { throw new Error('cache failed') }
+    else if (failure === 'refresh') s.deps.refreshActivatedLibrary = async () => { throw new Error('refresh failed') }
+    else {
+        const read = s.deps.native.state; let reads = 0
+        s.deps.native.state = async () => { if (++reads > 1) throw Error('native state unavailable'); return read() }
+    }
+    await expect(s.flow.bind(target, s.transport, { mode: 'new-device' })).rejects.toThrow()
+    if (failure !== 'state') expect((await s.deps.native.state()).targetAuthority).toBe('1')
+    expect(guarded).toBe(true)
+    expect(staleWrites).toBe(0)
+    expect(complete).not.toHaveBeenCalled()
+    expect(abortUnchanged).not.toHaveBeenCalled()
+    for (const event of ['restart', 'resume', 'resume-new-device', 'publish']) expect(s.events).not.toContain(event)
+})
+it('only unchanged native failure aborts the activation guard before restarting old state', async () => {
+    const s = setup(); newDeviceTransport(s)
+    let guarded = false
+    const abortUnchanged = vi.fn(async () => { guarded = false })
+    s.deps.beginActivatedLibraryGuard = () => { guarded = true; return { complete: vi.fn(), abortUnchanged } }
+    s.transport.replaceAsNewDevice = async () => { throw new Error('unchanged native failure') }
+    s.deps.plugins.restart = async () => { expect(guarded).toBe(false); s.events.push('restart') }
+    await expect(s.flow.bind(target, s.transport, { mode: 'new-device' })).rejects.toThrow('unchanged native failure')
+    expect(abortUnchanged).toHaveBeenCalledOnce()
+    expect(guarded).toBe(false)
+})
+it('unchanged binding with changed native revision cannot release the guard or restart old state', async () => {
+    const s = setup(); newDeviceTransport(s)
+    let guarded = false
+    s.deps.beginActivatedLibraryGuard = () => {
+        guarded = true
+        return { complete() { guarded = false }, async abortUnchanged() { throw Error('native revision changed') } }
+    }
+    s.transport.replaceAsNewDevice = async () => { throw new Error('native failure') }
+    await expect(s.flow.bind(target, s.transport, { mode: 'new-device' })).rejects.toThrow('Sync binding failed while resuming local state')
+    expect(guarded).toBe(true)
+    for (const event of ['restart', 'resume', 'resume-new-device', 'publish']) expect(s.events).not.toContain(event)
+})
+it('successful activated projection completes the guard before new plugin execution and publication', async () => {
+    const s = setup(); newDeviceTransport(s)
+    let guarded = false
+    s.deps.beginActivatedLibraryGuard = () => { guarded = true; return { complete() { guarded = false }, async abortUnchanged() { throw Error('unexpected abort') } } }
+    s.deps.refreshActivatedLibrary = async () => { expect(guarded).toBe(true); s.events.push('refresh') }
+    s.deps.plugins.restart = async () => { expect(guarded).toBe(false); s.events.push('restart') }
+    const resume = s.transport.resumeNewDeviceBinding!
+    s.transport.resumeNewDeviceBinding = async (...args) => { expect(guarded).toBe(false); return resume(...args) }
+    expect(await s.flow.bind(target, s.transport, { mode: 'new-device' })).toMatchObject({ kind: 'bound', action: 'new-device' })
+    expect(guarded).toBe(false)
 })
 
 describe('transport-neutral first binding', () => {
