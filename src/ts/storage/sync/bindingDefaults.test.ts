@@ -69,3 +69,8 @@ it('counts modified protected preset settings and ignores identical protected de
     data.protectedValues = { seperateModels: { model: 'custom' } }
     expect(hasNonDefaultBindingData(data)).toBe(true)
 })
+
+it('native backing views do not make default data non-default', () => {
+    const data = defaults(); Object.assign(data.library,{explicitGlobalChatVariables:{},protectedPresetValues:{}})
+    expect(hasNonDefaultBindingData(data)).toBe(false)
+})

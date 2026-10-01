@@ -36,6 +36,7 @@ function libraryProjection(library: JsonRecord): unknown {
         if (Array.isArray(value)) return value.map(item => project(item, scope, reference))
         if (!record(value)) return value
         return Object.fromEntries(Object.entries(value).filter(([key]) => {
+            if (records.has(value) && ['id', 'chaId'].includes(key)) return false
             if (scope === 'characters' && ['chatPage', 'lastInteraction', 'reloadKeys'].includes(key)) return false
             if (['isStreaming', 'activeStreamingDisplayOptimizationMode', 'configured_index'].includes(key)) return false
             return true
@@ -44,7 +45,7 @@ function libraryProjection(library: JsonRecord): unknown {
             ['bindedPersona', 'characterIds', 'enabledModules', 'charOrder', 'modules', 'characters', 'folderId'].includes(key))]))
     }
     return canonical(Object.fromEntries(Object.entries(library).filter(([key]) =>
-        recordCollections.has(key) || (!localRootKeys.has(key) && !derivedRootKeys.has(key) && !['botPresetsId', 'selectedPersona', 'hypaV3PresetId', 'translatorPresetId'].includes(key)))
+        recordCollections.has(key) || (!localRootKeys.has(key) && !derivedRootKeys.has(key) && !['botPresetsId', 'selectedPersona', 'hypaV3PresetId', 'translatorPresetId', 'explicitGlobalChatVariables', 'protectedPresetValues'].includes(key)))
         .map(([key, value]) => [key, project(value, key)])))
 }
 
