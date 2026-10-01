@@ -30,9 +30,74 @@ function setup(options: Partial<InspectedSyncTarget> & { nonDefault?: boolean; c
         pullAvailableState: async () => { events.push('stage'); return { targetId: 'target', libraryId: 'library', stagingId: 'validated', receiveId: 'receive' } },
         replaceFromTarget: record('activate-database'), publishInitialSharedState: record('publish'), resumeBinding: record('resume'), fenceOldJobs: record('jobs-fence'),
     }
-    return { events, deps, transport, flow: createSyncBindingFlow(deps), changeAuthority: () => { state.targetAuthority = 'changed' } }
+    return { events, deps, transport, flow: createSyncBindingFlow(deps), changeAuthority: () => { state.targetAuthority = 'changed' }, setState: (next: SyncBindingState) => { state = next } }
 }
 const target = { kind: 'server', connectionId: 'connection' } as const
+
+function newDeviceTransport(s: ReturnType<typeof setup>) {
+    s.transport.prepareNewDeviceBinding = async (_staged, context) => {
+        expect(context.state.targetAuthority).toBe('0')
+        s.events.push('reserve-register-settle')
+        return { authorizationId: 'native-authorization', writerId: 'reserved-writer' }
+    }
+    s.transport.replaceAsNewDevice = async (_staged, preparation, context) => {
+        expect(context.state.targetAuthority).toBe('0')
+        expect(preparation.authorizationId).toBe('native-authorization')
+        s.events.push('activate-new-device')
+        s.setState({ target, targetAuthority: '1', selectionEpoch: 'new', libraryId: 'library', progress: [] })
+        return { revision: 42, writerId: 'reserved-writer', bindingAuthority: '1' }
+    }
+    s.transport.resumeNewDeviceBinding = async (preparation, result, context) => {
+        expect(result.writerId).toBe(preparation.writerId)
+        expect(context.state.targetAuthority).toBe(result.bindingAuthority)
+        s.events.push('resume-new-device')
+    }
+}
+
+it.each([{ empty: true }, { previouslyBoundLibrary: true }])('explicit new device stages and replaces even when %s', async inspected => {
+    const s = setup({ ...inspected, nonDefault: false })
+    newDeviceTransport(s)
+    const result = await s.flow.bind(target, s.transport, { mode: 'new-device' })
+    expect(result).toMatchObject({ kind: 'bound', action: 'new-device', newDevice: { writerId: 'reserved-writer', bindingAuthority: '1' } })
+    expect(s.events).toEqual(['inspect', 'confirm', 'stage', 'jobs-fence', 'reserve-register-settle', 'plugin-fence', 'pause-flush', 'gate', 'activate-new-device', 'invalidate', 'refresh', 'restart', 'resume-new-device'])
+})
+it('cancelled new device consent never reserves, stages, changes writer or clears content', async () => {
+    const s = setup({ confirm: false }); newDeviceTransport(s)
+    expect(await s.flow.bind(target, s.transport, { mode: 'new-device' })).toEqual({ kind: 'cancelled' })
+    expect(s.events).toEqual(['inspect', 'confirm'])
+})
+it('new device requires a complete adapter capability before inspecting', async () => {
+    const s = setup()
+    await expect(s.flow.bind(target, s.transport, { mode: 'new-device' })).rejects.toThrow('New device sync binding is unavailable')
+    expect(s.events).toEqual([])
+})
+it('new device uses fresh registration only after pause and exclusive gate release', async () => {
+    const s = setup(); newDeviceTransport(s)
+    const gate = createStorageMutationGate({ locks: createInRealmStorageLockManager() }); s.deps.gate = gate
+    let paused = false
+    s.deps.withPausedWrites = async operation => { paused = true; try { return await operation() } finally { paused = false } }
+    const prepare = s.transport.prepareNewDeviceBinding!
+    s.transport.prepareNewDeviceBinding = async (...args) => { expect(paused).toBe(false); return prepare(...args) }
+    const resume = s.transport.resumeNewDeviceBinding!
+    s.transport.resumeNewDeviceBinding = async (...args) => { expect(paused).toBe(false); await gate.runWrite(() => resume(...args)) }
+    await s.flow.bind(target, s.transport, { mode: 'new-device' })
+    expect(s.events).toContain('resume-new-device')
+})
+it('new device rejects a returned writer different from its native preparation', async () => {
+    const s = setup(); newDeviceTransport(s)
+    const activate = s.transport.replaceAsNewDevice!
+    s.transport.replaceAsNewDevice = async (...args) => ({ ...await activate(...args), writerId: 'different' })
+    await expect(s.flow.bind(target, s.transport, { mode: 'new-device' })).rejects.toThrow('New device sync binding changed')
+    expect(s.events).not.toContain('resume-new-device')
+    expect(s.events).not.toContain('refresh')
+})
+it('unsettled old publication cannot enter new device activation or plugin reset', async () => {
+    const s = setup(); newDeviceTransport(s)
+    s.transport.prepareNewDeviceBinding = async () => { throw new Error('publication outcome unresolved') }
+    await expect(s.flow.bind(target, s.transport, { mode: 'new-device' })).rejects.toThrow('publication outcome unresolved')
+    expect(s.events).toEqual(['inspect', 'confirm', 'stage', 'jobs-fence'])
+    expect((await s.deps.native.state()).targetAuthority).toBe('0')
+})
 
 describe('transport-neutral first binding', () => {
     it('acknowledges, validates, fences and activates database before refreshing and restarting plugins', async () => {
