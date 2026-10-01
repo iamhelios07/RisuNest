@@ -865,6 +865,9 @@ export function createPersistentDataRuntime(
                 selectedConversationId: activatedLibraryGuard ? null : selectedConversationId,
                 activeCharacterIds,
             }, activatedLibraryGuard ? captureChanges({wholeLibrary: true}) : options?.changeSet)
+            if (activatedLibraryGuard && projected.deferred) {
+                throw new Error('Activated library projection is incomplete')
+            }
             coordinator.assertDestructiveReplacementFence(fenceOwner)
             if (
                 navigationGeneration !== workingSet.navigationGenerationToken ||
@@ -1049,6 +1052,7 @@ export function createPersistentDataRuntime(
             coordinator.assertActivatedLibraryGuard(guard.owner, token)
             const latest = await dependencies.store.readRoot()
             const projected = await projectRefreshedWorkingSet(latest.revision, {selectedCharacterId:null, selectedConversationId:null, activeCharacterIds:new Set()}, {wholeLibrary:true, root:true, presets:true, pluginStorage:true, characterIds:[], conversations:[]})
+            if (projected.deferred) throw new Error('Activated library projection is incomplete')
             coordinator.assertActivatedLibraryGuard(guard.owner, token)
             workingSet.invalidateNavigation()
             dependencies.state.replaceDatabase(projected.database, new Set(), true)
