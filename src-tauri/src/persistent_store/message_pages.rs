@@ -143,19 +143,15 @@ pub(super) fn capture_manifest(
     }
     #[cfg(test)]
     {
-        capture(
-            tx,
-            generation,
-            character,
-            conversation,
-            edit,
-            &mut PageWork::default(),
-        )
+        let mut work = PageWork::default();
+        let result = capture(tx, generation, character, conversation, edit, &mut work);
+        record_capture_work(&work, result.is_ok());
+        result
     }
 }
 
 #[cfg(test)]
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Eq, PartialEq)]
 pub(super) struct PageWork {
     pub messages_read: usize,
     pub hash_rows_read: usize,
@@ -163,6 +159,46 @@ pub(super) struct PageWork {
     pub pages_written: usize,
     pub prefix_reused: usize,
     pub suffix_reused: usize,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(super) struct CaptureWork {
+    pub capture_calls: usize,
+    pub successful_captures: usize,
+    pub failed_captures: usize,
+    pub work: PageWork,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static CAPTURE_WORK: std::cell::RefCell<CaptureWork> = std::cell::RefCell::new(CaptureWork::default());
+}
+
+#[cfg(test)]
+pub(super) fn reset_capture_work() {
+    CAPTURE_WORK.with(|slot| *slot.borrow_mut() = CaptureWork::default());
+}
+
+#[cfg(test)]
+pub(super) fn take_capture_work() -> CaptureWork {
+    CAPTURE_WORK.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
+}
+
+#[cfg(test)]
+fn record_capture_work(work: &PageWork, succeeded: bool) {
+    CAPTURE_WORK.with(|slot| {
+        let mut totals = slot.borrow_mut();
+        totals.capture_calls += 1;
+        totals.successful_captures += usize::from(succeeded);
+        totals.failed_captures += usize::from(!succeeded);
+        totals.work.messages_read += work.messages_read;
+        totals.work.hash_rows_read += work.hash_rows_read;
+        totals.work.bytes_read += work.bytes_read;
+        totals.work.pages_written += work.pages_written;
+        totals.work.prefix_reused += work.prefix_reused;
+        totals.work.suffix_reused += work.suffix_reused;
+    });
 }
 
 #[cfg(test)]
@@ -569,4 +605,130 @@ fn sql_u64(value: i64, index: usize) -> rusqlite::Result<u64> {
 }
 fn sql_usize(value: i64, index: usize) -> rusqlite::Result<usize> {
     usize::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(index, value))
+}
+
+#[cfg(test)]
+mod capture_work_tests {
+    use super::*;
+
+    fn fixture() -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE messages(generation TEXT,character_id TEXT,conversation_id TEXT,message_index INTEGER,
+            message_id TEXT,value TEXT,canonical_hash TEXT NOT NULL DEFAULT '',canonical_size INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(generation,character_id,conversation_id,message_index));
+            CREATE TABLE conversations(generation TEXT,character_id TEXT,conversation_id TEXT,message_count INTEGER,
+            PRIMARY KEY(generation,character_id,conversation_id));
+            INSERT INTO conversations VALUES('g','c','chat',2);
+            INSERT INTO messages VALUES('g','c','chat',0,'first','{\"chatId\":\"first\"}','','0');
+            INSERT INTO messages VALUES('g','c','chat',1,'second','{\"chatId\":\"second\"}','','0');").unwrap();
+        db.execute_batch(SCHEMA).unwrap();
+        db
+    }
+
+    #[test]
+    fn captures_are_counted_once_and_take_clears_the_actual_work() {
+        let mut db = fixture();
+        let tx = db.transaction().unwrap();
+        capture_manifest(&tx, "g", "c", "chat", None).unwrap();
+        reset_capture_work();
+        current_manifest(&tx, "g", "c", "chat").unwrap();
+        assert_eq!(take_capture_work(), CaptureWork::default());
+        let value = serde_json::json!({"chatId":"third"});
+        let body = payload_value::encode(&value).unwrap();
+        let hash = MessageHash::from_bytes(&body);
+        tx.execute(
+            "INSERT INTO messages VALUES('g','c','chat',2,'third',?1,?2,?3)",
+            params![
+                String::from_utf8(body).unwrap(),
+                hash.hash,
+                hash.byte_length as i64
+            ],
+        )
+        .unwrap();
+        tx.execute("UPDATE conversations SET message_count=3", [])
+            .unwrap();
+        capture_manifest(
+            &tx,
+            "g",
+            "c",
+            "chat",
+            Some(MessageEdit {
+                start: 2,
+                delete_count: 0,
+                insert_count: 1,
+            }),
+        )
+        .unwrap();
+        let totals = take_capture_work();
+        assert_eq!(totals.capture_calls, 1);
+        assert_eq!(totals.successful_captures, 1);
+        assert_eq!(totals.failed_captures, 0);
+        assert_eq!(totals.work.messages_read, 3);
+        assert_eq!(totals.work.hash_rows_read, 3);
+        assert_eq!(
+            totals.work.bytes_read,
+            b"{\"chatId\":\"first\"}".len() as u64
+                + b"{\"chatId\":\"second\"}".len() as u64
+                + b"{\"chatId\":\"third\"}".len() as u64
+        );
+        assert_eq!(totals.work.pages_written, 1);
+        assert_eq!(totals.work.prefix_reused + totals.work.suffix_reused, 0);
+        assert_eq!(take_capture_work(), CaptureWork::default());
+        assert!(capture_manifest(
+            &tx,
+            "g",
+            "c",
+            "chat",
+            Some(MessageEdit {
+                start: 4,
+                delete_count: 0,
+                insert_count: 1
+            })
+        )
+        .is_err());
+        let totals = take_capture_work();
+        assert_eq!(totals.capture_calls, 1);
+        assert_eq!(totals.successful_captures, 0);
+        assert_eq!(totals.failed_captures, 1);
+        assert_eq!(totals.work, PageWork::default());
+    }
+
+    #[test]
+    fn accumulator_is_thread_local_and_explicit_probes_are_not_double_counted() {
+        reset_capture_work();
+        record_capture_work(
+            &PageWork {
+                messages_read: 7,
+                bytes_read: 70,
+                ..Default::default()
+            },
+            true,
+        );
+        std::thread::spawn(|| {
+            assert_eq!(take_capture_work(), CaptureWork::default());
+            record_capture_work(
+                &PageWork {
+                    messages_read: 2,
+                    bytes_read: 20,
+                    ..Default::default()
+                },
+                false,
+            );
+            let totals = take_capture_work();
+            assert_eq!(totals.capture_calls, 1);
+            assert_eq!(totals.failed_captures, 1);
+            assert_eq!(totals.work.messages_read, 2);
+        })
+        .join()
+        .unwrap();
+        let totals = take_capture_work();
+        assert_eq!(totals.capture_calls, 1);
+        assert_eq!(totals.successful_captures, 1);
+        assert_eq!(totals.work.messages_read, 7);
+        let mut db = fixture();
+        let tx = db.transaction().unwrap();
+        let (_, work) = capture_with_work(&tx, "g", "c", "chat", None).unwrap();
+        assert_eq!(work.messages_read, 2);
+        assert_eq!(take_capture_work(), CaptureWork::default());
+    }
 }
