@@ -764,6 +764,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         native_file_jobs::screenshot_output::native_file_job_screenshot_output_publish,
         native_file_jobs::screenshot_output::native_file_job_screenshot_output_cancel,
         native_file_jobs::screenshot_output::native_file_job_screenshot_output_release,
+        persistent_store::sync_selection::pds_lww_binding_content,
         persistent_store::commands::pds_open,
         persistent_store::commands::pds_asset_gc_maintenance,
         persistent_store::commands::pds_read_root,

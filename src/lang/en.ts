@@ -3091,6 +3091,22 @@ export const languageEnglish = {
     "generationInterruptedInBackground": "Response generation was interrupted in the background.",
     "screenshotPreparationFailed": "Screenshot preparation failed. Reduce the range and try again.",
     "mcpDesktopOnly": "Local MCPs are available in the desktop app.",
+    lwwSync: {
+        concurrentEditNotice: "When the same item is edited on multiple devices at the same time, the last edit is kept. Edits or messages may be lost. Avoid using multiple devices at the same time.",
+        replaceTitle: "Replace the data on this device?",
+        replaceDescription: "To sync, the data on this device will be cleared and replaced with remote data. Make a manual backup if needed.",
+        replaceAcknowledge: "Clear the data on this device",
+        replaceAction: "Replace",
+        cancelAction: "Cancel",
+        clockBlocked: "Sync stopped because the device and remote times differ. Correct the time and try again.",
+        writerCollision: "Sync stopped because another device uses the same identity. Reconnect as a new device.",
+        restoreTitle: "Restore the backup?",
+        restoreDescriptionBound: "The current data will be cleared and replaced with the selected backup, and the restored data will sync remotely. Make a manual backup if needed.",
+        restoreDescription: "The current data will be cleared and replaced with the selected backup. Make a manual backup if needed.",
+        restoreAcknowledge: "Clear the current data",
+        restoreAction: "Restore",
+        myboxSyncUnavailable: "MYBOX cannot be used for sync.",
+    },
 } satisfies I18nTranslation;
 
 type I18nTranslationFunction = (...args: any[]) => string;
