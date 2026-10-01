@@ -179,6 +179,32 @@ describe('plugin changed-unit intent', () => {
         ])
     })
 
+    it.each(['character', 'conversation'] as const)('preserves explicit opaque own-field edits for %s without emitting untouched opaque values', kind => {
+        const before: any = kind === 'character'
+            ? { chaId: 'c', type: 'character', chats: [], retainedOpaque: { data: 'Imported' }, editedOpaque: { data: 'Before' }, deletedOpaque: true, chatPage: 0, statics: { messages: 2, count: 1 } }
+            : { id: 'q', message: [], retainedOpaque: { data: 'Imported' }, editedOpaque: { data: 'Before' }, deletedOpaque: true }
+        const registry = new PluginReadBaselines('p', () => 1)
+        const target = kind === 'character' ? 'c' : JSON.stringify(['c', 'q'])
+        const read: any = registry.track(structuredClone(before), kind, target, 1)
+        read.editedOpaque = { data: 'Edited' }
+        read.addedOpaque = [1, 2]
+        delete read.deletedOpaque
+        if (kind === 'character') { read.chatPage = 1; read.statics.messages = 3 }
+        const intents = registry.intent(read, kind, target, {})
+        const changes = pluginUnitIntents(intents, kind, 'p', read, 'c', 'q')
+        const prefix = kind === 'character' ? ['character', 'c'] : ['conversation', 'c', 'q']
+        expect(changes.units).toContainEqual({ key: JSON.stringify([...prefix, 'editedOpaque']), type: 'set', value: { data: 'Edited' } })
+        expect(changes.units).toContainEqual({ key: JSON.stringify([...prefix, 'addedOpaque']), type: 'set', value: [1, 2] })
+        expect(changes.units).toContainEqual({ key: JSON.stringify([...prefix, 'deletedOpaque']), type: 'delete' })
+        expect(changes.units.some(unit => JSON.parse(unit.key).at(-1) === 'retainedOpaque')).toBe(false)
+        expect(changes.units.some(unit => ['chaId', 'type', 'id'].includes(JSON.parse(unit.key).at(-1)))).toBe(false)
+        expect(changes.wholeMessages).toEqual([])
+        if (kind === 'character') {
+            expect(changes.units).toContainEqual({ key: '["character","c","chatPage"]', type: 'set', value: 1 })
+            expect(changes.units).toContainEqual({ key: '["character","c","statics"]', type: 'set', value: { messages: 3, count: 1 } })
+        }
+    })
+
     it('emits whole generic records and permanent deletion only for non-plugin collections', () => {
         const before = { plugins: [{ name: 'p', script: 'before' }], modules: [{ id: 'm', name: 'Before' }] }
         const after = { plugins: [{ name: 'p', script: 'after' }], modules: [] }
