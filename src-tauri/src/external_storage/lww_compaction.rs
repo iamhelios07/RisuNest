@@ -388,7 +388,7 @@ mod tests {
         body_spool.seal().unwrap();
         let state=PublishedState{catalog,body_spool,standalone:Default::default(),standalone_roots:Default::default(),
             asset_catalogs:vec![],snapshots:vec![],segments:vec![]};
-        let mut capture=super::super::capture::CaptureCatalog::create(&directory.path().join("capture"),&directory.path().join("external-storage"),None).unwrap();
+        let mut capture=super::super::capture::CaptureCatalog::create(&directory.path().join("external-storage/captures/current-payload"),&directory.path().join("external-storage"),None).unwrap();
         let identity=CaptureIdentity{store_id:"synthetic".into(),library_epoch:"synthetic".into(),generation:"synthetic".into(),selection_epoch:"synthetic".into(),revision:0};
         capture.begin(&identity,None).unwrap();capture.record("current",b"synthetic record").unwrap();
         let (live,_)=live_published_objects(&state,&mut capture,Some("current"),directory.path(),&Cancellation::default()).unwrap();
