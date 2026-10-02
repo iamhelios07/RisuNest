@@ -634,3 +634,226 @@ fn dropped_actual_pending_async_read_preserves_known_prefix() {
     assert_eq!(measured.total.outstanding_readers, 0);
     conserved(&measured);
 }
+
+#[test]
+fn noncontiguous_actual_reads_and_selections_keep_every_range() {
+    let _reset = Reset::new();
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("body");
+    let bytes = b"synthetic repeated range";
+    std::fs::write(&path, bytes).unwrap();
+    let hash = risunest_sync_wire::hash(bytes);
+    begin(
+        root.path(),
+        "every-range".into(),
+        "source".into(),
+        vec![role(&hash, &["Asset"])],
+    )
+    .unwrap();
+    let mut file = TrackedFile::open(root.path(), &hash, &path, "file").unwrap();
+    for _ in 0..4097 {
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.reader.selected(0, 1);
+        assert_eq!(file.read(&mut [0; 1]).unwrap(), 1);
+    }
+    drop(file);
+    let measured = snapshot(true).unwrap();
+    assert!(measured.complete);
+    assert_eq!(measured.objects[0].read_ranges.len(), 4097);
+    assert_eq!(measured.objects[0].selected_ranges.len(), 4097);
+    assert_eq!(measured.total.read_calls, 4097);
+    assert_eq!(measured.total.read_bytes, 4097);
+    conserved(&measured);
+}
+
+#[test]
+fn actual_failed_seek_preserves_prefix_and_is_incomplete() {
+    let _reset = Reset::new();
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("body");
+    let bytes = b"synthetic seek prefix";
+    std::fs::write(&path, bytes).unwrap();
+    let hash = risunest_sync_wire::hash(bytes);
+    begin(
+        root.path(),
+        "seek-error".into(),
+        "error".into(),
+        vec![role(&hash, &["Asset"])],
+    )
+    .unwrap();
+    let mut file = TrackedFile::open(root.path(), &hash, &path, "file").unwrap();
+    assert_eq!(file.read(&mut [0; 3]).unwrap(), 3);
+    assert!(file.seek(SeekFrom::Start(u64::MAX)).is_err());
+    drop(file);
+    let measured = snapshot(true).unwrap();
+    assert!(!measured.complete);
+    assert_eq!(measured.total.read_bytes, 3);
+    assert!(measured.violations.contains_key("source-seek-error"));
+    conserved(&measured);
+}
+
+#[test]
+fn actual_unresolved_and_mismatched_source_roots_cannot_report_complete_zero() {
+    let _reset = Reset::new();
+    let (root, store, _, inline, _) = seeded();
+    let foreign = tempfile::tempdir().unwrap();
+    let inline_hash = risunest_sync_wire::hash(&inline);
+    let bytes = b"synthetic rooted body";
+    let path = root.path().join("body");
+    std::fs::write(&path, bytes).unwrap();
+    begin(
+        root.path(),
+        "root-errors".into(),
+        "error".into(),
+        vec![role(&inline_hash, &["Control"])],
+    )
+    .unwrap();
+    {
+        let mut file = TrackedFile::open(
+            &root.path().join("absent-parent/absent-root"),
+            &inline_hash,
+            &path,
+            "file",
+        )
+        .unwrap();
+        assert_eq!(file.read(&mut [0; 3]).unwrap(), 3);
+    }
+    {
+        let mut file = TrackedFile::open(foreign.path(), &inline_hash, &path, "file").unwrap();
+        assert_eq!(file.read(&mut [0; 3]).unwrap(), 3);
+    }
+    assert_eq!(store.get_object(&inline_hash).unwrap(), inline);
+    let measured = snapshot(true).unwrap();
+    assert!(!measured.complete);
+    assert!(measured.violations.contains_key("source-root-unresolved"));
+    assert!(measured.violations.contains_key("source-root-mismatch"));
+    assert_eq!(measured.total.read_bytes, inline.len() as u64);
+    assert!(begin(root.path(), "reset".into(), "error".into(), vec![]).is_err());
+    conserved(&measured);
+}
+
+#[test]
+fn actual_inline_sql_with_no_root_and_unattributed_upload_sha_fail_closed() {
+    use crate::store::UploadManifest;
+    let _reset = Reset::new();
+    let root = tempfile::tempdir().unwrap();
+    let foreign = tempfile::tempdir().unwrap();
+    let store = Store::init(foreign.path()).unwrap();
+    let credential = store.add_device().unwrap();
+    let device = Device {
+        id: credential.device_id,
+    };
+    let body = vec![59; 65_541];
+    let hash = risunest_sync_wire::hash(&body);
+    let upload = store
+        .begin_upload(
+            &device,
+            &UploadManifest {
+                hash: hash.clone(),
+                size: (body.len() as u64).into(),
+            },
+        )
+        .unwrap();
+    store
+        .put_upload_chunk(&device, &upload, 0, &hash, &body)
+        .unwrap();
+    let mut memory = rusqlite::Connection::open_in_memory().unwrap();
+    small_object_store::initialize(&memory).unwrap();
+    let inline = b"synthetic rootless inline";
+    let inline_hash = risunest_sync_wire::hash(inline);
+    {
+        let tx = memory.transaction().unwrap();
+        small_object_store::insert_batch(&tx, &[(&inline_hash, inline)]).unwrap();
+        tx.commit().unwrap();
+    }
+    begin(
+        root.path(),
+        "missing-context".into(),
+        "error".into(),
+        vec![role(&hash, &["Asset"]), role(&inline_hash, &["Control"])],
+    )
+    .unwrap();
+    assert_eq!(
+        small_object_store::read(&memory, &inline_hash, 1024)
+            .unwrap()
+            .unwrap(),
+        inline
+    );
+    assert_eq!(store.finish_upload(&device, &upload).unwrap(), hash);
+    let measured = snapshot(true).unwrap();
+    assert!(!measured.complete);
+    assert!(
+        measured.violations.contains_key("inline-origin-missing")
+            || measured.violations.contains_key("inline-root-missing")
+            || measured.violations.contains_key("source-root-unresolved")
+    );
+    assert!(measured.violations.contains_key("source-root-mismatch"));
+    assert!(measured.violations.contains_key("unattributed-hash"));
+    for domain in ["upload-full-sha256", "upload-chunk-sha256"] {
+        assert_eq!(measured.hash_domains[domain].hash_calls, 1);
+        assert_eq!(measured.hash_domains[domain].hash_bytes, body.len() as u64);
+    }
+    conserved(&measured);
+}
+
+#[test]
+fn actual_reader_opened_before_scope_cannot_hide_reads_inside_scope() {
+    let _reset = Reset::new();
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("body");
+    let bytes = b"synthetic unscoped reader";
+    std::fs::write(&path, bytes).unwrap();
+    let hash = risunest_sync_wire::hash(bytes);
+    let mut file = TrackedFile::open(root.path(), &hash, &path, "file").unwrap();
+    assert_eq!(file.read(&mut [0; 3]).unwrap(), 3);
+    assert!(active().is_none());
+    begin(
+        root.path(),
+        "unscoped-reader".into(),
+        "error".into(),
+        vec![role(&hash, &["Asset"])],
+    )
+    .unwrap();
+    file.seek(SeekFrom::Start(0)).unwrap();
+    assert_eq!(file.read(&mut [0; 3]).unwrap(), 3);
+    drop(file);
+    let measured = snapshot(true).unwrap();
+    assert!(!measured.complete);
+    assert_eq!(measured.total, Work::default());
+    assert!(measured.violations.contains_key("unattributed-source-read"));
+    assert!(measured.violations.contains_key("unattributed-source-seek"));
+    assert!(begin(root.path(), "reset".into(), "error".into(), vec![]).is_err());
+}
+
+#[test]
+fn actual_unscoped_pending_async_seek_cannot_report_complete_zero() {
+    let _reset = Reset::new();
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("body");
+    let bytes = b"synthetic unscoped pending seek";
+    std::fs::write(&path, bytes).unwrap();
+    let hash = risunest_sync_wire::hash(bytes);
+    let file = TrackedFile::open(root.path(), &hash, &path, "file").unwrap();
+    begin(
+        root.path(),
+        "unscoped-seek".into(),
+        "error".into(),
+        vec![role(&hash, &["Asset"])],
+    )
+    .unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let mut file = file.into_async();
+        Pin::new(&mut file).start_seek(SeekFrom::Start(0)).unwrap();
+        drop(file);
+    });
+    runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+    let measured = snapshot(true).unwrap();
+    assert!(!measured.complete);
+    assert_eq!(measured.total, Work::default());
+    assert!(measured.violations.contains_key("unattributed-source-seek"));
+    assert!(begin(root.path(), "reset".into(), "error".into(), vec![]).is_err());
+}

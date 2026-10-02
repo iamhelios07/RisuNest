@@ -19,6 +19,32 @@ pub struct BodyDomain {
     pub escaped_handles: u64,
     pub escaped_paths: u64,
     pub outstanding_readers: u64,
+    pub identity_metadata_open_attempts:u64,
+    pub identity_metadata_opens:u64,
+    pub identity_metadata_failed_opens:u64,
+    pub verified_identity_metadata_opens:u64,
+}
+
+impl BodyDomain {
+    fn add(&mut self,work:&Self)->Result<(),String> {
+        macro_rules! add {($($field:ident),*)=>{$(self.$field=self.$field.checked_add(work.$field)
+            .ok_or("body contribution overflow")?;)*};}
+        add!(open_attempts,opens,failed_opens,unknown_open_results,read_operations,read_bytes,
+            incomplete_reads,escaped_handles,escaped_paths,outstanding_readers,
+            identity_metadata_open_attempts,identity_metadata_opens,identity_metadata_failed_opens,
+            verified_identity_metadata_opens);
+        Ok(())
+    }
+    fn complete(&self)->bool {
+        self.failed_opens==0 && self.unknown_open_results==0 && self.incomplete_reads==0
+            && self.escaped_handles==0 && self.escaped_paths==0 && self.outstanding_readers==0
+            && self.identity_metadata_failed_opens==0 && self.open_attempts==self.opens
+    }
+    fn identity_only(&self)->bool {
+        self.complete() && self.read_operations==0 && self.read_bytes==0
+            && self.open_attempts==self.opens && self.opens==self.identity_metadata_open_attempts
+            && self.opens==self.identity_metadata_opens && self.opens==self.verified_identity_metadata_opens
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -92,17 +118,14 @@ impl NativeObservation {
             || self.body_unattributed_managed != BodyDomain::default()
             || self.body_unattributed_owned != BodyDomain::default()
             || self.body_pending_owned_identities != 0
-            || self.body_owned_work != BodyDomain::default()
-            || self.body_domains.get("owned").is_some_and(|work| work != &BodyDomain::default())
             || self.body_objects.values().any(|object| object.purposes.is_empty()
                 && (object.work != BodyDomain::default() || object.owned_work != BodyDomain::default()))
             || self.body_domains.values().chain(self.body_objects.values().map(|object| &object.work))
                 .chain(self.body_objects.values().map(|object| &object.owned_work)).any(|domain|
-            domain.unknown_open_results != 0 || domain.incomplete_reads != 0
-                || domain.escaped_handles != 0 || domain.escaped_paths != 0
-                || domain.outstanding_readers != 0) {
+            !domain.complete()) {
             return Err("incomplete or unobserved CAS body scope".into());
         }
+        self.validate_body_conservation()?;
         if self.asset_body_opens != Some(self.body_asset_work.open_attempts)
             || self.asset_body_bytes_read != Some(self.body_asset_work.read_bytes) {
             return Err("inconsistent asset-purpose body totals".into());
@@ -121,6 +144,40 @@ impl NativeObservation {
                 Some(_) => return Err(format!("nonzero {name}")),
                 None => return Err(format!("unobserved {name}")),
             }
+        }
+        Ok(())
+    }
+
+    fn validate_body_conservation(&self)->Result<(),String> {
+        let mut managed=BodyDomain::default();let mut owned=BodyDomain::default();
+        let mut control=BodyDomain::default();let mut asset=BodyDomain::default();
+        let mut unknown=BodyDomain::default();
+        for (hash,object) in &self.body_objects {
+            if hash.len()!=64 || !hash.bytes().all(|v|v.is_ascii_hexdigit())
+                || object.purposes.iter().any(|v|v!="Control" && v!="Asset")
+                || object.purposes.iter().collect::<std::collections::BTreeSet<_>>().len()!=object.purposes.len() {
+                return Err("invalid actual body identity or purpose inventory".into());
+            }
+            managed.add(&object.work)?;owned.add(&object.owned_work)?;
+            let exclusive_control=object.purposes.len()==1 && object.purposes[0]=="Control";
+            if object.owned_work!=BodyDomain::default()
+                && (!exclusive_control || !object.owned_work.identity_only()) {
+                return Err("owned IO is not exclusively verified Control identity metadata".into());
+            }
+            let classified=if object.purposes.iter().any(|v|v=="Asset") {&mut asset}
+                else if exclusive_control {&mut control} else {&mut unknown};
+            classified.add(&object.work)?;classified.add(&object.owned_work)?;
+        }
+        for (name,work) in &self.body_domains {
+            if name!="managed" && name!="owned" && work!=&BodyDomain::default() {
+                return Err("unclassified body domain contribution".into());
+            }
+        }
+        if managed!=self.body_domains.get("managed").cloned().unwrap_or_default()
+            || owned!=self.body_domains.get("owned").cloned().unwrap_or_default()
+            || owned!=self.body_owned_work || control!=self.body_control_work
+            || asset!=self.body_asset_work || unknown!=self.body_unknown_work {
+            return Err("per-object, domain and purpose body work does not conserve".into());
         }
         Ok(())
     }
@@ -275,6 +332,8 @@ mod tests {
         sample.body_control_work = BodyDomain {open_attempts:1, opens:1, read_operations:1,
             read_bytes:22, ..Default::default()};
         sample.body_domains.insert("managed".into(), sample.body_control_work.clone());
+        sample.body_objects.insert("ab".repeat(32),ObjectBodyDomain {purposes:vec!["Control".into()],
+            work:sample.body_control_work.clone(),..Default::default()});
         sample.validate_routine_invariants().unwrap();
         sample.body_unknown_work.open_attempts = 1;
         assert!(sample.validate_routine_invariants().is_err());
@@ -287,6 +346,61 @@ mod tests {
         sample.body_scope_violations = 0;
         sample.body_owned_work.read_bytes = 1;
         assert!(sample.validate_routine_invariants().is_err());
+    }
+
+    #[test]
+    fn owned_control_identity_proof_is_exact_and_conserves_all_contributions() {
+        let mut sample=NativeObservation {asset_body_opens:Some(0),asset_body_bytes_read:Some(0),
+            shared_head_reads:Some(0),body_scope_complete:Some(true),..Default::default()};
+        let hash="ab".repeat(32);
+        let owned=BodyDomain {open_attempts:4,opens:4,identity_metadata_open_attempts:4,
+            identity_metadata_opens:4,verified_identity_metadata_opens:4,..Default::default()};
+        sample.body_objects.insert(hash.clone(),ObjectBodyDomain {purposes:vec!["Control".into()],
+            owned_work:owned.clone(),..Default::default()});
+        sample.body_owned_work=owned.clone();sample.body_control_work=owned.clone();
+        sample.body_domains.insert("owned".into(),owned.clone());sample.validate_routine_invariants().unwrap();
+        for (field,value) in [("identity_metadata_open_attempts",3),("identity_metadata_opens",3),
+            ("verified_identity_metadata_opens",3),("verified_identity_metadata_opens",5),
+            ("identity_metadata_failed_opens",1),("failed_opens",1),("unknown_open_results",1),
+            ("read_operations",1),("read_bytes",1),("incomplete_reads",1),("escaped_handles",1),
+            ("escaped_paths",1),("outstanding_readers",1)] {
+            let mut changed=sample.clone();let mut body=serde_json::to_value(&owned).unwrap();body[field]=value.into();
+            let body:BodyDomain=serde_json::from_value(body).unwrap();
+            changed.body_objects.get_mut(&hash).unwrap().owned_work=body.clone();
+            changed.body_owned_work=body.clone();changed.body_control_work=body.clone();
+            changed.body_domains.insert("owned".into(),body);
+            assert!(changed.validate_routine_invariants().is_err(),"conserved invalid owned field {field}");
+        }
+        for purposes in [vec!["Asset".into()],vec!["Control".into(),"Asset".into()],Vec::new()] {
+            let mut changed=sample.clone();changed.body_objects.get_mut(&hash).unwrap().purposes=purposes.clone();
+            changed.body_control_work=BodyDomain::default();
+            if purposes.is_empty() {changed.body_unknown_work=owned.clone();}
+            else {changed.body_asset_work=owned.clone();changed.asset_body_opens=Some(4);}
+            assert!(changed.validate_routine_invariants().is_err());
+        }
+        let mut raw=sample.clone();let mut work=owned.clone();
+        work.identity_metadata_open_attempts=0;work.identity_metadata_opens=0;work.verified_identity_metadata_opens=0;
+        raw.body_objects.get_mut(&hash).unwrap().owned_work=work.clone();raw.body_owned_work=work.clone();
+        raw.body_control_work=work.clone();raw.body_domains.insert("owned".into(),work);
+        assert!(raw.validate_routine_invariants().is_err());
+        for tamper in 0..7 {
+            let mut changed=sample.clone();match tamper {
+                0=>changed.body_owned_work.opens+=1,
+                1=>changed.body_control_work.verified_identity_metadata_opens+=1,
+                2=>changed.body_domains.get_mut("owned").unwrap().identity_metadata_open_attempts+=1,
+                3=>{changed.body_objects.clear();},
+                4=>changed.body_unattributed_owned.open_attempts=1,
+                5=>changed.body_pending_owned_identities=1,
+                _=>{changed.body_domains.insert("unrecognized".into(),owned.clone());},
+            }
+            assert!(changed.validate_routine_invariants().is_err(),"conservation tamper {tamper}");
+        }
+        let mut overflow=sample.clone();let maximal=BodyDomain {open_attempts:u64::MAX,opens:u64::MAX,
+            identity_metadata_open_attempts:u64::MAX,identity_metadata_opens:u64::MAX,
+            verified_identity_metadata_opens:u64::MAX,..Default::default()};
+        overflow.body_objects.get_mut(&hash).unwrap().owned_work=maximal;
+        overflow.body_objects.insert("cd".repeat(32),sample.body_objects[&hash].clone());
+        assert_eq!(overflow.validate_routine_invariants().unwrap_err(),"body contribution overflow");
     }
 
     #[test]
