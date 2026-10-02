@@ -20,6 +20,7 @@ const LOCATION_KEYS: &[&str] = &[
     "tenant",
     "driveId",
     "rootItemId",
+    "syncRootPath",
     "redirectUri",
 ];
 

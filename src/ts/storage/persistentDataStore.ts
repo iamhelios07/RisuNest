@@ -285,6 +285,7 @@ export interface CharacterSummary {
     type: CharacterDetail['type']
     creatorNotes?: string
     trashTime?: number
+    trashStampMs?: string
     archived?: ArchivedCharacterSummary
 }
 
@@ -617,7 +618,13 @@ export interface PersistentRevisionLease extends PersistentRevisionReader {
     release(): Promise<void>
 }
 
+export interface PersistentDatabaseReplacementStage {
+    activate(): Promise<{revision: DataRevision}>
+    abort(): Promise<void>
+}
+
 export interface PersistentDataStore {
+    lwwBindingState?(): Promise<{ targetAuthority: string }>
     lwwReadOutbox?(request: LwwOutboxRequest): Promise<LwwOutboxPage>
     lwwAckOutbox?(request: LwwAcknowledgeRequest): Promise<void>
     lwwClockState?(request: LwwReceiveHeader): Promise<LwwClockState>
@@ -674,11 +681,19 @@ export interface PersistentDataStore {
         expectedRevision: DataRevision,
         signal?: AbortSignal,
     ): Promise<{ revision: DataRevision }>
+    stageDatabaseReplacement?(
+        database: Database,
+        expectedRevision?: DataRevision,
+        assetAliases?: AssetAlias[],
+        pluginStorageValues?: PluginStorageValue[],
+        replacementHeader?: LwwReceiveHeader,
+    ): Promise<PersistentDatabaseReplacementStage>
     replaceFromDatabase(
         database: Database,
         expectedRevision?: DataRevision,
         assetAliases?: AssetAlias[],
         pluginStorageValues?: PluginStorageValue[],
+        replacementHeader?: LwwReceiveHeader,
     ): Promise<{ revision: DataRevision }>
     materializeDatabase(revision?: DataRevision): Promise<Database>
     acquireRevision(revision: DataRevision): Promise<PersistentRevisionLease>

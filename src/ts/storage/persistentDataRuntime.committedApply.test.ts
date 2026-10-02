@@ -1,4 +1,5 @@
 import { applyRootMutations } from './rootMutation'
+import { acquireUpstreamImportPause } from './upstreamReplacement'
 import { describe, expect, it, vi } from 'vitest'
 import type { Database } from './database.svelte'
 import type { PersistentDataStore, PersistentRevisionLease } from './persistentDataStore'
@@ -114,6 +115,60 @@ async function createHarness(officialPublisher?: OfficialRevisionPublisher, capt
         },
     }
 }
+
+describe('upstream import activation pause', () => {
+    it('holds writes through activation and installs current native baselines before release', async () => {
+        const harness = await createHarness()
+        const admission = acquireUpstreamImportPause(harness.runtime, 'upstream-import')
+        const queued = vi.fn(async () => 1)
+        const operation = harness.runtime.runStorageOnlyMutation(queued).catch(error => error)
+        const pause = await admission
+        harness.nativeCommit(replacement('Imported library'))
+        expect(() => harness.runtime.markPersistentDataDirty(1)).toThrow(PersistentMutationFencedError)
+        await expect(pause.fence.refreshCommittedWorkingSet(2)).resolves.toEqual({kind:'committed',revision:2,projection:'applied'})
+        pause.complete()
+        await pause.finish()
+        expect(await operation).toBeInstanceOf(PersistentMutationFencedError)
+        expect(queued).not.toHaveBeenCalled()
+        expect(harness.database.username).toBe('Imported library')
+        await harness.runtime.flushPendingDataLocally('installed-baselines')
+        expect(harness.store.commit).not.toHaveBeenCalled()
+    })
+
+    it('retains the guard across failed strict refresh and recovers current native content', async () => {
+        const harness = await createHarness()
+        const admission = acquireUpstreamImportPause(harness.runtime, 'upstream-import')
+        const queued = vi.fn(async () => 1)
+        const operation = harness.runtime.runStorageOnlyMutation(queued).catch(error => error)
+        const pause = await admission
+        harness.nativeCommit(replacement('Imported library'))
+        harness.replaceDatabase.mockImplementationOnce(() => { throw new Error('projection failed') })
+        await expect(pause.fence.refreshCommittedWorkingSet(2)).rejects.toThrow('projection failed')
+        await pause.finish()
+        expect(await operation).toBeInstanceOf(PersistentMutationFencedError)
+        expect(queued).not.toHaveBeenCalled()
+        expect(() => harness.runtime.markPersistentDataDirty(1)).toThrow(PersistentMutationFencedError)
+        await expect(harness.runtime.retryCommittedWorkingSetRefresh()).resolves.toEqual({kind:'committed',revision:2,projection:'applied'})
+        expect(harness.database.username).toBe('Imported library')
+        await harness.runtime.flushPendingDataLocally('recovered-baselines')
+        expect(harness.store.commit).not.toHaveBeenCalled()
+    })
+
+    it('releases an unchanged activation only after binding and exact native revision proof', async () => {
+        const harness = await createHarness()
+        const pause = await acquireUpstreamImportPause(harness.runtime, 'preactivation')
+        const proof = vi.fn(async () => {})
+        await pause.abortUnchanged(proof)
+        expect(proof).toHaveBeenCalledOnce()
+        const allowed = vi.fn(async () => 1)
+        await harness.runtime.runStorageOnlyMutation(allowed)
+        expect(allowed).toHaveBeenCalledOnce()
+        const uncertain = await acquireUpstreamImportPause(harness.runtime, 'uncertain')
+        harness.nativeCommit(replacement('Activated library'))
+        await expect(uncertain.abortUnchanged(proof)).rejects.toThrow(PersistentMutationFencedError)
+        expect(() => harness.runtime.markPersistentDataDirty(1)).toThrow(PersistentMutationFencedError)
+    })
+})
 
 function replacement(username = 'Committed replacement'): Database {
     return { ...makeDatabase(), username }

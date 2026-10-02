@@ -69,6 +69,7 @@ pub(crate) struct ArchivedObject {
     pub(crate) message_count: i64,
     pub(crate) asset_hashes: Vec<String>,
     pub(crate) shared_asset_hashes: Vec<String>,
+    pub(crate) identity_remap: Vec<super::portable_identity::IdentityRemap>,
 }
 
 impl ArchivedObject {
@@ -939,6 +940,7 @@ pub(super) fn archive_character_with_cancellation_lww(
         message_count: metadata.message_count,
         asset_hashes,
         shared_asset_hashes,
+        identity_remap: Vec::new(),
     };
     let encoded = serde_json::to_string(&archived)?;
     let marker = serde_json::to_string(&marker_detail(
@@ -1010,7 +1012,23 @@ pub(super) fn restore_character_with_cancellation_lww(
     };
     let _staging = create_restore_staging(connection)?;
     let result = (|| {
-        let payload = stage_payload(connection, file, is_cancelled)?;
+        let mut payload = stage_payload(connection, file, is_cancelled)?;
+        for remap in &archived.identity_remap {
+            let owner = payload.character_id.clone();
+            remap.character(&mut payload.detail);
+            payload.character_id = payload.detail.get("chaId").and_then(Value::as_str)
+                .ok_or_else(|| StoreError::Validation { message: "archived character identity is missing".into() })?.to_owned();
+            let mut query = connection.prepare("SELECT ordinal,detail FROM archive_restore.archive_restore_conversations ORDER BY ordinal")?;
+            let mut rows = query.query([])?;
+            while let Some(row) = rows.next()? {
+                ensure_not_cancelled(is_cancelled)?;
+                let ordinal: i64 = row.get(0)?;
+                let raw: String = row.get(1)?;
+                let mut detail: Value = serde_json::from_str(&raw)?;
+                remap.chat(&owner, &mut detail);
+                connection.execute("UPDATE archive_restore.archive_restore_conversations SET conversation_id=?2,detail=?3 WHERE ordinal=?1", params![ordinal, detail["id"].as_str(), serde_json::to_string(&detail)?])?;
+            }
+        }
         ensure_not_cancelled(is_cancelled)?;
         if payload.version != ARCHIVE_PAYLOAD_VERSION {
             return validation("archived character payload version is unsupported");

@@ -3,21 +3,12 @@ import type {
     ExternalJobSummary,
     ExternalHistoryItem,
     ExternalOpenMode,
-    ExternalCapturePolicy,
     ExternalProviderId,
     PrepareExternalConnectionRequest,
 } from './types'
 import { buildConnectionConfig, getExternalProviderDefinition } from './providerRegistry'
 
 export const GITHUB_DEDICATED_REPOSITORY_ACKNOWLEDGEMENT = 'github-dedicated-private-repository'
-
-/** Backup connections start with everything the device can contribute. */
-export function defaultExternalCapturePolicy(
-    purpose: ExternalConnectionPurpose,
-): ExternalCapturePolicy | undefined {
-    if (purpose !== 'backup') return undefined
-    return { hypa: true, localPlugins: true, localSettings: true }
-}
 
 export function requiredConnectionAcknowledgements(
     providerId: ExternalProviderId,
@@ -34,17 +25,12 @@ export function buildPrepareConnectionRequest(options: {
     platform: string
     mode: ExternalOpenMode
     purpose: ExternalConnectionPurpose
-    capturePolicy?: ExternalCapturePolicy
     recoveryKey?: string
     acknowledgements: string[]
 }): PrepareExternalConnectionRequest {
     const definition = getExternalProviderDefinition(options.providerId)
     if (options.purpose === 'sync' && !definition.supportsSync)
         throw new Error('This provider does not support synchronization.')
-    if (options.purpose === 'sync' && options.capturePolicy)
-        throw new Error('A synchronization connection does not carry a capture policy.')
-    if (options.purpose === 'backup' && !options.capturePolicy)
-        throw new Error('A backup connection needs a capture policy.')
     const missingAcknowledgement = requiredConnectionAcknowledgements(
         options.providerId,
     ).find(item => !options.acknowledgements.includes(item))
@@ -54,7 +40,6 @@ export function buildPrepareConnectionRequest(options: {
         config: buildConnectionConfig(options.providerId, options.values, options.platform),
         mode: options.mode,
         purpose: options.purpose,
-        ...(options.capturePolicy ? { capturePolicy: { ...options.capturePolicy } } : {}),
         ...(options.recoveryKey ? { recoveryKey: options.recoveryKey } : {}),
         acknowledgements: [...options.acknowledgements],
     }

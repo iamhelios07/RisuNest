@@ -306,6 +306,7 @@ pub(crate) fn export_compatible_local_backup(
             revision: expected_revision,
             source_bytes: published.bytes,
             source_sha256: published.sha256,
+            source_fingerprint_kind: crate::native_file_jobs::SourceFingerprintKind::WholeFileSha256,
             character_count: counts.0,
             preset_count: counts.1,
             warning_codes: if projector.losses.0.is_empty() && attachments.warning_codes.is_empty()
@@ -1045,9 +1046,9 @@ mod tests {
                 .unwrap();
             let mut root = json!({"account":{"token":"synthetic-token"},"characterOrder":["synthetic",{"name":"Folder","data":["group","synthetic"],"id":"folder","color":"red","img":"assets/nested/icon.webp"},"group"],"plugins":[],"modules":[],"personas":[],"loadouts":[],"disableToggleBinding":true,"defaultToggleValues":{"test":"1"},"risunestInlayMode":"unsupported","streamingThoughtMode":"unsupported","unknownRoot":true});
             root["pluginCustomStorage"] = json!({"10":null,"2":true,"01":"leading zero","z":{"exact":"assets/nested/icon.webp","opaque":"prefix assets/nested/icon.webp suffix","large":"큰".repeat(65536)},"4294967295":9007199254740991u64});
-            store.replace_put_root(&staging, &root).unwrap();
+            store.replace_put_upstream_root(&staging, &root).unwrap();
             store
-                .replace_put_presets(
+                .replace_put_upstream_presets(
                     &staging,
                     &[json!({"name":"Synthetic Preset","image":"assets/nested/icon.webp"})],
                 )

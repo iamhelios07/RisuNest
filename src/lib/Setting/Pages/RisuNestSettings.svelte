@@ -13,6 +13,7 @@
     import RisuNestInlayInventory from './RisuNestInlayInventory.svelte'
     import RisuNestPluginData from './RisuNestPluginData.svelte'
     import RisuNestLocalData from './RisuNestLocalData.svelte'
+    import ServerSyncSettings from './ServerSyncSettings.svelte'
     import RisuNestStorageDashboard from './RisuNestStorageDashboard.svelte'
     import RisuNestDataHealth from './RisuNestDataHealth.svelte'
     import RisuNestBackupRestore from './RisuNestBackupRestore.svelte'
@@ -115,6 +116,9 @@
             <RisuNestBackupRestore />
             <LocalDataReset />
         {:else if activeTab === 'sync'}
+            {#if isTauri}
+                <ServerSyncSettings />
+            {/if}
             <ExternalStorageSettings />
             {#if isTauri}
                 <RisuNestLocalData />

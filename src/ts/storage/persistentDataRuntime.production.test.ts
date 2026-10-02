@@ -34,7 +34,7 @@ import {
 } from './workingSetCatalog'
 import { workingSetResidency } from './workingSetResidency'
 import { canonicalJson, SaveCoordinator } from './saveCoordinator'
-import { capturePersistentRoot } from './persistentDataRuntime'
+import { capturePersistentRoot, createPersistentDataRuntime } from './persistentDataRuntime'
 import { IndexedDbPersistentDataStore } from './indexedDbPersistentDataStore'
 import { observePersistentSaveChanges } from './persistentSaveObserver.svelte'
 
@@ -188,6 +188,55 @@ describe('production persistent working-set publication', () => {
             rootMutations: [{ type: 'set', key: 'username', value: 'Immediately changed' }],
         })
         expect(JSON.stringify(commit.mock.calls[0]).length).toBeLessThan(256)
+    })
+
+    it('adopts a small production root edit without decoding an unchanged large background in the renderer', async () => {
+        const initial = {
+            username: 'Before', customBackground: 'x'.repeat(6 * 1024 * 1024),
+            botPresets: [], plugins: [], characters: [], pluginCustomStorage: {},
+            modules: [{ id: 'module', name: 'Before', description: '' }],
+        } as unknown as Database
+        const store = new IndexedDbPersistentDataStore('cached-root-adoption', new IDBFactory(), IDBKeyRange)
+        await store.open()
+        await store.replaceFromDatabase(initial)
+        setDatabaseLite(initial)
+        selectedCharID.set(-1)
+        const adapter = createProductionStateAdapter()
+        const runtime = createPersistentDataRuntime({ store, state: adapter, prepareDatabase: async (value) => value })
+        await runtime.initializeActiveWorkingSet(getDatabase())
+        const coordinator = new SaveCoordinator({ store, ...adapter })
+        coordinator.initialize(runtime.revision)
+        const originalParse = JSON.parse
+        let inBackendCommit = false
+        const rendererParseLengths: number[] = []
+        const parse = vi.spyOn(JSON, 'parse').mockImplementation((value, reviver) => {
+            if (!inBackendCommit) rendererParseLengths.push(value.length)
+            return originalParse(value, reviver)
+        })
+        const originalCommit = store.commit.bind(store)
+        // IndexedDB's backend root clone is outside the renderer capture/adoption path.
+        const commit = vi.spyOn(store, 'commit').mockImplementation(async (request) => {
+            inBackendCommit = true
+            try { return await originalCommit(request) }
+            finally { inBackendCommit = false }
+        })
+        try {
+            const baseline = coordinator.capturePersistentBaselineRoot()
+            baseline.modules[0].name = 'Detached baseline only'
+            expect(coordinator.capturePersistentBaselineRoot().modules[0].name).toBe('Before')
+            getDatabase().modules[0].name = 'After'
+            runtime.markPersistentDataDirty(1)
+            await runtime.flushPendingData('cached-root-adoption')
+            runtime.markPersistentDataDirty(1)
+            await runtime.flushPendingData('cached-root-no-echo')
+            expect(rendererParseLengths.some((length) => length > 1024 * 1024)).toBe(false)
+        } finally {
+            parse.mockRestore()
+        }
+        expect(commit).toHaveBeenCalledTimes(1)
+        const persisted = (await store.readRoot()).value
+        expect(persisted.modules[0].name).toBe('After')
+        expect(persisted.customBackground).toBe(initial.customBackground)
     })
 
     it('restores only affected activation entries, selection and residency', () => {

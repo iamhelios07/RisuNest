@@ -18,6 +18,7 @@ pub(crate) const DEVICE_DATABASE_FILE: &str = "device.sqlite";
 pub(crate) mod claim_sessions;
 pub(crate) mod hypa;
 pub(crate) mod plugin_permissions;
+pub(crate) mod plugin_gc;
 pub(crate) mod plugin_values;
 pub(crate) mod sections;
 
@@ -98,6 +99,12 @@ CREATE TABLE plugin_device_storage(
 );
 CREATE INDEX plugin_device_storage_clock ON plugin_device_storage(write_clock);
 CREATE INDEX plugin_device_storage_pending ON plugin_device_storage(owner,space,key) WHERE published_clock IS NULL OR published_clock<>write_clock;
+
+CREATE TABLE plugin_gc_state(
+  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+  instance_id TEXT NOT NULL CHECK(length(instance_id)>0),
+  revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>=0)
+);
 
 CREATE TABLE hypa_embeddings(
   cache_key TEXT PRIMARY KEY,
@@ -237,6 +244,7 @@ fn create_triggers(db: &Connection) -> StoreResult<()> {
             db.execute_batch(&trigger_sql(table, event, section, key1, key2, key3))?;
         }
     }
+    plugin_gc::create_triggers(db)?;
     Ok(())
 }
 
@@ -470,12 +478,14 @@ fn create_schema(connection: &mut Connection) -> StoreResult<()> {
     transaction.execute_batch(SCHEMA)?;
     transaction.execute_batch(super::lww::UNIT_SCHEMA)?;
     transaction.execute_batch(super::lww::DEVICE_SCHEMA)?;
+    transaction.execute_batch(super::external_lww::SCHEMA)?;
     transaction.execute("INSERT INTO lww_clock VALUES(1,NULL,NULL,'0')", [])?;
     create_triggers(&transaction)?;
     transaction.execute(
         "INSERT INTO device_meta (singleton, writer_id, created_at, revision) VALUES (1,?1,?2,0)",
         params![Uuid::new_v4().to_string(), now_ms()?],
     )?;
+    transaction.execute("INSERT INTO plugin_gc_state VALUES(1,?1,0)", [Uuid::new_v4().to_string()])?;
     for (section, participating) in SECTIONS {
         transaction.execute(
             "INSERT INTO device_sections
@@ -500,6 +510,7 @@ fn validate_schema(db: &Connection) -> StoreResult<()> {
     reference.execute_batch(SCHEMA)?;
     reference.execute_batch(super::lww::UNIT_SCHEMA)?;
     reference.execute_batch(super::lww::DEVICE_SCHEMA)?;
+    reference.execute_batch(super::external_lww::SCHEMA)?;
     create_triggers(&reference)?;
     if definitions(db)? != definitions(&reference)? {
         return Err(invalid("Device schema is incompatible"));
@@ -515,9 +526,11 @@ fn validate_schema(db: &Connection) -> StoreResult<()> {
         [],
         |row| row.get(0),
     )?;
-    if meta != 1 || sections != SECTIONS.len() as i64 || policy != 1 {
+    let plugin_gc: i64 = db.query_row("SELECT count(*) FROM plugin_gc_state WHERE singleton=1", [], |row| row.get(0))?;
+    if meta != 1 || sections != SECTIONS.len() as i64 || policy != 1 || plugin_gc != 1 {
         return Err(invalid("Device control rows are invalid"));
     }
+    plugin_gc::validate_state(db)?;
     Ok(())
 }
 

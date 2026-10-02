@@ -27,6 +27,41 @@ CREATE TABLE message_page_manifests (
     body BLOB NOT NULL, PRIMARY KEY(generation,character_id,conversation_id)
 );
 CREATE TABLE message_page_objects (hash TEXT PRIMARY KEY, body BLOB NOT NULL);
+CREATE TABLE message_page_verified_objects (
+    hash TEXT PRIMARY KEY REFERENCES message_page_objects(hash) ON DELETE CASCADE
+);
+CREATE TABLE message_page_proofs (
+    hash TEXT PRIMARY KEY REFERENCES message_page_objects(hash) ON DELETE CASCADE,
+    message_count INTEGER NOT NULL, byte_length INTEGER NOT NULL,
+    first_length INTEGER NOT NULL, ends_cut INTEGER NOT NULL, message_hashes TEXT NOT NULL
+);
+CREATE TRIGGER message_page_objects_immutable_update BEFORE UPDATE ON message_page_objects
+BEGIN SELECT RAISE(ABORT,'message object is immutable'); END;
+CREATE TRIGGER message_page_objects_immutable_replace BEFORE INSERT ON message_page_objects
+WHEN EXISTS(SELECT 1 FROM message_page_objects WHERE hash=NEW.hash)
+BEGIN SELECT RAISE(ABORT,'message object is immutable'); END;
+CREATE TRIGGER message_page_objects_invalidate AFTER DELETE ON message_page_objects
+BEGIN
+    DELETE FROM message_page_verified_objects WHERE hash=OLD.hash;
+    DELETE FROM message_page_proofs WHERE hash=OLD.hash;
+END;
+CREATE TRIGGER message_page_verified_objects_immutable BEFORE UPDATE ON message_page_verified_objects
+BEGIN SELECT RAISE(ABORT,'message verification is immutable'); END;
+CREATE TRIGGER message_page_verified_objects_parent BEFORE INSERT ON message_page_verified_objects
+WHEN NOT EXISTS(SELECT 1 FROM message_page_objects WHERE hash=NEW.hash)
+BEGIN SELECT RAISE(ABORT,'message object is missing'); END;
+CREATE TRIGGER message_page_verified_objects_no_replace BEFORE INSERT ON message_page_verified_objects
+WHEN EXISTS(SELECT 1 FROM message_page_verified_objects WHERE hash=NEW.hash)
+BEGIN SELECT RAISE(ABORT,'message verification is immutable'); END;
+CREATE TRIGGER message_page_proofs_immutable BEFORE UPDATE ON message_page_proofs
+BEGIN SELECT RAISE(ABORT,'message page proof is immutable'); END;
+CREATE TRIGGER message_page_proofs_parent BEFORE INSERT ON message_page_proofs
+WHEN NOT EXISTS(SELECT 1 FROM message_page_objects o
+    JOIN message_page_verified_objects v ON v.hash=o.hash WHERE o.hash=NEW.hash)
+BEGIN SELECT RAISE(ABORT,'message object is not verified'); END;
+CREATE TRIGGER message_page_proofs_no_replace BEFORE INSERT ON message_page_proofs
+WHEN EXISTS(SELECT 1 FROM message_page_proofs WHERE hash=NEW.hash)
+BEGIN SELECT RAISE(ABORT,'message page proof is immutable'); END;
 ";
 
 #[derive(Clone, Copy, Debug)]
@@ -45,7 +80,12 @@ pub(super) fn object_body(db: &Connection, hash: &str) -> StoreResult<Option<Vec
         )
         .optional()?;
     if let Some(body) = &body {
-        if risunest_sync_wire::hash(body) != hash {
+        if {
+            let hash_input = body;
+            #[cfg(test)]
+            crate::persistent_store::hash_work::observe("native_page_object_verify", hash_input.len());
+            risunest_sync_wire::hash(hash_input)
+        } != hash {
             return Err(codec_error("message object hash mismatch"));
         }
     }
@@ -54,17 +94,34 @@ pub(super) fn object_body(db: &Connection, hash: &str) -> StoreResult<Option<Vec
 
 pub(super) fn put_object(db: &Connection, hash: &str, body: &[u8]) -> StoreResult<()> {
     risunest_sync_wire::validate_hash(hash).map_err(codec_error)?;
-    if risunest_sync_wire::hash(body) != hash {
+    if {
+        let hash_input = body;
+        #[cfg(test)]
+        crate::persistent_store::hash_work::observe("native_page_object_verify", hash_input.len());
+        risunest_sync_wire::hash(hash_input)
+    } != hash {
         return Err(codec_error("message object hash mismatch"));
     }
-    db.execute(
-        "INSERT OR IGNORE INTO message_page_objects(hash,body) VALUES(?1,?2)",
-        params![hash, body],
-    )?;
+    let exists: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM message_page_objects WHERE hash=?1)",
+        [hash], |row| row.get(0))?;
+    if !exists {
+        db.execute("INSERT INTO message_page_objects(hash,body) VALUES(?1,?2)", params![hash, body])?;
+    }
     if object_body(db, hash)?.as_deref() != Some(body) {
         return Err(codec_error("message object identity collision"));
     }
+    if !verified_object_present(db, hash)? {
+        db.execute("INSERT INTO message_page_verified_objects(hash) VALUES(?1)", [hash])?;
+    }
     Ok(())
+}
+
+// Only successful hash verification certifies presence. Deleting an immutable
+// object invalidates its proofs, including when foreign keys are disabled.
+pub(super) fn verified_object_present(db: &Connection, hash: &str) -> StoreResult<bool> {
+    risunest_sync_wire::validate_hash(hash).map_err(codec_error)?;
+    Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM message_page_verified_objects v
+        JOIN message_page_objects o ON o.hash=v.hash WHERE v.hash=?1)", [hash], |row| row.get(0))?)
 }
 
 fn require_object(db: &Connection, hash: &str) -> StoreResult<Vec<u8>> {
@@ -74,7 +131,12 @@ fn require_object(db: &Connection, hash: &str) -> StoreResult<Vec<u8>> {
 fn descriptor(
     manifest: &MessageManifest,
 ) -> StoreResult<(RecordDescriptor, Vec<(String, Vec<u8>)>)> {
-    let object = manifest.encode().map_err(codec_error)?;
+    let object = {
+        let result = manifest.encode();
+        #[cfg(test)]
+        crate::persistent_store::hash_work::encoded_object("native_manifest_identity", &result);
+        result
+    }.map_err(codec_error)?;
     let mut descriptor = RecordDescriptor::content(object.hash);
     let mut hashes = manifest
         .pages
@@ -87,7 +149,12 @@ fn descriptor(
         descriptor.dependencies = hashes;
         Vec::new()
     } else {
-        let (root, objects) = build_reference_tree(&hashes, false).map_err(codec_error)?;
+        let (root, objects) = {
+            let result = build_reference_tree(&hashes, false);
+            #[cfg(test)]
+            crate::persistent_store::hash_work::reference_creation(&result);
+            result
+        }.map_err(codec_error)?;
         descriptor.dependency_root = root;
         objects
     };
@@ -96,15 +163,30 @@ fn descriptor(
 }
 
 fn unit_value(db: &Connection, manifest: &MessageManifest) -> StoreResult<UnitValue> {
-    let object = manifest.encode().map_err(codec_error)?;
+    let object = {
+        let result = manifest.encode();
+        #[cfg(test)]
+        crate::persistent_store::hash_work::encoded_object("native_manifest_identity", &result);
+        result
+    }.map_err(codec_error)?;
     put_object(db, &object.hash, &object.bytes)?;
     let (descriptor, references) = descriptor(manifest)?;
     for (hash, body) in references {
         put_object(db, &hash, &body)?;
     }
     let body = descriptor.bytes().map_err(codec_error)?;
-    put_object(db, &risunest_sync_wire::hash(&body), &body)?;
-    UnitValue::object(descriptor).map_err(codec_error)
+    put_object(db, &{
+        let hash_input = &body;
+        #[cfg(test)]
+        crate::persistent_store::hash_work::observe("native_descriptor_object_identity", hash_input.len());
+        risunest_sync_wire::hash(hash_input)
+    }, &body)?;
+    {
+        let result = UnitValue::object(descriptor);
+        #[cfg(test)]
+        crate::persistent_store::hash_work::descriptor_creation(&result);
+        result
+    }.map_err(codec_error)
 }
 
 pub(super) fn load_pages(
@@ -229,7 +311,12 @@ pub(super) fn current_manifest(
         )
         .optional()?;
     match body {
-        Some(body) => unit_value(tx, &MessageManifest::decode(&body).map_err(codec_error)?),
+        Some(body) => unit_value(tx, &{
+            let result = MessageManifest::decode(&body);
+            #[cfg(test)]
+            crate::persistent_store::hash_work::decoded("native_manifest_decode_identity", &body, &result);
+            result
+        }.map_err(codec_error)?),
         None => capture_manifest(tx, generation, character, conversation, None),
     }
 }
@@ -312,6 +399,7 @@ fn capture(
     while let Some((_, _)) = &next {
         let start = position;
         let mut bytes = PAGE_PREFIX.to_vec();
+        let mut page_hashes = Vec::new();
         loop {
             let (index, hash) = next
                 .take()
@@ -326,13 +414,18 @@ fn capture(
                 |r| r.get(0),
             )?;
             let body = payload_value::canonicalize(body.as_bytes()).map_err(codec_error)?;
-            if MessageHash::from_bytes(&body) != hash {
+            if {
+                #[cfg(test)]
+                crate::persistent_store::hash_work::observe("native_message_verify", body.len());
+                MessageHash::from_bytes(&body)
+            } != hash {
                 return Err(codec_error("cached message hash mismatch"));
             }
             if position > start {
                 bytes.push(b',');
             }
             bytes.extend(&body);
+            page_hashes.push(hash.clone());
             #[cfg(test)]
             {
                 work.messages_read += 1;
@@ -361,7 +454,12 @@ fn capture(
             }
         }
         bytes.extend(PAGE_SUFFIX);
-        let object = encoded_object(bytes).map_err(codec_error)?;
+        let object = {
+            let result = encoded_object(bytes);
+            #[cfg(test)]
+            crate::persistent_store::hash_work::encoded_object("native_page_identity", &result);
+            result
+        }.map_err(codec_error)?;
         let boundary = PageBoundary {
             start,
             page: ManifestPage {
@@ -393,6 +491,7 @@ fn capture(
             }
         }
         put_object(tx, &object.hash, &object.bytes)?;
+        store_page_proof(tx, &boundary.page, &page_hashes)?;
         pages.push(boundary);
         #[cfg(test)]
         {
@@ -444,7 +543,11 @@ fn next_hash(
         |r| r.get(0),
     )?;
     let bytes = payload_value::canonicalize(body.as_bytes()).map_err(codec_error)?;
-    let cached = MessageHash::from_bytes(&bytes);
+    let cached = {
+        #[cfg(test)]
+        crate::persistent_store::hash_work::observe("native_message_verify", bytes.len());
+        MessageHash::from_bytes(&bytes)
+    };
     tx.execute("UPDATE messages SET canonical_hash=?5,canonical_size=?6 WHERE generation=?1 AND character_id=?2
         AND conversation_id=?3 AND message_index=?4",params![generation,character,conversation,index,cached.hash,sql_i64(cached.byte_length)?])?;
     Ok(Some((index as usize, cached)))
@@ -495,17 +598,121 @@ fn save_index(
             generation,
             character,
             conversation,
-            manifest.encode().map_err(codec_error)?.bytes
+            {
+                let result = manifest.encode();
+                #[cfg(test)]
+                crate::persistent_store::hash_work::encoded_object("native_manifest_identity", &result);
+                result
+            }.map_err(codec_error)?.bytes
         ],
     )?;
     Ok(())
 }
 
+#[derive(Debug, PartialEq)]
+struct PageProof {
+    message_count: u32,
+    byte_length: u64,
+    first_length: u64,
+    ends_cut: bool,
+}
+
+fn derive_page_proof(page: &ManifestPage, hashes: &[MessageHash]) -> StoreResult<PageProof> {
+    if hashes.is_empty() || hashes.len() != page.message_count as usize {
+        return Err(codec_error("message page manifest length mismatch"));
+    }
+    let mut length = (PAGE_PREFIX.len() + PAGE_SUFFIX.len()) as u64;
+    let mut ends_cut = false;
+    for (offset, hash) in hashes.iter().enumerate() {
+        length = length.checked_add(hash.byte_length)
+            .and_then(|v| v.checked_add(u64::from(offset != 0)))
+            .ok_or_else(|| codec_error("message page length overflow"))?;
+        let count = offset + 1;
+        ends_cut = count == LOGICAL_MESSAGE_PAGE_SIZE
+            || (count >= MIN_PAGE_MESSAGES && hash.boundary().map_err(codec_error)?)
+            || length > MAX_PAGE_BYTES as u64;
+        if let Some(next) = hashes.get(offset + 1) {
+            if ends_cut || length.checked_add(1).and_then(|v| v.checked_add(next.byte_length))
+                .is_none_or(|v| v > MAX_PAGE_BYTES as u64) {
+                return Err(codec_error("message page boundaries are not deterministic"));
+            }
+        }
+    }
+    if length != page.byte_length.0 {
+        return Err(codec_error("message page manifest length mismatch"));
+    }
+    Ok(PageProof { message_count: page.message_count, byte_length: length,
+        first_length: hashes[0].byte_length, ends_cut })
+}
+
+fn cached_page_proof(db: &Connection, hash: &str) -> StoreResult<Option<PageProof>> {
+    Ok(db.query_row("SELECT p.message_count,p.byte_length,p.first_length,p.ends_cut
+        FROM message_page_proofs p JOIN message_page_verified_objects v ON v.hash=p.hash
+        JOIN message_page_objects o ON o.hash=p.hash WHERE p.hash=?1", [hash], |r| {
+        Ok(PageProof { message_count: r.get(0)?, byte_length: sql_u64(r.get(1)?, 1)?,
+            first_length: sql_u64(r.get(2)?, 2)?, ends_cut: r.get(3)? })
+    }).optional()?)
+}
+
+// A proof certifies canonical bytes and every internal cut, not a page's
+// position. The next page's first message still determines a size cut.
+fn store_page_proof(db: &Connection, page: &ManifestPage, hashes: &[MessageHash]) -> StoreResult<PageProof> {
+    let proof = derive_page_proof(page, hashes)?;
+    if !verified_object_present(db, &page.hash)? {
+        return Err(codec_error("message object is not verified"));
+    }
+    if let Some(existing) = cached_page_proof(db, &page.hash)? {
+        if existing != proof {
+            return Err(codec_error("message page proof mismatch"));
+        }
+        return Ok(existing);
+    }
+    db.execute("INSERT INTO message_page_proofs VALUES(?1,?2,?3,?4,?5,?6)", params![
+        page.hash, proof.message_count, sql_i64(proof.byte_length)?, sql_i64(proof.first_length)?,
+        proof.ends_cut, serde_json::to_string(hashes)?])?;
+    Ok(proof)
+}
+
+fn ensure_page_proof(db: &Connection, page: &ManifestPage) -> StoreResult<PageProof> {
+    if let Some(proof) = cached_page_proof(db, &page.hash)? {
+        if proof.message_count != page.message_count || proof.byte_length != page.byte_length.0 {
+            return Err(codec_error("message page manifest length mismatch"));
+        }
+        return Ok(proof);
+    }
+    let body = require_object(db, &page.hash)?;
+    let decoded = {
+        let result = decode_message_page(&body);
+        #[cfg(test)]
+        crate::persistent_store::hash_work::decoded("native_page_decode_identity", &body, &result);
+        result
+    }.map_err(codec_error)?;
+    if decoded.len() != page.message_count as usize || body.len() as u64 != page.byte_length.0 {
+        return Err(codec_error("message page manifest length mismatch"));
+    }
+    let hashes = decoded.iter().map(|value| {
+        let body = payload_value::encode(value).map_err(codec_error)?;
+        #[cfg(test)]
+        crate::persistent_store::hash_work::observe("native_message_verify", body.len());
+        Ok(MessageHash::from_bytes(&body))
+    }).collect::<StoreResult<Vec<_>>>()?;
+    derive_page_proof(page, &hashes)?;
+    if !verified_object_present(db, &page.hash)? {
+        db.execute("INSERT INTO message_page_verified_objects(hash) VALUES(?1)", [&page.hash])?;
+    }
+    store_page_proof(db, page, &hashes)
+}
+
 fn validated_manifest(
     db: &Connection,
     value: &UnitValue,
-) -> StoreResult<(MessageManifest, Vec<Value>, Vec<Vec<u8>>, Vec<PageBoundary>)> {
-    value.validate().map_err(codec_error)?;
+) -> StoreResult<(MessageManifest, Vec<PageBoundary>)> {
+    {
+        let result = value.validate();
+        #[cfg(test)]
+        crate::persistent_store::hash_work::validation(&value);
+        result
+    }.map_err(codec_error)?;
     let UnitValue::Object {
         descriptor: received,
         ..
@@ -514,7 +721,12 @@ fn validated_manifest(
         return Err(codec_error("messages require an object manifest"));
     };
     let body = require_object(db, &received.object_hash)?;
-    let manifest = MessageManifest::decode(&body).map_err(codec_error)?;
+    let manifest = {
+        let result = MessageManifest::decode(&body);
+        #[cfg(test)]
+        crate::persistent_store::hash_work::decoded("native_manifest_decode_identity", &body, &result);
+        result
+    }.map_err(codec_error)?;
     let (expected, references) = descriptor(&manifest)?;
     if received != &expected {
         return Err(codec_error("message manifest dependencies mismatch"));
@@ -524,43 +736,99 @@ fn validated_manifest(
             return Err(codec_error("message reference tree mismatch"));
         }
     }
-    let mut messages = Vec::new();
     let mut pages = Vec::new();
+    let mut previous: Option<PageProof> = None;
+    let mut position = 0usize;
     for page in &manifest.pages {
-        let body = require_object(db, &page.hash)?;
-        let decoded = decode_message_page(&body).map_err(codec_error)?;
-        if decoded.len() != page.message_count as usize || body.len() as u64 != page.byte_length.0 {
-            return Err(codec_error("message page manifest length mismatch"));
+        let proof = ensure_page_proof(db, page)?;
+        if let Some(previous) = previous {
+            if !previous.ends_cut && previous.byte_length.checked_add(1)
+                .and_then(|v| v.checked_add(proof.first_length))
+                .is_some_and(|v| v <= MAX_PAGE_BYTES as u64) {
+                return Err(codec_error("message page boundaries are not deterministic"));
+            }
         }
         pages.push(PageBoundary {
-            start: messages.len(),
+            start: position,
             page: page.clone(),
         });
-        messages.extend(decoded);
+        position = position.checked_add(page.message_count as usize)
+            .ok_or_else(|| codec_error("message count overflow"))?;
+        previous = Some(proof);
     }
-    let bodies = messages
-        .iter()
-        .map(|v| payload_value::encode(v).map_err(codec_error))
-        .collect::<StoreResult<Vec<_>>>()?;
-    let hashes = bodies
-        .iter()
-        .map(|b| MessageHash::from_bytes(b))
-        .collect::<Vec<_>>();
-    let rebuilt = risunest_external_storage_format::message_pages::repage::<StoreError>(
-        &Default::default(),
-        hashes,
-        0..0,
-        messages.len(),
-        |i| Ok(bodies[i].clone()),
-    )?;
-    if rebuilt.index.manifest() != manifest {
-        return Err(codec_error("message page boundaries are not deterministic"));
-    }
-    Ok((manifest, messages, bodies, pages))
+    Ok((manifest, pages))
 }
 
 pub(super) fn validate_manifest(db: &Connection, value: &UnitValue) -> StoreResult<()> {
     validated_manifest(db, value).map(|_| ())
+}
+
+// Copied SQLite files cannot supply certificates for their own contents.
+pub(super) fn accept_copied_database(tx: &Transaction<'_>) -> StoreResult<()> {
+    tx.execute_batch("DELETE FROM message_page_proofs; DELETE FROM message_page_verified_objects;")?;
+    let mut messages = tx.prepare("SELECT generation,character_id,conversation_id,message_index,value,canonical_hash,canonical_size FROM messages")?;
+    let mut rows = messages.query([])?;
+    while let Some(row) = rows.next()? {
+        let text: String = row.get(4)?;
+        let value: Value = serde_json::from_str(&text)?;
+        let bytes = payload_value::encode(&value).map_err(codec_error)?;
+        let hash = MessageHash::from_bytes(&bytes);
+        let imported_hash: String = row.get(5)?;
+        let imported_size: i64 = row.get(6)?;
+        if !imported_hash.is_empty() && (imported_hash != hash.hash || imported_size != sql_i64(hash.byte_length)?) {
+            return Err(codec_error("copied native message identity mismatch"));
+        }
+        tx.execute("UPDATE messages SET canonical_hash=?5,canonical_size=?6 WHERE generation=?1 AND character_id=?2 AND conversation_id=?3 AND message_index=?4",
+            params![row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,i64>(3)?,hash.hash,sql_i64(hash.byte_length)?])?;
+    }
+    drop(rows);
+    drop(messages);
+    let invalid_parent: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM messages m LEFT JOIN conversations c ON c.generation=m.generation AND c.character_id=m.character_id AND c.conversation_id=m.conversation_id WHERE c.conversation_id IS NULL)",[],|r|r.get(0))?;
+    if invalid_parent { return Err(codec_error("copied native message parent is missing")); }
+    let invalid_order: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM conversations c WHERE c.message_count!=(SELECT COUNT(*) FROM messages m WHERE m.generation=c.generation AND m.character_id=c.character_id AND m.conversation_id=c.conversation_id) OR (c.message_count>0 AND ((SELECT MIN(message_index) FROM messages m WHERE m.generation=c.generation AND m.character_id=c.character_id AND m.conversation_id=c.conversation_id)!=0 OR (SELECT MAX(message_index) FROM messages m WHERE m.generation=c.generation AND m.character_id=c.character_id AND m.conversation_id=c.conversation_id)!=c.message_count-1)))",[],|r|r.get(0))?;
+    if invalid_order { return Err(codec_error("copied native message indices or count mismatch")); }
+    let invalid_id: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE message_id IS NOT json_extract(value,'$.chatId'))",[],|r|r.get(0))?;
+    if invalid_id { return Err(codec_error("copied native message chatId mismatch")); }
+    let orphan: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM message_page_indexes i LEFT JOIN message_page_manifests m
+        ON m.generation=i.generation AND m.character_id=i.character_id AND m.conversation_id=i.conversation_id WHERE m.body IS NULL)",[],|r|r.get(0))?;
+    if orphan { return Err(codec_error("copied page index has no manifest")); }
+    let mut manifests = tx.prepare("SELECT generation,character_id,conversation_id,body FROM message_page_manifests")?;
+    let entries = manifests.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,Vec<u8>>(3)?)))?
+        .collect::<Result<Vec<_>,_>>()?;
+    drop(manifests);
+    for (generation,character,conversation,body) in entries {
+        let original = MessageManifest::decode(&body).map_err(codec_error)?;
+        let original_pages = load_pages(tx,&generation,&character,&conversation)?;
+        let original_value = unit_value(tx,&original)?;
+        let (_, expected_pages) = validated_manifest(tx,&original_value)?;
+        if original_pages != expected_pages { return Err(codec_error("copied page index mismatch")); }
+        tx.execute("DELETE FROM message_page_indexes WHERE generation=?1 AND character_id=?2 AND conversation_id=?3",params![generation,character,conversation])?;
+        tx.execute("DELETE FROM message_page_manifests WHERE generation=?1 AND character_id=?2 AND conversation_id=?3",params![generation,character,conversation])?;
+        let actual = capture_manifest(tx,&generation,&character,&conversation,None)?;
+        if actual != original_value { return Err(codec_error("copied message manifest differs from native messages")); }
+    }
+    for table in ["lww_units", "lww_outbox", "lww_receive_rows", "lww_binding_source_units"] {
+        let identity_column = if matches!(table,"lww_units"|"lww_outbox") { "identity" } else { "NULL" };
+        let mut statement = tx.prepare(&format!("SELECT key,value,stamp,{identity_column} FROM {table}"))?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let key: risunest_sync_wire::unit::UnitKey = row.get::<_,String>(0)?.try_into().map_err(codec_error)?;
+            let value: UnitValue = serde_json::from_str(&row.get::<_,String>(1)?)?;
+            value.validate().map_err(codec_error)?;
+            let stamp: risunest_sync_wire::stamp::Stamp = serde_json::from_str(&row.get::<_,String>(2)?)?;
+            stamp.validate().map_err(codec_error)?;
+            if let Some(identity) = row.get::<_,Option<String>>(3)? {
+                let bytes = risunest_sync_wire::canonical::encode(&value).map_err(codec_error)?;
+                if risunest_sync_wire::hash(&bytes)!=identity { return Err(codec_error("copied native unit identity mismatch")); }
+            }
+            super::lww::validate_received(tx,&key,&value)?;
+            if key.components()[0]=="messages" && !matches!(value,UnitValue::Deleted) {
+                let (manifest,_) = validated_manifest(tx,&value)?;
+                unit_value(tx,&manifest)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn apply_manifest(
@@ -570,25 +838,95 @@ pub(super) fn apply_manifest(
     conversation: &str,
     value: &UnitValue,
 ) -> StoreResult<()> {
-    let (manifest, messages, bodies, pages) = validated_manifest(tx, value)?;
+    let (manifest, pages) = validated_manifest(tx, value)?;
     let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM conversations WHERE generation=?1 AND character_id=?2 AND conversation_id=?3)",
         params![generation,character,conversation],|r|r.get(0))?;
     if !exists {
         return Err(codec_error("message manifest parent is missing"));
     }
-    tx.execute(
-        "DELETE FROM messages WHERE generation=?1 AND character_id=?2 AND conversation_id=?3",
-        params![generation, character, conversation],
-    )?;
-    for (index, (value, body)) in messages.iter().zip(bodies).enumerate() {
-        let hash = MessageHash::from_bytes(&body);
+    let old = load_pages(tx, generation, character, conversation)?;
+    let prefix = old.iter().zip(&pages).take_while(|(a,b)| a == b).count();
+    let suffix = old[prefix..].iter().rev().zip(pages[prefix..].iter().rev())
+        .take_while(|(a,b)| a.page == b.page).count();
+    let mut start = pages.get(prefix).map_or(manifest.message_count.0, |p| p.start as u64);
+    let old_count = if let Some(last) = old.last() {
+        last.start as u64 + last.page.message_count as u64
+    } else {
+        sql_u64(tx.query_row("SELECT message_count FROM conversations WHERE generation=?1
+            AND character_id=?2 AND conversation_id=?3", params![generation,character,conversation],
+            |r| r.get(0))?, 0)?
+    };
+    let mut old_end = old.get(old.len()-suffix).map_or(old_count, |p| p.start as u64);
+    let mut new_end = pages.get(pages.len()-suffix).map_or(manifest.message_count.0, |p| p.start as u64);
+    let mut replacement = Vec::new();
+    for page in &pages[prefix..pages.len()-suffix] {
+        let (body, hashes): (Vec<u8>, String) = tx.query_row("SELECT o.body,p.message_hashes
+            FROM message_page_objects o JOIN message_page_proofs p ON p.hash=o.hash
+            JOIN message_page_verified_objects v ON v.hash=o.hash WHERE o.hash=?1", [&page.page.hash],
+            |r| Ok((r.get(0)?, r.get(1)?)))?;
+        // These exact immutable bytes already passed canonical decoding and hash
+        // verification. Only changed pages are materialized into native rows.
+        let document: Value = serde_json::from_slice(&body)?;
+        let messages = document["messages"].as_array().ok_or_else(|| codec_error("invalid verified page"))?;
+        let hashes: Vec<MessageHash> = serde_json::from_str(&hashes)?;
+        if messages.len() != hashes.len() || messages.len() != page.page.message_count as usize {
+            return Err(codec_error("message page proof mismatch"));
+        }
+        for (value, hash) in messages.iter().zip(hashes) {
+            let body = payload_value::encode(value).map_err(codec_error)?;
+            replacement.push((value.get("chatId").and_then(Value::as_str).map(str::to_owned),
+                String::from_utf8(body).map_err(codec_error)?, hash));
+        }
+    }
+    // A changed page can contain unchanged messages. Compare only the affected
+    // native range's stored identities to preserve its leading/trailing rows.
+    let mut leading = 0;
+    while leading < replacement.len() && start < old_end {
+        if native_message_hash(tx, generation, character, conversation, start)? != replacement[leading].2 {
+            break;
+        }
+        start += 1;
+        leading += 1;
+    }
+    let mut trailing = 0;
+    while trailing < replacement.len()-leading && old_end > start {
+        if native_message_hash(tx, generation, character, conversation, old_end-1)?
+            != replacement[replacement.len()-trailing-1].2 {
+            break;
+        }
+        old_end -= 1;
+        new_end -= 1;
+        trailing += 1;
+    }
+    tx.execute("DELETE FROM messages WHERE generation=?1 AND character_id=?2 AND conversation_id=?3
+        AND message_index>=?4 AND message_index<?5",
+        params![generation,character,conversation,sql_i64(start)?,sql_i64(old_end)?])?;
+    let delta = sql_i64(new_end)? - sql_i64(old_end)?;
+    if delta != 0 {
+        tx.execute("UPDATE messages SET message_index=-(message_index+?4)-1
+            WHERE generation=?1 AND character_id=?2 AND conversation_id=?3 AND message_index>=?5",
+            params![generation,character,conversation,delta,sql_i64(old_end)?])?;
+        tx.execute("UPDATE messages SET message_index=-message_index-1
+            WHERE generation=?1 AND character_id=?2 AND conversation_id=?3 AND message_index<0",
+            params![generation,character,conversation])?;
+    }
+    for (offset, (id, body, hash)) in replacement[leading..replacement.len()-trailing].iter().enumerate() {
         tx.execute("INSERT INTO messages(generation,character_id,conversation_id,message_index,message_id,value,canonical_hash,canonical_size)
-            VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![generation,character,conversation,index as i64,
-                value.get("chatId").and_then(Value::as_str),String::from_utf8(body).map_err(codec_error)?,hash.hash,sql_i64(hash.byte_length)?])?;
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![generation,character,conversation,
+                sql_i64(start+offset as u64)?,id,body,hash.hash,sql_i64(hash.byte_length)?])?;
     }
     tx.execute("UPDATE conversations SET message_count=?4 WHERE generation=?1 AND character_id=?2 AND conversation_id=?3",
         params![generation,character,conversation,sql_i64(manifest.message_count.0)?])?;
     save_index(tx, generation, character, conversation, &pages, &manifest)
+}
+
+fn native_message_hash(db: &Connection, generation: &str, character: &str,
+    conversation: &str, index: u64) -> StoreResult<MessageHash> {
+    Ok(db.query_row("SELECT canonical_hash,canonical_size FROM messages WHERE generation=?1
+        AND character_id=?2 AND conversation_id=?3 AND message_index=?4",
+        params![generation,character,conversation,sql_i64(index)?], |r| {
+            Ok(MessageHash { hash: r.get(0)?, byte_length: sql_u64(r.get(1)?, 1)? })
+        })?)
 }
 
 impl From<risunest_external_storage_format::logical_records::LogicalRecordError> for StoreError {
@@ -623,6 +961,82 @@ mod capture_work_tests {
             INSERT INTO messages VALUES('g','c','chat',1,'second','{\"chatId\":\"second\"}','','0');").unwrap();
         db.execute_batch(SCHEMA).unwrap();
         db
+    }
+
+    #[test]
+    fn hash_work_counts_fallback_reverification_pages_and_manifest_passes() {
+        use crate::persistent_store::hash_work::{reset_hash_work, take_hash_work, DomainWork};
+        let mut db = fixture(); let tx = db.transaction().unwrap();
+        let bodies = [b"{\"chatId\":\"first\"}".to_vec(), b"{\"chatId\":\"second\"}".to_vec()];
+        let message_bytes = bodies.iter().map(|body| body.len() as u64).sum::<u64>();
+        let page_bytes = PAGE_PREFIX.len() as u64 + message_bytes + 1 + PAGE_SUFFIX.len() as u64;
+        reset_hash_work();
+        let value = capture_manifest(&tx, "g", "c", "chat", None).unwrap();
+        let manifest_bytes: Vec<u8> = tx.query_row("SELECT body FROM message_page_manifests", [], |row| row.get(0)).unwrap();
+        let work = take_hash_work();
+        assert_eq!(work.domains["native_message_verify"], DomainWork { calls: 4, bytes: 2 * message_bytes });
+        assert_eq!(work.domains["native_page_identity"], DomainWork { calls: 1, bytes: page_bytes });
+        assert_eq!(work.domains["native_manifest_identity"], DomainWork { calls: 3, bytes: 3 * manifest_bytes.len() as u64 });
+        assert!(work.incomplete.is_empty());
+        reset_hash_work();
+        validate_manifest(&tx, &value).unwrap();
+        let work = take_hash_work();
+        assert_eq!(work.domains["native_manifest_decode_identity"], DomainWork { calls: 1, bytes: manifest_bytes.len() as u64 });
+        for domain in ["native_page_decode_identity", "native_message_verify", "native_repage_message_verify", "native_repage_page_identity"] {
+            assert!(!work.domains.contains_key(domain), "persisted proof must skip {domain}");
+        }
+        assert!(work.incomplete.is_empty());
+        // Removing the proof forces real canonical decoding and message hashes.
+        tx.execute("DELETE FROM message_page_proofs", []).unwrap();
+        reset_hash_work();
+        validate_manifest(&tx, &value).unwrap();
+        let work = take_hash_work();
+        assert_eq!(work.domains["native_page_decode_identity"], DomainWork { calls: 1, bytes: page_bytes });
+        assert_eq!(work.domains["native_message_verify"], DomainWork { calls: 2, bytes: message_bytes });
+        assert!(!work.domains.contains_key("native_repage_message_verify"));
+        assert!(!work.domains.contains_key("native_repage_page_identity"));
+        assert!(work.incomplete.is_empty());
+    }
+
+    #[test]
+    fn verified_object_put_counts_both_passes_and_failed_hash_exactly() {
+        use crate::persistent_store::hash_work::{reset_hash_work, take_hash_work, DomainWork};
+        let db = fixture(); let body = b"synthetic control"; let hash = risunest_sync_wire::hash(body);
+        reset_hash_work();
+        put_object(&db, &hash, body).unwrap(); object_body(&db, &hash).unwrap();
+        assert!(put_object(&db, &hash, b"wrong").is_err());
+        let work = take_hash_work();
+        assert_eq!(work.domains["native_page_object_verify"], DomainWork { calls: 4, bytes: (3 * body.len() + 5) as u64 });
+        assert!(work.incomplete.is_empty());
+    }
+
+    #[test]
+    fn failed_delegated_decode_marks_unknown_partial_work_incomplete() {
+        use crate::persistent_store::hash_work::{reset_hash_work, take_hash_work};
+        let db = fixture();
+        let body = b"{ \"schema\":\"risunest.message-manifest/v1\",\"messageCount\":\"0\",\"pages\":[]}";
+        let hash = risunest_sync_wire::hash(body); put_object(&db, &hash, body).unwrap();
+        let value = UnitValue::object(RecordDescriptor::content(hash)).unwrap();
+        reset_hash_work();
+        assert!(validate_manifest(&db, &value).is_err());
+        let work = take_hash_work();
+        assert_eq!(work.incomplete["native_manifest_decode_identity"], 1);
+        assert!(!work.domains.contains_key("native_manifest_decode_identity"));
+        assert_eq!(work.domains["native_page_object_verify"].bytes, body.len() as u64);
+    }
+
+    #[test]
+    fn reference_creation_counts_returned_pages_without_rehashing() {
+        use crate::persistent_store::hash_work::{reset_hash_work, take_hash_work, DomainWork};
+        let manifest = MessageManifest { schema: MANIFEST_SCHEMA.into(), message_count: 65.into(), pages: (0..65).map(|index| ManifestPage {
+            hash: format!("{index:064x}"), message_count: 1, byte_length: 80.into()
+        }).collect() };
+        reset_hash_work();
+        let (_, objects) = descriptor(&manifest).unwrap();
+        let work = take_hash_work();
+        assert_eq!(work.domains["native_reference_create"], DomainWork { calls: objects.len() as u64, bytes: objects.iter().map(|(_, body)| body.len() as u64).sum() });
+        assert!(!work.domains.contains_key("native_reference_relation_boundary"));
+        assert!(work.incomplete.is_empty());
     }
 
     #[test]

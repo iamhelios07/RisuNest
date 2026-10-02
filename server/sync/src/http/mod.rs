@@ -277,6 +277,16 @@ impl IntoResponse for Error {
     }
 }
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
+    #[cfg(test)]
+    let worker = crate::source_observer::worker();
+    #[cfg(test)]
+    let f = move || {
+        let _entered = worker.enter();
+        let result = f();
+        drop(_entered);
+        drop(worker);
+        result
+    };
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|_| Error::new("worker-unavailable", 503))?
@@ -511,7 +521,14 @@ async fn object_response(
             };
             response = match body {
                 crate::store::Body::File(file) => {
+                    #[cfg(not(test))]
                     let mut file = tokio::fs::File::from_std(file);
+                    #[cfg(test)]
+                    let mut file = {
+                        let file = file.into_async();
+                        file.selected(start, length);
+                        file
+                    };
                     use tokio::io::{AsyncReadExt, AsyncSeekExt};
                     file.seek(std::io::SeekFrom::Start(start)).await?;
                     axum::body::Body::from_stream(tokio_util::io::ReaderStream::with_capacity(
@@ -523,6 +540,8 @@ async fn object_response(
                 // Already in memory and bounded by the inline threshold, so a
                 // range is a slice rather than a seek.
                 crate::store::Body::Bytes(bytes) => {
+                    #[cfg(test)]
+                    crate::source_observer::inline_selection(digest, start, length);
                     let bytes = bytes.into_inner();
                     let end = (start + length).min(bytes.len() as u64) as usize;
                     axum::body::Body::from(bytes[start as usize..end].to_vec()).into_response()

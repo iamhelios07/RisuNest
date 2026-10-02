@@ -2649,29 +2649,24 @@ describe('SaveCoordinator', () => {
         expect(commit).toHaveBeenCalledOnce()
         expect(commit).toHaveBeenCalledWith({
             expectedRevision: 1,
-            root: expect.objectContaining({
-                characterOrder: ['group-a', 'group-b', 'group-trash'],
-            }),
-            deleteCharacterIds: ['char-a'],
-            characterDetails: [
-                expect.objectContaining({
-                    chaId: 'group-a',
+            unitMutations: [
+                {type:'delete',key:'["exists","character","char-a"]'},
+                {type:'set',key:'["group-members","group-a"]',value:{
                     characters: ['char-b'],
                     characterTalks: [0.75],
                     characterActive: [true],
-                }),
-                expect.objectContaining({
-                    chaId: 'group-b',
+                }},
+                {type:'set',key:'["group-members","group-b"]',value:{
                     characters: ['char-b'],
                     characterTalks: [0.4],
                     characterActive: [true],
-                }),
-                expect.objectContaining({
-                    chaId: 'group-trash',
+                }},
+                {type:'set',key:'["group-members","group-trash"]',value:{
                     characters: [],
                     characterTalks: [],
                     characterActive: [],
-                }),
+                }},
+                {type:'set',key:'["order","characters"]',value:['group-a','group-b','group-trash']},
             ],
         })
         expect(publishCharacterMutation).toHaveBeenCalledWith(expect.objectContaining({
@@ -2739,11 +2734,11 @@ describe('SaveCoordinator', () => {
         expect(commit).toHaveBeenCalledOnce()
         expect(commit.mock.calls[0][0]).toMatchObject({
             expectedRevision: 1,
-            deleteCharacterIds: ['char-a'],
-            characterDetails: [expect.objectContaining({
-                chaId: 'group-a',
-                characters: ['char-b'],
-            })],
+            unitMutations: [
+                {type:'delete',key:'["exists","character","char-a"]'},
+                {type:'set',key:'["group-members","group-a"]',value:expect.objectContaining({characters:['char-b']})},
+                {type:'set',key:'["order","characters"]',value:['group-a']},
+            ],
         })
         expect(group.characters).toEqual(['char-b'])
         expect(coordinator.revision).toBe(2)
@@ -2763,7 +2758,7 @@ describe('SaveCoordinator', () => {
         let durable: character | groupChat | null = structuredClone(target)
         const commit = vi.fn(async (input: WorkingSetCommit) => {
             if (commit.mock.calls.length === 1) await firstCommit.promise
-            if (input.deleteCharacterIds?.includes('char-a')) durable = null
+            if (input.unitMutations?.some(item => item.type === 'delete' && item.key === '["exists","character","char-a"]')) durable = null
             if (input.addCharacter) durable = structuredClone(input.addCharacter)
             return { revision: ++revision }
         })
@@ -2812,7 +2807,7 @@ describe('SaveCoordinator', () => {
         expect(commit).toHaveBeenCalledTimes(2)
         expect(commit.mock.calls[0][0]).toMatchObject({
             expectedRevision: 1,
-            deleteCharacterIds: ['char-a'],
+            unitMutations:expect.arrayContaining([{type:'delete',key:'["exists","character","char-a"]'}]),
         })
         expect(commit.mock.calls[1][0]).toMatchObject({
             expectedRevision: 2,
@@ -4605,4 +4600,37 @@ describe('SaveCoordinator', () => {
         expect(coordinator.revision).toBe(32)
     })
 
+})
+
+
+describe('upstream replacement publication completion',()=>{
+    it.each([true,false])('preserves a newer publication queued after pause release, publishOfficial=%s',async publishOfficial=>{
+        const database=makeDatabase()
+        const started=deferred<void>()
+        const committed=deferred<{revision:number}>()
+        const pin=vi.fn(async()=>({publish:vi.fn(async()=>{}),dispose:vi.fn(async()=>{})}))
+        const store=makeStore(vi.fn(async()=>{started.resolve();return committed.promise}))
+        const coordinator=new SaveCoordinator({store,captureRoot:()=>captureRoot(database),captureSelectedCharacter:()=>database.characters[0],replaceDatabase:()=>{},
+            officialPublisher:{pin},clock:{setTimeout:vi.fn(()=>1),clearTimeout:vi.fn()}})
+        coordinator.initialize(2,database)
+        const newer=coordinator.commitPersistentUnitIntent('post-import-write',[{type:'set',key:JSON.stringify(['root','username']),value:'Newer'}])
+        await started.promise
+        const finish=coordinator.finishUpstreamReplacementPublication(2,publishOfficial)
+        committed.resolve({revision:3})
+        await Promise.all([newer,finish])
+        expect(coordinator.hasPendingOfficialPublication).toBe(true)
+        await coordinator.publishCurrentOfficialRevision()
+        expect(pin).toHaveBeenCalledExactlyOnceWith(3)
+    })
+    it.each([true,false])('retains accepted revision behavior without later writes, publishOfficial=%s',async publishOfficial=>{
+        const database=makeDatabase()
+        const pin=vi.fn(async()=>({publish:vi.fn(async()=>{}),dispose:vi.fn(async()=>{})}))
+        const coordinator=new SaveCoordinator({store:makeStore(),captureRoot:()=>captureRoot(database),captureSelectedCharacter:()=>database.characters[0],replaceDatabase:()=>{},
+            officialPublisher:{pin},clock:{setTimeout:vi.fn(()=>1),clearTimeout:vi.fn()}})
+        coordinator.initialize(2,database)
+        await coordinator.finishUpstreamReplacementPublication(2,publishOfficial)
+        expect(coordinator.hasPendingOfficialPublication).toBe(publishOfficial)
+        if(publishOfficial){await coordinator.publishCurrentOfficialRevision();expect(pin).toHaveBeenCalledExactlyOnceWith(2)}
+        else expect(pin).not.toHaveBeenCalled()
+    })
 })
