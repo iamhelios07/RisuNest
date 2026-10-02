@@ -48,6 +48,7 @@ export function disposeNativeSyncBindings(): void { disposeServer?.(); disposeSe
 
 type Status = { configured: boolean; libraryId?: string | null; deviceId?: string | null; writerId: string; bindingAuthority: string }
 let status: Status = { configured: false, writerId: '', bindingAuthority: '0' }
+let persistedBinding: BindingContext['state'] | undefined
 let context: BindingContext | undefined
 let error = ''
 let foreground = false
@@ -105,9 +106,15 @@ async function retryNativeClock(automatic = false): Promise<void> {
     const captured = context
     if (!captured) throw new Error('Sync binding is unavailable')
     checkContext(captured)
-    await invoke('server_sync_lww_retry', { request: header() })
+    const request = header()
+    try { await invoke('server_sync_lww_retry', { request }) }
+    catch (value) { if (!automatic) scheduler.reportFailure(value); throw value }
     checkContext(captured)
     if (!automatic || error === 'clock-skew' || error === 'server-unreachable') { error = ''; hydrationError = ''; changed() }
+}
+async function resumeCurrentServerBinding(state: BindingContext['state']): Promise<void> {
+    try { await resumeCurrentSyncBinding(state.target) }
+    catch (value) { error = serverSyncErrorCode(value) || 'server-unreachable'; await controller.ensureStatus(); throw value }
 }
 async function pushAvailable(captured: BindingContext, requireForeground = false): Promise<void> {
     for (;;) {
@@ -158,7 +165,7 @@ const transport: SyncBindingTransport = {
     inspectTarget: c => invoke('server_sync_lww_inspect', { request: { bindingAuthority: c.state.targetAuthority, requestId: crypto.randomUUID() } }),
     pullAvailableState: (inspected,c) => invoke('server_sync_lww_stage_target', { inspectionId: inspected.inspectionId, request: { bindingAuthority: c.state.targetAuthority, requestId: crypto.randomUUID() } }),
     replaceFromTarget: replaceNativeSyncBinding,
-    async fenceOldJobs(c) { foreground = false; context = undefined; await scheduler.fence(); await hydrating; await invoke('server_sync_lww_fence', { newDevice: c.mode === 'new-device' }); hydrationPending = false; hydrationAgain = false },
+    async fenceOldJobs(c) { foreground = false; context = undefined; persistedBinding = undefined; await scheduler.fence(); await hydrating; await invoke('server_sync_lww_fence', { newDevice: c.mode === 'new-device' }); hydrationPending = false; hydrationAgain = false },
     async receiveAvailableChanges(c) { c.signal.throwIfAborted(); if (!context || context.state.targetAuthority !== c.state.targetAuthority || context.state.selectionEpoch !== c.state.selectionEpoch) throw new Error('Sync binding changed'); await receiveAvailableServerChanges(); c.signal.throwIfAborted() },
     async publishInitialSharedState(c) {
         context = c
@@ -174,15 +181,23 @@ const transport: SyncBindingTransport = {
         foreground = document.visibilityState !== 'hidden'
         await pushAvailable(c, true)
     },
-    async resumeBinding(c) { context = c; await invoke('server_sync_lww_activate', { request: header() }); checkContext(c); hydrationPending = true; await updateForeground(document.visibilityState !== 'hidden'); scheduler.remoteHint() },
+    async resumeBinding(c) { context = c; await invoke('server_sync_lww_activate', { request: header() }); checkContext(c); persistedBinding = c.state; hydrationPending = true; await updateForeground(document.visibilityState !== 'hidden'); scheduler.remoteHint() },
     prepareNewDeviceBinding: (staged,c) => invoke('server_sync_lww_prepare_new_device', { stagingId: staged.stagingId, request: { bindingAuthority: c.state.targetAuthority, requestId: staged.receiveId } }),
     replaceAsNewDevice: replaceNativeSyncBindingAsNewDevice,
-    async resumeNewDeviceBinding(preparation,result,c) { await invoke('server_sync_lww_activate_new_device', { authorizationId: preparation.authorizationId, writerId: result.writerId, request: { bindingAuthority: result.bindingAuthority, requestId: crypto.randomUUID() } }); context = c; checkContext(c); error = ''; hydrationError = ''; hydrationPending = true; await scheduler.retry(); await updateForeground(document.visibilityState !== 'hidden'); scheduler.remoteHint() },
+    async resumeNewDeviceBinding(preparation,result,c) { await invoke('server_sync_lww_activate_new_device', { authorizationId: preparation.authorizationId, writerId: result.writerId, request: { bindingAuthority: result.bindingAuthority, requestId: crypto.randomUUID() } }); context = c; checkContext(c); persistedBinding = c.state; error = ''; hydrationError = ''; hydrationPending = true; await scheduler.retry(); await updateForeground(document.visibilityState !== 'hidden'); scheduler.remoteHint() },
 }
 export async function receiveAvailableServerChanges(): Promise<void> { await scheduler.receiveAvailableChanges() }
 export async function connectServerSync(config: ServerConfig, newDevice = false): Promise<void> { await invoke('server_sync_configure', { config }); error = ''; await bindSyncTarget({ kind: 'server', connectionId: 'server' }, newDevice ? { mode: 'new-device' } : {}); await controller.ensureStatus() }
 export async function disconnectServerSync(): Promise<void> { await unbindSyncTarget(); context = undefined; await controller.ensureStatus() }
-export async function retryServerSync(): Promise<void> { foreground = false; await scheduler.fence(); await hydrating; await retryNativeClock(); await scheduler.retry(); await updateForeground(document.visibilityState !== 'hidden'); changed() }
+export async function retryServerSync(): Promise<void> {
+    await controller.ensureStatus()
+    const current = persistedBinding
+    if (!current || current.target.kind !== 'server') throw new Error('Sync binding is unavailable')
+    if (!context || context.signal.aborted || context.state.targetAuthority !== current.targetAuthority || context.state.selectionEpoch !== current.selectionEpoch || context.state.libraryId !== current.libraryId || context.state.target.kind !== 'server' || context.state.target.connectionId !== current.target.connectionId) {
+        await resumeCurrentServerBinding(current)
+    }
+    foreground = false; await scheduler.fence(); await hydrating; await retryNativeClock(); await scheduler.retry(); await updateForeground(document.visibilityState !== 'hidden'); changed()
+}
 export async function installServerSyncProduction(): Promise<void> {
     if (!isTauri || disposeServer) return
     const disposers = [registerSyncBindingTransport({ kind: 'server', connectionId: 'server' }, transport)]
@@ -193,13 +208,13 @@ export async function installServerSyncProduction(): Promise<void> {
     const visibility = () => { void updateForeground(document.visibilityState !== 'hidden').catch(value => { error = serverSyncErrorCode(value) || 'server-unreachable'; changed() }) }
     document.addEventListener('visibilitychange', visibility)
     disposers.push(() => document.removeEventListener('visibilitychange', visibility))
-    disposeServer = () => { scheduler.dispose(); for (const dispose of disposers) dispose(); context = undefined; foreground = false; hydrationPending = false; hydrationAgain = false }
+    disposeServer = () => { scheduler.dispose(); for (const dispose of disposers) dispose(); context = undefined; persistedBinding = undefined; foreground = false; hydrationPending = false; hydrationAgain = false }
     await controller.ensureStatus()
     const current = await invoke<BindingContext['state']>('pds_lww_binding_state')
-    if (current.target.kind === 'server' && status.configured) await resumeCurrentSyncBinding(current.target)
+    if (current.target.kind === 'server' && status.configured) await resumeCurrentServerBinding(current)
 }
 
-const snapshot = () => ({ status: { ...status, bound: !!context && !context.signal.aborted }, running: scheduler.isRunning() || !!hydrating, paused: !context || context.signal.aborted || scheduler.isBlocked(), replacing, draining: false, error })
+const snapshot = () => ({ status: { ...status, bound: persistedBinding?.target.kind === 'server' || !!context && !context.signal.aborted }, running: scheduler.isRunning() || !!hydrating, paused: !context || context.signal.aborted || scheduler.isBlocked(), replacing, draining: false, error })
 const controller = {
     snapshot,
     subscribe: (listener: (value: ReturnType<typeof snapshot>) => void) => { listeners.add(listener); listener(controller.snapshot()); return () => { listeners.delete(listener) } },
@@ -207,7 +222,7 @@ const controller = {
     beginReplacement: async () => { replacing = true; foreground = false; if (hydrating) hydrationPending = true; await scheduler.fence(); await hydrating; changed(); return async () => { replacing = false; await updateForeground(document.visibilityState !== 'hidden'); changed() } },
     confirmReplacement: async () => {},
     holdAutomaticSync: () => { foreground = false; if (hydrating) hydrationPending = true; void scheduler.fence() },
-    ensureStatus: async () => { if (isTauri) status = await invoke<Status>('server_sync_status'); changed() },
+    ensureStatus: async () => { if (isTauri) { [status,persistedBinding] = await Promise.all([invoke<Status>('server_sync_status'),invoke<BindingContext['state']>('pds_lww_binding_state')]) } changed() },
 }
 export function getServerSyncController() { return controller }
 export function createServerSyncExitDrainAdapter(id = 'server', _fence?: RetainableReplacementFence): SyncExitDrainAdapter {
