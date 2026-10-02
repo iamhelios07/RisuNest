@@ -5241,6 +5241,15 @@ mod tests {
             let entry=entries.into_iter().next().unwrap();
             let decoded=snapshot_restore::download_packed_body(&hash,entry.byte_length,entry.chunks,packs.values().map(|pack|pack.stored(&repository).unwrap()).collect(),&stage,&key,&provider,&repository,&Cancellation::default()).await.unwrap();
             assert_eq!(decoded,body);
+            let pack=packs.values().next().unwrap();let name=&pack.receipt.locator.object;
+            let reads=provider.read_attempts(name);
+            assert_eq!(snapshot_restore::revalidate_catalog(&completed.catalog,wire::CatalogKind::Records,&key,&provider,&repository,&Cancellation::default()).await.unwrap_err().kind,ErrorKind::Corrupt);
+            assert_eq!(provider.read_attempts(name),reads,"wrong-kind metadata refuses before Asset pack reads");
+            snapshot_restore::revalidate_catalog(&completed.catalog,wire::CatalogKind::Assets,&key,&provider,&repository,&Cancellation::default()).await.unwrap();
+            assert!(provider.read_attempts(name)>reads,"aged prepared Asset roots authenticate their pack closure");
+            let uploads=provider.upload_attempts(&pack.object_id);provider.forget(name);
+            assert_eq!(snapshot_restore::revalidate_catalog(&completed.catalog,wire::CatalogKind::Assets,&key,&provider,&repository,&Cancellation::default()).await.unwrap_err().kind,ErrorKind::NotFound);
+            assert_eq!(provider.upload_attempts(&pack.object_id),uploads,"aged prepared verification never repairs a saved Asset pack");
         });
     }
 
@@ -5257,10 +5266,30 @@ mod tests {
             let completed=package_and_upload_control_catalog(vec![AssetCatalogSource{content_hash:page.hash.clone(),byte_length:page.size,source:ObjectSource::File(source)}],
                 root.path(),&root.path().join("data-cache"),&key,limits(256*1024),&mut transfer,&provider,&repository,&PhaseProgress::silent(),&Cancellation::default(),None).await.unwrap();
             let mut store=crate::persistent_store::PersistentStore::open(destination.path()).unwrap();
-            let hashes=snapshot_restore::admit_data_catalogs(&[completed.catalog.clone()],&mut store,&key,&provider,&repository,&Cancellation::default()).await.unwrap();
+            let hashes=snapshot_restore::admit_data_catalogs(&[completed.catalog.clone()],&mut store,"synthetic-controls",&key,&provider,&repository,&Cancellation::default()).await.unwrap();
             assert_eq!(hashes,vec![page.hash.clone()]);assert_eq!(store.lww_object_body(&page.hash).unwrap().unwrap(),page.bytes);
+            let reads=provider.read_count();
+            assert_eq!(snapshot_restore::admit_data_catalogs(&[completed.catalog.clone()],&mut store,"synthetic-controls",&key,&provider,&repository,&Cancellation::default()).await.unwrap(),hashes);
+            assert_eq!(provider.read_count(),reads,"an exact verified root with local controls needs no remote reads");
+            let pack_reads=completed.referenced.iter().filter(|object|object.role==ObjectRole::Pack).map(|object|
+                (object.receipt.locator.object.clone(),provider.read_attempts(&object.receipt.locator.object))).collect::<BTreeMap<_,_>>();
+            assert_eq!(snapshot_restore::admit_data_catalogs(&[completed.catalog.clone()],&mut store,"fresh-catalog-target",&key,&provider,&repository,&Cancellation::default()).await.unwrap(),hashes);
+            assert!(provider.read_count()>reads,"an unknown root authenticates its metadata");
+            for (name,reads) in pack_reads {assert_eq!(provider.read_attempts(&name),reads,"known controls are removed before pack turnover");}
             let remote=RemoteObject::from_stored(&completed.catalog,&repository).unwrap();
             assert!(snapshot_restore::read_catalog(&remote,wire::CatalogKind::Assets,&key,&root.path().join("wrong-kind"),&provider,&repository,&Cancellation::default()).await.is_err());
+            let packs=completed.referenced.iter().filter(|object|object.role==ObjectRole::Pack).collect::<Vec<_>>();
+            let reads=packs.iter().map(|pack|provider.read_attempts(&pack.receipt.locator.object)).collect::<Vec<_>>();
+            snapshot_restore::revalidate_catalog(&completed.catalog,wire::CatalogKind::Records,&key,&provider,&repository,&Cancellation::default()).await.unwrap();
+            for (pack,reads) in packs.iter().zip(reads) {assert!(provider.read_attempts(&pack.receipt.locator.object)>reads,"aged proof authenticates every required pack despite local controls");}
+            let pack=packs[0];let name=&pack.receipt.locator.object;
+            let uploads=provider.upload_attempts(&pack.object_id);
+            let mut damaged=provider.state.lock().unwrap().objects[name].0.clone();let last=damaged.len()-1;damaged[last]^=1;
+            provider.seed(name,ObjectRole::Pack,damaged);
+            assert_eq!(snapshot_restore::revalidate_catalog(&completed.catalog,wire::CatalogKind::Records,&key,&provider,&repository,&Cancellation::default()).await.unwrap_err().kind,ErrorKind::Corrupt);
+            provider.forget(name);
+            assert_eq!(snapshot_restore::revalidate_catalog(&completed.catalog,wire::CatalogKind::Records,&key,&provider,&repository,&Cancellation::default()).await.unwrap_err().kind,ErrorKind::NotFound);
+            assert_eq!(provider.upload_attempts(&pack.object_id),uploads,"aged immutable verification never repairs or replaces the captured source");
         });
     }
 

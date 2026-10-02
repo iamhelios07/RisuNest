@@ -1595,26 +1595,70 @@ pub(crate) async fn download_control_catalogs(
     Ok(objects.into_values().collect())
 }
 
+pub(crate) async fn revalidate_catalog(
+    catalog:&wire::StoredObject,kind:wire::CatalogKind,root_key:&[u8;32],provider:&dyn Provider,
+    repository:&RepositoryHandle,cancel:&Cancellation,
+) -> Result<()> {
+    if !matches!(kind,wire::CatalogKind::Records|wire::CatalogKind::Assets)
+        || catalog.header.repository_id!=repository.repository_id || catalog.header.role!=wire::ObjectRole::Catalog {return Err(corrupt("dependency catalog scope differs"));}
+    let stage=tempfile::tempdir().map_err(transient)?;
+    let remote=RemoteObject::from_stored(catalog,repository)?;
+    let (entries,packs,_)=read_catalog(&remote,kind,root_key,stage.path(),provider,repository,cancel).await?;
+    if entries.iter().any(|entry|entry.kind!=wire::CatalogEntryKind::Object) {return Err(corrupt("dependency catalog contains unit records"));}
+    for pack in packs.values() {
+        cancel.check()?;
+        let body=tempfile::tempdir_in(stage.path()).map_err(transient)?;
+        open_object(pack,root_key,body.path(),provider,repository,cancel).await?;
+    }
+    Ok(())
+}
+
 pub(crate) async fn admit_data_catalogs(
-    catalogs:&[wire::StoredObject],store:&mut crate::persistent_store::PersistentStore,root_key:&[u8;32],
+    catalogs:&[wire::StoredObject],store:&mut crate::persistent_store::PersistentStore,target:&str,root_key:&[u8;32],
     provider:&dyn Provider,repository:&RepositoryHandle,cancel:&Cancellation,
 ) -> Result<Vec<String>> {
     if catalogs.is_empty() {return Ok(Vec::new());}
     let stage=tempfile::tempdir().map_err(transient)?;
-    let controls=download_control_catalogs(catalogs,stage.path(),root_key,provider,repository,cancel).await?;
-    let mut hashes=Vec::new();
-    for control in controls {
+    let mut hashes=BTreeSet::new();let mut roots=BTreeMap::new();
+    for catalog in catalogs {
         cancel.check()?;
-        let ObjectSource::File(path)=control.source else {return Err(corrupt("control file is unavailable"));};
-        let bytes=read_bytes(&path,usize::try_from(control.byte_length).map_err(corrupt)?)?;
-        if bytes.len() as u64!=control.byte_length || crate::persistent_store::external_capture::hash_backup_body(&bytes,"native_data_catalog_control_identity")!=control.content_hash {
-            return Err(corrupt("control body identity differs"));
+        if catalog.header.repository_id!=repository.repository_id || catalog.header.role!=wire::ObjectRole::Catalog {return Err(corrupt("control catalog scope differs"));}
+        if let Some(previous)=roots.insert(catalog.header.object_id.clone(),catalog.clone()) {
+            if previous!=*catalog {return Err(corrupt("control catalog identity differs"));}continue;
         }
-        if bytes.len()>risunest_sync_wire::MAX_METADATA_BYTES {crate::persistent_store::external_capture::verified_large_message_page(&bytes).map_err(corrupt)?;}
-        store.lww_put_object(&control.content_hash,&bytes).map_err(corrupt)?;
-        hashes.push(control.content_hash);
+        if let Some(known)=store.external_lww_verified_data_catalog(target,catalog).map_err(corrupt)? {
+            let mut complete=true;
+            for hash in &known {if !store.lww_verified_object_present(hash).map_err(corrupt)? {complete=false;break;}}
+            if complete {hashes.extend(known);continue;}
+        }
+        let remote=RemoteObject::from_stored(catalog,repository)?;
+        let directory=stage.path().join(&catalog.header.object_id);ensure_directory(&directory)?;
+        let (entries,packs,_)=read_catalog(&remote,wire::CatalogKind::Records,root_key,&directory,provider,repository,cancel).await?;
+        let mut required=BTreeSet::new();let mut missing=Vec::new();
+        for entry in entries {
+            if entry.kind!=wire::CatalogEntryKind::Object {return Err(corrupt("control catalog contains unit records"));}
+            let hash=hex::encode(entry.content_sha256);required.insert(hash.clone());
+            if let Some(size)=store.external_lww_verified_control_size(&hash).map_err(corrupt)? {
+                if size!=entry.byte_length {return Err(corrupt("known control body length differs"));}
+            } else {missing.push(entry);}
+        }
+        let content=content_store(&directory)?;
+        let plan=resolve_entries(missing,&directory,&content,None,cancel)?;
+        let (records,controls)=turn_over_packs(plan,&packs,root_key,&directory,provider,repository,&PhaseProgress::silent(),cancel).await?;
+        if !records.is_empty() {return Err(corrupt("control catalog contains unit records"));}
+        for control in controls.into_values() {
+            cancel.check()?;
+            let ObjectSource::File(path)=control.source else {return Err(corrupt("control file is unavailable"));};
+            let bytes=read_bytes(&path,usize::try_from(control.byte_length).map_err(corrupt)?)?;
+            if bytes.len() as u64!=control.byte_length || crate::persistent_store::external_capture::hash_backup_body(&bytes,"native_data_catalog_control_identity")!=control.content_hash {return Err(corrupt("control body identity differs"));}
+            if bytes.len()>risunest_sync_wire::MAX_METADATA_BYTES {crate::persistent_store::external_capture::verified_large_message_page(&bytes).map_err(corrupt)?;}
+            store.lww_put_object(&control.content_hash,&bytes).map_err(corrupt)?;
+        }
+        let required=required.into_iter().collect::<Vec<_>>();
+        store.external_lww_witness_data_catalog(target,catalog,&required).map_err(corrupt)?;
+        hashes.extend(required);
     }
-    Ok(hashes)
+    Ok(hashes.into_iter().collect())
 }
 
 pub(crate) async fn download_packed_body(hash:&str,length:u64,chunks:Vec<wire::StoredChunk>,packs:Vec<wire::StoredObject>,stage:&Path,key:&[u8;32],provider:&dyn Provider,repository:&RepositoryHandle,cancel:&Cancellation)->Result<Vec<u8>> {
@@ -1725,7 +1769,7 @@ pub(crate) struct DatabaseFirstSnapshot {
 }
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn admit_asset_catalogs(
-    catalogs:&[wire::StoredObject],store:&mut crate::persistent_store::PersistentStore,
+    catalogs:&[wire::StoredObject],store:&mut crate::persistent_store::PersistentStore,target:&str,
     library_id:&str,protected_segment:&str,connection_id:&str,connection_root:&Path,root_key:&[u8;32],
     provider:&dyn Provider,repository:&RepositoryHandle,cancel:&Cancellation,
 ) -> Result<Vec<String>> {
@@ -1733,13 +1777,14 @@ pub(crate) async fn admit_asset_catalogs(
     let metadata=rusqlite::Connection::open_with_flags(store.repository_root().join("persistent/persistent.sqlite"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(transient)?;
     let cas=PayloadCas::new(store.repository_root()).map_err(transient)?;
-    let mut planned=BTreeMap::<String,super::lww_residency::PackedSource>::new();
+    let mut planned=BTreeMap::<String,super::lww_residency::PackedSource>::new();let mut proofs=Vec::new();
     for catalog in catalogs {
         if catalog.header.repository_id!=repository.repository_id || catalog.header.role!=wire::ObjectRole::Catalog {
             return Err(corrupt("asset catalog repository or role differs"));
         }
         let root=RemoteObject::from_stored(catalog,repository)?;
         let (entries,packs,_)=read_catalog(&root,wire::CatalogKind::Assets,root_key,scratch.path(),provider,repository,cancel).await?;
+        let mut witnessed=Vec::new();
         for entry in entries {
             cancel.check()?;
             if entry.kind!=wire::CatalogEntryKind::Object {return Err(corrupt("asset catalog kind differs"));}
@@ -1756,12 +1801,15 @@ pub(crate) async fn admit_asset_catalogs(
                 library_id:library_id.into(),connection_id:connection_id.into(),connection_root:connection_root.into(),
                 protected_snapshot:protected_segment.into(),catalog:catalog.clone(),chunks:entry.chunks,packs:references};
             super::lww_residency::validate_packed_source(&source,repository)?;
+            witnessed.push((hash.clone(),source.byte_length));
             if let Some(previous)=planned.get(&hash) {
                 if previous.byte_length!=source.byte_length {return Err(corrupt("conflicting asset catalog body"));}
             } else {planned.insert(hash,source);}
         }
+        proofs.push((catalog,witnessed));
     }
     cancel.check()?;
+    for (catalog,entries) in proofs {store.external_lww_witness_asset_catalog(target,catalog,&entries).map_err(corrupt)?;}
     let registrations=planned.values().map(|source|crate::persistent_store::asset_object_catalog::AssetObjectRegistration{object_hash:source.hash.clone(),byte_size:source.byte_length}).collect::<Vec<_>>();
     for batch in registrations.chunks(crate::persistent_store::asset_object_catalog::ASSET_OBJECT_CATALOG_MAX_PAGE as usize) {
         store.asset_object_catalog().register(batch,super::runtime::now_ms() as i64).map_err(transient)?;
