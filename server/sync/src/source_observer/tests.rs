@@ -1,12 +1,17 @@
 use super::*;
 use crate::store::{Device, Store};
 
-pub(crate) struct Reset;
+static FIXTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub(crate) struct Reset {
+    _fixture: std::sync::MutexGuard<'static, ()>,
+}
 impl Reset {
     pub(crate) fn new() -> Self {
+        let fixture = FIXTURE.lock().unwrap();
         install();
         assert!(registry().lock().unwrap().active.is_none());
-        Self
+        Self { _fixture: fixture }
     }
 }
 impl Drop for Reset {
@@ -19,6 +24,10 @@ impl Drop for Reset {
                 .rows
                 .values()
                 .all(|row| row.work.outstanding_readers == 0));
+            assert!(scope
+                .read_barrier
+                .as_ref()
+                .is_none_or(|b| b.observation().waiters == 0));
         }
         registry().lock().unwrap().active = None;
     }
@@ -280,6 +289,7 @@ fn ingress_inline_comparison_is_separate_and_corruption_preserves_body_work() {
 
 #[test]
 fn structural_recipe_adapter_preserves_actual_encode_and_negative_results() {
+    let _reset = Reset::new();
     use risunest_sync_wire::{
         delta,
         transfer::{self, Frame},
@@ -856,4 +866,212 @@ fn actual_unscoped_pending_async_seek_cannot_report_complete_zero() {
     assert_eq!(measured.total, Work::default());
     assert!(measured.violations.contains_key("unattributed-source-seek"));
     assert!(begin(root.path(), "reset".into(), "error".into(), vec![]).is_err());
+}
+
+#[test]
+fn actual_sync_first_read_barrier_is_one_shot_and_scoped() {
+    let _reset = Reset::new();
+    let (root, store, _, _, body) = seeded();
+    let hash = risunest_sync_wire::hash(&body);
+    let generation = begin(
+        root.path(),
+        "sync-held".into(),
+        "asset-transfer".into(),
+        vec![role(&hash, &["Asset"])],
+    )
+    .unwrap();
+    let intent = read_barrier::Intent {
+        scope_id: "sync-held".into(),
+        generation,
+        barrier_id: "sync-first-read".into(),
+        hash: hash.clone(),
+        flow: "source".into(),
+    };
+    let (send, receive) = std::sync::mpsc::channel();
+    read_barrier::install_hook(Some(Arc::new(move |event| {
+        send.send(serde_json::to_value(event).unwrap()).unwrap()
+    })));
+    assert_eq!(read_barrier::arm(intent.clone()).unwrap().status, "armed");
+    assert!(read_barrier::release(&intent).is_err());
+    let worker = worker();
+    let read_hash = hash.clone();
+    let task = std::thread::spawn(move || {
+        let _entered = worker.enter();
+        store.get_object(&read_hash)
+    });
+    let event = receive
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(event["type"], "readBarrierReached");
+    assert_eq!(event["readKind"], "stdRead");
+    assert_eq!(event["hash"], hash);
+    assert_eq!(event["offset"], 0);
+    let held = snapshot(false).unwrap();
+    assert!(!held.complete);
+    assert_eq!(held.total.read_bytes, 0);
+    assert_eq!(held.total.outstanding_readers, 1);
+    assert_eq!(held.pending_workers, 1);
+    assert_eq!(held.read_barrier.unwrap().waiters, 1);
+    let mut wrong = intent.clone();
+    wrong.barrier_id = "wrong-id".into();
+    assert!(read_barrier::release(&wrong).is_err());
+    wrong = intent.clone();
+    wrong.hash = "0".repeat(64);
+    assert!(read_barrier::release(&wrong).is_err());
+    wrong = intent.clone();
+    wrong.generation += 1;
+    assert!(read_barrier::release(&wrong).is_err());
+    assert_eq!(read_barrier::release(&intent).unwrap().status, "released");
+    assert_eq!(task.join().unwrap().unwrap(), body);
+    assert!(read_barrier::release(&intent).is_err());
+    let done = snapshot(true).unwrap();
+    assert!(done.complete);
+    assert_eq!(done.total.read_bytes, body.len() as u64);
+    assert_eq!(done.read_barrier.unwrap().waiters, 0);
+    conserved(&snapshot(false).unwrap());
+    let next = begin(
+        root.path(),
+        "sync-next".into(),
+        "source".into(),
+        vec![role(&hash, &["Asset"])],
+    )
+    .unwrap();
+    let reused = read_barrier::Intent {
+        scope_id: "sync-next".into(),
+        generation: next,
+        ..intent
+    };
+    assert!(read_barrier::arm(reused).is_err());
+    assert!(snapshot(true).unwrap().complete);
+}
+
+#[test]
+fn actual_held_sync_read_cancel_unblocks_and_reset_cannot_erase_failure() {
+    let _reset = Reset::new();
+    let (root, store, _, _, body) = seeded();
+    let hash = risunest_sync_wire::hash(&body);
+    let generation = begin(
+        root.path(),
+        "sync-cancel".into(),
+        "asset-transfer".into(),
+        vec![role(&hash, &["Asset"])],
+    )
+    .unwrap();
+    let intent = read_barrier::Intent {
+        scope_id: "sync-cancel".into(),
+        generation,
+        barrier_id: "sync-cancel-read".into(),
+        hash: hash.clone(),
+        flow: "source".into(),
+    };
+    let (send, receive) = std::sync::mpsc::channel();
+    read_barrier::install_hook(Some(Arc::new(move |event| send.send(event).unwrap())));
+    read_barrier::arm(intent.clone()).unwrap();
+    let worker = worker();
+    let task = std::thread::spawn(move || {
+        let _entered = worker.enter();
+        store.get_object(&hash)
+    });
+    receive
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    assert!(begin(
+        root.path(),
+        "premature-reset".into(),
+        "source".into(),
+        vec![]
+    )
+    .is_err());
+    assert_eq!(read_barrier::cancel(&intent).unwrap().status, "cancelled");
+    assert!(task.join().unwrap().is_err());
+    let done = snapshot(true).unwrap();
+    assert!(!done.complete);
+    assert_eq!(done.total.read_bytes, 0);
+    assert_eq!(done.read_barrier.unwrap().waiters, 0);
+    assert!(begin(root.path(), "erase".into(), "source".into(), vec![]).is_err());
+}
+
+#[test]
+fn actual_source_read_before_arm_and_nonasset_scope_are_rejected() {
+    let _reset = Reset::new();
+    let (root, store, _, _, body) = seeded();
+    let hash = risunest_sync_wire::hash(&body);
+    let generation = begin(
+        root.path(),
+        "arm-after-read".into(),
+        "source".into(),
+        vec![role(&hash, &["Asset"])],
+    )
+    .unwrap();
+    assert_eq!(store.get_object(&hash).unwrap(), body);
+    let intent = read_barrier::Intent {
+        scope_id: "arm-after-read".into(),
+        generation,
+        barrier_id: "too-late-first-read".into(),
+        hash: hash.clone(),
+        flow: "source".into(),
+    };
+    assert!(read_barrier::arm(intent).is_err());
+    assert!(snapshot(true).unwrap().complete);
+    let next = begin(
+        root.path(),
+        "control-not-asset".into(),
+        "source".into(),
+        vec![role(&hash, &["Control"])],
+    )
+    .unwrap();
+    let intent = read_barrier::Intent {
+        scope_id: "control-not-asset".into(),
+        generation: next,
+        barrier_id: "control-first-read".into(),
+        hash,
+        flow: "source".into(),
+    };
+    assert!(read_barrier::arm(intent).is_err());
+    assert!(snapshot(true).unwrap().complete);
+}
+
+#[test]
+fn actual_empty_read_buffer_does_not_trigger_source_first_body_read() {
+    let _reset = Reset::new();
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("body");
+    let bytes = b"synthetic nonempty physical read";
+    std::fs::write(&path, bytes).unwrap();
+    let hash = risunest_sync_wire::hash(bytes);
+    let generation = begin(
+        root.path(),
+        "nonempty-read".into(),
+        "source".into(),
+        vec![role(&hash, &["Asset"])],
+    )
+    .unwrap();
+    let intent = read_barrier::Intent {
+        scope_id: "nonempty-read".into(),
+        generation,
+        barrier_id: "nonempty-body-first-read".into(),
+        hash: hash.clone(),
+        flow: "source".into(),
+    };
+    let (send, receive) = std::sync::mpsc::channel();
+    read_barrier::install_hook(Some(Arc::new(move |event| send.send(event).unwrap())));
+    read_barrier::arm(intent.clone()).unwrap();
+    let mut file = TrackedFile::open(root.path(), &hash, &path, "file").unwrap();
+    assert_eq!(file.read(&mut []).unwrap(), 0);
+    assert!(receive.try_recv().is_err());
+    assert_eq!(
+        snapshot(false).unwrap().read_barrier.unwrap().status,
+        "armed"
+    );
+    let worker = worker();
+    let task = std::thread::spawn(move || {
+        let _entered = worker.enter();
+        file.read(&mut [0; 1]).unwrap()
+    });
+    receive
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    read_barrier::release(&intent).unwrap();
+    assert_eq!(task.join().unwrap(), 1);
+    assert!(snapshot(true).unwrap().complete);
 }

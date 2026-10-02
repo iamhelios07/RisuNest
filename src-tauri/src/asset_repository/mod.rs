@@ -9,7 +9,7 @@ mod payload_cas;
 #[cfg(test)]
 pub(crate) mod body_io;
 
-pub(crate) use payload_cas::exact_file_identity;
+pub(crate) use payload_cas::{exact_file_identity, ExactFileIdentity};
 #[cfg(test)]
 pub(crate) use payload_cas::{reset_root_path_validations, root_path_validations};
 pub use payload_cas::PayloadCas;

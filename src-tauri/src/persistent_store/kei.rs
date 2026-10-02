@@ -450,6 +450,7 @@ pub(crate) fn run_job(
                     revision,
                     source_bytes: payload.bytes,
                     source_sha256: payload.sha256.clone(),
+                    source_fingerprint_kind: crate::native_file_jobs::SourceFingerprintKind::WholeFileSha256,
                     character_count: payload.character_count,
                     preset_count: payload.preset_count,
                     warning_codes: Vec::new(),

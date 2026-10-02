@@ -202,6 +202,7 @@ export async function reconcileNativeFileJobsBeforeBootstrap(
                 break
             }
             case 'export-portable-backup':
+            case 'snapshot-bodies':
                 // The app-owned export intent resumes publication after the
                 // maintenance navigation. Never discard its SAF handoff here.
                 break

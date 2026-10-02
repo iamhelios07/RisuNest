@@ -2,6 +2,8 @@ import { doingChat, reserveGeneration } from "../process/generationState";
 import { isLibraryFileOperationReserved, registerLibraryFileOperationGate } from "./libraryFileOperation";
 import { get } from 'svelte/store'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+const nativeInvoke = vi.hoisted(() => vi.fn())
+vi.mock('@tauri-apps/api/core', () => ({invoke: nativeInvoke}))
 
 import {
     cancelActiveNativeFileOperation,
@@ -33,6 +35,24 @@ function status(patch: Partial<NativeFileJobStatus> = {}): NativeFileJobStatus {
 }
 
 describe('renderer-lifetime native file job manager', () => {
+    it('permits foreground generation and sync only for a native-confirmed snapshot body owner', async () => {
+        const receipt = {jobId: 'bodies', kind: 'snapshot-bodies' as const, stagingId: 'stage', activationRevision: '8', bindingAuthority: '2'}
+        nativeInvoke.mockResolvedValue(status({jobId: 'bodies', kind: 'snapshot-bodies', snapshotStagingId: 'stage', activationRevision: 8, activationAuthority: '2', phase: 'copying-missing-bodies'}))
+        doingChat.set(true)
+        const unregister = registerLibraryFileOperationGate(() => new Promise<void>(() => {}))
+        try {
+            await expect(runSharedNativeFileOperation('import', 'snapshot-bodies', async () => {
+                expect(isLibraryFileOperationReserved()).toBe(false)
+                return 'settled'
+            }, {format: 'library-backup', snapshotBodyOwner: receipt})).resolves.toBe('settled')
+            nativeInvoke.mockResolvedValue(status({jobId: 'bodies', kind: 'restore-portable-backup'}))
+            await expect(runSharedNativeFileOperation('import', 'wrong-body-owner', async () => 'unsafe', {format: 'library-backup', snapshotBodyOwner: receipt})).rejects.toMatchObject({code: 'snapshot-body-receipt-mismatch'})
+            await expect(runSharedNativeFileOperation('import', 'replacement', async () => 'unsafe', {format: 'library-backup'})).rejects.toMatchObject({code: 'generation-active'})
+        } finally {
+            doingChat.set(false)
+            unregister()
+        }
+    })
     it('waits for safe synchronization settlement and releases a cancelled wait', async () => {
         let releaseSync!: () => void
         const sync = new Promise<void>(resolve => { releaseSync = resolve })
@@ -223,7 +243,7 @@ describe('renderer-lifetime native file job manager', () => {
             result: {
                 revision: 7,
                 sourceBytes: 128,
-                sourceSha256: 'abc',
+                sourceFingerprintKind: 'whole-file-sha256' as const, sourceSha256: 'abc',
                 characterCount: 2,
                 presetCount: 1,
                 warningCodes: ['cleanup-failed'],

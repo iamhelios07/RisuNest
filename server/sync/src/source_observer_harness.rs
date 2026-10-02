@@ -91,7 +91,13 @@ async fn admission(State(gate): State<Gate>, request: Request, next: Next) -> Re
     let head = request.method() == Method::HEAD;
     let response = observed::request_context(next.run(request)).await;
     let (parts, body) = response.into_parts();
-    let remaining = if head {
+    let bodyless = head
+        || parts.status.is_informational()
+        || matches!(
+            parts.status,
+            StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED
+        );
+    let remaining = if bodyless {
         Some(0)
     } else {
         body.size_hint().exact().or_else(|| {
@@ -169,6 +175,7 @@ impl Server {
         })
     }
     async fn barrier(&mut self) -> bool {
+        observed::read_barrier::cancel_dangling("read-barrier-drain");
         self.gate.open.store(false, Ordering::Release);
         if self.lease.is_none() {
             match self.workload.acquire() {
@@ -288,6 +295,33 @@ enum Command {
         scope_id: String,
     },
     #[serde(rename_all = "camelCase")]
+    ArmReadBarrier {
+        request_id: String,
+        scope_id: String,
+        generation: u64,
+        barrier_id: String,
+        hash: String,
+        flow: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    ReleaseReadBarrier {
+        request_id: String,
+        scope_id: String,
+        generation: u64,
+        barrier_id: String,
+        hash: String,
+        flow: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    CancelReadBarrier {
+        request_id: String,
+        scope_id: String,
+        generation: u64,
+        barrier_id: String,
+        hash: String,
+        flow: String,
+    },
+    #[serde(rename_all = "camelCase")]
     Shutdown { request_id: String },
 }
 impl Command {
@@ -297,6 +331,9 @@ impl Command {
             | Self::Register { request_id, .. }
             | Self::BeginScope { request_id, .. }
             | Self::EndScope { request_id, .. }
+            | Self::ArmReadBarrier { request_id, .. }
+            | Self::ReleaseReadBarrier { request_id, .. }
+            | Self::CancelReadBarrier { request_id, .. }
             | Self::Shutdown { request_id } => request_id,
         }
     }
@@ -360,6 +397,9 @@ fn binary_hash() -> String {
 #[ignore]
 fn serve() {
     observed::install();
+    observed::read_barrier::install_hook(Some(Arc::new(|event| {
+        reply(serde_json::to_value(event).unwrap())
+    })));
     let mut input = std::io::stdin().lock();
     let first = read_command(&mut input)
         .expect("invalid initial private command")
@@ -394,12 +434,13 @@ fn serve() {
         .unwrap();
     let mut server = runtime.block_on(Server::start(root.path())).unwrap();
     reply(
-        json!({"type":"ready","requestId":request_id,"runId":run_id,"endpoint":server.endpoint,"rootId":root_path,"sourceFingerprint":fingerprint,"binarySha256":binary,"observerSchema":1,"maxCommandBytes":MAX_COMMAND_BYTES,"sourceClosure":closure,"sourceComposition":"same-source-linked-object-delta-stream-transfer","structuralVerification":"normal-linked-recipe-field-move-and-frame-encode-parity"}),
+        json!({"type":"ready","requestId":request_id,"runId":run_id,"endpoint":server.endpoint,"rootId":root_path,"sourceFingerprint":fingerprint,"binarySha256":binary,"observerSchema":1,"maxCommandBytes":MAX_COMMAND_BYTES,"readBarrierHoldLimitMillis":observed::read_barrier::HOLD_LIMIT.as_millis(),"sourceClosure":closure,"sourceComposition":"same-source-linked-object-delta-stream-transfer","structuralVerification":"normal-linked-recipe-field-move-and-frame-encode-parity"}),
     );
     loop {
-        let command = match read_command(&mut input) {
-            Ok(Some(command)) => command,
-            Ok(None) => panic!("Shutdown required before EOF"),
+        let command = match read_command(&mut input)
+            .and_then(|command| command.ok_or_else(|| "stdin-eof-before-shutdown".into()))
+        {
+            Ok(command) => command,
             Err(code) => {
                 observed::note_violation("private-command-error");
                 let shutdown = runtime.block_on(server.stop());
@@ -420,6 +461,9 @@ fn serve() {
             }
             Command::BeginScope {scope_id,phase,roles,..}=>runtime.block_on(server.begin(&root_path,scope_id.clone(),phase,roles)).map(|generation|json!({"type":"scopeStarted","scopeId":scope_id,"generation":generation,"completeReset":true})),
             Command::EndScope {scope_id,..}=>runtime.block_on(server.end(&scope_id)).map(|snapshot|json!({"type":"scopeEnded","observation":snapshot,"sourceFingerprint":fingerprint,"binarySha256":binary})),
+            Command::ArmReadBarrier {scope_id,generation,barrier_id,hash,flow,..}=> observed::read_barrier::arm(observed::read_barrier::Intent{scope_id,generation,barrier_id,hash,flow}).map(|barrier|json!({"type":"readBarrierArmed","barrier":barrier})).map_err(str::to_owned),
+            Command::ReleaseReadBarrier {scope_id,generation,barrier_id,hash,flow,..}=> observed::read_barrier::release(&observed::read_barrier::Intent{scope_id,generation,barrier_id,hash,flow}).map(|barrier|json!({"type":"readBarrierReleased","barrier":barrier})).map_err(str::to_owned),
+            Command::CancelReadBarrier {scope_id,generation,barrier_id,hash,flow,..}=> observed::read_barrier::cancel(&observed::read_barrier::Intent{scope_id,generation,barrier_id,hash,flow}).map(|barrier|json!({"type":"readBarrierCancelled","barrier":barrier})).map_err(str::to_owned),
             Command::Shutdown {..}=>{
                 let result=runtime.block_on(server.stop());
                 runtime.shutdown_timeout(DRAIN_LIMIT);
@@ -455,6 +499,124 @@ mod tests {
         request
             .bearer_auth(&credential.token)
             .header("x-risu-library", &credential.library_id)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn actual_tcp_no_content_and_full_content_length_bodies_complete() {
+        let _reset = Reset::new();
+        let root = tempfile::tempdir().unwrap();
+        let mut server = Server::start(root.path()).await.unwrap();
+        let credential = server.store.add_device().unwrap();
+        let device = Device {
+            id: credential.device_id.clone(),
+        };
+        let asset = vec![41; 98_304];
+        let digest = hash(&asset);
+        server.store.put_object(&device, &digest, &asset).unwrap();
+        server
+            .begin(
+                root.path(),
+                "http-body-completion".into(),
+                "source".into(),
+                vec![role(&digest, "Asset")],
+            )
+            .await
+            .unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for request in [
+            client
+                .post(format!("{}/ack", server.endpoint))
+                .body(br#"{"seq":"0"}"#.to_vec()),
+            client
+                .post(format!("{}/objects/pins", server.endpoint))
+                .body(b"[]".to_vec()),
+            client.delete(format!("{}/state/pins/synthetic-pin", server.endpoint)),
+        ] {
+            let response = auth(request, &credential).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            assert!(response.bytes().await.unwrap().is_empty());
+        }
+        let response = auth(
+            client.get(format!("{}/objects/{digest}", server.endpoint)),
+            &credential,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.content_length(), Some(asset.len() as u64));
+        assert_eq!(response.bytes().await.unwrap().as_ref(), asset);
+        let response = auth(
+            client
+                .get(format!("{}/objects/{digest}", server.endpoint))
+                .header("if-none-match", format!("\"{digest}\"")),
+            &credential,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert!(response.bytes().await.unwrap().is_empty());
+        let response = auth(
+            client.head(format!("{}/objects/{digest}", server.endpoint)),
+            &credential,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["content-length"],
+            asset.len().to_string()
+        );
+        assert!(response.bytes().await.unwrap().is_empty());
+        let ended = server.end("http-body-completion").await.unwrap();
+        assert_eq!(ended.total.opens, 3);
+        assert_eq!(ended.total.read_bytes, asset.len() as u64);
+        assert!(ended.complete, "{:?}", ended.violations);
+        assert!(server.stop().await.unwrap().unwrap().complete);
+    }
+
+    #[tokio::test]
+    async fn exact_length_completion_without_eof_poll_preserves_prefix_drop_failure() {
+        use futures_util::StreamExt;
+        let _reset = Reset::new();
+        let root = tempfile::tempdir().unwrap();
+        observed::begin(root.path(), "body-drop".into(), "source".into(), vec![]).unwrap();
+        let gate = Gate::new();
+        let mut complete = ResponseStream {
+            stream: Body::from("complete").into_data_stream(),
+            _permit: gate.lock.clone().read_owned().await,
+            _request: observed::request(),
+            remaining: Some(8),
+            finished: false,
+        };
+        assert_eq!(
+            complete.next().await.unwrap().unwrap().as_ref(),
+            b"complete"
+        );
+        assert!(!complete.finished);
+        drop(complete);
+        assert!(observed::snapshot(false).unwrap().complete);
+
+        let body = Body::from_stream(futures_util::stream::iter([
+            Ok::<_, axum::Error>(Bytes::from_static(b"prefix")),
+            Ok(Bytes::from_static(b"tail")),
+        ]));
+        let mut prefix = ResponseStream {
+            stream: body.into_data_stream(),
+            _permit: gate.lock.clone().read_owned().await,
+            _request: observed::request(),
+            remaining: Some(10),
+            finished: false,
+        };
+        assert_eq!(prefix.next().await.unwrap().unwrap().as_ref(), b"prefix");
+        assert_eq!(prefix.remaining, Some(4));
+        drop(prefix);
+        let ended = observed::snapshot(true).unwrap();
+        assert!(!ended.complete);
+        assert_eq!(ended.pending_requests, 0);
+        assert_eq!(ended.violations.get("response-body-abandoned"), Some(&1));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -586,6 +748,173 @@ mod tests {
         assert_eq!(subset.total.read_bytes, b.len() as u64);
         assert_eq!(subset.total.hash_calls, 0);
         assert!(server.stop().await.unwrap().unwrap().complete);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn actual_tcp_first_read_barrier_keeps_foreground_body_requests_running() {
+        let _reset = Reset::new();
+        let root = tempfile::tempdir().unwrap();
+        let mut server = Server::start(root.path()).await.unwrap();
+        let credential = server.store.add_device().unwrap();
+        let device = Device {
+            id: credential.device_id.clone(),
+        };
+        let asset = vec![37; 65_537];
+        let control = b"synthetic other unit body";
+        let asset_hash = hash(&asset);
+        let control_hash = hash(control);
+        server
+            .store
+            .put_object(&device, &asset_hash, &asset)
+            .unwrap();
+        server
+            .store
+            .put_object(&device, &control_hash, control)
+            .unwrap();
+        let generation = server
+            .begin(
+                root.path(),
+                "tcp-held".into(),
+                "asset-transfer".into(),
+                vec![role(&asset_hash, "Asset"), role(&control_hash, "Control")],
+            )
+            .await
+            .unwrap();
+        let intent = observed::read_barrier::Intent {
+            scope_id: "tcp-held".into(),
+            generation,
+            barrier_id: "tcp-first-read".into(),
+            hash: asset_hash.clone(),
+            flow: "source".into(),
+        };
+        let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
+        observed::read_barrier::install_hook(Some(Arc::new(move |event| {
+            send.send(serde_json::to_value(event).unwrap()).unwrap()
+        })));
+        observed::read_barrier::arm(intent.clone()).unwrap();
+        let client = reqwest::Client::new();
+        let request = auth(
+            client.get(format!("{}/objects/{}", server.endpoint, asset_hash)),
+            &credential,
+        );
+        let body =
+            tokio::spawn(async move { request.send().await.unwrap().bytes().await.unwrap() });
+        let event = tokio::time::timeout(DRAIN_LIMIT, receive.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event["readKind"], "asyncRead");
+        assert_eq!(event["placement"], "file");
+        assert_eq!(event["hash"], asset_hash);
+        assert_eq!(event["offset"], 0);
+        let held = observed::snapshot(false).unwrap();
+        assert!(!held.complete);
+        assert_eq!(held.total.read_bytes, 0);
+        assert!(held.pending_requests > 0);
+        assert_eq!(held.read_barrier.unwrap().waiters, 1);
+        let foreground = tokio::time::timeout(
+            DRAIN_LIMIT,
+            auth(
+                client.get(format!("{}/objects/{}", server.endpoint, control_hash)),
+                &credential,
+            )
+            .send(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(foreground.status(), StatusCode::OK);
+        assert_eq!(foreground.bytes().await.unwrap().as_ref(), control);
+        assert!(!body.is_finished());
+        assert_eq!(
+            observed::snapshot(false).unwrap().purposes["Asset"].read_bytes,
+            0
+        );
+        observed::read_barrier::release(&intent).unwrap();
+        assert_eq!(
+            tokio::time::timeout(DRAIN_LIMIT, body)
+                .await
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            asset
+        );
+        let done = server.end("tcp-held").await.unwrap();
+        assert!(done.complete, "{:?}", done.violations);
+        assert_eq!(done.purposes["Asset"].read_bytes, asset.len() as u64);
+        assert_eq!(done.purposes["Control"].read_bytes, control.len() as u64);
+        assert_eq!(done.read_barrier.unwrap().status, "released");
+        assert!(server.stop().await.unwrap().unwrap().complete);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn actual_tcp_dangling_read_barrier_end_cancels_and_cannot_reset() {
+        let _reset = Reset::new();
+        let root = tempfile::tempdir().unwrap();
+        let mut server = Server::start(root.path()).await.unwrap();
+        let credential = server.store.add_device().unwrap();
+        let device = Device {
+            id: credential.device_id.clone(),
+        };
+        let asset = vec![43; 65_537];
+        let asset_hash = hash(&asset);
+        server
+            .store
+            .put_object(&device, &asset_hash, &asset)
+            .unwrap();
+        let generation = server
+            .begin(
+                root.path(),
+                "tcp-cancel".into(),
+                "asset-transfer".into(),
+                vec![role(&asset_hash, "Asset")],
+            )
+            .await
+            .unwrap();
+        let intent = observed::read_barrier::Intent {
+            scope_id: "tcp-cancel".into(),
+            generation,
+            barrier_id: "tcp-cancel-first".into(),
+            hash: asset_hash.clone(),
+            flow: "source".into(),
+        };
+        let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
+        observed::read_barrier::install_hook(Some(Arc::new(move |event| {
+            send.send(event).unwrap()
+        })));
+        observed::read_barrier::arm(intent).unwrap();
+        let request = auth(
+            reqwest::Client::new().get(format!("{}/objects/{}", server.endpoint, asset_hash)),
+            &credential,
+        );
+        let body = tokio::spawn(async move {
+            match request.send().await {
+                Ok(response) => response.bytes().await.map(|_| ()),
+                Err(error) => Err(error),
+            }
+        });
+        tokio::time::timeout(DRAIN_LIMIT, receive.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let ended = server.end("tcp-cancel").await.unwrap();
+        assert!(!ended.complete);
+        assert_eq!(ended.read_barrier.unwrap().status, "cancelled");
+        assert!(tokio::time::timeout(DRAIN_LIMIT, body)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
+        assert!(server
+            .begin(
+                root.path(),
+                "reset-after-cancel".into(),
+                "source".into(),
+                vec![]
+            )
+            .await
+            .is_err());
+        assert!(!server.stop().await.unwrap().unwrap().complete);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -731,13 +1060,21 @@ mod tests {
 
     #[test]
     fn separate_libtest_process_protocol_fingerprint_and_cleanup() {
-        separate_process_protocol(false);
+        separate_process_protocol(0);
     }
     #[test]
     fn separate_libtest_invalid_command_is_terminal_and_cleans_up() {
-        separate_process_protocol(true);
+        separate_process_protocol(1);
     }
-    fn separate_process_protocol(fail_command: bool) {
+    #[test]
+    fn separate_libtest_eof_unblocks_actual_held_read_and_cleans_up() {
+        separate_process_protocol(2);
+    }
+    #[test]
+    fn separate_libtest_read_barrier_release_protocol_and_cleanup() {
+        separate_process_protocol(3);
+    }
+    fn separate_process_protocol(case: u8) {
         use std::{
             io::BufReader,
             process::{Command as Process, Stdio},
@@ -806,15 +1143,92 @@ mod tests {
             risunest_sync_connect::Registration::parse_uri(registration["uri"].as_str().unwrap())
                 .unwrap();
         assert_eq!(parsed.endpoint, ready["endpoint"]);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let asset = vec![71; 65_537];
+        let asset_hash = hash(&asset);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        if case >= 2 {
+            let frames =
+                risunest_sync_wire::transfer::encode(&[risunest_sync_wire::transfer::Frame::Full(
+                    asset.clone(),
+                )])
+                .unwrap();
+            let uploaded = runtime
+                .block_on(
+                    client
+                        .post(format!("{}/uploads/frames", parsed.endpoint))
+                        .bearer_auth(&parsed.token)
+                        .header("x-risu-library", &parsed.library_id)
+                        .body(frames)
+                        .send(),
+                )
+                .unwrap();
+            assert!(uploaded.status().is_success());
+            runtime.block_on(uploaded.bytes()).unwrap();
+        }
+        let roles = if case >= 2 {
+            json!([{"hash":asset_hash,"purposes":["Asset"]}])
+        } else {
+            json!([])
+        };
         send_command(
             &mut input,
-            json!({"op":"beginScope","requestId":"begin","scopeId":"zero","phase":"protocol-control","roles":[]}),
+            json!({"op":"beginScope","requestId":"begin","scopeId":"zero","phase":"protocol-control","roles":roles}),
         );
-        assert_eq!(
-            receive.recv_timeout(DRAIN_LIMIT).unwrap()["type"],
-            "scopeStarted"
-        );
-        if fail_command {
+        let scope = receive.recv_timeout(DRAIN_LIMIT).unwrap();
+        assert_eq!(scope["type"], "scopeStarted");
+        if case >= 2 {
+            let intent = json!({"scopeId":"zero","generation":scope["generation"],"barrierId":"process-first-read","hash":asset_hash,"flow":"source"});
+            let mut arm = intent.clone();
+            arm["op"] = "armReadBarrier".into();
+            arm["requestId"] = "arm".into();
+            send_command(&mut input, arm);
+            let armed = receive.recv_timeout(DRAIN_LIMIT).unwrap();
+            assert_eq!(armed["type"], "readBarrierArmed");
+            let request = client
+                .get(format!("{}/objects/{}", parsed.endpoint, asset_hash))
+                .bearer_auth(&parsed.token)
+                .header("x-risu-library", &parsed.library_id);
+            let download = runtime.spawn(async move {
+                match request.send().await {
+                    Ok(response) => response.bytes().await,
+                    Err(error) => Err(error),
+                }
+            });
+            let reached = receive.recv_timeout(DRAIN_LIMIT).unwrap();
+            assert_eq!(reached["type"], "readBarrierReached");
+            assert_eq!(reached["hash"], asset_hash);
+            assert_eq!(reached["readKind"], "asyncRead");
+            if case == 2 {
+                drop(input);
+                let error = receive.recv_timeout(DRAIN_LIMIT).unwrap();
+                assert_eq!(error["type"], "error");
+                assert_eq!(error["error"], "stdin-eof-before-shutdown");
+                assert_eq!(error["complete"], false);
+                assert_eq!(error["cleanupComplete"], true);
+                assert_eq!(error["rootRemoved"], true);
+                assert!(!root.exists());
+                assert!(runtime.block_on(download).unwrap().is_err());
+                assert!(!child.0.wait().unwrap().success());
+                reader.join().unwrap();
+                runtime.shutdown_timeout(DRAIN_LIMIT);
+                return;
+            }
+            let mut release = intent;
+            release["op"] = "releaseReadBarrier".into();
+            release["requestId"] = "release".into();
+            send_command(&mut input, release);
+            assert_eq!(
+                receive.recv_timeout(DRAIN_LIMIT).unwrap()["type"],
+                "readBarrierReleased"
+            );
+            assert_eq!(runtime.block_on(download).unwrap().unwrap().as_ref(), asset);
+        }
+        if case == 1 {
             send_command(
                 &mut input,
                 json!({"op":"shutdown","requestId":"bad","omittedProof":true}),
@@ -829,6 +1243,7 @@ mod tests {
             drop(input);
             assert!(!child.0.wait().unwrap().success());
             reader.join().unwrap();
+            runtime.shutdown_timeout(DRAIN_LIMIT);
             return;
         }
         send_command(
@@ -848,5 +1263,6 @@ mod tests {
         drop(input);
         assert!(child.0.wait().unwrap().success());
         reader.join().unwrap();
+        runtime.shutdown_timeout(DRAIN_LIMIT);
     }
 }

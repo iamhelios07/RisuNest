@@ -98,6 +98,7 @@ impl StrictLocalBackupDatabaseRestore for Import<'_> {
             OpenedJobSource {
                 file: open_staged(database)?,
                 total_bytes: database.byte_length,
+                custody: None,
             },
             1,
             self.job,

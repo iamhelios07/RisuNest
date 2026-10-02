@@ -26,11 +26,39 @@ pub(crate) struct UploadState {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct SealedBody {
     pub object_id: String,
+    pub content_hash: String,
+    pub byte_length: u64,
     pub sha256: String,
     pub bytes: String,
     pub resume: Option<UploadState>,
     pub complete: bool,
     pub locator: Option<crate::external_storage::contract::RemoteLocator>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct FrozenAsset {
+    pub content_hash: String,
+    pub byte_length: u64,
+    pub local_pin: bool,
+    pub remote_source: Option<crate::external_storage::lww_residency::FrozenBodySource>,
+}
+impl PartialEq for FrozenAsset {
+    fn eq(&self, other: &Self) -> bool {
+        self.content_hash == other.content_hash && self.byte_length == other.byte_length
+            && self.local_pin == other.local_pin
+            && match (serde_json::to_value(&self.remote_source), serde_json::to_value(&other.remote_source)) {
+                (Ok(left), Ok(right)) => left == right,
+                _ => false,
+            }
+    }
+}
+impl Eq for FrozenAsset {}
+impl std::fmt::Debug for FrozenAsset {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("FrozenAsset").field("content_hash", &self.content_hash)
+            .field("byte_length", &self.byte_length).field("local_pin", &self.local_pin)
+            .field("remote_source", &self.remote_source.is_some()).finish()
+    }
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -46,6 +74,9 @@ pub(crate) struct SealedPublication {
     pub sealed: bool,
     pub entries: Vec<OutboxEntry>,
     pub bodies: Vec<SealedBody>,
+    pub assets: Vec<FrozenAsset>,
+    pub asset_job: Option<crate::external_storage::journal::JobIdentity>,
+    pub asset_catalogs: Vec<risunest_external_storage_format::snapshot::StoredObject>,
     pub resume: Option<UploadState>,
     pub dispatched: bool,
     pub complete: bool,
@@ -272,6 +303,17 @@ impl PersistentStore {
         publication: &SealedPublication,
         bytes: &[u8],
     ) -> StoreResult<()> {
+        if publication.bodies.iter().any(|body| {
+            if body.bytes.is_empty() {
+                !body.sha256.is_empty() || body.byte_length != 0 || body.resume.is_some()
+                    || body.complete || body.locator.is_some() || publication.sealed
+            } else {
+                body.sha256.is_empty() || body.byte_length == 0
+                    || (body.complete && body.locator.is_none())
+            }
+        }) {
+            return Err(super::lww::error("sealed-body-integrity"));
+        }
         let tx = self.device_store_mut()?.transaction()?;
         let authority: String = tx.query_row(
             "SELECT binding_authority FROM lww_clock WHERE singleton=1",
@@ -291,6 +333,12 @@ impl PersistentStore {
             if previous.entries != publication.entries {
                 return Err(super::lww::error("captured-version-integrity"));
             }
+            if previous.assets != publication.assets || previous.asset_job != publication.asset_job {
+                return Err(super::lww::error("captured-asset-integrity"));
+            }
+            if !previous.asset_catalogs.is_empty() && previous.asset_catalogs != publication.asset_catalogs {
+                return Err(super::lww::error("sealed-asset-catalog-integrity"));
+            }
             if previous.bodies.len() != publication.bodies.len()
                 || previous
                     .bodies
@@ -298,8 +346,10 @@ impl PersistentStore {
                     .zip(&publication.bodies)
                     .any(|(old, new)| {
                         old.object_id != new.object_id
-                            || old.sha256 != new.sha256
-                            || old.bytes != new.bytes
+                            || old.content_hash != new.content_hash
+                            || (!old.bytes.is_empty() && (old.sha256 != new.sha256 || old.bytes != new.bytes || old.byte_length != new.byte_length))
+                            || (old.bytes.is_empty() && (!old.sha256.is_empty() || old.byte_length != 0))
+                            || (old.complete && (!new.complete || old.locator != new.locator))
                     })
             {
                 return Err(super::lww::error("sealed-body-integrity"));

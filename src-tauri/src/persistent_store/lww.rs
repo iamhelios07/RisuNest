@@ -22,6 +22,7 @@ pub(super) use binding_stage::{seed_binding_holds, validate_binding_source, BIND
 mod new_device;
 #[path = "lww_projection.rs"]
 mod projection;
+pub(super) use projection::validate_received;
 pub(super) use projection::{
     apply_mutation, capture_device_changes, capture_targets, is_device, preserve_local_root,
     refresh_orders, archive_value,
@@ -514,6 +515,16 @@ fn pin_backup_device_snapshot(library: &Connection, path: &str) -> StoreResult<(
 }
 
 impl PersistentStore {
+    #[cfg(test)]
+    pub(crate) fn lww_backup_device_revision(&self, lease: &str) -> StoreResult<i64> {
+        let reader = self.revision_leases.get(lease).ok_or(StoreError::SnapshotReleased)?;
+        if current_revision(&reader.connection)? != reader.target.revision
+            || active_generation(&reader.connection)? != reader.target.generation
+        { return Err(error("backup-lease-identity-changed")); }
+        let pinned: bool = reader.connection.query_row("SELECT EXISTS(SELECT 1 FROM pragma_database_list WHERE name='backup_device')", [], |row| row.get(0))?;
+        if !pinned { return Err(error("backup-capture-lease-required")); }
+        Ok(reader.connection.query_row("SELECT revision FROM backup_device.device_meta WHERE singleton=1", [], |row| row.get(0))?)
+    }
     pub(crate) fn lww_backup_unit_values(&self, lease: &str) -> StoreResult<BTreeMap<UnitKey, UnitValue>> {
         let reader = self.revision_leases.get(lease).ok_or(StoreError::SnapshotReleased)?;
         if current_revision(&reader.connection)? != reader.target.revision
@@ -589,6 +600,16 @@ impl PersistentStore {
         &mut self,
         revision: i64,
     ) -> StoreResult<(super::LeaseResult, Vec<device_store::sections::PreparedSectionRows>)> {
+        self.acquire_backup_capture(revision, true)
+    }
+    pub(crate) fn lww_acquire_library_backup_capture(&mut self, revision: i64) -> StoreResult<super::LeaseResult> {
+        self.acquire_backup_capture(revision, false).map(|(lease, _)| lease)
+    }
+    fn acquire_backup_capture(
+        &mut self,
+        revision: i64,
+        device_sections: bool,
+    ) -> StoreResult<(super::LeaseResult, Vec<device_store::sections::PreparedSectionRows>)> {
         use risunest_external_storage_format::section::SectionKind;
         let path: String = self.device_store()?.connection().query_row(
             "SELECT file FROM pragma_database_list WHERE name='main'", [], |row| row.get(0),
@@ -602,11 +623,14 @@ impl PersistentStore {
         if tx.query_row("SELECT EXISTS(SELECT 1 FROM lww_intents WHERE complete=0) OR EXISTS(SELECT 1 FROM lww_receive WHERE finished=0 AND authority=(SELECT binding_authority FROM lww_clock WHERE singleton=1))", [], |row| row.get::<_,bool>(0))? {
             return Err(StoreError::CommitBusy);
         }
-        let snapshot = Connection::open_with_flags(
-            &path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        snapshot.execute_batch("PRAGMA busy_timeout=5000; PRAGMA query_only=ON; PRAGMA mmap_size=0; BEGIN;")?;
-        snapshot.query_row("SELECT revision FROM device_meta WHERE singleton=1", [], |row| row.get::<_,i64>(0))?;
+        let snapshot = if device_sections {
+            let snapshot = Connection::open_with_flags(
+                &path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            snapshot.execute_batch("PRAGMA busy_timeout=5000; PRAGMA query_only=ON; PRAGMA mmap_size=0; BEGIN;")?;
+            snapshot.query_row("SELECT revision FROM device_meta WHERE singleton=1", [], |row| row.get::<_,i64>(0))?;
+            Some(snapshot)
+        } else { None };
         let lease = self.acquire_revision(revision)?;
         let outcome = (|| {
             let library = &self.revision_leases[&lease.lease].connection;
@@ -616,10 +640,13 @@ impl PersistentStore {
             tx.rollback()?;
             #[cfg(test)]
             BACKUP_CAPTURE_RELEASED.with(|hook| { if let Some(hook) = hook.borrow_mut().take() { hook(); } });
-            let sections = device_store::sections::capture_backup_sections_snapshot(
-                &snapshot, &[SectionKind::Hypa, SectionKind::LocalPlugins, SectionKind::LocalSettings],
-            )?;
-            snapshot.execute_batch("COMMIT;")?;
+            let sections = if let Some(snapshot) = snapshot {
+                let sections = device_store::sections::capture_backup_sections_snapshot(
+                    &snapshot, &[SectionKind::Hypa, SectionKind::LocalPlugins, SectionKind::LocalSettings],
+                )?;
+                snapshot.execute_batch("COMMIT;")?;
+                sections
+            } else { Vec::new() };
             Ok(sections)
         })();
         drop(barrier);
