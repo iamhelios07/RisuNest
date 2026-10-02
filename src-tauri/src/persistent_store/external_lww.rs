@@ -72,11 +72,17 @@ pub(crate) struct FrozenControlCatalog {
 struct DataCatalogWitness {
     catalog: risunest_external_storage_format::snapshot::StoredObject,
     hashes: Vec<String>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ControlCatalogProof {
+    catalog: risunest_external_storage_format::snapshot::StoredObject,
     rooted_at_ms: Option<u64>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ControlCatalogReference {
+    content_hash: String,
     catalog_key: String,
 }
 impl std::fmt::Debug for FrozenAsset {
@@ -329,6 +335,23 @@ impl PersistentStore {
             Ok(witness)
         }).transpose()
     }
+    fn external_lww_control_catalog_key(catalog: &risunest_external_storage_format::snapshot::StoredObject) -> StoreResult<String> {
+        Self::external_lww_data_catalog_key(catalog)?;
+        Ok(format!("data-proof/{}",catalog.ciphertext_sha256))
+    }
+    // Routine reuse and renewal read a bounded proof, not the complete admission inventory.
+    fn external_lww_control_catalog_proof(&self,target:&str,key:&str) -> StoreResult<Option<ControlCatalogProof>> {
+        let body:Option<Option<Vec<u8>>>=self.device_store()?.connection().query_row(
+            "SELECT body FROM external_lww_objects WHERE target=?1 AND hash=?2",params![target,key],|row|row.get(0),
+        ).optional()?;
+        body.flatten().map(|body| {
+            let proof:ControlCatalogProof=serde_json::from_slice(&body)?;
+            if Self::external_lww_control_catalog_key(&proof.catalog)?!=key {
+                return Err(super::lww::error("control-catalog-witness-integrity"));
+            }
+            Ok(proof)
+        }).transpose()
+    }
     pub(crate) fn external_lww_verified_data_catalog(&self, target:&str, catalog:&risunest_external_storage_format::snapshot::StoredObject) -> StoreResult<Option<Vec<String>>> {
         let key=Self::external_lww_data_catalog_key(catalog)?;
         self.external_lww_data_catalog_witness(target,&key)?.map(|witness| {
@@ -344,20 +367,18 @@ impl PersistentStore {
     }
     fn external_lww_store_data_catalog_witness(&self,target:&str,witness:&DataCatalogWitness) -> StoreResult<()> {
         let key=Self::external_lww_data_catalog_key(&witness.catalog)?;
+        let proof_key=Self::external_lww_control_catalog_key(&witness.catalog)?;
+        let proof=if let Some(previous)=self.external_lww_control_catalog_proof(target,&proof_key)? {
+            if previous.catalog!=witness.catalog {return Err(super::lww::error("control-catalog-witness-integrity"));}
+            previous
+        } else {ControlCatalogProof{catalog:witness.catalog.clone(),rooted_at_ms:None}};
         let tx=self.device_store()?.connection().unchecked_transaction()?;
         tx.execute("INSERT INTO external_lww_objects(target,hash,body) VALUES(?1,?2,?3)
             ON CONFLICT(target,hash) DO UPDATE SET body=excluded.body",params![target,key,serde_json::to_vec(witness)?])?;
+        tx.execute("INSERT INTO external_lww_objects(target,hash,body) VALUES(?1,?2,?3)
+            ON CONFLICT(target,hash) DO UPDATE SET body=excluded.body",params![target,proof_key,serde_json::to_vec(&proof)?])?;
         for hash in &witness.hashes {
-            let previous:Option<Option<Vec<u8>>>=tx.query_row("SELECT body FROM external_lww_objects WHERE target=?1 AND hash=?2",
-                params![target,hash],|row|row.get(0)).optional()?;
-            let previous_at=if let Some(body)=previous.flatten() {
-                let reference:ControlCatalogReference=serde_json::from_slice(&body)?;
-                let previous:Option<Vec<u8>>=tx.query_row("SELECT body FROM external_lww_objects WHERE target=?1 AND hash=?2",
-                    params![target,reference.catalog_key],|row|row.get(0)).optional()?;
-                previous.map(|body|serde_json::from_slice::<DataCatalogWitness>(&body)).transpose()?.and_then(|proof|proof.rooted_at_ms)
-            } else {None};
-            if previous_at> witness.rooted_at_ms {continue;}
-            let reference=ControlCatalogReference{catalog_key:key.clone()};
+            let reference=ControlCatalogReference{content_hash:hash.clone(),catalog_key:proof_key.clone()};
             tx.execute("INSERT INTO external_lww_objects(target,hash,body) VALUES(?1,?2,?3)
                 ON CONFLICT(target,hash) DO UPDATE SET body=excluded.body",params![target,hash,serde_json::to_vec(&reference)?])?;
         }
@@ -368,18 +389,19 @@ impl PersistentStore {
         let key=Self::external_lww_data_catalog_key(catalog)?;
         let mut hashes=hashes.to_vec(); hashes.sort(); hashes.dedup();
         for hash in &hashes {risunest_sync_wire::validate_hash(hash).map_err(super::lww::error)?;}
-        let rooted_at_ms=if let Some(previous)=self.external_lww_data_catalog_witness(target,&key)? {
+        if let Some(previous)=self.external_lww_data_catalog_witness(target,&key)? {
             if previous.catalog!=*catalog || previous.hashes!=hashes {return Err(super::lww::error("control-catalog-witness-integrity"));}
-            previous.rooted_at_ms
-        } else {None};
-        self.external_lww_store_data_catalog_witness(target,&DataCatalogWitness{catalog:catalog.clone(),hashes,rooted_at_ms})
+        }
+        self.external_lww_store_data_catalog_witness(target,&DataCatalogWitness{catalog:catalog.clone(),hashes})
     }
     pub(crate) fn external_lww_authorize_data_catalog(&self,target:&str,catalog:&risunest_external_storage_format::snapshot::StoredObject,rooted_at_ms:u64) -> StoreResult<()> {
-        let key=Self::external_lww_data_catalog_key(catalog)?;
-        let mut witness=self.external_lww_data_catalog_witness(target,&key)?.ok_or_else(||super::lww::error("control-catalog-witness-missing"))?;
-        if witness.catalog!=*catalog {return Err(super::lww::error("control-catalog-witness-integrity"));}
-        witness.rooted_at_ms=Some(witness.rooted_at_ms.map_or(rooted_at_ms,|previous|previous.max(rooted_at_ms)));
-        self.external_lww_store_data_catalog_witness(target,&witness)
+        let key=Self::external_lww_control_catalog_key(catalog)?;
+        let mut proof=self.external_lww_control_catalog_proof(target,&key)?.ok_or_else(||super::lww::error("control-catalog-witness-missing"))?;
+        if proof.catalog!=*catalog {return Err(super::lww::error("control-catalog-witness-integrity"));}
+        proof.rooted_at_ms=Some(proof.rooted_at_ms.map_or(rooted_at_ms,|previous|previous.max(rooted_at_ms)));
+        self.device_store()?.connection().execute("UPDATE external_lww_objects SET body=?1 WHERE target=?2 AND hash=?3",
+            params![serde_json::to_vec(&proof)?,target,key])?;
+        Ok(())
     }
     pub(crate) fn external_lww_reusable_control_catalog(&self,target:&str,hash:&str,now_ms:u64) -> StoreResult<Option<FrozenControlCatalog>> {
         risunest_sync_wire::validate_hash(hash).map_err(super::lww::error)?;
@@ -387,11 +409,11 @@ impl PersistentStore {
             params![target,hash],|row|row.get(0)).optional()?;
         let Some(body)=body.flatten() else {return Ok(None)};
         let reference:ControlCatalogReference=serde_json::from_slice(&body)?;
-        let witness=self.external_lww_data_catalog_witness(target,&reference.catalog_key)?.ok_or_else(||super::lww::error("control-catalog-witness-missing"))?;
-        if witness.hashes.binary_search_by(|value|value.as_str().cmp(hash)).is_err() {return Err(super::lww::error("control-catalog-witness-integrity"));}
-        let Some(rooted_at_ms)=witness.rooted_at_ms else {return Ok(None)};
+        if reference.content_hash!=hash {return Err(super::lww::error("control-catalog-witness-integrity"));}
+        let proof=self.external_lww_control_catalog_proof(target,&reference.catalog_key)?.ok_or_else(||super::lww::error("control-catalog-witness-missing"))?;
+        let Some(rooted_at_ms)=proof.rooted_at_ms else {return Ok(None)};
         if now_ms.checked_sub(rooted_at_ms).is_none_or(|age|age>crate::external_storage::leases::CACHE_REUSE_LIMIT_MS) {return Ok(None);}
-        Ok(Some(FrozenControlCatalog{catalog:witness.catalog,rooted_at_ms}))
+        Ok(Some(FrozenControlCatalog{catalog:proof.catalog,rooted_at_ms}))
     }
     pub(crate) fn external_lww_next_sequence(
         &self,
@@ -652,16 +674,39 @@ mod asset_root_tests {
             let catalog=payload.data_catalogs[0].clone();
             let target=f.sender.target_scope();
             let key=PersistentStore::external_lww_data_catalog_key(&catalog).unwrap();
-            let mut witness=f.a.external_lww_data_catalog_witness(&target,&key).unwrap().unwrap();
+            let witness=f.a.external_lww_data_catalog_witness(&target,&key).unwrap().unwrap();
+            let proof_key=PersistentStore::external_lww_control_catalog_key(&catalog).unwrap();
+            let mut proof=f.a.external_lww_control_catalog_proof(&target,&proof_key).unwrap().unwrap();
             let now=crate::external_storage::runtime::now_ms();
             let aged=now-crate::external_storage::leases::CACHE_REUSE_LIMIT_MS-1;
-            witness.rooted_at_ms=Some(aged);
-            f.a.external_lww_store_data_catalog_witness(&target,&witness).unwrap();
+            proof.rooted_at_ms=Some(aged);
+            f.a.device_store().unwrap().connection().execute("UPDATE external_lww_objects SET body=?1 WHERE target=?2 AND hash=?3",
+                params![serde_json::to_vec(&proof).unwrap(),target,proof_key]).unwrap();
             f.a.external_lww_witness_data_catalog(&target,&catalog,&witness.hashes).unwrap();
-            assert_eq!(f.a.external_lww_data_catalog_witness(&target,&key).unwrap().unwrap().rooted_at_ms,Some(aged));
+            assert_eq!(f.a.external_lww_control_catalog_proof(&target,&proof_key).unwrap().unwrap().rooted_at_ms,Some(aged));
             assert!(f.a.external_lww_reusable_control_catalog(&target,&witness.hashes[0],now).unwrap().is_none());
             assert!(f.a.external_lww_verified_data_catalog("another-target",&catalog).unwrap().is_none());
             f.a.external_lww_authorize_data_catalog(&target,&catalog,now).unwrap();
+            let hash=&witness.hashes[0];
+            let pointer:Vec<u8>=f.a.device_store().unwrap().connection().query_row(
+                "SELECT body FROM external_lww_objects WHERE target=?1 AND hash=?2",params![target,hash],|row|row.get(0)).unwrap();
+            f.a.device_store().unwrap().connection().execute("UPDATE external_lww_objects SET body=?1 WHERE target=?2 AND hash=?3",
+                params![b"invalid inventory".as_slice(),target,key]).unwrap();
+            assert!(f.a.external_lww_verified_data_catalog(&target,&catalog).is_err());
+            assert!(f.a.external_lww_reusable_control_catalog(&target,hash,now).unwrap().is_some());
+            f.a.external_lww_authorize_data_catalog(&target,&catalog,now).unwrap();
+            let after:Vec<u8>=f.a.device_store().unwrap().connection().query_row(
+                "SELECT body FROM external_lww_objects WHERE target=?1 AND hash=?2",params![target,hash],|row|row.get(0)).unwrap();
+            assert_eq!(after,pointer,"routine proof renewal must not rewrite control pointers");
+            assert!(f.a.external_lww_verified_data_catalog(&target,&catalog).is_err(),"routine lookup and renewal must not deserialize or replace the inventory");
+            f.a.device_store().unwrap().connection().execute("UPDATE external_lww_objects SET body=?1 WHERE target=?2 AND hash=?3",
+                params![serde_json::to_vec(&witness).unwrap(),target,key]).unwrap();
+            let changed=ControlCatalogReference{content_hash:"a".repeat(64),catalog_key:proof_key.clone()};
+            f.a.device_store().unwrap().connection().execute("UPDATE external_lww_objects SET body=?1 WHERE target=?2 AND hash=?3",
+                params![serde_json::to_vec(&changed).unwrap(),target,hash]).unwrap();
+            assert!(f.a.external_lww_reusable_control_catalog(&target,hash,now).is_err());
+            f.a.device_store().unwrap().connection().execute("UPDATE external_lww_objects SET body=?1 WHERE target=?2 AND hash=?3",
+                params![pointer,target,hash]).unwrap();
             f.a.commit(&crate::persistent_store::WorkingSetCommit{expected_revision:f.a.revision().unwrap(),
                 conversations:Some(vec![crate::persistent_store::ConversationMutation::ReplaceRange{character_id:"char".into(),conversation_id:"conv".into(),
                     start:40,delete_count:0,messages:vec![serde_json::json!({"chatId":"synthetic-aged-append","data":"append"})],
