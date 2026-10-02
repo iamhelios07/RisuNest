@@ -2832,6 +2832,87 @@ mod tests {
     }
 
     #[test]
+    fn cross_owner_plugin_order_preserves_export_positions_after_updates_and_reorder() {
+        use crate::persistent_store::{lww::UnitMutation, PluginStorageMutation, WorkingSetCommit};
+        use risunest_sync_wire::unit::UnitKey;
+
+        fn exported_storage(store: &mut PersistentStore) -> Value {
+            let lease = store.acquire_revision(store.revision().unwrap()).unwrap().lease;
+            let exported = store.export_risu_save(&lease, false).unwrap();
+            let value = read_blocks(Path::new(&exported.path))
+                .into_iter()
+                .find(|block| block.block_type == PLUGIN_STORAGE)
+                .unwrap()
+                .value;
+            store.release_revision(&lease).unwrap();
+            value
+        }
+        fn assert_keys(value: &Value, expected: &[&str]) {
+            assert_eq!(value.as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>(), expected);
+        }
+        fn set(owner: &str, key: &str, value: i64) -> PluginStorageMutation {
+            PluginStorageMutation::Set { owner: owner.into(), key: key.into(), value: json!(value) }
+        }
+
+        let (_directory, mut store, revision, initial_lease) = fixture();
+        store.release_revision(&initial_lease).unwrap();
+        let imported = store.commit(&WorkingSetCommit {
+            expected_revision: revision,
+            plugin_storage: Some(vec![
+                PluginStorageMutation::Clear { owner: UNOWNED_OWNER.into() },
+                set(UNOWNED_OWNER, "10", 10),
+                set(UNOWNED_OWNER, "2", 2),
+                set(UNOWNED_OWNER, "01", 1),
+                set(UNOWNED_OWNER, "z", 0),
+                set(UNOWNED_OWNER, "4294967295", 5),
+            ]),
+            ..Default::default()
+        }).unwrap();
+        let inserted = store.commit(&WorkingSetCommit {
+            expected_revision: imported.revision,
+            plugin_storage: Some(vec![
+                set("plugin-a", "first", 1),
+                set("plugin-b", "between", 2),
+                set("plugin-a", "second", 3),
+            ]),
+            ..Default::default()
+        }).unwrap();
+        let original_order = ["2", "10", "01", "z", "4294967295", "first", "between", "second"];
+        assert_keys(&exported_storage(&mut store), &original_order);
+
+        let updated = store.commit(&WorkingSetCommit {
+            expected_revision: inserted.revision,
+            plugin_storage: Some(vec![set("plugin-a", "first", 4)]),
+            ..Default::default()
+        }).unwrap();
+        let storage = exported_storage(&mut store);
+        assert_keys(&storage, &original_order);
+        assert_eq!(storage["first"], 4);
+
+        let reordered = store.commit(&WorkingSetCommit {
+            expected_revision: updated.revision,
+            unit_mutations: Some(vec![UnitMutation::Set {
+                key: UnitKey::new(&["order", "plugin-storage", "plugin-a"]).unwrap(),
+                value: json!(["second", "first"]),
+            }]),
+            ..Default::default()
+        }).unwrap();
+        let reordered_keys = ["2", "10", "01", "z", "4294967295", "second", "between", "first"];
+        assert_keys(&exported_storage(&mut store), &reordered_keys);
+        store.commit(&WorkingSetCommit {
+            expected_revision: reordered.revision,
+            plugin_storage: Some(vec![
+                PluginStorageMutation::Delete { owner: "plugin-a".into(), key: "first".into() },
+                set("plugin-a", "first", 6),
+            ]),
+            ..Default::default()
+        }).unwrap();
+        let storage = exported_storage(&mut store);
+        assert_keys(&storage, &reordered_keys);
+        assert_eq!(storage["first"], 6);
+    }
+
+    #[test]
     fn removes_partial_output_when_export_fails() {
         let (_directory, mut store, revision, lease) = fixture();
         store.release_revision(&lease).unwrap();
