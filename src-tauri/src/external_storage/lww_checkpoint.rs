@@ -154,27 +154,41 @@ impl PublishedCatalog {
         Ok(())
     }
     pub(crate) fn changes(&self) -> Result<Vec<Change>> {
-        let retired: BTreeMap<String, Change> = self.db.prepare("SELECT key,body FROM retirements").map_err(sql)?.query_map([], |r| Ok((r.get::<_, String>(0)?,r.get::<_, String>(1)?))).map_err(sql)?.map(|row| { let (key,body)=row.map_err(sql)?; Ok((key, serde_json::from_str(&body).map_err(sql)?)) }).collect::<Result<_>>()?;
         let mut changes = Vec::new();
-        let mut query = self.db.prepare("SELECT key,body FROM units ORDER BY key").map_err(sql)?;
-        let rows = query.query_map([], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).map_err(sql)?;
-        for row in rows {
-            let (key,body) = row.map_err(sql)?;
-            let change: Change = serde_json::from_str(&body).map_err(sql)?;
-            if let Some(deletion) = retired.get(&key) { changes.push(deletion.clone()); continue; }
-            if parents(&change.key)?.iter().any(|parent| retired.contains_key(parent.as_str())) { continue; }
-            changes.push(change);
-        }
+        self.visit_changes(&mut |change| {changes.push(change);Ok(())})?;
         Ok(changes)
+    }
+    pub(crate) fn visit_changes(&self,visitor:&mut dyn FnMut(Change)->Result<()>)->Result<()> {
+        let mut query = self.db.prepare("SELECT units.key,COALESCE(retirements.body,units.body),retirements.key IS NOT NULL FROM units LEFT JOIN retirements ON retirements.key=units.key ORDER BY units.key").map_err(sql)?;
+        let rows = query.query_map([], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,bool>(2)?))).map_err(sql)?;
+        for row in rows {
+            let (key,body,retired) = row.map_err(sql)?;
+            let change: Change = serde_json::from_str(&body).map_err(sql)?;
+            if change.key.as_str()!=key {return Err(segment::corrupt());}
+            if !retired {
+                let mut suppressed=false;
+                for parent in parents(&change.key)? {
+                    if self.db.query_row("SELECT EXISTS(SELECT 1 FROM retirements WHERE key=?1)",[parent.as_str()],|row|row.get::<_,bool>(0)).map_err(sql)? {suppressed=true;break;}
+                }
+                if suppressed {continue;}
+            }
+            visitor(change)?;
+        }
+        Ok(())
     }
     pub(crate) fn identity(&self) -> Result<String> {
         let mut digest = sha2::Sha256::new();
         use sha2::Digest;
         #[cfg(test)] crate::persistent_store::hash_work::begin("checkpoint-state.identity");
-        for change in self.changes()? {
+        let visited=self.visit_changes(&mut |change| {
             let bytes = risunest_sync_wire::canonical::encode(&serde_json::to_value(change).map_err(sql)?).map_err(sql)?;
             digest.update((bytes.len() as u64).to_le_bytes()); digest.update(&bytes);
             #[cfg(test)] crate::persistent_store::hash_work::update("checkpoint-state.identity",8+bytes.len());
+            Ok(())
+        });
+        if let Err(error)=visited {
+            #[cfg(test)] crate::persistent_store::hash_work::incomplete("checkpoint-state.identity");
+            return Err(error);
         }
         Ok(hex::encode(digest.finalize()))
     }

@@ -403,7 +403,7 @@ export async function requestExternalStorageRestore(
                 && !['succeeded', 'failed', 'cancelled'].includes(job.state))
             const previous = observed ? await getExternalStorageBridge().getJob(observed.id) : undefined
             replacement = await (await import('../bindingRegistry')).prepareBoundLibraryReplacement({
-                confirmedCommittedRestore: previous?.result?.receivedRevision !== undefined,
+                confirmedCommittedRestore: previous?.applicationStarted === true && previous.result?.receivedRevision !== undefined,
             })
             replacementFenced = true
             await replacement.fence()

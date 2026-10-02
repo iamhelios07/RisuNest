@@ -152,7 +152,7 @@ impl ExternalLwwEngine {
         }
         let mut segments=Vec::new();
         let mut history=PublishedCatalog::create(&directory.join("history.sqlite"))?;
-        for change in catalog.changes()? {history.merge(&change)?;}
+        catalog.visit_changes(&mut |change|history.merge(&change))?;
         let upper=self.admitted_upper()?.checked_add(300_000).ok_or_else(segment::corrupt)?;
         for ((writer,seq),variants) in groups {
             let mut identity=None; let mut winner=None;
@@ -173,6 +173,7 @@ impl ExternalLwwEngine {
                     for (hash,source) in &payload.large_bodies { standalone.insert(hash.clone(),source.clone()); standalone_roots.insert(hash.clone(),super::contract::segment_object_id(&payload.writer_id,payload.seq.0,&identity.clone().ok_or_else(segment::corrupt)?)?); }
                 }
                 payload.message_pages.clear();
+                payload.changes.clear();
                 segments.push((receipt,payload));
             }
         }
@@ -188,12 +189,17 @@ impl ExternalLwwEngine {
         let external=directory.join("external-storage");
         let mut capture=super::capture::CaptureCatalog::create(&directory.join("capture"),&external,None).map_err(error)?;
         capture.begin(&identity,None).map_err(error)?;
-        let changes=state.catalog.changes()?;
-        for change in &changes {
-            let bytes=risunest_sync_wire::canonical::encode(&serde_json::to_value(change).map_err(error)?).map_err(error)?;
+        let mut first_key=None;
+        let mut count=0usize;
+        state.catalog.visit_changes(&mut |change| {
+            cancel.check()?;
+            let bytes=risunest_sync_wire::canonical::encode(&serde_json::to_value(&change).map_err(error)?).map_err(error)?;
             capture.record(change.key.as_str(),&bytes).map_err(error)?;
-        }
-        if let Some(first)=changes.first() {
+            if first_key.is_none() {first_key=Some(change.key.as_str().to_owned());}
+            count=count.checked_add(1).ok_or_else(segment::corrupt)?;
+            Ok(())
+        })?;
+        if let Some(first)=first_key {
             let cas=crate::asset_repository::PayloadCas::new(directory).map_err(error)?;
             let copied=state.body_spool.visit(&mut |hash,bytes,role| {
                 if cancel.check().is_err() {return Err(crate::persistent_store::StoreError::Validation{message:"Published source copying cancelled".into()});}
@@ -204,7 +210,7 @@ impl ExternalLwwEngine {
                         if prepared.content_hash!=hash {return Err(crate::persistent_store::StoreError::Validation{message:"Published payload identity differs".into()});}
                     }
                 }
-                capture.reference(first.key.as_str(),hash,bytes.len() as u64)
+                capture.reference(&first,hash,bytes.len() as u64)
             });
             cancel.check()?;
             copied.map_err(error)?;
@@ -213,7 +219,7 @@ impl ExternalLwwEngine {
         let fingerprint=capture.content_fingerprint(&risunest_external_storage_format::format::library_fingerprint_domain()).map_err(error)?;
         let metadata=super::packaging::SnapshotMetadata { snapshot_id:job_id.into(),repository_id:self.repository.repository_id.clone(),library_id:self.library.clone(),author_device_id:writer.into(),created_at_ms:self.admitted_upper()?,logical_revision:0,parent_snapshot_id:None,content_fingerprint:fingerprint,
             purpose:super::packaging::SnapshotPurpose::LwwCheckpoint { covered_prefixes:state.catalog.coverage.clone(),state_identity:state.catalog.identity()?,asset_catalogs:state.asset_catalogs,standalone_bodies:state.standalone } };
-        let captured=CapturedSnapshot{id:job_id.into(),identity:identity.clone(),catalog:capture,projected_records:changes.len(),shared:true};
+        let captured=CapturedSnapshot{id:job_id.into(),identity:identity.clone(),catalog:capture,projected_records:count,shared:true};
         let mut journal=super::journal::TransferJournal::open(&directory.join("journal"),super::journal::JobIdentity{job_id:job_id.into(),connection_id:self.connection_id.clone(),repository_id:self.repository.repository_id.clone(),capture_id:job_id.into(),capture:identity}).map_err(error)?;
         let limits=super::packaging::PackageLimits::from_capabilities(capabilities)?;
         super::packaging::package_and_upload_protected(captured,Vec::new(),directory,&directory.join("cache"),metadata,&self.root_key,limits,None,&mut journal,self.provider.as_ref(),&self.repository,&super::phase_progress::PhaseProgress::silent(),cancel,protection).await
