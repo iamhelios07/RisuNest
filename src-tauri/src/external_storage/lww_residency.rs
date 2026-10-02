@@ -434,7 +434,18 @@ pub(crate) async fn spool_frozen_remote_body(source:&FrozenBodySource,destinatio
             segment::open_body_stream(&mut input,&mut output,&source.library_id,&source.body.object_id,&key,source.body.plaintext_byte_length.0)?;
             if !super::snapshot_restore::verify_body_file(output.path(),source.body.plaintext_byte_length.0,hash)? {return Err(segment::corrupt());}
         } else if let FrozenBodySource::Packed(source)=&source {
-            let path=super::snapshot_restore::download_packed_body_file(hash,source.byte_length,source.chunks.clone(),source.packs.clone(),scratch.path(),&key,provider.as_ref(),&repository,cancel).await?;
+            let path=match super::snapshot_restore::download_packed_body_file(hash,source.byte_length,source.chunks.clone(),source.packs.clone(),scratch.path(),&key,provider.as_ref(),&repository,cancel).await {
+                Err(error) if error.kind==ErrorKind::NotFound => {
+                    let engine=super::lww_engine::ExternalLwwEngine{provider:provider.clone(),repository:repository.clone(),library:source.library_id.clone(),
+                        root_key:zeroize::Zeroizing::new(*key),admission:None,connection_id:connection_id.clone(),connection_root:connection_root.clone(),
+                        capabilities:stored.capabilities.clone(),descriptor:stored.descriptor.clone()};
+                    let mut refreshed=engine.refresh_packed_sources(std::slice::from_ref(source),&scratch.path().join("current-catalogs"),cancel).await?;
+                    let refreshed=refreshed.pop().ok_or_else(segment::corrupt)?;
+                    if let Some(reason)=owner.recheck(&protection,cancel).await? {return Err(super::leases::yield_error(reason));}
+                    super::snapshot_restore::download_packed_body_file(hash,source.byte_length,refreshed.chunks,refreshed.packs,&scratch.path().join("current-source"),&key,provider.as_ref(),&repository,cancel).await?
+                }
+                other=>other?,
+            };
             let mut input=crate::trust_boundary::open_regular_source(&path).map_err(local)?;
             std::io::copy(&mut input,&mut output).map_err(local)?;
         }
