@@ -155,14 +155,17 @@ mod tests {
     fn upstream_identity_assignment_is_confined_to_stage_and_preserves_mirror_edits() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = PersistentStore::open(dir.path()).unwrap();
+        let before = store.read_root(None).unwrap().value;
         let stage = store.replace_begin().unwrap().staging_id;
-        store.replace_put_upstream_root(&stage,&json!({"botPresetsId":1,"selectedPersona":0,"temperature":0.8,"NAIsettings":{"synthetic":true},"username":"edited","doNotChangeFallbackModels":true,"fallbackModels":["protected"],"personas":[{"name":"stale","embeddedModule":{"assets":[]}}],"modules":[{"id":"kept"},{"id":"kept"},{}],"loadouts":[{}],"globalChatVariables":{"toggle_synthetic":"1"}})).unwrap();
+        store.replace_put_upstream_root(&stage,&json!({"botPresetsId":1,"selectedPersona":0,"temperature":0.8,"NAIsettings":{"synthetic":true},"username":"edited","doNotChangeFallbackModels":true,"fallbackModels":["protected"],"personas":[{"id":"persona-kept","name":"stale","embeddedModule":{"assets":[]}},{"id":"persona-kept","name":"duplicate"},{"name":"missing"}],"modules":[{"id":"kept"},{"id":"kept"},{}],"loadouts":[{}],"globalChatVariables":{"toggle_synthetic":"1"}})).unwrap();
+        assert!(store.replace_put_presets(&stage, &[json!({"name":"missing"})]).is_err());
         store
             .replace_put_upstream_presets(
                 &stage,
                 &[
                     json!({"id":"existing","name":"one"}),
                     json!({"temperature":0.1,"fallbackModels":["preset"]}),
+                    json!({"id":"existing","name":"duplicate"}),
                 ],
             )
             .unwrap();
@@ -193,12 +196,28 @@ mod tests {
             json!(["protected"])
         );
         assert_eq!(root["personas"][0]["name"], "edited");
+        assert_eq!(root["personas"][0]["id"], "persona-kept");
+        assert_eq!(root["selectedPersona"], "persona-kept");
         assert!(root["personas"][0]["embeddedModule"]["id"]
             .as_str()
             .is_some());
         assert_eq!(root["modules"][0]["id"], "kept");
         assert_ne!(root["modules"][1]["id"], "kept");
         assert_eq!(root["explicitGlobalChatVariables"]["toggle_synthetic"], "1");
+        let staged = store.materialize_staging(&stage).unwrap();
+        for field in ["botPresets", "personas"] {
+            let records = staged[field].as_array().unwrap();
+            let ids = records.iter().map(|record| record["id"].as_str().unwrap()).collect::<std::collections::HashSet<_>>();
+            assert_eq!(ids.len(), records.len());
+            for record in &records[1..] {
+                assert!(uuid::Uuid::parse_str(record["id"].as_str().unwrap()).is_ok());
+            }
+        }
+        assert_eq!(staged["botPresets"][0]["id"], "existing");
+        store.replace_put_upstream_root(&stage, &root).unwrap();
+        store.replace_put_upstream_presets(&stage, staged["botPresets"].as_array().unwrap()).unwrap();
+        assert_eq!(store.materialize_staging(&stage).unwrap(), staged);
+        assert_eq!(store.read_root(None).unwrap().value, before);
         assert_eq!(store.revision().unwrap(), 0);
         store.replace_commit(&stage, None).unwrap();
         let generation = active_generation(&store.connection).unwrap();
