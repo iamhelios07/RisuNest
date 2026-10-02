@@ -428,6 +428,7 @@ pub(crate) struct RawCompaction {
     pub native_publication_complete_ms:Option<f64>,
     pub snapshot:Option<Value>,
     pub protection_run_completed:bool,
+    pub temporary_costs:Option<Value>,
     pub native_observation:NativeObservation,
     pub source_observation:Option<Value>,
     pub error:Option<String>,
@@ -479,17 +480,55 @@ pub(crate) async fn compact_native_raw(
     observation.requests=(provider.read_count()+provider.upload_count()+provider.listing_count()-requests_before) as u64;
     observation.uploaded_bytes=bytes_after.0-bytes_before.0;
     observation.downloaded_bytes=bytes_after.1-bytes_before.1;
-    let (snapshot,error)=match outcome {
+    let (snapshot,mut error)=match outcome {
         Ok(completed)=>(Some(json!({"snapshotId":completed.snapshot_id,"repositoryId":completed.repository_id,
             "stateFingerprint":completed.fingerprint,"libraryFingerprint":completed.library_fingerprint,
             "logicalRevision":completed.logical_revision,"referencedObjectCount":completed.referenced_objects.len(),
             "sectionCount":completed.sections.len()})),None),
         Err(error)=>(None,Some(format!("{error:?}"))),
     };
+    // Structural inspection occurs after elapsed timing and every counter take.
+    let temporary_costs=match retained_compaction_costs(directory) {
+        Ok(value)=>Some(value),Err(reason)=>{error=Some(match error {Some(prior)=>format!("{prior}; {reason}"),None=>reason});None}
+    };
     Ok(RawCompaction {status:"INVALID",fixture_for_scenario:scenario,iteration,warmup:iteration==0,
         native_publication_complete_ms:snapshot.as_ref().map(|_|elapsed_ms),
-        protection_run_completed:protection.is_some() && snapshot.is_some(),snapshot,native_observation:observation,
+        protection_run_completed:protection.is_some() && snapshot.is_some(),snapshot,temporary_costs,native_observation:observation,
         source_observation:None,error})
+}
+
+fn retained_compaction_costs(directory:&Path)->Result<Value,String> {
+    let mut pending=vec![directory.to_owned()];let mut files=Vec::new();let mut retained_bytes=0u64;
+    while let Some(path)=pending.pop() {
+        if !path.exists() {continue;}
+        for entry in std::fs::read_dir(&path).map_err(|e|e.to_string())? {
+            let path=entry.map_err(|e|e.to_string())?.path();
+            let metadata=std::fs::symlink_metadata(&path).map_err(|e|e.to_string())?;
+            if metadata.file_type().is_symlink() {return Err("compaction cost inspection encountered a symbolic link".into());}
+            if metadata.is_dir() {pending.push(path);continue;}
+            retained_bytes=retained_bytes.checked_add(metadata.len()).ok_or("retained compaction file byte overflow")?;
+            let mut row=json!({"relativePath":path.strip_prefix(directory).map_err(|e|e.to_string())?,"fileLengthBytes":metadata.len()});
+            if path.extension().is_some_and(|extension|extension=="sqlite") {
+                let db=rusqlite::Connection::open_with_flags(&path,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e|e.to_string())?;
+                let pages:u64=db.query_row("PRAGMA page_count",[],|row|sql_u64(row,0)).map_err(|e|e.to_string())?;
+                let page_size:u64=db.query_row("PRAGMA page_size",[],|row|sql_u64(row,0)).map_err(|e|e.to_string())?;
+                row["sqliteAllocatedBytes"]=json!(pages.checked_mul(page_size).ok_or("SQLite allocation overflow")?);
+                let mut statement=db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").map_err(|e|e.to_string())?;
+                let names=statement.query_map([],|row|row.get::<_,String>(0)).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+                let mut counts=std::collections::BTreeMap::new();
+                for name in names {
+                    let query=format!("SELECT count(*) FROM \"{}\"",name.replace('"',"\"\""));
+                    let count=db.query_row(&query,[],|row|sql_u64(row,0)).map_err(|e|e.to_string())?;counts.insert(name,count);
+                }
+                row["tableRows"]=json!(counts);
+            }
+            files.push(row);
+        }
+    }
+    files.sort_by_key(|row|row["relativePath"].as_str().unwrap_or("").to_owned());
+    Ok(json!({"inspectionPhase":"post-completion excluded structural inspection","survivingFileLengthBytes":retained_bytes,
+        "files":files,"peakDiskBytes":null,"removedCatalogRows":null,
+        "scope":"actual surviving file lengths and SQLite page allocation/row counts; removed files and peak allocation are unobserved"}))
 }
 
 /// Both stale views contain actual published receipts, and freeze before either checkpoint exists.
@@ -501,32 +540,56 @@ pub(crate) async fn produce_incomparable_native(
     use crate::external_storage::lww_compaction::{CompactionBarrier,install_compaction_barrier};
     if writers[0]==writers[1] || jobs[0]==jobs[1] {return Err("incomparable producer identities must be independent".into());}
     let cancel=Cancellation::default();
-    let snapshots=provider.list_objects(&engine.repository,Collection::Snapshots,None,1000,&cancel).await
-        .map_err(|e|format!("{e:?}"))?;
-    if !snapshots.objects.is_empty() || snapshots.next_cursor.is_some() {
+    let mut snapshots=ObjectPage {objects:Vec::new(),next_cursor:None};
+    let mut cursor=None;let mut seen=std::collections::BTreeSet::new();
+    loop {
+        let page=provider.list_objects(&engine.repository,Collection::Snapshots,cursor.as_deref(),1000,&cancel).await
+            .map_err(|e|format!("{e:?}"))?;
+        snapshots.objects.extend(page.objects);
+        match page.next_cursor {Some(next) if seen.insert(next.clone())=>cursor=Some(next),
+            Some(_)=>return Err("snapshot listing did not advance".into()),None=>break}
+    }
+    if !snapshots.objects.is_empty() {
         return Err("incomparable producer requires a fresh actual snapshot listing".into());
     }
-    let segments=provider.list_objects(&engine.repository,Collection::Segments,None,1000,&cancel).await
+    let mut sequences=[std::collections::BTreeMap::new(),std::collections::BTreeMap::new()];
+    let mut cursor=None;let mut seen=std::collections::BTreeSet::new();
+    loop {
+    let segments=provider.list_objects(&engine.repository,Collection::Segments,cursor.as_deref(),1000,&cancel).await
         .map_err(|e|format!("{e:?}"))?;
-    if segments.next_cursor.is_some() {return Err("tiny incomparable producer segment listing is not complete".into());}
-    let mut views=[Vec::new(),Vec::new()];
     for receipt in segments.objects {
         let name=receipt.locator.object.rsplit('/').next().ok_or("actual segment name absent")?;
         let (writer,sequence,_)=parse_segment_object_id(name).map_err(|e|format!("{e:?}"))?;
-        let index=writers.iter().position(|expected|*expected==writer).ok_or("unexpected writer in tiny producer")?;
-        if sequence!=1 {return Err("tiny incomparable producer expects each actual first publication".into());}
-        views[index].push(receipt);
+        let index=writers.iter().position(|expected|*expected==writer).ok_or("unexpected writer in incomparable producer")?;
+        if sequences[index].insert(sequence,receipt).is_some() {return Err("actual writer sequence is duplicated".into());}
     }
-    if views.iter().any(|view|view.len()!=1) {return Err("both actual writer prefixes must be published before checkpoint construction".into());}
+    match segments.next_cursor {Some(next) if seen.insert(next.clone())=>cursor=Some(next),
+        Some(_)=>return Err("segment listing did not advance".into()),None=>break}
+    }
+    let mut prefixes=[0u64;2];
+    let mut views=[Vec::new(),Vec::new()];
+    for index in 0..2 {
+        for (sequence,receipt) in std::mem::take(&mut sequences[index]) {
+            if sequence!=prefixes[index]+1 {return Err("actual writer prefix is not contiguous from sequence1".into());}
+            prefixes[index]=sequence;views[index].push(receipt);
+        }
+        if prefixes[index]==0 {return Err("both actual writer prefixes must be published before checkpoint construction".into());}
+    }
     let barriers=[CompactionBarrier::new(),CompactionBarrier::new()];
     for index in 0..2 {install_compaction_barrier(jobs[index],barriers[index].clone());}
     provider.script_page(Collection::Snapshots,Ok(snapshots.clone()));
-    provider.script_page(Collection::Segments,Ok(ObjectPage {objects:views[0].clone(),next_cursor:None}));
+    for (page,objects) in views[0].chunks(100).enumerate() {
+        let more=(page+1)*100<views[0].len();
+        provider.script_page(Collection::Segments,Ok(ObjectPage {objects:objects.to_vec(),next_cursor:more.then(||format!("frozen-a-{}",page+1))}));
+    }
     let first=engine.compact_published(directories[0],jobs[0],writers[0],capabilities,&cancel,None);
     let second=async {
         barriers[0].reached.notified().await;
         provider.script_page(Collection::Snapshots,Ok(snapshots));
-        provider.script_page(Collection::Segments,Ok(ObjectPage {objects:views[1].clone(),next_cursor:None}));
+        for (page,objects) in views[1].chunks(100).enumerate() {
+            let more=(page+1)*100<views[1].len();
+            provider.script_page(Collection::Segments,Ok(ObjectPage {objects:objects.to_vec(),next_cursor:more.then(||format!("frozen-b-{}",page+1))}));
+        }
         let capture=engine.compact_published(directories[1],jobs[1],writers[1],capabilities,&cancel,None);
         let release=async {
             barriers[1].reached.notified().await;
@@ -540,7 +603,7 @@ pub(crate) async fn produce_incomparable_native(
     let mut coverages=vec![];
     for index in 0..2 {
         let (_,checkpoint)=engine.checkpoint(&completed[index].reference.receipt,&cancel).await.map_err(|e|format!("{e:?}"))?;
-        if checkpoint.covered_prefixes.len()!=1 || checkpoint.covered_prefixes.get(writers[index]).map(|seq|seq.0)!=Some(1) {
+        if checkpoint.covered_prefixes.len()!=1 || checkpoint.covered_prefixes.get(writers[index]).map(|seq|seq.0)!=Some(prefixes[index]) {
             return Err("actual authenticated checkpoint did not retain its frozen exclusive writer prefix".into());
         }
         coverages.push(checkpoint.covered_prefixes);
