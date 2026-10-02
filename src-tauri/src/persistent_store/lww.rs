@@ -510,6 +510,16 @@ fn pin_backup_device_snapshot(library: &Connection, path: &str) -> StoreResult<(
 }
 
 impl PersistentStore {
+    #[cfg(test)]
+    pub(crate) fn lww_backup_device_revision(&self, lease: &str) -> StoreResult<i64> {
+        let reader = self.revision_leases.get(lease).ok_or(StoreError::SnapshotReleased)?;
+        if current_revision(&reader.connection)? != reader.target.revision
+            || active_generation(&reader.connection)? != reader.target.generation
+        { return Err(error("backup-lease-identity-changed")); }
+        let pinned: bool = reader.connection.query_row("SELECT EXISTS(SELECT 1 FROM pragma_database_list WHERE name='backup_device')", [], |row| row.get(0))?;
+        if !pinned { return Err(error("backup-capture-lease-required")); }
+        Ok(reader.connection.query_row("SELECT revision FROM backup_device.device_meta WHERE singleton=1", [], |row| row.get(0))?)
+    }
     pub(crate) fn lww_backup_unit_values(&self, lease: &str) -> StoreResult<BTreeMap<UnitKey, UnitValue>> {
         let reader = self.revision_leases.get(lease).ok_or(StoreError::SnapshotReleased)?;
         if current_revision(&reader.connection)? != reader.target.revision
