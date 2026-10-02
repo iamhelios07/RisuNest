@@ -1969,7 +1969,11 @@ fn insert_messages(
             start + offset as i64,
             message_id,
             serde_json::to_string(message)?,
-            risunest_sync_wire::hash(&canonical),
+            {
+                #[cfg(test)]
+                crate::persistent_store::hash_work::observe("native_message_insert", canonical.len());
+                risunest_sync_wire::hash(&canonical)
+            },
             canonical.len() as i64,
         ])?;
     }

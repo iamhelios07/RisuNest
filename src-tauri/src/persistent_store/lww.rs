@@ -412,14 +412,24 @@ fn count_work() {
     });
 }
 fn value_identity(value: &UnitValue) -> StoreResult<String> {
-    wire(value.validate())?;
+    wire({
+        let result = value.validate();
+        #[cfg(test)]
+        crate::persistent_store::hash_work::validation(&value);
+        result
+    })?;
     let bytes = wire(risunest_sync_wire::canonical::encode(value))?;
     #[cfg(test)]
     WORK.with(|v| {
         let (u, b) = v.get();
         v.set((u, b + bytes.len() as u64));
     });
-    Ok(risunest_sync_wire::hash(&bytes))
+    Ok({
+        let hash_input = &bytes;
+        #[cfg(test)]
+        crate::persistent_store::hash_work::observe("native_unit_envelope", hash_input.len());
+        risunest_sync_wire::hash(hash_input)
+    })
 }
 pub(super) fn record_changes(
     tx: &Transaction<'_>,
@@ -462,7 +472,12 @@ impl PersistentStore {
         };
         let mut body = Vec::new();
         file.read_to_end(&mut body)?;
-        if risunest_sync_wire::hash(&body) != hash {
+        if {
+            let hash_input = &body;
+            #[cfg(test)]
+            crate::persistent_store::hash_work::observe("native_object_verify", hash_input.len());
+            risunest_sync_wire::hash(hash_input)
+        } != hash {
             return Err(error("object-hash-mismatch"));
         }
         Ok(Some(body))
@@ -471,7 +486,12 @@ impl PersistentStore {
         super::message_pages::put_object(&self.connection, hash, body)
     }
     pub(crate) fn lww_put_managed_object(&mut self, hash: &str, body: &[u8]) -> StoreResult<()> {
-        if risunest_sync_wire::hash(body) != hash {
+        if {
+            let hash_input = body;
+            #[cfg(test)]
+            crate::persistent_store::hash_work::observe("native_object_verify", hash_input.len());
+            risunest_sync_wire::hash(hash_input)
+        } != hash {
             return Err(error("object-hash-mismatch"));
         }
         let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
@@ -519,7 +539,12 @@ impl PersistentStore {
     fn reserve_intent(&mut self, header: &Header, intent: &Intent) -> StoreResult<(Stamp, String)> {
         validate_header(header)?;
         let body = serde_json::to_string(intent)?;
-        let digest = risunest_sync_wire::hash(body.as_bytes());
+        let digest = {
+            let hash_input = body.as_bytes();
+            #[cfg(test)]
+            crate::persistent_store::hash_work::observe("native_intent", hash_input.len());
+            risunest_sync_wire::hash(hash_input)
+        };
         let tx = self.device_store_mut()?.transaction()?;
         verify(&tx, header.binding_authority)?;
         let previous: Option<(String, String)> = tx
@@ -566,7 +591,12 @@ impl PersistentStore {
         header: &Header,
         intent: &Intent,
     ) -> StoreResult<Option<RevisionResult>> {
-        let digest = risunest_sync_wire::hash(serde_json::to_string(intent)?.as_bytes());
+        let digest = {
+            let hash_input = serde_json::to_string(intent)?;
+            #[cfg(test)]
+            crate::persistent_store::hash_work::observe("native_intent", hash_input.len());
+            risunest_sync_wire::hash(hash_input.as_bytes())
+        };
         let row: Option<(String, String, bool)> = self
             .device_store()?
             .connection()
@@ -1054,7 +1084,12 @@ impl PersistentStore {
         let mut keys = BTreeSet::new();
         for change in &request.changes {
             wire(change.stamp.validate())?;
-            wire(change.value.validate())?;
+            wire({
+                let result = change.value.validate();
+                #[cfg(test)]
+                crate::persistent_store::hash_work::validation(&change.value);
+                result
+            })?;
             if !keys.insert(&change.key) {
                 return Err(error("duplicate-receive-key"));
             }
@@ -1069,17 +1104,27 @@ impl PersistentStore {
                 },
                 &change.key,
             )? {
-                wire(compare_version(
-                    &stamp,
-                    &value,
-                    &change.stamp,
-                    &change.value,
-                ))?;
+                wire({
+                    let result = compare_version(
+                        &stamp,
+                        &value,
+                        &change.stamp,
+                        &change.value,
+                    );
+                    #[cfg(test)]
+                    crate::persistent_store::hash_work::comparison(&value, &change.value, &result);
+                    result
+                })?;
             }
             projection::validate_received(&self.connection, &change.key, &change.value)?;
         }
         let body = serde_json::to_string(request)?;
-        let digest = risunest_sync_wire::hash(body.as_bytes());
+        let digest = {
+            let hash_input = body.as_bytes();
+            #[cfg(test)]
+            crate::persistent_store::hash_work::observe("native_receive_intent", hash_input.len());
+            risunest_sync_wire::hash(hash_input)
+        };
         let tx = self.device_store_mut()?.transaction()?;
         verify(&tx, request.header.binding_authority)?;
         let old: Option<String> = tx
@@ -1180,12 +1225,17 @@ impl PersistentStore {
                 continue;
             }
             if let Some((stamp, value)) = read_unit(&self.connection, &change.key)? {
-                if wire(compare_version(
-                    &stamp,
-                    &value,
-                    &change.stamp,
-                    &change.value,
-                ))? != LwwDecision::ApplyRemote
+                if wire({
+                    let result = compare_version(
+                        &stamp,
+                        &value,
+                        &change.stamp,
+                        &change.value,
+                    );
+                    #[cfg(test)]
+                    crate::persistent_store::hash_work::comparison(&value, &change.value, &result);
+                    result
+                })? != LwwDecision::ApplyRemote
                 {
                     continue;
                 }
@@ -1208,7 +1258,12 @@ impl PersistentStore {
                 request_id: format!(
                     "archive-transition:{}:{}",
                     staged.header.request_id,
-                    risunest_sync_wire::hash(change.key.as_str().as_bytes())
+                    {
+                        let hash_input = change.key.as_str().as_bytes();
+                        #[cfg(test)]
+                        crate::persistent_store::hash_work::observe("native_archive", hash_input.len());
+                        risunest_sync_wire::hash(hash_input)
+                    }
                 ),
             };
             let expected_revision = self.revision()?;
@@ -1321,12 +1376,17 @@ impl PersistentStore {
                 let hard_delete = c[0] == "exists" && matches!(change.value, UnitValue::Deleted);
                 if status == "done" && (!retired || hard_delete) {
                     let decision = if let Some((stamp, value)) = read_unit(&tx, &change.key)? {
-                        wire(compare_version(
-                            &stamp,
-                            &value,
-                            &change.stamp,
-                            &change.value,
-                        ))?
+                        wire({
+                            let result = compare_version(
+                                &stamp,
+                                &value,
+                                &change.stamp,
+                                &change.value,
+                            );
+                            #[cfg(test)]
+                            crate::persistent_store::hash_work::comparison(&value, &change.value, &result);
+                            result
+                        })?
                     } else {
                         LwwDecision::ApplyRemote
                     };
@@ -1505,7 +1565,12 @@ impl PersistentStore {
                 p.key == entry.key
                     && p.version == entry.version
                     && p.stamp == entry.stamp
-                    && entry.value.identity().ok().as_ref() == Some(&p.value_identity)
+                    && {
+                        let result = entry.value.identity();
+                        #[cfg(test)]
+                        crate::persistent_store::hash_work::identity(&entry.value, &result);
+                        result
+                    }.ok().as_ref() == Some(&p.value_identity)
             }) {
                 return Err(error("unpublished-proof-incomplete"));
             }
@@ -1514,7 +1579,12 @@ impl PersistentStore {
             entries: entries.clone(),
         };
         let body = serde_json::to_string(&intent)?;
-        let digest = risunest_sync_wire::hash(body.as_bytes());
+        let digest = {
+            let hash_input = body.as_bytes();
+            #[cfg(test)]
+            crate::persistent_store::hash_work::observe("native_retry_intent", hash_input.len());
+            risunest_sync_wire::hash(hash_input)
+        };
         let tx = self.device_store_mut()?.transaction()?;
         verify(&tx, header.binding_authority)?;
         let stamp = wire(issue_stamp(
@@ -1661,7 +1731,12 @@ impl PersistentStore {
         let mut after = projection::capture_all(&mut self.connection, staging_id)?;
         if let Some(units) = source_units {
             for (key, value) in units {
-                wire(value.validate())?;
+                wire({
+                    let result = value.validate();
+                    #[cfg(test)]
+                    crate::persistent_store::hash_work::validation(&value);
+                    result
+                })?;
                 projection::validate_received(&self.connection, key, value)?;
                 after.insert(key.clone(), value.clone());
             }
@@ -1745,7 +1820,12 @@ impl PersistentStore {
         }
         verify(self.device_store()?.connection(), header.binding_authority)?;
         for c in changes {
-            wire(c.value.validate())?;
+            wire({
+                let result = c.value.validate();
+                #[cfg(test)]
+                crate::persistent_store::hash_work::validation(&c.value);
+                result
+            })?;
             wire(c.stamp.validate())?;
             projection::validate_received(&self.connection, &c.key, &c.value)?;
         }
@@ -2236,5 +2316,71 @@ impl PersistentStore {
             tx.commit()?;
         }
         Ok(page)
+    }
+}
+
+#[cfg(test)]
+mod hash_work_tests {
+    use super::*;
+    use crate::persistent_store::hash_work::{reset_hash_work, take_hash_work, DomainWork};
+
+    #[test]
+    fn envelope_bytes_alias_work_metrics_and_descriptor_validation_is_separate() {
+        let value = UnitValue::object(risunest_sync_wire::descriptor::RecordDescriptor::content("a".repeat(64))).unwrap();
+        let envelope = risunest_sync_wire::canonical::encode(&value).unwrap().len() as u64;
+        let UnitValue::Object { descriptor, .. } = &value else { unreachable!() };
+        let descriptor_bytes = descriptor.bytes().unwrap().len() as u64;
+        reset_hash_work(); reset_work_metrics();
+        value_identity(&value).unwrap();
+        let work = take_hash_work();
+        assert_eq!(work.domains["native_unit_envelope"], DomainWork { calls: 1, bytes: envelope });
+        assert_eq!(work.domains["native_wire_descriptor_validation"], DomainWork { calls: 1, bytes: descriptor_bytes });
+        assert!(!work.domains.contains_key("native_wire_identity"));
+        assert!(work.incomplete.is_empty());
+        assert_eq!(take_work_metrics(), (0, envelope));
+        reset_hash_work();
+        value_identity(&UnitValue::Deleted).unwrap();
+        assert!(!take_hash_work().domains.contains_key("native_wire_descriptor_validation"));
+    }
+
+    #[test]
+    fn routine_commit_does_not_hash_binding_proofs() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let key = UnitKey::new(&["toggle", "synthetic-counter"]).unwrap();
+        for value in [true, false] {
+            reset_hash_work();
+            store.commit(&crate::persistent_store::WorkingSetCommit {
+                expected_revision: store.revision().unwrap(),
+                unit_mutations: Some(vec![UnitMutation::Set { key: key.clone(), value: serde_json::json!(value) }]),
+                ..Default::default()
+            }).unwrap();
+            let work = take_hash_work();
+            assert!(work.incomplete.is_empty());
+            assert!(work.domains["native_intent"].calls > 0);
+            for domain in ["binding_source_proof", "binding_status_proof", "binding_catalog_proof", "binding_stage_proof"] {
+                assert!(!work.domains.contains_key(domain));
+            }
+        }
+    }
+
+    #[test]
+    fn equal_stamp_conflict_counts_both_executed_comparison_identities() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let key = UnitKey::new(&["future", "counter"]).unwrap();
+        let stamp = Stamp { physical_ms: 7.into(), logical: 0, writer_id: "00000000-0000-4000-8000-000000000001".into() };
+        let local = inline(&serde_json::json!("local")).unwrap();
+        let remote = inline(&serde_json::json!("remote")).unwrap();
+        put_unit(&store.connection, &key, &stamp, &local, "prior", None).unwrap();
+        let bytes = [local.clone(),remote.clone()].iter().map(|value| risunest_sync_wire::canonical::encode(value).unwrap().len() as u64).sum();
+        reset_hash_work();
+        let request = StageReceive { header: Header { binding_authority: store.lww_binding_authority().unwrap(), request_id: uuid::Uuid::new_v4().to_string() },
+            changes: vec![Change { key, stamp, value: remote }], progress: Progress { kind: "server".into(), cursor: 1.into(), writer_id: None }, admitted_time_upper_ms: 10.into() };
+        assert!(store.lww_stage_receive(&request).is_err());
+        let work = take_hash_work();
+        assert_eq!(work.domains["native_wire_identity"], DomainWork { calls: 2, bytes });
+        assert!(work.incomplete.is_empty());
+        assert!(!work.domains.contains_key("native_receive_intent"));
     }
 }

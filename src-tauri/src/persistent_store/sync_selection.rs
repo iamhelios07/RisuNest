@@ -592,7 +592,12 @@ impl super::PersistentStore {
         self.prepare_replace_commit(staging_id, None)?;
         for change in changes {
             change.stamp.validate().map_err(|e| invalid(&e.to_string()))?;
-            change.value.validate().map_err(|e| invalid(&e.to_string()))?;
+            {
+                let result = change.value.validate();
+                #[cfg(test)]
+                crate::persistent_store::hash_work::validation(&change.value);
+                result
+            }.map_err(|e| invalid(&e.to_string()))?;
         }
         let encoded = serde_json::to_string(changes)?;
         let existing: Option<(String,String,String)> = self.connection.query_row("SELECT inspection_id,receive_id,changes FROM lww_binding_stages WHERE staging_id=?1", [staging_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
@@ -691,7 +696,10 @@ pub(crate) fn binding_stage_digest(db: &Connection, staging_id: &str) -> StoreRe
     let value = super::query::materialize_target(db, &target)?;
     let aliases = super::query::list_asset_aliases(db, &target)?.value;
     let owners = super::query::list_asset_owner_heads(db, &target)?.value;
-    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&(value,aliases,owners))?)))
+    let bytes = serde_json::to_vec(&(value,aliases,owners))?;
+    #[cfg(test)]
+    crate::persistent_store::hash_work::observe("binding_stage_proof", bytes.len());
+    Ok(hex::encode(Sha256::digest(&bytes)))
 }
 
 pub(crate) fn validate_binding_stage_content(db: &Connection, staging_id: &str) -> StoreResult<()> {

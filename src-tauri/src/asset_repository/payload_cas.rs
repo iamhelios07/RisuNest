@@ -181,6 +181,8 @@ impl PayloadCas {
             return collision_or_corruption(expected_hash);
         }
         let mut hash = Sha256::new();
+        #[cfg(test)]
+        crate::persistent_store::hash_work::begin("cas_import_adopt");
         let mut buffer = [0_u8; COPY_BUFFER_BYTES];
         loop {
             if cancelled() {
@@ -191,6 +193,8 @@ impl PayloadCas {
                 break;
             }
             hash.update(&buffer[..length]);
+            #[cfg(test)]
+            crate::persistent_store::hash_work::update("cas_import_adopt", length);
         }
         if hex::encode(hash.finalize()) != expected_hash || exact_file_identity(&file)? != identity
         {
@@ -289,6 +293,8 @@ impl PayloadCas {
         let staging_path = staging_directory.join(format!("{}.tmp", uuid::Uuid::new_v4()));
         let (mut file, staging) = create_staging_file(&staging_path, &staging_directory)?;
         let mut hasher = Sha256::new();
+        #[cfg(test)]
+        crate::persistent_store::hash_work::begin("cas_stage");
         let mut byte_size = 0_u64;
         let mut buffer = [0_u8; COPY_BUFFER_BYTES];
         loop {
@@ -298,6 +304,8 @@ impl PayloadCas {
             }
             file.write_all(&buffer[..read])?;
             hasher.update(&buffer[..read]);
+            #[cfg(test)]
+            crate::persistent_store::hash_work::update("cas_stage", read);
             byte_size = byte_size
                 .checked_add(read as u64)
                 .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "payload size overflow"))?;
@@ -874,6 +882,8 @@ fn collision_or_corruption<T>(physical_key: &str) -> io::Result<T> {
 
 fn hash_open_file(file: &mut File, cancelled: &dyn Fn() -> bool) -> io::Result<String> {
     let mut hasher = Sha256::new();
+    #[cfg(test)]
+    crate::persistent_store::hash_work::begin("cas_existing_verify");
     let mut buffer = [0_u8; COPY_BUFFER_BYTES];
     loop {
         if cancelled() {
@@ -884,6 +894,8 @@ fn hash_open_file(file: &mut File, cancelled: &dyn Fn() -> bool) -> io::Result<S
             break;
         }
         hasher.update(&buffer[..read]);
+        #[cfg(test)]
+        crate::persistent_store::hash_work::update("cas_existing_verify", read);
     }
     Ok(hex::encode(hasher.finalize()))
 }
@@ -1520,5 +1532,48 @@ mod tests {
         assert!(cas
             .holds_exact_object(&prepared.content_hash, prepared.byte_size, &|| false)
             .unwrap());
+    }
+}
+
+#[cfg(test)]
+mod hash_work_tests {
+    use super::*;
+    use crate::persistent_store::hash_work::{reset_hash_work, take_hash_work, DomainWork};
+
+    #[test]
+    fn stream_accounting_counts_only_executed_updates_on_read_failure() {
+        struct FailingReader { first: bool }
+        impl Read for FailingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                if !self.first { return Err(io::Error::other("synthetic failure")); }
+                self.first = false; buffer[..7].copy_from_slice(b"partial"); Ok(7)
+            }
+        }
+        let directory = tempfile::tempdir().unwrap(); let cas = PayloadCas::new(directory.path()).unwrap();
+        reset_hash_work();
+        assert!(cas.prepare_reader(&mut FailingReader { first: true }).is_err());
+        let work = take_hash_work();
+        assert_eq!(work.domains["cas_stage"], DomainWork { calls: 1, bytes: 7 });
+        assert!(work.incomplete.is_empty());
+    }
+
+    #[test]
+    fn adoption_and_existing_file_verification_are_separate_hash_passes() {
+        let directory = tempfile::tempdir().unwrap(); let cas = PayloadCas::new(directory.path()).unwrap();
+        let staging = directory.path().join("native-file-jobs/jobs/synthetic"); fs::create_dir_all(&staging).unwrap();
+        let path = staging.join("body.payload"); let bytes = vec![7; COPY_BUFFER_BYTES + 13]; fs::write(&path, &bytes).unwrap();
+        let expected = hex::encode(Sha256::digest(&bytes));
+        reset_hash_work();
+        let prepared = cas.adopt_import_payload(&path, &expected, bytes.len() as u64, &|| false).unwrap();
+        let work = take_hash_work();
+        assert_eq!(work.domains["cas_import_adopt"], DomainWork { calls: 1, bytes: bytes.len() as u64 });
+        assert!(!work.domains.contains_key("cas_stage"));
+        let mut file = File::open(directory.path().join(&prepared.physical_key)).unwrap();
+        reset_hash_work();
+        hash_open_file(&mut file, &|| false).unwrap();
+        assert_eq!(take_hash_work().domains["cas_existing_verify"], DomainWork { calls: 1, bytes: bytes.len() as u64 });
+        reset_hash_work();
+        cas.stat_object(&expected).unwrap();
+        assert!(take_hash_work().domains.is_empty());
     }
 }

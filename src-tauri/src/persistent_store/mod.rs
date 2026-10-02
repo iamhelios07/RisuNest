@@ -5,6 +5,8 @@ pub(crate) mod commands;
 pub(crate) mod commit;
 pub(crate) mod content_capture;
 mod message_pages;
+#[cfg(test)]
+pub(crate) mod hash_work;
 pub(crate) mod content_change_index;
 pub(crate) mod lww;
 mod upstream_identity;
