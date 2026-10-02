@@ -145,18 +145,74 @@ fn crash_retry_uses_exact_ciphertext_nonce_sequence_and_capture() {
                 .unwrap();
         assert!(pending.dispatched);
         assert_eq!(f.provider.contents(&pending.object_id).unwrap(), sealed);
-        set(&mut f.a, &["root", "language"], serde_json::json!("new"));
         f.a = PersistentStore::open(f.directory_a.path()).unwrap();
-        assert_eq!(f.publish_a().await.segments.0, 2);
+        let header = crate::persistent_store::lww::Header {
+            binding_authority: 0.into(),
+            request_id: "initial-requeue-after-response-loss".into(),
+        };
+        f.a.lww_queue_unit_state_page(&header, None, 4096).unwrap();
+        assert_eq!(f.publish_a().await.segments.0, 1);
+        assert_eq!(f.provider.upload_attempts(&pending.object_id), 1);
+        assert_eq!(f.provider.uploaded_ids(), vec![pending.object_id.clone()]);
+        assert_eq!(f.provider.contents(&pending.object_id).unwrap(), sealed);
+        assert!(f
+            .a
+            .lww_read_outbox(0.into(), 4096)
+            .unwrap()
+            .entries
+            .is_empty());
+        assert_eq!(
+            f.a.external_lww_next_sequence(&f.sender.target_scope(), &writer)
+                .unwrap(),
+            2
+        );
+        f.a.lww_queue_unit_state_page(&header, None, 4096).unwrap();
+        assert!(f
+            .a
+            .lww_read_outbox(0.into(), 4096)
+            .unwrap()
+            .entries
+            .is_empty());
+        assert_eq!(f.publish_a().await.segments.0, 0);
+        assert_eq!(f.provider.uploaded_ids(), vec![pending.object_id.clone()]);
+        set(&mut f.a, &["root", "language"], serde_json::json!("new"));
+        f.provider.state.lock().unwrap().lose_response = true;
+        assert!(f
+            .sender
+            .publish(&mut f.a, 0.into(), &[], &Cancellation::default())
+            .await
+            .is_err());
+        let (later_pending, later_sealed) =
+            f.a.external_lww_pending(&f.sender.target_scope(), &writer)
+                .unwrap()
+                .unwrap();
+        set(&mut f.a, &["root", "language"], serde_json::json!("newer"));
+        f.a = PersistentStore::open(f.directory_a.path()).unwrap();
+        f.a.lww_queue_unit_state_page(&header, None, 4096).unwrap();
+        let newer = f.a.lww_read_outbox(0.into(), 4096).unwrap().entries;
+        f.provider
+            .fail_upload_number(f.provider.upload_count() + 1, ErrorKind::Transient);
+        assert!(f
+            .sender
+            .publish(&mut f.a, 0.into(), &[], &Cancellation::default())
+            .await
+            .is_err());
+        assert_eq!(f.a.lww_read_outbox(0.into(), 4096).unwrap().entries, newer);
+        assert_eq!(f.provider.upload_attempts(&later_pending.object_id), 1);
+        assert_eq!(
+            f.provider.contents(&later_pending.object_id).unwrap(),
+            later_sealed
+        );
+        assert_eq!(f.publish_a().await.segments.0, 1);
         assert_eq!(f.provider.upload_attempts(&pending.object_id), 1);
         assert_eq!(f.provider.contents(&pending.object_id).unwrap(), sealed);
         assert_eq!(
             f.a.external_lww_next_sequence(&f.sender.target_scope(), &writer)
                 .unwrap(),
-            3
+            4
         );
         f.receive_b().await;
-        assert_eq!(f.b.read_root(None).unwrap().value["language"], "new");
+        assert_eq!(f.b.read_root(None).unwrap().value["language"], "newer");
     })
 }
 #[test]
@@ -745,6 +801,35 @@ fn delegated_hash_observations_count_real_wire_invocations_without_rehashing() {
         )
     );
     assert_eq!(lww_segment::take_hash_bytes(), 0);
+}
+#[test]
+fn production_cycle_reports_disjoint_native_and_transport_hash_work() {
+    run(async {
+        let mut fixture = CycleFixture::new();
+        crate::persistent_store::hash_work::reset_hash_work();
+        lww_segment::reset_hash_bytes();
+        lww_segment::reset_delegated_hash_work();
+        set(
+            &mut fixture.a,
+            &["root", "language"],
+            serde_json::json!("counter"),
+        );
+        fixture.publish_a().await;
+        fixture.receive_b().await;
+        let native = crate::persistent_store::hash_work::take_hash_work();
+        assert!(native.incomplete.is_empty());
+        assert!(native.domains["native_unit_envelope"].calls > 0);
+        assert!(lww_segment::take_hash_bytes() > 0);
+        assert!(lww_segment::take_hash_calls() > 0);
+        let delegated = lww_segment::take_delegated_hash_work();
+        assert!(delegated["publish-ack.identity"].0 > 0);
+        assert!(delegated["receive-history.identity"].0 > 0);
+        assert!(!native.domains.contains_key("publish-ack.identity"));
+        assert_eq!(
+            fixture.b.read_root(None).unwrap().value["language"],
+            "counter"
+        );
+    });
 }
 
 #[test]
