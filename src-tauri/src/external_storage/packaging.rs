@@ -3420,13 +3420,6 @@ pub(crate) async fn package_and_upload_asset_catalog(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn revalidate_control_catalog(
-    catalog:&wire::StoredObject,_repository_root:&Path,_cache_root:&Path,root_key:&[u8;32],
-    _journal:&mut TransferJournal,provider:&dyn Provider,repository:&RepositoryHandle,cancel:&Cancellation,
-) -> Result<()> {
-    super::snapshot_restore::revalidate_control_catalog(catalog,root_key,provider,repository,cancel).await
-}
-
 pub(crate) async fn package_and_upload_control_catalog(
     sources:Vec<AssetCatalogSource>,repository_root:&Path,cache_root:&Path,
     root_key:&[u8;32],limits:PackageLimits,journal:&mut TransferJournal,
@@ -5278,15 +5271,15 @@ mod tests {
             assert!(snapshot_restore::read_catalog(&remote,wire::CatalogKind::Assets,&key,&root.path().join("wrong-kind"),&provider,&repository,&Cancellation::default()).await.is_err());
             let packs=completed.referenced.iter().filter(|object|object.role==ObjectRole::Pack).collect::<Vec<_>>();
             let reads=packs.iter().map(|pack|provider.read_attempts(&pack.receipt.locator.object)).collect::<Vec<_>>();
-            revalidate_control_catalog(&completed.catalog,root.path(),&root.path().join("data-cache"),&key,&mut transfer,&provider,&repository,&Cancellation::default()).await.unwrap();
+            snapshot_restore::revalidate_control_catalog(&completed.catalog,&key,&provider,&repository,&Cancellation::default()).await.unwrap();
             for (pack,reads) in packs.iter().zip(reads) {assert!(provider.read_attempts(&pack.receipt.locator.object)>reads,"aged proof authenticates every required pack despite local controls");}
             let pack=packs[0];let name=&pack.receipt.locator.object;
             let uploads=provider.upload_attempts(&pack.object_id);
             let mut damaged=provider.state.lock().unwrap().objects[name].0.clone();let last=damaged.len()-1;damaged[last]^=1;
             provider.seed(name,ObjectRole::Pack,damaged);
-            assert_eq!(revalidate_control_catalog(&completed.catalog,root.path(),&root.path().join("data-cache"),&key,&mut transfer,&provider,&repository,&Cancellation::default()).await.unwrap_err().kind,ErrorKind::Corrupt);
+            assert_eq!(snapshot_restore::revalidate_control_catalog(&completed.catalog,&key,&provider,&repository,&Cancellation::default()).await.unwrap_err().kind,ErrorKind::Corrupt);
             provider.forget(name);
-            assert_eq!(revalidate_control_catalog(&completed.catalog,root.path(),&root.path().join("data-cache"),&key,&mut transfer,&provider,&repository,&Cancellation::default()).await.unwrap_err().kind,ErrorKind::NotFound);
+            assert_eq!(snapshot_restore::revalidate_control_catalog(&completed.catalog,&key,&provider,&repository,&Cancellation::default()).await.unwrap_err().kind,ErrorKind::NotFound);
             assert_eq!(provider.upload_attempts(&pack.object_id),uploads,"aged immutable verification never repairs or replaces the captured source");
         });
     }
