@@ -28,11 +28,12 @@ pub(crate) struct HeldAssetTransfer {
     pub held: std::sync::atomic::AtomicBool,
     pub fail_pack_after: std::sync::atomic::AtomicUsize,
     pub attempts: std::sync::Mutex<Vec<ObjectIntent>>,
+    pub before_lease: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 impl HeldAssetTransfer {
     pub(crate) fn new(inner: Arc<FakeProvider>) -> Arc<Self> {
         Arc::new(Self { inner, entered: Default::default(), resume: Default::default(),
-            lose_pack_response: false.into(), cancel_after_pack_loss: false.into(), held: true.into(), fail_pack_after: 0.into(), attempts: Default::default() })
+            lose_pack_response: false.into(), cancel_after_pack_loss: false.into(), held: true.into(), fail_pack_after: 0.into(), attempts: Default::default(), before_lease: Default::default() })
     }
 }
 impl Provider for HeldAssetTransfer {
@@ -45,6 +46,10 @@ impl Provider for HeldAssetTransfer {
     fn create_object<'a>(&'a self, repository: &'a RepositoryHandle, intent: &'a ObjectIntent, source: &'a dyn TransferSource, resume: Option<&'a ResumeState>, cancel: &'a Cancellation)
         -> ProviderFuture<'a, ObjectReceipt> {
         Box::pin(async move {
+            if intent.role == ObjectRole::Lease {
+                let action = self.before_lease.lock().unwrap().take();
+                if let Some(action) = action { action(); }
+            }
             let mut lost = false;
             if intent.role == ObjectRole::Pack {
                 let attempted = { let mut attempts = self.attempts.lock().unwrap(); attempts.push(intent.clone()); attempts.len() };
@@ -285,7 +290,7 @@ fn packed_asset_uncertainty_reopens_frozen_job_and_keeps_original_pack_bytes() {
         let writer = f.a.lww_clock_state().unwrap().writer_id;
         let (pending, segment_bytes) = f.a.external_lww_pending(&f.sender.target_scope(), &writer).unwrap().unwrap();
         assert!(!pending.sealed); assert!(segment_bytes.is_empty());
-        assert_eq!(pending.assets, vec![crate::persistent_store::external_lww::FrozenAsset { content_hash: hash.clone(), byte_length: body.len() as u64, local_pin: true, remote_source: None }]);
+        assert_eq!(pending.assets, vec![crate::persistent_store::external_lww::FrozenAsset { content_hash: hash.clone(), byte_length: body.len() as u64, local_pin: true, remote_source: None, server_source: None }]);
         let original_job = pending.asset_job.clone().unwrap();
         let original_intent = held.attempts.lock().unwrap()[0].clone();
         let original_ciphertext = f.provider.contents(&original_intent.object_id).unwrap();
@@ -304,6 +309,93 @@ fn packed_asset_uncertainty_reopens_frozen_job_and_keeps_original_pack_bytes() {
         assert!(!f.b.external_lww_object_is_local(&hash).unwrap());
         assert_eq!(super::lww_residency::stat(f.directory_b.path(), &hash).unwrap(), Some(body.len() as u64));
     });
+}
+
+#[test]
+fn server_held_publication_keeps_captured_source_and_rejects_changed_authority() {
+    use crate::server_sync::{lww_tests::LocalServerFixture, residency::{AssetPolicy, Residency}};
+    for large in [false, true] {
+        for stale in [false, true] {
+            let mut f = CycleFixture::new();
+            let server = LocalServerFixture::new();
+            let core = server.client(&f.a);
+            let body = vec![67; if large { 5 * 1024 * 1024 } else { 96 * 1024 }];
+            let hash = small_asset(&mut f.a, "synthetic-server-frozen", &body);
+            crate::server_sync::lww_tests::drain_publications(&core, &mut f.a, &[]).unwrap();
+            f.a.asset_residency_set_policy(AssetPolicy::Remote, || Ok(())).unwrap();
+            f.a.asset_residency_evict(|| Ok(())).unwrap();
+            assert!(!f.a.external_lww_object_is_local(&hash).unwrap());
+            let original = Residency::open(f.directory_a.path()).unwrap().object(&hash, None).unwrap().unwrap();
+            let alias = crate::persistent_store::AssetAlias { key: "synthetic-server-frozen".into(),
+                object_hash: Some(hash.clone()), kind: "asset".into(), size: body.len() as i64,
+                mime: "application/octet-stream".into(), name: "Synthetic changed alias".into(), ext: "bin".into(),
+                inlay_type: None, width: None, height: None, metadata: serde_json::json!({}) };
+            f.a.commit_asset_alias(&alias, f.a.revision().unwrap()).unwrap();
+            let original_pending = f.a.lww_read_outbox(0.into(), 100).unwrap().entries;
+            assert_eq!(original_pending.len(), 1);
+            let held = HeldAssetTransfer::new(f.provider.clone());
+            held.held.store(false, std::sync::atomic::Ordering::SeqCst);
+            let root = f.directory_a.path().to_owned();
+            let target_scope = f.sender.target_scope();
+            let writer = f.a.lww_clock_state().unwrap().writer_id;
+            let source_hash = hash.clone();
+            let original_metadata = serde_json::to_value(&original).unwrap();
+            let mut changed_config = original.config.clone();
+            changed_config.endpoint = format!("{}/changed-source", server.endpoint);
+            let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reached_callback = reached.clone();
+            *held.before_lease.lock().unwrap() = Some(Box::new(move || {
+                let mut store = PersistentStore::open(&root).unwrap();
+                let (capture, bytes) = store.external_lww_pending(&target_scope, &writer).unwrap().unwrap();
+                assert!(!capture.sealed);
+                let asset = capture.assets.iter().find(|asset| asset.content_hash == source_hash).unwrap();
+                assert!(!asset.local_pin && asset.remote_source.is_none());
+                assert_eq!(serde_json::to_value(asset.server_source.as_ref().unwrap()).unwrap(), original_metadata);
+                let mut altered_capture = capture.clone();
+                altered_capture.assets[0].server_source.as_mut().unwrap().context.push('x');
+                assert!(store.external_lww_persist(&altered_capture, &bytes).is_err());
+                Residency::open(&root).unwrap().replace_access_config(&changed_config).unwrap();
+                assert_ne!(serde_json::to_value(Residency::open(&root).unwrap().object(&source_hash, None).unwrap().unwrap()).unwrap(), original_metadata);
+                if stale {
+                    let state = store.lww_binding_state().unwrap();
+                    let target = crate::persistent_store::sync_selection::SyncTarget::External("changed-source-target".into());
+                    let inspection = store.register_lww_binding_inspection(state.target_authority, &target, "synthetic-next-repository", "synthetic-next-library").unwrap();
+                    store.switch_lww_binding(&crate::persistent_store::sync_selection::SwitchBindingRequest {
+                        header: crate::persistent_store::lww::Header { binding_authority: state.target_authority, request_id: "frozen-source-authority".into() },
+                        expected_selection_epoch: state.selection_epoch, target, inspection_id: Some(inspection),
+                    }).unwrap();
+                }
+                reached_callback.store(true, std::sync::atomic::Ordering::SeqCst);
+            }));
+            f.sender.provider = held.clone();
+            crate::server_sync::hash_metrics::reset_hash_metrics();
+            super::worker_observation::begin();
+            let result = run(f.sender.publish(&mut f.a, 0.into(), &[], &Cancellation::default()));
+            let workers = super::worker_observation::take();
+            let server_hashes = crate::server_sync::hash_metrics::take_hash_metrics();
+            assert!(reached.load(std::sync::atomic::Ordering::SeqCst));
+            let segments = f.provider.uploaded_ids().iter().filter(|id| parse_segment_object_id(id).is_ok()).count();
+            if stale {
+                assert_eq!(result.err().expect("changed authority must reject publication").kind, ErrorKind::PreconditionFailed);
+                assert_eq!(segments, 0); assert!(held.attempts.lock().unwrap().is_empty());
+                let writer = f.a.lww_clock_state().unwrap().writer_id;
+                let pending = f.a.external_lww_pending(&f.sender.target_scope(), &writer).unwrap().unwrap().0;
+                assert_eq!(pending.entries, original_pending);
+                assert!(!pending.sealed && !pending.dispatched && pending.bodies.iter().all(|body| body.bytes.is_empty()));
+                assert_eq!(f.a.external_lww_next_sequence(&f.sender.target_scope(), &writer).unwrap(), 1);
+            } else {
+                assert!(!workers.is_empty());
+                assert!(workers.iter().all(|worker| worker.completed && worker.hashes.incomplete.is_empty()));
+                assert!(!server_hashes.incomplete);
+                assert!(server_hashes.domains["c_cache_stream_verify"].bytes >= body.len() as u64);
+                assert_eq!(result.unwrap().segments.0, 1); assert_eq!(segments, 1);
+                assert!(f.a.lww_read_outbox(0.into(), 100).unwrap().entries.is_empty());
+                assert!(!f.a.external_lww_object_is_local(&hash).unwrap());
+                run(f.receiver.receive_and_apply(&mut f.b, 0.into(), &[], &Cancellation::default())).unwrap();
+                assert_eq!(super::lww_residency::stat(f.directory_b.path(), &hash).unwrap(), Some(body.len() as u64));
+            }
+        }
+    }
 }
 
 #[test]
@@ -346,17 +438,24 @@ fn checkpoint_uses_only_published_units_and_restores_after_segment_retirement() 
         let (_,snapshot)=f.sender.checkpoint(&snapshots[0],&Cancellation::default()).await.unwrap();
         assert_eq!(snapshot.covered_prefixes.values().next().unwrap().0,1);
         let backup_id="00000000-0000-4000-8000-000000000096";
+        // This input exercises metadata classification; its copied catalogs are not restored.
+        let mut backup_library=snapshot.library.clone();
+        for object in [&mut backup_library.record_catalog,&mut backup_library.asset_catalog] {
+            object.header.repository_id=f.sender.descriptor.repository_id.clone();
+            object.ciphertext_length=risunest_external_storage_format::snapshot::envelope_length(&object.header).unwrap();
+        }
+        let original_units=backup_library.record_catalog.clone();
         let backup=risunest_external_storage_format::control::BackupBundleDocument::new(
-            f.sender.repository.repository_id.clone(),backup_id.into(),
+            f.sender.descriptor.repository_id.clone(),backup_id.into(),
             risunest_external_storage_format::control::BundleSource::Device{writer_id:f.a.lww_clock_state().unwrap().writer_id},
             super::runtime::now_ms(),Some(risunest_sync_wire::head::Sequence::from(0u64)),None,None,
-            snapshot.library.clone(),std::collections::BTreeMap::new(),
-            Some(snapshot.library.record_catalog.clone()),
+            backup_library,std::collections::BTreeMap::new(),
+            Some(original_units),
         ).unwrap();
         let backup_plain=backup.encode(risunest_external_storage_format::snapshot::MAX_METADATA_BYTES).unwrap();
         let backup_object=format!("snapshot-{backup_id}");
-        let header=risunest_external_storage_format::snapshot::PublicObjectHeader::new(f.sender.repository.repository_id.clone(),backup_object.clone(),risunest_external_storage_format::snapshot::ObjectRole::BackupBundle,backup_plain.len() as u64).unwrap();
-        let key=risunest_external_storage_format::crypto::derive_key(&[7;32],&f.sender.repository.repository_id,"metadata").unwrap();
+        let header=risunest_external_storage_format::snapshot::PublicObjectHeader::new(f.sender.descriptor.repository_id.clone(),backup_object.clone(),risunest_external_storage_format::snapshot::ObjectRole::BackupBundle,backup_plain.len() as u64).unwrap();
+        let key=risunest_external_storage_format::crypto::derive_key(&[7;32],&f.sender.descriptor.repository_id,"metadata").unwrap();
         let mut sealed=Vec::new();risunest_external_storage_format::snapshot::seal_envelope(&mut std::io::Cursor::new(backup_plain),&mut sealed,&key,&header).unwrap();
         f.provider.seed(&backup_object,ObjectRole::BackupBundle,sealed);
         assert_eq!(f.sender.snapshot_listing(&Cancellation::default()).await.unwrap().len(),1);

@@ -161,6 +161,14 @@ pub(crate) fn hash_backup_body(bytes:&[u8], domain:&'static str) -> String {
     risunest_sync_wire::hash(bytes)
 }
 
+pub(crate) fn published_json_asset_roots(bytes:&[u8])->StoreResult<crate::asset_repository::migration_gc::AssetRootSet> {
+    if bytes.len()>risunest_sync_wire::MAX_METADATA_BYTES {return Err(invalid("Published metadata exceeds its bound"))}
+    let value:serde_json::Value=serde_json::from_slice(bytes)?;
+    let mut roots=crate::asset_repository::migration_gc::AssetRootSet::default();
+    super::snapshot::observe_json_value(&value,None,&mut roots);
+    Ok(roots)
+}
+
 pub(crate) fn original_unit_dependency_inventory(
     units: &BTreeMap<risunest_sync_wire::unit::UnitKey,risunest_sync_wire::unit::UnitValue>,
     read_body: &dyn Fn(&str) -> StoreResult<Option<Vec<u8>>>,

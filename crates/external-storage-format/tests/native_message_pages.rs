@@ -35,6 +35,19 @@ pub(crate) mod native_hash_work;
 mod persistent_store {
     pub(crate) use crate::native_hash_work as hash_work;
 }
+mod lww {
+    // Copied-database acceptance needs the full native LWW store. This page
+    // fixture must reject any attempt to cross that unavailable boundary.
+    pub(crate) fn validate_received(
+        _db: &rusqlite::Connection,
+        _key: &risunest_sync_wire::unit::UnitKey,
+        _value: &risunest_sync_wire::unit::UnitValue,
+    ) -> super::StoreResult<()> {
+        Err(super::record_projection::codec_error(
+            "native LWW validation is unavailable in the isolated page fixture",
+        ))
+    }
+}
 #[path = "../../../src-tauri/src/persistent_store/message_pages.rs"]
 mod message_pages;
 

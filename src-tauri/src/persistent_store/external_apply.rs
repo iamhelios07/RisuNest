@@ -567,9 +567,6 @@ fn open_snapshot_input(
         ObjectSource::Library(_) => {
             return invalid("External snapshot library body is not an input");
         }
-        ObjectSource::Unchanged => {
-            return invalid("External snapshot record body was not fetched");
-        }
     };
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_file() || crate::trust_boundary::is_link_like(&metadata) {
