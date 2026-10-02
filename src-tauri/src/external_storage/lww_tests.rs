@@ -438,17 +438,24 @@ fn checkpoint_uses_only_published_units_and_restores_after_segment_retirement() 
         let (_,snapshot)=f.sender.checkpoint(&snapshots[0],&Cancellation::default()).await.unwrap();
         assert_eq!(snapshot.covered_prefixes.values().next().unwrap().0,1);
         let backup_id="00000000-0000-4000-8000-000000000096";
+        // This input exercises metadata classification; its copied catalogs are not restored.
+        let mut backup_library=snapshot.library.clone();
+        for object in [&mut backup_library.record_catalog,&mut backup_library.asset_catalog] {
+            object.header.repository_id=f.sender.descriptor.repository_id.clone();
+            object.ciphertext_length=risunest_external_storage_format::snapshot::envelope_length(&object.header).unwrap();
+        }
+        let original_units=backup_library.record_catalog.clone();
         let backup=risunest_external_storage_format::control::BackupBundleDocument::new(
-            f.sender.repository.repository_id.clone(),backup_id.into(),
+            f.sender.descriptor.repository_id.clone(),backup_id.into(),
             risunest_external_storage_format::control::BundleSource::Device{writer_id:f.a.lww_clock_state().unwrap().writer_id},
             super::runtime::now_ms(),Some(risunest_sync_wire::head::Sequence::from(0u64)),None,None,
-            snapshot.library.clone(),std::collections::BTreeMap::new(),
-            Some(snapshot.library.record_catalog.clone()),
+            backup_library,std::collections::BTreeMap::new(),
+            Some(original_units),
         ).unwrap();
         let backup_plain=backup.encode(risunest_external_storage_format::snapshot::MAX_METADATA_BYTES).unwrap();
         let backup_object=format!("snapshot-{backup_id}");
-        let header=risunest_external_storage_format::snapshot::PublicObjectHeader::new(f.sender.repository.repository_id.clone(),backup_object.clone(),risunest_external_storage_format::snapshot::ObjectRole::BackupBundle,backup_plain.len() as u64).unwrap();
-        let key=risunest_external_storage_format::crypto::derive_key(&[7;32],&f.sender.repository.repository_id,"metadata").unwrap();
+        let header=risunest_external_storage_format::snapshot::PublicObjectHeader::new(f.sender.descriptor.repository_id.clone(),backup_object.clone(),risunest_external_storage_format::snapshot::ObjectRole::BackupBundle,backup_plain.len() as u64).unwrap();
+        let key=risunest_external_storage_format::crypto::derive_key(&[7;32],&f.sender.descriptor.repository_id,"metadata").unwrap();
         let mut sealed=Vec::new();risunest_external_storage_format::snapshot::seal_envelope(&mut std::io::Cursor::new(backup_plain),&mut sealed,&key,&header).unwrap();
         f.provider.seed(&backup_object,ObjectRole::BackupBundle,sealed);
         assert_eq!(f.sender.snapshot_listing(&Cancellation::default()).await.unwrap().len(),1);

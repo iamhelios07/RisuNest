@@ -847,6 +847,17 @@ async fn open_listed_inventory_page(
     repository: &RepositoryHandle,
     cancel: &Cancellation,
 ) -> Result<ListedInventoryPage> {
+    open_listed_inventory_page_in_scope(receipt,descriptor,root_key,provider,repository,cancel,None).await
+}
+async fn open_listed_inventory_page_in_scope(
+    receipt: ObjectReceipt,
+    descriptor: &Descriptor,
+    root_key: &[u8; 32],
+    provider: &dyn Provider,
+    repository: &RepositoryHandle,
+    cancel: &Cancellation,
+    extra_repository_id:Option<&str>,
+) -> Result<ListedInventoryPage> {
     receipt.locator.validate_for(repository)?;
     if !receipt.complete || receipt.byte_length == 0 || receipt.byte_length > MAX_POINT_CIPHERTEXT {
         return Err(corrupt("invalid listed inventory page"));
@@ -861,6 +872,11 @@ async fn open_listed_inventory_page(
     )
     .await?;
     let bytes = bytes.ok_or_else(|| corrupt("listed inventory page was not downloaded"))?;
+    let (advertised,_)=wire::read_public_header(&mut Cursor::new(&bytes)).map_err(corrupt)?;
+    if advertised.role!=wire::ObjectRole::InventoryPage || (advertised.repository_id!=descriptor.repository_id
+        && extra_repository_id!=Some(advertised.repository_id.as_str())) {return Err(corrupt("inventory page repository differs"))}
+    let mut scoped=descriptor.clone();scoped.repository_id=advertised.repository_id;
+    let descriptor=&scoped;
     let (plaintext, header, plaintext_sha256, ciphertext_sha256) = open(
         descriptor,
         root_key,
@@ -895,6 +911,13 @@ pub(crate) async fn delete_authenticated_inventory_page(
     expected: &wire::StoredObject,
     cancel: &Cancellation,
 ) -> Result<RemoteInventoryPageDeleteOutcome> {
+    delete_authenticated_inventory_page_for_repository(connected,expected,&connected.stored.descriptor.repository_id,cancel).await
+}
+pub(crate) async fn delete_authenticated_inventory_page_for_repository(
+    connected:&super::connection_commands::ConnectedRepository,expected:&wire::StoredObject,repository_id:&str,cancel:&Cancellation,
+)->Result<RemoteInventoryPageDeleteOutcome> {
+    if expected.header.repository_id!=repository_id {return Err(corrupt("inventory page repository differs"))}
+    let mut descriptor=connected.stored.descriptor.clone();descriptor.repository_id=repository_id.into();
     if expected.header.role != wire::ObjectRole::InventoryPage
         || !expected.header.object_id.starts_with("inventory-page-")
     {
@@ -903,7 +926,7 @@ pub(crate) async fn delete_authenticated_inventory_page(
     let expected = RemoteObject::from_stored(expected, &connected.handle)?;
     let listed = match open_listed_inventory_page(
         expected.receipt.clone(),
-        &connected.stored.descriptor,
+        &descriptor,
         &connected.root_key,
         connected.provider.as_ref(),
         &connected.handle,
@@ -999,6 +1022,7 @@ pub(crate) async fn delete_authenticated_backup_point(
     Ok(RemoteBackupPointDeleteOutcome::Deleted)
 }
 
+#[cfg(test)]
 pub(crate) async fn list_inventory_pages_page(
     descriptor: &Descriptor,
     root_key: &[u8; 32],
@@ -1008,6 +1032,12 @@ pub(crate) async fn list_inventory_pages_page(
     limit: u16,
     cancel: &Cancellation,
 ) -> Result<InventoryPagePage> {
+    list_inventory_pages_page_in_scope(descriptor,root_key,provider,repository,cursor,limit,cancel,None).await
+}
+pub(crate) async fn list_inventory_pages_page_in_scope(
+    descriptor:&Descriptor,root_key:&[u8;32],provider:&dyn Provider,repository:&RepositoryHandle,
+    cursor:Option<&str>,limit:u16,cancel:&Cancellation,extra_repository_id:Option<&str>,
+)->Result<InventoryPagePage> {
     if limit == 0 || limit > 100 {
         return Err(corrupt("invalid inventory page limit"));
     }
@@ -1024,13 +1054,14 @@ pub(crate) async fn list_inventory_pages_page(
     for receipt in page.objects {
         cancel.check()?;
         pages.push(
-            open_listed_inventory_page(
+            open_listed_inventory_page_in_scope(
                 receipt,
                 descriptor,
                 root_key,
                 provider,
                 repository,
                 cancel,
+                extra_repository_id,
             )
             .await?,
         );
@@ -1110,8 +1141,13 @@ pub(crate) async fn read_catalog_children(
     node: &RemoteObject,
     cancel: &Cancellation,
 ) -> Result<Vec<RemoteObject>> {
-    let repository_id = &connected.stored.descriptor.repository_id;
-    if node.role != ObjectRole::Catalog || node.repository_id != *repository_id {
+    read_catalog_children_for_repository(connected,node,&connected.stored.descriptor.repository_id,cancel).await
+}
+pub(crate) async fn read_catalog_children_for_repository(
+    connected:&super::connection_commands::ConnectedRepository,node:&RemoteObject,repository_id:&str,cancel:&Cancellation,
+)->Result<Vec<RemoteObject>> {
+    let mut descriptor=connected.stored.descriptor.clone();descriptor.repository_id=repository_id.into();
+    if node.role != ObjectRole::Catalog || node.repository_id != repository_id {
         return Err(corrupt("invalid catalog node"));
     }
     node.stored(&connected.handle)?;
@@ -1126,7 +1162,7 @@ pub(crate) async fn read_catalog_children(
     .await?;
     let bytes = bytes.ok_or_else(|| corrupt("catalog node was not downloaded"))?;
     let (plaintext, _, plaintext_sha256, ciphertext_sha256) = open(
-        &connected.stored.descriptor,
+        &descriptor,
         &connected.root_key,
         Some(&node.object_id),
         wire::ObjectRole::Catalog,
