@@ -159,6 +159,26 @@ impl Store {
             uploads: count("uploads")?,
         })
     }
+    #[cfg(test)]
+    pub(crate) fn source_observer_body_work(
+        &self,
+    ) -> Result<crate::source_observer::PendingBodyWork> {
+        let db = self.reader()?;
+        let (upload_jobs,download_jobs,upload_sessions):(i64,i64,i64)=db.query_row(
+            "SELECT (SELECT count(*) FROM upload_jobs WHERE terminal=0), (SELECT count(*) FROM download_deltas WHERE state IN ('queued','working')), (SELECT count(*) FROM uploads WHERE state IN ('open','queued','finalizing') AND expires>unixepoch())",
+            [],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
+        Ok(crate::source_observer::PendingBodyWork {
+            upload_jobs: upload_jobs
+                .try_into()
+                .map_err(|_| Error::new("corrupt-metadata", 503))?,
+            download_jobs: download_jobs
+                .try_into()
+                .map_err(|_| Error::new("corrupt-metadata", 503))?,
+            upload_sessions: upload_sessions
+                .try_into()
+                .map_err(|_| Error::new("corrupt-metadata", 503))?,
+        })
+    }
 
     pub fn init(root: &Path) -> Result<Self> {
         Self::open_inner(root, true)

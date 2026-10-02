@@ -6,12 +6,18 @@ type Flow = ReturnType<typeof createSyncBindingFlow>
 let bindingFlow: Flow | undefined
 const transports = new Map<string, SyncBindingTransport>()
 const key = (target: Exclude<BindingTarget, { kind: 'none' }>) => `${target.kind}:${target.connectionId}`
+export const getSyncBindingTransport = (target: Exclude<BindingTarget, { kind: 'none' }>) => transports.get(key(target))
 
-export async function prepareBoundLibraryReplacement() {
+export async function resumeCurrentSyncBinding(target: BindingTarget): Promise<void> {
+    if (!bindingFlow) throw new Error('Sync binding flow is unavailable')
+    await bindingFlow.resumeCurrent(target)
+}
+
+export async function prepareBoundLibraryReplacement(options: { confirmedCommittedRestore?: boolean } = {}) {
     const native = createNativeSyncBindingBridge()
     const state = await native.state()
     const transport = state.target.kind === 'none' ? undefined : transports.get(key(state.target))
-    if (state.target.kind !== 'none' && !transport?.receiveAvailableChanges) throw new Error('Sync is unavailable for library replacement')
+    if (state.target.kind !== 'none' && (!transport || (!options.confirmedCommittedRestore && !transport.receiveAvailableChanges))) throw new Error('Sync is unavailable for library replacement')
     const context = { state, signal: new AbortController().signal }
     const assertUnchanged = async () => {
         await native.assertAuthority(state)
@@ -20,7 +26,7 @@ export async function prepareBoundLibraryReplacement() {
             throw new Error('Sync binding changed')
         }
     }
-    await transport?.receiveAvailableChanges?.(context)
+    if (!options.confirmedCommittedRestore) await transport?.receiveAvailableChanges?.(context)
     await assertUnchanged()
     return {
         state,

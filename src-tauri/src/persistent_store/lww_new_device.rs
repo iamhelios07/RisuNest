@@ -124,7 +124,12 @@ impl PersistentStore {
             if original_authorization != authorization_id
                 || expected != header.binding_authority.0.to_string()
                 || original != staging_id
-                || risunest_sync_wire::hash(body.as_bytes()) != digest
+                || {
+                    let hash_input = body.as_bytes();
+                    #[cfg(test)]
+                    crate::persistent_store::hash_work::observe("native_new_device_intent", hash_input.len());
+                    risunest_sync_wire::hash(hash_input)
+                } != digest
             {
                 return Err(error("request-id-integrity"));
             }
@@ -182,7 +187,12 @@ impl PersistentStore {
             selection_change: selection_change.clone(),
         };
         let body = serde_json::to_string(&intent)?;
-        let digest = risunest_sync_wire::hash(body.as_bytes());
+        let digest = {
+            let hash_input = body.as_bytes();
+            #[cfg(test)]
+            crate::persistent_store::hash_work::observe("native_new_device_intent", hash_input.len());
+            risunest_sync_wire::hash(hash_input)
+        };
         let stamp = match state.issued.or(state.accepted) {
             Some(stamp) => stamp,
             None => wire(issue_stamp(
@@ -244,7 +254,12 @@ impl PersistentStore {
                 return Err(error("duplicate-unit-in-new-device-stage"));
             }
             wire(change.stamp.validate())?;
-            wire(change.value.validate())?;
+            wire({
+                let result = change.value.validate();
+                #[cfg(test)]
+                crate::persistent_store::hash_work::validation(&change.value);
+                result
+            })?;
             projection::validate_received(&self.connection, &change.key, &change.value)?;
         }
         Ok((
@@ -304,6 +319,7 @@ impl PersistentStore {
             changes,
             Some(new_authority),
             Some(selection_change),
+            None,
         )?;
         let tx = self.device_store_mut()?.transaction()?;
         verify(&tx, header.binding_authority)?;

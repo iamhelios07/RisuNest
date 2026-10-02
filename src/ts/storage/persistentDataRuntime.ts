@@ -1,10 +1,10 @@
 import { canonicalJson, canonicalClone } from './saveCoordinatorHelpers'
-import {continueCommittedWorkingSetRefresh, hasRetryableCommittedWorkingSetContinuation, rebaseCommittedWorkingSetContinuation, registerCommittedWorkingSetContinuation} from './committedWorkingSetContinuation'
+import {claimCommittedWorkingSetRecovery, continueCommittedWorkingSetRefresh, hasRetryableCommittedWorkingSetContinuation, rebaseCommittedWorkingSetContinuation, registerCommittedWorkingSetContinuation} from './committedWorkingSetContinuation'
 import { diffRootMutations } from './rootMutation'
 import { generatingConversations } from './generatingConversationRegistry'
 import { captureLwwWorkingSetBaseline, applyLwwWorkingSetUnits } from './lwwWorkingSetApply'
 import { translatePersistentRootUnitIntents } from './persistentIdentityHooks'
-import type { LwwStageReceive, LwwReceiveHeader, LwwApplyResult, PersistentUnitMutation, ConversationMutation, WholeMessageIntent, GeneratingConversation } from './persistentDataStore'
+import type { LwwStageReceive, LwwApplyResult, PersistentUnitMutation, ConversationMutation, WholeMessageIntent, GeneratingConversation } from './persistentDataStore'
 import { isTauri } from '../platform'
 import type { PersistenceCanonicalCapture } from './reactivePersistenceCapture.svelte'
 import type { Chat, Database, Message, botPreset, character, groupChat } from './database.svelte'
@@ -376,7 +376,7 @@ export interface PersistentDataRuntime {
     setActivatedLibraryRecoveryLifecycle(token: PersistentMutationToken, lifecycle: ActivatedLibraryRecoveryLifecycle): void
     refreshActivatedLibraryUnderPause(token: PersistentMutationToken): Promise<CommittedApplyOutcome>
     applyLwwReceive(request: LwwStageReceive): Promise<LwwApplyResult>
-    drainLwwDeferred(request: LwwReceiveHeader): Promise<LwwApplyResult>
+    drainLwwDeferred(expectedAuthorityEpoch?: number): Promise<void>
     commitPersistentUnitIntent(reason: string, mutations: readonly PersistentUnitMutation[], conversations?: readonly ConversationMutation[], wholeMessages?: readonly WholeMessageIntent[]): Promise<void>
 
     readonly store: PersistentDataStore
@@ -575,6 +575,7 @@ export function createPersistentDataRuntime(
 ): PersistentDataRuntime {
     let workingSet: ActiveWorkingSet
     let activatedLibraryGuard: { owner: symbol; ready: boolean; lifecycle?: ActivatedLibraryRecoveryLifecycle } | null = null
+    let committedWorkingSetRecovery: Promise<CommittedApplyOutcome | null> | null = null
     let pendingRefreshChangeSet: ReplacementChangeSet | null = null
     const captureChanges = (changes: Partial<ReplacementChangeSet>): ReplacementChangeSet => ({
         root: changes.root ?? false,
@@ -993,27 +994,38 @@ export function createPersistentDataRuntime(
             lease?.release()
         }
     }
-    let activeReceiveHeader: LwwReceiveHeader | null = null
     const generating = () => [...(dependencies.state.getGeneratingConversations?.() ?? generatingConversations.snapshot())]
     const projectAppliedUnits = async (result: LwwApplyResult, baseline?: ReturnType<typeof captureLwwWorkingSetBaseline>, localIntent = false): Promise<void> => {
         const database = dependencies.state.captureWorkingSetDatabase?.()
         if (!database) { coordinator.adoptAppliedUnitState(result.revision, null, null, []); return }
-        baseline ??= captureLwwWorkingSetBaseline(database, coordinator.capturePersistentBaselineRoot(), dependencies.state.capturePresets?.() ?? null, coordinator.captureMaterializedBaseline())
+        baseline ??= captureLwwWorkingSetBaseline(database, coordinator.capturePersistentBaselineRoot(), dependencies.state.capturePresets?.() ?? null, coordinator.captureMaterializedBaseline(), coordinator.capturePresetRecordBaseline())
         const selectedTarget = workingSet.captureSelectedConversationTarget()
         const selectedSession = workingSet.activeConversationSession
+        const authorityEpoch = coordinator.storageAuthorityEpoch
         const lease = await dependencies.store.acquireRevision(result.revision)
+        const projectionBaseline = baseline
         let applied: ReturnType<typeof captureLwwWorkingSetBaseline>
-        try { applied = await applyLwwWorkingSetUnits(database, baseline, lease, result.affectedKeys, dependencies.state.captureCharacterIndex?.(), localIntent) }
-        finally { await releasePersistentRevisionLease(lease) }
-        const beforeDerive = canonicalJson(dependencies.state.captureRoot())
-        dependencies.state.afterRemoteApply?.()
-        const afterDerive = dependencies.state.captureRoot()
-        for (const mutation of diffRootMutations(JSON.parse(beforeDerive), afterDerive)) {
-            const root = applied.root as unknown as Record<string, unknown>
-            if (mutation.type === 'set') root[mutation.key] = canonicalClone(mutation.value)
-            else delete root[mutation.key]
-        }
-        coordinator.adoptAppliedUnitState(result.revision, applied.root, applied.presets, applied.characters)
+        try {
+            applied = await applyLwwWorkingSetUnits(database, projectionBaseline, lease, result.affectedKeys, dependencies.state.captureCharacterIndex?.(), localIntent, () => {
+                coordinator.assertPersistentMutationAllowed(authorityEpoch)
+                if (dependencies.state.captureWorkingSetDatabase?.() !== database) throw new Error('Persistent working set changed during unit projection')
+                dependencies.state.beforeCapture?.()
+            }, () => {
+                const canonicalCapture = dependencies.state.canonicalCapture
+                const beforeDerive = canonicalCapture?.root() ?? canonicalJson(dependencies.state.captureRoot())
+                dependencies.state.afterRemoteApply?.()
+                const afterDerive = canonicalCapture?.root() ?? canonicalJson(dependencies.state.captureRoot())
+                const derivedMutations = beforeDerive === afterDerive ? [] : canonicalCapture
+                    ? canonicalCapture.diffRoot(beforeDerive, afterDerive)
+                    : diffRootMutations(JSON.parse(beforeDerive), JSON.parse(afterDerive))
+                for (const mutation of derivedMutations) {
+                    const root = projectionBaseline.root as unknown as Record<string, unknown>
+                    if (mutation.type === 'set') root[mutation.key] = canonicalClone(mutation.value)
+                    else delete root[mutation.key]
+                }
+            })
+        } finally { await releasePersistentRevisionLease(lease) }
+        coordinator.adoptAppliedUnitState(result.revision, applied.root, applied.presets, applied.characters, applied.presetRecords)
         if (selectedTarget && selectedSession) workingSet.refreshSelectedConversationAfterReplacement(selectedTarget, selectedSession)
         for (const key of result.affectedKeys) {
             const [kind, owner, name] = JSON.parse(key)
@@ -1024,14 +1036,26 @@ export function createPersistentDataRuntime(
         }
         await commitContentCursor(result.revision)
     }
-    const drainLwwDeferred = (request: LwwReceiveHeader): Promise<LwwApplyResult> => coordinator.withPausedPersistentWrites('generation-deferred-drain', async () => {
-        if (!dependencies.store.lwwDrainDeferred) throw new Error('LWW receive is unavailable')
-        const database = dependencies.state.captureWorkingSetDatabase?.()
-        const baseline = database ? captureLwwWorkingSetBaseline(database, dependencies.state.captureRoot(), dependencies.state.capturePresets?.() ?? null, coordinator.captureMaterializedBaseline()) : undefined
-        const result = await dependencies.store.lwwDrainDeferred({ ...request, generating: generating() })
-        await projectAppliedUnits(result, baseline)
-        return result
-    })
+    const drainLwwDeferred = async (authorityEpoch = coordinator.storageAuthorityEpoch): Promise<void> => {
+        coordinator.assertPersistentMutationAllowed(authorityEpoch)
+        if (!dependencies.store.lwwBindingState || !dependencies.store.lwwDrainDeferred) return
+        await coordinator.withPausedPersistentWrites('generation-deferred-drain', async () => {
+            coordinator.assertPersistentMutationAllowed(authorityEpoch)
+            const binding = await dependencies.store.lwwBindingState!()
+            coordinator.assertPersistentMutationAllowed(authorityEpoch)
+            const database = dependencies.state.captureWorkingSetDatabase?.()
+            const baseline = database ? captureLwwWorkingSetBaseline(database, dependencies.state.captureRoot(), dependencies.state.capturePresets?.() ?? null, coordinator.captureMaterializedBaseline(), coordinator.capturePresetRecordBaseline()) : undefined
+            const result = await dependencies.store.lwwDrainDeferred!({ bindingAuthority: binding.targetAuthority, requestId: crypto.randomUUID(), generating: generating() })
+            try {
+                coordinator.assertPersistentMutationAllowed(authorityEpoch)
+                await projectAppliedUnits(result, baseline)
+                coordinator.assertPersistentMutationAllowed(authorityEpoch)
+            } catch (error) {
+                coordinator.markCommittedWorkingSetRefreshRequired(result.revision, error)
+                throw error
+            }
+        })
+    }
     const runtime: PersistentDataRuntime = {
         store: dependencies.store,
         withPausedPersistentWrites: (reason, operation) => coordinator.withPausedPersistentWrites(reason, operation),
@@ -1085,11 +1109,10 @@ export function createPersistentDataRuntime(
                 const store = dependencies.store
                 if (!store.lwwStageReceive || !store.lwwApplyReceive || !store.lwwFinishReceive) throw new Error('LWW receive is unavailable')
                 const database = dependencies.state.captureWorkingSetDatabase?.()
-                const baseline = database ? captureLwwWorkingSetBaseline(database, dependencies.state.captureRoot(), dependencies.state.capturePresets?.() ?? null, coordinator.captureMaterializedBaseline()) : undefined
+                const baseline = database ? captureLwwWorkingSetBaseline(database, dependencies.state.captureRoot(), dependencies.state.capturePresets?.() ?? null, coordinator.captureMaterializedBaseline(), coordinator.capturePresetRecordBaseline()) : undefined
                 await store.lwwStageReceive(staged)
                 const header = { bindingAuthority: staged.bindingAuthority, requestId: staged.requestId }
                 const result = await store.lwwApplyReceive({ ...header, generating: generating() })
-                activeReceiveHeader = header
                 try { await projectAppliedUnits(result, baseline) }
                 catch (error) { coordinator.markCommittedWorkingSetRefreshRequired(result.revision, error); throw error }
                 finally { await store.lwwFinishReceive(header) }
@@ -1126,6 +1149,7 @@ export function createPersistentDataRuntime(
             if (activatedLibraryGuard) throw new PersistentMutationFencedError()
             dependencies.state.afterRemoteApply?.()
             const result = await workingSet.initializeActiveWorkingSet(database)
+            await drainLwwDeferred()
             // A recreated WebView starts from a projection of the current
             // revision, so the cursor is realigned with it.
             await commitContentCursor(coordinator.revision)
@@ -1139,31 +1163,45 @@ export function createPersistentDataRuntime(
                 fence.release()
             }
         },
-        async retryCommittedWorkingSetRefresh() {
-            const revision = coordinator.pendingWorkingSetRefreshRevision
-            if (revision === null) return null
-            const changes = pendingRefreshChangeSet
-            const epoch = coordinator.storageAuthorityEpoch
-            const guardedRecovery = activatedLibraryGuard !== null || hasRetryableCommittedWorkingSetContinuation(runtime, epoch)
-            const fence = await acquireCommittedWorkingSetRefreshFence()
-            let outcome: CommittedApplyOutcome
-            try {
-                outcome = await fence.refreshCommittedWorkingSet(revision, {
-                    changeSet: changes ?? undefined,
-                })
-            } finally {
-                fence.release()
-            }
-            if (guardedRecovery && outcome.projection === 'applied') {
-                try { await continueCommittedWorkingSetRefresh(outcome.revision, runtime, epoch) }
-                catch (error) {
-                    const required = requireCommittedRefresh(outcome.revision, error)
-                    rebaseCommittedWorkingSetContinuation(runtime, epoch, coordinator.storageAuthorityEpoch)
-                    return required
-                }
-            }
-            if (guardedRecovery && outcome.projection === 'refresh-required') rebaseCommittedWorkingSetContinuation(runtime, epoch, coordinator.storageAuthorityEpoch)
-            return outcome
+        retryCommittedWorkingSetRefresh() {
+            if (committedWorkingSetRecovery) return committedWorkingSetRecovery
+            const recovering = (async () => {
+                const revision = coordinator.pendingWorkingSetRefreshRevision
+                if (revision === null) return null
+                const changes = pendingRefreshChangeSet
+                const epoch = coordinator.storageAuthorityEpoch
+                const guardedRecovery = activatedLibraryGuard !== null || hasRetryableCommittedWorkingSetContinuation(runtime, epoch)
+                let adoptedEpoch = epoch
+                let ownsRefreshFence = false
+                const releaseRecovery = claimCommittedWorkingSetRecovery(runtime, epoch,
+                    activatedLibraryGuard?.owner ?? Symbol('critical-working-set-recovery'),
+                    () => ownsRefreshFence || coordinator.storageAuthorityEpoch === adoptedEpoch)
+                try {
+                    const fence = await acquireCommittedWorkingSetRefreshFence()
+                    ownsRefreshFence = true
+                    let outcome: CommittedApplyOutcome
+                    try {
+                        outcome = await fence.refreshCommittedWorkingSet(revision, {changeSet: changes ?? undefined})
+                    } finally {
+                        adoptedEpoch = coordinator.storageAuthorityEpoch
+                        ownsRefreshFence = false
+                        fence.release()
+                    }
+                    if (guardedRecovery) rebaseCommittedWorkingSetContinuation(runtime, epoch, adoptedEpoch)
+                    if (guardedRecovery && outcome.projection === 'applied') {
+                        try { await continueCommittedWorkingSetRefresh(outcome.revision, runtime, adoptedEpoch) }
+                        catch (error) {
+                            if (coordinator.storageAuthorityEpoch !== adoptedEpoch) throw error
+                            return requireCommittedRefresh(outcome.revision, error)
+                        }
+                    }
+                    return outcome
+                } finally { releaseRecovery() }
+            })()
+            committedWorkingSetRecovery = recovering
+            const clearRecovery = () => { if (committedWorkingSetRecovery === recovering) committedWorkingSetRecovery = null }
+            void recovering.then(clearRecovery, clearRecovery)
+            return recovering
         },
         runStorageOnlyMutation: (operation) =>
             coordinator.runStorageOnlyMutation(operation),
@@ -1176,7 +1214,7 @@ export function createPersistentDataRuntime(
             coordinator.assertPersistentMutationAllowed(expectedAuthorityEpoch)
             await coordinator.flushPendingDataLocally('generation-completion')
             coordinator.assertPersistentMutationAllowed(expectedAuthorityEpoch)
-            if (activeReceiveHeader && dependencies.store.lwwDrainDeferred) await drainLwwDeferred({ ...activeReceiveHeader, requestId: crypto.randomUUID() })
+            await drainLwwDeferred(expectedAuthorityEpoch)
         },
         commitCharacterAddition: (request, reason) =>
             coordinator.commitCharacterAddition(request, reason),
@@ -1262,6 +1300,7 @@ export function createPersistentDataRuntime(
                 const restartPlugins = async () => {
                     await plugins.invalidatePluginCachesAfterAuthorityReplacement()
                     await plugins.restartPluginsAfterAuthorityReplacement()
+                    options.onPluginsRestarted?.()
                 }
                 runtime.setActivatedLibraryRecoveryLifecycle(pause.token, {
                     beforeRefresh: () => binding.assertAuthority(),

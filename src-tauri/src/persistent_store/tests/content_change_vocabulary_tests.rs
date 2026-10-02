@@ -53,7 +53,7 @@ fn root_and_preset_mutations_record_their_own_locators() {
         .unwrap();
     assert_eq!(
         recorded(&store, before),
-        vec![key("preset", "0", ""), key("preset", "1", "")]
+        vec![key("preset", "preset-alpha", ""), key("preset", "preset-beta", "")]
     );
 }
 
@@ -276,7 +276,7 @@ fn owner_head_changes_always_accompany_their_parent_record() {
         .unwrap();
     assert_eq!(
         recorded(&store, before),
-        vec![key("owner", "root-module-assets", "0"), key("root", "", "")]
+        vec![key("owner", "root-module-assets", "module-0"), key("root", "", "")]
     );
 
     let before = store.revision().unwrap();

@@ -162,7 +162,7 @@ describe('plugin list database mutation policy', () => {
             owner: 'caller',
             getPersistentRevision:()=>1,
             commitPersistentUnitIntent:async (_reason:string,units:readonly import('./pluginUnitIntents').PluginUnitMutation[])=>{
-                let order:string[]|undefined
+                let order: string[] | undefined
                 for(const unit of units){
                     const key=JSON.parse(unit.key)
                     if(key[0]==='order'&&key[1]==='plugins'){if(unit.type==='set')order=unit.value as string[];continue}
@@ -187,7 +187,7 @@ describe('plugin list database mutation policy', () => {
             mutatePluginStorage: async () => undefined,
             flushPendingData: async () => undefined,
             prepareAuthoritativeDatabaseUpdate: async (value: Record<string, unknown>) => ({
-                ...value, ...(value.plugins ? {plugins: await handlePluginInstallViaPlugin(value.plugins as RisuPlugin[])} : {}),
+                ...value, ...(value.plugins ? { plugins: await handlePluginInstallViaPlugin(value.plugins as RisuPlugin[]) } : {}),
             }),
         } as any)
     }

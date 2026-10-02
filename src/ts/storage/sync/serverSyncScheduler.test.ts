@@ -1,0 +1,131 @@
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { createServerSyncScheduler } from './serverSyncScheduler'
+
+afterEach(() => vi.useRealTimers())
+function fixture() {
+    vi.useFakeTimers()
+    const dependencies = { push: vi.fn(async () => {}), pull: vi.fn(async () => {}), connect: vi.fn(async () => {}), disconnect: vi.fn(async () => {}), retryClock: vi.fn(async () => {}), failed: vi.fn() }
+    return { ...dependencies, scheduler: createServerSyncScheduler(dependencies) }
+}
+describe('server LWW foreground scheduler', () => {
+    it('debounces from the last durable edit and flushes generation completion immediately', async () => {
+        const f = fixture(); await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0); f.push.mockClear()
+        f.scheduler.localChange(); await vi.advanceTimersByTimeAsync(1500); f.scheduler.localChange()
+        await vi.advanceTimersByTimeAsync(1999); expect(f.push).not.toHaveBeenCalled()
+        await vi.advanceTimersByTimeAsync(1); expect(f.push).toHaveBeenCalledTimes(1)
+        f.scheduler.localChange(true); await vi.advanceTimersByTimeAsync(0); expect(f.push).toHaveBeenCalledTimes(2)
+        f.scheduler.dispose()
+    })
+    it('keeps a stalled receive independent from publication', async () => {
+        const f = fixture(); let release!: () => void; f.pull.mockImplementation(() => new Promise<void>(resolve => { release = resolve }))
+        await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0); f.push.mockClear()
+        f.scheduler.localChange(true); await vi.advanceTimersByTimeAsync(0)
+        expect(f.push).toHaveBeenCalledTimes(1); release(); f.scheduler.dispose()
+    })
+    it('uses foreground fallback and connected safety intervals and stops all work in background', async () => {
+        const f = fixture(); await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0); f.pull.mockClear()
+        await vi.advanceTimersByTimeAsync(5000); expect(f.pull).toHaveBeenCalledTimes(1)
+        f.scheduler.socket(true); f.pull.mockClear(); await vi.advanceTimersByTimeAsync(59_999); expect(f.pull).not.toHaveBeenCalled()
+        await vi.advanceTimersByTimeAsync(1); expect(f.pull).toHaveBeenCalledTimes(1)
+        await f.scheduler.foreground(false); f.pull.mockClear(); f.push.mockClear(); f.connect.mockClear()
+        await vi.advanceTimersByTimeAsync(120_000); f.scheduler.localChange(true); f.scheduler.remoteHint()
+        expect(f.pull).not.toHaveBeenCalled(); expect(f.push).not.toHaveBeenCalled(); expect(f.connect).not.toHaveBeenCalled(); expect(f.disconnect).toHaveBeenCalledTimes(1)
+    })
+    it('immediately pulls on notification, conversation open, foreground return and socket loss', async () => {
+        const f = fixture(); await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0); f.pull.mockClear()
+        f.scheduler.remoteHint(); await vi.advanceTimersByTimeAsync(0); f.scheduler.conversationOpened(); await vi.advanceTimersByTimeAsync(0); f.scheduler.socket(false); await vi.advanceTimersByTimeAsync(0)
+        expect(f.pull).toHaveBeenCalledTimes(3)
+        await f.scheduler.foreground(false); await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0); expect(f.pull).toHaveBeenCalledTimes(4)
+        f.scheduler.dispose()
+    })
+    it('retries transient publication with bounded backoff and stops permanent failures', async () => {
+        const f = fixture()
+        f.push.mockRejectedValueOnce({ code: 'server-unreachable', retryable: true })
+        await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0)
+        expect(f.push).toHaveBeenCalledTimes(1)
+        await vi.advanceTimersByTimeAsync(999); expect(f.push).toHaveBeenCalledTimes(1)
+        await vi.advanceTimersByTimeAsync(1); expect(f.push).toHaveBeenCalledTimes(2)
+        f.push.mockRejectedValueOnce({ code: 'equal-stamp-integrity', retryable: false })
+        f.scheduler.localChange(true); await vi.advanceTimersByTimeAsync(0)
+        expect(f.scheduler.isBlocked()).toBe(true)
+        f.push.mockClear(); f.pull.mockClear(); f.connect.mockClear()
+        await vi.advanceTimersByTimeAsync(120_000)
+        expect(f.push).not.toHaveBeenCalled(); expect(f.pull).not.toHaveBeenCalled(); expect(f.connect).not.toHaveBeenCalled()
+        f.scheduler.dispose()
+    })
+    it('serializes explicit receive-to-head in background and fences every active lane', async () => {
+        const f = fixture(); const release: Array<() => void> = []
+        f.pull.mockImplementation(() => new Promise<void>(resolve => release.push(resolve)))
+        const available = f.scheduler.receiveAvailableChanges()
+        await vi.advanceTimersByTimeAsync(0)
+        expect(f.pull).toHaveBeenCalledWith(true)
+        let fenced = false; const fence = f.scheduler.fence().then(() => { fenced = true })
+        await vi.advanceTimersByTimeAsync(0); expect(fenced).toBe(false)
+        release[0](); await available; await fence; expect(fenced).toBe(true)
+        await vi.advanceTimersByTimeAsync(120_000); expect(f.pull).toHaveBeenCalledTimes(1)
+        f.scheduler.dispose()
+    })
+    it('stops native integrity errors restored as Error messages', async () => {
+        const f=fixture(); f.pull.mockRejectedValueOnce(new Error('equal-stamp-integrity'))
+        await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0)
+        expect(f.scheduler.isBlocked()).toBe(true); f.pull.mockClear(); f.push.mockClear()
+        await vi.advanceTimersByTimeAsync(120_000); expect(f.pull).not.toHaveBeenCalled(); expect(f.push).not.toHaveBeenCalled()
+        f.scheduler.dispose()
+    })
+    it('rechecks only a clock block on foreground and resumes publication after native admission succeeds', async () => {
+        const f = fixture(); f.push.mockRejectedValueOnce({ code: 'clock-skew', retryable: false })
+        await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0)
+        expect(f.scheduler.isBlocked()).toBe(true)
+        await vi.advanceTimersByTimeAsync(120_000); expect(f.retryClock).not.toHaveBeenCalled()
+        await f.scheduler.foreground(false); await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0)
+        expect(f.retryClock).toHaveBeenCalledOnce(); expect(f.scheduler.isBlocked()).toBe(false)
+        expect(f.push).toHaveBeenCalledTimes(2)
+        f.scheduler.dispose()
+    })
+    it('keeps an uncorrected clock blocked and coalesces an open-event native recheck', async () => {
+        const f = fixture(); f.push.mockRejectedValueOnce(new Error('clock-skew'))
+        await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0)
+        f.retryClock.mockRejectedValueOnce({ code: 'clock-skew', retryable: false })
+        await f.scheduler.conversationOpened(); expect(f.scheduler.isBlocked()).toBe(true)
+        let finish!: () => void
+        f.retryClock.mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve }))
+        const first = f.scheduler.conversationOpened(); const second = f.scheduler.conversationOpened()
+        await vi.advanceTimersByTimeAsync(0); expect(f.retryClock).toHaveBeenCalledTimes(2)
+        expect(f.scheduler.isBlocked()).toBe(true)
+        finish(); await Promise.all([first, second]); await vi.advanceTimersByTimeAsync(0)
+        expect(f.scheduler.isBlocked()).toBe(false); expect(f.push).toHaveBeenCalledTimes(2)
+        f.scheduler.dispose()
+    })
+    it('waits for the blocked connection cancellation before admitting clock repair', async () => {
+        const f = fixture(); let stopped!: () => void
+        f.disconnect.mockImplementationOnce(() => new Promise<void>(resolve => { stopped = resolve }))
+        f.push.mockRejectedValueOnce({ code: 'clock-skew', retryable: false })
+        await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0)
+        const opened = f.scheduler.conversationOpened(); await vi.advanceTimersByTimeAsync(0)
+        expect(f.retryClock).not.toHaveBeenCalled()
+        stopped(); await opened
+        expect(f.retryClock).toHaveBeenCalledOnce()
+        f.scheduler.dispose()
+    })
+    it.each(['incoming-clock-skew', 'accepted-clock-correction-required', 'writer-collision', 'equal-stamp-integrity'])('never automatically clears %s', async code => {
+        const f = fixture(); f.push.mockRejectedValueOnce({ code, retryable: false })
+        await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0)
+        await f.scheduler.foreground(false); await f.scheduler.foreground(true); await f.scheduler.conversationOpened()
+        await vi.advanceTimersByTimeAsync(120_000)
+        expect(f.retryClock).not.toHaveBeenCalled(); expect(f.scheduler.isBlocked()).toBe(true)
+        expect(f.push).toHaveBeenCalledTimes(1)
+        f.scheduler.dispose()
+    })
+    it('retains an incoming integrity block when an already running push later fails clock admission', async () => {
+        const f = fixture(); let rejectPush!: (error: unknown) => void; let rejectPull!: (error: unknown) => void
+        f.push.mockImplementationOnce(() => new Promise<void>((_resolve, reject) => { rejectPush = reject }))
+        f.pull.mockImplementationOnce(() => new Promise<void>((_resolve, reject) => { rejectPull = reject }))
+        await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0)
+        rejectPull({ code: 'equal-stamp-integrity', retryable: false }); await vi.advanceTimersByTimeAsync(0)
+        rejectPush({ code: 'clock-skew', retryable: false }); await vi.advanceTimersByTimeAsync(0)
+        await f.scheduler.conversationOpened()
+        expect(f.retryClock).not.toHaveBeenCalled(); expect(f.scheduler.isBlocked()).toBe(true)
+        expect(f.failed).toHaveBeenLastCalledWith({ code: 'equal-stamp-integrity', retryable: false })
+        f.scheduler.dispose()
+    })
+})

@@ -137,5 +137,6 @@ it('preserves the distinct web PocketRisu importer', async () => {
     const button = [...target.querySelectorAll('button')].find(button => button.textContent?.trim() === language.loadPocketRisuBackup)!
     button.click()
     await vi.waitFor(() => expect(LoadLocalBackup).toHaveBeenCalledOnce())
+    expect(LoadLocalBackup).toHaveBeenCalledWith(language.pocketRisuImportConfirm)
     expect(restoreBackupFromSystemPicker).not.toHaveBeenCalled()
 })

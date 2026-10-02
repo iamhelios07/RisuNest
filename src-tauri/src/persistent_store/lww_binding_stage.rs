@@ -2,7 +2,7 @@ use super::{
     error, is_device, parent_status, projection, put_unit, validate_header, verify, wire, Change,
     DecimalU64, Header, PersistentStore, StoreResult, UnitValue,
 };
-use crate::persistent_store::{commit, message_pages, schema, GENERATION_TABLES};
+use crate::persistent_store::{message_pages, schema, GENERATION_TABLES};
 use risunest_sync_wire::{
     canonical,
     descriptor::{ReferencePage, MAX_DESCRIPTOR_REFERENCES, MAX_TREE_DEPTH},
@@ -24,10 +24,12 @@ pub(crate) struct BindingUnitStage {
     pub source_digest: String,
 }
 
-struct HashWriter(Sha256);
+struct HashWriter(Sha256, #[cfg(test)] &'static str);
 impl Write for HashWriter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         self.0.update(bytes);
+        #[cfg(test)]
+        crate::persistent_store::hash_work::update(self.1, bytes.len());
         Ok(bytes.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -36,8 +38,12 @@ impl Write for HashWriter {
 }
 
 fn source_digest(changes: &[&Change]) -> StoreResult<String> {
-    let mut writer = HashWriter(Sha256::new());
+    let mut writer = HashWriter(Sha256::new(), #[cfg(test)] "binding_source_proof");
+    #[cfg(test)]
+    crate::persistent_store::hash_work::begin("binding_source_proof");
     writer.0.update(b"risunest.lww-binding-source/v1\0");
+    #[cfg(test)]
+    crate::persistent_store::hash_work::update("binding_source_proof", b"risunest.lww-binding-source/v1\0".len());
     serde_json::to_writer(&mut writer, changes)?;
     Ok(hex::encode(writer.0.finalize()))
 }
@@ -52,8 +58,12 @@ fn sorted_source(changes: &[Change]) -> StoreResult<Vec<&Change>> {
 }
 
 fn status_digest(statuses: &[(&str, &str)]) -> StoreResult<String> {
-    let mut writer = HashWriter(Sha256::new());
+    let mut writer = HashWriter(Sha256::new(), #[cfg(test)] "binding_status_proof");
+    #[cfg(test)]
+    crate::persistent_store::hash_work::begin("binding_status_proof");
     writer.0.update(b"risunest.lww-binding-status/v1\0");
+    #[cfg(test)]
+    crate::persistent_store::hash_work::update("binding_status_proof", b"risunest.lww-binding-status/v1\0".len());
     serde_json::to_writer(&mut writer, statuses)?;
     Ok(hex::encode(writer.0.finalize()))
 }
@@ -64,9 +74,13 @@ fn catalog_columns(db: &Connection, table: &str) -> StoreResult<Vec<String>> {
     Ok(names.into_iter().filter(|name| name != "generation").collect())
 }
 
-fn catalog_digest(db: &Connection, staging_id: &str) -> StoreResult<String> {
-    let mut writer = HashWriter(Sha256::new());
+pub(in crate::persistent_store) fn catalog_digest(db: &Connection, staging_id: &str) -> StoreResult<String> {
+    let mut writer = HashWriter(Sha256::new(), #[cfg(test)] "binding_catalog_proof");
+    #[cfg(test)]
+    crate::persistent_store::hash_work::begin("binding_catalog_proof");
     writer.0.update(b"risunest.lww-binding-catalog/v1\0");
+    #[cfg(test)]
+    crate::persistent_store::hash_work::update("binding_catalog_proof", b"risunest.lww-binding-catalog/v1\0".len());
     for &(table, _) in GENERATION_TABLES {
         let columns = catalog_columns(db, table)?;
         serde_json::to_writer(&mut writer, &(table, &columns))?;
@@ -127,7 +141,12 @@ impl PersistentStore {
         let changes = sorted_source(changes)?;
         for change in &changes {
             wire(change.stamp.validate())?;
-            wire(change.value.validate())?;
+            wire({
+                let result = change.value.validate();
+                #[cfg(test)]
+                crate::persistent_store::hash_work::validation(&change.value);
+                result
+            })?;
             if change.stamp.physical_ms > admitted_upper_ms {
                 return Err(error("incoming-clock-skew"));
             }
@@ -254,7 +273,12 @@ fn copy_controls(source: &Connection, target: &Connection, change: &Change) -> S
     match change.key.components()[0].as_str() {
         "messages" => {
             let bytes = copy_required_object(source, target, &descriptor.object_hash)?;
-            let manifest = risunest_external_storage_format::message_pages::MessageManifest::decode(&bytes).map_err(error)?;
+            let manifest = {
+                let result = risunest_external_storage_format::message_pages::MessageManifest::decode(&bytes);
+                #[cfg(test)]
+                crate::persistent_store::hash_work::decoded("native_manifest_decode_identity", &bytes, &result);
+                result
+            }.map_err(error)?;
             for page in manifest.pages { copy_required_object(source, target, &page.hash)?; }
         }
         "archive" => { copy_required_object(source, target, &descriptor.object_hash)?; }
@@ -333,3 +357,23 @@ pub(in crate::persistent_store) fn seed_binding_holds(tx: &Transaction<'_>, stag
 #[cfg(test)]
 #[path = "lww_binding_stage_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod hash_work_tests {
+    use super::*;
+    use crate::persistent_store::hash_work::{reset_hash_work, take_hash_work, DomainWork};
+    #[test]
+    fn digest_prefixes_streamed_json_and_repeated_invocations_are_counted() {
+        let changes: Vec<&Change> = vec![];
+        let statuses = [("key", "held")];
+        let source_bytes = b"risunest.lww-binding-source/v1\0".len() + serde_json::to_vec(&changes).unwrap().len();
+        let status_bytes = b"risunest.lww-binding-status/v1\0".len() + serde_json::to_vec(&statuses).unwrap().len();
+        reset_hash_work();
+        source_digest(&changes).unwrap(); source_digest(&changes).unwrap(); status_digest(&statuses).unwrap();
+        let work = take_hash_work();
+        assert_eq!(work.domains["binding_source_proof"], DomainWork { calls: 2, bytes: 2 * source_bytes as u64 });
+        assert_eq!(work.domains["binding_status_proof"], DomainWork { calls: 1, bytes: status_bytes as u64 });
+        assert!(work.incomplete.is_empty());
+        assert!(take_hash_work().domains.is_empty());
+    }
+}

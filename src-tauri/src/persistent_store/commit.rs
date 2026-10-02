@@ -132,10 +132,35 @@ fn commit_inner(
             reject_archived_targets(transaction, active, input)?;
             validate_owner_heads_for_commit(input)?;
             let retained = retained_commit_owner_heads(transaction, active, input)?;
-            let before = super::lww::capture_targets(transaction, active, input, asset_aliases, true)?;
-            Ok((retained, before))
+            let mut conversation_orders = BTreeSet::new();
+            for mutation in input.conversations.iter().flatten() {
+                match mutation {
+                    ConversationMutation::Delete { character_id, .. }
+                    | ConversationMutation::Reorder { character_id, .. } => {
+                        conversation_orders.insert(character_id.clone());
+                    }
+                    ConversationMutation::ReplaceRange { character_id, conversation_id, .. } => {
+                        let exists: bool = transaction.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM conversations WHERE generation=?1 AND character_id=?2 AND conversation_id=?3)",
+                            params![active, character_id, conversation_id], |row| row.get(0),
+                        )?;
+                        let created_by_unit = input.unit_mutations.iter().flatten().any(|mutation| {
+                            if let super::lww::UnitMutation::Set { key, .. } = mutation {
+                                let parts = key.components();
+                                parts.len() == 4 && parts[0] == "exists" && parts[1] == "conversation"
+                                    && parts[2] == *character_id && parts[3] == *conversation_id
+                            } else { false }
+                        });
+                        if !exists && !created_by_unit {
+                            conversation_orders.insert(character_id.clone());
+                        }
+                    }
+                }
+            }
+            let before = super::lww::capture_targets(transaction, active, input, asset_aliases, true, &conversation_orders)?;
+            Ok((retained, before, conversation_orders))
         },
-        |transaction, generation, (retained, before)| {
+        |transaction, generation, (retained, before, conversation_orders)| {
             if let Some(root) = &input.root {
                 put_root(transaction, generation, root)?;
             }
@@ -177,7 +202,7 @@ fn commit_inner(
             }
             replace_changed_owner_heads(transaction, generation, input, &retained)?;
             if let Some((header, stamp, digest)) = lww {
-                let after = super::lww::capture_targets(transaction, generation, input, asset_aliases, false)?;
+                let after = super::lww::capture_targets(transaction, generation, input, asset_aliases, false, &conversation_orders)?;
                 let changed=before.keys().chain(after.keys()).cloned().collect::<Vec<_>>();
                 super::lww::record_changes(transaction, before, after, stamp, header.binding_authority, &header.request_id)?;
                 super::lww::refresh_orders(transaction, generation,&changed)?;
@@ -1297,6 +1322,7 @@ pub(super) fn replace_commit_lww(
     received: &[super::lww::Change],
     received_authority: Option<risunest_sync_wire::stamp::DecimalU64>,
     selection_change: Option<&super::sync_selection::BindingSelectionChange>,
+    replacement_proof: Option<(i64, &str)>,
 ) -> StoreResult<RevisionResult> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let completed: Option<(String,i64)> = transaction.query_row(
@@ -1309,6 +1335,15 @@ pub(super) fn replace_commit_lww(
     }
     if let Some(change)=selection_change {super::sync_selection::apply_binding_selection(&transaction,change)?;}
     require_staging(&transaction, staging_id)?;
+    if let Some((base_revision, expected_digest)) = replacement_proof {
+        let actual = current_revision(&transaction)?;
+        if actual != base_revision {
+            return Err(StoreError::RevisionConflict { expected: base_revision, actual });
+        }
+        if super::lww::catalog_digest(&transaction, staging_id)? != expected_digest {
+            return Err(validation("replacement-stage-changed"));
+        }
+    }
     if target {
         super::sync_selection::validate_binding_stage_content(&transaction,staging_id)?;
         super::lww::validate_binding_source(&transaction,staging_id,header,received)?;
@@ -1336,6 +1371,7 @@ pub(super) fn replace_commit_lww(
             if super::lww::parent_status(&transaction,key)?=="retired"&&!(key.components()[0]=="exists"&&matches!(value,risunest_sync_wire::unit::UnitValue::Deleted)){continue;}
             super::lww::put_unit(&transaction,key,stamp,value,&header.request_id,Some(header.binding_authority))?;
         }
+        super::lww::project_replacement_units(&transaction,&generation,header,stamp,changes)?;
     }
     if !target {for (key,_) in changes{super::lww::ensure_publishable_parents(&transaction,key,header.binding_authority)?;}}
     let changed=if target {received.iter().map(|c|c.key.clone()).collect::<Vec<_>>()}else{changes.iter().map(|(k,_)|k.clone()).collect::<Vec<_>>()};
@@ -1969,7 +2005,11 @@ fn insert_messages(
             start + offset as i64,
             message_id,
             serde_json::to_string(message)?,
-            risunest_sync_wire::hash(&canonical),
+            {
+                #[cfg(test)]
+                crate::persistent_store::hash_work::observe("native_message_insert", canonical.len());
+                risunest_sync_wire::hash(&canonical)
+            },
             canonical.len() as i64,
         ])?;
     }
@@ -2386,40 +2426,34 @@ fn validation(message: impl Into<String>) -> StoreError {
     }
 }
 
-/// Moves one value from the unowned side to the plugin that asked for it, in
-/// the revision path so the change index and the outbox see it. Answers with
-/// nothing when the plugin already holds that key or no unassigned row from
-/// this import carries it, and then nothing is written.
-pub(super) fn claim_unowned_plugin_value(
-    connection: &mut Connection,
+pub(super) fn plugin_claim_source(
+    connection: &Connection,
     owner: &str,
     key: &str,
     import_batch_id: &str,
-    assigned_at: i64,
     expected_revision: i64,
-) -> StoreResult<(Option<Value>, i64)> {
+) -> StoreResult<Option<(i64, i64, String)>> {
     if !plugin_owner::validate_owner(owner) || plugin_owner::is_unowned(owner) {
         return Err(validation("plugin storage owner is invalid"));
     }
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let actual_revision = current_revision(&transaction)?;
+    let actual_revision = current_revision(connection)?;
     if actual_revision != expected_revision {
         return Err(StoreError::RevisionConflict {
             expected: expected_revision,
             actual: actual_revision,
         });
     }
-    let generation = active_generation(&transaction)?;
-    let held: i64 = transaction.query_row(
+    let generation = active_generation(connection)?;
+    let held: i64 = connection.query_row(
         "SELECT COUNT(*) FROM plugin_storage
          WHERE generation = ?1 AND owner = ?2 AND storage_key = ?3",
         params![generation, owner, key],
         |row| row.get(0),
     )?;
     if held != 0 {
-        return Ok((None, actual_revision));
+        return Ok(None);
     }
-    let source: Option<(i64, i64, String)> = transaction
+    Ok(connection
         .query_row(
             "SELECT byte_size, ordinal, value FROM plugin_storage
              WHERE generation = ?1 AND owner = ?2 AND storage_key = ?3
@@ -2432,12 +2466,46 @@ pub(super) fn claim_unowned_plugin_value(
             ],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
-        .optional()?;
+        .optional()?)
+}
+
+/// Moves one value without changing its global position. Both owner keys and
+/// their order values are compared and recorded in the same transaction.
+pub(super) fn claim_unowned_plugin_value(
+    connection: &mut Connection,
+    owner: &str,
+    key: &str,
+    import_batch_id: &str,
+    assigned_at: i64,
+    expected_revision: i64,
+    header: &super::lww::Header,
+    stamp: &risunest_sync_wire::stamp::Stamp,
+    digest: &str,
+) -> StoreResult<(Option<Value>, i64)> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Some((previous, revision)) = transaction.query_row(
+        "SELECT digest,revision FROM lww_requests WHERE request_id=?1", [&header.request_id],
+        |row| Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?)),
+    ).optional()? {
+        if previous != digest { return Err(validation("request-id-integrity")); }
+        return Ok((None, revision));
+    }
+    let source = plugin_claim_source(&transaction, owner, key, import_batch_id, expected_revision)?;
     let Some((byte_size, ordinal, serialized)) = source else {
-        return Ok((None, actual_revision));
+        return Ok((None, expected_revision));
     };
+    let generation = active_generation(&transaction)?;
     let value: Value = serde_json::from_str(&serialized)?;
-    let revision = actual_revision + 1;
+    let input = WorkingSetCommit {
+        expected_revision,
+        plugin_storage: Some(vec![
+            PluginStorageMutation::Delete { owner: plugin_owner::UNOWNED_OWNER.into(), key: key.into() },
+            PluginStorageMutation::Set { owner: owner.into(), key: key.into(), value: value.clone() },
+        ]),
+        ..Default::default()
+    };
+    let before = super::lww::capture_targets(&transaction, &generation, &input, &[], true, &BTreeSet::new())?;
+    let revision = expected_revision + 1;
     super::content_change_index::begin_mutation(&transaction, &generation, revision, "local")?;
     // A delete and an insert, so both sides of the move reach the change index.
     transaction.execute(
@@ -2462,6 +2530,11 @@ pub(super) fn claim_unowned_plugin_value(
             assigned_at
         ],
     )?;
+    let after = super::lww::capture_targets(&transaction, &generation, &input, &[], false, &BTreeSet::new())?;
+    let changed = before.keys().chain(after.keys()).cloned().collect::<Vec<_>>();
+    super::lww::record_changes(&transaction, before, after, stamp, header.binding_authority, &header.request_id)?;
+    super::lww::refresh_orders(&transaction, &generation, &changed)?;
+    transaction.execute("INSERT INTO lww_requests VALUES(?1,?2,?3)", params![header.request_id, digest, revision])?;
     super::content_change_index::finish_mutation(&transaction)?;
     set_active(&transaction, revision, &generation)?;
     transaction.commit()?;

@@ -1,4 +1,5 @@
 use super::*;
+use crate::persistent_store::commit;
 use super::super::{inline, read_unit, unit_key, ApplyReceive, Progress, StageReceive, UnitMutation};
 use crate::persistent_store::{
     active_generation, query, sync_selection::{ReplaceBindingRequest, SwitchBindingRequest, SyncTarget},
@@ -140,7 +141,7 @@ fn archive_alias_and_reference_controls_stage_without_reading_any_large_dependen
     let dir = tempfile::tempdir().unwrap(); let mut store = PersistentStore::open(dir.path()).unwrap();
     let body_hash = "ab".repeat(32); let asset_hash = "cd".repeat(32);
     for hash in [&body_hash,&asset_hash] { store.connection.execute("INSERT INTO message_page_objects VALUES(?1,?2)", params![hash,b"poison-body".as_slice()]).unwrap(); }
-    let archived = crate::persistent_store::archive::ArchivedObject { object_hash:body_hash.clone(),shared_object_hash:body_hash, archived_at:1,conversation_count:1,message_count:1,asset_hashes:vec![asset_hash.clone()],shared_asset_hashes:vec![asset_hash.clone()] };
+    let archived = crate::persistent_store::archive::ArchivedObject { object_hash:body_hash.clone(),shared_object_hash:body_hash, archived_at:1,conversation_count:1,message_count:1,asset_hashes:vec![asset_hash.clone()],shared_asset_hashes:vec![asset_hash.clone()],identity_remap:Vec::new() };
     let mut archive = change(&["archive","archived"],Value::Null); archive.value = projection::archive_value(&store.connection,&archived).unwrap();
     let hashes = (0..100).map(|i| format!("{i:064x}")).collect::<Vec<_>>();
     let (root,objects) = risunest_sync_wire::descriptor::build_reference_tree(&hashes,false).unwrap();
@@ -239,7 +240,7 @@ fn uncertain_target_activation_replays_device_intent_without_replacing_later_edi
     let source=sorted_source(&incoming).unwrap().into_iter().cloned().collect::<Vec<_>>();
     let intent=super::super::Intent::Target{staging_id:stage.staging_id.clone(),changes:source.clone()};
     let (stamp,digest)=store.reserve_intent(&activation,&intent).unwrap();
-    let result=commit::replace_commit_lww(&mut store.connection,&stage.staging_id,&activation,&stamp,&digest,&[],true,&source,None,None).unwrap();
+    let result=commit::replace_commit_lww(&mut store.connection,&stage.staging_id,&activation,&stamp,&digest,&[],true,&source,None,None,None).unwrap();
     drop(store); let mut store=PersistentStore::open(dir.path()).unwrap();
     assert_eq!(store.revision().unwrap(),result.revision);
     assert_eq!(store.connection.query_row("SELECT count(*) FROM lww_receive_rows WHERE status='held'",[],|r|r.get::<_,i64>(0)).unwrap(),1);

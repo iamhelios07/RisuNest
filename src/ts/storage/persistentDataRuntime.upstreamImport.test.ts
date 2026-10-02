@@ -115,6 +115,47 @@ async function createHarness(officialPublisher?: OfficialRevisionPublisher, capt
 
 beforeEach(()=>{vi.clearAllMocks();plugins.restartPluginsAfterAuthorityReplacement.mockImplementation(async()=>{});binding.bound=true;binding.fence.mockClear();binding.assertAuthority.mockClear();binding.resume.mockReset();binding.resume.mockImplementation(async()=>{})})
 describe('direct native upstream import publication',()=>{
+    it.each(['cursor','resume'] as const)('shares concurrent recovery after adoption while %s is blocked and retains failed resume',async phase=>{
+        const h=await createHarness()
+        const incoming={...makeDatabase(),username:'Concurrent import'}
+        vi.mocked(h.store.replaceFromDatabase).mockImplementationOnce(async database=>{
+            h.nativeCommit(database)
+            throw new Error('activation response lost')
+        })
+        await expect(h.runtime.replacePersistentDatabase(incoming,'concurrent-import',{upstreamImport:true})).rejects.toThrow()
+        const originalEpoch=h.runtime.getStorageAuthorityEpoch()
+        let enter!:()=>void
+        let release!:()=>void
+        const entered=new Promise<void>(resolve=>{enter=resolve})
+        const blocked=new Promise<void>(resolve=>{release=resolve})
+        if(phase==='cursor')vi.mocked(h.store.commitWorkingSetChangeCursor!).mockImplementationOnce(async()=>{enter();await blocked})
+        binding.resume.mockImplementationOnce(async()=>{
+            if(phase==='resume'){enter();await blocked}
+            throw new Error('first adapter resume failed')
+        })
+        const first=h.runtime.retryCommittedWorkingSetRefresh()
+        await entered
+        expect(h.runtime.getStorageAuthorityEpoch()).toBeGreaterThan(originalEpoch)
+        const competing=retryCommittedWorkingSetRefreshWithContinuation(h.runtime)
+        release()
+        await expect(first).resolves.toMatchObject({projection:'refresh-required'})
+        await expect(competing).resolves.toMatchObject({projection:'refresh-required'})
+        expect(binding.resume).toHaveBeenCalledOnce()
+        expect(()=>h.runtime.markPersistentDataDirty(1)).toThrow()
+        await expect(retryCommittedWorkingSetRefreshWithContinuation(h.runtime)).resolves.toEqual({kind:'committed',revision:2,projection:'applied'})
+        expect(binding.resume).toHaveBeenCalledTimes(2)
+        expect(plugins.restartPluginsAfterAuthorityReplacement).toHaveBeenCalledOnce()
+        expect(h.store.replaceFromDatabase).toHaveBeenCalledOnce()
+        expect(h.database.username).toBe(incoming.username)
+        await expect(retryCommittedWorkingSetRefreshWithContinuation(h.runtime)).resolves.toBeNull()
+    })
+
+    it('emits the operation restart receipt only after the required native restart succeeds',async()=>{
+        const h=await createHarness()
+        const receipt=vi.fn(()=>{expect(plugins.restartPluginsAfterAuthorityReplacement).toHaveBeenCalledOnce()})
+        await h.runtime.replacePersistentDatabase(makeDatabase(),'receipt',{upstreamImport:true,onPluginsRestarted:receipt})
+        expect(receipt).toHaveBeenCalledOnce()
+    })
     it.each([{expectedRevision:99},{expectedMutationGeneration:99}])('preserves snapshot expectation before direct native staging: %j',async expectation=>{
         const h=await createHarness()
         await expect(h.runtime.replacePersistentDatabase({...makeDatabase(),username:'Rejected'},'stale-snapshot',{upstreamImport:true,...expectation})).rejects.toThrow()
@@ -175,6 +216,33 @@ describe('direct native upstream import publication',()=>{
 
 
 describe('native upstream job activation recovery with the real runtime',()=>{
+    it('cancels and drains a proven busy finalize rejection before exact unchanged abort and resume',async()=>{
+        const h=await createHarness()
+        const original=structuredClone(h.database)
+        let cancelled=false
+        const invoke=vi.fn(async(command:string)=>{
+            if(command==='native_file_job_start')return {jobId:'synthetic-busy'}
+            if(command==='native_file_job_status')return {state:cancelled?'cancelled':'waitingForInput',phase:cancelled?'cancelled':'awaiting-activation',kind:'restore-block-risu-save'}
+            if(command==='native_file_job_finalize')throw {code:'library-operation-busy',message:'library-operation-busy'}
+            if(command==='native_file_job_cancel'){cancelled=true;return {outcome:'requested'}}
+            if(command==='native_file_job_forget')return true
+            throw new Error(`Unexpected native command ${command}`)
+        })
+        plugins.restartPluginsAfterAuthorityReplacement.mockImplementation(async()=>{
+            expect(cancelled).toBe(true)
+            expect(h.database).toEqual(original)
+        })
+        await expect(runNativeBlockRisuSaveRestore(h.runtime,{type:'desktopPath',path:'E:/synthetic/busy.risudat'}, {},
+            {isTauri:()=>true,invoke,wait:async()=>{}})).rejects.toMatchObject({code:'library-operation-busy'})
+        expect(h.database).toEqual(original)
+        expect(h.runtime.revision).toBe(1)
+        expect(()=>h.runtime.markPersistentDataDirty(1)).not.toThrow()
+        expect(plugins.restartPluginsAfterAuthorityReplacement).toHaveBeenCalledOnce()
+        expect(binding.resume).toHaveBeenCalledOnce()
+        expect(invoke.mock.calls.filter(([command])=>command==='native_file_job_finalize')).toHaveLength(1)
+        expect(invoke.mock.calls.filter(([command])=>command==='native_file_job_cancel')).toHaveLength(1)
+        await expect(h.runtime.retryCommittedWorkingSetRefresh()).resolves.toBeNull()
+    })
     it.each(['observer','finalize-response','status-response','late','inaccessible','restart','resume'] as const)('reconciles before strict adoption and resumes once: %s',async failure=>{
         const h=await createHarness()
         const incoming={...makeDatabase(),username:'Native staged import'}
@@ -225,6 +293,7 @@ describe('native upstream job activation recovery with the real runtime',()=>{
             {isTauri:()=>true,invoke,wait:async()=>{}})).rejects.toThrow()
         expect(()=>h.runtime.markPersistentDataDirty(1)).toThrow()
         expect(binding.resume).not.toHaveBeenCalled()
+        expect(invoke.mock.calls.filter(([command])=>command==='native_file_job_cancel')).toHaveLength(0)
         const projections=h.replaceDatabase.mock.calls.length
         if(failure==='late'||failure==='inaccessible'){
             await expect(h.runtime.retryCommittedWorkingSetRefresh()).resolves.toMatchObject({projection:'refresh-required'})
