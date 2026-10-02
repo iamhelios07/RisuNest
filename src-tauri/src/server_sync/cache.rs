@@ -313,6 +313,8 @@ impl Cache {
             .open_object(hash)?
             .ok_or_else(|| SyncError::new("cached-object-missing", 409))?;
         let mut digest = Sha256::new();
+        #[cfg(test)]
+        super::hash_metrics::begin_stream("c_cache_stream_verify");
         let mut buffer = [0u8; 64 * 1024];
         loop {
             check()?;
@@ -321,6 +323,8 @@ impl Cache {
                 break;
             }
             digest.update(&buffer[..size]);
+            #[cfg(test)]
+            super::hash_metrics::stream_bytes("c_cache_stream_verify", size);
         }
         if hex::encode(digest.finalize()) != hash {
             return Err(SyncError::new("cached-object-corrupt", 409));
@@ -333,7 +337,11 @@ impl Cache {
     fn emit(&self, emission: Emission, bytes: &[u8]) -> Result<String> {
         match emission {
             Emission::Persist => self.put(bytes),
-            Emission::Identity => Ok(risunest_sync_wire::hash(bytes)),
+            Emission::Identity => {
+                #[cfg(test)]
+                super::hash_metrics::record("c_cache_identity", bytes.len());
+                Ok(risunest_sync_wire::hash(bytes))
+            },
         }
     }
 
@@ -341,6 +349,8 @@ impl Cache {
         #[cfg(test)]
         PUT_CALLS.with(|calls| calls.set(calls.get() + 1));
         let hash = risunest_sync_wire::hash(bytes);
+        #[cfg(test)]
+        super::hash_metrics::record("c_cache_identity", bytes.len());
         if bytes.len() > SMALL_OBJECT_BYTES {
             if self.cas.stat_object(&hash)?.is_some() {
                 self.read(&hash, bytes.len())?;
@@ -380,6 +390,8 @@ impl Cache {
         if bytes.len() > limit {
             return Err(SyncError::new("cached-object-too-large", 413));
         }
+        #[cfg(test)]
+        super::hash_metrics::record("c_cache_verify", bytes.len());
         if risunest_sync_wire::hash(&bytes) != hash {
             return Err(SyncError::new("cached-object-corrupt", 409));
         }
@@ -443,6 +455,8 @@ impl Cache {
         scopes: Vec<String>,
     ) -> Result<ProjectedRecord> {
         let local_hash = risunest_sync_wire::hash(bytes);
+        #[cfg(test)]
+        super::hash_metrics::record("c_cache_identity", bytes.len());
         let mut objects = BTreeSet::new();
         let segmented = if bytes.len() <= INLINE_PAYLOAD_BYTES {
             RecordContent::Inline {
@@ -544,6 +558,8 @@ impl Cache {
             RecordContent::Inline { bytes_base64url } => {
                 let bytes = decode_inline(&bytes_base64url)?;
                 let hash = risunest_sync_wire::hash(&bytes);
+                #[cfg(test)]
+                super::hash_metrics::record("c_cache_identity", bytes.len());
                 Ok((bytes, hash))
             }
             RecordContent::Tree { value } => {

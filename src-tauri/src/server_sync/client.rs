@@ -209,6 +209,8 @@ fn jitter(delay: Duration, attempt: u32) -> Duration {
 
 pub(crate) use risunest_sync_connect::Registration as ServerConfig;
 pub(crate) struct ServerClient {
+    #[cfg(test)]
+    pub(crate) test_io: Option<Arc<TestIoCounters>>,
     http: Client,
     url: RwLock<Url>,
     config: RwLock<ServerConfig>,
@@ -220,6 +222,18 @@ pub(crate) struct ServerClient {
     /// The cycle's activity slot. The transfer layer raises it while object
     /// bytes are on the wire and restores what it replaced afterwards.
     pub(crate) activity: Option<std::sync::Arc<std::sync::atomic::AtomicU8>>,
+}
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct TestIoCounters {
+    pub requests: std::sync::atomic::AtomicU64,
+    pub request_body_bytes: std::sync::atomic::AtomicU64,
+    pub response_body_bytes: std::sync::atomic::AtomicU64,
+}
+#[cfg(test)]
+impl TestIoCounters {
+    pub(crate) fn reset(&self) { for value in [&self.requests,&self.request_body_bytes,&self.response_body_bytes] {value.store(0,std::sync::atomic::Ordering::Relaxed);} }
+    pub(crate) fn snapshot(&self) -> [u64;3] { [self.requests.load(std::sync::atomic::Ordering::Relaxed),self.request_body_bytes.load(std::sync::atomic::Ordering::Relaxed),self.response_body_bytes.load(std::sync::atomic::Ordering::Relaxed)] }
 }
 /// The activity id shown while frames or chunks are in flight.
 pub(crate) const ACTIVITY_UPLOADING: u8 = 4;
@@ -405,6 +419,8 @@ impl ServerClient {
             .build()
             .map_err(|_| SyncError::new("http-client-unavailable", 503))?;
         Ok(Self {
+            #[cfg(test)]
+            test_io: None,
             http,
             url: RwLock::new(url),
             config: RwLock::new(config),
@@ -608,6 +624,11 @@ impl ServerClient {
         limit: usize,
     ) -> Result<Reply> {
         self.ensure_active()?;
+        #[cfg(test)]
+        if let Some(counter)=&self.test_io {
+            counter.requests.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+            counter.request_body_bytes.fetch_add(body.as_ref().map_or(0,|b|b.len() as u64),std::sync::atomic::Ordering::Relaxed);
+        }
         if path.starts_with('/') || path.contains("..") || path.contains('?') || path.contains('#')
         {
             return Err(SyncError::new("invalid-request-path", 400));
@@ -693,6 +714,8 @@ impl ServerClient {
         if bytes.len() > limit {
             return Err(SyncError::new("response-too-large", 502));
         }
+        #[cfg(test)]
+        if let Some(counter)=&self.test_io {counter.response_body_bytes.fetch_add(bytes.len() as u64,std::sync::atomic::Ordering::Relaxed);}
         Ok(Reply {
             status,
             body: bytes,

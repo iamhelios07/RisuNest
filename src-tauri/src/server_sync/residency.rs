@@ -151,6 +151,8 @@ impl Residency {
         Ok(())
     }
     pub fn context_id(config: &StoredConfig, epoch: &str) -> String {
+        #[cfg(test)]
+        super::hash_metrics::record("c_context_identity", format!("{}\0{}\0{}", config.library_id, config.device_id, epoch).len());
         hash(format!("{}\0{}\0{}", config.library_id, config.device_id, epoch).as_bytes())
     }
     pub fn confirm(
