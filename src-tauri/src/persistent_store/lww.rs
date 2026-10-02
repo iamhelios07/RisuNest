@@ -22,6 +22,7 @@ pub(super) use binding_stage::{seed_binding_holds, validate_binding_source, BIND
 mod new_device;
 #[path = "lww_projection.rs"]
 mod projection;
+pub(super) use projection::validate_received;
 pub(super) use projection::{
     apply_mutation, capture_device_changes, capture_targets, is_device, preserve_local_root,
     refresh_orders, archive_value,

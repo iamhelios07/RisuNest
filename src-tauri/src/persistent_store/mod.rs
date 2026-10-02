@@ -873,13 +873,13 @@ pub(super) struct ReadTarget {
 }
 
 pub(crate) struct PersistentStore {
+    gc_instance: String,
     revision_leases: HashMap<String, snapshot::RevisionReadLease>,
     active_readers: Arc<snapshot::ActiveReaderRegistry>,
     connection: Connection,
     repository_root: PathBuf,
     database_path: PathBuf,
     snapshots_dir: PathBuf,
-    pending_restore_failure: Option<String>,
     // A device store that cannot be opened must not block the library, so the
     // failure is carried until something actually needs per-device state.
     device_store: Result<device_store::DeviceStore, String>,
@@ -1347,8 +1347,6 @@ impl PersistentStore {
         let persistent_dir = app_data_dir.join("persistent");
         let snapshots_dir = persistent_dir.join("snapshots");
         std::fs::create_dir_all(&snapshots_dir)?;
-        let pending_restore_failure =
-            snapshot::apply_pending_restore(&persistent_dir, &snapshots_dir)?;
 
         let database_path = persistent_dir.join(DATABASE_FILE);
         let mut connection = Connection::open(&database_path)?;
@@ -1377,13 +1375,13 @@ impl PersistentStore {
         let active_readers = Arc::new(snapshot::ActiveReaderRegistry::default());
         let device_store = open_device_store(&persistent_dir);
         let mut store = Self {
+            gc_instance: uuid::Uuid::new_v4().to_string(),
             revision_leases: HashMap::new(),
             active_readers,
             connection,
             repository_root: app_data_dir.to_owned(),
             database_path,
             snapshots_dir,
-            pending_restore_failure,
             device_store,
         };
         store.lww_recover_intents()?;
@@ -1395,25 +1393,18 @@ impl PersistentStore {
         Ok(store)
     }
 
-    // Reports a user-requested snapshot restore that was skipped during this
-    // open, so command surfaces can tell the frontend instead of silently
-    // proceeding on the old database.
-    pub(crate) fn pending_restore_failure(&self) -> Option<&str> {
-        self.pending_restore_failure.as_deref()
-    }
-
     pub(crate) fn open_native_job_store(&self) -> StoreResult<Self> {
         let mut connection = Connection::open(&self.database_path)?;
         schema::initialize(&mut connection)?;
         let device_store = open_device_store(&self.repository_root.join("persistent"));
         Ok(Self {
+            gc_instance: uuid::Uuid::new_v4().to_string(),
             revision_leases: HashMap::new(),
             active_readers: Arc::clone(&self.active_readers),
             connection,
             repository_root: self.repository_root.clone(),
             database_path: self.database_path.clone(),
             snapshots_dir: self.snapshots_dir.clone(),
-            pending_restore_failure: None,
             device_store,
         })
     }
@@ -2364,8 +2355,8 @@ impl PersistentStore {
         snapshot::checkpoint(&self.connection, mode)
     }
 
-    pub(crate) fn snapshot_create(&self, reason: &str) -> StoreResult<SnapshotCreated> {
-        snapshot::create(&self.connection, &self.snapshots_dir, reason)
+    pub(crate) fn snapshot_create(&mut self, reason: &str) -> StoreResult<SnapshotCreated> {
+        snapshot::create(self, reason)
     }
 
     pub(crate) fn snapshot_list(&self) -> StoreResult<Vec<SnapshotInfo>> {
@@ -2471,9 +2462,6 @@ impl PersistentStore {
         })
     }
 
-    pub(crate) fn snapshot_restore_request(&self, id: &str) -> StoreResult<()> {
-        snapshot_archive::Archive::open(&self.snapshots_dir)?.request_restore(id)
-    }
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn asset_gc_dry_run(
@@ -2723,9 +2711,22 @@ impl PersistentStore {
         let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
         let residency = crate::server_sync::residency::Residency::open(&self.repository_root)
             .map_err(|error| std::io::Error::other(error.code))?;
-        Ok(crate::asset_repository::migration_gc::mark_asset_roots_with_remote(
-            &cas, self.collect_asset_gc_roots(false, false)?, |hash| residency.gc_size(hash),
-        )?)
+        let (device_fence, mut plugins) = snapshot::collect_device_plugin_asset_roots(self)?;
+        let _device_guard = self.device_store()?.acquire_plugin_gc_barrier(&device_fence)?;
+        let transaction = rusqlite::Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let library_revision: i64 = self.connection.query_row("SELECT revision FROM plugin_gc_revision WHERE singleton=1", [], |row| row.get(0))?;
+        snapshot::merge_asset_roots(&mut plugins, snapshot::collect_plugin_asset_roots(&self.connection)?);
+        for reader in self.revision_leases.values() {
+            snapshot::merge_asset_roots(&mut plugins, snapshot::collect_plugin_asset_roots(&reader.connection)?);
+        }
+        let roots = self.collect_asset_gc_roots_with_plugin_cache(false, false, Some(&plugins))?
+            .into_iter().map(|(_, roots)| roots);
+        let mut marks = crate::asset_repository::migration_gc::mark_asset_roots_with_remote(&cas, roots, |hash| residency.gc_size(hash))?;
+        transaction.rollback()?;
+        marks.plugin_cache = Some(crate::asset_repository::migration_gc::PluginGcCache {
+            instance: self.gc_instance.clone(), library_revision, device_fence, roots: plugins,
+        });
+        Ok(marks)
     }
 
     pub(crate) fn asset_gc_delete_page_with_hook(
@@ -2754,11 +2755,15 @@ impl PersistentStore {
         ) -> StoreResult<()>,
     ) -> StoreResult<crate::asset_repository::migration_gc::AssetGcDryRunPage> {
         use crate::asset_repository::migration_gc::{
-            dry_run_mark_and_sweep_with_remote, sweep_asset_candidates_with_remote,
+            mark_asset_roots_with_remote, sweep_asset_candidates_with_remote,
             AssetGcDeleteHookPoint, AssetGcDryRunPage,
         };
 
         let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
+        let plugins = initial_marks.plugin_cache.as_ref().ok_or_else(|| StoreError::Validation {
+            message: "asset GC plugin cache is unavailable".into(),
+        })?;
+        self.validate_plugin_gc_cache(plugins)?;
         let initial_candidates = self.query_asset_object_catalog(limit, cursor)?;
         let residency = crate::server_sync::residency::Residency::open(&self.repository_root)
             .map_err(|error| std::io::Error::other(error.code))?;
@@ -2787,20 +2792,23 @@ impl PersistentStore {
         hook(AssetGcDeleteHookPoint::AfterInitialScan)?;
 
         let _repository_guard = crate::asset_repository::coordinator::lock_repository_mutation()?;
+        let _device_guard = self.device_store()?.acquire_plugin_gc_barrier(&plugins.device_fence)?;
         let final_candidates = self.query_asset_object_catalog(limit, cursor)?;
         if final_candidates != initial_candidates {
             return Err(StoreError::Validation {
                 message: "asset object catalog page changed before final GC recheck".to_owned(),
             });
         }
-        let mut report = dry_run_mark_and_sweep_with_remote(
-            &cas,
-            final_candidates.items.clone(),
-            self.collect_asset_gc_roots(true, false)?,
-            now_ms,
-            minimum_grace_ms,
-            |hash| residency.gc_size(hash),
-        )?;
+        self.validate_plugin_gc_cache(plugins)?;
+        let final_transaction = rusqlite::Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let current_roots = self.collect_asset_gc_roots_with_plugin_cache(true, false, Some(&plugins.roots))?
+            .into_iter().map(|(_, roots)| roots);
+        let final_marks = mark_asset_roots_with_remote(&cas, current_roots, |hash| residency.gc_size(hash))?;
+        let library_version: i64 = self.connection.query_row("PRAGMA data_version", [], |row|row.get(0))?;
+        let mut expected_changes: i64 = self.connection.query_row("SELECT total_changes()", [], |row|row.get(0))?;
+        final_transaction.rollback()?;
+        let mut report = sweep_asset_candidates_with_remote(&cas, final_candidates.items.clone(), &final_marks,
+            now_ms, minimum_grace_ms, |hash| residency.gc_size(hash))?;
         if !report.blockers.is_empty() {
             return Ok(AssetGcDryRunPage {
                 report,
@@ -2831,15 +2839,34 @@ impl PersistentStore {
             let transaction = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current_version: i64 = transaction.query_row("PRAGMA data_version", [], |row|row.get(0))?;
+            let current_changes: i64 = transaction.query_row("SELECT total_changes()", [], |row|row.get(0))?;
+            if current_version != library_version || current_changes != expected_changes {
+                return Err(StoreError::CommitBusy);
+            }
             transaction.execute(
                 "INSERT INTO asset_object_deletions (
                     object_hash, byte_size, physical_key, state, created_at_ms
                  ) VALUES (?1, ?2, ?3, 'pending', ?4)",
                 params![object_hash, byte_size, physical_key, now_ms],
             )?;
+            expected_changes = transaction.query_row("SELECT total_changes()", [], |row|row.get(0))?;
             transaction.commit()?;
             hook(AssetGcDeleteHookPoint::AfterTombstone)?;
 
+            let transaction = rusqlite::Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+            self.validate_plugin_gc_cache(plugins)?;
+            let current_version: i64 = transaction.query_row("PRAGMA data_version", [], |row|row.get(0))?;
+            let current_changes: i64 = transaction.query_row("SELECT total_changes()", [], |row|row.get(0))?;
+            let exact: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM asset_objects WHERE object_hash=?1 AND byte_size=?2)", params![object_hash,byte_size], |row|row.get(0))?;
+            if current_version != library_version || current_changes != expected_changes || !exact {
+                return Err(StoreError::CommitBusy);
+            }
+            let checked = sweep_asset_candidates_with_remote(&cas, [candidate.clone()], &final_marks,
+                now_ms, minimum_grace_ms, |hash| residency.gc_size(hash))?;
+            if !checked.blockers.is_empty() || !checked.potential_delete_hashes.contains(&object_hash) {
+                return Err(StoreError::Validation { message: "asset GC roots changed before unlink".into() });
+            }
             let unlink = cas.unlink_exact_object(
                 &candidate.object_hash,
                 candidate.byte_size,
@@ -2856,9 +2883,6 @@ impl PersistentStore {
                     directory_entries_synced,
                 } => directory_entries_synced,
             };
-            let transaction = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)?;
             if transaction.execute(
                 "DELETE FROM asset_objects
                  WHERE object_hash = ?1 AND byte_size = ?2",
@@ -2880,6 +2904,7 @@ impl PersistentStore {
                     [&object_hash],
                 )?;
             }
+            expected_changes = transaction.query_row("SELECT total_changes()", [], |row|row.get(0))?;
             transaction.commit()?;
             report.deleted_bytes = report
                 .deleted_bytes
@@ -2893,6 +2918,15 @@ impl PersistentStore {
             report,
             next_cursor: final_candidates.next_cursor,
         })
+    }
+
+    fn validate_plugin_gc_cache(&self, cache: &crate::asset_repository::migration_gc::PluginGcCache) -> StoreResult<()> {
+        let revision: i64 = self.connection.query_row("SELECT revision FROM plugin_gc_revision WHERE singleton=1", [], |row| row.get(0))?;
+        if cache.instance != self.gc_instance || revision != cache.library_revision
+            || !self.device_store()?.plugin_gc_fence_is_current(&cache.device_fence)? {
+            return Err(StoreError::CommitBusy);
+        }
+        Ok(())
     }
 
     fn collect_asset_gc_roots(
@@ -2922,6 +2956,15 @@ impl PersistentStore {
         read_only: bool,
         _backup_references: Option<&mut std::collections::BTreeSet<String>>,
     ) -> StoreResult<Vec<(&'static str, crate::asset_repository::migration_gc::AssetRootSet)>> {
+        self.collect_asset_gc_roots_with_plugin_cache(repository_guard_held, read_only, None)
+    }
+
+    fn collect_asset_gc_roots_with_plugin_cache(
+        &self,
+        repository_guard_held: bool,
+        read_only: bool,
+        plugins: Option<&crate::asset_repository::migration_gc::AssetRootSet>,
+    ) -> StoreResult<Vec<(&'static str, crate::asset_repository::migration_gc::AssetRootSet)>> {
         use crate::asset_repository::job_pins::{
             collect_durable_cas_job_roots, collect_durable_cas_job_roots_already_guarded,
             collect_durable_cas_job_roots_read_only,
@@ -2933,11 +2976,16 @@ impl PersistentStore {
             count.set((preliminary + usize::from(!repository_guard_held),
                 final_checks + usize::from(repository_guard_held)));
         });
-        let mut roots = vec![("library", snapshot::collect_asset_roots(&self.connection)?)];
+        let collect = |connection: &Connection| match plugins {
+            Some(plugins) => snapshot::collect_asset_roots_with_plugin_cache(connection, plugins),
+            None => snapshot::collect_asset_roots(connection),
+        };
+        let mut roots = vec![("library", collect(&self.connection)?)];
+        roots.push(("source-preservation",snapshot::collect_preserved_source_roots(self.repository_root())));
         for reader in self.revision_leases.values() {
             roots.push((
                 "library",
-                snapshot::collect_asset_roots(&reader.connection)?,
+                collect(&reader.connection)?,
             ));
         }
         roots.extend(

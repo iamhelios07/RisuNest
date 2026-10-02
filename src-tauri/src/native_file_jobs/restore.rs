@@ -401,6 +401,7 @@ fn restore_risu_save_reader_controlled<R: Read>(
             revision,
             source_bytes: reader.completed,
             source_sha256: hex::encode(reader.hasher.finalize()),
+            source_fingerprint_kind: crate::native_file_jobs::SourceFingerprintKind::WholeFileSha256,
             character_count: parsed.character_count,
             preset_count: parsed.preset_count,
             warning_codes,

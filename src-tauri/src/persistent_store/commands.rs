@@ -280,8 +280,6 @@ impl PersistentStoreState {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PersistentStoreOpenResult {
     revision: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    restore_failure: Option<String>,
 }
 
 fn current_time_ms() -> StoreResult<i64> {
@@ -465,23 +463,17 @@ fn open_persistent_store(
 ) -> StoreResult<PersistentStoreOpenResult> {
     if let Some(store) = store.as_mut() {
         let revision = store.revision()?;
-        let restore_failure = store.pending_restore_failure().map(str::to_owned);
         return Ok(PersistentStoreOpenResult {
             revision,
-            restore_failure,
         });
     }
 
     let persistent_store = PersistentStore::open(app_data_dir)?;
     let revision = persistent_store.revision()?;
-    let restore_failure = persistent_store
-        .pending_restore_failure()
-        .map(str::to_owned);
     *store = Some(persistent_store);
 
     Ok(PersistentStoreOpenResult {
         revision,
-        restore_failure,
     })
 }
 
@@ -1037,16 +1029,16 @@ pub(crate) fn pds_snapshot_create(
             })?;
     let started = std::time::Instant::now();
     let (mut archive, scratch, current_bytes, inventory) = {
-        let store = state.store.lock().map_err(|error| StoreError::Store {
+        let mut store = state.store.lock().map_err(|error| StoreError::Store {
             message: format!("persistent store mutex poisoned: {error}"),
         })?;
-        let store = store.as_ref().ok_or_else(|| StoreError::Validation {
+        let store = store.as_mut().ok_or_else(|| StoreError::Validation {
             message: "persistent store has not been opened".to_owned(),
         })?;
         let archive = super::snapshot_archive::Archive::open(&store.snapshots_dir)?;
         let inventory = store.active_readers.defer_asset_inventory();
         let (scratch, current_bytes) =
-            super::snapshot::capture_scratch(&store.connection, &archive)?;
+            super::snapshot::capture_scratch(store, &archive)?;
         (archive, scratch, current_bytes, inventory)
     };
     let result = super::snapshot::archive_scratch(
@@ -1253,11 +1245,16 @@ fn pds_asset_gc_execute_page(
 }
 
 #[tauri::command(async)]
-pub(crate) fn pds_snapshot_restore_request(
-    state: State<'_, PersistentStoreState>,
-    id: String,
-) -> Result<(), StoreError> {
-    with_store(state, |store| store.snapshot_restore_request(&id))
+pub(crate) fn pds_snapshot_restore_stage(state: State<'_, PersistentStoreState>, id:String, request_id:String) -> Result<super::StagingResult,StoreError> {
+    with_store_mut(state,|store|store.snapshot_restore_stage(&id,&request_id))
+}
+#[tauri::command(async)]
+pub(crate) fn pds_snapshot_restore_activate(state: State<'_, PersistentStoreState>, staging_id:String, expected_revision:i64, binding_authority:risunest_sync_wire::stamp::DecimalU64) -> Result<super::RevisionResult,StoreError> {
+    with_store_mut(state,|store|store.snapshot_restore_activate(&staging_id,expected_revision,binding_authority))
+}
+#[tauri::command(async)]
+pub(crate) fn pds_snapshot_restore_abort(state: State<'_, PersistentStoreState>, staging_id:String) -> Result<(),StoreError> {
+    with_store_mut(state,|store|store.snapshot_restore_abort(&staging_id))
 }
 
 #[derive(serde::Deserialize)]
@@ -2106,34 +2103,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn open_result_reports_a_skipped_pending_restore() {
-        let directory = tempdir().expect("create restore failure directory");
-        drop(PersistentStore::open(directory.path()).unwrap());
-        fs::write(
-            directory
-                .path()
-                .join("persistent/snapshots/pending-restore.json"),
-            b"{ not json",
-        )
-        .unwrap();
-        let mut slot = None;
-        let result =
-            open_persistent_store(directory.path(), &mut slot).expect("reopen with corrupt marker");
-        let failure = slot
-            .as_ref()
-            .unwrap()
-            .pending_restore_failure()
-            .expect("skipped restore is reported")
-            .to_owned();
-        assert!(failure.contains("persistent snapshot restore skipped"));
-        assert_eq!(
-            serde_json::to_value(result).unwrap(),
-            json!({"revision": 0, "restoreFailure": failure})
-        );
-        let repeated = open_persistent_store(directory.path(), &mut slot).unwrap();
-        assert_eq!(repeated.restore_failure.as_deref(), Some(failure.as_str()));
-    }
 
     #[test]
     fn product_maintenance_commands_share_one_store_serialization_lock() {
@@ -2358,14 +2327,14 @@ mod tests {
             .participating))
         .unwrap());
 
-        set_section_participation(&state, "hypa", false).unwrap();
+        assert!(set_section_participation(&state, "hypa", false).is_err());
         assert_eq!(
             read_section_participation(&state)
                 .unwrap()
                 .iter()
                 .map(|row| (row.section.as_str(), row.participating))
                 .collect::<Vec<_>>(),
-            vec![("hypa", false), ("local-plugins", true)]
+            vec![("hypa", true), ("local-plugins", true)]
         );
 
         assert!(matches!(

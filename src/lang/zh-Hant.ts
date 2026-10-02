@@ -1,5 +1,8 @@
 export const languageChineseTraditional = {
     risuNest: {
+        importDialog: {
+            warningUpstreamRestoreLosses: '部分冷儲存或嵌入資料無法復原。請檢查復原的資料。',
+        },
         plugins: {
             "removeTitle": "刪除此外掛嗎？",
             "removeDescription": "一併刪除外掛資料後，即使重新安裝也無法還原設定與儲存內容。保留外掛資料可在重新安裝後繼續使用。",
@@ -50,8 +53,8 @@ export const languageChineseTraditional = {
         "requestLogRemoved": "該請求記錄已被刪除。",
         "requestLogRemovedDesc": "當用戶端重新整理或重新載入時，該請求記錄會被刪除。",
         "vertexAuthError": "缺少 Vertex AI 驗證詳細資料。",
-        "coldStorageIncompleteRestoreConfirm": (characterNames: string, unavailableCount: number, unresolvedCount: number) =>
-            `無法復原 ${characterNames || "未知角色"}的冷儲存資料。${unresolvedCount > 0 ? `有 ${unresolvedCount} 個項目無法連結到角色。` : ""}\n\n若繼續，${unavailableCount} 個冷儲存項目將無法使用，受影響的角色或對話資料可能永久遺失。\n\n仍要繼續不完整的復原嗎？`
+        "coldStorageIncompleteRestoreConfirm": (characterNames: string, unavailableCount: number, unresolvedCount: number, includeQuestion = true) =>
+            `無法復原 ${characterNames || "未知角色"}的冷儲存資料。${unresolvedCount > 0 ? `有 ${unresolvedCount} 個項目無法連結到角色。` : ""}\n\n若繼續，${unavailableCount} 個冷儲存項目將無法使用，受影響的角色或對話資料可能永久遺失。${includeQuestion ? "\n\n仍要繼續不完整的復原嗎？" : ""}`
     },
     "showHelp": "顯示幫助",
     "help": {

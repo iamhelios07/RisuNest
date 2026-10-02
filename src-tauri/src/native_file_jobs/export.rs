@@ -181,6 +181,7 @@ pub(crate) fn export_block_risu_save(
             revision: prepared.revision,
             source_bytes: result.bytes,
             source_sha256: result.sha256,
+            source_fingerprint_kind: crate::native_file_jobs::SourceFingerprintKind::WholeFileSha256,
             character_count: encoded.character_count,
             preset_count: encoded.preset_count,
             warning_codes: Vec::new(),
