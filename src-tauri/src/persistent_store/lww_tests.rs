@@ -300,6 +300,39 @@ fn unknown_units_are_opaque_and_never_recaptured() {
 }
 
 #[test]
+fn commit_input_capture_conserves_actual_reserve_completed_and_rejected_retry_hashes() {
+    use crate::persistent_store::hash_work::{reset_commit_intent_inputs, take_commit_intent_inputs,
+        reset_hash_work, take_hash_work, DomainWork};
+    let (_directory, mut store) = store();
+    let header = Header { binding_authority: store.lww_binding_authority().unwrap(), request_id: "synthetic-commit-input".into() };
+    let input = WorkingSetCommit { expected_revision: store.revision().unwrap(), request_id: Some(header.request_id.clone()),
+        unit_mutations: Some(vec![mutation(&["root", "language"], serde_json::json!("synthetic\nvalue"))]),
+        ..Default::default() };
+    let intent = Intent::Commit { commit: input.clone(), aliases: vec![] };
+    let mut changed = input.clone(); changed.expected_revision += 1;
+    let changed = Intent::Commit { commit: changed, aliases: vec![] };
+    let expected = serde_json::to_vec(&intent).unwrap();
+    let changed_expected = serde_json::to_vec(&changed).unwrap();
+    reset_hash_work(); reset_commit_intent_inputs();
+    let result = store.commit(&input).unwrap();
+    assert_eq!(store.completed_intent(&header, &intent).unwrap().unwrap().revision, result.revision);
+    assert!(store.completed_intent(&header, &changed).is_err());
+    let work = take_hash_work(); let inputs = take_commit_intent_inputs();
+    assert_eq!(inputs, vec![expected.clone(), expected, changed_expected]);
+    assert_eq!(work.domains["native_intent"], DomainWork { calls: inputs.len() as u64,
+        bytes: inputs.iter().map(|input| input.len() as u64).sum() });
+    let persisted: String = store.device_store().unwrap().connection().query_row(
+        "SELECT body FROM lww_intents WHERE request_id=?1", [&header.request_id], |row| row.get(0)).unwrap();
+    assert_eq!(persisted.as_bytes(), inputs[0]);
+    for bytes in inputs {
+        let typed: CommitIntentInput = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(serde_json::to_vec(&typed).unwrap(), bytes);
+    }
+    store.completed_intent(&header, &intent).unwrap();
+    assert!(take_commit_intent_inputs().is_empty());
+}
+
+#[test]
 fn commit_intent_replays_once_after_restart() {
     let (dir, mut store) = store();
     let header = Header {
