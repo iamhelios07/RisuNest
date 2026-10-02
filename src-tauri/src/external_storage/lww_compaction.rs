@@ -71,6 +71,12 @@ impl ExternalLwwEngine {
                 }
             }
         }
+        for (receipt,document) in &state.segments {
+            let protected_segment=receipt.locator.object.rsplit('/').next().ok_or_else(segment::corrupt)?;
+            super::snapshot_restore::admit_asset_catalogs(&document.asset_catalogs,store,&self.library,
+                protected_segment,&self.connection_id,&self.connection_root,&self.root_key,
+                self.provider.as_ref(),&self.repository,cancel).await?;
+        }
         Ok(())
     }
     pub(crate) async fn snapshot_listing(&self,cancel:&Cancellation) -> Result<Vec<ObjectReceipt>> {
@@ -163,15 +169,10 @@ impl ExternalLwwEngine {
             if let Some((receipt,mut payload))=winner {
                 if catalog.include_segment(&payload)? {
                     for (hash,bytes) in &payload.message_pages { body_spool.push(hash,&URL_SAFE_NO_PAD.decode(bytes).map_err(error)?,crate::persistent_store::external_capture::BackupBodyRole::Control).map_err(error)?; }
-                    for (hash,bytes) in &payload.small_bodies {
-                        let bytes=URL_SAFE_NO_PAD.decode(bytes).map_err(error)?;
-                        if segment::digest(&bytes)!=*hash { return Err(segment::corrupt()); }
-                        body_spool.push(hash,&bytes,crate::persistent_store::external_capture::BackupBodyRole::Payload).map_err(error)?;
-                    }
+                    asset_catalogs.extend(payload.asset_catalogs.clone());
                     for (hash,source) in &payload.large_bodies { standalone.insert(hash.clone(),source.clone()); standalone_roots.insert(hash.clone(),super::contract::segment_object_id(&payload.writer_id,payload.seq.0,&identity.clone().ok_or_else(segment::corrupt)?)?); }
                 }
                 payload.message_pages.clear();
-                payload.small_bodies.clear();
                 segments.push((receipt,payload));
             }
         }
