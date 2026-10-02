@@ -6400,12 +6400,10 @@ mod tests {
         });
     }
 
-    /// R04. A receive whose base already names most of the snapshot's records
-    /// under the same identity reads only the packs of the ones that moved.
-    /// When the receive has to replace the library after all, a second pass
-    /// fetches the skipped records and reads nothing it already has.
+    /// R04. A receive reuses its verified record cache and reads only the
+    /// packs of changed records. Reading it again does not fetch any pack.
     #[test]
-    fn c_a_receive_reads_only_the_packs_of_records_its_base_does_not_hold() {
+    fn c_a_receive_reads_only_the_packs_of_records_its_cache_does_not_hold() {
         runtime().block_on(async {
             const RECORDS: usize = 600;
             let sender = tempfile::tempdir().unwrap();
@@ -6415,6 +6413,7 @@ mod tests {
             let key = [31; 32];
             let cancel = Cancellation::default();
             let cache = sender.path().join("cache");
+            let staging = receiver.path().join("receive");
             let capture = captured_record_window(sender.path(), "first", 1, RECORDS, 0, 0, 0);
             let meta = metadata("first", &capture);
             let mut first_journal = journal(&sender.path().join("first-job"), "first-job", &capture);
@@ -6422,7 +6421,7 @@ mod tests {
                 limits(4 * 1024), None, &mut first_journal, &provider, &repository,
                 &PhaseProgress::silent(), &cancel).await.unwrap();
             let base = snapshot_restore::download_snapshot(&first.reference,
-                &receiver.path().join("first"), &key, None, snapshot_restore::SourceTrust::Downloaded,
+                &staging, &key, None, snapshot_restore::SourceTrust::Downloaded,
                 &provider, &repository, &PhaseProgress::silent(), &cancel).await.unwrap();
             let base: BTreeMap<String, String> = base.records.iter()
                 .map(|record| (record.key.clone(), record.content_hash.clone())).collect();
@@ -6434,41 +6433,39 @@ mod tests {
             let second = package_and_upload(capture, vec![], sender.path(), &cache, meta, &key,
                 limits(4 * 1024), Some(&parent), &mut second_journal, &provider, &repository,
                 &PhaseProgress::silent(), &cancel).await.unwrap();
-            let within = crate::external_storage::receive_difference::DifferenceBudget {
-                records: 16, bytes: 1024 * 1024, dependent_bytes: 1024 * 1024, work: 1024,
-            };
 
-            let staging = receiver.path().join("receive");
             snapshot_restore::reset_test_read_counts(&staging);
             let received = snapshot_restore::download_snapshot(&second.reference, &staging, &key,
-                None, snapshot_restore::SourceTrust::AdmittedLibraryAt {
-                    root: receiver.path(), records: &base, within,
-                }, &provider, &repository, &PhaseProgress::silent(), &cancel).await.unwrap();
+                None, snapshot_restore::SourceTrust::AdmittedLibrary(receiver.path()),
+                &provider, &repository, &PhaseProgress::silent(), &cancel).await.unwrap();
             let skipping = snapshot_restore::take_test_read_counts(&staging);
             assert_eq!(received.records.len(), RECORDS);
-            let fetched: Vec<_> = received.records.iter()
-                .filter(|record| !matches!(record.source, ObjectSource::Unchanged)).collect();
-            assert_eq!(fetched.len(), 1);
-            assert_eq!(fetched[0].key, "record/000000");
-            assert_eq!(received.body(&fetched[0].source), br#"{"record":0,"value":2}"#);
-            for record in &received.records {
+            let changed: Vec<_> = received.records.iter()
+                .filter(|record| base.get(&record.key) != Some(&record.content_hash)).collect();
+            assert_eq!(changed.len(), 1);
+            assert_eq!(changed[0].key, "record/000000");
+            for (index, record) in received.records.iter().enumerate() {
+                assert_eq!(record.key, format!("record/{index:06}"));
+                let value = if index == 0 { 2 } else { 0 };
+                assert_eq!(received.body(&record.source),
+                    format!("{{\"record\":{index},\"value\":{value}}}").as_bytes());
                 assert_eq!(base.get(&record.key).is_some_and(|hash| *hash == record.content_hash),
-                    record.key != "record/000000", "{}", record.key);
+                    index != 0, "{}", record.key);
             }
             assert_eq!(skipping.packs, 1);
 
-            // The same snapshot read for a replace fetches every other record,
-            // and the one already in hand costs nothing more.
             snapshot_restore::reset_test_read_counts(&staging);
-            let replace = snapshot_restore::download_snapshot(&second.reference, &staging, &key,
+            let repeated = snapshot_restore::download_snapshot(&second.reference, &staging, &key,
                 None, snapshot_restore::SourceTrust::AdmittedLibrary(receiver.path()),
                 &provider, &repository, &PhaseProgress::silent(), &cancel).await.unwrap();
-            let refetching = snapshot_restore::take_test_read_counts(&staging);
-            assert!(replace.records.iter().all(|record| !matches!(record.source, ObjectSource::Unchanged)));
-            let bodies = replace.records.iter()
-                .map(|record| replace.body(&record.source)).collect::<Vec<_>>();
-            assert_eq!(bodies[0], br#"{"record":0,"value":2}"#);
-            assert_eq!(bodies[1], br#"{"record":1,"value":0}"#);
+            assert_eq!(snapshot_restore::take_test_read_counts(&staging).packs, 0);
+            for (index, record) in repeated.records.iter().enumerate() {
+                let value = if index == 0 { 2 } else { 0 };
+                assert_eq!(repeated.body(&record.source),
+                    format!("{{\"record\":{index},\"value\":{value}}}").as_bytes());
+            }
+            assert_eq!(repeated.records.len(), RECORDS);
+
             let full = tempfile::tempdir().unwrap();
             snapshot_restore::reset_test_read_counts(full.path());
             snapshot_restore::reset_test_turnover(full.path());
@@ -6477,22 +6474,11 @@ mod tests {
                 &PhaseProgress::silent(), &cancel).await.unwrap();
             let everything = snapshot_restore::take_test_read_counts(full.path());
             assert!(everything.packs > 2, "{everything:?}");
+            assert!(skipping.packs < everything.packs,
+                "skipping={skipping:?} everything={everything:?}");
             // Each pack is placed and released before the next one arrives.
             assert_eq!(snapshot_restore::take_test_turnover(full.path()),
                 snapshot_restore::TestTurnover { ciphertexts: 1, plaintexts: 1 });
-            assert_eq!(skipping.packs + refetching.packs, everything.packs,
-                "skipping={skipping:?} refetching={refetching:?} everything={everything:?}");
-
-            // Past the budget the receive replaces, so nothing is skipped.
-            let over = snapshot_restore::download_snapshot(&second.reference,
-                &receiver.path().join("over"), &key, None,
-                snapshot_restore::SourceTrust::AdmittedLibraryAt {
-                    root: receiver.path(), records: &base,
-                    within: crate::external_storage::receive_difference::DifferenceBudget {
-                        records: 0, ..within
-                    },
-                }, &provider, &repository, &PhaseProgress::silent(), &cancel).await.unwrap();
-            assert!(over.records.iter().all(|record| !matches!(record.source, ObjectSource::Unchanged)));
         });
     }
 
