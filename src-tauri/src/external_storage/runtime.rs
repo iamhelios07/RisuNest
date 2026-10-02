@@ -1173,6 +1173,12 @@ async fn run_cleanup(
     job: &DurableJob,
     cancel: &Cancellation,
 ) -> Result<Value> {
+    run_connected_cleanup(app,connected,&job.request.connection_id,&job.id,None,cancel).await
+}
+pub(crate) async fn run_connected_cleanup(
+    app:&AppHandle,connected:&ConnectedRepository,connection_id:&str,job_id:&str,
+    engine:Option<&super::lww_engine::ExternalLwwEngine>,cancel:&Cancellation,
+)->Result<Value> {
     let root = root(app)?;
     let writer_id = native_store(app)?
         .external_identity()
@@ -1181,7 +1187,7 @@ async fn run_cleanup(
     let unfinished = JobStore::open(&root)?
         .list_pending()?
         .into_iter()
-        .filter(|item| item.request.connection_id == job.request.connection_id && item.id != job.id)
+        .filter(|item| item.request.connection_id == connection_id && item.id != job_id)
         .map(|item| super::cleanup::UnfinishedJob {
             directory: job_directory(&root, &item.request.connection_id, &item.id),
             // A job publishes under its own snapshot identifier and may also
@@ -1198,7 +1204,7 @@ async fn run_cleanup(
     // One reading of the clock: the retention decision and the grace window
     // are measured against the same moment.
     let started = now_ms();
-    let cleanup_directory = job_directory(&root, &job.request.connection_id, &job.id);
+    let cleanup_directory = job_directory(&root, connection_id, job_id);
     let cache_root = cleanup_directory
         .parent()
         .and_then(|path| path.parent())
@@ -1222,19 +1228,36 @@ async fn run_cleanup(
             .clock_sample_after(&connected.handle.account, not_before)?
             .is_some())
     };
-    let outcome = super::cleanup::run(
-        &lease_context(&app, &root, connected, &writer_id)?,
-        &super::cleanup::CleanupRequest {
-            job_id: &job.id,
-            cleanup_supported: connected.stored.capabilities.cleanup_supported(),
-            limits: super::cleanup::CleanupLimits::default(),
-            connection_time: &connection_time,
-        },
-        &view,
-        &documents,
-        cancel,
-    )
-    .await?;
+    let protection=lease_context(app,&root,connected,&writer_id)?;
+    let request=super::cleanup::CleanupRequest {
+        job_id,cleanup_supported:connected.stored.capabilities.cleanup_supported(),
+        limits:super::cleanup::CleanupLimits::default(),connection_time:&connection_time,
+    };
+    let mut opened=None;
+    if engine.is_none() && connected.stored.descriptor.publication_strategy.is_some() {
+        let selected_connection=super::connection_commands::open_connected_with_cancel(app,connection_id,cancel).await?;
+        if selected_connection.handle.repository_id!=connected.handle.repository_id
+            || selected_connection.handle.connection_identity!=connected.handle.connection_identity
+            || selected_connection.stored.descriptor.repository_id!=connected.stored.descriptor.repository_id {
+            return Err(ProviderError::new(ErrorKind::Corrupt));
+        }
+        let fresh_after=std::time::Instant::now();
+        connected.provider.list_objects(&connected.handle,super::contract::Collection::Segments,None,1,cancel).await?;
+        let sample=connected.dependencies.requests.clock_sample_after(&connected.handle.account,fresh_after)?
+            .ok_or_else(||ProviderError::new(ErrorKind::ClockSkew))?;
+        let mut selected=super::lww_engine::ExternalLwwEngine {
+            provider:selected_connection.provider,repository:selected_connection.handle,
+            library:connected.stored.descriptor.repository_id.clone(),root_key:connected.root_key.clone(),
+            admission:None,connection_id:connection_id.into(),connection_root:root.clone(),
+            capabilities:connected.stored.capabilities.clone(),descriptor:connected.stored.descriptor.clone(),
+        };
+        selected.admit(&sample)?;opened=Some(selected);
+    }
+    let outcome=if let Some(engine)=engine.or(opened.as_ref()) {
+        super::cleanup::run_lww(&protection,&request,engine,view,&scratch,cancel).await?
+    } else {
+        super::cleanup::run(&protection,&request,&view,&documents,cancel).await?
+    };
     Ok(outcome.summary())
 }
 /// Proves the selected published state can still be read. The result is a

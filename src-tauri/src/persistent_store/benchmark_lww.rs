@@ -15,6 +15,9 @@ mod scale_certificate;
 mod measurement;
 #[path = "../../../benchmarks/lww-native/src/final_runner.rs"]
 mod final_runner;
+#[allow(dead_code)]
+#[path = "../../../benchmarks/lww-native/src/costly_runner.rs"]
+mod costly_runner;
 #[path = "../../../benchmarks/lww-native/src/fixture_configuration.rs"]
 mod fixture_configuration;
 #[allow(dead_code)]
@@ -40,6 +43,204 @@ use risunest_sync_wire::unit::UnitKey;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::{fs::File, path::Path, sync::Arc, time::Instant};
+
+pub(crate) fn final_device_file_costly_slot(
+    slot:&costly_runner::CostlySlot,store:PersistentStore,source:Option<crate::native_file_jobs::OpenedJobSource>,
+    owned:std::path::PathBuf,handoffs:&Path,jobs:Arc<crate::native_file_jobs::NativeFileJobState>,
+    persistent:Arc<crate::persistent_store::commands::PersistentStoreState>,device:Arc<crate::device_backup::DeviceBackupState>,
+    asset_hashes:Vec<String>,capture_ready:impl Fn(&str,i64)+Send+Sync+'static,
+) ->Result<Value,String> {
+    if slot.warmup!=(slot.iteration<costly_runner::WARMUPS) || slot.iteration>=costly_runner::WARMUPS+costly_runner::REPETITIONS {
+        return Err("device-file costly slot differs from the fixed matrix".into());
+    }
+    let mut raw=match slot.scenario {
+        measurement::Scenario::DuringBackup=>native_maintenance::portable_backup_raw(
+            store,&owned,handoffs,&asset_hashes,slot.iteration,capture_ready)?,
+        measurement::Scenario::RestoreAllPresent|measurement::Scenario::RestoreMissing=>native_maintenance::portable_restore_raw(
+            source.ok_or("actual portable source handle is required")?,store,owned,jobs,persistent,device,asset_hashes,
+            slot.iteration,slot.scenario==measurement::Scenario::RestoreAllPresent)?,
+        _=>return Err("scenario does not use the device-file backup route".into()),
+    };
+    raw["direction"]=serde_json::to_value(slot.direction).map_err(|e|e.to_string())?;
+    Ok(raw)
+}
+
+/// The actual capture callback holds the coherent backup lease until the foreground cycle joins.
+pub(crate) fn final_backup_overlap_costly_slot(
+    slot:&costly_runner::CostlySlot,backup:PersistentStore,owned:&Path,handoffs:&Path,
+    foreground:PersistentStore,peer:PersistentStore,sender:LwwClient,receiver:LwwClient,
+    asset_hashes:Vec<String>,
+) ->Result<Value,String> {
+    if slot.scenario!=measurement::Scenario::DuringBackup || slot.warmup!=(slot.iteration<costly_runner::WARMUPS)
+        || slot.iteration>=costly_runner::WARMUPS+costly_runner::REPETITIONS {
+        return Err("backup overlap slot differs from the fixed matrix".into());
+    }
+    if backup.repository_root()!=foreground.repository_root() || foreground.repository_root()==peer.repository_root() {
+        return Err("backup overlap requires the actual library and an independent peer".into());
+    }
+    let inputs=Arc::new(std::sync::Mutex::new(Some((foreground,peer,sender,receiver,asset_hashes.clone()))));
+    let result=Arc::new(std::sync::Mutex::new(None));
+    let result_in_callback=result.clone();
+    let direction=slot.direction;let iteration=slot.iteration;let warmup=slot.warmup;
+    let mut raw=native_maintenance::portable_backup_raw(backup,owned,handoffs,&asset_hashes,iteration,move |lease,revision| {
+        let mut output=result_in_callback.lock().unwrap();
+        let Some((mut foreground,mut peer,sender,receiver,assets))=inputs.lock().unwrap().take() else {
+            *output=Some((lease.to_owned(),revision,Err(final_runner::CycleFailure {
+                reason:"backup capture callback repeated".into(),observation:None})));return;
+        };
+        let worker=std::thread::spawn(move ||final_server_cycle(&mut foreground,&mut peer,&sender,&receiver,&assets,
+            measurement::Scenario::SettingEdit,direction,iteration,warmup));
+        let observed=match worker.join() {Ok(observed)=>observed,Err(_)=>Err(final_runner::CycleFailure {
+            reason:"backup foreground worker panicked".into(),observation:None})};
+        *output=Some((lease.to_owned(),revision,observed));
+    })?;
+    match result.lock().unwrap().take() {
+        Some((lease,revision,Ok(sample)))=>{
+            raw["foregroundObservation"]=serde_json::to_value(sample).map_err(|e|e.to_string())?;
+            raw["foregroundCaptureLease"]=json!({"lease":lease,"revision":revision,"workerJoinedWhileLeaseHeld":true});
+        },
+        Some((lease,revision,Err(failure)))=>{
+            raw["foregroundObservation"]=json!({"status":"INVALID","reason":failure.reason,"nativeObservation":failure.observation});
+            raw["foregroundCaptureLease"]=json!({"lease":lease,"revision":revision,"workerJoinedWhileLeaseHeld":true});
+        },
+        None=>raw["foregroundObservation"]=json!({"status":"INVALID","reason":"actual backup capture callback was not observed"}),
+    }
+    raw["direction"]=serde_json::to_value(direction).map_err(|e|e.to_string())?;
+    Ok(raw)
+}
+
+pub(crate) fn final_snapshot_costly_slot(
+    slot:&costly_runner::CostlySlot,store:&mut PersistentStore,snapshot_id:&str,request_id:&str,
+    jobs:&crate::native_file_jobs::NativeFileJobState,scratch:&Path,asset_hashes:&[String],
+    native_activated:impl FnOnce(i64)->Result<(),String>,
+) ->Result<Value,String> {
+    if !matches!(slot.scenario,measurement::Scenario::RestoreAllPresent|measurement::Scenario::RestoreMissing)
+        || slot.warmup!=(slot.iteration<costly_runner::WARMUPS) || slot.iteration>=costly_runner::WARMUPS+costly_runner::REPETITIONS {
+        return Err("snapshot costly slot differs from the fixed matrix".into());
+    }
+    let mut raw=native_maintenance::snapshot_restore_raw(store,snapshot_id,request_id,jobs,scratch,asset_hashes,
+        slot.iteration,slot.scenario==measurement::Scenario::RestoreAllPresent,native_activated)?;
+    raw["direction"]=serde_json::to_value(slot.direction).map_err(|e|e.to_string())?;
+    Ok(raw)
+}
+
+pub(crate) fn final_server_bootstrap_costly_slot(
+    slot:&costly_runner::CostlySlot,source:source_process::SourceProcess,destination:&mut PersistentStore,
+    io:Arc<server_sync::client::TestIoCounters>,roles:&std::collections::BTreeMap<String,std::collections::BTreeSet<String>>,
+    selected_character_id:Option<&str>,
+) ->Result<Value,String> {
+    if !matches!(slot.scenario,measurement::Scenario::FullBootstrap|measurement::Scenario::RestoreAllPresent|measurement::Scenario::RestoreMissing)
+        || slot.warmup!=(slot.iteration<costly_runner::WARMUPS) || slot.iteration>=costly_runner::WARMUPS+costly_runner::REPETITIONS {
+        return Err("server first-binding costly slot differs from the fixed matrix".into());
+    }
+    let mut record=native_bootstrap::server_bootstrap_source_raw(source,destination,io,roles,selected_character_id,slot.direction,slot.iteration)?;
+    record.scenario=slot.scenario;
+    let mut raw=serde_json::to_value(record).map_err(|e|e.to_string())?;
+    raw["route"]=json!("server-sync-first-binding");
+    Ok(raw)
+}
+
+pub(crate) fn final_server_transfer_costly_slot(
+    slot:&costly_runner::CostlySlot,source:source_process::SourceProcess,
+    destination:&mut PersistentStore,sender:&LwwClient,peer:&mut PersistentStore,receiver:&LwwClient,
+    roles:&std::collections::BTreeMap<String,std::collections::BTreeSet<String>>,barrier_hash:&str,selected_character_id:Option<&str>,
+) ->Result<Value,String> {
+    if slot.scenario!=measurement::Scenario::DuringAssetTransfer || slot.warmup!=(slot.iteration<costly_runner::WARMUPS)
+        || slot.iteration>=costly_runner::WARMUPS+costly_runner::REPETITIONS {
+        return Err("asset-transfer costly slot differs from the fixed matrix".into());
+    }
+    serde_json::to_value(native_bootstrap::server_asset_transfer_overlap_raw(source,destination,sender,peer,receiver,roles,
+        barrier_hash,selected_character_id,slot.direction,slot.iteration)?).map_err(|e|e.to_string())
+}
+
+pub(crate) async fn final_external_bootstrap_costly_slot(
+    slot:&costly_runner::CostlySlot,store:&mut PersistentStore,
+    engine:&crate::external_storage::lww_engine::ExternalLwwEngine,
+    connected:Arc<crate::external_storage::connection_commands::ConnectedRepository>,
+    provider:&Arc<crate::external_storage::fake::FakeProvider>,asset_hashes:&[String],selected_character_id:Option<&str>,
+) ->Result<Value,String> {
+    if slot.warmup!=(slot.iteration<costly_runner::WARMUPS) {return Err("external bootstrap warmup differs from the fixed matrix".into());}
+    let mut raw=native_maintenance::external_bootstrap_raw(store,engine,connected,provider,asset_hashes,selected_character_id,slot.scenario,slot.iteration).await?;
+    raw["direction"]=serde_json::to_value(slot.direction).map_err(|e|e.to_string())?;Ok(raw)
+}
+
+/// The compactor owns its runtime and counter scope; the foreground keeps the caller's scope.
+pub(crate) async fn final_compaction_overlap_costly_slot(
+    slot:&costly_runner::CostlySlot,compactor:crate::external_storage::lww_engine::ExternalLwwEngine,
+    provider:Arc<crate::external_storage::fake::FakeProvider>,directory:std::path::PathBuf,job_id:String,writer:String,
+    owner:crate::external_storage::leases::LeaseOwner,
+    ledger:Arc<crate::external_storage::lease_ledger::LocalLeaseLedger>,
+    source:&mut PersistentStore,destination:&mut PersistentStore,
+    sender:&mut crate::external_storage::lww_engine::ExternalLwwEngine,
+    receiver:&mut crate::external_storage::lww_engine::ExternalLwwEngine,asset_hashes:&[String],
+) ->Result<Value,String> {
+    use crate::external_storage::{leases,lww_compaction::{CompactionBarrier,install_compaction_barrier}};
+    if slot.scenario!=measurement::Scenario::DuringCompaction || slot.warmup!=(slot.iteration<costly_runner::WARMUPS)
+        || slot.iteration>=costly_runner::WARMUPS+costly_runner::REPETITIONS || !compactor.capabilities.lease_operations {
+        return Err("compaction overlap requires the fixed slot and actual protection support".into());
+    }
+    if Arc::as_ptr(&sender.provider) as *const ()!=Arc::as_ptr(&provider) as *const ()
+        || Arc::as_ptr(&receiver.provider) as *const ()!=Arc::as_ptr(&provider) as *const () {
+        return Err("foreground compaction observer belongs to a different provider".into());
+    }
+    let barrier=CompactionBarrier::new();install_compaction_barrier(&job_id,barrier.clone());
+    let (send,mut completed)=tokio::sync::oneshot::channel();
+    let assets=asset_hashes.to_vec();let iteration=slot.iteration;let foreground_provider=provider.clone();
+    let background=std::thread::spawn(move || {
+        let outcome=(||->Result<native_maintenance::RawCompaction,String> {
+            let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e|e.to_string())?;
+            runtime.block_on(async {
+                let context=leases::LeaseContext {root:&compactor.connection_root,connection_id:&compactor.connection_id,
+                    writer_id:&writer,descriptor:&compactor.descriptor,root_key:&compactor.root_key,
+                    provider:compactor.provider.as_ref(),repository:&compactor.repository,clock:leases::system_clock(),
+                    protection_supported:compactor.capabilities.lease_operations,ledger:Some(ledger)};
+                native_maintenance::compact_native_raw(&compactor,&provider,&directory,&job_id,&writer,&compactor.capabilities,
+                    Some((&owner,&context)),&assets,measurement::Scenario::DuringCompaction,iteration).await
+            })
+        })();
+        let _=send.send(outcome);
+    });
+    let mut foreground=None;let mut reached=false;
+    let outcome=tokio::select! {
+        result=&mut completed=>result.map_err(|_|"compaction worker ended without a receipt".to_owned()),
+        _=barrier.reached.notified()=>{
+            reached=true;
+            foreground=Some(final_external_cycle(source,destination,sender,receiver,&foreground_provider,asset_hashes,
+                measurement::Scenario::SettingEdit,slot.direction,slot.iteration,slot.warmup).await);
+            barrier.resume.notify_one();
+            completed.await.map_err(|_|"compaction worker ended without a receipt".to_owned())
+        },
+    };
+    let joined=background.join();
+    let mut errors=vec![];
+    let background=match outcome {Ok(Ok(raw))=>Some(serde_json::to_value(raw).map_err(|e|e.to_string())?),
+        Ok(Err(error))|Err(error)=>{errors.push(error);None}};
+    if joined.is_err() {errors.push("compaction worker panicked".into());}
+    let foreground=match foreground {Some(Ok(sample))=>Some(serde_json::to_value(sample).map_err(|e|e.to_string())?),
+        Some(Err(failed))=>{errors.push(failed.reason.clone());Some(json!({"status":"INVALID","reason":failed.reason,
+            "nativeObservation":failed.observation}))},None=>None};
+    Ok(json!({"status":"INVALID","scenario":"during-compaction","direction":slot.direction,
+        "iteration":slot.iteration,"warmup":slot.warmup,"actualProtectedInputBarrierReached":reached,
+        "background":background,"foregroundObservation":foreground,
+        "providerIoScope":"whole overlap, includes foreground; foreground provider counters are non-additive",
+        "nativeCounterScopes":"separate actual compactor and foreground worker threads",
+        "sourceObservation":null,"rendererAdoption":null,"errors":errors}))
+}
+
+pub(crate) async fn final_remote_backup_costly_slot(
+    slot:&costly_runner::CostlySlot,store:&mut PersistentStore,state:&crate::persistent_store::commands::PersistentStoreState,
+    connected:&crate::external_storage::connection_commands::ConnectedRepository,job:&crate::external_storage::job_store::DurableJob,
+    provider:&Arc<crate::external_storage::fake::FakeProvider>,permit:crate::native_file_jobs::admission::Permit,
+    asset_hashes:&[String],selected_character_id:Option<String>,
+) ->Result<(Value,Option<crate::native_file_jobs::admission::Permit>),String> {
+    if !matches!(slot.scenario,measurement::Scenario::RestoreAllPresent|measurement::Scenario::RestoreMissing)
+        || slot.warmup!=(slot.iteration<costly_runner::WARMUPS) || slot.iteration>=costly_runner::WARMUPS+costly_runner::REPETITIONS {
+        return Err("remote backup costly slot differs from the fixed matrix".into());
+    }
+    let (mut raw,guard)=native_maintenance::remote_backup_restore_raw(store,state,connected,job,provider,permit,asset_hashes,
+        selected_character_id,slot.iteration,slot.scenario==measurement::Scenario::RestoreAllPresent).await?;
+    raw["direction"]=serde_json::to_value(slot.direction).map_err(|e|e.to_string())?;Ok((raw,guard))
+}
 
 #[derive(Clone, Copy, Debug, Serialize)]
 pub(crate) enum SmallChange { Setting, Preset, Append }
@@ -1120,6 +1321,69 @@ pub(crate) fn append_native_shard(store:&mut PersistentStore, shard:&native_shar
     store.commit_with_asset_aliases(&commit,&aliases).unwrap();
 }
 
+/// This excluded delta is reported alongside the unchanged base certificate.
+pub(crate) fn prepare_large_asset_delta(store:&mut PersistentStore,base:&scale_certificate::ScaleCertificate,
+    sender:&LwwClient)->Result<Value,String> {
+    use crate::asset_repository::{PayloadCas,owner_manifest_codec::{encode_owner_manifest,decode_owner_manifest,OwnerManifestEntry}};
+    base.validate()?;
+    let before=store.list_asset_aliases(None).map_err(|e|e.to_string())?.value;
+    let base_hashes=base.assets.iter().map(|asset|asset.payload_hash.clone()).collect::<std::collections::BTreeSet<_>>();
+    let before_hashes=before.iter().filter_map(|alias|alias.object_hash.clone()).collect::<std::collections::BTreeSet<_>>();
+    if before.len()!=base.assets.len() || before_hashes!=base_hashes {
+        return Err("large Asset delta requires the exact certified base alias inventory".into());
+    }
+    let cas=PayloadCas::new(store.repository_root()).map_err(|e|e.to_string())?;
+    let bytes=(0..96*1024u32).map(|index|((index.wrapping_mul(73)^index.rotate_left(11)^0x5b)&255) as u8).collect::<Vec<_>>();
+    let payload=cas.prepare_bytes(&bytes).map_err(|e|e.to_string())?;
+    if base_hashes.contains(&payload.content_hash) {return Err("large delta collides with certified base Asset".into());}
+    let owner=super::AssetOwnerLocator::CharacterAdditionalAssets {character_id:"synthetic-character-0".into()};
+    let previous=store.read_asset_owner_head(&owner,None).map_err(|e|e.to_string())?.ok_or("selected fixture owner absent")?.value;
+    let previous_manifest=previous.manifest_hash.ok_or("selected fixture owner manifest absent")?;
+    let encoded=cas.read_object(&previous_manifest).map_err(|e|e.to_string())?.ok_or("selected owner manifest body absent")?;
+    let mut entries=decode_owner_manifest(&encoded).map_err(|e|e.to_string())?;
+    let key="assets/synthetic-transfer-large.bin";
+    entries.push(OwnerManifestEntry {tuple:["Synthetic transfer Asset".into(),key.into(),"bin".into()],
+        payload_hash:Some(hex::decode(&payload.content_hash).map_err(|e|e.to_string())?.try_into().map_err(|_|"invalid actual payload hash")?)});
+    let manifest=cas.prepare_bytes(&encode_owner_manifest(&entries).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+    store.asset_object_catalog().register(&[
+        super::asset_object_catalog::AssetObjectRegistration {object_hash:payload.content_hash.clone(),byte_size:payload.byte_size},
+        super::asset_object_catalog::AssetObjectRegistration {object_hash:manifest.content_hash.clone(),byte_size:manifest.byte_size}],1).map_err(|e|e.to_string())?;
+    let mut character=store.read_character("synthetic-character-0",None).map_err(|e|e.to_string())?.ok_or("selected fixture parent absent")?.value;
+    character["additionalAssets"]=json!(entries.iter().map(|entry|entry.tuple.clone()).collect::<Vec<_>>());
+    let alias=super::AssetAlias {key:key.into(),object_hash:Some(payload.content_hash.clone()),kind:"asset".into(),
+        size:payload.byte_size as i64,mime:"application/octet-stream".into(),name:"Synthetic transfer Asset".into(),ext:"bin".into(),
+        inlay_type:None,width:None,height:None,metadata:json!({})};
+    store.commit_with_asset_aliases(&WorkingSetCommit {expected_revision:store.revision().map_err(|e|e.to_string())?,
+        character:Some(character),asset_owner_heads:Some(vec![super::AssetOwnerHead::present(owner.clone(),manifest.content_hash.clone(),entries.len() as i64)]),
+        ..Default::default()},std::slice::from_ref(&alias)).map_err(|e|e.to_string())?;
+    server_sync::lww_tests::drain_publications(sender,store,&[]).map_err(|e|format!("{e:?}"))?;
+    let path=cas.object_path(&payload.content_hash).map_err(|e|e.to_string())?.ok_or("large delta physical file absent")?;
+    let (metadata,sparse,reparse)=observed_file_kind(&path)?;
+    if !metadata.is_file() || sparse || reparse || metadata.len()!=payload.byte_size || metadata.len()<=64*1024 {
+        return Err("large delta actual materialized body proof failed".into());
+    }
+    let read=cas.read_object(&payload.content_hash).map_err(|e|e.to_string())?.ok_or("large delta body absent")?;
+    if risunest_sync_wire::hash(&read)!=payload.content_hash {return Err("large delta physical digest mismatch".into());}
+    let catalog_size:i64=store.connection.query_row("SELECT byte_size FROM asset_objects WHERE object_hash=?1",
+        [&payload.content_hash],|row|row.get(0)).map_err(|e|e.to_string())?;
+    if catalog_size!=payload.byte_size as i64
+        || !store.lww_read_outbox(store.lww_binding_authority().map_err(|e|e.to_string())?,1)
+            .map_err(|e|e.to_string())?.entries.is_empty() {
+        return Err("large delta actual catalog or publication settlement proof differs".into());
+    }
+    let after=store.list_asset_aliases(None).map_err(|e|e.to_string())?.value;
+    let after_hashes=after.iter().filter_map(|alias|alias.object_hash.clone()).collect::<std::collections::BTreeSet<_>>();
+    if after.len()!=before.len()+1 || after_hashes.len()!=base_hashes.len()+1
+        || store.read_asset_owner_head(&owner,None).map_err(|e|e.to_string())?.ok_or("delta owner missing after publication")?.value.manifest_hash.as_deref()!=Some(manifest.content_hash.as_str()) {
+        return Err("large delta owner and unique current inventory proof differs".into());
+    }
+    Ok(json!({"phase":"excluded-certified-base-plus-explicit-delta","baseCertificateIsPostSetup":false,
+        "baseOwnedAssetCount":base.assets.len(),"currentUniqueOwnedAssetCount":after_hashes.len(),
+        "payloadHash":payload.content_hash,"byteSize":payload.byte_size,"ownerCharacterId":"synthetic-character-0",
+        "ownerManifestHash":manifest.content_hash,"ownerEntryCount":entries.len(),"physicalRegularFile":true,
+        "catalogByteSize":catalog_size,"normalPublicationDrained":true,"sourcePhysicalReadProof":null,"currentAssetHashes":after_hashes}))
+}
+
 #[derive(Debug,Serialize)]
 pub(crate) struct NativeBuildProgress {
     pub shards:u64,
@@ -1465,6 +1729,26 @@ fn lazy_native_constructor_stops_on_observed_persistence_and_honors_callback_can
 }
 
 #[test]
+fn large_asset_delta_keeps_base_certificate_and_full_prior_conversation() {
+    let server=LocalServerFixture::new();
+    let (_directory,mut store)=server_sync::lww_tests::local();
+    let plan=native_shards::ShardPlan {ordinary_messages:2,assets_per_owner:2,..native_shards::ShardPlan::new(11,3)};
+    let base=build_native_fixture(&mut store,plan,scale_certificate::ScaleRequirement::Correctness {
+        minimum_database_bytes:4096,minimum_assets:3},|_|Ok(())).unwrap();
+    let sender=server.client(&store);let config=sender.client.config();
+    bind(&mut store,SyncTarget::Server(config.endpoint.clone()),&config.endpoint,&config.library_id);
+    let prior=store.read_conversation("synthetic-character-0","synthetic-conversation-0",None).unwrap().unwrap().value;
+    let receipt=prepare_large_asset_delta(&mut store,&base.certificate,&sender).unwrap();
+    assert_eq!(receipt["baseCertificateIsPostSetup"],false);
+    assert_eq!(receipt["baseOwnedAssetCount"],3);assert_eq!(receipt["currentUniqueOwnedAssetCount"],4);
+    assert_eq!(receipt["byteSize"],96*1024);assert_eq!(receipt["sourcePhysicalReadProof"],Value::Null);
+    assert_eq!(base.certificate.validate().unwrap().unique_materialized_owned_assets,3);
+    assert_eq!(store.read_conversation("synthetic-character-0","synthetic-conversation-0",None).unwrap().unwrap().value,prior);
+    assert!(prepare_large_asset_delta(&mut store,&base.certificate,&sender).unwrap_err().contains("exact certified base"));
+    eprintln!("M-LARGE-ASSET-DELTA-CORRECTNESS {receipt}");
+}
+
+#[test]
 fn additional_fixed_changes_preserve_full_message_lists_and_stable_personas() {
     let (_directory,mut store) = server_sync::lww_tests::local();
     let generated = tempfile::tempdir().unwrap();
@@ -1666,7 +1950,7 @@ fn actual_compaction_producer_keeps_unobserved_source_and_protection_invalid() {
         assert!(record.native_publication_complete_ms.is_some());
         assert!(record.native_observation.requests>0);
         assert!(record.source_observation.is_none());assert!(!record.protection_run_completed);
-        assert!(record.native_observation.hash_totals().is_err());
+        assert!(record.native_observation.hash_totals().unwrap().bytes>0);
     });
 }
 

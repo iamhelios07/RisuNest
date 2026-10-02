@@ -743,6 +743,7 @@ fn validate_live_columns(source: &Connection) -> StoreResult<()> {
             && !matches!(
                 name.as_str(),
                 "asset_alias_replacement_candidates"
+                    | "snapshot_original_meta"
                     | "snapshot_leases"
                     | "content_change_context"
                     | "content_changes"
