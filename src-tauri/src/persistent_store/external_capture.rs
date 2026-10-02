@@ -259,6 +259,8 @@ pub(crate) fn original_unit_dependency_inventory(
                 if !page && !relations {required.insert(value.to_owned());}
                 Ok(())
             });
+            #[cfg(test)]
+            if visited.is_err() {crate::persistent_store::hash_work::incomplete("native_backup_reference_verify");}
             check(probe)?;
             if let Some(error) = source_error { return Err(error); }
             visited.map_err(|_| invalid("Backup reference tree integrity failed"))?;
@@ -1253,6 +1255,21 @@ mod hydration_tests {
         descriptor.dependencies.clear();
         invalid_units.insert(UnitKey::new(&["archive","synthetic"]).unwrap(),risunest_sync_wire::unit::UnitValue::object(descriptor).unwrap());
         assert!(original_unit_dependency_inventory(&invalid_units,&|hash| super::super::message_pages::object_body(&store.connection,hash),&|_| Ok(Some(32)),&crate::local_backup::NeverCancelled,false,&mut |_,_,_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn original_unit_inventory_failed_reference_decode_invalidates_hash_receipt() {
+        use risunest_sync_wire::{descriptor::RecordDescriptor,unit::{UnitKey,UnitValue}};
+        let malformed = b"synthetic invalid reference JSON";
+        let root = risunest_sync_wire::hash(malformed);
+        let mut descriptor = RecordDescriptor::content(risunest_sync_wire::hash(b"synthetic opaque payload"));
+        descriptor.dependency_root = Some(root.clone());
+        let units = BTreeMap::from([(UnitKey::new(&["future-unit","malformed-tree"]).unwrap(),UnitValue::object(descriptor).unwrap())]);
+        crate::persistent_store::hash_work::reset_hash_work();
+        assert!(original_unit_dependency_inventory(&units,&|hash| {assert_eq!(hash,root); Ok(Some(malformed.to_vec()))},&|_| Ok(None),&crate::local_backup::NeverCancelled,false,&mut |_,_,_| Ok(())).is_err());
+        let observed = crate::persistent_store::hash_work::take_hash_work();
+        assert_eq!(observed.incomplete["native_backup_reference_verify"],1);
+        assert_eq!(observed.domains["native_backup_dependency_source"].bytes,malformed.len() as u64);
     }
 
     #[test]
