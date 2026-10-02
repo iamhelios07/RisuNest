@@ -51,11 +51,25 @@ fn load(path:&Path,requirement:scale_certificate::ScaleRequirement,output:&Path)
     let fork=tempfile::tempdir().map_err(|e|e.to_string())?;
     std::fs::create_dir_all(fork.path().join("persistent")).map_err(|e|e.to_string())?;
     std::fs::copy(&database,fork.path().join("persistent/persistent.sqlite")).map_err(|e|e.to_string())?;
-    for asset in &certificate.assets {
-        let source=root.join("assets/objects").join(&asset.payload_hash[..2]).join(&asset.payload_hash[2..]);
-        let destination=fork.path().join("assets/objects").join(&asset.payload_hash[..2]).join(&asset.payload_hash[2..]);
-        std::fs::create_dir_all(destination.parent().ok_or("canonical Asset parent absent")?).map_err(|e|e.to_string())?;
-        std::fs::copy(source,destination).map_err(|e|e.to_string())?;
+    // The canonical closure includes owner manifests and live controls as well as alias payloads.
+    for shard in std::fs::read_dir(root.join("assets/objects")).map_err(|e|e.to_string())? {
+        let shard=shard.map_err(|e|e.to_string())?;let name=shard.file_name();
+        let name=name.to_str().ok_or("canonical CAS shard is not UTF-8")?;
+        let kind=shard.file_type().map_err(|e|e.to_string())?;
+        if !kind.is_dir() || kind.is_symlink() || name.len()!=2 || !name.bytes().all(|byte|byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()) {
+            return Err("canonical CAS shard is not an actual hash directory".into());
+        }
+        let destination=fork.path().join("assets/objects").join(name);
+        std::fs::create_dir_all(&destination).map_err(|e|e.to_string())?;
+        for object in std::fs::read_dir(shard.path()).map_err(|e|e.to_string())? {
+            let object=object.map_err(|e|e.to_string())?;let file=object.file_name();
+            let file=file.to_str().ok_or("canonical CAS object is not UTF-8")?;
+            let kind=object.file_type().map_err(|e|e.to_string())?;
+            if !kind.is_file() || kind.is_symlink() || file.len()!=62 || !file.bytes().all(|byte|byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()) {
+                return Err("canonical CAS object is not an actual regular hash file".into());
+            }
+            std::fs::copy(object.path(),destination.join(file)).map_err(|e|e.to_string())?;
+        }
     }
     let mut store=PersistentStore::open(fork.path()).map_err(|e|e.to_string())?;
     let fork_writer=store.lww_clock_state().map_err(|e|e.to_string())?.writer_id;
@@ -496,7 +510,7 @@ async fn costly_external(output:&Path,fixture:&mut CycleFixture,hashes:&[String]
     use crate::external_storage::{leases,lease_ledger::LocalLeaseLedger,job_store::{JobStore,DurableJob,StartJobRequest}};
     let setup=tempfile::tempdir().map_err(|e|e.to_string())?;
     let connected=connected(fixture).await?;
-    let backup=if route=="remote-backup" {Some(prepare_remote_backup(&mut fixture.a,&connected,&setup.path().join("remote-backup")).await?)}else{None};
+    let backup=if route=="remote-backup" && scenario!=Scenario::DuringCompaction && scenario!=Scenario::DuringBackup && scenario!=Scenario::DuringAssetTransfer {Some(prepare_remote_backup(&mut fixture.a,&connected,&setup.path().join("remote-backup")).await?)}else{None};
     if scenario==Scenario::ConsolidatedSnapshot {
         fixture.sender.compact_published(&setup.path().join("consolidated"),&uuid::Uuid::new_v4().to_string(),
             &fixture.a.lww_clock_state().map_err(|e|e.to_string())?.writer_id,&fixture.sender.capabilities,&Cancellation::default(),None)
@@ -579,9 +593,9 @@ async fn costly_external(output:&Path,fixture:&mut CycleFixture,hashes:&[String]
                 raw["direction"]=serde_json::to_value(direction).map_err(|e|e.to_string())?;
                 Ok::<Value,String>(raw)
             }).await.map_err(|e|e.to_string())?
-        } else if route=="serverless-bootstrap" {
+        } else if route=="serverless-bootstrap" && scenario!=Scenario::DuringCompaction && scenario!=Scenario::DuringAssetTransfer {
             final_external_bootstrap_costly_slot(&slot,&mut destination,&fixture.sender,connected.clone(),&fixture.provider,hashes,Some("synthetic-character-0")).await
-        } else if route=="remote-backup" {
+        } else if route=="remote-backup" && scenario!=Scenario::DuringCompaction && scenario!=Scenario::DuringAssetTransfer {
             let request:StartJobRequest=serde_json::from_value(json!({"connectionId":connected.stored.id,"kind":"restore",
                 "snapshotId":backup.as_ref().ok_or("actual full backup producer absent")?.snapshot_id,
                 "restoreAreas":["library","referencedAssets","hypa","local-plugins","local-settings"]})).map_err(|e|e.to_string())?;
