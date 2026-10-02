@@ -483,7 +483,61 @@ async fn costly_external(output:&Path,fixture:&mut CycleFixture,hashes:&[String]
             matches!(scenario,Scenario::FullBootstrap|Scenario::ConsolidatedSnapshot|Scenario::IncomparableSnapshots))?;
         write(output,&format!("costly-{label}-setup.json"),&partition)?;
         let reads_before=source_ids.keys().map(|id|(id.clone(),fixture.provider.read_attempts(id))).collect::<BTreeMap<_,_>>();
-        let raw=if route=="serverless-bootstrap" {
+        let raw=if scenario==Scenario::DuringBackup {
+            use crate::external_storage::contract::{Provider,SecretRef,OpenMode};
+            let (source,peer,source_engine,peer_engine)=match slot.direction {
+                FinalDirection::AtoB=>(&fixture.a,&fixture.b,&fixture.sender,&fixture.receiver),
+                FinalDirection::BtoA=>(&fixture.b,&fixture.a,&fixture.receiver,&fixture.sender),
+            };
+            let backup=source.open_native_job_store().map_err(|e|e.to_string())?;
+            let foreground=source.open_native_job_store().map_err(|e|e.to_string())?;
+            let peer=peer.open_native_job_store().map_err(|e|e.to_string())?;
+            let mut engines=Vec::new();
+            for engine in [source_engine,peer_engine] {
+                let (handle,capabilities)=fixture.provider.open_repository(&connected.stored.config,&SecretRef("fixture".into()),
+                    OpenMode::Existing,&Cancellation::default()).await.map_err(|e|format!("{e:?}"))?;
+                if handle.repository_id!=engine.repository.repository_id || handle.connection_identity!=engine.repository.connection_identity {
+                    return Err("actual backup foreground repository reopen changed identity".into());
+                }
+                engines.push(crate::external_storage::lww_engine::ExternalLwwEngine {provider:engine.provider.clone(),repository:handle,
+                    library:engine.library.clone(),root_key:zeroize::Zeroizing::new(*engine.root_key),admission:engine.admission.clone(),
+                    connection_id:engine.connection_id.clone(),connection_root:engine.connection_root.clone(),
+                    capabilities,descriptor:engine.descriptor.clone()});
+            }
+            let receiver=engines.pop().ok_or("actual foreground receiver absent")?;
+            let sender=engines.pop().ok_or("actual foreground sender absent")?;
+            let provider=fixture.provider.clone();let assets=hashes.to_vec();
+            let direction=slot.direction;let iteration=slot.iteration;let warmup=slot.warmup;
+            let owned=setup.path().join(format!("backup-{label}"));let handoffs=setup.path().join(format!("handoffs-{label}"));
+            tokio::task::spawn_blocking(move || {
+                let inputs=Arc::new(std::sync::Mutex::new(Some((foreground,peer,sender,receiver,provider,assets.clone()))));
+                let result=Arc::new(std::sync::Mutex::new(None));let callback_result=result.clone();
+                let mut raw=native_maintenance::portable_backup_raw(backup,&owned,&handoffs,&assets,iteration,move |lease,revision| {
+                    let observed=match inputs.lock().unwrap().take() {
+                        Some((mut foreground,mut peer,mut sender,mut receiver,provider,assets))=> {
+                            std::thread::spawn(move || {
+                                let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build()
+                                    .map_err(|error|final_runner::CycleFailure {reason:error.to_string(),observation:None})?;
+                                runtime.block_on(final_external_cycle(&mut foreground,&mut peer,&mut sender,&mut receiver,
+                                    &provider,&assets,Scenario::SettingEdit,direction,iteration,warmup))
+                            }).join().unwrap_or_else(|_|Err(final_runner::CycleFailure {reason:"backup foreground worker panicked".into(),observation:None}))
+                        },
+                        None=>Err(final_runner::CycleFailure {reason:"backup capture callback repeated".into(),observation:None}),
+                    };
+                    *callback_result.lock().unwrap()=Some((lease.to_owned(),revision,observed));
+                })?;
+                match result.lock().unwrap().take() {
+                    Some((lease,revision,observed))=>{
+                        raw["foregroundCaptureLease"]=json!({"lease":lease,"revision":revision,"workerJoinedWhileLeaseHeld":true});
+                        raw["foregroundObservation"]=match observed {Ok(sample)=>serde_json::to_value(sample).map_err(|e|e.to_string())?,
+                            Err(failure)=>json!({"status":"INVALID","reason":failure.reason,"nativeObservation":failure.observation})};
+                    },
+                    None=>raw["foregroundObservation"]=json!({"status":"INVALID","reason":"actual backup capture callback was not observed"}),
+                }
+                raw["direction"]=serde_json::to_value(direction).map_err(|e|e.to_string())?;
+                Ok::<Value,String>(raw)
+            }).await.map_err(|e|e.to_string())?
+        } else if route=="serverless-bootstrap" {
             final_external_bootstrap_costly_slot(&slot,&mut destination,&fixture.sender,connected.clone(),&fixture.provider,hashes,Some("synthetic-character-0")).await
         } else if route=="remote-backup" {
             let request:StartJobRequest=serde_json::from_value(json!({"connectionId":connected.stored.id,"kind":"restore",
@@ -516,7 +570,7 @@ async fn costly_external(output:&Path,fixture:&mut CycleFixture,hashes:&[String]
         write(output,&format!("costly-{label}-raw.json"),&raw)?;
         let reads=source_ids.keys().map(|id|Ok((id.clone(),fixture.provider.read_attempts(id).checked_sub(reads_before[id])
             .ok_or("actual source per-object read counter regressed")? as u64))).collect::<Result<BTreeMap<_,_>,String>>()?;
-        let reporting=external_native_result(&raw,&slot,&partition,&reads);
+        let reporting=if scenario==Scenario::DuringBackup {server_native_result(&raw,&slot,&partition)}else{external_native_result(&raw,&slot,&partition,&reads)};
         let summary=match reporting {Ok(summary)=>summary,Err(error)=>json!({"status":"INVALID","slot":slot,"error":error,
             "actualSourceObjectReadAttempts":reads,"sourceFileReads":null,"decodedAssetSourceReads":null,"rendererAdoption":null})};
         write(output,&format!("costly-{label}-native-result.json"),&summary)?;summaries.push(summary);
