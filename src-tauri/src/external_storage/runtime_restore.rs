@@ -78,6 +78,52 @@ pub(crate) fn completed_restore(app: &AppHandle, job: &DurableJob) -> Result<Opt
     completed_restore_in_store(&runtime::native_store(app)?, job)
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all="camelCase",deny_unknown_fields)]
+pub(crate) struct RestoreAdoptionRequest {
+    pub job_id:String,
+    pub received_revision:String,
+    pub selected_character_id:Option<String>,
+}
+
+fn confirm_restore_adoption_in_store(store:&PersistentStore,root:&Path,request:&RestoreAdoptionRequest)->Result<Value> {
+    let revision=request.received_revision.parse::<i64>().map_err(|_|corrupt())?;
+    if revision<0 || revision.to_string()!=request.received_revision {return Err(corrupt());}
+    let jobs=JobStore::open(root)?;
+    let mut job=jobs.read(&request.job_id)?;
+    let receipt=completed_restore_in_store(store,&job)?.ok_or_else(||ProviderError::new(ErrorKind::PreconditionFailed))?;
+    if receipt["receivedRevision"]!=request.received_revision {return Err(ProviderError::new(ErrorKind::PreconditionFailed));}
+    let intent:RestoreCommitIntent=serde_json::from_value(job.summary["restoreCommit"].clone()).map_err(|_|corrupt())?;
+    let identity=store.external_identity().map_err(pds_error)?;
+    if identity.store_id!=job.admission_identity.store_id
+        || identity.library_epoch!=job.admission_identity.library_epoch
+        || identity.selection_epoch!=job.admission_identity.selection_epoch
+        || identity.generation!=format!("revision-{revision}")
+        || store.lww_binding_authority().map_err(pds_error)?!=intent.header.binding_authority {
+        return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+    }
+    if let Some(id)=&request.selected_character_id {
+        if id.is_empty() || id.contains('\0') {return Err(corrupt());}
+        if store.read_character_summary(id,None).map_err(pds_error)?.is_none() {
+            return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+        }
+    }
+    let adopted=serde_json::to_value(request).map_err(runtime::local_error)?;
+    if let Some(existing)=job.summary.get("restoreAdopted") {
+        if existing!=&adopted {return Err(ProviderError::new(ErrorKind::PreconditionFailed));}
+        return Ok(receipt);
+    }
+    job.summary["restoreAdopted"]=adopted;
+    job.summary["updatedAtMs"]=json!(runtime::now_ms().to_string());
+    jobs.put(&job)?;
+    Ok(receipt)
+}
+
+#[tauri::command]
+pub(crate) fn external_storage_confirm_restore_adoption(app:AppHandle,request:RestoreAdoptionRequest)->Result<Value> {
+    confirm_restore_adoption_in_store(&runtime::native_store(&app)?,&runtime::root(&app)?,&request)
+}
+
 pub(crate) fn application_started(job: &DurableJob) -> bool {
     job.request.kind == JobKind::Restore && job.summary["applicationStarted"] == true
 }
@@ -568,6 +614,31 @@ mod tests {
         store.lww_commit_replacement_with_device_sections(&intent.header,&intent.staging_id,Some(&Default::default()),&sections.iter().collect::<Vec<_>>()).unwrap();
         assert_eq!(store.device_store().unwrap().read_setting("accountst").unwrap(),Some(json!("synthetic restored setting")));
         pending
+    }
+
+    #[test]
+    fn renderer_adoption_accepts_exact_durable_restore_and_refuses_another_generation() {
+        let root=tempfile::tempdir().unwrap();
+        let mut store=PersistentStore::open(root.path()).unwrap();
+        let input=serde_json::from_value(json!({"connectionId":"synthetic-connection","kind":"restore","snapshotId":"synthetic-snapshot","targetRevision":"0"})).unwrap();
+        let job=DurableJob::new(input,false,1,store.external_identity().unwrap());
+        let pending=commit_fixture(&mut store,root.path(),&job);
+        let receipt=completed_restore_in_store(&store,&pending).unwrap().unwrap();
+        let request=RestoreAdoptionRequest{job_id:job.id.clone(),received_revision:receipt["receivedRevision"].as_str().unwrap().into(),selected_character_id:None};
+        assert_eq!(confirm_restore_adoption_in_store(&store,root.path(),&request).unwrap(),receipt);
+        let adopted=JobStore::open(root.path()).unwrap().read(&job.id).unwrap();
+        assert_eq!(confirm_restore_adoption_in_store(&store,root.path(),&request).unwrap(),receipt);
+        assert_eq!(JobStore::open(root.path()).unwrap().read(&job.id).unwrap().summary,adopted.summary);
+        let mut wrong=request.clone(); wrong.selected_character_id=Some("synthetic-missing-character".into());
+        assert_eq!(confirm_restore_adoption_in_store(&store,root.path(),&wrong).unwrap_err().kind,ErrorKind::PreconditionFailed);
+        let mut wrong=request.clone(); wrong.received_revision="01".into();
+        assert_eq!(confirm_restore_adoption_in_store(&store,root.path(),&wrong).unwrap_err().kind,ErrorKind::Corrupt);
+        wrong.received_revision="2".into();
+        assert_eq!(confirm_restore_adoption_in_store(&store,root.path(),&wrong).unwrap_err().kind,ErrorKind::PreconditionFailed);
+        let stage=store.replace_begin().unwrap();
+        store.replace_put_root(&stage.staging_id,&json!({"language":"synthetic later replacement"})).unwrap();
+        store.replace_commit(&stage.staging_id,Some(1)).unwrap();
+        assert_eq!(confirm_restore_adoption_in_store(&store,root.path(),&request).unwrap_err().kind,ErrorKind::PreconditionFailed);
     }
 
     #[test]

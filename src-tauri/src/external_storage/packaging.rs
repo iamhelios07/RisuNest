@@ -3324,6 +3324,70 @@ pub(crate) async fn package_and_upload(
     package_and_upload_protected(capture,sections,repository_root,cache_root,metadata,root_key,limits,parent,journal,provider,repository,prepared,cancel,None).await
 }
 
+pub(crate) struct AssetCatalogSource {
+    pub content_hash:String,
+    pub byte_length:u64,
+    pub source:ObjectSource,
+}
+pub(crate) struct CompletedAssetCatalog {
+    pub catalog:wire::StoredObject,
+    pub referenced:Vec<RemoteObject>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn package_and_upload_asset_catalog(
+    sources:Vec<AssetCatalogSource>,repository_root:&Path,cache_root:&Path,
+    root_key:&[u8;32],limits:PackageLimits,journal:&mut TransferJournal,
+    provider:&dyn Provider,repository:&RepositoryHandle,prepared:&Arc<PhaseProgress>,
+    cancel:&Cancellation,
+    protection:Option<(&super::leases::LeaseOwner,&super::leases::LeaseContext<'_>)>,
+) -> Result<CompletedAssetCatalog> {
+    cancel.check()?;
+    let mut sources=sources.into_iter().map(|source| {
+        risunest_sync_wire::validate_hash(&source.content_hash).map_err(corrupt)?;
+        Ok(SourceEntry{kind:wire::CatalogEntryKind::Object,key:format!("object/{}",source.content_hash),
+            content_sha256:source.content_hash,byte_length:source.byte_length,
+            source:source.source,file_offset:None,compression:CompressionPolicy::AlreadyCompressed})
+    }).collect::<Result<Vec<_>>>()?;
+    sources.sort_by(|a,b|a.key.cmp(&b.key));
+    if sources.windows(2).any(|pair|pair[0].key==pair[1].key) {
+        return Err(corrupt("duplicate asset catalog source"));
+    }
+    let fingerprint=catalog_fingerprint(wire::CatalogKind::Assets,&sources);
+    let build_root=cache_root.join("build");
+    fs::create_dir_all(&build_root).map_err(transient)?;
+    let mut cache=PackageCache::open(cache_root)?;
+    let mut evidence=ObjectEvidence::open(repository_root,journal.connection_id())?;
+    let mut referenced=Vec::new();
+    let cached=match cache.catalog(&repository.repository_id,repository,wire::CatalogKind::Assets,&fingerprint)? {
+        Some(root)=>revalidate_cached_catalog(&root,&mut cache,&mut evidence,journal,root_key,provider,repository,cancel).await?,
+        None=>None,
+    };
+    let root=if let Some(objects)=cached {
+        let root=objects.first().cloned().ok_or_else(||corrupt("empty asset catalog closure"))?;
+        referenced=objects;
+        root
+    } else {
+        let mut hydration=SourceHydration::default();
+        let mut maintenance=MaintenanceReport::default();
+        let (entries,uploaded)=build_entries(wire::CatalogKind::Assets,sources,
+            &repository_root.join("external-storage"),&repository.repository_id,&build_root,
+            root_key,limits,None,None,false,&mut cache,&mut evidence,journal,provider,repository,
+            prepared,&mut maintenance,&mut hydration,cancel).await?;
+        referenced.extend(uploaded);
+        build_catalog(wire::CatalogKind::Assets,entries,&fingerprint,&repository.repository_id,
+            &build_root,root_key,limits,None,None,false,&mut cache,&mut evidence,journal,
+            provider,repository,cancel,&mut referenced).await?
+    };
+    if let Some((owner,context))=protection {
+        owner.renew_if_due(context,cancel).await?;
+        if let Some(reason)=owner.recheck(context,cancel).await? {
+            return Err(super::leases::yield_error(reason));
+        }
+    }
+    Ok(CompletedAssetCatalog{catalog:root.stored(repository)?,referenced})
+}
+
 pub(crate) async fn package_and_upload_protected(
     capture: CapturedSnapshot,
     sections: Vec<CapturedSection>,
@@ -4856,6 +4920,68 @@ mod tests {
     }
 
     #[test]
+    fn database_first_backup_validates_unindexed_present_asset_without_body_io() {
+        runtime().block_on(async {
+            let root=tempfile::tempdir().unwrap();
+            let body=b"synthetic present remote backup body";
+            let (capture,hash)=captured(root.path(),"db-first",0,b"{}",body);
+            let provider=FakeProvider::new(false);
+            let repository=fake::repository();let key=[21;32];
+            let mut metadata=metadata("db-first",&capture);
+            metadata.purpose=SnapshotPurpose::BackupBundle{source:wire_control::BundleSource::Device{writer_id:"synthetic-writer".into()},remote_generation:None,original_units:BTreeMap::new()};
+            let mut transfer=journal(&root.path().join("db-first-upload"),"db-first",&capture);
+            let completed=package_and_upload(capture,Vec::new(),root.path(),&root.path().join("db-first-cache"),metadata,&key,limits(256*1024),None,&mut transfer,&provider,&repository,&PhaseProgress::silent(),&Cancellation::default()).await.unwrap();
+            let cache=PackageCache::open(&root.path().join("db-first-cache")).unwrap();
+            let identity=ObjectEvidence::identity(&completed.asset_catalog,&repository).unwrap();
+            let asset_packs=cache.graph_of(&completed.repository_id,&repository,&identity).unwrap().into_iter().filter(|object|object.role==ObjectRole::Pack).map(|object|(object.receipt.locator.object.clone(),provider.read_attempts(&object.receipt.locator.object))).collect::<Vec<_>>();
+            let destination=tempfile::tempdir().unwrap();
+            crate::persistent_store::PersistentStore::open(destination.path()).unwrap();
+            PayloadCas::new(destination.path()).unwrap().prepare_bytes(body).unwrap();
+            crate::asset_repository::body_io::reset_body_io();
+            crate::asset_repository::body_io::register_object_purpose(&hash,crate::asset_repository::body_io::BodyPurpose::Asset);
+            crate::external_storage::worker_observation::begin();
+            let database=snapshot_restore::download_snapshot_database_first(&completed.reference,&root.path().join("db-first-read"),destination.path(),root.path(),"synthetic-connection",&key,&provider,&repository,&Cancellation::default()).await.unwrap();
+            let workers=crate::external_storage::worker_observation::take();
+            let work=crate::asset_repository::body_io::take_body_io();
+            assert!(work.complete());assert_eq!(work.asset_work(),Default::default());
+            assert!(workers.iter().all(|receipt|receipt.completed));
+            assert_eq!(database.required,BTreeSet::from([hash.clone()]));
+            assert_eq!(database.present,database.required);assert!(database.missing.is_empty());
+            assert!(super::super::lww_residency::packed_source(destination.path(),&hash).unwrap().is_none());
+            for (pack,reads) in asset_packs {assert_eq!(provider.read_attempts(&pack),reads);}
+            let object=destination.path().join("assets/objects").join(&hash[..2]).join(&hash[2..]);
+            fs::write(object,b"synthetic wrong size").unwrap();
+            assert!(snapshot_restore::download_snapshot_database_first(&completed.reference,&root.path().join("db-first-invalid"),destination.path(),root.path(),"synthetic-connection",&key,&provider,&repository,&Cancellation::default()).await.is_err());
+            assert!(super::super::lww_residency::packed_source(destination.path(),&hash).unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn asset_only_publication_uses_existing_authenticated_pack_catalog() {
+        runtime().block_on(async {
+            let root=tempfile::tempdir().unwrap();
+            let body=b"synthetic segment managed body";
+            let (capture,hash)=captured(root.path(),"segment-assets",0,b"{}",body);
+            let provider=FakeProvider::new(false);
+            let repository=fake::repository();
+            let key=[17;32];
+            let mut transfer=journal(&root.path().join("asset-journal"),"segment-assets",&capture);
+            let completed=package_and_upload_asset_catalog(vec![AssetCatalogSource{content_hash:hash.clone(),byte_length:body.len() as u64,source:ObjectSource::Library(hash.clone())}],root.path(),&root.path().join("asset-cache"),&key,limits(256*1024),&mut transfer,&provider,&repository,&PhaseProgress::silent(),&Cancellation::default(),None).await.unwrap();
+            assert_eq!(completed.catalog.header.role,wire::ObjectRole::Catalog);
+            assert_eq!(completed.catalog.header.repository_id,repository.repository_id);
+            assert!(completed.referenced.iter().any(|object|object.role==ObjectRole::Pack));
+            let stage=root.path().join("asset-reader");
+            let catalog=RemoteObject::from_stored(&completed.catalog,&repository).unwrap();
+            let (entries,packs,_)=snapshot_restore::read_catalog(&catalog,wire::CatalogKind::Assets,&key,&stage,&provider,&repository,&Cancellation::default()).await.unwrap();
+            assert_eq!(entries.len(),1);
+            assert_eq!(hex::encode(entries[0].content_sha256),hash);
+            let entry=entries.into_iter().next().unwrap();
+            let decoded=snapshot_restore::download_packed_body(&hash,entry.byte_length,entry.chunks,packs.values().map(|pack|pack.stored(&repository).unwrap()).collect(),&stage,&key,&provider,&repository,&Cancellation::default()).await.unwrap();
+            assert_eq!(decoded,body);
+        });
+    }
+
+    #[test]
     fn existing_manifest_control_is_prepared_from_data_pack_independently_of_local_asset_residency() {
         runtime().block_on(async {
             let root=tempfile::tempdir().unwrap();
@@ -4885,6 +5011,7 @@ mod tests {
             let observed=crate::asset_repository::body_io::take_body_io();
             assert!(!receipts.is_empty());
             assert!(receipts.iter().all(|receipt| receipt.completed && receipt.hashes.incomplete.is_empty()));
+            assert!(receipts.iter().any(|receipt| receipt.hashes.domains.get("external_content_put_verify").is_some_and(|work| work.calls>0 && work.bytes>0)));
             assert_eq!(receipts.len() as u64,observed.worker_scopes_started);
             assert_eq!(observed.worker_scopes_started,observed.worker_scopes_settled);
             assert!(observed.complete());
