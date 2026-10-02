@@ -376,8 +376,7 @@ export interface PersistentDataRuntime {
     setActivatedLibraryRecoveryLifecycle(token: PersistentMutationToken, lifecycle: ActivatedLibraryRecoveryLifecycle): void
     refreshActivatedLibraryUnderPause(token: PersistentMutationToken): Promise<CommittedApplyOutcome>
     applyLwwReceive(request: LwwStageReceive): Promise<LwwApplyResult>
-    drainLwwDeferred(): Promise<void>
-    drainDeferredLwwReceives(expectedAuthorityEpoch?: number): Promise<void>
+    drainLwwDeferred(expectedAuthorityEpoch?: number): Promise<void>
     commitPersistentUnitIntent(reason: string, mutations: readonly PersistentUnitMutation[], conversations?: readonly ConversationMutation[], wholeMessages?: readonly WholeMessageIntent[]): Promise<void>
 
     readonly store: PersistentDataStore
@@ -1113,7 +1112,6 @@ export function createPersistentDataRuntime(
             })
         },
         drainLwwDeferred,
-        drainDeferredLwwReceives: drainLwwDeferred,
         async commitPersistentUnitIntent(reason, mutations, conversations, wholeMessages) {
             const translated = translatePersistentRootUnitIntents(mutations)
             const affectedKeys = translated.map((value) => value.key)

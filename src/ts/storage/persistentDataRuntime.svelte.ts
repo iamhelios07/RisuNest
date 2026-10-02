@@ -520,7 +520,7 @@ export const acknowledgeGenerationCompletion = async (expectedAuthorityEpoch?: n
 export const drainDeferredLwwReceives = async (expectedAuthorityEpoch?: number): Promise<void> => {
     const runtime = getPersistentDataRuntime()
     const authorityEpoch = expectedAuthorityEpoch ?? runtime.getStorageAuthorityEpoch()
-    await runtime.drainDeferredLwwReceives(authorityEpoch)
+    await runtime.drainLwwDeferred(authorityEpoch)
     runtime.assertPersistentMutationAllowed(authorityEpoch)
 }
 export const commitCharacterAddition = (

@@ -1917,6 +1917,16 @@ export class SaveCoordinator {
                     }).map((loadout): PersistentUnitMutation => ({type:'set',key:JSON.stringify(['record','loadouts',loadout.id]),value:loadout})),
                 ],
             }
+            const committedBaselineRoot = canonicalClone(rootValue.value)
+            if (orderChanged) {
+                if (committedRoot.characterOrder === undefined) delete committedBaselineRoot.characterOrder
+                else committedBaselineRoot.characterOrder = canonicalClone(committedRoot.characterOrder)
+            }
+            const committedLoadouts = new Map((commit.unitMutations ?? [])
+                .filter((mutation): mutation is Extract<PersistentUnitMutation, {type:'set'}> => { const key = JSON.parse(mutation.key); return mutation.type === 'set' && key[0] === 'record' && key[1] === 'loadouts' })
+                .map((mutation) => [JSON.parse(mutation.key)[2], mutation.value]))
+            if (committedLoadouts.size) committedBaselineRoot.loadouts = committedBaselineRoot.loadouts!.map((value) =>
+                (committedLoadouts.get(value.id) ?? value) as typeof value)
             const committed = await this.dependencies.store.commit(commit)
             const changedDuringCommit = this.dirtyGeneration !== mutationGeneration
             const relatedRaces = new Map<
@@ -1958,7 +1968,7 @@ export class SaveCoordinator {
                     character: null,
                     relatedCharacters: publishedRelatedCharacters,
                 },
-                committedRoot,
+                committedBaselineRoot,
                 {
                     preservePendingWork: changedDuringCommit || relatedRaces.size > 0,
                     additionalDeletedCharacterIds,
