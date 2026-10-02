@@ -96,13 +96,13 @@ fn preset_catalog_reads_and_materializes_in_configured_order() {
     store
         .commit(&WorkingSetCommit {
             root: Some(json!({ "username": "Preset commit", "botPresets": ["strip"] })),
-            replace_presets: Some(vec![json!({ "name": "Replacement" })]),
+            replace_presets: Some(vec![json!({ "id": "replacement-preset", "name": "Replacement" })]),
             ..empty_working_set_commit(1)
         })
         .expect("replace presets");
     assert_eq!(
         store.materialize(None).expect("materialize replacement")["botPresets"],
-        json!([{ "name": "Replacement" }])
+        json!([{ "id": "replacement-preset", "name": "Replacement" }])
     );
     assert_eq!(
         store
@@ -1251,7 +1251,7 @@ fn conversation_append_after_deletion_preserves_configured_order() {
             .iter()
             .map(|item| (item.id.as_str(), item.configured_index))
             .collect::<Vec<_>>(),
-        vec![("conv-short", 1), ("conv-appended", 2)]
+        vec![("conv-short", 0), ("conv-appended", 1)]
     );
 }
 
@@ -1301,6 +1301,69 @@ fn conversation_insert_after_deletion_uses_the_visible_position() {
             .collect::<Vec<_>>(),
         vec!["conv-short", "conv-inserted", "conv-third"]
     );
+}
+
+#[test]
+fn conversation_membership_batch_captures_its_final_explicit_order() {
+    let (_directory, mut store, _) = open_fixture();
+    store.commit(&WorkingSetCommit {
+        conversations: Some(vec![
+            ConversationMutation::Delete {
+                character_id: "char-a".into(), conversation_id: "conv-long".into(),
+            },
+            ConversationMutation::ReplaceRange {
+                character_id: "char-a".into(), conversation_id: "inserted".into(),
+                start: 0, delete_count: 0, messages: vec![],
+                conversation: Some(json!({"name":"Inserted"})), configured_index: Some(0),
+            },
+            ConversationMutation::ReplaceRange {
+                character_id: "char-a".into(), conversation_id: "appended".into(),
+                start: 0, delete_count: 0, messages: vec![],
+                conversation: Some(json!({"name":"Appended"})), configured_index: None,
+            },
+        ]),
+        ..empty_working_set_commit(1)
+    }).unwrap();
+    let ids = store.materialize(None).unwrap()["characters"][1]["chats"].as_array().unwrap()
+        .iter().map(|chat| chat["id"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
+    assert_eq!(ids, ["inserted", "conv-short", "appended"]);
+    let value: String = store.connection.query_row(
+        "SELECT value FROM lww_units WHERE key=?1", [r#"["order","conversations","char-a"]"#],
+        |row| row.get(0),
+    ).unwrap();
+    let value = serde_json::from_str(&value).unwrap();
+    assert_eq!(super::super::lww::json_value(&value).unwrap().unwrap()["ids"], json!(ids));
+}
+
+#[test]
+fn conversation_field_projection_preserves_recent_time_until_last_date_changes() {
+    let (_directory, mut store, _) = open_fixture();
+    store.connection.execute(
+        "UPDATE conversations SET recent_at=123,detail=json_remove(detail,'$.lastDate') WHERE conversation_id='conv-short'",
+        [],
+    ).unwrap();
+    let edit = |field: &str, value: Option<Value>| match value {
+        Some(value) => super::super::lww::UnitMutation::Set {
+            key: super::super::lww::unit_key(&["conversation","char-a","conv-short",field]).unwrap(), value,
+        },
+        None => super::super::lww::UnitMutation::Delete {
+            key: super::super::lww::unit_key(&["conversation","char-a","conv-short",field]).unwrap(),
+        },
+    };
+    for (mutation, expected) in [
+        (edit("name", Some(json!("Renamed"))), 123),
+        (edit("lastDate", Some(json!(321))), 321),
+        (edit("lastDate", None), 0),
+    ] {
+        store.commit(&WorkingSetCommit {
+            unit_mutations: Some(vec![mutation]),
+            ..empty_working_set_commit(store.revision().unwrap())
+        }).unwrap();
+        assert_eq!(store.connection.query_row(
+            "SELECT recent_at FROM conversations WHERE conversation_id='conv-short'", [],
+            |row| row.get::<_, i64>(0),
+        ).unwrap(), expected);
+    }
 }
 
 #[test]
@@ -1923,7 +1986,7 @@ fn wal_lease_keeps_every_final_record_family_and_native_export_canonical() {
                 "username": "Writer root",
                 "modules": [{ "id": "module-0" }]
             })),
-            replace_presets: Some(vec![json!({ "name": "Writer preset" })]),
+            replace_presets: Some(vec![json!({ "id": "writer-preset", "name": "Writer preset" })]),
             character: Some(changed_character),
             conversations: Some(vec![ConversationMutation::ReplaceRange {
                 character_id: "char-a".to_owned(),

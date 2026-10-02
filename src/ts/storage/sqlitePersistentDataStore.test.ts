@@ -89,6 +89,12 @@ describe('SqlitePersistentDataStore', () => {
         mocks.invoke.mockReset()
     })
 
+    it('reads current binding authority through the existing native state command', async () => {
+        mocks.invoke.mockResolvedValue({targetAuthority:'9007199254740993'})
+        expect(await new SqlitePersistentDataStore().lwwBindingState()).toEqual({targetAuthority:'9007199254740993'})
+        expect(mocks.invoke).toHaveBeenCalledWith('pds_lww_binding_state', {})
+    })
+
     it('forwards LWW commands with decimal controls and the exact shared request envelope', async () => {
         const store = new SqlitePersistentDataStore()
         const header = {bindingAuthority:'authority', requestId:'request'}

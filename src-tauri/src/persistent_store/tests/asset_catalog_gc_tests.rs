@@ -1407,9 +1407,11 @@ fn resolved_aliases_allow_gc_but_unknown_references_and_plugins_report_blocked()
         register_gc_candidate(&mut store, &held);
         if plugin {
             store.connection.execute("UPDATE root SET value = '{}'", []).unwrap();
+            let unresolved = json!({"image":"assets/plugin-unknown.bin"}).to_string();
             store.connection.execute(
                 "INSERT INTO plugin_storage (generation, owner, storage_key, byte_size, ordinal, value)
-                 VALUES (?1, 'synthetic-plugin', 'opaque', 2, 0, '{}')", [&generation]).unwrap();
+                 VALUES (?1, 'synthetic-plugin', 'opaque', ?2, 0, ?3)",
+                rusqlite::params![generation, unresolved.len() as i64, unresolved]).unwrap();
         } else {
             store.connection.execute("UPDATE root SET value = ?1 WHERE generation = ?2",
                 rusqlite::params![r#"{"image":"assets/unknown.bin"}"#, generation]).unwrap();
