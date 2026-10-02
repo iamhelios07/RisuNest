@@ -79,6 +79,7 @@ export interface SharedNativeFileOperationContext {
     setBlocking(blocking: boolean): void
     setSource(source: NativeFileOperationSource): void
     setPartialWritesPossible(value: boolean): void
+    releaseLibraryAfterPortableAdoption(receipt: NativeFileJobStatus): Promise<void>
 }
 
 export interface SharedNativeFileOperationOptions {
@@ -257,7 +258,11 @@ function runSharedNativeFileOperationWithAdmission<T>(
             ),
         )
     }
-    const releaseAdmission = bodyOnly ? () => {} : reserveLibraryFileOperation()
+    const releaseReservation = bodyOnly ? () => {} : reserveLibraryFileOperation()
+    let reservationReleased=false
+    const releaseAdmission=()=> {
+        if (!reservationReleased) {reservationReleased=true;releaseReservation()}
+    }
 
     const controller = new AbortController()
     const presentation = options.presentation ?? 'inline'
@@ -301,6 +306,17 @@ function runSharedNativeFileOperationWithAdmission<T>(
         setBlocking: (blocking) => updateActiveState({ blocking }),
         setSource: (source) => updateActiveState({ source }),
         setPartialWritesPossible: (value) => updateActiveState({ partialWritesPossible: value }),
+        async releaseLibraryAfterPortableAdoption(receipt) {
+            const status=await invoke<NativeFileJobStatus>('native_file_job_status',{jobId:receipt.jobId})
+            if (receipt.kind!=='restore-portable-backup' || status.kind!==receipt.kind || status.jobId!==receipt.jobId
+                || status.activationRevision!==receipt.activationRevision || !Number.isSafeInteger(status.activationRevision)
+                || status.activationAuthority!==receipt.activationAuthority || !status.activationAuthority
+                || status.deviceSessionId!==receipt.deviceSessionId || !status.deviceSessionId
+                || status.restoreAdoptionConfirmed!==true) {
+                throw new NativeFileJobError('portable-adoption-receipt-mismatch','Portable restore adoption could not be confirmed')
+            }
+            releaseAdmission()
+        },
     }
     try {
         const taskKind = options.format === 'library-backup' || options.format === 'risu-save'

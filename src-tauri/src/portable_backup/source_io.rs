@@ -13,6 +13,8 @@ pub(crate) struct ObjectWork {
     pub outstanding:u64, pub ranges:Vec<ReadRange>,
 }
 #[derive(Clone,Debug,Default,Eq,PartialEq)]
+pub(crate) struct CachedSqlReadWork {pub reads:u64,pub bytes:u64,pub failures:u64,pub failed_adoptions:u64}
+#[derive(Clone,Debug,Default,Eq,PartialEq)]
 pub(crate) struct SourceIo {
     pub metadata_ranges:Vec<ReadRange>, pub metadata_failures:u64,
     pub catalog_hashed_bytes:u64, pub objects:BTreeMap<String,ObjectWork>,
@@ -22,10 +24,12 @@ pub(crate) struct SourceIo {
     pub workers:BTreeMap<String,u64>,
     pub active_workers:u64, pub scope_violations:u64,
     pub captures:Vec<CaptureMilestone>,
+    pub cached_sql_reads:BTreeMap<String,CachedSqlReadWork>,
 }
 impl SourceIo {
     pub(crate) fn complete(&self)->bool {
         self.metadata_failures==0 && self.catalog_hash_failures==0 && self.active_workers==0 && self.scope_violations==0 && self.objects.values().all(|v|v.incomplete==0 && v.outstanding==0 && v.hash_failures==0)
+            && self.cached_sql_reads.values().all(|row|row.failures==0 && row.failed_adoptions==0)
     }
 }
 #[derive(Clone)]
@@ -47,6 +51,13 @@ pub(crate) fn attach(scope:&Scope)->Attachment {
 }
 impl Drop for Attachment { fn drop(&mut self) {self.1.0.lock().unwrap().active_workers-=1; CURRENT.with(|v|*v.borrow_mut()=self.0.clone()); } }
 impl Scope {
+    pub(crate) fn cached_sql_read(&self,hash:&str,result:&std::io::Result<usize>) {
+        self.check_scope();let mut work=self.0.lock().unwrap();let row=work.cached_sql_reads.entry(hash.into()).or_default();row.reads+=1;
+        match result {Ok(bytes)=>row.bytes+=*bytes as u64,Err(_)=>row.failures+=1}
+    }
+    pub(crate) fn cached_sql_adoption(&self,hash:&str,success:bool) {
+        self.check_scope();if !success {self.0.lock().unwrap().cached_sql_reads.entry(hash.into()).or_default().failed_adoptions+=1;}
+    }
     pub(crate) fn capture_ready(&self,lease:&str,revision:i64,pinned_device_meta_revision:i64) {
         self.check_scope();
         self.0.lock().unwrap().captures.push(CaptureMilestone{lease:lease.into(),revision,pinned_device_meta_revision});

@@ -21,6 +21,17 @@ pub(crate) struct BodyResult {
 fn error(value:impl std::fmt::Display)->NativeJobError {NativeJobError::new("snapshot-bodies-failed",value.to_string())}
 fn sync_error(value:crate::server_sync::SyncError)->NativeJobError {NativeJobError::new(&value.code,value.cause.unwrap_or_else(||"Snapshot body source is unavailable".to_owned()))}
 
+pub(super) fn prepare_directory(root:&Path,job:&JobControl)->Result<PathBuf,NativeJobError> {
+    match super::create_owned_directory(root,&job.id()) {
+        Ok(directory)=>Ok(directory),
+        Err(failure)=>{
+            let error=NativeJobError::new("store-error",failure);
+            job.finish_failure(&error.code,&error.message).map_err(|failure|NativeJobError::new("store-error",failure))?;
+            Err(error)
+        }
+    }
+}
+
 fn check(store:&PersistentStore,plan:&BodyPlan,job:&JobControl)->Result<(),NativeJobError> {
     if job.is_cancel_requested() {return Err(NativeJobError::new("cancelled","Snapshot body transfer was cancelled"));}
     if store.lww_binding_authority().map_err(error)?.0.to_string()!=plan.authority
@@ -50,11 +61,20 @@ fn observe(store:&PersistentStore,plan:&BodyPlan)->Result<BodyResult,NativeJobEr
     Ok(result)
 }
 
-struct CheckedRead<'a,R:Read> {inner:R,store:&'a PersistentStore,plan:&'a BodyPlan,job:&'a JobControl}
+struct CheckedRead<'a,R:Read> {inner:R,store:&'a PersistentStore,plan:&'a BodyPlan,job:&'a JobControl,#[cfg(test)] hash:&'a str,cached_identity:Option<(&'a File,&'a crate::asset_repository::ExactFileIdentity)>}
 impl<R:Read> Read for CheckedRead<'_,R> {
     fn read(&mut self,output:&mut[u8])->io::Result<usize> {
         check(self.store,self.plan,self.job).map_err(|error|io::Error::other(error.message))?;
-        let read=self.inner.read(output)?;
+        #[cfg(test)] self.job.source_io_scope.before_object_read(self.hash);
+        if let Some((file,identity))=self.cached_identity {
+            if crate::asset_repository::exact_file_identity(file)?!=*identity {return Err(io::Error::other("Snapshot cached source identity changed"));}
+        }
+        let result=self.inner.read(output);
+        #[cfg(test)] if self.cached_identity.is_some() {self.job.source_io_scope.cached_sql_read(self.hash,&result);}
+        if let Some((file,identity))=self.cached_identity {
+            if crate::asset_repository::exact_file_identity(file)?!=*identity {return Err(io::Error::other("Snapshot cached source identity changed"));}
+        }
+        let read=result?;
         if read>0 {
             let mut progress=self.job.status.lock().map_err(|_|io::Error::other("Snapshot body progress mutex is poisoned"))?.progress;
             progress.completed_bytes=progress.completed_bytes.checked_add(read as u64).ok_or_else(||io::Error::other("Snapshot body read count overflow"))?;
@@ -95,7 +115,7 @@ pub(crate) fn run(store:&mut PersistentStore,plan:&BodyPlan,job:&JobControl,scra
                 pins.pin_existing(&cas,&object.hash,object.size,role).map_err(error)?;
                 continue;
             }
-            if plan.policy==AssetPolicy::Remote {continue;}
+            if plan.policy==AssetPolicy::Remote && !object.cached {continue;}
             if object.cached {
                 let file=File::open(&plan.source).map_err(error)?;
                 let identity=crate::asset_repository::exact_file_identity(&file).map_err(error)?;
@@ -104,19 +124,21 @@ pub(crate) fn run(store:&mut PersistentStore,plan:&BodyPlan,job:&JobControl,scra
                 let (row,size):(i64,i64)=source.query_row("SELECT rowid,length(body) FROM message_page_objects WHERE hash=?1",[&object.hash],|row|Ok((row.get(0)?,row.get(1)?))).map_err(error)?;
                 if u64::try_from(size).ok()!=Some(object.size) {return Err(error("Snapshot cached payload size differs"));}
                 let blob=source.blob_open("main","message_page_objects","body",row,true).map_err(error)?;
-                let mut input=CheckedRead {inner:blob,store:&*store,plan,job};
-                pins.prepare_reader_expected(&cas,&mut input,&object.hash,object.size,role).map_err(error)?;
+                let mut input=CheckedRead {inner:blob,store:&*store,plan,job,#[cfg(test)] hash:&object.hash,cached_identity:Some((&file,&identity))};
+                let installed=pins.prepare_reader_expected(&cas,&mut input,&object.hash,object.size,role);
+                #[cfg(test)] job.source_io_scope.cached_sql_adoption(&object.hash,installed.is_ok());
+                installed.map_err(error)?;
                 if crate::asset_repository::exact_file_identity(&file).map_err(error)?!=identity {return Err(error("Snapshot cached source identity changed"));}
             } else {
                 let check_source=||check(store,plan,job).map_err(|error|crate::server_sync::SyncError::new(error.code,409));
                 if let Some(body)=crate::server_sync::residency::open_transient_server_with_check(store.repository_root(),scratch,&object.hash,&check_source).map_err(sync_error)? {
-                    let mut input=CheckedRead {inner:body,store:&*store,plan,job};
+                    let mut input=CheckedRead {inner:body,store:&*store,plan,job,#[cfg(test)] hash:&object.hash,cached_identity:None};
                     pins.prepare_reader_expected(&cas,&mut input,&object.hash,object.size,role).map_err(error)?;
                 } else {
                     let cancellation=crate::external_storage::contract::Cancellation::with_external_flag(job.cancellation_flag());
                     let body=tauri::async_runtime::block_on(crate::external_storage::lww_residency::spool_verified_remote_body(store.repository_root(),&object.hash,scratch,&cancellation)).map_err(error)?;
                     if let Some(mut body)=body {
-                        let mut input=CheckedRead {inner:body.as_file_mut(),store:&*store,plan,job};
+                        let mut input=CheckedRead {inner:body.as_file_mut(),store:&*store,plan,job,#[cfg(test)] hash:&object.hash,cached_identity:None};
                         pins.prepare_reader_expected(&cas,&mut input,&object.hash,object.size,role).map_err(error)?;
                     }
                 }
@@ -175,6 +197,142 @@ mod tests {
             status.activation_authority=Some(plan.authority.clone());
         }
         job
+    }
+
+    fn cached_plan(store:&mut PersistentStore)->(BodyPlan,String,Vec<u8>) {
+        use crate::persistent_store::lww::{Header,Change,StageReceive,ApplyReceive,Progress};
+        use risunest_sync_wire::{stamp::Stamp,unit::{UnitKey,UnitValue},descriptor::RecordDescriptor};
+        let bytes=vec![93;128*1024+7];
+        let hash=risunest_sync_wire::hash(&bytes);
+        store.lww_put_object(&hash,&bytes).unwrap();
+        let header=Header {binding_authority:store.lww_binding_authority().unwrap(),request_id:"synthetic-cached-source".into()};
+        store.lww_stage_receive(&StageReceive {header:header.clone(),changes:vec![Change {key:UnitKey::new(&["future-snapshot","cached"]).unwrap(),value:UnitValue::object(RecordDescriptor::content(hash.clone())).unwrap(),stamp:Stamp {physical_ms:1.into(),logical:0,writer_id:"00000000-0000-4000-8000-000000000001".into()}}],progress:Progress {kind:"server".into(),cursor:1.into(),writer_id:None},admitted_time_upper_ms:u64::MAX.into()}).unwrap();
+        store.lww_apply_receive(&ApplyReceive {header:header.clone(),generating:vec![]}).unwrap();
+        store.lww_finish_receive(&header).unwrap();
+        (activated(store),hash,bytes)
+    }
+
+    #[test]
+    fn snapshot_bodies_cached_sql_is_read_only_when_missing_under_both_policies() {
+        for policy in [AssetPolicy::Full,AssetPolicy::Remote] {
+            let server=crate::server_sync::lww_tests::LocalServerFixture::new();
+            let (root,mut store)=local();
+            let _client=server.client(&store);
+            store.asset_residency_set_policy(policy,||Ok(())).unwrap();
+            let (plan,hash,bytes)=cached_plan(&mut store);
+            assert!(plan.objects.iter().any(|object|object.hash==hash && object.cached));
+            crate::portable_backup::source_io::reset_source_io();
+            crate::asset_repository::body_io::reset_body_io();
+            let result=run(&mut store,&plan,&job(&plan),root.path()).unwrap();
+            let source=crate::portable_backup::source_io::take_source_io();
+            let body=crate::asset_repository::body_io::take_body_io();
+            assert!(result.all_bodies_local);
+            assert!(source.complete());
+            assert_eq!(source.cached_sql_reads[&hash].bytes,bytes.len() as u64);
+            assert!(source.cached_sql_reads[&hash].reads>0);
+            assert!(body.objects[&hash].owned_work.body_sha.values().map(|work|work.bytes).sum::<u64>()>=bytes.len() as u64);
+            let revision=store.revision().unwrap();
+            let retry=activated(&mut store);
+            crate::portable_backup::source_io::reset_source_io();
+            assert!(run(&mut store,&retry,&job(&retry),root.path()).unwrap().all_bodies_local);
+            assert!(crate::portable_backup::source_io::take_source_io().cached_sql_reads.is_empty());
+            assert_eq!(store.revision().unwrap(),revision+1);
+        }
+    }
+
+    #[test]
+    fn snapshot_bodies_cached_sql_tamper_fails_after_commit_without_source_identity_inference() {
+        let (root,mut store)=local();
+        let (plan,hash,bytes)=cached_plan(&mut store);
+        let source=Connection::open(&plan.source).unwrap();
+        source.execute_batch("DROP TRIGGER message_page_objects_immutable_update;").unwrap();
+        source.execute("UPDATE message_page_objects SET body=?1 WHERE hash=?2",rusqlite::params![vec![94u8;bytes.len()],hash]).unwrap();
+        drop(source);
+        crate::portable_backup::source_io::reset_source_io();
+        assert!(run(&mut store,&plan,&job(&plan),root.path()).is_err());
+        let source=crate::portable_backup::source_io::take_source_io();
+        assert_eq!(source.cached_sql_reads[&hash].bytes,bytes.len() as u64);
+        assert!(!source.complete());
+        assert_eq!(store.revision().unwrap(),plan.revision);
+        assert!(PayloadCas::new(store.repository_root()).unwrap().stat_object(&hash).unwrap().is_none());
+        assert!(plan.source.exists());
+    }
+
+    #[test]
+    fn snapshot_bodies_setup_refusal_marks_owner_terminal() {
+        let (root,mut store)=local();
+        let plan=activated(&mut store);
+        let job=job(&plan);
+        let refused=root.path().join("not-a-directory");
+        std::fs::write(&refused,b"synthetic refusal").unwrap();
+        assert!(prepare_directory(&refused,&job).is_err());
+        assert!(job.status().state.is_terminal());
+        assert_eq!(job.status().state,JobState::Failed);
+    }
+
+    #[test]
+    fn snapshot_bodies_authenticated_full_transfer_allows_foreground_edit_and_server_admission() {
+        use crate::server_sync::lww_tests::{LocalServerFixture,header,save};
+        let server=LocalServerFixture::new();
+        let (root,mut store)=local();
+        let client=server.client(&store);
+        let bytes=vec![95;128*1024+3];
+        let hash=put_asset(&mut store,"assets/held-snapshot.png",&bytes).object_hash.unwrap();
+        let request=header(&store);
+        client.push(&mut store,&request,&[]).unwrap();
+        store.asset_residency_set_policy(AssetPolicy::Remote,||Ok(())).unwrap();
+        store.asset_residency_evict(||Ok(())).unwrap();
+        let policy_checks=std::sync::atomic::AtomicUsize::new(0);
+        assert!(store.asset_residency_set_policy(AssetPolicy::Full,|| {
+            if policy_checks.fetch_add(1,std::sync::atomic::Ordering::AcqRel)==0 {Ok(())} else {Err(crate::server_sync::SyncError::new("cancelled",499))}
+        }).is_err());
+        assert!(PayloadCas::new(store.repository_root()).unwrap().stat_object(&hash).unwrap().is_none());
+        let original=activated(&mut store);
+        assert_eq!(original.policy,AssetPolicy::Full);
+        let state=super::super::NativeFileJobState::initialize(root.path().join("native-file-jobs"));
+        crate::portable_backup::source_io::reset_source_io();
+        crate::asset_repository::body_io::reset_body_io();
+        let (mut worker_store,plan,job)=state.prepare_snapshot_bodies(&mut store,&original.stage_id,original.revision,&original.authority).unwrap();
+        let (entered,waiting)=std::sync::mpsc::channel();
+        let (release,resume)=std::sync::mpsc::channel();
+        let resume=std::sync::Mutex::new(resume);
+        let once=std::sync::atomic::AtomicBool::new(false);
+        let held_hash=hash.clone();
+        crate::portable_backup::source_io::on_object_read(move |hash| {
+            if hash==held_hash && !once.swap(true,std::sync::atomic::Ordering::AcqRel) {
+                entered.send(()).unwrap();
+                resume.lock().unwrap().recv().unwrap();
+            }
+        });
+        let source_scope=job.source_io_scope.clone();
+        let body_scope=crate::asset_repository::body_io::capture_body_io_scope();
+        let scratch=tempfile::tempdir().unwrap();
+        let worker=std::thread::spawn(move||crate::asset_repository::body_io::with_body_io_scope(body_scope,|| {
+            let _scope=crate::portable_backup::source_io::attach(&source_scope);
+            run(&mut worker_store,&plan,&job,scratch.path())
+        }));
+        waiting.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
+        let mut foreground=PersistentStore::open(root.path()).unwrap();
+        save(&mut foreground,&["root","username"],serde_json::json!("synthetic foreground during body transfer"));
+        let foreground_revision=foreground.revision().unwrap();
+        {
+            let _server_admission=state.admission.server().unwrap();
+            let request=header(&foreground);
+            client.push(&mut foreground,&request,&[]).unwrap();
+        }
+        assert!(PayloadCas::new(foreground.repository_root()).unwrap().stat_object(&hash).unwrap().is_none());
+        assert!(crate::server_sync::residency::Residency::open(foreground.repository_root()).unwrap().object(&hash,None).unwrap().is_some());
+        release.send(()).unwrap();
+        let result=worker.join().unwrap().unwrap();
+        assert!(result.all_bodies_local && result.settled);
+        assert_eq!(result.locally_present,1);
+        assert_eq!(foreground.revision().unwrap(),foreground_revision);
+        assert_eq!(foreground.read_root(None).unwrap().value["username"],"synthetic foreground during body transfer");
+        assert_eq!(PayloadCas::new(foreground.repository_root()).unwrap().stat_object(&hash).unwrap(),Some(bytes.len() as u64));
+        assert!(crate::portable_backup::source_io::take_source_io().complete());
+        let work=crate::asset_repository::body_io::take_body_io();
+        assert_eq!(work.pending_worker_scopes,0);
+        assert_eq!(work.worker_scopes_started,work.worker_scopes_settled);
     }
 
     #[test]
