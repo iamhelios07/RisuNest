@@ -1,15 +1,28 @@
-//! Scoped CAS read-I/O observations for verification entries only.
+//! Scoped CAS body-I/O observations for verification entries only.
 //!
-//! Reset/run/take must execute on the same thread. This sample covers CAS read
-//! opens and reads inside payload_cas, not every filesystem read in the app.
+//! Reset/run/take must execute on the same thread. This sample covers CAS opens,
+//! reads, staging writes and publication inside payload_cas, not all app I/O.
 //! Returned raw File handles and paths make subsequent coverage incomplete.
 //! Register purposes from actual object provenance after reset. Domains are
 //! totals; object rows are a classification of those totals, not extra work.
 //! Tracked readers retain their owner scope. Crossing threads or reset/take
-//! boundaries invalidates that scope. Other worker I/O is not propagated.
+//! boundaries invalidates that scope. Worker aggregation requires an explicit
+//! captured scope, kept alive until its worker has completed.
 #![cfg(test)]
 
 use std::{cell::RefCell, collections::{BTreeMap, BTreeSet}, fs::File, io::{self, Read, Seek, SeekFrom}, sync::{Arc, Mutex}, thread::ThreadId};
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct BodyShaWork { pub calls: u64, pub bytes: u64 }
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PublicationWork {
+    pub attempts: u64,
+    pub successes: u64,
+    pub already_exists: u64,
+    pub failures: u64,
+    pub object_bytes: u64,
+}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct BodyWork {
@@ -27,10 +40,25 @@ pub(crate) struct BodyWork {
     pub identity_metadata_opens: u64,
     pub identity_metadata_failed_opens: u64,
     pub verified_identity_metadata_opens: u64,
+    pub staging_write_attempts: u64,
+    pub staging_writes: u64,
+    pub staging_failed_writes: u64,
+    pub staging_requested_bytes: u64,
+    pub staging_written_bytes: u64,
+    pub incomplete_writes: u64,
+    pub publication_attempts: u64,
+    pub publications: u64,
+    pub publication_already_exists: u64,
+    pub publication_failures: u64,
+    // The identity size named by a successful link/rename, not copied bytes.
+    pub publication_object_bytes: u64,
+    pub publication_kinds: BTreeMap<&'static str, PublicationWork>,
+    // A per-object attribution of native hash_work, not additional SHA work.
+    pub body_sha: BTreeMap<&'static str, BodyShaWork>,
 }
 
 impl BodyWork {
-    fn add(&mut self, other: &Self) {
+    pub(super) fn add(&mut self, other: &Self) {
         self.open_attempts += other.open_attempts; self.opens += other.opens;
         self.failed_opens += other.failed_opens; self.unknown_open_results += other.unknown_open_results;
         self.read_operations += other.read_operations; self.read_bytes += other.read_bytes;
@@ -40,9 +68,24 @@ impl BodyWork {
         self.identity_metadata_opens += other.identity_metadata_opens;
         self.identity_metadata_failed_opens += other.identity_metadata_failed_opens;
         self.verified_identity_metadata_opens += other.verified_identity_metadata_opens;
+        self.staging_write_attempts += other.staging_write_attempts; self.staging_writes += other.staging_writes;
+        self.staging_failed_writes += other.staging_failed_writes;
+        self.staging_requested_bytes += other.staging_requested_bytes; self.staging_written_bytes += other.staging_written_bytes;
+        self.incomplete_writes += other.incomplete_writes;
+        self.publication_attempts += other.publication_attempts; self.publications += other.publications;
+        self.publication_already_exists += other.publication_already_exists; self.publication_failures += other.publication_failures;
+        self.publication_object_bytes += other.publication_object_bytes;
+        for (kind, source) in &other.publication_kinds {
+            let target = self.publication_kinds.entry(kind).or_default();
+            target.attempts += source.attempts; target.successes += source.successes;
+            target.already_exists += source.already_exists; target.failures += source.failures; target.object_bytes += source.object_bytes;
+        }
+        for (domain, source) in &other.body_sha {
+            let target = self.body_sha.entry(domain).or_default(); target.calls += source.calls; target.bytes += source.bytes;
+        }
     }
     fn observed_completely(&self) -> bool {
-        self.unknown_open_results == 0 && self.incomplete_reads == 0
+        self.unknown_open_results == 0 && self.incomplete_reads == 0 && self.incomplete_writes == 0
             && self.escaped_handles == 0 && self.escaped_paths == 0 && self.outstanding_readers == 0
     }
 }
@@ -66,7 +109,13 @@ pub(crate) struct BodyIo {
     pub unattributed_managed: BodyWork,
     pub unattributed_owned: BodyWork,
     pub pending_owned_identities: u64,
+    pub pending_body_hashes: u64,
+    pub pending_worker_scopes: u64,
+    pub worker_scopes_started: u64,
+    pub worker_scopes_settled: u64,
+    pub worker_threads: BTreeSet<String>,
     pub scope_violations: u64,
+    closed: bool,
     // API requests/queries, not OS metadata syscall counts.
     pub stat_requests: u64,
     pub batch_stat_requests: u64,
@@ -78,7 +127,9 @@ impl Default for BodyIo {
         Self {
             thread: std::thread::current().id(), domains: BTreeMap::new(), objects: BTreeMap::new(),
             unattributed_managed: BodyWork::default(), unattributed_owned: BodyWork::default(),
-            pending_owned_identities: 0, scope_violations: 0,
+            pending_owned_identities: 0, pending_body_hashes: 0, pending_worker_scopes: 0,
+            worker_scopes_started: 0, worker_scopes_settled: 0, worker_threads: BTreeSet::new(),
+            scope_violations: 0, closed: false,
             stat_requests: 0, batch_stat_requests: 0, presence_queries: 0,
         }
     }
@@ -86,7 +137,9 @@ impl Default for BodyIo {
 
 impl BodyIo {
     pub(crate) fn complete(&self) -> bool {
-        self.scope_violations == 0 && self.pending_owned_identities == 0 && self.domains.values().all(BodyWork::observed_completely)
+        self.scope_violations == 0 && self.pending_owned_identities == 0 && self.pending_body_hashes == 0
+            && self.pending_worker_scopes == 0 && self.worker_scopes_started == self.worker_scopes_settled
+            && self.domains.values().all(BodyWork::observed_completely)
             && self.unknown_work() == BodyWork::default()
     }
     pub(crate) fn asset_work(&self) -> BodyWork {
@@ -115,13 +168,50 @@ thread_local! {
 fn current_scope() -> Arc<Mutex<BodyIo>> { WORK.with(|work| work.borrow().clone()) }
 
 pub(crate) fn reset_body_io() {
-    WORK.with(|work| *work.borrow_mut() = Arc::new(Mutex::new(BodyIo::default())));
+    let previous = current_scope();
+    let mut previous = previous.lock().unwrap(); previous.closed = true;
+    let mut next = BodyIo::default();
+    if previous.pending_worker_scopes > 0 { previous.scope_violations += 1; next.scope_violations += 1; }
+    WORK.with(|work| *work.borrow_mut() = Arc::new(Mutex::new(next)));
 }
 
 pub(crate) fn take_body_io() -> BodyIo {
     let scope = current_scope();
     let work = scope.lock().unwrap().clone();
     reset_body_io(); work
+}
+
+pub(crate) struct BodyIoScope { pub(super) scope: Arc<Mutex<BodyIo>>, entered: bool }
+
+pub(crate) fn capture_body_io_scope() -> BodyIoScope {
+    let scope = current_scope();
+    { let mut work = scope.lock().unwrap(); if work.closed { work.scope_violations += 1; } work.pending_worker_scopes += 1; }
+    BodyIoScope { scope, entered: false }
+}
+
+pub(crate) fn with_body_io_scope<T>(mut scope: BodyIoScope, operation: impl FnOnce() -> T) -> T {
+    let previous = current_scope();
+    {
+        let mut work = scope.scope.lock().unwrap();
+        if work.closed { work.scope_violations += 1; }
+        work.worker_scopes_started += 1;
+        work.worker_threads.insert(format!("{:?}", std::thread::current().id()));
+    }
+    scope.entered = true;
+    WORK.with(|work| *work.borrow_mut() = scope.scope.clone());
+    struct Restore(Arc<Mutex<BodyIo>>);
+    impl Drop for Restore { fn drop(&mut self) { WORK.with(|work| *work.borrow_mut() = self.0.clone()); } }
+    let _restore = Restore(previous);
+    operation()
+}
+
+impl Drop for BodyIoScope {
+    fn drop(&mut self) {
+        let mut work = self.scope.lock().unwrap(); work.pending_worker_scopes -= 1;
+        if self.entered { work.worker_scopes_settled += 1; }
+        else { work.scope_violations += 1; }
+        if work.closed || std::thread::panicking() { work.scope_violations += 1; }
+    }
 }
 
 pub(crate) fn register_object_purpose(hash: &str, purpose: BodyPurpose) {
@@ -137,6 +227,7 @@ impl Drop for ObjectScope {
 }
 
 fn record(work: &mut BodyIo, kind: &'static str, hash: Option<&str>, update: impl Fn(&mut BodyWork)) {
+    if work.closed { work.scope_violations += 1; }
     update(work.domains.entry(kind).or_default());
     if kind == "managed" || kind == "owned" {
         match hash {
@@ -152,7 +243,7 @@ fn domain(kind: &'static str, update: impl Fn(&mut BodyWork)) {
     if kind == "owned" {
         if let Some((scope, pending)) = PENDING_OWNED.with(|pending| pending.borrow().last().cloned()) {
             let current = current_scope();
-            if !Arc::ptr_eq(&scope, &current) {
+            if scope.lock().unwrap().closed || !Arc::ptr_eq(&scope, &current) {
                 scope.lock().unwrap().scope_violations += 1;
                 current.lock().unwrap().scope_violations += 1;
             }
@@ -187,7 +278,7 @@ impl Drop for PendingOwnedIdentity {
     fn drop(&mut self) {
         PENDING_OWNED.with(|pending| { pending.borrow_mut().pop(); });
         let current = current_scope();
-        let changed = self.owner != std::thread::current().id() || !Arc::ptr_eq(&self.scope, &current);
+        let changed = self.scope.lock().unwrap().closed || self.owner != std::thread::current().id() || !Arc::ptr_eq(&self.scope, &current);
         let mut scope = self.scope.lock().unwrap();
         scope.pending_owned_identities -= 1;
         if changed { scope.scope_violations += 1; }
@@ -214,7 +305,7 @@ impl OwnedIdentity {
     }
     pub(super) fn check_scope(&self) {
         let current = current_scope();
-        if self.owner != std::thread::current().id() || !Arc::ptr_eq(&self.scope, &current) {
+        if self.scope.lock().unwrap().closed || self.owner != std::thread::current().id() || !Arc::ptr_eq(&self.scope, &current) {
             self.scope.lock().unwrap().scope_violations += 1;
             if !Arc::ptr_eq(&self.scope, &current) { current.lock().unwrap().scope_violations += 1; }
         }
@@ -248,6 +339,64 @@ pub(super) fn identity_metadata_open_result<T>(result: &io::Result<T>) {
 
 pub(super) fn verified_identity_metadata_open() {
     domain("owned", |work| work.verified_identity_metadata_opens += 1);
+}
+
+pub(super) fn staging_write_result(result: &io::Result<()>, bytes: usize) {
+    domain("owned", |work| {
+        work.staging_write_attempts += 1; work.staging_requested_bytes += bytes as u64;
+        if result.is_ok() { work.staging_writes += 1; work.staging_written_bytes += bytes as u64; }
+        else { work.staging_failed_writes += 1; work.incomplete_writes += 1; }
+    });
+}
+
+pub(super) fn publication_result(kind: &'static str, result: &io::Result<()>, bytes: u64) {
+    domain("owned", |work| {
+        work.publication_attempts += 1;
+        let detail = work.publication_kinds.entry(kind).or_default(); detail.attempts += 1;
+        match result {
+            Ok(()) => { work.publications += 1; work.publication_object_bytes += bytes; detail.successes += 1; detail.object_bytes += bytes; }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => { work.publication_already_exists += 1; detail.already_exists += 1; }
+            Err(_) => { work.publication_failures += 1; detail.failures += 1; }
+        }
+    });
+}
+
+pub(super) fn body_sha_begin(kind: &'static str, name: &'static str) {
+    domain(kind, |work| work.body_sha.entry(name).or_default().calls += 1);
+}
+pub(super) fn body_sha_update(kind: &'static str, name: &'static str, bytes: usize) {
+    domain(kind, |work| work.body_sha.entry(name).or_default().bytes += bytes as u64);
+}
+
+pub(super) struct PendingBodyHash { scope: Arc<Mutex<BodyIo>>, work: BodyWork, name: &'static str, hash: Option<String>, owner: ThreadId }
+impl PendingBodyHash {
+    pub(super) fn new(name: &'static str) -> Self {
+        let scope = current_scope();
+        let mut work = BodyWork::default(); work.body_sha.entry(name).or_default().calls = 1;
+        { let mut sample = scope.lock().unwrap(); sample.pending_body_hashes += 1; sample.domains.entry("managed").or_default().add(&work); }
+        Self { scope, work, name, hash: None, owner: std::thread::current().id() }
+    }
+    pub(super) fn update(&mut self, bytes: usize) {
+        self.work.body_sha.entry(self.name).or_default().bytes += bytes as u64;
+        self.scope.lock().unwrap().domains.entry("managed").or_default().body_sha.entry(self.name).or_default().bytes += bytes as u64;
+    }
+    pub(super) fn verified(&mut self, hash: &str) {
+        if OBJECT.with(|object| object.borrow().last().is_some_and(|expected| expected == hash)) { self.hash = Some(hash.to_owned()); }
+    }
+}
+impl Drop for PendingBodyHash {
+    fn drop(&mut self) {
+        let current = current_scope();
+        let mut sample = self.scope.lock().unwrap(); sample.pending_body_hashes -= 1;
+        let changed = sample.closed || self.owner != std::thread::current().id() || !Arc::ptr_eq(&self.scope, &current);
+        if changed { sample.scope_violations += 1; }
+        match &self.hash {
+            Some(hash) => sample.objects.entry(hash.clone()).or_default().work.add(&self.work),
+            None => sample.unattributed_managed.add(&self.work),
+        }
+        drop(sample);
+        if changed && !Arc::ptr_eq(&self.scope,&current) { current.lock().unwrap().scope_violations += 1; }
+    }
 }
 
 pub(super) fn escaped_handle(kind: &'static str) {
@@ -304,7 +453,7 @@ impl TrackedBodyFile {
     }
     fn check_scope(&self) {
         let current = current_scope();
-        if self.owner != std::thread::current().id() || !Arc::ptr_eq(&self.scope, &current) {
+        if self.scope.lock().unwrap().closed || self.owner != std::thread::current().id() || !Arc::ptr_eq(&self.scope, &current) {
             self.scope.lock().unwrap().scope_violations += 1;
             if !Arc::ptr_eq(&self.scope, &current) { current.lock().unwrap().scope_violations += 1; }
         }
@@ -386,5 +535,46 @@ mod tests {
         assert!(!work.complete());
         assert_eq!(work.unknown_work(), BodyWork { open_attempts: 1, failed_opens: 1, ..Default::default() });
         assert_eq!(work.control_work(), BodyWork::default());
+    }
+
+    #[test]
+    fn failed_actual_write_retains_requested_bytes_without_inventing_partial_bytes() {
+        use std::io::Write;
+        let directory=tempfile::tempdir().unwrap(); let path=directory.path().join("read-only");
+        std::fs::write(&path,b"synthetic unchanged").unwrap(); let mut file=File::open(&path).unwrap();
+        reset_body_io(); let hash="ad".repeat(32); register_object_purpose(&hash,BodyPurpose::Asset);
+        let identity=object_scope(&hash);
+        let bytes=b"synthetic attempted write";
+        let result=file.write_all(bytes);
+        staging_write_result(&result,bytes.len()); assert!(result.is_err()); drop(identity);
+        let work=take_body_io(); assert!(!work.complete()); let asset=work.asset_work();
+        assert_eq!(asset.staging_write_attempts,1); assert_eq!(asset.staging_failed_writes,1);
+        assert_eq!(asset.staging_requested_bytes,bytes.len() as u64); assert_eq!(asset.staging_written_bytes,0);
+        assert_eq!(asset.incomplete_writes,1); assert_eq!(asset,work.domains["owned"]);
+    }
+
+    #[test]
+    fn an_unentered_or_panicking_worker_scope_invalidates_the_parent_receipt() {
+        reset_body_io(); drop(capture_body_io_scope()); assert!(!take_body_io().complete());
+        reset_body_io(); let scope=capture_body_io_scope();
+        assert!(std::thread::spawn(move ||with_body_io_scope(scope,||panic!("synthetic worker failure"))).join().is_err());
+        let work=take_body_io(); assert!(!work.complete()); assert!(work.scope_violations>0);
+        assert_eq!(work.pending_worker_scopes,0); assert_eq!(work.worker_scopes_started,work.worker_scopes_settled);
+    }
+
+    #[test]
+    fn actual_failed_link_records_the_attempt_and_keeps_unknown_roles_incomplete() {
+        let directory=tempfile::tempdir().unwrap();
+        reset_body_io();
+        let source=directory.path().join("absent"); let destination=directory.path().join("destination");
+        let result=std::fs::hard_link(&source,&destination); assert!(result.is_err());
+        publication_result("hard-link",&result,0);
+        let work=take_body_io(); assert!(!work.complete());
+        assert_eq!(work.unattributed_owned.publication_attempts,1);
+        assert_eq!(work.unattributed_owned.publication_failures,1);
+        assert_eq!(work.unattributed_owned.publications,0);
+        assert_eq!(work.unattributed_owned.publication_object_bytes,0);
+        assert_eq!(work.unattributed_owned.publication_kinds["hard-link"].failures,1);
+        assert_eq!(work.unattributed_owned,work.domains["owned"]);
     }
 }
