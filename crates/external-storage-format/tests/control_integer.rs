@@ -100,9 +100,9 @@ fn snapshot_metadata_decimal_wire_roundtrips_with_hash_bytes_unchanged() {
 #[test]
 fn backup_lease_inventory_and_catalog_counters_use_strict_decimal_strings() {
     let bundle = BackupBundleDocument::new("repository".into(), "bundle".into(),
-        BundleSource::Device { writer_id: "writer".into() }, 17,
+        BundleSource::SyncState { commit_id: "commit".into() }, 17,
         Some(Sequence::from(1u64)), Some(Sequence::from(1u64)), None,
-        state().library, BTreeMap::new()).unwrap();
+        state().library, BTreeMap::new(), None).unwrap();
     let point = BackupPointDocument::single("repository".into(), "point".into(),
         BackupPointKind::Backup, 19, object(ObjectRole::BackupBundle, "bundle")).unwrap();
     let lease = LeaseDocument::new("writer".into(), "job".into(), LeaseKind::Work, 2, 23).unwrap();
@@ -166,4 +166,31 @@ fn section_control_metadata_changes_without_normalizing_user_payload_numbers() {
     assert_eq!(serde_json::from_value::<HypaValue>(value).unwrap(), hypa);
     let plugin = LocalPluginValue { space: PluginSpace::Json, value: json!({"fraction": 0.5, "count": 9}) };
     assert_eq!(serde_json::to_value(&plugin).unwrap()["value"], plugin.value);
+}
+
+
+#[test]
+fn logical_owner_head_control_counters_are_decimal_without_changing_payload_numbers() {
+    use risunest_external_storage_format::logical_records::{LogicalOwnerHead, LogicalOwnerLocator};
+    let head = LogicalOwnerHead {
+        owner: LogicalOwnerLocator::RootModule { module_id: "module".into() },
+        present: true, manifest_hash: Some("a".repeat(64)),
+        entry_count: u64::MAX, property_index: Some(u64::MAX),
+    };
+    let value = serde_json::to_value(&head).unwrap();
+    assert_eq!(value["entryCount"], "18446744073709551615");
+    assert_eq!(value["propertyIndex"], "18446744073709551615");
+    assert_eq!(serde_json::from_value::<LogicalOwnerHead>(value.clone()).unwrap(), head);
+    rejects::<LogicalOwnerHead>(&value, "entryCount", "18446744073709551616");
+    // propertyIndex remains optional, but a supplied value must be canonical decimal.
+    for invalid in [json!(0), json!(0.5), json!(true), json!(""), json!("00"),
+        json!("+1"), json!("-1"), json!(" 1"), json!("1 "), json!("18446744073709551616")] {
+        let mut changed = value.clone();
+        changed["propertyIndex"] = invalid;
+        assert!(serde_json::from_value::<LogicalOwnerHead>(changed.clone()).is_err(), "accepted {changed}");
+    }
+    let absent = LogicalOwnerHead { entry_count: 0, property_index: None, ..head };
+    let value = serde_json::to_value(&absent).unwrap();
+    assert!(value.get("propertyIndex").is_none());
+    assert_eq!(serde_json::from_value::<LogicalOwnerHead>(value).unwrap(), absent);
 }

@@ -60,8 +60,13 @@ pub struct LogicalOwnerHead {
     pub owner: LogicalOwnerLocator,
     pub present: bool,
     pub manifest_hash: Option<String>,
+    #[serde(with = "crate::control_integer")]
     pub entry_count: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        with = "crate::control_integer::optional",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub property_index: Option<u64>,
 }
 
@@ -932,6 +937,11 @@ mod tests {
             assert_eq!(json["kind"], expected_kind);
             if expected_kind == "root" {
                 assert!(json["ownerHeads"][0].get("manifestSize").is_none());
+                assert_eq!(json["ownerHeads"][0]["entryCount"], "2");
+                assert_eq!(json["ownerHeads"][0]["propertyIndex"], "1");
+            }
+            if expected_kind == "preset" {
+                assert_eq!(json["configuredIndex"], 4);
             }
             if expected_kind == "archived-character" {
                 assert_eq!(json["identityRemap"], json!([]));
@@ -948,7 +958,7 @@ mod tests {
     fn present_owner_heads_require_a_canonical_property_position() {
         let manifest_hash = "2".repeat(64);
         let canonical = format!(
-            "{{\"schema\":\"risunest.logical-record/v1\",\"kind\":\"root\",\"value\":{{}},\"ownerHeads\":[{{\"owner\":{{\"kind\":\"root-module-assets\",\"moduleId\":\"module-0\"}},\"present\":true,\"manifestHash\":\"{manifest_hash}\",\"entryCount\":0,\"propertyIndex\":0}}]}}"
+            "{{\"schema\":\"risunest.logical-record/v1\",\"kind\":\"root\",\"value\":{{}},\"ownerHeads\":[{{\"owner\":{{\"kind\":\"root-module-assets\",\"moduleId\":\"module-0\"}},\"present\":true,\"manifestHash\":\"{manifest_hash}\",\"entryCount\":\"0\",\"propertyIndex\":\"0\"}}]}}"
         );
         let decoded = decode_logical_record(canonical.as_bytes())
             .expect("decode present owner head with a property position");
@@ -959,15 +969,15 @@ mod tests {
 
         for invalid in [
             format!(
-                "{{\"schema\":\"risunest.logical-record/v1\",\"kind\":\"root\",\"value\":{{}},\"ownerHeads\":[{{\"owner\":{{\"kind\":\"root-module-assets\",\"moduleId\":\"module-0\"}},\"present\":true,\"manifestHash\":\"{manifest_hash}\",\"entryCount\":0}}]}}"
+                "{{\"schema\":\"risunest.logical-record/v1\",\"kind\":\"root\",\"value\":{{}},\"ownerHeads\":[{{\"owner\":{{\"kind\":\"root-module-assets\",\"moduleId\":\"module-0\"}},\"present\":true,\"manifestHash\":\"{manifest_hash}\",\"entryCount\":\"0\"}}]}}"
             ),
             format!(
-                "{{\"schema\":\"risunest.logical-record/v1\",\"kind\":\"root\",\"value\":{{}},\"ownerHeads\":[{{\"owner\":{{\"kind\":\"root-module-assets\",\"moduleId\":\"module-0\"}},\"present\":true,\"manifestHash\":\"{manifest_hash}\",\"entryCount\":0,\"propertyIndex\":null}}]}}"
+                "{{\"schema\":\"risunest.logical-record/v1\",\"kind\":\"root\",\"value\":{{}},\"ownerHeads\":[{{\"owner\":{{\"kind\":\"root-module-assets\",\"moduleId\":\"module-0\"}},\"present\":true,\"manifestHash\":\"{manifest_hash}\",\"entryCount\":\"0\",\"propertyIndex\":null}}]}}"
             ),
             format!(
-                "{{\"schema\":\"risunest.logical-record/v1\",\"kind\":\"root\",\"value\":{{}},\"ownerHeads\":[{{\"owner\":{{\"kind\":\"root-module-assets\",\"moduleId\":\"module-0\"}},\"present\":true,\"manifestHash\":\"{manifest_hash}\",\"entryCount\":0,\"propertyIndex\":9007199254740992}}]}}"
+                "{{\"schema\":\"risunest.logical-record/v1\",\"kind\":\"root\",\"value\":{{}},\"ownerHeads\":[{{\"owner\":{{\"kind\":\"root-module-assets\",\"moduleId\":\"module-0\"}},\"present\":true,\"manifestHash\":\"{manifest_hash}\",\"entryCount\":\"0\",\"propertyIndex\":\"9007199254740992\"}}]}}"
             ),
-            "{\"schema\":\"risunest.logical-record/v1\",\"kind\":\"root\",\"value\":{},\"ownerHeads\":[{\"owner\":{\"kind\":\"root-module-assets\",\"moduleId\":\"module-0\"},\"present\":false,\"manifestHash\":null,\"entryCount\":0,\"propertyIndex\":0}]}".to_owned(),
+            "{\"schema\":\"risunest.logical-record/v1\",\"kind\":\"root\",\"value\":{},\"ownerHeads\":[{\"owner\":{\"kind\":\"root-module-assets\",\"moduleId\":\"module-0\"},\"present\":false,\"manifestHash\":null,\"entryCount\":\"0\",\"propertyIndex\":\"0\"}]}".to_owned(),
         ] {
             assert!(decode_logical_record(invalid.as_bytes()).is_err());
         }
