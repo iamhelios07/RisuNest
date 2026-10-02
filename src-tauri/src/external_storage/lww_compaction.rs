@@ -368,6 +368,13 @@ impl ExternalLwwEngine {
             purpose:super::packaging::SnapshotPurpose::LwwCheckpoint { covered_prefixes:state.catalog.coverage.clone(),state_identity:state.catalog.identity()?,asset_catalogs,standalone_bodies } };
         let captured=CapturedSnapshot{id:job_id.into(),identity:identity.clone(),catalog:capture,projected_records:count,shared:true};
         let completed=super::packaging::package_and_upload_protected(captured,Vec::new(),directory,&directory.join("cache"),metadata,&self.root_key,limits,None,&mut journal,self.provider.as_ref(),&self.repository,&super::phase_progress::PhaseProgress::silent(),cancel,protection).await?;
+        #[cfg(test)]
+        let completed={
+            let mut completed=completed;
+            completed.compaction_catalog_merge_visits=Some(state.catalog.visited);
+            completed.compaction_capture_rows=Some(u64::try_from(count).map_err(error)?);
+            completed
+        };
         if let Some(pins)=pins.as_mut() {pins.release(crate::asset_repository::job_pins::CasReleaseOutcome::Aborted).map_err(error)?;}
         Ok(completed)
     }
@@ -440,6 +447,8 @@ mod tests {
                 let work=tempfile::tempdir().unwrap();
                 let completed=engine.compact_published(work.path(),"00000000-0000-4000-8000-000000000087",
                     &f.a.lww_clock_state().unwrap().writer_id,&fake::capabilities(true),&cancel,None).await.unwrap();
+                assert!(completed.compaction_capture_rows.unwrap()>0);
+                assert!(completed.compaction_catalog_merge_visits.unwrap()>=completed.compaction_capture_rows.unwrap());
                 let (_,checkpoint)=engine.checkpoint(&completed.reference.receipt,&cancel).await.unwrap();
                 assert_eq!(checkpoint.asset_catalogs.len(),1);
                 let root=RemoteObject::from_stored(&checkpoint.asset_catalogs[0],&engine.repository).unwrap();
