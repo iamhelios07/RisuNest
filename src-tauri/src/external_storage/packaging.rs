@@ -5257,8 +5257,16 @@ mod tests {
             let completed=package_and_upload_control_catalog(vec![AssetCatalogSource{content_hash:page.hash.clone(),byte_length:page.size,source:ObjectSource::File(source)}],
                 root.path(),&root.path().join("data-cache"),&key,limits(256*1024),&mut transfer,&provider,&repository,&PhaseProgress::silent(),&Cancellation::default(),None).await.unwrap();
             let mut store=crate::persistent_store::PersistentStore::open(destination.path()).unwrap();
-            let hashes=snapshot_restore::admit_data_catalogs(&[completed.catalog.clone()],&mut store,&key,&provider,&repository,&Cancellation::default()).await.unwrap();
+            let hashes=snapshot_restore::admit_data_catalogs(&[completed.catalog.clone()],&mut store,"synthetic-controls",&key,&provider,&repository,&Cancellation::default()).await.unwrap();
             assert_eq!(hashes,vec![page.hash.clone()]);assert_eq!(store.lww_object_body(&page.hash).unwrap().unwrap(),page.bytes);
+            let reads=provider.read_count();
+            assert_eq!(snapshot_restore::admit_data_catalogs(&[completed.catalog.clone()],&mut store,"synthetic-controls",&key,&provider,&repository,&Cancellation::default()).await.unwrap(),hashes);
+            assert_eq!(provider.read_count(),reads,"an exact verified root with local controls needs no remote reads");
+            let pack_reads=completed.referenced.iter().filter(|object|object.role==ObjectRole::Pack).map(|object|
+                (object.receipt.locator.object.clone(),provider.read_attempts(&object.receipt.locator.object))).collect::<BTreeMap<_,_>>();
+            assert_eq!(snapshot_restore::admit_data_catalogs(&[completed.catalog.clone()],&mut store,"fresh-catalog-target",&key,&provider,&repository,&Cancellation::default()).await.unwrap(),hashes);
+            assert!(provider.read_count()>reads,"an unknown root authenticates its metadata");
+            for (name,reads) in pack_reads {assert_eq!(provider.read_attempts(&name),reads,"known controls are removed before pack turnover");}
             let remote=RemoteObject::from_stored(&completed.catalog,&repository).unwrap();
             assert!(snapshot_restore::read_catalog(&remote,wire::CatalogKind::Assets,&key,&root.path().join("wrong-kind"),&provider,&repository,&Cancellation::default()).await.is_err());
         });
