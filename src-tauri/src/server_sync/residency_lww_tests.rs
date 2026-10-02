@@ -318,6 +318,76 @@ fn transient_hydration_keeps_the_body_remote_and_reclaims_its_spool() {
 }
 
 #[test]
+fn frozen_server_transient_source_survives_access_config_replacement() {
+    let server = LocalServerFixture::new();
+    let (_root, mut store) = local();
+    let core = server.client(&store);
+    let bytes = vec![97; 128 * 1024 + 1];
+    let hash = put_asset(&mut store, "assets/frozen-source.png", &bytes).object_hash.unwrap();
+    let request = super::lww_tests::header(&store);
+    core.push(&mut store, &request, &[]).unwrap();
+    store.asset_residency_set_policy(super::residency::AssetPolicy::Remote, || Ok(())).unwrap();
+    store.asset_residency_evict(|| Ok(())).unwrap();
+    let residency = Residency::open(store.repository_root()).unwrap();
+    let captured = residency.object(&hash, None).unwrap().unwrap();
+    let serialized = serde_json::to_value(&captured).unwrap();
+    assert!(serialized["config"].get("token").is_none());
+    assert!(serialized["config"].get("directory").is_none());
+    assert!(serialized["config"]["credentialId"].is_string());
+    let frozen: super::residency::RemoteObject = serde_json::from_value(serialized.clone()).unwrap();
+
+    let other_server = LocalServerFixture::new();
+    let mut replacement = captured.config.clone();
+    replacement.endpoint = other_server.endpoint.clone();
+    residency.replace_access_config(&replacement).unwrap();
+    store.server_save_config(&replacement).unwrap();
+    assert_eq!(residency.object(&hash, None).unwrap().unwrap().config.endpoint, other_server.endpoint);
+    assert_eq!(serde_json::to_value(&frozen).unwrap(), serialized);
+
+    let scratch = tempfile::tempdir().unwrap();
+    let mut body = super::residency::open_transient_server_proof_with_check(
+        store.repository_root(), scratch.path(), &frozen, &|| Ok(()),
+    ).unwrap().unwrap();
+    let mut actual = Vec::new();
+    std::io::Read::read_to_end(&mut body, &mut actual).unwrap();
+    assert_eq!(actual, bytes);
+    assert_eq!(body.len().unwrap(), frozen.size);
+    assert!(PayloadCas::new(store.repository_root()).unwrap().stat_object(&hash).unwrap().is_none());
+    assert_eq!(residency.object(&hash, None).unwrap().unwrap().retention_id, frozen.retention_id);
+    drop(body);
+    assert!(std::fs::read_dir(scratch.path()).unwrap().next().is_none());
+}
+
+#[test]
+fn frozen_server_transient_authority_failure_stops_before_body_transfer() {
+    let server = LocalServerFixture::new();
+    let (_root, mut store) = local();
+    let core = server.client(&store);
+    let bytes = vec![101; 128 * 1024 + 1];
+    let hash = put_asset(&mut store, "assets/frozen-authority.png", &bytes).object_hash.unwrap();
+    let request = super::lww_tests::header(&store);
+    core.push(&mut store, &request, &[]).unwrap();
+    store.asset_residency_set_policy(super::residency::AssetPolicy::Remote, || Ok(())).unwrap();
+    store.asset_residency_evict(|| Ok(())).unwrap();
+    let proof = Residency::open(store.repository_root()).unwrap().object(&hash, None).unwrap().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let counters = Arc::new(super::client::TestIoCounters::default());
+    let error = super::client::with_test_io(store.repository_root(), counters.clone(), || {
+        super::residency::open_transient_server_proof_with_check(
+            store.repository_root(), scratch.path(), &proof, &|| {
+                if counters.snapshot()[0] != 0 { return Err(super::SyncError::new("stale-authority", 409)); }
+                Ok(())
+            },
+        )
+    }).err().expect("authority must be checked again after identity resolution");
+    assert_eq!(error.code, "stale-authority");
+    assert_eq!(counters.snapshot()[0], 1);
+    assert!(std::fs::read_dir(scratch.path()).unwrap().next().is_none());
+    assert!(PayloadCas::new(store.repository_root()).unwrap().stat_object(&hash).unwrap().is_none());
+    assert_eq!(Residency::open(store.repository_root()).unwrap().object(&hash, None).unwrap().unwrap().retention_id, proof.retention_id);
+}
+
+#[test]
 fn server_only_transient_source_does_not_hydrate_without_server_custody() {
     let (_root,store)=local();
     let scratch=tempfile::tempdir().unwrap();
