@@ -148,14 +148,41 @@ pub(crate) fn save(store: &mut PersistentStore, parts: &[&str], value: serde_jso
         .unwrap();
 }
 fn push(client: &LwwClient, store: &mut PersistentStore) {
-    let request = header(store);
-    assert!(client.push(store, &request, &[]).unwrap().is_some());
+    assert!(publish_cycle(client, store, &[]).unwrap().is_some());
 }
 fn receive(client: &LwwClient, store: &mut PersistentStore) {
+    receive_available(client, store, &[]).unwrap();
+}
+pub(crate) fn publish_cycle(
+    client: &LwwClient,
+    store: &mut PersistentStore,
+    generating: &[crate::persistent_store::lww::MessageLocator],
+) -> super::Result<Option<risunest_sync_wire::lww::PushReceipt>> {
+    client.push(store, &header(store), generating)
+}
+pub(crate) fn receive_cycle(
+    client: &LwwClient,
+    store: &mut PersistentStore,
+    generating: &[crate::persistent_store::lww::MessageLocator],
+) -> super::Result<super::lww_client::NativeReceiveCompletion> {
+    client.receive_native_complete(store, &header(store), generating)
+}
+pub(crate) fn drain_publications(
+    client: &LwwClient,
+    store: &mut PersistentStore,
+    generating: &[crate::persistent_store::lww::MessageLocator],
+) -> super::Result<()> {
+    while publish_cycle(client, store, generating)?.is_some() {}
+    Ok(())
+}
+pub(crate) fn receive_available(
+    client: &LwwClient,
+    store: &mut PersistentStore,
+    generating: &[crate::persistent_store::lww::MessageLocator],
+) -> super::Result<()> {
     loop {
-        let result = client.receive_native(store, &header(store), &[]).unwrap();
-        if result.affected_keys.is_empty() {
-            break;
+        if receive_cycle(client, store, generating)?.received_units == 0 {
+            return Ok(());
         }
     }
 }
@@ -583,6 +610,98 @@ fn publication(client: &LwwClient, store: &PersistentStore) -> Publication {
 }
 
 #[test]
+fn initial_state_retry_settles_original_acceptance_without_republishing_acked_units() {
+    let server = LocalServerFixture::new();
+    let (root, mut store) = local();
+    let client = server.client(&store);
+    save(&mut store, &["root", "language"], serde_json::json!("ja"));
+    let operation = publication(&client, &store);
+    let body = client.log.prepare(&operation).unwrap();
+    let reply = client
+        .client
+        .request(
+            reqwest::Method::POST,
+            "push",
+            &[],
+            Some(body),
+            &[],
+            MAX_METADATA_BYTES,
+        )
+        .unwrap();
+    assert_eq!(reply.status, 200);
+    let config = client.client.config();
+    drop(client);
+    drop(store);
+    let mut store = PersistentStore::open(root.path()).unwrap();
+    let mut client = LwwClient::new(root.path(), config).unwrap();
+    let io = std::sync::Arc::new(super::client::TestIoCounters::default());
+    client.client.test_io = Some(io.clone());
+    save(
+        &mut store,
+        &["root", "askRemoval"],
+        serde_json::json!(false),
+    );
+    for attempt in 0..2 {
+        let request = header(&store);
+        store
+            .lww_queue_unit_state_page(&request, None, 256)
+            .unwrap();
+        io.reset();
+        let receipt = client.push(&mut store, &request, &[]).unwrap();
+        let counters = io.snapshot();
+        if attempt == 1 {
+            assert!(receipt.is_none());
+            assert_eq!(counters[0], 0);
+        } else {
+            assert!(receipt.is_some());
+            assert!(counters[0] > 0);
+            let intent: String = client
+                .log
+                .0
+                .query_row(
+                    "SELECT intent FROM publications WHERE id<>?1",
+                    [&operation.request.operation_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let next: Publication = serde_json::from_str(&intent).unwrap();
+            assert_eq!(next.request.changes.len(), 1);
+            assert_eq!(
+                next.request.changes[0].key,
+                UnitKey::new(&["root", "askRemoval"]).unwrap()
+            );
+            let original: Vec<u8> = client
+                .log
+                .0
+                .query_row(
+                    "SELECT body FROM publications WHERE id=?1",
+                    [&operation.request.operation_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                original,
+                risunest_sync_wire::canonical::encode(&operation.request).unwrap()
+            );
+        }
+        assert!(store
+            .lww_read_outbox(0.into(), 256)
+            .unwrap()
+            .entries
+            .is_empty());
+        assert_eq!(
+            client
+                .log
+                .0
+                .query_row("SELECT COUNT(*) FROM publications", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+}
+
+#[test]
 fn terminal_receipt_saved_before_ack_recovers_exact_versions_after_reopen() {
     let server = LocalServerFixture::new();
     let (root, mut store) = local();
@@ -900,12 +1019,7 @@ fn a_new_target_initialization_preserves_received_issuers_under_its_authenticate
     assert!(entries
         .iter()
         .any(|entry| entry.stamp.writer_id == publisher));
-    loop {
-        let request = header(&target);
-        if c.push(&mut target, &request, &[]).unwrap().is_none() {
-            break;
-        }
-    }
+    drain_publications(&c, &mut target, &[]).unwrap();
     let (_d, mut peer) = local();
     let d = new_target.client(&peer);
     receive(&d, &mut peer);

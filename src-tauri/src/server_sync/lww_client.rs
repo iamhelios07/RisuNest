@@ -198,6 +198,12 @@ pub(crate) struct LwwClient {
     root: std::path::PathBuf,
     cancelled: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
+#[cfg(test)]
+#[derive(serde::Serialize)]
+pub(crate) struct NativeReceiveCompletion {
+    pub result: ApplyResult,
+    pub received_units: usize,
+}
 impl LwwClient {
     pub(crate) fn new(root: &Path, config: ServerConfig) -> Result<Self> {
         Self::with_cancellation(root, config, None)
@@ -923,7 +929,18 @@ impl LwwClient {
         header: &Header,
         generating: &[MessageLocator],
     ) -> Result<ApplyResult> {
+        self.receive_native_complete(store, header, generating)
+            .map(|completion| completion.result)
+    }
+    #[cfg(test)]
+    pub(crate) fn receive_native_complete(
+        &self,
+        store: &mut PersistentStore,
+        header: &Header,
+        generating: &[MessageLocator],
+    ) -> Result<NativeReceiveCompletion> {
         let page = self.receive_page(store, header)?;
+        let received_units = page.changes.len();
         store.lww_stage_receive(&page)?;
         let result = store.lww_apply_receive(&ApplyReceive {
             header: page.header.clone(),
@@ -931,7 +948,10 @@ impl LwwClient {
         })?;
         store.lww_finish_receive(&page.header)?;
         self.finish_receive(store, &page.header)?;
-        Ok(result)
+        Ok(NativeReceiveCompletion {
+            result,
+            received_units,
+        })
     }
     pub(crate) fn finish_receive(&self, store: &PersistentStore, header: &Header) -> Result<()> {
         self.check()?;
