@@ -224,6 +224,11 @@ enum Intent {
     },
 }
 
+#[cfg(test)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct CommitIntentInput(Intent);
+
 pub(super) fn authority(db: &Connection) -> StoreResult<DecimalU64> {
     let value: String = db.query_row(
         "SELECT binding_authority FROM lww_clock WHERE singleton=1",
@@ -546,7 +551,10 @@ impl PersistentStore {
         let digest = {
             let hash_input = body.as_bytes();
             #[cfg(test)]
-            crate::persistent_store::hash_work::observe("native_intent", hash_input.len());
+            {
+                crate::persistent_store::hash_work::observe("native_intent", hash_input.len());
+                crate::persistent_store::hash_work::record_commit_intent_input(hash_input);
+            }
             risunest_sync_wire::hash(hash_input)
         };
         let tx = self.device_store_mut()?.transaction()?;
@@ -598,7 +606,10 @@ impl PersistentStore {
         let digest = {
             let hash_input = serde_json::to_string(intent)?;
             #[cfg(test)]
-            crate::persistent_store::hash_work::observe("native_intent", hash_input.len());
+            {
+                crate::persistent_store::hash_work::observe("native_intent", hash_input.len());
+                crate::persistent_store::hash_work::record_commit_intent_input(hash_input.as_bytes());
+            }
             risunest_sync_wire::hash(hash_input.as_bytes())
         };
         let row: Option<(String, String, bool)> = self

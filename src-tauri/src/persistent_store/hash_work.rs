@@ -4,7 +4,7 @@
 //! threads must return their own sample. Incomplete delegated calls invalidate
 //! a total, even when the domains still contain useful observed partial work.
 //! The byte component of `lww::take_work_metrics` aliases native_unit_envelope.
-//! Receive-intent input capture is off by default and only for synthetic
+//! Intent input capture is off by default and only for synthetic
 //! diagnostics. Reset enables it; take disables it. Parse after timing ends.
 #![cfg(test)]
 
@@ -25,6 +25,21 @@ pub(crate) struct HashWork {
 
 thread_local! { static WORK: RefCell<HashWork> = RefCell::new(HashWork::default()); }
 thread_local! { static RECEIVE_INTENT_INPUTS: RefCell<Option<Vec<Vec<u8>>>> = const { RefCell::new(None) }; }
+thread_local! { static COMMIT_INTENT_INPUTS: RefCell<Option<Vec<Vec<u8>>>> = const { RefCell::new(None) }; }
+
+pub(crate) fn reset_commit_intent_inputs() {
+    COMMIT_INTENT_INPUTS.with(|inputs| *inputs.borrow_mut() = Some(Vec::new()));
+}
+
+pub(crate) fn take_commit_intent_inputs() -> Vec<Vec<u8>> {
+    COMMIT_INTENT_INPUTS.with(|inputs| inputs.borrow_mut().take().unwrap_or_default())
+}
+
+pub(super) fn record_commit_intent_input(bytes: &[u8]) {
+    COMMIT_INTENT_INPUTS.with(|inputs| {
+        if let Some(inputs) = inputs.borrow_mut().as_mut() { inputs.push(bytes.to_vec()); }
+    });
+}
 
 // Opt-in diagnostic capture. Parse only after taking the operation's timings
 // and counters; captured inputs are not additional hash work.
@@ -186,5 +201,34 @@ mod tests {
         reset_hash_work(); assert_eq!(take_hash_work(), HashWork::default());
         assert_eq!(worker, vec![b"worker".to_vec()]);
         assert_eq!(take_receive_intent_inputs(), vec![b"owner".to_vec()]);
+    }
+
+    #[test]
+    fn commit_input_capture_is_default_off_resettable_and_independent_of_receive_capture() {
+        assert!(take_commit_intent_inputs().is_empty());
+        record_commit_intent_input(b"disabled"); assert!(take_commit_intent_inputs().is_empty());
+        reset_commit_intent_inputs(); record_commit_intent_input(b"discarded"); reset_commit_intent_inputs();
+        reset_receive_intent_inputs(); record_receive_intent_input(b"receive");
+        record_commit_intent_input(b"commit");
+        assert_eq!(take_receive_intent_inputs(), vec![b"receive".to_vec()]);
+        record_commit_intent_input(b"commit-after-receive-take");
+        assert_eq!(take_commit_intent_inputs(), vec![b"commit".to_vec(), b"commit-after-receive-take".to_vec()]);
+        record_commit_intent_input(b"disabled-again"); assert!(take_commit_intent_inputs().is_empty());
+        reset_receive_intent_inputs(); record_receive_intent_input(b"receive-before-commit-take");
+        reset_commit_intent_inputs(); assert!(take_commit_intent_inputs().is_empty());
+        record_receive_intent_input(b"receive-after-commit-take");
+        assert_eq!(take_receive_intent_inputs(), vec![b"receive-before-commit-take".to_vec(), b"receive-after-commit-take".to_vec()]);
+    }
+
+    #[test]
+    fn commit_input_capture_is_thread_local_and_independent_of_hash_reset() {
+        reset_commit_intent_inputs(); record_commit_intent_input(b"owner");
+        let worker = std::thread::spawn(|| {
+            record_commit_intent_input(b"worker-disabled"); assert!(take_commit_intent_inputs().is_empty());
+            reset_commit_intent_inputs(); record_commit_intent_input(b"worker"); take_commit_intent_inputs()
+        }).join().unwrap();
+        reset_hash_work(); assert_eq!(take_hash_work(), HashWork::default());
+        assert_eq!(worker, vec![b"worker".to_vec()]);
+        assert_eq!(take_commit_intent_inputs(), vec![b"owner".to_vec()]);
     }
 }
