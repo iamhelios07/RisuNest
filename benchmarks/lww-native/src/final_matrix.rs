@@ -12,7 +12,7 @@ fn write(directory:&Path,name:&str,value:&Value)->Result<(),String> {
     let file=std::fs::OpenOptions::new().create_new(true).write(true).open(directory.join(name)).map_err(|e|e.to_string())?;
     serde_json::to_writer_pretty(file,value).map_err(|e|e.to_string())
 }
-fn load(path:&Path,requirement:scale_certificate::ScaleRequirement)->Result<(PersistentStore,scale_certificate::ScaleCertificate),String> {
+fn load(path:&Path,requirement:scale_certificate::ScaleRequirement,output:&Path)->Result<(PersistentStore,scale_certificate::ScaleCertificate,tempfile::TempDir),String> {
     let value:Value=serde_json::from_reader(File::open(path).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
     if value["setup_only"]!=true {return Err("input is not a native construction receipt".into());}
     let root=PathBuf::from(value["target"]["root"].as_str().ok_or("construction root missing")?);
@@ -20,14 +20,55 @@ fn load(path:&Path,requirement:scale_certificate::ScaleRequirement)->Result<(Per
         .map_err(|e|e.to_string())?;
     if certificate.requirement!=requirement {return Err("construction receipt has the wrong physical tier".into());}
     certificate.validate()?;
-    let mut store=PersistentStore::open(&root).map_err(|e|e.to_string())?;
+    if value["schema"]!="risunest.lww-native-construction/v1" {return Err("input is not the owned native constructor receipt".into());}
+    let original_writer=value["target"]["writer_id"].as_str().ok_or("construction writer is absent")?;
+    let database=root.join("persistent/persistent.sqlite");let device=root.join("persistent/device.sqlite");
+    for database in [&database,&device] {
+        let wal=PathBuf::from(format!("{}-wal",database.display()));
+        if wal.exists() && std::fs::metadata(&wal).map_err(|e|e.to_string())?.len()!=0 {
+            return Err("owned constructor has an active WAL; no fixture fork was made".into());
+        }
+    }
+    let readonly=rusqlite::Connection::open_with_flags(&database,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e|e.to_string())?;
+    let target:String=readonly.query_row("SELECT target FROM library_sync_selection WHERE singleton=1",[],|row|row.get(0)).map_err(|e|e.to_string())?;
+    if target!="none" {return Err("owned constructor is already bound".into());}
+    for table in ["lww_publications","lww_receive_rows","lww_binding_switch_requests","lww_binding_stages"] {
+        let count=readonly.query_row(&format!("SELECT count(*) FROM {table}"),[],|row|sql_u64(row,0)).map_err(|e|e.to_string())?;
+        if count!=0 {return Err(format!("owned constructor contains transport state in {table}"));}
+    }
+    let device_readonly=rusqlite::Connection::open_with_flags(&device,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e|e.to_string())?;
+    let actual_writer:String=device_readonly.query_row("SELECT writer_id FROM device_meta WHERE singleton=1",[],|row|row.get(0)).map_err(|e|e.to_string())?;
+    if actual_writer!=original_writer {return Err("owned constructor writer changed since its receipt".into());}
+    for query in ["SELECT count(*) FROM lww_progress","SELECT count(*) FROM external_lww_segments",
+        "SELECT count(*) FROM external_lww_seen","SELECT count(*) FROM lww_receive",
+        "SELECT count(*) FROM lww_intents WHERE complete=0"] {
+        if device_readonly.query_row(query,[],|row|sql_u64(row,0)).map_err(|e|e.to_string())?!=0 {
+            return Err("owned constructor has transport progress or pending operations".into());
+        }
+    }
+    drop(device_readonly);drop(readonly);
+    let fork=tempfile::tempdir().map_err(|e|e.to_string())?;
+    std::fs::create_dir_all(fork.path().join("persistent")).map_err(|e|e.to_string())?;
+    std::fs::copy(&database,fork.path().join("persistent/persistent.sqlite")).map_err(|e|e.to_string())?;
+    for asset in &certificate.assets {
+        let source=root.join("assets/objects").join(&asset.payload_hash[..2]).join(&asset.payload_hash[2..]);
+        let destination=fork.path().join("assets/objects").join(&asset.payload_hash[..2]).join(&asset.payload_hash[2..]);
+        std::fs::create_dir_all(destination.parent().ok_or("canonical Asset parent absent")?).map_err(|e|e.to_string())?;
+        std::fs::copy(source,destination).map_err(|e|e.to_string())?;
+    }
+    let mut store=PersistentStore::open(fork.path()).map_err(|e|e.to_string())?;
+    let fork_writer=store.lww_clock_state().map_err(|e|e.to_string())?.writer_id;
+    if fork_writer==original_writer {return Err("physical fixture fork did not initialize an independent writer".into());}
     if store.lww_binding_state().map_err(|e|e.to_string())?.target!=SyncTarget::None {
         return Err("final matrix requires a fresh unbound certified producer".into());
     }
     let plan=native_shards::ShardPlan::new(1,requirement.minimums().1);
     let actual=collect_native_scale_certificate(&mut store,&plan,requirement)?;
     if actual!=certificate {return Err("actual persisted producer no longer matches its construction certificate".into());}
-    Ok((store,certificate))
+    write(output,"excluded-certified-fixture-fork.json",&json!({"phase":"excluded-physical-fixture-fork","originalRoot":root,
+        "forkRoot":fork.path(),"originalWriter":original_writer,"forkWriter":fork_writer,"physicalCertificate":actual,
+        "scope":"checkpointed library SQLite and canonical CAS copied; device/config/jobs not copied; original library unit stamps and unbound outbox retained"}))?;
+    Ok((store,certificate,fork))
 }
 fn inventory(store:&PersistentStore)->Result<Vec<String>,String> {
     let aliases=store.list_asset_aliases(None).map_err(|e|e.to_string())?.value;
@@ -86,11 +127,11 @@ fn run_inner()->Result<(),String> {
     let mut tiers=Vec::new();
     for (name,variable,requirement) in [("target","RISUNEST_LWW_TARGET_RECEIPT",scale_certificate::ScaleRequirement::Target),
         ("above-target","RISUNEST_LWW_ABOVE_RECEIPT",scale_certificate::ScaleRequirement::AboveTarget)] {
-        let (store,certificate)=load(&PathBuf::from(environment(variable)?),requirement)?;
+        let (store,certificate,fork)=load(&PathBuf::from(environment(variable)?),requirement,&directory.join(name))?;
         if directory.starts_with(store.repository_root()) || store.repository_root().starts_with(&directory) {
             return Err("measurement output and native data roots must be separate".into());
         }
-        tiers.push((name,store,certificate));
+        tiers.push((name,store,certificate,fork));
     }
     scale_certificate::validate_above_target(&tiers[0].2,&tiers[1].2)?;
     write(&directory,"native-matrix-plan.json",&json!({"checkpoint":checkpoint,"binary_sha256":binary,
@@ -103,7 +144,7 @@ fn run_inner()->Result<(),String> {
         let mut selected_samples=Vec::new();
         let mut resume_samples=Vec::new();
         let mut costly_reports=Vec::new();
-        for (name,mut store,certificate) in tiers {
+        for (name,mut store,certificate,_fork) in tiers {
             let output=directory.join(name);std::fs::create_dir_all(&output).map_err(|e|e.to_string())?;
             let hashes=inventory(&store)?;
             if transport=="local-server" {
