@@ -520,10 +520,27 @@ impl ExternalLwwEngine {
                 let mut spools = Vec::new();
                 let mut sources = Vec::new();
                 for asset in publication.assets.iter().filter(|asset| asset.byte_length <= segment::SMALL_BODY_BYTES as u64) {
+                    Self::check_publication_authority(store, &publication)?;
                     let source = if let Some(proof) = &asset.remote_source {
                         let spool = super::lww_residency::spool_frozen_remote_body(
                             proof, &root.join("external-storage").join("lww-publications").join(&job.job_id), cancel,
                         ).await?.into_temp_path();
+                        Self::check_publication_authority(store, &publication)?;
+                        let source = super::content_store::ObjectSource::File(spool.to_path_buf());
+                        spools.push(spool);
+                        source
+                    } else if asset.server_source.is_some() {
+                        let mut body = Self::open_frozen_server_body(store, asset, job, publication.authority, cancel)?;
+                        let scratch = root.join("external-storage").join("lww-publications").join(&job.job_id);
+                        let mut spool = tempfile::NamedTempFile::new_in(&scratch).map_err(transient)?;
+                        let mut chunk = [0; 64 * 1024];
+                        loop {
+                            Self::check_frozen_body_authority(store, publication.authority, cancel).map_err(|error| Self::body_source_error(error, cancel))?;
+                            let read = std::io::Read::read(&mut body, &mut chunk).map_err(transient)?;
+                            if read == 0 { break; }
+                            std::io::Write::write_all(&mut spool, &chunk[..read]).map_err(transient)?;
+                        }
+                        let spool = spool.into_temp_path();
                         let source = super::content_store::ObjectSource::File(spool.to_path_buf());
                         spools.push(spool);
                         source
@@ -553,7 +570,7 @@ impl ExternalLwwEngine {
                 let body = &publication.bodies[index];
                 let asset = publication.assets.iter().find(|asset| asset.content_hash == body.content_hash)
                     .ok_or_else(segment::corrupt)?;
-                let bytes = self.read_frozen_standalone(store, asset, publication.asset_job.as_ref().ok_or_else(segment::corrupt)?, cancel).await?;
+                let bytes = self.read_frozen_standalone(store, asset, publication.asset_job.as_ref().ok_or_else(segment::corrupt)?, publication.authority, cancel).await?;
                 if bytes.len() as u64 != asset.byte_length { return Err(segment::corrupt()); }
                 let sealed_body = segment::seal_body(&bytes, &self.library, &body.object_id, &self.root_key)?;
                 publication.bodies[index].sha256 = segment::digest(&sealed_body);
@@ -747,33 +764,54 @@ impl ExternalLwwEngine {
         }
         Ok(())
     }
+    fn check_frozen_body_authority(store: &PersistentStore, authority: DecimalU64, cancel: &Cancellation) -> crate::server_sync::Result<()> {
+        cancel.check().map_err(|_| crate::server_sync::SyncError::new("operation-cancelled", 499))?;
+        if store.lww_binding_authority().map_err(|_| crate::server_sync::SyncError::new("binding-authority-unavailable", 409))? != authority {
+            return Err(crate::server_sync::SyncError::new("binding-authority-changed", 409));
+        }
+        Ok(())
+    }
+    fn body_source_error(error: crate::server_sync::SyncError, cancel: &Cancellation) -> ProviderError {
+        ProviderError::new(if cancel.check().is_err() { ErrorKind::Cancelled }
+            else if error.code == "binding-authority-changed" || error.code == "binding-authority-unavailable" { ErrorKind::PreconditionFailed }
+            else { ErrorKind::Transient })
+    }
+    fn open_frozen_server_body(
+        store: &PersistentStore, asset: &FrozenAsset, job: &super::journal::JobIdentity,
+        authority: DecimalU64, cancel: &Cancellation,
+    ) -> Result<crate::server_sync::residency::TransientBody> {
+        let proof = asset.server_source.as_ref().ok_or_else(segment::corrupt)?;
+        if proof.hash != asset.content_hash || proof.size != asset.byte_length { return Err(segment::corrupt()); }
+        let root = store.repository_root();
+        let scratch = root.join("external-storage").join("lww-publications").join(&job.job_id);
+        std::fs::create_dir_all(&scratch).map_err(transient)?;
+        let check = || Self::check_frozen_body_authority(store, authority, cancel);
+        crate::server_sync::residency::open_transient_server_proof_with_check(root, &scratch, proof, &check)
+            .map_err(|error| Self::body_source_error(error, cancel))?.ok_or_else(segment::corrupt)
+    }
     async fn read_frozen_standalone(
         &self,
         store: &mut PersistentStore,
         asset: &FrozenAsset,
         job: &super::journal::JobIdentity,
+        authority: DecimalU64,
         cancel: &Cancellation,
     ) -> Result<Vec<u8>> {
-        cancel.check()?;
+        Self::check_frozen_body_authority(store, authority, cancel).map_err(|error| Self::body_source_error(error, cancel))?;
         let bytes = if asset.local_pin {
             store.lww_object_body(&asset.content_hash).map_err(store_error)?.ok_or_else(segment::corrupt)?
         } else if let Some(proof) = &asset.remote_source {
             let spool = super::lww_residency::spool_frozen_remote_body(
                 proof, &store.repository_root().join("external-storage").join("lww-publications").join(&job.job_id), cancel,
             ).await?;
+            Self::check_frozen_body_authority(store, authority, cancel).map_err(|error| Self::body_source_error(error, cancel))?;
             super::lww_residency::read_frozen_body_spool(proof, &spool, cancel)?
         } else {
-            let root = store.repository_root();
-            let scratch = root.join("external-storage").join("lww-publications").join(&job.job_id);
-            std::fs::create_dir_all(&scratch).map_err(transient)?;
-            let check = || cancel.check().map_err(|_| crate::server_sync::SyncError::new("operation-cancelled", 499));
-            let mut body = crate::server_sync::residency::open_transient_server_with_check(
-                root, &scratch, &asset.content_hash, &check,
-            ).map_err(|_| ProviderError::new(ErrorKind::Transient))?.ok_or_else(segment::corrupt)?;
+            let mut body = Self::open_frozen_server_body(store, asset, job, authority, cancel)?;
             let mut bytes = Vec::new();
             let mut chunk = [0; 64 * 1024];
             loop {
-                cancel.check()?;
+                Self::check_frozen_body_authority(store, authority, cancel).map_err(|error| Self::body_source_error(error, cancel))?;
                 let read = std::io::Read::read(&mut body, &mut chunk).map_err(transient)?;
                 if read == 0 { break; }
                 bytes.extend_from_slice(&chunk[..read]);
@@ -945,20 +983,21 @@ impl ExternalLwwEngine {
             let remote_source = if local_size.is_none() {
                 super::lww_residency::freeze_remote_body(root, &hash)?
             } else { None };
+            let server_source = if local_size.is_none() && remote_source.is_none() {
+                if !crate::server_sync::residency::Residency::exists(root) { return Err(segment::corrupt()); }
+                Some(crate::server_sync::residency::Residency::open(root)
+                    .and_then(|residency| residency.object(&hash, None)).map_err(|_| ProviderError::new(ErrorKind::Transient))?
+                    .ok_or_else(segment::corrupt)?)
+            } else { None };
             let byte_length = match local_size {
                 Some(size) => size,
                 None => match &remote_source {
                     Some(source) => source.byte_length(),
-                    None => {
-                        if !crate::server_sync::residency::Residency::exists(root) { return Err(segment::corrupt()); }
-                        crate::server_sync::residency::Residency::open(root)
-                            .and_then(|residency| residency.object(&hash, None)).map_err(|_| ProviderError::new(ErrorKind::Transient))?
-                            .map(|object| object.size).ok_or_else(segment::corrupt)?
-                    },
+                    None => server_source.as_ref().ok_or_else(segment::corrupt)?.size,
                 },
             };
             assets.insert(hash.clone(), FrozenAsset {
-                content_hash: hash.clone(), byte_length, local_pin: local_size.is_some(), remote_source,
+                content_hash: hash.clone(), byte_length, local_pin: local_size.is_some(), remote_source, server_source,
             });
             if byte_length > segment::SMALL_BODY_BYTES as u64 {
                 let id = uuid::Uuid::new_v4().to_string();
