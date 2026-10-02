@@ -128,6 +128,91 @@ fn switching_to_full_policy_hydrates_selected_references_before_other_characters
 }
 
 #[test]
+fn selected_archived_owner_hydration_requires_only_the_existing_full_inventory() {
+    use crate::{
+        asset_repository::{job_pins::CasReleaseOutcome, owner_manifest_codec::{encode_owner_manifest,OwnerManifestEntry}},
+        persistent_store::{AssetOwnerHead,AssetOwnerLocator},
+    };
+    let server=LocalServerFixture::new(); let (_root,mut store)=local();
+    let core=server.client(&store);
+    let asset=put_asset(&mut store,"assets/owner-archive.png",b"synthetic selected archived owner payload").object_hash.unwrap();
+    let cas=PayloadCas::new(store.repository_root()).unwrap();
+    let canonical=encode_owner_manifest(&[OwnerManifestEntry {
+        tuple:["extra".into(),"assets/owner-archive.png".into(),"png".into()],
+        payload_hash:Some(hex::decode(&asset).unwrap().try_into().unwrap()),
+    }]).unwrap();
+    let mut job=DurableCasJob::begin(store.repository_root(),"selected-archive-owner",CasJobKind::CardOrModuleContentImport,1).unwrap();
+    let manifest=job.prepare_reader(&cas,&mut canonical.as_slice(),CasObjectRole::OwnerManifest).unwrap();
+    job.seal(&mut store,2).unwrap();
+    let head=AssetOwnerHead::present(AssetOwnerLocator::CharacterAdditionalAssets { character_id:"selected-owner-archive".into() },manifest.content_hash.clone(),1);
+    store.commit(&WorkingSetCommit {
+        expected_revision:store.revision().unwrap(),
+        add_character:Some(serde_json::json!({"chaId":"selected-owner-archive","type":"character","name":"Synthetic","additionalAssets":[["extra","assets/owner-archive.png","png"]],"localFuture":"synthetic local-only archive detail","chats":[]})),
+        asset_owner_heads:Some(vec![head.clone()]),
+        ..Default::default()
+    }).unwrap();
+    job.release(CasReleaseOutcome::Committed).unwrap();
+    super::lww_tests::drain_publications(&core,&mut store,&[]).unwrap();
+    store.archive_character("selected-owner-archive",store.revision().unwrap(),5).unwrap();
+    super::lww_tests::drain_publications(&core,&mut store,&[]).unwrap();
+    let generation=store.read_asset_owner_head(&head.owner,None).unwrap().unwrap();
+    assert_eq!(generation.value,head);
+    let selected=store.selected_character_asset_hashes("selected-owner-archive").unwrap();
+    assert!(selected.contains(&manifest.content_hash)); assert!(selected.contains(&asset));
+    let archive_unit=store.lww_read_unit_state(store.lww_binding_authority().unwrap(),None,100).unwrap().entries.into_iter().find(|entry|entry.key.components()==["archive","selected-owner-archive"]).unwrap();
+    let risunest_sync_wire::unit::UnitValue::Object {descriptor,..}=archive_unit.value else {panic!("native archive must have a descriptor")};
+    let metadata:serde_json::Value=serde_json::from_slice(&store.lww_object_body(&descriptor.object_hash).unwrap().unwrap()).unwrap();
+    let shared=metadata["sharedObjectHash"].as_str().unwrap().to_owned();
+    let local_roots=selected.iter().filter(|hash|**hash!=asset && **hash!=manifest.content_hash && **hash!=shared).cloned().collect::<Vec<_>>();
+    assert_eq!(local_roots.len(),1);
+    let local_archive=&local_roots[0];
+    assert!(selected.contains(&shared)); assert_ne!(local_archive,&shared);
+    let inventory=store.residency_inventory_classification_test(false).unwrap();
+    assert!(inventory.0.contains(local_archive)); assert!(!inventory.0.contains(&shared));
+    assert!(!selected.contains(&descriptor.object_hash));
+    assert!(cas.stat_object(&descriptor.object_hash).unwrap().is_none());
+    store.asset_residency_set_policy(super::residency::AssetPolicy::Remote,||Ok(())).unwrap();
+    store.asset_residency_evict(||Ok(())).unwrap();
+    assert!(cas.stat_object(&asset).unwrap().is_none()); assert!(cas.stat_object(local_archive).unwrap().is_none());
+    assert!(cas.stat_object(&manifest.content_hash).unwrap().is_some());
+    let collected=store.asset_gc_delete_page(64,None,10_000,0).unwrap();
+    assert!(collected.report.deleted_hashes.contains(&shared));
+    assert!(cas.stat_object(&shared).unwrap().is_none());
+    assert!(Residency::open(store.repository_root()).unwrap().object(&shared,None).unwrap().is_none());
+    store.asset_residency_set_policy_prioritized(super::residency::AssetPolicy::Full,None,Some("selected-owner-archive"),||Ok(())).unwrap();
+    assert!(cas.stat_object(&asset).unwrap().is_some()); assert!(cas.stat_object(local_archive).unwrap().is_some());
+    assert!(cas.stat_object(&manifest.content_hash).unwrap().is_some());
+    assert!(cas.stat_object(&shared).unwrap().is_none());
+    assert_eq!(store.read_asset_owner_head(&head.owner,None).unwrap().unwrap().value,head);
+}
+
+#[test]
+fn selected_priority_does_not_hide_missing_required_assets_in_the_full_inventory() {
+    let server=LocalServerFixture::new(); let (_root,mut store)=local();
+    let _core=server.client(&store);
+    let selected=put_asset(&mut store,"assets/selected-present.png",b"synthetic selected present payload");
+    let missing=put_asset(&mut store,"assets/other-missing.png",b"synthetic required missing payload");
+    for (character,alias) in [("selected-present",&selected),("other-missing",&missing)] {
+        store.commit(&WorkingSetCommit {
+            expected_revision:store.revision().unwrap(),
+            add_character:Some(serde_json::json!({"chaId":character,"type":"character","name":"Synthetic","image":alias.key,"chats":[]})),
+            ..Default::default()
+        }).unwrap();
+    }
+    let cas=PayloadCas::new(store.repository_root()).unwrap();
+    let hash=missing.object_hash.as_ref().unwrap();
+    let size=cas.stat_object(hash).unwrap().unwrap();
+    cas.unlink_exact_object(hash,size,&crate::asset_repository::object_physical_key(hash)).unwrap();
+    assert!(store.residency_inventory_classification_test(false).unwrap().0.contains(hash));
+    assert!(Residency::open(store.repository_root()).unwrap().object(hash,None).unwrap().is_none());
+    store.asset_residency_set_policy(super::residency::AssetPolicy::Remote,||Ok(())).unwrap();
+    let error=store.asset_residency_set_policy_prioritized(super::residency::AssetPolicy::Full,None,Some("selected-present"),||Ok(())).err().unwrap();
+    assert_eq!(error.code,"required-asset-unavailable");
+    assert!(cas.stat_object(selected.object_hash.as_ref().unwrap()).unwrap().is_some());
+    assert!(cas.stat_object(hash).unwrap().is_none());
+}
+
+#[test]
 fn cancelled_full_hydration_keeps_remote_proof_and_retries_without_a_partial_body() {
     let cancelled = Arc::new(AtomicBool::new(false));
     let armed = Arc::new(AtomicBool::new(false));

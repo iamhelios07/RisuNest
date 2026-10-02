@@ -295,7 +295,9 @@ impl PersistentStore {
             let inventory = self.residency_inventory(false)?;
             let mut hydration = crate::server_sync::residency::HydrationSession::new(&self.repository_root, cancellation)?;
             if let Some(character_id) = selected_character_id {
-                if !hydration.hydrate_many(&self.selected_character_asset_hashes(character_id)?, &check)?.is_empty() {
+                let selected = self.selected_character_asset_hashes(character_id)?.into_iter()
+                    .filter(|hash| inventory.referenced.contains(hash)).collect::<Vec<_>>();
+                if !hydration.hydrate_many(&selected, &check)?.is_empty() {
                     return Err(SyncError::new("required-asset-unavailable", 409));
                 }
             }
