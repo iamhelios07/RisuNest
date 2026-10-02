@@ -32,6 +32,8 @@ mod source_receipt;
 #[allow(dead_code)]
 #[path = "../../../benchmarks/lww-native/src/source_process.rs"]
 mod source_process;
+#[path = "../../../benchmarks/lww-native/src/final_matrix.rs"]
+mod final_matrix;
 
 use super::{lww::{self, MessageLocator, UnitMutation}, sync_selection::{SwitchBindingRequest, SyncTarget},
     ConversationMutation, PersistentStore, WorkingSetCommit};
@@ -1465,6 +1467,12 @@ fn construct_native_target_for_final_stage() {
     let file=std::fs::OpenOptions::new().create_new(true).write(true).open(output.join("native-construction.json")).unwrap();
     serde_json::to_writer_pretty(file,&json!({"schema":"risunest.lww-native-construction/v1","checkpoint":checkpoint,
         "binary_sha256":fingerprint,"setup_only":true,"target":built})).unwrap();
+}
+
+#[test]
+#[ignore = "final-stage physical target matrix, explicit coordinator authorization required"]
+fn final_native_matrix_for_final_stage() {
+    final_matrix::run().expect("final matrix retained its raw failure output");
 }
 
 pub(crate) fn build_final_native_tiers(target:&mut PersistentStore,above:&mut PersistentStore,

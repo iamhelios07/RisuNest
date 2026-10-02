@@ -1,7 +1,7 @@
 use super::{measurement::{percentiles, Percentiles, Scenario, ALL_SCENARIOS},
     native_observation::{assert_frozen_growth, FrozenGrowthProof, NativeObservation},
     scale_certificate::{validate_above_target, ScaleCertificate}};
-use serde::Serialize;
+use serde::{Serialize,Deserialize};
 
 pub const WARMUPS:u32 = 5;
 pub const REPETITIONS:u32 = 30;
@@ -9,17 +9,17 @@ pub const AVAILABLE:&[Scenario] = &[Scenario::SettingEdit,Scenario::PresetSwitch
     Scenario::Append,Scenario::MiddleEdit,Scenario::Insertion,Scenario::Deletion,Scenario::OversizedMessage,Scenario::Burst,
     Scenario::SparseBoundary];
 
-#[derive(Clone,Copy,Debug,Serialize,PartialEq,Eq)]
+#[derive(Clone,Copy,Debug,Serialize,Deserialize,PartialEq,Eq)]
 pub enum Direction { AtoB, BtoA }
 
-#[derive(Clone,Debug,Serialize)]
+#[derive(Clone,Debug,Serialize,Deserialize)]
 pub struct NativeTimings {
     pub durable_save_ms:f64,
     pub publication_complete_ms:f64,
     pub receiver_durable_ack_ms:f64,
 }
 
-#[derive(Clone,Debug,Serialize)]
+#[derive(Clone,Debug,Serialize,Deserialize)]
 pub struct RoutineSample {
     pub scenario:Scenario,
     pub direction:Direction,
