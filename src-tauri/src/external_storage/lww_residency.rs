@@ -266,7 +266,7 @@ pub(crate) fn hydrate_registered_many(root:&Path,digests:&[String],priority:&std
         }
     }
     let mut groups=Vec::new();
-    for (connection,sources) in connections {for group in packed_body_groups(sources,priority) {groups.push((connection,group));}}
+    for (connection,sources) in connections {for group in packed_body_groups(sources,priority) {groups.push((connection.clone(),group));}}
     groups.sort_by_key(|(_,group)|!group.iter().any(|source|priority.contains(&source.hash)));
     standalone.sort_by_key(|source|!priority.contains(&source.hash));
     let mut install=|hash:&str,size:u64,path:&Path|->crate::server_sync::Result<()> {
