@@ -3804,11 +3804,16 @@ pub(crate) async fn package_and_upload_protected(
                 metadata.created_at_ms,
                 library,
                 published_sections,
-            )
-            .map_err(corrupt)?;
+            );
+            #[cfg(test)] super::control::observe_state_result(&document,2);
+            let document=document.map_err(corrupt)?;
             let max_state = wire::MAX_METADATA_BYTES;
+            let encoded=document.encode(max_state);
+            #[cfg(test)]
+            if encoded.is_ok() {super::control::observe_control_fingerprint(wire::ObjectRole::SyncState,&document.library_fingerprint,&document.sections,None,1);}
+            else {crate::persistent_store::hash_work::incomplete("native_external_state_fingerprint");}
             (
-                document.encode(max_state).map_err(corrupt)?,
+                encoded.map_err(corrupt)?,
                 document.state_fingerprint,
                 document.sections,
                 ObjectRole::SyncState,
@@ -3830,8 +3835,9 @@ pub(crate) async fn package_and_upload_protected(
                 library,
                 published_sections,
                 original_units_root,
-            )
-            .map_err(corrupt)?;
+            );
+            #[cfg(test)] super::control::observe_bundle_result(&document,2);
+            let document=document.map_err(corrupt)?;
             let max_bundle = wire::MAX_METADATA_BYTES;
             (
                 document.encode(max_bundle).map_err(corrupt)?,
@@ -5053,7 +5059,11 @@ mod tests {
                 let mut job=DurableJob::new(request,false,1,store.external_identity().unwrap());
                 job.summary["restoreSource"]=serde_json::to_value(completed.reference.stored(&connected.handle).unwrap()).unwrap();
                 let jobs=JobStore::open(destination.path()).unwrap();jobs.put(&job).unwrap();
+                crate::persistent_store::hash_work::reset_hash_work();
                 let (prepared,received_sections)=runtime_restore::prepare_database_first_backup(destination.path(),&connected,&job,&Cancellation::default()).await.unwrap();
+                let preparation_hashes=crate::persistent_store::hash_work::take_hash_work();
+                assert!(preparation_hashes.incomplete.is_empty());
+                assert!(preparation_hashes.domains["native_external_bundle_fingerprint"].bytes>0);
                 assert_eq!(prepared.present.contains(&hash),already_present);
                 jobs.freeze_restore_bodies(&job,&prepared.sources,&prepared.present).unwrap();
                 let pack_ids=prepared.sources.iter().flat_map(|source|source.chunks.iter().map(|chunk|chunk.pack_id.clone())).collect::<BTreeSet<_>>();
