@@ -455,6 +455,7 @@ impl ExternalLwwEngine {
                         writer: writer.clone(),
                         seq: DecimalU64(seq),
                         authority,
+                        captured_at_ms: Self::trusted_control_time(),
                         object_id,
                         sha256,
                         payload_sha256,
@@ -572,9 +573,34 @@ impl ExternalLwwEngine {
                 for proof in &publication.reused_control_catalogs {
                     if Self::trusted_control_time().and_then(|now|now.checked_sub(proof.rooted_at_ms))
                         .is_none_or(|age|age>super::leases::CACHE_REUSE_LIMIT_MS) {
-                        super::snapshot_restore::revalidate_control_catalog(
-                            &proof.catalog,&self.root_key,self.provider.as_ref(),&self.repository,cancel,
+                        super::snapshot_restore::revalidate_catalog(
+                            &proof.catalog,risunest_external_storage_format::snapshot::CatalogKind::Records,
+                            &self.root_key,self.provider.as_ref(),&self.repository,cancel,
                         ).await?;
+                    }
+                }
+                if Self::trusted_control_time().and_then(|now|publication.captured_at_ms.and_then(|captured|now.checked_sub(captured)))
+                    .is_none_or(|age|age>super::leases::CACHE_REUSE_LIMIT_MS) {
+                    for catalog in &publication.data_catalogs {
+                        super::snapshot_restore::revalidate_catalog(catalog,risunest_external_storage_format::snapshot::CatalogKind::Records,
+                            &self.root_key,self.provider.as_ref(),&self.repository,cancel).await?;
+                    }
+                    for catalog in &publication.asset_catalogs {
+                        super::snapshot_restore::revalidate_catalog(catalog,risunest_external_storage_format::snapshot::CatalogKind::Assets,
+                            &self.root_key,self.provider.as_ref(),&self.repository,cancel).await?;
+                    }
+                    for body in publication.bodies.iter().filter(|body|body.complete) {
+                        let intent=ObjectIntent{job_id:self.library.clone(),repository_id:self.repository.repository_id.clone(),
+                            object_id:body.object_id.clone(),role:ObjectRole::Pack,byte_length:body.byte_length,sha256:body.sha256.clone()};
+                        let resume=body.resume.as_ref().map(Self::resume);
+                        match self.provider.reconcile_upload(&self.repository,&intent,resume.as_ref(),cancel).await? {
+                            UploadResolution::Complete(receipt)=>{
+                                Self::validate_receipt(&intent,&receipt)?;
+                                if body.locator.as_ref()!=Some(&receipt.locator) {return Err(segment::corrupt());}
+                            }
+                            UploadResolution::Conflict=>return Err(segment::corrupt()),
+                            UploadResolution::RestartRequired|UploadResolution::Resumable(_)=>return Err(ProviderError::new(ErrorKind::NotFound)),
+                        }
                     }
                 }
             }
