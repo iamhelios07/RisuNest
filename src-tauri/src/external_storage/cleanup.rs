@@ -713,7 +713,13 @@ impl ConnectedRepositoryView<'_> {
                 }
                 let mut present = 0usize;
                 for entry in &listed.document.objects {
-                    let role = packaging::native_role(entry.role)?;
+                    let role = if entry.role == risunest_external_storage_format::snapshot::ObjectRole::SyncState
+                        && uuid::Uuid::parse_str(&entry.object_id).is_ok_and(|id| id.to_string()==entry.object_id)
+                    {
+                        ObjectRole::Snapshot
+                    } else {
+                        packaging::native_role(entry.role)?
+                    };
                     let intent = ObjectIntent {
                         repository_id: self.connected.handle.repository_id.clone(),
                         job_id: listed.document.operation_id.clone(),
@@ -1055,8 +1061,10 @@ mod tests {
             f.a.delete_asset_alias("asset","obsolete-large",f.a.revision().unwrap()).unwrap();
             f.publish_a().await;
             let directory=tempfile::tempdir().unwrap();let id=uuid::Uuid::new_v4().to_string();
-            f.sender.compact_published(directory.path(),&id,&f.a.lww_clock_state().unwrap().writer_id,
+            let checkpoint=f.sender.compact_published(directory.path(),&id,&f.a.lww_clock_state().unwrap().writer_id,
                 &f.sender.capabilities,&cancel,None).await.unwrap();
+            assert_eq!(checkpoint.reference.role,ObjectRole::Snapshot);
+            assert_eq!(checkpoint.reference.object_id,id);
             let connected=ConnectedRepository {
                 stored:super::super::connection_store::StoredConnection {
                     id:"sender".into(),config:ConnectionConfig{provider:"synthetic".into(),profile:None,
@@ -1101,6 +1109,9 @@ mod tests {
             let inventory=view.inventory(&cancel).await.unwrap();
             assert!(inventory.pages.iter().any(|page|page.reference.repository_id==f.sender.repository.repository_id));
             assert!(inventory.pages.iter().any(|page|page.reference.repository_id==connected.stored.descriptor.repository_id));
+            assert!(inventory.objects.iter().any(|object|object.object_id==id && object.role==ObjectRole::Snapshot));
+            assert_eq!(backup.reference.role,ObjectRole::BackupBundle);
+            assert_eq!(backup.reference.object_id,format!("snapshot-{backup_id}"));
             let body=known.iter().find(|object|view.native_body(object).unwrap()).unwrap().clone();
             assert!(body.stored(&connected.handle).is_err(),"native ciphertext is not a generic StoredObject envelope");
             assert!(validate_generic_body(&body,&connected.handle).is_err());
