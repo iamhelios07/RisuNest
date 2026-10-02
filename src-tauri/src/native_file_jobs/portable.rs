@@ -717,15 +717,38 @@ fn restore_portable_inner(
             };
             job.publish_portable_activation(final_revision, store.lww_binding_authority().map_err(error)?.0.to_string()).map_err(error)?;
             job.wait_for_portable_adoption().map_err(error)?;
+            let retained=job.requires_restore_finalization && context.is_some();
+            if retained {
+                job.prepare_portable_body_retry(&stage.as_ref().expect("full library stage").staging_id,&source_sha256,archive.source_identity_guard().map_err(error)?).map_err(error)?;
+            }
             job.set_phase(JobPhase::CopyingMissingBodies).map_err(error)?;
-            if selection.library {
-                let inventory = portable_backup::RestoreInventory::build(&archive, owned, &probe).map_err(error)?;
-                install(&archive,&inventory,&mut store,&mut pins,&probe)?;
-                if let Some(report)=inventory.preserve(&archive,&store,&mut pins,&probe).map_err(error)? {
-                    job.set_preservation_report(report).map_err(error)?;
+            loop {
+                let bodies=(|| {
+                    if selection.library {
+                        let inventory = portable_backup::RestoreInventory::build(&archive, owned, &probe).map_err(error)?;
+                        install(&archive,&inventory,&mut store,&mut pins,&probe)?;
+                        if let Some(report)=inventory.preserve(&archive,&store,&mut pins,&probe).map_err(error)? {
+                            job.set_preservation_report(report).map_err(error)?;
+                        }
+                    }
+                    pins.seal(&mut store,now()).map_err(error)?;
+                    archive.check_identity().map_err(error)
+                })();
+                match bodies {
+                    Ok(())=>break,
+                    Err(failure) if retained=>{
+                        if archive.check_identity().is_err() {
+                            job.portable_body_source_required().map_err(error)?;
+                            return Err(NativeJobError::new("portable-body-source-required","Portable library is restored, but the backup source changed"));
+                        }
+                        if !job.wait_for_portable_body_retry(&failure).map_err(error)? {
+                            return Err(NativeJobError::new("portable-body-source-required","Portable library is restored, but the backup source is required"));
+                        }
+                    }
+                    Err(failure)=>return Err(failure),
                 }
             }
-            archive.check_identity().map_err(error)?;
+            if retained {job.portable_bodies_completed().map_err(error)?;}
             Ok(JobResultSummary {
                 export_exclusions: None,
                 revision: final_revision,
@@ -811,7 +834,6 @@ fn install(
         )
         .map_err(error)?;
     }
-    pins.seal(store, now()).map_err(error)?;
     Ok(())
 }
 struct CancelledRead<'a> {
@@ -1022,26 +1044,22 @@ mod tests {
         let source = root.join("source");
         let jobs = root.join("export-job");
         fs::create_dir(&jobs).unwrap();
-        let store = library(&source);
+        let mut store = library(&source);
         let hash = with_asset.then(|| {
             let payload = b"synthetic incoming object";
-            let prepared = PayloadCas::new(&source)
-                .unwrap()
-                .prepare_bytes(payload)
-                .unwrap();
-            add_test_aliases(&source, &prepared.content_hash, payload.len(), 1);
-            prepared.content_hash
+            crate::server_sync::lww_tests::put_asset(&mut store, "assets/synthetic-0.bin", payload).object_hash.unwrap()
         });
+        let revision = store.revision().unwrap();
         let job = super::super::JobRegistry::default()
             .create_internal(
                 super::super::JobKind::ExportPortableBackup,
-                Some(1),
+                Some(revision),
                 vec![],
                 false,
             )
             .unwrap();
         let result =
-            export_portable(None, 1, &jobs, &root.join("handoffs"), store, &job, None, "9.8.7-synthetic").unwrap();
+            export_portable(None, revision, &jobs, &root.join("handoffs"), store, &job, None, "9.8.7-synthetic").unwrap();
         (
             result.handoff_path.unwrap().into(),
             result.source_bytes,
@@ -1065,6 +1083,129 @@ mod tests {
             probe.result().unwrap();
         }
     }
+
+    fn portable_body_retry_case(retire: bool, source_changed: bool) {
+        use super::super::{JobKind, JobState, NativeFileJobState, PortableBodyRetryRequest, WorkerPermit};
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}, mpsc};
+        use std::time::{Duration, Instant};
+        let directory = tempfile::tempdir().unwrap();
+        let (path, bytes, hash) = test_archive(directory.path(), true);
+        let hash = hash.unwrap();
+        let target = directory.path().join("target");
+        drop(library(&target));
+        let retained_hash = PayloadCas::new(&target).unwrap().prepare_bytes(b"synthetic existing retained").unwrap().content_hash;
+        let state = Arc::new(NativeFileJobState::initialize(target.join("native-file-jobs")));
+        let coordinator = Arc::new(DeviceBackupState::initialize(target.join("device-backup")));
+        portable_backup::source_io::reset_source_io();
+        let (job, _admission) = state.create_portable_restore_fixture(1).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel_job = Arc::downgrade(&job);
+        let cancel_once = cancelled.clone();
+        let cancel_hash = hash.clone();
+        portable_backup::source_io::on_object_read(move |actual| {
+            if actual == cancel_hash && !cancel_once.swap(true, Ordering::AcqRel) {
+                assert_eq!(cancel_job.upgrade().unwrap().request_cancel().unwrap(), super::super::CancelOutcome::Requested);
+            }
+        });
+        let owned = directory.path().join("restore-job");
+        fs::create_dir(&owned).unwrap();
+        let source = OpenedJobSource {file: File::open(&path).unwrap(), custody: None, total_bytes: bytes};
+        let worker_job = job.clone();
+        let worker_coordinator = coordinator.clone();
+        let worker_target = target.clone();
+        let permit = WorkerPermit::acquire(state.active_workers.clone(), state.max_concurrent_jobs).unwrap();
+        let (done, completion) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _permit = permit;
+            let persistent = crate::persistent_store::commands::PersistentStoreState::default();
+            let context = NativePortableRestoreContext {persistent: &persistent, coordinator: &worker_coordinator};
+            let result = restore_portable_with_context(source, true, 1, &owned, PersistentStore::open(&worker_target).unwrap(), &worker_job, Some((&context, None)));
+            let receipt = result.as_ref().map(|result| result.revision).map_err(|error| error.code.clone());
+            super::super::finish_worker_outcome(&worker_job, JobKind::RestorePortableBackup, result, vec![]);
+            done.send(receipt).unwrap();
+        });
+        struct Retire(Arc<NativeFileJobState>);
+        impl Drop for Retire {fn drop(&mut self) {let _ = self.0.begin_cleanup();}}
+        let _retire_on_failure = Retire(state.clone());
+        let wait = |ready: &dyn Fn(&super::super::JobStatus) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let status = job.status();
+                if ready(&status) {break status;}
+                assert!(Instant::now() < deadline, "portable worker did not reach required phase: {status:?}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        wait(&|status| status.phase == JobPhase::AwaitingBackupSelection);
+        state.select_portable_restore_fixture(&job.id(), PortableSelection::default()).unwrap();
+        wait(&|status| status.phase == JobPhase::AwaitingActivation);
+        state.finalize(&job.id(), Some(1)).unwrap();
+        let activated = wait(&|status| status.activation_revision.is_some());
+        let revision = activated.activation_revision.unwrap();
+        let authority = activated.activation_authority.unwrap();
+        let session = activated.device_session_id.unwrap();
+        coordinator.recovery_complete(&session).unwrap();
+        state.confirm_portable_restore_adoption(&coordinator, &job.id(), &revision.to_string(), &authority, &session).unwrap();
+        coordinator.cleanup(&session).unwrap();
+        let failed = wait(&|status| status.portable_body_retry.as_ref().is_some_and(|receipt| receipt.available));
+        assert_eq!(failed.state, JobState::Cancelled);
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(!state.cleanup_drained());
+        assert!(state.forget(&job.id()).is_err());
+        let body = failed.portable_body_retry.unwrap();
+        let request = PortableBodyRetryRequest {job_id: job.id(), staging_id: body.staging_id, catalog_sha256: body.catalog_sha256, activation_revision: revision.to_string(), binding_authority: authority, device_session_id: session};
+        let mut wrong = request.clone();
+        wrong.catalog_sha256 = "f".repeat(64);
+        assert_eq!(state.retry_portable_restore_bodies(&wrong).unwrap_err().code, "invalid-activation-receipt");
+        wrong = request.clone();
+        wrong.activation_revision = (revision + 1).to_string();
+        assert!(state.retry_portable_restore_bodies(&wrong).is_err());
+        let db = rusqlite::Connection::open(target.join("persistent/persistent.sqlite")).unwrap();
+        let generation: String = db.query_row("SELECT value FROM meta WHERE key='activeGeneration'", [], |row| row.get(0)).unwrap();
+        db.execute("UPDATE meta SET value=?1 WHERE key='activeGeneration'", ["\"synthetic-other-generation\""]).unwrap();
+        assert_eq!(state.retry_portable_restore_bodies(&request).unwrap_err().code, "invalid-activation-receipt");
+        db.execute("UPDATE meta SET value=?1 WHERE key='activeGeneration'", [&generation]).unwrap();
+        drop(db);
+        if retire {
+            if source_changed {
+                let mut changed = fs::OpenOptions::new().append(true).open(&path).unwrap();
+                changed.write_all(b"changed synthetic source").unwrap();
+                changed.sync_all().unwrap();
+                drop(changed);
+                assert_eq!(state.retry_portable_restore_bodies(&request).unwrap_err().code, "portable-body-source-required");
+            } else {state.begin_cleanup().unwrap();}
+            assert_eq!(completion.recv_timeout(Duration::from_secs(30)).unwrap().unwrap_err(), "portable-body-source-required");
+            worker.join().unwrap();
+            assert!(state.cleanup_drained());
+            state.close_for_cleanup().unwrap();
+            let restarted = NativeFileJobState::initialize(target.join("native-file-jobs"));
+            assert_eq!(restarted.retry_portable_restore_bodies(&request).unwrap_err().code, "portable-body-source-required");
+        } else {
+            state.retry_portable_restore_bodies(&request).unwrap();
+            let completed = completion.recv_timeout(Duration::from_secs(30)).unwrap();
+            assert!(completed.is_ok(), "body retry failed: {:?}", job.status());
+            assert_eq!(completed.unwrap(), revision);
+            worker.join().unwrap();
+            let status = job.status();
+            assert_eq!(status.state, JobState::Succeeded);
+            assert!(!status.portable_body_retry.unwrap().pending);
+            assert!(PayloadCas::new(&target).unwrap().stat_object(&hash).unwrap().is_some());
+            assert!(state.cleanup_drained());
+        }
+        let store = PersistentStore::open(&target).unwrap();
+        assert_eq!(store.revision().unwrap(), revision);
+        assert_eq!(store.lww_binding_authority().unwrap().0.to_string(), request.binding_authority);
+        assert!(PayloadCas::new(&target).unwrap().stat_object(&retained_hash).unwrap().is_some());
+    }
+
+    #[test]
+    fn portable_body_retry_cancel_resumes_same_activated_owner() {portable_body_retry_case(false, false);}
+
+    #[test]
+    fn portable_body_retry_cleanup_releases_waiting_source_owner() {portable_body_retry_case(true, false);}
+
+    #[test]
+    fn portable_body_retry_changed_source_retires_without_reactivation() {portable_body_retry_case(true, true);}
 
     #[test]
     fn portable_disk_full_keeps_its_classification_through_wrappers() {
@@ -1174,7 +1315,9 @@ mod tests {
             let hash = hash.unwrap();
             let target = directory.path().join("target");
             let store = library(&target);
+            let observer = store.open_native_job_store().unwrap();
             let before = store.read_root(None).unwrap().value;
+            let expected = PersistentStore::open(&directory.path().join("source")).unwrap().read_root(None).unwrap().value;
             let object = target
                 .join("assets/objects")
                 .join(&hash[..2])
@@ -1202,7 +1345,7 @@ mod tests {
                     false,
                 )
                 .unwrap();
-            assert!(restore_portable(
+            let failure = restore_portable(
                 OpenedJobSource {
                     file: File::open(path).unwrap(),
                     custody: None,
@@ -1215,12 +1358,25 @@ mod tests {
                 &job,
                 None
             )
-            .is_err());
+            .unwrap_err();
             assert_eq!(fs::read(&object).unwrap(), payload);
-            let store = PersistentStore::open(&target).unwrap();
-            assert_eq!(store.revision().unwrap(), 1);
-            assert_eq!(store.read_root(None).unwrap().value, before);
-            assert!(store.snapshot_list().unwrap().is_empty());
+            if corrupt_existing {
+                assert_eq!(failure.code, "portable-backup-failed");
+                assert!(failure.message.contains("existing portable payload size mismatch"), "{}", failure.message);
+                assert_eq!(observer.revision().unwrap(), 2);
+                assert_eq!(job.status().activation_revision, Some(2));
+                assert_eq!(observer.read_root(None).unwrap().value, expected);
+                let db = rusqlite::Connection::open(target.join("persistent/persistent.sqlite")).unwrap();
+                assert_eq!(db.query_row::<i64,_,_>("SELECT revision FROM lww_requests WHERE request_id=?1", [&job.id()], |row| row.get(0)).unwrap(), 2);
+                assert_eq!(db.query_row::<String,_,_>("SELECT object_hash FROM asset_aliases WHERE generation='revision-2' AND logical_key='assets/synthetic-0.bin'", [], |row| row.get(0)).unwrap(), hash);
+            } else {
+                assert_eq!(failure.code, "portable-backup-failed");
+                assert_eq!(failure.message, "device-storage-failed: Native backup section storage failed");
+                assert_eq!(observer.revision().unwrap(), 1);
+                assert_eq!(observer.read_root(None).unwrap().value, before);
+                assert_eq!(job.status().activation_revision, None);
+            }
+            assert!(observer.snapshot_list().unwrap().is_empty());
             assert!(!target.join("persistent/recovery").exists());
         }
     }
@@ -1395,8 +1551,7 @@ mod tests {
             }
         }
     }
-    #[test]
-    fn native_portable_restore_preserves_unregistered_cas_files_outside_live_cas() {
+    fn portable_preserved_cas_case(present: bool) {
         use sha2::{Digest, Sha256};
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("source");
@@ -1427,8 +1582,19 @@ mod tests {
             export_portable(None, revision, &jobs, &handoffs, store, &export, None, "9.8.7-synthetic").unwrap();
         let path = std::path::PathBuf::from(exported.handoff_path.unwrap());
         let expected_catalog=portable_backup::VerifiedArchive::open_for_restore(File::open(&path).unwrap(),&restore_jobs,&crate::local_backup::NeverCancelled).unwrap().manifest.catalog_sha256;
-        let target_store = library(&target);
+        let mut target_store = library(&target);
+        if present {
+            PayloadCas::new(&target).unwrap().prepare_bytes(payload).unwrap();
+            let archive = VerifiedArchive::open_for_restore(File::open(&path).unwrap(), &restore_jobs, &NeverCancelled).unwrap();
+            let inventory = portable_backup::RestoreInventory::build(&archive, &restore_jobs, &NeverCancelled).unwrap();
+            let mut sealed = new_pins(&target_store, CasJobKind::LocalBackupRestore).unwrap();
+            sealed.seal(&mut target_store, now()).unwrap();
+            assert!(inventory.preserve(&archive, &target_store, &mut sealed, &NeverCancelled).is_err(), "sealing before preserved CAS registration loses pin admission");
+            sealed.release(CasReleaseOutcome::Aborted).unwrap();
+        }
+        portable_backup::source_io::reset_source_io();
         let target_revision = target_store.revision().unwrap();
+        crate::asset_repository::body_io::reset_body_io();
         let restore = registry
             .create_internal(
                 super::super::JobKind::RestorePortableBackup,
@@ -1456,17 +1622,23 @@ mod tests {
         assert_eq!(result.source_sha256, expected_catalog);
         let report = restore.status().preservation_report.unwrap();
         assert_eq!(report.files, "1");
-        assert_eq!(report.bytes, payload.len().to_string());
+        assert_eq!(report.bytes, if present {"0".into()} else {payload.len().to_string()});
         assert!(report.deletable);
-        assert_eq!(
-            fs::read(Path::new(&report.path).join("objects").join(&hash)).unwrap(),
-            payload
-        );
-        assert!(PayloadCas::new(&target)
-            .unwrap()
-            .stat_object(&hash)
-            .unwrap()
-            .is_none());
+        if present {
+            assert!(!Path::new(&report.path).join("objects").join(&hash).exists());
+            let index = rusqlite::Connection::open(Path::new(&report.path).join("index.sqlite")).unwrap();
+            assert_eq!(index.query_row::<String, _, _>("SELECT storage_kind FROM source_files WHERE object_hash=?1", [&hash], |row| row.get(0)).unwrap(), "cas");
+            assert!(!portable_backup::source_io::take_source_io().objects.contains_key(&hash));
+            if let Some(object) = crate::asset_repository::body_io::take_body_io().objects.get(&hash) {
+                for work in [&object.work, &object.owned_work] {
+                    assert_eq!((work.opens, work.read_bytes, work.staging_write_attempts, work.publication_attempts), (0, 0, 0, 0));
+                    assert!(work.body_sha.is_empty());
+                }
+            }
+        } else {
+            assert_eq!(fs::read(Path::new(&report.path).join("objects").join(&hash)).unwrap(), payload);
+        }
+        assert_eq!(PayloadCas::new(&target).unwrap().stat_object(&hash).unwrap().is_some(), present);
         assert!(!target.join("persistent/recovery").exists());
         let mut target_store = PersistentStore::open(&target).unwrap();
         let mut pins = new_pins(
@@ -1484,13 +1656,18 @@ mod tests {
             false,
         )
         .unwrap();
-        let (key,stored_hash,metadata):(String,String,String)=captured.catalog.db.query_row("SELECT logical_key,lower(hex(object_hash)),metadata FROM files WHERE kind='preserved'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        let (key,stored_hash,metadata):(String,String,String)=captured.catalog.db.query_row("SELECT logical_key,lower(hex(object_hash)),metadata FROM files WHERE kind='preserved' AND logical_key LIKE 'source-preservation/%'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
         assert!(key.starts_with("source-preservation/"));
         assert!(key.ends_with(&format!("/{physical_key}")));
         assert_eq!(stored_hash, hash);
         assert_eq!(metadata, "{\"storage\":\"cas\"}");
         pins.release(CasReleaseOutcome::Aborted).unwrap();
     }
+    #[test]
+    fn native_portable_restore_preserves_unregistered_cas_files_outside_live_cas() {portable_preserved_cas_case(false);}
+
+    #[test]
+    fn native_portable_present_unreferenced_cas_is_preserved_before_pin_seal() {portable_preserved_cas_case(true);}
     #[test]
     fn native_portable_export_restore_preserves_sql_without_recovery_backup() {
         let directory = tempfile::tempdir().unwrap();
