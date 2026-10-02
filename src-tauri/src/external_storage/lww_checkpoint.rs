@@ -16,11 +16,47 @@ pub(crate) struct Checkpoint {
     pub library_id: String,
     pub covered_prefixes: Coverage,
     pub state_identity: String,
+    #[serde(with="nested_metadata")]
     pub library: risunest_external_storage_format::snapshot::LibrarySnapshotRef,
+    #[serde(with="nested_metadata")]
     pub asset_catalogs: Vec<risunest_external_storage_format::snapshot::StoredObject>,
     pub standalone_bodies: BTreeMap<String, segment::LargeBody>,
 }
-impl Checkpoint {
+mod nested_metadata {
+    use serde::{Serialize,Deserialize,Serializer,Deserializer,de::{DeserializeOwned,Error}};
+    use serde_json::Value;
+    pub fn serialize<T:Serialize,S:Serializer>(value:&T,serializer:S)->Result<S::Ok,S::Error> {
+        fn convert(value:&mut Value) {
+            match value {
+                Value::Number(number)=>*value=Value::String(number.to_string()),
+                Value::Array(values)=>values.iter_mut().for_each(convert),
+                Value::Object(values)=>values.values_mut().for_each(convert),
+                _=>{},
+            }
+        }
+        let mut value=serde_json::to_value(value).map_err(<S::Error as serde::ser::Error>::custom)?;convert(&mut value);value.serialize(serializer)
+    }
+    pub fn deserialize<'de,T:DeserializeOwned,D:Deserializer<'de>>(deserializer:D)->Result<T,D::Error> {
+        fn integer(value:&mut Value)->Result<(),String> {
+            let text=value.as_str().ok_or("control integer must be a decimal string")?;
+            if text.is_empty() || (text.len()>1&&text.starts_with('0')) || !text.bytes().all(|byte|byte.is_ascii_digit()) {return Err("noncanonical control integer".into());}
+            *value=Value::Number(text.parse::<u64>().map_err(|_|"control integer overflow")?.into());Ok(())
+        }
+        fn convert(value:&mut Value)->Result<(),String> {
+            match value {
+                Value::Number(_)=>return Err("numeric control integer".into()),
+                Value::Array(values)=>for value in values {if value.is_string() {integer(value)?;} else {convert(value)?;}},
+                Value::Object(values)=>for (name,value) in values {
+                    if matches!(name.as_str(),"plaintextLength"|"ciphertextLength") {integer(value)?;} else {convert(value)?;}
+                },
+                _=>{},
+            }
+            Ok(())
+        }
+        let mut value=Value::deserialize(deserializer)?;convert(&mut value).map_err(D::Error::custom)?;
+        serde_json::from_value(value).map_err(D::Error::custom)
+    }
+}impl Checkpoint {
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
         if self.schema != "risunest.lww-snapshot/v1" || self.library_id.is_empty() {
             return Err(segment::corrupt());
@@ -31,14 +67,20 @@ impl Checkpoint {
             risunest_sync_wire::stamp::validate_writer_id(writer).map_err(|_| segment::corrupt())?;
         }
         self.library.validate(&self.repository_id).map_err(|_| segment::corrupt())?;
-        for catalog in &self.asset_catalogs { catalog.validate().map_err(sql)?; if catalog.header.repository_id != self.repository_id { return Err(segment::corrupt()); } }
-        let bytes=serde_json::to_vec(self).map_err(|_| segment::corrupt())?;
+        for (hash,body) in &self.standalone_bodies {
+            risunest_sync_wire::validate_hash(hash).map_err(sql)?;
+            risunest_sync_wire::validate_hash(&body.sha256).map_err(sql)?;
+            let id=uuid::Uuid::parse_str(&body.object_id).map_err(sql)?;
+            if id.to_string()!=body.object_id || body.locator.as_ref().is_none_or(|locator|locator.object.is_empty())
+                || risunest_external_storage_format::crypto::ciphertext_length(body.plaintext_byte_length.0).map_err(sql)?!=body.byte_length.0 {return Err(segment::corrupt());}
+        }        for catalog in &self.asset_catalogs { catalog.validate().map_err(sql)?; if catalog.header.repository_id != self.repository_id { return Err(segment::corrupt()); } }
+        let bytes=risunest_sync_wire::canonical::encode(self).map_err(|_|segment::corrupt())?;
         if bytes.len()>risunest_external_storage_format::snapshot::MAX_METADATA_BYTES {return Err(segment::corrupt());}
         Ok(bytes)
     }
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
         if bytes.len()>risunest_external_storage_format::snapshot::MAX_METADATA_BYTES {return Err(segment::corrupt());}
-        let value: Self = serde_json::from_slice(bytes).map_err(|_| segment::corrupt())?;
+        let value: Self = risunest_sync_wire::canonical::decode(bytes,bytes.len()).map_err(|_|segment::corrupt())?;
         if value.encode()? != bytes { return Err(segment::corrupt()); }
         Ok(value)
     }
@@ -96,7 +138,11 @@ impl PublishedCatalog {
         segment::merge(&mut winner, change.clone())?;
         self.db.execute("INSERT INTO units VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET body=excluded.body", params![change.key.as_str(), serde_json::to_string(winner.get(change.key.as_str()).ok_or_else(segment::corrupt)?).map_err(sql)?]).map_err(sql)?;
         if change.key.components()[0] == "exists" && matches!(change.value, UnitValue::Deleted) {
-            self.db.execute("INSERT OR IGNORE INTO retirements VALUES(?1,?2)", params![change.key.as_str(), serde_json::to_string(change).map_err(sql)?]).map_err(sql)?;
+            let old:Option<String>=self.db.query_row("SELECT body FROM retirements WHERE key=?1",[change.key.as_str()],|row|row.get(0)).optional().map_err(sql)?;
+            let mut deletion=BTreeMap::new();
+            if let Some(old)=old {deletion.insert(change.key.as_str().into(),serde_json::from_str::<Change>(&old).map_err(sql)?);}
+            segment::merge(&mut deletion,change.clone())?;
+            self.db.execute("INSERT INTO retirements VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET body=excluded.body",params![change.key.as_str(),serde_json::to_string(deletion.get(change.key.as_str()).ok_or_else(segment::corrupt)?).map_err(sql)?]).map_err(sql)?;
         }
         Ok(())
     }
@@ -152,6 +198,20 @@ mod tests {
             for change in input {catalog.merge(&change).unwrap();}
             let changes=catalog.changes().unwrap(); assert_eq!(changes.len(),1); assert!(matches!(changes[0].value,UnitValue::Deleted)); assert_eq!(changes[0].stamp,deletion.stamp);
         }
+    }
+    #[test]
+    fn two_deletion_stamps_have_the_same_retired_state_in_every_order() {
+        let older=change(&["exists","character","c"],1,UnitValue::Deleted);
+        let newer=change(&["exists","character","c"],2,UnitValue::Deleted);
+        let revived=change(&["exists","character","c"],3,UnitValue::inline(b"true").unwrap());
+        let inputs=[older.clone(),newer.clone(),revived.clone()]; let mut identities=BTreeSet::new();
+        for indices in [[0,1,2],[0,2,1],[1,0,2],[1,2,0],[2,0,1],[2,1,0]] {
+            let root=tempfile::tempdir().unwrap();let mut catalog=PublishedCatalog::create(&root.path().join("units")).unwrap();
+            for index in indices {catalog.merge(&inputs[index]).unwrap();}
+            assert_eq!(catalog.changes().unwrap()[0].stamp,newer.stamp);
+            identities.insert(catalog.identity().unwrap());
+        }
+        assert_eq!(identities.len(),1);
     }
     #[test]
     fn historical_equal_stamp_conflict_is_detected_even_after_a_greater_winner() {

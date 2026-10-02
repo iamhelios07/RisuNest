@@ -167,9 +167,28 @@ fn checkpoint_uses_only_published_units_and_restores_after_segment_retirement() 
         assert_eq!(snapshots.len(),1);
         let (_,snapshot)=f.sender.checkpoint(&snapshots[0],&Cancellation::default()).await.unwrap();
         assert_eq!(snapshot.covered_prefixes.values().next().unwrap().0,1);
+        let backup_id="00000000-0000-4000-8000-000000000096";
+        let backup=risunest_external_storage_format::control::BackupBundleDocument::new(
+            f.sender.repository.repository_id.clone(),backup_id.into(),
+            risunest_external_storage_format::control::BundleSource::Device{writer_id:f.a.lww_clock_state().unwrap().writer_id},
+            super::runtime::now_ms(),Some(risunest_sync_wire::head::Sequence::from(0u64)),None,None,
+            snapshot.library.clone(),std::collections::BTreeMap::new(),
+        ).unwrap();
+        let backup_plain=backup.encode(risunest_external_storage_format::snapshot::MAX_METADATA_BYTES).unwrap();
+        let backup_object=format!("snapshot-{backup_id}");
+        let header=risunest_external_storage_format::snapshot::PublicObjectHeader::new(f.sender.repository.repository_id.clone(),backup_object.clone(),risunest_external_storage_format::snapshot::ObjectRole::BackupBundle,backup_plain.len() as u64).unwrap();
+        let key=risunest_external_storage_format::crypto::derive_key(&[7;32],&f.sender.repository.repository_id,"metadata").unwrap();
+        let mut sealed=Vec::new();risunest_external_storage_format::snapshot::seal_envelope(&mut std::io::Cursor::new(backup_plain),&mut sealed,&key,&header).unwrap();
+        f.provider.seed(&backup_object,ObjectRole::BackupBundle,sealed);
+        assert_eq!(f.sender.snapshot_listing(&Cancellation::default()).await.unwrap().len(),1);
         let mut identical=snapshot.clone(); identical.snapshot_id="00000000-0000-4000-8000-000000000098".into();
         assert_eq!(super::lww_checkpoint::retained(&[snapshot.clone(),identical.clone()]).unwrap(),std::collections::BTreeSet::from([identical.snapshot_id.clone()]));
-        identical.state_identity="a".repeat(64);
+        let mut encoded:serde_json::Value=serde_json::from_slice(&snapshot.encode().unwrap()).unwrap();
+        assert!(encoded["library"]["recordCatalog"]["header"]["plaintextLength"].is_string());
+        encoded["library"]["recordCatalog"]["header"]["plaintextLength"]=serde_json::json!(0);
+        assert!(super::lww_checkpoint::Checkpoint::decode(&serde_json::to_vec(&encoded).unwrap()).is_err());        let mut malformed_source=snapshot.clone();
+        malformed_source.standalone_bodies.insert("a".repeat(64),super::lww_segment::LargeBody{object_id:"00000000-0000-4000-8000-000000000091".into(),sha256:"b".repeat(64),byte_length:DecimalU64(1),plaintext_byte_length:DecimalU64(1),locator:Some(completed.reference.receipt.locator.clone())});
+        assert!(malformed_source.encode().is_err());        identical.state_identity="a".repeat(64);
         assert!(super::lww_checkpoint::retained(&[snapshot.clone(),identical]).is_err());
         for object in f.sender.listing(&Cancellation::default()).await.unwrap() {
             f.provider.delete_object(&f.sender.repository,&object.locator,&Cancellation::default()).await.unwrap();
@@ -177,7 +196,14 @@ fn checkpoint_uses_only_published_units_and_restores_after_segment_retirement() 
         assert_eq!(f.receive_b().await,1);
         assert_eq!(f.b.read_root(None).unwrap().value["language"],"ko");
         assert_eq!(f.a.read_root(None).unwrap().value["language"],"en");
-        assert_eq!(f.receive_b().await,0);
+        assert_eq!(f.receive_b().await,0);        let bad_id="00000000-0000-4000-8000-000000000092";
+        let bad_plain=b"{\"schema\":\"risunest.lww-snapshot/v1\"}";
+        let bad_header=risunest_external_storage_format::snapshot::PublicObjectHeader::new(f.sender.repository.repository_id.clone(),bad_id.into(),risunest_external_storage_format::snapshot::ObjectRole::SyncState,bad_plain.len() as u64).unwrap();
+        let mut bad_sealed=Vec::new();risunest_external_storage_format::snapshot::seal_envelope(&mut std::io::Cursor::new(bad_plain),&mut bad_sealed,&key,&bad_header).unwrap();
+        f.provider.seed(bad_id,ObjectRole::Snapshot,bad_sealed);
+        assert_eq!(f.receiver.snapshot_listing(&Cancellation::default()).await.unwrap_err().kind,ErrorKind::Corrupt);
+        let (header,inspection)=binding_context(&f.b,&f.receiver,"corrupt-snapshot-binding");
+        assert_eq!(f.receiver.stage_binding(&mut f.b,&header,&inspection,&Cancellation::default()).await.err().unwrap().kind,ErrorKind::Corrupt);
     });
 }
 #[test]
@@ -558,7 +584,20 @@ fn large_bodies_stay_remote_then_only_missing_body_hydrates() {
         f.a.commit_asset_alias(&alias, f.a.revision().unwrap())
             .unwrap();
         f.publish_a().await;
-        let before = f.provider.transferred_body_bytes();
+        let second=vec![32;5*1024*1024];let second_hash=risunest_sync_wire::hash(&second);
+        f.a.lww_put_managed_object(&second_hash,&second).unwrap();
+        let mut second_alias=alias.clone();second_alias.key="synthetic-second-asset".into();second_alias.object_hash=Some(second_hash.clone());
+        f.a.commit_asset_alias(&second_alias,f.a.revision().unwrap()).unwrap();f.publish_a().await;
+        let inputs=tempfile::tempdir().unwrap();let mut state=f.receiver.published_state(inputs.path(),&Cancellation::default()).await.unwrap();
+        let first_root=state.standalone_roots.get(&hash).unwrap().clone();let second_root=state.standalone_roots.get(&second_hash).unwrap().clone();
+        assert_ne!(first_root,second_root);
+        for (body_hash,root) in [(&hash,&first_root),(&second_hash,&second_root)] {
+            let (_,payload)=state.segments.iter().find(|(_,payload)|{let (writer,seq,_)=parse_segment_object_id(root).unwrap();payload.writer_id==writer&&payload.seq.0==seq}).unwrap();
+            assert_eq!(payload.large_bodies.get(body_hash).unwrap().object_id,state.standalone.get(body_hash).unwrap().object_id);
+        }
+        f.receiver.stage_published_objects(&mut f.b,&mut state,inputs.path(),&Cancellation::default()).await.unwrap();
+        assert_eq!(super::lww_residency::source(f.directory_b.path(),&hash).unwrap().unwrap().protected_segment,first_root);
+        assert_eq!(super::lww_residency::source(f.directory_b.path(),&second_hash).unwrap().unwrap().protected_segment,second_root);        let before = f.provider.transferred_body_bytes();
         f.receive_b().await;
         assert!(!f.b.external_lww_object_is_local(&hash).unwrap());
         let source = super::lww_residency::source(f.directory_b.path(), &hash)

@@ -192,6 +192,19 @@ fn promote(root: &Path, hash: &str, bytes: &[u8]) -> Result<Option<std::fs::File
     .map_err(local)?;
     cas.open_object(hash).map_err(local)
 }
+pub(crate) fn hydrate_registered(root:&Path,hash:&str,check:&dyn Fn()->crate::server_sync::Result<()>)->crate::server_sync::Result<bool> {
+    check()?;
+    let cas=crate::asset_repository::PayloadCas::new(root)?;
+    if cas.stat_object(hash)?.is_some() {return Ok(true);}
+    if stat(root,hash)?.is_none() {return Ok(false);}
+    let scratch=tempfile::tempdir()?;
+    let Some(mut body)=tauri::async_runtime::block_on(spool_verified_remote_body(root,hash,scratch.path(),&Cancellation::default())).map_err(|_|crate::server_sync::SyncError::new("external-body-unavailable",502))? else {return Ok(false)};
+    check()?;
+    let prepared=cas.prepare_reader(body.as_file_mut())?;
+    if prepared.content_hash!=hash {return Err(crate::server_sync::SyncError::new("external-body-unavailable",502));}
+    crate::persistent_store::register_asset_objects_at_root(root,&[crate::persistent_store::asset_object_catalog::AssetObjectRegistration{object_hash:hash.into(),byte_size:prepared.byte_size}],i64::try_from(super::runtime::now_ms()).map_err(|_|crate::server_sync::SyncError::new("external-body-unavailable",502))?).map_err(|_|crate::server_sync::SyncError::new("external-body-unavailable",502))?;
+    check()?;Ok(true)
+}
 pub(crate) fn hydrate(
     root: &Path,
     hash: &str,
@@ -280,6 +293,7 @@ pub(crate) async fn spool_verified_remote_body(root:&Path,hash:&str,destination:
             std::io::copy(&mut input,&mut output).map_err(local)?;
         }
         output.as_file().sync_all().map_err(local)?;
+        std::io::Seek::seek(output.as_file_mut(),std::io::SeekFrom::Start(0)).map_err(local)?;
         if let Some(reason)=owner.recheck(&protection,cancel).await? {return Err(super::leases::yield_error(reason));}
         Ok(Some(output))
     }).await
