@@ -37,6 +37,17 @@ function makeStore() {
 }
 
 describe('createMutationGatedPersistentDataStore', () => {
+    it('forwards optional current binding reads without acquiring a mutation gate', async () => {
+        const store = makeStore()
+        store.lwwBindingState = vi.fn(async () => ({targetAuthority:'17'}))
+        const gate = {runWrite:vi.fn(),runTransition:vi.fn()} as unknown as StorageMutationGate
+        const gated = createMutationGatedPersistentDataStore(store, gate)
+        expect(await gated.lwwBindingState!()).toEqual({targetAuthority:'17'})
+        expect(store.lwwBindingState).toHaveBeenCalledOnce()
+        expect(gate.runWrite).not.toHaveBeenCalled()
+        expect(gate.runTransition).not.toHaveBeenCalled()
+        expect(createMutationGatedPersistentDataStore(makeStore(), gate).lwwBindingState).toBeUndefined()
+    })
     it('gates activation on exposed native stages without nesting the normal replacement gate',async()=>{
         const store=makeStore()
         const activate=vi.fn(async()=>({revision:2})),abort=vi.fn(async()=>{})

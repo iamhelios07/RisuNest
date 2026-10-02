@@ -33,6 +33,10 @@ async function harness() {
 
 async function runtimeHarness(registry?: ReturnType<typeof createGeneratingConversationRegistry>) {
     const values = await harness()
+    return initializeRuntimeHarness(values, registry)
+}
+
+async function initializeRuntimeHarness(values: Omit<Awaited<ReturnType<typeof harness>>, 'store'> & {store: PersistentDataStore}, registry?: ReturnType<typeof createGeneratingConversationRegistry>) {
     const {database,store} = values
     const runtime = createPersistentDataRuntime({store,state:{
         captureRoot:()=>capturePersistentRoot(database), capturePresets:()=>database.botPresets,
@@ -318,6 +322,7 @@ describe('LWW renderer save path', () => {
         store.lwwStageReceive = async () => undefined
         store.lwwApplyReceive = async () => ({revision:runtime.revision,affectedKeys:[],heldKeys:[],deferredKeys:['["messages","char-a","conv-long"]','["messages","char-b","conv-beta"]']})
         store.lwwFinishReceive = async () => undefined
+        store.lwwBindingState = async () => ({targetAuthority:'a'})
         store.lwwDrainDeferred = vi.fn(async (request) => {
             expect(request.generating).toEqual([{characterId:'char-b',conversationId:'conv-beta'}])
             const current = (await store.readConversation('char-a','conv-long'))!
@@ -334,6 +339,68 @@ describe('LWW renderer save path', () => {
         await runtime.flushPendingDataLocally('after-completion-drain')
         expect(commit).not.toHaveBeenCalled()
         completeB()
+    })
+
+    it('drains a completed durable receive on runtime restart without another remote receive', async () => {
+        const registry = createGeneratingConversationRegistry()
+        registry.register({characterId:'char-a',conversationId:'conv-long'})
+        const first = await runtimeHarness(registry)
+        const {store, commit, database} = first
+        let deferred = false
+        store.lwwBindingState = async () => ({targetAuthority:'7'})
+        const stage = vi.fn(async () => undefined)
+        store.lwwStageReceive = stage
+        store.lwwFinishReceive = async () => undefined
+        store.lwwApplyReceive = async () => {
+            deferred = true
+            return {revision:first.runtime.revision,affectedKeys:[],heldKeys:[],deferredKeys:['["messages","char-a","conv-long"]']}
+        }
+        store.lwwDrainDeferred = vi.fn(async (request) => {
+            expect(request.bindingAuthority).toBe('7')
+            expect(request.generating).toEqual([])
+            const current = (await store.readConversation('char-a','conv-long'))!
+            const result = await store.commit({expectedRevision:current.revision,conversations:[{type:'replace-range',characterId:'char-a',conversationId:'conv-long',start:current.value.message.length,deleteCount:0,messages:[{role:'char',data:'restart remote',chatId:'restart-remote-id'}]}]})
+            deferred = false
+            return {...result,affectedKeys:['["messages","char-a","conv-long"]'],heldKeys:[],deferredKeys:[]}
+        })
+        await first.runtime.applyLwwReceive({bindingAuthority:'7',requestId:'completed-before-crash',changes:[],progress:{kind:'server',cursor:'1'},admittedTimeUpperMs:'100'})
+        expect(deferred).toBe(true)
+        stage.mockClear()
+        const restarted = await initializeRuntimeHarness(first)
+        expect(deferred).toBe(false)
+        expect(store.lwwDrainDeferred).toHaveBeenCalledOnce()
+        expect(store.lwwStageReceive).not.toHaveBeenCalled()
+        expect(database.characters.find(value=>value.chaId==='char-a')!.chats[0].message.at(-1)?.chatId).toBe('restart-remote-id')
+        commit.mockClear()
+        await restarted.runtime.flushPendingDataLocally('restart-adopted-baseline')
+        expect(commit).not.toHaveBeenCalled()
+    })
+
+    it('keeps native drain optional for web startup and generation completion', async () => {
+        const values = await harness()
+        const binding = vi.fn(async () => ({targetAuthority:'9'}))
+        const store = values.store as PersistentDataStore
+        store.lwwBindingState = binding
+        const {runtime} = await initializeRuntimeHarness(values)
+        await runtime.acknowledgeGenerationCompletion()
+        expect(binding).not.toHaveBeenCalled()
+    })
+
+    it('uses the current binding for completion after switching without a new receive', async () => {
+        const {store,runtime} = await runtimeHarness()
+        let authority = '11'
+        store.lwwBindingState = async () => ({targetAuthority:authority})
+        store.lwwStageReceive = async () => undefined
+        store.lwwApplyReceive = async () => ({revision:runtime.revision,affectedKeys:[],heldKeys:[],deferredKeys:[]})
+        store.lwwFinishReceive = async () => undefined
+        store.lwwDrainDeferred = vi.fn(async request => {
+            if (request.bindingAuthority !== authority) throw new Error('binding-authority-changed')
+            return {revision:runtime.revision,affectedKeys:[],heldKeys:[],deferredKeys:[]}
+        })
+        await runtime.applyLwwReceive({bindingAuthority:'11',requestId:'old-binding-receive',changes:[],progress:{kind:'server',cursor:'1'},admittedTimeUpperMs:'100'})
+        authority = '12'
+        await expect(runtime.acknowledgeGenerationCompletion()).resolves.toBeUndefined()
+        expect(store.lwwDrainDeferred).toHaveBeenCalledWith(expect.objectContaining({bindingAuthority:'12',generating:[]}))
     })
 
     it('registers all generating conversations using both stable IDs', () => {
