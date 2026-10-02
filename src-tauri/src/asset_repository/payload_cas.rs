@@ -321,10 +321,15 @@ impl PayloadCas {
         drop(file);
         #[cfg(test)]
         let mut observed_identity = super::body_io::PendingOwnedIdentity::new();
-        let verified_file = self.open_exact_owned_file(&staging_path)?;
+        let opened = self.open_exact_owned_file(&staging_path);
+        #[cfg(test)]
+        super::body_io::identity_metadata_open_result(&opened);
+        let verified_file = opened?;
         if exact_file_identity(&verified_file)? != identity {
             return exact_object_changed();
         }
+        #[cfg(test)]
+        super::body_io::verified_identity_metadata_open();
         directory_entries_synced &= sync_directory(&staging_directory)?;
 
         let content_hash = hex::encode(hasher.finalize());
@@ -374,12 +379,17 @@ impl PayloadCas {
         } = staged;
         #[cfg(test)]
         let _body_scope = super::body_io::object_scope(&content_hash);
-        let path_file = self.open_exact_owned_file(&staging.path)?;
+        let opened = self.open_exact_owned_file(&staging.path);
+        #[cfg(test)]
+        super::body_io::identity_metadata_open_result(&opened);
+        let path_file = opened?;
         if exact_file_identity(&verified_file)? != identity
             || exact_file_identity(&path_file)? != identity
         {
             return exact_object_changed();
         }
+        #[cfg(test)]
+        super::body_io::verified_identity_metadata_open();
         let staging_path = staging.path.clone();
         let assets_directory = self.ensure_directory(
             &self.repository_root,
@@ -1686,13 +1696,37 @@ mod body_io_tests {
             let staged = cas.stage_reader_expected(&mut bytes.as_slice(), &hash, bytes.len() as u64).unwrap();
             cas.publish_staged(staged).unwrap();
             let work = take_body_io(); assert!(work.complete());
-            assert_eq!(work.domains["owned"], BodyWork { open_attempts: 2, opens: 2, ..Default::default() });
+            assert_eq!(work.domains["owned"], BodyWork { open_attempts: 2, opens: 2,
+                identity_metadata_open_attempts: 2, identity_metadata_opens: 2,
+                verified_identity_metadata_opens: 2, ..Default::default() });
             assert_eq!(work.objects[&hash].owned_work, work.domains["owned"]);
             assert_eq!(work.objects[&hash].work, BodyWork::default());
             assert_eq!(work.unknown_work(), BodyWork::default());
             let classified = if purpose == BodyPurpose::Control { work.control_work() } else { work.asset_work() };
             assert_eq!(classified, work.domains["owned"]);
         }
+    }
+
+    #[test]
+    fn two_control_stagings_conserve_four_verified_identity_metadata_opens() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let bodies = [b"first synthetic control".as_slice(), b"second synthetic control".as_slice()];
+        let hashes = bodies.map(risunest_sync_wire::hash);
+        reset_body_io();
+        for (bytes, hash) in bodies.into_iter().zip(&hashes) {
+            register_object_purpose(hash, BodyPurpose::Control);
+            let mut reader = bytes;
+            let staged = cas.stage_reader_expected(&mut reader, hash, bytes.len() as u64).unwrap();
+            cas.publish_staged(staged).unwrap();
+        }
+        let work = take_body_io(); assert!(work.complete());
+        let owned = work.domains["owned"].clone();
+        assert_eq!(owned, BodyWork { open_attempts: 4, opens: 4,
+            identity_metadata_open_attempts: 4, identity_metadata_opens: 4,
+            verified_identity_metadata_opens: 4, ..Default::default() });
+        assert_eq!(work.control_work(), owned); assert_eq!(work.asset_work(), BodyWork::default());
+        for hash in hashes { assert_eq!(work.objects[&hash].owned_work.verified_identity_metadata_opens, 2); }
     }
 
     #[test]
@@ -1706,15 +1740,77 @@ mod body_io_tests {
         let unknown = take_body_io(); assert!(!unknown.complete());
         assert_eq!(unknown.unknown_work(), unknown.domains["owned"]);
         assert_eq!(unknown.control_work(), BodyWork::default());
+        assert_eq!(unknown.unknown_work().verified_identity_metadata_opens, 2);
         register_object_purpose(&hash, BodyPurpose::Control);
         assert!(cas.stage_reader_expected(&mut bytes.as_slice(), &hash, 0).is_err());
         let failed = take_body_io(); assert!(!failed.complete());
         assert_eq!(failed.unattributed_owned.opens, 1);
         assert_eq!(failed.unattributed_owned, failed.domains["owned"]);
+        assert_eq!(failed.unattributed_owned.verified_identity_metadata_opens, 1);
         reset_body_io();
         assert!(cas.open_exact_owned_file(&directory.path().join("missing.tmp")).is_err());
         let missing = take_body_io(); assert!(!missing.complete());
         assert_eq!(missing.unattributed_owned.failed_opens, 1);
+        assert_eq!(missing.unattributed_owned.identity_metadata_open_attempts, 0);
+    }
+
+    #[test]
+    fn identity_metadata_proof_excludes_nonidentity_owned_opens_and_mixed_assets() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let bytes = b"synthetic owned identity discriminator";
+        let hash = risunest_sync_wire::hash(bytes);
+        let path = directory.path().join("known-control.tmp");
+        std::fs::write(&path, bytes).unwrap();
+        reset_body_io(); register_object_purpose(&hash, BodyPurpose::Control);
+        {
+            let _scope = super::super::body_io::object_scope(&hash);
+            drop(cas.open_exact_owned_file(&path).unwrap());
+        }
+        let work = take_body_io(); assert!(work.complete());
+        assert_eq!(work.control_work().opens, 1);
+        assert_eq!(work.control_work().identity_metadata_open_attempts, 0);
+        assert_eq!(work.control_work().verified_identity_metadata_opens, 0);
+        assert_eq!(work.objects[&hash].owned_work, work.domains["owned"]);
+        register_object_purpose(&hash, BodyPurpose::Control);
+        register_object_purpose(&hash, BodyPurpose::Asset);
+        cas.prepare_bytes(bytes).unwrap();
+        let mixed = take_body_io(); assert!(mixed.complete());
+        assert_eq!(mixed.control_work(), BodyWork::default());
+        assert_eq!(mixed.asset_work(), mixed.domains["owned"]);
+        assert_eq!(mixed.asset_work().verified_identity_metadata_opens, 2);
+        register_object_purpose(&hash, BodyPurpose::Control);
+        drop(cas.open_object(&hash).unwrap().unwrap());
+        let raw = take_body_io(); assert!(!raw.complete());
+        assert_eq!(raw.domains["managed"].escaped_handles, 1);
+        assert_eq!(raw.domains["managed"].verified_identity_metadata_opens, 0);
+    }
+
+    #[test]
+    fn identity_metadata_open_failure_and_identity_mismatch_never_become_verified() {
+        for missing in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let cas = PayloadCas::new(directory.path()).unwrap();
+            let bytes = b"synthetic rejected staging identity";
+            let hash = risunest_sync_wire::hash(bytes);
+            reset_body_io(); register_object_purpose(&hash, BodyPurpose::Control);
+            let staged = cas.stage_reader_expected(&mut bytes.as_slice(), &hash, bytes.len() as u64).unwrap();
+            let path = staged.staging.path.clone();
+            std::fs::remove_file(&path).unwrap();
+            if !missing { std::fs::write(&path, b"replacement has a different identity and length").unwrap(); }
+            assert!(cas.publish_staged(staged).is_err());
+            let work = take_body_io(); assert!(work.complete());
+            let owned = work.domains["owned"].clone();
+            assert_eq!(owned.identity_metadata_open_attempts, 2);
+            assert_eq!(owned.verified_identity_metadata_opens, 1);
+            assert_eq!(owned.identity_metadata_opens, if missing { 1 } else { 2 });
+            assert_eq!(owned.identity_metadata_failed_opens, if missing { 1 } else { 0 });
+            assert_eq!(owned.open_attempts, owned.identity_metadata_open_attempts);
+            assert_eq!(owned.opens, owned.identity_metadata_opens);
+            assert_eq!(owned.failed_opens, owned.identity_metadata_failed_opens);
+            assert_eq!(work.objects[&hash].owned_work, owned);
+            assert_eq!(work.control_work(), owned);
+        }
     }
 
     #[test]
@@ -1727,6 +1823,7 @@ mod body_io_tests {
         let staged = cas.stage_reader_expected(&mut bytes.as_slice(), &hash, bytes.len() as u64).unwrap();
         let live = take_body_io(); assert!(!live.complete());
         assert_eq!(live.control_work().outstanding_readers, 1);
+        assert_eq!(live.control_work().verified_identity_metadata_opens, 1);
         drop(staged); assert!(!take_body_io().complete());
         reset_body_io(); register_object_purpose(&hash, BodyPurpose::Control);
         let staged = cas.stage_reader_expected(&mut bytes.as_slice(), &hash, bytes.len() as u64).unwrap();
@@ -1735,6 +1832,8 @@ mod body_io_tests {
         }).join().unwrap();
         let owner = take_body_io(); assert!(!owner.complete()); assert!(!worker.complete());
         assert_eq!(owner.control_work().opens, 1); assert_eq!(worker.unknown_work().opens, 1);
+        assert_eq!(owner.control_work().verified_identity_metadata_opens, 1);
+        assert_eq!(worker.unknown_work().verified_identity_metadata_opens, 1);
         assert_eq!(owner.domains["owned"].outstanding_readers, 0);
     }
 
