@@ -14,7 +14,7 @@ function setup(options: Partial<InspectedSyncTarget> & { nonDefault?: boolean; c
             assertAuthority: async expected => { if (expected.targetAuthority !== state.targetAuthority) throw Error('stale authority') },
             switchTarget: async (expected, target, inspection) => {
                 if (expected.targetAuthority !== state.targetAuthority) throw Error('stale authority')
-                events.push('switch'); state = { ...state, target, libraryId: inspection?.libraryId ?? state.libraryId, targetAuthority: String(Number(state.targetAuthority) + 1) }; return state
+                events.push('switch'); state = { ...state, target, libraryId: inspection?.libraryId ?? state.libraryId, targetAuthority: String(Number(state.targetAuthority) + 1) }; return structuredClone(state)
             },
         },
         gate: { runTransition: async f => { events.push('gate'); return f() }, runWrite: f => f(), runKeyedWrite: (_key, f) => f() },
@@ -245,7 +245,7 @@ describe('transport-neutral first binding', () => {
     it('acknowledges, validates, fences and activates database before refreshing and restarting plugins', async () => {
         const s = setup()
         expect(await s.flow.bind(target, s.transport)).toMatchObject({ kind: 'bound', action: 'replaced' })
-        expect(s.events).toEqual(['inspect', 'confirm', 'stage', 'jobs-fence', 'plugin-fence', 'pause-flush', 'gate', 'switch', 'activate-database', 'invalidate', 'refresh', 'restart'])
+        expect(s.events).toEqual(['inspect', 'confirm', 'stage', 'jobs-fence', 'plugin-fence', 'pause-flush', 'gate', 'switch', 'activate-database', 'invalidate', 'refresh', 'restart', 'resume'])
     })
     it('cancellation leaves original authority, plugin execution and contents intact', async () => {
         const s = setup({ confirm: false })
@@ -268,12 +268,13 @@ describe('transport-neutral first binding', () => {
     })
     it('empty targets initialize without resetting plugin values', async () => {
         const s = setup({ empty: true }); await s.flow.bind(target, s.transport)
-        expect(s.events).toEqual(['inspect', 'jobs-fence', 'pause-flush', 'gate', 'switch', 'publish'])
+        expect(s.events).toEqual(['inspect', 'jobs-fence', 'pause-flush', 'gate', 'switch', 'publish', 'resume'])
     })
     it('default shared state needs no transfer even with plugin-local-only data', async () => {
         const s = setup({ empty: true }); s.deps.hasNonDefaultSharedData = async () => false
         await s.flow.bind(target, s.transport)
         expect(s.events).not.toContain('publish'); expect(s.events).not.toContain('plugin-fence')
+        expect(s.events.filter(event => event === 'resume')).toHaveLength(1)
     })
     it('same-library recovery resumes without staging or resetting namespaces', async () => {
         const s = setup({ previouslyBoundLibrary: true }); await s.flow.bind(target, s.transport)
@@ -405,6 +406,76 @@ it('resume and initial publish callbacks may use the same renderer gate', async 
         await s.flow.bind(target,s.transport)
         expect(s.events).toContain(empty ? 'gated-publish' : 'gated-resume')
     }
+})
+
+it.each([
+    { empty: true, nonDefault: false, action: 'initialized', publishes: false },
+    { empty: true, nonDefault: true, action: 'initialized', publishes: true },
+    { empty: false, nonDefault: true, action: 'replaced', publishes: false },
+    { previouslyBoundLibrary: true, action: 'resumed', publishes: false },
+])('activates the ordinary adapter after pause release and delivers the first edit for %s', async options => {
+    const s = setup(options)
+    const gate = createStorageMutationGate({ locks: createInRealmStorageLockManager() })
+    const store = createMutationGatedPersistentDataStore(
+        new IndexedDbPersistentDataStore('binding-first-edit', new IDBFactory(), IDBKeyRange), gate,
+    )
+    await store.open()
+    s.deps.gate = gate
+    let paused = false
+    let adapterActive = false
+    const delivered: number[] = []
+    s.deps.withPausedWrites = async operation => {
+        paused = true
+        try { return await operation() } finally { paused = false; s.events.push('pause-release') }
+    }
+    const publish = vi.fn(() => gate.runWrite(async () => {
+        expect(paused).toBe(false)
+        s.events.push('publish')
+    }))
+    const resume = vi.fn(() => gate.runWrite(async () => {
+        expect(paused).toBe(false)
+        expect(adapterActive).toBe(false)
+        adapterActive = true
+        s.events.push('resume')
+    }))
+    s.transport.publishInitialSharedState = publish
+    s.transport.resumeBinding = resume
+    expect(await s.flow.bind(target, s.transport)).toMatchObject({ action: options.action })
+    expect(publish).toHaveBeenCalledTimes(options.publishes ? 1 : 0)
+    expect(resume).toHaveBeenCalledOnce()
+    expect(s.events.indexOf('resume')).toBeGreaterThan(s.events.indexOf('pause-release'))
+    if (options.publishes) expect(s.events.indexOf('resume')).toBeGreaterThan(s.events.indexOf('publish'))
+    const root = await store.readRoot()
+    const commit = await store.commit({ expectedRevision: root.revision, root: { ...root.value, username: 'Synthetic first edit' } })
+    if (adapterActive) delivered.push(commit.revision)
+    expect(delivered).toEqual([commit.revision])
+    expect((await store.readRoot()).value.username).toBe('Synthetic first edit')
+})
+
+it('does not publish or resume when authority changes as pause releases', async () => {
+    const s = setup({ empty: true })
+    s.deps.withPausedWrites = async operation => {
+        const result = await operation()
+        s.changeAuthority()
+        return result
+    }
+    await expect(s.flow.bind(target, s.transport)).rejects.toThrow('stale authority')
+    expect(s.events).not.toContain('publish')
+    expect(s.events).not.toContain('resume')
+})
+it('does not resume if authority changes during initial publication', async () => {
+    const s = setup({ empty: true })
+    s.transport.publishInitialSharedState = async () => { s.events.push('publish'); s.changeAuthority() }
+    await expect(s.flow.bind(target, s.transport)).rejects.toThrow('stale authority')
+    expect(s.events).toContain('publish')
+    expect(s.events).not.toContain('resume')
+})
+it('does not publish or resume after replacement refresh fails', async () => {
+    const s = setup()
+    s.deps.refreshActivatedLibrary = async () => { throw Error('refresh failed') }
+    await expect(s.flow.bind(target, s.transport)).rejects.toThrow('refresh failed')
+    expect(s.events).not.toContain('publish')
+    expect(s.events).not.toContain('resume')
 })
 
 it('drains coordinator-queued plugin mutations before acquiring pause', async () => {
