@@ -194,6 +194,8 @@ enum Intent {
         staging_id: String,
         changes: Vec<(UnitKey, UnitValue)>,
         source_units: Option<BTreeMap<UnitKey, UnitValue>>,
+        device_sections: Option<device_store::sections::FrozenBackupSections>,
+        device_changes: Vec<(UnitKey, UnitValue)>,
     },
     Target {
         staging_id: String,
@@ -727,6 +729,9 @@ impl PersistentStore {
             if header.binding_authority != authority {
                 return Err(error("unfinished-intent-authority-changed"));
             }
+            if matches!(&intent, Intent::Replacement { .. }) {
+                self.completed_intent(&header, &intent)?;
+            }
             match intent {
                 Intent::Commit {
                     commit: input,
@@ -744,17 +749,15 @@ impl PersistentStore {
                 Intent::Replacement {
                     staging_id,
                     changes,
+                    device_sections,
+                    device_changes,
                     ..
                 } => {
-                    self.finish_lww_replacement(
-                        &header,
-                        &staging_id,
-                        &changes,
-                        &stamp,
-                        &digest,
-                        false,
-                        &[],
-                    )?;
+                    if let Some(sections) = device_sections {
+                        self.finish_lww_device_replacement(&header, &staging_id, &changes, &sections, &device_changes, &stamp, &digest)?;
+                    } else {
+                        self.finish_lww_replacement(&header, &staging_id, &changes, &stamp, &digest, false, &[])?;
+                    }
                 }
                 Intent::Target {
                     staging_id,
@@ -1717,6 +1720,29 @@ impl PersistentStore {
         staging_id: &str,
         source_units: Option<&BTreeMap<UnitKey, UnitValue>>,
     ) -> StoreResult<RevisionResult> {
+        self.lww_commit_replacement_inputs(header, staging_id, source_units, None)
+    }
+    pub(crate) fn lww_commit_replacement_with_device_sections(
+        &mut self,
+        header: &Header,
+        staging_id: &str,
+        source_units: Option<&BTreeMap<UnitKey, UnitValue>>,
+        sections: &[&device_store::sections::PreparedSectionRows],
+    ) -> StoreResult<RevisionResult> {
+        let frozen = device_store::sections::freeze_backup_sections(sections)?;
+        self.lww_commit_replacement_inputs(header, staging_id, source_units, Some(&frozen))
+    }
+    fn lww_commit_replacement_inputs(
+        &mut self,
+        header: &Header,
+        staging_id: &str,
+        source_units: Option<&BTreeMap<UnitKey, UnitValue>>,
+        device_sections: Option<&device_store::sections::FrozenBackupSections>,
+    ) -> StoreResult<RevisionResult> {
+        validate_header(header)?;
+        if source_units.is_some_and(|units| units.keys().any(projection::is_device)) {
+            return Err(error("replacement-library-source-contains-device-units"));
+        }
         let existing: Option<(String, String, bool)> = self
             .device_store()?
             .connection()
@@ -1731,7 +1757,7 @@ impl PersistentStore {
                 return Err(error("request-id-integrity"));
             }
             let intent: Intent = serde_json::from_str(&body)?;
-            if !matches!(&intent,Intent::Replacement{staging_id:old,source_units:old_units,..} if old==staging_id&&old_units.as_ref()==source_units)
+            if !matches!(&intent,Intent::Replacement{staging_id:old,source_units:old_units,device_sections:old_sections,..} if old==staging_id&&old_units.as_ref()==source_units&&old_sections.as_ref()==device_sections)
             {
                 return Err(error("request-id-integrity"));
             }
@@ -1808,17 +1834,54 @@ impl PersistentStore {
                 changes.push((key, value));
             }
         }
+        let device_changes = if let Some(sections) = device_sections {
+            let tx = self.device_store_mut()?.transaction()?;
+            verify(&tx, header.binding_authority)?;
+            let changes = projection::device_replacement_changes(&tx, sections)?;
+            tx.commit()?;
+            changes
+        } else { vec![] };
         let (stamp, digest) = self.reserve_intent(
             header,
             &Intent::Replacement {
                 staging_id: staging_id.into(),
                 changes: changes.clone(),
                 source_units: source_units.cloned(),
+                device_sections: device_sections.cloned(),
+                device_changes: device_changes.clone(),
             },
         )?;
-        let result =
-            self.finish_lww_replacement(header, staging_id, &changes, &stamp, &digest, false, &[])?;
-        self.complete_intent(header)?;
+        let result = if let Some(sections) = device_sections {
+            self.finish_lww_device_replacement(header, staging_id, &changes, sections, &device_changes, &stamp, &digest)?
+        } else {
+            let result = self.finish_lww_replacement(header, staging_id, &changes, &stamp, &digest, false, &[])?;
+            self.complete_intent(header)?;
+            result
+        };
+        Ok(result)
+    }
+    fn finish_lww_device_replacement(
+        &mut self,
+        header: &Header,
+        staging_id: &str,
+        changes: &[(UnitKey, UnitValue)],
+        sections: &device_store::sections::FrozenBackupSections,
+        device_changes: &[(UnitKey, UnitValue)],
+        stamp: &Stamp,
+        digest: &str,
+    ) -> StoreResult<RevisionResult> {
+        verify(self.device_store()?.connection(), header.binding_authority)?;
+        let result = self.finish_lww_replacement(header, staging_id, changes, stamp, digest, false, &[])?;
+        let tx = self.device_store_mut()?.transaction()?;
+        verify(&tx, header.binding_authority)?;
+        device_store::begin_mutation_remote(&tx)?;
+        device_store::sections::restore_frozen_backup_sections(&tx, sections, stamp)?;
+        for (key, value) in device_changes {
+            put_unit(&tx, key, stamp, value, &header.request_id, Some(header.binding_authority))?;
+        }
+        device_store::finish_mutation_remote(&tx)?;
+        tx.execute("UPDATE lww_intents SET complete=1 WHERE request_id=?1", [&header.request_id])?;
+        tx.commit()?;
         Ok(result)
     }
     pub(crate) fn lww_replace_target(
