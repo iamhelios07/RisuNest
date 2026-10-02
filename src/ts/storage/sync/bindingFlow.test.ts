@@ -14,7 +14,7 @@ function setup(options: Partial<InspectedSyncTarget> & { nonDefault?: boolean; c
             assertAuthority: async expected => { if (expected.targetAuthority !== state.targetAuthority) throw Error('stale authority') },
             switchTarget: async (expected, target, inspection) => {
                 if (expected.targetAuthority !== state.targetAuthority) throw Error('stale authority')
-                events.push('switch'); state = { ...state, target, libraryId: inspection?.libraryId ?? state.libraryId, targetAuthority: String(Number(state.targetAuthority) + 1) }; return state
+                events.push('switch'); state = { ...state, target, libraryId: inspection?.libraryId ?? state.libraryId, targetAuthority: String(Number(state.targetAuthority) + 1) }; return structuredClone(state)
             },
         },
         gate: { runTransition: async f => { events.push('gate'); return f() }, runWrite: f => f(), runKeyedWrite: (_key, f) => f() },
@@ -23,6 +23,7 @@ function setup(options: Partial<InspectedSyncTarget> & { nonDefault?: boolean; c
         hasNonDefaultSharedData: async () => options.nonDefault ?? true,
         confirmReplacement: async () => { events.push('confirm'); return options.confirm ?? true },
         refreshActivatedLibrary: record('refresh'),
+        beginActivatedLibraryGuard: () => ({ complete() {}, async abortUnchanged() {} }),
     }
     const target: InspectedSyncTarget = { inspectionId: 'inspected', targetId: 'target', libraryId: 'library', empty: false, previouslyBoundLibrary: false, ...options }
     const transport: SyncBindingTransport = {
@@ -53,6 +54,57 @@ function newDeviceTransport(s: ReturnType<typeof setup>) {
         s.events.push('resume-new-device')
     }
 }
+
+it('passes explicit new-device context mode through inspection, staging, fencing, preparation, activation and resume', async () => {
+    const s = setup(); newDeviceTransport(s)
+    const phases = [
+        vi.spyOn(s.transport, 'inspectTarget'), vi.spyOn(s.transport, 'pullAvailableState'),
+        vi.spyOn(s.transport, 'fenceOldJobs'), vi.spyOn(s.transport, 'prepareNewDeviceBinding'),
+        vi.spyOn(s.transport, 'replaceAsNewDevice'), vi.spyOn(s.transport, 'resumeNewDeviceBinding'),
+    ]
+    await s.flow.bind(target, s.transport, { mode: 'new-device' })
+    for (const phase of phases) {
+        expect(phase).toHaveBeenCalledOnce()
+        expect(phase.mock.calls[0].at(-1)).toHaveProperty('mode', 'new-device')
+    }
+})
+it.each([{}, { empty: true }, { previouslyBoundLibrary: true }])('ordinary binding omits context mode in every callback for %s', async inspected => {
+    const s = setup(inspected)
+    const phases = [
+        vi.spyOn(s.transport, 'inspectTarget'), vi.spyOn(s.transport, 'pullAvailableState'),
+        vi.spyOn(s.transport, 'fenceOldJobs'), vi.spyOn(s.transport, 'replaceFromTarget'),
+        vi.spyOn(s.transport, 'publishInitialSharedState'), vi.spyOn(s.transport, 'resumeBinding'),
+    ]
+    await s.flow.bind(target, s.transport)
+    for (const phase of phases) for (const args of phase.mock.calls) expect(args.at(-1)).not.toHaveProperty('mode')
+})
+it('explicit new-device operation passes mode when fencing and recovering an already active ordinary binding', async () => {
+    const s = setup({ empty: true }); await s.flow.bind(target, s.transport)
+    const fence = vi.spyOn(s.transport, 'fenceOldJobs')
+    const resume = vi.spyOn(s.transport, 'resumeBinding')
+    const prepare = vi.fn<NonNullable<SyncBindingTransport['prepareNewDeviceBinding']>>(async () => { throw new Error('prepare stopped') })
+    s.transport.prepareNewDeviceBinding = prepare
+    s.transport.replaceAsNewDevice = vi.fn()
+    s.transport.resumeNewDeviceBinding = vi.fn()
+    await expect(s.flow.bind(target, s.transport, { mode: 'new-device' })).rejects.toThrow('prepare stopped')
+    expect(fence.mock.calls[0][0]).toMatchObject({ mode: 'new-device', state: { targetAuthority: '1' } })
+    expect(fence.mock.calls[0][0].signal.aborted).toBe(true)
+    expect(prepare.mock.calls[0][1]).toHaveProperty('mode', 'new-device')
+    expect(resume.mock.calls[0][0]).toHaveProperty('mode', 'new-device')
+    expect(resume.mock.calls[0][0].signal.aborted).toBe(false)
+})
+it('new-device context mode does not leak into later ordinary binding or unbind', async () => {
+    const s = setup(); newDeviceTransport(s)
+    await s.flow.bind(target, s.transport, { mode: 'new-device' })
+    s.transport.inspectTarget = async () => ({ inspectionId: 'inspected', targetId: 'target', libraryId: 'library', empty: false, previouslyBoundLibrary: true })
+    const fence = vi.spyOn(s.transport, 'fenceOldJobs')
+    const resume = vi.spyOn(s.transport, 'resumeBinding')
+    await s.flow.bind(target, s.transport)
+    await s.flow.unbind()
+    expect(fence).toHaveBeenCalledTimes(2)
+    for (const args of fence.mock.calls) expect(args[0]).not.toHaveProperty('mode')
+    expect(resume.mock.calls[0][0]).not.toHaveProperty('mode')
+})
 
 it.each([{ empty: true }, { previouslyBoundLibrary: true }])('explicit new device stages and replaces even when %s', async inspected => {
     const s = setup({ ...inspected, nonDefault: false })
@@ -98,12 +150,102 @@ it('unsettled old publication cannot enter new device activation or plugin reset
     expect(s.events).toEqual(['inspect', 'confirm', 'stage', 'jobs-fence'])
     expect((await s.deps.native.state()).targetAuthority).toBe('0')
 })
+it.each(['prepare', 'activate'])('resumes unchanged active binding after new device %s failure outside pause and gate', async failure => {
+    const s = setup({ empty: true })
+    await s.flow.bind(target, s.transport)
+    s.events.length = 0
+    const gate = createStorageMutationGate({ locks: createInRealmStorageLockManager() }); s.deps.gate = gate
+    let paused = false
+    s.deps.withPausedWrites = async operation => { paused = true; try { return await operation() } finally { paused = false } }
+    s.deps.plugins.restart = async () => { expect(paused).toBe(false); await gate.runWrite(async () => { s.events.push('restart-old') }) }
+    s.transport.resumeBinding = async context => { expect(paused).toBe(false); expect(context.signal.aborted).toBe(false); expect(context.state.targetAuthority).toBe('1'); await gate.runWrite(async () => { s.events.push('resume-old') }) }
+    s.transport.prepareNewDeviceBinding = async () => {
+        if (failure === 'prepare') throw new Error('new device failed')
+        return { authorizationId: 'native', writerId: 'reserved' }
+    }
+    s.transport.replaceAsNewDevice = async () => { throw new Error('new device failed') }
+    s.transport.resumeNewDeviceBinding = async () => { throw new Error('unexpected new device resume') }
+    await expect(s.flow.bind(target, s.transport, { mode: 'new-device' })).rejects.toThrow('new device failed')
+    expect((await s.deps.native.state()).targetAuthority).toBe('1')
+    expect(s.events).toContain('resume-old')
+    if (failure === 'activate') expect(s.events).toContain('restart-old')
+    else expect(s.events).not.toContain('restart-old')
+    expect(paused).toBe(false)
+})
+it('ordinary replacement switch failure restores unchanged plugins and active adapter', async () => {
+    const s = setup({ empty: true }); await s.flow.bind(target, s.transport); s.events.length = 0
+    s.transport.inspectTarget = async () => ({ inspectionId: 'new', targetId: 'target', libraryId: 'library', empty: false, previouslyBoundLibrary: false })
+    s.deps.native.switchTarget = async () => { throw new Error('native switch failed') }
+    await expect(s.flow.bind(target, s.transport)).rejects.toThrow('native switch failed')
+    expect(s.events).toContain('restart')
+    expect(s.events).toContain('resume')
+    expect((await s.deps.native.state()).targetAuthority).toBe('1')
+})
+it.each(['result', 'cache', 'refresh', 'state'])('postactivation %s failure keeps stale captures fenced and never resumes or publishes', async failure => {
+    const s = setup(); newDeviceTransport(s)
+    let guarded = false
+    let staleWrites = 0
+    const complete = vi.fn(() => { guarded = false })
+    const abortUnchanged = vi.fn(async () => { guarded = false })
+    s.deps.beginActivatedLibraryGuard = () => { guarded = true; return { complete, abortUnchanged } }
+    s.deps.withPausedWrites = async operation => { try { return await operation() } finally { if (!guarded) staleWrites++ } }
+    if (failure === 'result') {
+        const activate = s.transport.replaceAsNewDevice!
+        s.transport.replaceAsNewDevice = async (...args) => ({ ...await activate(...args), writerId: 'different' })
+    } else if (failure === 'cache') s.deps.plugins.invalidateCaches = async () => { throw new Error('cache failed') }
+    else if (failure === 'refresh') s.deps.refreshActivatedLibrary = async () => { throw new Error('refresh failed') }
+    else {
+        const read = s.deps.native.state; let reads = 0
+        s.deps.native.state = async () => { if (++reads > 1) throw Error('native state unavailable'); return read() }
+    }
+    await expect(s.flow.bind(target, s.transport, { mode: 'new-device' })).rejects.toThrow()
+    if (failure !== 'state') expect((await s.deps.native.state()).targetAuthority).toBe('1')
+    expect(guarded).toBe(true)
+    expect(staleWrites).toBe(0)
+    expect(complete).not.toHaveBeenCalled()
+    expect(abortUnchanged).not.toHaveBeenCalled()
+    for (const event of ['restart', 'resume', 'resume-new-device', 'publish']) expect(s.events).not.toContain(event)
+})
+it('only unchanged native failure aborts the activation guard before restarting old state', async () => {
+    const s = setup(); newDeviceTransport(s)
+    let guarded = false
+    const abortUnchanged = vi.fn(async () => { guarded = false })
+    s.deps.beginActivatedLibraryGuard = () => { guarded = true; return { complete: vi.fn(), abortUnchanged } }
+    s.transport.replaceAsNewDevice = async () => { throw new Error('unchanged native failure') }
+    s.deps.plugins.restart = async () => { expect(guarded).toBe(false); s.events.push('restart') }
+    await expect(s.flow.bind(target, s.transport, { mode: 'new-device' })).rejects.toThrow('unchanged native failure')
+    expect(abortUnchanged).toHaveBeenCalledOnce()
+    expect(guarded).toBe(false)
+})
+it('unchanged binding with changed native revision cannot release the guard or restart old state', async () => {
+    const s = setup(); newDeviceTransport(s)
+    let guarded = false
+    s.deps.beginActivatedLibraryGuard = () => {
+        guarded = true
+        return { complete() { guarded = false }, async abortUnchanged() { throw Error('native revision changed') } }
+    }
+    s.transport.replaceAsNewDevice = async () => { throw new Error('native failure') }
+    await expect(s.flow.bind(target, s.transport, { mode: 'new-device' })).rejects.toThrow('Sync binding failed while resuming local state')
+    expect(guarded).toBe(true)
+    for (const event of ['restart', 'resume', 'resume-new-device', 'publish']) expect(s.events).not.toContain(event)
+})
+it('successful activated projection holds the guard through fresh plugin restart before publication', async () => {
+    const s = setup(); newDeviceTransport(s)
+    let guarded = false
+    s.deps.beginActivatedLibraryGuard = () => { guarded = true; return { complete() { guarded = false }, async abortUnchanged() { throw Error('unexpected abort') } } }
+    s.deps.refreshActivatedLibrary = async () => { expect(guarded).toBe(true); s.events.push('refresh') }
+    s.deps.plugins.restart = async () => { expect(guarded).toBe(true); s.events.push('restart') }
+    const resume = s.transport.resumeNewDeviceBinding!
+    s.transport.resumeNewDeviceBinding = async (...args) => { expect(guarded).toBe(false); return resume(...args) }
+    expect(await s.flow.bind(target, s.transport, { mode: 'new-device' })).toMatchObject({ kind: 'bound', action: 'new-device' })
+    expect(guarded).toBe(false)
+})
 
 describe('transport-neutral first binding', () => {
     it('acknowledges, validates, fences and activates database before refreshing and restarting plugins', async () => {
         const s = setup()
         expect(await s.flow.bind(target, s.transport)).toMatchObject({ kind: 'bound', action: 'replaced' })
-        expect(s.events).toEqual(['inspect', 'confirm', 'stage', 'jobs-fence', 'plugin-fence', 'pause-flush', 'gate', 'switch', 'activate-database', 'invalidate', 'refresh', 'restart'])
+        expect(s.events).toEqual(['inspect', 'confirm', 'stage', 'jobs-fence', 'plugin-fence', 'pause-flush', 'gate', 'switch', 'activate-database', 'invalidate', 'refresh', 'restart', 'resume'])
     })
     it('cancellation leaves original authority, plugin execution and contents intact', async () => {
         const s = setup({ confirm: false })
@@ -126,16 +268,25 @@ describe('transport-neutral first binding', () => {
     })
     it('empty targets initialize without resetting plugin values', async () => {
         const s = setup({ empty: true }); await s.flow.bind(target, s.transport)
-        expect(s.events).toEqual(['inspect', 'jobs-fence', 'pause-flush', 'gate', 'switch', 'publish'])
+        expect(s.events).toEqual(['inspect', 'jobs-fence', 'pause-flush', 'gate', 'switch', 'refresh', 'publish', 'resume'])
     })
     it('default shared state needs no transfer even with plugin-local-only data', async () => {
         const s = setup({ empty: true }); s.deps.hasNonDefaultSharedData = async () => false
         await s.flow.bind(target, s.transport)
         expect(s.events).not.toContain('publish'); expect(s.events).not.toContain('plugin-fence')
+        expect(s.events.filter(event => event === 'resume')).toHaveLength(1)
     })
     it('same-library recovery resumes without staging or resetting namespaces', async () => {
         const s = setup({ previouslyBoundLibrary: true }); await s.flow.bind(target, s.transport)
-        expect(s.events).toEqual(['inspect', 'jobs-fence', 'pause-flush', 'gate', 'switch', 'resume'])
+        expect(s.events).toEqual(['inspect', 'jobs-fence', 'pause-flush', 'gate', 'switch', 'refresh', 'resume'])
+    })
+    it('same-target same-library recovery takes no activation guard or full refresh', async () => {
+        const s = setup({ previouslyBoundLibrary: true })
+        s.setState({ target, targetAuthority: '9', selectionEpoch: 'same', libraryId: 'library', progress: null })
+        const guard = vi.spyOn(s.deps, 'beginActivatedLibraryGuard')
+        await s.flow.bind(target, s.transport)
+        expect(guard).not.toHaveBeenCalled()
+        expect(s.events).toEqual(['inspect', 'jobs-fence', 'pause-flush', 'gate', 'resume'])
     })
     it('stale state stops before activation', async () => {
         const s = setup(); s.transport.pullAvailableState = async () => { s.changeAuthority(); return { targetId: 'target', libraryId: 'library', stagingId: 'stage', receiveId: 'receive' } }
@@ -263,6 +414,76 @@ it('resume and initial publish callbacks may use the same renderer gate', async 
         await s.flow.bind(target,s.transport)
         expect(s.events).toContain(empty ? 'gated-publish' : 'gated-resume')
     }
+})
+
+it.each([
+    { empty: true, nonDefault: false, action: 'initialized', publishes: false },
+    { empty: true, nonDefault: true, action: 'initialized', publishes: true },
+    { empty: false, nonDefault: true, action: 'replaced', publishes: false },
+    { previouslyBoundLibrary: true, action: 'resumed', publishes: false },
+])('activates the ordinary adapter after pause release and delivers the first edit for %s', async options => {
+    const s = setup(options)
+    const gate = createStorageMutationGate({ locks: createInRealmStorageLockManager() })
+    const store = createMutationGatedPersistentDataStore(
+        new IndexedDbPersistentDataStore('binding-first-edit', new IDBFactory(), IDBKeyRange), gate,
+    )
+    await store.open()
+    s.deps.gate = gate
+    let paused = false
+    let adapterActive = false
+    const delivered: number[] = []
+    s.deps.withPausedWrites = async operation => {
+        paused = true
+        try { return await operation() } finally { paused = false; s.events.push('pause-release') }
+    }
+    const publish = vi.fn(() => gate.runWrite(async () => {
+        expect(paused).toBe(false)
+        s.events.push('publish')
+    }))
+    const resume = vi.fn(() => gate.runWrite(async () => {
+        expect(paused).toBe(false)
+        expect(adapterActive).toBe(false)
+        adapterActive = true
+        s.events.push('resume')
+    }))
+    s.transport.publishInitialSharedState = publish
+    s.transport.resumeBinding = resume
+    expect(await s.flow.bind(target, s.transport)).toMatchObject({ action: options.action })
+    expect(publish).toHaveBeenCalledTimes(options.publishes ? 1 : 0)
+    expect(resume).toHaveBeenCalledOnce()
+    expect(s.events.indexOf('resume')).toBeGreaterThan(s.events.indexOf('pause-release'))
+    if (options.publishes) expect(s.events.indexOf('resume')).toBeGreaterThan(s.events.indexOf('publish'))
+    const root = await store.readRoot()
+    const commit = await store.commit({ expectedRevision: root.revision, root: { ...root.value, username: 'Synthetic first edit' } })
+    if (adapterActive) delivered.push(commit.revision)
+    expect(delivered).toEqual([commit.revision])
+    expect((await store.readRoot()).value.username).toBe('Synthetic first edit')
+})
+
+it('does not publish or resume when authority changes as pause releases', async () => {
+    const s = setup({ empty: true })
+    s.deps.withPausedWrites = async operation => {
+        const result = await operation()
+        s.changeAuthority()
+        return result
+    }
+    await expect(s.flow.bind(target, s.transport)).rejects.toThrow('stale authority')
+    expect(s.events).not.toContain('publish')
+    expect(s.events).not.toContain('resume')
+})
+it('does not resume if authority changes during initial publication', async () => {
+    const s = setup({ empty: true })
+    s.transport.publishInitialSharedState = async () => { s.events.push('publish'); s.changeAuthority() }
+    await expect(s.flow.bind(target, s.transport)).rejects.toThrow('stale authority')
+    expect(s.events).toContain('publish')
+    expect(s.events).not.toContain('resume')
+})
+it('does not publish or resume after replacement refresh fails', async () => {
+    const s = setup()
+    s.deps.refreshActivatedLibrary = async () => { throw Error('refresh failed') }
+    await expect(s.flow.bind(target, s.transport)).rejects.toThrow('refresh failed')
+    expect(s.events).not.toContain('publish')
+    expect(s.events).not.toContain('resume')
 })
 
 it('drains coordinator-queued plugin mutations before acquiring pause', async () => {

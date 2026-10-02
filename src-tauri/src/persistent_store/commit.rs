@@ -1295,6 +1295,8 @@ pub(super) fn replace_commit_lww(
     changes: &[(risunest_sync_wire::unit::UnitKey, risunest_sync_wire::unit::UnitValue)],
     target: bool,
     received: &[super::lww::Change],
+    received_authority: Option<risunest_sync_wire::stamp::DecimalU64>,
+    selection_change: Option<&super::sync_selection::BindingSelectionChange>,
 ) -> StoreResult<RevisionResult> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let completed: Option<(String,i64)> = transaction.query_row(
@@ -1305,8 +1307,12 @@ pub(super) fn replace_commit_lww(
         if old!=digest {return Err(validation("request-id-integrity"));}
         return Ok(RevisionResult {revision});
     }
+    if let Some(change)=selection_change {super::sync_selection::apply_binding_selection(&transaction,change)?;}
     require_staging(&transaction, staging_id)?;
-    if target {super::sync_selection::validate_binding_stage_content(&transaction,staging_id)?;}
+    if target {
+        super::sync_selection::validate_binding_stage_content(&transaction,staging_id)?;
+        super::lww::validate_binding_source(&transaction,staging_id,header,received)?;
+    }
     let active=active_generation(&transaction)?;
     if target {super::lww::preserve_local_root(&transaction,&active,staging_id)?;}
     let revision=current_revision(&transaction)?+1;
@@ -1322,13 +1328,15 @@ pub(super) fn replace_commit_lww(
         transaction.execute("DELETE FROM lww_receive_rows",[])?;
         for change in received {if !super::lww::is_device(&change.key) {
             super::lww::put_unit(&transaction,&change.key,&change.stamp,&change.value,&header.request_id,None)?;
-            super::lww::witness_received(&transaction,change,header.binding_authority)?;
+            super::lww::witness_received(&transaction,change,received_authority.unwrap_or(header.binding_authority))?;
         }}
+        super::lww::seed_binding_holds(&transaction,staging_id,header)?;
     } else {
         for (key,value) in changes {
             if super::lww::parent_status(&transaction,key)?=="retired"&&!(key.components()[0]=="exists"&&matches!(value,risunest_sync_wire::unit::UnitValue::Deleted)){continue;}
             super::lww::put_unit(&transaction,key,stamp,value,&header.request_id,Some(header.binding_authority))?;
         }
+        super::lww::project_replacement_units(&transaction,&generation,header,stamp,changes)?;
     }
     if !target {for (key,_) in changes{super::lww::ensure_publishable_parents(&transaction,key,header.binding_authority)?;}}
     let changed=if target {received.iter().map(|c|c.key.clone()).collect::<Vec<_>>()}else{changes.iter().map(|(k,_)|k.clone()).collect::<Vec<_>>()};
@@ -1962,7 +1970,11 @@ fn insert_messages(
             start + offset as i64,
             message_id,
             serde_json::to_string(message)?,
-            risunest_sync_wire::hash(&canonical),
+            {
+                #[cfg(test)]
+                crate::persistent_store::hash_work::observe("native_message_insert", canonical.len());
+                risunest_sync_wire::hash(&canonical)
+            },
             canonical.len() as i64,
         ])?;
     }

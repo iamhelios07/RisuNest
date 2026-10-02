@@ -378,10 +378,9 @@ mod binding_tests {
         assert_eq!(content.ordinary_plugin_value_count.0, 0);
     }
     fn staged(store: &mut super::super::PersistentStore, inspection: &str, changes: &[super::super::lww::Change]) -> (String,String) {
-        let staging = store.replace_begin().unwrap().staging_id;
-        store.replace_put_root(&staging,&serde_json::json!({"language":"en","statics":{"messages":0}})).unwrap();
         let receive = uuid::Uuid::new_v4().to_string();
-        store.register_lww_binding_stage(inspection,&staging,&receive,changes).unwrap();
+        let header = super::super::lww::Header { binding_authority:store.lww_binding_authority().unwrap(),request_id:receive.clone() };
+        let staging = store.lww_stage_binding_units(&header,inspection,changes,risunest_sync_wire::stamp::DecimalU64(u64::MAX)).unwrap().staging_id;
         (staging,receive)
     }
     fn inspect(store: &super::super::PersistentStore, target: &SyncTarget) -> String {
@@ -593,7 +592,12 @@ impl super::PersistentStore {
         self.prepare_replace_commit(staging_id, None)?;
         for change in changes {
             change.stamp.validate().map_err(|e| invalid(&e.to_string()))?;
-            change.value.validate().map_err(|e| invalid(&e.to_string()))?;
+            {
+                let result = change.value.validate();
+                #[cfg(test)]
+                crate::persistent_store::hash_work::validation(&change.value);
+                result
+            }.map_err(|e| invalid(&e.to_string()))?;
         }
         let encoded = serde_json::to_string(changes)?;
         let existing: Option<(String,String,String)> = self.connection.query_row("SELECT inspection_id,receive_id,changes FROM lww_binding_stages WHERE staging_id=?1", [staging_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
@@ -617,6 +621,11 @@ impl super::PersistentStore {
             if current.selection_epoch != change.expected_epoch && current.selection_epoch != change.new_epoch {
                 return Err(invalid("Stale binding switch completion"));
             }
+            if current.selection_epoch == change.expected_epoch {
+                if let Some(inspection)=change.inspection_id.as_deref() {
+                    validate_binding_inspection_stages(self,inspection,request.header.binding_authority)?;
+                }
+            }
             self.lww_switch_target(&request.header,&change)?;
             return self.lww_binding_state();
         }
@@ -629,12 +638,7 @@ impl super::PersistentStore {
             let inspection = request.inspection_id.as_deref().ok_or_else(|| invalid("Missing binding inspection"))?;
             let (target,library,target_id,authority,epoch):(String,String,String,String,String) = self.connection.query_row("SELECT target,library_id,target_id,source_authority,source_epoch FROM lww_binding_inspections WHERE inspection_id=?1", [inspection], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
             if serde_json::from_str::<SyncTarget>(&target)? != request.target || authority != request.header.binding_authority.0.to_string() || epoch != request.expected_selection_epoch { return Err(invalid("Wrong target binding inspection")); }
-            let mut stages = self.connection.prepare("SELECT staging_id FROM lww_binding_stages WHERE inspection_id=?1")?;
-            for staging in stages.query_map([inspection], |r| r.get::<_,String>(0))? {
-                let staging = staging?;
-                self.prepare_replace_commit(&staging,None)?;
-                validate_binding_stage_content(&self.connection,&staging)?;
-            }
+            validate_binding_inspection_stages(self,inspection,request.header.binding_authority)?;
             (Some(library),Some(target_id))
         };
         let change = BindingSelectionChange { expected_epoch: request.expected_selection_epoch.clone(),new_epoch:uuid::Uuid::new_v4().to_string(),target:request.target.clone(),library_id,target_id,inspection_id:request.inspection_id.clone() };
@@ -652,12 +656,25 @@ impl super::PersistentStore {
         if receive != request.receive_id || epoch.as_deref() != Some(request.expected_selection_epoch.as_str()) || stage_library != request.library_id || stage_target != request.target_id { return Err(invalid("Stale or wrong-target replacement stage")); }
         if request.header.request_id != request.receive_id { return Err(invalid("Binding receive request identity changed")); }
         let library_committed:bool = self.connection.query_row("SELECT EXISTS(SELECT 1 FROM lww_requests WHERE request_id=?1)", [&request.header.request_id], |r| r.get(0))?;
+        let changes:Vec<super::lww::Change> = serde_json::from_str(&encoded)?;
         if !library_committed {
             validate_binding_stage_content(&self.connection,&request.staging_id)?;
+            super::lww::validate_binding_source(&self.connection,&request.staging_id,&request.header,&changes)?;
         }
-        let changes:Vec<super::lww::Change> = serde_json::from_str(&encoded)?;
         self.lww_replace_target(&request.header,&request.staging_id,&changes)
     }
+}
+
+fn validate_binding_inspection_stages(store: &super::PersistentStore, inspection: &str, authority: risunest_sync_wire::stamp::DecimalU64) -> StoreResult<()> {
+    let mut stages = store.connection.prepare("SELECT staging_id,receive_id,changes FROM lww_binding_stages WHERE inspection_id=?1")?;
+    for staging in stages.query_map([inspection], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))? {
+        let (staging,receive,encoded) = staging?;
+        store.prepare_replace_commit(&staging,None)?;
+        validate_binding_stage_content(&store.connection,&staging)?;
+        let source_header = super::lww::Header { binding_authority:authority,request_id:receive };
+        super::lww::validate_binding_source(&store.connection,&staging,&source_header,&serde_json::from_str::<Vec<super::lww::Change>>(&encoded)?)?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -673,13 +690,16 @@ pub(crate) fn pds_lww_replace_from_target(state: tauri::State<'_, super::command
     super::commands::with_store_mut(state, |store| store.replace_lww_binding(&request))
 }
 
-fn binding_stage_digest(db: &Connection, staging_id: &str) -> StoreResult<String> {
+pub(crate) fn binding_stage_digest(db: &Connection, staging_id: &str) -> StoreResult<String> {
     use sha2::{Digest, Sha256};
     let target = super::ReadTarget { generation: staging_id.into(), revision: current_revision(db)? };
     let value = super::query::materialize_target(db, &target)?;
     let aliases = super::query::list_asset_aliases(db, &target)?.value;
     let owners = super::query::list_asset_owner_heads(db, &target)?.value;
-    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&(value,aliases,owners))?)))
+    let bytes = serde_json::to_vec(&(value,aliases,owners))?;
+    #[cfg(test)]
+    crate::persistent_store::hash_work::observe("binding_stage_proof", bytes.len());
+    Ok(hex::encode(Sha256::digest(&bytes)))
 }
 
 pub(crate) fn validate_binding_stage_content(db: &Connection, staging_id: &str) -> StoreResult<()> {

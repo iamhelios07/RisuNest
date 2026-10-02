@@ -359,14 +359,20 @@ pub(crate) struct Cancellation(Arc<CancelState>);
 struct CancelState {
     cancelled: AtomicBool,
     notify: tokio::sync::Notify,
+    external_flag: Option<Arc<AtomicBool>>,
 }
 impl Cancellation {
+    pub(crate) fn with_external_flag(external_flag: Arc<AtomicBool>) -> Self {
+        Self(Arc::new(CancelState { external_flag: Some(external_flag), ..Default::default() }))
+    }
     pub fn cancel(&self) {
         self.0.cancelled.store(true, Ordering::Release);
         self.0.notify.notify_waiters();
     }
     pub fn check(&self) -> Result<()> {
-        if self.0.cancelled.load(Ordering::Acquire) {
+        if self.0.cancelled.load(Ordering::Acquire)
+            || self.0.external_flag.as_ref().is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
             Err(ProviderError::new(ErrorKind::Cancelled))
         } else {
             Ok(())
@@ -380,7 +386,14 @@ impl Cancellation {
             if self.check().is_err() {
                 return;
             }
-            notified.await;
+            if self.0.external_flag.is_some() {
+                tokio::select! {
+                    _ = notified => {},
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {},
+                }
+            } else {
+                notified.await;
+            }
         }
     }
 }
@@ -612,6 +625,30 @@ impl HeadBytes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_native_job_cancellation_reaches_checks_and_pending_control_requests() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let flag = Arc::new(AtomicBool::new(false));
+            let cancel = Cancellation::with_external_flag(flag.clone());
+            cancel.check().unwrap();
+            let pending = super::super::leases::control_request(
+                &cancel, std::future::pending::<Result<()>>(),
+            );
+            tokio::pin!(pending);
+            assert!(tokio::time::timeout(std::time::Duration::from_millis(1), &mut pending).await.is_err());
+            flag.store(true, Ordering::Release);
+            assert_eq!(cancel.check().unwrap_err().kind, ErrorKind::Cancelled);
+            let error = tokio::time::timeout(std::time::Duration::from_secs(1), pending)
+                .await.unwrap().unwrap_err();
+            assert_eq!(error.kind, ErrorKind::Cancelled);
+            let local = Cancellation::with_external_flag(Arc::new(AtomicBool::new(false)));
+            let clone = local.clone();
+            local.cancel();
+            assert_eq!(clone.check().unwrap_err().kind, ErrorKind::Cancelled);
+        });
+    }
 
     #[test]
     fn role_names_ignore_only_proven_foreign_members() {

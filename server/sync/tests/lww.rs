@@ -25,6 +25,191 @@ fn expire_journal(root: &std::path::Path) {
 }
 
 #[test]
+fn mixed_origin_initialization_preserves_stamps_and_binds_only_publishers() {
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::init(root.path()).unwrap();
+    let a = device(&store);
+    let b = device(&store);
+    let origin = "00000000-0000-4000-8000-000000000003";
+    let parent = unit(
+        &["exists", "character", "char"],
+        WRITER_B,
+        10,
+        UnitValue::inline(b"true").unwrap(),
+    );
+    let chat = unit(
+        &["exists", "conversation", "char", "chat"],
+        WRITER_B,
+        11,
+        UnitValue::inline(b"true").unwrap(),
+    );
+    let messages = unit(
+        &["messages", "char", "chat"],
+        WRITER_B,
+        12,
+        UnitValue::inline(b"[]").unwrap(),
+    );
+    let initial = request(
+        &store,
+        WRITER_A,
+        "forward-initial",
+        vec![
+            parent.clone(),
+            chat.clone(),
+            messages,
+            inline("other-origin", origin, 13, "existing"),
+            inline("own", WRITER_A, 14, "existing"),
+        ],
+    );
+    let receipt = store.push(&a, &initial).unwrap();
+    assert_eq!(receipt.seq.0, 5);
+    let persisted = state(&store, &a);
+    assert_eq!(persisted.len(), initial.changes.len());
+    for change in &initial.changes {
+        assert!(persisted.contains(change));
+    }
+    let db = Connection::open(root.path().join("metadata.sqlite")).unwrap();
+    let publishers: Vec<String> = db
+        .prepare("SELECT writer FROM writers ORDER BY writer")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(publishers, [WRITER_A]);
+    for (issuer, count) in [(WRITER_A, 1), (WRITER_B, 3), (origin, 1)] {
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM writer_versions WHERE writer=?1",
+                [issuer],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            count
+        );
+    }
+    let changed = unit(
+        &["messages", "char", "chat"],
+        WRITER_B,
+        20,
+        UnitValue::inline(br#"["changed"]"#).unwrap(),
+    );
+    let next = request(
+        &store,
+        WRITER_B,
+        "forward-parents",
+        vec![
+            parent.clone(),
+            chat.clone(),
+            changed.clone(),
+            initial.changes.last().unwrap().clone(),
+        ],
+    );
+    let next_receipt = store.push(&b, &next).unwrap();
+    assert_eq!(next_receipt.seq.0, 6);
+    assert_eq!(next_receipt.accepted_keys, vec![changed.key.clone()]);
+    let persisted = state(&store, &b);
+    assert!(persisted.contains(&parent));
+    assert!(persisted.contains(&chat));
+    assert!(persisted.contains(&changed));
+    assert_eq!(store.push(&a, &initial).unwrap(), receipt);
+    assert_eq!(store.push(&b, &next).unwrap(), next_receipt);
+}
+
+#[test]
+fn forwarded_issuer_collision_after_supersession_rejects_other_publishers_atomically() {
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::init(root.path()).unwrap();
+    let a = device(&store);
+    let b = device(&store);
+    let origin = "00000000-0000-4000-8000-000000000003";
+    let first = request(
+        &store,
+        WRITER_A,
+        "origin-old",
+        vec![inline("key", origin, 10, "old")],
+    );
+    let first_receipt = store.push(&a, &first).unwrap();
+    store
+        .push(
+            &a,
+            &request(
+                &store,
+                WRITER_A,
+                "origin-new",
+                vec![inline("key", origin, 20, "new")],
+            ),
+        )
+        .unwrap();
+    let bad = request(
+        &store,
+        WRITER_B,
+        "origin-bad",
+        vec![
+            inline("unrelated", WRITER_B, 21, "unrelated"),
+            inline("key", origin, 10, "altered"),
+        ],
+    );
+    assert_eq!(
+        store.push(&b, &bad).unwrap_err().code,
+        "equal-stamp-integrity"
+    );
+    assert_eq!(store.head().unwrap().seq.as_str(), "2");
+    assert_eq!(state(&store, &a).len(), 1);
+    assert!(
+        matches!(store.operation(&b, "origin-bad").unwrap(), OperationReceipt::Rejected { body_digest, error, .. } if body_digest == bad.digest().unwrap() && error == "equal-stamp-integrity")
+    );
+    let db = Connection::open(root.path().join("metadata.sqlite")).unwrap();
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM writers", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM writer_versions WHERE writer=?1",
+            [origin],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        2
+    );
+    let identical = request(&store, WRITER_B, "origin-identical", first.changes.clone());
+    assert!(store.push(&b, &identical).unwrap().accepted_keys.is_empty());
+    let different_issuer = request(
+        &store,
+        WRITER_B,
+        "issuer-independent",
+        vec![inline("key", WRITER_B, 10, "different issuer")],
+    );
+    assert!(store
+        .push(&b, &different_issuer)
+        .unwrap()
+        .accepted_keys
+        .is_empty());
+    assert_eq!(store.push(&a, &first).unwrap(), first_receipt);
+    drop(store);
+    let reopened = Store::open(root.path()).unwrap();
+    assert_eq!(
+        reopened.push(&b, &bad).unwrap_err().code,
+        "equal-stamp-integrity"
+    );
+    let mut fresh_bad = bad.clone();
+    fresh_bad.operation_id = "origin-bad-reopened".into();
+    assert_eq!(
+        reopened.push(&b, &fresh_bad).unwrap_err().code,
+        "equal-stamp-integrity"
+    );
+    let mut altered = bad;
+    altered.changes[1].value = first.changes[0].value.clone();
+    assert_eq!(
+        reopened.push(&b, &altered).unwrap_err().code,
+        "operation-integrity"
+    );
+    assert_eq!(reopened.head().unwrap().seq.as_str(), "2");
+}
+
+#[test]
 fn independent_units_converge_in_both_orders() {
     let mut results = Vec::new();
     for reverse in [false, true] {

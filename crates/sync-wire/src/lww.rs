@@ -9,6 +9,41 @@ use std::collections::BTreeSet;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NewDeviceClaimRequest {
+    pub writer_id: String,
+    pub authorization_id: String,
+    pub former_token: Option<String>,
+}
+impl NewDeviceClaimRequest {
+    pub fn validate(&self) -> Result<()> {
+        validate_writer_id(&self.writer_id)?;
+        validate_id(&self.authorization_id)?;
+        if self.former_token.as_ref().is_some_and(|token| {
+            token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }) {
+            return Err(WireError("invalid-former-token"));
+        }
+        Ok(())
+    }
+    pub fn digest(&self) -> Result<String> {
+        Ok(hash(&canonical::encode(self)?))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NewDeviceClaimReceipt {
+    pub authorization_id: String,
+    pub writer_id: String,
+    pub device_id: String,
+    pub library_id: String,
+    pub epoch: String,
+    /// A supplied former token cannot authenticate this library after the claim.
+    pub former_credential_inactive: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UnitChange {
     pub key: UnitKey,
     pub stamp: Stamp,
@@ -25,6 +60,7 @@ impl UnitChange {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PushRequest {
     pub library_id: String,
+    /// Authenticated publisher identity; unit stamps retain their original issuers.
     pub writer_id: String,
     pub operation_id: String,
     pub changes: Vec<UnitChange>,
@@ -40,9 +76,6 @@ impl PushRequest {
         let mut keys = BTreeSet::new();
         for change in &self.changes {
             change.validate()?;
-            if change.stamp.writer_id != self.writer_id {
-                return Err(WireError("writer-mismatch"));
-            }
             if !keys.insert(change.key.as_str()) {
                 return Err(WireError("duplicate-unit-key"));
             }

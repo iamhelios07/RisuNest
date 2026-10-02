@@ -1154,6 +1154,54 @@ fn apply_hypa(tx: &Connection, key: &str, next: Option<Value>) -> StoreResult<()
     tx.execute("INSERT INTO hypa_embeddings VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'0','',NULL,NULL,NULL) ON CONFLICT(cache_key) DO UPDATE SET producer=excluded.producer,model=excluded.model,endpoint=excluded.endpoint,preprocess_version=excluded.preprocess_version,dimensions=excluded.dimensions,vector=excluded.vector,metadata=excluded.metadata,tombstone=excluded.tombstone",params![key,v.get("producer").and_then(Value::as_str).unwrap_or_default(),v.get("model").and_then(Value::as_str).unwrap_or_default(),v.get("endpoint").and_then(Value::as_str),v.get("preprocessVersion").and_then(Value::as_i64).unwrap_or(0),v.get("dimensions").and_then(Value::as_i64).unwrap_or(1),vector,v.get("metadata").and_then(Value::as_str),i64::from(v.as_object().is_none_or(Map::is_empty))])?;
     Ok(())
 }
+
+pub(in crate::persistent_store) fn device_replacement_changes(
+    tx: &Transaction<'_>,
+    replacement: &device_store::sections::FrozenBackupSections,
+) -> StoreResult<Vec<(UnitKey, UnitValue)>> {
+    use device_store::sections::{FrozenBackupSections, SectionValueRow};
+    use base64::Engine;
+    fn units(rows: &FrozenBackupSections) -> StoreResult<BTreeMap<UnitKey, UnitValue>> {
+        let mut values = BTreeMap::new();
+        for row in &rows.hypa {
+            let value = match &row.value {
+                SectionValueRow::Hypa { producer, model, endpoint, preprocess_version, dimensions, vector, metadata } => inline(
+                    &json!({"producer":producer,"model":model,"endpoint":endpoint,"preprocessVersion":preprocess_version,"dimensions":dimensions,
+                        "vector":base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vector),"metadata":metadata}),
+                )?,
+                SectionValueRow::Tombstone { .. } => UnitValue::Deleted,
+                _ => return Err(error("replacement-hypa-row-invalid")),
+            };
+            values.insert(unit_key(&["hypa", &row.key1])?, value);
+        }
+        for row in &rows.local_plugins {
+            let value = match &row.value {
+                SectionValueRow::Plugin { value, .. } => inline(&json!(value))?,
+                SectionValueRow::Tombstone { .. } => UnitValue::Deleted,
+                _ => return Err(error("replacement-plugin-row-invalid")),
+            };
+            values.insert(unit_key(&["plugin-local", &row.key1, &row.key2, &row.key3])?, value);
+        }
+        Ok(values)
+    }
+    let before = units(&device_store::sections::capture_replacement_device_rows(tx)?)?;
+    let after = units(replacement)?;
+    let mut keys: BTreeSet<_> = before.keys().chain(after.keys()).cloned().collect();
+    let mut statement = tx.prepare("SELECT key FROM lww_units WHERE json_extract(key,'$[0]') IN ('hypa','plugin-local')")?;
+    let stored = statement.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+    for key in stored { keys.insert(wire(key.try_into())?); }
+    let mut changes = vec![];
+    for key in keys {
+        let value = after.get(&key).cloned().unwrap_or(UnitValue::Deleted);
+        let prior = read_unit(tx, &key)?.map(|(_, value)| value)
+            .or_else(|| before.get(&key).cloned()).unwrap_or(UnitValue::Deleted);
+        #[cfg(test)]
+        count_work();
+        if prior != value { changes.push((key, value)); }
+    }
+    Ok(changes)
+}
+
 pub(in crate::persistent_store) fn capture_device_changes(
     tx: &Transaction<'_>,
     stamp: &Stamp,
@@ -1202,7 +1250,8 @@ pub(in crate::persistent_store) fn capture_device_changes(
             };
             (unit_key(&["plugin-local", &k1, &k2, &k3])?, value)
         };
-        count_work(&value);
+        #[cfg(test)]
+        count_work();
         if read_unit(tx, &key)?.is_some_and(|(_, old)| old == value) {
             continue;
         }
@@ -1437,7 +1486,12 @@ fn effective_edit(
     let Some(body) = body else {
         return Ok(None);
     };
-    let old = risunest_external_storage_format::message_pages::MessageManifest::decode(&body)
+    let old = {
+        let result = risunest_external_storage_format::message_pages::MessageManifest::decode(&body);
+        #[cfg(test)]
+        crate::persistent_store::hash_work::decoded("native_manifest_decode_identity", &body, &result);
+        result
+    }
         .map_err(error)?
         .message_count
         .0;
@@ -1506,7 +1560,12 @@ pub(in crate::persistent_store) fn archive_value(
     archived.object_hash = archived.shared_object_hash.clone();
     archived.asset_hashes = archived.shared_asset_hashes.clone();
     let body = payload_value::encode(&serde_json::to_value(&archived)?).map_err(error)?;
-    let hash = risunest_sync_wire::hash(&body);
+    let hash = {
+        let hash_input = &body;
+        #[cfg(test)]
+        crate::persistent_store::hash_work::observe("native_archive", hash_input.len());
+        risunest_sync_wire::hash(hash_input)
+    };
     super::super::message_pages::put_object(db, &hash, &body)?;
     let mut descriptor = RecordDescriptor::content(hash);
     let mut dependencies = archived
@@ -1518,13 +1577,23 @@ pub(in crate::persistent_store) fn archive_value(
     if inline_references(&dependencies).map_err(error)? {
         descriptor.dependencies = dependencies;
     } else {
-        let (root, objects) = build_reference_tree(&dependencies, false).map_err(error)?;
+        let (root, objects) = {
+            let result = build_reference_tree(&dependencies, false);
+            #[cfg(test)]
+            crate::persistent_store::hash_work::reference_creation(&result);
+            result
+        }.map_err(error)?;
         descriptor.dependency_root = root;
         for (hash, body) in objects {
             super::super::message_pages::put_object(db, &hash, &body)?;
         }
     }
-    UnitValue::object(descriptor).map_err(error)
+    {
+        let result = UnitValue::object(descriptor);
+        #[cfg(test)]
+        crate::persistent_store::hash_work::descriptor_creation(&result);
+        result
+    }.map_err(error)
 }
 pub(in crate::persistent_store) fn archive_metadata(
     db: &Connection,
@@ -1611,4 +1680,26 @@ pub(in crate::persistent_store) fn shared_archive_conversation(mut value: Value)
         object.retain(|key, _| CONVERSATION_FIELDS.contains(&key.as_str()) || key == "id");
     }
     value
+}
+
+
+#[cfg(test)]
+mod hash_work_tests {
+    use super::*;
+    use crate::persistent_store::hash_work::{reset_hash_work, take_hash_work, DomainWork};
+    #[test]
+    fn effective_message_range_counts_only_executed_manifest_decode() {
+        use risunest_external_storage_format::message_pages::{MessageManifest, MANIFEST_SCHEMA};
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE message_page_manifests(generation TEXT,character_id TEXT,conversation_id TEXT,body BLOB)").unwrap();
+        let manifest = MessageManifest { schema: MANIFEST_SCHEMA.into(), message_count: 0.into(), pages: vec![] }.encode().unwrap();
+        db.execute("INSERT INTO message_page_manifests VALUES('g','c','chat',?1)", [&manifest.bytes]).unwrap();
+        reset_hash_work();
+        effective_edit(&db, "g", "c", "chat", 0, 0, 1, true).unwrap();
+        assert!(take_hash_work().domains.is_empty());
+        effective_edit(&db, "g", "c", "chat", 0, 0, 1, false).unwrap();
+        let work = take_hash_work();
+        assert_eq!(work.domains["native_manifest_decode_identity"], DomainWork { calls: 1, bytes: manifest.bytes.len() as u64 });
+        assert!(work.incomplete.is_empty());
+    }
 }

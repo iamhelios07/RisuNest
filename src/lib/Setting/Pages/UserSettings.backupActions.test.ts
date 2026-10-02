@@ -94,11 +94,11 @@ describe('rendered backup actions', () => {
         await click(language.portableBackup.restore)
         expect(m.normal).toHaveBeenCalledWith(`${language.risuNest.backup.localBackupRestored} ${language.risuSaveCleanupWarning}`)
     })
-    it.each([false, true])('runs web import only after acknowledgement (%s confirmed)', async (confirmed) => {
-        m.confirm.mockResolvedValue(confirmed)
+    it('lets the WebView importer preflight and acknowledge the selected backup', async () => {
         await render(false)
         await click(language.loadBackupLocal)
-        expect(m.webImport).toHaveBeenCalledTimes(confirmed ? 1 : 0)
+        expect(m.webImport).toHaveBeenCalledOnce()
+        expect(m.confirm).not.toHaveBeenCalled()
         expect(m.restore).not.toHaveBeenCalled()
         expect(m.normal).not.toHaveBeenCalled()
     })

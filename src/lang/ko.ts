@@ -236,8 +236,8 @@ export const languageKorean = {
         "requestLogRemoved": "요청 로그가 삭제되었습니다.",
         "requestLogRemovedDesc": "요청 로그는 앱이 재시작되거나 새로고침되면 삭제됩니다.",
         "vertexAuthError": "Vertex AI 인증 정보가 누락되었습니다.",
-        "coldStorageIncompleteRestoreConfirm": (characterNames: string, unavailableCount: number, unresolvedCount: number) =>
-            `${characterNames || "알 수 없는 캐릭터"}의 콜드 스토리지 데이터를 복원하지 못했습니다.${unresolvedCount > 0 ? ` 캐릭터를 확인할 수 없는 항목이 ${unresolvedCount}개 있습니다.` : ""}\n\n계속하면 콜드 스토리지 항목 ${unavailableCount}개를 사용할 수 없으며, 해당 캐릭터 또는 채팅 데이터가 영구적으로 손실될 수 있습니다.\n\n그래도 불완전한 복원을 계속하시겠습니까?`
+        "coldStorageIncompleteRestoreConfirm": (characterNames: string, unavailableCount: number, unresolvedCount: number, includeQuestion = true) =>
+            `${characterNames || "알 수 없는 캐릭터"}의 콜드 스토리지 데이터를 복원하지 못했습니다.${unresolvedCount > 0 ? ` 캐릭터를 확인할 수 없는 항목이 ${unresolvedCount}개 있습니다.` : ""}\n\n계속하면 콜드 스토리지 항목 ${unavailableCount}개를 사용할 수 없으며, 해당 캐릭터 또는 채팅 데이터가 영구적으로 손실될 수 있습니다.${includeQuestion ? "\n\n그래도 불완전한 복원을 계속하시겠습니까?" : ""}`
     },
     "showHelp": "도움말 보기",
     "help": {
@@ -2642,6 +2642,7 @@ export const languageKorean = {
             reasonUnknown: '알 수 없는 오류가 발생했습니다.',
             warningCleanupFailed:
                 '임시 파일을 정리하지 못했습니다. 다음 시작 때 다시 시도합니다.',
+            warningUpstreamRestoreLosses: '콜드 스토리지 또는 인레이 데이터 일부를 복원하지 못했습니다. 복원된 데이터를 확인해주세요.',
             warningPocketInlayFailed:
                 '일부 PocketRisu 첨부를 가져오지 못했습니다.',
             warningUnknown: '작업은 완료되었지만 경고가 있습니다. 상세 내용을 확인해주세요.',
@@ -2911,6 +2912,7 @@ export const languageKorean = {
         cancelAction: "취소",
         clockBlocked: "기기와 원격 간의 시간 차이가 있어 동기화가 중단되었습니다. 시간을 보정한 후 다시 시도해주세요.",
         writerCollision: "중복된 기기로 인해 동기화가 중단되었습니다. 새 기기로 다시 연결해주세요.",
+        newDeviceAction: "새 기기로 연결",
         restoreTitle: "백업을 복원하시겠습니까?",
         restoreDescriptionBound: "현재 데이터를 초기화한 후 선택한 백업으로 복원하며, 복원한 내용은 원격으로 동기화됩니다. 백업이 필요한 경우 수동으로 백업해주세요.",
         restoreDescription: "현재 데이터를 초기화한 후 선택한 백업으로 복원합니다. 백업이 필요한 경우 수동으로 백업해주세요.",

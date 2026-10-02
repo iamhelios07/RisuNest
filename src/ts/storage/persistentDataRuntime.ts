@@ -1,4 +1,5 @@
 import { canonicalJson, canonicalClone } from './saveCoordinatorHelpers'
+import {claimCommittedWorkingSetRecovery, continueCommittedWorkingSetRefresh, hasRetryableCommittedWorkingSetContinuation, rebaseCommittedWorkingSetContinuation, registerCommittedWorkingSetContinuation} from './committedWorkingSetContinuation'
 import { diffRootMutations } from './rootMutation'
 import { generatingConversations } from './generatingConversationRegistry'
 import { captureLwwWorkingSetBaseline, applyLwwWorkingSetUnits } from './lwwWorkingSetApply'
@@ -364,9 +365,15 @@ export interface PersistentActivatedLibraryGuard {
     abortUnchanged(): Promise<void>
 }
 
+export interface ActivatedLibraryRecoveryLifecycle {
+    beforeRefresh(): Promise<number | void>
+    afterRefresh(): Promise<void>
+}
+
 export interface PersistentDataRuntime {
     withPausedPersistentWrites<T>(reason: string, operation: (token: PersistentMutationToken) => Promise<T>): Promise<T>
     beginActivatedLibraryGuard(token: PersistentMutationToken): PersistentActivatedLibraryGuard
+    setActivatedLibraryRecoveryLifecycle(token: PersistentMutationToken, lifecycle: ActivatedLibraryRecoveryLifecycle): void
     refreshActivatedLibraryUnderPause(token: PersistentMutationToken): Promise<CommittedApplyOutcome>
     applyLwwReceive(request: LwwStageReceive): Promise<LwwApplyResult>
     drainLwwDeferred(request: LwwReceiveHeader): Promise<LwwApplyResult>
@@ -567,7 +574,8 @@ export function createPersistentDataRuntime(
     dependencies: PersistentDataRuntimeDependencies,
 ): PersistentDataRuntime {
     let workingSet: ActiveWorkingSet
-    let activatedLibraryGuard: { owner: symbol; ready: boolean } | null = null
+    let activatedLibraryGuard: { owner: symbol; ready: boolean; lifecycle?: ActivatedLibraryRecoveryLifecycle } | null = null
+    let committedWorkingSetRecovery: Promise<CommittedApplyOutcome | null> | null = null
     let pendingRefreshChangeSet: ReplacementChangeSet | null = null
     const captureChanges = (changes: Partial<ReplacementChangeSet>): ReplacementChangeSet => ({
         root: changes.root ?? false,
@@ -887,6 +895,7 @@ export function createPersistentDataRuntime(
             deferredContentPending = projected.deferred
             if (!projected.deferred) await commitContentCursor(revision, activatedLibraryGuard !== null)
             if (activatedLibraryGuard) {
+                await activatedLibraryGuard.lifecycle?.afterRefresh()
                 coordinator.finishActivatedLibraryGuard(activatedLibraryGuard.owner)
                 activatedLibraryGuard = null
             }
@@ -915,11 +924,14 @@ export function createPersistentDataRuntime(
                     }
                     try {
                         coordinator.assertDestructiveReplacementFence(owner)
+                        const reconciledRevision = await activatedLibraryGuard?.lifecycle?.beforeRefresh()
+                        coordinator.assertDestructiveReplacementFence(owner)
                         const latest = await dependencies.store.readRoot()
                         coordinator.assertDestructiveReplacementFence(owner)
                         const minimum = Math.max(
                             minimumRevision,
                             coordinator.pendingWorkingSetRefreshRevision ?? minimumRevision,
+                            typeof reconciledRevision === 'number' ? reconciledRevision : minimumRevision,
                         )
                         if (latest.revision < minimum) {
                             throw new RevisionConflictError(minimum, latest.revision)
@@ -1021,9 +1033,15 @@ export function createPersistentDataRuntime(
         await projectAppliedUnits(result, baseline)
         return result
     })
-    return {
+    const runtime: PersistentDataRuntime = {
         store: dependencies.store,
         withPausedPersistentWrites: (reason, operation) => coordinator.withPausedPersistentWrites(reason, operation),
+        setActivatedLibraryRecoveryLifecycle(token, lifecycle) {
+            const guard = activatedLibraryGuard
+            if (!guard || guard.lifecycle) throw new PersistentMutationFencedError()
+            coordinator.assertActivatedLibraryGuard(guard.owner, token)
+            guard.lifecycle = lifecycle
+        },
         beginActivatedLibraryGuard(token) {
             const owner = coordinator.beginActivatedLibraryGuard(token)
             const guard = {owner, ready: false}
@@ -1122,18 +1140,45 @@ export function createPersistentDataRuntime(
                 fence.release()
             }
         },
-        async retryCommittedWorkingSetRefresh() {
-            const revision = coordinator.pendingWorkingSetRefreshRevision
-            if (revision === null) return null
-            const changes = pendingRefreshChangeSet
-            const fence = await acquireCommittedWorkingSetRefreshFence()
-            try {
-                return await fence.refreshCommittedWorkingSet(revision, {
-                    changeSet: changes ?? undefined,
-                })
-            } finally {
-                fence.release()
-            }
+        retryCommittedWorkingSetRefresh() {
+            if (committedWorkingSetRecovery) return committedWorkingSetRecovery
+            const recovering = (async () => {
+                const revision = coordinator.pendingWorkingSetRefreshRevision
+                if (revision === null) return null
+                const changes = pendingRefreshChangeSet
+                const epoch = coordinator.storageAuthorityEpoch
+                const guardedRecovery = activatedLibraryGuard !== null || hasRetryableCommittedWorkingSetContinuation(runtime, epoch)
+                let adoptedEpoch = epoch
+                let ownsRefreshFence = false
+                const releaseRecovery = claimCommittedWorkingSetRecovery(runtime, epoch,
+                    activatedLibraryGuard?.owner ?? Symbol('critical-working-set-recovery'),
+                    () => ownsRefreshFence || coordinator.storageAuthorityEpoch === adoptedEpoch)
+                try {
+                    const fence = await acquireCommittedWorkingSetRefreshFence()
+                    ownsRefreshFence = true
+                    let outcome: CommittedApplyOutcome
+                    try {
+                        outcome = await fence.refreshCommittedWorkingSet(revision, {changeSet: changes ?? undefined})
+                    } finally {
+                        adoptedEpoch = coordinator.storageAuthorityEpoch
+                        ownsRefreshFence = false
+                        fence.release()
+                    }
+                    if (guardedRecovery) rebaseCommittedWorkingSetContinuation(runtime, epoch, adoptedEpoch)
+                    if (guardedRecovery && outcome.projection === 'applied') {
+                        try { await continueCommittedWorkingSetRefresh(outcome.revision, runtime, adoptedEpoch) }
+                        catch (error) {
+                            if (coordinator.storageAuthorityEpoch !== adoptedEpoch) throw error
+                            return requireCommittedRefresh(outcome.revision, error)
+                        }
+                    }
+                    return outcome
+                } finally { releaseRecovery() }
+            })()
+            committedWorkingSetRecovery = recovering
+            const clearRecovery = () => { if (committedWorkingSetRecovery === recovering) committedWorkingSetRecovery = null }
+            void recovering.then(clearRecovery, clearRecovery)
+            return recovering
         },
         runStorageOnlyMutation: (operation) =>
             coordinator.runStorageOnlyMutation(operation),
@@ -1195,7 +1240,7 @@ export function createPersistentDataRuntime(
         getNavigationGeneration: () => workingSet.navigationGenerationToken,
         fenceNavigation: () => workingSet.fenceNavigation(),
         invalidateNavigation: () => workingSet.invalidateNavigation(),
-        replacePersistentDatabase: (database, reason, options) => {
+        replacePersistentDatabase: async (database, reason, options) => {
             if (
                 !options?.authoritative &&
                 hasIncompletePersistentWorkingSet(database, workingSetResidency)
@@ -1205,6 +1250,76 @@ export function createPersistentDataRuntime(
                         'Cannot replace persistent data from an incomplete persistent working set',
                     ),
                 )
+            }
+            if (isTauri && options?.upstreamImport) {
+                const {prepareUpstreamImport} = await import('./importedIdentity')
+                const candidate = await dependencies.prepareDatabase(prepareUpstreamImport(database))
+                const {prepareBoundLibraryReplacement} = await import('./sync/bindingRegistry')
+                const binding = await prepareBoundLibraryReplacement()
+                const {acquireUpstreamImportPause, confirmUpstreamLibraryReplacement} = await import('./upstreamReplacement')
+                if (!(await confirmUpstreamLibraryReplacement(binding.bound, options.upstreamImportWarnings))) throw new Error('Import cancelled')
+                const plugins = await import('../plugins/apiV3/v3.svelte')
+                let pause: Awaited<ReturnType<typeof acquireUpstreamImportPause>>
+                try {
+                    await binding.fence()
+                    await plugins.fencePluginExecutionForAuthorityReplacement()
+                    pause = await acquireUpstreamImportPause(runtime, reason)
+                } catch (error) {
+                    try {
+                        await binding.assertAuthority()
+                        await plugins.restartPluginsAfterAuthorityReplacement()
+                        await binding.resume()
+                    } catch {}
+                    throw error
+                }
+                let committed = false
+                let acceptedRevision = pause.fence.revision
+                const restartPlugins = async () => {
+                    await plugins.invalidatePluginCachesAfterAuthorityReplacement()
+                    await plugins.restartPluginsAfterAuthorityReplacement()
+                    options.onPluginsRestarted?.()
+                }
+                runtime.setActivatedLibraryRecoveryLifecycle(pause.token, {
+                    beforeRefresh: () => binding.assertAuthority(),
+                    afterRefresh: restartPlugins,
+                })
+                try {
+                    if ((options.expectedRevision !== undefined && options.expectedRevision !== pause.fence.revision) ||
+                        (options.expectedMutationGeneration !== undefined && options.expectedMutationGeneration !== pause.token.mutationGeneration)) {
+                        throw new PersistentMutationFencedError()
+                    }
+                    await binding?.assertAuthority()
+                    const result = await dependencies.store.replaceFromDatabase(candidate, pause.fence.revision, [], options.pluginStorageValues,
+                        binding.bound ? {bindingAuthority:binding.state.targetAuthority,requestId:crypto.randomUUID()} : undefined)
+                    committed = true
+                    acceptedRevision = result.revision
+                    const outcome = await pause.fence.refreshCommittedWorkingSet(result.revision)
+                    await restartPlugins()
+                    pause.complete()
+                    await pause.finish()
+                    await coordinator.finishUpstreamReplacementPublication(outcome.revision, options.publishOfficial)
+                    await binding?.resume()
+                    return outcome
+                } catch (error) {
+                    let abortedUnchanged = false
+                    if (!committed) {
+                        try {
+                            await pause.abortUnchanged(async () => { await binding.assertAuthority() })
+                            abortedUnchanged = true
+                            await plugins.restartPluginsAfterAuthorityReplacement()
+                            await binding.resume()
+                        } catch { await pause.finish() }
+                    } else await pause.finish()
+                    if (!abortedUnchanged) {
+                        coordinator.markCommittedWorkingSetRefreshRequired(acceptedRevision, error)
+                        registerCommittedWorkingSetContinuation(acceptedRevision, runtime, runtime.getStorageAuthorityEpoch(), async () => {
+                            await binding.assertAuthority()
+                            await coordinator.finishUpstreamReplacementPublication(coordinator.revision, options.publishOfficial)
+                            await binding.resume()
+                        }, undefined, true)
+                    }
+                    throw error
+                }
             }
             return coordinator.replacePreparedPersistentDatabase(
                 () => dependencies.prepareDatabase(database),
@@ -1402,4 +1517,5 @@ export function createPersistentDataRuntime(
         hasPendingOfficialPublication: () =>
             coordinator.hasPendingOfficialPublication,
     }
+    return runtime
 }
