@@ -482,6 +482,10 @@ impl PersistentStore {
         }
         Ok(Some(body))
     }
+
+    pub(crate) fn lww_verified_object_present(&self, hash: &str) -> StoreResult<bool> {
+        super::message_pages::verified_object_present(&self.connection, hash)
+    }
     pub(crate) fn lww_put_object(&self, hash: &str, body: &[u8]) -> StoreResult<()> {
         super::message_pages::put_object(&self.connection, hash, body)
     }
