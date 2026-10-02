@@ -126,7 +126,7 @@ impl FakeProvider {
     pub(crate) fn arm_read_barrier(&self,object_id:&str)->Result<Arc<FakeReadBarrier>> {
         let mut state=self.state.lock().unwrap();
         if state.read_barrier.is_some() || !state.objects.contains_key(object_id) {
-            return Err(ProviderError::new(ErrorKind::Conflict));
+            return Err(ProviderError::new(ErrorKind::PreconditionFailed));
         }
         let barrier=Arc::new(FakeReadBarrier {object_id:object_id.into(),reached:Default::default(),release:Default::default(),
             was_reached:false.into(),was_released:false.into()});

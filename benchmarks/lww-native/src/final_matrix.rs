@@ -673,7 +673,7 @@ async fn costly_external(output:&Path,fixture:&mut CycleFixture,hashes:&[String]
             let context=leases::LeaseContext {root:&compactor.connection_root,connection_id:&compactor.connection_id,writer_id:&writer,
                 descriptor:&compactor.descriptor,root_key:&compactor.root_key,provider:compactor.provider.as_ref(),repository:&compactor.repository,
                 clock:leases::system_clock(),protection_supported:compactor.capabilities.lease_operations,ledger:Some(ledger.clone())};
-            let owner=match leases::admit(&context,&job_id,risunest_external_storage_format::control::LeaseKind::Work,&Cancellation::default())
+            let owner=match leases::admit(&context,&job_id,crate::external_storage::contract::LeaseKind::Work,&Cancellation::default())
                 .await.map_err(|e|format!("{e:?}"))? {leases::Admission::Admitted(owner)=>owner,_=>return Err("actual compaction protection not admitted".into())};
             final_compaction_overlap_costly_slot(&slot,compactor,fixture.provider.clone(),setup.path().join(&label),job_id,writer,owner,ledger,
                 &mut fixture.a,&mut fixture.b,&mut fixture.sender,&mut fixture.receiver,hashes).await
