@@ -368,11 +368,15 @@ fn server_held_publication_keeps_captured_source_and_rejects_changed_authority()
                 reached_callback.store(true, std::sync::atomic::Ordering::SeqCst);
             }));
             f.sender.provider = held.clone();
+            crate::server_sync::hash_metrics::reset_hash_metrics();
+            super::worker_observation::begin();
             let result = run(f.sender.publish(&mut f.a, 0.into(), &[], &Cancellation::default()));
+            let workers = super::worker_observation::take();
+            let server_hashes = crate::server_sync::hash_metrics::take_hash_metrics();
             assert!(reached.load(std::sync::atomic::Ordering::SeqCst));
             let segments = f.provider.uploaded_ids().iter().filter(|id| parse_segment_object_id(id).is_ok()).count();
             if stale {
-                assert_eq!(result.unwrap_err().kind, ErrorKind::PreconditionFailed);
+                assert_eq!(result.err().expect("changed authority must reject publication").kind, ErrorKind::PreconditionFailed);
                 assert_eq!(segments, 0); assert!(held.attempts.lock().unwrap().is_empty());
                 let writer = f.a.lww_clock_state().unwrap().writer_id;
                 let pending = f.a.external_lww_pending(&f.sender.target_scope(), &writer).unwrap().unwrap().0;
@@ -380,6 +384,10 @@ fn server_held_publication_keeps_captured_source_and_rejects_changed_authority()
                 assert!(!pending.sealed && !pending.dispatched && pending.bodies.iter().all(|body| body.bytes.is_empty()));
                 assert_eq!(f.a.external_lww_next_sequence(&f.sender.target_scope(), &writer).unwrap(), 1);
             } else {
+                assert!(!workers.is_empty());
+                assert!(workers.iter().all(|worker| worker.completed && worker.hashes.incomplete.is_empty()));
+                assert!(!server_hashes.incomplete);
+                assert!(server_hashes.domains["c_cache_stream_verify"].bytes >= body.len() as u64);
                 assert_eq!(result.unwrap().segments.0, 1); assert_eq!(segments, 1);
                 assert!(f.a.lww_read_outbox(0.into(), 100).unwrap().entries.is_empty());
                 assert!(!f.a.external_lww_object_is_local(&hash).unwrap());
