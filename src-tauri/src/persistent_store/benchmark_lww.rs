@@ -443,6 +443,29 @@ pub(crate) fn collect_final_local(a:&mut PersistentStore,b:&mut PersistentStore,
 }
 
 /// Counters end before journal diagnostics and full message verification.
+fn verify_post_scope<T>(observation:&NativeObservation,verify:impl FnOnce()->Result<T,String>)
+    ->Result<T,final_runner::CycleFailure> {
+    let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(verify));
+    let reason=match result {
+        Ok(Ok(value))=>return Ok(value),
+        Ok(Err(reason))=>reason,
+        Err(_)=>"post-scope correctness assertion failed".into(),
+    };
+    Err(final_runner::CycleFailure {reason,observation:Some(Box::new(observation.clone()))})
+}
+
+#[test]
+fn final_post_scope_errors_and_assertions_preserve_actual_observation() {
+    let observation=NativeObservation {units_visited:37,requests:11,..Default::default()};
+    let sql_error=verify_post_scope::<()>(&observation,||Err("journal diagnostic failed".into())).unwrap_err();
+    assert_eq!(sql_error.reason,"journal diagnostic failed");
+    assert_eq!(sql_error.observation.unwrap().units_visited,37);
+    let assertion=verify_post_scope::<()>(&observation,|| {assert_eq!(1,2,"full message mismatch");Ok(())}).unwrap_err();
+    assert_eq!(assertion.reason,"post-scope correctness assertion failed");
+    assert_eq!(assertion.observation.unwrap().requests,11);
+    assert_eq!(verify_post_scope(&observation,||Ok(19)).unwrap(),19);
+}
+
 fn final_server_cycle(source:&mut PersistentStore,destination:&mut PersistentStore,sender:&LwwClient,receiver:&LwwClient,
     asset_hashes:&[String],scenario:measurement::Scenario,direction:final_runner::Direction,iteration:u32,warmup:bool)
     ->Result<final_runner::RoutineSample,final_runner::CycleFailure> {
@@ -470,6 +493,7 @@ fn final_server_cycle(source:&mut PersistentStore,destination:&mut PersistentSto
         observation.requests+=requests;observation.uploaded_bytes+=sent;observation.downloaded_bytes+=received;}
     let (durable_save_ms,publication_complete_ms,receiver_durable_ack_ms,receipt,completion)=result
         .map_err(|reason|final_runner::CycleFailure {reason,observation:Some(Box::new(observation.clone()))})?;
+    verify_post_scope(&observation.clone(),|| {
     if completion.received_units==0 {return Err("fixed final change had no receive units".into());}
     let (body,intent):(Vec<u8>,String)=sender.log.0.query_row("SELECT body,intent FROM publications WHERE id=?1",
         [&receipt.operation_id],|row|Ok((row.get(0)?,row.get(1)?))).map_err(|e|e.to_string())?;
@@ -485,6 +509,7 @@ fn final_server_cycle(source:&mut PersistentStore,destination:&mut PersistentSto
         accepted_winner_keys:Some(key_set(receipt.accepted_keys)),affected_keys:key_set(completion.result.affected_keys),
         dispatch_keys:None,failed_operations:0,pending_operations:0,observation,
         timings:final_runner::NativeTimings {durable_save_ms,publication_complete_ms,receiver_durable_ack_ms}})
+    })
 }
 
 async fn final_external_cycle(source:&mut PersistentStore,destination:&mut PersistentStore,
@@ -515,6 +540,7 @@ async fn final_external_cycle(source:&mut PersistentStore,destination:&mut Persi
     observation.shared_head_reads=Some((provider.read_attempts("head")-heads_before) as u64);
     let (durable_save_ms,publication_complete_ms,receiver_durable_ack_ms)=result
         .map_err(|reason|final_runner::CycleFailure {reason,observation:Some(Box::new(observation.clone()))})?;
+    verify_post_scope(&observation.clone(),|| {
     verify_additional_change(destination,&prepared);
     verify_settled(source,sender);verify_settled(destination,receiver);
     Ok(final_runner::RoutineSample {scenario,direction,iteration,warmup,
@@ -522,6 +548,7 @@ async fn final_external_cycle(source:&mut PersistentStore,destination:&mut Persi
         affected_keys:key_set(keys.affected_keys),dispatch_keys:Some(key_set(keys.attempted_keys)),
         failed_operations:keys.failed_operations as u64,pending_operations:keys.pending_operations as u64,observation,
         timings:final_runner::NativeTimings {durable_save_ms,publication_complete_ms,receiver_durable_ack_ms}})
+    })
 }
 
 fn verify_bootstrap(a:&PersistentStore, b:&PersistentStore) {
@@ -787,10 +814,12 @@ fn final_server_resume_endpoint(source:&mut PersistentStore,sender:&LwwClient,de
     observation.uploaded_bytes=sent;observation.downloaded_bytes=received;
     let (destination,receiver,reopened_ms,receiver_durable_ack_ms,completion)=result
         .map_err(|reason|final_runner::CycleFailure {reason,observation:Some(Box::new(observation.clone()))})?;
+    verify_post_scope(&observation.clone(),|| {
     if destination.lww_clock_state().map_err(|e|e.to_string())?.writer_id!=writer {return Err("resume changed native writer".into());}
     verify(&destination,SmallChange::Setting,&expected);
     Ok((destination,receiver,final_runner::NativeResumeSample {direction,iteration,warmup,reopened_ms,receiver_durable_ack_ms,
         missed_published_keys,affected_keys:key_set(completion.result.affected_keys),observation}))
+    })
 }
 
 fn paired_diagnostics(a:&NativeSample,b:&NativeSample) -> Value {

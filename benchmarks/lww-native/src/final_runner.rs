@@ -51,6 +51,11 @@ impl RoutineSample {
             .into_iter().chain(self.accepted_winner_keys.iter()).chain(self.dispatch_keys.iter()) {
             if keys.windows(2).any(|pair|pair[0]>=pair[1]) {return Err("key evidence is not a unique ordered set".into());}
         }
+        if self.accepted_winner_keys.as_ref().is_some_and(|keys| keys!=&self.emitted_keys)
+            || self.dispatch_keys.as_ref().is_some_and(|keys| keys!=&self.selected_keys)
+            || self.accepted_winner_keys.is_some()==self.dispatch_keys.is_some() {
+            return Err("fixed routine transport key witness differs from settled keys".into());
+        }
         let t=&self.timings;
         if [t.durable_save_ms,t.publication_complete_ms,t.receiver_durable_ack_ms]
             .iter().any(|v|!v.is_finite() || *v<0.0)
@@ -410,10 +415,27 @@ mod tests {
         observation.insert_domain("unit-test","synthetic-input",1,1);
         let durable=if warmup {999.0} else {iteration as f64};
         RoutineSample {scenario,direction,iteration,warmup,selected_keys:vec!["synthetic-key".into()],emitted_keys:vec!["synthetic-key".into()],
-            affected_keys:vec!["synthetic-key".into()],accepted_winner_keys:None,dispatch_keys:None,
+            affected_keys:vec!["synthetic-key".into()],accepted_winner_keys:Some(vec!["synthetic-key".into()]),dispatch_keys:None,
             failed_operations:0,pending_operations:0,observation,
             timings:NativeTimings {durable_save_ms:durable,publication_complete_ms:durable+1.0,receiver_durable_ack_ms:durable+2.0}}
     }
+    #[test]
+    fn transport_key_witness_requires_the_exact_actual_fixed_change_set() {
+        let original=sample(Scenario::SettingEdit,Direction::AtoB,0,false);
+        original.validate().unwrap();
+        for keys in [Vec::new(),vec!["extra".into()],vec!["extra".into(),"synthetic-key".into()]] {
+            let mut changed=original.clone();changed.accepted_winner_keys=Some(keys.clone());
+            assert!(changed.validate().is_err());
+            changed.accepted_winner_keys=None;changed.dispatch_keys=Some(keys);
+            assert!(changed.validate().is_err());
+        }
+        let mut external=original.clone();external.accepted_winner_keys=None;
+        external.dispatch_keys=Some(external.selected_keys.clone());external.validate().unwrap();
+        external.dispatch_keys=None;assert!(external.validate().is_err());
+        external.accepted_winner_keys=original.accepted_winner_keys.clone();
+        external.dispatch_keys=Some(external.selected_keys.clone());assert!(external.validate().is_err());
+    }
+
     #[test]
     fn fixed_policy_retains_warmups_but_excludes_them_from_percentiles() {
         let collection=collect(|s,d,i,w|Ok(sample(s,d,i,w)));
