@@ -2,7 +2,7 @@ import { invoke } from '@tauri-apps/api/core'
 import type { SyncExitDrainAdapter } from '../syncExitCoordinator'
 import type { RetainableReplacementFence } from '../retainableReplacementFence'
 import { isTauri } from 'src/ts/platform'
-import { installSyncBindingFlow } from './bindingProduction'
+import { createSyncBindingRecoveryRegistration, installSyncBindingFlow } from './bindingProduction'
 import { withPausedPersistentWrites, beginActivatedLibraryGuard, refreshActivatedLibraryUnderPause, applyPersistentLwwReceive, getPersistentDataRuntime } from '../persistentDataRuntime.svelte'
 import type { PersistentMutationToken } from '../saveCoordinator'
 import type { LwwStageReceive } from '../persistentDataStore'
@@ -25,6 +25,7 @@ export function initializeNativeSyncBindings(): () => void {
     let activeToken: PersistentMutationToken | undefined
     const token = () => { if (!activeToken) throw new Error('Sync binding pause is unavailable'); return activeToken }
     nativeBindings = installSyncBindingFlow({
+        recovery: createSyncBindingRecoveryRegistration(getPersistentDataRuntime, token),
         withPausedWrites: operation => withPausedPersistentWrites('sync-binding', async pausedToken => {
             activeToken = pausedToken
             try { return await operation() } finally { activeToken = undefined }
@@ -52,8 +53,27 @@ const header = () => {
     if (!context || context.signal.aborted) throw new Error('Sync binding is unavailable')
     return { bindingAuthority: context.state.targetAuthority, requestId: crypto.randomUUID() }
 }
+async function pushAvailable(captured: BindingContext, requireForeground = false): Promise<void> {
+    for (;;) {
+        captured.signal.throwIfAborted()
+        if (captured !== context) throw new Error('Sync binding changed')
+        if (!foreground) {
+            if (requireForeground) throw new Error('Sync binding foreground is unavailable')
+            return
+        }
+        const receipt = await invoke('server_sync_lww_push', { request: header(), generating: generatingConversations.snapshot() })
+        captured.signal.throwIfAborted()
+        if (captured !== context) throw new Error('Sync binding changed')
+        if (!foreground) {
+            if (requireForeground) throw new Error('Sync binding foreground is unavailable')
+            return
+        }
+        if (!receipt) break
+    }
+    changed()
+}
 const scheduler = createServerSyncScheduler({
-    async push() { const captured = context; if (!captured) return; for (;;) { captured.signal.throwIfAborted(); if (captured !== context) throw new Error('Sync binding changed'); const receipt = await invoke('server_sync_lww_push', { request: header(), generating: generatingConversations.snapshot() }); if (!receipt || !foreground) break } },
+    async push() { if (context) await pushAvailable(context) },
     async pull(completeAvailable = false) {
         const captured = context
         if (!captured) throw new Error('Sync binding is unavailable')
@@ -77,18 +97,20 @@ const transport: SyncBindingTransport = {
     pullAvailableState: (inspected,c) => invoke('server_sync_lww_stage_target', { inspectionId: inspected.inspectionId, request: { bindingAuthority: c.state.targetAuthority, requestId: crypto.randomUUID() } }),
     replaceFromTarget: replaceNativeSyncBinding,
     async fenceOldJobs(c) { foreground = false; await scheduler.fence(); await invoke('server_sync_lww_fence', { newDevice: c.mode === 'new-device' }) },
+    async receiveAvailableChanges(c) { c.signal.throwIfAborted(); if (!context || context.state.targetAuthority !== c.state.targetAuthority || context.state.selectionEpoch !== c.state.selectionEpoch) throw new Error('Sync binding changed'); await receiveAvailableServerChanges(); c.signal.throwIfAborted() },
     async publishInitialSharedState(c) {
         context = c
         await invoke('server_sync_lww_activate', { request: header() })
         let afterKey: string | null = null
         for (;;) {
+            c.signal.throwIfAborted()
+            if (c !== context) throw new Error('Sync binding changed')
             const page = await invoke<{ afterKey: string | null; hasMore: boolean }>('pds_lww_queue_unit_state_page', { request: { ...header(), afterKey, limit: '256' } })
             if (!page.hasMore) break
             afterKey = page.afterKey
         }
         foreground = document.visibilityState !== 'hidden'
-        await scheduler.foreground(foreground)
-        await scheduler.flush()
+        await pushAvailable(c, true)
     },
     async resumeBinding(c) { context = c; await invoke('server_sync_lww_activate', { request: header() }); foreground = document.visibilityState !== 'hidden'; await scheduler.foreground(foreground); scheduler.remoteHint(); if (foreground) void invoke('server_sync_lww_hydrate', { request: header() }).catch(() => {}) },
     prepareNewDeviceBinding: (staged,c) => invoke('server_sync_lww_prepare_new_device', { stagingId: staged.stagingId, request: { bindingAuthority: c.state.targetAuthority, requestId: staged.receiveId } }),
@@ -96,7 +118,6 @@ const transport: SyncBindingTransport = {
     async resumeNewDeviceBinding(preparation,result,c) { await invoke('server_sync_lww_activate_new_device', { authorizationId: preparation.authorizationId, writerId: result.writerId, request: { bindingAuthority: result.bindingAuthority, requestId: crypto.randomUUID() } }); context = c; error = ''; foreground = document.visibilityState !== 'hidden'; await scheduler.foreground(foreground); await scheduler.retry(); scheduler.remoteHint() },
 }
 export async function receiveAvailableServerChanges(): Promise<void> { await scheduler.receiveAvailableChanges() }
-Object.assign(transport, { receiveAvailableChanges: async (c: BindingContext) => { c.signal.throwIfAborted(); if (!context || context.state.targetAuthority !== c.state.targetAuthority || context.state.selectionEpoch !== c.state.selectionEpoch) throw new Error('Sync binding changed'); await receiveAvailableServerChanges(); c.signal.throwIfAborted() } })
 export async function connectServerSync(config: ServerConfig, newDevice = false): Promise<void> { await invoke('server_sync_configure', { config }); error = ''; await bindSyncTarget({ kind: 'server', connectionId: 'server' }, newDevice ? { mode: 'new-device' } : {}); await controller.ensureStatus() }
 export async function disconnectServerSync(): Promise<void> { await unbindSyncTarget(); context = undefined; await controller.ensureStatus() }
 export async function retryServerSync(): Promise<void> { await scheduler.fence(); await invoke('server_sync_lww_retry', { request: header() }); error = ''; await scheduler.foreground(foreground = document.visibilityState !== 'hidden'); await scheduler.retry(); changed() }
