@@ -961,7 +961,13 @@ fn read_chunk(
     }
     input.seek(SeekFrom::Start(chunk.offset)).map_err(corrupt)?;
     let mut limited = input.take(chunk.stored_length);
-    let decoded = pack::read_entry(&mut limited, pack::MAX_CHUNK_BYTES).map_err(corrupt)?;
+    let decoded = pack::read_entry(&mut limited, pack::MAX_CHUNK_BYTES);
+    #[cfg(test)]
+    match &decoded {
+        Ok(decoded)=>crate::persistent_store::hash_work::observe("native_external_pack_decode",decoded.bytes.len()),
+        Err(_)=>crate::persistent_store::hash_work::incomplete("native_external_pack_decode"),
+    }
+    let decoded=decoded.map_err(corrupt)?;
     if limited.limit() != 0
         || decoded.hash != chunk.plaintext_sha256
         || decoded.bytes.len() as u64 != chunk.plaintext_length
