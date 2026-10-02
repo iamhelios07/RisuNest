@@ -20,6 +20,9 @@ mod fixture_configuration;
 #[allow(dead_code)]
 #[path = "../../../benchmarks/lww-native/src/native_bootstrap.rs"]
 mod native_bootstrap;
+#[path = "../../../benchmarks/lww-native/src/native_maintenance.rs"]
+#[allow(dead_code)]
+mod native_maintenance;
 
 use super::{lww::{self, MessageLocator, UnitMutation}, sync_selection::{SwitchBindingRequest, SyncTarget},
     ConversationMutation, PersistentStore, WorkingSetCommit};
@@ -1631,6 +1634,34 @@ fn final_native_sparse_boundary_uses_actual_transport_and_preserves_full_message
         assert_eq!(sample.selected_keys,sample.emitted_keys);
         assert_eq!(sample.emitted_keys,sample.affected_keys);
     }
+}
+
+#[test]
+fn actual_compaction_producer_keeps_unobserved_source_and_protection_invalid() {
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        let mut fixture=crate::external_storage::lww_tests::CycleFixture::new();
+        fixture.a.commit(&WorkingSetCommit {expected_revision:fixture.a.revision().unwrap(),
+            unit_mutations:Some(vec![UnitMutation::Set {key:UnitKey::new(&["root","language"]).unwrap(),
+                value:json!("ko")}]),..Default::default()}).unwrap();
+        fixture.publish_a().await;
+        let directory=tempfile::tempdir().unwrap();
+        let job_id="00000000-0000-4000-8000-000000000881";
+        let writer=fixture.a.lww_clock_state().unwrap().writer_id;
+        use crate::external_storage::contract::{Provider,ConnectionConfig,SecretRef,OpenMode};
+        let (_,capabilities)=fixture.provider.open_repository(&ConnectionConfig {provider:"fake".into(),
+            profile:None,endpoint:"synthetic".into(),account_id:"synthetic".into(),location:Default::default(),
+            oauth_profile:None},&SecretRef("synthetic".into()),OpenMode::Existing,&Cancellation::default()).await.unwrap();
+        let record=native_maintenance::compact_native_raw(&fixture.sender,&fixture.provider,directory.path(),job_id,&writer,
+            &capabilities,None,&[],measurement::Scenario::ConsolidatedSnapshot,0)
+            .await.unwrap();
+        eprintln!("M-COMPACTION-PRODUCER-CORRECTNESS {}",serde_json::to_string(&record).unwrap());
+        assert_eq!(record.status,"INVALID");assert!(record.error.is_none(),"{:?}",record.error);
+        assert_eq!(record.snapshot.as_ref().unwrap()["snapshotId"],job_id);
+        assert!(record.native_publication_complete_ms.is_some());
+        assert!(record.native_observation.requests>0);
+        assert!(record.source_observation.is_none());assert!(!record.protection_run_completed);
+        assert!(record.native_observation.hash_totals().is_err());
+    });
 }
 
 #[test]
