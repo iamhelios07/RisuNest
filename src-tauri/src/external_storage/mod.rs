@@ -63,6 +63,8 @@ pub(crate) mod usage;
 pub(crate) mod wire_fixture;
 pub(crate) mod lww_segment;
 pub(crate) mod lww_engine;
+pub(crate) mod lww_checkpoint;
+pub(crate) mod lww_compaction;
 
 pub(crate) mod lww_residency;
 pub(crate) mod lww_commands;

@@ -227,6 +227,7 @@ fn ensure_directory(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+pub(crate) fn verify_body_file(path:&Path,length:u64,sha256:&str)->Result<bool> {verify(path,length,sha256)}
 fn verify(path: &Path, length: u64, sha256: &str) -> Result<bool> {
     let mut file = match crate::trust_boundary::open_regular_source(path) {
         Ok(file) => file,
@@ -391,7 +392,8 @@ pub(super) async fn open_object(
         output.sync_all().map_err(transient)?;
         drop(output);
         let expected_role = match object_copy.role {
-            ObjectRole::Segment | ObjectRole::Snapshot => return Err(ProviderError::new(ErrorKind::Unsupported)),
+            ObjectRole::Segment => return Err(ProviderError::new(ErrorKind::Unsupported)),
+            ObjectRole::Snapshot => wire::ObjectRole::SyncState,
             ObjectRole::Descriptor => wire::ObjectRole::Descriptor,
             ObjectRole::Pack => wire::ObjectRole::Pack,
             ObjectRole::Catalog => wire::ObjectRole::Catalog,
@@ -1558,6 +1560,37 @@ pub(crate) async fn download_sections(
         });
     }
     Ok(prepared)
+}
+
+pub(crate) async fn download_checkpoint_data(
+    root: &RemoteObject, staging_root: &Path, root_key: &[u8;32],
+    provider: &dyn Provider, repository: &RepositoryHandle, cancel: &Cancellation,
+) -> Result<(Vec<PreparedRecord>, Vec<PreparedObject>)> {
+    ensure_directory(staging_root)?;
+    let (entries,packs,_) = read_catalog(root,wire::CatalogKind::Records,root_key,staging_root,provider,repository,cancel).await?;
+    let content=content_store(staging_root)?;
+    let plan=resolve_entries(entries,staging_root,&content,None,&BTreeSet::new(),cancel)?;
+    let (records,objects)=turn_over_packs(plan,&packs,root_key,staging_root,provider,repository,&PhaseProgress::silent(),cancel).await?;
+    Ok((records.into_values().collect(),objects.into_values().collect()))
+}
+
+pub(crate) async fn download_packed_body(hash:&str,length:u64,chunks:Vec<wire::StoredChunk>,packs:Vec<wire::StoredObject>,stage:&Path,key:&[u8;32],provider:&dyn Provider,repository:&RepositoryHandle,cancel:&Cancellation)->Result<Vec<u8>> {
+    let path=download_packed_body_file(hash,length,chunks,packs,stage,key,provider,repository,cancel).await?;
+    std::fs::read(path).map_err(transient)
+}
+pub(crate) async fn download_packed_body_file(
+    hash:&str, length:u64, chunks:Vec<wire::StoredChunk>, stored_packs:Vec<wire::StoredObject>, staging_root:&Path, root_key:&[u8;32],
+    provider:&dyn Provider, repository:&RepositoryHandle,cancel:&Cancellation,
+) -> Result<PathBuf> {
+    ensure_directory(staging_root)?;
+    let mut packs=BTreeMap::new();
+    for stored in &stored_packs { let pack=RemoteObject::from_stored(stored,repository)?; packs.insert(pack.object_id.clone(),pack); }
+    let entry=CompleteEntry {kind:wire::CatalogEntryKind::Object,key:format!("object/{hash}"),content_sha256:hex::decode(hash).map_err(corrupt)?.try_into().map_err(|_|corrupt("body hash"))?,byte_length:length,chunks};
+    let content=content_store(staging_root)?;
+    let plan=resolve_entries(vec![entry],staging_root,&content,None,&BTreeSet::new(),cancel)?;
+    let (_,objects)=turn_over_packs(plan,&packs,root_key,staging_root,provider,repository,&PhaseProgress::silent(),cancel).await?;
+    let body=objects.get(hash).ok_or_else(||corrupt("body missing"))?;
+    match &body.source { ObjectSource::File(path)=>Ok(path.clone()), _=>Err(corrupt("body source")) }
 }
 
 pub(crate) async fn download_snapshot(

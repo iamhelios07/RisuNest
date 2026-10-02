@@ -247,7 +247,11 @@ pub(crate) fn seal_body(
     .map_err(|_| corrupt())?;
     Ok(sealed)
 }
-pub(crate) fn open_body(
+pub(crate) fn open_body_stream(input:&mut impl std::io::Read,output:&mut impl std::io::Write,library:&str,object:&str,root_key:&[u8;32],length:u64)->Result<()> {
+    let key=derive_key(root_key,library,"metadata").map_err(|_|corrupt())?;
+    if decrypt(input,output,&key,&binding(library,object,0,"body")?,length).map_err(|_|corrupt())? != length {return Err(corrupt());}
+    Ok(())
+}pub(crate) fn open_body(
     bytes: &[u8],
     library: &str,
     object: &str,

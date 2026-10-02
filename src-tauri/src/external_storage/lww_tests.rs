@@ -127,6 +127,34 @@ fn two_actual_stores_publish_receive_and_quiet_listing() {
         assert_eq!(f.publish_a().await.segments.0, 0);
     })
 }
+
+#[test]
+fn checkpoint_uses_only_published_units_and_restores_after_segment_retirement() {
+    run(async {
+        let mut f=CycleFixture::new();
+        set(&mut f.a,&["root","language"],serde_json::json!("ko"));
+        f.publish_a().await;
+        set(&mut f.a,&["root","language"],serde_json::json!("en"));
+        let job=tempfile::tempdir().unwrap();
+        let completed=f.sender.compact_published(job.path(),"00000000-0000-4000-8000-000000000099",&f.a.lww_clock_state().unwrap().writer_id,&fake::capabilities(true),&Cancellation::default(),None).await.unwrap();
+        assert_eq!(completed.reference.role,ObjectRole::Snapshot);
+        let snapshots=f.sender.snapshot_listing(&Cancellation::default()).await.unwrap();
+        assert_eq!(snapshots.len(),1);
+        let (_,snapshot)=f.sender.checkpoint(&snapshots[0],&Cancellation::default()).await.unwrap();
+        assert_eq!(snapshot.covered_prefixes.values().next().unwrap().0,1);
+        let mut identical=snapshot.clone(); identical.snapshot_id="00000000-0000-4000-8000-000000000098".into();
+        assert_eq!(super::lww_checkpoint::retained(&[snapshot.clone(),identical.clone()]).unwrap(),std::collections::BTreeSet::from([identical.snapshot_id.clone()]));
+        identical.state_identity="a".repeat(64);
+        assert!(super::lww_checkpoint::retained(&[snapshot.clone(),identical]).is_err());
+        for object in f.sender.listing(&Cancellation::default()).await.unwrap() {
+            f.provider.delete_object(&f.sender.repository,&object.locator,&Cancellation::default()).await.unwrap();
+        }
+        assert_eq!(f.receive_b().await,1);
+        assert_eq!(f.b.read_root(None).unwrap().value["language"],"ko");
+        assert_eq!(f.a.read_root(None).unwrap().value["language"],"en");
+        assert_eq!(f.receive_b().await,0);
+    });
+}
 #[test]
 fn cycle_key_sets_match_real_emission_and_durable_apply_and_noop_is_empty() {
     use super::lww_engine::cycle_keys;

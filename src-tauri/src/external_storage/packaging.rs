@@ -426,6 +426,12 @@ impl PackageLimits {
 /// backup bundle instead declares its own coverage and never merges.
 #[derive(Clone, Debug)]
 pub(crate) enum SnapshotPurpose {
+    LwwCheckpoint {
+        covered_prefixes: super::lww_checkpoint::Coverage,
+        state_identity: String,
+        asset_catalogs: Vec<wire::StoredObject>,
+        standalone_bodies: BTreeMap<String, super::lww_segment::LargeBody>,
+    },
     SyncState {
         epoch: String,
         generation: Sequence,
@@ -614,7 +620,8 @@ pub(crate) async fn verify_publication(
 
 pub(crate) fn wire_role(role: ObjectRole) -> Result<wire::ObjectRole> {
     match role {
-        ObjectRole::Segment | ObjectRole::Snapshot => Err(ProviderError::new(ErrorKind::Unsupported)),
+        ObjectRole::Segment => Err(ProviderError::new(ErrorKind::Unsupported)),
+        ObjectRole::Snapshot => Ok(wire::ObjectRole::SyncState),
         ObjectRole::Pack => Ok(wire::ObjectRole::Pack),
         ObjectRole::Catalog => Ok(wire::ObjectRole::Catalog),
         ObjectRole::SyncState => Ok(wire::ObjectRole::SyncState),
@@ -3251,6 +3258,25 @@ pub(crate) async fn package_and_upload(
     prepared: &Arc<PhaseProgress>,
     cancel: &Cancellation,
 ) -> Result<CompletedSnapshot> {
+    package_and_upload_protected(capture,sections,repository_root,cache_root,metadata,root_key,limits,parent,journal,provider,repository,prepared,cancel,None).await
+}
+
+pub(crate) async fn package_and_upload_protected(
+    capture: CapturedSnapshot,
+    sections: Vec<CapturedSection>,
+    repository_root: &Path,
+    cache_root: &Path,
+    metadata: SnapshotMetadata,
+    root_key: &[u8; 32],
+    limits: PackageLimits,
+    parent: Option<&ParentGraph>,
+    journal: &mut TransferJournal,
+    provider: &dyn Provider,
+    repository: &RepositoryHandle,
+    prepared: &Arc<PhaseProgress>,
+    cancel: &Cancellation,
+    protection:Option<(&super::leases::LeaseOwner,&super::leases::LeaseContext<'_>)>,
+) -> Result<CompletedSnapshot> {
     cancel.check()?;
     journal.verification = Default::default();
     if metadata.repository_id.is_empty()
@@ -3454,7 +3480,7 @@ pub(crate) async fn package_and_upload(
         SnapshotPurpose::SyncState {
             parent_sections, ..
         } => parent_sections.clone(),
-        SnapshotPurpose::BackupBundle { .. } => BTreeMap::new(),
+        SnapshotPurpose::BackupBundle { .. } | SnapshotPurpose::LwwCheckpoint { .. } => BTreeMap::new(),
     };
     let mut built_sections = BTreeSet::new();
     for captured in sections {
@@ -3558,6 +3584,22 @@ pub(crate) async fn package_and_upload(
         referenced.extend(objects);
     }
     let (bytes, fingerprint, sections, role) = match metadata.purpose {
+        SnapshotPurpose::LwwCheckpoint { covered_prefixes, state_identity, asset_catalogs, standalone_bodies } => {
+            if !published_sections.is_empty() { return Err(corrupt("checkpoint device sections")); }
+            let document = super::lww_checkpoint::Checkpoint {
+                schema: "risunest.lww-snapshot/v1".into(),
+                snapshot_id: metadata.snapshot_id.clone(),
+                repository_id: metadata.repository_id.clone(),
+                library_id: metadata.library_id,
+                covered_prefixes,
+                state_identity,
+                library,
+                asset_catalogs,
+                standalone_bodies,
+            };
+            let bytes = document.encode()?;
+            (bytes.clone(), hash(&bytes), BTreeMap::new(), ObjectRole::Snapshot)
+        }
         SnapshotPurpose::SyncState {
             epoch, generation, ..
         } => {
@@ -3612,13 +3654,17 @@ pub(crate) async fn package_and_upload(
     let mut file = tempfile::NamedTempFile::new_in(&build_root).map_err(transient)?;
     file.write_all(&bytes).map_err(transient)?;
     file.as_file_mut().sync_all().map_err(transient)?;
+    if let Some((owner,context))=protection {
+        owner.renew_if_due(context,cancel).await?;
+        if let Some(reason)=owner.recheck(context,cancel).await? {return Err(super::leases::yield_error(reason));}
+    }
     // The stable random snapshot ID is the immutable object identity. A retry
     // with different bytes is rejected by the journal instead of overwriting it.
     let reference = upload_plain_object(
         file.path(),
         bytes.len() as u64,
         hash(&bytes),
-        format!("snapshot-{}", metadata.snapshot_id),
+        if role == ObjectRole::Snapshot { metadata.snapshot_id.clone() } else { format!("snapshot-{}", metadata.snapshot_id) },
         role,
         &metadata.repository_id,
         root_key,

@@ -16,7 +16,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
     time::Instant,
 };
-use tauri::AppHandle;
+use tauri::{AppHandle,Manager};
 
 struct Session {
     engine: Option<ExternalLwwEngine>,
@@ -27,6 +27,7 @@ struct Session {
 struct Context {
     session: tokio::sync::Mutex<Session>,
     cancel: Mutex<Cancellation>,
+    maintenance:tokio::sync::Mutex<()>,
 }
 static CONTEXTS: OnceLock<Mutex<BTreeMap<String, Arc<Context>>>> = OnceLock::new();
 fn context(id: &str) -> Result<Arc<Context>> {
@@ -48,6 +49,7 @@ fn context(id: &str) -> Result<Arc<Context>> {
                     cancel: Cancellation::default(),
                 }),
                 cancel: Mutex::new(Cancellation::default()),
+                maintenance:tokio::sync::Mutex::new(()),
             })
         })
         .clone())
@@ -179,7 +181,7 @@ pub(crate) async fn external_lww_inspect(app: AppHandle, request: Request) -> Re
         inspection_id,
         target_id,
         library_id: library_id.clone(),
-        empty: objects.is_empty(),
+        empty: objects.is_empty() && engine.snapshot_listing(&session.cancel).await?.is_empty(),
         previously_bound_library: previous.library_id.as_deref() == Some(&library_id),
     })
 }
@@ -337,6 +339,39 @@ pub(crate) async fn external_lww_receive(
             &session.cancel,
         )
         .await
+}
+
+#[tauri::command]
+pub(crate) async fn external_lww_maintenance(app:AppHandle,request:Request)->Result<Option<serde_json::Value>> {
+    let context=context(&request.connection_id)?;
+    let Ok(_maintenance)=context.maintenance.try_lock() else {return Ok(None)};
+    let cancel=context.cancel.lock().map_err(runtime::local_error)?.clone();
+    let mut session=Session{engine:None,dependencies:None,fresh_after:Instant::now(),cancel:cancel.clone()};
+    open(&app,&request.connection_id,&mut session).await?;
+    let store=check(&app,&request,true)?;
+    let writer=store.lww_clock_state().map_err(runtime::local_error)?.writer_id;
+    let engine=session.engine.as_ref().ok_or_else(lww_segment::corrupt)?;
+    let segments=engine.listing(&cancel).await?;
+    let snapshots=engine.snapshot_listing(&cancel).await?;
+    if segments.len()<100 && segments.iter().map(|r|r.byte_length).sum::<u64>()<64*1024*1024 && snapshots.len()<2 {return Ok(None)};
+    let root=runtime::root(&app)?;
+    let stored=super::connection_store::ConnectionStore::open(&root)?.read(&request.connection_id)?;
+    let job=uuid::Uuid::new_v4().to_string();
+    let protection=super::leases::LeaseContext{root:&root,connection_id:&request.connection_id,writer_id:&writer,descriptor:&stored.descriptor,root_key:&engine.root_key,provider:engine.provider.as_ref(),repository:&engine.repository,clock:super::leases::system_clock(),protection_supported:stored.capabilities.lease_operations,ledger:Some(app.state::<super::job_store::JobCommandState>().lease_ledger()?)};
+    let owner=match super::leases::admit_shared_work(&protection,&job,&cancel).await? {
+        super::leases::Admission::Admitted(owner)=>owner,
+        super::leases::Admission::Yield{..}=>return Ok(None),
+        super::leases::Admission::UnsupportedProtection=>return Err(ProviderError::new(ErrorKind::Unsupported)),
+    };
+    let directory=root.join("external-storage").join("maintenance").join(&job);
+    let result=owner.run(&protection,&cancel,async {
+        if let Some(reason)=owner.recheck(&protection,&cancel).await? {return Err(super::leases::yield_error(reason));}
+        check(&app,&request,true)?;
+        let completed=engine.compact_published(&directory,&job,&writer,&stored.capabilities,&cancel,Some((&owner,&protection))).await?;
+        check(&app,&request,true)?;
+        Ok(completed)
+    }).await?;
+    Ok(Some(serde_json::json!({"snapshotId":result.snapshot_id})))
 }
 #[tauri::command]
 pub(crate) async fn external_lww_fence(app: AppHandle, connection_id: String) -> Result<()> {
