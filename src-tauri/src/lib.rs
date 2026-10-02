@@ -780,6 +780,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         native_file_jobs::native_raw_recovery_handoff_cleanup,
         native_file_jobs::native_portable_select_sections,
         native_file_jobs::native_portable_confirm_restore_adoption,
+        native_file_jobs::native_portable_retry_restore_bodies,
         native_file_jobs::native_snapshot_restore_bodies_start,
         native_file_jobs::native_plugin_values_assign,
         native_file_jobs::native_backup_source_format,

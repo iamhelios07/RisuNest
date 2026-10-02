@@ -359,6 +359,11 @@ impl VerifiedArchive {
         Ok(())
     }
 
+    pub(crate) fn source_identity_guard(&self) -> Result<(File, crate::asset_repository::ExactFileIdentity)> {
+        self.check_identity()?;
+        Ok((self.input.file.try_clone()?, self.identity.clone()))
+    }
+
     fn verify_objects(&mut self, probe: &dyn CancellationProbe, verify_bodies: bool) -> Result<()> {
         let mut statement = self.db.prepare(
             "SELECT sha256,pack_id,offset,byte_length FROM objects ORDER BY pack_id,offset,sha256",
