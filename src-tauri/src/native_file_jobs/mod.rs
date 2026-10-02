@@ -11,6 +11,18 @@ pub mod screenshot_output;
 mod backup_source;
 mod legacy_backup;
 mod portable;
+pub(crate) mod portable_source_custody;
+
+#[tauri::command(async)]
+pub(crate) fn native_portable_source_discard(app:AppHandle,source:JobSource)->Result<bool,NativeJobError> {
+    portable_source_custody::ensure_platform_source(&app,&source)?;
+    portable_source_custody::discard(&source)
+}
+
+#[tauri::command(async)]
+pub(crate) fn native_portable_source_cleanup_orphans(app:AppHandle)->Result<(),NativeJobError> {
+    portable_source_custody::cleanup_orphans(&app)
+}
 pub(crate) mod raw_recovery;
 pub(crate) use backup_source::*;
 mod official_snapshot;
@@ -80,6 +92,8 @@ impl std::error::Error for NativeJobError {}
 pub(crate) enum JobSource {
     DesktopPath { path: String },
     AndroidSpool { token: String },
+    AndroidSeekable { token: String },
+    IosScoped { token: String },
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -387,6 +401,7 @@ pub(crate) struct PreparedContent {
 pub(crate) struct OpenedJobSource {
     pub(crate) file: File,
     pub(crate) total_bytes: u64,
+    pub(crate) custody: Option<portable_source_custody::PortableSourceCustodyLease>,
 }
 
 #[derive(Debug)]
@@ -437,7 +452,7 @@ fn open_source_file(path: &Path, _allow_cloud_source: bool) -> Result<OpenedJobS
         if !metadata.is_file() || metadata.file_type().is_symlink() {
             return Err(invalid_source_error("source must be a regular file"));
         }
-        return Ok(OpenedJobSource { file, total_bytes: metadata.len() });
+        return Ok(OpenedJobSource { file, total_bytes: metadata.len(), custody: None });
     }
     if metadata.file_type().is_symlink() || is_reparse_point || !metadata.is_file() {
         return Err(invalid_source_error("source must be a regular file"));
@@ -445,6 +460,7 @@ fn open_source_file(path: &Path, _allow_cloud_source: bool) -> Result<OpenedJobS
     Ok(OpenedJobSource {
         file,
         total_bytes: metadata.len(),
+        custody: None,
     })
 }
 
@@ -466,6 +482,7 @@ pub(crate) fn open_job_source(
             let path = resolve_spool_source(job_root, token)?;
             open_regular_file_no_follow(&path)
         }
+        JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } => Err(invalid_source_error("Portable custody requires its bounded probe or exact job claim")),
     }
 }
 
@@ -490,6 +507,7 @@ fn resolve_source(job_root: &Path, source: &JobSource) -> Result<PathBuf, Native
     match source {
         JobSource::DesktopPath { path } => resolve_desktop_source(path),
         JobSource::AndroidSpool { token } => resolve_spool_source(job_root, token),
+        JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } => Err(invalid_source_error("Portable custody has no path authority")),
     }
 }
 
@@ -1315,7 +1333,7 @@ impl NativeFileJobState {
                         parse_android_spool_token(token)?;
                         None
                     }
-
+                    JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } => return Err(invalid_source_error("Portable custody is not an upstream/content source")),
                 };
                 NativeFileJobTask::Restore {
                     opened_source,
@@ -1371,7 +1389,7 @@ impl NativeFileJobState {
                         parse_android_spool_token(token)?;
                         None
                     }
-
+                    JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } => return Err(invalid_source_error("Portable custody is not an upstream/content source")),
                 };
                 let repository_root =
                     crate::persistent_store::commands::with_store_mut(app.state(), |store| {
@@ -1450,6 +1468,7 @@ impl NativeFileJobState {
                         parse_android_spool_token(token)?;
                         None
                     }
+                    JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } => { portable_source_custody::ensure_platform_source(&app, &source)?; None },
                 };
                 let store =
                     crate::persistent_store::commands::with_store_mut(app.state(), |store| {
@@ -1617,7 +1636,7 @@ impl NativeFileJobState {
                         parse_android_spool_token(token)?;
                         None
                     }
-
+                    JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } => return Err(invalid_source_error("Portable custody is not an upstream/content source")),
                 };
                 let store =
                     crate::persistent_store::commands::with_store_mut(app.state(), |store| {
@@ -1785,6 +1804,7 @@ impl NativeFileJobState {
                 claim_spool_content_source(&self.root, token, &owned_directory, &display_name)
                     .map(|source| source.opened)
             }
+            JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } => Err(invalid_source_error("Portable custody is not a content source")),
         };
         let opened_source = match opened_source {
             Ok(source) => source,
@@ -1861,7 +1881,7 @@ impl NativeFileJobState {
                 parse_android_spool_token(token)?;
                 None
             }
-
+            JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } => return Err(invalid_source_error("Portable custody is not an upstream source")),
         };
         self.spawn(
             NativeFileJobTask::Restore {
@@ -1985,6 +2005,10 @@ impl NativeFileJobState {
                         expected_display_name,
                     )?;
                     *opened_source = Some(source.opened);
+                    Ok(())
+                }
+                JobSource::AndroidSeekable { .. } | JobSource::IosScoped { .. } if opened_source.is_none() => {
+                    *opened_source = Some(portable_source_custody::claim(source, &job_id)?);
                     Ok(())
                 }
                 _ => Err(NativeJobError::new(

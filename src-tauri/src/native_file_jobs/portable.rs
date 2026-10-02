@@ -866,6 +866,7 @@ mod tests {
         let error = restore_portable(
             OpenedJobSource {
                 file: File::open(source).unwrap(),
+                custody: None,
                 total_bytes: bytes,
             },
             true,
@@ -1119,6 +1120,7 @@ mod tests {
         let result = restore_portable(
             OpenedJobSource {
                 file: File::open(path).unwrap(),
+                custody: None,
                 total_bytes: bytes,
             },
             true,
@@ -1183,7 +1185,8 @@ mod tests {
             assert!(restore_portable(
                 OpenedJobSource {
                     file: File::open(path).unwrap(),
-                    total_bytes: bytes
+                    custody: None,
+                    total_bytes: bytes,
                 },
                 true,
                 1,
@@ -1248,6 +1251,7 @@ mod tests {
         let failure = restore_portable(
             OpenedJobSource {
                 file: File::open(exported.handoff_path.unwrap()).unwrap(),
+                custody: None,
                 total_bytes: exported.source_bytes,
             },
             true,
@@ -1415,6 +1419,7 @@ mod tests {
         let result = restore_portable(
             OpenedJobSource {
                 file: File::open(&path).unwrap(),
+                custody: None,
                 total_bytes: exported.source_bytes,
             },
             true,
@@ -1513,6 +1518,7 @@ mod tests {
         let restored = restore_portable(
             OpenedJobSource {
                 file: File::open(path).unwrap(),
+                custody: None,
                 total_bytes: bytes,
             },
             true,

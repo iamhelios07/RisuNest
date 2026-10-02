@@ -30,6 +30,8 @@ import type { NativePortableDeviceSection } from './deviceBackup/selection'
 export type NativeFileJobSource =
     | { type: 'desktopPath'; path: string }
     | { type: 'androidSpool'; token: string }
+    | { type: 'androidSeekable'; token: string }
+    | { type: 'iosScoped'; token: string }
 
 export type NativeFileJobState =
     | 'queued'
