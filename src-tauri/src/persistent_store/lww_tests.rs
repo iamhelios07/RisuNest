@@ -712,6 +712,53 @@ fn device_replacement_receipt_cannot_attest_a_library_only_replacement() {
 }
 
 #[test]
+fn backup_device_revision_is_fixed_after_own_and_second_connection_mutations() {
+    use device_store::plugin_values::PluginDeviceMutation;
+    fn write(store:&mut PersistentStore,value:&str) {
+        store.device_store_mut().unwrap().write_plugin_device_values("synthetic",&[
+            PluginDeviceMutation::Set{space:"string".into(),key:"revision-proof".into(),value:value.into()},
+        ]).unwrap();
+    }
+    let (dir,mut primary)=store();
+    write(&mut primary,"before");
+    let mut writer=PersistentStore::open(dir.path()).unwrap();
+    let revision=primary.device_store().unwrap().revision().unwrap();
+    let (lease,_)=primary.lww_acquire_backup_capture(primary.revision().unwrap()).unwrap();
+    assert_eq!(primary.lww_backup_device_revision(&lease.lease).unwrap(),revision);
+    write(&mut primary,"own-after");
+    assert!(primary.device_store().unwrap().revision().unwrap()>revision);
+    assert_eq!(primary.lww_backup_device_revision(&lease.lease).unwrap(),revision);
+    write(&mut writer,"second-after");
+    assert!(writer.device_store().unwrap().revision().unwrap()>revision+1);
+    assert_eq!(primary.lww_backup_device_revision(&lease.lease).unwrap(),revision);
+    primary.release_revision(&lease.lease).unwrap();
+}
+
+#[test]
+fn backup_device_revision_rejects_absent_released_unpinned_foreign_and_changed_identity_leases() {
+    let (_dir,mut primary)=store();
+    assert!(matches!(primary.lww_backup_device_revision("absent"),Err(StoreError::SnapshotReleased)));
+    let ordinary=primary.acquire_revision(0).unwrap();
+    assert!(matches!(primary.lww_backup_device_revision(&ordinary.lease),Err(StoreError::Validation{message}) if message=="backup-capture-lease-required"));
+    primary.release_revision(&ordinary.lease).unwrap();
+    let (_foreign,mut foreign)=store();
+    let (foreign_lease,_)=foreign.lww_acquire_backup_capture(0).unwrap();
+    assert!(matches!(primary.lww_backup_device_revision(&foreign_lease.lease),Err(StoreError::SnapshotReleased)));
+    foreign.release_revision(&foreign_lease.lease).unwrap();
+    let (lease,_)=primary.lww_acquire_backup_capture(0).unwrap();
+    let generation=primary.revision_leases[&lease.lease].target.generation.clone();
+    primary.revision_leases.get_mut(&lease.lease).unwrap().target.generation="foreign-generation".into();
+    assert!(matches!(primary.lww_backup_device_revision(&lease.lease),Err(StoreError::Validation{message}) if message=="backup-lease-identity-changed"));
+    primary.revision_leases.get_mut(&lease.lease).unwrap().target.generation=generation;
+    primary.revision_leases.get_mut(&lease.lease).unwrap().target.revision=1;
+    assert!(matches!(primary.lww_backup_device_revision(&lease.lease),Err(StoreError::Validation{message}) if message=="backup-lease-identity-changed"));
+    primary.revision_leases.get_mut(&lease.lease).unwrap().target.revision=0;
+    assert_eq!(primary.lww_backup_device_revision(&lease.lease).unwrap(),0);
+    primary.release_revision(&lease.lease).unwrap();
+    assert!(matches!(primary.lww_backup_device_revision(&lease.lease),Err(StoreError::SnapshotReleased)));
+}
+
+#[test]
 fn backup_unit_values_are_lease_fixed_and_include_opaque_held_and_permanent_deletions() {
     let (_dir,mut store)=store();
     save(&mut store,vec![mutation(&["root","language"],serde_json::json!("before")),mutation(&["exists","character","retired"],serde_json::json!({"type":"character"}))]);
