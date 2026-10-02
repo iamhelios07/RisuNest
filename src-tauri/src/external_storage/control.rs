@@ -19,9 +19,11 @@ use risunest_external_storage_format::{
     content_identity::hash,
     control as wire_control,
     crypto::derive_key,
-    format::{Descriptor, Strategy},
+    format::Descriptor,
     snapshot as wire,
 };
+#[cfg(test)]
+use risunest_external_storage_format::format::Strategy;
 use std::{
     fs,
     io::{Cursor, Read, Write},

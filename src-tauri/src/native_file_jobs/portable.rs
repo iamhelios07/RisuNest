@@ -1,6 +1,6 @@
 use super::{JobControl, JobPhase, JobResultSummary, NativeJobError, OpenedJobSource};
 use crate::device_backup::{
-    capture_native_sections, capture_prepared_native_sections, journal_prepared_native_sections,
+    capture_prepared_native_sections, journal_prepared_native_sections,
     prepare_native_sections, resume_journaled_native_restore, DeviceBackupError, DeviceBackupState,
     Spool,
 };
@@ -15,7 +15,7 @@ use crate::{
 };
 use std::{
     fs::{self, File},
-    io::{Read, Seek, SeekFrom},
+    io::Read,
     path::Path,
 };
 use tauri::Manager;
