@@ -926,13 +926,15 @@ pub(crate) fn resume_journaled_native_restore(
         for section in &pending { state.section_intent(id,section)?; }
     }
     let committed = store.lww_commit_replacement_with_device_sections(&header,stage,Some(&units),&rows).map_err(device_store_error)?;
-    if state.session(id)?.phase=="applying-device" {
+    let phase = state.session(id)?.phase;
+    if matches!(phase.as_str(), "applying-device" | "committed") {
         let manifests = state.section_list(id,Spool::Source)?.into_iter().map(|manifest|(manifest.section_id.clone(),manifest)).collect::<BTreeMap<_,_>>();
         for section in pending {
             let manifest=manifests.get(&section).ok_or_else(||error("device-section-missing","Native recovery source manifest is absent"))?;
+            if phase == "committed" { state.section_intent(id,&section)?; }
             state.section_complete(id,&section,&manifest.sha256)?;
         }
-        state.finish_device(id)?;
+        if phase == "applying-device" { state.finish_device(id)?; }
     }
     if state.session(id)?.phase=="committing-library" { state.mark_library_committed(id)?; }
     require(state.session(id)?.phase=="committed", "Native recovery did not reach its committed state")?;

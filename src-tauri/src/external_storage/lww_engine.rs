@@ -6,7 +6,7 @@ use super::{
 #[cfg(test)]
 use crate::persistent_store::lww::ApplyReceive;
 use crate::persistent_store::{
-    external_lww::{FrozenAsset, SealedBody, SealedPublication, UploadState},
+    external_lww::{FrozenAsset, FrozenControl, FrozenControlCatalog, SealedBody, SealedPublication, UploadState},
     lww::{Change, Header, MessageLocator, Progress, StageReceive},
     PersistentStore,
 };
@@ -356,9 +356,13 @@ impl ExternalLwwEngine {
                     let mut selected = Vec::new();
                     let mut bodies = Vec::new();
                     let mut assets = BTreeMap::new();
+                    let mut controls = BTreeMap::new();
+                    let mut reused_controls = BTreeMap::new();
                     for entry in entries {
                         let mut candidate = payload.clone();
                         let mut candidate_assets = assets.clone();
+                        let mut candidate_controls = controls.clone();
+                        let mut candidate_reused = reused_controls.clone();
                         let mut added = Vec::new();
                         self.include_objects(
                             store,
@@ -366,6 +370,8 @@ impl ExternalLwwEngine {
                             &mut candidate,
                             &mut added,
                             &mut candidate_assets,
+                            &mut candidate_controls,
+                            &mut candidate_reused,
                             cancel,
                         )
                         .await?;
@@ -374,7 +380,18 @@ impl ExternalLwwEngine {
                             stamp: entry.stamp.clone(),
                             value: entry.value.clone(),
                         });
-                        if candidate.encode_capture()?.len() > segment::SEGMENT_BYTES {
+                        let control_bytes=candidate.message_pages.values().try_fold(0usize,|total,body| {
+                            total.checked_add(body.len().checked_mul(3).ok_or_else(segment::corrupt)?/4).ok_or_else(segment::corrupt)
+                        })?;
+                        if control_bytes>segment::SMALL_BODY_BYTES {
+                            candidate_controls.extend(std::mem::take(&mut candidate.message_pages));
+                        }
+                        let mut fits=Self::capture_fits(&candidate,&candidate_controls,&candidate_assets)?;
+                        if !fits {
+                            candidate_controls.extend(std::mem::take(&mut candidate.message_pages));
+                            fits=Self::capture_fits(&candidate,&candidate_controls,&candidate_assets)?;
+                        }
+                        if !fits {
                             if selected.is_empty() {
                                 return Err(ProviderError::new(ErrorKind::FileTooLarge));
                             }
@@ -382,6 +399,8 @@ impl ExternalLwwEngine {
                         }
                         payload = candidate;
                         assets = candidate_assets;
+                        controls = candidate_controls;
+                        reused_controls = candidate_reused;
                         bodies.extend(added);
                         selected.push(entry);
                     }
@@ -391,7 +410,7 @@ impl ExternalLwwEngine {
                     let sha256 = String::new();
                     let object_id = String::new();
                     let assets = assets.into_values().collect::<Vec<_>>();
-                    let asset_job = if assets.is_empty() {
+                    let asset_job = if assets.is_empty() && controls.is_empty() && reused_controls.is_empty() {
                         None
                     } else {
                         let job = super::journal::JobIdentity {
@@ -415,11 +434,28 @@ impl ExternalLwwEngine {
                         pins.seal(store, super::runtime::now_ms() as i64).map_err(transient)?;
                         Some(job)
                     };
+                    let mut frozen_controls=Vec::new();
+                    if !controls.is_empty() {
+                        let job=asset_job.as_ref().ok_or_else(segment::corrupt)?;
+                        let directory=store.repository_root().join("external-storage").join("lww-publications")
+                            .join(&job.job_id).join("controls");
+                        std::fs::create_dir_all(&directory).map_err(transient)?;
+                        for (hash,encoded) in controls {
+                            cancel.check()?;
+                            let bytes=URL_SAFE_NO_PAD.decode(encoded).map_err(|_|segment::corrupt())?;
+                            let source=directory.join(&hash);
+                            let mut file=std::fs::OpenOptions::new().write(true).create_new(true).open(&source).map_err(transient)?;
+                            std::io::Write::write_all(&mut file,&bytes).map_err(transient)?;
+                            file.sync_all().map_err(transient)?;
+                            frozen_controls.push(FrozenControl { content_hash:hash,byte_length:bytes.len() as u64,source });
+                        }
+                    }
                     let publication = SealedPublication {
                         target: self.target_scope(),
                         writer: writer.clone(),
                         seq: DecimalU64(seq),
                         authority,
+                        captured_at_ms: Self::trusted_control_time(),
                         object_id,
                         sha256,
                         payload_sha256,
@@ -428,7 +464,10 @@ impl ExternalLwwEngine {
                         entries: selected,
                         bodies,
                         assets,
+                        controls: frozen_controls,
+                        reused_control_catalogs: reused_controls.into_values().collect(),
                         asset_job,
+                        data_catalogs: Vec::new(),
                         asset_catalogs: Vec::new(),
                         resume: None,
                         dispatched: false,
@@ -496,6 +535,16 @@ impl ExternalLwwEngine {
         key_operation.finish();
         Ok(result)
     }
+    fn capture_fits(payload:&Segment,controls:&BTreeMap<String,String>,assets:&BTreeMap<String,FrozenAsset>)->Result<bool> {
+        let catalogs=usize::from(!controls.is_empty())+usize::from(assets.values().any(|asset|asset.byte_length<=segment::SMALL_BODY_BYTES as u64));
+        let reserved=risunest_external_storage_format::snapshot::MAX_METADATA_BYTES.checked_mul(catalogs).ok_or_else(segment::corrupt)?;
+        let length=payload.encode_capture()?.len().checked_add(reserved).ok_or_else(segment::corrupt)?;
+        match segment::sealed_length(length) {
+            Ok(_)=>Ok(true),
+            Err(error) if error.kind==ErrorKind::FileTooLarge=>Ok(false),
+            Err(error)=>Err(error),
+        }
+    }
     async fn publish_captured(
         &self,
         store: &mut PersistentStore,
@@ -506,6 +555,10 @@ impl ExternalLwwEngine {
     ) -> Result<PublicationResult> {
         let mut result = PublicationResult::default();
         Self::check_publication_authority(store, &publication)?;
+        if publication.dispatched {
+            if !publication.sealed {return Err(segment::corrupt());}
+            self.reconcile_publication(&mut publication,&sealed,cancel).await?;
+        }
         if let Some(job) = &publication.asset_job {
             if job.connection_id != self.connection_id || job.repository_id != self.repository.repository_id {
                 return Err(segment::corrupt());
@@ -515,6 +568,62 @@ impl ExternalLwwEngine {
             let roots = pins.root_set().map_err(transient)?;
             if publication.assets.iter().filter(|asset| asset.local_pin).any(|asset| !roots.object_hashes.contains(&asset.content_hash)) {
                 return Err(segment::corrupt());
+            }
+            if !publication.complete {
+                for proof in &publication.reused_control_catalogs {
+                    if Self::trusted_control_time().and_then(|now|now.checked_sub(proof.rooted_at_ms))
+                        .is_none_or(|age|age>super::leases::CACHE_REUSE_LIMIT_MS) {
+                        super::snapshot_restore::revalidate_catalog(
+                            &proof.catalog,risunest_external_storage_format::snapshot::CatalogKind::Records,
+                            &self.root_key,self.provider.as_ref(),&self.repository,cancel,
+                        ).await?;
+                    }
+                }
+                if Self::trusted_control_time().and_then(|now|publication.captured_at_ms.and_then(|captured|now.checked_sub(captured)))
+                    .is_none_or(|age|age>super::leases::CACHE_REUSE_LIMIT_MS) {
+                    for catalog in &publication.data_catalogs {
+                        super::snapshot_restore::revalidate_catalog(catalog,risunest_external_storage_format::snapshot::CatalogKind::Records,
+                            &self.root_key,self.provider.as_ref(),&self.repository,cancel).await?;
+                    }
+                    for catalog in &publication.asset_catalogs {
+                        super::snapshot_restore::revalidate_catalog(catalog,risunest_external_storage_format::snapshot::CatalogKind::Assets,
+                            &self.root_key,self.provider.as_ref(),&self.repository,cancel).await?;
+                    }
+                    for body in publication.bodies.iter().filter(|body|body.complete) {
+                        let intent=ObjectIntent{job_id:self.library.clone(),repository_id:self.repository.repository_id.clone(),
+                            object_id:body.object_id.clone(),role:ObjectRole::Pack,byte_length:body.byte_length,sha256:body.sha256.clone()};
+                        let resume=body.resume.as_ref().map(Self::resume);
+                        match self.provider.reconcile_upload(&self.repository,&intent,resume.as_ref(),cancel).await? {
+                            UploadResolution::Complete(receipt)=>{
+                                Self::validate_receipt(&intent,&receipt)?;
+                                if body.locator.as_ref()!=Some(&receipt.locator) {return Err(segment::corrupt());}
+                            }
+                            UploadResolution::Conflict=>return Err(segment::corrupt()),
+                            UploadResolution::RestartRequired|UploadResolution::Resumable(_)=>return Err(ProviderError::new(ErrorKind::NotFound)),
+                        }
+                    }
+                }
+            }
+            if publication.data_catalogs.is_empty() && !publication.controls.is_empty() {
+                let mut journal=super::journal::TransferJournal::open(
+                    &root.join("external-storage").join("lww-publications").join(&job.job_id).join("data"),job.clone(),
+                ).map_err(transient)?;
+                let sources=publication.controls.iter().map(|control|super::packaging::AssetCatalogSource {
+                    content_hash:control.content_hash.clone(),byte_length:control.byte_length,
+                    source:super::content_store::ObjectSource::File(control.source.clone()),
+                }).collect();
+                let completed=super::packaging::package_and_upload_control_catalog(
+                    sources,&root,&self.connection_root.join("external-storage").join("package-cache").join(&self.connection_id),
+                    &self.root_key,super::packaging::PackageLimits::from_capabilities(&self.capabilities)?,
+                    &mut journal,self.provider.as_ref(),&self.repository,
+                    &super::phase_progress::PhaseProgress::silent(),cancel,protection,
+                ).await?;
+                publication.data_catalogs.push(completed.catalog);
+                store.external_lww_persist(&publication,&sealed).map_err(store_error)?;
+            }
+            for catalog in &publication.data_catalogs {
+                store.external_lww_witness_data_catalog(&self.target_scope(),catalog,
+                    &publication.controls.iter().map(|control|control.content_hash.clone()).collect::<Vec<_>>()).map_err(store_error)?;
             }
             if publication.asset_catalogs.is_empty() && publication.assets.iter().any(|asset| asset.byte_length <= segment::SMALL_BODY_BYTES as u64) {
                 let mut journal = super::journal::TransferJournal::open(
@@ -563,7 +672,8 @@ impl ExternalLwwEngine {
                 publication.asset_catalogs.push(completed.catalog);
                 store.external_lww_persist(&publication, &sealed).map_err(store_error)?;
             }
-        } else if !publication.assets.is_empty() || !publication.asset_catalogs.is_empty() {
+        } else if !publication.assets.is_empty() || !publication.asset_catalogs.is_empty()
+            || !publication.controls.is_empty() || !publication.data_catalogs.is_empty() {
             return Err(segment::corrupt());
         }
         for index in 0..publication.bodies.len() {
@@ -621,6 +731,7 @@ impl ExternalLwwEngine {
                 .decode(&publication.payload)
                 .map_err(|_| segment::corrupt())?;
             let mut payload = Segment::decode_capture(&plain)?;
+            payload.data_catalogs.extend(publication.data_catalogs.clone());
             payload.asset_catalogs = publication.asset_catalogs.clone();
             for body in payload.large_bodies.values_mut() {
                 let prepared = publication
@@ -656,24 +767,6 @@ impl ExternalLwwEngine {
             byte_length: sealed.len() as u64,
             sha256: publication.sha256.clone(),
         };
-        if publication.dispatched && !publication.complete {
-            let resume = publication.resume.as_ref().map(Self::resume);
-            match self
-                .provider
-                .reconcile_upload(&self.repository, &intent, resume.as_ref(), cancel)
-                .await?
-            {
-                UploadResolution::Complete(receipt) => {
-                    Self::validate_receipt(&intent, &receipt)?;
-                    publication.complete = true
-                }
-                UploadResolution::Resumable(state) => {
-                    publication.resume = Some(Self::saved(state))
-                }
-                UploadResolution::Conflict => return Err(segment::corrupt()),
-                UploadResolution::RestartRequired => {}
-            }
-        }
         if !publication.complete {
             Self::check_publication_authority(store, &publication)?;
             if let Some((owner, context)) = protection {
@@ -727,6 +820,11 @@ impl ExternalLwwEngine {
             .external_lww_verify_versions(&self.target_scope(), &payload.changes)
             .map_err(store_error)?;
         self.admit_objects(store, &payload, &publication.object_id, cancel).await?;
+        if let Some(rooted_at_ms)=Self::trusted_control_time() {
+            for catalog in &payload.data_catalogs {
+                store.external_lww_authorize_data_catalog(&self.target_scope(),catalog,rooted_at_ms).map_err(store_error)?;
+            }
+        }
         for hash in payload
             .message_pages
             .keys()
@@ -762,11 +860,29 @@ impl ExternalLwwEngine {
         result.bytes.0 += sealed.len() as u64;
         Ok(result)
     }
+    async fn reconcile_publication(&self,publication:&mut SealedPublication,bytes:&[u8],cancel:&Cancellation)->Result<()> {
+        if publication.complete {return Ok(());}
+        let intent=ObjectIntent{job_id:self.library.clone(),repository_id:self.repository.repository_id.clone(),
+            object_id:publication.object_id.clone(),role:ObjectRole::Segment,byte_length:bytes.len() as u64,sha256:publication.sha256.clone()};
+        let resume=publication.resume.as_ref().map(Self::resume);
+        match self.provider.reconcile_upload(&self.repository,&intent,resume.as_ref(),cancel).await? {
+            UploadResolution::Complete(receipt)=>{Self::validate_receipt(&intent,&receipt)?; publication.complete=true;}
+            UploadResolution::Resumable(state)=>publication.resume=Some(Self::saved(state)),
+            UploadResolution::Conflict=>return Err(segment::corrupt()),
+            UploadResolution::RestartRequired=>{},
+        }
+        Ok(())
+    }
     fn check_publication_authority(store: &PersistentStore, publication: &SealedPublication) -> Result<()> {
         if store.lww_binding_authority().map_err(store_error)? != publication.authority {
             return Err(ProviderError::new(ErrorKind::PreconditionFailed));
         }
         Ok(())
+    }
+    fn trusted_control_time()->Option<u64> {
+        let clock:&dyn super::leases::LeaseClock=super::leases::system_clock();
+        let reading=clock.reading();
+        (reading.trusted && reading.foreground).then_some(reading.wall_ms)
     }
     fn check_frozen_body_authority(store: &PersistentStore, authority: DecimalU64, cancel: &Cancellation) -> crate::server_sync::Result<()> {
         cancel.check().map_err(|_| crate::server_sync::SyncError::new("operation-cancelled", 499))?;
@@ -938,6 +1054,8 @@ impl ExternalLwwEngine {
         payload: &mut Segment,
         bodies: &mut Vec<SealedBody>,
         assets: &mut BTreeMap<String, FrozenAsset>,
+        controls: &mut BTreeMap<String,String>,
+        reused_controls: &mut BTreeMap<String,FrozenControlCatalog>,
         _cancel: &Cancellation,
     ) -> Result<()> {
         let mut hashes = BTreeSet::new();
@@ -976,19 +1094,29 @@ impl ExternalLwwEngine {
         }
         for hash in hashes {
             if payload.message_pages.contains_key(&hash)
+                || controls.contains_key(&hash)
                 || assets.contains_key(&hash)
                 || payload.large_bodies.contains_key(&hash)
-                || store
-                    .external_lww_has_object(&self.target_scope(), &hash)
-                    .map_err(store_error)?
             {
                 continue;
             }
             if store.external_lww_object_is_control(&hash).map_err(store_error)? {
+                if let Some(now)=Self::trusted_control_time() {
+                    if let Some(proof)=store.external_lww_reusable_control_catalog(&self.target_scope(),&hash,now).map_err(store_error)? {
+                        if let Some(previous)=payload.data_catalogs.iter().find(|root|root.header.object_id==proof.catalog.header.object_id) {
+                            if previous!=&proof.catalog {return Err(segment::corrupt());}
+                        } else {payload.data_catalogs.push(proof.catalog.clone());}
+                        reused_controls.insert(hex::encode(proof.catalog.ciphertext_sha256),proof);
+                        continue;
+                    }
+                }
                 let bytes = store.lww_object_body(&hash).map_err(store_error)?.ok_or_else(segment::corrupt)?;
-                payload.message_pages.insert(hash, URL_SAFE_NO_PAD.encode(bytes));
+                let encoded=URL_SAFE_NO_PAD.encode(&bytes);
+                if bytes.len()>segment::SMALL_BODY_BYTES { controls.insert(hash,encoded); }
+                else { payload.message_pages.insert(hash,encoded); }
                 continue;
             }
+            if store.external_lww_has_object(&self.target_scope(),&hash).map_err(store_error)? {continue;}
             let root = store.repository_root();
             let local_size = crate::asset_repository::PayloadCas::new(root).map_err(transient)?
                 .stat_object(&hash).map_err(transient)?;
@@ -1186,6 +1314,20 @@ impl ExternalLwwEngine {
                 .external_lww_witness_object(&self.target_scope(), hash)
                 .map_err(store_error)?;
         }
+        let hashes=super::snapshot_restore::admit_data_catalogs(
+            &payload.data_catalogs,store,&self.target_scope(),&self.root_key,self.provider.as_ref(),&self.repository,cancel,
+        ).await?;
+        for hash in hashes {
+            store.external_lww_witness_object(&self.target_scope(),&hash).map_err(store_error)?;
+        }
+        if let Some(rooted_at_ms)=payload.changes.iter().map(|change|change.stamp.physical_ms.0).max() {
+            // Original unit clocks bound publication age; downloading does not renew it.
+            let upper=self.admitted_upper()?.checked_add(300_000).ok_or_else(segment::corrupt)?;
+            if rooted_at_ms>upper {return Err(ProviderError::new(ErrorKind::ClockSkew));}
+            for catalog in &payload.data_catalogs {
+                store.external_lww_authorize_data_catalog(&self.target_scope(),catalog,rooted_at_ms).map_err(store_error)?;
+            }
+        }
         let hashes = super::snapshot_restore::admit_asset_catalogs(
             &payload.asset_catalogs, store, &self.library, physical_segment, &self.connection_id,
             &self.connection_root, &self.root_key, self.provider.as_ref(), &self.repository, cancel,
@@ -1272,11 +1414,18 @@ impl ExternalLwwEngine {
     ) -> Result<Vec<StageReceive>> {
         let progress=store.lww_receive_progress(authority).map_err(store_error)?;
         let current=progress.into_iter().filter(|p|p.kind=="external").filter_map(|p|p.writer_id.map(|w|(w,p.cursor))).collect::<BTreeMap<_,_>>();
-        let mut behind=false;
+        let mut covered=BTreeMap::new();
         for receipt in self.snapshot_listing(cancel).await? {
             let (_,snapshot)=self.checkpoint(&receipt,cancel).await?;
-            if snapshot.covered_prefixes.iter().any(|(writer,prefix)|current.get(writer).copied().unwrap_or(DecimalU64(0))<*prefix) {behind=true;}
+            for (writer,prefix) in snapshot.covered_prefixes {
+                let value=covered.entry(writer).or_insert(DecimalU64(0));
+                *value=(*value).max(prefix);
+            }
         }
+        let segments = self.verified_segments(store, false, cancel).await?;
+        let mut available=current.clone();
+        for segment in &segments { available.insert(segment.writer_id.clone(),segment.seq); }
+        let behind=covered.iter().any(|(writer,prefix)|available.get(writer).copied().unwrap_or(DecimalU64(0))<*prefix);
         if behind {
             let directory=tempfile::tempdir().map_err(transient)?;
             let mut state=self.published_state(directory.path(),cancel).await?;
@@ -1294,7 +1443,6 @@ impl ExternalLwwEngine {
             }
             return Ok(requests);
         }
-        let segments = self.verified_segments(store, false, cancel).await?;
         segments
             .into_iter()
             .map(|segment| {
