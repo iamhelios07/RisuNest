@@ -101,17 +101,17 @@ impl PersistentStore {
         check: impl Fn() -> Result<()>,
         on_object_done: impl Fn(),
     ) -> Result<()> {
-        if !Residency::exists(&self.repository_root) {
-            return Ok(());
-        }
-        let residency = Residency::open(&self.repository_root)?;
+        let residency = Residency::exists(&self.repository_root).then(||Residency::open(&self.repository_root)).transpose()?;
         let mut hydration = crate::server_sync::residency::HydrationSession::new(&self.repository_root, cancellation)?;
         let mut completed = BTreeSet::new();
         let mut hydrate = |hashes: &[String]| -> Result<()> {
             check()?;
             let mut registered = Vec::new();
             for hash in hashes {
-                if !completed.contains(hash) && residency.object(hash, None)?.is_some() { registered.push(hash.clone()); }
+                if !completed.contains(hash) && (residency.as_ref().map(|residency|residency.object(hash,None)).transpose()?.flatten().is_some()
+                    || crate::external_storage::lww_residency::stat(&self.repository_root,hash)?.is_some()) {
+                    registered.push(hash.clone());
+                }
             }
             if !hydration.hydrate_many_observed(&registered, &check, &on_object_done)?.is_empty() {
                 return Err(SyncError::new("required-asset-unavailable", 409));

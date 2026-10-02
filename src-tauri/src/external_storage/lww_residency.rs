@@ -410,7 +410,37 @@ async fn remote_source(
     let (connection_root,connection_id,library_id)=if let Some(source)=source(root,hash)? {(source.connection_root,source.connection_id,source.library_id)} else if let Some(source)=packed_source(root,hash)? {(source.connection_root,source.connection_id,source.library_id)} else {return Ok(None)};
     open_source_connection(&connection_root,&connection_id,&library_id,cancel).await.map(Some)
 }
+#[cfg(test)]
+fn test_source_connections()->&'static std::sync::Mutex<std::collections::BTreeMap<(std::path::PathBuf,String),std::sync::Arc<super::connection_commands::ConnectedRepository>>> {
+    static CONNECTIONS:std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeMap<(std::path::PathBuf,String),std::sync::Arc<super::connection_commands::ConnectedRepository>>>>=std::sync::OnceLock::new();
+    CONNECTIONS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) struct TestSourceConnection { key:(std::path::PathBuf,String) }
+#[cfg(test)]
+impl Drop for TestSourceConnection {
+    fn drop(&mut self) {if let Ok(mut connections)=test_source_connections().lock() {connections.remove(&self.key);}}
+}
+#[cfg(test)]
+pub(crate) fn install_test_source_connection(root:&Path,connection:std::sync::Arc<super::connection_commands::ConnectedRepository>)->Result<TestSourceConnection> {
+    let key=(root.to_owned(),connection.stored.id.clone());
+    let mut connections=test_source_connections().lock().map_err(super::runtime::local_error)?;
+    if connections.contains_key(&key) {return Err(ProviderError::new(ErrorKind::PreconditionFailed));}
+    connections.insert(key.clone(),connection);
+    Ok(TestSourceConnection{key})
+}
 async fn open_source_connection(connection_root:&Path,connection_id:&str,library_id:&str,cancel:&Cancellation)->Result<(std::sync::Arc<dyn Provider>,RepositoryHandle,zeroize::Zeroizing<[u8;32]>)> {
+    #[cfg(test)]
+    {
+        let connection=test_source_connections().lock().map_err(super::runtime::local_error)?.get(&(connection_root.to_owned(),connection_id.to_owned())).cloned();
+        if let Some(connection)=connection {
+            cancel.check()?;
+            if connection.stored.descriptor.repository_id!=library_id {return Err(segment::corrupt());}
+            let (repository,_)=connection.provider.open_repository(&connection.stored.config,&SecretRef(connection.stored.credential_ref.clone()),OpenMode::Existing,cancel).await?;
+            if repository.repository_id!=connection.handle.repository_id || repository.connection_identity!=connection.handle.connection_identity {return Err(segment::corrupt());}
+            return Ok((connection.provider.clone(),repository,zeroize::Zeroizing::new(*connection.root_key)));
+        }
+    }
     let stored = ConnectionStore::open(connection_root)?.read(connection_id)?;
     if stored.descriptor.repository_id != library_id {
         return Err(segment::corrupt());

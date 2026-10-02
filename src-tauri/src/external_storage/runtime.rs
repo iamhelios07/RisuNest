@@ -305,7 +305,8 @@ pub(crate) async fn external_storage_cancel_job(app: AppHandle, job_id: String) 
     let store = JobStore::open(&root(&app)?)?;
     let state = app.state::<JobCommandState>();
     let observed = store.read(&job_id)?;
-    if super::runtime_restore::application_started(&observed) && !observed.terminal() {
+    if super::runtime_restore::application_started(&observed) && !observed.terminal()
+        && observed.summary.get("restoreAdopted").is_none() {
         return Ok(reconcile_job(&app, observed)?.summary);
     }
     {
@@ -604,7 +605,12 @@ pub(crate) fn require_admitted_library(
     Ok(())
 }
 
-fn reconcile_job(app: &AppHandle, job: DurableJob) -> Result<DurableJob> {
+fn reconcile_job(app: &AppHandle, mut job: DurableJob) -> Result<DurableJob> {
+    if job.request.kind==JobKind::Restore && !job.terminal() {
+        if let Some(result)=super::runtime_restore::confirmed_restore_activation(app,&job)? {
+            job.summary["result"]=result;
+        } else {job.summary.as_object_mut().unwrap().remove("result");}
+    }
     let state = app.state::<JobCommandState>();
     let active = state.active.lock().map_err(local_error)?;
     if active.contains_key(&job.id) {
@@ -1136,7 +1142,7 @@ async fn run_job(app: &AppHandle, id: &str, cancel: &Cancellation) -> Result<Val
             let context=lease_context(app,&root,&connected,&writer)?;
             match leases::admit_shared_work(&context,&job.id,cancel).await? {
                 leases::Admission::Admitted(owner)=>{
-                    owner.run(&context,cancel,super::runtime_restore::run_restore(app,&connected,&job,cancel)).await
+                    owner.run_restore(&context,cancel,super::runtime_restore::run_restore(app,&connected,&job,cancel)).await
                 }
                 leases::Admission::Yield{reason}=>Err(leases::yield_error(reason)),
                 leases::Admission::UnsupportedProtection if !context.protection_supported=>{

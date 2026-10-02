@@ -1605,6 +1605,30 @@ pub(crate) async fn download_packed_body(hash:&str,length:u64,chunks:Vec<wire::S
     let path=download_packed_body_file(hash,length,chunks,packs,stage,key,provider,repository,cancel).await?;
     std::fs::read(path).map_err(transient)
 }
+pub(crate) async fn download_packed_body_files(
+    sources:&[super::lww_residency::PackedSource],staging_root:&Path,root_key:&[u8;32],
+    provider:&dyn Provider,repository:&RepositoryHandle,cancel:&Cancellation,
+)->Result<BTreeMap<String,PathBuf>> {
+    ensure_directory(staging_root)?;
+    let mut packs=BTreeMap::new();let mut entries=Vec::new();let mut hashes=BTreeSet::new();
+    for source in sources {
+        cancel.check()?;super::lww_residency::validate_packed_source(source,repository)?;
+        if !hashes.insert(source.hash.clone()) {return Err(corrupt("duplicate body"));}
+        for stored in &source.packs {
+            let pack=RemoteObject::from_stored(stored,repository)?;
+            if let Some(previous)=packs.insert(pack.object_id.clone(),pack.clone()) {
+                if previous!=pack {return Err(corrupt("conflicting pack"));}
+            }
+        }
+        entries.push(CompleteEntry {kind:wire::CatalogEntryKind::Object,key:format!("object/{}",source.hash),content_sha256:hex::decode(&source.hash).map_err(corrupt)?.try_into().map_err(|_|corrupt("body hash"))?,byte_length:source.byte_length,chunks:source.chunks.clone()});
+    }
+    let content=content_store(staging_root)?;
+    let mut plan=resolve_entries(entries,staging_root,&content,None,&BTreeSet::new(),cancel)?;
+    for resolved in &mut plan {resolved.destination=Some(staging_root.join(format!("{}.payload",resolved.digest)));}
+    let (_,objects)=turn_over_packs(plan,&packs,root_key,staging_root,provider,repository,&PhaseProgress::silent(),cancel).await?;
+    objects.into_iter().map(|(hash,object)|match object.source {ObjectSource::File(path)=>Ok((hash,path)),_=>Err(corrupt("body source"))}).collect()
+}
+
 pub(crate) async fn download_packed_body_file(
     hash:&str, length:u64, chunks:Vec<wire::StoredChunk>, stored_packs:Vec<wire::StoredObject>, staging_root:&Path, root_key:&[u8;32],
     provider:&dyn Provider, repository:&RepositoryHandle,cancel:&Cancellation,
