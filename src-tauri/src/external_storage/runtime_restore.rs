@@ -28,65 +28,49 @@ const RESTORE_COMMIT_SCHEMA: &str = "risunest.external-restore-commit/v1";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct RestoreCommitMarker {
+struct RestoreCommitIntent {
     schema: String,
     job_id: String,
     connection_id: String,
     snapshot_id: String,
     expected_revision: String,
-    received_revision: String,
+    header: crate::persistent_store::lww::Header,
+    staging_id: String,
 }
 
-fn restore_marker_key(job: &str) -> String {
-    format!("external-restore-commit:{job}")
-}
-
-fn restore_marker(job: &DurableJob, expected_revision: i64) -> Result<RestoreCommitMarker> {
-    let received_revision = expected_revision
-        .checked_add(1)
-        .ok_or_else(|| ProviderError::new(ErrorKind::PreconditionFailed))?;
-    Ok(RestoreCommitMarker {
-        schema: RESTORE_COMMIT_SCHEMA.into(),
-        job_id: job.id.clone(),
-        connection_id: job.request.connection_id.clone(),
-        snapshot_id: job.request.snapshot_id.clone().ok_or_else(corrupt)?,
-        expected_revision: expected_revision.to_string(),
-        received_revision: received_revision.to_string(),
+fn restore_intent(job: &DurableJob, expected_revision: i64, header: crate::persistent_store::lww::Header, staging_id:&str) -> Result<RestoreCommitIntent> {
+    Ok(RestoreCommitIntent {
+        schema: RESTORE_COMMIT_SCHEMA.into(), job_id:job.id.clone(),
+        connection_id:job.request.connection_id.clone(),
+        snapshot_id:job.request.snapshot_id.clone().ok_or_else(corrupt)?,
+        expected_revision:expected_revision.to_string(), header, staging_id:staging_id.into(),
     })
 }
 
 fn completed_restore_in_store(store: &PersistentStore, job: &DurableJob) -> Result<Option<Value>> {
-    if job.request.kind != JobKind::Restore {
-        return Ok(None);
-    }
-    let expected_revision = job
-        .request
-        .target_revision
-        .as_deref()
-        .ok_or_else(corrupt)?
-        .parse::<i64>()
-        .map_err(|_| corrupt())?;
-    let Some(value) = store
-        .get_app_kv(&restore_marker_key(&job.id))
-        .map_err(pds_error)?
-    else {
-        return Ok(None);
-    };
-    let marker: RestoreCommitMarker = serde_json::from_value(value).map_err(|_| corrupt())?;
-    let expected = restore_marker(job, expected_revision)?;
-    if marker != expected
-        || store.revision().map_err(pds_error)?
-            < marker
-                .received_revision
-                .parse::<i64>()
-                .map_err(|_| corrupt())?
-    {
-        return Err(corrupt());
-    }
-    Ok(Some(json!({
-        "snapshotId":marker.snapshot_id,
-        "receivedRevision":marker.received_revision
-    })))
+    if job.request.kind != JobKind::Restore {return Ok(None)}
+    let Some(value) = job.summary.get("restoreCommit") else {return Ok(None)};
+    let intent:RestoreCommitIntent = serde_json::from_value(value.clone()).map_err(|_| corrupt())?;
+    let expected_revision = job.request.target_revision.as_deref().ok_or_else(corrupt)?
+        .parse::<i64>().map_err(|_| corrupt())?;
+    if serde_json::to_value(&intent).map_err(runtime::local_error)? != *value
+        || intent != restore_intent(job,expected_revision,intent.header.clone(),&intent.staging_id)?
+        || intent.header.request_id != format!("external-backup-restore:{}",job.id)
+        || intent.staging_id.is_empty() {return Err(corrupt())}
+    let Some(receipt) = store.lww_device_replacement_receipt(&intent.header,&intent.staging_id).map_err(pds_error)? else {return Ok(None)};
+    Ok(Some(json!({"snapshotId":intent.snapshot_id,"receivedRevision":receipt.revision.to_string()})))
+}
+
+fn persist_restore_intent(root:&Path, job:&DurableJob, intent:&RestoreCommitIntent) -> Result<()> {
+    let jobs=JobStore::open(root)?;
+    let mut current=jobs.read(&job.id)?;
+    let value=serde_json::to_value(intent).map_err(runtime::local_error)?;
+    if current.summary.get("restoreCommit").is_some_and(|old| old != &value) {return Err(corrupt())}
+    current.summary["restoreCommit"]=value;
+    current.summary["applicationStarted"]=json!(true);
+    current.summary["phase"]=json!("applying-local");
+    current.summary["updatedAtMs"]=json!(runtime::now_ms().to_string());
+    jobs.put(&current)
 }
 
 /// Read-only completion recovery used before reopening a provider connection.
@@ -98,6 +82,7 @@ pub(crate) fn application_started(job: &DurableJob) -> bool {
     job.request.kind == JobKind::Restore && job.summary["applicationStarted"] == true
 }
 
+#[cfg(test)]
 fn mark_application_started(root: &Path, job: &DurableJob) -> Result<()> {
     let jobs = JobStore::open(root)?;
     let mut current = jobs.read(&job.id)?;
@@ -284,6 +269,9 @@ pub(crate) async fn run_restore(
         cancel,
     )
     .await?;
+    let original_units = snapshot_restore::download_backup_original_units(
+        &remote,&staging_root,&connected.root_key,connected.provider.as_ref(),&connected.handle,cancel,
+    ).await?;
     cancel.check()?;
     validate_download(connected, snapshot_id, &snapshot)?;
     let selection = restore_selection(job.request.restore_areas.as_deref())?;
@@ -319,6 +307,7 @@ pub(crate) async fn run_restore(
             &worker_job,
             expected_revision,
             snapshot,
+            original_units,
             selection,
             sections,
             worker_cancel,
@@ -329,12 +318,59 @@ pub(crate) async fn run_restore(
     Ok(result)
 }
 
+fn stage_original_backup_controls(
+    store:&mut PersistentStore,
+    snapshot:&PreparedRemoteSnapshot,
+    units:&std::collections::BTreeMap<risunest_sync_wire::unit::UnitKey,risunest_sync_wire::unit::UnitValue>,
+    cancel:&Cancellation,
+) -> Result<()> {
+    use crate::persistent_store::external_capture::{original_unit_dependency_inventory,BackupBodyRole};
+    let content=super::content_store::ContentStore::open(&snapshot.staging_root.join("external-storage")).map_err(pds_error)?;
+    let declared=snapshot.objects.iter().map(|object| (object.content_hash.as_str(),object)).collect::<std::collections::BTreeMap<_,_>>();
+    if declared.len() != snapshot.objects.len() {return Err(corrupt())}
+    let read=|hash:&str| -> crate::persistent_store::StoreResult<Option<Vec<u8>>> {
+        cancel.check().map_err(|_| StoreError::Validation{message:"External restore cancelled".into()})?;
+        let Some(object)=declared.get(hash) else {return Ok(None)};
+        if matches!(object.source,super::content_store::ObjectSource::Library(_)) {return Ok(None)}
+        if object.byte_length > risunest_sync_wire::MAX_METADATA_BYTES as u64 {return Err(StoreError::Validation{message:"Backup control exceeds its bound".into()})}
+        let mut source=content.open_source(&object.source)?;
+        let mut bytes=Vec::new();
+        use std::io::Read;
+        source.by_ref().take(risunest_sync_wire::MAX_METADATA_BYTES as u64+1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 != object.byte_length {return Err(StoreError::Validation{message:"Backup control size differs".into()})}
+        Ok(Some(bytes))
+    };
+    let size=|hash:&str| Ok(declared.get(hash).map(|object| object.byte_length));
+    let probe=runtime::CancelProbe(cancel.clone());
+    let metadata=original_unit_dependency_inventory(units,&read,&size,&probe,false,&mut |_,_,_| Ok(()));
+    cancel.check()?;
+    let metadata=metadata.map_err(pds_error)?;
+    let mut spool=super::capture::BackupDependencySpool::new(&snapshot.staging_root.join("verified-original-controls")).map_err(pds_error)?;
+    let inventory=original_unit_dependency_inventory(units,
+        &|hash| if metadata.controls.contains_key(hash) {read(hash)} else {Ok(None)},
+        &size,&probe,true,&mut |hash,bytes,role| Ok(spool.push(hash,bytes,role)?),
+    );
+    cancel.check()?;
+    let inventory=inventory.map_err(pds_error)?;
+    if !inventory.spooled_payloads.is_empty() {return Err(corrupt())}
+    cancel.check()?;
+    spool.seal().map_err(pds_error)?;
+    let result=spool.visit(&mut |hash,bytes,role| {
+        if cancel.check().is_err() {return Err(StoreError::Validation{message:"External restore cancelled".into()})}
+        if role != BackupBodyRole::Control {return Err(StoreError::Validation{message:"Backup control role differs".into()})}
+        store.lww_put_object(hash,bytes)
+    });
+    cancel.check()?;
+    result.map_err(pds_error)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_local_restore(
     app: &AppHandle,
     job: &DurableJob,
     expected_revision: i64,
     snapshot: PreparedRemoteSnapshot,
+    original_units: std::collections::BTreeMap<risunest_sync_wire::unit::UnitKey,risunest_sync_wire::unit::UnitValue>,
     selection: RestoreSelection,
     sections: Vec<super::sections::CapturedSection>,
     cancel: Cancellation,
@@ -348,6 +384,11 @@ fn prepare_local_restore(
     // Open a dedicated native connection while renderer admission is still
     // available. It remains owned across the maintenance WebView reload.
     let mut store = runtime::native_store(app)?;
+    let current_identity=store.external_identity().map_err(pds_error)?;
+    runtime::require_admitted_library(job,&current_identity)?;
+    if current_identity.selection_epoch != job.admission_identity.selection_epoch {
+        return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+    }
     let maintenance = app
         .state::<PersistentStoreState>()
         .acquire_device_maintenance()
@@ -356,6 +397,7 @@ fn prepare_local_restore(
     if store.revision().map_err(pds_error)? != expected_revision {
         return Err(ProviderError::new(ErrorKind::PreconditionFailed));
     }
+    stage_original_backup_controls(&mut store,&snapshot,&original_units,&cancel)?;
     let snapshot_id = snapshot.snapshot_id.clone();
     let staging_root = snapshot.staging_root.clone();
     let prepared = if selection.library {
@@ -407,24 +449,17 @@ fn prepare_local_restore(
     // bundle with a missing object from installing half of itself.
     let prepared_sections =
         super::sections::prepare_received_backup_sections(&sections, &cancel)?;
-    let marker = restore_marker(job, expected_revision)?;
-    let marker_value = serde_json::to_value(&marker).map_err(runtime::local_error)?;
+    let header = crate::persistent_store::lww::Header {
+        binding_authority:store.lww_binding_authority().map_err(pds_error)?,
+        request_id:format!("external-backup-restore:{}",job.id),
+    };
+    let intent = restore_intent(job,expected_revision,header,prepared.external_staging_id())?;
     cancel.check()?;
-    mark_application_started(&runtime::root(app)?, job)?;
-    let device = store.device_store_mut().map_err(pds_error)?;
-    for rows in &prepared_sections {
-        device.restore_prepared_backup_section(rows).map_err(pds_error)?;
-    }
-    let revision = store
-        .finish_prepared_replace_with_app_kv(
-            prepared,
-            &restore_marker_key(&job.id),
-            &marker_value,
-        )
-        .map_err(pds_error)?;
-    if revision.revision.to_string() != marker.received_revision {
-        return Err(corrupt());
-    }
+    persist_restore_intent(&runtime::root(app)?,job,&intent)?;
+    let revision = store.lww_commit_replacement_with_device_sections(
+        &intent.header,&intent.staging_id,Some(&original_units),&prepared_sections.iter().collect::<Vec<_>>(),
+    ).map_err(pds_error)?;
+    drop(prepared);
     drop(maintenance);
     drop(permit);
     cleanup_staging(&staging_root);
@@ -473,30 +508,87 @@ mod tests {
     }
 
     #[test]
+    fn original_control_admission_certifies_held_manifest_and_rejects_missing_tree_before_install() {
+        use risunest_sync_wire::{descriptor::RecordDescriptor,unit::{UnitKey,UnitValue}};
+        let directory=tempfile::tempdir().unwrap();
+        let mut store=PersistentStore::open(directory.path()).unwrap();
+        let staging=directory.path().join("staging");
+        let mut content=super::super::content_store::ContentStore::open(&staging.join("external-storage")).unwrap();
+        let manifest=risunest_external_storage_format::message_pages::MessageManifest {
+            schema:risunest_external_storage_format::message_pages::MANIFEST_SCHEMA.into(),message_count:0.into(),pages:Vec::new(),
+        }.encode().unwrap();
+        content.put(&manifest.hash,&manifest.bytes).unwrap();
+        content.commit().unwrap();
+        let units=std::collections::BTreeMap::from([(UnitKey::new(&["messages","missing-character","missing-conversation"]).unwrap(),UnitValue::object(RecordDescriptor::content(manifest.hash.clone())).unwrap())]);
+        let mut snapshot=prepared(Some("source-device"));
+        snapshot.staging_root=staging;
+        snapshot.objects.push(snapshot_restore::PreparedObject {content_hash:manifest.hash.clone(),byte_length:manifest.bytes.len() as u64,source:super::super::content_store::ObjectSource::Captured(manifest.hash.clone())});
+        let mut invalid_units=units.clone();
+        let mut invalid=RecordDescriptor::content(risunest_sync_wire::hash(b"synthetic absent opaque payload"));
+        invalid.dependency_root=Some("ab".repeat(32));
+        invalid_units.insert(UnitKey::new(&["z-future-unit","missing-tree"]).unwrap(),UnitValue::object(invalid).unwrap());
+        assert!(stage_original_backup_controls(&mut store,&snapshot,&invalid_units,&Cancellation::default()).is_err());
+        assert!(store.lww_object_body(&manifest.hash).unwrap().is_none());
+        stage_original_backup_controls(&mut store,&snapshot,&units,&Cancellation::default()).unwrap();
+        assert_eq!(store.lww_object_body(&manifest.hash).unwrap(),Some(manifest.bytes));
+    }
+
+    #[test]
+    fn original_control_admission_never_opens_present_opaque_payload() {
+        use risunest_sync_wire::{descriptor::RecordDescriptor,unit::{UnitKey,UnitValue}};
+        let directory=tempfile::tempdir().unwrap();
+        let mut store=PersistentStore::open(directory.path()).unwrap();
+        let body=crate::asset_repository::PayloadCas::new(directory.path()).unwrap().prepare_bytes(b"synthetic present opaque payload").unwrap();
+        let units=std::collections::BTreeMap::from([(UnitKey::new(&["future-unit","present-body"]).unwrap(),UnitValue::object(RecordDescriptor::content(body.content_hash.clone())).unwrap())]);
+        let mut snapshot=prepared(Some("source-device"));
+        snapshot.staging_root=directory.path().join("staging");
+        snapshot.objects.push(snapshot_restore::PreparedObject {content_hash:body.content_hash.clone(),byte_length:body.byte_size,source:super::super::content_store::ObjectSource::Library(body.content_hash)});
+        crate::asset_repository::body_io::reset_body_io();
+        stage_original_backup_controls(&mut store,&snapshot,&units,&Cancellation::default()).unwrap();
+        let observed=crate::asset_repository::body_io::take_body_io();
+        assert!(observed.complete());
+        assert_eq!(observed.asset_work(),Default::default());
+        assert!(observed.objects.is_empty());
+    }
+
+    fn commit_fixture(store:&mut PersistentStore,root:&Path,job:&DurableJob) -> DurableJob {
+        use risunest_external_storage_format::section::SectionKind;
+        JobStore::open(root).unwrap().put(job).unwrap();
+        let source_dir=tempfile::tempdir().unwrap();
+        let mut source=PersistentStore::open(source_dir.path()).unwrap();
+        source.device_store_mut().unwrap().write_setting("accountst",&json!("synthetic restored setting")).unwrap();
+        let sections=source.device_store_mut().unwrap().capture_backup_sections(&[SectionKind::Hypa,SectionKind::LocalPlugins,SectionKind::LocalSettings]).unwrap();
+        let stage=store.replace_begin().unwrap();
+        store.replace_put_root(&stage.staging_id,&json!({"language":"synthetic restored language"})).unwrap();
+        let header=crate::persistent_store::lww::Header {binding_authority:store.lww_binding_authority().unwrap(),request_id:format!("external-backup-restore:{}",job.id)};
+        let intent=restore_intent(job,0,header,&stage.staging_id).unwrap();
+        persist_restore_intent(root,job,&intent).unwrap();
+        let pending=JobStore::open(root).unwrap().read(&job.id).unwrap();
+        assert!(completed_restore_in_store(store,&pending).unwrap().is_none());
+        store.lww_commit_replacement_with_device_sections(&intent.header,&intent.staging_id,Some(&Default::default()),&sections.iter().collect::<Vec<_>>()).unwrap();
+        assert_eq!(store.device_store().unwrap().read_setting("accountst").unwrap(),Some(json!("synthetic restored setting")));
+        pending
+    }
+
+    #[test]
     fn local_application_evidence_survives_reopen_and_later_phase_updates() {
-        let root = tempfile::tempdir().unwrap();
-        let input = serde_json::from_value(json!({
-            "connectionId":"synthetic-connection", "kind":"restore",
-            "snapshotId":"synthetic-snapshot", "targetRevision":"0"
-        })).unwrap();
-        let job = DurableJob::new(input, false, 1, identity());
+        let root=tempfile::tempdir().unwrap();
+        let input=serde_json::from_value(json!({"connectionId":"synthetic-connection","kind":"restore","snapshotId":"synthetic-snapshot","targetRevision":"0"})).unwrap();
+        let job=DurableJob::new(input,false,1,identity());
         JobStore::open(root.path()).unwrap().put(&job).unwrap();
-        mark_application_started(root.path(), &job).unwrap();
-        update_phase(root.path(), &job, "downloading").unwrap();
-        let reopened = JobStore::open(root.path()).unwrap().read(&job.id).unwrap();
-        assert!(application_started(&reopened));
-        assert_eq!(reopened.summary["phase"], "downloading");
-        let mut store = PersistentStore::open(root.path()).unwrap();
-        assert!(completed_restore_in_store(&store, &reopened).unwrap().is_none());
-        let stage = store.replace_begin().unwrap();
-        store.replace_put_root(&stage.staging_id, &json!({"marker":"restored"})).unwrap();
-        let prepared = store.prepare_replace_commit(&stage.staging_id, Some(0)).unwrap();
-        let marker = serde_json::to_value(restore_marker(&job, 0).unwrap()).unwrap();
-        store.finish_prepared_replace_with_app_kv(prepared, &restore_marker_key(&job.id), &marker).unwrap();
-        for _ in 0..2 {
-            assert_eq!(completed_restore_in_store(&store, &reopened).unwrap().unwrap()["receivedRevision"], "1");
-        }
-        assert_eq!(store.revision().unwrap(), 1);
+        mark_application_started(root.path(),&job).unwrap();
+        update_phase(root.path(),&job,"downloading").unwrap();
+        let mut store=PersistentStore::open(root.path()).unwrap();
+        let pending=commit_fixture(&mut store,root.path(),&job);
+        let receipt=completed_restore_in_store(&store,&pending).unwrap().unwrap();
+        update_phase(root.path(),&pending,"settling-bodies").unwrap();
+        drop(store);
+        let reopened=PersistentStore::open(root.path()).unwrap();
+        let durable=JobStore::open(root.path()).unwrap().read(&job.id).unwrap();
+        assert!(application_started(&durable));
+        assert_eq!(durable.summary["phase"],"settling-bodies");
+        for _ in 0..2 {assert_eq!(completed_restore_in_store(&reopened,&durable).unwrap(),Some(receipt.clone()));}
+        assert_eq!(reopened.revision().unwrap().to_string(),receipt["receivedRevision"].as_str().unwrap());
     }
 
     #[test]
@@ -531,37 +623,24 @@ mod tests {
         assert!(require_restorable_sections(&selection,&prepared(Some("")),"this-device").is_err());
     }
     #[test]
-    fn library_restore_marker_recovers_only_the_exact_durable_request() {
-        let root = tempfile::tempdir().unwrap();
-        let store = PersistentStore::open(root.path()).unwrap();
-        let request = serde_json::from_value(json!({
-            "connectionId":"synthetic-connection",
-            "kind":"restore",
-            "snapshotId":"synthetic-snapshot",
-            "targetRevision":"0"
-        }))
-        .unwrap();
-        let job = DurableJob::new(request, false, 1, identity());
-        assert!(completed_restore_in_store(&store, &job).unwrap().is_none());
-        let marker = restore_marker(&job, 0).unwrap();
-        store
-            .set_app_kv(
-                &restore_marker_key(&job.id),
-                &serde_json::to_value(marker).unwrap(),
-            )
-            .unwrap();
-        let database =
-            rusqlite::Connection::open(root.path().join("persistent/persistent.sqlite")).unwrap();
-        database
-            .execute("UPDATE meta SET value='1' WHERE key='currentRevision'", [])
-            .unwrap();
-
-        assert_eq!(
-            completed_restore_in_store(&store, &job).unwrap().unwrap(),
-            json!({"snapshotId":"synthetic-snapshot","receivedRevision":"1"})
-        );
-        let mut different = job.clone();
-        different.request.snapshot_id = Some("different-snapshot".into());
-        assert!(completed_restore_in_store(&store, &different).is_err());
+    fn library_restore_receipt_recovers_only_the_exact_durable_request() {
+        let root=tempfile::tempdir().unwrap();
+        let mut store=PersistentStore::open(root.path()).unwrap();
+        let request=serde_json::from_value(json!({"connectionId":"synthetic-connection","kind":"restore","snapshotId":"synthetic-snapshot","targetRevision":"0"})).unwrap();
+        let job=DurableJob::new(request,false,1,identity());
+        assert!(completed_restore_in_store(&store,&job).unwrap().is_none());
+        let pending=commit_fixture(&mut store,root.path(),&job);
+        assert!(completed_restore_in_store(&store,&pending).unwrap().is_some());
+        let mut different=pending.clone();
+        different.request.snapshot_id=Some("different-snapshot".into());
+        assert!(completed_restore_in_store(&store,&different).is_err());
+        different=pending.clone();
+        different.summary["restoreCommit"]["stagingId"]=json!("different-stage");
+        assert!(matches!(completed_restore_in_store(&store,&different),Err(ProviderError{kind:ErrorKind::Corrupt,..})));
+        different=pending.clone();
+        different.summary["restoreCommit"]["header"]["bindingAuthority"]=json!("1");
+        assert!(matches!(completed_restore_in_store(&store,&different),Err(ProviderError{kind:ErrorKind::Corrupt,..})));
+        store.set_app_kv(&format!("external-restore-commit:{}",job.id),&json!({"receivedRevision":"999"})).unwrap();
+        assert!(completed_restore_in_store(&store,&job).unwrap().is_none());
     }
 }

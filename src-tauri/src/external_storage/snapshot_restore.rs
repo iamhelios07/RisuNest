@@ -1610,7 +1610,12 @@ pub(crate) async fn download_original_backup_units(
     let mut units = BTreeMap::new();
     for record in records {
         cancel.check()?;
-        let bytes = content.read_all(&record.content_hash).map_err(transient)?;
+        if record.byte_length > risunest_sync_wire::MAX_METADATA_BYTES as u64 {
+            return Err(corrupt("original unit control exceeds its bound"));
+        }
+        let mut source=content.open_body(&record.content_hash).map_err(transient)?;
+        let mut bytes=Vec::new();
+        source.by_ref().take(risunest_sync_wire::MAX_METADATA_BYTES as u64+1).read_to_end(&mut bytes).map_err(transient)?;
         if bytes.len() as u64 != record.byte_length {
             return Err(corrupt("original unit control length"));
         }
@@ -1622,12 +1627,26 @@ pub(crate) async fn download_original_backup_units(
         {
             return Err(corrupt("original unit catalog key differs from its control"));
         }
+        #[cfg(test)]
+        crate::persistent_store::hash_work::validation(&unit.value);
         unit.value.validate().map_err(corrupt)?;
         if units.insert(unit.key, unit.value).is_some() {
             return Err(corrupt("duplicate original unit"));
         }
     }
     Ok(units)
+}
+
+pub(crate) async fn download_backup_original_units(
+    snapshot:&RemoteObject, staging_root:&Path, key:&[u8;32], provider:&dyn Provider,
+    repository:&RepositoryHandle, cancel:&Cancellation,
+) -> Result<BTreeMap<risunest_sync_wire::unit::UnitKey,risunest_sync_wire::unit::UnitValue>> {
+    if snapshot.role != ObjectRole::BackupBundle {return Err(corrupt("full backup is required"))}
+    let root=open_object(snapshot,key,staging_root,provider,repository,cancel).await?;
+    let document=super::control::SnapshotView::read(&read_bytes(&root,wire::MAX_METADATA_BYTES)?,wire::ObjectRole::BackupBundle,&snapshot.repository_id)?;
+    if snapshot.object_id != format!("snapshot-{}",document.snapshot_id) {return Err(corrupt("backup identity differs"))}
+    let original=RemoteObject::from_stored(document.original_units.as_ref().ok_or_else(|| corrupt("complete original unit root is required"))?,repository)?;
+    download_original_backup_units(&original,staging_root,key,provider,repository,cancel).await
 }
 
 pub(crate) struct DatabaseFirstSnapshot {
