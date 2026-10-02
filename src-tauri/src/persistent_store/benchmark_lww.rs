@@ -6,6 +6,11 @@ mod fixture;
 mod native_observation;
 #[path = "../../../benchmarks/lww-native/src/invalid_diagnostics.rs"]
 mod invalid_diagnostics;
+#[path = "../../../benchmarks/lww-native/src/native_shards.rs"]
+mod native_shards;
+#[path = "../../../benchmarks/lww-native/src/scale_certificate.rs"]
+mod scale_certificate;
+
 
 use super::{lww::{self, MessageLocator, UnitMutation}, sync_selection::{SwitchBindingRequest, SyncTarget},
     ConversationMutation, PersistentStore, WorkingSetCommit};
@@ -283,6 +288,95 @@ fn verify(store: &PersistentStore, change: SmallChange, expected: &Value) {
             assert_eq!(unique.len(), messages.len());
         },
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AdditionalChange { Persona, MiddleEdit, Insertion, Deletion, Burst }
+
+pub(crate) struct PreparedAdditionalChange {
+    pub commits:Vec<WorkingSetCommit>,
+    expected_root:std::collections::BTreeMap<String,Value>,
+    expected_messages:Option<Vec<Value>>,
+}
+
+pub(crate) fn prepare_additional_change(store:&PersistentStore, change:AdditionalChange,
+    direction:Direction, iteration:u64) -> PreparedAdditionalChange {
+    let root = store.read_root(None).unwrap().value;
+    let revision = store.revision().unwrap();
+    let authority = store.lww_binding_authority().unwrap();
+    let mut prepared = PreparedAdditionalChange {commits:Vec::new(),
+        expected_root:std::collections::BTreeMap::new(),expected_messages:None};
+    let make_commit = |offset:i64| WorkingSetCommit {
+        expected_revision:revision.checked_add(offset).unwrap(),binding_authority:Some(authority),
+        request_id:Some(uuid::Uuid::new_v4().to_string()),..Default::default()};
+    match change {
+        AdditionalChange::Persona => {
+            let current = root["selectedPersona"].as_str().expect("final fixture needs stable persona selection");
+            assert!(matches!(current,"synthetic-persona-0" | "synthetic-persona-1"));
+            let next = json!(if current=="synthetic-persona-0" {"synthetic-persona-1"} else {"synthetic-persona-0"});
+            let mut commit = make_commit(0);
+            commit.unit_mutations = Some(vec![UnitMutation::Set {
+                key:UnitKey::new(&["root","selectedPersona"]).unwrap(),value:next.clone()}]);
+            prepared.expected_root.insert("selectedPersona".into(),next);
+            prepared.commits.push(commit);
+        },
+        AdditionalChange::Burst => {
+            let initial = root["loreBookDepth"].as_i64().unwrap();
+            // Sixteen durable changes to one shared unit test actual outbox coalescing.
+            for offset in 0..16 {
+                let mut commit = make_commit(offset);
+                let value = json!(initial.checked_add(offset+1).unwrap());
+                commit.unit_mutations = Some(vec![UnitMutation::Set {
+                    key:UnitKey::new(&["root","loreBookDepth"]).unwrap(),value}]);
+                prepared.commits.push(commit);
+            }
+            prepared.expected_root.insert("loreBookDepth".into(),json!(initial.checked_add(16).unwrap()));
+        },
+        AdditionalChange::MiddleEdit | AdditionalChange::Insertion | AdditionalChange::Deletion => {
+            let conversation = store.read_conversation("synthetic-character-0","synthetic-conversation-0",None)
+                .unwrap().unwrap().value;
+            let mut expected = conversation["message"].as_array().unwrap().clone();
+            let index = 2048;
+            assert!(expected.len()>index);
+            let (delete_count,messages) = match change {
+                AdditionalChange::MiddleEdit => {
+                    let mut message = expected[index].clone();
+                    message["data"] = json!(format!("Fixed synthetic middle edit {direction:?}-{iteration}"));
+                    expected[index]=message.clone();
+                    (1,vec![message])
+                },
+                AdditionalChange::Insertion => {
+                    let message = json!({"role":"user","data":"Fixed synthetic inserted message",
+                        "chatId":format!("synthetic-insert-{direction:?}-{iteration}")});
+                    expected.insert(index,message.clone());
+                    (0,vec![message])
+                },
+                AdditionalChange::Deletion => {expected.remove(index); (1,Vec::new())},
+                _ => unreachable!(),
+            };
+            let mut commit = make_commit(0);
+            commit.conversations=Some(vec![ConversationMutation::ReplaceRange {
+                character_id:"synthetic-character-0".into(),conversation_id:"synthetic-conversation-0".into(),
+                start:index as i64,delete_count,messages,conversation:None,configured_index:None}]);
+            commit.messages_changed=Some(vec![MessageLocator {character_id:"synthetic-character-0".into(),
+                conversation_id:"synthetic-conversation-0".into(),start:Some(index as i64)}]);
+            prepared.expected_messages=Some(expected);
+            prepared.commits.push(commit);
+        },
+    }
+    prepared
+}
+
+pub(crate) fn verify_additional_change(store:&PersistentStore, prepared:&PreparedAdditionalChange) {
+    let root = store.read_root(None).unwrap().value;
+    for (key,value) in &prepared.expected_root {assert_eq!(&root[key.as_str()],value);}
+    if let Some(messages) = &prepared.expected_messages {
+        verify(store,SmallChange::Append,&Value::Array(messages.clone()));
+    }
+}
+
+pub(crate) fn apply_additional_change(store:&mut PersistentStore,prepared:&PreparedAdditionalChange) {
+    for commit in &prepared.commits {store.commit(commit).unwrap();}
 }
 
 fn verify_bootstrap(a:&PersistentStore, b:&PersistentStore) {
@@ -636,6 +730,368 @@ fn write_samples(directory:&Path, samples:&[NativeSample],attributions:&[PairAtt
                 "affected":"actual native ApplyResult after durable completion"},
             "excluded":["server internal SHA", "MAC", "HKDF", "general hashing", "renderer paint", "scheduler empty polls"],
             "precise_control_attribution":attributions,"samples":samples})).unwrap();
+}
+
+pub(crate) fn append_native_shard(store:&mut PersistentStore, shard:&native_shards::NativeShard, seed:u64) {
+    use crate::asset_repository::PayloadCas;
+    use crate::asset_repository::owner_manifest_codec::{encode_owner_manifest,OwnerManifestEntry};
+    let cas = PayloadCas::new(store.repository_root()).unwrap();
+    let mut registrations = Vec::new();
+    let mut aliases = Vec::new();
+    for asset in &shard.assets {
+        let object = cas.prepare_bytes(&fixture::asset_body(seed,asset.index)).unwrap();
+        assert_eq!(object.content_hash,asset.payload_hash);
+        assert_eq!(object.byte_size,asset.byte_length);
+        registrations.push(super::asset_object_catalog::AssetObjectRegistration {
+            object_hash:object.content_hash.clone(),byte_size:object.byte_size});
+        aliases.push(super::AssetAlias {key:asset.logical_key.clone(),object_hash:Some(object.content_hash),
+            kind:"asset".into(),size:asset.byte_length as i64,mime:"application/octet-stream".into(),
+            name:format!("Synthetic asset {}",asset.index),ext:"bin".into(),inlay_type:None,
+            width:None,height:None,metadata:json!({})});
+    }
+    let entries = shard.owner_entries.iter().map(|entry| OwnerManifestEntry {
+        tuple:entry.tuple.clone(),payload_hash:Some(hex::decode(&entry.payload_hash).unwrap().try_into().unwrap())
+    }).collect::<Vec<_>>();
+    let manifest = cas.prepare_bytes(&encode_owner_manifest(&entries).unwrap()).unwrap();
+    registrations.push(super::asset_object_catalog::AssetObjectRegistration {
+        object_hash:manifest.content_hash.clone(),byte_size:manifest.byte_size});
+    store.asset_object_catalog().register(&registrations,1).unwrap();
+    let owner = super::AssetOwnerLocator::CharacterAdditionalAssets {
+        character_id:shard.character["chaId"].as_str().unwrap().into()};
+    let commit = WorkingSetCommit {expected_revision:store.revision().unwrap(),
+        add_character:Some(shard.character.clone()),asset_owner_heads:Some(vec![super::AssetOwnerHead::present(
+            owner,manifest.content_hash,entries.len() as i64)]),..Default::default()};
+    store.commit_with_asset_aliases(&commit,&aliases).unwrap();
+}
+
+#[derive(Debug,Serialize)]
+pub(crate) struct NativeBuildProgress {
+    pub shards:u64,
+    pub assigned_assets:u64,
+    pub generated_input_bytes:u64,
+    pub maximum_shard_bytes:u64,
+    pub observed_active_record_bytes:u64,
+}
+
+#[derive(Debug,Serialize)]
+pub(crate) struct BuiltNativeFixture {
+    pub progress:NativeBuildProgress,
+    pub certificate:scale_certificate::ScaleCertificate,
+}
+
+fn sql_u64(row:&rusqlite::Row<'_>,column:usize) -> rusqlite::Result<u64> {
+    let value:i64=row.get(column)?;
+    u64::try_from(value).map_err(|error|rusqlite::Error::FromSqlConversionFailure(
+        column,rusqlite::types::Type::Integer,Box::new(error)))
+}
+
+pub(crate) fn build_native_fixture<F>(store:&mut PersistentStore,plan:native_shards::ShardPlan,
+    requirement:scale_certificate::ScaleRequirement,mut progress:F) -> Result<BuiltNativeFixture,String>
+where F:FnMut(&NativeBuildProgress)->Result<(),String> {
+    let (minimum_bytes,minimum_assets)=requirement.minimums();
+    if plan.assets<minimum_assets {return Err("shard plan cannot satisfy required asset count".into());}
+    let generation=super::active_generation(&store.connection).map_err(|e|e.to_string())?;
+    let characters:u64=store.connection.query_row("SELECT COUNT(*) FROM characters WHERE generation=?1",
+        [&generation],|row|sql_u64(row,0)).map_err(|e|e.to_string())?;
+    if characters!=0 || !store.list_asset_aliases(None).map_err(|e|e.to_string())?.value.is_empty()
+        || store.lww_binding_state().map_err(|e|e.to_string())?.target!=SyncTarget::None {
+        return Err("native fixture construction requires a fresh unbound synthetic store".into());
+    }
+    let root=json!({"loreBookDepth":5,"temperature":1,"botPresetsId":"synthetic-preset-0",
+        "selectedPersona":"synthetic-persona-0","personas":[
+            {"id":"synthetic-persona-0","name":"Synthetic 0"},{"id":"synthetic-persona-1","name":"Synthetic 1"}]});
+    let presets=json!([{ "id":"synthetic-preset-0","name":"Synthetic 0"},
+        {"id":"synthetic-preset-1","name":"Synthetic 1"}]);
+    let revision=store.revision().map_err(|e|e.to_string())?;
+    let staging=store.replace_begin().map_err(|e|e.to_string())?.staging_id;
+    store.replace_put_root(&staging,&root).map_err(|e|e.to_string())?;
+    store.replace_put_presets(&staging,presets.as_array().unwrap()).map_err(|e|e.to_string())?;
+    store.replace_commit(&staging,Some(revision)).map_err(|e|e.to_string())?;
+    let mut shards=native_shards::NativeShards::new(plan.clone())?;
+    let mut state=NativeBuildProgress {shards:0,assigned_assets:0,generated_input_bytes:0,
+        maximum_shard_bytes:0,observed_active_record_bytes:0};
+    loop {
+        let shard=shards.next().ok_or("native shard ordinals exhausted")??;
+        append_native_shard(store,&shard,plan.seed);
+        state.shards=shards.generated_characters();state.assigned_assets=shards.assigned_assets();
+        state.generated_input_bytes=state.generated_input_bytes.checked_add(shard.serialized_character_bytes).ok_or("input size overflow")?;
+        state.maximum_shard_bytes=state.maximum_shard_bytes.max(shard.serialized_character_bytes);
+        let generation=super::active_generation(&store.connection).map_err(|e|e.to_string())?;
+        let character=shard.character["chaId"].as_str().unwrap();
+        let records:u64=store.connection.query_row(
+            "SELECT COALESCE(SUM(length(CAST(value AS BLOB))),0) FROM messages WHERE generation=?1 AND character_id=?2",
+            rusqlite::params![generation,character],|row|sql_u64(row,0)).map_err(|e|e.to_string())?;
+        let detail:u64=store.connection.query_row(
+            "SELECT length(CAST(detail AS BLOB)) FROM characters WHERE generation=?1 AND character_id=?2",
+            rusqlite::params![generation,character],|row|sql_u64(row,0)).map_err(|e|e.to_string())?;
+        state.observed_active_record_bytes=state.observed_active_record_bytes.checked_add(records)
+            .and_then(|bytes|bytes.checked_add(detail)).ok_or("observed record size overflow")?;
+        progress(&state)?;
+        if state.shards<2 || state.assigned_assets!=plan.assets || state.observed_active_record_bytes<minimum_bytes {continue;}
+        store.checkpoint(super::CheckpointMode::Truncate).map_err(|e|e.to_string())?;
+        let pages:u64=store.connection.query_row("PRAGMA page_count",[],|row|sql_u64(row,0)).map_err(|e|e.to_string())?;
+        let free:u64=store.connection.query_row("PRAGMA freelist_count",[],|row|sql_u64(row,0)).map_err(|e|e.to_string())?;
+        let page_size:u64=store.connection.query_row("PRAGMA page_size",[],|row|sql_u64(row,0)).map_err(|e|e.to_string())?;
+        if pages.checked_sub(free).and_then(|pages|pages.checked_mul(page_size)).ok_or("invalid live page allocation")?<minimum_bytes {continue;}
+        let certificate=collect_native_scale_certificate(store,&plan,requirement)?;
+        certificate.validate()?;
+        if certificate.database.active_record_bytes!=state.observed_active_record_bytes {
+            return Err("observed shard records differ from complete active native record inventory".into());
+        }
+        return Ok(BuiltNativeFixture {progress:state,certificate});
+    }
+}
+
+fn observed_file_kind(path:&Path) -> Result<(std::fs::Metadata,bool,bool),String> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error|error.to_string())?;
+    #[cfg(windows)]
+    let (sparse,reparse) = {
+        use std::os::windows::fs::MetadataExt;
+        (metadata.file_attributes() & 0x200 != 0,metadata.file_attributes() & 0x400 != 0)
+    };
+    #[cfg(unix)]
+    let (sparse,reparse) = {
+        use std::os::unix::fs::MetadataExt;
+        (metadata.blocks().saturating_mul(512)<metadata.len(),metadata.file_type().is_symlink())
+    };
+    #[cfg(not(any(windows,unix)))]
+    return Err("file allocation observer unsupported on this target".into());
+    #[cfg(any(windows,unix))]
+    Ok((metadata,sparse,reparse))
+}
+
+pub(crate) fn collect_native_scale_certificate(store:&mut PersistentStore, plan:&native_shards::ShardPlan,
+    requirement:scale_certificate::ScaleRequirement) -> Result<scale_certificate::ScaleCertificate,String> {
+    use scale_certificate::{CertifiedAsset,DatabaseAllocation,ScaleCertificate};
+    use sha2::{Digest,Sha256};
+    store.checkpoint(super::CheckpointMode::Truncate).map_err(|e|e.to_string())?;
+    let mut reopened=PersistentStore::open(store.repository_root()).map_err(|e|e.to_string())?;
+    reopened.checkpoint(super::CheckpointMode::Truncate).map_err(|e|e.to_string())?;
+    let store=&mut reopened;
+    let checked = || -> Result<ScaleCertificate,String> {
+        let connection = &store.connection;
+        let scalar = |sql:&str| connection.query_row(sql,[],|row|sql_u64(row,0)).map_err(|e|e.to_string());
+        let generation = super::active_generation(connection).map_err(|e|e.to_string())?;
+        let active_scalar = |sql:&str| connection.query_row(sql,[&generation],|row|sql_u64(row,0)).map_err(|e|e.to_string());
+        let db_path = Path::new(connection.path().ok_or("native SQLite path missing")?);
+        let (metadata,sparse,reparse) = observed_file_kind(db_path)?;
+        let wal_path = db_path.with_file_name(format!("{}-wal",db_path.file_name().unwrap().to_str().unwrap()));
+        let wal_bytes = match std::fs::metadata(wal_path) {
+            Ok(value)=>value.len(),Err(error) if error.kind()==std::io::ErrorKind::NotFound=>0,
+            Err(error)=>return Err(error.to_string()),
+        };
+        let schema = |db:&rusqlite::Connection| -> Result<Vec<(String,String,Option<String>)>,String> {
+            let mut statement = db.prepare("SELECT type,name,sql FROM sqlite_master ORDER BY type,name")
+                .map_err(|e|e.to_string())?;
+            let rows = statement.query_map([],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))
+                .map_err(|e|e.to_string())?;
+            rows.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())
+        };
+        let template_root = tempfile::tempdir().map_err(|e|e.to_string())?;
+        let template = PersistentStore::open(template_root.path()).map_err(|e|e.to_string())?;
+        let integrity:String = connection.query_row("PRAGMA integrity_check",[],|row|row.get(0)).map_err(|e|e.to_string())?;
+        let database = DatabaseAllocation {page_size:scalar("PRAGMA page_size")?,page_count:scalar("PRAGMA page_count")?,
+            freelist_count:scalar("PRAGMA freelist_count")?,file_bytes:metadata.len(),wal_bytes,
+            regular_file:metadata.is_file(),sparse_file:sparse,reparse_point:reparse,checkpoint_complete:true,reopened:true,
+            integrity_checked:integrity=="ok",native_schema_only:schema(connection)?==schema(&template.connection)?,
+            active_characters:active_scalar("SELECT COUNT(*) FROM characters WHERE generation=?1")?,
+            active_conversations:active_scalar("SELECT COUNT(*) FROM conversations WHERE generation=?1")?,
+            active_messages:active_scalar("SELECT COUNT(*) FROM messages WHERE generation=?1")?,
+            active_record_bytes:active_scalar("SELECT COALESCE(SUM(length(CAST(value AS BLOB))),0) FROM messages WHERE generation=?1")?
+                .checked_add(active_scalar("SELECT COALESCE(SUM(length(CAST(detail AS BLOB))),0) FROM characters WHERE generation=?1")?)
+                .ok_or("native record byte overflow")?,
+            maximum_message_bytes:active_scalar("SELECT COALESCE(MAX(length(CAST(value AS BLOB))),0) FROM messages WHERE generation=?1")?,
+            maximum_character_detail_bytes:active_scalar("SELECT COALESCE(MAX(length(CAST(detail AS BLOB))),0) FROM characters WHERE generation=?1")?,
+            maximum_root_bytes:active_scalar("SELECT COALESCE(MAX(length(CAST(value AS BLOB))),0) FROM root WHERE generation=?1")?};
+        let aliases = store.list_asset_aliases(None).map_err(|e|e.to_string())?.value;
+        if aliases.len() as u64 != plan.assets {return Err("actual fixture alias count differs from shard plan".into());}
+        let aliases_by_key = aliases.iter().map(|alias|(alias.key.as_str(),alias)).collect::<std::collections::BTreeMap<_,_>>();
+        let cas = crate::asset_repository::PayloadCas::new(store.repository_root()).map_err(|e|e.to_string())?;
+        let mut owner_references = std::collections::BTreeMap::<String,u64>::new();
+        let mut owner_manifests=Vec::new();
+        let mut verified_owner_heads = 0;
+        for head in store.list_asset_owner_heads(None).map_err(|e|e.to_string())?.value {
+            if !head.present {continue;}
+            let super::AssetOwnerLocator::CharacterAdditionalAssets {character_id} = &head.owner else {
+                return Err("unexpected owner kind in synthetic shard fixture".into());
+            };
+            let hash = head.manifest_hash.as_deref().ok_or("owner manifest identity missing")?;
+            let path=cas.object_path(hash).map_err(|e|e.to_string())?.ok_or("owner manifest physical body missing")?;
+            let (metadata,sparse,reparse)=observed_file_kind(&path)?;
+            if !metadata.is_file() || sparse || reparse || metadata.len()>1024*1024 {
+                return Err("owner manifest is indirect, sparse or unbounded".into());
+            }
+            let bytes = cas.read_object(hash).map_err(|e|e.to_string())?.ok_or("owner manifest body missing")?;
+            if hex::encode(Sha256::digest(&bytes))!=hash {return Err("owner manifest physical digest mismatch".into());}
+            owner_manifests.push((hash.to_owned(),bytes.len() as u64));
+            let entries = crate::asset_repository::owner_manifest_codec::decode_owner_manifest(&bytes).map_err(|e|e.to_string())?;
+            if entries.len() as i64 != head.entry_count {return Err("owner entry count differs from manifest".into());}
+            let character = store.read_character(character_id,None).map_err(|e|e.to_string())?
+                .ok_or("owner parent missing")?.value;
+            let tuples = json!(entries.iter().map(|entry|entry.tuple.clone()).collect::<Vec<_>>());
+            if character["additionalAssets"] != tuples {return Err("owner manifest differs from native parent tuples".into());}
+            for entry in entries {
+                let hash = hex::encode(entry.payload_hash.ok_or("fixture owner has unresolved payload")?);
+                if aliases_by_key.get(entry.tuple[1].as_str()).and_then(|alias|alias.object_hash.as_deref())!=Some(hash.as_str()) {
+                    return Err("owner payload does not match actual alias".into());
+                }
+                *owner_references.entry(hash).or_default()+=1;
+            }
+            verified_owner_heads+=1;
+        }
+        let mut catalog = std::collections::BTreeMap::new();
+        let mut cursor = None;
+        loop {
+            let page = store.query_asset_object_catalog(4096,cursor.as_deref()).map_err(|e|e.to_string())?;
+            catalog.extend(page.items.into_iter().map(|item|(item.object_hash,item.byte_size)));
+            cursor=page.next_cursor;
+            if cursor.is_none() {break;}
+        }
+        let mut assets = Vec::new();
+        for (hash,size) in owner_manifests {
+            if catalog.get(&hash)!=Some(&size) {return Err("owner manifest physical body/catalog mismatch".into());}
+        }
+        for alias in aliases {
+            let index = alias.key.strip_prefix("assets/synthetic-").and_then(|v|v.strip_suffix(".bin"))
+                .and_then(|v|v.parse::<u64>().ok()).ok_or("unexpected synthetic asset alias")?;
+            if index>=plan.assets {return Err("asset ordinal outside shard plan".into());}
+            let expected = fixture::asset_descriptor(plan.seed,index);
+            let hash = alias.object_hash.as_deref().ok_or("fixture alias lacks payload identity")?;
+            if hash!=expected.payload_hash || alias.kind!="asset" || alias.size!=expected.byte_length as i64 {
+                return Err("fixture alias differs from deterministic body identity".into());
+            }
+            let path = cas.object_path(hash).map_err(|e|e.to_string())?.ok_or("physical fixture body missing")?;
+            let (metadata,sparse,reparse)=observed_file_kind(&path)?;
+            if !metadata.is_file() || sparse || reparse || metadata.len()!=expected.byte_length {
+                return Err("physical fixture body is indirect, sparse or has incorrect size".into());
+            }
+            let verified_file_hash=hex::encode(Sha256::digest(std::fs::read(path).map_err(|e|e.to_string())?));
+            assets.push(CertifiedAsset {payload_hash:hash.into(),catalog_bytes:*catalog.get(hash).ok_or("payload catalog row missing")?,
+                file_bytes:metadata.len(),regular_file:true,sparse_file:sparse,reparse_point:reparse,verified_file_hash,
+                active_aliases:1,verified_owner_references:owner_references.get(hash).copied().unwrap_or(0)});
+        }
+        Ok(ScaleCertificate {schema:"risunest.native-persisted-scale/v1".into(),requirement,database,
+            catalog_rows:catalog.len() as u64,verified_owner_heads,assets,
+            measured_conversation_sha256:hex::encode(Sha256::digest(serde_json::to_vec(
+                &store.read_conversation("synthetic-character-0","synthetic-conversation-0",None)
+                    .map_err(|e|e.to_string())?.ok_or("measured conversation missing")?.value)
+                    .map_err(|e|e.to_string())?))})
+    };
+    checked()
+}
+
+#[test]
+fn bounded_native_shards_have_real_catalog_bodies_and_owner_closure() {
+    let (_directory,mut store) = server_sync::lww_tests::local();
+    let plan = native_shards::ShardPlan {ordinary_messages:2,assets_per_owner:2,
+        ..native_shards::ShardPlan::new(11,3)};
+    let mut shards = native_shards::NativeShards::new(plan.clone()).unwrap();
+    for _ in 0..2 {append_native_shard(&mut store,&shards.next().unwrap().unwrap(),plan.seed);}
+    let certificate = collect_native_scale_certificate(&mut store,&plan,
+        scale_certificate::ScaleRequirement::Correctness {minimum_database_bytes:4096,minimum_assets:3}).unwrap();
+    assert_eq!(certificate.validate().unwrap().unique_materialized_owned_assets,3);
+    assert_eq!(certificate.verified_owner_heads,2);
+    assert_eq!(certificate.database.active_messages,4098);
+    let mut fake_target=certificate.clone(); fake_target.requirement=scale_certificate::ScaleRequirement::Target;
+    assert!(fake_target.validate().is_err());
+    store.connection.execute_batch("CREATE TABLE synthetic_padding (value BLOB)").unwrap();
+    let padded = collect_native_scale_certificate(&mut store,&plan,certificate.requirement).unwrap();
+    assert!(!padded.database.native_schema_only);
+    assert!(padded.validate().is_err());
+}
+
+#[test]
+fn lazy_native_constructor_stops_on_observed_persistence_and_honors_callback_cancellation() {
+    let (_directory,mut store)=server_sync::lww_tests::local();
+    let plan=native_shards::ShardPlan {ordinary_messages:2,assets_per_owner:2,..native_shards::ShardPlan::new(11,3)};
+    let requirement=scale_certificate::ScaleRequirement::Correctness {minimum_database_bytes:4096,minimum_assets:3};
+    let built=build_native_fixture(&mut store,plan.clone(),requirement,|progress| {
+        assert!(progress.maximum_shard_bytes<=native_shards::MAX_SHARD_BYTES as u64);Ok(())
+    }).unwrap();
+    assert_eq!(built.progress.shards,2);
+    assert_eq!(built.certificate.validate().unwrap().unique_materialized_owned_assets,3);
+    assert_eq!(built.certificate.database.active_messages,4098);
+    assert!(built.certificate.database.reopened);
+    assert_eq!(store.read_root(None).unwrap().value["selectedPersona"],"synthetic-persona-0");
+    let (_cancelled_directory,mut cancelled)=server_sync::lww_tests::local();
+    let result=build_native_fixture(&mut cancelled,plan,requirement,|_|Err("cancelled synthetic construction".into()));
+    assert_eq!(result.err().unwrap(),"cancelled synthetic construction");
+}
+
+#[test]
+fn additional_fixed_changes_preserve_full_message_lists_and_stable_personas() {
+    let (_directory,mut store) = server_sync::lww_tests::local();
+    let generated = tempfile::tempdir().unwrap();
+    seed(&mut store,&generated.path().join("fixture"),FixtureScale::small());
+    store.commit(&WorkingSetCommit {expected_revision:store.revision().unwrap(),
+        unit_mutations:Some(vec![UnitMutation::Set {key:UnitKey::new(&["root","selectedPersona"]).unwrap(),
+            value:json!("synthetic-persona-0")}]),..Default::default()}).unwrap();
+    for change in [AdditionalChange::Persona,AdditionalChange::MiddleEdit,AdditionalChange::Insertion,
+        AdditionalChange::Deletion,AdditionalChange::Burst] {
+        let prepared=prepare_additional_change(&store,change,Direction::AtoB,0);
+        assert_eq!(prepared.commits.len(),if matches!(change,AdditionalChange::Burst) {16} else {1});
+        apply_additional_change(&mut store,&prepared);
+        verify_additional_change(&store,&prepared);
+    }
+}
+
+#[test]
+fn additional_native_adapters_use_real_local_transport_in_both_directions() {
+    let mut driver=ServerDriver::prepare(FixtureScale::small());
+    driver.a.commit(&WorkingSetCommit {expected_revision:driver.a.revision().unwrap(),
+        unit_mutations:Some(vec![UnitMutation::Set {key:UnitKey::new(&["root","selectedPersona"]).unwrap(),
+            value:json!("synthetic-persona-0")}]),..Default::default()}).unwrap();
+    server_sync::lww_tests::publish_cycle(&driver.ca,&mut driver.a,&[]).unwrap().unwrap();
+    server_sync::lww_tests::receive_cycle(&driver.cb,&mut driver.b,&[]).unwrap();
+    for change in [AdditionalChange::Persona,AdditionalChange::MiddleEdit,AdditionalChange::Insertion,
+        AdditionalChange::Deletion,AdditionalChange::Burst] {
+        for direction in [Direction::AtoB,Direction::BtoA] {
+            let (source,destination,sender,receiver)=match direction {
+                Direction::AtoB=>(&mut driver.a,&mut driver.b,&driver.ca,&driver.cb),
+                Direction::BtoA=>(&mut driver.b,&mut driver.a,&driver.cb,&driver.ca),
+            };
+            let prepared=prepare_additional_change(source,change,direction,0);
+            apply_additional_change(source,&prepared);
+            verify_additional_change(source,&prepared);
+            let publication=server_sync::lww_tests::publish_cycle(sender,source,&[]).unwrap().unwrap();
+            let completion=server_sync::lww_tests::receive_cycle(receiver,destination,&[]).unwrap();
+            assert!(!publication.accepted_keys.is_empty());
+            assert!(completion.received_units>0);
+            verify_additional_change(destination,&prepared);
+        }
+    }
+}
+
+#[test]
+fn additional_native_adapters_use_real_external_cycle_in_both_directions() {
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        let mut driver=ExternalDriver::prepare(FixtureScale::small()).await;
+        let fixture=&mut driver.fixture;
+        fixture.a.commit(&WorkingSetCommit {expected_revision:fixture.a.revision().unwrap(),
+            unit_mutations:Some(vec![UnitMutation::Set {key:UnitKey::new(&["root","selectedPersona"]).unwrap(),
+                value:json!("synthetic-persona-0")}]),..Default::default()}).unwrap();
+        let authority_a=fixture.a.lww_binding_authority().unwrap();
+        fixture.sender.publish(&mut fixture.a,authority_a,&[],&Cancellation::default()).await.unwrap();
+        let authority_b=fixture.b.lww_binding_authority().unwrap();
+        fixture.receiver.receive_and_apply(&mut fixture.b,authority_b,&[],&Cancellation::default()).await.unwrap();
+        for change in [AdditionalChange::Persona,AdditionalChange::MiddleEdit,AdditionalChange::Insertion,
+            AdditionalChange::Deletion,AdditionalChange::Burst] {
+            for direction in [Direction::AtoB,Direction::BtoA] {
+                let (source,destination,sender,receiver)=match direction {
+                    Direction::AtoB=>(&mut fixture.a,&mut fixture.b,&mut fixture.sender,&mut fixture.receiver),
+                    Direction::BtoA=>(&mut fixture.b,&mut fixture.a,&mut fixture.receiver,&mut fixture.sender),
+                };
+                let prepared=prepare_additional_change(source,change,direction,0);
+                apply_additional_change(source,&prepared);
+                verify_additional_change(source,&prepared);
+                let source_authority=source.lww_binding_authority().unwrap();
+                sender.publish(source,source_authority,&[],&Cancellation::default()).await.unwrap();
+                let destination_authority=destination.lww_binding_authority().unwrap();
+                receiver.receive_and_apply(destination,destination_authority,&[],&Cancellation::default()).await.unwrap();
+                verify_additional_change(destination,&prepared);
+            }
+        }
+    });
 }
 
 #[test]
