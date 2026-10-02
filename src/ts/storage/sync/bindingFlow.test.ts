@@ -268,7 +268,7 @@ describe('transport-neutral first binding', () => {
     })
     it('empty targets initialize without resetting plugin values', async () => {
         const s = setup({ empty: true }); await s.flow.bind(target, s.transport)
-        expect(s.events).toEqual(['inspect', 'jobs-fence', 'pause-flush', 'gate', 'switch', 'publish', 'resume'])
+        expect(s.events).toEqual(['inspect', 'jobs-fence', 'pause-flush', 'gate', 'switch', 'refresh', 'publish', 'resume'])
     })
     it('default shared state needs no transfer even with plugin-local-only data', async () => {
         const s = setup({ empty: true }); s.deps.hasNonDefaultSharedData = async () => false
@@ -278,7 +278,15 @@ describe('transport-neutral first binding', () => {
     })
     it('same-library recovery resumes without staging or resetting namespaces', async () => {
         const s = setup({ previouslyBoundLibrary: true }); await s.flow.bind(target, s.transport)
-        expect(s.events).toEqual(['inspect', 'jobs-fence', 'pause-flush', 'gate', 'switch', 'resume'])
+        expect(s.events).toEqual(['inspect', 'jobs-fence', 'pause-flush', 'gate', 'switch', 'refresh', 'resume'])
+    })
+    it('same-target same-library recovery takes no activation guard or full refresh', async () => {
+        const s = setup({ previouslyBoundLibrary: true })
+        s.setState({ target, targetAuthority: '9', selectionEpoch: 'same', libraryId: 'library', progress: null })
+        const guard = vi.spyOn(s.deps, 'beginActivatedLibraryGuard')
+        await s.flow.bind(target, s.transport)
+        expect(guard).not.toHaveBeenCalled()
+        expect(s.events).toEqual(['inspect', 'jobs-fence', 'pause-flush', 'gate', 'resume'])
     })
     it('stale state stops before activation', async () => {
         const s = setup(); s.transport.pullAvailableState = async () => { s.changeAuthority(); return { targetId: 'target', libraryId: 'library', stagingId: 'stage', receiveId: 'receive' } }

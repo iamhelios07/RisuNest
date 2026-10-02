@@ -142,6 +142,50 @@ it.each([false, true])('retries initialized adapter resume without repeating ini
     expect(h.events).not.toContain('activate')
 })
 
+it.each([false, true])('settles lost initialized switch before projection without reset or plugin restart (shared data: %s)', async nonDefault => {
+    const h = await harness()
+    const username = h.database.username
+    h.transport.inspectTarget = async () => ({ inspectionId: 'inspection', targetId: 'target', libraryId: 'library', empty: true, previouslyBoundLibrary: false })
+    h.dependencies.hasNonDefaultSharedData = async () => nonDefault
+    const fence = vi.spyOn(h.dependencies.plugins, 'fenceExecution')
+    const restart = vi.spyOn(h.dependencies.plugins, 'restart')
+    const switchTarget = h.dependencies.native.switchTarget
+    const bodies: string[] = []
+    h.dependencies.native.switchTarget = async (...args) => {
+        bodies.push(JSON.stringify(args))
+        const result = await switchTarget(...args)
+        if (bodies.length === 1) throw Error('initialized response lost')
+        return result
+    }
+    await expect(h.flow.bind(h.target, h.transport)).rejects.toThrow('initialized response lost')
+    expect(h.events).not.toContain('projection')
+    expect(h.transport.publishInitialSharedState).not.toHaveBeenCalled()
+    expect(h.transport.resumeBinding).not.toHaveBeenCalled()
+    expect((await h.runtime.retryCommittedWorkingSetRefresh())?.projection).toBe('applied')
+    expect(bodies[1]).toBe(bodies[0])
+    expect(h.database.username).toBe(username)
+    expect(h.events).not.toContain('activate')
+    expect(fence).not.toHaveBeenCalled()
+    expect(restart).not.toHaveBeenCalled()
+    expect(h.transport.publishInitialSharedState).toHaveBeenCalledTimes(nonDefault ? 1 : 0)
+    expect(h.transport.resumeBinding).toHaveBeenCalledOnce()
+})
+
+it.each(['request', 'authority'])('rejects wrong initialized switch %s proof before any projection or publication', async change => {
+    const h = await harness()
+    h.transport.inspectTarget = async () => ({ inspectionId: 'inspection', targetId: 'target', libraryId: 'library', empty: true, previouslyBoundLibrary: false })
+    const switchTarget = h.dependencies.native.switchTarget
+    h.dependencies.native.switchTarget = async (...args) => { await switchTarget(...args); throw Error('response lost') }
+    await expect(h.flow.bind(h.target, h.transport)).rejects.toThrow('response lost')
+    if (change === 'authority') h.changeAuthority()
+    else h.dependencies.native.switchTarget = (previous, target, inspection) => switchTarget(previous, target, inspection, 'different-request')
+    expect((await h.runtime.retryCommittedWorkingSetRefresh())?.projection).toBe('refresh-required')
+    expect(h.events).not.toContain('projection')
+    expect(h.transport.publishInitialSharedState).not.toHaveBeenCalled()
+    expect(h.transport.resumeBinding).not.toHaveBeenCalled()
+    expect(() => h.runtime.markPersistentDataDirty(1)).toThrow()
+})
+
 it.each(['switch', 'replacement'])('settles a lost %s response by exact replay before recovery projection', async phase => {
     const h = await harness()
     const original = phase === 'switch' ? h.dependencies.native.switchTarget : h.transport.replaceFromTarget
