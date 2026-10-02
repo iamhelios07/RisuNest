@@ -91,7 +91,13 @@ async fn admission(State(gate): State<Gate>, request: Request, next: Next) -> Re
     let head = request.method() == Method::HEAD;
     let response = observed::request_context(next.run(request)).await;
     let (parts, body) = response.into_parts();
-    let remaining = if head {
+    let bodyless = head
+        || parts.status.is_informational()
+        || matches!(
+            parts.status,
+            StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED
+        );
+    let remaining = if bodyless {
         Some(0)
     } else {
         body.size_hint().exact().or_else(|| {
@@ -493,6 +499,124 @@ mod tests {
         request
             .bearer_auth(&credential.token)
             .header("x-risu-library", &credential.library_id)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn actual_tcp_no_content_and_full_content_length_bodies_complete() {
+        let _reset = Reset::new();
+        let root = tempfile::tempdir().unwrap();
+        let mut server = Server::start(root.path()).await.unwrap();
+        let credential = server.store.add_device().unwrap();
+        let device = Device {
+            id: credential.device_id.clone(),
+        };
+        let asset = vec![41; 98_304];
+        let digest = hash(&asset);
+        server.store.put_object(&device, &digest, &asset).unwrap();
+        server
+            .begin(
+                root.path(),
+                "http-body-completion".into(),
+                "source".into(),
+                vec![role(&digest, "Asset")],
+            )
+            .await
+            .unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for request in [
+            client
+                .post(format!("{}/ack", server.endpoint))
+                .body(br#"{"seq":"0"}"#.to_vec()),
+            client
+                .post(format!("{}/objects/pins", server.endpoint))
+                .body(b"[]".to_vec()),
+            client.delete(format!("{}/state/pins/synthetic-pin", server.endpoint)),
+        ] {
+            let response = auth(request, &credential).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            assert!(response.bytes().await.unwrap().is_empty());
+        }
+        let response = auth(
+            client.get(format!("{}/objects/{digest}", server.endpoint)),
+            &credential,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.content_length(), Some(asset.len() as u64));
+        assert_eq!(response.bytes().await.unwrap().as_ref(), asset);
+        let response = auth(
+            client
+                .get(format!("{}/objects/{digest}", server.endpoint))
+                .header("if-none-match", format!("\"{digest}\"")),
+            &credential,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert!(response.bytes().await.unwrap().is_empty());
+        let response = auth(
+            client.head(format!("{}/objects/{digest}", server.endpoint)),
+            &credential,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["content-length"],
+            asset.len().to_string()
+        );
+        assert!(response.bytes().await.unwrap().is_empty());
+        let ended = server.end("http-body-completion").await.unwrap();
+        assert_eq!(ended.total.opens, 3);
+        assert_eq!(ended.total.read_bytes, asset.len() as u64);
+        assert!(ended.complete, "{:?}", ended.violations);
+        assert!(server.stop().await.unwrap().unwrap().complete);
+    }
+
+    #[tokio::test]
+    async fn exact_length_completion_without_eof_poll_preserves_prefix_drop_failure() {
+        use futures_util::StreamExt;
+        let _reset = Reset::new();
+        let root = tempfile::tempdir().unwrap();
+        observed::begin(root.path(), "body-drop".into(), "source".into(), vec![]).unwrap();
+        let gate = Gate::new();
+        let mut complete = ResponseStream {
+            stream: Body::from("complete").into_data_stream(),
+            _permit: gate.lock.clone().read_owned().await,
+            _request: observed::request(),
+            remaining: Some(8),
+            finished: false,
+        };
+        assert_eq!(
+            complete.next().await.unwrap().unwrap().as_ref(),
+            b"complete"
+        );
+        assert!(!complete.finished);
+        drop(complete);
+        assert!(observed::snapshot(false).unwrap().complete);
+
+        let body = Body::from_stream(futures_util::stream::iter([
+            Ok::<_, axum::Error>(Bytes::from_static(b"prefix")),
+            Ok(Bytes::from_static(b"tail")),
+        ]));
+        let mut prefix = ResponseStream {
+            stream: body.into_data_stream(),
+            _permit: gate.lock.clone().read_owned().await,
+            _request: observed::request(),
+            remaining: Some(10),
+            finished: false,
+        };
+        assert_eq!(prefix.next().await.unwrap().unwrap().as_ref(), b"prefix");
+        assert_eq!(prefix.remaining, Some(4));
+        drop(prefix);
+        let ended = observed::snapshot(true).unwrap();
+        assert!(!ended.complete);
+        assert_eq!(ended.pending_requests, 0);
+        assert_eq!(ended.violations.get("response-body-abandoned"), Some(&1));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1,12 +1,17 @@
 use super::*;
 use crate::store::{Device, Store};
 
-pub(crate) struct Reset;
+static FIXTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub(crate) struct Reset {
+    _fixture: std::sync::MutexGuard<'static, ()>,
+}
 impl Reset {
     pub(crate) fn new() -> Self {
+        let fixture = FIXTURE.lock().unwrap();
         install();
         assert!(registry().lock().unwrap().active.is_none());
-        Self
+        Self { _fixture: fixture }
     }
 }
 impl Drop for Reset {
@@ -284,6 +289,7 @@ fn ingress_inline_comparison_is_separate_and_corruption_preserves_body_work() {
 
 #[test]
 fn structural_recipe_adapter_preserves_actual_encode_and_negative_results() {
+    let _reset = Reset::new();
     use risunest_sync_wire::{
         delta,
         transfer::{self, Frame},

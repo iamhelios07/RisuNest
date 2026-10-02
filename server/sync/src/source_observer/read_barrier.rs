@@ -378,7 +378,12 @@ mod tests {
             flow: "source".into(),
         };
         let (send, receive) = std::sync::mpsc::channel();
-        install_hook(Some(Arc::new(move |event| send.send(event).unwrap())));
+        let reader_held = Arc::new(std::sync::Barrier::new(2));
+        let release_reader = reader_held.clone();
+        install_hook(Some(Arc::new(move |event| {
+            send.send(event).unwrap();
+            release_reader.wait();
+        })));
         arm(intent.clone()).unwrap();
         let context = active().unwrap();
         let barrier = context.scope.lock().unwrap().read_barrier.clone().unwrap();
@@ -391,8 +396,11 @@ mod tests {
         });
         receive.recv_timeout(Duration::from_secs(2)).unwrap();
         barrier.state.lock().unwrap().deadline = Some(Instant::now());
-        assert!(matches!(release(&intent), Err("read-barrier-timeout")));
-        assert!(task.join().unwrap().is_err());
+        let released = release(&intent);
+        reader_held.wait();
+        let read = task.join().unwrap();
+        assert!(matches!(released, Err("read-barrier-timeout")));
+        assert!(read.is_err());
         let observed = snapshot(true).unwrap();
         assert!(!observed.complete);
         assert_eq!(observed.total.read_bytes, 0);
