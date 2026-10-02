@@ -7,6 +7,19 @@ pub struct HashDomain {
     pub bytes: u64,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BodyDomain {
+    pub open_attempts: u64,
+    pub opens: u64,
+    pub failed_opens: u64,
+    pub unknown_open_results: u64,
+    pub read_operations: u64,
+    pub read_bytes: u64,
+    pub incomplete_reads: u64,
+    pub escaped_handles: u64,
+    pub escaped_paths: u64,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct NativeObservation {
     pub units_visited: u64,
@@ -22,6 +35,12 @@ pub struct NativeObservation {
     pub asset_body_opens: Option<u64>,
     pub asset_body_bytes_read: Option<u64>,
     pub shared_head_reads: Option<u64>,
+    pub body_scope_complete: Option<bool>,
+    pub body_scope_thread: Option<String>,
+    pub body_domains: BTreeMap<String, BodyDomain>,
+    pub body_stat_requests: u64,
+    pub body_batch_stat_requests: u64,
+    pub body_presence_queries: u64,
 }
 
 impl NativeObservation {
@@ -43,6 +62,11 @@ impl NativeObservation {
 
     pub fn validate_routine_invariants(&self) -> Result<(), String> {
         self.hash_totals()?;
+        if self.body_scope_complete != Some(true) || self.body_domains.values().any(|domain|
+            domain.unknown_open_results != 0 || domain.incomplete_reads != 0
+                || domain.escaped_handles != 0 || domain.escaped_paths != 0) {
+            return Err("incomplete or unobserved CAS body scope".into());
+        }
         for (domain, work) in &self.hashes {
             if (domain.contains("binding") || domain.contains("catalog_proof") || domain.contains("generation_digest"))
                 && (work.calls != 0 || work.bytes != 0)
@@ -94,6 +118,7 @@ mod tests {
         sample.asset_body_opens = Some(0);
         sample.asset_body_bytes_read = Some(0);
         sample.shared_head_reads = Some(0);
+        sample.body_scope_complete = Some(true);
         assert!(sample.validate_routine_invariants().is_ok());
         sample.incomplete.push("native/stream".into());
         assert!(sample.hash_totals().is_err());
@@ -101,7 +126,7 @@ mod tests {
     #[test]
     fn growth_requires_precise_control_attribution_and_never_more_calls() {
         let mut a = NativeObservation { asset_body_opens:Some(0), asset_body_bytes_read:Some(0),
-            shared_head_reads:Some(0), ..Default::default() };
+            shared_head_reads:Some(0), body_scope_complete:Some(true), ..Default::default() };
         a.insert_domain("C", "intent", 1, 100);
         let mut b = a.clone();
         b.hashes.get_mut("C/intent").unwrap().bytes += 10;
