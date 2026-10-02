@@ -5064,9 +5064,9 @@ mod tests {
                         use crate::server_sync::lww_tests::{LocalServerFixture,put_asset,drain_publications};
                         let mixed=tempfile::tempdir().unwrap();let mut mixed_store=PersistentStore::open(mixed.path()).unwrap();
                         super::super::connection_store::ConnectionStore::open(mixed.path()).unwrap().insert(&connection.stored).unwrap();
-                        let _connection=super::super::lww_residency::install_test_source_connection(mixed.path(),connection).unwrap();
+                        let _connection=super::super::lww_residency::install_test_source_connection(mixed.path(),connection.clone()).unwrap();
                         let mut external_source=external_source;external_source.connection_root=mixed.path().to_owned();
-                        super::super::lww_residency::register_packed(mixed.path(),&external_source).unwrap();
+                        super::super::lww_residency::register_packed(mixed.path(),&external_source,&connection.handle).unwrap();
                         let server=LocalServerFixture::new();let core=server.client(&mixed_store);
                         let server_hash=put_asset(&mut mixed_store,"assets/background-server.bin",&vec![71;100_000]).object_hash.unwrap();
                         drain_publications(&core,&mut mixed_store,&[]).unwrap();
@@ -5092,7 +5092,7 @@ mod tests {
                 if already_present {for bytes in &asset_bytes {bootstrap_cas.prepare_bytes(bytes).unwrap();}}
                 for source in &prepared.sources {
                     let mut source=source.clone();source.connection_root=bootstrap.path().to_owned();
-                    super::super::lww_residency::register_packed(bootstrap.path(),&source).unwrap();
+                    super::super::lww_residency::register_packed(bootstrap.path(),&source,&connected.handle).unwrap();
                 }
                 crate::persistent_store::register_asset_objects_at_root(bootstrap.path(),&assets.iter().map(|asset|crate::persistent_store::asset_object_catalog::AssetObjectRegistration{object_hash:asset.content_hash.clone(),byte_size:asset.byte_size}).collect::<Vec<_>>(),1).unwrap();
                 let bootstrap_pack=prepared.sources[0].packs[0].locator.object.clone();
