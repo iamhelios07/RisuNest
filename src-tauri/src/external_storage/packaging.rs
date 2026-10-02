@@ -5105,10 +5105,22 @@ mod tests {
                 }
                 crate::persistent_store::register_asset_objects_at_root(bootstrap.path(),&assets.iter().map(|asset|crate::persistent_store::asset_object_catalog::AssetObjectRegistration{object_hash:asset.content_hash.clone(),byte_size:asset.byte_size}).collect::<Vec<_>>(),1).unwrap();
                 let bootstrap_pack=prepared.sources[0].packs[0].locator.object.clone();
-                let bootstrap_reads=provider.read_attempts(&bootstrap_pack);
+                let refusal_provider=provider.clone();let refusal_pack=bootstrap_pack.clone();let refusal_hash=prepared.sources[0].hash.clone();
                 crate::asset_repository::body_io::reset_body_io();
                 for asset in &assets {crate::asset_repository::body_io::register_object_purpose(&asset.content_hash,crate::asset_repository::body_io::BodyPurpose::Asset);}
-                bootstrap_store.hydrate_registered_remote_assets_prioritized(None,None,||Ok(()),||{}).unwrap();
+                let bootstrap_reads=spawn_blocking(move || {
+                    if !already_present {
+                        let before=refusal_provider.read_attempts(&refusal_pack);
+                        let refused=bootstrap_store.hydrate_registered_remote_assets_prioritized(None,None,|| {
+                            if refusal_provider.read_attempts(&refusal_pack)>before {Err(crate::server_sync::SyncError::new("stale-binding-authority",409))} else {Ok(())}
+                        },||{}).unwrap_err();
+                        assert_eq!(refused.code,"stale-binding-authority");
+                        assert!(PayloadCas::new(bootstrap_store.repository_root()).unwrap().stat_object(&refusal_hash).unwrap().is_none());
+                    }
+                    let before=refusal_provider.read_attempts(&refusal_pack);
+                    bootstrap_store.hydrate_registered_remote_assets_prioritized(None,None,||Ok(()),||{}).unwrap();
+                    before
+                }).await.unwrap();
                 let bootstrap_bodies=crate::asset_repository::body_io::take_body_io();
                 assert!(bootstrap_bodies.complete());
                 if already_present {assert_eq!(bootstrap_bodies.asset_work(),Default::default());}
