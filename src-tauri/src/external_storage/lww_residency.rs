@@ -222,6 +222,122 @@ fn promote(root: &Path, hash: &str, bytes: &[u8]) -> Result<Option<std::fs::File
     .map_err(local)?;
     cas.open_object(hash).map_err(local)
 }
+pub(crate) fn packed_body_groups(sources:Vec<PackedSource>,priority:&std::collections::BTreeSet<String>)->Vec<Vec<PackedSource>> {
+    let mut parents=(0..sources.len()).collect::<Vec<_>>();
+    let mut users=std::collections::BTreeMap::<String,usize>::new();
+    fn root(parents:&mut [usize],mut index:usize)->usize {
+        while parents[index]!=index {parents[index]=parents[parents[index]];index=parents[index];}index
+    }
+    for (index,source) in sources.iter().enumerate() {
+        for chunk in &source.chunks {
+            if let Some(previous)=users.insert(chunk.pack_id.clone(),index) {
+                let left=root(&mut parents,index);let right=root(&mut parents,previous);
+                parents[left.max(right)]=left.min(right);
+            }
+        }
+    }
+    let mut groups=std::collections::BTreeMap::<usize,Vec<PackedSource>>::new();
+    for (index,source) in sources.into_iter().enumerate() {groups.entry(root(&mut parents,index)).or_default().push(source);}
+    let mut groups=groups.into_values().collect::<Vec<_>>();
+    groups.sort_by_key(|group|!group.iter().any(|source|priority.contains(&source.hash)));
+    for group in &mut groups {group.sort_by_key(|source|!priority.contains(&source.hash));}
+    groups
+}
+pub(crate) fn hydrate_registered_many(root:&Path,digests:&[String],priority:&std::collections::BTreeSet<String>,
+    cancellation:Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,check:&dyn Fn()->crate::server_sync::Result<()>,
+    opened:&mut dyn FnMut(&str,crate::server_sync::residency::HydrationOutcome))->crate::server_sync::Result<Vec<String>> {
+    use crate::server_sync::residency::{with_hydration_lock,HydrationOutcome};
+    fn error(_:impl std::fmt::Display)->crate::server_sync::SyncError {crate::server_sync::SyncError::new("external-body-unavailable",502)}
+    let cancel=cancellation.map(Cancellation::with_external_flag).unwrap_or_default();
+    let cas=crate::asset_repository::PayloadCas::new(root)?;
+    let scratch=tempfile::tempdir()?;
+    let mut seen=std::collections::BTreeSet::new();
+    let mut unavailable=Vec::new();
+    let mut standalone=Vec::new();
+    let mut connections=std::collections::BTreeMap::<(PathBuf,String,String),Vec<PackedSource>>::new();
+    for hash in digests {
+        check()?;cancel.check().map_err(error)?;
+        if !seen.insert(hash.clone()) {continue;}
+        if cas.stat_object(hash)?.is_some() {opened(hash,HydrationOutcome::AlreadyLocal);continue;}
+        match freeze_remote_body(root,hash).map_err(error)? {
+            Some(FrozenBodySource::Standalone(source))=>standalone.push(source),
+            Some(FrozenBodySource::Packed(source))=>connections.entry((source.connection_root.clone(),source.connection_id.clone(),source.library_id.clone())).or_default().push(source),
+            None=>unavailable.push(hash.clone()),
+        }
+    }
+    let mut groups=Vec::new();
+    for (connection,sources) in connections {for group in packed_body_groups(sources,priority) {groups.push((connection,group));}}
+    groups.sort_by_key(|(_,group)|!group.iter().any(|source|priority.contains(&source.hash)));
+    standalone.sort_by_key(|source|!priority.contains(&source.hash));
+    let mut install=|hash:&str,size:u64,path:&Path|->crate::server_sync::Result<()> {
+        with_hydration_lock(root,hash,check,|| {
+            check()?;cancel.check().map_err(error)?;
+            if let Some(actual)=cas.stat_object(hash)? {
+                if actual!=size {return Err(error("invalid-body"));}
+                opened(hash,HydrationOutcome::AlreadyLocal);return Ok(());
+            }
+            #[cfg(test)]
+            let _scope=crate::asset_repository::body_io::object_scope(hash);
+            let input=crate::trust_boundary::open_regular_source(path);
+            #[cfg(test)]
+            crate::asset_repository::body_io::open_result("managed",&input);
+            let input=input?;
+            #[cfg(test)]
+            let mut input=crate::asset_repository::body_io::TrackedBodyFile::new(input,hash);
+            #[cfg(not(test))]
+            let mut input=input;
+            let install_check=|| {check()?;cancel.check().map_err(error)};
+            let staged=crate::server_sync::transfer::stage_checked(&cas,&mut input,hash,size,&install_check)?;
+            let _guard=crate::asset_repository::coordinator::lock_repository_mutation()?;
+            check()?;cancel.check().map_err(error)?;
+            cas.publish_staged(staged)?;
+            crate::persistent_store::register_asset_objects_at_root(root,&[crate::persistent_store::asset_object_catalog::AssetObjectRegistration{object_hash:hash.into(),byte_size:size}],i64::try_from(super::runtime::now_ms()).map_err(error)?).map_err(error)?;
+            opened(hash,HydrationOutcome::Downloaded);Ok(())
+        })
+    };
+    // Selected standalone bodies precede background pack groups.
+    for source in standalone.iter().filter(|source|priority.contains(&source.hash)) {
+        let frozen=FrozenBodySource::Standalone(source.clone());
+        let file=tauri::async_runtime::block_on(spool_frozen_remote_body(&frozen,scratch.path(),&cancel)).map_err(error)?;
+        install(&source.hash,source.body.plaintext_byte_length.0,file.path())?;
+    }
+    for ((connection_root,connection_id,library_id),group) in groups {
+        check()?;cancel.check().map_err(error)?;
+        tauri::async_runtime::block_on(async {
+            let (provider,repository,key)=open_source_connection(&connection_root,&connection_id,&library_id,&cancel).await?;
+            let stored=ConnectionStore::open(&connection_root)?.read(&connection_id)?;
+            for source in &group {validate_packed_source(source,&repository)?;}
+            let writer=uuid::Uuid::new_v4().to_string();let job=uuid::Uuid::new_v4().to_string();
+            let protection=super::leases::LeaseContext{root:&connection_root,connection_id:&connection_id,writer_id:&writer,descriptor:&stored.descriptor,root_key:&key,provider:provider.as_ref(),repository:&repository,clock:super::leases::system_clock(),protection_supported:stored.capabilities.lease_operations,ledger:None};
+            let owner=match super::leases::admit_shared_work(&protection,&job,&cancel).await? {
+                super::leases::Admission::Admitted(owner)=>owner,
+                super::leases::Admission::Yield{reason}=>return Err(super::leases::yield_error(reason)),
+                super::leases::Admission::UnsupportedProtection=>return Err(ProviderError::new(ErrorKind::Unsupported)),
+            };
+            owner.run(&protection,&cancel,async {
+                let mut missing=Vec::new();
+                for source in group {
+                    if let Some(size)=cas.stat_object(&source.hash).map_err(local)? {if size!=source.byte_length {return Err(segment::corrupt());} install(&source.hash,size,scratch.path()).map_err(local)?;}
+                    else {missing.push(source);}
+                }
+                if missing.is_empty() {return Ok(());}
+                let stage=tempfile::tempdir_in(scratch.path()).map_err(local)?;
+                let files=super::snapshot_restore::download_packed_body_files(&missing,stage.path(),&key,provider.as_ref(),&repository,&cancel).await?;
+                for source in missing {
+                    if let Some(reason)=owner.recheck(&protection,&cancel).await? {return Err(super::leases::yield_error(reason));}
+                    install(&source.hash,source.byte_length,files.get(&source.hash).ok_or_else(segment::corrupt)?).map_err(local)?;
+                }
+                Ok(())
+            }).await
+        }).map_err(error)?;
+    }
+    for source in standalone.iter().filter(|source|!priority.contains(&source.hash)) {
+        let frozen=FrozenBodySource::Standalone(source.clone());
+        let file=tauri::async_runtime::block_on(spool_frozen_remote_body(&frozen,scratch.path(),&cancel)).map_err(error)?;
+        install(&source.hash,source.body.plaintext_byte_length.0,file.path())?;
+    }
+    check()?;Ok(unavailable)
+}
 pub(crate) fn hydrate_registered(root:&Path,hash:&str,check:&dyn Fn()->crate::server_sync::Result<()>)->crate::server_sync::Result<bool> {
     check()?;
     let cas=crate::asset_repository::PayloadCas::new(root)?;
