@@ -128,6 +128,20 @@ it('retains a failed post-release adapter resume for ordinary runtime retry', as
     await expect(h.runtime.retryCommittedWorkingSetRefresh()).resolves.toBeNull()
 })
 
+it.each([false, true])('retries initialized adapter resume without repeating initial publication (shared data: %s)', async nonDefault => {
+    const h = await harness()
+    h.transport.inspectTarget = async () => ({ inspectionId: 'inspection', targetId: 'target', libraryId: 'library', empty: true, previouslyBoundLibrary: false })
+    h.dependencies.hasNonDefaultSharedData = async () => nonDefault
+    const resume = vi.fn(async () => { if (resume.mock.calls.length === 1) throw Error('adapter resume failed') })
+    h.transport.resumeBinding = resume
+    await expect(h.flow.bind(h.target, h.transport)).rejects.toThrow('adapter resume failed')
+    expect(h.transport.publishInitialSharedState).toHaveBeenCalledTimes(nonDefault ? 1 : 0)
+    expect((await h.runtime.retryCommittedWorkingSetRefresh())?.projection).toBe('applied')
+    expect(resume).toHaveBeenCalledTimes(2)
+    expect(h.transport.publishInitialSharedState).toHaveBeenCalledTimes(nonDefault ? 1 : 0)
+    expect(h.events).not.toContain('activate')
+})
+
 it.each(['switch', 'replacement'])('settles a lost %s response by exact replay before recovery projection', async phase => {
     const h = await harness()
     const original = phase === 'switch' ? h.dependencies.native.switchTarget : h.transport.replaceFromTarget
