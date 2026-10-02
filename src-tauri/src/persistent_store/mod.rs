@@ -3012,16 +3012,15 @@ impl PersistentStore {
             "repair",
             crate::data_health::journal::roots(&self.repository_root)?,
         ));
-        roots.push((
-            "job",
-            if read_only {
-                collect_durable_cas_job_roots_read_only(&self.repository_root)
-            } else if repository_guard_held {
-                collect_durable_cas_job_roots_already_guarded(&self.repository_root)
-            } else {
-                collect_durable_cas_job_roots(&self.repository_root)
-            },
-        ));
+        let mut jobs = if read_only {
+            collect_durable_cas_job_roots_read_only(&self.repository_root)
+        } else if repository_guard_held {
+            collect_durable_cas_job_roots_already_guarded(&self.repository_root)
+        } else {
+            collect_durable_cas_job_roots(&self.repository_root)
+        };
+        jobs.object_hashes.extend(self.external_lww_active_asset_roots()?.object_hashes);
+        roots.push(("job", jobs));
         Ok(roots)
     }
 
