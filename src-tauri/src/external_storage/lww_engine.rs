@@ -6,7 +6,7 @@ use super::{
 #[cfg(test)]
 use crate::persistent_store::lww::ApplyReceive;
 use crate::persistent_store::{
-    external_lww::{FrozenAsset, SealedBody, SealedPublication, UploadState},
+    external_lww::{FrozenAsset, FrozenControl, SealedBody, SealedPublication, UploadState},
     lww::{Change, Header, MessageLocator, Progress, StageReceive},
     PersistentStore,
 };
@@ -356,9 +356,11 @@ impl ExternalLwwEngine {
                     let mut selected = Vec::new();
                     let mut bodies = Vec::new();
                     let mut assets = BTreeMap::new();
+                    let mut controls = BTreeMap::new();
                     for entry in entries {
                         let mut candidate = payload.clone();
                         let mut candidate_assets = assets.clone();
+                        let mut candidate_controls = controls.clone();
                         let mut added = Vec::new();
                         self.include_objects(
                             store,
@@ -366,6 +368,7 @@ impl ExternalLwwEngine {
                             &mut candidate,
                             &mut added,
                             &mut candidate_assets,
+                            &mut candidate_controls,
                             cancel,
                         )
                         .await?;
@@ -374,7 +377,12 @@ impl ExternalLwwEngine {
                             stamp: entry.stamp.clone(),
                             value: entry.value.clone(),
                         });
-                        if candidate.encode_capture()?.len() > segment::SEGMENT_BYTES {
+                        let mut fits=Self::capture_fits(&candidate,&candidate_controls,&candidate_assets)?;
+                        if !fits {
+                            candidate_controls.extend(std::mem::take(&mut candidate.message_pages));
+                            fits=Self::capture_fits(&candidate,&candidate_controls,&candidate_assets)?;
+                        }
+                        if !fits {
                             if selected.is_empty() {
                                 return Err(ProviderError::new(ErrorKind::FileTooLarge));
                             }
@@ -382,6 +390,7 @@ impl ExternalLwwEngine {
                         }
                         payload = candidate;
                         assets = candidate_assets;
+                        controls = candidate_controls;
                         bodies.extend(added);
                         selected.push(entry);
                     }
@@ -391,7 +400,7 @@ impl ExternalLwwEngine {
                     let sha256 = String::new();
                     let object_id = String::new();
                     let assets = assets.into_values().collect::<Vec<_>>();
-                    let asset_job = if assets.is_empty() {
+                    let asset_job = if assets.is_empty() && controls.is_empty() {
                         None
                     } else {
                         let job = super::journal::JobIdentity {
@@ -415,6 +424,22 @@ impl ExternalLwwEngine {
                         pins.seal(store, super::runtime::now_ms() as i64).map_err(transient)?;
                         Some(job)
                     };
+                    let mut frozen_controls=Vec::new();
+                    if !controls.is_empty() {
+                        let job=asset_job.as_ref().ok_or_else(segment::corrupt)?;
+                        let directory=store.repository_root().join("external-storage").join("lww-publications")
+                            .join(&job.job_id).join("controls");
+                        std::fs::create_dir_all(&directory).map_err(transient)?;
+                        for (hash,encoded) in controls {
+                            cancel.check()?;
+                            let bytes=URL_SAFE_NO_PAD.decode(encoded).map_err(|_|segment::corrupt())?;
+                            let source=directory.join(&hash);
+                            let mut file=std::fs::OpenOptions::new().write(true).create_new(true).open(&source).map_err(transient)?;
+                            std::io::Write::write_all(&mut file,&bytes).map_err(transient)?;
+                            file.sync_all().map_err(transient)?;
+                            frozen_controls.push(FrozenControl { content_hash:hash,byte_length:bytes.len() as u64,source });
+                        }
+                    }
                     let publication = SealedPublication {
                         target: self.target_scope(),
                         writer: writer.clone(),
@@ -428,7 +453,9 @@ impl ExternalLwwEngine {
                         entries: selected,
                         bodies,
                         assets,
+                        controls: frozen_controls,
                         asset_job,
+                        data_catalogs: Vec::new(),
                         asset_catalogs: Vec::new(),
                         resume: None,
                         dispatched: false,
@@ -496,6 +523,16 @@ impl ExternalLwwEngine {
         key_operation.finish();
         Ok(result)
     }
+    fn capture_fits(payload:&Segment,controls:&BTreeMap<String,String>,assets:&BTreeMap<String,FrozenAsset>)->Result<bool> {
+        let catalogs=usize::from(!controls.is_empty())+usize::from(assets.values().any(|asset|asset.byte_length<=segment::SMALL_BODY_BYTES as u64));
+        let reserved=risunest_external_storage_format::snapshot::MAX_METADATA_BYTES.checked_mul(catalogs).ok_or_else(segment::corrupt)?;
+        let length=payload.encode_capture()?.len().checked_add(reserved).ok_or_else(segment::corrupt)?;
+        match segment::sealed_length(length) {
+            Ok(_)=>Ok(true),
+            Err(error) if error.kind==ErrorKind::FileTooLarge=>Ok(false),
+            Err(error)=>Err(error),
+        }
+    }
     async fn publish_captured(
         &self,
         store: &mut PersistentStore,
@@ -515,6 +552,23 @@ impl ExternalLwwEngine {
             let roots = pins.root_set().map_err(transient)?;
             if publication.assets.iter().filter(|asset| asset.local_pin).any(|asset| !roots.object_hashes.contains(&asset.content_hash)) {
                 return Err(segment::corrupt());
+            }
+            if publication.data_catalogs.is_empty() && !publication.controls.is_empty() {
+                let mut journal=super::journal::TransferJournal::open(
+                    &root.join("external-storage").join("lww-publications").join(&job.job_id).join("data"),job.clone(),
+                ).map_err(transient)?;
+                let sources=publication.controls.iter().map(|control|super::packaging::AssetCatalogSource {
+                    content_hash:control.content_hash.clone(),byte_length:control.byte_length,
+                    source:super::content_store::ObjectSource::File(control.source.clone()),
+                }).collect();
+                let completed=super::packaging::package_and_upload_control_catalog(
+                    sources,&root,&self.connection_root.join("external-storage").join("package-cache").join(&self.connection_id),
+                    &self.root_key,super::packaging::PackageLimits::from_capabilities(&self.capabilities)?,
+                    &mut journal,self.provider.as_ref(),&self.repository,
+                    &super::phase_progress::PhaseProgress::silent(),cancel,protection,
+                ).await?;
+                publication.data_catalogs.push(completed.catalog);
+                store.external_lww_persist(&publication,&sealed).map_err(store_error)?;
             }
             if publication.asset_catalogs.is_empty() && publication.assets.iter().any(|asset| asset.byte_length <= segment::SMALL_BODY_BYTES as u64) {
                 let mut journal = super::journal::TransferJournal::open(
@@ -563,7 +617,8 @@ impl ExternalLwwEngine {
                 publication.asset_catalogs.push(completed.catalog);
                 store.external_lww_persist(&publication, &sealed).map_err(store_error)?;
             }
-        } else if !publication.assets.is_empty() || !publication.asset_catalogs.is_empty() {
+        } else if !publication.assets.is_empty() || !publication.asset_catalogs.is_empty()
+            || !publication.controls.is_empty() || !publication.data_catalogs.is_empty() {
             return Err(segment::corrupt());
         }
         for index in 0..publication.bodies.len() {
@@ -621,6 +676,7 @@ impl ExternalLwwEngine {
                 .decode(&publication.payload)
                 .map_err(|_| segment::corrupt())?;
             let mut payload = Segment::decode_capture(&plain)?;
+            payload.data_catalogs = publication.data_catalogs.clone();
             payload.asset_catalogs = publication.asset_catalogs.clone();
             for body in payload.large_bodies.values_mut() {
                 let prepared = publication
@@ -938,6 +994,7 @@ impl ExternalLwwEngine {
         payload: &mut Segment,
         bodies: &mut Vec<SealedBody>,
         assets: &mut BTreeMap<String, FrozenAsset>,
+        controls: &mut BTreeMap<String,String>,
         _cancel: &Cancellation,
     ) -> Result<()> {
         let mut hashes = BTreeSet::new();
@@ -976,6 +1033,7 @@ impl ExternalLwwEngine {
         }
         for hash in hashes {
             if payload.message_pages.contains_key(&hash)
+                || controls.contains_key(&hash)
                 || assets.contains_key(&hash)
                 || payload.large_bodies.contains_key(&hash)
                 || store
@@ -986,7 +1044,9 @@ impl ExternalLwwEngine {
             }
             if store.external_lww_object_is_control(&hash).map_err(store_error)? {
                 let bytes = store.lww_object_body(&hash).map_err(store_error)?.ok_or_else(segment::corrupt)?;
-                payload.message_pages.insert(hash, URL_SAFE_NO_PAD.encode(bytes));
+                let encoded=URL_SAFE_NO_PAD.encode(&bytes);
+                if bytes.len()>segment::SMALL_BODY_BYTES { controls.insert(hash,encoded); }
+                else { payload.message_pages.insert(hash,encoded); }
                 continue;
             }
             let root = store.repository_root();
@@ -1186,6 +1246,12 @@ impl ExternalLwwEngine {
                 .external_lww_witness_object(&self.target_scope(), hash)
                 .map_err(store_error)?;
         }
+        let hashes=super::snapshot_restore::admit_data_catalogs(
+            &payload.data_catalogs,store,&self.root_key,self.provider.as_ref(),&self.repository,cancel,
+        ).await?;
+        for hash in hashes {
+            store.external_lww_witness_object(&self.target_scope(),&hash).map_err(store_error)?;
+        }
         let hashes = super::snapshot_restore::admit_asset_catalogs(
             &payload.asset_catalogs, store, &self.library, physical_segment, &self.connection_id,
             &self.connection_root, &self.root_key, self.provider.as_ref(), &self.repository, cancel,
@@ -1272,11 +1338,18 @@ impl ExternalLwwEngine {
     ) -> Result<Vec<StageReceive>> {
         let progress=store.lww_receive_progress(authority).map_err(store_error)?;
         let current=progress.into_iter().filter(|p|p.kind=="external").filter_map(|p|p.writer_id.map(|w|(w,p.cursor))).collect::<BTreeMap<_,_>>();
-        let mut behind=false;
+        let mut covered=BTreeMap::new();
         for receipt in self.snapshot_listing(cancel).await? {
             let (_,snapshot)=self.checkpoint(&receipt,cancel).await?;
-            if snapshot.covered_prefixes.iter().any(|(writer,prefix)|current.get(writer).copied().unwrap_or(DecimalU64(0))<*prefix) {behind=true;}
+            for (writer,prefix) in snapshot.covered_prefixes {
+                let value=covered.entry(writer).or_insert(DecimalU64(0));
+                *value=(*value).max(prefix);
+            }
         }
+        let segments = self.verified_segments(store, false, cancel).await?;
+        let mut available=current.clone();
+        for segment in &segments { available.insert(segment.writer_id.clone(),segment.seq); }
+        let behind=covered.iter().any(|(writer,prefix)|available.get(writer).copied().unwrap_or(DecimalU64(0))<*prefix);
         if behind {
             let directory=tempfile::tempdir().map_err(transient)?;
             let mut state=self.published_state(directory.path(),cancel).await?;
@@ -1294,7 +1367,6 @@ impl ExternalLwwEngine {
             }
             return Ok(requests);
         }
-        let segments = self.verified_segments(store, false, cancel).await?;
         segments
             .into_iter()
             .map(|segment| {
