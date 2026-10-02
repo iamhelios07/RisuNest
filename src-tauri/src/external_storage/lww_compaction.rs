@@ -241,15 +241,21 @@ impl ExternalLwwEngine {
         Ok(output)
     }
     pub(crate) async fn checkpoint(&self,receipt:&ObjectReceipt,cancel:&Cancellation)->Result<(RemoteObject,Checkpoint)> {self.classified_checkpoint(receipt,cancel).await?.ok_or_else(segment::corrupt)}
-    async fn classified_checkpoint(&self, receipt:&ObjectReceipt,cancel:&Cancellation) -> Result<Option<(RemoteObject,Checkpoint)>> {
+    pub(super) async fn classified_checkpoint(&self, receipt:&ObjectReceipt,cancel:&Cancellation) -> Result<Option<(RemoteObject,Checkpoint)>> {
         receipt.locator.validate_for(&self.repository)?;
         let bytes=read_bytes(self.provider.as_ref(),&self.repository,&receipt.locator,cancel).await?;
-        let key=derive_key(&self.root_key,&self.repository.repository_id,"metadata").map_err(error)?;
+        let (advertised,_)=wire::read_public_header(&mut Cursor::new(&bytes)).map_err(error)?;
+        let ordinary=advertised.object_id.starts_with("snapshot-");
+        let repository_id=if ordinary {&self.descriptor.repository_id}else{&self.repository.repository_id};
+        if advertised.repository_id!=*repository_id
+            || (ordinary && !matches!(advertised.role,wire::ObjectRole::SyncState|wire::ObjectRole::BackupBundle))
+            || (!ordinary && advertised.role!=wire::ObjectRole::SyncState) {return Err(segment::corrupt())}
+        let key=derive_key(&self.root_key,repository_id,"metadata").map_err(error)?;
         let mut plaintext=Vec::new();
         let header=wire::open_envelope(&mut Cursor::new(&bytes),&mut plaintext,&key,wire::MAX_METADATA_BYTES as u64).map_err(error)?;
-        if header.repository_id!=self.repository.repository_id || receipt.byte_length!=bytes.len() as u64 || !receipt.complete {return Err(segment::corrupt());}
-        if header.object_id.starts_with("snapshot-") && matches!(header.role,wire::ObjectRole::SyncState|wire::ObjectRole::BackupBundle) {
-            let backup=super::control::SnapshotView::read(&plaintext,header.role,&self.repository.repository_id)?;
+        if header!=advertised || receipt.byte_length!=bytes.len() as u64 || !receipt.complete {return Err(segment::corrupt());}
+        if ordinary {
+            let backup=super::control::SnapshotView::read(&plaintext,header.role,repository_id)?;
             if header.object_id!=format!("snapshot-{}",backup.snapshot_id) {return Err(segment::corrupt());}
             return Ok(None);
         }
