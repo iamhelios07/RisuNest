@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
 import { IndexedDbPersistentDataStore } from './indexedDbPersistentDataStore'
 import { fixtureDatabase } from './tests/persistentDataFixtures'
-import { SaveCoordinator } from './saveCoordinator'
+import { PersistentMutationFencedError, SaveCoordinator } from './saveCoordinator'
 import { capturePersistentRoot, createPersistentDataRuntime } from './persistentDataRuntime'
 import { applyLwwWorkingSetUnits, captureLwwWorkingSetBaseline } from './lwwWorkingSetApply'
 import { createGeneratingConversationRegistry } from './generatingConversationRegistry'
@@ -401,6 +401,39 @@ describe('LWW renderer save path', () => {
         authority = '12'
         await expect(runtime.acknowledgeGenerationCompletion()).resolves.toBeUndefined()
         expect(store.lwwDrainDeferred).toHaveBeenCalledWith(expect.objectContaining({bindingAuthority:'12',generating:[]}))
+    })
+
+    it('drains held receives after a response-free generation without acknowledging completion', async () => {
+        const registry = createGeneratingConversationRegistry()
+        const release = registry.register({characterId:'char-a',conversationId:'conv-long'})
+        const {store,runtime,database,commit} = await runtimeHarness(registry)
+        store.lwwBindingState = async () => ({targetAuthority:'current-target'})
+        store.lwwDrainDeferred = vi.fn(async (request) => {
+            expect(request.generating).toEqual([])
+            const result = await store.commit({expectedRevision:runtime.revision,unitMutations:[{
+                key:'["character","char-a","desc"]',type:'set',value:'Held remote edit',
+            }]})
+            return {...result,affectedKeys:['["character","char-a","desc"]'],heldKeys:[],deferredKeys:[]}
+        })
+        const acknowledge = vi.spyOn(runtime, 'acknowledgeGenerationCompletion')
+        const epoch = runtime.getStorageAuthorityEpoch()
+        release()
+        await runtime.drainDeferredLwwReceives(epoch)
+        expect(acknowledge).not.toHaveBeenCalled()
+        expect(database.characters.find((value) => value.chaId === 'char-a')).toMatchObject({desc:'Held remote edit'})
+        expect(store.lwwDrainDeferred).toHaveBeenCalledWith(expect.objectContaining({bindingAuthority:'current-target'}))
+        const calls = commit.mock.calls.length
+        await runtime.flushPendingDataLocally('response-free-drain-no-echo')
+        expect(commit.mock.calls).toHaveLength(calls)
+    })
+
+    it('rejects a response-free deferred drain admitted under a stale authority epoch', async () => {
+        const {store,runtime} = await runtimeHarness()
+        store.lwwBindingState = vi.fn(async () => ({targetAuthority:'current-target'}))
+        store.lwwDrainDeferred = vi.fn(async () => ({revision:runtime.revision,affectedKeys:[],heldKeys:[],deferredKeys:[]}))
+        await expect(runtime.drainDeferredLwwReceives(runtime.getStorageAuthorityEpoch() - 1)).rejects.toThrow(PersistentMutationFencedError)
+        expect(store.lwwBindingState).not.toHaveBeenCalled()
+        expect(store.lwwDrainDeferred).not.toHaveBeenCalled()
     })
 
     it('registers all generating conversations using both stable IDs', () => {
