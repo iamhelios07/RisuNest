@@ -17,10 +17,6 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
 
-pub(crate) const MAX_ROLES: usize = 131_072;
-const MAX_ROWS: usize = 262_144;
-const MAX_RANGES: usize = 4096;
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Role {
@@ -162,9 +158,20 @@ fn active() -> Option<Context> {
 }
 fn root_context(root: &Path) -> Option<Context> {
     let context = current().or_else(active)?;
-    let root = crate::resolve_data_root(root).ok()?;
-    let matches = context.scope.lock().unwrap().root == root;
-    matches.then_some(context)
+    let root = match crate::resolve_data_root(root) {
+        Ok(root) => root,
+        Err(_) => {
+            violation(&mut context.scope.lock().unwrap(), "source-root-unresolved");
+            return None;
+        }
+    };
+    let mut scope = context.scope.lock().unwrap();
+    if scope.root != root {
+        violation(&mut scope, "source-root-mismatch");
+        return None;
+    }
+    drop(scope);
+    Some(context)
 }
 fn violation(scope: &mut Scope, name: &str) {
     let count = scope.violations.entry(name.into()).or_default();
@@ -188,10 +195,6 @@ impl Context {
             violation(&mut scope, "unknown-object");
         }
         let key = (hash.into(), placement.into(), self.flow.clone());
-        if !scope.rows.contains_key(&key) && scope.rows.len() >= MAX_ROWS {
-            violation(&mut scope, "row-limit");
-            return;
-        }
         let row = scope.rows.entry(key).or_insert_with(|| ObjectWork {
             hash: hash.into(),
             purposes,
@@ -210,7 +213,6 @@ impl Context {
                 .or_default()
                 .add(&value);
         }
-        let mut range_limit = false;
         if let Some(range) = range {
             if let Some(last) = row
                 .read_ranges
@@ -225,17 +227,12 @@ impl Context {
                     overflow = true;
                     u64::MAX
                 });
-            } else if row.read_ranges.len() < MAX_RANGES {
-                row.read_ranges.push(range);
             } else {
-                range_limit = true;
+                row.read_ranges.push(range);
             }
         }
         if overflow {
             violation(&mut scope, "counter-overflow");
-        }
-        if range_limit {
-            violation(&mut scope, "range-limit");
         }
     }
     fn reader(&self, hash: &str, placement: &str, delta: bool) {
@@ -357,7 +354,7 @@ pub(crate) fn body_work(value: PendingBodyWork) {
     }
 }
 pub(crate) fn note_current_violation(name: &str) {
-    if let Some(context) = current() {
+    if let Some(context) = current().or_else(active) {
         violation(&mut context.scope.lock().unwrap(), name);
     }
 }
@@ -373,8 +370,12 @@ pub(crate) fn install() {
         let origin = match &event {
             Event::Extract { origin, .. } | Event::Hash { origin, .. } => origin,
         };
-        let Some(origin) = origin else { return };
+        let Some(origin) = origin else {
+            note_violation("inline-origin-missing");
+            return;
+        };
         let Some(root) = Path::new(origin).parent() else {
+            note_violation("inline-root-missing");
             return;
         };
         let Some(mut context) = root_context(root) else {
@@ -457,12 +458,7 @@ pub(crate) fn begin(
     phase: String,
     roles: Vec<Role>,
 ) -> Result<u64, &'static str> {
-    if roles.len() > MAX_ROLES
-        || id.is_empty()
-        || id.len() > 128
-        || phase.is_empty()
-        || phase.len() > 64
-    {
+    if id.is_empty() || id.len() > 128 || phase.is_empty() || phase.len() > 64 {
         return Err("scope-limit");
     }
     let root = crate::resolve_data_root(root).map_err(|_| "invalid-source-root")?;
@@ -618,15 +614,11 @@ pub(crate) fn inline_selection(hash: &str, start: u64, bytes: u64) {
             .rows
             .get_mut(&(hash.into(), "inline".into(), context.flow))
         {
-            if row.selected_ranges.len() < MAX_RANGES {
-                row.selected_ranges.push(Range {
-                    start,
-                    bytes,
-                    calls: 1,
-                });
-            } else {
-                violation(&mut scope, "range-limit");
-            }
+            row.selected_ranges.push(Range {
+                start,
+                bytes,
+                calls: 1,
+            });
         } else {
             violation(&mut scope, "unobserved-inline-selection");
         }
@@ -640,8 +632,13 @@ pub(crate) struct HashScope {
 }
 impl HashScope {
     pub(crate) fn new(hash: &str, domain: &'static str) -> Self {
+        let context = current().or_else(|| {
+            let context = active()?;
+            violation(&mut context.scope.lock().unwrap(), "unattributed-hash");
+            Some(context)
+        });
         let scope = Self {
-            context: current(),
+            context,
             hash: hash.into(),
             domain,
             complete: false,
@@ -655,6 +652,8 @@ impl HashScope {
     fn record(&self, work: Work) {
         if let Some(context) = &self.context {
             context.update(&self.hash, "memory", work, Some(self.domain), None);
+        } else {
+            note_violation("unattributed-hash");
         }
     }
     pub(crate) fn input(&mut self, bytes: usize) {
@@ -738,6 +737,8 @@ impl Reader {
                     calls: 1,
                 }),
             );
+        } else {
+            note_violation("unattributed-source-read");
         }
         if let Ok(bytes) = result {
             self.position = self.position.saturating_add(*bytes as u64);
@@ -755,6 +756,8 @@ impl Reader {
                 None,
                 None,
             );
+        } else {
+            note_violation("unattributed-source-read");
         }
     }
     fn selected(&self, start: u64, bytes: u64) {
@@ -766,14 +769,27 @@ impl Reader {
                 context.flow.clone(),
             );
             if let Some(row) = scope.rows.get_mut(&key) {
-                if row.selected_ranges.len() < MAX_RANGES {
-                    row.selected_ranges.push(Range {
-                        start,
-                        bytes,
-                        calls: 1,
-                    });
-                } else {
-                    violation(&mut scope, "range-limit");
+                row.selected_ranges.push(Range {
+                    start,
+                    bytes,
+                    calls: 1,
+                });
+            } else {
+                violation(&mut scope, "unobserved-file-selection");
+            }
+        } else {
+            note_violation("unattributed-source-selection");
+        }
+    }
+    fn seek(&mut self, result: &io::Result<u64>) {
+        if self.context.is_none() {
+            note_violation("unattributed-source-seek");
+        }
+        match result {
+            Ok(position) => self.position = *position,
+            Err(_) => {
+                if let Some(context) = &self.context {
+                    violation(&mut context.scope.lock().unwrap(), "source-seek-error");
                 }
             }
         }
@@ -836,9 +852,7 @@ impl Read for TrackedFile {
 impl Seek for TrackedFile {
     fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
         let result = self.file.seek(position);
-        if let Ok(position) = result {
-            self.reader.position = position;
-        }
+        self.reader.seek(&result);
         result
     }
 }
@@ -877,9 +891,14 @@ impl AsyncRead for TrackedAsyncFile {
 }
 impl AsyncSeek for TrackedAsyncFile {
     fn start_seek(mut self: Pin<&mut Self>, position: SeekFrom) -> io::Result<()> {
+        if self.reader.context.is_none() {
+            note_violation("unattributed-source-seek");
+        }
         let result = Pin::new(&mut self.file).start_seek(position);
         if result.is_ok() {
             self.seeking = true;
+        } else if let Some(context) = &self.reader.context {
+            violation(&mut context.scope.lock().unwrap(), "source-seek-error");
         }
         result
     }
@@ -887,14 +906,7 @@ impl AsyncSeek for TrackedAsyncFile {
         let result = Pin::new(&mut self.file).poll_complete(cx);
         if let Poll::Ready(result) = &result {
             self.seeking = false;
-            match result {
-                Ok(position) => self.reader.position = *position,
-                Err(_) => {
-                    if let Some(context) = &self.reader.context {
-                        violation(&mut context.scope.lock().unwrap(), "source-seek-error");
-                    }
-                }
-            }
+            self.reader.seek(result);
         }
         result
     }
