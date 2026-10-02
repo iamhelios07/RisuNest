@@ -105,6 +105,19 @@ fn preinstall(source:&PersistentStore,destination:&PersistentStore,hashes:&[Stri
             present.insert(hash.clone(),size);
         } else {missing.insert(hash.clone(),size);}
     }
+    let registrations=present.iter().map(|(hash,size)|crate::persistent_store::asset_object_catalog::AssetObjectRegistration {
+        object_hash:hash.clone(),byte_size:*size}).collect::<Vec<_>>();
+    crate::persistent_store::register_asset_objects_at_root(destination.repository_root(),&registrations,1).map_err(|e|e.to_string())?;
+    for (hash,size) in &present {
+        let catalog:i64=destination.connection.query_row("SELECT byte_size FROM asset_objects WHERE object_hash=?1",[hash],|row|row.get(0)).map_err(|e|e.to_string())?;
+        if catalog as u64!=*size || destination_cas.stat_object(hash).map_err(|e|e.to_string())?!=Some(*size) {
+            return Err("excluded setup present catalog/file partition differs".into());
+        }
+    }
+    for hash in missing.keys() {
+        let catalog:u64=destination.connection.query_row("SELECT count(*) FROM asset_objects WHERE object_hash=?1",[hash],|row|sql_u64(row,0)).map_err(|e|e.to_string())?;
+        if catalog!=0 || destination_cas.stat_object(hash).map_err(|e|e.to_string())?.is_some() {return Err("excluded setup missing partition is already present".into());}
+    }
     Ok(json!({"phase":"excluded-actual-destination-body-setup","alreadyPresent":present,"missing":missing}))
 }
 fn source(run:&str)->Result<source_process::SourceProcess,String> {
@@ -510,6 +523,40 @@ async fn costly_external(output:&Path,fixture:&mut CycleFixture,hashes:&[String]
     use crate::external_storage::{leases,lease_ledger::LocalLeaseLedger,job_store::{JobStore,DurableJob,StartJobRequest}};
     let setup=tempfile::tempdir().map_err(|e|e.to_string())?;
     let connected=connected(fixture).await?;
+    let mut current_hashes=hashes.to_vec();let mut transfer_hash=None;
+    if scenario==Scenario::DuringAssetTransfer {
+        use crate::asset_repository::{PayloadCas,owner_manifest_codec::{decode_owner_manifest,encode_owner_manifest,OwnerManifestEntry}};
+        let body=(0..8*1024*1024u32).map(|index|((index.wrapping_mul(79)^index.rotate_left(7)^0x63)&255) as u8).collect::<Vec<_>>();
+        let key="assets/synthetic-external-transfer.bin";
+        let hash=crate::external_storage::lww_tests::small_asset(&mut fixture.a,key,&body);
+        if current_hashes.contains(&hash) {return Err("standalone transfer delta collides with base Asset".into());}
+        let cas=PayloadCas::new(fixture.a.repository_root()).map_err(|e|e.to_string())?;
+        let owner=crate::persistent_store::AssetOwnerLocator::CharacterAdditionalAssets {character_id:"synthetic-character-0".into()};
+        let head=fixture.a.read_asset_owner_head(&owner,None).map_err(|e|e.to_string())?.ok_or("actual transfer owner absent")?.value;
+        let old=cas.read_object(&head.manifest_hash.ok_or("actual transfer owner manifest absent")?).map_err(|e|e.to_string())?.ok_or("owner manifest body absent")?;
+        let mut entries=decode_owner_manifest(&old).map_err(|e|e.to_string())?;
+        entries.push(OwnerManifestEntry {tuple:["Synthetic standalone transfer".into(),key.into(),"bin".into()],
+            payload_hash:Some(hex::decode(&hash).map_err(|e|e.to_string())?.try_into().map_err(|_|"actual standalone hash malformed")?)});
+        let manifest=cas.prepare_bytes(&encode_owner_manifest(&entries).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+        fixture.a.asset_object_catalog().register(&[crate::persistent_store::asset_object_catalog::AssetObjectRegistration {
+            object_hash:manifest.content_hash.clone(),byte_size:manifest.byte_size}],1).map_err(|e|e.to_string())?;
+        let mut character=fixture.a.read_character("synthetic-character-0",None).map_err(|e|e.to_string())?.ok_or("actual selected parent absent")?.value;
+        character["additionalAssets"]=json!(entries.iter().map(|entry|entry.tuple.clone()).collect::<Vec<_>>());
+        fixture.a.commit(&WorkingSetCommit {expected_revision:fixture.a.revision().map_err(|e|e.to_string())?,character:Some(character),
+            asset_owner_heads:Some(vec![crate::persistent_store::AssetOwnerHead::present(owner,manifest.content_hash.clone(),entries.len() as i64)]),
+            ..Default::default()}).map_err(|e|e.to_string())?;
+        let authority=fixture.a.lww_binding_authority().map_err(|e|e.to_string())?;
+        fixture.sender.publish(&mut fixture.a,authority,&[],&Cancellation::default()).await.map_err(|e|format!("{e:?}"))?;
+        let path=cas.object_path(&hash).map_err(|e|e.to_string())?.ok_or("actual standalone file absent")?;
+        let (metadata,sparse,reparse)=observed_file_kind(&path)?;
+        if !metadata.is_file() || sparse || reparse || metadata.len()!=8*1024*1024 || cas.read_object(&hash).map_err(|e|e.to_string())?.as_deref()!=Some(body.as_slice()) {
+            return Err("actual standalone transfer file verification failed".into());
+        }
+        current_hashes.push(hash.clone());current_hashes.sort();transfer_hash=Some(hash.clone());
+        write(output,"excluded-standalone-transfer-delta.json",&json!({"baseCertificateUnchanged":true,"hash":hash,"byteSize":metadata.len(),
+            "currentUniqueAssets":current_hashes.len(),"ownerManifest":manifest.content_hash,"normalPublicationComplete":true}))?;
+    }
+    let hashes=current_hashes.as_slice();
     let backup=if route=="remote-backup" && scenario!=Scenario::DuringCompaction && scenario!=Scenario::DuringBackup && scenario!=Scenario::DuringAssetTransfer {Some(prepare_remote_backup(&mut fixture.a,&connected,&setup.path().join("remote-backup")).await?)}else{None};
     if scenario==Scenario::ConsolidatedSnapshot {
         fixture.sender.compact_published(&setup.path().join("consolidated"),&uuid::Uuid::new_v4().to_string(),
@@ -535,8 +582,12 @@ async fn costly_external(output:&Path,fixture:&mut CycleFixture,hashes:&[String]
     for slot in costly_runner::slots().into_iter().filter(|slot|slot.scenario==scenario) {
         let label=format!("{:?}-{}",slot.direction,slot.iteration);
         let (_destination_directory,mut destination)=server_sync::lww_tests::local();
-        let partition=preinstall(&fixture.a,&destination,hashes,scenario==Scenario::RestoreAllPresent,
-            matches!(scenario,Scenario::FullBootstrap|Scenario::ConsolidatedSnapshot|Scenario::IncomparableSnapshots))?;
+        let partition=if let Some(hash)=&transfer_hash {
+            let other=hashes.iter().filter(|candidate|*candidate!=hash).cloned().collect::<Vec<_>>();
+            let mut partition=preinstall(&fixture.a,&destination,&other,true,false)?;
+            partition["missing"]=json!({hash:8*1024*1024u64});partition
+        } else {preinstall(&fixture.a,&destination,hashes,scenario==Scenario::RestoreAllPresent,
+            matches!(scenario,Scenario::FullBootstrap|Scenario::ConsolidatedSnapshot|Scenario::IncomparableSnapshots))?};
         write(output,&format!("costly-{label}-setup.json"),&partition)?;
         let reads_before=source_ids.keys().map(|id|(id.clone(),fixture.provider.read_attempts(id))).collect::<BTreeMap<_,_>>();
         let raw=if scenario==Scenario::DuringBackup {
@@ -593,6 +644,11 @@ async fn costly_external(output:&Path,fixture:&mut CycleFixture,hashes:&[String]
                 raw["direction"]=serde_json::to_value(direction).map_err(|e|e.to_string())?;
                 Ok::<Value,String>(raw)
             }).await.map_err(|e|e.to_string())?
+        } else if scenario==Scenario::DuringAssetTransfer {
+            let hash=transfer_hash.as_ref().ok_or("actual standalone transfer hash absent")?;
+            let ids=source_ids.iter().filter(|(_,assets)|assets.contains(hash)).map(|(id,_)|id.clone()).collect::<Vec<_>>();
+            if ids.len()!=1 {return Err("standalone transfer has no unique authenticated physical source".into());}
+            fake_transfer_overlap(&slot,&mut destination,fixture,connected.clone(),hashes,&ids[0]).await
         } else if route=="serverless-bootstrap" && scenario!=Scenario::DuringCompaction && scenario!=Scenario::DuringAssetTransfer {
             final_external_bootstrap_costly_slot(&slot,&mut destination,&fixture.sender,connected.clone(),&fixture.provider,hashes,Some("synthetic-character-0")).await
         } else if route=="remote-backup" && scenario!=Scenario::DuringCompaction && scenario!=Scenario::DuringAssetTransfer {
@@ -633,6 +689,58 @@ async fn costly_external(output:&Path,fixture:&mut CycleFixture,hashes:&[String]
     }
     write(output,"costly-native-results.json",&costly_summary(&summaries))?;
     Ok(())
+}
+
+async fn fake_transfer_overlap(slot:&costly_runner::CostlySlot,destination:&mut PersistentStore,fixture:&CycleFixture,
+    connected:Arc<crate::external_storage::connection_commands::ConnectedRepository>,hashes:&[String],object_id:&str)->Result<Value,String> {
+    use crate::external_storage::contract::{Provider,SecretRef,OpenMode};
+    let foreground=destination.open_native_job_store().map_err(|e|e.to_string())?;
+    let peer=fixture.a.open_native_job_store().map_err(|e|e.to_string())?;
+    let mut engines=Vec::new();
+    for root in [destination.repository_root(),fixture.a.repository_root()] {
+        let (repository,capabilities)=fixture.provider.open_repository(&connected.stored.config,&SecretRef("fixture".into()),
+            OpenMode::Existing,&Cancellation::default()).await.map_err(|e|format!("{e:?}"))?;
+        if repository.repository_id!=fixture.sender.repository.repository_id || repository.connection_identity!=fixture.sender.repository.connection_identity {
+            return Err("actual transfer foreground repository changed".into());
+        }
+        engines.push(crate::external_storage::lww_engine::ExternalLwwEngine {provider:fixture.sender.provider.clone(),repository,
+            library:fixture.sender.library.clone(),root_key:zeroize::Zeroizing::new(*fixture.sender.root_key),admission:fixture.sender.admission.clone(),
+            connection_id:fixture.sender.connection_id.clone(),connection_root:root.to_owned(),capabilities,descriptor:fixture.sender.descriptor.clone()});
+    }
+    let peer_engine=engines.pop().ok_or("actual transfer peer engine absent")?;
+    let foreground_engine=engines.pop().ok_or("actual transfer foreground engine absent")?;
+    let barrier=fixture.provider.arm_read_barrier(object_id).map_err(|e|format!("{e:?}"))?;
+    let background=native_maintenance::external_bootstrap_raw(destination,&fixture.sender,connected,&fixture.provider,hashes,
+        Some("synthetic-character-0"),Scenario::FullBootstrap,slot.iteration);
+    tokio::pin!(background);
+    let mut foreground_result=None;
+    let result=tokio::select! {
+        result=&mut background=>result,
+        _=barrier.reached.notified()=> {
+            let assets=hashes.to_vec();let provider=fixture.provider.clone();let direction=slot.direction;let iteration=slot.iteration;let warmup=slot.warmup;
+            foreground_result=Some(tokio::task::spawn_blocking(move || {
+                let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build()
+                    .map_err(|e|final_runner::CycleFailure {reason:e.to_string(),observation:None})?;
+                let (mut a,mut b,mut sender,mut receiver)=match direction {
+                    FinalDirection::AtoB=>(peer,foreground,peer_engine,foreground_engine),
+                    FinalDirection::BtoA=>(foreground,peer,foreground_engine,peer_engine),
+                };
+                runtime.block_on(final_external_cycle(&mut a,&mut b,&mut sender,&mut receiver,&provider,&assets,
+                    Scenario::SettingEdit,direction,iteration,warmup))
+            }).await.unwrap_or_else(|e|Err(final_runner::CycleFailure {reason:e.to_string(),observation:None})));
+            fixture.provider.clear_read_barrier(&barrier);
+            background.await
+        }
+    };
+    fixture.provider.clear_read_barrier(&barrier);
+    let mut raw=result?;
+    raw["scenario"]=json!(Scenario::DuringAssetTransfer);
+    raw["transferBarrier"]=json!({"actualObjectId":barrier.object_id,"reached":barrier.was_reached.load(std::sync::atomic::Ordering::SeqCst),
+        "released":barrier.was_released.load(std::sync::atomic::Ordering::SeqCst),"scope":"actual FakeProvider read before sink byte delivery"});
+    raw["foregroundObservation"]=match foreground_result {Some(Ok(sample))=>serde_json::to_value(sample).map_err(|e|e.to_string())?,
+        Some(Err(failure))=>json!({"status":"INVALID","reason":failure.reason,"nativeObservation":failure.observation}),
+        None=>json!({"status":"INVALID","reason":"actual body transfer did not reach its armed barrier"})};
+    Ok(raw)
 }
 
 async fn authenticated_source_ids(fixture:&CycleFixture,backup:Option<&crate::external_storage::packaging::CompletedSnapshot>,
@@ -686,11 +794,17 @@ fn external_native_result(raw:&Value,slot:&costly_runner::CostlySlot,partition:&
             return Err("missing restore performed actual destination work on an already-present Asset".into());
         }
     }
+    if slot.scenario==Scenario::DuringAssetTransfer {
+        if raw.pointer("/transferBarrier/reached")!=Some(&json!(true)) || raw.pointer("/transferBarrier/released")!=Some(&json!(true)) {
+            return Err("actual provider transfer barrier was not reached and released".into());
+        }
+        serde_json::from_value::<final_runner::RoutineSample>(raw["foregroundObservation"].clone()).map_err(|e|e.to_string())?.validate()?;
+    }
     let (activation,completion)=if slot.scenario==Scenario::DuringCompaction {
         if raw["actualProtectedInputBarrierReached"]!=true || raw.pointer("/background/protection_run_completed")!=Some(&json!(true))
             || raw.pointer("/background/snapshot").is_none_or(Value::is_null) {return Err("actual protected compaction publication receipt missing".into());}
         if raw.pointer("/background/temporary_costs").is_none_or(Value::is_null)
-            || raw.pointer("/background/actual_visits").and_then(Value::as_u64).is_none() {
+            || raw.pointer("/background/compaction_catalog_merge_visits").and_then(Value::as_u64).is_none() {
             return Err("actual compactor temporary catalog/disk or visit observation is unavailable".into());
         }
         (None,raw.pointer("/background/native_publication_complete_ms").and_then(Value::as_f64))
@@ -705,7 +819,8 @@ fn external_native_result(raw:&Value,slot:&costly_runner::CostlySlot,partition:&
         "nativeObservation":observation,"actualSourceObjectReadAttempts":reads,
         "sourceFileReads":null,"decodedAssetSourceReads":null,"rendererAdoption":null,
         "compactionCosts":raw.get("background").map(|background|json!({"temporaryCosts":background.get("temporary_costs"),
-            "actualVisits":background.get("actual_visits"),"actualUncachedProviderBodyReadAttempts":reads})),
+            "actualCanonicalCatalogMergeAttempts":background.get("compaction_catalog_merge_visits"),
+            "actualCaptureRows":background.get("compaction_capture_rows"),"actualUncachedProviderBodyReadAttempts":reads})),
         "scopeClarification":"raw strict full-source result remains INVALID; this report validates existing native counters, awaited completion and authenticated physical provider body-request IDs only"}))
 }
 

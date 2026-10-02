@@ -429,6 +429,8 @@ pub(crate) struct RawCompaction {
     pub snapshot:Option<Value>,
     pub protection_run_completed:bool,
     pub temporary_costs:Option<Value>,
+    pub compaction_catalog_merge_visits:Option<u64>,
+    pub compaction_capture_rows:Option<u64>,
     pub native_observation:NativeObservation,
     pub source_observation:Option<Value>,
     pub error:Option<String>,
@@ -480,6 +482,8 @@ pub(crate) async fn compact_native_raw(
     observation.requests=(provider.read_count()+provider.upload_count()+provider.listing_count()-requests_before) as u64;
     observation.uploaded_bytes=bytes_after.0-bytes_before.0;
     observation.downloaded_bytes=bytes_after.1-bytes_before.1;
+    let compaction_catalog_merge_visits=outcome.as_ref().ok().and_then(|completed|completed.compaction_catalog_merge_visits);
+    let compaction_capture_rows=outcome.as_ref().ok().and_then(|completed|completed.compaction_capture_rows);
     let (snapshot,mut error)=match outcome {
         Ok(completed)=>(Some(json!({"snapshotId":completed.snapshot_id,"repositoryId":completed.repository_id,
             "stateFingerprint":completed.fingerprint,"libraryFingerprint":completed.library_fingerprint,
@@ -493,7 +497,7 @@ pub(crate) async fn compact_native_raw(
     };
     Ok(RawCompaction {status:"INVALID",fixture_for_scenario:scenario,iteration,warmup:iteration==0,
         native_publication_complete_ms:snapshot.as_ref().map(|_|elapsed_ms),
-        protection_run_completed:protection.is_some() && snapshot.is_some(),snapshot,temporary_costs,native_observation:observation,
+        protection_run_completed:protection.is_some() && snapshot.is_some(),snapshot,temporary_costs,compaction_catalog_merge_visits,compaction_capture_rows,native_observation:observation,
         source_observation:None,error})
 }
 
