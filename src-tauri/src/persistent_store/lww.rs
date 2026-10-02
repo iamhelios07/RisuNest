@@ -27,6 +27,10 @@ pub(super) use projection::{
     refresh_orders, archive_value,
 };
 
+pub(crate) fn lww_known_unit_key(key: &UnitKey) -> bool {
+    projection::known(key)
+}
+
 pub(super) const UNIT_SCHEMA: &str = r#"CREATE TABLE lww_units(key TEXT PRIMARY KEY,stamp TEXT NOT NULL,value TEXT NOT NULL,version TEXT NOT NULL,identity TEXT NOT NULL);
 CREATE TABLE lww_outbox(key TEXT PRIMARY KEY,stamp TEXT NOT NULL,value TEXT NOT NULL,version TEXT NOT NULL,identity TEXT NOT NULL,authority TEXT NOT NULL);
 CREATE TABLE lww_retired(key TEXT PRIMARY KEY,stamp TEXT NOT NULL);
