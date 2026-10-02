@@ -24,7 +24,7 @@ mod new_device;
 mod projection;
 pub(super) use projection::{
     apply_mutation, capture_device_changes, capture_targets, is_device, preserve_local_root,
-    refresh_orders,
+    refresh_orders, archive_value,
 };
 
 pub(super) const UNIT_SCHEMA: &str = r#"CREATE TABLE lww_units(key TEXT PRIMARY KEY,stamp TEXT NOT NULL,value TEXT NOT NULL,version TEXT NOT NULL,identity TEXT NOT NULL);
@@ -1726,10 +1726,12 @@ impl PersistentStore {
         }
         self.lww_recover_intents()?;
         verify(self.device_store()?.connection(), header.binding_authority)?;
+        let remapped_units = self.remap_retired_staging(staging_id, source_units)?;
+        let effective_source_units = remapped_units.as_ref();
         let generation = active_generation(&self.connection)?;
         let before = projection::capture_all(&mut self.connection, &generation)?;
         let mut after = projection::capture_all(&mut self.connection, staging_id)?;
-        if let Some(units) = source_units {
+        if let Some(units) = effective_source_units {
             for (key, value) in units {
                 wire({
                     let result = value.validate();
@@ -1770,7 +1772,7 @@ impl PersistentStore {
                 after
                     .get(&unit_key(&["archive", id]).unwrap())
                     .is_some_and(|value| matches!(value, UnitValue::Object { .. }))
-            }) && source_units.is_none_or(|units| !units.contains_key(&key))
+            }) && effective_source_units.is_none_or(|units| !units.contains_key(&key))
             {
                 continue;
             }

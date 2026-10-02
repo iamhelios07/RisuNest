@@ -140,7 +140,7 @@ fn archive_alias_and_reference_controls_stage_without_reading_any_large_dependen
     let dir = tempfile::tempdir().unwrap(); let mut store = PersistentStore::open(dir.path()).unwrap();
     let body_hash = "ab".repeat(32); let asset_hash = "cd".repeat(32);
     for hash in [&body_hash,&asset_hash] { store.connection.execute("INSERT INTO message_page_objects VALUES(?1,?2)", params![hash,b"poison-body".as_slice()]).unwrap(); }
-    let archived = crate::persistent_store::archive::ArchivedObject { object_hash:body_hash.clone(),shared_object_hash:body_hash, archived_at:1,conversation_count:1,message_count:1,asset_hashes:vec![asset_hash.clone()],shared_asset_hashes:vec![asset_hash.clone()] };
+    let archived = crate::persistent_store::archive::ArchivedObject { object_hash:body_hash.clone(),shared_object_hash:body_hash, archived_at:1,conversation_count:1,message_count:1,asset_hashes:vec![asset_hash.clone()],shared_asset_hashes:vec![asset_hash.clone()],identity_remap:Vec::new() };
     let mut archive = change(&["archive","archived"],Value::Null); archive.value = projection::archive_value(&store.connection,&archived).unwrap();
     let hashes = (0..100).map(|i| format!("{i:064x}")).collect::<Vec<_>>();
     let (root,objects) = risunest_sync_wire::descriptor::build_reference_tree(&hashes,false).unwrap();

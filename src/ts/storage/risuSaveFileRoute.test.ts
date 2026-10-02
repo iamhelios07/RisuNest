@@ -17,6 +17,10 @@ function dependencies(platform: 'native-desktop' | 'web'): RisuSaveFileRouteDepe
             store: {} as never,
             revision: 4,
             getStorageAuthorityEpoch: () => 1,
+            withPausedPersistentWrites: async () => { throw new Error('Unexpected route pause') },
+            setActivatedLibraryRecoveryLifecycle: () => { throw new Error('Unexpected upstream lifecycle') },
+            beginActivatedLibraryGuard: () => { throw new Error('Unexpected route guard') },
+            refreshActivatedLibraryUnderPause: async () => { throw new Error('Unexpected route refresh') },
             flushPendingData: vi.fn(async () => undefined),
             capturePersistentMutationToken: vi.fn(async () => ({
                 revision: 4,
@@ -643,9 +647,9 @@ describe('RisuSave picker route', () => {
         expect(exported?.mode).toBe('web')
         expect(deps.decodeRisuSave).toHaveBeenCalledWith(Uint8Array.from([1, 2, 3]))
         expect(runtime.replacePersistentDatabase).toHaveBeenCalledWith(
-            { username: 'Web import', characters: [] },
+            { username: 'Web import', characters: [], explicitGlobalChatVariables: {} },
             'risu-save-file-import',
-            { authoritative: true },
+            { authoritative: true, upstreamImport: true },
         )
         expect(deps.collectWebExport).toHaveBeenCalledWith(false)
         expect(deps.downloadWebExport).toHaveBeenCalledWith(

@@ -26,13 +26,13 @@ vi.mock('./apiV3/v3.svelte', () => ({
 // through the database module, otherwise its startup effect runs mid-cycle.
 import '../stores.svelte'
 import * as alertModule from '../alert'
-import { loadV3Plugins } from './apiV3/v3.svelte'
+import { customV3ProviderMetaStore, loadV3Plugins } from './apiV3/v3.svelte'
 import {
     getDatabase,
     setDatabaseLite,
     type Database,
 } from '../storage/database.svelte'
-import { importPlugin, loadPlugins, handlePluginInstallViaPlugin, applyPreparedPluginDatabaseUpdate, allowedDbKeys, type RisuPlugin } from './plugins.svelte'
+import { importPlugin, loadPlugins, loadPluginsAfterAuthoritativeRestore, handlePluginInstallViaPlugin, applyPreparedPluginDatabaseUpdate, allowedDbKeys, type RisuPlugin } from './plugins.svelte'
 
 import { createPluginDatabaseAccess } from './pluginDatabaseAccess'
 
@@ -64,6 +64,23 @@ beforeEach(() => {
 })
 
 describe('plugin API version gate', () => {
+    it('restarts only supported enabled hosts and retains fresh provider registrations through the exact restore followup',async()=>{
+        await loadPlugins()
+        const meta=customV3ProviderMetaStore as unknown as Array<{name:string}>
+        meta.push({name:'stale-provider'})
+        const db=getDatabase()
+        db.plugins=[makePlugin('modern','3.0'),{...makePlugin('disabled','3.0'),enabled:false},makePlugin('unsupported','2.1')]
+        setDatabaseLite(db)
+        vi.mocked(loadV3Plugins).mockClear()
+        vi.mocked(loadV3Plugins).mockImplementationOnce(async plugins=>{meta.push({name:plugins[0].name})})
+        await loadPluginsAfterAuthoritativeRestore()
+        expect(vi.mocked(loadV3Plugins).mock.calls.map(([plugins])=>plugins.map(plugin=>plugin.name))).toEqual([['modern']])
+        expect(meta).toEqual([{name:'modern'}])
+        await loadPluginsAfterAuthoritativeRestore(true)
+        expect(loadV3Plugins).toHaveBeenCalledOnce()
+        expect(meta).toEqual([{name:'modern'}])
+    })
+
     it('loads only API 3.0 records and reports the stored older ones', async () => {
         const db = getDatabase()
         db.plugins = [makePlugin('legacy', '2.1'), makePlugin('modern', '3.0')]

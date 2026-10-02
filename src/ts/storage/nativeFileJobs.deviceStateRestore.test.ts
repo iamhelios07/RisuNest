@@ -48,7 +48,12 @@ it('clears cached update and device preferences through an empty native settings
         { ...base, state: 'succeeded', phase: 'complete', result, deviceSessionId: 'empty-settings' },
     ]
     const runtime: Parameters<typeof runNativeArchiveRestore>[0] = {
+        store: {readRoot:async()=>({revision:7})} as unknown as import('./persistentDataStore').PersistentDataStore,
+        setActivatedLibraryRecoveryLifecycle: () => { throw new Error('Unexpected upstream lifecycle') },
         getStorageAuthorityEpoch: () => 1,
+        withPausedPersistentWrites: async () => { throw new Error('Unexpected upstream pause') },
+        beginActivatedLibraryGuard: () => { throw new Error('Unexpected upstream guard') },
+        refreshActivatedLibraryUnderPause: async () => { throw new Error('Unexpected upstream refresh') },
         capturePersistentMutationToken: async () => ({ revision: 3, mutationGeneration: 1 }),
         acquireDestructiveReplacementFence: async () => {
             fenced = true

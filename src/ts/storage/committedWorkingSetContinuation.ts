@@ -10,6 +10,8 @@ let pending:
           authorityEpoch: number
           continueAfterRefresh: CommittedWorkingSetContinuation
           prepareRefresh?: CommittedWorkingSetContinuation
+          retainOnFailure: boolean
+          dispatch: {promise?:Promise<void>}
       }>
     | undefined
 
@@ -19,6 +21,7 @@ export function registerCommittedWorkingSetContinuation(
     authorityEpoch: number,
     continueAfterRefresh: CommittedWorkingSetContinuation,
     prepareRefresh?: CommittedWorkingSetContinuation,
+    retainOnFailure = false,
 ): void {
     if (pending?.runtime === runtime && pending.authorityEpoch === authorityEpoch) {
         throw new Error('A committed working-set continuation is already pending')
@@ -29,6 +32,8 @@ export function registerCommittedWorkingSetContinuation(
         authorityEpoch,
         continueAfterRefresh,
         prepareRefresh,
+        retainOnFailure,
+        dispatch: {},
     }
 }
 
@@ -43,9 +48,23 @@ export async function continueCommittedWorkingSetRefresh(
         return
     }
     if (revision < pending.minimumRevision) return
-    const continuation = pending.continueAfterRefresh
-    pending = undefined
-    await continuation()
+    const owned = pending
+    owned.dispatch.promise ??= Promise.resolve().then(owned.continueAfterRefresh).then(() => {
+        if (pending === owned) pending = undefined
+    }, error => {
+        if (owned.retainOnFailure) owned.dispatch.promise = undefined
+        else if (pending === owned) pending = undefined
+        throw error
+    })
+    await owned.dispatch.promise
+}
+
+export function hasRetryableCommittedWorkingSetContinuation(runtime: object, authorityEpoch: number): boolean {
+    return pending?.runtime === runtime && pending.authorityEpoch === authorityEpoch && pending.retainOnFailure
+}
+
+export function rebaseCommittedWorkingSetContinuation(runtime: object, authorityEpoch: number, currentEpoch: number): void {
+    if (hasRetryableCommittedWorkingSetContinuation(runtime, authorityEpoch)) pending = {...pending!, authorityEpoch:currentEpoch}
 }
 
 async function prepareCommittedWorkingSetRetry(

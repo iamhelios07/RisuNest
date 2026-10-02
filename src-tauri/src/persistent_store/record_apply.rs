@@ -750,6 +750,7 @@ pub(super) fn apply_record_rows(
                 message_count: sqlite_i64(*message_count, "archived message count")?,
                 asset_hashes: asset_hashes.clone(),
                 shared_asset_hashes: shared_asset_hashes.clone(),
+                identity_remap: if let LogicalRecordEnvelope::ArchivedCharacter { identity_remap, .. } = envelope { identity_remap.iter().cloned().map(serde_json::from_value).collect::<Result<_,_>>()? } else { unreachable!() },
             };
             let marker = super::archive::marker_detail(character_id, name, character_type);
             transaction

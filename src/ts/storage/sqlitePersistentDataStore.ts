@@ -353,12 +353,20 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
         )
     }
 
-    async replaceFromDatabase(
+    async replaceFromDatabase(...args: Parameters<PersistentDataStore['replaceFromDatabase']>): Promise<{revision: DataRevision}> {
+        const stage = await this.stageDatabaseReplacement(...args)
+        try { return await stage.activate() }
+        catch (error) { try { await stage.abort() } catch {} ; throw error }
+    }
+
+    async stageDatabaseReplacement(
         database: Database,
         expectedRevision?: DataRevision,
         assetAliases: AssetAlias[] = [],
         pluginStorageValues?: PluginStorageValue[],
-    ): Promise<{ revision: DataRevision }> {
+        replacementHeader?: import('./persistentDataStore').LwwReceiveHeader,
+    ): Promise<import('./persistentDataStore').PersistentDatabaseReplacementStage> {
+        replacementHeader = replacementHeader && {...replacementHeader}
         database = prepareNativePersistenceValue(database, 'replacement database')
         assetAliases = prepareNativePersistenceValue(assetAliases, 'asset aliases')
         pluginStorageValues = prepareNativePersistenceValue(pluginStorageValues, 'plugin storage')
@@ -394,10 +402,19 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
                     aliases,
                 })
             }
-            return await invokeStore('pds_replace_commit', {
-                stagingId,
-                expectedRevision: preserved.revision,
-            })
+            const header = replacementHeader && {...replacementHeader}
+            let submitted = false
+            return {
+                async activate() {
+                    if (submitted) throw new Error('Replacement activation was already submitted')
+                    submitted = true
+                    if (header) return invokeStore('pds_lww_commit_replacement', {request: {...header, stagingId}})
+                    return invokeStore('pds_replace_commit', {stagingId, expectedRevision: preserved.revision})
+                },
+                async abort() {
+                    if (!submitted) await invokeStore<void>('pds_replace_abort', {stagingId})
+                },
+            }
         } catch (error) {
             try {
                 await invokeStore<void>('pds_replace_abort', { stagingId })
