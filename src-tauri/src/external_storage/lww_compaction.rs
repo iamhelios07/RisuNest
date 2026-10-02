@@ -40,7 +40,7 @@ impl crate::local_backup::CancellationProbe for PublishedProbe<'_> {
     fn is_cancelled(&self)->bool {self.0.check().is_err()}
 }
 
-fn live_published_objects(state:&PublishedState,capture:&mut super::capture::CaptureCatalog,anchor:Option<&str>,cancel:&Cancellation)
+fn live_published_objects(state:&PublishedState,capture:&mut super::capture::CaptureCatalog,anchor:Option<&str>,directory:&Path,cancel:&Cancellation)
     ->Result<(BTreeSet<String>,bool)> {
     use crate::persistent_store::external_capture::{original_unit_dependency_inventory,published_json_asset_roots,BackupBodyRole};
     use risunest_sync_wire::unit::UnitValue;
@@ -88,6 +88,15 @@ fn live_published_objects(state:&PublishedState,capture:&mut super::capture::Cap
     }
     conservative|=legacy.into_iter().any(|key|!aliases.contains(&("asset".into(),key)))
         || inlays.into_iter().any(|key|!aliases.contains(&("inlay".into(),key)));
+    let cas=crate::asset_repository::PayloadCas::new(directory).map_err(error)?;
+    for hash in &live {
+        cancel.check()?;
+        if let Some(bytes)=state.body_spool.payload(hash).map_err(error)? {
+            let prepared=cas.prepare_bytes(&bytes).map_err(error)?;
+            if prepared.content_hash!=*hash {return Err(segment::corrupt())}
+            if let Some(anchor)=anchor {capture.reference(anchor,hash,prepared.byte_size).map_err(error)?;}
+        }
+    }
     Ok((live,conservative))
 }
 impl ExternalLwwEngine {
@@ -145,7 +154,7 @@ impl ExternalLwwEngine {
             if !group.iter().any(|source|source.chunks.iter().any(|chunk|sparse.contains(&chunk.pack_id))) {continue}
             let mut available=true;
             for source in &group {
-                if cas.stat_object(&source.hash).map_err(error)?.is_none_or(|stat|stat.byte_size!=source.byte_length) {available=false;break}
+                if cas.stat_object(&source.hash).map_err(error)?.is_none_or(|size|size!=source.byte_length) {available=false;break}
             }
             if available {repack.extend(group)}
         }
@@ -342,7 +351,7 @@ impl ExternalLwwEngine {
             count=count.checked_add(1).ok_or_else(segment::corrupt)?;
             Ok(())
         })?;
-        let (live,conservative)=live_published_objects(&state,&mut capture,first_key.as_deref(),cancel)?;
+        let (live,conservative)=live_published_objects(&state,&mut capture,first_key.as_deref(),directory,cancel)?;
         capture.finish().map_err(error)?;
         let fingerprint=capture.content_fingerprint(&risunest_external_storage_format::format::library_fingerprint_domain()).map_err(error)?;
         let mut journal=super::journal::TransferJournal::open(&directory.join("journal"),super::journal::JobIdentity{job_id:job_id.into(),connection_id:self.connection_id.clone(),repository_id:self.repository.repository_id.clone(),capture_id:job_id.into(),capture:identity.clone()}).map_err(error)?;
@@ -364,11 +373,51 @@ mod tests {
     use super::super::{fake,lww_tests::{CycleFixture,small_asset}};
 
     #[test]
+    fn current_published_payload_is_captured_and_unreferenced_payload_is_left_out() {
+        use risunest_sync_wire::{unit::{UnitKey,UnitValue},descriptor::RecordDescriptor,stamp::{Stamp,DecimalU64}};
+        let directory=tempfile::tempdir().unwrap();let bytes=b"\"synthetic current data\"";let dead=b"\"synthetic retired data\"";
+        let hash=risunest_sync_wire::hash(bytes);let dead_hash=risunest_sync_wire::hash(dead);
+        let mut catalog=PublishedCatalog::create(&directory.path().join("published.sqlite")).unwrap();
+        catalog.merge(&crate::persistent_store::lww::Change{key:UnitKey::new(&["root","language"]).unwrap(),
+            stamp:Stamp{physical_ms:DecimalU64(1),logical:0,writer_id:"00000000-0000-4000-8000-000000000001".into()},
+            value:UnitValue::object(RecordDescriptor::content(hash.clone())).unwrap()}).unwrap();
+        let mut body_spool=super::super::capture::BackupDependencySpool::new(directory.path()).unwrap();
+        for (hash,body) in [(&hash,bytes.as_slice()),(&dead_hash,dead.as_slice())] {
+            body_spool.push(hash,body,crate::persistent_store::external_capture::BackupBodyRole::Payload).unwrap();
+        }
+        body_spool.seal().unwrap();
+        let state=PublishedState{catalog,body_spool,standalone:Default::default(),standalone_roots:Default::default(),
+            asset_catalogs:vec![],snapshots:vec![],segments:vec![]};
+        let mut capture=super::super::capture::CaptureCatalog::create(&directory.path().join("capture"),&directory.path().join("external-storage"),None).unwrap();
+        let identity=CaptureIdentity{store_id:"synthetic".into(),library_epoch:"synthetic".into(),generation:"synthetic".into(),selection_epoch:"synthetic".into(),revision:0};
+        capture.begin(&identity,None).unwrap();capture.record("current",b"synthetic record").unwrap();
+        let (live,_)=live_published_objects(&state,&mut capture,Some("current"),directory.path(),&Cancellation::default()).unwrap();
+        capture.finish().unwrap();
+        let cas=crate::asset_repository::PayloadCas::new(directory.path()).unwrap();
+        assert_eq!(cas.read_object(&hash).unwrap().unwrap(),bytes);
+        assert!(cas.stat_object(&dead_hash).unwrap().is_none());assert!(live.contains(&hash));assert!(!live.contains(&dead_hash));
+        let reference=capture.durable_reference("synthetic",directory.path()).unwrap();
+        let roots=super::super::capture::registered_capture_roots([&reference],directory.path()).unwrap();
+        assert!(roots.assets.object_hashes.contains(&hash));assert!(!roots.assets.object_hashes.contains(&dead_hash));
+    }
+
+    #[test]
     fn compaction_prunes_dead_assets_and_repacks_only_locally_available_sparse_packs() {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
             for local in [false,true] {
                 let mut f=CycleFixture::new();let cancel=Cancellation::default();let mut hashes=Vec::new();
                 for n in 0..4 {hashes.push(small_asset(&mut f.a,&format!("asset-{n}"),format!("synthetic pack body {n}").as_bytes()));}
+                use crate::persistent_store::{WorkingSetCommit,ConversationMutation,lww::UnitMutation};
+                use risunest_sync_wire::unit::UnitKey;
+                f.a.commit(&WorkingSetCommit{expected_revision:f.a.revision().unwrap(),unit_mutations:Some(vec![
+                    UnitMutation::Set{key:UnitKey::new(&["exists","character","char"]).unwrap(),value:serde_json::json!({"type":"character"})},
+                    UnitMutation::Set{key:UnitKey::new(&["exists","conversation","char","conv"]).unwrap(),value:serde_json::json!(true)},
+                ]),..Default::default()}).unwrap();
+                f.a.commit(&WorkingSetCommit{expected_revision:f.a.revision().unwrap(),conversations:Some(vec![ConversationMutation::ReplaceRange{
+                    character_id:"char".into(),conversation_id:"conv".into(),start:0,delete_count:0,
+                    messages:vec![serde_json::json!({"data":"synthetic retained message","chatId":"synthetic-message"})],
+                    conversation:None,configured_index:None,
+                }]),..Default::default()}).unwrap();
                 f.publish_a().await;
                 let input=tempfile::tempdir().unwrap();
                 let state=f.sender.published_state(input.path(),&cancel).await.unwrap();
@@ -395,6 +444,10 @@ mod tests {
                 assert_eq!(packs.keys().collect::<Vec<_>>()==old_packs.keys().collect::<Vec<_>>(),!local);
                 for (id,reads) in before {assert_eq!(f.provider.read_attempts(&id),reads,"compaction never fetches old Asset packs");}
                 for old in old_packs.values() {assert!(f.provider.state.lock().unwrap().objects.contains_key(&old.object_id),"old packs remain until retention/grace GC");}
+                for segment in engine.listing(&cancel).await.unwrap() {f.provider.delete_object(&engine.repository,&segment.locator,&cancel).await.unwrap();}
+                assert!(f.receive_b().await>0);
+                let restored=f.b.materialize(None).unwrap();
+                assert_eq!(restored["characters"][0]["chats"][0]["message"][0]["data"],"synthetic retained message");
             }
         });
     }
