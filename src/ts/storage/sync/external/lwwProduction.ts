@@ -9,7 +9,7 @@ import type { LwwStageReceive } from '../../persistentDataStore'
 import type { SyncExitDrainAdapter } from '../../syncExitCoordinator'
 import type { BindingContext, SyncBindingState, SyncBindingTransport, InspectedSyncTarget, StagedSyncTarget, NewDeviceBindingPreparation } from '../bindingFlow'
 import { createNativeSyncBindingBridge, replaceNativeSyncBinding, replaceNativeSyncBindingAsNewDevice } from '../bindingNative'
-import { registerSyncBindingTransport } from '../bindingRegistry'
+import { registerSyncBindingTransport, resumeCurrentSyncBinding } from '../bindingRegistry'
 import { SERVER_SYNC_DEVICE_CHANGED_EVENT } from '../serverSyncNativeSignals'
 import { createLwwScheduler } from './lwwScheduler'
 import type { ExternalStorageState } from './types'
@@ -128,7 +128,7 @@ export async function refreshExternalLwwAdapters(state: ExternalStorageState): P
     }
     if (binding.target.kind === 'external') {
         const adapter = adapters.get(binding.target.connectionId)
-        if (adapter && adapter.state?.targetAuthority !== binding.targetAuthority) await adapter.transport.resumeBinding({ state: binding, signal: new AbortController().signal })
+        if (adapter && adapter.state?.targetAuthority !== binding.targetAuthority) await resumeCurrentSyncBinding(binding.target)
     }
 }
 

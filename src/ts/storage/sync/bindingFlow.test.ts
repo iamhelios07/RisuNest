@@ -242,6 +242,52 @@ it('successful activated projection holds the guard through fresh plugin restart
 })
 
 describe('transport-neutral first binding', () => {
+    it.each(['server', 'external'] as const)('owns the resumed persisted %s signal and fences it before disconnect', async kind => {
+        const s = setup()
+        const persisted: SyncBindingState = { target: { kind, connectionId: 'persisted' }, targetAuthority: '4', selectionEpoch: 'persisted', libraryId: 'library', progress: null }
+        s.setState(persisted)
+        const old = { ...s.transport, resumeBinding: vi.fn<SyncBindingTransport['resumeBinding']>(async () => {}), fenceOldJobs: vi.fn(async () => {}) }
+        s.deps.resolveTransport = () => old
+        await s.flow.resumeCurrent(persisted.target)
+        await s.flow.resumeCurrent(persisted.target)
+        expect(old.resumeBinding).toHaveBeenCalledOnce()
+        const signal = old.resumeBinding.mock.calls[0][0].signal
+        expect(signal.aborted).toBe(false)
+        await s.flow.unbind()
+        expect(signal.aborted).toBe(true)
+        expect(old.fenceOldJobs).toHaveBeenCalledWith(expect.objectContaining({ state: persisted, signal }))
+    })
+    it('fences a partially resumed startup adapter before reporting failure and permits a fresh retry', async () => {
+        const s = setup()
+        const persisted: SyncBindingState = { target, targetAuthority: '4', selectionEpoch: 'persisted', libraryId: 'library', progress: null }
+        s.setState(persisted)
+        const old = { ...s.transport, resumeBinding: vi.fn<SyncBindingTransport['resumeBinding']>().mockRejectedValueOnce(new Error('startup failure')).mockResolvedValue(undefined), fenceOldJobs: vi.fn(async () => {}) }
+        s.deps.resolveTransport = () => old
+        await expect(s.flow.resumeCurrent(target)).rejects.toThrow('startup failure')
+        expect(old.resumeBinding.mock.calls[0][0].signal.aborted).toBe(true)
+        expect(old.fenceOldJobs).toHaveBeenCalledOnce()
+        await s.flow.resumeCurrent(target)
+        expect(old.resumeBinding).toHaveBeenCalledTimes(2)
+        expect(old.resumeBinding.mock.calls[1][0].signal.aborted).toBe(false)
+    })
+    it('resumes an adopted but never started persisted adapter after replacement acknowledgement is cancelled', async () => {
+        const s = setup({ confirm: false })
+        const persisted: SyncBindingState = { target, targetAuthority: '4', selectionEpoch: 'persisted', libraryId: 'library', progress: null }
+        s.setState(persisted)
+        const old = { ...s.transport, resumeBinding: vi.fn(async () => {}) }
+        s.deps.resolveTransport = () => old
+        expect(await s.flow.bind({ kind: 'external', connectionId: 'incoming' }, s.transport)).toEqual({ kind: 'cancelled' })
+        await s.flow.resumeCurrent(target)
+        expect(old.resumeBinding).toHaveBeenCalledOnce()
+    })
+    it('refuses a persisted binding whose registered transport is unavailable before any selection change', async () => {
+        const s = setup(); s.setState({ target, targetAuthority: '4', selectionEpoch: 'persisted', libraryId: 'library', progress: null })
+        s.deps.resolveTransport = () => undefined
+        await expect(s.flow.resumeCurrent(target)).rejects.toThrow('transport is unavailable')
+        await expect(s.flow.unbind()).rejects.toThrow('transport is unavailable')
+        await expect(s.flow.bind({ kind: 'external', connectionId: 'incoming' }, s.transport)).rejects.toThrow('transport is unavailable')
+        expect(s.events).toEqual([])
+    })
     it('acknowledges, validates, fences and activates database before refreshing and restarting plugins', async () => {
         const s = setup()
         expect(await s.flow.bind(target, s.transport)).toMatchObject({ kind: 'bound', action: 'replaced' })
@@ -307,6 +353,28 @@ describe('transport-neutral first binding', () => {
         await s.flow.bind({ kind: 'external', connectionId: 'other' }, other)
         expect(oldSignal?.aborted).toBe(true)
         expect(other.fenceOldJobs).not.toHaveBeenCalled()
+    })
+    it.each(['server', 'external'] as const)('fences the persisted %s adapter before a cross-transport switch without a prior flow bind', async kind => {
+        const s = setup({ empty: true, nonDefault: false })
+        const persisted: SyncBindingState = { target: { kind, connectionId: 'persisted' }, targetAuthority: '4', selectionEpoch: 'persisted', libraryId: 'library', progress: null }
+        s.setState(persisted)
+        const old = { ...s.transport, fenceOldJobs: vi.fn(async () => { s.events.push('persisted-fence') }) }
+        Object.assign(s.deps, { resolveTransport: () => old })
+        const incoming = { ...s.transport, fenceOldJobs: vi.fn(async () => { s.events.push('incoming-fence') }) }
+        await s.flow.bind({ kind: kind === 'server' ? 'external' : 'server', connectionId: 'incoming' }, incoming)
+        expect(old.fenceOldJobs).toHaveBeenCalledWith(expect.objectContaining({ state: persisted }))
+        expect(incoming.fenceOldJobs).not.toHaveBeenCalled()
+        expect(s.events.indexOf('persisted-fence')).toBeLessThan(s.events.indexOf('switch'))
+    })
+    it('fences the persisted adapter before disconnect without a prior flow bind', async () => {
+        const s = setup()
+        const persisted: SyncBindingState = { target, targetAuthority: '4', selectionEpoch: 'persisted', libraryId: 'library', progress: null }
+        s.setState(persisted)
+        const fence = vi.fn(async () => { s.events.push('persisted-fence') })
+        Object.assign(s.deps, { resolveTransport: () => ({ ...s.transport, fenceOldJobs: fence }) })
+        expect((await s.flow.unbind()).target).toEqual({ kind: 'none' })
+        expect(fence).toHaveBeenCalledWith(expect.objectContaining({ state: persisted }))
+        expect(s.events.indexOf('persisted-fence')).toBeLessThan(s.events.indexOf('switch'))
     })
 })
 

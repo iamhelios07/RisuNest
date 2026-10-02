@@ -514,7 +514,7 @@ fn native_journal_resumes_before_intent_and_around_an_inflight_section_commit() 
 
     for interruption in ["before-intent", "after-intent", "after-commit"] {
         let root = tempfile::tempdir().unwrap();
-        let selected = vec!["local-plugins".to_owned()];
+        let selected = vec!["hypa".to_owned(), "local-plugins".to_owned(), "local-settings".to_owned()];
         let mut source = crate::persistent_store::PersistentStore::open(
             &root.path().join("synthetic-source"),
         )
@@ -531,6 +531,13 @@ fn native_journal_resumes_before_intent_and_around_an_inflight_section_commit() 
                 }],
             )
             .unwrap();
+        source.device_store_mut().unwrap().write_setting("dosync", &serde_json::json!(true)).unwrap();
+        let source_stage = source.replace_begin().unwrap().staging_id;
+        source.replace_put_root(&source_stage, &serde_json::json!({"username":"restored"})).unwrap();
+        source.replace_commit(&source_stage, Some(0)).unwrap();
+        let lease = source.lww_acquire_library_backup_capture(source.revision().unwrap()).unwrap().lease;
+        let units = source.lww_backup_unit_values(&lease).unwrap();
+        source.release_revision(&lease).unwrap();
         let incoming = capture_prepared_native_sections(&mut source, &selected, &NeverCancelled)
             .unwrap();
 
@@ -551,10 +558,17 @@ fn native_journal_resumes_before_intent_and_around_an_inflight_section_commit() 
         }
         let rollback =
             capture_prepared_native_sections(&mut target, &selected, &NeverCancelled).unwrap();
+        let stage = target.replace_begin().unwrap().staging_id;
+        target.replace_put_root(&stage, &serde_json::json!({"username":"restored"})).unwrap();
+        let header = crate::persistent_store::lww::Header {
+            binding_authority: target.lww_binding_authority().unwrap(),
+            request_id: "synthetic-job".into(),
+        };
         let coordinator = state(root.path());
         let id = coordinator
-            .create_native_portable_session("synthetic-job", false, &selected, 0, None)
+            .create_native_portable_session("synthetic-job", true, &selected, 0, Some(stage.clone()))
             .unwrap();
+        coordinator.set_library_replacement(&id, &header, &units).unwrap();
         let source_manifests = journal_prepared_native_sections(
             &coordinator,
             &id,
@@ -571,7 +585,8 @@ fn native_journal_resumes_before_intent_and_around_an_inflight_section_commit() 
                 .unwrap();
         }
         let revision_after_first_apply = if interruption == "after-commit" {
-            apply_prepared_native_sections(&mut target, &incoming).unwrap();
+            let rows = incoming.iter().map(PreparedDeviceSection::rows).collect::<Vec<_>>();
+            assert_eq!(target.lww_commit_replacement_with_device_sections(&header, &stage, Some(&units), &rows).unwrap().revision, 1);
             Some(target.device_store().unwrap().revision().unwrap())
         } else {
             None
@@ -587,12 +602,12 @@ fn native_journal_resumes_before_intent_and_around_an_inflight_section_commit() 
                 .session
                 .unwrap()
                 .phase,
-            "applying-device"
+            if interruption == "after-commit" {"committed"} else {"applying-device"}
         );
         if interruption == "before-intent" {
             assert_eq!(
                 recovered.pending_source_sections(&id).unwrap(),
-                vec!["local-plugins".to_owned()]
+                selected
             );
         }
         let mut target = crate::persistent_store::PersistentStore::open(root.path()).unwrap();
@@ -601,7 +616,9 @@ fn native_journal_resumes_before_intent_and_around_an_inflight_section_commit() 
         assert_eq!(session.phase, "committed");
         assert_eq!(session.action, "native-complete");
         assert!(recovered.pending_source_sections(&id).unwrap().is_empty());
-        assert_eq!(source_manifests.len(), 1);
+        assert_eq!(source_manifests.len(), 3);
+        assert_eq!(target.revision().unwrap(), 1);
+        assert_eq!(target.read_root(None).unwrap().value["username"], "restored");
         let device = target.device_store().unwrap();
         assert_eq!(
             device
@@ -625,7 +642,7 @@ fn native_library_stage_survives_reopen_and_marker_prevents_second_activation() 
     use crate::local_backup::NeverCancelled;
 
     let root = tempfile::tempdir().unwrap();
-    let selected = vec!["local-settings".to_owned()];
+    let selected = vec!["hypa".to_owned(), "local-plugins".to_owned(), "local-settings".to_owned()];
     let mut store = crate::persistent_store::PersistentStore::open(root.path()).unwrap();
     let unrelated = store.replace_begin().unwrap().staging_id;
     store
@@ -635,7 +652,14 @@ fn native_library_stage_survives_reopen_and_marker_prevents_second_activation() 
     store
         .replace_put_root(&stage, &serde_json::json!({ "username": "restored" }))
         .unwrap();
-    let source = capture_prepared_native_sections(&mut store, &selected, &NeverCancelled).unwrap();
+    let mut original = crate::persistent_store::PersistentStore::open(&root.path().join("synthetic-source")).unwrap();
+    let original_stage = original.replace_begin().unwrap().staging_id;
+    original.replace_put_root(&original_stage, &serde_json::json!({"username":"restored"})).unwrap();
+    original.replace_commit(&original_stage, Some(0)).unwrap();
+    let lease = original.lww_acquire_library_backup_capture(original.revision().unwrap()).unwrap().lease;
+    let units = original.lww_backup_unit_values(&lease).unwrap();
+    original.release_revision(&lease).unwrap();
+    let source = capture_prepared_native_sections(&mut original, &selected, &NeverCancelled).unwrap();
     let rollback =
         capture_prepared_native_sections(&mut store, &selected, &NeverCancelled).unwrap();
     let mut pins = crate::asset_repository::job_pins::DurableCasJob::begin(
@@ -657,14 +681,18 @@ fn native_library_stage_survives_reopen_and_marker_prevents_second_activation() 
             Some(stage.clone()),
         )
         .unwrap();
-    let source_manifest = journal_prepared_native_sections(
+    let header = crate::persistent_store::lww::Header {
+        binding_authority: store.lww_binding_authority().unwrap(),
+        request_id: "library-recovery-job".into(),
+    };
+    coordinator.set_library_replacement(&id, &header, &units).unwrap();
+    journal_prepared_native_sections(
         &coordinator,
         &id,
         Spool::Source,
         &source,
     )
-    .unwrap()
-    .remove(0);
+    .unwrap();
     coordinator.source_ready(&id).unwrap();
     journal_prepared_native_sections(&coordinator, &id, Spool::Rollback, &rollback).unwrap();
     coordinator.prepared(&id).unwrap();
@@ -674,29 +702,9 @@ fn native_library_stage_survives_reopen_and_marker_prevents_second_activation() 
     assert!(reopened
         .prepare_replace_commit(&unrelated, Some(0))
         .is_err());
-    let prepared = reopened
-        .prepare_replace_commit(&stage, Some(0))
-        .unwrap();
-    coordinator
-        .section_intent(&id, "local-settings")
-        .unwrap();
-    apply_prepared_native_sections(&mut reopened, &source).unwrap();
-    coordinator
-        .section_complete(
-            &id,
-            "local-settings",
-            &source_manifest.sha256,
-        )
-        .unwrap();
-    coordinator.finish_device(&id).unwrap();
-    let (marker_key, marker) = coordinator.commit_marker(&id).unwrap();
-    let committed = reopened
-        .finish_prepared_replace_with_app_kv(
-            prepared,
-            &marker_key,
-            &serde_json::to_value(marker).unwrap(),
-        )
-        .unwrap();
+    for section in &selected {coordinator.section_intent(&id, section).unwrap();}
+    let rows = source.iter().map(PreparedDeviceSection::rows).collect::<Vec<_>>();
+    let committed = reopened.lww_commit_replacement_with_device_sections(&header, &stage, Some(&units), &rows).unwrap();
     assert_eq!(committed.revision, 1);
     drop(reopened);
     drop(coordinator);

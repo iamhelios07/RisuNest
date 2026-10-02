@@ -10,9 +10,6 @@ pub(crate) struct CapturedLibrary {
     pub(crate) repair_required: bool,
 }
 
-/// A failed normal capture is discarded before calling again with preservation=true. Each call
-/// establishes a fresh lease and immutable physical inventory. I/O and cancellation never become
-/// successful preservation merely because a normal attempt failed.
 pub(crate) fn capture_library(
     store: &mut PersistentStore,
     revision: i64,
@@ -22,10 +19,54 @@ pub(crate) fn capture_library(
     probe: &dyn CancellationProbe,
     source_build: &str,
 ) -> Result<CapturedLibrary> {
+    capture_library_with_ready(store, revision, job_directory, pins, preservation, probe, source_build, &|| Ok(()))
+}
+
+pub(crate) fn capture_library_with_ready(
+    store: &mut PersistentStore,
+    revision: i64,
+    job_directory: &Path,
+    pins: &mut DurableCasJob,
+    preservation: bool,
+    probe: &dyn CancellationProbe,
+    source_build: &str,
+    ready: &dyn Fn() -> Result<()>,
+) -> Result<CapturedLibrary> {
+    capture_library_inner(store, revision, job_directory, pins, preservation, probe, source_build, true, ready)
+}
+
+pub(crate) fn capture_library_only(
+    store: &mut PersistentStore,
+    revision: i64,
+    job_directory: &Path,
+    pins: &mut DurableCasJob,
+    preservation: bool,
+    probe: &dyn CancellationProbe,
+    source_build: &str,
+) -> Result<CapturedLibrary> {
+    capture_library_inner(store, revision, job_directory, pins, preservation, probe, source_build, false, &|| Ok(()))
+}
+
+fn capture_library_inner(
+    store: &mut PersistentStore,
+    revision: i64,
+    job_directory: &Path,
+    pins: &mut DurableCasJob,
+    preservation: bool,
+    probe: &dyn CancellationProbe,
+    source_build: &str,
+    include_device: bool,
+    ready: &dyn Fn() -> Result<()>,
+) -> Result<CapturedLibrary> {
     check(probe)?;
-    let (capture,device_sections)=store.lww_acquire_backup_capture(revision)?;
+    let (capture,device_sections)=if include_device {
+        store.lww_acquire_backup_capture(revision)?
+    } else {
+        (store.lww_acquire_library_backup_capture(revision)?, Vec::new())
+    };
     let lease = capture.lease;
     let outcome = (|| {
+        ready()?;
         #[cfg(test)] super::source_io::capture_scope().capture_ready(&lease,revision,store.lww_backup_device_revision(&lease)?);
         let mut catalog = Catalog::create(job_directory, source_build, revision)?;
         let generation = store.portable_source_generation(&lease)?;
