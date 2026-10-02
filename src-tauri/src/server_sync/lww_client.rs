@@ -1172,8 +1172,14 @@ impl LwwClient {
                 }
             }
         }
-        transfer.download(&controls.iter().cloned().collect::<Vec<_>>(), &[])?;
+        let mut required_controls = Vec::new();
         for hash in controls {
+            if !store.lww_verified_object_present(&hash)? {
+                required_controls.push(hash);
+            }
+        }
+        transfer.download(&required_controls, &[])?;
+        for hash in required_controls {
             let body = cache.read(&hash, MAX_METADATA_BYTES)?;
             store.lww_put_object(&hash, &body)?;
         }
