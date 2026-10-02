@@ -203,7 +203,7 @@ pub(super) fn protected_preset_flag(key: &str) -> Option<&'static str> {
         _ => None,
     }
 }
-pub(super) fn derive_identity_root(
+pub(crate) fn derive_identity_root(
     connection: &Connection,
     generation: &str,
     root: &mut Map<String, Value>,
