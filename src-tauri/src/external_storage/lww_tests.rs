@@ -128,6 +128,120 @@ fn two_actual_stores_publish_receive_and_quiet_listing() {
     })
 }
 #[test]
+fn cycle_key_sets_match_real_emission_and_durable_apply_and_noop_is_empty() {
+    use super::lww_engine::cycle_keys;
+    run(async {
+        let mut f = CycleFixture::new();
+        cycle_keys::reset();
+        set(&mut f.a, &["root", "language"], serde_json::json!("ko"));
+        let published = f.publish_a().await;
+        assert_eq!(f.receive_b().await, 1);
+        let keys = cycle_keys::take();
+        let expected = std::collections::BTreeSet::from([
+            UnitKey::new(&["root", "language"]).unwrap(),
+        ]);
+        assert!(keys.complete());
+        assert_eq!(keys.selected_keys, expected);
+        assert_eq!(keys.attempted_keys, expected);
+        assert_eq!(keys.emitted_keys, expected);
+        assert_eq!(keys.affected_keys, expected);
+        assert!(keys.held_keys.is_empty());
+        assert!(keys.deferred_keys.is_empty());
+        assert_eq!(keys.segment_attempts, 1);
+        assert_eq!(keys.accepted_publications as u64, published.segments.0);
+        assert_eq!(keys.receive_applies, 1);
+
+        cycle_keys::reset();
+        set(&mut f.a, &["root", "language"], serde_json::json!("ko"));
+        assert_eq!(f.publish_a().await.segments.0, 0);
+        assert_eq!(f.receive_b().await, 0);
+        let keys = cycle_keys::take();
+        assert!(keys.complete());
+        assert!(keys.selected_keys.is_empty());
+        assert!(keys.attempted_keys.is_empty());
+        assert!(keys.emitted_keys.is_empty());
+        assert!(keys.affected_keys.is_empty());
+        assert_eq!(keys.segment_attempts, 0);
+        assert_eq!(keys.accepted_publications, 0);
+        assert_eq!(keys.receive_applies, 0);
+    });
+}
+#[test]
+fn cycle_key_sample_stays_failed_when_uncertain_publication_is_later_reconciled() {
+    use super::lww_engine::cycle_keys;
+    run(async {
+        let mut f = CycleFixture::new();
+        cycle_keys::reset();
+        set(&mut f.a, &["root", "language"], serde_json::json!("ko"));
+        f.provider.state.lock().unwrap().lose_response = true;
+        assert!(f.sender.publish(&mut f.a, 0.into(), &[], &Cancellation::default()).await.is_err());
+        assert_eq!(f.publish_a().await.segments.0, 1);
+        assert_eq!(f.receive_b().await, 1);
+        let keys = cycle_keys::take();
+        assert!(!keys.complete());
+        assert_eq!(keys.failed_operations, 1);
+        assert_eq!(keys.pending_operations, 0);
+        assert_eq!(keys.segment_attempts, 1);
+        assert_eq!(keys.accepted_publications, 1);
+        assert_eq!(keys.receive_applies, 1);
+        assert_eq!(keys.selected_keys, keys.emitted_keys);
+        assert_eq!(keys.attempted_keys, keys.emitted_keys);
+        assert_eq!(keys.emitted_keys, keys.affected_keys);
+        assert_eq!(keys.emitted_keys.len(), 1);
+        assert_eq!(f.provider.upload_count(), 1);
+    });
+}
+#[test]
+fn cycle_key_sets_exclude_generating_publication_and_report_actual_deferred_apply() {
+    use super::lww_engine::cycle_keys;
+    run(async {
+        let mut f = CycleFixture::new();
+        conversation(&mut f.a);
+        f.publish_a().await;
+        f.receive_b().await;
+        let generating = vec![MessageLocator {
+            character_id: "char".into(), conversation_id: "conv".into(), start: None,
+        }];
+        cycle_keys::reset();
+        f.a.commit(&WorkingSetCommit {
+            expected_revision: f.a.revision().unwrap(),
+            conversations: Some(vec![ConversationMutation::ReplaceRange {
+                character_id: "char".into(), conversation_id: "conv".into(),
+                start: 0, delete_count: 0,
+                messages: vec![serde_json::json!({"data":"synthetic-message","chatId":"synthetic-id"})],
+                conversation: None, configured_index: None,
+            }]),
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(f.sender.publish(&mut f.a, 0.into(), &generating, &Cancellation::default())
+            .await.unwrap().segments.0, 0);
+        let keys = cycle_keys::take();
+        assert!(keys.complete());
+        assert!(keys.selected_keys.is_empty());
+        assert!(keys.attempted_keys.is_empty());
+        assert!(keys.emitted_keys.is_empty());
+        assert!(keys.affected_keys.is_empty());
+        assert_eq!(keys.accepted_publications, 0);
+        assert!(!f.a.lww_read_outbox(0.into(), 4096).unwrap().entries.is_empty());
+
+        cycle_keys::reset();
+        assert_eq!(f.publish_a().await.segments.0, 1);
+        assert_eq!(f.receiver.receive_and_apply(&mut f.b, 0.into(), &generating,
+            &Cancellation::default()).await.unwrap(), 1);
+        let keys = cycle_keys::take();
+        let expected = std::collections::BTreeSet::from([
+            UnitKey::new(&["messages", "char", "conv"]).unwrap(),
+        ]);
+        assert!(keys.complete());
+        assert_eq!(keys.selected_keys, expected);
+        assert_eq!(keys.emitted_keys, expected);
+        assert!(keys.affected_keys.is_empty());
+        assert!(keys.held_keys.is_empty());
+        assert_eq!(keys.deferred_keys, expected);
+        assert_eq!(keys.receive_applies, 1);
+    });
+}
+#[test]
 fn crash_retry_uses_exact_ciphertext_nonce_sequence_and_capture() {
     run(async {
         let mut f = CycleFixture::new();
