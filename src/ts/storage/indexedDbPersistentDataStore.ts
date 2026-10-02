@@ -218,14 +218,17 @@ function validateOwnerHeadsForCommit(input: WorkingSetCommit): void {
             }
             entries = ownArrayProperty(parent, 'additionalAssets')
         } else {
-            if (!input.root) throw new TypeError('Root asset owner head requires its parent root')
             if (owner.kind === 'root-module-assets') {
-                const module = input.root.modules?.find((value) => value.id === owner.moduleId)
-                if (!module) throw new TypeError('Root module asset owner occurrence does not exist')
+                const parent = input.unitMutations?.find((mutation) => mutation.key === JSON.stringify(['record', 'modules', owner.moduleId]))
+                if (!input.root && !parent) throw new TypeError('Root asset owner head requires its parent root or module unit')
+                const module = parent ? parent.type === 'set' ? parent.value : null : input.root?.modules?.find((value) => value.id === owner.moduleId)
+                if (!module || typeof module !== 'object' || (module as {id?:unknown}).id !== owner.moduleId) throw new TypeError('Root module asset owner occurrence does not exist')
                 entries = ownArrayProperty(module, 'assets')
             } else {
-                const module = input.root.personas?.find((value) => value.id === owner.personaId && value.embeddedModule?.id === owner.moduleId)?.embeddedModule
-                if (!module) throw new TypeError('Persona module asset owner occurrence does not exist')
+                const parent = input.unitMutations?.find((mutation) => mutation.key === JSON.stringify(['persona', owner.personaId, 'embeddedModule']))
+                if (!input.root && !parent) throw new TypeError('Root asset owner head requires its parent root or persona unit')
+                const module = parent ? parent.type === 'set' ? parent.value : null : input.root?.personas?.find((value) => value.id === owner.personaId && value.embeddedModule?.id === owner.moduleId)?.embeddedModule
+                if (!module || typeof module !== 'object' || (module as {id?:unknown}).id !== owner.moduleId) throw new TypeError('Persona module asset owner occurrence does not exist')
                 entries = ownArrayProperty(module, 'assets')
             }
         }
@@ -943,12 +946,16 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             if (input.addCharacter) {
                 await this.addCharacter(transaction, generation, input.addCharacter)
             }
+            const conversationOrders: PersistentUnitMutation[] = []
             for (const mutation of input.unitMutations ?? []) {
-                await this.applyUnitMutation(transaction, generation, mutation)
+                const [kind, scope] = JSON.parse(mutation.key)
+                if (kind === 'order' && scope === 'conversations') conversationOrders.push(mutation)
+                else await this.applyUnitMutation(transaction, generation, mutation)
             }
             for (const mutation of input.conversations ?? []) {
                 await this.applyConversationMutation(transaction, generation, mutation)
             }
+            for (const mutation of conversationOrders) await this.applyUnitMutation(transaction, generation, mutation)
             for (const mutation of input.pluginStorage ?? []) {
                 await this.applyPluginStorageMutation(transaction, generation, mutation)
             }
