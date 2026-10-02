@@ -181,7 +181,7 @@ pub(crate) async fn external_bootstrap_raw(
         "nativeActivationMs":activation_ms,"actualReceiveFinishes":receive_finishes,"nativeHydrationConsumerReturnedMs":bodies_ms,"bodyCompletion":body_completion,"sourceObservation":null,"rendererAdoption":null,
         "providerRequests":requests_after.checked_sub(requests_before),"sentBodyBytes":bytes_after.0.checked_sub(bytes_before.0),
         "receivedBodyBytes":bytes_after.1.checked_sub(bytes_before.1),"nativeObservation":observation,
-        "unobserved":["bundle/state fingerprint SHA input receipt","renderer adoption"],"errors":errors}))
+        "unobserved":["physical external source receipt","renderer adoption"],"errors":errors}))
 }
 
 pub(crate) fn portable_restore_raw(
@@ -210,8 +210,17 @@ pub(crate) fn portable_restore_raw(
     let mut adopted=false;
     let mut observed_activation_ms=None;
     let mut errors=vec![];
+    let mut retired=false;
+    let mut cleanup_failed=false;
+    let mut terminal_status=None;
     while !worker.is_finished() {
         let status=job.status();
+        if matches!(status.state,JobState::Failed|JobState::Cancelled) {
+            terminal_status=Some(status);
+            errors.push("actual portable body worker failed or was cancelled".into());
+            match jobs.begin_cleanup() {Ok(())=>retired=true,Err(error)=>{errors.push(error);cleanup_failed=true;}}
+            break;
+        }
         let outcome=(||->Result<(),String> {
             if !selected && status.state==JobState::WaitingForInput && status.phase==JobPhase::AwaitingBackupSelection {
                 jobs.select_portable_restore_fixture(&job.id(),portable::PortableSelection::default())
@@ -235,10 +244,15 @@ pub(crate) fn portable_restore_raw(
             }
             Ok(())
         })();
-        if let Err(error)=outcome {errors.push(error);break;}
+        if let Err(error)=outcome {
+            errors.push(error);
+            terminal_status=Some(job.status());
+            match jobs.begin_cleanup() {Ok(())=>retired=true,Err(error)=>{errors.push(error);cleanup_failed=true;}}
+            break;
+        }
         std::thread::yield_now();
     }
-    let settled=errors.is_empty() && (adopted || worker.is_finished());
+    let settled=!cleanup_failed && (retired || worker.is_finished() || (errors.is_empty() && adopted));
     let worker_raw=if settled {
         match worker.join() {
             Ok(Ok(raw))=>Some(raw),
@@ -246,7 +260,7 @@ pub(crate) fn portable_restore_raw(
             Err(_)=>{errors.push("actual portable restore worker panicked".into());None},
         }
     } else {
-        // The actual unacknowledged operation remains pending. Do not invent ACK or join its waiter.
+        // Failed retirement leaves the actual waiter pending; do not invent ACK or join it.
         drop(worker);None
     };
     let parent=take_work(false);
@@ -255,7 +269,7 @@ pub(crate) fn portable_restore_raw(
     if let Err(error)=parent.validate_costly_native_coverage() {errors.push(error);}
     Ok(json!({"status":"INVALID","route":"device-file-backup","scenario":if all_present {"restore-all-present"} else {"restore-missing"},
         "iteration":iteration,"warmup":iteration==0,"selected":selected,"finalized":finalized,"nativeAdoptionConfirmed":adopted,
-        "jobStatus":job.status(),"nativeActivationStatusObservedMs":observed_activation_ms,
+        "jobStatus":terminal_status.unwrap_or_else(||job.status()),"nativeActivationStatusObservedMs":observed_activation_ms,
         "nativeActivationMs":null,"rendererAdoption":null,"workerJoined":settled,
         "nativeParentObservation":parent,"nativeWorkerRaw":worker_raw,"sourceObservation":portable_source_receipt(&source),"errors":errors}))
 }
@@ -465,7 +479,6 @@ pub(crate) async fn compact_native_raw(
     observation.requests=(provider.read_count()+provider.upload_count()+provider.listing_count()-requests_before) as u64;
     observation.uploaded_bytes=bytes_after.0-bytes_before.0;
     observation.downloaded_bytes=bytes_after.1-bytes_before.1;
-    observation.incomplete.push("external bundle/state fingerprint SHA input coverage is awaiting the owner caller wrapper".into());
     let (snapshot,error)=match outcome {
         Ok(completed)=>(Some(json!({"snapshotId":completed.snapshot_id,"repositoryId":completed.repository_id,
             "stateFingerprint":completed.fingerprint,"libraryFingerprint":completed.library_fingerprint,
