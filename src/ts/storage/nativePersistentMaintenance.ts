@@ -78,8 +78,6 @@ export interface NativeAssetGcResult {
 
 export interface NativeSnapshotRestoreActions {
     choose(snapshots: readonly NativeSnapshotInfo[]): Promise<string | null>
-    confirm(): Promise<boolean>
-    restart(): Promise<void>
     onEmpty(): void | Promise<void>
 }
 
@@ -164,8 +162,65 @@ export function undoNativeDataHealthRepair(journalId: string, expectedRevision: 
     return invoke('pds_data_health_undo', { journalId, expectedRevision })
 }
 
-export async function requestNativePersistentSnapshotRestore(id: string): Promise<void> {
-    await invoke('pds_snapshot_restore_request', { id })
+export async function requestNativePersistentSnapshotRestore(id: string): Promise<boolean> {
+    const [{getPersistentDataRuntime}, {prepareBoundLibraryReplacement}, {acquireUpstreamImportPause,confirmUpstreamLibraryReplacement}, plugins, {registerCommittedWorkingSetContinuation}, {createStorageMutationGate}] = await Promise.all([
+        import('./persistentDataRuntime.svelte'),import('./sync/bindingRegistry'),import('./upstreamReplacement'),import('../plugins/apiV3/v3.svelte'),import('./committedWorkingSetContinuation'),import('./storageMutationGate'),
+    ])
+    const runtime = getPersistentDataRuntime()
+    const staged = await invoke<{stagingId:string}>('pds_snapshot_restore_stage',{id,requestId:crypto.randomUUID()})
+    let submitted = false
+    let pause: Awaited<ReturnType<typeof acquireUpstreamImportPause>> | undefined
+    let binding: Awaited<ReturnType<typeof prepareBoundLibraryReplacement>> | undefined
+    let acceptedRevision: number | undefined
+    const gate = createStorageMutationGate()
+    try {
+        binding = await prepareBoundLibraryReplacement()
+        if (!(await confirmUpstreamLibraryReplacement(binding.bound))) {
+            await invoke('pds_snapshot_restore_abort',{stagingId:staged.stagingId})
+            return false
+        }
+        await binding.fence()
+        await plugins.fencePluginExecutionForAuthorityReplacement()
+        pause = await acquireUpstreamImportPause(runtime,'native-snapshot-restore')
+        await binding.assertAuthority()
+        const args = {stagingId:staged.stagingId,expectedRevision:pause.fence.revision,bindingAuthority:binding.state.targetAuthority}
+        runtime.setActivatedLibraryRecoveryLifecycle(pause.token,{
+            async beforeRefresh() {
+                await binding!.assertAuthority()
+                const result = await gate.runTransition(() => invoke<{revision:number}>('pds_snapshot_restore_activate',args))
+                acceptedRevision = result.revision
+                return result.revision
+            },
+            async afterRefresh() {
+                await plugins.invalidatePluginCachesAfterAuthorityReplacement()
+                await plugins.restartPluginsAfterAuthorityReplacement()
+            },
+        })
+        submitted = true
+        const result = await gate.runTransition(() => invoke<{revision:number}>('pds_snapshot_restore_activate',args))
+        acceptedRevision = result.revision
+        await pause.fence.refreshCommittedWorkingSet(result.revision)
+        await plugins.invalidatePluginCachesAfterAuthorityReplacement()
+        await plugins.restartPluginsAfterAuthorityReplacement()
+        pause.complete()
+        await pause.finish()
+        await binding.resume()
+        return true
+    } catch (error) {
+        if (submitted && pause) {
+            const revision = acceptedRevision ?? pause.fence.revision
+            runtime.markCommittedWorkingSetRefreshRequired(revision,error)
+            registerCommittedWorkingSetContinuation(revision,runtime,runtime.getStorageAuthorityEpoch(),async () => { await binding!.assertAuthority(); await binding!.resume() },undefined,true)
+        } else {
+            await invoke('pds_snapshot_restore_abort',{stagingId:staged.stagingId})
+            if (pause) await pause.abortUnchanged(async () => {await binding?.assertAuthority()})
+            await plugins.restartPluginsAfterAuthorityReplacement()
+            await binding?.resume()
+        }
+        throw error
+    } finally {
+        if (pause) await pause.finish()
+    }
 }
 
 export async function restartNativeApp(): Promise<void> {
@@ -229,9 +284,5 @@ export async function restoreNativePersistentSnapshot(
     if (!snapshots.some((snapshot) => snapshot.id === id)) {
         throw new Error('Selected native snapshot is not available')
     }
-    if (!(await actions.confirm())) return false
-
-    await requestNativePersistentSnapshotRestore(id)
-    await actions.restart()
-    return true
+    return requestNativePersistentSnapshotRestore(id)
 }

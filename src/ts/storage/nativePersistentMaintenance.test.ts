@@ -4,10 +4,23 @@ const mocks = vi.hoisted(() => ({
     invoke: vi.fn(),
     isTauriMobile: true,
     relaunch: vi.fn(),
+    confirmReplacement: vi.fn(),
+    prepareReplacement: vi.fn(),
+    acquirePause: vi.fn(),
+    invalidatePlugins: vi.fn(),
+    restartPlugins: vi.fn(),
+    fencePlugins: vi.fn(),
+    lifecycle: vi.fn(),
+    continuation: vi.fn(),
 }))
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: mocks.invoke }))
 vi.mock('../desktopRelaunch', () => ({ relaunch: mocks.relaunch }))
+vi.mock('./persistentDataRuntime.svelte',()=>({getPersistentDataRuntime:()=>({setActivatedLibraryRecoveryLifecycle:mocks.lifecycle,markCommittedWorkingSetRefreshRequired:vi.fn(),getStorageAuthorityEpoch:()=>4})}))
+vi.mock('./sync/bindingRegistry',()=>({prepareBoundLibraryReplacement:mocks.prepareReplacement}))
+vi.mock('./upstreamReplacement',()=>({acquireUpstreamImportPause:mocks.acquirePause,confirmUpstreamLibraryReplacement:mocks.confirmReplacement}))
+vi.mock('../plugins/apiV3/v3.svelte',()=>({fencePluginExecutionForAuthorityReplacement:mocks.fencePlugins,invalidatePluginCachesAfterAuthorityReplacement:mocks.invalidatePlugins,restartPluginsAfterAuthorityReplacement:mocks.restartPlugins}))
+vi.mock('./committedWorkingSetContinuation',()=>({registerCommittedWorkingSetContinuation:mocks.continuation}))
 vi.mock('../platform', () => ({
     isTauriIOS: false,
     get isTauriMobile() {
@@ -48,6 +61,14 @@ describe('native persistent maintenance', () => {
         mocks.invoke.mockReset()
         mocks.isTauriMobile = true
         mocks.relaunch.mockReset()
+        mocks.confirmReplacement.mockReset().mockResolvedValue(true)
+        mocks.prepareReplacement.mockReset().mockResolvedValue({bound:false,state:{targetAuthority:'0'},fence:vi.fn(),assertAuthority:vi.fn(),resume:vi.fn()})
+        mocks.acquirePause.mockReset().mockResolvedValue({token:{},fence:{revision:7,refreshCommittedWorkingSet:vi.fn()},complete:vi.fn(),finish:vi.fn(),abortUnchanged:vi.fn()})
+        mocks.lifecycle.mockReset()
+        mocks.continuation.mockReset()
+        mocks.invalidatePlugins.mockReset()
+        mocks.restartPlugins.mockReset()
+        mocks.fencePlugins.mockReset()
         vi.useRealTimers()
         vi.unstubAllGlobals()
         delete (window as Window & {
@@ -69,7 +90,8 @@ describe('native persistent maintenance', () => {
         mocks.invoke
             .mockResolvedValueOnce(created)
             .mockResolvedValueOnce(snapshots)
-            .mockResolvedValueOnce(undefined)
+            .mockResolvedValueOnce({stagingId:'stage'})
+            .mockResolvedValueOnce({revision:8})
 
         await expect(createNativePersistentSnapshot('periodic')).resolves.toEqual(created)
         await expect(listNativePersistentSnapshots()).resolves.toEqual(snapshots)
@@ -78,7 +100,8 @@ describe('native persistent maintenance', () => {
         expect(mocks.invoke.mock.calls).toEqual([
             ['pds_snapshot_create', { reason: 'periodic' }],
             ['pds_snapshot_list'],
-            ['pds_snapshot_restore_request', { id: 'ab18b8a5-f45c-46ba-bbf9-74b2cae87717' }],
+            ['pds_snapshot_restore_stage', { id: 'ab18b8a5-f45c-46ba-bbf9-74b2cae87717',requestId:expect.any(String) }],
+            ['pds_snapshot_restore_activate',{stagingId:'stage',expectedRevision:7,bindingAuthority:'0'}],
         ])
     })
 
@@ -197,8 +220,6 @@ describe('native persistent maintenance', () => {
     it('reports an empty snapshot list without prompting', async () => {
         const actions = {
             choose: vi.fn(),
-            confirm: vi.fn(),
-            restart: vi.fn(),
             onEmpty: vi.fn(),
         }
         mocks.invoke.mockResolvedValueOnce([])
@@ -212,7 +233,6 @@ describe('native persistent maintenance', () => {
     it('stops when snapshot choice or confirmation is cancelled', async () => {
         const snapshot = { id: 'snapshot.db', bytes: 1, modifiedAt: 2 }
         const baseActions = {
-            restart: vi.fn(),
             onEmpty: vi.fn(),
         }
         mocks.invoke.mockResolvedValueOnce([snapshot])
@@ -221,21 +241,20 @@ describe('native persistent maintenance', () => {
             restoreNativePersistentSnapshot({
                 ...baseActions,
                 choose: vi.fn().mockResolvedValue(null),
-                confirm: vi.fn(),
             }),
         ).resolves.toBe(false)
 
-        mocks.invoke.mockResolvedValueOnce([snapshot])
+        mocks.confirmReplacement.mockResolvedValueOnce(false)
+        mocks.invoke.mockResolvedValueOnce([snapshot]).mockResolvedValueOnce({stagingId:'cancelled-stage'}).mockResolvedValueOnce(undefined)
         await expect(
             restoreNativePersistentSnapshot({
                 ...baseActions,
                 choose: vi.fn().mockResolvedValue(snapshot.id),
-                confirm: vi.fn().mockResolvedValue(false),
             }),
         ).resolves.toBe(false)
 
-        expect(mocks.invoke.mock.calls).toEqual([['pds_snapshot_list'], ['pds_snapshot_list']])
-        expect(baseActions.restart).not.toHaveBeenCalled()
+        expect(mocks.invoke.mock.calls).toEqual([['pds_snapshot_list'], ['pds_snapshot_list'],['pds_snapshot_restore_stage',{id:snapshot.id,requestId:expect.any(String)}],['pds_snapshot_restore_abort',{stagingId:'cancelled-stage'}]])
+        expect(mocks.relaunch).not.toHaveBeenCalled()
     })
 
     it('rejects a path outside the returned snapshot list', async () => {
@@ -244,8 +263,6 @@ describe('native persistent maintenance', () => {
         await expect(
             restoreNativePersistentSnapshot({
                 choose: vi.fn().mockResolvedValue('other.db'),
-                confirm: vi.fn(),
-                restart: vi.fn(),
                 onEmpty: vi.fn(),
             }),
         ).rejects.toThrow('Selected native snapshot is not available')
@@ -253,42 +270,33 @@ describe('native persistent maintenance', () => {
         expect(mocks.invoke).toHaveBeenCalledTimes(1)
     })
 
-    it('confirms, writes the restore marker, and only then restarts', async () => {
-        const order: string[] = []
-        const snapshot = { id: 'snapshot.db', bytes: 1, modifiedAt: 2 }
-        mocks.invoke.mockImplementation(async (command: string) => {
-            order.push(command)
-            return command === 'pds_snapshot_list' ? [snapshot] : undefined
-        })
-
-        await expect(
-            restoreNativePersistentSnapshot({
-                choose: async () => {
-                    order.push('choose')
-                    return snapshot.id
-                },
-                confirm: async () => {
-                    order.push('confirm')
-                    return true
-                },
-                restart: async () => {
-                    order.push('restart')
-                },
-                onEmpty: vi.fn(),
-            }),
-        ).resolves.toBe(true)
-
-        expect(order).toEqual([
-            'pds_snapshot_list',
-            'choose',
-            'confirm',
-            'pds_snapshot_restore_request',
-            'restart',
-        ])
+    it('adopts the committed snapshot under the shared guard and reloads plugins', async () => {
+        mocks.invoke.mockResolvedValueOnce([{id:'snapshot.db',bytes:1,modifiedAt:2}]).mockResolvedValueOnce({stagingId:'stage'}).mockResolvedValueOnce({revision:8})
+        await expect(restoreNativePersistentSnapshot({choose:async()=>'snapshot.db',onEmpty:vi.fn()})).resolves.toBe(true)
+        const pause=await mocks.acquirePause.mock.results[0].value
+        const binding=await mocks.prepareReplacement.mock.results[0].value
+        expect(pause.fence.refreshCommittedWorkingSet).toHaveBeenCalledWith(8)
+        expect(mocks.invalidatePlugins).toHaveBeenCalledOnce()
+        expect(mocks.restartPlugins).toHaveBeenCalledOnce()
+        expect(pause.complete).toHaveBeenCalledOnce()
+        expect(binding.resume).toHaveBeenCalledOnce()
+        expect(mocks.relaunch).not.toHaveBeenCalled()
+        expect(mocks.lifecycle).toHaveBeenCalledOnce()
     })
-
-    it('does not restart when writing the restore marker fails', async () => {
-        const requestError = new Error('marker failed')
+    it('retains exact activation recovery after a lost receipt', async () => {
+        const lost=new Error('receipt lost')
+        mocks.invoke.mockResolvedValueOnce({stagingId:'stage'}).mockRejectedValueOnce(lost).mockResolvedValueOnce({revision:8})
+        await expect(requestNativePersistentSnapshotRestore('snapshot')).rejects.toBe(lost)
+        expect(mocks.continuation).toHaveBeenCalledOnce()
+        const lifecycle=mocks.lifecycle.mock.calls[0][1]
+        await expect(lifecycle.beforeRefresh()).resolves.toBe(8)
+        expect(mocks.invoke.mock.calls[1]).toEqual(mocks.invoke.mock.calls[2])
+        expect(mocks.invoke.mock.calls.some(([command])=>command==='pds_snapshot_restore_abort')).toBe(false)
+        await lifecycle.afterRefresh()
+        expect(mocks.restartPlugins).toHaveBeenCalledOnce()
+    })
+    it('does not restart when snapshot staging fails', async () => {
+        const requestError = new Error('stage failed')
         const restart = vi.fn()
         mocks.invoke
             .mockResolvedValueOnce([{ id: 'snapshot.db', bytes: 1, modifiedAt: 2 }])
@@ -297,8 +305,6 @@ describe('native persistent maintenance', () => {
         await expect(
             restoreNativePersistentSnapshot({
                 choose: vi.fn().mockResolvedValue('snapshot.db'),
-                confirm: vi.fn().mockResolvedValue(true),
-                restart,
                 onEmpty: vi.fn(),
             }),
         ).rejects.toBe(requestError)
