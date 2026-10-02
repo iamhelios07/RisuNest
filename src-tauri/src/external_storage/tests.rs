@@ -1,7 +1,7 @@
 use super::{capabilities::*, contract::*, registry::Registry};
 use std::sync::Arc;
 
-use super::fake::{capabilities, locator, repository, FakeProvider};
+use super::fake::{locator, repository, FakeProvider};
 
 #[test]
 fn cas_two_writers_have_exactly_one_winner_for_create_and_update() {
