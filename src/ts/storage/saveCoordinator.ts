@@ -2779,6 +2779,7 @@ export class SaveCoordinator {
             const baselineField = (key: string): unknown => baselineFields
                 ? baselineFields.get(key)
                 : (decodedBaselineRoot ??= JSON.parse(this.rootBaseline!))[key]
+            const rootUnitStart = commit.unitMutations?.length ?? 0
             if (commit.rootMutations && this.rootBaseline !== null) {
                 commit.rootMutations = commit.rootMutations.filter((mutation) => {
                     if (!recordCollections.has(mutation.key)) return true
@@ -2807,6 +2808,10 @@ export class SaveCoordinator {
                     }
                     return false
                 })
+            }
+            // Empty split collections have no durable units, but their captured projection must converge.
+            if (commit.rootMutations?.length === 0 && (commit.unitMutations?.length ?? 0) === rootUnitStart) {
+                this.rootBaseline = captured.rootCanonical
             }
             if (!this.pluginStorageMatchesBaseline(captured)) {
                 commit.pluginStorage = diffPluginStorage(
