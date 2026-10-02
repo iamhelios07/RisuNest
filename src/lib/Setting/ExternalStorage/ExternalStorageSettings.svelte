@@ -12,6 +12,7 @@
     import { DBState } from 'src/ts/stores.svelte'
     import { getExternalStorageBridge } from 'src/ts/storage/sync/external/bridge'
     import { bindSyncTarget, unbindSyncTarget } from 'src/ts/storage/sync/bindingRegistry'
+    import { createNativeSyncBindingBridge } from 'src/ts/storage/sync/bindingNative'
     import { requestExternalLwwNow, subscribeExternalLwwFailures, supportsExternalLwwNewDevice } from 'src/ts/storage/sync/external/lwwProduction'
     import BindingTargetSwitch from 'src/ts/storage/sync/BindingTargetSwitch.svelte'
     import { language } from 'src/lang'
@@ -196,11 +197,14 @@
         } = {},
     ): Promise<void> {
         if (job === 'restore') {
+            const binding = await createNativeSyncBindingBridge().state()
             const answer = await alertCheckboxConfirm({
-                title: strings.restoreConfirm,
-                description: strings.restoreFullScope,
-                checkboxLabel: strings.restoreFullScopeAcknowledgement,
-                actionLabel: strings.restore,
+                title: language.lwwSync.restoreTitle,
+                description: binding.target.kind === 'none'
+                    ? language.lwwSync.restoreDescription
+                    : language.lwwSync.restoreDescriptionBound,
+                checkboxLabel: language.lwwSync.restoreAcknowledge,
+                actionLabel: language.lwwSync.restoreAction,
                 cancelLabel: strings.cancel,
                 requireChecked: true,
             })
