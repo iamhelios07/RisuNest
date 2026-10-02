@@ -1164,7 +1164,7 @@ mod tests {
             run_lww(&context,&request,&f.sender,ConnectedRepositoryView{connected:&connected,writer_id:"collector",policy:RetentionPolicy::DEFAULT,
                 now_ms:1000+2*leases::UNREACHABLE_GRACE_MS,unfinished:vec![],cache_root:&cache},&scratch,&cancel).await.unwrap();
             assert!(!f.provider.holds(&old_pack),"finite aged GC retires the saved equal-coverage pack");
-            let mut receiver_connection=ConnectedRepository{stored:connected.stored.clone(),provider:connected.provider.clone(),handle:connected.handle.clone(),
+            let mut receiver_connection=ConnectedRepository{stored:connected.stored.clone(),provider:connected.provider.clone(),handle:fake::repository(),
                 dependencies:fake::loopback_dependencies(fake::MemoryVault::default(),1).dependencies,root_key:zeroize::Zeroizing::new(*connected.root_key)};
             receiver_connection.stored.id="receiver".into();
             super::super::connection_store::ConnectionStore::open(f.directory_b.path()).unwrap().insert(&receiver_connection.stored).unwrap();
