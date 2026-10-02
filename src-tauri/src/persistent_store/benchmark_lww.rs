@@ -218,6 +218,18 @@ fn verify_bootstrap(a:&PersistentStore, b:&PersistentStore) {
             "synthetic-conversation-0", None).unwrap().unwrap().value);
 }
 
+fn verify_settled(store:&PersistentStore, engine:&crate::external_storage::lww_engine::ExternalLwwEngine) {
+    assert!(store.lww_read_outbox(store.lww_binding_authority().unwrap(), 1).unwrap().entries.is_empty());
+    assert!(store.external_lww_pending(&engine.target_scope(), &store.lww_clock_state().unwrap().writer_id)
+        .unwrap().is_none());
+    let device = store.device_store().unwrap().connection();
+    for query in ["SELECT COUNT(*) FROM lww_intents WHERE complete=0",
+        "SELECT COUNT(*) FROM lww_receive WHERE finished=0",
+        "SELECT COUNT(*) FROM lww_receive_rows WHERE status IN ('staged','held','deferred')"] {
+        assert_eq!(device.query_row(query, [], |row| row.get::<_,i64>(0)).unwrap(), 0);
+    }
+}
+
 pub(crate) struct ExternalDriver {
     pub fixture: CycleFixture,
     _generated: tempfile::TempDir,
@@ -238,7 +250,16 @@ impl ExternalDriver {
         fixture.sender.publish(&mut fixture.a, authority, &[], &Cancellation::default()).await.unwrap();
         let authority = fixture.b.lww_binding_authority().unwrap();
         fixture.receiver.receive_and_apply(&mut fixture.b, authority, &[], &Cancellation::default()).await.unwrap();
-        assert!(fixture.a.lww_read_outbox(fixture.a.lww_binding_authority().unwrap(), 1).unwrap().entries.is_empty());
+        verify_settled(&fixture.a, &fixture.sender);
+        verify_settled(&fixture.b, &fixture.receiver);
+        let writer = fixture.a.lww_clock_state().unwrap().writer_id;
+        let published_prefix = fixture.a.external_lww_next_sequence(&fixture.sender.target_scope(), &writer).unwrap() - 1;
+        // Publication ACK advances the sender's own receive prefix durably.
+        for store in [&fixture.a, &fixture.b] {
+            let progress = store.lww_receive_progress(store.lww_binding_authority().unwrap()).unwrap();
+            let own = progress.iter().find(|item| item.kind == "external" && item.writer_id.as_deref() == Some(writer.as_str())).unwrap();
+            assert_eq!(own.cursor.0, published_prefix);
+        }
         verify_bootstrap(&fixture.a, &fixture.b);
         Self {fixture, _generated:generated, receipt}
     }
@@ -425,6 +446,7 @@ pub(crate) fn write_samples(directory:&Path, samples:&[NativeSample]) {
     serde_json::to_writer_pretty(File::create(directory.join("native-smoke.json")).unwrap(),
         &json!({"schema":"risunest-lww-native-smoke/v1", "scope":"native-content-identity-sha-inputs",
             "verified_checkpoint":checkpoint, "timing_origin":"native commit start; cumulative milliseconds",
+            "bootstrap_phase":"excluded; both endpoints settled before warmup or sample counters",
             "key_semantics":{
                 "local_http_emitted":"immutable body submitted to /push, including dominated submissions",
                 "local_http_accepted":"winning server keys",
@@ -468,11 +490,20 @@ fn frozen_fixture_stages_real_native_rows_and_unique_message_ids() {
 #[test]
 fn external_fixture_bootstrap_correctness() {
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-        let driver = ExternalDriver::prepare(FixtureScale::small()).await;
+        let mut driver = ExternalDriver::prepare(FixtureScale::small()).await;
         assert_eq!(driver.fixture.a.read_conversation("synthetic-character-0", "synthetic-conversation-0", None)
             .unwrap().unwrap().value, driver.fixture.b.read_conversation("synthetic-character-0",
                 "synthetic-conversation-0", None).unwrap().unwrap().value);
         assert_eq!(driver.fixture.provider.read_attempts("head"), 0);
+        let reads = driver.fixture.provider.read_count();
+        let bytes = driver.fixture.provider.transferred_body_bytes();
+        let authority = driver.fixture.a.lww_binding_authority().unwrap();
+        assert_eq!(driver.fixture.sender.receive_and_apply(&mut driver.fixture.a, authority, &[],
+            &Cancellation::default()).await.unwrap(), 0);
+        assert_eq!(driver.fixture.provider.read_count(), reads);
+        assert_eq!(driver.fixture.provider.transferred_body_bytes(), bytes);
+        verify_settled(&driver.fixture.a, &driver.fixture.sender);
+        verify_settled(&driver.fixture.b, &driver.fixture.receiver);
     });
 }
 
