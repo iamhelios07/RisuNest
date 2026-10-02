@@ -355,9 +355,105 @@ pub(crate) fn activate(
 }
 
 #[cfg(test)]
+pub(crate) struct NativeBindingCompletion {
+    pub activation: crate::persistent_store::RevisionResult,
+    pub activation_request: crate::persistent_store::sync_selection::ReplaceBindingRequest,
+    pub state: crate::persistent_store::sync_selection::BindingState,
+    pub staging_id: String,
+    pub receive_id: String,
+}
+#[cfg(test)]
+pub(crate) fn first_binding_cycle(
+    store: &mut PersistentStore,
+    counters: std::sync::Arc<super::client::TestIoCounters>,
+    database_activated: impl FnOnce(&crate::persistent_store::RevisionResult),
+) -> Result<NativeBindingCompletion> {
+    let root = store.repository_root().to_owned();
+    super::client::with_test_io(&root, counters, || {
+        let original = store.lww_binding_state()?;
+        if original.target != SyncTarget::None { return Err(SyncError::new("fixture-first-binding-required",409)); }
+        let inspected = inspect(store, &super::lww_tests::header(store))?;
+        if inspected.previously_bound_library { return Err(SyncError::new("fixture-first-binding-required",409)); }
+        if inspected.empty { return Err(SyncError::new("fixture-nonempty-target-required",409)); }
+        let staged = stage(store, &super::lww_tests::header(store), &inspected.inspection_id)?;
+        let next = store.switch_lww_binding(&crate::persistent_store::sync_selection::SwitchBindingRequest {
+            header: super::lww_tests::header(store),
+            expected_selection_epoch: original.selection_epoch,
+            target: SyncTarget::Server("server".into()),
+            inspection_id: Some(inspected.inspection_id),
+        })?;
+        let activation_request = crate::persistent_store::sync_selection::ReplaceBindingRequest {
+            header: Header { binding_authority: next.target_authority, request_id: staged.receive_id.clone() },
+            expected_selection_epoch: next.selection_epoch,
+            staging_id: staged.staging_id.clone(), receive_id: staged.receive_id.clone(),
+            target_id: staged.target_id, library_id: staged.library_id,
+        };
+        let activation = store.replace_lww_binding(&activation_request)?;
+        database_activated(&activation);
+        activate(store, &super::lww_tests::header(store), None)?;
+        Ok(NativeBindingCompletion { activation, activation_request, state: store.lww_binding_state()?, staging_id: staged.staging_id, receive_id: staged.receive_id })
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn hydrate_binding_bodies(
+    store: &PersistentStore,
+    counters: std::sync::Arc<super::client::TestIoCounters>,
+    selected_character_id: Option<&str>,
+    on_object_done: impl Fn(),
+) -> Result<()> {
+    if store.server_asset_policy()? != super::residency::AssetPolicy::Full { return Err(SyncError::new("fixture-full-asset-policy-required",409)); }
+    super::client::with_test_io(store.repository_root(), counters, || super::commands::hydrate_binding_assets(
+        store, &super::lww_tests::header(store), std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), selected_character_id, on_object_done,
+    ))
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::server_sync::lww_tests::{header, local, save, LocalServerFixture};
+    #[test]
+    fn fixture_first_binding_has_durable_activation_and_a_separate_real_hydration_barrier() {
+        use crate::asset_repository::{PayloadCas, body_io::{register_object_purpose,reset_body_io,take_body_io,BodyPurpose}};
+        let server = LocalServerFixture::new();
+        let (_source_root, mut source) = local(); let (target_root, mut target) = local();
+        let sender = server.client(&source);
+        save(&mut source, &["root","language"], serde_json::json!("ja"));
+        let hash = crate::server_sync::lww_tests::put_asset(&mut source, "assets/first-binding.png", &vec![91;200_000]).object_hash.unwrap();
+        crate::server_sync::lww_tests::drain_publications(&sender,&mut source,&[]).unwrap();
+        server.prepare_binding_candidate(&target);
+        let counters = std::sync::Arc::new(super::super::client::TestIoCounters::default());
+        let activated = std::cell::Cell::new(None);
+        let completion = first_binding_cycle(&mut target,counters.clone(),|receipt| activated.set(Some(receipt.revision))).unwrap();
+        assert_eq!(activated.get(),Some(completion.activation.revision));
+        let current_revision = target.revision().unwrap();
+        let replay = target.replace_lww_binding(&completion.activation_request).unwrap();
+        assert_eq!(replay.revision,completion.activation.revision);
+        assert_eq!(target.revision().unwrap(),current_revision);
+        assert!(!completion.staging_id.is_empty()); assert!(!completion.receive_id.is_empty());
+        assert!(counters.snapshot()[0] > 0);
+        assert_eq!(target.read_root(None).unwrap().value["language"],"ja");
+        let cas = PayloadCas::new(target.repository_root()).unwrap();
+        assert!(cas.stat_object(&hash).unwrap().is_none());
+        assert!(super::super::residency::Residency::open(target.repository_root()).unwrap().object(&hash,None).unwrap().is_some());
+        counters.reset();
+        hydrate_binding_bodies(&target,counters.clone(),None,||{}).unwrap();
+        assert!(cas.stat_object(&hash).unwrap().is_some()); assert!(counters.snapshot()[0]>0);
+        counters.reset(); reset_body_io(); register_object_purpose(&hash,BodyPurpose::Asset);
+        hydrate_binding_bodies(&target,counters.clone(),None,||{}).unwrap();
+        let work=take_body_io(); assert!(work.complete()); assert!(work.domains.is_empty());
+        assert_eq!(counters.snapshot(),[0;3]);
+        let bound=completion.state;
+        drop(target);
+        let mut target=PersistentStore::open(target_root.path()).unwrap();
+        assert_eq!(target.lww_binding_state().unwrap().target_authority,bound.target_authority);
+        let receiver=LocalServerFixture::reopen_client(&target,counters.clone()).unwrap();
+        assert!(std::sync::Arc::ptr_eq(receiver.client.test_io.as_ref().unwrap(),&counters));
+        save(&mut source,&["root","language"],serde_json::json!("ko"));
+        crate::server_sync::lww_tests::drain_publications(&sender,&mut source,&[]).unwrap();
+        crate::server_sync::lww_tests::receive_available(&receiver,&mut target,&[]).unwrap();
+        assert_eq!(target.read_root(None).unwrap().value["language"],"ko");
+    }
     fn configure(
         server: &LocalServerFixture,
         store: &PersistentStore,

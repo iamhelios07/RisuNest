@@ -15,6 +15,119 @@ use std::sync::{
 };
 
 #[test]
+fn present_bulk_hydration_completes_without_any_body_open_or_hash() {
+    use crate::asset_repository::body_io::{reset_body_io, take_body_io};
+    let (_root, mut store) = local();
+    let hashes = (0..3).map(|index| put_asset(&mut store, &format!("assets/present-{index}.png"), &vec![index; 100_000]).object_hash.unwrap()).collect::<Vec<_>>();
+    let mut session = super::residency::HydrationSession::new(store.repository_root(), None).unwrap();
+    reset_body_io(); crate::persistent_store::hash_work::reset_hash_work();
+    let mut completed = Vec::new();
+    assert!(session.hydrate_many_outcomes(&hashes, &|| Ok(()), |hash,outcome| completed.push((hash.to_owned(),outcome))).unwrap().is_empty());
+    let work = take_body_io(); let hashes_work = crate::persistent_store::hash_work::take_hash_work();
+    assert!(work.complete()); assert!(work.domains.is_empty());
+    assert_eq!(completed.len(), hashes.len());
+    assert!(completed.iter().all(|(_,outcome)| *outcome == super::residency::HydrationOutcome::AlreadyLocal));
+    assert!(hashes_work.domains.is_empty()); assert!(hashes_work.incomplete.is_empty());
+}
+
+#[test]
+fn selected_archive_priority_uses_native_metadata_without_reading_the_archive() {
+    use crate::asset_repository::body_io::{reset_body_io,take_body_io};
+    let (_root,mut store)=local();
+    let hash=put_asset(&mut store,"assets/archived-priority.png",b"synthetic archive priority").object_hash.unwrap();
+    store.commit(&WorkingSetCommit {
+        expected_revision:store.revision().unwrap(),
+        add_character:Some(serde_json::json!({"chaId":"archived-priority","type":"character","name":"Synthetic","image":"assets/archived-priority.png","chats":[]})),
+        ..Default::default()
+    }).unwrap();
+    store.archive_character("archived-priority",store.revision().unwrap(),1).unwrap();
+    reset_body_io(); crate::persistent_store::hash_work::reset_hash_work();
+    let hashes=store.selected_character_asset_hashes("archived-priority").unwrap();
+    let work=take_body_io(); let hashes_work=crate::persistent_store::hash_work::take_hash_work();
+    assert!(hashes.contains(&hash)); assert!(hashes.len()>1);
+    assert!(work.complete()); assert!(work.domains.is_empty()); assert!(hashes_work.domains.is_empty());
+}
+
+#[test]
+fn hydration_rejects_stale_authority_or_cancellation_before_opening_any_body() {
+    use crate::asset_repository::body_io::{reset_body_io,take_body_io};
+    let server=LocalServerFixture::new(); let (_root,mut store)=local();
+    let core=server.client(&store);
+    put_asset(&mut store,"assets/authority-hydration.png",b"synthetic authority hydration");
+    super::lww_tests::drain_publications(&core,&mut store,&[]).unwrap();
+    let _residency=Residency::open(store.repository_root()).unwrap();
+    let mut request=super::lww_tests::header(&store);
+    request.binding_authority=(request.binding_authority.0+1).into();
+    reset_body_io();
+    let result=super::commands::hydrate_binding_assets(&store,&request,Arc::new(AtomicBool::new(false)),None,||panic!("stale hydration completed"));
+    assert_eq!(result.unwrap_err().code,"binding-authority-changed");
+    let work=take_body_io(); assert!(work.complete()); assert!(work.domains.is_empty());
+    let result=super::commands::hydrate_binding_assets(&store,&super::lww_tests::header(&store),Arc::new(AtomicBool::new(true)),None,||panic!("cancelled hydration completed"));
+    assert_eq!(result.unwrap_err().code,"cancelled");
+    let work=take_body_io(); assert!(work.complete()); assert!(work.domains.is_empty());
+}
+
+#[test]
+fn selected_character_assets_finish_before_uncapped_catalog_hydration() {
+    let server = LocalServerFixture::new();
+    let (_root, mut store) = local();
+    let core = server.client(&store);
+    let hashes = (0..130).map(|index| put_asset(&mut store, &format!("assets/priority-{index}.png"), format!("synthetic priority {index}").as_bytes()).object_hash.unwrap()).collect::<Vec<_>>();
+    store.commit(&WorkingSetCommit {
+        expected_revision: store.revision().unwrap(),
+        add_character: Some(serde_json::json!({"chaId":"selected-priority","type":"character","name":"Synthetic","image":"assets/priority-129.png","additionalAssets":[["extra","assets/priority-128.png","png"]],"chats":[]})),
+        ..Default::default()
+    }).unwrap();
+    super::lww_tests::drain_publications(&core, &mut store, &[]).unwrap();
+    store.asset_residency_set_policy(super::residency::AssetPolicy::Remote, || Ok(())).unwrap();
+    store.asset_residency_evict(|| Ok(())).unwrap();
+    let cas = PayloadCas::new(store.repository_root()).unwrap();
+    assert_eq!(store.selected_character_asset_hashes("selected-priority").unwrap(), [hashes[128].clone(),hashes[129].clone()].into_iter().collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>());
+    assert!(store.selected_character_asset_hashes("missing-character").unwrap().is_empty());
+    let visits = std::cell::Cell::new(0);
+    store.hydrate_registered_remote_assets_prioritized(None, Some("selected-priority"), || Ok(()), || {
+        visits.set(visits.get()+1);
+        if visits.get() == 2 {
+            assert!(cas.stat_object(&hashes[128]).unwrap().is_some());
+            assert!(cas.stat_object(&hashes[129]).unwrap().is_some());
+            assert!(hashes[..128].iter().all(|hash| cas.stat_object(hash).unwrap().is_none()));
+        }
+    }).unwrap();
+    assert_eq!(visits.get(),130);
+    assert!(hashes.iter().all(|hash| cas.stat_object(hash).unwrap().is_some()));
+}
+
+#[test]
+fn switching_to_full_policy_hydrates_selected_references_before_other_characters() {
+    let server=LocalServerFixture::new(); let (_root,mut store)=local();
+    let core=server.client(&store);
+    let mut aliases=[
+        put_asset(&mut store,"assets/policy-first.png",b"first synthetic policy priority"),
+        put_asset(&mut store,"assets/policy-second.png",b"second synthetic policy priority"),
+    ];
+    aliases.sort_by(|a,b| a.object_hash.cmp(&b.object_hash));
+    for (character,alias) in [("policy-other",&aliases[0]),("policy-selected",&aliases[1])] {
+        store.commit(&WorkingSetCommit {
+            expected_revision:store.revision().unwrap(),
+            add_character:Some(serde_json::json!({"chaId":character,"type":"character","name":"Synthetic","image":alias.key,"chats":[]})),
+            ..Default::default()
+        }).unwrap();
+    }
+    super::lww_tests::drain_publications(&core,&mut store,&[]).unwrap();
+    store.asset_residency_set_policy(super::residency::AssetPolicy::Remote,||Ok(())).unwrap();
+    store.asset_residency_evict(||Ok(())).unwrap();
+    let cas=PayloadCas::new(store.repository_root()).unwrap();
+    let selected=aliases[1].object_hash.as_ref().unwrap(); let other=aliases[0].object_hash.as_ref().unwrap();
+    assert!(cas.stat_object(selected).unwrap().is_none()); assert!(cas.stat_object(other).unwrap().is_none());
+    let prioritized=std::cell::Cell::new(false);
+    store.asset_residency_set_policy_prioritized(super::residency::AssetPolicy::Full,None,Some("policy-selected"),||{
+        if cas.stat_object(selected)?.is_some() && cas.stat_object(other)?.is_none() { prioritized.set(true); }
+        Ok(())
+    }).unwrap();
+    assert!(prioritized.get()); assert!(cas.stat_object(selected).unwrap().is_some()); assert!(cas.stat_object(other).unwrap().is_some());
+}
+
+#[test]
 fn cancelled_full_hydration_keeps_remote_proof_and_retries_without_a_partial_body() {
     let cancelled = Arc::new(AtomicBool::new(false));
     let armed = Arc::new(AtomicBool::new(false));
@@ -96,7 +209,7 @@ fn transient_hydration_keeps_the_body_remote_and_reclaims_its_spool() {
         .unwrap();
     store.asset_residency_evict(|| Ok(())).unwrap();
     let cas = PayloadCas::new(store.repository_root()).unwrap();
-    let mut body = super::residency::open_transient_with_check(
+    let mut body = super::residency::open_transient_server_with_check(
         store.repository_root(),
         store.repository_root(),
         &hash,
@@ -108,6 +221,7 @@ fn transient_hydration_keeps_the_body_remote_and_reclaims_its_spool() {
     std::io::Read::read_to_end(&mut body, &mut actual).unwrap();
     assert_eq!(actual, bytes);
     assert!(cas.stat_object(&hash).unwrap().is_none());
+    assert!(Residency::open(store.repository_root()).unwrap().object(&hash,None).unwrap().is_some());
     drop(body);
     assert!(!std::fs::read_dir(store.repository_root())
         .unwrap()
@@ -116,6 +230,16 @@ fn transient_hydration_keeps_the_body_remote_and_reclaims_its_spool() {
             .file_name()
             .to_string_lossy()
             .starts_with("asset-transient-")));
+}
+
+#[test]
+fn server_only_transient_source_does_not_hydrate_without_server_custody() {
+    let (_root,store)=local();
+    let scratch=tempfile::tempdir().unwrap();
+    let hash="a".repeat(64);
+    assert!(super::residency::open_transient_server_with_check(store.repository_root(),scratch.path(),&hash,&||Ok(())).unwrap().is_none());
+    assert!(PayloadCas::new(store.repository_root()).unwrap().stat_object(&hash).unwrap().is_none());
+    assert!(std::fs::read_dir(scratch.path()).unwrap().next().is_none());
 }
 
 #[test]

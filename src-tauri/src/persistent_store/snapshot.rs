@@ -816,7 +816,7 @@ fn collect_character_asset_hashes_inner(
 
 /// String leaves of the character detail are the only place an alias logical key
 /// can appear without a recognizable prefix, so they are looked up directly.
-fn collect_alias_key_candidates(
+pub(super) fn collect_alias_key_candidates(
     connection: &Connection,
     generation: &str,
     character_id: &str,
@@ -1020,7 +1020,7 @@ fn scan_text_column<P: rusqlite::Params>(
     Ok(())
 }
 
-fn observe_json_value(
+pub(super) fn observe_json_value(
     value: &serde_json::Value,
     parent_key: Option<&str>,
     roots: &mut AssetRootSet,

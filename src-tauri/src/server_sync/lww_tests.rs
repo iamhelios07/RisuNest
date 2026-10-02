@@ -76,6 +76,17 @@ impl LocalServerFixture {
             super::credentials::StoredConfig::persist(store.repository_root(), &config).unwrap();
         (config, stored)
     }
+    pub(crate) fn prepare_binding_candidate(&self, store: &PersistentStore) {
+        let (_, stored) = self.candidate(store);
+        OperationLog::open(store.repository_root()).unwrap().save_config("candidate", &stored).unwrap();
+    }
+    pub(crate) fn reopen_client(store: &PersistentStore, counters: Arc<super::client::TestIoCounters>) -> super::Result<LwwClient> {
+        let stored = store.server_stored_config()?.ok_or_else(|| super::SyncError::new("server-unconfigured",409))?;
+        let mut client = LwwClient::new(store.repository_root(), stored.resolve(store.repository_root())?)?;
+        client.access = Some(stored);
+        client.client.test_io = Some(counters);
+        Ok(client)
+    }
 }
 impl Drop for LocalServerFixture {
     fn drop(&mut self) {
