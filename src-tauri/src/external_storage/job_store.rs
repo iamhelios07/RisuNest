@@ -222,6 +222,7 @@ impl JobStore {
         db.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=FULL;
+             PRAGMA foreign_keys=ON;
              CREATE TABLE IF NOT EXISTS external_requests(
                  id TEXT PRIMARY KEY,
                  connection_id TEXT NOT NULL,
@@ -258,10 +259,64 @@ impl JobStore {
              CREATE TABLE IF NOT EXISTS external_receive_cleanup(
                  connection_id TEXT PRIMARY KEY,
                  after_rowid INTEGER NOT NULL CHECK(after_rowid>=0)
+             );
+             CREATE TABLE IF NOT EXISTS external_restore_bodies(
+                 job_id TEXT NOT NULL REFERENCES external_requests(id) ON DELETE CASCADE,
+                 hash TEXT NOT NULL,
+                 source TEXT NOT NULL,
+                 present INTEGER NOT NULL CHECK(present IN (0,1)),
+                 settled INTEGER NOT NULL CHECK(settled IN (0,1)),
+                 PRIMARY KEY(job_id,hash)
              );",
         )
         .map_err(failure)?;
         Ok(Self(db))
+    }
+    pub(crate) fn freeze_restore_bodies(&self,job:&DurableJob,sources:&[super::lww_residency::PackedSource],present:&std::collections::BTreeSet<String>) -> Result<()> {
+        let tx=self.0.unchecked_transaction().map_err(failure)?;
+        let mut current=self.read(&job.id)?;
+        let ready=current.summary["restoreBodiesReady"]==true;
+        let mut seen=std::collections::BTreeSet::new();
+        for source in sources {
+            if !seen.insert(source.hash.clone()) {return Err(ProviderError::new(ErrorKind::Corrupt));}
+            let encoded=serde_json::to_string(source).map_err(failure)?;
+            let is_present=present.contains(&source.hash);
+            let previous:Option<(String,bool)>=tx.query_row("SELECT source,present FROM external_restore_bodies WHERE job_id=?1 AND hash=?2",rusqlite::params![job.id,source.hash],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(failure)?;
+            if let Some(previous)=previous {
+                if previous.0!=encoded {return Err(ProviderError::new(ErrorKind::Corrupt));}
+            } else {
+                if ready {return Err(ProviderError::new(ErrorKind::Corrupt));}
+                tx.execute("INSERT INTO external_restore_bodies VALUES(?1,?2,?3,?4,?4)",rusqlite::params![job.id,source.hash,encoded,is_present]).map_err(failure)?;
+            }
+        }
+        let count:i64=tx.query_row("SELECT count(*) FROM external_restore_bodies WHERE job_id=?1",[&job.id],|row|row.get(0)).map_err(failure)?;
+        if count as usize!=sources.len() || present.iter().any(|hash|!seen.contains(hash)) {
+            return Err(ProviderError::new(ErrorKind::Corrupt));
+        }
+        current.summary["restoreBodiesReady"]=json!(true);
+        tx.execute("UPDATE external_requests SET value=?2 WHERE id=?1",rusqlite::params![job.id,serde_json::to_string(&current).map_err(failure)?]).map_err(failure)?;
+        tx.commit().map_err(failure)
+    }
+    pub(crate) fn restore_body_page(&self,job:&str,after:&str)->Result<Vec<super::lww_residency::PackedSource>> {
+        if self.read(job)?.summary["restoreBodiesReady"]!=true {return Err(ProviderError::new(ErrorKind::Corrupt));}
+        let mut statement=self.0.prepare("SELECT source FROM external_restore_bodies WHERE job_id=?1 AND hash>?2 AND settled=0 ORDER BY hash LIMIT 128").map_err(failure)?;
+        let rows=statement.query_map(rusqlite::params![job,after],|row|row.get::<_,String>(0)).map_err(failure)?;
+        rows.map(|row|serde_json::from_str(&row.map_err(failure)?).map_err(failure)).collect()
+    }
+    pub(crate) fn restore_body(&self,job:&str,hash:&str)->Result<Option<super::lww_residency::PackedSource>> {
+        let source:Option<String>=self.0.query_row("SELECT source FROM external_restore_bodies WHERE job_id=?1 AND hash=?2 AND settled=0",rusqlite::params![job,hash],|row|row.get(0)).optional().map_err(failure)?;
+        source.map(|value|serde_json::from_str(&value).map_err(failure)).transpose()
+    }
+    pub(crate) fn settle_restore_body(&self,job:&str,hash:&str)->Result<()> {
+        if self.0.execute("UPDATE external_restore_bodies SET settled=1 WHERE job_id=?1 AND hash=?2",rusqlite::params![job,hash]).map_err(failure)?!=1 {
+            return Err(ProviderError::new(ErrorKind::Corrupt));
+        }
+        Ok(())
+    }
+    pub(crate) fn restore_bodies_settled(&self,job:&str)->Result<bool> {
+        if self.read(job)?.summary["restoreBodiesReady"]!=true {return Ok(false);}
+        let pending:bool=self.0.query_row("SELECT EXISTS(SELECT 1 FROM external_restore_bodies WHERE job_id=?1 AND settled=0)",[job],|row|row.get(0)).map_err(failure)?;
+        Ok(!pending)
     }
     pub fn put(&self, job: &DurableJob) -> Result<()> {
         let encoded = serde_json::to_string(job).map_err(failure)?;

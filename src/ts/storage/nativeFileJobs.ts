@@ -424,6 +424,7 @@ export interface NativeFileJobStatus {
     expectedRevision?: number
     activationRevision?: number
     activationAuthority?: string
+    restoreAdoptionConfirmed?: boolean
     snapshotStagingId?: string
     snapshotBodies?: NativeSnapshotBodyResult
     deviceSessionId?: string
@@ -614,6 +615,7 @@ export interface NativeFileRestoreJobOptions extends NativeFileJobOptions {
     ): Promise<NativeStagedPluginChoice | null>
     afterRefresh?(pluginsAlreadyRestarted?: boolean): void | Promise<void>
     onBlockingChange?(blocking: boolean): void
+    afterPortableAdoption?(status: NativeFileJobStatus): Promise<void>
 }
 
 export interface NativeFileExportJobOptions extends NativeFileJobOptions {
@@ -1613,6 +1615,7 @@ async function runNativeReplacementRestore(
                 portableAdoptedRevision = status.activationRevision
                 replacementFence = undefined
                 await upstreamBinding!.resume()
+                await options.afterPortableAdoption?.(status)
                 uiBlocking = false
                 options.onBlockingChange?.(false)
                 terminal = undefined
@@ -1737,6 +1740,7 @@ async function runNativeReplacementRestore(
             registerCommittedWorkingSetContinuation(minimumRevision, runtime, runtime.getStorageAuthorityEpoch(), async () => {
                 await upstreamBinding!.assertAuthority()
                 await upstreamBinding!.resume()
+                if (kind==='restore-portable-backup' && terminal) await options.afterPortableAdoption?.(terminal)
                 try { await options.afterRefresh?.(upstreamPause ? true : undefined) } catch {}
                 try { await invokeNative(dependencies, 'native_file_job_forget', {jobId: started.jobId}) } catch {}
             }, undefined, true)

@@ -23,6 +23,7 @@ const mocks = vi.hoisted(() => ({
         getJob: vi.fn(),
         cancelJob: vi.fn(),
         applyReceived: vi.fn(),
+        confirmRestoreAdoption: vi.fn(async () => {}),
         openConflictSource: vi.fn(),
         releaseConflictSource: vi.fn(),
     },
@@ -37,6 +38,11 @@ const mocks = vi.hoisted(() => ({
     })),
     releaseFence: vi.fn(),
     reloadPlugins: vi.fn(async () => {}),
+    fencePlugins: vi.fn(async () => {}),
+    bindingFence: vi.fn(async () => {}),
+    bindingAssert: vi.fn(async () => {}),
+    bindingResume: vi.fn(async () => {}),
+    completeGuard: vi.fn(),
     pendingContinuation: undefined as undefined | (() => void | Promise<void>),
     registerContinuation: vi.fn(),
 }))
@@ -61,6 +67,8 @@ vi.mock('../../../mobileBackgroundTask', async original => {
 })
 
 vi.mock('../../../platform', () => ({ isTauri: false, isTauriAndroid: false, isTauriIOS: false, get isTauriDesktop() { return mocks.desktop } }))
+vi.mock('../../../stores.svelte', async () => ({ selectedCharID: (await import('svelte/store')).writable(-1) }))
+vi.mock('../../database.svelte', () => ({ getDatabase: () => ({ characters: [] }) }))
 vi.mock('../../deviceStateRestore', () => ({ flushDeviceStateBeforeRestore: vi.fn(), refreshDeviceStateAfterRestore: vi.fn() }))
 
 vi.mock('./bridge', () => ({
@@ -83,6 +91,16 @@ vi.mock('../../persistentDataRuntime.svelte', () => ({
 }))
 vi.mock('../../../plugins/plugins.svelte', () => ({
     loadPluginsAfterAuthoritativeRestore: mocks.reloadPlugins,
+}))
+vi.mock('../../../plugins/apiV3/v3.svelte', () => ({
+    fencePluginExecutionForAuthorityReplacement: mocks.fencePlugins,
+    invalidatePluginCachesAfterAuthorityReplacement: vi.fn(async () => {}),
+    restartPluginsAfterAuthorityReplacement: mocks.reloadPlugins,
+}))
+vi.mock('../bindingRegistry', () => ({
+    prepareBoundLibraryReplacement: vi.fn(async () => ({
+        fence: mocks.bindingFence, assertAuthority: mocks.bindingAssert, resume: mocks.bindingResume,
+    })),
 }))
 vi.mock('../../committedWorkingSetContinuation', () => ({
     registerCommittedWorkingSetContinuation: (
@@ -157,7 +175,81 @@ function succeeded(connectionId: string, revision: string): ExternalJobSummary {
     }
 }
 
+async function installActualRestorePause() {
+    const { createPersistentDataRuntime, capturePersistentRoot } = await import('../../persistentDataRuntime')
+    const { makeDatabase } = await import('../../saveCoordinator.testSupport')
+    const database = makeDatabase()
+    database.characters = []
+    let actual: ReturnType<typeof createPersistentDataRuntime>
+    Object.assign(mocks.persistentRuntime, {
+        async withPausedPersistentWrites(reason: string, operation: (token: unknown) => Promise<unknown>) {
+            const store = {
+                open: async () => undefined,
+                readRoot: async () => ({ revision: mocks.revision, value: capturePersistentRoot(database) }),
+                acquireRevision: async (revision: number) => ({
+                    revision, readRoot: async () => ({ revision, value: capturePersistentRoot(database) }),
+                    queryPresets: async () => ({ revision, items: [] }),
+                    queryCharacters: async () => ({ revision, items: [] }),
+                    queryPluginStorage: async () => ({ revision, items: [] }),
+                    release: async () => {},
+                }),
+            } as unknown as import('../../persistentDataStore').PersistentDataStore
+            actual = createPersistentDataRuntime({
+                store, state: {
+                    captureRoot: () => capturePersistentRoot(database), captureSelectedCharacter: () => null,
+                    captureCharacter: () => null,
+                    getSelectedCharacterId: () => undefined, getSelectedConversationId: () => null,
+                    replaceDatabase: () => {}, publishCharacter: () => {}, publishConversation: () => {},
+                }, prepareDatabase: async value => value,
+                clock: { setTimeout: () => 1, clearTimeout: () => {} },
+            })
+            await actual.initializeActiveWorkingSet(database)
+            return actual.withPausedPersistentWrites(reason, operation).finally(() => mocks.releaseFence())
+        },
+        beginActivatedLibraryGuard(token: import('../../saveCoordinator').PersistentMutationToken) {
+            const guard = actual.beginActivatedLibraryGuard(token)
+            return { ...guard, complete() { guard.complete(); mocks.completeGuard() } }
+        },
+        async refreshActivatedLibraryUnderPause(token: import('../../saveCoordinator').PersistentMutationToken) {
+            const revision = token.revision + 1
+            const outcome = await mocks.refreshWorkingSet(revision)
+            if (outcome.projection !== 'applied') return outcome
+            mocks.revision = revision
+            return actual.refreshActivatedLibraryUnderPause(token)
+        },
+    })
+}
+
 describe('external storage production integration', () => {
+    it.each(['adoption', 'settled'] as const)('retries a committed restore after one %s failure without completing its actual guard twice', async failure => {
+        const production = await import('./production')
+        await production.installExternalStorageProduction()
+        mocks.bridge.startJob.mockImplementation(async (_request, id) => ({
+            ...succeeded('old-sync', '8'), id, kind: 'restore', applicationStarted: true,
+            result: { receivedRevision: '9' },
+        }))
+        if (failure === 'adoption') mocks.bridge.confirmRestoreAdoption.mockRejectedValueOnce(new Error('Lost adoption response'))
+        else mocks.bindingResume.mockRejectedValueOnce(new Error('Adapter resume failed'))
+        await expect(production.requestExternalStorageRestore('old-sync', 'snapshot', ['library'])).rejects.toThrow()
+        expect(mocks.completeGuard).toHaveBeenCalledTimes(failure === 'adoption' ? 0 : 1)
+        await (await import('./applicationRecovery')).retryExternalApplication()
+        expect(mocks.completeGuard).toHaveBeenCalledOnce()
+        expect(mocks.reloadPlugins).toHaveBeenCalledOnce()
+        expect(mocks.bridge.startJob).toHaveBeenCalledOnce()
+        expect((await import('./applicationRecovery')).hasPendingExternalApplication()).toBe(false)
+    })
+
+    it('restores the original plugins and binding after proven unchanged pause admission failure', async () => {
+        const production = await import('./production')
+        await production.installExternalStorageProduction()
+        Object.assign(mocks.persistentRuntime, { withPausedPersistentWrites: async () => { throw new Error('Pause unavailable') } })
+        await expect(production.requestExternalStorageRestore('old-sync', 'snapshot', ['library'])).rejects.toThrow('Pause unavailable')
+        expect(mocks.bindingAssert).toHaveBeenCalledOnce()
+        expect(mocks.reloadPlugins).toHaveBeenCalledOnce()
+        expect(mocks.bindingResume).toHaveBeenCalledOnce()
+        expect(mocks.bridge.startJob).not.toHaveBeenCalled()
+    })
+
     it('keeps desktop work alive when the window becomes hidden', async () => {
         mocks.desktop = true
         const { installExternalStorageProduction } = await import('./production')
@@ -216,7 +308,7 @@ describe('external storage production integration', () => {
                 return ++starts === 1 ? {
                     ...succeeded('old-sync', '8'), id, kind: 'restore', state: 'waiting', phase: 'paused',
                     error: { code: 'transient', message: 'Retry', action: 'retry', retryable: true },
-                } : { ...succeeded('old-sync', '8'), id, kind: 'restore', result: { receivedRevision: '9' } }
+                } : { ...succeeded('old-sync', '8'), id, kind: 'restore', applicationStarted: true, result: { receivedRevision: '9' } }
             })
             const operation = requestExternalStorageRestore('old-sync', 'snapshot', ['library'])
             await vi.advanceTimersByTimeAsync(5_100)
@@ -271,6 +363,13 @@ describe('external storage production integration', () => {
         mocks.releaseFence.mockReset()
         mocks.flush.mockReset().mockResolvedValue(undefined)
         mocks.reloadPlugins.mockReset().mockResolvedValue(undefined)
+        mocks.fencePlugins.mockReset().mockResolvedValue(undefined)
+        mocks.bindingFence.mockReset().mockResolvedValue(undefined)
+        mocks.bindingAssert.mockReset().mockResolvedValue(undefined)
+        mocks.bindingResume.mockReset().mockResolvedValue(undefined)
+        mocks.completeGuard.mockReset()
+        mocks.bridge.confirmRestoreAdoption.mockReset().mockResolvedValue(undefined)
+        await installActualRestorePause()
         mocks.refreshWorkingSet.mockReset().mockImplementation(async revision => ({
             kind: 'committed', revision, projection: 'applied',
         }))
@@ -279,6 +378,7 @@ describe('external storage production integration', () => {
         }))
         mocks.bridge.cancelJob.mockReset().mockImplementation(async id => ({ ...succeeded('old-sync', '8'), id, state: 'cancelled' }))
         mocks.bridge.getJob.mockReset()
+        mocks.bridge.getJob.mockImplementation(async id => (await mocks.bridge.getState()).jobs.find((job: ExternalJobSummary) => job.id === id))
         mocks.bridge.applyReceived.mockReset()
         mocks.pendingContinuation = undefined
         mocks.restoreConflictSource.mockImplementation(async (source) => {
@@ -431,7 +531,7 @@ describe('external storage production integration', () => {
         expect(mocks.refreshWorkingSet).not.toHaveBeenCalled()
     })
 
-    it('releases the replacement fence before authoritative restore plugin reload', async () => {
+    it('retains the replacement fence through authoritative restore plugin reload and adoption', async () => {
         const {
             installExternalStorageProduction,
             requestExternalStorageRestore,
@@ -441,6 +541,7 @@ describe('external storage production integration', () => {
         mocks.bridge.startJob.mockImplementation(async (_request, id) => ({
             ...succeeded('old-sync', '23'), id,
             kind: 'restore',
+            applicationStarted: true,
             result: { snapshotId: 'snapshot-1', receivedRevision: '24' },
         }))
         const events: string[] = []
@@ -458,7 +559,7 @@ describe('external storage production integration', () => {
         expect(mocks.refreshWorkingSet).toHaveBeenCalledWith(24)
         expect(mocks.reloadPlugins).toHaveBeenCalledOnce()
         expect(mocks.releaseFence).toHaveBeenCalledOnce()
-        expect(events).toEqual(['fence-released', 'plugins-reloaded'])
+        expect(events).toEqual(['plugins-reloaded', 'fence-released'])
     })
 
     it('continues a committed restore once after read-only recovery without reactivation', async () => {
@@ -471,6 +572,7 @@ describe('external storage production integration', () => {
         mocks.bridge.startJob.mockImplementation(async (_request, id) => ({
             ...succeeded('old-sync', '23'), id,
             kind: 'restore',
+            applicationStarted: true,
             result: { snapshotId: 'snapshot-1', receivedRevision: '24' },
         }))
         mocks.refreshWorkingSet.mockResolvedValueOnce({
@@ -483,14 +585,14 @@ describe('external storage production integration', () => {
             ['library'],
         )).rejects.toBeInstanceOf(Error)
 
-        expect(mocks.releaseFence).toHaveBeenCalledOnce()
+        expect(mocks.releaseFence).not.toHaveBeenCalled()
         expect(mocks.reloadPlugins).not.toHaveBeenCalled()
         expect(mocks.bridge.startJob).toHaveBeenCalledOnce()
         await (await import('./applicationRecovery')).retryExternalApplication()
-        expect(mocks.refreshReleased).toHaveBeenCalledWith(24)
+        expect(mocks.refreshReleased).not.toHaveBeenCalled()
         expect(mocks.reloadPlugins).toHaveBeenCalledOnce()
         expect(mocks.bridge.startJob).toHaveBeenCalledOnce()
-        expect(mocks.refreshWorkingSet).toHaveBeenCalledOnce()
+        expect(mocks.refreshWorkingSet).toHaveBeenCalledTimes(2)
     })
 
 })

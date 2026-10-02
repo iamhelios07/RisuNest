@@ -320,6 +320,18 @@ describe('native persistent maintenance', () => {
         await expect(completeNativeSnapshotRestoreBodies('stage',8,'0')).resolves.toMatchObject({allBodiesLocal:true})
         expect(mocks.invoke.mock.calls.filter(([command])=>command==='pds_snapshot_restore_activate')).toHaveLength(1)
     })
+    it('keeps the committed snapshot identity after a lost body-start response', async () => {
+        mocks.invoke.mockResolvedValueOnce({stagingId:'stage'}).mockResolvedValueOnce({revision:8}).mockRejectedValueOnce(new Error('start response lost'))
+        await expect(requestNativePersistentSnapshotRestore('snapshot')).rejects.toMatchObject({
+            name:'NativeSnapshotBodiesCommittedError',code:'snapshot-body-start-unknown',
+            receipt:{stagingId:'stage',activationRevision:'8',bindingAuthority:'0'},
+        })
+        expect(mocks.continuation).not.toHaveBeenCalled()
+        expect(mocks.invoke.mock.calls.some(([command])=>command==='pds_snapshot_restore_abort')).toBe(false)
+        mocks.invoke.mockImplementation(async command=>command==='native_snapshot_restore_bodies_start'?bodyReceipt:bodyStatus)
+        await expect(completeNativeSnapshotRestoreBodies('stage',8,'0')).resolves.toMatchObject({allBodiesLocal:true})
+        expect(mocks.invoke.mock.calls.filter(([command])=>command==='pds_snapshot_restore_activate')).toHaveLength(1)
+    })
     it('does not restart when snapshot staging fails', async () => {
         const requestError = new Error('stage failed')
         const restart = vi.fn()

@@ -396,6 +396,32 @@ impl DeviceBackupState {
         session_for(self.lock()?.connection.as_ref().unwrap(), id)
     }
 
+    pub(crate) fn verify_portable_adoption_complete(&self,id:&str,job:&str,revision:&str,authority:&str)->Result<()> {
+        let inner=self.lock()?;
+        let connection=inner.connection.as_ref().unwrap();
+        let session=session_for(connection,id)?;
+        require(session.job_id==job && session.includes_library && native_section_session(&session),"Portable adoption session identity differs")?;
+        let active:bool=connection.query_row("SELECT active FROM sessions WHERE id=?1",[id],|row|row.get(0))?;
+        require(!active && session.phase=="committed","Portable device recovery has not completed")?;
+        verify_completions(connection,id,Spool::Source)?;
+        let encoded:String=connection.query_row("SELECT header FROM replacements WHERE session=?1",[id],|row|row.get(0))?;
+        let header:crate::persistent_store::lww::Header=serde_json::from_str(&encoded).map_err(|_|error("device-metadata-invalid","Replacement header is invalid"))?;
+        require(header.request_id==job && header.binding_authority.0.to_string()==authority,"Portable adoption authority differs")?;
+        let stage=session.stage_id.as_deref().ok_or_else(||error("device-metadata-invalid","Replacement staging identity is missing"))?;
+        let persistent=self.repository_root.join("persistent");
+        let library=Connection::open_with_flags(persistent.join(crate::persistent_store::DATABASE_FILE),OpenFlags::SQLITE_OPEN_READ_ONLY|OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+        let device=Connection::open_with_flags(persistent.join(crate::persistent_store::device_store::DEVICE_DATABASE_FILE),OpenFlags::SQLITE_OPEN_READ_ONLY|OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+        library.execute_batch("PRAGMA trusted_schema=OFF; PRAGMA query_only=ON;")?;
+        device.execute_batch("PRAGMA trusted_schema=OFF; PRAGMA query_only=ON;")?;
+        let generation:String=library.query_row("SELECT value FROM meta WHERE key='activeGeneration'",[],|row|row.get(0))?;
+        let generation:String=serde_json::from_str(&generation).map_err(|_|error("device-metadata-invalid","Active library identity is invalid"))?;
+        let current_authority:String=device.query_row("SELECT binding_authority FROM lww_clock WHERE singleton=1",[],|row|row.get(0))?;
+        require(current_authority==authority,"Portable activated library authority has changed")?;
+        let receipt=crate::persistent_store::lww::completed_device_replacement_receipt(&library,&device,&header,stage)
+            .map_err(|failure|error("device-receipt-invalid",&failure.to_string()))?;
+        require(receipt.is_some_and(|receipt|receipt.revision.to_string()==revision && generation==format!("revision-{}",receipt.revision)),"Portable adoption activation identity differs")
+    }
+
     /// Native-only: source section and binary import has fully completed.
     pub(crate) fn source_ready(&self, id: &str) -> Result<()> {
         let mut inner = self.lock()?;
