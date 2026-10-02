@@ -2220,6 +2220,7 @@ impl NativeFileJobState {
                         let prepared = crate::persistent_store::commands::with_store_mut(app.state(), |store| {
                             store.prepare_risu_save_export(expected_revision)
                         }).map_err(native_store_error)?;
+                        job.publish_export_capture(expected_revision).map_err(|message| NativeJobError::new("store-error", message))?;
                         export::export_block_risu_save(prepared, &destination, omit_account, account.as_ref(), &job)
                     }),
                     NativeFileJobTask::RestoreOfficialSnapshot {
@@ -3657,6 +3658,8 @@ pub(crate) struct JobStatus {
     pub(crate) detail: Option<JobDetail>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) expected_revision: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) export_capture_revision: Option<i64>,
     pub(crate) activation_revision: Option<i64>,
     pub(crate) activation_authority: Option<String>,
     pub(crate) restore_adoption_confirmed: bool,
@@ -3860,6 +3863,7 @@ impl JobRegistry {
                 progress: JobProgress::default(),
                 detail: None,
                 expected_revision,
+                export_capture_revision: None,
                 activation_revision: None,
                 activation_authority: None,
                 restore_adoption_confirmed: false,
@@ -4006,6 +4010,16 @@ pub(crate) struct JobControl {
 }
 
 impl JobControl {
+    pub(crate) fn publish_export_capture(&self, revision: i64) -> Result<(), String> {
+        let mut status = self.status.lock().map_err(|_| "native job mutex poisoned".to_owned())?;
+        if !matches!(status.kind, JobKind::ExportBlockRisuSave | JobKind::ExportPortableBackup)
+            || status.state.is_terminal() || status.expected_revision != Some(revision)
+            || status.export_capture_revision.is_some_and(|previous| previous != revision) {
+            return Err("native export capture receipt differs".into());
+        }
+        status.export_capture_revision = Some(revision);
+        Ok(())
+    }
     pub(crate) fn set_incomplete_restore_preview(&self, preview: IncompleteRestorePreview) -> Result<(), String> {
         let mut status = self.status.lock().map_err(|_| "native job mutex poisoned".to_owned())?;
         status.incomplete_restore_preview = if preview.warning_codes().is_empty() { None } else { Some(preview) };
