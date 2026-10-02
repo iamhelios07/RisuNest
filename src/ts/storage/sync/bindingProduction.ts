@@ -6,7 +6,7 @@ import { registerCommittedWorkingSetContinuation } from '../committedWorkingSetC
 import { confirmSyncBindingReplacement } from './bindingDialog'
 import { hasLocalBindingData, hasLocalSharedBindingData } from './bindingLocalData'
 import { createNativeSyncBindingBridge } from './bindingNative'
-import { registerSyncBindingFlow } from './bindingRegistry'
+import { getSyncBindingTransport, registerSyncBindingFlow } from './bindingRegistry'
 
 export function createSyncBindingRecoveryRegistration(
     getRuntime: () => PersistentDataRuntime,
@@ -34,6 +34,7 @@ export function installSyncBindingFlow(dependencies: {
     const flow = createSyncBindingFlow({
         ...dependencies,
         native: dependencies.native ?? createNativeSyncBindingBridge(),
+        resolveTransport: getSyncBindingTransport,
         gate: createStorageMutationGate(),
         hasNonDefaultData: hasLocalBindingData,
         hasNonDefaultSharedData: hasLocalSharedBindingData,

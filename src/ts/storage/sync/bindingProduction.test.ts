@@ -8,7 +8,46 @@ import type { PersistentMutationToken } from '../saveCoordinator'
 import { makeDatabase } from '../saveCoordinator.testSupport'
 import { createStorageMutationGate, createInRealmStorageLockManager } from '../storageMutationGate'
 import { createSyncBindingFlow, type SyncBindingDependencies, type SyncBindingState, type SyncBindingTransport } from './bindingFlow'
-import { createSyncBindingRecoveryRegistration } from './bindingProduction'
+import { createSyncBindingRecoveryRegistration, installSyncBindingFlow } from './bindingProduction'
+import { registerSyncBindingTransport, resumeCurrentSyncBinding, bindSyncTarget, unbindSyncTarget } from './bindingRegistry'
+
+it.each(['server', 'external'] as const)('composes persisted %s startup ownership through the actual installer and registry before switch and unbind', async kind => {
+    let state: SyncBindingState = { target: { kind, connectionId: 'persisted' }, targetAuthority: '4', selectionEpoch: 'persisted', libraryId: 'library', progress: null }
+    const oldTarget = state.target as Exclude<SyncBindingState['target'], { kind: 'none' }>
+    const incoming = { kind: kind === 'server' ? 'external' as const : 'server' as const, connectionId: 'incoming' }
+    const adapter = () => ({
+        inspectTarget: vi.fn(async () => ({ inspectionId: 'inspection', targetId: 'target', libraryId: 'library', empty: false, previouslyBoundLibrary: true })),
+        pullAvailableState: vi.fn(), replaceFromTarget: vi.fn(), publishInitialSharedState: vi.fn(),
+        resumeBinding: vi.fn<SyncBindingTransport['resumeBinding']>(async () => {}), fenceOldJobs: vi.fn<SyncBindingTransport['fenceOldJobs']>(async () => {}),
+    })
+    const old = adapter(), next = adapter()
+    const releaseOld = registerSyncBindingTransport(oldTarget, old), releaseNext = registerSyncBindingTransport(incoming, next)
+    const switchTarget = vi.fn<SyncBindingDependencies['native']['switchTarget']>(async (_expected, target) => {
+        state = { ...state, target, targetAuthority: String(Number(state.targetAuthority) + 1) }; return state
+    })
+    const installed = installSyncBindingFlow({
+        native: { state: async () => structuredClone(state), assertAuthority: async expected => { expect(expected.targetAuthority).toBe(state.targetAuthority) }, switchTarget },
+        plugins: { fenceExecution: async () => {}, invalidateCaches: async () => {}, restart: async () => {} },
+        withPausedWrites: operation => operation(), beginActivatedLibraryGuard: () => ({ complete() {}, async abortUnchanged() {} }),
+        refreshActivatedLibrary: async () => {}, recovery: { setLifecycle() {}, registerFailure() {} },
+    })
+    try {
+        await resumeCurrentSyncBinding(oldTarget)
+        expect(old.resumeBinding).toHaveBeenCalledOnce()
+        const signal = old.resumeBinding.mock.calls[0][0].signal
+        let finish!: () => void
+        old.fenceOldJobs.mockImplementationOnce(async context => { expect(context.signal).toBe(signal); expect(signal.aborted).toBe(true); await new Promise<void>(resolve => { finish = resolve }) })
+        const switched = bindSyncTarget(incoming)
+        for (let i = 0; i < 20; i++) await Promise.resolve()
+        expect(old.fenceOldJobs).toHaveBeenCalledOnce(); expect(switchTarget).not.toHaveBeenCalled()
+        finish(); await switched
+        expect(next.fenceOldJobs).not.toHaveBeenCalled(); expect(next.resumeBinding).toHaveBeenCalledOnce()
+        const nextSignal = next.resumeBinding.mock.calls[0][0].signal
+        await unbindSyncTarget()
+        expect(nextSignal.aborted).toBe(true); expect(next.fenceOldJobs).toHaveBeenCalledOnce()
+        expect(state.target).toEqual({ kind: 'none' })
+    } finally { installed.dispose(); releaseOld(); releaseNext() }
+})
 
 async function harness() {
     let database = makeDatabase()
