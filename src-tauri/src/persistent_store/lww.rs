@@ -2622,7 +2622,7 @@ pub(super) fn ensure_publishable_parents(
     let p = key.components();
     if p[0] == "root" && matches!(p[1].as_str(), "botPresetsId" | "selectedPersona") {
         if let Some((_, value)) = read_unit(db, key)? {
-            if let Some(id) = json_value(&value)?.and_then(|v| v.as_str().map(str::to_owned)) {
+            if let Some(id) = json_value(&value)?.and_then(|v| v.as_str().filter(|id| !id.is_empty()).map(str::to_owned)) {
                 initialize_owner(
                     db,
                     if p[1] == "botPresetsId" {
