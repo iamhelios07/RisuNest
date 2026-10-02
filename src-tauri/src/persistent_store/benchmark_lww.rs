@@ -10,7 +10,7 @@ use super::{lww::{self, MessageLocator, UnitMutation}, sync_selection::{SwitchBi
 use crate::{external_storage::{contract::Cancellation, lww_tests::CycleFixture, lww_segment},
     server_sync::{self, lww_client::LwwClient, lww_tests::LocalServerFixture}};
 use fixture::{FixtureReceipt, FixtureScale};
-use native_observation::{BodyDomain, NativeObservation};
+use native_observation::{BodyDomain, NativeObservation, ObjectBodyDomain};
 use risunest_sync_wire::unit::UnitKey;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -94,8 +94,32 @@ fn bind(store: &mut PersistentStore, target: SyncTarget, target_id: &str, librar
     }).unwrap();
 }
 
-fn reset_work() {
+fn fixture_asset_inventory(store:&PersistentStore, scale:&FixtureScale) -> Vec<String> {
+    let aliases = store.list_asset_aliases(None).unwrap().value;
+    assert_eq!(aliases.len(), scale.assets as usize);
+    let hashes = aliases.into_iter().map(|alias| {
+        assert_eq!(alias.kind, "asset");
+        alias.object_hash.expect("fixture asset must have a cataloged object")
+    }).collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(hashes.len(), scale.assets as usize);
+    let mut catalog = std::collections::BTreeSet::new();
+    let mut cursor = None;
+    loop {
+        let page = store.query_asset_object_catalog(4096, cursor.as_deref()).unwrap();
+        catalog.extend(page.items.into_iter().map(|item| item.object_hash));
+        cursor = page.next_cursor;
+        if cursor.is_none() { break; }
+    }
+    assert!(hashes.is_subset(&catalog), "fixture aliases must reference actual catalog rows");
+    hashes.into_iter().collect()
+}
+
+fn reset_work(asset_hashes:&[String]) {
     crate::asset_repository::body_io::reset_body_io();
+    for hash in asset_hashes {
+        crate::asset_repository::body_io::register_object_purpose(hash,
+            crate::asset_repository::body_io::BodyPurpose::Asset);
+    }
     crate::external_storage::lww_engine::cycle_keys::reset();
     lww::reset_work_metrics();
     super::hash_work::reset_hash_work();
@@ -138,18 +162,32 @@ fn take_work(external: bool) -> NativeObservation {
     result.body_stat_requests = bodies.stat_requests;
     result.body_batch_stat_requests = bodies.batch_stat_requests;
     result.body_presence_queries = bodies.presence_queries;
-    let managed = bodies.domains.get("managed").cloned().unwrap_or_default();
-    result.asset_body_opens = Some(managed.open_attempts);
-    result.asset_body_bytes_read = Some(managed.read_bytes);
-    for (domain, work) in bodies.domains {
-        result.body_domains.insert(domain.into(), BodyDomain {
-            open_attempts:work.open_attempts, opens:work.opens, failed_opens:work.failed_opens,
-            unknown_open_results:work.unknown_open_results, read_operations:work.read_operations,
-            read_bytes:work.read_bytes, incomplete_reads:work.incomplete_reads,
-            escaped_handles:work.escaped_handles, escaped_paths:work.escaped_paths,
+    result.body_asset_work = body_domain(bodies.asset_work());
+    result.body_control_work = body_domain(bodies.control_work());
+    result.body_owned_work = body_domain(bodies.domains.get("owned").cloned().unwrap_or_default());
+    result.body_unknown_work = body_domain(bodies.unknown_work());
+    result.body_unattributed_managed = body_domain(bodies.unattributed_managed.clone());
+    result.body_scope_violations = bodies.scope_violations;
+    result.asset_body_opens = Some(result.body_asset_work.open_attempts);
+    result.asset_body_bytes_read = Some(result.body_asset_work.read_bytes);
+    for (hash, object) in bodies.objects {
+        result.body_objects.insert(hash, ObjectBodyDomain {
+            purposes:object.purposes.into_iter().map(|purpose| format!("{purpose:?}")).collect(),
+            work:body_domain(object.work),
         });
     }
+    for (domain, work) in bodies.domains {
+        result.body_domains.insert(domain.into(), body_domain(work));
+    }
     result
+}
+
+fn body_domain(work:crate::asset_repository::body_io::BodyWork) -> BodyDomain {
+    BodyDomain {open_attempts:work.open_attempts, opens:work.opens, failed_opens:work.failed_opens,
+        unknown_open_results:work.unknown_open_results, read_operations:work.read_operations,
+        read_bytes:work.read_bytes, incomplete_reads:work.incomplete_reads,
+        escaped_handles:work.escaped_handles, escaped_paths:work.escaped_paths,
+        outstanding_readers:work.outstanding_readers}
 }
 
 fn require_routine_observation(observation:&NativeObservation, transport:&str,
@@ -247,6 +285,7 @@ pub(crate) struct ExternalDriver {
     pub fixture: CycleFixture,
     _generated: tempfile::TempDir,
     pub receipt: FixtureReceipt,
+    asset_hashes: Vec<String>,
 }
 
 impl ExternalDriver {
@@ -259,6 +298,7 @@ impl ExternalDriver {
             &fixture.receiver.repository.connection_identity, &fixture.receiver.library);
         let generated = tempfile::tempdir().unwrap();
         let receipt = seed(&mut fixture.a, &generated.path().join("fixture"), scale);
+        let asset_hashes = fixture_asset_inventory(&fixture.a, &receipt.scale);
         let authority = fixture.a.lww_binding_authority().unwrap();
         fixture.sender.publish(&mut fixture.a, authority, &[], &Cancellation::default()).await.unwrap();
         let authority = fixture.b.lww_binding_authority().unwrap();
@@ -274,7 +314,7 @@ impl ExternalDriver {
             assert_eq!(own.cursor.0, published_prefix);
         }
         verify_bootstrap(&fixture.a, &fixture.b);
-        Self {fixture, _generated:generated, receipt}
+        Self {fixture, _generated:generated, receipt, asset_hashes}
     }
 
     pub(crate) async fn run(&mut self, direction:Direction, change:SmallChange, iteration:u64) -> NativeSample {
@@ -288,7 +328,7 @@ impl ExternalDriver {
         };
         let (commit, expected) = prepare_edit(source, change, direction, iteration);
         let source_database_bytes_before_change = source.storage_stats().unwrap().database_bytes;
-        reset_work();
+        reset_work(&self.asset_hashes);
         let started = Instant::now();
         source.commit(&commit).unwrap();
         let durable_save_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -333,6 +373,7 @@ pub(crate) struct ServerDriver {
     ca: LwwClient,
     cb: LwwClient,
     pub receipt: FixtureReceipt,
+    asset_hashes: Vec<String>,
 }
 
 impl ServerDriver {
@@ -351,12 +392,13 @@ impl ServerDriver {
         }
         let generated = tempfile::tempdir().unwrap();
         let receipt = seed(&mut a, &generated.path().join("fixture"), scale);
+        let asset_hashes = fixture_asset_inventory(&a, &receipt.scale);
         server_sync::lww_tests::drain_publications(&ca, &mut a, &[]).unwrap();
         server_sync::lww_tests::receive_available(&cb, &mut b, &[]).unwrap();
         server_sync::lww_tests::receive_available(&ca, &mut a, &[]).unwrap();
         assert!(a.lww_read_outbox(a.lww_binding_authority().unwrap(), 1).unwrap().entries.is_empty());
         verify_bootstrap(&a, &b);
-        Self {_server:server, _directories:[directory_a,directory_b,generated], a,b,ca,cb,receipt}
+        Self {_server:server, _directories:[directory_a,directory_b,generated], a,b,ca,cb,receipt,asset_hashes}
     }
 
     pub(crate) fn run(&mut self, direction:Direction, change:SmallChange, iteration:u64) -> NativeSample {
@@ -369,7 +411,7 @@ impl ServerDriver {
         for counter in io { counter.reset(); }
         let (commit, expected) = prepare_edit(source, change, direction, iteration);
         let source_database_bytes_before_change = source.storage_stats().unwrap().database_bytes;
-        reset_work();
+        reset_work(&self.asset_hashes);
         let started = Instant::now();
         source.commit(&commit).unwrap();
         let durable_save_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -460,6 +502,14 @@ pub(crate) fn write_samples(directory:&Path, samples:&[NativeSample]) {
         &json!({"schema":"risunest-lww-native-smoke/v1", "scope":"native-content-identity-sha-inputs",
             "verified_checkpoint":checkpoint, "timing_origin":"native commit start; cumulative milliseconds",
             "bootstrap_phase":"excluded; both endpoints settled before warmup or sample counters",
+            "capture_work_scope":"partial native message capture work; SHA totals include separately observed full content identity inputs",
+            "body_work_semantics":{
+                "domains":"all-purpose actual CAS boundary totals, not summed again with object or role work",
+                "asset":"actual asset-purpose object IO, including mixed asset/control objects",
+                "control":"exclusively actual control-purpose object IO",
+                "unknown":"unclassified canonical object IO; invalidates samples",
+                "owned":"staging/import CAS body IO without per-object role coverage; any nonzero work invalidates these fixed routine samples",
+                "inventory":"actual fixture asset aliases checked against persisted catalog during excluded setup, re-registered after every reset"},
             "key_semantics":{
                 "local_http_emitted":"immutable body submitted to /push, including dominated submissions",
                 "local_http_accepted":"winning server keys",
@@ -542,7 +592,7 @@ fn actual_body_observer_binding_counts_reads_and_preserves_catalog_only_scope() 
     let directory = tempfile::tempdir().unwrap();
     let cas = crate::asset_repository::PayloadCas::new(directory.path()).unwrap();
     let object = cas.prepare_bytes(b"synthetic-body-data").unwrap();
-    reset_work();
+    reset_work(&[]);
     assert_eq!(cas.stat_object(&object.content_hash).unwrap(), Some(19));
     let mut catalog = take_work(false);
     catalog.shared_head_reads = Some(0);
@@ -551,15 +601,46 @@ fn actual_body_observer_binding_counts_reads_and_preserves_catalog_only_scope() 
     assert_eq!(catalog.body_stat_requests, 1);
     catalog.validate_routine_invariants().unwrap();
 
-    reset_work();
+    reset_work(std::slice::from_ref(&object.content_hash));
+    crate::asset_repository::body_io::register_object_purpose(&object.content_hash,
+        crate::asset_repository::body_io::BodyPurpose::Control);
     assert_eq!(cas.read_object(&object.content_hash).unwrap().unwrap(), b"synthetic-body-data");
     let mut body = take_work(false);
     body.shared_head_reads = Some(0);
     assert_eq!(body.asset_body_opens, Some(1));
     assert_eq!(body.asset_body_bytes_read, Some(19));
     assert_eq!(body.body_domains["managed"].read_operations, 1);
+    assert_eq!(body.body_asset_work.read_bytes, 19);
+    assert_eq!(body.body_control_work, BodyDomain::default());
     assert_eq!(body.body_scope_complete, Some(true));
     assert!(body.validate_routine_invariants().is_err());
+}
+
+#[test]
+fn actual_body_observer_distinguishes_control_and_unknown_reads() {
+    use crate::asset_repository::body_io::{register_object_purpose, BodyPurpose};
+    let directory = tempfile::tempdir().unwrap();
+    let cas = crate::asset_repository::PayloadCas::new(directory.path()).unwrap();
+    let object = cas.prepare_bytes(b"synthetic-control-data").unwrap();
+    reset_work(&[]);
+    register_object_purpose(&object.content_hash, BodyPurpose::Control);
+    assert_eq!(cas.read_object(&object.content_hash).unwrap().unwrap(), b"synthetic-control-data");
+    let mut control = take_work(false);
+    control.shared_head_reads = Some(0);
+    assert_eq!(control.body_control_work.open_attempts, 1);
+    assert_eq!(control.body_control_work.read_bytes, 22);
+    assert_eq!(control.body_objects[&object.content_hash].purposes, vec!["Control"]);
+    assert_eq!(control.asset_body_opens, Some(0));
+    control.validate_routine_invariants().unwrap();
+
+    reset_work(&[]);
+    assert_eq!(cas.read_object(&object.content_hash).unwrap().unwrap(), b"synthetic-control-data");
+    let mut unknown = take_work(false);
+    unknown.shared_head_reads = Some(0);
+    assert_eq!(unknown.body_unknown_work.open_attempts, 1);
+    assert_eq!(unknown.body_unknown_work.read_bytes, 22);
+    assert_eq!(unknown.body_scope_complete, Some(false));
+    assert!(unknown.validate_routine_invariants().is_err());
 }
 
 #[test]
@@ -567,7 +648,7 @@ fn actual_body_observer_binding_rejects_escaped_file_and_path() {
     let directory = tempfile::tempdir().unwrap();
     let cas = crate::asset_repository::PayloadCas::new(directory.path()).unwrap();
     let object = cas.prepare_bytes(b"synthetic-body-data").unwrap();
-    reset_work();
+    reset_work(std::slice::from_ref(&object.content_hash));
     let file = cas.open_object(&object.content_hash).unwrap().unwrap();
     let mut escaped = take_work(false);
     escaped.shared_head_reads = Some(0);
@@ -575,7 +656,7 @@ fn actual_body_observer_binding_rejects_escaped_file_and_path() {
     assert_eq!(escaped.body_scope_complete, Some(false));
     assert!(escaped.validate_routine_invariants().is_err());
     drop(file);
-    reset_work();
+    reset_work(std::slice::from_ref(&object.content_hash));
     assert!(cas.object_path(&object.content_hash).unwrap().is_some());
     let mut path = take_work(false);
     path.shared_head_reads = Some(0);
