@@ -134,7 +134,10 @@ impl PublishedCatalog {
     pub(crate) fn merge(&mut self, change: &Change) -> Result<()> {
         self.visited = self.visited.checked_add(1).ok_or_else(segment::corrupt)?;
         change.stamp.validate().map_err(sql)?;
-        let identity = change.value.identity().map_err(sql)?;
+        let identity = change.value.identity();
+        #[cfg(test)]
+        super::lww_segment::observe_value_identity("native_checkpoint_descriptor_identity","native_checkpoint_value_identity",&change.value,identity.is_ok());
+        let identity = identity.map_err(sql)?;
         let stamp = serde_json::to_string(&change.stamp).map_err(sql)?;
         let old: Option<String> = self.db.query_row("SELECT identity FROM versions WHERE key=?1 AND stamp=?2", params![change.key.as_str(), stamp], |r| r.get(0)).optional().map_err(sql)?;
         if old.as_ref().is_some_and(|old| old != &identity) { return Err(segment::corrupt()); }
