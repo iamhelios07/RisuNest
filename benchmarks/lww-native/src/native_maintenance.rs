@@ -57,7 +57,7 @@ pub(crate) async fn remote_backup_restore_raw(
             .map_err(|e|e.to_string())?;
         let mut statement=connection.prepare("SELECT hash,present,settled,json_extract(source,'$.byteLength') FROM external_restore_bodies WHERE job_id=?1 ORDER BY hash")
             .map_err(|e|e.to_string())?;
-        let rows=statement.query_map([&job.id],|row|Ok((row.get::<_,String>(0)?,row.get::<_,bool>(1)?,row.get::<_,bool>(2)?,row.get::<_,u64>(3)?)))
+        let rows=statement.query_map([&job.id],|row|Ok((row.get::<_,String>(0)?,row.get::<_,bool>(1)?,row.get::<_,bool>(2)?,sql_u64(row,3)?)))
             .map_err(|e|e.to_string())?;
         let mut result=std::collections::BTreeMap::new();
         for row in rows {let (hash,present,settled,size)=row.map_err(|e|e.to_string())?;
