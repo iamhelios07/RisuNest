@@ -26,29 +26,36 @@ mod nested_metadata {
     use serde::{Serialize,Deserialize,Serializer,Deserializer,de::{DeserializeOwned,Error}};
     use serde_json::Value;
     pub fn serialize<T:Serialize,S:Serializer>(value:&T,serializer:S)->Result<S::Ok,S::Error> {
-        fn convert(value:&mut Value) {
+        fn convert(value:&mut Value)->Result<(),String> {
             match value {
-                Value::Number(number)=>*value=Value::String(number.to_string()),
-                Value::Array(values)=>values.iter_mut().for_each(convert),
-                Value::Object(values)=>values.values_mut().for_each(convert),
+                Value::Number(_)=>return Err("numeric control integer".into()),
+                Value::Array(values)=>for value in values {
+                    if let Value::Number(number)=value {
+                        let byte=number.as_u64().filter(|byte|*byte<=u8::MAX as u64)
+                            .ok_or("invalid control hash byte")?;
+                        *value=Value::String(byte.to_string());
+                    } else {convert(value)?;}
+                },
+                Value::Object(values)=>for value in values.values_mut() {convert(value)?;},
                 _=>{},
             }
+            Ok(())
         }
-        let mut value=serde_json::to_value(value).map_err(<S::Error as serde::ser::Error>::custom)?;convert(&mut value);value.serialize(serializer)
+        let mut value=serde_json::to_value(value).map_err(<S::Error as serde::ser::Error>::custom)?;
+        convert(&mut value).map_err(<S::Error as serde::ser::Error>::custom)?;
+        value.serialize(serializer)
     }
     pub fn deserialize<'de,T:DeserializeOwned,D:Deserializer<'de>>(deserializer:D)->Result<T,D::Error> {
         fn integer(value:&mut Value)->Result<(),String> {
             let text=value.as_str().ok_or("control integer must be a decimal string")?;
             if text.is_empty() || (text.len()>1&&text.starts_with('0')) || !text.bytes().all(|byte|byte.is_ascii_digit()) {return Err("noncanonical control integer".into());}
-            *value=Value::Number(text.parse::<u64>().map_err(|_|"control integer overflow")?.into());Ok(())
+            *value=Value::Number(text.parse::<u8>().map_err(|_|"control hash byte overflow")?.into());Ok(())
         }
         fn convert(value:&mut Value)->Result<(),String> {
             match value {
                 Value::Number(_)=>return Err("numeric control integer".into()),
                 Value::Array(values)=>for value in values {if value.is_string() {integer(value)?;} else {convert(value)?;}},
-                Value::Object(values)=>for (name,value) in values {
-                    if matches!(name.as_str(),"plaintextLength"|"ciphertextLength") {integer(value)?;} else {convert(value)?;}
-                },
+                Value::Object(values)=>for value in values.values_mut() {convert(value)?;},
                 _=>{},
             }
             Ok(())
