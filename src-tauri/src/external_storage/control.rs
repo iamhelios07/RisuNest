@@ -28,6 +28,39 @@ use std::{
     io::{Cursor, Read, Write},
 };
 
+#[cfg(test)]
+pub(crate) fn observe_control_fingerprint(role:wire::ObjectRole,library:&[u8;32],sections:&std::collections::BTreeMap<String,wire::SectionSnapshotRef>,original:Option<&wire::StoredObject>,calls:usize) {
+    use serde::Serialize;
+    #[derive(Serialize)]
+    #[serde(rename_all="camelCase")]
+    struct Section<'a>{content:String,generation:&'a risunest_sync_wire::head::Sequence,gc_floor:&'a risunest_sync_wire::head::Sequence,max_write_clock:&'a risunest_sync_wire::head::Sequence}
+    #[derive(Serialize)]
+    struct State<'a>{domain:&'static str,library:String,sections:std::collections::BTreeMap<&'a str,Section<'a>>}
+    #[derive(Serialize)]
+    #[serde(rename_all="camelCase")]
+    struct Bundle<'a>{#[serde(flatten)]state:State<'a>,original_units:Option<&'a wire::StoredObject>}
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self,bytes:&[u8])->std::io::Result<usize>{self.0=self.0.checked_add(bytes.len()).ok_or_else(||std::io::Error::other("fingerprint input length overflow"))?;Ok(bytes.len())}
+        fn flush(&mut self)->std::io::Result<()>{Ok(())}
+    }
+    let bundle=role==wire::ObjectRole::BackupBundle;
+    let domain=if bundle {"native_external_bundle_fingerprint"} else {"native_external_state_fingerprint"};
+    let state=State{domain:if bundle {wire::BUNDLE_FINGERPRINT_DOMAIN} else {wire::STATE_FINGERPRINT_DOMAIN},library:hex::encode(library),sections:sections.iter().map(|(id,section)|(id.as_str(),Section{content:hex::encode(section.content_fingerprint),generation:&section.generation,gc_floor:&section.gc_floor,max_write_clock:&section.max_write_clock})).collect()};
+    let mut count=Count(0);
+    let result=if bundle {serde_json::to_writer(&mut count,&Bundle{state,original_units:original})} else {serde_json::to_writer(&mut count,&state)};
+    if result.is_err() {crate::persistent_store::hash_work::incomplete(domain);return;}
+    for _ in 0..calls {crate::persistent_store::hash_work::observe(domain,count.0);}
+}
+#[cfg(test)]
+pub(crate) fn observe_bundle_result(result:&risunest_external_storage_format::Result<wire_control::BackupBundleDocument>,calls:usize) {
+    match result {Ok(document)=>observe_control_fingerprint(wire::ObjectRole::BackupBundle,&document.library.content_fingerprint,&document.sections,document.original_units.as_ref(),calls),Err(_)=>crate::persistent_store::hash_work::incomplete("native_external_bundle_fingerprint")}
+}
+#[cfg(test)]
+pub(crate) fn observe_state_result(result:&risunest_external_storage_format::Result<wire::SyncStateDocument>,calls:usize) {
+    match result {Ok(document)=>observe_control_fingerprint(wire::ObjectRole::SyncState,&document.library_fingerprint,&document.sections,None,calls),Err(_)=>crate::persistent_store::hash_work::incomplete("native_external_state_fingerprint")}
+}
+
 const HEAD_OBJECT_ID: &str = "head";
 const MAX_CONTROL_PLAINTEXT: usize = 48 * 1024;
 const MAX_POINT_PLAINTEXT: usize = wire_control::MAX_CONTROL_BYTES;
@@ -769,6 +802,7 @@ pub(crate) async fn upload_backup_bundle(
     captured_at_ms: u64,
     library: wire::LibrarySnapshotRef,
     sections: std::collections::BTreeMap<String, wire::SectionSnapshotRef>,
+    original_units: Option<wire::StoredObject>,
     journal: &mut TransferJournal,
     provider: &dyn Provider,
     repository: &RepositoryHandle,
@@ -784,8 +818,10 @@ pub(crate) async fn upload_backup_bundle(
         None,
         library,
         sections,
-    )
-    .map_err(corrupt)?;
+        original_units,
+    );
+    #[cfg(test)] observe_bundle_result(&document,2);
+    let document=document.map_err(corrupt)?;
     let plaintext = document.encode(MAX_POINT_PLAINTEXT).map_err(corrupt)?;
     upload_control_object(
         descriptor,
@@ -834,6 +870,7 @@ pub(crate) async fn ensure_remote_conflict_bundle(
                 captured_at_ms,
                 view.library,
                 view.sections,
+                None,
                 journal,
                 connected.provider.as_ref(),
                 &connected.handle,
@@ -877,12 +914,14 @@ pub(crate) async fn upload_sync_state(
         created_at_ms,
         library,
         sections,
-    )
-    .map_err(corrupt)?;
+    );
+    #[cfg(test)] observe_state_result(&document,2);
+    let document=document.map_err(corrupt)?;
     let fingerprint = hex::encode(document.state_fingerprint);
-    let plaintext = document
-        .encode(wire::MAX_METADATA_BYTES)
-        .map_err(corrupt)?;
+    let plaintext=document.encode(wire::MAX_METADATA_BYTES);
+    #[cfg(test)]
+    observe_control_fingerprint(wire::ObjectRole::SyncState,&document.library_fingerprint,&document.sections,None,1);
+    let plaintext=plaintext.map_err(corrupt)?;
     let object = upload_control_object(
         descriptor,
         root_key,
@@ -1566,6 +1605,7 @@ pub(crate) struct SnapshotView {
     /// a published state. These are different counters and are never mixed.
     pub revision: String,
     pub library: wire::LibrarySnapshotRef,
+    pub original_units: Option<wire::StoredObject>,
     pub sections: std::collections::BTreeMap<String, wire::SectionSnapshotRef>,
     pub is_state: bool,
     /// The device whose own values these sections are, when there is one. A
@@ -1578,8 +1618,9 @@ impl SnapshotView {
     pub(crate) fn read(plaintext: &[u8], role: wire::ObjectRole, repository_id: &str) -> Result<Self> {
         let view = match role {
             wire::ObjectRole::SyncState => {
-                let document = wire::SyncStateDocument::decode(plaintext, wire::MAX_METADATA_BYTES)
-                    .map_err(corrupt)?;
+                let document = wire::SyncStateDocument::decode(plaintext, wire::MAX_METADATA_BYTES);
+                #[cfg(test)] observe_state_result(&document,2);
+                let document=document.map_err(corrupt)?;
                 Self {
                     snapshot_id: document.state_id,
                     parent_snapshot_id: document.parent_state_id,
@@ -1590,12 +1631,13 @@ impl SnapshotView {
                     sections: document.sections,
                     is_state: true,
                     captured_by_device: None,
+                    original_units: None,
                 }
             }
             wire::ObjectRole::BackupBundle => {
-                let document =
-                    wire_control::BackupBundleDocument::decode(plaintext, MAX_POINT_PLAINTEXT)
-                        .map_err(corrupt)?;
+                let document=wire_control::BackupBundleDocument::decode(plaintext, MAX_POINT_PLAINTEXT);
+                #[cfg(test)] observe_bundle_result(&document,1);
+                let document=document.map_err(corrupt)?;
                 Self {
                     snapshot_id: document.bundle_id,
                     parent_snapshot_id: None,
@@ -1613,6 +1655,7 @@ impl SnapshotView {
                         wire_control::BundleSource::SyncState { .. } => None,
                     },
                     library: document.library,
+                    original_units: document.original_units,
                     sections: document.sections,
                     is_state: false,
                 }
@@ -1924,6 +1967,7 @@ mod tests {
                 content_fingerprint: [3; 32],
             },
             BTreeMap::new(),
+            Some(catalog(&connected.handle, "original-units")),
         )
         .unwrap()
         .encode(MAX_POINT_PLAINTEXT)

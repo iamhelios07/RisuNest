@@ -81,6 +81,7 @@ const STAGE_ORDER: DialogStageId[] = [
     'finalizing-staging',
     'assign-plugin-values',
     'activating',
+    'copying-assets',
     'refreshing-app',
     'reloading-plugins',
     'restarting-app',
@@ -265,6 +266,7 @@ function stageLabel(stage: NativeFileJobDialogStage): string {
     const copy = language.risuNest.importDialog
     switch (stage) {
         case 'copying-source': return copy.stageCopyingSource
+        case 'copying-assets': return copy.stageCopyingSource
         case 'awaiting-reselect': return copy.stageAwaitingReselect
         case 'reading-archive': return copy.stageReadingArchive
         case 'preparing-attachments': return copy.stagePreparingAttachments
@@ -467,6 +469,8 @@ function warningText(code: string): string {
     switch (code) {
         case 'cleanup-failed':
             return copy.warningCleanupFailed
+        case 'upstream-restore-losses':
+            return copy.warningUpstreamRestoreLosses
         case 'pocket-inlay-failed':
             return copy.warningPocketInlayFailed
         case 'partial-destination-may-remain':

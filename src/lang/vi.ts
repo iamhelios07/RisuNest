@@ -1,5 +1,8 @@
 export const languageVietnamese = {
     risuNest: {
+        importDialog: {
+            warningUpstreamRestoreLosses: 'Không thể khôi phục một phần dữ liệu bộ nhớ lạnh hoặc Inlay. Vui lòng kiểm tra dữ liệu đã khôi phục.',
+        },
         plugins: {
             "removeTitle": "Xóa plugin này?",
             "removeDescription": "Nếu xóa dữ liệu plugin, cài đặt và nội dung đã lưu sẽ không được khôi phục khi cài lại. Giữ dữ liệu cho phép tiếp tục sử dụng sau khi cài lại.",
@@ -50,8 +53,8 @@ export const languageVietnamese = {
         "requestLogRemoved": "This request log is removed.",
         "requestLogRemovedDesc": "This request log removes when client is refreshed or reloaded.",
         "vertexAuthError": "Thiếu thông tin xác thực Vertex AI.",
-        "coldStorageIncompleteRestoreConfirm": (characterNames: string, unavailableCount: number, unresolvedCount: number) =>
-            `Không thể khôi phục dữ liệu bộ nhớ lạnh của ${characterNames || "nhân vật không xác định"}.${unresolvedCount > 0 ? ` Có ${unresolvedCount} mục không thể liên kết với nhân vật.` : ""}\n\nNếu tiếp tục, ${unavailableCount} mục bộ nhớ lạnh sẽ vẫn không khả dụng và dữ liệu nhân vật hoặc cuộc trò chuyện bị ảnh hưởng có thể bị mất vĩnh viễn.\n\nVẫn tiếp tục khôi phục không đầy đủ?`
+        "coldStorageIncompleteRestoreConfirm": (characterNames: string, unavailableCount: number, unresolvedCount: number, includeQuestion = true) =>
+            `Không thể khôi phục dữ liệu bộ nhớ lạnh của ${characterNames || "nhân vật không xác định"}.${unresolvedCount > 0 ? ` Có ${unresolvedCount} mục không thể liên kết với nhân vật.` : ""}\n\nNếu tiếp tục, ${unavailableCount} mục bộ nhớ lạnh sẽ vẫn không khả dụng và dữ liệu nhân vật hoặc cuộc trò chuyện bị ảnh hưởng có thể bị mất vĩnh viễn.${includeQuestion ? "\n\nVẫn tiếp tục khôi phục không đầy đủ?" : ""}`
     },
     "showHelp": "Hiển thị trợ giúp",
     "help": {

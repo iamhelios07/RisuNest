@@ -53,6 +53,8 @@ pub(crate) mod sections;
 pub(crate) mod snapshot_export;
 pub(crate) mod snapshot_export_commands;
 pub(crate) mod snapshot_restore;
+#[cfg(test)]
+pub(crate) mod worker_observation;
 pub(crate) mod head_observation;
 #[cfg(test)]
 mod tests;
@@ -63,6 +65,8 @@ pub(crate) mod usage;
 pub(crate) mod wire_fixture;
 pub(crate) mod lww_segment;
 pub(crate) mod lww_engine;
+pub(crate) mod lww_checkpoint;
+pub(crate) mod lww_compaction;
 
 pub(crate) mod lww_residency;
 pub(crate) mod lww_commands;

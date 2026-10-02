@@ -24,6 +24,7 @@ pub(crate) fn document_references(
 ) -> Vec<&risunest_external_storage_format::snapshot::StoredObject> {
     std::iter::once(&view.library.record_catalog)
         .chain(std::iter::once(&view.library.asset_catalog))
+        .chain(view.original_units.iter())
         .chain(view.sections.values().map(|section| &section.entries_root))
         .collect()
 }

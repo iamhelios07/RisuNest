@@ -12,6 +12,7 @@
     import { DBState } from 'src/ts/stores.svelte'
     import { getExternalStorageBridge } from 'src/ts/storage/sync/external/bridge'
     import { bindSyncTarget, unbindSyncTarget } from 'src/ts/storage/sync/bindingRegistry'
+    import { createNativeSyncBindingBridge } from 'src/ts/storage/sync/bindingNative'
     import { requestExternalLwwNow, subscribeExternalLwwFailures, supportsExternalLwwNewDevice } from 'src/ts/storage/sync/external/lwwProduction'
     import BindingTargetSwitch from 'src/ts/storage/sync/BindingTargetSwitch.svelte'
     import { language } from 'src/lang'
@@ -32,11 +33,10 @@
         ExternalConnectionSettingsMaterial,
         ExternalRetentionPolicy,
         ExternalRestoreArea,
-        ExternalRestoreSection,
         ExternalStorageState,
         ExternalSnapshotExportProgress,
     } from 'src/ts/storage/sync/external/types'
-    import { externalRestorableSections, externalRestoreAreas } from 'src/ts/storage/sync/external/restoreScope'
+    import { externalRestoreAreas } from 'src/ts/storage/sync/external/restoreScope'
     import ConnectionForm from './ConnectionForm.svelte'
     import { externalConnectionTitle, externalErrorKind, externalErrorMessage, externalStorageStrings } from './strings'
 
@@ -70,16 +70,10 @@
     let connectionSettingsPanel = $state<HTMLDivElement | undefined>()
     let connectionSettingsQr = $state('')
     /** The history entry whose restore scope is open, and what is ticked in it. */
-    let restoreScope = $state<{ id: string; sections: ExternalRestoreSection[] } | null>(null)
     let exportRun = $state<{ id: string; connectionId: string; progress?: ExternalSnapshotExportProgress } | null>(null)
     const pendingPins = new Map<string, string>()
     let pollTimer: ReturnType<typeof setTimeout> | undefined
 
-    const sectionLabels: Record<ExternalRestoreSection, 'hypa' | 'devicePlugins' | 'deviceSettings'> = {
-        hypa: 'hypa',
-        'local-plugins': 'devicePlugins',
-        'local-settings': 'deviceSettings',
-    }
     async function setSyncBinding(connection: ExternalConnectionSummary, enabled: boolean): Promise<void> {
         busy = true
         try {
@@ -96,41 +90,14 @@
         catch (reason) { error = externalErrorMessage(strings, reason) }
         finally { busy = false }
     }
-    const sectionHelp: Record<ExternalRestoreSection, keyof typeof strings> = {
-        hypa: 'hypaHelp',
-        'local-plugins': 'devicePluginsHelp',
-        'local-settings': 'deviceSettingsHelp',
-    }
-
-    /**
-     * A backup that carries nothing beside the library has nothing to choose,
-     * so it restores straight away. Otherwise the areas it covers are offered,
-     * ticked, because they are what the backup was made to keep.
-     */
-    function beginRestore(
-        connection: ExternalConnectionSummary,
-        item: ExternalHistoryItem,
-    ): void {
-        const sections = externalRestorableSections(item)
-        if (sections.length === 0) {
+    function beginRestore(connection: ExternalConnectionSummary, item: ExternalHistoryItem): void {
+        try {
             void runJob(connection, 'restore', {
                 snapshotId: item.snapshotId,
                 restoreAreas: externalRestoreAreas(item, []),
             })
-            return
-        }
-        restoreScope = { id: item.id, sections }
+        } catch (reason) { error = externalErrorMessage(strings, reason) }
     }
-
-    function toggleRestoreSection(section: ExternalRestoreSection, included: boolean): void {
-        if (!restoreScope) return
-        const sections = restoreScope.sections.filter(current => current !== section)
-        restoreScope = {
-            ...restoreScope,
-            sections: included ? [...sections, section] : sections,
-        }
-    }
-
     onMount(() => {
         const openExternalStorage = (event: Event) => {
             const providerId = (event as CustomEvent<{ providerId?: string }>).detail?.providerId
@@ -229,7 +196,20 @@
             restoreAreas?: ExternalRestoreArea[]
         } = {},
     ): Promise<void> {
-        if (job === 'restore' && !(await alertConfirm(strings.restore))) return
+        if (job === 'restore') {
+            const binding = await createNativeSyncBindingBridge().state()
+            const answer = await alertCheckboxConfirm({
+                title: language.lwwSync.restoreTitle,
+                description: binding.target.kind === 'none'
+                    ? language.lwwSync.restoreDescription
+                    : language.lwwSync.restoreDescriptionBound,
+                checkboxLabel: language.lwwSync.restoreAcknowledge,
+                actionLabel: language.lwwSync.restoreAction,
+                cancelLabel: strings.cancel,
+                requireChecked: true,
+            })
+            if (!answer.confirmed) return
+        }
         busy = true
         activeAction = `${job}:${connection.id}`
         try {
@@ -244,7 +224,6 @@
                 if (!details.snapshotId || !details.restoreAreas) {
                     throw new Error('Missing restore request')
                 }
-                restoreScope = null
                 const operation = requestExternalStorageRestore(
                     connection.id,
                     details.snapshotId,
@@ -357,7 +336,6 @@
 
 
     async function openDetails(connection: ExternalConnectionSummary, kind: 'history' | 'quota'): Promise<void> {
-        restoreScope = null
         expanded[connection.id] = kind
         try {
             if (kind === 'history') await loadHistory(connection, false)
@@ -754,21 +732,7 @@
                                         {#if item.deletable}<SettingButton variant="danger" disabled={busy} onclick={() => deleteHistory(connection, item)}>{strings.deleteHistory}</SettingButton>{/if}
                                     </span>
                                 </div>
-                                {#if restoreScope && restoreScope.id === item.id}
-                                    {@const chosen = restoreScope.sections}
-                                    <div class="scope">
-                                        <h3 class="policy-title">{strings.chooseRestore}</h3>
-                                        <p class="always"><span>{strings.library}</span><span class="value">{strings.included}</span></p>
-                                        {#each externalRestorableSections(item) as section (section)}
-                                            <SettingToggle showLabel label={strings[sectionLabels[section]]} disabled={busy} checked={chosen.includes(section)} onchange={checked => toggleRestoreSection(section, checked)} />
-                                            <p class="policy-note">{strings[sectionHelp[section]]}</p>
-                                        {/each}
-                                        <div class="actions">
-                                            <SettingButton disabled={busy} onclick={() => runJob(connection, 'restore', { snapshotId: item.snapshotId, restoreAreas: externalRestoreAreas(item, chosen) })}>{strings.restore}</SettingButton>
-                                            <SettingButton variant="secondary" disabled={busy} onclick={() => { restoreScope = null }}>{strings.cancel}</SettingButton>
-                                        </div>
-                                    </div>
-                                {/if}
+
                             </div>
                         {/each}
                         {#if historyCursor[connection.id]}<div><SettingButton variant="secondary" busy={historyLoading[connection.id]} onclick={() => loadHistory(connection, true)}>{strings.loadMore}</SettingButton></div>{/if}
@@ -898,17 +862,6 @@
         flex-wrap: wrap;
         gap: 0.4rem;
     }
-    .policy-title {
-        margin: 0.25rem 0 0;
-        font-size: 0.9375rem;
-        font-weight: 600;
-    }
-    .policy-note {
-        margin: 0;
-        font-size: 0.8125rem;
-        line-height: 1.45;
-        color: var(--risu-theme-textcolor2);
-    }
     .policy-row {
         display: flex;
         align-items: center;
@@ -921,17 +874,6 @@
     }
     .policy-row .value {
         color: var(--risu-theme-textcolor2);
-    }
-    .always {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 0.35rem;
-        margin: 0;
-        font-size: 0.8125rem;
-        color: var(--risu-theme-textcolor2);
-    }
-    .always .value {
-        font-weight: 600;
     }
     .empty {
         margin: 0;
@@ -1056,12 +998,6 @@
         align-items: center;
         justify-content: space-between;
         gap: 0.5rem;
-    }
-    .scope {
-        display: grid;
-        gap: 0.35rem;
-        padding-top: 0.5rem;
-        border-top: 1px solid color-mix(in srgb, var(--risu-theme-darkborderc) 55%, transparent);
     }
     .dialog {
         display: grid;

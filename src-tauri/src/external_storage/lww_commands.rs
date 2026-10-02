@@ -16,7 +16,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
     time::Instant,
 };
-use tauri::AppHandle;
+use tauri::{AppHandle,Manager};
 
 struct Session {
     engine: Option<ExternalLwwEngine>,
@@ -27,6 +27,7 @@ struct Session {
 struct Context {
     session: tokio::sync::Mutex<Session>,
     cancel: Mutex<Cancellation>,
+    maintenance:tokio::sync::Mutex<()>,
 }
 static CONTEXTS: OnceLock<Mutex<BTreeMap<String, Arc<Context>>>> = OnceLock::new();
 fn context(id: &str) -> Result<Arc<Context>> {
@@ -48,6 +49,7 @@ fn context(id: &str) -> Result<Arc<Context>> {
                     cancel: Cancellation::default(),
                 }),
                 cancel: Mutex::new(Cancellation::default()),
+                maintenance:tokio::sync::Mutex::new(()),
             })
         })
         .clone())
@@ -69,11 +71,13 @@ async fn open(app: &AppHandle, id: &str, session: &mut Session) -> Result<()> {
         session.engine = Some(ExternalLwwEngine {
             provider: connected.provider,
             repository: connected.handle,
-            library: connected.stored.descriptor.repository_id,
+            library: connected.stored.descriptor.repository_id.clone(),
             root_key: connected.root_key,
             admission: None,
             connection_id: id.into(),
             connection_root: runtime::root(app)?,
+            capabilities: connected.stored.capabilities,
+            descriptor: connected.stored.descriptor,
         });
     }
     let engine = session.engine.as_mut().ok_or_else(lww_segment::corrupt)?;
@@ -128,6 +132,14 @@ fn check(
     selected: bool,
 ) -> Result<crate::persistent_store::PersistentStore> {
     let store = runtime::native_store(app)?;
+    check_store(&store, request, selected)?;
+    Ok(store)
+}
+fn check_store(
+    store: &crate::persistent_store::PersistentStore,
+    request: &Request,
+    selected: bool,
+) -> Result<()> {
     if store
         .lww_binding_authority()
         .map_err(runtime::local_error)?
@@ -144,7 +156,7 @@ fn check(
     {
         return Err(ProviderError::new(ErrorKind::Cancelled));
     }
-    Ok(store)
+    Ok(())
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -179,7 +191,7 @@ pub(crate) async fn external_lww_inspect(app: AppHandle, request: Request) -> Re
         inspection_id,
         target_id,
         library_id: library_id.clone(),
-        empty: objects.is_empty(),
+        empty: objects.is_empty() && engine.snapshot_listing(&session.cancel).await?.is_empty(),
         previously_bound_library: previous.library_id.as_deref() == Some(&library_id),
     })
 }
@@ -266,10 +278,13 @@ pub(crate) async fn external_lww_publish(
     request: Request,
     initial: bool,
 ) -> Result<PublicationResult> {
+    let state = app.state::<crate::persistent_store::PersistentStoreState>();
+    let _operation = state.admit_renderer_operation().map_err(runtime::local_error)?;
     let context = context(&request.connection_id)?;
     let mut session = context.session.lock().await;
     open(&app, &request.connection_id, &mut session).await?;
-    let mut store = check(&app, &request, true)?;
+    let mut store = state.open_admitted_native_job_store(&_operation).map_err(runtime::local_error)?;
+    check_store(&store, &request, true)?;
     if let Some(target) = &request.exit_target {
         let identity = store.external_identity().map_err(runtime::local_error)?;
         if identity.library_epoch != target.library_epoch
@@ -337,6 +352,39 @@ pub(crate) async fn external_lww_receive(
             &session.cancel,
         )
         .await
+}
+
+#[tauri::command]
+pub(crate) async fn external_lww_maintenance(app:AppHandle,request:Request)->Result<Option<serde_json::Value>> {
+    let context=context(&request.connection_id)?;
+    let Ok(_maintenance)=context.maintenance.try_lock() else {return Ok(None)};
+    let cancel=context.cancel.lock().map_err(runtime::local_error)?.clone();
+    let mut session=Session{engine:None,dependencies:None,fresh_after:Instant::now(),cancel:cancel.clone()};
+    open(&app,&request.connection_id,&mut session).await?;
+    let store=check(&app,&request,true)?;
+    let writer=store.lww_clock_state().map_err(runtime::local_error)?.writer_id;
+    let engine=session.engine.as_ref().ok_or_else(lww_segment::corrupt)?;
+    let segments=engine.listing(&cancel).await?;
+    let snapshots=engine.snapshot_listing(&cancel).await?;
+    if segments.len()<100 && segments.iter().map(|r|r.byte_length).sum::<u64>()<64*1024*1024 && snapshots.len()<2 {return Ok(None)};
+    let root=runtime::root(&app)?;
+    let stored=super::connection_store::ConnectionStore::open(&root)?.read(&request.connection_id)?;
+    let job=uuid::Uuid::new_v4().to_string();
+    let protection=super::leases::LeaseContext{root:&root,connection_id:&request.connection_id,writer_id:&writer,descriptor:&stored.descriptor,root_key:&engine.root_key,provider:engine.provider.as_ref(),repository:&engine.repository,clock:super::leases::system_clock(),protection_supported:stored.capabilities.lease_operations,ledger:Some(app.state::<super::job_store::JobCommandState>().lease_ledger()?)};
+    let owner=match super::leases::admit_shared_work(&protection,&job,&cancel).await? {
+        super::leases::Admission::Admitted(owner)=>owner,
+        super::leases::Admission::Yield{..}=>return Ok(None),
+        super::leases::Admission::UnsupportedProtection=>return Err(ProviderError::new(ErrorKind::Unsupported)),
+    };
+    let directory=root.join("external-storage").join("maintenance").join(&job);
+    let result=owner.run(&protection,&cancel,async {
+        if let Some(reason)=owner.recheck(&protection,&cancel).await? {return Err(super::leases::yield_error(reason));}
+        check(&app,&request,true)?;
+        let completed=engine.compact_published(&directory,&job,&writer,&stored.capabilities,&cancel,Some((&owner,&protection))).await?;
+        check(&app,&request,true)?;
+        Ok(completed)
+    }).await?;
+    Ok(Some(serde_json::json!({"snapshotId":result.snapshot_id})))
 }
 #[tauri::command]
 pub(crate) async fn external_lww_fence(app: AppHandle, connection_id: String) -> Result<()> {
