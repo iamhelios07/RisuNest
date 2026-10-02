@@ -1126,7 +1126,10 @@ impl PersistentStore {
         let digest = {
             let hash_input = body.as_bytes();
             #[cfg(test)]
-            crate::persistent_store::hash_work::observe("native_receive_intent", hash_input.len());
+            {
+                crate::persistent_store::hash_work::observe("native_receive_intent", hash_input.len());
+                crate::persistent_store::hash_work::record_receive_intent_input(hash_input);
+            }
             risunest_sync_wire::hash(hash_input)
         };
         let tx = self.device_store_mut()?.transaction()?;
@@ -2388,5 +2391,36 @@ mod hash_work_tests {
         assert_eq!(work.domains["native_wire_identity"], DomainWork { calls: 2, bytes });
         assert!(work.incomplete.is_empty());
         assert!(!work.domains.contains_key("native_receive_intent"));
+    }
+
+    #[test]
+    fn receive_input_capture_matches_actual_hash_and_persisted_body_on_exact_retry() {
+        use crate::persistent_store::hash_work::{reset_receive_intent_inputs, take_receive_intent_inputs};
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let request = StageReceive {
+            header: Header { binding_authority: store.lww_binding_authority().unwrap(), request_id: uuid::Uuid::new_v4().to_string() },
+            changes: vec![Change { key: UnitKey::new(&["future", "synthetic-input"]).unwrap(),
+                stamp: Stamp { physical_ms: 7.into(), logical: 0, writer_id: "00000000-0000-4000-8000-000000000001".into() },
+                value: inline(&serde_json::json!({"escaped":"synthetic\nvalue"})).unwrap() }],
+            progress: Progress { kind: "server".into(), cursor: 999.into(), writer_id: None },
+            admitted_time_upper_ms: 10.into(),
+        };
+        let expected = serde_json::to_vec(&request).unwrap();
+        reset_hash_work(); reset_receive_intent_inputs();
+        store.lww_stage_receive(&request).unwrap(); store.lww_stage_receive(&request).unwrap();
+        let work = take_hash_work(); let inputs = take_receive_intent_inputs();
+        assert_eq!(inputs, vec![expected.clone(), expected]);
+        assert_eq!(work.domains["native_receive_intent"], DomainWork { calls: inputs.len() as u64,
+            bytes: inputs.iter().map(|input| input.len() as u64).sum() });
+        let persisted: String = store.device_store().unwrap().connection().query_row(
+            "SELECT body FROM lww_receive WHERE request_id=?1", [&request.header.request_id], |row| row.get(0)).unwrap();
+        assert_eq!(persisted.as_bytes(), inputs[0]);
+        store.lww_stage_receive(&request).unwrap(); assert!(take_receive_intent_inputs().is_empty());
+        let mut rejected = request; rejected.admitted_time_upper_ms = 6.into();
+        reset_hash_work(); reset_receive_intent_inputs();
+        assert!(store.lww_stage_receive(&rejected).is_err());
+        assert!(take_receive_intent_inputs().is_empty());
+        assert!(!take_hash_work().domains.contains_key("native_receive_intent"));
     }
 }
