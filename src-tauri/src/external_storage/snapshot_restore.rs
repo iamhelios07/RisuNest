@@ -1690,6 +1690,8 @@ pub(crate) async fn admit_asset_catalogs(
     provider:&dyn Provider,repository:&RepositoryHandle,cancel:&Cancellation,
 ) -> Result<Vec<String>> {
     let scratch=super::leftovers::managed_scratch(store.repository_root(),"asset-catalog-")?;
+    let metadata=rusqlite::Connection::open_with_flags(store.repository_root().join("persistent/persistent.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(transient)?;
     let cas=PayloadCas::new(store.repository_root()).map_err(transient)?;
     let mut planned=BTreeMap::<String,super::lww_residency::PackedSource>::new();
     for catalog in catalogs {
@@ -1702,7 +1704,7 @@ pub(crate) async fn admit_asset_catalogs(
             cancel.check()?;
             if entry.kind!=wire::CatalogEntryKind::Object {return Err(corrupt("asset catalog kind differs"));}
             let hash=hex::encode(entry.content_sha256);
-            let catalogued:Option<i64>=store.library_rows().query_row("SELECT byte_size FROM asset_objects WHERE object_hash=?1",[&hash],|row|row.get(0)).optional().map_err(transient)?;
+            let catalogued:Option<i64>=metadata.query_row("SELECT byte_size FROM asset_objects WHERE object_hash=?1",[&hash],|row|row.get(0)).optional().map_err(transient)?;
             let catalogued=catalogued.map(u64::try_from).transpose().map_err(corrupt)?;
             if catalogued.is_some_and(|size|size!=entry.byte_length)
                 || cas.stat_object(&hash).map_err(transient)?.is_some_and(|size|size!=entry.byte_length) {
