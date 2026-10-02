@@ -3,6 +3,8 @@ import type { SyncBindingTransport, SyncBindingDependencies } from './bindingFlo
 
 const f = vi.hoisted(() => ({
     native: true,
+    selectedIndex: 0,
+    database: { characters: [{ chaId: 'selected-stable-id' }] },
     invoke: vi.fn(),
     install: vi.fn(),
     register: vi.fn(),
@@ -26,6 +28,8 @@ const f = vi.hoisted(() => ({
 vi.mock('@tauri-apps/api/core', () => ({ invoke: f.invoke }))
 vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn(async () => () => {}) }))
 vi.mock('src/ts/platform', () => ({ get isTauri() { return f.native } }))
+vi.mock('src/ts/stores.svelte', () => ({ selectedCharID: { subscribe: (run: (value: number) => void) => { run(f.selectedIndex); return () => {} } } }))
+vi.mock('../database.svelte', () => ({ getDatabase: () => f.database }))
 vi.mock('./bindingProduction', async importOriginal => ({
     ...await importOriginal<typeof import('./bindingProduction')>(),
     installSyncBindingFlow: f.install,
@@ -49,7 +53,7 @@ vi.mock('../generatingConversationRegistry', () => ({ generatingConversations: {
 let production: typeof import('./serverSyncProduction')
 beforeEach(async () => {
     vi.resetModules(); vi.clearAllMocks(); vi.useFakeTimers()
-    f.native = true; f.transport = undefined; f.dependencies = undefined; f.generating = []
+    f.native = true; f.transport = undefined; f.dependencies = undefined; f.generating = []; f.selectedIndex = 0
     const document = new EventTarget() as EventTarget & { visibilityState: string }
     document.visibilityState = 'hidden'
     vi.stubGlobal('document', document)
@@ -66,6 +70,17 @@ beforeEach(async () => {
 afterEach(() => { production.disposeNativeSyncBindings(); vi.useRealTimers(); vi.unstubAllGlobals() })
 
 describe('production server LWW composition', () => {
+    it('passes the actual stable selected character ID to foreground hydration and null when no character is selected', async () => {
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        const state = { target: { kind: 'server' as const, connectionId: 'server' }, targetAuthority: '0', selectionEpoch: '0', libraryId: 'library', progress: null }
+        const context = { state, signal: new AbortController().signal }
+        Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true })
+        await f.transport!.resumeBinding(context)
+        expect(f.invoke).toHaveBeenCalledWith('server_sync_lww_hydrate', { request: expect.objectContaining({ bindingAuthority: '0' }), selectedCharacterId: 'selected-stable-id' })
+        f.selectedIndex = -1
+        await f.transport!.resumeBinding(context)
+        expect(f.invoke).toHaveBeenCalledWith('server_sync_lww_hydrate', { request: expect.objectContaining({ bindingAuthority: '0' }), selectedCharacterId: null })
+    })
     it('installs one shared binding flow without any server configuration and carries the exact pause token', async () => {
         const token = Object.freeze({ id: 'exact-token' })
         f.paused.mockImplementation(async (_reason, operation) => operation(token))

@@ -244,8 +244,11 @@ impl LwwClient {
         config: ServerConfig,
         cancelled: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<Self> {
+        let client = ServerClient::with_cancellation(config, cancelled.clone())?;
+        #[cfg(test)]
+        let client = { let mut client = client; super::client::attach_test_io(root, &mut client); client };
         Ok(Self {
-            client: ServerClient::with_cancellation(config, cancelled.clone())?,
+            client,
             log: OperationLog::open(root)?,
             access: None,
             root: root.into(),

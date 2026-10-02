@@ -428,13 +428,35 @@ pub(crate) fn open_transient_with_check(
     digest: &str,
     check: &dyn Fn() -> Result<()>,
 ) -> Result<Option<TransientBody>> {
+    open_transient_inner(root, scratch_root, digest, check, true)
+}
+pub(crate) fn open_transient_server_with_check(
+    root: &Path,
+    scratch_root: &Path,
+    digest: &str,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<Option<TransientBody>> {
+    open_transient_inner(root, scratch_root, digest, check, false)
+}
+fn open_transient_inner(
+    root: &Path,
+    scratch_root: &Path,
+    digest: &str,
+    check: &dyn Fn() -> Result<()>,
+    allow_external: bool,
+) -> Result<Option<TransientBody>> {
     check()?;
     validate_hash(digest)?;
     let cas = crate::asset_repository::PayloadCas::new(root)?;
-    if let Some(file) = cas.open_object(digest)? {
-        return Ok(Some(TransientBody { body: super::cache::Body::File(file), _directory: None }));
+    #[cfg(test)]
+    let local = cas.open_object_tracked(digest)?.map(super::cache::Body::Tracked);
+    #[cfg(not(test))]
+    let local = cas.open_object(digest)?.map(super::cache::Body::File);
+    if let Some(body) = local {
+        return Ok(Some(TransientBody { body, _directory: None }));
     }
     let Some(proof) = Residency::open(root)?.object(digest, None)? else {
+        if !allow_external { return Ok(None); }
         return Ok(crate::external_storage::lww_residency::hydrate(root, digest, check)?.map(|file|TransientBody {body:super::cache::Body::File(file),_directory:None}));
     };
     let _budget = lock_with_check(&TRANSFER_BUDGET, check)?;
@@ -461,6 +483,8 @@ pub(crate) fn open_transient_with_check(
         return Ok(Some(TransientBody { body, _directory: Some(directory) }));
     }
     let client = super::client::ServerClient::new(proof.config.resolve(root)?)?;
+    #[cfg(test)]
+    let client = { let mut client = client; super::client::attach_test_io(root, &mut client); client };
     client.resolve_identity(false)?;
     check()?;
     let directory = tempfile::Builder::new().prefix("asset-transient-").tempdir_in(scratch_root)?;
@@ -483,22 +507,24 @@ pub(crate) struct HydrationSession {
     directory: Option<tempfile::TempDir>,
     cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HydrationOutcome { AlreadyLocal, Downloaded }
 impl HydrationSession {
     pub(crate) fn new(root: &Path, cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) -> Result<Self> {
         Ok(Self { root: std::fs::canonicalize(root)?, residency: None, clients: Default::default(), cache: None, directory: None, cancellation })
     }
     pub(crate) fn open(&mut self, digest: &str, check: &dyn Fn() -> Result<()>) -> Result<Option<std::fs::File>> {
-        let mut file = None;
-        self.hydrate_many_capture(&[digest.to_owned()], check, |_, opened| file = Some(opened))?;
-        Ok(file)
+        if !self.hydrate_many(&[digest.to_owned()], check)?.is_empty() { return Ok(None); }
+        check()?;
+        Ok(crate::asset_repository::PayloadCas::new(&self.root)?.open_object(digest)?)
     }
     pub(crate) fn hydrate_many(&mut self, digests: &[String], check: &dyn Fn() -> Result<()>) -> Result<Vec<String>> {
-        self.hydrate_many_capture(digests, check, |_, _| {})
+        self.hydrate_many_outcomes(digests, check, |_, _| {})
     }
     pub(crate) fn hydrate_many_observed(&mut self, digests: &[String], check: &dyn Fn() -> Result<()>, on_object_done: &dyn Fn()) -> Result<Vec<String>> {
-        self.hydrate_many_capture(digests, check, |_, _| on_object_done())
+        self.hydrate_many_outcomes(digests, check, |_, _| on_object_done())
     }
-    fn hydrate_many_capture(&mut self, digests: &[String], check: &dyn Fn() -> Result<()>, mut opened: impl FnMut(&str, std::fs::File)) -> Result<Vec<String>> {
+    pub(crate) fn hydrate_many_outcomes(&mut self, digests: &[String], check: &dyn Fn() -> Result<()>, mut opened: impl FnMut(&str, HydrationOutcome)) -> Result<Vec<String>> {
         let mut unavailable = Vec::new();
         let cas = crate::asset_repository::PayloadCas::new(&self.root)?;
         for page in digests.chunks(64) {
@@ -512,14 +538,14 @@ impl HydrationSession {
                 validate_hash(hash)?;
                 {
                     let _guard = crate::asset_repository::coordinator::lock_repository_mutation()?;
-                    if let Some(file) = cas.open_object(hash)? {
-                        opened(hash, file);
+                    if cas.stat_object(hash)?.is_some() {
+                        opened(hash, HydrationOutcome::AlreadyLocal);
                         continue;
                     }
                 }
                 if self.residency.is_none() { self.residency = Some(Residency::open(&self.root)?); }
                 let Some(proof) = self.residency.as_ref().unwrap().object(hash, None)? else {
-                    if let Some(file) = crate::external_storage::lww_residency::hydrate(&self.root, hash, check)? {opened(hash,file);continue;}
+                    if crate::external_storage::lww_residency::hydrate_registered(&self.root, hash, check)? {opened(hash,HydrationOutcome::Downloaded);continue;}
                     unavailable.push(hash.clone());
                     continue;
                 };
@@ -532,7 +558,7 @@ impl HydrationSession {
                     let outcome = cas.publish_staged(staged);
                     check()?;
                     outcome?;
-                    if let Some(file) = cas.open_object(hash)? { opened(hash, file); }
+                    opened(hash, HydrationOutcome::Downloaded);
                     continue;
                 }
                 let key = format!("{}:{}", proof.context, serde_json::to_string(&proof.config)
@@ -543,6 +569,8 @@ impl HydrationSession {
                 let _budget = lock_with_check(&TRANSFER_BUDGET, check)?;
                 if !self.clients.contains_key(&key) {
                     let client = super::client::ServerClient::with_cancellation(objects[0].config.resolve(&self.root)?, self.cancellation.clone())?;
+                    #[cfg(test)]
+                    let client = { let mut client = client; super::client::attach_test_io(&self.root, &mut client); client };
                     client.resolve_identity(false)?;
                     self.clients.insert(key.clone(), client);
                 }
@@ -564,7 +592,7 @@ impl HydrationSession {
                         let outcome = cas.publish_staged(staged);
                         check()?;
                         outcome?;
-                        if let Some(file) = cas.open_object(&object.hash)? { opened(&object.hash, file); }
+                        opened(&object.hash, HydrationOutcome::Downloaded);
                     }
                     drop(body);
                     cache.remove_derived(&object.hash)?;

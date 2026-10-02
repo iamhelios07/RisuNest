@@ -10,6 +10,7 @@ use crate::{
     },
 };
 use std::collections::BTreeSet;
+use rusqlite::OptionalExtension;
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -36,6 +37,42 @@ impl ResidencyStatus {
 }
 
 impl PersistentStore {
+    pub(crate) fn selected_character_asset_hashes(&self, character_id: &str) -> super::StoreResult<Vec<String>> {
+        let generation = super::active_generation(&self.connection)?;
+        let mut roots = crate::asset_repository::migration_gc::AssetRootSet::default();
+        for query in [
+            "SELECT detail FROM characters WHERE generation=?1 AND character_id=?2",
+            "SELECT detail FROM conversations WHERE generation=?1 AND character_id=?2",
+            "SELECT value FROM messages WHERE generation=?1 AND character_id=?2",
+        ] {
+            let mut statement = self.connection.prepare(query)?;
+            let rows = statement.query_map(rusqlite::params![generation, character_id], |row| row.get::<_,String>(0))?;
+            for row in rows { super::snapshot::observe_json_value(&serde_json::from_str(&row?)?, None, &mut roots); }
+        }
+        let image: Option<String> = self.connection.query_row(
+            "SELECT image FROM characters WHERE generation=?1 AND character_id=?2",
+            rusqlite::params![generation, character_id], |row| row.get(0),
+        ).optional()?.flatten();
+        if let Some(image) = image { super::snapshot::observe_json_value(&serde_json::Value::String(image), None, &mut roots); }
+        let mut hashes = std::mem::take(&mut roots.object_hashes);
+        let mut candidates = roots.legacy_asset_keys.into_iter().chain(roots.inlay_ids).collect();
+        super::snapshot::collect_alias_key_candidates(&self.connection, &generation, character_id, &mut candidates, false)?;
+        for candidate in candidates {
+            let mut statement = self.connection.prepare_cached(
+                "SELECT object_hash FROM asset_aliases WHERE generation=?1 AND logical_key=?2 AND object_hash IS NOT NULL",
+            )?;
+            for hash in statement.query_map(rusqlite::params![generation, candidate], |row| row.get::<_,String>(0))? { hashes.insert(hash?); }
+        }
+        let manifest: Option<String> = self.connection.query_row(
+            "SELECT manifest_hash FROM asset_owner_heads WHERE generation=?1 AND owner_kind='character-additional-assets' AND owner_locator=?2 AND present=1",
+            rusqlite::params![generation, character_id], |row| row.get(0),
+        ).optional()?.flatten();
+        hashes.extend(manifest);
+        if let Some(archived) = super::archive::read_archived_object(&self.connection, &generation, character_id)? {
+            hashes.extend(archived.object_roots().map(str::to_owned));
+        }
+        Ok(hashes.into_iter().collect())
+    }
     pub(crate) fn hydrate_registered_remote_assets(
         &self,
         check: impl Fn() -> Result<()>,
@@ -55,22 +92,36 @@ impl PersistentStore {
         check: impl Fn() -> Result<()>,
         on_object_done: impl Fn(),
     ) -> Result<()> {
+        self.hydrate_registered_remote_assets_prioritized(cancellation, None, check, on_object_done)
+    }
+    pub(crate) fn hydrate_registered_remote_assets_prioritized(
+        &self,
+        cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        selected_character_id: Option<&str>,
+        check: impl Fn() -> Result<()>,
+        on_object_done: impl Fn(),
+    ) -> Result<()> {
         if !Residency::exists(&self.repository_root) {
             return Ok(());
         }
         let residency = Residency::open(&self.repository_root)?;
         let mut hydration = crate::server_sync::residency::HydrationSession::new(&self.repository_root, cancellation)?;
+        let mut completed = BTreeSet::new();
         let mut hydrate = |hashes: &[String]| -> Result<()> {
             check()?;
             let mut registered = Vec::new();
             for hash in hashes {
-                if residency.object(hash, None)?.is_some() { registered.push(hash.clone()); }
+                if !completed.contains(hash) && residency.object(hash, None)?.is_some() { registered.push(hash.clone()); }
             }
             if !hydration.hydrate_many_observed(&registered, &check, &on_object_done)?.is_empty() {
                 return Err(SyncError::new("required-asset-unavailable", 409));
             }
+            completed.extend(registered);
             Ok(())
         };
+        if let Some(character_id) = selected_character_id {
+            hydrate(&self.selected_character_asset_hashes(character_id)?)?;
+        }
         let mut cursor = None;
         loop {
             check()?;
@@ -226,6 +277,15 @@ impl PersistentStore {
         cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
         check: impl Fn() -> Result<()>,
     ) -> Result<ResidencyStatus> {
+        self.asset_residency_set_policy_prioritized(policy, cancellation, None, check)
+    }
+    pub(crate) fn asset_residency_set_policy_prioritized(
+        &self,
+        policy: AssetPolicy,
+        cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        selected_character_id: Option<&str>,
+        check: impl Fn() -> Result<()>,
+    ) -> Result<ResidencyStatus> {
         check()?;
         if policy == AssetPolicy::Remote && self.server_stored_config()?.is_none() {
             return Err(SyncError::new("server-not-bound", 409));
@@ -234,6 +294,11 @@ impl PersistentStore {
         if policy == AssetPolicy::Full {
             let inventory = self.residency_inventory(false)?;
             let mut hydration = crate::server_sync::residency::HydrationSession::new(&self.repository_root, cancellation)?;
+            if let Some(character_id) = selected_character_id {
+                if !hydration.hydrate_many(&self.selected_character_asset_hashes(character_id)?, &check)?.is_empty() {
+                    return Err(SyncError::new("required-asset-unavailable", 409));
+                }
+            }
             let unavailable = hydration.hydrate_many(&inventory.referenced.into_iter().collect::<Vec<_>>(), &check)?;
             if !unavailable.is_empty() {
                 return Err(SyncError::new("required-asset-unavailable", 409));
