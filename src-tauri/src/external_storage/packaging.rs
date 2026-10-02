@@ -5245,6 +5245,26 @@ mod tests {
     }
 
     #[test]
+    fn control_catalog_carries_a_verified_indivisible_message_page() {
+        runtime().block_on(async {
+            let root=tempfile::tempdir().unwrap();let destination=tempfile::tempdir().unwrap();
+            let page=risunest_external_storage_format::logical_records::encode_message_page(&[
+                serde_json::json!({"role":"user","content":"x".repeat(risunest_sync_wire::MAX_METADATA_BYTES)})]).unwrap();
+            let source=root.path().join("frozen-page");std::fs::write(&source,&page.bytes).unwrap();
+            let (capture,_)=captured(root.path(),"segment-controls",0,b"{}",b"unrelated asset");
+            let provider=FakeProvider::new(false);let repository=fake::repository();let key=[17;32];
+            let mut transfer=journal(&root.path().join("data-journal"),"segment-controls",&capture);
+            let completed=package_and_upload_control_catalog(vec![AssetCatalogSource{content_hash:page.hash.clone(),byte_length:page.size,source:ObjectSource::File(source)}],
+                root.path(),&root.path().join("data-cache"),&key,limits(256*1024),&mut transfer,&provider,&repository,&PhaseProgress::silent(),&Cancellation::default(),None).await.unwrap();
+            let mut store=crate::persistent_store::PersistentStore::open(destination.path()).unwrap();
+            let hashes=snapshot_restore::admit_data_catalogs(&[completed.catalog.clone()],&mut store,&key,&provider,&repository,&Cancellation::default()).await.unwrap();
+            assert_eq!(hashes,vec![page.hash.clone()]);assert_eq!(store.lww_object_body(&page.hash).unwrap().unwrap(),page.bytes);
+            let remote=RemoteObject::from_stored(&completed.catalog,&repository).unwrap();
+            assert!(snapshot_restore::read_catalog(&remote,wire::CatalogKind::Assets,&key,&root.path().join("wrong-kind"),&provider,&repository,&Cancellation::default()).await.is_err());
+        });
+    }
+
+    #[test]
     fn existing_manifest_control_is_prepared_from_data_pack_independently_of_local_asset_residency() {
         runtime().block_on(async {
             let root=tempfile::tempdir().unwrap();
