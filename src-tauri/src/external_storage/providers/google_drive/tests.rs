@@ -2532,7 +2532,8 @@ fn segment_listing_keeps_logical_names_and_routes_read_stat_delete_to_file_ids()
         assert_eq!(receipt.locator, page.objects[0].locator);
         assert!(receipt.checksum.unwrap().provider_verified && sink.is_verified());
         let downloaded = std::fs::read(body_path).unwrap();
-        assert_eq!(crate::external_storage::lww_segment::open(&downloaded, "synthetic-drive-library", listed_writer, seq, &key).unwrap(), segment);
+        let opened_segment = crate::external_storage::lww_segment::open(&downloaded, "synthetic-drive-library", listed_writer, seq, &key).unwrap();
+        assert_eq!(opened_segment.encode().unwrap(), segment.encode().unwrap());
         provider.delete_object(&repository, &receipt.locator, &cancel).await.unwrap();
         let lines = request_lines(&server);
         assert_eq!(lines.len(), 9);

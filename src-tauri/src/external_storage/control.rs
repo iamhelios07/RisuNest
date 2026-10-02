@@ -1022,6 +1022,7 @@ pub(crate) async fn delete_authenticated_backup_point(
     Ok(RemoteBackupPointDeleteOutcome::Deleted)
 }
 
+#[cfg(test)]
 pub(crate) async fn list_inventory_pages_page(
     descriptor: &Descriptor,
     root_key: &[u8; 32],
