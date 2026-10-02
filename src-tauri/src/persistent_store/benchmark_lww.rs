@@ -1470,6 +1470,12 @@ fn construct_native_target_for_final_stage() {
 }
 
 #[test]
+#[ignore = "setup-only populated renderer endpoint; explicit coordinator authorization required"]
+fn populated_renderer_source_for_final_stage() {
+    final_matrix::renderer_setup().expect("renderer source setup retained its structural cleanup result");
+}
+
+#[test]
 #[ignore = "final-stage physical target matrix, explicit coordinator authorization required"]
 fn final_native_matrix_for_final_stage() {
     final_matrix::run().expect("final matrix retained its raw failure output");
