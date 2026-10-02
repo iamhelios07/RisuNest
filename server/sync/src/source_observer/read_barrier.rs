@@ -234,6 +234,14 @@ pub(crate) fn release(intent: &Intent) -> Result<Observation, &'static str> {
     if state.status != "reached" {
         return Err("read-barrier-not-reached");
     }
+    if state
+        .deadline
+        .is_some_and(|deadline| Instant::now() >= deadline)
+    {
+        drop(state);
+        barrier.cancel("read-barrier-timeout");
+        return Err("read-barrier-timeout");
+    }
     state.status = "released";
     state.released_elapsed_nanos = Some(barrier.started.elapsed().as_nanos().to_string());
     let wakers = std::mem::take(&mut state.wakers);
@@ -338,5 +346,56 @@ impl Drop for Wait {
             self.barrier.cancel("read-barrier-reader-dropped");
             self.finish();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn expired_release_cancels_actual_waiter_without_resuming_body_read() {
+        let _reset = super::super::tests::Reset::new();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("body");
+        let body = b"synthetic deadline body";
+        std::fs::write(&path, body).unwrap();
+        let hash = risunest_sync_wire::hash(body);
+        let generation = begin(
+            root.path(),
+            "deadline".into(),
+            "source".into(),
+            vec![Role {
+                hash: hash.clone(),
+                purposes: ["Asset".into()].into_iter().collect(),
+            }],
+        )
+        .unwrap();
+        let intent = Intent {
+            scope_id: "deadline".into(),
+            generation,
+            barrier_id: "deadline-first-read".into(),
+            hash: hash.clone(),
+            flow: "source".into(),
+        };
+        let (send, receive) = std::sync::mpsc::channel();
+        install_hook(Some(Arc::new(move |event| send.send(event).unwrap())));
+        arm(intent.clone()).unwrap();
+        let context = active().unwrap();
+        let barrier = context.scope.lock().unwrap().read_barrier.clone().unwrap();
+        let worker = worker();
+        let owned_root = root.path().to_owned();
+        let task = std::thread::spawn(move || {
+            let _entered = worker.enter();
+            let mut file = TrackedFile::open(&owned_root, &hash, &path, "file").unwrap();
+            file.read(&mut [0; 1])
+        });
+        receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        barrier.state.lock().unwrap().deadline = Some(Instant::now());
+        assert!(matches!(release(&intent), Err("read-barrier-timeout")));
+        assert!(task.join().unwrap().is_err());
+        let observed = snapshot(true).unwrap();
+        assert!(!observed.complete);
+        assert_eq!(observed.total.read_bytes, 0);
+        assert_eq!(observed.read_barrier.unwrap().status, "cancelled");
     }
 }
