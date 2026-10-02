@@ -73,6 +73,8 @@ pub(crate) struct RetainedObject {
     pub retention_id: String,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct RemoteObject {
     pub context: String,
     pub hash: String,
@@ -459,6 +461,17 @@ fn open_transient_inner(
         if !allow_external { return Ok(None); }
         return Ok(crate::external_storage::lww_residency::hydrate(root, digest, check)?.map(|file|TransientBody {body:super::cache::Body::File(file),_directory:None}));
     };
+    open_transient_server_proof_with_check(root, scratch_root, &proof, check)
+}
+pub(crate) fn open_transient_server_proof_with_check(
+    root: &Path,
+    scratch_root: &Path,
+    proof: &RemoteObject,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<Option<TransientBody>> {
+    check()?;
+    let digest = proof.hash.as_str();
+    validate_hash(digest)?;
     let _budget = lock_with_check(&TRANSFER_BUDGET, check)?;
     #[cfg(test)]
     if let Some(bytes) = test_remote::body(&std::fs::canonicalize(root)?, digest) {
@@ -496,6 +509,7 @@ fn open_transient_inner(
         return Err(SyncError::new("hydration-size-mismatch", 409));
     }
     let body = cache.open_object(digest)?.ok_or_else(|| SyncError::new("hydration-incomplete", 502))?;
+    check()?;
     Ok(Some(TransientBody { body, _directory: Some(directory) }))
 }
 
