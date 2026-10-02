@@ -173,6 +173,8 @@ impl PayloadCas {
         {
             return invalid_owned_path(path, "only private import payloads may be adopted");
         }
+        #[cfg(test)]
+        let mut observed_identity = super::body_io::PendingOwnedIdentity::new();
         let mut file = self.open_exact_owned_file(&canonical)?;
         let identity = exact_file_identity(&file)?;
         #[cfg(any(unix, windows))]
@@ -185,6 +187,8 @@ impl PayloadCas {
         let mut hash = Sha256::new();
         #[cfg(test)]
         crate::persistent_store::hash_work::begin("cas_import_adopt");
+        #[cfg(test)]
+        super::body_io::body_sha_begin("owned", "cas_import_adopt");
         let mut buffer = [0_u8; COPY_BUFFER_BYTES];
         loop {
             if cancelled() {
@@ -200,11 +204,16 @@ impl PayloadCas {
             hash.update(&buffer[..length]);
             #[cfg(test)]
             crate::persistent_store::hash_work::update("cas_import_adopt", length);
+            #[cfg(test)]
+            super::body_io::body_sha_update("owned", "cas_import_adopt", length);
         }
-        if hex::encode(hash.finalize()) != expected_hash || exact_file_identity(&file)? != identity
+        let content_hash = hex::encode(hash.finalize());
+        if content_hash != expected_hash || exact_file_identity(&file)? != identity
         {
             return collision_or_corruption(expected_hash);
         }
+        #[cfg(test)]
+        observed_identity.verified(&content_hash);
         // Check the path still names the held, verified file before publishing.
         let path_file = self.open_exact_owned_file(&canonical)?;
         if exact_file_identity(&path_file)? != identity {
@@ -228,6 +237,10 @@ impl PayloadCas {
         let published = crate::trust_boundary::rename_without_replace(&canonical, &object_path);
         #[cfg(not(any(target_os = "android", windows)))]
         let published = fs::hard_link(&canonical, &object_path);
+        #[cfg(all(test, any(target_os = "android", windows)))]
+        super::body_io::publication_result("rename", &published, expected_size);
+        #[cfg(all(test, not(any(target_os = "android", windows))))]
+        super::body_io::publication_result("hard-link", &published, expected_size);
         let deduplicated = match published {
             Ok(()) => false,
             Err(error) if error.kind() == ErrorKind::AlreadyExists => {
@@ -297,9 +310,13 @@ impl PayloadCas {
             self.ensure_directory(&assets_directory, "staging", &mut directory_entries_synced)?;
         let staging_path = staging_directory.join(format!("{}.tmp", uuid::Uuid::new_v4()));
         let (mut file, staging) = create_staging_file(&staging_path, &staging_directory)?;
+        #[cfg(test)]
+        let mut observed_identity = super::body_io::PendingOwnedIdentity::new();
         let mut hasher = Sha256::new();
         #[cfg(test)]
         crate::persistent_store::hash_work::begin("cas_stage");
+        #[cfg(test)]
+        super::body_io::body_sha_begin("owned", "cas_stage");
         let mut byte_size = 0_u64;
         let mut buffer = [0_u8; COPY_BUFFER_BYTES];
         loop {
@@ -307,10 +324,19 @@ impl PayloadCas {
             if read == 0 {
                 break;
             }
+            #[cfg(not(test))]
             file.write_all(&buffer[..read])?;
+            #[cfg(test)]
+            {
+                let written = file.write_all(&buffer[..read]);
+                super::body_io::staging_write_result(&written, read);
+                written?;
+            }
             hasher.update(&buffer[..read]);
             #[cfg(test)]
             crate::persistent_store::hash_work::update("cas_stage", read);
+            #[cfg(test)]
+            super::body_io::body_sha_update("owned", "cas_stage", read);
             byte_size = byte_size
                 .checked_add(read as u64)
                 .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "payload size overflow"))?;
@@ -319,12 +345,15 @@ impl PayloadCas {
         file.sync_all()?;
         let identity = exact_file_identity(&file)?;
         drop(file);
+        let opened = self.open_exact_owned_file(&staging_path);
         #[cfg(test)]
-        let mut observed_identity = super::body_io::PendingOwnedIdentity::new();
-        let verified_file = self.open_exact_owned_file(&staging_path)?;
+        super::body_io::identity_metadata_open_result(&opened);
+        let verified_file = opened?;
         if exact_file_identity(&verified_file)? != identity {
             return exact_object_changed();
         }
+        #[cfg(test)]
+        super::body_io::verified_identity_metadata_open();
         directory_entries_synced &= sync_directory(&staging_directory)?;
 
         let content_hash = hex::encode(hasher.finalize());
@@ -374,12 +403,17 @@ impl PayloadCas {
         } = staged;
         #[cfg(test)]
         let _body_scope = super::body_io::object_scope(&content_hash);
-        let path_file = self.open_exact_owned_file(&staging.path)?;
+        let opened = self.open_exact_owned_file(&staging.path);
+        #[cfg(test)]
+        super::body_io::identity_metadata_open_result(&opened);
+        let path_file = opened?;
         if exact_file_identity(&verified_file)? != identity
             || exact_file_identity(&path_file)? != identity
         {
             return exact_object_changed();
         }
+        #[cfg(test)]
+        super::body_io::verified_identity_metadata_open();
         let staging_path = staging.path.clone();
         let assets_directory = self.ensure_directory(
             &self.repository_root,
@@ -401,6 +435,10 @@ impl PayloadCas {
             crate::trust_boundary::rename_without_replace(&staging_path, &object_path);
         #[cfg(not(target_os = "android"))]
         let publication = fs::hard_link(&staging_path, &object_path);
+        #[cfg(all(test, target_os = "android"))]
+        super::body_io::publication_result("rename", &publication, byte_size);
+        #[cfg(all(test, not(target_os = "android")))]
+        super::body_io::publication_result("hard-link", &publication, byte_size);
         let deduplicated = match publication {
             Ok(()) => {
                 directory_entries_synced &= sync_directory(&object_directory)?;
@@ -965,6 +1003,8 @@ fn hash_open_file(file: &mut File, cancelled: &dyn Fn() -> bool) -> io::Result<S
     let mut hasher = Sha256::new();
     #[cfg(test)]
     crate::persistent_store::hash_work::begin("cas_existing_verify");
+    #[cfg(test)]
+    let mut observed_hash = super::body_io::PendingBodyHash::new("cas_existing_verify");
     let mut buffer = [0_u8; COPY_BUFFER_BYTES];
     loop {
         if cancelled() {
@@ -980,8 +1020,13 @@ fn hash_open_file(file: &mut File, cancelled: &dyn Fn() -> bool) -> io::Result<S
         hasher.update(&buffer[..read]);
         #[cfg(test)]
         crate::persistent_store::hash_work::update("cas_existing_verify", read);
+        #[cfg(test)]
+        observed_hash.update(read);
     }
-    Ok(hex::encode(hasher.finalize()))
+    let content_hash = hex::encode(hasher.finalize());
+    #[cfg(test)]
+    observed_hash.verified(&content_hash);
+    Ok(content_hash)
 }
 
 fn exact_object_changed<T>() -> io::Result<T> {
@@ -1666,6 +1711,7 @@ mod hash_work_tests {
 #[cfg(test)]
 mod body_io_tests {
     use super::*;
+    use std::collections::BTreeMap;
     use crate::asset_repository::body_io::{register_object_purpose, reset_body_io, take_body_io, BodyPurpose, BodyWork};
 
     fn fixture(bytes: &[u8]) -> (tempfile::TempDir, PayloadCas, PreparedPayload) {
@@ -1673,6 +1719,154 @@ mod body_io_tests {
         let cas = PayloadCas::new(directory.path()).unwrap();
         let prepared = cas.prepare_bytes(bytes).unwrap();
         (directory, cas, prepared)
+    }
+
+    #[test]
+    fn actual_destination_writes_links_and_sha_conserve_control_asset_and_mixed_roles() {
+        use crate::asset_repository::body_io::{BodyShaWork, BodyWork};
+        let directory=tempfile::tempdir().unwrap(); let cas=PayloadCas::new(directory.path()).unwrap();
+        let bodies=[vec![31;13],vec![32;COPY_BUFFER_BYTES+17],vec![33;5]];
+        let hashes=bodies.iter().map(|body|hex::encode(Sha256::digest(body))).collect::<Vec<_>>();
+        reset_body_io(); crate::persistent_store::hash_work::reset_hash_work();
+        register_object_purpose(&hashes[0],BodyPurpose::Control);
+        register_object_purpose(&hashes[1],BodyPurpose::Asset);
+        register_object_purpose(&hashes[2],BodyPurpose::Control); register_object_purpose(&hashes[2],BodyPurpose::Asset);
+        for (body,hash) in bodies.iter().zip(&hashes) {
+            cas.prepare_reader_expected(&mut body.as_slice(),hash,body.len() as u64).unwrap();
+        }
+        let work=take_body_io(); let native=crate::persistent_store::hash_work::take_hash_work();
+        assert!(work.complete()); assert!(native.incomplete.is_empty());
+        let mut sum=BodyWork::default();
+        for (body,hash) in bodies.iter().zip(&hashes) {
+            let object=&work.objects[hash]; assert_eq!(object.work,BodyWork::default());
+            sum.add(&object.owned_work);
+            assert_eq!(object.owned_work.staging_written_bytes,body.len() as u64);
+            assert_eq!(object.owned_work.staging_requested_bytes,body.len() as u64);
+            assert_eq!(object.owned_work.publication_attempts,1); assert_eq!(object.owned_work.publications,1);
+            assert_eq!(object.owned_work.publication_object_bytes,body.len() as u64);
+            assert_eq!(object.owned_work.body_sha["cas_stage"],BodyShaWork{calls:1,bytes:body.len() as u64});
+            #[cfg(not(target_os="android"))]
+            assert_eq!(object.owned_work.publication_kinds["hard-link"].successes,1);
+            #[cfg(target_os="android")]
+            assert_eq!(object.owned_work.publication_kinds["rename"].successes,1);
+        }
+        assert_eq!(sum,work.domains["owned"]);
+        assert_eq!(sum.body_sha["cas_stage"].calls,native.domains["cas_stage"].calls);
+        assert_eq!(sum.body_sha["cas_stage"].bytes,native.domains["cas_stage"].bytes);
+        assert_eq!(work.control_work(),work.objects[&hashes[0]].owned_work);
+        let mut assets=work.objects[&hashes[1]].owned_work.clone(); assets.add(&work.objects[&hashes[2]].owned_work);
+        assert_eq!(work.asset_work(),assets); assert_eq!(work.unknown_work(),BodyWork::default());
+    }
+
+    #[test]
+    fn existing_destination_reports_actual_link_result_and_separate_verified_sha() {
+        let bytes=b"synthetic deduplicated destination";
+        let (_directory,cas,prepared)=fixture(bytes);
+        reset_body_io(); register_object_purpose(&prepared.content_hash,BodyPurpose::Asset);
+        crate::persistent_store::hash_work::reset_hash_work();
+        assert!(cas.prepare_reader_expected(&mut bytes.as_slice(),&prepared.content_hash,bytes.len() as u64).unwrap().deduplicated);
+        let work=take_body_io(); let native=crate::persistent_store::hash_work::take_hash_work();
+        assert!(work.complete()); let object=&work.objects[&prepared.content_hash];
+        assert_eq!(object.owned_work.staging_written_bytes,bytes.len() as u64);
+        assert_eq!(object.owned_work.publication_attempts,1); assert_eq!(object.owned_work.publications,0);
+        assert_eq!(object.owned_work.publication_already_exists,1); assert_eq!(object.owned_work.publication_failures,0);
+        assert_eq!(object.owned_work.publication_object_bytes,0);
+        assert_eq!(object.work.body_sha["cas_existing_verify"].calls,1);
+        assert_eq!(object.work.body_sha["cas_existing_verify"].bytes,bytes.len() as u64);
+        assert_eq!(object.work.body_sha["cas_existing_verify"].bytes,native.domains["cas_existing_verify"].bytes);
+        assert_eq!(object.owned_work.body_sha["cas_stage"].bytes,native.domains["cas_stage"].bytes);
+    }
+
+    #[test]
+    fn actual_import_adoption_attributes_sha_only_after_computed_identity_validation() {
+        let bytes=b"synthetic private import asset";
+        let hash=hex::encode(Sha256::digest(bytes));
+        for valid in [true,false] {
+            let directory=tempfile::tempdir().unwrap(); let cas=PayloadCas::new(directory.path()).unwrap();
+            let jobs=directory.path().join("native-file-jobs").join("jobs").join("synthetic-import");
+            fs::create_dir_all(&jobs).unwrap(); let path=jobs.join("asset.payload"); fs::write(&path,bytes).unwrap();
+            let expected=if valid {hash.clone()} else {"ad".repeat(32)};
+            reset_body_io(); register_object_purpose(&expected,BodyPurpose::Asset);
+            crate::persistent_store::hash_work::reset_hash_work();
+            let result=cas.adopt_import_payload(&path,&expected,bytes.len() as u64,&||false);
+            assert_eq!(result.is_ok(),valid);
+            let work=take_body_io(); let native=crate::persistent_store::hash_work::take_hash_work();
+            assert_eq!(work.complete(),valid);
+            assert_eq!(work.domains["owned"].body_sha["cas_import_adopt"].bytes,native.domains["cas_import_adopt"].bytes);
+            if valid {
+                let object=&work.objects[&hash].owned_work;
+                assert_eq!(object.body_sha["cas_import_adopt"].bytes,bytes.len() as u64);
+                assert_eq!(object.publication_attempts,1); assert_eq!(object.publications,1);
+                assert_eq!(object.staging_write_attempts,0); assert_eq!(*object,work.asset_work());
+                #[cfg(any(target_os="android",windows))]
+                assert_eq!(object.publication_kinds["rename"].successes,1);
+                #[cfg(not(any(target_os="android",windows)))]
+                assert_eq!(object.publication_kinds["hard-link"].successes,1);
+            } else {
+                assert_eq!(work.unattributed_owned.body_sha["cas_import_adopt"].bytes,bytes.len() as u64);
+                assert_eq!(work.unattributed_owned.publication_attempts,0);
+                assert!(path.exists()); assert!(cas.stat_object(&expected).unwrap().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn failed_stream_retains_actual_copy_and_sha_prefix_without_claiming_identity() {
+        struct Prefix(bool);
+        impl Read for Prefix { fn read(&mut self,buffer:&mut[u8])->io::Result<usize> {
+            if self.0 { return Err(io::Error::other("synthetic reader failure")); }
+            self.0=true; buffer[..3].copy_from_slice(b"abc"); Ok(3)
+        }}
+        let directory=tempfile::tempdir().unwrap(); let cas=PayloadCas::new(directory.path()).unwrap();
+        reset_body_io(); crate::persistent_store::hash_work::reset_hash_work();
+        assert!(cas.prepare_reader(&mut Prefix(false)).is_err());
+        let work=take_body_io(); let native=crate::persistent_store::hash_work::take_hash_work();
+        assert!(!work.complete()); assert!(work.objects.is_empty());
+        assert_eq!(work.unattributed_owned.staging_write_attempts,1);
+        assert_eq!(work.unattributed_owned.staging_written_bytes,3);
+        assert_eq!(work.unattributed_owned.body_sha["cas_stage"].bytes,3);
+        assert_eq!(work.unattributed_owned.body_sha["cas_stage"].bytes,native.domains["cas_stage"].bytes);
+        assert_eq!(work.unattributed_owned,work.domains["owned"]);
+        assert_eq!(work.unattributed_owned.publication_attempts,0);
+    }
+
+    #[test]
+    fn explicit_worker_scope_aggregates_actual_cas_work_and_native_worker_receipt() {
+        use crate::asset_repository::body_io::{capture_body_io_scope,with_body_io_scope};
+        let directory=tempfile::tempdir().unwrap(); let cas=PayloadCas::new(directory.path()).unwrap();
+        let bytes=b"synthetic worker destination"; let hash=hex::encode(Sha256::digest(bytes));
+        reset_body_io(); register_object_purpose(&hash,BodyPurpose::Asset);
+        crate::persistent_store::hash_work::reset_hash_work();
+        let scope=capture_body_io_scope();
+        let native=std::thread::spawn(move ||with_body_io_scope(scope,|| {
+            crate::persistent_store::hash_work::reset_hash_work();
+            cas.prepare_reader_expected(&mut bytes.as_slice(),&hash,bytes.len() as u64).unwrap();
+            crate::persistent_store::hash_work::take_hash_work()
+        })).join().unwrap();
+        let work=take_body_io(); assert!(work.complete());
+        assert_eq!(work.worker_scopes_started,1); assert_eq!(work.worker_scopes_settled,1);
+        assert_eq!(work.pending_worker_scopes,0); assert_eq!(work.worker_threads.len(),1);
+        assert_eq!(work.asset_work().staging_written_bytes,bytes.len() as u64);
+        assert_eq!(work.asset_work().body_sha["cas_stage"].bytes,native.domains["cas_stage"].bytes);
+        assert!(native.incomplete.is_empty());
+        assert!(crate::persistent_store::hash_work::take_hash_work().domains.is_empty());
+    }
+
+    #[test]
+    fn outstanding_worker_scope_reset_and_late_work_cannot_report_complete_zero() {
+        use crate::asset_repository::body_io::{capture_body_io_scope,with_body_io_scope};
+        let directory=tempfile::tempdir().unwrap(); let cas=PayloadCas::new(directory.path()).unwrap();
+        let bytes=b"synthetic late worker"; let hash=hex::encode(Sha256::digest(bytes));
+        reset_body_io(); register_object_purpose(&hash,BodyPurpose::Asset);
+        let scope=capture_body_io_scope(); let old=scope.scope.clone();
+        let before=take_body_io(); assert!(!before.complete()); assert_eq!(before.pending_worker_scopes,1);
+        std::thread::spawn(move ||with_body_io_scope(scope,|| {
+            cas.prepare_reader_expected(&mut bytes.as_slice(),&hash,bytes.len() as u64).unwrap();
+        })).join().unwrap();
+        assert!(!take_body_io().complete());
+        let late=old.lock().unwrap(); assert!(!late.complete()); assert!(late.scope_violations>0);
+        assert_eq!(late.asset_work().staging_written_bytes,bytes.len() as u64);
+        assert_eq!(late.worker_scopes_started,late.worker_scopes_settled);
     }
 
     #[test]
@@ -1686,13 +1880,53 @@ mod body_io_tests {
             let staged = cas.stage_reader_expected(&mut bytes.as_slice(), &hash, bytes.len() as u64).unwrap();
             cas.publish_staged(staged).unwrap();
             let work = take_body_io(); assert!(work.complete());
-            assert_eq!(work.domains["owned"], BodyWork { open_attempts: 2, opens: 2, ..Default::default() });
+            assert_eq!(work.domains["owned"], BodyWork { open_attempts: 2, opens: 2,
+                identity_metadata_open_attempts: 2, identity_metadata_opens: 2,
+                verified_identity_metadata_opens: 2,
+                staging_write_attempts: 1, staging_writes: 1, staging_requested_bytes: bytes.len() as u64,
+                staging_written_bytes: bytes.len() as u64, publication_attempts: 1, publications: 1,
+                publication_object_bytes: bytes.len() as u64,
+                publication_kinds: BTreeMap::from([(if cfg!(target_os="android") {"rename"} else {"hard-link"}, crate::asset_repository::body_io::PublicationWork {
+                    attempts:1,successes:1,object_bytes:bytes.len() as u64,..Default::default()
+                })]),
+                body_sha: BTreeMap::from([("cas_stage",crate::asset_repository::body_io::BodyShaWork {calls:1,bytes:bytes.len() as u64})]),
+                ..Default::default() });
             assert_eq!(work.objects[&hash].owned_work, work.domains["owned"]);
             assert_eq!(work.objects[&hash].work, BodyWork::default());
             assert_eq!(work.unknown_work(), BodyWork::default());
             let classified = if purpose == BodyPurpose::Control { work.control_work() } else { work.asset_work() };
             assert_eq!(classified, work.domains["owned"]);
         }
+    }
+
+    #[test]
+    fn two_control_stagings_conserve_four_verified_identity_metadata_opens() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let bodies = [b"first synthetic control".as_slice(), b"second synthetic control".as_slice()];
+        let hashes = bodies.map(risunest_sync_wire::hash);
+        reset_body_io();
+        for (bytes, hash) in bodies.into_iter().zip(&hashes) {
+            register_object_purpose(hash, BodyPurpose::Control);
+            let mut reader = bytes;
+            let staged = cas.stage_reader_expected(&mut reader, hash, bytes.len() as u64).unwrap();
+            cas.publish_staged(staged).unwrap();
+        }
+        let work = take_body_io(); assert!(work.complete());
+        let owned = work.domains["owned"].clone();
+        assert_eq!(owned, BodyWork { open_attempts: 4, opens: 4,
+            identity_metadata_open_attempts: 4, identity_metadata_opens: 4,
+            verified_identity_metadata_opens: 4,
+            staging_write_attempts: 2, staging_writes: 2, staging_requested_bytes: bodies.iter().map(|body|body.len() as u64).sum(),
+            staging_written_bytes: bodies.iter().map(|body|body.len() as u64).sum(), publication_attempts: 2, publications: 2,
+            publication_object_bytes: bodies.iter().map(|body|body.len() as u64).sum(),
+            publication_kinds: BTreeMap::from([(if cfg!(target_os="android") {"rename"} else {"hard-link"}, crate::asset_repository::body_io::PublicationWork {
+                attempts:2,successes:2,object_bytes:bodies.iter().map(|body|body.len() as u64).sum(),..Default::default()
+            })]),
+            body_sha: BTreeMap::from([("cas_stage",crate::asset_repository::body_io::BodyShaWork {calls:2,bytes:bodies.iter().map(|body|body.len() as u64).sum()})]),
+            ..Default::default() });
+        assert_eq!(work.control_work(), owned); assert_eq!(work.asset_work(), BodyWork::default());
+        for hash in hashes { assert_eq!(work.objects[&hash].owned_work.verified_identity_metadata_opens, 2); }
     }
 
     #[test]
@@ -1706,15 +1940,77 @@ mod body_io_tests {
         let unknown = take_body_io(); assert!(!unknown.complete());
         assert_eq!(unknown.unknown_work(), unknown.domains["owned"]);
         assert_eq!(unknown.control_work(), BodyWork::default());
+        assert_eq!(unknown.unknown_work().verified_identity_metadata_opens, 2);
         register_object_purpose(&hash, BodyPurpose::Control);
         assert!(cas.stage_reader_expected(&mut bytes.as_slice(), &hash, 0).is_err());
         let failed = take_body_io(); assert!(!failed.complete());
         assert_eq!(failed.unattributed_owned.opens, 1);
         assert_eq!(failed.unattributed_owned, failed.domains["owned"]);
+        assert_eq!(failed.unattributed_owned.verified_identity_metadata_opens, 1);
         reset_body_io();
         assert!(cas.open_exact_owned_file(&directory.path().join("missing.tmp")).is_err());
         let missing = take_body_io(); assert!(!missing.complete());
         assert_eq!(missing.unattributed_owned.failed_opens, 1);
+        assert_eq!(missing.unattributed_owned.identity_metadata_open_attempts, 0);
+    }
+
+    #[test]
+    fn identity_metadata_proof_excludes_nonidentity_owned_opens_and_mixed_assets() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let bytes = b"synthetic owned identity discriminator";
+        let hash = risunest_sync_wire::hash(bytes);
+        let path = directory.path().join("known-control.tmp");
+        std::fs::write(&path, bytes).unwrap();
+        reset_body_io(); register_object_purpose(&hash, BodyPurpose::Control);
+        {
+            let _scope = super::super::body_io::object_scope(&hash);
+            drop(cas.open_exact_owned_file(&path).unwrap());
+        }
+        let work = take_body_io(); assert!(work.complete());
+        assert_eq!(work.control_work().opens, 1);
+        assert_eq!(work.control_work().identity_metadata_open_attempts, 0);
+        assert_eq!(work.control_work().verified_identity_metadata_opens, 0);
+        assert_eq!(work.objects[&hash].owned_work, work.domains["owned"]);
+        register_object_purpose(&hash, BodyPurpose::Control);
+        register_object_purpose(&hash, BodyPurpose::Asset);
+        cas.prepare_bytes(bytes).unwrap();
+        let mixed = take_body_io(); assert!(mixed.complete());
+        assert_eq!(mixed.control_work(), BodyWork::default());
+        assert_eq!(mixed.asset_work(), mixed.domains["owned"]);
+        assert_eq!(mixed.asset_work().verified_identity_metadata_opens, 2);
+        register_object_purpose(&hash, BodyPurpose::Control);
+        drop(cas.open_object(&hash).unwrap().unwrap());
+        let raw = take_body_io(); assert!(!raw.complete());
+        assert_eq!(raw.domains["managed"].escaped_handles, 1);
+        assert_eq!(raw.domains["managed"].verified_identity_metadata_opens, 0);
+    }
+
+    #[test]
+    fn identity_metadata_open_failure_and_identity_mismatch_never_become_verified() {
+        for missing in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let cas = PayloadCas::new(directory.path()).unwrap();
+            let bytes = b"synthetic rejected staging identity";
+            let hash = risunest_sync_wire::hash(bytes);
+            reset_body_io(); register_object_purpose(&hash, BodyPurpose::Control);
+            let staged = cas.stage_reader_expected(&mut bytes.as_slice(), &hash, bytes.len() as u64).unwrap();
+            let path = staged.staging.path.clone();
+            std::fs::remove_file(&path).unwrap();
+            if !missing { std::fs::write(&path, b"replacement has a different identity and length").unwrap(); }
+            assert!(cas.publish_staged(staged).is_err());
+            let work = take_body_io(); assert!(work.complete());
+            let owned = work.domains["owned"].clone();
+            assert_eq!(owned.identity_metadata_open_attempts, 2);
+            assert_eq!(owned.verified_identity_metadata_opens, 1);
+            assert_eq!(owned.identity_metadata_opens, if missing { 1 } else { 2 });
+            assert_eq!(owned.identity_metadata_failed_opens, if missing { 1 } else { 0 });
+            assert_eq!(owned.open_attempts, owned.identity_metadata_open_attempts);
+            assert_eq!(owned.opens, owned.identity_metadata_opens);
+            assert_eq!(owned.failed_opens, owned.identity_metadata_failed_opens);
+            assert_eq!(work.objects[&hash].owned_work, owned);
+            assert_eq!(work.control_work(), owned);
+        }
     }
 
     #[test]
@@ -1727,6 +2023,7 @@ mod body_io_tests {
         let staged = cas.stage_reader_expected(&mut bytes.as_slice(), &hash, bytes.len() as u64).unwrap();
         let live = take_body_io(); assert!(!live.complete());
         assert_eq!(live.control_work().outstanding_readers, 1);
+        assert_eq!(live.control_work().verified_identity_metadata_opens, 1);
         drop(staged); assert!(!take_body_io().complete());
         reset_body_io(); register_object_purpose(&hash, BodyPurpose::Control);
         let staged = cas.stage_reader_expected(&mut bytes.as_slice(), &hash, bytes.len() as u64).unwrap();
@@ -1735,6 +2032,8 @@ mod body_io_tests {
         }).join().unwrap();
         let owner = take_body_io(); assert!(!owner.complete()); assert!(!worker.complete());
         assert_eq!(owner.control_work().opens, 1); assert_eq!(worker.unknown_work().opens, 1);
+        assert_eq!(owner.control_work().verified_identity_metadata_opens, 1);
+        assert_eq!(worker.unknown_work().verified_identity_metadata_opens, 1);
         assert_eq!(owner.domains["owned"].outstanding_readers, 0);
     }
 
@@ -1823,9 +2122,12 @@ mod body_io_tests {
         let work = take_body_io();
         assert_eq!(work.domains["managed"], BodyWork {
             open_attempts: 1, opens: 1, read_operations: 1, read_bytes: COPY_BUFFER_BYTES as u64,
+            body_sha:BTreeMap::from([("cas_existing_verify",crate::asset_repository::body_io::BodyShaWork {calls:1,bytes:COPY_BUFFER_BYTES as u64})]),
             ..Default::default()
         });
-        assert!(work.complete());
+        assert_eq!(work.asset_work().read_bytes,COPY_BUFFER_BYTES as u64);
+        assert_eq!(work.unattributed_managed.body_sha["cas_existing_verify"].bytes,COPY_BUFFER_BYTES as u64);
+        assert!(!work.complete());
     }
 
     #[test]

@@ -235,6 +235,26 @@ impl TestIoCounters {
     pub(crate) fn reset(&self) { for value in [&self.requests,&self.request_body_bytes,&self.response_body_bytes] {value.store(0,std::sync::atomic::Ordering::Relaxed);} }
     pub(crate) fn snapshot(&self) -> [u64;3] { [self.requests.load(std::sync::atomic::Ordering::Relaxed),self.request_body_bytes.load(std::sync::atomic::Ordering::Relaxed),self.response_body_bytes.load(std::sync::atomic::Ordering::Relaxed)] }
 }
+#[cfg(test)]
+thread_local! {
+    static TEST_IO_SCOPES: std::cell::RefCell<Vec<(Vec<std::path::PathBuf>, Arc<TestIoCounters>)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+#[cfg(test)]
+pub(crate) fn with_test_io<T>(root: &std::path::Path, counters: Arc<TestIoCounters>, operation: impl FnOnce() -> T) -> T {
+    struct Scope;
+    impl Drop for Scope { fn drop(&mut self) { TEST_IO_SCOPES.with(|scopes| { scopes.borrow_mut().pop(); }); } }
+    let mut roots = vec![root.to_owned()];
+    if let Ok(canonical) = std::fs::canonicalize(root) { roots.push(canonical); }
+    TEST_IO_SCOPES.with(|scopes| scopes.borrow_mut().push((roots, counters)));
+    let _scope = Scope;
+    operation()
+}
+#[cfg(test)]
+pub(crate) fn attach_test_io(root: &std::path::Path, client: &mut ServerClient) {
+    client.test_io = TEST_IO_SCOPES.with(|scopes| scopes.borrow().iter().rev()
+        .find(|(roots, _)| roots.iter().any(|candidate| candidate == root))
+        .map(|(_, counters)| counters.clone()));
+}
 /// The activity id shown while frames or chunks are in flight.
 pub(crate) const ACTIVITY_UPLOADING: u8 = 4;
 /// Restores the activity the transfer replaced, on every exit path. Nested

@@ -355,6 +355,7 @@ fn import_jpeg_asset_with_before_commit(
             revision: committed.revision,
             source_bytes: prepared.byte_size,
             source_sha256: prepared.content_hash,
+            source_fingerprint_kind: crate::native_file_jobs::SourceFingerprintKind::WholeFileSha256,
             character_count: 1,
             preset_count: 0,
             warning_codes: Vec::new(),

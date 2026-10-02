@@ -9,6 +9,18 @@ function transport(receive=vi.fn(async()=>{})) {
     return {receiveAvailableChanges:receive,fenceOldJobs:vi.fn(async()=>{}),resumeBinding:vi.fn(async()=>{})} as unknown as SyncBindingTransport
 }
 describe('bound library replacement prerequisite',()=>{
+    it('skips new catchup for an exact committed restore while retaining old-job and authority fences',async()=>{
+        const adapter={fenceOldJobs:vi.fn(async()=>{}),resumeBinding:vi.fn(async()=>{})} as unknown as SyncBindingTransport
+        const release=registerSyncBindingTransport(state.target as {kind:'server';connectionId:string},adapter)
+        try {
+            const prepared=await prepareBoundLibraryReplacement({confirmedCommittedRestore:true})
+            await prepared.fence()
+            expect(adapter.fenceOldJobs).toHaveBeenCalledOnce()
+            expect(native.assertAuthority).toHaveBeenCalledTimes(2)
+            native.state.mockResolvedValue({...state,libraryId:'synthetic-other-library'})
+            await expect(prepared.assertAuthority()).rejects.toThrow('changed')
+        } finally {release()}
+    })
     it('fails closed when its bound adapter or receive hook is unavailable',async()=>{
         await expect(prepareBoundLibraryReplacement()).rejects.toThrow('unavailable')
         const release=registerSyncBindingTransport(state.target as {kind:'server';connectionId:string},{fenceOldJobs:async()=>{}} as unknown as SyncBindingTransport)

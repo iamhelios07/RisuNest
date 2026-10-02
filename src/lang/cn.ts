@@ -1,5 +1,8 @@
 export const languageChinese = {
     risuNest: {
+        importDialog: {
+            warningUpstreamRestoreLosses: '部分冷存储或内嵌数据无法恢复。请检查恢复的数据。',
+        },
         plugins: {
             "removeTitle": "删除此插件吗？",
             "removeDescription": "同时删除插件数据后，即使重新安装插件也无法恢复设置和保存的内容。保留插件数据可在重新安装后继续使用。",
@@ -50,8 +53,8 @@ export const languageChinese = {
         "requestLogRemoved": "该请求记录已被删除。",
         "requestLogRemovedDesc": "当客户端刷新或加载时，该请求记录会被删除。",
         "vertexAuthError": "Vertex AI 身份验证详情缺失。",
-        "coldStorageIncompleteRestoreConfirm": (characterNames: string, unavailableCount: number, unresolvedCount: number) =>
-            `无法恢复 ${characterNames || "未知角色"}的冷存储数据。${unresolvedCount > 0 ? `有 ${unresolvedCount} 个项目无法关联到角色。` : ""}\n\n如果继续，${unavailableCount} 个冷存储项目将不可用，受影响的角色或聊天数据可能会永久丢失。\n\n仍要继续不完整的恢复吗？`
+        "coldStorageIncompleteRestoreConfirm": (characterNames: string, unavailableCount: number, unresolvedCount: number, includeQuestion = true) =>
+            `无法恢复 ${characterNames || "未知角色"}的冷存储数据。${unresolvedCount > 0 ? `有 ${unresolvedCount} 个项目无法关联到角色。` : ""}\n\n如果继续，${unavailableCount} 个冷存储项目将不可用，受影响的角色或聊天数据可能会永久丢失。${includeQuestion ? "\n\n仍要继续不完整的恢复吗？" : ""}`
     },
     "showHelp": "显示帮助",
     "help": {

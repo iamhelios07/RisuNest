@@ -61,7 +61,6 @@ const textEncoder = new TextEncoder()
 export interface PersistentStoreOpenResult {
     revision: DataRevision
     /** Present when a requested snapshot restore was skipped and the old database stayed active. */
-    restoreFailure?: string
 }
 
 interface NativeStoreError {
@@ -164,19 +163,12 @@ function batches<T>(values: T[], limit: number): T[][] {
 }
 
 export class SqlitePersistentDataStore implements PersistentDataStore {
-    /** Latest native revision and skipped restore details; every open still reaches the store. */
+    /** Latest native revision; every open still reaches the store. */
     lastOpenResult: PersistentStoreOpenResult | null = null
 
     async open(): Promise<void> {
         const result = await invokeStore<PersistentStoreOpenResult>('pds_open')
         this.lastOpenResult = result
-        if (result?.restoreFailure) {
-            // The native side already wrote this to the native log, but the web layer keeps its
-            // own console breadcrumb so a skipped restore is not silent in the frontend.
-            console.warn(
-                `Persistent store opened without the requested snapshot restore: ${result.restoreFailure}`,
-            )
-        }
     }
 
     readRoot(): Promise<Versioned<PersistentRoot>> {

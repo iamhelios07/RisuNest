@@ -30,32 +30,19 @@ function item(
         pinned: false,
         complete: true,
         verified: true,
-        includedSections: [],
+        includedSections: ['hypa', 'local-plugins', 'local-settings'],
         sameDevice: false,
         ...overrides,
     }
 }
 describe('external storage onboarding action', () => {
-    it('replaces only what a backup covers, so no restore restarts the app', () => {
+    it('restores the complete backup scope and rejects incomplete entries', () => {
         expect(externalOnboardingRestoreAreas(item('one', '1'))).toEqual([
-            'library',
-            'referencedAssets',
+            'library', 'referencedAssets', 'hypa', 'local-plugins', 'local-settings',
         ])
-        expect(
-            externalOnboardingRestoreAreas(
-                item('two', '1', {
-                    includedSections: ['hypa', 'local-plugins', 'local-settings'],
-                }),
-            ),
-        ).toEqual(['library', 'referencedAssets', 'hypa', 'local-plugins'])
-        expect(
-            externalOnboardingRestoreAreas(
-                item('three', '1', {
-                    includedSections: ['hypa', 'local-settings'],
-                    sameDevice: true,
-                }),
-            ),
-        ).toEqual(['library', 'referencedAssets', 'hypa', 'local-settings'])
+        expect(() => externalOnboardingRestoreAreas(item('two', '1', {
+            includedSections: ['hypa', 'local-settings'],
+        }))).toThrow('complete restore scope')
         expect(externalOnboardingRestoreRestarts()).toBe(false)
     })
 })

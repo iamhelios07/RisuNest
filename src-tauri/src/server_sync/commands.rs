@@ -85,15 +85,16 @@ pub(crate) async fn server_sync_asset_status(
 pub(crate) async fn server_sync_asset_policy(
     app: AppHandle,
     policy: super::residency::AssetPolicy,
+    selected_character_id: Option<String>,
 ) -> Result<crate::persistent_store::asset_residency::ResidencyStatus> {
-    logged_blocking("asset-policy", move || server_sync_asset_policy_operation(&app, policy)).await
+    logged_blocking("asset-policy", move || server_sync_asset_policy_operation(&app, policy, selected_character_id.as_deref())).await
 }
 
-fn server_sync_asset_policy_operation<R: tauri::Runtime>(app: &AppHandle<R>, policy: super::residency::AssetPolicy) -> Result<crate::persistent_store::asset_residency::ResidencyStatus> {
+fn server_sync_asset_policy_operation<R: tauri::Runtime>(app: &AppHandle<R>, policy: super::residency::AssetPolicy, selected_character_id: Option<&str>) -> Result<crate::persistent_store::asset_residency::ResidencyStatus> {
     let _admission = claim_library(&app)?;
     let state = app.state::<ServerSyncCommandState>();
     let (_running, cancelled) = state.claim_preparation()?;
-    job_store(&app)?.asset_residency_set_policy_cancelled(policy, Some(cancelled.clone()), || {
+    job_store(&app)?.asset_residency_set_policy_prioritized(policy, Some(cancelled.clone()), selected_character_id, || {
         if cancelled.load(Ordering::Acquire) {
             Err(SyncError::new("cancelled", 409))
         } else {
@@ -196,8 +197,13 @@ pub(crate) async fn server_sync_lww_drain(app:AppHandle,request:crate::persisten
     logged_blocking("drain",move||{let state=app.state::<ServerSyncCommandState>();let (_job,cancelled)=state.claim_transport(&app.state::<crate::native_file_jobs::NativeFileJobState>().admission,"send")?;let mut store=job_store(&app)?;let core=lww_client_cancelled(&store,Some(cancelled))?;let mut next=request;while core.push(&mut store,&next,&generating)?.is_some(){next.request_id=uuid::Uuid::new_v4().to_string();}if !store.lww_read_outbox(next.binding_authority,1)?.entries.is_empty(){return Err(SyncError::new("generation-active",409));}Ok(())}).await
 }
 #[tauri::command]
-pub(crate) async fn server_sync_lww_hydrate(app:AppHandle,request:crate::persistent_store::lww::Header)->Result<()> {
-    logged_blocking("hydrate",move|| {let state=app.state::<ServerSyncCommandState>();let (_job,cancelled)=state.claim_transport(&app.state::<crate::native_file_jobs::NativeFileJobState>().admission,"hydrate")?;let store=job_store(&app)?;if store.server_asset_policy()?!=super::residency::AssetPolicy::Full{return Ok(());}let authority=request.binding_authority;store.hydrate_registered_remote_assets_cancelled(Some(cancelled.clone()),||{if cancelled.load(Ordering::Acquire){return Err(SyncError::new("cancelled",409));}if store.lww_binding_authority()?!=authority{return Err(SyncError::new("binding-authority-changed",409));}Ok(())})}).await
+pub(crate) async fn server_sync_lww_hydrate(app:AppHandle,request:crate::persistent_store::lww::Header,selected_character_id:Option<String>)->Result<()> {
+    logged_blocking("hydrate",move|| {let state=app.state::<ServerSyncCommandState>();let (_job,cancelled)=state.claim_transport(&app.state::<crate::native_file_jobs::NativeFileJobState>().admission,"hydrate")?;let store=job_store(&app)?;hydrate_binding_assets(&store,&request,cancelled,selected_character_id.as_deref(),||{})}).await
+}
+pub(crate) fn hydrate_binding_assets(store:&crate::persistent_store::PersistentStore,request:&crate::persistent_store::lww::Header,cancelled:Arc<AtomicBool>,selected_character_id:Option<&str>,on_object_done:impl Fn())->Result<()> {
+    if store.server_asset_policy()?!=super::residency::AssetPolicy::Full{return Ok(());}
+    let authority=request.binding_authority;
+    store.hydrate_registered_remote_assets_prioritized(Some(cancelled.clone()),selected_character_id,||{if cancelled.load(Ordering::Acquire){return Err(SyncError::new("cancelled",409));}if store.lww_binding_authority()?!=authority{return Err(SyncError::new("binding-authority-changed",409));}Ok(())},on_object_done)
 }
 
 #[tauri::command]

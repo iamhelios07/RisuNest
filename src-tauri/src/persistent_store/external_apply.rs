@@ -567,9 +567,6 @@ fn open_snapshot_input(
         ObjectSource::Library(_) => {
             return invalid("External snapshot library body is not an input");
         }
-        ObjectSource::Unchanged => {
-            return invalid("External snapshot record body was not fetched");
-        }
     };
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_file() || crate::trust_boundary::is_link_like(&metadata) {
@@ -628,11 +625,9 @@ where
             if digest != &object.content_hash {
                 return invalid("External snapshot library body is not the object it names");
             }
-            let path = cas
-                .object_path(&object.content_hash)?
-                .ok_or_else(|| validation("External snapshot library body is missing"))?;
-            let file = crate::trust_boundary::open_regular_source(&path)?;
-            if file.metadata()?.len() != object.byte_length {
+            let size = cas.stat_object(&object.content_hash)?.or(
+                crate::external_storage::lww_residency::stat(repository_root, &object.content_hash)?);
+            if size != Some(object.byte_length) {
                 return invalid("External snapshot input size differs from its catalog");
             }
             continue;
@@ -1243,7 +1238,7 @@ fn require_object(
         .copied()
         .ok_or_else(|| validation("External snapshot has an incomplete payload reference"))?;
     if expected_size.is_some_and(|expected| expected != catalog_size)
-        || cas.stat_object(hash)? != Some(catalog_size)
+        || cas.stat_object(hash)?.or(crate::external_storage::lww_residency::stat(cas.repository_root(), hash)?) != Some(catalog_size)
     {
         return invalid("External snapshot payload size differs from its logical reference");
     }

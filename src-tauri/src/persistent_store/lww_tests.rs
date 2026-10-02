@@ -1,4 +1,5 @@
 use super::*;
+use crate::persistent_store::query;
 
 fn store() -> (tempfile::TempDir, PersistentStore) {
     let dir = tempfile::tempdir().unwrap();
@@ -576,6 +577,394 @@ fn full_restore_disabled_receive_without_later_local_edit_reprojects_on_enable()
     assert_eq!(read_unit(store.device_store().unwrap().connection(),&remote.key).unwrap().unwrap(),(remote.stamp,remote.value));
     assert_eq!(store.device_store().unwrap().connection().query_row("SELECT value FROM plugin_device_storage WHERE owner='orphan' AND key='received'",[],|row|row.get::<_,String>(0)).unwrap(),"remote-only");
     assert!(store.lww_read_outbox(0.into(),100).unwrap().entries.is_empty());
+}
+
+#[test]
+fn backup_capture_pins_both_stores_before_releasing_concurrent_reservation_and_device_writes() {
+    use std::{sync::mpsc, time::Duration};
+    let (dir,mut store)=store();
+    save(&mut store,vec![mutation(&["root","language"],serde_json::json!("before"))]);
+    write_restore_device_fixture(&mut store,"before");
+    let revision=store.revision().unwrap();
+    let mut writer=PersistentStore::open(dir.path()).unwrap();
+    writer.device_store().unwrap().connection().busy_timeout(Duration::from_millis(20)).unwrap();
+    let (start_tx,start_rx)=mpsc::channel(); let (blocked_tx,blocked_rx)=mpsc::channel();
+    let (release_tx,release_rx)=mpsc::channel(); let (done_tx,done_rx)=mpsc::channel();
+    let worker=std::thread::spawn(move || {
+        start_rx.recv().unwrap();
+        let attempted=writer.commit(&WorkingSetCommit{expected_revision:revision,unit_mutations:Some(vec![mutation(&["root","language"],serde_json::json!("blocked"))]),..Default::default()});
+        let device_attempt=writer.device_store().unwrap().write_setting("accountst",&serde_json::json!("blocked"));
+        blocked_tx.send((attempted.is_err(),device_attempt.is_err())).unwrap();
+        release_rx.recv().unwrap();
+        writer.device_store().unwrap().connection().busy_timeout(Duration::from_secs(5)).unwrap();
+        save(&mut writer,vec![mutation(&["root","language"],serde_json::json!("after"))]);
+        write_restore_device_fixture(&mut writer,"after");
+        done_tx.send(()).unwrap();
+    });
+    BACKUP_CAPTURE_PINNED.with(|hook| *hook.borrow_mut()=Some(Box::new(move || {
+        start_tx.send(()).unwrap();
+        assert_eq!(blocked_rx.recv_timeout(Duration::from_secs(5)).unwrap(),(true,true));
+    })));
+    BACKUP_CAPTURE_RELEASED.with(|hook| *hook.borrow_mut()=Some(Box::new(move || {
+        release_tx.send(()).unwrap();
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    })));
+    let (lease,sections)=store.lww_acquire_backup_capture(revision).unwrap(); worker.join().unwrap();
+    assert_eq!(store.read_root(Some(&lease.lease)).unwrap().value["language"],"before");
+    assert_eq!(read_unit(&store.revision_leases[&lease.lease].connection,&unit_key(&["root","language"]).unwrap()).unwrap().unwrap().1,inline(&serde_json::json!("before")).unwrap());
+    assert_eq!(store.read_root(None).unwrap().value["language"],"after");
+    assert_device_restore_label(&store,"after");
+    let frozen=device_store::sections::freeze_backup_sections(&sections.iter().collect::<Vec<_>>()).unwrap();
+    let device_store::sections::SectionValueRow::Hypa{model,..}=&frozen.hypa[0].value else {panic!()};
+    assert_eq!(model,"before");
+    assert!(frozen.local_plugins.iter().any(|row| matches!(&row.value,device_store::sections::SectionValueRow::Plugin{space,value} if space=="string"&&value=="before")));
+    let (_target_dir,mut target)=self::store(); let stage=restore_stage(&mut target,"before");
+    target.lww_commit_replacement_with_device_sections(&Header{binding_authority:0.into(),request_id:"capture-boundary-restore".into()},&stage,None,&sections.iter().collect::<Vec<_>>()).unwrap();
+    assert_device_restore_label(&target,"before");
+    store.release_revision(&lease.lease).unwrap(); assert!(store.revision_leases.is_empty());
+}
+
+#[test]
+fn backup_capture_busy_and_revision_failure_release_barrier_without_issuing_stamp() {
+    let (_dir,mut store)=store();
+    let issued=store.lww_clock_state().unwrap().issued;
+    assert!(matches!(store.lww_acquire_backup_capture(1),Err(StoreError::RevisionConflict{..})));
+    assert!(store.revision_leases.is_empty());
+    assert_eq!(store.lww_clock_state().unwrap().issued,issued);
+    store.device_store().unwrap().write_setting("accountst",&serde_json::json!("after-failure")).unwrap();
+    let header=Header{binding_authority:0.into(),request_id:"pending-capture-intent".into()};
+    store.reserve_intent(&header,&Intent::Commit{commit:WorkingSetCommit{expected_revision:0,unit_mutations:Some(vec![mutation(&["root","language"],serde_json::json!("pending"))]),..Default::default()},aliases:vec![]}).unwrap();
+    let issued=store.lww_clock_state().unwrap().issued;
+    assert!(matches!(store.lww_acquire_backup_capture(0),Err(StoreError::CommitBusy)));
+    assert_eq!(store.revision().unwrap(),0); assert!(store.revision_leases.is_empty());
+    assert_eq!(store.lww_clock_state().unwrap().issued,issued);
+    store.lww_recover_intents().unwrap();
+    let (lease,sections)=store.lww_acquire_backup_capture(1).unwrap();
+    assert_eq!(sections.len(),3); assert_eq!(store.read_root(Some(&lease.lease)).unwrap().value["language"],"pending");
+    store.release_revision(&lease.lease).unwrap();
+}
+
+#[test]
+fn backup_capture_spool_failure_releases_library_lease_and_device_barrier() {
+    let (dir,mut store)=store();
+    store.device_store().unwrap().connection().execute_batch("INSERT INTO hypa_embeddings VALUES('invalid-key','synthetic','model',NULL,1,1,x'00000000',NULL,0,'0','',NULL,NULL,NULL)").unwrap();
+    let clock=store.lww_clock_state().unwrap().issued;
+    assert!(store.lww_acquire_backup_capture(0).is_err());
+    assert!(store.revision_leases.is_empty()); assert_eq!(store.active_readers.active_count(),0);
+    assert_eq!(store.lww_clock_state().unwrap().issued,clock);
+    let mut writer=PersistentStore::open(dir.path()).unwrap();
+    writer.device_store().unwrap().connection().busy_timeout(std::time::Duration::from_millis(20)).unwrap();
+    writer.device_store().unwrap().write_setting("accountst",&serde_json::json!("released")).unwrap();
+    save(&mut writer,vec![mutation(&["root","language"],serde_json::json!("released"))]);
+    assert_eq!(store.revision().unwrap(),1);
+}
+
+#[test]
+fn backup_capture_rejects_active_staged_and_applied_unfinished_receive_but_ignores_detached_rows() {
+    let (_dir,mut store)=store();
+    let header=Header{binding_authority:0.into(),request_id:"capture-pending-receive".into()};
+    store.lww_stage_receive(&StageReceive{header:header.clone(),changes:vec![change(&["root","language"],1,serde_json::json!("received"))],progress:Progress{kind:"server".into(),cursor:1.into(),writer_id:None},admitted_time_upper_ms:2.into()}).unwrap();
+    assert!(matches!(store.lww_acquire_backup_capture(0),Err(StoreError::CommitBusy)));
+    store.lww_apply_receive(&ApplyReceive{header:header.clone(),generating:vec![]}).unwrap();
+    assert!(matches!(store.lww_acquire_backup_capture(store.revision().unwrap()),Err(StoreError::CommitBusy)));
+    store.lww_finish_receive(&header).unwrap();
+    let (lease,sections)=store.lww_acquire_backup_capture(store.revision().unwrap()).unwrap();
+    assert_eq!(sections.len(),3); store.release_revision(&lease.lease).unwrap();
+    store.device_store().unwrap().connection().execute("UPDATE lww_receive SET finished=0,authority='999' WHERE request_id=?1",[&header.request_id]).unwrap();
+    let (lease,_)=store.lww_acquire_backup_capture(store.revision().unwrap()).unwrap();
+    assert_eq!(store.lww_binding_authority().unwrap(),0.into()); store.release_revision(&lease.lease).unwrap();
+}
+
+#[test]
+fn device_replacement_receipt_rejects_false_markers_incomplete_and_altered_identity_without_writes() {
+    let (_dir,mut store)=store();
+    let header=Header{binding_authority:0.into(),request_id:"exact-device-receipt".into()};
+    let sections=full_device_backup(Some("receipt")); let stage=restore_stage(&mut store,"receipt");
+    store.connection.execute("INSERT INTO app_kv VALUES('device-backup-commit',?1)",[&header.request_id]).unwrap();
+    assert!(store.lww_device_replacement_receipt(&header,&stage).unwrap().is_none());
+    store.device_store().unwrap().connection().execute_batch("CREATE TEMP TRIGGER reject_device BEFORE INSERT ON device_settings BEGIN SELECT RAISE(ABORT,'synthetic-device-failure'); END").unwrap();
+    assert!(store.lww_commit_replacement_with_device_sections(&header,&stage,None,&sections.iter().collect::<Vec<_>>()).is_err());
+    assert_eq!(store.revision().unwrap(),1);
+    assert!(store.lww_device_replacement_receipt(&header,&stage).unwrap().is_none());
+    assert!(store.lww_device_replacement_receipt(&header,"other-stage").is_err());
+    assert!(store.lww_device_replacement_receipt(&Header{binding_authority:1.into(),..header.clone()},&stage).is_err());
+    let clock=store.lww_clock_state().unwrap().issued;
+    store.device_store().unwrap().connection().execute_batch("DROP TRIGGER reject_device").unwrap();
+    assert!(store.lww_device_replacement_receipt(&header,&stage).unwrap().is_none());
+    assert_eq!(store.lww_clock_state().unwrap().issued,clock);
+    store.lww_recover_intents().unwrap();
+    assert_eq!(store.lww_device_replacement_receipt(&header,&stage).unwrap().unwrap().revision,1);
+    let library=Connection::open_with_flags(&store.database_path,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let device_path:String=store.device_store().unwrap().connection().query_row("SELECT file FROM pragma_database_list WHERE name='main'",[],|row|row.get(0)).unwrap();
+    let device=Connection::open_with_flags(device_path,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    assert_eq!(completed_device_replacement_receipt(&library,&device,&header,&stage).unwrap().unwrap().revision,1);
+    store.connection.execute("UPDATE lww_requests SET digest='corrupted' WHERE request_id=?1",[&header.request_id]).unwrap();
+    assert!(store.lww_device_replacement_receipt(&header,&stage).is_err());
+    assert_eq!(store.lww_clock_state().unwrap().issued,clock);
+}
+
+#[test]
+fn device_replacement_receipt_cannot_attest_a_library_only_replacement() {
+    let (_dir,mut store)=store(); let stage=restore_stage(&mut store,"library-only");
+    let header=Header{binding_authority:0.into(),request_id:"not-full-device-receipt".into()};
+    store.lww_commit_replacement(&header,&stage).unwrap();
+    assert!(store.lww_device_replacement_receipt(&header,&stage).is_err());
+}
+
+#[test]
+fn backup_device_revision_is_fixed_after_own_and_second_connection_mutations() {
+    use device_store::plugin_values::PluginDeviceMutation;
+    fn write(store:&mut PersistentStore,value:&str) {
+        store.device_store_mut().unwrap().write_plugin_device_values("synthetic",&[
+            PluginDeviceMutation::Set{space:"string".into(),key:"revision-proof".into(),value:value.into()},
+        ]).unwrap();
+    }
+    let (dir,mut primary)=store();
+    write(&mut primary,"before");
+    let mut writer=PersistentStore::open(dir.path()).unwrap();
+    let revision=primary.device_store().unwrap().revision().unwrap();
+    let (lease,_)=primary.lww_acquire_backup_capture(primary.revision().unwrap()).unwrap();
+    assert_eq!(primary.lww_backup_device_revision(&lease.lease).unwrap(),revision);
+    write(&mut primary,"own-after");
+    assert!(primary.device_store().unwrap().revision().unwrap()>revision);
+    assert_eq!(primary.lww_backup_device_revision(&lease.lease).unwrap(),revision);
+    write(&mut writer,"second-after");
+    assert!(writer.device_store().unwrap().revision().unwrap()>revision+1);
+    assert_eq!(primary.lww_backup_device_revision(&lease.lease).unwrap(),revision);
+    primary.release_revision(&lease.lease).unwrap();
+}
+
+#[test]
+fn backup_device_revision_rejects_absent_released_unpinned_foreign_and_changed_identity_leases() {
+    let (_dir,mut primary)=store();
+    assert!(matches!(primary.lww_backup_device_revision("absent"),Err(StoreError::SnapshotReleased)));
+    let ordinary=primary.acquire_revision(0).unwrap();
+    assert!(matches!(primary.lww_backup_device_revision(&ordinary.lease),Err(StoreError::Validation{message}) if message=="backup-capture-lease-required"));
+    primary.release_revision(&ordinary.lease).unwrap();
+    let (_foreign,mut foreign)=store();
+    let (foreign_lease,_)=foreign.lww_acquire_backup_capture(0).unwrap();
+    assert!(matches!(primary.lww_backup_device_revision(&foreign_lease.lease),Err(StoreError::SnapshotReleased)));
+    foreign.release_revision(&foreign_lease.lease).unwrap();
+    let (lease,_)=primary.lww_acquire_backup_capture(0).unwrap();
+    let generation=primary.revision_leases[&lease.lease].target.generation.clone();
+    primary.revision_leases.get_mut(&lease.lease).unwrap().target.generation="foreign-generation".into();
+    assert!(matches!(primary.lww_backup_device_revision(&lease.lease),Err(StoreError::Validation{message}) if message=="backup-lease-identity-changed"));
+    primary.revision_leases.get_mut(&lease.lease).unwrap().target.generation=generation;
+    primary.revision_leases.get_mut(&lease.lease).unwrap().target.revision=1;
+    assert!(matches!(primary.lww_backup_device_revision(&lease.lease),Err(StoreError::Validation{message}) if message=="backup-lease-identity-changed"));
+    primary.revision_leases.get_mut(&lease.lease).unwrap().target.revision=0;
+    assert_eq!(primary.lww_backup_device_revision(&lease.lease).unwrap(),0);
+    primary.release_revision(&lease.lease).unwrap();
+    assert!(matches!(primary.lww_backup_device_revision(&lease.lease),Err(StoreError::SnapshotReleased)));
+}
+
+#[test]
+fn backup_unit_values_are_lease_fixed_and_include_opaque_held_and_permanent_deletions() {
+    let (_dir,mut store)=store();
+    save(&mut store,vec![mutation(&["root","language"],serde_json::json!("before")),mutation(&["exists","character","retired"],serde_json::json!({"type":"character"}))]);
+    store.commit(&WorkingSetCommit{expected_revision:store.revision().unwrap(),unit_mutations:Some(vec![UnitMutation::Delete{key:unit_key(&["exists","character","retired"]).unwrap()}]),..Default::default()}).unwrap();
+    let opaque=change(&["future-unit","opaque-backup"],1,serde_json::json!({"future":3}));
+    let held=change(&["character","missing-parent","name"],1,serde_json::json!("held"));
+    receive(&mut store,"backup-opaque-held",vec![opaque.clone(),held.clone()],vec![]);
+    let revision=store.revision().unwrap(); let (lease,sections)=store.lww_acquire_backup_capture(revision).unwrap();
+    assert_eq!(sections.len(),3);
+    let before=store.lww_backup_unit_values(&lease.lease).unwrap();
+    assert_eq!(before[&opaque.key],opaque.value);
+    assert_eq!(before[&held.key],held.value);
+    assert_eq!(before[&unit_key(&["exists","character","retired"]).unwrap()],UnitValue::Deleted);
+    assert!(before.keys().all(|key|!is_device(key)));
+    save(&mut store,vec![mutation(&["root","language"],serde_json::json!("after"))]);
+    assert_eq!(store.lww_backup_unit_values(&lease.lease).unwrap(),before);
+    assert_eq!(json_value(&before[&unit_key(&["root","language"]).unwrap()]).unwrap().unwrap(),"before");
+    assert!(matches!(store.lww_backup_unit_values("absent-lease"),Err(StoreError::SnapshotReleased)));
+    store.release_revision(&lease.lease).unwrap();
+    assert!(matches!(store.lww_backup_unit_values(&lease.lease),Err(StoreError::SnapshotReleased)));
+}
+
+fn incoming_message_value(target: &PersistentStore, character: &str, conversation: &str, text: &str) -> UnitValue {
+    let (_dir,mut source)=store(); create_conversation(&mut source,character,conversation);
+    source.commit(&WorkingSetCommit{expected_revision:source.revision().unwrap(),conversations:Some(vec![super::super::ConversationMutation::ReplaceRange{character_id:character.into(),conversation_id:conversation.into(),start:0,delete_count:0,messages:vec![serde_json::json!({"data":text,"chatId":"synthetic-message"})],conversation:None,configured_index:None}]),..Default::default()}).unwrap();
+    copy_objects(&source,target);
+    read_unit(&source.connection,&unit_key(&["messages",character,conversation]).unwrap()).unwrap().unwrap().1
+}
+
+#[test]
+fn library_backup_capture_pins_finished_held_and_deferred_proofs_without_device_spools() {
+    let (_dir,mut store)=store(); create_conversation(&mut store,"char","chat");
+    let time=store.lww_clock_state().unwrap().issued.unwrap().physical_ms.0+1;
+    let message=Change{key:unit_key(&["messages","char","chat"]).unwrap(),stamp:stamp(time),value:incoming_message_value(&store,"char","chat","library-only-deferred")};
+    let held=change(&["character","missing","name"],time,serde_json::json!("library-only-held"));
+    let header=Header{binding_authority:store.lww_binding_authority().unwrap(),request_id:"library-only-capture".into()};
+    store.lww_stage_receive(&StageReceive{header:header.clone(),changes:vec![message.clone(),held.clone()],progress:Progress{kind:"server".into(),cursor:1.into(),writer_id:None},admitted_time_upper_ms:u64::MAX.into()}).unwrap();
+    assert!(matches!(store.lww_acquire_library_backup_capture(store.revision().unwrap()),Err(StoreError::CommitBusy)));
+    let applied=store.lww_apply_receive(&ApplyReceive{header:header.clone(),generating:vec![MessageLocator{character_id:"char".into(),conversation_id:"chat".into(),start:None}]}).unwrap();
+    assert_eq!(applied.held_keys,vec![held.key.clone()]);
+    assert_eq!(applied.deferred_keys,vec![message.key.clone()]);
+    assert!(matches!(store.lww_acquire_library_backup_capture(store.revision().unwrap()),Err(StoreError::CommitBusy)));
+    assert!(store.revision_leases.is_empty());
+    store.lww_finish_receive(&header).unwrap();
+    store.device_store().unwrap().connection().execute_batch("INSERT INTO hypa_embeddings VALUES('invalid-key','synthetic','model',NULL,1,1,x'00000000',NULL,0,'0','',NULL,NULL,NULL)").unwrap();
+    assert!(store.lww_acquire_backup_capture(store.revision().unwrap()).is_err());
+    assert!(store.revision_leases.is_empty());
+    let lease=store.lww_acquire_library_backup_capture(store.revision().unwrap()).unwrap();
+    assert!(store.revision_leases[&lease.lease].connection.is_readonly("backup_device").unwrap());
+    let units=store.lww_backup_unit_values(&lease.lease).unwrap();
+    assert_eq!(units[&held.key],held.value);
+    assert_eq!(units[&message.key],message.value);
+    assert!(units.keys().all(|key|!is_device(key)));
+    store.device_store().unwrap().connection().execute("UPDATE lww_receive SET finished=0,digest='changed-after-pin' WHERE request_id=?1",[&header.request_id]).unwrap();
+    assert_eq!(store.lww_backup_unit_values(&lease.lease).unwrap(),units);
+    assert!(matches!(store.lww_acquire_library_backup_capture(store.revision().unwrap()),Err(StoreError::CommitBusy)));
+    store.release_revision(&lease.lease).unwrap();
+    assert!(store.revision_leases.is_empty());
+    assert_eq!(store.active_readers.active_count(),0);
+    assert!(matches!(store.lww_backup_unit_values(&lease.lease),Err(StoreError::SnapshotReleased)));
+}
+
+#[test]
+fn backup_held_messages_restore_with_one_stamp_and_project_after_reopen_and_later_parent() {
+    let (dir,mut store)=store();
+    let message=Change{key:unit_key(&["messages","waiting","chat"]).unwrap(),stamp:stamp(2),value:incoming_message_value(&store,"waiting","chat","held-backup-message")};
+    let conversation=change(&["exists","conversation","waiting","chat"],2,serde_json::json!(true));
+    let name=change(&["character","waiting","name"],2,serde_json::json!("held-name"));
+    let opaque=change(&["future","restore-opaque"],2,serde_json::json!({"opaque":true}));
+    let applied=receive(&mut store,"held-backup-source",vec![conversation.clone(),message.clone(),name.clone(),opaque.clone()],vec![]);
+    assert_eq!(applied.held_keys.len(),3);
+    let (lease,sections)=store.lww_acquire_backup_capture(store.revision().unwrap()).unwrap();
+    let units=store.lww_backup_unit_values(&lease.lease).unwrap();
+    for change in [&conversation,&message,&name,&opaque] { assert_eq!(units[&change.key],change.value); }
+    store.release_revision(&lease.lease).unwrap();
+    let stage=restore_stage(&mut store,"held-restore");
+    let header=Header{binding_authority:0.into(),request_id:"held-local-restore".into()};
+    store.lww_commit_replacement_with_device_sections(&header,&stage,Some(&units),&sections.iter().collect::<Vec<_>>()).unwrap();
+    let restored=read_unit(&store.connection,&message.key).unwrap().unwrap();
+    assert!(restored.0>message.stamp); assert_eq!(restored.1,message.value);
+    assert_eq!(store.connection.query_row("SELECT count(*) FROM lww_receive_rows WHERE request_id=?1 AND status='held'",[&header.request_id],|row|row.get::<_,i64>(0)).unwrap(),3);
+    assert_eq!(store.connection.query_row("SELECT count(*) FROM characters WHERE generation=?1",[active_generation(&store.connection).unwrap()],|row|row.get::<_,i64>(0)).unwrap(),0);
+    let progress=serde_json::to_value(store.lww_receive_progress(0.into()).unwrap()).unwrap();
+    drop(store); let mut store=PersistentStore::open(dir.path()).unwrap();
+    let applied=receive(&mut store,"later-parent",vec![change(&["exists","character","waiting"],3,serde_json::json!({"type":"character"}))],vec![]);
+    assert!(applied.affected_keys.contains(&message.key));
+    let database=query::materialize_target(&store.connection,&super::super::ReadTarget{generation:active_generation(&store.connection).unwrap(),revision:store.revision().unwrap()}).unwrap();
+    assert_eq!(database["characters"][0]["name"],"held-name");
+    assert_eq!(database["characters"][0]["chats"][0]["message"][0]["data"],"held-backup-message");
+    assert_eq!(read_unit(&store.connection,&message.key).unwrap().unwrap(),restored);
+    assert_eq!(store.connection.query_row("SELECT version FROM lww_units WHERE key=?1",[message.key.as_str()],|row|row.get::<_,String>(0)).unwrap(),header.request_id);
+    let pending=store.lww_read_outbox(0.into(),100).unwrap().entries;
+    assert!(pending.iter().any(|entry|entry.key==message.key&&entry.stamp==restored.0&&entry.version==header.request_id));
+    assert_eq!(serde_json::to_value(store.lww_receive_progress(0.into()).unwrap()).unwrap(),progress);
+    assert_eq!(read_unit(&store.connection,&opaque.key).unwrap().unwrap().1,opaque.value);
+    receive(&mut store,"retire-restored-parent",vec![Change{key:unit_key(&["exists","character","waiting"]).unwrap(),stamp:stamp(4),value:UnitValue::Deleted}],vec![]);
+    receive(&mut store,"retired-parent-arrives-again",vec![change(&["exists","character","waiting"],5,serde_json::json!(true)),Change{stamp:stamp(restored.0.physical_ms.0+1),..message.clone()}],vec![]);
+    assert_eq!(store.connection.query_row("SELECT count(*) FROM characters WHERE generation=?1",[active_generation(&store.connection).unwrap()],|row|row.get::<_,i64>(0)).unwrap(),0);
+    assert_eq!(read_unit(&store.connection,&message.key).unwrap().unwrap(),restored);
+    assert_eq!(parent_status(&store.connection,&message.key).unwrap(),"retired");
+    assert!(store.lww_read_outbox(0.into(),100).unwrap().entries.iter().all(|entry|entry.key!=message.key));
+    assert_eq!(store.connection.query_row("SELECT count(*) FROM lww_receive_rows WHERE key=?1 AND status<>'done'",[message.key.as_str()],|row|row.get::<_,i64>(0)).unwrap(),0);
+}
+
+#[test]
+fn backup_deferred_winner_projects_at_restore_and_requires_verified_message_controls() {
+    let (_dir,mut store)=store(); create_conversation(&mut store,"char","chat");
+    let message=Change{key:unit_key(&["messages","char","chat"]).unwrap(),stamp:stamp(store.lww_clock_state().unwrap().issued.unwrap().physical_ms.0+1),value:incoming_message_value(&store,"char","chat","deferred-backup-message")};
+    receive(&mut store,"deferred-backup-source",vec![message.clone()],vec![MessageLocator{character_id:"char".into(),conversation_id:"chat".into(),start:None}]);
+    let (lease,sections)=store.lww_acquire_backup_capture(store.revision().unwrap()).unwrap();
+    let units=store.lww_backup_unit_values(&lease.lease).unwrap(); assert_eq!(units[&message.key],message.value);
+    let reader=&store.revision_leases[&lease.lease];
+    let mut database=query::materialize_target(&reader.connection,&reader.target).unwrap();
+    assert!(database["characters"][0]["chats"][0]["message"].as_array().unwrap().is_empty());
+    let characters=database.as_object_mut().unwrap().remove("characters").unwrap(); let presets=database.as_object_mut().unwrap().remove("botPresets").unwrap();
+    store.release_revision(&lease.lease).unwrap();
+    let stage=store.replace_begin().unwrap().staging_id;
+    store.replace_put_root(&stage,&database).unwrap(); store.replace_put_presets(&stage,presets.as_array().unwrap()).unwrap(); store.replace_add_characters(&stage,characters.as_array().unwrap()).unwrap();
+    let UnitValue::Object{descriptor,..}=&message.value else {panic!()};
+    let hash=&descriptor.dependencies[0]; let body=store.lww_object_body(hash).unwrap().unwrap();
+    store.connection.execute("DELETE FROM message_page_objects WHERE hash=?1",[hash]).unwrap();
+    let clock=store.lww_clock_state().unwrap().issued; let revision=store.revision().unwrap();
+    let header=Header{binding_authority:0.into(),request_id:"deferred-local-restore".into()};
+    assert!(store.lww_commit_replacement_with_device_sections(&header,&stage,Some(&units),&sections.iter().collect::<Vec<_>>()).is_err());
+    assert_eq!(store.revision().unwrap(),revision); assert_eq!(store.lww_clock_state().unwrap().issued,clock);
+    store.lww_put_object(hash,&body).unwrap();
+    store.lww_commit_replacement_with_device_sections(&header,&stage,Some(&units),&sections.iter().collect::<Vec<_>>()).unwrap();
+    let restored=read_unit(&store.connection,&message.key).unwrap().unwrap();
+    assert!(restored.0>message.stamp); assert_eq!(restored.1,message.value);
+    let database=query::materialize_target(&store.connection,&super::super::ReadTarget{generation:active_generation(&store.connection).unwrap(),revision:store.revision().unwrap()}).unwrap();
+    assert_eq!(database["characters"][0]["chats"][0]["message"][0]["data"],"deferred-backup-message");
+    store.lww_drain_deferred(&ApplyReceive{header:Header{binding_authority:0.into(),request_id:"drain-restored-deferred".into()},generating:vec![]}).unwrap();
+    assert_eq!(read_unit(&store.connection,&message.key).unwrap().unwrap(),restored);
+    assert!(store.lww_read_outbox(0.into(),100).unwrap().entries.iter().any(|entry|entry.key==message.key&&entry.stamp==restored.0&&entry.version==header.request_id));
+}
+
+#[test]
+fn backup_held_proofs_are_pinned_and_reject_equal_stamp_conflicts_or_changed_receipts() {
+    let (_dir,mut store)=store();
+    let held=change(&["character","missing","name"],2,serde_json::json!("before"));
+    receive(&mut store,"held-proof-before",vec![held.clone()],vec![]);
+    let ordinary=store.acquire_revision(store.revision().unwrap()).unwrap();
+    assert!(store.lww_backup_unit_values(&ordinary.lease).is_err()); store.release_revision(&ordinary.lease).unwrap();
+    let (lease,_)=store.lww_acquire_backup_capture(store.revision().unwrap()).unwrap();
+    assert!(store.revision_leases[&lease.lease].connection.is_readonly("backup_device").unwrap());
+    store.device_store().unwrap().connection().execute("UPDATE lww_receive SET authority='999',digest='invalid' WHERE request_id='held-proof-before'",[]).unwrap();
+    assert_eq!(store.lww_backup_unit_values(&lease.lease).unwrap()[&held.key],held.value);
+    store.release_revision(&lease.lease).unwrap();
+    let (lease,_)=store.lww_acquire_backup_capture(store.revision().unwrap()).unwrap();
+    assert!(!store.lww_backup_unit_values(&lease.lease).unwrap().contains_key(&held.key)); store.release_revision(&lease.lease).unwrap();
+    receive(&mut store,"held-proof-one",vec![held.clone()],vec![]);
+    receive(&mut store,"held-proof-conflict",vec![change(&["character","missing","name"],2,serde_json::json!("conflicting"))],vec![]);
+    let (lease,_)=store.lww_acquire_backup_capture(store.revision().unwrap()).unwrap();
+    assert!(store.lww_backup_unit_values(&lease.lease).is_err()); store.release_revision(&lease.lease).unwrap();
+    store.device_store().unwrap().connection().execute("UPDATE lww_receive SET authority='999' WHERE request_id='held-proof-conflict'",[]).unwrap();
+    store.device_store().unwrap().connection().execute("UPDATE lww_receive SET digest='invalid' WHERE request_id='held-proof-one'",[]).unwrap();
+    let (lease,_)=store.lww_acquire_backup_capture(store.revision().unwrap()).unwrap();
+    assert!(store.lww_backup_unit_values(&lease.lease).is_err()); store.release_revision(&lease.lease).unwrap();
+    assert!(store.revision_leases.is_empty()); assert_eq!(store.active_readers.active_count(),0);
+}
+
+#[test]
+fn backup_device_attachment_is_readonly_with_readwrite_revision_reader_flags() {
+    let (_dir,store)=store();
+    let library=Connection::open_with_flags(&store.database_path,super::super::snapshot::revision_reader_open_flags_for_target(true)).unwrap();
+    library.execute_batch("PRAGMA query_only=ON; BEGIN").unwrap();
+    let path:String=store.device_store().unwrap().connection().query_row("SELECT file FROM pragma_database_list WHERE name='main'",[],|row|row.get(0)).unwrap();
+    pin_backup_device_snapshot(&library,&path).unwrap();
+    assert!(library.is_readonly("backup_device").unwrap());
+    assert!(library.execute("INSERT INTO backup_device.device_settings VALUES('accountst','null')",[]).is_err());
+    library.execute_batch("ROLLBACK; DETACH DATABASE backup_device").unwrap();
+    assert!(!library.query_row("SELECT EXISTS(SELECT 1 FROM pragma_database_list WHERE name='backup_device')",[],|row|row.get::<_,bool>(0)).unwrap());
+}
+
+#[test]
+fn backup_archived_parent_holds_restore_until_explicit_unarchive_without_child_restamping() {
+    use crate::logical_records::{decode_logical_record,encode_logical_record_key,LogicalRecordLocator};
+    let (dir,mut store)=store(); create_conversation(&mut store,"char","chat");
+    save(&mut store,vec![mutation(&["character","char","name"],serde_json::json!("before"))]);
+    store.archive_character("char",store.revision().unwrap(),10).unwrap();
+    let name=change(&["character","char","name"],store.lww_clock_state().unwrap().issued.unwrap().physical_ms.0+1,serde_json::json!("held-archive-name"));
+    assert_eq!(receive(&mut store,"archive-backup-held",vec![name.clone()],vec![]).held_keys,vec![name.key.clone()]);
+    let (lease,sections)=store.lww_acquire_backup_capture(store.revision().unwrap()).unwrap();
+    let units=store.lww_backup_unit_values(&lease.lease).unwrap(); assert_eq!(units[&name.key],name.value);
+    let reader=&store.revision_leases[&lease.lease];
+    let locator=LogicalRecordLocator::Character{character_id:"char".into()}; let key=encode_logical_record_key(&locator).unwrap();
+    let cas=crate::asset_repository::PayloadCas::new(&store.repository_root).unwrap();
+    let encoded=super::super::record_projection::reconstruct_record_with_owner_objects(&reader.connection,&cas,&reader.target.generation,&key,vec![],|_|Ok(()),&|hash|Ok(cas.stat_object(hash)?.unwrap())).unwrap();
+    let envelope=decode_logical_record(&encoded).unwrap(); let root=store.read_root(Some(&lease.lease)).unwrap().value;
+    store.release_revision(&lease.lease).unwrap();
+    store.restore_character("char",store.revision().unwrap()).unwrap();
+    save(&mut store,vec![mutation(&["character","char","name"],serde_json::json!("later-local"))]);
+    let stage=store.replace_begin().unwrap().staging_id; store.replace_put_root(&stage,&root).unwrap(); store.replace_put_presets(&stage,&[]).unwrap();
+    let tx=store.connection.transaction().unwrap(); super::super::record_apply::apply_record_rows(&tx,&stage,&key,&locator,&envelope,0).unwrap(); tx.commit().unwrap();
+    let header=Header{binding_authority:0.into(),request_id:"archive-held-full-restore".into()};
+    store.lww_commit_replacement_with_device_sections(&header,&stage,Some(&units),&sections.iter().collect::<Vec<_>>()).unwrap();
+    let restored=read_unit(&store.connection,&name.key).unwrap().unwrap(); assert!(restored.0>name.stamp); assert_eq!(restored.1,name.value);
+    assert_eq!(parent_status(&store.connection,&name.key).unwrap(),"held");
+    assert_eq!(store.connection.query_row("SELECT status FROM lww_receive_rows WHERE request_id=?1 AND key=?2",params![header.request_id,name.key.as_str()],|row|row.get::<_,String>(0)).unwrap(),"held");
+    drop(store); let mut store=PersistentStore::open(dir.path()).unwrap();
+    assert!(super::super::archive::read_archived_object(&store.connection,&active_generation(&store.connection).unwrap(),"char").unwrap().is_some());
+    store.restore_character("char",store.revision().unwrap()).unwrap();
+    assert_eq!(store.read_character("char",None).unwrap().unwrap().value["name"],"held-archive-name");
+    store.lww_drain_deferred(&ApplyReceive{header:Header{binding_authority:0.into(),request_id:"drain-unarchived-local-held".into()},generating:vec![]}).unwrap();
+    assert_eq!(read_unit(&store.connection,&name.key).unwrap().unwrap(),restored);
+    assert!(store.lww_read_outbox(0.into(),100).unwrap().entries.iter().any(|entry|entry.key==name.key&&entry.stamp==restored.0&&entry.version==header.request_id));
 }
 
 #[test]

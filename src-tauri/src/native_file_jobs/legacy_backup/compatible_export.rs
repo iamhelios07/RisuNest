@@ -306,6 +306,7 @@ pub(crate) fn export_compatible_local_backup(
             revision: expected_revision,
             source_bytes: published.bytes,
             source_sha256: published.sha256,
+            source_fingerprint_kind: crate::native_file_jobs::SourceFingerprintKind::WholeFileSha256,
             character_count: counts.0,
             preset_count: counts.1,
             warning_codes: if projector.losses.0.is_empty() && attachments.warning_codes.is_empty()

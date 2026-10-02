@@ -19,7 +19,6 @@
         listNativePersistentSnapshots,
         previewNativePersistentAssetGc,
         restoreNativePersistentSnapshot,
-        restartNativeApp,
     } from 'src/ts/storage/nativePersistentMaintenance'
     import { getSyncConflictBackupStore } from 'src/ts/storage/sync/syncConflictBackup'
     import { describeBlockedReason } from 'src/ts/storage/sync/blockedReasonText'
@@ -203,8 +202,6 @@
                     listed = snapshots.some((snapshot) => snapshot.id === id)
                     return listed ? id : null
                 },
-                confirm: () => alertConfirm(language.restoreLocalSnapshotConfirm),
-                restart: restartNativeApp,
                 onEmpty: () => { listed = false },
             })
         } catch (error) {

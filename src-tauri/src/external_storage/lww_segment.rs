@@ -2,6 +2,7 @@ use super::contract::{ErrorKind, ProviderError, Result};
 use crate::persistent_store::lww::Change;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use risunest_external_storage_format::crypto::{decrypt, derive_key, encrypt};
+use risunest_external_storage_format::snapshot::{ObjectRole as WireRole, StoredObject};
 use risunest_sync_wire::{
     stamp::{validate_writer_id, DecimalU64},
     unit::compare_version,
@@ -94,7 +95,7 @@ pub(crate) fn observe_value_identity(
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct LargeBody {
     pub object_id: String,
@@ -112,7 +113,8 @@ pub(crate) struct Segment {
     pub seq: DecimalU64,
     pub changes: Vec<Change>,
     pub message_pages: BTreeMap<String, String>,
-    pub small_bodies: BTreeMap<String, String>,
+    #[serde(with = "super::lww_checkpoint::nested_metadata")]
+    pub asset_catalogs: Vec<StoredObject>,
     pub large_bodies: BTreeMap<String, LargeBody>,
 }
 impl Segment {
@@ -124,11 +126,14 @@ impl Segment {
             seq: DecimalU64(seq),
             changes: Vec::new(),
             message_pages: BTreeMap::new(),
-            small_bodies: BTreeMap::new(),
+            asset_catalogs: Vec::new(),
             large_bodies: BTreeMap::new(),
         }
     }
     pub(crate) fn validate(&self) -> Result<()> {
+        self.validate_inner(true)
+    }
+    fn validate_inner(&self, prepared: bool) -> Result<()> {
         if self.schema != "risunest.segment/v1" || self.library_id.is_empty() || self.seq.0 == 0 {
             return Err(corrupt());
         }
@@ -151,17 +156,26 @@ impl Segment {
                 return Err(corrupt());
             }
         }
-        for (hash, bytes) in &self.small_bodies {
-            risunest_sync_wire::validate_hash(hash).map_err(|_| corrupt())?;
-            let body = URL_SAFE_NO_PAD.decode(bytes).map_err(|_| corrupt())?;
-            if body.len() > SMALL_BODY_BYTES || URL_SAFE_NO_PAD.encode(&body) != *bytes {
+        let mut catalogs = BTreeSet::new();
+        let mut repository = None;
+        for catalog in &self.asset_catalogs {
+            catalog.validate().map_err(|_| corrupt())?;
+            if catalog.header.role != WireRole::Catalog
+                || !catalogs.insert(&catalog.header.object_id)
+                || repository.is_some_and(|id| id != &catalog.header.repository_id)
+            {
                 return Err(corrupt());
             }
+            repository = Some(&catalog.header.repository_id);
         }
         for (hash, body) in &self.large_bodies {
             risunest_sync_wire::validate_hash(hash).map_err(|_| corrupt())?;
             risunest_sync_wire::validate_hash(&body.sha256).map_err(|_| corrupt())?;
             risunest_sync_wire::validate_id(&body.object_id).map_err(|_| corrupt())?;
+            if prepared && (body.byte_length.0 == 0 || body.sha256 == "0".repeat(64)
+                || body.plaintext_byte_length.0 <= SMALL_BODY_BYTES as u64 || body.locator.is_none()) {
+                return Err(corrupt());
+            }
         }
         Ok(())
     }
@@ -169,6 +183,16 @@ impl Segment {
         self.validate()?;
         let value = serde_json::to_value(self).map_err(|_| corrupt())?;
         risunest_sync_wire::canonical::encode(&value).map_err(|_| corrupt())
+    }
+    pub(super) fn encode_capture(&self) -> Result<Vec<u8>> {
+        self.validate_inner(false)?;
+        let value = serde_json::to_value(self).map_err(|_| corrupt())?;
+        risunest_sync_wire::canonical::encode(&value).map_err(|_| corrupt())
+    }
+    pub(super) fn decode_capture(bytes: &[u8]) -> Result<Self> {
+        let value: Self = risunest_sync_wire::canonical::decode(bytes, bytes.len()).map_err(|_| corrupt())?;
+        if value.encode_capture()? != bytes { return Err(corrupt()); }
+        Ok(value)
     }
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
         let value: Self =
@@ -188,6 +212,7 @@ fn binding(library: &str, writer: &str, seq: u64, role: &str) -> Result<Vec<u8>>
 }
 pub(crate) fn seal(segment: &Segment, root_key: &[u8; 32]) -> Result<(Vec<u8>, String)> {
     let plaintext = segment.encode()?;
+    if plaintext.len() > SEGMENT_BYTES { return Err(ProviderError::new(super::contract::ErrorKind::FileTooLarge)); }
     let hash = digest(&plaintext);
     let key = derive_key(root_key, &segment.library_id, "metadata").map_err(|_| corrupt())?;
     let mut sealed = Vec::new();
@@ -247,7 +272,11 @@ pub(crate) fn seal_body(
     .map_err(|_| corrupt())?;
     Ok(sealed)
 }
-pub(crate) fn open_body(
+pub(crate) fn open_body_stream(input:&mut impl std::io::Read,output:&mut impl std::io::Write,library:&str,object:&str,root_key:&[u8;32],length:u64)->Result<()> {
+    let key=derive_key(root_key,library,"metadata").map_err(|_|corrupt())?;
+    if decrypt(input,output,&key,&binding(library,object,0,"body")?,length).map_err(|_|corrupt())? != length {return Err(corrupt());}
+    Ok(())
+}pub(crate) fn open_body(
     bytes: &[u8],
     library: &str,
     object: &str,

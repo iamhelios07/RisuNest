@@ -16,6 +16,11 @@ import { listen } from '@tauri-apps/api/event'
 import { generatingConversations } from '../generatingConversationRegistry'
 import { bindSyncTarget, unbindSyncTarget } from './bindingRegistry'
 import type { ServerConfig } from './serverSync'
+import { get } from 'svelte/store'
+import { selectedCharID } from 'src/ts/stores.svelte'
+import { getDatabase } from '../database.svelte'
+
+const selectedCharacterId = () => getDatabase().characters[get(selectedCharID)]?.chaId ?? null
 
 let nativeBindings: ReturnType<typeof installSyncBindingFlow> | undefined
 let disposeServer: (() => void) | undefined
@@ -112,10 +117,10 @@ const transport: SyncBindingTransport = {
         foreground = document.visibilityState !== 'hidden'
         await pushAvailable(c, true)
     },
-    async resumeBinding(c) { context = c; await invoke('server_sync_lww_activate', { request: header() }); foreground = document.visibilityState !== 'hidden'; await scheduler.foreground(foreground); scheduler.remoteHint(); if (foreground) void invoke('server_sync_lww_hydrate', { request: header() }).catch(() => {}) },
+    async resumeBinding(c) { context = c; await invoke('server_sync_lww_activate', { request: header() }); foreground = document.visibilityState !== 'hidden'; await scheduler.foreground(foreground); scheduler.remoteHint(); if (foreground) void invoke('server_sync_lww_hydrate', { request: header(), selectedCharacterId: selectedCharacterId() }).catch(() => {}) },
     prepareNewDeviceBinding: (staged,c) => invoke('server_sync_lww_prepare_new_device', { stagingId: staged.stagingId, request: { bindingAuthority: c.state.targetAuthority, requestId: staged.receiveId } }),
     replaceAsNewDevice: replaceNativeSyncBindingAsNewDevice,
-    async resumeNewDeviceBinding(preparation,result,c) { await invoke('server_sync_lww_activate_new_device', { authorizationId: preparation.authorizationId, writerId: result.writerId, request: { bindingAuthority: result.bindingAuthority, requestId: crypto.randomUUID() } }); context = c; error = ''; foreground = document.visibilityState !== 'hidden'; await scheduler.foreground(foreground); await scheduler.retry(); scheduler.remoteHint() },
+    async resumeNewDeviceBinding(preparation,result,c) { await invoke('server_sync_lww_activate_new_device', { authorizationId: preparation.authorizationId, writerId: result.writerId, request: { bindingAuthority: result.bindingAuthority, requestId: crypto.randomUUID() } }); context = c; error = ''; foreground = document.visibilityState !== 'hidden'; await scheduler.foreground(foreground); await scheduler.retry(); scheduler.remoteHint(); if (foreground) void invoke('server_sync_lww_hydrate', { request: header(), selectedCharacterId: selectedCharacterId() }).catch(() => {}) },
 }
 export async function receiveAvailableServerChanges(): Promise<void> { await scheduler.receiveAvailableChanges() }
 export async function connectServerSync(config: ServerConfig, newDevice = false): Promise<void> { await invoke('server_sync_configure', { config }); error = ''; await bindSyncTarget({ kind: 'server', connectionId: 'server' }, newDevice ? { mode: 'new-device' } : {}); await controller.ensureStatus() }
