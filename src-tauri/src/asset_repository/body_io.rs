@@ -46,6 +46,7 @@ pub(crate) enum BodyPurpose { Control, Asset }
 pub(crate) struct ObjectBodyWork {
     pub purposes: BTreeSet<BodyPurpose>,
     pub work: BodyWork,
+    pub owned_work: BodyWork,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -55,6 +56,8 @@ pub(crate) struct BodyIo {
     pub domains: BTreeMap<&'static str, BodyWork>,
     pub objects: BTreeMap<String, ObjectBodyWork>,
     pub unattributed_managed: BodyWork,
+    pub unattributed_owned: BodyWork,
+    pub pending_owned_identities: u64,
     pub scope_violations: u64,
     // API requests/queries, not OS metadata syscall counts.
     pub stat_requests: u64,
@@ -66,7 +69,8 @@ impl Default for BodyIo {
     fn default() -> Self {
         Self {
             thread: std::thread::current().id(), domains: BTreeMap::new(), objects: BTreeMap::new(),
-            unattributed_managed: BodyWork::default(), scope_violations: 0,
+            unattributed_managed: BodyWork::default(), unattributed_owned: BodyWork::default(),
+            pending_owned_identities: 0, scope_violations: 0,
             stat_requests: 0, batch_stat_requests: 0, presence_queries: 0,
         }
     }
@@ -74,7 +78,7 @@ impl Default for BodyIo {
 
 impl BodyIo {
     pub(crate) fn complete(&self) -> bool {
-        self.scope_violations == 0 && self.domains.values().all(BodyWork::observed_completely)
+        self.scope_violations == 0 && self.pending_owned_identities == 0 && self.domains.values().all(BodyWork::observed_completely)
             && self.unknown_work() == BodyWork::default()
     }
     pub(crate) fn asset_work(&self) -> BodyWork {
@@ -85,11 +89,11 @@ impl BodyIo {
     }
     pub(crate) fn unknown_work(&self) -> BodyWork {
         let mut work = self.classified_work(|row| row.purposes.is_empty());
-        work.add(&self.unattributed_managed); work
+        work.add(&self.unattributed_managed); work.add(&self.unattributed_owned); work
     }
     fn classified_work(&self, include: impl Fn(&ObjectBodyWork) -> bool) -> BodyWork {
         let mut work = BodyWork::default();
-        for row in self.objects.values().filter(|row| include(row)) { work.add(&row.work); }
+        for row in self.objects.values().filter(|row| include(row)) { work.add(&row.work); work.add(&row.owned_work); }
         work
     }
 }
@@ -97,6 +101,7 @@ impl BodyIo {
 thread_local! {
     static WORK: RefCell<Arc<Mutex<BodyIo>>> = RefCell::new(Arc::new(Mutex::new(BodyIo::default())));
     static OBJECT: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    static PENDING_OWNED: RefCell<Vec<(Arc<Mutex<BodyIo>>, Arc<Mutex<BodyWork>>)>> = const { RefCell::new(Vec::new()) };
 }
 
 fn current_scope() -> Arc<Mutex<BodyIo>> { WORK.with(|work| work.borrow().clone()) }
@@ -125,16 +130,93 @@ impl Drop for ObjectScope {
 
 fn record(work: &mut BodyIo, kind: &'static str, hash: Option<&str>, update: impl Fn(&mut BodyWork)) {
     update(work.domains.entry(kind).or_default());
-    if kind == "managed" {
+    if kind == "managed" || kind == "owned" {
         match hash {
-            Some(hash) => update(&mut work.objects.entry(hash.to_owned()).or_default().work),
-            None => update(&mut work.unattributed_managed),
+            Some(hash) => {
+                let row = work.objects.entry(hash.to_owned()).or_default();
+                update(if kind == "managed" { &mut row.work } else { &mut row.owned_work });
+            }
+            None => update(if kind == "managed" { &mut work.unattributed_managed } else { &mut work.unattributed_owned }),
         }
     }
 }
 fn domain(kind: &'static str, update: impl Fn(&mut BodyWork)) {
+    if kind == "owned" {
+        if let Some((scope, pending)) = PENDING_OWNED.with(|pending| pending.borrow().last().cloned()) {
+            let current = current_scope();
+            if !Arc::ptr_eq(&scope, &current) {
+                scope.lock().unwrap().scope_violations += 1;
+                current.lock().unwrap().scope_violations += 1;
+            }
+            update(scope.lock().unwrap().domains.entry(kind).or_default());
+            update(&mut pending.lock().unwrap());
+            return;
+        }
+    }
     let hash = OBJECT.with(|object| object.borrow().last().cloned());
     record(&mut current_scope().lock().unwrap(), kind, hash.as_deref(), update);
+}
+
+// Staging opens precede final stream validation. Associate their observed work
+// only after that validation supplies the actual immutable content identity.
+pub(super) struct PendingOwnedIdentity {
+    scope: Arc<Mutex<BodyIo>>,
+    work: Arc<Mutex<BodyWork>>,
+    hash: Option<String>,
+    owner: ThreadId,
+}
+impl PendingOwnedIdentity {
+    pub(super) fn new() -> Self {
+        let scope = current_scope();
+        scope.lock().unwrap().pending_owned_identities += 1;
+        let work = Arc::new(Mutex::new(BodyWork::default()));
+        PENDING_OWNED.with(|pending| pending.borrow_mut().push((scope.clone(), work.clone())));
+        Self { scope, work, hash: None, owner: std::thread::current().id() }
+    }
+    pub(super) fn verified(&mut self, hash: &str) { self.hash = Some(hash.to_owned()); }
+}
+impl Drop for PendingOwnedIdentity {
+    fn drop(&mut self) {
+        PENDING_OWNED.with(|pending| { pending.borrow_mut().pop(); });
+        let current = current_scope();
+        let changed = self.owner != std::thread::current().id() || !Arc::ptr_eq(&self.scope, &current);
+        let mut scope = self.scope.lock().unwrap();
+        scope.pending_owned_identities -= 1;
+        if changed { scope.scope_violations += 1; }
+        let work = self.work.lock().unwrap();
+        match &self.hash {
+            Some(hash) => scope.objects.entry(hash.clone()).or_default().owned_work.add(&work),
+            None => scope.unattributed_owned.add(&work),
+        }
+        drop(scope);
+        if changed && !Arc::ptr_eq(&self.scope, &current) { current.lock().unwrap().scope_violations += 1; }
+    }
+}
+
+pub(super) struct OwnedIdentity {
+    scope: Arc<Mutex<BodyIo>>,
+    hash: String,
+    owner: ThreadId,
+}
+impl OwnedIdentity {
+    pub(super) fn new(hash: &str) -> Self {
+        let scope = current_scope();
+        record(&mut scope.lock().unwrap(), "owned", Some(hash), |work| work.outstanding_readers += 1);
+        Self { scope, hash: hash.to_owned(), owner: std::thread::current().id() }
+    }
+    pub(super) fn check_scope(&self) {
+        let current = current_scope();
+        if self.owner != std::thread::current().id() || !Arc::ptr_eq(&self.scope, &current) {
+            self.scope.lock().unwrap().scope_violations += 1;
+            if !Arc::ptr_eq(&self.scope, &current) { current.lock().unwrap().scope_violations += 1; }
+        }
+    }
+}
+impl Drop for OwnedIdentity {
+    fn drop(&mut self) {
+        self.check_scope();
+        record(&mut self.scope.lock().unwrap(), "owned", Some(&self.hash), |work| work.outstanding_readers -= 1);
+    }
 }
 
 pub(super) fn stat_request() { current_scope().lock().unwrap().stat_requests += 1; }
