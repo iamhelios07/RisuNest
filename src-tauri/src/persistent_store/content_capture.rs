@@ -83,6 +83,7 @@ pub(crate) struct PreparedContentCapture {
     consumer: String,
     capture_id: String,
     reader: RevisionReadLease,
+    full: bool,
     repository_root: PathBuf,
     _inventory: super::snapshot::DeferredAssetInventory,
 }
@@ -122,6 +123,45 @@ impl PersistentStore {
             consumer: consumer.into(),
             capture_id: capture_id.into(),
             reader,
+            full: false,
+            repository_root: self.repository_root.clone(),
+            _inventory: inventory,
+        })
+    }
+}
+
+impl PersistentStore {
+    /// Consume the caller's pinned lease without opening a second snapshot.
+    pub(crate) fn prepare_content_capture_from_lease(
+        &mut self,
+        capture_id: &str,
+        consumer: &str,
+        lease: &str,
+    ) -> StoreResult<PreparedContentCapture> {
+        if capture_id.is_empty() || consumer.is_empty() {
+            return Err(missing_source("capture identity"));
+        }
+        let reader = self.revision_leases.get(lease)
+            .ok_or_else(|| missing_source("capture lease"))?;
+        let identity = sync_selection::identity(&reader.connection)?;
+        let current = sync_selection::identity(&self.connection)?;
+        if identity.store_id != current.store_id
+            || identity.library_epoch != current.library_epoch
+            || identity.generation != current.generation
+            || identity.selection_epoch != current.selection_epoch
+            || identity.revision > current.revision
+        {
+            return Err(missing_source("matching capture lease authority"));
+        }
+        let inventory = self.active_readers.defer_asset_inventory();
+        let reader = self.revision_leases.remove(lease)
+            .ok_or_else(|| missing_source("capture lease"))?;
+        Ok(PreparedContentCapture {
+            identity,
+            consumer: consumer.into(),
+            capture_id: capture_id.into(),
+            reader,
+            full: true,
             repository_root: self.repository_root.clone(),
             _inventory: inventory,
         })
@@ -187,7 +227,12 @@ impl PreparedContentCapture {
         let db = &self.reader.connection;
         let cas = PayloadCas::new(&self.repository_root)?;
         let sizes = PayloadSizes::open(&self.repository_root)?;
-        let after = match content_change_index::window(&self.reader, &self.consumer)? {
+        let window = if self.full {
+            ChangeWindow::Rebuild
+        } else {
+            content_change_index::window(&self.reader, &self.consumer)?
+        };
+        let after = match window {
             ChangeWindow::Rebuild => None,
             ChangeWindow::Incremental { after_revision } => {
                 // Authority transitions can change alias interpretation without

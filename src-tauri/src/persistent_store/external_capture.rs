@@ -804,6 +804,33 @@ impl PersistentStore {
         })
     }
 
+    /// On success or failure after admission, the supplied lease is consumed.
+    pub(crate) fn capture_external_library_from_lease(
+        &mut self,
+        consumer: &str,
+        hydration: &CaptureHydration,
+        lease: &str,
+        probe: &dyn CancellationProbe,
+    ) -> StoreResult<CapturedSnapshot> {
+        let reader = self.revision_leases.get(lease)
+            .ok_or_else(|| invalid("Capture lease is unavailable"))?;
+        let identity = sync_selection::identity(&reader.connection)?;
+        let scope = library_fingerprint_domain();
+        if hydration.consumer != consumer || hydration.identity != identity || hydration.scope_id != scope {
+            return Err(invalid("Capture hydration differs from its pinned lease"));
+        }
+        check(probe)?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let prepared = self.prepare_content_capture_from_lease(&id, consumer, lease)?;
+        let root = self.repository_root.join("external-storage");
+        let directory = root.join("captures").join(&id);
+        let mut catalog = CaptureCatalog::create(&directory, &root, None)?;
+        let projected_records = prepared.project(&mut catalog, probe)?;
+        check(probe)?;
+        let id = prepared.register(self, &catalog, &scope, CODEC)?;
+        Ok(CapturedSnapshot { id, identity, catalog, projected_records, shared: false })
+    }
+
     pub(crate) fn retain_external_capture(
         &mut self,
         capture: &str,
@@ -857,6 +884,39 @@ impl PersistentStore {
 #[cfg(test)]
 mod hydration_tests {
     use super::*;
+
+    #[test]
+    fn supplied_capture_lease_keeps_the_original_view_and_is_consumed() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let probe = crate::local_backup::NeverCancelled;
+        let commit = serde_json::from_value(serde_json::json!({
+            "expectedRevision":0,"root":{"username":"synthetic original"}
+        })).unwrap();
+        store.commit(&commit).unwrap();
+        let hydration = store.hydrate_external_capture_dependencies("backup", &probe).unwrap();
+        let first = store.capture_external_library("backup", &hydration, &probe).unwrap();
+        let scope = library_fingerprint_domain();
+        let fingerprint = first.catalog.content_fingerprint(&scope).unwrap();
+        let hydration = store.hydrate_external_capture_dependencies("backup", &probe).unwrap();
+        let lease = store.acquire_revision(1).unwrap();
+        let commit = serde_json::from_value(serde_json::json!({
+            "expectedRevision":1,"root":{"username":"synthetic later"}
+        })).unwrap();
+        store.commit(&commit).unwrap();
+        assert!(store.capture_external_library_from_lease("wrong", &hydration, &lease.lease, &probe).is_err());
+        assert!(store.revision_leases.contains_key(&lease.lease));
+        let captured = store.capture_external_library_from_lease("backup", &hydration, &lease.lease, &probe).unwrap();
+        assert_eq!(captured.identity.revision, 1);
+        assert_eq!(captured.catalog.content_fingerprint(&scope).unwrap(), fingerprint);
+        assert_eq!(store.revision().unwrap(), 2);
+        assert!(!store.revision_leases.contains_key(&lease.lease));
+        assert!(store.capture_external_library_from_lease("backup", &hydration, &lease.lease, &probe).is_err());
+        let later = store.acquire_revision(2).unwrap();
+        assert!(store.capture_external_library_from_lease("backup", &hydration, &later.lease, &probe).is_err());
+        assert!(store.revision_leases.contains_key(&later.lease));
+        store.release_revision(&later.lease).unwrap();
+    }
 
 
     #[test]
