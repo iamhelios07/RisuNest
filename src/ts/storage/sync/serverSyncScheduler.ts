@@ -3,6 +3,7 @@ export interface ServerSyncSchedulerDependencies {
     pull(completeAvailable?: boolean): Promise<void>
     connect(): Promise<void>
     disconnect(): Promise<void>
+    retryClock?(): Promise<void>
     failed(error: unknown): void
 }
 
@@ -27,12 +28,21 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
     let reconnectAttempt = 0
     let sendRetryAttempt = 0
     let blocked = false
+    let blockedCode = ''
+    let checkingClock: Promise<boolean> | undefined
+    let disconnecting: Promise<void> | undefined
+    const disconnect = () => {
+        if (!disconnecting) disconnecting = dependencies.disconnect().finally(() => { disconnecting = undefined })
+        return disconnecting
+    }
     const code = serverSyncErrorCode
     const fail = (error: unknown) => {
+        if (blocked && blockedCode !== 'clock-skew') return
         if ((typeof error === 'object' && error && 'retryable' in error && error.retryable === false && code(error) !== 'server-unreachable') || integrityCodes.includes(code(error))) {
             blocked = true
+            blockedCode = code(error)
             clear()
-            void dependencies.disconnect().catch(() => {})
+            void disconnect().catch(() => {})
         }
         dependencies.failed(error)
     }
@@ -81,13 +91,27 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
         }
         schedulePull()
     }
+    const recheckClock = (): Promise<boolean> => {
+        if (!foreground || !blocked || blockedCode !== 'clock-skew' || !dependencies.retryClock) return Promise.resolve(false)
+        if (checkingClock) return checkingClock
+        checkingClock = (async () => {
+            await Promise.allSettled([sending, receiving, disconnecting])
+            if (!foreground || blockedCode !== 'clock-skew') return false
+            await dependencies.retryClock!()
+            if (!foreground || blockedCode !== 'clock-skew') return false
+            blocked = false; blockedCode = ''; sendRetryAttempt = 0
+            connect(); void pull().catch(() => {}); void push().catch(() => {})
+            return true
+        })().catch(error => { fail(error); return false }).finally(() => { checkingClock = undefined })
+        return checkingClock
+    }
     return {
         async foreground(value: boolean) {
-            if (foreground === value) return
+            if (foreground === value) { if (value) await recheckClock(); return }
             foreground = value
             clear()
-            if (value) { reconnectAttempt = 0; connect(); void pull().catch(() => {}); void push().catch(() => {}) }
-            else { connected = false; await dependencies.disconnect() }
+            if (value) { reconnectAttempt = 0; if (!await recheckClock()) { connect(); void pull().catch(() => {}); void push().catch(() => {}) } }
+            else { connected = false; await disconnect() }
         },
         localChange(immediate = false) {
             clearTimeout(pushTimer)
@@ -96,7 +120,7 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
             else pushTimer = setTimeout(() => { void push().catch(() => {}) }, 2000)
         },
         remoteHint: () => { void pull().catch(() => {}) },
-        conversationOpened: () => { void pull().catch(() => {}) },
+        async conversationOpened() { if (!await recheckClock()) void pull().catch(() => {}) },
         socket,
         flush: push,
         async receiveAvailableChanges() {
@@ -105,10 +129,10 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
             if (blocked) throw new Error('Sync is stopped')
             await pull(true)
         },
-        retry() { blocked = false; sendRetryAttempt = 0; connect(); void pull().catch(() => {}); return push() },
+        retry() { blocked = false; blockedCode = ''; sendRetryAttempt = 0; connect(); void pull().catch(() => {}); return push() },
         isBlocked: () => blocked,
-        isRunning: () => !!sending || !!receiving,
-        async fence() { foreground = false; pushAgain = false; pullAgain = false; clear(); await dependencies.disconnect(); await Promise.allSettled([sending, receiving]) },
-        dispose() { foreground = false; clear(); void dependencies.disconnect().catch(fail) },
+        isRunning: () => !!sending || !!receiving || !!checkingClock,
+        async fence() { foreground = false; pushAgain = false; pullAgain = false; clear(); await disconnect(); await Promise.allSettled([sending, receiving, checkingClock]) },
+        dispose() { foreground = false; clear(); void disconnect().catch(fail) },
     }
 }
