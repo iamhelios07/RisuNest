@@ -226,6 +226,11 @@ fn source_identity() -> (String, Vec<Value>) {
             include_bytes!("../../../../server/sync/src/source_observer/mod.rs"),
         ),
         (
+            "server/sync/src/source_observer/read_barrier.rs",
+            "server",
+            include_bytes!("../../../../server/sync/src/source_observer/read_barrier.rs"),
+        ),
+        (
             "server/sync/src/source_observer/shared_wire.rs",
             "server",
             include_bytes!("../../../../server/sync/src/source_observer/shared_wire.rs"),

@@ -1,3 +1,4 @@
+pub(crate) mod read_barrier;
 #[allow(dead_code)]
 pub(crate) mod shared_wire;
 #[allow(dead_code)]
@@ -108,6 +109,7 @@ pub(crate) struct Snapshot {
     pub pending_workers: u64,
     pub pending_requests: u64,
     pub pending_body_work: PendingBodyWork,
+    pub read_barrier: Option<read_barrier::Observation>,
 }
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -133,6 +135,9 @@ struct Scope {
     requests: u64,
     closed: bool,
     pending_body_work: PendingBodyWork,
+    started: std::time::Instant,
+    started_reads: BTreeSet<(String, String)>,
+    read_barrier: Option<Arc<read_barrier::Barrier>>,
 }
 #[derive(Clone)]
 pub(crate) struct Context {
@@ -143,6 +148,7 @@ pub(crate) struct Context {
 struct Registry {
     active: Option<Context>,
     generation: u64,
+    used_read_barriers: BTreeSet<String>,
 }
 static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
 fn registry() -> &'static Mutex<Registry> {
@@ -365,6 +371,7 @@ pub(crate) fn unsupported(root: &Path, name: &str) {
 }
 
 pub(crate) fn install() {
+    read_barrier::install_hook(None);
     small_object_store::source_test_observer::install(Arc::new(|event| {
         use small_object_store::source_test_observer::Event;
         let origin = match &event {
@@ -469,6 +476,10 @@ pub(crate) fn begin(
             || scope.workers != 0
             || scope.requests != 0
             || scope
+                .read_barrier
+                .as_ref()
+                .is_some_and(|b| !b.observation().complete())
+            || scope
                 .rows
                 .values()
                 .any(|row| row.work.outstanding_readers != 0)
@@ -507,6 +518,9 @@ pub(crate) fn begin(
             requests: 0,
             closed: false,
             pending_body_work: PendingBodyWork::default(),
+            started: std::time::Instant::now(),
+            started_reads: BTreeSet::new(),
+            read_barrier: None,
         })),
         flow: "source".into(),
     });
@@ -535,6 +549,7 @@ pub(crate) fn snapshot(close: bool) -> Option<Snapshot> {
         pending_workers: scope.workers,
         pending_requests: scope.requests,
         pending_body_work: scope.pending_body_work.clone(),
+        read_barrier: scope.read_barrier.as_ref().map(|b| b.observation()),
     };
     let mut overflow = false;
     for row in &result.objects {
@@ -580,6 +595,7 @@ pub(crate) fn snapshot(close: bool) -> Option<Snapshot> {
         && result.pending_workers == 0
         && result.pending_requests == 0
         && result.pending_body_work.settled()
+        && result.read_barrier.as_ref().is_none_or(|b| b.complete())
         && result.unknown_work == Work::default();
     Some(result)
 }
@@ -689,6 +705,8 @@ struct Reader {
     placement: &'static str,
     position: u64,
     registered: bool,
+    started: bool,
+    cancelled: bool,
 }
 impl Reader {
     fn new(root: &Path, hash: &str, placement: &'static str, result: &io::Result<File>) -> Self {
@@ -716,7 +734,30 @@ impl Reader {
             placement,
             position: 0,
             registered: result.is_ok(),
+            started: false,
+            cancelled: false,
         }
+    }
+    fn before_read(&mut self, kind: &'static str) -> Option<read_barrier::Wait> {
+        if self.started {
+            return None;
+        }
+        self.started = true;
+        let context = self.context.as_ref()?;
+        let mut scope = context.scope.lock().unwrap();
+        scope
+            .started_reads
+            .insert((self.hash.clone(), context.flow.clone()));
+        let barrier = scope
+            .read_barrier
+            .as_ref()
+            .filter(|barrier| {
+                let intent = barrier.observation();
+                intent.matches_reader(&self.hash, &context.flow)
+            })
+            .cloned();
+        drop(scope);
+        barrier.and_then(|barrier| barrier.enter(self.placement, kind, self.position))
     }
     fn read(&mut self, result: &io::Result<usize>) {
         if let Some(context) = &self.context {
@@ -839,11 +880,24 @@ impl TrackedFile {
             reader: self.reader,
             pending: false,
             seeking: false,
+            read_wait: None,
         }
     }
 }
 impl Read for TrackedFile {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        if self.reader.cancelled {
+            return Err(io::Error::other("source read barrier cancelled"));
+        }
+        if let Some(wait) = (!bytes.is_empty())
+            .then(|| self.reader.before_read("stdRead"))
+            .flatten()
+        {
+            if let Err(error) = wait.blocking() {
+                self.reader.cancelled = true;
+                return Err(error);
+            }
+        }
         let result = self.file.read(bytes);
         self.reader.read(&result);
         result
@@ -861,6 +915,7 @@ pub(crate) struct TrackedAsyncFile {
     reader: Reader,
     pending: bool,
     seeking: bool,
+    read_wait: Option<read_barrier::Wait>,
 }
 impl TrackedAsyncFile {
     pub(crate) fn selected(&self, start: u64, bytes: u64) {
@@ -873,6 +928,24 @@ impl AsyncRead for TrackedAsyncFile {
         cx: &mut TaskContext<'_>,
         bytes: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if self.reader.cancelled {
+            return Poll::Ready(Err(io::Error::other("source read barrier cancelled")));
+        }
+        if self.read_wait.is_none() && bytes.remaining() != 0 {
+            self.read_wait = self.reader.before_read("asyncRead");
+        }
+        if let Some(wait) = &mut self.read_wait {
+            match wait.poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(result) => {
+                    self.read_wait.take();
+                    if let Err(error) = result {
+                        self.reader.cancelled = true;
+                        return Poll::Ready(Err(error));
+                    }
+                }
+            }
+        }
         let before = bytes.filled().len();
         let result = Pin::new(&mut self.file).poll_read(cx, bytes);
         match &result {
