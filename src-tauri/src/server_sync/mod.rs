@@ -9,6 +9,17 @@ pub(crate) mod residency;
 #[cfg(test)]
 mod tests;
 pub(crate) mod transfer;
+pub(crate) mod lww_client;
+#[cfg(test)]
+pub(crate) mod hash_metrics;
+mod binding;
+pub(crate) mod notification;
+#[cfg(test)]
+pub(crate) mod lww_tests;
+#[cfg(test)]
+mod media_admission_tests;
+#[cfg(test)]
+mod residency_lww_tests;
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -112,6 +123,7 @@ impl From<crate::persistent_store::StoreError> for SyncError {
             crate::persistent_store::StoreError::RevisionConflict { .. } => {
                 Self::new("local-revision-changed", 409)
             }
+            crate::persistent_store::StoreError::Validation { message } if matches!(message.as_str(), "accepted-clock-correction-required" | "incoming-clock-skew" | "clock-skew" | "equal-stamp-integrity" | "writer-collision" | "binding-authority-changed") => Self::new(message,409),
             other => Self::caused("local-validation", 409, other.to_string()),
         }
     }
