@@ -68,6 +68,41 @@ fn change(parts: &[&str], time: u64, value: Value) -> Change {
 }
 
 #[test]
+fn empty_identity_selections_replace_and_commit_without_initializing_empty_owners() {
+    let (_dir, mut store) = store();
+    let stage = store.replace_begin().unwrap().staging_id;
+    store.replace_put_root(&stage, &serde_json::json!({
+        "botPresetsId":"", "selectedPersona":"", "personas":[], "username":"retained"
+    })).unwrap();
+    let replaced = store.replace_commit(&stage, Some(0)).unwrap();
+    assert_eq!(replaced.revision, 1);
+    let root = store.read_root(None).unwrap().value;
+    assert_eq!(root["botPresetsId"], "");
+    assert_eq!(root["selectedPersona"], "");
+    assert_eq!(root["username"], "retained");
+    let outbox = store.lww_read_outbox(0.into(), 100).unwrap().entries;
+    for field in ["botPresetsId", "selectedPersona"] {
+        assert_eq!(outbox.iter().find(|entry| entry.key == unit_key(&["root", field]).unwrap()).unwrap().value,
+            inline(&serde_json::json!("")).unwrap());
+    }
+    assert!(outbox.iter().all(|entry| entry.key.components()[0] != "exists"));
+    save(&mut store, vec![
+        mutation(&["root", "botPresetsId"], serde_json::json!("missing-preset")),
+        mutation(&["root", "selectedPersona"], serde_json::json!("missing-persona")),
+    ]);
+    let cleared = save(&mut store, vec![
+        mutation(&["root", "botPresetsId"], serde_json::json!("")),
+        mutation(&["root", "selectedPersona"], serde_json::json!("")),
+    ]);
+    assert_eq!(cleared.revision, 3);
+    let root = store.read_root(None).unwrap().value;
+    assert_eq!(root["botPresetsId"], "");
+    assert_eq!(root["selectedPersona"], "");
+    assert_eq!(root["username"], "retained");
+    assert_eq!(store.connection.query_row("SELECT count(*) FROM lww_initialization_scopes", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+}
+
+#[test]
 fn unchanged_units_emit_nothing_and_a_commit_shares_one_stamp() {
     let (_dir, mut store) = store();
     save(
@@ -1665,7 +1700,7 @@ fn same_batch_parent_creation_precedes_message_range_and_local_statics_never_pub
 #[test]
 fn archive_publishes_one_state_unit_and_shared_payload_excludes_local_fields() {
     use std::io::Read;
-    let (_, mut store) = store();
+    let (_directory, mut store) = store();
     create_conversation(&mut store, "char", "chat");
     save(
         &mut store,
@@ -1743,7 +1778,7 @@ fn archive_publishes_one_state_unit_and_shared_payload_excludes_local_fields() {
 }
 #[test]
 fn received_archive_retains_local_fields_and_holds_children_until_restore() {
-    let (_, mut source) = store();
+    let (_source_directory, mut source) = store();
     let (dir, mut target) = store();
     create_conversation(&mut source, "char", "chat");
     create_conversation(&mut target, "char", "chat");
@@ -1865,7 +1900,7 @@ fn archive_record_restore_keeps_both_bodies_but_publishes_filtered_body_only() {
         decode_logical_record, encode_logical_record_key, LogicalRecordEnvelope,
         LogicalRecordLocator,
     };
-    let (_, mut store) = store();
+    let (_directory, mut store) = store();
     create_conversation(&mut store, "char", "chat");
     save(
         &mut store,
