@@ -561,8 +561,10 @@ fn a_plugin_root_added_after_first_release_page_keeps_every_later_custody_proof(
         .unwrap();
     *trace.target.lock().unwrap() = Some((store.repository_root().to_path_buf(), target));
     trace.armed.store(true, Ordering::SeqCst);
+    let revision = store.revision().unwrap();
     store.asset_residency_release_unused(|| Ok(())).unwrap();
     assert!(!trace.armed.load(Ordering::SeqCst));
+    assert_eq!(store.revision().unwrap(), revision + 1);
     let requests = trace.requests.lock().unwrap();
     assert_eq!(requests.iter().map(Vec::len).collect::<Vec<_>>(), vec![128]);
     let residency = Residency::open(store.repository_root()).unwrap();
