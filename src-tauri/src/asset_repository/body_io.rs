@@ -23,6 +23,10 @@ pub(crate) struct BodyWork {
     pub escaped_handles: u64,
     pub escaped_paths: u64,
     pub outstanding_readers: u64,
+    pub identity_metadata_open_attempts: u64,
+    pub identity_metadata_opens: u64,
+    pub identity_metadata_failed_opens: u64,
+    pub verified_identity_metadata_opens: u64,
 }
 
 impl BodyWork {
@@ -32,6 +36,10 @@ impl BodyWork {
         self.read_operations += other.read_operations; self.read_bytes += other.read_bytes;
         self.incomplete_reads += other.incomplete_reads; self.escaped_handles += other.escaped_handles;
         self.escaped_paths += other.escaped_paths; self.outstanding_readers += other.outstanding_readers;
+        self.identity_metadata_open_attempts += other.identity_metadata_open_attempts;
+        self.identity_metadata_opens += other.identity_metadata_opens;
+        self.identity_metadata_failed_opens += other.identity_metadata_failed_opens;
+        self.verified_identity_metadata_opens += other.verified_identity_metadata_opens;
     }
     fn observed_completely(&self) -> bool {
         self.unknown_open_results == 0 && self.incomplete_reads == 0
@@ -228,6 +236,18 @@ pub(super) fn open_result<T>(kind: &'static str, result: &io::Result<T>) {
         work.open_attempts += 1;
         if result.is_ok() { work.opens += 1; } else { work.failed_opens += 1; }
     });
+}
+
+pub(super) fn identity_metadata_open_result<T>(result: &io::Result<T>) {
+    domain("owned", |work| {
+        work.identity_metadata_open_attempts += 1;
+        if result.is_ok() { work.identity_metadata_opens += 1; }
+        else { work.identity_metadata_failed_opens += 1; }
+    });
+}
+
+pub(super) fn verified_identity_metadata_open() {
+    domain("owned", |work| work.verified_identity_metadata_opens += 1);
 }
 
 pub(super) fn escaped_handle(kind: &'static str) {
