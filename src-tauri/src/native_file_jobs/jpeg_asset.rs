@@ -543,6 +543,7 @@ mod tests {
     fn opened_source(path: &std::path::Path, total_bytes: u64) -> OpenedJobSource {
         OpenedJobSource {
             file: std::fs::File::open(path).expect("open JPEG source"),
+            custody: None,
             total_bytes,
         }
     }

@@ -397,6 +397,7 @@ impl StrictLocalBackupDatabaseRestore for LegacyDatabaseRestore<'_> {
             OpenedJobSource {
                 file,
                 total_bytes: database.byte_length,
+                custody: None,
             },
             self.expected_revision,
             self.job,
