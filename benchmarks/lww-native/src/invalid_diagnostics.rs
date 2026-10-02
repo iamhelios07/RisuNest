@@ -26,10 +26,15 @@ pub struct ReceiveIntentEvidence {
     pub inputs:Vec<JsonByteStructure>,
 }
 
+pub type CommitIntentEvidence=ReceiveIntentEvidence;
+
 impl ReceiveIntentEvidence {
     pub fn finish(&mut self) {
+        self.finish_for("receive-intent");
+    }
+    pub fn finish_for(&mut self,domain:&str) {
         if self.captured_calls!=self.observed_calls || self.captured_bytes!=self.observed_bytes {
-            self.errors.push("captured receive-intent calls/bytes differ from actual SHA domain".into());
+            self.errors.push(format!("captured {domain} calls/bytes differ from actual SHA domain"));
         }
         if self.inputs.len() as u64!=self.captured_calls {
             self.errors.push("not every captured input has a verified partition".into());
@@ -148,7 +153,8 @@ pub fn byte_deltas(a:&JsonByteStructure,b:&JsonByteStructure) -> Vec<JsonByteDel
         let baseline_bytes=a.nodes.get(path).map_or(0,|node|node.own_bytes);
         let trial_bytes=b.nodes.get(path).map_or(0,|node|node.own_bytes);
         if baseline_bytes==trial_bytes {return None;}
-        let category=if path=="/changes" || path.starts_with("/changes/") {"protected-change-input"}
+        let category=if ["/changes","/commit","/aliases"].iter().any(|prefix|
+            path==*prefix || path.starts_with(&format!("{prefix}/"))) {"protected-change-input"}
             else if path=="/progress" || path.starts_with("/progress/") || ["/bindingAuthority","/requestId","/admittedTimeUpperMs"].contains(&path.as_str()) {
                 "transport-control-candidate"
             } else {"framing-or-unknown"};
@@ -191,5 +197,17 @@ mod tests {
         let changed=br#"{"changes":[{"value":"different"}],"progress":{"cursor":"100"}}"#;
         assert!(byte_deltas(&exact_json_structure(a,a).unwrap(),&exact_json_structure(changed,changed).unwrap())
             .iter().any(|delta|delta.category=="protected-change-input"));
+    }
+    #[test]
+    fn commit_revision_and_alias_changes_remain_protected_pending_evidence() {
+        let a=br#"{"kind":"commit","commit":{"expectedRevision":9},"aliases":[]}"#;
+        let b=br#"{"kind":"commit","commit":{"expectedRevision":10},"aliases":[]}"#;
+        let deltas=byte_deltas(&exact_json_structure(a,a).unwrap(),&exact_json_structure(b,b).unwrap());
+        assert_eq!(deltas.len(),1);
+        assert_eq!(deltas[0].path,"/commit/expectedRevision");
+        assert_eq!(deltas[0].category,"protected-change-input");
+        let changed=br#"{"kind":"commit","commit":{"expectedRevision":10},"aliases":[{"key":"new"}]}"#;
+        assert!(byte_deltas(&exact_json_structure(b,b).unwrap(),&exact_json_structure(changed,changed).unwrap())
+            .iter().filter(|delta|delta.path.starts_with("/aliases")).all(|delta|delta.category=="protected-change-input"));
     }
 }

@@ -118,6 +118,7 @@ fn fixture_asset_inventory(store:&PersistentStore, scale:&FixtureScale) -> Vec<S
 
 fn reset_work(asset_hashes:&[String]) {
     super::hash_work::reset_receive_intent_inputs();
+    super::hash_work::reset_commit_intent_inputs();
     crate::asset_repository::body_io::reset_body_io();
     for hash in asset_hashes {
         crate::asset_repository::body_io::register_object_purpose(hash,
@@ -183,22 +184,30 @@ fn take_work(external: bool) -> NativeObservation {
         result.body_domains.insert(domain.into(), body_domain(work));
     }
     let inputs=super::hash_work::take_receive_intent_inputs();
+    let commit_inputs=super::hash_work::take_commit_intent_inputs();
     let observed=result.hashes.get("native/native_receive_intent").cloned().unwrap_or_default();
+    result.receive_intents=Some(input_evidence::<lww::StageReceive>(inputs,observed,"receive-intent"));
+    let observed=result.hashes.get("native/native_intent").cloned().unwrap_or_default();
+    result.commit_intents=Some(input_evidence::<lww::CommitIntentInput>(commit_inputs,observed,"commit-intent"));
+    result
+}
+
+fn input_evidence<T:serde::de::DeserializeOwned+Serialize>(inputs:Vec<Vec<u8>>,
+    observed:native_observation::HashDomain,domain:&str) -> invalid_diagnostics::ReceiveIntentEvidence {
     let mut evidence=invalid_diagnostics::ReceiveIntentEvidence {
         observed_calls:observed.calls,observed_bytes:observed.bytes,captured_calls:inputs.len() as u64,
         ..Default::default()};
     for input in inputs {
         evidence.captured_bytes=evidence.captured_bytes.checked_add(input.len() as u64).unwrap();
         let structure=(|| -> Result<invalid_diagnostics::JsonByteStructure,String> {
-            let request:lww::StageReceive=serde_json::from_slice(&input).map_err(|e|e.to_string())?;
+            let request:T=serde_json::from_slice(&input).map_err(|e|e.to_string())?;
             let roundtrip=serde_json::to_vec(&request).map_err(|e|e.to_string())?;
             invalid_diagnostics::exact_json_structure(&input,&roundtrip)
         })();
         match structure {Ok(value)=>evidence.inputs.push(value),Err(error)=>evidence.errors.push(error)}
     }
-    evidence.finish();
-    result.receive_intents=Some(evidence);
-    result
+    evidence.finish_for(domain);
+    evidence
 }
 
 fn body_domain(work:crate::asset_repository::body_io::BodyWork) -> BodyDomain {
@@ -520,8 +529,17 @@ fn paired_diagnostics(a:&NativeSample,b:&NativeSample) -> Value {
                 "trial_bytes":right.input_bytes,"exclusive_field_deltas":invalid_diagnostics::byte_deltas(left,right)}));
         }
     }
+    let mut commit_deltas=Vec::new();
+    if let (Some(baseline),Some(trial))=(&a.observation.commit_intents,&b.observation.commit_intents) {
+        for (index,(left,right)) in baseline.inputs.iter().zip(&trial.inputs).enumerate() {
+            commit_deltas.push(json!({"input_index":index,"baseline_bytes":left.input_bytes,
+                "trial_bytes":right.input_bytes,"exclusive_field_deltas":invalid_diagnostics::byte_deltas(left,right)}));
+        }
+    }
     json!({"iteration":a.iteration,"change":a.change,"direction":a.direction,
         "all_positive_hash_domain_growth":growth,"receive_intent_deltas":intent_deltas,
+        "commit_intent_deltas":commit_deltas,
+        "baseline_commit_intents":a.observation.commit_intents,"trial_commit_intents":b.observation.commit_intents,
         "baseline_receive_intents":a.observation.receive_intents,"trial_receive_intents":b.observation.receive_intents})
 }
 
@@ -552,6 +570,11 @@ fn validate_smoke_pairs(directory:&Path,by_scale:&[Vec<NativeSample>]) -> Result
             write_invalid_diagnostics(directory,by_scale,reason,Some(index));
             return Err(reason.into());
         }
+        if [a,b].iter().any(|sample|!sample.observation.commit_intents.as_ref().is_some_and(|e|e.complete)) {
+            let reason="incomplete exact commit-intent input provenance";
+            write_invalid_diagnostics(directory,by_scale,reason,Some(index));
+            return Err(reason.into());
+        }
         let keys=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||assert_same_key_sets(a,b)));
         let result=if keys.is_err() {Err("exact key-set comparison failed".into())}
             else {native_observation::assert_frozen_growth(&a.observation,&b.observation,&[])};
@@ -570,6 +593,8 @@ pub(crate) fn write_samples(directory:&Path, samples:&[NativeSample]) {
         sample.observation.validate_routine_invariants().unwrap();
         assert!(sample.observation.receive_intents.as_ref().is_some_and(|evidence|evidence.complete),
             "receive-intent input provenance must be complete before accepted output");
+        assert!(sample.observation.commit_intents.as_ref().is_some_and(|evidence|evidence.complete),
+            "commit-intent input provenance must be complete before accepted output");
         assert!(sample.selected_keys.is_some() && sample.emitted_keys.is_some() && sample.affected_keys.is_some(),
             "key-set observation must be linked before smoke output");
         if let Some(keys) = &sample.external_key_scope {
@@ -664,6 +689,11 @@ fn local_routine_observation_regression() {
             let sample = driver.run(direction, change, 0);
             sample.observation.validate_routine_invariants().unwrap();
             let evidence=sample.observation.receive_intents.as_ref().unwrap();
+            assert!(evidence.complete);
+            assert_eq!(evidence.observed_calls,evidence.captured_calls);
+            assert_eq!(evidence.observed_bytes,evidence.captured_bytes);
+            assert_eq!(evidence.inputs.iter().map(|input|input.input_bytes).sum::<u64>(),evidence.observed_bytes);
+            let evidence=sample.observation.commit_intents.as_ref().unwrap();
             assert!(evidence.complete);
             assert_eq!(evidence.observed_calls,evidence.captured_calls);
             assert_eq!(evidence.observed_bytes,evidence.captured_bytes);
@@ -845,4 +875,28 @@ fn local_receive_intent_growth_diagnostic() {
     }
     write_invalid_diagnostics(Path::new(&output),&by_scale,
         "diagnostic only: all executed warmup and recorded operations retained; no acceptance authorized",None);
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+#[ignore = "explicit FakeProvider diagnostic only, always writes INVALID output"]
+fn fake_provider_intent_growth_diagnostic() {
+    let output=std::env::var_os("RISUNEST_LWW_NATIVE_OUTPUT").expect("fresh separate diagnostic directory");
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        let mut by_scale=Vec::new();
+        for scale in frozen_small_scales() {
+            let mut driver=ExternalDriver::prepare(scale).await;
+            let mut samples=Vec::new();
+            for iteration in 0..4 {
+                for change in [SmallChange::Setting,SmallChange::Preset,SmallChange::Append] {
+                    for direction in [Direction::AtoB,Direction::BtoA] {
+                        samples.push(driver.run(direction,change,iteration).await);
+                    }
+                }
+            }
+            by_scale.push(samples);
+        }
+        write_invalid_diagnostics(Path::new(&output),&by_scale,
+            "FakeProvider diagnostic only: all executed warmup and recorded operations retained; no acceptance authorized",None);
+    });
 }

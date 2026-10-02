@@ -56,6 +56,7 @@ pub struct NativeObservation {
     pub body_batch_stat_requests: u64,
     pub body_presence_queries: u64,
     pub receive_intents:Option<super::invalid_diagnostics::ReceiveIntentEvidence>,
+    pub commit_intents:Option<super::invalid_diagnostics::CommitIntentEvidence>,
 }
 
 impl NativeObservation {
@@ -79,6 +80,9 @@ impl NativeObservation {
         self.hash_totals()?;
         if self.receive_intents.as_ref().is_some_and(|evidence|!evidence.complete) {
             return Err("incomplete exact receive-intent input provenance".into());
+        }
+        if self.commit_intents.as_ref().is_some_and(|evidence|!evidence.complete) {
+            return Err("incomplete exact commit-intent input provenance".into());
         }
         if self.body_scope_complete != Some(true) || self.body_scope_violations != 0
             || self.body_unknown_work != BodyDomain::default()
@@ -150,6 +154,9 @@ mod tests {
         sample.shared_head_reads = Some(0);
         sample.body_scope_complete = Some(true);
         assert!(sample.validate_routine_invariants().is_ok());
+        sample.commit_intents=Some(Default::default());
+        assert_eq!(sample.validate_routine_invariants().unwrap_err(),"incomplete exact commit-intent input provenance");
+        sample.commit_intents=None;
         sample.incomplete.push("native/stream".into());
         assert!(sample.hash_totals().is_err());
     }
