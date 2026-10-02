@@ -198,13 +198,19 @@ export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
                     return result
                 }
                 const activatedContext = bindingContext(result.state, controller.signal, mode)
+                await check(activatedContext)
                 active = { transport, context: bindingContext(result.state, controller.signal), controller }
                 jobsFenced = false
                 if (result.action === 'new-device') {
                     await transport.resumeNewDeviceBinding!(preparation!, result.newDevice!, activatedContext)
-                } else if (result.action === 'initialized') {
-                    if (await dependencies.hasNonDefaultSharedData()) await transport.publishInitialSharedState(activatedContext)
-                } else if (result.action === 'resumed') await transport.resumeBinding(activatedContext)
+                } else {
+                    if (result.action === 'initialized' && await dependencies.hasNonDefaultSharedData()) {
+                        await check(activatedContext)
+                        await transport.publishInitialSharedState(activatedContext)
+                    }
+                    await check(activatedContext)
+                    await transport.resumeBinding(activatedContext)
+                }
                 await check(activatedContext)
                 return result
             } catch (error) {
