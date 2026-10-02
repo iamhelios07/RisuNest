@@ -35,6 +35,36 @@ function status(patch: Partial<NativeFileJobStatus> = {}): NativeFileJobStatus {
 }
 
 describe('renderer-lifetime native file job manager', () => {
+    it('releases only the adopted portable reservation while retaining body progress and cancellation', async () => {
+        const receipt=status({jobId:'portable',kind:'restore-portable-backup',activationRevision:8,activationAuthority:'2',deviceSessionId:'session'})
+        let finish!:()=>void
+        const held=new Promise<void>(resolve=>{finish=resolve})
+        let entered!:()=>void
+        const ready=new Promise<void>(resolve=>{entered=resolve})
+        const operation=runSharedNativeFileOperation('import','portable-body-progress',async context=> {
+            expect(reserveGeneration()).toBeNull()
+            context.setBlocking(false)
+            expect(isLibraryFileOperationReserved()).toBe(true)
+            nativeInvoke.mockResolvedValue({...receipt,restoreAdoptionConfirmed:false})
+            await expect(context.releaseLibraryAfterPortableAdoption(receipt)).rejects.toMatchObject({code:'portable-adoption-receipt-mismatch'})
+            expect(isLibraryFileOperationReserved()).toBe(true)
+            nativeInvoke.mockResolvedValue({...receipt,restoreAdoptionConfirmed:true,phase:'copying-missing-bodies'})
+            await context.releaseLibraryAfterPortableAdoption(receipt)
+            expect(isLibraryFileOperationReserved()).toBe(false)
+            const generation=reserveGeneration()
+            expect(generation).not.toBeNull()
+            generation!.release()
+            context.onStatus({...receipt,phase:'copying-missing-bodies'})
+            entered()
+            await held
+            expect(context.signal.aborted).toBe(true)
+        },{format:'library-backup'})
+        await ready
+        expect(get(nativeFileOperation)?.status?.phase).toBe('copying-missing-bodies')
+        cancelActiveNativeFileOperation()
+        finish()
+        await operation
+    })
     it('permits foreground generation and sync only for a native-confirmed snapshot body owner', async () => {
         const receipt = {jobId: 'bodies', kind: 'snapshot-bodies' as const, stagingId: 'stage', activationRevision: '8', bindingAuthority: '2'}
         nativeInvoke.mockResolvedValue(status({jobId: 'bodies', kind: 'snapshot-bodies', snapshotStagingId: 'stage', activationRevision: 8, activationAuthority: '2', phase: 'copying-missing-bodies'}))

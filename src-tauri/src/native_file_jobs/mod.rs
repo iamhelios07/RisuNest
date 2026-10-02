@@ -1241,6 +1241,38 @@ pub(crate) struct NativeFileJobState {
 }
 
 impl NativeFileJobState {
+    pub(crate) fn prepare_snapshot_bodies(&self,store:&mut crate::persistent_store::PersistentStore,stage:&str,revision:i64,authority:&str)->Result<(crate::persistent_store::PersistentStore,snapshot_bodies::BodyPlan,Arc<JobControl>),NativeJobError> {
+        let plan=store.snapshot_restore_body_plan(stage,revision,authority).map_err(error::store_error)?;
+        let worker_store=store.open_native_job_store().map_err(error::store_error)?;
+        let job=self.registry.create_internal(JobKind::SnapshotBodies,Some(revision),Vec::new(),false).map_err(|error|NativeJobError::new("store-error",error))?;
+        {
+            let mut status=job.status.lock().map_err(|_|NativeJobError::new("store-error","Snapshot job status is unavailable"))?;
+            status.snapshot_staging_id=Some(stage.to_owned());
+            status.activation_revision=Some(revision);
+            status.activation_authority=Some(authority.to_owned());
+        }
+        Ok((worker_store,plan,job))
+    }
+    #[cfg(test)]
+    pub(crate) fn create_portable_restore_fixture(&self,revision:i64)->Result<(Arc<JobControl>,Arc<Mutex<Option<admission::Permit>>>),NativeJobError> {
+        let permit=self.admission.file(true).map_err(|error|NativeJobError::new("library-operation-busy",error))?;
+        let slot=Arc::new(Mutex::new(Some(permit)));
+        let job=self.registry.create_with_context(JobKind::RestorePortableBackup,Some(revision),Vec::new()).map_err(|error|NativeJobError::new("store-error",error))?;
+        job.set_activation_permit(Arc::downgrade(&slot)).map_err(|error|NativeJobError::new("store-error",error))?;
+        Ok((job,slot))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn select_portable_restore_fixture(&self,id:&str,selection:portable::PortableSelection)->Result<(),NativeJobError> {
+        let job=self.registry.lookup(id).map_err(|error|NativeJobError::new("store-error",error))?.ok_or_else(||NativeJobError::new("job-not-found","Portable restore owner is unavailable"))?;
+        job.select_portable_sections(selection).map_err(|error|NativeJobError::new("invalid-selection",error))
+    }
+
+    pub(crate) fn confirm_portable_restore_adoption(&self,device:&crate::device_backup::DeviceBackupState,id:&str,revision:&str,authority:&str,session:&str)->Result<(),NativeJobError> {
+        let job=self.registry.lookup(id).map_err(|error|NativeJobError::new("store-error",error))?.ok_or_else(||NativeJobError::new("job-not-found","Portable restore owner is unavailable"))?;
+        job.confirm_portable_adoption(revision,authority,session,||device.verify_portable_adoption_complete(session,id,revision,authority).map_err(|error|error.message))
+            .map_err(|error|NativeJobError::new("invalid-activation-receipt",error))
+    }
     fn admit_cleanup_operation(&self) -> Result<std::sync::RwLockReadGuard<'_, bool>, NativeJobError> {
         let guard = self.cleanup_closed.read().map_err(|_| NativeJobError::new("store-error", "Native cleanup state is unavailable"))?;
         if *guard { return Err(NativeJobError::new("cleanup-pending", "Application cleanup is pending")); }
@@ -3103,24 +3135,15 @@ pub(crate) fn native_snapshot_restore_bodies_start(
         }
     }
     let permit=WorkerPermit::acquire(Arc::clone(&state.active_workers),state.max_concurrent_jobs)?;
-    let (mut store,plan)=crate::persistent_store::commands::with_store_mut(app.state(),|store| {
-        let plan=store.snapshot_restore_body_plan(&staging_id,revision,&binding_authority)?;
-        Ok((store.open_native_job_store()?,plan))
-    }).map_err(error::store_error)?;
-    let job=state.registry.create_internal(JobKind::SnapshotBodies,Some(revision),Vec::new(),false)
-        .map_err(|error|NativeJobError::new("store-error",error))?;
-    {
-        let mut status=job.status.lock().map_err(|_|NativeJobError::new("store-error","Snapshot job status is unavailable"))?;
-        status.snapshot_staging_id=Some(staging_id.clone());
-        status.activation_revision=Some(revision);
-        status.activation_authority=Some(binding_authority.clone());
-    }
-    let directory=create_owned_directory(&state.root.join("jobs"),&job.id()).map_err(|error|NativeJobError::new("store-error",error))?;
+    let (mut store,plan,job)=crate::persistent_store::commands::with_store_mut(app.state(),|store|Ok(state.prepare_snapshot_bodies(store,&staging_id,revision,&binding_authority)))
+        .map_err(error::store_error)??;
+    let directory=snapshot_bodies::prepare_directory(&state.root.join("jobs"),&job)?;
     let started=NativeSnapshotBodiesStarted {job_id:job.id(),kind:JobKind::SnapshotBodies,staging_id,activation_revision,binding_authority};
     #[cfg(test)] let body_scope=crate::asset_repository::body_io::capture_body_io_scope();
     tauri::async_runtime::spawn_blocking(move || {
         let _permit=permit;
         let mut operation=|| {
+            #[cfg(test)] let _source_scope=crate::portable_backup::source_io::attach(&job.source_io_scope);
             let mut outcome=run_worker(||snapshot_bodies::run(&mut store,&plan,&job,&directory),"Snapshot body worker panicked");
             if let Err(failure)=cleanup_one_owned_directory(directory.parent().expect("owned job directory has a parent"),&directory,&job.id()) {
                 outcome=Err(NativeJobError::new("cleanup-failed",failure));
@@ -3136,16 +3159,13 @@ pub(crate) fn native_snapshot_restore_bodies_start(
 #[tauri::command(async)]
 pub(crate) fn native_portable_confirm_restore_adoption(
     state: State<'_, NativeFileJobState>,
+    device: State<'_, crate::device_backup::DeviceBackupState>,
     job_id: String,
     activation_revision: String,
     binding_authority: String,
     device_session_id: String,
 ) -> Result<(), NativeJobError> {
-    let job = state.registry.lookup(&job_id)
-        .map_err(|error| NativeJobError::new("store-error", error))?
-        .ok_or_else(|| NativeJobError::new("job-not-found", "Portable restore owner is unavailable"))?;
-    job.confirm_portable_adoption(&activation_revision, &binding_authority, &device_session_id)
-        .map_err(|error| NativeJobError::new("invalid-activation-receipt", error))
+    state.confirm_portable_restore_adoption(&device,&job_id,&activation_revision,&binding_authority,&device_session_id)
 }
 
 #[tauri::command(async)]
@@ -3564,6 +3584,7 @@ pub(crate) struct JobStatus {
     pub(crate) expected_revision: Option<i64>,
     pub(crate) activation_revision: Option<i64>,
     pub(crate) activation_authority: Option<String>,
+    pub(crate) restore_adoption_confirmed: bool,
     pub(crate) warning_codes: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) result: Option<JobResultSummary>,
@@ -3762,6 +3783,7 @@ impl JobRegistry {
                 expected_revision,
                 activation_revision: None,
                 activation_authority: None,
+                restore_adoption_confirmed: false,
                 warning_codes,
                 result: None,
                 error: None,
@@ -3989,8 +4011,8 @@ impl JobControl {
         Ok(())
     }
 
-    fn confirm_portable_adoption(&self, revision: &str, authority: &str, session: &str) -> Result<(), String> {
-        let status = self.status.lock().map_err(|_| "native job mutex poisoned".to_owned())?;
+    fn confirm_portable_adoption(&self, revision: &str, authority: &str, session: &str, verify_completed:impl FnOnce()->Result<(),String>) -> Result<(), String> {
+        let mut status = self.status.lock().map_err(|_| "native job mutex poisoned".to_owned())?;
         if status.kind != JobKind::RestorePortableBackup
             || status.activation_revision.map(|value| value.to_string()).as_deref() != Some(revision)
             || status.activation_authority.as_deref() != Some(authority)
@@ -3999,10 +4021,12 @@ impl JobControl {
         }
         let mut wait = self.wait_state.lock().map_err(|_| "native job wait mutex poisoned".to_owned())?;
         if wait.portable_adoption_confirmed { return Ok(()); }
+        verify_completed()?;
         let slot = wait.activation_permit.as_ref().and_then(std::sync::Weak::upgrade)
             .ok_or_else(|| "portable activation owner is unavailable".to_owned())?;
         release_worker_admission(&slot);
         wait.portable_adoption_confirmed = true;
+        status.restore_adoption_confirmed = true;
         self.wait_changed.notify_all();
         Ok(())
     }
@@ -5916,10 +5940,11 @@ mod tests {
         job.set_device_session("synthetic-device-session").unwrap();
         job.publish_portable_activation(7, "3".into()).unwrap();
         assert!(admission.server().is_err());
-        assert!(job.confirm_portable_adoption("07", "3", "synthetic-device-session").is_err());
-        assert!(job.confirm_portable_adoption("8", "3", "synthetic-device-session").is_err());
-        assert!(job.confirm_portable_adoption("7", "4", "synthetic-device-session").is_err());
-        assert!(job.confirm_portable_adoption("7", "3", "other-session").is_err());
+        assert!(job.confirm_portable_adoption("07", "3", "synthetic-device-session", ||Ok(())).is_err());
+        assert!(job.confirm_portable_adoption("8", "3", "synthetic-device-session", ||Ok(())).is_err());
+        assert!(job.confirm_portable_adoption("7", "4", "synthetic-device-session", ||Ok(())).is_err());
+        assert!(job.confirm_portable_adoption("7", "3", "other-session", ||Ok(())).is_err());
+        assert!(job.confirm_portable_adoption("7", "3", "synthetic-device-session", ||Err("Device recovery has not completed".into())).is_err());
         assert!(admission.server().is_err());
         let worker = Arc::clone(&job);
         let (done, completed) = std::sync::mpsc::channel();
@@ -5928,12 +5953,25 @@ mod tests {
             done.send(()).unwrap();
         });
         assert!(completed.try_recv().is_err());
-        job.confirm_portable_adoption("7", "3", "synthetic-device-session").unwrap();
+        job.confirm_portable_adoption("7", "3", "synthetic-device-session", ||Ok(())).unwrap();
         completed.recv().unwrap();
         joined.join().unwrap();
         assert!(admission.server().is_ok());
-        job.confirm_portable_adoption("7", "3", "synthetic-device-session").unwrap();
-        assert!(job.confirm_portable_adoption("9", "3", "synthetic-device-session").is_err());
+        job.confirm_portable_adoption("7", "3", "synthetic-device-session", ||panic!("matching completed ACK must be idempotent after session cleanup")).unwrap();
+        assert!(job.confirm_portable_adoption("9", "3", "synthetic-device-session", ||Ok(())).is_err());
+    }
+
+    #[test]
+    fn portable_adoption_fixture_keeps_mandatory_finalization_and_actual_exclusion() {
+        let root=tempfile::tempdir().unwrap();
+        let state=NativeFileJobState::initialize(root.path().join("native-file-jobs"));
+        let (job,slot)=state.create_portable_restore_fixture(7).unwrap();
+        assert!(job.requires_restore_finalization);
+        assert_eq!(job.status().expected_revision,Some(7));
+        assert!(state.admission.server().is_err());
+        assert!(slot.lock().unwrap().is_some());
+        drop(slot);
+        assert!(state.admission.server().is_ok());
     }
 
     #[test]
