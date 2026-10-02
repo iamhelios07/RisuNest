@@ -6,6 +6,10 @@ pub mod management;
 mod management_tests;
 pub mod publication;
 pub mod runtime;
+#[cfg(test)]
+mod source_observer;
+#[cfg(test)]
+mod source_observer_harness;
 pub mod store;
 pub mod tunnel;
 #[cfg(windows)]
