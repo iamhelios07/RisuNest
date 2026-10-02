@@ -1713,18 +1713,9 @@ async fn commit_preparation(
     if let Some(account_id) = provided_account_id {
         config.account_id = account_id.clone();
     }
-    if preparation.request.purpose == ConnectionPurpose::Sync {
-        if config.provider == "onedrive" && !config.location.contains_key("syncRootPath") {
-            let reference = match &credential { CredentialInput::Reference { reference, .. } => reference,
-                _ => return Err(ProviderError::new(ErrorKind::Unsupported).into()) };
-            let drive = config.location.get("driveId").ok_or_else(||ProviderError::new(ErrorKind::Unsupported))?;
-            let item = config.location.get("rootItemId").ok_or_else(||ProviderError::new(ErrorKind::Unsupported))?;
-            let folder = providers::onedrive::OneDrive::new(dependencies.clone()).inspect_setup_folder(
-                &config, reference, &config.account_id, drive, item, cancel).await?;
-            config.location.insert("syncRootPath".into(), folder.sync_root_path()?.into());
-        }
-        connection::validate_sync_location(&config)?;
-    }
+    validate_sync_folder_before_commit(
+        &mut config, preparation.request.purpose, &credential, &dependencies, cancel,
+    ).await?;
     let effective_connection_id = if preparation.request.mode == ConnectionOpenMode::Create
         && store
             .pending(connection_id)
@@ -2033,6 +2024,33 @@ async fn commit_preparation(
         connection: connection::summary(&stored),
         recovery,
     })
+}
+
+async fn validate_sync_folder_before_commit(
+    config: &mut super::contract::ConnectionConfig,
+    purpose: ConnectionPurpose,
+    credential: &CredentialInput,
+    dependencies: &Dependencies,
+    cancel: &Cancellation,
+) -> Result<()> {
+    if purpose != ConnectionPurpose::Sync {
+        return Ok(());
+    }
+    if config.provider == "onedrive" {
+        let reference = match credential {
+            CredentialInput::Reference { reference, .. } => reference,
+            _ => return Err(ProviderError::new(ErrorKind::Unsupported)),
+        };
+        let drive = config.location.get("driveId")
+            .ok_or_else(|| ProviderError::new(ErrorKind::Unsupported))?;
+        let item = config.location.get("rootItemId")
+            .ok_or_else(|| ProviderError::new(ErrorKind::Unsupported))?;
+        let folder = providers::onedrive::OneDrive::new(dependencies.clone()).inspect_setup_folder(
+            config, reference, &config.account_id, drive, item, cancel,
+        ).await?;
+        config.location.insert("syncRootPath".into(), folder.sync_root_path()?.into());
+    }
+    connection::validate_sync_location(config)
 }
 
 pub(crate) async fn read_root_key(vault: &dyn SecretVault, reference: &str) -> Result<Zeroizing<[u8; 32]>> {
@@ -2498,6 +2516,39 @@ mod tests {
     }
 
     use std::collections::BTreeMap;
+
+    #[test]
+    fn onedrive_sync_commit_uses_actual_decoded_folder_path_even_when_supplied() {
+        use super::super::{fake::{loopback_dependencies, MemoryVault}, wire_fixture::{Reply, WireServer}};
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let now = 1_700_000_000_000u64;
+            let secret = serde_json::to_vec(&serde_json::json!({"refreshToken":"synthetic-refresh","accessToken":"synthetic-access","accessTokenExpiresAtMs":now+3_600_000})).unwrap();
+            for allowed in [false, true] {
+                let parent = if allowed {"Projects/%EC%83%88%20%ED%8F%B4%EB%8D%94".into()} else {"r".repeat(200)};
+                let name = if allowed {"Allowed".into()} else {"r".repeat(68)};
+                let body = serde_json::to_vec(&serde_json::json!({"id":"configured-root","name":name,"folder":{},"parentReference":{"driveId":"drive-1","path":format!("/drive/root:/{parent}")}})).unwrap();
+                let server = WireServer::start(vec![Reply::Http {status:200,headers:vec![("Content-Type".into(),"application/json".into())],body}]);
+                let dependencies = loopback_dependencies(MemoryVault::with("synthetic-secret", &secret), now).dependencies;
+                let mut config = super::super::contract::ConnectionConfig {provider:"onedrive".into(), profile:Some("personal".into()), endpoint:server.url.to_string(), account_id:"account-1".into(),
+                    location:BTreeMap::from([("accountType".into(),"personal".into()),("tenant".into(),"consumers".into()),("driveId".into(),"drive-1".into()),("rootItemId".into(),"configured-root".into()),("syncRootPath".into(),"forged-safe".into())]),
+                    oauth_profile:Some(super::super::contract::OAuthProfile {project_id:"synthetic-app".into(),platform_client_ids:BTreeMap::new()})};
+                let credential = CredentialInput::Reference {reference:SecretRef("synthetic-secret".into()),account_id:Some("account-1".into())};
+                let result = validate_sync_folder_before_commit(&mut config, ConnectionPurpose::Sync, &credential, &dependencies, &Cancellation::default()).await;
+                assert_eq!(server.requests.lock().unwrap().len(),1);
+                if allowed {
+                    result.unwrap();
+                    assert_eq!(config.location["syncRootPath"], "Projects/새 폴더/Allowed");
+                } else {assert_eq!(result.unwrap_err().kind,ErrorKind::Unsupported);}
+            }
+            let server = WireServer::start(vec![]);
+            let dependencies = loopback_dependencies(MemoryVault::with("synthetic-secret", &secret), now).dependencies;
+            let mut config = super::super::contract::ConnectionConfig {provider:"onedrive".into(),profile:Some("personal".into()),endpoint:server.url.to_string(),account_id:"account-1".into(),location:BTreeMap::from([("syncRootPath".into(),"supplied-backup-value".into())]),oauth_profile:None};
+            let credential = CredentialInput::Reference {reference:SecretRef("synthetic-secret".into()),account_id:None};
+            validate_sync_folder_before_commit(&mut config, ConnectionPurpose::Backup, &credential, &dependencies, &Cancellation::default()).await.unwrap();
+            assert!(server.requests.lock().unwrap().is_empty());
+            assert_eq!(config.location["syncRootPath"],"supplied-backup-value");
+        });
+    }
 
     #[test]
     fn existing_prepare_requires_a_well_formed_recovery_key() {
