@@ -317,7 +317,7 @@ pub(crate) fn hydrate_registered_many(root:&Path,digests:&[String],priority:&std
             owner.run(&protection,&cancel,async {
                 let mut missing=Vec::new();
                 for source in group {
-                    if let Some(size)=cas.stat_object(&source.hash).map_err(local)? {if size!=source.byte_length {return Err(segment::corrupt());} install(&source.hash,size,scratch.path()).map_err(local)?;}
+                    if let Some(size)=cas.stat_object(&source.hash).map_err(local)? {if size!=source.byte_length {return Err(segment::corrupt());} install(&source.hash,size,scratch.path()).map_err(|_|segment::corrupt())?;}
                     else {missing.push(source);}
                 }
                 if missing.is_empty() {return Ok(());}
@@ -325,7 +325,7 @@ pub(crate) fn hydrate_registered_many(root:&Path,digests:&[String],priority:&std
                 let files=super::snapshot_restore::download_packed_body_files(&missing,stage.path(),&key,provider.as_ref(),&repository,&cancel).await?;
                 for source in missing {
                     if let Some(reason)=owner.recheck(&protection,&cancel).await? {return Err(super::leases::yield_error(reason));}
-                    install(&source.hash,source.byte_length,files.get(&source.hash).ok_or_else(segment::corrupt)?).map_err(local)?;
+                    install(&source.hash,source.byte_length,files.get(&source.hash).ok_or_else(segment::corrupt)?).map_err(|_|segment::corrupt())?;
                 }
                 Ok(())
             }).await
