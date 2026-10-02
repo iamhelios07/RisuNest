@@ -471,7 +471,7 @@ fn reused_data_roots_keep_controls_reachable_and_skip_present_catalog_bodies() {
         assert_eq!(f.receive_b().await,1);
         for (id,reads) in before {assert_eq!(f.provider.read_attempts(&id),reads,"known root and its present controls must not be downloaded again");}
         assert_eq!(f.b.read_conversation("char","conv",None).unwrap().unwrap().value["message"].as_array().unwrap().len(),41);
-        let mut changed=root.clone(); changed.plaintext_sha256="a".repeat(64);
+        let mut changed=root.clone(); changed.plaintext_sha256=[0xaa;32];
         assert!(f.a.external_lww_verified_data_catalog(&f.sender.target_scope(),&changed).is_err());
         let mut changed_hashes=hashes.clone(); changed_hashes.push("a".repeat(64));
         assert!(f.a.external_lww_witness_data_catalog(&f.sender.target_scope(),&root,&changed_hashes).is_err());

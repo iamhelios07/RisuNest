@@ -1106,7 +1106,7 @@ impl ExternalLwwEngine {
                         if let Some(previous)=payload.data_catalogs.iter().find(|root|root.header.object_id==proof.catalog.header.object_id) {
                             if previous!=&proof.catalog {return Err(segment::corrupt());}
                         } else {payload.data_catalogs.push(proof.catalog.clone());}
-                        reused_controls.insert(proof.catalog.ciphertext_sha256.clone(),proof);
+                        reused_controls.insert(hex::encode(proof.catalog.ciphertext_sha256),proof);
                         continue;
                     }
                 }

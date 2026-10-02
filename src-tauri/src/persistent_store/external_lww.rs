@@ -324,7 +324,7 @@ impl PersistentStore {
             return Err(super::lww::error("invalid-control-catalog"));
         }
         // Catalog proofs cannot collide with canonical control hash witnesses.
-        Ok(format!("data/{}", catalog.ciphertext_sha256))
+        Ok(format!("data/{}", hex::encode(catalog.ciphertext_sha256)))
     }
     fn external_lww_data_catalog_witness(&self, target: &str, key: &str) -> StoreResult<Option<DataCatalogWitness>> {
         let body: Option<Option<Vec<u8>>> = self.device_store()?.connection().query_row(
@@ -342,7 +342,7 @@ impl PersistentStore {
     }
     fn external_lww_control_catalog_key(catalog: &risunest_external_storage_format::snapshot::StoredObject) -> StoreResult<String> {
         Self::external_lww_data_catalog_key(catalog)?;
-        Ok(format!("data-proof/{}",catalog.ciphertext_sha256))
+        Ok(format!("data-proof/{}",hex::encode(catalog.ciphertext_sha256)))
     }
     // Routine reuse and renewal read a bounded proof, not the complete admission inventory.
     fn external_lww_control_catalog_proof(&self,target:&str,key:&str) -> StoreResult<Option<ControlCatalogProof>> {
