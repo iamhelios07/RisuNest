@@ -84,6 +84,7 @@ pub(crate) struct RemoteObject {
 
 pub(crate) struct Residency {
     db: Connection,
+    root: PathBuf,
 }
 
 impl Residency {
@@ -135,7 +136,7 @@ impl Residency {
             return Err(SyncError::new("incompatible-residency-store", 409));
         }
         hold_anchor(root, &path);
-        Ok(Self { db })
+        Ok(Self { db, root: root.to_path_buf() })
     }
     /// A fresh registration restores access to the same library's historical
     /// custody. Keep its original owner ID for eventual retention release.
@@ -254,6 +255,7 @@ impl Residency {
         self.lookup(digest, None, false)
             .map(|object| object.map(|object| object.size))
             .map_err(|error| std::io::Error::other(error.code))
+            .and_then(|size| match size { Some(size) => Ok(Some(size)), None => crate::external_storage::lww_residency::stat(&self.root, digest) })
     }
     pub fn page(&self, after: &str) -> Result<Vec<(String, String, u64)>> {
         let mut statement=self.db.prepare("SELECT context||'/'||hash,hash,size FROM objects WHERE state!='released' AND context||'/'||hash>?1 ORDER BY context,hash LIMIT 128")?;
@@ -430,7 +432,9 @@ pub(crate) fn open_transient_with_check(
     if let Some(file) = cas.open_object(digest)? {
         return Ok(Some(TransientBody { body: super::cache::Body::File(file), _directory: None }));
     }
-    let Some(proof) = Residency::open(root)?.object(digest, None)? else { return Ok(None); };
+    let Some(proof) = Residency::open(root)?.object(digest, None)? else {
+        return Ok(crate::external_storage::lww_residency::hydrate(root, digest, check)?.map(|file|TransientBody {body:super::cache::Body::File(file),_directory:None}));
+    };
     let _budget = lock_with_check(&TRANSFER_BUDGET, check)?;
     #[cfg(test)]
     if let Some(bytes) = test_remote::body(&std::fs::canonicalize(root)?, digest) {
@@ -513,6 +517,7 @@ impl HydrationSession {
                 }
                 if self.residency.is_none() { self.residency = Some(Residency::open(&self.root)?); }
                 let Some(proof) = self.residency.as_ref().unwrap().object(hash, None)? else {
+                    if let Some(file) = crate::external_storage::lww_residency::hydrate(&self.root, hash, check)? {opened(hash,file);continue;}
                     unavailable.push(hash.clone());
                     continue;
                 };

@@ -1382,7 +1382,6 @@ async fn run_backup(
     let worker_job = job.clone();
     let repository_id = connected.stored.descriptor.repository_id.clone();
     let probe = CancelProbe(cancel.clone());
-    let policy = connected.stored.capture_policy;
     let section_spool =
         job_directory(&root, &job.request.connection_id, &job.id).join("sections");
     let worker_spool = section_spool.clone();
@@ -1455,17 +1454,7 @@ async fn run_backup(
             .catalog
             .content_fingerprint(&risunest_external_storage_format::format::library_fingerprint_domain())
             .map_err(local_error)?;
-        // A backup keeps exactly what its connection selected. Capturing after
-        // the library keeps one cancellation point for the whole job.
-        let sections = match policy {
-            Some(policy) => super::sections::capture_backup_sections(
-                &mut pds,
-                policy,
-                &worker_spool,
-                &probe.0,
-            )?,
-            None => Vec::new(),
-        };
+        let sections = super::sections::capture_backup_sections(&mut pds, &worker_spool, &probe.0)?;
         Ok((capture, fingerprint, sections))
     })
     .await

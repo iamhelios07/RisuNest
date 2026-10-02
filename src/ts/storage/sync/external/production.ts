@@ -18,6 +18,7 @@ import { subscribeLocalPersistentRevision } from '../../persistentRevisionEvents
 import type { SyncExitDrainAdapter } from '../../syncExitCoordinator'
 import { hasPendingExternalApplication, runExternalApplication } from './applicationRecovery'
 import { getExternalStorageBridge } from './bridge'
+import { installExternalLwwAdapters, refreshExternalLwwAdapters, externalLwwExitDrain } from './lwwProduction'
 import {
     createExternalStorageController,
     type ExternalControllerResult,
@@ -77,6 +78,7 @@ async function refreshForeground(current: ProductionRuntime): Promise<void> {
     const state = await bridge.getState()
     current.state = state
     current.controller.replaceState(state)
+    await refreshExternalLwwAdapters(state)
     const token = await capturePersistentMutationToken('external-storage-foreground')
     current.scheduler.durableRevision(String(token.revision) as DecimalString)
     current.scheduler.resume()
@@ -139,6 +141,7 @@ export function installExternalStorageProduction(): Promise<() => void> {
         }
         holder.current = current
         runtime = current
+        disposers.push(await installExternalLwwAdapters(state))
         disposers.push(controller.subscribe(snapshot => {
             for (const [connectionId, job] of snapshot.activeJobs) {
                 if (job.error?.action !== 'reauthenticate' && job.error?.action !== 'unlock-key') continue
@@ -217,6 +220,7 @@ export async function refreshExternalStorageProductionState(): Promise<void> {
     const state = await getExternalStorageBridge().getState()
     current.state = state
     current.controller.replaceState(state)
+    await refreshExternalLwwAdapters(state)
     const token = await capturePersistentMutationToken('external-storage-routing-changed')
     if (runtime !== current) return
     current.scheduler.durableRevision(String(token.revision) as DecimalString)
@@ -477,6 +481,11 @@ export interface ExternalExitSelectionCapture {
 
 
 export function getExternalStorageSyncExitDrainAdapter(
-    _capture?: ExternalExitSelectionCapture,
-    _fence?: RetainableReplacementFence,
-): SyncExitDrainAdapter | null { return null }
+    capture?: ExternalExitSelectionCapture,
+    fence?: RetainableReplacementFence,
+): SyncExitDrainAdapter | null {
+    const selection = capture?.selection ?? runtime?.state.selection
+    if (selection?.kind !== 'external') return null
+    const connectionId = selection.connectionId ?? ('id' in selection ? selection.id : undefined)
+    return typeof connectionId === 'string' ? externalLwwExitDrain(connectionId, selection.selectionEpoch, !!fence) : null
+}

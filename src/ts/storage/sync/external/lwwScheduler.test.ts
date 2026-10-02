@@ -1,0 +1,65 @@
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { createLwwScheduler } from './lwwScheduler'
+
+afterEach(() => vi.useRealTimers())
+function fixture() {
+    vi.useFakeTimers()
+    const publish = vi.fn(async () => {})
+    const receive = vi.fn(async () => 0)
+    const failed = vi.fn()
+    let available = true
+    const scheduler = createLwwScheduler({ available: () => available, publish, receive, failed, now: () => Date.now() })
+    return { scheduler, publish, receive, failed, unavailable: () => { available = false } }
+}
+describe('LWW foreground scheduling', () => {
+    it('publishes after quiet edits and caps a continuous burst at sixty seconds', async () => {
+        const f = fixture(); f.scheduler.start(); await f.scheduler.settled()
+        f.scheduler.dirty()
+        await vi.advanceTimersByTimeAsync(14_999)
+        expect(f.publish).not.toHaveBeenCalled()
+        await vi.advanceTimersByTimeAsync(1)
+        await f.scheduler.settled()
+        expect(f.publish).toHaveBeenCalledTimes(1)
+        for (let i = 0; i < 6; i++) { f.scheduler.dirty(); await vi.advanceTimersByTimeAsync(10_000) }
+        expect(f.publish).toHaveBeenCalledTimes(2)
+        f.scheduler.stop()
+    })
+    it('publishes answer completion at five seconds and immediately lists opened conversations', async () => {
+        const f = fixture(); f.scheduler.start(); await f.scheduler.settled()
+        f.scheduler.dirty(true)
+        await vi.advanceTimersByTimeAsync(4_999)
+        expect(f.publish).not.toHaveBeenCalled()
+        await vi.advanceTimersByTimeAsync(1)
+        expect(f.publish).toHaveBeenCalledTimes(1)
+        const before = f.receive.mock.calls.length
+        await f.scheduler.conversationOpened()
+        expect(f.receive).toHaveBeenCalledTimes(before + 1)
+        f.scheduler.stop()
+    })
+    it('lists once when returning to foreground and does not start a background loop', async () => {
+        const f = fixture(); f.scheduler.start(); await f.scheduler.settled()
+        f.scheduler.stop(); const before = f.receive.mock.calls.length
+        await f.scheduler.resumeForeground(); await f.scheduler.settled()
+        expect(f.receive).toHaveBeenCalledTimes(before + 1)
+        f.scheduler.stop(); await vi.advanceTimersByTimeAsync(600_000)
+        expect(f.receive).toHaveBeenCalledTimes(before + 1)
+    })
+    it('backs idle listings off to two minutes, suspends offline, and waits for real completion', async () => {
+        const f = fixture(); f.scheduler.start(); await f.scheduler.settled()
+        await vi.advanceTimersByTimeAsync(30_000 + 60_000 + 120_000)
+        expect(f.receive).toHaveBeenCalledTimes(4)
+        let finish!: () => void
+        f.publish.mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve }))
+        const request = f.scheduler.publishNow()
+        await Promise.resolve(); await Promise.resolve()
+        let complete = false
+        void f.scheduler.settled().then(() => { complete = true })
+        await Promise.resolve()
+        expect(complete).toBe(false)
+        finish(); await request; await f.scheduler.settled()
+        f.unavailable()
+        await f.scheduler.conversationOpened()
+        expect(f.receive).toHaveBeenCalledTimes(4)
+        f.scheduler.stop()
+    })
+})

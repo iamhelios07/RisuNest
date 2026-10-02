@@ -100,18 +100,26 @@ pub(super) struct FakeState {
     inventory_upload_failure: Option<ErrorKind>,
     upload_failure: Option<(usize, ErrorKind)>,
     first_upload: Option<std::time::Instant>,
+    sent_body_bytes: u64,
+    received_body_bytes: u64,
 }
 pub(crate) struct FakeProvider {
     pub(super) state: Mutex<FakeState>,
     cas: bool,
+    object_limit: u64,
 }
 impl FakeProvider {
     pub(crate) fn new(cas: bool) -> Self {
+        Self::with_object_limit(cas,1024*1024)
+    }
+    pub(crate) fn with_object_limit(cas:bool,object_limit:u64)->Self {
         Self {
             state: Mutex::new(FakeState::default()),
             cas,
+            object_limit,
         }
     }
+    pub(crate) fn transferred_body_bytes(&self)->(u64,u64) {let state=self.state.lock().unwrap();(state.sent_body_bytes,state.received_body_bytes)}
     /// Places an object of a role directly, so a listing of any collection can
     /// be arranged without going through an upload.
     pub(crate) fn seed(&self, object: &str, role: ObjectRole, bytes: Vec<u8>) {
@@ -357,13 +365,13 @@ impl Provider for FakeProvider {
             if unchanged == Some(&token) && !self.state.lock().unwrap().ignore_unchanged {
                 return Ok(ReadReceipt::NotModified(token));
             }
-            *self.state.lock().unwrap().body_bytes.entry(l.object.clone()).or_default() += bytes.len();
             let hash = risunest_sync_wire::hash(&bytes);
             let mut writer = sink.open(0, bytes.len() as u64, c).await?;
             writer
                 .write_all(&bytes)
                 .await
                 .map_err(|_| ProviderError::new(ErrorKind::Transient))?;
+            {let mut state=self.state.lock().unwrap();state.received_body_bytes+=bytes.len() as u64;*state.body_bytes.entry(l.object.clone()).or_default()+=bytes.len();}
             writer
                 .shutdown()
                 .await
@@ -417,7 +425,7 @@ impl Provider for FakeProvider {
                     return Err(ProviderError::new(kind));
                 }
             }
-            if intent.byte_length > 1024 * 1024 || source.byte_length() != intent.byte_length {
+            if intent.byte_length > self.object_limit || source.byte_length() != intent.byte_length {
                 return Err(ProviderError::new(ErrorKind::FileTooLarge));
             }
             let mut bytes = Vec::new();
@@ -428,6 +436,7 @@ impl Provider for FakeProvider {
                 .read_to_end(&mut bytes)
                 .await
                 .map_err(|_| ProviderError::new(ErrorKind::Transient))?;
+            self.state.lock().unwrap().sent_body_bytes+=bytes.len() as u64;
             if bytes.len() as u64 != intent.byte_length
                 || risunest_sync_wire::hash(&bytes) != intent.sha256
             {

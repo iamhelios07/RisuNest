@@ -204,6 +204,9 @@ impl PersistentStore {
             } else if let Some(object) = residency.object(&hash, None)? {
                 status.remote_bytes += object.size;
                 status.remote_objects += 1;
+            } else if let Some(size) = crate::external_storage::lww_residency::stat(&self.repository_root, &hash)? {
+                status.remote_bytes += size;
+                status.remote_objects += 1;
             } else {
                 status.unavailable_objects += 1;
             }
