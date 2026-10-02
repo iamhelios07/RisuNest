@@ -1154,6 +1154,54 @@ fn apply_hypa(tx: &Connection, key: &str, next: Option<Value>) -> StoreResult<()
     tx.execute("INSERT INTO hypa_embeddings VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'0','',NULL,NULL,NULL) ON CONFLICT(cache_key) DO UPDATE SET producer=excluded.producer,model=excluded.model,endpoint=excluded.endpoint,preprocess_version=excluded.preprocess_version,dimensions=excluded.dimensions,vector=excluded.vector,metadata=excluded.metadata,tombstone=excluded.tombstone",params![key,v.get("producer").and_then(Value::as_str).unwrap_or_default(),v.get("model").and_then(Value::as_str).unwrap_or_default(),v.get("endpoint").and_then(Value::as_str),v.get("preprocessVersion").and_then(Value::as_i64).unwrap_or(0),v.get("dimensions").and_then(Value::as_i64).unwrap_or(1),vector,v.get("metadata").and_then(Value::as_str),i64::from(v.as_object().is_none_or(Map::is_empty))])?;
     Ok(())
 }
+
+pub(in crate::persistent_store) fn device_replacement_changes(
+    tx: &Transaction<'_>,
+    replacement: &device_store::sections::FrozenBackupSections,
+) -> StoreResult<Vec<(UnitKey, UnitValue)>> {
+    use device_store::sections::{FrozenBackupSections, SectionValueRow};
+    use base64::Engine;
+    fn units(rows: &FrozenBackupSections) -> StoreResult<BTreeMap<UnitKey, UnitValue>> {
+        let mut values = BTreeMap::new();
+        for row in &rows.hypa {
+            let value = match &row.value {
+                SectionValueRow::Hypa { producer, model, endpoint, preprocess_version, dimensions, vector, metadata } => inline(
+                    &json!({"producer":producer,"model":model,"endpoint":endpoint,"preprocessVersion":preprocess_version,"dimensions":dimensions,
+                        "vector":base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vector),"metadata":metadata}),
+                )?,
+                SectionValueRow::Tombstone { .. } => UnitValue::Deleted,
+                _ => return Err(error("replacement-hypa-row-invalid")),
+            };
+            values.insert(unit_key(&["hypa", &row.key1])?, value);
+        }
+        for row in &rows.local_plugins {
+            let value = match &row.value {
+                SectionValueRow::Plugin { value, .. } => inline(&json!(value))?,
+                SectionValueRow::Tombstone { .. } => UnitValue::Deleted,
+                _ => return Err(error("replacement-plugin-row-invalid")),
+            };
+            values.insert(unit_key(&["plugin-local", &row.key1, &row.key2, &row.key3])?, value);
+        }
+        Ok(values)
+    }
+    let before = units(&device_store::sections::capture_replacement_device_rows(tx)?)?;
+    let after = units(replacement)?;
+    let mut keys: BTreeSet<_> = before.keys().chain(after.keys()).cloned().collect();
+    let mut statement = tx.prepare("SELECT key FROM lww_units WHERE json_extract(key,'$[0]') IN ('hypa','plugin-local')")?;
+    let stored = statement.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+    for key in stored { keys.insert(wire(key.try_into())?); }
+    let mut changes = vec![];
+    for key in keys {
+        let value = after.get(&key).cloned().unwrap_or(UnitValue::Deleted);
+        let prior = read_unit(tx, &key)?.map(|(_, value)| value)
+            .or_else(|| before.get(&key).cloned()).unwrap_or(UnitValue::Deleted);
+        #[cfg(test)]
+        count_work();
+        if prior != value { changes.push((key, value)); }
+    }
+    Ok(changes)
+}
+
 pub(in crate::persistent_store) fn capture_device_changes(
     tx: &Transaction<'_>,
     stamp: &Stamp,
