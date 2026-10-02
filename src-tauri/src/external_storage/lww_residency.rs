@@ -332,7 +332,9 @@ pub(crate) fn hydrate_registered_many(root:&Path,digests:&[String],priority:&std
                 let stage=tempfile::tempdir_in(scratch.path()).map_err(local)?;
                 let files=match super::snapshot_restore::download_packed_body_files(&missing,stage.path(),&key,provider.as_ref(),&repository,&cancel).await {
                     Err(error) if error.kind==ErrorKind::NotFound => {
-                        let engine=super::lww_engine::ExternalLwwEngine {provider:provider.clone(),repository:repository.clone(),library:library_id.clone(),
+                        let (current_repository,_)=provider.open_repository(&stored.config,&SecretRef(stored.credential_ref.clone()),OpenMode::Existing,&cancel).await?;
+                        if current_repository.repository_id!=repository.repository_id || current_repository.connection_identity!=repository.connection_identity {return Err(segment::corrupt());}
+                        let engine=super::lww_engine::ExternalLwwEngine {provider:provider.clone(),repository:current_repository,library:library_id.clone(),
                             root_key:zeroize::Zeroizing::new(*key),admission:None,connection_id:connection_id.clone(),connection_root:connection_root.clone(),
                             capabilities:stored.capabilities.clone(),descriptor:stored.descriptor.clone()};
                         let refreshed=engine.refresh_packed_sources(&missing,&scratch.path().join("current-catalogs"),&cancel).await?;
@@ -436,7 +438,9 @@ pub(crate) async fn spool_frozen_remote_body(source:&FrozenBodySource,destinatio
         } else if let FrozenBodySource::Packed(source)=&source {
             let path=match super::snapshot_restore::download_packed_body_file(hash,source.byte_length,source.chunks.clone(),source.packs.clone(),scratch.path(),&key,provider.as_ref(),&repository,cancel).await {
                 Err(error) if error.kind==ErrorKind::NotFound => {
-                    let engine=super::lww_engine::ExternalLwwEngine{provider:provider.clone(),repository:repository.clone(),library:source.library_id.clone(),
+                    let (current_repository,_)=provider.open_repository(&stored.config,&SecretRef(stored.credential_ref.clone()),OpenMode::Existing,cancel).await?;
+                    if current_repository.repository_id!=repository.repository_id || current_repository.connection_identity!=repository.connection_identity {return Err(segment::corrupt());}
+                    let engine=super::lww_engine::ExternalLwwEngine{provider:provider.clone(),repository:current_repository,library:source.library_id.clone(),
                         root_key:zeroize::Zeroizing::new(*key),admission:None,connection_id:connection_id.clone(),connection_root:connection_root.clone(),
                         capabilities:stored.capabilities.clone(),descriptor:stored.descriptor.clone()};
                     let mut refreshed=engine.refresh_packed_sources(std::slice::from_ref(source),&scratch.path().join("current-catalogs"),cancel).await?;

@@ -377,6 +377,7 @@ export interface PersistentDataRuntime {
     refreshActivatedLibraryUnderPause(token: PersistentMutationToken): Promise<CommittedApplyOutcome>
     applyLwwReceive(request: LwwStageReceive): Promise<LwwApplyResult>
     drainLwwDeferred(): Promise<void>
+    drainDeferredLwwReceives(expectedAuthorityEpoch?: number): Promise<void>
     commitPersistentUnitIntent(reason: string, mutations: readonly PersistentUnitMutation[], conversations?: readonly ConversationMutation[], wholeMessages?: readonly WholeMessageIntent[]): Promise<void>
 
     readonly store: PersistentDataStore
@@ -1028,9 +1029,9 @@ export function createPersistentDataRuntime(
         }
         await commitContentCursor(result.revision)
     }
-    const drainLwwDeferred = async (): Promise<void> => {
+    const drainLwwDeferred = async (authorityEpoch = coordinator.storageAuthorityEpoch): Promise<void> => {
+        coordinator.assertPersistentMutationAllowed(authorityEpoch)
         if (!dependencies.store.lwwBindingState || !dependencies.store.lwwDrainDeferred) return
-        const authorityEpoch = coordinator.storageAuthorityEpoch
         await coordinator.withPausedPersistentWrites('generation-deferred-drain', async () => {
             coordinator.assertPersistentMutationAllowed(authorityEpoch)
             const binding = await dependencies.store.lwwBindingState!()
@@ -1041,6 +1042,7 @@ export function createPersistentDataRuntime(
             try {
                 coordinator.assertPersistentMutationAllowed(authorityEpoch)
                 await projectAppliedUnits(result, baseline)
+                coordinator.assertPersistentMutationAllowed(authorityEpoch)
             } catch (error) {
                 coordinator.markCommittedWorkingSetRefreshRequired(result.revision, error)
                 throw error
@@ -1111,6 +1113,7 @@ export function createPersistentDataRuntime(
             })
         },
         drainLwwDeferred,
+        drainDeferredLwwReceives: drainLwwDeferred,
         async commitPersistentUnitIntent(reason, mutations, conversations, wholeMessages) {
             const translated = translatePersistentRootUnitIntents(mutations)
             const affectedKeys = translated.map((value) => value.key)
@@ -1205,7 +1208,7 @@ export function createPersistentDataRuntime(
             coordinator.assertPersistentMutationAllowed(expectedAuthorityEpoch)
             await coordinator.flushPendingDataLocally('generation-completion')
             coordinator.assertPersistentMutationAllowed(expectedAuthorityEpoch)
-            await drainLwwDeferred()
+            await drainLwwDeferred(expectedAuthorityEpoch)
         },
         commitCharacterAddition: (request, reason) =>
             coordinator.commitCharacterAddition(request, reason),
