@@ -27,13 +27,14 @@ pub(crate) struct HeldAssetTransfer {
     pub cancel_after_pack_loss: std::sync::atomic::AtomicBool,
     pub held: std::sync::atomic::AtomicBool,
     pub fail_pack_after: std::sync::atomic::AtomicUsize,
+    pub fail_segment_begin: std::sync::atomic::AtomicBool,
     pub attempts: std::sync::Mutex<Vec<ObjectIntent>>,
     pub before_lease: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 impl HeldAssetTransfer {
     pub(crate) fn new(inner: Arc<FakeProvider>) -> Arc<Self> {
         Arc::new(Self { inner, entered: Default::default(), resume: Default::default(),
-            lose_pack_response: false.into(), cancel_after_pack_loss: false.into(), held: true.into(), fail_pack_after: 0.into(), attempts: Default::default(), before_lease: Default::default() })
+            lose_pack_response: false.into(), cancel_after_pack_loss: false.into(), held: true.into(), fail_pack_after: 0.into(), fail_segment_begin: false.into(), attempts: Default::default(), before_lease: Default::default() })
     }
 }
 impl Provider for HeldAssetTransfer {
@@ -42,7 +43,14 @@ impl Provider for HeldAssetTransfer {
     fn read_object<'a>(&'a self, repository: &'a RepositoryHandle, locator: &'a RemoteLocator, unchanged: Option<&'a VersionToken>, sink: &'a mut dyn TransferSink, cancel: &'a Cancellation)
         -> ProviderFuture<'a, ReadReceipt> { self.inner.read_object(repository, locator, unchanged, sink, cancel) }
     fn begin_upload<'a>(&'a self, repository: &'a RepositoryHandle, intent: &'a ObjectIntent, cancel: &'a Cancellation)
-        -> ProviderFuture<'a, Option<ResumeState>> { self.inner.begin_upload(repository, intent, cancel) }
+        -> ProviderFuture<'a, Option<ResumeState>> {
+        Box::pin(async move {
+            if intent.role==ObjectRole::Segment && self.fail_segment_begin.swap(false,std::sync::atomic::Ordering::SeqCst) {
+                return Err(ProviderError::new(ErrorKind::Transient));
+            }
+            self.inner.begin_upload(repository,intent,cancel).await
+        })
+    }
     fn create_object<'a>(&'a self, repository: &'a RepositoryHandle, intent: &'a ObjectIntent, source: &'a dyn TransferSource, resume: Option<&'a ResumeState>, cancel: &'a Cancellation)
         -> ProviderFuture<'a, ObjectReceipt> {
         Box::pin(async move {
@@ -424,6 +432,49 @@ fn real_publish_and_receive_continue_while_checkpoint_inputs_are_paused() {
         let completed=completed.unwrap(); let (_,snapshot)=f.sender.checkpoint(&completed.reference.receipt,&cancel).await.unwrap();
         assert_eq!(snapshot.covered_prefixes.get(&writer).unwrap().0,1);
         assert_eq!(f.b.read_root(None).unwrap().value["language"],serde_json::json!("en"));
+    });
+}
+#[test]
+fn reused_data_roots_keep_controls_reachable_and_skip_present_catalog_bodies() {
+    run(async {
+        let mut f=CycleFixture::new(); conversation(&mut f.a);
+        let transfer=HeldAssetTransfer::new(f.provider.clone());
+        transfer.held.store(false,std::sync::atomic::Ordering::SeqCst);
+        f.sender.provider=transfer.clone();
+        let messages=(0..40).map(|index|serde_json::json!({"chatId":format!("synthetic-root-{index}"),"data":"x".repeat(128*1024)})).collect();
+        f.a.commit(&WorkingSetCommit{expected_revision:f.a.revision().unwrap(),
+            conversations:Some(vec![ConversationMutation::ReplaceRange{character_id:"char".into(),conversation_id:"conv".into(),
+                start:0,delete_count:0,messages,conversation:None,configured_index:None}]),..Default::default()}).unwrap();
+        f.publish_a().await; assert_eq!(f.receive_b().await,1);
+        let first=f.sender.listing(&Cancellation::default()).await.unwrap().remove(0);
+        let (writer,seq,_)=parse_segment_object_id(&first.locator.object).unwrap();
+        let first_payload=lww_segment::open(&f.provider.contents(&first.locator.object).unwrap(),&f.sender.library,writer,seq,&f.sender.root_key).unwrap();
+        assert_eq!(first_payload.data_catalogs.len(),1);
+        let root=first_payload.data_catalogs[0].clone();
+        let hashes=f.a.external_lww_verified_data_catalog(&f.sender.target_scope(),&root).unwrap().unwrap();
+        assert!(hashes.len()>20);
+        assert_eq!(f.a.external_lww_verified_control_size(&hashes[0]).unwrap(),
+            Some(f.a.lww_object_body(&hashes[0]).unwrap().unwrap().len() as u64));
+        let before=std::iter::once(root.locator.object.clone()).chain(transfer.attempts.lock().unwrap().iter().map(|intent|intent.object_id.clone()))
+            .map(|id|(id.clone(),f.provider.read_attempts(&id))).collect::<Vec<_>>();
+        let old_pack_attempts=transfer.attempts.lock().unwrap().len();
+        f.a.commit(&WorkingSetCommit{expected_revision:f.a.revision().unwrap(),
+            conversations:Some(vec![ConversationMutation::ReplaceRange{character_id:"char".into(),conversation_id:"conv".into(),
+                start:40,delete_count:0,messages:vec![serde_json::json!({"chatId":"synthetic-root-append","data":"append"})],
+                conversation:None,configured_index:None}]),..Default::default()}).unwrap();
+        assert_eq!(f.publish_a().await.segments.0,1);
+        assert_eq!(transfer.attempts.lock().unwrap().len(),old_pack_attempts);
+        let next=f.sender.listing(&Cancellation::default()).await.unwrap().into_iter()
+            .find(|receipt|parse_segment_object_id(&receipt.locator.object).unwrap().1==2).unwrap();
+        let next_payload=lww_segment::open(&f.provider.contents(&next.locator.object).unwrap(),&f.sender.library,writer,2,&f.sender.root_key).unwrap();
+        assert!(next_payload.data_catalogs.contains(&root));
+        assert_eq!(f.receive_b().await,1);
+        for (id,reads) in before {assert_eq!(f.provider.read_attempts(&id),reads,"known root and its present controls must not be downloaded again");}
+        assert_eq!(f.b.read_conversation("char","conv",None).unwrap().unwrap().value["message"].as_array().unwrap().len(),41);
+        let mut changed=root.clone(); changed.plaintext_sha256=[0xaa;32];
+        assert!(f.a.external_lww_verified_data_catalog(&f.sender.target_scope(),&changed).is_err());
+        let mut changed_hashes=hashes.clone(); changed_hashes.push("a".repeat(64));
+        assert!(f.a.external_lww_witness_data_catalog(&f.sender.target_scope(),&root,&changed_hashes).is_err());
     });
 }
 #[test]
