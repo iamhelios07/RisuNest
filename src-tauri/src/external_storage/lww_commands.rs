@@ -71,11 +71,13 @@ async fn open(app: &AppHandle, id: &str, session: &mut Session) -> Result<()> {
         session.engine = Some(ExternalLwwEngine {
             provider: connected.provider,
             repository: connected.handle,
-            library: connected.stored.descriptor.repository_id,
+            library: connected.stored.descriptor.repository_id.clone(),
             root_key: connected.root_key,
             admission: None,
             connection_id: id.into(),
             connection_root: runtime::root(app)?,
+            capabilities: connected.stored.capabilities,
+            descriptor: connected.stored.descriptor,
         });
     }
     let engine = session.engine.as_mut().ok_or_else(lww_segment::corrupt)?;
@@ -130,6 +132,14 @@ fn check(
     selected: bool,
 ) -> Result<crate::persistent_store::PersistentStore> {
     let store = runtime::native_store(app)?;
+    check_store(&store, request, selected)?;
+    Ok(store)
+}
+fn check_store(
+    store: &crate::persistent_store::PersistentStore,
+    request: &Request,
+    selected: bool,
+) -> Result<()> {
     if store
         .lww_binding_authority()
         .map_err(runtime::local_error)?
@@ -146,7 +156,7 @@ fn check(
     {
         return Err(ProviderError::new(ErrorKind::Cancelled));
     }
-    Ok(store)
+    Ok(())
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -268,10 +278,13 @@ pub(crate) async fn external_lww_publish(
     request: Request,
     initial: bool,
 ) -> Result<PublicationResult> {
+    let state = app.state::<crate::persistent_store::PersistentStoreState>();
+    let _operation = state.admit_renderer_operation().map_err(runtime::local_error)?;
     let context = context(&request.connection_id)?;
     let mut session = context.session.lock().await;
     open(&app, &request.connection_id, &mut session).await?;
-    let mut store = check(&app, &request, true)?;
+    let mut store = state.open_admitted_native_job_store(&_operation).map_err(runtime::local_error)?;
+    check_store(&store, &request, true)?;
     if let Some(target) = &request.exit_target {
         let identity = store.external_identity().map_err(runtime::local_error)?;
         if identity.library_epoch != target.library_epoch

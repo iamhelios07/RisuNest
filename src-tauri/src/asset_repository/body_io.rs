@@ -218,8 +218,8 @@ pub(crate) fn register_object_purpose(hash: &str, purpose: BodyPurpose) {
     current_scope().lock().unwrap().objects.entry(hash.to_owned()).or_default().purposes.insert(purpose);
 }
 
-pub(super) struct ObjectScope;
-pub(super) fn object_scope(hash: &str) -> ObjectScope {
+pub(crate) struct ObjectScope;
+pub(crate) fn object_scope(hash: &str) -> ObjectScope {
     OBJECT.with(|object| object.borrow_mut().push(hash.to_owned())); ObjectScope
 }
 impl Drop for ObjectScope {
@@ -322,7 +322,7 @@ pub(super) fn stat_request() { current_scope().lock().unwrap().stat_requests += 
 pub(super) fn batch_stat_request() { current_scope().lock().unwrap().batch_stat_requests += 1; }
 pub(super) fn presence_query() { current_scope().lock().unwrap().presence_queries += 1; }
 
-pub(super) fn open_result<T>(kind: &'static str, result: &io::Result<T>) {
+pub(crate) fn open_result<T>(kind: &'static str, result: &io::Result<T>) {
     domain(kind, |work| {
         work.open_attempts += 1;
         if result.is_ok() { work.opens += 1; } else { work.failed_opens += 1; }
@@ -446,7 +446,7 @@ pub(crate) struct TrackedBodyFile {
 }
 
 impl TrackedBodyFile {
-    pub(super) fn new(file: File, hash: &str) -> Self {
+    pub(crate) fn new(file: File, hash: &str) -> Self {
         let scope = current_scope();
         record(&mut scope.lock().unwrap(), "managed", Some(hash), |work| work.outstanding_readers += 1);
         Self { file, hash: hash.to_owned(), scope, owner: std::thread::current().id() }

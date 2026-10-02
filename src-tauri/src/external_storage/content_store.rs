@@ -153,6 +153,8 @@ impl ContentStore {
     /// identity already present keeps the body it already has; different bytes
     /// under it are corruption, never a replacement.
     pub(crate) fn put(&mut self, expected: &str, bytes: &[u8]) -> Result<()> {
+        #[cfg(test)]
+        crate::persistent_store::hash_work::observe("external_content_put_verify",bytes.len());
         if hex::encode(hash(bytes)) != expected {
             return Err(invalid("Capture object identity differs"));
         }

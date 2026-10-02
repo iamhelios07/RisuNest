@@ -1131,7 +1131,19 @@ async fn run_job(app: &AppHandle, id: &str, cancel: &Cancellation) -> Result<Val
             }
         }
         JobKind::Restore => {
-            super::runtime_restore::run_restore(app, &connected, &job, cancel).await
+            let root=root(app)?;
+            let writer=native_store(app)?.external_identity().map_err(local_error)?.store_id;
+            let context=lease_context(app,&root,&connected,&writer)?;
+            match leases::admit_shared_work(&context,&job.id,cancel).await? {
+                leases::Admission::Admitted(owner)=>{
+                    owner.run(&context,cancel,super::runtime_restore::run_restore(app,&connected,&job,cancel)).await
+                }
+                leases::Admission::Yield{reason}=>Err(leases::yield_error(reason)),
+                leases::Admission::UnsupportedProtection if !context.protection_supported=>{
+                    super::runtime_restore::run_restore(app,&connected,&job,cancel).await
+                }
+                leases::Admission::UnsupportedProtection=>Err(ProviderError::new(ErrorKind::Unsupported)),
+            }
         }
         JobKind::PinHistory => {
             super::history_jobs::run_pin_history(app, &connected, &job, cancel).await
