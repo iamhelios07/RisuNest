@@ -16,6 +16,7 @@ fn load(path:&Path,requirement:scale_certificate::ScaleRequirement,output:&Path)
     let value:Value=serde_json::from_reader(File::open(path).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
     if value["setup_only"]!=true {return Err("input is not a native construction receipt".into());}
     let root=PathBuf::from(value["target"]["root"].as_str().ok_or("construction root missing")?);
+    if output.starts_with(&root) || root.starts_with(output) {return Err("measurement output overlaps the preserved certified source".into());}
     let certificate:scale_certificate::ScaleCertificate=serde_json::from_value(value["target"]["fixture"]["certificate"].clone())
         .map_err(|e|e.to_string())?;
     if certificate.requirement!=requirement {return Err("construction receipt has the wrong physical tier".into());}
