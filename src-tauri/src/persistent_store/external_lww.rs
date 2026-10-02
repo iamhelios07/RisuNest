@@ -847,7 +847,7 @@ mod asset_root_tests {
                 let mut dependencies=transfer.attempts.lock().unwrap().iter().take(uploads).map(|intent|RemoteLocator {
                     connection_identity:f.sender.repository.connection_identity.clone(),collection:None,object:intent.object_id.clone(),
                 }).collect::<Vec<_>>();
-                if let AssetReference::Catalog(catalog)=&original.reference {dependencies.push(catalog.locator.clone());}
+                if let AssetReference::Catalog(catalog)=&original.reference {dependencies.push(crate::external_storage::contract::RemoteObject::from_stored(catalog,&f.sender.repository).unwrap().locator);}
                 for locator in dependencies {
                     f.provider.delete_object(&f.sender.repository,&locator,&cancel).await.unwrap();
                     assert!(f.provider.contents(&locator.object).is_none());
@@ -899,7 +899,7 @@ mod asset_root_tests {
                 f.a.device_store().unwrap().connection().execute("UPDATE external_lww_segments SET metadata=?1 WHERE target=?2 AND writer=?3 AND seq=?4",
                     params![serde_json::to_string(&pending).unwrap(),target,writer,pending.seq.0.to_string()]).unwrap();
                 let (locator,object_id)=match &pending.reused_assets[0].reference {
-                    AssetReference::Catalog(catalog)=>(catalog.locator.clone(),None),
+                    AssetReference::Catalog(catalog)=>(crate::external_storage::contract::RemoteObject::from_stored(catalog,&f.sender.repository).unwrap().locator,None),
                     AssetReference::Standalone(body)=>(body.locator.clone().unwrap(),Some(body.object_id.clone())),
                 };
                 let before_reads=f.provider.read_attempts(&locator.object);
