@@ -4581,11 +4581,18 @@ export class SaveCoordinator {
         return [...this.materializedBaselines.values()].map((value) => ({...value, chats: value.chats.map((chat) => ({...chat}))} as CompleteCharacter))
     }
 
-    adoptAppliedUnitState(revision: DataRevision, root: RootDatabase | null, presets: botPreset[] | null, characters: readonly CompleteCharacter[]): void {
+    capturePresetRecordBaseline(): botPreset[] {
+        return (this.dependencies.capturePresetRecords?.() ?? []).flatMap((value) => {
+            const baseline = this.presetRecordBaselines.get(value['id'] as string)
+            return baseline ? [canonicalClone(baseline)] : []
+        })
+    }
+
+    adoptAppliedUnitState(revision: DataRevision, root: RootDatabase | null, presets: botPreset[] | null, characters: readonly CompleteCharacter[], presetRecords: readonly botPreset[] = presets ?? []): void {
         this.currentRevision = revision
         if (root) this.rootBaseline = canonicalJson(root)
         if (presets) this.presetsBaseline = canonicalJson(presets)
-        for (const preset of this.dependencies.capturePresetRecords?.() ?? []) {
+        for (const preset of presetRecords) {
             if (preset['id']) this.presetRecordBaselines.set(preset['id'] as string, canonicalClone(preset))
         }
         for (const character of characters) this.materializedBaselines.set(character.chaId, captureMaterializedCharacter(character))
