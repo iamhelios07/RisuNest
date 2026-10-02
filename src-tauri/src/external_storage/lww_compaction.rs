@@ -100,14 +100,14 @@ fn live_published_objects(state:&PublishedState,capture:&mut super::capture::Cap
     Ok((live,conservative))
 }
 impl ExternalLwwEngine {
-    async fn compact_asset_catalogs(&self,state:&PublishedState,live:&BTreeSet<String>,conservative:bool,
+    async fn compact_asset_catalogs(&self,mut roots:Vec<wire::StoredObject>,live:&BTreeSet<String>,conservative:bool,
         directory:&Path,limits:super::packaging::PackageLimits,journal:&mut super::journal::TransferJournal,
         cancel:&Cancellation,protection:Option<(&super::leases::LeaseOwner,&super::leases::LeaseContext<'_>)>)
         ->Result<(Vec<wire::StoredObject>,Option<crate::asset_repository::job_pins::DurableCasJob>)> {
         use super::packaging::{EntryPlan,AssetCatalogSource};
         use crate::asset_repository::job_pins::{DurableCasJob,CasJobKind,CasObjectRole};
-        if conservative {return Ok((state.asset_catalogs.clone(),None))}
-        let mut roots=state.asset_catalogs.clone();roots.sort_by(|a,b|a.header.object_id.cmp(&b.header.object_id));
+        if conservative {return Ok((roots,None))}
+        roots.sort_by(|a,b|a.header.object_id.cmp(&b.header.object_id));
         roots.dedup_by(|a,b|a.header.object_id==b.header.object_id);
         let mut plans=BTreeMap::<String,EntryPlan>::new();let mut sources=BTreeMap::new();
         let mut pack_chunks=BTreeMap::<(String,u64), (wire::StoredChunk,bool)>::new();let mut pack_sizes=BTreeMap::new();
@@ -333,7 +333,7 @@ impl ExternalLwwEngine {
         Ok(PublishedState {catalog,body_spool,standalone,standalone_roots,asset_catalogs,snapshots,segments})
     }
     pub(crate) async fn compact_published(&self,directory:&Path,job_id:&str,writer:&str,capabilities:&super::capabilities::Capabilities,cancel:&Cancellation,protection:Option<(&super::leases::LeaseOwner,&super::leases::LeaseContext<'_>)>) -> Result<super::packaging::CompletedSnapshot> {
-        let state=self.published_state(&directory.join("inputs"),cancel).await?;
+        let mut state=self.published_state(&directory.join("inputs"),cancel).await?;
         if let Some((owner,context))=protection {if let Some(reason)=owner.recheck(context,cancel).await? {return Err(super::leases::yield_error(reason));}}
         #[cfg(test)] pause_compaction(job_id).await;
         cancel.check()?;
@@ -356,7 +356,7 @@ impl ExternalLwwEngine {
         let fingerprint=capture.content_fingerprint(&risunest_external_storage_format::format::library_fingerprint_domain()).map_err(error)?;
         let mut journal=super::journal::TransferJournal::open(&directory.join("journal"),super::journal::JobIdentity{job_id:job_id.into(),connection_id:self.connection_id.clone(),repository_id:self.repository.repository_id.clone(),capture_id:job_id.into(),capture:identity.clone()}).map_err(error)?;
         let limits=super::packaging::PackageLimits::from_capabilities(capabilities)?;
-        let (asset_catalogs,mut pins)=self.compact_asset_catalogs(&state,&live,conservative,directory,limits,&mut journal,cancel,protection).await?;
+        let (asset_catalogs,mut pins)=self.compact_asset_catalogs(std::mem::take(&mut state.asset_catalogs),&live,conservative,directory,limits,&mut journal,cancel,protection).await?;
         let standalone_bodies=state.standalone.into_iter().filter(|(hash,_)|conservative || live.contains(hash)).collect();
         let metadata=super::packaging::SnapshotMetadata { snapshot_id:job_id.into(),repository_id:self.repository.repository_id.clone(),library_id:self.library.clone(),author_device_id:writer.into(),created_at_ms:self.admitted_upper()?,logical_revision:0,parent_snapshot_id:None,content_fingerprint:fingerprint,
             purpose:super::packaging::SnapshotPurpose::LwwCheckpoint { covered_prefixes:state.catalog.coverage.clone(),state_identity:state.catalog.identity()?,asset_catalogs,standalone_bodies } };
@@ -388,7 +388,7 @@ mod tests {
         body_spool.seal().unwrap();
         let state=PublishedState{catalog,body_spool,standalone:Default::default(),standalone_roots:Default::default(),
             asset_catalogs:vec![],snapshots:vec![],segments:vec![]};
-        let mut capture=super::super::capture::CaptureCatalog::create(&directory.path().join("capture"),&directory.path().join("external-storage"),None).unwrap();
+        let mut capture=super::super::capture::CaptureCatalog::create(&directory.path().join("external-storage/captures/current-payload"),&directory.path().join("external-storage"),None).unwrap();
         let identity=CaptureIdentity{store_id:"synthetic".into(),library_epoch:"synthetic".into(),generation:"synthetic".into(),selection_epoch:"synthetic".into(),revision:0};
         capture.begin(&identity,None).unwrap();capture.record("current",b"synthetic record").unwrap();
         let (live,_)=live_published_objects(&state,&mut capture,Some("current"),directory.path(),&Cancellation::default()).unwrap();
