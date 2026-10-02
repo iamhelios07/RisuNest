@@ -321,7 +321,9 @@ impl Provider for FakeProvider {
     ) -> ProviderFuture<'a, (RepositoryHandle, Capabilities)> {
         Box::pin(async move {
             c.check()?;
-            Ok((repository(), capabilities(self.cas)))
+            let mut capabilities = capabilities(self.cas);
+            capabilities.max_stored_bytes = Some(self.object_limit);
+            Ok((repository(), capabilities))
         })
     }
     fn read_object<'a>(
@@ -692,6 +694,21 @@ pub(crate) fn locator() -> RemoteLocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn opened_capabilities_report_the_configured_object_ceiling() {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let config = ConnectionConfig { provider: "synthetic".into(), profile: None,
+                endpoint: "https://synthetic.invalid".into(), account_id: "fixture".into(),
+                location: Default::default(), oauth_profile: None };
+            for (provider, limit) in [(FakeProvider::new(true), 1024 * 1024),
+                (FakeProvider::with_object_limit(true, 128 * 1024 * 1024), 128 * 1024 * 1024)] {
+                let (_, actual) = provider.open_repository(&config, &SecretRef("fixture".into()),
+                    OpenMode::Existing, &Cancellation::default()).await.unwrap();
+                let mut expected = capabilities(true); expected.max_stored_bytes = Some(limit);
+                assert_eq!(serde_json::to_value(actual).unwrap(), serde_json::to_value(expected).unwrap());
+            }
+        });
+    }
 
     fn object(name: &str) -> RemoteLocator {
         RemoteLocator {

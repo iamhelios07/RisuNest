@@ -916,7 +916,7 @@ pub(crate) async fn final_external_resume_endpoint(source:&mut PersistentStore,
     let root=destination.repository_root().to_owned();
     let writer=destination.lww_clock_state().map_err(|e|e.to_string())?.writer_id;
     let authority=destination.lww_binding_authority().map_err(|e|e.to_string())?;
-    let ExternalLwwEngine {provider:engine_provider,repository,library,root_key,admission,connection_id,connection_root}=receiver;
+    let ExternalLwwEngine {provider:engine_provider,repository,library,root_key,admission,connection_id,connection_root,capabilities,descriptor}=receiver;
     drop(destination);
     let (commit,expected)=prepare_edit(source,SmallChange::Setting,final_direction(direction),iteration.into());
     source.commit(&commit).map_err(|e|e.to_string())?;
@@ -934,7 +934,7 @@ pub(crate) async fn final_external_resume_endpoint(source:&mut PersistentStore,
     let started=Instant::now();
     let result=async {
         let mut destination=PersistentStore::open(&root).map_err(|e|e.to_string())?;
-        let receiver=ExternalLwwEngine {provider:engine_provider,repository,library,root_key,admission,connection_id,connection_root};
+        let receiver=ExternalLwwEngine {provider:engine_provider,repository,library,root_key,admission,connection_id,connection_root,capabilities,descriptor};
         let reopened_ms=started.elapsed().as_secs_f64()*1000.0;
         receiver.receive_and_apply(&mut destination,authority,&[],&Cancellation::default()).await.map_err(|e|e.to_string())?;
         Ok::<_,String>((destination,receiver,reopened_ms,started.elapsed().as_secs_f64()*1000.0))

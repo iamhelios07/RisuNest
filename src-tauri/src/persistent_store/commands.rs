@@ -172,6 +172,13 @@ impl PersistentStoreState {
         })
     }
 
+    pub(crate) fn open_admitted_native_job_store(
+        &self,
+        operation: &RendererOperationGuard,
+    ) -> StoreResult<PersistentStore> {
+        with_store_mutex_admitted(self, operation, PersistentStore::open_native_job_store)
+    }
+
     pub(crate) fn acquire_cleanup_maintenance(&self, timeout: std::time::Duration) -> StoreResult<DeviceMaintenanceGuard> {
         let deadline = std::time::Instant::now() + timeout;
         let mut state = self.renderer_gate.state.lock().map_err(|_| renderer_gate_error())?;
@@ -1603,6 +1610,83 @@ mod tests {
     mod snapshot_lock;
 
     use super::*;
+    #[test]
+    fn admitted_external_asset_publication_allows_global_commits_and_rechecks_ack_authority() {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            use crate::external_storage::{contract::*, lww_tests::{CycleFixture, HeldAssetTransfer, small_asset}};
+            for switch_authority in [false, true] {
+                let mut fixture = CycleFixture::new();
+                let original_hash = small_asset(&mut fixture.a, "synthetic-overlap", &[51; 64 * 1024]);
+                let state = PersistentStoreState::with_test_store(fixture.a);
+                let operation = state.admit_renderer_operation().unwrap();
+                let mut job_store = state.open_admitted_native_job_store(&operation).unwrap();
+                let writer = job_store.lww_clock_state().unwrap().writer_id;
+                let original = job_store.lww_read_outbox(0.into(), 100).unwrap().entries;
+                let held = HeldAssetTransfer::new(fixture.provider.clone());
+                fixture.sender.provider = held.clone();
+                let target = fixture.sender.target_scope();
+                let cancel = Cancellation::default();
+                let ordinary_ran = std::cell::Cell::new(false);
+                let publication = async {
+                    let result = fixture.sender.publish(&mut job_store, 0.into(), &[], &cancel).await;
+                    if !ordinary_ran.get() {
+                        return Err(result.err().unwrap_or_else(|| ProviderError::new(ErrorKind::Corrupt)));
+                    }
+                    Ok(result)
+                };
+                let ordinary_write = async {
+                    held.entered.notified().await;
+                    let local_operation = state.admit_renderer_operation().unwrap();
+                    with_store_mutex_mut_admitted(&state, &local_operation, |store| {
+                        if switch_authority {
+                            let current = store.lww_binding_state()?;
+                            let next = super::super::sync_selection::SyncTarget::External("synthetic-other".into());
+                            let inspection = store.register_lww_binding_inspection(current.target_authority,
+                                &next, "synthetic-other-target", "synthetic-other-library")?;
+                            store.switch_lww_binding(&super::super::sync_selection::SwitchBindingRequest {
+                                header: super::super::lww::Header { binding_authority: current.target_authority, request_id: "overlap-switch".into() },
+                                expected_selection_epoch: current.selection_epoch, target: next, inspection_id: Some(inspection),
+                            })?;
+                        } else {
+                            small_asset(store, "synthetic-overlap", &[52; 64 * 1024]);
+                            held.fail_pack_after.store(2, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        Ok(())
+                    }).unwrap();
+                    {
+                        let gate = state.renderer_gate.state.lock().unwrap();
+                        assert!(!gate.maintenance_active);
+                        assert_eq!(gate.operations, 2);
+                    }
+                    let captured = state.open_admitted_native_job_store(&operation).unwrap();
+                    assert!(crate::asset_repository::job_pins::collect_durable_cas_job_roots(captured.repository_root())
+                        .object_hashes.contains(&original_hash));
+                    ordinary_ran.set(true);
+                    held.resume.notify_one();
+                    Ok::<_, ProviderError>(())
+                };
+                let (result, ()) = tokio::try_join!(publication, ordinary_write).unwrap();
+                assert!(ordinary_ran.get());
+                assert!(result.is_err());
+                let current = state.open_admitted_native_job_store(&operation).unwrap();
+                if switch_authority {
+                    assert_eq!(current.external_lww_next_sequence(&target, &writer).unwrap(), 1);
+                    assert_eq!(fixture.provider.uploaded_ids().iter().filter(|id| parse_segment_object_id(id).is_ok()).count(), 0);
+                    assert_eq!(current.external_lww_pending(&target, &writer).unwrap().unwrap().0.entries, original);
+                } else {
+                    assert_eq!(current.external_lww_next_sequence(&target, &writer).unwrap(), 2);
+                    let remaining = current.lww_read_outbox(0.into(), 100).unwrap().entries;
+                    assert_eq!(remaining.len(), 1);
+                    assert_eq!(remaining[0].key, original[0].key);
+                    assert_ne!(remaining[0].version, original[0].version);
+                    assert_ne!(remaining[0].stamp, original[0].stamp);
+                    assert_eq!(fixture.provider.uploaded_ids().iter().filter(|id| parse_segment_object_id(id).is_ok()).count(), 1);
+                }
+                drop(job_store); drop(current); drop(operation);
+                assert!(state.try_acquire_renderer_maintenance().unwrap().is_some());
+            }
+        });
+    }
     use serde_json::json;
     use std::fs;
     use tempfile::tempdir;
