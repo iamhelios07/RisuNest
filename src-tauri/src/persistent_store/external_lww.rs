@@ -100,6 +100,8 @@ pub(crate) struct SealedPublication {
     pub writer: String,
     pub seq: DecimalU64,
     pub authority: DecimalU64,
+    #[serde(deserialize_with = "required_capture_time")]
+    pub captured_at_ms: Option<u64>,
     pub object_id: String,
     pub sha256: String,
     pub payload_sha256: String,
@@ -116,6 +118,9 @@ pub(crate) struct SealedPublication {
     pub resume: Option<UploadState>,
     pub dispatched: bool,
     pub complete: bool,
+}
+fn required_capture_time<'de,D:serde::Deserializer<'de>>(deserializer:D) -> std::result::Result<Option<u64>,D::Error> {
+    Option::<u64>::deserialize(deserializer)
 }
 impl SealedPublication {
     pub(crate) fn acknowledgements(&self) -> StoreResult<Vec<AckEntry>> {
@@ -319,7 +324,7 @@ impl PersistentStore {
             return Err(super::lww::error("invalid-control-catalog"));
         }
         // Catalog proofs cannot collide with canonical control hash witnesses.
-        Ok(format!("data/{}", catalog.ciphertext_sha256))
+        Ok(format!("data/{}", hex::encode(catalog.ciphertext_sha256)))
     }
     fn external_lww_data_catalog_witness(&self, target: &str, key: &str) -> StoreResult<Option<DataCatalogWitness>> {
         let body: Option<Option<Vec<u8>>> = self.device_store()?.connection().query_row(
@@ -337,7 +342,7 @@ impl PersistentStore {
     }
     fn external_lww_control_catalog_key(catalog: &risunest_external_storage_format::snapshot::StoredObject) -> StoreResult<String> {
         Self::external_lww_data_catalog_key(catalog)?;
-        Ok(format!("data-proof/{}",catalog.ciphertext_sha256))
+        Ok(format!("data-proof/{}",hex::encode(catalog.ciphertext_sha256)))
     }
     // Routine reuse and renewal read a bounded proof, not the complete admission inventory.
     fn external_lww_control_catalog_proof(&self,target:&str,key:&str) -> StoreResult<Option<ControlCatalogProof>> {
@@ -506,6 +511,9 @@ impl PersistentStore {
             if previous.entries != publication.entries {
                 return Err(super::lww::error("captured-version-integrity"));
             }
+            if previous.captured_at_ms != publication.captured_at_ms {
+                return Err(super::lww::error("captured-time-integrity"));
+            }
             if previous.assets != publication.assets || previous.asset_job != publication.asset_job {
                 return Err(super::lww::error("captured-asset-integrity"));
             }
@@ -653,6 +661,81 @@ mod asset_root_tests {
     use crate::external_storage::{contract::{Cancellation, ErrorKind}, lww_tests::{CycleFixture, HeldAssetTransfer, small_asset}};
     use crate::server_sync::{lww_tests::LocalServerFixture, residency::{AssetPolicy, Residency}};
     use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+
+    #[test]
+    fn aged_saved_new_dependencies_are_verified_before_exact_publication_retry() {
+        for (missing,dispatched) in [(None,false),(Some("data"),false),(Some("asset"),false),(Some("body"),false),(Some("body"),true)] {
+            let mut f=CycleFixture::new();
+            f.a.commit(&crate::persistent_store::WorkingSetCommit{expected_revision:f.a.revision().unwrap(),unit_mutations:Some(vec![
+                crate::persistent_store::lww::UnitMutation::Set{key:risunest_sync_wire::unit::UnitKey::new(&["exists","character","char"]).unwrap(),value:serde_json::json!({"type":"character"})},
+                crate::persistent_store::lww::UnitMutation::Set{key:risunest_sync_wire::unit::UnitKey::new(&["exists","conversation","char","conv"]).unwrap(),value:serde_json::json!(true)},
+            ]),..Default::default()}).unwrap();
+            f.a.commit(&crate::persistent_store::WorkingSetCommit{expected_revision:f.a.revision().unwrap(),
+                conversations:Some(vec![crate::persistent_store::ConversationMutation::ReplaceRange{character_id:"char".into(),conversation_id:"conv".into(),
+                    start:0,delete_count:0,messages:(0..40).map(|index|serde_json::json!({"chatId":format!("synthetic-new-dependency-{index}"),"data":"x".repeat(128*1024)})).collect(),
+                    conversation:None,configured_index:None}]),..Default::default()}).unwrap();
+            small_asset(&mut f.a,"synthetic-new-packed",&vec![31;96*1024]);
+            small_asset(&mut f.a,"synthetic-new-standalone",&vec![32;5*1024*1024]);
+            let transfer=HeldAssetTransfer::new(f.provider.clone());
+            transfer.held.store(false,Ordering::SeqCst);
+            transfer.fail_segment_begin.store(true,Ordering::SeqCst);
+            f.sender.provider=transfer.clone();
+            let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            assert_eq!(runtime.block_on(f.sender.publish(&mut f.a,0.into(),&[],&Cancellation::default())).err().unwrap().kind,ErrorKind::Transient);
+            let target=f.sender.target_scope();let writer=f.a.lww_clock_state().unwrap().writer_id;
+            let (mut pending,bytes)=f.a.external_lww_pending(&target,&writer).unwrap().unwrap();
+            assert!(pending.sealed && !pending.dispatched && pending.captured_at_ms.is_some());
+            assert_eq!(pending.data_catalogs.len(),1);assert_eq!(pending.asset_catalogs.len(),1);
+            assert_eq!(pending.bodies.len(),1);assert!(pending.bodies[0].complete);
+            let mut shape=serde_json::to_value(&pending).unwrap();shape.as_object_mut().unwrap().remove("capturedAtMs");
+            assert!(serde_json::from_value::<SealedPublication>(shape).is_err());
+            pending.captured_at_ms=missing.map(|_|crate::external_storage::runtime::now_ms()-crate::external_storage::leases::CACHE_REUSE_LIMIT_MS-1);
+            assert!(f.a.external_lww_persist(&pending,&bytes).is_err(),"capture age cannot be changed during retry");
+            pending.dispatched=dispatched;
+            // Model an aged or unproven capture without changing its dependency identities or sealed bytes.
+            f.a.device_store().unwrap().connection().execute("UPDATE external_lww_segments SET metadata=?1 WHERE target=?2 AND writer=?3 AND seq=?4",
+                params![serde_json::to_string(&pending).unwrap(),target,writer,pending.seq.0.to_string()]).unwrap();
+            let data=&pending.data_catalogs[0].locator.object;let asset=&pending.asset_catalogs[0].locator.object;
+            let body=&pending.bodies[0].object_id;
+            let reads=(f.provider.read_attempts(data),f.provider.read_attempts(asset));
+            let reconciles=f.provider.reconcile_attempts(body);
+            let packs=transfer.attempts.lock().unwrap().len();
+            if let Some(missing)=missing {
+                f.provider.forget(match missing {"data"=>data.as_str(),"asset"=>asset.as_str(),"body"=>pending.bodies[0].locator.as_ref().unwrap().object.as_str(),_=>unreachable!()});
+            }
+            f.a=PersistentStore::open(f.directory_a.path()).unwrap();
+            if missing.is_some() {
+                f.a.commit(&crate::persistent_store::WorkingSetCommit{expected_revision:f.a.revision().unwrap(),
+                    conversations:Some(vec![crate::persistent_store::ConversationMutation::ReplaceRange{character_id:"char".into(),conversation_id:"conv".into(),
+                        start:40,delete_count:0,messages:vec![serde_json::json!({"chatId":"synthetic-newer-dependency","data":"newer"})],
+                        conversation:None,configured_index:None}]),..Default::default()}).unwrap();
+            }
+            let outbox=f.a.lww_read_outbox(0.into(),4096).unwrap().entries;
+            let result=runtime.block_on(f.sender.publish(&mut f.a,0.into(),&[],&Cancellation::default()));
+            assert!(f.provider.read_attempts(data)>reads.0);
+            if missing!=Some("data") {assert!(f.provider.read_attempts(asset)>reads.1);}
+            if missing.is_none() || missing==Some("body") {assert!(f.provider.reconcile_attempts(body)>reconciles);}
+            assert_eq!(transfer.attempts.lock().unwrap().len(),packs,"saved dependency validation must not repair or upload replacements");
+            if dispatched {assert!(f.provider.reconcile_attempts(&pending.object_id)>0,"uncertain original segment must be reconciled first");}
+            if missing.is_some() {
+                assert_eq!(result.err().unwrap().kind,ErrorKind::NotFound);
+                let (after,after_bytes)=f.a.external_lww_pending(&target,&writer).unwrap().unwrap();
+                assert_eq!(after_bytes,bytes);assert_eq!(after.entries,pending.entries);
+                assert_eq!(after.captured_at_ms,pending.captured_at_ms);assert_eq!(after.dispatched,dispatched);
+                assert!(after.data_catalogs==pending.data_catalogs && after.asset_catalogs==pending.asset_catalogs);
+                assert!(serde_json::to_value(&after.bodies).unwrap()==serde_json::to_value(&pending.bodies).unwrap());
+                assert_eq!(f.a.lww_read_outbox(0.into(),4096).unwrap().entries,outbox);
+                assert_eq!(f.a.external_lww_next_sequence(&target,&writer).unwrap(),pending.seq.0);
+                assert_eq!(f.a.read_conversation("char","conv",None).unwrap().unwrap().value["message"].as_array().unwrap().len(),41);
+                assert_eq!(f.provider.upload_attempts(&pending.object_id),0);
+            } else {
+                assert_eq!(result.unwrap().segments.0,1);
+                assert_eq!(f.provider.contents(&pending.object_id).unwrap(),bytes);
+                assert!(f.a.external_lww_pending(&target,&writer).unwrap().is_none());
+                assert_eq!(f.a.external_lww_next_sequence(&target,&writer).unwrap(),pending.seq.0+1);
+            }
+        }
+    }
 
     #[test]
     fn expired_control_catalogs_are_not_renewed_by_cache_admission_and_frozen_retry_checks_exact_root() {

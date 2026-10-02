@@ -27,13 +27,14 @@ pub(crate) struct HeldAssetTransfer {
     pub cancel_after_pack_loss: std::sync::atomic::AtomicBool,
     pub held: std::sync::atomic::AtomicBool,
     pub fail_pack_after: std::sync::atomic::AtomicUsize,
+    pub fail_segment_begin: std::sync::atomic::AtomicBool,
     pub attempts: std::sync::Mutex<Vec<ObjectIntent>>,
     pub before_lease: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 impl HeldAssetTransfer {
     pub(crate) fn new(inner: Arc<FakeProvider>) -> Arc<Self> {
         Arc::new(Self { inner, entered: Default::default(), resume: Default::default(),
-            lose_pack_response: false.into(), cancel_after_pack_loss: false.into(), held: true.into(), fail_pack_after: 0.into(), attempts: Default::default(), before_lease: Default::default() })
+            lose_pack_response: false.into(), cancel_after_pack_loss: false.into(), held: true.into(), fail_pack_after: 0.into(), fail_segment_begin: false.into(), attempts: Default::default(), before_lease: Default::default() })
     }
 }
 impl Provider for HeldAssetTransfer {
@@ -42,7 +43,14 @@ impl Provider for HeldAssetTransfer {
     fn read_object<'a>(&'a self, repository: &'a RepositoryHandle, locator: &'a RemoteLocator, unchanged: Option<&'a VersionToken>, sink: &'a mut dyn TransferSink, cancel: &'a Cancellation)
         -> ProviderFuture<'a, ReadReceipt> { self.inner.read_object(repository, locator, unchanged, sink, cancel) }
     fn begin_upload<'a>(&'a self, repository: &'a RepositoryHandle, intent: &'a ObjectIntent, cancel: &'a Cancellation)
-        -> ProviderFuture<'a, Option<ResumeState>> { self.inner.begin_upload(repository, intent, cancel) }
+        -> ProviderFuture<'a, Option<ResumeState>> {
+        Box::pin(async move {
+            if intent.role==ObjectRole::Segment && self.fail_segment_begin.swap(false,std::sync::atomic::Ordering::SeqCst) {
+                return Err(ProviderError::new(ErrorKind::Transient));
+            }
+            self.inner.begin_upload(repository,intent,cancel).await
+        })
+    }
     fn create_object<'a>(&'a self, repository: &'a RepositoryHandle, intent: &'a ObjectIntent, source: &'a dyn TransferSource, resume: Option<&'a ResumeState>, cancel: &'a Cancellation)
         -> ProviderFuture<'a, ObjectReceipt> {
         Box::pin(async move {
@@ -463,7 +471,7 @@ fn reused_data_roots_keep_controls_reachable_and_skip_present_catalog_bodies() {
         assert_eq!(f.receive_b().await,1);
         for (id,reads) in before {assert_eq!(f.provider.read_attempts(&id),reads,"known root and its present controls must not be downloaded again");}
         assert_eq!(f.b.read_conversation("char","conv",None).unwrap().unwrap().value["message"].as_array().unwrap().len(),41);
-        let mut changed=root.clone(); changed.plaintext_sha256="a".repeat(64);
+        let mut changed=root.clone(); changed.plaintext_sha256=[0xaa;32];
         assert!(f.a.external_lww_verified_data_catalog(&f.sender.target_scope(),&changed).is_err());
         let mut changed_hashes=hashes.clone(); changed_hashes.push("a".repeat(64));
         assert!(f.a.external_lww_witness_data_catalog(&f.sender.target_scope(),&root,&changed_hashes).is_err());
