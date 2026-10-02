@@ -44,6 +44,7 @@ import {
 } from './generationState'
 import {
     acknowledgeGenerationCompletion,
+    drainDeferredLwwReceives,
     assertPersistentMutationAllowed,
     getPersistentStorageAuthorityEpoch,
     getPersistentNavigationGeneration,
@@ -382,10 +383,14 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         releaseGeneration?.()
         if (lifecycle.generationTarget && !lifecycle.acknowledgementAttempted &&
             lifecycle.isTargetCurrent()) {
-            lifecycle.acknowledgementAttempted = true
             try {
-                await acknowledgeGenerationCompletion(lifecycle.authorityEpoch)
-                lifecycle.onProgress?.(3)
+                if (lifecycle.responseApplied) {
+                    lifecycle.acknowledgementAttempted = true
+                    await acknowledgeGenerationCompletion(lifecycle.authorityEpoch)
+                    lifecycle.onProgress?.(3)
+                } else {
+                    await drainDeferredLwwReceives(lifecycle.authorityEpoch)
+                }
             } catch (acknowledgeError) {
                 console.error(acknowledgeError)
             }
