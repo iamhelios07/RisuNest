@@ -6,7 +6,7 @@ use super::{
 };
 use crate::{
     asset_repository::PayloadCas,
-    external_storage::capture::{CaptureCatalog, DurableCaptureReference},
+    external_storage::capture::{BackupDependencySpool, CaptureCatalog, DurableCaptureReference},
     local_backup::CancellationProbe,
     server_sync::residency::HydrationSession,
 };
@@ -62,6 +62,17 @@ pub(crate) struct BackupDependencyClosure {
     pub record_payloads: BTreeSet<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BackupBodyRole { Control, Payload }
+
+#[derive(Default)]
+pub(crate) struct BackupDependencyInventory {
+    pub controls: BTreeMap<String, u64>,
+    pub payloads: BTreeMap<String, Option<u64>>,
+    pub spooled_payloads: BTreeSet<String>,
+    pub record_payloads: BTreeSet<String>,
+}
+
 impl PersistentStore {
     pub(crate) fn lww_backup_dependency_closure(
         &self,
@@ -69,6 +80,29 @@ impl PersistentStore {
         units: &BTreeMap<risunest_sync_wire::unit::UnitKey, risunest_sync_wire::unit::UnitValue>,
         probe: &dyn CancellationProbe,
     ) -> StoreResult<BackupDependencyClosure> {
+        let mut controls = BTreeMap::new();
+        let mut payload_bodies = BTreeMap::new();
+        let inventory = self.lww_backup_dependency_inventory(lease,units,probe,true,&mut |hash,bytes,role| {
+            match role {
+                BackupBodyRole::Control => {controls.insert(hash.to_owned(),bytes.to_vec());}
+                BackupBodyRole::Payload => {payload_bodies.insert(hash.to_owned(),bytes.to_vec());}
+            }
+            Ok(())
+        })?;
+        let managed_payloads = inventory.payloads.into_iter().filter(|(hash,_)| !inventory.spooled_payloads.contains(hash))
+            .map(|(hash,size)| size.map(|size| (hash,size)).ok_or_else(|| invalid("Backup payload size is unavailable")))
+            .collect::<StoreResult<_>>()?;
+        Ok(BackupDependencyClosure {controls,payload_bodies,managed_payloads,record_payloads:inventory.record_payloads})
+    }
+
+    pub(crate) fn lww_backup_dependency_inventory(
+        &self,
+        lease: &str,
+        units: &BTreeMap<risunest_sync_wire::unit::UnitKey,risunest_sync_wire::unit::UnitValue>,
+        probe: &dyn CancellationProbe,
+        copy_bodies: bool,
+        emit: &mut dyn FnMut(&str,&[u8],BackupBodyRole) -> StoreResult<()>,
+    ) -> StoreResult<BackupDependencyInventory> {
         check(probe)?;
         if self.lww_backup_unit_values(lease)? != *units {
             return Err(invalid("Backup dependency source differs from the complete pinned units"));
@@ -91,7 +125,7 @@ impl PersistentStore {
             ).optional()?;
             size.map(u64::try_from).transpose().map_err(|_| invalid("Pinned backup payload size is invalid"))
         };
-        original_unit_dependency_closure(units,&load,&payload_size,probe)
+        original_unit_dependency_inventory(units,&load,&payload_size,probe,copy_bodies,emit)
     }
 }
 
@@ -101,75 +135,151 @@ pub(crate) fn original_unit_dependency_closure(
     payload_size: &dyn Fn(&str) -> StoreResult<Option<u64>>,
     probe: &dyn CancellationProbe,
 ) -> StoreResult<BackupDependencyClosure> {
-        use risunest_sync_wire::{descriptor::visit_reference_tree, unit::UnitValue};
-        let mut controls = BTreeMap::new();
-        let mut required = BTreeSet::new();
-        let mut record_payloads = BTreeSet::new();
-        let load = |hash:&str| -> StoreResult<Option<Vec<u8>>> {
-            check(probe)?;
-            let bytes = read_body(hash)?;
-            if bytes.as_ref().is_some_and(|bytes| bytes.len() > risunest_sync_wire::MAX_METADATA_BYTES || risunest_sync_wire::hash(bytes) != hash) {
-                return Err(invalid("Backup bounded source body integrity failed"));
-            }
-            Ok(bytes)
-        };
-        for (key, value) in units {
-            check(probe)?;
-            value.validate().map_err(|_| invalid("Invalid original backup value"))?;
-            let UnitValue::Object { descriptor_hash, descriptor } = value else { continue; };
-            let descriptor_bytes = descriptor.bytes().map_err(|_| invalid("Invalid original backup descriptor"))?;
-            if risunest_sync_wire::hash(&descriptor_bytes) != *descriptor_hash {
-                return Err(invalid("Original backup descriptor identity differs"));
-            }
-            controls.insert(descriptor_hash.clone(), descriptor_bytes);
-            let kind = key.components();
-            if super::lww::lww_known_unit_key(key) && matches!(kind[0].as_str(), "messages" | "archive") {
-                let body = load(&descriptor.object_hash)?.ok_or_else(|| invalid("Pinned backup control is unavailable"))?;
-                if kind[0] == "messages" {
-                    let manifest = risunest_external_storage_format::message_pages::MessageManifest::decode(&body)
-                        .map_err(|_| invalid("Pinned backup message manifest integrity failed"))?;
-                    for page in manifest.pages {
+    let mut controls = BTreeMap::new();
+    let mut payload_bodies = BTreeMap::new();
+    let inventory = original_unit_dependency_inventory(units,read_body,payload_size,probe,true,&mut |hash,bytes,role| {
+        match role {
+            BackupBodyRole::Control => { controls.insert(hash.to_owned(),bytes.to_vec()); }
+            BackupBodyRole::Payload => { payload_bodies.insert(hash.to_owned(),bytes.to_vec()); }
+        }
+        Ok(())
+    })?;
+    let managed_payloads = inventory.payloads.into_iter()
+        .filter(|(hash,_)| !inventory.spooled_payloads.contains(hash))
+        .map(|(hash,size)| size.map(|size| (hash,size)).ok_or_else(|| invalid("Backup payload size is unavailable")))
+        .collect::<StoreResult<_>>()?;
+    Ok(BackupDependencyClosure {controls,payload_bodies,managed_payloads,record_payloads:inventory.record_payloads})
+}
+
+pub(crate) fn hash_backup_body(bytes:&[u8], domain:&'static str) -> String {
+    #[cfg(test)]
+    crate::persistent_store::hash_work::observe(domain,bytes.len());
+    #[cfg(not(test))]
+    let _ = domain;
+    risunest_sync_wire::hash(bytes)
+}
+
+pub(crate) fn original_unit_dependency_inventory(
+    units: &BTreeMap<risunest_sync_wire::unit::UnitKey,risunest_sync_wire::unit::UnitValue>,
+    read_body: &dyn Fn(&str) -> StoreResult<Option<Vec<u8>>>,
+    payload_size: &dyn Fn(&str) -> StoreResult<Option<u64>>,
+    probe: &dyn CancellationProbe,
+    copy_bodies: bool,
+    emit: &mut dyn FnMut(&str,&[u8],BackupBodyRole) -> StoreResult<()>,
+) -> StoreResult<BackupDependencyInventory> {
+    use risunest_sync_wire::{descriptor::visit_reference_tree,unit::UnitValue};
+    let mut inventory = BackupDependencyInventory::default();
+    let mut required = BTreeSet::new();
+    let load = |hash:&str| -> StoreResult<Option<Vec<u8>>> {
+        check(probe)?;
+        let bytes = read_body(hash)?;
+        if bytes.as_ref().is_some_and(|bytes| bytes.len() > risunest_sync_wire::MAX_METADATA_BYTES || hash_backup_body(bytes,"native_backup_dependency_source") != hash) {
+            return Err(invalid("Backup bounded source body integrity failed"));
+        }
+        Ok(bytes)
+    };
+    fn control(inventory:&mut BackupDependencyInventory,emit:&mut dyn FnMut(&str,&[u8],BackupBodyRole)->StoreResult<()>,hash:&str,bytes:&[u8]) -> StoreResult<()> {
+        if inventory.controls.insert(hash.to_owned(),bytes.len() as u64).is_none() {
+            emit(hash,bytes,BackupBodyRole::Control)?;
+        }
+        Ok(())
+    }
+    for (key,value) in units {
+        check(probe)?;
+        #[cfg(test)]
+        crate::persistent_store::hash_work::validation(value);
+        value.validate().map_err(|_| invalid("Invalid original backup value"))?;
+        let UnitValue::Object {descriptor_hash,descriptor} = value else {continue};
+        let bytes = descriptor.bytes().map_err(|_| invalid("Invalid original backup descriptor"))?;
+        if hash_backup_body(&bytes,"native_backup_dependency_descriptor") != *descriptor_hash {return Err(invalid("Original backup descriptor identity differs"))}
+        control(&mut inventory,emit,descriptor_hash,&bytes)?;
+        let kind = key.components();
+        if super::lww::lww_known_unit_key(key) && matches!(kind[0].as_str(),"messages"|"archive") {
+            let body = load(&descriptor.object_hash)?.ok_or_else(|| invalid("Pinned backup control is unavailable"))?;
+            if kind[0] == "messages" {
+                let result = risunest_external_storage_format::message_pages::MessageManifest::decode(&body);
+                #[cfg(test)]
+                crate::persistent_store::hash_work::decoded("native_backup_manifest_decode_identity",&body,&result);
+                let manifest = result.map_err(|_| invalid("Pinned backup message manifest integrity failed"))?;
+                for page in manifest.pages {
+                    if copy_bodies {
                         let bytes = load(&page.hash)?.ok_or_else(|| invalid("Pinned backup message page is unavailable"))?;
-                        if bytes.len() as u64 != page.byte_length.0 { return Err(invalid("Pinned backup message page length differs")); }
-                        controls.insert(page.hash, bytes);
+                        if bytes.len() as u64 != page.byte_length.0 {return Err(invalid("Pinned backup message page length differs"))}
+                        control(&mut inventory,emit,&page.hash,&bytes)?;
+                    } else {
+                        inventory.controls.insert(page.hash,page.byte_length.0);
                     }
                 }
-                controls.insert(descriptor.object_hash.clone(), body);
             } else {
-                required.insert(descriptor.object_hash.clone());
-                record_payloads.insert(descriptor.object_hash.clone());
+                let archived: super::archive::ArchivedObject = serde_json::from_slice(&body)?;
+                let mut shared = archived.clone();
+                shared.object_hash = shared.shared_object_hash.clone();
+                shared.asset_hashes = shared.shared_asset_hashes.clone();
+                let encoded = risunest_sync_wire::payload_value::encode(&serde_json::to_value(&shared)?)
+                    .map_err(|_| invalid("Invalid backup archive metadata"))?;
+                if encoded != body {return Err(invalid("Backup archive metadata differs from its shared value"))}
+                let mut expected = risunest_sync_wire::descriptor::RecordDescriptor::content(
+                    hash_backup_body(&encoded,"native_backup_archive_metadata"));
+                let mut roots = shared.object_roots().map(str::to_owned).collect::<Vec<_>>();
+                roots.sort(); roots.dedup();
+                if risunest_sync_wire::descriptor::inline_references(&roots).map_err(|_| invalid("Invalid backup archive roots"))? {
+                    expected.dependencies = roots;
+                } else {
+                    let tree = risunest_sync_wire::descriptor::build_reference_tree(&roots,false);
+                    #[cfg(test)]
+                    crate::persistent_store::hash_work::reference_creation(&tree);
+                    expected.dependency_root = tree.map_err(|_| invalid("Invalid backup archive roots"))?.0;
+                }
+                if expected != *descriptor {return Err(invalid("Backup archive descriptor differs from its metadata"))}
             }
-            required.extend(descriptor.dependencies.iter().cloned());
-            for (root, relations) in [(&descriptor.dependency_root, false), (&descriptor.relation_root, true)] {
-                let Some(root) = root else { continue; };
-                let mut pages = BTreeMap::new();
-                let visited = visit_reference_tree(root, relations, |hash| {
-                    let bytes = load(hash).map_err(|_| risunest_sync_wire::WireError("backup-reference-control-unavailable"))?
-                        .ok_or(risunest_sync_wire::WireError("backup-reference-control-unavailable"))?;
-                    pages.insert(hash.to_owned(), bytes.clone());
-                    Ok(bytes)
-                }, |value, page| {
-                    if !page && !relations { required.insert(value.to_owned()); }
-                    Ok(())
-                });
-                check(probe)?;
-                visited.map_err(|_| invalid("Backup reference tree integrity failed"))?;
-                controls.extend(pages);
-            }
+            control(&mut inventory,emit,&descriptor.object_hash,&body)?;
+        } else {
+            required.insert(descriptor.object_hash.clone());
+            inventory.record_payloads.insert(descriptor.object_hash.clone());
         }
-        let mut managed_payloads = BTreeMap::new();
-        let mut payload_bodies = BTreeMap::new();
-        for hash in required {
+        required.extend(descriptor.dependencies.iter().cloned());
+        for (root,relations) in [(&descriptor.dependency_root,false),(&descriptor.relation_root,true)] {
+            let Some(root) = root else {continue};
+            let mut source_error = None;
+            let visited = visit_reference_tree(root,relations,|hash| {
+                let result = (|| {
+                    let bytes = load(hash)?.ok_or_else(|| invalid("Backup reference control is unavailable"))?;
+                    control(&mut inventory,emit,hash,&bytes)?;
+                    Ok(bytes)
+                })();
+                match result {
+                    Ok(bytes) => {
+                        #[cfg(test)]
+                        crate::persistent_store::hash_work::observe("native_backup_reference_verify",bytes.len());
+                        Ok(bytes)
+                    },
+                    Err(error) => { source_error = Some(error); Err(risunest_sync_wire::WireError("backup-reference-source-failed")) }
+                }
+            },|value,page| {
+                if !page && !relations {required.insert(value.to_owned());}
+                Ok(())
+            });
             check(probe)?;
-            if controls.contains_key(&hash) { continue; }
-            if let Some(body) = load(&hash)? {
-                payload_bodies.insert(hash, body);
+            if let Some(error) = source_error { return Err(error); }
+            visited.map_err(|_| invalid("Backup reference tree integrity failed"))?;
+        }
+    }
+    for hash in required {
+        check(probe)?;
+        if inventory.controls.contains_key(&hash) {continue}
+        if copy_bodies {
+            if let Some(bytes) = load(&hash)? {
+                emit(&hash,&bytes,BackupBodyRole::Payload)?;
+                inventory.payloads.insert(hash.clone(),Some(bytes.len() as u64));
+                inventory.spooled_payloads.insert(hash);
                 continue;
             }
-            let size = payload_size(&hash)?.ok_or_else(|| invalid("Backup payload metadata is unavailable"))?;
-            managed_payloads.insert(hash, size);
         }
-        Ok(BackupDependencyClosure { controls, payload_bodies, managed_payloads, record_payloads })
+        let size = payload_size(&hash)?;
+        if copy_bodies && size.is_none() {return Err(invalid("Backup payload metadata is unavailable"))}
+        inventory.payloads.insert(hash,size);
+    }
+    Ok(inventory)
 }
 
 struct Candidate {
@@ -949,13 +1059,17 @@ impl PersistentStore {
         }
         check(probe)?;
         let units = self.lww_backup_unit_values(lease)?;
-        let closure = self.lww_backup_dependency_closure(lease, &units, probe)?;
         let id = uuid::Uuid::new_v4().to_string();
-        let prepared = self.prepare_content_capture_from_lease(&id, consumer, lease)?;
         let root = self.repository_root.join("external-storage");
         let directory = root.join("captures").join(&id);
+        let mut spool = BackupDependencySpool::new(&directory)?;
+        let inventory = self.lww_backup_dependency_inventory(lease, &units, probe, true,
+            &mut |hash, bytes, role| Ok(spool.push(hash, bytes, role)?))?;
+        check(probe)?;
+        spool.seal()?;
+        let prepared = self.prepare_content_capture_from_lease(&id, consumer, lease)?;
         let mut catalog = CaptureCatalog::create(&directory, &root, None)?;
-        catalog.install_backup_inputs(units, closure, sections)?;
+        catalog.install_streamed_backup_inputs(units, inventory, spool, sections)?;
         let projected_records = prepared.project(&mut catalog, probe)?;
         check(probe)?;
         let (manifest,_,_) = catalog.manifest()?;
@@ -1103,6 +1217,71 @@ mod hydration_tests {
         assert!(closure.payload_bodies.is_empty() && closure.managed_payloads.is_empty());
         assert!(original_unit_dependency_closure(&units,&|_| Ok(None),&|_| Ok(None),&crate::local_backup::NeverCancelled).is_err());
         assert!(original_unit_dependency_closure(&units,&|_| Ok(Some(b"wrong body".to_vec())),&|_| Ok(None),&crate::local_backup::NeverCancelled).is_err());
+    }
+
+    #[test]
+    fn original_unit_inventory_keeps_real_archive_metadata_and_shared_payload_roots() {
+        use risunest_sync_wire::unit::UnitKey;
+        let directory = tempfile::tempdir().unwrap();
+        let store = PersistentStore::open(directory.path()).unwrap();
+        let compressed = risunest_sync_wire::hash(b"synthetic compressed archive");
+        let asset = risunest_sync_wire::hash(b"synthetic archived asset");
+        let archived = super::super::archive::ArchivedObject {
+            object_hash:compressed.clone(),shared_object_hash:compressed.clone(),archived_at:1,
+            conversation_count:0,message_count:0,asset_hashes:vec![asset.clone()],shared_asset_hashes:vec![asset.clone()],identity_remap:Vec::new(),
+        };
+        let value = super::super::lww::archive_value(&store.connection,&archived).unwrap();
+        let units = BTreeMap::from([(UnitKey::new(&["archive","synthetic"]).unwrap(),value.clone())]);
+        let metadata_hash = match &value {risunest_sync_wire::unit::UnitValue::Object{descriptor,..} => descriptor.object_hash.clone(),_ => unreachable!()};
+        let mut emitted = Vec::new();
+        crate::persistent_store::hash_work::reset_hash_work();
+        let inventory = original_unit_dependency_inventory(&units,
+            &|hash| {assert_eq!(hash,metadata_hash,"Archive payload opened during metadata validation"); super::super::message_pages::object_body(&store.connection,hash)},
+            &|_| Ok(Some(32)),&crate::local_backup::NeverCancelled,false,
+            &mut |hash,_,role| {emitted.push((hash.to_owned(),role)); Ok(())}).unwrap();
+        let hashes = crate::persistent_store::hash_work::take_hash_work();
+        assert!(hashes.incomplete.is_empty());
+        for domain in ["native_backup_dependency_source","native_backup_dependency_descriptor","native_backup_archive_metadata","native_wire_descriptor_validation"] {
+            assert!(hashes.domains[domain].bytes > 0,"Missing actual SHA observation: {domain}");
+        }
+        assert!(inventory.controls.contains_key(&metadata_hash));
+        assert_eq!(inventory.payloads,BTreeMap::from([(compressed,Some(32)),(asset,Some(32))]));
+        assert!(!inventory.record_payloads.contains(&metadata_hash));
+        assert!(emitted.iter().all(|(_,role)| *role == BackupBodyRole::Control));
+        let mut invalid_units = units.clone();
+        let mut descriptor = match value {risunest_sync_wire::unit::UnitValue::Object{descriptor,..} => descriptor,_ => unreachable!()};
+        descriptor.dependencies.clear();
+        invalid_units.insert(UnitKey::new(&["archive","synthetic"]).unwrap(),risunest_sync_wire::unit::UnitValue::object(descriptor).unwrap());
+        assert!(original_unit_dependency_inventory(&invalid_units,&|hash| super::super::message_pages::object_body(&store.connection,hash),&|_| Ok(Some(32)),&crate::local_backup::NeverCancelled,false,&mut |_,_,_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn original_unit_inventory_gc_never_reads_payloads_and_streams_typed_controls() {
+        use risunest_sync_wire::{descriptor::{build_reference_tree,RecordDescriptor},unit::{UnitKey,UnitValue}};
+        let payload = risunest_sync_wire::hash(b"synthetic opaque payload");
+        let dependency = risunest_sync_wire::hash(b"synthetic dependency");
+        let tree = build_reference_tree(&[dependency.clone()],false).unwrap();
+        let mut descriptor = RecordDescriptor::content(payload.clone());
+        descriptor.dependency_root = tree.0;
+        let value = UnitValue::object(descriptor).unwrap();
+        let units = BTreeMap::from([(UnitKey::new(&["future-unit","stream"]).unwrap(),value)]);
+        let reads = std::cell::RefCell::new(Vec::new());
+        let read = |hash:&str| -> StoreResult<Option<Vec<u8>>> {
+            reads.borrow_mut().push(hash.to_owned());
+            assert!(hash != payload && hash != dependency,"GC opened a payload body");
+            Ok(tree.1.iter().find(|(digest,_)| digest == hash).map(|(_,bytes)| bytes.clone()))
+        };
+        let mut emitted = Vec::new();
+        let inventory = original_unit_dependency_inventory(&units,&read,&|_| Ok(None),&crate::local_backup::NeverCancelled,false,
+            &mut |hash,_,role| {emitted.push((hash.to_owned(),role)); Ok(())}).unwrap();
+        assert_eq!(inventory.payloads,BTreeMap::from([(payload.clone(),None),(dependency.clone(),None)]));
+        assert!(inventory.record_payloads.contains(&payload));
+        assert!(emitted.iter().all(|(_,role)| *role == BackupBodyRole::Control));
+        assert_eq!(reads.borrow().len(),tree.1.len());
+        assert_eq!(inventory.controls.len(),tree.1.len()+1);
+        let failure = original_unit_dependency_inventory(&units,&read,&|_| Ok(None),&crate::local_backup::NeverCancelled,false,
+            &mut |hash,_,_| if tree.1.iter().any(|(digest,_)| digest == hash) {Err(invalid("synthetic sink failure"))} else {Ok(())});
+        assert!(matches!(failure,Err(StoreError::Validation{message}) if message == "synthetic sink failure"));
     }
 
     #[test]
