@@ -750,6 +750,33 @@ impl LeaseOwner {
             }
         }).await;
     }
+    pub(crate) async fn run_restore<T>(
+        &self,context:&LeaseContext<'_>,cancel:&Cancellation,
+        operation:impl Future<Output=Result<T>>,
+    )->Result<T> {
+        if self.running.compare_exchange(false,true,Ordering::AcqRel,Ordering::Acquire).is_err() {return Err(corrupt());}
+        struct Running<'a>(&'a LeaseOwner);
+        impl Drop for Running<'_> {
+            fn drop(&mut self) {self.0.closed.store(true,Ordering::Release);self.0.running.store(false,Ordering::Release);}
+        }
+        let _running=Running(self);
+        tokio::pin!(operation);
+        let result=match self.check_control(context,false) {
+            Err(error)=>Err(error),
+            Ok(())=>tokio::select! {
+                biased;
+                _=cancel.cancelled()=>operation.await,
+                result=&mut operation=>result,
+                protection=self.renewal_loop(context,cancel)=>{
+                    cancel.cancel();
+                    let settled=operation.await;
+                    match protection {Err(error)=>Err(error),Ok(())=>settled.and_then(|_|Err(transient()))}
+                }
+            },
+        };
+        self.release_all(context).await;
+        result
+    }
     pub(crate) async fn run<T>(
         &self, context: &LeaseContext<'_>, cancel: &Cancellation,
         operation: impl Future<Output = Result<T>>,
@@ -790,6 +817,20 @@ mod tests {
     pub(super) const NOW: u64 = 1000 * 24 * 60 * MINUTE_MS;
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+    }
+    #[test]
+    fn restore_cancellation_drains_same_future_before_releasing_admission() {
+        runtime().block_on(async {
+            let h=Harness::new();let context=h.context();let cancel=Cancellation::default();
+            let owner=match admit_shared_work(&context,"restore-drain",&cancel).await.unwrap() {Admission::Admitted(owner)=>owner,_=>panic!("work admission")};
+            let admission=std::sync::Arc::new(crate::native_file_jobs::admission::Admission::default());
+            let mut permit=admission.staging().unwrap();permit.upgrade_staging().unwrap();
+            let (started,start)=tokio::sync::oneshot::channel();let (adopted,adopt)=tokio::sync::oneshot::channel();
+            let operation=async {let _=started.send(());adopt.await.map_err(|_|transient())?;drop(permit);cancel.check()};
+            let control=async {start.await.unwrap();cancel.cancel();tokio::task::yield_now().await;assert!(admission.file(true).is_err());adopted.send(()).unwrap();};
+            let (result,())=tokio::join!(owner.run_restore(&context,&cancel,operation),control);
+            assert_eq!(result.unwrap_err().kind,ErrorKind::Cancelled);assert!(admission.file(true).is_ok());
+        });
     }
     struct Harness {
         root: tempfile::TempDir,

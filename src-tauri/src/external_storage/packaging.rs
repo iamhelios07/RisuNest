@@ -4957,6 +4957,99 @@ mod tests {
     }
 
     #[test]
+    fn database_first_native_restore_activates_before_actual_missing_body_completion() {
+        runtime().block_on(async {
+            use crate::external_storage::{runtime_restore,job_store::{DurableJob,JobStore}};
+            let root=tempfile::tempdir().unwrap();
+            let bytes=b"synthetic full restore managed body";
+            let asset_bytes=[bytes.as_slice(),b"synthetic second managed body".as_slice(),b"synthetic present managed body".as_slice()];
+            let cas=PayloadCas::new(root.path()).unwrap();
+            let assets=asset_bytes.iter().map(|bytes|cas.prepare_bytes(bytes).unwrap()).collect::<Vec<_>>();
+            let hash=assets[0].content_hash.clone();
+            let identity=CaptureIdentity{store_id:"store".into(),library_epoch:"epoch".into(),generation:"generation".into(),selection_epoch:"selection".into(),revision:0};
+            let mut catalog=crate::external_storage::capture::CaptureCatalog::create(&root.path().join("external-storage/captures/full-phase"),&root.path().join("external-storage"),None).unwrap();
+            catalog.begin(&identity,None).unwrap();
+            let record=crate::logical_records::encode_logical_record(&crate::logical_records::LogicalRecordEnvelope::Root{value:serde_json::json!({}),owner_heads:vec![]}).unwrap();
+            let root_key=crate::logical_records::encode_logical_record_key(&crate::logical_records::LogicalRecordLocator::Root).unwrap();
+            catalog.record(&root_key,&record.bytes).unwrap();
+            for asset in &assets {catalog.reference(&root_key,&asset.content_hash,asset.byte_size).unwrap();}
+            catalog.finish().unwrap();
+            let capture=CapturedSnapshot{id:"full-phase".into(),identity,catalog,projected_records:1,shared:false};
+            let provider=Arc::new(FakeProvider::new(false));let repository=fake::repository();let key=[21;32];
+            let mut source=crate::persistent_store::PersistentStore::open(root.path()).unwrap();
+            let sections=super::super::sections::capture_backup_sections(&mut source,&root.path().join("sections"),&Cancellation::default()).unwrap();
+            let mut metadata=metadata("full-phase",&capture);
+            let original_units=assets.iter().enumerate().map(|(index,asset)|(
+                risunest_sync_wire::unit::UnitKey::new(&["future-opaque",&format!("full-body-{index}")]).unwrap(),
+                risunest_sync_wire::unit::UnitValue::object(risunest_sync_wire::descriptor::RecordDescriptor::content(asset.content_hash.clone())).unwrap(),
+            )).collect();
+            metadata.purpose=SnapshotPurpose::BackupBundle{source:wire_control::BundleSource::Device{writer_id:"synthetic-writer".into()},remote_generation:None,original_units};
+            let mut transfer=journal(&root.path().join("full-phase-upload"),"full-phase",&capture);
+            let completed=package_and_upload(capture,sections.clone(),root.path(),&root.path().join("full-phase-cache"),metadata,&key,limits(256*1024),None,&mut transfer,provider.as_ref(),&repository,&PhaseProgress::silent(),&Cancellation::default()).await.unwrap();
+            let connected=super::super::connection_commands::ConnectedRepository {
+                stored:super::super::connection_store::StoredConnection {
+                    id:"synthetic-connection".into(),config:super::super::contract::ConnectionConfig {provider:"synthetic".into(),profile:None,endpoint:"https://synthetic.invalid".into(),account_id:"account".into(),location:BTreeMap::new(),oauth_profile:None},
+                    descriptor:risunest_external_storage_format::format::Descriptor::new("format-repository".into(),Some(risunest_external_storage_format::format::Strategy::Cas)).unwrap(),
+                    descriptor_locator:RemoteLocator{connection_identity:repository.connection_identity.clone(),collection:None,object:"descriptor".into()},provider_repository_id:repository.repository_id.clone(),credential_ref:"credential".into(),root_key_ref:"key".into(),recovery_key_ref:"recovery".into(),retention_policy:None,capabilities:fake::capabilities(true),created_at_ms:1,verified_at_ms:1,last_sync_at_ms:None,last_backup_at_ms:None,
+                },provider:provider.clone(),handle:repository,dependencies:fake::loopback_dependencies(fake::MemoryVault::default(),1).dependencies,root_key:zeroize::Zeroizing::new(key),
+            };
+            for already_present in [false,true] {
+                let destination=tempfile::tempdir().unwrap();
+                let mut store=crate::persistent_store::PersistentStore::open(destination.path()).unwrap();
+                let local=PayloadCas::new(destination.path()).unwrap();
+                local.prepare_bytes(asset_bytes[2]).unwrap();
+                if already_present {for bytes in &asset_bytes[..2] {local.prepare_bytes(bytes).unwrap();}}
+                let request=serde_json::from_value(serde_json::json!({"connectionId":"synthetic-connection","kind":"restore","snapshotId":"full-phase","targetRevision":"0"})).unwrap();
+                let mut job=DurableJob::new(request,false,1,store.external_identity().unwrap());
+                job.summary["restoreSource"]=serde_json::to_value(completed.reference.stored(&connected.handle).unwrap()).unwrap();
+                let jobs=JobStore::open(destination.path()).unwrap();jobs.put(&job).unwrap();
+                let (prepared,received_sections)=runtime_restore::prepare_database_first_backup(destination.path(),&connected,&job,&Cancellation::default()).await.unwrap();
+                assert_eq!(prepared.present.contains(&hash),already_present);
+                jobs.freeze_restore_bodies(&job,&prepared.sources,&prepared.present).unwrap();
+                let pack_ids=prepared.sources.iter().flat_map(|source|source.chunks.iter().map(|chunk|chunk.pack_id.clone())).collect::<BTreeSet<_>>();
+                assert_eq!(pack_ids.len(),1);
+                let pack=prepared.sources.iter().flat_map(|source|source.packs.iter()).find(|pack|pack_ids.contains(&pack.header.object_id)).unwrap().clone();
+                let reads_before=provider.read_attempts(&pack.locator.object);
+                let mut different=prepared.sources.clone();different[0].protected_snapshot="different-published-source".into();
+                assert!(jobs.freeze_restore_bodies(&job,&different,&prepared.present).is_err());
+                jobs.freeze_restore_bodies(&job,&prepared.sources,&BTreeSet::from([hash.clone()])).unwrap();
+                let admission=Arc::new(crate::native_file_jobs::admission::Admission::default());
+                let state=crate::persistent_store::commands::PersistentStoreState::default();
+                crate::asset_repository::body_io::reset_body_io();
+                for asset in &assets {crate::asset_repository::body_io::register_object_purpose(&asset.content_hash,crate::asset_repository::body_io::BodyPurpose::Asset);}
+                let (receipt,permit)=runtime_restore::activate_database_first_backup(&mut store,&state,&job,prepared,received_sections,Cancellation::default(),admission.staging().unwrap()).unwrap();
+                let activation=crate::asset_repository::body_io::take_body_io();
+                assert!(activation.complete());assert_eq!(activation.asset_work(),Default::default());
+                assert!(admission.file(true).is_err());
+                assert_eq!(store.revision().unwrap().to_string(),receipt["receivedRevision"].as_str().unwrap());
+                assert_eq!(PayloadCas::new(destination.path()).unwrap().stat_object(&hash).unwrap().is_some(),already_present);
+                assert_ne!(jobs.read(&job.id).unwrap().summary["restoreBodiesComplete"],true);
+                crate::asset_repository::body_io::reset_body_io();crate::external_storage::worker_observation::begin();
+                for asset in &assets {crate::asset_repository::body_io::register_object_purpose(&asset.content_hash,crate::asset_repository::body_io::BodyPurpose::Asset);}
+                let adoption=runtime_restore::RestoreAdoptionRequest{job_id:job.id.clone(),received_revision:receipt["receivedRevision"].as_str().unwrap().into(),selected_character_id:None};
+                let mut permit=Some(permit);
+                let invalid_adoption=runtime_restore::RestoreAdoptionRequest{received_revision:"999".into(),..adoption.clone()};
+                let refused_store=crate::persistent_store::PersistentStore::open(destination.path()).unwrap();
+                assert!(runtime_restore::settle_database_first_backup(refused_store,&connected,&job,invalid_adoption,&mut permit,&Cancellation::default()).await.is_err());
+                assert!(permit.is_some());assert!(admission.file(true).is_err());
+                let cancelled=Cancellation::default();cancelled.cancel();
+                assert_eq!(runtime_restore::settle_database_first_backup(store,&connected,&job,adoption.clone(),&mut permit,&cancelled).await.unwrap_err().kind,ErrorKind::Cancelled);
+                assert!(admission.file(true).is_ok());
+                let store=crate::persistent_store::PersistentStore::open(destination.path()).unwrap();
+                assert_eq!(store.revision().unwrap().to_string(),receipt["receivedRevision"].as_str().unwrap());
+                runtime_restore::settle_database_first_backup(store,&connected,&job,adoption,&mut Some(admission.file(true).unwrap()),&Cancellation::default()).await.unwrap();
+                let workers=crate::external_storage::worker_observation::take();let bodies=crate::asset_repository::body_io::take_body_io();
+                assert!(bodies.complete());assert!(workers.iter().all(|worker|worker.completed));
+                if already_present {assert_eq!(bodies.asset_work(),Default::default());} else {assert!(bodies.asset_work().read_bytes>0);}
+                assert!(admission.file(true).is_ok());assert_eq!(jobs.read(&job.id).unwrap().summary["restoreBodiesComplete"],true);
+                assert!(jobs.restore_bodies_settled(&job.id).unwrap());
+                assert_eq!(provider.read_attempts(&pack.locator.object)-reads_before,usize::from(!already_present));
+                for asset in &assets {assert!(PayloadCas::new(destination.path()).unwrap().stat_object(&asset.content_hash).unwrap().is_some());}
+            }
+        });
+    }
+
+    #[test]
     fn asset_only_publication_uses_existing_authenticated_pack_catalog() {
         runtime().block_on(async {
             let root=tempfile::tempdir().unwrap();
