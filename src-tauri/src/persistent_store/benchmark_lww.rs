@@ -23,6 +23,12 @@ mod native_bootstrap;
 #[path = "../../../benchmarks/lww-native/src/native_maintenance.rs"]
 #[allow(dead_code)]
 mod native_maintenance;
+#[allow(dead_code)]
+#[path = "../../../benchmarks/lww-native/src/source_receipt.rs"]
+mod source_receipt;
+#[allow(dead_code)]
+#[path = "../../../benchmarks/lww-native/src/source_process.rs"]
+mod source_process;
 
 use super::{lww::{self, MessageLocator, UnitMutation}, sync_selection::{SwitchBindingRequest, SyncTarget},
     ConversationMutation, PersistentStore, WorkingSetCommit};
@@ -1662,6 +1668,92 @@ fn actual_compaction_producer_keeps_unobserved_source_and_protection_invalid() {
         assert!(record.source_observation.is_none());assert!(!record.protection_run_completed);
         assert!(record.native_observation.hash_totals().is_err());
     });
+}
+
+#[test]
+#[ignore = "requires coordinator-frozen source libtest identities; tiny endpoint correctness only"]
+fn actual_source_process_bootstrap_retains_complete_source_and_native_receipts() {
+    let executable=std::path::PathBuf::from(std::env::var("LWW_SOURCE_TEST_EXE").expect("frozen source executable required"));
+    let fingerprint=std::env::var("LWW_SOURCE_FINGERPRINT").expect("source fingerprint required");
+    let binary=std::env::var("LWW_SOURCE_BINARY_SHA").expect("source binary SHA required");
+    let mut source=source_process::SourceProcess::start(&executable,&fingerprint,&binary,"tiny-native-bootstrap").unwrap();
+    let (_source_directory,mut producer)=server_sync::lww_tests::local();
+    let (_destination_directory,mut destination)=server_sync::lww_tests::local();
+    assert_ne!(producer.lww_clock_state().unwrap().writer_id,destination.lww_clock_state().unwrap().writer_id);
+    let sender=native_bootstrap::source_client(&mut source,&producer,"synthetic-producer",
+        &"82".repeat(32),false).unwrap();
+    let config=sender.client.config();
+    bind(&mut producer,SyncTarget::Server(config.endpoint.clone()),&config.endpoint,&config.library_id);
+    producer.commit(&WorkingSetCommit {expected_revision:producer.revision().unwrap(),
+        unit_mutations:Some(vec![UnitMutation::Set {key:UnitKey::new(&["root","language"]).unwrap(),value:json!("ko")}]),
+        ..Default::default()}).unwrap();
+    let asset=server_sync::lww_tests::put_asset(&mut producer,"assets/synthetic-source-large.png",&vec![37;96*1024]);
+    let hash=asset.object_hash.unwrap();
+    reset_work(std::slice::from_ref(&hash));
+    server_sync::lww_tests::drain_publications(&sender,&mut producer,&[]).unwrap();
+    let published=take_work(false);
+    let roles=published.body_objects.iter().map(|(hash,object)|(hash.clone(),object.purposes.iter().cloned().collect()))
+        .collect::<std::collections::BTreeMap<String,std::collections::BTreeSet<String>>>();
+    assert!(roles[&hash].contains("Asset"));
+    let candidate=native_bootstrap::source_client(&mut source,&destination,"synthetic-destination",
+        &"83".repeat(32),true).unwrap();
+    let record=native_bootstrap::server_bootstrap_source_raw(source,&mut destination,
+        candidate.client.test_io.unwrap(),&roles,None,final_runner::Direction::AtoB,0).unwrap();
+    eprintln!("M-SOURCE-NATIVE-BOOTSTRAP-CORRECTNESS {}",serde_json::to_string(&record).unwrap());
+    assert!(record.error.is_none(),"{:?}",record.error);
+    assert_eq!(record.status,"INVALID");
+    let source:source_receipt::SettledSource=serde_json::from_value(record.source_end_and_shutdown.unwrap()).unwrap();
+    source.validate().unwrap();
+    assert!(source.end.observation.objects.iter().any(|object|object.hash==hash && object.flow=="source" && object.work.read_bytes>0));
+    record.native_observation.validate_costly_native_coverage().unwrap();
+    assert!(record.activation_revision.is_some());assert!(record.all_bodies_local_ms.is_some());
+}
+
+#[test]
+#[ignore = "requires coordinator-frozen source libtest identities; tiny physical overlap correctness only"]
+fn actual_source_read_barrier_allows_real_foreground_publication_during_hydration() {
+    let executable=std::path::PathBuf::from(std::env::var("LWW_SOURCE_TEST_EXE").expect("frozen source executable required"));
+    let fingerprint=std::env::var("LWW_SOURCE_FINGERPRINT").expect("source fingerprint required");
+    let binary=std::env::var("LWW_SOURCE_BINARY_SHA").expect("source binary SHA required");
+    let mut source=source_process::SourceProcess::start(&executable,&fingerprint,&binary,"tiny-native-physical-overlap").unwrap();
+    let (_source_directory,mut producer)=server_sync::lww_tests::local();
+    let (_destination_directory,mut destination)=server_sync::lww_tests::local();
+    let sender=native_bootstrap::source_client(&mut source,&producer,"synthetic-overlap-producer",
+        &"84".repeat(32),false).unwrap();
+    let config=sender.client.config();
+    bind(&mut producer,SyncTarget::Server(config.endpoint.clone()),&config.endpoint,&config.library_id);
+    producer.commit(&WorkingSetCommit {expected_revision:producer.revision().unwrap(),
+        unit_mutations:Some(vec![UnitMutation::Set {key:UnitKey::new(&["root","loreBookDepth"]).unwrap(),value:json!(5)}]),
+        ..Default::default()}).unwrap();
+    let alias=server_sync::lww_tests::put_asset(&mut producer,"assets/synthetic-overlap-large.png",&vec![43;96*1024]);
+    let hash=alias.object_hash.unwrap();
+    reset_work(std::slice::from_ref(&hash));
+    server_sync::lww_tests::drain_publications(&sender,&mut producer,&[]).unwrap();
+    let published=take_work(false);
+    let roles=published.body_objects.iter().map(|(hash,object)|(hash.clone(),object.purposes.iter().cloned().collect()))
+        .collect::<std::collections::BTreeMap<String,std::collections::BTreeSet<String>>>();
+    let candidate=native_bootstrap::source_client(&mut source,&destination,"synthetic-overlap-destination",
+        &"85".repeat(32),true).unwrap();
+    let bound=server_sync::first_binding_cycle(&mut destination,candidate.client.test_io.as_ref().unwrap().clone(),|_|{}).unwrap();
+    assert!(bound.activation.revision>=0);
+    server_sync::lww_tests::receive_available(&sender,&mut producer,&[]).unwrap();
+    let destination_client=LocalServerFixture::reopen_client(&destination,Arc::new(server_sync::client::TestIoCounters::default())).unwrap();
+    let cas=crate::asset_repository::PayloadCas::new(destination.repository_root()).unwrap();
+    assert!(cas.stat_object(&hash).unwrap().is_none());
+    let record=native_bootstrap::server_asset_transfer_overlap_raw(source,&mut destination,&destination_client,
+        &mut producer,&sender,&roles,&hash,None,final_runner::Direction::BtoA,0).unwrap();
+    eprintln!("M-SOURCE-NATIVE-OVERLAP-CORRECTNESS {}",serde_json::to_string(&record).unwrap());
+    assert!(record.errors.is_empty(),"{:?}",record.errors);
+    assert_eq!(record.status,"INVALID");
+    assert!(record.source_reached.is_some());assert!(record.source_release.is_some());
+    assert!(record.foreground_revision.is_some());assert!(record.foreground_publication_ms.is_some());
+    assert!(record.native_bodies_settled_ms.is_some());
+    assert_eq!(record.native_observation.body_worker_scopes_started,1);
+    assert_eq!(record.native_observation.body_worker_scopes_settled,1);
+    assert_eq!(record.native_observation.native_worker_hash_receipts.len(),1);
+    let source:source_receipt::SettledSource=serde_json::from_value(record.source_end_and_shutdown.unwrap()).unwrap();
+    source.validate().unwrap();assert_eq!(source.end.observation.read_barrier.unwrap().status,"released");
+    record.native_observation.validate_costly_native_coverage().unwrap();
 }
 
 #[test]
