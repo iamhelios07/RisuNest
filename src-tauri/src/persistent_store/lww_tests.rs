@@ -417,6 +417,98 @@ fn copy_objects(source: &PersistentStore, target: &PersistentStore) {
         target.lww_put_object(&hash, &body).unwrap();
     }
 }
+
+#[test]
+fn incremental_message_receive_staging_and_generation_deferral_reuse_after_restart() {
+    use crate::persistent_store::hash_work::{reset_hash_work,take_hash_work,DomainWork};
+    for generating in [false,true] {
+        let (_,mut sender) = store(); let (directory,mut target) = store();
+        create_conversation(&mut sender,"char","chat"); create_conversation(&mut target,"char","chat");
+        let messages = (0..1024).map(|i| serde_json::json!({"chatId":format!("m-{i}"),"data":format!("synthetic-{i}")})).collect::<Vec<_>>();
+        let replace = |store: &mut PersistentStore,start,delete_count,messages| {
+            store.commit(&WorkingSetCommit { expected_revision:store.revision().unwrap(),
+                conversations:Some(vec![super::super::ConversationMutation::ReplaceRange {
+                    character_id:"char".into(),conversation_id:"chat".into(),start,delete_count,messages,
+                    conversation:None,configured_index:None,
+                }]),..Default::default() }).unwrap();
+        };
+        replace(&mut sender,0,0,messages.clone()); replace(&mut target,0,0,messages);
+        let start = if generating { 500 } else { 1024 };
+        let id = if generating { "m-500" } else { "appended" };
+        replace(&mut sender,start,i64::from(generating),vec![serde_json::json!({"chatId":id,"data":"remote-update"})]);
+        copy_objects(&sender,&target);
+        let key = UnitKey::new(&["messages","char","chat"]).unwrap();
+        let entry = sender.lww_read_outbox(0.into(),100).unwrap().entries.into_iter().find(|e| e.key==key).unwrap();
+        let expected = entry.value.clone();
+        let UnitValue::Object { descriptor,.. } = &expected else { unreachable!() };
+        assert!(target.lww_verified_object_present(&descriptor.object_hash).unwrap());
+        assert!(!target.lww_verified_object_present(&"00".repeat(32)).unwrap());
+        let manifest = risunest_external_storage_format::message_pages::MessageManifest::decode(
+            &target.lww_object_body(&descriptor.object_hash).unwrap().unwrap()).unwrap();
+        let new_pages = manifest.pages.iter().filter(|page| !target.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM message_page_proofs WHERE hash=?1)",[&page.hash],|r|r.get::<_,bool>(0)).unwrap()).collect::<Vec<_>>();
+        let message_calls = new_pages.iter().map(|p|p.message_count as u64).sum::<u64>();
+        let message_bytes = new_pages.iter().map(|p|p.byte_length.0-(
+            risunest_external_storage_format::message_pages::PAGE_PREFIX.len()+
+            risunest_external_storage_format::message_pages::PAGE_SUFFIX.len()) as u64-(p.message_count as u64-1)).sum::<u64>();
+        let change = Change { key:key.clone(),stamp:stamp(u64::MAX-1),value:entry.value };
+        let header = Header { binding_authority:target.lww_binding_authority().unwrap(),request_id:format!("incremental-{generating}") };
+        let original_rowids = target.connection.prepare("SELECT message_id,rowid FROM messages ORDER BY message_index").unwrap()
+            .query_map([],|r| Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?))).unwrap()
+            .collect::<Result<std::collections::BTreeMap<_,_>,_>>().unwrap();
+        target.connection.execute_batch("CREATE TABLE page_receive_writes(kind TEXT);
+            CREATE TRIGGER page_receive_insert AFTER INSERT ON messages BEGIN INSERT INTO page_receive_writes VALUES('insert'); END;
+            CREATE TRIGGER page_receive_delete AFTER DELETE ON messages BEGIN INSERT INTO page_receive_writes VALUES('delete'); END;").unwrap();
+        reset_hash_work();
+        target.lww_stage_receive(&StageReceive { header:header.clone(),changes:vec![change.clone()],
+            progress:Progress { kind:"server".into(),cursor:1.into(),writer_id:None },admitted_time_upper_ms:u64::MAX.into() }).unwrap();
+        let admission = take_hash_work();
+        assert_eq!(admission.domains["native_message_verify"],DomainWork { calls:message_calls,bytes:message_bytes });
+        assert_eq!(admission.domains["native_page_decode_identity"],DomainWork {
+            calls:new_pages.len() as u64,bytes:new_pages.iter().map(|p|p.byte_length.0).sum(),
+        });
+        assert!(message_calls<256,"fixed fixture must reuse unchanged pages");
+        assert!(admission.incomplete.is_empty());
+        drop(target); let mut target = PersistentStore::open(directory.path()).unwrap();
+        reset_hash_work();
+        let applied = target.lww_apply_receive(&ApplyReceive { header:header.clone(),generating:if generating {
+            vec![MessageLocator { character_id:"char".into(),conversation_id:"chat".into(),start:None }]
+        } else { vec![] } }).unwrap();
+        let work = take_hash_work();
+        for domain in ["native_message_verify","native_page_decode_identity","native_repage_message_verify","native_repage_page_identity"] {
+            assert!(!work.domains.contains_key(domain),"restart apply must skip {domain}: {work:?}");
+        }
+        assert!(work.incomplete.is_empty());
+        target.lww_finish_receive(&header).unwrap();
+        if generating {
+            assert_eq!(applied.deferred_keys,vec![key.clone()]);
+            assert_eq!(target.connection.query_row("SELECT count(*) FROM page_receive_writes",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+            drop(target); target = PersistentStore::open(directory.path()).unwrap();
+            reset_hash_work();
+            let drained = target.lww_drain_deferred(&ApplyReceive { header:Header {
+                binding_authority:target.lww_binding_authority().unwrap(),request_id:"incremental-drain".into(),
+            },generating:vec![] }).unwrap();
+            assert!(drained.affected_keys.contains(&key));
+            let work = take_hash_work();
+            for domain in ["native_message_verify","native_page_decode_identity","native_repage_message_verify","native_repage_page_identity"] {
+                assert!(!work.domains.contains_key(domain),"deferred drain must skip {domain}: {work:?}");
+            }
+            assert!(work.incomplete.is_empty());
+        } else { assert!(applied.affected_keys.contains(&key)); }
+        let counts = |kind| target.connection.query_row("SELECT count(*) FROM page_receive_writes WHERE kind=?1",[kind],|r|r.get::<_,i64>(0)).unwrap();
+        assert_eq!(counts("insert"),1); assert_eq!(counts("delete"),i64::from(generating));
+        for (id,rowid) in target.connection.prepare("SELECT message_id,rowid FROM messages ORDER BY message_index").unwrap()
+            .query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?))).unwrap().collect::<Result<Vec<_>,_>>().unwrap() {
+            if id=="m-500" && generating { continue; }
+            if let Some(old) = original_rowids.get(&id) { assert_eq!(*old,rowid,"unchanged {id}"); }
+        }
+        assert_eq!(read_unit(&target.connection,&key).unwrap(),Some((change.stamp,expected)));
+        let generation = super::super::active_generation(&target.connection).unwrap();
+        assert_eq!(target.connection.query_row("SELECT value FROM messages WHERE generation=?1 AND message_index=?2",params![generation,start],
+            |r|r.get::<_,String>(0)).unwrap(),format!("{{\"chatId\":\"{id}\",\"data\":\"remote-update\"}}"));
+    }
+}
+
 #[test]
 fn every_generating_message_list_is_deferred_but_metadata_applies() {
     let (_, mut sender) = store();
