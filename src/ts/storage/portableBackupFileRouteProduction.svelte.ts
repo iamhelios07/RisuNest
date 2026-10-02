@@ -252,6 +252,10 @@ export async function restoreBackupFromNativeSource(
                         context.setBlocking(blocking)
                         options.onBlockingChange?.(blocking)
                     },
+                    async afterPortableAdoption(status) {
+                        await context.releaseLibraryAfterPortableAdoption(status)
+                        await options.afterPortableAdoption?.(status)
+                    },
                     beforeActivation: options.beforeActivation,
                     onNativeStatus: options.onNativeStatus,
                     afterRefresh: async (alreadyRestarted) => {
@@ -260,7 +264,6 @@ export async function restoreBackupFromNativeSource(
                     },
                 }
                 const selectedInput = input
-                try {
                     const result = await (async () => {
                         if (
                             format === 'portable'
@@ -323,9 +326,6 @@ export async function restoreBackupFromNativeSource(
                             `${language.portableBackup.preserved}: ${report.files} ${language.files}, ${report.bytes} bytes. ${language.portableBackup.preservedSourceHelp}\n${report.path}`,
                         )
                     return result
-                } finally {
-                    // Native job ownership determines cleanup and recovery.
-                }
             } finally {
                 joined.dispose()
                 // A claimed token has already moved to native ownership, so this only removes an

@@ -165,16 +165,17 @@ export function undoNativeDataHealthRepair(journalId: string, expectedRevision: 
 }
 
 export class NativeSnapshotBodiesCommittedError extends NativeFileJobError {
-    constructor(public readonly receipt: NativeSnapshotBodiesStarted, public readonly bodies: NativeSnapshotBodyResult | undefined, code: string, message: string) {
+    constructor(public readonly receipt: Pick<NativeSnapshotBodiesStarted,'stagingId'|'activationRevision'|'bindingAuthority'> & Partial<Pick<NativeSnapshotBodiesStarted,'jobId'|'kind'>>, public readonly bodies: NativeSnapshotBodyResult | undefined, code: string, message: string) {
         super(code, message)
         this.name = 'NativeSnapshotBodiesCommittedError'
     }
 }
 
 export async function completeNativeSnapshotRestoreBodies(stagingId: string, activationRevision: number, bindingAuthority: string): Promise<NativeSnapshotBodyResult> {
-    const receipt = await invoke<NativeSnapshotBodiesStarted>('native_snapshot_restore_bodies_start', {
-        stagingId, activationRevision: String(activationRevision), bindingAuthority,
-    })
+    const identity={stagingId,activationRevision:String(activationRevision),bindingAuthority}
+    let receipt:NativeSnapshotBodiesStarted
+    try {receipt=await invoke<NativeSnapshotBodiesStarted>('native_snapshot_restore_bodies_start',identity)}
+    catch {throw new NativeSnapshotBodiesCommittedError(identity,undefined,'snapshot-body-start-unknown','Snapshot library is restored, but body transfer could not be confirmed')}
     return runSharedNativeFileOperation('import', `snapshot-bodies:${stagingId}`, async context => {
         let cancelled = false
         while (true) {
