@@ -3,9 +3,11 @@ use super::{
     http::HttpClockSample,
     lww_segment::{self as segment, LargeBody, Segment},
 };
+#[cfg(test)]
+use crate::persistent_store::lww::ApplyReceive;
 use crate::persistent_store::{
     external_lww::{SealedBody, SealedPublication, UploadState},
-    lww::{ApplyReceive, Change, Header, MessageLocator, Progress, StageReceive},
+    lww::{Change, Header, MessageLocator, Progress, StageReceive},
     PersistentStore,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -983,6 +985,7 @@ impl ExternalLwwEngine {
             })
             .collect()
     }
+    #[cfg(test)]
     pub(crate) async fn receive_and_apply(
         &self,
         store: &mut PersistentStore,
