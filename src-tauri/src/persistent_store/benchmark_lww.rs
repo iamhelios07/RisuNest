@@ -10,7 +10,7 @@ use super::{lww::{self, MessageLocator, UnitMutation}, sync_selection::{SwitchBi
 use crate::{external_storage::{contract::Cancellation, lww_tests::CycleFixture, lww_segment},
     server_sync::{self, lww_client::LwwClient, lww_tests::LocalServerFixture}};
 use fixture::{FixtureReceipt, FixtureScale};
-use native_observation::NativeObservation;
+use native_observation::{BodyDomain, NativeObservation};
 use risunest_sync_wire::unit::UnitKey;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -23,6 +23,18 @@ pub(crate) enum SmallChange { Setting, Preset, Append }
 pub(crate) enum Direction { AtoB, BtoA }
 
 #[derive(Debug, Serialize)]
+struct ExternalKeyScope {
+    attempted_keys: Vec<String>,
+    held_keys: Vec<String>,
+    deferred_keys: Vec<String>,
+    segment_attempts: usize,
+    accepted_publications: usize,
+    receive_applies: usize,
+    failed_operations: usize,
+    pending_operations: usize,
+}
+
+#[derive(Debug, Serialize)]
 pub(crate) struct NativeSample {
     transport: &'static str,
     direction: Direction,
@@ -31,6 +43,11 @@ pub(crate) struct NativeSample {
     fixture_scale: FixtureScale,
     generated_json_bytes: u64,
     source_database_bytes_before_change: u64,
+    selected_keys: Option<Vec<String>>,
+    emitted_keys: Option<Vec<String>>,
+    accepted_keys: Option<Vec<String>>,
+    affected_keys: Option<Vec<String>>,
+    external_key_scope: Option<ExternalKeyScope>,
     observation: NativeObservation,
     durable_save_ms: f64,
     publication_complete_ms: f64,
@@ -78,6 +95,8 @@ fn bind(store: &mut PersistentStore, target: SyncTarget, target_id: &str, librar
 }
 
 fn reset_work() {
+    crate::asset_repository::body_io::reset_body_io();
+    crate::external_storage::lww_engine::cycle_keys::reset();
     lww::reset_work_metrics();
     super::hash_work::reset_hash_work();
     super::message_pages::reset_capture_work();
@@ -113,6 +132,23 @@ fn take_work(external: bool) -> NativeObservation {
     result.pages_written = capture.work.pages_written as u64;
     result.pages_reused = (capture.work.prefix_reused + capture.work.suffix_reused) as u64;
     if capture.failed_captures > 0 { result.incomplete.push("native/failed-capture".into()); }
+    let bodies = crate::asset_repository::body_io::take_body_io();
+    result.body_scope_complete = Some(bodies.complete() && bodies.thread == std::thread::current().id());
+    result.body_scope_thread = Some(format!("{:?}", bodies.thread));
+    result.body_stat_requests = bodies.stat_requests;
+    result.body_batch_stat_requests = bodies.batch_stat_requests;
+    result.body_presence_queries = bodies.presence_queries;
+    let managed = bodies.domains.get("managed").cloned().unwrap_or_default();
+    result.asset_body_opens = Some(managed.open_attempts);
+    result.asset_body_bytes_read = Some(managed.read_bytes);
+    for (domain, work) in bodies.domains {
+        result.body_domains.insert(domain.into(), BodyDomain {
+            open_attempts:work.open_attempts, opens:work.opens, failed_opens:work.failed_opens,
+            unknown_open_results:work.unknown_open_results, read_operations:work.read_operations,
+            read_bytes:work.read_bytes, incomplete_reads:work.incomplete_reads,
+            escaped_handles:work.escaped_handles, escaped_paths:work.escaped_paths,
+        });
+    }
     result
 }
 
@@ -146,7 +182,9 @@ fn prepare_edit(store: &PersistentStore, change: SmallChange, direction: Directi
                 start, delete_count:0, messages:vec![message.clone()], conversation:None, configured_index:None }]);
             commit.messages_changed = Some(vec![MessageLocator {
                 character_id:"synthetic-character-0".into(), conversation_id:"synthetic-conversation-0".into(), start:Some(start) }]);
-            message
+            let mut expected_messages = conversation["message"].as_array().unwrap().clone();
+            expected_messages.push(message);
+            Value::Array(expected_messages)
         },
     };
     (commit, expected)
@@ -160,7 +198,7 @@ fn verify(store: &PersistentStore, change: SmallChange, expected: &Value) {
             let conversation = store.read_conversation("synthetic-character-0", "synthetic-conversation-0", None)
                 .unwrap().unwrap().value;
             let messages = conversation["message"].as_array().unwrap();
-            assert_eq!(messages.last().unwrap(), expected);
+            assert!(messages == expected.as_array().unwrap(), "append changed prior message content or fields");
             let unique = messages.iter().map(|message| message["chatId"].as_str().unwrap())
                 .collect::<std::collections::BTreeSet<_>>();
             assert_eq!(unique.len(), messages.len());
@@ -225,16 +263,30 @@ impl ExternalDriver {
         receiver.receive_and_apply(destination, destination.lww_binding_authority().unwrap(), &[], &Cancellation::default()).await.unwrap();
         let receiver_durable_complete_ms = started.elapsed().as_secs_f64() * 1000.0;
         let mut observation = take_work(true);
+        let keys = crate::external_storage::lww_engine::cycle_keys::take();
+        assert!(keys.complete(), "failed or unfinished external key observation");
+        let selected_keys = key_set(keys.selected_keys);
+        let emitted_keys = key_set(keys.emitted_keys);
+        let affected_keys = key_set(keys.affected_keys);
+        let external_key_scope = ExternalKeyScope {
+            attempted_keys:key_set(keys.attempted_keys), held_keys:key_set(keys.held_keys),
+            deferred_keys:key_set(keys.deferred_keys), segment_attempts:keys.segment_attempts,
+            accepted_publications:keys.accepted_publications, receive_applies:keys.receive_applies,
+            failed_operations:keys.failed_operations, pending_operations:keys.pending_operations,
+        };
         observation.requests = (provider.read_count() + provider.upload_count() + provider.listing_count()) as u64 - requests_before;
         let bytes_after = provider.transferred_body_bytes();
         observation.uploaded_bytes = bytes_after.0 - bytes_before.0;
         observation.downloaded_bytes = bytes_after.1 - bytes_before.1;
         observation.shared_head_reads = Some((provider.read_attempts("head") - head_reads_before) as u64);
+        observation.validate_routine_invariants().unwrap();
         verify(destination, change, &expected);
         assert!(source.lww_read_outbox(source.lww_binding_authority().unwrap(), 1).unwrap().entries.is_empty());
         NativeSample {transport:"native-fake-provider", direction, change, iteration, observation,
             fixture_scale:self.receipt.scale.clone(), generated_json_bytes:self.receipt.database_bytes,
             source_database_bytes_before_change,
+            selected_keys:Some(selected_keys), emitted_keys:Some(emitted_keys), accepted_keys:None,
+            affected_keys:Some(affected_keys), external_key_scope:Some(external_key_scope),
             durable_save_ms, publication_complete_ms, receiver_durable_complete_ms}
     }
 }
@@ -287,7 +339,7 @@ impl ServerDriver {
         let started = Instant::now();
         source.commit(&commit).unwrap();
         let durable_save_ms = started.elapsed().as_secs_f64() * 1000.0;
-        assert!(server_sync::lww_tests::publish_cycle(sender, source, &[]).unwrap().is_some());
+        let receipt = server_sync::lww_tests::publish_cycle(sender, source, &[]).unwrap().unwrap();
         let publication_complete_ms = started.elapsed().as_secs_f64() * 1000.0;
         let completion = server_sync::lww_tests::receive_cycle(receiver, destination, &[]).unwrap();
         assert!(completion.received_units > 0);
@@ -301,12 +353,51 @@ impl ServerDriver {
             observation.uploaded_bytes += sent;
             observation.downloaded_bytes += received;
         }
+        observation.validate_routine_invariants().unwrap();
+        // Read the actual submitted operation only after timing and collector take.
+        let (body, intent):(Vec<u8>, String) = sender.log.0.query_row(
+            "SELECT body,intent FROM publications WHERE id=?1", [&receipt.operation_id],
+            |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        let request: risunest_sync_wire::lww::PushRequest = serde_json::from_slice(&body).unwrap();
+        let publication: server_sync::lww_client::Publication = serde_json::from_str(&intent).unwrap();
+        assert_eq!(request.operation_id, receipt.operation_id);
+        assert_eq!(publication.request, request);
+        let selected_keys = key_set(publication.entries.into_iter().map(|entry| entry.key));
+        // Submitted immutable body keys include dominated changes; accepted keys are winners.
+        let emitted_keys = key_set(request.changes.into_iter().map(|change| change.key));
+        assert_eq!(selected_keys, emitted_keys);
+        let accepted_keys = key_set(receipt.accepted_keys);
+        let affected_keys = key_set(completion.result.affected_keys);
         verify(destination, change, &expected);
         assert!(source.lww_read_outbox(source.lww_binding_authority().unwrap(), 1).unwrap().entries.is_empty());
         NativeSample {transport:"native-local-http", direction, change, iteration, observation,
             fixture_scale:self.receipt.scale.clone(), generated_json_bytes:self.receipt.database_bytes,
             source_database_bytes_before_change,
+            selected_keys:Some(selected_keys), emitted_keys:Some(emitted_keys),
+            accepted_keys:Some(accepted_keys), affected_keys:Some(affected_keys),
+            external_key_scope:None,
             durable_save_ms, publication_complete_ms, receiver_durable_complete_ms}
+    }
+}
+
+fn key_set(keys:impl IntoIterator<Item=UnitKey>) -> Vec<String> {
+    keys.into_iter().map(|key| key.as_str().to_owned()).collect::<std::collections::BTreeSet<_>>()
+        .into_iter().collect()
+}
+
+fn assert_same_key_sets(a:&NativeSample, b:&NativeSample) {
+    for (name, small, larger) in [("selected", &a.selected_keys, &b.selected_keys),
+        ("emitted", &a.emitted_keys, &b.emitted_keys), ("affected", &a.affected_keys, &b.affected_keys)] {
+        assert!(small.is_some() && larger.is_some(), "unobserved {name} key set");
+        assert_eq!(small, larger, "{name} key-set growth");
+    }
+    assert_eq!(a.accepted_keys, b.accepted_keys, "accepted key-set growth");
+    if let (Some(small), Some(larger)) = (&a.external_key_scope, &b.external_key_scope) {
+        assert_eq!(small.attempted_keys, larger.attempted_keys, "dispatch key-set growth");
+        assert_eq!(small.held_keys, larger.held_keys, "held key-set growth");
+        assert_eq!(small.deferred_keys, larger.deferred_keys, "deferred key-set growth");
+    } else {
+        assert_eq!(a.external_key_scope.is_some(), b.external_key_scope.is_some());
     }
 }
 
@@ -321,11 +412,25 @@ fn measurement_gate() -> String {
 pub(crate) fn write_samples(directory:&Path, samples:&[NativeSample]) {
     let checkpoint = measurement_gate();
     assert!(!samples.is_empty());
-    for sample in samples { sample.observation.validate_routine_invariants().unwrap(); }
+    for sample in samples {
+        sample.observation.validate_routine_invariants().unwrap();
+        assert!(sample.selected_keys.is_some() && sample.emitted_keys.is_some() && sample.affected_keys.is_some(),
+            "key-set observation must be linked before smoke output");
+        if let Some(keys) = &sample.external_key_scope {
+            assert_eq!(keys.failed_operations, 0);
+            assert_eq!(keys.pending_operations, 0);
+        }
+    }
     std::fs::create_dir(directory).unwrap();
     serde_json::to_writer_pretty(File::create(directory.join("native-smoke.json")).unwrap(),
         &json!({"schema":"risunest-lww-native-smoke/v1", "scope":"native-content-identity-sha-inputs",
             "verified_checkpoint":checkpoint, "timing_origin":"native commit start; cumulative milliseconds",
+            "key_semantics":{
+                "local_http_emitted":"immutable body submitted to /push, including dominated submissions",
+                "local_http_accepted":"winning server keys",
+                "external_emitted":"authenticated publication changes after exact native ACK",
+                "external_attempted":"keys at actual segment create dispatch",
+                "affected":"actual native ApplyResult after durable completion"},
             "excluded":["server internal SHA", "MAC", "HKDF", "general hashing", "renderer paint", "scheduler empty polls"],
             "samples":samples})).unwrap();
 }
@@ -341,9 +446,23 @@ fn frozen_fixture_stages_real_native_rows_and_unique_message_ids() {
     store.commit(&commit).unwrap();
     verify(&store, SmallChange::Append, &expected);
     store.checkpoint(super::CheckpointMode::Truncate).unwrap();
-    let reopened = PersistentStore::open(directory.path()).unwrap();
+    let mut reopened = PersistentStore::open(directory.path()).unwrap();
     verify(&reopened, SmallChange::Append, &expected);
     assert!(reopened.storage_stats().unwrap().database_bytes > 0);
+    let mut prior = expected[0].clone();
+    prior["data"] = json!("synthetic corrupted prefix");
+    reopened.commit(&WorkingSetCommit {
+        expected_revision:reopened.revision().unwrap(),
+        conversations:Some(vec![ConversationMutation::ReplaceRange {
+            character_id:"synthetic-character-0".into(), conversation_id:"synthetic-conversation-0".into(),
+            start:0, delete_count:1, messages:vec![prior], conversation:None, configured_index:None }]),
+        messages_changed:Some(vec![MessageLocator {
+            character_id:"synthetic-character-0".into(), conversation_id:"synthetic-conversation-0".into(), start:Some(0) }]),
+        ..Default::default()
+    }).unwrap();
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+        verify(&reopened, SmallChange::Append, &expected))).is_err(),
+        "same last message and unique IDs must not hide a changed earlier prefix");
 }
 
 #[test]
@@ -361,6 +480,54 @@ fn external_fixture_bootstrap_correctness() {
 fn local_server_fixture_bootstrap_correctness() {
     let driver = ServerDriver::prepare(FixtureScale::small());
     verify_bootstrap(&driver.a, &driver.b);
+}
+
+#[test]
+fn actual_body_observer_binding_counts_reads_and_preserves_catalog_only_scope() {
+    let directory = tempfile::tempdir().unwrap();
+    let cas = crate::asset_repository::PayloadCas::new(directory.path()).unwrap();
+    let object = cas.prepare_bytes(b"synthetic-body-data").unwrap();
+    reset_work();
+    assert_eq!(cas.stat_object(&object.content_hash).unwrap(), Some(19));
+    let mut catalog = take_work(false);
+    catalog.shared_head_reads = Some(0);
+    assert_eq!(catalog.asset_body_opens, Some(0));
+    assert_eq!(catalog.asset_body_bytes_read, Some(0));
+    assert_eq!(catalog.body_stat_requests, 1);
+    catalog.validate_routine_invariants().unwrap();
+
+    reset_work();
+    assert_eq!(cas.read_object(&object.content_hash).unwrap().unwrap(), b"synthetic-body-data");
+    let mut body = take_work(false);
+    body.shared_head_reads = Some(0);
+    assert_eq!(body.asset_body_opens, Some(1));
+    assert_eq!(body.asset_body_bytes_read, Some(19));
+    assert_eq!(body.body_domains["managed"].read_operations, 1);
+    assert_eq!(body.body_scope_complete, Some(true));
+    assert!(body.validate_routine_invariants().is_err());
+}
+
+#[test]
+fn actual_body_observer_binding_rejects_escaped_file_and_path() {
+    let directory = tempfile::tempdir().unwrap();
+    let cas = crate::asset_repository::PayloadCas::new(directory.path()).unwrap();
+    let object = cas.prepare_bytes(b"synthetic-body-data").unwrap();
+    reset_work();
+    let file = cas.open_object(&object.content_hash).unwrap().unwrap();
+    let mut escaped = take_work(false);
+    escaped.shared_head_reads = Some(0);
+    assert_eq!(escaped.body_domains["managed"].escaped_handles, 1);
+    assert_eq!(escaped.body_scope_complete, Some(false));
+    assert!(escaped.validate_routine_invariants().is_err());
+    drop(file);
+    reset_work();
+    assert!(cas.object_path(&object.content_hash).unwrap().is_some());
+    let mut path = take_work(false);
+    path.shared_head_reads = Some(0);
+    assert_eq!(path.asset_body_opens, Some(0));
+    assert_eq!(path.body_domains["managed"].escaped_paths, 1);
+    assert_eq!(path.body_scope_complete, Some(false));
+    assert!(path.validate_routine_invariants().is_err());
 }
 
 #[cfg(target_os = "windows")]
@@ -385,6 +552,7 @@ fn windows_fake_provider_smoke() {
             by_scale.push(samples);
         }
         for (a,b) in by_scale[0].iter().zip(&by_scale[1]) {
+            assert_same_key_sets(a,b);
             native_observation::assert_frozen_growth(&a.observation, &b.observation, &[]).unwrap();
         }
         write_samples(Path::new(&output), &by_scale.into_iter().flatten().collect::<Vec<_>>());
@@ -412,6 +580,7 @@ fn windows_local_server_smoke() {
         by_scale.push(samples);
     }
     for (a,b) in by_scale[0].iter().zip(&by_scale[1]) {
+        assert_same_key_sets(a,b);
         native_observation::assert_frozen_growth(&a.observation, &b.observation, &[]).unwrap();
     }
     write_samples(Path::new(&output), &by_scale.into_iter().flatten().collect::<Vec<_>>());
