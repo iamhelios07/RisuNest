@@ -16,6 +16,7 @@ pub(crate) mod device_store;
 pub(crate) mod export;
 pub(crate) mod external_apply;
 pub(crate) mod external_capture;
+pub(crate) mod external_lww;
 pub(crate) mod external_content_gc;
 pub(crate) mod external_runtime;
 pub(crate) mod external_storage_state;

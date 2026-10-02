@@ -2,10 +2,10 @@ import { listen } from '@tauri-apps/api/event'
 import { Channel, invoke } from '@tauri-apps/api/core'
 import { isTauri } from '../../../platform'
 import type {
-    ExternalCapturePolicy,
     ExternalSnapshotExportProgress,
     DecimalString,
     ExternalConnectionResult,
+    ExternalConnectionConfig,
     ExternalHistoryPage,
     ExternalHistoryDeletePreparation,
     ExternalJobSummary,
@@ -111,6 +111,10 @@ export class ExternalStorageBridge {
         return this.native('external_storage_list_providers')
     }
 
+    validateSyncRoot(config: ExternalConnectionConfig): Promise<void> {
+        return this.native('external_storage_validate_sync_root', { config })
+    }
+
     prepareConnection(request: PrepareExternalConnectionRequest): Promise<PreparedExternalConnection> {
         return this.native('external_storage_prepare_connection', { request })
     }
@@ -166,9 +170,7 @@ export class ExternalStorageBridge {
         return this.native('external_storage_cancel_authorization', { authorizationId })
     }
 
-    setCapturePolicy(connectionId: string, policy: ExternalCapturePolicy): Promise<void> {
-        return this.native('external_storage_set_capture_policy', { connectionId, policy })
-    }
+
 
     setRetentionPolicy(connectionId: string, policy: ExternalRetentionPolicy): Promise<void> {
         return this.native('external_storage_set_retention_policy', { connectionId, policy })

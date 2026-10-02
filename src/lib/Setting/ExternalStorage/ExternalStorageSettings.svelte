@@ -8,9 +8,13 @@
     import SettingButton from '../RisuNest/SettingButton.svelte'
     import SettingProgress from '../RisuNest/SettingProgress.svelte'
     import SettingToggle from '../RisuNest/SettingToggle.svelte'
-    import { alertConfirm, alertNormal } from 'src/ts/alert'
+    import { alertConfirm, alertNormal, alertCheckboxConfirm } from 'src/ts/alert'
     import { DBState } from 'src/ts/stores.svelte'
     import { getExternalStorageBridge } from 'src/ts/storage/sync/external/bridge'
+    import { bindSyncTarget, unbindSyncTarget } from 'src/ts/storage/sync/bindingRegistry'
+    import { requestExternalLwwNow, subscribeExternalLwwFailures, supportsExternalLwwNewDevice } from 'src/ts/storage/sync/external/lwwProduction'
+    import BindingTargetSwitch from 'src/ts/storage/sync/BindingTargetSwitch.svelte'
+    import { language } from 'src/lang'
     import { externalJobIsActive, externalJobIsPaused, externalJobProgress, mergeExternalHistoryItems } from 'src/ts/storage/sync/external/connection'
     import {
         refreshExternalStorageProductionState,
@@ -21,7 +25,6 @@
     } from 'src/ts/storage/sync/external/production'
     import type {
         ExternalConnectionResult,
-        ExternalCapturePolicy,
         ExternalConnectionSummary,
         ExternalHistoryItem,
         ExternalJobSummary,
@@ -50,6 +53,8 @@
     let unlockKey = $state('')
     let destroyed = false
     let stopJobEvents: (() => void) | undefined
+    let stopSyncFailures: (() => void) | undefined
+    let syncFailures = $state<ReadonlyMap<string, unknown>>(new Map())
     let busy = $state(false)
     /** Which action is running, so only the button that started it shows a spinner. */
     let activeAction = $state('')
@@ -74,6 +79,22 @@
         hypa: 'hypa',
         'local-plugins': 'devicePlugins',
         'local-settings': 'deviceSettings',
+    }
+    async function setSyncBinding(connection: ExternalConnectionSummary, enabled: boolean): Promise<void> {
+        busy = true
+        try {
+            if (enabled) await bindSyncTarget({ kind: 'external', connectionId: connection.id })
+            else await unbindSyncTarget()
+            await refreshExternalStorageProductionState()
+            await refresh()
+        } catch (reason) { error = externalErrorMessage(strings, reason) }
+        finally { busy = false }
+    }
+    async function syncNow(connection: ExternalConnectionSummary): Promise<void> {
+        busy = true
+        try { await requestExternalLwwNow(connection.id) }
+        catch (reason) { error = externalErrorMessage(strings, reason) }
+        finally { busy = false }
     }
     const sectionHelp: Record<ExternalRestoreSection, keyof typeof strings> = {
         hypa: 'hypaHelp',
@@ -265,12 +286,21 @@
                 item.pointId,
                 item.pointObservation,
             )
-            if (!preparation.sameDevice
-                && !(await alertConfirm(strings.deleteOtherDeviceConfirm))) return
-            if (preparation.lastRetained
-                && !(await alertConfirm(strings.deleteLastRetainedConfirm))) return
-            if (preparation.sameDevice && !preparation.lastRetained
-                && !(await alertConfirm(strings.deleteHistoryConfirm))) return
+            const descriptions = [
+                ...(!preparation.sameDevice ? [strings.deleteOtherDeviceConfirm] : []),
+                ...(preparation.lastRetained ? [strings.deleteLastRetainedConfirm] : []),
+            ]
+            if (descriptions.length) {
+                const answer = await alertCheckboxConfirm({
+                    title: strings.deleteHistoryConfirm,
+                    description: descriptions.join(' '),
+                    checkboxLabel: strings.deleteHistory,
+                    actionLabel: strings.deleteHistory,
+                    cancelLabel: strings.cancel,
+                    requireChecked: true,
+                })
+                if (!answer.confirmed) return
+            } else if (!(await alertConfirm(strings.deleteHistoryConfirm))) return
             const operation = requestExternalStorageDeleteHistory(
                 connection.id,
                 item,
@@ -363,20 +393,6 @@
         }
     }
 
-    async function changeCapturePolicy(
-        connection: ExternalConnectionSummary,
-        policy: ExternalCapturePolicy,
-    ): Promise<void> {
-        busy = true
-        try {
-            await bridge.setCapturePolicy(connection.id, policy)
-            await refresh(true)
-        } catch (failure) {
-            error = externalErrorMessage(strings, failure)
-        } finally {
-            busy = false
-        }
-    }
 
     async function changeRetentionPolicy(
         connection: ExternalConnectionSummary,
@@ -606,6 +622,7 @@
     })
 
     onMount(async () => {
+        stopSyncFailures = subscribeExternalLwwFailures(value => syncFailures = value)
         try {
             const stop = await bridge.onJobStarted(() => {
                 if (destroyed) return
@@ -622,6 +639,7 @@
         destroyed = true
         clearTimeout(pollTimer)
         stopJobEvents?.()
+        stopSyncFailures?.()
         if (exportRun) void bridge.cancelExport(exportRun.id).catch(() => {})
     })
 </script>
@@ -655,6 +673,13 @@
                 </div>
 
                 {#if connection.lastError}<p class="text-sm text-danger-400">{errorLabel(connection.lastError)}</p>{/if}
+                {#if syncFailures.has(connection.id)}
+                    {@const failure = syncFailures.get(connection.id)}
+                    <p class="text-sm text-danger-400" role="status">{externalErrorKind(failure) === 'clockSkew' ? language.lwwSync.clockBlocked : externalErrorMessage(strings, failure)}</p>
+                    {#if ['clockSkew', 'corrupt'].includes(externalErrorKind(failure) ?? '') && supportsExternalLwwNewDevice(connection.id)}
+                        <BindingTargetSwitch target={{kind:'external',connectionId:connection.id}} options={{mode:'new-device'}} label={language.lwwSync.newDeviceAction} onBound={() => refreshExternalStorageProductionState().then(() => refresh())} onError={reason => error = externalErrorMessage(strings, reason)} />
+                    {/if}
+                {/if}
                 {#if job && (!externalJobIsActive(job) || externalJobIsPaused(job)) && job.state !== 'succeeded' && !connection.lastError}<p class="text-sm text-danger-400" role="status">{jobLabel(job)}</p>{/if}
 
                 {#if job?.result?.decisionRequired || job?.state === 'uncertain'}
@@ -678,21 +703,15 @@
 
                 {#if connection.purpose === 'backup'}
                     <SettingToggle showLabel label={strings.automaticBackup} disabled={busy} checked={!connection.automaticBackupPaused} onchange={enabled => setAutomaticWork(connection, enabled)} />
+                {:else}
+                    <SettingToggle showLabel label={strings.sync} disabled={busy} checked={storageState.selection.kind === 'external' && storageState.selection.connectionId === connection.id} onchange={enabled => setSyncBinding(connection, enabled)} />
                 {/if}
                 {#if unlockConnection?.id === connection.id}
                     <label>{strings.recoveryCode}<TextInput hideText bind:value={unlockKey} /></label>
                     <SettingButton disabled={busy || !unlockKey.trim()} onclick={unlock}>{strings.unlock}</SettingButton>
                     <SettingButton variant="secondary" disabled={busy} onclick={() => { unlockConnection = undefined; unlockKey = '' }}>{strings.cancel}</SettingButton>
                 {/if}
-                {#if connection.capturePolicy}
-                    {@const policy = connection.capturePolicy}
-                    <h3 class="policy-title">{strings.scope}</h3>
-                    <p class="policy-note">{strings.scopeHelp}</p>
-                    <p class="always"><span>{strings.library}</span><span class="value">{strings.included}</span></p>
-                    <SettingToggle showLabel label={strings.hypa} disabled={busy} checked={policy.hypa} onchange={checked => changeCapturePolicy(connection, { ...policy, hypa: checked })} />
-                    <SettingToggle showLabel label={strings.devicePlugins} disabled={busy} checked={policy.localPlugins} onchange={checked => changeCapturePolicy(connection, { ...policy, localPlugins: checked })} />
-                    <SettingToggle showLabel label={strings.deviceSettings} disabled={busy} checked={policy.localSettings} onchange={checked => changeCapturePolicy(connection, { ...policy, localSettings: checked })} />
-                {/if}
+
 
                 <div class="actions">
                     {#if connection.status === 'reauth-required' || job?.error?.action === 'reauthenticate'}
@@ -707,7 +726,8 @@
                     {#if job && externalJobIsPaused(job) && ['retry', 'wait', 'free-space'].includes(job.error?.action ?? '') && ['backup', 'cleanup', 'restore', 'check-repository', 'pin-history', 'delete-history'].includes(job.kind)}
                         <SettingButton disabled={busy || Number(job.error?.retryAtMs ?? 0) > Date.now()} onclick={() => resumeJob(connection, job)}>{strings.retryAction}</SettingButton>
                     {/if}
-                    <SettingButton busy={activeAction === `backup:${connection.id}`} disabled={busy || (job && externalJobIsActive(job))} onclick={() => runJob(connection, 'backup')}>{strings.runBackup}</SettingButton>
+                    {#if connection.purpose === 'backup'}<SettingButton busy={activeAction === `backup:${connection.id}`} disabled={busy || (job && externalJobIsActive(job))} onclick={() => runJob(connection, 'backup')}>{strings.runBackup}</SettingButton>
+                    {:else if storageState.selection.kind === 'external' && storageState.selection.connectionId === connection.id}<SettingButton disabled={busy} onclick={() => syncNow(connection)}>{strings.sync}</SettingButton>{/if}
                     {#if job && externalJobIsActive(job)}<SettingButton variant="secondary" onclick={() => cancelJob(job)}>{strings.cancel}</SettingButton>{/if}
                 </div>
 

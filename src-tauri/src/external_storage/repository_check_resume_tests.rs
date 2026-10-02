@@ -59,7 +59,6 @@ fn connected(provider: Arc<FakeProvider>) -> ConnectedRepository {
             credential_ref: "credential".into(),
             root_key_ref: "key".into(),
             recovery_key_ref: "recovery-key".into(),
-            capture_policy: None,
             retention_policy: None,
             capabilities: fake::capabilities(true),
             created_at_ms: 1_000,
