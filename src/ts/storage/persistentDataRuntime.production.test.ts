@@ -239,6 +239,119 @@ describe('production persistent working-set publication', () => {
         expect(persisted.customBackground).toBe(initial.customBackground)
     })
 
+    it.each(['root', 'preset', 'mirror', 'selection'] as const)('retains concurrent catalog preset edits during async %s unit projection', async (scope) => {
+        const initial = {
+            language: 'en', mainPrompt: 'Initial prompt', botPresetsId: 0,
+            botPresets: [{ id: 'resident-preset', name: 'Initial preset', mainPrompt: 'Initial prompt' },
+                { id: 'other-preset', name: 'Other preset', mainPrompt: 'Other prompt' }],
+            plugins: [], characters: [], pluginCustomStorage: {},
+        } as unknown as Database
+        const store = new IndexedDbPersistentDataStore(`catalog-preset-race-${scope}`, new IDBFactory(), IDBKeyRange)
+        await store.open()
+        const { revision } = await store.replaceFromDatabase(initial)
+        setDatabaseLite(projectCompleteScalableWorkingSet(initial, null, revision))
+        selectedCharID.set(-1)
+        const adapter = createProductionStateAdapter()
+        const runtime = createPersistentDataRuntime({store, state: adapter, prepareDatabase: async (value) => value})
+        await runtime.initializeActiveWorkingSet(getDatabase())
+        expect(adapter.capturePresets?.()).toBeNull()
+        expect(adapter.capturePresetRecords?.()).toHaveLength(1)
+        let entered!: () => void
+        const reading = new Promise<void>((resolve) => { entered = resolve })
+        let release!: () => void
+        const blocked = new Promise<void>((resolve) => { release = resolve })
+        const acquire = store.acquireRevision.bind(store)
+        vi.spyOn(store, 'acquireRevision').mockImplementationOnce(async (requested) => {
+            const lease = await acquire(requested)
+            if (scope === 'preset' || scope === 'selection') {
+                const read = lease.readPreset.bind(lease)
+                vi.spyOn(lease, 'readPreset').mockImplementationOnce(async (id) => {
+                    const value = await read(id)
+                    entered()
+                    await blocked
+                    return value
+                })
+            } else {
+                const read = lease.readRoot.bind(lease)
+                vi.spyOn(lease, 'readRoot').mockImplementationOnce(async () => {
+                    const value = await read()
+                    entered()
+                    await blocked
+                    return value
+                })
+            }
+            return lease
+        })
+        const commit = vi.spyOn(store, 'commit')
+        const mirrorEdit = scope === 'mirror' || scope === 'selection'
+        const projected = runtime.commitPersistentUnitIntent('catalog-preset-race', [{
+            key: scope === 'selection' ? '["root","botPresetsId"]' : scope === 'preset' ? '["preset","resident-preset","name"]' : '["root","language"]',
+            type: 'set', value: scope === 'selection' ? 'other-preset' : scope === 'preset' ? 'Received preset' : 'ko',
+        }])
+        await reading
+        if (mirrorEdit) getDatabase().mainPrompt = 'Concurrent prompt'
+        else getDatabase().botPresets[0].name = 'Concurrent preset'
+        runtime.markPersistentDataDirty(1)
+        release()
+        await projected
+        if (mirrorEdit) {
+            expect(getDatabase().mainPrompt).toBe(scope === 'selection' ? 'Other prompt' : 'Concurrent prompt')
+            expect(getDatabase().botPresets.find((value) => value['id'] === 'resident-preset')?.mainPrompt).toBe('Concurrent prompt')
+            expect((await store.readPreset('resident-preset'))?.value.mainPrompt).toBe('Initial prompt')
+        } else {
+            expect(getDatabase().botPresets[0].name).toBe('Concurrent preset')
+            expect((await store.readPreset('resident-preset'))?.value.name).toBe(scope === 'root' ? 'Initial preset' : 'Received preset')
+        }
+        await runtime.flushPendingDataLocally('persist-concurrent-catalog-preset')
+        if (mirrorEdit) {
+            expect((await store.readPreset('resident-preset'))?.value.mainPrompt).toBe('Concurrent prompt')
+            expect((await store.readPreset('other-preset'))?.value.mainPrompt).toBe('Other prompt')
+        } else expect((await store.readPreset('resident-preset'))?.value.name).toBe('Concurrent preset')
+        expect(commit).toHaveBeenCalledTimes(2)
+        await runtime.flushPendingDataLocally('catalog-preset-no-echo')
+        expect(commit).toHaveBeenCalledTimes(2)
+    })
+
+    it('adopts received protected flags and explicit toggles without creating preset or toggle echoes', async () => {
+        const initial = {
+            botPresetsId: 0, doNotChangeSeperateModels: false, seperateModels: {memory: 'initial'},
+            protectedPresetValues: {}, explicitGlobalChatVariables: {toggle_mode: 'initial'},
+            globalChatVariables: {toggle_mode: 'initial'},
+            botPresets: [{id: 'resident-preset', name: 'Preset', seperateModels: {memory: 'initial'}}],
+            plugins: [], characters: [], pluginCustomStorage: {},
+        } as unknown as Database
+        const store = new IndexedDbPersistentDataStore('catalog-protected-no-echo', new IDBFactory(), IDBKeyRange) as PersistentDataStore
+        await store.open()
+        const {revision} = await store.replaceFromDatabase(initial)
+        setDatabaseLite(projectCompleteScalableWorkingSet(initial, null, revision))
+        selectedCharID.set(-1)
+        const adapter = createProductionStateAdapter()
+        const runtime = createPersistentDataRuntime({store, state: adapter, prepareDatabase: async (value) => value})
+        await runtime.initializeActiveWorkingSet(getDatabase())
+        const mutations = [
+            {key: '["root","doNotChangeSeperateModels"]', type: 'set' as const, value: true},
+            {key: '["preset-protected","seperateModels"]', type: 'set' as const, value: {memory: 'received'}},
+            {key: '["toggle","toggle_mode"]', type: 'set' as const, value: 'received-toggle'},
+        ]
+        store.lwwStageReceive = async () => undefined
+        store.lwwApplyReceive = async () => {
+            const result = await store.commit({expectedRevision: runtime.revision, unitMutations: mutations})
+            return {...result, affectedKeys: mutations.map((value) => value.key), heldKeys: [], deferredKeys: []}
+        }
+        store.lwwFinishReceive = async () => undefined
+        const commit = vi.spyOn(store, 'commit')
+        await runtime.applyLwwReceive({bindingAuthority: '1', requestId: 'protected-receive', changes: [], progress: {kind: 'server', cursor: '1'}, admittedTimeUpperMs: '100'})
+        expect(getDatabase().doNotChangeSeperateModels).toBe(true)
+        expect(getDatabase().protectedPresetValues?.seperateModels).toEqual({memory: 'received'})
+        expect(getDatabase().seperateModels).toEqual({memory: 'received'})
+        expect(getDatabase().globalChatVariables.toggle_mode).toBe('received-toggle')
+        expect(getDatabase().explicitGlobalChatVariables?.toggle_mode).toBe('received-toggle')
+        expect((await store.readPreset('resident-preset'))?.value.seperateModels).toEqual({memory: 'initial'})
+        commit.mockClear()
+        await runtime.flushPendingDataLocally('protected-receive-no-echo')
+        expect(commit).not.toHaveBeenCalled()
+    })
+
     it('restores only affected activation entries, selection and residency', () => {
         const selected = {
             type: 'character',
