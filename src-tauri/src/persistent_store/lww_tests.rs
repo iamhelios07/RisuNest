@@ -332,6 +332,252 @@ fn commit_input_capture_conserves_actual_reserve_completed_and_rejected_retry_ha
     assert!(take_commit_intent_inputs().is_empty());
 }
 
+fn full_device_backup(label: Option<&str>) -> Vec<device_store::sections::PreparedSectionRows> {
+    use risunest_external_storage_format::section::SectionKind;
+    let (_dir, mut source) = store();
+    if let Some(label) = label { write_restore_device_fixture(&mut source, label); }
+    source.device_store_mut().unwrap().capture_backup_sections(
+        &[SectionKind::Hypa, SectionKind::LocalPlugins, SectionKind::LocalSettings],
+    ).unwrap()
+}
+
+fn write_restore_device_fixture(store: &mut PersistentStore, label: &str) {
+    use device_store::{hypa::HypaEmbeddingWrite, plugin_values::PluginDeviceMutation};
+    let device = store.device_store_mut().unwrap();
+    device.write_hypa_embeddings(&[HypaEmbeddingWrite {
+        cache_key: "a".repeat(64), producer: "synthetic".into(), model: label.into(), endpoint: None,
+        preprocess_version: 1, dimensions: 1, vector: vec![0,0,128,63], metadata: None,
+    }]).unwrap();
+    device.write_plugin_device_values("orphan", &[
+        PluginDeviceMutation::Set { space:"string".into(), key:"shared-key".into(), value:label.into() },
+        PluginDeviceMutation::Set { space:"json".into(), key:"shared-key".into(), value:serde_json::to_string(&serde_json::json!({"label":label})).unwrap() },
+    ]).unwrap();
+    device.write_setting("accountst", &serde_json::json!(label)).unwrap();
+    device.connection().execute("INSERT INTO plugin_permissions VALUES(?1,'synthetic',1)", [label]).unwrap();
+}
+
+fn restore_stage(store: &mut PersistentStore, language: &str) -> String {
+    let stage = store.replace_begin().unwrap().staging_id;
+    let mut root = store.read_root(None).unwrap().value;
+    root["language"] = serde_json::json!(language);
+    store.replace_put_root(&stage, &root).unwrap();
+    store.replace_put_presets(&stage, &[]).unwrap();
+    stage
+}
+
+fn assert_device_restore_label(store: &PersistentStore, label: &str) {
+    let device = store.device_store().unwrap();
+    assert_eq!(device.read_setting("accountst").unwrap(), Some(serde_json::json!(label)));
+    assert_eq!(device.connection().query_row("SELECT model FROM hypa_embeddings WHERE cache_key=?1 AND tombstone=0", ["a".repeat(64)], |row| row.get::<_,String>(0)).unwrap(), label);
+    let values: Vec<(String,String)> = device.connection().prepare("SELECT space,value FROM plugin_device_storage WHERE owner='orphan' AND key='shared-key' AND tombstone=0 ORDER BY space").unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?))).unwrap().collect::<Result<_,_>>().unwrap();
+    assert_eq!(values, vec![("json".into(), serde_json::to_string(&serde_json::json!({"label":label})).unwrap()), ("string".into(),label.into())]);
+}
+
+#[test]
+fn full_restore_library_hypa_and_enabled_plugin_changes_share_stamp_and_receipt() {
+    let (_dir, mut store) = store();
+    store.device_store_mut().unwrap().set_section_participating(device_store::Section::LocalPlugins,true).unwrap();
+    write_restore_device_fixture(&mut store, "old");
+    store.device_store().unwrap().write_setting("nightlyWarned", &serde_json::json!(true)).unwrap();
+    store.device_store().unwrap().write_setting("official-account.association.v1", &serde_json::json!({"synthetic":"current"})).unwrap();
+    receive(&mut store,"accepted-before-restore",vec![change(&["future-unit","opaque"],1,serde_json::json!({"retained":true}))],vec![]);
+    let progress = store.lww_receive_progress(0.into()).unwrap();
+    clear_outbox(&mut store);
+    let clock = store.lww_clock_state().unwrap();
+    let sections = full_device_backup(Some("restored"));
+    let stage = restore_stage(&mut store,"restored");
+    let original = BTreeMap::from([(unit_key(&["future-unit","backup"]).unwrap(),inline(&serde_json::json!({"opaque":3})).unwrap())]);
+    let header = Header { binding_authority:0.into(), request_id:"full-device-restore".into() };
+    let revision = store.lww_commit_replacement_with_device_sections(&header,&stage,Some(&original),&sections.iter().collect::<Vec<_>>()).unwrap().revision;
+    assert_device_restore_label(&store,"restored");
+    assert!(store.device_store().unwrap().read_setting("nightlyWarned").unwrap().is_none());
+    assert_eq!(store.device_store().unwrap().read_setting("official-account.association.v1").unwrap(),Some(serde_json::json!({"synthetic":"current"})));
+    assert_eq!(store.device_store().unwrap().connection().query_row("SELECT count(*) FROM plugin_permissions WHERE code_hash='old'",[],|row| row.get::<_,i64>(0)).unwrap(),0);
+    assert_eq!(store.lww_clock_state().unwrap().writer_id,clock.writer_id);
+    assert_eq!(store.lww_clock_state().unwrap().accepted,clock.accepted);
+    assert_eq!(serde_json::to_value(store.lww_receive_progress(0.into()).unwrap()).unwrap(),serde_json::to_value(progress).unwrap());
+    let outbox = store.lww_read_outbox(0.into(),100).unwrap().entries;
+    assert!(outbox.iter().any(|entry| entry.key==unit_key(&["root","language"]).unwrap()));
+    assert_eq!(outbox.iter().filter(|entry| is_device(&entry.key)).count(),3);
+    assert!(outbox.iter().all(|entry| entry.stamp==outbox[0].stamp&&entry.version==header.request_id));
+    assert!(outbox.iter().all(|entry| !entry.key.as_str().contains("accountst")&&!entry.key.as_str().contains("synthetic")));
+    let persisted: String=store.device_store().unwrap().connection().query_row("SELECT body FROM lww_intents WHERE request_id=?1",[&header.request_id],|row| row.get(0)).unwrap();
+    let Intent::Replacement{source_units,device_sections,..}=serde_json::from_str(&persisted).unwrap() else {panic!()};
+    assert_eq!(source_units,Some(original.clone())); assert!(device_sections.is_some());
+    let (_peer_dir,mut peer)=self::store();
+    peer.device_store_mut().unwrap().set_section_participating(device_store::Section::LocalPlugins,true).unwrap();
+    receive(&mut peer,"full-restored-peer",outbox.iter().map(|entry|Change{key:entry.key.clone(),stamp:entry.stamp.clone(),value:entry.value.clone()}).collect(),vec![]);
+    assert_eq!(peer.read_root(None).unwrap().value["language"],"restored");
+    assert_eq!(peer.device_store().unwrap().connection().query_row("SELECT model FROM hypa_embeddings WHERE cache_key=?1",["a".repeat(64)],|row| row.get::<_,String>(0)).unwrap(),"restored");
+    assert!(peer.device_store().unwrap().read_setting("accountst").unwrap().is_none());
+    write_restore_device_fixture(&mut store,"later");
+    assert_eq!(store.lww_commit_replacement_with_device_sections(&header,&stage,Some(&original),&sections.iter().collect::<Vec<_>>()).unwrap().revision,revision);
+    assert_device_restore_label(&store,"later");
+    let altered=full_device_backup(Some("altered"));
+    assert!(store.lww_commit_replacement_with_device_sections(&header,&stage,Some(&original),&altered.iter().collect::<Vec<_>>()).is_err());
+    assert!(store.lww_commit_replacement_units(&header,&stage,Some(&original)).is_err());
+    assert_device_restore_label(&store,"later");
+}
+
+#[test]
+fn full_restore_required_empty_sections_publish_device_deletions_and_clear_local_user_data() {
+    let (_dir,mut store)=store();
+    store.device_store_mut().unwrap().set_section_participating(device_store::Section::LocalPlugins,true).unwrap();
+    write_restore_device_fixture(&mut store,"old"); clear_outbox(&mut store);
+    let sections=full_device_backup(None); let stage=restore_stage(&mut store,"empty");
+    let header=Header{binding_authority:0.into(),request_id:"empty-full-device-restore".into()};
+    store.lww_commit_replacement_with_device_sections(&header,&stage,None,&sections.iter().collect::<Vec<_>>()).unwrap();
+    let device=store.device_store().unwrap();
+    assert_eq!(device.hypa_embedding_usage().unwrap().0,0);
+    assert!(device.list_plugin_device_storage().unwrap().is_empty());
+    assert!(device.read_setting("accountst").unwrap().is_none());
+    assert_eq!(device.connection().query_row("SELECT count(*) FROM plugin_permissions",[],|row|row.get::<_,i64>(0)).unwrap(),0);
+    let changes=store.lww_read_outbox(0.into(),100).unwrap().entries;
+    assert_eq!(changes.iter().filter(|entry|is_device(&entry.key)&&matches!(entry.value,UnitValue::Deleted)).count(),3);
+    assert!(changes.iter().all(|entry|entry.stamp==changes[0].stamp));
+}
+
+#[test]
+fn full_restore_rejects_missing_duplicate_and_versioned_device_sections_before_reserving() {
+    use risunest_external_storage_format::section::SectionKind;
+    let (_dir,mut store)=store(); let stage=restore_stage(&mut store,"invalid");
+    let sections=full_device_backup(None); let before=store.lww_clock_state().unwrap().issued;
+    let header=Header{binding_authority:0.into(),request_id:"invalid-device-scope".into()};
+    assert!(store.lww_commit_replacement_with_device_sections(&header,&stage,None,&sections[..2].iter().collect::<Vec<_>>()).is_err());
+    assert!(store.lww_commit_replacement_with_device_sections(&header,&stage,None,&[&sections[0],&sections[0],&sections[2]]).is_err());
+    let empty_fingerprint=risunest_external_storage_format::format::FingerprintBuilder::new(&SectionKind::Hypa.fingerprint_domain()).finish();
+    let versioned=device_store::sections::SectionSpoolBuilder::new(device_store::Section::Hypa).unwrap().finish(&empty_fingerprint).unwrap();
+    assert_eq!(versioned.kind(),SectionKind::Hypa);
+    assert!(store.lww_commit_replacement_with_device_sections(&header,&stage,None,&[&versioned,&sections[1],&sections[2]]).is_err());
+    assert_eq!(store.lww_clock_state().unwrap().issued,before);
+    assert_eq!(store.device_store().unwrap().connection().query_row("SELECT count(*) FROM lww_intents",[],|row|row.get::<_,i64>(0)).unwrap(),0);
+    assert_eq!(store.revision().unwrap(),0);
+}
+
+#[test]
+fn full_restore_recovers_original_inputs_after_library_and_device_transaction_failures() {
+    for phase in 0..3 {
+        let (dir,mut store)=store();
+        store.device_store_mut().unwrap().set_section_participating(device_store::Section::LocalPlugins,true).unwrap();
+        write_restore_device_fixture(&mut store,"old"); clear_outbox(&mut store);
+        let sections=full_device_backup(Some("frozen")); let stage=restore_stage(&mut store,"frozen");
+        let header=Header{binding_authority:0.into(),request_id:format!("crash-device-restore-{phase}")};
+        let original=BTreeMap::from([(unit_key(&["future-unit","frozen"]).unwrap(),inline(&serde_json::json!(phase)).unwrap())]);
+        if phase==0 { store.connection.execute_batch("CREATE TEMP TRIGGER reject_library BEFORE DELETE ON root BEGIN SELECT RAISE(ABORT,'synthetic-library-failure'); END").unwrap(); }
+        else { store.device_store().unwrap().connection().execute_batch(if phase==1 {
+            "CREATE TEMP TRIGGER reject_device BEFORE INSERT ON device_settings BEGIN SELECT RAISE(ABORT,'synthetic-device-failure'); END"
+        } else {
+            "CREATE TEMP TRIGGER reject_device_outbox BEFORE INSERT ON lww_outbox BEGIN SELECT RAISE(ABORT,'synthetic-device-outbox-failure'); END"
+        }).unwrap(); }
+        assert!(store.lww_commit_replacement_with_device_sections(&header,&stage,Some(&original),&sections.iter().collect::<Vec<_>>()).is_err());
+        assert_eq!(store.revision().unwrap(),if phase==0 {0}else{1});
+        assert_device_restore_label(&store,"old");
+        let reserved=store.lww_clock_state().unwrap().issued.unwrap();
+        assert_eq!(store.device_store().unwrap().connection().query_row("SELECT complete FROM lww_intents WHERE request_id=?1",[&header.request_id],|row|row.get::<_,bool>(0)).unwrap(),false);
+        drop(sections); drop(store);
+        let mut store=PersistentStore::open(dir.path()).unwrap();
+        assert_eq!(store.revision().unwrap(),1); assert_device_restore_label(&store,"frozen");
+        assert_eq!(read_unit(&store.connection,&unit_key(&["future-unit","frozen"]).unwrap()).unwrap().unwrap().1,original.values().next().unwrap().clone());
+        assert_eq!(store.lww_clock_state().unwrap().issued,Some(reserved.clone()));
+        let out=store.lww_read_outbox(0.into(),100).unwrap().entries;
+        assert!(out.iter().all(|entry|entry.stamp==reserved&&entry.version==header.request_id));
+        let sections=full_device_backup(Some("frozen"));
+        assert_eq!(store.lww_commit_replacement_with_device_sections(&header,&stage,Some(&original),&sections.iter().collect::<Vec<_>>()).unwrap().revision,1);
+        assert_eq!(store.device_store().unwrap().connection().query_row("SELECT complete FROM lww_intents WHERE request_id=?1",[&header.request_id],|row|row.get::<_,bool>(0)).unwrap(),true);
+    }
+}
+
+#[test]
+fn full_restore_stale_authority_cannot_replay_device_changes_after_library_activation() {
+    let (_dir,mut store)=store(); write_restore_device_fixture(&mut store,"old");
+    let sections=full_device_backup(Some("frozen")); let stage=restore_stage(&mut store,"frozen");
+    let header=Header{binding_authority:0.into(),request_id:"stale-full-device-restore".into()};
+    let device=store.device_store().unwrap().connection();
+    device.execute_batch("CREATE TEMP TRIGGER reject_device BEFORE INSERT ON device_settings BEGIN SELECT RAISE(ABORT,'synthetic-device-failure'); END").unwrap();
+    assert!(store.lww_commit_replacement_with_device_sections(&header,&stage,None,&sections.iter().collect::<Vec<_>>()).is_err());
+    let device=store.device_store().unwrap().connection();
+    device.execute_batch("DROP TRIGGER reject_device; UPDATE lww_clock SET binding_authority='1'").unwrap();
+    assert!(store.lww_recover_intents().is_err()); assert_device_restore_label(&store,"old");
+    assert_eq!(store.device_store().unwrap().connection().query_row("SELECT complete FROM lww_intents WHERE request_id=?1",[&header.request_id],|row|row.get::<_,bool>(0)).unwrap(),false);
+}
+
+#[test]
+fn full_restore_corrupted_frozen_intent_fails_before_replaying_device_rows() {
+    let (_dir,mut store)=store(); write_restore_device_fixture(&mut store,"old");
+    let sections=full_device_backup(Some("frozen")); let stage=restore_stage(&mut store,"frozen");
+    let header=Header{binding_authority:0.into(),request_id:"corrupted-device-restore".into()};
+    store.device_store().unwrap().connection().execute_batch("CREATE TEMP TRIGGER reject_device BEFORE INSERT ON device_settings BEGIN SELECT RAISE(ABORT,'synthetic-device-failure'); END").unwrap();
+    assert!(store.lww_commit_replacement_with_device_sections(&header,&stage,None,&sections.iter().collect::<Vec<_>>()).is_err());
+    let device=store.device_store().unwrap().connection();
+    device.execute_batch("DROP TRIGGER reject_device").unwrap();
+    let body:String=device.query_row("SELECT body FROM lww_intents WHERE request_id=?1",[&header.request_id],|row|row.get(0)).unwrap();
+    let mut intent:Intent=serde_json::from_str(&body).unwrap();
+    let Intent::Replacement{device_sections:Some(sections),..}=&mut intent else {panic!()};
+    let device_store::sections::SectionValueRow::Hypa{model,..}=&mut sections.hypa[0].value else {panic!()};
+    *model="corrupted".into();
+    device.execute("UPDATE lww_intents SET body=?1 WHERE request_id=?2",params![serde_json::to_string(&intent).unwrap(),header.request_id]).unwrap();
+    assert!(store.lww_recover_intents().is_err()); assert_device_restore_label(&store,"old");
+    assert_eq!(store.revision().unwrap(),1);
+    assert_eq!(store.device_store().unwrap().connection().query_row("SELECT complete FROM lww_intents WHERE request_id=?1",[&header.request_id],|row|row.get::<_,bool>(0)).unwrap(),false);
+}
+
+#[test]
+fn full_restore_disabled_plugin_local_queues_one_stamp_and_enable_preserves_restored_values() {
+    let (_dir,mut store)=store(); write_restore_device_fixture(&mut store,"old");
+    let key=unit_key(&["plugin-local","orphan","string","shared-key"]).unwrap();
+    let remote=Change{key:key.clone(),stamp:Stamp{physical_ms:(store.lww_clock_state().unwrap().issued.unwrap().physical_ms.0+1).into(),logical:0,writer_id:stamp(1).writer_id},value:inline(&serde_json::json!("received-disabled")).unwrap()};
+    receive(&mut store,"disabled-before-restore",vec![remote.clone()],vec![]);
+    let device=store.device_store().unwrap().connection();
+    let unit_before=read_unit(device,&key).unwrap().unwrap();
+    let sections=full_device_backup(Some("restored-off")); let stage=restore_stage(&mut store,"restored-off");
+    let header=Header{binding_authority:0.into(),request_id:"off-full-device-restore".into()};
+    store.lww_commit_replacement_with_device_sections(&header,&stage,None,&sections.iter().collect::<Vec<_>>()).unwrap();
+    assert_device_restore_label(&store,"restored-off");
+    let device=store.device_store().unwrap().connection();
+    let restored=read_unit(device,&key).unwrap().unwrap();
+    assert!(restored.0>unit_before.0);
+    assert_eq!(restored.1,inline(&serde_json::json!("restored-off")).unwrap());
+    let pending: Vec<(String,String,String)>=device.prepare("SELECT key,stamp,version FROM lww_outbox WHERE json_extract(key,'$[0]')='plugin-local' ORDER BY key").unwrap().query_map([],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap().collect::<Result<_,_>>().unwrap();
+    assert_eq!(pending.len(),2);
+    assert!(pending.iter().all(|(_,stamp,version)|*stamp==serde_json::to_string(&restored.0).unwrap()&&*version==header.request_id));
+    assert!(store.lww_read_outbox(0.into(),100).unwrap().entries.iter().all(|entry|entry.key.components()[0]!="plugin-local"));
+    store.device_store_mut().unwrap().set_section_participating(device_store::Section::LocalPlugins,true).unwrap();
+    assert_device_restore_label(&store,"restored-off");
+    assert_eq!(read_unit(store.device_store().unwrap().connection(),&key).unwrap().unwrap(),restored);
+    assert_eq!(store.lww_read_outbox(0.into(),100).unwrap().entries.iter().filter(|entry|entry.key.components()[0]=="plugin-local"&&entry.stamp==restored.0&&entry.version==header.request_id).count(),2);
+    receive(&mut store,"later-remote-plugin",vec![Change{key:key.clone(),stamp:Stamp{physical_ms:(restored.0.physical_ms.0+1).into(),logical:0,writer_id:remote.stamp.writer_id},value:inline(&serde_json::json!("later-remote")).unwrap()}],vec![]);
+    assert_eq!(store.device_store().unwrap().connection().query_row("SELECT value FROM plugin_device_storage WHERE owner='orphan' AND space='string' AND key='shared-key'",[],|row|row.get::<_,String>(0)).unwrap(),"later-remote");
+}
+
+#[test]
+fn full_restore_unchanged_device_values_keep_original_stamps_and_emit_no_device_entries() {
+    let (_dir,mut store)=store(); write_restore_device_fixture(&mut store,"same"); clear_outbox(&mut store);
+    let keys=[unit_key(&["hypa",&"a".repeat(64)]).unwrap(),unit_key(&["plugin-local","orphan","string","shared-key"]).unwrap()];
+    let before:Vec<_>=keys.iter().map(|key|read_unit(store.device_store().unwrap().connection(),key).unwrap()).collect();
+    let sections=full_device_backup(Some("same")); let stage=restore_stage(&mut store,"device-no-op");
+    let header=Header{binding_authority:0.into(),request_id:"same-full-device-restore".into()};
+    store.lww_commit_replacement_with_device_sections(&header,&stage,None,&sections.iter().collect::<Vec<_>>()).unwrap();
+    let after:Vec<_>=keys.iter().map(|key|read_unit(store.device_store().unwrap().connection(),key).unwrap()).collect();
+    assert_eq!(before,after);
+    assert_eq!(store.device_store().unwrap().connection().query_row("SELECT count(*) FROM lww_outbox WHERE version=?1",[&header.request_id],|row|row.get::<_,i64>(0)).unwrap(),0);
+    assert_device_restore_label(&store,"same");
+}
+
+#[test]
+fn full_restore_disabled_receive_without_later_local_edit_reprojects_on_enable() {
+    let (_dir,mut store)=store();
+    let remote=change(&["plugin-local","orphan","string","received"],1,serde_json::json!("remote-only"));
+    receive(&mut store,"disabled-no-local-edit",vec![remote.clone()],vec![]);
+    assert!(store.device_store().unwrap().list_plugin_device_storage().unwrap().is_empty());
+    let clock=store.lww_clock_state().unwrap().issued;
+    store.device_store_mut().unwrap().set_section_participating(device_store::Section::LocalPlugins,true).unwrap();
+    assert_eq!(store.lww_clock_state().unwrap().issued,clock);
+    assert_eq!(read_unit(store.device_store().unwrap().connection(),&remote.key).unwrap().unwrap(),(remote.stamp,remote.value));
+    assert_eq!(store.device_store().unwrap().connection().query_row("SELECT value FROM plugin_device_storage WHERE owner='orphan' AND key='received'",[],|row|row.get::<_,String>(0)).unwrap(),"remote-only");
+    assert!(store.lww_read_outbox(0.into(),100).unwrap().entries.is_empty());
+}
+
 #[test]
 fn commit_intent_replays_once_after_restart() {
     let (dir, mut store) = store();
