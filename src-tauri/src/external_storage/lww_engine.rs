@@ -285,7 +285,7 @@ impl ExternalLwwEngine {
             .ok_or_else(|| ProviderError::new(ErrorKind::ClockSkew))?
             .upper()
     }
-    fn intent(&self, id: &str, role: ObjectRole, bytes: &[u8]) -> ObjectIntent {
+    pub(super) fn intent(&self, id: &str, role: ObjectRole, bytes: &[u8]) -> ObjectIntent {
         ObjectIntent {
             job_id: self.library.clone(),
             repository_id: self.repository.repository_id.clone(),
@@ -1000,18 +1000,15 @@ impl ExternalLwwEngine {
         inspection: &str,
         cancel: &Cancellation,
     ) -> Result<crate::persistent_store::lww::BindingUnitStage> {
-        let segments = self.verified_segments(store, true, cancel).await?;
-        let mut winners = BTreeMap::new();
-        for segment in segments {
-            for change in segment.changes {
-                segment::merge(&mut winners, change)?;
-            }
-        }
+        let directory=tempfile::tempdir().map_err(transient)?;
+        let mut published=self.published_state(directory.path(),cancel).await?;
+        published.require_complete()?;
+        self.stage_published_objects(store,&mut published,directory.path(),cancel).await?;
         store
             .lww_stage_binding_units(
                 header,
                 inspection,
-                &winners.into_values().collect::<Vec<_>>(),
+                &published.catalog.changes()?,
                 DecimalU64(
                     self.admitted_upper()?
                         .checked_add(300_000)
@@ -1028,7 +1025,8 @@ impl ExternalLwwEngine {
         cancel: &Cancellation,
     ) -> Result<crate::persistent_store::lww::NewDevicePreparation> {
         self.settle_publication(store, cancel).await?;
-        self.verified_segments(store, true, cancel).await?;
+        let directory=tempfile::tempdir().map_err(transient)?;
+        self.published_state(directory.path(),cancel).await?.require_complete()?;
         let preparation = store
             .prepare_lww_new_device(header, staging)
             .map_err(store_error)?;
@@ -1042,6 +1040,30 @@ impl ExternalLwwEngine {
         authority: DecimalU64,
         cancel: &Cancellation,
     ) -> Result<Vec<StageReceive>> {
+        let progress=store.lww_receive_progress(authority).map_err(store_error)?;
+        let current=progress.into_iter().filter(|p|p.kind=="external").filter_map(|p|p.writer_id.map(|w|(w,p.cursor))).collect::<BTreeMap<_,_>>();
+        let mut behind=false;
+        for receipt in self.snapshot_listing(cancel).await? {
+            let (_,snapshot)=self.checkpoint(&receipt,cancel).await?;
+            if snapshot.covered_prefixes.iter().any(|(writer,prefix)|current.get(writer).copied().unwrap_or(DecimalU64(0))<*prefix) {behind=true;}
+        }
+        if behind {
+            let directory=tempfile::tempdir().map_err(transient)?;
+            let mut state=self.published_state(directory.path(),cancel).await?;
+            self.stage_published_objects(store,&mut state,directory.path(),cancel).await?;
+            let changes=state.catalog.changes()?;
+            let identity=state.catalog.identity()?;
+            let mut requests=Vec::new();
+            for (writer,prefix) in &state.catalog.coverage {
+                if current.get(writer).copied().unwrap_or(DecimalU64(0))>=*prefix {continue;}
+                requests.push(store.external_lww_stable_receive(StageReceive {
+                    header:Header{binding_authority:authority,request_id:format!("external-snapshot-{}-{}-{}-{}",authority.0,identity,writer,prefix.0)},
+                    changes:changes.clone(), progress:Progress{kind:"external".into(),cursor:*prefix,writer_id:Some(writer.clone())},
+                    admitted_time_upper_ms:DecimalU64(self.admitted_upper()?.checked_add(300_000).ok_or_else(segment::corrupt)?),
+                }).map_err(store_error)?);
+            }
+            return Ok(requests);
+        }
         let segments = self.verified_segments(store, false, cancel).await?;
         segments
             .into_iter()

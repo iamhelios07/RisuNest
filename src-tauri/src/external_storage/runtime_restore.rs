@@ -13,7 +13,6 @@ use crate::persistent_store::{
     external_apply::{ExternalSnapshotApplication, ExternalSnapshotObject, ExternalSnapshotRecord},
     PersistentStore, StoreError,
 };
-use risunest_external_storage_format::section::SectionKind;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::BTreeSet, path::Path};
@@ -130,57 +129,18 @@ fn decode_hash(value: &str) -> Result<[u8; 32]> {
         .ok_or_else(corrupt)
 }
 
-/// A bundle declares what it covers, and a restore asks for a subset of that.
-/// An area the request does not name is left alone on this device, and an
-/// unknown one is rejected rather than quietly narrowed.
-fn restore_selection(restore_areas: Option<&[String]>) -> Result<RestoreSelection> {
-    let defaults;
-    let areas = match restore_areas {
-        Some(areas) => areas,
-        None => {
-            defaults = vec!["library".to_owned(), "referencedAssets".to_owned()];
-            &defaults
-        }
-    };
-    let unique = areas.iter().collect::<BTreeSet<_>>();
-    if unique.len() != areas.len() {
-        return Err(corrupt());
+const FULL_RESTORE_AREAS: [&str;5]=["library","referencedAssets","hypa","local-plugins","local-settings"];
+fn restore_selection(restore_areas:Option<&[String]>)->Result<RestoreSelection> {
+    if let Some(areas)=restore_areas {
+        let unique=areas.iter().map(String::as_str).collect::<BTreeSet<_>>();
+        if unique.len()!=areas.len() || unique!=FULL_RESTORE_AREAS.into_iter().collect() {return Err(corrupt());}
     }
-    let library_areas = ["library", "referencedAssets"];
-    let mut sections = BTreeSet::new();
-    for area in areas {
-        if library_areas.contains(&area.as_str()) {
-            continue;
-        }
-        sections.insert(SectionKind::parse(area).map_err(|_| corrupt())?.id().to_owned());
-    }
-    let library = areas
-        .iter()
-        .any(|area| library_areas.contains(&area.as_str()));
-    if !library {
-        return Err(corrupt());
-    }
-    Ok(RestoreSelection { library, sections })
+    Ok(RestoreSelection{library:true,sections:BTreeSet::from(["hypa".into(),"local-plugins".into(),"local-settings".into()])})
 }
-
-/// Local settings belong to the device that wrote them, so only that device's
-/// own backup may bring them back. Published states and another device's
-/// bundles are refused here rather than at the screen, because the request
-/// names the areas and the screen is not the only caller.
-fn require_restorable_sections(
-    selection: &RestoreSelection,
-    snapshot: &PreparedRemoteSnapshot,
-    store_id: &str,
-) -> Result<()> {
-    if !selection.sections.contains(SectionKind::LocalSettings.id()) {
-        return Ok(());
-    }
-    if store_id.is_empty() || snapshot.captured_by_device.as_deref() != Some(store_id) {
-        return Err(ProviderError::new(ErrorKind::PreconditionFailed));
-    }
+fn require_restorable_sections(_selection:&RestoreSelection,snapshot:&PreparedRemoteSnapshot,_store_id:&str)->Result<()> {
+    if snapshot.captured_by_device.as_deref().is_none_or(str::is_empty) {return Err(ProviderError::new(ErrorKind::PreconditionFailed));}
     Ok(())
 }
-
 fn checked_required_bytes(
     snapshot: &PreparedRemoteSnapshot,
     selection: &RestoreSelection,
@@ -540,42 +500,15 @@ mod tests {
     }
 
     #[test]
-    fn restore_area_selection_matches_the_renderer_contract() {
-        assert_eq!(
-            restore_selection(None).unwrap(),
-            RestoreSelection {
-                library: true,
-                sections: BTreeSet::new()
-            }
-        );
-        assert_eq!(
-            restore_selection(Some(&["referencedAssets".into()])).unwrap(),
-            RestoreSelection {
-                library: true,
-                sections: BTreeSet::new()
-            }
-        );
-        assert_eq!(
-            restore_selection(Some(&["library".into(), "hypa".into(), "local-settings".into()]))
-                .unwrap(),
-            RestoreSelection {
-                library: true,
-                sections: BTreeSet::from(["hypa".to_owned(), "local-settings".to_owned()])
-            }
-        );
+    fn restore_area_selection_matches_the_full_renderer_contract() {
+        let areas=FULL_RESTORE_AREAS.map(str::to_owned);
+        assert_eq!(restore_selection(None).unwrap(),restore_selection(Some(&areas)).unwrap());
+        assert_eq!(restore_selection(None).unwrap().sections.len(),3);
     }
-
-    /// A bundle declares what it covers. Asking for coverage it does not
-    /// declare fails rather than restoring a narrowed selection.
     #[test]
-    fn restore_area_selection_rejects_duplicates_and_undeclared_areas() {
-        assert!(restore_selection(Some(&["library".into(), "library".into()])).is_err());
-        assert!(restore_selection(Some(&["devicePlugins".into()])).is_err());
-        assert!(restore_selection(Some(&["deviceSettings".into()])).is_err());
-        assert!(restore_selection(Some(&["hypa".into()])).is_err());
-        assert!(restore_selection(Some(&[])).is_err());
+    fn restore_area_selection_rejects_partial_duplicate_and_undeclared_areas() {
+        for areas in [vec!["library".into()],vec!["hypa".into()],vec!["devicePlugins".into()],vec!["library".into(),"library".into()],vec![]] {assert!(restore_selection(Some(&areas)).is_err());}
     }
-
     fn prepared(captured_by_device: Option<&str>) -> PreparedRemoteSnapshot {
         PreparedRemoteSnapshot {
             snapshot_id: "synthetic-snapshot".into(),
@@ -590,39 +523,13 @@ mod tests {
         }
     }
 
-    /// Invariant 32 on the restore side. Local settings belong to the device
-    /// that wrote them, so only that device's own backup installs them. Another
-    /// device's backup and a published state are refused even when the request
-    /// names the area, and the areas beside them are unaffected.
     #[test]
-    fn another_devices_backup_does_not_install_local_settings() {
-        let areas = [
-            "library".to_owned(),
-            "hypa".to_owned(),
-            "local-settings".to_owned(),
-        ];
-        let selection = restore_selection(Some(&areas)).unwrap();
-        assert!(require_restorable_sections(&selection, &prepared(Some("this-device")), "this-device").is_ok());
-        assert!(require_restorable_sections(
-            &selection,
-            &prepared(Some("other-device")),
-            "this-device"
-        )
-        .is_err());
-        assert!(require_restorable_sections(&selection, &prepared(None), "this-device").is_err());
-        assert!(require_restorable_sections(&selection, &prepared(Some("")), "").is_err());
-
-        let without = ["library".to_owned(), "hypa".to_owned(), "local-plugins".to_owned()];
-        let selection = restore_selection(Some(&without)).unwrap();
-        assert!(require_restorable_sections(&selection, &prepared(None), "this-device").is_ok());
-        assert!(require_restorable_sections(
-            &selection,
-            &prepared(Some("other-device")),
-            "this-device"
-        )
-        .is_ok());
+    fn complete_backup_restores_device_sections_across_devices_but_periodic_state_does_not() {
+        let selection=restore_selection(None).unwrap();
+        assert!(require_restorable_sections(&selection,&prepared(Some("other-device")),"this-device").is_ok());
+        assert!(require_restorable_sections(&selection,&prepared(None),"this-device").is_err());
+        assert!(require_restorable_sections(&selection,&prepared(Some("")),"this-device").is_err());
     }
-
     #[test]
     fn library_restore_marker_recovers_only_the_exact_durable_request() {
         let root = tempfile::tempdir().unwrap();

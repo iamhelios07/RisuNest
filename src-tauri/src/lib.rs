@@ -651,6 +651,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         external_storage::lww_commands::external_lww_stage_binding,
         external_storage::lww_commands::external_lww_publish,
         external_storage::lww_commands::external_lww_receive,
+        external_storage::lww_commands::external_lww_maintenance,
         external_storage::lww_commands::external_lww_fence,
         external_storage::lww_commands::external_lww_resume,
         external_storage::lww_commands::external_lww_prepare_new_device,
