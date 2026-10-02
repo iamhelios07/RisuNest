@@ -964,6 +964,103 @@ fn production_cycle_counters_record_actual_hash_inputs_and_completed_native_rece
 }
 
 #[test]
+fn actual_append_cycle_tracks_control_files_without_opening_known_asset_bodies() {
+    use crate::{
+        asset_repository::body_io::{
+            register_object_purpose, reset_body_io, take_body_io, BodyPurpose,
+        },
+        persistent_store::ConversationMutation,
+    };
+    let server = LocalServerFixture::new();
+    let (_a, mut source) = local();
+    let (_b, mut target) = local();
+    let a = server.client(&source);
+    let b = server.client(&target);
+    save(
+        &mut source,
+        &["exists", "character", "char"],
+        serde_json::json!({"type":"character"}),
+    );
+    save(
+        &mut source,
+        &["exists", "conversation", "char", "chat"],
+        serde_json::json!(true),
+    );
+    let asset = put_asset(
+        &mut source,
+        "assets/known-body.png",
+        &vec![42; 128 * 1024 + 17],
+    )
+    .object_hash
+    .unwrap();
+    source
+        .commit(&WorkingSetCommit {
+            expected_revision: source.revision().unwrap(),
+            conversations: Some(vec![ConversationMutation::ReplaceRange {
+            character_id: "char".into(), conversation_id: "chat".into(),
+            start: 0, delete_count: 0,
+            messages: (0..64).map(|index| serde_json::json!({
+                "role":"user", "data":"s".repeat(9000), "chatId":format!("message-{index}")
+            })).collect(),
+            conversation: None, configured_index: None,
+        }]),
+            ..Default::default()
+        })
+        .unwrap();
+    drain_publications(&a, &mut source, &[]).unwrap();
+    receive_available(&b, &mut target, &[]).unwrap();
+    target.hydrate_registered_remote_assets(|| Ok(())).unwrap();
+
+    reset_body_io();
+    register_object_purpose(&asset, BodyPurpose::Asset);
+    source.commit(&WorkingSetCommit {
+        expected_revision: source.revision().unwrap(),
+        conversations: Some(vec![ConversationMutation::ReplaceRange {
+            character_id: "char".into(), conversation_id: "chat".into(),
+            start: 64, delete_count: 0,
+            messages: vec![serde_json::json!({"role":"user","data":"appended".repeat(9 * 1024),"chatId":"preserved-new-id"})],
+            conversation: None, configured_index: None,
+        }]),
+        ..Default::default()
+    }).unwrap();
+    assert!(publish_cycle(&a, &mut source, &[]).unwrap().is_some());
+    let received = receive_cycle(&b, &mut target, &[]).unwrap();
+    let observed = take_body_io();
+    assert!(observed.complete(), "{observed:#?}");
+    let controls = observed
+        .objects
+        .values()
+        .filter(|object| {
+            object.purposes.contains(&BodyPurpose::Control)
+                && !object.purposes.contains(&BodyPurpose::Asset)
+        })
+        .collect::<Vec<_>>();
+    assert!(controls.iter().map(|object| object.work.opens).sum::<u64>() > 0);
+    assert!(
+        controls
+            .iter()
+            .map(|object| object.work.read_bytes)
+            .sum::<u64>()
+            > super::cache::SMALL_OBJECT_BYTES as u64
+    );
+    let known_asset = observed.objects.get(&asset).unwrap();
+    assert!(known_asset.purposes.contains(&BodyPurpose::Asset));
+    assert_eq!(known_asset.work.open_attempts, 0);
+    assert_eq!(known_asset.work.read_bytes, 0);
+    assert!(received
+        .result
+        .affected_keys
+        .contains(&UnitKey::new(&["messages", "char", "chat"]).unwrap()));
+    let value = target
+        .read_conversation("char", "chat", None)
+        .unwrap()
+        .unwrap()
+        .value;
+    assert_eq!(value["message"].as_array().unwrap().len(), 65);
+    assert_eq!(value["message"][64]["chatId"], "preserved-new-id");
+}
+
+#[test]
 fn a_new_target_initialization_preserves_received_issuers_under_its_authenticated_publisher() {
     let old_target = LocalServerFixture::new();
     let new_target = LocalServerFixture::new();

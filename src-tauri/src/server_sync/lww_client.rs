@@ -191,6 +191,37 @@ fn now_ms() -> Result<u64> {
     )
     .map_err(|_| SyncError::new("clock-overflow", 409))
 }
+#[cfg(test)]
+fn observe_dependency_purposes(key: &risunest_sync_wire::unit::UnitKey, hashes: &[String]) {
+    use crate::asset_repository::body_io::{register_object_purpose, BodyPurpose};
+    let purpose = match key.components()[0].as_str() {
+        "messages" => BodyPurpose::Control,
+        "archive" => BodyPurpose::Asset,
+        _ => return,
+    };
+    for hash in hashes {
+        register_object_purpose(hash, purpose);
+    }
+}
+#[cfg(test)]
+fn observe_descriptor_purposes(
+    key: &risunest_sync_wire::unit::UnitKey,
+    descriptor_hash: &str,
+    descriptor: &risunest_sync_wire::descriptor::RecordDescriptor,
+) {
+    use crate::asset_repository::body_io::{register_object_purpose, BodyPurpose};
+    register_object_purpose(descriptor_hash, BodyPurpose::Control);
+    if matches!(key.components()[0].as_str(), "messages" | "archive") {
+        register_object_purpose(&descriptor.object_hash, BodyPurpose::Control);
+    }
+    observe_dependency_purposes(key, &descriptor.dependencies);
+    for root in [&descriptor.dependency_root, &descriptor.relation_root]
+        .into_iter()
+        .flatten()
+    {
+        register_object_purpose(root, BodyPurpose::Control);
+    }
+}
 pub(crate) struct LwwClient {
     pub client: ServerClient,
     pub log: OperationLog,
@@ -415,6 +446,8 @@ impl LwwClient {
                 descriptor,
             } = &entry.value
             {
+                #[cfg(test)]
+                observe_descriptor_purposes(&entry.key, descriptor_hash, descriptor);
                 let bytes = canonical::encode(descriptor)?;
                 if cache.put(&bytes)? != *descriptor_hash {
                     return Err(SyncError::new("descriptor-integrity", 409));
@@ -428,6 +461,11 @@ impl LwwClient {
                 {
                     let mut pending = vec![root.clone()];
                     while let Some(hash) = pending.pop() {
+                        #[cfg(test)]
+                        crate::asset_repository::body_io::register_object_purpose(
+                            &hash,
+                            crate::asset_repository::body_io::BodyPurpose::Control,
+                        );
                         if !objects.insert(hash.clone()) {
                             continue;
                         }
@@ -445,6 +483,8 @@ impl LwwClient {
                                 children,
                             } => pending.extend(children),
                             risunest_sync_wire::descriptor::ReferencePage::Objects { hashes } => {
+                                #[cfg(test)]
+                                observe_dependency_purposes(&entry.key, &hashes);
                                 objects.extend(hashes)
                             }
                             risunest_sync_wire::descriptor::ReferencePage::Relations { .. } => (),
@@ -462,6 +502,11 @@ impl LwwClient {
                     .map_err(|_| SyncError::new("invalid-alias", 409))?;
                     if let Some(hash) = value.get("objectHash").and_then(|v| v.as_str()) {
                         risunest_sync_wire::validate_hash(hash)?;
+                        #[cfg(test)]
+                        crate::asset_repository::body_io::register_object_purpose(
+                            hash,
+                            crate::asset_repository::body_io::BodyPurpose::Asset,
+                        );
                         objects.insert(hash.into());
                     }
                 }
@@ -1052,6 +1097,8 @@ impl LwwClient {
                 descriptor,
             } = &change.value
             {
+                #[cfg(test)]
+                observe_descriptor_purposes(&change.key, descriptor_hash, descriptor);
                 let body = canonical::encode(descriptor)?;
                 #[cfg(test)]
                 super::hash_metrics::record("c_descriptor_verify", body.len());
@@ -1076,6 +1123,8 @@ impl LwwClient {
                 {
                     let dependencies =
                         transfer.download_reference_tree(vec![(root.clone(), vec![])])?;
+                    #[cfg(test)]
+                    observe_dependency_purposes(&change.key, &dependencies);
                     if change.key.components()[0] == "messages" {
                         controls.extend(dependencies);
                     } else {
@@ -1084,6 +1133,11 @@ impl LwwClient {
                     let mut pending = vec![root.clone()];
                     let mut seen = BTreeSet::new();
                     while let Some(hash) = pending.pop() {
+                        #[cfg(test)]
+                        crate::asset_repository::body_io::register_object_purpose(
+                            &hash,
+                            crate::asset_repository::body_io::BodyPurpose::Control,
+                        );
                         if !seen.insert(hash.clone()) {
                             continue;
                         }
@@ -1108,6 +1162,11 @@ impl LwwClient {
                     .map_err(|_| SyncError::new("invalid-alias", 409))?;
                     if let Some(hash) = value.get("objectHash").and_then(|v| v.as_str()) {
                         risunest_sync_wire::validate_hash(hash)?;
+                        #[cfg(test)]
+                        crate::asset_repository::body_io::register_object_purpose(
+                            hash,
+                            crate::asset_repository::body_io::BodyPurpose::Asset,
+                        );
                         remote.insert(hash.into());
                     }
                 }
