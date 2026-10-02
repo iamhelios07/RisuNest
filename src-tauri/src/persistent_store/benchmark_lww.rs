@@ -18,7 +18,6 @@ mod final_runner;
 #[path = "../../../benchmarks/lww-native/src/fixture_configuration.rs"]
 mod fixture_configuration;
 
-
 use super::{lww::{self, MessageLocator, UnitMutation}, sync_selection::{SwitchBindingRequest, SyncTarget},
     ConversationMutation, PersistentStore, WorkingSetCommit};
 use crate::{external_storage::{contract::Cancellation, lww_tests::CycleFixture, lww_segment},
@@ -230,7 +229,11 @@ fn body_domain(work:crate::asset_repository::body_io::BodyWork) -> BodyDomain {
         unknown_open_results:work.unknown_open_results, read_operations:work.read_operations,
         read_bytes:work.read_bytes, incomplete_reads:work.incomplete_reads,
         escaped_handles:work.escaped_handles, escaped_paths:work.escaped_paths,
-        outstanding_readers:work.outstanding_readers}
+        outstanding_readers:work.outstanding_readers,
+        identity_metadata_open_attempts:work.identity_metadata_open_attempts,
+        identity_metadata_opens:work.identity_metadata_opens,
+        identity_metadata_failed_opens:work.identity_metadata_failed_opens,
+        verified_identity_metadata_opens:work.verified_identity_metadata_opens}
 }
 
 fn require_routine_observation(observation:&NativeObservation, transport:&str,
@@ -935,7 +938,7 @@ fn write_samples(directory:&Path, samples:&[NativeSample],attributions:&[PairAtt
                 "asset":"actual asset-purpose object IO, including mixed asset/control objects",
                 "control":"exclusively actual control-purpose object IO",
                 "unknown":"unclassified canonical object IO; invalidates samples",
-                "owned":"staging/import CAS body IO without per-object role coverage; any nonzero work invalidates these fixed routine samples",
+                "owned":"exclusive Control identity-metadata opens only: per-object/domain attempts, successes and verified proofs equal; zero reads/errors/escapes/pending work; all contributions conserved",
                 "inventory":"actual fixture asset aliases checked against persisted catalog during excluded setup, re-registered after every reset"},
             "key_semantics":{
                 "local_http_emitted":"immutable body submitted to /push, including dominated submissions",
@@ -1400,44 +1403,40 @@ fn additional_native_adapters_use_real_external_cycle_in_both_directions() {
 }
 
 #[test]
-fn final_native_local_adapters_keep_unknown_owned_staging_fail_closed() {
+fn final_native_local_adapters_prove_owned_identity_metadata_in_fixed_pairs() {
     let _entry=collect_final_local;
-    let mut driver=ServerDriver::prepare(FixtureScale::small());
-    driver.a.commit(&WorkingSetCommit {expected_revision:driver.a.revision().unwrap(),
-        unit_mutations:Some(vec![UnitMutation::Set {key:UnitKey::new(&["root","selectedPersona"]).unwrap(),
-            value:json!("synthetic-persona-0")}]),..Default::default()}).unwrap();
-    server_sync::lww_tests::publish_cycle(&driver.ca,&mut driver.a,&[]).unwrap().unwrap();
-    server_sync::lww_tests::receive_cycle(&driver.cb,&mut driver.b,&[]).unwrap();
-    for &scenario in final_runner::AVAILABLE {
-        for direction in [final_runner::Direction::AtoB,final_runner::Direction::BtoA] {
-            let (source,destination,sender,receiver)=match direction {
-                final_runner::Direction::AtoB=>(&mut driver.a,&mut driver.b,&driver.ca,&driver.cb),
-                final_runner::Direction::BtoA=>(&mut driver.b,&mut driver.a,&driver.cb,&driver.ca)};
-            let sample=final_server_cycle(source,destination,sender,receiver,&driver.asset_hashes,scenario,direction,0,true).unwrap();
-            if sample.observation.body_owned_work!=BodyDomain::default() {
-                if matches!(scenario,measurement::Scenario::MiddleEdit) && matches!(direction,final_runner::Direction::AtoB) {
-                    eprintln!("M-OWNED-CONTROL-DIAGNOSTIC {}",serde_json::to_string(&json!({
-                        "status":"INVALID","scenario":scenario,"direction":direction,"body_scope_complete":sample.observation.body_scope_complete,
-                        "domains":sample.observation.body_domains,"objects":sample.observation.body_objects,
-                        "owned_total":sample.observation.body_owned_work,"control_total":sample.observation.body_control_work,
-                        "asset_total":sample.observation.body_asset_work,"unknown_total":sample.observation.body_unknown_work,
-                        "unattributed_owned":sample.observation.body_unattributed_owned,
-                        "pending_owned_identities":sample.observation.body_pending_owned_identities})).unwrap());
-                }
-                assert!(sample.validate().unwrap_err().contains("CAS body scope"));
-                assert_eq!(sample.observation.body_scope_complete,Some(true));
-                assert_eq!(sample.observation.body_unknown_work,BodyDomain::default());
-                assert_eq!(sample.observation.body_asset_work,BodyDomain::default());
-            } else {
+    let mut by_scale=Vec::new();
+    for scale in frozen_small_scales() {
+        let mut driver=ServerDriver::prepare(scale);
+        driver.a.commit(&WorkingSetCommit {expected_revision:driver.a.revision().unwrap(),
+            unit_mutations:Some(vec![UnitMutation::Set {key:UnitKey::new(&["root","selectedPersona"]).unwrap(),
+                value:json!("synthetic-persona-0")}]),..Default::default()}).unwrap();
+        server_sync::lww_tests::publish_cycle(&driver.ca,&mut driver.a,&[]).unwrap().unwrap();
+        server_sync::lww_tests::receive_cycle(&driver.cb,&mut driver.b,&[]).unwrap();
+        let mut samples=Vec::new();
+        for &scenario in final_runner::AVAILABLE {
+            for direction in [final_runner::Direction::AtoB,final_runner::Direction::BtoA] {
+                let (source,destination,sender,receiver)=match direction {
+                    final_runner::Direction::AtoB=>(&mut driver.a,&mut driver.b,&driver.ca,&driver.cb),
+                    final_runner::Direction::BtoA=>(&mut driver.b,&mut driver.a,&driver.cb,&driver.ca)};
+                let sample=final_server_cycle(source,destination,sender,receiver,&driver.asset_hashes,scenario,direction,0,true).unwrap();
                 sample.validate().unwrap_or_else(|reason|panic!("{scenario:?}/{direction:?}: {reason}; {}",
                     serde_json::to_string(&sample.observation).unwrap()));
+                samples.push(sample);
             }
-            assert!(sample.observation.hash_totals().unwrap().calls>0);
-            assert!(sample.observation.requests>0);
         }
+        by_scale.push(samples);
     }
+    let proofs=by_scale[0].iter().zip(&by_scale[1]).map(|(a,b)| {
+        assert_eq!(a.selected_keys,b.selected_keys);assert_eq!(a.emitted_keys,b.emitted_keys);
+        assert_eq!(a.accepted_winner_keys,b.accepted_winner_keys);assert_eq!(a.affected_keys,b.affected_keys);
+        native_observation::assert_frozen_growth(&a.observation,&b.observation).unwrap()
+    }).collect::<Vec<_>>();
+    assert!(by_scale.iter().flatten().any(|sample|sample.observation.body_owned_work.opens>0),
+        "actual verified identity-only owned opens must be exercised");
+    eprintln!("M-OWNED-IDENTITY-PAIR-DIAGNOSTIC {}",serde_json::to_string(&json!({
+        "status":"CORRECTNESS_ONLY","accepted_measurement":false,"actual_samples":by_scale,"proofs":proofs})).unwrap());
 }
-
 #[test]
 fn final_native_resume_reopens_same_registration_and_receives_only_missed_units() {
     let mut driver=ServerDriver::prepare(FixtureScale::small());
