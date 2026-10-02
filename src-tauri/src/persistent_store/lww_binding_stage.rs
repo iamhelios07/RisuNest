@@ -2,7 +2,7 @@ use super::{
     error, is_device, parent_status, projection, put_unit, validate_header, verify, wire, Change,
     DecimalU64, Header, PersistentStore, StoreResult, UnitValue,
 };
-use crate::persistent_store::{commit, message_pages, schema, GENERATION_TABLES};
+use crate::persistent_store::{message_pages, schema, GENERATION_TABLES};
 use risunest_sync_wire::{
     canonical,
     descriptor::{ReferencePage, MAX_DESCRIPTOR_REFERENCES, MAX_TREE_DEPTH},

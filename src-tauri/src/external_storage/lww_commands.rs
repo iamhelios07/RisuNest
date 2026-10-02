@@ -71,11 +71,13 @@ async fn open(app: &AppHandle, id: &str, session: &mut Session) -> Result<()> {
         session.engine = Some(ExternalLwwEngine {
             provider: connected.provider,
             repository: connected.handle,
-            library: connected.stored.descriptor.repository_id,
+            library: connected.stored.descriptor.repository_id.clone(),
             root_key: connected.root_key,
             admission: None,
             connection_id: id.into(),
             connection_root: runtime::root(app)?,
+            capabilities: connected.stored.capabilities,
+            descriptor: connected.stored.descriptor,
         });
     }
     let engine = session.engine.as_mut().ok_or_else(lww_segment::corrupt)?;
@@ -130,6 +132,14 @@ fn check(
     selected: bool,
 ) -> Result<crate::persistent_store::PersistentStore> {
     let store = runtime::native_store(app)?;
+    check_store(&store, request, selected)?;
+    Ok(store)
+}
+fn check_store(
+    store: &crate::persistent_store::PersistentStore,
+    request: &Request,
+    selected: bool,
+) -> Result<()> {
     if store
         .lww_binding_authority()
         .map_err(runtime::local_error)?
@@ -146,7 +156,7 @@ fn check(
     {
         return Err(ProviderError::new(ErrorKind::Cancelled));
     }
-    Ok(store)
+    Ok(())
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -268,10 +278,13 @@ pub(crate) async fn external_lww_publish(
     request: Request,
     initial: bool,
 ) -> Result<PublicationResult> {
+    let state = app.state::<crate::persistent_store::PersistentStoreState>();
+    let _operation = state.admit_renderer_operation().map_err(runtime::local_error)?;
     let context = context(&request.connection_id)?;
     let mut session = context.session.lock().await;
     open(&app, &request.connection_id, &mut session).await?;
-    let mut store = check(&app, &request, true)?;
+    let mut store = state.open_admitted_native_job_store(&_operation).map_err(runtime::local_error)?;
+    check_store(&store, &request, true)?;
     if let Some(target) = &request.exit_target {
         let identity = store.external_identity().map_err(runtime::local_error)?;
         if identity.library_epoch != target.library_epoch
@@ -353,25 +366,33 @@ pub(crate) async fn external_lww_maintenance(app:AppHandle,request:Request)->Res
     let engine=session.engine.as_ref().ok_or_else(lww_segment::corrupt)?;
     let segments=engine.listing(&cancel).await?;
     let snapshots=engine.snapshot_listing(&cancel).await?;
-    if segments.len()<100 && segments.iter().map(|r|r.byte_length).sum::<u64>()<64*1024*1024 && snapshots.len()<2 {return Ok(None)};
+    let compact=segments.len()>=100 || segments.iter().map(|r|r.byte_length).sum::<u64>()>=64*1024*1024 || snapshots.len()>=2;
     let root=runtime::root(&app)?;
     let stored=super::connection_store::ConnectionStore::open(&root)?.read(&request.connection_id)?;
     let job=uuid::Uuid::new_v4().to_string();
     let protection=super::leases::LeaseContext{root:&root,connection_id:&request.connection_id,writer_id:&writer,descriptor:&stored.descriptor,root_key:&engine.root_key,provider:engine.provider.as_ref(),repository:&engine.repository,clock:super::leases::system_clock(),protection_supported:stored.capabilities.lease_operations,ledger:Some(app.state::<super::job_store::JobCommandState>().lease_ledger()?)};
-    let owner=match super::leases::admit_shared_work(&protection,&job,&cancel).await? {
-        super::leases::Admission::Admitted(owner)=>owner,
-        super::leases::Admission::Yield{..}=>return Ok(None),
-        super::leases::Admission::UnsupportedProtection=>return Err(ProviderError::new(ErrorKind::Unsupported)),
-    };
-    let directory=root.join("external-storage").join("maintenance").join(&job);
-    let result=owner.run(&protection,&cancel,async {
-        if let Some(reason)=owner.recheck(&protection,&cancel).await? {return Err(super::leases::yield_error(reason));}
-        check(&app,&request,true)?;
-        let completed=engine.compact_published(&directory,&job,&writer,&stored.capabilities,&cancel,Some((&owner,&protection))).await?;
-        check(&app,&request,true)?;
-        Ok(completed)
-    }).await?;
-    Ok(Some(serde_json::json!({"snapshotId":result.snapshot_id})))
+    let snapshot_id=if compact {
+        let owner=match super::leases::admit_shared_work(&protection,&job,&cancel).await? {
+            super::leases::Admission::Admitted(owner)=>owner,
+            super::leases::Admission::Yield{..}=>return Ok(None),
+            super::leases::Admission::UnsupportedProtection=>return Err(ProviderError::new(ErrorKind::Unsupported)),
+        };
+        let directory=root.join("external-storage").join("maintenance").join(&job);
+        let result=owner.run(&protection,&cancel,async {
+            if let Some(reason)=owner.recheck(&protection,&cancel).await? {return Err(super::leases::yield_error(reason));}
+            check(&app,&request,true)?;
+            let completed=engine.compact_published(&directory,&job,&writer,&stored.capabilities,&cancel,Some((&owner,&protection))).await?;
+            check(&app,&request,true)?;
+            Ok(completed)
+        }).await?;
+        Some(result.snapshot_id)
+    } else {None};
+    check(&app,&request,true)?;
+    let connected=connection_commands::open_connected_with_cancel(&app,&request.connection_id,&cancel).await?;
+    if connected.handle.repository_id!=engine.repository.repository_id || connected.handle.connection_identity!=engine.repository.connection_identity || connected.stored.descriptor.repository_id!=engine.library {return Err(lww_segment::corrupt())}
+    let cleanup=runtime::run_connected_cleanup(&app,&connected,&request.connection_id,&job,Some(engine),&cancel).await?;
+    check(&app,&request,true)?;
+    Ok(Some(serde_json::json!({"snapshotId":snapshot_id,"cleanup":cleanup})))
 }
 #[tauri::command]
 pub(crate) async fn external_lww_fence(app: AppHandle, connection_id: String) -> Result<()> {

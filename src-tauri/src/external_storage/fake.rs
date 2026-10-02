@@ -102,6 +102,20 @@ pub(super) struct FakeState {
     first_upload: Option<std::time::Instant>,
     sent_body_bytes: u64,
     received_body_bytes: u64,
+    read_barrier: Option<(String,Arc<FakeReadBarrier>)>,
+}
+/// One actual exact-object read is held before delivering bytes to its real sink.
+pub(crate) struct FakeReadBarrier {
+    pub object_id:String,
+    pub reached:tokio::sync::Notify,
+    release:tokio::sync::Notify,
+    pub was_reached:AtomicBool,
+    pub was_released:AtomicBool,
+}
+impl FakeReadBarrier {
+    pub(crate) fn release(&self) {
+        self.was_released.store(true,Ordering::SeqCst);self.release.notify_one();
+    }
 }
 pub(crate) struct FakeProvider {
     pub(super) state: Mutex<FakeState>,
@@ -109,6 +123,20 @@ pub(crate) struct FakeProvider {
     object_limit: u64,
 }
 impl FakeProvider {
+    pub(crate) fn arm_read_barrier(&self,object_id:&str)->Result<Arc<FakeReadBarrier>> {
+        let mut state=self.state.lock().unwrap();
+        if state.read_barrier.is_some() || !state.objects.contains_key(object_id) {
+            return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+        }
+        let barrier=Arc::new(FakeReadBarrier {object_id:object_id.into(),reached:Default::default(),release:Default::default(),
+            was_reached:false.into(),was_released:false.into()});
+        state.read_barrier=Some((object_id.into(),barrier.clone()));Ok(barrier)
+    }
+    pub(crate) fn clear_read_barrier(&self,barrier:&Arc<FakeReadBarrier>) {
+        let mut state=self.state.lock().unwrap();
+        if state.read_barrier.as_ref().is_some_and(|(_,pending)|Arc::ptr_eq(pending,barrier)) {state.read_barrier=None;}
+        drop(state);barrier.release();
+    }
     pub(crate) fn new(cas: bool) -> Self {
         Self::with_object_limit(cas,1024*1024)
     }
@@ -321,7 +349,9 @@ impl Provider for FakeProvider {
     ) -> ProviderFuture<'a, (RepositoryHandle, Capabilities)> {
         Box::pin(async move {
             c.check()?;
-            Ok((repository(), capabilities(self.cas)))
+            let mut capabilities = capabilities(self.cas);
+            capabilities.max_stored_bytes = Some(self.object_limit);
+            Ok((repository(), capabilities))
         })
     }
     fn read_object<'a>(
@@ -364,6 +394,12 @@ impl Provider for FakeProvider {
             let token = VersionToken(version.to_string());
             if unchanged == Some(&token) && !self.state.lock().unwrap().ignore_unchanged {
                 return Ok(ReadReceipt::NotModified(token));
+            }
+            let barrier={let mut state=self.state.lock().unwrap();
+                if state.read_barrier.as_ref().is_some_and(|(object,_)|object==&l.object) {state.read_barrier.take().map(|(_,barrier)|barrier)}else{None}};
+            if let Some(barrier)=barrier {
+                barrier.was_reached.store(true,Ordering::SeqCst);barrier.reached.notify_one();
+                barrier.release.notified().await;c.check()?;
             }
             let hash = risunest_sync_wire::hash(&bytes);
             let mut writer = sink.open(0, bytes.len() as u64, c).await?;
@@ -692,6 +728,21 @@ pub(crate) fn locator() -> RemoteLocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn opened_capabilities_report_the_configured_object_ceiling() {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let config = ConnectionConfig { provider: "synthetic".into(), profile: None,
+                endpoint: "https://synthetic.invalid".into(), account_id: "fixture".into(),
+                location: Default::default(), oauth_profile: None };
+            for (provider, limit) in [(FakeProvider::new(true), 1024 * 1024),
+                (FakeProvider::with_object_limit(true, 128 * 1024 * 1024), 128 * 1024 * 1024)] {
+                let (_, actual) = provider.open_repository(&config, &SecretRef("fixture".into()),
+                    OpenMode::Existing, &Cancellation::default()).await.unwrap();
+                let mut expected = capabilities(true); expected.max_stored_bytes = Some(limit);
+                assert_eq!(serde_json::to_value(actual).unwrap(), serde_json::to_value(expected).unwrap());
+            }
+        });
+    }
 
     fn object(name: &str) -> RemoteLocator {
         RemoteLocator {

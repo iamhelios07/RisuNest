@@ -10,6 +10,42 @@ fn state(root: &Path) -> DeviceBackupState {
 }
 
 #[test]
+fn portable_adoption_requires_completed_exact_native_session_before_release() {
+    use crate::local_backup::NeverCancelled;
+    let root=tempfile::tempdir().unwrap();
+    let mut store=crate::persistent_store::PersistentStore::open(root.path()).unwrap();
+    let stage=store.replace_begin().unwrap().staging_id;
+    store.replace_put_root(&stage,&serde_json::json!({"username":"synthetic restored"})).unwrap();
+    let selected=vec!["hypa".to_owned(),"local-plugins".to_owned(),"local-settings".to_owned()];
+    let source=capture_prepared_native_sections(&mut store,&selected,&NeverCancelled).unwrap();
+    let rollback=capture_prepared_native_sections(&mut store,&selected,&NeverCancelled).unwrap();
+    let coordinator=state(root.path());
+    let job="coordinated-adoption";
+    let id=coordinator.create_native_portable_session(job,true,&selected,0,Some(stage)).unwrap();
+    let header=crate::persistent_store::lww::Header {binding_authority:store.lww_binding_authority().unwrap(),request_id:job.into()};
+    coordinator.set_library_replacement(&id,&header,&std::collections::BTreeMap::new()).unwrap();
+    journal_prepared_native_sections(&coordinator,&id,Spool::Source,&source).unwrap();
+    coordinator.source_ready(&id).unwrap();
+    journal_prepared_native_sections(&coordinator,&id,Spool::Rollback,&rollback).unwrap();
+    coordinator.prepared(&id).unwrap();
+    let revision=resume_journaled_native_restore(&coordinator,&id,&mut store).unwrap();
+    let authority=header.binding_authority.0.to_string();
+    assert!(coordinator.verify_portable_adoption_complete(&id,job,&revision.to_string(),&authority).is_err());
+    coordinator.recovery_complete(&id).unwrap();
+    coordinator.verify_portable_adoption_complete(&id,job,&revision.to_string(),&authority).unwrap();
+    crate::server_sync::lww_tests::save(&mut store,&["root","username"],serde_json::json!("synthetic later ordinary edit"));
+    assert!(store.revision().unwrap()>revision);
+    coordinator.verify_portable_adoption_complete(&id,job,&revision.to_string(),&authority).unwrap();
+    assert!(coordinator.verify_portable_adoption_complete(&id,"other-job",&revision.to_string(),&authority).is_err());
+    assert!(coordinator.verify_portable_adoption_complete(&id,job,&(revision+1).to_string(),&authority).is_err());
+    assert!(coordinator.verify_portable_adoption_complete(&id,job,&revision.to_string(),"999").is_err());
+    coordinator.verify_portable_adoption_complete(&id,job,&revision.to_string(),&authority).unwrap();
+    let library=rusqlite::Connection::open(root.path().join("persistent").join(crate::persistent_store::DATABASE_FILE)).unwrap();
+    library.execute("UPDATE meta SET value=?1 WHERE key='activeGeneration'",[serde_json::to_string("other-generation").unwrap()]).unwrap();
+    assert!(coordinator.verify_portable_adoption_complete(&id,job,&revision.to_string(),&authority).is_err());
+}
+
+#[test]
 fn large_device_row_reads_are_exact_bounded_and_validate_offsets() {
     let root = tempfile::tempdir().unwrap();
     let coordinator = state(root.path());

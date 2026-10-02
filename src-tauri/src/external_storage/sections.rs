@@ -8,8 +8,15 @@ use crate::persistent_store::device_store::{
         SectionValueRow, TombstonePublication},
     Section,
 };
+#[cfg(not(test))]
+use risunest_external_storage_format::content_identity::hash;
+#[cfg(test)]
+fn hash(bytes:&[u8])->[u8;32] {
+    crate::persistent_store::hash_work::observe("native_external_section_content",bytes.len());
+    risunest_external_storage_format::content_identity::hash(bytes)
+}
 use risunest_external_storage_format::{
-    content_identity::hash,
+
     format::fingerprint,
     section::{
         InlineOrObject, SectionEntry, SectionEntryVersion, SectionKind, SectionValue,
@@ -133,9 +140,13 @@ fn captured_section_fingerprint(
     kind: SectionKind,
     sources: &[SectionSource],
 ) -> Result<[u8; 32]> {
+    #[cfg(test)]
+    crate::persistent_store::hash_work::observe("native_external_section_domain",b"risunest.section-fingerprint/v1\0".len()+kind.id().len());
     let mut fingerprint = risunest_external_storage_format::format::FingerprintBuilder::new(
         &kind.fingerprint_domain(),
     );
+    #[cfg(test)]
+    crate::persistent_store::hash_work::observe("native_external_section_fingerprint",b"risunest.external-fingerprint/v1\0".len()+32);
     let mut previous = None;
     for source in sources.iter().filter(|source| {
         source.kind == wire::CatalogEntryKind::SectionEntry
@@ -146,6 +157,8 @@ fn captured_section_fingerprint(
         let digest: [u8; 32] = hex::decode(&source.content_sha256).map_err(corrupt)?
             .try_into().map_err(|_| corrupt("section entry hash is invalid"))?;
         fingerprint.push(&source.key, &digest).map_err(corrupt)?;
+        #[cfg(test)]
+        crate::persistent_store::hash_work::update("native_external_section_fingerprint",40+source.key.len());
         previous = Some(source.key.clone());
     }
     Ok(fingerprint.finish())
@@ -155,6 +168,8 @@ fn publication_evidence_fingerprint(connection: &Connection) -> Result<[u8; 32]>
     let mut fingerprint = risunest_external_storage_format::format::FingerprintBuilder::new(
         b"risunest-section-evidence-v1____",
     );
+    #[cfg(test)]
+    crate::persistent_store::hash_work::observe("native_external_section_evidence_fingerprint",b"risunest.external-fingerprint/v1\0".len()+32);
     let mut statement = connection.prepare(
         "SELECT key1,key2,key3,write_clock,writer_id,disposition,stamped,
             first_published_generation,first_published_at_ms
@@ -176,6 +191,8 @@ fn publication_evidence_fingerprint(connection: &Connection) -> Result<[u8; 32]>
             row.get::<_, Option<i64>>(8).map_err(corrupt)?,
         )).map_err(corrupt)?;
         fingerprint.push(&key, &hash(&bytes)).map_err(corrupt)?;
+        #[cfg(test)]
+        crate::persistent_store::hash_work::update("native_external_section_evidence_fingerprint",40+key.len());
     }
     Ok(fingerprint.finish())
 }
@@ -1120,6 +1137,12 @@ pub(crate) fn decode_section(
                     message: "Section object is missing".into(),
                 })
         }).map_err(corrupt)?);
+    }
+    #[cfg(test)]
+    {
+        crate::persistent_store::hash_work::observe("native_external_section_domain",b"risunest.section-fingerprint/v1\0".len()+kind.id().len());
+        crate::persistent_store::hash_work::observe("native_external_section_received_fingerprint",b"risunest.external-fingerprint/v1\0".len()+32);
+        for key in fingerprints.keys() {crate::persistent_store::hash_work::update("native_external_section_received_fingerprint",40+key.len());}
     }
     if fingerprint(&kind.fingerprint_domain(), &fingerprints) != *expected_fingerprint {
         return Err(corrupt("section content differs from its reference"));

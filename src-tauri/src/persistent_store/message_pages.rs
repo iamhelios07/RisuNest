@@ -763,6 +763,74 @@ pub(super) fn validate_manifest(db: &Connection, value: &UnitValue) -> StoreResu
     validated_manifest(db, value).map(|_| ())
 }
 
+// Copied SQLite files cannot supply certificates for their own contents.
+pub(super) fn accept_copied_database(tx: &Transaction<'_>) -> StoreResult<()> {
+    tx.execute_batch("DELETE FROM message_page_proofs; DELETE FROM message_page_verified_objects;")?;
+    let mut messages = tx.prepare("SELECT generation,character_id,conversation_id,message_index,value,canonical_hash,canonical_size FROM messages")?;
+    let mut rows = messages.query([])?;
+    while let Some(row) = rows.next()? {
+        let text: String = row.get(4)?;
+        let value: Value = serde_json::from_str(&text)?;
+        let bytes = payload_value::encode(&value).map_err(codec_error)?;
+        let hash = MessageHash::from_bytes(&bytes);
+        let imported_hash: String = row.get(5)?;
+        let imported_size: i64 = row.get(6)?;
+        if !imported_hash.is_empty() && (imported_hash != hash.hash || imported_size != sql_i64(hash.byte_length)?) {
+            return Err(codec_error("copied native message identity mismatch"));
+        }
+        tx.execute("UPDATE messages SET canonical_hash=?5,canonical_size=?6 WHERE generation=?1 AND character_id=?2 AND conversation_id=?3 AND message_index=?4",
+            params![row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,i64>(3)?,hash.hash,sql_i64(hash.byte_length)?])?;
+    }
+    drop(rows);
+    drop(messages);
+    let invalid_parent: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM messages m LEFT JOIN conversations c ON c.generation=m.generation AND c.character_id=m.character_id AND c.conversation_id=m.conversation_id WHERE c.conversation_id IS NULL)",[],|r|r.get(0))?;
+    if invalid_parent { return Err(codec_error("copied native message parent is missing")); }
+    let invalid_order: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM conversations c WHERE c.message_count!=(SELECT COUNT(*) FROM messages m WHERE m.generation=c.generation AND m.character_id=c.character_id AND m.conversation_id=c.conversation_id) OR (c.message_count>0 AND ((SELECT MIN(message_index) FROM messages m WHERE m.generation=c.generation AND m.character_id=c.character_id AND m.conversation_id=c.conversation_id)!=0 OR (SELECT MAX(message_index) FROM messages m WHERE m.generation=c.generation AND m.character_id=c.character_id AND m.conversation_id=c.conversation_id)!=c.message_count-1)))",[],|r|r.get(0))?;
+    if invalid_order { return Err(codec_error("copied native message indices or count mismatch")); }
+    let invalid_id: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE message_id IS NOT json_extract(value,'$.chatId'))",[],|r|r.get(0))?;
+    if invalid_id { return Err(codec_error("copied native message chatId mismatch")); }
+    let orphan: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM message_page_indexes i LEFT JOIN message_page_manifests m
+        ON m.generation=i.generation AND m.character_id=i.character_id AND m.conversation_id=i.conversation_id WHERE m.body IS NULL)",[],|r|r.get(0))?;
+    if orphan { return Err(codec_error("copied page index has no manifest")); }
+    let mut manifests = tx.prepare("SELECT generation,character_id,conversation_id,body FROM message_page_manifests")?;
+    let entries = manifests.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,Vec<u8>>(3)?)))?
+        .collect::<Result<Vec<_>,_>>()?;
+    drop(manifests);
+    for (generation,character,conversation,body) in entries {
+        let original = MessageManifest::decode(&body).map_err(codec_error)?;
+        let original_pages = load_pages(tx,&generation,&character,&conversation)?;
+        let original_value = unit_value(tx,&original)?;
+        let (_, expected_pages) = validated_manifest(tx,&original_value)?;
+        if original_pages != expected_pages { return Err(codec_error("copied page index mismatch")); }
+        tx.execute("DELETE FROM message_page_indexes WHERE generation=?1 AND character_id=?2 AND conversation_id=?3",params![generation,character,conversation])?;
+        tx.execute("DELETE FROM message_page_manifests WHERE generation=?1 AND character_id=?2 AND conversation_id=?3",params![generation,character,conversation])?;
+        let actual = capture_manifest(tx,&generation,&character,&conversation,None)?;
+        if actual != original_value { return Err(codec_error("copied message manifest differs from native messages")); }
+    }
+    for table in ["lww_units", "lww_outbox", "lww_receive_rows", "lww_binding_source_units"] {
+        let identity_column = if matches!(table,"lww_units"|"lww_outbox") { "identity" } else { "NULL" };
+        let mut statement = tx.prepare(&format!("SELECT key,value,stamp,{identity_column} FROM {table}"))?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let key: risunest_sync_wire::unit::UnitKey = row.get::<_,String>(0)?.try_into().map_err(codec_error)?;
+            let value: UnitValue = serde_json::from_str(&row.get::<_,String>(1)?)?;
+            value.validate().map_err(codec_error)?;
+            let stamp: risunest_sync_wire::stamp::Stamp = serde_json::from_str(&row.get::<_,String>(2)?)?;
+            stamp.validate().map_err(codec_error)?;
+            if let Some(identity) = row.get::<_,Option<String>>(3)? {
+                let bytes = risunest_sync_wire::canonical::encode(&value).map_err(codec_error)?;
+                if risunest_sync_wire::hash(&bytes)!=identity { return Err(codec_error("copied native unit identity mismatch")); }
+            }
+            super::lww::validate_received(tx,&key,&value)?;
+            if key.components()[0]=="messages" && !matches!(value,UnitValue::Deleted) {
+                let (manifest,_) = validated_manifest(tx,&value)?;
+                unit_value(tx,&manifest)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn apply_manifest(
     tx: &Transaction<'_>,
     generation: &str,

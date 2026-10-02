@@ -30,6 +30,24 @@ pub(crate) struct PackedSource {
     pub chunks:Vec<risunest_external_storage_format::snapshot::StoredChunk>,
     pub packs:Vec<risunest_external_storage_format::snapshot::StoredObject>,
 }
+#[derive(Clone,Serialize,Deserialize)]
+#[serde(tag="kind",rename_all="kebab-case",deny_unknown_fields)]
+pub(crate) enum FrozenBodySource {
+    Standalone(Source),
+    Packed(PackedSource),
+}
+impl FrozenBodySource {
+    pub(crate) fn byte_length(&self)->u64 {
+        match self {
+            Self::Standalone(source)=>source.body.plaintext_byte_length.0,
+            Self::Packed(source)=>source.byte_length,
+        }
+    }
+}
+pub(crate) fn freeze_remote_body(root:&Path,hash:&str)->Result<Option<FrozenBodySource>> {
+    if let Some(source)=source(root,hash)? {return Ok(Some(FrozenBodySource::Standalone(source)));}
+    Ok(packed_source(root,hash)?.map(FrozenBodySource::Packed))
+}
 fn local(_: impl std::fmt::Display) -> ProviderError {
     segment::corrupt()
 }
@@ -104,20 +122,32 @@ pub(crate) fn stat(root: &Path, hash: &str) -> std::io::Result<Option<u64>> {
         .and_then(|source| if let Some(source)=source {Ok(Some(source.body.plaintext_byte_length.0))} else {packed_source(root,hash).map(|s|s.map(|s|s.byte_length))})
         .map_err(|_| std::io::Error::other("external-source-invalid"))
 }
-pub(crate) fn register_packed(root:&Path,source:&PackedSource,repository:&RepositoryHandle) -> Result<()> {
+pub(crate) fn validate_packed_source(source:&PackedSource,repository:&RepositoryHandle) -> Result<()> {
     risunest_sync_wire::validate_hash(&source.hash).map_err(local)?;
     source.catalog.validate().map_err(local)?;
     super::packaging::RemoteObject::from_stored(&source.catalog,repository)?;
-    if source.protected_snapshot.is_empty() || source.connection_id.is_empty() || source.chunks.is_empty() { return Err(segment::corrupt()); }
+    if source.catalog.header.role!=risunest_external_storage_format::snapshot::ObjectRole::Catalog
+        || source.protected_snapshot.is_empty() || source.connection_id.is_empty()
+        || (source.chunks.is_empty() && source.byte_length!=0) { return Err(segment::corrupt()); }
     let mut length=0u64;
     let packs=source.packs.iter().map(|p|(p.header.object_id.as_str(),p)).collect::<std::collections::BTreeMap<_,_>>();
+    if packs.len()!=source.packs.len() {return Err(segment::corrupt());}
     for chunk in &source.chunks {
         let pack=packs.get(chunk.pack_id.as_str()).ok_or_else(segment::corrupt)?;
         super::packaging::RemoteObject::from_stored(pack,repository)?;
-        if pack.header.repository_id!=source.catalog.header.repository_id || chunk.offset.checked_add(chunk.stored_length).is_none_or(|end|end>pack.plaintext_length) { return Err(segment::corrupt()); }
+        if pack.header.role!=risunest_external_storage_format::snapshot::ObjectRole::Pack
+            || pack.header.repository_id!=source.catalog.header.repository_id
+            || chunk.offset.checked_add(chunk.stored_length).is_none_or(|end|end>pack.plaintext_length) { return Err(segment::corrupt()); }
         length=length.checked_add(chunk.plaintext_length).ok_or_else(segment::corrupt)?;
     }
     if length!=source.byte_length { return Err(segment::corrupt()); }
+    Ok(())
+}
+pub(crate) fn register_packed(root:&Path,source:&PackedSource,repository:&RepositoryHandle) -> Result<()> {
+    validate_packed_source(source,repository)?;
+    register_verified_packed(root,source)
+}
+pub(super) fn register_verified_packed(root:&Path,source:&PackedSource) -> Result<()> {
     let db=database(root,true)?.ok_or_else(segment::corrupt)?;
     db.execute("INSERT INTO packed_sources VALUES(?1,?2,?3) ON CONFLICT(hash,library) DO UPDATE SET source=excluded.source",params![source.hash,source.library_id,serde_json::to_string(source).map_err(local)?]).map_err(local)?;
     Ok(())
@@ -192,6 +222,128 @@ fn promote(root: &Path, hash: &str, bytes: &[u8]) -> Result<Option<std::fs::File
     .map_err(local)?;
     cas.open_object(hash).map_err(local)
 }
+pub(crate) fn packed_body_groups(sources:Vec<PackedSource>,priority:&std::collections::BTreeSet<String>)->Vec<Vec<PackedSource>> {
+    let mut parents=(0..sources.len()).collect::<Vec<_>>();
+    let mut users=std::collections::BTreeMap::<String,usize>::new();
+    fn root(parents:&mut [usize],mut index:usize)->usize {
+        while parents[index]!=index {parents[index]=parents[parents[index]];index=parents[index];}index
+    }
+    for (index,source) in sources.iter().enumerate() {
+        for chunk in &source.chunks {
+            if let Some(previous)=users.insert(chunk.pack_id.clone(),index) {
+                let left=root(&mut parents,index);let right=root(&mut parents,previous);
+                parents[left.max(right)]=left.min(right);
+            }
+        }
+    }
+    let mut groups=std::collections::BTreeMap::<usize,Vec<PackedSource>>::new();
+    for (index,source) in sources.into_iter().enumerate() {groups.entry(root(&mut parents,index)).or_default().push(source);}
+    let mut groups=groups.into_values().collect::<Vec<_>>();
+    groups.sort_by_key(|group|!group.iter().any(|source|priority.contains(&source.hash)));
+    for group in &mut groups {group.sort_by_key(|source|!priority.contains(&source.hash));}
+    groups
+}
+pub(crate) fn hydrate_registered_many(root:&Path,digests:&[String],priority:&std::collections::BTreeSet<String>,
+    cancellation:Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,check:&dyn Fn()->crate::server_sync::Result<()>,
+    opened:&mut dyn FnMut(&str,crate::server_sync::residency::HydrationOutcome))->crate::server_sync::Result<Vec<String>> {
+    use crate::server_sync::residency::{with_hydration_lock,HydrationOutcome};
+    fn error(_:impl std::fmt::Display)->crate::server_sync::SyncError {crate::server_sync::SyncError::new("external-body-unavailable",502)}
+    fn remote_error(error:ProviderError)->crate::server_sync::SyncError {
+        if error.kind==ErrorKind::Cancelled {crate::server_sync::SyncError::new("cancelled",409)} else {crate::server_sync::SyncError::new("external-body-unavailable",502)}
+    }
+    let installer_error=std::cell::RefCell::new(None);
+    let cancel=cancellation.map(Cancellation::with_external_flag).unwrap_or_default();
+    let cas=crate::asset_repository::PayloadCas::new(root)?;
+    let scratch=tempfile::tempdir()?;
+    let mut seen=std::collections::BTreeSet::new();
+    let mut unavailable=Vec::new();
+    let mut standalone=Vec::new();
+    let mut connections=std::collections::BTreeMap::<(PathBuf,String,String),Vec<PackedSource>>::new();
+    for hash in digests {
+        check()?;cancel.check().map_err(remote_error)?;
+        if !seen.insert(hash.clone()) {continue;}
+        if cas.stat_object(hash)?.is_some() {opened(hash,HydrationOutcome::AlreadyLocal);continue;}
+        match freeze_remote_body(root,hash).map_err(error)? {
+            Some(FrozenBodySource::Standalone(source))=>standalone.push(source),
+            Some(FrozenBodySource::Packed(source))=>connections.entry((source.connection_root.clone(),source.connection_id.clone(),source.library_id.clone())).or_default().push(source),
+            None=>unavailable.push(hash.clone()),
+        }
+    }
+    let mut groups=Vec::new();
+    for (connection,sources) in connections {for group in packed_body_groups(sources,priority) {groups.push((connection.clone(),group));}}
+    groups.sort_by_key(|(_,group)|!group.iter().any(|source|priority.contains(&source.hash)));
+    standalone.sort_by_key(|source|!priority.contains(&source.hash));
+    let mut install=|hash:&str,size:u64,path:&Path|->crate::server_sync::Result<()> {
+        with_hydration_lock(root,hash,check,|| {
+            check()?;cancel.check().map_err(remote_error)?;
+            if let Some(actual)=cas.stat_object(hash)? {
+                if actual!=size {return Err(error("invalid-body"));}
+                opened(hash,HydrationOutcome::AlreadyLocal);return Ok(());
+            }
+            #[cfg(test)]
+            let _scope=crate::asset_repository::body_io::object_scope(hash);
+            let input=crate::trust_boundary::open_regular_source(path);
+            #[cfg(test)]
+            crate::asset_repository::body_io::open_result("managed",&input);
+            let input=input?;
+            #[cfg(test)]
+            let mut input=crate::asset_repository::body_io::TrackedBodyFile::new(input,hash);
+            #[cfg(not(test))]
+            let mut input=input;
+            let install_check=|| {check()?;cancel.check().map_err(remote_error)};
+            let staged=crate::server_sync::transfer::stage_checked(&cas,&mut input,hash,size,&install_check)?;
+            let _guard=crate::asset_repository::coordinator::lock_repository_mutation()?;
+            check()?;cancel.check().map_err(remote_error)?;
+            cas.publish_staged(staged)?;
+            crate::persistent_store::register_asset_objects_at_root(root,&[crate::persistent_store::asset_object_catalog::AssetObjectRegistration{object_hash:hash.into(),byte_size:size}],i64::try_from(super::runtime::now_ms()).map_err(error)?).map_err(error)?;
+            opened(hash,HydrationOutcome::Downloaded);Ok(())
+        })
+    };
+    // Selected standalone bodies precede background pack groups.
+    for source in standalone.iter().filter(|source|priority.contains(&source.hash)) {
+        let frozen=FrozenBodySource::Standalone(source.clone());
+        let file=tauri::async_runtime::block_on(spool_frozen_remote_body(&frozen,scratch.path(),&cancel)).map_err(remote_error)?;
+        install(&source.hash,source.body.plaintext_byte_length.0,file.path())?;
+    }
+    for ((connection_root,connection_id,library_id),group) in groups {
+        check()?;cancel.check().map_err(remote_error)?;
+        let result=tauri::async_runtime::block_on(async {
+            let (provider,repository,key)=open_source_connection(&connection_root,&connection_id,&library_id,&cancel).await?;
+            let stored=ConnectionStore::open(&connection_root)?.read(&connection_id)?;
+            for source in &group {validate_packed_source(source,&repository)?;}
+            let writer=uuid::Uuid::new_v4().to_string();let job=uuid::Uuid::new_v4().to_string();
+            let protection=super::leases::LeaseContext{root:&connection_root,connection_id:&connection_id,writer_id:&writer,descriptor:&stored.descriptor,root_key:&key,provider:provider.as_ref(),repository:&repository,clock:super::leases::system_clock(),protection_supported:stored.capabilities.lease_operations,ledger:None};
+            let owner=match super::leases::admit_shared_work(&protection,&job,&cancel).await? {
+                super::leases::Admission::Admitted(owner)=>owner,
+                super::leases::Admission::Yield{reason}=>return Err(super::leases::yield_error(reason)),
+                super::leases::Admission::UnsupportedProtection=>return Err(ProviderError::new(ErrorKind::Unsupported)),
+            };
+            owner.run(&protection,&cancel,async {
+                let mut missing=Vec::new();
+                for source in group {
+                    if let Some(size)=cas.stat_object(&source.hash).map_err(local)? {if size!=source.byte_length {return Err(segment::corrupt());} install(&source.hash,size,scratch.path()).map_err(|error| {installer_error.replace(Some(error));segment::corrupt()})?;}
+                    else {missing.push(source);}
+                }
+                if missing.is_empty() {return Ok(());}
+                let stage=tempfile::tempdir_in(scratch.path()).map_err(local)?;
+                let files=super::snapshot_restore::download_packed_body_files(&missing,stage.path(),&key,provider.as_ref(),&repository,&cancel).await?;
+                for source in missing {
+                    if let Some(reason)=owner.recheck(&protection,&cancel).await? {return Err(super::leases::yield_error(reason));}
+                    install(&source.hash,source.byte_length,files.get(&source.hash).ok_or_else(segment::corrupt)?).map_err(|error| {installer_error.replace(Some(error));segment::corrupt()})?;
+                }
+                Ok(())
+            }).await
+        });
+        if let Some(error)=installer_error.borrow_mut().take() {return Err(error);}
+        result.map_err(remote_error)?;
+    }
+    for source in standalone.iter().filter(|source|!priority.contains(&source.hash)) {
+        let frozen=FrozenBodySource::Standalone(source.clone());
+        let file=tauri::async_runtime::block_on(spool_frozen_remote_body(&frozen,scratch.path(),&cancel)).map_err(remote_error)?;
+        install(&source.hash,source.body.plaintext_byte_length.0,file.path())?;
+    }
+    check()?;Ok(unavailable)
+}
 pub(crate) fn hydrate_registered(root:&Path,hash:&str,check:&dyn Fn()->crate::server_sync::Result<()>)->crate::server_sync::Result<bool> {
     check()?;
     let cas=crate::asset_repository::PayloadCas::new(root)?;
@@ -254,12 +406,21 @@ pub(crate) async fn hydrate_missing(
     fulfill(root, hash, provider.as_ref(), &repository, &key, cancel).await
 }
 pub(crate) async fn spool_verified_remote_body(root:&Path,hash:&str,destination:&Path,cancel:&Cancellation)->Result<Option<tempfile::NamedTempFile>> {
-    let Some((provider, repository, key)) = remote_source(root, hash, cancel).await? else {
-        return Ok(None);
+    let Some(source)=freeze_remote_body(root,hash)? else {return Ok(None)};
+    spool_frozen_remote_body(&source,destination,cancel).await.map(Some)
+}
+pub(crate) async fn spool_frozen_remote_body(source:&FrozenBodySource,destination:&Path,cancel:&Cancellation)->Result<tempfile::NamedTempFile> {
+    let (hash,connection_root,connection_id,library_id)=match source {
+        FrozenBodySource::Standalone(source)=>(&source.hash,&source.connection_root,&source.connection_id,&source.library_id),
+        FrozenBodySource::Packed(source)=>(&source.hash,&source.connection_root,&source.connection_id,&source.library_id),
     };
-    let connection_root=if let Some(source)=source(root,hash)? {source.connection_root} else {packed_source(root,hash)?.ok_or_else(segment::corrupt)?.connection_root};
-    let connection_id=if let Some(source)=source(root,hash)? {source.connection_id} else {packed_source(root,hash)?.ok_or_else(segment::corrupt)?.connection_id};
-    let stored=ConnectionStore::open(&connection_root)?.read(&connection_id)?;
+    let (provider,repository,key)=open_source_connection(connection_root,connection_id,library_id,cancel).await?;
+    let stored=ConnectionStore::open(connection_root)?.read(connection_id)?;
+    if let FrozenBodySource::Packed(source)=source {validate_packed_source(source,&repository)?;}
+    risunest_sync_wire::validate_hash(hash).map_err(local)?;
+    let connection_root=connection_root.clone();
+    let connection_id=connection_id.clone();
+    let source=source.clone();
     let writer=uuid::Uuid::new_v4().to_string();
     let job=uuid::Uuid::new_v4().to_string();
     let protection=super::leases::LeaseContext{root:&connection_root,connection_id:&connection_id,writer_id:&writer,descriptor:&stored.descriptor,root_key:&key,provider:provider.as_ref(),repository:&repository,clock:super::leases::system_clock(),protection_supported:stored.capabilities.lease_operations,ledger:None};
@@ -272,7 +433,7 @@ pub(crate) async fn spool_verified_remote_body(root:&Path,hash:&str,destination:
         std::fs::create_dir_all(destination).map_err(local)?;
         let mut output=tempfile::NamedTempFile::new_in(destination).map_err(local)?;
         let scratch=tempfile::tempdir_in(destination).map_err(local)?;
-        if let Some(source)=source(root,hash)? {
+        if let FrozenBodySource::Standalone(source)=&source {
             let locator=source.body.locator.as_ref().ok_or_else(segment::corrupt)?;
             locator.validate_for(&repository)?;
             let cipher=scratch.path().join("ciphertext");
@@ -286,24 +447,77 @@ pub(crate) async fn spool_verified_remote_body(root:&Path,hash:&str,destination:
             let mut input=crate::trust_boundary::open_regular_source(&cipher).map_err(local)?;
             segment::open_body_stream(&mut input,&mut output,&source.library_id,&source.body.object_id,&key,source.body.plaintext_byte_length.0)?;
             if !super::snapshot_restore::verify_body_file(output.path(),source.body.plaintext_byte_length.0,hash)? {return Err(segment::corrupt());}
-        } else {
-            let source=packed_source(root,hash)?.ok_or_else(segment::corrupt)?;
-            let path=super::snapshot_restore::download_packed_body_file(hash,source.byte_length,source.chunks,source.packs,scratch.path(),&key,provider.as_ref(),&repository,cancel).await?;
+        } else if let FrozenBodySource::Packed(source)=&source {
+            let path=super::snapshot_restore::download_packed_body_file(hash,source.byte_length,source.chunks.clone(),source.packs.clone(),scratch.path(),&key,provider.as_ref(),&repository,cancel).await?;
             let mut input=crate::trust_boundary::open_regular_source(&path).map_err(local)?;
             std::io::copy(&mut input,&mut output).map_err(local)?;
         }
         output.as_file().sync_all().map_err(local)?;
         std::io::Seek::seek(output.as_file_mut(),std::io::SeekFrom::Start(0)).map_err(local)?;
         if let Some(reason)=owner.recheck(&protection,cancel).await? {return Err(super::leases::yield_error(reason));}
-        Ok(Some(output))
+        Ok(output)
     }).await
 }
 pub(crate) async fn read_verified_remote_body(root:&Path,hash:&str,cancel:&Cancellation)->Result<Option<Vec<u8>>> {
     let temporary=tempfile::tempdir().map_err(local)?;
-    let Some(file)=spool_verified_remote_body(root,hash,temporary.path(),cancel).await? else {return Ok(None)};
-    Ok(Some(std::fs::read(file.path()).map_err(local)?))
+    let Some(source)=freeze_remote_body(root,hash)? else {return Ok(None)};
+    let file=spool_frozen_remote_body(&source,temporary.path(),cancel).await?;
+    read_frozen_body_spool(&source,&file,cancel).map(Some)
+}
+pub(crate) fn read_frozen_body_spool(source:&FrozenBodySource,file:&tempfile::NamedTempFile,cancel:&Cancellation)->Result<Vec<u8>> {
+    use std::io::Read;
+    cancel.check()?;
+    let hash=match source {FrozenBodySource::Standalone(source)=>&source.hash,FrozenBodySource::Packed(source)=>&source.hash};
+    risunest_sync_wire::validate_hash(hash).map_err(local)?;
+    #[cfg(test)]
+    let _scope=crate::asset_repository::body_io::object_scope(hash);
+    let input=crate::trust_boundary::open_regular_source(file.path());
+    #[cfg(test)]
+    crate::asset_repository::body_io::open_result("managed",&input);
+    let input=input.map_err(local)?;
+    if input.metadata().map_err(local)?.len()!=source.byte_length() {return Err(segment::corrupt());}
+    #[cfg(test)]
+    let mut input=crate::asset_repository::body_io::TrackedBodyFile::new(input,hash);
+    #[cfg(not(test))]
+    let mut input=input;
+    let mut bytes=Vec::new();
+    bytes.try_reserve_exact(usize::try_from(source.byte_length()).map_err(local)?).map_err(local)?;
+    let mut chunk=[0u8;64*1024];
+    loop {
+        cancel.check()?;
+        let count=input.read(&mut chunk).map_err(local)?;
+        if count==0 {break;}
+        bytes.extend_from_slice(&chunk[..count]);
+        if bytes.len() as u64>source.byte_length() {return Err(segment::corrupt());}
+    }
+    if bytes.len() as u64!=source.byte_length() {return Err(segment::corrupt());}
+    cancel.check()?;
+    Ok(bytes)
 }
 async fn fetch_missing(root:&Path,hash:&str,cancel:&Cancellation)->Result<Option<Vec<u8>>> {read_verified_remote_body(root,hash,cancel).await}
+#[cfg(test)]
+mod frozen_spool_tests {
+    use super::*;
+    use std::io::Write;
+    #[test]
+    fn frozen_spool_read_observes_actual_asset_open_and_bytes() {
+        let bytes=b"synthetic captured remote body";
+        let hash=risunest_sync_wire::hash(bytes);
+        let source=FrozenBodySource::Standalone(Source {
+            hash:hash.clone(),library_id:"synthetic-library".into(),connection_id:"synthetic-connection".into(),
+            connection_root:PathBuf::new(),protected_segment:"synthetic-segment".into(),
+            body:LargeBody {object_id:"synthetic-body".into(),sha256:hash.clone(),byte_length:(bytes.len() as u64).into(),plaintext_byte_length:(bytes.len() as u64).into(),locator:None},
+        });
+        let mut file=tempfile::NamedTempFile::new().unwrap();file.write_all(bytes).unwrap();
+        crate::asset_repository::body_io::reset_body_io();
+        crate::asset_repository::body_io::register_object_purpose(&hash,crate::asset_repository::body_io::BodyPurpose::Asset);
+        assert_eq!(read_frozen_body_spool(&source,&file,&Cancellation::default()).unwrap(),bytes);
+        let observed=crate::asset_repository::body_io::take_body_io();
+        assert!(observed.complete());
+        assert_eq!(observed.asset_work().opens,1);
+        assert_eq!(observed.asset_work().read_bytes,bytes.len() as u64);
+    }
+}
 async fn remote_source(
     root: &Path,
     hash: &str,
@@ -316,7 +530,40 @@ async fn remote_source(
     )>,
 > {
     let (connection_root,connection_id,library_id)=if let Some(source)=source(root,hash)? {(source.connection_root,source.connection_id,source.library_id)} else if let Some(source)=packed_source(root,hash)? {(source.connection_root,source.connection_id,source.library_id)} else {return Ok(None)};
-    let stored = ConnectionStore::open(&connection_root)?.read(&connection_id)?;
+    open_source_connection(&connection_root,&connection_id,&library_id,cancel).await.map(Some)
+}
+#[cfg(test)]
+fn test_source_connections()->&'static std::sync::Mutex<std::collections::BTreeMap<(std::path::PathBuf,String),std::sync::Arc<super::connection_commands::ConnectedRepository>>> {
+    static CONNECTIONS:std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeMap<(std::path::PathBuf,String),std::sync::Arc<super::connection_commands::ConnectedRepository>>>>=std::sync::OnceLock::new();
+    CONNECTIONS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) struct TestSourceConnection { key:(std::path::PathBuf,String) }
+#[cfg(test)]
+impl Drop for TestSourceConnection {
+    fn drop(&mut self) {if let Ok(mut connections)=test_source_connections().lock() {connections.remove(&self.key);}}
+}
+#[cfg(test)]
+pub(crate) fn install_test_source_connection(root:&Path,connection:std::sync::Arc<super::connection_commands::ConnectedRepository>)->Result<TestSourceConnection> {
+    let key=(root.to_owned(),connection.stored.id.clone());
+    let mut connections=test_source_connections().lock().map_err(super::runtime::local_error)?;
+    if connections.contains_key(&key) {return Err(ProviderError::new(ErrorKind::PreconditionFailed));}
+    connections.insert(key.clone(),connection);
+    Ok(TestSourceConnection{key})
+}
+async fn open_source_connection(connection_root:&Path,connection_id:&str,library_id:&str,cancel:&Cancellation)->Result<(std::sync::Arc<dyn Provider>,RepositoryHandle,zeroize::Zeroizing<[u8;32]>)> {
+    #[cfg(test)]
+    {
+        let connection=test_source_connections().lock().map_err(super::runtime::local_error)?.get(&(connection_root.to_owned(),connection_id.to_owned())).cloned();
+        if let Some(connection)=connection {
+            cancel.check()?;
+            if connection.stored.descriptor.repository_id!=library_id {return Err(segment::corrupt());}
+            let (repository,_)=connection.provider.open_repository(&connection.stored.config,&SecretRef(connection.stored.credential_ref.clone()),OpenMode::Existing,cancel).await?;
+            if repository.repository_id!=connection.handle.repository_id || repository.connection_identity!=connection.handle.connection_identity {return Err(segment::corrupt());}
+            return Ok((connection.provider.clone(),repository,zeroize::Zeroizing::new(*connection.root_key)));
+        }
+    }
+    let stored = ConnectionStore::open(connection_root)?.read(connection_id)?;
     if stored.descriptor.repository_id != library_id {
         return Err(segment::corrupt());
     }
@@ -336,5 +583,5 @@ async fn remote_source(
         &stored.root_key_ref,
     )
     .await?;
-    Ok(Some((provider, repository, key)))
+    Ok((provider, repository, key))
 }

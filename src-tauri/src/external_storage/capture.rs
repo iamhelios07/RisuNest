@@ -127,6 +127,23 @@ impl BackupDependencySpool {
         self.sealed = true;
         Ok(())
     }
+    pub(crate) fn control(&self,hash:&str)->Result<Option<Vec<u8>>> {
+        self.body_with_role(hash,1)
+    }
+    pub(crate) fn payload(&self,hash:&str)->Result<Option<Vec<u8>>> {
+        self.body_with_role(hash,2)
+    }
+    fn body_with_role(&self,hash:&str,expected_role:i64)->Result<Option<Vec<u8>>> {
+        if !self.sealed {return Err(invalid("Backup dependency spool is not sealed"))}
+        let metadata:Option<(i64,i64)>=self.db.query_row("SELECT length(body),role FROM bodies WHERE hash=?1",[hash],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
+        let Some((length,role))=metadata else {return Ok(None)};
+        if role!=expected_role {return Ok(None)}
+        if length<0 || length as u64>risunest_sync_wire::MAX_METADATA_BYTES as u64 {return Err(invalid("Backup dependency spool body exceeds its bound"))}
+        let bytes:Vec<u8>=self.db.query_row("SELECT body FROM bodies WHERE hash=?1",[hash],|row|row.get(0))?;
+        let domain=if expected_role==1 {"native_backup_spool_control_read"}else{"native_backup_spool_payload_read"};
+        if bytes.len() as i64!=length || crate::persistent_store::external_capture::hash_backup_body(&bytes,domain)!=hash {return Err(invalid("Backup dependency spool integrity failed"))}
+        Ok(Some(bytes))
+    }
     pub(crate) fn visit(&self,visitor:&mut dyn FnMut(&str,&[u8],crate::persistent_store::external_capture::BackupBodyRole)->Result<()>) -> Result<()> {
         if !self.sealed {return Err(invalid("Backup dependency spool is not sealed"))}
         let mut statement = self.db.prepare("SELECT hash,length(body),body,role FROM bodies ORDER BY hash")?;
@@ -408,6 +425,8 @@ impl CaptureCatalog {
             return Err(invalid("Capture catalog is not durable"));
         }
         let mut digest = risunest_external_storage_format::format::FingerprintBuilder::new(scope);
+        #[cfg(test)]
+        crate::persistent_store::hash_work::observe("native_external_capture_fingerprint",b"risunest.external-fingerprint/v1\0".len()+32);
         let mut query = self
             .db
             .prepare("SELECT key,hash FROM records ORDER BY key")?;
@@ -422,6 +441,8 @@ impl CaptureCatalog {
             digest
                 .push(&key, &hash)
                 .map_err(|_| invalid("Capture records are not ordered"))?;
+            #[cfg(test)]
+            crate::persistent_store::hash_work::update("native_external_capture_fingerprint",40+key.len());
         }
         Ok(digest.finish())
     }

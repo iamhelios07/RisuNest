@@ -101,38 +101,18 @@ impl PersistentStore {
         check: impl Fn() -> Result<()>,
         on_object_done: impl Fn(),
     ) -> Result<()> {
-        if !Residency::exists(&self.repository_root) {
-            return Ok(());
-        }
-        let residency = Residency::open(&self.repository_root)?;
+        let residency = Residency::exists(&self.repository_root).then(||Residency::open(&self.repository_root)).transpose()?;
         let mut hydration = crate::server_sync::residency::HydrationSession::new(&self.repository_root, cancellation)?;
-        let mut completed = BTreeSet::new();
-        let mut hydrate = |hashes: &[String]| -> Result<()> {
-            check()?;
-            let mut registered = Vec::new();
-            for hash in hashes {
-                if !completed.contains(hash) && residency.object(hash, None)?.is_some() { registered.push(hash.clone()); }
-            }
-            if !hydration.hydrate_many_observed(&registered, &check, &on_object_done)?.is_empty() {
-                return Err(SyncError::new("required-asset-unavailable", 409));
-            }
-            completed.extend(registered);
-            Ok(())
-        };
-        if let Some(character_id) = selected_character_id {
-            hydrate(&self.selected_character_asset_hashes(character_id)?)?;
-        }
+        let priority=selected_character_id.map(|id|self.selected_character_asset_hashes(id)).transpose()?.unwrap_or_default().into_iter().collect::<BTreeSet<_>>();
+        let mut inventory=priority.iter().cloned().collect::<Vec<_>>();
+        let mut included=priority.clone();
         let mut cursor = None;
         loop {
             check()?;
-            // Custody records outlive physical GC. Preserve catalog files even
-            // without references, but do not revive deleted catalog entries.
             let page = self.query_asset_object_catalog(128, cursor.as_deref())?;
-            hydrate(&page.items.into_iter().map(|object| object.object_hash).collect::<Vec<_>>())?;
+            for object in page.items {if included.insert(object.object_hash.clone()) {inventory.push(object.object_hash);}}
             cursor = page.next_cursor;
-            if cursor.is_none() {
-                break;
-            }
+            if cursor.is_none() {break;}
         }
         // Restoring an older snapshot can roll back the live catalog while
         // newer retained snapshots still own remote payloads. GC protects these
@@ -146,7 +126,12 @@ impl PersistentStore {
             manifests.extend(root.manifest_hashes);
         }
         for manifest in manifests {
-            hydrate(std::slice::from_ref(&manifest))?;
+            // Ownership manifests must be available before their payload inventory is known.
+            let registered=residency.as_ref().map(|residency|residency.object(&manifest,None)).transpose()?.flatten().is_some()
+                || crate::external_storage::lww_residency::stat(&self.repository_root,&manifest)?.is_some();
+            if registered && !hydration.hydrate_many_observed(std::slice::from_ref(&manifest),&check,&on_object_done)?.is_empty() {
+                return Err(SyncError::new("required-asset-unavailable",409));
+            }
             // Missing or damaged local files remain for the backup's existing
             // preservation path. Only verified manifests supply dependencies.
             if let Some(bytes) = cas.read_object(&manifest)? {
@@ -163,7 +148,16 @@ impl PersistentStore {
                 }
             }
         }
-        hydrate(&historical.into_iter().collect::<Vec<_>>())?;
+        for hash in historical {if included.insert(hash.clone()) {inventory.push(hash);}}
+        let mut registered=Vec::new();
+        for hash in inventory {
+            check()?;
+            if residency.as_ref().map(|residency|residency.object(&hash,None)).transpose()?.flatten().is_some()
+                || crate::external_storage::lww_residency::stat(&self.repository_root,&hash)?.is_some() {registered.push(hash);}
+        }
+        if !hydration.hydrate_many_outcomes_prioritized(&registered,&priority,&check,|_,_|on_object_done())?.is_empty() {
+            return Err(SyncError::new("required-asset-unavailable",409));
+        }
         check()
     }
     fn residency_inventory(&self, guarded: bool) -> Result<Inventory> {

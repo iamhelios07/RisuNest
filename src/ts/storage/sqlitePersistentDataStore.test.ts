@@ -89,6 +89,12 @@ describe('SqlitePersistentDataStore', () => {
         mocks.invoke.mockReset()
     })
 
+    it('reads current binding authority through the existing native state command', async () => {
+        mocks.invoke.mockResolvedValue({targetAuthority:'9007199254740993'})
+        expect(await new SqlitePersistentDataStore().lwwBindingState()).toEqual({targetAuthority:'9007199254740993'})
+        expect(mocks.invoke).toHaveBeenCalledWith('pds_lww_binding_state', {})
+    })
+
     it('forwards LWW commands with decimal controls and the exact shared request envelope', async () => {
         const store = new SqlitePersistentDataStore()
         const header = {bindingAuthority:'authority', requestId:'request'}
@@ -631,25 +637,8 @@ describe('SqlitePersistentDataStore', () => {
         expect(mocks.invoke).toHaveBeenCalledTimes(16)
     })
 
-    it('retains the native open report and warns when a snapshot restore was skipped', async () => {
-        const openResult = {
-            revision: 12,
-            restoreFailure: 'persistent snapshot restore skipped: integrity check failed',
-        }
-        mocks.invoke.mockResolvedValue(openResult)
-        const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
-        const store = new SqlitePersistentDataStore()
 
-        expect(store.lastOpenResult).toBeNull()
-        await store.open()
-
-        expect(store.lastOpenResult).toEqual(openResult)
-        expect(warn).toHaveBeenCalledOnce()
-        expect(warn.mock.calls[0][0]).toContain(openResult.restoreFailure)
-        warn.mockRestore()
-    })
-
-    it('keeps the open report without warning when no snapshot restore was skipped', async () => {
+    it('keeps each native revision report without warning', async () => {
         const openResult = { revision: 3 }
         mocks.invoke.mockResolvedValue(openResult)
         const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
@@ -659,7 +648,6 @@ describe('SqlitePersistentDataStore', () => {
 
         expect(mocks.invoke).toHaveBeenCalledWith('pds_open')
         expect(store.lastOpenResult).toEqual(openResult)
-        expect(store.lastOpenResult?.restoreFailure).toBeUndefined()
         mocks.invoke.mockResolvedValueOnce({ revision: 4 })
         await store.open()
         expect(store.lastOpenResult).toEqual({ revision: 4 })

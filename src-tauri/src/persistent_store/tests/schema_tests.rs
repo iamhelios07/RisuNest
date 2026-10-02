@@ -1,5 +1,24 @@
 use super::*;
 
+#[test]
+fn plugin_gc_revision_tracks_generic_own_and_second_connection_writes() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = PersistentStore::open(directory.path()).unwrap();
+    let revision = || store.connection.query_row("SELECT revision FROM plugin_gc_revision WHERE singleton = 1", [], |row| row.get::<_, i64>(0)).unwrap();
+    let initial = revision();
+    store.connection.execute("INSERT INTO plugin_storage (generation,owner,storage_key,byte_size,ordinal,value) VALUES ('synthetic','synthetic','key',2,0,'{}')", []).unwrap();
+    assert_eq!(revision(), initial + 1);
+    store.connection.execute("UPDATE plugin_storage SET value = '[]' WHERE generation = 'synthetic'", []).unwrap();
+    assert_eq!(revision(), initial + 2);
+    let second = rusqlite::Connection::open(database_path(directory.path())).unwrap();
+    second.execute("DELETE FROM plugin_storage WHERE generation = 'synthetic'", []).unwrap();
+    assert_eq!(revision(), initial + 3);
+    drop(second);
+    drop(store);
+    let reopened = PersistentStore::open(directory.path()).unwrap();
+    assert_eq!(reopened.connection.query_row("SELECT revision FROM plugin_gc_revision WHERE singleton = 1", [], |row| row.get::<_, i64>(0)).unwrap(), initial + 3);
+}
+
 fn database_path(directory: &Path) -> PathBuf {
     directory.join("persistent").join("persistent.sqlite")
 }

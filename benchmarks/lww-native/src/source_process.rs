@@ -10,7 +10,7 @@ const REPLY_WAIT:Duration=Duration::from_secs(60);
 
 pub struct PrivateRegistration {pub uri:String}
 pub struct SourceProcess {
-    child:Child,input:ChildStdin,replies:mpsc::Receiver<Result<Value,String>>,
+    child:Child,input:Option<ChildStdin>,replies:mpsc::Receiver<Result<Value,String>>,
     pub ready:Value,pub raw_observations:Vec<Value>,request_sequence:u64,active:Option<(String,u64,String)>,ended:Option<EndReceipt>,
     events:Vec<Value>,failed:bool,stopped:bool,
     inventory:BTreeMap<String,BTreeSet<String>>,barrier:Option<(String,String)>,
@@ -78,7 +78,7 @@ impl SourceProcess {
                 }
             }
         });
-        let mut process=Self {child,input,replies,ready:Value::Null,raw_observations:vec![],request_sequence:0,active:None,ended:None,events:vec![],failed:false,stopped:false,
+        let mut process=Self {child,input:Some(input),replies,ready:Value::Null,raw_observations:vec![],request_sequence:0,active:None,ended:None,events:vec![],failed:false,stopped:false,
             inventory:BTreeMap::new(),barrier:None};
         let ready=process.exchange(json!({"op":"start","runId":run_id,"expectedSourceFingerprint":expected_source}),"ready")?;
         verify_ready(&ready,expected_source,expected_binary,run_id)?;process.ready=ready;Ok(process)
@@ -90,7 +90,8 @@ impl SourceProcess {
         let mut bytes=serde_json::to_vec(&command).map_err(|_|"source command encoding failed")?;bytes.push(b'\n');
         let limit=self.ready["maxCommandBytes"].as_u64().unwrap_or(67108864);
         if bytes.len() as u64>limit {self.failed=true;return Err("whole source command exceeds Ready resource limit".into());}
-        if self.input.write_all(&bytes).and_then(|_|self.input.flush()).is_err() {self.failed=true;return Err("source command write failed".into());}
+        let input=self.input.as_mut().ok_or("source stdin is closed")?;
+        if input.write_all(&bytes).and_then(|_|input.flush()).is_err() {self.failed=true;return Err("source command write failed".into());}
         loop {
             let reply=match self.replies.recv_timeout(REPLY_WAIT) {
                 Ok(Ok(reply))=>reply,
@@ -99,7 +100,8 @@ impl SourceProcess {
             };
             if matches!(reply["type"].as_str(),Some("scopeEnded"|"stopped"|"error")) {self.raw_observations.push(reply.clone());}
             if reply["type"]=="readBarrierReached" {self.events.push(reply);continue;}
-            if reply["type"]=="error" {self.failed=true;return Err("source process explicitly rejected command".into());}
+            if reply["type"]=="error" {self.failed=true;return Err(format!("source process explicitly rejected command: {}",
+                reply["error"].as_str().unwrap_or("unreported structural error")));}
             if reply["requestId"]!=id || reply["type"]!=expected {self.failed=true;return Err("source reply identity mismatch".into());}
             return Ok(reply);
         }
@@ -205,7 +207,18 @@ impl SourceProcess {
     }
 }
 impl Drop for SourceProcess {
-    fn drop(&mut self) {if !self.stopped {let _=self.child.kill();let _=self.child.wait();}}
+    fn drop(&mut self) {
+        if !self.stopped {
+            // EOF lets the private source drain readers and remove its synthetic root on failure.
+            drop(self.input.take());
+            let started=std::time::Instant::now();
+            while started.elapsed()<REPLY_WAIT {
+                match self.child.try_wait() {Ok(Some(_))=>return,Err(_)=>break,Ok(None)=>{}}
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let _=self.child.kill();let _=self.child.wait();
+        }
+    }
 }
 
 #[cfg(test)]

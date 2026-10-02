@@ -6,7 +6,7 @@ use super::{
 #[cfg(test)]
 use crate::persistent_store::lww::ApplyReceive;
 use crate::persistent_store::{
-    external_lww::{SealedBody, SealedPublication, UploadState},
+    external_lww::{FrozenAsset, SealedBody, SealedPublication, UploadState},
     lww::{Change, Header, MessageLocator, Progress, StageReceive},
     PersistentStore,
 };
@@ -21,6 +21,10 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(test)]
+use super::worker_observation::spawn_blocking;
+#[cfg(not(test))]
+use tokio::task::spawn_blocking;
 
 fn store_error(_: crate::persistent_store::StoreError) -> ProviderError {
     segment::corrupt()
@@ -268,6 +272,8 @@ pub(crate) struct ExternalLwwEngine {
     pub admission: Option<Admission>,
     pub connection_id: String,
     pub connection_root: std::path::PathBuf,
+    pub capabilities: super::capabilities::Capabilities,
+    pub descriptor: risunest_external_storage_format::format::Descriptor,
 }
 impl ExternalLwwEngine {
     pub(crate) fn target_scope(&self) -> String {
@@ -329,7 +335,7 @@ impl ExternalLwwEngine {
             let pending = store
                 .external_lww_pending(&self.target_scope(), &writer)
                 .map_err(store_error)?;
-            let (mut publication, mut sealed) = match pending {
+            let (publication, sealed) = match pending {
                 Some(value) => value,
                 None => {
                     let entries = store
@@ -349,14 +355,17 @@ impl ExternalLwwEngine {
                     let mut payload = Segment::new(&self.library, &writer, seq);
                     let mut selected = Vec::new();
                     let mut bodies = Vec::new();
+                    let mut assets = BTreeMap::new();
                     for entry in entries {
                         let mut candidate = payload.clone();
+                        let mut candidate_assets = assets.clone();
                         let mut added = Vec::new();
                         self.include_objects(
                             store,
                             &entry.value,
                             &mut candidate,
                             &mut added,
+                            &mut candidate_assets,
                             cancel,
                         )
                         .await?;
@@ -365,21 +374,47 @@ impl ExternalLwwEngine {
                             stamp: entry.stamp.clone(),
                             value: entry.value.clone(),
                         });
-                        if candidate.encode()?.len() > segment::SEGMENT_BYTES {
+                        if candidate.encode_capture()?.len() > segment::SEGMENT_BYTES {
                             if selected.is_empty() {
                                 return Err(ProviderError::new(ErrorKind::FileTooLarge));
                             }
                             break;
                         }
                         payload = candidate;
+                        assets = candidate_assets;
                         bodies.extend(added);
                         selected.push(entry);
                     }
-                    let plaintext = payload.encode()?;
+                    let plaintext = payload.encode_capture()?;
                     let payload_sha256 = segment::digest(&plaintext);
                     let bytes = Vec::new();
                     let sha256 = String::new();
                     let object_id = String::new();
+                    let assets = assets.into_values().collect::<Vec<_>>();
+                    let asset_job = if assets.is_empty() {
+                        None
+                    } else {
+                        let job = super::journal::JobIdentity {
+                            job_id: uuid::Uuid::new_v4().to_string(),
+                            connection_id: self.connection_id.clone(),
+                            repository_id: self.repository.repository_id.clone(),
+                            capture_id: format!("lww:{writer}:{seq}:{payload_sha256}"),
+                            capture: store.external_identity().map_err(store_error)?,
+                        };
+                        let root = store.repository_root().to_owned();
+                        let cas = crate::asset_repository::PayloadCas::new(&root).map_err(transient)?;
+                        let mut pins = crate::asset_repository::job_pins::DurableCasJob::begin(
+                            &root, &job.job_id,
+                            crate::asset_repository::job_pins::CasJobKind::OfficialPublicationOrExportPreparation,
+                            super::runtime::now_ms() as i64,
+                        ).map_err(transient)?;
+                        pins.pin_existing_batch(&cas, &assets.iter().filter(|asset| asset.local_pin).map(|asset| (
+                            asset.content_hash.clone(), asset.byte_length,
+                            crate::asset_repository::job_pins::CasObjectRole::DirectObject,
+                        )).collect::<Vec<_>>()).map_err(transient)?;
+                        pins.seal(store, super::runtime::now_ms() as i64).map_err(transient)?;
+                        Some(job)
+                    };
                     let publication = SealedPublication {
                         target: self.target_scope(),
                         writer: writer.clone(),
@@ -392,6 +427,9 @@ impl ExternalLwwEngine {
                         sealed: false,
                         entries: selected,
                         bodies,
+                        assets,
+                        asset_job,
+                        asset_catalogs: Vec::new(),
                         resume: None,
                         dispatched: false,
                         complete: false,
@@ -417,180 +455,385 @@ impl ExternalLwwEngine {
                 store
                     .external_lww_abandon_unsent(&self.target_scope(), &writer)
                     .map_err(store_error)?;
+                if let Some(job) = &publication.asset_job {
+                    crate::asset_repository::job_pins::DurableCasJob::open(store.repository_root(), &job.job_id)
+                        .and_then(|mut pins| pins.release(crate::asset_repository::job_pins::CasReleaseOutcome::Aborted))
+                        .map_err(transient)?;
+                }
                 continue;
             }
             #[cfg(test)]
             cycle_keys::observe(|work| {
                 work.selected_keys.extend(publication.entries.iter().map(|entry| entry.key.clone()));
             });
-            for index in 0..publication.bodies.len() {
-                if publication.bodies[index].complete {
-                    continue;
-                }
-                let body = publication.bodies[index].clone();
-                let bytes = URL_SAFE_NO_PAD
-                    .decode(&body.bytes)
-                    .map_err(|_| segment::corrupt())?;
-                let intent = self.intent(&body.object_id, ObjectRole::Pack, &bytes);
-                if publication.bodies[index].resume.is_none() {
-                    publication.bodies[index].resume = self
-                        .provider
-                        .begin_upload(&self.repository, &intent, cancel)
-                        .await?
-                        .map(Self::saved);
-                    store
-                        .external_lww_persist(&publication, &sealed)
-                        .map_err(store_error)?;
-                }
-                let resume = publication.bodies[index].resume.as_ref().map(Self::resume);
-                let receipt = self
-                    .provider
-                    .create_object(
-                        &self.repository,
-                        &intent,
-                        &BytesSource(bytes),
-                        resume.as_ref(),
-                        cancel,
-                    )
-                    .await?;
-                Self::validate_receipt(&intent, &receipt)?;
-                publication.bodies[index].locator = Some(receipt.locator);
-                publication.bodies[index].complete = true;
-                store
-                    .external_lww_persist(&publication, &sealed)
-                    .map_err(store_error)?;
-            }
-            if !publication.sealed {
-                let plain = URL_SAFE_NO_PAD
-                    .decode(&publication.payload)
-                    .map_err(|_| segment::corrupt())?;
-                let mut payload = Segment::decode(&plain)?;
-                for body in payload.large_bodies.values_mut() {
-                    body.locator = publication
-                        .bodies
-                        .iter()
-                        .find(|item| item.object_id == body.object_id)
-                        .and_then(|item| item.locator.clone());
-                    if body.locator.is_none() {
-                        return Err(segment::corrupt());
-                    }
-                }
-                let (bytes, payload_hash) = segment::seal(&payload, &self.root_key)?;
-                sealed = bytes;
-                publication.payload_sha256 = payload_hash;
-                publication.sha256 = segment::digest(&sealed);
-                publication.object_id =
-                    segment_object_id(&writer, publication.seq.0, &publication.sha256)?;
-                publication.sealed = true;
-                publication.payload = URL_SAFE_NO_PAD.encode(payload.encode()?);
-                store
-                    .external_lww_persist(&publication, &sealed)
-                    .map_err(store_error)?;
-            }
-            let intent = ObjectIntent {
-                job_id: self.library.clone(),
-                repository_id: self.repository.repository_id.clone(),
-                object_id: publication.object_id.clone(),
-                role: ObjectRole::Segment,
-                byte_length: sealed.len() as u64,
-                sha256: publication.sha256.clone(),
+            let completed = if let Some(job) = &publication.asset_job {
+                let protection = super::leases::LeaseContext {
+                    root: &self.connection_root,
+                    connection_id: &self.connection_id,
+                    writer_id: &writer,
+                    descriptor: &self.descriptor,
+                    root_key: &self.root_key,
+                    provider: self.provider.as_ref(),
+                    repository: &self.repository,
+                    clock: super::leases::system_clock(),
+                    protection_supported: self.capabilities.lease_operations,
+                    ledger: None,
+                };
+                let owner = match super::leases::admit_shared_work(&protection, &job.job_id, cancel).await? {
+                    super::leases::Admission::Admitted(owner) => owner,
+                    super::leases::Admission::Yield { reason } => return Err(super::leases::yield_error(reason)),
+                    super::leases::Admission::UnsupportedProtection => return Err(ProviderError::new(ErrorKind::Unsupported)),
+                };
+                owner.run(&protection, cancel, self.publish_captured(store, publication, sealed, cancel, Some((&owner, &protection)))).await?
+            } else {
+                self.publish_captured(store, publication, sealed, cancel, None).await?
             };
-            if publication.dispatched && !publication.complete {
-                let resume = publication.resume.as_ref().map(Self::resume);
-                match self
-                    .provider
-                    .reconcile_upload(&self.repository, &intent, resume.as_ref(), cancel)
-                    .await?
-                {
-                    UploadResolution::Complete(receipt) => {
-                        Self::validate_receipt(&intent, &receipt)?;
-                        publication.complete = true
-                    }
-                    UploadResolution::Resumable(state) => {
-                        publication.resume = Some(Self::saved(state))
-                    }
-                    UploadResolution::Conflict => return Err(segment::corrupt()),
-                    UploadResolution::RestartRequired => {}
-                }
-            }
-            if !publication.complete {
-                if publication.resume.is_none() {
-                    publication.resume = self
-                        .provider
-                        .begin_upload(&self.repository, &intent, cancel)
-                        .await?
-                        .map(Self::saved);
-                    store
-                        .external_lww_persist(&publication, &sealed)
-                        .map_err(store_error)?;
-                }
-                publication.dispatched = true;
-                store
-                    .external_lww_persist(&publication, &sealed)
-                    .map_err(store_error)?;
-                let resume = publication.resume.as_ref().map(Self::resume);
-                #[cfg(test)]
-                cycle_keys::observe(|work| {
-                    work.segment_attempts += 1;
-                    work.attempted_keys.extend(publication.entries.iter().map(|entry| entry.key.clone()));
-                });
-                let receipt = self
-                    .provider
-                    .create_object(
-                        &self.repository,
-                        &intent,
-                        &BytesSource(sealed.clone()),
-                        resume.as_ref(),
-                        cancel,
-                    )
-                    .await?;
-                Self::validate_receipt(&intent, &receipt)?;
-                publication.complete = true;
-            }
-            let payload = segment::open(
-                &sealed,
-                &self.library,
-                &writer,
-                publication.seq.0,
-                &self.root_key,
-            )?;
-            store
-                .external_lww_verify_versions(&self.target_scope(), &payload.changes)
-                .map_err(store_error)?;
-            self.register_sources(store, &payload, &publication.object_id)?;
-            for hash in payload
-                .message_pages
-                .keys()
-                .chain(payload.small_bodies.keys())
-                .chain(payload.large_bodies.keys())
-            {
-                store
-                    .external_lww_witness_object(&self.target_scope(), hash)
-                    .map_err(store_error)?;
-            }
-            store
-                .external_lww_record_seen(
-                    &self.target_scope(),
-                    &writer,
-                    publication.seq.0,
-                    &publication.sha256,
-                )
-                .map_err(store_error)?;
-            store
-                .external_lww_finish_publication(&publication, &sealed)
-                .map_err(store_error)?;
-            #[cfg(test)]
-            cycle_keys::observe(|work| {
-                work.accepted_publications += 1;
-                work.emitted_keys.extend(payload.changes.iter().map(|change| change.key.clone()));
-            });
-            result.segments.0 += 1;
-            result.units.0 += publication.entries.len() as u64;
-            result.bytes.0 += sealed.len() as u64;
+            result.segments.0 += completed.segments.0;
+            result.units.0 += completed.units.0;
+            result.bytes.0 += completed.bytes.0;
         }
         #[cfg(test)]
         key_operation.finish();
         Ok(result)
+    }
+    async fn publish_captured(
+        &self,
+        store: &mut PersistentStore,
+        mut publication: SealedPublication,
+        mut sealed: Vec<u8>,
+        cancel: &Cancellation,
+        protection: Option<(&super::leases::LeaseOwner, &super::leases::LeaseContext<'_>)>,
+    ) -> Result<PublicationResult> {
+        let mut result = PublicationResult::default();
+        Self::check_publication_authority(store, &publication)?;
+        if let Some(job) = &publication.asset_job {
+            if job.connection_id != self.connection_id || job.repository_id != self.repository.repository_id {
+                return Err(segment::corrupt());
+            }
+            let root = store.repository_root().to_owned();
+            let pins = crate::asset_repository::job_pins::DurableCasJob::open(&root, &job.job_id).map_err(transient)?;
+            let roots = pins.root_set().map_err(transient)?;
+            if publication.assets.iter().filter(|asset| asset.local_pin).any(|asset| !roots.object_hashes.contains(&asset.content_hash)) {
+                return Err(segment::corrupt());
+            }
+            if publication.asset_catalogs.is_empty() && publication.assets.iter().any(|asset| asset.byte_length <= segment::SMALL_BODY_BYTES as u64) {
+                let mut journal = super::journal::TransferJournal::open(
+                    &root.join("external-storage").join("lww-publications").join(&job.job_id),
+                    job.clone(),
+                ).map_err(transient)?;
+                let mut spools = Vec::new();
+                let mut sources = Vec::new();
+                for asset in publication.assets.iter().filter(|asset| asset.byte_length <= segment::SMALL_BODY_BYTES as u64) {
+                    Self::check_publication_authority(store, &publication)?;
+                    let source = if let Some(proof) = &asset.remote_source {
+                        let spool = super::lww_residency::spool_frozen_remote_body(
+                            proof, &root.join("external-storage").join("lww-publications").join(&job.job_id), cancel,
+                        ).await?.into_temp_path();
+                        Self::check_publication_authority(store, &publication)?;
+                        let source = super::content_store::ObjectSource::File(spool.to_path_buf());
+                        spools.push(spool);
+                        source
+                    } else if asset.server_source.is_some() {
+                        let mut body = Self::open_frozen_server_body(store, asset, job, publication.authority, cancel).await?;
+                        let scratch = root.join("external-storage").join("lww-publications").join(&job.job_id);
+                        let mut spool = tempfile::NamedTempFile::new_in(&scratch).map_err(transient)?;
+                        let mut chunk = [0; 64 * 1024];
+                        loop {
+                            Self::check_frozen_body_authority(store, publication.authority, cancel).map_err(|error| Self::body_source_error(error, cancel))?;
+                            let read = std::io::Read::read(&mut body, &mut chunk).map_err(transient)?;
+                            if read == 0 { break; }
+                            std::io::Write::write_all(&mut spool, &chunk[..read]).map_err(transient)?;
+                        }
+                        let spool = spool.into_temp_path();
+                        let source = super::content_store::ObjectSource::File(spool.to_path_buf());
+                        spools.push(spool);
+                        source
+                    } else { super::content_store::ObjectSource::Library(asset.content_hash.clone()) };
+                    sources.push(super::packaging::AssetCatalogSource {
+                        content_hash: asset.content_hash.clone(), byte_length: asset.byte_length, source,
+                    });
+                }
+                let completed = super::packaging::package_and_upload_asset_catalog(
+                    sources, &root,
+                    &self.connection_root.join("external-storage").join("package-cache").join(&self.connection_id),
+                    &self.root_key, super::packaging::PackageLimits::from_capabilities(&self.capabilities)?,
+                    &mut journal, self.provider.as_ref(), &self.repository,
+                    &super::phase_progress::PhaseProgress::silent(), cancel, protection,
+                ).await?;
+                publication.asset_catalogs.push(completed.catalog);
+                store.external_lww_persist(&publication, &sealed).map_err(store_error)?;
+            }
+        } else if !publication.assets.is_empty() || !publication.asset_catalogs.is_empty() {
+            return Err(segment::corrupt());
+        }
+        for index in 0..publication.bodies.len() {
+            if publication.bodies[index].complete {
+                continue;
+            }
+            if publication.bodies[index].bytes.is_empty() {
+                let body = &publication.bodies[index];
+                let asset = publication.assets.iter().find(|asset| asset.content_hash == body.content_hash)
+                    .ok_or_else(segment::corrupt)?;
+                let bytes = self.read_frozen_standalone(store, asset, publication.asset_job.as_ref().ok_or_else(segment::corrupt)?, publication.authority, cancel).await?;
+                if bytes.len() as u64 != asset.byte_length { return Err(segment::corrupt()); }
+                let sealed_body = segment::seal_body(&bytes, &self.library, &body.object_id, &self.root_key)?;
+                publication.bodies[index].sha256 = segment::digest(&sealed_body);
+                publication.bodies[index].byte_length = sealed_body.len() as u64;
+                publication.bodies[index].bytes = URL_SAFE_NO_PAD.encode(sealed_body);
+                store.external_lww_persist(&publication, &sealed).map_err(store_error)?;
+            }
+            let body = publication.bodies[index].clone();
+            let bytes = URL_SAFE_NO_PAD
+                .decode(&body.bytes)
+                .map_err(|_| segment::corrupt())?;
+            let intent = self.intent(&body.object_id, ObjectRole::Pack, &bytes);
+            if intent.sha256 != body.sha256 || intent.byte_length != body.byte_length { return Err(segment::corrupt()); }
+            if publication.bodies[index].resume.is_none() {
+                publication.bodies[index].resume = self
+                    .provider
+                    .begin_upload(&self.repository, &intent, cancel)
+                    .await?
+                    .map(Self::saved);
+                store
+                    .external_lww_persist(&publication, &sealed)
+                    .map_err(store_error)?;
+            }
+            let resume = publication.bodies[index].resume.as_ref().map(Self::resume);
+            let receipt = self
+                .provider
+                .create_object(
+                    &self.repository,
+                    &intent,
+                    &BytesSource(bytes),
+                    resume.as_ref(),
+                    cancel,
+                )
+                .await?;
+            Self::validate_receipt(&intent, &receipt)?;
+            publication.bodies[index].locator = Some(receipt.locator);
+            publication.bodies[index].complete = true;
+            store
+                .external_lww_persist(&publication, &sealed)
+                .map_err(store_error)?;
+        }
+        if !publication.sealed {
+            let plain = URL_SAFE_NO_PAD
+                .decode(&publication.payload)
+                .map_err(|_| segment::corrupt())?;
+            let mut payload = Segment::decode_capture(&plain)?;
+            payload.asset_catalogs = publication.asset_catalogs.clone();
+            for body in payload.large_bodies.values_mut() {
+                let prepared = publication
+                    .bodies
+                    .iter()
+                    .find(|item| item.object_id == body.object_id)
+                    .filter(|item| item.complete && !item.bytes.is_empty() && item.byte_length > 0)
+                    .ok_or_else(segment::corrupt)?;
+                body.sha256 = prepared.sha256.clone();
+                body.byte_length = DecimalU64(prepared.byte_length);
+                body.locator = prepared.locator.clone();
+                if body.locator.is_none() {
+                    return Err(segment::corrupt());
+                }
+            }
+            let (bytes, payload_hash) = segment::seal(&payload, &self.root_key)?;
+            sealed = bytes;
+            publication.payload_sha256 = payload_hash;
+            publication.sha256 = segment::digest(&sealed);
+            publication.object_id =
+                segment_object_id(&publication.writer, publication.seq.0, &publication.sha256)?;
+            publication.sealed = true;
+            publication.payload = URL_SAFE_NO_PAD.encode(payload.encode()?);
+            store
+                .external_lww_persist(&publication, &sealed)
+                .map_err(store_error)?;
+        }
+        let intent = ObjectIntent {
+            job_id: self.library.clone(),
+            repository_id: self.repository.repository_id.clone(),
+            object_id: publication.object_id.clone(),
+            role: ObjectRole::Segment,
+            byte_length: sealed.len() as u64,
+            sha256: publication.sha256.clone(),
+        };
+        if publication.dispatched && !publication.complete {
+            let resume = publication.resume.as_ref().map(Self::resume);
+            match self
+                .provider
+                .reconcile_upload(&self.repository, &intent, resume.as_ref(), cancel)
+                .await?
+            {
+                UploadResolution::Complete(receipt) => {
+                    Self::validate_receipt(&intent, &receipt)?;
+                    publication.complete = true
+                }
+                UploadResolution::Resumable(state) => {
+                    publication.resume = Some(Self::saved(state))
+                }
+                UploadResolution::Conflict => return Err(segment::corrupt()),
+                UploadResolution::RestartRequired => {}
+            }
+        }
+        if !publication.complete {
+            Self::check_publication_authority(store, &publication)?;
+            if let Some((owner, context)) = protection {
+                owner.renew_if_due(context, cancel).await?;
+                if let Some(reason) = owner.recheck(context, cancel).await? {
+                    return Err(super::leases::yield_error(reason));
+                }
+            }
+            if publication.resume.is_none() {
+                publication.resume = self
+                    .provider
+                    .begin_upload(&self.repository, &intent, cancel)
+                    .await?
+                    .map(Self::saved);
+                store
+                    .external_lww_persist(&publication, &sealed)
+                    .map_err(store_error)?;
+            }
+            publication.dispatched = true;
+            store
+                .external_lww_persist(&publication, &sealed)
+                .map_err(store_error)?;
+            let resume = publication.resume.as_ref().map(Self::resume);
+            #[cfg(test)]
+            cycle_keys::observe(|work| {
+                work.segment_attempts += 1;
+                work.attempted_keys.extend(publication.entries.iter().map(|entry| entry.key.clone()));
+            });
+            let receipt = self
+                .provider
+                .create_object(
+                    &self.repository,
+                    &intent,
+                    &BytesSource(sealed.clone()),
+                    resume.as_ref(),
+                    cancel,
+                )
+                .await?;
+            Self::validate_receipt(&intent, &receipt)?;
+            publication.complete = true;
+        }
+        let payload = segment::open(
+            &sealed,
+            &self.library,
+            &publication.writer,
+            publication.seq.0,
+            &self.root_key,
+        )?;
+        Self::check_publication_authority(store, &publication)?;
+        store
+            .external_lww_verify_versions(&self.target_scope(), &payload.changes)
+            .map_err(store_error)?;
+        self.admit_objects(store, &payload, &publication.object_id, cancel).await?;
+        for hash in payload
+            .message_pages
+            .keys()
+            .chain(payload.large_bodies.keys())
+        {
+            store
+                .external_lww_witness_object(&self.target_scope(), hash)
+                .map_err(store_error)?;
+        }
+        store
+            .external_lww_record_seen(
+                &self.target_scope(),
+                &publication.writer,
+                publication.seq.0,
+                &publication.sha256,
+            )
+            .map_err(store_error)?;
+        store
+            .external_lww_finish_publication(&publication, &sealed)
+            .map_err(store_error)?;
+        if let Some(job) = &publication.asset_job {
+            crate::asset_repository::job_pins::DurableCasJob::open(store.repository_root(), &job.job_id)
+                .and_then(|mut pins| pins.release(crate::asset_repository::job_pins::CasReleaseOutcome::Committed))
+                .map_err(transient)?;
+        }
+        #[cfg(test)]
+        cycle_keys::observe(|work| {
+            work.accepted_publications += 1;
+            work.emitted_keys.extend(payload.changes.iter().map(|change| change.key.clone()));
+        });
+        result.segments.0 += 1;
+        result.units.0 += publication.entries.len() as u64;
+        result.bytes.0 += sealed.len() as u64;
+        Ok(result)
+    }
+    fn check_publication_authority(store: &PersistentStore, publication: &SealedPublication) -> Result<()> {
+        if store.lww_binding_authority().map_err(store_error)? != publication.authority {
+            return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+        }
+        Ok(())
+    }
+    fn check_frozen_body_authority(store: &PersistentStore, authority: DecimalU64, cancel: &Cancellation) -> crate::server_sync::Result<()> {
+        cancel.check().map_err(|_| crate::server_sync::SyncError::new("operation-cancelled", 499))?;
+        if store.lww_binding_authority().map_err(|_| crate::server_sync::SyncError::new("binding-authority-unavailable", 409))? != authority {
+            return Err(crate::server_sync::SyncError::new("binding-authority-changed", 409));
+        }
+        Ok(())
+    }
+    fn body_source_error(error: crate::server_sync::SyncError, cancel: &Cancellation) -> ProviderError {
+        ProviderError::new(if cancel.check().is_err() { ErrorKind::Cancelled }
+            else if error.code == "binding-authority-changed" || error.code == "binding-authority-unavailable" { ErrorKind::PreconditionFailed }
+            else { ErrorKind::Transient })
+    }
+    async fn open_frozen_server_body(
+        store: &mut PersistentStore, asset: &FrozenAsset, job: &super::journal::JobIdentity,
+        authority: DecimalU64, cancel: &Cancellation,
+    ) -> Result<crate::server_sync::residency::TransientBody> {
+        let proof = asset.server_source.as_ref().ok_or_else(segment::corrupt)?.clone();
+        if proof.hash != asset.content_hash || proof.size != asset.byte_length { return Err(segment::corrupt()); }
+        let root = store.repository_root().to_owned();
+        let scratch = root.join("external-storage").join("lww-publications").join(&job.job_id);
+        let store = store.open_native_job_store().map_err(store_error)?;
+        let cancel = cancel.clone();
+        #[cfg(test)]
+        let hash_scope = crate::server_sync::hash_metrics::capture();
+        spawn_blocking(move || {
+            #[cfg(test)]
+            let _hash_scope = crate::server_sync::hash_metrics::enter(hash_scope);
+            std::fs::create_dir_all(&scratch).map_err(transient)?;
+            let check = || Self::check_frozen_body_authority(&store, authority, &cancel);
+            crate::server_sync::residency::open_transient_server_proof_with_check(&root, &scratch, &proof, &check)
+                .map_err(|error| Self::body_source_error(error, &cancel))?.ok_or_else(segment::corrupt)
+        }).await.map_err(transient)?
+    }
+    async fn read_frozen_standalone(
+        &self,
+        store: &mut PersistentStore,
+        asset: &FrozenAsset,
+        job: &super::journal::JobIdentity,
+        authority: DecimalU64,
+        cancel: &Cancellation,
+    ) -> Result<Vec<u8>> {
+        Self::check_frozen_body_authority(store, authority, cancel).map_err(|error| Self::body_source_error(error, cancel))?;
+        let bytes = if asset.local_pin {
+            store.lww_object_body(&asset.content_hash).map_err(store_error)?.ok_or_else(segment::corrupt)?
+        } else if let Some(proof) = &asset.remote_source {
+            let spool = super::lww_residency::spool_frozen_remote_body(
+                proof, &store.repository_root().join("external-storage").join("lww-publications").join(&job.job_id), cancel,
+            ).await?;
+            Self::check_frozen_body_authority(store, authority, cancel).map_err(|error| Self::body_source_error(error, cancel))?;
+            super::lww_residency::read_frozen_body_spool(proof, &spool, cancel)?
+        } else {
+            let mut body = Self::open_frozen_server_body(store, asset, job, authority, cancel).await?;
+            let mut bytes = Vec::new();
+            let mut chunk = [0; 64 * 1024];
+            loop {
+                Self::check_frozen_body_authority(store, authority, cancel).map_err(|error| Self::body_source_error(error, cancel))?;
+                let read = std::io::Read::read(&mut body, &mut chunk).map_err(transient)?;
+                if read == 0 { break; }
+                bytes.extend_from_slice(&chunk[..read]);
+            }
+            bytes
+        };
+        if bytes.len() as u64 != asset.byte_length || segment::digest(&bytes) != asset.content_hash {
+            return Err(segment::corrupt());
+        }
+        Ok(bytes)
     }
     fn validate_receipt(intent: &ObjectIntent, receipt: &ObjectReceipt) -> Result<()> {
         if !receipt.complete
@@ -694,7 +937,8 @@ impl ExternalLwwEngine {
         value: &UnitValue,
         payload: &mut Segment,
         bodies: &mut Vec<SealedBody>,
-        cancel: &Cancellation,
+        assets: &mut BTreeMap<String, FrozenAsset>,
+        _cancel: &Cancellation,
     ) -> Result<()> {
         let mut hashes = BTreeSet::new();
         if let UnitValue::Object { descriptor, .. } = value {
@@ -732,7 +976,7 @@ impl ExternalLwwEngine {
         }
         for hash in hashes {
             if payload.message_pages.contains_key(&hash)
-                || payload.small_bodies.contains_key(&hash)
+                || assets.contains_key(&hash)
                 || payload.large_bodies.contains_key(&hash)
                 || store
                     .external_lww_has_object(&self.target_scope(), &hash)
@@ -740,50 +984,43 @@ impl ExternalLwwEngine {
             {
                 continue;
             }
-            let bytes = if let Some(bytes) = store.lww_object_body(&hash).map_err(store_error)? {
-                bytes
-            } else {
-                let root = store.external_lww_root();
-                super::lww_residency::hydrate_missing(&root, &hash, cancel)
-                    .await?
-                    .ok_or_else(segment::corrupt)?;
-                store
-                    .lww_object_body(&hash)
-                    .map_err(store_error)?
-                    .ok_or_else(segment::corrupt)?
+            if store.external_lww_object_is_control(&hash).map_err(store_error)? {
+                let bytes = store.lww_object_body(&hash).map_err(store_error)?.ok_or_else(segment::corrupt)?;
+                payload.message_pages.insert(hash, URL_SAFE_NO_PAD.encode(bytes));
+                continue;
+            }
+            let root = store.repository_root();
+            let local_size = crate::asset_repository::PayloadCas::new(root).map_err(transient)?
+                .stat_object(&hash).map_err(transient)?;
+            let remote_source = if local_size.is_none() {
+                super::lww_residency::freeze_remote_body(root, &hash)?
+            } else { None };
+            let server_source = if local_size.is_none() && remote_source.is_none() {
+                if !crate::server_sync::residency::Residency::exists(root) { return Err(segment::corrupt()); }
+                Some(crate::server_sync::residency::Residency::open(root)
+                    .and_then(|residency| residency.object(&hash, None)).map_err(|_| ProviderError::new(ErrorKind::Transient))?
+                    .ok_or_else(segment::corrupt)?)
+            } else { None };
+            let byte_length = match local_size {
+                Some(size) => size,
+                None => match &remote_source {
+                    Some(source) => source.byte_length(),
+                    None => server_source.as_ref().ok_or_else(segment::corrupt)?.size,
+                },
             };
-            if store
-                .external_lww_object_is_control(&hash)
-                .map_err(store_error)?
-            {
-                payload
-                    .message_pages
-                    .insert(hash, URL_SAFE_NO_PAD.encode(bytes));
-            } else if bytes.len() <= segment::SMALL_BODY_BYTES {
-                payload
-                    .small_bodies
-                    .insert(hash, URL_SAFE_NO_PAD.encode(bytes));
-            } else {
+            assets.insert(hash.clone(), FrozenAsset {
+                content_hash: hash.clone(), byte_length, local_pin: local_size.is_some(), remote_source, server_source,
+            });
+            if byte_length > segment::SMALL_BODY_BYTES as u64 {
                 let id = uuid::Uuid::new_v4().to_string();
-                let sealed = segment::seal_body(&bytes, &self.library, &id, &self.root_key)?;
-                let sha = segment::digest(&sealed);
-                payload.large_bodies.insert(
-                    hash,
-                    LargeBody {
-                        object_id: id.clone(),
-                        sha256: sha.clone(),
-                        byte_length: DecimalU64(sealed.len() as u64),
-                        plaintext_byte_length: DecimalU64(bytes.len() as u64),
-                        locator: None,
-                    },
-                );
+                payload.large_bodies.insert(hash.clone(), LargeBody {
+                    object_id: id.clone(), sha256: "0".repeat(64), byte_length: DecimalU64(0),
+                    plaintext_byte_length: DecimalU64(byte_length), locator: None,
+                });
                 bodies.push(SealedBody {
-                    object_id: id,
-                    sha256: sha,
-                    bytes: URL_SAFE_NO_PAD.encode(sealed),
-                    resume: None,
-                    complete: false,
-                    locator: None,
+                    object_id: id, content_hash: hash, byte_length: 0,
+                    sha256: String::new(), bytes: String::new(), resume: None,
+                    complete: false, locator: None,
                 });
             }
         }
@@ -938,7 +1175,7 @@ impl ExternalLwwEngine {
         store: &mut PersistentStore,
         payload: &Segment,
         physical_segment: &str,
-        _cancel: &Cancellation,
+        cancel: &Cancellation,
     ) -> Result<()> {
         for (hash, encoded) in &payload.message_pages {
             let bytes = URL_SAFE_NO_PAD
@@ -949,20 +1186,13 @@ impl ExternalLwwEngine {
                 .external_lww_witness_object(&self.target_scope(), hash)
                 .map_err(store_error)?;
         }
-        for (hash, encoded) in &payload.small_bodies {
-            if !store
-                .external_lww_object_is_local(hash)
-                .map_err(store_error)?
-            {
-                let bytes = URL_SAFE_NO_PAD
-                    .decode(encoded)
-                    .map_err(|_| segment::corrupt())?;
-                store
-                    .lww_put_managed_object(hash, &bytes)
-                    .map_err(store_error)?;
-            }
+        let hashes = super::snapshot_restore::admit_asset_catalogs(
+            &payload.asset_catalogs, store, &self.library, physical_segment, &self.connection_id,
+            &self.connection_root, &self.root_key, self.provider.as_ref(), &self.repository, cancel,
+        ).await?;
+        for hash in hashes {
             store
-                .external_lww_witness_object(&self.target_scope(), hash)
+                .external_lww_witness_object(&self.target_scope(), &hash)
                 .map_err(store_error)?;
         }
         self.register_sources(store, payload, physical_segment)?;

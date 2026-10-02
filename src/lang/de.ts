@@ -1,5 +1,8 @@
 export const languageGerman = {
     risuNest: {
+        importDialog: {
+            warningUpstreamRestoreLosses: 'Einige Kaltlager- oder Inlay-Daten konnten nicht wiederhergestellt werden. Prüfen Sie die wiederhergestellten Daten.',
+        },
         plugins: {
             "removeTitle": "Dieses Plugin entfernen?",
             "removeDescription": "Beim Löschen der Plugin-Daten gehen Einstellungen und gespeicherte Inhalte auch bei einer Neuinstallation verloren. Behaltene Daten stehen nach der Neuinstallation wieder zur Verfügung.",
@@ -50,8 +53,8 @@ export const languageGerman = {
         "requestLogRemoved": "Dieses Anfrage-Protokoll wurde entfernt.",
         "requestLogRemovedDesc": "Dieses Anfrage-Protokoll wird entfernt, wenn der Client aktualisiert oder neu geladen wird.",
         "vertexAuthError": "Vertex AI-Authentifizierungsdetails fehlen.",
-        "coldStorageIncompleteRestoreConfirm": (characterNames: string, unavailableCount: number, unresolvedCount: number) =>
-            `Kaltlagerdaten für ${characterNames || "unbekannte Charaktere"} konnten nicht wiederhergestellt werden.${unresolvedCount > 0 ? ` ${unresolvedCount} Element(e) konnten keinem Charakter zugeordnet werden.` : ""}\n\nWenn Sie fortfahren, bleiben ${unavailableCount} Kaltlagerelement(e) nicht verfügbar. Die betroffenen Charakter- oder Chatdaten können dauerhaft verloren gehen.\n\nTrotzdem mit der unvollständigen Wiederherstellung fortfahren?`
+        "coldStorageIncompleteRestoreConfirm": (characterNames: string, unavailableCount: number, unresolvedCount: number, includeQuestion = true) =>
+            `Kaltlagerdaten für ${characterNames || "unbekannte Charaktere"} konnten nicht wiederhergestellt werden.${unresolvedCount > 0 ? ` ${unresolvedCount} Element(e) konnten keinem Charakter zugeordnet werden.` : ""}\n\nWenn Sie fortfahren, bleiben ${unavailableCount} Kaltlagerelement(e) nicht verfügbar. Die betroffenen Charakter- oder Chatdaten können dauerhaft verloren gehen.${includeQuestion ? "\n\nTrotzdem mit der unvollständigen Wiederherstellung fortfahren?" : ""}`
     },
     "showHelp": "Hilfe anzeigen",
     "help": {

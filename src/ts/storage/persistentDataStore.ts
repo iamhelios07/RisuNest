@@ -624,6 +624,7 @@ export interface PersistentDatabaseReplacementStage {
 }
 
 export interface PersistentDataStore {
+    lwwBindingState?(): Promise<{ targetAuthority: string }>
     lwwReadOutbox?(request: LwwOutboxRequest): Promise<LwwOutboxPage>
     lwwAckOutbox?(request: LwwAcknowledgeRequest): Promise<void>
     lwwClockState?(request: LwwReceiveHeader): Promise<LwwClockState>
