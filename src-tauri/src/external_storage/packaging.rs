@@ -4885,6 +4885,7 @@ mod tests {
             let observed=crate::asset_repository::body_io::take_body_io();
             assert!(!receipts.is_empty());
             assert!(receipts.iter().all(|receipt| receipt.completed && receipt.hashes.incomplete.is_empty()));
+            assert!(receipts.iter().any(|receipt| receipt.hashes.domains.get("external_content_put_verify").is_some_and(|work| work.calls>0 && work.bytes>0)));
             assert_eq!(receipts.len() as u64,observed.worker_scopes_started);
             assert_eq!(observed.worker_scopes_started,observed.worker_scopes_settled);
             assert!(observed.complete());

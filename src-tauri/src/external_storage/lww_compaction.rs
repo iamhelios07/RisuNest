@@ -19,8 +19,7 @@ async fn pause_compaction(job_id:&str) {
 }
 pub(crate) struct PublishedState {
     pub catalog: PublishedCatalog,
-    pub controls: BTreeMap<String,Vec<u8>>,
-    pub bodies: BTreeMap<String,Vec<u8>>,
+    pub body_spool: super::capture::BackupDependencySpool,
     pub standalone: BTreeMap<String,segment::LargeBody>,
     pub standalone_roots:BTreeMap<String,String>,
     pub asset_catalogs: Vec<wire::StoredObject>,
@@ -39,8 +38,16 @@ impl ExternalLwwEngine {
     pub(crate) async fn stage_published_objects(&self,store:&mut crate::persistent_store::PersistentStore,state:&mut PublishedState,directory:&Path,cancel:&Cancellation)->Result<()> {
         let root=store.external_lww_root();
         let cas=crate::asset_repository::PayloadCas::new(&root).map_err(error)?;
-        for (hash,bytes) in &state.controls { store.lww_put_object(hash,bytes).map_err(error)?; }
-        for (hash,bytes) in &state.bodies { if cas.stat_object(hash).map_err(error)?.is_none() {store.lww_put_managed_object(hash,bytes).map_err(error)?;} }
+        let staged=state.body_spool.visit(&mut |hash,bytes,role| {
+            if cancel.check().is_err() {return Err(crate::persistent_store::StoreError::Validation{message:"Published source staging cancelled".into()});}
+            match role {
+                crate::persistent_store::external_capture::BackupBodyRole::Control=>store.lww_put_object(hash,bytes)?,
+                crate::persistent_store::external_capture::BackupBodyRole::Payload=>if cas.stat_object(hash)?.is_none() {store.lww_put_managed_object(hash,bytes)?;},
+            }
+            Ok(())
+        });
+        cancel.check()?;
+        staged.map_err(error)?;
         for (hash,body) in &state.standalone {
             if cas.stat_object(hash).map_err(error)?.is_none() {
                 super::lww_residency::register(&root,&super::lww_residency::Source {hash:hash.clone(),library_id:self.library.clone(),connection_id:self.connection_id.clone(),connection_root:self.connection_root.clone(),protected_segment:state.standalone_roots.get(hash).cloned().ok_or_else(segment::corrupt)?,body:body.clone()})?;
@@ -101,7 +108,8 @@ impl ExternalLwwEngine {
         let mut snapshots=Vec::new();
         for receipt in self.snapshot_listing(cancel).await? { snapshots.push(self.checkpoint(&receipt,cancel).await?); }
         let retained=lww_checkpoint::retained(&snapshots.iter().map(|(_,s)|s.clone()).collect::<Vec<_>>())?;
-        let mut controls=BTreeMap::new(); let mut bodies=BTreeMap::new(); let mut standalone=BTreeMap::new(); let mut standalone_roots=BTreeMap::new(); let mut asset_catalogs=Vec::new();
+        let mut body_spool=super::capture::BackupDependencySpool::new(directory).map_err(error)?;
+        let mut standalone=BTreeMap::new(); let mut standalone_roots=BTreeMap::new(); let mut asset_catalogs=Vec::new();
         for (root,snapshot) in &snapshots {
             if !retained.contains(&snapshot.snapshot_id) { continue; }
             let data=RemoteObject::from_stored(&snapshot.library.record_catalog,&self.repository)?;
@@ -110,16 +118,20 @@ impl ExternalLwwEngine {
             let mut proof=PublishedCatalog::create(&stage.join("proof.sqlite"))?;
             let content=super::content_store::ContentStore::open(&stage.join("external-storage")).map_err(error)?;
             for record in records {
+                cancel.check()?;
+                if record.byte_length > risunest_sync_wire::MAX_METADATA_BYTES as u64 {return Err(segment::corrupt());}
                 let body=content.read_all(&record.content_hash).map_err(error)?;
-                let change:crate::persistent_store::lww::Change=risunest_sync_wire::canonical::decode(&body,body.len()).map_err(error)?;
+                let change:crate::persistent_store::lww::Change=risunest_sync_wire::canonical::decode(&body,risunest_sync_wire::MAX_METADATA_BYTES).map_err(error)?;
                 if record.key!=change.key.as_str() { return Err(segment::corrupt()); }
                 proof.merge(&change)?; catalog.merge(&change)?;
             }
             if proof.identity()?!=snapshot.state_identity { return Err(segment::corrupt()); }
             for object in objects {
+                cancel.check()?;
+                if object.byte_length > risunest_sync_wire::MAX_METADATA_BYTES as u64 {return Err(segment::corrupt());}
                 let bytes=match object.source { super::content_store::ObjectSource::Captured(hash)=>content.read_all(&hash).map_err(error)?, super::content_store::ObjectSource::File(path)=>std::fs::read(path).map_err(error)?, _=>return Err(segment::corrupt()) };
                 if segment::digest(&bytes)!=object.content_hash { return Err(segment::corrupt()); }
-                controls.insert(object.content_hash,bytes);
+                body_spool.push(&object.content_hash,&bytes,crate::persistent_store::external_capture::BackupBodyRole::Control).map_err(error)?;
             }
             catalog.include_prefixes(&snapshot.covered_prefixes);
             asset_catalogs.push(snapshot.library.asset_catalog.clone());
@@ -148,20 +160,23 @@ impl ExternalLwwEngine {
                 for change in &payload.changes { if change.stamp.physical_ms.0>upper { return Err(ProviderError::new(ErrorKind::ClockSkew)); } history.merge(change)?; }
                 identity=Some(hash.to_owned()); winner=Some((receipt,payload));
             }
-            if let Some((receipt,payload))=winner {
+            if let Some((receipt,mut payload))=winner {
                 if catalog.include_segment(&payload)? {
-                    for (hash,bytes) in &payload.message_pages { controls.insert(hash.clone(),URL_SAFE_NO_PAD.decode(bytes).map_err(error)?); }
+                    for (hash,bytes) in &payload.message_pages { body_spool.push(hash,&URL_SAFE_NO_PAD.decode(bytes).map_err(error)?,crate::persistent_store::external_capture::BackupBodyRole::Control).map_err(error)?; }
                     for (hash,bytes) in &payload.small_bodies {
                         let bytes=URL_SAFE_NO_PAD.decode(bytes).map_err(error)?;
                         if segment::digest(&bytes)!=*hash { return Err(segment::corrupt()); }
-                        bodies.insert(hash.clone(),bytes);
+                        body_spool.push(hash,&bytes,crate::persistent_store::external_capture::BackupBodyRole::Payload).map_err(error)?;
                     }
                     for (hash,source) in &payload.large_bodies { standalone.insert(hash.clone(),source.clone()); standalone_roots.insert(hash.clone(),super::contract::segment_object_id(&payload.writer_id,payload.seq.0,&identity.clone().ok_or_else(segment::corrupt)?)?); }
                 }
+                payload.message_pages.clear();
+                payload.small_bodies.clear();
                 segments.push((receipt,payload));
             }
         }
-        Ok(PublishedState {catalog,controls,bodies,standalone,standalone_roots,asset_catalogs,snapshots,segments})
+        body_spool.seal().map_err(error)?;
+        Ok(PublishedState {catalog,body_spool,standalone,standalone_roots,asset_catalogs,snapshots,segments})
     }
     pub(crate) async fn compact_published(&self,directory:&Path,job_id:&str,writer:&str,capabilities:&super::capabilities::Capabilities,cancel:&Cancellation,protection:Option<(&super::leases::LeaseOwner,&super::leases::LeaseContext<'_>)>) -> Result<super::packaging::CompletedSnapshot> {
         let state=self.published_state(&directory.join("inputs"),cancel).await?;
@@ -178,13 +193,20 @@ impl ExternalLwwEngine {
             capture.record(change.key.as_str(),&bytes).map_err(error)?;
         }
         if let Some(first)=changes.first() {
-            for (hash,bytes) in state.controls { capture.object(&hash,&bytes).map_err(error)?; capture.reference(first.key.as_str(),&hash,bytes.len() as u64).map_err(error)?; }
             let cas=crate::asset_repository::PayloadCas::new(directory).map_err(error)?;
-            for (hash,bytes) in state.bodies {
-                let prepared=cas.prepare_bytes(&bytes).map_err(error)?;
-                if prepared.content_hash!=hash { return Err(segment::corrupt()); }
-                capture.reference(first.key.as_str(),&hash,bytes.len() as u64).map_err(error)?;
-            }
+            let copied=state.body_spool.visit(&mut |hash,bytes,role| {
+                if cancel.check().is_err() {return Err(crate::persistent_store::StoreError::Validation{message:"Published source copying cancelled".into()});}
+                match role {
+                    crate::persistent_store::external_capture::BackupBodyRole::Control=>capture.object(hash,bytes)?,
+                    crate::persistent_store::external_capture::BackupBodyRole::Payload=>{
+                        let prepared=cas.prepare_bytes(bytes)?;
+                        if prepared.content_hash!=hash {return Err(crate::persistent_store::StoreError::Validation{message:"Published payload identity differs".into()});}
+                    }
+                }
+                capture.reference(first.key.as_str(),hash,bytes.len() as u64)
+            });
+            cancel.check()?;
+            copied.map_err(error)?;
         }
         capture.finish().map_err(error)?;
         let fingerprint=capture.content_fingerprint(&risunest_external_storage_format::format::library_fingerprint_domain()).map_err(error)?;
