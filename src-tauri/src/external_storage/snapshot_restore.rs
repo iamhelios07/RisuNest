@@ -1681,6 +1681,54 @@ pub(crate) struct DatabaseFirstSnapshot {
     pub required:BTreeSet<String>,
     pub present:BTreeSet<String>,
     pub missing:BTreeSet<String>,
+    pub sources:Vec<super::lww_residency::PackedSource>,
+}
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn admit_asset_catalogs(
+    catalogs:&[wire::StoredObject],store:&mut crate::persistent_store::PersistentStore,
+    library_id:&str,protected_segment:&str,connection_id:&str,connection_root:&Path,root_key:&[u8;32],
+    provider:&dyn Provider,repository:&RepositoryHandle,cancel:&Cancellation,
+) -> Result<Vec<String>> {
+    let scratch=super::leftovers::managed_scratch(store.repository_root(),"asset-catalog-")?;
+    let cas=PayloadCas::new(store.repository_root()).map_err(transient)?;
+    let mut planned=BTreeMap::<String,super::lww_residency::PackedSource>::new();
+    for catalog in catalogs {
+        if catalog.header.repository_id!=repository.repository_id || catalog.header.role!=wire::ObjectRole::Catalog {
+            return Err(corrupt("asset catalog repository or role differs"));
+        }
+        let root=RemoteObject::from_stored(catalog,repository)?;
+        let (entries,packs,_)=read_catalog(&root,wire::CatalogKind::Assets,root_key,scratch.path(),provider,repository,cancel).await?;
+        for entry in entries {
+            cancel.check()?;
+            if entry.kind!=wire::CatalogEntryKind::Object {return Err(corrupt("asset catalog kind differs"));}
+            let hash=hex::encode(entry.content_sha256);
+            let catalogued:Option<i64>=store.library_rows().query_row("SELECT byte_size FROM asset_objects WHERE object_hash=?1",[&hash],|row|row.get(0)).optional().map_err(transient)?;
+            let catalogued=catalogued.map(u64::try_from).transpose().map_err(corrupt)?;
+            if catalogued.is_some_and(|size|size!=entry.byte_length)
+                || cas.stat_object(&hash).map_err(transient)?.is_some_and(|size|size!=entry.byte_length) {
+                return Err(corrupt("immutable asset size differs"));
+            }
+            let ids=entry.chunks.iter().map(|chunk|chunk.pack_id.as_str()).collect::<BTreeSet<_>>();
+            let references=packs.iter().filter(|(id,_)|ids.contains(id.as_str())).map(|(_,pack)|pack.stored(repository)).collect::<Result<Vec<_>>>()?;
+            let source=super::lww_residency::PackedSource{hash:hash.clone(),byte_length:entry.byte_length,
+                library_id:library_id.into(),connection_id:connection_id.into(),connection_root:connection_root.into(),
+                protected_snapshot:protected_segment.into(),catalog:catalog.clone(),chunks:entry.chunks,packs:references};
+            super::lww_residency::validate_packed_source(&source,repository)?;
+            if let Some(previous)=planned.get(&hash) {
+                if previous.byte_length!=source.byte_length {return Err(corrupt("conflicting asset catalog body"));}
+            } else {planned.insert(hash,source);}
+        }
+    }
+    cancel.check()?;
+    let registrations=planned.values().map(|source|crate::persistent_store::asset_object_catalog::AssetObjectRegistration{object_hash:source.hash.clone(),byte_size:source.byte_length}).collect::<Vec<_>>();
+    for batch in registrations.chunks(crate::persistent_store::asset_object_catalog::ASSET_OBJECT_CATALOG_MAX_PAGE as usize) {
+        store.asset_object_catalog().register(batch,super::runtime::now_ms() as i64).map_err(transient)?;
+    }
+    for source in planned.values() {
+        cancel.check()?;
+        super::lww_residency::register_packed(store.repository_root(),source,repository)?;
+    }
+    Ok(planned.into_keys().collect())
 }
 pub(crate) async fn download_snapshot_database_first(snapshot:&RemoteObject,staging_root:&Path,library_root:&Path,connection_root:&Path,connection_id:&str,key:&[u8;32],provider:&dyn Provider,repository:&RepositoryHandle,cancel:&Cancellation)->Result<DatabaseFirstSnapshot> {
     if snapshot.role!=ObjectRole::BackupBundle {return Err(corrupt("full backup required"));}
@@ -1704,9 +1752,11 @@ pub(crate) async fn download_snapshot_database_first(snapshot:&RemoteObject,stag
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     ).map_err(transient)?;
     let mut required=BTreeSet::new();let mut present=BTreeSet::new();let mut missing=BTreeSet::new();
+    let mut sources=Vec::new();
     for entry in entries {
         if entry.kind!=wire::CatalogEntryKind::Object {return Err(corrupt("asset catalog kind"));}
-        let hash=hex::encode(entry.content_sha256);required.insert(hash.clone());
+        let hash=hex::encode(entry.content_sha256);
+        if !required.insert(hash.clone()) {return Err(corrupt("duplicate asset body"));}
         let catalogued: Option<i64> = metadata.query_row(
             "SELECT byte_size FROM asset_objects WHERE object_hash=?1", [&hash], |row| row.get(0),
         ).optional().map_err(transient)?;
@@ -1714,17 +1764,21 @@ pub(crate) async fn download_snapshot_database_first(snapshot:&RemoteObject,stag
         if catalogued.is_some_and(|size| size != entry.byte_length) {
             return Err(corrupt("local immutable body size differs from backup"));
         }
-        if catalogued == Some(entry.byte_length)
-            && cas.stat_object(&hash).map_err(transient)?==Some(entry.byte_length) {present.insert(hash.clone());}
-        else {
-            missing.insert(hash.clone());
-            let ids=entry.chunks.iter().map(|chunk|chunk.pack_id.as_str()).collect::<BTreeSet<_>>();
-            let references=packs.iter().filter(|(id,_)|ids.contains(id.as_str())).map(|(_,pack)|pack.stored(repository)).collect::<Result<Vec<_>>>()?;
-            super::lww_residency::register_packed(library_root,&super::lww_residency::PackedSource {hash:hash.clone(),byte_length:entry.byte_length,library_id:snapshot.repository_id.clone(),connection_id:connection_id.into(),connection_root:connection_root.into(),protected_snapshot:snapshot.object_id.clone(),catalog:document.library.asset_catalog.clone(),chunks:entry.chunks,packs:references},repository)?;
+        let local_size=cas.stat_object(&hash).map_err(transient)?;
+        if local_size.is_some_and(|size|size!=entry.byte_length) {
+            return Err(corrupt("local immutable body size differs from backup"));
         }
+        if local_size==Some(entry.byte_length) {present.insert(hash.clone());} else {
+            missing.insert(hash.clone());
+        }
+        let ids=entry.chunks.iter().map(|chunk|chunk.pack_id.as_str()).collect::<BTreeSet<_>>();
+        let references=packs.iter().filter(|(id,_)|ids.contains(id.as_str())).map(|(_,pack)|pack.stored(repository)).collect::<Result<Vec<_>>>()?;
+        let source=super::lww_residency::PackedSource {hash:hash.clone(),byte_length:entry.byte_length,library_id:snapshot.repository_id.clone(),connection_id:connection_id.into(),connection_root:connection_root.into(),protected_snapshot:snapshot.object_id.clone(),catalog:document.library.asset_catalog.clone(),chunks:entry.chunks,packs:references};
+        super::lww_residency::validate_packed_source(&source,repository)?;
+        sources.push(source);
         objects.push(PreparedObject{content_hash:hash.clone(),byte_length:entry.byte_length,source:ObjectSource::Library(hash)});
     }
-    Ok(DatabaseFirstSnapshot{snapshot:PreparedRemoteSnapshot{snapshot_id:document.snapshot_id,repository_id:snapshot.repository_id.clone(),fingerprint:hex::encode(document.library.content_fingerprint),library_fingerprint:hex::encode(document.library.content_fingerprint),logical_revision:document.revision.parse().map_err(corrupt)?,staging_root:staging_root.into(),records,objects,captured_by_device:document.captured_by_device},original_units,required,present,missing})
+    Ok(DatabaseFirstSnapshot{snapshot:PreparedRemoteSnapshot{snapshot_id:document.snapshot_id,repository_id:snapshot.repository_id.clone(),fingerprint:hex::encode(document.library.content_fingerprint),library_fingerprint:hex::encode(document.library.content_fingerprint),logical_revision:document.revision.parse().map_err(corrupt)?,staging_root:staging_root.into(),records,objects,captured_by_device:document.captured_by_device},original_units,required,present,missing,sources})
 }
 pub(crate) async fn download_snapshot(
     snapshot: &RemoteObject,

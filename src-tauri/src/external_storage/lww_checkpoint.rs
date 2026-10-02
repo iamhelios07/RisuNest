@@ -22,7 +22,7 @@ pub(crate) struct Checkpoint {
     pub asset_catalogs: Vec<risunest_external_storage_format::snapshot::StoredObject>,
     pub standalone_bodies: BTreeMap<String, segment::LargeBody>,
 }
-mod nested_metadata {
+pub(super) mod nested_metadata {
     use serde::{Serialize,Deserialize,Serializer,Deserializer,de::{DeserializeOwned,Error}};
     use serde_json::Value;
     pub fn serialize<T:Serialize,S:Serializer>(value:&T,serializer:S)->Result<S::Ok,S::Error> {
