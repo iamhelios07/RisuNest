@@ -618,6 +618,11 @@ export interface PersistentRevisionLease extends PersistentRevisionReader {
     release(): Promise<void>
 }
 
+export interface PersistentDatabaseReplacementStage {
+    activate(): Promise<{revision: DataRevision}>
+    abort(): Promise<void>
+}
+
 export interface PersistentDataStore {
     lwwReadOutbox?(request: LwwOutboxRequest): Promise<LwwOutboxPage>
     lwwAckOutbox?(request: LwwAcknowledgeRequest): Promise<void>
@@ -675,6 +680,13 @@ export interface PersistentDataStore {
         expectedRevision: DataRevision,
         signal?: AbortSignal,
     ): Promise<{ revision: DataRevision }>
+    stageDatabaseReplacement?(
+        database: Database,
+        expectedRevision?: DataRevision,
+        assetAliases?: AssetAlias[],
+        pluginStorageValues?: PluginStorageValue[],
+        replacementHeader?: LwwReceiveHeader,
+    ): Promise<PersistentDatabaseReplacementStage>
     replaceFromDatabase(
         database: Database,
         expectedRevision?: DataRevision,

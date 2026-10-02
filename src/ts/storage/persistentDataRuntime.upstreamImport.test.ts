@@ -1,14 +1,16 @@
 import {beforeEach,describe,expect,it,vi} from 'vitest'
 vi.mock('../platform',()=>({isTauri:true}))
+const plugins=vi.hoisted(()=>({fencePluginExecutionForAuthorityReplacement:vi.fn(async()=>{}),invalidatePluginCachesAfterAuthorityReplacement:vi.fn(async()=>{}),restartPluginsAfterAuthorityReplacement:vi.fn(async()=>{})}))
 const binding=vi.hoisted(()=>({bound:true,state:{targetAuthority:'9007199254740993'},fence:vi.fn(async()=>{}),assertAuthority:vi.fn(async()=>{}),resume:vi.fn(async()=>{})}))
 vi.mock('./sync/bindingRegistry',()=>({prepareBoundLibraryReplacement:async()=>binding}))
 vi.mock('../alert',()=>({alertCheckboxConfirm:async()=>({confirmed:true,checked:true})}))
-vi.mock('../plugins/apiV3/v3.svelte',()=>({fencePluginExecutionForAuthorityReplacement:async()=>{},invalidatePluginCachesAfterAuthorityReplacement:async()=>{},restartPluginsAfterAuthorityReplacement:async()=>{}}))
+vi.mock('../plugins/apiV3/v3.svelte',()=>plugins)
 import type {Database} from './database.svelte'
 import type {PersistentDataStore,PersistentRevisionLease} from './persistentDataStore'
 import {capturePersistentPluginStorage,capturePersistentPresets,capturePersistentRoot,createPersistentDataRuntime} from './persistentDataRuntime'
 import type {OfficialRevisionPublisher} from './saveCoordinator'
 import {makeDatabase} from './saveCoordinator.testSupport'
+import {runNativeBlockRisuSaveRestore,type NativeFileJobStatus} from './nativeFileJobs'
 import {retryCommittedWorkingSetRefreshWithContinuation} from './committedWorkingSetContinuation'
 async function createHarness(officialPublisher?: OfficialRevisionPublisher, captureWorkingSet = false) {
     let database = makeDatabase()
@@ -21,6 +23,7 @@ async function createHarness(officialPublisher?: OfficialRevisionPublisher, capt
     const onBackgroundError = vi.fn()
     const publishPresetWorkingSet = vi.fn()
     const store = {
+        commitWorkingSetChangeCursor:vi.fn(async()=>{}),
         open: vi.fn(async () => undefined),
         readRoot: vi.fn(async () => ({ revision, value: capturePersistentRoot(durable) })),
         commit: vi.fn(async () => { throw new Error('Unexpected content commit') }),
@@ -110,7 +113,7 @@ async function createHarness(officialPublisher?: OfficialRevisionPublisher, capt
     }
 }
 
-beforeEach(()=>{binding.bound=true;binding.fence.mockClear();binding.assertAuthority.mockClear();binding.resume.mockClear()})
+beforeEach(()=>{vi.clearAllMocks();plugins.restartPluginsAfterAuthorityReplacement.mockImplementation(async()=>{});binding.bound=true;binding.fence.mockClear();binding.assertAuthority.mockClear();binding.resume.mockReset();binding.resume.mockImplementation(async()=>{})})
 describe('direct native upstream import publication',()=>{
     it.each([{expectedRevision:99},{expectedMutationGeneration:99}])('preserves snapshot expectation before direct native staging: %j',async expectation=>{
         const h=await createHarness()
@@ -167,5 +170,86 @@ describe('direct native upstream import publication',()=>{
         expect(h.runtime.hasPendingOfficialPublication()).toBe(false)
         expect(pin).not.toHaveBeenCalled()
         expect(h.database.username).toBe('Second')
+    })
+})
+
+
+describe('native upstream job activation recovery with the real runtime',()=>{
+    it.each(['observer','finalize-response','status-response','late','inaccessible','restart','resume'] as const)('reconciles before strict adoption and resumes once: %s',async failure=>{
+        const h=await createHarness()
+        const incoming={...makeDatabase(),username:'Native staged import'}
+        const result={revision:2,sourceBytes:16,sourceSha256:'a'.repeat(64),characterCount:1,presetCount:0,warningCodes:[]}
+        let submitted=false
+        let finished=false
+        let unavailable=false
+        const events:string[]=[]
+        vi.mocked(h.store.commitWorkingSetChangeCursor!).mockImplementation(async revision=>{events.push(`cursor-${revision}`)})
+        plugins.restartPluginsAfterAuthorityReplacement.mockImplementation(async()=>{
+            expect(h.database.username).toBe(incoming.username)
+            expect(()=>h.runtime.markPersistentDataDirty(1)).toThrow()
+            expect(events).toContain('cursor-2')
+            await expect(h.runtime.commitPersistentUnitIntent('plugin-initial-setter',[{type:'set',key:JSON.stringify(['root','username']),value:'Stale plugin setter'}])).rejects.toThrow()
+            if(failure==='restart'&&plugins.restartPluginsAfterAuthorityReplacement.mock.calls.length===1)throw new Error('fresh restart failed')
+            events.push('restart')
+        })
+        binding.resume.mockImplementation(async()=>{
+            expect(events).toContain('restart')
+            expect(()=>h.runtime.markPersistentDataDirty(1)).not.toThrow()
+            if(failure==='resume'&&binding.resume.mock.calls.length===1)throw new Error('adapter resume failed')
+            events.push('resume')
+        })
+        const invoke=vi.fn(async(command:string)=>{
+            if(command==='native_file_job_start') return {jobId:'synthetic-recovery'}
+            if(command==='native_file_job_status'){
+                events.push('native-status')
+                if(unavailable) throw new Error('status inaccessible')
+                if(!submitted) return {state:'waitingForInput',phase:'awaiting-activation',kind:'restore-block-risu-save'} as NativeFileJobStatus
+                if(failure==='status-response'&&!finished){finished=true;throw new Error('status response lost')}
+                return {state:finished?'succeeded':'running',phase:finished?'complete':'activating-database',kind:'restore-block-risu-save',...(finished?{result}:{})} as NativeFileJobStatus
+            }
+            if(command==='native_file_job_finalize'){
+                submitted=true
+                if(failure!=='late'&&failure!=='inaccessible'){h.nativeCommit(incoming);finished=failure!=='status-response'}
+                if(failure==='finalize-response'||failure==='late'||failure==='inaccessible'||failure==='restart'){
+                    unavailable=failure==='inaccessible'
+                    throw new Error('finalize response lost')
+                }
+                return {outcome:'requested'}
+            }
+            if(command==='native_file_job_forget') return true
+            throw new Error(`Unexpected native command ${command}`)
+        })
+        const followup=vi.fn(async()=>{})
+        await expect(runNativeBlockRisuSaveRestore(h.runtime,{type:'desktopPath',path:'E:/synthetic/upstream.risudat'},
+            {afterRefresh:followup,onNativeStatus:async status=>{if((failure==='observer'||failure==='resume')&&status.state==='succeeded')throw new Error('committed observer failed')}},
+            {isTauri:()=>true,invoke,wait:async()=>{}})).rejects.toThrow()
+        expect(()=>h.runtime.markPersistentDataDirty(1)).toThrow()
+        expect(binding.resume).not.toHaveBeenCalled()
+        const projections=h.replaceDatabase.mock.calls.length
+        if(failure==='late'||failure==='inaccessible'){
+            await expect(h.runtime.retryCommittedWorkingSetRefresh()).resolves.toMatchObject({projection:'refresh-required'})
+            expect(h.replaceDatabase).toHaveBeenCalledTimes(projections)
+            expect(plugins.restartPluginsAfterAuthorityReplacement).not.toHaveBeenCalled()
+            expect(binding.resume).not.toHaveBeenCalled()
+            expect(()=>h.runtime.markPersistentDataDirty(1)).toThrow()
+            if(failure==='inaccessible') return
+            h.nativeCommit(incoming);finished=true
+        }
+        if(failure==='restart'||failure==='resume'){
+            await expect(h.runtime.retryCommittedWorkingSetRefresh()).resolves.toMatchObject({projection:'refresh-required'})
+            expect(()=>h.runtime.markPersistentDataDirty(1)).toThrow()
+            expect(followup).not.toHaveBeenCalled()
+        }
+        await expect(h.runtime.retryCommittedWorkingSetRefresh()).resolves.toEqual({kind:'committed',revision:2,projection:'applied'})
+        expect(h.database.username).toBe(incoming.username)
+        expect(h.runtime.pendingWorkingSetRefreshRevision).toBeNull()
+        expect(plugins.restartPluginsAfterAuthorityReplacement).toHaveBeenCalledTimes(failure==='restart'?2:1)
+        expect(binding.resume).toHaveBeenCalledTimes(failure==='resume'?2:1)
+        expect(followup).toHaveBeenCalledExactlyOnceWith(true)
+        expect(invoke.mock.calls.filter(([command])=>command==='native_file_job_finalize')).toHaveLength(1)
+        expect(events.indexOf('cursor-2')).toBeLessThan(events.indexOf('restart'))
+        expect(events.indexOf('restart')).toBeLessThan(events.indexOf('resume'))
+        expect(invoke.mock.calls.filter(([command])=>command==='native_file_job_forget')).toHaveLength(1)
+        await expect(retryCommittedWorkingSetRefreshWithContinuation(h.runtime)).resolves.toBeNull()
     })
 })

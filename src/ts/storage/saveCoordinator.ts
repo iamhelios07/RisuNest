@@ -3475,14 +3475,21 @@ export class SaveCoordinator {
         this.assertPersistentMutationAllowed()
         return this.enqueue(async () => {
             if (publishOfficial) {
-                await this.finishExplicitCommit(revision)
+                await this.finishExplicitCommit(Math.max(revision, this.pendingPublicationRevision ?? revision,
+                    this.deferredPublicationRevision ?? revision))
                 return
             }
-            const stale = this.pendingPublication
-            this.pendingPublication = null
-            this.pendingPublicationRevision = null
-            this.deferredPublicationRevision = null
-            this.cancelOfficialPublishRetry()
+            const stale = this.pendingPublicationRevision !== null && this.pendingPublicationRevision <= revision
+                ? this.pendingPublication : null
+            if (this.pendingPublicationRevision !== null && this.pendingPublicationRevision <= revision) {
+                this.pendingPublication = null
+                this.pendingPublicationRevision = null
+            }
+            if (this.deferredPublicationRevision !== null && this.deferredPublicationRevision <= revision) {
+                this.deferredPublicationRevision = null
+            }
+            if (this.pendingPublicationRevision === null && this.deferredPublicationRevision === null) this.cancelOfficialPublishRetry()
+            else this.armOfficialPublishRetry(this.officialPublishDelayMs())
             if (stale) await this.disposeOrQueuePublication(stale)
         })
     }

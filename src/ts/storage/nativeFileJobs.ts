@@ -485,6 +485,8 @@ export type NativeBlockRestoreRuntime = Pick<
     | 'withPausedPersistentWrites'
     | 'beginActivatedLibraryGuard'
     | 'refreshActivatedLibraryUnderPause'
+    | 'setActivatedLibraryRecoveryLifecycle'
+    | 'store'
 >
 
 export interface NativeFileJobOptions {
@@ -578,7 +580,7 @@ export interface NativeFileRestoreJobOptions extends NativeFileJobOptions {
         preview: NativeStagedPluginPreview,
         remembered: NativeStagedPluginChoice | null,
     ): Promise<NativeStagedPluginChoice | null>
-    afterRefresh?(): void | Promise<void>
+    afterRefresh?(pluginsAlreadyRestarted?: boolean): void | Promise<void>
     onBlockingChange?(blocking: boolean): void
 }
 
@@ -1507,6 +1509,29 @@ async function runNativeReplacementRestore(
                 }
                 // Finalization uses the exact token captured after preparation and choices.
                 activationSubmitted = true
+                if (upstreamPause) {
+                    runtime.setActivatedLibraryRecoveryLifecycle(upstreamPause.token, {
+                        async beforeRefresh() {
+                            await upstreamBinding!.assertAuthority()
+                            if (!terminal || !['succeeded', 'failed', 'cancelled'].includes(terminal.state)) {
+                                terminal = await invokeNative(dependencies, 'native_file_job_status', {jobId: started.jobId}) as NativeFileJobStatus
+                            }
+                            if (!['succeeded', 'failed', 'cancelled'].includes(terminal.state)) throw new Error('Native activation is not terminal')
+                            if (terminal.state === 'succeeded') {
+                                if (!terminal.result) throw new Error('Native activation result is unavailable')
+                                return terminal.result.revision
+                            }
+                            const current = await runtime.store.readRoot()
+                            if (current.revision !== upstreamPause!.fence.revision) throw new Error('Failed native activation changed the library')
+                            return current.revision
+                        },
+                        async afterRefresh() {
+                            const plugins = await import('../plugins/apiV3/v3.svelte')
+                            await plugins.invalidatePluginCachesAfterAuthorityReplacement()
+                            await plugins.restartPluginsAfterAuthorityReplacement()
+                        },
+                    })
+                }
                 await invokeNative(dependencies, 'native_file_job_finalize', {
                     jobId: started.jobId,
                     expectedRevision: replacementFence.revision,
@@ -1554,7 +1579,7 @@ async function runNativeReplacementRestore(
                     options.onStatus?.(
                         syntheticNativeFileJobStatus(terminal, 'reloading-plugins'),
                     )
-                    await options.afterRefresh?.()
+                    await options.afterRefresh?.(upstreamPause ? true : undefined)
                 } catch {
                     committedResult.warningCodes = mergeWarningCodes(
                         committedResult.warningCodes, ['post-refresh-followup-failed'],
@@ -1626,11 +1651,13 @@ async function runNativeReplacementRestore(
                 const outcome = await replacementFence.refreshCommittedWorkingSet(
                     terminal.result.revision,
                 )
-                await upstreamPause?.finish()
-                if (upstreamBinding) {
+                if (upstreamPause) {
                     const plugins = await import('../plugins/apiV3/v3.svelte')
                     await plugins.invalidatePluginCachesAfterAuthorityReplacement()
-                    await upstreamBinding.resume()
+                    await plugins.restartPluginsAfterAuthorityReplacement()
+                    upstreamPause.complete()
+                    await upstreamPause.finish()
+                    await upstreamBinding!.resume()
                 }
                 replacementFence.release()
                 replacementFence = undefined
@@ -1645,16 +1672,6 @@ async function runNativeReplacementRestore(
                 }
                 await continueAfterRefresh()
             } catch (error) {
-                if (upstreamPause) {
-                    runtime.markCommittedWorkingSetRefreshRequired(terminal.result.revision, error)
-                    registerCommittedWorkingSetContinuation(terminal.result.revision, runtime,
-                        runtime.getStorageAuthorityEpoch(), async () => {
-                            const plugins = await import('../plugins/apiV3/v3.svelte')
-                            await plugins.invalidatePluginCachesAfterAuthorityReplacement()
-                            await upstreamBinding?.resume()
-                            await continueAfterRefresh()
-                        })
-                }
                 throw new NativeFileJobActivationCommittedError(
                     terminal.result.revision,
                     error,
@@ -1678,7 +1695,17 @@ async function runNativeReplacementRestore(
         } catch {}
         throw error
     } catch (error) {
-        if (!terminal) {
+        if (upstreamPause && activationSubmitted && (!terminal || terminal.state === 'succeeded' || !['failed', 'cancelled'].includes(terminal.state))) {
+            const minimumRevision = terminal?.result?.revision ?? upstreamPause.fence.revision
+            runtime.markCommittedWorkingSetRefreshRequired(minimumRevision, error)
+            registerCommittedWorkingSetContinuation(minimumRevision, runtime, runtime.getStorageAuthorityEpoch(), async () => {
+                await upstreamBinding!.assertAuthority()
+                await upstreamBinding!.resume()
+                try { await options.afterRefresh?.(upstreamPause ? true : undefined) } catch {}
+                try { await invokeNative(dependencies, 'native_file_job_forget', {jobId: started.jobId}) } catch {}
+            }, undefined, true)
+        }
+        if (!terminal && !activationSubmitted) {
             try {
                 await invokeNative(dependencies, 'native_file_job_cancel', {
                     jobId: started.jobId,

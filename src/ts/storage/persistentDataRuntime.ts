@@ -1,5 +1,5 @@
 import { canonicalJson, canonicalClone } from './saveCoordinatorHelpers'
-import {registerCommittedWorkingSetContinuation} from './committedWorkingSetContinuation'
+import {continueCommittedWorkingSetRefresh, hasRetryableCommittedWorkingSetContinuation, rebaseCommittedWorkingSetContinuation, registerCommittedWorkingSetContinuation} from './committedWorkingSetContinuation'
 import { diffRootMutations } from './rootMutation'
 import { generatingConversations } from './generatingConversationRegistry'
 import { captureLwwWorkingSetBaseline, applyLwwWorkingSetUnits } from './lwwWorkingSetApply'
@@ -365,9 +365,15 @@ export interface PersistentActivatedLibraryGuard {
     abortUnchanged(): Promise<void>
 }
 
+export interface ActivatedLibraryRecoveryLifecycle {
+    beforeRefresh(): Promise<number | void>
+    afterRefresh(): Promise<void>
+}
+
 export interface PersistentDataRuntime {
     withPausedPersistentWrites<T>(reason: string, operation: (token: PersistentMutationToken) => Promise<T>): Promise<T>
     beginActivatedLibraryGuard(token: PersistentMutationToken): PersistentActivatedLibraryGuard
+    setActivatedLibraryRecoveryLifecycle(token: PersistentMutationToken, lifecycle: ActivatedLibraryRecoveryLifecycle): void
     refreshActivatedLibraryUnderPause(token: PersistentMutationToken): Promise<CommittedApplyOutcome>
     applyLwwReceive(request: LwwStageReceive): Promise<LwwApplyResult>
     drainLwwDeferred(request: LwwReceiveHeader): Promise<LwwApplyResult>
@@ -568,7 +574,7 @@ export function createPersistentDataRuntime(
     dependencies: PersistentDataRuntimeDependencies,
 ): PersistentDataRuntime {
     let workingSet: ActiveWorkingSet
-    let activatedLibraryGuard: { owner: symbol; ready: boolean } | null = null
+    let activatedLibraryGuard: { owner: symbol; ready: boolean; lifecycle?: ActivatedLibraryRecoveryLifecycle } | null = null
     let pendingRefreshChangeSet: ReplacementChangeSet | null = null
     const captureChanges = (changes: Partial<ReplacementChangeSet>): ReplacementChangeSet => ({
         root: changes.root ?? false,
@@ -888,6 +894,7 @@ export function createPersistentDataRuntime(
             deferredContentPending = projected.deferred
             if (!projected.deferred) await commitContentCursor(revision, activatedLibraryGuard !== null)
             if (activatedLibraryGuard) {
+                await activatedLibraryGuard.lifecycle?.afterRefresh()
                 coordinator.finishActivatedLibraryGuard(activatedLibraryGuard.owner)
                 activatedLibraryGuard = null
             }
@@ -916,11 +923,14 @@ export function createPersistentDataRuntime(
                     }
                     try {
                         coordinator.assertDestructiveReplacementFence(owner)
+                        const reconciledRevision = await activatedLibraryGuard?.lifecycle?.beforeRefresh()
+                        coordinator.assertDestructiveReplacementFence(owner)
                         const latest = await dependencies.store.readRoot()
                         coordinator.assertDestructiveReplacementFence(owner)
                         const minimum = Math.max(
                             minimumRevision,
                             coordinator.pendingWorkingSetRefreshRevision ?? minimumRevision,
+                            typeof reconciledRevision === 'number' ? reconciledRevision : minimumRevision,
                         )
                         if (latest.revision < minimum) {
                             throw new RevisionConflictError(minimum, latest.revision)
@@ -1025,6 +1035,12 @@ export function createPersistentDataRuntime(
     const runtime: PersistentDataRuntime = {
         store: dependencies.store,
         withPausedPersistentWrites: (reason, operation) => coordinator.withPausedPersistentWrites(reason, operation),
+        setActivatedLibraryRecoveryLifecycle(token, lifecycle) {
+            const guard = activatedLibraryGuard
+            if (!guard || guard.lifecycle) throw new PersistentMutationFencedError()
+            coordinator.assertActivatedLibraryGuard(guard.owner, token)
+            guard.lifecycle = lifecycle
+        },
         beginActivatedLibraryGuard(token) {
             const owner = coordinator.beginActivatedLibraryGuard(token)
             const guard = {owner, ready: false}
@@ -1127,14 +1143,27 @@ export function createPersistentDataRuntime(
             const revision = coordinator.pendingWorkingSetRefreshRevision
             if (revision === null) return null
             const changes = pendingRefreshChangeSet
+            const epoch = coordinator.storageAuthorityEpoch
+            const guardedRecovery = activatedLibraryGuard !== null || hasRetryableCommittedWorkingSetContinuation(runtime, epoch)
             const fence = await acquireCommittedWorkingSetRefreshFence()
+            let outcome: CommittedApplyOutcome
             try {
-                return await fence.refreshCommittedWorkingSet(revision, {
+                outcome = await fence.refreshCommittedWorkingSet(revision, {
                     changeSet: changes ?? undefined,
                 })
             } finally {
                 fence.release()
             }
+            if (guardedRecovery && outcome.projection === 'applied') {
+                try { await continueCommittedWorkingSetRefresh(outcome.revision, runtime, epoch) }
+                catch (error) {
+                    const required = requireCommittedRefresh(outcome.revision, error)
+                    rebaseCommittedWorkingSetContinuation(runtime, epoch, coordinator.storageAuthorityEpoch)
+                    return required
+                }
+            }
+            if (guardedRecovery && outcome.projection === 'refresh-required') rebaseCommittedWorkingSetContinuation(runtime, epoch, coordinator.storageAuthorityEpoch)
+            return outcome
         },
         runStorageOnlyMutation: (operation) =>
             coordinator.runStorageOnlyMutation(operation),
@@ -1230,6 +1259,14 @@ export function createPersistentDataRuntime(
                 }
                 let committed = false
                 let acceptedRevision = pause.fence.revision
+                const restartPlugins = async () => {
+                    await plugins.invalidatePluginCachesAfterAuthorityReplacement()
+                    await plugins.restartPluginsAfterAuthorityReplacement()
+                }
+                runtime.setActivatedLibraryRecoveryLifecycle(pause.token, {
+                    beforeRefresh: () => binding.assertAuthority(),
+                    afterRefresh: restartPlugins,
+                })
                 try {
                     if ((options.expectedRevision !== undefined && options.expectedRevision !== pause.fence.revision) ||
                         (options.expectedMutationGeneration !== undefined && options.expectedMutationGeneration !== pause.token.mutationGeneration)) {
@@ -1241,9 +1278,10 @@ export function createPersistentDataRuntime(
                     committed = true
                     acceptedRevision = result.revision
                     const outcome = await pause.fence.refreshCommittedWorkingSet(result.revision)
+                    await restartPlugins()
+                    pause.complete()
                     await pause.finish()
                     await coordinator.finishUpstreamReplacementPublication(outcome.revision, options.publishOfficial)
-                    await plugins.invalidatePluginCachesAfterAuthorityReplacement()
                     await binding?.resume()
                     return outcome
                 } catch (error) {
@@ -1256,14 +1294,13 @@ export function createPersistentDataRuntime(
                             await binding.resume()
                         } catch { await pause.finish() }
                     } else await pause.finish()
-                    if (!abortedUnchanged && coordinator.pendingWorkingSetRefreshRevision !== null) {
+                    if (!abortedUnchanged) {
+                        coordinator.markCommittedWorkingSetRefreshRequired(acceptedRevision, error)
                         registerCommittedWorkingSetContinuation(acceptedRevision, runtime, runtime.getStorageAuthorityEpoch(), async () => {
                             await binding.assertAuthority()
                             await coordinator.finishUpstreamReplacementPublication(coordinator.revision, options.publishOfficial)
-                            await plugins.invalidatePluginCachesAfterAuthorityReplacement()
-                            await plugins.restartPluginsAfterAuthorityReplacement()
                             await binding.resume()
-                        })
+                        }, undefined, true)
                     }
                     throw error
                 }

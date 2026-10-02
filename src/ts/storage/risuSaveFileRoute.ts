@@ -43,6 +43,7 @@ type FileRouteRuntime = Pick<
     | 'withPausedPersistentWrites'
     | 'beginActivatedLibraryGuard'
     | 'refreshActivatedLibraryUnderPause'
+    | 'setActivatedLibraryRecoveryLifecycle'
 >
 
 export interface RisuSaveFileRouteDependencies {
@@ -78,7 +79,7 @@ export interface RisuSaveFileRouteDependencies {
     markAndroidExportReady(requestId: string): boolean | Promise<boolean>
     acknowledgeAndroidExport(requestId: string): boolean | Promise<boolean>
     reloadPlugins(): void | Promise<void>
-    reloadPluginsAfterNativeRestore(): void | Promise<void>
+    reloadPluginsAfterNativeRestore(pluginsAlreadyRestarted?: boolean): void | Promise<void>
     /** Name and size of a picked desktop file for the progress dialog; defaults to the basename. */
     describeNativeSource?(path: string): Promise<NativeFileOperationSource>
 }

@@ -83,8 +83,16 @@ export function createMutationGatedPersistentDataStore(
             expectedRevision: DataRevision,
             signal?: AbortSignal,
         ) => gate.runWrite(() => store.restoreCharacter(characterId, expectedRevision, signal)),
-        replaceFromDatabase: (...args: Parameters<PersistentDataStore['replaceFromDatabase']>) =>
-            gate.runTransition(() => store.replaceFromDatabase(...args)),
+        stageDatabaseReplacement: store.stageDatabaseReplacement ? async (...args: Parameters<PersistentDataStore['replaceFromDatabase']>) => {
+            const stage = await store.stageDatabaseReplacement!(...args)
+            return {activate: () => gate.runTransition(() => stage.activate()), abort: () => stage.abort()}
+        } : undefined,
+        replaceFromDatabase: async (...args: Parameters<PersistentDataStore['replaceFromDatabase']>) => {
+            if (!store.stageDatabaseReplacement) return gate.runTransition(() => store.replaceFromDatabase(...args))
+            const stage = await store.stageDatabaseReplacement(...args)
+            try { return await gate.runTransition(() => stage.activate()) }
+            catch (error) { try { await stage.abort() } catch {} ; throw error }
+        },
         materializeDatabase: (revision?: DataRevision) => store.materializeDatabase(revision),
         acquireRevision: (revision: DataRevision): Promise<PersistentRevisionLease> =>
             store.acquireRevision(revision),

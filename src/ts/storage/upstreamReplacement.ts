@@ -22,7 +22,6 @@ export async function acquireUpstreamImportPause(runtime: UpstreamReplacementRun
                 if (released) throw new Error('Import write pause was released')
                 const outcome = await runtime.refreshActivatedLibraryUnderPause(token)
                 if (outcome.revision < minimumRevision) throw new Error('Imported library revision is unavailable')
-                guard!.complete()
                 return outcome
             },
             release() { released = true; release() },
@@ -34,6 +33,7 @@ export async function acquireUpstreamImportPause(runtime: UpstreamReplacementRun
     return {
         fence,
         token: admittedToken,
+        complete() { guard!.complete() },
         async finish() { fence.release(); await settled },
         async abortUnchanged(proveBindingUnchanged: () => Promise<void>) {
             try {

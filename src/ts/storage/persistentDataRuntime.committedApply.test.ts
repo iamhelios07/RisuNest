@@ -126,6 +126,7 @@ describe('upstream import activation pause', () => {
         harness.nativeCommit(replacement('Imported library'))
         expect(() => harness.runtime.markPersistentDataDirty(1)).toThrow(PersistentMutationFencedError)
         await expect(pause.fence.refreshCommittedWorkingSet(2)).resolves.toEqual({kind:'committed',revision:2,projection:'applied'})
+        pause.complete()
         await pause.finish()
         expect(await operation).toBeInstanceOf(PersistentMutationFencedError)
         expect(queued).not.toHaveBeenCalled()

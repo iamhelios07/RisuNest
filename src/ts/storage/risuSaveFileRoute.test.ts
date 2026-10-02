@@ -18,6 +18,7 @@ function dependencies(platform: 'native-desktop' | 'web'): RisuSaveFileRouteDepe
             revision: 4,
             getStorageAuthorityEpoch: () => 1,
             withPausedPersistentWrites: async () => { throw new Error('Unexpected route pause') },
+            setActivatedLibraryRecoveryLifecycle: () => { throw new Error('Unexpected upstream lifecycle') },
             beginActivatedLibraryGuard: () => { throw new Error('Unexpected route guard') },
             refreshActivatedLibraryUnderPause: async () => { throw new Error('Unexpected route refresh') },
             flushPendingData: vi.fn(async () => undefined),

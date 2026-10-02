@@ -4601,3 +4601,36 @@ describe('SaveCoordinator', () => {
     })
 
 })
+
+
+describe('upstream replacement publication completion',()=>{
+    it.each([true,false])('preserves a newer publication queued after pause release, publishOfficial=%s',async publishOfficial=>{
+        const database=makeDatabase()
+        const started=deferred<void>()
+        const committed=deferred<{revision:number}>()
+        const pin=vi.fn(async()=>({publish:vi.fn(async()=>{}),dispose:vi.fn(async()=>{})}))
+        const store=makeStore(vi.fn(async()=>{started.resolve();return committed.promise}))
+        const coordinator=new SaveCoordinator({store,captureRoot:()=>captureRoot(database),captureSelectedCharacter:()=>database.characters[0],replaceDatabase:()=>{},
+            officialPublisher:{pin},clock:{setTimeout:vi.fn(()=>1),clearTimeout:vi.fn()}})
+        coordinator.initialize(2,database)
+        const newer=coordinator.commitPersistentUnitIntent('post-import-write',[{type:'set',key:JSON.stringify(['root','username']),value:'Newer'}])
+        await started.promise
+        const finish=coordinator.finishUpstreamReplacementPublication(2,publishOfficial)
+        committed.resolve({revision:3})
+        await Promise.all([newer,finish])
+        expect(coordinator.hasPendingOfficialPublication).toBe(true)
+        await coordinator.publishCurrentOfficialRevision()
+        expect(pin).toHaveBeenCalledExactlyOnceWith(3)
+    })
+    it.each([true,false])('retains accepted revision behavior without later writes, publishOfficial=%s',async publishOfficial=>{
+        const database=makeDatabase()
+        const pin=vi.fn(async()=>({publish:vi.fn(async()=>{}),dispose:vi.fn(async()=>{})}))
+        const coordinator=new SaveCoordinator({store:makeStore(),captureRoot:()=>captureRoot(database),captureSelectedCharacter:()=>database.characters[0],replaceDatabase:()=>{},
+            officialPublisher:{pin},clock:{setTimeout:vi.fn(()=>1),clearTimeout:vi.fn()}})
+        coordinator.initialize(2,database)
+        await coordinator.finishUpstreamReplacementPublication(2,publishOfficial)
+        expect(coordinator.hasPendingOfficialPublication).toBe(publishOfficial)
+        if(publishOfficial){await coordinator.publishCurrentOfficialRevision();expect(pin).toHaveBeenCalledExactlyOnceWith(2)}
+        else expect(pin).not.toHaveBeenCalled()
+    })
+})

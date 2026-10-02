@@ -272,9 +272,9 @@ export async function restoreBackupFromNativeSource(
                             holdServerSyncAfterRestore()
                         await options.onNativeStatus?.(status)
                     },
-                    afterRefresh: async () => {
-                        await loadPluginsAfterAuthoritativeRestore()
-                        await options.afterRefresh?.()
+                    afterRefresh: async (alreadyRestarted) => {
+                        await loadPluginsAfterAuthoritativeRestore(alreadyRestarted)
+                        await options.afterRefresh?.(alreadyRestarted)
                     },
                 }
                 const selectedInput = input

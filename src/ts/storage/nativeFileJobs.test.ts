@@ -141,6 +141,8 @@ function restoreRuntime(
             try { return await operation({revision:options.fencedRevision ?? revision,mutationGeneration:1} as import('./saveCoordinator').PersistentMutationToken) }
             finally { options.release?.() }
         },
+        store: {readRoot:async()=>({revision})} as unknown as import('./persistentDataStore').PersistentDataStore,
+        setActivatedLibraryRecoveryLifecycle: () => {},
         beginActivatedLibraryGuard: () => ({complete(){},abortUnchanged:async()=>{}}),
         refreshActivatedLibraryUnderPause: async () => {
             await options.refresh?.((options.fencedRevision ?? revision) + 1)
