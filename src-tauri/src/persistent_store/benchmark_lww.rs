@@ -1950,7 +1950,7 @@ fn actual_compaction_producer_keeps_unobserved_source_and_protection_invalid() {
         assert!(record.native_publication_complete_ms.is_some());
         assert!(record.native_observation.requests>0);
         assert!(record.source_observation.is_none());assert!(!record.protection_run_completed);
-        assert!(record.native_observation.hash_totals().is_err());
+        assert!(record.native_observation.hash_totals().unwrap().bytes>0);
     });
 }
 

@@ -1273,6 +1273,25 @@ impl NativeFileJobState {
         job.confirm_portable_adoption(revision,authority,session,||device.verify_portable_adoption_complete(session,id,revision,authority).map_err(|error|error.message))
             .map_err(|error|NativeJobError::new("invalid-activation-receipt",error))
     }
+    pub(crate) fn retry_portable_restore_bodies(&self,request:&PortableBodyRetryRequest)->Result<NativeFileJobStarted,NativeJobError> {
+        let _cleanup=self.admit_cleanup_operation()?;
+        let repository=self.root.parent().ok_or_else(||NativeJobError::new("store-error","Native repository is unavailable"))?;
+        verify_portable_body_receipt(repository,request)?;
+        let job=self.registry.lookup(&request.job_id).map_err(|error|NativeJobError::new("store-error",error))?
+            .ok_or_else(||NativeJobError::new("portable-body-source-required","Portable library is restored, but the backup source is required"))?;
+        let status=job.status();
+        if status.kind!=JobKind::RestorePortableBackup || !status.restore_adoption_confirmed
+            || status.activation_revision.map(|revision|revision.to_string()).as_deref()!=Some(request.activation_revision.as_str())
+            || status.activation_authority.as_deref()!=Some(request.binding_authority.as_str())
+            || status.device_session_id.as_deref()!=Some(request.device_session_id.as_str())
+            || !status.portable_body_retry.as_ref().is_some_and(|receipt|receipt.staging_id==request.staging_id && receipt.catalog_sha256==request.catalog_sha256)
+        {return Err(NativeJobError::new("invalid-activation-receipt","Portable body retry receipt differs"));}
+        let receipt=status.portable_body_retry.as_ref().expect("validated receipt");
+        if receipt.source_required {return Err(NativeJobError::new("portable-body-source-required","Portable library is restored, but the backup source is required"));}
+        if receipt.available {job.retry_portable_bodies(&status).map_err(|error|NativeJobError::new(if error=="portable-body-source-required" {"portable-body-source-required"} else {"portable-body-retry-refused"},error))?;}
+        Ok(NativeFileJobStarted {job_id:request.job_id.clone(),warning_codes:status.warning_codes})
+    }
+
     fn admit_cleanup_operation(&self) -> Result<std::sync::RwLockReadGuard<'_, bool>, NativeJobError> {
         let guard = self.cleanup_closed.read().map_err(|_| NativeJobError::new("store-error", "Native cleanup state is unavailable"))?;
         if *guard { return Err(NativeJobError::new("cleanup-pending", "Application cleanup is pending")); }
@@ -1286,7 +1305,12 @@ impl NativeFileJobState {
 
     pub(crate) fn begin_cleanup(&self) -> Result<(), String> {
         *self.cleanup_closed.try_write().map_err(|_| "cleanup-native-jobs-busy")? = true;
-        for job in self.registry.list()? { self.registry.cancel(&job.job_id)?; }
+        for job in self.registry.list()? {
+            if job.kind==JobKind::RestorePortableBackup {
+                if let Some(owner)=self.registry.lookup(&job.job_id)? {owner.retire_portable_body_owner()?;}
+            }
+            self.registry.cancel(&job.job_id)?;
+        }
         Ok(())
     }
 
@@ -3169,6 +3193,11 @@ pub(crate) fn native_portable_confirm_restore_adoption(
 }
 
 #[tauri::command(async)]
+pub(crate) fn native_portable_retry_restore_bodies(state:State<'_,NativeFileJobState>,request:PortableBodyRetryRequest)->Result<NativeFileJobStarted,NativeJobError> {
+    state.retry_portable_restore_bodies(&request)
+}
+
+#[tauri::command(async)]
 pub(crate) fn native_portable_select_sections(
     state: State<'_, NativeFileJobState>,
     job_id: String,
@@ -3261,6 +3290,9 @@ fn forget_device_session(
         return Ok(());
     };
     let status = job.status();
+    if status.portable_body_retry.as_ref().is_some_and(|receipt|receipt.pending) {
+        return Err(NativeJobError::new("portable-bodies-pending","Portable body retry ownership is still retained"));
+    }
     if !status.state.is_terminal() {
         return Err(NativeJobError::new(
             "job-active",
@@ -3568,7 +3600,50 @@ fn validate_detail_transition(
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct PortableBodyRetry {
+    pub(crate) staging_id:String,
+    pub(crate) catalog_sha256:String,
+    pub(crate) pending:bool,
+    pub(crate) available:bool,
+    pub(crate) source_required:bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all="camelCase",deny_unknown_fields)]
+pub(crate) struct PortableBodyRetryRequest {
+    pub(crate) job_id:String,
+    pub(crate) staging_id:String,
+    pub(crate) catalog_sha256:String,
+    pub(crate) activation_revision:String,
+    pub(crate) binding_authority:String,
+    pub(crate) device_session_id:String,
+}
+
+fn verify_portable_body_receipt(repository:&Path,request:&PortableBodyRetryRequest)->Result<(),NativeJobError> {
+    let valid=(||->crate::persistent_store::StoreResult<bool> {
+        let flags=rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY|rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let persistent=repository.join("persistent");
+        let library=rusqlite::Connection::open_with_flags(persistent.join(crate::persistent_store::DATABASE_FILE),flags)?;
+        let device=rusqlite::Connection::open_with_flags(persistent.join(crate::persistent_store::device_store::DEVICE_DATABASE_FILE),flags)?;
+        library.execute_batch("PRAGMA trusted_schema=OFF; PRAGMA query_only=ON;")?;
+        device.execute_batch("PRAGMA trusted_schema=OFF; PRAGMA query_only=ON;")?;
+        let generation:String=library.query_row("SELECT value FROM meta WHERE key='activeGeneration'",[],|row|row.get(0))?;
+        let generation:String=serde_json::from_str(&generation)?;
+        let authority:String=device.query_row("SELECT binding_authority FROM lww_clock WHERE singleton=1",[],|row|row.get(0))?;
+        if authority!=request.binding_authority {return Ok(false);}
+        let header=crate::persistent_store::lww::Header {request_id:request.job_id.clone(),binding_authority:serde_json::from_value(serde_json::json!(request.binding_authority))?};
+        let receipt=crate::persistent_store::lww::completed_device_replacement_receipt(&library,&device,&header,&request.staging_id)?;
+        Ok(receipt.is_some_and(|receipt|receipt.revision.to_string()==request.activation_revision && generation==format!("revision-{}",receipt.revision)))
+    })().map_err(native_store_error)?;
+    if !valid {return Err(NativeJobError::new("invalid-activation-receipt","Portable activated library identity differs"));}
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct JobStatus {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) portable_body_retry:Option<PortableBodyRetry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) snapshot_staging_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3699,6 +3774,9 @@ pub(crate) struct JobRegistry {
 #[derive(Default)]
 struct JobWaitState {
     portable_adoption_confirmed: bool,
+    portable_body_retry_requested:bool,
+    portable_body_retired:bool,
+    portable_body_source:Option<(File,crate::asset_repository::ExactFileIdentity)>,
     inline_asset_upload: Option<content::InlineAssetUpload>,
     portable_selection: Option<portable::PortableSelection>,
     restore_finalized: bool,
@@ -3772,6 +3850,7 @@ impl JobRegistry {
             wait_changed: Condvar::new(),
             terminal_at: Mutex::new(None),
             status: Mutex::new(JobStatus {
+                portable_body_retry:None,
                 snapshot_staging_id: None,
                 snapshot_bodies: None,
                 job_id: id.clone(),
@@ -3869,6 +3948,9 @@ impl JobRegistry {
         };
         if !job.status().state.is_terminal() {
             return Err("native job cannot be forgotten before it is terminal".to_owned());
+        }
+        if job.status().portable_body_retry.is_some_and(|receipt|receipt.pending) {
+            return Err("portable body retry ownership is still retained".into());
         }
         jobs.remove(id);
         Ok(true)
@@ -4035,8 +4117,86 @@ impl JobControl {
         let mut wait = self.wait_state.lock().map_err(|_| "native job wait mutex poisoned".to_owned())?;
         if wait.activation_permit.is_none() { return Ok(()); }
         while !wait.portable_adoption_confirmed {
+            if wait.portable_body_retired {return Err("portable-body-source-required".into());}
             wait = self.wait_changed.wait(wait).map_err(|_| "native job wait mutex poisoned".to_owned())?;
         }
+        Ok(())
+    }
+
+    pub(crate) fn prepare_portable_body_retry(&self,stage:&str,catalog:&str,source:(File,crate::asset_repository::ExactFileIdentity))->Result<(),String> {
+        let mut status=self.status.lock().map_err(|_|"native job mutex poisoned")?;
+        if !status.restore_adoption_confirmed || status.device_session_id.is_none() {return Err("portable adoption has not been confirmed".into());}
+        let mut wait=self.wait_state.lock().map_err(|_|"native job wait mutex poisoned")?;
+        status.portable_body_retry=Some(PortableBodyRetry {staging_id:stage.into(),catalog_sha256:catalog.into(),pending:true,available:false,source_required:false});
+        wait.portable_body_source=Some(source);
+        Ok(())
+    }
+
+    pub(crate) fn wait_for_portable_body_retry(&self,failure:&NativeJobError)->Result<bool,String> {
+        let mut status=self.status.lock().map_err(|_|"native job mutex poisoned")?;
+        let mut wait=self.wait_state.lock().map_err(|_|"native job wait mutex poisoned")?;
+        let receipt=status.portable_body_retry.as_mut().ok_or("portable body owner is missing")?;
+        receipt.available=!wait.portable_body_retired;
+        status.state=if self.is_cancel_requested() {JobState::Cancelled} else {JobState::Failed};
+        status.error=Some(JobFailure {code:failure.code.clone(),message:bounded_message(&failure.message)});
+        drop(status);
+        while !wait.portable_body_retry_requested && !wait.portable_body_retired {
+            wait=self.wait_changed.wait(wait).map_err(|_|"native job wait mutex poisoned")?;
+        }
+        let retry=!wait.portable_body_retired;
+        wait.portable_body_retry_requested=false;
+        drop(wait);
+        if !retry {self.portable_body_source_required()?;}
+        Ok(retry)
+    }
+
+    fn retire_portable_body_owner(&self)->Result<(),String> {
+        let mut wait=self.wait_state.lock().map_err(|_|"native job wait mutex poisoned")?;
+        wait.portable_body_retired=true;
+        drop(wait);
+        self.wait_changed.notify_all();
+        Ok(())
+    }
+
+    pub(crate) fn portable_body_source_required(&self)->Result<(),String> {
+        let mut status=self.status.lock().map_err(|_|"native job mutex poisoned")?;
+        if let Some(receipt)=status.portable_body_retry.as_mut() {receipt.available=false;receipt.source_required=true;}
+        status.state=JobState::Running;
+        self.wait_state.lock().map_err(|_|"native job wait mutex poisoned")?.portable_body_source.take();
+        Ok(())
+    }
+
+    pub(crate) fn portable_bodies_completed(&self)->Result<(),String> {
+        let mut status=self.status.lock().map_err(|_|"native job mutex poisoned")?;
+        if let Some(receipt)=status.portable_body_retry.as_mut() {receipt.pending=false;receipt.available=false;}
+        self.wait_state.lock().map_err(|_|"native job wait mutex poisoned")?.portable_body_source.take();
+        Ok(())
+    }
+
+    fn retry_portable_bodies(&self,expected:&JobStatus)->Result<(),String> {
+        let mut status=self.status.lock().map_err(|_|"native job mutex poisoned")?;
+        if status.activation_revision!=expected.activation_revision || status.activation_authority!=expected.activation_authority || status.device_session_id!=expected.device_session_id || status.portable_body_retry!=expected.portable_body_retry {return Err("portable body receipt changed".into());}
+        let mut wait=self.wait_state.lock().map_err(|_|"native job wait mutex poisoned")?;
+        if wait.portable_body_retired {return Err("portable-body-source-required".into());}
+        let receipt=status.portable_body_retry.as_mut().ok_or("portable body owner is missing")?;
+        if !receipt.pending || !receipt.available || receipt.source_required {return Err("portable body retry is unavailable".into());}
+        let (file,identity)=wait.portable_body_source.as_ref().ok_or("portable-body-source-required")?;
+        if !crate::asset_repository::exact_file_identity(file).is_ok_and(|actual|actual==*identity) {
+            receipt.available=false;
+            receipt.source_required=true;
+            wait.portable_body_retired=true;
+            drop(wait);drop(status);
+            self.wait_changed.notify_all();
+            return Err("portable-body-source-required".into());
+        }
+        receipt.available=false;
+        self.cancel_requested.store(false,Ordering::Release);
+        wait.portable_body_retry_requested=true;
+        status.state=JobState::Running;
+        status.phase=JobPhase::CopyingMissingBodies;
+        status.error=None;
+        drop(wait);drop(status);
+        self.wait_changed.notify_all();
         Ok(())
     }
 

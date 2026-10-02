@@ -402,7 +402,17 @@ export function emptyNativeImportCounts(): NativeImportCounts {
     }
 }
 
+export interface NativePortableBodyRetryRequest {
+    jobId: string
+    stagingId: string
+    catalogSha256: string
+    activationRevision: string
+    bindingAuthority: string
+    deviceSessionId: string
+}
+
 export interface NativeFileJobStatus {
+    portableBodyRetry?: {stagingId: string; catalogSha256: string; pending: boolean; available: boolean; sourceRequired: boolean}
     jobId: string
     kind:
         | 'restore-block-risu-save'
@@ -1792,6 +1802,37 @@ export function runNativeBlockRisuSaveRestore(
     )
 }
 
+
+export function portableBodyRetryRequest(status: NativeFileJobStatus): NativePortableBodyRetryRequest {
+    const bodies = status.portableBodyRetry
+    if (status.kind !== 'restore-portable-backup' || status.restoreAdoptionConfirmed !== true
+        || !bodies?.pending || bodies.sourceRequired || !status.deviceSessionId
+        || !Number.isSafeInteger(status.activationRevision) || !status.activationAuthority) {
+        throw new NativeFileJobError('portable-body-retry-refused', 'Portable body retry is unavailable')
+    }
+    return {jobId: status.jobId, stagingId: bodies.stagingId, catalogSha256: bodies.catalogSha256,
+        activationRevision: String(status.activationRevision), bindingAuthority: status.activationAuthority,
+        deviceSessionId: status.deviceSessionId}
+}
+
+export async function retryNativePortableRestoreBodies(request: NativePortableBodyRetryRequest, options: NativeFileJobOptions = {}, dependencies: NativeFileJobDependencies = productionDependencies): Promise<NativeFileJobResult> {
+    try { await invokeNative(dependencies, 'native_portable_retry_restore_bodies', {request}) }
+    catch (error) { throw new NativeFileJobActivationCommittedError(Number(request.activationRevision), error) }
+    const terminal = await pollNativeFileJobUntilTerminal(request.jobId, options, dependencies)
+    if (terminal.kind !== 'restore-portable-backup' || terminal.restoreAdoptionConfirmed !== true
+        || String(terminal.activationRevision) !== request.activationRevision || terminal.activationAuthority !== request.bindingAuthority
+        || terminal.deviceSessionId !== request.deviceSessionId || terminal.portableBodyRetry?.stagingId !== request.stagingId
+        || terminal.portableBodyRetry.catalogSha256 !== request.catalogSha256) {
+        throw new NativeFileJobActivationCommittedError(Number(request.activationRevision), new NativeFileJobError('portable-body-receipt-mismatch', 'Portable body retry receipt differs'))
+    }
+    if (terminal.state !== 'succeeded' || !terminal.result || terminal.portableBodyRetry.pending) {
+        throw new NativeFileJobActivationCommittedError(Number(request.activationRevision), new NativeFileJobError(terminal.error?.code ?? 'portable-bodies-incomplete', terminal.error?.message ?? 'Portable missing bodies could not be restored'))
+    }
+    const warningCodes = mergeWarningCodes(terminal.warningCodes, terminal.result.warningCodes)
+    try { await invokeNative(dependencies, 'native_file_job_forget', {jobId: request.jobId}) }
+    catch { if (!warningCodes.includes('cleanup-failed')) warningCodes.push('cleanup-failed') }
+    return {...terminal.result, warningCodes}
+}
 
 export function runNativeArchiveRestore(
     runtime: NativeBlockRestoreRuntime,
