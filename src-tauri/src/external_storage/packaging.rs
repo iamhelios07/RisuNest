@@ -3810,8 +3810,7 @@ pub(crate) async fn package_and_upload_protected(
             let max_state = wire::MAX_METADATA_BYTES;
             let encoded=document.encode(max_state);
             #[cfg(test)]
-            if encoded.is_ok() {super::control::observe_control_fingerprint(wire::ObjectRole::SyncState,&document.library_fingerprint,&document.sections,None,1);}
-            else {crate::persistent_store::hash_work::incomplete("native_external_state_fingerprint");}
+            super::control::observe_control_fingerprint(wire::ObjectRole::SyncState,&document.library_fingerprint,&document.sections,None,1);
             (
                 encoded.map_err(corrupt)?,
                 document.state_fingerprint,

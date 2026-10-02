@@ -920,8 +920,7 @@ pub(crate) async fn upload_sync_state(
     let fingerprint = hex::encode(document.state_fingerprint);
     let plaintext=document.encode(wire::MAX_METADATA_BYTES);
     #[cfg(test)]
-    if plaintext.is_ok() {observe_control_fingerprint(wire::ObjectRole::SyncState,&document.library_fingerprint,&document.sections,None,1);}
-    else {crate::persistent_store::hash_work::incomplete("native_external_state_fingerprint");}
+    observe_control_fingerprint(wire::ObjectRole::SyncState,&document.library_fingerprint,&document.sections,None,1);
     let plaintext=plaintext.map_err(corrupt)?;
     let object = upload_control_object(
         descriptor,
