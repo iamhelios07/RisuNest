@@ -107,7 +107,7 @@ const harness = vi.hoisted(() => {
 })
 
 vi.mock('../storage/database.svelte', () => ({
-    changeToPreset: vi.fn(async () => undefined),
+    activatePresetOverride: vi.fn(async () => undefined),
     setCurrentChat: vi.fn(),
 }))
 
