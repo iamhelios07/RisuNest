@@ -302,6 +302,12 @@ impl Command {
     }
 }
 fn read_command(input: &mut impl BufRead) -> Result<Option<Command>, String> {
+    read_command_bounded(input, MAX_COMMAND_BYTES)
+}
+fn read_command_bounded(
+    input: &mut impl BufRead,
+    max_bytes: usize,
+) -> Result<Option<Command>, String> {
     let mut bytes = Vec::new();
     loop {
         let chunk = input.fill_buf().map_err(|_| "stdin-failed")?;
@@ -315,7 +321,7 @@ fn read_command(input: &mut impl BufRead) -> Result<Option<Command>, String> {
             .iter()
             .position(|v| *v == b'\n')
             .map_or(chunk.len(), |n| n + 1);
-        if bytes.len() + count > MAX_COMMAND_BYTES {
+        if bytes.len().checked_add(count).is_none_or(|n| n > max_bytes) {
             return Err("command-too-large".into());
         }
         let done = chunk[count - 1] == b'\n';
@@ -388,15 +394,21 @@ fn serve() {
         .unwrap();
     let mut server = runtime.block_on(Server::start(root.path())).unwrap();
     reply(
-        json!({"type":"ready","requestId":request_id,"runId":run_id,"endpoint":server.endpoint,"rootId":root_path,"sourceFingerprint":fingerprint,"binarySha256":binary,"observerSchema":1,"sourceClosure":closure,"sourceComposition":"same-source-linked-object-delta-stream-transfer","structuralVerification":"normal-linked-recipe-field-move-and-frame-encode-parity"}),
+        json!({"type":"ready","requestId":request_id,"runId":run_id,"endpoint":server.endpoint,"rootId":root_path,"sourceFingerprint":fingerprint,"binarySha256":binary,"observerSchema":1,"maxCommandBytes":MAX_COMMAND_BYTES,"sourceClosure":closure,"sourceComposition":"same-source-linked-object-delta-stream-transfer","structuralVerification":"normal-linked-recipe-field-move-and-frame-encode-parity"}),
     );
     loop {
         let command = match read_command(&mut input) {
             Ok(Some(command)) => command,
             Ok(None) => panic!("Shutdown required before EOF"),
             Err(code) => {
-                reply(json!({"type":"error","error":code}));
-                continue;
+                observed::note_violation("private-command-error");
+                let shutdown = runtime.block_on(server.stop());
+                runtime.shutdown_timeout(DRAIN_LIMIT);
+                let cleanup = root.close();
+                reply(
+                    json!({"type":"error","error":code,"complete":false,"rootRemoved":!root_path.exists(),"cleanupComplete":shutdown.is_ok() && cleanup.is_ok()}),
+                );
+                panic!("invalid private command");
             }
         };
         let id = command.id().to_owned();
@@ -687,6 +699,16 @@ mod tests {
         )
         .is_err());
         assert!(read_command(&mut &b"{\"op\":\"shutdown\",\"requestId\":\"r\"}"[..]).is_err());
+        assert!(matches!(
+            read_command_bounded(&mut &valid[..], valid.len()).unwrap(),
+            Some(Command::Start { .. })
+        ));
+        assert_eq!(
+            read_command_bounded(&mut &valid[..], valid.len() - 1)
+                .err()
+                .unwrap(),
+            "command-too-large"
+        );
         let (fingerprint, entries) = source_identity();
         assert_eq!(fingerprint.len(), 64);
         for path in [
@@ -709,6 +731,13 @@ mod tests {
 
     #[test]
     fn separate_libtest_process_protocol_fingerprint_and_cleanup() {
+        separate_process_protocol(false);
+    }
+    #[test]
+    fn separate_libtest_invalid_command_is_terminal_and_cleans_up() {
+        separate_process_protocol(true);
+    }
+    fn separate_process_protocol(fail_command: bool) {
         use std::{
             io::BufReader,
             process::{Command as Process, Stdio},
@@ -764,6 +793,7 @@ mod tests {
         assert_eq!(ready["type"], "ready");
         assert_eq!(ready["sourceFingerprint"], fingerprint);
         assert_eq!(ready["binarySha256"], expected_binary);
+        assert_eq!(ready["maxCommandBytes"], MAX_COMMAND_BYTES);
         let root = std::path::PathBuf::from(ready["rootId"].as_str().unwrap());
         assert!(root.exists());
         send_command(
@@ -784,6 +814,23 @@ mod tests {
             receive.recv_timeout(DRAIN_LIMIT).unwrap()["type"],
             "scopeStarted"
         );
+        if fail_command {
+            send_command(
+                &mut input,
+                json!({"op":"shutdown","requestId":"bad","omittedProof":true}),
+            );
+            let error = receive.recv_timeout(DRAIN_LIMIT).unwrap();
+            assert_eq!(error["type"], "error");
+            assert_eq!(error["error"], "invalid-command");
+            assert_eq!(error["complete"], false);
+            assert_eq!(error["cleanupComplete"], true);
+            assert_eq!(error["rootRemoved"], true);
+            assert!(!root.exists());
+            drop(input);
+            assert!(!child.0.wait().unwrap().success());
+            reader.join().unwrap();
+            return;
+        }
         send_command(
             &mut input,
             json!({"op":"endScope","requestId":"end","scopeId":"zero"}),
