@@ -415,6 +415,23 @@ describe('plugin unit writes with read provenance', () => {
         expect(harness.replacePersistentCompleteCharacter).not.toHaveBeenCalled()
     })
 
+    it('passes only explicit opaque edits from public character and chat setters to local unit commit', async () => {
+        const harness = createHarness({ unitIntent: true })
+        const database = makeFullObjectDatabase()
+        Object.assign(database.characters[0], { opaqueRetained: 'Imported', opaqueEdited: 'Before' })
+        Object.assign(database.characters[0].chats[0], { opaqueRetained: 'Imported', opaqueEdited: 'Before' })
+        harness.pinnedDatabases.push(database, database, database)
+        const read: any = await harness.access.getCharacterFromIndex(0, callContext())
+        read.opaqueEdited = 'Edited character'
+        await harness.access.setCharacterToIndex(0, read, callContext())
+        expect(harness.commitPersistentUnitIntent).toHaveBeenLastCalledWith('plugin-setCharacterToIndex', [{ key: '["character","active","opaqueEdited"]', type: 'set', value: 'Edited character' }], [], [])
+        read.chats[0].opaqueEdited = 'Edited chat'
+        await harness.access.setChatToIndex(0, 0, read.chats[0], callContext())
+        expect(harness.commitPersistentUnitIntent).toHaveBeenLastCalledWith('plugin-setChatToIndex', [{ key: '["conversation","active","active-chat-a","opaqueEdited"]', type: 'set', value: 'Edited chat' }], [], [])
+        expect(harness.replacePersistentCompleteCharacter).not.toHaveBeenCalled()
+        expect(harness.replacePersistentConversation).not.toHaveBeenCalled()
+    })
+
     it('uses nested chat provenance from a character read without replacing messages', async () => {
         const harness = createHarness({ unitIntent: true })
         const database = makeFullObjectDatabase()
@@ -425,6 +442,27 @@ describe('plugin unit writes with read provenance', () => {
         database.characters[0].chats[0].message.push({ role: 'user', data: 'Remote append' })
         await harness.access.setChatToIndex(0, 0, chat, callContext())
         expect(harness.commitPersistentUnitIntent).toHaveBeenCalledWith('plugin-setChatToIndex', [{ key: '["conversation","active","active-chat-a","name"]', type: 'set', value: 'Edited chat' }], [], [])
+    })
+
+    it('commits only approved plugin additions and preserves installed records on API list omission and replacement', async () => {
+        const harness = createHarness()
+        const original = { name: 'installed', script: 'original', version: '3.0', enabled: true }
+        harness.compatibilityDatabase.plugins = [original] as any
+        harness.prepareAuthoritativeDatabaseUpdate.mockImplementation(async update => ({ ...update, plugins: [] }))
+        await harness.access.setDatabase({ plugins: [] }, ['plugins'])
+        expect(harness.commitPersistentUnitIntent).toHaveBeenLastCalledWith('plugin-setDatabase', [], [], [])
+        await harness.access.setDatabase({ plugins: [{ ...original, script: 'replacement' }] }, ['plugins'])
+        expect(harness.commitPersistentUnitIntent).toHaveBeenLastCalledWith('plugin-setDatabase', [], [], [])
+        const proposed = { name: 'new', script: 'proposed', version: '3.0', enabled: true }
+        await harness.access.setDatabase({ plugins: [proposed] }, ['plugins'])
+        expect(harness.commitPersistentUnitIntent).toHaveBeenLastCalledWith('plugin-setDatabase', [], [], [])
+        harness.prepareAuthoritativeDatabaseUpdate.mockImplementation(async update => ({ ...update, plugins: [proposed] }))
+        await harness.access.setDatabase({ plugins: [proposed, proposed] }, ['plugins'])
+        expect(harness.commitPersistentUnitIntent).toHaveBeenLastCalledWith('plugin-setDatabase', [
+            { key: '["record","plugins","new"]', type: 'set', value: proposed },
+            { key: '["order","plugins"]', type: 'set', value: ['installed', 'new'] },
+        ], [], [])
+        expect(harness.compatibilityDatabase.plugins).toEqual([original])
     })
 
     it('commits a single-baseline copy but rejects an ambiguous copy without writes', async () => {
@@ -1679,6 +1717,7 @@ describe('plugin database access', () => {
         resultPresets[0].mainPrompt = 'mutated snapshot'
         expect(durablePresets[0].mainPrompt).toBe('full first body')
         expect(harness.compatibilityDatabase.botPresets[0]).toEqual({
+            id: '0',
             name: 'First',
             image: 'first.png',
         })

@@ -1,5 +1,3 @@
-import { CHARACTER_SHARED_FIELDS as pluginCharacterSharedFields, CONVERSATION_SHARED_FIELDS as pluginConversationSharedFields } from '../storage/persistentUnitCapture'
-
 export type PluginReadKind = 'database' | 'character' | 'conversation' | 'preset'
 
 export interface PluginReadProvenance {
@@ -79,17 +77,7 @@ export function diffPluginReadBaseline(baseline: any, submitted: any, kind: Plug
             return
         }
         if (before && after && !Array.isArray(before) && !Array.isArray(after) && typeof before === 'object' && typeof after === 'object') {
-            const characterRecord = (kind === 'character' && path.length === 0) || (kind === 'database' && path[0] === 'characters' && path.length === 2)
-            const conversationRecord = (kind === 'conversation' && path.length === 0) || (kind === 'character' && path[0] === 'chats' && path.length === 2) || (kind === 'database' && path[0] === 'characters' && path[2] === 'chats' && path.length === 4)
             for (const key of new Set([...Object.keys(before), ...Object.keys(after)])) {
-                if (characterRecord && !pluginCharacterSharedFields.has(key) && !['chaId', 'type', 'chats', 'chatFolders', 'characters', 'characterTalks', 'characterActive'].includes(key)) continue
-                if (conversationRecord && !pluginConversationSharedFields.has(key) && !['id', 'message'].includes(key)) continue
-                if (characterRecord && key === 'statics') {
-                    const withoutMessages = (value: any) => value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).filter(([field]) => field !== 'messages')) : value
-                    const oldValue = withoutMessages(before[key]), newValue = withoutMessages(after[key])
-                    if (canonical(oldValue) !== canonical(newValue)) intents.push(Object.hasOwn(after, key) ? { path: [...path, key], type: 'set', value: structuredClone(newValue) } : { path: [...path, key], type: 'delete' })
-                    continue
-                }
                 if (!Object.hasOwn(after, key)) {
                     if (!partial) {
                         if (recordIdentity([...path, key]) && Array.isArray(before[key])) visit(before[key], [], [...path, key])

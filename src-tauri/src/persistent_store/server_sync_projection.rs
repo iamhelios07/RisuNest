@@ -48,12 +48,16 @@ pub(crate) fn dependencies_with(
         }
         LogicalRecordEnvelope::ArchivedCharacter {
             archive_object_hash,
+            shared_archive_object_hash,
             asset_hashes,
+            shared_asset_hashes,
             owner_heads,
             ..
         } => {
             hashes.insert(archive_object_hash.clone());
+            hashes.insert(shared_archive_object_hash.clone());
             hashes.extend(asset_hashes.iter().cloned());
+            hashes.extend(shared_asset_hashes.iter().cloned());
             for head in owner_heads {
                 if let Some(hash) = &head.manifest_hash {
                     hashes.insert(hash.clone());

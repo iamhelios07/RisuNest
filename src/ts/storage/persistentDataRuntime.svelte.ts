@@ -786,4 +786,6 @@ export const commitPersistentUnitIntent = (reason: string, mutations: readonly P
     getPersistentDataRuntime().commitPersistentUnitIntent(reason, mutations, conversations, wholeMessages)
 export const withPausedPersistentWrites = <T>(reason: string, operation: (token: PersistentMutationToken) => Promise<T>): Promise<T> => getPersistentDataRuntime().withPausedPersistentWrites(reason, operation)
 
+export const beginActivatedLibraryGuard = (token: PersistentMutationToken) => getPersistentDataRuntime().beginActivatedLibraryGuard(token)
+
 export const refreshActivatedLibraryUnderPause = (token: import("./saveCoordinator").PersistentMutationToken) => getPersistentDataRuntime().refreshActivatedLibraryUnderPause(token)

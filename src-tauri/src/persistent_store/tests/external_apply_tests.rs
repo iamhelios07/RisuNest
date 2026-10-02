@@ -154,10 +154,10 @@ fn external_snapshot_stages_streamed_records_and_preserves_local_view_fields() {
             value: json!({
                 "marker": "remote",
                 "statics": { "messages": ["remote-device-value"] },
-                "modules": [{"name":"Remote module"}]
+                "modules": [{"id": "module-0", "name":"Remote module"}]
             }),
             owner_heads: vec![LogicalOwnerHead::present(
-                LogicalOwnerLocator::RootModule { index: 0 },
+                LogicalOwnerLocator::RootModule { module_id: "module-0".to_owned() },
                 owner_manifest.content_hash.clone(),
                 1,
                 1,
@@ -243,11 +243,14 @@ fn external_snapshot_restores_archived_character_state_and_payload_references() 
             creator_notes: None,
             trash_time: None,
             archive_object_hash: archive_object.content_hash.clone(),
+            shared_archive_object_hash: archive_object.content_hash.clone(),
             archive_object_size: archive_object.byte_length,
             archived_at: 10,
             conversation_count: 1,
             message_count: 2,
             asset_hashes: vec![asset_object.content_hash.clone()],
+            shared_asset_hashes: vec![asset_object.content_hash.clone()],
+            identity_remap: vec![],
             owner_heads: vec![],
         },
     );

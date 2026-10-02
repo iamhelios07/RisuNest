@@ -1,5 +1,4 @@
 import type { PluginFieldIntent, PluginReadKind } from './pluginReadBaselines'
-import { CHARACTER_SHARED_FIELDS as pluginCharacterSharedFields, CONVERSATION_SHARED_FIELDS as pluginConversationSharedFields } from '../storage/persistentUnitCapture'
 
 import type { PersistentUnitMutation, WholeMessageIntent } from '../storage/persistentDataStore'
 import type { Message } from '../storage/database.svelte'
@@ -34,7 +33,7 @@ export function pluginUnitIntents(
             }
         } else if (fields[0] === 'message') {
             wholeMessages.push({ characterId: id, conversationId: chatId, messages: intent.type === 'delete' ? [] : intent.value as Message[] })
-        } else if (pluginConversationSharedFields.has(String(fields[0]))) emit(['conversation', id, chatId, String(fields[0])], intent)
+        } else if (fields[0] !== 'id') emit(['conversation', id, chatId, String(fields[0])], intent)
     }
     const character = (id: string, fields: Array<string | number>, intent: PluginFieldIntent) => {
         if (!fields.length) {
@@ -61,7 +60,7 @@ export function pluginUnitIntents(
                 const group = submittedGroup(id)
                 emit(['group-members', id], { ...intent, type: 'set', value: Object.fromEntries(groupFields.map(field => [field, group[field]])) })
             }
-        } else if (pluginCharacterSharedFields.has(String(fields[0]))) emit(['character', id, String(fields[0])], intent)
+        } else if (!['chaId', 'type'].includes(String(fields[0]))) emit(['character', id, String(fields[0])], intent)
     }
     const submittedGroup = (id: string) => kind === 'character' ? submitted : submitted.characters?.find((record: any) => record.chaId === id)
     const emitConversationOrder = (id: string, intent: PluginFieldIntent) => {

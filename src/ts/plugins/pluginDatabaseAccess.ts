@@ -1423,9 +1423,21 @@ export function createPluginDatabaseAccess(
             if (hasCharacterUpdate(preparedUpdate)) {
                 validateCompleteCharacters(preparedUpdate.characters)
             }
-            const changes = databaseUnitChanges(intents.map(intent => intent.path[0] === 'plugins' && intent.path.length === 2 && intent.type === 'set'
-                ? { ...intent, value: (preparedUpdate.plugins as RisuPlugin[] | undefined)?.find(plugin => plugin.name === intent.path[1]) ?? intent.value }
-                : intent), preparedUpdate, allowedKeys)
+            let acceptedIntents = intents
+            if (Object.hasOwn(detachedUpdate, 'plugins')) {
+                const installed = dependencies.getCompatibilityDatabase().plugins ?? []
+                const installedNames = new Set(installed.map(plugin => plugin.name))
+                const approved = new Map((preparedUpdate.plugins as RisuPlugin[] | undefined ?? []).map(plugin => [plugin.name, plugin]))
+                const additions = intents.filter(intent => intent.path[0] === 'plugins' && intent.path.length === 2 && intent.path[1] !== '$order' && intent.type === 'set' && !installedNames.has(String(intent.path[1])) && approved.has(String(intent.path[1])))
+                    .map(intent => ({ ...intent, value: approved.get(String(intent.path[1]))! }))
+                // Whole-list API submissions request installation, while addressed storage deletes remain independent.
+                acceptedIntents = [...intents.filter(intent => intent.path[0] !== 'plugins'), ...additions]
+                if (additions.length) {
+                    const addedNames = new Set(additions.map(intent => String(intent.path[1])))
+                    acceptedIntents.push({ path: ['plugins', '$order'], type: 'set', value: [...installed.map(plugin => plugin.name), ...[...approved.keys()].filter(name => addedNames.has(name))] })
+                }
+            }
+            const changes = databaseUnitChanges(acceptedIntents, preparedUpdate, allowedKeys)
             await dependencies.commitPersistentUnitIntent('plugin-setDatabase', changes.units, [], changes.wholeMessages)
             dependencies.assertPersistentMutationAllowed(authorityEpoch)
 

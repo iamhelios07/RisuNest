@@ -1,10 +1,10 @@
-import { persistentRootFields } from './persistentRootFields'
+import { sharedRootFields } from './persistentRootFields'
 import { createCatalogCharacterStub } from './workingSetCatalog'
 import { createConversationSummaryStub, createConversationSummaryFromMetadata } from './conversationResidency'
 import type { Chat, Database, botPreset, character, groupChat } from './database.svelte'
 import type { PersistentRevisionReader, PersistentRoot } from './persistentDataStore'
-import { canonicalClone, canonicalJson } from './saveCoordinatorHelpers'
-import { captureMaterializedCharacter } from './persistentUnitCapture'
+import { canonicalClone, canonicalJson, clonePersistentRootFields } from './saveCoordinatorHelpers'
+import { captureMaterializedCharacter, CHARACTER_SHARED_FIELDS, CONVERSATION_SHARED_FIELDS } from './persistentUnitCapture'
 import { isWorkingSetCharacterStub } from './workingSetCatalog'
 
 type CompleteCharacter = character | groupChat
@@ -16,7 +16,7 @@ export interface LwwWorkingSetBaseline {
 }
 
 export function captureLwwWorkingSetBaseline(database: Database, root: PersistentRoot, presets: botPreset[] | null, materialized?: CompleteCharacter[]): LwwWorkingSetBaseline {
-    return { root: canonicalClone(root), presets: presets && canonicalClone(presets),
+    return { root: clonePersistentRootFields(root), presets: presets && canonicalClone(presets),
         characters: materialized ?? database.characters.filter((value) => !isWorkingSetCharacterStub(value)).map(captureMaterializedCharacter) }
 }
 
@@ -32,11 +32,13 @@ function patchField(live: object, baseline: object, remote: object, field: strin
 }
 
 export async function applyLwwWorkingSetUnits(
-    database: Database, baseline: LwwWorkingSetBaseline, store: PersistentRevisionReader, affectedKeys: readonly string[], liveIndex?: ReadonlyMap<string, CompleteCharacter>,
+    database: Database, baseline: LwwWorkingSetBaseline, store: PersistentRevisionReader, affectedKeys: readonly string[], liveIndex?: ReadonlyMap<string, CompleteCharacter>, allowLocalFields = false,
 ): Promise<LwwWorkingSetBaseline> {
     const charactersById = liveIndex ?? new Map(database.characters.map((value) => [value.chaId,value]))
     const baselineById = new Map(baseline.characters.map((value) => [value.chaId,value]))
     const keys = affectedKeys.map((key) => JSON.parse(key) as string[])
+        .filter(([kind, , field, metadataField]) => allowLocalFields || (kind !== 'character' || CHARACTER_SHARED_FIELDS.has(field)) && (kind !== 'conversation' || CONVERSATION_SHARED_FIELDS.has(metadataField)))
+        .sort((a, b) => Number(a[0] === 'root' && ['botPresetsId', 'selectedPersona'].includes(a[1])) - Number(b[0] === 'root' && ['botPresetsId', 'selectedPersona'].includes(b[1])))
     const root = keys.some(([kind]) => ['root', 'variable', 'toggle', 'record', 'order', 'persona', 'preset-protected', 'exists'].includes(kind))
         ? (await store.readRoot()).value : null
     const details = new Map<string, CompleteCharacter | null>()
@@ -47,7 +49,7 @@ export async function applyLwwWorkingSetUnits(
         }
     }
     for (const [kind, id, field, metadataField] of keys) {
-        if (kind === 'root' && root && persistentRootFields.has(id)) {
+        if (kind === 'root' && root && (allowLocalFields || sharedRootFields.has(id))) {
             if (id === 'botPresetsId' && typeof root.botPresetsId === 'string') {
                 const preset = await store.readPreset(root.botPresetsId)
                 if (preset) {
@@ -69,7 +71,17 @@ export async function applyLwwWorkingSetUnits(
             const before = baselineById.get(id)
             const remote = details.get(id)
             if (!live || !before || !remote) continue
-            for (const key of kind === 'group-members' ? ['characters', 'characterTalks', 'characterActive'] : [field]) patchField(live, before, remote, key)
+            for (const key of kind === 'group-members' ? ['characters', 'characterTalks', 'characterActive'] : [field]) {
+                if (key !== 'statics' || allowLocalFields) { patchField(live, before, remote, key); continue }
+                const sharedStatics = (value: unknown) => value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).filter(([key]) => key !== 'messages')) : value
+                const liveView = {statics:sharedStatics(live['statics'])}, beforeView = {statics:sharedStatics(before['statics'])}
+                patchField(liveView, beforeView, {statics:sharedStatics(remote['statics'])}, 'statics')
+                for (const [target, view] of [[live,liveView],[before,beforeView]] as const) {
+                    const local = target['statics'] as Record<string, unknown> | undefined
+                    if (view.statics === undefined && !local?.messages) delete target['statics']
+                    else target['statics'] = {...view.statics as object, ...(local && Object.hasOwn(local, 'messages') ? {messages:local.messages} : {})}
+                }
+            }
         } else if (kind === 'conversation' || kind === 'messages') {
             const liveCharacter = charactersById.get(id)
             const beforeCharacter = baselineById.get(id)
@@ -102,7 +114,11 @@ export async function applyLwwWorkingSetUnits(
             const before = baseline.root.personas ?? [], live = database.personas ?? []
             const previous = before.find((value) => value.id === field), current = live.find((value) => value.id === field), remote = root.personas?.find((value) => value.id === field)
             const replace = (values: typeof live) => remote ? [...values.filter((value) => value.id !== field), canonicalClone(remote)] : values.filter((value) => value.id !== field)
-            if (canonicalJson(previous ?? null) === canonicalJson(current ?? null)) database.personas = replace(live)
+            if (canonicalJson(previous ?? null) === canonicalJson(current ?? null)) {
+                const selectedId = live[database.selectedPersona]?.id
+                database.personas = replace(live)
+                database.selectedPersona = Math.max(0, database.personas.findIndex((value) => value.id === selectedId))
+            }
             baseline.root.personas = replace(before)
         } else if (root && kind === 'persona') {
             const live = database.personas?.find((value) => value.id === id)
@@ -148,14 +164,20 @@ export async function applyLwwWorkingSetUnits(
             const order = new Map((remote[id] ?? []).map((item, index) => [item[identity], index]))
             const sort = (values: Record<string, unknown>[] = []) => [...values].sort((a,b) => (order.get(a[identity]) ?? Infinity) - (order.get(b[identity]) ?? Infinity))
             const live = database as unknown as Record<string, Record<string, unknown>[]>, before = baseline.root as unknown as Record<string, Record<string, unknown>[]>
-            if (canonicalJson((live[id] ?? []).map((value) => value[identity])) === canonicalJson((before[id] ?? []).map((value) => value[identity]))) live[id] = sort(live[id])
+            if (canonicalJson((live[id] ?? []).map((value) => value[identity])) === canonicalJson((before[id] ?? []).map((value) => value[identity]))) {
+                const selectedId = id === 'personas' ? database.personas?.[database.selectedPersona]?.id : undefined
+                live[id] = sort(live[id])
+                if (id === 'personas') database.selectedPersona = Math.max(0, database.personas?.findIndex((value) => value.id === selectedId) ?? 0)
+            }
             before[id] = sort(before[id])
         } else if (root && kind === 'order' && id === 'characters') {
             patchField(database, baseline.root, root, 'characterOrder')
         } else if ((kind === 'order' && id === 'presets') || (kind === 'exists' && id === 'preset')) {
+            const selectedId = database.botPresets[database.botPresetsId]?.['id']
             const catalog = await store.queryPresets()
             const byId = new Map(database.botPresets.filter(Boolean).map((value) => [value['id'], value]))
             database.botPresets = catalog.items.map((summary) => byId.get(summary.id) ?? { id: summary.id, name: summary.name, image: summary.image } as unknown as botPreset)
+            database.botPresetsId = Math.max(0, database.botPresets.findIndex((value) => value['id'] === selectedId))
             if (baseline.presets) baseline.presets = catalog.items.map((summary) => baseline.presets!.find((value) => value['id'] === summary.id) ?? byId.get(summary.id)!).filter(Boolean)
         } else if (kind === 'exists' && id === 'character') {
             const summary = await store.readCharacterSummary(field)

@@ -92,29 +92,11 @@
 
     async function loadPocketRisuBackup(): Promise<void> {
         if (isTauri) return runRisuSaveOperation('import')
-        if (
-            (await alertCheckboxConfirm({
-                title: language.pocketRisuImportConfirm,
-                description: language.backupLoadConfirm2,
-                checkboxLabel: language.checkboxConfirmation.dataReplacement,
-                actionLabel: language.confirm,
-                cancelLabel: language.cancel,
-                requireChecked: true,
-            })).confirmed
-        )
-            LoadLocalBackup()
+        await LoadLocalBackup(language.pocketRisuImportConfirm)
     }
 
     function restoreOfficialBackup(): Promise<void | undefined> {
         return runNativeAccountOperation(async () => {
-            if (!(await alertCheckboxConfirm({
-                title: language.risuNest.backup.officialRestoreConfirm,
-                description: language.risuNest.backup.officialRestoreInlayWarning,
-                checkboxLabel: language.checkboxConfirmation.dataReplacement,
-                actionLabel: language.confirm,
-                cancelLabel: language.cancel,
-                requireChecked: true,
-            })).confirmed) return
             const startedAt = Date.now()
             try {
                 const result = await restoreNativeOfficialAccountBackup()

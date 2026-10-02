@@ -235,7 +235,7 @@ fn an_undo_leaves_a_record_the_reader_changed_after_the_repair() {
             delete_character_ids: None,
             plugin_storage: None,
             asset_owner_heads: None,
-        })
+        ..Default::default()})
         .unwrap();
 
     let (_, skipped) = store.undo_repair(&journal, 3).unwrap();

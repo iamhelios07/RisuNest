@@ -16,6 +16,7 @@ export interface PersistenceCanonicalCapture {
     materializedCharacters?(): ReadonlyMap<string, character | groupChat>
     characters?(): ReadonlyMap<string, string>
     root(): string
+    rootFields?(canonical: string): ReadonlyMap<string, unknown> | undefined
     diffRoot(before: string, after: string): RootMutation[]
     presets(): string | null
     character(): string | null
@@ -65,6 +66,7 @@ function fieldCapture(
             })
             const seed = takeStringSeed?.()
             return {
+                value,
                 json:
                     typeof value === 'string' && seed?.[0] === value
                         ? seed[1]
@@ -73,7 +75,7 @@ function fieldCapture(
             }
         } catch (error) {
             if (error !== volatileValue) throw error
-            return { json: undefined, volatile: true }
+            return { value: undefined, json: undefined, volatile: true }
         }
     }
     const cached = $derived.by(capture)
@@ -89,7 +91,7 @@ function objectCapture(
 ) {
     const fields = new Map<string, ReturnType<typeof fieldCapture>>()
     let previous:
-        | { volatile: false; json: string; entries: readonly (readonly [string, string])[] }
+        | { volatile: false; json: string; entries: readonly (readonly [string, string])[]; values: ReadonlyMap<string, unknown> }
         | undefined
     const snapshot = () => {
         const source = read()
@@ -114,6 +116,7 @@ function objectCapture(
         const active = new Set(currentKeys)
         for (const key of fields.keys()) if (!active.has(key)) fields.delete(key)
         const entries: Array<readonly [string, string]> = []
+        const values = new Map<string, unknown>()
         let volatile = false
         for (const key of currentKeys) {
             let field = fields.get(key)
@@ -138,7 +141,10 @@ function objectCapture(
             }
             const captured = field()
             volatile ||= captured.volatile
-            if (captured.json !== undefined) entries.push(Object.freeze([key, captured.json]))
+            if (captured.json !== undefined) {
+                entries.push(Object.freeze([key, captured.json]))
+                values.set(key, captured.value)
+            }
         }
         stringSeeds?.clear()
         if (volatile) return { volatile: true as const }
@@ -161,6 +167,7 @@ function objectCapture(
                     '}')
             },
             entries: Object.freeze(entries),
+            values,
         }
         return previous
     }
@@ -175,7 +182,7 @@ function objectCapture(
         const value: Record<string, unknown> = {}
         for (const key of Object.keys(source))
             if (!omit.has(key)) defineOwnEnumerableProperty(value, key, transform ? transform(key, source[key]) : source[key])
-        return { json: ordered ? pluginStorageJson(value) : canonicalJson(value), entries: null }
+        return { json: ordered ? pluginStorageJson(value) : canonicalJson(value), entries: null, values: undefined }
     }
 }
 
@@ -211,7 +218,8 @@ export function createPersistenceCanonicalCapture(read: {
                 let previous: {json:string; value:character | groupChat} | undefined
                 const capture = () => {
                     const capturedDetail = detail()!
-                    const details = Object.fromEntries((capturedDetail.entries ?? Object.entries(JSON.parse(capturedDetail.json)).map(([key,value]) => [key, canonicalJson(value)] as const))
+                    const detailEntries: readonly (readonly [string, string])[] = capturedDetail.entries ?? Object.entries(JSON.parse(capturedDetail.json)).map(([key,value]) => [key, canonicalJson(value)] as const)
+                    const details = Object.fromEntries(detailEntries
                         .map(([key,json]) => [key, decode('detail:' + key, json)]))
                     const serializedChats: string[] = []
                     const chatValues: Chat[] = []
@@ -229,7 +237,11 @@ export function createPersistenceCanonicalCapture(read: {
                         chatValues.push(Object.fromEntries((captured.entries ?? Object.entries(JSON.parse(captured.json)).map(([key,value]) => [key,canonicalJson(value)] as const))
                             .map(([key,json]) => [key, decode('chat:' + chat.id + ':' + key, json)])) as Chat)
                     }
-                    const json = capturedDetail.json.slice(0, -1) + ',"chats":[' + serializedChats.join(',') + ']}'
+                    const fields = new Map(detailEntries)
+                    fields.set('chats', '[' + serializedChats.join(',') + ']')
+                    const order: Record<string, boolean> = {}
+                    for (const key of [...fields.keys()].sort()) defineOwnEnumerableProperty(order, key, true)
+                    const json = '{' + Object.keys(order).map((key) => JSON.stringify(key) + ':' + fields.get(key)).join(',') + '}'
                     if (previous?.json === json) return previous
                     return previous = {json, value: {...details, chats:chatValues} as unknown as character | groupChat}
                 }
@@ -245,7 +257,7 @@ export function createPersistenceCanonicalCapture(read: {
     const captureStorage = objectCapture(read.pluginStorage, new Set(), true, storageStringSeeds)
     const presets = fieldCapture(read.presets)
     const character = fieldCapture(read.character)
-    const roots = new Map<string, ReadonlyMap<string, string>>()
+    const roots = new Map<string, { entries: ReadonlyMap<string, string>; values: ReadonlyMap<string, unknown> }>()
     return {
         characters: () => new Map([...captureCharacters()].map(([id,value]) => [id,value.json])),
         materializedCharacters: () => new Map([...captureCharacters()].map(([id,value]) => [id,value.value])),
@@ -258,14 +270,15 @@ export function createPersistenceCanonicalCapture(read: {
         root() {
             const captured = captureRoot()!
             if (captured.entries && !roots.has(captured.json)) {
-                roots.set(captured.json, new Map(captured.entries))
+                roots.set(captured.json, { entries: new Map(captured.entries), values: captured.values! })
                 if (roots.size > 2) roots.delete(roots.keys().next().value!)
             }
             return captured.json
         },
+        rootFields: (canonical) => roots.get(canonical)?.values,
         diffRoot(before, after) {
-            const previous = roots.get(before)
-            const current = roots.get(after)
+            const previous = roots.get(before)?.entries
+            const current = roots.get(after)?.entries
             if (!previous || !current)
                 return diffRootMutations(JSON.parse(before), JSON.parse(after))
             const result: RootMutation[] = []

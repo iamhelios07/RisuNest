@@ -1,3 +1,4 @@
+import { presetMirrorMap, protectedPresetGroups } from './effectiveIdentityState'
 import type { ExportExclusions } from './exportExcludedReport'
 import type { Database } from './database.svelte'
 import {
@@ -241,6 +242,22 @@ export interface PinnedRisuSaveExport {
 function adaptStableSelectionsForExport(database: Database, root: import('./persistentDataStore').PersistentRoot, presets: Database['botPresets']): void {
     if (typeof root.botPresetsId === 'string') database.botPresetsId = Math.max(0, presets.findIndex((preset) => preset['id'] === root.botPresetsId))
     if (typeof root.selectedPersona === 'string') database.selectedPersona = Math.max(0, database.personas?.findIndex((persona) => persona.id === root.selectedPersona) ?? 0)
+    const target = database as unknown as Record<string, unknown>
+    const preset = presets[database.botPresetsId] as unknown as Record<string, unknown> | undefined
+    if (preset) for (const [key, field] of Object.entries(presetMirrorMap)) {
+        const flag = protectedPresetGroups[key as keyof typeof protectedPresetGroups]
+        const source = flag && target[flag] ? database.protectedPresetValues as Record<string, unknown> | undefined : preset
+        const sourceKey = flag && target[flag] ? key : field
+        if (source && Object.hasOwn(source, sourceKey)) defineOwnEnumerableProperty(target, key, structuredClone(source[sourceKey]))
+        else delete target[key]
+    }
+    const persona = database.personas?.[database.selectedPersona] as unknown as Record<string, unknown> | undefined
+    if (persona) for (const [key, field] of Object.entries({username:'name',userIcon:'icon',personaPrompt:'personaPrompt',userNote:'note'})) {
+        if (Object.hasOwn(persona, field)) defineOwnEnumerableProperty(target, key, structuredClone(persona[field]))
+        else delete target[key]
+    }
+    if (database.explicitGlobalChatVariables) database.globalChatVariables = structuredClone(database.explicitGlobalChatVariables)
+
 }
 
 async function materializeDatabaseFromLease(

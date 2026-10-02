@@ -624,7 +624,7 @@ describe('persistent production runtime', () => {
             'complete first',
             'complete second',
         ])
-        expect(adapter.current().botPresets[0]).toEqual({id:'preset-first', name:'First'})
+        expect(adapter.current().botPresets[0]).toEqual({id:'preset-first', name:'First', mainPrompt:'complete first'})
         expect(adapter.current().botPresets[1].mainPrompt).toBe('complete second')
     })
 

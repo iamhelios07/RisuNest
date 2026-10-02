@@ -32,11 +32,7 @@ export interface ExternalConnectionConfig {
  * has none: what it exchanges is chosen per device under local data. Changing
  * it applies to work started afterwards and never rewrites an existing point.
  */
-export interface ExternalCapturePolicy {
-    hypa: boolean
-    localPlugins: boolean
-    localSettings: boolean
-}
+
 
 /**
  * How much of what this device backed up a connection keeps. An automatic
@@ -80,7 +76,6 @@ export interface PrepareExternalConnectionRequest {
     config: ExternalConnectionConfig
     mode: ExternalOpenMode
     purpose: ExternalConnectionPurpose
-    capturePolicy?: ExternalCapturePolicy
     recoveryKey?: string
     acknowledgements: string[]
 }
@@ -153,7 +148,6 @@ export interface ExternalConnectionSummary {
     mode: ExternalOpenMode
     displayName: string
     endpoint: ExternalEndpointConfirmation
-    capturePolicy?: ExternalCapturePolicy
     /** The policy in force, which is the default until the user changes it. */
     retentionPolicy: ExternalRetentionPolicy
     capabilities: ExternalCapabilities

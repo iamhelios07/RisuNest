@@ -61,7 +61,6 @@ const textEncoder = new TextEncoder()
 export interface PersistentStoreOpenResult {
     revision: DataRevision
     /** Present when a requested snapshot restore was skipped and the old database stayed active. */
-    restoreFailure?: string
 }
 
 interface NativeStoreError {
@@ -164,19 +163,12 @@ function batches<T>(values: T[], limit: number): T[][] {
 }
 
 export class SqlitePersistentDataStore implements PersistentDataStore {
-    /** Latest native revision and skipped restore details; every open still reaches the store. */
+    /** Latest native revision; every open still reaches the store. */
     lastOpenResult: PersistentStoreOpenResult | null = null
 
     async open(): Promise<void> {
         const result = await invokeStore<PersistentStoreOpenResult>('pds_open')
         this.lastOpenResult = result
-        if (result?.restoreFailure) {
-            // The native side already wrote this to the native log, but the web layer keeps its
-            // own console breadcrumb so a skipped restore is not silent in the frontend.
-            console.warn(
-                `Persistent store opened without the requested snapshot restore: ${result.restoreFailure}`,
-            )
-        }
     }
 
     readRoot(): Promise<Versioned<PersistentRoot>> {
@@ -303,6 +295,7 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
         })
     }
 
+    lwwBindingState(): Promise<{ targetAuthority: string }> { return invokeStore('pds_lww_binding_state', {}) }
     lwwReadOutbox(request: LwwOutboxRequest): Promise<LwwOutboxPage> { return invokeStore('pds_lww_read_outbox', { request }) }
     lwwAckOutbox(request: LwwAcknowledgeRequest): Promise<void> { return invokeStore('pds_lww_ack_outbox', { request }) }
     lwwClockState(request: LwwReceiveHeader): Promise<LwwClockState> { return invokeStore('pds_lww_clock_state', { request }) }
@@ -353,12 +346,20 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
         )
     }
 
-    async replaceFromDatabase(
+    async replaceFromDatabase(...args: Parameters<PersistentDataStore['replaceFromDatabase']>): Promise<{revision: DataRevision}> {
+        const stage = await this.stageDatabaseReplacement(...args)
+        try { return await stage.activate() }
+        catch (error) { try { await stage.abort() } catch {} ; throw error }
+    }
+
+    async stageDatabaseReplacement(
         database: Database,
         expectedRevision?: DataRevision,
         assetAliases: AssetAlias[] = [],
         pluginStorageValues?: PluginStorageValue[],
-    ): Promise<{ revision: DataRevision }> {
+        replacementHeader?: import('./persistentDataStore').LwwReceiveHeader,
+    ): Promise<import('./persistentDataStore').PersistentDatabaseReplacementStage> {
+        replacementHeader = replacementHeader && {...replacementHeader}
         database = prepareNativePersistenceValue(database, 'replacement database')
         assetAliases = prepareNativePersistenceValue(assetAliases, 'asset aliases')
         pluginStorageValues = prepareNativePersistenceValue(pluginStorageValues, 'plugin storage')
@@ -394,10 +395,19 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
                     aliases,
                 })
             }
-            return await invokeStore('pds_replace_commit', {
-                stagingId,
-                expectedRevision: preserved.revision,
-            })
+            const header = replacementHeader && {...replacementHeader}
+            let submitted = false
+            return {
+                async activate() {
+                    if (submitted) throw new Error('Replacement activation was already submitted')
+                    submitted = true
+                    if (header) return invokeStore('pds_lww_commit_replacement', {request: {...header, stagingId}})
+                    return invokeStore('pds_replace_commit', {stagingId, expectedRevision: preserved.revision})
+                },
+                async abort() {
+                    if (!submitted) await invokeStore<void>('pds_replace_abort', {stagingId})
+                },
+            }
         } catch (error) {
             try {
                 await invokeStore<void>('pds_replace_abort', { stagingId })

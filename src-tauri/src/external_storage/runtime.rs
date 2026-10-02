@@ -305,7 +305,8 @@ pub(crate) async fn external_storage_cancel_job(app: AppHandle, job_id: String) 
     let store = JobStore::open(&root(&app)?)?;
     let state = app.state::<JobCommandState>();
     let observed = store.read(&job_id)?;
-    if super::runtime_restore::application_started(&observed) && !observed.terminal() {
+    if super::runtime_restore::application_started(&observed) && !observed.terminal()
+        && observed.summary.get("restoreAdopted").is_none() {
         return Ok(reconcile_job(&app, observed)?.summary);
     }
     {
@@ -604,7 +605,12 @@ pub(crate) fn require_admitted_library(
     Ok(())
 }
 
-fn reconcile_job(app: &AppHandle, job: DurableJob) -> Result<DurableJob> {
+fn reconcile_job(app: &AppHandle, mut job: DurableJob) -> Result<DurableJob> {
+    if job.request.kind==JobKind::Restore && !job.terminal() {
+        if let Some(result)=super::runtime_restore::confirmed_restore_activation(app,&job)? {
+            job.summary["result"]=result;
+        } else {job.summary.as_object_mut().unwrap().remove("result");}
+    }
     let state = app.state::<JobCommandState>();
     let active = state.active.lock().map_err(local_error)?;
     if active.contains_key(&job.id) {
@@ -1131,7 +1137,19 @@ async fn run_job(app: &AppHandle, id: &str, cancel: &Cancellation) -> Result<Val
             }
         }
         JobKind::Restore => {
-            super::runtime_restore::run_restore(app, &connected, &job, cancel).await
+            let root=root(app)?;
+            let writer=native_store(app)?.external_identity().map_err(local_error)?.store_id;
+            let context=lease_context(app,&root,&connected,&writer)?;
+            match leases::admit_shared_work(&context,&job.id,cancel).await? {
+                leases::Admission::Admitted(owner)=>{
+                    owner.run_restore(&context,cancel,super::runtime_restore::run_restore(app,&connected,&job,cancel)).await
+                }
+                leases::Admission::Yield{reason}=>Err(leases::yield_error(reason)),
+                leases::Admission::UnsupportedProtection if !context.protection_supported=>{
+                    super::runtime_restore::run_restore(app,&connected,&job,cancel).await
+                }
+                leases::Admission::UnsupportedProtection=>Err(ProviderError::new(ErrorKind::Unsupported)),
+            }
         }
         JobKind::PinHistory => {
             super::history_jobs::run_pin_history(app, &connected, &job, cancel).await
@@ -1155,6 +1173,12 @@ async fn run_cleanup(
     job: &DurableJob,
     cancel: &Cancellation,
 ) -> Result<Value> {
+    run_connected_cleanup(app,connected,&job.request.connection_id,&job.id,None,cancel).await
+}
+pub(crate) async fn run_connected_cleanup(
+    app:&AppHandle,connected:&ConnectedRepository,connection_id:&str,job_id:&str,
+    engine:Option<&super::lww_engine::ExternalLwwEngine>,cancel:&Cancellation,
+)->Result<Value> {
     let root = root(app)?;
     let writer_id = native_store(app)?
         .external_identity()
@@ -1163,7 +1187,7 @@ async fn run_cleanup(
     let unfinished = JobStore::open(&root)?
         .list_pending()?
         .into_iter()
-        .filter(|item| item.request.connection_id == job.request.connection_id && item.id != job.id)
+        .filter(|item| item.request.connection_id == connection_id && item.id != job_id)
         .map(|item| super::cleanup::UnfinishedJob {
             directory: job_directory(&root, &item.request.connection_id, &item.id),
             // A job publishes under its own snapshot identifier and may also
@@ -1180,7 +1204,7 @@ async fn run_cleanup(
     // One reading of the clock: the retention decision and the grace window
     // are measured against the same moment.
     let started = now_ms();
-    let cleanup_directory = job_directory(&root, &job.request.connection_id, &job.id);
+    let cleanup_directory = job_directory(&root, connection_id, job_id);
     let cache_root = cleanup_directory
         .parent()
         .and_then(|path| path.parent())
@@ -1204,19 +1228,36 @@ async fn run_cleanup(
             .clock_sample_after(&connected.handle.account, not_before)?
             .is_some())
     };
-    let outcome = super::cleanup::run(
-        &lease_context(&app, &root, connected, &writer_id)?,
-        &super::cleanup::CleanupRequest {
-            job_id: &job.id,
-            cleanup_supported: connected.stored.capabilities.cleanup_supported(),
-            limits: super::cleanup::CleanupLimits::default(),
-            connection_time: &connection_time,
-        },
-        &view,
-        &documents,
-        cancel,
-    )
-    .await?;
+    let protection=lease_context(app,&root,connected,&writer_id)?;
+    let request=super::cleanup::CleanupRequest {
+        job_id,cleanup_supported:connected.stored.capabilities.cleanup_supported(),
+        limits:super::cleanup::CleanupLimits::default(),connection_time:&connection_time,
+    };
+    let mut opened=None;
+    if engine.is_none() && connected.stored.descriptor.publication_strategy.is_some() {
+        let selected_connection=super::connection_commands::open_connected_with_cancel(app,connection_id,cancel).await?;
+        if selected_connection.handle.repository_id!=connected.handle.repository_id
+            || selected_connection.handle.connection_identity!=connected.handle.connection_identity
+            || selected_connection.stored.descriptor.repository_id!=connected.stored.descriptor.repository_id {
+            return Err(ProviderError::new(ErrorKind::Corrupt));
+        }
+        let fresh_after=std::time::Instant::now();
+        connected.provider.list_objects(&connected.handle,super::contract::Collection::Segments,None,1,cancel).await?;
+        let sample=connected.dependencies.requests.clock_sample_after(&connected.handle.account,fresh_after)?
+            .ok_or_else(||ProviderError::new(ErrorKind::ClockSkew))?;
+        let mut selected=super::lww_engine::ExternalLwwEngine {
+            provider:selected_connection.provider,repository:selected_connection.handle,
+            library:connected.stored.descriptor.repository_id.clone(),root_key:connected.root_key.clone(),
+            admission:None,connection_id:connection_id.into(),connection_root:root.clone(),
+            capabilities:connected.stored.capabilities.clone(),descriptor:connected.stored.descriptor.clone(),
+        };
+        selected.admit(&sample)?;opened=Some(selected);
+    }
+    let outcome=if let Some(engine)=engine.or(opened.as_ref()) {
+        super::cleanup::run_lww(&protection,&request,engine,view,&scratch,cancel).await?
+    } else {
+        super::cleanup::run(&protection,&request,&view,&documents,cancel).await?
+    };
     Ok(outcome.summary())
 }
 /// Proves the selected published state can still be read. The result is a
@@ -1382,7 +1423,6 @@ async fn run_backup(
     let worker_job = job.clone();
     let repository_id = connected.stored.descriptor.repository_id.clone();
     let probe = CancelProbe(cancel.clone());
-    let policy = connected.stored.capture_policy;
     let section_spool =
         job_directory(&root, &job.request.connection_id, &job.id).join("sections");
     let worker_spool = section_spool.clone();
@@ -1415,15 +1455,23 @@ async fn run_backup(
         let capture = match &retained {
             Some(id) => pds.reopen_external_capture(id).map_err(local_error)?,
             None => {
+                let revision = pds.revision().map_err(local_error)?;
+                let (lease, prepared_sections) = pds.lww_acquire_backup_capture(revision).map_err(local_error)?;
+                let sections = match super::sections::capture_prepared_backup_sections(&prepared_sections, &worker_spool, &probe.0) {
+                    Ok(sections) => sections,
+                    Err(error) => { let _ = pds.release_revision(&lease.lease); return Err(error); }
+                };
                 let capture = pds
-                    .capture_external_library(
+                    .capture_external_library_from_lease_with_sections(
                         &worker_job.request.connection_id,
                         hydration
                             .as_ref()
                             .ok_or_else(|| ProviderError::new(ErrorKind::Corrupt))?,
+                        &lease.lease,
+                        sections,
                         &probe,
                     )
-                    .map_err(local_error)?;
+                    .map_err(|error| { let _ = pds.release_revision(&lease.lease); local_error(error) })?;
                 probe.0.check()?;
                 pds.external_prepare_backup(
                     &worker_job.id,
@@ -1455,22 +1503,13 @@ async fn run_backup(
             .catalog
             .content_fingerprint(&risunest_external_storage_format::format::library_fingerprint_domain())
             .map_err(local_error)?;
-        // A backup keeps exactly what its connection selected. Capturing after
-        // the library keeps one cancellation point for the whole job.
-        let sections = match policy {
-            Some(policy) => super::sections::capture_backup_sections(
-                &mut pds,
-                policy,
-                &worker_spool,
-                &probe.0,
-            )?,
-            None => Vec::new(),
-        };
+        let sections = capture.catalog.backup_sections().map_err(local_error)?;
         Ok((capture, fingerprint, sections))
     })
     .await
     .map_err(local_error)??;
     let identity = capture.identity.clone();
+    let original_units = capture.catalog.original_backup_units().map_err(local_error)?;
     let capture_id = capture.id.clone();
     let directory = job_directory(&root, &job.request.connection_id, &job.id);
     let mut journal = TransferJournal::open(
@@ -1484,46 +1523,6 @@ async fn run_backup(
         },
     )?;
     journal.set_spool_budget(spool_budget(&root, &job.id));
-    // A backup wraps the library the published state already covers, so that
-    // state names the graph this capture can reuse from. Selected and recorded
-    // before anything reuses it. A connection that has never published one has
-    // nothing to select.
-    let parent_graph = match super::control::read_head(
-        connected.provider.as_ref(),
-        &connected.handle,
-        &connected.stored.descriptor,
-        &connected.root_key,
-        None,
-        cancel,
-    )
-    .await?
-    {
-        Some(head) => {
-            let view =
-                super::control::read_snapshot_document(connected, &head.document.state, cancel)
-                    .await?;
-            let mut roots = vec![
-                (
-                    super::packaging::CatalogRoot::Records,
-                    view.library.record_catalog,
-                ),
-                (
-                    super::packaging::CatalogRoot::Assets,
-                    view.library.asset_catalog,
-                ),
-            ];
-            roots.extend(view.sections.into_iter().map(|(id, section)| {
-                (
-                    super::packaging::CatalogRoot::Section(id),
-                    section.entries_root,
-                )
-            }));
-            let graph = super::packaging::ParentGraph::new(roots, &connected.handle)?;
-            journal.record_parent(graph.stored())?;
-            Some(graph)
-        }
-        None => None,
-    };
     let metadata = SnapshotMetadata {
         snapshot_id: job.snapshot_id.clone(),
         repository_id: connected.stored.descriptor.repository_id.clone(),
@@ -1541,6 +1540,7 @@ async fn run_backup(
                 writer_id: identity.store_id.clone(),
             },
             remote_generation: None,
+            original_units,
         },
     };
     let cache = package_cache_root(&directory)?;
@@ -1553,7 +1553,7 @@ async fn run_backup(
         &connected.root_key,
         PackageLimits::from_capabilities(&connected.stored.capabilities)?
             .with_maintenance(maintenance_allowed(app, connected, job)),
-        parent_graph.as_ref(),
+        None,
         &mut journal,
         connected.provider.as_ref(),
         &connected.handle,

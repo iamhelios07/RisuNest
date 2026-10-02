@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mount, tick, unmount } from 'svelte'
 
 const state = vi.hoisted(() => ({
+    native: true,
+    validateSyncRoot: vi.fn(async () => {}),
     listProviders: vi.fn(),
     prepareConnection: vi.fn(),
     prepareRenewal: vi.fn(),
@@ -26,6 +28,8 @@ vi.mock('@tauri-apps/plugin-os', () => ({ type: () => 'android' }))
 vi.mock('@tauri-apps/plugin-opener', () => ({ openUrl: state.openUrl }))
 vi.mock('src/ts/storage/sync/external/bridge', () => ({
     getExternalStorageBridge: () => ({
+        get supported() { return state.native },
+        validateSyncRoot: state.validateSyncRoot,
         listProviders: state.listProviders,
         prepareConnection: state.prepareConnection,
         prepareRenewal: state.prepareRenewal,
@@ -158,7 +162,8 @@ async function beginGoogleAuthorization(): Promise<void> {
 beforeEach(() => {
     platformState.android = true
     platformState.ios = false
-    for (const mock of Object.values(state)) mock.mockReset()
+    state.native = true
+    for (const mock of Object.values(state)) if (typeof mock !== 'boolean') mock.mockReset()
     target = document.createElement('div')
     document.body.append(target)
     state.listProviders.mockResolvedValue([{
@@ -656,7 +661,32 @@ describe('service presets', () => {
 })
 
 describe('what a connection stores', () => {
-    it('offers backup scope while the synchronization control is hidden', async () => {
+    it.each(['webdav', 's3', 'google_drive', 'onedrive'])('shows native Sync purpose for %s', async id => {
+        component = mount(ConnectionForm, { target, props: { strings, onconnected: vi.fn(), oncancel: vi.fn() } })
+        await settle(); await selectProvider(id)
+        expect([...target.querySelectorAll('button')].some(item => item.textContent?.trim() === strings.sync)).toBe(true)
+    })
+    it.each(['github_releases', 'gitlab_packages', 'mybox'])('keeps %s backup only', async id => {
+        component = mount(ConnectionForm, { target, props: { strings, onconnected: vi.fn(), oncancel: vi.fn() } })
+        await settle(); await selectProvider(id)
+        expect([...target.querySelectorAll('button')].some(item => item.textContent?.trim() === strings.sync)).toBe(false)
+    })
+    it.each(['webdav', 's3', 'google_drive', 'onedrive'])('hides Sync purpose for %s on web', async id => {
+        state.native = false
+        component = mount(ConnectionForm, { target, props: { strings, onconnected: vi.fn(), oncancel: vi.fn() } })
+        await settle(); await selectProvider(id)
+        expect([...target.querySelectorAll('button')].some(item => item.textContent?.trim() === strings.sync)).toBe(false)
+    })
+    it('calls the native Sync-root validator before preparing a Sync connection', async () => {
+        state.validateSyncRoot.mockRejectedValueOnce({ kind: 'invalid-config' })
+        component = mount(ConnectionForm, { target, props: { strings, onconnected: vi.fn(), oncancel: vi.fn() } })
+        await settle(); await selectProvider('s3'); button(strings.sync).click(); await settle()
+        button(strings.prepare).click(); await settle()
+        expect(state.validateSyncRoot).toHaveBeenCalledOnce()
+        expect(state.prepareConnection).not.toHaveBeenCalled()
+    })
+
+    it('offers fixed backup scope and synchronization for an eligible provider', async () => {
         component = mount(ConnectionForm, {
             target,
             props: { strings, onconnected: vi.fn(), oncancel: vi.fn() },
@@ -665,20 +695,13 @@ describe('what a connection stores', () => {
         await selectProvider('s3')
 
         for (const item of [strings.hypa, strings.devicePlugins, strings.deviceSettings]) {
-            expect(labelControl<HTMLInputElement>(item).type).toBe('checkbox')
+            expect(() => labelControl<HTMLInputElement>(item)).toThrow()
         }
-        // The library is always stored, so its row states the outcome instead
-        // of offering a control that does nothing.
         expect(() => labelControl<HTMLInputElement>(strings.library)).toThrow()
-        const library = [...target.querySelectorAll('p')]
-            .find(item => item.textContent?.includes(strings.library))
-        expect(library?.textContent).toContain(strings.included)
-        expect(library?.querySelector('input')).toBeNull()
-
-        expect([...target.querySelectorAll('button')].some(button => button.textContent?.trim() === strings.sync)).toBe(false)
+        expect([...target.querySelectorAll('button')].some(button => button.textContent?.trim() === strings.sync)).toBe(true)
     })
 
-    it('sends the chosen backup policy', async () => {
+    it('offers fixed full backups without exclusion controls', async () => {
         state.prepareConnection.mockResolvedValue(prepared)
         component = mount(ConnectionForm, {
             target,
@@ -686,16 +709,15 @@ describe('what a connection stores', () => {
         })
         await settle()
         await selectProvider('s3')
-        labelControl<HTMLInputElement>(strings.hypa).click()
-        await settle()
+        expect(target.textContent).not.toContain(strings.scopeHelp)
         button(strings.prepare).click()
         await settle()
 
         expect(state.prepareConnection).toHaveBeenCalledWith(expect.objectContaining({
             purpose: 'backup',
-            capturePolicy: { hypa: false, localPlugins: true, localSettings: true },
         }))
 
+        expect(state.prepareConnection.mock.calls.at(-1)?.[0]).not.toHaveProperty('capturePolicy')
         expect(state.prepareConnection.mock.calls.at(-1)?.[0]).not.toHaveProperty('publicationStrategy')
     })
 
