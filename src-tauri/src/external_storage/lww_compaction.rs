@@ -4,6 +4,19 @@ use risunest_external_storage_format::{crypto::derive_key, snapshot as wire};
 use crate::persistent_store::{content_capture::ContentCaptureSink, external_capture::CapturedSnapshot, sync_selection::CaptureIdentity};
 use std::{collections::{BTreeMap,BTreeSet}, io::Cursor, path::Path};
 
+#[cfg(test)]
+pub(crate) struct CompactionBarrier { pub reached:tokio::sync::Notify, pub resume:tokio::sync::Notify }
+#[cfg(test)]
+impl CompactionBarrier {pub(crate) fn new()->std::sync::Arc<Self> {std::sync::Arc::new(Self{reached:tokio::sync::Notify::new(),resume:tokio::sync::Notify::new()})}}
+#[cfg(test)]
+static BARRIERS:std::sync::LazyLock<std::sync::Mutex<BTreeMap<String,std::sync::Arc<CompactionBarrier>>>>=std::sync::LazyLock::new(||std::sync::Mutex::new(BTreeMap::new()));
+#[cfg(test)]
+pub(crate) fn install_compaction_barrier(job_id:&str,barrier:std::sync::Arc<CompactionBarrier>) {assert!(BARRIERS.lock().unwrap().insert(job_id.into(),barrier).is_none());}
+#[cfg(test)]
+async fn pause_compaction(job_id:&str) {
+    let barrier=BARRIERS.lock().unwrap().remove(job_id);
+    if let Some(barrier)=barrier {barrier.reached.notify_one();barrier.resume.notified().await;}
+}
 pub(crate) struct PublishedState {
     pub catalog: PublishedCatalog,
     pub controls: BTreeMap<String,Vec<u8>>,
@@ -141,6 +154,9 @@ impl ExternalLwwEngine {
     }
     pub(crate) async fn compact_published(&self,directory:&Path,job_id:&str,writer:&str,capabilities:&super::capabilities::Capabilities,cancel:&Cancellation,protection:Option<(&super::leases::LeaseOwner,&super::leases::LeaseContext<'_>)>) -> Result<super::packaging::CompletedSnapshot> {
         let state=self.published_state(&directory.join("inputs"),cancel).await?;
+        if let Some((owner,context))=protection {if let Some(reason)=owner.recheck(context,cancel).await? {return Err(super::leases::yield_error(reason));}}
+        #[cfg(test)] pause_compaction(job_id).await;
+        cancel.check()?;
         let identity=CaptureIdentity {store_id:writer.into(),library_epoch:self.library.clone(),generation:job_id.into(),selection_epoch:job_id.into(),revision:0};
         let external=directory.join("external-storage");
         let mut capture=super::capture::CaptureCatalog::create(&directory.join("capture"),&external,None).map_err(error)?;

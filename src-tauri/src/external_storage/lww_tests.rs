@@ -129,6 +129,31 @@ fn two_actual_stores_publish_receive_and_quiet_listing() {
 }
 
 #[test]
+fn real_publish_and_receive_continue_while_checkpoint_inputs_are_paused() {
+    run(async {
+        let mut f=CycleFixture::new();
+        set(&mut f.a,&["root","language"],serde_json::json!("ko")); f.publish_a().await;
+        let job=tempfile::tempdir().unwrap(); let id="00000000-0000-4000-8000-000000000097";
+        let barrier=super::lww_compaction::CompactionBarrier::new();
+        super::lww_compaction::install_compaction_barrier(id,barrier.clone());
+        let writer=f.a.lww_clock_state().unwrap().writer_id;
+        let caps=fake::capabilities(true); let cancel=Cancellation::default();
+        let compactor=ExternalLwwEngine{provider:f.provider.clone(),repository:fake::repository(),library:f.sender.library.clone(),root_key:zeroize::Zeroizing::new([7;32]),admission:Some(Admission::synthetic(super::runtime::now_ms())),connection_id:"compactor".into(),connection_root:job.path().into()};
+        let compaction=compactor.compact_published(job.path(),id,&writer,&caps,&cancel,None);
+        let routine=async {
+            barrier.reached.notified().await;
+            set(&mut f.a,&["root","language"],serde_json::json!("en"));
+            assert_eq!(f.sender.publish(&mut f.a,DecimalU64(0),&[],&cancel).await.unwrap().segments.0,1);
+            assert_eq!(f.receiver.receive_and_apply(&mut f.b,DecimalU64(0),&[],&cancel).await.unwrap(),2);
+            barrier.resume.notify_one();
+        };
+        let (completed,())=tokio::join!(compaction,routine);
+        let completed=completed.unwrap(); let (_,snapshot)=f.sender.checkpoint(&completed.reference.receipt,&cancel).await.unwrap();
+        assert_eq!(snapshot.covered_prefixes.get(&writer).unwrap().0,1);
+        assert_eq!(f.b.read_root(None).unwrap().value["language"],serde_json::json!("en"));
+    });
+}
+#[test]
 fn checkpoint_uses_only_published_units_and_restores_after_segment_retirement() {
     run(async {
         let mut f=CycleFixture::new();
