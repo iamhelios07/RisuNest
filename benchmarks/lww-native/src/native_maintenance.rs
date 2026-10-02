@@ -55,7 +55,7 @@ pub(crate) async fn remote_backup_restore_raw(
     let frozen_inventory=(||->Result<Value,String> {
         let connection=rusqlite::Connection::open_with_flags(root.join("external-jobs.sqlite"),rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|e|e.to_string())?;
-        let mut statement=connection.prepare("SELECT hash,present,settled,json_extract(source,'$.size') FROM external_restore_bodies WHERE job_id=?1 ORDER BY hash")
+        let mut statement=connection.prepare("SELECT hash,present,settled,json_extract(source,'$.byteLength') FROM external_restore_bodies WHERE job_id=?1 ORDER BY hash")
             .map_err(|e|e.to_string())?;
         let rows=statement.query_map([&job.id],|row|Ok((row.get::<_,String>(0)?,row.get::<_,bool>(1)?,row.get::<_,bool>(2)?,row.get::<_,u64>(3)?)))
             .map_err(|e|e.to_string())?;
@@ -132,18 +132,22 @@ pub(crate) async fn external_bootstrap_raw(
         if store.server_asset_policy().map_err(|e|format!("{e:?}"))?!=server_sync::residency::AssetPolicy::Full {
             return Err("all-local bootstrap completion requires the actual Full policy".into());
         }
-        let authority=store.lww_binding_authority().map_err(|e|e.to_string())?;
-        let identity=store.external_identity().map_err(|e|e.to_string())?;
-        store.hydrate_registered_remote_assets_prioritized(None,selected_character_id,|| {
-            cancel.check().map_err(|_|server_sync::SyncError::new("cancelled",409))?;
-            let current=store.external_identity().map_err(|_|server_sync::SyncError::new("store-error",500))?;
-            if store.lww_binding_authority().map_err(|_|server_sync::SyncError::new("store-error",500))?!=authority
-                || current.store_id!=identity.store_id || current.library_epoch!=identity.library_epoch || current.generation!=identity.generation {
-                return Err(server_sync::SyncError::new("sync-authority-changed",409));
-            }
-            Ok(())
-        },||{})
-            .map_err(|e|format!("{e:?}"))?;
+        let worker=store.open_native_job_store().map_err(|e|e.to_string())?;
+        let authority=worker.lww_binding_authority().map_err(|e|e.to_string())?;
+        let identity=worker.external_identity().map_err(|e|e.to_string())?;
+        let selected=selected_character_id.map(str::to_owned);
+        let worker_cancel=cancel.clone();
+        crate::external_storage::worker_observation::spawn_blocking(move || {
+            worker.hydrate_registered_remote_assets_prioritized(None,selected.as_deref(),|| {
+                worker_cancel.check().map_err(|_|server_sync::SyncError::new("cancelled",409))?;
+                let current=worker.external_identity().map_err(|_|server_sync::SyncError::new("store-error",500))?;
+                if worker.lww_binding_authority().map_err(|_|server_sync::SyncError::new("store-error",500))?!=authority
+                    || current.store_id!=identity.store_id || current.library_epoch!=identity.library_epoch || current.generation!=identity.generation {
+                    return Err(server_sync::SyncError::new("sync-authority-changed",409));
+                }
+                Ok(())
+            },||{}).map_err(|e|format!("{e:?}"))
+        }).await.map_err(|e|e.to_string())??;
         bodies_ms=Some(started.elapsed().as_secs_f64()*1000.0);
         Ok::<(),String>(())
     }.await;
