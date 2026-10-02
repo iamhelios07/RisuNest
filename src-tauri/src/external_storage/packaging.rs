@@ -579,6 +579,10 @@ pub(crate) struct CompletedSnapshot {
     /// the publication's own work.
     pub maintenance: MaintenanceReport,
     pub hydration: SourceHydration,
+    #[cfg(test)]
+    pub compaction_catalog_merge_visits: Option<u64>,
+    #[cfg(test)]
+    pub compaction_capture_rows: Option<u64>,
 }
 
 /// Library bodies this publication fetched through custody into the asset
@@ -3900,6 +3904,10 @@ pub(crate) async fn package_and_upload_protected(
     referenced.sort_by(|a, b| a.object_id.cmp(&b.object_id));
     referenced.dedup_by(|a, b| a.object_id == b.object_id);
     Ok(CompletedSnapshot {
+        #[cfg(test)]
+        compaction_catalog_merge_visits: None,
+        #[cfg(test)]
+        compaction_capture_rows: None,
         maintenance,
         hydration,
         reference,

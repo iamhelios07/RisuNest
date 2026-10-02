@@ -307,7 +307,7 @@ async fn run_owned(
     known_objects.extend(inventory.objects);
     let marked = reachability::mark(context.root, source, MarkRequest {
         connection_id: context.connection_id, repository: context.repository,
-        format_repository_id: source.format_repository_id().unwrap_or(&context.descriptor.repository_id),
+        format_repository_id: &context.descriptor.repository_id,
         now_ms: context.clock.reading().wall_ms,
         roots: Roots {
             head: before.head.clone(), kept_points: before.kept_points.clone(),
@@ -675,6 +675,9 @@ impl ConnectedRepositoryView<'_> {
     }
 
     async fn read_inventory(&self, cancel: &Cancellation) -> Result<InventorySurvey> {
+        self.read_inventory_in_scope(cancel,None).await
+    }
+    async fn read_inventory_in_scope(&self,cancel:&Cancellation,extra_repository_id:Option<&str>)->Result<InventorySurvey> {
         let mut survey = InventorySurvey::default();
         let mut cursor: Option<String> = None;
         let mut tracker = PageTracker::default();
@@ -682,7 +685,7 @@ impl ConnectedRepositoryView<'_> {
         loop {
             let page = leases::control_request(
                 cancel,
-                control::list_inventory_pages_page(
+                control::list_inventory_pages_page_in_scope(
                     &self.connected.stored.descriptor,
                     &self.connected.root_key,
                     self.connected.provider.as_ref(),
@@ -690,6 +693,7 @@ impl ConnectedRepositoryView<'_> {
                     cursor.as_deref(),
                     100,
                     cancel,
+                    extra_repository_id,
                 ),
             )
             .await?;
@@ -709,7 +713,13 @@ impl ConnectedRepositoryView<'_> {
                 }
                 let mut present = 0usize;
                 for entry in &listed.document.objects {
-                    let role = packaging::native_role(entry.role)?;
+                    let role = if entry.role == risunest_external_storage_format::snapshot::ObjectRole::SyncState
+                        && uuid::Uuid::parse_str(&entry.object_id).is_ok_and(|id| id.to_string()==entry.object_id)
+                    {
+                        ObjectRole::Snapshot
+                    } else {
+                        packaging::native_role(entry.role)?
+                    };
                     let intent = ObjectIntent {
                         repository_id: self.connected.handle.repository_id.clone(),
                         job_id: listed.document.operation_id.clone(),
@@ -907,14 +917,20 @@ impl RepositoryView for LwwRepositoryView<'_> {
     fn known_objects(&self)->Result<Vec<RemoteObject>> {
         let mut known=self.base.known_objects()?;known.extend(self.known.lock().map_err(|_|ProviderError::new(ErrorKind::Transient))?.clone());Ok(known)
     }
-    fn inventory<'a>(&'a self,cancel:&'a Cancellation)->ProviderFuture<'a,InventorySurvey> {self.base.inventory(cancel)}
-    fn delete_inventory_page<'a>(&'a self,expected:&'a risunest_external_storage_format::snapshot::StoredObject,cancel:&'a Cancellation)->ProviderFuture<'a,control::RemoteInventoryPageDeleteOutcome> {self.base.delete_inventory_page(expected,cancel)}
+    fn inventory<'a>(&'a self,cancel:&'a Cancellation)->ProviderFuture<'a,InventorySurvey> {Box::pin(self.base.read_inventory_in_scope(cancel,Some(&self.engine.repository.repository_id)))}
+    fn delete_inventory_page<'a>(&'a self,expected:&'a risunest_external_storage_format::snapshot::StoredObject,cancel:&'a Cancellation)->ProviderFuture<'a,control::RemoteInventoryPageDeleteOutcome> {
+        if expected.header.repository_id==self.engine.repository.repository_id {
+            Box::pin(control::delete_authenticated_inventory_page_for_repository(self.base.connected,expected,&self.engine.repository.repository_id,cancel))
+        } else {self.base.delete_inventory_page(expected,cancel)}
+    }
     fn prepare_removals(&self,objects:&[RemoteObject])->Result<()> {self.base.prepare_removals(objects)}
     fn confirmed_removed(&self,object:&RemoteObject)->Result<()> {self.base.confirmed_removed(object)}
     fn protected_jobs(&self)->Vec<String> {self.base.protected_jobs()}
 }
 impl DocumentSource for LwwRepositoryView<'_> {
-    fn format_repository_id(&self)->Option<&str> {Some(&self.engine.repository.repository_id)}
+    fn format_repository_id(&self,object:&RemoteObject)->Option<&str> {
+        (object.repository_id==self.engine.repository.repository_id).then_some(self.engine.repository.repository_id.as_str())
+    }
     fn native_body(&self,object:&RemoteObject)->Result<bool> {
         if object.role!=ObjectRole::Pack {return Ok(false)}
         let bodies=self.native_bodies.lock().map_err(|_|ProviderError::new(ErrorKind::Transient))?;
@@ -935,16 +951,27 @@ impl DocumentSource for LwwRepositoryView<'_> {
     }
     fn listed<'a>(&'a self,receipt:&'a ObjectReceipt)->ProviderFuture<'a,(RemoteObject,DocumentNode)> {
         Box::pin(async move {
-            let name=receipt.locator.object.rsplit('/').next().ok_or_else(||ProviderError::new(ErrorKind::Corrupt))?;
-            if super::contract::parse_segment_object_id(name).is_ok() {return self.segment_node(receipt).await}
-            if !name.starts_with("snapshot-") {let (object,document)=self.engine.checkpoint(receipt,self.documents.cancel).await?;return Ok((object,self.checkpoint_node(&document)?))}
+            let segment=self.known.lock().map_err(|_|ProviderError::new(ErrorKind::Transient))?.iter()
+                .any(|object|object.role==ObjectRole::Segment && object.receipt.locator==receipt.locator);
+            if segment {return self.segment_node(receipt).await}
+            if let Some((object,document))=self.engine.classified_checkpoint(receipt,self.documents.cancel).await? {
+                return Ok((object,self.checkpoint_node(&document)?));
+            }
             self.documents.listed(receipt).await
         })
     }
-    fn catalog<'a>(&'a self,object:&'a RemoteObject)->ProviderFuture<'a,Vec<RemoteObject>> {self.documents.catalog(object)}
+    fn catalog<'a>(&'a self,object:&'a RemoteObject)->ProviderFuture<'a,Vec<RemoteObject>> {
+        if object.repository_id==self.engine.repository.repository_id {
+            Box::pin(control::read_catalog_children_for_repository(self.base.connected,object,&self.engine.repository.repository_id,self.documents.cancel))
+        } else {self.documents.catalog(object)}
+    }
     fn probe<'a>(&'a self,object:&'a RemoteObject)->ProviderFuture<'a,Option<ObjectReceipt>> {
         Box::pin(async move {
-            if object.role!=ObjectRole::Segment && !self.native_body(object)? {return self.documents.probe(object).await}
+            if object.role!=ObjectRole::Segment && !self.native_body(object)? {
+                return if object.repository_id==self.engine.repository.repository_id {
+                    self.documents.probe_for_repository(object,&self.engine.repository.repository_id).await
+                } else {self.documents.probe(object).await};
+            }
             let intent=ObjectIntent{repository_id:self.engine.repository.repository_id.clone(),job_id:"cleanup-probe".into(),object_id:object.object_id.clone(),
                 role:object.role,byte_length:object.receipt.byte_length,sha256:object.ciphertext_sha256.clone()};
             let mut receipt=object.receipt.clone();receipt.checksum=None;
@@ -954,6 +981,33 @@ impl DocumentSource for LwwRepositoryView<'_> {
     }
 }
 impl ConnectedDocuments<'_> {
+    fn probe_for_repository<'a>(&'a self, object: &'a RemoteObject,repository_id:&'a str) -> ProviderFuture<'a, Option<ObjectReceipt>> {
+        Box::pin(async move {
+            object.stored(&self.connected.handle)?;
+            if object.repository_id != repository_id {
+                return Err(ProviderError::new(ErrorKind::Corrupt));
+            }
+            std::fs::create_dir_all(self.scratch)
+                .map_err(|_| ProviderError::new(ErrorKind::Transient))?;
+            if crate::trust_boundary::is_link_like(
+                &std::fs::symlink_metadata(self.scratch)
+                    .map_err(|_| ProviderError::new(ErrorKind::Transient))?,
+            ) {
+                return Err(ProviderError::new(ErrorKind::Corrupt));
+            }
+            let intent = ObjectIntent {
+                repository_id: self.connected.handle.repository_id.clone(), job_id: "cleanup-probe".into(),
+                object_id: object.object_id.clone(), role: object.role,
+                byte_length: object.receipt.byte_length, sha256: object.ciphertext_sha256.clone(),
+            };
+            let mut receipt = object.receipt.clone();
+            receipt.checksum = None;
+            super::transfer_job::verify_remote_receipt(
+                self.scratch, &intent, self.connected.provider.as_ref(), &self.connected.handle,
+                receipt, self.cancel,
+            ).await
+        })
+    }
     fn node(&self, view: &control::SnapshotView) -> Result<DocumentNode> {
         let references = reachability::document_references(view).into_iter()
             .map(|stored| RemoteObject::from_stored(stored, &self.connected.handle))
@@ -980,31 +1034,7 @@ impl DocumentSource for ConnectedDocuments<'_> {
         Box::pin(async move { control::read_catalog_children(self.connected, object, self.cancel).await })
     }
     fn probe<'a>(&'a self, object: &'a RemoteObject) -> ProviderFuture<'a, Option<ObjectReceipt>> {
-        Box::pin(async move {
-            object.stored(&self.connected.handle)?;
-            if object.repository_id != self.connected.stored.descriptor.repository_id {
-                return Err(ProviderError::new(ErrorKind::Corrupt));
-            }
-            std::fs::create_dir_all(self.scratch)
-                .map_err(|_| ProviderError::new(ErrorKind::Transient))?;
-            if crate::trust_boundary::is_link_like(
-                &std::fs::symlink_metadata(self.scratch)
-                    .map_err(|_| ProviderError::new(ErrorKind::Transient))?,
-            ) {
-                return Err(ProviderError::new(ErrorKind::Corrupt));
-            }
-            let intent = ObjectIntent {
-                repository_id: self.connected.handle.repository_id.clone(), job_id: "cleanup-probe".into(),
-                object_id: object.object_id.clone(), role: object.role,
-                byte_length: object.receipt.byte_length, sha256: object.ciphertext_sha256.clone(),
-            };
-            let mut receipt = object.receipt.clone();
-            receipt.checksum = None;
-            super::transfer_job::verify_remote_receipt(
-                self.scratch, &intent, self.connected.provider.as_ref(), &self.connected.handle,
-                receipt, self.cancel,
-            ).await
-        })
+        self.probe_for_repository(object,&self.connected.stored.descriptor.repository_id)
     }
 }
 
@@ -1031,8 +1061,10 @@ mod tests {
             f.a.delete_asset_alias("asset","obsolete-large",f.a.revision().unwrap()).unwrap();
             f.publish_a().await;
             let directory=tempfile::tempdir().unwrap();let id=uuid::Uuid::new_v4().to_string();
-            f.sender.compact_published(directory.path(),&id,&f.a.lww_clock_state().unwrap().writer_id,
+            let checkpoint=f.sender.compact_published(directory.path(),&id,&f.a.lww_clock_state().unwrap().writer_id,
                 &f.sender.capabilities,&cancel,None).await.unwrap();
+            assert_eq!(checkpoint.reference.role,ObjectRole::Snapshot);
+            assert_eq!(checkpoint.reference.object_id,id);
             let connected=ConnectedRepository {
                 stored:super::super::connection_store::StoredConnection {
                     id:"sender".into(),config:ConnectionConfig{provider:"synthetic".into(),profile:None,
@@ -1044,30 +1076,76 @@ mod tests {
                 dependencies:fake::loopback_dependencies(fake::MemoryVault::default(),1).dependencies,root_key:zeroize::Zeroizing::new([7;32]),
             };
             let cache=directory.path().join("cache");let scratch=directory.path().join("probe");
+            let source_root=f.directory_a.path().to_path_buf();let backup_spool=directory.path().join("backup-sections");
+            let (capture,sections,original_units,writer)=super::super::worker_observation::spawn_blocking(move || {
+                let mut source=crate::persistent_store::PersistentStore::open(&source_root).unwrap();
+                let probe=super::super::runtime::CancelProbe(Cancellation::default());
+                let hydration=source.hydrate_external_capture_dependencies("sender",&probe).unwrap();
+                let (lease,prepared)=source.lww_acquire_backup_capture(source.revision().unwrap()).unwrap();
+                let sections=super::super::sections::capture_prepared_backup_sections(&prepared,&backup_spool,&probe.0).unwrap();
+                let capture=source.capture_external_library_from_lease_with_sections("sender",&hydration,&lease.lease,sections,&probe).unwrap();
+                let sections=capture.catalog.backup_sections().unwrap();let original=capture.catalog.original_backup_units().unwrap();
+                (capture,sections,original,source.lww_clock_state().unwrap().writer_id)
+            }).await.unwrap();
+            let backup_id=uuid::Uuid::new_v4().to_string();
+            let mut journal=TransferJournal::open(&directory.path().join("backup-journal"),super::super::journal::JobIdentity{
+                job_id:backup_id.clone(),connection_id:"sender".into(),repository_id:connected.handle.repository_id.clone(),
+                capture_id:capture.id.clone(),capture:capture.identity.clone(),
+            }).unwrap();
+            let metadata=packaging::SnapshotMetadata{snapshot_id:backup_id.clone(),repository_id:connected.stored.descriptor.repository_id.clone(),
+                library_id:capture.identity.library_epoch.clone(),author_device_id:capture.identity.store_id.clone(),created_at_ms:super::super::runtime::now_ms(),
+                logical_revision:capture.identity.revision as u64,parent_snapshot_id:None,
+                content_fingerprint:capture.catalog.content_fingerprint(&risunest_external_storage_format::format::library_fingerprint_domain()).unwrap(),
+                purpose:packaging::SnapshotPurpose::BackupBundle{source:BundleSource::Device{writer_id:writer},remote_generation:None,original_units},
+            };
+            let backup=packaging::package_and_upload(capture,sections,f.directory_a.path(),&cache,metadata,&connected.root_key,
+                packaging::PackageLimits::from_capabilities(&connected.stored.capabilities).unwrap(),None,&mut journal,
+                connected.provider.as_ref(),&connected.handle,&super::super::phase_progress::PhaseProgress::silent(),&cancel).await.unwrap();
+            assert_ne!(backup.reference.repository_id,f.sender.repository.repository_id);
+            assert_eq!(f.sender.snapshot_listing(&cancel).await.unwrap().len(),1,"ordinary logical-scope backup coexists with the physical checkpoint");
             let view=LwwRepositoryView::new(&f.sender,ConnectedRepositoryView{connected:&connected,writer_id:"sender",policy:RetentionPolicy::DEFAULT,
                 now_ms:1000,unfinished:vec![],cache_root:&cache},ConnectedDocuments{connected:&connected,cancel:&cancel,scratch:&scratch});
             let observed=view.roots(&cancel).await.unwrap();let listed=view.snapshots(&cancel).await.unwrap();let known=view.known_objects().unwrap();
+            let inventory=view.inventory(&cancel).await.unwrap();
+            assert!(inventory.pages.iter().any(|page|page.reference.repository_id==f.sender.repository.repository_id));
+            assert!(inventory.pages.iter().any(|page|page.reference.repository_id==connected.stored.descriptor.repository_id));
+            assert!(inventory.objects.iter().any(|object|object.object_id==id && object.role==ObjectRole::Snapshot));
+            assert_eq!(backup.reference.role,ObjectRole::BackupBundle);
+            assert_eq!(backup.reference.object_id,format!("snapshot-{backup_id}"));
             let body=known.iter().find(|object|view.native_body(object).unwrap()).unwrap().clone();
             assert!(body.stored(&connected.handle).is_err(),"native ciphertext is not a generic StoredObject envelope");
             assert!(validate_generic_body(&body,&connected.handle).is_err());
             let roots=Roots{head:observed.head,kept_points:observed.kept_points,kept_bundles:observed.kept_bundles,..Default::default()};
-            let gc=GcStore::open(directory.path()).unwrap();
+            let gc=GcStore::open(f.directory_a.path()).unwrap();
             gc.begin_observation("sender").unwrap();
-            let first=reachability::mark(directory.path(),&view,reachability::MarkRequest{connection_id:"sender",repository:&connected.handle,
-                format_repository_id:&f.sender.repository.repository_id,now_ms:1000,roots:roots.clone(),listed:listed.clone(),known_objects:known.clone(),retired_points:vec![]},&cancel).await.unwrap();
+            let first=reachability::mark(f.directory_a.path(),&view,reachability::MarkRequest{connection_id:"sender",repository:&connected.handle,
+                format_repository_id:&connected.stored.descriptor.repository_id,now_ms:1000,roots:roots.clone(),listed:listed.clone(),known_objects:known.clone(),retired_points:vec![]},&cancel).await.unwrap();
             assert!(first.candidates.is_empty());gc.finish_observation("sender").unwrap();
             gc.begin_observation("sender").unwrap();
-            let marked=reachability::mark(directory.path(),&view,reachability::MarkRequest{connection_id:"sender",repository:&connected.handle,
-                format_repository_id:&f.sender.repository.repository_id,now_ms:1000+leases::UNREACHABLE_GRACE_MS,roots:roots.clone(),listed:listed.clone(),known_objects:known.clone(),retired_points:vec![]},&cancel).await.unwrap();
+            let marked=reachability::mark(f.directory_a.path(),&view,reachability::MarkRequest{connection_id:"sender",repository:&connected.handle,
+                format_repository_id:&connected.stored.descriptor.repository_id,now_ms:1000+leases::UNREACHABLE_GRACE_MS,roots:roots.clone(),listed:listed.clone(),known_objects:known.clone(),retired_points:vec![]},&cancel).await.unwrap();
             assert_eq!(marked.candidates.first().unwrap().object_id,body.object_id);
             assert!(marked.candidates.iter().skip(1).any(|object|object.role==ObjectRole::Segment));
+            gc.finish_observation("sender").unwrap();gc.begin_observation("sender").unwrap();
             let mut protected=roots;protected.job_references.push(body.clone());
-            let retained=reachability::mark(directory.path(),&view,reachability::MarkRequest{connection_id:"sender",repository:&connected.handle,
-                format_repository_id:&f.sender.repository.repository_id,now_ms:1000+leases::UNREACHABLE_GRACE_MS,
+            let retained=reachability::mark(f.directory_a.path(),&view,reachability::MarkRequest{connection_id:"sender",repository:&connected.handle,
+                format_repository_id:&connected.stored.descriptor.repository_id,now_ms:1000+leases::UNREACHABLE_GRACE_MS,
                 roots:protected,listed,known_objects:known,retired_points:vec![]},&cancel).await.unwrap();
             assert!(!retained.candidates.iter().any(|object|object.object_id==body.object_id));
             assert!(retained.candidates.iter().any(|object|object.role==ObjectRole::Segment),"a live body does not pin obsolete discovery parents");
-            connected.provider.delete_object(&connected.handle,&body.receipt.locator,&cancel).await.unwrap();
+            gc.finish_observation("sender").unwrap();
+            let clock=fake::FakeLeaseClock::new(1000+leases::UNREACHABLE_GRACE_MS);
+            let context=LeaseContext{root:f.directory_a.path(),connection_id:"sender",writer_id:"collector",descriptor:&connected.stored.descriptor,
+                root_key:&connected.root_key,provider:connected.provider.as_ref(),repository:&connected.handle,clock:&clock,protection_supported:true,ledger:None};
+            let request=CleanupRequest{job_id:"first-finite-gc",cleanup_supported:true,limits:CleanupLimits{batch:1,per_run:1},connection_time:&available_time};
+            let first=run_lww(&context,&request,&f.sender,ConnectedRepositoryView{connected:&connected,writer_id:"collector",policy:RetentionPolicy::DEFAULT,
+                now_ms:1000+leases::UNREACHABLE_GRACE_MS,unfinished:vec![],cache_root:&cache},&scratch,&cancel).await.unwrap();
+            assert!(first.deleted_objects<=1);assert!(f.provider.holds(&body.object_id),"a newly unmarked protected body retains its grace period");
+            clock.advance(leases::UNREACHABLE_GRACE_MS);
+            let request=CleanupRequest{job_id:"second-finite-gc",..request};
+            let settled=run_lww(&context,&request,&f.sender,ConnectedRepositoryView{connected:&connected,writer_id:"collector",policy:RetentionPolicy::DEFAULT,
+                now_ms:1000+2*leases::UNREACHABLE_GRACE_MS,unfinished:vec![],cache_root:&cache},&scratch,&cancel).await.unwrap();
+            assert_eq!(settled.deleted_objects,1);assert!(!f.provider.holds(&body.object_id));
             assert!(view.snapshots(&cancel).await.unwrap().len()>=3,"partial deletion keeps signed discovery parents");
         });
     }

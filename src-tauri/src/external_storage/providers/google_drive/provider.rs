@@ -45,6 +45,32 @@ fn corrupt() -> ProviderError {
     ProviderError::new(ErrorKind::Corrupt)
 }
 
+fn segment_file_name(file: &DriveFile) -> Result<&str> {
+    if file.property(ROLE_KEY) != Some("segment") { return Err(corrupt()); }
+    let name = file.name.as_deref().and_then(|name| name.strip_prefix("segments/")).ok_or_else(corrupt)?;
+    crate::external_storage::contract::parse_segment_object_id(name)?;
+    Ok(name)
+}
+
+fn segment_locator_object(file_id: &str, name: &str) -> Result<String> {
+    if !config::is_drive_id(file_id) { return Err(corrupt()); }
+    crate::external_storage::contract::parse_segment_object_id(name)?;
+    Ok(format!("{file_id}/{name}"))
+}
+
+fn segment_locator_parts(locator: &RemoteLocator) -> Result<Option<(&str, &str)>> {
+    if locator.collection.as_deref() != Some("segments") { return Ok(None); }
+    let (file_id, name) = locator.object.split_once('/').ok_or_else(corrupt)?;
+    if !config::is_drive_id(file_id) { return Err(corrupt()); }
+    crate::external_storage::contract::parse_segment_object_id(name)?;
+    Ok(Some((file_id, name)))
+}
+
+fn validate_segment_file(file: &DriveFile, file_id: &str, name: &str) -> Result<()> {
+    if file.file_id()? != file_id || segment_file_name(file)? != name { return Err(corrupt()); }
+    Ok(())
+}
+
 fn role_token(role: ObjectRole) -> &'static str {
     match role {
         ObjectRole::Descriptor => DESCRIPTOR_ROLE,
@@ -773,11 +799,15 @@ impl GoogleDrive {
         {
             return Err(corrupt());
         }
+        let object = if intent.role == ObjectRole::Segment {
+            if segment_file_name(file)? != intent.object_id { return Err(corrupt()); }
+            segment_locator_object(file_id, &intent.object_id)?
+        } else { file_id.to_owned() };
         Ok(ObjectReceipt {
             locator: RemoteLocator {
                 connection_identity: settings.connection_identity.clone(),
                 collection: collection_token(intent.role).map(str::to_owned),
-                object: file_id.to_owned(),
+                object,
             },
             byte_length: intent.byte_length,
             version: file.version_token(),
@@ -793,8 +823,11 @@ impl GoogleDrive {
         if file.byte_length()? != intent.byte_length || file.property(ROLE_KEY) != Some(role_token(intent.role)) {
             return Err(ProviderError::new(ErrorKind::PreconditionFailed));
         }
-        if intent.role == ObjectRole::Segment && file.name.as_deref() != Some(format!("segments/{}", intent.object_id).as_str()) {
-            return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+        if intent.role == ObjectRole::Segment {
+            segment_locator_object(file.file_id()?, &intent.object_id)?;
+            if file.name.as_deref() != Some(format!("segments/{}", intent.object_id).as_str()) {
+                return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+            }
         }
         let token = self.token(session, false, cancel).await?;
         let mut response = self.dispatch(HttpRequest {
@@ -910,6 +943,7 @@ fn context(repository: &RepositoryHandle) -> Result<&Context> {
 }
 
 fn resolve_file_id(context: &Context, locator: &RemoteLocator) -> Result<String> {
+    if let Some((file_id, _)) = segment_locator_parts(locator)? { return Ok(file_id.to_owned()); }
     if locator.object == HEAD_OBJECT {
         let head = context.head.lock().unwrap();
         return if head.present {
@@ -1144,18 +1178,20 @@ impl Provider for GoogleDrive {
             let context = context(repository)?;
             locator.validate_for(repository)?;
             let file_id = resolve_file_id(context, locator)?;
+            let segment_name = segment_locator_parts(locator)?.map(|(_, name)| name);
             let session = context.session();
             let metadata: DriveFile = self
                 .control(
                     session,
                     &with_query(
                         context.settings.api(&format!("/files/{file_id}"))?,
-                        &[("fields", "id,size,version,sha256Checksum")],
+                        &[("fields", if segment_name.is_some() { FILE_FIELDS } else { "id,size,version,sha256Checksum" })],
                     ),
                     ProviderOperation::Metadata,
                     cancel,
                 )
                 .await?;
+            if let Some(name) = segment_name { validate_segment_file(&metadata, &file_id, name)?; }
             let version = metadata.version_token();
             if let (Some(unchanged), Some(current)) = (unchanged, version.as_ref()) {
                 if unchanged == current {
@@ -1198,6 +1234,9 @@ impl Provider for GoogleDrive {
             let (received, hash) =
                 common::stream_to_sink(&mut response.body, sink, Some(length), length, cancel)
                     .await?;
+            if let Some(name) = segment_name {
+                if crate::external_storage::contract::parse_segment_object_id(name)?.2 != hash { return Err(corrupt()); }
+            }
             let checksum = metadata.checksum(Some(&hash));
             if checksum
                 .as_ref()
@@ -1385,17 +1424,19 @@ impl Provider for GoogleDrive {
             cancel.check()?;
             let context = context(repository)?;
             locator.validate_for(repository)?;
-            if locator.object == HEAD_OBJECT || !config::is_drive_id(&locator.object) {
+            if locator.object == HEAD_OBJECT
+                || (locator.collection.as_deref() != Some("segments") && !config::is_drive_id(&locator.object)) {
                 return Err(ProviderError::new(ErrorKind::Unsupported));
             }
-            let file_id = &locator.object;
+            let file_id = resolve_file_id(context, locator)?;
+            let segment_name = segment_locator_parts(locator)?.map(|(_, name)| name);
             let session = context.session();
             let metadata: DriveFile = match self
                 .control(
                     session,
                     &with_query(
                         context.settings.api(&format!("/files/{file_id}"))?,
-                        &[("fields", "id,parents,appProperties")],
+                        &[("fields", if segment_name.is_some() { "id,name,parents,appProperties" } else { "id,parents,appProperties" })],
                     ),
                     ProviderOperation::Metadata,
                     cancel,
@@ -1406,6 +1447,7 @@ impl Provider for GoogleDrive {
                 Err(error) if error.kind == ErrorKind::NotFound => return Ok(()),
                 Err(error) => return Err(error),
             };
+            if let Some(name) = segment_name { validate_segment_file(&metadata, &file_id, name)?; }
             if !removable(&context.settings, &metadata) {
                 return Err(ProviderError::new(ErrorKind::Unsupported));
             }
@@ -1456,11 +1498,14 @@ impl Provider for GoogleDrive {
             page.validate_page(cursor)?;
             let mut objects = Vec::with_capacity(page.files.len());
             for file in &page.files {
+                let object = if collection == Collection::Segments {
+                    segment_locator_object(file.file_id()?, segment_file_name(file)?)?
+                } else { file.file_id()?.to_owned() };
                 objects.push(ObjectReceipt {
                     locator: RemoteLocator {
                         connection_identity: context.settings.connection_identity.clone(),
                         collection: collection_token(role).map(str::to_owned),
-                        object: file.file_id()?.to_owned(),
+                        object,
                     },
                     byte_length: file.byte_length()?,
                     version: file.version_token(),

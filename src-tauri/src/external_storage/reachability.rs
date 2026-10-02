@@ -45,7 +45,7 @@ pub(crate) trait DocumentSource: Sync {
     /// Verify current identity and bytes. Only a confirmed missing object is None.
     fn probe<'a>(&'a self, object: &'a RemoteObject) -> ProviderFuture<'a, Option<ObjectReceipt>>;
     fn native_body(&self, _object:&RemoteObject)->Result<bool> {Ok(false)}
-    fn format_repository_id(&self)->Option<&str> {None}
+    fn format_repository_id(&self,_object:&RemoteObject)->Option<&str> {None}
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -173,7 +173,7 @@ async fn walk(
     while let Some(object) = pending.pop_front() {
         cancel.check()?;
         let native_body=source.native_body(&object)?;
-        validate_object(&object, repository, format_repository_id,native_body)?;
+        validate_object(&object, repository, source.format_repository_id(&object).unwrap_or(format_repository_id),native_body)?;
         let key = locator_key(&object.receipt.locator)?;
         let identity = if native_body {native_identity(&object,repository)?}else{object_identity(&object, repository)?};
         if let Some(previous) = graph.identities.insert(key.clone(), identity.clone()) {
@@ -249,7 +249,7 @@ pub(crate) async fn mark(
             return Err(corrupt());
         }
         let (object, document) = source.listed(receipt).await?;
-        validate_object(&object, request.repository, request.format_repository_id,source.native_body(&object)?)?;
+        validate_object(&object, request.repository, source.format_repository_id(&object).unwrap_or(request.format_repository_id),source.native_body(&object)?)?;
         if !matches!(object.role, ObjectRole::SyncState | ObjectRole::BackupBundle | ObjectRole::Snapshot | ObjectRole::Segment)
             || object.receipt.locator != receipt.locator || object.receipt.byte_length != receipt.byte_length
             || document.snapshot_id.is_empty()
@@ -263,7 +263,7 @@ pub(crate) async fn mark(
     let mut known_by_locator = BTreeMap::new();
     for object in &request.known_objects {
         let native_body=source.native_body(object)?;
-        validate_object(object, request.repository, request.format_repository_id,native_body)?;
+        validate_object(object, request.repository, source.format_repository_id(object).unwrap_or(request.format_repository_id),native_body)?;
         let key = locator_key(&object.receipt.locator)?;
         authorized.insert(key.clone());
         if let Some(previous) = known_by_locator.insert(key, object.clone()) {

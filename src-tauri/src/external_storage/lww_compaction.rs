@@ -241,15 +241,21 @@ impl ExternalLwwEngine {
         Ok(output)
     }
     pub(crate) async fn checkpoint(&self,receipt:&ObjectReceipt,cancel:&Cancellation)->Result<(RemoteObject,Checkpoint)> {self.classified_checkpoint(receipt,cancel).await?.ok_or_else(segment::corrupt)}
-    async fn classified_checkpoint(&self, receipt:&ObjectReceipt,cancel:&Cancellation) -> Result<Option<(RemoteObject,Checkpoint)>> {
+    pub(super) async fn classified_checkpoint(&self, receipt:&ObjectReceipt,cancel:&Cancellation) -> Result<Option<(RemoteObject,Checkpoint)>> {
         receipt.locator.validate_for(&self.repository)?;
         let bytes=read_bytes(self.provider.as_ref(),&self.repository,&receipt.locator,cancel).await?;
-        let key=derive_key(&self.root_key,&self.repository.repository_id,"metadata").map_err(error)?;
+        let (advertised,_)=wire::read_public_header(&mut Cursor::new(&bytes)).map_err(error)?;
+        let ordinary=advertised.object_id.starts_with("snapshot-");
+        let repository_id=if ordinary {&self.descriptor.repository_id}else{&self.repository.repository_id};
+        if advertised.repository_id!=*repository_id
+            || (ordinary && !matches!(advertised.role,wire::ObjectRole::SyncState|wire::ObjectRole::BackupBundle))
+            || (!ordinary && advertised.role!=wire::ObjectRole::SyncState) {return Err(segment::corrupt())}
+        let key=derive_key(&self.root_key,repository_id,"metadata").map_err(error)?;
         let mut plaintext=Vec::new();
         let header=wire::open_envelope(&mut Cursor::new(&bytes),&mut plaintext,&key,wire::MAX_METADATA_BYTES as u64).map_err(error)?;
-        if header.repository_id!=self.repository.repository_id || receipt.byte_length!=bytes.len() as u64 || !receipt.complete {return Err(segment::corrupt());}
-        if header.object_id.starts_with("snapshot-") && matches!(header.role,wire::ObjectRole::SyncState|wire::ObjectRole::BackupBundle) {
-            let backup=super::control::SnapshotView::read(&plaintext,header.role,&self.repository.repository_id)?;
+        if header!=advertised || receipt.byte_length!=bytes.len() as u64 || !receipt.complete {return Err(segment::corrupt());}
+        if ordinary {
+            let backup=super::control::SnapshotView::read(&plaintext,header.role,repository_id)?;
             if header.object_id!=format!("snapshot-{}",backup.snapshot_id) {return Err(segment::corrupt());}
             return Ok(None);
         }
@@ -362,6 +368,13 @@ impl ExternalLwwEngine {
             purpose:super::packaging::SnapshotPurpose::LwwCheckpoint { covered_prefixes:state.catalog.coverage.clone(),state_identity:state.catalog.identity()?,asset_catalogs,standalone_bodies } };
         let captured=CapturedSnapshot{id:job_id.into(),identity:identity.clone(),catalog:capture,projected_records:count,shared:true};
         let completed=super::packaging::package_and_upload_protected(captured,Vec::new(),directory,&directory.join("cache"),metadata,&self.root_key,limits,None,&mut journal,self.provider.as_ref(),&self.repository,&super::phase_progress::PhaseProgress::silent(),cancel,protection).await?;
+        #[cfg(test)]
+        let completed={
+            let mut completed=completed;
+            completed.compaction_catalog_merge_visits=Some(state.catalog.visited);
+            completed.compaction_capture_rows=Some(u64::try_from(count).map_err(error)?);
+            completed
+        };
         if let Some(pins)=pins.as_mut() {pins.release(crate::asset_repository::job_pins::CasReleaseOutcome::Aborted).map_err(error)?;}
         Ok(completed)
     }
@@ -434,6 +447,8 @@ mod tests {
                 let work=tempfile::tempdir().unwrap();
                 let completed=engine.compact_published(work.path(),"00000000-0000-4000-8000-000000000087",
                     &f.a.lww_clock_state().unwrap().writer_id,&fake::capabilities(true),&cancel,None).await.unwrap();
+                assert!(completed.compaction_capture_rows.unwrap()>0);
+                assert!(completed.compaction_catalog_merge_visits.unwrap()>=completed.compaction_capture_rows.unwrap());
                 let (_,checkpoint)=engine.checkpoint(&completed.reference.receipt,&cancel).await.unwrap();
                 assert_eq!(checkpoint.asset_catalogs.len(),1);
                 let root=RemoteObject::from_stored(&checkpoint.asset_catalogs[0],&engine.repository).unwrap();
