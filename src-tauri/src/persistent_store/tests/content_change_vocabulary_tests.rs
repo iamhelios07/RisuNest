@@ -276,7 +276,7 @@ fn owner_head_changes_always_accompany_their_parent_record() {
         .unwrap();
     assert_eq!(
         recorded(&store, before),
-        vec![key("owner", "root-module-assets", "0"), key("root", "", "")]
+        vec![key("owner", "root-module-assets", "module-0"), key("root", "", "")]
     );
 
     let before = store.revision().unwrap();
