@@ -54,6 +54,13 @@ impl PartialEq for FrozenAsset {
     }
 }
 impl Eq for FrozenAsset {}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct FrozenControl {
+    pub content_hash: String,
+    pub byte_length: u64,
+    pub source: std::path::PathBuf,
+}
 impl std::fmt::Debug for FrozenAsset {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("FrozenAsset").field("content_hash", &self.content_hash)
@@ -77,7 +84,9 @@ pub(crate) struct SealedPublication {
     pub entries: Vec<OutboxEntry>,
     pub bodies: Vec<SealedBody>,
     pub assets: Vec<FrozenAsset>,
+    pub controls: Vec<FrozenControl>,
     pub asset_job: Option<crate::external_storage::journal::JobIdentity>,
+    pub data_catalogs: Vec<risunest_external_storage_format::snapshot::StoredObject>,
     pub asset_catalogs: Vec<risunest_external_storage_format::snapshot::StoredObject>,
     pub resume: Option<UploadState>,
     pub dispatched: bool,
@@ -326,6 +335,15 @@ impl PersistentStore {
         }) {
             return Err(super::lww::error("captured-asset-source-integrity"));
         }
+        for control in &publication.controls {
+            risunest_sync_wire::validate_hash(&control.content_hash).map_err(super::lww::error)?;
+            let job=publication.asset_job.as_ref().ok_or_else(||super::lww::error("captured-control-job-missing"))?;
+            let expected=self.repository_root.join("external-storage").join("lww-publications")
+                .join(&job.job_id).join("controls").join(&control.content_hash);
+            if control.source!=expected {
+                return Err(super::lww::error("captured-control-source-integrity"));
+            }
+        }
         if publication.bodies.iter().any(|body| {
             if body.bytes.is_empty() {
                 !body.sha256.is_empty() || body.byte_length != 0 || body.resume.is_some()
@@ -358,6 +376,12 @@ impl PersistentStore {
             }
             if previous.assets != publication.assets || previous.asset_job != publication.asset_job {
                 return Err(super::lww::error("captured-asset-integrity"));
+            }
+            if previous.controls != publication.controls {
+                return Err(super::lww::error("captured-control-integrity"));
+            }
+            if !previous.data_catalogs.is_empty() && previous.data_catalogs != publication.data_catalogs {
+                return Err(super::lww::error("sealed-data-catalog-integrity"));
             }
             if !previous.asset_catalogs.is_empty() && previous.asset_catalogs != publication.asset_catalogs {
                 return Err(super::lww::error("sealed-asset-catalog-integrity"));

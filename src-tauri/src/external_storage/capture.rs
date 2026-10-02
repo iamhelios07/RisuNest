@@ -103,18 +103,22 @@ impl BackupDependencySpool {
         let file = tempfile::NamedTempFile::new_in(directory)?;
         let db = Connection::open(file.path())?;
         db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=OFF; PRAGMA cache_size=-4096; PRAGMA temp_store=FILE;
-            CREATE TABLE bodies(hash TEXT PRIMARY KEY,body BLOB NOT NULL,role INTEGER NOT NULL CHECK(role IN(1,2)));
+            CREATE TABLE bodies(hash TEXT PRIMARY KEY,body BLOB NOT NULL,role INTEGER NOT NULL CHECK(role IN(1,2,3)));
             BEGIN IMMEDIATE;")?;
         Ok(Self {file,db,sealed:false})
     }
     pub(crate) fn push(&mut self, hash:&str,bytes:&[u8],role:crate::persistent_store::external_capture::BackupBodyRole) -> Result<()> {
-        if self.sealed || bytes.len() > risunest_sync_wire::MAX_METADATA_BYTES || crate::persistent_store::external_capture::hash_backup_body(bytes,"native_backup_spool_write") != hash {
+        if self.sealed || crate::persistent_store::external_capture::hash_backup_body(bytes,"native_backup_spool_write") != hash {
             return Err(invalid("Backup spool body identity differs"));
         }
         let role = match role {
+            crate::persistent_store::external_capture::BackupBodyRole::Control if bytes.len()>risunest_sync_wire::MAX_METADATA_BYTES => {
+                crate::persistent_store::external_capture::verified_large_message_page(bytes)?;3
+            },
             crate::persistent_store::external_capture::BackupBodyRole::Control => 1,
             crate::persistent_store::external_capture::BackupBodyRole::Payload => 2,
         };
+        if role!=3 && bytes.len()>risunest_sync_wire::MAX_METADATA_BYTES {return Err(invalid("Backup spool body exceeds its bound"));}
         self.db.execute("INSERT OR IGNORE INTO bodies VALUES(?1,?2,?3)",params![hash,bytes,role])?;
         let actual: i64 = self.db.query_row("SELECT role FROM bodies WHERE hash=?1",[hash],|row| row.get(0))?;
         if actual != role {return Err(invalid("Backup spool body role differs"))}
@@ -137,11 +141,12 @@ impl BackupDependencySpool {
         if !self.sealed {return Err(invalid("Backup dependency spool is not sealed"))}
         let metadata:Option<(i64,i64)>=self.db.query_row("SELECT length(body),role FROM bodies WHERE hash=?1",[hash],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
         let Some((length,role))=metadata else {return Ok(None)};
-        if role!=expected_role {return Ok(None)}
-        if length<0 || length as u64>risunest_sync_wire::MAX_METADATA_BYTES as u64 {return Err(invalid("Backup dependency spool body exceeds its bound"))}
+        if role!=expected_role && !(expected_role==1 && role==3) {return Ok(None)}
+        if length<0 || (role!=3 && length as u64>risunest_sync_wire::MAX_METADATA_BYTES as u64) {return Err(invalid("Backup dependency spool body exceeds its bound"))}
         let bytes:Vec<u8>=self.db.query_row("SELECT body FROM bodies WHERE hash=?1",[hash],|row|row.get(0))?;
         let domain=if expected_role==1 {"native_backup_spool_control_read"}else{"native_backup_spool_payload_read"};
         if bytes.len() as i64!=length || crate::persistent_store::external_capture::hash_backup_body(&bytes,domain)!=hash {return Err(invalid("Backup dependency spool integrity failed"))}
+        if role==3 {crate::persistent_store::external_capture::verified_large_message_page(&bytes)?;}
         Ok(Some(bytes))
     }
     pub(crate) fn visit(&self,visitor:&mut dyn FnMut(&str,&[u8],crate::persistent_store::external_capture::BackupBodyRole)->Result<()>) -> Result<()> {
@@ -151,16 +156,18 @@ impl BackupDependencySpool {
         while let Some(row) = rows.next()? {
             let hash:String = row.get(0)?;
             let length:i64 = row.get(1)?;
-            if length < 0 || length as u64 > risunest_sync_wire::MAX_METADATA_BYTES as u64 {
+            let stored_role=row.get::<_,i64>(3)?;
+            if length < 0 || (stored_role!=3 && length as u64 > risunest_sync_wire::MAX_METADATA_BYTES as u64) {
                 return Err(invalid("Backup dependency spool body exceeds its bound"));
             }
             let bytes:Vec<u8> = row.get(2)?;
-            let role = match row.get::<_,i64>(3)? {
-                1 => crate::persistent_store::external_capture::BackupBodyRole::Control,
+            let role = match stored_role {
+                1|3 => crate::persistent_store::external_capture::BackupBodyRole::Control,
                 2 => crate::persistent_store::external_capture::BackupBodyRole::Payload,
                 _ => return Err(invalid("Backup dependency role is invalid")),
             };
-            if bytes.len() > risunest_sync_wire::MAX_METADATA_BYTES || crate::persistent_store::external_capture::hash_backup_body(&bytes,"native_backup_spool_read") != hash {return Err(invalid("Backup dependency spool integrity failed"))}
+            if bytes.len() as i64!=length || crate::persistent_store::external_capture::hash_backup_body(&bytes,"native_backup_spool_read") != hash {return Err(invalid("Backup dependency spool integrity failed"))}
+            if stored_role==3 {crate::persistent_store::external_capture::verified_large_message_page(&bytes)?;}
             visitor(&hash,&bytes,role)?;
         }
         Ok(())

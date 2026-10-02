@@ -319,6 +319,7 @@ impl PersistentStore {
             changes,
             Some(new_authority),
             Some(selection_change),
+            None,
         )?;
         let tx = self.device_store_mut()?.transaction()?;
         verify(&tx, header.binding_authority)?;

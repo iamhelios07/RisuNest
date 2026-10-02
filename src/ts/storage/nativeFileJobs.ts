@@ -412,6 +412,7 @@ export interface NativePortableBodyRetryRequest {
 }
 
 export interface NativeFileJobStatus {
+    exportCaptureRevision?: number
     portableBodyRetry?: {stagingId: string; catalogSha256: string; pending: boolean; available: boolean; sourceRequired: boolean}
     jobId: string
     kind:
@@ -1513,6 +1514,7 @@ async function runNativeReplacementRestore(
                         const {acquireUpstreamImportPause, confirmUpstreamLibraryReplacement} = await import('./upstreamReplacement')
                         const {language} = await import('../../lang')
                         const warnings: string[] = []
+                        if (kind === 'restore-official-account-snapshot') warnings.push(language.risuNest.backup.officialRestoreInlayWarning)
                         const preview = status.incompleteRestorePreview
                         if (preview?.unavailableColdKeys.length) warnings.push(language.errors.coldStorageIncompleteRestoreConfirm(preview.characterNames.join(', '), preview.unavailableColdKeys.length, 0))
                         if (preview?.invalidInlays.length) warnings.push(language.portableBackup.invalidInlaysConfirm(preview.invalidInlays.length))
@@ -1909,11 +1911,41 @@ export function runNativeLegacyLocalBackupRestore(
     )
 }
 
-export async function runNativeBlockRisuSaveExport(
-    runtime: {
-        readonly revision: number
-        flushPendingData(reason: string): Promise<void>
-    },
+async function withPausedNativeExport<T>(
+    runtime: Pick<PersistentDataRuntime, 'withPausedPersistentWrites'>,
+    reason: string,
+    options: NativeFileJobOptions,
+    operation: (revision: number, options: NativeFileJobOptions) => Promise<T>,
+): Promise<T> {
+    const {result} = await runtime.withPausedPersistentWrites(reason, async token => {
+        let ready!: () => void
+        const captured = new Promise<void>(resolve => {ready = resolve})
+        const result = operation(token.revision, {...options, onStatus(status) {
+            if (status.exportCaptureRevision !== undefined) {
+                if (status.exportCaptureRevision !== token.revision) throw new NativeFileJobError('export-capture-mismatch', 'Native export captured another revision')
+                ready()
+            }
+            options.onStatus?.(status)
+        }})
+        await Promise.race([captured, result.then(() => {throw new NativeFileJobError('export-capture-missing', 'Native export capture receipt is absent')})])
+        return {result}
+    })
+    return result
+}
+
+export function runNativeBlockRisuSaveExport(
+    runtime: Pick<PersistentDataRuntime, 'withPausedPersistentWrites'>,
+    destination: string,
+    options: NativeFileExportJobOptions = {},
+    dependencies: NativeFileJobDependencies = productionDependencies,
+): Promise<NativeFileJobResult> {
+    if (!dependencies.isTauri()) throw new Error('Native block RisuSave export requires Tauri')
+    return withPausedNativeExport(runtime, 'native-block-risu-save-export', options,
+        (revision, observed) => runNativeBlockRisuSaveExportAtRevision(revision, destination, {...options, ...observed}, dependencies))
+}
+
+async function runNativeBlockRisuSaveExportAtRevision(
+    expectedRevision: number,
     destination: string,
     options: NativeFileExportJobOptions = {},
     dependencies: NativeFileJobDependencies = productionDependencies,
@@ -1923,9 +1955,6 @@ export async function runNativeBlockRisuSaveExport(
     }
     if (options.signal?.aborted) throw abortError()
 
-    await runtime.flushPendingData('native-block-risu-save-export')
-    if (options.signal?.aborted) throw abortError()
-    const expectedRevision = runtime.revision
     const started = (await invokeNative(dependencies, 'native_file_job_start', {
         request: {
             kind: 'export-block-risu-save',
@@ -2336,17 +2365,28 @@ function runNativePortableBackupExport(
 }
 
 
-export async function runNativeArchiveExport(
-    runtime: NativeBlockRestoreRuntime & {
-        readonly revision: number
-        flushPendingData(reason: string): Promise<void>
-    },
+export function runNativeArchiveExport(
+    runtime: NativeBlockRestoreRuntime & {readonly revision: number; flushPendingData(reason: string): Promise<void>},
     destination: NativeBackupDestination,
     selection: NativePortableSelection,
     options: NativeFileJobOptions & { confirmSourcePreservation?(): Promise<boolean> } = {},
     dependencies: NativeBackupExportDependencies = productionBackupExportDependencies,
 ): Promise<NativeFileJobResult> {
-    let expectedRevision = runtime.revision
+    return withPausedNativeExport(runtime, 'native-portable-export', options,
+        (revision, observed) => runNativeArchiveExportAtRevision(runtime, revision, destination, selection, {...options, ...observed}, dependencies))
+}
+
+async function runNativeArchiveExportAtRevision(
+    runtime: NativeBlockRestoreRuntime & {
+        readonly revision: number
+        flushPendingData(reason: string): Promise<void>
+    },
+    expectedRevision: number,
+    destination: NativeBackupDestination,
+    selection: NativePortableSelection,
+    options: NativeFileJobOptions & { confirmSourcePreservation?(): Promise<boolean> } = {},
+    dependencies: NativeBackupExportDependencies = productionBackupExportDependencies,
+): Promise<NativeFileJobResult> {
     let intent:
         | import('./deviceBackup/job').PortableExportIntentStore
         | undefined
@@ -2371,10 +2411,8 @@ export async function runNativeArchiveExport(
                                 'Finish the previous backup save before starting another',
                             )
                     }
-                    await runtime.flushPendingData('native-portable-export')
                     const {flushDeviceStateBeforeRestore}=await import('./deviceStateRestore')
                     await flushDeviceStateBeforeRestore()
-                    expectedRevision = runtime.revision
                     return {
                         kind: 'export-portable-backup',
                         expectedRevision,
