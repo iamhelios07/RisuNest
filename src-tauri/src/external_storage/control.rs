@@ -769,6 +769,7 @@ pub(crate) async fn upload_backup_bundle(
     captured_at_ms: u64,
     library: wire::LibrarySnapshotRef,
     sections: std::collections::BTreeMap<String, wire::SectionSnapshotRef>,
+    original_units: Option<wire::StoredObject>,
     journal: &mut TransferJournal,
     provider: &dyn Provider,
     repository: &RepositoryHandle,
@@ -784,6 +785,7 @@ pub(crate) async fn upload_backup_bundle(
         None,
         library,
         sections,
+        original_units,
     )
     .map_err(corrupt)?;
     let plaintext = document.encode(MAX_POINT_PLAINTEXT).map_err(corrupt)?;
@@ -834,6 +836,7 @@ pub(crate) async fn ensure_remote_conflict_bundle(
                 captured_at_ms,
                 view.library,
                 view.sections,
+                None,
                 journal,
                 connected.provider.as_ref(),
                 &connected.handle,
@@ -1566,6 +1569,7 @@ pub(crate) struct SnapshotView {
     /// a published state. These are different counters and are never mixed.
     pub revision: String,
     pub library: wire::LibrarySnapshotRef,
+    pub original_units: Option<wire::StoredObject>,
     pub sections: std::collections::BTreeMap<String, wire::SectionSnapshotRef>,
     pub is_state: bool,
     /// The device whose own values these sections are, when there is one. A
@@ -1590,6 +1594,7 @@ impl SnapshotView {
                     sections: document.sections,
                     is_state: true,
                     captured_by_device: None,
+                    original_units: None,
                 }
             }
             wire::ObjectRole::BackupBundle => {
@@ -1613,6 +1618,7 @@ impl SnapshotView {
                         wire_control::BundleSource::SyncState { .. } => None,
                     },
                     library: document.library,
+                    original_units: document.original_units,
                     sections: document.sections,
                     is_state: false,
                 }
@@ -1924,6 +1930,7 @@ mod tests {
                 content_fingerprint: [3; 32],
             },
             BTreeMap::new(),
+            Some(catalog(&connected.handle, "original-units")),
         )
         .unwrap()
         .encode(MAX_POINT_PLAINTEXT)

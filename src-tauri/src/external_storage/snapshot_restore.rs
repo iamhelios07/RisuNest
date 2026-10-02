@@ -18,6 +18,7 @@ use risunest_external_storage_format::{
     content_identity::hash_reader, crypto::derive_key, pack, snapshot as wire,
 };
 use sha2::{Digest, Sha256};
+use rusqlite::OptionalExtension;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
@@ -1593,6 +1594,93 @@ pub(crate) async fn download_packed_body_file(
     match &body.source { ObjectSource::File(path)=>Ok(path.clone()), _=>Err(corrupt("body source")) }
 }
 
+pub(crate) async fn download_original_backup_units(
+    root: &RemoteObject,
+    staging_root: &Path,
+    key: &[u8; 32],
+    provider: &dyn Provider,
+    repository: &RepositoryHandle,
+    cancel: &Cancellation,
+) -> Result<BTreeMap<risunest_sync_wire::unit::UnitKey, risunest_sync_wire::unit::UnitValue>> {
+    let (records, objects) = download_checkpoint_data(
+        root, staging_root, key, provider, repository, cancel,
+    ).await?;
+    if !objects.is_empty() { return Err(corrupt("original unit catalog contains non-unit controls")); }
+    let content = content_store(staging_root)?;
+    let mut units = BTreeMap::new();
+    for record in records {
+        cancel.check()?;
+        let bytes = content.read_all(&record.content_hash).map_err(transient)?;
+        if bytes.len() as u64 != record.byte_length {
+            return Err(corrupt("original unit control length"));
+        }
+        let unit: super::packaging::OriginalBackupUnit = risunest_sync_wire::canonical::decode(
+            &bytes, risunest_sync_wire::MAX_METADATA_BYTES,
+        ).map_err(corrupt)?;
+        if unit.schema != "risunest.backup-unit/v1"
+            || record.key != format!("original-unit/{}", hex::encode(unit.key.as_str()))
+        {
+            return Err(corrupt("original unit catalog key differs from its control"));
+        }
+        unit.value.validate().map_err(corrupt)?;
+        if units.insert(unit.key, unit.value).is_some() {
+            return Err(corrupt("duplicate original unit"));
+        }
+    }
+    Ok(units)
+}
+
+pub(crate) struct DatabaseFirstSnapshot {
+    pub snapshot:PreparedRemoteSnapshot,
+    pub original_units:BTreeMap<risunest_sync_wire::unit::UnitKey,risunest_sync_wire::unit::UnitValue>,
+    pub required:BTreeSet<String>,
+    pub present:BTreeSet<String>,
+    pub missing:BTreeSet<String>,
+}
+pub(crate) async fn download_snapshot_database_first(snapshot:&RemoteObject,staging_root:&Path,library_root:&Path,connection_root:&Path,connection_id:&str,key:&[u8;32],provider:&dyn Provider,repository:&RepositoryHandle,cancel:&Cancellation)->Result<DatabaseFirstSnapshot> {
+    if snapshot.role!=ObjectRole::BackupBundle {return Err(corrupt("full backup required"));}
+    ensure_directory(staging_root)?;
+    let root_path=open_object(snapshot,key,staging_root,provider,repository,cancel).await?;
+    let document=super::control::SnapshotView::read(&read_bytes(&root_path,wire::MAX_METADATA_BYTES)?,wire::ObjectRole::BackupBundle,&snapshot.repository_id)?;
+    if snapshot.object_id!=format!("snapshot-{}",document.snapshot_id) {return Err(corrupt("backup identity"));}
+    let original_root = document.original_units.as_ref()
+        .ok_or_else(|| corrupt("full backup original unit root is required"))?;
+    let original_root = RemoteObject::from_stored(original_root, repository)?;
+    let original_units = download_original_backup_units(
+        &original_root, staging_root, key, provider, repository, cancel,
+    ).await?;
+    let records_root=RemoteObject::from_stored(&document.library.record_catalog,repository)?;
+    let (records,mut objects)=download_checkpoint_data(&records_root,staging_root,key,provider,repository,cancel).await?;
+    let assets_root=RemoteObject::from_stored(&document.library.asset_catalog,repository)?;
+    let (entries,packs,_)=read_catalog(&assets_root,wire::CatalogKind::Assets,key,staging_root,provider,repository,cancel).await?;
+    let cas=PayloadCas::new(library_root).map_err(transient)?;
+    let metadata = rusqlite::Connection::open_with_flags(
+        library_root.join("persistent/persistent.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ).map_err(transient)?;
+    let mut required=BTreeSet::new();let mut present=BTreeSet::new();let mut missing=BTreeSet::new();
+    for entry in entries {
+        if entry.kind!=wire::CatalogEntryKind::Object {return Err(corrupt("asset catalog kind"));}
+        let hash=hex::encode(entry.content_sha256);required.insert(hash.clone());
+        let catalogued: Option<i64> = metadata.query_row(
+            "SELECT byte_size FROM asset_objects WHERE object_hash=?1", [&hash], |row| row.get(0),
+        ).optional().map_err(transient)?;
+        let catalogued = catalogued.map(u64::try_from).transpose().map_err(corrupt)?;
+        if catalogued.is_some_and(|size| size != entry.byte_length) {
+            return Err(corrupt("local immutable body size differs from backup"));
+        }
+        if catalogued == Some(entry.byte_length)
+            && cas.stat_object(&hash).map_err(transient)?==Some(entry.byte_length) {present.insert(hash.clone());}
+        else {
+            missing.insert(hash.clone());
+            let ids=entry.chunks.iter().map(|chunk|chunk.pack_id.as_str()).collect::<BTreeSet<_>>();
+            let references=packs.iter().filter(|(id,_)|ids.contains(id.as_str())).map(|(_,pack)|pack.stored(repository)).collect::<Result<Vec<_>>>()?;
+            super::lww_residency::register_packed(library_root,&super::lww_residency::PackedSource {hash:hash.clone(),byte_length:entry.byte_length,library_id:snapshot.repository_id.clone(),connection_id:connection_id.into(),connection_root:connection_root.into(),protected_snapshot:snapshot.object_id.clone(),catalog:document.library.asset_catalog.clone(),chunks:entry.chunks,packs:references},repository)?;
+        }
+        objects.push(PreparedObject{content_hash:hash.clone(),byte_length:entry.byte_length,source:ObjectSource::Library(hash)});
+    }
+    Ok(DatabaseFirstSnapshot{snapshot:PreparedRemoteSnapshot{snapshot_id:document.snapshot_id,repository_id:snapshot.repository_id.clone(),fingerprint:hex::encode(document.library.content_fingerprint),library_fingerprint:hex::encode(document.library.content_fingerprint),logical_revision:document.revision.parse().map_err(corrupt)?,staging_root:staging_root.into(),records,objects,captured_by_device:document.captured_by_device},original_units,required,present,missing})
+}
 pub(crate) async fn download_snapshot(
     snapshot: &RemoteObject,
     staging_root: &Path,

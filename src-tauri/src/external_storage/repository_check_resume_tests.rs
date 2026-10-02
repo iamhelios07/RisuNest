@@ -197,6 +197,7 @@ impl World {
             NOW,
             view.library,
             view.sections,
+            None,
             &mut journal,
             self.provider.as_ref(),
             &connected.handle,

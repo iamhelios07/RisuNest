@@ -179,10 +179,22 @@ impl PreparedContentCapture {
         scope_id: &[u8; 32],
         codec: &str,
     ) -> StoreResult<String> {
+        self.register_with_device_capture_id(store,catalog,scope_id,codec,"")
+    }
+
+    pub(crate) fn register_with_device_capture_id(
+        self,
+        store: &mut PersistentStore,
+        catalog: &crate::external_storage::capture::CaptureCatalog,
+        scope_id: &[u8; 32],
+        codec: &str,
+        device_capture_id: &str,
+    ) -> StoreResult<String> {
         let (file_hash, path, identity) = catalog.manifest()?;
         if identity != &self.identity
             || store.repository_root != self.repository_root
             || codec.is_empty()
+            || (!device_capture_id.is_empty() && device_capture_id != hex::encode(file_hash))
         {
             return Err(missing_source("matching capture identity"));
         }
@@ -202,7 +214,7 @@ impl PreparedContentCapture {
             &self.identity,
             &hex::encode(scope_id),
             codec,
-            "",
+            device_capture_id,
             &hex::encode(fingerprint),
             &self.consumer,
         )?;

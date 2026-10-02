@@ -440,6 +440,7 @@ pub(crate) enum SnapshotPurpose {
     BackupBundle {
         source: wire_control::BundleSource,
         remote_generation: Option<Sequence>,
+        original_units: BTreeMap<risunest_sync_wire::unit::UnitKey, risunest_sync_wire::unit::UnitValue>,
     },
 }
 
@@ -1180,6 +1181,48 @@ impl StoredSize<'_> {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct OriginalBackupUnit {
+    pub schema: String,
+    pub key: risunest_sync_wire::unit::UnitKey,
+    pub value: risunest_sync_wire::unit::UnitValue,
+}
+
+fn original_unit_sources(
+    units: &BTreeMap<risunest_sync_wire::unit::UnitKey, risunest_sync_wire::unit::UnitValue>,
+    directory: &Path,
+) -> Result<Vec<SourceEntry>> {
+    let mut spool = tempfile::NamedTempFile::new_in(directory).map_err(transient)?;
+    let mut offset = 0u64;
+    let mut sources = Vec::with_capacity(units.len());
+    for (key, value) in units {
+        value.validate().map_err(corrupt)?;
+        let record = OriginalBackupUnit {
+            schema: "risunest.backup-unit/v1".into(), key: key.clone(), value: value.clone(),
+        };
+        let bytes = risunest_sync_wire::canonical::encode(&record).map_err(corrupt)?;
+        if bytes.len() > risunest_sync_wire::MAX_METADATA_BYTES {
+            return Err(ProviderError::new(ErrorKind::FileTooLarge));
+        }
+        spool.write_all(&bytes).map_err(transient)?;
+        sources.push(SourceEntry {
+            kind: wire::CatalogEntryKind::Record,
+            key: format!("original-unit/{}", hex::encode(key.as_str())),
+            content_sha256: hex::encode(hash(&bytes)),
+            byte_length: bytes.len() as u64,
+            source: ObjectSource::File(spool.path().into()),
+            file_offset: Some(offset),
+            compression: CompressionPolicy::Text,
+        });
+        offset = offset.checked_add(bytes.len() as u64).ok_or_else(|| corrupt("original unit spool size"))?;
+    }
+    spool.as_file_mut().sync_all().map_err(transient)?;
+    let (_file, path) = spool.keep().map_err(transient)?;
+    for source in &mut sources { source.source = ObjectSource::File(path.clone()); }
+    Ok(sources)
+}
+
 fn capture_sources(capture: &CapturedSnapshot) -> Result<(Vec<SourceEntry>, Vec<SourceEntry>)> {
     let mut records = Vec::new();
     let mut query = capture
@@ -1208,7 +1251,7 @@ fn capture_sources(capture: &CapturedSnapshot) -> Result<(Vec<SourceEntry>, Vec<
     let mut generated = capture
         .catalog
         .db
-        .prepare("SELECT hash,bytes FROM generated ORDER BY hash")
+        .prepare("SELECT g.hash,g.bytes FROM generated g LEFT JOIN original_payloads p ON p.hash=g.hash WHERE p.hash IS NULL ORDER BY g.hash")
         .map_err(corrupt)?;
     for row in generated
         .query_map([], |row| {
@@ -1232,14 +1275,14 @@ fn capture_sources(capture: &CapturedSnapshot) -> Result<(Vec<SourceEntry>, Vec<
     }
     records.sort_by(|a, b| a.key.cmp(&b.key));
     let mut assets = Vec::new();
-    let mut query = capture.catalog.db.prepare("SELECT DISTINCT d.hash,d.bytes FROM dependencies d LEFT JOIN generated g ON g.hash=d.hash WHERE g.hash IS NULL ORDER BY d.hash").map_err(corrupt)?;
+    let mut query = capture.catalog.db.prepare("SELECT DISTINCT d.hash,d.bytes,g.hash IS NOT NULL FROM dependencies d LEFT JOIN generated g ON g.hash=d.hash LEFT JOIN original_payloads p ON p.hash=d.hash WHERE g.hash IS NULL OR p.hash IS NOT NULL ORDER BY d.hash").map_err(corrupt)?;
     for row in query
         .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_,bool>(2)?))
         })
         .map_err(corrupt)?
     {
-        let (digest, bytes) = row.map_err(corrupt)?;
+        let (digest, bytes, captured) = row.map_err(corrupt)?;
         if !crate::trust_boundary::is_lower_hex_256(&digest) {
             return Err(corrupt("capture dependency hash is invalid"));
         }
@@ -1248,7 +1291,7 @@ fn capture_sources(capture: &CapturedSnapshot) -> Result<(Vec<SourceEntry>, Vec<
             key: format!("object/{digest}"),
             content_sha256: digest.clone(),
             byte_length: u64::try_from(bytes).map_err(corrupt)?,
-            source: ObjectSource::Library(digest),
+            source: if captured { ObjectSource::Captured(digest) } else { ObjectSource::Library(digest) },
             file_offset: None,
             compression: CompressionPolicy::AlreadyCompressed,
         });
@@ -1353,7 +1396,11 @@ async fn build_entries(
     );
     let size = StoredSize { limits, repository_id: format_repository_id };
     let max_pack = size.pack_capacity(&format!("pack-{}", "0".repeat(64)))?;
-    let target = limits.target_plaintext_bytes.min(max_pack).max(1);
+    let preferred = match kind {
+        wire::CatalogKind::Assets => 64 * 1024 * 1024,
+        wire::CatalogKind::Records | wire::CatalogKind::Section => 32 * 1024 * 1024,
+    };
+    let target = limits.target_plaintext_bytes.min(preferred).min(max_pack).max(1);
     let chunk_bytes = usize::try_from(
         max_pack
             .saturating_sub(ENTRY_OVERHEAD + 1)
@@ -1990,6 +2037,15 @@ struct TransientLibrarySource {
     body: crate::server_sync::residency::TransientBody,
     _scratch: tempfile::TempDir,
 }
+struct TransientExternalSource {
+    body: tempfile::NamedTempFile,
+    _scratch: tempfile::TempDir,
+}
+impl Read for TransientExternalSource {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.body.as_file_mut().read(buffer)
+    }
+}
 impl Read for TransientLibrarySource {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         self.body.read(buffer)
@@ -2024,7 +2080,14 @@ fn open_library_source(
         None
     };
     let Some(size) = custody_size else {
-        return Err(ProviderError::new(ErrorKind::NotFound));
+        let scratch = super::leftovers::managed_scratch(repository_root, "asset-transient-")?;
+        let body = tauri::async_runtime::block_on(super::lww_residency::spool_verified_remote_body(
+            repository_root,digest,scratch.path(),cancel,
+        ))?.ok_or_else(|| ProviderError::new(ErrorKind::NotFound))?;
+        let length = body.as_file().metadata().map_err(transient)?.len();
+        hydration.objects += 1;
+        hydration.bytes += length;
+        return Ok((Box::new(TransientExternalSource {body,_scratch:scratch}),length));
     };
     if fs2::available_space(repository_root).map_err(transient)? < size {
         return Err(ProviderError::new(ErrorKind::LocalStorageFull));
@@ -3583,6 +3646,21 @@ pub(crate) async fn package_and_upload_protected(
         };
         referenced.extend(objects);
     }
+    let original_units_root = if let SnapshotPurpose::BackupBundle { original_units, .. } = &metadata.purpose {
+        let sources = original_unit_sources(original_units, &build_root)?;
+        let fingerprint = catalog_fingerprint(wire::CatalogKind::Records, &sources);
+        let (entries, objects) = build_entries(
+            wire::CatalogKind::Records, sources, &external_root, &metadata.repository_id,
+            &build_root, root_key, limits, None, None, false, &mut cache, &mut evidence,
+            journal, provider, repository, prepared, &mut maintenance, &mut hydration, cancel,
+        ).await?;
+        referenced.extend(objects);
+        Some(build_catalog(
+            wire::CatalogKind::Records, entries, &fingerprint, &metadata.repository_id,
+            &build_root, root_key, limits, None, None, false, &mut cache, &mut evidence,
+            journal, provider, repository, cancel, &mut referenced,
+        ).await?.stored(repository)?)
+    } else { None };
     let (bytes, fingerprint, sections, role) = match metadata.purpose {
         SnapshotPurpose::LwwCheckpoint { covered_prefixes, state_identity, asset_catalogs, standalone_bodies } => {
             if !published_sections.is_empty() { return Err(corrupt("checkpoint device sections")); }
@@ -3627,6 +3705,7 @@ pub(crate) async fn package_and_upload_protected(
         SnapshotPurpose::BackupBundle {
             source,
             remote_generation,
+            original_units: _,
         } => {
             let document = wire_control::BackupBundleDocument::new(
                 metadata.repository_id.clone(),
@@ -3638,6 +3717,7 @@ pub(crate) async fn package_and_upload_protected(
                 remote_generation,
                 library,
                 published_sections,
+                original_units_root,
             )
             .map_err(corrupt)?;
             let max_bundle = wire::MAX_METADATA_BYTES;
@@ -4801,6 +4881,10 @@ mod tests {
                             writer_id: writer.into(),
                         },
                         remote_generation: None,
+                        original_units: BTreeMap::from([(
+                            risunest_sync_wire::unit::UnitKey::new(&["future-backup", "synthetic"]).unwrap(),
+                            risunest_sync_wire::unit::UnitValue::inline(&serde_json::to_vec(marker).unwrap()).unwrap(),
+                        )]),
                     };
                     let mut transfer = journal(&root.join(id), id, &capture);
                     package_and_upload(
@@ -4849,6 +4933,17 @@ mod tests {
                 .await
                 .unwrap();
                 assert_eq!(document.captured_by_device.as_deref(), Some(writer));
+                let stage = root.path().join(format!("original-{marker}"));
+                fs::create_dir_all(&stage).unwrap();
+                let path = snapshot_restore::open_object(&completed.reference,&key,&stage,&provider,&repository,&Cancellation::default()).await.unwrap();
+                let view = crate::external_storage::control::SnapshotView::read(
+                    &snapshot_restore::read_bytes(&path,wire::MAX_METADATA_BYTES).unwrap(),
+                    wire::ObjectRole::BackupBundle,&completed.reference.repository_id,
+                ).unwrap();
+                let original = RemoteObject::from_stored(view.original_units.as_ref().unwrap(),&repository).unwrap();
+                let units = snapshot_restore::download_original_backup_units(&original,&stage,&key,&provider,&repository,&Cancellation::default()).await.unwrap();
+                assert_eq!(units.len(),1);
+                assert_eq!(units.values().next().unwrap(), &risunest_sync_wire::unit::UnitValue::inline(&serde_json::to_vec(marker).unwrap()).unwrap());
                 let received = snapshot_restore::download_sections(
                     &completed.reference,
                     &BTreeSet::from(["local-plugins".to_owned()]),

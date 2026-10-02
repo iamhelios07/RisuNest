@@ -80,6 +80,13 @@ pub(crate) struct CaptureCatalog {
     identity: Option<CaptureIdentity>,
     pub(crate) rebuilt: bool,
     finalized: bool,
+    backup_inputs: Option<BackupCaptureInputs>,
+}
+
+struct BackupCaptureInputs {
+    units: std::collections::BTreeMap<risunest_sync_wire::unit::UnitKey, risunest_sync_wire::unit::UnitValue>,
+    closure: crate::persistent_store::external_capture::BackupDependencyClosure,
+    sections: Vec<super::sections::CapturedSection>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,6 +140,7 @@ impl CaptureCatalog {
             identity: Some(identity),
             rebuilt: false,
             finalized: true,
+            backup_inputs: None,
         })
     }
 
@@ -198,7 +206,11 @@ impl CaptureCatalog {
                 CREATE TABLE records(key TEXT PRIMARY KEY,hash TEXT NOT NULL,bytes INTEGER NOT NULL);
                 CREATE TABLE generated(hash TEXT PRIMARY KEY,bytes INTEGER NOT NULL);
                 CREATE TABLE dependencies(record TEXT NOT NULL,hash TEXT NOT NULL,bytes INTEGER NOT NULL,PRIMARY KEY(record,hash));
-                CREATE TABLE delta(key TEXT PRIMARY KEY);")?;
+                CREATE TABLE delta(key TEXT PRIMARY KEY);
+                CREATE TABLE original_units(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+                CREATE TABLE original_payloads(hash TEXT PRIMARY KEY,bytes INTEGER NOT NULL,record INTEGER NOT NULL);
+                CREATE TABLE backup_scope(singleton INTEGER PRIMARY KEY CHECK(singleton=1),unit_count INTEGER NOT NULL);
+                CREATE TABLE backup_sections(kind TEXT PRIMARY KEY,body TEXT NOT NULL);")?;
         }
         destination_guard.keep();
         Ok(Self {
@@ -208,7 +220,52 @@ impl CaptureCatalog {
             identity: None,
             rebuilt: false,
             finalized: false,
+            backup_inputs: None,
         })
+    }
+
+    pub(crate) fn install_backup_inputs(
+        &mut self,
+        units: std::collections::BTreeMap<risunest_sync_wire::unit::UnitKey, risunest_sync_wire::unit::UnitValue>,
+        closure: crate::persistent_store::external_capture::BackupDependencyClosure,
+        sections: Vec<super::sections::CapturedSection>,
+    ) -> Result<()> {
+        if self.identity.is_some() || self.finalized || self.backup_inputs.is_some() {
+            return Err(invalid("Backup inputs must precede capture projection"));
+        }
+        self.backup_inputs = Some(BackupCaptureInputs { units, closure, sections });
+        Ok(())
+    }
+
+    pub(crate) fn backup_sections(&self) -> Result<Vec<super::sections::CapturedSection>> {
+        if !self.finalized { return Err(invalid("Backup capture is not durable")); }
+        self.original_backup_units()?;
+        let mut sections = Vec::new();
+        let mut statement = self.db.prepare("SELECT kind,body FROM backup_sections ORDER BY kind")?;
+        for row in statement.query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))? {
+            let (kind, body) = row?;
+            let section: super::sections::CapturedSection = serde_json::from_str(&body)?;
+            if section.kind.id() != kind { return Err(invalid("Backup section identity differs")); }
+            sections.push(section);
+        }
+        if sections.len() != 3 { return Err(invalid("Complete backup sections are unavailable")); }
+        Ok(sections)
+    }
+
+    pub(crate) fn original_backup_units(&self) -> Result<std::collections::BTreeMap<risunest_sync_wire::unit::UnitKey, risunest_sync_wire::unit::UnitValue>> {
+        if !self.finalized { return Err(invalid("Backup capture is not durable")); }
+        let expected: i64 = self.db.query_row("SELECT unit_count FROM backup_scope WHERE singleton=1", [], |row| row.get(0))?;
+        let mut units = std::collections::BTreeMap::new();
+        let mut statement = self.db.prepare("SELECT key,value FROM original_units ORDER BY key")?;
+        for row in statement.query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))? {
+            let (key,value) = row?;
+            let key = risunest_sync_wire::unit::UnitKey::try_from(key).map_err(|_| invalid("Invalid original backup key"))?;
+            let value: risunest_sync_wire::unit::UnitValue = serde_json::from_str(&value)?;
+            value.validate().map_err(|_| invalid("Invalid original backup value"))?;
+            if units.insert(key,value).is_some() { return Err(invalid("Repeated original backup key")); }
+        }
+        if i64::try_from(units.len()).ok() != Some(expected) { return Err(invalid("Original backup unit count differs")); }
+        Ok(units)
     }
 
     pub(crate) fn manifest(&self) -> Result<([u8; 32], &Path, &CaptureIdentity)> {
@@ -323,7 +380,8 @@ impl ContentCaptureSink for CaptureCatalog {
         self.rebuilt = after.is_none();
         if self.rebuilt {
             self.db.execute_batch(
-                "DELETE FROM records; DELETE FROM generated; DELETE FROM dependencies;",
+                "DELETE FROM records; DELETE FROM generated; DELETE FROM dependencies;
+                 DELETE FROM original_units; DELETE FROM original_payloads; DELETE FROM backup_scope; DELETE FROM backup_sections;",
             )?;
         }
         self.identity = Some(identity.clone());
@@ -376,6 +434,28 @@ impl ContentCaptureSink for CaptureCatalog {
     }
     fn finish(&mut self) -> Result<()> {
         self.require_writing()?;
+        if let Some(inputs) = self.backup_inputs.take() {
+            for section in inputs.sections {
+                self.db.execute("INSERT INTO backup_sections VALUES(?1,?2)", params![section.kind.id(),serde_json::to_string(&section)?])?;
+            }
+            self.db.execute("INSERT INTO backup_scope VALUES(1,?1)", [i64::try_from(inputs.units.len()).map_err(|_| invalid("Original backup count overflow"))?])?;
+            for (key,value) in inputs.units {
+                self.db.execute("INSERT INTO original_units VALUES(?1,?2)", params![key.as_str(),serde_json::to_string(&value)?])?;
+            }
+            for (hash,body) in inputs.closure.controls {
+                self.object(&hash,&body)?;
+                self.reference("backup-original-units",&hash,body.len() as u64)?;
+            }
+            for (hash,body) in inputs.closure.payload_bodies {
+                self.object(&hash,&body)?;
+                self.reference("backup-original-units",&hash,body.len() as u64)?;
+                self.db.execute("INSERT INTO original_payloads VALUES(?1,?2,?3)", params![hash,body.len() as i64,inputs.closure.record_payloads.contains(&hash)])?;
+            }
+            for (hash,size) in inputs.closure.managed_payloads {
+                self.reference("backup-original-units",&hash,size)?;
+                self.db.execute("INSERT INTO original_payloads VALUES(?1,?2,?3)", params![hash,i64::try_from(size).map_err(|_| invalid("Original payload size overflow"))?,inputs.closure.record_payloads.contains(&hash)])?;
+            }
+        }
         let identity = self
             .identity
             .as_ref()

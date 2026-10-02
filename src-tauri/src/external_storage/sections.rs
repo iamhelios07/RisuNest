@@ -35,7 +35,7 @@ fn transient(error: impl std::fmt::Display + 'static) -> ProviderError {
 
 /// One file the packager will carry. Section bytes live in the job spool
 /// because a section changes without the library revision changing.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SectionSource {
     pub kind: wire::CatalogEntryKind,
     pub key: String,
@@ -45,7 +45,7 @@ pub(crate) struct SectionSource {
     pub offset: Option<u64>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CapturedSection {
     pub kind: SectionKind,
     pub generation: Sequence,
@@ -310,6 +310,14 @@ pub(crate) fn capture_backup_sections(
     let device = store.device_store_mut().map_err(device_error)?;
     let kinds = [SectionKind::Hypa, SectionKind::LocalPlugins, SectionKind::LocalSettings];
     let prepared = device.capture_backup_sections(&kinds).map_err(device_error)?;
+    capture_prepared_backup_sections(&prepared, spool, cancel)
+}
+
+pub(crate) fn capture_prepared_backup_sections(
+    prepared: &[crate::persistent_store::device_store::sections::PreparedSectionRows],
+    spool: &Path,
+    cancel: &Cancellation,
+) -> Result<Vec<CapturedSection>> {
     prepared.iter().map(|section| capture_prepared_section(
             section,
             Sequence::from(0u64),
