@@ -3804,11 +3804,15 @@ pub(crate) async fn package_and_upload_protected(
                 metadata.created_at_ms,
                 library,
                 published_sections,
-            )
-            .map_err(corrupt)?;
+            );
+            #[cfg(test)] super::control::observe_state_result(&document,2);
+            let document=document.map_err(corrupt)?;
             let max_state = wire::MAX_METADATA_BYTES;
+            let encoded=document.encode(max_state);
+            #[cfg(test)]
+            super::control::observe_control_fingerprint(wire::ObjectRole::SyncState,&document.library_fingerprint,&document.sections,None,1);
             (
-                document.encode(max_state).map_err(corrupt)?,
+                encoded.map_err(corrupt)?,
                 document.state_fingerprint,
                 document.sections,
                 ObjectRole::SyncState,
@@ -3830,8 +3834,9 @@ pub(crate) async fn package_and_upload_protected(
                 library,
                 published_sections,
                 original_units_root,
-            )
-            .map_err(corrupt)?;
+            );
+            #[cfg(test)] super::control::observe_bundle_result(&document,2);
+            let document=document.map_err(corrupt)?;
             let max_bundle = wire::MAX_METADATA_BYTES;
             (
                 document.encode(max_bundle).map_err(corrupt)?,
@@ -5053,7 +5058,11 @@ mod tests {
                 let mut job=DurableJob::new(request,false,1,store.external_identity().unwrap());
                 job.summary["restoreSource"]=serde_json::to_value(completed.reference.stored(&connected.handle).unwrap()).unwrap();
                 let jobs=JobStore::open(destination.path()).unwrap();jobs.put(&job).unwrap();
+                crate::persistent_store::hash_work::reset_hash_work();
                 let (prepared,received_sections)=runtime_restore::prepare_database_first_backup(destination.path(),&connected,&job,&Cancellation::default()).await.unwrap();
+                let preparation_hashes=crate::persistent_store::hash_work::take_hash_work();
+                assert!(preparation_hashes.incomplete.is_empty());
+                assert!(preparation_hashes.domains["native_external_bundle_fingerprint"].bytes>0);
                 assert_eq!(prepared.present.contains(&hash),already_present);
                 jobs.freeze_restore_bodies(&job,&prepared.sources,&prepared.present).unwrap();
                 let pack_ids=prepared.sources.iter().flat_map(|source|source.chunks.iter().map(|chunk|chunk.pack_id.clone())).collect::<BTreeSet<_>>();
@@ -5064,9 +5073,9 @@ mod tests {
                         use crate::server_sync::lww_tests::{LocalServerFixture,put_asset,drain_publications};
                         let mixed=tempfile::tempdir().unwrap();let mut mixed_store=PersistentStore::open(mixed.path()).unwrap();
                         super::super::connection_store::ConnectionStore::open(mixed.path()).unwrap().insert(&connection.stored).unwrap();
-                        let _connection=super::super::lww_residency::install_test_source_connection(mixed.path(),connection).unwrap();
+                        let _connection=super::super::lww_residency::install_test_source_connection(mixed.path(),connection.clone()).unwrap();
                         let mut external_source=external_source;external_source.connection_root=mixed.path().to_owned();
-                        super::super::lww_residency::register_packed(mixed.path(),&external_source).unwrap();
+                        super::super::lww_residency::register_packed(mixed.path(),&external_source,&connection.handle).unwrap();
                         let server=LocalServerFixture::new();let core=server.client(&mixed_store);
                         let server_hash=put_asset(&mut mixed_store,"assets/background-server.bin",&vec![71;100_000]).object_hash.unwrap();
                         drain_publications(&core,&mut mixed_store,&[]).unwrap();
@@ -5092,14 +5101,26 @@ mod tests {
                 if already_present {for bytes in &asset_bytes {bootstrap_cas.prepare_bytes(bytes).unwrap();}}
                 for source in &prepared.sources {
                     let mut source=source.clone();source.connection_root=bootstrap.path().to_owned();
-                    super::super::lww_residency::register_packed(bootstrap.path(),&source).unwrap();
+                    super::super::lww_residency::register_packed(bootstrap.path(),&source,&connected.handle).unwrap();
                 }
                 crate::persistent_store::register_asset_objects_at_root(bootstrap.path(),&assets.iter().map(|asset|crate::persistent_store::asset_object_catalog::AssetObjectRegistration{object_hash:asset.content_hash.clone(),byte_size:asset.byte_size}).collect::<Vec<_>>(),1).unwrap();
                 let bootstrap_pack=prepared.sources[0].packs[0].locator.object.clone();
-                let bootstrap_reads=provider.read_attempts(&bootstrap_pack);
+                let refusal_provider=provider.clone();let refusal_pack=bootstrap_pack.clone();let refusal_hash=prepared.sources[0].hash.clone();
                 crate::asset_repository::body_io::reset_body_io();
                 for asset in &assets {crate::asset_repository::body_io::register_object_purpose(&asset.content_hash,crate::asset_repository::body_io::BodyPurpose::Asset);}
-                bootstrap_store.hydrate_registered_remote_assets_prioritized(None,None,||Ok(()),||{}).unwrap();
+                let bootstrap_reads=spawn_blocking(move || {
+                    if !already_present {
+                        let before=refusal_provider.read_attempts(&refusal_pack);
+                        let refused=bootstrap_store.hydrate_registered_remote_assets_prioritized(None,None,|| {
+                            if refusal_provider.read_attempts(&refusal_pack)>before {Err(crate::server_sync::SyncError::new("stale-binding-authority",409))} else {Ok(())}
+                        },||{}).unwrap_err();
+                        assert_eq!(refused.code,"stale-binding-authority");
+                        assert!(PayloadCas::new(bootstrap_store.repository_root()).unwrap().stat_object(&refusal_hash).unwrap().is_none());
+                    }
+                    let before=refusal_provider.read_attempts(&refusal_pack);
+                    bootstrap_store.hydrate_registered_remote_assets_prioritized(None,None,||Ok(()),||{}).unwrap();
+                    before
+                }).await.unwrap();
                 let bootstrap_bodies=crate::asset_repository::body_io::take_body_io();
                 assert!(bootstrap_bodies.complete());
                 if already_present {assert_eq!(bootstrap_bodies.asset_work(),Default::default());}
