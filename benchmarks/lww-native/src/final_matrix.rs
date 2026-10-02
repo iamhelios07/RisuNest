@@ -125,6 +125,73 @@ fn source(run:&str)->Result<source_process::SourceProcess,String> {
         &environment("LWW_SOURCE_FINGERPRINT")?,&environment("LWW_SOURCE_BINARY_SHA")?,run)
 }
 
+pub(super) fn renderer_setup()->Result<(),String> {
+    if environment("RISUNEST_LWW_FINAL_STAGE")?!="authorized-synthetic" {return Err("renderer setup gate is closed".into());}
+    let checkpoint=environment("RISUNEST_LWW_FINAL_CHECKPOINT")?;
+    if checkpoint.len()!=40 || !checkpoint.bytes().all(|byte|byte.is_ascii_hexdigit()) {return Err("verified setup checkpoint is required".into());}
+    let output=PathBuf::from(environment("RISUNEST_LWW_OUTPUT_DIRECTORY")?);
+    let input=PathBuf::from(environment("RISUNEST_LWW_RENDERER_RECEIPT")?);
+    let tier=match environment("RISUNEST_LWW_FINAL_TIER")?.as_str() {
+        "target"=>scale_certificate::ScaleRequirement::Target,"above-target"=>scale_certificate::ScaleRequirement::AboveTarget,
+        _=>return Err("renderer setup tier is invalid".into()),
+    };
+    let receipt:Value=serde_json::from_reader(File::open(&input).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+    let configuration:fixture_configuration::NativeFixtureConfiguration=serde_json::from_value(receipt["target"]["configuration"].clone()).map_err(|e|e.to_string())?;
+    let endpoint=configuration.local_sse.as_ref().ok_or("renderer construction receipt requires an actual local SSE configuration")?.url()?;
+    let (mut store,certificate,_fork)=load(&input,tier,&output)?;
+    let (expected_root,expected_presets)=configuration.initial_values()?;
+    let actual_root=store.read_root(None).map_err(|e|e.to_string())?.value;
+    for (key,value) in expected_root.as_object().ok_or("synthetic root shape is invalid")? {
+        if actual_root.get(key)!=Some(value) {return Err(format!("actual renderer root configuration differs at {key}"));}
+    }
+    for expected in expected_presets {
+        let id=expected["id"].as_str().ok_or("synthetic preset identity missing")?;
+        let actual=store.read_preset(id,None).map_err(|e|e.to_string())?.ok_or("actual renderer preset absent")?.value;
+        for (key,value) in expected.as_object().ok_or("synthetic preset shape invalid")? {
+            if actual.get(key)!=Some(value) {return Err(format!("actual renderer preset configuration differs at {key}"));}
+        }
+    }
+    let shutdown_file=output.join("shutdown-request");
+    if shutdown_file.exists() {return Err("renderer setup shutdown sentinel already exists".into());}
+    let mut child=source(&format!("renderer-{}",uuid::Uuid::new_v4()))?;
+    let setup=(||->Result<(),String> {
+        let producer=native_bootstrap::source_client(&mut child,&store,"synthetic-renderer-producer",&"71".repeat(32),false)?;
+        let config=producer.client.config();
+        bind(&mut store,SyncTarget::Server(config.endpoint.clone()),&config.endpoint,&config.library_id);
+        server_sync::lww_tests::drain_publications(&producer,&mut store,&[]).map_err(|e|format!("{e:?}"))?;
+        if !store.lww_read_outbox(store.lww_binding_authority().map_err(|e|e.to_string())?,1).map_err(|e|e.to_string())?.entries.is_empty() {
+            return Err("renderer producer publication is not drained".into());
+        }
+        let registrations=[("producer-registration.uri",config.encode_uri().map_err(|_|"producer URI encoding failed")?),
+            ("windows-registration.uri",child.register("synthetic-renderer-windows",&"72".repeat(32))?.uri),
+            ("android-registration.uri",child.register("synthetic-renderer-android",&"73".repeat(32))?.uri)];
+        for (name,uri) in registrations {
+            use std::io::Write;
+            let mut file=std::fs::OpenOptions::new().create_new(true).write(true).open(output.join(name)).map_err(|e|e.to_string())?;
+            file.write_all(uri.as_bytes()).and_then(|_|file.sync_all()).map_err(|_|"private registration file write failed")?;
+        }
+        let executable=std::env::current_exe().map_err(|e|e.to_string())?;
+        write(&output,"renderer-source-ready.json",&json!({"phase":"excluded-renderer-source-setup","checkpoint":checkpoint,
+            "nativeBinarySha256":hex::encode(sha2::Sha256::digest(std::fs::read(executable).map_err(|e|e.to_string())?)),
+            "endpoint":config.endpoint,"sourceRoot":child.ready["rootId"],"sourceFingerprint":child.ready["sourceFingerprint"],
+            "sourceBinarySha256":child.ready["binarySha256"],"tier":tier,"baseCertificate":certificate,
+            "producerWriter":store.lww_clock_state().map_err(|e|e.to_string())?.writer_id,"localSseUrl":endpoint,
+            "privateRegistrations":["producer-registration.uri","windows-registration.uri","android-registration.uri"],
+            "shutdownSentinel":"shutdown-request","rendererAdoption":null,"measurement":false}))?;
+        while !shutdown_file.exists() {std::thread::sleep(std::time::Duration::from_millis(100));}
+        Ok(())
+    })();
+    // Existing shutdown requires End; this quiescent cleanup scope is not a measurement.
+    let cleanup=(||->Result<Value,String> {
+        child.begin("renderer-source-cleanup","excluded-setup-cleanup",&BTreeMap::new())?;
+        child.end()?;
+        serde_json::to_value(child.shutdown()?).map_err(|e|e.to_string())
+    })();
+    write(&output,"renderer-source-stopped.json",&json!({"phase":"excluded-renderer-source-cleanup","measurement":false,
+        "setupError":setup.as_ref().err(),"cleanupError":cleanup.as_ref().err(),"cleanupReceipt":cleanup.as_ref().ok()}))?;
+    setup?;cleanup?;Ok(())
+}
+
 pub(super) fn run()->Result<(),String> {
     let result=run_inner();
     if let Err(reason)=&result {
@@ -248,9 +315,9 @@ fn run_inner()->Result<(),String> {
                     let recorded=collection.samples.iter().filter(|sample|sample.direction==direction && !sample.warmup).collect::<Vec<_>>();
                     if recorded.len()!=final_runner::REPETITIONS as usize {return Err("selected routine recorded slot count differs from policy".into());}
                     timings.push(json!({"tier":tier,"direction":direction,"recordedCount":recorded.len(),
-                        "nativeDurableSaveMs":measurement::percentiles(recorded.iter().map(|sample|sample.timings.durable_save_ms).collect())?,
-                        "nativePublicationCompleteMs":measurement::percentiles(recorded.iter().map(|sample|sample.timings.publication_complete_ms).collect())?,
-                        "nativeReceiverDurableAckMs":measurement::percentiles(recorded.iter().map(|sample|sample.timings.receiver_durable_ack_ms).collect())?}));
+                        "nativeDurableSaveMs":measurement::percentiles(recorded.iter().map(|sample|sample.timings.durable_save_ms))?,
+                        "nativePublicationCompleteMs":measurement::percentiles(recorded.iter().map(|sample|sample.timings.publication_complete_ms))?,
+                        "nativeReceiverDurableAckMs":measurement::percentiles(recorded.iter().map(|sample|sample.timings.receiver_durable_ack_ms))?}));
                 }
             }
             return write(&directory,"native-final-selected-pair.json",&json!({"status":"native-only-valid","proofs":proofs,"timings":timings,"rendererAdoption":null}));
@@ -673,7 +740,7 @@ async fn costly_external(output:&Path,fixture:&mut CycleFixture,hashes:&[String]
             let context=leases::LeaseContext {root:&compactor.connection_root,connection_id:&compactor.connection_id,writer_id:&writer,
                 descriptor:&compactor.descriptor,root_key:&compactor.root_key,provider:compactor.provider.as_ref(),repository:&compactor.repository,
                 clock:leases::system_clock(),protection_supported:compactor.capabilities.lease_operations,ledger:Some(ledger.clone())};
-            let owner=match leases::admit(&context,&job_id,risunest_external_storage_format::control::LeaseKind::Work,&Cancellation::default())
+            let owner=match leases::admit(&context,&job_id,crate::external_storage::contract::LeaseKind::Work,&Cancellation::default())
                 .await.map_err(|e|format!("{e:?}"))? {leases::Admission::Admitted(owner)=>owner,_=>return Err("actual compaction protection not admitted".into())};
             final_compaction_overlap_costly_slot(&slot,compactor,fixture.provider.clone(),setup.path().join(&label),job_id,writer,owner,ledger,
                 &mut fixture.a,&mut fixture.b,&mut fixture.sender,&mut fixture.receiver,hashes).await
