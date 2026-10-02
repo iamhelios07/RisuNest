@@ -468,22 +468,7 @@ async fn receive_restore_bodies_in_store(mut store:PersistentStore,root:&Path,co
         if page.is_empty() {break;}
         for source in page {after=source.hash.clone();sources.push(source);}
     }
-    let mut parents=(0..sources.len()).collect::<Vec<_>>();
-    let mut pack_users=std::collections::BTreeMap::<String,usize>::new();
-    fn group_root(parents:&mut [usize],mut index:usize)->usize {
-        while parents[index]!=index {parents[index]=parents[parents[index]];index=parents[index];}index
-    }
-    for (index,source) in sources.iter().enumerate() {
-        for chunk in &source.chunks {
-            if let Some(previous)=pack_users.insert(chunk.pack_id.clone(),index) {
-                let left=group_root(&mut parents,index);let right=group_root(&mut parents,previous);parents[left]=right;
-            }
-        }
-    }
-    let mut groups=std::collections::BTreeMap::<usize,Vec<super::lww_residency::PackedSource>>::new();
-    for (index,source) in sources.into_iter().enumerate() {groups.entry(group_root(&mut parents,index)).or_default().push(source);}
-    let mut groups=groups.into_values().collect::<Vec<_>>();
-    groups.sort_by_key(|group|!group.iter().any(|source|priority.contains(&source.hash)));
+    let groups=super::lww_residency::packed_body_groups(sources,&priority);
     let stage=root.join("native-file-jobs/jobs").join(&job.id).join("external-restore-bodies");
     for mut group in groups {
         group.sort_by_key(|source|!priority.contains(&source.hash));

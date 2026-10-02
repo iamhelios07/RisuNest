@@ -21,6 +21,10 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(test)]
+use super::worker_observation::spawn_blocking;
+#[cfg(not(test))]
+use tokio::task::spawn_blocking;
 
 fn store_error(_: crate::persistent_store::StoreError) -> ProviderError {
     segment::corrupt()
@@ -530,7 +534,7 @@ impl ExternalLwwEngine {
                         spools.push(spool);
                         source
                     } else if asset.server_source.is_some() {
-                        let mut body = Self::open_frozen_server_body(store, asset, job, publication.authority, cancel)?;
+                        let mut body = Self::open_frozen_server_body(store, asset, job, publication.authority, cancel).await?;
                         let scratch = root.join("external-storage").join("lww-publications").join(&job.job_id);
                         let mut spool = tempfile::NamedTempFile::new_in(&scratch).map_err(transient)?;
                         let mut chunk = [0; 64 * 1024];
@@ -776,18 +780,26 @@ impl ExternalLwwEngine {
             else if error.code == "binding-authority-changed" || error.code == "binding-authority-unavailable" { ErrorKind::PreconditionFailed }
             else { ErrorKind::Transient })
     }
-    fn open_frozen_server_body(
-        store: &PersistentStore, asset: &FrozenAsset, job: &super::journal::JobIdentity,
+    async fn open_frozen_server_body(
+        store: &mut PersistentStore, asset: &FrozenAsset, job: &super::journal::JobIdentity,
         authority: DecimalU64, cancel: &Cancellation,
     ) -> Result<crate::server_sync::residency::TransientBody> {
-        let proof = asset.server_source.as_ref().ok_or_else(segment::corrupt)?;
+        let proof = asset.server_source.as_ref().ok_or_else(segment::corrupt)?.clone();
         if proof.hash != asset.content_hash || proof.size != asset.byte_length { return Err(segment::corrupt()); }
-        let root = store.repository_root();
+        let root = store.repository_root().to_owned();
         let scratch = root.join("external-storage").join("lww-publications").join(&job.job_id);
-        std::fs::create_dir_all(&scratch).map_err(transient)?;
-        let check = || Self::check_frozen_body_authority(store, authority, cancel);
-        crate::server_sync::residency::open_transient_server_proof_with_check(root, &scratch, proof, &check)
-            .map_err(|error| Self::body_source_error(error, cancel))?.ok_or_else(segment::corrupt)
+        let store = store.open_native_job_store().map_err(store_error)?;
+        let cancel = cancel.clone();
+        #[cfg(test)]
+        let hash_scope = crate::server_sync::hash_metrics::capture();
+        spawn_blocking(move || {
+            #[cfg(test)]
+            let _hash_scope = crate::server_sync::hash_metrics::enter(hash_scope);
+            std::fs::create_dir_all(&scratch).map_err(transient)?;
+            let check = || Self::check_frozen_body_authority(&store, authority, &cancel);
+            crate::server_sync::residency::open_transient_server_proof_with_check(&root, &scratch, &proof, &check)
+                .map_err(|error| Self::body_source_error(error, &cancel))?.ok_or_else(segment::corrupt)
+        }).await.map_err(transient)?
     }
     async fn read_frozen_standalone(
         &self,
@@ -807,7 +819,7 @@ impl ExternalLwwEngine {
             Self::check_frozen_body_authority(store, authority, cancel).map_err(|error| Self::body_source_error(error, cancel))?;
             super::lww_residency::read_frozen_body_spool(proof, &spool, cancel)?
         } else {
-            let mut body = Self::open_frozen_server_body(store, asset, job, authority, cancel)?;
+            let mut body = Self::open_frozen_server_body(store, asset, job, authority, cancel).await?;
             let mut bytes = Vec::new();
             let mut chunk = [0; 64 * 1024];
             loop {

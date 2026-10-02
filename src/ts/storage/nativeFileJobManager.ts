@@ -10,11 +10,14 @@ import {
     NativeFileJobActivationCommittedError,
     NativeFileJobError,
     resolveNativeFileJobStage,
+    portableBodyRetryRequest,
+    retryNativePortableRestoreBodies,
     type NativeFileJobResult,
     type NativeFileJobStage,
     type NativeFileJobStatus,
     type NativeFileOperationFormat,
     type NativeSnapshotBodiesStarted,
+    type NativePortableBodyRetryRequest,
 } from './nativeFileJobs'
 
 export type { NativeFileOperationFormat } from './nativeFileJobs'
@@ -87,6 +90,7 @@ export interface SharedNativeFileOperationOptions {
     presentation?: NativeFileOperationPresentation
     format?: NativeFileOperationFormat
     snapshotBodyOwner?: NativeSnapshotBodiesStarted
+    portableBodyOwner?: NativePortableBodyRetryRequest
 }
 
 export const nativeFileOperation = writable<NativeFileOperationState | null>(null)
@@ -222,6 +226,17 @@ export function runSharedNativeFileOperation<T>(
     operation: (context: SharedNativeFileOperationContext) => Promise<T>,
     options: SharedNativeFileOperationOptions = {},
 ): Promise<T> {
+    if (options.portableBodyOwner) {
+        const receipt = options.portableBodyOwner
+        return invoke<NativeFileJobStatus>('native_file_job_status', {jobId: receipt.jobId}).then(status => {
+            const actual = portableBodyRetryRequest(status)
+            if (kind !== 'import' || !status.portableBodyRetry?.available
+                || Object.keys(receipt).some(key => receipt[key as keyof typeof receipt] !== actual[key as keyof typeof actual])) {
+                throw new NativeFileJobError('portable-body-receipt-mismatch', 'Portable body retry receipt differs')
+            }
+            return runSharedNativeFileOperationWithAdmission(kind, operationKey, operation, options, true)
+        })
+    }
     if (options.snapshotBodyOwner) {
         const receipt = options.snapshotBodyOwner
         return invoke<NativeFileJobStatus>('native_file_job_status', {jobId: receipt.jobId}).then(status => {
@@ -383,6 +398,16 @@ export function cancelActiveNativeFileOperation(): void {
 
 export function dismissNativeFileOperationOutcome(): void {
     nativeFileOperationOutcome.set(null)
+}
+
+export async function retryPortableRestoreBodiesFromOutcome(): Promise<NativeFileJobResult> {
+    const outcome = get(nativeFileOperationOutcome)
+    if (!outcome?.status) return Promise.reject(new NativeFileJobError('portable-body-retry-refused', 'Portable body retry is unavailable'))
+    const receipt = portableBodyRetryRequest(outcome.status)
+    return runSharedNativeFileOperation('import', `portable-bodies:${receipt.jobId}`, context => {
+        context.setBlocking(false)
+        return retryNativePortableRestoreBodies(receipt, {signal: context.signal, onStatus: context.onStatus})
+    }, {presentation: 'dialog', format: 'library-backup', portableBodyOwner: receipt})
 }
 
 /**

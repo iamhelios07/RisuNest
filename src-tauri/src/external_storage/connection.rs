@@ -1037,25 +1037,15 @@ mod tests {
         assert!(!decision.roots.contains(&"bundle-mine-old".to_string()));
     }
 
-    /// A kept point, a conflict and a recovery candidate outlive any policy,
-    /// and a conflict keeps both of the sides it preserved.
+    /// A manual point and a recovery candidate outlive any policy.
     #[test]
-    fn kept_conflict_and_recovery_points_survive_the_narrowest_policy() {
+    fn manual_and_recovery_points_survive_the_narrowest_policy() {
         let points = [
             point(
                 "manual",
                 BackupPointKind::Manual,
                 400,
                 vec![made_by("bundle-manual", "this-device")],
-            ),
-            point(
-                "conflict",
-                BackupPointKind::Conflict,
-                400,
-                vec![
-                    made_by("bundle-local", "this-device"),
-                    made_by("bundle-remote", "other-device"),
-                ],
             ),
             point(
                 "recovery",
@@ -1075,9 +1065,9 @@ mod tests {
             NOW_MS,
         );
         assert_eq!(decision.remove, Vec::<String>::new());
-        assert_eq!(decision.keep, ["manual", "conflict", "recovery", "automatic"]);
-        assert!(decision.roots.contains(&"bundle-local".to_string()));
-        assert!(decision.roots.contains(&"bundle-remote".to_string()));
+        assert_eq!(decision.keep, ["manual", "recovery", "automatic"]);
+        assert!(decision.roots.contains(&"bundle-manual".to_string()));
+        assert!(decision.roots.contains(&"bundle-recovery".to_string()));
     }
 
     /// One limit alone never removes anything, and a bundle a synchronized

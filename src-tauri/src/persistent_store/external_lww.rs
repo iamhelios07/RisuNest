@@ -526,7 +526,7 @@ mod asset_root_tests {
             }));
             f.sender.provider = held.clone();
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-            assert_eq!(runtime.block_on(f.sender.publish(&mut f.a, 0.into(), &[], &cancel)).unwrap_err().kind, ErrorKind::Cancelled);
+            assert_eq!(runtime.block_on(f.sender.publish(&mut f.a, 0.into(), &[], &cancel)).err().expect("cancelled publication must retain its capture").kind, ErrorKind::Cancelled);
             assert!(overwritten.load(Ordering::SeqCst));
             f.a = PersistentStore::open(f.directory_a.path()).unwrap();
             let writer = f.a.lww_clock_state().unwrap().writer_id;
@@ -541,7 +541,7 @@ mod asset_root_tests {
             assert!(Residency::open(f.directory_a.path()).unwrap().object(&hash, None).unwrap().is_some());
             if acknowledged {
                 held.fail_pack_after.store(2, Ordering::SeqCst);
-                assert_eq!(runtime.block_on(f.sender.publish(&mut f.a, 0.into(), &[], &Cancellation::default())).unwrap_err().kind, ErrorKind::RateLimited);
+                assert_eq!(runtime.block_on(f.sender.publish(&mut f.a, 0.into(), &[], &Cancellation::default())).err().expect("later publication must reach the held pack").kind, ErrorKind::RateLimited);
                 assert_eq!(f.a.external_lww_next_sequence(&f.sender.target_scope(), &writer).unwrap(), 2);
                 assert!(f.a.external_lww_active_asset_roots().unwrap().object_hashes.len() == 1);
                 assert!(!f.a.external_lww_active_asset_roots().unwrap().object_hashes.contains(&hash));

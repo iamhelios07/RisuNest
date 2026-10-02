@@ -82,6 +82,7 @@ import {
     runNativeBlockRisuSaveRestore,
     runNativeArchiveExport,
     runNativeArchiveRestore,
+    retryNativePortableRestoreBodies,
     runNativeBlockRisuSaveExport,
     runNativeRawRecoveryExport,
     runNativeCompatibleLocalBackupExport,
@@ -275,6 +276,21 @@ async function restoreOverPluginValues(options: {
 }
 
 describe('native file jobs', () => {
+    it('continues only portable bodies on the same job and retains committed outcome after a lost retry response', async () => {
+        const request = {jobId: 'portable', stagingId: 'stage', catalogSha256: 'a'.repeat(64), activationRevision: '8', bindingAuthority: '2', deviceSessionId: 'session'}
+        const result = {revision: 8, sourceBytes: 128, sourceFingerprintKind: 'portable-catalog-sha256' as const, sourceSha256: request.catalogSha256, characterCount: 1, presetCount: 0, warningCodes: []}
+        const invoke = vi.fn(async (command: string) => {
+            if (command === 'native_portable_retry_restore_bodies') return {jobId: request.jobId}
+            if (command === 'native_file_job_forget') return true
+            if (command === 'native_file_job_status') return {...status('succeeded', result), jobId: request.jobId, kind: 'restore-portable-backup', activationRevision: 8, activationAuthority: '2', deviceSessionId: 'session', restoreAdoptionConfirmed: true, portableBodyRetry: {stagingId: request.stagingId, catalogSha256: request.catalogSha256, pending: false, available: false, sourceRequired: false}}
+            throw new Error(`Body retry touched ${command}`)
+        })
+        await expect(retryNativePortableRestoreBodies(request, {}, {isTauri: () => true, wait: async () => {}, invoke})).resolves.toEqual(result)
+        expect(invoke.mock.calls).toEqual([['native_portable_retry_restore_bodies', {request}], ['native_file_job_status', {jobId: request.jobId}], ['native_file_job_forget', {jobId: request.jobId}]])
+        const lost = vi.fn(async () => {throw new Error('synthetic lost response')})
+        await expect(retryNativePortableRestoreBodies(request, {}, {isTauri: () => true, wait: async () => {}, invoke: lost})).rejects.toMatchObject({committedRevision: 8})
+        expect(lost).toHaveBeenCalledOnce()
+    })
     it('flushes a device-section export without acquiring the old renderer replacement fence', async () => {
         localStorage.removeItem('risuNestPortableExportIntent')
         const calls: Array<[string, Record<string, unknown> | undefined]> = []

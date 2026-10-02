@@ -368,11 +368,15 @@ fn server_held_publication_keeps_captured_source_and_rejects_changed_authority()
                 reached_callback.store(true, std::sync::atomic::Ordering::SeqCst);
             }));
             f.sender.provider = held.clone();
+            crate::server_sync::hash_metrics::reset_hash_metrics();
+            super::worker_observation::begin();
             let result = run(f.sender.publish(&mut f.a, 0.into(), &[], &Cancellation::default()));
+            let workers = super::worker_observation::take();
+            let server_hashes = crate::server_sync::hash_metrics::take_hash_metrics();
             assert!(reached.load(std::sync::atomic::Ordering::SeqCst));
             let segments = f.provider.uploaded_ids().iter().filter(|id| parse_segment_object_id(id).is_ok()).count();
             if stale {
-                assert_eq!(result.unwrap_err().kind, ErrorKind::PreconditionFailed);
+                assert_eq!(result.err().expect("changed authority must reject publication").kind, ErrorKind::PreconditionFailed);
                 assert_eq!(segments, 0); assert!(held.attempts.lock().unwrap().is_empty());
                 let writer = f.a.lww_clock_state().unwrap().writer_id;
                 let pending = f.a.external_lww_pending(&f.sender.target_scope(), &writer).unwrap().unwrap().0;
@@ -380,6 +384,10 @@ fn server_held_publication_keeps_captured_source_and_rejects_changed_authority()
                 assert!(!pending.sealed && !pending.dispatched && pending.bodies.iter().all(|body| body.bytes.is_empty()));
                 assert_eq!(f.a.external_lww_next_sequence(&f.sender.target_scope(), &writer).unwrap(), 1);
             } else {
+                assert!(!workers.is_empty());
+                assert!(workers.iter().all(|worker| worker.completed && worker.hashes.incomplete.is_empty()));
+                assert!(!server_hashes.incomplete);
+                assert!(server_hashes.domains["c_cache_stream_verify"].bytes >= body.len() as u64);
                 assert_eq!(result.unwrap().segments.0, 1); assert_eq!(segments, 1);
                 assert!(f.a.lww_read_outbox(0.into(), 100).unwrap().entries.is_empty());
                 assert!(!f.a.external_lww_object_is_local(&hash).unwrap());
@@ -430,17 +438,24 @@ fn checkpoint_uses_only_published_units_and_restores_after_segment_retirement() 
         let (_,snapshot)=f.sender.checkpoint(&snapshots[0],&Cancellation::default()).await.unwrap();
         assert_eq!(snapshot.covered_prefixes.values().next().unwrap().0,1);
         let backup_id="00000000-0000-4000-8000-000000000096";
+        // This input exercises metadata classification; its copied catalogs are not restored.
+        let mut backup_library=snapshot.library.clone();
+        for object in [&mut backup_library.record_catalog,&mut backup_library.asset_catalog] {
+            object.header.repository_id=f.sender.descriptor.repository_id.clone();
+            object.ciphertext_length=risunest_external_storage_format::snapshot::envelope_length(&object.header).unwrap();
+        }
+        let original_units=backup_library.record_catalog.clone();
         let backup=risunest_external_storage_format::control::BackupBundleDocument::new(
-            f.sender.repository.repository_id.clone(),backup_id.into(),
+            f.sender.descriptor.repository_id.clone(),backup_id.into(),
             risunest_external_storage_format::control::BundleSource::Device{writer_id:f.a.lww_clock_state().unwrap().writer_id},
             super::runtime::now_ms(),Some(risunest_sync_wire::head::Sequence::from(0u64)),None,None,
-            snapshot.library.clone(),std::collections::BTreeMap::new(),
-            Some(snapshot.library.record_catalog.clone()),
+            backup_library,std::collections::BTreeMap::new(),
+            Some(original_units),
         ).unwrap();
         let backup_plain=backup.encode(risunest_external_storage_format::snapshot::MAX_METADATA_BYTES).unwrap();
         let backup_object=format!("snapshot-{backup_id}");
-        let header=risunest_external_storage_format::snapshot::PublicObjectHeader::new(f.sender.repository.repository_id.clone(),backup_object.clone(),risunest_external_storage_format::snapshot::ObjectRole::BackupBundle,backup_plain.len() as u64).unwrap();
-        let key=risunest_external_storage_format::crypto::derive_key(&[7;32],&f.sender.repository.repository_id,"metadata").unwrap();
+        let header=risunest_external_storage_format::snapshot::PublicObjectHeader::new(f.sender.descriptor.repository_id.clone(),backup_object.clone(),risunest_external_storage_format::snapshot::ObjectRole::BackupBundle,backup_plain.len() as u64).unwrap();
+        let key=risunest_external_storage_format::crypto::derive_key(&[7;32],&f.sender.descriptor.repository_id,"metadata").unwrap();
         let mut sealed=Vec::new();risunest_external_storage_format::snapshot::seal_envelope(&mut std::io::Cursor::new(backup_plain),&mut sealed,&key,&header).unwrap();
         f.provider.seed(&backup_object,ObjectRole::BackupBundle,sealed);
         assert_eq!(f.sender.snapshot_listing(&Cancellation::default()).await.unwrap().len(),1);
