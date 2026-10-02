@@ -556,12 +556,12 @@ struct FingerprintedState<'a> {
     sections: BTreeMap<&'a str, FingerprintedSection<'a>>,
 }
 
-fn synthesized_fingerprint(
-    domain: &str,
+fn fingerprinted_state<'a>(
+    domain: &'a str,
     library_fingerprint: &[u8; 32],
-    sections: &BTreeMap<String, SectionSnapshotRef>,
-) -> [u8; 32] {
-    let value = FingerprintedState {
+    sections: &'a BTreeMap<String, SectionSnapshotRef>,
+) -> FingerprintedState<'a> {
+    FingerprintedState {
         domain,
         library: hex::encode(library_fingerprint),
         sections: sections
@@ -578,9 +578,12 @@ fn synthesized_fingerprint(
                 )
             })
             .collect(),
-    };
+    }
+}
+
+fn fingerprint(value: &impl Serialize) -> [u8; 32] {
     super::content_identity::hash(
-        &serde_json::to_vec(&value).expect("fingerprint inputs are plain strings and maps"),
+        &serde_json::to_vec(value).expect("fingerprint inputs are serializable control metadata"),
     )
 }
 
@@ -593,16 +596,32 @@ pub fn state_fingerprint(
     library_fingerprint: &[u8; 32],
     sections: &BTreeMap<String, SectionSnapshotRef>,
 ) -> [u8; 32] {
-    synthesized_fingerprint(STATE_FINGERPRINT_DOMAIN, library_fingerprint, sections)
+    fingerprint(&fingerprinted_state(
+        STATE_FINGERPRINT_DOMAIN,
+        library_fingerprint,
+        sections,
+    ))
 }
 
 pub const BUNDLE_FINGERPRINT_DOMAIN: &str = "risunest.external-backup-bundle-fingerprint/v1";
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FingerprintedBundle<'a> {
+    #[serde(flatten)]
+    state: FingerprintedState<'a>,
+    original_units: Option<&'a StoredObject>,
+}
+
 pub fn bundle_fingerprint(
     library_fingerprint: &[u8; 32],
     sections: &BTreeMap<String, SectionSnapshotRef>,
+    original_units: Option<&StoredObject>,
 ) -> [u8; 32] {
-    synthesized_fingerprint(BUNDLE_FINGERPRINT_DOMAIN, library_fingerprint, sections)
+    fingerprint(&FingerprintedBundle {
+        state: fingerprinted_state(BUNDLE_FINGERPRINT_DOMAIN, library_fingerprint, sections),
+        original_units,
+    })
 }
 
 /// One head points at one of these, and it binds the library to whichever

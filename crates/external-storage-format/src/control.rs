@@ -217,6 +217,14 @@ pub struct BackupBundleDocument {
     pub library: LibrarySnapshotRef,
     pub sections: BTreeMap<String, SectionSnapshotRef>,
     pub bundle_fingerprint: [u8; 32],
+    #[serde(deserialize_with = "deserialize_original_units")]
+    pub original_units: Option<StoredObject>,
+}
+
+fn deserialize_original_units<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<StoredObject>, D::Error> {
+    Option::<StoredObject>::deserialize(deserializer)
 }
 
 impl BackupBundleDocument {
@@ -231,6 +239,7 @@ impl BackupBundleDocument {
         remote_generation: Option<Sequence>,
         library: LibrarySnapshotRef,
         sections: BTreeMap<String, SectionSnapshotRef>,
+        original_units: Option<StoredObject>,
     ) -> Result<Self> {
         let value = Self {
             schema: BUNDLE_SCHEMA.into(),
@@ -242,9 +251,14 @@ impl BackupBundleDocument {
             local_device_revision,
             remote_generation,
             included_sections: sections.keys().cloned().collect(),
-            bundle_fingerprint: bundle_fingerprint(&library.content_fingerprint, &sections),
+            bundle_fingerprint: bundle_fingerprint(
+                &library.content_fingerprint,
+                &sections,
+                original_units.as_ref(),
+            ),
             library,
             sections,
+            original_units,
         };
         value.validate()?;
         Ok(value)
@@ -259,6 +273,18 @@ impl BackupBundleDocument {
             return Err(FormatError("invalid-backup-bundle"));
         }
         self.source.validate()?;
+        match (&self.source, &self.original_units) {
+            (BundleSource::Device { .. }, Some(root)) => {
+                root.validate()?;
+                if root.header.repository_id != self.repository_id
+                    || root.header.role != ObjectRole::Catalog
+                {
+                    return Err(FormatError("invalid-original-unit-catalog"));
+                }
+            }
+            (BundleSource::SyncState { .. }, None) => {}
+            _ => return Err(FormatError("invalid-original-unit-catalog")),
+        }
         self.library.validate(&self.repository_id)?;
         let mut previous: Option<&str> = None;
         for id in &self.included_sections {
@@ -281,7 +307,11 @@ impl BackupBundleDocument {
             section.validate(&self.repository_id, id)?;
         }
         if self.bundle_fingerprint
-            != bundle_fingerprint(&self.library.content_fingerprint, &self.sections)
+            != bundle_fingerprint(
+                &self.library.content_fingerprint,
+                &self.sections,
+                self.original_units.as_ref(),
+            )
         {
             return Err(FormatError("invalid-bundle-fingerprint"));
         }
@@ -544,6 +574,39 @@ mod tests {
             },
             header,
         }
+    }
+
+    fn original_catalog(repository: &str, id: &str, role: ObjectRole) -> StoredObject {
+        use crate::snapshot::{open_envelope, seal_envelope, CatalogDocument, CatalogKind};
+        let plaintext = CatalogDocument::leaf(CatalogKind::Records, vec![], vec![])
+            .unwrap()
+            .encode(4096)
+            .unwrap();
+        let header =
+            PublicObjectHeader::new(repository.into(), id.into(), role, plaintext.len() as u64)
+                .unwrap();
+        let mut sealed = Vec::new();
+        seal_envelope(&mut plaintext.as_slice(), &mut sealed, &[7; 32], &header).unwrap();
+        let mut opened = Vec::new();
+        assert_eq!(
+            open_envelope(&mut sealed.as_slice(), &mut opened, &[7; 32], 4096).unwrap(),
+            header
+        );
+        assert_eq!(opened, plaintext);
+        let root = StoredObject {
+            header,
+            locator: WireLocator {
+                connection_identity: "account/root".into(),
+                collection: None,
+                object: id.into(),
+            },
+            ciphertext_length: sealed.len() as u64,
+            ciphertext_sha256: crate::content_identity::hash(&sealed),
+            plaintext_length: plaintext.len() as u64,
+            plaintext_sha256: crate::content_identity::hash(&plaintext),
+        };
+        root.validate().unwrap();
+        root
     }
 
     pub(crate) fn library() -> LibrarySnapshotRef {
@@ -813,6 +876,11 @@ mod tests {
             None,
             library(),
             sections.clone(),
+            Some(original_catalog(
+                "repository",
+                "original-a",
+                ObjectRole::Catalog,
+            )),
         )
         .unwrap();
         assert_eq!(
@@ -837,6 +905,7 @@ mod tests {
             Some(Sequence::from(9u64)),
             library(),
             BTreeMap::new(),
+            None,
         )
         .unwrap();
         assert!(empty.included_sections.is_empty());
@@ -882,6 +951,11 @@ mod tests {
                 None,
                 library(),
                 BTreeMap::from([(kind.id().into(), section(kind, 1))]),
+                Some(original_catalog(
+                    "repository",
+                    "original-a",
+                    ObjectRole::Catalog,
+                )),
             )
             .unwrap()
         };
@@ -1040,5 +1114,146 @@ mod tests {
         let full_pages = wire_capacity_objects.div_ceil(MAX_INVENTORY_OBJECTS);
         assert_eq!(full_pages, 79);
         assert!(maximum_bytes * full_pages < 5 * 1024 * 1024);
+    }
+
+    #[test]
+    fn device_bundle_authenticates_the_original_catalog_reference() {
+        let root = original_catalog("repository", "original-a", ObjectRole::Catalog);
+        let make = |original_units| {
+            BackupBundleDocument::new(
+                "repository".into(),
+                "bundle".into(),
+                BundleSource::Device {
+                    writer_id: "writer".into(),
+                },
+                1,
+                None,
+                None,
+                None,
+                library(),
+                BTreeMap::new(),
+                original_units,
+            )
+        };
+        let bundle = make(Some(root.clone())).unwrap();
+        assert_eq!(
+            BackupBundleDocument::decode(&bundle.encode(16384).unwrap(), 16384).unwrap(),
+            bundle
+        );
+        assert_eq!(
+            make(None),
+            Err(FormatError("invalid-original-unit-catalog"))
+        );
+        for invalid in [
+            original_catalog("other-repository", "original-a", ObjectRole::Catalog),
+            original_catalog("repository", "original-a", ObjectRole::Pack),
+        ] {
+            assert_eq!(
+                make(Some(invalid)),
+                Err(FormatError("invalid-original-unit-catalog"))
+            );
+        }
+        let mut invalid = root.clone();
+        invalid.ciphertext_length += 1;
+        assert_eq!(
+            make(Some(invalid)),
+            Err(FormatError("object-length-mismatch"))
+        );
+        let mut tampered = bundle.clone();
+        tampered.original_units.as_mut().unwrap().ciphertext_sha256[0] ^= 1;
+        assert_eq!(
+            tampered.validate(),
+            Err(FormatError("invalid-bundle-fingerprint"))
+        );
+        assert_eq!(
+            BackupBundleDocument::decode(&serde_json::to_vec(&tampered).unwrap(), 16384),
+            Err(FormatError("invalid-bundle-fingerprint"))
+        );
+        let mut missing_root = serde_json::to_value(&bundle).unwrap();
+        missing_root["originalUnits"] = serde_json::Value::Null;
+        assert_eq!(
+            BackupBundleDocument::decode(&serde_json::to_vec(&missing_root).unwrap(), 16384),
+            Err(FormatError("invalid-original-unit-catalog"))
+        );
+        let changed_root = make(Some(original_catalog(
+            "repository",
+            "original-b",
+            ObjectRole::Catalog,
+        )))
+        .unwrap();
+        assert_eq!(
+            bundle.library.content_fingerprint,
+            changed_root.library.content_fingerprint
+        );
+        assert_ne!(bundle.bundle_fingerprint, changed_root.bundle_fingerprint);
+        // Every part of the immutable reference, including location and hashes,
+        // is bound even when the original catalog's plaintext is unchanged.
+        for field in 0..5 {
+            let mut changed = root.clone();
+            match field {
+                0 => changed.header.object_id = "original-b".into(),
+                1 => changed.locator.object = "other-object".into(),
+                2 => changed.ciphertext_sha256[0] ^= 1,
+                3 => changed.plaintext_sha256[0] ^= 1,
+                _ => changed.locator.connection_identity = "other-account/root".into(),
+            }
+            assert_ne!(
+                bundle.bundle_fingerprint,
+                make(Some(changed)).unwrap().bundle_fingerprint
+            );
+        }
+    }
+
+    #[test]
+    fn synchronized_bundle_requires_explicit_null_original_units() {
+        let make = |root| {
+            BackupBundleDocument::new(
+                "repository".into(),
+                "bundle".into(),
+                BundleSource::SyncState {
+                    commit_id: "commit".into(),
+                },
+                1,
+                None,
+                None,
+                Some(Sequence::from(1u64)),
+                library(),
+                BTreeMap::new(),
+                root,
+            )
+        };
+        assert_eq!(
+            make(Some(original_catalog(
+                "repository",
+                "original-a",
+                ObjectRole::Catalog
+            ))),
+            Err(FormatError("invalid-original-unit-catalog"))
+        );
+        let bundle = make(None).unwrap();
+        let expected_bundle_input = format!(
+            "{{\"domain\":\"risunest.external-backup-bundle-fingerprint/v1\",\"library\":\"{}\",\"sections\":{{}},\"originalUnits\":null}}",
+            hex::encode(bundle.library.content_fingerprint),
+        );
+        assert_eq!(
+            bundle.bundle_fingerprint,
+            crate::content_identity::hash(expected_bundle_input.as_bytes())
+        );
+        let expected_state_input = format!(
+            "{{\"domain\":\"risunest.external-state-fingerprint/v1\",\"library\":\"{}\",\"sections\":{{}}}}",
+            hex::encode(bundle.library.content_fingerprint),
+        );
+        assert_eq!(
+            state_fingerprint(&bundle.library.content_fingerprint, &BTreeMap::new()),
+            crate::content_identity::hash(expected_state_input.as_bytes())
+        );
+        let bytes = bundle.encode(16384).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(value.as_object().unwrap().contains_key("originalUnits"));
+        assert!(value["originalUnits"].is_null());
+        assert_eq!(BackupBundleDocument::decode(&bytes, 16384).unwrap(), bundle);
+        value.as_object_mut().unwrap().remove("originalUnits");
+        assert!(serde_json::from_value::<BackupBundleDocument>(value.clone()).is_err());
+        assert!(BackupBundleDocument::decode(&serde_json::to_vec(&value).unwrap(), 16384).is_err());
     }
 }
