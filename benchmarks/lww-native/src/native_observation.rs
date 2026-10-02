@@ -18,6 +18,13 @@ pub struct BodyDomain {
     pub incomplete_reads: u64,
     pub escaped_handles: u64,
     pub escaped_paths: u64,
+    pub outstanding_readers: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectBodyDomain {
+    pub purposes: Vec<String>,
+    pub work: BodyDomain,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -38,6 +45,13 @@ pub struct NativeObservation {
     pub body_scope_complete: Option<bool>,
     pub body_scope_thread: Option<String>,
     pub body_domains: BTreeMap<String, BodyDomain>,
+    pub body_objects: BTreeMap<String, ObjectBodyDomain>,
+    pub body_asset_work: BodyDomain,
+    pub body_control_work: BodyDomain,
+    pub body_owned_work: BodyDomain,
+    pub body_unknown_work: BodyDomain,
+    pub body_unattributed_managed: BodyDomain,
+    pub body_scope_violations: u64,
     pub body_stat_requests: u64,
     pub body_batch_stat_requests: u64,
     pub body_presence_queries: u64,
@@ -62,10 +76,22 @@ impl NativeObservation {
 
     pub fn validate_routine_invariants(&self) -> Result<(), String> {
         self.hash_totals()?;
-        if self.body_scope_complete != Some(true) || self.body_domains.values().any(|domain|
+        if self.body_scope_complete != Some(true) || self.body_scope_violations != 0
+            || self.body_unknown_work != BodyDomain::default()
+            || self.body_unattributed_managed != BodyDomain::default()
+            || self.body_owned_work != BodyDomain::default()
+            || self.body_domains.get("owned").is_some_and(|work| work != &BodyDomain::default())
+            || self.body_objects.values().any(|object| object.purposes.is_empty()
+                && object.work != BodyDomain::default())
+            || self.body_domains.values().chain(self.body_objects.values().map(|object| &object.work)).any(|domain|
             domain.unknown_open_results != 0 || domain.incomplete_reads != 0
-                || domain.escaped_handles != 0 || domain.escaped_paths != 0) {
+                || domain.escaped_handles != 0 || domain.escaped_paths != 0
+                || domain.outstanding_readers != 0) {
             return Err("incomplete or unobserved CAS body scope".into());
+        }
+        if self.asset_body_opens != Some(self.body_asset_work.open_attempts)
+            || self.asset_body_bytes_read != Some(self.body_asset_work.read_bytes) {
+            return Err("inconsistent asset-purpose body totals".into());
         }
         for (domain, work) in &self.hashes {
             if (domain.contains("binding") || domain.contains("catalog_proof") || domain.contains("generation_digest"))
@@ -123,6 +149,27 @@ mod tests {
         sample.incomplete.push("native/stream".into());
         assert!(sample.hash_totals().is_err());
     }
+    #[test]
+    fn role_coverage_and_reader_lifecycle_remain_fail_closed() {
+        let mut sample = NativeObservation {asset_body_opens:Some(0), asset_body_bytes_read:Some(0),
+            shared_head_reads:Some(0), body_scope_complete:Some(true), ..Default::default()};
+        sample.body_control_work = BodyDomain {open_attempts:1, opens:1, read_operations:1,
+            read_bytes:22, ..Default::default()};
+        sample.body_domains.insert("managed".into(), sample.body_control_work.clone());
+        sample.validate_routine_invariants().unwrap();
+        sample.body_unknown_work.open_attempts = 1;
+        assert!(sample.validate_routine_invariants().is_err());
+        sample.body_unknown_work = BodyDomain::default();
+        sample.body_domains.get_mut("managed").unwrap().outstanding_readers = 1;
+        assert!(sample.validate_routine_invariants().is_err());
+        sample.body_domains.get_mut("managed").unwrap().outstanding_readers = 0;
+        sample.body_scope_violations = 1;
+        assert!(sample.validate_routine_invariants().is_err());
+        sample.body_scope_violations = 0;
+        sample.body_owned_work.read_bytes = 1;
+        assert!(sample.validate_routine_invariants().is_err());
+    }
+
     #[test]
     fn growth_requires_precise_control_attribution_and_never_more_calls() {
         let mut a = NativeObservation { asset_body_opens:Some(0), asset_body_bytes_read:Some(0),
