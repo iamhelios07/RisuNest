@@ -4855,6 +4855,50 @@ mod tests {
         });
     }
 
+    #[test]
+    fn existing_manifest_control_is_prepared_from_data_pack_independently_of_local_asset_residency() {
+        runtime().block_on(async {
+            let root=tempfile::tempdir().unwrap();
+            let external=root.path().join("external-storage");
+            let mut catalog=crate::external_storage::capture::CaptureCatalog::create(&external.join("captures/control"),&external,None).unwrap();
+            let identity=CaptureIdentity {store_id:"store".into(),library_epoch:"epoch".into(),generation:"generation".into(),selection_epoch:"selection".into(),revision:1};
+            let manifest=risunest_external_storage_format::message_pages::MessageManifest {schema:risunest_external_storage_format::message_pages::MANIFEST_SCHEMA.into(),message_count:0.into(),pages:Vec::new()}.encode().unwrap();
+            catalog.begin(&identity,None).unwrap();
+            catalog.record("root",b"synthetic root record").unwrap();
+            catalog.object(&manifest.hash,&manifest.bytes).unwrap();
+            catalog.reference("root",&manifest.hash,manifest.bytes.len() as u64).unwrap();
+            catalog.finish().unwrap();
+            let capture=CapturedSnapshot {id:"control".into(),identity,catalog,projected_records:1,shared:false};
+            let provider=FakeProvider::new(false);
+            let repository=fake::repository();
+            let key=[11;32];
+            let snapshot_metadata=metadata("existing-control",&capture);
+            let mut transfer=journal(&root.path().join("upload"),"control",&capture);
+            let completed=package_and_upload(capture,Vec::new(),root.path(),&root.path().join("cache"),snapshot_metadata,&key,limits(256 * 1024),None,&mut transfer,&provider,&repository,&PhaseProgress::silent(),&Cancellation::default()).await.unwrap();
+            let destination=tempfile::tempdir().unwrap();
+            PayloadCas::new(destination.path()).unwrap().prepare_bytes(&manifest.bytes).unwrap();
+            let stage=root.path().join("download-control");
+            crate::asset_repository::body_io::reset_body_io();
+            crate::external_storage::worker_observation::begin();
+            let prepared=snapshot_restore::download_snapshot(&completed.reference,&stage,&key,None,snapshot_restore::SourceTrust::ProvenLibrary(destination.path()),&provider,&repository,&PhaseProgress::silent(),&Cancellation::default()).await.unwrap();
+            let receipts=crate::external_storage::worker_observation::take();
+            let observed=crate::asset_repository::body_io::take_body_io();
+            assert!(!receipts.is_empty());
+            assert!(receipts.iter().all(|receipt| receipt.completed && receipt.hashes.incomplete.is_empty()));
+            assert_eq!(receipts.len() as u64,observed.worker_scopes_started);
+            assert_eq!(observed.worker_scopes_started,observed.worker_scopes_settled);
+            assert!(observed.complete());
+            assert_eq!(observed.asset_work(),Default::default());
+            let object=prepared.objects.iter().find(|object| object.content_hash == manifest.hash).unwrap();
+            assert!(!matches!(object.source,crate::external_storage::content_store::ObjectSource::Library(_)));
+            let content=crate::external_storage::content_store::ContentStore::open(&stage.join("external-storage")).unwrap();
+            let mut body=content.open_source(&object.source).unwrap();
+            let mut bytes=Vec::new();
+            std::io::Read::read_to_end(&mut body,&mut bytes).unwrap();
+            assert_eq!(bytes,manifest.bytes);
+        });
+    }
+
     /// Invariant 32. Two devices produce separate bundles. Neither carries the
     /// other's section material and nothing is merged between them.
     #[test]

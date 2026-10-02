@@ -53,6 +53,8 @@ pub(crate) mod sections;
 pub(crate) mod snapshot_export;
 pub(crate) mod snapshot_export_commands;
 pub(crate) mod snapshot_restore;
+#[cfg(test)]
+pub(crate) mod worker_observation;
 pub(crate) mod head_observation;
 #[cfg(test)]
 mod tests;

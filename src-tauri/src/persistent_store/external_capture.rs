@@ -74,6 +74,7 @@ pub(crate) struct BackupDependencyInventory {
 }
 
 impl PersistentStore {
+    #[cfg(test)]
     pub(crate) fn lww_backup_dependency_closure(
         &self,
         lease: &str,
@@ -129,6 +130,7 @@ impl PersistentStore {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn original_unit_dependency_closure(
     units: &BTreeMap<risunest_sync_wire::unit::UnitKey,risunest_sync_wire::unit::UnitValue>,
     read_body: &dyn Fn(&str) -> StoreResult<Option<Vec<u8>>>,

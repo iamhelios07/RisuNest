@@ -1,6 +1,10 @@
 //! Direct-locator snapshot download and full verification into native staging.
 //! No PDS generation is activated here; the caller owns the subsequent staged
 //! apply and eventual cleanup of this durable verified directory.
+#[cfg(test)]
+use super::worker_observation::spawn_blocking;
+#[cfg(not(test))]
+use tokio::task::spawn_blocking;
 use super::{
     content_store::{ContentStore, ObjectSource},
     package_cache::CatalogRange,
@@ -373,7 +377,7 @@ pub(super) async fn open_object(
     let cipher_path = ciphertext.clone();
     let partial_path = partial.clone();
     let cpu = cpu_permit().await?;
-    tokio::task::spawn_blocking(move || {
+    spawn_blocking(move || {
         let mut input =
             crate::trust_boundary::open_regular_source(&cipher_path).map_err(corrupt)?;
         let mut output = OpenOptions::new()
@@ -1225,7 +1229,7 @@ async fn turn_over_packs(
     let prepared_root = staging_root.to_path_buf();
     let prepared_pending = pending.clone();
     let cpu = cpu_permit().await?;
-    tokio::task::spawn_blocking(move || prepare_turnover(&prepared_root, &prepared_pending))
+    spawn_blocking(move || prepare_turnover(&prepared_root, &prepared_pending))
         .await
         .map_err(transient)??;
     drop(cpu);
@@ -1237,7 +1241,7 @@ async fn turn_over_packs(
     );
     let opened_root = staging_root.to_path_buf();
     let mut content = Some(
-        tokio::task::spawn_blocking(move || content_store(&opened_root))
+        spawn_blocking(move || content_store(&opened_root))
             .await
             .map_err(transient)??,
     );
@@ -1276,7 +1280,7 @@ async fn turn_over_packs(
             let mut place_group = group.take().ok_or_else(|| transient("placed group"))?;
             let plaintext_length = pack.plaintext_length;
             let cpu = cpu_permit().await?;
-            let (returned_content, returned_group, placed) = tokio::task::spawn_blocking(move || {
+            let (returned_content, returned_group, placed) = spawn_blocking(move || {
                 let placed = place_pack(
                     &place_root,
                     &place_id,
@@ -1314,7 +1318,7 @@ async fn turn_over_packs(
     // attempt, which is what makes it resume rather than restart.
     if let (Some(mut flush_content), Some(mut flush_group)) = (content.take(), group.take()) {
         let flush_root = staging_root.to_path_buf();
-        let flushed = tokio::task::spawn_blocking(move || {
+        let flushed = spawn_blocking(move || {
             flush_group.flush(&flush_root, &mut flush_content)
         })
         .await
@@ -1327,7 +1331,7 @@ async fn turn_over_packs(
     let finish_root = staging_root.to_path_buf();
     let finish_pending = pending.clone();
     let cpu = cpu_permit().await?;
-    tokio::task::spawn_blocking(move || finish_assemblies(&finish_root, &finish_pending))
+    spawn_blocking(move || finish_assemblies(&finish_root, &finish_pending))
         .await
         .map_err(transient)??;
     drop(cpu);
@@ -1545,7 +1549,7 @@ pub(crate) async fn download_sections(
         let cpu = cpu_permit().await?;
         let section_cancel = cancel.clone();
         let section_staging = staging_root.to_path_buf();
-        let sources = tokio::task::spawn_blocking(move || {
+        let sources = spawn_blocking(move || {
             materialize_section_entries(complete, &pack_paths, &section_staging, &section_cancel)
         })
         .await
@@ -1610,7 +1614,12 @@ pub(crate) async fn download_original_backup_units(
     let mut units = BTreeMap::new();
     for record in records {
         cancel.check()?;
-        let bytes = content.read_all(&record.content_hash).map_err(transient)?;
+        if record.byte_length > risunest_sync_wire::MAX_METADATA_BYTES as u64 {
+            return Err(corrupt("original unit control exceeds its bound"));
+        }
+        let mut source=content.open_body(&record.content_hash).map_err(transient)?;
+        let mut bytes=Vec::new();
+        source.by_ref().take(risunest_sync_wire::MAX_METADATA_BYTES as u64+1).read_to_end(&mut bytes).map_err(transient)?;
         if bytes.len() as u64 != record.byte_length {
             return Err(corrupt("original unit control length"));
         }
@@ -1622,12 +1631,26 @@ pub(crate) async fn download_original_backup_units(
         {
             return Err(corrupt("original unit catalog key differs from its control"));
         }
+        #[cfg(test)]
+        crate::persistent_store::hash_work::validation(&unit.value);
         unit.value.validate().map_err(corrupt)?;
         if units.insert(unit.key, unit.value).is_some() {
             return Err(corrupt("duplicate original unit"));
         }
     }
     Ok(units)
+}
+
+pub(crate) async fn download_backup_original_units(
+    snapshot:&RemoteObject, staging_root:&Path, key:&[u8;32], provider:&dyn Provider,
+    repository:&RepositoryHandle, cancel:&Cancellation,
+) -> Result<BTreeMap<risunest_sync_wire::unit::UnitKey,risunest_sync_wire::unit::UnitValue>> {
+    if snapshot.role != ObjectRole::BackupBundle {return Err(corrupt("full backup is required"))}
+    let root=open_object(snapshot,key,staging_root,provider,repository,cancel).await?;
+    let document=super::control::SnapshotView::read(&read_bytes(&root,wire::MAX_METADATA_BYTES)?,wire::ObjectRole::BackupBundle,&snapshot.repository_id)?;
+    if snapshot.object_id != format!("snapshot-{}",document.snapshot_id) {return Err(corrupt("backup identity differs"))}
+    let original=RemoteObject::from_stored(document.original_units.as_ref().ok_or_else(|| corrupt("complete original unit root is required"))?,repository)?;
+    download_original_backup_units(&original,staging_root,key,provider,repository,cancel).await
 }
 
 pub(crate) struct DatabaseFirstSnapshot {
@@ -1778,8 +1801,6 @@ pub(crate) async fn download_snapshot(
         } => unchanged_records(&record_entries, records, within)?,
         _ => BTreeSet::new(),
     };
-    let mut library_entries = record_entries;
-    library_entries.extend(asset_entries);
     let library_staging = staging_root.to_path_buf();
     let library_cancel = cancel.clone();
     let library = match trust {
@@ -1796,16 +1817,12 @@ pub(crate) async fn download_snapshot(
         }
     };
     let cpu = cpu_permit().await?;
-    let plan = tokio::task::spawn_blocking(move || {
+    let plan = spawn_blocking(move || {
         let content = content_store(&library_staging)?;
-        resolve_entries(
-            library_entries,
-            &library_staging,
-            &content,
-            library,
-            &unchanged,
-            &library_cancel,
-        )
+        let mut data=resolve_entries(record_entries,&library_staging,&content,None,&unchanged,&library_cancel)?;
+        let assets=resolve_entries(asset_entries,&library_staging,&content,library,&BTreeSet::new(),&library_cancel)?;
+        data.extend(assets);
+        Ok::<_,ProviderError>(data)
     })
     .await
     .map_err(transient)??;
