@@ -16,6 +16,28 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 internal data class PortableSelected(val ready: SafSpoolReady, val sourceType: String)
 
+internal class PortableSourceOwner {
+  private val lock = Any()
+  private var retired = false
+  private val tokens = mutableSetOf<String>()
+
+  fun isRetired(): Boolean = synchronized(lock) { retired }
+
+  fun retain(token: String, register: () -> Unit) = synchronized(lock) {
+    if (retired) throw IOException("source-reselect-required")
+    register()
+    tokens.add(token)
+    Unit
+  }
+
+  fun released(token: String) { synchronized(lock) { tokens.remove(token) } }
+
+  fun retire(discard: (String) -> Boolean) {
+    val owned = synchronized(lock) { retired = true; tokens.toList() }
+    owned.forEach { token -> if (runCatching { discard(token) }.getOrDefault(false)) released(token) }
+  }
+}
+
 @androidx.annotation.Keep
 internal object PortableSourceNative {
   @JvmStatic external fun register(token: String, fd: Int): Boolean
@@ -24,6 +46,7 @@ internal object PortableSourceNative {
   @JvmStatic external fun verifyCopy(token: String): Boolean
   private data class Owned(
     val descriptor: ParcelFileDescriptor,
+    val owner: PortableSourceOwner,
     val name: String,
     val bytes: Long,
     val cancelled: AtomicBoolean = AtomicBoolean(false),
@@ -32,7 +55,8 @@ internal object PortableSourceNative {
   )
   private val selected = ConcurrentHashMap<String, Owned>()
 
-  fun select(resolver: ContentResolver, uri: Uri, name: String, store: SafSpoolStore, cancelled: () -> Boolean): PortableSelected {
+  fun select(resolver: ContentResolver, uri: Uri, name: String, store: SafSpoolStore, owner: PortableSourceOwner, cancelled: () -> Boolean): PortableSelected {
+    if (owner.isRetired()) throw IOException("source-reselect-required")
     val descriptor = resolver.openFileDescriptor(uri, "r")
       ?: throw IOException("source-unavailable")
     try {
@@ -56,17 +80,19 @@ internal object PortableSourceNative {
             override val totalBytes: Long? = null
             override fun open(): InputStream = SequenceInputStream(ByteArrayInputStream(prefix, 0, count), input)
           }
-          val copied = store.spool(listOf(wrapped), isCancelled = cancelled)
+          val copied = store.spool(listOf(wrapped), isCancelled = { cancelled() || owner.isRetired() })
           if (copied.failures.isNotEmpty() || copied.ready.size != 1) throw IOException(copied.failures.firstOrNull()?.code ?: "source-copy-failed")
           return PortableSelected(copied.ready.single(), "androidSpool")
         }
       }
       if (selected.size >= 16) throw IOException("source-busy")
       val token = UUID.randomUUID().toString()
-      selected[token] = Owned(descriptor, name, info.st_size)
-      if (!register(token, descriptor.fd)) {
-        selected.remove(token)
-        throw IOException("source-unavailable")
+      owner.retain(token) {
+        selected[token] = Owned(descriptor, owner, name, info.st_size)
+        if (!register(token, descriptor.fd)) {
+          selected.remove(token)
+          throw IOException("source-unavailable")
+        }
       }
       return PortableSelected(SafSpoolReady(token, name, info.st_size, info.st_size), "androidSeekable")
     } catch (error: Exception) { descriptor.close(); throw error }
@@ -78,10 +104,11 @@ internal object PortableSourceNative {
     if (source.copying.get()) source.copied.await()
     source.descriptor.close()
     selected.remove(token, source)
+    source.owner.released(token)
     return true
   }
 
-  fun discardUnclaimed() { selected.keys.toList().forEach { runCatching { discard(it) } } }
+  fun retireUnclaimed(owner: PortableSourceOwner) { owner.retire { discard(it) } }
 
   fun materialize(token: String, store: SafSpoolStore): SafSpoolBatch {
     val source = selected[token] ?: throw IOException("source-reselect-required")

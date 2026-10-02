@@ -461,11 +461,39 @@ pub(crate) fn cleanup_orphans(app: &tauri::AppHandle) -> Result<(), NativeJobErr
             .portable_source_orphans()
             .map_err(|_| error("Source owner reset could not be confirmed"))?;
         for token in retired {
-            super::parse_android_spool_token(&token)?;
-            let _ = release(&token, Platform::Ios, None)?;
+            cleanup_orphan(&token, |token| {
+                app.ios_native()
+                    .acknowledge_portable_source_orphan(token)
+                    .map_err(|_| error("Source orphan cleanup acknowledgement is unavailable"))
+            })?;
         }
     }
     let _ = app;
+    Ok(())
+}
+#[cfg(any(target_os = "ios", test))]
+fn cleanup_orphan(
+    token: &str,
+    acknowledge: impl FnOnce(&str) -> Result<bool, NativeJobError>,
+) -> Result<(), NativeJobError> {
+    super::parse_android_spool_token(token)?;
+    release(token, Platform::Ios, None)?;
+    let selected = sources()
+        .lock()
+        .map_err(|_| error("Source custody is unavailable"))?;
+    if selected.contains_key(token) {
+        return Err(NativeJobError::new(
+            "cleanup-failed",
+            "Source orphan still has a native owner",
+        ));
+    }
+    // Hold registration ownership until the exact platform receipt is consumed.
+    if !acknowledge(token)? {
+        return Err(NativeJobError::new(
+            "cleanup-failed",
+            "Source orphan cleanup acknowledgement did not complete",
+        ));
+    }
     Ok(())
 }
 #[derive(Debug)]
@@ -702,6 +730,9 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
     fn selected() -> (tempfile::TempDir, JobSource) {
+        selected_on(Platform::Android)
+    }
+    fn selected_on(platform: Platform) -> (tempfile::TempDir, JobSource) {
         use std::io::Write;
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("synthetic.risunest");
@@ -726,8 +757,63 @@ mod tests {
         archive.write_all(&vec![7; 65536]).unwrap();
         archive.finish().unwrap();
         let token = uuid::Uuid::new_v4().to_string();
-        register(&token, Platform::Android, File::open(path).unwrap(), None).unwrap();
-        (directory, JobSource::AndroidSeekable { token })
+        register(&token, platform, File::open(path).unwrap(), None).unwrap();
+        let source = match platform {
+            Platform::Android => JobSource::AndroidSeekable { token },
+            Platform::Ios => JobSource::IosScoped { token },
+        };
+        (directory, source)
+    }
+    #[test]
+    fn orphan_acknowledgement_follows_cleanup_and_failed_ack_remains_retryable() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (_directory, source) = selected_on(Platform::Ios);
+        let (token, _) = parts(&source).unwrap();
+        let closed = Arc::new(AtomicBool::new(false));
+        sources().lock().unwrap().get_mut(token).unwrap().release = Some(Arc::new(|_| {
+            Err(NativeJobError::new(
+                "cleanup-failed",
+                "Synthetic scope failure",
+            ))
+        }));
+        assert!(cleanup_orphan(token, |_| panic!("ACK before native cleanup")).is_err());
+        assert!(sources().lock().unwrap().contains_key(token));
+        let observed = closed.clone();
+        sources().lock().unwrap().get_mut(token).unwrap().release = Some(Arc::new(move |_| {
+            observed.store(true, Ordering::SeqCst);
+            Ok(())
+        }));
+        assert!(cleanup_orphan(token, |exact| {
+            assert_eq!(exact, token);
+            assert!(closed.load(Ordering::SeqCst));
+            Ok(false)
+        })
+        .is_err());
+        assert!(!sources().lock().unwrap().contains_key(token));
+        cleanup_orphan(token, |exact| {
+            assert_eq!(exact, token);
+            Ok(true)
+        })
+        .unwrap();
+        let absent = uuid::Uuid::new_v4().to_string();
+        cleanup_orphan(&absent, |exact| {
+            assert_eq!(exact, absent);
+            Ok(true)
+        })
+        .unwrap();
+    }
+    #[test]
+    fn orphan_cleanup_does_not_acknowledge_foreign_or_claimed_native_owners() {
+        let (_directory, source) = selected();
+        let (token, _) = parts(&source).unwrap();
+        assert!(cleanup_orphan(token, |_| panic!("ACK of foreign owner")).is_err());
+        assert!(discard(&source).unwrap());
+        let (_directory, source) = selected_on(Platform::Ios);
+        probe_format(&source).unwrap();
+        let mut opened = claim(&source, &uuid::Uuid::new_v4().to_string()).unwrap();
+        let (token, _) = parts(&source).unwrap();
+        assert!(cleanup_orphan(token, |_| panic!("ACK of claimed owner")).is_err());
+        opened.custody.take().unwrap().finish().unwrap();
     }
     #[test]
     fn exact_descriptor_is_probed_then_claimed_once_and_released_after_job() {

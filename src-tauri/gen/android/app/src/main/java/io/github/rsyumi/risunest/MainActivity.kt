@@ -554,6 +554,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   private val generationKeepAliveOwner = GenerationKeepAliveOwner()
   private val mainHandler = Handler(Looper.getMainLooper())
   private val safScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+  private val portableSourceOwner = PortableSourceOwner()
   private val safSourcePickFlow = SafSourcePickFlow { block -> safScope.launch { block() } }
   private val postNotificationsGate = PostNotificationsRequestGate(
     Build.VERSION.SDK_INT,
@@ -832,7 +833,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     commitBridge?.close()
     commitBridge = null
     safSourceCancellations.values.forEach { it.set(true) }
-    PortableSourceNative.discardUnclaimed()
+    PortableSourceNative.retireUnclaimed(portableSourceOwner)
     safDestinationCancellations.values.forEach { it.set(true) }
     pendingSafDestination = null
     pendingBackupSource = null
@@ -1372,7 +1373,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
             if (pending.restored) throw java.io.IOException("source-reselect-required")
             val (name, _) = resolveSourceMetadata(uri)
             if (!isBackupSource(name)) throw java.io.IOException("unsupported-source")
-            val selected = PortableSourceNative.select(contentResolver, uri, name, safSpoolStore(), { pending.cancellation.get() })
+            val selected = PortableSourceNative.select(contentResolver, uri, name, safSpoolStore(), portableSourceOwner, { pending.cancellation.get() })
             if (pending.cancellation.get()) {
               val removed = if (selected.sourceType == "androidSeekable") PortableSourceNative.discard(selected.ready.token)
                 else safSpoolStore().discardReady(selected.ready.token)

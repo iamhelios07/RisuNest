@@ -135,6 +135,9 @@ impl<R: Runtime> IosNative<R> {
     pub fn portable_source_orphans(&self)->Result<Vec<String>,String> {
         self.0.handle.run_mobile_plugin("portableSourceOrphans",()).map_err(|error|error.to_string())
     }
+    pub fn acknowledge_portable_source_orphan(&self,token:&str)->Result<bool,String> {
+        self.0.handle.run_mobile_plugin("acknowledgePortableSourceOrphan",PortableSourceRequest{token,job_id:None}).map_err(|error|error.to_string())
+    }
     pub fn begin_portable_source_probe(&self,token:&str,probe_id:&str)->Result<bool,String> {
         self.0.handle.run_mobile_plugin("beginPortableSourceProbe",PortableSourceProbeRequest{token,probe_id}).map_err(|error|error.to_string())
     }

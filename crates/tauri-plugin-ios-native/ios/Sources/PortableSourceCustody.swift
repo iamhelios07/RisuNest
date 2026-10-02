@@ -188,7 +188,7 @@ final class PortableSourceCustody {
     func release(token: String, jobId: String?) -> Bool {
         lock.lock()
         guard let source = active[token] else {
-            let completed = released.contains(token)
+            let completed = released.contains(token) || retired.contains(token)
             lock.unlock()
             return completed
         }
@@ -222,7 +222,6 @@ final class PortableSourceCustody {
         retirementQueue.addOperation {
             for token in tokens where self.release(token: token, jobId: nil) {
                 self.lock.lock(); self.retired.append(token)
-                if self.retired.count > 32 { self.retired.removeFirst(self.retired.count - 32) }
                 self.lock.unlock()
             }
             completion?()
@@ -232,5 +231,12 @@ final class PortableSourceCustody {
     func orphanTokens() -> [String] {
         retirementQueue.waitUntilAllOperationsAreFinished()
         lock.lock(); defer { lock.unlock() }; return retired
+    }
+
+    func acknowledgeOrphan(token: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard active[token] == nil, let index = retired.firstIndex(of: token) else { return false }
+        retired.remove(at: index)
+        return true
     }
 }

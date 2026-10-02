@@ -490,6 +490,10 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate, ASWebAuthenticati
     @objc func portableSourceOrphans(_ invoke: Invoke) {
         fileQueue.async { invoke.resolve(self.portableSources.orphanTokens()) }
     }
+    @objc func acknowledgePortableSourceOrphan(_ invoke: Invoke) throws {
+        let args = try invoke.parseArgs(PortableSourceArgs.self)
+        invoke.resolve(portableSources.acknowledgeOrphan(token: args.token))
+    }
     @objc func beginPortableSourceProbe(_ invoke: Invoke) throws {
         let args = try invoke.parseArgs(PortableSourceProbeArgs.self)
         do { try portableSources.beginProbe(token: args.token, probeId: args.probeId); invoke.resolve(true) }
