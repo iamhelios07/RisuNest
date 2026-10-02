@@ -427,6 +427,8 @@ impl PayloadCas {
     }
 
     pub fn read_object(&self, content_hash: &str) -> io::Result<Option<Vec<u8>>> {
+        #[cfg(test)]
+        let _body_scope = super::body_io::object_scope(content_hash);
         let Some(path) = self.existing_object_path(content_hash)? else {
             return Ok(None);
         };
@@ -442,6 +444,8 @@ impl PayloadCas {
         start: u64,
         end_exclusive: u64,
     ) -> io::Result<Option<Vec<u8>>> {
+        #[cfg(test)]
+        let _body_scope = super::body_io::object_scope(content_hash);
         if end_exclusive < start {
             return Err(io::Error::new(
                 ErrorKind::InvalidInput,
@@ -470,6 +474,8 @@ impl PayloadCas {
     }
 
     pub fn open_object(&self, content_hash: &str) -> io::Result<Option<File>> {
+        #[cfg(test)]
+        let _body_scope = super::body_io::object_scope(content_hash);
         let Some(path) = self.existing_object_path(content_hash)? else {
             return Ok(None);
         };
@@ -482,7 +488,18 @@ impl PayloadCas {
         Ok(Some(file))
     }
 
+    #[cfg(test)]
+    pub(crate) fn open_object_tracked(&self, content_hash: &str) -> io::Result<Option<super::body_io::TrackedBodyFile>> {
+        let _body_scope = super::body_io::object_scope(content_hash);
+        let Some(path) = self.existing_object_path(content_hash)? else { return Ok(None); };
+        let file = File::open(path);
+        super::body_io::open_result("managed", &file);
+        Ok(Some(super::body_io::TrackedBodyFile::new(file?, content_hash)))
+    }
+
     pub fn object_path(&self, content_hash: &str) -> io::Result<Option<PathBuf>> {
+        #[cfg(test)]
+        let _body_scope = super::body_io::object_scope(content_hash);
         let path = self.existing_object_path(content_hash);
         #[cfg(test)]
         if path.as_ref().is_ok_and(Option::is_some) {
@@ -500,6 +517,8 @@ impl PayloadCas {
         expected_size: u64,
         cancelled: &dyn Fn() -> bool,
     ) -> io::Result<bool> {
+        #[cfg(test)]
+        let _body_scope = super::body_io::object_scope(content_hash);
         let Some(path) = self.existing_object_path(content_hash)? else {
             return Ok(false);
         };
@@ -547,6 +566,8 @@ impl PayloadCas {
         expected_physical_key: &str,
         after_hash: impl FnOnce(&Path) -> io::Result<()>,
     ) -> io::Result<ExactObjectUnlink> {
+        #[cfg(test)]
+        let _body_scope = super::body_io::object_scope(content_hash);
         validate_content_hash(content_hash)?;
         let physical_key = object_physical_key(content_hash);
         if expected_physical_key != physical_key {
@@ -697,6 +718,15 @@ impl PayloadCas {
     }
 
     fn open_exact_owned_file(&self, path: &Path) -> io::Result<File> {
+        #[cfg(test)]
+        let _body_scope = {
+            let hash = path.parent().and_then(Path::file_name).and_then(|name| name.to_str())
+                .zip(path.file_name().and_then(|name| name.to_str()))
+                .map(|(prefix, tail)| format!("{prefix}{tail}"))
+                .filter(|hash| validate_content_hash(hash).is_ok()
+                    && path == self.repository_root.join(object_physical_key(hash)));
+            hash.as_deref().map(super::body_io::object_scope)
+        };
         let mut options = OpenOptions::new();
         options.read(true);
         #[cfg(unix)]
@@ -737,6 +767,8 @@ impl PayloadCas {
         expected_size: u64,
         physical_key: &str,
     ) -> io::Result<()> {
+        #[cfg(test)]
+        let _body_scope = super::body_io::object_scope(expected_hash);
         let mut file = self.open_exact_owned_file(path)?;
         if file.metadata()?.len() != expected_size {
             return collision_or_corruption(physical_key);
@@ -1620,7 +1652,7 @@ mod hash_work_tests {
 #[cfg(test)]
 mod body_io_tests {
     use super::*;
-    use crate::asset_repository::body_io::{reset_body_io, take_body_io, BodyWork};
+    use crate::asset_repository::body_io::{register_object_purpose, reset_body_io, take_body_io, BodyPurpose, BodyWork};
 
     fn fixture(bytes: &[u8]) -> (tempfile::TempDir, PayloadCas, PreparedPayload) {
         let directory = tempfile::tempdir().unwrap();
@@ -1653,6 +1685,7 @@ mod body_io_tests {
         let body = b"synthetic body";
         let (_directory, cas, prepared) = fixture(body);
         reset_body_io();
+        register_object_purpose(&prepared.content_hash, BodyPurpose::Asset);
         assert_eq!(cas.read_object(&prepared.content_hash).unwrap().unwrap(), body);
         assert_eq!(cas.read_object_range(&prepared.content_hash, 2, 7).unwrap().unwrap(), &body[2..7]);
         let work = take_body_io();
@@ -1671,6 +1704,7 @@ mod body_io_tests {
         let (_directory, cas, _prepared) = fixture(b"synthetic body");
         let missing = cas.repository_root.join(object_physical_key(&"a".repeat(64)));
         reset_body_io();
+        register_object_purpose(&"a".repeat(64), BodyPurpose::Asset);
         assert!(cas.open_exact_owned_file(&missing).is_err());
         assert!(cas.read_object_range(&"a".repeat(64), 3, 2).is_err());
         let work = take_body_io();
@@ -1683,6 +1717,7 @@ mod body_io_tests {
     fn escaped_handles_mark_later_external_read_bytes_incomplete() {
         let (_directory, cas, prepared) = fixture(b"synthetic body");
         reset_body_io();
+        register_object_purpose(&prepared.content_hash, BodyPurpose::Asset);
         let mut file = cas.open_object(&prepared.content_hash).unwrap().unwrap();
         let mut bytes = Vec::new(); file.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, b"synthetic body");
@@ -1690,6 +1725,7 @@ mod body_io_tests {
         assert_eq!(work.domains["managed"], BodyWork { open_attempts: 1, opens: 1, escaped_handles: 1, ..Default::default() });
         assert!(!work.complete());
         reset_body_io();
+        register_object_purpose(&prepared.content_hash, BodyPurpose::Asset);
         let path = cas.object_path(&prepared.content_hash).unwrap().unwrap();
         assert_eq!(fs::read(path).unwrap(), b"synthetic body");
         let work = take_body_io();
@@ -1703,6 +1739,7 @@ mod body_io_tests {
         let (_directory, cas, prepared) = fixture(&bytes);
         let checks = std::cell::Cell::new(0);
         reset_body_io();
+        register_object_purpose(&prepared.content_hash, BodyPurpose::Asset);
         assert!(cas.holds_exact_object(&prepared.content_hash, bytes.len() as u64, &|| {
             let count = checks.get(); checks.set(count + 1); count > 0
         }).is_err());
@@ -1722,6 +1759,7 @@ mod body_io_tests {
         let caller = std::thread::current().id();
         let worker = std::thread::spawn(move || {
             reset_body_io();
+            register_object_purpose(&prepared.content_hash, BodyPurpose::Asset);
             cas.read_object(&prepared.content_hash).unwrap().unwrap();
             take_body_io()
         }).join().unwrap();
@@ -1733,5 +1771,91 @@ mod body_io_tests {
         assert_eq!(parent.thread, caller);
         assert!(parent.domains.is_empty());
         assert!(parent.complete());
+    }
+
+    #[test]
+    fn tracked_reads_classify_actual_objects_and_count_exact_bytes() {
+        let bytes = b"synthetic body";
+        let (_directory, cas, prepared) = fixture(bytes);
+        reset_body_io();
+        register_object_purpose(&prepared.content_hash, BodyPurpose::Control);
+        let mut reader = cas.open_object_tracked(&prepared.content_hash).unwrap().unwrap();
+        assert_eq!(reader.len().unwrap(), bytes.len() as u64);
+        reader.seek(SeekFrom::Start(2)).unwrap();
+        let mut part = [0; 5]; reader.read_exact(&mut part).unwrap();
+        assert_eq!(&part, &bytes[2..7]);
+        drop(reader);
+        let work = take_body_io();
+        assert!(work.complete());
+        assert_eq!(work.control_work(), BodyWork { open_attempts: 1, opens: 1, read_operations: 1, read_bytes: 5, ..Default::default() });
+        assert_eq!(work.asset_work(), BodyWork::default());
+        assert_eq!(work.unknown_work(), BodyWork::default());
+        assert_eq!(work.objects[&prepared.content_hash].work, work.domains["managed"]);
+    }
+
+    #[test]
+    fn tracked_unread_drop_and_full_read_are_observed_without_guessed_bytes() {
+        let bytes = b"synthetic body";
+        let (_directory, cas, prepared) = fixture(bytes);
+        reset_body_io(); register_object_purpose(&prepared.content_hash, BodyPurpose::Asset);
+        drop(cas.open_object_tracked(&prepared.content_hash).unwrap().unwrap());
+        let work = take_body_io(); assert!(work.complete());
+        assert_eq!(work.asset_work(), BodyWork { open_attempts: 1, opens: 1, ..Default::default() });
+        register_object_purpose(&prepared.content_hash, BodyPurpose::Asset);
+        let mut reader = cas.open_object_tracked(&prepared.content_hash).unwrap().unwrap();
+        let mut result = Vec::new(); reader.read_to_end(&mut result).unwrap(); drop(reader);
+        let work = take_body_io(); assert!(work.complete()); assert_eq!(result, bytes);
+        assert_eq!(work.asset_work().read_bytes, bytes.len() as u64);
+        assert!(work.asset_work().read_operations >= 2);
+        assert_eq!(work.asset_work().escaped_handles, 0);
+    }
+
+    #[test]
+    fn unknown_role_is_incomplete_and_mixed_roles_count_as_assets_across_roots() {
+        let (_directory, cas, prepared) = fixture(b"synthetic body");
+        let (_other_directory, other, other_prepared) = fixture(b"synthetic body");
+        assert_eq!(prepared.content_hash, other_prepared.content_hash);
+        reset_body_io(); drop(cas.open_object_tracked(&prepared.content_hash).unwrap());
+        let unknown = take_body_io(); assert!(!unknown.complete());
+        assert_eq!(unknown.unknown_work().opens, 1); assert_eq!(unknown.asset_work().opens, 0);
+        register_object_purpose(&prepared.content_hash, BodyPurpose::Control);
+        drop(cas.open_object_tracked(&prepared.content_hash).unwrap());
+        register_object_purpose(&prepared.content_hash, BodyPurpose::Asset);
+        drop(other.open_object_tracked(&prepared.content_hash).unwrap());
+        let mixed = take_body_io(); assert!(mixed.complete());
+        assert_eq!(mixed.asset_work().opens, 2); assert_eq!(mixed.control_work(), BodyWork::default());
+        assert_eq!(mixed.objects[&prepared.content_hash].purposes.len(), 2);
+    }
+
+    #[test]
+    fn live_reader_and_reset_boundary_fail_closed_without_erasing_old_scope() {
+        let (_directory, cas, prepared) = fixture(b"synthetic body");
+        reset_body_io(); register_object_purpose(&prepared.content_hash, BodyPurpose::Control);
+        let mut reader = cas.open_object_tracked(&prepared.content_hash).unwrap().unwrap();
+        let live = take_body_io(); assert!(!live.complete());
+        assert_eq!(live.control_work().outstanding_readers, 1);
+        let mut byte = [0]; assert_eq!(reader.read(&mut byte).unwrap(), 1); drop(reader);
+        let stale = take_body_io(); assert!(!stale.complete()); assert!(stale.scope_violations > 0);
+        assert_eq!(stale.asset_work().read_bytes, 0);
+        reset_body_io(); assert!(take_body_io().complete());
+        register_object_purpose(&prepared.content_hash, BodyPurpose::Control);
+        let reader = cas.open_object_tracked(&prepared.content_hash).unwrap().unwrap();
+        reset_body_io(); drop(reader); assert!(!take_body_io().complete());
+    }
+
+    #[test]
+    fn tracked_reader_cross_thread_use_invalidates_owner_and_worker_scopes() {
+        let (_directory, cas, prepared) = fixture(b"synthetic body");
+        reset_body_io(); register_object_purpose(&prepared.content_hash, BodyPurpose::Asset);
+        let mut reader = cas.open_object_tracked(&prepared.content_hash).unwrap().unwrap();
+        let worker = std::thread::spawn(move || {
+            reset_body_io(); let mut bytes = [0; 3]; reader.read_exact(&mut bytes).unwrap(); drop(reader);
+            take_body_io()
+        }).join().unwrap();
+        let owner = take_body_io();
+        assert!(!owner.complete()); assert!(!worker.complete());
+        assert_eq!(owner.asset_work().read_bytes, 3); assert_eq!(owner.asset_work().outstanding_readers, 0);
+        assert!(owner.scope_violations > 0); assert!(worker.scope_violations > 0);
+        assert_eq!(worker.asset_work().read_bytes, 0);
     }
 }
