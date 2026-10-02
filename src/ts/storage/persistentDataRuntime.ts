@@ -376,7 +376,7 @@ export interface PersistentDataRuntime {
     setActivatedLibraryRecoveryLifecycle(token: PersistentMutationToken, lifecycle: ActivatedLibraryRecoveryLifecycle): void
     refreshActivatedLibraryUnderPause(token: PersistentMutationToken): Promise<CommittedApplyOutcome>
     applyLwwReceive(request: LwwStageReceive): Promise<LwwApplyResult>
-    drainLwwDeferred(): Promise<void>
+    drainLwwDeferred(expectedAuthorityEpoch?: number): Promise<void>
     commitPersistentUnitIntent(reason: string, mutations: readonly PersistentUnitMutation[], conversations?: readonly ConversationMutation[], wholeMessages?: readonly WholeMessageIntent[]): Promise<void>
 
     readonly store: PersistentDataStore
@@ -998,26 +998,34 @@ export function createPersistentDataRuntime(
     const projectAppliedUnits = async (result: LwwApplyResult, baseline?: ReturnType<typeof captureLwwWorkingSetBaseline>, localIntent = false): Promise<void> => {
         const database = dependencies.state.captureWorkingSetDatabase?.()
         if (!database) { coordinator.adoptAppliedUnitState(result.revision, null, null, []); return }
-        baseline ??= captureLwwWorkingSetBaseline(database, coordinator.capturePersistentBaselineRoot(), dependencies.state.capturePresets?.() ?? null, coordinator.captureMaterializedBaseline())
+        baseline ??= captureLwwWorkingSetBaseline(database, coordinator.capturePersistentBaselineRoot(), dependencies.state.capturePresets?.() ?? null, coordinator.captureMaterializedBaseline(), coordinator.capturePresetRecordBaseline())
         const selectedTarget = workingSet.captureSelectedConversationTarget()
         const selectedSession = workingSet.activeConversationSession
+        const authorityEpoch = coordinator.storageAuthorityEpoch
         const lease = await dependencies.store.acquireRevision(result.revision)
+        const projectionBaseline = baseline
         let applied: ReturnType<typeof captureLwwWorkingSetBaseline>
-        try { applied = await applyLwwWorkingSetUnits(database, baseline, lease, result.affectedKeys, dependencies.state.captureCharacterIndex?.(), localIntent) }
-        finally { await releasePersistentRevisionLease(lease) }
-        const canonicalCapture = dependencies.state.canonicalCapture
-        const beforeDerive = canonicalCapture?.root() ?? canonicalJson(dependencies.state.captureRoot())
-        dependencies.state.afterRemoteApply?.()
-        const afterDerive = canonicalCapture?.root() ?? canonicalJson(dependencies.state.captureRoot())
-        const derivedMutations = beforeDerive === afterDerive ? [] : canonicalCapture
-            ? canonicalCapture.diffRoot(beforeDerive, afterDerive)
-            : diffRootMutations(JSON.parse(beforeDerive), JSON.parse(afterDerive))
-        for (const mutation of derivedMutations) {
-            const root = applied.root as unknown as Record<string, unknown>
-            if (mutation.type === 'set') root[mutation.key] = canonicalClone(mutation.value)
-            else delete root[mutation.key]
-        }
-        coordinator.adoptAppliedUnitState(result.revision, applied.root, applied.presets, applied.characters)
+        try {
+            applied = await applyLwwWorkingSetUnits(database, projectionBaseline, lease, result.affectedKeys, dependencies.state.captureCharacterIndex?.(), localIntent, () => {
+                coordinator.assertPersistentMutationAllowed(authorityEpoch)
+                if (dependencies.state.captureWorkingSetDatabase?.() !== database) throw new Error('Persistent working set changed during unit projection')
+                dependencies.state.beforeCapture?.()
+            }, () => {
+                const canonicalCapture = dependencies.state.canonicalCapture
+                const beforeDerive = canonicalCapture?.root() ?? canonicalJson(dependencies.state.captureRoot())
+                dependencies.state.afterRemoteApply?.()
+                const afterDerive = canonicalCapture?.root() ?? canonicalJson(dependencies.state.captureRoot())
+                const derivedMutations = beforeDerive === afterDerive ? [] : canonicalCapture
+                    ? canonicalCapture.diffRoot(beforeDerive, afterDerive)
+                    : diffRootMutations(JSON.parse(beforeDerive), JSON.parse(afterDerive))
+                for (const mutation of derivedMutations) {
+                    const root = projectionBaseline.root as unknown as Record<string, unknown>
+                    if (mutation.type === 'set') root[mutation.key] = canonicalClone(mutation.value)
+                    else delete root[mutation.key]
+                }
+            })
+        } finally { await releasePersistentRevisionLease(lease) }
+        coordinator.adoptAppliedUnitState(result.revision, applied.root, applied.presets, applied.characters, applied.presetRecords)
         if (selectedTarget && selectedSession) workingSet.refreshSelectedConversationAfterReplacement(selectedTarget, selectedSession)
         for (const key of result.affectedKeys) {
             const [kind, owner, name] = JSON.parse(key)
@@ -1028,19 +1036,20 @@ export function createPersistentDataRuntime(
         }
         await commitContentCursor(result.revision)
     }
-    const drainLwwDeferred = async (): Promise<void> => {
+    const drainLwwDeferred = async (authorityEpoch = coordinator.storageAuthorityEpoch): Promise<void> => {
+        coordinator.assertPersistentMutationAllowed(authorityEpoch)
         if (!dependencies.store.lwwBindingState || !dependencies.store.lwwDrainDeferred) return
-        const authorityEpoch = coordinator.storageAuthorityEpoch
         await coordinator.withPausedPersistentWrites('generation-deferred-drain', async () => {
             coordinator.assertPersistentMutationAllowed(authorityEpoch)
             const binding = await dependencies.store.lwwBindingState!()
             coordinator.assertPersistentMutationAllowed(authorityEpoch)
             const database = dependencies.state.captureWorkingSetDatabase?.()
-            const baseline = database ? captureLwwWorkingSetBaseline(database, dependencies.state.captureRoot(), dependencies.state.capturePresets?.() ?? null, coordinator.captureMaterializedBaseline()) : undefined
+            const baseline = database ? captureLwwWorkingSetBaseline(database, dependencies.state.captureRoot(), dependencies.state.capturePresets?.() ?? null, coordinator.captureMaterializedBaseline(), coordinator.capturePresetRecordBaseline()) : undefined
             const result = await dependencies.store.lwwDrainDeferred!({ bindingAuthority: binding.targetAuthority, requestId: crypto.randomUUID(), generating: generating() })
             try {
                 coordinator.assertPersistentMutationAllowed(authorityEpoch)
                 await projectAppliedUnits(result, baseline)
+                coordinator.assertPersistentMutationAllowed(authorityEpoch)
             } catch (error) {
                 coordinator.markCommittedWorkingSetRefreshRequired(result.revision, error)
                 throw error
@@ -1100,7 +1109,7 @@ export function createPersistentDataRuntime(
                 const store = dependencies.store
                 if (!store.lwwStageReceive || !store.lwwApplyReceive || !store.lwwFinishReceive) throw new Error('LWW receive is unavailable')
                 const database = dependencies.state.captureWorkingSetDatabase?.()
-                const baseline = database ? captureLwwWorkingSetBaseline(database, dependencies.state.captureRoot(), dependencies.state.capturePresets?.() ?? null, coordinator.captureMaterializedBaseline()) : undefined
+                const baseline = database ? captureLwwWorkingSetBaseline(database, dependencies.state.captureRoot(), dependencies.state.capturePresets?.() ?? null, coordinator.captureMaterializedBaseline(), coordinator.capturePresetRecordBaseline()) : undefined
                 await store.lwwStageReceive(staged)
                 const header = { bindingAuthority: staged.bindingAuthority, requestId: staged.requestId }
                 const result = await store.lwwApplyReceive({ ...header, generating: generating() })
@@ -1205,7 +1214,7 @@ export function createPersistentDataRuntime(
             coordinator.assertPersistentMutationAllowed(expectedAuthorityEpoch)
             await coordinator.flushPendingDataLocally('generation-completion')
             coordinator.assertPersistentMutationAllowed(expectedAuthorityEpoch)
-            await drainLwwDeferred()
+            await drainLwwDeferred(expectedAuthorityEpoch)
         },
         commitCharacterAddition: (request, reason) =>
             coordinator.commitCharacterAddition(request, reason),
