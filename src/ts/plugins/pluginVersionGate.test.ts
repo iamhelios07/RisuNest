@@ -143,6 +143,24 @@ describe('plugin list database mutation policy', () => {
     function access() {
         return createPluginDatabaseAccess({
             owner: 'caller',
+            getPersistentRevision:()=>1,
+            commitPersistentUnitIntent:async (_reason:string,units:readonly import('./pluginUnitIntents').PluginUnitMutation[])=>{
+                let order: string[] | undefined
+                for(const unit of units){
+                    const key=JSON.parse(unit.key)
+                    if(key[0]==='order'&&key[1]==='plugins'){if(unit.type==='set')order=unit.value as string[];continue}
+                    if(key[0]!=='record'||key[1]!=='plugins')throw new Error(`Unexpected plugin list unit ${unit.key}`)
+                    const plugins=getDatabase().plugins
+                    const index=plugins.findIndex(plugin=>plugin.name===key[2])
+                    if(unit.type==='delete'){if(index>=0)plugins.splice(index,1)}
+                    else if(index>=0)plugins[index]=structuredClone(unit.value) as RisuPlugin
+                    else plugins.push(structuredClone(unit.value) as RisuPlugin)
+                }
+                if(order){
+                    const current=getDatabase().plugins
+                    getDatabase().plugins=[...order.flatMap(name=>{const plugin=current.find(value=>value.name===name);return plugin?[plugin]:[]}),...current.filter(plugin=>!order!.includes(plugin.name))]
+                }
+            },
             getCompatibilityDatabase: getDatabase,
             assertPersistentMutationAllowed: () => undefined,
             getStorageAuthorityEpoch: () => 0,
@@ -152,7 +170,7 @@ describe('plugin list database mutation policy', () => {
             mutatePluginStorage: async () => undefined,
             flushPendingData: async () => undefined,
             prepareAuthoritativeDatabaseUpdate: async (value: Record<string, unknown>) => ({
-                ...value, plugins: await handlePluginInstallViaPlugin(value.plugins as RisuPlugin[]),
+                ...value, ...(value.plugins ? { plugins: await handlePluginInstallViaPlugin(value.plugins as RisuPlugin[]) } : {}),
             }),
         } as any)
     }
