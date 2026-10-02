@@ -104,6 +104,7 @@ pub struct BackupPointDocument {
     pub repository_id: String,
     pub point_id: String,
     pub kind: BackupPointKind,
+    #[serde(with = "crate::control_integer")]
     pub created_at_ms: u64,
     pub bundle: StoredObject,
 }
@@ -207,6 +208,7 @@ pub struct BackupBundleDocument {
     pub repository_id: String,
     pub bundle_id: String,
     pub source: BundleSource,
+    #[serde(with = "crate::control_integer")]
     pub captured_at_ms: u64,
     pub local_library_revision: Option<Sequence>,
     pub local_device_revision: Option<Sequence>,
@@ -305,8 +307,10 @@ impl BackupBundleDocument {
 pub struct InventoryEntry {
     pub object_id: String,
     pub role: ObjectRole,
+    #[serde(with = "crate::control_integer")]
     pub ciphertext_length: u64,
     pub ciphertext_sha256: [u8; 32],
+    #[serde(with = "crate::control_integer")]
     pub plaintext_length: u64,
     pub plaintext_sha256: [u8; 32],
 }
@@ -444,8 +448,11 @@ pub struct LeaseDocument {
     pub writer_id: String,
     pub job_id: String,
     pub kind: LeaseKind,
+    #[serde(with = "crate::control_integer")]
     pub seq: u64,
+    #[serde(with = "crate::control_integer")]
     pub created_at_ms: u64,
+    #[serde(with = "crate::control_integer")]
     pub expires_at_ms: u64,
 }
 
@@ -669,7 +676,7 @@ mod tests {
             .unwrap();
         let encoded = lease.encode(4096).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
-        assert_eq!(value["expiresAtMs"], 42 + 60 * 60_000u64);
+        assert_eq!(value["expiresAtMs"], (42 + 60 * 60_000u64).to_string());
         assert_eq!(value["schema"], LEASE_SCHEMA);
         assert_eq!(LeaseDocument::decode(&encoded, 4096).unwrap(), lease);
     }
@@ -682,7 +689,8 @@ mod tests {
         let lease = LeaseDocument::new("writer".into(), "job".into(), LeaseKind::Work, 0, 0)
             .unwrap();
         let encoded = String::from_utf8(lease.encode(4096).unwrap()).unwrap();
-        let without_expiry = encoded.replace(",\"expiresAtMs\":3600000", "");
+        let without_expiry = encoded.replace(",\"expiresAtMs\":\"3600000\"", "");
+        assert_ne!(without_expiry, encoded);
         assert!(LeaseDocument::decode(without_expiry.as_bytes(), 4096).is_err());
     }
 

@@ -80,6 +80,7 @@ pub struct PublicObjectHeader {
     pub repository_id: String,
     pub object_id: String,
     pub role: ObjectRole,
+    #[serde(with = "crate::control_integer")]
     pub plaintext_length: u64,
 }
 
@@ -156,8 +157,10 @@ impl WireLocator {
 pub struct StoredObject {
     pub header: PublicObjectHeader,
     pub locator: WireLocator,
+    #[serde(with = "crate::control_integer")]
     pub ciphertext_length: u64,
     pub ciphertext_sha256: [u8; 32],
+    #[serde(with = "crate::control_integer")]
     pub plaintext_length: u64,
     pub plaintext_sha256: [u8; 32],
 }
@@ -264,8 +267,11 @@ pub enum CatalogEntryKind {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StoredChunk {
     pub pack_id: String,
+    #[serde(with = "crate::control_integer")]
     pub offset: u64,
+    #[serde(with = "crate::control_integer")]
     pub stored_length: u64,
+    #[serde(with = "crate::control_integer")]
     pub plaintext_length: u64,
     pub plaintext_sha256: [u8; 32],
 }
@@ -276,8 +282,11 @@ pub struct CatalogEntryFragment {
     pub kind: CatalogEntryKind,
     pub key: String,
     pub content_sha256: [u8; 32],
+    #[serde(with = "crate::control_integer")]
     pub byte_length: u64,
+    #[serde(with = "crate::control_integer")]
     pub fragment_index: u32,
+    #[serde(with = "crate::control_integer")]
     pub fragment_count: u32,
     pub chunks: Vec<StoredChunk>,
 }
@@ -295,6 +304,7 @@ pub struct CatalogChild {
 pub struct CatalogDocument {
     pub schema: String,
     pub kind: CatalogKind,
+    #[serde(with = "crate::control_integer")]
     pub level: u16,
     pub first_key: String,
     pub last_key: String,
@@ -608,6 +618,7 @@ pub struct SyncStateDocument {
     pub generation: Sequence,
     pub parent_state_id: Option<String>,
     pub author_writer_id: String,
+    #[serde(with = "crate::control_integer")]
     pub created_at_ms: u64,
     pub library: LibrarySnapshotRef,
     pub sections: BTreeMap<String, SectionSnapshotRef>,
