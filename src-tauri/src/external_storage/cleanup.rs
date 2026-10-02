@@ -874,7 +874,7 @@ impl<'a> LwwRepositoryView<'a> {
         let object=RemoteObject{repository_id:self.engine.repository.repository_id.clone(),object_id:name.into(),role:ObjectRole::Segment,
             receipt:receipt.clone(),ciphertext_sha256:hash.into(),plaintext_length:plaintext.len() as u64,
             plaintext_sha256:super::lww_segment::digest(&plaintext)};
-        let mut references=document.asset_catalogs.iter().map(|object|RemoteObject::from_stored(object,&self.engine.repository)).collect::<Result<Vec<_>>>()?;
+        let mut references=document.asset_catalogs.iter().chain(&document.data_catalogs).map(|object|RemoteObject::from_stored(object,&self.engine.repository)).collect::<Result<Vec<_>>>()?;
         for (hash,body) in &document.large_bodies {references.push(self.standalone(hash,body)?);}
         Ok((object,DocumentNode{snapshot_id:name.into(),parent_snapshot_id:None,references}))
     }
