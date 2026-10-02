@@ -74,7 +74,7 @@ fn catalog_columns(db: &Connection, table: &str) -> StoreResult<Vec<String>> {
     Ok(names.into_iter().filter(|name| name != "generation").collect())
 }
 
-fn catalog_digest(db: &Connection, staging_id: &str) -> StoreResult<String> {
+pub(in crate::persistent_store) fn catalog_digest(db: &Connection, staging_id: &str) -> StoreResult<String> {
     let mut writer = HashWriter(Sha256::new(), #[cfg(test)] "binding_catalog_proof");
     #[cfg(test)]
     crate::persistent_store::hash_work::begin("binding_catalog_proof");

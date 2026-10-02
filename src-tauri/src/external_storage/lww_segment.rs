@@ -114,6 +114,8 @@ pub(crate) struct Segment {
     pub changes: Vec<Change>,
     pub message_pages: BTreeMap<String, String>,
     #[serde(with = "super::lww_checkpoint::nested_metadata")]
+    pub data_catalogs: Vec<StoredObject>,
+    #[serde(with = "super::lww_checkpoint::nested_metadata")]
     pub asset_catalogs: Vec<StoredObject>,
     pub large_bodies: BTreeMap<String, LargeBody>,
 }
@@ -126,6 +128,7 @@ impl Segment {
             seq: DecimalU64(seq),
             changes: Vec::new(),
             message_pages: BTreeMap::new(),
+            data_catalogs: Vec::new(),
             asset_catalogs: Vec::new(),
             large_bodies: BTreeMap::new(),
         }
@@ -158,7 +161,7 @@ impl Segment {
         }
         let mut catalogs = BTreeSet::new();
         let mut repository = None;
-        for catalog in &self.asset_catalogs {
+        for catalog in self.data_catalogs.iter().chain(&self.asset_catalogs) {
             catalog.validate().map_err(|_| corrupt())?;
             if catalog.header.role != WireRole::Catalog
                 || !catalogs.insert(&catalog.header.object_id)
@@ -210,9 +213,15 @@ fn binding(library: &str, writer: &str, seq: u64, role: &str) -> Result<Vec<u8>>
     }))
     .map_err(|_| corrupt())
 }
+pub(crate) fn sealed_length(plaintext_length: usize) -> Result<u64> {
+    let length = risunest_external_storage_format::crypto::ciphertext_length(plaintext_length as u64)
+        .map_err(|_| corrupt())?;
+    if length > SEGMENT_BYTES as u64 { return Err(ProviderError::new(super::contract::ErrorKind::FileTooLarge)); }
+    Ok(length)
+}
 pub(crate) fn seal(segment: &Segment, root_key: &[u8; 32]) -> Result<(Vec<u8>, String)> {
     let plaintext = segment.encode()?;
-    if plaintext.len() > SEGMENT_BYTES { return Err(ProviderError::new(super::contract::ErrorKind::FileTooLarge)); }
+    let expected_length = sealed_length(plaintext.len())?;
     let hash = digest(&plaintext);
     let key = derive_key(root_key, &segment.library_id, "metadata").map_err(|_| corrupt())?;
     let mut sealed = Vec::new();
@@ -229,6 +238,7 @@ pub(crate) fn seal(segment: &Segment, root_key: &[u8; 32]) -> Result<(Vec<u8>, S
         plaintext.len() as u64,
     )
     .map_err(|_| corrupt())?;
+    if sealed.len() as u64 != expected_length { return Err(corrupt()); }
     Ok((sealed, hash))
 }
 pub(crate) fn open(
@@ -238,6 +248,7 @@ pub(crate) fn open(
     seq: u64,
     root_key: &[u8; 32],
 ) -> Result<Segment> {
+    if bytes.len() > SEGMENT_BYTES { return Err(corrupt()); }
     let key = derive_key(root_key, library, "metadata").map_err(|_| corrupt())?;
     let mut plain = Vec::new();
     decrypt(

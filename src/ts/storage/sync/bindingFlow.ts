@@ -73,6 +73,7 @@ export interface BindingRecoveryRegistration {
 }
 export interface SyncBindingDependencies {
     native: SyncBindingNative
+    resolveTransport?(target: Exclude<BindingTarget, { kind: 'none' }>): SyncBindingTransport | undefined
     gate: StorageMutationGate
     plugins: BindingPluginLifecycle
     withPausedWrites<T>(operation: () => Promise<T>): Promise<T>
@@ -95,11 +96,25 @@ function bindingContext(state: SyncBindingState, signal: AbortSignal, mode?: Syn
 
 export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
     let running = false
-    let active: { transport: SyncBindingTransport; context: BindingContext; controller: AbortController } | undefined
+    let active: { transport: SyncBindingTransport; context: BindingContext; controller: AbortController; resumed: boolean } | undefined
     const check = async (context: BindingContext) => {
         context.signal.throwIfAborted()
         await dependencies.native.assertAuthority(context.state)
         context.signal.throwIfAborted()
+    }
+    const adoptPersisted = async (state: SyncBindingState) => {
+        if (active && dependencies.resolveTransport && (active.context.state.targetAuthority !== state.targetAuthority ||
+            active.context.state.selectionEpoch !== state.selectionEpoch || active.context.state.libraryId !== state.libraryId || !sameTarget(active.context.state.target, state.target))) {
+            active.controller.abort()
+            await active.transport.fenceOldJobs(active.context)
+            active = undefined
+        }
+        if (active || state.target.kind === 'none' || !dependencies.resolveTransport) return active
+        const transport = dependencies.resolveTransport(state.target)
+        if (!transport) throw new Error('Sync binding transport is unavailable')
+        const controller = new AbortController()
+        active = { transport, context: bindingContext(state, controller.signal), controller, resumed: false }
+        return active
     }
     const fenceOld = async (transport: SyncBindingTransport, context: BindingContext) => {
         if (active) {
@@ -114,12 +129,42 @@ export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
         const controller = new AbortController()
         active = { ...active, controller, context: bindingContext(active.context.state, controller.signal) }
         await active.transport.resumeBinding(bindingContext(active.context.state, controller.signal, mode))
+        active.resumed = true
     }
     const registerFailure = (error: unknown, resume: () => Promise<void>) => {
         try { dependencies.recovery?.registerFailure(error, resume) }
         catch (registrationError) { throw new AggregateError([error, registrationError], 'Sync binding recovery registration failed') }
     }
     return {
+        async resumeCurrent(expectedTarget: BindingTarget): Promise<void> {
+            if (running) throw new Error('A sync binding change is already running')
+            running = true
+            try {
+                const state = await dependencies.native.state()
+                if (!sameTarget(state.target, expectedTarget)) throw new Error('Sync binding changed')
+                if (active?.resumed && !active.context.signal.aborted && active.context.state.targetAuthority === state.targetAuthority &&
+                    active.context.state.selectionEpoch === state.selectionEpoch && active.context.state.libraryId === state.libraryId && sameTarget(active.context.state.target, state.target)) return
+                if (active) {
+                    active.controller.abort()
+                    await active.transport.fenceOldJobs(active.context)
+                    active = undefined
+                }
+                const current = await adoptPersisted(state)
+                if (current) {
+                    try {
+                        await check(current.context)
+                        await current.transport.resumeBinding(current.context)
+                        await check(current.context)
+                        current.resumed = true
+                    } catch (error) {
+                        current.controller.abort()
+                        try { await current.transport.fenceOldJobs(current.context) }
+                        catch (fenceError) { throw new AggregateError([error, fenceError], 'Sync binding startup failed while fencing jobs') }
+                        throw error
+                    }
+                }
+            } finally { running = false }
+        },
         async bind(target: Exclude<BindingTarget, { kind: 'none' }>, transport: SyncBindingTransport, options: SyncBindingOptions = {}): Promise<BindingOutcome> {
             if (running) throw new Error('A sync binding change is already running')
             target = structuredClone(target)
@@ -140,6 +185,7 @@ export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
             let resumeActivated: (() => Promise<void>) | undefined
             try {
                 const state = await dependencies.native.state()
+                await adoptPersisted(state)
                 originalState = state
                 const context = bindingContext(state, controller.signal, mode)
                 const inspected = structuredClone(await transport.inspectTarget(context))
@@ -202,7 +248,7 @@ export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
                         await transport.resumeBinding(activatedContext)
                     }
                     await check(activatedContext)
-                    active = { transport, context: bindingContext(activatedContext.state, controller.signal), controller }
+                    active = { transport, context: bindingContext(activatedContext.state, controller.signal), controller, resumed: true }
                     jobsFenced = false
                 }
                 const result: BindingOutcome = await dependencies.withPausedWrites(async () => {
@@ -290,6 +336,7 @@ export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
             running = true
             try {
                 const state = await dependencies.native.state()
+                await adoptPersisted(state)
                 if (active) {
                     active.controller.abort()
                     await active.transport.fenceOldJobs(bindingContext(active.context.state, active.context.signal))

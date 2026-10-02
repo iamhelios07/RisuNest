@@ -240,7 +240,7 @@ fn uncertain_target_activation_replays_device_intent_without_replacing_later_edi
     let source=sorted_source(&incoming).unwrap().into_iter().cloned().collect::<Vec<_>>();
     let intent=super::super::Intent::Target{staging_id:stage.staging_id.clone(),changes:source.clone()};
     let (stamp,digest)=store.reserve_intent(&activation,&intent).unwrap();
-    let result=commit::replace_commit_lww(&mut store.connection,&stage.staging_id,&activation,&stamp,&digest,&[],true,&source,None,None).unwrap();
+    let result=commit::replace_commit_lww(&mut store.connection,&stage.staging_id,&activation,&stamp,&digest,&[],true,&source,None,None,None).unwrap();
     drop(store); let mut store=PersistentStore::open(dir.path()).unwrap();
     assert_eq!(store.revision().unwrap(),result.revision);
     assert_eq!(store.connection.query_row("SELECT count(*) FROM lww_receive_rows WHERE status='held'",[],|r|r.get::<_,i64>(0)).unwrap(),1);

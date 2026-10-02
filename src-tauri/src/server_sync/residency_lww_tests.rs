@@ -168,7 +168,7 @@ fn selected_archived_owner_hydration_requires_only_the_existing_full_inventory()
     let local_archive=&local_roots[0];
     assert!(selected.contains(&shared)); assert_ne!(local_archive,&shared);
     let inventory=store.residency_inventory_classification_test(false).unwrap();
-    assert!(inventory.0.contains(local_archive)); assert!(!inventory.0.contains(&shared));
+    for hash in [local_archive,&shared,&asset,&manifest.content_hash] {assert!(inventory.0.contains(hash));}
     assert!(!selected.contains(&descriptor.object_hash));
     assert!(cas.stat_object(&descriptor.object_hash).unwrap().is_none());
     store.asset_residency_set_policy(super::residency::AssetPolicy::Remote,||Ok(())).unwrap();
@@ -176,13 +176,13 @@ fn selected_archived_owner_hydration_requires_only_the_existing_full_inventory()
     assert!(cas.stat_object(&asset).unwrap().is_none()); assert!(cas.stat_object(local_archive).unwrap().is_none());
     assert!(cas.stat_object(&manifest.content_hash).unwrap().is_some());
     let collected=store.asset_gc_delete_page(64,None,10_000,0).unwrap();
-    assert!(collected.report.deleted_hashes.contains(&shared));
+    assert!(!collected.report.deleted_hashes.contains(&shared));
     assert!(cas.stat_object(&shared).unwrap().is_none());
-    assert!(Residency::open(store.repository_root()).unwrap().object(&shared,None).unwrap().is_none());
+    assert!(Residency::open(store.repository_root()).unwrap().object(&shared,None).unwrap().is_some());
     store.asset_residency_set_policy_prioritized(super::residency::AssetPolicy::Full,None,Some("selected-owner-archive"),||Ok(())).unwrap();
     assert!(cas.stat_object(&asset).unwrap().is_some()); assert!(cas.stat_object(local_archive).unwrap().is_some());
     assert!(cas.stat_object(&manifest.content_hash).unwrap().is_some());
-    assert!(cas.stat_object(&shared).unwrap().is_none());
+    assert!(cas.stat_object(&shared).unwrap().is_some());
     assert_eq!(store.read_asset_owner_head(&head.owner,None).unwrap().unwrap().value,head);
 }
 
@@ -438,7 +438,7 @@ fn residency_classification_preserves_live_plugin_snapshot_and_durable_job_roots
         baseline,
         store.residency_inventory_classification_test(true).unwrap()
     );
-    assert!(baseline.2);
+    assert!(!baseline.2);
     for hash in [&live, &plugin, &pinned] {
         assert!(baseline.0.contains(hash));
     }
@@ -561,8 +561,10 @@ fn a_plugin_root_added_after_first_release_page_keeps_every_later_custody_proof(
         .unwrap();
     *trace.target.lock().unwrap() = Some((store.repository_root().to_path_buf(), target));
     trace.armed.store(true, Ordering::SeqCst);
+    let revision = store.revision().unwrap();
     store.asset_residency_release_unused(|| Ok(())).unwrap();
     assert!(!trace.armed.load(Ordering::SeqCst));
+    assert_eq!(store.revision().unwrap(), revision + 1);
     let requests = trace.requests.lock().unwrap();
     assert_eq!(requests.iter().map(Vec::len).collect::<Vec<_>>(), vec![128]);
     let residency = Residency::open(store.repository_root()).unwrap();

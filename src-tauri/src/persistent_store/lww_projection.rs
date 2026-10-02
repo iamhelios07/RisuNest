@@ -331,6 +331,7 @@ pub(in crate::persistent_store) fn capture_targets(
     input: &WorkingSetCommit,
     aliases: &[super::super::AssetAlias],
     before: bool,
+    conversation_orders: &BTreeSet<String>,
 ) -> StoreResult<BTreeMap<UnitKey, UnitValue>> {
     let mut out = BTreeMap::new();
     if input.root.is_some() {
@@ -403,28 +404,29 @@ pub(in crate::persistent_store) fn capture_targets(
                 before,
                 &mut out,
             )?,
-            super::super::ConversationMutation::Reorder { character_id, .. } => {
-                let ids: Vec<String> = {
-                    let mut s=db.prepare("SELECT conversation_id FROM conversations WHERE generation=?1 AND character_id=?2 ORDER BY configured_index,conversation_id")?;
-                    let v = s
-                        .query_map(params![generation, character_id], |r| r.get(0))?
-                        .collect::<Result<_, _>>()?;
-                    v
-                };
-                let folders = text_value(
-                    db,
-                    "SELECT detail FROM characters WHERE generation=?1 AND character_id=?2",
-                    params![generation, character_id],
-                )?
-                .and_then(|v| v.get("chatFolders").cloned())
-                .unwrap_or(json!([]));
-                add(
-                    &mut out,
-                    &["order", "conversations", character_id],
-                    &json!({"ids":ids,"folders":folders}),
-                )?;
-            }
+            super::super::ConversationMutation::Reorder { .. } => {}
         }
+    }
+    for character_id in conversation_orders {
+        let ids: Vec<String> = {
+            let mut s=db.prepare("SELECT conversation_id FROM conversations WHERE generation=?1 AND character_id=?2 ORDER BY configured_index,conversation_id")?;
+            let v = s
+                .query_map(params![generation, character_id], |r| r.get(0))?
+                .collect::<Result<_, _>>()?;
+            v
+        };
+        let folders = text_value(
+            db,
+            "SELECT detail FROM characters WHERE generation=?1 AND character_id=?2",
+            params![generation, character_id],
+        )?
+        .and_then(|v| v.get("chatFolders").cloned())
+        .unwrap_or(json!([]));
+        add(
+            &mut out,
+            &["order", "conversations", character_id],
+            &json!({"ids":ids,"folders":folders}),
+        )?;
     }
     for loc in input.messages_changed.iter().flatten() {
         capture_conversation(
@@ -960,7 +962,7 @@ fn apply_value(
         "conversation" => {
             let mut v=text_value(tx,"SELECT detail FROM conversations WHERE generation=?1 AND character_id=?2 AND conversation_id=?3",params![generation,p[1],p[2]])?.ok_or_else(||error("parent-missing"))?;
             patch(&mut v, &p[3], next)?;
-            tx.execute("UPDATE conversations SET detail=?4,name=?5,recent_at=?6 WHERE generation=?1 AND character_id=?2 AND conversation_id=?3",params![generation,p[1],p[2],serde_json::to_string(&v)?,v.get("name").and_then(Value::as_str).unwrap_or_default(),v.get("lastDate").and_then(Value::as_i64).unwrap_or_default()])?;
+            tx.execute("UPDATE conversations SET detail=?4,name=?5,recent_at=CASE WHEN ?7='lastDate' THEN ?6 ELSE recent_at END WHERE generation=?1 AND character_id=?2 AND conversation_id=?3",params![generation,p[1],p[2],serde_json::to_string(&v)?,v.get("name").and_then(Value::as_str).unwrap_or_default(),v.get("lastDate").and_then(Value::as_i64).unwrap_or_default(),p[3]])?;
         }
         "preset" => {
             let mut v = text_value(
@@ -1339,8 +1341,22 @@ pub(in crate::persistent_store) fn refresh_orders(
                 &live,
                 &BTreeSet::new(),
             );
-            for (index, id) in ids.iter().enumerate() {
-                tx.execute("UPDATE plugin_storage SET ordinal=?4 WHERE generation=?1 AND owner=?2 AND storage_key=?3",params![generation,p[2],id,index as i64])?;
+            let positions: Vec<i64> = {
+                let mut q = tx.prepare(
+                    "SELECT ordinal FROM plugin_storage WHERE generation=?1 AND owner=?2 ORDER BY ordinal,storage_key",
+                )?;
+                let rows = q
+                    .query_map(params![generation, p[2]], |r| r.get(0))?
+                    .collect::<Result<_, _>>()?;
+                rows
+            };
+            if positions.len() != ids.len() {
+                return Err(error("plugin-order-projection-mismatch"));
+            }
+            // Owner-local reordering must retain the positions of other owners
+            // in the flattened upstream object.
+            for (id, position) in ids.iter().zip(positions) {
+                tx.execute("UPDATE plugin_storage SET ordinal=?4 WHERE generation=?1 AND owner=?2 AND storage_key=?3 AND ordinal<>?4",params![generation,p[2],id,position])?;
             }
             continue;
         }
@@ -1439,13 +1455,13 @@ pub(in crate::persistent_store) fn refresh_orders(
         for (i, id) in ids.iter().enumerate() {
             match p[1].as_str() {
                 "characters" => {
-                    tx.execute("UPDATE characters SET configured_index=?3 WHERE generation=?1 AND character_id=?2",params![generation,id,i as i64])?;
+                    tx.execute("UPDATE characters SET configured_index=?3 WHERE generation=?1 AND character_id=?2 AND configured_index<>?3",params![generation,id,i as i64])?;
                 }
                 "conversations" => {
-                    tx.execute("UPDATE conversations SET configured_index=?4 WHERE generation=?1 AND character_id=?2 AND conversation_id=?3",params![generation,p[2],id,i as i64])?;
+                    tx.execute("UPDATE conversations SET configured_index=?4 WHERE generation=?1 AND character_id=?2 AND conversation_id=?3 AND configured_index<>?4",params![generation,p[2],id,i as i64])?;
                 }
                 "presets" => {
-                    tx.execute("UPDATE bot_presets SET configured_index=?3 WHERE generation=?1 AND preset_id=?2",params![generation,id,i as i64])?;
+                    tx.execute("UPDATE bot_presets SET configured_index=?3 WHERE generation=?1 AND preset_id=?2 AND configured_index<>?3",params![generation,id,i as i64])?;
                 }
                 _ => {}
             }

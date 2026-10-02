@@ -7,6 +7,42 @@ vi.mock('./sync/bindingRegistry', () => ({prepareBoundLibraryReplacement: async 
 vi.mock('../plugins/apiV3/v3.svelte', () => ({fencePluginExecutionForAuthorityReplacement:async()=>{},invalidatePluginCachesAfterAuthorityReplacement:async()=>{},restartPluginsAfterAuthorityReplacement:async()=>{}}))
 beforeEach(() => { restoreAlerts.checkbox.mockReset().mockResolvedValue({confirmed:true,checked:true}) })
 
+it.each(['portable', 'block'] as const)('holds the write pause until the actual %s capture, then permits writes during export', async format => {
+    let paused = false
+    let releaseCapture!: () => void
+    let releaseBodies!: () => void
+    const capture = new Promise<void>(resolve => {releaseCapture = resolve})
+    const bodies = new Promise<void>(resolve => {releaseBodies = resolve})
+    let waits = 0
+    let polls = 0
+    const runtime = {...restoreRuntime(5, {acquire: () => {paused = true}, release: () => {paused = false}}), revision: 5, flushPendingData: async () => {throw new Error('A write pause already flushes')}}
+    const result = {revision:5,sourceBytes:12,sourceFingerprintKind:'whole-file-sha256' as const,sourceSha256:'a'.repeat(64),characterCount:1,presetCount:0,warningCodes:[]}
+    const dependencies = {
+        isTauri: () => true,
+        invoke: async (command: string) => {
+            if (command === 'native_file_job_start') {expect(paused).toBe(true); return {jobId:'captured-export'}}
+            if (command === 'native_file_job_status') {
+                const index = polls++
+                return {jobId:'captured-export',kind:format === 'portable' ? 'export-portable-backup' : 'export-block-risu-save',state:index === 2 ? 'succeeded' : 'running',phase:index === 2 ? 'complete' : 'writing-export',progress:{completedBytes:0,completedItems:0},...(index > 0 ? {exportCaptureRevision:5} : {}),...(index === 2 ? {result} : {})}
+            }
+            if (command === 'native_file_job_forget') return true
+            throw new Error(command)
+        },
+        wait: async () => {if (waits++ === 0) await capture; else await bodies},
+        copyToAndroidSaf: async () => {throw new Error('Desktop fixture')},
+    }
+    const operation = format === 'portable'
+        ? runNativeArchiveExport(runtime, {type:'desktopPath',path:'C:\\synthetic\\capture.risunest'}, {library:true,deviceSections:['hypa','local-plugins','local-settings']}, {}, dependencies)
+        : runNativeBlockRisuSaveExport(runtime, 'C:\\synthetic\\capture.risudat', {}, dependencies)
+    await vi.waitFor(() => expect(waits).toBe(1))
+    expect(paused).toBe(true)
+    releaseCapture()
+    await vi.waitFor(() => expect(paused).toBe(false))
+    expect(polls).toBe(2)
+    releaseBodies()
+    await expect(operation).resolves.toEqual(result)
+})
+
 describe('local source preservation consent', () => {
     it.each(['accept', 'refuse', 'cancel'] as const)('requires explicit %s before retrying damaged source export', async (decision) => {
         const requests: Record<string, unknown>[] = []
@@ -29,7 +65,7 @@ describe('local source preservation consent', () => {
                     if (command === 'native_file_job_start') { requests.push(args!.request as Record<string, unknown>); return { jobId: `synthetic-${requests.length}` } }
                     if (command === 'native_file_job_status') return requests.length === 1
                         ? { ...status('failed'), error: { code: 'source-preservation-confirmation-required', message: 'synthetic source requires preservation' } }
-                        : status('succeeded', result)
+                        : {...status('succeeded', result), exportCaptureRevision: 4}
                     if (command === 'native_portable_confirm_restore_adoption') return undefined
                 if (command === 'native_file_job_forget') return true
                     throw new Error(`Unexpected command: ${command}`)
@@ -62,7 +98,7 @@ describe('local source preservation consent', () => {
                 wait: async () => {},
                 invoke: async (command) => {
                     if (command === 'native_file_job_start') return { jobId: 'synthetic' }
-                    if (command === 'native_file_job_status') return status('succeeded', { revision: 4, sourceBytes: 12, sourceFingerprintKind: 'whole-file-sha256' as const, sourceSha256: 'a'.repeat(64), characterCount: 1, presetCount: 1, warningCodes: [], handoffPath: 'C:\\synthetic\\handoff.risunest' })
+                    if (command === 'native_file_job_status') return {...status('succeeded', { revision: 4, sourceBytes: 12, sourceFingerprintKind: 'whole-file-sha256' as const, sourceSha256: 'a'.repeat(64), characterCount: 1, presetCount: 1, warningCodes: [], handoffPath: 'C:\\synthetic\\handoff.risunest' }), exportCaptureRevision: 4}
                     if (command === 'native_portable_handoff_cleanup' || command === 'native_file_job_forget') return true
                     throw new Error(`Unexpected command: ${command}`)
                 },
@@ -291,17 +327,15 @@ describe('native file jobs', () => {
         await expect(retryNativePortableRestoreBodies(request, {}, {isTauri: () => true, wait: async () => {}, invoke: lost})).rejects.toMatchObject({committedRevision: 8})
         expect(lost).toHaveBeenCalledOnce()
     })
-    it('flushes a device-section export without acquiring the old renderer replacement fence', async () => {
+    it('pauses a device-section export at its flushed revision without a replacement fence', async () => {
         localStorage.removeItem('risuNestPortableExportIntent')
         const calls: Array<[string, Record<string, unknown> | undefined]> = []
         let revision = 20
         const runtime = {
-            ...restoreRuntime(20, {
+            ...restoreRuntime(21, {
                 capture: () => {
-                    throw new Error('old mutation token must not be captured')
-                },
-                acquire: () => {
-                    throw new Error('old replacement fence must not be acquired')
+                    calls.push(['flush:native-portable-export', undefined])
+                    revision = 21
                 },
             }),
             get revision() {
@@ -336,6 +370,7 @@ describe('native file jobs', () => {
                         if (command === 'native_file_job_status')
                             return {
                                 ...status('succeeded', result),
+                                exportCaptureRevision: 21,
                                 jobId: 'device-export-1',
                                 kind: 'export-portable-backup',
                             }
@@ -3087,6 +3122,11 @@ describe('native file jobs', () => {
         const observed: NativeFileJobStatus[] = []
         let revision = 11
         const runtime = {
+            withPausedPersistentWrites: async <T>(reason: string, operation: (token: import('./saveCoordinator').PersistentMutationToken) => Promise<T>) => {
+                calls.push([`flush:${reason}`, undefined])
+                revision = 12
+                return operation({revision: 12, mutationGeneration: 1} as import('./saveCoordinator').PersistentMutationToken)
+            },
             get revision() {
                 return revision
             },
@@ -3097,6 +3137,7 @@ describe('native file jobs', () => {
         }
         const running: NativeFileJobStatus = {
             jobId: 'export-1',
+            exportCaptureRevision: 12,
             kind: 'export-block-risu-save',
             state: 'running',
             phase: 'writing-export',
@@ -3179,6 +3220,7 @@ describe('native file jobs', () => {
         const tenGiB = 10 * 1024 * 1024 * 1024
         const terminal: NativeFileJobStatus = {
             jobId: 'large-export',
+            exportCaptureRevision: 15,
             kind: 'export-block-risu-save',
             state: 'succeeded',
             phase: 'complete',
@@ -3200,8 +3242,7 @@ describe('native file jobs', () => {
 
         const result = await runNativeBlockRisuSaveExport(
             {
-                revision: 15,
-                flushPendingData: async () => undefined,
+                ...restoreRuntime(15),
             },
             'C:\\chosen\\ten-gib.risudat',
             {},
@@ -3242,8 +3283,7 @@ describe('native file jobs', () => {
 
         const promise = runNativeBlockRisuSaveExport(
             {
-                revision: 6,
-                flushPendingData: async () => undefined,
+                ...restoreRuntime(6),
             },
             'C:\\chosen\\backup.risudat',
             { signal: controller.signal },

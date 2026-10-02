@@ -17,7 +17,7 @@ mod classification;
 #[path = "lww_binding_stage.rs"]
 mod binding_stage;
 pub(crate) use binding_stage::BindingUnitStage;
-pub(super) use binding_stage::{seed_binding_holds, validate_binding_source, BINDING_STAGE_SCHEMA};
+pub(super) use binding_stage::{catalog_digest, seed_binding_holds, validate_binding_source, BINDING_STAGE_SCHEMA};
 #[path = "lww_new_device.rs"]
 mod new_device;
 #[path = "lww_projection.rs"]
@@ -197,6 +197,8 @@ enum Intent {
     },
     Replacement {
         staging_id: String,
+        base_revision: i64,
+        staging_digest: String,
         changes: Vec<(UnitKey, UnitValue)>,
         source_units: Option<BTreeMap<UnitKey, UnitValue>>,
         device_sections: Option<device_store::sections::FrozenBackupSections>,
@@ -815,11 +817,16 @@ impl PersistentStore {
                 return Err(error("request-id-integrity"));
             }
             if complete {
-                let revision = self.connection.query_row(
-                    "SELECT revision FROM lww_requests WHERE request_id=?1",
+                let (committed_digest, revision): (String, i64) = self.connection.query_row(
+                    "SELECT digest,revision FROM lww_requests WHERE request_id=?1",
                     [&header.request_id],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )?;
+                if committed_digest != digest
+                    || matches!(intent, Intent::Replacement { base_revision, .. } if base_revision.checked_add(1) != Some(revision))
+                {
+                    return Err(error("request-id-integrity"));
+                }
                 return Ok(Some(RevisionResult { revision }));
             }
         }
@@ -1895,6 +1902,58 @@ impl PersistentStore {
         }
         Ok(())
     }
+    pub(super) fn lww_prepared_replacement_revision(
+        &self,
+        staging_id: &str,
+        expected_revision: Option<i64>,
+    ) -> StoreResult<i64> {
+        let current_authority = self.lww_binding_authority()?;
+        let row: Option<(String, String, String, bool)> = self.device_store()?.connection().query_row(
+            "SELECT authority,body,digest,complete FROM lww_intents WHERE request_id=?1", [staging_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).optional()?;
+        let Some((authority, body, digest, complete)) = row else {
+            return commit::validate_replace_commit(&self.connection, staging_id, expected_revision);
+        };
+        let intent: Intent = serde_json::from_str(&body)?;
+        let Intent::Replacement {
+            staging_id: original, base_revision, staging_digest,
+            source_units: None, device_sections: None, ..
+        } = intent else { return Err(error("request-id-integrity")); };
+        #[cfg(test)]
+        crate::persistent_store::hash_work::observe("native_replacement_receipt", body.len());
+        if authority != current_authority.0.to_string() || original != staging_id
+            || risunest_sync_wire::hash(body.as_bytes()) != digest || base_revision < 0
+        { return Err(error("request-id-integrity")); }
+        if let Some(expected) = expected_revision {
+            if expected != base_revision {
+                return Err(StoreError::RevisionConflict { expected, actual: base_revision });
+            }
+        }
+        let committed: Option<(String, i64)> = self.connection.query_row(
+            "SELECT digest,revision FROM lww_requests WHERE request_id=?1", [staging_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        if let Some((committed_digest, revision)) = committed {
+            if committed_digest != digest || base_revision.checked_add(1) != Some(revision) {
+                return Err(error("request-id-integrity"));
+            }
+            for &(table, _) in super::GENERATION_TABLES {
+                let exists: bool = self.connection.query_row(
+                    &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE generation=?1)"),
+                    [staging_id], |row| row.get(0),
+                )?;
+                if exists { return Err(error("replacement-stage-reused")); }
+            }
+        } else {
+            if complete { return Err(error("replacement-receipt-missing")); }
+            commit::validate_replace_commit(&self.connection, staging_id, Some(base_revision))?;
+            if binding_stage::catalog_digest(&self.connection, staging_id)? != staging_digest {
+                return Err(error("replacement-stage-changed"));
+            }
+        }
+        Ok(base_revision)
+    }
     pub(crate) fn lww_commit_replacement(
         &mut self,
         header: &Header,
@@ -1958,6 +2017,7 @@ impl PersistentStore {
         }
         self.lww_recover_intents()?;
         verify(self.device_store()?.connection(), header.binding_authority)?;
+        let base_revision = super::current_revision(&self.connection)?;
         let remapped_units = self.remap_retired_staging(staging_id, source_units)?;
         let effective_source_units = remapped_units.as_ref();
         let generation = active_generation(&self.connection)?;
@@ -2029,10 +2089,13 @@ impl PersistentStore {
             tx.commit()?;
             changes
         } else { vec![] };
+        let staging_digest = binding_stage::catalog_digest(&self.connection, staging_id)?;
         let (stamp, digest) = self.reserve_intent(
             header,
             &Intent::Replacement {
                 staging_id: staging_id.into(),
+                base_revision,
+                staging_digest,
                 changes: changes.clone(),
                 source_units: source_units.cloned(),
                 device_sections: device_sections.cloned(),
@@ -2117,6 +2180,17 @@ impl PersistentStore {
         target: bool,
         received: &[Change],
     ) -> StoreResult<RevisionResult> {
+        let proof = if target { None } else {
+            let body: String = self.device_store()?.connection().query_row(
+                "SELECT body FROM lww_intents WHERE request_id=?1", [&header.request_id], |row| row.get(0),
+            )?;
+            let intent: Intent = serde_json::from_str(&body)?;
+            self.completed_intent(header, &intent)?;
+            let Intent::Replacement { staging_id: original, base_revision, staging_digest, .. } = intent
+                else { return Err(error("request-id-integrity")); };
+            if original != staging_id { return Err(error("request-id-integrity")); }
+            Some((base_revision, staging_digest))
+        };
         let result = commit::replace_commit_lww(
             &mut self.connection,
             staging_id,
@@ -2128,6 +2202,7 @@ impl PersistentStore {
             received,
             None,
             None,
+            proof.as_ref().map(|(revision, digest)| (*revision, digest.as_str())),
         )?;
         if target {
             let tx = self.device_store_mut()?.transaction()?;
@@ -2152,9 +2227,11 @@ pub(crate) fn completed_device_replacement_receipt(
     ).optional()?;
     let Some((authority, body, digest, complete)) = row else { return Ok(None); };
     let intent: Intent = serde_json::from_str(&body)?;
-    if authority != header.binding_authority.0.to_string()
-        || !matches!(intent, Intent::Replacement { staging_id:ref stage, device_sections:Some(_), .. } if stage==staging_id)
-    { return Err(error("request-id-integrity")); }
+    let Intent::Replacement { staging_id: stage, base_revision, device_sections: Some(_), .. } = intent
+        else { return Err(error("request-id-integrity")); };
+    if authority != header.binding_authority.0.to_string() || stage != staging_id || base_revision < 0 {
+        return Err(error("request-id-integrity"));
+    }
     #[cfg(test)]
     crate::persistent_store::hash_work::observe("native_replacement_receipt", body.len());
     if risunest_sync_wire::hash(body.as_bytes()) != digest { return Err(error("request-id-integrity")); }
@@ -2164,7 +2241,9 @@ pub(crate) fn completed_device_replacement_receipt(
         |row| Ok((row.get(0)?,row.get(1)?)),
     ).optional()?;
     let Some((committed_digest, revision)) = committed else { return Err(error("replacement-receipt-missing")); };
-    if committed_digest != digest || revision <= 0 { return Err(error("request-id-integrity")); }
+    if committed_digest != digest || base_revision.checked_add(1) != Some(revision) {
+        return Err(error("request-id-integrity"));
+    }
     Ok(Some(RevisionResult { revision }))
 }
 

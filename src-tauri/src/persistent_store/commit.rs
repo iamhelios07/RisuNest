@@ -132,10 +132,35 @@ fn commit_inner(
             reject_archived_targets(transaction, active, input)?;
             validate_owner_heads_for_commit(input)?;
             let retained = retained_commit_owner_heads(transaction, active, input)?;
-            let before = super::lww::capture_targets(transaction, active, input, asset_aliases, true)?;
-            Ok((retained, before))
+            let mut conversation_orders = BTreeSet::new();
+            for mutation in input.conversations.iter().flatten() {
+                match mutation {
+                    ConversationMutation::Delete { character_id, .. }
+                    | ConversationMutation::Reorder { character_id, .. } => {
+                        conversation_orders.insert(character_id.clone());
+                    }
+                    ConversationMutation::ReplaceRange { character_id, conversation_id, .. } => {
+                        let exists: bool = transaction.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM conversations WHERE generation=?1 AND character_id=?2 AND conversation_id=?3)",
+                            params![active, character_id, conversation_id], |row| row.get(0),
+                        )?;
+                        let created_by_unit = input.unit_mutations.iter().flatten().any(|mutation| {
+                            if let super::lww::UnitMutation::Set { key, .. } = mutation {
+                                let parts = key.components();
+                                parts.len() == 4 && parts[0] == "exists" && parts[1] == "conversation"
+                                    && parts[2] == *character_id && parts[3] == *conversation_id
+                            } else { false }
+                        });
+                        if !exists && !created_by_unit {
+                            conversation_orders.insert(character_id.clone());
+                        }
+                    }
+                }
+            }
+            let before = super::lww::capture_targets(transaction, active, input, asset_aliases, true, &conversation_orders)?;
+            Ok((retained, before, conversation_orders))
         },
-        |transaction, generation, (retained, before)| {
+        |transaction, generation, (retained, before, conversation_orders)| {
             if let Some(root) = &input.root {
                 put_root(transaction, generation, root)?;
             }
@@ -177,7 +202,7 @@ fn commit_inner(
             }
             replace_changed_owner_heads(transaction, generation, input, &retained)?;
             if let Some((header, stamp, digest)) = lww {
-                let after = super::lww::capture_targets(transaction, generation, input, asset_aliases, false)?;
+                let after = super::lww::capture_targets(transaction, generation, input, asset_aliases, false, &conversation_orders)?;
                 let changed=before.keys().chain(after.keys()).cloned().collect::<Vec<_>>();
                 super::lww::record_changes(transaction, before, after, stamp, header.binding_authority, &header.request_id)?;
                 super::lww::refresh_orders(transaction, generation,&changed)?;
@@ -1297,6 +1322,7 @@ pub(super) fn replace_commit_lww(
     received: &[super::lww::Change],
     received_authority: Option<risunest_sync_wire::stamp::DecimalU64>,
     selection_change: Option<&super::sync_selection::BindingSelectionChange>,
+    replacement_proof: Option<(i64, &str)>,
 ) -> StoreResult<RevisionResult> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let completed: Option<(String,i64)> = transaction.query_row(
@@ -1309,6 +1335,15 @@ pub(super) fn replace_commit_lww(
     }
     if let Some(change)=selection_change {super::sync_selection::apply_binding_selection(&transaction,change)?;}
     require_staging(&transaction, staging_id)?;
+    if let Some((base_revision, expected_digest)) = replacement_proof {
+        let actual = current_revision(&transaction)?;
+        if actual != base_revision {
+            return Err(StoreError::RevisionConflict { expected: base_revision, actual });
+        }
+        if super::lww::catalog_digest(&transaction, staging_id)? != expected_digest {
+            return Err(validation("replacement-stage-changed"));
+        }
+    }
     if target {
         super::sync_selection::validate_binding_stage_content(&transaction,staging_id)?;
         super::lww::validate_binding_source(&transaction,staging_id,header,received)?;

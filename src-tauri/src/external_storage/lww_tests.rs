@@ -27,13 +27,14 @@ pub(crate) struct HeldAssetTransfer {
     pub cancel_after_pack_loss: std::sync::atomic::AtomicBool,
     pub held: std::sync::atomic::AtomicBool,
     pub fail_pack_after: std::sync::atomic::AtomicUsize,
+    pub fail_segment_begin: std::sync::atomic::AtomicBool,
     pub attempts: std::sync::Mutex<Vec<ObjectIntent>>,
     pub before_lease: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 impl HeldAssetTransfer {
     pub(crate) fn new(inner: Arc<FakeProvider>) -> Arc<Self> {
         Arc::new(Self { inner, entered: Default::default(), resume: Default::default(),
-            lose_pack_response: false.into(), cancel_after_pack_loss: false.into(), held: true.into(), fail_pack_after: 0.into(), attempts: Default::default(), before_lease: Default::default() })
+            lose_pack_response: false.into(), cancel_after_pack_loss: false.into(), held: true.into(), fail_pack_after: 0.into(), fail_segment_begin: false.into(), attempts: Default::default(), before_lease: Default::default() })
     }
 }
 impl Provider for HeldAssetTransfer {
@@ -42,7 +43,14 @@ impl Provider for HeldAssetTransfer {
     fn read_object<'a>(&'a self, repository: &'a RepositoryHandle, locator: &'a RemoteLocator, unchanged: Option<&'a VersionToken>, sink: &'a mut dyn TransferSink, cancel: &'a Cancellation)
         -> ProviderFuture<'a, ReadReceipt> { self.inner.read_object(repository, locator, unchanged, sink, cancel) }
     fn begin_upload<'a>(&'a self, repository: &'a RepositoryHandle, intent: &'a ObjectIntent, cancel: &'a Cancellation)
-        -> ProviderFuture<'a, Option<ResumeState>> { self.inner.begin_upload(repository, intent, cancel) }
+        -> ProviderFuture<'a, Option<ResumeState>> {
+        Box::pin(async move {
+            if intent.role==ObjectRole::Segment && self.fail_segment_begin.swap(false,std::sync::atomic::Ordering::SeqCst) {
+                return Err(ProviderError::new(ErrorKind::Transient));
+            }
+            self.inner.begin_upload(repository,intent,cancel).await
+        })
+    }
     fn create_object<'a>(&'a self, repository: &'a RepositoryHandle, intent: &'a ObjectIntent, source: &'a dyn TransferSource, resume: Option<&'a ResumeState>, cancel: &'a Cancellation)
         -> ProviderFuture<'a, ObjectReceipt> {
         Box::pin(async move {
@@ -240,6 +248,9 @@ fn small_assets_use_authenticated_catalogs_and_present_bootstrap_reads_no_bodies
         assert!(!text.contains("smallBodies"));
         assert!(!text.contains(&base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &body)));
         let mut shape: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        shape.as_object_mut().unwrap().remove("dataCatalogs");
+        assert!(lww_segment::Segment::decode(&risunest_sync_wire::canonical::encode(&shape).unwrap()).is_err());
+        shape["dataCatalogs"]=serde_json::json!([]);
         shape.as_object_mut().unwrap().remove("assetCatalogs");
         assert!(lww_segment::Segment::decode(&risunest_sync_wire::canonical::encode(&shape).unwrap()).is_err());
         shape["assetCatalogs"] = serde_json::json!([]); shape["smallBodies"] = serde_json::json!({});
@@ -421,6 +432,203 @@ fn real_publish_and_receive_continue_while_checkpoint_inputs_are_paused() {
         let completed=completed.unwrap(); let (_,snapshot)=f.sender.checkpoint(&completed.reference.receipt,&cancel).await.unwrap();
         assert_eq!(snapshot.covered_prefixes.get(&writer).unwrap().0,1);
         assert_eq!(f.b.read_root(None).unwrap().value["language"],serde_json::json!("en"));
+    });
+}
+#[test]
+fn reused_data_roots_keep_controls_reachable_and_skip_present_catalog_bodies() {
+    run(async {
+        let mut f=CycleFixture::new(); conversation(&mut f.a);
+        let transfer=HeldAssetTransfer::new(f.provider.clone());
+        transfer.held.store(false,std::sync::atomic::Ordering::SeqCst);
+        f.sender.provider=transfer.clone();
+        let messages=(0..40).map(|index|serde_json::json!({"chatId":format!("synthetic-root-{index}"),"data":"x".repeat(128*1024)})).collect();
+        f.a.commit(&WorkingSetCommit{expected_revision:f.a.revision().unwrap(),
+            conversations:Some(vec![ConversationMutation::ReplaceRange{character_id:"char".into(),conversation_id:"conv".into(),
+                start:0,delete_count:0,messages,conversation:None,configured_index:None}]),..Default::default()}).unwrap();
+        f.publish_a().await; assert_eq!(f.receive_b().await,1);
+        let first=f.sender.listing(&Cancellation::default()).await.unwrap().remove(0);
+        let (writer,seq,_)=parse_segment_object_id(&first.locator.object).unwrap();
+        let first_payload=lww_segment::open(&f.provider.contents(&first.locator.object).unwrap(),&f.sender.library,writer,seq,&f.sender.root_key).unwrap();
+        assert_eq!(first_payload.data_catalogs.len(),1);
+        let root=first_payload.data_catalogs[0].clone();
+        let hashes=f.a.external_lww_verified_data_catalog(&f.sender.target_scope(),&root).unwrap().unwrap();
+        assert!(hashes.len()>20);
+        assert_eq!(f.a.external_lww_verified_control_size(&hashes[0]).unwrap(),
+            Some(f.a.lww_object_body(&hashes[0]).unwrap().unwrap().len() as u64));
+        let before=std::iter::once(root.locator.object.clone()).chain(transfer.attempts.lock().unwrap().iter().map(|intent|intent.object_id.clone()))
+            .map(|id|(id.clone(),f.provider.read_attempts(&id))).collect::<Vec<_>>();
+        let old_pack_attempts=transfer.attempts.lock().unwrap().len();
+        f.a.commit(&WorkingSetCommit{expected_revision:f.a.revision().unwrap(),
+            conversations:Some(vec![ConversationMutation::ReplaceRange{character_id:"char".into(),conversation_id:"conv".into(),
+                start:40,delete_count:0,messages:vec![serde_json::json!({"chatId":"synthetic-root-append","data":"append"})],
+                conversation:None,configured_index:None}]),..Default::default()}).unwrap();
+        assert_eq!(f.publish_a().await.segments.0,1);
+        assert_eq!(transfer.attempts.lock().unwrap().len(),old_pack_attempts);
+        let next=f.sender.listing(&Cancellation::default()).await.unwrap().into_iter()
+            .find(|receipt|parse_segment_object_id(&receipt.locator.object).unwrap().1==2).unwrap();
+        let next_payload=lww_segment::open(&f.provider.contents(&next.locator.object).unwrap(),&f.sender.library,writer,2,&f.sender.root_key).unwrap();
+        assert!(next_payload.data_catalogs.contains(&root));
+        assert_eq!(f.receive_b().await,1);
+        for (id,reads) in before {assert_eq!(f.provider.read_attempts(&id),reads,"known root and its present controls must not be downloaded again");}
+        assert_eq!(f.b.read_conversation("char","conv",None).unwrap().unwrap().value["message"].as_array().unwrap().len(),41);
+        let mut changed=root.clone(); changed.plaintext_sha256=[0xaa;32];
+        assert!(f.a.external_lww_verified_data_catalog(&f.sender.target_scope(),&changed).is_err());
+        let mut changed_hashes=hashes.clone(); changed_hashes.push("a".repeat(64));
+        assert!(f.a.external_lww_witness_data_catalog(&f.sender.target_scope(),&root,&changed_hashes).is_err());
+    });
+}
+#[test]
+fn oversized_control_pages_use_frozen_data_packs_and_preserve_newer_edits_on_retry() {
+    run(async {
+        let mut f=CycleFixture::new();
+        conversation(&mut f.a);
+        let messages=(0..224).map(|index|serde_json::json!({
+            "chatId":format!("synthetic-large-{index}"),"data":"x".repeat(225*1024),
+        })).collect::<Vec<_>>();
+        f.a.commit(&WorkingSetCommit { expected_revision:f.a.revision().unwrap(),
+            conversations:Some(vec![ConversationMutation::ReplaceRange { character_id:"char".into(),conversation_id:"conv".into(),
+                start:0,delete_count:0,messages,conversation:None,configured_index:None }]),..Default::default() }).unwrap();
+        let key=UnitKey::new(&["messages","char","conv"]).unwrap();
+        let original=f.a.lww_read_outbox(0.into(),4096).unwrap().entries.into_iter().find(|entry|entry.key==key).unwrap();
+        let risunest_sync_wire::unit::UnitValue::Object { descriptor,.. }=&original.value else { panic!("messages must use a manifest") };
+        let manifest=risunest_external_storage_format::message_pages::MessageManifest::decode(
+            &f.a.lww_object_body(&descriptor.object_hash).unwrap().unwrap()).unwrap();
+        assert!(manifest.pages.iter().all(|page|page.byte_length.0<=256*1024));
+        assert!(manifest.pages.iter().map(|page|page.byte_length.0).sum::<u64>()>48*1024*1024);
+        let transfer=HeldAssetTransfer::new(f.provider.clone());
+        transfer.held.store(false,std::sync::atomic::Ordering::SeqCst);
+        transfer.lose_pack_response.store(true,std::sync::atomic::Ordering::SeqCst);
+        transfer.cancel_after_pack_loss.store(true,std::sync::atomic::Ordering::SeqCst);
+        f.sender.provider=transfer.clone();
+        assert!(f.sender.publish(&mut f.a,0.into(),&[],&Cancellation::default()).await.is_err());
+        let writer=f.a.lww_clock_state().unwrap().writer_id;
+        let (pending,sealed)=f.a.external_lww_pending(&f.sender.target_scope(),&writer).unwrap().unwrap();
+        assert!(!pending.sealed && sealed.is_empty());
+        assert!(!pending.controls.is_empty());
+        assert_eq!(pending.seq.0,1);
+        assert!(pending.entries.iter().any(|entry|entry==&original));
+        let pack=transfer.attempts.lock().unwrap()[0].object_id.clone();
+        let original_pack=f.provider.contents(&pack).unwrap();
+        let mut changed=pending.clone(); changed.controls[0].byte_length+=1;
+        assert!(f.a.external_lww_persist(&changed,&sealed).is_err());
+        f.a.commit(&WorkingSetCommit { expected_revision:f.a.revision().unwrap(),
+            conversations:Some(vec![ConversationMutation::ReplaceRange { character_id:"char".into(),conversation_id:"conv".into(),
+                start:224,delete_count:0,messages:vec![serde_json::json!({"chatId":"synthetic-newer","data":"newer"})],
+                conversation:None,configured_index:None }]),..Default::default() }).unwrap();
+        f.a=PersistentStore::open(f.directory_a.path()).unwrap();
+        let reopened=f.a.external_lww_pending(&f.sender.target_scope(),&writer).unwrap().unwrap().0;
+        assert_eq!(reopened.controls,pending.controls);
+        assert!(reopened.asset_job==pending.asset_job);
+        assert_eq!(f.publish_a().await.segments.0,2,"exact older ACK must leave the newer messages version pending");
+        assert_eq!(f.provider.contents(&pack).unwrap(),original_pack);
+        let mut segments=f.sender.listing(&Cancellation::default()).await.unwrap();
+        segments.sort_by_key(|receipt|parse_segment_object_id(&receipt.locator.object).unwrap().1);
+        assert_eq!(segments.len(),2);
+        let first=&segments[0];
+        let bytes=f.provider.contents(&first.locator.object).unwrap();
+        assert!(bytes.len()<=lww_segment::SEGMENT_BYTES);
+        let payload=lww_segment::open(&bytes,&f.sender.library,&writer,1,&f.sender.root_key).unwrap();
+        assert_eq!(payload.data_catalogs.len(),1);
+        let published=payload.changes.iter().find(|change|change.key==key).unwrap();
+        assert_eq!(published.stamp,original.stamp);
+        assert_eq!(published.value,original.value);
+        let catalog=&payload.data_catalogs[0];
+        let original_catalog=f.provider.contents(&catalog.locator.object).unwrap();
+        let mut corrupt=original_catalog.clone(); *corrupt.last_mut().unwrap()^=1;
+        f.provider.seed(&catalog.locator.object,ObjectRole::Catalog,corrupt);
+        let revision=f.b.revision().unwrap();
+        assert_eq!(f.receiver.receive_requests(&mut f.b,0.into(),&Cancellation::default()).await.err().unwrap().kind,ErrorKind::Corrupt);
+        assert_eq!(f.b.revision().unwrap(),revision);
+        assert!(f.b.lww_receive_progress(0.into()).unwrap().is_empty());
+        f.provider.seed(&catalog.locator.object,ObjectRole::Catalog,original_catalog);
+        assert_eq!(f.receive_b().await,2);
+        let conversation=f.b.read_conversation("char","conv",None).unwrap().unwrap().value;
+        assert_eq!(conversation["message"].as_array().unwrap().len(),225);
+        assert_eq!(conversation["message"][224]["chatId"],"synthetic-newer");
+        assert!(f.a.lww_read_outbox(0.into(),4096).unwrap().entries.is_empty());
+    });
+}
+#[test]
+fn indivisible_message_above_segment_cap_uses_chunked_data_control_carriage() {
+    run(async {
+        let mut f=CycleFixture::new(); conversation(&mut f.a);
+        f.a.commit(&WorkingSetCommit { expected_revision:f.a.revision().unwrap(),
+            conversations:Some(vec![ConversationMutation::ReplaceRange { character_id:"char".into(),conversation_id:"conv".into(),
+                start:0,delete_count:0,messages:vec![serde_json::json!({"chatId":"synthetic-indivisible","data":"x".repeat(65*1024*1024)})],
+                conversation:None,configured_index:None }]),..Default::default() }).unwrap();
+        assert_eq!(f.publish_a().await.segments.0,1);
+        let object=f.sender.listing(&Cancellation::default()).await.unwrap().remove(0);
+        let bytes=f.provider.contents(&object.locator.object).unwrap();
+        assert!(bytes.len()<=lww_segment::SEGMENT_BYTES);
+        let (writer,seq,_)=parse_segment_object_id(&object.locator.object).unwrap();
+        let payload=lww_segment::open(&bytes,&f.sender.library,writer,seq,&f.sender.root_key).unwrap();
+        assert_eq!(payload.data_catalogs.len(),1);
+        assert_eq!(f.receive_b().await,1);
+        let conversation=f.b.read_conversation("char","conv",None).unwrap().unwrap().value;
+        assert_eq!(conversation["message"][0]["data"].as_str().unwrap().len(),65*1024*1024);
+    });
+}
+#[test]
+fn segment_limit_counts_encryption_framing_at_the_exact_boundary() {
+    let mut low=0;
+    let mut high=lww_segment::SEGMENT_BYTES;
+    while low<high {
+        let middle=low+(high-low).div_ceil(2);
+        if lww_segment::sealed_length(middle).is_ok() { low=middle; } else { high=middle-1; }
+    }
+    assert!(low<lww_segment::SEGMENT_BYTES);
+    assert!(lww_segment::sealed_length(low).unwrap()<=lww_segment::SEGMENT_BYTES as u64);
+    assert_eq!(lww_segment::sealed_length(low+1).unwrap_err().kind,ErrorKind::FileTooLarge);
+    assert_eq!(lww_segment::sealed_length(lww_segment::SEGMENT_BYTES).unwrap_err().kind,ErrorKind::FileTooLarge);
+    let segment=lww_segment::Segment::new("synthetic-library","00000000-0000-4000-8000-000000000001",1);
+    let plain=segment.encode().unwrap();
+    let (sealed,_)=lww_segment::seal(&segment,&[7;32]).unwrap();
+    assert_eq!(sealed.len() as u64,lww_segment::sealed_length(plain.len()).unwrap());
+}
+#[test]
+fn restart_uses_retained_segments_and_bootstraps_only_after_required_retirement() {
+    run(async {
+        for retire_required in [false,true] {
+            let mut f=CycleFixture::new();
+            set(&mut f.a,&["root","language"],serde_json::json!("one"));
+            f.publish_a().await;
+            assert_eq!(f.receive_b().await,1);
+            set(&mut f.a,&["root","language"],serde_json::json!("two"));
+            f.publish_a().await;
+            let required=f.sender.listing(&Cancellation::default()).await.unwrap().into_iter()
+                .find(|receipt| parse_segment_object_id(&receipt.locator.object).unwrap().1==2).unwrap();
+            let required_bytes=f.provider.contents(&required.locator.object).unwrap();
+            let job=tempfile::tempdir().unwrap();
+            let completed=f.sender.compact_published(job.path(),"00000000-0000-4000-8000-000000000090",
+                &f.a.lww_clock_state().unwrap().writer_id,&f.sender.capabilities,&Cancellation::default(),None).await.unwrap();
+            let dependencies=completed.referenced_objects.iter()
+                .filter(|object|matches!(object.role,ObjectRole::Pack|ObjectRole::Catalog))
+                .map(|object|object.receipt.locator.object.clone()).collect::<Vec<_>>();
+            assert!(!dependencies.is_empty());
+            let before=dependencies.iter().map(|id|f.provider.read_attempts(id)).collect::<Vec<_>>();
+            set(&mut f.b,&["root","loreBookDepth"],serde_json::json!(7));
+            f.b=PersistentStore::open(f.directory_b.path()).unwrap();
+            if retire_required { f.provider.forget(&required.locator.object); }
+            assert_eq!(f.receive_b().await,1);
+            assert_eq!(f.b.read_root(None).unwrap().value["language"],"two");
+            assert_eq!(f.b.read_root(None).unwrap().value["loreBookDepth"],7);
+            assert!(!f.b.lww_read_outbox(0.into(),100).unwrap().entries.is_empty());
+            let after=dependencies.iter().map(|id|f.provider.read_attempts(id)).collect::<Vec<_>>();
+            if retire_required {
+                assert!(after.iter().zip(&before).any(|(after,before)|after>before));
+            } else {
+                assert_eq!(after,before,"retained contiguous history must not read checkpoint catalogs/data packs");
+                let (writer,seq,_)=parse_segment_object_id(&required.locator.object).unwrap();
+                let mut variant=lww_segment::open(&required_bytes,&f.sender.library,writer,seq,&f.sender.root_key).unwrap();
+                variant.changes.clear();
+                let (bytes,_)=lww_segment::seal(&variant,&f.sender.root_key).unwrap();
+                let id=segment_object_id(writer,seq,&lww_segment::digest(&bytes)).unwrap();
+                f.provider.seed(&id,ObjectRole::Segment,bytes);
+                let progress=f.b.lww_receive_progress(0.into()).unwrap();
+                assert_eq!(f.receiver.receive_requests(&mut f.b,0.into(),&Cancellation::default()).await.err().unwrap().kind,ErrorKind::Corrupt);
+                assert_eq!(serde_json::to_value(f.b.lww_receive_progress(0.into()).unwrap()).unwrap(),serde_json::to_value(progress).unwrap());
+            }
+        }
     });
 }
 #[test]

@@ -444,6 +444,7 @@ impl PersistentStore {
         let cas = PayloadCas::new(&self.repository_root)?;
         // Custody the library still uses is kept without asking the server.
         // What remains is decided again under the mutation lock below.
+        let revision = self.revision()?;
         let used = self.residency_inventory(false)?;
         if used.release_blocked {
             return Ok(());
@@ -484,6 +485,9 @@ impl PersistentStore {
                 check()?;
                 let objects = {
                     let _guard = crate::asset_repository::coordinator::lock_repository_mutation()?;
+                    if self.revision()? != revision {
+                        return Ok(());
+                    }
                     let inventory = self.residency_inventory(true)?;
                     if inventory.release_blocked {
                         return Ok(());

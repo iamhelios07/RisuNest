@@ -37,11 +37,37 @@ fn all_live_tables_have_an_explicit_preservation_owner() {
         "external_storage_capture_files",
         "external_storage_base_records",
         "external_storage_base_record_state",
+        "lww_binding_identity",
+        "lww_binding_inspections",
+        "lww_binding_source_units",
+        "lww_binding_sources",
+        "lww_binding_stages",
+        "lww_binding_switch_requests",
+        "lww_initialization_scopes",
+        "lww_outbox",
+        "lww_publications",
+        "lww_receive_rows",
+        "lww_requests",
+        "plugin_gc_revision",
+        "snapshot_original_meta",
+        "snapshot_original_units",
+        "snapshot_restore_body_jobs",
+        "snapshot_restore_payloads",
+        "snapshot_restore_stages",
+        "snapshot_restore_units",
+    ];
+    let shared_unit_state = ["lww_units", "lww_retired", "message_page_objects"];
+    let derived_message_state = [
+        "message_page_indexes", "message_page_manifests",
+        "message_page_proofs", "message_page_verified_objects",
     ];
     let server_operations = [
         "server_sync_state",
     ];
-    let groups = [&portable[..], &local_operations[..], &server_operations[..]];
+    let groups = [
+        &portable[..], &shared_unit_state[..], &derived_message_state[..],
+        &local_operations[..], &server_operations[..],
+    ];
     let mut classified = BTreeSet::new();
     for group in groups {
         for name in group {

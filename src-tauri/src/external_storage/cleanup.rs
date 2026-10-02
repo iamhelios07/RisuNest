@@ -874,7 +874,7 @@ impl<'a> LwwRepositoryView<'a> {
         let object=RemoteObject{repository_id:self.engine.repository.repository_id.clone(),object_id:name.into(),role:ObjectRole::Segment,
             receipt:receipt.clone(),ciphertext_sha256:hash.into(),plaintext_length:plaintext.len() as u64,
             plaintext_sha256:super::lww_segment::digest(&plaintext)};
-        let mut references=document.asset_catalogs.iter().map(|object|RemoteObject::from_stored(object,&self.engine.repository)).collect::<Result<Vec<_>>>()?;
+        let mut references=document.asset_catalogs.iter().chain(&document.data_catalogs).map(|object|RemoteObject::from_stored(object,&self.engine.repository)).collect::<Result<Vec<_>>>()?;
         for (hash,body) in &document.large_bodies {references.push(self.standalone(hash,body)?);}
         Ok((object,DocumentNode{snapshot_id:name.into(),parent_snapshot_id:None,references}))
     }
@@ -1057,12 +1057,25 @@ mod tests {
             use super::super::{lww_tests::{CycleFixture,small_asset},fake,contract::{ConnectionConfig,RemoteLocator}};
             let mut f=CycleFixture::new();let cancel=Cancellation::default();
             small_asset(&mut f.a,"obsolete-large",&vec![31;5*1024*1024]);
+            let mut small=Vec::new();
+            for n in 0..4 {small.push(small_asset(&mut f.a,&format!("small-{n}"),format!("synthetic retained pack entry {n}").as_bytes()));}
             f.publish_a().await;
             f.a.delete_asset_alias("asset","obsolete-large",f.a.revision().unwrap()).unwrap();
+            for n in 1..4 {f.a.delete_asset_alias("asset",&format!("small-{n}"),f.a.revision().unwrap()).unwrap();}
             f.publish_a().await;
-            let directory=tempfile::tempdir().unwrap();let id=uuid::Uuid::new_v4().to_string();
+            let directory=tempfile::tempdir().unwrap();
+            let baseline=f.receiver.compact_published(&directory.path().join("remote-baseline"),"ffffffff-ffff-4fff-8fff-ffffffffffff",&f.a.lww_clock_state().unwrap().writer_id,
+                &f.receiver.capabilities,&cancel,None).await.unwrap();
+            assert!(f.receive_b().await>0);
+            let saved=super::super::lww_residency::packed_source(f.directory_b.path(),&small[0]).unwrap().unwrap();
+            let old_pack=saved.packs[0].header.object_id.clone();
+            assert!(crate::asset_repository::PayloadCas::new(f.directory_b.path()).unwrap().stat_object(&small[0]).unwrap().is_none());
+            let id="00000000-0000-4000-8000-000000000090".to_owned();
             let checkpoint=f.sender.compact_published(directory.path(),&id,&f.a.lww_clock_state().unwrap().writer_id,
                 &f.sender.capabilities,&cancel,None).await.unwrap();
+            let old=f.sender.checkpoint(&baseline.reference.receipt,&cancel).await.unwrap().1;
+            let current=f.sender.checkpoint(&checkpoint.reference.receipt,&cancel).await.unwrap().1;
+            assert_eq!(old.covered_prefixes,current.covered_prefixes);
             assert_eq!(checkpoint.reference.role,ObjectRole::Snapshot);
             assert_eq!(checkpoint.reference.object_id,id);
             let connected=ConnectedRepository {
@@ -1102,7 +1115,7 @@ mod tests {
                 packaging::PackageLimits::from_capabilities(&connected.stored.capabilities).unwrap(),None,&mut journal,
                 connected.provider.as_ref(),&connected.handle,&super::super::phase_progress::PhaseProgress::silent(),&cancel).await.unwrap();
             assert_ne!(backup.reference.repository_id,f.sender.repository.repository_id);
-            assert_eq!(f.sender.snapshot_listing(&cancel).await.unwrap().len(),1,"ordinary logical-scope backup coexists with the physical checkpoint");
+            assert_eq!(f.sender.snapshot_listing(&cancel).await.unwrap().len(),2,"ordinary logical-scope backup coexists with the physical checkpoints");
             let view=LwwRepositoryView::new(&f.sender,ConnectedRepositoryView{connected:&connected,writer_id:"sender",policy:RetentionPolicy::DEFAULT,
                 now_ms:1000,unfinished:vec![],cache_root:&cache},ConnectedDocuments{connected:&connected,cancel:&cancel,scratch:&scratch});
             let observed=view.roots(&cancel).await.unwrap();let listed=view.snapshots(&cancel).await.unwrap();let known=view.known_objects().unwrap();
@@ -1147,6 +1160,38 @@ mod tests {
                 now_ms:1000+2*leases::UNREACHABLE_GRACE_MS,unfinished:vec![],cache_root:&cache},&scratch,&cancel).await.unwrap();
             assert_eq!(settled.deleted_objects,1);assert!(!f.provider.holds(&body.object_id));
             assert!(view.snapshots(&cancel).await.unwrap().len()>=3,"partial deletion keeps signed discovery parents");
+            let request=CleanupRequest{job_id:"retire-covered-pack",limits:CleanupLimits{batch:100,per_run:100},..request};
+            run_lww(&context,&request,&f.sender,ConnectedRepositoryView{connected:&connected,writer_id:"collector",policy:RetentionPolicy::DEFAULT,
+                now_ms:1000+2*leases::UNREACHABLE_GRACE_MS,unfinished:vec![],cache_root:&cache},&scratch,&cancel).await.unwrap();
+            assert!(!f.provider.holds(&old_pack),"finite aged GC retires the saved equal-coverage pack");
+            let mut receiver_connection=ConnectedRepository{stored:connected.stored.clone(),provider:connected.provider.clone(),handle:fake::repository(),
+                dependencies:fake::loopback_dependencies(fake::MemoryVault::default(),1).dependencies,root_key:zeroize::Zeroizing::new(*connected.root_key)};
+            receiver_connection.stored.id="receiver".into();
+            super::super::connection_store::ConnectionStore::open(f.directory_b.path()).unwrap().insert(&receiver_connection.stored).unwrap();
+            let _resolver=super::super::lww_residency::install_test_source_connection(f.directory_b.path(),Arc::new(receiver_connection)).unwrap();
+            let catalog_id=&current.asset_catalogs[0].header.object_id;
+            let authentic=f.provider.state.lock().unwrap().objects[catalog_id].0.clone();
+            let mut corrupt=authentic.clone();let last=corrupt.len()-1;corrupt[last]^=1;
+            f.provider.seed(catalog_id,ObjectRole::Catalog,corrupt);
+            let root=f.directory_b.path().to_path_buf();let hash=small[0].clone();
+            super::super::worker_observation::spawn_blocking(move || {
+                assert!(super::super::lww_residency::hydrate_registered(&root,&hash,&||Ok(())).is_err());
+                assert!(crate::asset_repository::PayloadCas::new(&root).unwrap().stat_object(&hash).unwrap().is_none());
+            }).await.unwrap();
+            assert_eq!(super::super::lww_residency::packed_source(f.directory_b.path(),&small[0]).unwrap().unwrap().packs,saved.packs);
+            f.provider.seed(catalog_id,ObjectRole::Catalog,authentic);
+            let frozen=super::super::lww_residency::FrozenBodySource::Packed(saved.clone());
+            let spool=super::super::lww_residency::spool_frozen_remote_body(&frozen,&scratch.join("frozen-destination"),&cancel).await.unwrap();
+            assert_eq!(super::super::lww_residency::read_frozen_body_spool(&frozen,&spool,&cancel).unwrap(),b"synthetic retained pack entry 0");
+            assert!(crate::asset_repository::PayloadCas::new(f.directory_b.path()).unwrap().stat_object(&small[0]).unwrap().is_none());
+            assert_eq!(super::super::lww_residency::packed_source(f.directory_b.path(),&small[0]).unwrap().unwrap().packs,saved.packs,"frozen backup custody never switches its saved source identity");
+            let root=f.directory_b.path().to_path_buf();let hash=small[0].clone();
+            super::super::worker_observation::spawn_blocking(move || {
+                assert!(super::super::lww_residency::hydrate_registered(&root,&hash,&||Ok(())).unwrap());
+                assert_eq!(crate::asset_repository::PayloadCas::new(&root).unwrap().read_object(&hash).unwrap().unwrap(),b"synthetic retained pack entry 0");
+            }).await.unwrap();
+            let refreshed=super::super::lww_residency::packed_source(f.directory_b.path(),&small[0]).unwrap().unwrap();
+            assert_eq!(refreshed.protected_snapshot,id);assert_ne!(refreshed.packs[0].header.object_id,old_pack);
         });
     }
     fn validate_generic_body(object:&RemoteObject,repository:&RepositoryHandle)->Result<()> {object.stored(repository).map(|_|())}
