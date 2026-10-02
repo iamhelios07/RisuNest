@@ -59,7 +59,7 @@ function dependencies(platform: 'native-desktop' | 'web'): RisuSaveFileRouteDepe
             return {
                 revision: 5,
                 sourceBytes: 4096,
-                sourceSha256: 'a'.repeat(64),
+                sourceFingerprintKind: 'whole-file-sha256' as const, sourceSha256: 'a'.repeat(64),
                 characterCount: 2,
                 presetCount: 1,
                 warningCodes: [],
@@ -68,7 +68,7 @@ function dependencies(platform: 'native-desktop' | 'web'): RisuSaveFileRouteDepe
         runNativeExport: vi.fn(async () => ({
             revision: 4,
             sourceBytes: 8192,
-            sourceSha256: 'b'.repeat(64),
+            sourceFingerprintKind: 'whole-file-sha256' as const, sourceSha256: 'b'.repeat(64),
             exportExclusions: { archivedCharacters: 1, collidingPluginValues: 2 },
             characterCount: 2,
             presetCount: 1,

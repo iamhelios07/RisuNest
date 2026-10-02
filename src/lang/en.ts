@@ -241,8 +241,8 @@ export const languageEnglish = {
         networkFetchPlain: "This can be a plain fetch error. try disabling force plain fetch option in settings.",
         requestLogRemoved: "This request log is removed.",
         requestLogRemovedDesc: "This request log removes when client is refreshed or reloaded.",
-        coldStorageIncompleteRestoreConfirm: (characterNames: string, unavailableCount: number, unresolvedCount: number) =>
-            `Cold storage data for ${characterNames || "unknown characters"} could not be restored.${unresolvedCount > 0 ? ` ${unresolvedCount} item(s) could not be linked to a character.` : ""}\n\nIf you continue, ${unavailableCount} cold storage item(s) will remain unavailable, and the affected character or chat data may be permanently lost.\n\nContinue with the incomplete restore anyway?`,
+        coldStorageIncompleteRestoreConfirm: (characterNames: string, unavailableCount: number, unresolvedCount: number, includeQuestion = true) =>
+            `Cold storage data for ${characterNames || "unknown characters"} could not be restored.${unresolvedCount > 0 ? ` ${unresolvedCount} item(s) could not be linked to a character.` : ""}\n\nIf you continue, ${unavailableCount} cold storage item(s) will remain unavailable, and the affected character or chat data may be permanently lost.${includeQuestion ? "\n\nContinue with the incomplete restore anyway?" : ""}`,
     },
     showHelp: "Show Help",
     help: {
@@ -2829,6 +2829,7 @@ export const languageEnglish = {
             reasonUnknown: 'An unknown error occurred.',
             warningCleanupFailed:
                 'A temporary file could not be cleaned up. It will be retried at startup.',
+            warningUpstreamRestoreLosses: 'Some cold storage or inlay data could not be restored. Review the restored data.',
             warningPocketInlayFailed:
                 'Some PocketRisu attachments could not be imported.',
             warningUnknown: 'The operation completed with a warning. Check the details.',

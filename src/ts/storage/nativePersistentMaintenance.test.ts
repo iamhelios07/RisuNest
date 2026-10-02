@@ -14,6 +14,9 @@ const mocks = vi.hoisted(() => ({
     continuation: vi.fn(),
 }))
 
+const bodyReceipt = {jobId:'bodies',kind:'snapshot-bodies',stagingId:'stage',activationRevision:'8',bindingAuthority:'0'}
+const bodyStatus = {jobId:'bodies',kind:'snapshot-bodies',snapshotStagingId:'stage',activationRevision:8,activationAuthority:'0',state:'succeeded',phase:'complete',progress:{completedBytes:0,completedItems:0},snapshotBodies:{stageId:'stage',activatedRevision:8,bindingAuthority:'0',policy:'full',total:0,locallyPresent:0,remoteHeld:0,unavailable:0,allBodiesLocal:true,settled:true}}
+
 vi.mock('@tauri-apps/api/core', () => ({ invoke: mocks.invoke }))
 vi.mock('../desktopRelaunch', () => ({ relaunch: mocks.relaunch }))
 vi.mock('./persistentDataRuntime.svelte',()=>({getPersistentDataRuntime:()=>({setActivatedLibraryRecoveryLifecycle:mocks.lifecycle,markCommittedWorkingSetRefreshRequired:vi.fn(),getStorageAuthorityEpoch:()=>4})}))
@@ -23,6 +26,7 @@ vi.mock('../plugins/apiV3/v3.svelte',()=>({fencePluginExecutionForAuthorityRepla
 vi.mock('./committedWorkingSetContinuation',()=>({registerCommittedWorkingSetContinuation:mocks.continuation}))
 vi.mock('../platform', () => ({
     isTauriIOS: false,
+    isTauriAndroid: false,
     get isTauriMobile() {
         return mocks.isTauriMobile
     },
@@ -41,6 +45,7 @@ import {
     createPeriodicNativeSnapshotIfDue,
     listNativePersistentSnapshots,
     requestNativePersistentSnapshotRestore,
+    completeNativeSnapshotRestoreBodies,
     restartNativeApp,
     restoreNativePersistentSnapshot,
     schedulePeriodicNativeSnapshot,
@@ -58,7 +63,10 @@ describe('native persistent maintenance', () => {
         ])
     })
     beforeEach(() => {
-        mocks.invoke.mockReset()
+        mocks.invoke.mockReset().mockImplementation(async command => {
+            if (command === 'native_snapshot_restore_bodies_start') return bodyReceipt
+            if (command === 'native_file_job_status') return bodyStatus
+        })
         mocks.isTauriMobile = true
         mocks.relaunch.mockReset()
         mocks.confirmReplacement.mockReset().mockResolvedValue(true)
@@ -102,6 +110,9 @@ describe('native persistent maintenance', () => {
             ['pds_snapshot_list'],
             ['pds_snapshot_restore_stage', { id: 'ab18b8a5-f45c-46ba-bbf9-74b2cae87717',requestId:expect.any(String) }],
             ['pds_snapshot_restore_activate',{stagingId:'stage',expectedRevision:7,bindingAuthority:'0'}],
+            ['native_snapshot_restore_bodies_start',{stagingId:'stage',activationRevision:'8',bindingAuthority:'0'}],
+            ['native_file_job_status',{jobId:'bodies'}],
+            ['native_file_job_status',{jobId:'bodies'}],
         ])
     })
 
@@ -294,6 +305,20 @@ describe('native persistent maintenance', () => {
         expect(mocks.invoke.mock.calls.some(([command])=>command==='pds_snapshot_restore_abort')).toBe(false)
         await lifecycle.afterRefresh()
         expect(mocks.restartPlugins).toHaveBeenCalledOnce()
+    })
+    it('reports post-adoption body failure without activating again or requiring working-set recovery', async () => {
+        const failed={...bodyStatus,state:'failed',error:{code:'snapshot-bodies-incomplete',message:'Snapshot library is restored, but some bodies remain unavailable'},snapshotBodies:{...bodyStatus.snapshotBodies,allBodiesLocal:false,settled:false,total:1,locallyPresent:0,unavailable:1}}
+        mocks.invoke.mockImplementation(async command=>command==='native_snapshot_restore_bodies_start'?bodyReceipt:command==='native_file_job_status'?failed:undefined)
+            .mockResolvedValueOnce({stagingId:'stage'}).mockResolvedValueOnce({revision:8})
+        await expect(requestNativePersistentSnapshotRestore('snapshot')).rejects.toMatchObject({name:'NativeSnapshotBodiesCommittedError',bodies:{unavailable:1}})
+        expect(mocks.continuation).not.toHaveBeenCalled()
+        expect(mocks.invoke.mock.calls.filter(([command])=>command==='pds_snapshot_restore_activate')).toHaveLength(1)
+        expect(mocks.invoke.mock.calls.some(([command])=>command==='pds_snapshot_restore_abort')).toBe(false)
+        const binding=await mocks.prepareReplacement.mock.results[0].value
+        expect(binding.resume).toHaveBeenCalledOnce()
+        mocks.invoke.mockImplementation(async command=>command==='native_snapshot_restore_bodies_start'?bodyReceipt:bodyStatus)
+        await expect(completeNativeSnapshotRestoreBodies('stage',8,'0')).resolves.toMatchObject({allBodiesLocal:true})
+        expect(mocks.invoke.mock.calls.filter(([command])=>command==='pds_snapshot_restore_activate')).toHaveLength(1)
     })
     it('does not restart when snapshot staging fails', async () => {
         const requestError = new Error('stage failed')
