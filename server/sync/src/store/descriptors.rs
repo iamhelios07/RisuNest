@@ -18,6 +18,8 @@ impl Store {
         &self,
         changes: &[risunest_sync_wire::lww::UnitChange],
     ) -> Result<()> {
+        #[cfg(test)]
+        let _observed = crate::source_observer::ingress(&self.root);
         let mut pending = PendingIndex::default();
         for change in changes {
             if let risunest_sync_wire::unit::UnitValue::Object {
