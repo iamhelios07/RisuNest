@@ -7,3 +7,5 @@ pub mod native_shards;
 pub mod scale_certificate;
 pub mod final_runner;
 pub mod fixture_configuration;
+pub mod source_receipt;
+pub mod source_process;
