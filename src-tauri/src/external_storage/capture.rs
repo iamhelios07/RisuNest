@@ -87,6 +87,67 @@ struct BackupCaptureInputs {
     units: std::collections::BTreeMap<risunest_sync_wire::unit::UnitKey, risunest_sync_wire::unit::UnitValue>,
     closure: crate::persistent_store::external_capture::BackupDependencyClosure,
     sections: Vec<super::sections::CapturedSection>,
+    streamed: Option<BackupDependencySpool>,
+}
+
+pub(crate) struct BackupDependencySpool {
+    db: Connection,
+    file: tempfile::NamedTempFile,
+    sealed: bool,
+}
+
+impl BackupDependencySpool {
+    pub(crate) fn new(directory: &Path) -> Result<Self> {
+        fs::create_dir_all(directory)?;
+        if is_link_like(&fs::symlink_metadata(directory)?) { return Err(invalid("Backup spool directory must not be a link")); }
+        let file = tempfile::NamedTempFile::new_in(directory)?;
+        let db = Connection::open(file.path())?;
+        db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=OFF; PRAGMA cache_size=-4096; PRAGMA temp_store=FILE;
+            CREATE TABLE bodies(hash TEXT PRIMARY KEY,body BLOB NOT NULL,role INTEGER NOT NULL CHECK(role IN(1,2)));
+            BEGIN IMMEDIATE;")?;
+        Ok(Self {file,db,sealed:false})
+    }
+    pub(crate) fn push(&mut self, hash:&str,bytes:&[u8],role:crate::persistent_store::external_capture::BackupBodyRole) -> Result<()> {
+        if self.sealed || bytes.len() > risunest_sync_wire::MAX_METADATA_BYTES || risunest_sync_wire::hash(bytes) != hash {
+            return Err(invalid("Backup spool body identity differs"));
+        }
+        let role = match role {
+            crate::persistent_store::external_capture::BackupBodyRole::Control => 1,
+            crate::persistent_store::external_capture::BackupBodyRole::Payload => 2,
+        };
+        self.db.execute("INSERT OR IGNORE INTO bodies VALUES(?1,?2,?3)",params![hash,bytes,role])?;
+        let actual: i64 = self.db.query_row("SELECT role FROM bodies WHERE hash=?1",[hash],|row| row.get(0))?;
+        if actual != role {return Err(invalid("Backup spool body role differs"))}
+        Ok(())
+    }
+    pub(crate) fn seal(&mut self) -> Result<()> {
+        if self.sealed {return Err(invalid("Backup spool was already sealed"))}
+        self.db.execute_batch("COMMIT; PRAGMA synchronous=FULL;")?;
+        self.file.as_file().sync_all()?;
+        self.sealed = true;
+        Ok(())
+    }
+    pub(crate) fn visit(&self,visitor:&mut dyn FnMut(&str,&[u8],crate::persistent_store::external_capture::BackupBodyRole)->Result<()>) -> Result<()> {
+        if !self.sealed {return Err(invalid("Backup dependency spool is not sealed"))}
+        let mut statement = self.db.prepare("SELECT hash,length(body),body,role FROM bodies ORDER BY hash")?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let hash:String = row.get(0)?;
+            let length:i64 = row.get(1)?;
+            if length < 0 || length as u64 > risunest_sync_wire::MAX_METADATA_BYTES as u64 {
+                return Err(invalid("Backup dependency spool body exceeds its bound"));
+            }
+            let bytes:Vec<u8> = row.get(2)?;
+            let role = match row.get::<_,i64>(3)? {
+                1 => crate::persistent_store::external_capture::BackupBodyRole::Control,
+                2 => crate::persistent_store::external_capture::BackupBodyRole::Payload,
+                _ => return Err(invalid("Backup dependency role is invalid")),
+            };
+            if bytes.len() > risunest_sync_wire::MAX_METADATA_BYTES || risunest_sync_wire::hash(&bytes) != hash {return Err(invalid("Backup dependency spool integrity failed"))}
+            visitor(&hash,&bytes,role)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -233,7 +294,25 @@ impl CaptureCatalog {
         if self.identity.is_some() || self.finalized || self.backup_inputs.is_some() {
             return Err(invalid("Backup inputs must precede capture projection"));
         }
-        self.backup_inputs = Some(BackupCaptureInputs { units, closure, sections });
+        self.backup_inputs = Some(BackupCaptureInputs { units, closure, sections, streamed:None });
+        Ok(())
+    }
+
+    pub(crate) fn install_streamed_backup_inputs(
+        &mut self,
+        units: std::collections::BTreeMap<risunest_sync_wire::unit::UnitKey,risunest_sync_wire::unit::UnitValue>,
+        inventory:crate::persistent_store::external_capture::BackupDependencyInventory,
+        spool:BackupDependencySpool,
+        sections:Vec<super::sections::CapturedSection>,
+    ) -> Result<()> {
+        let managed_payloads = inventory.payloads.into_iter().filter(|(hash,_)| !inventory.spooled_payloads.contains(hash))
+            .map(|(hash,size)| size.map(|size| (hash,size)).ok_or_else(|| invalid("Backup payload size is missing")))
+            .collect::<Result<_>>()?;
+        let closure = crate::persistent_store::external_capture::BackupDependencyClosure {
+            controls:Default::default(),payload_bodies:Default::default(),managed_payloads,record_payloads:inventory.record_payloads,
+        };
+        self.install_backup_inputs(units,closure,sections)?;
+        self.backup_inputs.as_mut().unwrap().streamed = Some(spool);
         Ok(())
     }
 
@@ -441,6 +520,16 @@ impl ContentCaptureSink for CaptureCatalog {
             self.db.execute("INSERT INTO backup_scope VALUES(1,?1)", [i64::try_from(inputs.units.len()).map_err(|_| invalid("Original backup count overflow"))?])?;
             for (key,value) in inputs.units {
                 self.db.execute("INSERT INTO original_units VALUES(?1,?2)", params![key.as_str(),serde_json::to_string(&value)?])?;
+            }
+            if let Some(spool) = inputs.streamed {
+                spool.visit(&mut |hash,bytes,role| {
+                    self.object(hash,bytes)?;
+                    self.reference("backup-original-units",hash,bytes.len() as u64)?;
+                    if role == crate::persistent_store::external_capture::BackupBodyRole::Payload {
+                        self.db.execute("INSERT INTO original_payloads VALUES(?1,?2,?3)",params![hash,bytes.len() as i64,inputs.closure.record_payloads.contains(hash)])?;
+                    }
+                    Ok(())
+                })?;
             }
             for (hash,body) in inputs.closure.controls {
                 self.object(&hash,&body)?;
@@ -726,6 +815,26 @@ mod tests {
         )
         .expect("retry catalog creation");
         assert!(catalog.path.is_file());
+    }
+
+    #[test]
+    fn backup_dependency_spool_seals_roles_and_rechecks_integrity() {
+        use crate::persistent_store::external_capture::BackupBodyRole;
+        let directory = tempfile::tempdir().unwrap();
+        let mut spool = BackupDependencySpool::new(directory.path()).unwrap();
+        let body = b"synthetic streamed control";
+        let digest = risunest_sync_wire::hash(body);
+        assert!(spool.visit(&mut |_,_,_| Ok(())).is_err());
+        assert!(spool.push(&digest,b"different synthetic bytes",BackupBodyRole::Control).is_err());
+        spool.push(&digest,body,BackupBodyRole::Control).unwrap();
+        assert!(spool.push(&digest,body,BackupBodyRole::Payload).is_err());
+        spool.seal().unwrap();
+        assert!(spool.push(&digest,body,BackupBodyRole::Control).is_err());
+        let mut observed = Vec::new();
+        spool.visit(&mut |hash,bytes,role| {observed.push((hash.to_owned(),bytes.to_vec(),role)); Ok(())}).unwrap();
+        assert_eq!(observed,vec![(digest.clone(),body.to_vec(),BackupBodyRole::Control)]);
+        spool.db.execute("UPDATE bodies SET body=?1 WHERE hash=?2",params![b"synthetic corruption".as_slice(),digest]).unwrap();
+        assert!(spool.visit(&mut |_,_,_| Ok(())).is_err());
     }
 
     #[test]
