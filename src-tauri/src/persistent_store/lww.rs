@@ -231,6 +231,12 @@ enum Intent {
 #[serde(transparent)]
 pub(crate) struct CommitIntentInput(Intent);
 
+#[cfg(test)]
+std::thread_local! {
+    static BACKUP_CAPTURE_PINNED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static BACKUP_CAPTURE_RELEASED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
 pub(super) fn authority(db: &Connection) -> StoreResult<DecimalU64> {
     let value: String = db.query_row(
         "SELECT binding_authority FROM lww_clock WHERE singleton=1",
@@ -353,6 +359,9 @@ fn is_retired(db: &Connection, key: &UnitKey) -> StoreResult<bool> {
     )?)
 }
 pub(super) fn parent_status(db: &Connection, key: &UnitKey) -> StoreResult<&'static str> {
+    parent_status_in_generation(db,key,None)
+}
+fn parent_status_in_generation(db: &Connection, key: &UnitKey, generation: Option<&str>) -> StoreResult<&'static str> {
     if is_retired(db, key)? {
         return Ok("retired");
     }
@@ -366,7 +375,7 @@ pub(super) fn parent_status(db: &Connection, key: &UnitKey) -> StoreResult<&'sta
             missing = true;
         }
         if archived_hold && parent.components()[1] == "character" {
-            let generation = active_generation(db)?;
+            let generation = generation.map(str::to_owned).map(Ok).unwrap_or_else(|| active_generation(db))?;
             let archived:Option<bool>=db.query_row("SELECT archived_object IS NOT NULL FROM characters WHERE generation=?1 AND character_id=?2",params![generation,parent.components()[2]],|r|r.get(0)).optional()?;
             if archived == Some(true) {
                 missing = true;
@@ -374,6 +383,30 @@ pub(super) fn parent_status(db: &Connection, key: &UnitKey) -> StoreResult<&'sta
         }
     }
     Ok(if missing { "held" } else { "ready" })
+}
+pub(super) fn project_replacement_units(
+    tx: &Transaction<'_>, generation: &str, header: &Header, stamp: &Stamp,
+    changes: &[(UnitKey,UnitValue)],
+) -> StoreResult<()> {
+    let mut ordered=changes.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|(key,_)| match key.components()[0].as_str() {
+        "exists" if key.components()[1]!="conversation" => 0,
+        "exists" => 1,
+        "archive" => 2,
+        _ => 3,
+    });
+    for (key,value) in ordered {
+        if read_unit(tx,key)? != Some((stamp.clone(),value.clone())) { continue; }
+        let hard_delete=key.components()[0]=="exists"&&matches!(value,UnitValue::Deleted);
+        match parent_status_in_generation(tx,key,Some(generation))? {
+            "retired" if !hard_delete => continue,
+            "held" => {
+                tx.execute("INSERT INTO lww_receive_rows VALUES(?1,?2,?3,?4,'held')", params![header.request_id,key.as_str(),serde_json::to_string(stamp)?,serde_json::to_string(value)?])?;
+            }
+            _ => projection::apply(tx,generation,key,value)?,
+        }
+    }
+    Ok(())
 }
 fn suppress_retired(db: &Connection, parent: &UnitKey) -> StoreResult<()> {
     let p = parent.components();
@@ -467,7 +500,130 @@ pub(super) fn record_changes(
     Ok(())
 }
 
+fn pin_backup_device_snapshot(library: &Connection, path: &str) -> StoreResult<()> {
+    let mut uri=url::Url::from_file_path(path).map_err(|_| error("backup-device-path-unavailable"))?;
+    uri.set_query(Some("mode=ro"));
+    library.execute("ATTACH DATABASE ?1 AS backup_device", [uri.as_str()])?;
+    if !library.is_readonly("backup_device")? { return Err(error("backup-device-snapshot-not-readonly")); }
+    library.query_row("SELECT revision FROM backup_device.device_meta WHERE singleton=1", [], |row| row.get::<_,i64>(0))?;
+    Ok(())
+}
+
 impl PersistentStore {
+    pub(crate) fn lww_backup_unit_values(&self, lease: &str) -> StoreResult<BTreeMap<UnitKey, UnitValue>> {
+        let reader = self.revision_leases.get(lease).ok_or(StoreError::SnapshotReleased)?;
+        if current_revision(&reader.connection)? != reader.target.revision
+            || active_generation(&reader.connection)? != reader.target.generation
+        { return Err(error("backup-lease-identity-changed")); }
+        let pinned: bool = reader.connection.query_row("SELECT EXISTS(SELECT 1 FROM pragma_database_list WHERE name='backup_device')", [], |row| row.get(0))?;
+        if !pinned { return Err(error("backup-capture-lease-required")); }
+        let authority: String = reader.connection.query_row("SELECT binding_authority FROM backup_device.lww_clock WHERE singleton=1", [], |row| row.get(0))?;
+        let authority: DecimalU64 = wire(authority.try_into())?;
+        let mut statement = reader.connection.prepare("SELECT key,stamp,value FROM lww_units ORDER BY key")?;
+        let rows = statement.query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?)))?;
+        let mut values = BTreeMap::<UnitKey,(Stamp,UnitValue)>::new();
+        for row in rows {
+            let (key,stamp,value) = row?;
+            let key: UnitKey = wire(key.try_into())?;
+            let stamp: Stamp = serde_json::from_str(&stamp)?;
+            wire(stamp.validate())?;
+            let value: UnitValue = serde_json::from_str(&value)?;
+            wire({
+                let result = value.validate();
+                #[cfg(test)]
+                crate::persistent_store::hash_work::validation(&value);
+                result
+            })?;
+            if !projection::is_device(&key) { values.insert(key,(stamp,value)); }
+        }
+        let mut statement = reader.connection.prepare("SELECT rows.request_id,rows.key,rows.stamp,rows.value,proof.digest,proof.body FROM lww_receive_rows rows JOIN backup_device.lww_receive proof ON proof.request_id=rows.request_id WHERE rows.status IN ('held','deferred') AND proof.applied=1 AND proof.finished=1 AND proof.authority=?1 ORDER BY rows.request_id,rows.key")?;
+        let rows = statement.query_map([authority.0.to_string()], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?)))?;
+        let mut proofs = BTreeMap::<String,StageReceive>::new();
+        for row in rows {
+            let (request_id,key,stamp,value,digest,body) = row?;
+            if !proofs.contains_key(&request_id) {
+                #[cfg(test)]
+                crate::persistent_store::hash_work::observe("native_backup_receive_proof", body.len());
+                if risunest_sync_wire::hash(body.as_bytes()) != digest { return Err(error("request-id-integrity")); }
+                let request: StageReceive = serde_json::from_str(&body)?;
+                if request.header.request_id != request_id || request.header.binding_authority != authority { return Err(error("request-id-integrity")); }
+                proofs.insert(request_id.clone(),request);
+            }
+            let change = Change { key:wire(key.try_into())?, stamp:serde_json::from_str(&stamp)?, value:serde_json::from_str(&value)? };
+            let request = &proofs[&request_id];
+            if !request.changes.contains(&change) || change.stamp.physical_ms > request.admitted_time_upper_ms { return Err(error("request-id-integrity")); }
+            wire(change.stamp.validate())?;
+            wire({
+                let result = change.value.validate();
+                #[cfg(test)]
+                crate::persistent_store::hash_work::validation(&change.value);
+                result
+            })?;
+            projection::validate_received(&reader.connection,&change.key,&change.value)?;
+            if projection::is_device(&change.key) || parent_status(&reader.connection,&change.key)?=="retired" { continue; }
+            let decision = match values.get(&change.key) {
+                Some((stamp,value)) => wire({
+                    let result=compare_version(stamp,value,&change.stamp,&change.value);
+                    #[cfg(test)]
+                    crate::persistent_store::hash_work::comparison(value,&change.value,&result);
+                    result
+                })?,
+                None => LwwDecision::ApplyRemote,
+            };
+            if decision==LwwDecision::ApplyRemote { values.insert(change.key,(change.stamp,change.value)); }
+        }
+        Ok(values.into_iter().map(|(key,(_,value))|(key,value)).collect())
+    }
+    pub(crate) fn lww_device_replacement_receipt(
+        &self,
+        header: &Header,
+        staging_id: &str,
+    ) -> StoreResult<Option<RevisionResult>> {
+        completed_device_replacement_receipt(&self.connection, self.device_store()?.connection(), header, staging_id)
+    }
+    pub(crate) fn lww_acquire_backup_capture(
+        &mut self,
+        revision: i64,
+    ) -> StoreResult<(super::LeaseResult, Vec<device_store::sections::PreparedSectionRows>)> {
+        use risunest_external_storage_format::section::SectionKind;
+        let path: String = self.device_store()?.connection().query_row(
+            "SELECT file FROM pragma_database_list WHERE name='main'", [], |row| row.get(0),
+        )?;
+        if path.is_empty() { return Err(error("backup-device-path-unavailable")); }
+        let mut barrier = Connection::open(&path)?;
+        let tx = barrier.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|error| match error {
+            rusqlite::Error::SqliteFailure(ref code, _) if matches!(code.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => StoreError::CommitBusy,
+            error => error.into(),
+        })?;
+        if tx.query_row("SELECT EXISTS(SELECT 1 FROM lww_intents WHERE complete=0) OR EXISTS(SELECT 1 FROM lww_receive WHERE finished=0 AND authority=(SELECT binding_authority FROM lww_clock WHERE singleton=1))", [], |row| row.get::<_,bool>(0))? {
+            return Err(StoreError::CommitBusy);
+        }
+        let snapshot = Connection::open_with_flags(
+            &path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        snapshot.execute_batch("PRAGMA busy_timeout=5000; PRAGMA query_only=ON; PRAGMA mmap_size=0; BEGIN;")?;
+        snapshot.query_row("SELECT revision FROM device_meta WHERE singleton=1", [], |row| row.get::<_,i64>(0))?;
+        let lease = self.acquire_revision(revision)?;
+        let outcome = (|| {
+            let library = &self.revision_leases[&lease.lease].connection;
+            pin_backup_device_snapshot(library,&path)?;
+            #[cfg(test)]
+            BACKUP_CAPTURE_PINNED.with(|hook| { if let Some(hook) = hook.borrow_mut().take() { hook(); } });
+            tx.rollback()?;
+            #[cfg(test)]
+            BACKUP_CAPTURE_RELEASED.with(|hook| { if let Some(hook) = hook.borrow_mut().take() { hook(); } });
+            let sections = device_store::sections::capture_backup_sections_snapshot(
+                &snapshot, &[SectionKind::Hypa, SectionKind::LocalPlugins, SectionKind::LocalSettings],
+            )?;
+            snapshot.execute_batch("COMMIT;")?;
+            Ok(sections)
+        })();
+        drop(barrier);
+        match outcome {
+            Ok(sections) => Ok((lease, sections)),
+            Err(error) => { self.release_revision(&lease.lease)?; Err(error) }
+        }
+    }
     pub(crate) fn lww_object_body(&self, hash: &str) -> StoreResult<Option<Vec<u8>>> {
         if let Some(body) = super::message_pages::object_body(&self.connection, hash)? {
             return Ok(Some(body));
@@ -1429,7 +1585,8 @@ impl PersistentStore {
                         projection::apply(&tx, &generation, &change.key, &change.value)?;
                         result.affected_keys.push(change.key.clone());
                     }
-                    witness_received(&tx, &change, current_authority)?;
+                    let local_pending: bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM lww_requests receipt JOIN lww_outbox pending ON pending.version=receipt.request_id WHERE receipt.request_id=?1 AND pending.key=?2 AND pending.stamp=?3 AND pending.value=?4)",params![id,change.key.as_str(),serde_json::to_string(&change.stamp)?,serde_json::to_string(&change.value)?],|row|row.get(0))?;
+                    if !local_pending { witness_received(&tx, &change, current_authority)?; }
                 }
                 tx.execute(
                     "UPDATE lww_receive_rows SET status=?3 WHERE request_id=?1 AND key=?2",
@@ -1949,6 +2106,35 @@ impl PersistentStore {
         }
         Ok(result)
     }
+}
+
+pub(crate) fn completed_device_replacement_receipt(
+    library: &Connection,
+    device: &Connection,
+    header: &Header,
+    staging_id: &str,
+) -> StoreResult<Option<RevisionResult>> {
+    validate_header(header)?;
+    let row: Option<(String,String,String,bool)> = device.query_row(
+        "SELECT authority,body,digest,complete FROM lww_intents WHERE request_id=?1", [&header.request_id],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+    ).optional()?;
+    let Some((authority, body, digest, complete)) = row else { return Ok(None); };
+    let intent: Intent = serde_json::from_str(&body)?;
+    if authority != header.binding_authority.0.to_string()
+        || !matches!(intent, Intent::Replacement { staging_id:ref stage, device_sections:Some(_), .. } if stage==staging_id)
+    { return Err(error("request-id-integrity")); }
+    #[cfg(test)]
+    crate::persistent_store::hash_work::observe("native_replacement_receipt", body.len());
+    if risunest_sync_wire::hash(body.as_bytes()) != digest { return Err(error("request-id-integrity")); }
+    if !complete { return Ok(None); }
+    let committed: Option<(String,i64)> = library.query_row(
+        "SELECT digest,revision FROM lww_requests WHERE request_id=?1", [&header.request_id],
+        |row| Ok((row.get(0)?,row.get(1)?)),
+    ).optional()?;
+    let Some((committed_digest, revision)) = committed else { return Err(error("replacement-receipt-missing")); };
+    if committed_digest != digest || revision <= 0 { return Err(error("request-id-integrity")); }
+    Ok(Some(RevisionResult { revision }))
 }
 
 fn reset_target_device(

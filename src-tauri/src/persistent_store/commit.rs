@@ -1336,6 +1336,7 @@ pub(super) fn replace_commit_lww(
             if super::lww::parent_status(&transaction,key)?=="retired"&&!(key.components()[0]=="exists"&&matches!(value,risunest_sync_wire::unit::UnitValue::Deleted)){continue;}
             super::lww::put_unit(&transaction,key,stamp,value,&header.request_id,Some(header.binding_authority))?;
         }
+        super::lww::project_replacement_units(&transaction,&generation,header,stamp,changes)?;
     }
     if !target {for (key,_) in changes{super::lww::ensure_publishable_parents(&transaction,key,header.binding_authority)?;}}
     let changed=if target {received.iter().map(|c|c.key.clone()).collect::<Vec<_>>()}else{changes.iter().map(|(k,_)|k.clone()).collect::<Vec<_>>()};
