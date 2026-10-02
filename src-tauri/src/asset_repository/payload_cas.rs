@@ -188,7 +188,10 @@ impl PayloadCas {
             if cancelled() {
                 return Err(io::Error::other("import cancelled"));
             }
-            let length = file.read(&mut buffer)?;
+            let read = file.read(&mut buffer);
+            #[cfg(test)]
+            super::body_io::read_result("owned", &read);
+            let length = read?;
             if length == 0 {
                 break;
             }
@@ -415,6 +418,8 @@ impl PayloadCas {
     }
 
     pub fn stat_object(&self, content_hash: &str) -> io::Result<Option<u64>> {
+        #[cfg(test)]
+        super::body_io::stat_request();
         let Some(path) = self.existing_object_path(content_hash)? else {
             return Ok(None);
         };
@@ -425,7 +430,10 @@ impl PayloadCas {
         let Some(path) = self.existing_object_path(content_hash)? else {
             return Ok(None);
         };
-        Ok(Some(fs::read(path)?))
+        let body = fs::read(path);
+        #[cfg(test)]
+        super::body_io::read_file_result(&body);
+        Ok(Some(body?))
     }
 
     pub fn read_object_range(
@@ -443,7 +451,10 @@ impl PayloadCas {
         let Some(path) = self.existing_object_path(content_hash)? else {
             return Ok(None);
         };
-        let mut file = File::open(path)?;
+        let file = File::open(path);
+        #[cfg(test)]
+        super::body_io::open_result("managed", &file);
+        let mut file = file?;
         let size = file.metadata()?.len();
         let bounded_start = start.min(size);
         let bounded_end = end_exclusive.min(size);
@@ -451,7 +462,10 @@ impl PayloadCas {
             .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "payload range is too large"))?;
         file.seek(SeekFrom::Start(bounded_start))?;
         let mut data = vec![0; length];
-        file.read_exact(&mut data)?;
+        let read = file.read_exact(&mut data);
+        #[cfg(test)]
+        super::body_io::read_exact_result("managed", &read, data.len());
+        read?;
         Ok(Some(data))
     }
 
@@ -459,11 +473,22 @@ impl PayloadCas {
         let Some(path) = self.existing_object_path(content_hash)? else {
             return Ok(None);
         };
-        Ok(Some(File::open(path)?))
+        let file = File::open(path);
+        #[cfg(test)]
+        super::body_io::open_result("managed", &file);
+        let file = file?;
+        #[cfg(test)]
+        super::body_io::escaped_handle("managed");
+        Ok(Some(file))
     }
 
     pub fn object_path(&self, content_hash: &str) -> io::Result<Option<PathBuf>> {
-        self.existing_object_path(content_hash)
+        let path = self.existing_object_path(content_hash);
+        #[cfg(test)]
+        if path.as_ref().is_ok_and(Option::is_some) {
+            super::body_io::escaped_path("managed");
+        }
+        path
     }
 
     /// Whether the object is held here at `expected_size` and its bytes hash
@@ -615,6 +640,8 @@ impl PayloadCas {
     }
 
     fn existing_object_path(&self, content_hash: &str) -> io::Result<Option<PathBuf>> {
+        #[cfg(test)]
+        super::body_io::presence_query();
         validate_content_hash(content_hash)?;
         self.ensure_repository_root()?;
         let assets_directory = self.repository_root.join("assets");
@@ -683,7 +710,13 @@ impl PayloadCas {
                 .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
                 .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE);
         }
-        let file = options.open(path)?;
+        let file = options.open(path);
+        #[cfg(test)]
+        super::body_io::open_result(
+            if path.starts_with(self.repository_root.join("assets").join("objects")) { "managed" } else { "owned" },
+            &file,
+        );
+        let file = file?;
         let metadata = file.metadata()?;
         self.validate_owned_file(path, &metadata)?;
         Ok(file)
@@ -725,6 +758,8 @@ impl PayloadCasReadScan {
         &self,
         content_hashes: impl IntoIterator<Item = &'a str>,
     ) -> io::Result<Vec<Option<u64>>> {
+        #[cfg(test)]
+        super::body_io::batch_stat_request();
         let content_hashes = content_hashes.into_iter().collect::<Vec<_>>();
         for content_hash in &content_hashes {
             validate_content_hash(content_hash)?;
@@ -889,7 +924,10 @@ fn hash_open_file(file: &mut File, cancelled: &dyn Fn() -> bool) -> io::Result<S
         if cancelled() {
             return Err(io::Error::other("payload verification cancelled"));
         }
-        let read = file.read(&mut buffer)?;
+        let read = file.read(&mut buffer);
+        #[cfg(test)]
+        super::body_io::read_result("managed", &read);
+        let read = read?;
         if read == 0 {
             break;
         }
@@ -1575,5 +1613,125 @@ mod hash_work_tests {
         reset_hash_work();
         cas.stat_object(&expected).unwrap();
         assert!(take_hash_work().domains.is_empty());
+    }
+}
+
+
+#[cfg(test)]
+mod body_io_tests {
+    use super::*;
+    use crate::asset_repository::body_io::{reset_body_io, take_body_io, BodyWork};
+
+    fn fixture(bytes: &[u8]) -> (tempfile::TempDir, PayloadCas, PreparedPayload) {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let prepared = cas.prepare_bytes(bytes).unwrap();
+        (directory, cas, prepared)
+    }
+
+    #[test]
+    fn catalog_and_missing_body_checks_do_not_open_payloads() {
+        let (directory, cas, prepared) = fixture(b"synthetic body");
+        let missing = "a".repeat(64);
+        let scan = PayloadCas::new(directory.path()).unwrap().into_read_scan();
+        reset_body_io();
+        assert_eq!(cas.stat_object(&prepared.content_hash).unwrap(), Some(14));
+        assert_eq!(cas.stat_object(&missing).unwrap(), None);
+        assert!(cas.read_object(&missing).unwrap().is_none());
+        assert!(cas.open_object(&missing).unwrap().is_none());
+        assert_eq!(scan.stat_objects([prepared.content_hash.as_str(),missing.as_str()]).unwrap(), vec![Some(14),None]);
+        let work = take_body_io();
+        assert!(work.domains.is_empty());
+        assert_eq!(work.stat_requests, 2);
+        assert_eq!(work.batch_stat_requests, 1);
+        assert_eq!(work.presence_queries, 4);
+        assert!(work.complete());
+    }
+
+    #[test]
+    fn full_and_range_reads_record_actual_opens_and_exact_bytes() {
+        let body = b"synthetic body";
+        let (_directory, cas, prepared) = fixture(body);
+        reset_body_io();
+        assert_eq!(cas.read_object(&prepared.content_hash).unwrap().unwrap(), body);
+        assert_eq!(cas.read_object_range(&prepared.content_hash, 2, 7).unwrap().unwrap(), &body[2..7]);
+        let work = take_body_io();
+        assert_eq!(work.domains["managed"], BodyWork {
+            open_attempts: 2, opens: 2, read_operations: 2, read_bytes: body.len() as u64 + 5,
+            ..Default::default()
+        });
+        assert!(work.complete());
+        assert_eq!(take_body_io().domains.len(), 0);
+        reset_body_io();
+        assert!(take_body_io().domains.is_empty());
+    }
+
+    #[test]
+    fn failed_actual_open_is_counted_without_inventing_a_body_read() {
+        let (_directory, cas, _prepared) = fixture(b"synthetic body");
+        let missing = cas.repository_root.join(object_physical_key(&"a".repeat(64)));
+        reset_body_io();
+        assert!(cas.open_exact_owned_file(&missing).is_err());
+        assert!(cas.read_object_range(&"a".repeat(64), 3, 2).is_err());
+        let work = take_body_io();
+        assert_eq!(work.domains["managed"], BodyWork { open_attempts: 1, failed_opens: 1, ..Default::default() });
+        assert_eq!(work.presence_queries, 0);
+        assert!(work.complete());
+    }
+
+    #[test]
+    fn escaped_handles_mark_later_external_read_bytes_incomplete() {
+        let (_directory, cas, prepared) = fixture(b"synthetic body");
+        reset_body_io();
+        let mut file = cas.open_object(&prepared.content_hash).unwrap().unwrap();
+        let mut bytes = Vec::new(); file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"synthetic body");
+        let work = take_body_io();
+        assert_eq!(work.domains["managed"], BodyWork { open_attempts: 1, opens: 1, escaped_handles: 1, ..Default::default() });
+        assert!(!work.complete());
+        reset_body_io();
+        let path = cas.object_path(&prepared.content_hash).unwrap().unwrap();
+        assert_eq!(fs::read(path).unwrap(), b"synthetic body");
+        let work = take_body_io();
+        assert_eq!(work.domains["managed"], BodyWork { escaped_paths: 1, ..Default::default() });
+        assert!(!work.complete());
+    }
+
+    #[test]
+    fn verification_reads_count_only_executed_bytes_before_cancellation() {
+        let bytes = vec![7; COPY_BUFFER_BYTES * 2 + 13];
+        let (_directory, cas, prepared) = fixture(&bytes);
+        let checks = std::cell::Cell::new(0);
+        reset_body_io();
+        assert!(cas.holds_exact_object(&prepared.content_hash, bytes.len() as u64, &|| {
+            let count = checks.get(); checks.set(count + 1); count > 0
+        }).is_err());
+        let work = take_body_io();
+        assert_eq!(work.domains["managed"], BodyWork {
+            open_attempts: 1, opens: 1, read_operations: 1, read_bytes: COPY_BUFFER_BYTES as u64,
+            ..Default::default()
+        });
+        assert!(work.complete());
+    }
+
+    #[test]
+    fn worker_io_is_collected_on_that_thread_and_never_inferred_on_caller() {
+        let (_directory, cas, prepared) = fixture(b"synthetic body");
+        let cas = std::sync::Arc::new(cas);
+        reset_body_io();
+        let caller = std::thread::current().id();
+        let worker = std::thread::spawn(move || {
+            reset_body_io();
+            cas.read_object(&prepared.content_hash).unwrap().unwrap();
+            take_body_io()
+        }).join().unwrap();
+        assert_ne!(worker.thread, caller);
+        assert_eq!(worker.domains["managed"].opens, 1);
+        assert_eq!(worker.domains["managed"].read_bytes, 14);
+        assert!(worker.complete());
+        let parent = take_body_io();
+        assert_eq!(parent.thread, caller);
+        assert!(parent.domains.is_empty());
+        assert!(parent.complete());
     }
 }

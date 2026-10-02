@@ -6,6 +6,8 @@ pub(crate) mod migration_gc;
 #[path = "../owner_manifest_codec.rs"]
 pub(crate) mod owner_manifest_codec;
 mod payload_cas;
+#[cfg(test)]
+pub(crate) mod body_io;
 
 pub(crate) use payload_cas::exact_file_identity;
 #[cfg(test)]
