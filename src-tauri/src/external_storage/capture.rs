@@ -108,7 +108,7 @@ impl BackupDependencySpool {
         Ok(Self {file,db,sealed:false})
     }
     pub(crate) fn push(&mut self, hash:&str,bytes:&[u8],role:crate::persistent_store::external_capture::BackupBodyRole) -> Result<()> {
-        if self.sealed || bytes.len() > risunest_sync_wire::MAX_METADATA_BYTES || risunest_sync_wire::hash(bytes) != hash {
+        if self.sealed || bytes.len() > risunest_sync_wire::MAX_METADATA_BYTES || crate::persistent_store::external_capture::hash_backup_body(bytes,"native_backup_spool_write") != hash {
             return Err(invalid("Backup spool body identity differs"));
         }
         let role = match role {
@@ -143,7 +143,7 @@ impl BackupDependencySpool {
                 2 => crate::persistent_store::external_capture::BackupBodyRole::Payload,
                 _ => return Err(invalid("Backup dependency role is invalid")),
             };
-            if bytes.len() > risunest_sync_wire::MAX_METADATA_BYTES || risunest_sync_wire::hash(&bytes) != hash {return Err(invalid("Backup dependency spool integrity failed"))}
+            if bytes.len() > risunest_sync_wire::MAX_METADATA_BYTES || crate::persistent_store::external_capture::hash_backup_body(&bytes,"native_backup_spool_read") != hash {return Err(invalid("Backup dependency spool integrity failed"))}
             visitor(&hash,&bytes,role)?;
         }
         Ok(())
@@ -815,6 +815,25 @@ mod tests {
         )
         .expect("retry catalog creation");
         assert!(catalog.path.is_file());
+    }
+
+    #[test]
+    fn backup_dependency_spool_observes_actual_write_and_read_hashes() {
+        use crate::persistent_store::external_capture::BackupBodyRole;
+        let directory = tempfile::tempdir().unwrap();
+        let mut spool = BackupDependencySpool::new(directory.path()).unwrap();
+        let body = b"synthetic observed payload";
+        let digest = risunest_sync_wire::hash(body);
+        crate::persistent_store::hash_work::reset_hash_work();
+        spool.push(&digest,body,BackupBodyRole::Payload).unwrap();
+        spool.seal().unwrap();
+        spool.visit(&mut |hash,bytes,role| {assert_eq!(hash,digest); assert_eq!(bytes,body); assert_eq!(role,BackupBodyRole::Payload); Ok(())}).unwrap();
+        let observed = crate::persistent_store::hash_work::take_hash_work();
+        assert!(observed.incomplete.is_empty());
+        for domain in ["native_backup_spool_write","native_backup_spool_read"] {
+            assert_eq!(observed.domains[domain].calls,1);
+            assert_eq!(observed.domains[domain].bytes,body.len() as u64);
+        }
     }
 
     #[test]

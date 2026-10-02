@@ -151,6 +151,14 @@ pub(crate) fn original_unit_dependency_closure(
     Ok(BackupDependencyClosure {controls,payload_bodies,managed_payloads,record_payloads:inventory.record_payloads})
 }
 
+pub(crate) fn hash_backup_body(bytes:&[u8], domain:&'static str) -> String {
+    #[cfg(test)]
+    crate::persistent_store::hash_work::observe(domain,bytes.len());
+    #[cfg(not(test))]
+    let _ = domain;
+    risunest_sync_wire::hash(bytes)
+}
+
 pub(crate) fn original_unit_dependency_inventory(
     units: &BTreeMap<risunest_sync_wire::unit::UnitKey,risunest_sync_wire::unit::UnitValue>,
     read_body: &dyn Fn(&str) -> StoreResult<Option<Vec<u8>>>,
@@ -165,7 +173,7 @@ pub(crate) fn original_unit_dependency_inventory(
     let load = |hash:&str| -> StoreResult<Option<Vec<u8>>> {
         check(probe)?;
         let bytes = read_body(hash)?;
-        if bytes.as_ref().is_some_and(|bytes| bytes.len() > risunest_sync_wire::MAX_METADATA_BYTES || risunest_sync_wire::hash(bytes) != hash) {
+        if bytes.as_ref().is_some_and(|bytes| bytes.len() > risunest_sync_wire::MAX_METADATA_BYTES || hash_backup_body(bytes,"native_backup_dependency_source") != hash) {
             return Err(invalid("Backup bounded source body integrity failed"));
         }
         Ok(bytes)
@@ -178,17 +186,21 @@ pub(crate) fn original_unit_dependency_inventory(
     }
     for (key,value) in units {
         check(probe)?;
+        #[cfg(test)]
+        crate::persistent_store::hash_work::validation(value);
         value.validate().map_err(|_| invalid("Invalid original backup value"))?;
         let UnitValue::Object {descriptor_hash,descriptor} = value else {continue};
         let bytes = descriptor.bytes().map_err(|_| invalid("Invalid original backup descriptor"))?;
-        if risunest_sync_wire::hash(&bytes) != *descriptor_hash {return Err(invalid("Original backup descriptor identity differs"))}
+        if hash_backup_body(&bytes,"native_backup_dependency_descriptor") != *descriptor_hash {return Err(invalid("Original backup descriptor identity differs"))}
         control(&mut inventory,emit,descriptor_hash,&bytes)?;
         let kind = key.components();
         if super::lww::lww_known_unit_key(key) && matches!(kind[0].as_str(),"messages"|"archive") {
             let body = load(&descriptor.object_hash)?.ok_or_else(|| invalid("Pinned backup control is unavailable"))?;
             if kind[0] == "messages" {
-                let manifest = risunest_external_storage_format::message_pages::MessageManifest::decode(&body)
-                    .map_err(|_| invalid("Pinned backup message manifest integrity failed"))?;
+                let result = risunest_external_storage_format::message_pages::MessageManifest::decode(&body);
+                #[cfg(test)]
+                crate::persistent_store::hash_work::decoded("native_backup_manifest_decode_identity",&body,&result);
+                let manifest = result.map_err(|_| invalid("Pinned backup message manifest integrity failed"))?;
                 for page in manifest.pages {
                     if copy_bodies {
                         let bytes = load(&page.hash)?.ok_or_else(|| invalid("Pinned backup message page is unavailable"))?;
@@ -198,6 +210,27 @@ pub(crate) fn original_unit_dependency_inventory(
                         inventory.controls.insert(page.hash,page.byte_length.0);
                     }
                 }
+            } else {
+                let archived: super::archive::ArchivedObject = serde_json::from_slice(&body)?;
+                let mut shared = archived.clone();
+                shared.object_hash = shared.shared_object_hash.clone();
+                shared.asset_hashes = shared.shared_asset_hashes.clone();
+                let encoded = risunest_sync_wire::payload_value::encode(&serde_json::to_value(&shared)?)
+                    .map_err(|_| invalid("Invalid backup archive metadata"))?;
+                if encoded != body {return Err(invalid("Backup archive metadata differs from its shared value"))}
+                let mut expected = risunest_sync_wire::descriptor::RecordDescriptor::content(
+                    hash_backup_body(&encoded,"native_backup_archive_metadata"));
+                let mut roots = shared.object_roots().map(str::to_owned).collect::<Vec<_>>();
+                roots.sort(); roots.dedup();
+                if risunest_sync_wire::descriptor::inline_references(&roots).map_err(|_| invalid("Invalid backup archive roots"))? {
+                    expected.dependencies = roots;
+                } else {
+                    let tree = risunest_sync_wire::descriptor::build_reference_tree(&roots,false);
+                    #[cfg(test)]
+                    crate::persistent_store::hash_work::reference_creation(&tree);
+                    expected.dependency_root = tree.map_err(|_| invalid("Invalid backup archive roots"))?.0;
+                }
+                if expected != *descriptor {return Err(invalid("Backup archive descriptor differs from its metadata"))}
             }
             control(&mut inventory,emit,&descriptor.object_hash,&body)?;
         } else {
@@ -215,7 +248,11 @@ pub(crate) fn original_unit_dependency_inventory(
                     Ok(bytes)
                 })();
                 match result {
-                    Ok(bytes) => Ok(bytes),
+                    Ok(bytes) => {
+                        #[cfg(test)]
+                        crate::persistent_store::hash_work::observe("native_backup_reference_verify",bytes.len());
+                        Ok(bytes)
+                    },
                     Err(error) => { source_error = Some(error); Err(risunest_sync_wire::WireError("backup-reference-source-failed")) }
                 }
             },|value,page| {
@@ -1180,6 +1217,42 @@ mod hydration_tests {
         assert!(closure.payload_bodies.is_empty() && closure.managed_payloads.is_empty());
         assert!(original_unit_dependency_closure(&units,&|_| Ok(None),&|_| Ok(None),&crate::local_backup::NeverCancelled).is_err());
         assert!(original_unit_dependency_closure(&units,&|_| Ok(Some(b"wrong body".to_vec())),&|_| Ok(None),&crate::local_backup::NeverCancelled).is_err());
+    }
+
+    #[test]
+    fn original_unit_inventory_keeps_real_archive_metadata_and_shared_payload_roots() {
+        use risunest_sync_wire::unit::UnitKey;
+        let directory = tempfile::tempdir().unwrap();
+        let store = PersistentStore::open(directory.path()).unwrap();
+        let compressed = risunest_sync_wire::hash(b"synthetic compressed archive");
+        let asset = risunest_sync_wire::hash(b"synthetic archived asset");
+        let archived = super::super::archive::ArchivedObject {
+            object_hash:compressed.clone(),shared_object_hash:compressed.clone(),archived_at:1,
+            conversation_count:0,message_count:0,asset_hashes:vec![asset.clone()],shared_asset_hashes:vec![asset.clone()],identity_remap:Vec::new(),
+        };
+        let value = super::super::lww::archive_value(&store.connection,&archived).unwrap();
+        let units = BTreeMap::from([(UnitKey::new(&["archive","synthetic"]).unwrap(),value.clone())]);
+        let metadata_hash = match &value {risunest_sync_wire::unit::UnitValue::Object{descriptor,..} => descriptor.object_hash.clone(),_ => unreachable!()};
+        let mut emitted = Vec::new();
+        crate::persistent_store::hash_work::reset_hash_work();
+        let inventory = original_unit_dependency_inventory(&units,
+            &|hash| {assert_eq!(hash,metadata_hash,"Archive payload opened during metadata validation"); super::super::message_pages::object_body(&store.connection,hash)},
+            &|_| Ok(Some(32)),&crate::local_backup::NeverCancelled,false,
+            &mut |hash,_,role| {emitted.push((hash.to_owned(),role)); Ok(())}).unwrap();
+        let hashes = crate::persistent_store::hash_work::take_hash_work();
+        assert!(hashes.incomplete.is_empty());
+        for domain in ["native_backup_dependency_source","native_backup_dependency_descriptor","native_backup_archive_metadata","native_wire_descriptor_validation"] {
+            assert!(hashes.domains[domain].bytes > 0,"Missing actual SHA observation: {domain}");
+        }
+        assert!(inventory.controls.contains_key(&metadata_hash));
+        assert_eq!(inventory.payloads,BTreeMap::from([(compressed,Some(32)),(asset,Some(32))]));
+        assert!(!inventory.record_payloads.contains(&metadata_hash));
+        assert!(emitted.iter().all(|(_,role)| *role == BackupBodyRole::Control));
+        let mut invalid_units = units.clone();
+        let mut descriptor = match value {risunest_sync_wire::unit::UnitValue::Object{descriptor,..} => descriptor,_ => unreachable!()};
+        descriptor.dependencies.clear();
+        invalid_units.insert(UnitKey::new(&["archive","synthetic"]).unwrap(),risunest_sync_wire::unit::UnitValue::object(descriptor).unwrap());
+        assert!(original_unit_dependency_inventory(&invalid_units,&|hash| super::super::message_pages::object_body(&store.connection,hash),&|_| Ok(Some(32)),&crate::local_backup::NeverCancelled,false,&mut |_,_,_| Ok(())).is_err());
     }
 
     #[test]
