@@ -4,6 +4,8 @@
 //! threads must return their own sample. Incomplete delegated calls invalidate
 //! a total, even when the domains still contain useful observed partial work.
 //! The byte component of `lww::take_work_metrics` aliases native_unit_envelope.
+//! Receive-intent input capture is off by default and only for synthetic
+//! diagnostics. Reset enables it; take disables it. Parse after timing ends.
 #![cfg(test)]
 
 use risunest_sync_wire::{canonical, descriptor::BuiltReferenceTree, unit::{LwwDecision, UnitValue}, WireError};
@@ -22,6 +24,23 @@ pub(crate) struct HashWork {
 }
 
 thread_local! { static WORK: RefCell<HashWork> = RefCell::new(HashWork::default()); }
+thread_local! { static RECEIVE_INTENT_INPUTS: RefCell<Option<Vec<Vec<u8>>>> = const { RefCell::new(None) }; }
+
+// Opt-in diagnostic capture. Parse only after taking the operation's timings
+// and counters; captured inputs are not additional hash work.
+pub(crate) fn reset_receive_intent_inputs() {
+    RECEIVE_INTENT_INPUTS.with(|inputs| *inputs.borrow_mut() = Some(Vec::new()));
+}
+
+pub(crate) fn take_receive_intent_inputs() -> Vec<Vec<u8>> {
+    RECEIVE_INTENT_INPUTS.with(|inputs| inputs.borrow_mut().take().unwrap_or_default())
+}
+
+pub(super) fn record_receive_intent_input(bytes: &[u8]) {
+    RECEIVE_INTENT_INPUTS.with(|inputs| {
+        if let Some(inputs) = inputs.borrow_mut().as_mut() { inputs.push(bytes.to_vec()); }
+    });
+}
 
 pub(crate) fn reset_hash_work() {
     WORK.with(|work| *work.borrow_mut() = HashWork::default());
@@ -143,5 +162,29 @@ mod tests {
         assert_eq!(take_hash_work(), HashWork::default());
         observe("discarded", 1); reset_hash_work();
         assert_eq!(take_hash_work(), HashWork::default());
+    }
+
+    #[test]
+    fn receive_input_capture_is_disabled_until_reset_and_take_disables_it() {
+        assert!(take_receive_intent_inputs().is_empty());
+        record_receive_intent_input(b"disabled"); assert!(take_receive_intent_inputs().is_empty());
+        reset_receive_intent_inputs(); record_receive_intent_input(b"discarded");
+        reset_receive_intent_inputs();
+        record_receive_intent_input(b"\"synthetic\\nbytes\""); record_receive_intent_input(&[0, 255]);
+        assert_eq!(take_receive_intent_inputs(), vec![b"\"synthetic\\nbytes\"".to_vec(), vec![0, 255]]);
+        record_receive_intent_input(b"disabled-again"); assert!(take_receive_intent_inputs().is_empty());
+    }
+
+    #[test]
+    fn receive_input_capture_is_thread_local_and_independent_of_hash_reset() {
+        reset_receive_intent_inputs(); record_receive_intent_input(b"owner");
+        let worker = std::thread::spawn(|| {
+            record_receive_intent_input(b"worker-disabled"); assert!(take_receive_intent_inputs().is_empty());
+            reset_receive_intent_inputs(); record_receive_intent_input(b"worker");
+            take_receive_intent_inputs()
+        }).join().unwrap();
+        reset_hash_work(); assert_eq!(take_hash_work(), HashWork::default());
+        assert_eq!(worker, vec![b"worker".to_vec()]);
+        assert_eq!(take_receive_intent_inputs(), vec![b"owner".to_vec()]);
     }
 }
