@@ -3,7 +3,7 @@ import { createCatalogCharacterStub } from './workingSetCatalog'
 import { createConversationSummaryStub, createConversationSummaryFromMetadata } from './conversationResidency'
 import type { Chat, Database, botPreset, character, groupChat } from './database.svelte'
 import type { PersistentRevisionReader, PersistentRoot } from './persistentDataStore'
-import { canonicalClone, canonicalJson } from './saveCoordinatorHelpers'
+import { canonicalClone, canonicalJson, clonePersistentRootFields } from './saveCoordinatorHelpers'
 import { captureMaterializedCharacter, CHARACTER_SHARED_FIELDS, CONVERSATION_SHARED_FIELDS } from './persistentUnitCapture'
 import { isWorkingSetCharacterStub } from './workingSetCatalog'
 
@@ -16,7 +16,7 @@ export interface LwwWorkingSetBaseline {
 }
 
 export function captureLwwWorkingSetBaseline(database: Database, root: PersistentRoot, presets: botPreset[] | null, materialized?: CompleteCharacter[]): LwwWorkingSetBaseline {
-    return { root: canonicalClone(root), presets: presets && canonicalClone(presets),
+    return { root: clonePersistentRootFields(root), presets: presets && canonicalClone(presets),
         characters: materialized ?? database.characters.filter((value) => !isWorkingSetCharacterStub(value)).map(captureMaterializedCharacter) }
 }
 

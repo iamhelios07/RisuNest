@@ -30,8 +30,7 @@ export function createLwwScheduler(dependencies: LwwSchedulerDependencies) {
     const clearReceive = () => { if (receiveTimer !== undefined) clearTimer(receiveTimer); receiveTimer = undefined }
     const clearMaintenance = () => { if (maintenanceTimer !== undefined) clearTimer(maintenanceTimer); maintenanceTimer = undefined }
     const scheduleMaintenance = () => {
-        clearMaintenance()
-        if (!enabled || !dependencies.maintain) return
+        if (!enabled || !dependencies.maintain || maintenanceTimer !== undefined || maintenance) return
         maintenanceTimer = setTimer(() => {
             maintenanceTimer = undefined
             if (enabled && dependencies.available() && firstDirty === undefined && !maintenance) {
@@ -85,6 +84,7 @@ export function createLwwScheduler(dependencies: LwwSchedulerDependencies) {
             enabled = true
             emptyListings = 0
             if (firstDirty !== undefined) this.dirty()
+            scheduleMaintenance()
             void receiveNow().catch(() => {})
         },
         stop() { enabled = false; clearPublish(); clearReceive(); clearMaintenance() },

@@ -323,11 +323,11 @@ async function savePartialLocalBackupSnapshot(blobStore: BlobStore, pinned: Pinn
     }
 }
 
-export function LoadLocalBackup(): Promise<void> {
+export function LoadLocalBackup(confirmationTitle = language.backupLoadConfirm): Promise<void> {
     return runSharedNativeFileOperation(
         'import',
         'legacy-local-backup-import',
-        (context) => importLegacyBackupWithWebView(context),
+        (context) => importLegacyBackupWithWebView(context, {}, confirmationTitle),
         { presentation: 'dialog', format: 'local-backup' },
     ).then(() => undefined, handleLegacyImportFailure)
 }
@@ -397,6 +397,7 @@ function pickWebBackupFile(signal: AbortSignal): Promise<File | null> {
 export async function importLegacyBackupWithWebView(
     context: LegacyLocalBackupFallbackContext,
     lifecycle: { beforeActivation?(): Promise<void>; onCommitted?(): void } = {},
+    confirmationTitle = language.backupLoadConfirm,
 ): Promise<{ warningCodes: string[], upstreamLosses: { coldMissing: number, invalidInlays: number, pocketInlays: number } } | null> {
     const file = await pickWebBackupFile(context.signal)
     if (!file) return null
@@ -602,8 +603,8 @@ export async function importLegacyBackupWithWebView(
         upstreamLosses.coldMissing = missingColdStorageKeys.length
         const description = missingColdStorageKeys.length === 0 ? language.backupLoadConfirm2
             : `${language.backupLoadConfirm2}\n\n${language.errors.coldStorageIncompleteRestoreConfirm(affectedCold.characterNames.join(', '), missingColdStorageKeys.length, affectedCold.unresolvedKeys.length, false)}`
-        if (!(await alertCheckboxConfirm({
-            title: language.backupLoadConfirm,
+        if (!isTauri && !(await alertCheckboxConfirm({
+            title: confirmationTitle,
             description,
             checkboxLabel: language.checkboxConfirmation.dataReplacement,
             actionLabel: language.confirm,
@@ -618,6 +619,7 @@ export async function importLegacyBackupWithWebView(
 
         report('activating')
         await installLocalBackup(dbData, {
+            ...(isTauri ? {upstreamImportWarnings: [description]} : {}),
             replaceDatabase: async (...args) => {
                 await lifecycle.beforeActivation?.()
                 checkCancelled()

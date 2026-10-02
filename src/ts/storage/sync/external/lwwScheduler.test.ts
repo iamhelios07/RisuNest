@@ -2,16 +2,34 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createLwwScheduler } from './lwwScheduler'
 
 afterEach(() => vi.useRealTimers())
-function fixture() {
+function fixture(withMaintenance = false) {
     vi.useFakeTimers()
     const publish = vi.fn(async () => {})
     const receive = vi.fn(async () => 0)
     const failed = vi.fn()
+    const maintain = vi.fn(async () => {})
     let available = true
-    const scheduler = createLwwScheduler({ available: () => available, publish, receive, failed, now: () => Date.now() })
-    return { scheduler, publish, receive, failed, unavailable: () => { available = false } }
+    const scheduler = createLwwScheduler({ available: () => available, publish, receive, failed, maintain: withMaintenance ? maintain : undefined, now: () => Date.now() })
+    return { scheduler, publish, receive, failed, maintain, unavailable: () => { available = false } }
 }
 describe('LWW foreground scheduling', () => {
+    it('keeps the maintenance deadline during sustained nonempty receives', async () => {
+        const f = fixture(true)
+        f.receive.mockImplementation(async () => 1)
+        f.scheduler.start()
+        await f.scheduler.settled()
+        await vi.advanceTimersByTimeAsync(59_999)
+        expect(f.receive).toHaveBeenCalledTimes(4)
+        expect(f.maintain).not.toHaveBeenCalled()
+        await vi.advanceTimersByTimeAsync(1)
+        expect(f.maintain).toHaveBeenCalledTimes(1)
+        expect(f.publish).not.toHaveBeenCalled()
+        await vi.advanceTimersByTimeAsync(60_000)
+        expect(f.maintain).toHaveBeenCalledTimes(2)
+        f.scheduler.stop()
+        await vi.advanceTimersByTimeAsync(120_000)
+        expect(f.maintain).toHaveBeenCalledTimes(2)
+    })
     it('publishes after quiet edits and caps a continuous burst at sixty seconds', async () => {
         const f = fixture(); f.scheduler.start(); await f.scheduler.settled()
         f.scheduler.dirty()
