@@ -6,6 +6,8 @@ pub(crate) mod commit;
 pub(crate) mod content_capture;
 mod message_pages;
 #[cfg(test)]
+mod message_pages_copied_database_tests;
+#[cfg(test)]
 pub(crate) mod hash_work;
 pub(crate) mod content_change_index;
 pub(crate) mod lww;
