@@ -4,6 +4,8 @@
 mod fixture;
 #[path = "../../../benchmarks/lww-native/src/native_observation.rs"]
 mod native_observation;
+#[path = "../../../benchmarks/lww-native/src/invalid_diagnostics.rs"]
+mod invalid_diagnostics;
 
 use super::{lww::{self, MessageLocator, UnitMutation}, sync_selection::{SwitchBindingRequest, SyncTarget},
     ConversationMutation, PersistentStore, WorkingSetCommit};
@@ -115,6 +117,7 @@ fn fixture_asset_inventory(store:&PersistentStore, scale:&FixtureScale) -> Vec<S
 }
 
 fn reset_work(asset_hashes:&[String]) {
+    super::hash_work::reset_receive_intent_inputs();
     crate::asset_repository::body_io::reset_body_io();
     for hash in asset_hashes {
         crate::asset_repository::body_io::register_object_purpose(hash,
@@ -179,6 +182,22 @@ fn take_work(external: bool) -> NativeObservation {
     for (domain, work) in bodies.domains {
         result.body_domains.insert(domain.into(), body_domain(work));
     }
+    let inputs=super::hash_work::take_receive_intent_inputs();
+    let observed=result.hashes.get("native/native_receive_intent").cloned().unwrap_or_default();
+    let mut evidence=invalid_diagnostics::ReceiveIntentEvidence {
+        observed_calls:observed.calls,observed_bytes:observed.bytes,captured_calls:inputs.len() as u64,
+        ..Default::default()};
+    for input in inputs {
+        evidence.captured_bytes=evidence.captured_bytes.checked_add(input.len() as u64).unwrap();
+        let structure=(|| -> Result<invalid_diagnostics::JsonByteStructure,String> {
+            let request:lww::StageReceive=serde_json::from_slice(&input).map_err(|e|e.to_string())?;
+            let roundtrip=serde_json::to_vec(&request).map_err(|e|e.to_string())?;
+            invalid_diagnostics::exact_json_structure(&input,&roundtrip)
+        })();
+        match structure {Ok(value)=>evidence.inputs.push(value),Err(error)=>evidence.errors.push(error)}
+    }
+    evidence.finish();
+    result.receive_intents=Some(evidence);
     result
 }
 
@@ -485,11 +504,72 @@ fn measurement_gate() -> String {
     checkpoint
 }
 
+fn paired_diagnostics(a:&NativeSample,b:&NativeSample) -> Value {
+    let domains=a.observation.hashes.keys().chain(b.observation.hashes.keys())
+        .collect::<std::collections::BTreeSet<_>>();
+    let growth=domains.into_iter().filter_map(|domain| {
+        let baseline=a.observation.hashes.get(domain).cloned().unwrap_or_default();
+        let trial=b.observation.hashes.get(domain).cloned().unwrap_or_default();
+        if trial.calls<=baseline.calls && trial.bytes<=baseline.bytes {return None;}
+        Some(json!({"domain":domain,"baseline":baseline,"trial":trial}))
+    }).collect::<Vec<_>>();
+    let mut intent_deltas=Vec::new();
+    if let (Some(baseline),Some(trial))=(&a.observation.receive_intents,&b.observation.receive_intents) {
+        for (index,(left,right)) in baseline.inputs.iter().zip(&trial.inputs).enumerate() {
+            intent_deltas.push(json!({"input_index":index,"baseline_bytes":left.input_bytes,
+                "trial_bytes":right.input_bytes,"exclusive_field_deltas":invalid_diagnostics::byte_deltas(left,right)}));
+        }
+    }
+    json!({"iteration":a.iteration,"change":a.change,"direction":a.direction,
+        "all_positive_hash_domain_growth":growth,"receive_intent_deltas":intent_deltas,
+        "baseline_receive_intents":a.observation.receive_intents,"trial_receive_intents":b.observation.receive_intents})
+}
+
+fn write_invalid_diagnostics(directory:&Path,by_scale:&[Vec<NativeSample>],reason:&str,index:Option<usize>) {
+    std::fs::create_dir(directory).unwrap();
+    let comparisons=if by_scale.len()==2 {
+        by_scale[0].iter().zip(&by_scale[1]).map(|(a,b)|paired_diagnostics(a,b)).collect::<Vec<_>>()
+    } else {Vec::new()};
+    let output=std::fs::OpenOptions::new().write(true).create_new(true)
+        .open(directory.join("INVALID-native-diagnostics.json")).unwrap();
+    serde_json::to_writer_pretty(output,&json!({"schema":"risunest.lww-invalid-diagnostics/v1",
+        "status":"INVALID","accepted":false,"failure_reason":reason,"failed_comparison_index":index,
+        "checkpoint":std::env::var("RISUNEST_LWW_MEASUREMENT_CHECKPOINT").ok(),
+        "field_semantics":"original JSON token spans, exclusive own bytes conserve each actual SHA input; typed roundtrip required",
+        "attribution":"transport control is a candidate only; changes, values, keys and framing have no allowance",
+        "comparisons":comparisons,"all_post_take_samples":by_scale})).unwrap();
+}
+
+fn validate_smoke_pairs(directory:&Path,by_scale:&[Vec<NativeSample>]) -> Result<(),String> {
+    if by_scale.len()!=2 || by_scale[0].len()!=by_scale[1].len() {
+        let reason="incomplete paired sample matrix";
+        write_invalid_diagnostics(directory,by_scale,reason,None);
+        return Err(reason.into());
+    }
+    for (index,(a,b)) in by_scale[0].iter().zip(&by_scale[1]).enumerate() {
+        if [a,b].iter().any(|sample|!sample.observation.receive_intents.as_ref().is_some_and(|e|e.complete)) {
+            let reason="incomplete exact receive-intent input provenance";
+            write_invalid_diagnostics(directory,by_scale,reason,Some(index));
+            return Err(reason.into());
+        }
+        let keys=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||assert_same_key_sets(a,b)));
+        let result=if keys.is_err() {Err("exact key-set comparison failed".into())}
+            else {native_observation::assert_frozen_growth(&a.observation,&b.observation,&[])};
+        if let Err(error)=result {
+            write_invalid_diagnostics(directory,by_scale,&error,Some(index));
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn write_samples(directory:&Path, samples:&[NativeSample]) {
     let checkpoint = measurement_gate();
     assert!(!samples.is_empty());
     for sample in samples {
         sample.observation.validate_routine_invariants().unwrap();
+        assert!(sample.observation.receive_intents.as_ref().is_some_and(|evidence|evidence.complete),
+            "receive-intent input provenance must be complete before accepted output");
         assert!(sample.selected_keys.is_some() && sample.emitted_keys.is_some() && sample.affected_keys.is_some(),
             "key-set observation must be linked before smoke output");
         if let Some(keys) = &sample.external_key_scope {
@@ -583,6 +663,11 @@ fn local_routine_observation_regression() {
         for direction in [Direction::AtoB, Direction::BtoA] {
             let sample = driver.run(direction, change, 0);
             sample.observation.validate_routine_invariants().unwrap();
+            let evidence=sample.observation.receive_intents.as_ref().unwrap();
+            assert!(evidence.complete);
+            assert_eq!(evidence.observed_calls,evidence.captured_calls);
+            assert_eq!(evidence.observed_bytes,evidence.captured_bytes);
+            assert_eq!(evidence.inputs.iter().map(|input|input.input_bytes).sum::<u64>(),evidence.observed_bytes);
         }
     }
 }
@@ -687,10 +772,7 @@ fn windows_fake_provider_smoke() {
             }
             by_scale.push(samples);
         }
-        for (a,b) in by_scale[0].iter().zip(&by_scale[1]) {
-            assert_same_key_sets(a,b);
-            native_observation::assert_frozen_growth(&a.observation, &b.observation, &[]).unwrap();
-        }
+        validate_smoke_pairs(Path::new(&output),&by_scale).unwrap();
         write_samples(Path::new(&output), &by_scale.into_iter().flatten().collect::<Vec<_>>());
     });
 }
@@ -715,9 +797,52 @@ fn windows_local_server_smoke() {
         }
         by_scale.push(samples);
     }
-    for (a,b) in by_scale[0].iter().zip(&by_scale[1]) {
-        assert_same_key_sets(a,b);
-        native_observation::assert_frozen_growth(&a.observation, &b.observation, &[]).unwrap();
-    }
+    validate_smoke_pairs(Path::new(&output),&by_scale).unwrap();
     write_samples(Path::new(&output), &by_scale.into_iter().flatten().collect::<Vec<_>>());
+}
+
+#[test]
+fn failed_pair_persists_all_positive_domains_without_accepted_output() {
+    fn sample(bytes:u64) -> NativeSample {
+        let mut observation=NativeObservation::default();
+        observation.hashes.insert("native/native_receive_intent".into(),native_observation::HashDomain {calls:1,bytes});
+        observation.hashes.insert("other/domain".into(),native_observation::HashDomain {calls:1,bytes});
+        NativeSample {transport:"diagnostic-validator",direction:Direction::AtoB,change:SmallChange::Setting,
+            iteration:1,fixture_scale:FixtureScale::small(),generated_json_bytes:0,source_database_bytes_before_change:0,
+            selected_keys:Some(Vec::new()),emitted_keys:Some(Vec::new()),accepted_keys:Some(Vec::new()),
+            affected_keys:Some(Vec::new()),external_key_scope:None,observation,
+            durable_save_ms:0.0,publication_complete_ms:0.0,receiver_durable_complete_ms:0.0}
+    }
+    let directory=tempfile::tempdir().unwrap();
+    let output=directory.path().join("invalid");
+    let matrix=vec![vec![sample(10)],vec![sample(11)]];
+    assert!(validate_smoke_pairs(&output,&matrix).is_err());
+    assert!(!output.join("native-smoke.json").exists());
+    let artifact:Value=serde_json::from_reader(File::open(output.join("INVALID-native-diagnostics.json")).unwrap()).unwrap();
+    assert_eq!(artifact["status"],"INVALID");
+    assert_eq!(artifact["accepted"],false);
+    assert_eq!(artifact["comparisons"][0]["all_positive_hash_domain_growth"].as_array().unwrap().len(),2);
+    assert_eq!(artifact["all_post_take_samples"].as_array().unwrap().len(),2);
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+#[ignore = "explicit diagnostic only, always writes INVALID output"]
+fn local_receive_intent_growth_diagnostic() {
+    let output=std::env::var_os("RISUNEST_LWW_NATIVE_OUTPUT").expect("fresh separate diagnostic directory");
+    let mut by_scale=Vec::new();
+    for scale in frozen_small_scales() {
+        let mut driver=ServerDriver::prepare(scale);
+        let mut samples=Vec::new();
+        for iteration in 0..4 {
+            for change in [SmallChange::Setting,SmallChange::Preset,SmallChange::Append] {
+                for direction in [Direction::AtoB,Direction::BtoA] {
+                    samples.push(driver.run(direction,change,iteration));
+                }
+            }
+        }
+        by_scale.push(samples);
+    }
+    write_invalid_diagnostics(Path::new(&output),&by_scale,
+        "diagnostic only: all executed warmup and recorded operations retained; no acceptance authorized",None);
 }
