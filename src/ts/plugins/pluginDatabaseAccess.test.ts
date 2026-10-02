@@ -444,6 +444,27 @@ describe('plugin unit writes with read provenance', () => {
         expect(harness.commitPersistentUnitIntent).toHaveBeenCalledWith('plugin-setChatToIndex', [{ key: '["conversation","active","active-chat-a","name"]', type: 'set', value: 'Edited chat' }], [], [])
     })
 
+    it('commits only approved plugin additions and preserves installed records on API list omission and replacement', async () => {
+        const harness = createHarness()
+        const original = { name: 'installed', script: 'original', version: '3.0', enabled: true }
+        harness.compatibilityDatabase.plugins = [original] as any
+        harness.prepareAuthoritativeDatabaseUpdate.mockImplementation(async update => ({ ...update, plugins: [] }))
+        await harness.access.setDatabase({ plugins: [] }, ['plugins'])
+        expect(harness.commitPersistentUnitIntent).toHaveBeenLastCalledWith('plugin-setDatabase', [], [], [])
+        await harness.access.setDatabase({ plugins: [{ ...original, script: 'replacement' }] }, ['plugins'])
+        expect(harness.commitPersistentUnitIntent).toHaveBeenLastCalledWith('plugin-setDatabase', [], [], [])
+        const proposed = { name: 'new', script: 'proposed', version: '3.0', enabled: true }
+        await harness.access.setDatabase({ plugins: [proposed] }, ['plugins'])
+        expect(harness.commitPersistentUnitIntent).toHaveBeenLastCalledWith('plugin-setDatabase', [], [], [])
+        harness.prepareAuthoritativeDatabaseUpdate.mockImplementation(async update => ({ ...update, plugins: [proposed] }))
+        await harness.access.setDatabase({ plugins: [proposed, proposed] }, ['plugins'])
+        expect(harness.commitPersistentUnitIntent).toHaveBeenLastCalledWith('plugin-setDatabase', [
+            { key: '["record","plugins","new"]', type: 'set', value: proposed },
+            { key: '["order","plugins"]', type: 'set', value: ['installed', 'new'] },
+        ], [], [])
+        expect(harness.compatibilityDatabase.plugins).toEqual([original])
+    })
+
     it('commits a single-baseline copy but rejects an ambiguous copy without writes', async () => {
         const harness = createHarness({ unitIntent: true })
         const read = await harness.access.getDatabaseSnapshot(['username'], ['username'])
