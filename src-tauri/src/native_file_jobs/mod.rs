@@ -2380,7 +2380,14 @@ impl NativeFileJobState {
     ) -> Result<FinalizeOutcome, NativeJobError> {
         self.registry
             .finalize(job_id, expected_revision)
-            .map_err(|error| NativeJobError::new("store-error", error))
+            .map_err(|error| {
+                let code = if error == "library-operation-busy" {
+                    "library-operation-busy"
+                } else {
+                    "store-error"
+                };
+                NativeJobError::new(code, error)
+            })
     }
 
     pub(crate) fn cancel(&self, job_id: &str) -> Result<CancelOutcome, NativeJobError> {
@@ -5712,8 +5719,10 @@ mod tests {
 
     #[test]
     fn upstream_finalize_upgrades_owned_staging_and_retains_exclusion_after_lost_response() {
-        let registry = Arc::new(JobRegistry::default());
-        let admission = Arc::new(admission::Admission::default());
+        let directory = TempDir::new().unwrap();
+        let state = NativeFileJobState::initialize(directory.path().join("native-file-jobs"));
+        let registry = Arc::clone(&state.registry);
+        let admission = Arc::clone(&state.admission);
         let permit = Arc::new(Mutex::new(Some(admission.staging().unwrap())));
         let job = registry
             .create_with_context(JobKind::RestoreBlockRisuSave, Some(3), Vec::new())
@@ -5727,7 +5736,8 @@ mod tests {
             std::thread::yield_now();
         }
         let receive = admission.server().unwrap();
-        assert!(registry.finalize(&job.id(), Some(9)).is_err());
+        assert_eq!(state.finalize(&job.id(), Some(9)).unwrap_err().code, "library-operation-busy");
+        assert_eq!(state.finalize("missing-synthetic-job", Some(9)).unwrap(), FinalizeOutcome::Missing);
         assert_eq!(job.status().state, JobState::WaitingForInput);
         assert_eq!(job.activation_expected_revision().unwrap(), None);
         drop(receive);

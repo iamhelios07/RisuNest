@@ -369,13 +369,18 @@ async function importWithBytes(
     const { prepareUpstreamImport } = await import('./importedIdentity')
     const database = prepareUpstreamImport(await dependencies.decodeRisuSave(bytes) as Database)
     webImportStatus(options, 'activating', bytes.byteLength, bytes.byteLength)
+    let pluginsRestarted = false
     await runtime.replacePersistentDatabase(
         database,
         'risu-save-file-import',
-        { authoritative: true, upstreamImport: true },
+        {
+            authoritative: true,
+            upstreamImport: true,
+            ...(dependencies.platform() === 'web' ? {} : {onPluginsRestarted: () => { pluginsRestarted = true }}),
+        },
     )
     webImportStatus(options, 'reloading-plugins', bytes.byteLength, bytes.byteLength)
-    await dependencies.reloadPlugins()
+    if (!pluginsRestarted) await dependencies.reloadPlugins()
     return { mode: 'web', warningCodes: [], bytes: bytes.byteLength }
 }
 

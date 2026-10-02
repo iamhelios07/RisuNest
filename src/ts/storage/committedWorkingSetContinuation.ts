@@ -15,6 +15,21 @@ let pending:
       }>
     | undefined
 
+const criticalRecoveryOwners = new WeakMap<object, {owner:symbol, dispatch:object, isCurrentAuthority:()=>boolean}>()
+
+function isOwnedCriticalRecovery(runtime: object): boolean {
+    const active = criticalRecoveryOwners.get(runtime)
+    return pending?.runtime === runtime && pending.retainOnFailure && active?.dispatch === pending.dispatch && active.isCurrentAuthority()
+}
+
+export function claimCommittedWorkingSetRecovery(runtime: object, authorityEpoch: number, owner: symbol, isCurrentAuthority:()=>boolean): () => void {
+    if (!hasRetryableCommittedWorkingSetContinuation(runtime, authorityEpoch)) return () => {}
+    if (criticalRecoveryOwners.has(runtime)) throw new Error('Critical working-set recovery is already owned')
+    const active = {owner, dispatch:pending!.dispatch, isCurrentAuthority}
+    criticalRecoveryOwners.set(runtime, active)
+    return () => { if (criticalRecoveryOwners.get(runtime) === active) criticalRecoveryOwners.delete(runtime) }
+}
+
 export function registerCommittedWorkingSetContinuation(
     minimumRevision: DataRevision,
     runtime: object,
@@ -44,6 +59,7 @@ export async function continueCommittedWorkingSetRefresh(
 ): Promise<void> {
     if (!pending) return
     if (pending.runtime !== runtime || pending.authorityEpoch !== authorityEpoch) {
+        if (isOwnedCriticalRecovery(runtime)) return
         pending = undefined
         return
     }
@@ -72,6 +88,7 @@ async function prepareCommittedWorkingSetRetry(
     authorityEpoch: number,
 ): Promise<boolean> {
     if (!pending) return false
+    if (isOwnedCriticalRecovery(runtime)) return true
     if (pending.runtime !== runtime || pending.authorityEpoch !== authorityEpoch) {
         pending = undefined
         return false

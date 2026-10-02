@@ -431,6 +431,7 @@ interface ReplacementAdmission extends PersistentMutationToken {
 export interface PersistentReplacementOptions {
     upstreamImport?: boolean
     upstreamImportWarnings?: string[]
+    onPluginsRestarted?(): void
     publishOfficial?: boolean
     authoritative?: boolean
     expectedRevision?: DataRevision

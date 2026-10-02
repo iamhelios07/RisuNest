@@ -1532,10 +1532,18 @@ async function runNativeReplacementRestore(
                         },
                     })
                 }
-                await invokeNative(dependencies, 'native_file_job_finalize', {
-                    jobId: started.jobId,
-                    expectedRevision: replacementFence.revision,
-                })
+                try {
+                    await invokeNative(dependencies, 'native_file_job_finalize', {
+                        jobId: started.jobId,
+                        expectedRevision: replacementFence.revision,
+                    })
+                } catch (error) {
+                    if (!upstreamPause || !(error instanceof NativeFileJobError) || error.code !== 'library-operation-busy') throw error
+                    mutationConflict = error
+                    cancellationRequested = true
+                    await invokeNative(dependencies, 'native_file_job_cancel', {jobId: started.jobId})
+                    continue
+                }
                 options.onStatus?.({
                     ...status,
                     state: 'running',
