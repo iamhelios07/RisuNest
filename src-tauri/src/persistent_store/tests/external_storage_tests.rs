@@ -262,16 +262,23 @@ fn external_replacement_and_physical_copy_invalidate_old_identity() {
     let (_dir, mut store, _) = open_fixture();
     select_external(&mut store);
     let old = capture(&mut store, "job");
+    let selected = selection::read(&store.connection).unwrap();
+    let clock = store.lww_clock_state().unwrap();
     let staging = stage_root(&mut store, "synthetic-replacement");
     store.replace_commit(&staging, Some(old.revision)).unwrap();
     let next = selection::identity(&store.connection).unwrap();
-    assert_ne!(old.library_epoch, next.library_epoch);
+    assert_eq!(old.library_epoch, next.library_epoch);
+    assert_eq!(old.store_id, next.store_id);
+    assert_eq!(old.selection_epoch, next.selection_epoch);
     assert_ne!(old.generation, next.generation);
-    assert!(
-        selection::read(&store.connection)
-            .unwrap()
-            .decision_required
-    );
+    assert_eq!(old.revision + 1, next.revision);
+    let current_selection = selection::read(&store.connection).unwrap();
+    assert_eq!(current_selection.target, selected.target);
+    assert_eq!(current_selection.epoch, selected.epoch);
+    assert_eq!(current_selection.decision_required, selected.decision_required);
+    let current_clock = store.lww_clock_state().unwrap();
+    assert_eq!(current_clock.writer_id, clock.writer_id);
+    assert_eq!(current_clock.binding_authority, clock.binding_authority);
     assert!(selection::require_publish(&store.connection, &old, "synthetic-connection").is_err());
     let tx = store.connection.transaction().unwrap();
     selection::restored_copy(&tx).unwrap();

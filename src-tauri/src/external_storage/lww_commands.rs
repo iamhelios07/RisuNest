@@ -364,9 +364,7 @@ pub(crate) async fn external_lww_maintenance(app:AppHandle,request:Request)->Res
     let store=check(&app,&request,true)?;
     let writer=store.lww_clock_state().map_err(runtime::local_error)?.writer_id;
     let engine=session.engine.as_ref().ok_or_else(lww_segment::corrupt)?;
-    let segments=engine.listing(&cancel).await?;
-    let snapshots=engine.snapshot_listing(&cancel).await?;
-    let compact=segments.len()>=100 || segments.iter().map(|r|r.byte_length).sum::<u64>()>=64*1024*1024 || snapshots.len()>=2;
+    let compact=engine.maintenance_needed(&cancel).await?;
     let root=runtime::root(&app)?;
     let stored=super::connection_store::ConnectionStore::open(&root)?.read(&request.connection_id)?;
     let job=uuid::Uuid::new_v4().to_string();

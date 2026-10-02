@@ -1386,11 +1386,15 @@ impl PersistentStore {
             snapshots_dir,
             device_store,
         };
-        store.lww_recover_intents()?;
-        snapshot::sweep_temporary_generations(&mut store.connection, retained_stage.as_deref())?;
+        if store.device_store.is_ok() {
+            store.lww_recover_intents()?;
+            snapshot::sweep_temporary_generations(&mut store.connection, retained_stage.as_deref())?;
+        }
         snapshot::checkpoint(&store.connection, CheckpointMode::Truncate)?;
-        if let Err(error) = store.server_repair_residency_access() {
-            crate::nlog!("warn", "server sync residency repair pending: {}", error.code);
+        if store.device_store.is_ok() {
+            if let Err(error) = store.server_repair_residency_access() {
+                crate::nlog!("warn", "server sync residency repair pending: {}", error.code);
+            }
         }
         Ok(store)
     }
@@ -1966,8 +1970,7 @@ impl PersistentStore {
         staging_id: &str,
         expected_revision: Option<i64>,
     ) -> StoreResult<PreparedReplaceCommit> {
-        let revision =
-            commit::validate_replace_commit(&self.connection, staging_id, expected_revision)?;
+        let revision = self.lww_prepared_replacement_revision(staging_id, expected_revision)?;
         Ok(PreparedReplaceCommit {
             staging_id: staging_id.to_owned(),
             revision,
@@ -1978,8 +1981,8 @@ impl PersistentStore {
         &mut self,
         prepared: PreparedReplaceCommit,
     ) -> StoreResult<RevisionResult> {
-        commit::validate_replace_commit(&self.connection,&prepared.staging_id,Some(prepared.revision))?;
-        let header=lww::Header{binding_authority:self.lww_binding_authority()?,request_id:uuid::Uuid::new_v4().to_string()};
+        self.lww_prepared_replacement_revision(&prepared.staging_id, Some(prepared.revision))?;
+        let header=lww::Header{binding_authority:self.lww_binding_authority()?,request_id:prepared.staging_id.clone()};
         self.lww_commit_replacement(&header,&prepared.staging_id)
     }
 

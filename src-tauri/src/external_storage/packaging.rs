@@ -3416,6 +3416,28 @@ pub(crate) async fn package_and_upload_asset_catalog(
     cancel:&Cancellation,
     protection:Option<(&super::leases::LeaseOwner,&super::leases::LeaseContext<'_>)>,
 ) -> Result<CompletedAssetCatalog> {
+    package_and_upload_content_catalog(wire::CatalogKind::Assets,sources,repository_root,cache_root,root_key,limits,journal,provider,repository,prepared,cancel,protection).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn package_and_upload_control_catalog(
+    sources:Vec<AssetCatalogSource>,repository_root:&Path,cache_root:&Path,
+    root_key:&[u8;32],limits:PackageLimits,journal:&mut TransferJournal,
+    provider:&dyn Provider,repository:&RepositoryHandle,prepared:&Arc<PhaseProgress>,
+    cancel:&Cancellation,
+    protection:Option<(&super::leases::LeaseOwner,&super::leases::LeaseContext<'_>)>,
+) -> Result<CompletedAssetCatalog> {
+    package_and_upload_content_catalog(wire::CatalogKind::Records,sources,repository_root,cache_root,root_key,limits,journal,provider,repository,prepared,cancel,protection).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn package_and_upload_content_catalog(
+    kind:wire::CatalogKind,sources:Vec<AssetCatalogSource>,repository_root:&Path,cache_root:&Path,
+    root_key:&[u8;32],limits:PackageLimits,journal:&mut TransferJournal,
+    provider:&dyn Provider,repository:&RepositoryHandle,prepared:&Arc<PhaseProgress>,
+    cancel:&Cancellation,
+    protection:Option<(&super::leases::LeaseOwner,&super::leases::LeaseContext<'_>)>,
+) -> Result<CompletedAssetCatalog> {
     cancel.check()?;
     let mut sources=sources.into_iter().map(|source| {
         risunest_sync_wire::validate_hash(&source.content_hash).map_err(corrupt)?;
@@ -3427,13 +3449,13 @@ pub(crate) async fn package_and_upload_asset_catalog(
     if sources.windows(2).any(|pair|pair[0].key==pair[1].key) {
         return Err(corrupt("duplicate asset catalog source"));
     }
-    let fingerprint=catalog_fingerprint(wire::CatalogKind::Assets,&sources);
+    let fingerprint=catalog_fingerprint(kind,&sources);
     let build_root=cache_root.join("build");
     fs::create_dir_all(&build_root).map_err(transient)?;
     let mut cache=PackageCache::open(cache_root)?;
     let mut evidence=ObjectEvidence::open(repository_root,journal.connection_id())?;
     let mut referenced=Vec::new();
-    let cached=match cache.catalog(&repository.repository_id,repository,wire::CatalogKind::Assets,&fingerprint)? {
+    let cached=match cache.catalog(&repository.repository_id,repository,kind,&fingerprint)? {
         Some(root)=>revalidate_cached_catalog(&root,&mut cache,&mut evidence,journal,root_key,provider,repository,cancel).await?,
         None=>None,
     };
@@ -3444,12 +3466,12 @@ pub(crate) async fn package_and_upload_asset_catalog(
     } else {
         let mut hydration=SourceHydration::default();
         let mut maintenance=MaintenanceReport::default();
-        let (entries,uploaded)=build_entries(wire::CatalogKind::Assets,sources,
+        let (entries,uploaded)=build_entries(kind,sources,
             &repository_root.join("external-storage"),&repository.repository_id,&build_root,
             root_key,limits,None,None,false,&mut cache,&mut evidence,journal,provider,repository,
             prepared,&mut maintenance,&mut hydration,cancel).await?;
         referenced.extend(uploaded);
-        build_catalog(wire::CatalogKind::Assets,entries,&fingerprint,&repository.repository_id,
+        build_catalog(kind,entries,&fingerprint,&repository.repository_id,
             &build_root,root_key,limits,None,None,false,&mut cache,&mut evidence,journal,
             provider,repository,cancel,&mut referenced).await?
     };
@@ -5219,6 +5241,26 @@ mod tests {
             let entry=entries.into_iter().next().unwrap();
             let decoded=snapshot_restore::download_packed_body(&hash,entry.byte_length,entry.chunks,packs.values().map(|pack|pack.stored(&repository).unwrap()).collect(),&stage,&key,&provider,&repository,&Cancellation::default()).await.unwrap();
             assert_eq!(decoded,body);
+        });
+    }
+
+    #[test]
+    fn control_catalog_carries_a_verified_indivisible_message_page() {
+        runtime().block_on(async {
+            let root=tempfile::tempdir().unwrap();let destination=tempfile::tempdir().unwrap();
+            let page=risunest_external_storage_format::logical_records::encode_message_page(&[
+                serde_json::json!({"role":"user","content":"x".repeat(risunest_sync_wire::MAX_METADATA_BYTES)})]).unwrap();
+            let source=root.path().join("frozen-page");std::fs::write(&source,&page.bytes).unwrap();
+            let (capture,_)=captured(root.path(),"segment-controls",0,b"{}",b"unrelated asset");
+            let provider=FakeProvider::new(false);let repository=fake::repository();let key=[17;32];
+            let mut transfer=journal(&root.path().join("data-journal"),"segment-controls",&capture);
+            let completed=package_and_upload_control_catalog(vec![AssetCatalogSource{content_hash:page.hash.clone(),byte_length:page.size,source:ObjectSource::File(source)}],
+                root.path(),&root.path().join("data-cache"),&key,limits(256*1024),&mut transfer,&provider,&repository,&PhaseProgress::silent(),&Cancellation::default(),None).await.unwrap();
+            let mut store=crate::persistent_store::PersistentStore::open(destination.path()).unwrap();
+            let hashes=snapshot_restore::admit_data_catalogs(&[completed.catalog.clone()],&mut store,&key,&provider,&repository,&Cancellation::default()).await.unwrap();
+            assert_eq!(hashes,vec![page.hash.clone()]);assert_eq!(store.lww_object_body(&page.hash).unwrap().unwrap(),page.bytes);
+            let remote=RemoteObject::from_stored(&completed.catalog,&repository).unwrap();
+            assert!(snapshot_restore::read_catalog(&remote,wire::CatalogKind::Assets,&key,&root.path().join("wrong-kind"),&provider,&repository,&Cancellation::default()).await.is_err());
         });
     }
 
@@ -8950,12 +8992,10 @@ mod tests {
             let (object, mut cache, mut evidence, _journal) =
                 inherited_object(root.path(), &provider, &repository, &capture).await;
             let mut next = journal(&root.path().join("evidence-next"), "evidence-next", &capture);
-            {
-                let mut state = provider.state.lock().unwrap();
-                let stored = state.objects.get_mut(&object.receipt.locator.object).unwrap();
-                let last = stored.0.len() - 1;
-                stored.0[last] ^= 0xff;
-            }
+            let mut damaged = provider.state.lock().unwrap().objects[&object.receipt.locator.object].0.clone();
+            let last = damaged.len() - 1;
+            damaged[last] ^= 0xff;
+            provider.seed(&object.receipt.locator.object, object.role, damaged);
             assert_eq!(revalidate_cached_object(
                 &object, &mut cache, &mut evidence, &mut next, &[41; 32], &provider, &repository,
                 &Cancellation::default(),
@@ -9844,14 +9884,18 @@ mod tests {
             let mut second_journal = journal(&root.path().join("second-job"), "second-job", &capture);
             let second = package_and_upload(capture, vec![], root.path(), &cache, meta, &key,
                 limits(128 * 1024), None, &mut second_journal, &provider, &repository, &PhaseProgress::silent(), &cancel).await.unwrap();
+            let requests_before=second.referenced_objects.iter().map(|object|
+                (object.receipt.locator.object.clone(),provider.read_attempts(&object.receipt.locator.object))).collect::<BTreeMap<_,_>>();
             assert_eq!(verify_publication(&second, root.path(), &cache, &mut second_journal, &key,
                 &provider, &repository, &cancel).await.unwrap(), PublicationReadiness::Verified);
             let pack = second.referenced_objects.iter().find(|object| object.role == ObjectRole::Pack
                 && first.referenced_objects.iter().any(|prior| prior.object_id == object.object_id)).unwrap();
             for object in [&second.asset_catalog, pack] {
                 let name = &object.receipt.locator.object;
-                let count = provider.state.lock().unwrap().body_bytes[name];
-                assert_eq!(count - before.get(name).copied().unwrap_or(0), object.receipt.byte_length as usize);
+                let count = provider.state.lock().unwrap().body_bytes.get(name).copied().unwrap_or(0);
+                let expected = if object.role == ObjectRole::Pack { 0 } else { object.receipt.byte_length as usize };
+                assert_eq!(count - before.get(name).copied().unwrap_or(0), expected);
+                assert!(provider.read_attempts(name)>requests_before[name]);
             }
             let bodies = provider.state.lock().unwrap().body_bytes.clone();
             assert_eq!(verify_publication(&second, root.path(), &cache, &mut second_journal, &key,
@@ -9861,7 +9905,7 @@ mod tests {
             assert_eq!(verify_publication(&second, root.path(), &cache, &mut second_journal, &key,
                 &provider, &repository, &cancel).await.unwrap(), PublicationReadiness::Verified);
             let pack_name = &pack.receipt.locator.object;
-            assert_eq!(provider.state.lock().unwrap().body_bytes[pack_name] - bodies[pack_name], pack.receipt.byte_length as usize);
+            assert_eq!(provider.state.lock().unwrap().body_bytes[pack_name] - bodies.get(pack_name).copied().unwrap_or(0), pack.receipt.byte_length as usize);
             provider.seed(pack_name, ObjectRole::Pack, vec![0; pack.receipt.byte_length as usize]);
             assert_eq!(verify_publication(&second, root.path(), &cache, &mut second_journal, &key,
                 &provider, &repository, &cancel).await.unwrap_err().kind, ErrorKind::Corrupt);
