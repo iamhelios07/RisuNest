@@ -1562,6 +1562,61 @@ pub(crate) async fn download_checkpoint_data(
     Ok((records.into_values().collect(),objects.into_values().collect()))
 }
 
+pub(crate) async fn download_control_catalogs(
+    catalogs:&[wire::StoredObject],staging_root:&Path,root_key:&[u8;32],
+    provider:&dyn Provider,repository:&RepositoryHandle,cancel:&Cancellation,
+) -> Result<Vec<PreparedObject>> {
+    let mut objects=BTreeMap::new();let mut roots=BTreeMap::new();
+    for catalog in catalogs {
+        cancel.check()?;
+        if catalog.header.repository_id!=repository.repository_id || catalog.header.role!=wire::ObjectRole::Catalog {
+            return Err(corrupt("control catalog scope differs"));
+        }
+        if let Some(previous)=roots.insert(catalog.header.object_id.clone(),catalog.clone()) {
+            if previous!=*catalog {return Err(corrupt("control catalog identity differs"));}
+            continue;
+        }
+        let remote=RemoteObject::from_stored(catalog,repository)?;
+        let stage=staging_root.join(&catalog.header.object_id);
+        let (records,controls)=download_checkpoint_data(&remote,&stage,root_key,provider,repository,cancel).await?;
+        if !records.is_empty() {return Err(corrupt("control catalog contains unit records"));}
+        for mut control in controls {
+            if let ObjectSource::Captured(hash)=&control.source {
+                let content=content_store(&stage)?;let mut reader=content.open_body(hash).map_err(transient)?;
+                let path=stage.join(format!("{hash}.control"));let mut file=std::fs::File::create(&path).map_err(transient)?;
+                if std::io::copy(&mut reader,&mut file).map_err(transient)?!=control.byte_length {return Err(corrupt("control file length differs"));}
+                file.sync_all().map_err(transient)?;control.source=ObjectSource::File(path);
+            }
+            if let Some(previous)=objects.insert(control.content_hash.clone(),control.clone()) {
+                if previous.byte_length!=control.byte_length {return Err(corrupt("control body length differs"));}
+            }
+        }
+    }
+    Ok(objects.into_values().collect())
+}
+
+pub(crate) async fn admit_data_catalogs(
+    catalogs:&[wire::StoredObject],store:&mut crate::persistent_store::PersistentStore,root_key:&[u8;32],
+    provider:&dyn Provider,repository:&RepositoryHandle,cancel:&Cancellation,
+) -> Result<Vec<String>> {
+    if catalogs.is_empty() {return Ok(Vec::new());}
+    let stage=tempfile::tempdir().map_err(transient)?;
+    let controls=download_control_catalogs(catalogs,stage.path(),root_key,provider,repository,cancel).await?;
+    let mut hashes=Vec::new();
+    for control in controls {
+        cancel.check()?;
+        let ObjectSource::File(path)=control.source else {return Err(corrupt("control file is unavailable"));};
+        let bytes=read_bytes(&path,usize::try_from(control.byte_length).map_err(corrupt)?)?;
+        if bytes.len() as u64!=control.byte_length || crate::persistent_store::external_capture::hash_backup_body(&bytes,"native_data_catalog_control_identity")!=control.content_hash {
+            return Err(corrupt("control body identity differs"));
+        }
+        if bytes.len()>risunest_sync_wire::MAX_METADATA_BYTES {crate::persistent_store::external_capture::verified_large_message_page(&bytes).map_err(corrupt)?;}
+        store.lww_put_object(&control.content_hash,&bytes).map_err(corrupt)?;
+        hashes.push(control.content_hash);
+    }
+    Ok(hashes)
+}
+
 pub(crate) async fn download_packed_body(hash:&str,length:u64,chunks:Vec<wire::StoredChunk>,packs:Vec<wire::StoredObject>,stage:&Path,key:&[u8;32],provider:&dyn Provider,repository:&RepositoryHandle,cancel:&Cancellation)->Result<Vec<u8>> {
     let path=download_packed_body_file(hash,length,chunks,packs,stage,key,provider,repository,cancel).await?;
     std::fs::read(path).map_err(transient)

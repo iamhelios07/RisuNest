@@ -249,7 +249,11 @@ pub(crate) fn hydrate_registered_many(root:&Path,digests:&[String],priority:&std
     use crate::server_sync::residency::{with_hydration_lock,HydrationOutcome};
     fn error(_:impl std::fmt::Display)->crate::server_sync::SyncError {crate::server_sync::SyncError::new("external-body-unavailable",502)}
     fn remote_error(error:ProviderError)->crate::server_sync::SyncError {
-        if error.kind==ErrorKind::Cancelled {crate::server_sync::SyncError::new("cancelled",409)} else {crate::server_sync::SyncError::new("external-body-unavailable",502)}
+        match error.kind {
+            ErrorKind::Cancelled=>crate::server_sync::SyncError::new("cancelled",409),
+            ErrorKind::ReauthRequired=>crate::server_sync::SyncError::new("external-reauth-required",502),
+            _=>crate::server_sync::SyncError::new("external-body-unavailable",502),
+        }
     }
     let installer_error=std::cell::RefCell::new(None);
     let cancel=cancellation.map(Cancellation::with_external_flag).unwrap_or_default();
@@ -326,7 +330,20 @@ pub(crate) fn hydrate_registered_many(root:&Path,digests:&[String],priority:&std
                 }
                 if missing.is_empty() {return Ok(());}
                 let stage=tempfile::tempdir_in(scratch.path()).map_err(local)?;
-                let files=super::snapshot_restore::download_packed_body_files(&missing,stage.path(),&key,provider.as_ref(),&repository,&cancel).await?;
+                let files=match super::snapshot_restore::download_packed_body_files(&missing,stage.path(),&key,provider.as_ref(),&repository,&cancel).await {
+                    Err(error) if error.kind==ErrorKind::NotFound => {
+                        let engine=super::lww_engine::ExternalLwwEngine {provider:provider.clone(),repository:repository.clone(),library:library_id.clone(),
+                            root_key:zeroize::Zeroizing::new(*key),admission:None,connection_id:connection_id.clone(),connection_root:connection_root.clone(),
+                            capabilities:stored.capabilities.clone(),descriptor:stored.descriptor.clone()};
+                        let refreshed=engine.refresh_packed_sources(&missing,&scratch.path().join("current-catalogs"),&cancel).await?;
+                        if let Some(reason)=owner.recheck(&protection,&cancel).await? {return Err(super::leases::yield_error(reason));}
+                        check().map_err(|error| {installer_error.replace(Some(error));segment::corrupt()})?;
+                        for source in &refreshed {register_packed(root,source,&repository)?;}
+                        missing=refreshed;
+                        super::snapshot_restore::download_packed_body_files(&missing,&stage.path().join("current-source"),&key,provider.as_ref(),&repository,&cancel).await?
+                    }
+                    other=>other?,
+                };
                 for source in missing {
                     if let Some(reason)=owner.recheck(&protection,&cancel).await? {return Err(super::leases::yield_error(reason));}
                     install(&source.hash,source.byte_length,files.get(&source.hash).ok_or_else(segment::corrupt)?).map_err(|error| {installer_error.replace(Some(error));segment::corrupt()})?;
@@ -345,17 +362,7 @@ pub(crate) fn hydrate_registered_many(root:&Path,digests:&[String],priority:&std
     check()?;Ok(unavailable)
 }
 pub(crate) fn hydrate_registered(root:&Path,hash:&str,check:&dyn Fn()->crate::server_sync::Result<()>)->crate::server_sync::Result<bool> {
-    check()?;
-    let cas=crate::asset_repository::PayloadCas::new(root)?;
-    if cas.stat_object(hash)?.is_some() {return Ok(true);}
-    if stat(root,hash)?.is_none() {return Ok(false);}
-    let scratch=tempfile::tempdir()?;
-    let Some(mut body)=tauri::async_runtime::block_on(spool_verified_remote_body(root,hash,scratch.path(),&Cancellation::default())).map_err(|_|crate::server_sync::SyncError::new("external-body-unavailable",502))? else {return Ok(false)};
-    check()?;
-    let prepared=cas.prepare_reader(body.as_file_mut())?;
-    if prepared.content_hash!=hash {return Err(crate::server_sync::SyncError::new("external-body-unavailable",502));}
-    crate::persistent_store::register_asset_objects_at_root(root,&[crate::persistent_store::asset_object_catalog::AssetObjectRegistration{object_hash:hash.into(),byte_size:prepared.byte_size}],i64::try_from(super::runtime::now_ms()).map_err(|_|crate::server_sync::SyncError::new("external-body-unavailable",502))?).map_err(|_|crate::server_sync::SyncError::new("external-body-unavailable",502))?;
-    check()?;Ok(true)
+    Ok(hydrate_registered_many(root,&[hash.to_owned()],&std::collections::BTreeSet::new(),None,check,&mut |_,_| {})?.is_empty())
 }
 pub(crate) fn hydrate(
     root: &Path,
@@ -366,29 +373,8 @@ pub(crate) fn hydrate(
     if let Some(file) = cas.open_object(hash)? {
         return Ok(Some(file));
     }
-    if stat(root, hash)?.is_none()
-    {
-        return Ok(None);
-    };
-    check()?;
-    let bytes = tauri::async_runtime::block_on(fetch_missing(root, hash, &Cancellation::default()))
-        .map_err(|error| {
-            crate::server_sync::SyncError::new(
-                match error.kind {
-                    ErrorKind::ReauthRequired => "external-reauth-required",
-                    _ => "external-body-unavailable",
-                },
-                502,
-            )
-        })?;
-    check()?;
-    let file = bytes
-        .map(|bytes| promote(root, hash, &bytes))
-        .transpose()
-        .map_err(|_| crate::server_sync::SyncError::new("external-body-unavailable", 502))?
-        .flatten();
-    check()?;
-    Ok(file)
+    if !hydrate_registered(root,hash,check)? {return Ok(None);}
+    check()?;cas.open_object(hash).map_err(Into::into)
 }
 
 pub(crate) async fn hydrate_missing(
@@ -448,7 +434,18 @@ pub(crate) async fn spool_frozen_remote_body(source:&FrozenBodySource,destinatio
             segment::open_body_stream(&mut input,&mut output,&source.library_id,&source.body.object_id,&key,source.body.plaintext_byte_length.0)?;
             if !super::snapshot_restore::verify_body_file(output.path(),source.body.plaintext_byte_length.0,hash)? {return Err(segment::corrupt());}
         } else if let FrozenBodySource::Packed(source)=&source {
-            let path=super::snapshot_restore::download_packed_body_file(hash,source.byte_length,source.chunks.clone(),source.packs.clone(),scratch.path(),&key,provider.as_ref(),&repository,cancel).await?;
+            let path=match super::snapshot_restore::download_packed_body_file(hash,source.byte_length,source.chunks.clone(),source.packs.clone(),scratch.path(),&key,provider.as_ref(),&repository,cancel).await {
+                Err(error) if error.kind==ErrorKind::NotFound => {
+                    let engine=super::lww_engine::ExternalLwwEngine{provider:provider.clone(),repository:repository.clone(),library:source.library_id.clone(),
+                        root_key:zeroize::Zeroizing::new(*key),admission:None,connection_id:connection_id.clone(),connection_root:connection_root.clone(),
+                        capabilities:stored.capabilities.clone(),descriptor:stored.descriptor.clone()};
+                    let mut refreshed=engine.refresh_packed_sources(std::slice::from_ref(source),&scratch.path().join("current-catalogs"),cancel).await?;
+                    let refreshed=refreshed.pop().ok_or_else(segment::corrupt)?;
+                    if let Some(reason)=owner.recheck(&protection,cancel).await? {return Err(super::leases::yield_error(reason));}
+                    super::snapshot_restore::download_packed_body_file(hash,source.byte_length,refreshed.chunks,refreshed.packs,&scratch.path().join("current-source"),&key,provider.as_ref(),&repository,cancel).await?
+                }
+                other=>other?,
+            };
             let mut input=crate::trust_boundary::open_regular_source(&path).map_err(local)?;
             std::io::copy(&mut input,&mut output).map_err(local)?;
         }
