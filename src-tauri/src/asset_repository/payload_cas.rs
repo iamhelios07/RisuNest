@@ -42,6 +42,8 @@ pub struct PreparedPayload {
 }
 
 pub(crate) struct StagedPayload {
+    #[cfg(test)]
+    body_identity: super::body_io::OwnedIdentity,
     verified_file: File,
     staging: StagingFile,
     repository_root: PathBuf,
@@ -317,6 +319,8 @@ impl PayloadCas {
         file.sync_all()?;
         let identity = exact_file_identity(&file)?;
         drop(file);
+        #[cfg(test)]
+        let mut observed_identity = super::body_io::PendingOwnedIdentity::new();
         let verified_file = self.open_exact_owned_file(&staging_path)?;
         if exact_file_identity(&verified_file)? != identity {
             return exact_object_changed();
@@ -332,7 +336,11 @@ impl PayloadCas {
                 ));
             }
         }
+        #[cfg(test)]
+        observed_identity.verified(&content_hash);
         Ok(StagedPayload {
+            #[cfg(test)]
+            body_identity: super::body_io::OwnedIdentity::new(&content_hash),
             verified_file,
             staging,
             repository_root: self.repository_root.clone(),
@@ -344,6 +352,8 @@ impl PayloadCas {
     }
 
     pub(crate) fn publish_staged(&self, staged: StagedPayload) -> io::Result<PreparedPayload> {
+        #[cfg(test)]
+        staged.body_identity.check_scope();
         if staged.repository_root != self.repository_root {
             return Err(io::Error::new(
                 ErrorKind::InvalidInput,
@@ -352,6 +362,8 @@ impl PayloadCas {
         }
         self.ensure_repository_root()?;
         let StagedPayload {
+            #[cfg(test)]
+            body_identity: _body_identity,
             verified_file,
             mut staging,
             identity,
@@ -360,6 +372,8 @@ impl PayloadCas {
             mut directory_entries_synced,
             ..
         } = staged;
+        #[cfg(test)]
+        let _body_scope = super::body_io::object_scope(&content_hash);
         let path_file = self.open_exact_owned_file(&staging.path)?;
         if exact_file_identity(&verified_file)? != identity
             || exact_file_identity(&path_file)? != identity
@@ -1659,6 +1673,69 @@ mod body_io_tests {
         let cas = PayloadCas::new(directory.path()).unwrap();
         let prepared = cas.prepare_bytes(bytes).unwrap();
         (directory, cas, prepared)
+    }
+
+    #[test]
+    fn staging_provenance_conserves_owned_opens_and_asset_classification() {
+        for purpose in [BodyPurpose::Control, BodyPurpose::Asset] {
+            let directory = tempfile::tempdir().unwrap();
+            let cas = PayloadCas::new(directory.path()).unwrap();
+            let bytes = b"synthetic staged body";
+            let hash = risunest_sync_wire::hash(bytes);
+            reset_body_io(); register_object_purpose(&hash, purpose);
+            let staged = cas.stage_reader_expected(&mut bytes.as_slice(), &hash, bytes.len() as u64).unwrap();
+            cas.publish_staged(staged).unwrap();
+            let work = take_body_io(); assert!(work.complete());
+            assert_eq!(work.domains["owned"], BodyWork { open_attempts: 2, opens: 2, ..Default::default() });
+            assert_eq!(work.objects[&hash].owned_work, work.domains["owned"]);
+            assert_eq!(work.objects[&hash].work, BodyWork::default());
+            assert_eq!(work.unknown_work(), BodyWork::default());
+            let classified = if purpose == BodyPurpose::Control { work.control_work() } else { work.asset_work() };
+            assert_eq!(classified, work.domains["owned"]);
+        }
+    }
+
+    #[test]
+    fn failed_or_unclassified_staging_never_acquires_a_control_default() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let bytes = b"synthetic staged body";
+        let hash = risunest_sync_wire::hash(bytes);
+        reset_body_io();
+        cas.prepare_bytes(bytes).unwrap();
+        let unknown = take_body_io(); assert!(!unknown.complete());
+        assert_eq!(unknown.unknown_work(), unknown.domains["owned"]);
+        assert_eq!(unknown.control_work(), BodyWork::default());
+        register_object_purpose(&hash, BodyPurpose::Control);
+        assert!(cas.stage_reader_expected(&mut bytes.as_slice(), &hash, 0).is_err());
+        let failed = take_body_io(); assert!(!failed.complete());
+        assert_eq!(failed.unattributed_owned.opens, 1);
+        assert_eq!(failed.unattributed_owned, failed.domains["owned"]);
+        reset_body_io();
+        assert!(cas.open_exact_owned_file(&directory.path().join("missing.tmp")).is_err());
+        let missing = take_body_io(); assert!(!missing.complete());
+        assert_eq!(missing.unattributed_owned.failed_opens, 1);
+    }
+
+    #[test]
+    fn staged_owned_identity_cannot_cross_reset_or_worker_boundaries() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let bytes = b"synthetic staged body";
+        let hash = risunest_sync_wire::hash(bytes);
+        reset_body_io(); register_object_purpose(&hash, BodyPurpose::Control);
+        let staged = cas.stage_reader_expected(&mut bytes.as_slice(), &hash, bytes.len() as u64).unwrap();
+        let live = take_body_io(); assert!(!live.complete());
+        assert_eq!(live.control_work().outstanding_readers, 1);
+        drop(staged); assert!(!take_body_io().complete());
+        reset_body_io(); register_object_purpose(&hash, BodyPurpose::Control);
+        let staged = cas.stage_reader_expected(&mut bytes.as_slice(), &hash, bytes.len() as u64).unwrap();
+        let worker = std::thread::spawn(move || {
+            reset_body_io(); cas.publish_staged(staged).unwrap(); take_body_io()
+        }).join().unwrap();
+        let owner = take_body_io(); assert!(!owner.complete()); assert!(!worker.complete());
+        assert_eq!(owner.control_work().opens, 1); assert_eq!(worker.unknown_work().opens, 1);
+        assert_eq!(owner.domains["owned"].outstanding_readers, 0);
     }
 
     #[test]
