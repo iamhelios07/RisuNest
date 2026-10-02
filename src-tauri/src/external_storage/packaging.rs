@@ -20,7 +20,7 @@ use super::{
 };
 use crate::{asset_repository::PayloadCas, persistent_store::external_capture::CapturedSnapshot};
 use risunest_external_storage_format::{
-    content_identity::{hash, hash_reader},
+
     control as wire_control,
     crypto::derive_key,
     format::library_fingerprint_domain,
@@ -30,7 +30,35 @@ use risunest_external_storage_format::{
 };
 use risunest_sync_wire::head::Sequence;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use super::worker_observation::spawn_blocking;
+#[cfg(not(test))]
+use tokio::task::spawn_blocking;
 use sha2::{Digest, Sha256};
+#[cfg(not(test))]
+use risunest_external_storage_format::content_identity::{hash,hash_reader};
+#[cfg(test)]
+fn hash(bytes:&[u8])->[u8;32] {
+    crate::persistent_store::hash_work::observe("native_external_content_identity",bytes.len());
+    risunest_external_storage_format::content_identity::hash(bytes)
+}
+#[cfg(test)]
+fn hash_reader(reader:&mut impl std::io::Read,expected_length:u64)->risunest_external_storage_format::Result<[u8;32]> {
+    struct Input<'a,R>{reader:&'a mut R,length:u64,expected:u64}
+    impl<R:std::io::Read> std::io::Read for Input<'_,R> {
+        fn read(&mut self,bytes:&mut [u8])->std::io::Result<usize> {
+            let count=self.reader.read(bytes)?;
+            self.length=self.length.saturating_add(count as u64);
+            if self.length<=self.expected {crate::persistent_store::hash_work::update("native_external_content_reader",count);}
+            Ok(count)
+        }
+    }
+    crate::persistent_store::hash_work::begin("native_external_content_reader");
+    let result=risunest_external_storage_format::content_identity::hash_reader(&mut Input{reader,length:0,expected:expected_length},expected_length);
+    if result.is_err() {crate::persistent_store::hash_work::incomplete("native_external_content_reader");}
+    result
+}
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
@@ -824,6 +852,7 @@ async fn revalidate_cached_object_at(
     // A repaired opaque locator may be newer than an entry's embedded receipt.
     // Consult the existing inventory before declaring that old locator missing;
     // the current remote bytes still have to pass a fresh verification below.
+    let mut persisted_version = None;
     let mut verified = match cache.object(
         &value.repository_id, repository, &value.object_id, &value.plaintext_sha256,
     )? {
@@ -834,6 +863,7 @@ async fn revalidate_cached_object_at(
             {
                 return Err(corrupt("cached immutable identity changed"));
             }
+            persisted_version = current.receipt.version.clone();
             current
         }
         None => value.clone(),
@@ -857,8 +887,10 @@ async fn revalidate_cached_object_at(
     let known = journal.verification.receipts.get(&key).cloned();
     let mut historical = known.clone().unwrap_or_else(|| verified.receipt.clone());
     historical.checksum = None;
-    // Only a version bound to bytes verified in this execution permits a conditional read.
-    let unchanged = if output.is_none() { known.as_ref().and_then(|receipt| receipt.version.as_ref()) } else { None };
+    // Persisted inventory versions are bound to this device's verified bytes.
+    let unchanged = if output.is_none() {
+        known.as_ref().and_then(|receipt| receipt.version.as_ref()).or(persisted_version.as_ref())
+    } else { None };
     // Keyed to the reference this attempt is about to contact, which the
     // inventory above may have moved on from the one the caller held. A
     // reference already found unusable stays that way even though the cache
@@ -1329,9 +1361,15 @@ pub(super) fn catalog_fingerprint_of<'a>(
     sources: impl Iterator<Item = (&'a str, u64, &'a str)>,
 ) -> String {
     let mut digest = Sha256::new();
+    #[cfg(test)]
+    crate::persistent_store::hash_work::begin("native_external_catalog_fingerprint");
+    #[cfg(test)]
+    crate::persistent_store::hash_work::update("native_external_catalog_fingerprint",b"risunest.external-catalog-fingerprint/v1\0".len()+kind_name(kind).len());
     digest.update(b"risunest.external-catalog-fingerprint/v1\0");
     digest.update(kind_name(kind).as_bytes());
     for (key, byte_length, content_sha256) in sources {
+        #[cfg(test)]
+        crate::persistent_store::hash_work::update("native_external_catalog_fingerprint",16+key.len()+content_sha256.len());
         digest.update((key.len() as u64).to_le_bytes());
         digest.update(key.as_bytes());
         digest.update(byte_length.to_le_bytes());
@@ -1622,7 +1660,7 @@ async fn build_entries(
     let handle = tokio::runtime::Handle::current();
     let families = journal.families();
     let producer_families = families.clone();
-    let producer = tokio::task::spawn_blocking(move || {
+    let producer = spawn_blocking(move || {
         prepare_packs(
             uncached,
             &repository_root_owned,
@@ -1942,6 +1980,8 @@ fn prepare_packs(
         }
         let mut remaining = source.byte_length;
         let mut source_hash = Sha256::new();
+        #[cfg(test)]
+        crate::persistent_store::hash_work::begin("native_external_pack_source");
         let mut chunks = Vec::new();
         loop {
             cancel.check()?;
@@ -1953,6 +1993,8 @@ fn prepare_packs(
             let mut bytes = vec![0; count];
             input.read_exact(&mut bytes).map_err(corrupt)?;
             source_hash.update(&bytes);
+            #[cfg(test)]
+            crate::persistent_store::hash_work::update("native_external_pack_source",bytes.len());
             let chunk = Chunk {
                 hash: hash(&bytes),
                 bytes,
@@ -1968,9 +2010,11 @@ fn prepare_packs(
                 tests::observe_boundary();
             } else {
                 let mut encoded = Vec::new();
-                let stored_length =
-                    pack::write_entry_with(&mut encoded, &chunk, &mut encoder, source.compression)
-                        .map_err(corrupt)?;
+                let stored_length = pack::write_entry_with(&mut encoded, &chunk, &mut encoder, source.compression);
+                #[cfg(test)]
+                if stored_length.is_ok() {crate::persistent_store::hash_work::observe("native_external_pack_entry_validation",chunk.bytes.len());}
+                else {crate::persistent_store::hash_work::incomplete("native_external_pack_entry_validation");}
+                let stored_length=stored_length.map_err(corrupt)?;
                 if current
                     .as_ref()
                     .is_some_and(|pack| pack_full(pack.length, stored_length, target))
@@ -2285,7 +2329,7 @@ async fn seal_plain_object(
         let header_copy = header.clone();
         let key_copy = *key;
         let cpu = cpu_permit().await?;
-        tokio::task::spawn_blocking(move || {
+        spawn_blocking(move || {
             let mut input =
                 crate::trust_boundary::open_regular_source(&cipher_path).map_err(corrupt)?;
             if input.metadata().map_err(corrupt)?.len() != ciphertext_length
@@ -2302,6 +2346,8 @@ async fn seal_plain_object(
             impl Write for HashSink {
                 fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
                     self.digest.update(bytes);
+                    #[cfg(test)]
+                    crate::persistent_store::hash_work::update("native_external_journal_plaintext",bytes.len());
                     self.length = self
                         .length
                         .checked_add(bytes.len() as u64)
@@ -2312,6 +2358,8 @@ async fn seal_plain_object(
                     Ok(())
                 }
             }
+            #[cfg(test)]
+            crate::persistent_store::hash_work::begin("native_external_journal_plaintext");
             let mut output = HashSink {
                 digest: Sha256::new(),
                 length: 0,
@@ -2353,7 +2401,7 @@ async fn seal_plain_object(
     let key_copy = *key;
     let header_copy = header.clone();
     let cpu = cpu_permit().await?;
-    let ciphertext_sha256 = tokio::task::spawn_blocking(move || {
+    let ciphertext_sha256 = spawn_blocking(move || {
         if spool_path.exists() {
             fs::remove_file(&spool_path).map_err(transient)?;
         }
@@ -3455,7 +3503,7 @@ pub(crate) async fn package_and_upload_protected(
     let library_domain = library_fingerprint_domain();
     let cpu = cpu_permit().await?;
     let (record_sources, asset_sources, observed_fingerprint) =
-        tokio::task::spawn_blocking(move || {
+        spawn_blocking(move || {
             let (records, assets) = capture_sources(&capture)?;
             let fingerprint = capture
                 .catalog
@@ -4957,6 +5005,148 @@ mod tests {
     }
 
     #[test]
+    fn database_first_native_restore_activates_before_actual_missing_body_completion() {
+        runtime().block_on(async {
+            use crate::external_storage::{runtime_restore,job_store::{DurableJob,JobStore}};
+            let root=tempfile::tempdir().unwrap();
+            let bytes=b"synthetic full restore managed body";
+            let mut asset_bytes=vec![bytes.to_vec(),b"synthetic second managed body".to_vec(),b"synthetic present managed body".to_vec()];
+            asset_bytes.extend((3..129).map(|index|format!("synthetic grouped asset {index}").into_bytes()));
+            let cas=PayloadCas::new(root.path()).unwrap();
+            let assets=asset_bytes.iter().map(|bytes|cas.prepare_bytes(bytes).unwrap()).collect::<Vec<_>>();
+            let hash=assets[0].content_hash.clone();
+            let identity=CaptureIdentity{store_id:"store".into(),library_epoch:"epoch".into(),generation:"generation".into(),selection_epoch:"selection".into(),revision:0};
+            let mut catalog=crate::external_storage::capture::CaptureCatalog::create(&root.path().join("external-storage/captures/full-phase"),&root.path().join("external-storage"),None).unwrap();
+            catalog.begin(&identity,None).unwrap();
+            let record=crate::logical_records::encode_logical_record(&crate::logical_records::LogicalRecordEnvelope::Root{value:serde_json::json!({}),owner_heads:vec![]}).unwrap();
+            let root_key=crate::logical_records::encode_logical_record_key(&crate::logical_records::LogicalRecordLocator::Root).unwrap();
+            catalog.record(&root_key,&record.bytes).unwrap();
+            for asset in &assets {catalog.reference(&root_key,&asset.content_hash,asset.byte_size).unwrap();}
+            catalog.finish().unwrap();
+            let capture=CapturedSnapshot{id:"full-phase".into(),identity,catalog,projected_records:1,shared:false};
+            let provider=Arc::new(FakeProvider::new(false));let repository=fake::repository();let key=[21;32];
+            let mut source=crate::persistent_store::PersistentStore::open(root.path()).unwrap();
+            let sections=super::super::sections::capture_backup_sections(&mut source,&root.path().join("sections"),&Cancellation::default()).unwrap();
+            let mut metadata=metadata("full-phase",&capture);
+            let original_units=assets.iter().enumerate().map(|(index,asset)|(
+                risunest_sync_wire::unit::UnitKey::new(&["future-opaque",&format!("full-body-{index}")]).unwrap(),
+                risunest_sync_wire::unit::UnitValue::object(risunest_sync_wire::descriptor::RecordDescriptor::content(asset.content_hash.clone())).unwrap(),
+            )).collect();
+            metadata.purpose=SnapshotPurpose::BackupBundle{source:wire_control::BundleSource::Device{writer_id:"synthetic-writer".into()},remote_generation:None,original_units};
+            let mut transfer=journal(&root.path().join("full-phase-upload"),"full-phase",&capture);
+            let completed=package_and_upload(capture,sections.clone(),root.path(),&root.path().join("full-phase-cache"),metadata,&key,limits(256*1024),None,&mut transfer,provider.as_ref(),&repository,&PhaseProgress::silent(),&Cancellation::default()).await.unwrap();
+            let connected=super::super::connection_commands::ConnectedRepository {
+                stored:super::super::connection_store::StoredConnection {
+                    id:"synthetic-connection".into(),config:super::super::contract::ConnectionConfig {provider:"synthetic".into(),profile:None,endpoint:"https://synthetic.invalid".into(),account_id:"account".into(),location:BTreeMap::new(),oauth_profile:None},
+                    descriptor:risunest_external_storage_format::format::Descriptor::new("format-repository".into(),Some(risunest_external_storage_format::format::Strategy::Cas)).unwrap(),
+                    descriptor_locator:RemoteLocator{connection_identity:repository.connection_identity.clone(),collection:None,object:"descriptor".into()},provider_repository_id:repository.repository_id.clone(),credential_ref:"credential".into(),root_key_ref:"key".into(),recovery_key_ref:"recovery".into(),retention_policy:None,capabilities:fake::capabilities(true),created_at_ms:1,verified_at_ms:1,last_sync_at_ms:None,last_backup_at_ms:None,
+                },provider:provider.clone(),handle:repository,dependencies:fake::loopback_dependencies(fake::MemoryVault::default(),1).dependencies,root_key:zeroize::Zeroizing::new(key),
+            };
+            let connected=Arc::new(connected);
+            for already_present in [false,true] {
+                let destination=tempfile::tempdir().unwrap();
+                let mut store=crate::persistent_store::PersistentStore::open(destination.path()).unwrap();
+                let local=PayloadCas::new(destination.path()).unwrap();
+                for bytes in &asset_bytes[2..] {local.prepare_bytes(bytes).unwrap();}
+                if already_present {for bytes in &asset_bytes[..2] {local.prepare_bytes(bytes).unwrap();}}
+                let request=serde_json::from_value(serde_json::json!({"connectionId":"synthetic-connection","kind":"restore","snapshotId":"full-phase","targetRevision":"0"})).unwrap();
+                let mut job=DurableJob::new(request,false,1,store.external_identity().unwrap());
+                job.summary["restoreSource"]=serde_json::to_value(completed.reference.stored(&connected.handle).unwrap()).unwrap();
+                let jobs=JobStore::open(destination.path()).unwrap();jobs.put(&job).unwrap();
+                let (prepared,received_sections)=runtime_restore::prepare_database_first_backup(destination.path(),&connected,&job,&Cancellation::default()).await.unwrap();
+                assert_eq!(prepared.present.contains(&hash),already_present);
+                jobs.freeze_restore_bodies(&job,&prepared.sources,&prepared.present).unwrap();
+                let pack_ids=prepared.sources.iter().flat_map(|source|source.chunks.iter().map(|chunk|chunk.pack_id.clone())).collect::<BTreeSet<_>>();
+                assert_eq!(pack_ids.len(),1);
+                if !already_present {
+                    let connection=connected.clone();let external_source=prepared.sources[0].clone();
+                    spawn_blocking(move || {
+                        use crate::server_sync::lww_tests::{LocalServerFixture,put_asset,drain_publications};
+                        let mixed=tempfile::tempdir().unwrap();let mut mixed_store=PersistentStore::open(mixed.path()).unwrap();
+                        super::super::connection_store::ConnectionStore::open(mixed.path()).unwrap().insert(&connection.stored).unwrap();
+                        let _connection=super::super::lww_residency::install_test_source_connection(mixed.path(),connection).unwrap();
+                        let mut external_source=external_source;external_source.connection_root=mixed.path().to_owned();
+                        super::super::lww_residency::register_packed(mixed.path(),&external_source).unwrap();
+                        let server=LocalServerFixture::new();let core=server.client(&mixed_store);
+                        let server_hash=put_asset(&mut mixed_store,"assets/background-server.bin",&vec![71;100_000]).object_hash.unwrap();
+                        drain_publications(&core,&mut mixed_store,&[]).unwrap();
+                        mixed_store.asset_residency_set_policy(crate::server_sync::residency::AssetPolicy::Remote,||Ok(())).unwrap();
+                        mixed_store.asset_residency_evict(||Ok(())).unwrap();
+                        let cas=PayloadCas::new(mixed.path()).unwrap();assert!(cas.stat_object(&server_hash).unwrap().is_none());
+                        let mut session=crate::server_sync::residency::HydrationSession::new(mixed.path(),None).unwrap();
+                        let priority=BTreeSet::from([external_source.hash.clone()]);let mut completed=Vec::new();
+                        assert!(session.hydrate_many_outcomes_prioritized(&[server_hash.clone(),external_source.hash.clone()],&priority,&||Ok(()),|hash,outcome| {
+                            if hash==external_source.hash {assert!(cas.stat_object(&server_hash).unwrap().is_none());}
+                            assert_eq!(outcome,crate::server_sync::residency::HydrationOutcome::Downloaded);
+                            completed.push(hash.to_owned());
+                        }).unwrap().is_empty());
+                        assert_eq!(completed,[external_source.hash,server_hash]);
+                    }).await.unwrap();
+                }
+                let bootstrap=tempfile::tempdir().unwrap();
+                let bootstrap_store=crate::persistent_store::PersistentStore::open(bootstrap.path()).unwrap();
+                super::super::connection_store::ConnectionStore::open(bootstrap.path()).unwrap().insert(&connected.stored).unwrap();
+                let _connection=super::super::lww_residency::install_test_source_connection(bootstrap.path(),connected.clone()).unwrap();
+                let bootstrap_cas=PayloadCas::new(bootstrap.path()).unwrap();
+                bootstrap_cas.prepare_bytes(&asset_bytes[2]).unwrap();
+                if already_present {for bytes in &asset_bytes {bootstrap_cas.prepare_bytes(bytes).unwrap();}}
+                for source in &prepared.sources {
+                    let mut source=source.clone();source.connection_root=bootstrap.path().to_owned();
+                    super::super::lww_residency::register_packed(bootstrap.path(),&source).unwrap();
+                }
+                crate::persistent_store::register_asset_objects_at_root(bootstrap.path(),&assets.iter().map(|asset|crate::persistent_store::asset_object_catalog::AssetObjectRegistration{object_hash:asset.content_hash.clone(),byte_size:asset.byte_size}).collect::<Vec<_>>(),1).unwrap();
+                let bootstrap_pack=prepared.sources[0].packs[0].locator.object.clone();
+                let bootstrap_reads=provider.read_attempts(&bootstrap_pack);
+                crate::asset_repository::body_io::reset_body_io();
+                for asset in &assets {crate::asset_repository::body_io::register_object_purpose(&asset.content_hash,crate::asset_repository::body_io::BodyPurpose::Asset);}
+                bootstrap_store.hydrate_registered_remote_assets_prioritized(None,None,||Ok(()),||{}).unwrap();
+                let bootstrap_bodies=crate::asset_repository::body_io::take_body_io();
+                assert!(bootstrap_bodies.complete());
+                if already_present {assert_eq!(bootstrap_bodies.asset_work(),Default::default());}
+                else {assert!(bootstrap_bodies.asset_work().read_bytes>0);}
+                assert_eq!(provider.read_attempts(&bootstrap_pack)-bootstrap_reads,usize::from(!already_present));
+                let pack=prepared.sources.iter().flat_map(|source|source.packs.iter()).find(|pack|pack_ids.contains(&pack.header.object_id)).unwrap().clone();
+                let reads_before=provider.read_attempts(&pack.locator.object);
+                let mut different=prepared.sources.clone();different[0].protected_snapshot="different-published-source".into();
+                assert!(jobs.freeze_restore_bodies(&job,&different,&prepared.present).is_err());
+                jobs.freeze_restore_bodies(&job,&prepared.sources,&BTreeSet::from([hash.clone()])).unwrap();
+                let admission=Arc::new(crate::native_file_jobs::admission::Admission::default());
+                let state=crate::persistent_store::commands::PersistentStoreState::default();
+                crate::asset_repository::body_io::reset_body_io();
+                for asset in &assets {crate::asset_repository::body_io::register_object_purpose(&asset.content_hash,crate::asset_repository::body_io::BodyPurpose::Asset);}
+                let (receipt,permit)=runtime_restore::activate_database_first_backup(&mut store,&state,&job,prepared,received_sections,Cancellation::default(),admission.staging().unwrap()).unwrap();
+                let activation=crate::asset_repository::body_io::take_body_io();
+                assert!(activation.complete());assert_eq!(activation.asset_work(),Default::default());
+                assert!(admission.file(true).is_err());
+                assert_eq!(store.revision().unwrap().to_string(),receipt["receivedRevision"].as_str().unwrap());
+                assert_eq!(PayloadCas::new(destination.path()).unwrap().stat_object(&hash).unwrap().is_some(),already_present);
+                assert_ne!(jobs.read(&job.id).unwrap().summary["restoreBodiesComplete"],true);
+                crate::asset_repository::body_io::reset_body_io();crate::external_storage::worker_observation::begin();
+                for asset in &assets {crate::asset_repository::body_io::register_object_purpose(&asset.content_hash,crate::asset_repository::body_io::BodyPurpose::Asset);}
+                let adoption=runtime_restore::RestoreAdoptionRequest{job_id:job.id.clone(),received_revision:receipt["receivedRevision"].as_str().unwrap().into(),selected_character_id:None};
+                let mut permit=Some(permit);
+                let invalid_adoption=runtime_restore::RestoreAdoptionRequest{received_revision:"999".into(),..adoption.clone()};
+                let refused_store=crate::persistent_store::PersistentStore::open(destination.path()).unwrap();
+                assert!(runtime_restore::settle_database_first_backup(refused_store,&connected,&job,invalid_adoption,&mut permit,&Cancellation::default()).await.is_err());
+                assert!(permit.is_some());assert!(admission.file(true).is_err());
+                let cancelled=Cancellation::default();cancelled.cancel();
+                assert_eq!(runtime_restore::settle_database_first_backup(store,&connected,&job,adoption.clone(),&mut permit,&cancelled).await.unwrap_err().kind,ErrorKind::Cancelled);
+                assert!(admission.file(true).is_ok());
+                let store=crate::persistent_store::PersistentStore::open(destination.path()).unwrap();
+                assert_eq!(store.revision().unwrap().to_string(),receipt["receivedRevision"].as_str().unwrap());
+                runtime_restore::settle_database_first_backup(store,&connected,&job,adoption,&mut Some(admission.file(true).unwrap()),&Cancellation::default()).await.unwrap();
+                let workers=crate::external_storage::worker_observation::take();let bodies=crate::asset_repository::body_io::take_body_io();
+                assert!(bodies.complete());assert!(workers.iter().all(|worker|worker.completed));
+                if already_present {assert_eq!(bodies.asset_work(),Default::default());} else {assert!(bodies.asset_work().read_bytes>0);}
+                assert!(admission.file(true).is_ok());assert_eq!(jobs.read(&job.id).unwrap().summary["restoreBodiesComplete"],true);
+                assert!(jobs.restore_bodies_settled(&job.id).unwrap());
+                assert_eq!(provider.read_attempts(&pack.locator.object)-reads_before,usize::from(!already_present));
+                for asset in &assets {assert!(PayloadCas::new(destination.path()).unwrap().stat_object(&asset.content_hash).unwrap().is_some());}
+            }
+        });
+    }
+
+    #[test]
     fn asset_only_publication_uses_existing_authenticated_pack_catalog() {
         runtime().block_on(async {
             let root=tempfile::tempdir().unwrap();
@@ -5023,6 +5213,63 @@ mod tests {
             let mut bytes=Vec::new();
             std::io::Read::read_to_end(&mut body,&mut bytes).unwrap();
             assert_eq!(bytes,manifest.bytes);
+        });
+    }
+
+    #[test]
+    fn actual_pack_hash_observations_include_streamed_inputs_and_failed_prefixes() {
+        crate::persistent_store::hash_work::reset_hash_work();
+        let bytes=b"synthetic hashing input";
+        let expected=hash(bytes);
+        assert_eq!(hash_reader(&mut bytes.as_slice(),bytes.len() as u64).unwrap(),expected);
+        let fingerprint=catalog_fingerprint_of(wire::CatalogKind::Assets,std::iter::once(("asset",bytes.len() as u64,"hash")));
+        assert_eq!(fingerprint.len(),64);
+        let observed=crate::persistent_store::hash_work::take_hash_work();
+        assert!(observed.incomplete.is_empty());
+        assert_eq!(observed.domains["native_external_content_identity"].bytes,bytes.len() as u64);
+        assert_eq!(observed.domains["native_external_content_reader"].bytes,bytes.len() as u64);
+        assert!(observed.domains["native_external_catalog_fingerprint"].bytes>0);
+        crate::persistent_store::hash_work::reset_hash_work();
+        assert!(hash_reader(&mut bytes.as_slice(),1).is_err());
+        let failed=crate::persistent_store::hash_work::take_hash_work();
+        assert!(failed.incomplete.contains_key("native_external_content_reader"));
+        assert_eq!(failed.domains["native_external_content_reader"].bytes,0);
+    }
+
+    #[test]
+    fn independent_full_backups_reuse_unchanged_asset_pack_without_body_retransmission() {
+        runtime().block_on(async {
+            let root=tempfile::tempdir().unwrap();let cache=root.path().join("cache");
+            let provider=FakeProvider::new(false);let repository=fake::repository();let key=[91;32];
+            let mut store=PersistentStore::open(root.path()).unwrap();
+            let sections=super::super::sections::capture_backup_sections(&mut store,&root.path().join("sections"),&Cancellation::default()).unwrap();
+            assert_eq!(sections.len(),3);
+            let mut previous:Option<CompletedSnapshot>=None;
+            for (index,id) in ["independent-first","independent-second"].into_iter().enumerate() {
+                let (capture,_)=captured(root.path(),id,index as i64,b"synthetic unchanged full record",b"synthetic unchanged managed asset");
+                let mut meta=metadata(id,&capture);
+                meta.purpose=SnapshotPurpose::BackupBundle{source:wire_control::BundleSource::Device{writer_id:"synthetic-writer".into()},remote_generation:None,original_units:BTreeMap::new()};
+                let asset_packs=previous.as_ref().map(|previous| {
+                    let identity=ObjectEvidence::identity(&previous.asset_catalog,&repository).unwrap();
+                    PackageCache::open(&cache).unwrap().graph_of(&previous.repository_id,&repository,&identity).unwrap().into_iter().filter(|object|object.role==ObjectRole::Pack).collect::<Vec<_>>()
+                }).unwrap_or_default();
+                let before=asset_packs.iter().map(|object|(object.receipt.locator.object.clone(),provider.state.lock().unwrap().body_bytes.get(&object.receipt.locator.object).copied().unwrap_or(0))).collect::<BTreeMap<_,_>>();
+                let uploads=asset_packs.iter().map(|object|provider.upload_attempts(&object.object_id)).collect::<Vec<_>>();
+                let mut transfer=journal(&root.path().join(format!("{id}-job")),id,&capture);
+                let completed=package_and_upload(capture,sections.clone(),root.path(),&cache,meta,&key,limits(256*1024),None,&mut transfer,&provider,&repository,&PhaseProgress::silent(),&Cancellation::default()).await.unwrap();
+                assert_eq!(completed.sections.len(),3);
+                if let Some(previous)=&previous {
+                    assert_ne!(completed.reference.object_id,previous.reference.object_id);
+                    assert_eq!(completed.asset_catalog.object_id,previous.asset_catalog.object_id);
+                    assert!(!asset_packs.is_empty());
+                    for (index,object) in asset_packs.iter().enumerate() {
+                        assert_eq!(provider.state.lock().unwrap().body_bytes.get(&object.receipt.locator.object).copied().unwrap_or(0),before[&object.receipt.locator.object]);
+                        assert_eq!(provider.upload_attempts(&object.object_id),uploads[index]);
+                        assert!(completed.referenced_objects.iter().any(|value|value.object_id==object.object_id));
+                    }
+                }
+                previous=Some(completed);
+            }
         });
     }
 

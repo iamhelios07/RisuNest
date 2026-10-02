@@ -41,12 +41,13 @@ pub(crate) struct FrozenAsset {
     pub byte_length: u64,
     pub local_pin: bool,
     pub remote_source: Option<crate::external_storage::lww_residency::FrozenBodySource>,
+    pub server_source: Option<crate::server_sync::residency::RemoteObject>,
 }
 impl PartialEq for FrozenAsset {
     fn eq(&self, other: &Self) -> bool {
         self.content_hash == other.content_hash && self.byte_length == other.byte_length
             && self.local_pin == other.local_pin
-            && match (serde_json::to_value(&self.remote_source), serde_json::to_value(&other.remote_source)) {
+            && match (serde_json::to_value((&self.remote_source, &self.server_source)), serde_json::to_value((&other.remote_source, &other.server_source))) {
                 (Ok(left), Ok(right)) => left == right,
                 _ => false,
             }
@@ -57,7 +58,8 @@ impl std::fmt::Debug for FrozenAsset {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("FrozenAsset").field("content_hash", &self.content_hash)
             .field("byte_length", &self.byte_length).field("local_pin", &self.local_pin)
-            .field("remote_source", &self.remote_source.is_some()).finish()
+            .field("remote_source", &self.remote_source.is_some())
+            .field("server_source", &self.server_source.is_some()).finish()
     }
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -105,6 +107,21 @@ impl SealedPublication {
     }
 }
 impl PersistentStore {
+    pub(super) fn external_lww_active_asset_roots(&self) -> StoreResult<crate::asset_repository::migration_gc::AssetRootSet> {
+        let device = self.device_store()?;
+        let db = device.connection();
+        if db.query_row("SELECT 1 FROM external_lww_segments WHERE complete=0 AND json_type(metadata,'$.assets') IS NOT 'array' LIMIT 1", [], |_| Ok(())).optional()?.is_some() {
+            return Err(super::lww::error("captured-asset-roots-integrity"));
+        }
+        let mut roots = crate::asset_repository::migration_gc::AssetRootSet::default();
+        let mut statement = db.prepare("SELECT DISTINCT json_extract(asset.value,'$.contentHash') FROM external_lww_segments publication,json_each(publication.metadata,'$.assets') asset WHERE publication.complete=0")?;
+        for hash in statement.query_map([], |row| row.get::<_, String>(0))? {
+            let hash = hash?;
+            risunest_sync_wire::validate_hash(&hash).map_err(super::lww::error)?;
+            roots.object_hashes.insert(hash);
+        }
+        Ok(roots)
+    }
     pub(crate) fn external_lww_unpublished_entries(
         &self,
         expected: DecimalU64,
@@ -303,6 +320,12 @@ impl PersistentStore {
         publication: &SealedPublication,
         bytes: &[u8],
     ) -> StoreResult<()> {
+        if publication.assets.iter().any(|asset| {
+            u8::from(asset.local_pin) + u8::from(asset.remote_source.is_some()) + u8::from(asset.server_source.is_some()) != 1
+                || asset.server_source.as_ref().is_some_and(|source| source.hash != asset.content_hash || source.size != asset.byte_length)
+        }) {
+            return Err(super::lww::error("captured-asset-source-integrity"));
+        }
         if publication.bodies.iter().any(|body| {
             if body.bytes.is_empty() {
                 !body.sha256.is_empty() || body.byte_length != 0 || body.resume.is_some()
@@ -462,5 +485,77 @@ impl PersistentStore {
             params![target, writer, seq.to_string(), hash],
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod asset_root_tests {
+    use super::*;
+    use crate::external_storage::{contract::{Cancellation, ErrorKind}, lww_tests::{CycleFixture, HeldAssetTransfer, small_asset}};
+    use crate::server_sync::{lww_tests::LocalServerFixture, residency::{AssetPolicy, Residency}};
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+
+    #[test]
+    fn pending_remote_asset_roots_survive_alias_overwrite_and_release_only_after_ack_or_abandon() {
+        for acknowledged in [false, true] {
+            let mut f = CycleFixture::new();
+            let server = LocalServerFixture::new();
+            let core = server.client(&f.a);
+            let hash = small_asset(&mut f.a, "synthetic-pending-root", &vec![71; 96 * 1024]);
+            crate::server_sync::lww_tests::drain_publications(&core, &mut f.a, &[]).unwrap();
+            f.a.asset_residency_set_policy(AssetPolicy::Remote, || Ok(())).unwrap();
+            f.a.asset_residency_evict(|| Ok(())).unwrap();
+            assert!(!f.a.external_lww_object_is_local(&hash).unwrap());
+            let alias = crate::persistent_store::AssetAlias { key: "synthetic-pending-root".into(),
+                object_hash: Some(hash.clone()), kind: "asset".into(), size: 96 * 1024,
+                mime: "application/octet-stream".into(), name: "Synthetic captured alias".into(), ext: "bin".into(),
+                inlay_type: None, width: None, height: None, metadata: serde_json::json!({}) };
+            f.a.commit_asset_alias(&alias, f.a.revision().unwrap()).unwrap();
+            let held = HeldAssetTransfer::new(f.provider.clone());
+            held.held.store(false, Ordering::SeqCst);
+            let root = f.directory_a.path().to_owned();
+            let cancel = Cancellation::default();
+            let callback_cancel = cancel.clone();
+            let overwritten = Arc::new(AtomicBool::new(false));
+            let callback_overwritten = overwritten.clone();
+            *held.before_lease.lock().unwrap() = Some(Box::new(move || {
+                let mut store = PersistentStore::open(&root).unwrap();
+                small_asset(&mut store, "synthetic-pending-root", b"synthetic later alias body");
+                callback_overwritten.store(true, Ordering::SeqCst);
+                callback_cancel.cancel();
+            }));
+            f.sender.provider = held.clone();
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            assert_eq!(runtime.block_on(f.sender.publish(&mut f.a, 0.into(), &[], &cancel)).err().expect("cancelled publication must retain its capture").kind, ErrorKind::Cancelled);
+            assert!(overwritten.load(Ordering::SeqCst));
+            f.a = PersistentStore::open(f.directory_a.path()).unwrap();
+            let writer = f.a.lww_clock_state().unwrap().writer_id;
+            let (pending, _) = f.a.external_lww_pending(&f.sender.target_scope(), &writer).unwrap().unwrap();
+            assert_eq!(f.a.external_lww_active_asset_roots().unwrap().object_hashes, [hash.clone()].into());
+            crate::persistent_store::ASSET_GC_ROOT_COLLECTIONS.with(|count| count.set((0, 0)));
+            assert!(f.a.residency_inventory_classification_test(false).unwrap().0.contains(&hash));
+            crate::persistent_store::ASSET_GC_ROOT_COLLECTIONS.with(|count| assert_eq!(count.get(), (1, 0)));
+            crate::persistent_store::ASSET_GC_ROOT_COLLECTIONS.with(|count| count.set((0, 0)));
+            f.a.asset_residency_release_unused(|| Ok(())).unwrap();
+            crate::persistent_store::ASSET_GC_ROOT_COLLECTIONS.with(|count| assert_eq!(count.get(), (1, 0)));
+            assert!(Residency::open(f.directory_a.path()).unwrap().object(&hash, None).unwrap().is_some());
+            if acknowledged {
+                held.fail_pack_after.store(2, Ordering::SeqCst);
+                assert_eq!(runtime.block_on(f.sender.publish(&mut f.a, 0.into(), &[], &Cancellation::default())).err().expect("later publication must reach the held pack").kind, ErrorKind::RateLimited);
+                assert_eq!(f.a.external_lww_next_sequence(&f.sender.target_scope(), &writer).unwrap(), 2);
+                assert!(f.a.external_lww_active_asset_roots().unwrap().object_hashes.len() == 1);
+                assert!(!f.a.external_lww_active_asset_roots().unwrap().object_hashes.contains(&hash));
+                assert!(f.a.lww_read_outbox(0.into(), 100).unwrap().entries.len() == 1);
+            } else {
+                f.a.external_lww_abandon_unsent(&f.sender.target_scope(), &writer).unwrap();
+                let job = pending.asset_job.unwrap();
+                crate::asset_repository::job_pins::DurableCasJob::open(f.directory_a.path(), &job.job_id).unwrap()
+                    .release(crate::asset_repository::job_pins::CasReleaseOutcome::Aborted).unwrap();
+                assert!(f.a.external_lww_active_asset_roots().unwrap().object_hashes.is_empty());
+            }
+            assert!(!f.a.residency_inventory_classification_test(false).unwrap().0.contains(&hash));
+            f.a.asset_residency_release_unused(|| Ok(())).unwrap();
+            assert!(Residency::open(f.directory_a.path()).unwrap().object(&hash, None).unwrap().is_none());
+        }
     }
 }
