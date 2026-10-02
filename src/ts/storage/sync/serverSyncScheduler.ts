@@ -130,6 +130,7 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
             await pull(true)
         },
         retry() { blocked = false; blockedCode = ''; sendRetryAttempt = 0; connect(); void pull().catch(() => {}); return push() },
+        reportFailure: fail,
         isBlocked: () => blocked,
         isRunning: () => !!sending || !!receiving || !!checkingClock,
         async fence() { foreground = false; pushAgain = false; pullAgain = false; clear(); await disconnect(); await Promise.allSettled([sending, receiving, checkingClock]) },
