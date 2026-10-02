@@ -44,6 +44,7 @@ import {
     PluginStorageCaptureCache,
     type PluginStorageCapture,
     canonicalClone,
+    clonePersistentRootFields,
     canonicalDatabaseClone,
     canonicalJson,
     diffPluginStorage,
@@ -1916,6 +1917,16 @@ export class SaveCoordinator {
                     }).map((loadout): PersistentUnitMutation => ({type:'set',key:JSON.stringify(['record','loadouts',loadout.id]),value:loadout})),
                 ],
             }
+            const committedBaselineRoot = canonicalClone(rootValue.value)
+            if (orderChanged) {
+                if (committedRoot.characterOrder === undefined) delete committedBaselineRoot.characterOrder
+                else committedBaselineRoot.characterOrder = canonicalClone(committedRoot.characterOrder)
+            }
+            const committedLoadouts = new Map((commit.unitMutations ?? [])
+                .filter((mutation): mutation is Extract<PersistentUnitMutation, {type:'set'}> => { const key = JSON.parse(mutation.key); return mutation.type === 'set' && key[0] === 'record' && key[1] === 'loadouts' })
+                .map((mutation) => [JSON.parse(mutation.key)[2], mutation.value]))
+            if (committedLoadouts.size) committedBaselineRoot.loadouts = committedBaselineRoot.loadouts!.map((value) =>
+                (committedLoadouts.get(value.id) ?? value) as typeof value)
             const committed = await this.dependencies.store.commit(commit)
             const changedDuringCommit = this.dirtyGeneration !== mutationGeneration
             const relatedRaces = new Map<
@@ -1957,7 +1968,7 @@ export class SaveCoordinator {
                     character: null,
                     relatedCharacters: publishedRelatedCharacters,
                 },
-                committedRoot,
+                committedBaselineRoot,
                 {
                     preservePendingWork: changedDuringCommit || relatedRaces.size > 0,
                     additionalDeletedCharacterIds,
@@ -2763,31 +2774,34 @@ export class SaveCoordinator {
                               captured.root,
                           )
             }
+            const baselineFields = this.rootBaseline === null ? undefined : this.dependencies.canonicalCapture?.rootFields?.(this.rootBaseline)
+            let decodedBaselineRoot: Record<string, unknown> | undefined
+            const baselineField = (key: string): unknown => baselineFields
+                ? baselineFields.get(key)
+                : (decodedBaselineRoot ??= JSON.parse(this.rootBaseline!))[key]
             if (commit.rootMutations && this.rootBaseline !== null) {
-                const baselineRoot = JSON.parse(this.rootBaseline)
                 commit.rootMutations = commit.rootMutations.filter((mutation) => {
                     if (!recordCollections.has(mutation.key)) return true
                     const after = mutation.type === 'set' ? mutation.value : []
                     commit.unitMutations = [...(commit.unitMutations ?? []), ...diffRecordCollection(
-                        mutation.key, baselineRoot[mutation.key] ?? [], after as unknown[],
+                        mutation.key, (baselineField(mutation.key) ?? []) as unknown[], after as unknown[],
                     )]
                     return false
                 })
             }
             if (commit.rootMutations && this.rootBaseline !== null) {
-                const baselineRoot = JSON.parse(this.rootBaseline)
                 commit.rootMutations = commit.rootMutations.filter((mutation) => {
                     if (!['explicitGlobalChatVariables', 'protectedPresetValues', 'personas'].includes(mutation.key)) return true
                     const after = mutation.type === 'set' ? mutation.value : mutation.key === 'personas' ? [] : {}
                     const prefix = mutation.key === 'protectedPresetValues' ? ['preset-protected'] : []
                     if (mutation.key === 'personas') {
-                        const previous = new Map((baselineRoot.personas ?? []).map((value: {id:string}) => [value.id, value]))
+                        const previous = new Map(((baselineField('personas') ?? []) as {id:string}[]).map((value) => [value.id, value]))
                         for (const value of after as {id:string}[]) { if (!previous.has(value.id)) commit.unitMutations = [...(commit.unitMutations ?? []), {key: JSON.stringify(['exists', 'persona', value.id]), type:'set', value:true}]; commit.unitMutations = [...(commit.unitMutations ?? []), ...diffFields(['persona', value.id], previous.get(value.id) as object ?? {}, value, new Set(['id']))] }
                         const next = new Set((after as {id:string}[]).map((value) => value.id))
                         for (const id of previous.keys()) if (!next.has(id as string)) commit.unitMutations = [...(commit.unitMutations ?? []), {key: JSON.stringify(['exists', 'persona', id]), type: 'delete'}]
                         if (canonicalJson([...previous.keys()]) !== canonicalJson([...next])) commit.unitMutations = [...(commit.unitMutations ?? []), {key: JSON.stringify(['order', 'personas']), type: 'set', value: [...next]}]
                     } else {
-                        const fields = diffFields(prefix, baselineRoot[mutation.key] ?? {}, after as object)
+                        const fields = diffFields(prefix, (baselineField(mutation.key) ?? {}) as object, after as object)
                         if (mutation.key === 'explicitGlobalChatVariables') for (const value of fields) { const name = JSON.parse(value.key)[0]; value.key = JSON.stringify([name.startsWith('toggle_') ? 'toggle' : 'variable', name]) }
                         commit.unitMutations = [...(commit.unitMutations ?? []), ...fields]
                     }
@@ -3526,7 +3540,7 @@ export class SaveCoordinator {
 
     private setCharacterBaseline(captured: CapturedState): void {
         this.characterBaseline = captured.characterCanonical
-        this.characterBaselineId = captured.character?.chaId ?? null
+        this.characterBaselineId = captured.characterId !== undefined ? captured.characterId : captured.character?.chaId ?? null
         this.windowedCharacterBaseline = null
         this.pendingWindowedActivationChange = null
         this.pendingWindowedChatListChange = null
@@ -4451,6 +4465,8 @@ export class SaveCoordinator {
     }
 
     capturePersistentBaselineRoot(): RootDatabase {
+        const fields = this.rootBaseline === null ? undefined : this.dependencies.canonicalCapture?.rootFields?.(this.rootBaseline)
+        if (fields) return clonePersistentRootFields(Object.fromEntries(fields) as RootDatabase)
         return JSON.parse(this.rootBaseline ?? canonicalJson(this.dependencies.captureRoot()))
     }
 

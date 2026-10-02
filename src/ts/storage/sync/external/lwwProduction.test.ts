@@ -4,7 +4,7 @@ import type { BindingContext, SyncBindingTransport } from '../bindingFlow'
 import type { ExternalStorageState } from './types'
 const fixture = vi.hoisted(() => ({
     native: true,
-    invoke: vi.fn(), listen: vi.fn(), state: vi.fn(), apply: vi.fn(), flush: vi.fn(), mobile: vi.fn(), outbox: vi.fn(), storageMutation: vi.fn(),
+    invoke: vi.fn(), listen: vi.fn(), state: vi.fn(), apply: vi.fn(), flush: vi.fn(), mobile: vi.fn(), outbox: vi.fn(), storageMutation: vi.fn(), resumeCurrent: vi.fn(),
     registrations: new Map<string, SyncBindingTransport>(), viewport: undefined as undefined | ((source: unknown) => void),
     revision: undefined as undefined | ((revision: number, cause: string) => void),
 }))
@@ -19,7 +19,7 @@ vi.mock('../../persistentDataRuntime.svelte', () => ({
 }))
 vi.mock('../../persistentRevisionEvents', () => ({ subscribeLocalPersistentRevision(callback: (revision: number, cause: string) => void) { fixture.revision = callback; return () => {} } }))
 vi.mock('../bindingNative', () => ({ createNativeSyncBindingBridge: () => ({ state: fixture.state }), replaceNativeSyncBinding: vi.fn(), replaceNativeSyncBindingAsNewDevice: vi.fn() }))
-vi.mock('../bindingRegistry', () => ({ registerSyncBindingTransport(target: { connectionId: string }, transport: SyncBindingTransport) { fixture.registrations.set(target.connectionId, transport); return () => fixture.registrations.delete(target.connectionId) } }))
+vi.mock('../bindingRegistry', () => ({ resumeCurrentSyncBinding: fixture.resumeCurrent, registerSyncBindingTransport(target: { connectionId: string }, transport: SyncBindingTransport) { fixture.registrations.set(target.connectionId, transport); return () => fixture.registrations.delete(target.connectionId) } }))
 import { installExternalLwwAdapters, refreshExternalLwwAdapters, externalLwwExitDrain, requestExternalLwwNow } from './lwwProduction'
 const binding = { target: { kind: 'external' as const, connectionId: 'sync' }, targetAuthority: '4', selectionEpoch: 'selection', libraryId: 'library', progress: [] }
 const context = (): BindingContext => ({ state: binding, signal: new AbortController().signal })
@@ -29,6 +29,7 @@ beforeEach(() => {
     vi.useFakeTimers(); fixture.native = true; fixture.registrations.clear()
     fixture.invoke.mockReset(); fixture.invoke.mockImplementation(async command => command === 'external_lww_receive' ? [] : undefined)
     fixture.state.mockResolvedValue(binding); fixture.listen.mockResolvedValue(() => {})
+    fixture.resumeCurrent.mockReset(); fixture.resumeCurrent.mockImplementation(async target => { const current = await fixture.state(); await fixture.registrations.get(target.connectionId)!.resumeBinding({ state: current, signal: new AbortController().signal }) })
     fixture.apply.mockReset(); fixture.flush.mockReset(); fixture.mobile.mockImplementation(async (_name, work) => work())
     fixture.outbox.mockReset(); fixture.outbox.mockResolvedValue({ revision: 12, entries: [] })
     fixture.storageMutation.mockReset(); fixture.storageMutation.mockImplementation(async work => { await work(12) })
@@ -38,6 +39,12 @@ beforeEach(() => {
 afterEach(() => { dispose?.(); dispose = undefined; vi.useRealTimers() })
 const settle = async () => { for (let i = 0; i < 20; i++) await Promise.resolve() }
 describe('native external LWW adapter', () => {
+    it('resumes a persisted external target through shared flow ownership exactly once for the current authority', async () => {
+        dispose = await installExternalLwwAdapters(state()); await settle()
+        expect(fixture.resumeCurrent).toHaveBeenCalledExactlyOnceWith(binding.target)
+        await refreshExternalLwwAdapters(state()); await settle()
+        expect(fixture.resumeCurrent).toHaveBeenCalledOnce()
+    })
     it('registers four eligible native providers and guards the web', async () => {
         dispose = await installExternalLwwAdapters(state(['webdav', 's3', 'google_drive', 'onedrive', 'mybox', 'github_releases', 'gitlab_packages']))
         expect([...fixture.registrations.keys()]).toEqual(['sync', 's3', 'google_drive', 'onedrive'])

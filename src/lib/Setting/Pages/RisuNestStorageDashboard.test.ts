@@ -11,7 +11,6 @@ const maintenance = vi.hoisted(() => ({
     deleteNativePersistentSnapshot: vi.fn(),
     createNativePersistentSnapshot: vi.fn(),
     restoreNativePersistentSnapshot: vi.fn(),
-    restartNativeApp: vi.fn(),
 }))
 const server = vi.hoisted(() => ({
     getServerSyncBackupInventory: vi.fn(),
@@ -362,23 +361,26 @@ describe('RisuNestStorageDashboard', () => {
             .filter((button) => button.textContent?.trim() === 'Refresh')).toHaveLength(1)
     })
 
-    it('restores a snapshot from its row after confirmation and restarts through the guarded flow', async () => {
+    it.each([true, false])('delegates the selected snapshot row to the live guarded restore (accepted=%s)', async accepted => {
         const target = setup()
-        alerts.alertConfirm.mockResolvedValue(true)
+        const selected: string[] = []
         maintenance.restoreNativePersistentSnapshot.mockImplementation(async (actions) => {
             const chosen = await actions.choose([{ id: 'snapshot.db', reason: 'manual', reclaimableBytes: 0, bytes: 1024, modifiedAt: 1 }])
-            if (chosen === null || !(await actions.confirm())) return false
-            await actions.restart()
-            return true
+            expect(chosen).toBe('snapshot.db')
+            expect(actions).not.toHaveProperty('confirm')
+            expect(actions).not.toHaveProperty('restart')
+            selected.push(chosen)
+            return accepted
         })
         await vi.waitFor(() => expect(exact(target, 'Restore')).toBeDefined())
 
         exact(target, 'Restore')!.click()
 
-        await vi.waitFor(() => expect(maintenance.restartNativeApp).toHaveBeenCalledOnce())
+        await vi.waitFor(() => expect(selected).toEqual(['snapshot.db']))
+        await vi.waitFor(() => expect(exact(target, 'Restore')?.disabled).toBe(false))
         expect(maintenance.restoreNativePersistentSnapshot).toHaveBeenCalledOnce()
-        expect(alerts.alertConfirm).toHaveBeenCalledWith(languageEnglish.restoreLocalSnapshotConfirm)
-        expect(languageKorean.restoreLocalSnapshotConfirm).toBe('현재 데이터를 이 로컬 스냅샷으로 교체하고 앱을 다시 시작하시겠습니까?')
+        expect(alerts.alertConfirm).not.toHaveBeenCalled()
+        expect(alerts.alertError).not.toHaveBeenCalled()
     })
 
     it('marks a running action busy on its button instead of swapping the label', async () => {

@@ -26,6 +26,31 @@ pub(crate) struct PublishedState {
     pub snapshots: Vec<(RemoteObject,Checkpoint)>,
     pub segments: Vec<(ObjectReceipt,segment::Segment)>,
 }
+
+fn maintenance_due(checkpoints:&[Checkpoint],segments:&[ObjectReceipt])->Result<bool> {
+    let retained=lww_checkpoint::retained(checkpoints)?;
+    if retained.len()>1 {return Ok(true);}
+    let mut coverage=super::lww_checkpoint::Coverage::new();
+    for checkpoint in checkpoints.iter().filter(|checkpoint|retained.contains(&checkpoint.snapshot_id)) {
+        for (writer,prefix) in &checkpoint.covered_prefixes {
+            let current=coverage.entry(writer.clone()).or_insert(risunest_sync_wire::stamp::DecimalU64(0));
+            *current=(*current).max(*prefix);
+        }
+    }
+    let mut unique=BTreeMap::new();let mut bytes=0u64;let mut count=0usize;
+    for receipt in segments {
+        let name=receipt.locator.object.rsplit('/').next().ok_or_else(segment::corrupt)?;
+        let (writer,seq,hash)=parse_segment_object_id(name)?;
+        if let Some(previous)=unique.insert((writer.to_owned(),seq),hash.to_owned()) {
+            if previous!=hash {return Err(segment::corrupt());}
+            continue;
+        }
+        if seq<=coverage.get(writer).map(|prefix|prefix.0).unwrap_or(0) {continue;}
+        count=count.checked_add(1).ok_or_else(segment::corrupt)?;
+        bytes=bytes.checked_add(receipt.byte_length).ok_or_else(segment::corrupt)?;
+    }
+    Ok(count>=100 || bytes>=64*1024*1024)
+}
 impl PublishedState {
     pub(crate) fn require_complete(&self)->Result<()> {
         if self.segments.iter().any(|(_,segment)|self.catalog.coverage.get(&segment.writer_id).copied().unwrap_or(risunest_sync_wire::stamp::DecimalU64(0))<segment.seq) {
@@ -100,6 +125,50 @@ fn live_published_objects(state:&PublishedState,capture:&mut super::capture::Cap
     Ok((live,conservative))
 }
 impl ExternalLwwEngine {
+    pub(crate) async fn maintenance_needed(&self,cancel:&Cancellation)->Result<bool> {
+        let mut checkpoints=Vec::new();
+        for receipt in self.snapshot_listing(cancel).await? {checkpoints.push(self.checkpoint(&receipt,cancel).await?.1);}
+        maintenance_due(&checkpoints,&self.listing(cancel).await?)
+    }
+    pub(super) async fn refresh_packed_sources(&self,sources:&[super::lww_residency::PackedSource],directory:&Path,cancel:&Cancellation)->Result<Vec<super::lww_residency::PackedSource>> {
+        let mut wanted=BTreeMap::new();
+        for source in sources {
+            if source.library_id!=self.library || source.connection_id!=self.connection_id || source.connection_root!=self.connection_root {
+                return Err(segment::corrupt());
+            }
+            if wanted.insert(source.hash.clone(),source.byte_length).is_some() {return Err(segment::corrupt());}
+        }
+        let mut checkpoints=Vec::new();
+        for receipt in self.snapshot_listing(cancel).await? {checkpoints.push(self.checkpoint(&receipt,cancel).await?.1);}
+        let retained=lww_checkpoint::retained(&checkpoints)?;
+        checkpoints.sort_by(|a,b|a.snapshot_id.cmp(&b.snapshot_id));
+        let mut refreshed=BTreeMap::new();let mut catalogs=BTreeMap::new();
+        for checkpoint in checkpoints.iter().filter(|checkpoint|retained.contains(&checkpoint.snapshot_id)) {
+            for catalog in std::iter::once(&checkpoint.library.asset_catalog).chain(&checkpoint.asset_catalogs) {
+                cancel.check()?;
+                if let Some(previous)=catalogs.insert(catalog.header.object_id.clone(),catalog.clone()) {
+                    if previous!=*catalog {return Err(segment::corrupt());}
+                    continue;
+                }
+                let object=RemoteObject::from_stored(catalog,&self.repository)?;
+                let (entries,packs,_)=super::snapshot_restore::read_catalog(&object,wire::CatalogKind::Assets,&self.root_key,
+                    directory,self.provider.as_ref(),&self.repository,cancel).await?;
+                for entry in entries {
+                    let hash=hex::encode(entry.content_sha256);
+                    let Some(size)=wanted.get(&hash) else {continue;};
+                    if *size!=entry.byte_length {return Err(segment::corrupt());}
+                    let selected=entry.chunks.iter().map(|chunk|chunk.pack_id.as_str()).collect::<BTreeSet<_>>();
+                    let references=packs.iter().filter(|(id,_)|selected.contains(id.as_str())).map(|(_,pack)|pack.stored(&self.repository)).collect::<Result<Vec<_>>>()?;
+                    let source=super::lww_residency::PackedSource {hash:hash.clone(),byte_length:entry.byte_length,library_id:self.library.clone(),
+                        connection_id:self.connection_id.clone(),connection_root:self.connection_root.clone(),protected_snapshot:checkpoint.snapshot_id.clone(),
+                        catalog:catalog.clone(),chunks:entry.chunks,packs:references};
+                    super::lww_residency::validate_packed_source(&source,&self.repository)?;
+                    refreshed.entry(hash).or_insert(source);
+                }
+            }
+        }
+        sources.iter().map(|source|refreshed.remove(&source.hash).ok_or_else(||ProviderError::new(ErrorKind::NotFound))).collect()
+    }
     async fn compact_asset_catalogs(&self,mut roots:Vec<wire::StoredObject>,live:&BTreeSet<String>,conservative:bool,
         directory:&Path,limits:super::packaging::PackageLimits,journal:&mut super::journal::TransferJournal,
         cancel:&Cancellation,protection:Option<(&super::leases::LeaseOwner,&super::leases::LeaseContext<'_>)>)
@@ -292,9 +361,8 @@ impl ExternalLwwEngine {
             if proof.identity()?!=snapshot.state_identity { return Err(segment::corrupt()); }
             for object in objects {
                 cancel.check()?;
-                if object.byte_length > risunest_sync_wire::MAX_METADATA_BYTES as u64 {return Err(segment::corrupt());}
                 let bytes=match object.source { super::content_store::ObjectSource::Captured(hash)=>content.read_all(&hash).map_err(error)?, super::content_store::ObjectSource::File(path)=>std::fs::read(path).map_err(error)?, _=>return Err(segment::corrupt()) };
-                if segment::digest(&bytes)!=object.content_hash { return Err(segment::corrupt()); }
+                if bytes.len() as u64!=object.byte_length || segment::digest(&bytes)!=object.content_hash { return Err(segment::corrupt()); }
                 body_spool.push(&object.content_hash,&bytes,crate::persistent_store::external_capture::BackupBodyRole::Control).map_err(error)?;
             }
             catalog.include_prefixes(&snapshot.covered_prefixes);
@@ -327,6 +395,14 @@ impl ExternalLwwEngine {
             if let Some((receipt,mut payload))=winner {
                 if catalog.include_segment(&payload)? {
                     for (hash,bytes) in &payload.message_pages { body_spool.push(hash,&URL_SAFE_NO_PAD.decode(bytes).map_err(error)?,crate::persistent_store::external_capture::BackupBodyRole::Control).map_err(error)?; }
+                    let controls=super::snapshot_restore::download_control_catalogs(&payload.data_catalogs,
+                        &directory.join(format!("segment-data-{writer}-{seq}")),&self.root_key,self.provider.as_ref(),&self.repository,cancel).await?;
+                    for control in controls {
+                        let super::content_store::ObjectSource::File(path)=control.source else {return Err(segment::corrupt());};
+                        let bytes=std::fs::read(path).map_err(error)?;
+                        if bytes.len() as u64!=control.byte_length {return Err(segment::corrupt());}
+                        body_spool.push(&control.content_hash,&bytes,crate::persistent_store::external_capture::BackupBodyRole::Control).map_err(error)?;
+                    }
                     asset_catalogs.extend(payload.asset_catalogs.clone());
                     for (hash,source) in &payload.large_bodies { standalone.insert(hash.clone(),source.clone()); standalone_roots.insert(hash.clone(),super::contract::segment_object_id(&payload.writer_id,payload.seq.0,&identity.clone().ok_or_else(segment::corrupt)?)?); }
                 }
@@ -450,6 +526,20 @@ mod tests {
                 assert!(completed.compaction_capture_rows.unwrap()>0);
                 assert!(completed.compaction_catalog_merge_visits.unwrap()>=completed.compaction_capture_rows.unwrap());
                 let (_,checkpoint)=engine.checkpoint(&completed.reference.receipt,&cancel).await.unwrap();
+                assert!(!engine.maintenance_needed(&cancel).await.unwrap());
+                if local {
+                    engine.compact_published(&work.path().join("equivalent"),"00000000-0000-4000-8000-000000000086",
+                        &f.a.lww_clock_state().unwrap().writer_id,&fake::capabilities(true),&cancel,None).await.unwrap();
+                    assert!(!engine.maintenance_needed(&cancel).await.unwrap(),"equal-coverage checkpoints awaiting grace do not trigger compaction");
+                    let writer=f.a.lww_clock_state().unwrap().writer_id;
+                    let mut covered=checkpoint.clone();covered.covered_prefixes.insert(writer.clone(),risunest_sync_wire::stamp::DecimalU64(100));
+                    let receipts=(1..=100).map(|seq| {let mut receipt=completed.reference.receipt.clone();
+                        receipt.locator.object=segment_object_id(&writer,seq,&"a".repeat(64)).unwrap();receipt.byte_length=1024*1024;receipt}).collect::<Vec<_>>();
+                    assert!(!maintenance_due(&[covered.clone()],&receipts).unwrap(),"covered grace history is excluded from both trigger budgets");
+                    let mut dominated=covered.clone();dominated.snapshot_id="00000000-0000-4000-8000-000000000085".into();
+                    dominated.covered_prefixes.insert(writer.clone(),risunest_sync_wire::stamp::DecimalU64(101));
+                    assert!(!maintenance_due(&[covered,dominated],&receipts).unwrap());
+                }
                 assert_eq!(checkpoint.asset_catalogs.len(),1);
                 let root=RemoteObject::from_stored(&checkpoint.asset_catalogs[0],&engine.repository).unwrap();
                 let (entries,packs,_)=super::super::snapshot_restore::read_catalog(&root,wire::CatalogKind::Assets,&[7;32],

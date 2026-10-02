@@ -2544,6 +2544,7 @@ fn explicit_new_device_recovery_finishes_after_library_activation_without_exposi
         &changes,
         Some(new_authority),
         Some(&selection_change),
+        None,
     )
     .unwrap();
     assert_eq!(store.lww_clock_state().unwrap().writer_id, state.writer_id);

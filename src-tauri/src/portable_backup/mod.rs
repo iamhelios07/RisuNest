@@ -9,7 +9,7 @@ mod writer;
 #[cfg(test)]
 pub(crate) mod source_io;
 
-pub(crate) use capture::{capture_library, CapturedLibrary};
+pub(crate) use capture::{capture_library, capture_library_only, capture_library_with_ready, CapturedLibrary};
 pub(crate) use catalog::Catalog;
 pub(crate) use reader::{ArchiveObjectReader, VerifiedArchive};
 pub(crate) use validation::{

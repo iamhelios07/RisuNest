@@ -275,19 +275,19 @@ fn capture(
     probe: &dyn CancellationProbe,
     source_build: &str,
     allow_source_preservation: bool,
+    job: Option<&JobControl>,
 ) -> Result<portable_backup::CapturedLibrary, NativeJobError> {
-    match portable_backup::capture_library(store, revision, owned, pins, false, probe, source_build) {
+    match portable_backup::capture_library_with_ready(store, revision, owned, pins, allow_source_preservation, probe, source_build, &|| {
+        match job {
+            Some(job) => job.publish_export_capture(revision).map_err(|failure| portable_backup::Error::Io(std::io::Error::other(failure))),
+            None => Ok(()),
+        }
+    }) {
         Err(portable_backup::Error::SourceNeedsPreservation) => {
-            if !allow_source_preservation {
-                return Err(NativeJobError::new(
-                    "source-preservation-confirmation-required",
-                    "Source preservation may include account information and requires confirmation",
-                ));
-            }
-            pins.release(CasReleaseOutcome::Aborted).map_err(error)?;
-            *pins = new_pins(store, CasJobKind::OfficialPublicationOrExportPreparation)?;
-            portable_backup::capture_library(store, revision, owned, pins, true, probe, source_build)
-                .map_err(portable_error)
+            Err(NativeJobError::new(
+                "source-preservation-confirmation-required",
+                "Source preservation may include account information and requires confirmation",
+            ))
         }
         result => result.map_err(portable_error),
     }
@@ -410,7 +410,7 @@ fn export_portable_running(
     let mut pins = new_pins(&store, CasJobKind::OfficialPublicationOrExportPreparation)?;
     let outcome = (|| {
         let captured = if selection.library {
-            capture(&mut store, revision, owned, &mut pins, &probe, source_build, selection.allow_source_preservation)?
+            capture(&mut store, revision, owned, &mut pins, &probe, source_build, selection.allow_source_preservation, Some(job))?
         } else {
             let catalog =
                 Catalog::create(owned, source_build, revision).map_err(error)?;
@@ -981,18 +981,13 @@ mod tests {
             &directory.path().join("handoffs"),
             store,
             &job,
-                &PortableSelection {
-                library: false,
-                device_sections: vec!["hypa".into()],
-                items: None,
-                allow_source_preservation: false,
-            },
+            &PortableSelection::default(),
             "9.8.7-synthetic",
         )
         .unwrap_err();
 
         assert_eq!(failure.code, "cancelled");
-        assert_eq!(failure.message, "Device catalog verification was cancelled");
+        assert_eq!(failure.message, "Portable backup was cancelled");
         assert_eq!(job.status().state, super::super::JobState::Cancelling);
         super::super::finish_worker_outcome(
             &job,
@@ -1476,7 +1471,7 @@ mod tests {
             let mut refused_store = PersistentStore::open(&source).unwrap();
             let mut refused_pins = new_pins(&refused_store, CasJobKind::OfficialPublicationOrExportPreparation).unwrap();
             let denied = capture(&mut refused_store, revision, &jobs, &mut refused_pins,
-                &NeverCancelled, "9.8.7-synthetic", false);
+                &NeverCancelled, "9.8.7-synthetic", false, None);
             assert!(matches!(denied, Err(ref failure) if failure.code == "source-preservation-confirmation-required"));
             refused_pins.release(CasReleaseOutcome::Aborted).unwrap();
             drop(refused_store);
@@ -1654,6 +1649,7 @@ mod tests {
             &NeverCancelled,
             "9.8.7-synthetic",
             false,
+            None,
         )
         .unwrap();
         let (key,stored_hash,metadata):(String,String,String)=captured.catalog.db.query_row("SELECT logical_key,lower(hex(object_hash)),metadata FROM files WHERE kind='preserved' AND logical_key LIKE 'source-preservation/%'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
@@ -1747,6 +1743,7 @@ mod tests {
             &NeverCancelled,
             "9.8.7-synthetic",
             false,
+            None,
         )
         .unwrap();
         assert_eq!(

@@ -12,6 +12,7 @@ import { sleep } from '../util'
 import { getBackupInlayName } from './backupAssets'
 
 const state = vi.hoisted(() => ({
+    native: true,
     blobStore: null as BlobStore | null,
     currentDatabase: null as Database | null,
     runtime: null as PersistentDataRuntime | null,
@@ -21,7 +22,7 @@ const state = vi.hoisted(() => ({
     nativeFileClose: vi.fn(async () => undefined),
     fullReadFile: vi.fn(async () => new Uint8Array([99])),
     restoreEvents: [] as string[],
-    replacePersistentDatabase: vi.fn(async (_database: Database, _reason: string) => ({
+    replacePersistentDatabase: vi.fn(async (_database: Database, _reason: string, _options?: import('../storage/saveCoordinator').PersistentReplacementOptions) => ({
         kind: 'committed', revision: 1, projection: 'applied',
     } as const)),
     getUncleanables: vi.fn(async () => ['assets/second-read.png']),
@@ -87,8 +88,8 @@ vi.mock('../storage/database.svelte', () => ({
 vi.mock('../storage/persistentDataRuntime.svelte', () => ({
     getPersistentDataRuntime: () => state.runtime,
     publishCurrentOfficialRevision: vi.fn(async () => undefined),
-    replacePersistentDatabase: (database: Database, reason: string) => (
-        state.replacePersistentDatabase(database, reason)
+    replacePersistentDatabase: (database: Database, reason: string, options?: import('../storage/saveCoordinator').PersistentReplacementOptions) => (
+        state.replacePersistentDatabase(database, reason, options)
     ),
 }))
 
@@ -108,7 +109,7 @@ vi.mock('../process/coldstorage.svelte', () => ({
 }))
 
 vi.mock('src/ts/platform', () => ({
-    isTauri: true,
+    get isTauri() {return state.native},
     isTauriDesktop: true,
     isTauriAndroid: false,
     isTauriIOS: false,
@@ -147,6 +148,7 @@ function emptyBlobStore(): BlobStore {
 
 describe('local backup persistent snapshot', () => {
     beforeEach(() => {
+        state.native = true
         vi.clearAllMocks()
         state.written.clear()
         state.restoreEvents = []
@@ -271,7 +273,8 @@ describe('local backup persistent snapshot', () => {
         expect(JSON.stringify(context.onStatus.mock.calls)).toContain(`coldstorage_${coldKey}.json`)
     })
 
-    it.each([[true,false],[false,false],[true,true]])('preflights, acknowledges, and preserves committed outcomes (%s,%s)', async (confirmed, bodyFails) => {
+    it.each([[true,false,false],[false,false,false],[true,true,false],[true,false,true]])('preflights, acknowledges, and preserves committed outcomes (%s,%s,%s)', async (confirmed, bodyFails, native) => {
+        state.native = native
         const { alertCheckboxConfirm } = await import('../alert')
         vi.mocked(alertCheckboxConfirm).mockResolvedValueOnce({ confirmed, checked: confirmed })
         const database = structuredClone(risuSaveFixtureDatabase) as Database
@@ -331,7 +334,8 @@ describe('local backup persistent snapshot', () => {
             setPartialWritesPossible: vi.fn(),
         }
 
-        const pending = importLegacyBackupWithWebView(context)
+        const {language} = await import('../../lang')
+        const pending = importLegacyBackupWithWebView(context, {}, language.pocketRisuImportConfirm)
         await vi.waitFor(() => expect(input.onchange).not.toBeNull())
         await input.onchange?.()
         if (!confirmed) {
@@ -352,7 +356,13 @@ describe('local backup persistent snapshot', () => {
         }
         const result = await pending
         createElement.mockRestore()
-        expect(alertCheckboxConfirm).toHaveBeenCalledOnce()
+        if (native) {
+            expect(alertCheckboxConfirm).not.toHaveBeenCalled()
+            expect(state.replacePersistentDatabase.mock.calls[0][2]).toMatchObject({upstreamImport:true, upstreamImportWarnings:[language.backupLoadConfirm2]})
+        } else {
+            expect(alertCheckboxConfirm).toHaveBeenCalledOnce()
+            expect(alertCheckboxConfirm).toHaveBeenCalledWith(expect.objectContaining({title:language.pocketRisuImportConfirm}))
+        }
 
         expect(result).toEqual({ warningCodes: ['upstream-restore-losses'], upstreamLosses: {coldMissing:0,invalidInlays:1,pocketInlays:0} })
         expect(state.blobStore?.put).not.toHaveBeenCalled()

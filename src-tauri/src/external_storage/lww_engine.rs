@@ -572,12 +572,8 @@ impl ExternalLwwEngine {
                 for proof in &publication.reused_control_catalogs {
                     if Self::trusted_control_time().and_then(|now|now.checked_sub(proof.rooted_at_ms))
                         .is_none_or(|age|age>super::leases::CACHE_REUSE_LIMIT_MS) {
-                        let mut journal=super::journal::TransferJournal::open(
-                            &root.join("external-storage").join("lww-publications").join(&job.job_id).join("data"),job.clone(),
-                        ).map_err(transient)?;
-                        super::packaging::revalidate_control_catalog(
-                            &proof.catalog,&root,&self.connection_root.join("external-storage").join("package-cache").join(&self.connection_id),
-                            &self.root_key,&mut journal,self.provider.as_ref(),&self.repository,cancel,
+                        super::snapshot_restore::revalidate_control_catalog(
+                            &proof.catalog,&self.root_key,self.provider.as_ref(),&self.repository,cancel,
                         ).await?;
                     }
                 }
