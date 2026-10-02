@@ -1005,10 +1005,14 @@ export function createPersistentDataRuntime(
         let applied: ReturnType<typeof captureLwwWorkingSetBaseline>
         try { applied = await applyLwwWorkingSetUnits(database, baseline, lease, result.affectedKeys, dependencies.state.captureCharacterIndex?.(), localIntent) }
         finally { await releasePersistentRevisionLease(lease) }
-        const beforeDerive = canonicalJson(dependencies.state.captureRoot())
+        const canonicalCapture = dependencies.state.canonicalCapture
+        const beforeDerive = canonicalCapture?.root() ?? canonicalJson(dependencies.state.captureRoot())
         dependencies.state.afterRemoteApply?.()
-        const afterDerive = dependencies.state.captureRoot()
-        for (const mutation of diffRootMutations(JSON.parse(beforeDerive), afterDerive)) {
+        const afterDerive = canonicalCapture?.root() ?? canonicalJson(dependencies.state.captureRoot())
+        const derivedMutations = beforeDerive === afterDerive ? [] : canonicalCapture
+            ? canonicalCapture.diffRoot(beforeDerive, afterDerive)
+            : diffRootMutations(JSON.parse(beforeDerive), JSON.parse(afterDerive))
+        for (const mutation of derivedMutations) {
             const root = applied.root as unknown as Record<string, unknown>
             if (mutation.type === 'set') root[mutation.key] = canonicalClone(mutation.value)
             else delete root[mutation.key]
