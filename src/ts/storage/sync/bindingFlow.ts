@@ -1,4 +1,5 @@
 import type { StorageMutationGate } from '../storageMutationGate'
+import type { ActivatedLibraryRecoveryLifecycle } from '../persistentDataRuntime'
 
 export type BindingTarget = { kind: 'server' | 'external'; connectionId: string } | { kind: 'none' }
 export interface SyncBindingState {
@@ -53,7 +54,7 @@ export interface SyncBindingTransport {
 }
 export interface SyncBindingNative {
     state(): Promise<SyncBindingState>
-    switchTarget(expected: SyncBindingState, target: BindingTarget, inspection: InspectedSyncTarget | null): Promise<SyncBindingState>
+    switchTarget(expected: SyncBindingState, target: BindingTarget, inspection: InspectedSyncTarget | null, requestId: string): Promise<SyncBindingState>
     assertAuthority(state: SyncBindingState): Promise<void>
 }
 export interface BindingPluginLifecycle {
@@ -65,6 +66,10 @@ export interface BindingActivationGuard {
     complete(): void
     abortUnchanged(): Promise<void>
 }
+export interface BindingRecoveryRegistration {
+    setLifecycle(lifecycle: ActivatedLibraryRecoveryLifecycle): void
+    registerFailure(error: unknown, resume: () => Promise<void>): void
+}
 export interface SyncBindingDependencies {
     native: SyncBindingNative
     gate: StorageMutationGate
@@ -75,6 +80,7 @@ export interface SyncBindingDependencies {
     confirmReplacement(): Promise<boolean>
     refreshActivatedLibrary(): Promise<void>
     beginActivatedLibraryGuard(): BindingActivationGuard
+    recovery?: BindingRecoveryRegistration
 }
 export type BindingOutcome = { kind: 'cancelled' } | { kind: 'bound'; action: 'initialized' | 'replaced' | 'resumed' | 'new-device'; state: SyncBindingState; newDevice?: NewDeviceBindingResult }
 
@@ -108,6 +114,10 @@ export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
         active = { ...active, controller, context: bindingContext(active.context.state, controller.signal) }
         await active.transport.resumeBinding(bindingContext(active.context.state, controller.signal, mode))
     }
+    const registerFailure = (error: unknown, resume: () => Promise<void>) => {
+        try { dependencies.recovery?.registerFailure(error, resume) }
+        catch (registrationError) { throw new AggregateError([error, registrationError], 'Sync binding recovery registration failed') }
+    }
     return {
         async bind(target: Exclude<BindingTarget, { kind: 'none' }>, transport: SyncBindingTransport, options: SyncBindingOptions = {}): Promise<BindingOutcome> {
             if (running) throw new Error('A sync binding change is already running')
@@ -118,10 +128,14 @@ export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
             }
             running = true
             const controller = new AbortController()
+            const switchRequestId = crypto.randomUUID()
             let originalState: SyncBindingState | undefined
             let jobsFenced = false
             let pluginsFenced = false
             let activationGuard: BindingActivationGuard | undefined
+            let activationAttempted = false
+            let activatedContext: BindingContext | undefined
+            let resumeActivated: (() => Promise<void>) | undefined
             try {
                 const state = await dependencies.native.state()
                 originalState = state
@@ -148,6 +162,46 @@ export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
                     await dependencies.plugins.fenceExecution()
                 }
                 let newDeviceResult: NewDeviceBindingResult | undefined
+                const activate = async () => {
+                    if (preparation) {
+                        newDeviceResult = await transport.replaceAsNewDevice!(staged!, preparation, context)
+                        const activated = await dependencies.native.state()
+                        if (newDeviceResult.writerId !== preparation.writerId || newDeviceResult.bindingAuthority !== activated.targetAuthority ||
+                            !sameTarget(activated.target, target) || activated.libraryId !== staged!.libraryId) {
+                            throw new Error('New device sync binding changed')
+                        }
+                        await check(bindingContext(activated, controller.signal, mode))
+                        return activated
+                    }
+                    const next = !replace && sameTarget(state.target, target) && state.libraryId === inspected.libraryId
+                        ? state : await dependencies.native.switchTarget(state, target, inspected, switchRequestId)
+                    if (!sameTarget(next.target, target) || next.libraryId !== inspected.libraryId) throw new Error('Sync target changed during activation')
+                    const nextContext = bindingContext(next, controller.signal, mode)
+                    await check(nextContext)
+                    if (staged) await transport.replaceFromTarget(staged, nextContext)
+                    await check(nextContext)
+                    return next
+                }
+                let initialStatePublished = false
+                resumeActivated = async () => {
+                    if (!activatedContext) throw new Error('Sync binding activation is not settled')
+                    await check(activatedContext)
+                    if (newDevice) {
+                        if (!newDeviceResult) throw new Error('New device sync binding is not settled')
+                        await transport.resumeNewDeviceBinding!(preparation!, newDeviceResult, activatedContext)
+                    } else {
+                        if (!staged && inspected.empty && !initialStatePublished && await dependencies.hasNonDefaultSharedData()) {
+                            await check(activatedContext)
+                            await transport.publishInitialSharedState(activatedContext)
+                            initialStatePublished = true
+                        }
+                        await check(activatedContext)
+                        await transport.resumeBinding(activatedContext)
+                    }
+                    await check(activatedContext)
+                    active = { transport, context: bindingContext(activatedContext.state, controller.signal), controller }
+                    jobsFenced = false
+                }
                 const result: BindingOutcome = await dependencies.withPausedWrites(async () => {
                     await check(context)
                     if (replace && !acknowledged && await dependencies.hasNonDefaultData()) {
@@ -158,36 +212,41 @@ export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
                         }
                         acknowledged = true
                     }
-                    if (staged) activationGuard = dependencies.beginActivatedLibraryGuard()
+                    if (staged) {
+                        activationGuard = dependencies.beginActivatedLibraryGuard()
+                        dependencies.recovery?.setLifecycle({
+                            async beforeRefresh() {
+                                if (!activatedContext) {
+                                    const next = await dependencies.gate.runTransition(activate)
+                                    activatedContext = bindingContext(next, controller.signal, mode)
+                                }
+                                await check(activatedContext)
+                            },
+                            async afterRefresh() {
+                                await check(activatedContext!)
+                                await dependencies.plugins.invalidateCaches()
+                                await dependencies.plugins.restart()
+                                await check(activatedContext!)
+                                pluginsFenced = false
+                            },
+                        })
+                    }
                     const next = await dependencies.gate.runTransition(async () => {
                         await check(context)
-                        if (preparation) {
-                            newDeviceResult = await transport.replaceAsNewDevice!(staged!, preparation, context)
-                            const activated = await dependencies.native.state()
-                            if (newDeviceResult.writerId !== preparation.writerId || newDeviceResult.bindingAuthority !== activated.targetAuthority ||
-                                !sameTarget(activated.target, target) || activated.libraryId !== staged!.libraryId) {
-                                throw new Error('New device sync binding changed')
-                            }
-                            await check(bindingContext(activated, controller.signal, mode))
-                            return activated
-                        }
-                        const next = !replace && sameTarget(state.target, target) && state.libraryId === inspected.libraryId
-                            ? state : await dependencies.native.switchTarget(state, target, inspected)
-                        const nextContext = bindingContext(next, controller.signal, mode)
-                        await check(nextContext)
-                        if (staged) await transport.replaceFromTarget(staged, nextContext)
-                        await check(nextContext)
-                        return next
+                        activationAttempted = true
+                        return activate()
                     })
                     const nextContext = bindingContext(next, controller.signal, mode)
+                    activatedContext = nextContext
                     if (staged) {
                         await dependencies.plugins.invalidateCaches()
                         await dependencies.refreshActivatedLibrary()
                         await check(nextContext)
+                        await dependencies.plugins.restart()
+                        await check(nextContext)
                         activationGuard!.complete()
                         activationGuard = undefined
                         pluginsFenced = false
-                        await dependencies.plugins.restart()
                     }
                     await check(nextContext)
                     return { kind: 'bound', action: newDevice ? 'new-device' : staged ? 'replaced' : inspected.empty ? 'initialized' : 'resumed', state: next, ...(newDeviceResult ? { newDevice: newDeviceResult } : {}) }
@@ -197,25 +256,11 @@ export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
                     await resumeOld(mode)
                     return result
                 }
-                const activatedContext = bindingContext(result.state, controller.signal, mode)
-                await check(activatedContext)
-                active = { transport, context: bindingContext(result.state, controller.signal), controller }
-                jobsFenced = false
-                if (result.action === 'new-device') {
-                    await transport.resumeNewDeviceBinding!(preparation!, result.newDevice!, activatedContext)
-                } else {
-                    if (result.action === 'initialized' && await dependencies.hasNonDefaultSharedData()) {
-                        await check(activatedContext)
-                        await transport.publishInitialSharedState(activatedContext)
-                    }
-                    await check(activatedContext)
-                    await transport.resumeBinding(activatedContext)
-                }
-                await check(activatedContext)
+                await resumeActivated()
                 return result
             } catch (error) {
                 let unchanged = false
-                if (originalState && (jobsFenced || pluginsFenced)) {
+                if (!activatedContext && originalState && (jobsFenced || pluginsFenced)) {
                     try {
                         const current = await dependencies.native.state()
                         unchanged = current.targetAuthority === originalState.targetAuthority && current.selectionEpoch === originalState.selectionEpoch &&
@@ -228,9 +273,10 @@ export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
                         if (pluginsFenced) { pluginsFenced = false; await dependencies.plugins.restart() }
                         if (jobsFenced) { jobsFenced = false; await resumeOld(mode) }
                     } catch (recoveryError) {
+                        if (activationGuard && activationAttempted && resumeActivated) registerFailure(recoveryError, resumeActivated)
                         throw new AggregateError([error, recoveryError], 'Sync binding failed while resuming local state')
                     }
-                }
+                } else if (activationAttempted && resumeActivated) registerFailure(error, resumeActivated)
                 throw error
             } finally { running = false }
         },
@@ -244,7 +290,7 @@ export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
                     await active.transport.fenceOldJobs(bindingContext(active.context.state, active.context.signal))
                 }
                 return await dependencies.withPausedWrites(async () => {
-                    const next = await dependencies.gate.runTransition(() => dependencies.native.switchTarget(state, { kind: 'none' }, null))
+                    const next = await dependencies.gate.runTransition(() => dependencies.native.switchTarget(state, { kind: 'none' }, null, crypto.randomUUID()))
                     active = undefined
                     return next
                 })
