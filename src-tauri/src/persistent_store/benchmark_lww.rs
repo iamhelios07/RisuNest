@@ -6,6 +6,18 @@ mod fixture;
 mod native_observation;
 #[path = "../../../benchmarks/lww-native/src/invalid_diagnostics.rs"]
 mod invalid_diagnostics;
+#[path = "../../../benchmarks/lww-native/src/native_shards.rs"]
+mod native_shards;
+#[path = "../../../benchmarks/lww-native/src/scale_certificate.rs"]
+mod scale_certificate;
+#[allow(dead_code)]
+#[path = "../../../benchmarks/lww-native/src/measurement.rs"]
+mod measurement;
+#[path = "../../../benchmarks/lww-native/src/final_runner.rs"]
+mod final_runner;
+#[path = "../../../benchmarks/lww-native/src/fixture_configuration.rs"]
+mod fixture_configuration;
+
 
 use super::{lww::{self, MessageLocator, UnitMutation}, sync_selection::{SwitchBindingRequest, SyncTarget},
     ConversationMutation, PersistentStore, WorkingSetCommit};
@@ -171,6 +183,8 @@ fn take_work(external: bool) -> NativeObservation {
     result.body_owned_work = body_domain(bodies.domains.get("owned").cloned().unwrap_or_default());
     result.body_unknown_work = body_domain(bodies.unknown_work());
     result.body_unattributed_managed = body_domain(bodies.unattributed_managed.clone());
+    result.body_unattributed_owned = body_domain(bodies.unattributed_owned.clone());
+    result.body_pending_owned_identities = bodies.pending_owned_identities;
     result.body_scope_violations = bodies.scope_violations;
     result.asset_body_opens = Some(result.body_asset_work.open_attempts);
     result.asset_body_bytes_read = Some(result.body_asset_work.read_bytes);
@@ -178,6 +192,7 @@ fn take_work(external: bool) -> NativeObservation {
         result.body_objects.insert(hash, ObjectBodyDomain {
             purposes:object.purposes.into_iter().map(|purpose| format!("{purpose:?}")).collect(),
             work:body_domain(object.work),
+            owned_work:body_domain(object.owned_work),
         });
     }
     for (domain, work) in bodies.domains {
@@ -283,6 +298,257 @@ fn verify(store: &PersistentStore, change: SmallChange, expected: &Value) {
             assert_eq!(unique.len(), messages.len());
         },
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AdditionalChange { Persona, MiddleEdit, Insertion, Deletion, Oversized, Burst }
+
+pub(crate) struct PreparedAdditionalChange {
+    pub commits:Vec<WorkingSetCommit>,
+    expected_root:std::collections::BTreeMap<String,Value>,
+    expected_messages:Option<Vec<Value>>,
+}
+
+pub(crate) fn prepare_additional_change(store:&PersistentStore, change:AdditionalChange,
+    direction:Direction, iteration:u64) -> PreparedAdditionalChange {
+    let root = store.read_root(None).unwrap().value;
+    let revision = store.revision().unwrap();
+    let authority = store.lww_binding_authority().unwrap();
+    let mut prepared = PreparedAdditionalChange {commits:Vec::new(),
+        expected_root:std::collections::BTreeMap::new(),expected_messages:None};
+    let make_commit = |offset:i64| WorkingSetCommit {
+        expected_revision:revision.checked_add(offset).unwrap(),binding_authority:Some(authority),
+        request_id:Some(uuid::Uuid::new_v4().to_string()),..Default::default()};
+    match change {
+        AdditionalChange::Persona => {
+            let current = root["selectedPersona"].as_str().expect("final fixture needs stable persona selection");
+            assert!(matches!(current,"synthetic-persona-0" | "synthetic-persona-1"));
+            let next = json!(if current=="synthetic-persona-0" {"synthetic-persona-1"} else {"synthetic-persona-0"});
+            let mut commit = make_commit(0);
+            commit.unit_mutations = Some(vec![UnitMutation::Set {
+                key:UnitKey::new(&["root","selectedPersona"]).unwrap(),value:next.clone()}]);
+            prepared.expected_root.insert("selectedPersona".into(),next);
+            prepared.commits.push(commit);
+        },
+        AdditionalChange::Burst => {
+            let initial = root["loreBookDepth"].as_i64().unwrap();
+            // Sixteen durable changes to one shared unit test actual outbox coalescing.
+            for offset in 0..16 {
+                let mut commit = make_commit(offset);
+                let value = json!(initial.checked_add(offset+1).unwrap());
+                commit.unit_mutations = Some(vec![UnitMutation::Set {
+                    key:UnitKey::new(&["root","loreBookDepth"]).unwrap(),value}]);
+                prepared.commits.push(commit);
+            }
+            prepared.expected_root.insert("loreBookDepth".into(),json!(initial.checked_add(16).unwrap()));
+        },
+        AdditionalChange::MiddleEdit | AdditionalChange::Insertion | AdditionalChange::Deletion | AdditionalChange::Oversized => {
+            let conversation = store.read_conversation("synthetic-character-0","synthetic-conversation-0",None)
+                .unwrap().unwrap().value;
+            let mut expected = conversation["message"].as_array().unwrap().clone();
+            let index = 2048;
+            assert!(expected.len()>index);
+            let (delete_count,messages) = match change {
+                AdditionalChange::MiddleEdit | AdditionalChange::Oversized => {
+                    let mut message = expected[index].clone();
+                    message["data"] = json!(if matches!(change,AdditionalChange::Oversized) {
+                        format!("{}{direction:?}-{iteration}","x".repeat(128*1024))
+                    } else {format!("Fixed synthetic middle edit {direction:?}-{iteration}")});
+                    expected[index]=message.clone();
+                    (1,vec![message])
+                },
+                AdditionalChange::Insertion => {
+                    let message = json!({"role":"user","data":"Fixed synthetic inserted message",
+                        "chatId":format!("synthetic-insert-{direction:?}-{iteration}")});
+                    expected.insert(index,message.clone());
+                    (0,vec![message])
+                },
+                AdditionalChange::Deletion => {expected.remove(index); (1,Vec::new())},
+                _ => unreachable!(),
+            };
+            let mut commit = make_commit(0);
+            commit.conversations=Some(vec![ConversationMutation::ReplaceRange {
+                character_id:"synthetic-character-0".into(),conversation_id:"synthetic-conversation-0".into(),
+                start:index as i64,delete_count,messages,conversation:None,configured_index:None}]);
+            commit.messages_changed=Some(vec![MessageLocator {character_id:"synthetic-character-0".into(),
+                conversation_id:"synthetic-conversation-0".into(),start:Some(index as i64)}]);
+            prepared.expected_messages=Some(expected);
+            prepared.commits.push(commit);
+        },
+    }
+    prepared
+}
+
+pub(crate) fn verify_additional_change(store:&PersistentStore, prepared:&PreparedAdditionalChange) {
+    let root = store.read_root(None).unwrap().value;
+    for (key,value) in &prepared.expected_root {assert_eq!(&root[key.as_str()],value);}
+    if let Some(messages) = &prepared.expected_messages {
+        verify(store,SmallChange::Append,&Value::Array(messages.clone()));
+    }
+}
+
+pub(crate) fn apply_additional_change(store:&mut PersistentStore,prepared:&PreparedAdditionalChange) {
+    for commit in &prepared.commits {store.commit(commit).unwrap();}
+}
+
+fn prepare_final_change(store:&PersistentStore,scenario:measurement::Scenario,
+    direction:Direction,iteration:u64)->Result<PreparedAdditionalChange,String> {
+    use measurement::Scenario;
+    let small=match scenario {Scenario::SettingEdit=>Some(SmallChange::Setting),
+        Scenario::PresetSwitch=>Some(SmallChange::Preset),Scenario::Append=>Some(SmallChange::Append),_=>None};
+    if let Some(change)=small {
+        let (commit,expected)=prepare_edit(store,change,direction,iteration);
+        let mut prepared=PreparedAdditionalChange {commits:vec![commit],expected_root:Default::default(),expected_messages:None};
+        match change {SmallChange::Setting=>{prepared.expected_root.insert("loreBookDepth".into(),expected);},
+            SmallChange::Preset=>{prepared.expected_root.insert("botPresetsId".into(),expected);},
+            SmallChange::Append=>prepared.expected_messages=Some(expected.as_array().unwrap().clone())}
+        return Ok(prepared);
+    }
+    let additional=match scenario {Scenario::PersonaSwitch=>AdditionalChange::Persona,Scenario::MiddleEdit=>AdditionalChange::MiddleEdit,
+        Scenario::Insertion=>AdditionalChange::Insertion,Scenario::Deletion=>AdditionalChange::Deletion,
+        Scenario::OversizedMessage=>AdditionalChange::Oversized,Scenario::Burst=>AdditionalChange::Burst,
+        _=>return Err("scenario requires an unverified production endpoint".into())};
+    Ok(prepare_additional_change(store,additional,direction,iteration))
+}
+
+fn final_direction(direction:final_runner::Direction)->Direction {
+    match direction {final_runner::Direction::AtoB=>Direction::AtoB,final_runner::Direction::BtoA=>Direction::BtoA}
+}
+
+pub(crate) struct FinalExternalAdapter<'a> {
+    pub fixture:&'a mut CycleFixture,
+    pub asset_hashes:&'a [String],
+}
+impl final_runner::AsyncCycleDriver for FinalExternalAdapter<'_> {
+    async fn cycle(&mut self,scenario:measurement::Scenario,direction:final_runner::Direction,iteration:u32,warmup:bool)
+        ->Result<final_runner::RoutineSample,final_runner::CycleFailure> {
+        let fixture=&mut self.fixture;
+        let (source,destination,sender,receiver)=match direction {
+            final_runner::Direction::AtoB=>(&mut fixture.a,&mut fixture.b,&mut fixture.sender,&mut fixture.receiver),
+            final_runner::Direction::BtoA=>(&mut fixture.b,&mut fixture.a,&mut fixture.receiver,&mut fixture.sender)};
+        final_external_cycle(source,destination,sender,receiver,&fixture.provider,self.asset_hashes,
+            scenario,direction,iteration,warmup).await
+    }
+}
+
+/// Both independently registered endpoints must already be bound and drained.
+pub(crate) fn collect_final_local(a:&mut PersistentStore,b:&mut PersistentStore,ca:&LwwClient,cb:&LwwClient,asset_hashes:&[String])
+    ->final_runner::CollectedSamples {
+    final_runner::collect(|scenario,direction,iteration,warmup| {
+        let (source,destination,sender,receiver)=match direction {
+            final_runner::Direction::AtoB=>(&mut *a,&mut *b,ca,cb),
+            final_runner::Direction::BtoA=>(&mut *b,&mut *a,cb,ca)};
+        final_server_cycle(source,destination,sender,receiver,asset_hashes,scenario,direction,iteration,warmup)
+    })
+}
+
+/// Counters end before journal diagnostics and full message verification.
+fn verify_post_scope<T>(observation:&NativeObservation,verify:impl FnOnce()->Result<T,String>)
+    ->Result<T,final_runner::CycleFailure> {
+    let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(verify));
+    let reason=match result {
+        Ok(Ok(value))=>return Ok(value),
+        Ok(Err(reason))=>reason,
+        Err(_)=>"post-scope correctness assertion failed".into(),
+    };
+    Err(final_runner::CycleFailure {reason,observation:Some(Box::new(observation.clone()))})
+}
+
+#[test]
+fn final_post_scope_errors_and_assertions_preserve_actual_observation() {
+    let observation=NativeObservation {units_visited:37,requests:11,..Default::default()};
+    let sql_error=verify_post_scope::<()>(&observation,||Err("journal diagnostic failed".into())).unwrap_err();
+    assert_eq!(sql_error.reason,"journal diagnostic failed");
+    assert_eq!(sql_error.observation.unwrap().units_visited,37);
+    let assertion=verify_post_scope::<()>(&observation,|| {assert_eq!(1,2,"full message mismatch");Ok(())}).unwrap_err();
+    assert_eq!(assertion.reason,"post-scope correctness assertion failed");
+    assert_eq!(assertion.observation.unwrap().requests,11);
+    assert_eq!(verify_post_scope(&observation,||Ok(19)).unwrap(),19);
+}
+
+fn final_server_cycle(source:&mut PersistentStore,destination:&mut PersistentStore,sender:&LwwClient,receiver:&LwwClient,
+    asset_hashes:&[String],scenario:measurement::Scenario,direction:final_runner::Direction,iteration:u32,warmup:bool)
+    ->Result<final_runner::RoutineSample,final_runner::CycleFailure> {
+    let prepared=prepare_final_change(source,scenario,final_direction(direction),iteration.into())?;
+    let io=[sender.client.test_io.as_ref().ok_or("sender HTTP observer absent")?,
+        receiver.client.test_io.as_ref().ok_or("receiver HTTP observer absent")?];
+    if Arc::ptr_eq(io[0],io[1]) {return Err("endpoint HTTP observers overlap".into());}
+    for counter in io {counter.reset();}
+    reset_work(asset_hashes);
+    let started=Instant::now();
+    let result=(|| {
+        for commit in &prepared.commits {source.commit(commit).map_err(|e|e.to_string())?;}
+        let durable=started.elapsed().as_secs_f64()*1000.0;
+        let receipt=server_sync::lww_tests::publish_cycle(sender,source,&[]).map_err(|e|format!("{e:?}"))?
+            .ok_or("fixed final change emitted no operation")?;
+        let published=started.elapsed().as_secs_f64()*1000.0;
+        let completion=server_sync::lww_tests::receive_cycle(receiver,destination,&[]).map_err(|e|format!("{e:?}"))?;
+        let finished=started.elapsed().as_secs_f64()*1000.0;
+        Ok::<_,String>((durable,published,finished,receipt,completion))
+    })();
+    let mut observation=take_work(false);
+    // The actual local-server LWW path has no shared mutable head API.
+    observation.shared_head_reads=Some(0);
+    for counter in io {let [requests,sent,received]=counter.snapshot();
+        observation.requests+=requests;observation.uploaded_bytes+=sent;observation.downloaded_bytes+=received;}
+    let (durable_save_ms,publication_complete_ms,receiver_durable_ack_ms,receipt,completion)=result
+        .map_err(|reason|final_runner::CycleFailure {reason,observation:Some(Box::new(observation.clone()))})?;
+    verify_post_scope(&observation.clone(),|| {
+    if completion.received_units==0 {return Err("fixed final change had no receive units".into());}
+    let (body,intent):(Vec<u8>,String)=sender.log.0.query_row("SELECT body,intent FROM publications WHERE id=?1",
+        [&receipt.operation_id],|row|Ok((row.get(0)?,row.get(1)?))).map_err(|e|e.to_string())?;
+    let request:risunest_sync_wire::lww::PushRequest=serde_json::from_slice(&body).map_err(|e|e.to_string())?;
+    let publication:server_sync::lww_client::Publication=serde_json::from_str(&intent).map_err(|e|e.to_string())?;
+    if publication.request!=request || request.operation_id!=receipt.operation_id {return Err("immutable operation evidence mismatch".into());}
+    verify_additional_change(destination,&prepared);
+    if !source.lww_read_outbox(source.lww_binding_authority().map_err(|e|e.to_string())?,1)
+        .map_err(|e|e.to_string())?.entries.is_empty() {return Err("routine publication left an outbox entry".into());}
+    Ok(final_runner::RoutineSample {scenario,direction,iteration,warmup,
+        selected_keys:key_set(publication.entries.into_iter().map(|entry|entry.key)),
+        emitted_keys:key_set(request.changes.into_iter().map(|change|change.key)),
+        accepted_winner_keys:Some(key_set(receipt.accepted_keys)),affected_keys:key_set(completion.result.affected_keys),
+        dispatch_keys:None,failed_operations:0,pending_operations:0,observation,
+        timings:final_runner::NativeTimings {durable_save_ms,publication_complete_ms,receiver_durable_ack_ms}})
+    })
+}
+
+async fn final_external_cycle(source:&mut PersistentStore,destination:&mut PersistentStore,
+    sender:&mut crate::external_storage::lww_engine::ExternalLwwEngine,
+    receiver:&mut crate::external_storage::lww_engine::ExternalLwwEngine,
+    provider:&crate::external_storage::fake::FakeProvider,asset_hashes:&[String],scenario:measurement::Scenario,
+    direction:final_runner::Direction,iteration:u32,warmup:bool)->Result<final_runner::RoutineSample,final_runner::CycleFailure> {
+    let prepared=prepare_final_change(source,scenario,final_direction(direction),iteration.into())?;
+    let requests_before=provider.read_count()+provider.upload_count()+provider.listing_count();
+    let bytes_before=provider.transferred_body_bytes();let heads_before=provider.read_attempts("head");
+    reset_work(asset_hashes);
+    let started=Instant::now();
+    let result=async {
+        for commit in &prepared.commits {source.commit(commit).map_err(|e|e.to_string())?;}
+        let durable=started.elapsed().as_secs_f64()*1000.0;
+        sender.publish(source,source.lww_binding_authority().map_err(|e|e.to_string())?,&[],&Cancellation::default())
+            .await.map_err(|e|e.to_string())?;
+        let published=started.elapsed().as_secs_f64()*1000.0;
+        receiver.receive_and_apply(destination,destination.lww_binding_authority().map_err(|e|e.to_string())?,&[],&Cancellation::default())
+            .await.map_err(|e|e.to_string())?;
+        Ok::<_,String>((durable,published,started.elapsed().as_secs_f64()*1000.0))
+    }.await;
+    let mut observation=take_work(true);
+    let keys=crate::external_storage::lww_engine::cycle_keys::take();
+    let bytes_after=provider.transferred_body_bytes();
+    observation.requests=(provider.read_count()+provider.upload_count()+provider.listing_count()-requests_before) as u64;
+    observation.uploaded_bytes=bytes_after.0-bytes_before.0;observation.downloaded_bytes=bytes_after.1-bytes_before.1;
+    observation.shared_head_reads=Some((provider.read_attempts("head")-heads_before) as u64);
+    let (durable_save_ms,publication_complete_ms,receiver_durable_ack_ms)=result
+        .map_err(|reason|final_runner::CycleFailure {reason,observation:Some(Box::new(observation.clone()))})?;
+    verify_post_scope(&observation.clone(),|| {
+    verify_additional_change(destination,&prepared);
+    verify_settled(source,sender);verify_settled(destination,receiver);
+    Ok(final_runner::RoutineSample {scenario,direction,iteration,warmup,
+        selected_keys:key_set(keys.selected_keys),emitted_keys:key_set(keys.emitted_keys),accepted_winner_keys:None,
+        affected_keys:key_set(keys.affected_keys),dispatch_keys:Some(key_set(keys.attempted_keys)),
+        failed_operations:keys.failed_operations as u64,pending_operations:keys.pending_operations as u64,observation,
+        timings:final_runner::NativeTimings {durable_save_ms,publication_complete_ms,receiver_durable_ack_ms}})
+    })
 }
 
 fn verify_bootstrap(a:&PersistentStore, b:&PersistentStore) {
@@ -513,6 +779,49 @@ fn measurement_gate() -> String {
     checkpoint
 }
 
+/// The fixed missed edit/publication is excluded. Only recipient reopen and real receive/ACK are timed.
+fn final_server_resume_endpoint(source:&mut PersistentStore,sender:&LwwClient,destination:PersistentStore,receiver:LwwClient,
+    asset_hashes:&[String],direction:final_runner::Direction,iteration:u32,warmup:bool)
+    ->Result<(PersistentStore,LwwClient,final_runner::NativeResumeSample),final_runner::CycleFailure> {
+    let root=destination.repository_root().to_owned();
+    let stored=destination.server_stored_config().map_err(|e|format!("{e:?}"))?.ok_or("resume lacks stored registration")?;
+    let writer=destination.lww_clock_state().map_err(|e|e.to_string())?.writer_id;
+    let io=receiver.client.test_io.as_ref().ok_or("resume HTTP observer absent")?.clone();
+    drop(receiver);drop(destination);
+    let (commit,expected)=prepare_edit(source,SmallChange::Setting,final_direction(direction),iteration.into());
+    source.commit(&commit).map_err(|e|e.to_string())?;
+    let receipt=server_sync::lww_tests::publish_cycle(sender,source,&[]).map_err(|e|format!("{e:?}"))?
+        .ok_or("missed edit emitted no publication")?;
+    let body:Vec<u8>=sender.log.0.query_row("SELECT body FROM publications WHERE id=?1",[&receipt.operation_id],|r|r.get(0))
+        .map_err(|e|e.to_string())?;
+    let request:risunest_sync_wire::lww::PushRequest=serde_json::from_slice(&body).map_err(|e|e.to_string())?;
+    if request.operation_id!=receipt.operation_id {return Err("resume missed-operation identity mismatch".into());}
+    let missed_published_keys=key_set(request.changes.into_iter().map(|c|c.key));
+    io.reset();reset_work(asset_hashes);
+    let started=Instant::now();
+    let result=(|| {
+        let mut destination=PersistentStore::open(&root).map_err(|e|e.to_string())?;
+        let mut receiver=LwwClient::new(&root,stored.resolve(&root).map_err(|e|format!("{e:?}"))?)
+            .map_err(|e|format!("{e:?}"))?;
+        receiver.access=Some(stored);receiver.client.test_io=Some(io.clone());
+        let reopened_ms=started.elapsed().as_secs_f64()*1000.0;
+        let completion=server_sync::lww_tests::receive_cycle(&receiver,&mut destination,&[]).map_err(|e|format!("{e:?}"))?;
+        let receiver_durable_ack_ms=started.elapsed().as_secs_f64()*1000.0;
+        Ok::<_,String>((destination,receiver,reopened_ms,receiver_durable_ack_ms,completion))
+    })();
+    let mut observation=take_work(false);observation.shared_head_reads=Some(0);
+    let [requests,sent,received]=io.snapshot();observation.requests=requests;
+    observation.uploaded_bytes=sent;observation.downloaded_bytes=received;
+    let (destination,receiver,reopened_ms,receiver_durable_ack_ms,completion)=result
+        .map_err(|reason|final_runner::CycleFailure {reason,observation:Some(Box::new(observation.clone()))})?;
+    verify_post_scope(&observation.clone(),|| {
+    if destination.lww_clock_state().map_err(|e|e.to_string())?.writer_id!=writer {return Err("resume changed native writer".into());}
+    verify(&destination,SmallChange::Setting,&expected);
+    Ok((destination,receiver,final_runner::NativeResumeSample {direction,iteration,warmup,reopened_ms,receiver_durable_ack_ms,
+        missed_published_keys,affected_keys:key_set(completion.result.affected_keys),observation}))
+    })
+}
+
 fn paired_diagnostics(a:&NativeSample,b:&NativeSample) -> Value {
     let domains=a.observation.hashes.keys().chain(b.observation.hashes.keys())
         .collect::<std::collections::BTreeSet<_>>();
@@ -636,6 +945,571 @@ fn write_samples(directory:&Path, samples:&[NativeSample],attributions:&[PairAtt
                 "affected":"actual native ApplyResult after durable completion"},
             "excluded":["server internal SHA", "MAC", "HKDF", "general hashing", "renderer paint", "scheduler empty polls"],
             "precise_control_attribution":attributions,"samples":samples})).unwrap();
+}
+
+pub(crate) fn append_native_shard(store:&mut PersistentStore, shard:&native_shards::NativeShard, seed:u64) {
+    use crate::asset_repository::PayloadCas;
+    use crate::asset_repository::owner_manifest_codec::{encode_owner_manifest,OwnerManifestEntry};
+    let cas = PayloadCas::new(store.repository_root()).unwrap();
+    let mut registrations = Vec::new();
+    let mut aliases = Vec::new();
+    for asset in &shard.assets {
+        let object = cas.prepare_bytes(&fixture::asset_body(seed,asset.index)).unwrap();
+        assert_eq!(object.content_hash,asset.payload_hash);
+        assert_eq!(object.byte_size,asset.byte_length);
+        registrations.push(super::asset_object_catalog::AssetObjectRegistration {
+            object_hash:object.content_hash.clone(),byte_size:object.byte_size});
+        aliases.push(super::AssetAlias {key:asset.logical_key.clone(),object_hash:Some(object.content_hash),
+            kind:"asset".into(),size:asset.byte_length as i64,mime:"application/octet-stream".into(),
+            name:format!("Synthetic asset {}",asset.index),ext:"bin".into(),inlay_type:None,
+            width:None,height:None,metadata:json!({})});
+    }
+    let entries = shard.owner_entries.iter().map(|entry| OwnerManifestEntry {
+        tuple:entry.tuple.clone(),payload_hash:Some(hex::decode(&entry.payload_hash).unwrap().try_into().unwrap())
+    }).collect::<Vec<_>>();
+    let manifest = cas.prepare_bytes(&encode_owner_manifest(&entries).unwrap()).unwrap();
+    registrations.push(super::asset_object_catalog::AssetObjectRegistration {
+        object_hash:manifest.content_hash.clone(),byte_size:manifest.byte_size});
+    store.asset_object_catalog().register(&registrations,1).unwrap();
+    let owner = super::AssetOwnerLocator::CharacterAdditionalAssets {
+        character_id:shard.character["chaId"].as_str().unwrap().into()};
+    let commit = WorkingSetCommit {expected_revision:store.revision().unwrap(),
+        add_character:Some(shard.character.clone()),asset_owner_heads:Some(vec![super::AssetOwnerHead::present(
+            owner,manifest.content_hash,entries.len() as i64)]),..Default::default()};
+    store.commit_with_asset_aliases(&commit,&aliases).unwrap();
+}
+
+#[derive(Debug,Serialize)]
+pub(crate) struct NativeBuildProgress {
+    pub shards:u64,
+    pub assigned_assets:u64,
+    pub generated_input_bytes:u64,
+    pub maximum_shard_bytes:u64,
+    pub observed_active_record_bytes:u64,
+}
+
+#[derive(Debug,Serialize)]
+pub(crate) struct BuiltNativeFixture {
+    pub progress:NativeBuildProgress,
+    pub certificate:scale_certificate::ScaleCertificate,
+}
+
+#[derive(Debug,Serialize)]
+pub(crate) struct ConstructedNativeTarget {
+    pub root:String,
+    pub writer_id:String,
+    pub configuration:fixture_configuration::NativeFixtureConfiguration,
+    pub fixture:BuiltNativeFixture,
+}
+
+pub(crate) fn construct_native_target(root:&Path,requirement:scale_certificate::ScaleRequirement,
+    configuration:fixture_configuration::NativeFixtureConfiguration,
+    progress:impl FnMut(&NativeBuildProgress)->Result<(),String>)->Result<ConstructedNativeTarget,String> {
+    if !root.is_absolute() {return Err("synthetic native root must be absolute".into());}
+    configuration.initial_values()?;
+    if root.exists() {
+        let (metadata,sparse,reparse)=observed_file_kind(root)?;
+        if !metadata.is_dir() || sparse || reparse || std::fs::read_dir(root).map_err(|e|e.to_string())?.next().is_some() {
+            return Err("synthetic native construction requires an empty regular directory".into());
+        }
+    }
+    let mut store=PersistentStore::open(root).map_err(|e|e.to_string())?;
+    let plan=native_shards::ShardPlan::new(1,requirement.minimums().1);
+    let fixture=build_native_fixture_configured(&mut store,plan,requirement,&configuration,progress)?;
+    let writer_id=store.lww_clock_state().map_err(|e|e.to_string())?.writer_id;
+    Ok(ConstructedNativeTarget {root:root.to_str().ok_or("synthetic root is not UTF-8")?.to_owned(),writer_id,configuration,fixture})
+}
+
+#[test]
+#[ignore = "final-stage synthetic construction, explicit fresh root and verified checkpoint required"]
+fn construct_native_target_for_final_stage() {
+    assert_eq!(std::env::var("RISUNEST_LWW_FINAL_STAGE").as_deref(),Ok("authorized-synthetic"));
+    let checkpoint=std::env::var("RISUNEST_LWW_FINAL_CHECKPOINT").expect("verified final checkpoint");
+    assert!(checkpoint.len()==40 && checkpoint.bytes().all(|b|b.is_ascii_hexdigit()));
+    let root=std::path::PathBuf::from(std::env::var("RISUNEST_LWW_NATIVE_ROOT").expect("fresh synthetic native root"));
+    let output=std::path::PathBuf::from(std::env::var("RISUNEST_LWW_OUTPUT_DIRECTORY").expect("separate structural output directory"));
+    assert!(!root.starts_with(&output) && !output.starts_with(&root),"native data and output roots must be separate");
+    std::fs::create_dir_all(&output).unwrap();
+    assert!(!output.join("native-construction.json").exists() && !output.join("INVALID-native-construction.json").exists());
+    let requirement=match std::env::var("RISUNEST_LWW_FINAL_TIER").as_deref() {
+        Ok("target")=>scale_certificate::ScaleRequirement::Target,
+        Ok("above-target")=>scale_certificate::ScaleRequirement::AboveTarget,
+        _=>panic!("exact final target/above-target tier required"),
+    };
+    let local_sse=match std::env::var("RISUNEST_LWW_LOCAL_SSE_ADDRESS") {
+        Ok(address)=>Some(fixture_configuration::LocalSseEndpoint {address:address.parse().expect("local IP address"),
+            port:std::env::var("RISUNEST_LWW_LOCAL_SSE_PORT").expect("local SSE port").parse().unwrap()}),
+        Err(std::env::VarError::NotPresent)=>None,
+        Err(error)=>panic!("invalid local SSE address: {error}"),
+    };
+    let built=construct_native_target(&root,requirement,fixture_configuration::NativeFixtureConfiguration {local_sse},|progress| {
+        if progress.shards%100==0 {eprintln!("M-NATIVE-CONSTRUCTION-PROGRESS {}",serde_json::to_string(progress).unwrap());}
+        Ok(())
+    });
+    let built=match built {
+        Ok(built)=>built,
+        Err(reason)=>{
+            let file=std::fs::OpenOptions::new().create_new(true).write(true).open(output.join("INVALID-native-construction.json")).unwrap();
+            serde_json::to_writer_pretty(file,&json!({"status":"INVALID","checkpoint":checkpoint,"reason":reason})).unwrap();
+            panic!("synthetic construction failed; only INVALID structural output written");
+        },
+    };
+    use sha2::Digest;
+    let executable=std::env::current_exe().unwrap();
+    let fingerprint=hex::encode(sha2::Sha256::digest(std::fs::read(executable).unwrap()));
+    let file=std::fs::OpenOptions::new().create_new(true).write(true).open(output.join("native-construction.json")).unwrap();
+    serde_json::to_writer_pretty(file,&json!({"schema":"risunest.lww-native-construction/v1","checkpoint":checkpoint,
+        "binary_sha256":fingerprint,"setup_only":true,"target":built})).unwrap();
+}
+
+pub(crate) fn build_final_native_tiers(target:&mut PersistentStore,above:&mut PersistentStore,
+    mut progress:impl FnMut(scale_certificate::ScaleRequirement,&NativeBuildProgress)->Result<(),String>)
+    ->Result<[BuiltNativeFixture;2],String> {
+    use scale_certificate::ScaleRequirement;
+    let target_plan=native_shards::ShardPlan::new(1,ScaleRequirement::Target.minimums().1);
+    let above_plan=native_shards::ShardPlan::new(1,ScaleRequirement::AboveTarget.minimums().1);
+    let base=build_native_fixture(target,target_plan,ScaleRequirement::Target,|state|progress(ScaleRequirement::Target,state))?;
+    let larger=build_native_fixture(above,above_plan,ScaleRequirement::AboveTarget,|state|progress(ScaleRequirement::AboveTarget,state))?;
+    scale_certificate::validate_above_target(&base.certificate,&larger.certificate)?;
+    Ok([base,larger])
+}
+
+fn sql_u64(row:&rusqlite::Row<'_>,column:usize) -> rusqlite::Result<u64> {
+    let value:i64=row.get(column)?;
+    u64::try_from(value).map_err(|error|rusqlite::Error::FromSqlConversionFailure(
+        column,rusqlite::types::Type::Integer,Box::new(error)))
+}
+
+pub(crate) fn build_native_fixture<F>(store:&mut PersistentStore,plan:native_shards::ShardPlan,
+    requirement:scale_certificate::ScaleRequirement,mut progress:F) -> Result<BuiltNativeFixture,String>
+where F:FnMut(&NativeBuildProgress)->Result<(),String> {
+    build_native_fixture_configured(store,plan,requirement,&fixture_configuration::NativeFixtureConfiguration::default(),&mut progress)
+}
+
+pub(crate) fn build_native_fixture_configured<F>(store:&mut PersistentStore,plan:native_shards::ShardPlan,
+    requirement:scale_certificate::ScaleRequirement,configuration:&fixture_configuration::NativeFixtureConfiguration,mut progress:F)
+    ->Result<BuiltNativeFixture,String> where F:FnMut(&NativeBuildProgress)->Result<(),String> {
+    let (root,presets)=configuration.initial_values()?;
+    let (minimum_bytes,minimum_assets)=requirement.minimums();
+    if plan.assets<minimum_assets {return Err("shard plan cannot satisfy required asset count".into());}
+    let generation=super::active_generation(&store.connection).map_err(|e|e.to_string())?;
+    let characters:u64=store.connection.query_row("SELECT COUNT(*) FROM characters WHERE generation=?1",
+        [&generation],|row|sql_u64(row,0)).map_err(|e|e.to_string())?;
+    if characters!=0 || !store.list_asset_aliases(None).map_err(|e|e.to_string())?.value.is_empty()
+        || store.lww_binding_state().map_err(|e|e.to_string())?.target!=SyncTarget::None {
+        return Err("native fixture construction requires a fresh unbound synthetic store".into());
+    }
+    let revision=store.revision().map_err(|e|e.to_string())?;
+    let staging=store.replace_begin().map_err(|e|e.to_string())?.staging_id;
+    store.replace_put_root(&staging,&root).map_err(|e|e.to_string())?;
+    store.replace_put_presets(&staging,&presets).map_err(|e|e.to_string())?;
+    store.replace_commit(&staging,Some(revision)).map_err(|e|e.to_string())?;
+    let mut shards=native_shards::NativeShards::new(plan.clone())?;
+    let mut state=NativeBuildProgress {shards:0,assigned_assets:0,generated_input_bytes:0,
+        maximum_shard_bytes:0,observed_active_record_bytes:0};
+    loop {
+        let mut shard=shards.next().ok_or("native shard ordinals exhausted")??;
+        if configuration.local_sse.is_some() {
+            configuration.configure_character(&mut shard.character);
+            let bytes=serde_json::to_vec(&shard.character).map_err(|e|e.to_string())?;
+            if bytes.len()>native_shards::MAX_SHARD_BYTES {return Err("configured native shard exceeds bounded bytes".into());}
+            shard.serialized_character_bytes=bytes.len() as u64;
+            use sha2::Digest;
+            shard.character_sha256=hex::encode(sha2::Sha256::digest(&bytes));
+        }
+        append_native_shard(store,&shard,plan.seed);
+        state.shards=shards.generated_characters();state.assigned_assets=shards.assigned_assets();
+        state.generated_input_bytes=state.generated_input_bytes.checked_add(shard.serialized_character_bytes).ok_or("input size overflow")?;
+        state.maximum_shard_bytes=state.maximum_shard_bytes.max(shard.serialized_character_bytes);
+        let generation=super::active_generation(&store.connection).map_err(|e|e.to_string())?;
+        let character=shard.character["chaId"].as_str().unwrap();
+        let records:u64=store.connection.query_row(
+            "SELECT COALESCE(SUM(length(CAST(value AS BLOB))),0) FROM messages WHERE generation=?1 AND character_id=?2",
+            rusqlite::params![generation,character],|row|sql_u64(row,0)).map_err(|e|e.to_string())?;
+        let detail:u64=store.connection.query_row(
+            "SELECT length(CAST(detail AS BLOB)) FROM characters WHERE generation=?1 AND character_id=?2",
+            rusqlite::params![generation,character],|row|sql_u64(row,0)).map_err(|e|e.to_string())?;
+        state.observed_active_record_bytes=state.observed_active_record_bytes.checked_add(records)
+            .and_then(|bytes|bytes.checked_add(detail)).ok_or("observed record size overflow")?;
+        progress(&state)?;
+        if state.shards<2 || state.assigned_assets!=plan.assets || state.observed_active_record_bytes<minimum_bytes {continue;}
+        store.checkpoint(super::CheckpointMode::Truncate).map_err(|e|e.to_string())?;
+        let pages:u64=store.connection.query_row("PRAGMA page_count",[],|row|sql_u64(row,0)).map_err(|e|e.to_string())?;
+        let free:u64=store.connection.query_row("PRAGMA freelist_count",[],|row|sql_u64(row,0)).map_err(|e|e.to_string())?;
+        let page_size:u64=store.connection.query_row("PRAGMA page_size",[],|row|sql_u64(row,0)).map_err(|e|e.to_string())?;
+        if pages.checked_sub(free).and_then(|pages|pages.checked_mul(page_size)).ok_or("invalid live page allocation")?<minimum_bytes {continue;}
+        let certificate=collect_native_scale_certificate(store,&plan,requirement)?;
+        certificate.validate()?;
+        if certificate.database.active_record_bytes!=state.observed_active_record_bytes {
+            return Err("observed shard records differ from complete active native record inventory".into());
+        }
+        return Ok(BuiltNativeFixture {progress:state,certificate});
+    }
+}
+
+fn observed_file_kind(path:&Path) -> Result<(std::fs::Metadata,bool,bool),String> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error|error.to_string())?;
+    #[cfg(windows)]
+    let (sparse,reparse) = {
+        use std::os::windows::fs::MetadataExt;
+        (metadata.file_attributes() & 0x200 != 0,metadata.file_attributes() & 0x400 != 0)
+    };
+    #[cfg(unix)]
+    let (sparse,reparse) = {
+        use std::os::unix::fs::MetadataExt;
+        (metadata.blocks().saturating_mul(512)<metadata.len(),metadata.file_type().is_symlink())
+    };
+    #[cfg(not(any(windows,unix)))]
+    return Err("file allocation observer unsupported on this target".into());
+    #[cfg(any(windows,unix))]
+    Ok((metadata,sparse,reparse))
+}
+
+pub(crate) fn collect_native_scale_certificate(store:&mut PersistentStore, plan:&native_shards::ShardPlan,
+    requirement:scale_certificate::ScaleRequirement) -> Result<scale_certificate::ScaleCertificate,String> {
+    use scale_certificate::{CertifiedAsset,DatabaseAllocation,ScaleCertificate};
+    use sha2::{Digest,Sha256};
+    store.checkpoint(super::CheckpointMode::Truncate).map_err(|e|e.to_string())?;
+    let mut reopened=PersistentStore::open(store.repository_root()).map_err(|e|e.to_string())?;
+    reopened.checkpoint(super::CheckpointMode::Truncate).map_err(|e|e.to_string())?;
+    let store=&mut reopened;
+    let checked = || -> Result<ScaleCertificate,String> {
+        let connection = &store.connection;
+        let scalar = |sql:&str| connection.query_row(sql,[],|row|sql_u64(row,0)).map_err(|e|e.to_string());
+        let generation = super::active_generation(connection).map_err(|e|e.to_string())?;
+        let active_scalar = |sql:&str| connection.query_row(sql,[&generation],|row|sql_u64(row,0)).map_err(|e|e.to_string());
+        let db_path = Path::new(connection.path().ok_or("native SQLite path missing")?);
+        let (metadata,sparse,reparse) = observed_file_kind(db_path)?;
+        let wal_path = db_path.with_file_name(format!("{}-wal",db_path.file_name().unwrap().to_str().unwrap()));
+        let wal_bytes = match std::fs::metadata(wal_path) {
+            Ok(value)=>value.len(),Err(error) if error.kind()==std::io::ErrorKind::NotFound=>0,
+            Err(error)=>return Err(error.to_string()),
+        };
+        let schema = |db:&rusqlite::Connection| -> Result<Vec<(String,String,Option<String>)>,String> {
+            let mut statement = db.prepare("SELECT type,name,sql FROM sqlite_master ORDER BY type,name")
+                .map_err(|e|e.to_string())?;
+            let rows = statement.query_map([],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))
+                .map_err(|e|e.to_string())?;
+            rows.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())
+        };
+        let template_root = tempfile::tempdir().map_err(|e|e.to_string())?;
+        let template = PersistentStore::open(template_root.path()).map_err(|e|e.to_string())?;
+        let integrity:String = connection.query_row("PRAGMA integrity_check",[],|row|row.get(0)).map_err(|e|e.to_string())?;
+        let database = DatabaseAllocation {page_size:scalar("PRAGMA page_size")?,page_count:scalar("PRAGMA page_count")?,
+            freelist_count:scalar("PRAGMA freelist_count")?,file_bytes:metadata.len(),wal_bytes,
+            regular_file:metadata.is_file(),sparse_file:sparse,reparse_point:reparse,checkpoint_complete:true,reopened:true,
+            integrity_checked:integrity=="ok",native_schema_only:schema(connection)?==schema(&template.connection)?,
+            active_characters:active_scalar("SELECT COUNT(*) FROM characters WHERE generation=?1")?,
+            active_conversations:active_scalar("SELECT COUNT(*) FROM conversations WHERE generation=?1")?,
+            active_messages:active_scalar("SELECT COUNT(*) FROM messages WHERE generation=?1")?,
+            active_record_bytes:active_scalar("SELECT COALESCE(SUM(length(CAST(value AS BLOB))),0) FROM messages WHERE generation=?1")?
+                .checked_add(active_scalar("SELECT COALESCE(SUM(length(CAST(detail AS BLOB))),0) FROM characters WHERE generation=?1")?)
+                .ok_or("native record byte overflow")?,
+            maximum_message_bytes:active_scalar("SELECT COALESCE(MAX(length(CAST(value AS BLOB))),0) FROM messages WHERE generation=?1")?,
+            maximum_character_detail_bytes:active_scalar("SELECT COALESCE(MAX(length(CAST(detail AS BLOB))),0) FROM characters WHERE generation=?1")?,
+            maximum_root_bytes:active_scalar("SELECT COALESCE(MAX(length(CAST(value AS BLOB))),0) FROM root WHERE generation=?1")?};
+        let aliases = store.list_asset_aliases(None).map_err(|e|e.to_string())?.value;
+        if aliases.len() as u64 != plan.assets {return Err("actual fixture alias count differs from shard plan".into());}
+        let aliases_by_key = aliases.iter().map(|alias|(alias.key.as_str(),alias)).collect::<std::collections::BTreeMap<_,_>>();
+        let cas = crate::asset_repository::PayloadCas::new(store.repository_root()).map_err(|e|e.to_string())?;
+        let mut owner_references = std::collections::BTreeMap::<String,u64>::new();
+        let mut owner_manifests=Vec::new();
+        let mut verified_owner_heads = 0;
+        for head in store.list_asset_owner_heads(None).map_err(|e|e.to_string())?.value {
+            if !head.present {continue;}
+            let super::AssetOwnerLocator::CharacterAdditionalAssets {character_id} = &head.owner else {
+                return Err("unexpected owner kind in synthetic shard fixture".into());
+            };
+            let hash = head.manifest_hash.as_deref().ok_or("owner manifest identity missing")?;
+            let path=cas.object_path(hash).map_err(|e|e.to_string())?.ok_or("owner manifest physical body missing")?;
+            let (metadata,sparse,reparse)=observed_file_kind(&path)?;
+            if !metadata.is_file() || sparse || reparse || metadata.len()>1024*1024 {
+                return Err("owner manifest is indirect, sparse or unbounded".into());
+            }
+            let bytes = cas.read_object(hash).map_err(|e|e.to_string())?.ok_or("owner manifest body missing")?;
+            if hex::encode(Sha256::digest(&bytes))!=hash {return Err("owner manifest physical digest mismatch".into());}
+            owner_manifests.push((hash.to_owned(),bytes.len() as u64));
+            let entries = crate::asset_repository::owner_manifest_codec::decode_owner_manifest(&bytes).map_err(|e|e.to_string())?;
+            if entries.len() as i64 != head.entry_count {return Err("owner entry count differs from manifest".into());}
+            let character = store.read_character(character_id,None).map_err(|e|e.to_string())?
+                .ok_or("owner parent missing")?.value;
+            let tuples = json!(entries.iter().map(|entry|entry.tuple.clone()).collect::<Vec<_>>());
+            if character["additionalAssets"] != tuples {return Err("owner manifest differs from native parent tuples".into());}
+            for entry in entries {
+                let hash = hex::encode(entry.payload_hash.ok_or("fixture owner has unresolved payload")?);
+                if aliases_by_key.get(entry.tuple[1].as_str()).and_then(|alias|alias.object_hash.as_deref())!=Some(hash.as_str()) {
+                    return Err("owner payload does not match actual alias".into());
+                }
+                *owner_references.entry(hash).or_default()+=1;
+            }
+            verified_owner_heads+=1;
+        }
+        let mut catalog = std::collections::BTreeMap::new();
+        let mut cursor = None;
+        loop {
+            let page = store.query_asset_object_catalog(4096,cursor.as_deref()).map_err(|e|e.to_string())?;
+            catalog.extend(page.items.into_iter().map(|item|(item.object_hash,item.byte_size)));
+            cursor=page.next_cursor;
+            if cursor.is_none() {break;}
+        }
+        let mut assets = Vec::new();
+        for (hash,size) in owner_manifests {
+            if catalog.get(&hash)!=Some(&size) {return Err("owner manifest physical body/catalog mismatch".into());}
+        }
+        for alias in aliases {
+            let index = alias.key.strip_prefix("assets/synthetic-").and_then(|v|v.strip_suffix(".bin"))
+                .and_then(|v|v.parse::<u64>().ok()).ok_or("unexpected synthetic asset alias")?;
+            if index>=plan.assets {return Err("asset ordinal outside shard plan".into());}
+            let expected = fixture::asset_descriptor(plan.seed,index);
+            let hash = alias.object_hash.as_deref().ok_or("fixture alias lacks payload identity")?;
+            if hash!=expected.payload_hash || alias.kind!="asset" || alias.size!=expected.byte_length as i64 {
+                return Err("fixture alias differs from deterministic body identity".into());
+            }
+            let path = cas.object_path(hash).map_err(|e|e.to_string())?.ok_or("physical fixture body missing")?;
+            let (metadata,sparse,reparse)=observed_file_kind(&path)?;
+            if !metadata.is_file() || sparse || reparse || metadata.len()!=expected.byte_length {
+                return Err("physical fixture body is indirect, sparse or has incorrect size".into());
+            }
+            let verified_file_hash=hex::encode(Sha256::digest(std::fs::read(path).map_err(|e|e.to_string())?));
+            assets.push(CertifiedAsset {payload_hash:hash.into(),catalog_bytes:*catalog.get(hash).ok_or("payload catalog row missing")?,
+                file_bytes:metadata.len(),regular_file:true,sparse_file:sparse,reparse_point:reparse,verified_file_hash,
+                active_aliases:1,verified_owner_references:owner_references.get(hash).copied().unwrap_or(0)});
+        }
+        Ok(ScaleCertificate {schema:"risunest.native-persisted-scale/v1".into(),requirement,database,
+            catalog_rows:catalog.len() as u64,verified_owner_heads,assets,
+            measured_conversation_sha256:hex::encode(Sha256::digest(serde_json::to_vec(
+                &store.read_conversation("synthetic-character-0","synthetic-conversation-0",None)
+                    .map_err(|e|e.to_string())?.ok_or("measured conversation missing")?.value)
+                    .map_err(|e|e.to_string())?))})
+    };
+    checked()
+}
+
+#[test]
+fn bounded_native_shards_have_real_catalog_bodies_and_owner_closure() {
+    let (_directory,mut store) = server_sync::lww_tests::local();
+    let plan = native_shards::ShardPlan {ordinary_messages:2,assets_per_owner:2,
+        ..native_shards::ShardPlan::new(11,3)};
+    let mut shards = native_shards::NativeShards::new(plan.clone()).unwrap();
+    for _ in 0..2 {append_native_shard(&mut store,&shards.next().unwrap().unwrap(),plan.seed);}
+    let certificate = collect_native_scale_certificate(&mut store,&plan,
+        scale_certificate::ScaleRequirement::Correctness {minimum_database_bytes:4096,minimum_assets:3}).unwrap();
+    assert_eq!(certificate.validate().unwrap().unique_materialized_owned_assets,3);
+    assert_eq!(certificate.verified_owner_heads,2);
+    assert_eq!(certificate.database.active_messages,4098);
+    let mut fake_target=certificate.clone(); fake_target.requirement=scale_certificate::ScaleRequirement::Target;
+    assert!(fake_target.validate().is_err());
+    store.connection.execute_batch("CREATE TABLE synthetic_padding (value BLOB)").unwrap();
+    let padded = collect_native_scale_certificate(&mut store,&plan,certificate.requirement).unwrap();
+    assert!(!padded.database.native_schema_only);
+    assert!(padded.validate().is_err());
+}
+
+#[test]
+fn lazy_native_constructor_stops_on_observed_persistence_and_honors_callback_cancellation() {
+    let (_directory,mut store)=server_sync::lww_tests::local();
+    let plan=native_shards::ShardPlan {ordinary_messages:2,assets_per_owner:2,..native_shards::ShardPlan::new(11,3)};
+    let requirement=scale_certificate::ScaleRequirement::Correctness {minimum_database_bytes:4096,minimum_assets:3};
+    let built=build_native_fixture(&mut store,plan.clone(),requirement,|progress| {
+        assert!(progress.maximum_shard_bytes<=native_shards::MAX_SHARD_BYTES as u64);Ok(())
+    }).unwrap();
+    assert_eq!(built.progress.shards,2);
+    assert_eq!(built.certificate.validate().unwrap().unique_materialized_owned_assets,3);
+    assert_eq!(built.certificate.database.active_messages,4098);
+    assert!(built.certificate.database.reopened);
+    assert_eq!(store.read_root(None).unwrap().value["selectedPersona"],"synthetic-persona-0");
+    let (_cancelled_directory,mut cancelled)=server_sync::lww_tests::local();
+    let result=build_native_fixture(&mut cancelled,plan,requirement,|_|Err("cancelled synthetic construction".into()));
+    assert_eq!(result.err().unwrap(),"cancelled synthetic construction");
+}
+
+#[test]
+fn additional_fixed_changes_preserve_full_message_lists_and_stable_personas() {
+    let (_directory,mut store) = server_sync::lww_tests::local();
+    let generated = tempfile::tempdir().unwrap();
+    seed(&mut store,&generated.path().join("fixture"),FixtureScale::small());
+    store.commit(&WorkingSetCommit {expected_revision:store.revision().unwrap(),
+        unit_mutations:Some(vec![UnitMutation::Set {key:UnitKey::new(&["root","selectedPersona"]).unwrap(),
+            value:json!("synthetic-persona-0")}]),..Default::default()}).unwrap();
+    for change in [AdditionalChange::Persona,AdditionalChange::MiddleEdit,AdditionalChange::Insertion,
+        AdditionalChange::Deletion,AdditionalChange::Burst] {
+        let prepared=prepare_additional_change(&store,change,Direction::AtoB,0);
+        assert_eq!(prepared.commits.len(),if matches!(change,AdditionalChange::Burst) {16} else {1});
+        apply_additional_change(&mut store,&prepared);
+        verify_additional_change(&store,&prepared);
+    }
+}
+
+#[test]
+fn additional_native_adapters_use_real_local_transport_in_both_directions() {
+    let mut driver=ServerDriver::prepare(FixtureScale::small());
+    driver.a.commit(&WorkingSetCommit {expected_revision:driver.a.revision().unwrap(),
+        unit_mutations:Some(vec![UnitMutation::Set {key:UnitKey::new(&["root","selectedPersona"]).unwrap(),
+            value:json!("synthetic-persona-0")}]),..Default::default()}).unwrap();
+    server_sync::lww_tests::publish_cycle(&driver.ca,&mut driver.a,&[]).unwrap().unwrap();
+    server_sync::lww_tests::receive_cycle(&driver.cb,&mut driver.b,&[]).unwrap();
+    for change in [AdditionalChange::Persona,AdditionalChange::MiddleEdit,AdditionalChange::Insertion,
+        AdditionalChange::Deletion,AdditionalChange::Burst] {
+        for direction in [Direction::AtoB,Direction::BtoA] {
+            let (source,destination,sender,receiver)=match direction {
+                Direction::AtoB=>(&mut driver.a,&mut driver.b,&driver.ca,&driver.cb),
+                Direction::BtoA=>(&mut driver.b,&mut driver.a,&driver.cb,&driver.ca),
+            };
+            let prepared=prepare_additional_change(source,change,direction,0);
+            apply_additional_change(source,&prepared);
+            verify_additional_change(source,&prepared);
+            let publication=server_sync::lww_tests::publish_cycle(sender,source,&[]).unwrap().unwrap();
+            let completion=server_sync::lww_tests::receive_cycle(receiver,destination,&[]).unwrap();
+            assert!(!publication.accepted_keys.is_empty());
+            assert!(completion.received_units>0);
+            verify_additional_change(destination,&prepared);
+        }
+    }
+}
+
+#[test]
+fn additional_native_adapters_use_real_external_cycle_in_both_directions() {
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        let mut driver=ExternalDriver::prepare(FixtureScale::small()).await;
+        let fixture=&mut driver.fixture;
+        fixture.a.commit(&WorkingSetCommit {expected_revision:fixture.a.revision().unwrap(),
+            unit_mutations:Some(vec![UnitMutation::Set {key:UnitKey::new(&["root","selectedPersona"]).unwrap(),
+                value:json!("synthetic-persona-0")}]),..Default::default()}).unwrap();
+        let authority_a=fixture.a.lww_binding_authority().unwrap();
+        fixture.sender.publish(&mut fixture.a,authority_a,&[],&Cancellation::default()).await.unwrap();
+        let authority_b=fixture.b.lww_binding_authority().unwrap();
+        fixture.receiver.receive_and_apply(&mut fixture.b,authority_b,&[],&Cancellation::default()).await.unwrap();
+        for change in [AdditionalChange::Persona,AdditionalChange::MiddleEdit,AdditionalChange::Insertion,
+            AdditionalChange::Deletion,AdditionalChange::Burst] {
+            for direction in [Direction::AtoB,Direction::BtoA] {
+                let (source,destination,sender,receiver)=match direction {
+                    Direction::AtoB=>(&mut fixture.a,&mut fixture.b,&mut fixture.sender,&mut fixture.receiver),
+                    Direction::BtoA=>(&mut fixture.b,&mut fixture.a,&mut fixture.receiver,&mut fixture.sender),
+                };
+                let prepared=prepare_additional_change(source,change,direction,0);
+                apply_additional_change(source,&prepared);
+                verify_additional_change(source,&prepared);
+                let source_authority=source.lww_binding_authority().unwrap();
+                sender.publish(source,source_authority,&[],&Cancellation::default()).await.unwrap();
+                let destination_authority=destination.lww_binding_authority().unwrap();
+                receiver.receive_and_apply(destination,destination_authority,&[],&Cancellation::default()).await.unwrap();
+                verify_additional_change(destination,&prepared);
+            }
+        }
+    });
+}
+
+#[test]
+fn final_native_local_adapters_keep_unknown_owned_staging_fail_closed() {
+    let _entry=collect_final_local;
+    let mut driver=ServerDriver::prepare(FixtureScale::small());
+    driver.a.commit(&WorkingSetCommit {expected_revision:driver.a.revision().unwrap(),
+        unit_mutations:Some(vec![UnitMutation::Set {key:UnitKey::new(&["root","selectedPersona"]).unwrap(),
+            value:json!("synthetic-persona-0")}]),..Default::default()}).unwrap();
+    server_sync::lww_tests::publish_cycle(&driver.ca,&mut driver.a,&[]).unwrap().unwrap();
+    server_sync::lww_tests::receive_cycle(&driver.cb,&mut driver.b,&[]).unwrap();
+    for &scenario in final_runner::AVAILABLE {
+        for direction in [final_runner::Direction::AtoB,final_runner::Direction::BtoA] {
+            let (source,destination,sender,receiver)=match direction {
+                final_runner::Direction::AtoB=>(&mut driver.a,&mut driver.b,&driver.ca,&driver.cb),
+                final_runner::Direction::BtoA=>(&mut driver.b,&mut driver.a,&driver.cb,&driver.ca)};
+            let sample=final_server_cycle(source,destination,sender,receiver,&driver.asset_hashes,scenario,direction,0,true).unwrap();
+            if sample.observation.body_owned_work!=BodyDomain::default() {
+                if matches!(scenario,measurement::Scenario::MiddleEdit) && matches!(direction,final_runner::Direction::AtoB) {
+                    eprintln!("M-OWNED-CONTROL-DIAGNOSTIC {}",serde_json::to_string(&json!({
+                        "status":"INVALID","scenario":scenario,"direction":direction,"body_scope_complete":sample.observation.body_scope_complete,
+                        "domains":sample.observation.body_domains,"objects":sample.observation.body_objects,
+                        "owned_total":sample.observation.body_owned_work,"control_total":sample.observation.body_control_work,
+                        "asset_total":sample.observation.body_asset_work,"unknown_total":sample.observation.body_unknown_work,
+                        "unattributed_owned":sample.observation.body_unattributed_owned,
+                        "pending_owned_identities":sample.observation.body_pending_owned_identities})).unwrap());
+                }
+                assert!(sample.validate().unwrap_err().contains("CAS body scope"));
+                assert_eq!(sample.observation.body_scope_complete,Some(true));
+                assert_eq!(sample.observation.body_unknown_work,BodyDomain::default());
+                assert_eq!(sample.observation.body_asset_work,BodyDomain::default());
+            } else {
+                sample.validate().unwrap_or_else(|reason|panic!("{scenario:?}/{direction:?}: {reason}; {}",
+                    serde_json::to_string(&sample.observation).unwrap()));
+            }
+            assert!(sample.observation.hash_totals().unwrap().calls>0);
+            assert!(sample.observation.requests>0);
+        }
+    }
+}
+
+#[test]
+fn final_native_resume_reopens_same_registration_and_receives_only_missed_units() {
+    let mut driver=ServerDriver::prepare(FixtureScale::small());
+    assert!(build_final_native_tiers(&mut driver.a,&mut driver.b,|_,_|panic!("a bound existing fixture must fail before construction"))
+        .unwrap_err().contains("fresh unbound"));
+    let ServerDriver {_server,_directories,mut a,b,ca,cb,receipt,asset_hashes}=driver;
+    let (mut b,cb,sample)=final_server_resume_endpoint(&mut a,&ca,b,cb,&asset_hashes,final_runner::Direction::AtoB,0,true).unwrap();
+    sample.validate().unwrap();assert!(sample.observation.requests>0);
+    let (a,ca,sample)=final_server_resume_endpoint(&mut b,&cb,a,ca,&asset_hashes,final_runner::Direction::BtoA,0,true).unwrap();
+    sample.validate().unwrap();assert!(sample.observation.requests>0);
+    let _driver=ServerDriver {_server,_directories,a,b,ca,cb,receipt,asset_hashes};
+}
+
+#[test]
+fn final_native_sse_constructor_uses_real_projection_and_independent_fresh_writers() {
+    let directory=tempfile::tempdir().unwrap();
+    let requirement=scale_certificate::ScaleRequirement::Correctness {minimum_database_bytes:4096,minimum_assets:3};
+    let configuration=fixture_configuration::NativeFixtureConfiguration {local_sse:Some(fixture_configuration::LocalSseEndpoint {
+        address:"127.0.0.1".parse().unwrap(),port:32123})};
+    assert!(construct_native_target(Path::new("relative"),requirement,configuration.clone(),|_|Ok(())).is_err());
+    let root=directory.path().join("desktop-agent");
+    let built=construct_native_target(&root,requirement,configuration.clone(),|_|Ok(())).unwrap();
+    assert!(root.join("persistent/persistent.sqlite").is_file());
+    assert!(root.join("persistent/device.sqlite").is_file());
+    let store=PersistentStore::open(&root).unwrap();
+    assert_eq!(store.lww_clock_state().unwrap().writer_id,built.writer_id);
+    let generation=super::active_generation(&store.connection).unwrap();
+    for index in 0..2 {
+        let mut projected=store.read_root(None).unwrap().value.as_object().unwrap().clone();
+        projected.insert("botPresetsId".into(),json!(format!("synthetic-preset-{index}")));
+        projected.insert("selectedPersona".into(),json!(format!("synthetic-persona-{index}")));
+        super::export::derive_identity_root(&store.connection,&generation,&mut projected).unwrap();
+        assert_eq!(projected["botPresetsId"],index);assert_eq!(projected["selectedPersona"],index);
+        assert_eq!(projected["username"],format!("Synthetic persona {index}"));
+        assert_eq!(projected["personaPrompt"],format!("Synthetic persona prompt {index}"));
+        assert_eq!(projected["globalNote"],"");
+        assert_eq!(projected["userNote"],format!("Synthetic persona note {index}"));
+        for key in ["aiModel","subModel"] {assert_eq!(projected[key],"reverse_proxy");}
+        assert_eq!(projected["forceReplaceUrl"],"http://127.0.0.1:32123/v1/chat/completions");
+        assert_eq!(projected["presetChain"],"");assert_eq!(projected["promptTemplate"],Value::Null);
+        assert_eq!(projected["useStreaming"],true);assert_eq!(projected["personaNote"],true);
+    }
+    assert!(construct_native_target(&root,requirement,configuration.clone(),|_|Ok(())).unwrap_err().contains("empty regular"));
+    let android=construct_native_target(&directory.path().join("android-agent"),requirement,
+        fixture_configuration::NativeFixtureConfiguration {local_sse:Some(fixture_configuration::LocalSseEndpoint {
+            address:"10.0.2.2".parse().unwrap(),port:32123})},|_|Ok(())).unwrap();
+    assert_ne!(built.writer_id,android.writer_id);
+    assert_eq!(built.fixture.certificate.measured_conversation_sha256,android.fixture.certificate.measured_conversation_sha256);
+}
+
+#[test]
+fn final_native_external_adapters_return_complete_phase_and_key_evidence() {
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        let mut driver=ExternalDriver::prepare(FixtureScale::small()).await;
+        driver.fixture.a.commit(&WorkingSetCommit {expected_revision:driver.fixture.a.revision().unwrap(),
+            unit_mutations:Some(vec![UnitMutation::Set {key:UnitKey::new(&["root","selectedPersona"]).unwrap(),
+                value:json!("synthetic-persona-0")}]),..Default::default()}).unwrap();
+        let authority=driver.fixture.a.lww_binding_authority().unwrap();
+        driver.fixture.sender.publish(&mut driver.fixture.a,authority,&[],&Cancellation::default()).await.unwrap();
+        let authority=driver.fixture.b.lww_binding_authority().unwrap();
+        driver.fixture.receiver.receive_and_apply(&mut driver.fixture.b,authority,&[],&Cancellation::default()).await.unwrap();
+        for &scenario in final_runner::AVAILABLE {
+            for direction in [final_runner::Direction::AtoB,final_runner::Direction::BtoA] {
+                let mut adapter=FinalExternalAdapter {fixture:&mut driver.fixture,asset_hashes:&driver.asset_hashes};
+                let sample=final_runner::AsyncCycleDriver::cycle(&mut adapter,scenario,direction,0,true).await.unwrap();
+                sample.validate().unwrap_or_else(|reason|panic!("{scenario:?}/{direction:?}: {reason}; {}",
+                    serde_json::to_string(&sample.observation).unwrap()));
+                assert!(sample.observation.hash_totals().unwrap().calls>0);
+                assert!(sample.observation.requests>0);
+            }
+        }
+    });
 }
 
 #[test]
