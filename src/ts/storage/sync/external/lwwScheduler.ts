@@ -61,7 +61,8 @@ export function createLwwScheduler(dependencies: LwwSchedulerDependencies) {
             if (firstDirty === undefined) firstDirty = now()
             clearPublish()
             if (!enabled) return
-            const delay = Math.max(0, Math.min(generationComplete ? 5_000 : 15_000, firstDirty + 60_000 - now()))
+            if (generationComplete) { void publishNow().catch(() => {}); return }
+            const delay = Math.max(0, Math.min(15_000, firstDirty + 60_000 - now()))
             publishTimer = setTimer(() => { publishTimer = undefined; void publishNow().catch(() => {}) }, delay)
         },
         start() {
