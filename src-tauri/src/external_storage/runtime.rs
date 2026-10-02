@@ -1414,15 +1414,23 @@ async fn run_backup(
         let capture = match &retained {
             Some(id) => pds.reopen_external_capture(id).map_err(local_error)?,
             None => {
+                let revision = pds.revision().map_err(local_error)?;
+                let (lease, prepared_sections) = pds.lww_acquire_backup_capture(revision).map_err(local_error)?;
+                let sections = match super::sections::capture_prepared_backup_sections(&prepared_sections, &worker_spool, &probe.0) {
+                    Ok(sections) => sections,
+                    Err(error) => { let _ = pds.release_revision(&lease.lease); return Err(error); }
+                };
                 let capture = pds
-                    .capture_external_library(
+                    .capture_external_library_from_lease_with_sections(
                         &worker_job.request.connection_id,
                         hydration
                             .as_ref()
                             .ok_or_else(|| ProviderError::new(ErrorKind::Corrupt))?,
+                        &lease.lease,
+                        sections,
                         &probe,
                     )
-                    .map_err(local_error)?;
+                    .map_err(|error| { let _ = pds.release_revision(&lease.lease); local_error(error) })?;
                 probe.0.check()?;
                 pds.external_prepare_backup(
                     &worker_job.id,
@@ -1454,12 +1462,13 @@ async fn run_backup(
             .catalog
             .content_fingerprint(&risunest_external_storage_format::format::library_fingerprint_domain())
             .map_err(local_error)?;
-        let sections = super::sections::capture_backup_sections(&mut pds, &worker_spool, &probe.0)?;
+        let sections = capture.catalog.backup_sections().map_err(local_error)?;
         Ok((capture, fingerprint, sections))
     })
     .await
     .map_err(local_error)??;
     let identity = capture.identity.clone();
+    let original_units = capture.catalog.original_backup_units().map_err(local_error)?;
     let capture_id = capture.id.clone();
     let directory = job_directory(&root, &job.request.connection_id, &job.id);
     let mut journal = TransferJournal::open(
@@ -1473,46 +1482,6 @@ async fn run_backup(
         },
     )?;
     journal.set_spool_budget(spool_budget(&root, &job.id));
-    // A backup wraps the library the published state already covers, so that
-    // state names the graph this capture can reuse from. Selected and recorded
-    // before anything reuses it. A connection that has never published one has
-    // nothing to select.
-    let parent_graph = match super::control::read_head(
-        connected.provider.as_ref(),
-        &connected.handle,
-        &connected.stored.descriptor,
-        &connected.root_key,
-        None,
-        cancel,
-    )
-    .await?
-    {
-        Some(head) => {
-            let view =
-                super::control::read_snapshot_document(connected, &head.document.state, cancel)
-                    .await?;
-            let mut roots = vec![
-                (
-                    super::packaging::CatalogRoot::Records,
-                    view.library.record_catalog,
-                ),
-                (
-                    super::packaging::CatalogRoot::Assets,
-                    view.library.asset_catalog,
-                ),
-            ];
-            roots.extend(view.sections.into_iter().map(|(id, section)| {
-                (
-                    super::packaging::CatalogRoot::Section(id),
-                    section.entries_root,
-                )
-            }));
-            let graph = super::packaging::ParentGraph::new(roots, &connected.handle)?;
-            journal.record_parent(graph.stored())?;
-            Some(graph)
-        }
-        None => None,
-    };
     let metadata = SnapshotMetadata {
         snapshot_id: job.snapshot_id.clone(),
         repository_id: connected.stored.descriptor.repository_id.clone(),
@@ -1530,6 +1499,7 @@ async fn run_backup(
                 writer_id: identity.store_id.clone(),
             },
             remote_generation: None,
+            original_units,
         },
     };
     let cache = package_cache_root(&directory)?;
@@ -1542,7 +1512,7 @@ async fn run_backup(
         &connected.root_key,
         PackageLimits::from_capabilities(&connected.stored.capabilities)?
             .with_maintenance(maintenance_allowed(app, connected, job)),
-        parent_graph.as_ref(),
+        None,
         &mut journal,
         connected.provider.as_ref(),
         &connected.handle,

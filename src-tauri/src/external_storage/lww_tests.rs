@@ -173,6 +173,7 @@ fn checkpoint_uses_only_published_units_and_restores_after_segment_retirement() 
             risunest_external_storage_format::control::BundleSource::Device{writer_id:f.a.lww_clock_state().unwrap().writer_id},
             super::runtime::now_ms(),Some(risunest_sync_wire::head::Sequence::from(0u64)),None,None,
             snapshot.library.clone(),std::collections::BTreeMap::new(),
+            Some(snapshot.library.record_catalog.clone()),
         ).unwrap();
         let backup_plain=backup.encode(risunest_external_storage_format::snapshot::MAX_METADATA_BYTES).unwrap();
         let backup_object=format!("snapshot-{backup_id}");

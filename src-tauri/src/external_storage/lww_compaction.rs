@@ -192,8 +192,7 @@ impl ExternalLwwEngine {
             purpose:super::packaging::SnapshotPurpose::LwwCheckpoint { covered_prefixes:state.catalog.coverage.clone(),state_identity:state.catalog.identity()?,asset_catalogs:state.asset_catalogs,standalone_bodies:state.standalone } };
         let captured=CapturedSnapshot{id:job_id.into(),identity:identity.clone(),catalog:capture,projected_records:changes.len(),shared:true};
         let mut journal=super::journal::TransferJournal::open(&directory.join("journal"),super::journal::JobIdentity{job_id:job_id.into(),connection_id:self.connection_id.clone(),repository_id:self.repository.repository_id.clone(),capture_id:job_id.into(),capture:identity}).map_err(error)?;
-        let mut limits=super::packaging::PackageLimits::from_capabilities(capabilities)?;
-        limits.target_plaintext_bytes=32*1024*1024;
+        let limits=super::packaging::PackageLimits::from_capabilities(capabilities)?;
         super::packaging::package_and_upload_protected(captured,Vec::new(),directory,&directory.join("cache"),metadata,&self.root_key,limits,None,&mut journal,self.provider.as_ref(),&self.repository,&super::phase_progress::PhaseProgress::silent(),cancel,protection).await
     }
 }

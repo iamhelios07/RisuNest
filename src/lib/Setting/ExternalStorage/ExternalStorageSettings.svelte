@@ -862,17 +862,6 @@
         flex-wrap: wrap;
         gap: 0.4rem;
     }
-    .policy-title {
-        margin: 0.25rem 0 0;
-        font-size: 0.9375rem;
-        font-weight: 600;
-    }
-    .policy-note {
-        margin: 0;
-        font-size: 0.8125rem;
-        line-height: 1.45;
-        color: var(--risu-theme-textcolor2);
-    }
     .policy-row {
         display: flex;
         align-items: center;
@@ -885,17 +874,6 @@
     }
     .policy-row .value {
         color: var(--risu-theme-textcolor2);
-    }
-    .always {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 0.35rem;
-        margin: 0;
-        font-size: 0.8125rem;
-        color: var(--risu-theme-textcolor2);
-    }
-    .always .value {
-        font-weight: 600;
     }
     .empty {
         margin: 0;
@@ -1020,12 +998,6 @@
         align-items: center;
         justify-content: space-between;
         gap: 0.5rem;
-    }
-    .scope {
-        display: grid;
-        gap: 0.35rem;
-        padding-top: 0.5rem;
-        border-top: 1px solid color-mix(in srgb, var(--risu-theme-darkborderc) 55%, transparent);
     }
     .dialog {
         display: grid;

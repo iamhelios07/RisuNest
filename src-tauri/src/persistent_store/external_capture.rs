@@ -13,7 +13,7 @@ use crate::{
 use risunest_external_storage_format::format::library_fingerprint_domain;
 use rusqlite::{params, OptionalExtension};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -53,6 +53,123 @@ enum HydrationMode {
     Reuse,
     Incremental,
     Rebuild,
+}
+
+pub(crate) struct BackupDependencyClosure {
+    pub controls: BTreeMap<String, Vec<u8>>,
+    pub payload_bodies: BTreeMap<String, Vec<u8>>,
+    pub managed_payloads: BTreeMap<String, u64>,
+    pub record_payloads: BTreeSet<String>,
+}
+
+impl PersistentStore {
+    pub(crate) fn lww_backup_dependency_closure(
+        &self,
+        lease: &str,
+        units: &BTreeMap<risunest_sync_wire::unit::UnitKey, risunest_sync_wire::unit::UnitValue>,
+        probe: &dyn CancellationProbe,
+    ) -> StoreResult<BackupDependencyClosure> {
+        check(probe)?;
+        if self.lww_backup_unit_values(lease)? != *units {
+            return Err(invalid("Backup dependency source differs from the complete pinned units"));
+        }
+        let reader = self.revision_leases.get(lease)
+            .ok_or_else(|| invalid("Backup dependency lease is unavailable"))?;
+        let load = |hash: &str| -> StoreResult<Option<Vec<u8>>> {
+            check(probe)?;
+            let length: Option<i64> = reader.connection.query_row(
+                "SELECT length(body) FROM message_page_objects WHERE hash=?1", [hash], |row| row.get(0),
+            ).optional()?;
+            if length.is_some_and(|size| size < 0 || size as u64 > risunest_sync_wire::MAX_METADATA_BYTES as u64) {
+                return Err(invalid("Backup control exceeds its bounded metadata limit"));
+            }
+            super::message_pages::object_body(&reader.connection, hash)
+        };
+        let payload_size = |hash: &str| -> StoreResult<Option<u64>> {
+            let size: Option<i64> = reader.connection.query_row(
+                "SELECT byte_size FROM asset_objects WHERE object_hash=?1", [hash], |row| row.get(0),
+            ).optional()?;
+            size.map(u64::try_from).transpose().map_err(|_| invalid("Pinned backup payload size is invalid"))
+        };
+        original_unit_dependency_closure(units,&load,&payload_size,probe)
+    }
+}
+
+pub(crate) fn original_unit_dependency_closure(
+    units: &BTreeMap<risunest_sync_wire::unit::UnitKey,risunest_sync_wire::unit::UnitValue>,
+    read_body: &dyn Fn(&str) -> StoreResult<Option<Vec<u8>>>,
+    payload_size: &dyn Fn(&str) -> StoreResult<Option<u64>>,
+    probe: &dyn CancellationProbe,
+) -> StoreResult<BackupDependencyClosure> {
+        use risunest_sync_wire::{descriptor::visit_reference_tree, unit::UnitValue};
+        let mut controls = BTreeMap::new();
+        let mut required = BTreeSet::new();
+        let mut record_payloads = BTreeSet::new();
+        let load = |hash:&str| -> StoreResult<Option<Vec<u8>>> {
+            check(probe)?;
+            let bytes = read_body(hash)?;
+            if bytes.as_ref().is_some_and(|bytes| bytes.len() > risunest_sync_wire::MAX_METADATA_BYTES || risunest_sync_wire::hash(bytes) != hash) {
+                return Err(invalid("Backup bounded source body integrity failed"));
+            }
+            Ok(bytes)
+        };
+        for (key, value) in units {
+            check(probe)?;
+            value.validate().map_err(|_| invalid("Invalid original backup value"))?;
+            let UnitValue::Object { descriptor_hash, descriptor } = value else { continue; };
+            let descriptor_bytes = descriptor.bytes().map_err(|_| invalid("Invalid original backup descriptor"))?;
+            if risunest_sync_wire::hash(&descriptor_bytes) != *descriptor_hash {
+                return Err(invalid("Original backup descriptor identity differs"));
+            }
+            controls.insert(descriptor_hash.clone(), descriptor_bytes);
+            let kind = key.components();
+            if super::lww::lww_known_unit_key(key) && matches!(kind[0].as_str(), "messages" | "archive") {
+                let body = load(&descriptor.object_hash)?.ok_or_else(|| invalid("Pinned backup control is unavailable"))?;
+                if kind[0] == "messages" {
+                    let manifest = risunest_external_storage_format::message_pages::MessageManifest::decode(&body)
+                        .map_err(|_| invalid("Pinned backup message manifest integrity failed"))?;
+                    for page in manifest.pages {
+                        let bytes = load(&page.hash)?.ok_or_else(|| invalid("Pinned backup message page is unavailable"))?;
+                        if bytes.len() as u64 != page.byte_length.0 { return Err(invalid("Pinned backup message page length differs")); }
+                        controls.insert(page.hash, bytes);
+                    }
+                }
+                controls.insert(descriptor.object_hash.clone(), body);
+            } else {
+                required.insert(descriptor.object_hash.clone());
+                record_payloads.insert(descriptor.object_hash.clone());
+            }
+            required.extend(descriptor.dependencies.iter().cloned());
+            for (root, relations) in [(&descriptor.dependency_root, false), (&descriptor.relation_root, true)] {
+                let Some(root) = root else { continue; };
+                let mut pages = BTreeMap::new();
+                let visited = visit_reference_tree(root, relations, |hash| {
+                    let bytes = load(hash).map_err(|_| risunest_sync_wire::WireError("backup-reference-control-unavailable"))?
+                        .ok_or(risunest_sync_wire::WireError("backup-reference-control-unavailable"))?;
+                    pages.insert(hash.to_owned(), bytes.clone());
+                    Ok(bytes)
+                }, |value, page| {
+                    if !page && !relations { required.insert(value.to_owned()); }
+                    Ok(())
+                });
+                check(probe)?;
+                visited.map_err(|_| invalid("Backup reference tree integrity failed"))?;
+                controls.extend(pages);
+            }
+        }
+        let mut managed_payloads = BTreeMap::new();
+        let mut payload_bodies = BTreeMap::new();
+        for hash in required {
+            check(probe)?;
+            if controls.contains_key(&hash) { continue; }
+            if let Some(body) = load(&hash)? {
+                payload_bodies.insert(hash, body);
+                continue;
+            }
+            let size = payload_size(&hash)?.ok_or_else(|| invalid("Backup payload metadata is unavailable"))?;
+            managed_payloads.insert(hash, size);
+        }
+        Ok(BackupDependencyClosure { controls, payload_bodies, managed_payloads, record_payloads })
 }
 
 struct Candidate {
@@ -135,7 +252,7 @@ impl PersistentStore {
         let candidate: Option<(String, String, String, Option<String>, Option<String>)> = self
             .connection
             .query_row(
-                "SELECT c.identity,c.scope_id,c.manifest_hash,f.catalog_path,f.file_hash FROM external_storage_captures c LEFT JOIN external_storage_capture_files f ON f.capture_id=c.id WHERE c.id=?1 AND c.codec_id=?2 AND c.device_capture_id=''",
+                "SELECT c.identity,c.scope_id,c.manifest_hash,f.catalog_path,f.file_hash FROM external_storage_captures c LEFT JOIN external_storage_capture_files f ON f.capture_id=c.id WHERE c.id=?1 AND c.codec_id=?2 AND (c.device_capture_id='' OR c.device_capture_id=f.file_hash)",
                 params![id, CODEC],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
@@ -812,6 +929,17 @@ impl PersistentStore {
         lease: &str,
         probe: &dyn CancellationProbe,
     ) -> StoreResult<CapturedSnapshot> {
+        self.capture_external_library_from_lease_with_sections(consumer, hydration, lease, Vec::new(), probe)
+    }
+
+    pub(crate) fn capture_external_library_from_lease_with_sections(
+        &mut self,
+        consumer: &str,
+        hydration: &CaptureHydration,
+        lease: &str,
+        sections: Vec<crate::external_storage::sections::CapturedSection>,
+        probe: &dyn CancellationProbe,
+    ) -> StoreResult<CapturedSnapshot> {
         let reader = self.revision_leases.get(lease)
             .ok_or_else(|| invalid("Capture lease is unavailable"))?;
         let identity = sync_selection::identity(&reader.connection)?;
@@ -820,14 +948,18 @@ impl PersistentStore {
             return Err(invalid("Capture hydration differs from its pinned lease"));
         }
         check(probe)?;
+        let units = self.lww_backup_unit_values(lease)?;
+        let closure = self.lww_backup_dependency_closure(lease, &units, probe)?;
         let id = uuid::Uuid::new_v4().to_string();
         let prepared = self.prepare_content_capture_from_lease(&id, consumer, lease)?;
         let root = self.repository_root.join("external-storage");
         let directory = root.join("captures").join(&id);
         let mut catalog = CaptureCatalog::create(&directory, &root, None)?;
+        catalog.install_backup_inputs(units, closure, sections)?;
         let projected_records = prepared.project(&mut catalog, probe)?;
         check(probe)?;
-        let id = prepared.register(self, &catalog, &scope, CODEC)?;
+        let (manifest,_,_) = catalog.manifest()?;
+        let id = prepared.register_with_device_capture_id(self, &catalog, &scope, CODEC, &hex::encode(manifest))?;
         Ok(CapturedSnapshot { id, identity, catalog, projected_records, shared: false })
     }
 
@@ -885,6 +1017,116 @@ impl PersistentStore {
 mod hydration_tests {
     use super::*;
 
+    fn receive_original_units(store: &mut PersistentStore, request: &str, changes: Vec<super::super::lww::Change>) {
+        use super::super::lww::{ApplyReceive, Header, Progress, StageReceive};
+        let header = Header { binding_authority: store.lww_binding_authority().unwrap(), request_id: request.into() };
+        store.lww_stage_receive(&StageReceive {
+            header: header.clone(), changes,
+            progress: Progress { kind: "server".into(), cursor: 1.into(), writer_id: None },
+            admitted_time_upper_ms: u64::MAX.into(),
+        }).unwrap();
+        store.lww_apply_receive(&ApplyReceive { header: header.clone(), generating: Vec::new() }).unwrap();
+        store.lww_finish_receive(&header).unwrap();
+    }
+
+    #[test]
+    fn original_unit_closure_keeps_opaque_and_held_controls_and_separates_relation_keys() {
+        use risunest_sync_wire::{descriptor::{build_reference_tree, RecordDescriptor}, unit::{UnitKey, UnitValue}, stamp::Stamp};
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let asset = PayloadCas::new(directory.path()).unwrap().prepare_bytes(b"synthetic managed dependency").unwrap();
+        store.asset_object_catalog().register(&[super::super::asset_object_catalog::AssetObjectRegistration {
+            object_hash: asset.content_hash.clone(), byte_size: asset.byte_size,
+        }], 1).unwrap();
+        let body = b"synthetic original control";
+        let body_hash = risunest_sync_wire::hash(body);
+        store.lww_put_object(&body_hash, body).unwrap();
+        let dependencies = build_reference_tree(&[asset.content_hash.clone()], false).unwrap();
+        let relation = UnitKey::new(&["root", "language"]).unwrap().as_str().to_owned();
+        let relations = build_reference_tree(&[relation.clone()], true).unwrap();
+        for (hash, bytes) in dependencies.1.iter().chain(&relations.1) {
+            store.lww_put_object(hash, bytes).unwrap();
+        }
+        let mut descriptor = RecordDescriptor::content(body_hash.clone());
+        descriptor.dependency_root = dependencies.0;
+        descriptor.relation_root = relations.0;
+        let value = UnitValue::object(descriptor).unwrap();
+        let stamp = Stamp { physical_ms: 1.into(), logical: 0, writer_id: "00000000-0000-4000-8000-000000000091".into() };
+        let opaque = UnitKey::new(&["future-unit", "synthetic"]).unwrap();
+        let held = UnitKey::new(&["field", "characters", "missing-parent", "name"]).unwrap();
+        receive_original_units(&mut store, "original-controls", vec![
+            super::super::lww::Change { key: opaque.clone(), stamp: stamp.clone(), value: value.clone() },
+            super::super::lww::Change { key: held.clone(), stamp: stamp.clone(), value: value.clone() },
+        ]);
+        let revision = store.revision().unwrap();
+        let (lease, _sections) = store.lww_acquire_backup_capture(revision).unwrap();
+        let units = store.lww_backup_unit_values(&lease.lease).unwrap();
+        assert_eq!(units[&opaque], value);
+        assert_eq!(units[&held], value);
+        let closure = store.lww_backup_dependency_closure(&lease.lease, &units, &crate::local_backup::NeverCancelled).unwrap();
+        assert_eq!(closure.payload_bodies[&body_hash], body);
+        assert!(!closure.controls.contains_key(&body_hash));
+        assert_eq!(closure.managed_payloads[&asset.content_hash], asset.byte_size);
+        assert!(!closure.managed_payloads.contains_key(&relation));
+        assert!(closure.record_payloads.contains(&body_hash));
+        assert!(store.lww_backup_dependency_closure(&lease.lease, &BTreeMap::new(), &crate::local_backup::NeverCancelled).is_err());
+        store.connection.execute_batch("DROP TRIGGER message_page_objects_immutable_update;").unwrap();
+        store.connection.execute("UPDATE message_page_objects SET body=?1 WHERE hash=?2", params![b"synthetic corruption".as_slice(),body_hash]).unwrap();
+        let pinned = store.lww_backup_dependency_closure(&lease.lease, &units, &crate::local_backup::NeverCancelled).unwrap();
+        assert_eq!(pinned.payload_bodies[&body_hash], body);
+        store.release_revision(&lease.lease).unwrap();
+        let (new_lease, _) = store.lww_acquire_backup_capture(revision).unwrap();
+        let new_units = store.lww_backup_unit_values(&new_lease.lease).unwrap();
+        assert!(store.lww_backup_dependency_closure(&new_lease.lease, &new_units, &crate::local_backup::NeverCancelled).is_err());
+        store.release_revision(&new_lease.lease).unwrap();
+    }
+
+    #[test]
+    fn original_unit_closure_verifies_known_manifests_without_certifying_unreferenced_bodies() {
+        use risunest_sync_wire::{descriptor::RecordDescriptor,unit::{UnitKey,UnitValue}};
+        let manifest = risunest_external_storage_format::message_pages::MessageManifest {
+            schema:risunest_external_storage_format::message_pages::MANIFEST_SCHEMA.into(),
+            message_count:0u64.into(),pages:Vec::new(),
+        }.encode().unwrap();
+        let units = BTreeMap::from([(
+            UnitKey::new(&["messages","synthetic-character","synthetic-conversation"]).unwrap(),
+            UnitValue::object(RecordDescriptor::content(manifest.hash.clone())).unwrap(),
+        )]);
+        let reads = std::cell::RefCell::new(Vec::new());
+        let read = |hash:&str| -> StoreResult<Option<Vec<u8>>> {
+            reads.borrow_mut().push(hash.to_owned());
+            Ok(if hash == manifest.hash {Some(manifest.bytes.clone())} else {Some(b"unreferenced synthetic bytes".to_vec())})
+        };
+        let closure = original_unit_dependency_closure(&units,&read,&|_| Ok(None),&crate::local_backup::NeverCancelled).unwrap();
+        assert_eq!(*reads.borrow(),[manifest.hash.clone()]);
+        assert_eq!(closure.controls[&manifest.hash],manifest.bytes);
+        assert!(closure.payload_bodies.is_empty() && closure.managed_payloads.is_empty());
+        assert!(original_unit_dependency_closure(&units,&|_| Ok(None),&|_| Ok(None),&crate::local_backup::NeverCancelled).is_err());
+        assert!(original_unit_dependency_closure(&units,&|_| Ok(Some(b"wrong body".to_vec())),&|_| Ok(None),&crate::local_backup::NeverCancelled).is_err());
+    }
+
+    #[test]
+    fn original_unit_closure_rejects_missing_source_and_cancellation_without_consuming_the_lease() {
+        use risunest_sync_wire::{descriptor::RecordDescriptor, unit::{UnitKey, UnitValue}, stamp::Stamp};
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        receive_original_units(&mut store, "missing-original-control", vec![super::super::lww::Change {
+            key: UnitKey::new(&["future-unit", "missing-body"]).unwrap(),
+            stamp: Stamp { physical_ms: 1.into(), logical: 0, writer_id: "00000000-0000-4000-8000-000000000092".into() },
+            value: UnitValue::object(RecordDescriptor::content("ab".repeat(32))).unwrap(),
+        }]);
+        let revision = store.revision().unwrap();
+        let (lease, _) = store.lww_acquire_backup_capture(revision).unwrap();
+        let units = store.lww_backup_unit_values(&lease.lease).unwrap();
+        assert!(store.lww_backup_dependency_closure(&lease.lease, &units, &crate::local_backup::NeverCancelled).is_err());
+        struct Cancelled;
+        impl CancellationProbe for Cancelled { fn is_cancelled(&self) -> bool { true } }
+        let error = store.lww_backup_dependency_closure(&lease.lease, &units, &Cancelled).err().unwrap();
+        assert!(matches!(error, StoreError::Validation { message } if message == "External capture cancelled"));
+        assert!(store.revision_leases.contains_key(&lease.lease));
+        store.release_revision(&lease.lease).unwrap();
+    }
+
     #[test]
     fn supplied_capture_lease_keeps_the_original_view_and_is_consumed() {
         let directory = tempfile::tempdir().unwrap();
@@ -899,17 +1141,30 @@ mod hydration_tests {
         let scope = library_fingerprint_domain();
         let fingerprint = first.catalog.content_fingerprint(&scope).unwrap();
         let hydration = store.hydrate_external_capture_dependencies("backup", &probe).unwrap();
-        let lease = store.acquire_revision(1).unwrap();
+        let (lease, prepared_sections) = store.lww_acquire_backup_capture(1).unwrap();
+        let original_units = store.lww_backup_unit_values(&lease.lease).unwrap();
+        let sections = crate::external_storage::sections::capture_prepared_backup_sections(
+            &prepared_sections,&directory.path().join("fixed-sections"),&crate::external_storage::contract::Cancellation::default(),
+        ).unwrap();
+        let fixed_section_identity = sections.iter().map(|section| (section.kind,section.content_fingerprint)).collect::<Vec<_>>();
         let commit = serde_json::from_value(serde_json::json!({
             "expectedRevision":1,"root":{"username":"synthetic later"}
         })).unwrap();
         store.commit(&commit).unwrap();
         assert!(store.capture_external_library_from_lease("wrong", &hydration, &lease.lease, &probe).is_err());
         assert!(store.revision_leases.contains_key(&lease.lease));
-        let captured = store.capture_external_library_from_lease("backup", &hydration, &lease.lease, &probe).unwrap();
+        let captured = store.capture_external_library_from_lease_with_sections("backup", &hydration, &lease.lease, sections, &probe).unwrap();
+        assert_ne!(captured.id,first.id);
+        assert!(first.catalog.original_backup_units().is_err());
         assert_eq!(captured.identity.revision, 1);
         assert_eq!(captured.catalog.content_fingerprint(&scope).unwrap(), fingerprint);
         assert_eq!(store.revision().unwrap(), 2);
+        assert_eq!(captured.catalog.original_backup_units().unwrap(), original_units);
+        assert_eq!(captured.catalog.backup_sections().unwrap().iter().map(|section| (section.kind,section.content_fingerprint)).collect::<Vec<_>>(),fixed_section_identity);
+        store.retain_external_capture(&captured.id,"synthetic-backup-job").unwrap();
+        let reopened = store.reopen_external_capture(&captured.id).unwrap();
+        assert_eq!(reopened.catalog.original_backup_units().unwrap(),original_units);
+        assert_eq!(reopened.catalog.backup_sections().unwrap().iter().map(|section| (section.kind,section.content_fingerprint)).collect::<Vec<_>>(),fixed_section_identity);
         assert!(!store.revision_leases.contains_key(&lease.lease));
         assert!(store.capture_external_library_from_lease("backup", &hydration, &lease.lease, &probe).is_err());
         let later = store.acquire_revision(2).unwrap();
