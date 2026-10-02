@@ -3260,4 +3260,6 @@ pub(super) fn active_generation(connection: &Connection) -> StoreResult<String> 
 #[cfg(test)]
 mod benchmark;
 #[cfg(test)]
+mod benchmark_lww;
+#[cfg(test)]
 mod tests;
