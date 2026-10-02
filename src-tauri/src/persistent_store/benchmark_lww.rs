@@ -558,12 +558,21 @@ fn write_invalid_diagnostics(directory:&Path,by_scale:&[Vec<NativeSample>],reaso
         "comparisons":comparisons,"all_post_take_samples":by_scale})).unwrap();
 }
 
-fn validate_smoke_pairs(directory:&Path,by_scale:&[Vec<NativeSample>]) -> Result<(),String> {
+#[derive(Serialize)]
+struct PairAttribution {
+    iteration:u64,
+    change:SmallChange,
+    direction:Direction,
+    proof:native_observation::FrozenGrowthProof,
+}
+
+fn validate_smoke_pairs(directory:&Path,by_scale:&[Vec<NativeSample>]) -> Result<Vec<PairAttribution>,String> {
     if by_scale.len()!=2 || by_scale[0].len()!=by_scale[1].len() {
         let reason="incomplete paired sample matrix";
         write_invalid_diagnostics(directory,by_scale,reason,None);
         return Err(reason.into());
     }
+    let mut attributions=Vec::new();
     for (index,(a,b)) in by_scale[0].iter().zip(&by_scale[1]).enumerate() {
         if [a,b].iter().any(|sample|!sample.observation.receive_intents.as_ref().is_some_and(|e|e.complete)) {
             let reason="incomplete exact receive-intent input provenance";
@@ -577,18 +586,22 @@ fn validate_smoke_pairs(directory:&Path,by_scale:&[Vec<NativeSample>]) -> Result
         }
         let keys=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||assert_same_key_sets(a,b)));
         let result=if keys.is_err() {Err("exact key-set comparison failed".into())}
-            else {native_observation::assert_frozen_growth(&a.observation,&b.observation,&[])};
-        if let Err(error)=result {
-            write_invalid_diagnostics(directory,by_scale,&error,Some(index));
-            return Err(error);
+            else {native_observation::assert_frozen_growth(&a.observation,&b.observation)};
+        match result {
+            Ok(proof)=>attributions.push(PairAttribution {iteration:a.iteration,change:a.change,direction:a.direction,proof}),
+            Err(error)=>{
+                write_invalid_diagnostics(directory,by_scale,&error,Some(index));
+                return Err(error);
+            }
         }
     }
-    Ok(())
+    Ok(attributions)
 }
 
-pub(crate) fn write_samples(directory:&Path, samples:&[NativeSample]) {
+fn write_samples(directory:&Path, samples:&[NativeSample],attributions:&[PairAttribution]) {
     let checkpoint = measurement_gate();
     assert!(!samples.is_empty());
+    assert_eq!(attributions.len()*2,samples.len());
     for sample in samples {
         sample.observation.validate_routine_invariants().unwrap();
         assert!(sample.observation.receive_intents.as_ref().is_some_and(|evidence|evidence.complete),
@@ -622,7 +635,7 @@ pub(crate) fn write_samples(directory:&Path, samples:&[NativeSample]) {
                 "external_attempted":"keys at actual segment create dispatch",
                 "affected":"actual native ApplyResult after durable completion"},
             "excluded":["server internal SHA", "MAC", "HKDF", "general hashing", "renderer paint", "scheduler empty polls"],
-            "samples":samples})).unwrap();
+            "precise_control_attribution":attributions,"samples":samples})).unwrap();
 }
 
 #[test]
@@ -688,6 +701,8 @@ fn local_routine_observation_regression() {
         for direction in [Direction::AtoB, Direction::BtoA] {
             let sample = driver.run(direction, change, 0);
             sample.observation.validate_routine_invariants().unwrap();
+            assert_eq!(native_observation::assert_frozen_growth(&sample.observation,&sample.observation)
+                .unwrap().aggregate_control_growth,0);
             let evidence=sample.observation.receive_intents.as_ref().unwrap();
             assert!(evidence.complete);
             assert_eq!(evidence.observed_calls,evidence.captured_calls);
@@ -802,8 +817,8 @@ fn windows_fake_provider_smoke() {
             }
             by_scale.push(samples);
         }
-        validate_smoke_pairs(Path::new(&output),&by_scale).unwrap();
-        write_samples(Path::new(&output), &by_scale.into_iter().flatten().collect::<Vec<_>>());
+        let attributions=validate_smoke_pairs(Path::new(&output),&by_scale).unwrap();
+        write_samples(Path::new(&output), &by_scale.into_iter().flatten().collect::<Vec<_>>(),&attributions);
     });
 }
 
@@ -827,8 +842,8 @@ fn windows_local_server_smoke() {
         }
         by_scale.push(samples);
     }
-    validate_smoke_pairs(Path::new(&output),&by_scale).unwrap();
-    write_samples(Path::new(&output), &by_scale.into_iter().flatten().collect::<Vec<_>>());
+    let attributions=validate_smoke_pairs(Path::new(&output),&by_scale).unwrap();
+    write_samples(Path::new(&output), &by_scale.into_iter().flatten().collect::<Vec<_>>(),&attributions);
 }
 
 #[test]
