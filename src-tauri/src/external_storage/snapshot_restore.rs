@@ -1595,6 +1595,23 @@ pub(crate) async fn download_control_catalogs(
     Ok(objects.into_values().collect())
 }
 
+pub(crate) async fn revalidate_control_catalog(
+    catalog:&wire::StoredObject,root_key:&[u8;32],provider:&dyn Provider,
+    repository:&RepositoryHandle,cancel:&Cancellation,
+) -> Result<()> {
+    if catalog.header.repository_id!=repository.repository_id || catalog.header.role!=wire::ObjectRole::Catalog {return Err(corrupt("control catalog scope differs"));}
+    let stage=tempfile::tempdir().map_err(transient)?;
+    let remote=RemoteObject::from_stored(catalog,repository)?;
+    let (entries,packs,_)=read_catalog(&remote,wire::CatalogKind::Records,root_key,stage.path(),provider,repository,cancel).await?;
+    if entries.iter().any(|entry|entry.kind!=wire::CatalogEntryKind::Object) {return Err(corrupt("control catalog contains unit records"));}
+    for pack in packs.values() {
+        cancel.check()?;
+        let body=tempfile::tempdir_in(stage.path()).map_err(transient)?;
+        open_object(pack,root_key,body.path(),provider,repository,cancel).await?;
+    }
+    Ok(())
+}
+
 pub(crate) async fn admit_data_catalogs(
     catalogs:&[wire::StoredObject],store:&mut crate::persistent_store::PersistentStore,target:&str,root_key:&[u8;32],
     provider:&dyn Provider,repository:&RepositoryHandle,cancel:&Cancellation,
