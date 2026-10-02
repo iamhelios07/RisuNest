@@ -44,4 +44,38 @@ describe('external storage onboarding action', () => {
             includedSections: ['hypa', 'local-settings'],
         }))).toThrow('complete restore scope')
         expect(externalOnboardingRestoreRestarts()).toBe(false)
-    })})
+    })
+})
+
+describe('external storage onboarding backups', () => {
+    it('offers the newest readable backup first', () => {
+        const merged = mergeExternalHistoryItems([], [
+            item('older', '1000'),
+            item('newest', '3000'),
+            item('middle', '2000'),
+        ])
+
+        expect(externalOnboardingRestorable(merged).map(entry => entry.id))
+            .toEqual(['newest', 'middle', 'older'])
+    })
+
+    it('preserves the restore snapshot identity when a retained point suppresses its recovery candidate', () => {
+        const merged = mergeExternalHistoryItems([], [
+            item('point-id', '2', { snapshotId: 'snapshot-id', kind: 'backup-point' }),
+            item('snapshot-id', '1', { snapshotId: 'snapshot-id', kind: 'recovery-candidate' }),
+        ])
+        const restored = externalOnboardingRestorable(merged)
+        expect(restored).toHaveLength(1)
+        expect(restored[0]).toMatchObject({ id: 'point-id', snapshotId: 'snapshot-id' })
+    })
+
+    it('leaves out entries a restore cannot read back', () => {
+        const merged = mergeExternalHistoryItems([], [
+            item('partial', '3000', { complete: false }),
+            item('unverified', '2000', { verified: false }),
+            item('usable', '1000'),
+        ])
+
+        expect(externalOnboardingRestorable(merged).map(entry => entry.id)).toEqual(['usable'])
+    })
+})
