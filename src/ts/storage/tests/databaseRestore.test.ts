@@ -175,7 +175,7 @@ describe.each([
         await expect(install(database, {
             replaceDatabase, publishAcceptedRevision, relaunch,
         })).resolves.toEqual(refreshRequired)
-        expect(replaceDatabase).toHaveBeenCalledExactlyOnceWith(database, reason, { publishOfficial: true })
+        expect(replaceDatabase).toHaveBeenCalledExactlyOnceWith({ ...database, explicitGlobalChatVariables: {} }, reason, { publishOfficial: true, upstreamImport:true })
         expect(publishAcceptedRevision).not.toHaveBeenCalled()
         expect(relaunch).not.toHaveBeenCalled()
     })

@@ -429,6 +429,8 @@ interface ReplacementAdmission extends PersistentMutationToken {
 }
 
 export interface PersistentReplacementOptions {
+    upstreamImport?: boolean
+    upstreamImportWarnings?: string[]
     publishOfficial?: boolean
     authoritative?: boolean
     expectedRevision?: DataRevision
@@ -1785,7 +1787,7 @@ export class SaveCoordinator {
             })
             this.assertReadRevision(revision, page.revision)
             for (const summary of page.items) {
-                if (summary.trashTime !== undefined && summary.trashTime < cutoff) expired.push(summary.id)
+                if (isTauri ? summary.trashStampMs !== undefined && BigInt(summary.trashStampMs) < BigInt(cutoff) : summary.trashTime !== undefined && summary.trashTime < cutoff) expired.push(summary.id)
             }
             cursor = page.nextCursor
         } while (cursor)
@@ -1833,8 +1835,11 @@ export class SaveCoordinator {
                 this.assertReadRevision(revision, rootValue.revision)
                 for (const id of deletedIds) {
                     const targetValue = await reader.readCharacter(id)
-                    if (!targetValue || (expiryCutoff !== undefined &&
-                        (targetValue.value.trashTime === undefined || targetValue.value.trashTime >= expiryCutoff))) {
+                    const expirySummary = expiryCutoff === undefined || !isTauri ? null : await reader.readCharacterSummary(id)
+                    const expired = expiryCutoff === undefined || (isTauri
+                        ? expirySummary?.trashed && expirySummary.trashStampMs !== undefined && BigInt(expirySummary.trashStampMs) < BigInt(expiryCutoff)
+                        : targetValue?.value.trashTime !== undefined && targetValue.value.trashTime < expiryCutoff)
+                    if (!targetValue || !expired) {
                         deletedIds.delete(id)
                         continue
                     }
@@ -1886,19 +1891,29 @@ export class SaveCoordinator {
 
             const mutatedRoot = canonicalClone(rootValue.value)
             for (const id of deletedIds) removeCharacterIdFromOrder(mutatedRoot, id)
+            for (const loadout of mutatedRoot.loadouts ?? []) {
+                if (Array.isArray(loadout.characterIds)) loadout.characterIds = loadout.characterIds.filter((id) => !deletedIds.has(id))
+            }
             const liveBeforeCommit = this.capture()
             const committedRoot = rebaseRootMutation(
                 rootValue.value,
                 mutatedRoot,
                 liveBeforeCommit.root,
             )
+            const previousLoadouts = new Map((rootValue.value.loadouts ?? []).map(value => [value.id, value]))
+            const orderChanged = (committedRoot.characterOrder === undefined ? null : canonicalJson(committedRoot.characterOrder)) !==
+                (rootValue.value.characterOrder === undefined ? null : canonicalJson(rootValue.value.characterOrder))
             const commit: WorkingSetCommit = {
                 expectedRevision: revision,
-                deleteCharacterIds: [...deletedIds],
-                characterDetails: canonicalClone(relatedCharacters),
-            }
-            if (canonicalJson(committedRoot) !== canonicalJson(rootValue.value)) {
-                commit.root = committedRoot
+                unitMutations: [
+                    ...[...deletedIds].map((id): PersistentUnitMutation => ({type:'delete',key:JSON.stringify(['exists','character',id])})),
+                    ...relatedCharacters.map((group): PersistentUnitMutation => ({type:'set',key:JSON.stringify(['group-members',group.chaId]),value:{characters:(group as Omit<groupChat,'chats'>).characters,characterTalks:(group as Omit<groupChat,'chats'>).characterTalks,characterActive:(group as Omit<groupChat,'chats'>).characterActive}})),
+                    ...(orderChanged ? [{type:'set' as const,key:JSON.stringify(['order','characters']),value:committedRoot.characterOrder}] : []),
+                    ...(committedRoot.loadouts ?? []).filter(loadout => {
+                        const previous = previousLoadouts.get(loadout.id)
+                        return previous !== undefined && canonicalJson(loadout) !== canonicalJson(previous)
+                    }).map((loadout): PersistentUnitMutation => ({type:'set',key:JSON.stringify(['record','loadouts',loadout.id]),value:loadout})),
+                ],
             }
             const committed = await this.dependencies.store.commit(commit)
             const changedDuringCommit = this.dirtyGeneration !== mutationGeneration
@@ -3454,6 +3469,29 @@ export class SaveCoordinator {
         group.characterTalks = retained.characterTalks
         group.characterActive = retained.characterActive
         return true
+    }
+
+    finishUpstreamReplacementPublication(revision: DataRevision, publishOfficial = false): Promise<void> {
+        this.assertPersistentMutationAllowed()
+        return this.enqueue(async () => {
+            if (publishOfficial) {
+                await this.finishExplicitCommit(Math.max(revision, this.pendingPublicationRevision ?? revision,
+                    this.deferredPublicationRevision ?? revision))
+                return
+            }
+            const stale = this.pendingPublicationRevision !== null && this.pendingPublicationRevision <= revision
+                ? this.pendingPublication : null
+            if (this.pendingPublicationRevision !== null && this.pendingPublicationRevision <= revision) {
+                this.pendingPublication = null
+                this.pendingPublicationRevision = null
+            }
+            if (this.deferredPublicationRevision !== null && this.deferredPublicationRevision <= revision) {
+                this.deferredPublicationRevision = null
+            }
+            if (this.pendingPublicationRevision === null && this.deferredPublicationRevision === null) this.cancelOfficialPublishRetry()
+            else this.armOfficialPublishRetry(this.officialPublishDelayMs())
+            if (stale) await this.disposeOrQueuePublication(stale)
+        })
     }
 
     private async finishExplicitCommit(revision: DataRevision, verifyBaseline = true): Promise<void> {

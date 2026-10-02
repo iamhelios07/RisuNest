@@ -238,19 +238,6 @@ export async function restoreBackupFromNativeSource(
                     | 'block-risu-save'
                     | 'local-backup'
                 >('native_backup_source_format', { source: input })
-                if (
-                    format !== 'portable' &&
-                    !options.firstRun &&
-                    !(await alertCheckboxConfirm({
-                        title: language.backupLoadConfirm,
-                        description: language.backupLoadConfirm2,
-                        checkboxLabel: language.checkboxConfirmation.dataReplacement,
-                        actionLabel: language.confirm,
-                        cancelLabel: language.cancel,
-                        requireChecked: true,
-                    })).confirmed
-                )
-                    return null
                 checkSignal(joined.signal)
                 const runtime = getPersistentDataRuntime()
                 let replacesLibrary = format !== 'portable'
@@ -266,6 +253,7 @@ export async function restoreBackupFromNativeSource(
                     },
                     beforeActivation: async () => {
                         await options.beforeActivation?.()
+                        if (format !== 'portable') return
                         if (!releaseServerReplacement) {
                             releaseServerReplacement =
                                 await getServerSyncController().beginReplacement()
@@ -280,13 +268,13 @@ export async function restoreBackupFromNativeSource(
                         }
                     },
                     onNativeStatus: async (status) => {
-                        if (status.state === 'succeeded' && replacesLibrary)
+                        if (status.state === 'succeeded' && replacesLibrary && format === 'portable')
                             holdServerSyncAfterRestore()
                         await options.onNativeStatus?.(status)
                     },
-                    afterRefresh: async () => {
-                        await loadPluginsAfterAuthoritativeRestore()
-                        await options.afterRefresh?.()
+                    afterRefresh: async (alreadyRestarted) => {
+                        await loadPluginsAfterAuthoritativeRestore(alreadyRestarted)
+                        await options.afterRefresh?.(alreadyRestarted)
                     },
                 }
                 const selectedInput = input

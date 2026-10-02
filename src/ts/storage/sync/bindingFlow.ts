@@ -40,6 +40,7 @@ export interface SyncBindingOptions {
     mode?: 'new-device'
 }
 export interface SyncBindingTransport {
+    receiveAvailableChanges?(context: BindingContext): Promise<void>
     inspectTarget(context: BindingContext): Promise<InspectedSyncTarget>
     pullAvailableState(target: InspectedSyncTarget, context: BindingContext): Promise<StagedSyncTarget>
     // Native activation only, called under the exclusive gate. It must not acquire a renderer gate.

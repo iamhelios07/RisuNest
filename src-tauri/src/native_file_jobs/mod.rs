@@ -1888,10 +1888,15 @@ impl NativeFileJobState {
                 | JobKind::RestoreLegacyLocalBackup
                 | JobKind::RestoreOfficialAccountSnapshot
         );
-        let admission = self
-            .admission
-            .file(exclusive)
-            .map_err(|code| NativeJobError::new(code, "Another library operation is running"))?;
+        let upstream_staging = require_restore_finalization
+            && matches!(task.kind(), JobKind::RestoreBlockRisuSave
+                | JobKind::RestoreLegacyLocalBackup | JobKind::RestoreOfficialAccountSnapshot);
+        let admission = if upstream_staging {
+            self.admission.staging()
+        } else {
+            self.admission.file(exclusive)
+        }.map_err(|code| NativeJobError::new(code, "Another library operation is running"))?;
+        let admission = Arc::new(Mutex::new(Some(admission)));
         if let NativeFileJobTask::ExportRawRecovery { app, .. } = &task {
             app.state::<crate::NativeStartupState>()
                 .ensure_ready()
@@ -1931,6 +1936,10 @@ impl NativeFileJobState {
                     ),
             )
             .map_err(|error| NativeJobError::new("store-error", error))?;
+        if upstream_staging {
+            job.set_activation_permit(Arc::downgrade(&admission))
+                .map_err(|error| NativeJobError::new("store-error", error))?;
+        }
         let job_id = job.id();
         let owned_directory = match create_owned_directory(&self.root.join("jobs"), &job_id) {
             Ok(path) => path,
@@ -2001,7 +2010,6 @@ impl NativeFileJobState {
         let root = self.root.clone();
         let registry = Arc::clone(&self.registry);
         std::thread::spawn(move || {
-            let mut admission = Some(admission);
             let _worker_permit = worker_permit;
             let outcome = run_worker(
                 || match task {
@@ -2042,7 +2050,9 @@ impl NativeFileJobState {
                             &job,
                         );
                         drop(capture_guard);
-                        drop(admission.take());
+                        drop(admission.lock().map_err(|_| NativeJobError::new(
+                            "store-error", "Native admission slot is unavailable",
+                        ))?.take());
                         captured.and_then(|captured| {
                             raw_recovery::publish(
                                 captured,
@@ -2263,6 +2273,7 @@ impl NativeFileJobState {
             {
                 cleanup_errors.push(error);
             }
+            release_worker_admission(&admission);
             finish_worker_outcome(&job, kind, outcome, cleanup_errors);
             let _ = registry.prune();
         });
@@ -2758,6 +2769,11 @@ fn create_owned_directory(jobs_root: &Path, job_id: &str) -> Result<PathBuf, Str
             )),
         },
     }
+}
+
+fn release_worker_admission(slot: &Mutex<Option<admission::Permit>>) {
+    let mut owned = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    drop(owned.take());
 }
 
 fn finish_worker_outcome(
@@ -3534,6 +3550,7 @@ struct JobWaitState {
     inline_asset_upload: Option<content::InlineAssetUpload>,
     portable_selection: Option<portable::PortableSelection>,
     restore_finalized: bool,
+    activation_permit: Option<std::sync::Weak<Mutex<Option<admission::Permit>>>>,
     /// Revision the renderer holds its replacement fence at. The renderer is
     /// free to commit while this job reads and stages, so activation, not the
     /// start request, decides which revision the replacement applies to.
@@ -3990,6 +4007,21 @@ impl JobControl {
         Ok(CancelOutcome::Requested)
     }
 
+    fn set_activation_permit(
+        &self,
+        permit: std::sync::Weak<Mutex<Option<admission::Permit>>>,
+    ) -> Result<(), String> {
+        let mut wait = self
+            .wait_state
+            .lock()
+            .map_err(|_| "native job mutex poisoned".to_owned())?;
+        if wait.activation_permit.is_some() || wait.restore_finalized {
+            return Err("native activation permit is already assigned".into());
+        }
+        wait.activation_permit = Some(permit);
+        Ok(())
+    }
+
     fn request_finalize(
         &self,
         expected_revision: Option<i64>,
@@ -4029,6 +4061,12 @@ impl JobControl {
             .map_err(|error| format!("native restore finalization mutex poisoned: {error}"))?;
         if wait.restore_finalized {
             return Ok(FinalizeOutcome::AlreadyRequested);
+        }
+        if let Some(slot) = &wait.activation_permit {
+            let slot = slot.upgrade().ok_or_else(|| "native activation worker exited".to_owned())?;
+            let mut owned = slot.lock().map_err(|_| "native activation permit is unavailable".to_owned())?;
+            owned.as_mut().ok_or_else(|| "native activation permit was released".to_owned())?
+                .upgrade_staging().map_err(|code| code.to_owned())?;
         }
         if expected_revision.is_some() {
             wait.activation_expected_revision = expected_revision;
@@ -5670,6 +5708,121 @@ mod tests {
                 .state,
             JobState::Succeeded,
         );
+    }
+
+    #[test]
+    fn upstream_finalize_upgrades_owned_staging_and_retains_exclusion_after_lost_response() {
+        let registry = Arc::new(JobRegistry::default());
+        let admission = Arc::new(admission::Admission::default());
+        let permit = Arc::new(Mutex::new(Some(admission.staging().unwrap())));
+        let job = registry
+            .create_with_context(JobKind::RestoreBlockRisuSave, Some(3), Vec::new())
+            .unwrap();
+        job.set_activation_permit(Arc::downgrade(&permit)).unwrap();
+        job.start(JobPhase::ReadingSource).unwrap();
+        job.set_phase(JobPhase::StagingDatabase).unwrap();
+        let waiter = Arc::clone(&job);
+        let waited = std::thread::spawn(move || waiter.wait_for_restore_finalization());
+        while job.status().state != JobState::WaitingForInput {
+            std::thread::yield_now();
+        }
+        let receive = admission.server().unwrap();
+        assert!(registry.finalize(&job.id(), Some(9)).is_err());
+        assert_eq!(job.status().state, JobState::WaitingForInput);
+        assert_eq!(job.activation_expected_revision().unwrap(), None);
+        drop(receive);
+        assert_eq!(
+            registry.finalize(&job.id(), Some(9)).unwrap(),
+            FinalizeOutcome::Requested
+        );
+        // Losing the renderer's response neither releases admission nor activates twice.
+        assert!(admission.server().is_err());
+        assert_eq!(
+            registry.finalize(&job.id(), Some(99)).unwrap(),
+            FinalizeOutcome::AlreadyRequested
+        );
+        assert_eq!(waited.join().unwrap(), Ok(Some(9)));
+        assert_eq!(registry.cancel(&job.id()).unwrap(), CancelOutcome::TooLate);
+        assert!(admission.server().is_err());
+        job.finish_success(result(10)).unwrap();
+        drop(permit);
+        assert!(admission.server().is_ok());
+        assert_eq!(
+            registry.finalize(&job.id(), Some(99)).unwrap(),
+            FinalizeOutcome::Terminal
+        );
+    }
+
+    #[test]
+    fn upstream_terminal_receipt_follows_cleanup_and_released_admission() {
+        let registry = Arc::new(JobRegistry::default());
+        let admission = Arc::new(admission::Admission::default());
+        let permit = Arc::new(Mutex::new(Some(admission.staging().unwrap())));
+        permit
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .upgrade_staging()
+            .unwrap();
+        let job = registry
+            .create_with_context(JobKind::RestoreBlockRisuSave, Some(3), Vec::new())
+            .unwrap();
+        job.start(JobPhase::ReadingSource).unwrap();
+        job.set_phase(JobPhase::StagingDatabase).unwrap();
+        let (cleanup_done, allow_cleanup) = std::sync::mpsc::channel();
+        let (released, admission_released) = std::sync::mpsc::channel();
+        let (publish, allow_publish) = std::sync::mpsc::channel();
+        let worker_job = Arc::clone(&job);
+        let worker = std::thread::spawn(move || {
+            allow_cleanup.recv().unwrap();
+            release_worker_admission(&permit);
+            released.send(()).unwrap();
+            allow_publish.recv().unwrap();
+            finish_worker_outcome(
+                &worker_job,
+                JobKind::RestoreBlockRisuSave,
+                Ok(result(4)),
+                Vec::new(),
+            );
+        });
+        assert!(admission.server().is_err());
+        assert_eq!(job.status().state, JobState::Running);
+        cleanup_done.send(()).unwrap();
+        admission_released.recv().unwrap();
+        assert_eq!(job.status().state, JobState::Running);
+        assert!(admission.server().is_ok());
+        publish.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(job.status().state, JobState::Succeeded);
+        assert!(admission.server().is_ok());
+    }
+
+    #[test]
+    fn upstream_cancelled_staging_releases_worker_permit_without_finalizing() {
+        let registry = Arc::new(JobRegistry::default());
+        let admission = Arc::new(admission::Admission::default());
+        let permit = Arc::new(Mutex::new(Some(admission.staging().unwrap())));
+        let job = registry
+            .create_with_context(JobKind::RestoreBlockRisuSave, Some(3), Vec::new())
+            .unwrap();
+        job.set_activation_permit(Arc::downgrade(&permit)).unwrap();
+        job.start(JobPhase::ReadingSource).unwrap();
+        job.set_phase(JobPhase::StagingDatabase).unwrap();
+        let waiter = Arc::clone(&job);
+        let waited = std::thread::spawn(move || waiter.wait_for_restore_finalization());
+        while job.status().state != JobState::WaitingForInput {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            registry.cancel(&job.id()).unwrap(),
+            CancelOutcome::Requested
+        );
+        assert!(waited.join().unwrap().is_err());
+        job.finish_failure("cancelled", "Synthetic cancellation")
+            .unwrap();
+        drop(permit);
+        assert!(admission.file(true).is_ok());
     }
 
     #[test]

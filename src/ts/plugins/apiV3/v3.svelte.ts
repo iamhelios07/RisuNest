@@ -1698,7 +1698,8 @@ export async function invalidatePluginCachesAfterAuthorityReplacement(): Promise
 }
 
 export async function restartPluginsAfterAuthorityReplacement(): Promise<void> {
-    await loadV3Plugins(getDatabase().plugins)
+    const {loadPluginsAfterAuthoritativeRestore} = await import('../plugins.svelte')
+    await loadPluginsAfterAuthoritativeRestore()
 }
 
 export async function loadV3Plugins(plugins:RisuPlugin[]){

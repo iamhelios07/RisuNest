@@ -23,6 +23,7 @@ pub(crate) mod owner_projection;
 pub(crate) mod plugin_owner;
 mod plugin_claim_eligibility;
 pub(crate) mod portable;
+pub(crate) mod portable_identity;
 pub(crate) mod portable_validation;
 mod preservation;
 mod query;
@@ -217,6 +218,8 @@ pub(crate) struct CharacterSummary {
     pub(crate) creator_notes: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) trash_time: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) trash_stamp_ms: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) archived: Option<ArchivedCharacterSummary>,
 }

@@ -22,6 +22,16 @@ describe('committed working-set continuation', () => {
         expect(continuation).toHaveBeenCalledOnce()
     })
 
+    it('retains a critical failed lifecycle and shares concurrent retries',async()=>{
+        const runtime={}
+        const continuation=vi.fn(async()=>{}).mockRejectedValueOnce(new Error('adapter resume failed'))
+        registerCommittedWorkingSetContinuation(11,runtime,3,continuation,undefined,true)
+        await expect(continueCommittedWorkingSetRefresh(11,runtime,3)).rejects.toThrow('adapter resume failed')
+        await Promise.all([continueCommittedWorkingSetRefresh(11,runtime,3),continueCommittedWorkingSetRefresh(11,runtime,3)])
+        await continueCommittedWorkingSetRefresh(11,runtime,3)
+        expect(continuation).toHaveBeenCalledTimes(2)
+    })
+
     it('does not repeat a continuation that fails', async () => {
         const runtime = {}
         const continuation = vi.fn(async () => {

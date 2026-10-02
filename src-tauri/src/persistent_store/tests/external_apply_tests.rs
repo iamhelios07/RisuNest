@@ -250,6 +250,7 @@ fn external_snapshot_restores_archived_character_state_and_payload_references() 
             message_count: 2,
             asset_hashes: vec![asset_object.content_hash.clone()],
             shared_asset_hashes: vec![asset_object.content_hash.clone()],
+            identity_remap: vec![],
             owner_heads: vec![],
         },
     );
