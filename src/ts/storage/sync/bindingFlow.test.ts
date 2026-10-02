@@ -229,12 +229,12 @@ it('unchanged binding with changed native revision cannot release the guard or r
     expect(guarded).toBe(true)
     for (const event of ['restart', 'resume', 'resume-new-device', 'publish']) expect(s.events).not.toContain(event)
 })
-it('successful activated projection completes the guard before new plugin execution and publication', async () => {
+it('successful activated projection holds the guard through fresh plugin restart before publication', async () => {
     const s = setup(); newDeviceTransport(s)
     let guarded = false
     s.deps.beginActivatedLibraryGuard = () => { guarded = true; return { complete() { guarded = false }, async abortUnchanged() { throw Error('unexpected abort') } } }
     s.deps.refreshActivatedLibrary = async () => { expect(guarded).toBe(true); s.events.push('refresh') }
-    s.deps.plugins.restart = async () => { expect(guarded).toBe(false); s.events.push('restart') }
+    s.deps.plugins.restart = async () => { expect(guarded).toBe(true); s.events.push('restart') }
     const resume = s.transport.resumeNewDeviceBinding!
     s.transport.resumeNewDeviceBinding = async (...args) => { expect(guarded).toBe(false); return resume(...args) }
     expect(await s.flow.bind(target, s.transport, { mode: 'new-device' })).toMatchObject({ kind: 'bound', action: 'new-device' })
