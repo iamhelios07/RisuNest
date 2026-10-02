@@ -408,6 +408,8 @@ impl CaptureCatalog {
             return Err(invalid("Capture catalog is not durable"));
         }
         let mut digest = risunest_external_storage_format::format::FingerprintBuilder::new(scope);
+        #[cfg(test)]
+        crate::persistent_store::hash_work::observe("native_external_capture_fingerprint",b"risunest.external-fingerprint/v1\0".len()+32);
         let mut query = self
             .db
             .prepare("SELECT key,hash FROM records ORDER BY key")?;
@@ -422,6 +424,8 @@ impl CaptureCatalog {
             digest
                 .push(&key, &hash)
                 .map_err(|_| invalid("Capture records are not ordered"))?;
+            #[cfg(test)]
+            crate::persistent_store::hash_work::update("native_external_capture_fingerprint",40+key.len());
         }
         Ok(digest.finish())
     }
