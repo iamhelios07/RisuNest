@@ -338,10 +338,64 @@ pub(crate) async fn spool_frozen_remote_body(source:&FrozenBodySource,destinatio
 }
 pub(crate) async fn read_verified_remote_body(root:&Path,hash:&str,cancel:&Cancellation)->Result<Option<Vec<u8>>> {
     let temporary=tempfile::tempdir().map_err(local)?;
-    let Some(file)=spool_verified_remote_body(root,hash,temporary.path(),cancel).await? else {return Ok(None)};
-    Ok(Some(std::fs::read(file.path()).map_err(local)?))
+    let Some(source)=freeze_remote_body(root,hash)? else {return Ok(None)};
+    let file=spool_frozen_remote_body(&source,temporary.path(),cancel).await?;
+    read_frozen_body_spool(&source,&file,cancel).map(Some)
+}
+pub(crate) fn read_frozen_body_spool(source:&FrozenBodySource,file:&tempfile::NamedTempFile,cancel:&Cancellation)->Result<Vec<u8>> {
+    use std::io::Read;
+    cancel.check()?;
+    let hash=match source {FrozenBodySource::Standalone(source)=>&source.hash,FrozenBodySource::Packed(source)=>&source.hash};
+    risunest_sync_wire::validate_hash(hash).map_err(local)?;
+    #[cfg(test)]
+    let _scope=crate::asset_repository::body_io::object_scope(hash);
+    let input=crate::trust_boundary::open_regular_source(file.path());
+    #[cfg(test)]
+    crate::asset_repository::body_io::open_result("managed",&input);
+    let input=input.map_err(local)?;
+    if input.metadata().map_err(local)?.len()!=source.byte_length() {return Err(segment::corrupt());}
+    #[cfg(test)]
+    let mut input=crate::asset_repository::body_io::TrackedBodyFile::new(input,hash);
+    #[cfg(not(test))]
+    let mut input=input;
+    let mut bytes=Vec::new();
+    bytes.try_reserve_exact(usize::try_from(source.byte_length()).map_err(local)?).map_err(local)?;
+    let mut chunk=[0u8;64*1024];
+    loop {
+        cancel.check()?;
+        let count=input.read(&mut chunk).map_err(local)?;
+        if count==0 {break;}
+        bytes.extend_from_slice(&chunk[..count]);
+        if bytes.len() as u64>source.byte_length() {return Err(segment::corrupt());}
+    }
+    if bytes.len() as u64!=source.byte_length() {return Err(segment::corrupt());}
+    cancel.check()?;
+    Ok(bytes)
 }
 async fn fetch_missing(root:&Path,hash:&str,cancel:&Cancellation)->Result<Option<Vec<u8>>> {read_verified_remote_body(root,hash,cancel).await}
+#[cfg(test)]
+mod frozen_spool_tests {
+    use super::*;
+    use std::io::Write;
+    #[test]
+    fn frozen_spool_read_observes_actual_asset_open_and_bytes() {
+        let bytes=b"synthetic captured remote body";
+        let hash=risunest_sync_wire::hash(bytes);
+        let source=FrozenBodySource::Standalone(Source {
+            hash:hash.clone(),library_id:"synthetic-library".into(),connection_id:"synthetic-connection".into(),
+            connection_root:PathBuf::new(),protected_segment:"synthetic-segment".into(),
+            body:LargeBody {object_id:"synthetic-body".into(),sha256:hash.clone(),byte_length:(bytes.len() as u64).into(),plaintext_byte_length:(bytes.len() as u64).into(),locator:None},
+        });
+        let mut file=tempfile::NamedTempFile::new().unwrap();file.write_all(bytes).unwrap();
+        crate::asset_repository::body_io::reset_body_io();
+        crate::asset_repository::body_io::register_object_purpose(&hash,crate::asset_repository::body_io::BodyPurpose::Asset);
+        assert_eq!(read_frozen_body_spool(&source,&file,&Cancellation::default()).unwrap(),bytes);
+        let observed=crate::asset_repository::body_io::take_body_io();
+        assert!(observed.complete());
+        assert_eq!(observed.asset_work().opens,1);
+        assert_eq!(observed.asset_work().read_bytes,bytes.len() as u64);
+    }
+}
 async fn remote_source(
     root: &Path,
     hash: &str,
