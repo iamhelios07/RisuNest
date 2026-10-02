@@ -7,6 +7,17 @@ pub struct HashDomain {
     pub bytes: u64,
 }
 
+#[derive(Clone,Debug,Default,Serialize,Deserialize,PartialEq,Eq)]
+pub struct PublicationDomain {
+    pub attempts:u64,pub successes:u64,pub already_exists:u64,pub failures:u64,pub object_bytes:u64,
+}
+impl PublicationDomain {
+    fn add(&mut self,other:&Self)->Result<(),String> {
+        macro_rules! fields {($($field:ident),*)=>{$(self.$field=self.$field.checked_add(other.$field).ok_or("publication contribution overflow")?;)*}}
+        fields!(attempts,successes,already_exists,failures,object_bytes);Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BodyDomain {
     pub open_attempts: u64,
@@ -23,6 +34,12 @@ pub struct BodyDomain {
     pub identity_metadata_opens:u64,
     pub identity_metadata_failed_opens:u64,
     pub verified_identity_metadata_opens:u64,
+    pub staging_write_attempts:u64,pub staging_writes:u64,pub staging_failed_writes:u64,
+    pub staging_requested_bytes:u64,pub staging_written_bytes:u64,pub incomplete_writes:u64,
+    pub publication_attempts:u64,pub publications:u64,pub publication_already_exists:u64,
+    pub publication_failures:u64,pub publication_object_bytes:u64,
+    pub publication_kinds:BTreeMap<String,PublicationDomain>,
+    pub body_sha:BTreeMap<String,HashDomain>,
 }
 
 impl BodyDomain {
@@ -32,13 +49,43 @@ impl BodyDomain {
         add!(open_attempts,opens,failed_opens,unknown_open_results,read_operations,read_bytes,
             incomplete_reads,escaped_handles,escaped_paths,outstanding_readers,
             identity_metadata_open_attempts,identity_metadata_opens,identity_metadata_failed_opens,
-            verified_identity_metadata_opens);
+            verified_identity_metadata_opens,staging_write_attempts,staging_writes,staging_failed_writes,
+            staging_requested_bytes,staging_written_bytes,incomplete_writes,publication_attempts,publications,
+            publication_already_exists,publication_failures,publication_object_bytes);
+        for (kind,work) in &work.publication_kinds {self.publication_kinds.entry(kind.clone()).or_default().add(work)?;}
+        for (name,work) in &work.body_sha {
+            let total=self.body_sha.entry(name.clone()).or_default();
+            total.calls=total.calls.checked_add(work.calls).ok_or("body SHA call overflow")?;
+            total.bytes=total.bytes.checked_add(work.bytes).ok_or("body SHA byte overflow")?;
+        }
         Ok(())
     }
     fn complete(&self)->bool {
         self.failed_opens==0 && self.unknown_open_results==0 && self.incomplete_reads==0
             && self.escaped_handles==0 && self.escaped_paths==0 && self.outstanding_readers==0
             && self.identity_metadata_failed_opens==0 && self.open_attempts==self.opens
+            && self.staging_failed_writes==0 && self.incomplete_writes==0 && self.staging_write_attempts==self.staging_writes
+            && self.staging_requested_bytes==self.staging_written_bytes && self.publication_failures==0
+            && self.publication_attempts==self.publications.checked_add(self.publication_already_exists).unwrap_or(u64::MAX)
+            && self.publication_conservation().is_ok()
+    }
+    fn publication_conservation(&self)->Result<(),String> {
+        let mut total=PublicationDomain::default();
+        for (kind,work) in &self.publication_kinds {
+            if !matches!(kind.as_str(),"hard-link"|"rename") || work.failures!=0
+                || work.attempts!=work.successes.checked_add(work.already_exists).ok_or("publication result overflow")? {
+                return Err("unrecognized or incomplete publication operation".into());
+            }
+            total.add(work)?;
+        }
+        if (total.attempts,total.successes,total.already_exists,total.failures,total.object_bytes)
+            !=(self.publication_attempts,self.publications,self.publication_already_exists,self.publication_failures,self.publication_object_bytes) {
+            return Err("publication kinds do not conserve actual summary".into());
+        }
+        if self.body_sha.keys().any(|name|!matches!(name.as_str(),"cas_stage"|"cas_import_adopt"|"cas_existing_verify")) {
+            return Err("unknown native body SHA boundary".into());
+        }
+        Ok(())
     }
     fn identity_only(&self)->bool {
         self.complete() && self.read_operations==0 && self.read_bytes==0
@@ -52,6 +99,10 @@ pub struct ObjectBodyDomain {
     pub purposes: Vec<String>,
     pub work: BodyDomain,
     pub owned_work: BodyDomain,
+}
+#[derive(Clone,Debug,Serialize,Deserialize)]
+pub struct NativeWorkerHashReceipt {
+    pub thread:String,pub domains:BTreeMap<String,HashDomain>,pub incomplete:Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -80,6 +131,10 @@ pub struct NativeObservation {
     pub body_unattributed_managed: BodyDomain,
     pub body_unattributed_owned: BodyDomain,
     pub body_pending_owned_identities:u64,
+    pub body_pending_hashes:u64,pub body_pending_worker_scopes:u64,pub body_worker_scopes_started:u64,
+    pub body_worker_scopes_settled:u64,pub body_worker_threads:Vec<String>,
+    pub native_caller_hashes:Option<BTreeMap<String,HashDomain>>,
+    pub native_worker_hash_receipts:Vec<NativeWorkerHashReceipt>,
     pub body_scope_violations: u64,
     pub body_stat_requests: u64,
     pub body_batch_stat_requests: u64,
@@ -118,6 +173,10 @@ impl NativeObservation {
             || self.body_unattributed_managed != BodyDomain::default()
             || self.body_unattributed_owned != BodyDomain::default()
             || self.body_pending_owned_identities != 0
+            || self.body_pending_hashes!=0 || self.body_pending_worker_scopes!=0
+            || self.body_worker_scopes_started!=self.body_worker_scopes_settled
+            || self.body_worker_scopes_started!=0 || !self.body_worker_threads.is_empty()
+            || !self.native_worker_hash_receipts.is_empty()
             || self.body_objects.values().any(|object| object.purposes.is_empty()
                 && (object.work != BodyDomain::default() || object.owned_work != BodyDomain::default()))
             || self.body_domains.values().chain(self.body_objects.values().map(|object| &object.work))
@@ -125,7 +184,14 @@ impl NativeObservation {
             !domain.complete()) {
             return Err("incomplete or unobserved CAS body scope".into());
         }
-        self.validate_body_conservation()?;
+        self.validate_body_conservation(true)?;
+        if self.body_asset_work!=BodyDomain::default() {return Err("routine Asset read/write/publication/SHA work is nonzero".into());}
+        let mut body_sha=BodyDomain::default();
+        for domain in self.body_domains.values() {body_sha.add(domain)?;}
+        for (name,work) in body_sha.body_sha {
+            let actual=self.hashes.get(&format!("native/{name}")).cloned().unwrap_or_default();
+            if work.calls>actual.calls || work.bytes>actual.bytes {return Err("per-object body SHA is not an actual native SHA subset".into());}
+        }
         if self.asset_body_opens != Some(self.body_asset_work.open_attempts)
             || self.asset_body_bytes_read != Some(self.body_asset_work.read_bytes) {
             return Err("inconsistent asset-purpose body totals".into());
@@ -148,7 +214,55 @@ impl NativeObservation {
         Ok(())
     }
 
-    fn validate_body_conservation(&self)->Result<(),String> {
+    /// Costly operations allow declared Asset work, but cannot omit worker-native SHA receipts.
+    pub fn validate_costly_native_coverage(&self)->Result<(),String> {
+        self.hash_totals()?;
+        if self.body_scope_complete!=Some(true) || self.body_scope_violations!=0
+            || self.body_pending_owned_identities!=0 || self.body_pending_hashes!=0 || self.body_pending_worker_scopes!=0
+            || self.body_worker_scopes_started!=self.body_worker_scopes_settled
+            || self.body_unknown_work!=BodyDomain::default() || self.body_unattributed_managed!=BodyDomain::default()
+            || self.body_unattributed_owned!=BodyDomain::default()
+            || self.body_domains.values().chain(self.body_objects.values().flat_map(|object|[&object.work,&object.owned_work]))
+                .any(|work|!work.complete()) {return Err("costly native body scope incomplete".into());}
+        self.validate_body_conservation(false)?;
+        let caller=self.native_caller_hashes.as_ref().ok_or("native caller SHA receipt unobserved")?;
+        let mut expected=caller.clone();let mut workers=std::collections::BTreeSet::new();
+        for worker in &self.native_worker_hash_receipts {
+            if worker.thread.is_empty() || !worker.incomplete.is_empty() {return Err("native worker SHA receipt incomplete".into());}
+            workers.insert(worker.thread.clone());
+            for (name,work) in &worker.domains {
+                let total=expected.entry(name.clone()).or_default();
+                total.calls=total.calls.checked_add(work.calls).ok_or("worker SHA call overflow")?;
+                total.bytes=total.bytes.checked_add(work.bytes).ok_or("worker SHA byte overflow")?;
+            }
+        }
+        if self.native_worker_hash_receipts.len() as u64!=self.body_worker_scopes_settled
+            || workers.into_iter().collect::<Vec<_>>()!=self.body_worker_threads
+            || self.body_worker_threads.windows(2).any(|p|p[0]>=p[1]) {
+            return Err("native worker SHA receipts do not cover actual entered body scopes".into());
+        }
+        let actual=self.hashes.iter().filter_map(|(name,work)|name.strip_prefix("native/").map(|name|(name.to_owned(),work.clone())))
+            .collect::<BTreeMap<_,_>>();
+        if expected!=actual {return Err("native caller plus worker SHA receipts do not conserve native totals".into());}
+        self.validate_body_sha_subset()
+    }
+    fn validate_body_sha_subset(&self)->Result<(),String> {
+        let mut total=BodyDomain::default();for work in self.body_domains.values() {total.add(work)?;}
+        for (name,work) in total.body_sha {
+            let actual=self.hashes.get(&format!("native/{name}")).cloned().unwrap_or_default();
+            if work.calls>actual.calls || work.bytes>actual.bytes {return Err("per-object body SHA exceeds full native SHA receipts".into());}
+        }Ok(())
+    }
+    pub fn attach_worker_hash_receipt(&mut self,receipt:NativeWorkerHashReceipt)->Result<(),String> {
+        for (name,work) in &receipt.domains {
+            let total=self.hashes.entry(format!("native/{name}")).or_default();
+            total.calls=total.calls.checked_add(work.calls).ok_or("native worker SHA call overflow")?;
+            total.bytes=total.bytes.checked_add(work.bytes).ok_or("native worker SHA byte overflow")?;
+        }
+        for incomplete in &receipt.incomplete {self.incomplete.push(format!("native-worker/{}:{incomplete}",receipt.thread));}
+        self.native_worker_hash_receipts.push(receipt);Ok(())
+    }
+    fn validate_body_conservation(&self,routine:bool)->Result<(),String> {
         let mut managed=BodyDomain::default();let mut owned=BodyDomain::default();
         let mut control=BodyDomain::default();let mut asset=BodyDomain::default();
         let mut unknown=BodyDomain::default();
@@ -160,9 +274,21 @@ impl NativeObservation {
             }
             managed.add(&object.work)?;owned.add(&object.owned_work)?;
             let exclusive_control=object.purposes.len()==1 && object.purposes[0]=="Control";
-            if object.owned_work!=BodyDomain::default()
+            if routine && object.owned_work!=BodyDomain::default()
                 && (!exclusive_control || !object.owned_work.identity_only()) {
-                return Err("owned IO is not exclusively verified Control identity metadata".into());
+                return Err("owned opens lack exclusive Control identity metadata proof".into());
+            }
+            if routine && exclusive_control {
+                let staged=object.owned_work.body_sha.get("cas_stage").cloned().unwrap_or_default();
+                if staged.bytes!=object.owned_work.staging_written_bytes
+                    || (staged.calls==0)!=(object.owned_work.staging_writes==0)
+                    || staged.calls>object.owned_work.staging_writes
+                    || object.work.staging_write_attempts!=0
+                    || object.work.body_sha.get("cas_stage").is_some_and(|work|work!=&HashDomain::default())
+                    || object.work.body_sha.get("cas_import_adopt").is_some_and(|work|work!=&HashDomain::default())
+                    || object.owned_work.body_sha.get("cas_import_adopt").is_some_and(|work|work!=&HashDomain::default()) {
+                    return Err("routine Control staging does not conserve actual validated stage SHA inputs".into());
+                }
             }
             let classified=if object.purposes.iter().any(|v|v=="Asset") {&mut asset}
                 else if exclusive_control {&mut control} else {&mut unknown};
@@ -210,6 +336,8 @@ pub struct DomainAttribution {
 pub struct FrozenGrowthProof {
     pub aggregate_control_growth:u64,
     pub domains:Vec<DomainAttribution>,
+    pub baseline_control_body_work:BodyDomain,
+    pub trial_control_body_work:BodyDomain,
 }
 
 fn verify_input_collection(evidence:&super::invalid_diagnostics::ReceiveIntentEvidence,
@@ -287,7 +415,22 @@ pub fn assert_frozen_growth(a:&NativeObservation,b:&NativeObservation) -> Result
     a.validate_routine_invariants()?;
     b.validate_routine_invariants()?;
     if b.units_visited>a.units_visited || b.requests>a.requests {return Err("unit/request growth".into());}
-    let mut proof=FrozenGrowthProof {aggregate_control_growth:0,domains:Vec::new()};
+    let mut proof=FrozenGrowthProof {aggregate_control_growth:0,domains:Vec::new(),
+        baseline_control_body_work:a.body_control_work.clone(),trial_control_body_work:b.body_control_work.clone()};
+    macro_rules! bounded {($($field:ident),*)=>{$(if b.body_control_work.$field>a.body_control_work.$field {
+        return Err(format!("unrelated-library Control body growth: {}",stringify!($field)));})*};}
+    bounded!(open_attempts,opens,read_operations,read_bytes,identity_metadata_open_attempts,identity_metadata_opens,
+        verified_identity_metadata_opens,staging_write_attempts,staging_writes,staging_requested_bytes,staging_written_bytes,
+        publication_attempts,publications,publication_already_exists,publication_object_bytes);
+    for (kind,larger) in &b.body_control_work.publication_kinds {
+        let smaller=a.body_control_work.publication_kinds.get(kind).cloned().unwrap_or_default();
+        if larger.attempts>smaller.attempts || larger.successes>smaller.successes || larger.already_exists>smaller.already_exists
+            || larger.object_bytes>smaller.object_bytes {return Err("unrelated-library Control publication growth".into());}
+    }
+    for (name,larger) in &b.body_control_work.body_sha {
+        let smaller=a.body_control_work.body_sha.get(name).cloned().unwrap_or_default();
+        if larger.calls>smaller.calls || larger.bytes>smaller.bytes {return Err("unrelated-library Control body SHA growth".into());}
+    }
     for (domain,leaf,kind,left,right) in [
         ("native/native_receive_intent","/progress/cursor","string",a.receive_intents.as_ref(),b.receive_intents.as_ref()),
         ("native/native_intent","/commit/expectedRevision","number",a.commit_intents.as_ref(),b.commit_intents.as_ref())] {
@@ -310,6 +453,50 @@ pub fn assert_frozen_growth(a:&NativeObservation,b:&NativeObservation) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn costly_native_sha_needs_every_actual_worker_receipt_without_double_counting() {
+        let mut sample=NativeObservation {body_scope_complete:Some(true),native_caller_hashes:Some(BTreeMap::new()),
+            body_worker_scopes_started:1,body_worker_scopes_settled:1,body_worker_threads:vec!["ThreadId(7)".into()],..Default::default()};
+        assert!(sample.validate_costly_native_coverage().is_err());
+        sample.attach_worker_hash_receipt(NativeWorkerHashReceipt {thread:"ThreadId(7)".into(),
+            domains:BTreeMap::from([("native_unit_envelope".into(),HashDomain {calls:1,bytes:100})]),incomplete:vec![]}).unwrap();
+        sample.validate_costly_native_coverage().unwrap();assert_eq!(sample.hash_totals().unwrap().bytes,100);
+        let valid=sample.clone();sample.hashes.get_mut("native/native_unit_envelope").unwrap().bytes=200;
+        assert!(sample.validate_costly_native_coverage().is_err());
+        sample=valid.clone();sample.native_worker_hash_receipts[0].thread="ThreadId(8)".into();assert!(sample.validate_costly_native_coverage().is_err());
+        sample=valid.clone();sample.native_worker_hash_receipts[0].incomplete.push("partial input".into());assert!(sample.validate_costly_native_coverage().is_err());
+        sample=valid.clone();sample.body_pending_worker_scopes=1;assert!(sample.validate_costly_native_coverage().is_err());
+        sample=valid;sample.native_caller_hashes=None;assert!(sample.validate_costly_native_coverage().is_err());
+    }
+    #[test]
+    fn control_stage_and_publication_are_distinct_conserved_sha_subset_evidence() {
+        let owned=BodyDomain {open_attempts:2,opens:2,identity_metadata_open_attempts:2,identity_metadata_opens:2,
+            verified_identity_metadata_opens:2,staging_write_attempts:2,staging_writes:2,staging_requested_bytes:7,staging_written_bytes:7,
+            body_sha:BTreeMap::from([("cas_stage".into(),HashDomain {calls:1,bytes:7})]),..Default::default()};
+        let managed=BodyDomain {publication_attempts:1,publications:1,publication_object_bytes:7,
+            publication_kinds:BTreeMap::from([("hard-link".into(),PublicationDomain {attempts:1,successes:1,object_bytes:7,..Default::default()})]),
+            ..Default::default()};
+        let mut total=owned.clone();total.add(&managed).unwrap();
+        let mut sample=NativeObservation {asset_body_opens:Some(0),asset_body_bytes_read:Some(0),shared_head_reads:Some(0),body_scope_complete:Some(true),
+            body_control_work:total,body_owned_work:owned.clone(),body_domains:BTreeMap::from([("managed".into(),managed.clone()),("owned".into(),owned.clone())]),
+            body_objects:BTreeMap::from([("ab".repeat(32),ObjectBodyDomain {purposes:vec!["Control".into()],work:managed,owned_work:owned})]),
+            hashes:BTreeMap::from([("native/cas_stage".into(),HashDomain {calls:1,bytes:7})]),..Default::default()};
+        sample.validate_routine_invariants().unwrap();assert_frozen_growth(&sample,&sample).unwrap();
+        let valid=sample.clone();sample.hashes.get_mut("native/cas_stage").unwrap().bytes=6;assert!(sample.validate_routine_invariants().is_err());
+        sample=valid.clone();sample.body_objects.values_mut().next().unwrap().owned_work.staging_written_bytes=8;assert!(sample.validate_routine_invariants().is_err());
+        sample=valid.clone();sample.body_domains.get_mut("managed").unwrap().publication_kinds.clear();assert!(sample.validate_routine_invariants().is_err());
+        sample=valid.clone();sample.body_worker_scopes_started=1;sample.body_worker_scopes_settled=1;assert!(sample.validate_routine_invariants().is_err());
+        sample=valid.clone();let object=sample.body_objects.values_mut().next().unwrap();object.purposes=vec!["Asset".into(),"Control".into()];
+        sample.body_asset_work=sample.body_control_work.clone();sample.body_control_work=BodyDomain::default();assert!(sample.validate_routine_invariants().is_err());
+        sample=valid.clone();sample.body_objects.values_mut().next().unwrap().work.publication_kinds.get_mut("hard-link").unwrap().object_bytes=8;
+        assert!(sample.validate_routine_invariants().is_err());
+        let mut grown=valid.clone();grown.hashes.get_mut("native/cas_stage").unwrap().bytes=8;
+        for work in [&mut grown.body_control_work,&mut grown.body_owned_work,grown.body_domains.get_mut("owned").unwrap(),
+            &mut grown.body_objects.values_mut().next().unwrap().owned_work] {
+            work.staging_requested_bytes=8;work.staging_written_bytes=8;work.body_sha.get_mut("cas_stage").unwrap().bytes=8;
+        }
+        grown.validate_routine_invariants().unwrap();assert!(assert_frozen_growth(&valid,&grown).is_err());
+    }
     #[test]
     fn incomplete_and_unobserved_inputs_cannot_pass() {
         let mut sample = NativeObservation::default();

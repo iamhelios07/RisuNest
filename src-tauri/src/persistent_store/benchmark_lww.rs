@@ -17,6 +17,9 @@ mod measurement;
 mod final_runner;
 #[path = "../../../benchmarks/lww-native/src/fixture_configuration.rs"]
 mod fixture_configuration;
+#[allow(dead_code)]
+#[path = "../../../benchmarks/lww-native/src/native_bootstrap.rs"]
+mod native_bootstrap;
 
 use super::{lww::{self, MessageLocator, UnitMutation}, sync_selection::{SwitchBindingRequest, SyncTarget},
     ConversationMutation, PersistentStore, WorkingSetCommit};
@@ -149,6 +152,8 @@ fn take_work(external: bool) -> NativeObservation {
     // The second tuple field is an alias of native_unit_envelope, not another domain.
     result.units_visited = lww::take_work_metrics().0;
     let native = super::hash_work::take_hash_work();
+    result.native_caller_hashes=Some(native.domains.iter().map(|(key,work)|(key.to_string(),native_observation::HashDomain {
+        calls:work.calls,bytes:work.bytes})).collect());
     for (key, work) in native.domains { result.insert_domain("native", key, work.calls, work.bytes); }
     for (key, count) in native.incomplete {
         result.incomplete.push(format!("native/{key}: {count}"));
@@ -184,6 +189,11 @@ fn take_work(external: bool) -> NativeObservation {
     result.body_unattributed_managed = body_domain(bodies.unattributed_managed.clone());
     result.body_unattributed_owned = body_domain(bodies.unattributed_owned.clone());
     result.body_pending_owned_identities = bodies.pending_owned_identities;
+    result.body_pending_hashes=bodies.pending_body_hashes;
+    result.body_pending_worker_scopes=bodies.pending_worker_scopes;
+    result.body_worker_scopes_started=bodies.worker_scopes_started;
+    result.body_worker_scopes_settled=bodies.worker_scopes_settled;
+    result.body_worker_threads=bodies.worker_threads.iter().cloned().collect();
     result.body_scope_violations = bodies.scope_violations;
     result.asset_body_opens = Some(result.body_asset_work.open_attempts);
     result.asset_body_bytes_read = Some(result.body_asset_work.read_bytes);
@@ -233,7 +243,16 @@ fn body_domain(work:crate::asset_repository::body_io::BodyWork) -> BodyDomain {
         identity_metadata_open_attempts:work.identity_metadata_open_attempts,
         identity_metadata_opens:work.identity_metadata_opens,
         identity_metadata_failed_opens:work.identity_metadata_failed_opens,
-        verified_identity_metadata_opens:work.verified_identity_metadata_opens}
+        verified_identity_metadata_opens:work.verified_identity_metadata_opens,
+        staging_write_attempts:work.staging_write_attempts,staging_writes:work.staging_writes,
+        staging_failed_writes:work.staging_failed_writes,staging_requested_bytes:work.staging_requested_bytes,
+        staging_written_bytes:work.staging_written_bytes,incomplete_writes:work.incomplete_writes,
+        publication_attempts:work.publication_attempts,publications:work.publications,
+        publication_already_exists:work.publication_already_exists,publication_failures:work.publication_failures,
+        publication_object_bytes:work.publication_object_bytes,
+        publication_kinds:work.publication_kinds.into_iter().map(|(kind,value)|(kind.into(),native_observation::PublicationDomain {
+            attempts:value.attempts,successes:value.successes,already_exists:value.already_exists,failures:value.failures,object_bytes:value.object_bytes})).collect(),
+        body_sha:work.body_sha.into_iter().map(|(name,value)|(name.into(),native_observation::HashDomain {calls:value.calls,bytes:value.bytes})).collect()}
 }
 
 fn require_routine_observation(observation:&NativeObservation, transport:&str,
@@ -304,7 +323,36 @@ fn verify(store: &PersistentStore, change: SmallChange, expected: &Value) {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum AdditionalChange { Persona, MiddleEdit, Insertion, Deletion, Oversized, Burst }
+pub(crate) enum AdditionalChange { Persona, MiddleEdit, Insertion, Deletion, Oversized, Burst, Sparse }
+
+fn sparse_message(mut message:Value,marker:&str)->Result<Value,String> {
+    for nonce in 0..1024u32 {
+        message["data"]=json!(format!("Synthetic sparse message {marker}-{nonce}"));
+        let bytes=risunest_sync_wire::payload_value::encode(&message).map_err(|e|e.to_string())?;
+        let hash=risunest_external_storage_format::message_pages::MessageHash::from_bytes(&bytes);
+        if !hash.boundary().map_err(|e|e.to_string())? {return Ok(message);}
+    }
+    Err("bounded sparse message search exhausted".into())
+}
+
+/// Fixture preparation is committed and transported before routine counters begin.
+fn prepare_sparse_fixture(store:&PersistentStore)->Result<PreparedAdditionalChange,String> {
+    let conversation=store.read_conversation("synthetic-character-0","synthetic-conversation-0",None)
+        .map_err(|e|e.to_string())?.ok_or("sparse fixture conversation absent")?.value;
+    let prior=conversation["message"].as_array().ok_or("sparse fixture messages absent")?;
+    if !(4096..=8192).contains(&prior.len()) {return Err("sparse fixed conversation is outside declared bounds".into());}
+    let messages=prior.iter().enumerate().map(|(index,message)|sparse_message(message.clone(),&index.to_string()))
+        .collect::<Result<Vec<_>,_>>()?;
+    let commit=WorkingSetCommit {expected_revision:store.revision().map_err(|e|e.to_string())?,
+        binding_authority:Some(store.lww_binding_authority().map_err(|e|e.to_string())?),
+        request_id:Some(uuid::Uuid::new_v4().to_string()),
+        conversations:Some(vec![ConversationMutation::ReplaceRange {
+            character_id:"synthetic-character-0".into(),conversation_id:"synthetic-conversation-0".into(),
+            start:0,delete_count:prior.len() as i64,messages:messages.clone(),conversation:None,configured_index:None}]),
+        messages_changed:Some(vec![MessageLocator {character_id:"synthetic-character-0".into(),
+            conversation_id:"synthetic-conversation-0".into(),start:Some(0)}]),..Default::default()};
+    Ok(PreparedAdditionalChange {commits:vec![commit],expected_root:Default::default(),expected_messages:Some(messages)})
+}
 
 pub(crate) struct PreparedAdditionalChange {
     pub commits:Vec<WorkingSetCommit>,
@@ -345,7 +393,7 @@ pub(crate) fn prepare_additional_change(store:&PersistentStore, change:Additiona
             }
             prepared.expected_root.insert("loreBookDepth".into(),json!(initial.checked_add(16).unwrap()));
         },
-        AdditionalChange::MiddleEdit | AdditionalChange::Insertion | AdditionalChange::Deletion | AdditionalChange::Oversized => {
+        AdditionalChange::MiddleEdit | AdditionalChange::Insertion | AdditionalChange::Deletion | AdditionalChange::Oversized | AdditionalChange::Sparse => {
             let conversation = store.read_conversation("synthetic-character-0","synthetic-conversation-0",None)
                 .unwrap().unwrap().value;
             let mut expected = conversation["message"].as_array().unwrap().clone();
@@ -360,9 +408,17 @@ pub(crate) fn prepare_additional_change(store:&PersistentStore, change:Additiona
                     expected[index]=message.clone();
                     (1,vec![message])
                 },
-                AdditionalChange::Insertion => {
-                    let message = json!({"role":"user","data":"Fixed synthetic inserted message",
+                AdditionalChange::Insertion | AdditionalChange::Sparse => {
+                    let mut message = json!({"role":"user","data":"Fixed synthetic inserted message",
                         "chatId":format!("synthetic-insert-{direction:?}-{iteration}")});
+                    if matches!(change,AdditionalChange::Sparse) {
+                        message["chatId"]=json!(format!("synthetic-sparse-insert-{direction:?}-{iteration}"));
+                        for existing in &expected {
+                            let bytes=risunest_sync_wire::payload_value::encode(existing).unwrap();
+                            assert!(!risunest_external_storage_format::message_pages::MessageHash::from_bytes(&bytes).boundary().unwrap());
+                        }
+                        message=sparse_message(message,&format!("insert-{direction:?}-{iteration}")).unwrap();
+                    }
                     expected.insert(index,message.clone());
                     (0,vec![message])
                 },
@@ -410,6 +466,7 @@ fn prepare_final_change(store:&PersistentStore,scenario:measurement::Scenario,
     let additional=match scenario {Scenario::PersonaSwitch=>AdditionalChange::Persona,Scenario::MiddleEdit=>AdditionalChange::MiddleEdit,
         Scenario::Insertion=>AdditionalChange::Insertion,Scenario::Deletion=>AdditionalChange::Deletion,
         Scenario::OversizedMessage=>AdditionalChange::Oversized,Scenario::Burst=>AdditionalChange::Burst,
+        Scenario::SparseBoundary=>AdditionalChange::Sparse,
         _=>return Err("scenario requires an unverified production endpoint".into())};
     Ok(prepare_additional_change(store,additional,direction,iteration))
 }
@@ -472,6 +529,13 @@ fn final_post_scope_errors_and_assertions_preserve_actual_observation() {
 fn final_server_cycle(source:&mut PersistentStore,destination:&mut PersistentStore,sender:&LwwClient,receiver:&LwwClient,
     asset_hashes:&[String],scenario:measurement::Scenario,direction:final_runner::Direction,iteration:u32,warmup:bool)
     ->Result<final_runner::RoutineSample,final_runner::CycleFailure> {
+    if scenario==measurement::Scenario::SparseBoundary && iteration==0 {
+        let setup=prepare_sparse_fixture(source)?;
+        for commit in &setup.commits {source.commit(commit).map_err(|e|e.to_string())?;}
+        server_sync::lww_tests::drain_publications(sender,source,&[]).map_err(|e|format!("{e:?}"))?;
+        server_sync::lww_tests::receive_available(receiver,destination,&[]).map_err(|e|format!("{e:?}"))?;
+        verify_additional_change(destination,&setup);
+    }
     let prepared=prepare_final_change(source,scenario,final_direction(direction),iteration.into())?;
     let io=[sender.client.test_io.as_ref().ok_or("sender HTTP observer absent")?,
         receiver.client.test_io.as_ref().ok_or("receiver HTTP observer absent")?];
@@ -520,6 +584,15 @@ async fn final_external_cycle(source:&mut PersistentStore,destination:&mut Persi
     receiver:&mut crate::external_storage::lww_engine::ExternalLwwEngine,
     provider:&crate::external_storage::fake::FakeProvider,asset_hashes:&[String],scenario:measurement::Scenario,
     direction:final_runner::Direction,iteration:u32,warmup:bool)->Result<final_runner::RoutineSample,final_runner::CycleFailure> {
+    if scenario==measurement::Scenario::SparseBoundary && iteration==0 {
+        let setup=prepare_sparse_fixture(source)?;
+        for commit in &setup.commits {source.commit(commit).map_err(|e|e.to_string())?;}
+        sender.publish(source,source.lww_binding_authority().map_err(|e|e.to_string())?,&[],&Cancellation::default())
+            .await.map_err(|e|e.to_string())?;
+        receiver.receive_and_apply(destination,destination.lww_binding_authority().map_err(|e|e.to_string())?,&[],&Cancellation::default())
+            .await.map_err(|e|e.to_string())?;
+        verify_additional_change(destination,&setup);verify_settled(source,sender);verify_settled(destination,receiver);
+    }
     let prepared=prepare_final_change(source,scenario,final_direction(direction),iteration.into())?;
     let requests_before=provider.read_count()+provider.upload_count()+provider.listing_count();
     let bytes_before=provider.transferred_body_bytes();let heads_before=provider.read_attempts("head");
@@ -822,6 +895,62 @@ fn final_server_resume_endpoint(source:&mut PersistentStore,sender:&LwwClient,de
     verify(&destination,SmallChange::Setting,&expected);
     Ok((destination,receiver,final_runner::NativeResumeSample {direction,iteration,warmup,reopened_ms,receiver_durable_ack_ms,
         missed_published_keys,affected_keys:key_set(completion.result.affected_keys),observation}))
+    })
+}
+
+pub(crate) async fn final_external_resume_endpoint(source:&mut PersistentStore,
+    sender:&mut crate::external_storage::lww_engine::ExternalLwwEngine,destination:PersistentStore,
+    receiver:crate::external_storage::lww_engine::ExternalLwwEngine,provider:&crate::external_storage::fake::FakeProvider,
+    asset_hashes:&[String],direction:final_runner::Direction,iteration:u32,warmup:bool)
+    ->Result<(PersistentStore,crate::external_storage::lww_engine::ExternalLwwEngine,final_runner::NativeResumeSample),final_runner::CycleFailure> {
+    use crate::external_storage::lww_engine::{ExternalLwwEngine,cycle_keys};
+    let root=destination.repository_root().to_owned();
+    let writer=destination.lww_clock_state().map_err(|e|e.to_string())?.writer_id;
+    let authority=destination.lww_binding_authority().map_err(|e|e.to_string())?;
+    let ExternalLwwEngine {provider:engine_provider,repository,library,root_key,admission,connection_id,connection_root}=receiver;
+    drop(destination);
+    let (commit,expected)=prepare_edit(source,SmallChange::Setting,final_direction(direction),iteration.into());
+    source.commit(&commit).map_err(|e|e.to_string())?;
+    cycle_keys::reset();
+    sender.publish(source,source.lww_binding_authority().map_err(|e|e.to_string())?,&[],&Cancellation::default())
+        .await.map_err(|e|e.to_string())?;
+    let publication=cycle_keys::take();
+    if !publication.complete() || publication.selected_keys!=publication.emitted_keys || publication.emitted_keys.is_empty() {
+        return Err("external resume missed publication did not settle exact keys".into());
+    }
+    let missed_published_keys=key_set(publication.emitted_keys);
+    let requests_before=provider.read_count()+provider.upload_count()+provider.listing_count();
+    let bytes_before=provider.transferred_body_bytes();let heads_before=provider.read_attempts("head");
+    reset_work(asset_hashes);
+    let started=Instant::now();
+    let result=async {
+        let mut destination=PersistentStore::open(&root).map_err(|e|e.to_string())?;
+        let receiver=ExternalLwwEngine {provider:engine_provider,repository,library,root_key,admission,connection_id,connection_root};
+        let reopened_ms=started.elapsed().as_secs_f64()*1000.0;
+        receiver.receive_and_apply(&mut destination,authority,&[],&Cancellation::default()).await.map_err(|e|e.to_string())?;
+        Ok::<_,String>((destination,receiver,reopened_ms,started.elapsed().as_secs_f64()*1000.0))
+    }.await;
+    let mut observation=take_work(true);
+    let keys=cycle_keys::take();
+    let bytes_after=provider.transferred_body_bytes();
+    observation.requests=(provider.read_count()+provider.upload_count()+provider.listing_count()-requests_before) as u64;
+    observation.uploaded_bytes=bytes_after.0-bytes_before.0;observation.downloaded_bytes=bytes_after.1-bytes_before.1;
+    observation.shared_head_reads=Some((provider.read_attempts("head")-heads_before) as u64);
+    let (destination,receiver,reopened_ms,receiver_durable_ack_ms)=result
+        .map_err(|reason|final_runner::CycleFailure {reason,observation:Some(Box::new(observation.clone()))})?;
+    verify_post_scope(&observation.clone(),|| {
+        if !keys.complete() || !keys.held_keys.is_empty() || !keys.deferred_keys.is_empty() {
+            return Err("external resume receive did not settle all observed keys".into());
+        }
+        if destination.lww_clock_state().map_err(|e|e.to_string())?.writer_id!=writer
+            || destination.lww_binding_authority().map_err(|e|e.to_string())?!=authority {
+            return Err("external resume changed writer or binding authority".into());
+        }
+        verify(&destination,SmallChange::Setting,&expected);verify_settled(&destination,&receiver);
+        let sample=final_runner::NativeResumeSample {direction,iteration,warmup,reopened_ms,receiver_durable_ack_ms,
+            missed_published_keys,affected_keys:key_set(keys.affected_keys),observation};
+        sample.validate()?;
+        Ok((destination,receiver,sample))
     })
 }
 
@@ -1414,7 +1543,7 @@ fn final_native_local_adapters_prove_owned_identity_metadata_in_fixed_pairs() {
         server_sync::lww_tests::publish_cycle(&driver.ca,&mut driver.a,&[]).unwrap().unwrap();
         server_sync::lww_tests::receive_cycle(&driver.cb,&mut driver.b,&[]).unwrap();
         let mut samples=Vec::new();
-        for &scenario in final_runner::AVAILABLE {
+        for &scenario in final_runner::AVAILABLE.iter().filter(|&&scenario|scenario!=measurement::Scenario::SparseBoundary) {
             for direction in [final_runner::Direction::AtoB,final_runner::Direction::BtoA] {
                 let (source,destination,sender,receiver)=match direction {
                     final_runner::Direction::AtoB=>(&mut driver.a,&mut driver.b,&driver.ca,&driver.cb),
@@ -1448,6 +1577,60 @@ fn final_native_resume_reopens_same_registration_and_receives_only_missed_units(
     let (a,ca,sample)=final_server_resume_endpoint(&mut b,&cb,a,ca,&asset_hashes,final_runner::Direction::BtoA,0,true).unwrap();
     sample.validate().unwrap();assert!(sample.observation.requests>0);
     let _driver=ServerDriver {_server,_directories,a,b,ca,cb,receipt,asset_hashes};
+}
+
+#[test]
+fn final_native_external_resume_reopens_same_writer_and_actual_bound_engine() {
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        let driver=ExternalDriver::prepare(FixtureScale::small()).await;
+        let crate::external_storage::lww_tests::CycleFixture {directory_a,directory_b,mut a,b,provider,mut sender,receiver}=driver.fixture;
+        let _directories=(directory_a,directory_b);
+        let (mut b,mut receiver,first)=final_external_resume_endpoint(&mut a,&mut sender,b,receiver,&provider,
+            &driver.asset_hashes,final_runner::Direction::AtoB,0,true).await.unwrap();
+        first.validate().unwrap();assert!(first.observation.requests>0);
+        let (_a,_sender,second)=final_external_resume_endpoint(&mut b,&mut receiver,a,sender,&provider,
+            &driver.asset_hashes,final_runner::Direction::BtoA,0,true).await.unwrap();
+        second.validate().unwrap();assert!(second.observation.requests>0);
+    });
+}
+
+#[test]
+fn final_native_bootstrap_retains_real_activation_and_body_receipts_without_source_claim() {
+    let driver=ServerDriver::prepare(FixtureScale::small());
+    let (_directory,mut destination)=server_sync::lww_tests::local();
+    driver._server.prepare_binding_candidate(&destination);
+    let writer=destination.lww_clock_state().unwrap().writer_id;
+    let record=native_bootstrap::server_bootstrap_native_raw(&mut destination,
+        Arc::new(server_sync::client::TestIoCounters::default()),&driver.asset_hashes,
+        Some("synthetic-character-0"),final_runner::Direction::AtoB,0).unwrap();
+    eprintln!("M-NATIVE-BOOTSTRAP-CORRECTNESS {}",serde_json::to_string(&record).unwrap());
+    assert_eq!(record.status,"INVALID");assert!(record.source_end_and_shutdown.is_none());
+    assert_eq!(record.writer_before,writer);assert_eq!(record.writer_after.as_ref(),Some(&writer));
+    assert!(record.activation_revision.is_some());assert!(record.activation_request.is_some());
+    assert!(record.usable_database_ms.is_some());assert!(record.all_bodies_local_ms.is_some());
+    assert!(record.native_observation.requests>0);
+    assert!(record.native_observation.body_asset_work.staging_written_bytes>0);
+    assert!(record.asset_sha_and_publication_ledger.is_some(),"{:?}",record.error);
+    assert!(record.error.is_none(),"{:?}",record.error);
+    assert_eq!(record.native_observation.shared_head_reads,None);
+}
+
+#[test]
+fn final_native_sparse_boundary_uses_actual_transport_and_preserves_full_messages() {
+    let mut driver=ServerDriver::prepare(FixtureScale::small());
+    for direction in [final_runner::Direction::AtoB,final_runner::Direction::BtoA] {
+        let (source,destination,sender,receiver)=match direction {
+            final_runner::Direction::AtoB=>(&mut driver.a,&mut driver.b,&driver.ca,&driver.cb),
+            final_runner::Direction::BtoA=>(&mut driver.b,&mut driver.a,&driver.cb,&driver.ca)};
+        let sample=final_server_cycle(source,destination,sender,receiver,&driver.asset_hashes,
+            measurement::Scenario::SparseBoundary,direction,0,true).unwrap();
+        eprintln!("M-NATIVE-SPARSE-CORRECTNESS {}",serde_json::to_string(&sample).unwrap());
+        sample.validate().unwrap();
+        assert!(sample.observation.messages_read>0);
+        assert!(sample.observation.pages_written>0);
+        assert_eq!(sample.selected_keys,sample.emitted_keys);
+        assert_eq!(sample.emitted_keys,sample.affected_keys);
+    }
 }
 
 #[test]

@@ -6,7 +6,8 @@ use serde::Serialize;
 pub const WARMUPS:u32 = 5;
 pub const REPETITIONS:u32 = 30;
 pub const AVAILABLE:&[Scenario] = &[Scenario::SettingEdit,Scenario::PresetSwitch,Scenario::PersonaSwitch,
-    Scenario::Append,Scenario::MiddleEdit,Scenario::Insertion,Scenario::Deletion,Scenario::OversizedMessage,Scenario::Burst];
+    Scenario::Append,Scenario::MiddleEdit,Scenario::Insertion,Scenario::Deletion,Scenario::OversizedMessage,Scenario::Burst,
+    Scenario::SparseBoundary];
 
 #[derive(Clone,Copy,Debug,Serialize,PartialEq,Eq)]
 pub enum Direction { AtoB, BtoA }
