@@ -34,8 +34,13 @@ async function installPluginRestore(
     reason: string,
     dependencies: PluginRestoreDependencies,
 ): Promise<CommittedApplyOutcome> {
-    const outcome = await dependencies.replaceDatabase(prepareUpstreamImport(database), reason, {upstreamImport:true})
+    let pluginsRestarted = false
+    const outcome = await dependencies.replaceDatabase(prepareUpstreamImport(database), reason, {
+        upstreamImport:true,
+        onPluginsRestarted: () => { pluginsRestarted = true },
+    })
     if (outcome.projection === 'refresh-required') return outcome
+    if (pluginsRestarted) return outcome
     return finishCommittedRestore(outcome, dependencies.loadPlugins, dependencies)
 }
 

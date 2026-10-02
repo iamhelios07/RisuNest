@@ -1,5 +1,5 @@
 import { canonicalJson, canonicalClone } from './saveCoordinatorHelpers'
-import {continueCommittedWorkingSetRefresh, hasRetryableCommittedWorkingSetContinuation, rebaseCommittedWorkingSetContinuation, registerCommittedWorkingSetContinuation} from './committedWorkingSetContinuation'
+import {claimCommittedWorkingSetRecovery, continueCommittedWorkingSetRefresh, hasRetryableCommittedWorkingSetContinuation, rebaseCommittedWorkingSetContinuation, registerCommittedWorkingSetContinuation} from './committedWorkingSetContinuation'
 import { diffRootMutations } from './rootMutation'
 import { generatingConversations } from './generatingConversationRegistry'
 import { captureLwwWorkingSetBaseline, applyLwwWorkingSetUnits } from './lwwWorkingSetApply'
@@ -575,6 +575,7 @@ export function createPersistentDataRuntime(
 ): PersistentDataRuntime {
     let workingSet: ActiveWorkingSet
     let activatedLibraryGuard: { owner: symbol; ready: boolean; lifecycle?: ActivatedLibraryRecoveryLifecycle } | null = null
+    let committedWorkingSetRecovery: Promise<CommittedApplyOutcome | null> | null = null
     let pendingRefreshChangeSet: ReplacementChangeSet | null = null
     const captureChanges = (changes: Partial<ReplacementChangeSet>): ReplacementChangeSet => ({
         root: changes.root ?? false,
@@ -1139,31 +1140,45 @@ export function createPersistentDataRuntime(
                 fence.release()
             }
         },
-        async retryCommittedWorkingSetRefresh() {
-            const revision = coordinator.pendingWorkingSetRefreshRevision
-            if (revision === null) return null
-            const changes = pendingRefreshChangeSet
-            const epoch = coordinator.storageAuthorityEpoch
-            const guardedRecovery = activatedLibraryGuard !== null || hasRetryableCommittedWorkingSetContinuation(runtime, epoch)
-            const fence = await acquireCommittedWorkingSetRefreshFence()
-            let outcome: CommittedApplyOutcome
-            try {
-                outcome = await fence.refreshCommittedWorkingSet(revision, {
-                    changeSet: changes ?? undefined,
-                })
-            } finally {
-                fence.release()
-            }
-            if (guardedRecovery && outcome.projection === 'applied') {
-                try { await continueCommittedWorkingSetRefresh(outcome.revision, runtime, epoch) }
-                catch (error) {
-                    const required = requireCommittedRefresh(outcome.revision, error)
-                    rebaseCommittedWorkingSetContinuation(runtime, epoch, coordinator.storageAuthorityEpoch)
-                    return required
-                }
-            }
-            if (guardedRecovery && outcome.projection === 'refresh-required') rebaseCommittedWorkingSetContinuation(runtime, epoch, coordinator.storageAuthorityEpoch)
-            return outcome
+        retryCommittedWorkingSetRefresh() {
+            if (committedWorkingSetRecovery) return committedWorkingSetRecovery
+            const recovering = (async () => {
+                const revision = coordinator.pendingWorkingSetRefreshRevision
+                if (revision === null) return null
+                const changes = pendingRefreshChangeSet
+                const epoch = coordinator.storageAuthorityEpoch
+                const guardedRecovery = activatedLibraryGuard !== null || hasRetryableCommittedWorkingSetContinuation(runtime, epoch)
+                let adoptedEpoch = epoch
+                let ownsRefreshFence = false
+                const releaseRecovery = claimCommittedWorkingSetRecovery(runtime, epoch,
+                    activatedLibraryGuard?.owner ?? Symbol('critical-working-set-recovery'),
+                    () => ownsRefreshFence || coordinator.storageAuthorityEpoch === adoptedEpoch)
+                try {
+                    const fence = await acquireCommittedWorkingSetRefreshFence()
+                    ownsRefreshFence = true
+                    let outcome: CommittedApplyOutcome
+                    try {
+                        outcome = await fence.refreshCommittedWorkingSet(revision, {changeSet: changes ?? undefined})
+                    } finally {
+                        adoptedEpoch = coordinator.storageAuthorityEpoch
+                        ownsRefreshFence = false
+                        fence.release()
+                    }
+                    if (guardedRecovery) rebaseCommittedWorkingSetContinuation(runtime, epoch, adoptedEpoch)
+                    if (guardedRecovery && outcome.projection === 'applied') {
+                        try { await continueCommittedWorkingSetRefresh(outcome.revision, runtime, adoptedEpoch) }
+                        catch (error) {
+                            if (coordinator.storageAuthorityEpoch !== adoptedEpoch) throw error
+                            return requireCommittedRefresh(outcome.revision, error)
+                        }
+                    }
+                    return outcome
+                } finally { releaseRecovery() }
+            })()
+            committedWorkingSetRecovery = recovering
+            const clearRecovery = () => { if (committedWorkingSetRecovery === recovering) committedWorkingSetRecovery = null }
+            void recovering.then(clearRecovery, clearRecovery)
+            return recovering
         },
         runStorageOnlyMutation: (operation) =>
             coordinator.runStorageOnlyMutation(operation),
@@ -1262,6 +1277,7 @@ export function createPersistentDataRuntime(
                 const restartPlugins = async () => {
                     await plugins.invalidatePluginCachesAfterAuthorityReplacement()
                     await plugins.restartPluginsAfterAuthorityReplacement()
+                    options.onPluginsRestarted?.()
                 }
                 runtime.setActivatedLibraryRecoveryLifecycle(pause.token, {
                     beforeRefresh: () => binding.assertAuthority(),

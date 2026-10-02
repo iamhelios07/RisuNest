@@ -675,6 +675,20 @@ describe('RisuSave picker route', () => {
         expect(runtime.replacePersistentDatabase).toHaveBeenCalledOnce()
     })
 
+    it.each([true,false])('decoded native fallback avoids duplicate loading only after its restart receipt=%s',async restarted=>{
+        const deps=dependencies('native-desktop')
+        const runtime=deps.runtime()
+        deps.runtime=()=>runtime
+        vi.mocked(deps.runNativeImport).mockRejectedValueOnce(new NativeFileJobError('unsupported-format','synthetic upstream format'))
+        vi.mocked(runtime.replacePersistentDatabase).mockImplementationOnce(async(_database,_reason,options)=>{
+            if(restarted)options?.onPluginsRestarted?.()
+            return {kind:'committed',revision:5,projection:'applied'}
+        })
+        await importRisuSaveFromPicker({},deps)
+        expect(runtime.replacePersistentDatabase).toHaveBeenCalledOnce()
+        expect(deps.reloadPlugins).toHaveBeenCalledTimes(restarted?0:1)
+    })
+
     it('uses a separate Web picker with the JavaScript codec for unsupported formats', async () => {
         const deps = dependencies('native-desktop')
         vi.mocked(deps.runNativeImport).mockRejectedValueOnce(
