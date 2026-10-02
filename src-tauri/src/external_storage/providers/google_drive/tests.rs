@@ -2427,7 +2427,7 @@ fn identical_drive_duplicates_are_verified_and_choose_the_smallest_file_id() {
         let source = spool(directory.path(), "sealed", bytes);
         let intent = intent(&repository, &name, ObjectRole::Segment, bytes);
         let receipt = provider.create_object(&repository, &intent, &source, None, &cancel).await.unwrap();
-        assert_eq!(receipt.locator.object, "file-a");
+        assert_eq!(receipt.locator.object, format!("file-a/{name}"));
         assert_eq!(provider.create_object(&repository, &intent, &source, None, &cancel).await.unwrap_err().kind, ErrorKind::PreconditionFailed);
         let lines = request_lines(&server);
         assert!(lines[3].contains("name+contains"));
@@ -2483,9 +2483,159 @@ fn distinct_drive_hash_variants_stop_reconciliation_and_both_remain_listable() {
         assert_eq!(provider.reconcile_upload(&repository, &intent, None, &cancel).await.err().unwrap().kind, ErrorKind::PreconditionFailed);
         let page = provider.list_objects(&repository, Collection::Segments, None, 10, &cancel).await.unwrap();
         assert_eq!(page.objects.len(), 2);
+        assert_eq!(page.objects[0].locator.object, format!("file-a/{first}"));
+        assert_eq!(page.objects[1].locator.object, format!("file-b/{second}"));
         let page = provider.list_objects(&repository, Collection::Snapshots, None, 10, &cancel).await.unwrap();
         assert_eq!(page.objects[0].locator.object, "snapshot-file");
         assert!(request_lines(&server).iter().all(|line| line.starts_with("GET ")));
+    });
+}
+
+#[test]
+fn segment_listing_keeps_logical_names_and_routes_read_stat_delete_to_file_ids() {
+    runtime().block_on(async {
+        let writer = "00000000-0000-4000-8000-000000000001";
+        let key = [31; 32];
+        let segment = crate::external_storage::lww_segment::Segment::new("synthetic-drive-library", writer, u64::MAX);
+        let (bytes, _) = crate::external_storage::lww_segment::seal(&segment, &key).unwrap();
+        let digest = hash(&bytes);
+        let name = segment_object_id(writer, u64::MAX, &digest).unwrap();
+        let file = |id: &str| json!({ "id":id, "name":format!("segments/{name}"),
+            "size":bytes.len().to_string(), "version":"9", "sha256Checksum":digest,
+            "parents":[FOLDER], "appProperties":{"risunestRole":"segment"} });
+        let mut replies = open_existing_replies();
+        replies.extend([control_reply(vec![file("opaque-file-a"), file("opaque-file-b")]),
+            json_reply(200, file("opaque-file-a")), json_reply(200, file("opaque-file-a")),
+            Reply::Http {status:200,headers:vec![],body:bytes.clone()},
+            json_reply(200, file("opaque-file-a")), Reply::Http {status:204,headers:vec![],body:vec![]}]);
+        let server = WireServer::start(replies);
+        let test = deps_with(Some(stored_secret(NOW_MS + 3_600_000)));
+        let cancel = Cancellation::default();
+        let (provider, repository) = opened(&server, &test, &cancel).await;
+        let page = provider.list_objects(&repository, Collection::Segments, None, 10, &cancel).await.unwrap();
+        assert_eq!(page.objects.len(), 2);
+        assert_eq!(page.objects[0].locator.object, format!("opaque-file-a/{name}"));
+        assert_eq!(page.objects[1].locator.object, format!("opaque-file-b/{name}"));
+        assert_eq!(page.objects[0].checksum.as_ref().unwrap().value, digest);
+        assert!(!page.objects[0].checksum.as_ref().unwrap().provider_verified);
+        let (listed_writer, seq, listed_hash) = parse_segment_object_id(page.objects[0].locator.object.rsplit('/').next().unwrap()).unwrap();
+        assert_eq!((listed_writer, seq, listed_hash), (writer, u64::MAX, digest.as_str()));
+        let directory = tempfile::tempdir().unwrap();
+        let mut unchanged = SpoolSink::create(&directory.path().join("unchanged"), bytes.len() as u64).unwrap();
+        assert_eq!(provider.read_object(&repository, &page.objects[0].locator, Some(&VersionToken("9".into())), &mut unchanged, &cancel).await.unwrap(),
+            ReadReceipt::NotModified(VersionToken("9".into())));
+        assert_eq!(request_lines(&server).len(), 5);
+        let body_path = directory.path().join("body");
+        let mut sink = SpoolSink::create(&body_path, bytes.len() as u64).unwrap();
+        let ReadReceipt::Body(receipt) = provider.read_object(&repository, &page.objects[0].locator, None, &mut sink, &cancel).await.unwrap()
+            else { panic!("expected a verified segment body") };
+        assert_eq!(receipt.locator, page.objects[0].locator);
+        assert!(receipt.checksum.unwrap().provider_verified && sink.is_verified());
+        let downloaded = std::fs::read(body_path).unwrap();
+        let opened_segment = crate::external_storage::lww_segment::open(&downloaded, "synthetic-drive-library", listed_writer, seq, &key).unwrap();
+        assert_eq!(opened_segment.encode().unwrap(), segment.encode().unwrap());
+        provider.delete_object(&repository, &receipt.locator, &cancel).await.unwrap();
+        let lines = request_lines(&server);
+        assert_eq!(lines.len(), 9);
+        assert!(lines[4].starts_with("GET /synthetic/drive/v3/files/opaque-file-a?fields="));
+        assert!(lines[5].starts_with("GET /synthetic/drive/v3/files/opaque-file-a?fields="));
+        assert!(lines[6].contains("/files/opaque-file-a?alt=media"));
+        assert!(lines[7].starts_with("GET /synthetic/drive/v3/files/opaque-file-a?fields="));
+        assert_eq!(lines[8], "DELETE /synthetic/drive/v3/files/opaque-file-a HTTP/1.1");
+        assert!(lines[4..].iter().all(|line| !line.contains(&name)));
+    });
+}
+
+#[test]
+fn segment_listing_refuses_missing_malformed_or_foreign_names() {
+    runtime().block_on(async {
+        let name = segment_object_id("00000000-0000-4000-8000-000000000001", 1, &hash(b"sealed-a")).unwrap();
+        for (id, file_name, role) in [
+            ("opaque-file", None, "segment"),
+            ("opaque-file", Some(format!("snapshots/{name}")), "segment"),
+            ("opaque-file", Some(format!("segments/{name}/extra")), "segment"),
+            ("opaque-file", Some(format!("segments/{}", name.replacen("-1-", "-01-", 1))), "segment"),
+            ("bad/file", Some(format!("segments/{name}")), "segment"),
+            ("opaque-file", Some(format!("segments/{name}")), "pack"),
+        ] {
+            let mut replies = open_existing_replies();
+            replies.push(control_reply(vec![json!({"id":id,"name":file_name,"size":"8","appProperties":{"risunestRole":role}})]));
+            let server = WireServer::start(replies);
+            let test = deps_with(Some(stored_secret(NOW_MS + 3_600_000)));
+            let cancel = Cancellation::default();
+            let (provider, repository) = opened(&server, &test, &cancel).await;
+            assert_eq!(provider.list_objects(&repository, Collection::Segments, None, 10, &cancel).await.unwrap_err().kind, ErrorKind::Corrupt);
+            assert_eq!(request_lines(&server).len(), 4);
+        }
+    });
+}
+
+#[test]
+fn segment_locators_reject_raw_ids_and_changed_metadata_before_media_or_delete() {
+    runtime().block_on(async {
+        let writer = "00000000-0000-4000-8000-000000000001";
+        let name = segment_object_id(writer, 1, &hash(b"sealed-a")).unwrap();
+        let changed = segment_object_id(writer, 2, &hash(b"sealed-a")).unwrap();
+        let file = |id: &str, name: &str| json!({"id":id,"name":format!("segments/{name}"),"size":"8","version":"9",
+            "parents":[FOLDER],"appProperties":{"risunestRole":"segment"}});
+        let mut replies = open_existing_replies();
+        replies.extend([control_reply(vec![file("opaque-file", &name)]),
+            json_reply(200, file("opaque-file", &changed)), json_reply(200, file("another-file", &name)),
+            json_reply(200, file("opaque-file", &changed))]);
+        let server = WireServer::start(replies);
+        let test = deps_with(Some(stored_secret(NOW_MS + 3_600_000)));
+        let cancel = Cancellation::default();
+        let (provider, repository) = opened(&server, &test, &cancel).await;
+        let page = provider.list_objects(&repository, Collection::Segments, None, 10, &cancel).await.unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let mut sink = SpoolSink::create(&directory.path().join("rejected"), 8).unwrap();
+        for object in ["opaque-file".into(), format!("opaque-file/{name}/extra"), format!("bad file/{name}")] {
+            let mut locator = page.objects[0].locator.clone(); locator.object = object;
+            assert_eq!(provider.read_object(&repository, &locator, None, &mut sink, &cancel).await.unwrap_err().kind, ErrorKind::Corrupt);
+            assert_eq!(provider.delete_object(&repository, &locator, &cancel).await.unwrap_err().kind, ErrorKind::Corrupt);
+        }
+        assert_eq!(request_lines(&server).len(), 4);
+        assert_eq!(provider.read_object(&repository, &page.objects[0].locator, Some(&VersionToken("9".into())), &mut sink, &cancel).await.unwrap_err().kind, ErrorKind::Corrupt);
+        assert_eq!(provider.read_object(&repository, &page.objects[0].locator, None, &mut sink, &cancel).await.unwrap_err().kind, ErrorKind::Corrupt);
+        assert_eq!(provider.delete_object(&repository, &page.objects[0].locator, &cancel).await.unwrap_err().kind, ErrorKind::Corrupt);
+        let lines = request_lines(&server);
+        assert_eq!(lines.len(), 7);
+        assert!(lines.iter().all(|line| line.starts_with("GET ") && !line.contains("alt=media")));
+        assert!(!sink.is_verified());
+    });
+}
+
+#[test]
+fn segment_response_loss_reconciles_the_same_preallocated_id_and_logical_name() {
+    runtime().block_on(async {
+        let bytes = b"sealed-a";
+        let name = segment_object_id("00000000-0000-4000-8000-000000000001", 1, &hash(bytes)).unwrap();
+        let file = json!({"id":"allocated-segment","name":format!("segments/{name}"),"size":"8","version":"1",
+            "sha256Checksum":hash(bytes),"appProperties":{"risunestRole":"segment"}});
+        let mut replies = open_existing_replies();
+        replies.extend([ids_reply("allocated-segment"), Reply::Lost, json_reply(200, file),
+            Reply::Http {status:200,headers:vec![],body:bytes.to_vec()}]);
+        let server = WireServer::start(replies);
+        let test = deps_with(Some(stored_secret(NOW_MS + 3_600_000)));
+        let cancel = Cancellation::default();
+        let (provider, repository) = opened(&server, &test, &cancel).await;
+        let intent = intent(&repository, &name, ObjectRole::Segment, bytes);
+        let resume = provider.begin_upload(&repository, &intent, &cancel).await.unwrap().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let source = spool(directory.path(), "segment", bytes);
+        assert_eq!(provider.create_object(&repository, &intent, &source, Some(&resume), &cancel).await.unwrap_err().kind, ErrorKind::Transient);
+        let UploadResolution::Complete(receipt) = provider.reconcile_upload(&repository, &intent, Some(&resume), &cancel).await.unwrap()
+            else { panic!("expected the original completed segment") };
+        assert_eq!(receipt.locator.object, format!("allocated-segment/{name}"));
+        assert_eq!(receipt.locator.collection.as_deref(), Some("segments"));
+        assert!(receipt.checksum.unwrap().provider_verified);
+        let lines = request_lines(&server);
+        assert_eq!(lines.len(), 7);
+        assert!(lines[3].contains("generateIds"));
+        assert!(lines[4].starts_with("POST "));
+        assert!(lines[5].starts_with("GET /synthetic/drive/v3/files/allocated-segment?fields="));
+        assert!(lines[6].contains("/files/allocated-segment?alt=media"));
+        assert!(lines[5..].iter().all(|line| !line.contains("generateIds") && !line.starts_with("POST ")));
     });
 }
 

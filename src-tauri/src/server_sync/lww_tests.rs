@@ -76,6 +76,17 @@ impl LocalServerFixture {
             super::credentials::StoredConfig::persist(store.repository_root(), &config).unwrap();
         (config, stored)
     }
+    pub(crate) fn prepare_binding_candidate(&self, store: &PersistentStore) {
+        let (_, stored) = self.candidate(store);
+        OperationLog::open(store.repository_root()).unwrap().save_config("candidate", &stored).unwrap();
+    }
+    pub(crate) fn reopen_client(store: &PersistentStore, counters: Arc<super::client::TestIoCounters>) -> super::Result<LwwClient> {
+        let stored = store.server_stored_config()?.ok_or_else(|| super::SyncError::new("server-unconfigured",409))?;
+        let mut client = LwwClient::new(store.repository_root(), stored.resolve(store.repository_root())?)?;
+        client.access = Some(stored);
+        client.client.test_io = Some(counters);
+        Ok(client)
+    }
 }
 impl Drop for LocalServerFixture {
     fn drop(&mut self) {
@@ -961,6 +972,231 @@ fn production_cycle_counters_record_actual_hash_inputs_and_completed_native_rece
             .load(std::sync::atomic::Ordering::Relaxed)
             > 0
     );
+}
+
+#[test]
+fn actual_append_cycle_tracks_control_files_without_opening_known_asset_bodies() {
+    use crate::{
+        asset_repository::body_io::{
+            register_object_purpose, reset_body_io, take_body_io, BodyPurpose,
+        },
+        persistent_store::ConversationMutation,
+    };
+    let server = LocalServerFixture::new();
+    let (_a, mut source) = local();
+    let (_b, mut target) = local();
+    let a = server.client(&source);
+    let b = server.client(&target);
+    save(
+        &mut source,
+        &["exists", "character", "char"],
+        serde_json::json!({"type":"character"}),
+    );
+    save(
+        &mut source,
+        &["exists", "conversation", "char", "chat"],
+        serde_json::json!(true),
+    );
+    let asset = put_asset(
+        &mut source,
+        "assets/known-body.png",
+        &vec![42; 128 * 1024 + 17],
+    )
+    .object_hash
+    .unwrap();
+    source
+        .commit(&WorkingSetCommit {
+            expected_revision: source.revision().unwrap(),
+            conversations: Some(vec![ConversationMutation::ReplaceRange {
+            character_id: "char".into(), conversation_id: "chat".into(),
+            start: 0, delete_count: 0,
+            messages: (0..64).map(|index| serde_json::json!({
+                "role":"user", "data":"s".repeat(9000), "chatId":format!("message-{index}")
+            })).collect(),
+            conversation: None, configured_index: None,
+        }]),
+            ..Default::default()
+        })
+        .unwrap();
+    drain_publications(&a, &mut source, &[]).unwrap();
+    receive_available(&b, &mut target, &[]).unwrap();
+    target.hydrate_registered_remote_assets(|| Ok(())).unwrap();
+
+    reset_body_io();
+    register_object_purpose(&asset, BodyPurpose::Asset);
+    source.commit(&WorkingSetCommit {
+        expected_revision: source.revision().unwrap(),
+        conversations: Some(vec![ConversationMutation::ReplaceRange {
+            character_id: "char".into(), conversation_id: "chat".into(),
+            start: 64, delete_count: 0,
+            messages: vec![serde_json::json!({"role":"user","data":"appended".repeat(9 * 1024),"chatId":"preserved-new-id"})],
+            conversation: None, configured_index: None,
+        }]),
+        ..Default::default()
+    }).unwrap();
+    assert!(publish_cycle(&a, &mut source, &[]).unwrap().is_some());
+    let received = receive_cycle(&b, &mut target, &[]).unwrap();
+    let observed = take_body_io();
+    assert!(observed.complete(), "{observed:#?}");
+    let controls = observed
+        .objects
+        .values()
+        .filter(|object| {
+            object.purposes.contains(&BodyPurpose::Control)
+                && !object.purposes.contains(&BodyPurpose::Asset)
+        })
+        .collect::<Vec<_>>();
+    assert!(controls.iter().map(|object| object.work.opens).sum::<u64>() > 0);
+    assert!(
+        controls
+            .iter()
+            .map(|object| object.work.read_bytes)
+            .sum::<u64>()
+            > super::cache::SMALL_OBJECT_BYTES as u64
+    );
+    let known_asset = observed.objects.get(&asset).unwrap();
+    assert!(known_asset.purposes.contains(&BodyPurpose::Asset));
+    assert_eq!(known_asset.work.open_attempts, 0);
+    assert_eq!(known_asset.work.read_bytes, 0);
+    assert!(received
+        .result
+        .affected_keys
+        .contains(&UnitKey::new(&["messages", "char", "chat"]).unwrap()));
+    let value = target
+        .read_conversation("char", "chat", None)
+        .unwrap()
+        .unwrap()
+        .value;
+    assert_eq!(value["message"].as_array().unwrap().len(), 65);
+    assert_eq!(value["message"][64]["chatId"], "preserved-new-id");
+}
+
+#[test]
+fn verified_native_controls_skip_cached_file_reads_and_unverified_corruption_fails_closed() {
+    use crate::{
+        asset_repository::body_io::{reset_body_io, take_body_io, BodyPurpose},
+        persistent_store::{lww::Change, ConversationMutation},
+    };
+    use risunest_sync_wire::lww::{AckRequest, ChangesPage};
+
+    let server = LocalServerFixture::new();
+    let (_a, mut source) = local();
+    let (_b, mut target) = local();
+    let a = server.client(&source);
+    let b = server.client(&target);
+    save(
+        &mut source,
+        &["exists", "character", "char"],
+        serde_json::json!({"type":"character"}),
+    );
+    save(
+        &mut source,
+        &["exists", "conversation", "char", "chat"],
+        serde_json::json!(true),
+    );
+    source
+        .commit(&WorkingSetCommit {
+            expected_revision: source.revision().unwrap(),
+            conversations: Some(vec![ConversationMutation::ReplaceRange {
+                character_id: "char".into(),
+                conversation_id: "chat".into(),
+                start: 0,
+                delete_count: 0,
+                messages: vec![serde_json::json!({
+                    "role":"user", "data":"p".repeat(90 * 1024), "chatId":"preserved-id"
+                })],
+                conversation: None,
+                configured_index: None,
+            }]),
+            ..Default::default()
+        })
+        .unwrap();
+    drain_publications(&a, &mut source, &[]).unwrap();
+    let (_, page): (_, ChangesPage) = b
+        .client
+        .json(
+            reqwest::Method::GET,
+            "changes",
+            &[("after", "0".into()), ("limit", "256".into())],
+            None::<&AckRequest>,
+            &[],
+        )
+        .unwrap();
+    let changes = page
+        .items
+        .into_iter()
+        .map(|item| Change {
+            key: item.key,
+            stamp: item.stamp,
+            value: item.value,
+        })
+        .collect::<Vec<_>>();
+    let page_hash = changes
+        .iter()
+        .find_map(|change| {
+            if change.key.components()[0] == "messages" {
+                match &change.value {
+                    UnitValue::Object { descriptor, .. } => {
+                        assert_eq!(descriptor.dependencies.len(), 1);
+                        Some(descriptor.dependencies[0].clone())
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    assert!(!target.lww_verified_object_present(&page_hash).unwrap());
+
+    let cache = super::cache::Cache::open(
+        &target.repository_root().join("server-sync/lww-cache"),
+    )
+    .unwrap()
+    .with_library(target.repository_root())
+    .unwrap();
+    super::transfer::Transfer::new(&b.client, &cache)
+        .unwrap()
+        .download(&[page_hash.clone()], &[])
+        .unwrap();
+    let original = cache.read(&page_hash, MAX_METADATA_BYTES).unwrap();
+    assert!(original.len() > super::cache::SMALL_OBJECT_BYTES);
+    let path = cache.cas.object_path(&page_hash).unwrap().unwrap();
+    let mut corrupt = original.clone();
+    corrupt[0] ^= 1;
+    std::fs::write(&path, &corrupt).unwrap();
+    let upper = b.admission().unwrap();
+    assert_eq!(
+        b.prepare_bodies(&mut target, &changes, upper)
+            .unwrap_err()
+            .code,
+        "cached-object-corrupt"
+    );
+    assert!(!target.lww_verified_object_present(&page_hash).unwrap());
+
+    std::fs::write(&path, &original).unwrap();
+    b.prepare_bodies(&mut target, &changes, upper).unwrap();
+    assert!(target.lww_verified_object_present(&page_hash).unwrap());
+    std::fs::write(&path, &corrupt).unwrap();
+    reset_body_io();
+    b.client.test_io.as_ref().unwrap().reset();
+    b.prepare_bodies(&mut target, &changes, upper).unwrap();
+    let observed = take_body_io();
+    assert!(observed.complete(), "{observed:#?}");
+    let cached_page = observed.objects.get(&page_hash).unwrap();
+    assert!(cached_page.purposes.contains(&BodyPurpose::Control));
+    assert_eq!(cached_page.work.open_attempts, 0);
+    assert_eq!(cached_page.work.read_bytes, 0);
+    assert_eq!(b.client.test_io.as_ref().unwrap().snapshot()[0], 0);
+
+    receive_available(&b, &mut target, &[]).unwrap();
+    let value = target
+        .read_conversation("char", "chat", None)
+        .unwrap()
+        .unwrap()
+        .value;
+    assert_eq!(value["message"][0]["chatId"], "preserved-id");
+    assert_eq!(value["message"][0]["data"], "p".repeat(90 * 1024));
 }
 
 #[test]

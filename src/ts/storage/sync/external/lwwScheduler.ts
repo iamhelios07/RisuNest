@@ -2,6 +2,7 @@ export interface LwwSchedulerDependencies {
     available(): boolean
     publish(): Promise<void>
     receive(): Promise<number>
+    maintain?(): Promise<void>
     failed(error: unknown): void
     now?(): number
     setTimer?(callback: () => void, delay: number): unknown
@@ -16,6 +17,8 @@ export function createLwwScheduler(dependencies: LwwSchedulerDependencies) {
     let firstDirty: number | undefined
     let publishTimer: unknown
     let receiveTimer: unknown
+    let maintenanceTimer: unknown
+    let maintenance: Promise<void> | undefined
     let serial = Promise.resolve()
     let emptyListings = 0
     const queue = <T>(operation: () => Promise<T>): Promise<T> => {
@@ -25,12 +28,24 @@ export function createLwwScheduler(dependencies: LwwSchedulerDependencies) {
     }
     const clearPublish = () => { if (publishTimer !== undefined) clearTimer(publishTimer); publishTimer = undefined }
     const clearReceive = () => { if (receiveTimer !== undefined) clearTimer(receiveTimer); receiveTimer = undefined }
+    const clearMaintenance = () => { if (maintenanceTimer !== undefined) clearTimer(maintenanceTimer); maintenanceTimer = undefined }
+    const scheduleMaintenance = () => {
+        clearMaintenance()
+        if (!enabled || !dependencies.maintain) return
+        maintenanceTimer = setTimer(() => {
+            maintenanceTimer = undefined
+            if (enabled && dependencies.available() && firstDirty === undefined && !maintenance) {
+                maintenance = dependencies.maintain!().catch(dependencies.failed).finally(() => { maintenance = undefined; scheduleMaintenance() })
+            } else scheduleMaintenance()
+        }, 60_000)
+    }
     const scheduleReceive = () => {
         clearReceive()
         if (!enabled) return
         receiveTimer = setTimer(() => {
             receiveTimer = undefined
             void receiveNow().catch(() => {})
+            scheduleMaintenance()
         }, Math.min(120_000, 15_000 * 2 ** Math.min(emptyListings, 3)))
     }
     const receiveNow = async (force = false) => {
@@ -61,7 +76,8 @@ export function createLwwScheduler(dependencies: LwwSchedulerDependencies) {
             if (firstDirty === undefined) firstDirty = now()
             clearPublish()
             if (!enabled) return
-            const delay = Math.max(0, Math.min(generationComplete ? 5_000 : 15_000, firstDirty + 60_000 - now()))
+            if (generationComplete) { void publishNow().catch(() => {}); return }
+            const delay = Math.max(0, Math.min(15_000, firstDirty + 60_000 - now()))
             publishTimer = setTimer(() => { publishTimer = undefined; void publishNow().catch(() => {}) }, delay)
         },
         start() {
@@ -71,7 +87,7 @@ export function createLwwScheduler(dependencies: LwwSchedulerDependencies) {
             if (firstDirty !== undefined) this.dirty()
             void receiveNow().catch(() => {})
         },
-        stop() { enabled = false; clearPublish(); clearReceive() },
+        stop() { enabled = false; clearPublish(); clearReceive(); clearMaintenance() },
         resumeForeground() { emptyListings = 0; if (!enabled) { this.start(); return serial } return receiveNow() },
         conversationOpened() { emptyListings = 0; return receiveNow() },
         publishNow,

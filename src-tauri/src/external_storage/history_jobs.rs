@@ -118,6 +118,7 @@ async fn upload_prepared(
             record.created_at_ms,
             view.library,
             view.sections,
+            None,
             &mut journal,
             connected.provider.as_ref(),
             &connected.handle,

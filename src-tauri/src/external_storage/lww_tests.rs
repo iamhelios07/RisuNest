@@ -9,6 +9,7 @@ use crate::persistent_store::{
     ConversationMutation, PersistentStore, WorkingSetCommit,
 };
 use risunest_sync_wire::{stamp::DecimalU64, unit::UnitKey};
+use futures::FutureExt;
 use std::sync::Arc;
 
 fn run<T>(future: impl std::future::Future<Output = T>) -> T {
@@ -17,6 +18,78 @@ fn run<T>(future: impl std::future::Future<Output = T>) -> T {
         .build()
         .unwrap()
         .block_on(future)
+}
+pub(crate) struct HeldAssetTransfer {
+    pub inner: Arc<FakeProvider>,
+    pub entered: tokio::sync::Notify,
+    pub resume: tokio::sync::Notify,
+    pub lose_pack_response: std::sync::atomic::AtomicBool,
+    pub cancel_after_pack_loss: std::sync::atomic::AtomicBool,
+    pub held: std::sync::atomic::AtomicBool,
+    pub fail_pack_after: std::sync::atomic::AtomicUsize,
+    pub attempts: std::sync::Mutex<Vec<ObjectIntent>>,
+    pub before_lease: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+impl HeldAssetTransfer {
+    pub(crate) fn new(inner: Arc<FakeProvider>) -> Arc<Self> {
+        Arc::new(Self { inner, entered: Default::default(), resume: Default::default(),
+            lose_pack_response: false.into(), cancel_after_pack_loss: false.into(), held: true.into(), fail_pack_after: 0.into(), attempts: Default::default(), before_lease: Default::default() })
+    }
+}
+impl Provider for HeldAssetTransfer {
+    fn open_repository<'a>(&'a self, config: &'a ConnectionConfig, secret: &'a SecretRef, mode: OpenMode, cancel: &'a Cancellation)
+        -> ProviderFuture<'a, (RepositoryHandle, super::capabilities::Capabilities)> { self.inner.open_repository(config, secret, mode, cancel) }
+    fn read_object<'a>(&'a self, repository: &'a RepositoryHandle, locator: &'a RemoteLocator, unchanged: Option<&'a VersionToken>, sink: &'a mut dyn TransferSink, cancel: &'a Cancellation)
+        -> ProviderFuture<'a, ReadReceipt> { self.inner.read_object(repository, locator, unchanged, sink, cancel) }
+    fn begin_upload<'a>(&'a self, repository: &'a RepositoryHandle, intent: &'a ObjectIntent, cancel: &'a Cancellation)
+        -> ProviderFuture<'a, Option<ResumeState>> { self.inner.begin_upload(repository, intent, cancel) }
+    fn create_object<'a>(&'a self, repository: &'a RepositoryHandle, intent: &'a ObjectIntent, source: &'a dyn TransferSource, resume: Option<&'a ResumeState>, cancel: &'a Cancellation)
+        -> ProviderFuture<'a, ObjectReceipt> {
+        Box::pin(async move {
+            if intent.role == ObjectRole::Lease {
+                let action = self.before_lease.lock().unwrap().take();
+                if let Some(action) = action { action(); }
+            }
+            let mut lost = false;
+            if intent.role == ObjectRole::Pack {
+                let attempted = { let mut attempts = self.attempts.lock().unwrap(); attempts.push(intent.clone()); attempts.len() };
+                let fail_after = self.fail_pack_after.load(std::sync::atomic::Ordering::SeqCst);
+                if fail_after > 0 && attempted >= fail_after { return Err(ProviderError::new(ErrorKind::RateLimited)); }
+                if self.held.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    self.entered.notify_one(); self.resume.notified().await;
+                }
+                lost = self.lose_pack_response.swap(false, std::sync::atomic::Ordering::SeqCst);
+                if lost {
+                    self.inner.state.lock().unwrap().lose_response = true;
+                }
+            }
+            let result = self.inner.create_object(repository, intent, source, resume, cancel).await;
+            if lost && self.cancel_after_pack_loss.load(std::sync::atomic::Ordering::SeqCst) { cancel.cancel(); }
+            result
+        })
+    }
+    fn compare_exchange_head<'a>(&'a self, repository: &'a RepositoryHandle, locator: &'a RemoteLocator, expected: &'a ExpectedHead, head: &'a HeadBytes, cancel: &'a Cancellation)
+        -> ProviderFuture<'a, HeadReceipt> { self.inner.compare_exchange_head(repository, locator, expected, head, cancel) }
+    fn replace_head<'a>(&'a self, repository: &'a RepositoryHandle, locator: &'a RemoteLocator, head: &'a HeadBytes, cancel: &'a Cancellation)
+        -> ProviderFuture<'a, HeadReceipt> { self.inner.replace_head(repository, locator, head, cancel) }
+    fn list_objects<'a>(&'a self, repository: &'a RepositoryHandle, collection: Collection, cursor: Option<&'a str>, limit: u16, cancel: &'a Cancellation)
+        -> ProviderFuture<'a, ObjectPage> { self.inner.list_objects(repository, collection, cursor, limit, cancel) }
+    fn delete_object<'a>(&'a self, repository: &'a RepositoryHandle, locator: &'a RemoteLocator, cancel: &'a Cancellation)
+        -> ProviderFuture<'a, ()> { self.inner.delete_object(repository, locator, cancel) }
+    fn reconcile_upload<'a>(&'a self, repository: &'a RepositoryHandle, intent: &'a ObjectIntent, resume: Option<&'a ResumeState>, cancel: &'a Cancellation)
+        -> ProviderFuture<'a, UploadResolution> { self.inner.reconcile_upload(repository, intent, resume, cancel) }
+    fn head_locator(&self, repository: &RepositoryHandle) -> Result<RemoteLocator> { self.inner.head_locator(repository) }
+}
+
+pub(crate) fn small_asset(store: &mut PersistentStore, key: &str, body: &[u8]) -> String {
+    let hash = risunest_sync_wire::hash(body);
+    store.lww_put_managed_object(&hash, body).unwrap();
+    let alias = crate::persistent_store::AssetAlias { key: key.into(), object_hash: Some(hash.clone()),
+        kind: "asset".into(), size: body.len() as i64, mime: "application/octet-stream".into(),
+        name: "synthetic".into(), ext: "bin".into(), inlay_type: None, width: None, height: None,
+        metadata: serde_json::json!({}) };
+    store.commit_asset_alias(&alias, store.revision().unwrap()).unwrap();
+    hash
 }
 pub(crate) struct CycleFixture {
     pub directory_a: tempfile::TempDir,
@@ -34,17 +107,30 @@ impl CycleFixture {
         let a = PersistentStore::open(directory_a.path()).unwrap();
         let b = PersistentStore::open(directory_b.path()).unwrap();
         let provider = Arc::new(FakeProvider::with_object_limit(true, 128 * 1024 * 1024));
-        let engine = |id: &str| ExternalLwwEngine {
+        let config = ConnectionConfig { provider: "synthetic".into(), profile: None,
+            endpoint: "https://synthetic.invalid".into(), account_id: "fixture".into(),
+            location: Default::default(), oauth_profile: None };
+        let (_, capabilities) = provider.open_repository(&config, &SecretRef("fixture".into()),
+            OpenMode::Existing, &Cancellation::default()).now_or_never().unwrap().unwrap();
+        let descriptor = risunest_external_storage_format::format::Descriptor::new(
+            "synthetic-lww-library".into(), Some(risunest_external_storage_format::format::Strategy::Cas)).unwrap();
+        let now = super::runtime::now_ms();
+        super::leases::observe_time_sample(super::leases::TimeSample { date_ms: Some(now),
+            local_before_ms: now, local_after_ms: now, round_trip_ms: 0,
+            cache_bypassed: true, cache_hit: false, age_ms: None, status: 200 });
+        let engine = |id: &str, root: &std::path::Path| ExternalLwwEngine {
             provider: provider.clone(),
             repository: fake::repository(),
             library: "synthetic-lww-library".into(),
             root_key: zeroize::Zeroizing::new([7; 32]),
             admission: Some(Admission::synthetic(super::runtime::now_ms())),
             connection_id: id.into(),
-            connection_root: std::path::PathBuf::from("synthetic-unused"),
+            connection_root: root.into(),
+            capabilities: capabilities.clone(),
+            descriptor: descriptor.clone(),
         };
-        let sender = engine("sender");
-        let receiver = engine("receiver");
+        let sender = engine("sender", directory_a.path());
+        let receiver = engine("receiver", directory_b.path());
         Self {
             directory_a,
             directory_b,
@@ -126,6 +212,277 @@ fn two_actual_stores_publish_receive_and_quiet_listing() {
         assert_eq!(f.provider.transferred_body_bytes(), bytes);
         assert_eq!(f.publish_a().await.segments.0, 0);
     })
+}
+#[test]
+fn small_assets_use_authenticated_catalogs_and_present_bootstrap_reads_no_bodies() {
+    run(async {
+        use crate::asset_repository::body_io::{reset_body_io, take_body_io, register_object_purpose, BodyPurpose};
+        let mut f = CycleFixture::new();
+        let body = vec![41; 128 * 1024];
+        let hash = small_asset(&mut f.a, "synthetic-packed", &body);
+        let second = vec![42; 64 * 1024];
+        let second_hash = small_asset(&mut f.a, "synthetic-packed-second", &second);
+        let transfer = HeldAssetTransfer::new(f.provider.clone());
+        transfer.held.store(false, std::sync::atomic::Ordering::SeqCst);
+        f.sender.provider = transfer.clone();
+        assert_eq!(f.publish_a().await.segments.0, 1);
+        let cancel = Cancellation::default();
+        let receipts = f.sender.listing(&cancel).await.unwrap();
+        let bytes = super::lww_engine::read_bytes(f.provider.as_ref(), &f.sender.repository, &receipts[0].locator, &cancel).await.unwrap();
+        let (writer, seq, _) = parse_segment_object_id(&receipts[0].locator.object).unwrap();
+        let payload = lww_segment::open(&bytes, &f.sender.library, writer, seq, &f.sender.root_key).unwrap();
+        assert_eq!(payload.asset_catalogs.len(), 1);
+        assert!(payload.large_bodies.is_empty());
+        assert!(payload.message_pages.is_empty());
+        let encoded = payload.encode().unwrap();
+        let text = std::str::from_utf8(&encoded).unwrap();
+        assert!(text.contains("\"assetCatalogs\""));
+        assert!(!text.contains("smallBodies"));
+        assert!(!text.contains(&base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &body)));
+        let mut shape: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        shape.as_object_mut().unwrap().remove("assetCatalogs");
+        assert!(lww_segment::Segment::decode(&risunest_sync_wire::canonical::encode(&shape).unwrap()).is_err());
+        shape["assetCatalogs"] = serde_json::json!([]); shape["smallBodies"] = serde_json::json!({});
+        assert!(lww_segment::Segment::decode(&risunest_sync_wire::canonical::encode(&shape).unwrap()).is_err());
+        let packs = transfer.attempts.lock().unwrap().iter().map(|intent| intent.object_id.clone()).collect::<Vec<_>>();
+        assert_eq!(packs.len(), 1, "small Assets share the existing pack container");
+        f.b.lww_put_managed_object(&hash, &body).unwrap();
+        f.b.lww_put_managed_object(&second_hash, &second).unwrap();
+        let pack_reads = packs.iter().map(|id| f.provider.read_attempts(id)).collect::<Vec<_>>();
+        reset_body_io();
+        for hash in [&hash, &second_hash] { register_object_purpose(hash, BodyPurpose::Asset); }
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = f.receiver.published_state(directory.path(), &cancel).await.unwrap();
+        f.receiver.stage_published_objects(&mut f.b, &mut state, directory.path(), &cancel).await.unwrap();
+        let work = take_body_io();
+        assert!(work.complete(), "{work:?}");
+        assert_eq!(work.asset_work(), Default::default());
+        assert_eq!(packs.iter().map(|id| f.provider.read_attempts(id)).collect::<Vec<_>>(), pack_reads);
+        assert!(super::lww_residency::stat(f.directory_b.path(), &hash).unwrap().is_some());
+        assert!(super::lww_residency::stat(f.directory_b.path(), &second_hash).unwrap().is_some());
+        assert_eq!(f.receive_b().await, 1);
+    });
+}
+
+#[test]
+fn packed_asset_uncertainty_reopens_frozen_job_and_keeps_original_pack_bytes() {
+    run(async {
+        let mut f = CycleFixture::new();
+        let body = vec![43; 96 * 1024];
+        let hash = small_asset(&mut f.a, "synthetic-frozen-packed", &body);
+        let held = HeldAssetTransfer::new(f.provider.clone());
+        held.lose_pack_response.store(true, std::sync::atomic::Ordering::SeqCst);
+        held.cancel_after_pack_loss.store(true, std::sync::atomic::Ordering::SeqCst);
+        f.sender.provider = held.clone();
+        let reached = std::cell::Cell::new(false);
+        let release = async { held.entered.notified().await; reached.set(true); held.resume.notify_one(); Ok::<_, ProviderError>(()) };
+        let cancel = Cancellation::default();
+        let publication = async {
+            let result = f.sender.publish(&mut f.a, 0.into(), &[], &cancel).await;
+            if !reached.get() { return Err(result.err().unwrap_or_else(|| ProviderError::new(ErrorKind::Corrupt))); }
+            Ok(result)
+        };
+        let (result, ()) = tokio::try_join!(publication, release).unwrap();
+        assert!(reached.get());
+        assert!(result.is_err());
+        assert!(cancel.check().is_err());
+        let cancel = Cancellation::default();
+        let writer = f.a.lww_clock_state().unwrap().writer_id;
+        let (pending, segment_bytes) = f.a.external_lww_pending(&f.sender.target_scope(), &writer).unwrap().unwrap();
+        assert!(!pending.sealed); assert!(segment_bytes.is_empty());
+        assert_eq!(pending.assets, vec![crate::persistent_store::external_lww::FrozenAsset { content_hash: hash.clone(), byte_length: body.len() as u64, local_pin: true, remote_source: None, server_source: None }]);
+        let original_job = pending.asset_job.clone().unwrap();
+        let original_intent = held.attempts.lock().unwrap()[0].clone();
+        let original_ciphertext = f.provider.contents(&original_intent.object_id).unwrap();
+        assert_eq!(f.provider.uploaded_ids().iter().filter(|id| parse_segment_object_id(id).is_ok()).count(), 0);
+        f.a = PersistentStore::open(f.directory_a.path()).unwrap();
+        let reopened = f.a.external_lww_pending(&f.sender.target_scope(), &writer).unwrap().unwrap().0;
+        assert_eq!(reopened.assets, pending.assets); assert!(reopened.asset_job == Some(original_job));
+        assert_eq!(f.publish_a().await.segments.0, 1);
+        assert_eq!(f.provider.contents(&original_intent.object_id).unwrap(), original_ciphertext);
+        assert!(held.attempts.lock().unwrap().iter().all(|intent| intent.object_id == original_intent.object_id && intent.sha256 == original_intent.sha256));
+        assert_eq!(f.a.external_lww_next_sequence(&f.sender.target_scope(), &writer).unwrap(), 2);
+        assert!(f.a.lww_read_outbox(0.into(), 100).unwrap().entries.is_empty());
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = f.receiver.published_state(directory.path(), &cancel).await.unwrap();
+        f.receiver.stage_published_objects(&mut f.b, &mut state, directory.path(), &cancel).await.unwrap();
+        assert!(!f.b.external_lww_object_is_local(&hash).unwrap());
+        assert_eq!(super::lww_residency::stat(f.directory_b.path(), &hash).unwrap(), Some(body.len() as u64));
+    });
+}
+
+#[test]
+fn server_held_publication_keeps_captured_source_and_rejects_changed_authority() {
+    use crate::server_sync::{lww_tests::LocalServerFixture, residency::{AssetPolicy, Residency}};
+    for large in [false, true] {
+        for stale in [false, true] {
+            let mut f = CycleFixture::new();
+            let server = LocalServerFixture::new();
+            let core = server.client(&f.a);
+            let body = vec![67; if large { 5 * 1024 * 1024 } else { 96 * 1024 }];
+            let hash = small_asset(&mut f.a, "synthetic-server-frozen", &body);
+            crate::server_sync::lww_tests::drain_publications(&core, &mut f.a, &[]).unwrap();
+            f.a.asset_residency_set_policy(AssetPolicy::Remote, || Ok(())).unwrap();
+            f.a.asset_residency_evict(|| Ok(())).unwrap();
+            assert!(!f.a.external_lww_object_is_local(&hash).unwrap());
+            let original = Residency::open(f.directory_a.path()).unwrap().object(&hash, None).unwrap().unwrap();
+            let alias = crate::persistent_store::AssetAlias { key: "synthetic-server-frozen".into(),
+                object_hash: Some(hash.clone()), kind: "asset".into(), size: body.len() as i64,
+                mime: "application/octet-stream".into(), name: "Synthetic changed alias".into(), ext: "bin".into(),
+                inlay_type: None, width: None, height: None, metadata: serde_json::json!({}) };
+            f.a.commit_asset_alias(&alias, f.a.revision().unwrap()).unwrap();
+            let original_pending = f.a.lww_read_outbox(0.into(), 100).unwrap().entries;
+            assert_eq!(original_pending.len(), 1);
+            let held = HeldAssetTransfer::new(f.provider.clone());
+            held.held.store(false, std::sync::atomic::Ordering::SeqCst);
+            let root = f.directory_a.path().to_owned();
+            let target_scope = f.sender.target_scope();
+            let writer = f.a.lww_clock_state().unwrap().writer_id;
+            let source_hash = hash.clone();
+            let original_metadata = serde_json::to_value(&original).unwrap();
+            let mut changed_config = original.config.clone();
+            changed_config.endpoint = format!("{}/changed-source", server.endpoint);
+            let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reached_callback = reached.clone();
+            *held.before_lease.lock().unwrap() = Some(Box::new(move || {
+                let mut store = PersistentStore::open(&root).unwrap();
+                let (capture, bytes) = store.external_lww_pending(&target_scope, &writer).unwrap().unwrap();
+                assert!(!capture.sealed);
+                let asset = capture.assets.iter().find(|asset| asset.content_hash == source_hash).unwrap();
+                assert!(!asset.local_pin && asset.remote_source.is_none());
+                assert_eq!(serde_json::to_value(asset.server_source.as_ref().unwrap()).unwrap(), original_metadata);
+                let mut altered_capture = capture.clone();
+                altered_capture.assets[0].server_source.as_mut().unwrap().context.push('x');
+                assert!(store.external_lww_persist(&altered_capture, &bytes).is_err());
+                Residency::open(&root).unwrap().replace_access_config(&changed_config).unwrap();
+                assert_ne!(serde_json::to_value(Residency::open(&root).unwrap().object(&source_hash, None).unwrap().unwrap()).unwrap(), original_metadata);
+                if stale {
+                    let state = store.lww_binding_state().unwrap();
+                    let target = crate::persistent_store::sync_selection::SyncTarget::External("changed-source-target".into());
+                    let inspection = store.register_lww_binding_inspection(state.target_authority, &target, "synthetic-next-repository", "synthetic-next-library").unwrap();
+                    store.switch_lww_binding(&crate::persistent_store::sync_selection::SwitchBindingRequest {
+                        header: crate::persistent_store::lww::Header { binding_authority: state.target_authority, request_id: "frozen-source-authority".into() },
+                        expected_selection_epoch: state.selection_epoch, target, inspection_id: Some(inspection),
+                    }).unwrap();
+                }
+                reached_callback.store(true, std::sync::atomic::Ordering::SeqCst);
+            }));
+            f.sender.provider = held.clone();
+            crate::server_sync::hash_metrics::reset_hash_metrics();
+            super::worker_observation::begin();
+            let result = run(f.sender.publish(&mut f.a, 0.into(), &[], &Cancellation::default()));
+            let workers = super::worker_observation::take();
+            let server_hashes = crate::server_sync::hash_metrics::take_hash_metrics();
+            assert!(reached.load(std::sync::atomic::Ordering::SeqCst));
+            let segments = f.provider.uploaded_ids().iter().filter(|id| parse_segment_object_id(id).is_ok()).count();
+            if stale {
+                assert_eq!(result.err().expect("changed authority must reject publication").kind, ErrorKind::PreconditionFailed);
+                assert_eq!(segments, 0); assert!(held.attempts.lock().unwrap().is_empty());
+                let writer = f.a.lww_clock_state().unwrap().writer_id;
+                let pending = f.a.external_lww_pending(&f.sender.target_scope(), &writer).unwrap().unwrap().0;
+                assert_eq!(pending.entries, original_pending);
+                assert!(!pending.sealed && !pending.dispatched && pending.bodies.iter().all(|body| body.bytes.is_empty()));
+                assert_eq!(f.a.external_lww_next_sequence(&f.sender.target_scope(), &writer).unwrap(), 1);
+            } else {
+                assert!(!workers.is_empty());
+                assert!(workers.iter().all(|worker| worker.completed && worker.hashes.incomplete.is_empty()));
+                assert!(!server_hashes.incomplete);
+                assert!(server_hashes.domains["c_cache_stream_verify"].bytes >= body.len() as u64);
+                assert_eq!(result.unwrap().segments.0, 1); assert_eq!(segments, 1);
+                assert!(f.a.lww_read_outbox(0.into(), 100).unwrap().entries.is_empty());
+                assert!(!f.a.external_lww_object_is_local(&hash).unwrap());
+                run(f.receiver.receive_and_apply(&mut f.b, 0.into(), &[], &Cancellation::default())).unwrap();
+                assert_eq!(super::lww_residency::stat(f.directory_b.path(), &hash).unwrap(), Some(body.len() as u64));
+            }
+        }
+    }
+}
+
+#[test]
+fn real_publish_and_receive_continue_while_checkpoint_inputs_are_paused() {
+    run(async {
+        let mut f=CycleFixture::new();
+        set(&mut f.a,&["root","language"],serde_json::json!("ko")); f.publish_a().await;
+        let job=tempfile::tempdir().unwrap(); let id="00000000-0000-4000-8000-000000000097";
+        let barrier=super::lww_compaction::CompactionBarrier::new();
+        super::lww_compaction::install_compaction_barrier(id,barrier.clone());
+        let writer=f.a.lww_clock_state().unwrap().writer_id;
+        let caps=fake::capabilities(true); let cancel=Cancellation::default();
+        let compactor=ExternalLwwEngine{provider:f.provider.clone(),repository:fake::repository(),library:f.sender.library.clone(),root_key:zeroize::Zeroizing::new([7;32]),admission:Some(Admission::synthetic(super::runtime::now_ms())),connection_id:"compactor".into(),connection_root:job.path().into(),capabilities:f.sender.capabilities.clone(),descriptor:f.sender.descriptor.clone()};
+        let compaction=compactor.compact_published(job.path(),id,&writer,&caps,&cancel,None);
+        let routine=async {
+            barrier.reached.notified().await;
+            set(&mut f.a,&["root","language"],serde_json::json!("en"));
+            assert_eq!(f.sender.publish(&mut f.a,DecimalU64(0),&[],&cancel).await.unwrap().segments.0,1);
+            assert_eq!(f.receiver.receive_and_apply(&mut f.b,DecimalU64(0),&[],&cancel).await.unwrap(),2);
+            barrier.resume.notify_one();
+        };
+        let (completed,())=tokio::join!(compaction,routine);
+        let completed=completed.unwrap(); let (_,snapshot)=f.sender.checkpoint(&completed.reference.receipt,&cancel).await.unwrap();
+        assert_eq!(snapshot.covered_prefixes.get(&writer).unwrap().0,1);
+        assert_eq!(f.b.read_root(None).unwrap().value["language"],serde_json::json!("en"));
+    });
+}
+#[test]
+fn checkpoint_uses_only_published_units_and_restores_after_segment_retirement() {
+    run(async {
+        let mut f=CycleFixture::new();
+        set(&mut f.a,&["root","language"],serde_json::json!("ko"));
+        f.publish_a().await;
+        set(&mut f.a,&["root","language"],serde_json::json!("en"));
+        let job=tempfile::tempdir().unwrap();
+        let completed=f.sender.compact_published(job.path(),"00000000-0000-4000-8000-000000000099",&f.a.lww_clock_state().unwrap().writer_id,&fake::capabilities(true),&Cancellation::default(),None).await.unwrap();
+        assert_eq!(completed.reference.role,ObjectRole::Snapshot);
+        let snapshots=f.sender.snapshot_listing(&Cancellation::default()).await.unwrap();
+        assert_eq!(snapshots.len(),1);
+        let (_,snapshot)=f.sender.checkpoint(&snapshots[0],&Cancellation::default()).await.unwrap();
+        assert_eq!(snapshot.covered_prefixes.values().next().unwrap().0,1);
+        let backup_id="00000000-0000-4000-8000-000000000096";
+        // This input exercises metadata classification; its copied catalogs are not restored.
+        let mut backup_library=snapshot.library.clone();
+        for object in [&mut backup_library.record_catalog,&mut backup_library.asset_catalog] {
+            object.header.repository_id=f.sender.descriptor.repository_id.clone();
+            object.ciphertext_length=risunest_external_storage_format::snapshot::envelope_length(&object.header).unwrap();
+        }
+        let original_units=backup_library.record_catalog.clone();
+        let backup=risunest_external_storage_format::control::BackupBundleDocument::new(
+            f.sender.descriptor.repository_id.clone(),backup_id.into(),
+            risunest_external_storage_format::control::BundleSource::Device{writer_id:f.a.lww_clock_state().unwrap().writer_id},
+            super::runtime::now_ms(),Some(risunest_sync_wire::head::Sequence::from(0u64)),None,None,
+            backup_library,std::collections::BTreeMap::new(),
+            Some(original_units),
+        ).unwrap();
+        let backup_plain=backup.encode(risunest_external_storage_format::snapshot::MAX_METADATA_BYTES).unwrap();
+        let backup_object=format!("snapshot-{backup_id}");
+        let header=risunest_external_storage_format::snapshot::PublicObjectHeader::new(f.sender.descriptor.repository_id.clone(),backup_object.clone(),risunest_external_storage_format::snapshot::ObjectRole::BackupBundle,backup_plain.len() as u64).unwrap();
+        let key=risunest_external_storage_format::crypto::derive_key(&[7;32],&f.sender.descriptor.repository_id,"metadata").unwrap();
+        let mut sealed=Vec::new();risunest_external_storage_format::snapshot::seal_envelope(&mut std::io::Cursor::new(backup_plain),&mut sealed,&key,&header).unwrap();
+        f.provider.seed(&backup_object,ObjectRole::BackupBundle,sealed);
+        assert_eq!(f.sender.snapshot_listing(&Cancellation::default()).await.unwrap().len(),1);
+        let mut identical=snapshot.clone(); identical.snapshot_id="00000000-0000-4000-8000-000000000098".into();
+        assert_eq!(super::lww_checkpoint::retained(&[snapshot.clone(),identical.clone()]).unwrap(),std::collections::BTreeSet::from([identical.snapshot_id.clone()]));
+        let mut encoded:serde_json::Value=serde_json::from_slice(&snapshot.encode().unwrap()).unwrap();
+        assert!(encoded["library"]["recordCatalog"]["header"]["plaintextLength"].is_string());
+        encoded["library"]["recordCatalog"]["header"]["plaintextLength"]=serde_json::json!(0);
+        assert!(super::lww_checkpoint::Checkpoint::decode(&serde_json::to_vec(&encoded).unwrap()).is_err());        let mut malformed_source=snapshot.clone();
+        malformed_source.standalone_bodies.insert("a".repeat(64),super::lww_segment::LargeBody{object_id:"00000000-0000-4000-8000-000000000091".into(),sha256:"b".repeat(64),byte_length:DecimalU64(1),plaintext_byte_length:DecimalU64(1),locator:Some(completed.reference.receipt.locator.clone())});
+        assert!(malformed_source.encode().is_err());        identical.state_identity="a".repeat(64);
+        assert!(super::lww_checkpoint::retained(&[snapshot.clone(),identical]).is_err());
+        for object in f.sender.listing(&Cancellation::default()).await.unwrap() {
+            f.provider.delete_object(&f.sender.repository,&object.locator,&Cancellation::default()).await.unwrap();
+        }
+        assert_eq!(f.receive_b().await,1);
+        assert_eq!(f.b.read_root(None).unwrap().value["language"],"ko");
+        assert_eq!(f.a.read_root(None).unwrap().value["language"],"en");
+        assert_eq!(f.receive_b().await,0);        let bad_id="00000000-0000-4000-8000-000000000092";
+        let bad_plain=b"{\"schema\":\"risunest.lww-snapshot/v1\"}";
+        let bad_header=risunest_external_storage_format::snapshot::PublicObjectHeader::new(f.sender.repository.repository_id.clone(),bad_id.into(),risunest_external_storage_format::snapshot::ObjectRole::SyncState,bad_plain.len() as u64).unwrap();
+        let mut bad_sealed=Vec::new();risunest_external_storage_format::snapshot::seal_envelope(&mut std::io::Cursor::new(bad_plain),&mut bad_sealed,&key,&bad_header).unwrap();
+        f.provider.seed(bad_id,ObjectRole::Snapshot,bad_sealed);
+        assert_eq!(f.receiver.snapshot_listing(&Cancellation::default()).await.unwrap_err().kind,ErrorKind::Corrupt);
+        let (header,inspection)=binding_context(&f.b,&f.receiver,"corrupt-snapshot-binding");
+        assert_eq!(f.receiver.stage_binding(&mut f.b,&header,&inspection,&Cancellation::default()).await.err().unwrap().kind,ErrorKind::Corrupt);
+    });
 }
 #[test]
 fn cycle_key_sets_match_real_emission_and_durable_apply_and_noop_is_empty() {
@@ -505,7 +862,20 @@ fn large_bodies_stay_remote_then_only_missing_body_hydrates() {
         f.a.commit_asset_alias(&alias, f.a.revision().unwrap())
             .unwrap();
         f.publish_a().await;
-        let before = f.provider.transferred_body_bytes();
+        let second=vec![32;5*1024*1024];let second_hash=risunest_sync_wire::hash(&second);
+        f.a.lww_put_managed_object(&second_hash,&second).unwrap();
+        let mut second_alias=alias.clone();second_alias.key="synthetic-second-asset".into();second_alias.object_hash=Some(second_hash.clone());
+        f.a.commit_asset_alias(&second_alias,f.a.revision().unwrap()).unwrap();f.publish_a().await;
+        let inputs=tempfile::tempdir().unwrap();let mut state=f.receiver.published_state(inputs.path(),&Cancellation::default()).await.unwrap();
+        let first_root=state.standalone_roots.get(&hash).unwrap().clone();let second_root=state.standalone_roots.get(&second_hash).unwrap().clone();
+        assert_ne!(first_root,second_root);
+        for (body_hash,root) in [(&hash,&first_root),(&second_hash,&second_root)] {
+            let (_,payload)=state.segments.iter().find(|(_,payload)|{let (writer,seq,_)=parse_segment_object_id(root).unwrap();payload.writer_id==writer&&payload.seq.0==seq}).unwrap();
+            assert_eq!(payload.large_bodies.get(body_hash).unwrap().object_id,state.standalone.get(body_hash).unwrap().object_id);
+        }
+        f.receiver.stage_published_objects(&mut f.b,&mut state,inputs.path(),&Cancellation::default()).await.unwrap();
+        assert_eq!(super::lww_residency::source(f.directory_b.path(),&hash).unwrap().unwrap().protected_segment,first_root);
+        assert_eq!(super::lww_residency::source(f.directory_b.path(),&second_hash).unwrap().unwrap().protected_segment,second_root);        let before = f.provider.transferred_body_bytes();
         f.receive_b().await;
         assert!(!f.b.external_lww_object_is_local(&hash).unwrap());
         let source = super::lww_residency::source(f.directory_b.path(), &hash)
@@ -750,7 +1120,7 @@ fn dependency_response_loss_reuses_exact_frozen_ciphertext_before_segment_seal()
         f.a.lww_put_managed_object(&hash, &body).unwrap();
         let alias = crate::persistent_store::AssetAlias {
             key: "synthetic".into(),
-            object_hash: Some(hash),
+            object_hash: Some(hash.clone()),
             kind: "asset".into(),
             size: body.len() as i64,
             mime: "application/octet-stream".into(),
@@ -763,12 +1133,20 @@ fn dependency_response_loss_reuses_exact_frozen_ciphertext_before_segment_seal()
         };
         f.a.commit_asset_alias(&alias, f.a.revision().unwrap())
             .unwrap();
-        f.provider.state.lock().unwrap().lose_response = true;
-        assert!(f
-            .sender
-            .publish(&mut f.a, DecimalU64(0), &[], &Cancellation::default())
-            .await
-            .is_err());
+        let held = HeldAssetTransfer::new(f.provider.clone());
+        held.lose_pack_response.store(true, std::sync::atomic::Ordering::SeqCst);
+        held.cancel_after_pack_loss.store(true, std::sync::atomic::Ordering::SeqCst);
+        f.sender.provider = held.clone();
+        let reached = std::cell::Cell::new(false);
+        let release = async { held.entered.notified().await; reached.set(true); held.resume.notify_one(); Ok::<_, ProviderError>(()) };
+        let cancel = Cancellation::default();
+        let publication = async {
+            let result = f.sender.publish(&mut f.a, 0.into(), &[], &cancel).await;
+            if !reached.get() { return Err(result.err().unwrap_or_else(|| ProviderError::new(ErrorKind::Corrupt))); }
+            Ok(result)
+        };
+        let (result, ()) = tokio::try_join!(publication, release).unwrap();
+        assert!(reached.get()); assert!(result.is_err());
         let writer = f.a.lww_clock_state().unwrap().writer_id;
         let (pending, bytes) =
             f.a.external_lww_pending(&f.sender.target_scope(), &writer)
@@ -778,11 +1156,33 @@ fn dependency_response_loss_reuses_exact_frozen_ciphertext_before_segment_seal()
         assert!(bytes.is_empty());
         assert_eq!(pending.seq.0, 1);
         assert_eq!(pending.bodies.len(), 1);
+        assert_eq!(pending.assets[0].content_hash, hash);
+        assert_eq!(pending.assets[0].byte_length, body.len() as u64);
+        assert_eq!(pending.bodies[0].content_hash, hash);
+        assert!(!pending.bodies[0].bytes.is_empty());
+        let draft_bytes = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &pending.payload).unwrap();
+        let draft = lww_segment::Segment::decode_capture(&draft_bytes).unwrap();
+        assert!(lww_segment::Segment::decode(&draft_bytes).is_err());
+        assert!(draft.encode().is_err());
+        assert!(lww_segment::seal(&draft, &f.sender.root_key).is_err());
+        let original_job = pending.asset_job.clone();
         let object = pending.bodies[0].object_id.clone();
         let sealed = f.provider.contents(&object).unwrap();
+        let original_intent = held.attempts.lock().unwrap()[0].clone();
+        let mut changed_capture = pending.clone();
+        changed_capture.assets[0].byte_length += 1;
+        assert!(f.a.external_lww_persist(&changed_capture, &bytes).is_err());
+        let mut changed_body = pending.clone();
+        changed_body.bodies[0].bytes.push('A');
+        assert!(f.a.external_lww_persist(&changed_body, &bytes).is_err());
         f.a = PersistentStore::open(f.directory_a.path()).unwrap();
+        let reopened = f.a.external_lww_pending(&f.sender.target_scope(), &writer).unwrap().unwrap().0;
+        assert!(reopened.asset_job == original_job);
+        assert_eq!(reopened.assets, pending.assets);
+        assert_eq!(reopened.bodies[0].bytes, pending.bodies[0].bytes);
         f.publish_a().await;
         assert_eq!(f.provider.contents(&object).unwrap(), sealed);
+        assert!(held.attempts.lock().unwrap().iter().all(|intent| intent.object_id != object || intent.sha256 == original_intent.sha256));
         assert_eq!(
             f.a.external_lww_next_sequence(&f.sender.target_scope(), &writer)
                 .unwrap(),

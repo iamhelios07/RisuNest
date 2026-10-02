@@ -203,6 +203,12 @@ export class ExternalStorageBridge {
         return this.native('external_storage_get_job', { jobId })
     }
 
+    confirmRestoreAdoption(jobId: string, receivedRevision: DecimalString, selectedCharacterId?: string): Promise<ExternalReceivedApplicationResult> {
+        return this.native('external_storage_confirm_restore_adoption', {
+            request: { jobId, receivedRevision, selectedCharacterId: selectedCharacterId ?? null },
+        })
+    }
+
 
     setExecutionSession(request: {
         kind: 'foreground' | 'hidden' | 'exitDrain'

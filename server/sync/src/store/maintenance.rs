@@ -282,8 +282,7 @@ impl Store {
             .map(|(_, hash)| hash.as_str())
             .collect::<Vec<_>>();
         let tx = db.transaction()?;
-        risunest_small_object_store::delete_batch(&tx, &hashes)
-            .map_err(super::objects::body_error)?;
+        super::objects::delete_inline(&tx, &hashes).map_err(super::objects::body_error)?;
         for row in obsolete.iter().chain(removed.iter().map(|(row, _)| row)) {
             tx.execute("DELETE FROM object_trash WHERE rowid=?1", [row])?;
         }

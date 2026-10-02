@@ -355,6 +355,7 @@ fn import_jpeg_asset_with_before_commit(
             revision: committed.revision,
             source_bytes: prepared.byte_size,
             source_sha256: prepared.content_hash,
+            source_fingerprint_kind: crate::native_file_jobs::SourceFingerprintKind::WholeFileSha256,
             character_count: 1,
             preset_count: 0,
             warning_codes: Vec::new(),
@@ -543,6 +544,7 @@ mod tests {
     fn opened_source(path: &std::path::Path, total_bytes: u64) -> OpenedJobSource {
         OpenedJobSource {
             file: std::fs::File::open(path).expect("open JPEG source"),
+            custody: None,
             total_bytes,
         }
     }

@@ -1,5 +1,8 @@
 export const languageSpanish = {
     risuNest: {
+        importDialog: {
+            warningUpstreamRestoreLosses: 'No se pudieron restaurar algunos datos del almacenamiento frío o de los inlays. Revise los datos restaurados.',
+        },
         plugins: {
             "removeTitle": "¿Eliminar este plugin?",
             "removeDescription": "Si eliminas los datos del plugin, sus ajustes y contenido guardado no se recuperarán al reinstalarlo. Si conservas los datos, podrás usarlos tras reinstalarlo.",
@@ -50,8 +53,8 @@ export const languageSpanish = {
         "requestLogRemoved": "Este registro de solicitud ha sido eliminado.",
         "requestLogRemovedDesc": "Este registro de solicitud se elimina cuando el cliente se actualiza o recarga.",
         "vertexAuthError": "Faltan los detalles de autenticación de Vertex AI.",
-        "coldStorageIncompleteRestoreConfirm": (characterNames: string, unavailableCount: number, unresolvedCount: number) =>
-            `No se pudieron restaurar los datos del almacenamiento frío de ${characterNames || "personajes desconocidos"}.${unresolvedCount > 0 ? ` No se pudieron asociar ${unresolvedCount} elemento(s) con un personaje.` : ""}\n\nSi continúa, ${unavailableCount} elemento(s) del almacenamiento frío seguirán sin estar disponibles y los datos de los personajes o chats afectados podrían perderse permanentemente.\n\n¿Continuar de todos modos con la restauración incompleta?`
+        "coldStorageIncompleteRestoreConfirm": (characterNames: string, unavailableCount: number, unresolvedCount: number, includeQuestion = true) =>
+            `No se pudieron restaurar los datos del almacenamiento frío de ${characterNames || "personajes desconocidos"}.${unresolvedCount > 0 ? ` No se pudieron asociar ${unresolvedCount} elemento(s) con un personaje.` : ""}\n\nSi continúa, ${unavailableCount} elemento(s) del almacenamiento frío seguirán sin estar disponibles y los datos de los personajes o chats afectados podrían perderse permanentemente.${includeQuestion ? "\n\n¿Continuar de todos modos con la restauración incompleta?" : ""}`
     },
     "showHelp": "Mostrar Ayuda",
     "help": {

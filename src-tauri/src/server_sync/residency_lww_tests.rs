@@ -15,6 +15,204 @@ use std::sync::{
 };
 
 #[test]
+fn present_bulk_hydration_completes_without_any_body_open_or_hash() {
+    use crate::asset_repository::body_io::{reset_body_io, take_body_io};
+    let (_root, mut store) = local();
+    let hashes = (0..3).map(|index| put_asset(&mut store, &format!("assets/present-{index}.png"), &vec![index; 100_000]).object_hash.unwrap()).collect::<Vec<_>>();
+    let mut session = super::residency::HydrationSession::new(store.repository_root(), None).unwrap();
+    reset_body_io(); crate::persistent_store::hash_work::reset_hash_work();
+    let mut completed = Vec::new();
+    assert!(session.hydrate_many_outcomes(&hashes, &|| Ok(()), |hash,outcome| completed.push((hash.to_owned(),outcome))).unwrap().is_empty());
+    let work = take_body_io(); let hashes_work = crate::persistent_store::hash_work::take_hash_work();
+    assert!(work.complete()); assert!(work.domains.is_empty());
+    assert_eq!(completed.len(), hashes.len());
+    assert!(completed.iter().all(|(_,outcome)| *outcome == super::residency::HydrationOutcome::AlreadyLocal));
+    assert!(hashes_work.domains.is_empty()); assert!(hashes_work.incomplete.is_empty());
+}
+
+#[test]
+fn selected_archive_priority_uses_native_metadata_without_reading_the_archive() {
+    use crate::asset_repository::body_io::{reset_body_io,take_body_io};
+    let (_root,mut store)=local();
+    let hash=put_asset(&mut store,"assets/archived-priority.png",b"synthetic archive priority").object_hash.unwrap();
+    store.commit(&WorkingSetCommit {
+        expected_revision:store.revision().unwrap(),
+        add_character:Some(serde_json::json!({"chaId":"archived-priority","type":"character","name":"Synthetic","image":"assets/archived-priority.png","chats":[]})),
+        ..Default::default()
+    }).unwrap();
+    store.archive_character("archived-priority",store.revision().unwrap(),1).unwrap();
+    reset_body_io(); crate::persistent_store::hash_work::reset_hash_work();
+    let hashes=store.selected_character_asset_hashes("archived-priority").unwrap();
+    let work=take_body_io(); let hashes_work=crate::persistent_store::hash_work::take_hash_work();
+    assert!(hashes.contains(&hash)); assert!(hashes.len()>1);
+    assert!(work.complete()); assert!(work.domains.is_empty()); assert!(hashes_work.domains.is_empty());
+}
+
+#[test]
+fn hydration_rejects_stale_authority_or_cancellation_before_opening_any_body() {
+    use crate::asset_repository::body_io::{reset_body_io,take_body_io};
+    let server=LocalServerFixture::new(); let (_root,mut store)=local();
+    let core=server.client(&store);
+    put_asset(&mut store,"assets/authority-hydration.png",b"synthetic authority hydration");
+    super::lww_tests::drain_publications(&core,&mut store,&[]).unwrap();
+    let _residency=Residency::open(store.repository_root()).unwrap();
+    let mut request=super::lww_tests::header(&store);
+    request.binding_authority=(request.binding_authority.0+1).into();
+    reset_body_io();
+    let result=super::commands::hydrate_binding_assets(&store,&request,Arc::new(AtomicBool::new(false)),None,||panic!("stale hydration completed"));
+    assert_eq!(result.unwrap_err().code,"binding-authority-changed");
+    let work=take_body_io(); assert!(work.complete()); assert!(work.domains.is_empty());
+    let result=super::commands::hydrate_binding_assets(&store,&super::lww_tests::header(&store),Arc::new(AtomicBool::new(true)),None,||panic!("cancelled hydration completed"));
+    assert_eq!(result.unwrap_err().code,"cancelled");
+    let work=take_body_io(); assert!(work.complete()); assert!(work.domains.is_empty());
+}
+
+#[test]
+fn selected_character_assets_finish_before_uncapped_catalog_hydration() {
+    let server = LocalServerFixture::new();
+    let (_root, mut store) = local();
+    let core = server.client(&store);
+    let hashes = (0..130).map(|index| put_asset(&mut store, &format!("assets/priority-{index}.png"), format!("synthetic priority {index}").as_bytes()).object_hash.unwrap()).collect::<Vec<_>>();
+    store.commit(&WorkingSetCommit {
+        expected_revision: store.revision().unwrap(),
+        add_character: Some(serde_json::json!({"chaId":"selected-priority","type":"character","name":"Synthetic","image":"assets/priority-129.png","additionalAssets":[["extra","assets/priority-128.png","png"]],"chats":[]})),
+        ..Default::default()
+    }).unwrap();
+    super::lww_tests::drain_publications(&core, &mut store, &[]).unwrap();
+    store.asset_residency_set_policy(super::residency::AssetPolicy::Remote, || Ok(())).unwrap();
+    store.asset_residency_evict(|| Ok(())).unwrap();
+    let cas = PayloadCas::new(store.repository_root()).unwrap();
+    assert_eq!(store.selected_character_asset_hashes("selected-priority").unwrap(), [hashes[128].clone(),hashes[129].clone()].into_iter().collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>());
+    assert!(store.selected_character_asset_hashes("missing-character").unwrap().is_empty());
+    let visits = std::cell::Cell::new(0);
+    store.hydrate_registered_remote_assets_prioritized(None, Some("selected-priority"), || Ok(()), || {
+        visits.set(visits.get()+1);
+        if visits.get() == 2 {
+            assert!(cas.stat_object(&hashes[128]).unwrap().is_some());
+            assert!(cas.stat_object(&hashes[129]).unwrap().is_some());
+            assert!(hashes[..128].iter().all(|hash| cas.stat_object(hash).unwrap().is_none()));
+        }
+    }).unwrap();
+    assert_eq!(visits.get(),130);
+    assert!(hashes.iter().all(|hash| cas.stat_object(hash).unwrap().is_some()));
+}
+
+#[test]
+fn switching_to_full_policy_hydrates_selected_references_before_other_characters() {
+    let server=LocalServerFixture::new(); let (_root,mut store)=local();
+    let core=server.client(&store);
+    let mut aliases=[
+        put_asset(&mut store,"assets/policy-first.png",b"first synthetic policy priority"),
+        put_asset(&mut store,"assets/policy-second.png",b"second synthetic policy priority"),
+    ];
+    aliases.sort_by(|a,b| a.object_hash.cmp(&b.object_hash));
+    for (character,alias) in [("policy-other",&aliases[0]),("policy-selected",&aliases[1])] {
+        store.commit(&WorkingSetCommit {
+            expected_revision:store.revision().unwrap(),
+            add_character:Some(serde_json::json!({"chaId":character,"type":"character","name":"Synthetic","image":alias.key,"chats":[]})),
+            ..Default::default()
+        }).unwrap();
+    }
+    super::lww_tests::drain_publications(&core,&mut store,&[]).unwrap();
+    store.asset_residency_set_policy(super::residency::AssetPolicy::Remote,||Ok(())).unwrap();
+    store.asset_residency_evict(||Ok(())).unwrap();
+    let cas=PayloadCas::new(store.repository_root()).unwrap();
+    let selected=aliases[1].object_hash.as_ref().unwrap(); let other=aliases[0].object_hash.as_ref().unwrap();
+    assert!(cas.stat_object(selected).unwrap().is_none()); assert!(cas.stat_object(other).unwrap().is_none());
+    let prioritized=std::cell::Cell::new(false);
+    store.asset_residency_set_policy_prioritized(super::residency::AssetPolicy::Full,None,Some("policy-selected"),||{
+        if cas.stat_object(selected)?.is_some() && cas.stat_object(other)?.is_none() { prioritized.set(true); }
+        Ok(())
+    }).unwrap();
+    assert!(prioritized.get()); assert!(cas.stat_object(selected).unwrap().is_some()); assert!(cas.stat_object(other).unwrap().is_some());
+}
+
+#[test]
+fn selected_archived_owner_hydration_requires_only_the_existing_full_inventory() {
+    use crate::{
+        asset_repository::{job_pins::CasReleaseOutcome, owner_manifest_codec::{encode_owner_manifest,OwnerManifestEntry}},
+        persistent_store::{AssetOwnerHead,AssetOwnerLocator},
+    };
+    let server=LocalServerFixture::new(); let (_root,mut store)=local();
+    let core=server.client(&store);
+    let asset=put_asset(&mut store,"assets/owner-archive.png",b"synthetic selected archived owner payload").object_hash.unwrap();
+    let cas=PayloadCas::new(store.repository_root()).unwrap();
+    let canonical=encode_owner_manifest(&[OwnerManifestEntry {
+        tuple:["extra".into(),"assets/owner-archive.png".into(),"png".into()],
+        payload_hash:Some(hex::decode(&asset).unwrap().try_into().unwrap()),
+    }]).unwrap();
+    let mut job=DurableCasJob::begin(store.repository_root(),"selected-archive-owner",CasJobKind::CardOrModuleContentImport,1).unwrap();
+    let manifest=job.prepare_reader(&cas,&mut canonical.as_slice(),CasObjectRole::OwnerManifest).unwrap();
+    job.seal(&mut store,2).unwrap();
+    let head=AssetOwnerHead::present(AssetOwnerLocator::CharacterAdditionalAssets { character_id:"selected-owner-archive".into() },manifest.content_hash.clone(),1);
+    store.commit(&WorkingSetCommit {
+        expected_revision:store.revision().unwrap(),
+        add_character:Some(serde_json::json!({"chaId":"selected-owner-archive","type":"character","name":"Synthetic","additionalAssets":[["extra","assets/owner-archive.png","png"]],"localFuture":"synthetic local-only archive detail","chats":[]})),
+        asset_owner_heads:Some(vec![head.clone()]),
+        ..Default::default()
+    }).unwrap();
+    job.release(CasReleaseOutcome::Committed).unwrap();
+    super::lww_tests::drain_publications(&core,&mut store,&[]).unwrap();
+    store.archive_character("selected-owner-archive",store.revision().unwrap(),5).unwrap();
+    super::lww_tests::drain_publications(&core,&mut store,&[]).unwrap();
+    let generation=store.read_asset_owner_head(&head.owner,None).unwrap().unwrap();
+    assert_eq!(generation.value,head);
+    let selected=store.selected_character_asset_hashes("selected-owner-archive").unwrap();
+    assert!(selected.contains(&manifest.content_hash)); assert!(selected.contains(&asset));
+    let archive_unit=store.lww_read_unit_state(store.lww_binding_authority().unwrap(),None,100).unwrap().entries.into_iter().find(|entry|entry.key.components()==["archive","selected-owner-archive"]).unwrap();
+    let risunest_sync_wire::unit::UnitValue::Object {descriptor,..}=archive_unit.value else {panic!("native archive must have a descriptor")};
+    let metadata:serde_json::Value=serde_json::from_slice(&store.lww_object_body(&descriptor.object_hash).unwrap().unwrap()).unwrap();
+    let shared=metadata["sharedObjectHash"].as_str().unwrap().to_owned();
+    let local_roots=selected.iter().filter(|hash|**hash!=asset && **hash!=manifest.content_hash && **hash!=shared).cloned().collect::<Vec<_>>();
+    assert_eq!(local_roots.len(),1);
+    let local_archive=&local_roots[0];
+    assert!(selected.contains(&shared)); assert_ne!(local_archive,&shared);
+    let inventory=store.residency_inventory_classification_test(false).unwrap();
+    assert!(inventory.0.contains(local_archive)); assert!(!inventory.0.contains(&shared));
+    assert!(!selected.contains(&descriptor.object_hash));
+    assert!(cas.stat_object(&descriptor.object_hash).unwrap().is_none());
+    store.asset_residency_set_policy(super::residency::AssetPolicy::Remote,||Ok(())).unwrap();
+    store.asset_residency_evict(||Ok(())).unwrap();
+    assert!(cas.stat_object(&asset).unwrap().is_none()); assert!(cas.stat_object(local_archive).unwrap().is_none());
+    assert!(cas.stat_object(&manifest.content_hash).unwrap().is_some());
+    let collected=store.asset_gc_delete_page(64,None,10_000,0).unwrap();
+    assert!(collected.report.deleted_hashes.contains(&shared));
+    assert!(cas.stat_object(&shared).unwrap().is_none());
+    assert!(Residency::open(store.repository_root()).unwrap().object(&shared,None).unwrap().is_none());
+    store.asset_residency_set_policy_prioritized(super::residency::AssetPolicy::Full,None,Some("selected-owner-archive"),||Ok(())).unwrap();
+    assert!(cas.stat_object(&asset).unwrap().is_some()); assert!(cas.stat_object(local_archive).unwrap().is_some());
+    assert!(cas.stat_object(&manifest.content_hash).unwrap().is_some());
+    assert!(cas.stat_object(&shared).unwrap().is_none());
+    assert_eq!(store.read_asset_owner_head(&head.owner,None).unwrap().unwrap().value,head);
+}
+
+#[test]
+fn selected_priority_does_not_hide_missing_required_assets_in_the_full_inventory() {
+    let server=LocalServerFixture::new(); let (_root,mut store)=local();
+    let _core=server.client(&store);
+    let selected=put_asset(&mut store,"assets/selected-present.png",b"synthetic selected present payload");
+    let missing=put_asset(&mut store,"assets/other-missing.png",b"synthetic required missing payload");
+    for (character,alias) in [("selected-present",&selected),("other-missing",&missing)] {
+        store.commit(&WorkingSetCommit {
+            expected_revision:store.revision().unwrap(),
+            add_character:Some(serde_json::json!({"chaId":character,"type":"character","name":"Synthetic","image":alias.key,"chats":[]})),
+            ..Default::default()
+        }).unwrap();
+    }
+    let cas=PayloadCas::new(store.repository_root()).unwrap();
+    let hash=missing.object_hash.as_ref().unwrap();
+    let size=cas.stat_object(hash).unwrap().unwrap();
+    cas.unlink_exact_object(hash,size,&crate::asset_repository::object_physical_key(hash)).unwrap();
+    assert!(store.residency_inventory_classification_test(false).unwrap().0.contains(hash));
+    assert!(Residency::open(store.repository_root()).unwrap().object(hash,None).unwrap().is_none());
+    store.asset_residency_set_policy(super::residency::AssetPolicy::Remote,||Ok(())).unwrap();
+    let error=store.asset_residency_set_policy_prioritized(super::residency::AssetPolicy::Full,None,Some("selected-present"),||Ok(())).err().unwrap();
+    assert_eq!(error.code,"required-asset-unavailable");
+    assert!(cas.stat_object(selected.object_hash.as_ref().unwrap()).unwrap().is_some());
+    assert!(cas.stat_object(hash).unwrap().is_none());
+}
+
+#[test]
 fn cancelled_full_hydration_keeps_remote_proof_and_retries_without_a_partial_body() {
     let cancelled = Arc::new(AtomicBool::new(false));
     let armed = Arc::new(AtomicBool::new(false));
@@ -96,7 +294,7 @@ fn transient_hydration_keeps_the_body_remote_and_reclaims_its_spool() {
         .unwrap();
     store.asset_residency_evict(|| Ok(())).unwrap();
     let cas = PayloadCas::new(store.repository_root()).unwrap();
-    let mut body = super::residency::open_transient_with_check(
+    let mut body = super::residency::open_transient_server_with_check(
         store.repository_root(),
         store.repository_root(),
         &hash,
@@ -108,6 +306,7 @@ fn transient_hydration_keeps_the_body_remote_and_reclaims_its_spool() {
     std::io::Read::read_to_end(&mut body, &mut actual).unwrap();
     assert_eq!(actual, bytes);
     assert!(cas.stat_object(&hash).unwrap().is_none());
+    assert!(Residency::open(store.repository_root()).unwrap().object(&hash,None).unwrap().is_some());
     drop(body);
     assert!(!std::fs::read_dir(store.repository_root())
         .unwrap()
@@ -116,6 +315,86 @@ fn transient_hydration_keeps_the_body_remote_and_reclaims_its_spool() {
             .file_name()
             .to_string_lossy()
             .starts_with("asset-transient-")));
+}
+
+#[test]
+fn frozen_server_transient_source_survives_access_config_replacement() {
+    let server = LocalServerFixture::new();
+    let (_root, mut store) = local();
+    let core = server.client(&store);
+    let bytes = vec![97; 128 * 1024 + 1];
+    let hash = put_asset(&mut store, "assets/frozen-source.png", &bytes).object_hash.unwrap();
+    let request = super::lww_tests::header(&store);
+    core.push(&mut store, &request, &[]).unwrap();
+    store.asset_residency_set_policy(super::residency::AssetPolicy::Remote, || Ok(())).unwrap();
+    store.asset_residency_evict(|| Ok(())).unwrap();
+    let residency = Residency::open(store.repository_root()).unwrap();
+    let captured = residency.object(&hash, None).unwrap().unwrap();
+    let serialized = serde_json::to_value(&captured).unwrap();
+    assert!(serialized["config"].get("token").is_none());
+    assert!(serialized["config"].get("directory").is_none());
+    assert!(serialized["config"]["credentialId"].is_string());
+    let frozen: super::residency::RemoteObject = serde_json::from_value(serialized.clone()).unwrap();
+
+    let other_server = LocalServerFixture::new();
+    let mut replacement = captured.config.clone();
+    replacement.endpoint = other_server.endpoint.clone();
+    residency.replace_access_config(&replacement).unwrap();
+    store.server_save_config(&replacement).unwrap();
+    assert_eq!(residency.object(&hash, None).unwrap().unwrap().config.endpoint, other_server.endpoint);
+    assert_eq!(serde_json::to_value(&frozen).unwrap(), serialized);
+
+    let scratch = tempfile::tempdir().unwrap();
+    let mut body = super::residency::open_transient_server_proof_with_check(
+        store.repository_root(), scratch.path(), &frozen, &|| Ok(()),
+    ).unwrap().unwrap();
+    let mut actual = Vec::new();
+    std::io::Read::read_to_end(&mut body, &mut actual).unwrap();
+    assert_eq!(actual, bytes);
+    assert_eq!(body.len().unwrap(), frozen.size);
+    assert!(PayloadCas::new(store.repository_root()).unwrap().stat_object(&hash).unwrap().is_none());
+    assert_eq!(residency.object(&hash, None).unwrap().unwrap().retention_id, frozen.retention_id);
+    drop(body);
+    assert!(std::fs::read_dir(scratch.path()).unwrap().next().is_none());
+}
+
+#[test]
+fn frozen_server_transient_authority_failure_stops_before_body_transfer() {
+    let server = LocalServerFixture::new();
+    let (_root, mut store) = local();
+    let core = server.client(&store);
+    let bytes = vec![101; 128 * 1024 + 1];
+    let hash = put_asset(&mut store, "assets/frozen-authority.png", &bytes).object_hash.unwrap();
+    let request = super::lww_tests::header(&store);
+    core.push(&mut store, &request, &[]).unwrap();
+    store.asset_residency_set_policy(super::residency::AssetPolicy::Remote, || Ok(())).unwrap();
+    store.asset_residency_evict(|| Ok(())).unwrap();
+    let proof = Residency::open(store.repository_root()).unwrap().object(&hash, None).unwrap().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let counters = Arc::new(super::client::TestIoCounters::default());
+    let error = super::client::with_test_io(store.repository_root(), counters.clone(), || {
+        super::residency::open_transient_server_proof_with_check(
+            store.repository_root(), scratch.path(), &proof, &|| {
+                if counters.snapshot()[0] != 0 { return Err(super::SyncError::new("stale-authority", 409)); }
+                Ok(())
+            },
+        )
+    }).err().expect("authority must be checked again after identity resolution");
+    assert_eq!(error.code, "stale-authority");
+    assert_eq!(counters.snapshot()[0], 1);
+    assert!(std::fs::read_dir(scratch.path()).unwrap().next().is_none());
+    assert!(PayloadCas::new(store.repository_root()).unwrap().stat_object(&hash).unwrap().is_none());
+    assert_eq!(Residency::open(store.repository_root()).unwrap().object(&hash, None).unwrap().unwrap().retention_id, proof.retention_id);
+}
+
+#[test]
+fn server_only_transient_source_does_not_hydrate_without_server_custody() {
+    let (_root,store)=local();
+    let scratch=tempfile::tempdir().unwrap();
+    let hash="a".repeat(64);
+    assert!(super::residency::open_transient_server_with_check(store.repository_root(),scratch.path(),&hash,&||Ok(())).unwrap().is_none());
+    assert!(PayloadCas::new(store.repository_root()).unwrap().stat_object(&hash).unwrap().is_none());
+    assert!(std::fs::read_dir(scratch.path()).unwrap().next().is_none());
 }
 
 #[test]

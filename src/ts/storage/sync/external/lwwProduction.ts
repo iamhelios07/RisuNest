@@ -71,6 +71,7 @@ function createAdapter(connectionId: string): Adapter {
         available: () => !!active && !active.signal.aborted && document.visibilityState !== 'hidden' && navigator.onLine,
         publish: () => publish(),
         receive: async () => receive(await context()),
+        maintain: async () => { const current = await context(); current.signal.throwIfAborted(); await invoke('external_lww_maintenance', { request: header(connectionId, current) }) },
         failed: error => {
             reportFailure(connectionId, error)
             if (['clockSkew', 'corrupt'].includes((error as { kind?: string })?.kind ?? '')) scheduler.stop()
