@@ -2824,7 +2824,12 @@ export class SaveCoordinator {
                 } else commit.replacePresets = captured.presets
             }
             if (this.dependencies.captureCharacters && !windowedCapture) {
-                if (recordedConversations) commit.conversations = [...(commit.conversations ?? []), ...recordedConversations]
+                if (recordedConversations) {
+                    const recordedTargets = new Set(recordedConversations.flatMap((mutation) => mutation.type === 'reorder'
+                        ? [] : [JSON.stringify([mutation.characterId, mutation.conversationId])]))
+                    commit.conversations = [...(commit.conversations ?? []).filter((mutation) => mutation.type === 'reorder'
+                        || !recordedTargets.has(JSON.stringify([mutation.characterId, mutation.conversationId]))), ...recordedConversations]
+                }
             } else if (windowedCapture) {
                 if (conversationProjection?.character) {
                     commit.character = conversationProjection.character
@@ -3972,6 +3977,7 @@ export class SaveCoordinator {
             pendingByConversation.set(pendingMutation.event.conversationId, conversationPending)
         }
 
+        let exactConversationValues = true
         const coveredSet = new Set<PendingConversationMutation>()
         const mutationsByPending = new Map<PendingConversationMutation, ConversationMutation[]>()
         for (const [conversationId, conversationPending] of pendingByConversation) {
@@ -4050,6 +4056,7 @@ export class SaveCoordinator {
                 }
             }
             if (coveredCount === 0 || !coveredConversation) continue
+            if (canonicalJson(coveredConversation) !== canonicalJson(capturedMatches[0])) exactConversationValues = false
             conversation = coveredConversation
             projected.chats[projectedIndex] = conversation
             for (let index = 0; index < coveredCount; index++) {
@@ -4066,7 +4073,7 @@ export class SaveCoordinator {
         )
         return {
             exactMutations:
-                mutations.length > 0 && canonicalJson(projected) === captured.characterCanonical
+                mutations.length > 0 && ((this.dependencies.captureCharacters && exactConversationValues) || canonicalJson(projected) === captured.characterCanonical)
                     ? mutations
                     : null,
             coveredPending,
