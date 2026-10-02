@@ -152,6 +152,19 @@ fn take_work(external: bool) -> NativeObservation {
     result
 }
 
+fn require_routine_observation(observation:&NativeObservation, transport:&str,
+    direction:Direction, change:SmallChange, iteration:u64) {
+    if let Err(error) = observation.validate_routine_invariants() {
+        eprintln!("{}", serde_json::to_string_pretty(&json!({
+            "kind":"synthetic-native-observation-failure", "transport":transport,
+            "direction":direction, "change":change, "iteration":iteration,
+            "validation_thread":format!("{:?}",std::thread::current().id()),
+            "error":error, "observation":observation,
+        })).unwrap());
+        panic!("invalid native sample: {error}");
+    }
+}
+
 fn prepare_edit(store: &PersistentStore, change: SmallChange, direction: Direction, iteration: u64) -> (WorkingSetCommit, Value) {
     let root = store.read_root(None).unwrap().value;
     let mut commit = WorkingSetCommit { expected_revision:store.revision().unwrap(),
@@ -300,7 +313,7 @@ impl ExternalDriver {
         observation.uploaded_bytes = bytes_after.0 - bytes_before.0;
         observation.downloaded_bytes = bytes_after.1 - bytes_before.1;
         observation.shared_head_reads = Some((provider.read_attempts("head") - head_reads_before) as u64);
-        observation.validate_routine_invariants().unwrap();
+        require_routine_observation(&observation, "fake-provider", direction, change, iteration);
         verify(destination, change, &expected);
         assert!(source.lww_read_outbox(source.lww_binding_authority().unwrap(), 1).unwrap().entries.is_empty());
         NativeSample {transport:"native-fake-provider", direction, change, iteration, observation,
@@ -374,7 +387,7 @@ impl ServerDriver {
             observation.uploaded_bytes += sent;
             observation.downloaded_bytes += received;
         }
-        observation.validate_routine_invariants().unwrap();
+        require_routine_observation(&observation, "local-server", direction, change, iteration);
         // Read the actual submitted operation only after timing and collector take.
         let (body, intent):(Vec<u8>, String) = sender.log.0.query_row(
             "SELECT body,intent FROM publications WHERE id=?1", [&receipt.operation_id],
@@ -511,6 +524,17 @@ fn external_fixture_bootstrap_correctness() {
 fn local_server_fixture_bootstrap_correctness() {
     let driver = ServerDriver::prepare(FixtureScale::small());
     verify_bootstrap(&driver.a, &driver.b);
+}
+
+#[test]
+fn local_routine_observation_regression() {
+    let mut driver = ServerDriver::prepare(FixtureScale::small());
+    for change in [SmallChange::Setting, SmallChange::Preset, SmallChange::Append] {
+        for direction in [Direction::AtoB, Direction::BtoA] {
+            let sample = driver.run(direction, change, 0);
+            sample.observation.validate_routine_invariants().unwrap();
+        }
+    }
 }
 
 #[test]
