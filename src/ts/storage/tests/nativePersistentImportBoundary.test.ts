@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 
 import type { Database } from '../database.svelte'
-import type { PersistentRoot } from '../persistentDataStore'
+import type { LwwApplyReceive, LwwApplyResult, PersistentRoot } from '../persistentDataStore'
 import { canonicalJson } from '../saveCoordinator'
 
 type StagedDatabase = {
@@ -26,6 +26,12 @@ class InMemoryNativeCommandDouble {
         switch (command) {
             case 'pds_lww_binding_state':
                 return {target:{kind:'none'},targetAuthority:'1',selectionEpoch:'0',libraryId:null,progress:null}
+            case 'pds_lww_drain_deferred': {
+                const request = args.request as LwwApplyReceive
+                if (request.bindingAuthority !== '1') throw new Error('Binding authority changed')
+                if (!request.requestId || !Array.isArray(request.generating)) throw new Error('Invalid deferred drain request')
+                return {revision:this.revision,affectedKeys:[],heldKeys:[],deferredKeys:[]} satisfies LwwApplyResult
+            }
             case 'pds_acquire_revision': {
                 if (args.revision !== this.revision) throw new Error('Requested revision is unavailable')
                 const lease=crypto.randomUUID()
