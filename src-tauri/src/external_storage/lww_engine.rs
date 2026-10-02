@@ -192,6 +192,74 @@ impl Default for PublicationResult {
         }
     }
 }
+#[cfg(test)]
+pub(crate) mod cycle_keys {
+    use risunest_sync_wire::unit::UnitKey;
+    use std::{cell::RefCell, collections::BTreeSet};
+
+    #[derive(Debug, Default)]
+    pub(crate) struct CycleKeys {
+        pub selected_keys: BTreeSet<UnitKey>,
+        pub attempted_keys: BTreeSet<UnitKey>,
+        pub emitted_keys: BTreeSet<UnitKey>,
+        pub affected_keys: BTreeSet<UnitKey>,
+        pub held_keys: BTreeSet<UnitKey>,
+        pub deferred_keys: BTreeSet<UnitKey>,
+        pub segment_attempts: usize,
+        pub accepted_publications: usize,
+        pub receive_applies: usize,
+        pub failed_operations: usize,
+        pub pending_operations: usize,
+    }
+    impl CycleKeys {
+        pub(crate) fn complete(&self) -> bool {
+            self.failed_operations == 0 && self.pending_operations == 0
+        }
+    }
+    thread_local! {
+        static WORK: RefCell<CycleKeys> = RefCell::new(CycleKeys::default());
+    }
+    pub(crate) fn reset() {
+        WORK.with(|work| {
+            let mut work = work.borrow_mut();
+            assert_eq!(work.pending_operations, 0, "cycle-key operation is still running");
+            *work = CycleKeys::default();
+        });
+    }
+    pub(crate) fn take() -> CycleKeys {
+        WORK.with(|work| {
+            let mut work = work.borrow_mut();
+            let result = std::mem::take(&mut *work);
+            work.pending_operations = result.pending_operations;
+            result
+        })
+    }
+    pub(super) fn observe(observe: impl FnOnce(&mut CycleKeys)) {
+        WORK.with(|work| observe(&mut work.borrow_mut()));
+    }
+    pub(super) struct Operation {
+        finished: bool,
+    }
+    impl Operation {
+        pub(super) fn start() -> Self {
+            observe(|work| work.pending_operations += 1);
+            Self { finished: false }
+        }
+        pub(super) fn finish(mut self) {
+            self.finished = true;
+        }
+    }
+    impl Drop for Operation {
+        fn drop(&mut self) {
+            observe(|work| {
+                work.pending_operations -= 1;
+                if !self.finished {
+                    work.failed_operations += 1;
+                }
+            });
+        }
+    }
+}
 pub(crate) struct ExternalLwwEngine {
     pub provider: Arc<dyn Provider>,
     pub repository: RepositoryHandle,
@@ -248,6 +316,8 @@ impl ExternalLwwEngine {
         generating: &[MessageLocator],
         cancel: &Cancellation,
     ) -> Result<PublicationResult> {
+        #[cfg(test)]
+        let key_operation = cycle_keys::Operation::start();
         let mut result = PublicationResult::default();
         let writer = store.lww_clock_state().map_err(store_error)?.writer_id;
         loop {
@@ -349,6 +419,10 @@ impl ExternalLwwEngine {
                     .map_err(store_error)?;
                 continue;
             }
+            #[cfg(test)]
+            cycle_keys::observe(|work| {
+                work.selected_keys.extend(publication.entries.iter().map(|entry| entry.key.clone()));
+            });
             for index in 0..publication.bodies.len() {
                 if publication.bodies[index].complete {
                     continue;
@@ -455,6 +529,11 @@ impl ExternalLwwEngine {
                     .external_lww_persist(&publication, &sealed)
                     .map_err(store_error)?;
                 let resume = publication.resume.as_ref().map(Self::resume);
+                #[cfg(test)]
+                cycle_keys::observe(|work| {
+                    work.segment_attempts += 1;
+                    work.attempted_keys.extend(publication.entries.iter().map(|entry| entry.key.clone()));
+                });
                 let receipt = self
                     .provider
                     .create_object(
@@ -500,10 +579,17 @@ impl ExternalLwwEngine {
             store
                 .external_lww_finish_publication(&publication, &sealed)
                 .map_err(store_error)?;
+            #[cfg(test)]
+            cycle_keys::observe(|work| {
+                work.accepted_publications += 1;
+                work.emitted_keys.extend(payload.changes.iter().map(|change| change.key.clone()));
+            });
             result.segments.0 += 1;
             result.units.0 += publication.entries.len() as u64;
             result.bytes.0 += sealed.len() as u64;
         }
+        #[cfg(test)]
+        key_operation.finish();
         Ok(result)
     }
     fn validate_receipt(intent: &ObjectIntent, receipt: &ObjectReceipt) -> Result<()> {
@@ -993,11 +1079,12 @@ impl ExternalLwwEngine {
         generating: &[MessageLocator],
         cancel: &Cancellation,
     ) -> Result<usize> {
+        let key_operation = cycle_keys::Operation::start();
         let requests = self.receive_requests(store, authority, cancel).await?;
         let mut count = 0;
         for request in requests {
             store.lww_stage_receive(&request).map_err(store_error)?;
-            store
+            let applied = store
                 .lww_apply_receive(&ApplyReceive {
                     header: request.header.clone(),
                     generating: generating.to_vec(),
@@ -1006,8 +1093,15 @@ impl ExternalLwwEngine {
             store
                 .lww_finish_receive(&request.header)
                 .map_err(store_error)?;
+            cycle_keys::observe(|work| {
+                work.receive_applies += 1;
+                work.affected_keys.extend(applied.affected_keys);
+                work.held_keys.extend(applied.held_keys);
+                work.deferred_keys.extend(applied.deferred_keys);
+            });
             count += 1;
         }
+        key_operation.finish();
         Ok(count)
     }
 }
