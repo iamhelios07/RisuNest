@@ -1,7 +1,7 @@
 use super::source_receipt::{EndReceipt,SettledSource,ShutdownReceipt,Snapshot};
 use serde_json::{json,Value};
 use sha2::{Digest,Sha256};
-use std::{collections::{BTreeMap,BTreeSet},io::{BufRead,BufReader,Write},path::Path,
+use std::{collections::{BTreeMap,BTreeSet},io::{BufRead,BufReader,Read,Write},path::Path,
     process::{Child,ChildStdin,Command,Stdio},sync::mpsc,time::Duration};
 
 const PREFIX:&[u8]=b"RISUNEST_SYNC_SOURCE ";
@@ -13,6 +13,7 @@ pub struct SourceProcess {
     child:Child,input:ChildStdin,replies:mpsc::Receiver<Result<Value,String>>,
     pub ready:Value,pub raw_observations:Vec<Value>,request_sequence:u64,active:Option<(String,u64,String)>,ended:Option<EndReceipt>,
     events:Vec<Value>,failed:bool,stopped:bool,
+    inventory:BTreeMap<String,BTreeSet<String>>,barrier:Option<(String,String)>,
 }
 fn hex_hash(value:&str)->bool {value.len()==64 && value.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b))}
 fn read_record(input:&mut impl BufRead,limit:usize)->Result<Option<Vec<u8>>,String> {
@@ -29,6 +30,7 @@ fn read_record(input:&mut impl BufRead,limit:usize)->Result<Option<Vec<u8>>,Stri
 fn verify_ready(ready:&Value,source:&str,binary:&str,run:&str)->Result<(),String> {
     if ready["type"]!="ready" || ready["sourceFingerprint"]!=source || ready["binarySha256"]!=binary
         || ready["runId"]!=run || ready["observerSchema"]!=1 || ready["maxCommandBytes"]!=67108864u64
+        || ready["readBarrierHoldLimitMillis"]!=30000u64
         || ready["sourceComposition"]!="same-source-linked-object-delta-stream-transfer"
         || ready["structuralVerification"]!="normal-linked-recipe-field-move-and-frame-encode-parity"
         || ready["endpoint"].as_str().is_none_or(|s|!s.starts_with("http://127.0.0.1:"))
@@ -36,19 +38,24 @@ fn verify_ready(ready:&Value,source:&str,binary:&str,run:&str)->Result<(),String
         || ready["sourceClosure"].as_array().is_none_or(Vec::is_empty) {
         return Err("source Ready identity or composition mismatch".into());
     }
-    let mut paths=BTreeSet::new();
+    let mut paths=BTreeMap::new();let mut identities=BTreeSet::new();
     for entry in ready["sourceClosure"].as_array().unwrap() {
         let path=entry["path"].as_str().ok_or("source closure path missing")?;
-        if path.is_empty() || !paths.insert(path) || entry["role"].as_str().is_none_or(str::is_empty)
-            || entry["sha256"].as_str().is_none_or(|s|!hex_hash(s)) {return Err("source closure identity invalid".into());}
+        let role=entry["role"].as_str().ok_or("source closure role missing")?;
+        let sha=entry["sha256"].as_str().ok_or("source closure SHA missing")?;
+        if path.is_empty() || role.is_empty() || !identities.insert((path,role)) || !hex_hash(sha)
+            || paths.insert(path,sha).is_some_and(|previous|previous!=sha) {return Err("source closure identity invalid".into());}
     }
     Ok(())
 }
 impl SourceProcess {
     pub fn start(executable:&Path,expected_source:&str,expected_binary:&str,run_id:&str)->Result<Self,String> {
         if !hex_hash(expected_source) || !hex_hash(expected_binary) || run_id.is_empty() {return Err("source launch identity absent".into());}
-        let binary=std::fs::read(executable).map_err(|_|"frozen source executable unavailable")?;
-        if hex::encode(Sha256::digest(&binary))!=expected_binary {return Err("frozen source executable SHA mismatch".into());}
+        let mut binary=std::fs::File::open(executable).map_err(|_|"frozen source executable unavailable")?;
+        let mut digest=Sha256::new();let mut buffer=[0u8;64*1024];
+        loop {let bytes=binary.read(&mut buffer).map_err(|_|"frozen source executable read failed")?;
+            if bytes==0 {break;}digest.update(&buffer[..bytes]);}
+        if hex::encode(digest.finalize())!=expected_binary {return Err("frozen source executable SHA mismatch".into());}
         let mut command=Command::new(executable);
         command.args(["--ignored","--exact","source_observer_harness::serve","--nocapture","--test-threads=1"])
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
@@ -71,7 +78,8 @@ impl SourceProcess {
                 }
             }
         });
-        let mut process=Self {child,input,replies,ready:Value::Null,raw_observations:vec![],request_sequence:0,active:None,ended:None,events:vec![],failed:false,stopped:false};
+        let mut process=Self {child,input,replies,ready:Value::Null,raw_observations:vec![],request_sequence:0,active:None,ended:None,events:vec![],failed:false,stopped:false,
+            inventory:BTreeMap::new(),barrier:None};
         let ready=process.exchange(json!({"op":"start","runId":run_id,"expectedSourceFingerprint":expected_source}),"ready")?;
         verify_ready(&ready,expected_source,expected_binary,run_id)?;process.ready=ready;Ok(process)
     }
@@ -113,7 +121,52 @@ impl SourceProcess {
         let reply=self.exchange(json!({"op":"beginScope","scopeId":scope,"phase":phase,"roles":roles}),"scopeStarted")?;
         let generation=reply["generation"].as_u64().filter(|&n|n>0).ok_or("source generation absent")?;
         if reply["scopeId"]!=scope || reply["completeReset"]!=true {self.failed=true;return Err("source Begin reset not proven".into());}
-        self.active=Some((scope.into(),generation,phase.into()));self.ended=None;Ok(reply)
+        self.active=Some((scope.into(),generation,phase.into()));self.ended=None;self.inventory=inventory.clone();
+        self.barrier=None;self.events.clear();Ok(reply)
+    }
+    pub fn arm_read_barrier(&mut self,barrier_id:&str,hash:&str)->Result<Value,String> {
+        let (scope,generation,_)=self.active.as_ref().ok_or("source read barrier lacks active scope")?.clone();
+        if self.barrier.is_some() || barrier_id.is_empty() || !self.inventory.get(hash).is_some_and(|roles|roles.contains("Asset")) {
+            return Err("source read barrier lacks exact declared Asset identity".into());
+        }
+        let reply=self.exchange(json!({"op":"armReadBarrier","scopeId":scope,"generation":generation,
+            "barrierId":barrier_id,"hash":hash,"flow":"source"}),"readBarrierArmed")?;
+        self.check_barrier(&reply["barrier"],barrier_id,hash,"armed")?;
+        self.barrier=Some((barrier_id.into(),hash.into()));Ok(reply)
+    }
+    fn check_barrier(&self,proof:&Value,id:&str,hash:&str,status:&str)->Result<(),String> {
+        let (scope,generation,phase)=self.active.as_ref().ok_or("source read barrier scope absent")?;
+        if proof["scopeId"]!=*scope || proof["generation"]!=*generation || proof["phase"]!=*phase
+            || proof["barrierId"]!=id || proof["hash"]!=hash || proof["flow"]!="source" || proof["status"]!=status {
+            return Err("source read barrier receipt identity differs".into());
+        }
+        Ok(())
+    }
+    pub fn wait_read_barrier(&mut self)->Result<Value,String> {
+        let (id,hash)=self.barrier.clone().ok_or("source read barrier not armed")?;
+        let event=if self.events.is_empty() {
+            match self.replies.recv_timeout(REPLY_WAIT) {
+                Ok(Ok(reply)) if reply["type"]=="readBarrierReached"=>reply,
+                _=>{self.failed=true;return Err("actual source physical read barrier was not observed".into());},
+            }
+        } else {self.events.remove(0)};
+        let (scope,generation,phase)=self.active.as_ref().ok_or("source barrier scope absent")?;
+        if event["scopeId"]!=*scope || event["generation"]!=*generation || event["phase"]!=*phase
+            || event["barrierId"]!=id || event["hash"]!=hash || event["flow"]!="source"
+            || !matches!(event["readKind"].as_str(),Some("stdRead"|"asyncRead"))
+            || event["placement"].as_str().is_none_or(|p|p.is_empty() || p=="inline")
+            || event["offset"].as_u64().is_none() || event["elapsedNanos"].as_str().is_none_or(|s|
+                s.parse::<u128>().ok().is_none_or(|n|n.to_string()!=s)) {
+            self.failed=true;return Err("actual source read event identity or clock differs".into());
+        }
+        self.raw_observations.push(event.clone());Ok(event)
+    }
+    pub fn release_read_barrier(&mut self)->Result<Value,String> {
+        let (id,hash)=self.barrier.clone().ok_or("source read barrier not armed")?;
+        let (scope,generation,_)=self.active.as_ref().ok_or("source read barrier scope absent")?.clone();
+        let reply=self.exchange(json!({"op":"releaseReadBarrier","scopeId":scope,"generation":generation,
+            "barrierId":id,"hash":hash,"flow":"source"}),"readBarrierReleased")?;
+        self.check_barrier(&reply["barrier"],&id,&hash,"released")?;Ok(reply)
     }
     pub fn end(&mut self)->Result<EndReceipt,String> {
         let (scope,generation,phase)=self.active.as_ref().ok_or("no active source scope")?.clone();
@@ -124,6 +177,10 @@ impl SourceProcess {
         let observation:Snapshot=serde_json::from_value(reply["observation"].clone()).map_err(|_|"unconsumed source observation schema")?;
         if observation.scope_id!=scope || observation.generation!=generation || observation.phase!=phase {
             self.failed=true;return Err("source End scope identity changed".into());
+        }
+        if observation.role_count!=self.inventory.len() as u64 || observation.objects.iter().any(|object|
+            self.inventory.get(&object.hash).is_none_or(|roles|roles.iter().cloned().collect::<Vec<_>>()!=object.purposes)) {
+            self.failed=true;return Err("source actual object roles differ from entire producer declaration".into());
         }
         observation.validate()?;let receipt=EndReceipt {scope_id:scope,observation};
         self.active=None;self.ended=Some(receipt.clone());Ok(receipt)
@@ -160,5 +217,18 @@ mod tests {
         assert!(read_record(&mut &b"oversized\n"[..],4).is_err());
         assert!(read_record(&mut &b"partial"[..],20).is_err());
         assert!(read_record(&mut &b""[..],20).unwrap().is_none());
+    }
+    #[test]
+    fn compiled_closure_preserves_same_path_role_pairs_and_rejects_hash_disagreement() {
+        let source="a".repeat(64);let binary="b".repeat(64);
+        let mut ready=json!({"type":"ready","runId":"synthetic","sourceFingerprint":source,"binarySha256":binary,
+            "observerSchema":1,"maxCommandBytes":67108864,"readBarrierHoldLimitMillis":30000,"endpoint":"http://127.0.0.1:1234","rootId":"synthetic-root",
+            "sourceComposition":"same-source-linked-object-delta-stream-transfer",
+            "structuralVerification":"normal-linked-recipe-field-move-and-frame-encode-parity",
+            "sourceClosure":[{"path":"shared.rs","role":"normal","sha256":"c".repeat(64)},
+                {"path":"shared.rs","role":"linked","sha256":"c".repeat(64)}]});
+        verify_ready(&ready,&source,&binary,"synthetic").unwrap();
+        let valid=ready.clone();ready["sourceClosure"][1]["role"]="normal".into();assert!(verify_ready(&ready,&source,&binary,"synthetic").is_err());
+        ready=valid;ready["sourceClosure"][1]["sha256"]="d".repeat(64).into();assert!(verify_ready(&ready,&source,&binary,"synthetic").is_err());
     }
 }
