@@ -599,6 +599,16 @@ impl PersistentStore {
         &mut self,
         revision: i64,
     ) -> StoreResult<(super::LeaseResult, Vec<device_store::sections::PreparedSectionRows>)> {
+        self.acquire_backup_capture(revision, true)
+    }
+    pub(crate) fn lww_acquire_library_backup_capture(&mut self, revision: i64) -> StoreResult<super::LeaseResult> {
+        self.acquire_backup_capture(revision, false).map(|(lease, _)| lease)
+    }
+    fn acquire_backup_capture(
+        &mut self,
+        revision: i64,
+        device_sections: bool,
+    ) -> StoreResult<(super::LeaseResult, Vec<device_store::sections::PreparedSectionRows>)> {
         use risunest_external_storage_format::section::SectionKind;
         let path: String = self.device_store()?.connection().query_row(
             "SELECT file FROM pragma_database_list WHERE name='main'", [], |row| row.get(0),
@@ -612,11 +622,14 @@ impl PersistentStore {
         if tx.query_row("SELECT EXISTS(SELECT 1 FROM lww_intents WHERE complete=0) OR EXISTS(SELECT 1 FROM lww_receive WHERE finished=0 AND authority=(SELECT binding_authority FROM lww_clock WHERE singleton=1))", [], |row| row.get::<_,bool>(0))? {
             return Err(StoreError::CommitBusy);
         }
-        let snapshot = Connection::open_with_flags(
-            &path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        snapshot.execute_batch("PRAGMA busy_timeout=5000; PRAGMA query_only=ON; PRAGMA mmap_size=0; BEGIN;")?;
-        snapshot.query_row("SELECT revision FROM device_meta WHERE singleton=1", [], |row| row.get::<_,i64>(0))?;
+        let snapshot = if device_sections {
+            let snapshot = Connection::open_with_flags(
+                &path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            snapshot.execute_batch("PRAGMA busy_timeout=5000; PRAGMA query_only=ON; PRAGMA mmap_size=0; BEGIN;")?;
+            snapshot.query_row("SELECT revision FROM device_meta WHERE singleton=1", [], |row| row.get::<_,i64>(0))?;
+            Some(snapshot)
+        } else { None };
         let lease = self.acquire_revision(revision)?;
         let outcome = (|| {
             let library = &self.revision_leases[&lease.lease].connection;
@@ -626,10 +639,13 @@ impl PersistentStore {
             tx.rollback()?;
             #[cfg(test)]
             BACKUP_CAPTURE_RELEASED.with(|hook| { if let Some(hook) = hook.borrow_mut().take() { hook(); } });
-            let sections = device_store::sections::capture_backup_sections_snapshot(
-                &snapshot, &[SectionKind::Hypa, SectionKind::LocalPlugins, SectionKind::LocalSettings],
-            )?;
-            snapshot.execute_batch("COMMIT;")?;
+            let sections = if let Some(snapshot) = snapshot {
+                let sections = device_store::sections::capture_backup_sections_snapshot(
+                    &snapshot, &[SectionKind::Hypa, SectionKind::LocalPlugins, SectionKind::LocalSettings],
+                )?;
+                snapshot.execute_batch("COMMIT;")?;
+                sections
+            } else { Vec::new() };
             Ok(sections)
         })();
         drop(barrier);

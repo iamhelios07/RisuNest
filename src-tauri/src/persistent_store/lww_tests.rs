@@ -789,6 +789,39 @@ fn incoming_message_value(target: &PersistentStore, character: &str, conversatio
 }
 
 #[test]
+fn library_backup_capture_pins_finished_held_and_deferred_proofs_without_device_spools() {
+    let (_dir,mut store)=store(); create_conversation(&mut store,"char","chat");
+    let time=store.lww_clock_state().unwrap().issued.unwrap().physical_ms.0+1;
+    let message=Change{key:unit_key(&["messages","char","chat"]).unwrap(),stamp:stamp(time),value:incoming_message_value(&store,"char","chat","library-only-deferred")};
+    let held=change(&["character","missing","name"],time,serde_json::json!("library-only-held"));
+    let header=Header{binding_authority:store.lww_binding_authority().unwrap(),request_id:"library-only-capture".into()};
+    store.lww_stage_receive(&StageReceive{header:header.clone(),changes:vec![message.clone(),held.clone()],progress:Progress{kind:"server".into(),cursor:1.into(),writer_id:None},admitted_time_upper_ms:u64::MAX.into()}).unwrap();
+    assert!(matches!(store.lww_acquire_library_backup_capture(store.revision().unwrap()),Err(StoreError::CommitBusy)));
+    let applied=store.lww_apply_receive(&ApplyReceive{header:header.clone(),generating:vec![MessageLocator{character_id:"char".into(),conversation_id:"chat".into(),start:None}]}).unwrap();
+    assert_eq!(applied.held_keys,vec![held.key.clone()]);
+    assert_eq!(applied.deferred_keys,vec![message.key.clone()]);
+    assert!(matches!(store.lww_acquire_library_backup_capture(store.revision().unwrap()),Err(StoreError::CommitBusy)));
+    assert!(store.revision_leases.is_empty());
+    store.lww_finish_receive(&header).unwrap();
+    store.device_store().unwrap().connection().execute_batch("INSERT INTO hypa_embeddings VALUES('invalid-key','synthetic','model',NULL,1,1,x'00000000',NULL,0,'0','',NULL,NULL,NULL)").unwrap();
+    assert!(store.lww_acquire_backup_capture(store.revision().unwrap()).is_err());
+    assert!(store.revision_leases.is_empty());
+    let lease=store.lww_acquire_library_backup_capture(store.revision().unwrap()).unwrap();
+    assert!(store.revision_leases[&lease.lease].connection.is_readonly("backup_device").unwrap());
+    let units=store.lww_backup_unit_values(&lease.lease).unwrap();
+    assert_eq!(units[&held.key],held.value);
+    assert_eq!(units[&message.key],message.value);
+    assert!(units.keys().all(|key|!is_device(key)));
+    store.device_store().unwrap().connection().execute("UPDATE lww_receive SET finished=0,digest='changed-after-pin' WHERE request_id=?1",[&header.request_id]).unwrap();
+    assert_eq!(store.lww_backup_unit_values(&lease.lease).unwrap(),units);
+    assert!(matches!(store.lww_acquire_library_backup_capture(store.revision().unwrap()),Err(StoreError::CommitBusy)));
+    store.release_revision(&lease.lease).unwrap();
+    assert!(store.revision_leases.is_empty());
+    assert_eq!(store.active_readers.active_count(),0);
+    assert!(matches!(store.lww_backup_unit_values(&lease.lease),Err(StoreError::SnapshotReleased)));
+}
+
+#[test]
 fn backup_held_messages_restore_with_one_stamp_and_project_after_reopen_and_later_parent() {
     let (dir,mut store)=store();
     let message=Change{key:unit_key(&["messages","waiting","chat"]).unwrap(),stamp:stamp(2),value:incoming_message_value(&store,"waiting","chat","held-backup-message")};
