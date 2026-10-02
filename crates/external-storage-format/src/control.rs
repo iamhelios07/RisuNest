@@ -93,7 +93,6 @@ pub enum BackupPointKind {
     Backup,
     History,
     Manual,
-    Conflict,
 }
 
 /// A point names the one backup bundle it preserves.
@@ -127,20 +126,6 @@ impl BackupPointDocument {
         };
         value.validate()?;
         Ok(value)
-    }
-    pub fn conflict(
-        repository_id: String,
-        point_id: String,
-        created_at_ms: u64,
-        remote_bundle: StoredObject,
-    ) -> Result<Self> {
-        Self::single(
-            repository_id,
-            point_id,
-            BackupPointKind::Conflict,
-            created_at_ms,
-            remote_bundle,
-        )
     }
     pub fn bundles(&self) -> Vec<&StoredObject> {
         vec![&self.bundle]
@@ -672,9 +657,10 @@ mod tests {
         )
         .is_err());
 
-        let point = BackupPointDocument::conflict(
+        let point = BackupPointDocument::single(
             "repository".into(),
             "point".into(),
+            BackupPointKind::Manual,
             1,
             stored("bundle-b", ObjectRole::BackupBundle),
         )
@@ -687,17 +673,11 @@ mod tests {
         assert!(encoded_value.get("remoteBundle").is_none());
         assert_eq!(point.bundles(), vec![&point.bundle]);
 
-        let old_dual_shape = serde_json::json!({
-            "schema": POINT_SCHEMA,
-            "repositoryId": "repository",
-            "pointId": "point",
-            "kind": "conflict",
-            "createdAtMs": 1,
-            "localBundle": stored("bundle-a", ObjectRole::BackupBundle),
-            "remoteBundle": stored("bundle-b", ObjectRole::BackupBundle),
-        });
+        let mut unknown_field = encoded_value.clone();
+        unknown_field["extraBundle"] =
+            serde_json::to_value(stored("bundle-a", ObjectRole::BackupBundle)).unwrap();
         assert!(
-            BackupPointDocument::decode(&serde_json::to_vec(&old_dual_shape).unwrap(), 8192)
+            BackupPointDocument::decode(&serde_json::to_vec(&unknown_field).unwrap(), 8192)
                 .is_err()
         );
 
@@ -710,18 +690,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(single.bundles().len(), 1);
-        assert!(BackupPointDocument::conflict(
+        assert!(BackupPointDocument::single(
             "repository".into(),
             "point".into(),
+            BackupPointKind::Manual,
             1,
             stored("state", ObjectRole::SyncState),
         )
         .is_err());
         let mut wrong_repository = stored("bundle", ObjectRole::BackupBundle);
         wrong_repository.header.repository_id = "other-repository".into();
-        assert!(BackupPointDocument::conflict(
+        assert!(BackupPointDocument::single(
             "repository".into(),
             "point".into(),
+            BackupPointKind::Manual,
             1,
             wrong_repository,
         )
@@ -934,10 +916,9 @@ mod tests {
     }
 
     /// Two devices backing up the same repository produce separate points whose
-    /// contents are never merged, and a conflict point names only the remote
-    /// bundle already being preserved.
+    /// contents are never merged.
     #[test]
-    fn a_backup_point_belongs_to_one_device_and_a_conflict_keeps_the_remote_bundle() {
+    fn a_backup_point_belongs_to_one_device() {
         let bundle = |id: &str, writer: &str, kind: SectionKind| {
             BackupBundleDocument::new(
                 "repository".into(),
@@ -981,23 +962,6 @@ mod tests {
         assert_eq!(own.bundles().len(), 1);
         assert_eq!(other.bundles().len(), 1);
         assert_ne!(own.bundles()[0].header.object_id, other.bundles()[0].header.object_id);
-
-        let conflict = BackupPointDocument::conflict(
-            "repository".into(),
-            "point-conflict".into(),
-            1,
-            stored("bundle-b", ObjectRole::BackupBundle),
-        )
-        .unwrap();
-        assert_eq!(conflict.bundle.header.object_id, "bundle-b");
-        assert_eq!(
-            conflict
-                .bundles()
-                .iter()
-                .map(|object| object.header.object_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["bundle-b"]
-        );
     }
 
     /// A repository created while every device section was switched off still

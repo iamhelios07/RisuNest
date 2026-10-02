@@ -248,6 +248,10 @@ pub(crate) fn hydrate_registered_many(root:&Path,digests:&[String],priority:&std
     opened:&mut dyn FnMut(&str,crate::server_sync::residency::HydrationOutcome))->crate::server_sync::Result<Vec<String>> {
     use crate::server_sync::residency::{with_hydration_lock,HydrationOutcome};
     fn error(_:impl std::fmt::Display)->crate::server_sync::SyncError {crate::server_sync::SyncError::new("external-body-unavailable",502)}
+    fn remote_error(error:ProviderError)->crate::server_sync::SyncError {
+        if error.kind==ErrorKind::Cancelled {crate::server_sync::SyncError::new("cancelled",409)} else {crate::server_sync::SyncError::new("external-body-unavailable",502)}
+    }
+    let installer_error=std::cell::RefCell::new(None);
     let cancel=cancellation.map(Cancellation::with_external_flag).unwrap_or_default();
     let cas=crate::asset_repository::PayloadCas::new(root)?;
     let scratch=tempfile::tempdir()?;
@@ -256,7 +260,7 @@ pub(crate) fn hydrate_registered_many(root:&Path,digests:&[String],priority:&std
     let mut standalone=Vec::new();
     let mut connections=std::collections::BTreeMap::<(PathBuf,String,String),Vec<PackedSource>>::new();
     for hash in digests {
-        check()?;cancel.check().map_err(error)?;
+        check()?;cancel.check().map_err(remote_error)?;
         if !seen.insert(hash.clone()) {continue;}
         if cas.stat_object(hash)?.is_some() {opened(hash,HydrationOutcome::AlreadyLocal);continue;}
         match freeze_remote_body(root,hash).map_err(error)? {
@@ -271,7 +275,7 @@ pub(crate) fn hydrate_registered_many(root:&Path,digests:&[String],priority:&std
     standalone.sort_by_key(|source|!priority.contains(&source.hash));
     let mut install=|hash:&str,size:u64,path:&Path|->crate::server_sync::Result<()> {
         with_hydration_lock(root,hash,check,|| {
-            check()?;cancel.check().map_err(error)?;
+            check()?;cancel.check().map_err(remote_error)?;
             if let Some(actual)=cas.stat_object(hash)? {
                 if actual!=size {return Err(error("invalid-body"));}
                 opened(hash,HydrationOutcome::AlreadyLocal);return Ok(());
@@ -286,10 +290,10 @@ pub(crate) fn hydrate_registered_many(root:&Path,digests:&[String],priority:&std
             let mut input=crate::asset_repository::body_io::TrackedBodyFile::new(input,hash);
             #[cfg(not(test))]
             let mut input=input;
-            let install_check=|| {check()?;cancel.check().map_err(error)};
+            let install_check=|| {check()?;cancel.check().map_err(remote_error)};
             let staged=crate::server_sync::transfer::stage_checked(&cas,&mut input,hash,size,&install_check)?;
             let _guard=crate::asset_repository::coordinator::lock_repository_mutation()?;
-            check()?;cancel.check().map_err(error)?;
+            check()?;cancel.check().map_err(remote_error)?;
             cas.publish_staged(staged)?;
             crate::persistent_store::register_asset_objects_at_root(root,&[crate::persistent_store::asset_object_catalog::AssetObjectRegistration{object_hash:hash.into(),byte_size:size}],i64::try_from(super::runtime::now_ms()).map_err(error)?).map_err(error)?;
             opened(hash,HydrationOutcome::Downloaded);Ok(())
@@ -298,12 +302,12 @@ pub(crate) fn hydrate_registered_many(root:&Path,digests:&[String],priority:&std
     // Selected standalone bodies precede background pack groups.
     for source in standalone.iter().filter(|source|priority.contains(&source.hash)) {
         let frozen=FrozenBodySource::Standalone(source.clone());
-        let file=tauri::async_runtime::block_on(spool_frozen_remote_body(&frozen,scratch.path(),&cancel)).map_err(error)?;
+        let file=tauri::async_runtime::block_on(spool_frozen_remote_body(&frozen,scratch.path(),&cancel)).map_err(remote_error)?;
         install(&source.hash,source.body.plaintext_byte_length.0,file.path())?;
     }
     for ((connection_root,connection_id,library_id),group) in groups {
-        check()?;cancel.check().map_err(error)?;
-        tauri::async_runtime::block_on(async {
+        check()?;cancel.check().map_err(remote_error)?;
+        let result=tauri::async_runtime::block_on(async {
             let (provider,repository,key)=open_source_connection(&connection_root,&connection_id,&library_id,&cancel).await?;
             let stored=ConnectionStore::open(&connection_root)?.read(&connection_id)?;
             for source in &group {validate_packed_source(source,&repository)?;}
@@ -317,7 +321,7 @@ pub(crate) fn hydrate_registered_many(root:&Path,digests:&[String],priority:&std
             owner.run(&protection,&cancel,async {
                 let mut missing=Vec::new();
                 for source in group {
-                    if let Some(size)=cas.stat_object(&source.hash).map_err(local)? {if size!=source.byte_length {return Err(segment::corrupt());} install(&source.hash,size,scratch.path()).map_err(|_|segment::corrupt())?;}
+                    if let Some(size)=cas.stat_object(&source.hash).map_err(local)? {if size!=source.byte_length {return Err(segment::corrupt());} install(&source.hash,size,scratch.path()).map_err(|error| {installer_error.replace(Some(error));segment::corrupt()})?;}
                     else {missing.push(source);}
                 }
                 if missing.is_empty() {return Ok(());}
@@ -325,15 +329,17 @@ pub(crate) fn hydrate_registered_many(root:&Path,digests:&[String],priority:&std
                 let files=super::snapshot_restore::download_packed_body_files(&missing,stage.path(),&key,provider.as_ref(),&repository,&cancel).await?;
                 for source in missing {
                     if let Some(reason)=owner.recheck(&protection,&cancel).await? {return Err(super::leases::yield_error(reason));}
-                    install(&source.hash,source.byte_length,files.get(&source.hash).ok_or_else(segment::corrupt)?).map_err(|_|segment::corrupt())?;
+                    install(&source.hash,source.byte_length,files.get(&source.hash).ok_or_else(segment::corrupt)?).map_err(|error| {installer_error.replace(Some(error));segment::corrupt()})?;
                 }
                 Ok(())
             }).await
-        }).map_err(error)?;
+        });
+        if let Some(error)=installer_error.borrow_mut().take() {return Err(error);}
+        result.map_err(remote_error)?;
     }
     for source in standalone.iter().filter(|source|!priority.contains(&source.hash)) {
         let frozen=FrozenBodySource::Standalone(source.clone());
-        let file=tauri::async_runtime::block_on(spool_frozen_remote_body(&frozen,scratch.path(),&cancel)).map_err(error)?;
+        let file=tauri::async_runtime::block_on(spool_frozen_remote_body(&frozen,scratch.path(),&cancel)).map_err(remote_error)?;
         install(&source.hash,source.body.plaintext_byte_length.0,file.path())?;
     }
     check()?;Ok(unavailable)

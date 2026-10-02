@@ -579,6 +579,10 @@ pub(crate) struct CompletedSnapshot {
     /// the publication's own work.
     pub maintenance: MaintenanceReport,
     pub hydration: SourceHydration,
+    #[cfg(test)]
+    pub compaction_catalog_merge_visits: Option<u64>,
+    #[cfg(test)]
+    pub compaction_capture_rows: Option<u64>,
 }
 
 /// Library bodies this publication fetched through custody into the asset
@@ -3382,6 +3386,28 @@ pub(crate) struct CompletedAssetCatalog {
     pub referenced:Vec<RemoteObject>,
 }
 
+pub(super) async fn carry_asset_catalog(
+    mut entries:Vec<EntryPlan>,repository_root:&Path,cache_root:&Path,root_key:&[u8;32],
+    limits:PackageLimits,journal:&mut TransferJournal,provider:&dyn Provider,
+    repository:&RepositoryHandle,cancel:&Cancellation,
+) -> Result<CompletedAssetCatalog> {
+    entries.sort_by(|a,b|a.key.cmp(&b.key));
+    for entry in &entries {entry.validate(&repository.repository_id,repository)?;}
+    if entries.windows(2).any(|pair|pair[0].key==pair[1].key) {return Err(corrupt("duplicate carried asset"));}
+    let fingerprint=catalog_fingerprint_of(wire::CatalogKind::Assets,
+        entries.iter().map(|entry|(entry.key.as_str(),entry.byte_length,entry.content_sha256.as_str())));
+    let build_root=cache_root.join("build");fs::create_dir_all(&build_root).map_err(transient)?;
+    let mut cache=PackageCache::open(cache_root)?;
+    let mut evidence=ObjectEvidence::open(repository_root,journal.connection_id())?;
+    let mut packs=BTreeMap::new();
+    for entry in &entries {for pack in &entry.packs {packs.insert(pack.object_id.clone(),pack.clone());}}
+    let mut referenced=packs.into_values().collect::<Vec<_>>();
+    let root=build_catalog(wire::CatalogKind::Assets,entries,&fingerprint,&repository.repository_id,
+        &build_root,root_key,limits,None,None,true,&mut cache,&mut evidence,journal,
+        provider,repository,cancel,&mut referenced).await?;
+    Ok(CompletedAssetCatalog{catalog:root.stored(repository)?,referenced})
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn package_and_upload_asset_catalog(
     sources:Vec<AssetCatalogSource>,repository_root:&Path,cache_root:&Path,
@@ -3804,11 +3830,15 @@ pub(crate) async fn package_and_upload_protected(
                 metadata.created_at_ms,
                 library,
                 published_sections,
-            )
-            .map_err(corrupt)?;
+            );
+            #[cfg(test)] super::control::observe_state_result(&document,2);
+            let document=document.map_err(corrupt)?;
             let max_state = wire::MAX_METADATA_BYTES;
+            let encoded=document.encode(max_state);
+            #[cfg(test)]
+            super::control::observe_control_fingerprint(wire::ObjectRole::SyncState,&document.library_fingerprint,&document.sections,None,1);
             (
-                document.encode(max_state).map_err(corrupt)?,
+                encoded.map_err(corrupt)?,
                 document.state_fingerprint,
                 document.sections,
                 ObjectRole::SyncState,
@@ -3830,8 +3860,9 @@ pub(crate) async fn package_and_upload_protected(
                 library,
                 published_sections,
                 original_units_root,
-            )
-            .map_err(corrupt)?;
+            );
+            #[cfg(test)] super::control::observe_bundle_result(&document,2);
+            let document=document.map_err(corrupt)?;
             let max_bundle = wire::MAX_METADATA_BYTES;
             (
                 document.encode(max_bundle).map_err(corrupt)?,
@@ -3873,6 +3904,10 @@ pub(crate) async fn package_and_upload_protected(
     referenced.sort_by(|a, b| a.object_id.cmp(&b.object_id));
     referenced.dedup_by(|a, b| a.object_id == b.object_id);
     Ok(CompletedSnapshot {
+        #[cfg(test)]
+        compaction_catalog_merge_visits: None,
+        #[cfg(test)]
+        compaction_capture_rows: None,
         maintenance,
         hydration,
         reference,
@@ -5053,7 +5088,11 @@ mod tests {
                 let mut job=DurableJob::new(request,false,1,store.external_identity().unwrap());
                 job.summary["restoreSource"]=serde_json::to_value(completed.reference.stored(&connected.handle).unwrap()).unwrap();
                 let jobs=JobStore::open(destination.path()).unwrap();jobs.put(&job).unwrap();
+                crate::persistent_store::hash_work::reset_hash_work();
                 let (prepared,received_sections)=runtime_restore::prepare_database_first_backup(destination.path(),&connected,&job,&Cancellation::default()).await.unwrap();
+                let preparation_hashes=crate::persistent_store::hash_work::take_hash_work();
+                assert!(preparation_hashes.incomplete.is_empty());
+                assert!(preparation_hashes.domains["native_external_bundle_fingerprint"].bytes>0);
                 assert_eq!(prepared.present.contains(&hash),already_present);
                 jobs.freeze_restore_bodies(&job,&prepared.sources,&prepared.present).unwrap();
                 let pack_ids=prepared.sources.iter().flat_map(|source|source.chunks.iter().map(|chunk|chunk.pack_id.clone())).collect::<BTreeSet<_>>();
@@ -5096,10 +5135,22 @@ mod tests {
                 }
                 crate::persistent_store::register_asset_objects_at_root(bootstrap.path(),&assets.iter().map(|asset|crate::persistent_store::asset_object_catalog::AssetObjectRegistration{object_hash:asset.content_hash.clone(),byte_size:asset.byte_size}).collect::<Vec<_>>(),1).unwrap();
                 let bootstrap_pack=prepared.sources[0].packs[0].locator.object.clone();
-                let bootstrap_reads=provider.read_attempts(&bootstrap_pack);
+                let refusal_provider=provider.clone();let refusal_pack=bootstrap_pack.clone();let refusal_hash=prepared.sources[0].hash.clone();
                 crate::asset_repository::body_io::reset_body_io();
                 for asset in &assets {crate::asset_repository::body_io::register_object_purpose(&asset.content_hash,crate::asset_repository::body_io::BodyPurpose::Asset);}
-                bootstrap_store.hydrate_registered_remote_assets_prioritized(None,None,||Ok(()),||{}).unwrap();
+                let bootstrap_reads=spawn_blocking(move || {
+                    if !already_present {
+                        let before=refusal_provider.read_attempts(&refusal_pack);
+                        let refused=bootstrap_store.hydrate_registered_remote_assets_prioritized(None,None,|| {
+                            if refusal_provider.read_attempts(&refusal_pack)>before {Err(crate::server_sync::SyncError::new("stale-binding-authority",409))} else {Ok(())}
+                        },||{}).unwrap_err();
+                        assert_eq!(refused.code,"stale-binding-authority");
+                        assert!(PayloadCas::new(bootstrap_store.repository_root()).unwrap().stat_object(&refusal_hash).unwrap().is_none());
+                    }
+                    let before=refusal_provider.read_attempts(&refusal_pack);
+                    bootstrap_store.hydrate_registered_remote_assets_prioritized(None,None,||Ok(()),||{}).unwrap();
+                    before
+                }).await.unwrap();
                 let bootstrap_bodies=crate::asset_repository::body_io::take_body_io();
                 assert!(bootstrap_bodies.complete());
                 if already_present {assert_eq!(bootstrap_bodies.asset_work(),Default::default());}
@@ -6357,12 +6408,10 @@ mod tests {
         });
     }
 
-    /// R04. A receive whose base already names most of the snapshot's records
-    /// under the same identity reads only the packs of the ones that moved.
-    /// When the receive has to replace the library after all, a second pass
-    /// fetches the skipped records and reads nothing it already has.
+    /// R04. A receive reuses its verified record cache and reads only the
+    /// packs of changed records. Reading it again does not fetch any pack.
     #[test]
-    fn c_a_receive_reads_only_the_packs_of_records_its_base_does_not_hold() {
+    fn c_a_receive_reads_only_the_packs_of_records_its_cache_does_not_hold() {
         runtime().block_on(async {
             const RECORDS: usize = 600;
             let sender = tempfile::tempdir().unwrap();
@@ -6372,6 +6421,7 @@ mod tests {
             let key = [31; 32];
             let cancel = Cancellation::default();
             let cache = sender.path().join("cache");
+            let staging = receiver.path().join("receive");
             let capture = captured_record_window(sender.path(), "first", 1, RECORDS, 0, 0, 0);
             let meta = metadata("first", &capture);
             let mut first_journal = journal(&sender.path().join("first-job"), "first-job", &capture);
@@ -6379,7 +6429,7 @@ mod tests {
                 limits(4 * 1024), None, &mut first_journal, &provider, &repository,
                 &PhaseProgress::silent(), &cancel).await.unwrap();
             let base = snapshot_restore::download_snapshot(&first.reference,
-                &receiver.path().join("first"), &key, None, snapshot_restore::SourceTrust::Downloaded,
+                &staging, &key, None, snapshot_restore::SourceTrust::Downloaded,
                 &provider, &repository, &PhaseProgress::silent(), &cancel).await.unwrap();
             let base: BTreeMap<String, String> = base.records.iter()
                 .map(|record| (record.key.clone(), record.content_hash.clone())).collect();
@@ -6391,41 +6441,39 @@ mod tests {
             let second = package_and_upload(capture, vec![], sender.path(), &cache, meta, &key,
                 limits(4 * 1024), Some(&parent), &mut second_journal, &provider, &repository,
                 &PhaseProgress::silent(), &cancel).await.unwrap();
-            let within = crate::external_storage::receive_difference::DifferenceBudget {
-                records: 16, bytes: 1024 * 1024, dependent_bytes: 1024 * 1024, work: 1024,
-            };
 
-            let staging = receiver.path().join("receive");
             snapshot_restore::reset_test_read_counts(&staging);
             let received = snapshot_restore::download_snapshot(&second.reference, &staging, &key,
-                None, snapshot_restore::SourceTrust::AdmittedLibraryAt {
-                    root: receiver.path(), records: &base, within,
-                }, &provider, &repository, &PhaseProgress::silent(), &cancel).await.unwrap();
+                None, snapshot_restore::SourceTrust::AdmittedLibrary(receiver.path()),
+                &provider, &repository, &PhaseProgress::silent(), &cancel).await.unwrap();
             let skipping = snapshot_restore::take_test_read_counts(&staging);
             assert_eq!(received.records.len(), RECORDS);
-            let fetched: Vec<_> = received.records.iter()
-                .filter(|record| !matches!(record.source, ObjectSource::Unchanged)).collect();
-            assert_eq!(fetched.len(), 1);
-            assert_eq!(fetched[0].key, "record/000000");
-            assert_eq!(received.body(&fetched[0].source), br#"{"record":0,"value":2}"#);
-            for record in &received.records {
+            let changed: Vec<_> = received.records.iter()
+                .filter(|record| base.get(&record.key) != Some(&record.content_hash)).collect();
+            assert_eq!(changed.len(), 1);
+            assert_eq!(changed[0].key, "record/000000");
+            for (index, record) in received.records.iter().enumerate() {
+                assert_eq!(record.key, format!("record/{index:06}"));
+                let value = if index == 0 { 2 } else { 0 };
+                assert_eq!(received.body(&record.source),
+                    format!("{{\"record\":{index},\"value\":{value}}}").as_bytes());
                 assert_eq!(base.get(&record.key).is_some_and(|hash| *hash == record.content_hash),
-                    record.key != "record/000000", "{}", record.key);
+                    index != 0, "{}", record.key);
             }
             assert_eq!(skipping.packs, 1);
 
-            // The same snapshot read for a replace fetches every other record,
-            // and the one already in hand costs nothing more.
             snapshot_restore::reset_test_read_counts(&staging);
-            let replace = snapshot_restore::download_snapshot(&second.reference, &staging, &key,
+            let repeated = snapshot_restore::download_snapshot(&second.reference, &staging, &key,
                 None, snapshot_restore::SourceTrust::AdmittedLibrary(receiver.path()),
                 &provider, &repository, &PhaseProgress::silent(), &cancel).await.unwrap();
-            let refetching = snapshot_restore::take_test_read_counts(&staging);
-            assert!(replace.records.iter().all(|record| !matches!(record.source, ObjectSource::Unchanged)));
-            let bodies = replace.records.iter()
-                .map(|record| replace.body(&record.source)).collect::<Vec<_>>();
-            assert_eq!(bodies[0], br#"{"record":0,"value":2}"#);
-            assert_eq!(bodies[1], br#"{"record":1,"value":0}"#);
+            assert_eq!(snapshot_restore::take_test_read_counts(&staging).packs, 0);
+            for (index, record) in repeated.records.iter().enumerate() {
+                let value = if index == 0 { 2 } else { 0 };
+                assert_eq!(repeated.body(&record.source),
+                    format!("{{\"record\":{index},\"value\":{value}}}").as_bytes());
+            }
+            assert_eq!(repeated.records.len(), RECORDS);
+
             let full = tempfile::tempdir().unwrap();
             snapshot_restore::reset_test_read_counts(full.path());
             snapshot_restore::reset_test_turnover(full.path());
@@ -6434,22 +6482,11 @@ mod tests {
                 &PhaseProgress::silent(), &cancel).await.unwrap();
             let everything = snapshot_restore::take_test_read_counts(full.path());
             assert!(everything.packs > 2, "{everything:?}");
+            assert!(skipping.packs < everything.packs,
+                "skipping={skipping:?} everything={everything:?}");
             // Each pack is placed and released before the next one arrives.
             assert_eq!(snapshot_restore::take_test_turnover(full.path()),
                 snapshot_restore::TestTurnover { ciphertexts: 1, plaintexts: 1 });
-            assert_eq!(skipping.packs + refetching.packs, everything.packs,
-                "skipping={skipping:?} refetching={refetching:?} everything={everything:?}");
-
-            // Past the budget the receive replaces, so nothing is skipped.
-            let over = snapshot_restore::download_snapshot(&second.reference,
-                &receiver.path().join("over"), &key, None,
-                snapshot_restore::SourceTrust::AdmittedLibraryAt {
-                    root: receiver.path(), records: &base,
-                    within: crate::external_storage::receive_difference::DifferenceBudget {
-                        records: 0, ..within
-                    },
-                }, &provider, &repository, &PhaseProgress::silent(), &cancel).await.unwrap();
-            assert!(over.records.iter().all(|record| !matches!(record.source, ObjectSource::Unchanged)));
         });
     }
 
