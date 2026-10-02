@@ -55,6 +55,7 @@ pub struct NativeObservation {
     pub body_stat_requests: u64,
     pub body_batch_stat_requests: u64,
     pub body_presence_queries: u64,
+    pub receive_intents:Option<super::invalid_diagnostics::ReceiveIntentEvidence>,
 }
 
 impl NativeObservation {
@@ -76,6 +77,9 @@ impl NativeObservation {
 
     pub fn validate_routine_invariants(&self) -> Result<(), String> {
         self.hash_totals()?;
+        if self.receive_intents.as_ref().is_some_and(|evidence|!evidence.complete) {
+            return Err("incomplete exact receive-intent input provenance".into());
+        }
         if self.body_scope_complete != Some(true) || self.body_scope_violations != 0
             || self.body_unknown_work != BodyDomain::default()
             || self.body_unattributed_managed != BodyDomain::default()
