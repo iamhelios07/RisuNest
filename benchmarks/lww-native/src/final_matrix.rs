@@ -248,9 +248,9 @@ fn run_inner()->Result<(),String> {
                     let recorded=collection.samples.iter().filter(|sample|sample.direction==direction && !sample.warmup).collect::<Vec<_>>();
                     if recorded.len()!=final_runner::REPETITIONS as usize {return Err("selected routine recorded slot count differs from policy".into());}
                     timings.push(json!({"tier":tier,"direction":direction,"recordedCount":recorded.len(),
-                        "nativeDurableSaveMs":measurement::percentiles(recorded.iter().map(|sample|sample.timings.durable_save_ms).collect())?,
-                        "nativePublicationCompleteMs":measurement::percentiles(recorded.iter().map(|sample|sample.timings.publication_complete_ms).collect())?,
-                        "nativeReceiverDurableAckMs":measurement::percentiles(recorded.iter().map(|sample|sample.timings.receiver_durable_ack_ms).collect())?}));
+                        "nativeDurableSaveMs":measurement::percentiles(recorded.iter().map(|sample|sample.timings.durable_save_ms))?,
+                        "nativePublicationCompleteMs":measurement::percentiles(recorded.iter().map(|sample|sample.timings.publication_complete_ms))?,
+                        "nativeReceiverDurableAckMs":measurement::percentiles(recorded.iter().map(|sample|sample.timings.receiver_durable_ack_ms))?}));
                 }
             }
             return write(&directory,"native-final-selected-pair.json",&json!({"status":"native-only-valid","proofs":proofs,"timings":timings,"rendererAdoption":null}));
