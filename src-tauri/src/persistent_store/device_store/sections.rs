@@ -1320,6 +1320,20 @@ fn capture_backup_rows(
     Ok(())
 }
 
+pub(crate) fn capture_backup_sections_snapshot(
+    snapshot: &Connection,
+    kinds: &[SectionKind],
+) -> StoreResult<Vec<PreparedSectionRows>> {
+    let mut seen = BTreeSet::new();
+    let mut spools = Vec::with_capacity(kinds.len());
+    for kind in kinds {
+        if !seen.insert(kind.id()) { return Err(invalid("Backup section kind is repeated")); }
+        spools.push((*kind, SectionSpoolBuilder::new_backup(*kind)?));
+    }
+    for (kind, spool) in &mut spools { capture_backup_rows(snapshot, *kind, spool)?; }
+    spools.into_iter().map(|(_, spool)| spool.finish_captured()).collect()
+}
+
 fn read_section_state(db: &Connection, section: Section) -> StoreResult<SectionState> {
     let (participating, max_write_clock, gc_floor, participation_generation): (
         i64,
@@ -1347,13 +1361,7 @@ impl DeviceStore {
         &mut self,
         kinds: &[SectionKind],
     ) -> StoreResult<Vec<PreparedSectionRows>> {
-        let mut seen = BTreeSet::new();
-        let mut spools = Vec::with_capacity(kinds.len());
-        for kind in kinds {
-            if !seen.insert(kind.id()) { return Err(invalid("Backup section kind is repeated")); }
-            spools.push((*kind, SectionSpoolBuilder::new_backup(*kind)?));
-        }
-        if spools.is_empty() { return Ok(Vec::new()); }
+        if kinds.is_empty() { return Ok(Vec::new()); }
         let path: String = self.connection.query_row(
             "SELECT file FROM pragma_database_list WHERE name='main'", [], |row| row.get(0),
         )?;
@@ -1365,9 +1373,9 @@ impl DeviceStore {
         snapshot.execute_batch(
             "PRAGMA busy_timeout=5000; PRAGMA query_only=ON; PRAGMA mmap_size=0; BEGIN;",
         )?;
-        for (kind, spool) in &mut spools { capture_backup_rows(&snapshot, *kind, spool)?; }
+        let sections = capture_backup_sections_snapshot(&snapshot, kinds)?;
         snapshot.execute_batch("COMMIT;")?;
-        spools.into_iter().map(|(_, spool)| spool.finish_captured()).collect()
+        Ok(sections)
     }
 
     /// Visits participating synchronized rows from one read-only SQLite
