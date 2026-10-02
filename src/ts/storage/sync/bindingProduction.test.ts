@@ -1,4 +1,6 @@
 import { expect, it, vi } from 'vitest'
+vi.mock('./bindingDialog', () => ({ confirmSyncBindingReplacement: vi.fn(async () => true) }))
+vi.mock('./bindingLocalData', () => ({ hasLocalBindingData: vi.fn(async () => true), hasLocalSharedBindingData: vi.fn(async () => true) }))
 import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
 import { IndexedDbPersistentDataStore } from '../indexedDbPersistentDataStore'
 import { createPersistentDataRuntime, capturePersistentRoot, capturePersistentPresets, capturePersistentPluginStorage } from '../persistentDataRuntime'
