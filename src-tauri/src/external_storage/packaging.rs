@@ -3382,6 +3382,28 @@ pub(crate) struct CompletedAssetCatalog {
     pub referenced:Vec<RemoteObject>,
 }
 
+pub(super) async fn carry_asset_catalog(
+    mut entries:Vec<EntryPlan>,repository_root:&Path,cache_root:&Path,root_key:&[u8;32],
+    limits:PackageLimits,journal:&mut TransferJournal,provider:&dyn Provider,
+    repository:&RepositoryHandle,cancel:&Cancellation,
+) -> Result<CompletedAssetCatalog> {
+    entries.sort_by(|a,b|a.key.cmp(&b.key));
+    for entry in &entries {entry.validate(&repository.repository_id,repository)?;}
+    if entries.windows(2).any(|pair|pair[0].key==pair[1].key) {return Err(corrupt("duplicate carried asset"));}
+    let fingerprint=catalog_fingerprint_of(wire::CatalogKind::Assets,
+        entries.iter().map(|entry|(entry.key.as_str(),entry.byte_length,entry.content_sha256.as_str())));
+    let build_root=cache_root.join("build");fs::create_dir_all(&build_root).map_err(transient)?;
+    let mut cache=PackageCache::open(cache_root)?;
+    let mut evidence=ObjectEvidence::open(repository_root,journal.connection_id())?;
+    let mut packs=BTreeMap::new();
+    for entry in &entries {for pack in &entry.packs {packs.insert(pack.object_id.clone(),pack.clone());}}
+    let mut referenced=packs.into_values().collect::<Vec<_>>();
+    let root=build_catalog(wire::CatalogKind::Assets,entries,&fingerprint,&repository.repository_id,
+        &build_root,root_key,limits,None,None,true,&mut cache,&mut evidence,journal,
+        provider,repository,cancel,&mut referenced).await?;
+    Ok(CompletedAssetCatalog{catalog:root.stored(repository)?,referenced})
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn package_and_upload_asset_catalog(
     sources:Vec<AssetCatalogSource>,repository_root:&Path,cache_root:&Path,

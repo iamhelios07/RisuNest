@@ -34,7 +34,150 @@ impl PublishedState {
         Ok(())
     }
 }fn error(_: impl std::fmt::Display) -> ProviderError { segment::corrupt() }
+
+struct PublishedProbe<'a>(&'a Cancellation);
+impl crate::local_backup::CancellationProbe for PublishedProbe<'_> {
+    fn is_cancelled(&self)->bool {self.0.check().is_err()}
+}
+
+fn live_published_objects(state:&PublishedState,capture:&mut super::capture::CaptureCatalog,anchor:Option<&str>,cancel:&Cancellation)
+    ->Result<(BTreeSet<String>,bool)> {
+    use crate::persistent_store::external_capture::{original_unit_dependency_inventory,published_json_asset_roots,BackupBodyRole};
+    use risunest_sync_wire::unit::UnitValue;
+    let mut live=BTreeSet::new();let mut conservative=false;let mut controls=BTreeMap::new();let mut emitted=BTreeSet::new();
+    let mut aliases=BTreeSet::new();let mut legacy=BTreeSet::new();let mut inlays=BTreeSet::new();
+    fn scan(bytes:&[u8],live:&mut BTreeSet<String>,conservative:&mut bool,legacy:&mut BTreeSet<String>,inlays:&mut BTreeSet<String>)->crate::persistent_store::StoreResult<()> {
+        let roots=published_json_asset_roots(bytes)?;
+        live.extend(roots.object_hashes);live.extend(roots.manifest_hashes);
+        *conservative|=roots.retain_all_objects || !roots.blockers.is_empty() || !roots.cold_keys.is_empty();
+        legacy.extend(roots.legacy_asset_keys);inlays.extend(roots.inlay_ids);
+        Ok(())
+    }
+    state.catalog.visit_changes(&mut |change| {
+        cancel.check()?;
+        if matches!(change.value,UnitValue::Deleted) {return Ok(())}
+        if !crate::persistent_store::lww::lww_known_unit_key(&change.key) {conservative=true;}
+        if let UnitValue::Inline{bytes}=&change.value {
+            let bytes=URL_SAFE_NO_PAD.decode(bytes).map_err(error)?;
+            let parts=change.key.components();
+            if matches!(parts[0].as_str(),"asset"|"inlay") {aliases.insert((parts[0].clone(),parts[1].clone()));}
+            scan(&bytes,&mut live,&mut conservative,&mut legacy,&mut inlays).map_err(error)?;
+        }
+        let units=BTreeMap::from([(change.key,change.value)]);
+        let inventory=original_unit_dependency_inventory(&units,&|hash|state.body_spool.control(hash),
+            &|_|Ok(None),&PublishedProbe(cancel),false,&mut |hash,bytes,role| {
+                if role!=BackupBodyRole::Control {return Err(crate::persistent_store::StoreError::Validation{message:"Published control role differs".into()})}
+                emitted.insert(hash.to_owned());capture.object(hash,bytes)?;
+                if let Some(anchor)=anchor {capture.reference(anchor,hash,bytes.len() as u64)?;}Ok(())
+            }).map_err(error)?;
+        controls.extend(inventory.controls);
+        live.extend(inventory.payloads.into_keys());
+        // A content body can carry references that metadata alone cannot interpret.
+        conservative|=!inventory.record_payloads.is_empty();
+        Ok(())
+    })?;
+    for (hash,size) in controls {
+        cancel.check()?;
+        let bytes=state.body_spool.control(&hash).map_err(error)?;
+        if let Some(bytes)=bytes {
+            if bytes.len() as u64!=size {return Err(segment::corrupt())}
+            capture.object(&hash,&bytes).map_err(error)?;
+            if let Some(anchor)=anchor {capture.reference(anchor,&hash,size).map_err(error)?;}
+            scan(&bytes,&mut live,&mut conservative,&mut legacy,&mut inlays).map_err(error)?;
+        } else if !emitted.contains(&hash) {return Err(segment::corrupt())}
+    }
+    conservative|=legacy.into_iter().any(|key|!aliases.contains(&("asset".into(),key)))
+        || inlays.into_iter().any(|key|!aliases.contains(&("inlay".into(),key)));
+    Ok((live,conservative))
+}
 impl ExternalLwwEngine {
+    async fn compact_asset_catalogs(&self,state:&PublishedState,live:&BTreeSet<String>,conservative:bool,
+        directory:&Path,limits:super::packaging::PackageLimits,journal:&mut super::journal::TransferJournal,
+        cancel:&Cancellation,protection:Option<(&super::leases::LeaseOwner,&super::leases::LeaseContext<'_>)>)
+        ->Result<(Vec<wire::StoredObject>,Option<crate::asset_repository::job_pins::DurableCasJob>)> {
+        use super::packaging::{EntryPlan,AssetCatalogSource};
+        use crate::asset_repository::job_pins::{DurableCasJob,CasJobKind,CasObjectRole};
+        if conservative {return Ok((state.asset_catalogs.clone(),None))}
+        let mut roots=state.asset_catalogs.clone();roots.sort_by(|a,b|a.header.object_id.cmp(&b.header.object_id));
+        roots.dedup_by(|a,b|a.header.object_id==b.header.object_id);
+        let mut plans=BTreeMap::<String,EntryPlan>::new();let mut sources=BTreeMap::new();
+        let mut pack_chunks=BTreeMap::<(String,u64), (wire::StoredChunk,bool)>::new();let mut pack_sizes=BTreeMap::new();
+        for root in roots {
+            cancel.check()?;
+            let remote=RemoteObject::from_stored(&root,&self.repository)?;
+            let (entries,packs,_)=super::snapshot_restore::read_catalog(&remote,wire::CatalogKind::Assets,
+                &self.root_key,&directory.join("asset-inputs"),self.provider.as_ref(),&self.repository,cancel).await?;
+            for (id,pack) in &packs {
+                if pack_sizes.insert(id.clone(),pack.plaintext_length).is_some_and(|old|old!=pack.plaintext_length) {return Err(segment::corrupt())}
+            }
+            for entry in entries {
+                let hash=hex::encode(entry.content_sha256);let retained=live.contains(&hash);
+                for chunk in &entry.chunks {
+                    let item=pack_chunks.entry((chunk.pack_id.clone(),chunk.offset)).or_insert((chunk.clone(),false));
+                    if item.0!=*chunk {return Err(segment::corrupt())}item.1|=retained;
+                }
+                if !retained {continue}
+                let ids=entry.chunks.iter().map(|chunk|chunk.pack_id.as_str()).collect::<BTreeSet<_>>();
+                let selected=packs.iter().filter(|(id,_)|ids.contains(id.as_str())).map(|(_,pack)|pack.clone()).collect::<Vec<_>>();
+                let plan=EntryPlan{kind:entry.kind,key:entry.key,content_sha256:hash.clone(),byte_length:entry.byte_length,
+                    chunks:entry.chunks,packs:selected};
+                plan.validate(&self.repository.repository_id,&self.repository)?;
+                if let Some(old)=plans.get(&hash) {
+                    if old.byte_length!=plan.byte_length {return Err(segment::corrupt())}continue;
+                }
+                let source=super::lww_residency::PackedSource{hash:hash.clone(),byte_length:plan.byte_length,
+                    library_id:self.library.clone(),connection_id:self.connection_id.clone(),connection_root:self.connection_root.clone(),
+                    protected_snapshot:remote.object_id.clone(),catalog:root.clone(),chunks:plan.chunks.clone(),
+                    packs:plan.packs.iter().map(|pack|pack.stored(&self.repository)).collect::<Result<Vec<_>>>()?};
+                sources.insert(hash.clone(),source);plans.insert(hash,plan);
+            }
+        }
+        let mut pack_live=pack_sizes.into_iter().map(|(id,size)|(id,(size,0u64))).collect::<BTreeMap<_,_>>();
+        for ((pack,_),(chunk,retained)) in pack_chunks {
+            let item=pack_live.get_mut(&pack).ok_or_else(segment::corrupt)?;
+            if retained {item.1=item.1.checked_add(chunk.stored_length).ok_or_else(segment::corrupt)?;}
+            if item.1>item.0 {return Err(segment::corrupt())}
+        }
+        let sparse=pack_live.into_iter().filter_map(|(id,(total,live))|if live<total-live {Some(id)}else{None}).collect::<BTreeSet<_>>();
+        let cas=crate::asset_repository::PayloadCas::new(&self.connection_root).map_err(error)?;
+        let mut repack=Vec::new();
+        for group in super::lww_residency::packed_body_groups(sources.into_values().collect(),&BTreeSet::new()) {
+            if !group.iter().any(|source|source.chunks.iter().any(|chunk|sparse.contains(&chunk.pack_id))) {continue}
+            let mut available=true;
+            for source in &group {
+                if cas.stat_object(&source.hash).map_err(error)?.is_none_or(|stat|stat.byte_size!=source.byte_length) {available=false;break}
+            }
+            if available {repack.extend(group)}
+        }
+        let mut pins=None;
+        if !repack.is_empty() {
+            let id=journal.job_id();
+            let mut job=match DurableCasJob::open(&self.connection_root,id) {
+                Ok(job)=>job,Err(failure) if failure.kind()==std::io::ErrorKind::NotFound=>DurableCasJob::begin(&self.connection_root,id,
+                    CasJobKind::OfficialPublicationOrExportPreparation,self.admitted_upper()? as i64).map_err(error)?,
+                Err(failure)=>return Err(error(failure)),
+            };
+            job.pin_existing_batch(&cas,&repack.iter().map(|source|(source.hash.clone(),source.byte_length,CasObjectRole::DirectObject)).collect::<Vec<_>>()).map_err(error)?;
+            pins=Some(job);
+        }
+        let mut catalogs=Vec::new();
+        if !repack.is_empty() {
+            let sources=repack.into_iter().map(|source| {
+                plans.remove(&source.hash);AssetCatalogSource{content_hash:source.hash.clone(),byte_length:source.byte_length,
+                    source:super::content_store::ObjectSource::Library(source.hash)}
+            }).collect();
+            let completed=super::packaging::package_and_upload_asset_catalog(sources,&self.connection_root,
+                &directory.join("asset-repack"),&self.root_key,limits,journal,self.provider.as_ref(),&self.repository,
+                &super::phase_progress::PhaseProgress::silent(),cancel,protection).await?;
+            catalogs.push(completed.catalog);
+        }
+        if !plans.is_empty() {
+            let completed=super::packaging::carry_asset_catalog(plans.into_values().collect(),&self.connection_root,
+                &directory.join("asset-carry"),&self.root_key,limits,journal,self.provider.as_ref(),&self.repository,cancel).await?;
+            catalogs.push(completed.catalog);
+        }
+        Ok((catalogs,pins))
+    }
     pub(crate) async fn stage_published_objects(&self,store:&mut crate::persistent_store::PersistentStore,state:&mut PublishedState,directory:&Path,cancel:&Cancellation)->Result<()> {
         let root=store.external_lww_root();
         let cas=crate::asset_repository::PayloadCas::new(&root).map_err(error)?;
@@ -199,29 +342,60 @@ impl ExternalLwwEngine {
             count=count.checked_add(1).ok_or_else(segment::corrupt)?;
             Ok(())
         })?;
-        if let Some(first)=first_key {
-            let cas=crate::asset_repository::PayloadCas::new(directory).map_err(error)?;
-            let copied=state.body_spool.visit(&mut |hash,bytes,role| {
-                if cancel.check().is_err() {return Err(crate::persistent_store::StoreError::Validation{message:"Published source copying cancelled".into()});}
-                match role {
-                    crate::persistent_store::external_capture::BackupBodyRole::Control=>capture.object(hash,bytes)?,
-                    crate::persistent_store::external_capture::BackupBodyRole::Payload=>{
-                        let prepared=cas.prepare_bytes(bytes)?;
-                        if prepared.content_hash!=hash {return Err(crate::persistent_store::StoreError::Validation{message:"Published payload identity differs".into()});}
-                    }
-                }
-                capture.reference(&first,hash,bytes.len() as u64)
-            });
-            cancel.check()?;
-            copied.map_err(error)?;
-        }
+        let (live,conservative)=live_published_objects(&state,&mut capture,first_key.as_deref(),cancel)?;
         capture.finish().map_err(error)?;
         let fingerprint=capture.content_fingerprint(&risunest_external_storage_format::format::library_fingerprint_domain()).map_err(error)?;
-        let metadata=super::packaging::SnapshotMetadata { snapshot_id:job_id.into(),repository_id:self.repository.repository_id.clone(),library_id:self.library.clone(),author_device_id:writer.into(),created_at_ms:self.admitted_upper()?,logical_revision:0,parent_snapshot_id:None,content_fingerprint:fingerprint,
-            purpose:super::packaging::SnapshotPurpose::LwwCheckpoint { covered_prefixes:state.catalog.coverage.clone(),state_identity:state.catalog.identity()?,asset_catalogs:state.asset_catalogs,standalone_bodies:state.standalone } };
-        let captured=CapturedSnapshot{id:job_id.into(),identity:identity.clone(),catalog:capture,projected_records:count,shared:true};
-        let mut journal=super::journal::TransferJournal::open(&directory.join("journal"),super::journal::JobIdentity{job_id:job_id.into(),connection_id:self.connection_id.clone(),repository_id:self.repository.repository_id.clone(),capture_id:job_id.into(),capture:identity}).map_err(error)?;
+        let mut journal=super::journal::TransferJournal::open(&directory.join("journal"),super::journal::JobIdentity{job_id:job_id.into(),connection_id:self.connection_id.clone(),repository_id:self.repository.repository_id.clone(),capture_id:job_id.into(),capture:identity.clone()}).map_err(error)?;
         let limits=super::packaging::PackageLimits::from_capabilities(capabilities)?;
-        super::packaging::package_and_upload_protected(captured,Vec::new(),directory,&directory.join("cache"),metadata,&self.root_key,limits,None,&mut journal,self.provider.as_ref(),&self.repository,&super::phase_progress::PhaseProgress::silent(),cancel,protection).await
+        let (asset_catalogs,mut pins)=self.compact_asset_catalogs(&state,&live,conservative,directory,limits,&mut journal,cancel,protection).await?;
+        let standalone_bodies=state.standalone.into_iter().filter(|(hash,_)|conservative || live.contains(hash)).collect();
+        let metadata=super::packaging::SnapshotMetadata { snapshot_id:job_id.into(),repository_id:self.repository.repository_id.clone(),library_id:self.library.clone(),author_device_id:writer.into(),created_at_ms:self.admitted_upper()?,logical_revision:0,parent_snapshot_id:None,content_fingerprint:fingerprint,
+            purpose:super::packaging::SnapshotPurpose::LwwCheckpoint { covered_prefixes:state.catalog.coverage.clone(),state_identity:state.catalog.identity()?,asset_catalogs,standalone_bodies } };
+        let captured=CapturedSnapshot{id:job_id.into(),identity:identity.clone(),catalog:capture,projected_records:count,shared:true};
+        let completed=super::packaging::package_and_upload_protected(captured,Vec::new(),directory,&directory.join("cache"),metadata,&self.root_key,limits,None,&mut journal,self.provider.as_ref(),&self.repository,&super::phase_progress::PhaseProgress::silent(),cancel,protection).await?;
+        if let Some(pins)=pins.as_mut() {pins.release(crate::asset_repository::job_pins::CasReleaseOutcome::Aborted).map_err(error)?;}
+        Ok(completed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::{fake,lww_tests::{CycleFixture,small_asset}};
+
+    #[test]
+    fn compaction_prunes_dead_assets_and_repacks_only_locally_available_sparse_packs() {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            for local in [false,true] {
+                let mut f=CycleFixture::new();let cancel=Cancellation::default();let mut hashes=Vec::new();
+                for n in 0..4 {hashes.push(small_asset(&mut f.a,&format!("asset-{n}"),format!("synthetic pack body {n}").as_bytes()));}
+                f.publish_a().await;
+                let input=tempfile::tempdir().unwrap();
+                let state=f.sender.published_state(input.path(),&cancel).await.unwrap();
+                assert_eq!(state.asset_catalogs.len(),1);
+                let root=RemoteObject::from_stored(&state.asset_catalogs[0],&f.sender.repository).unwrap();
+                let (_,old_packs,_)=super::super::snapshot_restore::read_catalog(&root,wire::CatalogKind::Assets,&[7;32],
+                    input.path(),f.provider.as_ref(),&f.sender.repository,&cancel).await.unwrap();
+                assert_eq!(old_packs.len(),1);
+                for n in 1..4 {f.a.delete_asset_alias("asset",&format!("asset-{n}"),f.a.revision().unwrap()).unwrap();}
+                f.publish_a().await;
+                let unpublished=small_asset(&mut f.a,"unpublished",b"unpublished native asset");
+                let before=old_packs.keys().map(|id|(id.clone(),f.provider.read_attempts(id))).collect::<BTreeMap<_,_>>();
+                let engine=if local {&f.sender}else{&f.receiver};
+                let work=tempfile::tempdir().unwrap();
+                let completed=engine.compact_published(work.path(),"00000000-0000-4000-8000-000000000087",
+                    &f.a.lww_clock_state().unwrap().writer_id,&fake::capabilities(true),&cancel,None).await.unwrap();
+                let (_,checkpoint)=engine.checkpoint(&completed.reference.receipt,&cancel).await.unwrap();
+                assert_eq!(checkpoint.asset_catalogs.len(),1);
+                let root=RemoteObject::from_stored(&checkpoint.asset_catalogs[0],&engine.repository).unwrap();
+                let (entries,packs,_)=super::super::snapshot_restore::read_catalog(&root,wire::CatalogKind::Assets,&[7;32],
+                    work.path(),f.provider.as_ref(),&engine.repository,&cancel).await.unwrap();
+                assert_eq!(entries.len(),1);assert_eq!(hex::encode(entries[0].content_sha256),hashes[0]);
+                assert_ne!(hex::encode(entries[0].content_sha256),unpublished);
+                assert_eq!(packs.keys().collect::<Vec<_>>()==old_packs.keys().collect::<Vec<_>>(),!local);
+                for (id,reads) in before {assert_eq!(f.provider.read_attempts(&id),reads,"compaction never fetches old Asset packs");}
+                for old in old_packs.values() {assert!(f.provider.state.lock().unwrap().objects.contains_key(&old.object_id),"old packs remain until retention/grace GC");}
+            }
+        });
     }
 }
