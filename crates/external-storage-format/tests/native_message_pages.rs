@@ -30,6 +30,11 @@ mod record_projection {
         }
     }
 }
+#[path = "../../../src-tauri/src/persistent_store/hash_work.rs"]
+pub(crate) mod native_hash_work;
+mod persistent_store {
+    pub(crate) use crate::native_hash_work as hash_work;
+}
 #[path = "../../../src-tauri/src/persistent_store/message_pages.rs"]
 mod message_pages;
 
