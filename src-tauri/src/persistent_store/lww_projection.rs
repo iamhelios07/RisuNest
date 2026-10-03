@@ -87,11 +87,17 @@ fn root(db: &Connection, generation: &str) -> StoreResult<Value> {
     )?
     .unwrap_or_else(|| json!({})))
 }
-fn add(out: &mut BTreeMap<UnitKey, UnitValue>, parts: &[&str], value: &Value) -> StoreResult<()> {
-    out.insert(unit_key(parts)?, inline(value)?);
+fn add(
+    db: &Connection,
+    out: &mut BTreeMap<UnitKey, UnitValue>,
+    parts: &[&str],
+    value: &Value,
+) -> StoreResult<()> {
+    out.insert(unit_key(parts)?, unit_value(db, value)?);
     Ok(())
 }
 fn fields(
+    db: &Connection,
     out: &mut BTreeMap<UnitKey, UnitValue>,
     prefix: &[&str],
     record: &Value,
@@ -101,7 +107,7 @@ fn fields(
         if let Some(value) = record.get(*field) {
             let mut p = prefix.to_vec();
             p.push(field);
-            add(out, &p, value)?;
+            add(db, out, &p, value)?;
         }
     }
     Ok(())
@@ -112,7 +118,7 @@ fn capture_root(
     out: &mut BTreeMap<UnitKey, UnitValue>,
 ) -> StoreResult<()> {
     let value = root(db, generation)?;
-    fields(out, &["root"], &value, ROOT_FIELDS)?;
+    fields(db, out, &["root"], &value, ROOT_FIELDS)?;
     for (collection, id_field) in [
         ("modules", "id"),
         ("plugins", "name"),
@@ -135,17 +141,17 @@ fn capture_root(
                 return Err(error("record-identity-invalid"));
             }
             if collection != "plugins" {
-                add(out, &["exists", collection, id], &json!(true))?;
+                add(db, out, &["exists", collection, id], &json!(true))?;
             }
             let mut record = record.clone();
             if let Some(o) = record.as_object_mut() {
                 o.shift_remove("configured_index");
             }
-            add(out, &["record", collection, id], &record)?;
+            add(db, out, &["record", collection, id], &record)?;
             order.push(id.to_owned());
         }
         if value.get(collection).is_some() {
-            add(out, &["order", collection], &json!(order))?;
+            add(db, out, &["order", collection], &json!(order))?;
         }
     }
     let mut personas = Vec::new();
@@ -162,12 +168,12 @@ fn capture_root(
         if id.is_empty() || personas.iter().any(|old| old == id) {
             return Err(error("persona-identity-invalid"));
         }
-        add(out, &["exists", "persona", id], &json!(true))?;
-        fields(out, &["persona", id], persona, PERSONA_FIELDS)?;
+        add(db, out, &["exists", "persona", id], &json!(true))?;
+        fields(db, out, &["persona", id], persona, PERSONA_FIELDS)?;
         personas.push(id.to_owned());
     }
     if value.get("personas").is_some() {
-        add(out, &["order", "personas"], &json!(personas))?;
+        add(db, out, &["order", "personas"], &json!(personas))?;
     }
     if let Some(vars) = value
         .get("explicitGlobalChatVariables")
@@ -175,6 +181,7 @@ fn capture_root(
     {
         for (key, value) in vars {
             add(
+                db,
                 out,
                 &[
                     if key.starts_with("toggle_") {
@@ -189,10 +196,10 @@ fn capture_root(
         }
     }
     if let Some(values) = value.get("protectedPresetValues") {
-        fields(out, &["preset-protected"], values, PROTECTED_FIELDS)?;
+        fields(db, out, &["preset-protected"], values, PROTECTED_FIELDS)?;
     }
     if let Some(order) = value.get("characterOrder") {
-        add(out, &["order", "characters"], order)?;
+        add(db, out, &["order", "characters"], order)?;
     }
     Ok(())
 }
@@ -207,8 +214,8 @@ fn capture_preset(
         "SELECT value FROM bot_presets WHERE generation=?1 AND preset_id=?2",
         params![generation, id],
     )? {
-        add(out, &["exists", "preset", id], &json!(true))?;
-        fields(out, &["preset", id], &value, PRESET_FIELDS)?;
+        add(db, out, &["exists", "preset", id], &json!(true))?;
+        fields(db, out, &["preset", id], &value, PRESET_FIELDS)?;
     }
     Ok(())
 }
@@ -227,7 +234,7 @@ fn capture_presets(
     for id in &ids {
         capture_preset(db, generation, id, out)?;
     }
-    add(out, &["order", "presets"], &json!(ids))?;
+    add(db, out, &["order", "presets"], &json!(ids))?;
     Ok(())
 }
 fn capture_character(
@@ -244,17 +251,18 @@ fn capture_character(
         params![generation, id],
     )? {
         add(
+            db,
             out,
             &["exists", "character", id],
             &json!({"type":value.get("type").cloned().unwrap_or(json!("character"))}),
         )?;
-        fields(out, &["character", id], &value, CHARACTER_FIELDS)?;
+        fields(db, out, &["character", id], &value, CHARACTER_FIELDS)?;
         out.remove(&unit_key(&["character", id, "statics"])?);
         if let Some(mut statics) = value.get("statics").cloned() {
             if let Some(o) = statics.as_object_mut() {
                 o.shift_remove("messages");
             }
-            add(out, &["character", id, "statics"], &statics)?;
+            add(db, out, &["character", id, "statics"], &statics)?;
         }
         if value.get("type").and_then(Value::as_str) == Some("group") {
             let mut members = Map::new();
@@ -263,7 +271,7 @@ fn capture_character(
                     members.insert(field.into(), v.clone());
                 }
             }
-            add(out, &["group-members", id], &Value::Object(members))?;
+            add(db, out, &["group-members", id], &Value::Object(members))?;
         }
         let archived: Option<String> = db.query_row(
             "SELECT archived_object FROM characters WHERE generation=?1 AND character_id=?2",
@@ -301,6 +309,7 @@ fn capture_character(
                 capture_conversation(db, generation, id, conv, None, before, out)?;
             }
             add(
+                db,
                 out,
                 &["order", "conversations", id],
                 &json!({"ids":ids,"folders":value.get("chatFolders").cloned().unwrap_or(json!([]))}),
@@ -319,7 +328,7 @@ fn capture_conversation(
     out: &mut BTreeMap<UnitKey, UnitValue>,
 ) -> StoreResult<()> {
     if let Some(value)=text_value(db,"SELECT detail FROM conversations WHERE generation=?1 AND character_id=?2 AND conversation_id=?3",params![generation,char_id,id])? {
-        add(out,&["exists","conversation",char_id,id],&json!(true))?;fields(out,&["conversation",char_id,id],&value,CONVERSATION_FIELDS)?;
+        add(db,out,&["exists","conversation",char_id,id],&json!(true))?;fields(db,out,&["conversation",char_id,id],&value,CONVERSATION_FIELDS)?;
         let manifest=if before || edit.is_none() && out.contains_key(&unit_key(&["messages",char_id,id])?) {super::super::message_pages::current_manifest(db,generation,char_id,id)?}else{super::super::message_pages::capture_manifest(db,generation,char_id,id,edit)?};
         out.insert(unit_key(&["messages",char_id,id])?,manifest);
     }
@@ -423,6 +432,7 @@ pub(in crate::persistent_store) fn capture_targets(
         .and_then(|v| v.get("chatFolders").cloned())
         .unwrap_or(json!([]));
         add(
+            db,
             &mut out,
             &["order", "conversations", character_id],
             &json!({"ids":ids,"folders":folders}),
@@ -446,7 +456,7 @@ pub(in crate::persistent_store) fn capture_targets(
                 out.insert(
                     key.clone(),
                     match mutation {
-                        UnitMutation::Set { value, .. } => inline(value)?,
+                        UnitMutation::Set { value, .. } => unit_value(db, value)?,
                         UnitMutation::Delete { .. } => UnitValue::Deleted,
                     },
                 );
@@ -535,6 +545,7 @@ fn capture_key(
             .and_then(|v| v.get("chatFolders").cloned())
             .unwrap_or(json!([]));
             add(
+                db,
                 out,
                 &["order", "conversations", &p[2]],
                 &json!({"ids":ids,"folders":folders}),
@@ -551,7 +562,7 @@ fn capture_key(
                     .collect::<Result<_, _>>()?;
                 v
             };
-            add(out, &["order", "presets"], &json!(ids))?;
+            add(db, out, &["order", "presets"], &json!(ids))?;
         }
         "conversation" | "messages" => {
             capture_conversation(db, generation, &p[1], &p[2], None, true, out)?
@@ -564,7 +575,7 @@ fn capture_key(
             _ => capture_root(db, generation, out)?,
         },
         "plugin" => {
-            if let Some(value)=text_value(db,"SELECT value FROM plugin_storage WHERE generation=?1 AND owner=?2 AND storage_key=?3",params![generation,p[1],p[2]])? {out.insert(key.clone(),inline(&value)?);}
+            if let Some(value)=text_value(db,"SELECT value FROM plugin_storage WHERE generation=?1 AND owner=?2 AND storage_key=?3",params![generation,p[1],p[2]])? {out.insert(key.clone(),unit_value(db,&value)?);}
         }
         "asset" | "inlay" => {
             let alias = super::super::query::read_asset_alias(
@@ -625,7 +636,7 @@ fn capture_key(
                 _ => None,
             };
             if let Some(value) = selected {
-                out.insert(key.clone(), inline(&value)?);
+                out.insert(key.clone(), unit_value(db, &value)?);
             }
         }
     }
@@ -703,7 +714,12 @@ pub(in crate::persistent_store) fn validate_received(
         archive_metadata(_db, value)?;
         return Ok(());
     }
-    if let Some(v) = json_value(value)? {
+    if matches!(key.components()[0].as_str(), "asset" | "inlay")
+        && matches!(value, UnitValue::Object { .. })
+    {
+        return Err(error("invalid-unit-payload"));
+    }
+    if let Some(v) = validate_large_unit(_db, value)? {
         let p = key.components();
         match p[0].as_str() {
             "exists" => {
@@ -747,7 +763,7 @@ pub(in crate::persistent_store) fn apply_mutation(
     mutation: &UnitMutation,
 ) -> StoreResult<()> {
     let value = match mutation {
-        UnitMutation::Set { value, .. } => inline(value)?,
+        UnitMutation::Set { value, .. } => unit_value(tx, value)?,
         UnitMutation::Delete { .. } => UnitValue::Deleted,
     };
     let key = mutation.key();
@@ -910,7 +926,10 @@ fn apply_value(
         }
         return Ok(());
     }
-    let next = json_value(value)?;
+    if p[0] == "plugin-local" && !plugin_participates(tx)? {
+        return Ok(());
+    }
+    let next = json_value_resolved(tx, value)?;
     match p[0].as_str() {
         "root" => {
             let mut v = root(tx, generation)?;
@@ -1163,11 +1182,12 @@ pub(in crate::persistent_store) fn device_replacement_changes(
 ) -> StoreResult<Vec<(UnitKey, UnitValue)>> {
     use device_store::sections::{FrozenBackupSections, SectionValueRow};
     use base64::Engine;
-    fn units(rows: &FrozenBackupSections) -> StoreResult<BTreeMap<UnitKey, UnitValue>> {
+    fn units(tx: &Connection, rows: &FrozenBackupSections) -> StoreResult<BTreeMap<UnitKey, UnitValue>> {
         let mut values = BTreeMap::new();
         for row in &rows.hypa {
             let value = match &row.value {
-                SectionValueRow::Hypa { producer, model, endpoint, preprocess_version, dimensions, vector, metadata } => inline(
+                SectionValueRow::Hypa { producer, model, endpoint, preprocess_version, dimensions, vector, metadata } => unit_value(
+                    tx,
                     &json!({"producer":producer,"model":model,"endpoint":endpoint,"preprocessVersion":preprocess_version,"dimensions":dimensions,
                         "vector":base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vector),"metadata":metadata}),
                 )?,
@@ -1178,7 +1198,7 @@ pub(in crate::persistent_store) fn device_replacement_changes(
         }
         for row in &rows.local_plugins {
             let value = match &row.value {
-                SectionValueRow::Plugin { value, .. } => inline(&json!(value))?,
+                SectionValueRow::Plugin { value, .. } => unit_value(tx, &json!(value))?,
                 SectionValueRow::Tombstone { .. } => UnitValue::Deleted,
                 _ => return Err(error("replacement-plugin-row-invalid")),
             };
@@ -1186,8 +1206,8 @@ pub(in crate::persistent_store) fn device_replacement_changes(
         }
         Ok(values)
     }
-    let before = units(&device_store::sections::capture_replacement_device_rows(tx)?)?;
-    let after = units(replacement)?;
+    let before = units(tx, &device_store::sections::capture_replacement_device_rows(tx)?)?;
+    let after = units(tx, replacement)?;
     let mut keys: BTreeSet<_> = before.keys().chain(after.keys()).cloned().collect();
     let mut statement = tx.prepare("SELECT key FROM lww_units WHERE json_extract(key,'$[0]') IN ('hypa','plugin-local')")?;
     let stored = statement.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
@@ -1238,7 +1258,8 @@ pub(in crate::persistent_store) fn capture_device_changes(
                     vector,
                     metadata,
                     false,
-                )) => inline(
+                )) => unit_value(
+                    tx,
                     &json!({"producer":producer,"model":model,"endpoint":endpoint,"preprocessVersion":preprocess,"dimensions":dimensions,"vector":vector.map(|v|base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v)),"metadata":metadata}),
                 )?,
                 _ => UnitValue::Deleted,
@@ -1247,7 +1268,7 @@ pub(in crate::persistent_store) fn capture_device_changes(
         } else {
             let row:Option<(Option<String>,bool)>=tx.query_row("SELECT value,tombstone FROM plugin_device_storage WHERE owner=?1 AND space=?2 AND key=?3",params![k1,k2,k3],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
             let value = match row {
-                Some((Some(value), false)) => inline(&json!(value))?,
+                Some((Some(value), false)) => unit_value(tx, &json!(value))?,
                 _ => UnitValue::Deleted,
             };
             (unit_key(&["plugin-local", &k1, &k2, &k3])?, value)
@@ -1303,7 +1324,7 @@ pub(in crate::persistent_store) fn refresh_orders(
         let key: UnitKey = wire(key.try_into())?;
         let p = key.components();
         let value: UnitValue = serde_json::from_str(&value)?;
-        let Some(order) = json_value(&value)? else {
+        let Some(order) = json_value_resolved(tx, &value)? else {
             continue;
         };
         let Some(order) = (if p[1] == "conversations" {
@@ -1561,7 +1582,7 @@ fn capture_plugin_order(
             .collect::<Result<_, _>>()?;
         rows
     };
-    add(out, &["order", "plugin-storage", owner], &json!(ids))
+    add(db, out, &["order", "plugin-storage", owner], &json!(ids))
 }
 
 pub(in crate::persistent_store) fn archive_value(

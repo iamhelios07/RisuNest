@@ -267,7 +267,7 @@ impl super::PersistentStore {
             let key:risunest_sync_wire::unit::UnitKey = key.try_into().map_err(|e:risunest_sync_wire::WireError| invalid(&e.to_string()))?;
             if key.components()[0] == "preset-protected" {
                 let value:risunest_sync_wire::unit::UnitValue = serde_json::from_str(&value)?;
-                if let Some(value) = super::lww::json_value(&value)? { protected.insert(key.components()[1].clone(),value); }
+                if let Some(value) = super::lww::json_value_resolved(&self.connection,&value)? { protected.insert(key.components()[1].clone(),value); }
             }
         }
         Ok(BindingContent {

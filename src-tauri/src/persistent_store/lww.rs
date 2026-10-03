@@ -3,8 +3,9 @@ use super::{
     StoreError, StoreResult, WorkingSetCommit,
 };
 use risunest_sync_wire::{
+    descriptor::RecordDescriptor,
     stamp::{issue_stamp, DecimalU64, Stamp},
-    unit::{compare_version, LwwDecision, UnitKey, UnitValue},
+    unit::{compare_version, LwwDecision, UnitKey, UnitValue, MAX_INLINE_UNIT_BYTES},
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -62,6 +63,60 @@ fn wire<T>(result: risunest_sync_wire::Result<T>) -> StoreResult<T> {
 }
 pub(super) fn inline(value: &Value) -> StoreResult<UnitValue> {
     wire(UnitValue::inline(&serde_json::to_vec(value)?))
+}
+/// A shared value whose canonical JSON exceeds the inline bound is stored as a
+/// content object. The choice depends only on the bytes, so equal values have
+/// equal units on every device.
+pub(super) fn unit_value(db: &Connection, value: &Value) -> StoreResult<UnitValue> {
+    use base64::Engine;
+    let canonical = wire(risunest_sync_wire::payload_value::canonicalize(&serde_json::to_vec(value)?))?;
+    if canonical.len() <= MAX_INLINE_UNIT_BYTES {
+        return Ok(UnitValue::Inline {
+            bytes: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(canonical),
+        });
+    }
+    let hash = {
+        #[cfg(test)]
+        crate::persistent_store::hash_work::observe("native_large_unit_identity", canonical.len());
+        risunest_sync_wire::hash(&canonical)
+    };
+    if !super::message_pages::verified_object_present(db, &hash)? {
+        super::message_pages::put_object(db, &hash, &canonical)?;
+    }
+    wire(UnitValue::object(RecordDescriptor::content(hash)))
+}
+fn large_unit_body(db: &Connection, value: &UnitValue) -> StoreResult<Option<Vec<u8>>> {
+    let UnitValue::Object { descriptor, .. } = value else {
+        return Ok(None);
+    };
+    super::message_pages::object_body(db, &descriptor.object_hash)?
+        .map(Some)
+        .ok_or_else(|| error("unit-object-body-required"))
+}
+/// Reads a unit value, resolving a large unit from its stored body. Message
+/// and archive units have their own object forms and are not read here.
+pub(super) fn json_value_resolved(db: &Connection, value: &UnitValue) -> StoreResult<Option<Value>> {
+    match large_unit_body(db, value)? {
+        Some(body) => Ok(Some(serde_json::from_slice(&body)?)),
+        None => json_value(value),
+    }
+}
+/// A received large unit must be the content form of a body that could not
+/// have been inline, so equal values keep equal identities across devices.
+pub(super) fn validate_large_unit(db: &Connection, value: &UnitValue) -> StoreResult<Option<Value>> {
+    let UnitValue::Object { descriptor, .. } = value else {
+        return json_value(value);
+    };
+    if *descriptor != RecordDescriptor::content(descriptor.object_hash.clone()) {
+        return Err(error("invalid-large-unit"));
+    }
+    let body = large_unit_body(db, value)?.ok_or_else(|| error("invalid-large-unit"))?;
+    if body.len() <= MAX_INLINE_UNIT_BYTES
+        || risunest_sync_wire::payload_value::canonicalize(&body).ok().as_ref() != Some(&body)
+    {
+        return Err(error("invalid-large-unit"));
+    }
+    Ok(Some(serde_json::from_slice(&body)?))
 }
 pub(super) fn unit_key(parts: &[&str]) -> StoreResult<UnitKey> {
     wire(UnitKey::new(parts))
@@ -668,6 +723,9 @@ impl PersistentStore {
         if let Some(body) = super::message_pages::object_body(&self.connection, hash)? {
             return Ok(Some(body));
         }
+        if let Some(body) = super::message_pages::object_body(self.device_store()?.connection(), hash)? {
+            return Ok(Some(body));
+        }
         use std::io::Read;
         let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
         let Some(mut file) = cas.open_object(hash)? else {
@@ -688,6 +746,23 @@ impl PersistentStore {
 
     pub(crate) fn lww_verified_object_present(&self, hash: &str) -> StoreResult<bool> {
         super::message_pages::verified_object_present(&self.connection, hash)
+    }
+    /// Device units are applied inside the device store, so their large bodies
+    /// are copied there from the library store where receive placed them.
+    fn copy_device_unit_bodies<'a>(&self, changes: impl IntoIterator<Item = &'a Change>) -> StoreResult<()> {
+        let device = self.device_store()?.connection();
+        for change in changes {
+            let UnitValue::Object { descriptor, .. } = &change.value else { continue };
+            if !projection::is_device(&change.key)
+                || super::message_pages::verified_object_present(device, &descriptor.object_hash)?
+            {
+                continue;
+            }
+            let body = super::message_pages::object_body(&self.connection, &descriptor.object_hash)?
+                .ok_or_else(|| error("unit-object-body-required"))?;
+            super::message_pages::put_object(device, &descriptor.object_hash, &body)?;
+        }
+        Ok(())
     }
     pub(crate) fn lww_put_object(&self, hash: &str, body: &[u8]) -> StoreResult<()> {
         super::message_pages::put_object(&self.connection, hash, body)
@@ -1212,7 +1287,7 @@ impl PersistentStore {
             }
             let p = key.components();
             if matches!(p[0].as_str(), "toggle" | "variable") {
-                if let Some(value) = json_value(&value)? {
+                if let Some(value) = json_value_resolved(&self.connection, &value)? {
                     vars.insert(p[1].clone(), value);
                 }
             }
@@ -1404,6 +1479,7 @@ impl PersistentStore {
         Ok(())
     }
     fn stage_receive_rows(&mut self, request: &StageReceive) -> StoreResult<()> {
+        self.copy_device_unit_bodies(&request.changes)?;
         for db in [
             &mut self.connection,
             &mut self.device_store.as_mut().map_err(|e| error(e))?.connection,
@@ -2243,6 +2319,7 @@ impl PersistentStore {
             proof.as_ref().map(|(revision, digest)| (*revision, digest.as_str())),
         )?;
         if target {
+            self.copy_device_unit_bodies(received)?;
             let tx = self.device_store_mut()?.transaction()?;
             verify(&tx, header.binding_authority)?;
             reset_target_device(&tx, header, received, header.binding_authority)?;
@@ -2310,6 +2387,9 @@ fn reset_target_device(
 #[cfg(test)]
 #[path = "lww_tests.rs"]
 mod tests;
+#[cfg(test)]
+#[path = "lww_large_unit_tests.rs"]
+mod large_unit_tests;
 
 pub(super) fn validate_local_targets(db: &Connection, input: &WorkingSetCommit) -> StoreResult<()> {
     for value in input
@@ -2622,7 +2702,7 @@ pub(super) fn ensure_publishable_parents(
     let p = key.components();
     if p[0] == "root" && matches!(p[1].as_str(), "botPresetsId" | "selectedPersona") {
         if let Some((_, value)) = read_unit(db, key)? {
-            if let Some(id) = json_value(&value)?.and_then(|v| v.as_str().filter(|id| !id.is_empty()).map(str::to_owned)) {
+            if let Some(id) = json_value_resolved(db, &value)?.and_then(|v| v.as_str().filter(|id| !id.is_empty()).map(str::to_owned)) {
                 initialize_owner(
                     db,
                     if p[1] == "botPresetsId" {

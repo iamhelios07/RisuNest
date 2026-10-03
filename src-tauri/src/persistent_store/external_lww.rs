@@ -320,11 +320,16 @@ impl PersistentStore {
         )
     }
     pub(crate) fn external_lww_object_is_control(&self, hash: &str) -> StoreResult<bool> {
-        Ok(self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM message_page_objects WHERE hash=?1)",
-            [hash],
-            |r| r.get(0),
-        )?)
+        for connection in [&self.connection, self.device_store()?.connection()] {
+            if connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM message_page_objects WHERE hash=?1)",
+                [hash],
+                |r| r.get(0),
+            )? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
     pub(crate) fn external_lww_witness_object(&self, target: &str, hash: &str) -> StoreResult<()> {
         self.device_store()?.connection().execute(
