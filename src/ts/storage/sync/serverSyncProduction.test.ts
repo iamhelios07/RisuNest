@@ -345,6 +345,22 @@ describe('production server LWW composition', () => {
         await release(); await settle()
         expect(syncCommands()).toEqual(expect.arrayContaining(['server_sync_notify_start', 'server_sync_lww_pull', 'server_sync_lww_push']))
     })
+    it('lifts a hold whose fence fails, so automatic sync resumes', async () => {
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        visible(true); await f.transport!.resumeBinding(bindingContext()); await settle()
+        const fallback = f.invoke.getMockImplementation()!
+        f.invoke.mockImplementationOnce(async command => { if (command === 'server_sync_notify_stop') throw { code: 'server-sync-state-unavailable', retryable: true }; return fallback(command) })
+        f.invoke.mockClear()
+        await expect(production.holdServerSync()).rejects.toMatchObject({ code: 'server-sync-state-unavailable' })
+        await settle()
+        const controller = production.getServerSyncController()
+        expect(controller.snapshot().replacing).toBe(false)
+        expect(() => controller.assertFileOperationAvailable()).not.toThrow()
+        visible(false); await settle(); f.invoke.mockClear()
+        visible(true); await settle()
+        const syncCommands = f.invoke.mock.calls.map(([command]) => command as string)
+        expect(syncCommands).toEqual(expect.arrayContaining(['server_sync_notify_start', 'server_sync_lww_pull', 'server_sync_lww_push']))
+    })
     it('guards native initialization and transport registration on the web', async () => {
         f.native = false
         production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
