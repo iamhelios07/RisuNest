@@ -808,7 +808,12 @@ fn stage_payload(
             connection,
             is_cancelled,
         }
-        .deserialize(&mut deserializer)?;
+        .deserialize(&mut deserializer);
+        // A JSON failure keeps only its position, so name a cancellation here.
+        let payload = match payload {
+            Err(_) if is_cancelled() => return validation(ARCHIVE_CANCELLED_MESSAGE),
+            payload => payload?,
+        };
         deserializer.end()?;
         payload
     };

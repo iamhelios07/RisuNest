@@ -295,14 +295,29 @@ fn a_kept_failure_never_quotes_json_input_or_network_text() {
     let text = failure_text(&shape);
     assert!(text.starts_with("json failure at line 1 column"), "{text}");
     assert!(!text.contains("private-payload-value"));
+    assert_eq!(failure_text(&&shape), text);
     assert_eq!(json_failure(&shape), format!("json-shape{}", &text["json failure".len()..]));
     let network = reqwest::Client::new()
         .get("http://[private-signature")
         .build()
         .unwrap_err();
     assert_eq!(failure_text(&network), "network failure");
+    assert_eq!(failure_text(&&network), "network failure");
     let io = std::io::Error::other("disk refused");
     assert_eq!(failure_text(&io), "disk refused");
+}
+
+#[test]
+fn a_json_reader_failure_keeps_the_reader_text() {
+    struct Refusing;
+    impl std::io::Read for Refusing {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("synthetic restore cancelled"))
+        }
+    }
+    let error = serde_json::from_reader::<_, serde_json::Value>(Refusing).unwrap_err();
+    assert_eq!(json_failure(&error), format!("json-io: {error}"));
+    assert!(json_failure(&error).contains("synthetic restore cancelled"));
 }
 
 #[test]

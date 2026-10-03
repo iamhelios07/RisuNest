@@ -572,10 +572,11 @@ pub(crate) fn record_command_failure(
 }
 
 /// Names a JSON decoding failure by its category and position only. The
-/// decoder's own text can quote the input it rejected.
+/// decoder's own text can quote the input it rejected; a reader's failure
+/// cannot, so it is kept.
 pub(crate) fn json_failure(error: &serde_json::Error) -> String {
     let category = match error.classify() {
-        serde_json::error::Category::Io => "io",
+        serde_json::error::Category::Io => return format!("json-io: {error}"),
         serde_json::error::Category::Syntax => "syntax",
         serde_json::error::Category::Data => "shape",
         serde_json::error::Category::Eof => "incomplete",
@@ -611,7 +612,7 @@ pub(crate) fn sqlite_failure(error: &rusqlite::Error) -> String {
 /// signed URL. The type is matched by name so borrowed errors such as a
 /// poisoned lock are accepted too.
 pub(crate) fn failure_text<E: std::fmt::Display + ?Sized>(error: &E) -> String {
-    let name = std::any::type_name::<E>();
+    let name = std::any::type_name::<E>().trim_start_matches('&');
     if name == std::any::type_name::<serde_json::Error>() {
         let text = error.to_string();
         match text.rfind(" at line ") {
