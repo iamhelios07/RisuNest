@@ -172,6 +172,8 @@ pub(crate) struct Inspection {
     library_id: String,
     empty: bool,
     previously_bound_library: bool,
+    registration_changed: bool,
+    server_restored: bool,
 }
 #[tauri::command]
 pub(crate) async fn external_lww_inspect(app: AppHandle, request: Request) -> Result<Inspection> {
@@ -201,6 +203,8 @@ pub(crate) async fn external_lww_inspect(app: AppHandle, request: Request) -> Re
         library_id,
         empty: objects.is_empty() && engine.snapshot_listing(&session.cancel).await?.is_empty(),
         previously_bound_library,
+        registration_changed: false,
+        server_restored: false,
     })
 }
 pub(crate) struct StageRequest {

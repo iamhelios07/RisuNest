@@ -705,6 +705,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         server_sync::commands::server_sync_lww_inspect,
         server_sync::commands::server_sync_lww_stage_target,
         server_sync::commands::server_sync_lww_prepare_new_device,
+        server_sync::commands::server_sync_lww_prepare_fresh_writer,
         server_sync::commands::server_sync_lww_activate_new_device,
         server_sync::commands::server_sync_lww_retry,
         server_sync::commands::server_sync_lww_drain,
