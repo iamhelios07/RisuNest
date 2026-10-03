@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
 pub const MAX_UNIT_KEY_BYTES: usize = 64 * 1024;
+/// Largest decoded canonical JSON payload an inline value may carry. Larger
+/// values travel as content objects so every page and push stays bounded.
+pub const MAX_INLINE_UNIT_BYTES: usize = 262_144;
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct UnitKey(String);
@@ -84,7 +87,9 @@ impl<'de> Deserialize<'de> for UnitValue {
 }
 impl UnitValue {
     pub fn inline(bytes: &[u8]) -> Result<Self> {
-        Ok(Self::Inline { bytes: URL_SAFE_NO_PAD.encode(payload_value::canonicalize(bytes)?) })
+        let canonical = payload_value::canonicalize(bytes)?;
+        if canonical.len() > MAX_INLINE_UNIT_BYTES { return Err(WireError("inline-unit-too-large")); }
+        Ok(Self::Inline { bytes: URL_SAFE_NO_PAD.encode(canonical) })
     }
     pub fn object(descriptor: RecordDescriptor) -> Result<Self> {
         Ok(Self::Object { descriptor_hash: descriptor.hash()?, descriptor })
@@ -93,6 +98,7 @@ impl UnitValue {
         match self {
             Self::Inline { bytes } => {
                 let decoded = URL_SAFE_NO_PAD.decode(bytes).map_err(|_| WireError("invalid-inline-value"))?;
+                if decoded.len() > MAX_INLINE_UNIT_BYTES { return Err(WireError("inline-unit-too-large")); }
                 if URL_SAFE_NO_PAD.encode(&decoded) != *bytes || payload_value::canonicalize(&decoded)? != decoded { return Err(WireError("noncanonical-inline-value")); }
             }
             Self::Object { descriptor_hash, descriptor } => {

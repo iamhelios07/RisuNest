@@ -211,7 +211,9 @@ fn observe_descriptor_purposes(
 ) {
     use crate::asset_repository::body_io::{register_object_purpose, BodyPurpose};
     register_object_purpose(descriptor_hash, BodyPurpose::Control);
-    if matches!(key.components()[0].as_str(), "messages" | "archive") {
+    if matches!(key.components()[0].as_str(), "messages" | "archive")
+        || crate::persistent_store::lww::lww_known_unit_key(key)
+    {
         register_object_purpose(&descriptor.object_hash, BodyPurpose::Control);
     }
     observe_dependency_purposes(key, &descriptor.dependencies);
@@ -438,6 +440,13 @@ impl LwwClient {
                 return Err(SyncError::new("clock-skew", 409));
             }
         }
+        let mut request = PushRequest {
+            library_id: self.client.config().library_id,
+            writer_id: store.lww_clock_state()?.writer_id,
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            changes: Vec::new(),
+        };
+        fit_push_page(&mut request, &mut entries)?;
         let cache = Cache::open(&store.repository_root().join("server-sync/lww-cache"))?
             .with_library(store.repository_root())?;
         let transfer = Transfer::new(&self.client, &cache)?;
@@ -530,19 +539,7 @@ impl LwwClient {
         )?;
         let publication = Publication {
             authority: header.binding_authority,
-            request: PushRequest {
-                library_id: self.client.config().library_id,
-                writer_id: store.lww_clock_state()?.writer_id,
-                operation_id: uuid::Uuid::new_v4().to_string(),
-                changes: entries
-                    .iter()
-                    .map(|entry| UnitChange {
-                        key: entry.key.clone(),
-                        stamp: entry.stamp.clone(),
-                        value: entry.value.clone(),
-                    })
-                    .collect(),
-            },
+            request,
             entries,
             config: self
                 .access
@@ -563,6 +560,11 @@ impl LwwClient {
             MAX_METADATA_BYTES,
         );
         let failure = match &reply {
+            Ok(super::client::RequestAttempt::Response(reply))
+                if reply.status == 413 && publication.request.changes.len() == 1 =>
+            {
+                Some("unit-too-large".into())
+            }
             Ok(super::client::RequestAttempt::Response(reply))
                 if !(200..300).contains(&reply.status) =>
             {
@@ -1088,6 +1090,7 @@ impl LwwClient {
             .with_library(store.repository_root())?;
         let transfer = Transfer::new(&self.client, &cache)?;
         let mut controls = BTreeSet::new();
+        let mut large = BTreeSet::new();
         let mut remote = BTreeSet::new();
         for change in changes {
             self.check()?;
@@ -1112,6 +1115,8 @@ impl LwwClient {
                 store.lww_put_object(descriptor_hash, &body)?;
                 if matches!(change.key.components()[0].as_str(), "messages" | "archive") {
                     controls.insert(descriptor.object_hash.clone());
+                } else if crate::persistent_store::lww::lww_known_unit_key(&change.key) {
+                    large.insert(descriptor.object_hash.clone());
                 } else {
                     remote.insert(descriptor.object_hash.clone());
                 }
@@ -1186,6 +1191,22 @@ impl LwwClient {
             let body = cache.read(&hash, MAX_METADATA_BYTES)?;
             store.lww_put_object(&hash, &body)?;
         }
+        let mut required_large = Vec::new();
+        for hash in large {
+            if !store.lww_verified_object_present(&hash)? {
+                required_large.push(hash);
+            }
+        }
+        transfer.download(&required_large, &[])?;
+        for hash in required_large {
+            let size = cache
+                .stat_object(&hash)?
+                .ok_or_else(|| SyncError::new("cached-object-missing", 409))?;
+            let size = usize::try_from(size)
+                .map_err(|_| SyncError::new("cached-object-too-large", 413))?;
+            let body = cache.read(&hash, size)?;
+            store.lww_put_object(&hash, &body)?;
+        }
         if !remote.is_empty() {
             let cas = crate::asset_repository::PayloadCas::new(store.repository_root())?;
             let missing = remote
@@ -1218,6 +1239,32 @@ impl LwwClient {
     }
 }
 
+/// Keeps the longest outbox prefix whose canonical push request stays below
+/// the metadata bound with room for framing; later entries wait for the next push.
+fn fit_push_page(request: &mut PushRequest, entries: &mut Vec<OutboxEntry>) -> Result<()> {
+    const PUSH_BUDGET: usize = MAX_METADATA_BYTES - 4096;
+    let mut total = canonical::encode(&*request)?.len();
+    let mut changes = Vec::new();
+    for entry in entries.iter() {
+        let change = UnitChange {
+            key: entry.key.clone(),
+            stamp: entry.stamp.clone(),
+            value: entry.value.clone(),
+        };
+        let bytes = canonical::encode(&change)?.len() + usize::from(!changes.is_empty());
+        if total + bytes > PUSH_BUDGET {
+            break;
+        }
+        total += bytes;
+        changes.push(change);
+    }
+    if changes.is_empty() {
+        return Err(SyncError::new("unit-too-large", 413));
+    }
+    entries.truncate(changes.len());
+    request.changes = changes;
+    Ok(())
+}
 fn operation_digest(request: &PushRequest) -> risunest_sync_wire::Result<String> {
     let result = request.digest();
     #[cfg(test)]
