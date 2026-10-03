@@ -186,13 +186,15 @@ pub(crate) async fn external_lww_inspect(app: AppHandle, request: Request) -> Re
             &library_id,
         )
         .map_err(runtime::local_error)?;
-    let previous = store.lww_binding_state().map_err(runtime::local_error)?;
+    let previously_bound_library = store
+        .lww_previously_bound(&library_id, &target_id)
+        .map_err(runtime::local_error)?;
     Ok(Inspection {
         inspection_id,
         target_id,
-        library_id: library_id.clone(),
+        library_id,
         empty: objects.is_empty() && engine.snapshot_listing(&session.cancel).await?.is_empty(),
-        previously_bound_library: previous.library_id.as_deref() == Some(&library_id),
+        previously_bound_library,
     })
 }
 pub(crate) struct StageRequest {

@@ -1500,6 +1500,7 @@ export const languageGerman = {
         cancelAction: "Abbrechen",
         clockBlocked: "Die Synchronisierung wurde wegen unterschiedlicher Geräte- und Remotezeiten angehalten. Korrigieren Sie die Zeit und versuchen Sie es erneut.",
         writerCollision: "Die Synchronisierung wurde wegen einer doppelten Geräteidentität angehalten. Verbinden Sie sich erneut als neues Gerät.",
+        unitTooLarge: "Die Synchronisierung wurde angehalten, weil ein Element auf diesem Gerät zu groß ist, um es an den Server zu senden. Verkleinern Sie das große Element und versuchen Sie es erneut.",
         newDeviceAction: "Als neues Gerät verbinden",
         restoreTitle: "Sicherung wiederherstellen?",
         restoreDescriptionBound: "Die aktuellen Daten werden gelöscht und durch die gewählte Sicherung ersetzt. Die wiederhergestellten Daten werden synchronisiert. Erstellen Sie bei Bedarf manuell eine Sicherung.",

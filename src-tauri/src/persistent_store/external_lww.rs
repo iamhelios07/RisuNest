@@ -166,6 +166,27 @@ impl SealedPublication {
             .collect()
     }
 }
+pub(super) fn carry_pending_publications(db: &rusqlite::Connection, old: DecimalU64, new: DecimalU64) -> StoreResult<()> {
+    let pending: Vec<(String, String, String, String)> = {
+        let mut statement = db.prepare("SELECT target,writer,seq,metadata FROM external_lww_segments WHERE complete=0 AND authority=?1")?;
+        let rows = statement
+            .query_map([old.0.to_string()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        rows
+    };
+    for (target, writer, seq, metadata) in pending {
+        let mut publication: SealedPublication = serde_json::from_str(&metadata)?;
+        publication.authority = new;
+        for entry in &mut publication.entries {
+            entry.target_authority = new;
+        }
+        db.execute(
+            "UPDATE external_lww_segments SET authority=?4,metadata=?5 WHERE target=?1 AND writer=?2 AND seq=?3",
+            params![target, writer, seq, new.0.to_string(), serde_json::to_string(&publication)?],
+        )?;
+    }
+    Ok(())
+}
 impl PersistentStore {
     pub(super) fn external_lww_active_asset_roots(&self) -> StoreResult<crate::asset_repository::migration_gc::AssetRootSet> {
         let device = self.device_store()?;

@@ -2161,11 +2161,6 @@ export const languageKorean = {
             pendingHelp:
                 '진행 중이던 동기화를 마쳐야 연결을 해제할 수 있습니다. 지금 동기화를 누르세요.',
             conflict: '충돌 확인 필요',
-            conflictCount: '충돌 항목 {0}개',
-            conflictHelp:
-                '이 기기와 서버에서 같은 항목이 변경되었습니다. 모든 충돌 항목에 유지할 쪽을 선택하세요. 적용하기 전에 양쪽 내용이 충돌 백업으로 저장됩니다.',
-            keepLocal: '이 기기 내용 유지',
-            keepRemote: '서버 내용 유지',
             busyHelp: '다른 작업이 라이브러리를 사용하고 있습니다. 작업이 끝난 후 다시 시도하세요.',
             errorHelp:
                 '동기화를 마치지 못했습니다. 이 기기에서 고친 내용은 그대로 있습니다. 다시 시도하세요.',
@@ -2881,6 +2876,7 @@ export const languageKorean = {
         cancelAction: "취소",
         clockBlocked: "기기와 원격 간의 시간 차이가 있어 동기화가 중단되었습니다. 시간을 보정한 후 다시 시도해주세요.",
         writerCollision: "중복된 기기로 인해 동기화가 중단되었습니다. 새 기기로 다시 연결해주세요.",
+        unitTooLarge: "이 기기의 항목 중 서버로 보내기에 너무 큰 항목이 있어 동기화가 중단되었습니다. 큰 항목의 크기를 줄인 후 다시 시도해주세요.",
         newDeviceAction: "새 기기로 연결",
         restoreTitle: "백업을 복원하시겠습니까?",
         restoreDescriptionBound: "현재 데이터를 초기화한 후 선택한 백업으로 복원하며, 복원한 내용은 원격으로 동기화됩니다. 백업이 필요한 경우 수동으로 백업해주세요.",

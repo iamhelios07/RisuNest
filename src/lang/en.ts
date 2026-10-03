@@ -2347,11 +2347,6 @@ export const languageEnglish = {
             pendingHelp:
                 'The sync in progress has to finish before disconnecting. Select Sync now.',
             conflict: 'Conflicts need attention',
-            conflictCount: '{0} conflicting items',
-            conflictHelp:
-                'The same items were edited on this device and on the server. Choose one side for all conflicting items. Both sides are saved as conflict backups before applying.',
-            keepLocal: 'Keep this device',
-            keepRemote: 'Keep server version',
             busyHelp: 'Another operation is using the library. Wait for it to finish and try again.',
             errorHelp:
                 'Sync could not finish. Your edits on this device are unchanged. Try again.',
@@ -3070,6 +3065,7 @@ export const languageEnglish = {
         cancelAction: "Cancel",
         clockBlocked: "Sync stopped because the device and remote times differ. Correct the time and try again.",
         writerCollision: "Sync stopped because another device uses the same identity. Reconnect as a new device.",
+        unitTooLarge: "Sync stopped because an item on this device is too large to send to the server. Make the large item smaller and try again.",
         newDeviceAction: "Connect as new device",
         restoreTitle: "Restore the backup?",
         restoreDescriptionBound: "The current data will be cleared and replaced with the selected backup, and the restored data will sync remotely. Make a manual backup if needed.",

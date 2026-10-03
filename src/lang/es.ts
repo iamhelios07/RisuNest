@@ -1499,6 +1499,7 @@ export const languageSpanish = {
         cancelAction: "Cancelar",
         clockBlocked: "La sincronización se detuvo porque la hora del dispositivo y la remota son distintas. Corrija la hora y vuelva a intentarlo.",
         writerCollision: "La sincronización se detuvo por una identidad de dispositivo duplicada. Vuelva a conectarse como un dispositivo nuevo.",
+        unitTooLarge: "La sincronización se detuvo porque un elemento de este dispositivo es demasiado grande para enviarlo al servidor. Reduzca el tamaño del elemento grande y vuelva a intentarlo.",
         newDeviceAction: "Conectar como dispositivo nuevo",
         restoreTitle: "¿Restaurar la copia de seguridad?",
         restoreDescriptionBound: "Se borrarán los datos actuales y se restaurará la copia seleccionada. Los datos restaurados se sincronizarán. Si necesita una copia de seguridad, créela manualmente.",
