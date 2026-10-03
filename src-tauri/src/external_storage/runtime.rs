@@ -234,7 +234,7 @@ pub(crate) fn external_storage_set_sync_paused(app: AppHandle, request: SetPause
 }
 #[tauri::command]
 pub(crate) fn external_storage_set_automatic_backup_paused(app: AppHandle, connection_id: String, paused: bool) -> Result<()> {
-    logged("external_storage_set_automatic_backup_paused", ConnectionStore::open(&root(&app)?)?.set_automatic_backup_paused(&connection_id, paused))
+    logged("external_storage_set_automatic_backup_paused", (|| ConnectionStore::open(&root(&app)?)?.set_automatic_backup_paused(&connection_id, paused))())
 }
 #[tauri::command]
 pub(crate) fn external_storage_get_job(app: AppHandle, job_id: String) -> Result<Value> {

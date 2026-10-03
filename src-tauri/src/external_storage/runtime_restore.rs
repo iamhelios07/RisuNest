@@ -147,7 +147,7 @@ pub(crate) fn confirmed_restore_activation(app:&AppHandle,job:&DurableJob)->Resu
 
 #[tauri::command]
 pub(crate) fn external_storage_confirm_restore_adoption(app:AppHandle,request:RestoreAdoptionRequest)->Result<Value> {
-    logged("external_storage_confirm_restore_adoption", confirm_restore_adoption_in_store(&runtime::native_store(&app)?,&runtime::root(&app)?,&request))
+    logged("external_storage_confirm_restore_adoption", (|| confirm_restore_adoption_in_store(&runtime::native_store(&app)?,&runtime::root(&app)?,&request))())
 }
 
 pub(crate) fn application_started(job: &DurableJob) -> bool {
