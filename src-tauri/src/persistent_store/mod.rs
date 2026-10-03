@@ -69,6 +69,7 @@ pub(super) const CONVERSATION_RANGE_MAX_LIMIT: i64 = 4_096;
 pub(super) const JAVASCRIPT_MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 pub(crate) const ASSET_GC_PRODUCT_PAGE_LIMIT: i64 = 128;
 const ASSET_GC_PRODUCT_MINIMUM_GRACE_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
+pub(crate) const MESSAGE_PAGE_SWEEP_LIMIT: usize = 1_024;
 
 // Add every generation-scoped record family here so staged moves and cleanup cannot omit it.
 pub(super) const GENERATION_TABLES: &[(&str, &str)] = &[
@@ -1643,8 +1644,7 @@ impl PersistentStore {
         expected_revision: i64,
     ) -> StoreResult<AssignedPluginStorage> {
         let assigned_at = device_store::now_ms()?;
-        let (outcome, revision) = commit::assign_plugin_storage(
-            &mut self.connection,
+        let (outcome, revision) = self.lww_assign_plugin_storage(
             sources,
             owner,
             collision,
@@ -1994,43 +1994,11 @@ impl PersistentStore {
         self.lww_commit_replacement(&header,&prepared.staging_id)
     }
 
-    pub(crate) fn finish_prepared_replace_with_app_kv(
-        &mut self,
-        prepared: PreparedReplaceCommit,
-        key: &str,
-        value: &Value,
-    ) -> StoreResult<RevisionResult> {
-        commit::replace_commit_with_app_kv(
-            &mut self.connection,
-            &prepared.staging_id,
-            Some(prepared.revision),
-            Some((key, value)),
-        )
-    }
-
-    /// Normal external sync receive, after complete staged logical/payload
-    /// validation and under the existing replacement fence and file(true).
-    /// The remote base and activation are committed atomically.
     /// The library rows themselves, for a test that has to look at what a
     /// receive did rather than at what it reported.
     #[cfg(test)]
     pub(crate) fn library_rows(&self) -> &rusqlite::Connection {
         &self.connection
-    }
-
-    pub(crate) fn finish_external_receive(
-        &mut self,
-        prepared: PreparedReplaceCommit,
-        job: &str,
-        records: &std::collections::BTreeMap<String, String>,
-    ) -> StoreResult<RevisionResult> {
-        commit::replace_commit_from_external(
-            &mut self.connection,
-            &prepared.staging_id,
-            prepared.revision,
-            job,
-            records,
-        )
     }
 
     pub(crate) fn replace_abort(&mut self, staging_id: &str) -> StoreResult<()> {
@@ -2699,6 +2667,37 @@ impl PersistentStore {
         )?;
         self.record_asset_gc_maintenance_cursor(page.next_cursor.as_deref())?;
         Ok(page)
+    }
+
+    /// One bounded pass over the library's message objects. Roots are read inside the
+    /// write transaction, so a reference committed before the pass is seen.
+    /// Callers hold native file admission so no replacement runs meanwhile.
+    pub(crate) fn sweep_message_page_objects(
+        &mut self,
+        now_ms: i64,
+        limit: usize,
+    ) -> StoreResult<message_pages::ObjectSweep> {
+        let Ok(device) = self.device_store.as_ref() else {
+            return Ok(message_pages::ObjectSweep::default());
+        };
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let roots = message_pages::object_roots(
+            &transaction,
+            self.revision_leases.values().map(|lease| &lease.connection),
+            device.connection(),
+            &transaction,
+        )?;
+        let sweep = message_pages::sweep_objects(
+            &transaction,
+            &roots,
+            now_ms,
+            ASSET_GC_PRODUCT_MINIMUM_GRACE_MS,
+            limit,
+        )?;
+        transaction.commit()?;
+        Ok(sweep)
     }
 
     fn record_asset_gc_maintenance_cursor(&mut self, cursor: Option<&str>) -> StoreResult<()> {

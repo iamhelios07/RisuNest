@@ -48,6 +48,8 @@ fn all_live_tables_have_an_explicit_preservation_owner() {
         "lww_publications",
         "lww_receive_rows",
         "lww_requests",
+        "message_page_object_marks",
+        "message_page_sweep_cursor",
         "plugin_gc_revision",
         "snapshot_original_meta",
         "snapshot_original_units",

@@ -486,11 +486,26 @@ fn open_persistent_store(
 
 #[tauri::command(async)]
 pub(crate) fn pds_asset_gc_maintenance(
+    app: AppHandle,
     state: State<'_, PersistentStoreState>,
 ) -> Result<crate::asset_repository::migration_gc::AssetGcDryRunPage, StoreError> {
     with_store_mut(state, |store| {
-        store.asset_gc_product_maintenance_page(current_time_ms()?)
+        let now = current_time_ms()?;
+        let page = store.asset_gc_product_maintenance_page(now)?;
+        if let Some(_permit) = message_page_sweep_permit(&app) {
+            store.sweep_message_page_objects(now, super::MESSAGE_PAGE_SWEEP_LIMIT)?;
+        }
+        Ok(page)
     })
+}
+
+/// Message objects are swept only while no replacement or server sync holds
+/// the library, so a refused permit skips the sweep.
+fn message_page_sweep_permit(app: &AppHandle) -> Option<crate::native_file_jobs::admission::Permit> {
+    app.try_state::<crate::native_file_jobs::NativeFileJobState>()?
+        .admission
+        .file(false)
+        .ok()
 }
 
 #[tauri::command(async)]
@@ -1195,13 +1210,36 @@ fn pds_asset_gc_preview_all(
 
 #[tauri::command(async)]
 pub(crate) fn pds_asset_gc_execute(
+    app: AppHandle,
     state: State<'_, PersistentStoreState>,
 ) -> Result<AssetGcMaintenanceResult, StoreError> {
     let operation_guard = state.admit_renderer_operation()?;
     finish_storage_command(
         "pds_asset_gc_execute",
-        pds_asset_gc_execute_all(&state, &operation_guard),
+        pds_asset_gc_execute_all(&state, &operation_guard).and_then(|result| {
+            sweep_message_pages(&app, &state, &operation_guard)?;
+            Ok(result)
+        }),
     )
+}
+
+fn sweep_message_pages(
+    app: &AppHandle,
+    state: &PersistentStoreState,
+    operation_guard: &RendererOperationGuard,
+) -> StoreResult<()> {
+    let now = current_time_ms()?;
+    loop {
+        let Some(_permit) = message_page_sweep_permit(app) else {
+            return Ok(());
+        };
+        let sweep = with_store_mutex_mut_admitted(state, operation_guard, |store| {
+            store.sweep_message_page_objects(now, super::MESSAGE_PAGE_SWEEP_LIMIT)
+        })?;
+        if sweep.wrapped {
+            return Ok(());
+        }
+    }
 }
 
 fn pds_asset_gc_execute_all(
