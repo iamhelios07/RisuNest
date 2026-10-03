@@ -889,7 +889,7 @@ mod tests {
         let root=tempfile::tempdir().unwrap();
         let mut store=PersistentStore::open(root.path()).unwrap();
         let input=serde_json::from_value(json!({"connectionId":"synthetic-connection","kind":"restore","snapshotId":"synthetic-snapshot","targetRevision":"0"})).unwrap();
-        let job=DurableJob::new(input,false,1,store.external_identity().unwrap());
+        let job=DurableJob::new(input,1,store.external_identity().unwrap());
         let pending=commit_fixture(&mut store,root.path(),&job);
         let receipt=completed_restore_in_store(&store,&pending).unwrap().unwrap();
         let request=RestoreAdoptionRequest{job_id:job.id.clone(),received_revision:receipt["receivedRevision"].as_str().unwrap().into(),selected_character_id:None};
@@ -914,7 +914,7 @@ mod tests {
         let root=tempfile::tempdir().unwrap();
         let mut store=PersistentStore::open(root.path()).unwrap();
         let input=serde_json::from_value(json!({"connectionId":"synthetic-connection","kind":"restore","snapshotId":"synthetic-snapshot","targetRevision":"0"})).unwrap();
-        let job=DurableJob::new(input,false,1,store.external_identity().unwrap());
+        let job=DurableJob::new(input,1,store.external_identity().unwrap());
         let pending=commit_fixture(&mut store,root.path(),&job);
         let receipt=completed_restore_in_store(&store,&pending).unwrap().unwrap();
         store.commit(&crate::persistent_store::WorkingSetCommit{expected_revision:1,
@@ -932,7 +932,7 @@ mod tests {
     fn local_application_evidence_survives_reopen_and_later_phase_updates() {
         let root=tempfile::tempdir().unwrap();
         let input=serde_json::from_value(json!({"connectionId":"synthetic-connection","kind":"restore","snapshotId":"synthetic-snapshot","targetRevision":"0"})).unwrap();
-        let job=DurableJob::new(input,false,1,identity());
+        let job=DurableJob::new(input,1,identity());
         JobStore::open(root.path()).unwrap().put(&job).unwrap();
         mark_application_started(root.path(),&job).unwrap();
         update_phase(root.path(),&job,"downloading").unwrap();
@@ -985,7 +985,7 @@ mod tests {
         let root=tempfile::tempdir().unwrap();
         let mut store=PersistentStore::open(root.path()).unwrap();
         let request=serde_json::from_value(json!({"connectionId":"synthetic-connection","kind":"restore","snapshotId":"synthetic-snapshot","targetRevision":"0"})).unwrap();
-        let job=DurableJob::new(request,false,1,identity());
+        let job=DurableJob::new(request,1,identity());
         assert!(completed_restore_in_store(&store,&job).unwrap().is_none());
         let pending=commit_fixture(&mut store,root.path(),&job);
         assert!(completed_restore_in_store(&store,&pending).unwrap().is_some());

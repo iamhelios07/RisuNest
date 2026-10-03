@@ -5110,7 +5110,7 @@ mod tests {
                 for bytes in &asset_bytes[2..] {local.prepare_bytes(bytes).unwrap();}
                 if already_present {for bytes in &asset_bytes[..2] {local.prepare_bytes(bytes).unwrap();}}
                 let request=serde_json::from_value(serde_json::json!({"connectionId":"synthetic-connection","kind":"restore","snapshotId":"full-phase","targetRevision":"0"})).unwrap();
-                let mut job=DurableJob::new(request,false,1,store.external_identity().unwrap());
+                let mut job=DurableJob::new(request,1,store.external_identity().unwrap());
                 job.summary["restoreSource"]=serde_json::to_value(completed.reference.stored(&connected.handle).unwrap()).unwrap();
                 let jobs=JobStore::open(destination.path()).unwrap();jobs.put(&job).unwrap();
                 crate::persistent_store::hash_work::reset_hash_work();
