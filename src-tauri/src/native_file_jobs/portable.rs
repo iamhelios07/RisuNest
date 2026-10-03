@@ -997,6 +997,7 @@ mod tests {
         let failure = device_error(DeviceBackupError {
             code: "device-storage-failed".into(),
             message: "synthetic storage failure".into(),
+            cause: None,
         });
 
         assert_eq!(failure.code, "portable-backup-failed");
