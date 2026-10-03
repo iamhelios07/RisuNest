@@ -39,7 +39,6 @@ pub(crate) mod publication;
 pub(crate) mod quota;
 pub(crate) mod quota_profiles;
 pub(crate) mod reachability;
-pub(crate) mod receive_artifacts;
 pub(crate) mod recovery;
 #[cfg(test)]
 mod recovery_integration_tests;
