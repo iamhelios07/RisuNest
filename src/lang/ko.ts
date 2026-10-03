@@ -919,6 +919,7 @@ export const languageKorean = {
     "syncConflictBackups": '계정 동기화 충돌 백업',
     "syncConflictNoBackups": "저장된 동기화 충돌 백업이 없습니다.",
     "syncConflictRestoreConfirm": '현재 데이터베이스를 이 백업으로 교체하시겠습니까? 자동 백업은 만들지 않습니다. 에셋, 콜드 스토리지 데이터, 인레이는 포함되지 않습니다.',
+    "syncConflictRestoreScope": '에셋, 콜드 스토리지 데이터, 인레이는 포함되지 않습니다.',
     "syncBackupEntry": "{date} / {side} / 캐릭터 {count}개",
     "syncBackupDatabaseOnly": "데이터베이스 전용, 에셋, 콜드 스토리지, 인레이 제외",
     "syncBackupSideLocal": "이 기기",
@@ -2534,6 +2535,8 @@ export const languageKorean = {
                 '동기화가 실행 중이거나 복구가 필요합니다. 처리가 끝난 뒤 백업·복원을 다시 실행해주세요.',
             syncUnconfirmed:
                 '동기화 결과를 확정하지 못했습니다. 미확정 작업을 해결한 뒤 복원해주세요.',
+            syncUnavailable:
+                '동기화가 연결되지 않아 백업을 복원할 수 없습니다. 동기화를 연결한 후 다시 시도해주세요.',
             title: '백업·복원',
             groupFiles: '백업 파일',
             filesHelp:

@@ -13,11 +13,20 @@ export async function resumeCurrentSyncBinding(target: BindingTarget): Promise<v
     await bindingFlow.resumeCurrent(target)
 }
 
+/** A bound library cannot be replaced until its sync target delivers the changes available now. */
+export class SyncBindingUnavailableError extends Error {
+    readonly code = 'sync-unavailable'
+    constructor(cause?: unknown) {
+        super('Sync is unavailable for library replacement', cause === undefined ? undefined : { cause })
+        this.name = 'SyncBindingUnavailableError'
+    }
+}
+
 export async function prepareBoundLibraryReplacement(options: { confirmedCommittedRestore?: boolean } = {}) {
     const native = createNativeSyncBindingBridge()
     const state = await native.state()
     const transport = state.target.kind === 'none' ? undefined : transports.get(key(state.target))
-    if (state.target.kind !== 'none' && (!transport || (!options.confirmedCommittedRestore && !transport.receiveAvailableChanges))) throw new Error('Sync is unavailable for library replacement')
+    if (state.target.kind !== 'none' && (!transport || (!options.confirmedCommittedRestore && !transport.receiveAvailableChanges))) throw new SyncBindingUnavailableError()
     const context = { state, signal: new AbortController().signal }
     const assertUnchanged = async () => {
         await native.assertAuthority(state)
@@ -26,7 +35,10 @@ export async function prepareBoundLibraryReplacement(options: { confirmedCommitt
             throw new Error('Sync binding changed')
         }
     }
-    if (!options.confirmedCommittedRestore) await transport?.receiveAvailableChanges?.(context)
+    if (!options.confirmedCommittedRestore && transport?.receiveAvailableChanges) {
+        try { await transport.receiveAvailableChanges(context) }
+        catch (error) { throw new SyncBindingUnavailableError(error) }
+    }
     await assertUnchanged()
     return {
         state,

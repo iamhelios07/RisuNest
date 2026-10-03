@@ -708,6 +708,9 @@ export class NativeFileJobError extends Error {
     }
 }
 
+const isSyncUnavailable = (error: unknown): boolean =>
+    typeof error === 'object' && error !== null && 'code' in error && error.code === 'sync-unavailable'
+
 export class NativeFileJobActivationCommittedError extends NativeFileJobError {
     readonly recoveryRequired = true
 
@@ -1541,7 +1544,7 @@ async function runNativeReplacementRestore(
                         error instanceof NativeFileJobError
                             ? error
                             : new NativeFileJobError(
-                                  'revision-conflict',
+                                  isSyncUnavailable(error) ? 'sync-unavailable' : 'revision-conflict',
                                   error instanceof Error
                                       ? error.message
                                       : String(error),

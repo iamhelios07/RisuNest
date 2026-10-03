@@ -205,7 +205,8 @@
                 onEmpty: () => { listed = false },
             })
         } catch (error) {
-            showActionError(error)
+            const syncUnavailable = typeof error === 'object' && error !== null && 'code' in error && error.code === 'sync-unavailable'
+            showActionError(error, syncUnavailable ? language.risuNest.backup.syncUnavailable : strings.actionFailed)
         } finally {
             restoringSnapshot = null
         }

@@ -383,6 +383,20 @@ describe('RisuNestStorageDashboard', () => {
         expect(alerts.alertError).not.toHaveBeenCalled()
     })
 
+    it('asks to connect sync when a snapshot restore cannot reach the bound sync target', async () => {
+        const target = setup()
+        maintenance.restoreNativePersistentSnapshot.mockRejectedValue(
+            Object.assign(new Error('Sync is unavailable for library replacement'), { code: 'sync-unavailable' }),
+        )
+        await vi.waitFor(() => expect(exact(target, 'Restore')).toBeDefined())
+
+        exact(target, 'Restore')!.click()
+
+        await vi.waitFor(() => expect(alerts.alertError).toHaveBeenCalledOnce())
+        expect(alerts.alertError).toHaveBeenCalledWith(languageEnglish.risuNest.backup.syncUnavailable)
+        expect(alerts.alertError).not.toHaveBeenCalledWith(languageEnglish.risuNest.storage.actionFailed)
+    })
+
     it('marks a running action busy on its button instead of swapping the label', async () => {
         const target = setup()
         let finish: ((value: { id: string; revision: number; bytes: number; durationMs: number }) => void) | undefined
