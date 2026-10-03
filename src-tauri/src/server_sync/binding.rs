@@ -856,6 +856,10 @@ mod tests {
         assert_eq!(b.read_root(None).unwrap().value["language"], "ko");
         assert_eq!(b.read_root(None).unwrap().value["askRemoval"], false);
         assert_eq!(a.read_root(None).unwrap().value["askRemoval"], false);
+        save(&mut b, &["root", "language"], serde_json::json!("en"));
+        drain_publications(&peer, &mut b, &[]).unwrap();
+        receive_available(&client, &mut a, &[]).unwrap();
+        assert_eq!(a.read_root(None).unwrap().value["language"], "en");
     }
     #[test]
     fn switching_away_from_an_unreachable_server_never_settles_its_publication_with_the_next_one() {
