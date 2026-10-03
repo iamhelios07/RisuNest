@@ -1507,6 +1507,5 @@ export const languageVietnamese = {
         restoreDescription: "Dữ liệu hiện tại sẽ bị xóa và thay thế bằng bản sao lưu đã chọn. Hãy sao lưu thủ công nếu cần.",
         restoreAcknowledge: "Xóa dữ liệu hiện tại",
         restoreAction: "Khôi phục",
-        myboxSyncUnavailable: "Không thể sử dụng MYBOX để đồng bộ.",
     },
 } satisfies DeepPartial<typeof import('./en').languageEnglish>;

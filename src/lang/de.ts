@@ -1507,6 +1507,5 @@ export const languageGerman = {
         restoreDescription: "Die aktuellen Daten werden gelöscht und durch die gewählte Sicherung ersetzt. Erstellen Sie bei Bedarf manuell eine Sicherung.",
         restoreAcknowledge: "Aktuelle Daten löschen",
         restoreAction: "Wiederherstellen",
-        myboxSyncUnavailable: "MYBOX kann nicht zur Synchronisierung verwendet werden.",
     },
 } satisfies DeepPartial<typeof import('./en').languageEnglish>;

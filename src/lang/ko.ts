@@ -2918,6 +2918,5 @@ export const languageKorean = {
         restoreDescription: "현재 데이터를 초기화한 후 선택한 백업으로 복원합니다. 백업이 필요한 경우 수동으로 백업해주세요.",
         restoreAcknowledge: "현재 데이터 초기화",
         restoreAction: "복원",
-        myboxSyncUnavailable: "MYBOX는 동기화에 사용할 수 없습니다.",
     },
 } satisfies DeepPartial<typeof import('./en').languageEnglish>
