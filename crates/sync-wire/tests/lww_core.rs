@@ -135,3 +135,21 @@ fn unit_value_strict_decode_preserves_canonical_wire_roundtrips() {
         assert_eq!(canonical::encode(&decoded).unwrap(), bytes);
     }
 }
+
+#[test]
+fn inline_values_are_bounded_by_decoded_canonical_bytes() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let string = |len: usize| format!("\"{}\"", "a".repeat(len - 2)).into_bytes();
+    let at_limit = string(MAX_INLINE_UNIT_BYTES);
+    let value = UnitValue::inline(&at_limit).unwrap();
+    value.validate().unwrap();
+    value.identity().unwrap();
+    let over = string(MAX_INLINE_UNIT_BYTES + 1);
+    assert_eq!(UnitValue::inline(&over).err(), Some(WireError("inline-unit-too-large")));
+    let forged = UnitValue::Inline { bytes: URL_SAFE_NO_PAD.encode(&over) };
+    assert_eq!(forged.validate(), Err(WireError("inline-unit-too-large")));
+    assert_eq!(forged.identity(), Err(WireError("inline-unit-too-large")));
+    // The bound applies to the canonical form, so whitespace cannot hide a large value.
+    let padded = format!("[{}0]", " ".repeat(MAX_INLINE_UNIT_BYTES)).into_bytes();
+    assert_eq!(UnitValue::inline(&padded).unwrap(), UnitValue::inline(b"[0]").unwrap());
+}
