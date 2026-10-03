@@ -1704,3 +1704,27 @@ fn rebinding_the_same_repository_finishes_the_sealed_segment_and_publishes_offli
         assert_eq!(f.b.read_root(None).unwrap().value["askRemoval"], true);
     })
 }
+#[test]
+fn a_rebind_drops_an_unfinished_receive_and_receives_its_segment_again() {
+    run(async {
+        use crate::persistent_store::sync_selection::SyncTarget;
+        let mut f = CycleFixture::new();
+        let target = SyncTarget::External("repository".into());
+        let sent = bind_external(&mut f.a, &f.sender, &target);
+        let bound = bind_external(&mut f.b, &f.receiver, &target);
+        set(&mut f.a, &["root", "language"], serde_json::json!("ja"));
+        f.sender.publish(&mut f.a, sent, &[], &Cancellation::default()).await.unwrap();
+        let requests = f.receiver.receive_requests(&mut f.b, bound, &Cancellation::default()).await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let unfinished = requests[0].header.request_id.clone();
+        f.b.lww_stage_receive(&requests[0]).unwrap();
+        f.b.lww_apply_receive(&crate::persistent_store::lww::ApplyReceive { header: requests[0].header.clone(), generating: vec![] }).unwrap();
+        assert_ne!(f.b.lww_receive_row_counts(&unfinished).unwrap().0, 0);
+        bind_external(&mut f.b, &f.receiver, &SyncTarget::None);
+        assert_eq!(f.b.lww_receive_row_counts(&unfinished).unwrap(), (0, 0));
+        let rebound = bind_external(&mut f.b, &f.receiver, &target);
+        assert_eq!(f.receiver.receive_and_apply(&mut f.b, rebound, &[], &Cancellation::default()).await.unwrap(), 1);
+        assert_eq!(f.b.read_root(None).unwrap().value["language"], "ja");
+        assert_eq!(f.b.lww_receive_row_counts(&unfinished).unwrap(), (0, 0));
+    })
+}
