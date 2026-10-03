@@ -673,7 +673,7 @@ await Risuai.pluginStorage.clear(); // Remove all items
 
 ### Safe Local Storage
 
-`safeLocalStorage` is **device-local**, string-only, and confined to your plugin in RisuNest the same way `pluginStorage` is. It is not included in save snapshots and does not sync to another device, making it suitable for device-specific cache or settings data.
+`safeLocalStorage` is **device-local**, string-only, and confined to your plugin in RisuNest the same way `pluginStorage` is. It does not sync to another device unless the user turns on local plugin data sync (see [Device-local data in RisuNest](#device-local-data-in-risunest)), making it suitable for device-specific cache or settings data.
 
 ```javascript
 // Same API as pluginStorage
@@ -687,9 +687,7 @@ const deviceId = await Risuai.safeLocalStorage.getItem('device_id');
 
 ### Local Plugin Storage
 
-`getLocalPluginStorage()` is also device-local and is not included in save snapshots or cross-device sync. Unlike `safeLocalStorage`, it accepts JSON-serializable values and is appropriate for structured device-only settings or caches. In RisuNest it is confined to your plugin, and it is a separate space from `safeLocalStorage`, so clearing one leaves the other alone.
-
-On the native app both device spaces are kept in the installation's own device file, which a save snapshot restore never replaces. They are not included in ordinary save snapshots, RisuAI/PocketRisu exports, or sync. Plugin permissions and OS-issued handles are not transferred either.
+`getLocalPluginStorage()` is also device-local and follows the same sync rule as `safeLocalStorage`. Unlike `safeLocalStorage`, it accepts JSON-serializable values and is appropriate for structured device-only settings or caches. In RisuNest it is confined to your plugin, and it is a separate space from `safeLocalStorage`, so clearing one leaves the other alone.
 
 `getLocalPluginStorage()` returns a `SafeLocalPluginStorage` instance: device-local storage that supports any JSON-serializable value (unlike `safeLocalStorage` which is strings-only), with generic type support:
 
@@ -713,6 +711,17 @@ await storage.clear();
 **Use `getLocalPluginStorage()` when:**
 - You need to store structured objects (not just strings)
 - Data should stay on one device
+
+### Device-local data in RisuNest
+
+On the native app `safeLocalStorage` and `getLocalPluginStorage()` are kept in the installation's own device file. RisuNest treats both spaces as follows:
+
+- **Full backups** always include both spaces, whether or not they sync. Restoring a full backup replaces them with the backup's values.
+- **Sync** carries them only when the user turns on the local plugin data option in RisuNest settings. The option is off by default, applies to both spaces of every plugin, and covers both the sync server and external storage. With it off, each device keeps its own values.
+- **First connection to a sync target that already holds data** clears both spaces for every plugin, including plugins that are no longer installed. With the option on they are then filled from the target; with it off they start empty. Reconnecting to the same target keeps them.
+- **RisuAI and PocketRisu exports** never include them.
+
+Plugin permissions and OS-issued handles are not transferred by any of these.
 
 ### Database Access
 
@@ -819,6 +828,33 @@ await Risuai.setChatToIndex(charIndex, chatIndex, chat);
 Indexes are resolved to stable internal targets when each call starts. Invalid character or
 chat indexes keep the existing `null` getter and fulfilled no-op setter behavior. Setters reject
 changes to `chaId` or `chat.id` and emit a structured development diagnostic.
+
+#### What a whole-object setter writes
+
+`setDatabase`, `setDatabaseLite`, `setCharacter`, `setCharacterToIndex` and `setChatToIndex`
+take a whole object, but RisuNest saves only the fields that differ from a baseline, so an edit
+made elsewhere to a field you did not change is kept. The baseline is your plugin's newest
+completed read of the same target: the character, the chat, or each requested `getDatabase()`
+key, including the characters and chats nested in a newer read.
+
+- An object from any earlier read of the target, or a copy of one (spread, `structuredClone`,
+  JSON round trip), is compared with that newest read. A field that changed between the read
+  your object came from and the newest read is written back with your object's value, so
+  read again right before you edit when other code may have changed the target meanwhile.
+- A target your plugin never read is compared with its current value when the setter is called.
+- An object read before the library was replaced (connecting to a sync target, restoring a
+  backup, or switching libraries) is rejected with a stale read baseline error. Read the
+  target again and repeat the edit.
+
+The usual pattern works as written:
+
+```javascript
+const chat = await Risuai.getChatFromIndex(charIndex, chatIndex);
+await Risuai.setChatToIndex(charIndex, chatIndex, {
+  ...chat,
+  message: chat.message.map((message) => ({ ...message, data: message.data.trim() })),
+});
+```
 
 A full character read costs one target character plus its conversations. A full chat read costs
 one target conversation plus the configured character and conversation catalog lookup. Prefer the
