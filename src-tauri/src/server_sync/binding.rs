@@ -1309,6 +1309,26 @@ mod tests {
         assert!(server.server.authenticate(&old.library_id, &old.token).is_err());
     }
     #[test]
+    fn a_new_registration_after_the_old_one_was_revoked_still_publishes_unsent_edits() {
+        let server = LocalServerFixture::new();
+        let (_root, mut a) = local();
+        let old = configure(&server, &a);
+        bind(&mut a);
+        save(&mut a, &["root", "language"], serde_json::json!("ko"));
+        let retained = outbox(&a);
+        assert_eq!(retained.len(), 1);
+        server.server.revoke_device(&old.device_id).unwrap();
+        let fresh = configure(&server, &a);
+        let inspected = fresh_inspection(&a);
+        assert!(inspected.previously_bound_library && inspected.registration_changed && !inspected.server_restored);
+        let prepared = fresh_writer(&mut a, &inspected.inspection_id).unwrap();
+        resume(&mut a);
+        assert_eq!(a.lww_clock_state().unwrap().writer_id, prepared.writer_id);
+        let receipt = push_now(&bound_client(&a), &mut a).unwrap().unwrap();
+        assert_eq!(receipt.accepted_keys, vec![retained[0].0.clone()]);
+        assert_eq!(server_unit(&server, &fresh, &retained[0].0).unwrap().stamp, retained[0].1);
+    }
+    #[test]
     fn a_new_registration_with_nothing_unsent_still_swaps_the_writer_and_publishes_the_next_edit() {
         use crate::server_sync::lww_tests::drain_publications;
         let server = LocalServerFixture::new();
