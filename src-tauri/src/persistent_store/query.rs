@@ -321,18 +321,18 @@ pub(super) fn list_asset_alias_page(
             });
         }
     }
-    let (cursor_kind, cursor_key, has_cursor) =
-        cursor.as_ref().map_or(("asset", "", 0_i64), |(kind, key)| {
-            (kind.as_str(), key.as_str(), 1)
-        });
+    // An empty pair sorts before every alias, so the first page seeks the index the same way.
+    let (cursor_kind, cursor_key) = cursor
+        .as_ref()
+        .map_or(("", ""), |(kind, key)| (kind.as_str(), key.as_str()));
     let mut statement = connection.prepare(
         "SELECT logical_key, object_hash, kind, size, mime, name, ext, inlay_type, width, height, metadata
          FROM asset_aliases
          WHERE generation = ?1
            AND (?2 IS NULL OR kind = ?2)
-           AND (?5 = 0 OR kind > ?3 OR (kind = ?3 AND logical_key > ?4))
+           AND (kind, logical_key) > (?3, ?4)
          ORDER BY kind ASC, logical_key ASC
-         LIMIT ?6",
+         LIMIT ?5",
     )?;
     let mut items = statement
         .query_map(
@@ -341,7 +341,6 @@ pub(super) fn list_asset_alias_page(
                 query.kind,
                 cursor_kind,
                 cursor_key,
-                has_cursor,
                 query.limit + 1,
             ],
             asset_alias_from_row,
