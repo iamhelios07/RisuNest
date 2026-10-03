@@ -781,7 +781,7 @@ fn collect_lww_asset_roots(connection: &Connection) -> StoreResult<AssetRootSet>
                         let decoded=base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(bytes).map_err(|error|validation(error.to_string()))?;
                         observe_json_value(&serde_json::from_slice(&decoded)?,None,&mut roots);
                     }
-                    UnitValue::Object {..} if super::lww::lww_known_unit_key(&key) && !matches!(key.components()[0].as_str(),"messages"|"archive") => {
+                    UnitValue::Object {..} if super::external_capture::is_large_unit(&key) => {
                         let value=super::lww::json_value_resolved(connection,&value)?.ok_or_else(||validation("large unit body is unavailable"))?;
                         observe_json_value(&value,None,&mut roots);
                     }
