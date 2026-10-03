@@ -930,6 +930,18 @@ mod tests {
         };
         client.log.0.execute("INSERT INTO receive_pages VALUES(?1,?2,NULL,1,0)", rusqlite::params![old.0.to_string(), serde_json::to_string(&page).unwrap()]).unwrap();
         client.log.0.execute("INSERT INTO bootstrap VALUES(?1,'synthetic-pin',NULL,'1')", [old.0.to_string()]).unwrap();
+        let stamp = risunest_sync_wire::stamp::Stamp { physical_ms: 1.into(), logical: 0, writer_id: "00000000-0000-4000-8000-000000000001".into() };
+        let inline = |value: serde_json::Value| risunest_sync_wire::unit::UnitValue::inline(&serde_json::to_vec(&value).unwrap()).unwrap();
+        store.lww_stage_receive(&StageReceive {
+            header: Header { binding_authority: old, request_id: "synthetic-unfinished".into() },
+            changes: vec![
+                crate::persistent_store::lww::Change { key: risunest_sync_wire::unit::UnitKey::new(&["root", "askRemoval"]).unwrap(), stamp: stamp.clone(), value: inline(serde_json::json!(true)) },
+                crate::persistent_store::lww::Change { key: risunest_sync_wire::unit::UnitKey::new(&["plugin-local", "orphan", "string", "received"]).unwrap(), stamp, value: inline(serde_json::json!("remote")) },
+            ],
+            progress: Progress { kind: "server".into(), cursor: DecimalU64(2), writer_id: None },
+            admitted_time_upper_ms: DecimalU64(u64::MAX),
+        }).unwrap();
+        assert_eq!(store.lww_receive_row_counts("synthetic-unfinished").unwrap(), (1, 1));
         drop(client);
         let original = store.lww_binding_state().unwrap();
         let request = crate::persistent_store::sync_selection::SwitchBindingRequest {
@@ -940,6 +952,7 @@ mod tests {
         };
         store.stop_next_switch_after_library_commit();
         assert!(store.switch_lww_binding(&request).is_err());
+        assert_eq!(store.lww_receive_row_counts("synthetic-unfinished").unwrap(), (0, 1));
         drop(store);
         let mut store = PersistentStore::open(root.path()).unwrap();
         let new = store.lww_binding_authority().unwrap();
@@ -963,6 +976,7 @@ mod tests {
             assert_eq!(serde_json::from_str::<StageReceive>(&body).unwrap().header.binding_authority, new);
             let bootstrap: Vec<String> = log.0.prepare("SELECT authority FROM bootstrap").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<std::result::Result<_, _>>().unwrap();
             assert_eq!(bootstrap, vec![new.0.to_string()]);
+            assert_eq!(store.lww_receive_row_counts("synthetic-unfinished").unwrap(), (0, 0));
         }
     }
     #[test]
@@ -994,5 +1008,35 @@ mod tests {
             fence_for_binding_change(&core, &mut store).unwrap();
             assert_eq!(core.log.pending().unwrap().len(), usize::from(!reachable));
         }
+    }
+    #[test]
+    fn a_rebind_stages_an_unfinished_receive_again_without_its_old_rows() {
+        use crate::server_sync::lww_tests::{drain_publications, receive_available};
+        let server = LocalServerFixture::new();
+        let (_a_root, mut a) = local();
+        let (_b_root, mut b) = local();
+        let peer = server.client(&b);
+        configure(&server, &a);
+        bind(&mut a);
+        let client = bound_client(&a);
+        save(&mut b, &["root", "language"], serde_json::json!("ja"));
+        drain_publications(&peer, &mut b, &[]).unwrap();
+        let receive = header(&a);
+        let page = client.receive_page(&mut a, &receive).unwrap();
+        assert!(!page.changes.is_empty());
+        a.lww_stage_receive(&page).unwrap();
+        let unfinished = page.header.request_id.clone();
+        assert_ne!(a.lww_receive_row_counts(&unfinished).unwrap().0, 0);
+        drop(client);
+        switch_to(&mut a, SyncTarget::None, None);
+        assert_eq!(a.lww_receive_row_counts(&unfinished).unwrap(), (0, 0));
+        let inspected = inspect(&a, &header(&a)).unwrap();
+        assert!(inspected.previously_bound_library);
+        let state = switch_to(&mut a, SyncTarget::Server("server".into()), Some(inspected.inspection_id));
+        activate(&mut a, &Header { binding_authority: state.target_authority, request_id: uuid::Uuid::new_v4().to_string() }, None).unwrap();
+        assert_ne!(a.read_root(None).unwrap().value["language"], "ja");
+        let client = bound_client(&a);
+        receive_available(&client, &mut a, &[]).unwrap();
+        assert_eq!(a.read_root(None).unwrap().value["language"], "ja");
     }
 }

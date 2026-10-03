@@ -1156,6 +1156,13 @@ impl PersistentStore {
         Ok(new_authority)
     }
     #[cfg(test)]
+    pub(crate) fn lww_receive_row_counts(&self, request_id: &str) -> StoreResult<(i64, i64)> {
+        let count = |db: &Connection| -> StoreResult<i64> {
+            Ok(db.query_row("SELECT count(*) FROM lww_receive_rows WHERE request_id=?1", [request_id], |r| r.get(0))?)
+        };
+        Ok((count(&self.connection)?, count(self.device_store()?.connection())?))
+    }
+    #[cfg(test)]
     pub(crate) fn stop_next_switch_after_library_commit(&self) {
         SWITCH_LIBRARY_COMMITTED.with(|stop| stop.set(true));
     }
@@ -1171,12 +1178,22 @@ impl PersistentStore {
             return Err(error("binding-authority-changed"));
         }
         let retain = super::sync_selection::switch_retains_binding_state(&self.connection, &header.request_id)?;
+        // The device commit below drops unfinished receives. Until it does, their ids stay readable,
+        // so a replay after a stop between the two commits removes the same library rows.
+        let dropped = if retain {
+            unfinished_receives(self.device_store()?.connection(), header.binding_authority)?
+        } else {
+            Vec::new()
+        };
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         super::sync_selection::apply_binding_selection(&tx, change)?;
         if retain {
             carry_units(&tx, header.binding_authority, new)?;
+            for request_id in &dropped {
+                tx.execute("DELETE FROM lww_receive_rows WHERE request_id=?1", [request_id])?;
+            }
         } else {
             tx.execute("DELETE FROM lww_outbox", [])?;
             tx.execute("DELETE FROM lww_receive_rows", [])?;
@@ -2313,12 +2330,18 @@ fn carry_units(db: &Connection, old: DecimalU64, new: DecimalU64) -> StoreResult
     db.execute("UPDATE OR REPLACE lww_initialization_scopes SET authority=?2 WHERE authority=?1", params![old, new])?;
     Ok(())
 }
+fn unfinished_receives(db: &Connection, authority: DecimalU64) -> StoreResult<Vec<String>> {
+    let mut statement = db.prepare("SELECT request_id FROM lww_receive WHERE authority=?1 AND finished=0")?;
+    let ids = statement.query_map([authority.0.to_string()], |r| r.get(0))?.collect::<Result<_, _>>()?;
+    Ok(ids)
+}
 fn carry_device_progress(db: &Connection, old: DecimalU64, new: DecimalU64) -> StoreResult<()> {
     let (old_text, new_text) = (old.0.to_string(), new.0.to_string());
     db.execute("UPDATE lww_progress SET authority=?2 WHERE authority=?1", params![old_text, new_text])?;
     db.execute("UPDATE lww_unpublished_proofs SET authority=?2 WHERE authority=?1", params![old_text, new_text])?;
-    // An unfinished receive is staged again under the new authority. A finished one stays the
-    // proof for the rows it still holds, so its body moves with the authority.
+    // An unfinished receive is staged again from the start under the new authority. A finished one
+    // stays the proof for the rows it still holds, so its body moves with the authority.
+    db.execute("DELETE FROM lww_receive_rows WHERE request_id IN (SELECT request_id FROM lww_receive WHERE authority=?1 AND finished=0)", [&old_text])?;
     db.execute("DELETE FROM lww_receive WHERE authority=?1 AND finished=0", [&old_text])?;
     let finished: Vec<(String, String)> = {
         let mut statement = db.prepare("SELECT request_id,body FROM lww_receive WHERE authority=?1")?;
