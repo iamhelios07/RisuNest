@@ -408,9 +408,6 @@ impl Store {
         )?;
         let floor = Sequence::from(floor);
         head.min_retained_seq = floor.clone();
-        for section in head.sections.values_mut() {
-            section.gc_floor = floor.clone();
-        }
         tx.execute("UPDATE library SET head=?1", [json(&head)?])?;
         tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS gc_roots(hash TEXT PRIMARY KEY); DELETE FROM gc_roots;
             INSERT OR IGNORE INTO gc_roots SELECT hash FROM object_leases;
@@ -471,9 +468,6 @@ impl Store {
         let mut head = RemoteHead::genesis(prior.library_id, random_id()?)?;
         head.seq = prior.seq;
         head.min_retained_seq = head.seq.clone();
-        for section in head.sections.values_mut() {
-            section.gc_floor = head.seq.clone();
-        }
         tx.execute(
             "INSERT OR IGNORE INTO staging_trash SELECT upload,ordinal FROM upload_chunks",
             [],
