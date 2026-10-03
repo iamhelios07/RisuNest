@@ -341,7 +341,7 @@ fn builder_with_main_window(
                     if let Some(state) =
                         webview.try_state::<server_sync::commands::ServerSyncCommandState>()
                     {
-                        if let Err(error) = state.cancel() {
+                        if let Err(error) = state.reset_renderer_session() {
                             crate::nlog!(
                                 "error",
                                 "failed to reset server sync renderer session: {}",
@@ -390,7 +390,7 @@ fn builder_with_main_window(
                 if let Some(state) =
                     webview.try_state::<server_sync::commands::ServerSyncCommandState>()
                 {
-                    if let Err(error) = state.cancel() {
+                    if let Err(error) = state.reset_renderer_session() {
                         crate::nlog!(
                             "error",
                             "failed to reset server sync renderer session: {}",
@@ -442,7 +442,7 @@ fn builder_with_main_window(
                 if let Some(state) =
                     webview.try_state::<server_sync::commands::ServerSyncCommandState>()
                 {
-                    if let Err(error) = state.cancel() {
+                    if let Err(error) = state.reset_renderer_session() {
                         crate::nlog!(
                             "error",
                             "failed to reset server sync renderer session: {}",
