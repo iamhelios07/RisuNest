@@ -21,7 +21,7 @@ import {
 import { getV2PluginAPIs } from '../plugins/plugins.svelte'
 import type { Database } from './database.svelte'
 import type { PersistentDataStore } from './persistentDataStore'
-import { getDatabase, setDatabase, setDatabaseLite } from './database.svelte'
+import { getDatabase, normalizeDatabaseDefaults, setDatabase, setDatabaseLite } from './database.svelte'
 import {
     configurePersistentDataRuntime,
     createProductionStateAdapter,
@@ -30,6 +30,7 @@ import {
 import {
     createCatalogCharacterStub,
     isCatalogCharacterStub,
+    isCatalogPresetWorkingSet,
     projectCompleteScalableWorkingSet,
 } from './workingSetCatalog'
 import { workingSetResidency } from './workingSetResidency'
@@ -46,6 +47,42 @@ afterEach(() => {
 })
 
 describe('production persistent working-set publication', () => {
+    it.each([true, false])('adopts a complete added preset without a follow-up publication (catalog=%s)', async (catalog) => {
+        const initial = normalizeDatabaseDefaults({} as Database)
+        initial.botPresets[0].id = 'existing-preset'
+        initial.personas[0].id = 'existing-persona'
+        const added = {...structuredClone(initial.botPresets[0]), id: 'added-preset', name: 'Added complete preset'}
+        const store = new IndexedDbPersistentDataStore(`complete-added-preset-${catalog}`, new IDBFactory(), IDBKeyRange)
+        await store.open()
+        const {revision} = await store.replaceFromDatabase(initial)
+        setDatabaseLite(catalog ? projectCompleteScalableWorkingSet(initial, null, revision, new Set()) : initial)
+        selectedCharID.set(-1)
+        const runtime = createPersistentDataRuntime({store, state: createProductionStateAdapter(), prepareDatabase: async (value) => value})
+        await runtime.initializeActiveWorkingSet(getDatabase())
+        const commit = vi.spyOn(store, 'commit')
+        const projectionReads: string[] = []
+        const acquire = store.acquireRevision.bind(store)
+        vi.spyOn(store, 'acquireRevision').mockImplementation(async (revision) => {
+            const lease = await acquire(revision)
+            const read = lease.readPreset.bind(lease)
+            vi.spyOn(lease, 'readPreset').mockImplementation((id: string) => { projectionReads.push(id); return read(id) })
+            return lease
+        })
+        await runtime.mutatePersistentPresets('add-complete-preset', (state) => { state.presets = [...state.presets, added] })
+        expect((await store.readPreset('added-preset'))!.value).toEqual(added)
+        if (!catalog) expect(getDatabase().botPresets.find((value) => value.id === added.id)).toEqual(added)
+        await runtime.flushPendingDataLocally('added-preset-no-echo')
+        expect(commit).toHaveBeenCalledOnce()
+        expect(projectionReads).toEqual(catalog ? [] : ['added-preset'])
+        expect(isCatalogPresetWorkingSet(getDatabase().botPresets)).toBe(catalog)
+        const liveExisting = getDatabase().botPresets.find((value) => value.id === 'existing-preset')!
+        liveExisting.mainPrompt = 'Retained loaded preset edit'
+        await runtime.flushPendingDataLocally('loaded-preset-after-membership')
+        expect(commit).toHaveBeenCalledTimes(2)
+        expect(commit.mock.calls[1][0].unitMutations).toEqual([{key: '["preset","existing-preset","mainPrompt"]', type: 'set', value: 'Retained loaded preset edit'}])
+        expect((await store.readPreset('existing-preset'))!.value.mainPrompt).toBe('Retained loaded preset edit')
+    })
+
     it.each(['metadata', 'presets', 'delete', 'upsert', 'module'] as const)('keeps sparse activated root defaults local during the first targeted %s edit', async (scope) => {
         const initial = {username: 'Before', botPresets: [{id: 'initial-preset', name: 'Initial preset'}], botPresetsId: 0, characters: [], plugins: []} as unknown as Database
         const store = new IndexedDbPersistentDataStore(`sparse-activated-root-defaults-${scope}`, new IDBFactory(), IDBKeyRange)

@@ -1,5 +1,5 @@
 import { sharedRootFields } from './persistentRootFields'
-import { createCatalogCharacterStub } from './workingSetCatalog'
+import { createCatalogCharacterStub, createPresetCatalogWorkingSetFromValues, isCatalogPresetWorkingSet } from './workingSetCatalog'
 import { createConversationSummaryStub, createConversationSummaryFromMetadata } from './conversationResidency'
 import type { Chat, Database, botPreset, character, groupChat } from './database.svelte'
 import type { PersistentRevisionReader, PersistentRoot } from './persistentDataStore'
@@ -65,6 +65,7 @@ export async function applyLwwWorkingSetUnits(
     }
     for (const [kind, id, field, metadataField] of keys) {
         if (kind === 'preset' && database.botPresets.some((value) => value?.['id'] === id)) await readPreset(id)
+        if (!isCatalogPresetWorkingSet(database.botPresets) && (kind === 'preset' || kind === 'exists' && id === 'preset')) await readPreset(kind === 'preset' ? id : field)
         if (kind === 'root' && id === 'botPresetsId' && typeof root?.botPresetsId === 'string') {
             await readPreset(root.botPresetsId)
             if (presets.get(root.botPresetsId) && !presetCatalog) presetCatalog = await store.queryPresets()
@@ -229,9 +230,12 @@ export async function applyLwwWorkingSetUnits(
             const selectedId = database.botPresets[database.botPresetsId]?.['id']
             const catalog = presetCatalog!
             const byId = new Map(database.botPresets.filter(Boolean).map((value) => [value['id'], value]))
-            database.botPresets = catalog.items.map((summary) => byId.get(summary.id) ?? { id: summary.id, name: summary.name, image: summary.image } as unknown as botPreset)
+            const next = catalog.items.map((summary) => byId.get(summary.id) ?? canonicalClone(presets.get(summary.id)?.value ?? { id: summary.id, name: summary.name, image: summary.image }) as botPreset)
+            database.botPresets = isCatalogPresetWorkingSet(database.botPresets)
+                ? createPresetCatalogWorkingSetFromValues(next, catalog.revision, selectedId) : next
+            if (isCatalogPresetWorkingSet(database.botPresets)) for (let index = 0; index < next.length; index++) database.botPresets[index] = next[index]
             database.botPresetsId = Math.max(0, database.botPresets.findIndex((value) => value['id'] === selectedId))
-            if (baseline.presets) baseline.presets = catalog.items.map((summary) => baseline.presets!.find((value) => value['id'] === summary.id) ?? byId.get(summary.id)!).filter(Boolean)
+            if (baseline.presets) baseline.presets = catalog.items.map((summary, index) => baseline.presets!.find((value) => value['id'] === summary.id) ?? canonicalClone(presets.get(summary.id)?.value ?? byId.get(summary.id) ?? next[index]))
         } else if (kind === 'exists' && id === 'character') {
             const summary = summaries.get(field)
             if (summary && !charactersById.has(field)) database.characters.push(createCatalogCharacterStub(summary))
