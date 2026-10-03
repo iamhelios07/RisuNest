@@ -166,6 +166,13 @@ impl OperationLog {
         )?;
         serde_json::from_str(&body).map_err(|_| SyncError::new("operation-integrity", 409))
     }
+    /// A publication is read only until its acknowledgement is recorded, so a
+    /// fence drops the ones acknowledged before it. Detached publications keep
+    /// their unknown outcome.
+    fn prune(&self) -> Result<()> {
+        self.0.execute("DELETE FROM publications WHERE acknowledged=1 AND json_extract(receipt,'$.status') IN ('accepted','rejected')", [])?;
+        Ok(())
+    }
     fn finish(&self, publication: &Publication, receipt: &OperationReceipt) -> Result<()> {
         if receipt.body_digest() != operation_digest(&publication.request)? {
             return Err(SyncError::new("operation-integrity", 409));
@@ -368,6 +375,7 @@ impl LwwClient {
         Ok(())
     }
     pub(crate) fn fence(&self, store: &mut PersistentStore) -> Result<()> {
+        self.log.prune()?;
         for publication in self.log.pending()? {
             let receipt = self.settle(&publication)?;
             self.acknowledge(store, &publication, &receipt)?;
@@ -378,6 +386,7 @@ impl LwwClient {
         Ok(())
     }
     pub(crate) fn fence_new_device(&self, store: &mut PersistentStore) -> Result<()> {
+        self.log.prune()?;
         for publication in self.log.pending()? {
             match self.settle(&publication) {
                 Ok(receipt) => self.acknowledge(store, &publication, &receipt)?,
@@ -661,18 +670,9 @@ impl LwwClient {
                             stamp: item.stamp,
                             value: item.value,
                         };
-                        let apply = if let Some(old) = merged.get(&incoming.key) {
-                            matches!(
-                                wire_compare(
-                                    &old.stamp,
-                                    &old.value,
-                                    &incoming.stamp,
-                                    &incoming.value
-                                )?,
-                                risunest_sync_wire::unit::LwwDecision::ApplyRemote
-                            )
-                        } else {
-                            true
+                        let apply = match merged.get(&incoming.key) {
+                            Some(pinned) => tail_replaces(pinned, &incoming)?,
+                            None => true,
                         };
                         if apply {
                             merged.insert(incoming.key.clone(), incoming);
@@ -721,11 +721,10 @@ impl LwwClient {
             .into_iter()
             .filter(|entry| entry.stamp.physical_ms.0 > upper)
             .collect::<Vec<_>>();
-        let mut query = self
-            .log
-            .0
-            .prepare("SELECT intent,receipt FROM publications")?;
-        let rows = query.query_map([], |r| {
+        let mut query = self.log.0.prepare(
+            "SELECT intent,receipt FROM publications WHERE json_extract(intent,'$.authority')=?1",
+        )?;
+        let rows = query.query_map([header.binding_authority.0.to_string()], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
         })?;
         for row in rows {
@@ -1218,6 +1217,20 @@ impl LwwClient {
     }
 }
 
+/// A journal entry after the pin is what the server applied, and the server
+/// lets a retirement replace a live existence whatever its stamp.
+fn tail_replaces(pinned: &Change, incoming: &Change) -> risunest_sync_wire::Result<bool> {
+    let decision = wire_compare(
+        &pinned.stamp,
+        &pinned.value,
+        &incoming.stamp,
+        &incoming.value,
+    )?;
+    Ok(decision == risunest_sync_wire::unit::LwwDecision::ApplyRemote
+        || (incoming.key.components()[0] == "exists"
+            && incoming.value == UnitValue::Deleted
+            && pinned.value != UnitValue::Deleted))
+}
 fn operation_digest(request: &PushRequest) -> risunest_sync_wire::Result<String> {
     let result = request.digest();
     #[cfg(test)]
