@@ -4634,28 +4634,6 @@ it('cancels staged restore and waits for terminal settlement when the fresh prec
     ])
 })
 
-it('cancels an incomplete legacy restore before acquiring the replacement fence', async () => {
-    const commands: string[] = []
-    const preview = { unavailableColdKeys: ['missing'], characterNames: ['Synthetic'], invalidInlays: ['inlay_aa.risuinlay'] }
-    const states = [{ ...status('waitingForInput'), phase: 'awaiting-activation', incompleteRestorePreview: preview }, status('cancelled')]
-    const acquire = vi.fn()
-    const confirmIncompleteRestore = vi.fn(async () => false)
-    await expect(runNativeLegacyLocalBackupRestore(
-        restoreRuntime(17, { acquire }), { type: 'desktopPath', path: 'synthetic.bin' },
-        { confirmIncompleteRestore },
-        { isTauri: () => true, wait: async () => undefined, invoke: async (command) => {
-            commands.push(command)
-            if (command === 'native_file_job_start') return { jobId: 'job-1' }
-            if (command === 'native_file_job_status') return states.shift()
-            return true
-        } },
-    )).rejects.toMatchObject({ name: 'AbortError' })
-    expect(confirmIncompleteRestore).toHaveBeenCalledWith(preview)
-    expect(acquire).not.toHaveBeenCalled()
-    expect(commands).toContain('native_file_job_cancel')
-    expect(commands).not.toContain('native_file_job_finalize')
-})
-
 it.each(['both', 'cold', 'inlay'] as const)('cancels default incomplete restore warnings in one dialog: %s', async kind => {
     restoreAlerts.confirm.mockReset().mockResolvedValue(false)
     restoreAlerts.checkbox.mockReset().mockResolvedValue({ confirmed: false, checked: false })

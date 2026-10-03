@@ -7,7 +7,6 @@ export const languageKorean = {
         "pluginDataDeletion": "플러그인 데이터 삭제",
         "lorebookDeletion": "로어북 폴더와 항목 삭제",
         "partialBackup": "다른 에셋을 제외한 백업",
-        "incompleteRestore": "누락된 데이터를 제외한 복원",
         "onlySelectedMessage": "이 메시지만 삭제"
     },
 
@@ -2360,7 +2359,6 @@ export const languageKorean = {
 
                 manual: '직접 만듦',
                 periodic: '자동',
-                preRestore: '복원 전 보관',
             },
             counts: '캐릭터 {0}개 · 대화 {1}개 · 메시지 {2}개',
             subMetrics:

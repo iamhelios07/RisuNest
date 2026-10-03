@@ -19,7 +19,6 @@ export const languageChinese = {
         "pluginDataDeletion": "删除插件数据",
         "lorebookDeletion": "删除世界书文件夹及条目",
         "partialBackup": "备份不包含其他资源",
-        "incompleteRestore": "恢复不包含缺失数据",
         "onlySelectedMessage": "仅删除此消息"
     },
 

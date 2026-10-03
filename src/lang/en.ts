@@ -7,7 +7,6 @@ export const languageEnglish = {
         "pluginDataDeletion": "Delete plugin data",
         "lorebookDeletion": "Delete lorebook folder and entries",
         "partialBackup": "Backup without other assets",
-        "incompleteRestore": "Restore without unavailable data",
         "onlySelectedMessage": "Delete only this message"
     },
 
@@ -2547,7 +2546,6 @@ export const languageEnglish = {
 
                 manual: 'Created manually',
                 periodic: 'Automatic',
-                preRestore: 'Kept before a restore',
             },
             counts: '{0} characters · {1} chats · {2} messages',
             subMetrics:

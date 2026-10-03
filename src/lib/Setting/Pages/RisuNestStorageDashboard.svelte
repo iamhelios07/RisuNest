@@ -117,7 +117,6 @@
         const reasons = strings.snapshotReasons
         if (reason === 'manual') return reasons.manual
         if (reason === 'periodic') return reasons.periodic
-        if (reason === 'pre-restore') return reasons.preRestore
         if (reason === "data-health-repair") return reasons.dataHealthRepair
         return ""
     }

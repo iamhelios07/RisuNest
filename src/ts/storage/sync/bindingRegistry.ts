@@ -68,10 +68,6 @@ export async function bindSyncTarget(target: Exclude<BindingTarget, { kind: 'non
     return bindingFlow.bind(target, transport, options)
 }
 
-export function bindSyncTargetAsNewDevice(target: Exclude<BindingTarget, { kind: 'none' }>) {
-    return bindSyncTarget(target, { mode: 'new-device' })
-}
-
 export async function unbindSyncTarget() {
     if (!bindingFlow) throw new Error('Sync binding flow is unavailable')
     return bindingFlow.unbind()

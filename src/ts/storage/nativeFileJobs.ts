@@ -591,27 +591,7 @@ export interface NativeIncompleteRestorePreview {
     invalidInlays: string[]
 }
 
-async function confirmIncompleteNativeRestore(preview: NativeIncompleteRestorePreview): Promise<boolean> {
-    const [{ alertConfirm, alertCheckboxConfirm }, { language }] = await Promise.all([import('../alert'), import('../../lang')])
-    const warnings: string[] = []
-    if (preview.unavailableColdKeys.length) warnings.push(language.errors.coldStorageIncompleteRestoreConfirm(
-        preview.characterNames.join(', '), preview.unavailableColdKeys.length, 0,
-    ))
-    if (preview.invalidInlays.length) warnings.push(language.portableBackup.invalidInlaysConfirm(preview.invalidInlays.length))
-    if (warnings.length === 1) return alertConfirm(warnings[0])
-    if (warnings.length > 1) return (await alertCheckboxConfirm({
-        title: warnings[0],
-        description: warnings.slice(1).join("\n\n"),
-        checkboxLabel: language.checkboxConfirmation.incompleteRestore,
-        actionLabel: language.confirm,
-        cancelLabel: language.cancel,
-        requireChecked: true,
-    })).confirmed
-    return true
-}
-
 export interface NativeFileRestoreJobOptions extends NativeFileJobOptions {
-    confirmIncompleteRestore?(preview: NativeIncompleteRestorePreview): Promise<boolean>
     /** Runs after staging and before taking the destructive replacement fence. */
     beforeActivation?(): void | Promise<void>
     /**
@@ -1506,12 +1486,6 @@ async function runNativeReplacementRestore(
                 try {
                     startUiBlocking()
                     {
-                        if (status.incompleteRestorePreview && options.confirmIncompleteRestore &&
-                            !(await options.confirmIncompleteRestore(status.incompleteRestorePreview))) {
-                            cancellationRequested = true
-                            await invokeNative(dependencies, 'native_file_job_cancel', {jobId:started.jobId})
-                            continue
-                        }
                         const {prepareBoundLibraryReplacement} = await import('./sync/bindingRegistry')
                         upstreamBinding = await prepareBoundLibraryReplacement()
                         const {acquireUpstreamImportPause, confirmUpstreamLibraryReplacement} = await import('./upstreamReplacement')

@@ -75,9 +75,9 @@ describe('RisuNestStorageDashboard', () => {
     })
 
     it('localizes snapshot reasons without exposing unknown tokens', async () => {
-        maintenance.listNativePersistentSnapshots.mockResolvedValueOnce(['manual', 'periodic', 'pre-restore', 'data-health-repair', 'synthetic-unknown'].map((reason, index) => ({ id: `snapshot-${index}`, reason, bytes: 1, reclaimableBytes: 0, modifiedAt: 1 })))
+        maintenance.listNativePersistentSnapshots.mockResolvedValueOnce(['manual', 'periodic', 'data-health-repair', 'synthetic-unknown'].map((reason, index) => ({ id: `snapshot-${index}`, reason, bytes: 1, reclaimableBytes: 0, modifiedAt: 1 })))
         const target = setup()
-        await vi.waitFor(() => expect(target.querySelectorAll('[data-storage-backup-list="snapshots"] [data-storage-backup-row]')).toHaveLength(5))
+        await vi.waitFor(() => expect(target.querySelectorAll('[data-storage-backup-list="snapshots"] [data-storage-backup-row]')).toHaveLength(4))
         expect(target.textContent).toContain(languageEnglish.risuNest.storage.snapshotReasons.dataHealthRepair)
         expect(target.textContent).not.toContain('synthetic-unknown')
         expect(target.textContent).not.toContain('data-health-repair')
