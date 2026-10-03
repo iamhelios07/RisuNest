@@ -103,7 +103,7 @@ type CompleteCharacter = character | groupChat
 
 // Catalog entries carry only their summary and the local fields normalization adds.
 const catalogPresetKeys = new Set(['id', 'name', 'image', 'localNetworkMode', 'localNetworkTimeoutSec'])
-const isLoadedPreset = (value: botPreset | undefined): boolean =>
+export const isLoadedPreset = (value: botPreset | undefined): boolean =>
     !!value && Object.keys(value).some((key) => !catalogPresetKeys.has(key))
 
 /// A whole replacement starts a new identity state, so a preset chain override
