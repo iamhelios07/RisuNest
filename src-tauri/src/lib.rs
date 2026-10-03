@@ -801,6 +801,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         persistent_store::sync_selection::pds_lww_replace_from_target,
         persistent_store::commands::pds_open,
         persistent_store::commands::pds_asset_gc_maintenance,
+        persistent_store::commands::pds_message_object_sweep,
         persistent_store::commands::pds_read_root,
         persistent_store::commands::pds_query_presets,
         persistent_store::commands::pds_read_preset,
