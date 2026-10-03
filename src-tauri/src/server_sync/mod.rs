@@ -62,6 +62,22 @@ impl SyncError {
         }
     }
 }
+/// Client-side waits, another library operation that has not finished yet and
+/// ordering outcomes, whatever their status.
+pub(crate) const TRANSIENT_CODES: [&str; 12] = [
+    "cancelled",
+    "library-operation-busy",
+    "server-sync-busy",
+    "stale-head",
+    "operation-already-pending",
+    "local-revision-changed",
+    "remote-catch-up-required",
+    "device-operation-active",
+    "staging-expired",
+    "upload-expired",
+    "pin-expired",
+    "operation-history-expired",
+];
 /// Transport failures, client-side waits, server load, another library
 /// operation that has not finished yet and ordering outcomes are worth another
 /// attempt. Every validation reply and local invariant failure is not,
@@ -69,18 +85,7 @@ impl SyncError {
 fn retryable(code: &str, status: u16) -> bool {
     match code {
         "local-storage-full" => false,
-        "cancelled"
-        | "library-operation-busy"
-        | "server-sync-busy"
-        | "stale-head"
-        | "operation-already-pending"
-        | "local-revision-changed"
-        | "remote-catch-up-required"
-        | "device-operation-active"
-        | "staging-expired"
-        | "upload-expired"
-        | "pin-expired"
-        | "operation-history-expired" => true,
+        code if TRANSIENT_CODES.contains(&code) => true,
         _ => match status {
             408 | 429 => true,
             // An unparsed body is what a gateway returns; a parsed 502 code is
