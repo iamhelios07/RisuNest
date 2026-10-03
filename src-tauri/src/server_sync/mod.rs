@@ -15,6 +15,7 @@ pub(crate) mod hash_metrics;
 mod binding;
 #[cfg(test)]
 pub(crate) use binding::{first_binding_cycle, hydrate_binding_bodies};
+pub(crate) use binding::carry_operation_log;
 pub(crate) mod notification;
 #[cfg(test)]
 pub(crate) mod lww_tests;

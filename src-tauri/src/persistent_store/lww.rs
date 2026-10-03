@@ -1155,6 +1155,10 @@ impl PersistentStore {
         self.finish_lww_switch(header, change, new_authority, &digest)?;
         Ok(new_authority)
     }
+    #[cfg(test)]
+    pub(crate) fn stop_next_switch_after_library_commit(&self) {
+        SWITCH_LIBRARY_COMMITTED.with(|stop| stop.set(true));
+    }
     fn finish_lww_switch(
         &mut self,
         header: &Header,
@@ -1166,17 +1170,28 @@ impl PersistentStore {
         if current != header.binding_authority && current != new {
             return Err(error("binding-authority-changed"));
         }
+        let retain = super::sync_selection::switch_retains_binding_state(&self.connection, &header.request_id)?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         super::sync_selection::apply_binding_selection(&tx, change)?;
-        tx.execute("DELETE FROM lww_outbox", [])?;
-        tx.execute("DELETE FROM lww_receive_rows", [])?;
+        if retain {
+            carry_units(&tx, header.binding_authority, new)?;
+        } else {
+            tx.execute("DELETE FROM lww_outbox", [])?;
+            tx.execute("DELETE FROM lww_receive_rows", [])?;
+        }
         tx.execute(
             "INSERT OR IGNORE INTO lww_requests VALUES(?1,?2,?3)",
             params![header.request_id, digest, current_revision(&tx)?],
         )?;
         tx.commit()?;
+        #[cfg(test)]
+        if SWITCH_LIBRARY_COMMITTED.with(|stop| stop.replace(false)) {
+            return Err(error("switch-stopped-after-library-commit"));
+        }
+        crate::server_sync::carry_operation_log(&self.repository_root, header.binding_authority, new, retain)
+            .map_err(|failure| error(failure.code))?;
         let tx = self.device_store_mut()?.transaction()?;
         let active = authority(&tx)?;
         if active != header.binding_authority && active != new {
@@ -1186,11 +1201,17 @@ impl PersistentStore {
             "UPDATE lww_clock SET binding_authority=?1 WHERE singleton=1",
             [new.0.to_string()],
         )?;
-        tx.execute("DELETE FROM lww_outbox", [])?;
-        tx.execute("DELETE FROM lww_receive", [])?;
-        tx.execute("DELETE FROM lww_receive_rows", [])?;
-        tx.execute("DELETE FROM lww_progress", [])?;
-        tx.execute("DELETE FROM lww_unpublished_proofs", [])?;
+        if retain {
+            carry_units(&tx, header.binding_authority, new)?;
+            carry_device_progress(&tx, header.binding_authority, new)?;
+            super::external_lww::carry_pending_publications(&tx, header.binding_authority, new)?;
+        } else {
+            tx.execute("DELETE FROM lww_outbox", [])?;
+            tx.execute("DELETE FROM lww_receive", [])?;
+            tx.execute("DELETE FROM lww_receive_rows", [])?;
+            tx.execute("DELETE FROM lww_progress", [])?;
+            tx.execute("DELETE FROM lww_unpublished_proofs", [])?;
+        }
         tx.execute(
             "UPDATE lww_intents SET complete=1 WHERE request_id=?1",
             [&header.request_id],
@@ -2285,6 +2306,40 @@ pub(crate) fn completed_device_replacement_receipt(
     Ok(Some(RevisionResult { revision }))
 }
 
+fn carry_units(db: &Connection, old: DecimalU64, new: DecimalU64) -> StoreResult<()> {
+    let (old, new) = (old.0.to_string(), new.0.to_string());
+    db.execute("UPDATE lww_outbox SET authority=?2 WHERE authority=?1", params![old, new])?;
+    db.execute("UPDATE OR REPLACE lww_publications SET authority=?2 WHERE authority=?1", params![old, new])?;
+    db.execute("UPDATE OR REPLACE lww_initialization_scopes SET authority=?2 WHERE authority=?1", params![old, new])?;
+    Ok(())
+}
+fn carry_device_progress(db: &Connection, old: DecimalU64, new: DecimalU64) -> StoreResult<()> {
+    let (old_text, new_text) = (old.0.to_string(), new.0.to_string());
+    db.execute("UPDATE lww_progress SET authority=?2 WHERE authority=?1", params![old_text, new_text])?;
+    db.execute("UPDATE lww_unpublished_proofs SET authority=?2 WHERE authority=?1", params![old_text, new_text])?;
+    // An unfinished receive is staged again under the new authority. A finished one stays the
+    // proof for the rows it still holds, so its body moves with the authority.
+    db.execute("DELETE FROM lww_receive WHERE authority=?1 AND finished=0", [&old_text])?;
+    let finished: Vec<(String, String)> = {
+        let mut statement = db.prepare("SELECT request_id,body FROM lww_receive WHERE authority=?1")?;
+        let rows = statement.query_map([&old_text], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+        rows
+    };
+    for (request_id, body) in finished {
+        let mut request: StageReceive = serde_json::from_str(&body)?;
+        request.header.binding_authority = new;
+        let body = serde_json::to_string(&request)?;
+        db.execute(
+            "UPDATE lww_receive SET authority=?2,digest=?3,body=?4 WHERE request_id=?1",
+            params![request_id, new_text, risunest_sync_wire::hash(body.as_bytes()), body],
+        )?;
+    }
+    Ok(())
+}
+#[cfg(test)]
+thread_local! {
+    static SWITCH_LIBRARY_COMMITTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 fn reset_target_device(
     tx: &Transaction<'_>,
     header: &Header,

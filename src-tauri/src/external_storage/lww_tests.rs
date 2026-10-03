@@ -1658,3 +1658,49 @@ fn native_unpublished_clock_repair_preserves_values_and_never_repairs_dispatched
         assert_eq!(after_bytes, bytes);
     })
 }
+
+fn bind_external(store: &mut PersistentStore, engine: &ExternalLwwEngine, target: &crate::persistent_store::sync_selection::SyncTarget) -> DecimalU64 {
+    use crate::persistent_store::sync_selection::SwitchBindingRequest;
+    let before = store.lww_binding_state().unwrap();
+    let inspection_id = match target {
+        crate::persistent_store::sync_selection::SyncTarget::None => None,
+        _ => Some(store.register_lww_binding_inspection(before.target_authority, target, &engine.repository.connection_identity, &engine.library).unwrap()),
+    };
+    store.switch_lww_binding(&SwitchBindingRequest {
+        header: crate::persistent_store::lww::Header { binding_authority: before.target_authority, request_id: uuid::Uuid::new_v4().to_string() },
+        expected_selection_epoch: before.selection_epoch, target: target.clone(), inspection_id,
+    }).unwrap().target_authority
+}
+#[test]
+fn rebinding_the_same_repository_finishes_the_sealed_segment_and_publishes_offline_edits() {
+    run(async {
+        use crate::persistent_store::sync_selection::SyncTarget;
+        let mut f = CycleFixture::new();
+        let target = SyncTarget::External("repository".into());
+        let first = bind_external(&mut f.a, &f.sender, &target);
+        set(&mut f.a, &["root", "language"], serde_json::json!("ja"));
+        f.sender.publish(&mut f.a, first, &[], &Cancellation::default()).await.unwrap();
+        f.receive_b().await;
+        assert_eq!(f.b.read_root(None).unwrap().value["language"], "ja");
+        set(&mut f.a, &["root", "language"], serde_json::json!("ko"));
+        let transfer = HeldAssetTransfer::new(f.provider.clone());
+        transfer.held.store(false, std::sync::atomic::Ordering::SeqCst);
+        transfer.fail_segment_begin.store(true, std::sync::atomic::Ordering::SeqCst);
+        f.sender.provider = transfer;
+        assert_eq!(f.sender.publish(&mut f.a, first, &[], &Cancellation::default()).await.err().unwrap().kind, ErrorKind::Transient);
+        let writer = f.a.lww_clock_state().unwrap().writer_id;
+        let pending = f.a.external_lww_pending(&f.sender.target_scope(), &writer).unwrap().unwrap().0;
+        assert!(pending.sealed && !pending.dispatched);
+        f.sender.provider = f.provider.clone();
+        bind_external(&mut f.a, &f.sender, &SyncTarget::None);
+        set(&mut f.a, &["root", "askRemoval"], serde_json::json!(true));
+        let rebound = bind_external(&mut f.a, &f.sender, &target);
+        let published = f.sender.publish(&mut f.a, rebound, &[], &Cancellation::default()).await.unwrap();
+        assert_eq!(published.segments.0, 2);
+        assert!(f.a.lww_read_outbox(rebound, 100).unwrap().entries.is_empty());
+        assert_eq!(f.a.external_lww_next_sequence(&f.sender.target_scope(), &writer).unwrap(), pending.seq.0 + 2);
+        f.receive_b().await;
+        assert_eq!(f.b.read_root(None).unwrap().value["language"], "ko");
+        assert_eq!(f.b.read_root(None).unwrap().value["askRemoval"], true);
+    })
+}
