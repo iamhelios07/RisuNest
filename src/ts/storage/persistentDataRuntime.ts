@@ -335,7 +335,6 @@ export interface PersistentDataRuntimeStateAdapter {
     /** Host caches outside the working set that a remote change invalidates. */
     onPluginStorageChanged?(owner: string, key: string): void
     getGeneratingConversations?(): readonly GeneratingConversation[]
-    getGeneratingConversation?(): { characterId: string; conversationId: string } | null
     conversationViewportRowBudget?: number
     canActivateWorkingSet?(): boolean
     canDeactivateWorkingSet?(): boolean
@@ -803,9 +802,12 @@ export function createPersistentDataRuntime(
                         ? (changeSet.wholeLibrary ? null : [])
                         : await readWorkingSetChangeWindow(lease)
                     if (keys) {
-                        const generating =
+                        // Only the selected conversation can be held by a targeted pass.
+                        const deferredConversation =
                             dependencies.state.isConversationOperationActive?.() === true
-                                ? dependencies.state.getGeneratingConversation?.() ?? null
+                                ? generating().find((target) =>
+                                    target.characterId === pinned.selectedCharacterId &&
+                                    target.conversationId === pinned.selectedConversationId) ?? null
                                 : null
                         const targeted = await applyTargetedWorkingSetInvalidation(
                             previous,
@@ -815,7 +817,7 @@ export function createPersistentDataRuntime(
                                 ...pinned,
                                 keepConversation,
                                 changeSet,
-                                deferredConversation: generating,
+                                deferredConversation,
                                 onPluginStorageChanged:
                                     dependencies.state.onPluginStorageChanged,
                             },

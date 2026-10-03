@@ -508,6 +508,27 @@ describe('sendChat generation durability control flow', () => {
         expect(harness.drainDeferredReceives.mock.calls).toEqual([[0], [0], [0]])
     })
 
+    it('drains deferred receives for the generated conversation after the selection moves away', async () => {
+        const response = deferred<ReturnType<typeof success>>()
+        const character = harness.DBState.db.characters[0]
+        character.chats.push({ ...structuredClone(character.chats[0]), id: 'chat-other' })
+        harness.requests.push(response.promise)
+        harness.drainDeferredReceives.mockImplementation(async () => {
+            expect(generatingConversations.snapshot()).toEqual([])
+        })
+
+        const sending = sendChat()
+        await vi.waitFor(() => expect(harness.requestChatData).toHaveBeenCalledOnce())
+        expect(generatingConversations.snapshot()).toEqual([{ characterId: 'char-a', conversationId: 'chat-char-a' }])
+        character.chatPage = 1
+        response.resolve(success('Late response'))
+
+        await expect(sending).resolves.toBe(false)
+        expect(harness.acknowledge).not.toHaveBeenCalled()
+        expect(harness.drainDeferredReceives).toHaveBeenCalledExactlyOnceWith(0)
+        expect(generatingConversations.snapshot()).toEqual([])
+    })
+
     it('acknowledges a partially committed streaming response when the stream is aborted', async () => {
         const controller = new AbortController()
         const committed = deferred()

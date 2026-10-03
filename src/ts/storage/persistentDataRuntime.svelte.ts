@@ -406,14 +406,6 @@ export function createProductionStateAdapter(): PersistentDataRuntimeStateAdapte
             notifyPluginStorageOwnerChanged(owner)
         },
         getGeneratingConversations: () => generatingConversations.snapshot(),
-        getGeneratingConversation() {
-            const database = getDatabase()
-            const character = database.characters[get(selectedCharID)]
-            if (!character) return null
-            const conversation = character.chats[character.chatPage ?? 0]
-            if (!conversation) return null
-            return { characterId: character.chaId, conversationId: conversation.id }
-        },
         subscribeConversationOperationActive(listener) {
             return doingChat.subscribe(listener)
         },
