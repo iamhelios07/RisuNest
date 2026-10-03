@@ -143,47 +143,8 @@ impl PersistentStore {
         row.map(|(snapshot, identity)| Ok((snapshot, serde_json::from_str(&identity)?)))
             .transpose()
     }
-    pub(crate) fn external_validate_receive(
-        &self,
-        job: &str,
-        connection: &str,
-        expected: &sync_selection::CaptureIdentity,
-        authenticated_head: &str,
-    ) -> StoreResult<()> {
-        let intent = self.external_job(job)?
-            .ok_or_else(|| invalid("Missing prepared receive intent"))?;
-        if intent.role != "restore" || intent.phase != "ready"
-            || intent.connection_id != connection || intent.identity != *expected
-            || intent.expected_head.as_deref() != Some(authenticated_head)
-            || self.external_identity()? != *expected
-        {
-            return Err(invalid("Prepared receive identity changed"));
-        }
-        sync_selection::require_publish(&self.connection, expected, connection)?;
-        sync_selection::require_no_pending_publication(&self.connection)
-    }
-
     pub(crate) fn external_identity(&self) -> StoreResult<sync_selection::CaptureIdentity> {
         sync_selection::identity(&self.connection)
-    }
-    pub(crate) fn external_library_is_pristine(&self) -> StoreResult<bool> {
-        let identity = sync_selection::identity(&self.connection)?;
-        if identity.revision != 0 {
-            return Ok(false);
-        }
-        Ok(self.connection.query_row(
-            "SELECT value='{}'
-             AND NOT EXISTS(SELECT 1 FROM bot_presets WHERE generation=?1)
-             AND NOT EXISTS(SELECT 1 FROM characters WHERE generation=?1)
-             AND NOT EXISTS(SELECT 1 FROM conversations WHERE generation=?1)
-             AND NOT EXISTS(SELECT 1 FROM messages WHERE generation=?1)
-             AND NOT EXISTS(SELECT 1 FROM plugin_storage WHERE generation=?1)
-             AND NOT EXISTS(SELECT 1 FROM asset_aliases WHERE generation=?1)
-             AND NOT EXISTS(SELECT 1 FROM asset_owner_heads WHERE generation=?1)
-             FROM root WHERE generation=?1",
-            [&identity.generation],
-            |row| row.get(0),
-        )?)
     }
     pub(crate) fn external_selection(&self) -> StoreResult<sync_selection::Selection> {
         sync_selection::read(&self.connection)
@@ -231,26 +192,6 @@ impl PersistentStore {
     }
 
 
-    pub(crate) fn external_jobs(&self, connection: &str) -> StoreResult<Vec<ExternalJob>> {
-        let mut query = self.connection.prepare("SELECT id,repository_id,capture_id,identity,role,strategy,expected_head,commit_id,phase FROM external_storage_jobs WHERE connection_id=?1 ORDER BY rowid DESC")?;
-        let mut rows = query.query([connection])?;
-        let mut result = Vec::new();
-        while let Some(row) = rows.next()? {
-            result.push(ExternalJob {
-                id: row.get(0)?,
-                connection_id: connection.into(),
-                repository_id: row.get(1)?,
-                capture_id: row.get(2)?,
-                identity: serde_json::from_str(&row.get::<_, String>(3)?)?,
-                role: row.get(4)?,
-                strategy: row.get(5)?,
-                expected_head: row.get(6)?,
-                commit_id: row.get(7)?,
-                phase: row.get(8)?,
-            });
-        }
-        Ok(result)
-    }
     pub(crate) fn external_job(&self, id: &str) -> StoreResult<Option<ExternalJob>> {
         self.connection
             .query_row(
@@ -314,17 +255,6 @@ impl PersistentStore {
         tx.commit()?;
         Ok(())
     }
-
-    pub(crate) fn external_prepare_receive(
-        &mut self,
-        intent: &jobs::ReceiveIntent<'_>,
-    ) -> StoreResult<()> {
-        let tx = self.connection.transaction()?;
-        jobs::prepare_receive(&tx, intent)?;
-        tx.commit()?;
-        Ok(())
-    }
-
 
     pub(crate) fn external_cancel_prepared(&mut self, job: &str) -> StoreResult<()> {
         let tx = self.connection.transaction()?;

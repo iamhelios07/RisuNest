@@ -140,59 +140,6 @@ pub(crate) fn require_no_pending_publication(db: &Connection) -> StoreResult<()>
     Ok(())
 }
 
-pub(crate) fn require_publish(
-    db: &Connection,
-    capture: &CaptureIdentity,
-    connection: &str,
-) -> StoreResult<()> {
-    require_publish_with_pause(db, capture, connection, false)
-}
-
-/// Exit drain may flush the selected paused target without changing the
-/// user's durable pause intent. Native code validates the live exit session
-/// immediately before every call to this override.
-pub(crate) fn require_publish_exit_drain(
-    db: &Connection,
-    capture: &CaptureIdentity,
-    connection: &str,
-) -> StoreResult<()> {
-    require_publish_with_pause(db, capture, connection, true)
-}
-
-fn require_publish_with_pause(
-    db: &Connection,
-    capture: &CaptureIdentity,
-    connection: &str,
-    allow_paused: bool,
-) -> StoreResult<()> {
-    let current = identity(db)?;
-    let selection = read(db)?;
-    if current.store_id != capture.store_id
-        || current.library_epoch != capture.library_epoch
-        || current.generation != capture.generation
-        || current.selection_epoch != capture.selection_epoch
-        || capture.revision > current.revision
-        || capture.revision < 0
-    {
-        return Err(invalid("Stale external capture"));
-    }
-    if selection.target != SyncTarget::External(connection.into())
-        || (selection.paused && !allow_paused)
-        || selection.decision_required
-    {
-        return Err(invalid("External sync target is not active"));
-    }
-    Ok(())
-}
-
-pub(crate) fn require_server(db: &Connection) -> StoreResult<()> {
-    let selected = read(db)?;
-    if !matches!(selected.target, SyncTarget::Server(_)) || selected.paused {
-        return Err(invalid("Server sync target is not active"));
-    }
-    Ok(())
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BindingContent {

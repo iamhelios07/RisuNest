@@ -180,55 +180,6 @@ fn capture(store: &mut PersistentStore, job: &str) -> selection::CaptureIdentity
     identity
 }
 
-#[test]
-fn ordinary_receive_reuses_only_the_same_terminal_job() {
-    let (_dir, mut store, _) = open_fixture();
-    select_external(&mut store);
-    let identity = capture(&mut store, "reused-receive");
-    store
-        .connection
-        .execute(
-            "UPDATE external_storage_jobs SET phase='stale' WHERE id='reused-receive'",
-            [],
-        )
-        .unwrap();
-    let receive = external::ReceiveIntent {
-        job_id: "reused-receive",
-        connection_id: "synthetic-connection",
-        repository_id: "remote-repository",
-        snapshot_id: "remote-snapshot",
-        commit_id: "remote-commit",
-        authenticated_head: "remote-head",
-        identity: &identity,
-    };
-    let tx = store.connection.transaction().unwrap();
-    external::prepare_receive(&tx, &receive).unwrap();
-    tx.commit().unwrap();
-    let job = store.external_job("reused-receive").unwrap().unwrap();
-    assert_eq!((job.role.as_str(), job.phase.as_str()), ("restore", "ready"));
-    assert_eq!(job.capture_id, "remote-snapshot");
-    assert_eq!(count(&store, "external_storage_capture_refs"), 0);
-
-    store
-        .connection
-        .execute(
-            "UPDATE external_storage_jobs SET connection_id='other',phase='stale' WHERE id='reused-receive'",
-            [],
-        )
-        .unwrap();
-    let tx = store.connection.transaction().unwrap();
-    assert!(external::prepare_receive(&tx, &receive).is_err());
-    tx.rollback().unwrap();
-    store
-        .connection
-        .execute(
-            "UPDATE external_storage_jobs SET connection_id='synthetic-connection',phase='ready' WHERE id='reused-receive'",
-            [],
-        )
-        .unwrap();
-    let tx = store.connection.transaction().unwrap();
-    assert!(external::prepare_receive(&tx, &receive).is_err());
-}
 
 
 #[test]
@@ -244,16 +195,6 @@ fn set_paused_preserves_selection_epoch_and_rejects_stale_selection() {
     assert!(!resumed.paused);
     assert!(store.external_set_paused("stale-selection", true).is_err());
     assert!(!store.external_selection().unwrap().paused);
-}
-
-
-#[test]
-fn only_an_untouched_empty_library_is_a_pristine_first_attach_target() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut store = PersistentStore::open(directory.path()).unwrap();
-    assert!(store.external_library_is_pristine().unwrap());
-    edit(&mut store, 1);
-    assert!(!store.external_library_is_pristine().unwrap());
 }
 
 
@@ -279,7 +220,6 @@ fn external_replacement_keeps_library_identity_and_invalidates_old_captures() {
     let current_clock = store.lww_clock_state().unwrap();
     assert_eq!(current_clock.writer_id, clock.writer_id);
     assert_eq!(current_clock.binding_authority, clock.binding_authority);
-    assert!(selection::require_publish(&store.connection, &old, "synthetic-connection").is_err());
 }
 
 #[test]
