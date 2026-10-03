@@ -237,6 +237,7 @@ pub(crate) struct BindingContent {
     pub ordinary_plugin_value_count: risunest_sync_wire::stamp::DecimalU64,
     pub hypa_value_count: risunest_sync_wire::stamp::DecimalU64,
     pub plugin_local_value_count: risunest_sync_wire::stamp::DecimalU64,
+    pub plugin_local_participating: bool,
 }
 
 impl super::PersistentStore {
@@ -280,6 +281,7 @@ impl super::PersistentStore {
             ordinary_plugin_value_count: (ordinary as u64).into(),
             hypa_value_count: device.hypa_embedding_usage()?.0.into(),
             plugin_local_value_count: (plugin_local as u64).into(),
+            plugin_local_participating: device.connection().query_row("SELECT participating FROM device_sections WHERE section='local-plugins'", [], |r| r.get(0))?,
         })
     }
 }
@@ -340,7 +342,8 @@ mod binding_tests {
         let encoded = serde_json::json!({
             "library":{},"sharedVariables":{},"protectedValues":{},
             "opaqueSharedUnitCount":"0","managedAliasCount":"18446744073709551615",
-            "ordinaryPluginValueCount":"9007199254740993","hypaValueCount":"1","pluginLocalValueCount":"2"
+            "ordinaryPluginValueCount":"9007199254740993","hypaValueCount":"1","pluginLocalValueCount":"2",
+            "pluginLocalParticipating":false
         });
         let decoded:BindingContent = serde_json::from_value(encoded.clone()).unwrap();
         assert_eq!(decoded.managed_alias_count.0,u64::MAX);
@@ -375,6 +378,7 @@ mod binding_tests {
         assert!(!participation);
         let content = store.lww_binding_content().unwrap();
         assert_eq!(content.plugin_local_value_count.0, 2);
+        assert!(!content.plugin_local_participating);
         assert_eq!(content.hypa_value_count.0, 0);
         assert_eq!(content.ordinary_plugin_value_count.0, 0);
     }
@@ -491,6 +495,7 @@ mod binding_tests {
             let opaque:i64=store.device_store().unwrap().connection().query_row("SELECT COUNT(*) FROM lww_units",[],|r|r.get(0)).unwrap();
             assert_eq!(opaque,1);
             assert_eq!(store.lww_binding_content().unwrap().plugin_local_value_count.0,1);
+            assert_eq!(store.lww_binding_content().unwrap().plugin_local_participating,enabled);
         }
     }
 
