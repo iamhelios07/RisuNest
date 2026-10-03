@@ -258,7 +258,7 @@ fn only_an_untouched_empty_library_is_a_pristine_first_attach_target() {
 
 
 #[test]
-fn external_replacement_and_physical_copy_invalidate_old_identity() {
+fn external_replacement_keeps_library_identity_and_invalidates_old_captures() {
     let (_dir, mut store, _) = open_fixture();
     select_external(&mut store);
     let old = capture(&mut store, "job");
@@ -280,13 +280,6 @@ fn external_replacement_and_physical_copy_invalidate_old_identity() {
     assert_eq!(current_clock.writer_id, clock.writer_id);
     assert_eq!(current_clock.binding_authority, clock.binding_authority);
     assert!(selection::require_publish(&store.connection, &old, "synthetic-connection").is_err());
-    let tx = store.connection.transaction().unwrap();
-    selection::restored_copy(&tx).unwrap();
-    tx.commit().unwrap();
-    let restored = selection::identity(&store.connection).unwrap();
-    assert_ne!(restored.store_id, next.store_id);
-    assert_ne!(restored.library_epoch, next.library_epoch);
-    assert_ne!(restored.selection_epoch, next.selection_epoch);
 }
 
 #[test]

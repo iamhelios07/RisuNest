@@ -193,21 +193,6 @@ pub(crate) fn require_server(db: &Connection) -> StoreResult<()> {
     Ok(())
 }
 
-pub(super) fn restored_copy(tx: &Transaction<'_>) -> StoreResult<()> {
-    tx.execute(
-        "UPDATE local_library_identity SET store_id=?1,library_epoch=?2 WHERE singleton=1",
-        params![
-            uuid::Uuid::new_v4().to_string(),
-            uuid::Uuid::new_v4().to_string()
-        ],
-    )?;
-    tx.execute("UPDATE library_sync_selection SET selection_epoch=?1,decision_required=1 WHERE singleton=1",[uuid::Uuid::new_v4().to_string()])?;
-    tx.execute("UPDATE external_storage_jobs SET phase='stale' WHERE phase NOT IN ('complete','cancelled')",[])?;
-    tx.execute("UPDATE content_change_consumers SET rebuild_required=1", [])?;
-    tx.execute("DELETE FROM content_change_context", [])?;
-    Ok(())
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BindingContent {
