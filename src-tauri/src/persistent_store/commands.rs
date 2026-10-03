@@ -412,7 +412,7 @@ fn with_store_mutex_mut_admitted<T>(
     operation(store)
 }
 
-pub(crate) fn replace_commit_with_snapshot(
+pub(crate) fn commit_staged_replacement(
     app: &AppHandle,
     staging_id: &str,
     expected_revision: Option<i64>,
@@ -895,7 +895,7 @@ pub(crate) fn pds_replace_commit(
     staging_id: String,
     expected_revision: Option<i64>,
 ) -> Result<RevisionResult, StoreError> {
-    replace_commit_with_snapshot(&app, &staging_id, expected_revision)
+    commit_staged_replacement(&app, &staging_id, expected_revision)
 }
 
 #[tauri::command(async)]
@@ -1214,6 +1214,7 @@ fn pds_asset_gc_execute_all(
         store.prepare_asset_gc_delete_marks()
     })?;
     let mut cursor = None;
+    let mut library = None;
     let mut result = AssetGcMaintenanceResult {
         candidate_count: 0,
         candidate_bytes: 0,
@@ -1224,7 +1225,7 @@ fn pds_asset_gc_execute_all(
         omitted: 0,
     };
     loop {
-        let page = pds_asset_gc_execute_page(state, operation_guard, &marks, cursor.as_deref(), now)?;
+        let page = pds_asset_gc_execute_page(state, operation_guard, &marks, &mut library, cursor.as_deref(), now)?;
         let page_result = asset_gc_result(page.report);
         result.candidate_count += page_result.candidate_count;
         result.candidate_bytes += page_result.candidate_bytes;
@@ -1243,11 +1244,12 @@ fn pds_asset_gc_execute_page(
     state: &PersistentStoreState,
     operation_guard: &RendererOperationGuard,
     marks: &crate::asset_repository::migration_gc::AssetGcMarks,
+    library: &mut Option<super::AssetGcLibraryRoots>,
     cursor: Option<&str>,
     now: i64,
 ) -> StoreResult<crate::asset_repository::migration_gc::AssetGcDryRunPage> {
     with_store_mutex_mut_admitted(state, operation_guard, |store| {
-        store.asset_gc_delete_marked_page_with_hook(marks, 1024, cursor, now, 7 * 24 * 60 * 60 * 1_000, |_| Ok(()))
+        store.asset_gc_delete_marked_page_reusing_library(marks, library, 1024, cursor, now, 7 * 24 * 60 * 60 * 1_000, |_| Ok(()))
     })
 }
 
@@ -2364,9 +2366,13 @@ mod tests {
         };
         let operation_guard = state.admit_renderer_operation().unwrap();
         super::super::ASSET_GC_ROOT_COLLECTIONS.with(|count| count.set((0, 0)));
+        super::super::ASSET_GC_LIBRARY_ROOT_COLLECTIONS.with(|count| count.set(0));
         let result = pds_asset_gc_execute_all(&state, &operation_guard).expect("execute complete cleanup");
         super::super::ASSET_GC_ROOT_COLLECTIONS.with(|count| {
             assert_eq!(count.get(), (1, 3), "one preliminary scan and one final check per deleting page");
+        });
+        super::super::ASSET_GC_LIBRARY_ROOT_COLLECTIONS.with(|count| {
+            assert_eq!(count.get(), 2, "an unchanged library is scanned once for marks and once for the final check");
         });
         assert!(state.store.try_lock().is_ok());
         drop(operation_guard);

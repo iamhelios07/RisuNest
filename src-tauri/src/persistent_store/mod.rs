@@ -987,6 +987,15 @@ fn scan_failure(error: crate::portable_backup::Error) -> StoreError {
 #[cfg(test)]
 std::thread_local! {
     static ASSET_GC_ROOT_COLLECTIONS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+    static ASSET_GC_LIBRARY_ROOT_COLLECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The library's own asset roots from one cleanup run, reused by its later pages while the
+/// database reports no change since they were collected.
+pub(crate) struct AssetGcLibraryRoots {
+    data_version: i64,
+    total_changes: i64,
+    roots: crate::asset_repository::migration_gc::AssetRootSet,
 }
 
 pub(crate) struct AssetGcPreview {
@@ -2754,6 +2763,25 @@ impl PersistentStore {
         cursor: Option<&str>,
         now_ms: i64,
         minimum_grace_ms: i64,
+        hook: impl FnMut(
+            crate::asset_repository::migration_gc::AssetGcDeleteHookPoint,
+        ) -> StoreResult<()>,
+    ) -> StoreResult<crate::asset_repository::migration_gc::AssetGcDryRunPage> {
+        self.asset_gc_delete_marked_page_reusing_library(
+            initial_marks, &mut None, limit, cursor, now_ms, minimum_grace_ms, hook,
+        )
+    }
+
+    /// Deletes one page, reusing `library` roots an earlier page of the same run collected when
+    /// the database is unchanged since. Every other root source is collected again.
+    pub(crate) fn asset_gc_delete_marked_page_reusing_library(
+        &mut self,
+        initial_marks: &crate::asset_repository::migration_gc::AssetGcMarks,
+        library: &mut Option<AssetGcLibraryRoots>,
+        limit: i64,
+        cursor: Option<&str>,
+        now_ms: i64,
+        minimum_grace_ms: i64,
         mut hook: impl FnMut(
             crate::asset_repository::migration_gc::AssetGcDeleteHookPoint,
         ) -> StoreResult<()>,
@@ -2805,11 +2833,13 @@ impl PersistentStore {
         }
         self.validate_plugin_gc_cache(plugins)?;
         let final_transaction = rusqlite::Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        let current_roots = self.collect_asset_gc_roots_with_plugin_cache(true, false, Some(&plugins.roots))?
-            .into_iter().map(|(_, roots)| roots);
-        let final_marks = mark_asset_roots_with_remote(&cas, current_roots, |hash| residency.gc_size(hash))?;
         let library_version: i64 = self.connection.query_row("PRAGMA data_version", [], |row|row.get(0))?;
         let mut expected_changes: i64 = self.connection.query_row("SELECT total_changes()", [], |row|row.get(0))?;
+        let current_roots = self.collect_asset_gc_roots_reusing_library(
+            true, false, Some(&plugins.roots), Some((library, library_version, expected_changes)),
+        )?
+            .into_iter().map(|(_, roots)| roots);
+        let final_marks = mark_asset_roots_with_remote(&cas, current_roots, |hash| residency.gc_size(hash))?;
         final_transaction.rollback()?;
         let mut report = sweep_asset_candidates_with_remote(&cas, final_candidates.items.clone(), &final_marks,
             now_ms, minimum_grace_ms, |hash| residency.gc_size(hash))?;
@@ -2856,6 +2886,8 @@ impl PersistentStore {
             )?;
             expected_changes = transaction.query_row("SELECT total_changes()", [], |row|row.get(0))?;
             transaction.commit()?;
+            // Deletion records are not library roots, so the cleanup's own writes keep them valid.
+            if let Some(library) = library.as_mut() { library.total_changes = expected_changes; }
             hook(AssetGcDeleteHookPoint::AfterTombstone)?;
 
             let transaction = rusqlite::Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
@@ -2910,6 +2942,7 @@ impl PersistentStore {
             }
             expected_changes = transaction.query_row("SELECT total_changes()", [], |row|row.get(0))?;
             transaction.commit()?;
+            if let Some(library) = library.as_mut() { library.total_changes = expected_changes; }
             report.deleted_bytes = report
                 .deleted_bytes
                 .checked_add(candidate.byte_size)
@@ -2969,6 +3002,18 @@ impl PersistentStore {
         read_only: bool,
         plugins: Option<&crate::asset_repository::migration_gc::AssetRootSet>,
     ) -> StoreResult<Vec<(&'static str, crate::asset_repository::migration_gc::AssetRootSet)>> {
+        self.collect_asset_gc_roots_reusing_library(repository_guard_held, read_only, plugins, None)
+    }
+
+    /// `library` carries roots an earlier page collected and the database `data_version` and
+    /// `total_changes()` observed now, which must be read in the transaction the roots come from.
+    fn collect_asset_gc_roots_reusing_library(
+        &self,
+        repository_guard_held: bool,
+        read_only: bool,
+        plugins: Option<&crate::asset_repository::migration_gc::AssetRootSet>,
+        library: Option<(&mut Option<AssetGcLibraryRoots>, i64, i64)>,
+    ) -> StoreResult<Vec<(&'static str, crate::asset_repository::migration_gc::AssetRootSet)>> {
         use crate::asset_repository::job_pins::{
             collect_durable_cas_job_roots, collect_durable_cas_job_roots_already_guarded,
             collect_durable_cas_job_roots_read_only,
@@ -2984,7 +3029,25 @@ impl PersistentStore {
             Some(plugins) => snapshot::collect_asset_roots_with_plugin_cache(connection, plugins),
             None => snapshot::collect_asset_roots(connection),
         };
-        let mut roots = vec![("library", collect(&self.connection)?)];
+        let collect_library = || {
+            #[cfg(test)]
+            ASSET_GC_LIBRARY_ROOT_COLLECTIONS.with(|count| count.set(count.get() + 1));
+            collect(&self.connection)
+        };
+        let library_roots = match library {
+            Some((Some(cached), data_version, total_changes))
+                if cached.data_version == data_version && cached.total_changes == total_changes =>
+            {
+                cached.roots.clone()
+            }
+            Some((cache, data_version, total_changes)) => {
+                let roots = collect_library()?;
+                *cache = Some(AssetGcLibraryRoots { data_version, total_changes, roots: roots.clone() });
+                roots
+            }
+            None => collect_library()?,
+        };
+        let mut roots = vec![("library", library_roots)];
         roots.push(("source-preservation",snapshot::collect_preserved_source_roots(self.repository_root())));
         for reader in self.revision_leases.values() {
             roots.push((
