@@ -432,9 +432,11 @@ pub(crate) fn pds_open(
     app: AppHandle,
     state: State<'_, PersistentStoreState>,
 ) -> Result<PersistentStoreOpenResult, StoreError> {
-    let operation_guard = state.admit_renderer_operation()?;
-    let app_data_dir = crate::app_paths::data_root(&app).map_err(|message| StoreError::Store { message })?;
-    open_renderer_persistent_store_admitted(&state, &operation_guard, &app_data_dir)
+    logged("pds_open", (|| {
+        let operation_guard = state.admit_renderer_operation()?;
+        let app_data_dir = crate::app_paths::data_root(&app).map_err(|message| StoreError::Store { message })?;
+        open_renderer_persistent_store_admitted(&state, &operation_guard, &app_data_dir)
+    })())
 }
 
 #[cfg(test)]
@@ -486,9 +488,9 @@ fn open_persistent_store(
 pub(crate) fn pds_asset_gc_maintenance(
     state: State<'_, PersistentStoreState>,
 ) -> Result<crate::asset_repository::migration_gc::AssetGcDryRunPage, StoreError> {
-    with_store_mut(state, |store| {
+    logged("pds_asset_gc_maintenance", with_store_mut(state, |store| {
         store.asset_gc_product_maintenance_page(current_time_ms()?)
-    })
+    }))
 }
 
 /// Sweeps one batch of message objects in each store, continuing from each
@@ -519,7 +521,7 @@ pub(crate) fn pds_read_root(
     state: State<'_, PersistentStoreState>,
     lease: Option<String>,
 ) -> Result<Versioned<Value>, StoreError> {
-    with_store(state, |store| store.read_root(lease.as_deref()))
+    logged("pds_read_root", with_store(state, |store| store.read_root(lease.as_deref())))
 }
 
 #[tauri::command(async)]
@@ -527,7 +529,7 @@ pub(crate) fn pds_query_presets(
     state: State<'_, PersistentStoreState>,
     lease: Option<String>,
 ) -> Result<PresetCatalog, StoreError> {
-    with_store(state, |store| store.query_presets(lease.as_deref()))
+    logged("pds_query_presets", with_store(state, |store| store.query_presets(lease.as_deref())))
 }
 
 #[tauri::command(async)]
@@ -536,7 +538,7 @@ pub(crate) fn pds_read_preset(
     id: String,
     lease: Option<String>,
 ) -> Result<Option<Versioned<Value>>, StoreError> {
-    with_store(state, |store| store.read_preset(&id, lease.as_deref()))
+    logged("pds_read_preset", with_store(state, |store| store.read_preset(&id, lease.as_deref())))
 }
 
 #[tauri::command(async)]
@@ -545,9 +547,9 @@ pub(crate) fn pds_query_characters(
     query: CharacterQuery,
     lease: Option<String>,
 ) -> Result<CharacterPage, StoreError> {
-    with_store(state, |store| {
+    logged("pds_query_characters", with_store(state, |store| {
         store.query_characters(&query, lease.as_deref())
-    })
+    }))
 }
 
 #[tauri::command(async)]
@@ -556,7 +558,7 @@ pub(crate) fn pds_read_character(
     id: String,
     lease: Option<String>,
 ) -> Result<Option<Versioned<Value>>, StoreError> {
-    with_store(state, |store| store.read_character(&id, lease.as_deref()))
+    logged("pds_read_character", with_store(state, |store| store.read_character(&id, lease.as_deref())))
 }
 
 #[tauri::command(async)]
@@ -565,9 +567,9 @@ pub(crate) fn pds_read_character_summary(
     id: String,
     lease: Option<String>,
 ) -> Result<Option<CharacterSummary>, StoreError> {
-    with_store(state, |store| {
+    logged("pds_read_character_summary", with_store(state, |store| {
         store.read_character_summary(&id, lease.as_deref())
-    })
+    }))
 }
 
 /// Reading the window and the records it names through one lease is what keeps
@@ -577,7 +579,7 @@ pub(crate) fn pds_working_set_change_window(
     state: State<'_, PersistentStoreState>,
     lease: String,
 ) -> Result<ContentChangeWindow, StoreError> {
-    with_store(state, |store| store.working_set_change_window(&lease))
+    logged("pds_working_set_change_window", with_store(state, |store| store.working_set_change_window(&lease)))
 }
 
 #[tauri::command(async)]
@@ -588,9 +590,9 @@ pub(crate) fn pds_working_set_change_page(
     after_key: Option<ContentKey>,
     limit: usize,
 ) -> Result<Vec<ContentKey>, StoreError> {
-    with_store(state, |store| {
+    logged("pds_working_set_change_page", with_store(state, |store| {
         store.working_set_change_page(&lease, after_revision, after_key, limit)
-    })
+    }))
 }
 
 #[tauri::command(async)]
@@ -598,9 +600,9 @@ pub(crate) fn pds_commit_working_set_change_cursor(
     state: State<'_, PersistentStoreState>,
     revision: i64,
 ) -> Result<(), StoreError> {
-    with_store_mut(state, |store| {
+    logged("pds_commit_working_set_change_cursor", with_store_mut(state, |store| {
         store.commit_working_set_change_cursor(revision)
-    })
+    }))
 }
 
 #[tauri::command(async)]
@@ -609,9 +611,9 @@ pub(crate) fn pds_query_conversations(
     query: ConversationQuery,
     lease: Option<String>,
 ) -> Result<ConversationPage, StoreError> {
-    with_store(state, |store| {
+    logged("pds_query_conversations", with_store(state, |store| {
         store.query_conversations(&query, lease.as_deref())
-    })
+    }))
 }
 
 #[tauri::command(async)]
@@ -621,9 +623,9 @@ pub(crate) fn pds_read_conversation(
     conversation_id: String,
     lease: Option<String>,
 ) -> Result<Option<Versioned<Value>>, StoreError> {
-    with_store(state, |store| {
+    logged("pds_read_conversation", with_store(state, |store| {
         store.read_conversation(&character_id, &conversation_id, lease.as_deref())
-    })
+    }))
 }
 
 #[tauri::command(async)]
@@ -633,9 +635,9 @@ pub(crate) fn pds_read_conversation_metadata(
     conversation_id: String,
     lease: Option<String>,
 ) -> Result<Option<Versioned<super::PersistentConversationMetadata>>, StoreError> {
-    with_store(state, |store| {
+    logged("pds_read_conversation_metadata", with_store(state, |store| {
         store.read_conversation_metadata(&character_id, &conversation_id, lease.as_deref())
-    })
+    }))
 }
 
 #[tauri::command(async)]
@@ -644,9 +646,9 @@ pub(crate) fn pds_read_conversation_window(
     query: ConversationWindowQuery,
     lease: Option<String>,
 ) -> Result<Option<Versioned<ConversationWindow>>, StoreError> {
-    with_store(state, |store| {
+    logged("pds_read_conversation_window", with_store(state, |store| {
         store.read_conversation_window(&query, lease.as_deref())
-    })
+    }))
 }
 
 #[tauri::command(async)]
@@ -655,9 +657,9 @@ pub(crate) fn pds_read_conversation_message_metadata_window(
     query: ConversationWindowQuery,
     lease: Option<String>,
 ) -> Result<Option<Versioned<super::ConversationMessageMetadataWindow>>, StoreError> {
-    with_store(state, |store| {
+    logged("pds_read_conversation_message_metadata_window", with_store(state, |store| {
         store.read_conversation_message_metadata_window(&query, lease.as_deref())
-    })
+    }))
 }
 
 #[tauri::command(async)]
@@ -665,7 +667,7 @@ pub(crate) fn pds_query_plugin_storage(
     state: State<'_, PersistentStoreState>,
     lease: Option<String>,
 ) -> Result<PluginStorageCatalog, StoreError> {
-    with_store(state, |store| store.query_plugin_storage(lease.as_deref()))
+    logged("pds_query_plugin_storage", with_store(state, |store| store.query_plugin_storage(lease.as_deref())))
 }
 
 #[tauri::command(async)]
@@ -674,7 +676,7 @@ pub(crate) fn pds_read_plugin_storage_page(
     query: super::PluginStorageValueQuery,
     lease: Option<String>,
 ) -> Result<super::PluginStorageValuePage, StoreError> {
-    with_store(state, |store| store.read_plugin_storage_page(&query, lease.as_deref()))
+    logged("pds_read_plugin_storage_page", with_store(state, |store| store.read_plugin_storage_page(&query, lease.as_deref())))
 }
 
 #[tauri::command(async)]
@@ -682,7 +684,7 @@ pub(crate) fn pds_list_plugin_storage(
     state: State<'_, PersistentStoreState>,
     lease: Option<String>,
 ) -> Result<Vec<PluginStorageListItem>, StoreError> {
-    with_store(state, |store| store.list_plugin_storage(lease.as_deref()))
+    logged("pds_list_plugin_storage", with_store(state, |store| store.list_plugin_storage(lease.as_deref())))
 }
 
 #[tauri::command(async)]
@@ -692,9 +694,9 @@ pub(crate) fn pds_read_plugin_storage(
     key: String,
     lease: Option<String>,
 ) -> Result<Option<Versioned<Value>>, StoreError> {
-    with_store(state, |store| {
+    logged("pds_read_plugin_storage", with_store(state, |store| {
         store.read_plugin_storage(&owner, &key, lease.as_deref())
-    })
+    }))
 }
 
 #[tauri::command(async)]
@@ -704,9 +706,9 @@ pub(crate) fn pds_read_asset_alias(
     key: String,
     lease: Option<String>,
 ) -> Result<Option<Versioned<AssetAlias>>, StoreError> {
-    with_store(state, |store| {
+    logged("pds_read_asset_alias", with_store(state, |store| {
         store.read_asset_alias(&kind, &key, lease.as_deref())
-    })
+    }))
 }
 
 #[tauri::command(async)]
@@ -716,9 +718,9 @@ pub(crate) fn pds_read_asset_aliases_by_keys(
     keys: Vec<String>,
     lease: Option<String>,
 ) -> Result<Versioned<Vec<AssetAlias>>, StoreError> {
-    with_store(state, |store| {
+    logged("pds_read_asset_aliases_by_keys", with_store(state, |store| {
         store.read_asset_aliases_by_keys(&kind, &keys, lease.as_deref())
-    })
+    }))
 }
 
 #[tauri::command(async)]
@@ -727,9 +729,9 @@ pub(crate) fn pds_list_asset_aliases(
     query: AssetAliasListQuery,
     lease: Option<String>,
 ) -> Result<AssetAliasPage, StoreError> {
-    with_store(state, |store| {
+    logged("pds_list_asset_aliases", with_store(state, |store| {
         store.list_asset_alias_page(&query, lease.as_deref())
-    })
+    }))
 }
 
 #[tauri::command(async)]
@@ -738,9 +740,9 @@ pub(crate) fn pds_read_asset_owner_head(
     owner: AssetOwnerLocator,
     lease: Option<String>,
 ) -> Result<Option<Versioned<AssetOwnerHead>>, StoreError> {
-    with_store(state, |store| {
+    logged("pds_read_asset_owner_head", with_store(state, |store| {
         store.read_asset_owner_head(&owner, lease.as_deref())
-    })
+    }))
 }
 
 #[tauri::command(async)]
@@ -749,9 +751,9 @@ pub(crate) fn pds_commit_asset_alias(
     alias: AssetAlias,
     expected_revision: i64,
 ) -> Result<RevisionResult, StoreError> {
-    with_store_mut(state, |store| {
+    logged("pds_commit_asset_alias", with_store_mut(state, |store| {
         store.commit_asset_alias(&alias, expected_revision)
-    })
+    }))
 }
 
 #[tauri::command(async)]
@@ -761,9 +763,9 @@ pub(crate) fn pds_delete_asset_alias(
     key: String,
     expected_revision: i64,
 ) -> Result<RevisionResult, StoreError> {
-    with_store_mut(state, |store| {
+    logged("pds_delete_asset_alias", with_store_mut(state, |store| {
         store.delete_asset_alias(&kind, &key, expected_revision)
-    })
+    }))
 }
 
 #[tauri::command(async)]
@@ -772,9 +774,9 @@ pub(crate) fn pds_commit(
     commit: WorkingSetCommit,
     asset_aliases: Vec<AssetAlias>,
 ) -> Result<RevisionResult, StoreError> {
-    with_store_mut(state, |store| {
+    logged("pds_commit", with_store_mut(state, |store| {
         store.commit_with_asset_aliases(&commit, &asset_aliases)
-    })
+    }))
 }
 
 #[tauri::command(async)]
@@ -783,9 +785,9 @@ pub(crate) fn pds_archive_preview(
     character_id: String,
     lease: Option<String>,
 ) -> Result<ArchivePreview, StoreError> {
-    with_store(state, |store| {
+    logged("pds_archive_preview", with_store(state, |store| {
         store.archive_preview(&character_id, lease.as_deref())
-    })
+    }))
 }
 
 #[tauri::command(async)]
@@ -795,16 +797,18 @@ pub(crate) fn pds_archive_character(
     expected_revision: i64,
     operation_id: String,
 ) -> Result<RevisionResult, StoreError> {
-    let now_ms = current_time_ms()?;
-    let operation = state.begin_archive_operation(operation_id)?;
-    with_store_mutex_mut(&state, |store| {
-        store.archive_character_with_cancellation(
-            &character_id,
-            expected_revision,
-            now_ms,
-            &|| operation.is_cancelled(),
-        )
-    })
+    logged("pds_archive_character", (|| {
+        let now_ms = current_time_ms()?;
+        let operation = state.begin_archive_operation(operation_id)?;
+        with_store_mutex_mut(&state, |store| {
+            store.archive_character_with_cancellation(
+                &character_id,
+                expected_revision,
+                now_ms,
+                &|| operation.is_cancelled(),
+            )
+        })
+    })())
 }
 
 #[tauri::command(async)]
@@ -814,14 +818,16 @@ pub(crate) fn pds_restore_character(
     expected_revision: i64,
     operation_id: String,
 ) -> Result<RevisionResult, StoreError> {
-    let operation = state.begin_archive_operation(operation_id)?;
-    with_store_mutex_mut(&state, |store| {
-        store.restore_character_with_cancellation(
-            &character_id,
-            expected_revision,
-            &|| operation.is_cancelled(),
-        )
-    })
+    logged("pds_restore_character", (|| {
+        let operation = state.begin_archive_operation(operation_id)?;
+        with_store_mutex_mut(&state, |store| {
+            store.restore_character_with_cancellation(
+                &character_id,
+                expected_revision,
+                &|| operation.is_cancelled(),
+            )
+        })
+    })())
 }
 
 #[tauri::command(async)]
@@ -829,14 +835,14 @@ pub(crate) fn pds_cancel_character_archive_operation(
     state: State<'_, PersistentStoreState>,
     operation_id: String,
 ) -> Result<bool, StoreError> {
-    state.cancel_archive_operation(&operation_id)
+    logged("pds_cancel_character_archive_operation", state.cancel_archive_operation(&operation_id))
 }
 
 #[tauri::command(async)]
 pub(crate) fn pds_replace_begin(
     state: State<'_, PersistentStoreState>,
 ) -> Result<StagingResult, StoreError> {
-    with_store_mut(state, PersistentStore::replace_begin)
+    logged("pds_replace_begin", with_store_mut(state, PersistentStore::replace_begin))
 }
 
 #[tauri::command(async)]
@@ -846,13 +852,13 @@ pub(crate) fn pds_replace_put_root(
     root: Value,
     plugin_storage_values: Option<Vec<super::PluginStorageValue>>,
 ) -> Result<(), StoreError> {
-    with_store_mut(state, |store| {
+    logged("pds_replace_put_root", with_store_mut(state, |store| {
         store.replace_put_root_with_plugin_storage(
             &staging_id,
             &root,
             plugin_storage_values.as_deref(),
         )
-    })
+    }))
 }
 
 #[tauri::command(async)]
@@ -861,9 +867,9 @@ pub(crate) fn pds_replace_add_characters(
     staging_id: String,
     characters: Vec<Value>,
 ) -> Result<(), StoreError> {
-    with_store_mut(state, |store| {
+    logged("pds_replace_add_characters", with_store_mut(state, |store| {
         store.replace_add_characters(&staging_id, &characters)
-    })
+    }))
 }
 
 #[tauri::command(async)]
@@ -872,9 +878,9 @@ pub(crate) fn pds_replace_put_presets(
     staging_id: String,
     presets: Vec<Value>,
 ) -> Result<(), StoreError> {
-    with_store_mut(state, |store| {
+    logged("pds_replace_put_presets", with_store_mut(state, |store| {
         store.replace_put_presets(&staging_id, &presets)
-    })
+    }))
 }
 
 #[tauri::command(async)]
@@ -883,9 +889,9 @@ pub(crate) fn pds_replace_put_asset_aliases(
     staging_id: String,
     aliases: Vec<AssetAlias>,
 ) -> Result<(), StoreError> {
-    with_store_mut(state, |store| {
+    logged("pds_replace_put_asset_aliases", with_store_mut(state, |store| {
         store.replace_put_asset_aliases(&staging_id, &aliases)
-    })
+    }))
 }
 
 #[tauri::command(async)]
@@ -894,9 +900,9 @@ pub(crate) fn pds_replace_put_asset_owner_heads(
     staging_id: String,
     heads: Vec<AssetOwnerHead>,
 ) -> Result<(), StoreError> {
-    with_store_mut(state, |store| {
+    logged("pds_replace_put_asset_owner_heads", with_store_mut(state, |store| {
         store.replace_put_asset_owner_heads(&staging_id, &heads)
-    })
+    }))
 }
 
 #[tauri::command(async)]
@@ -905,9 +911,9 @@ pub(crate) fn pds_replace_preserve_repositories(
     staging_id: String,
     expected_revision: Option<i64>,
 ) -> Result<RevisionResult, StoreError> {
-    with_store_mut(state, |store| {
+    logged("pds_replace_preserve_repositories", with_store_mut(state, |store| {
         store.replace_preserve_repositories(&staging_id, expected_revision)
-    })
+    }))
 }
 
 #[tauri::command(async)]
@@ -916,7 +922,7 @@ pub(crate) fn pds_replace_commit(
     staging_id: String,
     expected_revision: Option<i64>,
 ) -> Result<RevisionResult, StoreError> {
-    commit_staged_replacement(&app, &staging_id, expected_revision)
+    logged("pds_replace_commit", commit_staged_replacement(&app, &staging_id, expected_revision))
 }
 
 #[tauri::command(async)]
@@ -924,7 +930,7 @@ pub(crate) fn pds_replace_abort(
     state: State<'_, PersistentStoreState>,
     staging_id: String,
 ) -> Result<(), StoreError> {
-    with_store_mut(state, |store| store.replace_abort(&staging_id))
+    logged("pds_replace_abort", with_store_mut(state, |store| store.replace_abort(&staging_id)))
 }
 
 #[tauri::command(async)]
@@ -932,7 +938,7 @@ pub(crate) fn pds_materialize(
     state: State<'_, PersistentStoreState>,
     revision: Option<i64>,
 ) -> Result<Value, StoreError> {
-    with_store(state, |store| store.materialize(revision))
+    logged("pds_materialize", with_store(state, |store| store.materialize(revision)))
 }
 
 #[tauri::command(async)]
@@ -940,7 +946,7 @@ pub(crate) fn pds_acquire_revision(
     state: State<'_, PersistentStoreState>,
     revision: i64,
 ) -> Result<LeaseResult, StoreError> {
-    with_store_mut(state, |store| store.acquire_revision(revision))
+    logged("pds_acquire_revision", with_store_mut(state, |store| store.acquire_revision(revision)))
 }
 
 #[tauri::command(async)]
@@ -948,7 +954,7 @@ pub(crate) fn pds_release_revision(
     state: State<'_, PersistentStoreState>,
     lease: String,
 ) -> Result<(), StoreError> {
-    with_store_mut(state, |store| store.release_revision(&lease))
+    logged("pds_release_revision", with_store_mut(state, |store| store.release_revision(&lease)))
 }
 
 #[tauri::command(async)]
@@ -958,26 +964,28 @@ pub(crate) fn pds_export_risu_save(
     lease: String,
     omit_account: bool,
 ) -> Result<ExportedRisuSave, StoreError> {
-    let account = crate::account_credential::export_account(&app, omit_account)
-        .map_err(|message| StoreError::Validation { message })?;
-    let operation_guard = state.admit_renderer_operation()?;
-    let prepared = with_store_mutex_mut_admitted(&state, &operation_guard, |store| {
-        store.detach_risu_save_export(&lease)
-    })?;
-    let outcome = prepared.create_attached_export(omit_account, account.as_ref());
-    let reattach = with_store_mutex_mut_admitted(&state, &operation_guard, |store| {
-        store.reattach_risu_save_export(prepared)
-    });
-    match (outcome, reattach) {
-        (Ok(exported), Ok(())) => Ok(exported),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
-        (Err(error), Err(reattach_error)) => Err(StoreError::Store {
-            message: format!(
-                "{error}; failed to reattach revision lease after native export: {reattach_error}"
-            ),
-        }),
-    }
+    logged("pds_export_risu_save", (|| {
+        let account = crate::account_credential::export_account(&app, omit_account)
+            .map_err(|message| StoreError::Validation { message })?;
+        let operation_guard = state.admit_renderer_operation()?;
+        let prepared = with_store_mutex_mut_admitted(&state, &operation_guard, |store| {
+            store.detach_risu_save_export(&lease)
+        })?;
+        let outcome = prepared.create_attached_export(omit_account, account.as_ref());
+        let reattach = with_store_mutex_mut_admitted(&state, &operation_guard, |store| {
+            store.reattach_risu_save_export(prepared)
+        });
+        match (outcome, reattach) {
+            (Ok(exported), Ok(())) => Ok(exported),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(reattach_error)) => Err(StoreError::Store {
+                message: format!(
+                    "{error}; failed to reattach revision lease after native export: {reattach_error}"
+                ),
+            }),
+        }
+    })())
 }
 
 #[tauri::command(async)]
@@ -985,9 +993,9 @@ pub(crate) fn pds_export_risu_save_cleanup(
     state: State<'_, PersistentStoreState>,
     path: String,
 ) -> Result<(), StoreError> {
-    with_store(state, |store| {
+    logged("pds_export_risu_save_cleanup", with_store(state, |store| {
         store.cleanup_risu_save_export(Path::new(&path))
-    })
+    }))
 }
 
 #[cfg(feature = "official-publication-upload-pilot")]
@@ -1015,23 +1023,25 @@ pub(crate) async fn pds_kei_backup_upload(
     expected_account_id: String,
     token: String,
 ) -> Result<KeiUploadResult, StoreError> {
-    let account = crate::account_credential::export_account(&app, false)
-        .map_err(|message| StoreError::Validation { message })?
-        .ok_or_else(|| StoreError::Validation { message: "KEI account credential is unavailable".to_owned() })?;
-    let operation = state.admit_renderer_operation()?;
-    let prepared = with_store_mutex_mut_admitted(&state, &operation, |store| {
-        store.prepare_kei_upload(&lease, &url, &expected_account_id, &token, &account)
-    })?;
-    // Keep admission with the native task even if its invoking renderer goes
-    // away while serialization or detached-reader checkpointing is running.
-    tauri::async_runtime::spawn(async move {
-        let _operation = operation;
-        prepared.upload().await
-    })
-    .await
-    .map_err(|error| StoreError::Store {
-        message: format!("failed to join KEI upload operation: {error}"),
-    })?
+    logged("pds_kei_backup_upload", async move {
+        let account = crate::account_credential::export_account(&app, false)
+            .map_err(|message| StoreError::Validation { message })?
+            .ok_or_else(|| StoreError::Validation { message: "KEI account credential is unavailable".to_owned() })?;
+        let operation = state.admit_renderer_operation()?;
+        let prepared = with_store_mutex_mut_admitted(&state, &operation, |store| {
+            store.prepare_kei_upload(&lease, &url, &expected_account_id, &token, &account)
+        })?;
+        // Keep admission with the native task even if its invoking renderer goes
+        // away while serialization or detached-reader checkpointing is running.
+        tauri::async_runtime::spawn(async move {
+            let _operation = operation;
+            prepared.upload().await
+        })
+        .await
+        .map_err(|error| StoreError::Store {
+            message: format!("failed to join KEI upload operation: {error}"),
+        })?
+    }.await)
 }
 
 #[tauri::command(async)]
@@ -1039,7 +1049,7 @@ pub(crate) fn pds_checkpoint(
     state: State<'_, PersistentStoreState>,
     mode: CheckpointMode,
 ) -> Result<(), StoreError> {
-    with_store(state, |store| store.checkpoint(mode))
+    logged("pds_checkpoint", with_store(state, |store| store.checkpoint(mode)))
 }
 
 #[tauri::command(async)]
@@ -1047,39 +1057,41 @@ pub(crate) fn pds_snapshot_create(
     state: State<'_, PersistentStoreState>,
     reason: String,
 ) -> Result<SnapshotCreated, StoreError> {
-    let _operation = state.admit_renderer_operation()?;
-    let snapshot_operation =
-        state
-            .snapshot_operations
-            .lock()
-            .map_err(|error| StoreError::Store {
-                message: format!("persistent snapshot mutex poisoned: {error}"),
+    logged("pds_snapshot_create", (|| {
+        let _operation = state.admit_renderer_operation()?;
+        let snapshot_operation =
+            state
+                .snapshot_operations
+                .lock()
+                .map_err(|error| StoreError::Store {
+                    message: format!("persistent snapshot mutex poisoned: {error}"),
+                })?;
+        let started = std::time::Instant::now();
+        let (mut archive, scratch, current_bytes, inventory) = {
+            let mut store = state.store.lock().map_err(|error| StoreError::Store {
+                message: format!("persistent store mutex poisoned: {error}"),
             })?;
-    let started = std::time::Instant::now();
-    let (mut archive, scratch, current_bytes, inventory) = {
-        let mut store = state.store.lock().map_err(|error| StoreError::Store {
-            message: format!("persistent store mutex poisoned: {error}"),
-        })?;
-        let store = store.as_mut().ok_or_else(|| StoreError::Validation {
-            message: "persistent store has not been opened".to_owned(),
-        })?;
-        let archive = super::snapshot_archive::Archive::open(&store.snapshots_dir)?;
-        let inventory = store.active_readers.defer_asset_inventory();
-        let (scratch, current_bytes) =
-            super::snapshot::capture_scratch(store, &archive)?;
-        (archive, scratch, current_bytes, inventory)
-    };
-    let result = super::snapshot::archive_scratch(
-        &mut archive,
-        scratch,
-        current_bytes,
-        &reason,
-        started,
-    );
-    drop(inventory);
-    drop(archive);
-    drop(snapshot_operation);
-    result
+            let store = store.as_mut().ok_or_else(|| StoreError::Validation {
+                message: "persistent store has not been opened".to_owned(),
+            })?;
+            let archive = super::snapshot_archive::Archive::open(&store.snapshots_dir)?;
+            let inventory = store.active_readers.defer_asset_inventory();
+            let (scratch, current_bytes) =
+                super::snapshot::capture_scratch(store, &archive)?;
+            (archive, scratch, current_bytes, inventory)
+        };
+        let result = super::snapshot::archive_scratch(
+            &mut archive,
+            scratch,
+            current_bytes,
+            &reason,
+            started,
+        );
+        drop(inventory);
+        drop(archive);
+        drop(snapshot_operation);
+        result
+    })())
 }
 
 #[tauri::command(async)]
@@ -1088,11 +1100,11 @@ pub(crate) fn pds_snapshot_list(
 ) -> Result<Vec<SnapshotInfo>, StoreError> {
     #[cfg(target_os = "android")]
     {
-        with_snapshot_directory(&state, super::snapshot::list)
+        logged("pds_snapshot_list", with_snapshot_directory(&state, super::snapshot::list))
     }
     #[cfg(not(target_os = "android"))]
     {
-        with_store(state, PersistentStore::snapshot_list)
+        logged("pds_snapshot_list", with_store(state, PersistentStore::snapshot_list))
     }
 }
 
@@ -1317,15 +1329,15 @@ fn pds_asset_gc_execute_page(
 
 #[tauri::command(async)]
 pub(crate) fn pds_snapshot_restore_stage(state: State<'_, PersistentStoreState>, id:String, request_id:String) -> Result<super::StagingResult,StoreError> {
-    with_store_mut(state,|store|store.snapshot_restore_stage(&id,&request_id))
+    logged("pds_snapshot_restore_stage", with_store_mut(state,|store|store.snapshot_restore_stage(&id,&request_id)))
 }
 #[tauri::command(async)]
 pub(crate) fn pds_snapshot_restore_activate(state: State<'_, PersistentStoreState>, staging_id:String, expected_revision:i64, binding_authority:risunest_sync_wire::stamp::DecimalU64) -> Result<super::RevisionResult,StoreError> {
-    with_store_mut(state,|store|store.snapshot_restore_activate(&staging_id,expected_revision,binding_authority))
+    logged("pds_snapshot_restore_activate", with_store_mut(state,|store|store.snapshot_restore_activate(&staging_id,expected_revision,binding_authority)))
 }
 #[tauri::command(async)]
 pub(crate) fn pds_snapshot_restore_abort(state: State<'_, PersistentStoreState>, staging_id:String) -> Result<(),StoreError> {
-    with_store_mut(state,|store|store.snapshot_restore_abort(&staging_id))
+    logged("pds_snapshot_restore_abort", with_store_mut(state,|store|store.snapshot_restore_abort(&staging_id)))
 }
 
 #[derive(serde::Deserialize)]
@@ -1341,9 +1353,9 @@ pub(crate) fn pds_colliding_plugin_storage_keys(
     owner: String,
     keys: Vec<String>,
 ) -> Result<Vec<String>, StoreError> {
-    with_store(state, |store| {
+    logged("pds_colliding_plugin_storage_keys", with_store(state, |store| {
         store.colliding_plugin_storage_keys(&owner, &keys)
-    })
+    }))
 }
 
 #[tauri::command(async)]
@@ -1354,13 +1366,15 @@ pub(crate) fn pds_assign_plugin_storage(
     collision: super::commit::AssignCollision,
     expected_revision: i64,
 ) -> Result<AssignedPluginStorage, StoreError> {
-    let sources: Vec<(String, String)> = sources
-        .into_iter()
-        .map(|source| (source.owner, source.key))
-        .collect();
-    with_store_mut(state, |store| {
-        store.assign_plugin_storage(&sources, &owner, collision, expected_revision)
-    })
+    logged("pds_assign_plugin_storage", (|| {
+        let sources: Vec<(String, String)> = sources
+            .into_iter()
+            .map(|source| (source.owner, source.key))
+            .collect();
+        with_store_mut(state, |store| {
+            store.assign_plugin_storage(&sources, &owner, collision, expected_revision)
+        })
+    })())
 }
 
 #[tauri::command(async)]
@@ -1370,9 +1384,9 @@ pub(crate) fn pds_begin_plugin_claim_session(
     code_hash: String,
     runtime_instance: String,
 ) -> Result<Option<String>, StoreError> {
-    with_store(state, |store| {
+    logged("pds_begin_plugin_claim_session", with_store(state, |store| {
         store.begin_plugin_claim_session(&owner, &code_hash, &runtime_instance)
-    })
+    }))
 }
 
 #[tauri::command(async)]
@@ -1385,7 +1399,7 @@ pub(crate) fn pds_claim_plugin_storage_value(
     key: String,
     expected_revision: i64,
 ) -> Result<ClaimedPluginValue, StoreError> {
-    with_store_mut(state, |store| {
+    logged("pds_claim_plugin_storage_value", with_store_mut(state, |store| {
         store.claim_plugin_storage_value(
             &session_id,
             &owner,
@@ -1394,14 +1408,14 @@ pub(crate) fn pds_claim_plugin_storage_value(
             &key,
             expected_revision,
         )
-    })
+    }))
 }
 
 #[tauri::command(async)]
 pub(crate) fn pds_close_plugin_claim_eligibility(
     state: State<'_, PersistentStoreState>,
 ) -> Result<(), StoreError> {
-    with_store(state, |store| store.close_plugin_claim_eligibility())
+    logged("pds_close_plugin_claim_eligibility", with_store(state, |store| store.close_plugin_claim_eligibility()))
 }
 
 #[tauri::command(async)]
@@ -1409,7 +1423,7 @@ pub(crate) fn pds_close_plugin_claim_session(
     state: State<'_, PersistentStoreState>,
     session_id: String,
 ) -> Result<(), StoreError> {
-    with_store(state, |store| store.close_plugin_claim_session(&session_id))
+    logged("pds_close_plugin_claim_session", with_store(state, |store| store.close_plugin_claim_session(&session_id)))
 }
 
 #[tauri::command(async)]
@@ -1417,9 +1431,9 @@ pub(crate) fn pds_hydrate_plugin_device_storage(
     state: State<'_, PersistentStoreState>,
     owner: String,
 ) -> Result<PluginDeviceHydration, StoreError> {
-    with_store(state, |store| {
+    logged("pds_hydrate_plugin_device_storage", with_store(state, |store| {
         store.device_store()?.hydrate_plugin_device_storage(&owner)
-    })
+    }))
 }
 
 #[tauri::command(async)]
@@ -1429,11 +1443,11 @@ pub(crate) fn pds_read_plugin_device_value(
     space: String,
     key: String,
 ) -> Result<Option<String>, StoreError> {
-    with_store(state, |store| {
+    logged("pds_read_plugin_device_value", with_store(state, |store| {
         store
             .device_store()?
             .read_plugin_device_value(&owner, &space, &key)
-    })
+    }))
 }
 
 #[tauri::command(async)]
@@ -1442,18 +1456,18 @@ pub(crate) fn pds_list_plugin_device_keys(
     owner: String,
     space: String,
 ) -> Result<Vec<String>, StoreError> {
-    with_store(state, |store| {
+    logged("pds_list_plugin_device_keys", with_store(state, |store| {
         store.device_store()?.list_plugin_device_keys(&owner, &space)
-    })
+    }))
 }
 
 #[tauri::command(async)]
 pub(crate) fn pds_list_plugin_device_storage(
     state: State<'_, PersistentStoreState>,
 ) -> Result<Vec<PluginDeviceListItem>, StoreError> {
-    with_store(state, |store| {
+    logged("pds_list_plugin_device_storage", with_store(state, |store| {
         store.device_store()?.list_plugin_device_storage()
-    })
+    }))
 }
 
 #[tauri::command(async)]
@@ -1463,16 +1477,18 @@ pub(crate) fn pds_write_plugin_device_values(
     owner: String,
     mutations: Vec<PluginDeviceMutation>,
 ) -> Result<(), StoreError> {
-    let changed = with_store_mut(state, |store| {
-        let device = store.device_store_mut()?;
-        let before = device.revision()?;
-        device.write_plugin_device_values(&owner, &mutations)?;
-        Ok(device.revision()? != before)
-    })?;
-    if changed {
-        crate::server_sync::events::notify_device_changed(&app);
-    }
-    Ok(())
+    logged("pds_write_plugin_device_values", (|| {
+        let changed = with_store_mut(state, |store| {
+            let device = store.device_store_mut()?;
+            let before = device.revision()?;
+            device.write_plugin_device_values(&owner, &mutations)?;
+            Ok(device.revision()? != before)
+        })?;
+        if changed {
+            crate::server_sync::events::notify_device_changed(&app);
+        }
+        Ok(())
+    })())
 }
 
 #[tauri::command(async)]
@@ -1480,7 +1496,7 @@ pub(crate) fn pds_get_device_setting(
     state: State<'_, PersistentStoreState>,
     key: String,
 ) -> Result<Option<Value>, StoreError> {
-    with_store(state, |store| store.device_store()?.read_setting(&key))
+    logged("pds_get_device_setting", with_store(state, |store| store.device_store()?.read_setting(&key)))
 }
 
 /// A null value removes the setting.
@@ -1490,13 +1506,13 @@ pub(crate) fn pds_set_device_setting(
     key: String,
     value: Option<Value>,
 ) -> Result<(), StoreError> {
-    with_store(state, |store| {
+    logged("pds_set_device_setting", with_store(state, |store| {
         let device = store.device_store()?;
         match value {
             Some(value) => device.write_setting(&key, &value),
             None => device.remove_setting(&key),
         }
-    })
+    }))
 }
 
 #[tauri::command(async)]
@@ -1505,9 +1521,9 @@ pub(crate) fn pds_patch_device_setting(
     key: String,
     entries: serde_json::Map<String, Value>,
 ) -> Result<(), StoreError> {
-    with_store_mut(state, |store| {
+    logged("pds_patch_device_setting", with_store_mut(state, |store| {
         store.device_store_mut()?.patch_setting(&key, &entries)
-    })
+    }))
 }
 
 /// Answers in request order so one call can fill the whole boot cache.
@@ -1516,7 +1532,7 @@ pub(crate) fn pds_read_device_settings(
     state: State<'_, PersistentStoreState>,
     keys: Vec<String>,
 ) -> Result<Vec<Option<Value>>, StoreError> {
-    with_store(state, |store| store.device_store()?.read_settings(&keys))
+    logged("pds_read_device_settings", with_store(state, |store| store.device_store()?.read_settings(&keys)))
 }
 
 #[derive(serde::Serialize)]
@@ -1546,7 +1562,7 @@ pub(crate) struct PluginPermissionState {
 pub(crate) fn pds_read_plugin_permissions(
     state: State<'_, PersistentStoreState>,
 ) -> Result<PluginPermissionState, StoreError> {
-    with_store(state, |store| {
+    logged("pds_read_plugin_permissions", with_store(state, |store| {
         let device = store.device_store()?;
         Ok(PluginPermissionState {
             permissions: device
@@ -1568,7 +1584,7 @@ pub(crate) fn pds_read_plugin_permissions(
                 })
                 .collect(),
         })
-    })
+    }))
 }
 
 #[tauri::command(async)]
@@ -1578,11 +1594,11 @@ pub(crate) fn pds_write_plugin_permission(
     permission: String,
     granted: bool,
 ) -> Result<(), StoreError> {
-    with_store(state, |store| {
+    logged("pds_write_plugin_permission", with_store(state, |store| {
         store
             .device_store()?
             .write_plugin_permission(&code_hash, &permission, granted)
-    })
+    }))
 }
 
 #[tauri::command(async)]
@@ -1592,22 +1608,22 @@ pub(crate) fn pds_write_plugin_permission_grant(
     permission: String,
     last_grant_at: i64,
 ) -> Result<(), StoreError> {
-    with_store(state, |store| {
+    logged("pds_write_plugin_permission_grant", with_store(state, |store| {
         store.device_store()?.write_plugin_permission_grant(
             &plugin_name,
             &permission,
             last_grant_at,
         )
-    })
+    }))
 }
 
 #[tauri::command(async)]
 pub(crate) fn pds_clear_plugin_permissions(
     state: State<'_, PersistentStoreState>,
 ) -> Result<(), StoreError> {
-    with_store_mut(state, |store| {
+    logged("pds_clear_plugin_permissions", with_store_mut(state, |store| {
         store.device_store_mut()?.clear_plugin_permissions()
-    })
+    }))
 }
 
 #[derive(serde::Serialize)]
@@ -1656,7 +1672,7 @@ fn set_section_participation(
 pub(crate) fn pds_read_section_participation(
     state: State<'_, PersistentStoreState>,
 ) -> Result<Vec<SectionParticipationRow>, StoreError> {
-    read_section_participation(&state)
+    logged("pds_read_section_participation", read_section_participation(&state))
 }
 
 #[tauri::command(async)]
@@ -1665,7 +1681,7 @@ pub(crate) fn pds_set_section_participating(
     section: String,
     participating: bool,
 ) -> Result<(), StoreError> {
-    set_section_participation(&state, &section, participating)
+    logged("pds_set_section_participating", set_section_participation(&state, &section, participating))
 }
 
 #[cfg(test)]
@@ -2263,6 +2279,35 @@ mod tests {
                 .expect("the failure is logged");
             assert!(entry.message.contains(summary));
             assert!(!entry.message.contains("private-payload-value"));
+        }
+    }
+
+    #[test]
+    fn storage_commands_log_their_own_failures() {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(PersistentStoreState::default());
+        assert!(pds_read_root(app.state(), None).is_err());
+        assert!(pds_archive_character(app.state(), "synthetic".into(), 0, String::new()).is_err());
+        assert!(data_health::pds_data_health_repair_plan(app.state()).is_err());
+        assert!(hypa::pds_hypa_embedding_usage(app.state()).is_err());
+        assert!(super::super::sync_selection::pds_lww_binding_content(app.state()).is_err());
+        for (command, file) in [
+            ("pds_read_root", "commands.rs:"),
+            ("pds_archive_character", "commands.rs:"),
+            ("pds_data_health_repair_plan", "data_health.rs:"),
+            ("pds_hypa_embedding_usage", "hypa.rs:"),
+            ("pds_lww_binding_content", "sync_selection.rs:"),
+        ] {
+            let entry = crate::native_log::global_state()
+                .tail(None)
+                .into_iter()
+                .rev()
+                .find(|entry| entry.message.starts_with(&format!("{command} failed: code=validation cause=")))
+                .unwrap_or_else(|| panic!("{command} logs its failure"));
+            assert_eq!((entry.level.as_str(), entry.target.as_str()), ("error", "native-command"));
+            assert!(entry.message.contains(file), "{}", entry.message);
         }
     }
 

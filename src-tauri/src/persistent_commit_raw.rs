@@ -3,6 +3,7 @@ use crate::persistent_store::{
     commands::with_store_mut, AssetAlias, RevisionResult, StoreError, StoreResult, WorkingSetCommit,
 };
 use serde::Deserialize;
+use crate::native_log::logged;
 use tauri::{
     ipc::{InvokeBody, Request},
     AppHandle, Manager, WebviewWindow,
@@ -35,14 +36,14 @@ pub(crate) fn pds_commit_raw(
     request: Request<'_>,
 ) -> StoreResult<RevisionResult> {
     if window.label() != "main" {
-        return Err(StoreError::Validation {
+        return logged("pds_commit_raw", Err(StoreError::Validation {
             message: "commit transport requires the main webview".to_owned(),
-        });
+        }));
     }
-    match request.body() {
+    logged("pds_commit_raw", match request.body() {
         InvokeBody::Raw(bytes) => commit_bytes(&app, bytes),
         _ => Err(StoreError::RawBodyUnavailable),
-    }
+    })
 }
 
 #[cfg(test)]
