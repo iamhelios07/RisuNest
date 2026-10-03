@@ -685,12 +685,8 @@ mod tests {
         assert!(reply.get("cause").is_none());
         let returned: ProviderError = serde_json::from_value(reply).unwrap();
         assert!(returned.cause.0.is_none());
-        let poisoned = std::sync::Mutex::new(());
-        let _ = std::panic::catch_unwind(|| {
-            let _guard = poisoned.lock().unwrap();
-            panic!("synthetic poison");
-        });
-        let error = poisoned.lock().map_err(|error| ProviderError::new(ErrorKind::Transient).caused(&error)).unwrap_err();
+        let poisoned: std::sync::LockResult<()> = Err(std::sync::PoisonError::new(()));
+        let error = poisoned.map_err(|error| ProviderError::new(ErrorKind::Transient).caused(&error)).unwrap_err();
         assert!(error.cause.0.unwrap().contains("poisoned"));
     }
 
