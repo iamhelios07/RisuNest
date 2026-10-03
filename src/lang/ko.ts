@@ -70,34 +70,11 @@ export const languageKorean = {
     portableBackup: {
         preservedSourceHelp:
             '복원한 라이브러리에 필요하지 않은 파일을 원본 보존 영역에 별도 보관했습니다. 자동 동기화되지 않으며 해당 보존 영역에서 삭제할 수 있습니다.',
-        title: 'RisuNest 백업',
         export: 'RisuNest 전체 백업 (.risunest)',
         restore: '백업 파일 복원',
-        library: '라이브러리와 첨부 파일',
-        device: '기기 플러그인 데이터',
         localStorage: '플러그인 로컬 저장소',
         localData: '플러그인 로컬 데이터',
         database: '플러그인 데이터베이스',
-        settings: '기기 설정',
-        chooseExport: '백업할 영역 선택',
-        chooseRestore: '복원할 영역 선택',
-        helpExport:
-            '선택한 기기 데이터는 앱을 유지보수 모드로 재시작한 뒤 캡처합니다.',
-        helpRestore:
-            '선택한 영역은 이 기기에만 있는 키를 포함해 교체됩니다. 선택하지 않은 영역은 유지됩니다. 자동 백업은 남기지 않습니다. 기존 데이터를 보관하려면 먼저 직접 백업하세요.',
-        helpRestoreFirstRun:
-            '선택한 영역을 이 기기로 가져옵니다. 선택하지 않은 영역은 나중에 설정에서 같은 파일로 복원할 수 있습니다.',
-        damaged: '이 백업에는 문제가 {0}건 있습니다. 문제가 없는 항목을 가져올 수 있습니다.',
-        choosePart: '선택한 항목만 복원',
-        choosePartHelp:
-            '현재 라이브러리는 선택한 항목으로 교체되며, 선택하지 않은 항목은 복원되지 않습니다.',
-        itemCharacters: '캐릭터',
-        itemPresets: '프리셋',
-        itemPlugins: '플러그인 데이터',
-        itemDamaged: '문제 {0}건',
-        repair: '손상된 원본을 보존한 파일입니다. 데이터 점검에서 수정한 뒤 사용할 수 있습니다.',
-        continue: '계속',
-        cancel: '취소',
         dbOnly: 'DB만 내보내기 (.risudat)',
         risuai: 'RisuAI용 내보내기 (.bin)',
         pocket: 'PocketRisu용 내보내기 (.bin)',
@@ -128,14 +105,6 @@ export const languageKorean = {
             "wait": '계속 기다리기',
             "stillRunning": '백업 작업이 진행 중이며, 나중에 다시 확인할 수 있습니다.',
         },
-        "nextItems": '다음',
-        "previousItems": '이전',
-        "searchItems": '항목 검색',
-        "wholeLibrary": '전체 라이브러리',
-        "excludeLibrary": "라이브러리 제외",
-        "skipLibrary": '복원 안 함',
-        "danglingLinks": '선택하지 않은 항목을 가리키는 연결은 끊어진 상태로 복원됩니다.',
-        "choosePartFirstRunHelp": '선택한 항목을 라이브러리로 가져옵니다.',
     },
     previousResponseCandidate: '이전 응답',
     nextResponseCandidate: '다음 응답',
@@ -2355,7 +2324,6 @@ export const languageKorean = {
             restoreSnapshot: '복원',
             snapshotReasons: {
             dataHealthRepair: "데이터 수정 전 보관",
-            serverSyncRecovery: "서버 비교 전 보관",
 
                 manual: '직접 만듦',
                 periodic: '자동',
