@@ -21,7 +21,7 @@ import {
 import { getV2PluginAPIs } from '../plugins/plugins.svelte'
 import type { Database } from './database.svelte'
 import type { PersistentDataStore } from './persistentDataStore'
-import { getDatabase, setDatabaseLite } from './database.svelte'
+import { getDatabase, setDatabase, setDatabaseLite } from './database.svelte'
 import {
     configurePersistentDataRuntime,
     createProductionStateAdapter,
@@ -46,6 +46,82 @@ afterEach(() => {
 })
 
 describe('production persistent working-set publication', () => {
+    it.each(['metadata', 'presets', 'delete', 'upsert', 'module'] as const)('keeps sparse activated root defaults local during the first targeted %s edit', async (scope) => {
+        const initial = {username: 'Before', botPresets: [{id: 'initial-preset', name: 'Initial preset'}], botPresetsId: 0, characters: [], plugins: []} as unknown as Database
+        const store = new IndexedDbPersistentDataStore(`sparse-activated-root-defaults-${scope}`, new IDBFactory(), IDBKeyRange)
+        await store.open()
+        await store.replaceFromDatabase(initial)
+        setDatabase(structuredClone(initial))
+        selectedCharID.set(-1)
+        const runtime = createPersistentDataRuntime({store, state: createProductionStateAdapter(), prepareDatabase: async (value) => value})
+        await runtime.initializeActiveWorkingSet(getDatabase())
+        await runtime.withPausedPersistentWrites('sparse-activation', async (token) => {
+            const guard = runtime.beginActivatedLibraryGuard(token)
+            await store.replaceFromDatabase({...initial, characters: [{type: 'character', chaId: 'sparse-owner', name: 'Owner', chatPage: 0,
+                chatFolders: [], chats: [{id: 'sparse-chat', message: []}]}]} as unknown as Database, token.revision)
+            await runtime.refreshActivatedLibraryUnderPause(token)
+            guard.complete()
+        })
+        const commit = vi.spyOn(store, 'commit')
+        await runtime.flushPendingDataLocally('sparse-activated-no-op')
+        expect(commit).not.toHaveBeenCalled()
+        if (scope === 'metadata') await runtime.mutatePersistentCharacterDetail('sparse-owner', 'first-targeted-edit', ({character}) => { if (character.type === 'group') throw new Error('Expected character'); character.desc = 'Real targeted edit' })
+        if (scope === 'presets') await runtime.mutatePersistentPresets('first-targeted-preset', (state) => { state.root.username = 'Explicit root edit' })
+        if (scope === 'delete') await runtime.deletePersistentCharacterWithGroupReferences('sparse-owner', 'first-targeted-delete')
+        if (scope === 'upsert') await runtime.upsertPersistentCompleteCharacter('new-owner', 'first-targeted-upsert', () => ({type: 'character', chaId: 'new-owner', name: 'New', chatPage: 0, chatFolders: [], chats: []}) as Database['characters'][number])
+        if (scope === 'module') await runtime.appendPersistentRootModule('first-targeted-module', {module: {id: 'new-module', name: 'New module', description: ''}, assetAliases: [], ownerHead: {present: false, manifestHash: null, entryCount: 0}})
+        await runtime.flushPendingDataLocally('after-targeted-edit')
+        expect(commit).toHaveBeenCalledOnce()
+        if (scope === 'metadata') expect(commit.mock.calls[0][0]).toMatchObject({unitMutations: [{key: '["character","sparse-owner","desc"]', type: 'set', value: 'Real targeted edit'}]})
+        expect(commit.mock.calls.flatMap(([input]) => input.rootMutations ?? []).filter((value) => value.key !== 'characterOrder')).toEqual(scope === 'presets' ? [{type: 'set', key: 'username', value: 'Explicit root edit'}] : [])
+        expect((await store.readRoot()).value).not.toHaveProperty('translatorMaxResponse')
+    })
+
+    it.each([false, true])('retains explicit and concurrent root deltas without copying defaults (failure=%s)', async (fail) => {
+        const initial = {username: 'Before', translator: 'Before', botPresets: [{id: 'preset', name: 'Preset'}], botPresetsId: 0, personas: [{id: 'persona', name: 'Persona', prompt: ''}], selectedPersona: 0, plugins: [],
+            opaqueRoot: {before: true}, removedRoot: 'Remove', characters: [{type: 'character', chaId: 'owner', name: 'Owner', chats: []}]} as unknown as Database
+        const store = new IndexedDbPersistentDataStore(`sparse-concurrent-root-${fail}`, new IDBFactory(), IDBKeyRange)
+        await store.open()
+        await store.replaceFromDatabase(initial)
+        setDatabase(structuredClone(initial))
+        selectedCharID.set(-1)
+        const runtime = createPersistentDataRuntime({store, state: createProductionStateAdapter(), prepareDatabase: async (value) => value})
+        await runtime.initializeActiveWorkingSet(getDatabase())
+        const commit = vi.spyOn(store, 'commit')
+        if (fail) commit.mockRejectedValueOnce(new Error('Synthetic root commit failure'))
+        let attempts = 0
+        const mutate = () => runtime.mutatePersistentCharacterDetail('owner', 'explicit-concurrent-root', async ({root, character}) => {
+            const concurrent = ++attempts === 1 ? 'Concurrent edit' : 'Concurrent retry edit'
+            root.translator = 'Callback edit'
+            ;(root as unknown as Record<string, unknown>).opaqueRoot = {explicit: true}
+            ;(root as unknown as Record<string, unknown>).nullableRoot = null
+            if (character.type === 'group') throw new Error('Expected character')
+            character.desc = 'Explicit detail'
+            await Promise.resolve()
+            getDatabase().translator = concurrent
+            const live = getDatabase() as unknown as Record<string, unknown>
+            delete live.removedRoot
+            live.addedRoot = {concurrent: true}
+        })
+        if (fail) {
+            await expect(mutate()).rejects.toThrow('Synthetic root commit failure')
+            expect((await store.readRoot()).value).toMatchObject({username: 'Before', translator: 'Before', opaqueRoot: {before: true}, removedRoot: 'Remove'})
+            expect((await store.readCharacter('owner'))!.value).not.toHaveProperty('desc')
+            await runtime.flushPendingDataLocally('retry-live-root-deltas')
+            expect((await store.readRoot()).value.translator).toBe('Concurrent edit')
+        }
+        await mutate()
+        const accepted = (await store.readRoot()).value
+        expect(accepted).toMatchObject({translator: 'Callback edit', opaqueRoot: {explicit: true}, addedRoot: {concurrent: true}, nullableRoot: null})
+        expect(accepted).not.toHaveProperty('removedRoot')
+        expect(accepted).not.toHaveProperty('translatorMaxResponse')
+        expect((await store.readCharacter('owner'))!.value).toMatchObject({desc: 'Explicit detail'})
+        await runtime.flushPendingDataLocally('remaining-concurrent-view')
+        expect((await store.readRoot()).value.translator).toBe(fail ? 'Concurrent retry edit' : 'Concurrent edit')
+        const roots = commit.mock.calls.flatMap(([input]) => input.rootMutations ?? [])
+        expect(roots.map((value) => value.key).filter((key) => !['translator', 'opaqueRoot', 'removedRoot', 'addedRoot', 'nullableRoot'].includes(key))).toEqual([])
+    })
+
     it('observes and persists edits through a retained module after a preset operation', async () => {
         const initial = {
             username: 'Before', botPresets: [], botPresetsId: 0, characters: [], plugins: [],

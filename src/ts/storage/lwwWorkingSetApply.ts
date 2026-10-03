@@ -118,7 +118,8 @@ export async function applyLwwWorkingSetUnits(
             if (id === 'botPresetsId' && typeof before[id] === 'string') before[id] = Math.max(0, database.botPresets.findIndex((value) => value?.['id'] === before[id]))
             if (id === 'selectedPersona' && typeof before[id] === 'string') before[id] = Math.max(0, database.personas?.findIndex((value) => value.id === before[id]) ?? 0)
             patchField(database, before, remote, id)
-            ;(baseline.root as unknown as Record<string, unknown>)[id] = canonicalClone((root as unknown as Record<string, unknown>)[id])
+            if (Object.hasOwn(root, id)) (baseline.root as unknown as Record<string, unknown>)[id] = canonicalClone((root as unknown as Record<string, unknown>)[id])
+            else delete (baseline.root as unknown as Record<string, unknown>)[id]
         } else if (kind === 'character' || kind === 'group-members') {
             const live = charactersById.get(id)
             const before = baselineById.get(id)
