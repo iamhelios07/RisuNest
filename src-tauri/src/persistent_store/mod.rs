@@ -1985,43 +1985,11 @@ impl PersistentStore {
         self.lww_commit_replacement(&header,&prepared.staging_id)
     }
 
-    pub(crate) fn finish_prepared_replace_with_app_kv(
-        &mut self,
-        prepared: PreparedReplaceCommit,
-        key: &str,
-        value: &Value,
-    ) -> StoreResult<RevisionResult> {
-        commit::replace_commit_with_app_kv(
-            &mut self.connection,
-            &prepared.staging_id,
-            Some(prepared.revision),
-            Some((key, value)),
-        )
-    }
-
-    /// Normal external sync receive, after complete staged logical/payload
-    /// validation and under the existing replacement fence and file(true).
-    /// The remote base and activation are committed atomically.
     /// The library rows themselves, for a test that has to look at what a
     /// receive did rather than at what it reported.
     #[cfg(test)]
     pub(crate) fn library_rows(&self) -> &rusqlite::Connection {
         &self.connection
-    }
-
-    pub(crate) fn finish_external_receive(
-        &mut self,
-        prepared: PreparedReplaceCommit,
-        job: &str,
-        records: &std::collections::BTreeMap<String, String>,
-    ) -> StoreResult<RevisionResult> {
-        commit::replace_commit_from_external(
-            &mut self.connection,
-            &prepared.staging_id,
-            prepared.revision,
-            job,
-            records,
-        )
     }
 
     pub(crate) fn replace_abort(&mut self, staging_id: &str) -> StoreResult<()> {

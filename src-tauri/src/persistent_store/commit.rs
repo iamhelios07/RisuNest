@@ -5,7 +5,7 @@ use super::{
 };
 use super::plugin_owner;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 pub(super) fn incremental_commit<T>(
     connection: &mut Connection,
@@ -1302,14 +1302,6 @@ pub(super) fn put_asset_alias(
     Ok(())
 }
 
-pub(super) fn replace_commit(
-    connection: &mut Connection,
-    staging_id: &str,
-    expected_revision: Option<i64>,
-) -> StoreResult<RevisionResult> {
-    replace_commit_with_app_kv(connection, staging_id, expected_revision, None)
-}
-
 pub(super) fn replace_commit_lww(
     connection: &mut Connection,
     staging_id: &str,
@@ -1378,88 +1370,6 @@ pub(super) fn replace_commit_lww(
     set_active(&transaction,revision,&generation)?;
     transaction.execute("INSERT INTO lww_requests VALUES(?1,?2,?3)",params![header.request_id,digest,revision])?;
     transaction.commit()?;Ok(RevisionResult{revision})
-}
-
-pub(super) fn replace_commit_with_app_kv(
-    connection: &mut Connection,
-    staging_id: &str,
-    expected_revision: Option<i64>,
-    app_kv: Option<(&str, &Value)>,
-) -> StoreResult<RevisionResult> {
-    replace_commit_transaction(connection, staging_id, expected_revision, app_kv, None)
-}
-
-pub(super) fn replace_commit_from_external(
-    connection: &mut Connection,
-    staging_id: &str,
-    expected_revision: i64,
-    job: &str,
-    records: &BTreeMap<String, String>,
-) -> StoreResult<RevisionResult> {
-    replace_commit_transaction(
-        connection,
-        staging_id,
-        Some(expected_revision),
-        None,
-        Some((job, records)),
-    )
-}
-
-fn replace_commit_transaction(
-    connection: &mut Connection,
-    staging_id: &str,
-    expected_revision: Option<i64>,
-    app_kv: Option<(&str, &Value)>,
-    external_job: Option<(&str, &BTreeMap<String, String>)>,
-) -> StoreResult<RevisionResult> {
-    if let Some((key, _)) = app_kv {
-        super::validate_app_kv_key(key)?;
-    }
-    let serialized_app_kv = app_kv
-        .map(|(key, value)| serde_json::to_string(value).map(|value| (key, value)))
-        .transpose()?;
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    require_staging(&transaction, staging_id)?;
-    let actual_revision = current_revision(&transaction)?;
-    if let Some(expected) = expected_revision {
-        if expected != actual_revision {
-            return Err(StoreError::RevisionConflict {
-                expected,
-                actual: actual_revision,
-            });
-        }
-    }
-
-    if let Some((job, _)) = external_job {
-        super::external_storage_state::begin_receive_activation(&transaction, job)?;
-    }
-    let active = active_generation(&transaction)?;
-    let revision = actual_revision + 1;
-    let generation = format!("revision-{revision}");
-    super::plugin_claim_eligibility::capture(&transaction, staging_id)?;
-    delete_generation(&transaction, &active)?;
-    move_generation(&transaction, staging_id, &generation)?;
-    super::content_change_index::full_replacement(&transaction, &generation, revision)?;
-    if external_job.is_none() {
-        super::sync_selection::replaced(&transaction)?;
-    }
-    set_active(&transaction, revision, &generation)?;
-    if let Some((job, records)) = external_job {
-        super::external_storage_state::finish_receive_activation(
-            &transaction,
-            job,
-            super::external_storage_state::BaseRecords::Complete(records),
-        )?;
-    }
-    if let Some((key, value)) = serialized_app_kv {
-        transaction.execute(
-            "INSERT INTO app_kv (key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![key, value],
-        )?;
-    }
-    transaction.commit()?;
-    Ok(RevisionResult { revision })
 }
 
 pub(super) fn validate_replace_commit(
