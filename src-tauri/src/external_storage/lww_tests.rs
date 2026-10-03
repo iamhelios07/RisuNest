@@ -1658,3 +1658,191 @@ fn native_unpublished_clock_repair_preserves_values_and_never_repairs_dispatched
         assert_eq!(after_bytes, bytes);
     })
 }
+fn third_device(f: &CycleFixture) -> (tempfile::TempDir, PersistentStore, ExternalLwwEngine) {
+    let directory = tempfile::tempdir().unwrap();
+    let store = PersistentStore::open(directory.path()).unwrap();
+    let engine = ExternalLwwEngine {
+        provider: f.provider.clone(),
+        repository: fake::repository(),
+        library: f.receiver.library.clone(),
+        root_key: f.receiver.root_key.clone(),
+        admission: Some(Admission::synthetic(super::runtime::now_ms())),
+        connection_id: "third".into(),
+        connection_root: directory.path().into(),
+        capabilities: f.receiver.capabilities.clone(),
+        descriptor: f.receiver.descriptor.clone(),
+    };
+    (directory, store, engine)
+}
+fn apply_all(store: &mut PersistentStore, requests: &[crate::persistent_store::lww::StageReceive]) {
+    for request in requests {
+        store.lww_stage_receive(request).unwrap();
+        store
+            .lww_apply_receive(&crate::persistent_store::lww::ApplyReceive {
+                header: request.header.clone(),
+                generating: Vec::new(),
+            })
+            .unwrap();
+        store.lww_finish_receive(&request.header).unwrap();
+    }
+}
+fn progress_writers(store: &PersistentStore) -> Vec<String> {
+    store
+        .lww_receive_progress(DecimalU64(0))
+        .unwrap()
+        .into_iter()
+        .filter_map(|progress| progress.writer_id)
+        .collect()
+}
+#[test]
+fn behind_recovery_carries_the_published_catalog_once_across_writer_requests() {
+    run(async {
+        let mut f = CycleFixture::new();
+        let cancel = Cancellation::default();
+        set(&mut f.a, &["root", "language"], serde_json::json!("from-a"));
+        f.publish_a().await;
+        set(&mut f.b, &["root", "loreBookDepth"], serde_json::json!(3));
+        f.receiver.publish(&mut f.b, DecimalU64(0), &[], &cancel).await.unwrap();
+        let job = tempfile::tempdir().unwrap();
+        f.sender
+            .compact_published(job.path(), "00000000-0000-4000-8000-0000000000b1",
+                &f.a.lww_clock_state().unwrap().writer_id, &f.sender.capabilities, &cancel, None)
+            .await
+            .unwrap();
+        for object in f.sender.listing(&cancel).await.unwrap() {
+            f.provider.delete_object(&f.sender.repository, &object.locator, &cancel).await.unwrap();
+        }
+        let (_directory, mut store, engine) = third_device(&f);
+        let requests = engine.receive_requests(&mut store, DecimalU64(0), &cancel).await.unwrap();
+        assert_eq!(requests.len(), 2, "one progress request per covered writer");
+        let carried = requests.iter().map(|request| request.changes.len()).sum::<usize>();
+        let catalog = requests.iter().map(|request| request.changes.len()).max().unwrap();
+        assert!(catalog >= 2);
+        assert_eq!(carried, catalog, "the published catalog is carried by one request only");
+        assert_eq!(requests[0].changes.len(), catalog, "progress never advances before the catalog applies");
+        apply_all(&mut store, &requests);
+        let root = store.read_root(None).unwrap().value;
+        assert_eq!(root["language"], "from-a");
+        assert_eq!(root["loreBookDepth"], 3);
+        let mut writers = progress_writers(&store);
+        writers.sort();
+        let mut expected = vec![
+            f.a.lww_clock_state().unwrap().writer_id,
+            f.b.lww_clock_state().unwrap().writer_id,
+        ];
+        expected.sort();
+        assert_eq!(writers, expected);
+        assert!(engine.receive_requests(&mut store, DecimalU64(0), &cancel).await.unwrap().is_empty());
+    })
+}
+#[test]
+fn a_future_stamped_writer_is_held_while_other_writers_are_received() {
+    run(async {
+        let mut f = CycleFixture::new();
+        let cancel = Cancellation::default();
+        set(&mut f.a, &["root", "language"], serde_json::json!("future"));
+        f.publish_a().await;
+        let id = f.provider.uploaded_ids()[0].clone();
+        let bytes = f.provider.contents(&id).unwrap();
+        f.provider.forget(&id);
+        let (writer, seq, _) = parse_segment_object_id(&id).unwrap();
+        let mut payload = lww_segment::open(&bytes, &f.sender.library, writer, seq, &[7; 32]).unwrap();
+        payload.changes[0].stamp.physical_ms = DecimalU64(super::runtime::now_ms() + 600_000);
+        let (sealed, _) = lww_segment::seal(&payload, &[7; 32]).unwrap();
+        let future = segment_object_id(writer, seq, &lww_segment::digest(&sealed)).unwrap();
+        f.provider.seed(&future, ObjectRole::Segment, sealed);
+        set(&mut f.b, &["root", "loreBookDepth"], serde_json::json!(5));
+        f.receiver.publish(&mut f.b, DecimalU64(0), &[], &cancel).await.unwrap();
+        let (_directory, mut store, engine) = third_device(&f);
+        assert_eq!(engine.receive_and_apply(&mut store, DecimalU64(0), &[], &cancel).await.unwrap(), 1);
+        assert_eq!(store.read_root(None).unwrap().value["loreBookDepth"], 5);
+        assert_eq!(progress_writers(&store), [f.b.lww_clock_state().unwrap().writer_id]);
+        assert_eq!(
+            engine.receive_requests(&mut store, DecimalU64(0), &cancel).await.err().unwrap().kind,
+            ErrorKind::ClockSkew,
+            "a held writer still reports skew when nothing else arrives"
+        );
+        assert_eq!(progress_writers(&store), [f.b.lww_clock_state().unwrap().writer_id]);
+    })
+}
+#[test]
+fn segment_assembly_hashes_each_page_a_bounded_number_of_times() {
+    run(async {
+        let mut f = CycleFixture::new();
+        let count = 300;
+        let mut units = vec![UnitMutation::Set {
+            key: UnitKey::new(&["exists", "character", "char"]).unwrap(),
+            value: serde_json::json!({"type":"character"}),
+        }];
+        for index in 0..count {
+            units.push(UnitMutation::Set {
+                key: UnitKey::new(&["exists", "conversation", "char", &format!("conv-{index}")]).unwrap(),
+                value: serde_json::json!(true),
+            });
+        }
+        f.a.commit(&WorkingSetCommit { expected_revision: f.a.revision().unwrap(), unit_mutations: Some(units), ..Default::default() }).unwrap();
+        let conversations = (0..count).map(|index| ConversationMutation::ReplaceRange {
+            character_id: "char".into(), conversation_id: format!("conv-{index}"), start: 0, delete_count: 0,
+            messages: vec![serde_json::json!({"chatId":format!("synthetic-{index}"),"data":"x".repeat(4096)})],
+            conversation: None, configured_index: None,
+        }).collect();
+        f.a.commit(&WorkingSetCommit { expected_revision: f.a.revision().unwrap(), conversations: Some(conversations), ..Default::default() }).unwrap();
+        lww_segment::reset_hash_bytes();
+        assert_eq!(f.publish_a().await.segments.0, 1);
+        let hashed = lww_segment::take_hash_bytes();
+        let object = f.sender.listing(&Cancellation::default()).await.unwrap().remove(0);
+        let bytes = f.provider.contents(&object.locator.object).unwrap();
+        let (writer, seq, _) = parse_segment_object_id(&object.locator.object).unwrap();
+        let payload = lww_segment::open(&bytes, &f.sender.library, writer, seq, &f.sender.root_key).unwrap();
+        assert!(payload.message_pages.len() >= count);
+        assert!(hashed <= 24 * bytes.len() as u64, "hashed {hashed} bytes to publish a {} byte segment", bytes.len());
+    })
+}
+#[test]
+fn captured_large_bodies_reserve_the_longest_locator_sealing_can_add() {
+    let repository = fake::repository();
+    let mut placeholder = lww_segment::Segment::new("synthetic-lww-library", "00000000-0000-4000-8000-000000000001", 1);
+    for index in 0..3u8 {
+        placeholder.large_bodies.insert(risunest_sync_wire::hash(&[index]), lww_segment::LargeBody {
+            object_id: format!("00000000-0000-4000-8000-00000000010{index}"),
+            sha256: "0".repeat(64),
+            byte_length: DecimalU64(0),
+            plaintext_byte_length: DecimalU64(lww_segment::SMALL_BODY_BYTES as u64 + 1),
+            locator: None,
+        });
+    }
+    let mut filled = placeholder.clone();
+    for body in filled.large_bodies.values_mut() {
+        body.sha256 = "f".repeat(64);
+        body.byte_length = DecimalU64(u64::MAX);
+        let locator = RemoteLocator {
+            connection_identity: repository.connection_identity.clone(),
+            collection: Some("\u{1}".repeat(super::lww_engine::MAX_LOCATOR_COLLECTION_BYTES)),
+            object: "\u{1}".repeat(8192),
+        };
+        locator.validate_for(&repository).unwrap();
+        body.locator = Some(locator);
+    }
+    let admitted = ExternalLwwEngine::capture_length(
+        &placeholder, &Default::default(), &Default::default(), &repository,
+    ).unwrap();
+    assert!(filled.encode().unwrap().len() <= admitted, "{} > {admitted}", filled.encode().unwrap().len());
+}
+#[test]
+fn segment_assembly_writes_control_pages_to_disk_instead_of_holding_them() {
+    run(async {
+        let mut f = CycleFixture::new();
+        conversation(&mut f.a);
+        let messages = (0..40).map(|index| serde_json::json!({
+            "chatId": format!("synthetic-spill-{index}"), "data": "x".repeat(225 * 1024),
+        })).collect::<Vec<_>>();
+        f.a.commit(&WorkingSetCommit { expected_revision: f.a.revision().unwrap(),
+            conversations: Some(vec![ConversationMutation::ReplaceRange { character_id: "char".into(), conversation_id: "conv".into(),
+                start: 0, delete_count: 0, messages, conversation: None, configured_index: None }]), ..Default::default() }).unwrap();
+        super::lww_engine::cycle_keys::reset();
+        assert_eq!(f.publish_a().await.segments.0, 1);
+        let held = super::lww_engine::cycle_keys::take().buffered_control_bytes;
+        assert!(held < lww_segment::SMALL_BODY_BYTES, "held {held} control bytes in memory while assembling a segment");
+        assert_eq!(f.receive_b().await, 1);
+    })
+}
