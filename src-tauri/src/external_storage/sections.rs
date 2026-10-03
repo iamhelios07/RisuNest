@@ -220,15 +220,13 @@ pub(crate) fn capture_section(
         cancel.check()?;
         let entry = row.to_entry(kind, versioned).map_err(corrupt)?;
         let key = entry.key.clone();
-        if let (SectionValueRow::Hypa { vector, .. }, SectionValue::Hypa(value)) = (&row.value, &entry.value) {
-            if matches!(value.vector, InlineOrObject::Object(_)) {
-                let (digest, path, offset) = bodies.push(vector)?;
-                sources.push(SectionSource {
-                    kind: wire::CatalogEntryKind::SectionObject,
-                    key: format!("object/{digest}"), content_sha256: digest,
-                    byte_length: vector.len() as u64, path, offset,
-                });
-            }
+        if let Some(body) = row.value.object_body() {
+            let (digest, path, offset) = bodies.push(body)?;
+            sources.push(SectionSource {
+                kind: wire::CatalogEntryKind::SectionObject,
+                key: format!("object/{digest}"), content_sha256: digest,
+                byte_length: body.len() as u64, path, offset,
+            });
         }
         let bytes = entry.encode().map_err(corrupt)?;
         let (digest, path, offset) = bodies.push(&bytes)?;
@@ -917,20 +915,17 @@ fn prepare_section_source_rows(
         if entry.kind != source.kind || entry.key != file.key {
             return Err(corrupt("section entry names another section or key"));
         }
-        let mut object = match &entry.value {
-            SectionValue::Hypa(value) => match &value.vector {
-                InlineOrObject::Object(reference) => {
-                    let digest = hex::encode(reference.content_sha256);
-                    let file = objects.get(&digest).ok_or_else(|| corrupt("section object is missing"))?;
-                    if file.byte_length != reference.byte_length {
-                        return Err(corrupt("section object length differs"));
-                    }
-                    used_objects.insert(digest);
-                    Some(read_source_bytes(file, cancel)?)
+        let mut object = match entry.value.object_reference() {
+            Some(reference) => {
+                let digest = hex::encode(reference.content_sha256);
+                let file = objects.get(&digest).ok_or_else(|| corrupt("section object is missing"))?;
+                if file.byte_length != reference.byte_length {
+                    return Err(corrupt("section object length differs"));
                 }
-                _ => None,
-            },
-            _ => None,
+                used_objects.insert(digest);
+                Some(read_source_bytes(file, cancel)?)
+            }
+            None => None,
         };
         if versioned {
             let row = SectionRow::from_entry(entry, true, |_| {
@@ -1263,7 +1258,21 @@ mod tests {
     #[test]
     fn plugin_spaces_and_device_settings_round_trip_without_being_rewritten() {
         let spool = tempfile::tempdir().expect("create spool");
+        let large_json = format!("{{\n  \"pad\": \"{}\",\n  \"n\": 1.50\n}}", "p".repeat(70_000));
+        let large_string = format!("{}\u{0}{}", "s".repeat(40_000), "가".repeat(10_000));
+        let large_setting = format!("{{ \"history\": \"{}\" }}", "h".repeat(70_000));
         let plugin_rows = [
+            SectionRow {
+                key1: "provider-manager".into(),
+                key2: "json".into(),
+                key3: "history".into(),
+                value: SectionValueRow::Plugin {
+                    space: "json".into(),
+                    value: large_json.clone(),
+                },
+                write_clock: Sequence::from(8u64),
+                writer_id: "writer-a".into(),
+            },
             SectionRow {
                 key1: "provider-manager".into(),
                 key2: "json".into(),
@@ -1274,6 +1283,17 @@ mod tests {
                 },
                 write_clock: Sequence::from(9u64),
                 writer_id: "writer-a".into(),
+            },
+            SectionRow {
+                key1: "yumi-translator".into(),
+                key2: "string".into(),
+                key3: "cache".into(),
+                value: SectionValueRow::Plugin {
+                    space: "string".into(),
+                    value: large_string.clone(),
+                },
+                write_clock: Sequence::from(7u64),
+                writer_id: "writer-b".into(),
             },
             SectionRow {
                 key1: "yumi-translator".into(),
@@ -1298,6 +1318,12 @@ mod tests {
             &Cancellation::default(),
         )
         .expect("capture plugin section");
+        assert_eq!(
+            plugins.sources.iter()
+                .filter(|source| source.kind == wire::CatalogEntryKind::SectionObject)
+                .map(|source| source.byte_length).collect::<BTreeSet<_>>(),
+            BTreeSet::from([large_json.len() as u64, large_string.len() as u64])
+        );
         let decoded = decode_section(
             SectionKind::LocalPlugins,
             &carried(&plugins),
@@ -1326,6 +1352,14 @@ mod tests {
                 write_clock: Sequence::from(0u64),
                 writer_id: String::new(),
             },
+            SectionRow {
+                key1: "setting".into(),
+                key2: "risuNestUpdateSettings".into(),
+                key3: String::new(),
+                value: SectionValueRow::Setting { value: large_setting.clone() },
+                write_clock: Sequence::from(0u64),
+                writer_id: String::new(),
+            },
         ];
         let settings = capture_section(
             SectionKind::LocalSettings,
@@ -1345,6 +1379,77 @@ mod tests {
         )
         .expect("decode settings section");
         assert_eq!(decoded, setting_rows);
+    }
+
+    /// Device values past the inline limit leave the entry as objects, so a
+    /// value the plugin storage API accepts is never too large to back up. The
+    /// stored text comes back byte for byte, whitespace and number spelling
+    /// included.
+    #[test]
+    fn large_device_values_survive_external_backup_capture_prepare_and_restore() {
+        let root = tempfile::tempdir().expect("create root");
+        let mut source = PersistentStore::open(&root.path().join("source")).expect("open source store");
+        let owner = "o".repeat(512);
+        let quoted_key = "\"".repeat(512);
+        let large_string = format!("{}\n\t{}", "가".repeat(25_000), "x".repeat(1_000));
+        let large_json = format!("{{\n  \"zeta\": \"{}\",\n  \"alpha\": [1, 2.50, 1e2]\n}}", "y".repeat(70_000));
+        let edge_string = "e".repeat(risunest_external_storage_format::section::MAX_INLINE_VALUE_BYTES);
+        let large_setting = serde_json::json!({ "history": "h".repeat(70_000) });
+        {
+            let device = source.device_store_mut().expect("open source device store");
+            device.write_plugin_device_values(&owner, &[
+                PluginDeviceMutation::Set { space: "string".into(), key: quoted_key.clone(), value: large_string.clone() },
+                PluginDeviceMutation::Set { space: "json".into(), key: "history".into(), value: large_json.clone() },
+                PluginDeviceMutation::Set { space: "string".into(), key: "edge".into(), value: edge_string.clone() },
+            ]).expect("write large plugin values");
+            assert!(device.write_plugin_device_values(&owner, &[PluginDeviceMutation::Set {
+                space: "string".into(), key: "k".repeat(513), value: "small".into(),
+            }]).is_err());
+            device.write_setting("risuNestDeviceSettings", &large_setting).expect("write large setting");
+        }
+        let stored_setting: String = source.device_store().unwrap().connection().query_row(
+            "SELECT value FROM device_settings WHERE key='risuNestDeviceSettings'", [], |row| row.get(0),
+        ).unwrap();
+
+        let revision = source.revision().expect("read revision");
+        let (lease, prepared) = source.lww_acquire_backup_capture(revision).expect("acquire backup capture");
+        let captured = capture_prepared_backup_sections(
+            &prepared, &root.path().join("spool"), &Cancellation::default(),
+        ).expect("capture backup sections");
+        source.release_revision(&lease.lease).expect("release capture lease");
+        let objects = |kind| captured.iter().find(|section| section.kind == kind).unwrap().sources.iter()
+            .filter(|source| source.kind == wire::CatalogEntryKind::SectionObject)
+            .map(|source| source.byte_length).collect::<BTreeSet<_>>();
+        assert_eq!(objects(SectionKind::LocalPlugins),
+            BTreeSet::from([large_string.len() as u64, large_json.len() as u64]));
+        assert_eq!(objects(SectionKind::LocalSettings), BTreeSet::from([stored_setting.len() as u64]));
+        assert!(objects(SectionKind::Hypa).is_empty());
+
+        let prepared = prepare_received_backup_sections(&captured, &Cancellation::default())
+            .expect("prepare captured backup sections");
+        let mut target = PersistentStore::open(&root.path().join("target")).expect("open target store");
+        let stage = target.replace_begin().expect("begin replacement");
+        target.replace_put_root(&stage.staging_id, &serde_json::json!({"language": "synthetic restored"}))
+            .expect("stage root");
+        let header = crate::persistent_store::lww::Header {
+            binding_authority: target.lww_binding_authority().expect("read authority"),
+            request_id: "synthetic-large-device-values".into(),
+        };
+        target.lww_commit_replacement_with_device_sections(
+            &header, &stage.staging_id, Some(&Default::default()), &prepared.iter().collect::<Vec<_>>(),
+        ).expect("restore backup with large device values");
+        let device = target.device_store().expect("open target device store");
+        for (space, key, expected) in [
+            ("string", quoted_key.as_str(), &large_string),
+            ("json", "history", &large_json),
+            ("string", "edge", &edge_string),
+        ] {
+            assert_eq!(device.read_plugin_device_value(&owner, space, key).unwrap().as_ref(), Some(expected));
+        }
+        let restored_setting: String = device.connection().query_row(
+            "SELECT value FROM device_settings WHERE key='risuNestDeviceSettings'", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(restored_setting, stored_setting);
     }
 
     #[test]
