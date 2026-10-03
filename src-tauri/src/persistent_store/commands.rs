@@ -499,8 +499,8 @@ pub(crate) fn pds_asset_gc_maintenance(
     })
 }
 
-/// Sweeps message objects in both stores until each pass wraps. It skips
-/// while device maintenance holds the renderer gate.
+/// Sweeps one batch of message objects in each store, continuing from each
+/// store's cursor. It skips while device maintenance holds the renderer gate.
 #[tauri::command(async)]
 pub(crate) fn pds_message_object_sweep(
     app: AppHandle,
@@ -511,7 +511,9 @@ pub(crate) fn pds_message_object_sweep(
     };
     finish_storage_command(
         "pds_message_object_sweep",
-        sweep_message_pages(file_admission(&app).as_ref(), &state, &operation_guard, current_time_ms()?),
+        sweep_message_pages(
+            file_admission(&app).as_ref(), &state, &operation_guard, current_time_ms()?, SweepBudget::OneBatch,
+        ),
     )
 }
 
@@ -1229,10 +1231,19 @@ pub(crate) fn pds_asset_gc_execute(
     finish_storage_command(
         "pds_asset_gc_execute",
         pds_asset_gc_execute_all(&state, &operation_guard).and_then(|result| {
-            sweep_message_pages(file_admission(&app).as_ref(), &state, &operation_guard, current_time_ms()?)?;
+            sweep_message_pages(
+                file_admission(&app).as_ref(), &state, &operation_guard, current_time_ms()?, SweepBudget::UntilWrapped,
+            )?;
             Ok(result)
         }),
     )
+}
+
+/// How many batches each store gets in one sweep call.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SweepBudget {
+    OneBatch,
+    UntilWrapped,
 }
 
 /// Message objects are swept only while no replacement or server sync holds
@@ -1242,6 +1253,7 @@ fn sweep_message_pages(
     state: &PersistentStoreState,
     operation_guard: &RendererOperationGuard,
     now: i64,
+    budget: SweepBudget,
 ) -> StoreResult<()> {
     let Some(admission) = admission else {
         return Ok(());
@@ -1254,7 +1266,7 @@ fn sweep_message_pages(
             let sweep = with_store_mutex_mut_admitted(state, operation_guard, |store| {
                 store.sweep_message_page_objects(target, now, super::MESSAGE_PAGE_SWEEP_LIMIT)
             })?;
-            if sweep.wrapped {
+            if sweep.wrapped || budget == SweepBudget::OneBatch {
                 break;
             }
         }
@@ -1785,23 +1797,69 @@ mod tests {
         };
         let operation = state.admit_renderer_operation().unwrap();
         let admission = Arc::new(Admission::default());
-        sweep_message_pages(None, &state, &operation, 1_000).unwrap();
+        sweep_message_pages(None, &state, &operation, 1_000, SweepBudget::UntilWrapped).unwrap();
         assert_eq!(marks(), (0, 0));
         let exclusive = admission.file(true).unwrap();
-        sweep_message_pages(Some(&admission), &state, &operation, 1_000).unwrap();
+        sweep_message_pages(Some(&admission), &state, &operation, 1_000, SweepBudget::UntilWrapped).unwrap();
         assert_eq!(marks(), (0, 0));
         drop(exclusive);
         let server = admission.server().unwrap();
-        sweep_message_pages(Some(&admission), &state, &operation, 1_000).unwrap();
+        sweep_message_pages(Some(&admission), &state, &operation, 1_000, SweepBudget::UntilWrapped).unwrap();
         assert_eq!(marks(), (0, 0));
         drop(server);
-        sweep_message_pages(Some(&admission), &state, &operation, 1_000).unwrap();
+        sweep_message_pages(Some(&admission), &state, &operation, 1_000, SweepBudget::UntilWrapped).unwrap();
         assert_eq!(marks(), (1, 1));
         drop(operation);
         let maintenance = state.acquire_cleanup_maintenance(std::time::Duration::from_secs(1)).unwrap();
         assert!(state.try_admit_renderer_operation().unwrap().is_none());
         drop(maintenance);
         assert!(state.try_admit_renderer_operation().unwrap().is_some());
+    }
+
+    #[test]
+    fn a_periodic_sweep_visits_one_batch_per_store_and_resumes_from_the_cursor() {
+        use crate::native_file_jobs::admission::Admission;
+        let limit = super::super::MESSAGE_PAGE_SWEEP_LIMIT;
+        let open = || {
+            let directory = tempdir().unwrap();
+            let store = PersistentStore::open(directory.path()).unwrap();
+            for db in [&store.connection, store.device_store().unwrap().connection()] {
+                let tx = db.unchecked_transaction().unwrap();
+                for index in 0..=limit {
+                    let body = format!("synthetic-orphan-object-{index}").into_bytes();
+                    super::super::message_pages::put_object(&tx, &risunest_sync_wire::hash(&body), &body).unwrap();
+                }
+                tx.commit().unwrap();
+            }
+            (directory, PersistentStoreState::with_test_store(store))
+        };
+        let count = |state: &PersistentStoreState, table: &str| -> (usize, usize) {
+            let guard = state.store.lock().unwrap();
+            let store = guard.as_ref().unwrap();
+            let sql = format!("SELECT count(*) FROM {table}");
+            let read = |db: &rusqlite::Connection| db.query_row(&sql, [], |row| row.get::<_, i64>(0)).unwrap() as usize;
+            (read(&store.connection), read(store.device_store().unwrap().connection()))
+        };
+        let admission = Arc::new(Admission::default());
+
+        let (_periodic_directory, periodic) = open();
+        assert_eq!(count(&periodic, "message_page_objects"), (limit + 1, limit + 1));
+        let operation = periodic.admit_renderer_operation().unwrap();
+        sweep_message_pages(Some(&admission), &periodic, &operation, 1_000, SweepBudget::OneBatch).unwrap();
+        assert_eq!(count(&periodic, "message_page_object_marks"), (limit, limit), "a periodic sweep ran more than one batch");
+        assert_eq!(count(&periodic, "message_page_sweep_cursor"), (1, 1));
+        sweep_message_pages(Some(&admission), &periodic, &operation, 1_000, SweepBudget::OneBatch).unwrap();
+        assert_eq!(
+            count(&periodic, "message_page_object_marks"),
+            (limit + 1, limit + 1),
+            "the next periodic sweep did not continue from the cursor",
+        );
+        assert_eq!(count(&periodic, "message_page_sweep_cursor"), (0, 0));
+
+        let (_cleanup_directory, cleanup) = open();
+        let operation = cleanup.admit_renderer_operation().unwrap();
+        sweep_message_pages(Some(&admission), &cleanup, &operation, 1_000, SweepBudget::UntilWrapped).unwrap();
+        assert_eq!(count(&cleanup, "message_page_object_marks"), (limit + 1, limit + 1));
     }
 
     #[test]
