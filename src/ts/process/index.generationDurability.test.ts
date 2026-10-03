@@ -529,6 +529,33 @@ describe('sendChat generation durability control flow', () => {
         expect(generatingConversations.snapshot()).toEqual([])
     })
 
+    it('acknowledges an applied response for the generated conversation after the selection moves away', async () => {
+        const character = harness.DBState.db.characters[0]
+        character.chats.push({ ...structuredClone(character.chats[0]), id: 'chat-other' })
+        harness.requests.push(success('Applied response'))
+        // Snapshots are compared afterwards because the finally branch logs acknowledgement errors.
+        const registered: unknown[] = []
+        harness.runTrigger.mockImplementation(async (_char, event) => {
+            if (event !== 'output') return null
+            registered.push(generatingConversations.snapshot())
+            character.chatPage = 1
+            return null
+        })
+        harness.acknowledge.mockImplementation(async () => {
+            registered.push(generatingConversations.snapshot())
+            harness.events.push('ack')
+        })
+
+        await expect(sendChat()).resolves.toBe(false)
+
+        expect(character.chats[0].message.at(-1)).toMatchObject({ role: 'char', data: 'Applied response' })
+        expect(character.chats[1].message.at(-1)).toMatchObject({ role: 'user' })
+        expect(registered).toEqual([[{ characterId: 'char-a', conversationId: 'chat-char-a' }], []])
+        expect(harness.acknowledge).toHaveBeenCalledExactlyOnceWith(0)
+        expect(harness.drainDeferredReceives).not.toHaveBeenCalled()
+        expect(generatingConversations.snapshot()).toEqual([])
+    })
+
     it('acknowledges a partially committed streaming response when the stream is aborted', async () => {
         const controller = new AbortController()
         const committed = deferred()
