@@ -6,7 +6,8 @@ use crate::persistent_store::StoreResult;
 use risunest_external_storage_format::section::{
     decode_local_plugin_entry_key, hypa_entry_key, local_plugin_entry_key, HypaValue,
     InlineOrObject, LocalPluginValue, LocalSettingValue, ObjectReference, PluginSpace,
-    SectionEntry, SectionEntryVersion, SectionKind, SectionValue, MAX_INLINE_VALUE_BYTES,
+    SectionEntry, SectionEntryVersion, SectionKind, SectionValue, ValueOrObject,
+    MAX_INLINE_VALUE_BYTES,
 };
 use risunest_sync_wire::Sequence;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -108,6 +109,24 @@ impl SectionValueRow {
         match self {
             Self::Tombstone { first_published } => first_published.as_ref(),
             _ => None,
+        }
+    }
+    /// The bytes this row's entry names as an object instead of carrying them
+    /// inline: a vector, or a plugin or setting value's stored text.
+    pub(crate) fn object_body(&self) -> Option<&[u8]> {
+        let bytes = match self {
+            Self::Hypa { vector, .. } => vector.as_slice(),
+            Self::Plugin { value, .. } | Self::Setting { value } => value.as_bytes(),
+            Self::PluginPermission { .. } | Self::Tombstone { .. } => return None,
+        };
+        rides_as_object(bytes).then_some(bytes)
+    }
+    fn take_object_body(&mut self) -> Option<Vec<u8>> {
+        self.object_body()?;
+        match self {
+            Self::Hypa { vector, .. } => Some(std::mem::take(vector)),
+            Self::Plugin { value, .. } | Self::Setting { value } => Some(std::mem::take(value).into_bytes()),
+            Self::PluginPermission { .. } | Self::Tombstone { .. } => None,
         }
     }
 }
@@ -374,6 +393,72 @@ fn section_format_error(_: risunest_external_storage_format::FormatError) -> cra
     invalid("Section entry is invalid")
 }
 
+fn rides_as_object(bytes: &[u8]) -> bool {
+    bytes.len() > MAX_INLINE_VALUE_BYTES
+}
+
+fn object_reference(bytes: &[u8]) -> ObjectReference {
+    ObjectReference {
+        content_sha256: risunest_external_storage_format::content_identity::hash(bytes),
+        byte_length: bytes.len() as u64,
+    }
+}
+
+fn is_json(text: &str) -> bool {
+    serde_json::from_str::<serde::de::IgnoredAny>(text).is_ok()
+}
+
+/// Stored JSON text as its entry carries it. Text that does not parse is
+/// refused at any length; past the inline limit the entry names the text.
+fn json_value(text: &str) -> StoreResult<ValueOrObject> {
+    if !rides_as_object(text.as_bytes()) {
+        return serde_json::from_str(text)
+            .map(ValueOrObject::Inline)
+            .map_err(|_| invalid("Device value is not JSON"));
+    }
+    if !is_json(text) {
+        return Err(invalid("Device value is not JSON"));
+    }
+    Ok(ValueOrObject::Object(object_reference(text.as_bytes())))
+}
+
+fn read_object(
+    reference: &ObjectReference,
+    object: &mut impl FnMut(&ObjectReference) -> StoreResult<Vec<u8>>,
+) -> StoreResult<Vec<u8>> {
+    let bytes = object(reference)?;
+    if bytes.len() as u64 != reference.byte_length
+        || risunest_external_storage_format::content_identity::hash(&bytes) != reference.content_sha256 {
+        return Err(invalid("Section object does not match its reference"));
+    }
+    Ok(bytes)
+}
+
+/// The stored text an object holds. It is installed byte for byte, so it has
+/// to be text, and JSON text has to parse.
+fn object_text(
+    reference: &ObjectReference,
+    object: &mut impl FnMut(&ObjectReference) -> StoreResult<Vec<u8>>,
+    json: bool,
+) -> StoreResult<String> {
+    let text = String::from_utf8(read_object(reference, object)?)
+        .map_err(|_| invalid("Section value object is not text"))?;
+    if json && !is_json(&text) {
+        return Err(invalid("Section value object is not JSON"));
+    }
+    Ok(text)
+}
+
+fn json_text(
+    value: ValueOrObject,
+    object: &mut impl FnMut(&ObjectReference) -> StoreResult<Vec<u8>>,
+) -> StoreResult<String> {
+    match value {
+        ValueOrObject::Inline(value) => Ok(serde_json::to_string(&value)?),
+        ValueOrObject::Object(reference) => object_text(&reference, object, true),
+    }
+}
+
 fn vector_identity(vector: &InlineOrObject) -> StoreResult<([u8; 32], u64)> {
     match vector {
         InlineOrObject::Object(reference) => Ok((reference.content_sha256, reference.byte_length)),
@@ -488,11 +573,8 @@ impl SectionRow {
                 SectionValue::tombstone(marker.generation.clone(), marker.at_ms)
             }
             (SectionValueRow::Hypa { producer, model, endpoint, preprocess_version, dimensions, vector, metadata }, SectionKind::Hypa) => {
-                let vector = if vector.len() > MAX_INLINE_VALUE_BYTES {
-                    InlineOrObject::Object(ObjectReference {
-                        content_sha256: risunest_external_storage_format::content_identity::hash(vector),
-                        byte_length: vector.len() as u64,
-                    })
+                let vector = if rides_as_object(vector) {
+                    InlineOrObject::Object(object_reference(vector))
                 } else {
                     InlineOrObject::inline(vector).map_err(section_format_error)?
                 };
@@ -508,8 +590,11 @@ impl SectionRow {
                     return Err(invalid("Plugin value names another space"));
                 }
                 let (space, value) = match space.as_str() {
-                    "string" => (PluginSpace::String, serde_json::Value::String(value.clone())),
-                    "json" => (PluginSpace::Json, serde_json::from_str(value)?),
+                    "string" if rides_as_object(value.as_bytes()) => {
+                        (PluginSpace::String, ValueOrObject::Object(object_reference(value.as_bytes())))
+                    }
+                    "string" => (PluginSpace::String, ValueOrObject::Inline(serde_json::Value::String(value.clone()))),
+                    "json" => (PluginSpace::Json, json_value(value)?),
                     _ => return Err(invalid("Plugin device space is invalid")),
                 };
                 SectionValue::LocalPlugin(LocalPluginValue { space, value })
@@ -518,13 +603,15 @@ impl SectionRow {
                 if self.key1 != "setting" || !setting_is_local(&self.key2) || !self.key3.is_empty() {
                     return Err(invalid("Device setting is outside the backup scope"));
                 }
-                SectionValue::LocalSetting(LocalSettingValue { value: serde_json::from_str(value)? })
+                SectionValue::LocalSetting(LocalSettingValue { value: json_value(value)? })
             }
             (SectionValueRow::PluginPermission { granted }, SectionKind::LocalSettings) => {
                 if self.key1 != "pluginPermission" || self.key2.is_empty() || self.key3.is_empty() {
                     return Err(invalid("Plugin permission key is invalid"));
                 }
-                SectionValue::LocalSetting(LocalSettingValue { value: serde_json::Value::Bool(*granted) })
+                SectionValue::LocalSetting(LocalSettingValue {
+                    value: ValueOrObject::Inline(serde_json::Value::Bool(*granted)),
+                })
             }
             _ => return Err(invalid("Section row belongs to another section")),
         };
@@ -554,14 +641,7 @@ impl SectionRow {
             SectionValue::Hypa(value) => {
                 let vector = match &value.vector {
                     InlineOrObject::Inline(_) => value.vector.decode_inline().map_err(section_format_error)?,
-                    InlineOrObject::Object(reference) => {
-                        let bytes = object(reference)?;
-                        if bytes.len() as u64 != reference.byte_length
-                            || risunest_external_storage_format::content_identity::hash(&bytes) != reference.content_sha256 {
-                            return Err(invalid("Section vector object does not match its reference"));
-                        }
-                        bytes
-                    }
+                    InlineOrObject::Object(reference) => read_object(reference, &mut object)?,
                 };
                 if vector.len() as u64 != u64::from(value.dimensions) * 4 {
                     return Err(invalid("Section vector length does not match its dimensions"));
@@ -575,21 +655,23 @@ impl SectionRow {
             SectionValue::LocalPlugin(value) => {
                 let space = match value.space { PluginSpace::String => "string", PluginSpace::Json => "json" };
                 if space != key2 { return Err(invalid("Plugin value names another space")); }
-                let text = match value.space {
-                    PluginSpace::String => match value.value {
-                        serde_json::Value::String(text) => text,
-                        _ => return Err(invalid("Plugin string value is not text")),
-                    },
-                    PluginSpace::Json => serde_json::to_string(&value.value)?,
+                let text = match (value.space, value.value) {
+                    (PluginSpace::String, ValueOrObject::Inline(serde_json::Value::String(text))) => text,
+                    (PluginSpace::String, ValueOrObject::Inline(_)) => return Err(invalid("Plugin string value is not text")),
+                    (PluginSpace::String, ValueOrObject::Object(reference)) => object_text(&reference, &mut object, false)?,
+                    (PluginSpace::Json, value) => json_text(value, &mut object)?,
                 };
                 SectionValueRow::Plugin { space: space.to_owned(), value: text }
             }
             SectionValue::LocalSetting(value) => match key1.as_str() {
                 "setting" if setting_is_local(&key2) && key3.is_empty() => {
-                    SectionValueRow::Setting { value: serde_json::to_string(&value.value)? }
+                    SectionValueRow::Setting { value: json_text(value.value, &mut object)? }
                 }
                 "pluginPermission" if !key2.is_empty() && !key3.is_empty() => SectionValueRow::PluginPermission {
-                    granted: value.value.as_bool().ok_or_else(|| invalid("Plugin permission is not a decision"))?,
+                    granted: match value.value {
+                        ValueOrObject::Inline(serde_json::Value::Bool(granted)) => granted,
+                        _ => return Err(invalid("Plugin permission is not a decision")),
+                    },
                 },
                 _ => return Err(invalid("Device setting is outside the backup scope")),
             },
@@ -984,12 +1066,7 @@ impl PreparedSectionRows {
                 let mut row = self.row_by_entry_key(&key).map_err(&mut map_error)?
                     .ok_or_else(|| map_error(invalid("Prepared row is missing")))?;
                 let entry = row.to_entry(self.kind, self.versioned).map_err(&mut map_error)?;
-                let object = match &mut row.value {
-                    SectionValueRow::Hypa { vector, .. } if vector.len() > MAX_INLINE_VALUE_BYTES => {
-                        Some(std::mem::take(vector))
-                    }
-                    _ => None,
-                };
+                let object = row.value.take_object_body();
                 #[cfg(test)]
                 if let Some(object) = &object {
                     SECTION_TEST_MAX_VALUE_BYTES.fetch_max(object.len(), Ordering::Relaxed);
@@ -1355,10 +1432,7 @@ impl DeviceStore {
         let kind = kind_of_section(section);
         let Some((mut row, published)) = read_row(&self.connection, section, &decode_entry_key(kind, key)?)? else { return Ok(None); };
         let entry = row.to_entry(kind, true)?;
-        let object = match &mut row.value {
-            SectionValueRow::Hypa { vector, .. } if vector.len() > MAX_INLINE_VALUE_BYTES => Some(std::mem::take(vector)),
-            _ => None,
-        };
+        let object = row.value.take_object_body();
         Ok(Some(LocalSectionEntry { version: row.version(), entry, object, published }))
     }
 
@@ -1433,7 +1507,7 @@ impl DeviceStore {
             SectionWriteInput::Apply { section, entry, object } => {
                 if entry.kind != kind_of_section(*section) { return Err(invalid("Section entry belongs to another section")); }
                 let row = SectionRow::from_entry((*entry).clone(), true, |_| {
-                    object.map(|bytes| bytes.to_vec()).ok_or_else(|| invalid("Section vector object is missing"))
+                    object.map(|bytes| bytes.to_vec()).ok_or_else(|| invalid("Section object is missing"))
                 })?;
                 merge_row(tx, *section, &row)?;
                 observe_remote_clock(tx, *section, &row.write_clock)?;

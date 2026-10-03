@@ -1510,6 +1510,167 @@ mod section_exchange {
         assert!(spool.push_backup_row(row).is_err());
     }
 
+    /// The stored text decides the form: up to the inline limit a value rides
+    /// in its entry, past it the entry names an object holding that text.
+    #[test]
+    fn a_device_value_past_the_inline_limit_becomes_an_object() {
+        use risunest_external_storage_format::section::MAX_INLINE_VALUE_BYTES;
+        let encoded = |row: SectionRow, kind| {
+            String::from_utf8(row.to_entry(kind, false).unwrap().encode().unwrap()).unwrap()
+        };
+        let json_row = |value: String| SectionRow {
+            key2: "json".into(),
+            value: SectionValueRow::Plugin { space: "json".into(), value },
+            ..plugin_row("edge", "", 0, "")
+        };
+        let setting_row = |value: String| SectionRow {
+            key1: "setting".into(),
+            key2: "risuNestDeviceSettings".into(),
+            key3: String::new(),
+            value: SectionValueRow::Setting { value },
+            write_clock: Sequence::from(0u64),
+            writer_id: String::new(),
+        };
+        let quoted = |length: usize| format!("\"{}\"", "q".repeat(length - 2));
+        for (at_limit, past, inline, object) in [
+            (
+                encoded(plugin_row("edge", &"a".repeat(MAX_INLINE_VALUE_BYTES), 0, ""), SectionKind::LocalPlugins),
+                encoded(plugin_row("edge", &"a".repeat(MAX_INLINE_VALUE_BYTES + 1), 0, ""), SectionKind::LocalPlugins),
+                "\"localPlugin\":{\"space\":\"string\",\"value\":",
+                "\"localPlugin\":{\"space\":\"string\",\"object\":{\"contentSha256\":",
+            ),
+            (
+                encoded(json_row(quoted(MAX_INLINE_VALUE_BYTES)), SectionKind::LocalPlugins),
+                encoded(json_row(quoted(MAX_INLINE_VALUE_BYTES + 1)), SectionKind::LocalPlugins),
+                "\"localPlugin\":{\"space\":\"json\",\"value\":",
+                "\"localPlugin\":{\"space\":\"json\",\"object\":{\"contentSha256\":",
+            ),
+            (
+                encoded(setting_row(quoted(MAX_INLINE_VALUE_BYTES)), SectionKind::LocalSettings),
+                encoded(setting_row(quoted(MAX_INLINE_VALUE_BYTES + 1)), SectionKind::LocalSettings),
+                "\"localSetting\":{\"value\":",
+                "\"localSetting\":{\"object\":{\"contentSha256\":",
+            ),
+        ] {
+            assert!(at_limit.contains(inline) && !at_limit.contains(object));
+            assert!(past.contains(object) && !past.contains(inline));
+            assert!(past.contains(&format!("\"byteLength\":\"{}\"", MAX_INLINE_VALUE_BYTES + 1)));
+        }
+    }
+
+    /// An object installs only as the stored text its entry names: the body
+    /// matches the reference, it is text, and a JSON value still parses.
+    #[test]
+    fn a_device_value_object_that_is_not_its_stored_text_is_refused() {
+        use crate::persistent_store::StoreError;
+        use risunest_external_storage_format::{
+            content_identity::hash,
+            section::{
+                local_plugin_entry_key, LocalPluginValue, LocalSettingValue, ObjectReference,
+                PluginSpace, SectionEntry, SectionValue, ValueOrObject,
+            },
+        };
+        let object = |body: &[u8]| ValueOrObject::Object(ObjectReference {
+            content_sha256: hash(body),
+            byte_length: body.len() as u64,
+        });
+        let plugin = |space: PluginSpace, body: &[u8]| {
+            let id = if space == PluginSpace::Json { "json" } else { "string" };
+            SectionEntry::new(
+                SectionKind::LocalPlugins,
+                local_plugin_entry_key("plugin-a", id, "key").unwrap(),
+                SectionValue::LocalPlugin(LocalPluginValue { space, value: object(body) }),
+                None,
+            )
+            .unwrap()
+        };
+        let setting = |body: &[u8]| {
+            SectionEntry::new(
+                SectionKind::LocalSettings,
+                serde_json::to_string(&["setting", "risuNestDeviceSettings", ""]).unwrap(),
+                SectionValue::LocalSetting(LocalSettingValue { value: object(body) }),
+                None,
+            )
+            .unwrap()
+        };
+        let push = |entry: SectionEntry, body: &[u8]| {
+            let mut spool = SectionSpoolBuilder::new_backup(entry.kind).unwrap();
+            spool.push_backup_entry(entry, |_| Ok(body.to_vec()))
+        };
+        let refused = |result: crate::persistent_store::StoreResult<()>| {
+            assert!(matches!(result, Err(StoreError::Validation { .. })), "{result:?}");
+        };
+        let json = format!("{{ \"pad\": \"{}\" }}", "p".repeat(5_000));
+        let broken = format!("{{\"pad\":\"{}\"", "b".repeat(5_000));
+        let mut not_text = "t".repeat(5_000).into_bytes();
+        not_text[7] = 0xff;
+        let mut altered = json.clone().into_bytes();
+        altered[10] = b'q';
+
+        push(plugin(PluginSpace::Json, json.as_bytes()), json.as_bytes()).unwrap();
+        push(plugin(PluginSpace::String, broken.as_bytes()), broken.as_bytes()).unwrap();
+        push(setting(json.as_bytes()), json.as_bytes()).unwrap();
+        refused(push(plugin(PluginSpace::Json, broken.as_bytes()), broken.as_bytes()));
+        refused(push(setting(broken.as_bytes()), broken.as_bytes()));
+        refused(push(plugin(PluginSpace::String, &not_text), &not_text));
+        refused(push(plugin(PluginSpace::String, json.as_bytes()), &altered));
+        refused(push(plugin(PluginSpace::String, json.as_bytes()), &json.as_bytes()[1..]));
+
+        let unparsable = SectionRow {
+            key2: "json".into(),
+            value: SectionValueRow::Plugin { space: "json".into(), value: broken.clone() },
+            ..plugin_row("key", "", 0, "")
+        };
+        assert!(matches!(
+            unparsable.to_entry(SectionKind::LocalPlugins, false),
+            Err(StoreError::Validation { .. })
+        ));
+    }
+
+    /// Stored JSON text that does not parse is refused the same way whether it
+    /// would ride inline or as an object, and the refusal never repeats it.
+    #[test]
+    fn unparseable_stored_json_is_refused_alike_at_any_length() {
+        use crate::persistent_store::StoreError;
+        use risunest_external_storage_format::section::MAX_INLINE_VALUE_BYTES;
+        let refusal = |kind: SectionKind, broken: &str| {
+            let (_directory, mut store) = open();
+            if kind == SectionKind::LocalPlugins {
+                store
+                    .write_plugin_device_values(
+                        "plugin-a",
+                        &[PluginDeviceMutation::Set {
+                            space: "json".to_owned(),
+                            key: "broken".to_owned(),
+                            value: broken.to_owned(),
+                        }],
+                    )
+                    .expect("write plugin value");
+            } else {
+                store
+                    .connection()
+                    .execute(
+                        "INSERT INTO device_settings(key,value) VALUES('risuNestDeviceSettings',?1)",
+                        [broken],
+                    )
+                    .expect("write setting");
+            }
+            match store.capture_backup_sections(&[kind]).err().expect("capture refused") {
+                StoreError::Validation { message } => {
+                    assert!(!message.contains("secret"), "{message}");
+                    message
+                }
+                other => panic!("{other:?}"),
+            }
+        };
+        let small = "{\"secret\":\"s\"".to_owned();
+        let large = format!("{{\"secret\":\"{}\"", "s".repeat(MAX_INLINE_VALUE_BYTES));
+        assert!(small.len() <= MAX_INLINE_VALUE_BYTES && large.len() > MAX_INLINE_VALUE_BYTES);
+        for kind in [SectionKind::LocalPlugins, SectionKind::LocalSettings] {
+            assert_eq!(refusal(kind, &small), refusal(kind, &large));
+        }
+    }
+
     /// Invariant 31 on the device side. The material decides the section: a key
     /// it carries is installed, a key it leaves out is removed, and a section it
     /// says nothing about keeps everything this device holds.
