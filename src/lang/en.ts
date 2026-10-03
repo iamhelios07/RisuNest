@@ -7,7 +7,6 @@ export const languageEnglish = {
         "pluginDataDeletion": "Delete plugin data",
         "lorebookDeletion": "Delete lorebook folder and entries",
         "partialBackup": "Backup without other assets",
-        "incompleteRestore": "Restore without unavailable data",
         "onlySelectedMessage": "Delete only this message"
     },
 
@@ -1054,6 +1053,7 @@ export const languageEnglish = {
     syncConflictBackups: 'Account sync conflict backups',
     syncConflictNoBackups: "There are no sync conflict backups.",
     syncConflictRestoreConfirm: 'Replace the current database with this database-only backup? No automatic backup is created. Assets, cold-storage payloads, and inlays are not included.',
+    syncConflictRestoreScope: 'Assets, cold-storage payloads, and inlays are not included.',
     syncBackupEntry: "{date} / {side} / {count} characters",
     syncBackupDatabaseOnly: "database only, excludes assets, cold storage, and inlays",
     syncBackupSideLocal: "this device",
@@ -2546,7 +2546,6 @@ export const languageEnglish = {
 
                 manual: 'Created manually',
                 periodic: 'Automatic',
-                preRestore: 'Kept before a restore',
             },
             counts: '{0} characters · {1} chats · {2} messages',
             subMetrics:
@@ -2722,6 +2721,8 @@ export const languageEnglish = {
                 'Synchronization is running or still needs recovery. Finish it before starting a backup or restore.',
             syncUnconfirmed:
                 'The synchronization outcome could not be confirmed. Resolve the pending operation before restoring.',
+            syncUnavailable:
+                'Sync is not connected, so the backup cannot be restored. Connect sync and try again.',
             title: 'Backup & restore',
             groupFiles: 'Backup files',
             filesHelp:

@@ -19,7 +19,6 @@ export const languageVietnamese = {
         "pluginDataDeletion": "Xóa dữ liệu plugin",
         "lorebookDeletion": "Xóa thư mục và mục lorebook",
         "partialBackup": "Sao lưu không gồm tài nguyên khác",
-        "incompleteRestore": "Khôi phục không gồm dữ liệu thiếu",
         "onlySelectedMessage": "Chỉ xóa tin nhắn này"
     },
 

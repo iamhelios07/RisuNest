@@ -19,7 +19,6 @@ export const languageSpanish = {
         "pluginDataDeletion": "Eliminar datos del plugin",
         "lorebookDeletion": "Eliminar carpeta y entradas del lorebook",
         "partialBackup": "Copia sin otros recursos",
-        "incompleteRestore": "Restaurar sin los datos ausentes",
         "onlySelectedMessage": "Eliminar solo este mensaje"
     },
 

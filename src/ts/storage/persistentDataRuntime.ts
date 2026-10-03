@@ -1302,7 +1302,7 @@ export function createPersistentDataRuntime(
                 const {prepareBoundLibraryReplacement} = await import('./sync/bindingRegistry')
                 const binding = await prepareBoundLibraryReplacement()
                 const {acquireUpstreamImportPause, confirmUpstreamLibraryReplacement} = await import('./upstreamReplacement')
-                if (!(await confirmUpstreamLibraryReplacement(binding.bound, options.upstreamImportWarnings))) throw new Error('Import cancelled')
+                if (!(await confirmUpstreamLibraryReplacement(binding.bound, options.upstreamImportWarnings))) throw new DOMException('Import cancelled', 'AbortError')
                 const plugins = await import('../plugins/apiV3/v3.svelte')
                 let pause: Awaited<ReturnType<typeof acquireUpstreamImportPause>>
                 try {

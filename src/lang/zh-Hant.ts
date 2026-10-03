@@ -19,7 +19,6 @@ export const languageChineseTraditional = {
         "pluginDataDeletion": "刪除外掛資料",
         "lorebookDeletion": "刪除世界書資料夾及項目",
         "partialBackup": "備份不包含其他資源",
-        "incompleteRestore": "還原不包含缺失資料",
         "onlySelectedMessage": "僅刪除此訊息"
     },
 
