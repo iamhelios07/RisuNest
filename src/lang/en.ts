@@ -74,34 +74,11 @@ export const languageEnglish = {
     portableBackup: {
         preservedSourceHelp:
             'These files are kept separately because the restored library does not need them. They do not sync automatically and can be deleted from the source preservation area.',
-        title: 'RisuNest backup',
         export: 'RisuNest full backup (.risunest)',
         restore: 'Restore backup file',
-        library: 'Library and attachments',
-        device: 'Device plugin data',
         localStorage: 'Plugin local storage',
         localData: 'Plugin local data',
         database: 'Plugin database',
-        settings: 'Device settings',
-        chooseExport: 'Choose what to back up',
-        chooseRestore: 'Choose what to restore',
-        helpExport:
-            'Selected device data is captured after restarting the app into maintenance mode.',
-        helpRestore:
-            'Selected areas replace the data on this device, including keys that exist only here. Unselected areas stay unchanged. No automatic backup will be kept. Back up your current data first if you want to keep it.',
-        helpRestoreFirstRun:
-            'Selected areas are brought onto this device. Unselected areas can be restored later from settings with the same file.',
-        damaged: 'This backup has {0} problems. You can still bring in the parts that are fine.',
-        choosePart: 'Restore selected items only',
-        choosePartHelp:
-            'The current library will be replaced with the selected items. Unselected items will not be restored.',
-        itemCharacters: 'Characters',
-        itemPresets: 'Presets',
-        itemPlugins: 'Plugin data',
-        itemDamaged: '{0} problems',
-        repair: 'This file preserves damaged source data. Its library cannot be activated until repaired.',
-        continue: 'Continue',
-        cancel: 'Cancel',
         dbOnly: 'Database only (.risudat)',
         risuai: 'Export for RisuAI (.bin)',
         pocket: 'Export for PocketRisu (.bin)',
@@ -132,14 +109,6 @@ export const languageEnglish = {
             "wait": 'Keep waiting',
             "stillRunning": 'The backup is still running. You can review it later.',
         },
-        "nextItems": 'Next',
-        "previousItems": 'Previous',
-        "searchItems": 'Search items',
-        "wholeLibrary": 'Entire library',
-        "excludeLibrary": "Do not include library",
-        "skipLibrary": 'Do not restore',
-        "danglingLinks": 'Links to unselected items will be restored with missing targets.',
-        "choosePartFirstRunHelp": 'The selected items will be imported into the library.',
     },
     previousResponseCandidate: 'Previous response',
     nextResponseCandidate: 'Next response',
@@ -2542,7 +2511,6 @@ export const languageEnglish = {
             restoreSnapshot: 'Restore',
             snapshotReasons: {
             dataHealthRepair: "Before data repair",
-            serverSyncRecovery: "Before server comparison",
 
                 manual: 'Created manually',
                 periodic: 'Automatic',
