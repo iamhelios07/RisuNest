@@ -2124,6 +2124,12 @@ export const languageKorean = {
                 '운영체제에서 이 기기의 인증 정보를 열 수 없습니다. 키 저장소 잠금을 해제하거나, 서버에서 이 기기를 새로 등록한 뒤 새 등록 코드를 입력하세요. Linux에서는 잠금 해제된 Secret Service가 필요합니다.',
             connect: '연결하고 동기화',
             disconnect: '연결 해제',
+            disconnectTitle: '연결을 해제하시겠습니까?',
+            disconnectRemoteOnly:
+                '서버에만 있는 파일이 있습니다. 필요한 경우 다운로드한 뒤 연결을 해제하세요.',
+            downloadThenDisconnect: '다운로드 후 연결 해제',
+            downloadFailedKeptConnection:
+                '파일을 다운로드하지 못해 연결을 해제하지 않았습니다. 다시 시도하거나 다운로드하지 않고 연결을 해제하세요.',
             syncNow: '지금 동기화',
             pause: '일시 중지',
             refresh: '화면 새로고침',
@@ -2182,7 +2188,6 @@ export const languageKorean = {
                 "unknown": '항목',
             },
             "statusUnknown": '동기화 상태를 확인할 수 없습니다',
-            "downloadBeforeDisconnect": '서버에만 있는 파일을 이 기기에 다운로드한 뒤 연결을 해제할 수 있습니다. 에셋 보관 방식을 이 기기에 모두 보관으로 변경한 뒤 다시 시도하세요.',
             "registrationRefusedHelp": '서버가 이 기기의 등록을 받지 않습니다. 서버에서 새 등록 코드를 발급한 뒤 새 기기로 등록에 입력하세요. 서버를 새로 만든 경우 연결을 해제한 뒤 다시 연결하세요.',
             "revokeBeforeRegistration": '서버에서 기존 기기의 등록을 해제한 뒤 새 등록 코드를 입력하세요.',
             "conflictRefreshed": '충돌 항목이 변경되었습니다. 유지할 쪽을 다시 선택하세요.',
