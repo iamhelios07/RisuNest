@@ -306,6 +306,25 @@ fn a_kept_failure_never_quotes_json_input_or_network_text() {
 }
 
 #[test]
+fn a_logged_failure_never_names_the_temporary_file_path() {
+    let root = tempfile::tempdir().unwrap();
+    let error = tempfile::Builder::new()
+        .tempfile_in(root.path().join("private-\"folder\"-name"))
+        .unwrap_err();
+    assert!(error.to_string().contains("private-"));
+    let failure = SyntheticFailure {
+        code: "synthetic-path",
+        detail: Some(format!("{error}; retry {error}; kept")),
+        expected: false,
+    };
+    let _ = logged::<(), _>("synthetic_path_command", Err(failure));
+    let entry = command_line("synthetic_path_command");
+    assert!(!entry.message.contains("private-"), "{}", entry.message);
+    assert!(entry.message.contains("; retry "), "{}", entry.message);
+    assert!(entry.message.contains("; kept at="), "{}", entry.message);
+}
+
+#[test]
 fn unconfigured_file_path_command_returns_only_a_bounded_code() {
     let state = NativeLogState::for_tests();
 

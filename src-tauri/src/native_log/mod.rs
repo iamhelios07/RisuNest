@@ -196,7 +196,7 @@ fn write_file(inner: &Inner, entry: &LogEntry) {
 }
 
 fn mask(message: &str) -> String {
-    let mut masked = message.to_owned();
+    let mut masked = without_temporary_file_paths(message);
     for key in [
         "authorization",
         "api_key",
@@ -236,6 +236,31 @@ fn mask(message: &str) -> String {
         });
     }
     redact_long_runs(&redact_sk_tokens(&masked))
+}
+
+/// tempfile appends the path it failed on, which names the user's folders.
+fn without_temporary_file_paths(input: &str) -> String {
+    const MARKER: &str = " at path \"";
+    let mut kept = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find(MARKER) {
+        kept.push_str(&rest[..start]);
+        let quoted = &rest[start + MARKER.len()..];
+        let mut escaped = false;
+        let end = quoted.char_indices().find_map(|(index, character)| {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                return Some(index + 1);
+            }
+            None
+        });
+        rest = &quoted[end.unwrap_or(quoted.len())..];
+    }
+    kept.push_str(rest);
+    kept
 }
 
 fn redact_json_value(input: &str, key: &str) -> String {
