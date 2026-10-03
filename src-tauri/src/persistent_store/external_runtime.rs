@@ -7,14 +7,6 @@ use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct ExternalBase {
-    pub repository_id: String,
-    pub snapshot_id: String,
-    pub commit_id: String,
-    pub head_observation: String,
-    pub identity: sync_selection::CaptureIdentity,
-}
-#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct ExternalJob {
     pub id: String,
     pub connection_id: String,
@@ -71,9 +63,11 @@ mod tests {
         assert_eq!(job.connection_id, "destination");
         assert_eq!(job.phase, "complete");
         assert!(store.external_job("missing").unwrap().is_none());
-        let base = store.external_base("destination").unwrap().unwrap();
-        assert_eq!(base.snapshot_id, "sync-snapshot");
-        assert_eq!(base.head_observation, "authenticated-head");
+        let base: (String, String) = store.connection.query_row(
+            "SELECT snapshot_id,head_observation FROM external_storage_bases WHERE connection_id='destination'",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(base, ("sync-snapshot".into(), "authenticated-head".into()));
         assert_eq!(
             store.external_backup_result("backup").unwrap(),
             Some(("backup-snapshot".into(), identity))
@@ -164,23 +158,6 @@ impl PersistentStore {
         let selected = sync_selection::set_paused(&tx, epoch, paused)?;
         tx.commit()?;
         Ok(selected)
-    }
-    pub(crate) fn external_base(&self, connection: &str) -> StoreResult<Option<ExternalBase>> {
-        let row: Option<(String,String,String,String,String)> = self.connection.query_row(
-            "SELECT repository_id,snapshot_id,commit_id,head_observation,identity FROM external_storage_bases WHERE connection_id=?1", [connection],
-            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).optional()?;
-        row.map(
-            |(repository_id, snapshot_id, commit_id, head_observation, identity)| {
-                Ok(ExternalBase {
-                    repository_id,
-                    snapshot_id,
-                    commit_id,
-                    head_observation,
-                    identity: serde_json::from_str(&identity)?,
-                })
-            },
-        )
-        .transpose()
     }
 
     pub(crate) fn external_job_has_no_capture_owner(&self, job: &str) -> StoreResult<bool> {
