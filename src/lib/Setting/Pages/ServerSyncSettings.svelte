@@ -35,6 +35,7 @@
         const token = typeof error === 'object' && error && 'code' in error ? String(error.code) : ''
         if (['clock-skew', 'incoming-clock-skew', 'accepted-clock-correction-required'].includes(token)) return language.lwwSync.clockBlocked
         if (writerRecoveryCodes.includes(token)) return language.lwwSync.writerCollision
+        if (token === 'unit-too-large') return language.lwwSync.unitTooLarge
         if (token.startsWith('credential-')) return copy.credentialUnavailable
         if (token.startsWith('qr-')) return token.includes('permission') ? copy.cameraDenied : copy.cameraUnavailable
         return copy.errorHelp

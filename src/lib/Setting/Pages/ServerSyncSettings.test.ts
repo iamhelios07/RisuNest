@@ -66,6 +66,14 @@ it.each(['', 'server-unreachable', 'clock-skew', 'unauthorized'])('offers no new
     expect(findButton(languageEnglish.risuNest.serverSync.connect)).toBeDefined()
     expect(findButton(languageEnglish.lwwSync.newDeviceAction)).toBeUndefined()
 })
+it('explains an item too large to send instead of the generic sync error', async () => {
+    f.view = { status: { configured: true, bound: true }, paused: true, error: 'unit-too-large' }
+    component = mount(ServerSyncSettings, { target: host, props: { connectTarget: vi.fn() } })
+    await settle()
+    const alert = host.querySelector('[role="alert"]')
+    expect(alert?.textContent).toBe(languageEnglish.lwwSync.unitTooLarge)
+    expect(alert?.textContent).not.toBe(languageEnglish.risuNest.serverSync.errorHelp)
+})
 it('keeps settings on the existing production action by default', async () => {
     component = mount(ServerSyncSettings, { target: host })
     await registration(); click(languageEnglish.risuNest.serverSync.connect); await settle()
