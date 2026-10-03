@@ -80,7 +80,7 @@ If your plugin relies on any of the above APIs, you will need to modify your cod
 - `addEventListener` (proxied to the main window)
 - `removeEventListener` (proxied to the main window)
 
-`safeLocalStorage`: A secure wrapper around localStorage that restricts access to internal data. can also be accessed using `localStorage`. It is device-local, is not included in save snapshots, and does not sync between devices. In RisuNest it holds only the calling plugin's own keys.
+`safeLocalStorage`: A secure wrapper around localStorage that restricts access to internal data. can also be accessed using `localStorage`. It is device-local, is not included in save snapshots, and does not sync between devices. In RisuNest it holds only the calling plugin's own keys, and its backup and sync follow [RisuNest device-local plugin data](#risunest-device-local-plugin-data).
 
 `safeDocument`: A secure wrapper around the Document object that restricts access to sensitive data and methods. still it can be used to create elements, query elements, and manipulate the DOM. can also be accessed using `document`.
 
@@ -870,3 +870,38 @@ are loaded again. There is no change notification for this and none is planned.
 On the native app both device-local spaces are kept in the installation's own device
 file. A `setItem`, `removeItem` or `clear` there settles only after the store has kept
 the change, so a call that resolved is already durable.
+
+## RisuNest device-local plugin data
+
+`safeLocalStorage` and `getLocalPluginStorage()` stay on the device by default, as in
+upstream RisuAI. RisuNest adds these rules:
+
+- A full RisuNest backup always includes both spaces, and restoring it replaces them
+  with the backup's values.
+- Both spaces of every plugin sync only when the user turns on the local plugin data
+  option in RisuNest settings. It is off by default and applies to the sync server
+  and external storage alike.
+- When a device first connects to a sync target that already holds data, both spaces
+  are cleared for every plugin. They are filled from the target when the option is on
+  and start empty when it is off. Reconnecting to the same target keeps them.
+- RisuAI and PocketRisu exports never include them.
+
+## RisuNest whole-object setters
+
+`setDatabase`, `setDatabaseLite`, `setCharacter`, `setCharacterToIndex` and
+`setChatToIndex` still take whole objects, but RisuNest saves only the fields that
+differ from your plugin's newest completed read of the same target (the character,
+the chat, or each requested `getDatabase()` key). An edit made elsewhere to a field
+your plugin did not change is kept.
+
+- An object from an earlier read, or a copy of one, is compared with the newest read
+  of its target. A field that changed between those two reads is written back with
+  your object's value, so read again right before editing.
+- A target your plugin never read is compared with its current value.
+- An object read before the library was replaced (connecting to a sync target,
+  restoring a backup, switching libraries) is rejected with a stale read baseline
+  error. Read again and repeat the edit.
+
+Spreading a fresh read and replacing one field, such as
+`setChatToIndex(ci, chi, { ...chat, message: chat.message.map(edit) })`, works as
+before.

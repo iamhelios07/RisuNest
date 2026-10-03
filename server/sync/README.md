@@ -94,7 +94,9 @@ Stop the daemon and use new absolute destination paths:
 ./risunest-sync-server.exe restore --backup-dir E:/backups/risunest-sync --data-dir E:/restored/risunest-sync
 ```
 
-Backup verifies registered objects and writes `backup.json` only after completion. A directory without that completion marker is not a valid backup. Restore verifies the backup, creates a new server epoch, and preserves registered devices so clients can reconcile with the restored server.
+Backup verifies registered objects and writes `backup.json` only after completion. A directory without that completion marker is not a valid backup. Restore verifies the backup, creates a new server epoch, and revokes every registered device. Register each device again (see [Registration and remote access](#registration-and-remote-access)); it connects as a new device, which replaces its library with the restored server state, so changes a device made after the backup was taken are lost unless saved separately before reconnecting.
+
+If clients stop with an integrity error because the server library holds two different changes under the same identity, the app cannot repair the library in place. Restore a backup taken before the problem, or connect the devices to a new, empty library.
 
 The private `connection-state` file is operational configuration and is not part of a library backup. Preserve it separately under the same daemon OS account when restoring the same registry identity.
 

@@ -146,18 +146,10 @@ export async function applyLwwWorkingSetUnits(
             if (kind === 'messages') {
                 if (!Object.hasOwn(before, 'message') || !Object.prototype.propertyIsEnumerable.call(live, 'message')) continue
                 const remote = conversations.get(pair(id, field))
-                if (remote) {
-                    const unchanged = canonicalJson(live.message) === canonicalJson(before.message)
-                    patchField(live, before, remote.value, 'message')
-                    if (unchanged) liveCharacter!.chats[liveCharacter!.chats.indexOf(live)] = { ...live }
-                }
+                if (remote) patchField(live, before, remote.value, 'message')
             } else {
                 const remote = metadata.get(pair(id, field))
-                if (remote) {
-                    const unchanged = canonicalJson({value:live[metadataField]}) === canonicalJson({value:before[metadataField]})
-                    patchField(live, before, remote.value.conversation, metadataField)
-                    if (unchanged) liveCharacter!.chats[liveCharacter!.chats.indexOf(live)] = {...live}
-                }
+                if (remote) patchField(live, before, remote.value.conversation, metadataField)
             }
         } else if (kind === 'preset') {
             const live = database.botPresets.find((value) => value?.['id'] === id)
