@@ -411,6 +411,63 @@ describe('persistent plugin storage capture', () => {
     })
 })
 
+describe('received unit projection into the selected conversation', () => {
+    it('signals the selected session for a received conversation field without replacing its object', async () => {
+        const database = makeConversationDatabase('Initial')
+        const persisted = structuredClone(database)
+        let revision = 1
+        const store = {
+            open: vi.fn(async () => undefined),
+            readRoot: vi.fn(async () => ({ revision, value: capturePersistentRoot(persisted) })),
+            commit: vi.fn(async () => ({ revision: ++revision })),
+            acquireRevision: vi.fn(async (pinned: number) => {
+                const lease = makeDatabaseLease(structuredClone(persisted), pinned)
+                lease.readConversationMetadata = vi.fn(async (characterId: string, conversationId: string) => {
+                    const { message, ...conversation } = persisted.characters.find((value) => value.chaId === characterId)!.chats.find((value) => value.id === conversationId)!
+                    return { revision: pinned, value: { characterId, conversationId, conversation: structuredClone(conversation), totalMessages: message.length } }
+                }) as PersistentRevisionLease['readConversationMetadata']
+                return lease
+            }),
+            lwwStageReceive: vi.fn(async () => undefined),
+            lwwApplyReceive: vi.fn(async () => {
+                persisted.characters[0].chats[0].note = 'Remote note'
+                return { revision: ++revision, affectedKeys: ['["conversation","char-a","chat-a","note"]'], heldKeys: [], deferredKeys: [] }
+            }),
+            lwwFinishReceive: vi.fn(async () => undefined),
+        } as unknown as PersistentDataStore
+        const runtime = createPersistentDataRuntime({
+            store,
+            state: {
+                captureRoot: () => capturePersistentRoot(database),
+                capturePresets: () => database.botPresets,
+                captureCharacters: () => database.characters,
+                captureWorkingSetDatabase: () => database,
+                captureSelectedCharacter: () => database.characters[0] ?? null,
+                captureCharacter: (id) => database.characters.find((character) => character.chaId === id) ?? null,
+                getSelectedCharacterId: () => database.characters[0]?.chaId,
+                getSelectedConversationId: () => database.characters[0]?.chats[0]?.id,
+                replaceDatabase: vi.fn(),
+                publishCharacter: vi.fn(),
+                publishConversation: vi.fn(),
+            },
+            prepareDatabase: async (value) => value,
+        })
+        await runtime.initializeActiveWorkingSet(database)
+        const session = runtime.getActiveConversationSession()!
+        const chat = database.characters[0].chats[0]
+        expect(session.matchesConversation('char-a', chat)).toBe(true)
+        const version = session.version
+        const events: unknown[] = []
+        session.subscribe((event) => { events.push(event) })
+        await runtime.applyLwwReceive({ bindingAuthority: '1', requestId: 'selected-metadata', changes: [], progress: { kind: 'server', cursor: '1' }, admittedTimeUpperMs: '100' })
+        expect(database.characters[0].chats[0]).toBe(chat)
+        expect(chat.note).toBe('Remote note')
+        expect(runtime.getActiveConversationSession()).toBe(session)
+        expect(session.version).toBe(version + 1)
+        expect(events).toEqual([expect.objectContaining({ commands: ['update-metadata'] })])
+    })
+})
+
 describe('persistent conversation replacement publication', () => {
     it('forwards a lease-owned replacement refresh without changing selection', async () => {
         const harness = await createActiveSessionRuntimeHarness()

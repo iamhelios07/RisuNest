@@ -1001,6 +1001,16 @@ export function createPersistentDataRuntime(
         baseline ??= captureLwwWorkingSetBaseline(database, coordinator.capturePersistentBaselineRoot(), dependencies.state.capturePresets?.() ?? null, coordinator.captureMaterializedBaseline(), coordinator.capturePresetRecordBaseline())
         const selectedTarget = workingSet.captureSelectedConversationTarget()
         const selectedSession = workingSet.activeConversationSession
+        // Remote values are patched into the live conversation in place; the
+        // session that renders it is told through its own version instead.
+        const selectedOwner = selectedTarget ? database.characters.find((value) => value.chaId === selectedTarget.characterId) : undefined
+        const selectedChat = selectedOwner?.chats.find((value) => value.id === selectedTarget!.conversationId)
+        const selectedFields = selectedChat && selectedSession?.matchesConversation(selectedTarget!.characterId, selectedChat)
+            ? new Map(result.affectedKeys.map((key) => JSON.parse(key) as string[])
+                .filter(([kind, characterId, conversationId]) => (kind === 'conversation' || kind === 'messages') && characterId === selectedTarget!.characterId && conversationId === selectedTarget!.conversationId)
+                .map(([kind, , , field]) => kind === 'messages' ? 'message' : field)
+                .map((field) => [field, (selectedChat as unknown as Record<string, unknown>)[field]] as const))
+            : undefined
         const authorityEpoch = coordinator.storageAuthorityEpoch
         const lease = await dependencies.store.acquireRevision(result.revision)
         const projectionBaseline = baseline
@@ -1026,6 +1036,13 @@ export function createPersistentDataRuntime(
             })
         } finally { await releasePersistentRevisionLease(lease) }
         coordinator.adoptAppliedUnitState(result.revision, applied.root, applied.presets, applied.characters, applied.presetRecords)
+        if (selectedFields && [...selectedFields].some(([field, value]) => (selectedChat as unknown as Record<string, unknown>)[field] !== value) &&
+            selectedSession!.matchesConversation(selectedTarget!.characterId, selectedChat!) &&
+            !selectedSession!.adoptPersistedMetadata(selectedChat!, result.revision)) {
+            // A session that cannot adopt the change is republished from a new object.
+            const index = selectedOwner!.chats.indexOf(selectedChat!)
+            if (index >= 0) selectedOwner!.chats[index] = { ...selectedChat! }
+        }
         if (selectedTarget && selectedSession) workingSet.refreshSelectedConversationAfterReplacement(selectedTarget, selectedSession)
         for (const key of result.affectedKeys) {
             const [kind, owner, name] = JSON.parse(key)
