@@ -314,13 +314,14 @@ fn capture_conversation(
     generation: &str,
     char_id: &str,
     id: &str,
-    edit: Option<super::super::message_pages::MessageEdit>,
+    edits: Option<&[super::super::message_pages::MessageEdit]>,
     before: bool,
     out: &mut BTreeMap<UnitKey, UnitValue>,
 ) -> StoreResult<()> {
     if let Some(value)=text_value(db,"SELECT detail FROM conversations WHERE generation=?1 AND character_id=?2 AND conversation_id=?3",params![generation,char_id,id])? {
         add(out,&["exists","conversation",char_id,id],&json!(true))?;fields(out,&["conversation",char_id,id],&value,CONVERSATION_FIELDS)?;
-        let manifest=if before || edit.is_none() && out.contains_key(&unit_key(&["messages",char_id,id])?) {super::super::message_pages::current_manifest(db,generation,char_id,id)?}else{super::super::message_pages::capture_manifest(db,generation,char_id,id,edit)?};
+        let unchanged=edits.is_some_and(<[_]>::is_empty)||edits.is_none()&&out.contains_key(&unit_key(&["messages",char_id,id])?);
+        let manifest=if before || unchanged {super::super::message_pages::current_manifest(db,generation,char_id,id)?}else{super::super::message_pages::capture_manifest(db,generation,char_id,id,edits)?};
         out.insert(unit_key(&["messages",char_id,id])?,manifest);
     }
     Ok(())
@@ -365,8 +366,11 @@ pub(in crate::persistent_store) fn capture_targets(
     for (id, full) in characters {
         capture_character(db, generation, &id, full, before, &mut out)?;
     }
+    // Every range of one conversation is captured once, from the pages the
+    // ranges touch, so later ranges see the count the earlier ones left.
+    let mut ranges: Vec<((&str, &str), Option<Vec<(i64, i64, i64)>>)> = Vec::new();
     for mutation in input.conversations.iter().flatten() {
-        match mutation {
+        let (conversation, range) = match mutation {
             super::super::ConversationMutation::ReplaceRange {
                 character_id,
                 conversation_id,
@@ -374,38 +378,32 @@ pub(in crate::persistent_store) fn capture_targets(
                 delete_count,
                 messages,
                 ..
-            } => capture_conversation(
-                db,
-                generation,
-                character_id,
-                conversation_id,
-                effective_edit(
-                    db,
-                    generation,
-                    character_id,
-                    conversation_id,
-                    *start,
-                    *delete_count,
-                    messages.len() as i64,
-                    before,
-                )?,
-                before,
-                &mut out,
-            )?,
+            } => ((character_id.as_str(), conversation_id.as_str()), Some((*start, *delete_count, messages.len() as i64))),
             super::super::ConversationMutation::Delete {
                 character_id,
                 conversation_id,
-            } => capture_conversation(
-                db,
-                generation,
-                character_id,
-                conversation_id,
-                None,
-                before,
-                &mut out,
-            )?,
-            super::super::ConversationMutation::Reorder { .. } => {}
+            } => ((character_id.as_str(), conversation_id.as_str()), None),
+            super::super::ConversationMutation::Reorder { .. } => continue,
+        };
+        let index = match ranges.iter().position(|(existing, _)| *existing == conversation) {
+            Some(index) => index,
+            None => {
+                ranges.push((conversation, Some(Vec::new())));
+                ranges.len() - 1
+            }
+        };
+        match (range, &mut ranges[index].1) {
+            (Some(range), Some(group)) => group.push(range),
+            (None, group) => *group = None,
+            (Some(_), None) => {}
         }
+    }
+    for ((character_id, conversation_id), group) in ranges {
+        let edits = match group {
+            Some(group) => conversation_edits(db, generation, character_id, conversation_id, &group, before)?,
+            None => None,
+        };
+        capture_conversation(db, generation, character_id, conversation_id, edits.as_deref(), before, &mut out)?;
     }
     for character_id in conversation_orders {
         let ids: Vec<String> = {
@@ -1368,7 +1366,7 @@ pub(in crate::persistent_store) fn refresh_orders(
             other => other,
         };
         let units: Vec<(String, String)> = {
-            let mut s=tx.prepare("SELECT key,stamp FROM lww_units WHERE json_extract(key,'$[0]')=?4 AND json_extract(key,'$[1]')=?1 AND value<>?2 AND (?3 IS NULL OR json_extract(key,'$[2]')=?3)")?;
+            let mut s=tx.prepare("SELECT u.key,u.stamp FROM lww_units u LEFT JOIN lww_retired r ON r.key=u.key WHERE r.key IS NULL AND json_extract(u.key,'$[0]')=?4 AND json_extract(u.key,'$[1]')=?1 AND u.value<>?2 AND (?3 IS NULL OR json_extract(u.key,'$[2]')=?3)")?;
             let v = s
                 .query_map(
                     params![
@@ -1395,9 +1393,6 @@ pub(in crate::persistent_store) fn refresh_orders(
             let k: UnitKey = wire(k.try_into())?;
             let parts = k.components();
             if exists_kind == "conversation" && parts[2] != p[2] {
-                continue;
-            }
-            if is_retired(tx, &k)? {
                 continue;
             }
             live.push(risunest_sync_wire::order::LiveRecord {
@@ -1485,16 +1480,17 @@ pub(in crate::persistent_store) fn refresh_orders(
     Ok(())
 }
 
-fn effective_edit(
+/// Folds a conversation's ranges into edits against the stored manifest,
+/// clamping each one to the count the earlier ones leave, as the commit applies
+/// them. Ranges that change nothing are dropped.
+fn conversation_edits(
     db: &Connection,
     generation: &str,
     char_id: &str,
     conv: &str,
-    start: i64,
-    deleted: i64,
-    inserted: i64,
+    ranges: &[(i64, i64, i64)],
     before: bool,
-) -> StoreResult<Option<super::super::message_pages::MessageEdit>> {
+) -> StoreResult<Option<Vec<super::super::message_pages::MessageEdit>>> {
     if before {
         return Ok(None);
     }
@@ -1511,14 +1507,22 @@ fn effective_edit(
         .map_err(error)?
         .message_count
         .0;
-    let old = i64::try_from(old).map_err(error)?;
-    let start = start.clamp(0, old);
-    let deleted = deleted.clamp(0, old - start);
-    Ok(Some(super::super::message_pages::MessageEdit {
-        start,
-        delete_count: deleted,
-        insert_count: inserted,
-    }))
+    let mut count = i64::try_from(old).map_err(error)?;
+    let mut edits = Vec::new();
+    for &(start, deleted, inserted) in ranges {
+        let start = start.clamp(0, count);
+        let deleted = deleted.clamp(0, count - start);
+        if deleted == 0 && inserted == 0 {
+            continue;
+        }
+        edits.push(super::super::message_pages::MessageEdit {
+            start,
+            delete_count: deleted,
+            insert_count: inserted,
+        });
+        count = count - deleted + inserted;
+    }
+    Ok(Some(edits))
 }
 
 pub(in crate::persistent_store) fn preserve_local_root(
@@ -1564,10 +1568,13 @@ fn capture_plugin_order(
     add(out, &["order", "plugin-storage", owner], &json!(ids))
 }
 
-pub(in crate::persistent_store) fn archive_value(
-    db: &Connection,
-    archived: &super::super::archive::ArchivedObject,
-) -> StoreResult<UnitValue> {
+type ArchiveObjects = (
+    String,
+    Vec<u8>,
+    risunest_sync_wire::descriptor::RecordDescriptor,
+    Vec<(String, Vec<u8>)>,
+);
+fn archive_objects(archived: &super::super::archive::ArchivedObject) -> StoreResult<ArchiveObjects> {
     use risunest_sync_wire::{
         descriptor::{build_reference_tree, inline_references, RecordDescriptor},
         payload_value,
@@ -1582,8 +1589,7 @@ pub(in crate::persistent_store) fn archive_value(
         crate::persistent_store::hash_work::observe("native_archive", hash_input.len());
         risunest_sync_wire::hash(hash_input)
     };
-    super::super::message_pages::put_object(db, &hash, &body)?;
-    let mut descriptor = RecordDescriptor::content(hash);
+    let mut descriptor = RecordDescriptor::content(hash.clone());
     let mut dependencies = archived
         .object_roots()
         .map(str::to_owned)
@@ -1600,9 +1606,26 @@ pub(in crate::persistent_store) fn archive_value(
             result
         }.map_err(error)?;
         descriptor.dependency_root = root;
-        for (hash, body) in objects {
-            super::super::message_pages::put_object(db, &hash, &body)?;
-        }
+        return Ok((hash, body, descriptor, objects));
+    }
+    Ok((hash, body, descriptor, Vec::new()))
+}
+/// The message objects an archive value of `archived` keeps: its body and the
+/// reference tree over its asset roots.
+pub(in crate::persistent_store) fn archive_object_hashes(
+    archived: &super::super::archive::ArchivedObject,
+) -> StoreResult<Vec<String>> {
+    let (hash, _, _, objects) = archive_objects(archived)?;
+    Ok(std::iter::once(hash).chain(objects.into_iter().map(|(hash, _)| hash)).collect())
+}
+pub(in crate::persistent_store) fn archive_value(
+    db: &Connection,
+    archived: &super::super::archive::ArchivedObject,
+) -> StoreResult<UnitValue> {
+    let (hash, body, descriptor, objects) = archive_objects(archived)?;
+    super::super::message_pages::put_object(db, &hash, &body)?;
+    for (hash, body) in objects {
+        super::super::message_pages::put_object(db, &hash, &body)?;
     }
     {
         let result = UnitValue::object(descriptor);
@@ -1711,9 +1734,9 @@ mod hash_work_tests {
         let manifest = MessageManifest { schema: MANIFEST_SCHEMA.into(), message_count: 0.into(), pages: vec![] }.encode().unwrap();
         db.execute("INSERT INTO message_page_manifests VALUES('g','c','chat',?1)", [&manifest.bytes]).unwrap();
         reset_hash_work();
-        effective_edit(&db, "g", "c", "chat", 0, 0, 1, true).unwrap();
+        conversation_edits(&db, "g", "c", "chat", &[(0, 0, 1), (1, 0, 1)], true).unwrap();
         assert!(take_hash_work().domains.is_empty());
-        effective_edit(&db, "g", "c", "chat", 0, 0, 1, false).unwrap();
+        conversation_edits(&db, "g", "c", "chat", &[(0, 0, 1), (1, 0, 1)], false).unwrap();
         let work = take_hash_work();
         assert_eq!(work.domains["native_manifest_decode_identity"], DomainWork { calls: 1, bytes: manifest.bytes.len() as u64 });
         assert!(work.incomplete.is_empty());

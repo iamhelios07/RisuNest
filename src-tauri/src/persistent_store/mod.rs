@@ -69,6 +69,7 @@ pub(super) const CONVERSATION_RANGE_MAX_LIMIT: i64 = 4_096;
 pub(super) const JAVASCRIPT_MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 pub(crate) const ASSET_GC_PRODUCT_PAGE_LIMIT: i64 = 128;
 const ASSET_GC_PRODUCT_MINIMUM_GRACE_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
+pub(crate) const MESSAGE_PAGE_SWEEP_LIMIT: usize = 1_024;
 
 // Add every generation-scoped record family here so staged moves and cleanup cannot omit it.
 pub(super) const GENERATION_TABLES: &[(&str, &str)] = &[
@@ -1634,8 +1635,7 @@ impl PersistentStore {
         expected_revision: i64,
     ) -> StoreResult<AssignedPluginStorage> {
         let assigned_at = device_store::now_ms()?;
-        let (outcome, revision) = commit::assign_plugin_storage(
-            &mut self.connection,
+        let (outcome, revision) = self.lww_assign_plugin_storage(
             sources,
             owner,
             collision,
@@ -2690,6 +2690,37 @@ impl PersistentStore {
         )?;
         self.record_asset_gc_maintenance_cursor(page.next_cursor.as_deref())?;
         Ok(page)
+    }
+
+    /// One bounded pass over the library's message objects. Roots are read inside the
+    /// write transaction, so a reference committed before the pass is seen.
+    /// Callers hold native file admission so no replacement runs meanwhile.
+    pub(crate) fn sweep_message_page_objects(
+        &mut self,
+        now_ms: i64,
+        limit: usize,
+    ) -> StoreResult<message_pages::ObjectSweep> {
+        let Ok(device) = self.device_store.as_ref() else {
+            return Ok(message_pages::ObjectSweep::default());
+        };
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let roots = message_pages::object_roots(
+            &transaction,
+            self.revision_leases.values().map(|lease| &lease.connection),
+            device.connection(),
+            &transaction,
+        )?;
+        let sweep = message_pages::sweep_objects(
+            &transaction,
+            &roots,
+            now_ms,
+            ASSET_GC_PRODUCT_MINIMUM_GRACE_MS,
+            limit,
+        )?;
+        transaction.commit()?;
+        Ok(sweep)
     }
 
     fn record_asset_gc_maintenance_cursor(&mut self, cursor: Option<&str>) -> StoreResult<()> {
