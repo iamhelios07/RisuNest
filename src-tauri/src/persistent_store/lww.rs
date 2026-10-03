@@ -2844,7 +2844,7 @@ mod hash_work_tests {
     fn routine_commit_does_not_hash_binding_proofs() {
         let directory = tempfile::tempdir().unwrap();
         let mut store = PersistentStore::open(directory.path()).unwrap();
-        let key = UnitKey::new(&["toggle", "synthetic-counter"]).unwrap();
+        let key = UnitKey::new(&["toggle", "toggle_synthetic-counter"]).unwrap();
         for value in [true, false] {
             reset_hash_work();
             store.commit(&crate::persistent_store::WorkingSetCommit {
