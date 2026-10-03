@@ -408,11 +408,13 @@ fn is_json(text: &str) -> bool {
     serde_json::from_str::<serde::de::IgnoredAny>(text).is_ok()
 }
 
-/// Stored JSON text as its entry carries it. Past the inline limit the entry
-/// names the text itself, which still has to parse.
+/// Stored JSON text as its entry carries it. Text that does not parse is
+/// refused at any length; past the inline limit the entry names the text.
 fn json_value(text: &str) -> StoreResult<ValueOrObject> {
     if !rides_as_object(text.as_bytes()) {
-        return Ok(ValueOrObject::Inline(serde_json::from_str(text)?));
+        return serde_json::from_str(text)
+            .map(ValueOrObject::Inline)
+            .map_err(|_| invalid("Device value is not JSON"));
     }
     if !is_json(text) {
         return Err(invalid("Device value is not JSON"));

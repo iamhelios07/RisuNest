@@ -1627,6 +1627,50 @@ mod section_exchange {
         ));
     }
 
+    /// Stored JSON text that does not parse is refused the same way whether it
+    /// would ride inline or as an object, and the refusal never repeats it.
+    #[test]
+    fn unparseable_stored_json_is_refused_alike_at_any_length() {
+        use crate::persistent_store::StoreError;
+        use risunest_external_storage_format::section::MAX_INLINE_VALUE_BYTES;
+        let refusal = |kind: SectionKind, broken: &str| {
+            let (_directory, mut store) = open();
+            if kind == SectionKind::LocalPlugins {
+                store
+                    .write_plugin_device_values(
+                        "plugin-a",
+                        &[PluginDeviceMutation::Set {
+                            space: "json".to_owned(),
+                            key: "broken".to_owned(),
+                            value: broken.to_owned(),
+                        }],
+                    )
+                    .expect("write plugin value");
+            } else {
+                store
+                    .connection()
+                    .execute(
+                        "INSERT INTO device_settings(key,value) VALUES('risuNestDeviceSettings',?1)",
+                        [broken],
+                    )
+                    .expect("write setting");
+            }
+            match store.capture_backup_sections(&[kind]).err().expect("capture refused") {
+                StoreError::Validation { message } => {
+                    assert!(!message.contains("secret"), "{message}");
+                    message
+                }
+                other => panic!("{other:?}"),
+            }
+        };
+        let small = "{\"secret\":\"s\"".to_owned();
+        let large = format!("{{\"secret\":\"{}\"", "s".repeat(MAX_INLINE_VALUE_BYTES));
+        assert!(small.len() <= MAX_INLINE_VALUE_BYTES && large.len() > MAX_INLINE_VALUE_BYTES);
+        for kind in [SectionKind::LocalPlugins, SectionKind::LocalSettings] {
+            assert_eq!(refusal(kind, &small), refusal(kind, &large));
+        }
+    }
+
     /// Invariant 31 on the device side. The material decides the section: a key
     /// it carries is installed, a key it leaves out is removed, and a section it
     /// says nothing about keeps everything this device holds.
