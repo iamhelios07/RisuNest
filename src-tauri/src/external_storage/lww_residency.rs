@@ -346,8 +346,9 @@ pub(crate) fn hydrate_registered_many(root:&Path,digests:&[String],priority:&std
                     }
                     other=>other?,
                 };
+                // Every read above finished before this check, so one check covers the whole group.
+                if let Some(reason)=owner.recheck(&protection,&cancel).await? {return Err(super::leases::yield_error(reason));}
                 for source in missing {
-                    if let Some(reason)=owner.recheck(&protection,&cancel).await? {return Err(super::leases::yield_error(reason));}
                     install(&source.hash,source.byte_length,files.get(&source.hash).ok_or_else(segment::corrupt)?).map_err(|error| {installer_error.replace(Some(error));segment::corrupt()})?;
                 }
                 Ok(())
