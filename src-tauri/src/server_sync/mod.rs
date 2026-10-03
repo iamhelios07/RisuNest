@@ -134,6 +134,8 @@ impl From<crate::persistent_store::StoreError> for SyncError {
                 Self::new("local-revision-changed", 409)
             }
             crate::persistent_store::StoreError::Validation { message } if matches!(message.as_str(), "accepted-clock-correction-required" | "incoming-clock-skew" | "clock-skew" | "equal-stamp-integrity" | "writer-collision" | "binding-authority-changed") => Self::new(message,409),
+            crate::persistent_store::StoreError::Store { message } => Self::caused("local-storage", 503, message),
+            crate::persistent_store::StoreError::CommitBusy => Self::new("library-operation-busy", 409),
             other => Self::caused("local-validation", 409, other.to_string()),
         }
     }
@@ -162,6 +164,23 @@ mod classification_tests {
         }
         assert!(SyncError::new("server-storage-full", 507).retryable);
         assert!(SyncError::new("local-storage", 503).retryable);
+    }
+
+    #[test]
+    fn local_store_failures_are_retryable_and_validation_stays_final() {
+        use crate::persistent_store::StoreError;
+        let store = SyncError::from(StoreError::Store { message: "disk I/O error".to_owned() });
+        assert_eq!((store.code.as_str(), store.status, store.retryable), ("local-storage", 503, true));
+        assert_eq!(store.cause.as_deref(), Some("disk I/O error"));
+        let busy = SyncError::from(StoreError::CommitBusy);
+        assert_eq!((busy.code.as_str(), busy.status, busy.retryable), ("library-operation-busy", 409, true));
+        let conflict = SyncError::from(StoreError::RevisionConflict { expected: 1, actual: 2 });
+        assert_eq!((conflict.code.as_str(), conflict.retryable), ("local-revision-changed", true));
+        let collision = SyncError::from(StoreError::Validation { message: "writer-collision".to_owned() });
+        assert_eq!((collision.code.as_str(), collision.retryable), ("writer-collision", false));
+        let invalid = SyncError::from(StoreError::Validation { message: "unit is malformed".to_owned() });
+        assert_eq!((invalid.code.as_str(), invalid.status, invalid.retryable), ("local-validation", 409, false));
+        assert_eq!(invalid.cause.as_deref(), Some("unit is malformed"));
     }
 
     #[test]
