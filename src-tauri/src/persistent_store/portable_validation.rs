@@ -151,10 +151,8 @@ fn validate_row(table: &PortableTable, row: &Row<'_>) -> StoreResult<()> {
         "bot_presets" => {
             let value = json(row, 4)?;
             let index: i64 = row.get(1)?;
-            require(
-                index >= 0 && row.get::<_, String>(0)? == index.to_string(),
-                "portable preset identity mismatch",
-            )?;
+            require(index >= 0, "portable preset order is negative")?;
+            required_id(row, 0, &value, "id")?;
             text_equal(
                 row,
                 2,
@@ -276,22 +274,7 @@ fn validate_row(table: &PortableTable, row: &Row<'_>) -> StoreResult<()> {
         "asset_owner_heads" => {
             let kind: String = row.get(0)?;
             let locator: String = row.get(1)?;
-            let owner = match kind.as_str() {
-                "character-additional-assets" => {
-                    super::AssetOwnerLocator::CharacterAdditionalAssets {
-                        character_id: locator,
-                    }
-                }
-                "root-module-assets" => super::AssetOwnerLocator::RootModuleAssets {
-                    index: owner_index(&locator)?,
-                },
-                "persona-embedded-module-assets" => {
-                    super::AssetOwnerLocator::PersonaEmbeddedModuleAssets {
-                        index: owner_index(&locator)?,
-                    }
-                }
-                _ => return Err(invalid("portable owner kind is invalid")),
-            };
+            let owner = super::AssetOwnerLocator::from_storage(&kind,&locator)?;
             let present: i64 = row.get(2)?;
             require(
                 matches!(present, 0 | 1),
@@ -424,17 +407,6 @@ fn required_id(row: &Row<'_>, index: usize, value: &Value, key: &str) -> StoreRe
         .ok_or_else(|| invalid("portable JSON identity is absent"))?;
     text_equal(row, index, id)
 }
-fn owner_index(locator: &str) -> StoreResult<i64> {
-    let index = locator
-        .parse::<i64>()
-        .map_err(|_| invalid("portable owner index is invalid"))?;
-    require(
-        index >= 0 && index.to_string() == locator,
-        "portable owner index is noncanonical",
-    )?;
-    Ok(index)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,6 +482,10 @@ mod tests {
     #[test]
     fn refuses_damaged_identity_order_parent_and_derived_columns() {
         for sql in [
+            "UPDATE bot_presets SET preset_id='forged-preset'",
+            "UPDATE bot_presets SET value=json_remove(value,'$.id')",
+            "UPDATE bot_presets SET configured_index=-1",
+            "INSERT INTO bot_presets SELECT * FROM bot_presets",
             "UPDATE characters SET detail='not JSON'",
             "UPDATE characters SET character_id='wrong'",
             "UPDATE characters SET name='wrong'",

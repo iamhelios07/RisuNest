@@ -54,6 +54,77 @@ describe('SaveCoordinator', () => {
         expect(coordinator.hasPendingPersistenceWork).toBe(false)
     })
 
+    it.each(['unchanged', 'other-conversation', 'unrelated-detail'] as const)('acknowledges captured session evidence with all-resident capture for %s edits', async (kind) => {
+        const database = makeChattyDatabase()
+        const commit = vi.fn(async ({expectedRevision}) => ({revision: expectedRevision + 1}))
+        const onPersisted = vi.fn()
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit), captureRoot: () => captureRoot(database),
+            captureCharacters: () => database.characters,
+            captureSelectedCharacter: () => database.characters[0], replaceDatabase: () => undefined,
+            onConversationMutationPersisted: onPersisted,
+        })
+        coordinator.initialize(2)
+        const conversation = database.characters[0].chats[1]
+        const session = new ActiveConversationSession({characterId: 'char-a', conversationId: 'two',
+            conversation, storeRevision: 2, onMutation: (event) => coordinator.recordActiveConversationMutation(event)})
+        session.transaction((transaction) => transaction.edit(transaction.locate(0), {...conversation.message[0]}))
+        if (kind === 'other-conversation') database.characters[0].chats[0].name = 'Changed metadata'
+        if (kind === 'unrelated-detail') database.characters[0].name = 'Changed detail'
+        await coordinator.flushPendingDataLocally('captured-session-evidence')
+        expect(onPersisted).toHaveBeenCalledOnce()
+        expect(coordinator.hasPendingPersistenceWork).toBe(false)
+    })
+
+    it('does not acknowledge all-resident session evidence whose metadata no longer matches the capture', async () => {
+        const database = makeChattyDatabase()
+        const commit = vi.fn(async ({expectedRevision}) => ({revision: expectedRevision + 1}))
+        const onPersisted = vi.fn()
+        const coordinator = new SaveCoordinator({store: makeStore(commit), captureRoot: () => captureRoot(database),
+            captureCharacters: () => database.characters, captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined, onConversationMutationPersisted: onPersisted})
+        coordinator.initialize(2)
+        const conversation = database.characters[0].chats[1]
+        const session = new ActiveConversationSession({characterId: 'char-a', conversationId: 'two', conversation,
+            storeRevision: 2, onMutation: (event) => coordinator.recordActiveConversationMutation(event)})
+        session.transaction((transaction) => transaction.edit(transaction.locate(0), {...conversation.message[0]}))
+        conversation.name = 'Changed after evidence'
+        await expect(coordinator.flushPendingDataLocally('uncovered-session-metadata')).rejects.toThrow('Pending conversation mutations could not be persisted')
+        expect(commit).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({unitMutations: [
+            {key: '["conversation","char-a","two","name"]', type: 'set', value: 'Changed after evidence'},
+        ]}))
+        expect(onPersisted).not.toHaveBeenCalled()
+        expect(session.persistedVersion).toBe(0)
+        expect(coordinator.hasPendingPersistenceWork).toBe(true)
+    })
+
+    it('retains covered all-resident session evidence until its independent detail commit succeeds', async () => {
+        const database = makeChattyDatabase()
+        const commit = vi.fn().mockRejectedValueOnce(new Error('synthetic write failure'))
+            .mockImplementation(async ({expectedRevision}) => ({revision: expectedRevision + 1}))
+        const onPersisted = vi.fn()
+        const coordinator = new SaveCoordinator({store: makeStore(commit), captureRoot: () => captureRoot(database),
+            captureCharacters: () => database.characters, captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined, onConversationMutationPersisted: onPersisted})
+        coordinator.initialize(2)
+        const conversation = database.characters[0].chats[1]
+        const session = new ActiveConversationSession({characterId: 'char-a', conversationId: 'two', conversation,
+            storeRevision: 2, onMutation: (event) => coordinator.recordActiveConversationMutation(event)})
+        session.transaction((transaction) => transaction.edit(transaction.locate(0), {...conversation.message[0]}))
+        database.characters[0].name = 'Independent detail'
+        await expect(coordinator.flushPendingDataLocally('failed-session-evidence')).rejects.toThrow('synthetic write failure')
+        expect(onPersisted).not.toHaveBeenCalled()
+        expect(coordinator.hasPendingPersistenceWork).toBe(true)
+        await coordinator.flushPendingDataLocally('retry-session-evidence')
+        expect(commit).toHaveBeenCalledTimes(2)
+        expect(commit.mock.calls[1][0]).toMatchObject({unitMutations: [
+            {key: '["character","char-a","name"]', type: 'set', value: 'Independent detail'},
+        ], conversations: [{type: 'replace-range', characterId: 'char-a', conversationId: 'two', start: 0, deleteCount: 1,
+            messages: [{role: 'user', data: 'hello two'}]}]})
+        expect(onPersisted).toHaveBeenCalledOnce()
+        expect(coordinator.hasPendingPersistenceWork).toBe(false)
+    })
+
     it('rejects top-level values that JSON cannot serialize', () => {
         expect(() => canonicalJson(undefined)).toThrow(TypeError)
     })
@@ -594,7 +665,7 @@ describe('SaveCoordinator', () => {
         expect(session.storeRevision).toBe(3)
     })
 
-    it('acknowledges a session append covered by legacy interaction and message-ID normalization', async () => {
+    it.each([false, true])('acknowledges a session append covered by legacy interaction and message-ID normalization (all-resident: %s)', async (allResident) => {
         const database = makeChattyDatabase()
         const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
         let session!: ActiveConversationSession
@@ -609,6 +680,7 @@ describe('SaveCoordinator', () => {
             store: makeStore(commit),
             captureRoot: () => captureRoot(database),
             captureSelectedCharacter: () => database.characters[0],
+            captureCharacters: allResident ? () => database.characters : undefined,
             replaceDatabase: () => undefined,
             onConversationMutationPersisted: onPersisted,
         })
@@ -636,28 +708,43 @@ describe('SaveCoordinator', () => {
         await coordinator.flushPendingData('mixed-session-and-legacy')
 
         expect(commit).toHaveBeenCalledOnce()
-        expect(commit.mock.calls[0][0].conversations).toBeUndefined()
-        expect(commit.mock.calls[0][0].replaceCharacter).toMatchObject({
-            chaId: 'char-a',
-            lastInteraction: 123,
-            chats: [
-                expect.anything(),
-                {
-                    id: 'two',
-                    name: 'Two',
-                    localLore: [],
-                    note: '',
-                    message: [
-                        expect.objectContaining({ chatId: 'normalized-0' }),
-                        expect.objectContaining({ chatId: 'normalized-1' }),
-                        expect.objectContaining({
-                            data: 'session append',
-                            chatId: 'session-output',
-                        }),
-                    ],
-                },
-            ],
-        })
+        if (allResident) {
+            expect(commit.mock.calls[0][0].replaceCharacter).toBeUndefined()
+            expect(commit.mock.calls[0][0].unitMutations).toEqual([
+                {key: '["character","char-a","lastInteraction"]', type: 'set', value: 123},
+            ])
+            expect(commit.mock.calls[0][0].conversations).toEqual([
+                {type: 'replace-range', characterId: 'char-a', conversationId: 'two', start: 0, deleteCount: 2,
+                    messages: [
+                        {role: 'user', data: 'hello two', chatId: 'normalized-0'},
+                        {role: 'char', data: 'reply two', chatId: 'normalized-1'},
+                        {role: 'user', data: 'session append', chatId: 'session-output'},
+                    ]},
+            ])
+        } else {
+            expect(commit.mock.calls[0][0].conversations).toBeUndefined()
+            expect(commit.mock.calls[0][0].replaceCharacter).toMatchObject({
+                chaId: 'char-a',
+                lastInteraction: 123,
+                chats: [
+                    expect.anything(),
+                    {
+                        id: 'two',
+                        name: 'Two',
+                        localLore: [],
+                        note: '',
+                        message: [
+                            expect.objectContaining({ chatId: 'normalized-0' }),
+                            expect.objectContaining({ chatId: 'normalized-1' }),
+                            expect.objectContaining({
+                                data: 'session append',
+                                chatId: 'session-output',
+                            }),
+                        ],
+                    },
+                ],
+            })
+        }
         expect(onPersisted).toHaveBeenCalledOnce()
         expect(session.persistedVersion).toBe(1)
         expect(session.storeRevision).toBe(3)
@@ -1689,7 +1776,7 @@ describe('SaveCoordinator', () => {
         expect(commit.mock.calls[0][0].addCharacter).toMatchObject({ chaId: 'char-added' })
     })
 
-    it('surfaces the pending conflict to a later import instead of blocking it', async () => {
+    it('retries a revision conflict once and preserves a failed addition when the conflict cannot advance', async () => {
         const { database, added } = makeAdditionDatabase()
         const gate = deferred<{ revision: number }>()
         const conflict = new RevisionConflictError(1, 2)
@@ -1711,7 +1798,7 @@ describe('SaveCoordinator', () => {
 
         gate.reject(conflict)
         await expect(first).rejects.toBe(conflict)
-        expect(commit).toHaveBeenCalledOnce()
+        expect(commit).toHaveBeenCalledTimes(2)
 
         const secondInstall = vi.fn()
         await expect(coordinator.commitCharacterAddition({
@@ -1721,8 +1808,8 @@ describe('SaveCoordinator', () => {
         }, 'other-character')).rejects.toBe(conflict)
 
         expect(secondInstall).not.toHaveBeenCalled()
-        expect(commit).toHaveBeenCalledTimes(2)
-        expect(coordinator.revision).toBe(1)
+        expect(commit).toHaveBeenCalledTimes(3)
+        expect(coordinator.revision).toBe(2)
         expect(coordinator.pendingBytes).toBe(9)
     })
 
@@ -2093,8 +2180,7 @@ describe('SaveCoordinator', () => {
         database.username = 'two'
         coordinator.markPersistentDataDirty(1)
         first.resolve({ revision: 2 })
-        await Promise.resolve()
-        await Promise.resolve()
+        await vi.waitFor(() => expect(commit).toHaveBeenCalledTimes(2))
         database.username = 'three'
         coordinator.markPersistentDataDirty(1)
         second.resolve({ revision: 3 })
@@ -2109,7 +2195,6 @@ describe('SaveCoordinator', () => {
 
     it.each([
         new Error('write failed'),
-        new RevisionConflictError(1, 2),
     ])('keeps failed work dirty without retrying for %s', async (error) => {
         const database = makeDatabase()
         const commit = vi.fn().mockRejectedValue(error)

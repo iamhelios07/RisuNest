@@ -1,161 +1,41 @@
-import { describe, expect, it } from 'vitest'
+import { beforeEach, expect, it, vi } from 'vitest'
+import { readFileSync } from 'node:fs'
+const f = vi.hoisted(() => ({ configure: vi.fn(), bind: vi.fn() }))
+vi.mock('src/ts/storage/sync/serverSyncProduction', () => ({ configureServerSyncConnection: f.configure }))
+vi.mock('src/ts/storage/sync/bindingRegistry', () => ({ bindSyncTarget: f.bind }))
+import { connectServerOnboardingTarget } from './externalStorageOnboardingFlow'
 
-import type { ServerSyncSnapshot } from 'src/ts/storage/sync/serverSyncController'
-import {
-    serverSyncOnboardingNext,
-    serverSyncOnboardingOpening,
-    serverSyncOnboardingOutcome,
-    serverSyncOnboardingResume,
-    createServerSyncOnboardingContinuation,
-} from './serverSyncOnboardingFlow'
-
-const head = {
-    libraryId: 'library',
-    epoch: 'epoch',
-    seq: '1',
-    headId: 'head',
-    minRetainedSeq: '0',
-    sections: {
-      hypa: { stateId: 'hypa-state', changedSeq: '0', gcFloor: '0' },
-      library: { stateId: 'library-state', changedSeq: '0', gcFloor: '0' },
-      'local-plugins': { stateId: 'plugins-state', changedSeq: '0', gcFloor: '0' },
-    },
-}
-const identity = {
-    endpoint: 'https://sync.example/',
-    libraryId: 'library',
-    deviceId: 'device',
-}
-function finished(phase: 'idle' | 'pending' | 'conflict'): ServerSyncSnapshot {
-    return {
-        running: false,
-        paused: false,
-        error: '',
-        attemptId: 1,
-        attemptIdentity: identity,
-        initialSyncComplete: phase === 'idle',
-        status: {
-            localRevision: 3,
-            reconciling: false,
-            configured: true,
-            ...identity,
-            head,
-            dirtyRecords: 0,
-            pendingDeviceSections: false,
-            fullScan: false,
-            registrationRequired: false,
-            operationPending: phase === 'pending',
-        },
-        result: {
-            endpoint: identity.endpoint,
-            phase,
-            localRevision: 3,
-            head,
-            conflictCount: phase === 'conflict' ? 1 : 0,
-            conflicts: [],
-            appliedRecords: 0,
-            proposedRecords: 0,
-        },
-    }
-}
-
-describe('sync server onboarding outcome', () => {
-    it('keeps the progress screen while the attempt runs', () => {
-        expect(serverSyncOnboardingOutcome({ ...finished('idle'), running: true })).toBe(
-            'syncing',
-        )
-    })
-
-    it('finishes only on the verified completion of the attempt', () => {
-        expect(serverSyncOnboardingOutcome(finished('idle'))).toBe('complete')
-        const stale = finished('idle')
-        stale.status!.dirtyRecords = 1
-        expect(serverSyncOnboardingOutcome(stale)).toBe('continuing')
-    })
-
-    it('offers the conflict choice when the first comparison found one', () => {
-        expect(serverSyncOnboardingOutcome(finished('conflict'))).toBe('conflict')
-    })
-
-    it('treats a stop the reader asked for as paused, not as a failure', () => {
-        expect(
-            serverSyncOnboardingOutcome({
-                ...finished('idle'),
-                paused: true,
-                error: 'cancelled',
-                initialSyncComplete: false,
-            }),
-        ).toBe('paused')
-    })
-
-    it('leaves the sync screen only for a completed attempt', () => {
-        expect(serverSyncOnboardingNext('complete')).toBe('done')
-        // A paused attempt stays on the screen so it can be continued there.
-        for (const outcome of ['syncing', 'paused', 'conflict', 'pending', 'continuing', 'error', undefined] as const)
-            expect(serverSyncOnboardingNext(outcome)).toBeUndefined()
-    })
-
-    it('separates an unfinished server job from a failure', () => {
-        expect(serverSyncOnboardingOutcome(finished('pending'))).toBe('pending')
-        expect(
-            serverSyncOnboardingOutcome({ ...finished('pending'), error: 'server-unreachable' }),
-        ).toBe('error')
-    })
-    it('bounds unchanging tails to two follow-ups and continues when the tail shrinks', () => {
-        const next = createServerSyncOnboardingContinuation()
-        const snapshot = finished('idle')
-        snapshot.status!.dirtyRecords = 5
-        expect(next(snapshot)).toBe(true)
-        expect(next(snapshot)).toBe(false)
-        snapshot.attemptId = 2
-        expect(next(snapshot)).toBe(true)
-        snapshot.attemptId = 3
-        expect(next(snapshot)).toBe(false)
-        snapshot.attemptId = 4
-        snapshot.status!.dirtyRecords = 4
-        expect(next(snapshot)).toBe(true)
-    })
-    it('shows registration errors even if a prior pause was retained', () => {
-        expect(serverSyncOnboardingOutcome({ ...finished('idle'), paused: true, error: 'unauthorized' })).toBe('error')
-    })
+const config = { endpoint: 'https://synthetic.invalid', libraryId: 'library', deviceId: 'registration', token: 'synthetic' }
+beforeEach(() => { vi.clearAllMocks(); f.configure.mockResolvedValue(undefined); f.bind.mockResolvedValue({ kind: 'bound' }) })
+it('configures the registered native target before binding exactly once', async () => {
+    const order: string[] = []
+    f.configure.mockImplementation(async () => { order.push('configure') })
+    f.bind.mockImplementation(async () => { order.push('bind'); return { kind: 'bound' } })
+    expect(await connectServerOnboardingTarget(config)).toEqual({ kind: 'bound' })
+    expect(f.configure).toHaveBeenCalledExactlyOnceWith(config)
+    expect(f.bind).toHaveBeenCalledExactlyOnceWith({ kind: 'server', connectionId: 'server' }, undefined)
+    expect(order).toEqual(['configure', 'bind'])
 })
-
-describe('sync server onboarding on a connected device', () => {
-    it('continues the connection instead of asking for a code again', () => {
-        expect(serverSyncOnboardingResume({ ...finished('pending'), running: true })).toBe('show')
-        // A held library waits for the settings to continue it.
-        expect(serverSyncOnboardingResume({ ...finished('pending'), paused: true })).toBe('show')
-        expect(serverSyncOnboardingResume({ ...finished('pending'), result: undefined })).toBe('retry')
-        expect(
-            serverSyncOnboardingResume({ ...finished('idle'), error: 'library-operation-busy' }),
-        ).toBe('retry')
-    })
-
-    it('asks for a code while the device is not connected', () => {
-        expect(serverSyncOnboardingResume(undefined)).toBeUndefined()
-        expect(serverSyncOnboardingResume({ running: false, paused: false, error: '' })).toBeUndefined()
-        const disconnected = finished('idle')
-        expect(
-            serverSyncOnboardingResume({
-                ...disconnected,
-                status: { ...disconnected.status!, configured: false },
-            }),
-        ).toBeUndefined()
-    })
-
-    it('opens on the sync screen only from the first screen of a connected device', () => {
-        const running = { ...finished('pending'), running: true }
-        expect(serverSyncOnboardingOpening('home', running)).toBe('sync-hub')
-        expect(serverSyncOnboardingOpening('home', finished('idle'))).toBe('sync-hub')
-        expect(serverSyncOnboardingOpening('import', running)).toBeUndefined()
-        expect(serverSyncOnboardingOpening('sync-hub', running)).toBeUndefined()
-        expect(serverSyncOnboardingOpening('home', undefined)).toBeUndefined()
-        const disconnected = finished('idle')
-        expect(
-            serverSyncOnboardingOpening('home', {
-                ...disconnected,
-                status: { ...disconnected.status!, configured: false },
-            }),
-        ).toBeUndefined()
-    })
+it('passes explicit new-device mode to the single shared binding action', async () => {
+    await connectServerOnboardingTarget(config, true)
+    expect(f.bind).toHaveBeenCalledExactlyOnceWith({ kind: 'server', connectionId: 'server' }, { mode: 'new-device' })
+})
+it('preserves cancellation and rejects configuration errors without binding', async () => {
+    const cancelled = { kind: 'cancelled' }
+    f.bind.mockResolvedValue(cancelled)
+    expect(await connectServerOnboardingTarget(config)).toBe(cancelled)
+    f.bind.mockClear(); f.configure.mockRejectedValue(new Error('invalid-endpoint'))
+    await expect(connectServerOnboardingTarget(config)).rejects.toThrow('invalid-endpoint')
+    expect(f.bind).not.toHaveBeenCalled()
+})
+it('preserves binding failure instead of claiming onboarding completion', async () => {
+    f.bind.mockRejectedValue(new Error('refresh-failed'))
+    await expect(connectServerOnboardingTarget(config)).rejects.toThrow('refresh-failed')
+})
+it('wires the native-only entry and advances only a bound server screen', () => {
+    const source = readFileSync('src/lib/Others/Onboarding/Onboarding.svelte', 'utf8')
+    expect(source).toMatch(/\{#if isTauri\}\s*<button[^>]*onclick=\{\(\) => goTo\('sync-server'\)\}/)
+    expect(source).toContain('<ServerSyncSettings connectTarget={onServerConnected} />')
+    expect(source).toContain("if (outcome.kind === 'bound' && flow.state === 'sync-server')")
+    expect(source).toContain("goToOnboardingState(flow, 'done', 'server')")
 })

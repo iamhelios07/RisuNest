@@ -116,6 +116,175 @@ pub(crate) fn pinned_asset_alias(
         .map(|versioned| versioned.value)
 }
 
+pub(super) const PRESET_MIRRORS: &[(&str, &str)] = &[
+    ("apiType", "apiType"),
+    ("localNetworkMode", "localNetworkMode"),
+    ("localNetworkTimeoutSec", "localNetworkTimeoutSec"),
+    ("mainPrompt", "mainPrompt"),
+    ("jailbreak", "jailbreak"),
+    ("globalNote", "globalNote"),
+    ("temperature", "temperature"),
+    ("maxContext", "maxContext"),
+    ("maxResponse", "maxResponse"),
+    ("frequencyPenalty", "frequencyPenalty"),
+    ("PresensePenalty", "PresensePenalty"),
+    ("formatingOrder", "formatingOrder"),
+    ("aiModel", "aiModel"),
+    ("subModel", "subModel"),
+    ("currentPluginProvider", "currentPluginProvider"),
+    ("textgenWebUIStreamURL", "textgenWebUIStreamURL"),
+    ("textgenWebUIBlockingURL", "textgenWebUIBlockingURL"),
+    ("forceReplaceUrl", "forceReplaceUrl"),
+    ("promptPreprocess", "promptPreprocess"),
+    ("bias", "bias"),
+    ("koboldURL", "koboldURL"),
+    ("proxyKey", "proxyKey"),
+    ("ooba", "ooba"),
+    ("ainconfig", "ainconfig"),
+    ("proxyRequestModel", "proxyRequestModel"),
+    ("openrouterRequestModel", "openrouterRequestModel"),
+    ("promptTemplate", "promptTemplate"),
+    ("NAIadventure", "NAIadventure"),
+    ("NAIappendName", "NAIappendName"),
+    ("localStopStrings", "localStopStrings"),
+    ("autoSuggestPrompt", "autoSuggestPrompt"),
+    ("autoSuggestPrefix", "autoSuggestPrefix"),
+    ("autoSuggestClean", "autoSuggestClean"),
+    ("customProxyRequestModel", "customProxyRequestModel"),
+    ("reverseProxyOobaArgs", "reverseProxyOobaArgs"),
+    ("top_p", "top_p"),
+    ("promptSettings", "promptSettings"),
+    ("repetition_penalty", "repetition_penalty"),
+    ("min_p", "min_p"),
+    ("top_a", "top_a"),
+    ("openrouterProvider", "openrouterProvider"),
+    ("useInstructPrompt", "useInstructPrompt"),
+    ("customPromptTemplateToggle", "customPromptTemplateToggle"),
+    ("templateDefaultVariables", "templateDefaultVariables"),
+    ("moduleIntergration", "moduleIntergration"),
+    ("top_k", "top_k"),
+    ("instructChatTemplate", "instructChatTemplate"),
+    ("JinjaTemplate", "JinjaTemplate"),
+    ("jsonSchemaEnabled", "jsonSchemaEnabled"),
+    ("jsonSchema", "jsonSchema"),
+    ("strictJsonSchema", "strictJsonSchema"),
+    ("extractJson", "extractJson"),
+    ("groupOtherBotRole", "groupOtherBotRole"),
+    ("groupTemplate", "groupTemplate"),
+    ("seperateParametersEnabled", "seperateParametersEnabled"),
+    ("seperateParameters", "seperateParameters"),
+    ("customAPIFormat", "customAPIFormat"),
+    ("systemContentReplacement", "systemContentReplacement"),
+    ("systemRoleReplacement", "systemRoleReplacement"),
+    ("customFlags", "customFlags"),
+    ("enableCustomFlags", "enableCustomFlags"),
+    ("thinkingTokens", "thinkingTokens"),
+    ("thinkingType", "thinkingType"),
+    ("deepseekThinkingType", "deepseekThinkingType"),
+    ("adaptiveThinkingEffort", "adaptiveThinkingEffort"),
+    ("deepseekReasoningEffort", "deepseekReasoningEffort"),
+    ("outputImageModal", "outputImageModal"),
+    ("seperateModelsForAxModels", "seperateModelsForAxModels"),
+    ("seperateModels", "seperateModels"),
+    ("modelTools", "modelTools"),
+    ("fallbackModels", "fallbackModels"),
+    ("fallbackWhenBlankResponse", "fallbackWhenBlankResponse"),
+    ("verbosity", "verbosity"),
+    ("dynamicOutput", "dynamicOutput"),
+    ("NAIsettings", "NAISettings"),
+    ("presetRegex", "regex"),
+    ("reasoningEffort", "reasonEffort"),
+];
+pub(super) fn protected_preset_flag(key: &str) -> Option<&'static str> {
+    match key {
+        "seperateModelsForAxModels" | "seperateModels" => Some("doNotChangeSeperateModels"),
+        "fallbackModels" | "fallbackWhenBlankResponse" => Some("doNotChangeFallbackModels"),
+        "seperateParameters" => Some("disableSeperateParameterChangeOnPresetChange"),
+        _ => None,
+    }
+}
+pub(crate) fn derive_identity_root(
+    connection: &Connection,
+    generation: &str,
+    root: &mut Map<String, Value>,
+) -> StoreResult<()> {
+    let presets: Vec<Value> = {
+        let mut q = connection.prepare(
+            "SELECT value FROM bot_presets WHERE generation=?1 ORDER BY configured_index,preset_id",
+        )?;
+        let records = q
+            .query_map([generation], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        records
+            .into_iter()
+            .map(|record| serde_json::from_str(&record).map_err(Into::into))
+            .collect::<StoreResult<_>>()?
+    };
+    let selected = match root.get("botPresetsId") {
+        Some(Value::String(id)) => presets
+            .iter()
+            .position(|p| p.get("id").and_then(Value::as_str) == Some(id.as_str()))
+            .unwrap_or(0),
+        Some(value) => value.as_u64().unwrap_or(0) as usize,
+        None => 0,
+    };
+    if root.contains_key("botPresetsId"){root.insert("botPresetsId".into(), Value::from(selected));}
+    if let Some(preset) = presets.get(selected) {
+        for &(key, field) in PRESET_MIRRORS {
+            let flag = match key {
+                "seperateModelsForAxModels" | "seperateModels" => Some("doNotChangeSeperateModels"),
+                "fallbackModels" | "fallbackWhenBlankResponse" => Some("doNotChangeFallbackModels"),
+                "seperateParameters" => Some("disableSeperateParameterChangeOnPresetChange"),
+                _ => None,
+            };
+            let protected =
+                flag.is_some_and(|f| root.get(f).and_then(Value::as_bool).unwrap_or(false));
+            let value = if protected {
+                root.get("protectedPresetValues").and_then(|v| v.get(key))
+            } else {
+                preset.get(field)
+            }
+            .cloned();
+            if let Some(value) = value {
+                root.insert(key.into(), value);
+            } else {
+                root.shift_remove(key);
+            }
+        }
+    }
+    let personas = root.get("personas").and_then(Value::as_array);
+    let selected = match root.get("selectedPersona") {
+        Some(Value::String(id)) => personas
+            .and_then(|p| {
+                p.iter()
+                    .position(|v| v.get("id").and_then(Value::as_str) == Some(id.as_str()))
+            })
+            .unwrap_or(0),
+        Some(value) => value.as_u64().unwrap_or(0) as usize,
+        None => 0,
+    };
+    let persona = personas.and_then(|p| p.get(selected)).cloned();
+    if root.contains_key("selectedPersona"){root.insert("selectedPersona".into(), Value::from(selected));}
+    if let Some(persona) = persona {
+        for (key, field) in [
+            ("username", "name"),
+            ("userIcon", "icon"),
+            ("personaPrompt", "personaPrompt"),
+            ("userNote", "note"),
+        ] {
+            if let Some(value) = persona.get(field) {
+                root.insert(key.into(), value.clone());
+            } else {
+                root.shift_remove(key);
+            }
+        }
+    }
+    if let Some(value) = root.get("explicitGlobalChatVariables").cloned() {
+        root.insert("globalChatVariables".into(), value);
+    }
+    Ok(())
+}
+
 const RISU_SAVE_HEADER: &[u8] = b"RISUSAVE\0";
 
 const CONFIG: u8 = 0;
@@ -309,6 +478,7 @@ fn create_controlled_inner(
         serde_json::from_str(&root)?,
         "Persistent root must be an object",
     )?;
+    derive_identity_root(connection,&target.generation,&mut root)?;
     root.shift_remove("account");
     if !omit_account {
         if let Some(account) = account {
@@ -1545,15 +1715,15 @@ mod tests {
                 &staging,
                 &json!({
                     "modules": [
-                        {
+                        {"id": "module-0",
                             "name": "Leased Module",
                             "assets": [
                                 ["first", "assets/shared.bin", "PNG", {"tail": 1}],
                                 ["second", "assets/shared.bin", "pNg", "tuple-tail"]
                             ]
                         },
-                        {"name": "Missing Assets"},
-                        {"name": "Empty Assets", "assets": []}
+                        {"id": "module-1", "name": "Missing Assets"},
+                        {"id": "module-2", "name": "Empty Assets", "assets": []}
                     ]
                 }),
             )
@@ -1586,13 +1756,13 @@ mod tests {
                         2,
                     ),
                     AssetOwnerHead::present(
-                        AssetOwnerLocator::RootModuleAssets { index: 0 },
+                        AssetOwnerLocator::RootModuleAssets { module_id: "module-0".to_owned() },
                         manifest.content_hash,
                         2,
                     ),
-                    AssetOwnerHead::absent(AssetOwnerLocator::RootModuleAssets { index: 1 }),
+                    AssetOwnerHead::absent(AssetOwnerLocator::RootModuleAssets { module_id: "module-1".to_owned() }),
                     AssetOwnerHead::present(
-                        AssetOwnerLocator::RootModuleAssets { index: 2 },
+                        AssetOwnerLocator::RootModuleAssets { module_id: "module-2".to_owned() },
                         cas.prepare_bytes(
                             &owner_manifest_codec::encode_owner_manifest(&[]).unwrap(),
                         )
@@ -1608,7 +1778,7 @@ mod tests {
 
         let current = store.replace_begin().unwrap().staging_id;
         store
-            .replace_put_root(&current, &json!({"modules": [{"name": "Current Module"}]}))
+            .replace_put_root(&current, &json!({"modules": [{"id": "module-0", "name": "Current Module"}]}))
             .unwrap();
         store.replace_put_presets(&current, &[]).unwrap();
         store
@@ -1683,7 +1853,8 @@ mod tests {
             fixture["moduleIndex"].as_u64().unwrap(),
         )
         .unwrap();
-        assert_semantically_equal(&projected.value, &fixture["expected"]);
+        let mut expected=fixture["expected"].clone();expected["id"]=serde_json::json!("module-0");
+        assert_semantically_equal(&projected.value, &expected);
         let occurrences = projected.asset_entries.unwrap();
         assert_eq!(
             occurrences
@@ -1723,8 +1894,8 @@ mod tests {
                 &json!({
                     "username": "Native Export",
                     "account": { "token": "secret" },
-                    "modules": [{ "name": "Module" }],
-                    "loadouts": [{ "name": "Loadout" }],
+                    "modules": [{"id": "module-0",  "name": "Module" }],
+                    "loadouts": [{ "id":"loadout-0", "name": "Loadout" }],
                     "plugins": [{ "name": "Plugin" }],
                     "pluginCustomStorage": { "plugin": { "enabled": true } }
                 }),
@@ -1733,7 +1904,7 @@ mod tests {
         store
             .replace_put_presets(
                 &staging,
-                &[json!({ "name": "Preset A" }), json!({ "name": "Preset B" })],
+                &[json!({ "id":"preset-a", "name": "Preset A" }), json!({ "id":"preset-b", "name": "Preset B" })],
             )
             .unwrap();
         store
@@ -1789,22 +1960,22 @@ mod tests {
                     "customBackground": resource,
                     "userIcon": resource,
                     "unrelated": "old",
-                    "modules": [{
+                    "modules": [{"id": "module-0",
                         "assets": [["module", resource, "png"]],
                         "icon": resource,
                         "unrelated": "old"
                     }],
-                    "personas": [{
+                    "personas": [{"id": "persona-0",
                         "icon": resource,
-                        "embeddedModule": {
+                        "embeddedModule": {"id": "embedded-0",
                             "assets": [["persona", resource, "png"]],
                             "icon": resource,
                             "unrelated": "old"
                         }
                     }],
                     "characterOrder": [{ "imgFile": resource, "unrelated": "old" }],
-                    "loadouts": [{ "resource": "old" }],
-                    "plugins": [{ "resource": "old" }],
+                    "loadouts": [{ "id":"loadout-0", "resource": "old" }],
+                    "plugins": [{ "name":"synthetic-plugin", "resource": "old" }],
                     "pluginCustomStorage": {
                         "resource": plugin_resource,
                         "prose": "prefix assets/plugin.bin"
@@ -1884,7 +2055,7 @@ mod tests {
                 "unrelated": "old",
                 "nested": { "icon": "old" },
                 "modules": [
-                    {
+                    {"id": "module-0",
                         "assets": [
                             ["first", "old", "png"],
                             ["second", "chain-start"],
@@ -1901,15 +2072,15 @@ mod tests {
                     "malformed"
                 ],
                 "personas": [
-                    {
+                    {"id": "persona-0",
                         "icon": "old",
-                        "embeddedModule": {
+                        "embeddedModule": {"id": "embedded-0",
                             "assets": [["embedded", "old"], null],
                             "icon": "old",
                             "unrelated": "old"
                         }
                     },
-                    { "icon": null, "embeddedModule": null },
+                    {"id": "persona-1",  "icon": null, "embeddedModule": null },
                     null
                 ],
                 "characterOrder": [
@@ -1933,7 +2104,7 @@ mod tests {
                 "unrelated": "old",
                 "nested": { "icon": "old" },
                 "modules": [
-                    {
+                    {"id": "module-0",
                         "assets": [
                             ["first", "new", "png"],
                             ["second", "chain-middle"],
@@ -1950,15 +2121,15 @@ mod tests {
                     "malformed"
                 ],
                 "personas": [
-                    {
+                    {"id": "persona-0",
                         "icon": "new",
-                        "embeddedModule": {
+                        "embeddedModule": {"id": "embedded-0",
                             "assets": [["embedded", "new"], null],
                             "icon": "new",
                             "unrelated": "old"
                         }
                     },
-                    { "icon": null, "embeddedModule": null },
+                    {"id": "persona-1",  "icon": null, "embeddedModule": null },
                     null
                 ],
                 "characterOrder": [
@@ -2422,7 +2593,7 @@ mod tests {
         );
         assert_eq!(
             blocks[1].value,
-            json!([{ "name": "Preset A" }, { "name": "Preset B" }])
+            json!([{ "id":"preset-a", "name": "Preset A" }, { "id":"preset-b", "name": "Preset B" }])
         );
         assert_eq!(blocks[5].value, json!({ "plugin": { "enabled": true } }));
         assert_eq!(blocks[7].value["chats"][0]["message"][0]["data"], "trash");
@@ -2434,7 +2605,7 @@ mod tests {
     fn moves_large_owned_root_and_block_values_without_recursive_clones() {
         let parsed = json!({
             "before": { "payload": "r".repeat(2 * 1024 * 1024) },
-            "modules": [{ "payload": "m".repeat(2 * 1024 * 1024) }],
+            "modules": [{"id": "module-0",  "payload": "m".repeat(2 * 1024 * 1024) }],
             "loadouts": [{ "payload": "l".repeat(2 * 1024 * 1024) }],
             "plugins": [{ "payload": "p".repeat(2 * 1024 * 1024) }],
             "after": 2,
@@ -2629,7 +2800,7 @@ mod tests {
                         value: json!("unicode"),
                     },
                 ]),
-            })
+            ..Default::default()})
             .unwrap();
         let lease = store.acquire_revision(committed.revision).unwrap().lease;
 
@@ -2658,6 +2829,146 @@ mod tests {
             ]
         );
         assert_eq!(plugin_storage["2"], json!(0));
+    }
+
+    #[test]
+    fn cross_owner_plugin_order_preserves_export_positions_after_updates_and_reorder() {
+        use crate::persistent_store::{lww::UnitMutation, PluginStorageMutation, WorkingSetCommit};
+        use risunest_sync_wire::unit::UnitKey;
+
+        fn exported_storage(store: &mut PersistentStore) -> Value {
+            let lease = store.acquire_revision(store.revision().unwrap()).unwrap().lease;
+            let exported = store.export_risu_save(&lease, false).unwrap();
+            let value = read_blocks(Path::new(&exported.path))
+                .into_iter()
+                .find(|block| block.block_type == PLUGIN_STORAGE)
+                .unwrap()
+                .value;
+            store.release_revision(&lease).unwrap();
+            value
+        }
+        fn assert_keys(value: &Value, expected: &[&str]) {
+            assert_eq!(value.as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>(), expected);
+        }
+        fn set(owner: &str, key: &str, value: i64) -> PluginStorageMutation {
+            PluginStorageMutation::Set { owner: owner.into(), key: key.into(), value: json!(value) }
+        }
+
+        let (_directory, mut store, revision, initial_lease) = fixture();
+        store.release_revision(&initial_lease).unwrap();
+        let imported = store.commit(&WorkingSetCommit {
+            expected_revision: revision,
+            plugin_storage: Some(vec![
+                PluginStorageMutation::Clear { owner: UNOWNED_OWNER.into() },
+                set(UNOWNED_OWNER, "10", 10),
+                set(UNOWNED_OWNER, "2", 2),
+                set(UNOWNED_OWNER, "01", 1),
+                set(UNOWNED_OWNER, "z", 0),
+                set(UNOWNED_OWNER, "4294967295", 5),
+            ]),
+            ..Default::default()
+        }).unwrap();
+        let inserted = store.commit(&WorkingSetCommit {
+            expected_revision: imported.revision,
+            plugin_storage: Some(vec![
+                set("plugin-a", "first", 1),
+                set("plugin-b", "between", 2),
+                set("plugin-a", "second", 3),
+            ]),
+            ..Default::default()
+        }).unwrap();
+        let original_order = ["2", "10", "01", "z", "4294967295", "first", "between", "second"];
+        assert_keys(&exported_storage(&mut store), &original_order);
+
+        let updated = store.commit(&WorkingSetCommit {
+            expected_revision: inserted.revision,
+            plugin_storage: Some(vec![set("plugin-a", "first", 4)]),
+            ..Default::default()
+        }).unwrap();
+        let storage = exported_storage(&mut store);
+        assert_keys(&storage, &original_order);
+        assert_eq!(storage["first"], 4);
+
+        let reordered = store.commit(&WorkingSetCommit {
+            expected_revision: updated.revision,
+            unit_mutations: Some(vec![UnitMutation::Set {
+                key: UnitKey::new(&["order", "plugin-storage", "plugin-a"]).unwrap(),
+                value: json!(["second", "first"]),
+            }]),
+            ..Default::default()
+        }).unwrap();
+        let reordered_keys = ["2", "10", "01", "z", "4294967295", "second", "between", "first"];
+        assert_keys(&exported_storage(&mut store), &reordered_keys);
+        store.commit(&WorkingSetCommit {
+            expected_revision: reordered.revision,
+            plugin_storage: Some(vec![
+                PluginStorageMutation::Delete { owner: "plugin-a".into(), key: "first".into() },
+                set("plugin-a", "first", 6),
+            ]),
+            ..Default::default()
+        }).unwrap();
+        let storage = exported_storage(&mut store);
+        assert_keys(&storage, &reordered_keys);
+        assert_eq!(storage["first"], 6);
+    }
+
+    #[test]
+    fn claimed_plugin_values_keep_global_export_positions_after_both_owners_write_and_reopen() {
+        use crate::persistent_store::{PluginStorageMutation, WorkingSetCommit};
+        let directory = TempDir::new().unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let staging = store.replace_begin().unwrap().staging_id;
+        store.replace_put_root(&staging, &json!({
+            "modules":[],"loadouts":[],
+            "plugins":[{"name":"plugin-a","script":"","enabled":true,"version":"3.0"}],
+            "pluginCustomStorage":{"first":1,"claimed":2,"last":3}
+        })).unwrap();
+        store.replace_commit(&staging, Some(0)).unwrap();
+        let set = |owner: &str, key: &str, value: i64| PluginStorageMutation::Set {
+            owner:owner.into(),key:key.into(),value:json!(value),
+        };
+        store.commit(&WorkingSetCommit {
+            expected_revision:store.revision().unwrap(),
+            plugin_storage:Some(vec![set("plugin-a","owned",4),set("plugin-b","between",5)]),
+            ..Default::default()
+        }).unwrap();
+        let generation = crate::persistent_store::active_generation(&store.connection).unwrap();
+        let original_ordinal: i64 = store.connection.query_row(
+            "SELECT ordinal FROM plugin_storage WHERE generation=?1 AND owner=?2 AND storage_key='claimed'",
+            rusqlite::params![generation,UNOWNED_OWNER], |row| row.get(0),
+        ).unwrap();
+        let script_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let session = store.begin_plugin_claim_session("plugin-a",script_hash,"run-one").unwrap().unwrap();
+        let answer = store.claim_plugin_storage_value(&session,"plugin-a",script_hash,"run-one","claimed",store.revision().unwrap()).unwrap();
+        assert_eq!(answer.value, Some(json!(2)));
+        assert_eq!(store.connection.query_row(
+            "SELECT ordinal FROM plugin_storage WHERE generation=?1 AND owner='plugin-a' AND storage_key='claimed'",
+            [&generation], |row| row.get::<_,i64>(0),
+        ).unwrap(), original_ordinal);
+        store.commit(&WorkingSetCommit {
+            expected_revision:answer.revision,
+            plugin_storage:Some(vec![
+                set("plugin-a","new-owned",6),set(UNOWNED_OWNER,"new-unowned",7),
+                set("plugin-a","claimed",8),set(UNOWNED_OWNER,"first",9),
+            ]), ..Default::default()
+        }).unwrap();
+        store.close_plugin_claim_session(&session).unwrap();
+        drop(store);
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let generation = crate::persistent_store::active_generation(&store.connection).unwrap();
+        let keys: Vec<String> = store.connection.prepare("SELECT storage_key FROM plugin_storage WHERE generation=?1 ORDER BY ordinal,storage_key").unwrap()
+            .query_map([&generation], |row| row.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+        let expected = ["first","claimed","last","owned","between","new-owned","new-unowned"];
+        assert_eq!(keys.iter().map(String::as_str).collect::<Vec<_>>(), expected);
+        let lease = store.acquire_revision(store.revision().unwrap()).unwrap().lease;
+        let exported = store.export_risu_save(&lease,false).unwrap();
+        let storage = read_blocks(Path::new(&exported.path)).into_iter().find(|block|block.block_type==PLUGIN_STORAGE).unwrap().value;
+        assert_eq!(storage.as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>(), expected);
+        assert_eq!(storage["claimed"], json!(8));
+        assert_eq!(storage["first"], json!(9));
+        assert_eq!(storage["new-owned"], json!(6));
+        assert_eq!(storage["new-unowned"], json!(7));
+        store.release_revision(&lease).unwrap();
     }
 
     #[test]
