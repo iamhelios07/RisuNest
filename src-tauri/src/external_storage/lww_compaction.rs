@@ -467,7 +467,7 @@ mod tests {
         let directory=tempfile::tempdir().unwrap();let bytes=b"\"synthetic current data\"";let dead=b"\"synthetic retired data\"";
         let hash=risunest_sync_wire::hash(bytes);let dead_hash=risunest_sync_wire::hash(dead);
         let mut catalog=PublishedCatalog::create(&directory.path().join("published.sqlite")).unwrap();
-        catalog.merge(&crate::persistent_store::lww::Change{key:UnitKey::new(&["root","language"]).unwrap(),
+        catalog.merge(&crate::persistent_store::lww::Change{key:UnitKey::new(&["future-unit","current"]).unwrap(),
             stamp:Stamp{physical_ms:DecimalU64(1),logical:0,writer_id:"00000000-0000-4000-8000-000000000001".into()},
             value:UnitValue::object(RecordDescriptor::content(hash.clone())).unwrap()}).unwrap();
         let mut body_spool=super::super::capture::BackupDependencySpool::new(directory.path()).unwrap();

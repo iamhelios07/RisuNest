@@ -211,7 +211,11 @@ fn observe_descriptor_purposes(
 ) {
     use crate::asset_repository::body_io::{register_object_purpose, BodyPurpose};
     register_object_purpose(descriptor_hash, BodyPurpose::Control);
-    register_object_purpose(&descriptor.object_hash, BodyPurpose::Control);
+    if matches!(key.components()[0].as_str(), "messages" | "archive")
+        || crate::persistent_store::lww::lww_known_unit_key(key)
+    {
+        register_object_purpose(&descriptor.object_hash, BodyPurpose::Control);
+    }
     observe_dependency_purposes(key, &descriptor.dependencies);
     for root in [&descriptor.dependency_root, &descriptor.relation_root]
         .into_iter()
@@ -1111,8 +1115,10 @@ impl LwwClient {
                 store.lww_put_object(descriptor_hash, &body)?;
                 if matches!(change.key.components()[0].as_str(), "messages" | "archive") {
                     controls.insert(descriptor.object_hash.clone());
-                } else {
+                } else if crate::persistent_store::lww::lww_known_unit_key(&change.key) {
                     large.insert(descriptor.object_hash.clone());
+                } else {
+                    remote.insert(descriptor.object_hash.clone());
                 }
                 if change.key.components()[0] == "messages" {
                     controls.extend(descriptor.dependencies.iter().cloned());

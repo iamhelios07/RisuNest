@@ -164,3 +164,43 @@ fn large_plugin_local_values_received_while_disabled_apply_on_enable() {
     assert_eq!(plugin_value(&store), Some(large));
     assert!(store.lww_read_outbox(store.lww_binding_authority().unwrap(), 1000).unwrap().entries.is_empty());
 }
+
+#[test]
+fn held_large_units_are_scanned_for_local_asset_roots() {
+    let (_dir, mut store) = store();
+    let asset = "b".repeat(64);
+    let large = serde_json::json!([asset, "x".repeat(MAX_INLINE_UNIT_BYTES)]);
+    let value = published(&store, &canonical(&large));
+    receive(&mut store, Change { key: unit_key(&["character", "held-character", "desc"]).unwrap(), stamp: stamp(1), value });
+    assert_eq!(store.connection.query_row("SELECT count(*) FROM lww_receive_rows WHERE status='held'", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+    let roots = super::super::snapshot::collect_asset_roots_with_plugin_cache(&store.connection, &Default::default()).unwrap();
+    assert!(roots.object_hashes.contains(&asset));
+    assert!(roots.blockers.is_empty(), "{:?}", roots.blockers);
+}
+
+#[test]
+fn large_plugin_local_units_are_scanned_from_the_device_store() {
+    let (_dir, mut store) = store();
+    let large = format!("assets/{}", "p".repeat(MAX_INLINE_UNIT_BYTES));
+    let value = published(&store, &canonical(&Value::String(large.clone())));
+    receive(&mut store, Change { key: unit_key(&PLUGIN_KEY).unwrap(), stamp: stamp(1), value });
+    assert_eq!(plugin_value(&store), None);
+    let (_, roots) = super::super::snapshot::collect_device_plugin_asset_roots(&store).unwrap();
+    assert!(roots.legacy_asset_keys.contains(&large));
+    assert!(roots.blockers.is_empty(), "{:?}", roots.blockers);
+}
+
+#[test]
+fn large_units_are_backup_controls_above_the_metadata_bound() {
+    let (_dir, mut store) = store();
+    let large = Value::String(text(risunest_sync_wire::MAX_METADATA_BYTES + 1));
+    save(&mut store, &LANGUAGE, large.clone());
+    let body = canonical(&large);
+    let hash = risunest_sync_wire::hash(&body);
+    let (lease, _) = store.lww_acquire_backup_capture(store.revision().unwrap()).unwrap();
+    let units = store.lww_backup_unit_values(&lease.lease).unwrap();
+    let closure = store.lww_backup_dependency_closure(&lease.lease, &units, &crate::local_backup::NeverCancelled).unwrap();
+    assert_eq!(closure.controls.get(&hash), Some(&body));
+    assert!(closure.payload_bodies.is_empty() && closure.managed_payloads.is_empty() && closure.record_payloads.is_empty());
+    store.release_revision(&lease.lease).unwrap();
+}
