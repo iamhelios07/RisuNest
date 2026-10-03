@@ -35,7 +35,7 @@ vi.mock('src/lib/Setting/ExternalStorage/ConnectionForm.svelte', () => ({ defaul
 vi.mock('src/lib/Others/Onboarding/onboardingWeave', () => ({ observeOnboardingWeave: () => () => {} }))
 vi.mock('src/ts/stores.svelte', () => ({ DBState: { db: { language: 'en' } } }))
 import ServerSyncSettings from './ServerSyncSettings.svelte'
-import Onboarding from 'src/lib/Others/Onboarding/Onboarding.svelte' 
+import Onboarding from 'src/lib/Others/Onboarding/Onboarding.svelte'
 let component: ReturnType<typeof mount> | undefined
 let host: HTMLDivElement
 beforeEach(() => { vi.clearAllMocks(); f.native = true; host = document.createElement('div'); document.body.append(host) })
