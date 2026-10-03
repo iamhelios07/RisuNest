@@ -112,9 +112,14 @@ async function retryNativeClock(automatic = false): Promise<void> {
     checkContext(captured)
     if (!automatic || error === 'clock-skew' || error === 'server-unreachable') { error = ''; hydrationError = ''; changed() }
 }
+const failures = (value: unknown): unknown[] => value instanceof AggregateError ? value.errors : [value]
+const transientTransportFailure = (value: unknown) => {
+    const code = serverSyncErrorCode(value)
+    return !!code && !code.startsWith('local-') && typeof value === 'object' && value !== null && 'retryable' in value && value.retryable === true
+}
 async function resumeCurrentServerBinding(state: BindingContext['state']): Promise<void> {
     try { await resumeCurrentSyncBinding(state.target) }
-    catch (value) { error = serverSyncErrorCode(value) || 'server-unreachable'; await controller.ensureStatus(); throw value }
+    catch (value) { error = serverSyncErrorCode(failures(value)[0]) || 'server-unreachable'; await controller.ensureStatus(); throw value }
 }
 async function pushAvailable(captured: BindingContext, requireForeground = false): Promise<void> {
     for (;;) {
@@ -215,8 +220,8 @@ export async function installServerSyncProduction(): Promise<void> {
     if (current.target.kind === 'server' && status.configured) {
         try { await resumeCurrentServerBinding(current) }
         catch (value) {
-            // A fenced offline binding keeps the local library usable until retry.
-            if (serverSyncErrorCode(value) !== 'server-unreachable' || typeof value !== 'object' || value === null || !('retryable' in value) || value.retryable !== true) throw value
+            // A fenced binding that cannot reach its server keeps the local library usable until retry.
+            if (!failures(value).every(transientTransportFailure)) throw value
         }
     }
 }
