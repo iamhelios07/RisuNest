@@ -1,4 +1,5 @@
-import {deriveEffectivePresetMirrors, deriveEffectivePersonaMirrors, deriveEffectiveToggleVariables, flushEffectivePresetEdits, flushEffectivePersonaEdits, flushEffectiveToggleEdits, presetMirrorMap, getExplicitGlobalChatVariables} from './effectiveIdentityState'
+import {deriveEffectivePresetMirrors, deriveEffectivePersonaMirrors, deriveEffectiveToggleVariables, flushEffectivePresetEdits, flushEffectivePersonaEdits, flushEffectiveToggleEdits, presetMirrorMap, getExplicitGlobalChatVariables, translateRootUnitIntents} from './effectiveIdentityState'
+import { configurePersistentIdentityHooks } from './persistentIdentityHooks'
 import { describe, expect, it, vi } from 'vitest'
 import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
 import { IndexedDbPersistentDataStore } from './indexedDbPersistentDataStore'
@@ -112,6 +113,22 @@ describe('LWW renderer save path', () => {
         commit.mockClear()
         await runtime.flushPendingDataLocally('after-received-selected-record')
         expect(commit).not.toHaveBeenCalled()
+    })
+
+    it('translates a plugin toggle intent after flushing an unsaved bound toggle edit', async () => {
+        const {database,store,runtime} = await identityRuntimeHarness()
+        configurePersistentIdentityHooks({beforeCapture:()=>flushEffectiveToggleEdits(database),afterRemoteApply:()=>undefined,
+            translateRootUnitIntents:(mutations)=>translateRootUnitIntents(database,mutations)})
+        try {
+            const chat = database.characters[0].chats[0]
+            database.globalChatVariables.toggle_mode = 'user edit'
+            await runtime.commitPersistentUnitIntent('plugin-toggle',[{key:'["toggle","toggle_plugin"]',type:'set',value:'plugin'}])
+            const stored = await store.readConversationMetadata(database.characters[0].chaId,chat.id!)
+            expect(stored?.value.conversation.savedToggleValues).toEqual({toggle_mode:'user edit',toggle_plugin:'plugin'})
+            expect(database.characters[0].chats[0].savedToggleValues).toEqual({toggle_mode:'user edit',toggle_plugin:'plugin'})
+        } finally {
+            configurePersistentIdentityHooks(null as never)
+        }
     })
 
     it('derives received saved toggles without publishing explicit toggle changes on the next flush', async () => {

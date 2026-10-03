@@ -1140,6 +1140,9 @@ export function createPersistentDataRuntime(
         },
         drainLwwDeferred,
         async commitPersistentUnitIntent(reason, mutations, conversations, wholeMessages) {
+            // Translation reads the effective identity records, so unsaved mirror
+            // edits reach them first.
+            dependencies.state.beforeCapture?.()
             const translated = translatePersistentRootUnitIntents(mutations)
             const affectedKeys = translated.map((value) => value.key)
             for (const value of wholeMessages ?? []) affectedKeys.push(JSON.stringify(['messages', value.characterId, value.conversationId]))
