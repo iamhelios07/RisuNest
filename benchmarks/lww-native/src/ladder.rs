@@ -694,13 +694,13 @@ fn backup_group(recorder:&Recorder,library:&Path,work:&Path,settings:&Settings) 
             let (path,rows)=backup.as_ref().ok_or("backup absent")?;
             let root=work.join(phase);std::fs::create_dir_all(&root).text()?;
             let (store,seeded,missing)=seed_destination(library,rows,&root,missing_every)?;
-            portable_restore(path,&root,store,settings,seeded,&missing)
+            portable_restore(path,&root,store,settings,seeded,rows,&missing)
         });
     }
 }
 
 /// Drives the restore job's selection, finalize and adoption gates the way the renderer does.
-fn portable_restore(backup:&Path,root:&Path,store:PersistentStore,settings:&Settings,seeded:Value,missing:&[(String,u64)])
+fn portable_restore(backup:&Path,root:&Path,store:PersistentStore,settings:&Settings,seeded:Value,rows:&[(String,u64)],missing:&[(String,u64)])
     ->Result<Value,String> {
     use crate::{native_file_jobs::{JobPhase,JobState,NativeFileJobState,OpenedJobSource,portable},portable_backup::source_io};
     let file=File::open(backup).text()?;
@@ -779,6 +779,10 @@ fn portable_restore(backup:&Path,root:&Path,store:PersistentStore,settings:&Sett
     let parent=take_observers(HashTotals::default());
     let source=source_io::take_source_io();
     let (result,worker_observers)=joined.map_err(|panic|format!("restore worker panicked: {}",panic_text(panic)))?;
+    let missing_hashes=missing.iter().map(|(hash,_)|hash.as_str()).collect::<BTreeSet<_>>();
+    let catalog_hashes=rows.iter().map(|(hash,_)|hash.as_str()).collect::<BTreeSet<_>>();
+    let present_reads=source.objects.iter().filter(|(hash,_)|catalog_hashes.contains(hash.as_str()) && !missing_hashes.contains(hash.as_str()))
+        .fold((0u64,0u64),|(count,bytes),(_,work)|(count+1,bytes+work.bytes));
     let cas=crate::asset_repository::PayloadCas::new(root).text()?;
     let mut restored=0u64;
     for (hash,size) in missing {if cas.stat_object(hash).text()?==Some(*size) {restored+=1;}}
@@ -786,6 +790,7 @@ fn portable_restore(backup:&Path,root:&Path,store:PersistentStore,settings:&Sett
         "counts":{"backupBytes":total_bytes,"selected":selected,"finalized":finalized,"adopted":adopted,"summary":result.as_ref().ok(),
             "missingObjects":missing.len(),"missingObjectsRestored":restored,
             "archiveObjectsRead":source.objects.len(),"archiveBytesRead":source.objects.values().map(|work|work.bytes).sum::<u64>(),
+            "archiveObjectsReadAlreadyPresent":present_reads.0,"archiveBytesReadAlreadyPresent":present_reads.1,
             "archiveHashedBytes":source.objects.values().map(|work|work.hashed_bytes).sum::<u64>(),
             "archiveCatalogHashedBytes":source.catalog_hashed_bytes,"workerObservers":worker_observers,"ownerObservers":parent},
         "sqlite":sqlite_sizes(root)});
@@ -982,9 +987,11 @@ fn serverless_group(recorder:&Recorder,library:&Path,work:&Path,settings:&Settin
             target_id:engine.repository.connection_identity.clone(),library_id:engine.library.clone()};
         let receipt=store.replace_lww_binding(&request).at("replace binding")?;
         let activation_ms=window.elapsed();
+        let provider_activated=provider_io(&cycle.provider);
         let authority=store.lww_binding_authority().text()?;
         let finishes=engine.receive_and_apply(&mut store,authority,&[],&cancel).await.at("receive")?;
         let received_ms=window.elapsed();
+        let provider_received=provider_io(&cycle.provider);
         if store.server_asset_policy().text()?!=server_sync::residency::AssetPolicy::Full {return Err("Full policy expected".into());}
         let worker=store.open_native_job_store().text()?;
         let worker_authority=worker.lww_binding_authority().text()?;
@@ -1010,7 +1017,10 @@ fn serverless_group(recorder:&Recorder,library:&Path,work:&Path,settings:&Settin
             "bodies":elapsed-received_ms},"memory":memory,
             "counts":{"remoteObjects":objects.len(),"remoteSnapshots":snapshots.len(),"activationRevision":receipt.revision,
                 "receiveFinishes":finishes,"hydratedObjects":objects_done.load(Ordering::Relaxed),
-                "provider":provider_delta(provider_before,provider_io(&cycle.provider)),"residencyAfter":status,
+                "provider":provider_delta(provider_before,provider_io(&cycle.provider)),
+                "providerBySubphase":{"databaseActivation":provider_delta(provider_before,provider_activated),
+                    "receive":provider_delta(provider_activated,provider_received),"bodies":provider_delta(provider_received,provider_io(&cycle.provider))},
+                "residencyAfter":status,
                 "allBodiesLocal":!status.has_remote_or_missing(),"hydrationWorkers":workers,"observers":observers},
             "sqlite":sqlite_sizes(&root),"remote":"FakeProvider holds every remote object in this process's memory"});
         if status.has_remote_or_missing() {return Err(format!("bodies remain remote or missing after serverless bootstrap: {line}"));}
