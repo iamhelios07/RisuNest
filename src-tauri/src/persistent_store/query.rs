@@ -1044,6 +1044,19 @@ pub(super) fn materialize_with_target(
     connection: &Connection,
     revision: Option<i64>,
 ) -> StoreResult<(Value, ReadTarget)> {
+    materialize_current(connection, revision, true)
+}
+
+/// The current library with every character's `chats` left out.
+pub(super) fn materialize_without_chats(connection: &Connection) -> StoreResult<(Value, ReadTarget)> {
+    materialize_current(connection, None, false)
+}
+
+fn materialize_current(
+    connection: &Connection,
+    revision: Option<i64>,
+    chats: bool,
+) -> StoreResult<(Value, ReadTarget)> {
     let transaction = connection.unchecked_transaction()?;
     let actual = current_revision(&transaction)?;
     let expected = revision.unwrap_or(actual);
@@ -1051,7 +1064,7 @@ pub(super) fn materialize_with_target(
         return Err(StoreError::RevisionConflict { expected, actual });
     }
     let generation = active_generation(&transaction)?;
-    let value = materialize_generation(&transaction, &generation)?
+    let value = materialize_generation(&transaction, &generation, chats)?
         .ok_or(StoreError::RevisionConflict { expected, actual })?;
     transaction.commit()?;
     Ok((
@@ -1067,7 +1080,7 @@ pub(super) fn materialize_target(
     connection: &Connection,
     target: &ReadTarget,
 ) -> StoreResult<Value> {
-    let value = materialize_generation(connection, &target.generation)?.ok_or_else(|| {
+    let value = materialize_generation(connection, &target.generation, true)?.ok_or_else(|| {
         StoreError::Store {
             message: "Persistent lease generation is missing its root".to_owned(),
         }
@@ -1078,7 +1091,7 @@ pub(super) fn materialize_target(
 pub(super) fn materialize_staging(connection: &Connection, staging_id: &str) -> StoreResult<Value> {
     let transaction = connection.unchecked_transaction()?;
     super::commit::require_staging(&transaction, staging_id)?;
-    let value = materialize_generation(&transaction, staging_id)?.ok_or_else(|| {
+    let value = materialize_generation(&transaction, staging_id, true)?.ok_or_else(|| {
         StoreError::Validation {
             message: "Staging generation does not exist".to_owned(),
         }
@@ -1087,7 +1100,11 @@ pub(super) fn materialize_staging(connection: &Connection, staging_id: &str) -> 
     Ok(value)
 }
 
-fn materialize_generation(connection: &Connection, generation: &str) -> StoreResult<Option<Value>> {
+fn materialize_generation(
+    connection: &Connection,
+    generation: &str,
+    chats: bool,
+) -> StoreResult<Option<Value>> {
     let root: Option<String> = connection
         .query_row(
             "SELECT value FROM root WHERE generation = ?1",
@@ -1120,6 +1137,10 @@ fn materialize_generation(connection: &Connection, generation: &str) -> StoreRes
             serde_json::from_str(&detail)?,
             "Character detail must be an object",
         )?;
+        if !chats {
+            characters.push(Value::Object(character));
+            continue;
+        }
         let conversation_records = {
             let mut statement = connection.prepare(
                 "SELECT conversation_id, detail FROM conversations

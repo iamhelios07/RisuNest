@@ -1773,6 +1773,17 @@ impl PersistentStore {
         Ok(database)
     }
 
+    pub(crate) fn materialize_without_chats(&self) -> StoreResult<Value> {
+        let (mut database, target) = query::materialize_without_chats(&self.connection)?;
+        owner_projection::OwnerManifestProjector::from_snapshots_dir(
+            &self.connection,
+            &target,
+            &self.snapshots_dir,
+        )?
+        .project_database(&mut database)?;
+        Ok(database)
+    }
+
     pub(crate) fn materialize_lease(&self, lease: &str) -> StoreResult<Value> {
         let (connection, target) = self.read_view(Some(lease))?;
         let mut database = query::materialize_target(connection, &target)?;
