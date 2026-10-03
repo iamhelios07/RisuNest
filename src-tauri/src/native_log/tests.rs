@@ -290,6 +290,22 @@ fn an_expected_refusal_is_a_warning_without_its_cause_and_success_logs_nothing()
 }
 
 #[test]
+fn a_kept_failure_never_quotes_json_input_or_network_text() {
+    let shape = serde_json::from_str::<u32>("\"private-payload-value\"").unwrap_err();
+    let text = failure_text(&shape);
+    assert!(text.starts_with("json failure at line 1 column"), "{text}");
+    assert!(!text.contains("private-payload-value"));
+    assert_eq!(json_failure(&shape), format!("json-shape{}", &text["json failure".len()..]));
+    let network = reqwest::Client::new()
+        .get("http://[private-signature")
+        .build()
+        .unwrap_err();
+    assert_eq!(failure_text(&network), "network failure");
+    let io = std::io::Error::other("disk refused");
+    assert_eq!(failure_text(&io), "disk refused");
+}
+
+#[test]
 fn unconfigured_file_path_command_returns_only_a_bounded_code() {
     let state = NativeLogState::for_tests();
 

@@ -13,6 +13,7 @@ use crate::persistent_store::{
     external_apply::{ExternalSnapshotApplication, ExternalSnapshotObject, ExternalSnapshotRecord},
     PersistentStore, StoreError,
 };
+use crate::native_log::logged;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::BTreeSet, path::Path};
@@ -146,7 +147,7 @@ pub(crate) fn confirmed_restore_activation(app:&AppHandle,job:&DurableJob)->Resu
 
 #[tauri::command]
 pub(crate) fn external_storage_confirm_restore_adoption(app:AppHandle,request:RestoreAdoptionRequest)->Result<Value> {
-    confirm_restore_adoption_in_store(&runtime::native_store(&app)?,&runtime::root(&app)?,&request)
+    logged("external_storage_confirm_restore_adoption", confirm_restore_adoption_in_store(&runtime::native_store(&app)?,&runtime::root(&app)?,&request))
 }
 
 pub(crate) fn application_started(job: &DurableJob) -> bool {

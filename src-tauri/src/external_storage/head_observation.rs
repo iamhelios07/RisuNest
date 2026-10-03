@@ -1,6 +1,6 @@
 use super::{contract::{ErrorKind, ProviderError, Result, VersionToken}, publication::HeadObservation};
 use serde::{Deserialize, Serialize};
-fn corrupt(_: impl std::fmt::Display) -> ProviderError { ProviderError::new(ErrorKind::Corrupt) }
+fn corrupt(error: impl std::fmt::Display) -> ProviderError { ProviderError::new(ErrorKind::Corrupt).caused(&error) }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StoredHeadObservation {

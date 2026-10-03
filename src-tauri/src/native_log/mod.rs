@@ -553,6 +553,25 @@ pub(crate) fn sqlite_failure(error: &rusqlite::Error) -> String {
     error.to_string()
 }
 
+/// The text of a failure kept for the device log. A JSON failure keeps only its
+/// position, and a network failure only its kind, since its text can carry a
+/// signed URL. The type is matched by name so borrowed errors such as a
+/// poisoned lock are accepted too.
+pub(crate) fn failure_text<E: std::fmt::Display + ?Sized>(error: &E) -> String {
+    let name = std::any::type_name::<E>();
+    if name == std::any::type_name::<serde_json::Error>() {
+        let text = error.to_string();
+        match text.rfind(" at line ") {
+            Some(position) => format!("json failure{}", &text[position..]),
+            None => "json failure".to_owned(),
+        }
+    } else if name == std::any::type_name::<reqwest::Error>() {
+        "network failure".to_owned()
+    } else {
+        error.to_string()
+    }
+}
+
 fn format_console_line(level: &str, target: &str, message: &str) -> String {
     mask(&format!("[{level}] {target}: {message}"))
 }

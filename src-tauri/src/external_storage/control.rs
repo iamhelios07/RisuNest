@@ -70,11 +70,11 @@ const MAX_SNAPSHOT_CIPHERTEXT: u64 = wire::MAX_METADATA_BYTES as u64 + 512 * 102
 const MAX_DISCOVERY_PAGES: usize = 10_000;
 const SNAPSHOT_DISCOVERY_PAGE_LIMIT: u16 = 100;
 
-fn corrupt(_: impl std::fmt::Display) -> ProviderError {
-    ProviderError::new(ErrorKind::Corrupt)
+fn corrupt(error: impl std::fmt::Display) -> ProviderError {
+    ProviderError::new(ErrorKind::Corrupt).caused(&error)
 }
-fn transient(_: impl std::fmt::Display) -> ProviderError {
-    ProviderError::new(ErrorKind::Transient)
+fn transient(error: impl std::fmt::Display) -> ProviderError {
+    ProviderError::new(ErrorKind::Transient).caused(&error)
 }
 fn decode_hash(value: &str) -> Result<[u8; 32]> {
     hex::decode(value)

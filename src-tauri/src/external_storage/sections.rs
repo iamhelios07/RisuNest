@@ -33,8 +33,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-fn corrupt(_: impl std::fmt::Display) -> ProviderError {
-    ProviderError::new(ErrorKind::Corrupt)
+fn corrupt(error: impl std::fmt::Display) -> ProviderError {
+    ProviderError::new(ErrorKind::Corrupt).caused(&error)
 }
 fn transient(error: impl std::fmt::Display + 'static) -> ProviderError {
     super::packaging::transient(error)
@@ -306,8 +306,8 @@ fn capture_prepared_section(
     })
 }
 
-fn device_error(_: crate::persistent_store::StoreError) -> ProviderError {
-    ProviderError::new(ErrorKind::Transient)
+fn device_error(error: crate::persistent_store::StoreError) -> ProviderError {
+    ProviderError::new(ErrorKind::Transient).caused(&error)
 }
 
 fn preparation_error(error: crate::persistent_store::StoreError) -> ProviderError {
