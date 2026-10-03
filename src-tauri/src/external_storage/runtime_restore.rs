@@ -548,7 +548,7 @@ fn stage_original_backup_controls(
     units:&std::collections::BTreeMap<risunest_sync_wire::unit::UnitKey,risunest_sync_wire::unit::UnitValue>,
     cancel:&Cancellation,
 ) -> Result<()> {
-    use crate::persistent_store::external_capture::{large_unit_body_hashes,original_unit_dependency_inventory,BackupBodyRole};
+    use crate::persistent_store::external_capture::{original_unit_control_lengths,original_unit_dependency_inventory,BackupBodyRole};
     let content=super::content_store::ContentStore::open(&snapshot.staging_root.join("external-storage")).map_err(pds_error)?;
     let declared=snapshot.objects.iter().map(|object| (object.content_hash.as_str(),object)).collect::<std::collections::BTreeMap<_,_>>();
     if declared.len() != snapshot.objects.len() {return Err(corrupt())}
@@ -566,12 +566,12 @@ fn stage_original_backup_controls(
     };
     let size=|hash:&str| Ok(declared.get(hash).map(|object| object.byte_length));
     let probe=runtime::CancelProbe(cancel.clone());
-    // Only large unit bodies are read above the bound here. Message pages are
-    // read in the second pass with the lengths their manifests declare.
-    let large=large_unit_body_hashes(units);
-    let metadata=original_unit_dependency_inventory(units,
-        &|hash| read(hash,if large.contains(hash) {u64::MAX} else {risunest_sync_wire::MAX_METADATA_BYTES as u64}),
-        &size,&probe,false,&mut |_,_,_| Ok(()));
+    // Nothing above the bound is read here. Message pages and large unit
+    // bodies are read once, in the second pass, at the lengths their
+    // manifests and the snapshot declare.
+    let metadata=original_unit_control_lengths(units,
+        &|hash| read(hash,risunest_sync_wire::MAX_METADATA_BYTES as u64),
+        &size,&size,&probe);
     cancel.check()?;
     let metadata=metadata.map_err(pds_error)?;
     let mut spool=super::capture::BackupDependencySpool::new(&snapshot.staging_root.join("verified-original-controls")).map_err(pds_error)?;
@@ -861,7 +861,10 @@ mod tests {
         let unit=|key:&[&str],bytes:&[u8]| std::collections::BTreeMap::from([(UnitKey::new(key).unwrap(),UnitValue::object(RecordDescriptor::content(risunest_sync_wire::hash(bytes))).unwrap())]);
         assert!(stage_original_backup_controls(&mut store,&snapshot,&unit(&["root","additionalPrompt"],&padded),&Cancellation::default()).is_err());
         assert!(store.lww_object_body(&risunest_sync_wire::hash(&body)).unwrap().is_none());
+        crate::persistent_store::hash_work::reset_hash_work();
         stage_original_backup_controls(&mut store,&snapshot,&unit(&["root","additionalPrompt"],&body),&Cancellation::default()).unwrap();
+        let work=crate::persistent_store::hash_work::take_hash_work();
+        assert_eq!(work.domains["native_backup_large_unit_source"].calls,1);
         assert!(store.lww_object_body(&risunest_sync_wire::hash(&body)).unwrap()==Some(body));
     }
 
