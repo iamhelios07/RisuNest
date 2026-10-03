@@ -106,6 +106,14 @@ impl Drop for StagedControls {
     }
 }
 
+/// What the repository holds for a segment this device sent.
+enum Settlement {
+    /// Nothing sent is waiting for an answer.
+    Nothing,
+    Landed,
+    Missing,
+    Conflict,
+}
 fn store_error(_: crate::persistent_store::StoreError) -> ProviderError {
     segment::corrupt()
 }
@@ -618,7 +626,11 @@ impl ExternalLwwEngine {
                 }
             };
             if publication.authority != authority {
-                return Err(segment::corrupt());
+                if store.lww_binding_authority().map_err(store_error)? != authority {
+                    return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+                }
+                self.settle_detached(store, publication, sealed, cancel).await?;
+                continue;
             }
             if publication
                 .entries
@@ -1191,44 +1203,133 @@ impl ExternalLwwEngine {
         store: &mut PersistentStore,
         cancel: &Cancellation,
     ) -> Result<()> {
+        match self.reconcile_pending(store, cancel).await? {
+            Settlement::Nothing | Settlement::Landed => Ok(()),
+            Settlement::Missing | Settlement::Conflict => Err(ProviderError::new(ErrorKind::PreconditionFailed)),
+        }
+    }
+    /// Stops depending on this repository before the binding changes. A sent
+    /// segment that the repository cannot be asked about, or never received,
+    /// does not hold the change back: a switch that keeps the pending state
+    /// sends it to this repository again, and one that drops it settles it the
+    /// next time this repository is bound.
+    pub(crate) async fn fence_binding_change(
+        &self,
+        store: &mut PersistentStore,
+        new_device: bool,
+        cancel: &Cancellation,
+    ) -> Result<()> {
+        match self.reconcile_pending(store, cancel).await {
+            Ok(Settlement::Conflict) => Err(segment::corrupt()),
+            Ok(_) => Ok(()),
+            Err(error) => Self::fence_outcome(error, new_device),
+        }
+    }
+    /// Only an unreachable repository lets a binding change go ahead without
+    /// an answer, and a refusal of this device does too when the change makes
+    /// it a new device.
+    pub(crate) fn fence_outcome(error: ProviderError, new_device: bool) -> Result<()> {
+        match error.kind {
+            ErrorKind::Transient
+            | ErrorKind::RateLimited
+            | ErrorKind::DailyQuotaExhausted
+            | ErrorKind::EndpointRejected => Ok(()),
+            ErrorKind::Unauthorized | ErrorKind::ReauthRequired if new_device => Ok(()),
+            _ => Err(error),
+        }
+    }
+    async fn reconcile_pending(
+        &self,
+        store: &mut PersistentStore,
+        cancel: &Cancellation,
+    ) -> Result<Settlement> {
         let writer = store.lww_clock_state().map_err(store_error)?.writer_id;
         let Some((publication, bytes)) = store
             .external_lww_pending(&self.target_scope(), &writer)
             .map_err(store_error)?
         else {
-            return Ok(());
+            return Ok(Settlement::Nothing);
         };
         if !publication.dispatched || publication.complete {
-            return Ok(());
+            return Ok(Settlement::Nothing);
         }
-        let intent = self.intent(&publication.object_id, ObjectRole::Segment, &bytes);
+        self.reconcile_sent(&publication, &bytes, cancel).await
+    }
+    async fn reconcile_sent(
+        &self,
+        publication: &SealedPublication,
+        bytes: &[u8],
+        cancel: &Cancellation,
+    ) -> Result<Settlement> {
+        let intent = self.intent(&publication.object_id, ObjectRole::Segment, bytes);
         let resume = publication.resume.as_ref().map(Self::resume);
-        if let UploadResolution::Complete(receipt) = self
+        let receipt = match self
             .provider
             .reconcile_upload(&self.repository, &intent, resume.as_ref(), cancel)
             .await?
         {
-            Self::validate_receipt(&intent, &receipt)?;
-            let received = read_bytes(
-                self.provider.as_ref(),
-                &self.repository,
-                &receipt.locator,
-                cancel,
-            )
-            .await?;
-            if received != bytes {
-                return Err(segment::corrupt());
+            UploadResolution::Complete(receipt) => receipt,
+            UploadResolution::Conflict => return Ok(Settlement::Conflict),
+            UploadResolution::Resumable(_) | UploadResolution::RestartRequired => {
+                return Ok(Settlement::Missing)
             }
-            segment::open(
-                &received,
-                &self.library,
-                &writer,
-                publication.seq.0,
-                &self.root_key,
-            )?;
-            return Ok(());
+        };
+        Self::validate_receipt(&intent, &receipt)?;
+        let received = read_bytes(
+            self.provider.as_ref(),
+            &self.repository,
+            &receipt.locator,
+            cancel,
+        )
+        .await?;
+        if received != bytes {
+            return Err(segment::corrupt());
         }
-        Err(ProviderError::new(ErrorKind::PreconditionFailed))
+        segment::open(
+            &received,
+            &self.library,
+            &publication.writer,
+            publication.seq.0,
+            &self.root_key,
+        )?;
+        Ok(Settlement::Landed)
+    }
+    /// Settles a segment captured under an earlier binding of this repository
+    /// that the switch did not carry. Its versions are never sent again: a
+    /// segment the repository holds keeps its sequence, and any other is
+    /// dropped so the next segment takes the sequence.
+    async fn settle_detached(
+        &self,
+        store: &mut PersistentStore,
+        publication: SealedPublication,
+        sealed: Vec<u8>,
+        cancel: &Cancellation,
+    ) -> Result<()> {
+        let landed = if publication.complete {
+            true
+        } else if publication.dispatched {
+            match self.reconcile_sent(&publication, &sealed, cancel).await? {
+                Settlement::Landed => true,
+                Settlement::Conflict => return Err(segment::corrupt()),
+                Settlement::Nothing | Settlement::Missing => false,
+            }
+        } else {
+            false
+        };
+        store
+            .external_lww_settle_detached(&publication, landed)
+            .map_err(store_error)?;
+        if let Some(job) = &publication.asset_job {
+            let outcome = if landed {
+                crate::asset_repository::job_pins::CasReleaseOutcome::Committed
+            } else {
+                crate::asset_repository::job_pins::CasReleaseOutcome::Aborted
+            };
+            crate::asset_repository::job_pins::DurableCasJob::open(store.repository_root(), &job.job_id)
+                .and_then(|mut pins| pins.release(outcome))
+                .map_err(transient)?;
+        }
+        Ok(())
     }
     async fn include_objects(
         &self,

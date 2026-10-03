@@ -1728,6 +1728,345 @@ fn a_rebind_drops_an_unfinished_receive_and_receives_its_segment_again() {
         assert_eq!(f.b.lww_receive_row_counts(&unfinished).unwrap(), (0, 0));
     })
 }
+/// The fake repository behind a connection that can fail every request with
+/// one kind of error, or lose the answer to the next segment upload.
+struct FlakyRemote {
+    inner: Arc<FakeProvider>,
+    failure: std::sync::Mutex<Option<ErrorKind>>,
+    lost_segment: std::sync::Mutex<Option<bool>>,
+}
+impl FlakyRemote {
+    fn new(inner: Arc<FakeProvider>) -> Arc<Self> {
+        Arc::new(Self { inner, failure: Default::default(), lost_segment: Default::default() })
+    }
+    fn fail(&self, failure: Option<ErrorKind>) {
+        *self.failure.lock().unwrap() = failure;
+    }
+    fn check(&self) -> Result<()> {
+        match *self.failure.lock().unwrap() {
+            Some(kind) => Err(ProviderError::new(kind)),
+            None => Ok(()),
+        }
+    }
+}
+impl Provider for FlakyRemote {
+    fn open_repository<'a>(&'a self, config: &'a ConnectionConfig, secret: &'a SecretRef, mode: OpenMode, cancel: &'a Cancellation)
+        -> ProviderFuture<'a, (RepositoryHandle, super::capabilities::Capabilities)> {
+        Box::pin(async move { self.check()?; self.inner.open_repository(config, secret, mode, cancel).await })
+    }
+    fn read_object<'a>(&'a self, repository: &'a RepositoryHandle, locator: &'a RemoteLocator, unchanged: Option<&'a VersionToken>, sink: &'a mut dyn TransferSink, cancel: &'a Cancellation)
+        -> ProviderFuture<'a, ReadReceipt> {
+        Box::pin(async move { self.check()?; self.inner.read_object(repository, locator, unchanged, sink, cancel).await })
+    }
+    fn begin_upload<'a>(&'a self, repository: &'a RepositoryHandle, intent: &'a ObjectIntent, cancel: &'a Cancellation)
+        -> ProviderFuture<'a, Option<ResumeState>> {
+        Box::pin(async move { self.check()?; self.inner.begin_upload(repository, intent, cancel).await })
+    }
+    fn create_object<'a>(&'a self, repository: &'a RepositoryHandle, intent: &'a ObjectIntent, source: &'a dyn TransferSource, resume: Option<&'a ResumeState>, cancel: &'a Cancellation)
+        -> ProviderFuture<'a, ObjectReceipt> {
+        Box::pin(async move {
+            self.check()?;
+            let lost = if intent.role == ObjectRole::Segment { self.lost_segment.lock().unwrap().take() } else { None };
+            let Some(landed) = lost else {
+                return self.inner.create_object(repository, intent, source, resume, cancel).await;
+            };
+            if landed {
+                self.inner.create_object(repository, intent, source, resume, cancel).await?;
+            }
+            Err(ProviderError::new(ErrorKind::Transient))
+        })
+    }
+    fn compare_exchange_head<'a>(&'a self, repository: &'a RepositoryHandle, locator: &'a RemoteLocator, expected: &'a ExpectedHead, head: &'a HeadBytes, cancel: &'a Cancellation)
+        -> ProviderFuture<'a, HeadReceipt> {
+        Box::pin(async move { self.check()?; self.inner.compare_exchange_head(repository, locator, expected, head, cancel).await })
+    }
+    fn replace_head<'a>(&'a self, repository: &'a RepositoryHandle, locator: &'a RemoteLocator, head: &'a HeadBytes, cancel: &'a Cancellation)
+        -> ProviderFuture<'a, HeadReceipt> {
+        Box::pin(async move { self.check()?; self.inner.replace_head(repository, locator, head, cancel).await })
+    }
+    fn list_objects<'a>(&'a self, repository: &'a RepositoryHandle, collection: Collection, cursor: Option<&'a str>, limit: u16, cancel: &'a Cancellation)
+        -> ProviderFuture<'a, ObjectPage> {
+        Box::pin(async move { self.check()?; self.inner.list_objects(repository, collection, cursor, limit, cancel).await })
+    }
+    fn delete_object<'a>(&'a self, repository: &'a RepositoryHandle, locator: &'a RemoteLocator, cancel: &'a Cancellation)
+        -> ProviderFuture<'a, ()> {
+        Box::pin(async move { self.check()?; self.inner.delete_object(repository, locator, cancel).await })
+    }
+    fn reconcile_upload<'a>(&'a self, repository: &'a RepositoryHandle, intent: &'a ObjectIntent, resume: Option<&'a ResumeState>, cancel: &'a Cancellation)
+        -> ProviderFuture<'a, UploadResolution> {
+        Box::pin(async move { self.check()?; self.inner.reconcile_upload(repository, intent, resume, cancel).await })
+    }
+    fn head_locator(&self, repository: &RepositoryHandle) -> Result<RemoteLocator> { self.inner.head_locator(repository) }
+}
+/// Leaves the next segment sent without an answer: `landed` decides whether
+/// the repository kept it.
+async fn send_unconfirmed(f: &mut CycleFixture, authority: DecimalU64, landed: bool) -> crate::persistent_store::external_lww::SealedPublication {
+    let remote = FlakyRemote::new(f.provider.clone());
+    *remote.lost_segment.lock().unwrap() = Some(landed);
+    f.sender.provider = remote;
+    let sent = f.sender.publish(&mut f.a, authority, &[], &Cancellation::default()).await;
+    f.sender.provider = f.provider.clone();
+    assert_eq!(sent.err().unwrap().kind, ErrorKind::Transient);
+    let writer = f.a.lww_clock_state().unwrap().writer_id;
+    let pending = f.a.external_lww_pending(&f.sender.target_scope(), &writer).unwrap().unwrap().0;
+    assert!(pending.dispatched && !pending.complete);
+    assert_eq!(f.provider.holds(&pending.object_id), landed);
+    pending
+}
+/// Leaves the next segment sealed but never sent.
+async fn seal_unsent(f: &mut CycleFixture, authority: DecimalU64) -> crate::persistent_store::external_lww::SealedPublication {
+    let transfer = HeldAssetTransfer::new(f.provider.clone());
+    transfer.held.store(false, std::sync::atomic::Ordering::SeqCst);
+    transfer.fail_segment_begin.store(true, std::sync::atomic::Ordering::SeqCst);
+    f.sender.provider = transfer;
+    let sent = f.sender.publish(&mut f.a, authority, &[], &Cancellation::default()).await;
+    f.sender.provider = f.provider.clone();
+    assert_eq!(sent.err().unwrap().kind, ErrorKind::Transient);
+    let writer = f.a.lww_clock_state().unwrap().writer_id;
+    let pending = f.a.external_lww_pending(&f.sender.target_scope(), &writer).unwrap().unwrap().0;
+    assert!(pending.sealed && !pending.dispatched);
+    pending
+}
+/// Binds another repository, so the next binding of the fixture repository
+/// starts without the pending state of the earlier one.
+fn bind_elsewhere(store: &mut PersistentStore) -> DecimalU64 {
+    use crate::persistent_store::sync_selection::{SwitchBindingRequest, SyncTarget};
+    let target = SyncTarget::External("elsewhere".into());
+    let before = store.lww_binding_state().unwrap();
+    let inspection_id = store.register_lww_binding_inspection(before.target_authority, &target, "synthetic-account/elsewhere", "synthetic-elsewhere-library").unwrap();
+    store.switch_lww_binding(&SwitchBindingRequest {
+        header: crate::persistent_store::lww::Header { binding_authority: before.target_authority, request_id: uuid::Uuid::new_v4().to_string() },
+        expected_selection_epoch: before.selection_epoch, target, inspection_id: Some(inspection_id),
+    }).unwrap().target_authority
+}
+#[test]
+fn unbinding_from_an_unreachable_repository_does_not_wait_for_a_sent_segment() {
+    run(async {
+        use crate::persistent_store::sync_selection::SyncTarget;
+        let mut f = CycleFixture::new();
+        let target = SyncTarget::External("repository".into());
+        let first = bind_external(&mut f.a, &f.sender, &target);
+        set(&mut f.a, &["root", "language"], serde_json::json!("ko"));
+        assert!(!f.a.external_lww_unconfirmed_dispatch().unwrap());
+        let pending = send_unconfirmed(&mut f, first, false).await;
+        assert!(f.a.external_lww_unconfirmed_dispatch().unwrap());
+        let remote = FlakyRemote::new(f.provider.clone());
+        remote.fail(Some(ErrorKind::Transient));
+        f.sender.provider = remote;
+        let fenced = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            f.sender.fence_binding_change(&mut f.a, false, &Cancellation::default()),
+        ).await.expect("the fence must not wait on the repository");
+        assert_eq!(fenced, Ok(()));
+        bind_external(&mut f.a, &f.sender, &SyncTarget::None);
+        assert!(f.a.external_lww_unconfirmed_dispatch().unwrap());
+        let rebound = bind_external(&mut f.a, &f.sender, &target);
+        f.sender.provider = f.provider.clone();
+        assert_eq!(f.sender.publish(&mut f.a, rebound, &[], &Cancellation::default()).await.unwrap().segments.0, 1);
+        assert!(!f.a.external_lww_unconfirmed_dispatch().unwrap());
+        let writer = f.a.lww_clock_state().unwrap().writer_id;
+        assert_eq!(f.a.external_lww_next_sequence(&f.sender.target_scope(), &writer).unwrap(), pending.seq.0 + 1);
+        assert!(f.a.lww_read_outbox(rebound, 100).unwrap().entries.is_empty());
+        f.receive_b().await;
+        assert_eq!(f.b.read_root(None).unwrap().value["language"], "ko");
+    })
+}
+#[test]
+fn a_binding_fence_stops_only_for_a_refusal_or_a_damaged_segment() {
+    run(async {
+        let mut f = CycleFixture::new();
+        set(&mut f.a, &["root", "language"], serde_json::json!("ko"));
+        let pending = send_unconfirmed(&mut f, DecimalU64(0), false).await;
+        let remote = FlakyRemote::new(f.provider.clone());
+        f.sender.provider = remote.clone();
+        let cancel = Cancellation::default();
+        for (kind, passes, passes_new_device) in [
+            (ErrorKind::Transient, true, true),
+            (ErrorKind::RateLimited, true, true),
+            (ErrorKind::DailyQuotaExhausted, true, true),
+            (ErrorKind::EndpointRejected, true, true),
+            (ErrorKind::Unauthorized, false, true),
+            (ErrorKind::ReauthRequired, false, true),
+            (ErrorKind::NotFound, false, false),
+            (ErrorKind::RepositoryKeyUnavailable, false, false),
+            (ErrorKind::Corrupt, false, false),
+            (ErrorKind::Cancelled, false, false),
+        ] {
+            remote.fail(Some(kind));
+            for (new_device, passes) in [(false, passes), (true, passes_new_device)] {
+                let fenced = f.sender.fence_binding_change(&mut f.a, new_device, &cancel).await.map_err(|error| error.kind);
+                assert_eq!(fenced, if passes { Ok(()) } else { Err(kind) }, "{kind:?}, new device: {new_device}");
+            }
+        }
+        remote.fail(None);
+        assert_eq!(f.sender.fence_binding_change(&mut f.a, false, &cancel).await, Ok(()));
+        assert_eq!(f.sender.settle_publication(&mut f.a, &cancel).await.err().unwrap().kind, ErrorKind::PreconditionFailed);
+        f.provider.seed(&pending.object_id, ObjectRole::Segment, b"synthetic other segment".to_vec());
+        for new_device in [false, true] {
+            assert_eq!(f.sender.fence_binding_change(&mut f.a, new_device, &cancel).await.err().unwrap().kind, ErrorKind::Corrupt);
+        }
+    })
+}
+#[test]
+fn returning_to_a_repository_without_its_pending_state_drops_an_unsent_segment() {
+    run(async {
+        use crate::persistent_store::sync_selection::SyncTarget;
+        let mut f = CycleFixture::new();
+        let target = SyncTarget::External("repository".into());
+        let first = bind_external(&mut f.a, &f.sender, &target);
+        set(&mut f.a, &["root", "language"], serde_json::json!("ja"));
+        f.sender.publish(&mut f.a, first, &[], &Cancellation::default()).await.unwrap();
+        set(&mut f.a, &["root", "language"], serde_json::json!("ko"));
+        let pending = seal_unsent(&mut f, first).await;
+        assert!(!f.a.external_lww_unconfirmed_dispatch().unwrap());
+        bind_elsewhere(&mut f.a);
+        let rebound = bind_external(&mut f.a, &f.sender, &target);
+        set(&mut f.a, &["root", "askRemoval"], serde_json::json!(true));
+        assert_eq!(f.sender.publish(&mut f.a, rebound, &[], &Cancellation::default()).await.unwrap().segments.0, 1);
+        let writer = f.a.lww_clock_state().unwrap().writer_id;
+        assert_eq!(f.a.external_lww_next_sequence(&f.sender.target_scope(), &writer).unwrap(), pending.seq.0 + 1);
+        assert_eq!(f.provider.upload_attempts(&pending.object_id), 0);
+        f.receive_b().await;
+        assert_eq!(f.b.read_root(None).unwrap().value["language"], "ja");
+        assert_eq!(f.b.read_root(None).unwrap().value["askRemoval"], true);
+    })
+}
+#[test]
+fn returning_to_a_repository_without_its_pending_state_counts_a_landed_segment_without_sending_it_again() {
+    run(async {
+        use crate::persistent_store::sync_selection::SyncTarget;
+        let mut f = CycleFixture::new();
+        let target = SyncTarget::External("repository".into());
+        let first = bind_external(&mut f.a, &f.sender, &target);
+        set(&mut f.a, &["root", "language"], serde_json::json!("ko"));
+        let pending = send_unconfirmed(&mut f, first, true).await;
+        assert_eq!(f.sender.fence_binding_change(&mut f.a, false, &Cancellation::default()).await, Ok(()));
+        assert!(f.a.external_lww_unconfirmed_dispatch().unwrap());
+        bind_elsewhere(&mut f.a);
+        assert!(!f.a.external_lww_unconfirmed_dispatch().unwrap());
+        let rebound = bind_external(&mut f.a, &f.sender, &target);
+        set(&mut f.a, &["root", "askRemoval"], serde_json::json!(true));
+        assert_eq!(f.sender.publish(&mut f.a, rebound, &[], &Cancellation::default()).await.unwrap().segments.0, 1);
+        assert_eq!(f.provider.upload_attempts(&pending.object_id), 1);
+        let writer = f.a.lww_clock_state().unwrap().writer_id;
+        assert_eq!(f.a.external_lww_next_sequence(&f.sender.target_scope(), &writer).unwrap(), pending.seq.0 + 2);
+        f.sender.receive_and_apply(&mut f.a, rebound, &[], &Cancellation::default()).await.unwrap();
+        assert_eq!(f.a.read_root(None).unwrap().value["language"], "ko");
+        assert_eq!(f.a.read_root(None).unwrap().value["askRemoval"], true);
+        f.receive_b().await;
+        assert_eq!(f.b.read_root(None).unwrap().value["language"], "ko");
+        assert_eq!(f.b.read_root(None).unwrap().value["askRemoval"], true);
+    })
+}
+#[test]
+fn returning_to_a_repository_without_its_pending_state_reuses_the_sequence_of_a_segment_that_never_arrived() {
+    run(async {
+        use crate::persistent_store::sync_selection::SyncTarget;
+        let mut f = CycleFixture::new();
+        let target = SyncTarget::External("repository".into());
+        let first = bind_external(&mut f.a, &f.sender, &target);
+        set(&mut f.a, &["root", "language"], serde_json::json!("ja"));
+        f.sender.publish(&mut f.a, first, &[], &Cancellation::default()).await.unwrap();
+        set(&mut f.a, &["root", "language"], serde_json::json!("ko"));
+        let pending = send_unconfirmed(&mut f, first, false).await;
+        bind_elsewhere(&mut f.a);
+        let rebound = bind_external(&mut f.a, &f.sender, &target);
+        set(&mut f.a, &["root", "askRemoval"], serde_json::json!(true));
+        assert_eq!(f.sender.publish(&mut f.a, rebound, &[], &Cancellation::default()).await.unwrap().segments.0, 1);
+        assert_eq!(f.provider.upload_attempts(&pending.object_id), 0);
+        assert!(!f.provider.holds(&pending.object_id));
+        let writer = f.a.lww_clock_state().unwrap().writer_id;
+        assert_eq!(f.a.external_lww_next_sequence(&f.sender.target_scope(), &writer).unwrap(), pending.seq.0 + 1);
+        f.receive_b().await;
+        assert_eq!(f.b.read_root(None).unwrap().value["language"], "ja");
+        assert_eq!(f.b.read_root(None).unwrap().value["askRemoval"], true);
+    })
+}
+#[test]
+fn switching_to_another_repository_never_sends_a_pending_segment_there() {
+    run(async {
+        use crate::persistent_store::sync_selection::SyncTarget;
+        for state in ["unsent", "lost", "landed"] {
+            let mut f = CycleFixture::new();
+            let first = bind_external(&mut f.a, &f.sender, &SyncTarget::External("repository".into()));
+            set(&mut f.a, &["root", "language"], serde_json::json!("ko"));
+            let pending = match state {
+                "unsent" => seal_unsent(&mut f, first).await,
+                _ => send_unconfirmed(&mut f, first, state == "landed").await,
+            };
+            let other = Arc::new(FakeProvider::with_object_limit(true, 128 * 1024 * 1024));
+            let engine = |id: &str, root: &std::path::Path| ExternalLwwEngine {
+                provider: other.clone(),
+                repository: fake::repository(),
+                library: "synthetic-elsewhere-library".into(),
+                root_key: f.sender.root_key.clone(),
+                admission: Some(Admission::synthetic(super::runtime::now_ms())),
+                connection_id: id.into(),
+                connection_root: root.into(),
+                capabilities: f.sender.capabilities.clone(),
+                descriptor: f.sender.descriptor.clone(),
+            };
+            let mut elsewhere = engine("elsewhere", f.directory_a.path());
+            let switched = bind_external(&mut f.a, &elsewhere, &SyncTarget::External("elsewhere".into()));
+            set(&mut f.a, &["root", "askRemoval"], serde_json::json!(true));
+            assert_eq!(elsewhere.publish(&mut f.a, switched, &[], &Cancellation::default()).await.unwrap().segments.0, 1, "{state}");
+            assert_eq!(other.upload_count(), 1, "{state}");
+            let directory = tempfile::tempdir().unwrap();
+            let mut store = PersistentStore::open(directory.path()).unwrap();
+            let unset = store.read_root(None).unwrap().value["language"].clone();
+            assert_ne!(unset, "ko");
+            engine("reader", directory.path()).receive_and_apply(&mut store, DecimalU64(0), &[], &Cancellation::default()).await.unwrap();
+            assert_eq!(store.read_root(None).unwrap().value["askRemoval"], true, "{state}");
+            assert_eq!(store.read_root(None).unwrap().value["language"], unset, "{state}");
+            let writer = f.a.lww_clock_state().unwrap().writer_id;
+            assert_eq!(f.a.external_lww_pending(&f.sender.target_scope(), &writer).unwrap().unwrap().0.object_id, pending.object_id, "{state}");
+        }
+    })
+}
+#[test]
+fn settling_a_segment_left_by_an_earlier_binding_releases_its_asset_pins() {
+    run(async {
+        use crate::persistent_store::sync_selection::SyncTarget;
+        for landed in [false, true] {
+            let mut f = CycleFixture::new();
+            let target = SyncTarget::External("repository".into());
+            let first = bind_external(&mut f.a, &f.sender, &target);
+            let hash = small_asset(&mut f.a, "synthetic-detached-asset", &[41; 4096]);
+            let pending = send_unconfirmed(&mut f, first, landed).await;
+            assert!(pending.asset_job.is_some());
+            let root = f.directory_a.path().to_owned();
+            let pinned = || crate::asset_repository::job_pins::collect_durable_cas_job_roots(&root).object_hashes.contains(&hash);
+            assert!(pinned(), "landed: {landed}");
+            bind_elsewhere(&mut f.a);
+            let rebound = bind_external(&mut f.a, &f.sender, &target);
+            assert_eq!(f.sender.publish(&mut f.a, rebound, &[], &Cancellation::default()).await.unwrap().segments.0, 0);
+            assert!(!pinned(), "landed: {landed}");
+            let writer = f.a.lww_clock_state().unwrap().writer_id;
+            assert_eq!(f.a.external_lww_next_sequence(&f.sender.target_scope(), &writer).unwrap(), pending.seq.0 + u64::from(landed));
+            assert!(f.a.external_lww_pending(&f.sender.target_scope(), &writer).unwrap().is_none());
+            f.sender.receive_and_apply(&mut f.a, rebound, &[], &Cancellation::default()).await.unwrap();
+        }
+    })
+}
+#[test]
+fn a_segment_left_by_an_earlier_binding_never_gives_away_a_sequence_already_seen() {
+    run(async {
+        use crate::persistent_store::sync_selection::SyncTarget;
+        let mut f = CycleFixture::new();
+        let target = SyncTarget::External("repository".into());
+        let first = bind_external(&mut f.a, &f.sender, &target);
+        set(&mut f.a, &["root", "language"], serde_json::json!("ko"));
+        let pending = send_unconfirmed(&mut f, first, false).await;
+        bind_elsewhere(&mut f.a);
+        let rebound = bind_external(&mut f.a, &f.sender, &target);
+        assert_eq!(f.sender.publish(&mut f.a, DecimalU64(u64::MAX), &[], &Cancellation::default()).await.err().unwrap().kind, ErrorKind::PreconditionFailed);
+        let writer = f.a.lww_clock_state().unwrap().writer_id;
+        f.a.external_lww_record_seen(&f.sender.target_scope(), &writer, pending.seq.0, &"0".repeat(64)).unwrap();
+        assert_eq!(f.sender.publish(&mut f.a, rebound, &[], &Cancellation::default()).await.err().unwrap().kind, ErrorKind::Corrupt);
+        assert_eq!(f.a.external_lww_pending(&f.sender.target_scope(), &writer).unwrap().unwrap().0.object_id, pending.object_id);
+        assert_eq!(f.a.external_lww_next_sequence(&f.sender.target_scope(), &writer).unwrap(), pending.seq.0);
+    })
+}
 fn third_device(f: &CycleFixture) -> (tempfile::TempDir, PersistentStore, ExternalLwwEngine) {
     let directory = tempfile::tempdir().unwrap();
     let store = PersistentStore::open(directory.path()).unwrap();
