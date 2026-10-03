@@ -2378,11 +2378,6 @@ export const languageEnglish = {
             pendingHelp:
                 'The sync in progress has to finish before disconnecting. Select Sync now.',
             conflict: 'Conflicts need attention',
-            conflictCount: '{0} conflicting items',
-            conflictHelp:
-                'The same items were edited on this device and on the server. Choose one side for all conflicting items. Both sides are saved as conflict backups before applying.',
-            keepLocal: 'Keep this device',
-            keepRemote: 'Keep server version',
             busyHelp: 'Another operation is using the library. Wait for it to finish and try again.',
             errorHelp:
                 'Sync could not finish. Your edits on this device are unchanged. Try again.',
