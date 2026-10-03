@@ -2876,6 +2876,7 @@ export const languageKorean = {
         concurrentEditNotice: "같은 항목을 여러 기기에서 동시에 수정할 경우 마지막 수정 내용이 유지됩니다. 수정한 내용이나 메시지가 사라질 수 있으니 여러 기기를 동시에 사용하지 마세요.",
         replaceTitle: "이 기기의 데이터를 교체하시겠습니까?",
         replaceDescription: "동기화를 위해 이 기기의 데이터를 초기화한 후 원격 데이터로 교체합니다. 백업이 필요한 경우 수동으로 백업해주세요.",
+        serverRestoredDescription: "서버가 백업에서 복원되었습니다. 이 기기의 데이터를 초기화한 후 서버 데이터로 교체하며, 백업 이후 이 기기에서 변경한 내용은 사라집니다. 백업이 필요한 경우 수동으로 백업해주세요.",
         replaceAcknowledge: "이 기기의 데이터 초기화",
         replaceAction: "교체",
         cancelAction: "취소",

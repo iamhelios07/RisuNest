@@ -2368,6 +2368,61 @@ fn new_device_stage(store: &mut PersistentStore) -> (Header, String, Vec<Change>
     )
 }
 #[test]
+fn adopting_a_fresh_writer_keeps_the_clock_unsent_versions_and_receive_progress() {
+    let (_, mut store) = store();
+    save(&mut store, vec![mutation(&["root", "language"], serde_json::json!("ko"))]);
+    let authority = store.lww_binding_authority().unwrap();
+    store
+        .device_store()
+        .unwrap()
+        .connection()
+        .execute(
+            "INSERT INTO lww_progress VALUES('server','','9',?1)",
+            [authority.0.to_string()],
+        )
+        .unwrap();
+    let before = store.lww_clock_state().unwrap();
+    let unsent = |store: &PersistentStore| -> Vec<(UnitKey, Stamp)> {
+        store
+            .lww_read_outbox(authority, 256)
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|entry| (entry.key, entry.stamp))
+            .collect()
+    };
+    let retained = unsent(&store);
+    assert_eq!(retained.len(), 1);
+    let fresh = Uuid::new_v4().to_string();
+    let refused = |result: StoreResult<()>| match result {
+        Err(StoreError::Validation { message }) => message,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        refused(store.lww_adopt_fresh_writer(DecimalU64(authority.0 + 1), &before.writer_id, &fresh)),
+        "binding-authority-changed"
+    );
+    assert_eq!(
+        refused(store.lww_adopt_fresh_writer(authority, &fresh, &Uuid::new_v4().to_string())),
+        "fresh-writer-changed"
+    );
+    for _ in 0..2 {
+        store.lww_adopt_fresh_writer(authority, &before.writer_id, &fresh).unwrap();
+    }
+    let after = store.lww_clock_state().unwrap();
+    assert_eq!(after.writer_id, fresh);
+    assert_eq!((after.issued.as_ref(), after.accepted.as_ref()), (before.issued.as_ref(), before.accepted.as_ref()));
+    assert_eq!(after.binding_authority, authority);
+    assert_eq!(unsent(&store), retained);
+    assert_eq!(store.lww_binding_state().unwrap().progress, serde_json::json!([{"kind": "server", "writerId": "", "cursor": "9"}]));
+    save(&mut store, vec![mutation(&["root", "askRemoval"], serde_json::json!(true))]);
+    let next = unsent(&store);
+    let edit = next.iter().find(|(key, _)| key.components()[1] == "askRemoval").unwrap();
+    assert_eq!(edit.1.writer_id, fresh);
+    assert!(edit.1.physical_ms >= before.issued.unwrap().physical_ms);
+    assert!(next.contains(&retained[0]));
+}
+#[test]
 fn explicit_new_device_replaces_before_identity_reset_and_completed_retry_preserves_later_edits() {
     use super::super::device_store::plugin_values::PluginDeviceMutation;
     let (_, mut store) = store();

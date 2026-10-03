@@ -361,6 +361,17 @@ describe('production server LWW composition', () => {
         const syncCommands = f.invoke.mock.calls.map(([command]) => command as string)
         expect(syncCommands).toEqual(expect.arrayContaining(['server_sync_notify_start', 'server_sync_lww_pull', 'server_sync_lww_push']))
     })
+    it('settles the old registration tolerantly and claims a fresh writer for a new registration without pushing', async () => {
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        f.invoke.mockClear()
+        await f.transport!.fenceOldJobs(bindingContext())
+        await f.transport!.fenceOldJobs({ ...bindingContext(), mode: 'fresh-writer' })
+        const inspected = { inspectionId: 'synthetic-inspection', targetId: 'target', libraryId: 'library', empty: false, previouslyBoundLibrary: true, registrationChanged: true, serverRestored: false }
+        await f.transport!.prepareFreshWriter!(inspected, { ...bindingContext(), mode: 'fresh-writer' })
+        expect(f.invoke.mock.calls.filter(([command]) => command === 'server_sync_lww_fence').map(([, args]) => args)).toEqual([{ newDevice: false }, { newDevice: true }])
+        expect(f.invoke).toHaveBeenCalledWith('server_sync_lww_prepare_fresh_writer', { inspectionId: 'synthetic-inspection', request: { bindingAuthority: '0', requestId: expect.any(String) } })
+        expect(f.invoke.mock.calls.some(([command]) => command === 'server_sync_lww_push' || command === 'server_sync_lww_activate')).toBe(false)
+    })
     it('guards native initialization and transport registration on the web', async () => {
         f.native = false
         production.initializeNativeSyncBindings(); await production.installServerSyncProduction()

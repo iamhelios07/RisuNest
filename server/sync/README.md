@@ -94,9 +94,13 @@ Stop the daemon and use new absolute destination paths:
 ./risunest-sync-server.exe restore --backup-dir E:/backups/risunest-sync --data-dir E:/restored/risunest-sync
 ```
 
-Backup verifies registered objects and writes `backup.json` only after completion. A directory without that completion marker is not a valid backup. Restore verifies the backup, creates a new server epoch, and revokes every registered device. Register each device again (see [Registration and remote access](#registration-and-remote-access)); it connects as a new device, which replaces its library with the restored server state, so changes a device made after the backup was taken are lost unless saved separately before reconnecting.
+Backup verifies registered objects and writes `backup.json` only after completion. A directory without that completion marker is not a valid backup.
 
-If clients stop with an integrity error because the server library holds two different changes under the same identity, the app cannot repair the library in place. Restore a backup taken before the problem, or connect the devices to a new, empty library.
+Restore is a last resort for when the server data is lost and no device still holds the library. When the devices are intact, start over with a new, empty library instead: stop the daemon, run `init` with a new absolute data directory, which creates a new library, and add a registration for each device there (see [Registration and remote access](#registration-and-remote-access)). Connect the most up-to-date device first; it publishes its library to the empty server. Then connect the other devices; each one replaces its own library with the server library.
+
+Restore verifies the backup, creates a new server epoch, and revokes every registered device. Register each device again. A device that was connected to the restored library reports that the server was restored and, after confirmation, connects as a new device, which replaces its library with the restored server state, so changes a device made after the backup was taken are lost unless saved separately before reconnecting.
+
+If clients stop with an integrity error because the server library holds two different changes under the same identity, the app cannot repair the library in place. Connect the devices to a new, empty library as described above, or restore a backup taken before the problem.
 
 The private `connection-state` file is operational configuration and is not part of a library backup. Preserve it separately under the same daemon OS account when restoring the same registry identity.
 
