@@ -189,7 +189,7 @@ impl crate::native_log::CommandFailure for StoreError {
 impl From<rusqlite::Error> for StoreError {
     fn from(error: rusqlite::Error) -> Self {
         Self::Store {
-            message: error.to_string(),
+            message: crate::native_log::sqlite_failure(&error),
         }
     }
 }
@@ -197,7 +197,7 @@ impl From<rusqlite::Error> for StoreError {
 impl From<std::io::Error> for StoreError {
     fn from(error: std::io::Error) -> Self {
         Self::Store {
-            message: error.to_string(),
+            message: crate::native_log::io_failure(&error),
         }
     }
 }
@@ -205,7 +205,7 @@ impl From<std::io::Error> for StoreError {
 impl From<serde_json::Error> for StoreError {
     fn from(error: serde_json::Error) -> Self {
         Self::Store {
-            message: error.to_string(),
+            message: crate::native_log::json_failure(&error),
         }
     }
 }

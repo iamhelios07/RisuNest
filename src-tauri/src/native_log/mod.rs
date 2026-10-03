@@ -518,6 +518,41 @@ pub(crate) fn record_command_failure(
     );
 }
 
+/// Names a JSON decoding failure by its category and position only. The
+/// decoder's own text can quote the input it rejected.
+pub(crate) fn json_failure(error: &serde_json::Error) -> String {
+    let category = match error.classify() {
+        serde_json::error::Category::Io => "io",
+        serde_json::error::Category::Syntax => "syntax",
+        serde_json::error::Category::Data => "shape",
+        serde_json::error::Category::Eof => "incomplete",
+    };
+    format!("json-{category} at line {} column {}", error.line(), error.column())
+}
+
+/// An io failure's text, with a JSON failure carried inside it named by
+/// [`json_failure`] instead.
+pub(crate) fn io_failure(error: &std::io::Error) -> String {
+    match error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<serde_json::Error>())
+    {
+        Some(json) => json_failure(json),
+        None => error.to_string(),
+    }
+}
+
+/// A SQLite failure's text, with a JSON failure met while reading a row named
+/// by [`json_failure`] instead.
+pub(crate) fn sqlite_failure(error: &rusqlite::Error) -> String {
+    if let rusqlite::Error::FromSqlConversionFailure(index, _, inner) = error {
+        if let Some(json) = inner.downcast_ref::<serde_json::Error>() {
+            return format!("column {index} is not readable: {}", json_failure(json));
+        }
+    }
+    error.to_string()
+}
+
 fn format_console_line(level: &str, target: &str, message: &str) -> String {
     mask(&format!("[{level}] {target}: {message}"))
 }

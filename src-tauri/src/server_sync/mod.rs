@@ -112,7 +112,7 @@ impl From<std::io::Error> for SyncError {
         } else {
             ("local-storage", 503)
         };
-        Self::caused(code, status, format!("{:?}: {error}", error.kind()))
+        Self::caused(code, status, format!("{:?}: {}", error.kind(), crate::native_log::io_failure(&error)))
     }
 }
 impl From<rusqlite::Error> for SyncError {
@@ -123,7 +123,7 @@ impl From<rusqlite::Error> for SyncError {
         } else {
             ("local-metadata", 503)
         };
-        Self::caused(code, status, error.to_string())
+        Self::caused(code, status, crate::native_log::sqlite_failure(&error))
     }
 }
 impl From<crate::persistent_store::StoreError> for SyncError {
@@ -280,6 +280,23 @@ mod log_detail_tests {
         let reply = serde_json::to_value(&error).unwrap();
         let keys = reply.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
         assert_eq!(keys, ["code", "status", "retryable"]);
+    }
+
+    #[test]
+    fn a_wrapped_json_failure_keeps_its_payload_out_of_the_cause() {
+        let shape = || serde_json::from_str::<u32>("\"private-payload-value\"").unwrap_err();
+        let io = SyncError::from(std::io::Error::new(std::io::ErrorKind::InvalidData, shape()));
+        let sqlite = SyncError::from(rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            Box::new(shape()),
+        ));
+        assert!(io.cause.as_deref().unwrap().starts_with("InvalidData: json-shape at line 1 column"));
+        for error in [io, sqlite] {
+            let cause = error.cause.unwrap();
+            assert!(cause.contains("json-shape"), "{cause}");
+            assert!(!cause.contains("private-payload-value"));
+        }
     }
 
     #[test]

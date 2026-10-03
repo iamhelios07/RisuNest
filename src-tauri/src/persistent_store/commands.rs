@@ -2219,6 +2219,54 @@ mod tests {
     }
 
     #[test]
+    fn a_json_payload_string_never_reaches_the_returned_error_or_the_log() {
+        let shape = || serde_json::from_str::<u32>("\"private-payload-value\"").unwrap_err();
+        let cases = [
+            ("synthetic_json_shape_command", StoreError::from(shape()), "json-shape at line 1 column"),
+            (
+                "synthetic_json_syntax_command",
+                StoreError::from(serde_json::from_str::<Value>("[\"private-payload-value\" x").unwrap_err()),
+                "json-syntax at line 1 column",
+            ),
+            (
+                "synthetic_json_eof_command",
+                StoreError::from(serde_json::from_str::<Value>("[\"private-payload-value\"").unwrap_err()),
+                "json-incomplete at line 1 column",
+            ),
+            (
+                "synthetic_json_io_command",
+                StoreError::from(std::io::Error::new(std::io::ErrorKind::InvalidData, shape())),
+                "json-shape at line 1 column",
+            ),
+            (
+                "synthetic_json_row_command",
+                StoreError::from(rusqlite::Error::FromSqlConversionFailure(
+                    10,
+                    rusqlite::types::Type::Text,
+                    Box::new(shape()),
+                )),
+                "json-shape at line 1 column",
+            ),
+        ];
+        for (command, error, summary) in cases {
+            let text = error.to_string();
+            assert!(text.contains(summary), "{text}");
+            assert!(!text.contains("private-payload-value"));
+            let returned = serde_json::to_value(&error).unwrap();
+            assert!(!returned.to_string().contains("private-payload-value"));
+            let _ = logged::<(), _>(command, Err(error));
+            let entry = crate::native_log::global_state()
+                .tail(None)
+                .into_iter()
+                .rev()
+                .find(|entry| entry.message.starts_with(&format!("{command} failed: ")))
+                .expect("the failure is logged");
+            assert!(entry.message.contains(summary));
+            assert!(!entry.message.contains("private-payload-value"));
+        }
+    }
+
+    #[test]
     fn every_storage_error_logs_the_code_it_returns() {
         use crate::native_log::CommandFailure;
         for error in [

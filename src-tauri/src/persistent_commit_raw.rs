@@ -16,16 +16,8 @@ pub(crate) struct Envelope {
 }
 
 pub(crate) fn decode_envelope(bytes: &[u8]) -> StoreResult<Envelope> {
-    serde_json::from_slice(bytes).map_err(|error| {
-        let category = match error.classify() {
-            serde_json::error::Category::Io => "io",
-            serde_json::error::Category::Syntax => "syntax",
-            serde_json::error::Category::Data => "shape",
-            serde_json::error::Category::Eof => "incomplete",
-        };
-        StoreError::CommitDecode {
-            message: format!("commit envelope {category} error at line {} column {}", error.line(), error.column()),
-        }
+    serde_json::from_slice(bytes).map_err(|error| StoreError::CommitDecode {
+        message: format!("commit envelope {}", crate::native_log::json_failure(&error)),
     })
 }
 
