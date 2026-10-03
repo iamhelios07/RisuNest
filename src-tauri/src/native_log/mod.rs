@@ -525,7 +525,7 @@ impl CommandFailure for String {
         (!is_code(self)).then(|| std::borrow::Cow::Borrowed(self.as_str()))
     }
     fn expected(&self) -> bool {
-        matches!(self.as_str(), "cancelled" | "library-operation-busy")
+        matches!(self.as_str(), "cancelled" | "library-operation-busy" | "cleanup-pending" | "native-media-busy")
     }
 }
 
