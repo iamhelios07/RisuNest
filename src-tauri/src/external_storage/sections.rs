@@ -2,9 +2,8 @@
 //! codec entries here and come back the same way, so the local tables can
 //! change without changing what the repository holds.
 use super::contract::{Cancellation, ErrorKind, ProviderError, Result};
-use crate::persistent_store::device_store::{
-    sections::{PreparedSectionRows, SectionRow, SectionSpoolBuilder, SectionValueRow},
-    Section,
+use crate::persistent_store::device_store::sections::{
+    PreparedSectionRows, SectionRow, SectionSpoolBuilder, SectionValueRow,
 };
 #[cfg(not(test))]
 use risunest_external_storage_format::content_identity::hash;
@@ -57,14 +56,6 @@ pub(crate) struct CapturedSection {
     pub max_write_clock: Sequence,
     pub content_fingerprint: [u8; 32],
     pub sources: Vec<SectionSource>,
-}
-
-pub(crate) fn section_of(kind: SectionKind) -> Option<Section> {
-    match kind {
-        SectionKind::Hypa => Some(Section::Hypa),
-        SectionKind::LocalPlugins => Some(Section::LocalPlugins),
-        SectionKind::LocalSettings => None,
-    }
 }
 
 struct SectionBodySpool {

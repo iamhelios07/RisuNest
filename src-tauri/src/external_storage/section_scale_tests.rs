@@ -4,6 +4,7 @@ use crate::persistent_store::{
         hypa::HypaEmbeddingWrite,
         plugin_values::PluginDeviceMutation,
         sections::{reset_section_resource_evidence, section_resource_evidence},
+        Section,
     },
     PersistentStore,
 };

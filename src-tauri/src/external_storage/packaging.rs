@@ -4685,44 +4685,31 @@ mod tests {
         source: &CapturedSection,
         versioned: bool,
     ) -> Vec<SectionRow> {
-        if versioned {
-            let entries = source
-                .sources
-                .iter()
-                .map(|file| {
-                    (
-                        file.kind,
-                        file.key.clone(),
-                        crate::external_storage::sections::read_source_bytes(file, &Cancellation::default())
-                            .unwrap(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            return crate::external_storage::sections::decode_section(
-                source.kind,
-                &entries,
-                &source.content_fingerprint,
+        if !versioned {
+            crate::external_storage::sections::prepare_received_backup_sections(
+                std::slice::from_ref(source),
+                &Cancellation::default(),
             )
             .unwrap();
         }
-        let directory = tempfile::tempdir().unwrap();
-        let mut store = PersistentStore::open(directory.path()).unwrap();
-        let section = crate::external_storage::sections::section_of(source.kind).unwrap();
-        let mut prepared = crate::external_storage::sections::prepare_received_backup_sections(
-            std::slice::from_ref(source),
-            &Cancellation::default(),
+        let entries = source
+            .sources
+            .iter()
+            .map(|file| {
+                (
+                    file.kind,
+                    file.key.clone(),
+                    crate::external_storage::sections::read_source_bytes(file, &Cancellation::default())
+                        .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        crate::external_storage::sections::decode_section(
+            source.kind,
+            &entries,
+            &source.content_fingerprint,
         )
-        .unwrap();
-        store
-            .device_store_mut()
-            .unwrap()
-            .restore_prepared_backup_section(&prepared.remove(0))
-            .unwrap();
-        store
-            .device_store_mut()
-            .unwrap()
-            .read_backup_section_rows(section)
-            .unwrap()
+        .unwrap()
     }
 
     fn section_values(

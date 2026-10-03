@@ -8,7 +8,7 @@ mod archive;
 mod commands;
 mod spool;
 pub(crate) use archive::{
-    apply_prepared_native_sections, capture_native_sections, capture_prepared_native_sections,
+    capture_native_sections, capture_prepared_native_sections,
     journal_prepared_native_sections, prepare_native_sections,
     resume_journaled_native_restore, validate_archive_catalog, write_native_section, PreparedDeviceSection,
 };

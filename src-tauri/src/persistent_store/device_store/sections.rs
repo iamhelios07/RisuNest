@@ -896,14 +896,6 @@ impl PreparedSectionRows {
         }).transpose()
     }
 
-    fn contains(&self, key: &SectionKey, tombstone_only: bool) -> StoreResult<bool> {
-        Ok(self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM row_index WHERE key1=?1 AND key2=?2 AND key3=?3
-                AND (?4=0 OR tombstone=1))",
-            params![key.0, key.1, key.2, tombstone_only], |row| row.get(0),
-        )?)
-    }
-
     fn visit(&self, mut visitor: impl FnMut(SectionRow) -> StoreResult<()>) -> StoreResult<()> {
         let mut after = (String::new(), String::new(), String::new());
         let mut visited = 0i64;
@@ -1577,114 +1569,6 @@ impl DeviceStore {
         let tx = self.transaction()?;
         record_cursor(&tx, connection_id, library_lineage, section, cursor)?;
         tx.commit()?;
-        Ok(())
-    }
-
-    /// Replaces exactly one present backup section. An empty spool clears the
-    /// selected scope; callers preserve an absent scope by not invoking this.
-    pub(crate) fn restore_prepared_backup_section(
-        &mut self,
-        prepared: &PreparedSectionRows,
-    ) -> StoreResult<()> {
-        if prepared.versioned { return Err(invalid("Synchronized section input is not backup material")); }
-        match section_of_kind(prepared.kind) {
-            Some(section) => self.restore_prepared_value_section(section, prepared),
-            None if prepared.kind == SectionKind::LocalSettings => self.restore_prepared_local_settings(prepared),
-            None => Err(invalid("Backup section kind is unsupported")),
-        }
-    }
-
-    fn restore_prepared_value_section(
-        &mut self,
-        section: Section,
-        prepared: &PreparedSectionRows,
-    ) -> StoreResult<()> {
-        let transaction = self.transaction()?;
-        let writer_id: String = transaction.query_row(
-            "SELECT writer_id FROM device_meta WHERE singleton=1", [], |row| row.get(0),
-        )?;
-        let mut changed = false;
-        prepared.visit(|mut row| {
-            if row.value.is_tombstone() { return Err(invalid("Restored section row has no value")); }
-            let settled = read_row(&transaction, section, &row.key())?.is_some_and(|(current, published)| {
-                !published && current.writer_id == writer_id && current.value.same_content(&row.value)
-            });
-            if settled { return Ok(()); }
-            if !changed { super::begin_mutation(&transaction)?; changed = true; }
-            row.write_clock = super::issue_write_clock(&transaction, section)?;
-            row.writer_id = writer_id.clone();
-            write_row(&transaction, section, &row, false)
-        })?;
-        let mut after = (String::new(), String::new(), String::new());
-        loop {
-            let page = local_key_page(&transaction, section, &after, false)?;
-            if page.is_empty() { break; }
-            for key in page {
-                let (mut current, _) = read_row(&transaction, section, &key)?
-                    .ok_or_else(|| invalid("Section row disappeared"))?;
-                after = key;
-                if current.value.is_tombstone() || prepared.contains(&after, false)? { continue; }
-                if !changed { super::begin_mutation(&transaction)?; changed = true; }
-                current.value = SectionValueRow::Tombstone { first_published: None };
-                current.write_clock = super::issue_write_clock(&transaction, section)?;
-                current.writer_id = writer_id.clone();
-                write_row(&transaction, section, &current, false)?;
-            }
-        }
-        if changed { super::finish_mutation(&transaction)?; }
-        transaction.commit()?;
-        Ok(())
-    }
-
-    fn restore_prepared_local_settings(&mut self, prepared: &PreparedSectionRows) -> StoreResult<()> {
-        let transaction = self.transaction()?;
-        prepared.visit(|row| match row.value {
-            SectionValueRow::Setting { value } => {
-                if row.key1 != "setting" || !setting_is_local(&row.key2) || !row.key3.is_empty() {
-                    return Err(invalid("Restored device setting is not a device setting"));
-                }
-                transaction.execute(
-                    "INSERT INTO device_settings (key,value) VALUES (?1,?2)
-                        ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    params![row.key2, value],
-                )?;
-                Ok(())
-            }
-            SectionValueRow::PluginPermission { granted } => {
-                if row.key1 != "pluginPermission" || row.key2.is_empty() || row.key3.is_empty() {
-                    return Err(invalid("Restored plugin permission is incomplete"));
-                }
-                transaction.execute(
-                    "INSERT INTO plugin_permissions (code_hash,permission,granted)
-                        VALUES (?1,?2,?3)
-                        ON CONFLICT(code_hash,permission) DO UPDATE SET granted=excluded.granted",
-                    params![row.key2, row.key3, i64::from(granted)],
-                )?;
-                Ok(())
-            }
-            _ => Err(invalid("Restored device setting has the wrong shape")),
-        })?;
-        for key in LOCAL_SETTING_KEYS {
-            let row_key = ("setting".to_owned(), key.to_owned(), String::new());
-            if !prepared.contains(&row_key, false)? {
-                transaction.execute("DELETE FROM device_settings WHERE key=?1", [key])?;
-            }
-        }
-        let mut after = (String::new(), String::new(), String::new());
-        loop {
-            let page = local_permission_key_page(&transaction, &after)?;
-            if page.is_empty() { break; }
-            for key in page {
-                after = key;
-                if !prepared.contains(&after, false)? {
-                    transaction.execute(
-                        "DELETE FROM plugin_permissions WHERE code_hash=?1 AND permission=?2",
-                        params![after.1, after.2],
-                    )?;
-                }
-            }
-        }
-        transaction.commit()?;
         Ok(())
     }
 
