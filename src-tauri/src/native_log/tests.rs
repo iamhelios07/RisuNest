@@ -318,6 +318,7 @@ fn a_string_failure_is_logged_as_its_code_or_as_a_message() {
     }
     assert_eq!(&*"x".repeat(65).code(), "error");
     assert!("cancelled".to_owned().expected());
+    assert!("library-operation-busy".to_owned().expected());
 }
 
 #[test]
