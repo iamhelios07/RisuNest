@@ -1223,7 +1223,7 @@ impl LwwClient {
                     .or(store.server_stored_config()?)
                     .filter(|config| config.library_id == self.client.config().library_id)
                     .ok_or_else(|| SyncError::new("server-unconfigured", 409))?;
-                let head = self.client.resolve_identity(false)?;
+                let head = self.client.resolve_identity()?;
                 let mut residency = super::residency::Residency::open(store.repository_root())?;
                 residency.retain(&self.client, &config, &head, &missing)?;
                 let objects=missing.iter().map(|(hash,_)| {let proof=residency.object(hash,None)?.ok_or_else(||SyncError::new("remote-object-unavailable",409))?;Ok(crate::persistent_store::asset_object_catalog::AssetObjectRegistration{object_hash:hash.clone(),byte_size:proof.size})}).collect::<Result<Vec<_>>>()?;

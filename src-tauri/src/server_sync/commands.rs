@@ -185,7 +185,7 @@ pub(crate) async fn server_sync_status(app:AppHandle)->Result<LwwStatus> {
 }
 #[tauri::command]
 pub(crate) async fn server_sync_configure(app:AppHandle,config:super::client::ServerConfig)->Result<()> {
-    logged_blocking("configure",move|| {let _permit=claim_library(&app)?;let store=job_store(&app)?;let client=super::client::ServerClient::new(config.clone())?;client.resolve_identity(false)?;let stored=super::credentials::StoredConfig::persist(store.repository_root(),&config)?;super::lww_client::OperationLog::open(store.repository_root())?.save_config("candidate",&stored)?;Ok(())}).await
+    logged_blocking("configure",move|| {let _permit=claim_library(&app)?;let store=job_store(&app)?;let client=super::client::ServerClient::new(config.clone())?;client.resolve_identity()?;let stored=super::credentials::StoredConfig::persist(store.repository_root(),&config)?;super::lww_client::OperationLog::open(store.repository_root())?.save_config("candidate",&stored)?;Ok(())}).await
 }
 #[tauri::command]
 pub(crate) async fn server_sync_lww_push(app:AppHandle,request:crate::persistent_store::lww::Header,generating:Vec<crate::persistent_store::lww::MessageLocator>)->Result<Option<risunest_sync_wire::lww::PushReceipt>> {
@@ -247,7 +247,7 @@ pub(crate) async fn server_sync_notify_start(app:AppHandle,request:crate::persis
     let start=app.state::<ServerSyncCommandState>().begin_notification()?;
     let lookup=start.cancelled.clone();
     let copy=app.clone();
-    let config=blocking(move|| {let store=job_store(&copy)?;if store.lww_binding_authority()?!=request.binding_authority {return Err(SyncError::new("binding-authority-changed",409));}let core=lww_client_cancelled(&store,Some(lookup))?;core.client.resolve_identity(false)?;Ok(core.client.config())}).await?;
+    let config=blocking(move|| {let store=job_store(&copy)?;if store.lww_binding_authority()?!=request.binding_authority {return Err(SyncError::new("binding-authority-changed",409));}let core=lww_client_cancelled(&store,Some(lookup))?;core.client.resolve_identity()?;Ok(core.client.config())}).await?;
     let events=app.clone();
     let connection=app.clone();
     app.state::<ServerSyncCommandState>().install_notification(start,move|guard| tauri::async_runtime::spawn(async move {
