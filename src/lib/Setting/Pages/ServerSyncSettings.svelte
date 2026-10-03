@@ -62,7 +62,13 @@
         if (!choice.checked) return disconnectServerSync()
         const release = await holdServerSync()
         try {
-            try { await downloadAll() } catch (error) { if (errorCode(error) !== 'cancelled') failure = copy.downloadFailedKeptConnection; return }
+            try { await downloadAll() } catch (error) {
+                if (errorCode(error) === 'cancelled') return
+                // Files that are on neither this device nor the server fail the download but are not lost by disconnecting.
+                let remaining: number | undefined
+                try { remaining = (await getAssetResidencyStatus()).remoteObjects } catch {}
+                if (remaining !== 0) { failure = copy.downloadFailedKeptConnection; return }
+            }
             await disconnectServerSync()
         } finally { await release() }
     }

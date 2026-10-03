@@ -158,8 +158,32 @@ describe('disconnecting with files kept only on the server', () => {
         expect(f.disconnect).not.toHaveBeenCalled(); expect(f.release).toHaveBeenCalledOnce()
         expect(alertText()).toBe(sync.downloadFailedKeptConnection)
     })
+    it('disconnects when the failed download leaves no file only on the server', async () => {
+        await mountBound()
+        f.status.mockResolvedValueOnce(residencyStatus()).mockResolvedValueOnce(residencyStatus({ remoteObjects: 0, remoteBytes: 0, unavailableObjects: 1 }))
+        f.checkbox.mockResolvedValue({ confirmed: true, checked: true })
+        f.policy.mockRejectedValue({ code: 'required-asset-unavailable', retryable: false })
+        click(sync.disconnect); await settle()
+        expect(f.disconnect).toHaveBeenCalledOnce(); expect(f.release).toHaveBeenCalledOnce()
+        const order = [f.hold, f.policy, f.disconnect, f.release].map(mock => mock.mock.invocationCallOrder[0])
+        expect(order).toEqual([...order].sort((a, b) => a - b))
+        expect(alertText()).toBeUndefined()
+    })
+    it.each([
+        { name: 'still lists files only on the server', reread: () => f.status.mockResolvedValueOnce(residencyStatus()).mockResolvedValueOnce(residencyStatus({ remoteObjects: 1, unavailableObjects: 1 })) },
+        { name: 'cannot be read', reread: () => f.status.mockResolvedValueOnce(residencyStatus()).mockRejectedValueOnce(new Error('status-unavailable')) },
+    ])('keeps the connection when the status after a failed download $name', async ({ reread }) => {
+        await mountBound()
+        reread()
+        f.checkbox.mockResolvedValue({ confirmed: true, checked: true })
+        f.policy.mockRejectedValue({ code: 'required-asset-unavailable', retryable: false })
+        click(sync.disconnect); await settle()
+        expect(f.disconnect).not.toHaveBeenCalled(); expect(f.release).toHaveBeenCalledOnce()
+        expect(alertText()).toBe(sync.downloadFailedKeptConnection)
+    })
     it('keeps the connection without a message when the download is cancelled', async () => {
         await mountBound()
+        f.status.mockResolvedValueOnce(residencyStatus()).mockResolvedValue(residencyStatus({ remoteObjects: 0, remoteBytes: 0 }))
         f.checkbox.mockResolvedValue({ confirmed: true, checked: true })
         f.policy.mockRejectedValue({ code: 'cancelled', retryable: true })
         click(sync.disconnect); await settle()
