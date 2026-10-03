@@ -21,7 +21,7 @@ import {
 import { getV2PluginAPIs } from '../plugins/plugins.svelte'
 import type { Database } from './database.svelte'
 import type { PersistentDataStore } from './persistentDataStore'
-import { getDatabase, normalizeDatabaseDefaults, setDatabase, setDatabaseLite } from './database.svelte'
+import { getDatabase, getEffectivePresetId, normalizeDatabaseDefaults, setDatabase, setDatabaseLite, setEffectivePresetOverride } from './database.svelte'
 import {
     configurePersistentDataRuntime,
     createProductionStateAdapter,
@@ -854,5 +854,45 @@ describe('production persistent working-set publication', () => {
         } finally {
             unregister()
         }
+    })
+})
+
+describe('preset chain override across a whole working-set replacement', () => {
+    function presetDatabase(): Database {
+        const database = normalizeDatabaseDefaults({} as Database)
+        database.botPresets[0].id = 'preset-a'
+        database.botPresets[0].mainPrompt = 'Prompt A'
+        database.botPresets.push({ ...structuredClone(database.botPresets[0]), id: 'preset-b', name: 'Preset B', mainPrompt: 'Prompt B' })
+        database.botPresetsId = 0
+        database.mainPrompt = 'Prompt A'
+        database.personas[0].id = 'persona'
+        return database
+    }
+
+    it.each([true, false])('keeps the override when its preset is still present (resident=%s)', async (resident) => {
+        const initial = presetDatabase()
+        const store = new IndexedDbPersistentDataStore(`override-carry-${resident}`, new IDBFactory(), IDBKeyRange)
+        await store.open()
+        const { revision } = await store.replaceFromDatabase(initial)
+        setDatabase(structuredClone(initial))
+        selectedCharID.set(-1)
+        setEffectivePresetOverride('preset-b')
+        expect(getDatabase().mainPrompt).toBe('Prompt B')
+        const replacement = resident ? structuredClone(initial) : projectCompleteScalableWorkingSet(initial, null, revision, new Set())
+        createProductionStateAdapter({ readPreset: (id) => store.readPreset(id) }).replaceDatabase(replacement, new Set(), false)
+        await vi.waitFor(() => expect(getEffectivePresetId()).toBe('preset-b'))
+        expect(getDatabase().mainPrompt).toBe('Prompt B')
+        expect(getDatabase().botPresets.find((preset) => preset.id === 'preset-a')!.mainPrompt).toBe('Prompt A')
+    })
+
+    it('clears the override when its preset is gone', () => {
+        const initial = presetDatabase()
+        setDatabase(structuredClone(initial))
+        selectedCharID.set(-1)
+        setEffectivePresetOverride('preset-b')
+        const replacement = structuredClone(initial)
+        replacement.botPresets.pop()
+        createProductionStateAdapter().replaceDatabase(replacement, new Set(), false)
+        expect(getEffectivePresetId()).toBe('preset-a')
     })
 })
