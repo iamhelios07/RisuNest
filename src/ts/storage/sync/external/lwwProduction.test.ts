@@ -119,6 +119,17 @@ describe('native external LWW adapter', () => {
         expect(fixture.flush).toHaveBeenCalledWith('external-lww-publish')
         expect(fixture.invoke.mock.calls.map(call => call[0])).toEqual(['external_lww_publish', 'external_lww_receive'])
     })
+    it('tells the native fence whether a binding change makes this a new device', async () => {
+        dispose = await installExternalLwwAdapters(state()); await settle()
+        const transport = fixture.registrations.get('sync')!
+        fixture.invoke.mockClear()
+        await transport.fenceOldJobs(context())
+        await transport.fenceOldJobs({ ...context(), mode: 'new-device' })
+        await externalLwwExitDrain('sync', 'selection', true)!.cancel('cancel-exit')
+        expect(fixture.invoke.mock.calls.filter(call => call[0] === 'external_lww_fence').map(call => call[1])).toEqual([
+            { connectionId: 'sync', newDevice: false }, { connectionId: 'sync', newDevice: true }, { connectionId: 'sync', newDevice: false },
+        ])
+    })
     it('reconciles the authoritative revision when publication fails after native clock repair', async () => {
         dispose = await installExternalLwwAdapters(state()); await settle()
         const transport = fixture.registrations.get('sync')!

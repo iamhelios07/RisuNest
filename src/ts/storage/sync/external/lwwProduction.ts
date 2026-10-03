@@ -100,7 +100,7 @@ function createAdapter(connectionId: string): Adapter {
                 const adapter = adapters.get(old.connectionId)
                 adapter?.scheduler.stop()
                 if (adapter) adapter.state = undefined
-                await invoke('external_lww_fence', { connectionId: old.connectionId })
+                await invoke('external_lww_fence', { connectionId: old.connectionId, newDevice: binding.mode === 'new-device' })
                 await adapter?.scheduler.settled()
             }
             await scheduler.settled()
@@ -198,7 +198,7 @@ export function externalLwwExitDrain(connectionId: string, selectionEpoch: strin
                 return { kind: 'complete' }
             } catch (error) { return { kind: 'blocked', reason: (error as { kind?: string })?.kind ?? 'sync-unavailable' } }
         },
-        async cancel() { adapter.scheduler.stop(); await invoke('external_lww_fence', { connectionId }); await adapter.scheduler.settled() },
+        async cancel() { adapter.scheduler.stop(); await invoke('external_lww_fence', { connectionId, newDevice: false }); await adapter.scheduler.settled() },
         async resumeAfterExitCancel() { await invoke('external_lww_resume', { connectionId }); adapter.scheduler.start() },
     }
 }
