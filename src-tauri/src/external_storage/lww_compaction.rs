@@ -344,6 +344,7 @@ impl ExternalLwwEngine {
         }
         Ok(output)
     }
+    #[cfg(test)]
     pub(crate) async fn checkpoint(&self,receipt:&ObjectReceipt,cancel:&Cancellation)->Result<(RemoteObject,Checkpoint)> {self.classified_checkpoint(receipt,cancel).await?.ok_or_else(segment::corrupt)}
     pub(super) async fn classified_checkpoint(&self, receipt:&ObjectReceipt,cancel:&Cancellation) -> Result<Option<(RemoteObject,Checkpoint)>> {
         receipt.locator.validate_for(&self.repository)?;
