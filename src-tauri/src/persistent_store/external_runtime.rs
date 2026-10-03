@@ -368,7 +368,6 @@ impl PersistentStore {
             "DELETE FROM external_storage_bases WHERE connection_id=?1",
             [connection],
         )?;
-        jobs::clear_base_records(&tx, connection)?;
         let selection = sync_selection::read(&tx)?;
         if selection.target == sync_selection::SyncTarget::External(connection.into()) {
             sync_selection::select(&tx, &selection.epoch, &sync_selection::SyncTarget::None)?;
