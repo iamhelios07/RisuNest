@@ -1501,6 +1501,7 @@ export const languageChinese = {
         cancelAction: "取消",
         clockBlocked: "设备与远程时间存在差异，同步已停止。请校正时间后重试。",
         writerCollision: "设备标识重复，同步已停止。请作为新设备重新连接。",
+        unitTooLarge: "此设备上有项目过大，无法发送到服务器，同步已停止。请缩小该项目后重试。",
         newDeviceAction: "作为新设备连接",
         restoreTitle: "是否恢复备份？",
         restoreDescriptionBound: "将清除当前数据并恢复所选备份，恢复的数据将同步到远程。如需备份，请手动备份。",

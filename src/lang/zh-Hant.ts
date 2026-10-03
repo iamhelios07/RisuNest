@@ -1544,6 +1544,7 @@ export const languageChineseTraditional = {
         cancelAction: "取消",
         clockBlocked: "裝置與遠端時間有差異，同步已停止。請校正時間後重試。",
         writerCollision: "裝置識別重複，同步已停止。請作為新裝置重新連線。",
+        unitTooLarge: "此裝置上有項目過大，無法傳送到伺服器，同步已停止。請縮小該項目後重試。",
         newDeviceAction: "作為新裝置連線",
         restoreTitle: "是否還原備份？",
         restoreDescriptionBound: "將清除目前資料並還原所選備份，還原的資料將同步至遠端。如需備份，請手動備份。",
