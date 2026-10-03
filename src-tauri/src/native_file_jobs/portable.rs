@@ -1768,6 +1768,87 @@ mod tests {
         );
         pins.release(CasReleaseOutcome::Aborted).unwrap();
     }
+
+    fn export_and_restore(directory: &Path, store: PersistentStore) -> PersistentStore {
+        let jobs = directory.join("jobs");
+        let handoffs = directory.join("handoffs");
+        fs::create_dir_all(&jobs).unwrap();
+        let revision = store.revision().unwrap();
+        let registry = super::super::JobRegistry::default();
+        let export = registry
+            .create_internal(super::super::JobKind::ExportPortableBackup, Some(revision), vec![], false)
+            .unwrap();
+        let result =
+            export_portable(None, revision, &jobs, &handoffs, store, &export, None, "9.8.7-synthetic").unwrap();
+        let path = std::path::PathBuf::from(result.handoff_path.unwrap());
+        let target = directory.join("target");
+        let target_store = library(&target);
+        let target_revision = target_store.revision().unwrap();
+        let restore_jobs = directory.join("restore-job");
+        fs::create_dir(&restore_jobs).unwrap();
+        let restore = registry
+            .create_internal(super::super::JobKind::RestorePortableBackup, Some(target_revision), vec![], false)
+            .unwrap();
+        let bytes = fs::metadata(&path).unwrap().len();
+        restore_portable(
+            OpenedJobSource { file: File::open(path).unwrap(), custody: None, total_bytes: bytes },
+            true,
+            target_revision,
+            &restore_jobs,
+            target_store,
+            &restore,
+            None,
+        )
+        .unwrap();
+        PersistentStore::open(&target).unwrap()
+    }
+
+    #[test]
+    fn portable_export_restore_carries_a_large_unit_above_the_metadata_bound() {
+        use crate::persistent_store::{lww::UnitMutation, WorkingSetCommit};
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = library(&directory.path().join("source"));
+        let large = serde_json::json!("x".repeat(risunest_sync_wire::MAX_METADATA_BYTES));
+        store
+            .commit(&WorkingSetCommit {
+                expected_revision: store.revision().unwrap(),
+                unit_mutations: Some(vec![UnitMutation::Set {
+                    key: risunest_sync_wire::unit::UnitKey::new(&["root", "additionalPrompt"]).unwrap(),
+                    value: large.clone(),
+                }]),
+                ..Default::default()
+            })
+            .unwrap();
+        let restored = export_and_restore(directory.path(), store);
+        assert!(restored.read_root(None).unwrap().value["additionalPrompt"] == large);
+    }
+
+    #[test]
+    fn portable_export_restore_carries_an_indivisible_message_above_the_metadata_bound() {
+        use crate::persistent_store::WorkingSetCommit;
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = library(&directory.path().join("source"));
+        let data = "x".repeat(risunest_sync_wire::MAX_METADATA_BYTES);
+        store
+            .commit(&WorkingSetCommit {
+                expected_revision: store.revision().unwrap(),
+                add_character: Some(serde_json::json!({
+                    "type": "character", "chaId": "synthetic-large", "name": "Large",
+                    "chats": [{"id": "synthetic-large-chat", "name": "Large", "message": [{"role": "user", "data": data}]}],
+                })),
+                ..Default::default()
+            })
+            .unwrap();
+        let restored = export_and_restore(directory.path(), store);
+        let database = restored.materialize(None).unwrap();
+        let character = database["characters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|character| character["chaId"] == "synthetic-large")
+            .unwrap();
+        assert!(character["chats"][0]["message"][0]["data"] == data.as_str());
+    }
 }
 
 #[cfg(test)]
