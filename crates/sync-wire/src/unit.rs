@@ -33,19 +33,26 @@ impl TryFrom<String> for UnitKey {
             "root" | "toggle" | "variable" | "preset-protected" | "archive" | "asset" | "inlay" | "hypa" | "group-members" => n == 2,
             "character" | "preset" | "persona" | "messages" | "record" | "plugin" => n == 3,
             "conversation" | "plugin-local" => n == 4,
+            // Record kinds and order scopes this build does not know stay opaque.
             "exists" => match components.get(1).map(String::as_str) {
                 Some("conversation") => n == 4,
                 Some("character" | "preset" | "persona" | "modules" | "loadouts" | "customModels") => n == 3,
-                _ => false,
+                Some("plugins" | "") | None => false,
+                Some(_) => n >= 3,
             },
             "order" => match components.get(1).map(String::as_str) {
                 Some("conversations" | "plugin-storage") => n == 3,
                 Some("characters" | "presets" | "personas" | "modules" | "plugins" | "loadouts" | "customModels") => n == 2,
-                _ => false,
+                Some("") | None => false,
+                Some(_) => true,
             },
             _ => true,
         };
-        if !valid || (kind == "record" && !matches!(components[1].as_str(), "modules" | "plugins" | "loadouts" | "customModels")) {
+        if !valid
+            || (kind == "record" && !matches!(components[1].as_str(), "modules" | "plugins" | "loadouts" | "customModels"))
+            // Every `toggle_*` global variable is a toggle unit and no other is.
+            || (matches!(kind, "toggle" | "variable") && (kind == "toggle") != components[1].starts_with("toggle_"))
+        {
             return Err(WireError("invalid-unit-key-shape"));
         }
         let structural_ids = match kind {

@@ -88,12 +88,33 @@ fn payload_matches_javascript_keys_numbers_escaping_and_rejects_invalid_json() {
 
 #[test]
 fn user_key_components_can_be_empty_without_weakening_structural_ids() {
-    for components in [vec!["variable", ""], vec!["toggle", ""], vec!["plugin", "", ""], vec!["plugin-local", "", "v3", ""], vec!["order", "plugin-storage", ""], vec!["record", "plugins", ""]] {
+    for components in [vec!["variable", ""], vec!["toggle", "toggle_"], vec!["plugin", "", ""], vec!["plugin-local", "", "v3", ""], vec!["order", "plugin-storage", ""], vec!["record", "plugins", ""]] {
         let key = UnitKey::new(&components).unwrap();
         assert_eq!(UnitKey::try_from(key.as_str().to_owned()).unwrap(), key);
     }
     assert!(UnitKey::new(&["character", "", "name"]).is_err());
     assert!(UnitKey::new(&["", "field"]).is_err());
+}
+
+#[test]
+fn unknown_existence_kinds_and_order_scopes_are_well_formed_opaque_keys() {
+    for components in [vec!["exists", "lorebook", "x"], vec!["exists", "future", "owner", "x"], vec!["order", "lorebooks"], vec!["order", "future", "owner", ""]] {
+        let key = UnitKey::new(&components).unwrap();
+        assert_eq!(UnitKey::try_from(key.as_str().to_owned()).unwrap(), key);
+    }
+    for components in [vec!["exists", "lorebook"], vec!["exists", "lorebook", ""], vec!["exists", "", "x"], vec!["exists", "plugins", "x"], vec!["order"], vec!["order", ""]] {
+        assert!(UnitKey::new(&components).is_err(), "{components:?}");
+    }
+}
+
+#[test]
+fn toggle_and_variable_keys_are_split_by_the_toggle_prefix() {
+    for components in [["toggle", "toggle_mode"], ["toggle", "toggle_"], ["variable", "mode"], ["variable", "toggle"]] {
+        assert!(UnitKey::new(&components).is_ok(), "{components:?}");
+    }
+    for components in [["toggle", "mode"], ["toggle", ""], ["variable", "toggle_mode"]] {
+        assert_eq!(UnitKey::new(&components), Err(WireError("invalid-unit-key-shape")), "{components:?}");
+    }
 }
 
 #[test]
