@@ -453,14 +453,11 @@ pub(crate) async fn external_storage_start_job(
         }
         return Ok(job_summary(&root, store.read(&pending.id)?));
     }
-    // Section publication is not wired yet, so a backup captures the library
-    // only and no device capture phase is scheduled.
-    let device = false;
     wait_for_settled_claim(&app, &request.connection_id).await?;
     let identity = native_store(&app)?
         .external_identity()
         .map_err(local_error)?;
-    let mut job = DurableJob::new(request, device, now_ms(), identity);
+    let mut job = DurableJob::new(request, false, now_ms(), identity);
     if let Some(id) = job_id {
         job = job.with_restore_id(id)?;
         if !store.insert_new(&job)? {
@@ -476,9 +473,7 @@ pub(crate) async fn external_storage_start_job(
     } else {
         store.put(&job)?;
     }
-    if !device {
-        wake_job(app, job.id.clone())?;
-    }
+    wake_job(app, job.id.clone())?;
     Ok(job.summary)
 }
 fn same_explicit_retry(job: &DurableJob, request: &StartJobRequest) -> bool {
