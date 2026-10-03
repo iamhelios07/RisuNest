@@ -1950,6 +1950,9 @@ fn returning_to_a_repository_without_its_pending_state_counts_a_landed_segment_w
         assert_eq!(f.provider.upload_attempts(&pending.object_id), 1);
         let writer = f.a.lww_clock_state().unwrap().writer_id;
         assert_eq!(f.a.external_lww_next_sequence(&f.sender.target_scope(), &writer).unwrap(), pending.seq.0 + 2);
+        f.sender.receive_and_apply(&mut f.a, rebound, &[], &Cancellation::default()).await.unwrap();
+        assert_eq!(f.a.read_root(None).unwrap().value["language"], "ko");
+        assert_eq!(f.a.read_root(None).unwrap().value["askRemoval"], true);
         f.receive_b().await;
         assert_eq!(f.b.read_root(None).unwrap().value["language"], "ko");
         assert_eq!(f.b.read_root(None).unwrap().value["askRemoval"], true);
@@ -2041,6 +2044,7 @@ fn settling_a_segment_left_by_an_earlier_binding_releases_its_asset_pins() {
             let writer = f.a.lww_clock_state().unwrap().writer_id;
             assert_eq!(f.a.external_lww_next_sequence(&f.sender.target_scope(), &writer).unwrap(), pending.seq.0 + u64::from(landed));
             assert!(f.a.external_lww_pending(&f.sender.target_scope(), &writer).unwrap().is_none());
+            f.sender.receive_and_apply(&mut f.a, rebound, &[], &Cancellation::default()).await.unwrap();
         }
     })
 }
