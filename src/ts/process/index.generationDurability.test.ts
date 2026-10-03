@@ -487,8 +487,9 @@ describe('sendChat generation durability control flow', () => {
     })
 
     it('does not acknowledge preview, abort, or provider failure paths', async () => {
-        harness.drainDeferredReceives.mockImplementation(async () => {
-            expect(generatingConversations.snapshot()).toEqual([])
+        const drained: unknown[] = []
+        harness.drainDeferredReceives.mockImplementation(async (epoch?: number) => {
+            drained.push({ epoch, registered: generatingConversations.snapshot() })
         })
         await expect(sendChat(-1, { preview: true })).resolves.toBe(true)
 
@@ -506,6 +507,7 @@ describe('sendChat generation durability control flow', () => {
 
         expect(harness.acknowledge).not.toHaveBeenCalled()
         expect(harness.drainDeferredReceives.mock.calls).toEqual([[0], [0], [0]])
+        expect(drained).toEqual(Array(3).fill({ epoch: 0, registered: [] }))
     })
 
     it('drains deferred receives for the generated conversation after the selection moves away', async () => {
@@ -513,8 +515,9 @@ describe('sendChat generation durability control flow', () => {
         const character = harness.DBState.db.characters[0]
         character.chats.push({ ...structuredClone(character.chats[0]), id: 'chat-other' })
         harness.requests.push(response.promise)
-        harness.drainDeferredReceives.mockImplementation(async () => {
-            expect(generatingConversations.snapshot()).toEqual([])
+        const drained: unknown[] = []
+        harness.drainDeferredReceives.mockImplementation(async (epoch?: number) => {
+            drained.push({ epoch, registered: generatingConversations.snapshot() })
         })
 
         const sending = sendChat()
@@ -526,6 +529,7 @@ describe('sendChat generation durability control flow', () => {
         await expect(sending).resolves.toBe(false)
         expect(harness.acknowledge).not.toHaveBeenCalled()
         expect(harness.drainDeferredReceives).toHaveBeenCalledExactlyOnceWith(0)
+        expect(drained).toEqual([{ epoch: 0, registered: [] }])
         expect(generatingConversations.snapshot()).toEqual([])
     })
 
@@ -828,8 +832,9 @@ describe('sendChat generation durability control flow', () => {
         }
         harness.DBState.db = makeDatabase(group as any)
         harness.requests.push(success('Member A'), success('Member B'))
-        harness.drainDeferredReceives.mockImplementation(async () => {
-            expect(generatingConversations.snapshot()).toEqual([])
+        const drained: unknown[] = []
+        harness.drainDeferredReceives.mockImplementation(async (epoch?: number) => {
+            drained.push({ epoch, registered: generatingConversations.snapshot() })
         })
 
         await expect(sendChat()).resolves.toBe(true)
@@ -838,6 +843,7 @@ describe('sendChat generation durability control flow', () => {
         expect(harness.acknowledge).toHaveBeenCalledTimes(2)
         expect(group.chats[0].message.filter((message) => message.role === 'char')).toHaveLength(2)
         expect(harness.drainDeferredReceives).toHaveBeenCalledExactlyOnceWith(0)
+        expect(drained).toEqual([{ epoch: 0, registered: [] }])
         expect(generatingConversations.snapshot()).toEqual([])
     })
 
