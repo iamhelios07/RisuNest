@@ -2215,6 +2215,14 @@ mod tests {
                 "synthetic_health_cancel_command",
                 StoreError::Validation { message: crate::data_health::CANCELLED.to_owned() },
             ),
+            (
+                "synthetic_archive_cancel_command",
+                StoreError::Validation { message: crate::persistent_store::archive::ARCHIVE_CANCELLED_MESSAGE.to_owned() },
+            ),
+            (
+                "synthetic_export_cancel_command",
+                StoreError::Validation { message: crate::persistent_store::export::EXPORT_CANCELLED_MESSAGE.to_owned() },
+            ),
         ] {
             let code = serde_json::to_value(&error).unwrap()["code"].as_str().unwrap().to_owned();
             let _ = logged::<(), _>(command, Err(error));

@@ -180,7 +180,11 @@ impl crate::native_log::CommandFailure for StoreError {
     fn expected(&self) -> bool {
         match self {
             Self::RevisionConflict { .. } | Self::CommitBusy | Self::SnapshotReleased => true,
-            Self::Validation { message } => message == crate::data_health::CANCELLED,
+            Self::Validation { message } => {
+                message == crate::data_health::CANCELLED
+                    || message == archive::ARCHIVE_CANCELLED_MESSAGE
+                    || message == export::EXPORT_CANCELLED_MESSAGE
+            }
             _ => false,
         }
     }
