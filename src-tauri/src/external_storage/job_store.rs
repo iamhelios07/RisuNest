@@ -160,8 +160,8 @@ impl DurableJob {
         )
     }
 }
-fn failure(_: impl std::fmt::Display) -> ProviderError {
-    ProviderError::new(ErrorKind::Transient)
+fn failure(error: impl std::fmt::Display) -> ProviderError {
+    ProviderError::new(ErrorKind::Transient).caused(&error)
 }
 pub(crate) struct JobStore(Connection);
 const STATE_TERMINAL_LIMIT: i64 = 32;

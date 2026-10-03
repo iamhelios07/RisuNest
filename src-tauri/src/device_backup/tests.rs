@@ -988,3 +988,42 @@ fn cleanup_closes_the_device_database_and_reopens_only_a_fresh_store() {
     assert!(inner.cold_session.is_none());
     assert!(!inner.reconciled);
 }
+
+#[test]
+fn device_backup_commands_log_their_failures() {
+    let root = tempfile::tempdir().unwrap();
+    let app = tauri::test::mock_builder()
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .unwrap();
+    tauri::Manager::manage(&app, state(root.path()));
+    let missing = native_device_backup_recovery_complete(tauri::Manager::state(&app), "missing-session".into());
+    assert_eq!(missing.unwrap_err().code, "device-session-missing");
+    let entry = crate::native_log::global_state()
+        .tail(None)
+        .into_iter()
+        .rev()
+        .find(|entry| entry.message.starts_with("native_device_backup_recovery_complete failed: code=device-session-missing cause="))
+        .expect("the command logs its failure");
+    assert_eq!((entry.level.as_str(), entry.target.as_str()), ("error", "native-command"));
+    assert!(entry.message.contains("commands.rs:"), "{}", entry.message);
+}
+
+#[test]
+fn a_kept_device_failure_cause_stays_out_of_the_reply() {
+    use crate::native_log::CommandFailure;
+    let failure = DeviceBackupError::from(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "synthetic refusal"));
+    assert_eq!(
+        serde_json::to_value(&failure).unwrap(),
+        serde_json::json!({"code": "device-storage-failed", "message": "Device maintenance filesystem operation failed"}),
+    );
+    assert_eq!(
+        failure.detail().as_deref(),
+        Some("Device maintenance filesystem operation failed: PermissionDenied: synthetic refusal"),
+    );
+    let failure = DeviceBackupError::from(rusqlite::Error::QueryReturnedNoRows);
+    assert_eq!(failure.code().as_ref(), "device-storage-failed");
+    assert_eq!(
+        failure.detail().as_deref(),
+        Some("Device maintenance SQLite operation failed: Query returned no rows"),
+    );
+}
