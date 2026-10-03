@@ -1,5 +1,4 @@
 //! Short authoritative operations called between native network stages.
-use std::collections::BTreeMap;
 
 use super::{
     external_storage_state as jobs, sync_selection, PersistentStore, StoreError, StoreResult,
@@ -248,23 +247,6 @@ impl PersistentStore {
             },
         )
         .transpose()
-    }
-    /// What the snapshot behind this connection's base named under each key,
-    /// while the library still holds exactly that. The revision and identity
-    /// are checked here rather than by the caller, so a view that no longer
-    /// describes the library reads as absent instead of as empty.
-    pub(crate) fn external_base_records(
-        &self,
-        connection: &str,
-    ) -> StoreResult<Option<BTreeMap<String, String>>> {
-        let Some(base) = self.external_base(connection)? else {
-            return Ok(None);
-        };
-        let identity = self.external_identity()?;
-        if base.identity != identity {
-            return Ok(None);
-        }
-        jobs::base_records(&self.connection, connection, &base.snapshot_id)
     }
 
     pub(crate) fn external_job_has_no_capture_owner(&self, job: &str) -> StoreResult<bool> {

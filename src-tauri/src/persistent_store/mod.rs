@@ -71,6 +71,14 @@ pub(crate) const ASSET_GC_PRODUCT_PAGE_LIMIT: i64 = 128;
 const ASSET_GC_PRODUCT_MINIMUM_GRACE_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 pub(crate) const MESSAGE_PAGE_SWEEP_LIMIT: usize = 1_024;
 
+/// The store whose message objects one sweep batch visits. Each keeps its own
+/// cursor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MessageObjectStore {
+    Library,
+    Device,
+}
+
 // Add every generation-scoped record family here so staged moves and cleanup cannot omit it.
 pub(super) const GENERATION_TABLES: &[(&str, &str)] = &[
     ("root", "value"),
@@ -2669,26 +2677,37 @@ impl PersistentStore {
         Ok(page)
     }
 
-    /// One bounded pass over the library's message objects. Roots are read inside the
-    /// write transaction, so a reference committed before the pass is seen.
-    /// Callers hold native file admission so no replacement runs meanwhile.
+    /// One bounded pass over one store's message objects. Roots are read under the
+    /// store lock and, for the store being swept, inside its write transaction, so
+    /// a reference committed before the pass is seen. Callers hold native file
+    /// admission so no replacement runs meanwhile.
     pub(crate) fn sweep_message_page_objects(
         &mut self,
+        target: MessageObjectStore,
         now_ms: i64,
         limit: usize,
     ) -> StoreResult<message_pages::ObjectSweep> {
-        let Ok(device) = self.device_store.as_ref() else {
-            return Ok(message_pages::ObjectSweep::default());
+        let Ok(device) = self.device_store.as_mut() else {
+            return Ok(message_pages::ObjectSweep { wrapped: true, ..Default::default() });
         };
+        let leases = self.revision_leases.values().map(|lease| &lease.connection);
+        if target == MessageObjectStore::Device {
+            let transaction = device.transaction()?;
+            let roots = message_pages::object_roots(&self.connection, leases, &transaction, &transaction)?;
+            let sweep = message_pages::sweep_objects(
+                &transaction,
+                &roots,
+                now_ms,
+                ASSET_GC_PRODUCT_MINIMUM_GRACE_MS,
+                limit,
+            )?;
+            transaction.commit()?;
+            return Ok(sweep);
+        }
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let roots = message_pages::object_roots(
-            &transaction,
-            self.revision_leases.values().map(|lease| &lease.connection),
-            device.connection(),
-            &transaction,
-        )?;
+        let roots = message_pages::object_roots(&transaction, leases, device.connection(), &transaction)?;
         let sweep = message_pages::sweep_objects(
             &transaction,
             &roots,

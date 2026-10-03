@@ -2829,11 +2829,11 @@ fn superseded_message_pages_are_collected_only_after_the_grace_period() {
     let superseded = before.difference(&after).cloned().collect::<Vec<_>>();
     assert!(!superseded.is_empty());
     let now = 1_900_000_000_000i64;
-    store.sweep_message_page_objects(now, super::super::MESSAGE_PAGE_SWEEP_LIMIT).unwrap();
+    store.sweep_message_page_objects(super::super::MessageObjectStore::Library, now, super::super::MESSAGE_PAGE_SWEEP_LIMIT).unwrap();
     assert!(superseded.iter().all(|hash| present(&store, hash)));
-    store.sweep_message_page_objects(now + super::super::ASSET_GC_PRODUCT_MINIMUM_GRACE_MS - 1, super::super::MESSAGE_PAGE_SWEEP_LIMIT).unwrap();
+    store.sweep_message_page_objects(super::super::MessageObjectStore::Library, now + super::super::ASSET_GC_PRODUCT_MINIMUM_GRACE_MS - 1, super::super::MESSAGE_PAGE_SWEEP_LIMIT).unwrap();
     assert!(superseded.iter().all(|hash| present(&store, hash)));
-    store.sweep_message_page_objects(now + super::super::ASSET_GC_PRODUCT_MINIMUM_GRACE_MS, super::super::MESSAGE_PAGE_SWEEP_LIMIT).unwrap();
+    store.sweep_message_page_objects(super::super::MessageObjectStore::Library, now + super::super::ASSET_GC_PRODUCT_MINIMUM_GRACE_MS, super::super::MESSAGE_PAGE_SWEEP_LIMIT).unwrap();
     for hash in &superseded {
         assert!(!present(&store, hash), "superseded object {hash} survived maintenance");
         let proofs: i64 = store.connection.query_row(
@@ -2896,11 +2896,11 @@ fn the_message_object_sweep_keeps_what_held_rows_archives_and_leases_need() {
     store.lww_put_object(&orphan_hash, &orphan).unwrap();
 
     let now = 1_900_000_000_000i64;
-    store.sweep_message_page_objects(now, limit).unwrap();
+    store.sweep_message_page_objects(super::super::MessageObjectStore::Library, now, limit).unwrap();
     assert!(!store.lww_verified_object_present(&orphan_hash).unwrap());
     store.lww_put_object(&orphan_hash, &orphan).unwrap();
     assert!(store.lww_verified_object_present(&orphan_hash).unwrap());
-    store.sweep_message_page_objects(now + grace, limit).unwrap();
+    store.sweep_message_page_objects(super::super::MessageObjectStore::Library, now + grace, limit).unwrap();
     assert!(present(&store, &orphan_hash), "a put after marking restarts the grace period");
     assert!(leased.iter().all(|hash| present(&store, hash)), "a revision lease still reads these pages");
     store.release_revision(&lease.lease).unwrap();
@@ -2923,8 +2923,8 @@ fn the_message_object_sweep_keeps_what_held_rows_archives_and_leases_need() {
         super::super::message_pages::validate_manifest(&store.connection, &value).unwrap();
     }
 
-    store.sweep_message_page_objects(now + 2 * grace, limit).unwrap();
-    store.sweep_message_page_objects(now + 3 * grace, limit).unwrap();
+    store.sweep_message_page_objects(super::super::MessageObjectStore::Library, now + 2 * grace, limit).unwrap();
+    store.sweep_message_page_objects(super::super::MessageObjectStore::Library, now + 3 * grace, limit).unwrap();
     assert!(!present(&store, &orphan_hash));
     let current: BTreeSet<String> = store.connection.prepare("SELECT hash FROM message_page_indexes WHERE character_id='leased'").unwrap()
         .query_map([], |row| row.get::<_, String>(0)).unwrap().collect::<Result<_, _>>().unwrap();
@@ -2959,13 +2959,13 @@ fn an_unreadable_reference_node_stops_the_message_object_sweep() {
         "INSERT INTO snapshot_original_units(key,value) VALUES('synthetic',?1)", [serde_json::to_string(&value).unwrap()],
     ).unwrap();
     let now = 1_900_000_000_000i64;
-    assert!(store.sweep_message_page_objects(now, limit).is_err());
-    assert!(store.sweep_message_page_objects(now + grace, limit).is_err());
+    assert!(store.sweep_message_page_objects(super::super::MessageObjectStore::Library, now, limit).is_err());
+    assert!(store.sweep_message_page_objects(super::super::MessageObjectStore::Library, now + grace, limit).is_err());
     let marks: i64 = store.connection.query_row("SELECT count(*) FROM message_page_object_marks", [], |row| row.get(0)).unwrap();
     assert_eq!(marks, 0);
     assert!([&node, &body, &orphan].iter().all(|hash| present(&store, hash)));
     store.connection.execute("DELETE FROM snapshot_original_units", []).unwrap();
-    store.sweep_message_page_objects(now + 2 * grace, limit).unwrap();
-    store.sweep_message_page_objects(now + 3 * grace, limit).unwrap();
+    store.sweep_message_page_objects(super::super::MessageObjectStore::Library, now + 2 * grace, limit).unwrap();
+    store.sweep_message_page_objects(super::super::MessageObjectStore::Library, now + 3 * grace, limit).unwrap();
     assert!([&node, &body, &orphan].iter().all(|hash| !present(&store, hash)));
 }

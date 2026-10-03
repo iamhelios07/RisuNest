@@ -80,7 +80,7 @@ pub(super) fn unit_value(db: &Connection, value: &Value) -> StoreResult<UnitValu
         crate::persistent_store::hash_work::observe("native_large_unit_identity", canonical.len());
         risunest_sync_wire::hash(&canonical)
     };
-    if !super::message_pages::verified_object_present(db, &hash)? {
+    if !super::message_pages::retained_object_present(db, &hash)? {
         super::message_pages::put_object(db, &hash, &canonical)?;
     }
     wire(UnitValue::object(RecordDescriptor::content(hash)))
@@ -768,7 +768,7 @@ impl PersistentStore {
         for change in changes {
             let UnitValue::Object { descriptor, .. } = &change.value else { continue };
             if !projection::is_device(&change.key)
-                || super::message_pages::verified_object_present(device, &descriptor.object_hash)?
+                || super::message_pages::retained_object_present(device, &descriptor.object_hash)?
             {
                 continue;
             }
@@ -779,8 +779,7 @@ impl PersistentStore {
         Ok(())
     }
     pub(crate) fn lww_put_object(&self, hash: &str, body: &[u8]) -> StoreResult<()> {
-        super::message_pages::put_object(&self.connection, hash, body)?;
-        super::message_pages::clear_object_mark(&self.connection, hash)
+        super::message_pages::put_object(&self.connection, hash, body)
     }
     pub(crate) fn lww_put_managed_object(&mut self, hash: &str, body: &[u8]) -> StoreResult<()> {
         if {

@@ -185,24 +185,6 @@ fn require_publish_with_pause(
     Ok(())
 }
 
-pub(super) fn replaced(tx: &Transaction<'_>) -> StoreResult<()> {
-    require_no_pending_publication(tx)?;
-    tx.execute("UPDATE lww_binding_identity SET library_id=NULL,target_id=NULL WHERE EXISTS(SELECT 1 FROM library_sync_selection WHERE target='none')", [])?;
-    tx.execute(
-        "UPDATE local_library_identity SET library_epoch=?1 WHERE singleton=1",
-        [uuid::Uuid::new_v4().to_string()],
-    )?;
-    tx.execute(
-        "UPDATE library_sync_selection SET decision_required=1 WHERE target='external'",
-        [],
-    )?;
-    tx.execute(
-        "UPDATE external_storage_jobs SET phase='stale' WHERE role!='backup' AND phase IN ('preparing','ready')",
-        [],
-    )?;
-    Ok(())
-}
-
 pub(crate) fn require_server(db: &Connection) -> StoreResult<()> {
     let selected = read(db)?;
     if !matches!(selected.target, SyncTarget::Server(_)) || selected.paused {
@@ -500,7 +482,7 @@ mod binding_tests {
     }
 
     #[test]
-    fn unbinding_retains_library_for_rebind_but_unbound_replacement_clears_association() {
+    fn unbinding_retains_library_for_rebind() {
         let mut db=database();let initial=change(&db);let tx=db.transaction().unwrap();
         apply_binding_selection(&tx,&initial).unwrap();
         let unbind=BindingSelectionChange {expected_epoch:initial.new_epoch,new_epoch:"unbound".into(),target:SyncTarget::None,library_id:None,target_id:None,inspection_id:None};
@@ -508,9 +490,6 @@ mod binding_tests {
         apply_binding_selection(&tx,&unbind).unwrap();
         let library:Option<String>=tx.query_row("SELECT library_id FROM lww_binding_identity WHERE singleton=1",[],|r|r.get(0)).unwrap();
         assert_eq!(library,Some("library".into()));
-        replaced(&tx).unwrap();
-        let library:Option<String>=tx.query_row("SELECT library_id FROM lww_binding_identity WHERE singleton=1",[],|r|r.get(0)).unwrap();
-        assert_eq!(library,None);
     }
 
     #[test]

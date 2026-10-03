@@ -204,3 +204,82 @@ fn large_units_are_backup_controls_above_the_metadata_bound() {
     assert!(closure.payload_bodies.is_empty() && closure.managed_payloads.is_empty() && closure.record_payloads.is_empty());
     store.release_revision(&lease.lease).unwrap();
 }
+
+fn write_plugin(store: &mut PersistentStore, value: &str) {
+    use device_store::plugin_values::PluginDeviceMutation;
+    store.device_store_mut().unwrap().write_plugin_device_values(PLUGIN_KEY[1], &[
+        PluginDeviceMutation::Set { space: PLUGIN_KEY[2].into(), key: PLUGIN_KEY[3].into(), value: value.into() },
+    ]).unwrap();
+}
+fn device_object(store: &PersistentStore, table: &str, hash: &str) -> bool {
+    store.device_store().unwrap().connection().query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE hash=?1)"), [hash], |row| row.get(0),
+    ).unwrap()
+}
+
+#[test]
+fn a_superseded_device_large_unit_body_is_reclaimed_once_no_backup_lease_reads_it() {
+    let grace = super::super::ASSET_GC_PRODUCT_MINIMUM_GRACE_MS;
+    let limit = super::super::MESSAGE_PAGE_SWEEP_LIMIT;
+    let device = super::super::MessageObjectStore::Device;
+    let (_dir, mut store) = store();
+    store.device_store_mut().unwrap().set_section_participating(device_store::Section::LocalPlugins, true).unwrap();
+    let (old, new) = (text(MAX_INLINE_UNIT_BYTES + 3), text(MAX_INLINE_UNIT_BYTES + 4));
+    let old_hash = risunest_sync_wire::hash(&canonical(&Value::String(old.clone())));
+    let new_hash = risunest_sync_wire::hash(&canonical(&Value::String(new.clone())));
+    write_plugin(&mut store, &old);
+    ack_all(&mut store);
+    let lease = store.lww_acquire_library_backup_capture(store.revision().unwrap()).unwrap();
+    write_plugin(&mut store, &new);
+    ack_all(&mut store);
+    assert!(device_object(&store, "message_page_objects", &old_hash));
+
+    let now = 1_900_000_000_000i64;
+    store.sweep_message_page_objects(device, now, limit).unwrap();
+    store.sweep_message_page_objects(device, now + grace, limit).unwrap();
+    assert!(device_object(&store, "message_page_objects", &old_hash), "a backup lease still reads the old device unit");
+    store.release_revision(&lease.lease).unwrap();
+    store.sweep_message_page_objects(device, now + 2 * grace, limit).unwrap();
+    assert!(device_object(&store, "message_page_object_marks", &old_hash));
+    store.sweep_message_page_objects(device, now + 3 * grace, limit).unwrap();
+    assert!(!device_object(&store, "message_page_objects", &old_hash), "the superseded device body survived");
+    assert!(device_object(&store, "message_page_objects", &new_hash));
+    assert!(!device_object(&store, "message_page_object_marks", &new_hash));
+    assert_eq!(plugin_value(&store), Some(new.clone()));
+    assert_eq!(store.lww_object_body(&new_hash).unwrap(), Some(canonical(&Value::String(new))));
+}
+
+#[test]
+fn a_marked_body_is_stored_again_before_a_write_or_receive_relies_on_it() {
+    let limit = super::super::MESSAGE_PAGE_SWEEP_LIMIT;
+    let (_dir, mut store) = store();
+    store.device_store_mut().unwrap().set_section_participating(device_store::Section::LocalPlugins, true).unwrap();
+    let values = [MAX_INLINE_UNIT_BYTES + 3, MAX_INLINE_UNIT_BYTES + 4, MAX_INLINE_UNIT_BYTES + 5].map(text);
+    let hashes = values.clone().map(|value| risunest_sync_wire::hash(&canonical(&Value::String(value))));
+    let now = 1_900_000_000_000i64;
+    write_plugin(&mut store, &values[0]);
+    write_plugin(&mut store, &values[1]);
+    ack_all(&mut store);
+    store.sweep_message_page_objects(super::super::MessageObjectStore::Device, now, limit).unwrap();
+    assert!(device_object(&store, "message_page_object_marks", &hashes[0]));
+    write_plugin(&mut store, &values[0]);
+    assert!(!device_object(&store, "message_page_object_marks", &hashes[0]), "a local write trusted a marked device body");
+
+    write_plugin(&mut store, &values[2]);
+    ack_all(&mut store);
+    store.sweep_message_page_objects(super::super::MessageObjectStore::Device, now, limit).unwrap();
+    assert!(device_object(&store, "message_page_object_marks", &hashes[1]));
+    let value = published(&store, &canonical(&Value::String(values[1].clone())));
+    stage(&mut store, Change { key: unit_key(&PLUGIN_KEY).unwrap(), stamp: stamp(1), value }).unwrap();
+    assert!(!device_object(&store, "message_page_object_marks", &hashes[1]), "a staged receive trusted a marked device body");
+
+    let control = b"synthetic-control-object".to_vec();
+    let control_hash = risunest_sync_wire::hash(&control);
+    store.lww_put_object(&control_hash, &control).unwrap();
+    assert_eq!(store.external_lww_verified_control_size(&control_hash).unwrap(), Some(control.len() as u64));
+    store.sweep_message_page_objects(super::super::MessageObjectStore::Library, now, limit).unwrap();
+    assert_eq!(store.external_lww_verified_control_size(&control_hash).unwrap(), None, "a marked control was trusted");
+    assert!(store.external_lww_object_is_control(&control_hash).unwrap());
+    store.lww_put_object(&control_hash, &control).unwrap();
+    assert_eq!(store.external_lww_verified_control_size(&control_hash).unwrap(), Some(control.len() as u64));
+}

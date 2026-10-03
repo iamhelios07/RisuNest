@@ -419,8 +419,10 @@ impl PersistentStore {
     }
     pub(crate) fn external_lww_verified_control_size(&self, hash:&str) -> StoreResult<Option<u64>> {
         risunest_sync_wire::validate_hash(hash).map_err(super::lww::error)?;
+        // A marked control may be collected, so it is fetched again instead.
         let size:Option<i64>=self.connection.query_row("SELECT length(o.body) FROM message_page_objects o
-            JOIN message_page_verified_objects v ON v.hash=o.hash WHERE o.hash=?1",[hash],|row|row.get(0)).optional()?;
+            JOIN message_page_verified_objects v ON v.hash=o.hash WHERE o.hash=?1
+            AND NOT EXISTS(SELECT 1 FROM message_page_object_marks m WHERE m.hash=o.hash)",[hash],|row|row.get(0)).optional()?;
         size.map(|size|u64::try_from(size).map_err(super::lww::error)).transpose()
     }
     fn external_lww_store_data_catalog_witness(&self,target:&str,witness:&DataCatalogWitness) -> StoreResult<()> {

@@ -221,6 +221,8 @@ pub(super) fn put_object(db: &Connection, hash: &str, body: &[u8]) -> StoreResul
     if !verified_object_present(db, hash)? {
         db.execute("INSERT INTO message_page_verified_objects(hash) VALUES(?1)", [hash])?;
     }
+    // Storing an object is a new use of it, so a pending collection stops.
+    db.execute("DELETE FROM message_page_object_marks WHERE hash=?1", [hash])?;
     Ok(())
 }
 
@@ -1132,9 +1134,9 @@ impl ObjectRoots {
     }
 }
 
-/// Every hash that a library row, a revision lease's view of the library or a
-/// device row references. The result roots the sweep of either store; tree
-/// nodes are read from `objects`, the store being swept.
+/// Every hash that a library row, a revision lease's view of the library or of
+/// the device it pinned, or a device row references. The result roots the sweep
+/// of either store; tree nodes are read from `objects`, the store being swept.
 pub(super) fn object_roots<'a>(
     library: &Connection,
     leases: impl IntoIterator<Item = &'a Connection>,
@@ -1145,8 +1147,16 @@ pub(super) fn object_roots<'a>(
     library_object_roots(library, objects, &mut roots)?;
     for lease in leases {
         library_object_roots(lease, objects, &mut roots)?;
+        let pinned: bool = lease.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_database_list WHERE name='backup_device')",
+            [],
+            |row| row.get(0),
+        )?;
+        if pinned {
+            device_object_roots(lease, "backup_device", objects, &mut roots)?;
+        }
     }
-    device_object_roots(device, objects, &mut roots)?;
+    device_object_roots(device, "main", objects, &mut roots)?;
     Ok(roots)
 }
 
@@ -1194,22 +1204,23 @@ fn library_object_roots(db: &Connection, objects: &Connection, roots: &mut Objec
     Ok(())
 }
 
-/// Collects the objects that unfinished device rows reference: device units,
-/// staged receives, unfinished intents and unpublished proofs.
-fn device_object_roots(device: &Connection, objects: &Connection, roots: &mut ObjectRoots) -> StoreResult<()> {
+/// Collects the objects that unfinished device rows in `schema` on `db`
+/// reference: device units, staged receives, unfinished intents and
+/// unpublished proofs.
+fn device_object_roots(db: &Connection, schema: &str, objects: &Connection, roots: &mut ObjectRoots) -> StoreResult<()> {
     for sql in [
-        "SELECT value FROM lww_units WHERE json_extract(value,'$.kind')='object'",
-        "SELECT value FROM lww_outbox WHERE json_extract(value,'$.kind')='object'",
-        "SELECT value FROM lww_receive_rows WHERE status<>'done' AND json_extract(value,'$.kind')='object'",
+        format!("SELECT value FROM {schema}.lww_units WHERE json_extract(value,'$.kind')='object'"),
+        format!("SELECT value FROM {schema}.lww_outbox WHERE json_extract(value,'$.kind')='object'"),
+        format!("SELECT value FROM {schema}.lww_receive_rows WHERE status<>'done' AND json_extract(value,'$.kind')='object'"),
     ] {
-        unit_value_roots(device, objects, sql, roots)?;
+        unit_value_roots(db, objects, &sql, roots)?;
     }
     for sql in [
-        "SELECT body FROM lww_receive WHERE finished=0",
-        "SELECT body FROM lww_intents WHERE complete=0",
-        "SELECT entries FROM lww_unpublished_proofs",
+        format!("SELECT body FROM {schema}.lww_receive WHERE finished=0"),
+        format!("SELECT body FROM {schema}.lww_intents WHERE complete=0"),
+        format!("SELECT entries FROM {schema}.lww_unpublished_proofs"),
     ] {
-        let mut statement = device.prepare(sql)?;
+        let mut statement = db.prepare(&sql)?;
         let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
         for row in rows {
             let body: Value = serde_json::from_str(&row?)?;
@@ -1306,11 +1317,6 @@ pub(super) fn retained_object_present(db: &Connection, hash: &str) -> StoreResul
             [hash],
             |row| row.get::<_, bool>(0),
         )?)
-}
-
-pub(super) fn clear_object_mark(db: &Connection, hash: &str) -> StoreResult<()> {
-    db.execute("DELETE FROM message_page_object_marks WHERE hash=?1", [hash])?;
-    Ok(())
 }
 
 fn sql_u64(value: i64, index: usize) -> rusqlite::Result<u64> {
