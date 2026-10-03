@@ -3060,6 +3060,7 @@ export const languageEnglish = {
         concurrentEditNotice: "When the same item is edited on multiple devices at the same time, the last edit is kept. Edits or messages may be lost. Avoid using multiple devices at the same time.",
         replaceTitle: "Replace the data on this device?",
         replaceDescription: "To sync, the data on this device will be cleared and replaced with remote data. Make a manual backup if needed.",
+        serverRestoredDescription: "The server was restored from a backup. The data on this device will be cleared and replaced with the server data, and changes made on this device after the backup will be lost. Make a manual backup if needed.",
         replaceAcknowledge: "Clear the data on this device",
         replaceAction: "Replace",
         cancelAction: "Cancel",
