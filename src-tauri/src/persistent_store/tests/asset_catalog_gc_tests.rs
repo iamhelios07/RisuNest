@@ -1488,11 +1488,13 @@ fn reused_library_roots_are_collected_again_after_a_change_between_gc_pages() {
         let marks = store.prepare_asset_gc_delete_marks().unwrap();
         let mut library = None;
         super::super::ASSET_GC_LIBRARY_ROOT_COLLECTIONS.with(|count| count.set(0));
+        super::super::ASSET_GC_FINAL_MARKINGS.with(|count| count.set(0));
         let first = store.asset_gc_delete_marked_page_reusing_library(&marks, &mut library, 1, None, 100, 10, |_| Ok(())).unwrap();
         let second = store.asset_gc_delete_marked_page_reusing_library(&marks, &mut library, 1, first.next_cursor.as_deref(), 100, 10, |_| Ok(())).unwrap();
         assert_eq!(first.report.deleted_hashes, [objects[0].content_hash.clone()]);
         assert_eq!(second.report.deleted_hashes, [objects[1].content_hash.clone()]);
         assert_eq!(super::super::ASSET_GC_LIBRARY_ROOT_COLLECTIONS.with(|count| count.get()), 1);
+        assert_eq!(super::super::ASSET_GC_FINAL_MARKINGS.with(|count| count.get()), 1);
         let generation = super::active_generation(&store.connection).unwrap();
         let insert = "INSERT INTO asset_aliases (generation, logical_key, object_hash, kind, size, mime, name, ext,
                 inlay_type, width, height, metadata)
@@ -1507,6 +1509,7 @@ fn reused_library_roots_are_collected_again_after_a_change_between_gc_pages() {
         let last = store.asset_gc_delete_marked_page_reusing_library(&marks, &mut library, 1, second.next_cursor.as_deref(), 100, 10, |_| Ok(())).unwrap();
         assert!(last.report.deleted_hashes.is_empty(), "other connection: {other_connection}");
         assert_eq!(super::super::ASSET_GC_LIBRARY_ROOT_COLLECTIONS.with(|count| count.get()), 2);
+        assert_eq!(super::super::ASSET_GC_FINAL_MARKINGS.with(|count| count.get()), 2);
         assert!(cas.stat_object(&objects[2].content_hash).unwrap().is_some());
     }
 }
