@@ -1,4 +1,6 @@
-use super::job_pins::{CasJobKind, CasObjectRole, CasReleaseOutcome, DurableCasJob};
+use super::job_pins::{
+    durable_cas_job_ids, CasJobKind, CasObjectRole, CasReleaseOutcome, DurableCasJob,
+};
 use super::{PayloadCas, PreparedPayload};
 use crate::asset_repository::owner_manifest_codec::{
     decode_owner_manifest, encode_owner_manifest, OWNER_MANIFEST_V1_MAX_CANONICAL_BYTES,
@@ -10,6 +12,7 @@ use crate::trust_boundary::is_lower_hex_256;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Cursor, ErrorKind, Seek, SeekFrom, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager, State};
@@ -23,6 +26,7 @@ pub(crate) struct ContentDirectObject {
 pub(crate) struct DurableCasJobState {
     jobs: Mutex<HashMap<String, DurableCasJob>>,
     uploads: Mutex<CasUploadPool>,
+    renderer_started: AtomicBool,
 }
 
 impl Default for DurableCasJobState {
@@ -30,23 +34,119 @@ impl Default for DurableCasJobState {
         Self {
             jobs: Mutex::new(HashMap::new()),
             uploads: Mutex::new(CasUploadPool::default()),
+            renderer_started: AtomicBool::new(false),
         }
+    }
+}
+
+/// Write sessions no page can finish any more, released on a blocking thread
+/// because the repository lock may be held for a long time.
+struct AbandonedCasJobs {
+    root: std::path::PathBuf,
+    sessions: Vec<DurableCasJob>,
+    journal_ids: Vec<String>,
+    listing_failure: Option<String>,
+}
+
+impl AbandonedCasJobs {
+    fn release(self) -> Result<(), String> {
+        let mut failure = self.listing_failure;
+        for mut session in self.sessions {
+            if let Err(error) = session.release(CasReleaseOutcome::Aborted) {
+                failure.get_or_insert(error.to_string());
+            }
+        }
+        for id in self.journal_ids {
+            let released = match DurableCasJob::open(&self.root, &id) {
+                Ok(mut job)
+                    if matches!(
+                        job.kind(),
+                        CasJobKind::DirectAssetOrInlayWrite | CasJobKind::CardOrModuleContentImport
+                    ) =>
+                {
+                    job.release(CasReleaseOutcome::Aborted)
+                }
+                Ok(_) => Ok(()),
+                Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = released {
+                failure.get_or_insert(error.to_string());
+            }
+        }
+        failure.map_or(Ok(()), Err)
     }
 }
 
 impl DurableCasJobState {
     pub(crate) fn close_for_cleanup(&self) -> Result<(), String> {
-        self.reset_renderer_session()?;
+        self.clear_uploads()?;
         self.jobs.lock().map_err(|_| "cleanup-cas-busy")?.clear();
         Ok(())
     }
 
-    pub(crate) fn reset_renderer_session(&self) -> Result<(), String> {
+    fn clear_uploads(&self) -> Result<(), String> {
         self.uploads
             .lock()
             .map_err(|error| format!("CAS upload mutex poisoned: {error}"))?
             .clear();
         Ok(())
+    }
+
+    pub(crate) fn reset_renderer_session(&self, app: &AppHandle) -> Result<(), String> {
+        let abandoned = self.take_abandoned(&repository_root(app)?)?;
+        if !abandoned.sessions.is_empty()
+            || !abandoned.journal_ids.is_empty()
+            || abandoned.listing_failure.is_some()
+        {
+            let app = app.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let released = app
+                    .state::<PersistentStoreState>()
+                    .admit_renderer_operation()
+                    .map_err(|error| error.to_string())
+                    .and_then(|_operation| abandoned.release());
+                if let Err(error) = released {
+                    crate::nlog!("error", "failed to release abandoned CAS write sessions: {error}");
+                }
+            });
+        }
+        Ok(())
+    }
+
+    fn take_abandoned(&self, root: &std::path::Path) -> Result<AbandonedCasJobs, String> {
+        self.clear_uploads()?;
+        let mut jobs = self
+            .jobs
+            .lock()
+            .map_err(|error| format!("CAS job session mutex poisoned: {error}"))?;
+        // A page keeps its write session IDs only in memory, so the next page
+        // cannot finish them.
+        let ids = jobs
+            .iter()
+            .filter(|(_, job)| job.kind() == CasJobKind::DirectAssetOrInlayWrite)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        let sessions = ids.iter().filter_map(|id| jobs.remove(id)).collect();
+        drop(jobs);
+        // Sessions an earlier run left behind have no page either, and neither
+        // does content a native import prepared for a page to activate. Native
+        // jobs of these kinds start only from a page, so none exists before the
+        // first one.
+        let (journal_ids, listing_failure) = if self.renderer_started.swap(true, Ordering::AcqRel) {
+            (Vec::new(), None)
+        } else {
+            match durable_cas_job_ids(root) {
+                Ok(ids) => (ids, None),
+                Err(error) => (Vec::new(), Some(error.to_string())),
+            }
+        };
+        Ok(AbandonedCasJobs {
+            root: root.to_owned(),
+            sessions,
+            journal_ids,
+            listing_failure,
+        })
     }
 }
 
@@ -979,6 +1079,55 @@ mod tests {
             assert!(roots.object_hashes.is_empty());
             assert!(cas.stat_object(&object.content_hash).unwrap().is_some());
         }
+    }
+
+    #[test]
+    fn a_new_page_releases_the_write_sessions_the_old_page_and_an_earlier_run_left_behind() {
+        let directory = TempDir::new().unwrap();
+        let root = directory.path();
+        let mut store = PersistentStore::open(root).unwrap();
+        let cas = PayloadCas::new(root).unwrap();
+        let begin = |id: &str, kind| DurableCasJob::begin(root, id, kind, 1).unwrap();
+        let mut earlier = begin("earlier-write", CasJobKind::DirectAssetOrInlayWrite);
+        earlier.prepare_bytes(&cas, b"synthetic earlier", CasObjectRole::DirectObject).unwrap();
+        drop(earlier);
+        drop(begin("earlier-import", CasJobKind::CardOrModuleContentImport));
+        drop(begin("earlier-restore", CasJobKind::LocalBackupRestore));
+        let state = DurableCasJobState::default();
+        let blockers = || {
+            collect_durable_cas_job_roots(root).blockers.into_iter().collect::<Vec<_>>()
+        };
+
+        state.take_abandoned(root).unwrap().release().unwrap();
+        assert_eq!(blockers(), ["job-pin-unsealed:earlier-restore"]);
+
+        let mut unsealed = begin("page-unsealed", CasJobKind::DirectAssetOrInlayWrite);
+        unsealed.prepare_bytes(&cas, b"synthetic unsealed", CasObjectRole::DirectObject).unwrap();
+        let mut sealed = begin("page-sealed", CasJobKind::DirectAssetOrInlayWrite);
+        let sealed_object =
+            sealed.prepare_bytes(&cas, b"synthetic sealed", CasObjectRole::DirectObject).unwrap();
+        sealed.seal(&mut store, 1).unwrap();
+        state.jobs.lock().unwrap().extend([
+            ("page-unsealed".to_owned(), unsealed),
+            ("page-sealed".to_owned(), sealed),
+            ("page-import".to_owned(), begin("page-import", CasJobKind::CardOrModuleContentImport)),
+        ]);
+        // After the first page, a journal outside the map belongs to a native job.
+        drop(begin("native-write", CasJobKind::DirectAssetOrInlayWrite));
+
+        state.take_abandoned(root).unwrap().release().unwrap();
+        assert_eq!(
+            blockers(),
+            [
+                "job-pin-unsealed:earlier-restore",
+                "job-pin-unsealed:native-write",
+                "job-pin-unsealed:page-import",
+            ],
+        );
+        assert!(!collect_durable_cas_job_roots(root)
+            .object_hashes
+            .contains(&sealed_object.content_hash));
+        assert_eq!(state.jobs.lock().unwrap().keys().collect::<Vec<_>>(), ["page-import"]);
     }
 
     fn owner_manifest() -> Vec<u8> {
