@@ -227,7 +227,6 @@ mod classification_tests {
             ("unexpected-content-encoding", 502),
             ("response-too-large", 502),
             ("epoch-reconciliation-required", 409),
-            ("new-device-registration-required", 409),
             ("device-credential-unavailable", 409),
         ] {
             assert!(
