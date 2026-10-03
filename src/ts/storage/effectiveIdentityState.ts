@@ -63,6 +63,10 @@ function boundConversation(db: Database, binding: ToggleBinding | undefined): Co
     return chat && !isConversationSummaryStub(chat) ? chat : undefined
 }
 
+export function getEffectivePresetOverride(db: Database): string | null {
+    return states.get(db)?.override ?? null
+}
+
 export function getEffectivePresetId(db: Database): string | undefined {
     return state(db).override ?? db.botPresets?.[db.botPresetsId]?.id
 }
