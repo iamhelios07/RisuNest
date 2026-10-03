@@ -2677,9 +2677,10 @@ impl PersistentStore {
         Ok(page)
     }
 
-    /// One bounded pass over one store's message objects. Roots are read inside the
-    /// write transaction, so a reference committed before the pass is seen.
-    /// Callers hold native file admission so no replacement runs meanwhile.
+    /// One bounded pass over one store's message objects. Roots are read under the
+    /// store lock and, for the store being swept, inside its write transaction, so
+    /// a reference committed before the pass is seen. Callers hold native file
+    /// admission so no replacement runs meanwhile.
     pub(crate) fn sweep_message_page_objects(
         &mut self,
         target: MessageObjectStore,
