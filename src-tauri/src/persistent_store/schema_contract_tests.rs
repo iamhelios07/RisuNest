@@ -43,6 +43,7 @@ fn all_live_tables_have_an_explicit_preservation_owner() {
         "lww_binding_sources",
         "lww_binding_stages",
         "lww_binding_switch_requests",
+        "lww_binding_switch_retained",
         "lww_initialization_scopes",
         "lww_outbox",
         "lww_publications",
