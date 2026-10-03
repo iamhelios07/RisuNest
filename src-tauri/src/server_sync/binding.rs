@@ -75,7 +75,7 @@ pub(crate) fn inspect(store: &PersistentStore, header: &Header) -> Result<Inspec
     assert_authority(store, header)?;
     let core = candidate(store)?;
     core.admission()?;
-    let head = core.client.resolve_identity(false)?;
+    let head = core.client.resolve_identity()?;
     let (_, pin): (_, StatePin) = core.client.json(
         reqwest::Method::POST,
         "state/pins",
@@ -163,12 +163,12 @@ pub(crate) fn stage(
         target.config.resolve(store.repository_root())?,
     )?;
     core.access = Some(target.config.clone());
-    if core.client.resolve_identity(false)?.epoch != target.epoch {
+    if core.client.resolve_identity()?.epoch != target.epoch {
         return Err(SyncError::new("server-epoch-changed", 409));
     }
     let upper = core.admission()?;
     let (cursor, changes) = core.state(store, upper)?;
-    if core.client.resolve_identity(false)?.epoch != target.epoch {
+    if core.client.resolve_identity()?.epoch != target.epoch {
         return Err(SyncError::new("server-epoch-changed", 409));
     }
     assert_authority(store, header)?;
@@ -312,7 +312,7 @@ pub(crate) fn activate(
         target.config.resolve(store.repository_root())?,
     )?;
     core.access = Some(target.config.clone());
-    if core.client.resolve_identity(false)?.epoch != target.epoch {
+    if core.client.resolve_identity()?.epoch != target.epoch {
         return Err(SyncError::new("server-epoch-changed", 409));
     }
     store.server_save_config(&target.config)?;
