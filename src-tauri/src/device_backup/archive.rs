@@ -637,20 +637,6 @@ fn read_native_object(
     Ok(bytes)
 }
 
-pub(crate) fn apply_prepared_native_sections(
-    store: &mut PersistentStore,
-    sections: &[PreparedDeviceSection],
-) -> Result<()> {
-    for section in sections {
-        store
-            .device_store_mut()
-            .map_err(device_store_error)?
-            .restore_prepared_backup_section(section.rows())
-            .map_err(device_store_error)?;
-    }
-    Ok(())
-}
-
 pub(crate) fn journal_prepared_native_sections(
     state: &DeviceBackupState,
     id: &str,

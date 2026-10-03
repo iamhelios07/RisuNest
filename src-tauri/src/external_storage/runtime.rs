@@ -421,7 +421,7 @@ pub(crate) async fn external_storage_start_job(
         if pending.terminal() {
             if job_id.is_some() { return Ok(pending.summary); }
             let identity = native_store(&app)?.external_identity().map_err(local_error)?;
-            let next = DurableJob::new(request, false, now_ms(), identity);
+            let next = DurableJob::new(request, now_ms(), identity);
             store.put(&next)?;
             wake_job(app, next.id.clone())?;
             return Ok(next.summary);
@@ -443,7 +443,7 @@ pub(crate) async fn external_storage_start_job(
     let identity = native_store(&app)?
         .external_identity()
         .map_err(local_error)?;
-    let mut job = DurableJob::new(request, false, now_ms(), identity);
+    let mut job = DurableJob::new(request, now_ms(), identity);
     if let Some(id) = job_id {
         job = job.with_restore_id(id)?;
         if !store.insert_new(&job)? {
@@ -1694,7 +1694,7 @@ mod tests {
         let request = serde_json::from_value(json!({
             "connectionId":"x", "kind":"backup", "reason":"automatic", "targetRevision":"1"
         })).unwrap();
-        DurableJob::new(request, false, 1, persistent_store::sync_selection::CaptureIdentity {
+        DurableJob::new(request, 1, persistent_store::sync_selection::CaptureIdentity {
             store_id: "store".into(), library_epoch: "library".into(), generation: "generation".into(),
             selection_epoch: "selection".into(), revision: 1,
         })
@@ -1904,7 +1904,7 @@ mod tests {
             selection_epoch: "selection".into(),
             revision: 1,
         };
-        let mut job = DurableJob::new(request, false, 1, identity);
+        let mut job = DurableJob::new(request, 1, identity);
         job.summary["state"] = json!("running");
         settle_interrupted(&mut job, None, true);
         assert_eq!(job.summary["state"], "uncertain");
@@ -1932,7 +1932,7 @@ mod tests {
             selection_epoch: "selection".into(),
             revision: 5,
         };
-        let job = DurableJob::new(request, false, 1, identity.clone());
+        let job = DurableJob::new(request, 1, identity.clone());
         let mut current = identity;
         current.revision = 10;
         assert!(require_admitted_library(&job, &current).is_ok());

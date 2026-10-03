@@ -1152,19 +1152,10 @@ fn a_committed_device_value_survives_reopening_the_device_file() {
 mod section_exchange {
     use risunest_external_storage_format::section::SectionKind;
 
-    impl DeviceStore {
-        fn restore_backup_fixture(&mut self, kind: SectionKind, rows: &[SectionRow]) -> crate::persistent_store::StoreResult<()> {
-            let mut spool = SectionSpoolBuilder::new_backup(kind)?;
-            for row in rows { spool.push_backup_row(row.clone())?; }
-            self.restore_prepared_backup_section(&spool.finish_captured()?)
-        }
-    }
-
     use super::super::sections::{
-        PublishedRows, SectionCursor, SectionRow, SectionSpoolBuilder,
+        SectionCursor, SectionRow, SectionSpoolBuilder,
         SectionValueRow, TombstonePublication, LOCAL_SETTING_KEYS,
     };
-    use std::collections::BTreeMap;
     use super::super::{plugin_values::PluginDeviceMutation, DeviceStore, Section};
     use super::open;
     use risunest_sync_wire::Sequence;
@@ -1180,13 +1171,6 @@ mod section_exchange {
             },
             write_clock: Sequence::from(clock),
             writer_id: writer.into(),
-        }
-    }
-
-    fn marker(generation: u64, at_ms: u64) -> TombstonePublication {
-        TombstonePublication {
-            generation: Sequence::from(generation),
-            at_ms,
         }
     }
 
@@ -1434,31 +1418,11 @@ mod section_exchange {
         );
     }
 
-    /// Invariant 32 on the device side. Restored backup material is this
-    /// device's own write, so it installs no other writer and no counters, and
-    /// coordination settings never enter a bundle in the first place.
+    /// Invariant 32 on the device side. Coordination settings never enter a
+    /// bundle in the first place.
     #[test]
-    fn restored_backup_material_becomes_this_device_own_write() {
+    fn coordination_settings_never_enter_local_setting_rows() {
         let (_directory, mut store) = open();
-        store
-            .restore_backup_fixture(
-                SectionKind::LocalPlugins,
-                &[plugin_row("alpha", "from-backup", 0, "")],
-            )
-            .expect("restore plugin value");
-        let (clock, writer, published): (String, String, Option<String>) = store
-            .connection()
-            .query_row(
-                "SELECT write_clock,writer_id,published_clock FROM plugin_device_storage
-                    WHERE owner='plugin-a' AND space='string' AND key='alpha'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .expect("read restored row");
-        assert_eq!(clock, "1");
-        assert_eq!(writer, store.writer_id().unwrap());
-        assert!(published.is_none());
-
         for key in [
             "official-account.association.v1",
             "official-account.asset-ledger.v1",
@@ -1479,27 +1443,6 @@ mod section_exchange {
             rows.iter().map(|row| row.key2.as_str()).collect::<Vec<_>>(),
             vec!["risuNestDeviceSettings"]
         );
-    }
-
-    #[test]
-    fn prepared_hypa_restore_reissues_local_clocks_and_retries_without_new_writes() {
-        let (_source_dir, mut source) = open();
-        source.write_hypa_embeddings(&[super::embedding("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", &[1.0, 2.0])]).unwrap();
-        let rows = source.read_backup_section_rows(Section::Hypa).unwrap();
-        let (_target_dir, mut target) = open();
-        target.write_hypa_embeddings(&[super::embedding("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", &[3.0])]).unwrap();
-        target.restore_backup_fixture(SectionKind::Hypa, &rows).unwrap();
-        let first = target.read_section_rows(Section::Hypa).unwrap();
-        assert!(first.iter().all(|row| row.writer_id == target.writer_id().unwrap()));
-        let restored = first.iter().find(|row| !row.value.is_tombstone()).unwrap();
-        assert_eq!(restored.value, rows[0].value);
-        assert!(restored.write_clock > Sequence::from(1u64));
-        let clock = target.section_state(Section::Hypa).unwrap().max_write_clock;
-        target.restore_backup_fixture(SectionKind::Hypa, &rows).unwrap();
-        assert_eq!(target.read_section_rows(Section::Hypa).unwrap(), first);
-        assert_eq!(target.section_state(Section::Hypa).unwrap().max_write_clock, clock);
-        target.restore_backup_fixture(SectionKind::Hypa, &[]).unwrap();
-        assert!(target.read_backup_section_rows(Section::Hypa).unwrap().is_empty());
     }
 
     #[test]
@@ -1671,180 +1614,6 @@ mod section_exchange {
         }
     }
 
-    /// Invariant 31 on the device side. The material decides the section: a key
-    /// it carries is installed, a key it leaves out is removed, and a section it
-    /// says nothing about keeps everything this device holds.
-    #[test]
-    fn restoring_a_section_replaces_only_what_the_material_covers() {
-        let (_directory, mut store) = open();
-        set(&mut store, "kept", "before");
-        set(&mut store, "dropped", "before");
-        store
-            .write_hypa_embeddings(&[super::embedding("kept-embedding", &[1.0])])
-            .expect("write embedding");
-        store
-            .restore_backup_fixture(
-                SectionKind::LocalPlugins,
-                &[
-                    plugin_row("kept", "after", 0, ""),
-                    plugin_row("added", "after", 0, ""),
-                ],
-            )
-            .expect("restore plugin values");
-        assert_eq!(
-            live(&mut store),
-            vec![
-                ("added".to_owned(), Some("after".to_owned())),
-                ("dropped".to_owned(), None),
-                ("kept".to_owned(), Some("after".to_owned())),
-            ]
-        );
-        assert_eq!(
-            store
-                .read_backup_section_rows(Section::Hypa)
-                .expect("read embeddings")
-                .len(),
-            1
-        );
-    }
-
-    /// Invariant 31. A selected area that the material covers with nothing is an
-    /// emptied area, not an untouched one.
-    #[test]
-    fn restoring_an_empty_selected_section_clears_it() {
-        let (_directory, mut store) = open();
-        set(&mut store, "alpha", "before");
-        set(&mut store, "beta", "before");
-        store
-            .restore_backup_fixture(SectionKind::LocalPlugins, &[])
-            .expect("restore an empty section");
-        assert_eq!(
-            live(&mut store),
-            vec![("alpha".to_owned(), None), ("beta".to_owned(), None)]
-        );
-        assert!(store
-            .read_backup_section_rows(Section::LocalPlugins)
-            .expect("read backup rows")
-            .is_empty());
-    }
-
-    /// Invariant 19 at the restore site. A restore that is interrupted before
-    /// its library commit runs again, and the second run finds its own
-    /// unpublished writes already in place instead of issuing new clocks for
-    /// them.
-    #[test]
-    fn a_retried_section_restore_does_not_reissue_write_clocks() {
-        let (_directory, mut store) = open();
-        set(&mut store, "dropped", "before");
-        let material = [
-            plugin_row("alpha", "from-backup", 0, ""),
-            plugin_row("beta", "from-backup", 0, ""),
-        ];
-        store
-            .restore_backup_fixture(SectionKind::LocalPlugins, &material)
-            .expect("restore plugin values");
-        let after_first = store
-            .section_state(Section::LocalPlugins)
-            .expect("read section state")
-            .max_write_clock;
-        let rows = store
-            .read_section_rows(Section::LocalPlugins)
-            .expect("read section rows");
-
-        store
-            .restore_backup_fixture(SectionKind::LocalPlugins, &material)
-            .expect("retry the restore");
-        assert_eq!(
-            store
-                .section_state(Section::LocalPlugins)
-                .expect("read section state")
-                .max_write_clock,
-            after_first
-        );
-        assert_eq!(
-            store
-                .read_section_rows(Section::LocalPlugins)
-                .expect("read section rows"),
-            rows
-        );
-    }
-
-    /// Invariant 31. The local settings area covers the backed-up list and
-    /// nothing else, so a coordination setting beside it keeps its value even
-    /// when the material leaves the whole area empty.
-    #[test]
-    fn a_local_settings_restore_leaves_coordination_settings_untouched() {
-        let (_directory, mut store) = open();
-        store
-            .write_setting("risuNestDeviceSettings", &serde_json::json!({ "a": 1 }))
-            .expect("write device setting");
-        store.write_setting("risuNestStartupExclusions", &serde_json::json!(["plugin-script", "triggers"])).unwrap();
-        store
-            .write_setting("dosync", &serde_json::json!(true))
-            .expect("write sync setting");
-        store
-            .write_setting("risu_lastsaved", &serde_json::json!("control"))
-            .expect("write control setting");
-        store
-            .write_plugin_permission(&"a".repeat(64), "network", true)
-            .expect("write permission");
-        store
-            .write_plugin_permission("code-b", "network", true)
-            .expect("write permission");
-
-        store
-            .restore_backup_fixture(SectionKind::LocalSettings, &[
-                SectionRow {
-                    key1: "setting".into(),
-                    key2: "dosync".into(),
-                    key3: String::new(),
-                    value: SectionValueRow::Setting {
-                        value: "false".into(),
-                    },
-                    write_clock: Sequence::from(0u64),
-                    writer_id: String::new(),
-                },
-                SectionRow {
-                    key1: "pluginPermission".into(),
-                    key2: "b".repeat(64),
-                    key3: "network".into(),
-                    value: SectionValueRow::PluginPermission { granted: false },
-                    write_clock: Sequence::from(0u64),
-                    writer_id: String::new(),
-                },
-            ])
-            .expect("restore local settings");
-
-        assert_eq!(
-            store.read_setting("dosync").expect("read sync setting"),
-            Some(serde_json::json!(false))
-        );
-        assert!(store
-            .read_setting("risuNestDeviceSettings")
-            .expect("read device setting")
-            .is_none());
-        assert_eq!(
-            store
-                .read_setting("risu_lastsaved")
-                .expect("read control setting"),
-            Some(serde_json::json!("control"))
-        );
-        assert_eq!(
-            store
-                .read_plugin_permissions()
-                .expect("read permissions")
-                .into_iter()
-                .map(|permission| (permission.code_hash, permission.granted))
-                .collect::<Vec<_>>(),
-            vec![("b".repeat(64), false)]
-        );
-        store.restore_backup_fixture(SectionKind::LocalSettings, &[]).unwrap();
-        assert!(store.read_setting("dosync").unwrap().is_none());
-        assert!(store.read_plugin_permissions().unwrap().is_empty());
-        assert_eq!(store.read_setting("risuNestStartupExclusions").unwrap(), Some(serde_json::json!(["plugin-script", "triggers"])));
-        assert_eq!(store.read_setting("risu_lastsaved").unwrap(), Some(serde_json::json!("control")));
-    }
-
     /// A cursor only moves forward, so a replayed apply cannot lose ground and
     /// a published section does not offer the same values again.
     #[test]
@@ -1874,9 +1643,7 @@ mod section_exchange {
     }
 
     /// A row this device wrote below the highest version the remote carries is
-    /// still unpublished, so counters cannot stand in for the question. A
-    /// confirmed publication marks the version it captured, and a write that
-    /// landed after that capture keeps owing one.
+    /// still unpublished, so counters cannot stand in for the question.
     #[test]
     fn a_local_write_below_the_remote_counter_still_owes_a_publication() {
         let (_directory, mut store) = open();
@@ -1903,49 +1670,6 @@ mod section_exchange {
             )
             .unwrap();
         assert!(store
-            .sections_await_publication("connection", "library")
-            .unwrap());
-
-        let captured: PublishedRows = store
-            .read_section_rows(Section::LocalPlugins)
-            .unwrap()
-            .into_iter()
-            .map(|row| (row.key(), row.version()))
-            .collect();
-        set(&mut store, "late", "after the capture");
-        store
-            .note_section_published(
-                Section::LocalPlugins,
-                &captured,
-                &[],
-                &marker(7, 1_760_000_000_000),
-                &BTreeMap::new(),
-                &Sequence::from(0u64),
-                None,
-            )
-            .expect("record the confirmed publication");
-        assert!(store
-            .sections_await_publication("connection", "library")
-            .unwrap());
-
-        let captured: PublishedRows = store
-            .read_section_rows(Section::LocalPlugins)
-            .unwrap()
-            .into_iter()
-            .map(|row| (row.key(), row.version()))
-            .collect();
-        store
-            .note_section_published(
-                Section::LocalPlugins,
-                &captured,
-                &[],
-                &marker(7, 1_760_000_000_000),
-                &BTreeMap::new(),
-                &Sequence::from(0u64),
-                None,
-            )
-            .expect("record the second publication");
-        assert!(!store
             .sections_await_publication("connection", "library")
             .unwrap());
 

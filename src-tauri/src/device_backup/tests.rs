@@ -1,5 +1,18 @@
 use super::*;
 
+fn native_restore_stage(
+    store: &mut crate::persistent_store::PersistentStore,
+    request_id: &str,
+) -> (crate::persistent_store::lww::Header, String) {
+    let stage = store.replace_begin().unwrap().staging_id;
+    store.replace_put_root(&stage, &serde_json::json!({"username":"restored"})).unwrap();
+    let header = crate::persistent_store::lww::Header {
+        binding_authority: store.lww_binding_authority().unwrap(),
+        request_id: request_id.into(),
+    };
+    (header, stage)
+}
+
 fn state(root: &Path) -> DeviceBackupState {
     let state = DeviceBackupState::initialize(root.join("device-backup"));
     let pds = crate::persistent_store::commands::PersistentStoreState::default();
@@ -465,9 +478,11 @@ fn native_section_archive_roundtrip_keeps_structured_keys_objects_and_local_scop
             .write_setting("risu_lastsaved", &serde_json::json!("target-control"))
             .unwrap();
     }
-    apply_prepared_native_sections(&mut target, &prepared).unwrap();
+    let rows = prepared.iter().map(PreparedDeviceSection::rows).collect::<Vec<_>>();
+    let (header, stage) = native_restore_stage(&mut target, "synthetic-native-roundtrip");
+    target.lww_commit_replacement_with_device_sections(&header, &stage, None, &rows).unwrap();
     let revision = target.device_store().unwrap().revision().unwrap();
-    apply_prepared_native_sections(&mut target, &prepared).unwrap();
+    target.lww_commit_replacement_with_device_sections(&header, &stage, None, &rows).unwrap();
     let device = target.device_store().unwrap();
     assert_eq!(device.revision().unwrap(), revision);
     assert_eq!(
@@ -530,7 +545,7 @@ fn native_section_archive_roundtrip_keeps_structured_keys_objects_and_local_scop
 }
 
 #[test]
-fn selected_empty_native_section_clears_only_that_section() {
+fn selected_empty_native_sections_clear_device_data_and_keep_coordination_settings() {
     use crate::persistent_store::device_store::plugin_values::PluginDeviceMutation;
 
     struct Never;
@@ -553,18 +568,22 @@ fn selected_empty_native_section_clears_only_that_section() {
             [],
         )
         .unwrap();
-    let selected = vec!["local-plugins".to_owned()];
+    let selected = vec![
+        "hypa".to_owned(),
+        "local-plugins".to_owned(),
+        "local-settings".to_owned(),
+    ];
     capture_native_sections(&mut source, &selected, &catalog, &Never).unwrap();
     assert_eq!(
         catalog
             .db
-            .query_row::<(i64, i64), _, _>(
-                "SELECT present,record_count FROM device_sections WHERE section='local-plugins'",
+            .query_row::<i64, _, _>(
+                "SELECT count(*) FROM device_sections WHERE present=1 AND record_count=0",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| row.get(0),
             )
             .unwrap(),
-        (1, 0)
+        3
     );
     let path = root.path().join("empty.risunest");
     catalog.write_candidate(&path, false, &Never).unwrap();
@@ -592,8 +611,16 @@ fn selected_empty_native_section_clears_only_that_section() {
         device
             .write_setting("dosync", &serde_json::json!(true))
             .unwrap();
+        device
+            .write_setting("risu_lastsaved", &serde_json::json!("target-control"))
+            .unwrap();
+        device
+            .write_plugin_permission("plugin-hash", "network", true)
+            .unwrap();
     }
-    apply_prepared_native_sections(&mut target, &prepared).unwrap();
+    let rows = prepared.iter().map(PreparedDeviceSection::rows).collect::<Vec<_>>();
+    let (header, stage) = native_restore_stage(&mut target, "synthetic-empty-restore");
+    target.lww_commit_replacement_with_device_sections(&header, &stage, None, &rows).unwrap();
     let device = target.device_store().unwrap();
     assert_eq!(
         device
@@ -601,10 +628,12 @@ fn selected_empty_native_section_clears_only_that_section() {
             .unwrap(),
         None
     );
+    assert_eq!(device.read_setting("dosync").unwrap(), None);
     assert_eq!(
-        device.read_setting("dosync").unwrap(),
-        Some(serde_json::json!(true))
+        device.read_setting("risu_lastsaved").unwrap(),
+        Some(serde_json::json!("target-control"))
     );
+    assert!(device.read_plugin_permissions().unwrap().is_empty());
 }
 
 #[test]
