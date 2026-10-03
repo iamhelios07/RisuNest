@@ -1090,16 +1090,14 @@ impl ObjectRoots {
             if !self.walked.insert(hash.clone()) {
                 continue;
             }
-            // A node that is absent or unreadable here leaves nothing below it
-            // reachable through this value.
-            let body = match object_body(objects, &hash) {
-                Ok(Some(body)) => body,
-                Ok(None) | Err(StoreError::Validation { .. }) => continue,
-                Err(error) => return Err(error),
-            };
-            let Ok(page) = risunest_sync_wire::canonical::decode::<ReferencePage>(&body, risunest_sync_wire::MAX_METADATA_BYTES) else {
+            // A node this store does not hold has nothing below it here. A node
+            // it holds but cannot read stops the sweep, since what it names is
+            // unknown.
+            let Some(body) = object_body(objects, &hash)? else {
                 continue;
             };
+            let page = risunest_sync_wire::canonical::decode::<ReferencePage>(&body, risunest_sync_wire::MAX_METADATA_BYTES)
+                .map_err(codec_error)?;
             match page {
                 ReferencePage::Branches { children } => pending.extend(children),
                 ReferencePage::Objects { hashes } if !relations => self.hashes.extend(hashes),
@@ -1116,10 +1114,9 @@ impl ObjectRoots {
             match value {
                 Value::Object(map) => {
                     if map.get("kind").and_then(Value::as_str) == Some("object") && map.contains_key("descriptorHash") {
-                        if let Ok(unit) = serde_json::from_value::<UnitValue>(value.clone()) {
-                            self.value(objects, &unit)?;
-                            continue;
-                        }
+                        let unit = serde_json::from_value::<UnitValue>(value.clone())?;
+                        self.value(objects, &unit)?;
+                        continue;
                     }
                     pending.extend(map.values());
                 }

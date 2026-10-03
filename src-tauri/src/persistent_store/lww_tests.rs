@@ -2933,3 +2933,39 @@ fn the_message_object_sweep_keeps_what_held_rows_archives_and_leases_need() {
         assert!(!present(&store, hash), "{hash} outlived its lease");
     }
 }
+
+#[test]
+fn an_unreadable_reference_node_stops_the_message_object_sweep() {
+    use risunest_sync_wire::descriptor::RecordDescriptor;
+    let grace = super::super::ASSET_GC_PRODUCT_MINIMUM_GRACE_MS;
+    let limit = super::super::MESSAGE_PAGE_SWEEP_LIMIT;
+    let (_dir, mut store) = store();
+    let put = |store: &PersistentStore, body: &[u8]| -> String {
+        let hash = risunest_sync_wire::hash(body);
+        store.lww_put_object(&hash, body).unwrap();
+        hash
+    };
+    let present = |store: &PersistentStore, hash: &str| -> bool {
+        store.connection.query_row("SELECT EXISTS(SELECT 1 FROM message_page_objects WHERE hash=?1)", [hash], |row| row.get(0)).unwrap()
+    };
+    let node = put(&store, b"synthetic-not-a-reference-page");
+    let body = put(&store, b"synthetic-record-body");
+    let orphan = put(&store, b"synthetic-unreferenced-object");
+    let value = UnitValue::object(RecordDescriptor {
+        object_hash: body.clone(), dependency_root: Some(node.clone()), relation_root: None,
+        dependencies: vec![], relations: vec![], scopes: vec![],
+    }).unwrap();
+    store.connection.execute(
+        "INSERT INTO snapshot_original_units(key,value) VALUES('synthetic',?1)", [serde_json::to_string(&value).unwrap()],
+    ).unwrap();
+    let now = 1_900_000_000_000i64;
+    assert!(store.sweep_message_page_objects(now, limit).is_err());
+    assert!(store.sweep_message_page_objects(now + grace, limit).is_err());
+    let marks: i64 = store.connection.query_row("SELECT count(*) FROM message_page_object_marks", [], |row| row.get(0)).unwrap();
+    assert_eq!(marks, 0);
+    assert!([&node, &body, &orphan].iter().all(|hash| present(&store, hash)));
+    store.connection.execute("DELETE FROM snapshot_original_units", []).unwrap();
+    store.sweep_message_page_objects(now + 2 * grace, limit).unwrap();
+    store.sweep_message_page_objects(now + 3 * grace, limit).unwrap();
+    assert!([&node, &body, &orphan].iter().all(|hash| !present(&store, hash)));
+}
