@@ -121,27 +121,6 @@ fn same_json(a: &str, b: &str) -> bool {
 
 /// The triple a section row is named by, in the order the change index holds.
 pub(crate) type SectionKey = (String, String, String);
-pub(crate) type PublishedRows = Vec<(SectionKey, SectionEntryVersion)>;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ReclaimedRowVersion {
-    pub write_clock: Sequence,
-    pub writer_id: String,
-    pub first_published: TombstonePublication,
-}
-
-pub(crate) type ReclaimedRows = BTreeMap<SectionKey, ReclaimedRowVersion>;
-
-pub(crate) enum SectionPublicationDisposition {
-    Published { first_published: Option<TombstonePublication> },
-    Reclaimed { first_published: TombstonePublication },
-}
-
-pub(crate) struct SectionPublicationRow {
-    pub key: SectionKey,
-    pub version: SectionEntryVersion,
-    pub disposition: SectionPublicationDisposition,
-}
 
 /// The key triple matches the change index, so a row and its change entry name
 /// the same thing without a second encoding.
@@ -186,18 +165,6 @@ pub(crate) struct SectionCursor {
     pub applied_generation: Sequence,
     pub applied_gc_floor: Sequence,
     pub observed_max_write_clock: Sequence,
-}
-
-pub(crate) enum SectionSnapshotEvent {
-    Section {
-        section: Section,
-        state: SectionState,
-        cursor: Option<SectionCursor>,
-    },
-    Row {
-        section: Section,
-        row: SectionRow,
-    },
 }
 
 impl SectionCursor {
@@ -1309,48 +1276,6 @@ impl DeviceStore {
         Ok(sections)
     }
 
-    /// Visits participating synchronized rows from one read-only SQLite
-    /// snapshot. The callback may spool each row before the snapshot closes.
-    pub(crate) fn visit_participating_section_snapshot_mapped<E>(
-        &self,
-        connection_id: &str,
-        library_lineage: &str,
-        mut visitor: impl FnMut(SectionSnapshotEvent) -> std::result::Result<(), E>,
-        mut map_error: impl FnMut(crate::persistent_store::StoreError) -> E,
-    ) -> std::result::Result<(), E> {
-        let path: String = self.connection.query_row(
-            "SELECT file FROM pragma_database_list WHERE name='main'", [], |row| row.get(0),
-        ).map_err(|error| map_error(error.into()))?;
-        if path.is_empty() { return Err(map_error(invalid("Device database path is unavailable"))); }
-        let snapshot = Connection::open_with_flags(
-            path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        ).map_err(|error| map_error(error.into()))?;
-        snapshot.execute_batch(
-            "PRAGMA busy_timeout=5000; PRAGMA query_only=ON; PRAGMA mmap_size=0; BEGIN;",
-        ).map_err(|error| map_error(error.into()))?;
-        for section in CHOOSABLE_SECTIONS {
-            let state = read_section_state(&snapshot, section).map_err(&mut map_error)?;
-            if !state.participating { continue; }
-            let cursor = read_cursor(&snapshot, connection_id, library_lineage, section)
-                .map_err(&mut map_error)?;
-            visitor(SectionSnapshotEvent::Section { section, state, cursor })?;
-            let mut statement = snapshot.prepare(match section {
-                Section::Hypa => "SELECT * FROM hypa_embeddings ORDER BY cache_key",
-                Section::LocalPlugins => "SELECT * FROM plugin_device_storage ORDER BY owner,space,key",
-            }).map_err(|error| map_error(error.into()))?;
-            let mut rows = statement.query([]).map_err(|error| map_error(error.into()))?;
-            while let Some(row) = rows.next().map_err(|error| map_error(error.into()))? {
-                visitor(SectionSnapshotEvent::Row {
-                    section,
-                    row: row_from_sql(section, row).map_err(&mut map_error)?,
-                })?;
-            }
-        }
-        snapshot.execute_batch("COMMIT;").map_err(|error| map_error(error.into()))?;
-        Ok(())
-    }
-
     pub(crate) fn read_section_entry(&self, section: Section, key: &str) -> StoreResult<Option<LocalSectionEntry>> {
         let kind = kind_of_section(section);
         let Some((mut row, published)) = read_row(&self.connection, section, &decode_entry_key(kind, key)?)? else { return Ok(None); };
@@ -1603,192 +1528,6 @@ impl DeviceStore {
         Ok(false)
     }
 
-    /// Records the versions a confirmed publication put on the remote. Each row
-    /// is matched at the version it was captured at, so a local write that
-    /// landed between the capture and the publication stays unpublished.
-    /// Publication bookkeeping is control metadata, so it runs outside a change
-    /// context and never reaches the device change index.
-    pub(crate) fn note_section_published(
-        &mut self,
-        section: Section,
-        published: &[(SectionKey, SectionEntryVersion)],
-        stamped: &[(SectionKey, SectionEntryVersion)],
-        first_published: &TombstonePublication,
-        _reclaimed: &ReclaimedRows,
-        gc_floor: &Sequence,
-        cursor: Option<(&str, &str, &Sequence, &SectionCursor)>,
-    ) -> StoreResult<bool> {
-        let transaction = self.transaction()?;
-        if let Some((_, _, expected_generation, _)) = cursor {
-            let (participating, generation): (bool, String) = transaction.query_row(
-                "SELECT participating,participation_generation FROM device_sections WHERE section=?1",
-                [section.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
-            if !participating || sequence(&generation)? != *expected_generation {
-                transaction.commit()?;
-                return Ok(false);
-            }
-        }
-        let current = sequence(&transaction.query_row(
-            "SELECT gc_floor FROM device_sections WHERE section=?1",
-            [section.as_str()],
-            |row| row.get::<_, String>(0),
-        )?)?;
-        if *gc_floor > current {
-            transaction.execute(
-                "UPDATE device_sections SET gc_floor=?1 WHERE section=?2",
-                params![gc_floor.as_str(), section.as_str()],
-            )?;
-        }
-        // A removal takes the marker the publication carried, so the device
-        // file and every remote that read it name the same commit. A removal
-        // rewritten since the capture is not the one that went out.
-        {
-            let mut statement = match section {
-                Section::Hypa => transaction.prepare(
-                    "UPDATE hypa_embeddings
-                        SET first_published_generation=?4,first_published_at_ms=?5
-                        WHERE cache_key=?1 AND write_clock=?2 AND writer_id=?3 AND tombstone=1
-                          AND first_published_generation IS NULL",
-                )?,
-                Section::LocalPlugins => transaction.prepare(
-                    "UPDATE plugin_device_storage
-                        SET first_published_generation=?6,first_published_at_ms=?7
-                        WHERE owner=?1 AND space=?2 AND key=?3 AND write_clock=?4 AND writer_id=?5
-                          AND tombstone=1 AND first_published_generation IS NULL",
-                )?,
-            };
-            let generation = first_published.generation.as_str();
-            let at_ms = i64::try_from(first_published.at_ms)
-                .map_err(|_| invalid("device removal marker time is out of range"))?;
-            for ((key1, key2, key3), version) in stamped {
-                match section {
-                    Section::Hypa => {
-                        statement.execute(params![key1, version.write_clock.as_str(),
-                            version.writer_id, generation, at_ms])?;
-                    }
-                    Section::LocalPlugins => {
-                        statement.execute(params![key1, key2, key3, version.write_clock.as_str(),
-                            version.writer_id, generation, at_ms])?;
-                    }
-                }
-            }
-        }
-        {
-            let mut statement = match section {
-                Section::Hypa => transaction.prepare(
-                    "UPDATE hypa_embeddings SET published_clock=?2
-                        WHERE cache_key=?1 AND write_clock=?2 AND writer_id=?3",
-                )?,
-                Section::LocalPlugins => transaction.prepare(
-                    "UPDATE plugin_device_storage SET published_clock=?4
-                        WHERE owner=?1 AND space=?2 AND key=?3 AND write_clock=?4 AND writer_id=?5",
-                )?,
-            };
-            for ((key1, key2, key3), version) in published {
-                match section {
-                    Section::Hypa => {
-                        statement.execute(params![key1, version.write_clock.as_str(), version.writer_id])?;
-                    }
-                    Section::LocalPlugins => {
-                        statement.execute(params![key1, key2, key3, version.write_clock.as_str(), version.writer_id])?;
-                    }
-                }
-            }
-        }
-        if let Some((connection_id, library_lineage, _, cursor)) = cursor {
-            record_cursor(&transaction, connection_id, library_lineage, section, cursor)?;
-        }
-        transaction.commit()?;
-        Ok(true)
-    }
-
-    /// Applies immutable publication evidence a row at a time. The evidence
-    /// may come from a durable job spool and is consumed inside one local
-    /// transaction, so a confirmed publication is either fully recorded or
-    /// left for reconciliation to retry.
-    pub(crate) fn note_spooled_section_published(
-        &mut self,
-        section: Section,
-        expected_participation_generation: &Sequence,
-        first_published: &TombstonePublication,
-        gc_floor: &Sequence,
-        cursor: (&str, &str, &SectionCursor),
-        rows: impl Iterator<Item = StoreResult<SectionPublicationRow>>,
-    ) -> StoreResult<bool> {
-        let transaction = self.transaction()?;
-        let (participating, generation): (bool, String) = transaction.query_row(
-            "SELECT participating,participation_generation FROM device_sections WHERE section=?1",
-            [section.as_str()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        if !participating || sequence(&generation)? != *expected_participation_generation {
-            transaction.commit()?;
-            return Ok(false);
-        }
-        let stamp_at_ms = i64::try_from(first_published.at_ms)
-            .map_err(|_| invalid("device removal marker time is out of range"))?;
-        for evidence in rows {
-            let evidence = evidence?;
-            let (key1, key2, key3) = evidence.key;
-            match evidence.disposition {
-                SectionPublicationDisposition::Reclaimed { .. } => {}
-                SectionPublicationDisposition::Published { first_published: stamp } => {
-                    if let Some(stamp) = stamp {
-                        if stamp != *first_published {
-                            return Err(invalid("Publication removal marker differs from its spool"));
-                        }
-                        match section {
-                            Section::Hypa => transaction.execute(
-                                "UPDATE hypa_embeddings
-                                    SET first_published_generation=?4,first_published_at_ms=?5
-                                    WHERE cache_key=?1 AND write_clock=?2 AND writer_id=?3 AND tombstone=1
-                                      AND first_published_generation IS NULL",
-                                params![key1, evidence.version.write_clock.as_str(), evidence.version.writer_id,
-                                    first_published.generation.as_str(), stamp_at_ms],
-                            )?,
-                            Section::LocalPlugins => transaction.execute(
-                                "UPDATE plugin_device_storage
-                                    SET first_published_generation=?6,first_published_at_ms=?7
-                                    WHERE owner=?1 AND space=?2 AND key=?3 AND write_clock=?4 AND writer_id=?5
-                                      AND tombstone=1 AND first_published_generation IS NULL",
-                                params![key1, key2, key3, evidence.version.write_clock.as_str(),
-                                    evidence.version.writer_id, first_published.generation.as_str(), stamp_at_ms],
-                            )?,
-                        };
-                    }
-                    match section {
-                        Section::Hypa => transaction.execute(
-                            "UPDATE hypa_embeddings SET published_clock=?2
-                                WHERE cache_key=?1 AND write_clock=?2 AND writer_id=?3",
-                            params![key1, evidence.version.write_clock.as_str(), evidence.version.writer_id],
-                        )?,
-                        Section::LocalPlugins => transaction.execute(
-                            "UPDATE plugin_device_storage SET published_clock=?4
-                                WHERE owner=?1 AND space=?2 AND key=?3 AND write_clock=?4 AND writer_id=?5",
-                            params![key1, key2, key3, evidence.version.write_clock.as_str(), evidence.version.writer_id],
-                        )?,
-                    };
-                }
-            }
-        }
-        let current = sequence(&transaction.query_row(
-            "SELECT gc_floor FROM device_sections WHERE section=?1",
-            [section.as_str()],
-            |row| row.get::<_, String>(0),
-        )?)?;
-        if *gc_floor > current {
-            transaction.execute(
-                "UPDATE device_sections SET gc_floor=?1 WHERE section=?2",
-                params![gc_floor.as_str(), section.as_str()],
-            )?;
-        }
-        record_cursor(&transaction, cursor.0, cursor.1, section, cursor.2)?;
-        transaction.commit()?;
-        Ok(true)
-    }
-
     /// Merges a received section. The higher `(write_clock, writer_id)` wins,
     /// the same version with different content is refused, and a received row
     /// keeps the version it arrived with instead of becoming a local write.
@@ -1838,24 +1577,6 @@ impl DeviceStore {
         let tx = self.transaction()?;
         record_cursor(&tx, connection_id, library_lineage, section, cursor)?;
         tx.commit()?;
-        Ok(())
-    }
-
-    /// Forgets how far one lineage has been applied, so the section counts as
-    /// not yet exchanged with it. The row stays, because it is what says the
-    /// markers this device holds were issued by this lineage. Explicit resets
-    /// may move a cursor backwards.
-    pub(crate) fn forget_section_cursor(
-        &mut self,
-        connection_id: &str,
-        library_lineage: &str,
-        section: Section,
-    ) -> StoreResult<()> {
-        self.connection.execute(
-            "UPDATE device_remote_cursors SET applied_generation='0',applied_gc_floor='0'
-                WHERE connection_id=?1 AND library_lineage=?2 AND section=?3",
-            params![connection_id, library_lineage, section.as_str()],
-        )?;
         Ok(())
     }
 

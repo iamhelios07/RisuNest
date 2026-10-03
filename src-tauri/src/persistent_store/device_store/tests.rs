@@ -1161,10 +1161,9 @@ mod section_exchange {
     }
 
     use super::super::sections::{
-        PublishedRows, SectionCursor, SectionRow, SectionSpoolBuilder,
+        SectionCursor, SectionRow, SectionSpoolBuilder,
         SectionValueRow, TombstonePublication, LOCAL_SETTING_KEYS,
     };
-    use std::collections::BTreeMap;
     use super::super::{plugin_values::PluginDeviceMutation, DeviceStore, Section};
     use super::open;
     use risunest_sync_wire::Sequence;
@@ -1180,13 +1179,6 @@ mod section_exchange {
             },
             write_clock: Sequence::from(clock),
             writer_id: writer.into(),
-        }
-    }
-
-    fn marker(generation: u64, at_ms: u64) -> TombstonePublication {
-        TombstonePublication {
-            generation: Sequence::from(generation),
-            at_ms,
         }
     }
 
@@ -1713,9 +1705,7 @@ mod section_exchange {
     }
 
     /// A row this device wrote below the highest version the remote carries is
-    /// still unpublished, so counters cannot stand in for the question. A
-    /// confirmed publication marks the version it captured, and a write that
-    /// landed after that capture keeps owing one.
+    /// still unpublished, so counters cannot stand in for the question.
     #[test]
     fn a_local_write_below_the_remote_counter_still_owes_a_publication() {
         let (_directory, mut store) = open();
@@ -1742,49 +1732,6 @@ mod section_exchange {
             )
             .unwrap();
         assert!(store
-            .sections_await_publication("connection", "library")
-            .unwrap());
-
-        let captured: PublishedRows = store
-            .read_section_rows(Section::LocalPlugins)
-            .unwrap()
-            .into_iter()
-            .map(|row| (row.key(), row.version()))
-            .collect();
-        set(&mut store, "late", "after the capture");
-        store
-            .note_section_published(
-                Section::LocalPlugins,
-                &captured,
-                &[],
-                &marker(7, 1_760_000_000_000),
-                &BTreeMap::new(),
-                &Sequence::from(0u64),
-                None,
-            )
-            .expect("record the confirmed publication");
-        assert!(store
-            .sections_await_publication("connection", "library")
-            .unwrap());
-
-        let captured: PublishedRows = store
-            .read_section_rows(Section::LocalPlugins)
-            .unwrap()
-            .into_iter()
-            .map(|row| (row.key(), row.version()))
-            .collect();
-        store
-            .note_section_published(
-                Section::LocalPlugins,
-                &captured,
-                &[],
-                &marker(7, 1_760_000_000_000),
-                &BTreeMap::new(),
-                &Sequence::from(0u64),
-                None,
-            )
-            .expect("record the second publication");
-        assert!(!store
             .sections_await_publication("connection", "library")
             .unwrap());
 
