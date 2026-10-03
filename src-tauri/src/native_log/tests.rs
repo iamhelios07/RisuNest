@@ -306,6 +306,21 @@ fn a_kept_failure_never_quotes_json_input_or_network_text() {
 }
 
 #[test]
+fn a_string_failure_is_logged_as_its_code_or_as_a_message() {
+    let code = "cleanup-journal-unavailable".to_owned();
+    assert_eq!((code.code().as_ref(), code.detail(), code.expected()), ("cleanup-journal-unavailable", None, false));
+    let message = "CAS upload mutex poisoned: synthetic".to_owned();
+    assert_eq!(message.code().as_ref(), "error");
+    assert_eq!(message.detail().as_deref(), Some("CAS upload mutex poisoned: synthetic"));
+    assert!(!message.expected());
+    for message in ["Upper-case", "two words", "", "trailing-"] {
+        assert_eq!(message.to_owned().code().as_ref(), "error", "{message}");
+    }
+    assert_eq!(&*"x".repeat(65).code(), "error");
+    assert!("cancelled".to_owned().expected());
+}
+
+#[test]
 fn a_logged_failure_never_names_the_temporary_file_path() {
     let root = tempfile::tempdir().unwrap();
     let error = tempfile::Builder::new()

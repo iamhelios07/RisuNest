@@ -74,7 +74,7 @@ impl NativeLogState {
         self.record("error", "webview", bounded);
     }
 
-    fn record_ring_only(&self, level: &str, target: &str, message: impl AsRef<str>) {
+    pub(crate) fn record_ring_only(&self, level: &str, target: &str, message: impl AsRef<str>) {
         self.record_inner(level, target, message.as_ref(), false);
     }
 
@@ -491,6 +491,14 @@ pub(crate) fn log_global(level: &str, target: &str, message: String) {
     global_state().record(level, target, message);
 }
 
+/// Records to the in-memory log only, for failures raised while the log
+/// directory may be removed.
+pub(crate) fn log_ring_only(level: &str, target: &str, message: String) {
+    #[cfg(debug_assertions)]
+    eprintln!("{}", format_console_line(level, target, &message));
+    global_state().record_ring_only(level, target, message);
+}
+
 /// Target of the one line a failed native command leaves in the device log.
 pub(crate) const COMMAND_TARGET: &str = "native-command";
 const MAX_COMMAND_DETAIL_CHARS: usize = 2048;
@@ -506,6 +514,26 @@ pub(crate) trait CommandFailure {
     fn expected(&self) -> bool {
         false
     }
+}
+
+/// A command that fails with a bare string returns either a code or a message.
+impl CommandFailure for String {
+    fn code(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed(if is_code(self) { self } else { "error" })
+    }
+    fn detail(&self) -> Option<std::borrow::Cow<'_, str>> {
+        (!is_code(self)).then(|| std::borrow::Cow::Borrowed(self.as_str()))
+    }
+    fn expected(&self) -> bool {
+        self == "cancelled"
+    }
+}
+
+fn is_code(text: &str) -> bool {
+    text.len() <= 64
+        && text.starts_with(|character: char| character.is_ascii_lowercase())
+        && !text.ends_with('-')
+        && text.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 /// Logs a failed command once, with where it was called, and returns the
