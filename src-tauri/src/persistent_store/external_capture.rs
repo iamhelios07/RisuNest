@@ -110,13 +110,14 @@ impl PersistentStore {
         }
         let reader = self.revision_leases.get(lease)
             .ok_or_else(|| invalid("Backup dependency lease is unavailable"))?;
+        let large = large_unit_body_hashes(units);
         let load = |hash: &str| -> StoreResult<Option<Vec<u8>>> {
             check(probe)?;
             let length: Option<i64> = reader.connection.query_row(
                 "SELECT length(body) FROM message_page_objects WHERE hash=?1", [hash], |row| row.get(0),
             ).optional()?;
             if length.is_some_and(|size| size < 0) {return Err(invalid("Backup control length is invalid"));}
-            if let Some(size)=length.filter(|size|*size as u64>risunest_sync_wire::MAX_METADATA_BYTES as u64 && !large_unit_body_hash(units,hash)) {
+            if let Some(size)=length.filter(|size|*size as u64>risunest_sync_wire::MAX_METADATA_BYTES as u64 && !large.contains(hash)) {
                 let page=original_unit_message_page(units,hash,&|manifest| {
                     let size:Option<i64>=reader.connection.query_row("SELECT length(body) FROM message_page_objects WHERE hash=?1",[manifest],|row|row.get(0)).optional()?;
                     if size.is_some_and(|size|size<0 || size as u64>risunest_sync_wire::MAX_METADATA_BYTES as u64) {return Err(invalid("Backup manifest exceeds its bound"));}
@@ -198,12 +199,17 @@ pub(crate) fn verified_oversized_control(bytes:&[u8])->StoreResult<()> {
 
 /// Known kinds other than messages and archive carry Object values only as
 /// large units. Unknown kinds stay opaque.
-fn is_large_unit(key:&risunest_sync_wire::unit::UnitKey)->bool {
+pub(crate) fn is_large_unit(key:&risunest_sync_wire::unit::UnitKey)->bool {
     super::lww::lww_known_unit_key(key) && !matches!(key.components()[0].as_str(),"messages"|"archive")
 }
 
-fn large_unit_body_hash(units:&BTreeMap<risunest_sync_wire::unit::UnitKey,risunest_sync_wire::unit::UnitValue>,hash:&str)->bool {
-    units.iter().any(|(key,value)| matches!(value,risunest_sync_wire::unit::UnitValue::Object{descriptor,..} if descriptor.object_hash==hash) && is_large_unit(key))
+/// The body hashes of the large units in `units`, the only controls besides
+/// indivisible message pages that may exceed the metadata bound.
+pub(crate) fn large_unit_body_hashes(units:&BTreeMap<risunest_sync_wire::unit::UnitKey,risunest_sync_wire::unit::UnitValue>)->BTreeSet<String> {
+    units.iter().filter_map(|(key,value)| match value {
+        risunest_sync_wire::unit::UnitValue::Object{descriptor,..} if is_large_unit(key) => Some(descriptor.object_hash.clone()),
+        _ => None,
+    }).collect()
 }
 
 pub(crate) fn verified_large_message_page(bytes:&[u8])->StoreResult<Vec<serde_json::Value>> {

@@ -310,8 +310,26 @@ impl PersistentStore {
         let temporary=tempfile::tempdir_in(&self.snapshots_dir)?;
         let certified=Connection::open(temporary.path().join("certified.sqlite"))?;
         certified.execute_batch("PRAGMA cache_size=-16384; PRAGMA temp_store=FILE; CREATE TABLE controls(hash TEXT PRIMARY KEY,body BLOB NOT NULL)")?;
+        let large = super::external_capture::large_unit_body_hashes(&units);
+        let bounded = |hash: &str| -> StoreResult<Option<Vec<u8>>> {
+            Ok(source.query_row("SELECT body FROM backup_controls WHERE hash=?1 AND length(body)<=?2",rusqlite::params![hash,risunest_sync_wire::MAX_METADATA_BYTES as i64],|row|row.get(0)).optional()?)
+        };
+        // A control above the bound is read only as a large unit body or as a
+        // page whose manifest declares that length.
+        let read = |hash: &str| -> StoreResult<Option<Vec<u8>>> {
+            let row: Option<(i64,Option<Vec<u8>>)> = source.query_row("SELECT length(body),CASE WHEN length(body)<=?2 THEN body END FROM backup_controls WHERE hash=?1",
+                rusqlite::params![hash,risunest_sync_wire::MAX_METADATA_BYTES as i64],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
+            let Some((length,body)) = row else {return Ok(None)};
+            if body.is_some() {return Ok(body)}
+            let length = u64::try_from(length).map_err(|_|invalid("invalid original control length"))?;
+            if !large.contains(hash)
+                && super::external_capture::original_unit_message_page(&units,hash,&bounded)?.is_none_or(|page|page.byte_length.0 != length) {
+                return Ok(None);
+            }
+            Ok(source.query_row("SELECT body FROM backup_controls WHERE hash=?1",[hash],|row|row.get(0)).optional()?)
+        };
         let inventory = super::external_capture::original_unit_dependency_inventory(&units,
-            &|hash| Ok(source.query_row("SELECT body FROM backup_controls WHERE hash=?1 AND length(body)<=?2",rusqlite::params![hash,risunest_sync_wire::MAX_METADATA_BYTES as i64],|row|row.get(0)).optional()?),
+            &read,
             &|hash| {
                 let size:Option<i64>=source.query_row("SELECT byte_length FROM backup_payloads WHERE hash=?1",[hash],|row|row.get(0)).optional()?;
                 size.map(|size|u64::try_from(size).map_err(|_|invalid("invalid original payload size"))).transpose()
