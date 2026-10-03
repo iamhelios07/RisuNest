@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager, State};
+use crate::native_log::logged;
 
 #[cfg(feature = "official-publication-upload-pilot")]
 use crate::publication_upload::{
@@ -368,13 +369,6 @@ fn with_snapshot_directory<T>(
     operation(&directory)
 }
 
-fn finish_storage_command<T>(command: &'static str, result: StoreResult<T>) -> StoreResult<T> {
-    result.map_err(|error| {
-        crate::nlog!("error", "{command} failed: {error}");
-        error
-    })
-}
-
 pub(crate) fn with_store_mut<T>(
     state: State<'_, PersistentStoreState>,
     operation: impl FnOnce(&mut PersistentStore) -> StoreResult<T>,
@@ -507,7 +501,7 @@ pub(crate) fn pds_message_object_sweep(
     let Some(operation_guard) = state.try_admit_renderer_operation()? else {
         return Ok(());
     };
-    finish_storage_command(
+    logged(
         "pds_message_object_sweep",
         sweep_message_pages(
             file_admission(&app).as_ref(), &state, &operation_guard, current_time_ms()?, SweepBudget::OneBatch,
@@ -1107,7 +1101,7 @@ pub(crate) fn pds_snapshot_delete(
     state: State<'_, PersistentStoreState>,
     id: String,
 ) -> Result<(), StoreError> {
-    finish_storage_command(
+    logged(
         "pds_snapshot_delete",
         with_store(state, |store| store.snapshot_delete(&id)),
     )
@@ -1117,7 +1111,7 @@ pub(crate) fn pds_snapshot_delete(
 pub(crate) fn pds_storage_stats(
     state: State<'_, PersistentStoreState>,
 ) -> Result<PersistentStorageStats, StoreError> {
-    finish_storage_command(
+    logged(
         "pds_storage_stats",
         with_store(state, PersistentStore::storage_stats),
     )
@@ -1166,7 +1160,7 @@ pub(crate) fn pds_asset_gc_preview(
     state: State<'_, PersistentStoreState>,
 ) -> Result<AssetGcMaintenanceResult, StoreError> {
     let operation_guard = state.admit_renderer_operation()?;
-    finish_storage_command(
+    logged(
         "pds_asset_gc_preview",
         pds_asset_gc_preview_all(&state, &operation_guard),
     )
@@ -1226,7 +1220,7 @@ pub(crate) fn pds_asset_gc_execute(
     state: State<'_, PersistentStoreState>,
 ) -> Result<AssetGcMaintenanceResult, StoreError> {
     let operation_guard = state.admit_renderer_operation()?;
-    finish_storage_command(
+    logged(
         "pds_asset_gc_execute",
         pds_asset_gc_execute_all(&state, &operation_guard).and_then(|result| {
             sweep_message_pages(
@@ -2167,7 +2161,7 @@ mod tests {
         ];
 
         for (command, error, expected_code) in cases {
-            let returned = finish_storage_command::<()>(command, Err(error))
+            let returned = logged::<(), _>(command, Err(error))
                 .expect_err("storage command error must be returned");
             let returned_json = serde_json::to_value(&returned).expect("serialize returned error");
             assert_eq!(returned_json["code"], expected_code);
@@ -2183,8 +2177,61 @@ mod tests {
                 .find(|entry| entry.message.contains(command))
                 .expect("storage command error reaches the native log");
             assert_eq!(entry.level, "error");
+            assert_eq!(entry.target, "native-command");
+            assert!(entry.message.starts_with(&format!(
+                "{command} failed: code={expected_code} cause="
+            )));
             assert!(entry.message.contains("Authorization: ***"));
             assert!(!entry.message.contains("fixture-"));
+        }
+    }
+
+    #[test]
+    fn routine_storage_refusals_are_warnings_without_their_detail() {
+        for (command, error) in [
+            (
+                "synthetic_revision_conflict_command",
+                StoreError::RevisionConflict { expected: 4, actual: 5 },
+            ),
+            ("synthetic_commit_busy_command", StoreError::CommitBusy),
+            ("synthetic_snapshot_released_command", StoreError::SnapshotReleased),
+            (
+                "synthetic_health_cancel_command",
+                StoreError::Validation { message: crate::data_health::CANCELLED.to_owned() },
+            ),
+        ] {
+            let code = serde_json::to_value(&error).unwrap()["code"].as_str().unwrap().to_owned();
+            let _ = logged::<(), _>(command, Err(error));
+            let entry = crate::native_log::global_state()
+                .tail(None)
+                .into_iter()
+                .rev()
+                .find(|entry| entry.message.starts_with(&format!("{command} failed: ")))
+                .expect("a routine refusal is logged");
+            assert_eq!(entry.level, "warn");
+            assert!(entry.message.starts_with(&format!("{command} failed: code={code} at=")));
+        }
+        assert!(logged("synthetic_quiet_storage_command", Ok::<(), StoreError>(())).is_ok());
+        assert!(crate::native_log::global_state()
+            .tail(None)
+            .iter()
+            .all(|entry| !entry.message.starts_with("synthetic_quiet_storage_command")));
+    }
+
+    #[test]
+    fn every_storage_error_logs_the_code_it_returns() {
+        use crate::native_log::CommandFailure;
+        for error in [
+            StoreError::RevisionConflict { expected: 1, actual: 2 },
+            StoreError::SnapshotReleased,
+            StoreError::RawBodyUnavailable,
+            StoreError::CommitBusy,
+            StoreError::CommitDecode { message: String::new() },
+            StoreError::Committed { revision: 1, message: String::new() },
+            StoreError::Validation { message: String::new() },
+            StoreError::Store { message: String::new() },
+        ] {
+            assert_eq!(serde_json::to_value(&error).unwrap()["code"], error.code().as_ref());
         }
     }
 

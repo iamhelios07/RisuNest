@@ -211,6 +211,84 @@ fn command_failures_log_native_detail_and_return_only_a_bounded_code() {
     assert!(!entry.message.contains(NATIVE_LOG_FILE_UPDATE_FAILED));
 }
 
+struct SyntheticFailure {
+    code: &'static str,
+    detail: Option<String>,
+    expected: bool,
+}
+
+impl CommandFailure for SyntheticFailure {
+    fn code(&self) -> std::borrow::Cow<'_, str> {
+        self.code.into()
+    }
+    fn detail(&self) -> Option<std::borrow::Cow<'_, str>> {
+        self.detail.as_deref().map(Into::into)
+    }
+    fn expected(&self) -> bool {
+        self.expected
+    }
+}
+
+fn command_line(command: &str) -> LogEntry {
+    global_state()
+        .tail(None)
+        .into_iter()
+        .rev()
+        .find(|entry| entry.message.starts_with(&format!("{command} failed: ")))
+        .expect("the command failure is logged")
+}
+
+#[test]
+fn a_failed_command_logs_one_masked_line_with_its_code_cause_and_caller() {
+    let failure = SyntheticFailure {
+        code: "synthetic-code",
+        detail: Some(format!("disk refused password=synthetic-secret {}", "x ".repeat(1500))),
+        expected: false,
+    };
+    let line = line!() + 1;
+    let returned = logged::<(), _>("synthetic_failed_command", Err(failure));
+    assert_eq!(returned.err().map(|error| error.code), Some("synthetic-code"));
+    let entry = command_line("synthetic_failed_command");
+    assert_eq!(entry.level, "error");
+    assert_eq!(entry.target, COMMAND_TARGET);
+    assert!(entry
+        .message
+        .starts_with("synthetic_failed_command failed: code=synthetic-code cause=disk refused password=*** x x"));
+    assert!(!entry.message.contains("synthetic-secret"));
+    assert!(entry.message.ends_with(&format!(" at={}:{line}", file!())));
+    assert!(entry.message.chars().count() < 2300);
+    assert_eq!(
+        global_state()
+            .tail(None)
+            .iter()
+            .filter(|entry| entry.message.starts_with("synthetic_failed_command failed: "))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn an_expected_refusal_is_a_warning_without_its_cause_and_success_logs_nothing() {
+    let refusal = SyntheticFailure {
+        code: "synthetic-busy",
+        detail: Some("synthetic-hidden-detail".to_owned()),
+        expected: true,
+    };
+    let _ = logged::<(), _>("synthetic_refused_command", Err(refusal));
+    let entry = command_line("synthetic_refused_command");
+    assert_eq!(entry.level, "warn");
+    assert!(entry
+        .message
+        .starts_with("synthetic_refused_command failed: code=synthetic-busy at="));
+    assert!(!entry.message.contains("synthetic-hidden-detail"));
+
+    assert_eq!(logged::<_, SyntheticFailure>("synthetic_quiet_command", Ok(7)).ok(), Some(7));
+    assert!(global_state()
+        .tail(None)
+        .iter()
+        .all(|entry| !entry.message.starts_with("synthetic_quiet_command")));
+}
+
 #[test]
 fn unconfigured_file_path_command_returns_only_a_bounded_code() {
     let state = NativeLogState::for_tests();

@@ -466,6 +466,58 @@ pub(crate) fn log_global(level: &str, target: &str, message: String) {
     global_state().record(level, target, message);
 }
 
+/// Target of the one line a failed native command leaves in the device log.
+pub(crate) const COMMAND_TARGET: &str = "native-command";
+const MAX_COMMAND_DETAIL_CHARS: usize = 2048;
+
+/// What a failed command reports to the device log. The detail is the failure
+/// behind the code; it must never carry user content.
+pub(crate) trait CommandFailure {
+    fn code(&self) -> std::borrow::Cow<'_, str>;
+    fn detail(&self) -> Option<std::borrow::Cow<'_, str>> {
+        None
+    }
+    /// A routine refusal, logged as a warning without its detail.
+    fn expected(&self) -> bool {
+        false
+    }
+}
+
+/// Logs a failed command once, with where it was called, and returns the
+/// result unchanged.
+#[track_caller]
+pub(crate) fn logged<T, E: CommandFailure>(command: &str, result: Result<T, E>) -> Result<T, E> {
+    if let Err(error) = &result {
+        record_command_failure(command, error, std::panic::Location::caller());
+    }
+    result
+}
+
+pub(crate) fn record_command_failure(
+    command: &str,
+    error: &(impl CommandFailure + ?Sized),
+    at: &std::panic::Location<'_>,
+) {
+    let expected = error.expected();
+    let cause = match error.detail() {
+        Some(detail) if !expected => {
+            let bounded: String = detail.chars().take(MAX_COMMAND_DETAIL_CHARS).collect();
+            format!(" cause={bounded}")
+        }
+        _ => String::new(),
+    };
+    log_global(
+        if expected { "warn" } else { "error" },
+        COMMAND_TARGET,
+        format!(
+            "{command} failed: code={}{cause} at={}:{}",
+            error.code(),
+            at.file(),
+            at.line()
+        ),
+    );
+}
+
 fn format_console_line(level: &str, target: &str, message: &str) -> String {
     mask(&format!("[{level}] {target}: {message}"))
 }

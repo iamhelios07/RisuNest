@@ -160,6 +160,32 @@ impl std::fmt::Display for StoreError {
 
 impl std::error::Error for StoreError {}
 
+impl crate::native_log::CommandFailure for StoreError {
+    fn code(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            Self::RevisionConflict { .. } => "revision-conflict",
+            Self::SnapshotReleased => "snapshot-released",
+            Self::RawBodyUnavailable => "raw-body-unavailable",
+            Self::CommitBusy => "commit-busy",
+            Self::CommitDecode { .. } => "commit-decode",
+            Self::Committed { .. } => "committed",
+            Self::Validation { .. } => "validation",
+            Self::Store { .. } => "store-error",
+        }
+        .into()
+    }
+    fn detail(&self) -> Option<std::borrow::Cow<'_, str>> {
+        Some(self.to_string().into())
+    }
+    fn expected(&self) -> bool {
+        match self {
+            Self::RevisionConflict { .. } | Self::CommitBusy | Self::SnapshotReleased => true,
+            Self::Validation { message } => message == crate::data_health::CANCELLED,
+            _ => false,
+        }
+    }
+}
+
 impl From<rusqlite::Error> for StoreError {
     fn from(error: rusqlite::Error) -> Self {
         Self::Store {
