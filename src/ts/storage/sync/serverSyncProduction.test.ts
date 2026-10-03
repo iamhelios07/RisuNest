@@ -333,6 +333,18 @@ describe('production server LWW composition', () => {
         visible(true); await f.transport!.resumeBinding(bindingContext()); await settle()
         expect(production.getServerSyncController().snapshot()).toMatchObject({ paused: false, error: '' })
     })
+    it('keeps automatic sync stopped through visibility changes until the hold is released', async () => {
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        visible(true); await f.transport!.resumeBinding(bindingContext()); await settle()
+        const release = await production.holdServerSync(); await settle()
+        f.invoke.mockClear()
+        const syncCommands = () => f.invoke.mock.calls.map(([command]) => command as string).filter(command => !['server_sync_status', 'pds_lww_binding_state'].includes(command))
+        visible(false); await settle(); visible(true); await settle(); visible(false); await settle(); visible(true); await settle()
+        await vi.advanceTimersByTimeAsync(120_000); await settle()
+        expect(syncCommands()).toEqual([])
+        await release(); await settle()
+        expect(syncCommands()).toEqual(expect.arrayContaining(['server_sync_notify_start', 'server_sync_lww_pull', 'server_sync_lww_push']))
+    })
     it('guards native initialization and transport registration on the web', async () => {
         f.native = false
         production.initializeNativeSyncBindings(); await production.installServerSyncProduction()

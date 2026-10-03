@@ -98,7 +98,7 @@ function continueHydration(): void {
     })
 }
 async function updateForeground(visible: boolean): Promise<void> {
-    foreground = visible && !!context && !context.signal.aborted
+    foreground = visible && !replacing && !!context && !context.signal.aborted
     if (!foreground && hydrating) hydrationPending = true
     await scheduler.foreground(foreground)
     continueHydration()
@@ -202,6 +202,8 @@ export async function receiveAvailableServerChanges(): Promise<void> { await sch
 export async function configureServerSyncConnection(config: ServerConfig): Promise<void> { await invoke('server_sync_configure', { config }); error = '' }
 export async function connectServerSync(config: ServerConfig, newDevice = false): Promise<void> { await configureServerSyncConnection(config); await bindSyncTarget({ kind: 'server', connectionId: 'server' }, newDevice ? { mode: 'new-device' } : {}); await controller.ensureStatus() }
 export async function disconnectServerSync(): Promise<void> { await unbindSyncTarget(); context = undefined; await controller.ensureStatus() }
+/** Stops automatic sync until the returned release runs, so an asset download is not refused as busy. */
+export const holdServerSync = () => controller.beginReplacement()
 export async function retryServerSync(): Promise<void> {
     await controller.ensureStatus()
     const current = persistedBinding
