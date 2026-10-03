@@ -1506,6 +1506,5 @@ export const languageSpanish = {
         restoreDescription: "Se borrarán los datos actuales y se restaurará la copia seleccionada. Si necesita una copia de seguridad, créela manualmente.",
         restoreAcknowledge: "Borrar los datos actuales",
         restoreAction: "Restaurar",
-        myboxSyncUnavailable: "MYBOX no se puede usar para sincronizar.",
     },
 } satisfies DeepPartial<typeof import('./en').languageEnglish>;

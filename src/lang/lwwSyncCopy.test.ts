@@ -26,7 +26,7 @@ it('preserves the exact approved Korean replacement and restore copy', () => {
         restoreTitle: '백업을 복원하시겠습니까?',
         restoreDescriptionBound: '현재 데이터를 초기화한 후 선택한 백업으로 복원하며, 복원한 내용은 원격으로 동기화됩니다. 백업이 필요한 경우 수동으로 백업해주세요.',
         restoreDescription: '현재 데이터를 초기화한 후 선택한 백업으로 복원합니다. 백업이 필요한 경우 수동으로 백업해주세요.',
-        restoreAcknowledge: '현재 데이터 초기화', restoreAction: '복원', myboxSyncUnavailable: 'MYBOX는 동기화에 사용할 수 없습니다.',
+        restoreAcknowledge: '현재 데이터 초기화', restoreAction: '복원',
     })
 })
 it('preserves the exact approved English new-device action', () => {

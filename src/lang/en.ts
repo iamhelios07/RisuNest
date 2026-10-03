@@ -3072,7 +3072,6 @@ export const languageEnglish = {
         restoreDescription: "The current data will be cleared and replaced with the selected backup. Make a manual backup if needed.",
         restoreAcknowledge: "Clear the current data",
         restoreAction: "Restore",
-        myboxSyncUnavailable: "MYBOX cannot be used for sync.",
     },
 } satisfies I18nTranslation;
 

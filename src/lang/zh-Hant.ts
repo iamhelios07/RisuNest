@@ -1550,6 +1550,5 @@ export const languageChineseTraditional = {
         restoreDescription: "將清除目前資料並還原所選備份。如需備份，請手動備份。",
         restoreAcknowledge: "清除目前資料",
         restoreAction: "還原",
-        myboxSyncUnavailable: "MYBOX 無法用於同步。",
     },
 } satisfies DeepPartial<typeof import('./en').languageEnglish>

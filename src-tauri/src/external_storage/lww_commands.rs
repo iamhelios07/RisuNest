@@ -28,6 +28,7 @@ struct Context {
     session: tokio::sync::Mutex<Session>,
     cancel: Mutex<Cancellation>,
     maintenance:tokio::sync::Mutex<()>,
+    turn:Mutex<super::lww_compaction::CompactionTurn>,
 }
 static CONTEXTS: OnceLock<Mutex<BTreeMap<String, Arc<Context>>>> = OnceLock::new();
 fn context(id: &str) -> Result<Arc<Context>> {
@@ -50,6 +51,7 @@ fn context(id: &str) -> Result<Arc<Context>> {
                 }),
                 cancel: Mutex::new(Cancellation::default()),
                 maintenance:tokio::sync::Mutex::new(()),
+                turn:Mutex::new(Default::default()),
             })
         })
         .clone())
@@ -319,6 +321,9 @@ pub(crate) async fn external_lww_publish(
             cancel,
         )
         .await?;
+    if result.segments.0 > 0 {
+        context.turn.lock().map_err(runtime::local_error)?.published(Instant::now());
+    }
     if let Some(target) = &request.exit_target {
         let identity = store.external_identity().map_err(runtime::local_error)?;
         if identity.library_epoch != target.library_epoch
@@ -344,7 +349,7 @@ pub(crate) async fn external_lww_receive(
     let mut session = context.session.lock().await;
     open(&app, &request.connection_id, &mut session).await?;
     let mut store = check(&app, &request, true)?;
-    session
+    let requests = session
         .engine
         .as_ref()
         .ok_or_else(lww_segment::corrupt)?
@@ -353,7 +358,12 @@ pub(crate) async fn external_lww_receive(
             request.header.binding_authority,
             &session.cancel,
         )
-        .await
+        .await?;
+    let own = store.lww_clock_state().map_err(runtime::local_error)?.writer_id;
+    if requests.iter().any(|request| request.progress.writer_id.as_deref() != Some(own.as_str())) {
+        context.turn.lock().map_err(runtime::local_error)?.observed_foreign(Instant::now());
+    }
+    Ok(requests)
 }
 
 #[tauri::command]
@@ -366,7 +376,8 @@ pub(crate) async fn external_lww_maintenance(app:AppHandle,request:Request)->Res
     let store=check(&app,&request,true)?;
     let writer=store.lww_clock_state().map_err(runtime::local_error)?.writer_id;
     let engine=session.engine.as_ref().ok_or_else(lww_segment::corrupt)?;
-    let compact=engine.maintenance_needed(&cancel).await?;
+    let due=engine.maintenance_needed(&cancel).await?;
+    let compact=context.turn.lock().map_err(runtime::local_error)?.ready(due,Instant::now());
     let root=runtime::root(&app)?;
     let stored=super::connection_store::ConnectionStore::open(&root)?.read(&request.connection_id)?;
     let job=uuid::Uuid::new_v4().to_string();
@@ -388,6 +399,10 @@ pub(crate) async fn external_lww_maintenance(app:AppHandle,request:Request)->Res
         Some(result.snapshot_id)
     } else {None};
     check(&app,&request,true)?;
+    let last_run=super::gc_store::GcStore::open(&root)?.last_run_ms(&request.connection_id)?;
+    if !super::cleanup::lww_cleanup_due(snapshot_id.is_some(),last_run,runtime::now_ms()) {
+        return Ok(Some(serde_json::json!({"snapshotId":snapshot_id,"cleanup":null})));
+    }
     let connected=connection_commands::open_connected_with_cancel(&app,&request.connection_id,&cancel).await?;
     if connected.handle.repository_id!=engine.repository.repository_id || connected.handle.connection_identity!=engine.repository.connection_identity || connected.stored.descriptor.repository_id!=engine.library {return Err(lww_segment::corrupt())}
     let cleanup=runtime::run_connected_cleanup(&app,&connected,&request.connection_id,&job,Some(engine),&cancel).await?;

@@ -74,7 +74,7 @@ function createAdapter(connectionId: string): Adapter {
         maintain: async () => { const current = await context(); current.signal.throwIfAborted(); await invoke('external_lww_maintenance', { request: header(connectionId, current) }) },
         failed: error => {
             reportFailure(connectionId, error)
-            if (['clockSkew', 'corrupt'].includes((error as { kind?: string })?.kind ?? '')) scheduler.stop()
+            if ((error as { kind?: string })?.kind === 'corrupt') scheduler.stop()
         },
     })
     const transport: SyncBindingTransport & { receiveAvailableChanges(context: BindingContext): Promise<void> } = {
@@ -176,7 +176,7 @@ export async function requestExternalLwwNow(connectionId: string): Promise<void>
     if (!adapter) throw new Error('Sync binding transport is unavailable')
     await runWithMobileBackgroundTask('sync', async () => {
         await adapter.scheduler.publishNow(true)
-        await adapter.scheduler.resumeForeground()
+        await adapter.scheduler.resumeForeground(false)
     })
 }
 
