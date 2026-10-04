@@ -1,3 +1,5 @@
+import isEqual from 'lodash/isEqual'
+
 import { safeStructuredClone } from '../polyfill'
 import {
     cloneConversationMetadata,
@@ -5,6 +7,9 @@ import {
 } from '../storage/activeConversationSession'
 import type { WindowedConversationMutationController } from '../storage/activeWorkingSet.svelte'
 import type { Chat } from '../storage/database.svelte'
+import { cloneConversationMetadata as cloneMetadataFields } from '../storage/selectedConversationLifecycle'
+
+type ConversationFields = Omit<Chat, 'message'>
 
 export interface HistoryWindowSessionSource {
     session: ActiveConversationSession
@@ -18,6 +23,16 @@ export interface HistoryWindowControllerEnvironment {
     /** The active session, when the generation's conversation is complete. */
     captureSession(): HistoryWindowSessionSource | null
     getCurrentSession(): ActiveConversationSession | null
+    /** The conversation's live metadata, which other writers may change during the generation. */
+    readLiveMetadata(): ConversationFields | null
+}
+
+export interface HistoryWindowController extends WindowedConversationMutationController {
+    /**
+     * Takes metadata changes made on the live conversation into the window and
+     * publishes the window's own metadata changes.
+     */
+    reconcileMetadata(): boolean
 }
 
 function sessionHoldsWindow(
@@ -102,6 +117,40 @@ export function captureSessionHistoryWindowController(
     }
 }
 
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null && Object.getPrototypeOf(value) === Object.prototype
+}
+
+// Three-way merge against the metadata last published: a side that left a
+// value as it was takes the other side's value, and the window wins when both
+// changed it. Plain objects such as chat variables merge one level deeper.
+function mergeField(window: unknown, baseline: unknown, live: unknown, nested: boolean): unknown {
+    if (isEqual(window, baseline)) return live
+    if (isEqual(live, baseline)) return window
+    if (!nested && isPlainRecord(window) && isPlainRecord(live)) {
+        const base = isPlainRecord(baseline) ? baseline : {}
+        const merged: Record<string, unknown> = {}
+        for (const key of new Set([...Object.keys(window), ...Object.keys(base), ...Object.keys(live)])) {
+            const value = mergeField(window[key], base[key], live[key], true)
+            if (value !== undefined) merged[key] = value
+        }
+        return merged
+    }
+    return window
+}
+
+function mergeLiveMetadata(chat: Chat, baseline: ConversationFields, live: ConversationFields): void {
+    const fields = chat as unknown as Record<string, unknown>
+    const base = baseline as Record<string, unknown>
+    const current = live as Record<string, unknown>
+    for (const key of new Set([...Object.keys(fields), ...Object.keys(base), ...Object.keys(current)])) {
+        if (key === 'message') continue
+        const value = mergeField(fields[key], base[key], current[key], false)
+        if (value === undefined) delete fields[key]
+        else if (value !== fields[key]) fields[key] = safeStructuredClone(value)
+    }
+}
+
 /**
  * Keeps a generation's window writable across a promotion: when the current
  * backend goes stale, it captures whichever backend the conversation now
@@ -112,9 +161,10 @@ export function createHistoryWindowController(
     chat: Chat,
     absoluteStartIndex: number,
     initial: WindowedConversationMutationController | null = null,
-): WindowedConversationMutationController {
+): HistoryWindowController {
     let backend = initial
     let released = false
+    let baseline = cloneMetadataFields(chat)
     const resolve = (): WindowedConversationMutationController | null => {
         if (released) return null
         if (backend?.isCurrent()) return backend
@@ -130,12 +180,36 @@ export function createHistoryWindowController(
             : environment.captureWindowed(chat, absoluteStartIndex)
         return backend
     }
+    const applyRange: WindowedConversationMutationController['applyRange'] = (
+        localStart,
+        deleteCount,
+        messages,
+        command,
+    ) => {
+        const current = resolve()
+        const live = current ? environment.readLiveMetadata() : null
+        if (!current || !live) return false
+        mergeLiveMetadata(chat, baseline, live)
+        if (!current.applyRange(localStart, deleteCount, messages, command)) return false
+        baseline = cloneMetadataFields(chat)
+        return true
+    }
     return {
         chat,
         absoluteStartIndex,
         isCurrent: () => resolve() !== null,
-        applyRange: (localStart, deleteCount, messages, command) =>
-            resolve()?.applyRange(localStart, deleteCount, messages, command) ?? false,
+        applyRange,
+        reconcileMetadata() {
+            const live = resolve() ? environment.readLiveMetadata() : null
+            if (!live) return false
+            mergeLiveMetadata(chat, baseline, live)
+            const merged = cloneMetadataFields(chat)
+            if (isEqual(merged, live)) {
+                baseline = merged
+                return true
+            }
+            return applyRange(0, 0, [], 'update-metadata')
+        },
         release() {
             if (released) return
             released = true
