@@ -411,6 +411,10 @@ fn replacement_activation_reads_no_messages_and_writes_no_pages() {
     for domain in ["native_message_verify", "native_page_identity"] {
         assert!(!hashes.domains.contains_key(domain), "{domain}");
     }
+    // The intent rows are hashed once, as they are written, and the body that
+    // is hashed again on completion carries only their digest.
+    assert_eq!(hashes.domains["native_intent_rows"].calls, 1);
+    assert!(hashes.domains["native_intent"].bytes < 1024, "{hashes:?}");
 }
 
 /// Conversations of a stage whose stored manifest is missing or differs from
@@ -619,4 +623,180 @@ fn activation_writes_each_character_detail_at_most_once() {
     let detail = store.read_character("char-d", None).unwrap().unwrap().value;
     assert_eq!(detail["desc"], "Source D description");
     assert_eq!(detail["firstMessage"], "Source D greeting");
+}
+
+fn intent_rows(store: &PersistentStore, request_id: &str) -> i64 {
+    store
+        .device_store()
+        .unwrap()
+        .connection()
+        .query_row("SELECT count(*) FROM lww_intent_rows WHERE request_id=?1", [request_id], |row| row.get(0))
+        .unwrap()
+}
+
+fn intent_complete(store: &PersistentStore, request_id: &str) -> bool {
+    store
+        .device_store()
+        .unwrap()
+        .connection()
+        .query_row("SELECT complete FROM lww_intents WHERE request_id=?1", [request_id], |row| row.get(0))
+        .unwrap()
+}
+
+fn reject_activation(store: &PersistentStore) {
+    store
+        .connection
+        .execute_batch(
+            "CREATE TEMP TRIGGER reject_activation BEFORE INSERT ON main.lww_requests
+             BEGIN SELECT RAISE(ABORT,'synthetic-activation-failure'); END",
+        )
+        .unwrap();
+}
+
+#[test]
+fn a_replacement_intent_body_carries_row_digests_instead_of_units() {
+    let (_directory, mut store) = seeded();
+    let stage = build_stage(&mut store);
+    let header = header(&store, "intent-body-source-units");
+    store.lww_commit_replacement_units(&header, &stage, Some(&source_units())).unwrap();
+    let body: String = store
+        .device_store()
+        .unwrap()
+        .connection()
+        .query_row("SELECT body FROM lww_intents WHERE request_id=?1", [&header.request_id], |row| row.get(0))
+        .unwrap();
+    let body: Value = serde_json::from_str(&body).unwrap();
+    assert!(body["changes"]["rows"].as_u64().unwrap() > 0, "{body}");
+    assert_eq!(body["changes"]["digest"].as_str().unwrap().len(), 64);
+    assert_eq!(body["source_units"]["rows"], 3);
+    assert_eq!(body["device_changes"], json!([]));
+    assert_eq!(intent_rows(&store, &header.request_id), 0);
+    assert_eq!(golden(&store, "source-units-rows"), SOURCE_UNITS);
+}
+
+#[test]
+fn an_interrupted_replacement_replays_its_rows_to_the_golden_state() {
+    let directory = {
+        let (directory, mut store) = seeded();
+        let stage = build_stage(&mut store);
+        let revision = store.revision().unwrap();
+        reject_activation(&store);
+        assert!(store.replace_commit(&stage, Some(revision)).is_err());
+        assert!(!intent_complete(&store, &stage));
+        assert!(intent_rows(&store, &stage) > 0);
+        assert_eq!(store.revision().unwrap(), revision);
+        directory
+    };
+    let mut store = PersistentStore::open(directory.path()).unwrap();
+    store.lww_recover_intents().unwrap();
+    assert_eq!(golden(&store, "plain-replayed"), PLAIN);
+    let stage: String = store
+        .device_store()
+        .unwrap()
+        .connection()
+        .query_row("SELECT request_id FROM lww_intents ORDER BY rowid DESC LIMIT 1", [], |row| row.get(0))
+        .unwrap();
+    assert!(intent_complete(&store, &stage));
+    assert_eq!(intent_rows(&store, &stage), 0);
+}
+
+#[test]
+fn a_changed_intent_row_stops_recovery() {
+    let (_directory, mut store) = seeded();
+    let stage = build_stage(&mut store);
+    let revision = store.revision().unwrap();
+    reject_activation(&store);
+    assert!(store.replace_commit(&stage, Some(revision)).is_err());
+    store.connection.execute_batch("DROP TRIGGER reject_activation").unwrap();
+    let language = inline(&json!("tampered")).unwrap();
+    let tampered = store
+        .device_store()
+        .unwrap()
+        .connection()
+        .execute(
+            "UPDATE lww_intent_rows SET value=?2 WHERE request_id=?1 AND key=?3",
+            params![stage, serde_json::to_string(&language).unwrap(), unit_key(&["root", "language"]).unwrap().as_str()],
+        )
+        .unwrap();
+    assert_eq!(tampered, 1);
+    let failure = store.lww_recover_intents().unwrap_err();
+    assert!(matches!(&failure, StoreError::Validation { message } if message == "request-id-integrity"), "{failure:?}");
+    assert_eq!(store.revision().unwrap(), revision);
+    assert!(!intent_complete(&store, &stage));
+}
+
+#[test]
+fn rows_left_before_an_intent_was_issued_are_dropped_and_the_request_retries() {
+    let directory = {
+        let (directory, store) = seeded();
+        let device = store.device_store().unwrap().connection();
+        for request in ["orphan-request", "another-orphan"] {
+            device
+                .execute(
+                    "INSERT INTO lww_intent_rows VALUES(?1,1,?2,NULL,?3,0)",
+                    params![request, unit_key(&["root", "username"]).unwrap().as_str(), "\"partial\""],
+                )
+                .unwrap();
+        }
+        directory
+    };
+    let mut store = PersistentStore::open(directory.path()).unwrap();
+    let stage = build_stage(&mut store);
+    let header = header(&store, "orphan-request");
+    store.lww_commit_replacement_units(&header, &stage, None).unwrap();
+    let left: i64 = store
+        .device_store()
+        .unwrap()
+        .connection()
+        .query_row("SELECT count(*) FROM lww_intent_rows", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(left, 0);
+    assert_eq!(golden(&store, "orphan-retried"), PLAIN);
+}
+
+#[test]
+fn rows_of_an_unfinished_intent_keep_their_objects() {
+    use crate::persistent_store::{MessageObjectStore, MESSAGE_PAGE_SWEEP_LIMIT};
+    use risunest_sync_wire::descriptor::RecordDescriptor;
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = PersistentStore::open(directory.path()).unwrap();
+    let body = b"synthetic intent row object".to_vec();
+    let hash = risunest_sync_wire::hash(&body);
+    store.lww_put_object(&hash, &body).unwrap();
+    let value = UnitValue::object(RecordDescriptor::content(hash.clone())).unwrap();
+    let device = store.device_store().unwrap().connection();
+    device
+        .execute("INSERT INTO lww_intents VALUES('rooted','0','{}','{}','unused',0)", [])
+        .unwrap();
+    device
+        .execute(
+            "INSERT INTO lww_intent_rows VALUES('rooted',1,?1,NULL,?2,0)",
+            params![unit_key(&["messages", "char", "chat"]).unwrap().as_str(), serde_json::to_string(&value).unwrap()],
+        )
+        .unwrap();
+    let present = |store: &PersistentStore| -> bool {
+        store
+            .connection
+            .query_row("SELECT EXISTS(SELECT 1 FROM message_page_objects WHERE hash=?1)", [&hash], |row| row.get(0))
+            .unwrap()
+    };
+    let now = 1_900_000_000_000i64;
+    for step in 0..4 {
+        store
+            .sweep_message_page_objects(MessageObjectStore::Library, now + step * ASSET_GC_PRODUCT_MINIMUM_GRACE_MS, MESSAGE_PAGE_SWEEP_LIMIT)
+            .unwrap();
+    }
+    assert!(present(&store), "an unfinished intent row lost its object");
+    store
+        .device_store()
+        .unwrap()
+        .connection()
+        .execute("UPDATE lww_intents SET complete=1 WHERE request_id='rooted'", [])
+        .unwrap();
+    for step in 4..8 {
+        store
+            .sweep_message_page_objects(MessageObjectStore::Library, now + step * ASSET_GC_PRODUCT_MINIMUM_GRACE_MS, MESSAGE_PAGE_SWEEP_LIMIT)
+            .unwrap();
+    }
+    assert!(!present(&store), "a completed intent row still roots its object");
 }

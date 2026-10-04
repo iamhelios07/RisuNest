@@ -440,7 +440,7 @@ fn full_restore_library_hypa_and_enabled_plugin_changes_share_stamp_and_receipt(
     assert!(outbox.iter().all(|entry| !entry.key.as_str().contains("accountst")&&!entry.key.as_str().contains("synthetic")));
     let persisted: String=store.device_store().unwrap().connection().query_row("SELECT body FROM lww_intents WHERE request_id=?1",[&header.request_id],|row| row.get(0)).unwrap();
     let Intent::Replacement{source_units,device_sections,..}=serde_json::from_str(&persisted).unwrap() else {panic!()};
-    assert_eq!(source_units,Some(original.clone())); assert!(device_sections.is_some());
+    assert_eq!(source_units,Some(super::intent_rows::source_digest(&original).unwrap())); assert!(device_sections.is_some());
     let (_peer_dir,mut peer)=self::store();
     peer.device_store_mut().unwrap().set_section_participating(device_store::Section::LocalPlugins,true).unwrap();
     receive(&mut peer,"full-restored-peer",outbox.iter().map(|entry|Change{key:entry.key.clone(),stamp:entry.stamp.clone(),value:entry.value.clone()}).collect(),vec![]);
@@ -576,7 +576,7 @@ fn full_restore_corrupted_frozen_intent_fails_before_replaying_device_rows() {
     let body:String=device.query_row("SELECT body FROM lww_intents WHERE request_id=?1",[&header.request_id],|row|row.get(0)).unwrap();
     let mut intent:Intent=serde_json::from_str(&body).unwrap();
     let Intent::Replacement{device_sections:Some(sections),..}=&mut intent else {panic!()};
-    let device_store::sections::SectionValueRow::Hypa{model,..}=&mut sections.hypa[0].value else {panic!()};
+    let device_store::sections::SectionValueRow::Hypa{model,..}=&mut sections.to_mut().hypa[0].value else {panic!()};
     *model="corrupted".into();
     device.execute("UPDATE lww_intents SET body=?1 WHERE request_id=?2",params![serde_json::to_string(&intent).unwrap(),header.request_id]).unwrap();
     assert!(store.lww_recover_intents().is_err()); assert_device_restore_label(&store,"old");

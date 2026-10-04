@@ -10,7 +10,10 @@ use risunest_sync_wire::{
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
+};
 use uuid::Uuid;
 
 #[path = "lww_classification.rs"]
@@ -19,6 +22,8 @@ mod classification;
 mod binding_stage;
 pub(crate) use binding_stage::BindingUnitStage;
 pub(super) use binding_stage::{catalog_digest, seed_binding_holds, validate_binding_source, BINDING_STAGE_SCHEMA};
+#[path = "lww_intent_rows.rs"]
+mod intent_rows;
 #[path = "lww_new_device.rs"]
 mod new_device;
 #[path = "lww_projection.rs"]
@@ -46,6 +51,7 @@ CREATE INDEX lww_receive_scope ON lww_receive_rows(json_extract(key,'$[0]'),json
 "#;
 pub(super) const DEVICE_SCHEMA: &str = r#"CREATE TABLE lww_clock(singleton INTEGER PRIMARY KEY CHECK(singleton=1),issued TEXT,accepted TEXT,binding_authority TEXT NOT NULL);
 CREATE TABLE lww_intents(request_id TEXT PRIMARY KEY,authority TEXT NOT NULL,stamp TEXT NOT NULL,body TEXT NOT NULL,digest TEXT NOT NULL,complete INTEGER NOT NULL CHECK(complete IN (0,1)));
+CREATE TABLE lww_intent_rows(request_id TEXT NOT NULL,ordinal INTEGER NOT NULL,key TEXT NOT NULL,stamp TEXT,value TEXT NOT NULL,source_override INTEGER NOT NULL CHECK(source_override IN (0,1)),PRIMARY KEY(request_id,ordinal));
 CREATE TABLE lww_receive(request_id TEXT PRIMARY KEY,authority TEXT NOT NULL,digest TEXT NOT NULL,body TEXT NOT NULL,applied INTEGER NOT NULL CHECK(applied IN (0,1)),finished INTEGER NOT NULL CHECK(finished IN (0,1)));
 CREATE TABLE lww_progress(kind TEXT NOT NULL,writer_id TEXT NOT NULL,cursor TEXT NOT NULL,authority TEXT NOT NULL,PRIMARY KEY(kind,writer_id));
 CREATE TABLE lww_device_context(singleton INTEGER PRIMARY KEY CHECK(singleton=1),stamp TEXT NOT NULL,legacy_clock TEXT NOT NULL);
@@ -245,7 +251,7 @@ pub(crate) struct NewDevicePreparation {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
-enum Intent {
+enum Intent<'a> {
     Commit {
         commit: WorkingSetCommit,
         aliases: Vec<super::AssetAlias>,
@@ -268,16 +274,17 @@ enum Intent {
         staging_id: String,
         base_revision: i64,
         staging_digest: String,
-        changes: Vec<(UnitKey, UnitValue)>,
-        /// Changed keys whose source unit replaced the value captured from the stage.
-        overrides: BTreeSet<UnitKey>,
-        source_units: Option<BTreeMap<UnitKey, UnitValue>>,
-        device_sections: Option<device_store::sections::FrozenBackupSections>,
-        device_changes: Vec<(UnitKey, UnitValue)>,
+        /// Rows of the changes, each marked when a source unit replaced the
+        /// value captured from the stage.
+        changes: intent_rows::IntentRows,
+        /// Recognizes a retry with the same source units; nothing replays them.
+        source_units: Option<intent_rows::IntentRows>,
+        device_sections: Option<Cow<'a, device_store::sections::FrozenBackupSections>>,
+        device_changes: Cow<'a, [(UnitKey, UnitValue)]>,
     },
     Target {
         staging_id: String,
-        changes: Vec<Change>,
+        changes: intent_rows::IntentRows,
     },
     NewDevice {
         authorization_id: String,
@@ -307,7 +314,7 @@ enum Intent {
 #[cfg(test)]
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(transparent)]
-pub(crate) struct CommitIntentInput(Intent);
+pub(crate) struct CommitIntentInput(Intent<'static>);
 
 #[cfg(test)]
 std::thread_local! {
@@ -911,6 +918,7 @@ impl PersistentStore {
             "UPDATE lww_intents SET complete=1 WHERE request_id=?1",
             [&header.request_id],
         )?;
+        tx.execute("DELETE FROM lww_intent_rows WHERE request_id=?1", [&header.request_id])?;
         tx.commit()?;
         Ok(())
     }
@@ -1048,6 +1056,7 @@ impl PersistentStore {
     }
     pub(crate) fn lww_recover_intents(&mut self) -> StoreResult<()> {
         let authority = self.lww_binding_authority()?;
+        intent_rows::delete_settled(self.device_store()?.connection())?;
         let rows: Vec<(String, String, String, String, String)> = {
             let db = self.device_store()?.connection();
             let mut s=db.prepare("SELECT request_id,authority,stamp,body,digest FROM lww_intents WHERE complete=0 ORDER BY rowid")?;
@@ -1163,20 +1172,24 @@ impl PersistentStore {
                 device_changes,
                 ..
             } => {
+                let (changes, overrides) =
+                    intent_rows::read_replacement(self.device_store()?.connection(), &header.request_id, &changes)?;
                 if let Some(sections) = device_sections {
-                    self.finish_lww_device_replacement(&header, &staging_id, &changes, &sections, &device_changes, &stamp, &digest)?;
+                    self.finish_lww_device_replacement(&header, &staging_id, &changes, &overrides, &sections, &device_changes, &stamp, &digest)?;
                 } else {
-                    self.finish_lww_replacement(&header, &staging_id, &changes, &stamp, &digest, false, &[])?;
+                    self.finish_lww_replacement(&header, &staging_id, &changes, &overrides, &stamp, &digest, false, &[])?;
                 }
             }
             Intent::Target {
                 staging_id,
                 changes,
             } => {
+                let changes = intent_rows::read_target(self.device_store()?.connection(), &header.request_id, &changes)?;
                 self.finish_lww_replacement(
                     &header,
                     &staging_id,
                     &[],
+                    &BTreeSet::new(),
                     &stamp,
                     &digest,
                     true,
@@ -2265,7 +2278,8 @@ impl PersistentStore {
                 return Err(error("request-id-integrity"));
             }
             let intent: Intent = serde_json::from_str(&body)?;
-            if !matches!(&intent,Intent::Replacement{staging_id:old,source_units:old_units,device_sections:old_sections,..} if old==staging_id&&old_units.as_ref()==source_units&&old_sections.as_ref()==device_sections)
+            let source = source_units.map(intent_rows::source_digest).transpose()?;
+            if !matches!(&intent,Intent::Replacement{staging_id:old,source_units:old_units,device_sections:old_sections,..} if old==staging_id&&*old_units==source&&old_sections.as_deref()==device_sections)
             {
                 return Err(error("request-id-integrity"));
             }
@@ -2361,23 +2375,29 @@ impl PersistentStore {
             changes
         } else { vec![] };
         let staging_digest = binding_stage::catalog_digest(&self.connection, staging_id)?;
+        let source = source_units.map(intent_rows::source_digest).transpose()?;
+        let rows = intent_rows::write(
+            &mut self.device_store_mut()?.connection,
+            &header.request_id,
+            "changes",
+            changes.iter().map(|(key, value)| intent_rows::replacement_row(key, value, overrides.contains(key))),
+        )?;
         let (stamp, digest) = self.reserve_intent(
             header,
             &Intent::Replacement {
                 staging_id: staging_id.into(),
                 base_revision,
                 staging_digest,
-                changes: changes.clone(),
-                overrides,
-                source_units: source_units.cloned(),
-                device_sections: device_sections.cloned(),
-                device_changes: device_changes.clone(),
+                changes: rows,
+                source_units: source,
+                device_sections: device_sections.map(Cow::Borrowed),
+                device_changes: Cow::Borrowed(&device_changes),
             },
         )?;
         let result = if let Some(sections) = device_sections {
-            self.finish_lww_device_replacement(header, staging_id, &changes, sections, &device_changes, &stamp, &digest)?
+            self.finish_lww_device_replacement(header, staging_id, &changes, &overrides, sections, &device_changes, &stamp, &digest)?
         } else {
-            let result = self.finish_lww_replacement(header, staging_id, &changes, &stamp, &digest, false, &[])?;
+            let result = self.finish_lww_replacement(header, staging_id, &changes, &overrides, &stamp, &digest, false, &[])?;
             self.complete_intent(header)?;
             result
         };
@@ -2388,13 +2408,14 @@ impl PersistentStore {
         header: &Header,
         staging_id: &str,
         changes: &[(UnitKey, UnitValue)],
+        overrides: &BTreeSet<UnitKey>,
         sections: &device_store::sections::FrozenBackupSections,
         device_changes: &[(UnitKey, UnitValue)],
         stamp: &Stamp,
         digest: &str,
     ) -> StoreResult<RevisionResult> {
         verify(self.device_store()?.connection(), header.binding_authority)?;
-        let result = self.finish_lww_replacement(header, staging_id, changes, stamp, digest, false, &[])?;
+        let result = self.finish_lww_replacement(header, staging_id, changes, overrides, stamp, digest, false, &[])?;
         let tx = self.device_store_mut()?.transaction()?;
         verify(&tx, header.binding_authority)?;
         device_store::begin_mutation_remote(&tx)?;
@@ -2404,6 +2425,7 @@ impl PersistentStore {
         }
         device_store::finish_mutation_remote(&tx)?;
         tx.execute("UPDATE lww_intents SET complete=1 WHERE request_id=?1", [&header.request_id])?;
+        tx.execute("DELETE FROM lww_intent_rows WHERE request_id=?1", [&header.request_id])?;
         tx.commit()?;
         Ok(result)
     }
@@ -2413,16 +2435,24 @@ impl PersistentStore {
         staging_id: &str,
         changes: &[Change],
     ) -> StoreResult<RevisionResult> {
-        let intent = Intent::Target {
-            staging_id: staging_id.into(),
-            changes: changes.to_vec(),
-        };
-        if let Some(result) = self.completed_intent(header, &intent)? {
-            return Ok(result);
-        }
-        self.lww_recover_intents()?;
-        if let Some(result) = self.completed_intent(header, &intent)? {
-            return Ok(result);
+        let issued: bool = self.device_store()?.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM lww_intents WHERE request_id=?1)", [&header.request_id], |row| row.get(0),
+        )?;
+        if issued {
+            // Only a retry needs the digest of rows it does not store again.
+            let intent = Intent::Target {
+                staging_id: staging_id.into(),
+                changes: intent_rows::digest("target", changes.iter().map(intent_rows::target_row))?,
+            };
+            if let Some(result) = self.completed_intent(header, &intent)? {
+                return Ok(result);
+            }
+            self.lww_recover_intents()?;
+            if let Some(result) = self.completed_intent(header, &intent)? {
+                return Ok(result);
+            }
+        } else {
+            self.lww_recover_intents()?;
         }
         verify(self.device_store()?.connection(), header.binding_authority)?;
         for c in changes {
@@ -2436,9 +2466,17 @@ impl PersistentStore {
             projection::validate_received(&self.connection, &c.key, &c.value)?;
         }
         validate_binding_source(&self.connection, staging_id, header, changes)?;
+        let rows = intent_rows::write(
+            &mut self.device_store_mut()?.connection,
+            &header.request_id,
+            "target",
+            changes.iter().map(intent_rows::target_row),
+        )?;
+        let intent = Intent::Target { staging_id: staging_id.into(), changes: rows };
         let (stamp, digest) = self.reserve_intent(header, &intent)?;
-        let result =
-            self.finish_lww_replacement(header, staging_id, &[], &stamp, &digest, true, changes)?;
+        let result = self.finish_lww_replacement(
+            header, staging_id, &[], &BTreeSet::new(), &stamp, &digest, true, changes,
+        )?;
         self.complete_intent(header)?;
         Ok(result)
     }
@@ -2447,6 +2485,7 @@ impl PersistentStore {
         header: &Header,
         staging_id: &str,
         changes: &[(UnitKey, UnitValue)],
+        overrides: &BTreeSet<UnitKey>,
         stamp: &Stamp,
         digest: &str,
         target: bool,
@@ -2458,10 +2497,10 @@ impl PersistentStore {
             )?;
             let intent: Intent = serde_json::from_str(&body)?;
             self.completed_intent(header, &intent)?;
-            let Intent::Replacement { staging_id: original, base_revision, staging_digest, overrides, .. } = intent
+            let Intent::Replacement { staging_id: original, base_revision, staging_digest, .. } = intent
                 else { return Err(error("request-id-integrity")); };
             if original != staging_id { return Err(error("request-id-integrity")); }
-            Some((base_revision, staging_digest, overrides))
+            Some((base_revision, staging_digest))
         };
         let result = commit::replace_commit_lww(
             &mut self.connection,
@@ -2474,7 +2513,7 @@ impl PersistentStore {
             received,
             None,
             None,
-            proof.as_ref().map(|(base_revision, staging_digest, overrides)| commit::ReplacementProof {
+            proof.as_ref().map(|(base_revision, staging_digest)| commit::ReplacementProof {
                 base_revision: *base_revision,
                 staging_digest,
                 overrides,

@@ -130,7 +130,8 @@ fn ordinary_replacement_receipt_rejects_another_source_kind_even_with_matching_d
         "SELECT body FROM lww_intents WHERE request_id=?1", [&stage], |row| row.get(0),
     ).unwrap();
     let mut body: Value = serde_json::from_str(&body).unwrap();
-    body["source_units"] = json!({});
+    assert_eq!(body["source_units"], Value::Null);
+    body["source_units"] = json!({ "rows": 0, "digest": "0".repeat(64) });
     let body = serde_json::to_string(&body).unwrap();
     let digest = risunest_sync_wire::hash(body.as_bytes());
     store.device_store().unwrap().connection().execute(
