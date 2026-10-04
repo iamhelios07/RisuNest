@@ -44,6 +44,7 @@ pub(crate) fn bind_server(store: &mut PersistentStore, server: &LocalServerFixtu
         expected_selection_epoch: original.selection_epoch,
         target: SyncTarget::Server("server".into()),
         inspection_id: Some(inspected.inspection_id),
+        initial_publication: false,
     }).unwrap();
     super::binding::activate(store, &header(store), None).unwrap();
     let mut after = None;

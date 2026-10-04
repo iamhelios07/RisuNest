@@ -59,7 +59,7 @@ fn bind_external(store: &mut PersistentStore, engine: &ExternalLwwEngine) -> Dec
     let inspection = store.register_lww_binding_inspection(before.target_authority, &target, &engine.repository.connection_identity, &engine.library).unwrap();
     let authority = store.switch_lww_binding(&SwitchBindingRequest {
         header: Header { binding_authority: before.target_authority, request_id: uuid::Uuid::new_v4().to_string() },
-        expected_selection_epoch: before.selection_epoch, target, inspection_id: Some(inspection),
+        expected_selection_epoch: before.selection_epoch, target, inspection_id: Some(inspection), initial_publication: false,
     }).unwrap().target_authority;
     let mut after = None;
     loop {
