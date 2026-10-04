@@ -295,6 +295,7 @@ fn bind_target(store: &mut PersistentStore) {
             expected_selection_epoch: state.selection_epoch,
             target: SyncTarget::Server("remote".into()),
             inspection_id: Some(inspection),
+            initial_publication: false,
         })
         .unwrap();
     store

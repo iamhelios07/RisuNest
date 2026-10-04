@@ -163,7 +163,7 @@ fn archive_alias_and_reference_controls_stage_without_reading_any_large_dependen
     let state=store.lww_binding_state().unwrap();
     assert!(store.switch_lww_binding(&SwitchBindingRequest {
         header: Header { binding_authority: state.target_authority, request_id: uuid::Uuid::new_v4().to_string() },
-        expected_selection_epoch: state.selection_epoch.clone(), target: SyncTarget::Server("remote".into()), inspection_id: Some(inspection.clone()),
+        expected_selection_epoch: state.selection_epoch.clone(), target: SyncTarget::Server("remote".into()), inspection_id: Some(inspection.clone()), initial_publication: false,
     }).is_err());
     assert_eq!(store.lww_binding_state().unwrap().selection_epoch,state.selection_epoch);
     store.connection.execute("UPDATE characters SET archived_object=?2 WHERE generation=?1 AND character_id='archived'",params![stage.staging_id,original]).unwrap();
@@ -534,7 +534,7 @@ fn a_bootstrap_proves_the_stage_catalog_once_per_boundary() {
     let state = store.lww_binding_state().unwrap();
     let state = store.switch_lww_binding(&SwitchBindingRequest {
         header: Header { binding_authority: state.target_authority, request_id: uuid::Uuid::new_v4().to_string() },
-        expected_selection_epoch: state.selection_epoch, target: SyncTarget::Server("remote".into()), inspection_id: Some(inspection.clone()),
+        expected_selection_epoch: state.selection_epoch, target: SyncTarget::Server("remote".into()), inspection_id: Some(inspection.clone()), initial_publication: false,
     }).unwrap();
     let switched = proofs();
     reset_hash_work();
