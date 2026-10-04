@@ -420,7 +420,7 @@ pub(crate) async fn run_restore(
 
 fn restore_pins(root:&Path,id:&str)->Result<crate::asset_repository::job_pins::DurableCasJob> {
     use crate::asset_repository::job_pins::{DurableCasJob,CasJobKind};
-    let pins=match DurableCasJob::begin(root,id,CasJobKind::LocalBackupRestore,runtime::now_ms() as i64) {
+    let pins=match DurableCasJob::begin(root,id,CasJobKind::LocalBackupRestore,crate::asset_repository::job_pins::CasJobOwner::external_restore(id),runtime::now_ms() as i64) {
         Ok(pins)=>pins,
         Err(error) if error.kind()==std::io::ErrorKind::AlreadyExists=>DurableCasJob::open(root,id).map_err(runtime::local_error)?,
         Err(error)=>return Err(runtime::local_error(error)),

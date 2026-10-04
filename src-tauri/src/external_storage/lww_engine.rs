@@ -584,6 +584,7 @@ impl ExternalLwwEngine {
                         let mut pins = crate::asset_repository::job_pins::DurableCasJob::begin(
                             &root, &job.job_id,
                             crate::asset_repository::job_pins::CasJobKind::OfficialPublicationOrExportPreparation,
+                            crate::asset_repository::job_pins::CasJobOwner::external_publication(&job.job_id),
                             super::runtime::now_ms() as i64,
                         ).map_err(transient)?;
                         let sealed = pins.pin_existing_batch(&cas, &assets.iter().filter(|asset| asset.local_pin).map(|asset| (

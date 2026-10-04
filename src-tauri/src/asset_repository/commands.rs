@@ -1,5 +1,5 @@
 use super::job_pins::{
-    durable_cas_job_ids, CasJobKind, CasObjectRole, CasReleaseOutcome, DurableCasJob,
+    durable_cas_job_ids, CasJobKind, CasJobOwner, CasObjectRole, CasReleaseOutcome, DurableCasJob,
 };
 use super::{PayloadCas, PreparedPayload};
 use crate::asset_repository::owner_manifest_codec::{
@@ -358,7 +358,7 @@ pub(crate) async fn asset_cas_job_begin(
                 .map_err(|error| error.to_string())?;
             let root = repository_root(&app)?;
             let session_id = uuid::Uuid::new_v4().to_string();
-            let job = DurableCasJob::begin(&root, &session_id, kind, now_ms()?)
+            let job = DurableCasJob::begin(&root, &session_id, kind, CasJobOwner::page_write(&session_id), now_ms()?)
                 .map_err(|error| error.to_string())?;
             app.state::<DurableCasJobState>()
                 .jobs
@@ -1067,7 +1067,7 @@ mod tests {
             let mut store = PersistentStore::open(directory.path()).unwrap();
             let cas = PayloadCas::new(directory.path()).unwrap();
             let mut job = DurableCasJob::begin(directory.path(), "activation-failure",
-                CasJobKind::DirectAssetOrInlayWrite, 1).unwrap();
+                CasJobKind::DirectAssetOrInlayWrite, crate::asset_repository::job_pins::CasJobOwner::for_test(), 1).unwrap();
             let object = job.prepare_bytes(&cas, b"synthetic activation", CasObjectRole::DirectObject).unwrap();
             if sealed { job.seal(&mut store, 0).unwrap(); }
             let mut jobs = HashMap::from([("activation-failure".to_owned(), job)]);
@@ -1087,7 +1087,7 @@ mod tests {
         let root = directory.path();
         let mut store = PersistentStore::open(root).unwrap();
         let cas = PayloadCas::new(root).unwrap();
-        let begin = |id: &str, kind| DurableCasJob::begin(root, id, kind, 1).unwrap();
+        let begin = |id: &str, kind| DurableCasJob::begin(root, id, kind, crate::asset_repository::job_pins::CasJobOwner::for_test(), 1).unwrap();
         let mut earlier = begin("earlier-write", CasJobKind::DirectAssetOrInlayWrite);
         earlier.prepare_bytes(&cas, b"synthetic earlier", CasObjectRole::DirectObject).unwrap();
         drop(earlier);
@@ -1255,7 +1255,7 @@ mod tests {
     }
 
     fn begin_content_job(root: &std::path::Path, id: &str) -> DurableCasJob {
-        DurableCasJob::begin(root, id, CasJobKind::CardOrModuleContentImport, 1).unwrap()
+        DurableCasJob::begin(root, id, CasJobKind::CardOrModuleContentImport, crate::asset_repository::job_pins::CasJobOwner::for_test(), 1).unwrap()
     }
 
     fn risum_fixture(module: Value, assets: &[&[u8]]) -> Vec<u8> {
@@ -1422,6 +1422,7 @@ mod tests {
             directory.path(),
             "wrong-kind",
             CasJobKind::LocalBackupRestore,
+            crate::asset_repository::job_pins::CasJobOwner::for_test(),
             1,
         )
         .unwrap();

@@ -2583,6 +2583,7 @@ mod tests {
             directory.path(),
             "preview-released-job",
             CasJobKind::LocalBackupRestore,
+            crate::asset_repository::job_pins::CasJobOwner::for_test(),
             0,
         )
         .expect("begin released journal fixture");

@@ -5423,6 +5423,7 @@ mod tests {
             repository_root,
             job_id,
             CasJobKind::OfficialPublicationOrExportPreparation,
+            crate::asset_repository::job_pins::CasJobOwner::for_test(),
             1,
         )
         .unwrap();
@@ -7302,6 +7303,7 @@ mod tests {
             repository_root,
             &job.id(),
             CasJobKind::CardOrModuleContentImport,
+            crate::asset_repository::job_pins::CasJobOwner::for_test(),
             1,
         )
         .unwrap();

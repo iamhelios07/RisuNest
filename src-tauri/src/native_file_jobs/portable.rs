@@ -206,10 +206,12 @@ pub(super) fn now() -> i64 {
 }
 
 fn new_pins(store: &PersistentStore, kind: CasJobKind) -> Result<DurableCasJob, NativeJobError> {
+    let id = uuid::Uuid::new_v4().to_string();
     DurableCasJob::begin(
         store.repository_root(),
-        &uuid::Uuid::new_v4().to_string(),
+        &id,
         kind,
+        crate::asset_repository::job_pins::CasJobOwner::native_file_job(&id),
         now(),
     )
     .map_err(error)
@@ -220,7 +222,7 @@ fn new_pins_for_job(
     kind: CasJobKind,
     job_id: &str,
 ) -> Result<DurableCasJob, NativeJobError> {
-    DurableCasJob::begin(store.repository_root(), job_id, kind, now()).map_err(error)
+    DurableCasJob::begin(store.repository_root(), job_id, kind, crate::asset_repository::job_pins::CasJobOwner::native_file_job(job_id), now()).map_err(error)
 }
 pub(super) fn finish_durable_job(
     outcome: Result<JobResultSummary, NativeJobError>,
