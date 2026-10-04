@@ -22,8 +22,11 @@ import {
 import { defineOwnEnumerableProperty } from '../storage/ownEnumerableProperty'
 import { selectConversationModules } from '../process/moduleSelection'
 import {
+    isPlainObject,
+    isPluginMessageField,
     pluginMessageWindow,
     requiredId,
+    throwIfAborted,
     type PluginMessageWindow,
     type PluginMessageWindowInput,
 } from './pluginQueryInput'
@@ -104,11 +107,6 @@ export interface ConversationContext {
     }
 }
 
-// Input arrives from the plugin frame, so the check does not depend on this realm's Object.
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-    return Object.prototype.toString.call(value) === '[object Object]'
-}
-
 function optionalBoolean(value: unknown, name: string, fallback: boolean): boolean {
     if (value === undefined) return fallback
     if (typeof value !== 'boolean') throw new TypeError(`${name} must be a boolean`)
@@ -163,18 +161,13 @@ export function normalizeConversationContextInput(input: unknown): ConversationC
             ? []
             : stringList(value.messages.extraFields, 'messages.extraFields', CONVERSATION_CONTEXT_MAX_EXTRA_FIELDS)
         for (const field of extraFields) {
-            if (!field.startsWith('__') || field.length <= 2 || field === '__proto__') {
+            if (!isPluginMessageField(field)) {
                 throw new RangeError(`messages.extraFields entry ${field} is not a plugin message field`)
             }
         }
         request.messages = { window: pluginMessageWindow(value.messages), extraFields }
     }
     return request
-}
-
-function throwIfAborted(signal: AbortSignal | undefined): void {
-    if (!signal?.aborted) return
-    throw signal.reason ?? new DOMException('The operation was aborted', 'AbortError')
 }
 
 function pickFields(

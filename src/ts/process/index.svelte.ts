@@ -1,4 +1,5 @@
 import { registerGeneratingConversation } from '../storage/generatingConversationRegistry'
+import { openGenerationRequestPhase } from './generationRequestPhase'
 import { boundedGenerationFallbackReason } from './boundedGenerationAdmission'
 import { get, writable } from "svelte/store";
 import { type character, type groupChat, type MessageGenerationInfo, type Chat, type MessagePresetInfo, activatePresetOverride, setCurrentChat, type Message } from "../storage/database.svelte";
@@ -2133,20 +2134,29 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
               requestSourceSession.canContinueGenerationFrom(requestSourceSessionVersion!) &&
               requestSourceSession.materializeCompatibilityArray() ===
                   requestSourceConversation.message)
-    const req = await requestChatData({
-        formated: formated,
-        biasString: biases,
-        currentChar: currentChar,
-        useStreaming: true,
-        isGroupChat: nowChatroom.type === 'group',
-        bias: {},
-        continue: arg.continue,
-        chatId: generationId,
-        imageResponse: DBState.db.outputImageModal,
-        previewBody: arg.previewPrompt,
-        escape: nowChatroom.type === 'character' && nowChatroom.escapeOutput,
-        rememberToolUsage: DBState.db.rememberToolUsage,
-    }, 'model', abortSignal)
+    const closeRequestPhase = openGenerationRequestPhase({
+        characterId: requestSourceCharacterId,
+        conversationId: requestSourceConversation.id ?? '',
+    })
+    let req: Awaited<ReturnType<typeof requestChatData>>
+    try {
+        req = await requestChatData({
+            formated: formated,
+            biasString: biases,
+            currentChar: currentChar,
+            useStreaming: true,
+            isGroupChat: nowChatroom.type === 'group',
+            bias: {},
+            continue: arg.continue,
+            chatId: generationId,
+            imageResponse: DBState.db.outputImageModal,
+            previewBody: arg.previewPrompt,
+            escape: nowChatroom.type === 'character' && nowChatroom.escapeOutput,
+            rememberToolUsage: DBState.db.rememberToolUsage,
+        }, 'model', abortSignal)
+    } finally {
+        await closeRequestPhase()
+    }
     if(!isRequestSourceCurrent()){
         return false
     }

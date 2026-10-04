@@ -2,6 +2,12 @@ import {
     normalizeConversationContextInput,
     type ConversationContext,
 } from '../conversationContext'
+import {
+    createConversationPatchLedger,
+    normalizeConversationPatchInput,
+    type ConversationPatchResult,
+} from '../conversationPatch'
+import type { ConversationPatchAccess } from '../conversationPatchAccess'
 import { linkPluginQueryAbortSignals, type PluginDatabaseAccess } from '../pluginDatabaseAccess'
 
 // Methods for RisuNest's own plugins. They are not part of the public plugin API and
@@ -9,9 +15,11 @@ import { linkPluginQueryAbortSignals, type PluginDatabaseAccess } from '../plugi
 
 export interface RisunestPrivateApiDependencies {
     databaseAccess: Pick<PluginDatabaseAccess, 'readConversationContext'>
+    patchAccess: ConversationPatchAccess
     /** The periodic `db` permission, the one `getDatabase` asks for. */
     hasDatabasePermission(): Promise<boolean>
     lifetimeSignal: AbortSignal
+    now?(): number
 }
 
 function throwIfAborted(signal: AbortSignal): void {
@@ -28,6 +36,7 @@ function inputSignal(input: unknown): AbortSignal | undefined {
 }
 
 export function createRisunestPrivateApi(dependencies: RisunestPrivateApiDependencies) {
+    const patchLedger = createConversationPatchLedger(dependencies.now)
     return {
         async readConversationContext(input?: unknown): Promise<ConversationContext | null> {
             const request = normalizeConversationContextInput(input)
@@ -47,6 +56,19 @@ export function createRisunestPrivateApi(dependencies: RisunestPrivateApiDepende
             } finally {
                 linked.dispose()
             }
+        },
+        async patchConversation(input?: unknown): Promise<ConversationPatchResult> {
+            const request = normalizeConversationPatchInput(input)
+            const signal = inputSignal(input)
+            return patchLedger.run(request.mutationId, async () => {
+                const linked = linkPluginQueryAbortSignals(signal, dependencies.lifetimeSignal)
+                try {
+                    throwIfAborted(linked.signal)
+                    return await dependencies.patchAccess.patchConversation(request, linked.signal)
+                } finally {
+                    linked.dispose()
+                }
+            })
         },
     }
 }

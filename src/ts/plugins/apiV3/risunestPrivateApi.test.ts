@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { ConversationContext } from '../conversationContext'
+import type { ConversationPatchResult } from '../conversationPatch'
 import { createRisunestPrivateApi } from './risunestPrivateApi'
 
 function setup(granted: boolean | Promise<boolean> = true) {
@@ -7,12 +8,14 @@ function setup(granted: boolean | Promise<boolean> = true) {
     const readConversationContext = vi.fn(async () => context)
     const hasDatabasePermission = vi.fn(async () => granted)
     const lifetime = new AbortController()
+    const patchConversation = vi.fn(async (_request: unknown, _signal?: AbortSignal): Promise<ConversationPatchResult> => ({ status: 'applied', revision: 2 }))
     const api = createRisunestPrivateApi({
         databaseAccess: { readConversationContext },
+        patchAccess: { patchConversation },
         hasDatabasePermission,
         lifetimeSignal: lifetime.signal,
     })
-    return { api, context, readConversationContext, hasDatabasePermission, lifetime }
+    return { api, context, readConversationContext, hasDatabasePermission, lifetime, patchConversation }
 }
 
 describe('risunestReadConversationContext', () => {
@@ -81,5 +84,51 @@ describe('risunestReadConversationContext', () => {
         answer(true)
         await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
         expect(unloading.readConversationContext).not.toHaveBeenCalled()
+    })
+})
+
+describe('risunestPatchConversation', () => {
+    const input = {
+        characterId: 'char',
+        conversationId: 'conv',
+        mutationId: 'patch-1',
+        messages: [{ index: 0, messageId: 'm0', set: { __tr: 'text' } }],
+    }
+
+    it('validates before patching, passes the request on and replays the outcome', async () => {
+        const { api, patchConversation } = setup()
+
+        await expect(api.patchConversation({ ...input, messages: [{ index: 0, messageId: 'm0', set: { role: 'user' } }] }))
+            .rejects.toThrow(TypeError)
+        expect(patchConversation).not.toHaveBeenCalled()
+
+        await expect(api.patchConversation(input)).resolves.toEqual({ status: 'applied', revision: 2 })
+        await expect(api.patchConversation(input)).resolves.toEqual({ status: 'already-applied', revision: 2 })
+        expect(patchConversation).toHaveBeenCalledOnce()
+        expect(patchConversation.mock.calls[0]).toEqual([
+            { characterId: 'char', conversationId: 'conv', mutationId: 'patch-1', messages: input.messages, chatVariables: [] },
+            expect.any(AbortSignal),
+        ])
+    })
+
+    it('stops for an aborted signal without recording the mutation ID', async () => {
+        const { api, patchConversation, lifetime } = setup()
+        const controller = new AbortController()
+        controller.abort()
+
+        await expect(api.patchConversation({ ...input, signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' })
+        expect(patchConversation).not.toHaveBeenCalled()
+        await expect(api.patchConversation(input)).resolves.toMatchObject({ status: 'applied' })
+        await expect(api.patchConversation({ ...input, mutationId: 'patch-2', signal: 'stop' })).rejects.toThrow(TypeError)
+
+        let finish!: () => void
+        patchConversation.mockImplementationOnce((_request, signal) => new Promise((resolve, reject) => {
+            finish = () => signal?.aborted ? reject(signal.reason) : resolve({ status: 'applied', revision: 3 })
+        }))
+        const pending = api.patchConversation({ ...input, mutationId: 'patch-3' })
+        await vi.waitFor(() => expect(patchConversation).toHaveBeenCalledTimes(2))
+        lifetime.abort()
+        finish()
+        await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
     })
 })

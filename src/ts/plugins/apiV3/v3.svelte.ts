@@ -69,6 +69,7 @@ import {
     type PluginFullObjectCallContext,
 } from "../pluginDatabaseAccess";
 import { createRisunestPrivateApi } from './risunestPrivateApi';
+import { conversationPatchAccess } from '../conversationPatchHost';
 
 /*
     V3 API for RisuAI Plugins
@@ -772,6 +773,7 @@ const makeRisuaiAPIV3 = (
     }
     const risunest = createRisunestPrivateApi({
         databaseAccess,
+        patchAccess: conversationPatchAccess,
         hasDatabasePermission: () => getPluginPermission(permissionContext, 'db', 'periodically'),
         lifetimeSignal: pluginLifetime.signal,
     })
@@ -958,6 +960,8 @@ const makeRisuaiAPIV3 = (
         },
         risunestReadConversationContext: (input?: unknown) =>
             risunest.readConversationContext(input),
+        risunestPatchConversation: (input?: unknown) =>
+            risunest.patchConversation(input),
 
         installPlugin: handlePluginInstallViaPlugin,
 

@@ -17,6 +17,7 @@ const mocks = vi.hoisted(() => ({
     confirm: vi.fn(async () => true),
     permissionValues: new Map<string, unknown>(),
     providers: new Map<string, Function>(),
+    patchConversation: vi.fn(async (): Promise<unknown> => ({ status: 'applied', revision: 4 })),
 }))
 
 const ownedStorageStub = {
@@ -134,6 +135,9 @@ vi.mock('../pluginChatOutputListeners', () => ({
     registerChatOutputListener: vi.fn(), removeChatOutputListener: vi.fn(),
 }))
 vi.mock('src/ts/conversationMutations', () => ({ appendCurrentConversationMessage: vi.fn() }))
+vi.mock('../conversationPatchAccess', () => ({
+    createConversationPatchAccess: () => ({ patchConversation: mocks.patchConversation }),
+}))
 
 const pluginName = 'dom-rpc-fixture'
 const happyDOMWindow = window as unknown as Window & {
@@ -238,7 +242,7 @@ describe('Plugin v3 real iframe DOM/RPC bridge', () => {
 globalThis.ImageBitmap = class {};
 function __postToParent(message) {
     const source = parent.document.querySelector('iframe[data-risu-test-frame="${frameId}"]').contentWindow;
-    const data = JSON.parse(JSON.stringify(message));
+    const data = __cloneForParent(message);
     parent.dispatchEvent(new parent.MessageEvent('message', { data, source }));
 }
 `
@@ -254,6 +258,7 @@ function __postToParent(message) {
             this.setAttribute('data-risu-test-frame', frameId)
             const child = this.contentWindow!
             const childRealm = child as any
+            childRealm.__cloneForParent = (message: unknown) => structuredClone(message)
             vi.spyOn(child, 'postMessage').mockImplementation((data) => {
                 child.dispatchEvent(new childRealm.MessageEvent('message', {
                     data: structuredClone(data),
@@ -554,6 +559,28 @@ function __postToParent(message) {
             }),
             { allowPrivate: false, signal: expect.any(AbortSignal) },
         )
+    })
+
+    it('reaches the private conversation patch from the guest with removals kept', async () => {
+        const name = 'conversation-patcher'
+        vi.mocked(linkPluginQueryAbortSignals).mockImplementation(() => ({ signal: new AbortController().signal, dispose() {} }))
+        await startFixture(name, 'globalThis.rpcReady = Promise.resolve()')
+
+        const result = await guest(name, `
+            const outcome = await risuai.risunestPatchConversation({
+                characterId: 'char',
+                conversationId: 'conv',
+                mutationId: 'guest-patch',
+                messages: [{ index: 0, messageId: 'm0', expected: { __old: undefined }, set: { __tr: 'text', __gone: undefined } }],
+            });
+            return JSON.stringify(outcome);
+        `)
+
+        expect(JSON.parse(String(result))).toEqual({ status: 'applied', revision: 4 })
+        const [request] = mocks.patchConversation.mock.calls[0] as unknown as [{ messages: { expected: object; set: object }[] }]
+        expect(request).toMatchObject({ characterId: 'char', conversationId: 'conv', mutationId: 'guest-patch' })
+        expect(Object.hasOwn(request.messages[0].set, '__gone')).toBe(true)
+        expect(Object.hasOwn(request.messages[0].expected, '__old')).toBe(true)
     })
 
     it('does not log RPC request or response payloads when DEV is false', async () => {

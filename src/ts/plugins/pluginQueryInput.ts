@@ -5,6 +5,21 @@ export const PLUGIN_SUMMARY_QUERY_MAX_LIMIT = 100
 export const PLUGIN_MESSAGE_QUERY_DEFAULT_LIMIT = 128
 export const PLUGIN_MESSAGE_QUERY_MAX_LIMIT = 128
 
+// Input arrives from the plugin frame, so the check does not depend on this realm's Object.
+export function isPlainObject(value: unknown): value is Record<string, unknown> {
+    return Object.prototype.toString.call(value) === '[object Object]'
+}
+
+/** A top-level message field a plugin owns: no host message field starts with `__`. */
+export function isPluginMessageField(name: string): boolean {
+    return name.startsWith('__') && name.length > 2 && name !== '__proto__'
+}
+
+export function throwIfAborted(signal: AbortSignal | undefined): void {
+    if (!signal?.aborted) return
+    throw signal.reason ?? new DOMException('The operation was aborted', 'AbortError')
+}
+
 export interface PluginMessageWindowInput {
     startIndex?: number
     limit?: number
