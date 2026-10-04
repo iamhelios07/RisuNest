@@ -3,7 +3,7 @@
     import { language } from 'src/lang'
     import { alertCheckboxConfirm, alertConfirm } from 'src/ts/alert'
     import { isTauri } from 'src/ts/platform'
-    import { connectServerSync, disconnectServerSync, holdServerSync, retryServerSync, getServerSyncController, getServerSyncCacheUsage, cleanupServerSyncCache, type ServerSyncCacheUsage } from 'src/ts/storage/sync/serverSyncProduction'
+    import { completeServerSyncBinding, connectServerSync, disconnectServerSync, holdServerSync, retryServerSync, getServerSyncController, getServerSyncCacheUsage, cleanupServerSyncCache, type ServerSyncCacheUsage } from 'src/ts/storage/sync/serverSyncProduction'
     import { parseServerRegistration } from 'src/ts/storage/sync/serverSyncRegistration'
     import { serverRegistrationInbox } from 'src/ts/storage/sync/serverSyncRegistrationInbox'
     import { canScanServerRegistration, createServerQrScanner } from 'src/ts/storage/sync/serverSyncQr'
@@ -108,9 +108,15 @@
                 <SettingButton onclick={() => { candidate = undefined }} disabled={busy}>{copy.discardRegistration}</SettingButton>
             </div>
         {/if}
+        {#if view.bindingIncomplete}
+            <p role="status" class="mt-2 text-sm">{language.lwwSync.bindingIncomplete}</p>
+            <div class="mt-2 flex flex-wrap gap-2">
+                <SettingButton onclick={() => void run(completeServerSyncBinding)} disabled={busy}>{copy.connect}</SettingButton>
+            </div>
+        {/if}
         {#if view.status.bound}
             <div class="mt-2 flex flex-wrap gap-2">
-                <SettingButton onclick={() => void run(retryServerSync)} disabled={busy}>{copy.syncNow}</SettingButton>
+                {#if !view.bindingIncomplete}<SettingButton onclick={() => void run(retryServerSync)} disabled={busy}>{copy.syncNow}</SettingButton>{/if}
                 <SettingButton onclick={() => void run(disconnect)} disabled={busy}>{copy.disconnect}</SettingButton>
             </div>
         {/if}

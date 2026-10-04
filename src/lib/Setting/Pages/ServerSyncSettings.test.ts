@@ -2,12 +2,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mount, tick, unmount } from 'svelte'
 import { languageEnglish } from 'src/lang/en'
-const f = vi.hoisted(() => ({ connect: vi.fn(), configure: vi.fn(), bind: vi.fn(), disconnect: vi.fn(), hold: vi.fn(), release: vi.fn(), status: vi.fn(), policy: vi.fn(), cancel: vi.fn(), checkbox: vi.fn(), native: true, view: { status: { configured: false }, paused: false } as Record<string, unknown> }))
+const f = vi.hoisted(() => ({ connect: vi.fn(), complete: vi.fn(), configure: vi.fn(), bind: vi.fn(), disconnect: vi.fn(), hold: vi.fn(), release: vi.fn(), status: vi.fn(), policy: vi.fn(), cancel: vi.fn(), checkbox: vi.fn(), native: true, view: { status: { configured: false }, paused: false } as Record<string, unknown> }))
 vi.mock('src/lang', async () => ({ language: (await import('src/lang/en')).languageEnglish, changeLanguage: vi.fn() }))
 vi.mock('src/ts/platform', () => ({ get isTauri() { return f.native } }))
 vi.mock('src/ts/alert', () => ({ alertConfirm: vi.fn(), alertCheckboxConfirm: f.checkbox, alertError: vi.fn(), alertNormal: vi.fn(), openRisuAccountLogin: vi.fn() }))
 vi.mock('src/ts/storage/sync/serverSyncProduction', () => ({
-    connectServerSync: f.connect, configureServerSyncConnection: f.configure, disconnectServerSync: f.disconnect, retryServerSync: vi.fn(), holdServerSync: f.hold,
+    connectServerSync: f.connect, completeServerSyncBinding: f.complete, configureServerSyncConnection: f.configure, disconnectServerSync: f.disconnect, retryServerSync: vi.fn(), holdServerSync: f.hold,
     getServerSyncCacheUsage: vi.fn(), cleanupServerSyncCache: vi.fn(),
     getServerSyncController: () => ({ snapshot: () => f.view, subscribe: () => () => {}, ensureStatus: vi.fn() }),
 }))
@@ -40,7 +40,7 @@ let component: ReturnType<typeof mount> | undefined
 let host: HTMLDivElement
 beforeEach(() => {
     vi.clearAllMocks(); f.native = true; f.view = { status: { configured: false }, paused: false }; host = document.createElement('div'); document.body.append(host)
-    for (const mock of [f.disconnect, f.hold, f.release, f.status, f.policy, f.cancel, f.checkbox]) mock.mockReset()
+    for (const mock of [f.disconnect, f.hold, f.release, f.status, f.policy, f.cancel, f.checkbox, f.complete]) mock.mockReset()
     f.hold.mockResolvedValue(f.release)
 })
 afterEach(async () => { if (component) await unmount(component); component = undefined; host.remove() })
@@ -69,6 +69,37 @@ it.each(['', 'server-unreachable', 'clock-skew', 'unauthorized'])('offers no new
     await registration()
     expect(findButton(languageEnglish.risuNest.serverSync.connect)).toBeDefined()
     expect(findButton(languageEnglish.lwwSync.newDeviceAction)).toBeUndefined()
+})
+it('shows an unfinished connection with Connect, which finishes it with the saved registration', async () => {
+    f.view = { status: { configured: false, bound: true }, paused: true, error: '', bindingIncomplete: true }
+    f.complete.mockResolvedValue(undefined)
+    component = mount(ServerSyncSettings, { target: host, props: { connectTarget: vi.fn() } })
+    await settle()
+    expect(host.querySelector('[role="status"]')?.textContent).toBe(languageEnglish.lwwSync.bindingIncomplete)
+    expect(findButton(languageEnglish.risuNest.serverSync.syncNow)).toBeUndefined()
+    expect(findButton(languageEnglish.risuNest.serverSync.disconnect)).toBeDefined()
+    click(languageEnglish.risuNest.serverSync.connect)
+    await settle()
+    expect(f.complete).toHaveBeenCalledOnce()
+    expect(f.connect).not.toHaveBeenCalled(); expect(f.bind).not.toHaveBeenCalled()
+})
+it('reports why Connect could not finish an unfinished connection', async () => {
+    f.view = { status: { configured: false, bound: true }, paused: true, error: '', bindingIncomplete: true }
+    f.complete.mockRejectedValue({ code: 'unauthorized' })
+    component = mount(ServerSyncSettings, { target: host, props: { connectTarget: vi.fn() } })
+    await settle()
+    click(languageEnglish.risuNest.serverSync.connect)
+    await settle()
+    expect(host.querySelector('[role="alert"]')?.textContent).toBe(languageEnglish.lwwSync.registrationRevoked)
+    expect(host.querySelector('[role="status"]')?.textContent).toBe(languageEnglish.lwwSync.bindingIncomplete)
+})
+it('shows no unfinished connection outside that state', async () => {
+    f.view = { status: { configured: true, bound: true }, paused: false, error: '' }
+    component = mount(ServerSyncSettings, { target: host, props: { connectTarget: vi.fn() } })
+    await settle()
+    expect(host.textContent).not.toContain(languageEnglish.lwwSync.bindingIncomplete)
+    expect(findButton(languageEnglish.risuNest.serverSync.connect)).toBeUndefined()
+    expect(findButton(languageEnglish.risuNest.serverSync.syncNow)).toBeDefined()
 })
 it('explains an item too large to send instead of the generic sync error', async () => {
     f.view = { status: { configured: true, bound: true }, paused: true, error: 'unit-too-large' }

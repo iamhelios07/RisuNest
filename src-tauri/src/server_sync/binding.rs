@@ -41,6 +41,14 @@ pub(crate) struct StagedTarget {
     staging_id: String,
     receive_id: String,
 }
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PendingBinding {
+    endpoint: String,
+    library_id: String,
+    epoch: String,
+    server_empty: bool,
+}
 #[derive(Serialize, Deserialize)]
 struct VerifiedStage {
     target: VerifiedTarget,
@@ -73,11 +81,7 @@ fn assert_authority(store: &PersistentStore, header: &Header) -> Result<()> {
     }
     Ok(())
 }
-pub(crate) fn inspect(store: &PersistentStore, header: &Header) -> Result<Inspection> {
-    assert_authority(store, header)?;
-    let core = candidate(store)?;
-    core.admission()?;
-    let head = core.client.resolve_identity()?;
+fn first_state_page(core: &LwwClient) -> Result<StatePage> {
     let (_, pin): (_, StatePin) = core.client.json(
         reqwest::Method::POST,
         "state/pins",
@@ -104,6 +108,14 @@ pub(crate) fn inspect(store: &PersistentStore, header: &Header) -> Result<Inspec
     if page.pin_id != pin.pin_id || page.start_seq != pin.start_seq {
         return Err(SyncError::new("invalid-state-page", 502));
     }
+    Ok(page)
+}
+pub(crate) fn inspect(store: &PersistentStore, header: &Header) -> Result<Inspection> {
+    assert_authority(store, header)?;
+    let core = candidate(store)?;
+    core.admission()?;
+    let head = core.client.resolve_identity()?;
+    let page = first_state_page(&core)?;
     let config = core
         .access
         .ok_or_else(|| SyncError::new("server-unconfigured", 409))?;
@@ -153,6 +165,45 @@ pub(crate) fn inspect(store: &PersistentStore, header: &Header) -> Result<Inspec
         registration_changed,
         server_restored,
     })
+}
+/// Reports a first binding that stopped after its target switch: the target is this
+/// server and a registration is saved, but no binding was ever activated. The server
+/// counts as still empty only when it is the library and epoch that were inspected and
+/// holds no unit; any failure to tell counts as not empty.
+pub(crate) fn pending_binding(store: &PersistentStore) -> Result<Option<PendingBinding>> {
+    let state = store.lww_binding_state()?;
+    if state.target != SyncTarget::Server("server".into()) || store.server_stored_config()?.is_some() {
+        return Ok(None);
+    }
+    let log = OperationLog::open(store.repository_root())?;
+    if log.verified::<VerifiedTarget>("bindings", "active").is_ok() {
+        return Ok(None);
+    }
+    let Some(saved) = log.config("candidate")? else {
+        return Ok(None);
+    };
+    let Ok(selected) = log.verified::<VerifiedTarget>("bindings", "selected") else {
+        return Ok(None);
+    };
+    let still_empty = || -> Result<bool> {
+        if saved.library_id != selected.config.library_id
+            || state.library_id.as_deref() != Some(&selected.config.library_id)
+        {
+            return Ok(false);
+        }
+        let core = candidate(store)?;
+        let head = core.client.resolve_identity()?;
+        Ok(head.library_id == selected.config.library_id
+            && head.epoch == selected.epoch
+            && first_state_page(&core)?.items.is_empty())
+    };
+    let server_empty = still_empty().unwrap_or(false);
+    Ok(Some(PendingBinding {
+        endpoint: selected.config.endpoint,
+        library_id: selected.config.library_id,
+        epoch: selected.epoch,
+        server_empty,
+    }))
 }
 /// Moves the operation log with a binding switch. A retained binding keeps its pending
 /// publications and receive position under the new authority; any other switch detaches
@@ -1268,6 +1319,49 @@ mod tests {
         drain_publications(&client, &mut a, &[]).unwrap();
         receive_available(&peer, &mut b, &[]).unwrap();
         assert_eq!(b.read_root(None).unwrap().value["language"], "ja");
+    }
+    #[test]
+    fn a_first_binding_stopped_after_its_switch_is_reported_with_whether_the_server_is_still_empty() {
+        use crate::server_sync::lww_tests::drain_publications;
+        let gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = vanishing_server(gone.clone());
+        let (_a_root, mut a) = local();
+        let (_b_root, mut b) = local();
+        let config = configure(&server, &a);
+        assert!(pending_binding(&a).unwrap().is_none());
+        let inspected = inspect(&a, &header(&a)).unwrap();
+        assert!(inspected.empty);
+        assert!(pending_binding(&a).unwrap().is_none());
+        switch_to(&mut a, SyncTarget::Server("server".into()), Some(inspected.inspection_id));
+        let peer = server.client(&b);
+        let epoch = peer.client.resolve_identity().unwrap().epoch;
+        let pending = pending_binding(&a).unwrap().unwrap();
+        assert_eq!(pending.endpoint, config.endpoint);
+        assert_eq!(pending.library_id, config.library_id);
+        assert_eq!(pending.epoch, epoch);
+        assert!(pending.server_empty);
+        gone.store(true, std::sync::atomic::Ordering::SeqCst);
+        let unreachable = pending_binding(&a).unwrap().unwrap();
+        assert!(!unreachable.server_empty);
+        gone.store(false, std::sync::atomic::Ordering::SeqCst);
+        save(&mut b, &["root", "language"], serde_json::json!("ja"));
+        drain_publications(&peer, &mut b, &[]).unwrap();
+        let published = pending_binding(&a).unwrap().unwrap();
+        assert!(!published.server_empty);
+        assert_eq!(published.epoch, epoch);
+        resume(&mut a);
+        assert!(pending_binding(&a).unwrap().is_none());
+    }
+    #[test]
+    fn a_stopped_first_binding_to_a_server_restored_since_is_not_still_empty() {
+        let server = LocalServerFixture::new();
+        let (_root, mut a) = local();
+        configure(&server, &a);
+        let inspected = inspect(&a, &header(&a)).unwrap();
+        switch_to(&mut a, SyncTarget::Server("server".into()), Some(inspected.inspection_id));
+        assert!(pending_binding(&a).unwrap().unwrap().server_empty);
+        server.server.rotate_restored_epoch().unwrap();
+        assert!(!pending_binding(&a).unwrap().unwrap().server_empty);
     }
     fn fresh_writer(store: &mut PersistentStore, inspection_id: &str) -> Result<NewDevicePreparation> {
         let request = header(store);
