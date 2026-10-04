@@ -1494,4 +1494,24 @@ describe('regex history actions over a history window', () => {
         expect(() => scope.assertOwnerCurrent()).toThrow()
         scope.release()
     })
+
+    it('keeps chat variables an editinput regex sets on the window chat', async () => {
+        const { char, controller } = windowedCharacter([
+            { ...makeScript('^input$', '{{setvar::scratch::regex}}'), type: 'editinput' },
+        ])
+        const scope = createPromptScriptOperationScope(char, {
+            historyWindow: { chat: controller.chat, conversationId: 'conversation-1' },
+        })
+
+        const result = await processScriptFull(char, 'input', 'editinput', -1, {}, {
+            promptOperationScope: scope,
+            cache: 'bypass',
+            regexWorker: false,
+        })
+        scope.finish()
+
+        expect(result.data).toBe('written')
+        expect(controller.chat.scriptstate).toEqual({ $scratch: 'regex' })
+        expect(Object.hasOwn(char.chats[0], 'scriptstate')).toBe(false)
+    })
 })
