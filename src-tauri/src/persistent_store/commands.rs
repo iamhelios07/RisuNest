@@ -38,6 +38,7 @@ pub(crate) struct PersistentStoreState {
     snapshot_operations: Mutex<()>,
     renderer_gate: Arc<RendererGate>,
     archive_operations: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    retired_purge_started: AtomicBool,
 }
 
 struct ArchiveOperationGuard<'a> {
@@ -279,7 +280,65 @@ impl Default for PersistentStoreState {
             snapshot_operations: Mutex::new(()),
             renderer_gate: Arc::new(RendererGate::default()),
             archive_operations: Mutex::new(HashMap::new()),
+            retired_purge_started: AtomicBool::new(false),
         }
+    }
+}
+
+const RETIRED_PURGE_BATCH_ROWS: usize = 512;
+const RETIRED_PURGE_PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
+const RETIRED_PURGE_BUSY: std::time::Duration = std::time::Duration::from_secs(1);
+const RETIRED_PURGE_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl PersistentStoreState {
+    /// One bounded purge step that never waits for the store. Returns whether
+    /// retired libraries remain, or nothing while the store is busy, closed or
+    /// under device maintenance.
+    fn purge_retired_step(&self, limit_rows: usize) -> StoreResult<Option<bool>> {
+        let Some(_operation) = self.try_admit_renderer_operation()? else {
+            return Ok(None);
+        };
+        let mut store = match self.store.try_lock() {
+            Ok(store) => store,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                return Err(StoreError::Store {
+                    message: format!("persistent store mutex poisoned: {error}"),
+                })
+            }
+        };
+        let Some(store) = store.as_mut() else {
+            return Ok(None);
+        };
+        store.purge_retired_batch(limit_rows).map(Some)
+    }
+}
+
+/// Deletes retired libraries in the background for the life of the process,
+/// starting with whatever an earlier run left behind.
+fn start_retired_purge(app: &AppHandle, state: &PersistentStoreState) {
+    if state.retired_purge_started.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let app = app.clone();
+    let spawned = std::thread::Builder::new()
+        .name("pds-retired-purge".to_owned())
+        .spawn(move || {
+            let state = app.state::<PersistentStoreState>();
+            loop {
+                let pause = match logged(
+                    "pds_retired_purge",
+                    state.purge_retired_step(RETIRED_PURGE_BATCH_ROWS),
+                ) {
+                    Ok(Some(true)) => RETIRED_PURGE_PAUSE,
+                    Ok(None) => RETIRED_PURGE_BUSY,
+                    Ok(Some(false)) | Err(_) => RETIRED_PURGE_IDLE,
+                };
+                std::thread::sleep(pause);
+            }
+        });
+    if spawned.is_err() {
+        state.retired_purge_started.store(false, Ordering::Release);
     }
 }
 
@@ -435,7 +494,9 @@ pub(crate) fn pds_open(
     logged("pds_open", (|| {
         let operation_guard = state.admit_renderer_operation()?;
         let app_data_dir = crate::app_paths::data_root(&app).map_err(|message| StoreError::Store { message })?;
-        open_renderer_persistent_store_admitted(&state, &operation_guard, &app_data_dir)
+        let opened = open_renderer_persistent_store_admitted(&state, &operation_guard, &app_data_dir)?;
+        start_retired_purge(&app, &state);
+        Ok(opened)
     })())
 }
 
@@ -2423,7 +2484,8 @@ mod tests {
                 .expect("stage abandoned root");
         }
 
-        let reopened = PersistentStore::open(directory.path()).expect("recover persistent store");
+        let mut reopened = PersistentStore::open(directory.path()).expect("recover persistent store");
+        while reopened.purge_retired_batch(64).expect("purge retired libraries") {}
         let revision_before_sweep = reopened.revision().expect("read revision before sweep");
         let root_before_sweep = reopened.read_root(None).expect("read root before sweep");
 
@@ -2448,6 +2510,40 @@ mod tests {
                 .expect("count swept P4 database staging rows");
             assert_eq!(remaining, 0, "{table}");
         }
+    }
+
+    #[test]
+    fn retired_purge_steps_skip_maintenance_and_a_held_store() {
+        let directory = tempdir().unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        for username in ["first", "second"] {
+            let stage = store.replace_begin().unwrap();
+            store.replace_put_root(&stage.staging_id, &json!({ "username": username })).unwrap();
+            let revision = store.revision().unwrap();
+            store.replace_commit(&stage.staging_id, Some(revision)).unwrap();
+        }
+        let state = PersistentStoreState::with_test_store(store);
+        let maintenance = state.acquire_raw_capture().unwrap();
+        assert_eq!(state.purge_retired_step(1).unwrap(), None);
+        drop(maintenance);
+        {
+            let _held = state.store.lock().unwrap();
+            assert_eq!(state.purge_retired_step(1).unwrap(), None);
+        }
+        assert_eq!(state.purge_retired_step(1).unwrap(), Some(true));
+        let mut steps = 1;
+        while state.purge_retired_step(1).unwrap() == Some(true) {
+            steps += 1;
+        }
+        assert!(steps > 1);
+        let store = state.store.lock().unwrap();
+        let retired: i64 = store
+            .as_ref()
+            .unwrap()
+            .connection
+            .query_row("SELECT COUNT(*) FROM generations WHERE state <> 'active'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(retired, 0);
     }
 
     #[test]
@@ -2574,6 +2670,7 @@ mod tests {
             snapshot_operations: Mutex::new(()),
             renderer_gate: Arc::new(RendererGate::default()),
             archive_operations: Mutex::new(HashMap::new()),
+            retired_purge_started: AtomicBool::new(false),
         });
         let barrier = Arc::new(Barrier::new(3));
         let active = Arc::new(AtomicUsize::new(0));

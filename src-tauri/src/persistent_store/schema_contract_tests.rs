@@ -15,6 +15,7 @@ fn all_live_tables_have_an_explicit_preservation_owner() {
     let local_operations = [
         "meta",
         "app_kv",
+        "generations",
         // Process-bound import claims are cleared on eligibility closure or store reopen.
         "plugin_claim_eligibility",
         "snapshot_leases",

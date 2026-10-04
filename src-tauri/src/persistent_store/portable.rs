@@ -466,6 +466,14 @@ impl PersistentStore {
             if digest_tables(&transaction, Some(&stage.staging_id), probe)? != expected {
                 return Err(invalid("portable staging changed raw SQL values"));
             }
+            let conversations = transaction
+                .prepare("SELECT character_id,conversation_id FROM conversations WHERE generation=?1")?
+                .query_map([&stage.staging_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            for (character, conversation) in conversations {
+                cancelled(probe)?;
+                super::commit::page_staged_conversation(&transaction, &stage.staging_id, &character, &conversation)?;
+            }
             cancelled(probe)?;
             transaction.commit()?;
             Ok(())

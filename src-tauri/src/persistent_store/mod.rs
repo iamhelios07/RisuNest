@@ -1485,10 +1485,22 @@ impl PersistentStore {
             "INSERT OR IGNORE INTO meta (key, value) VALUES (?1, ?2)",
             params!["activeGeneration", "\"revision-0\""],
         )?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO root (generation, value) VALUES (?1, ?2)",
-            params!["revision-0", "{}"],
+        let seeded: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM generations WHERE state = 'active')",
+            [],
+            |row| row.get(0),
         )?;
+        if !seeded {
+            let active = active_generation(&transaction)?;
+            transaction.execute(
+                "INSERT INTO generations (id, state) VALUES (?1, 'active')",
+                [&active],
+            )?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO root (generation, value) VALUES (?1, ?2)",
+                params![active, "{}"],
+            )?;
+        }
         transaction.commit()?;
         export::sweep_abandoned(&snapshots_dir)?;
         #[cfg(feature = "native-kei-upload-pilot")]
@@ -2126,6 +2138,12 @@ impl PersistentStore {
 
     pub(crate) fn replace_abort(&mut self, staging_id: &str) -> StoreResult<()> {
         commit::replace_abort(&mut self.connection, staging_id)
+    }
+
+    /// One bounded step of deleting libraries that an activation or the startup
+    /// sweep retired. Returns whether retired libraries remain.
+    pub(crate) fn purge_retired_batch(&mut self, limit_rows: usize) -> StoreResult<bool> {
+        commit::purge_retired_batch(&mut self.connection, limit_rows)
     }
 
     pub(crate) fn acquire_revision(&mut self, revision: i64) -> StoreResult<LeaseResult> {

@@ -123,10 +123,11 @@ fn confirm_restore_adoption_in_store(store:&PersistentStore,root:&Path,request:&
 fn require_activated_target(store:&PersistentStore,job:&DurableJob,revision:i64)->Result<()> {
     let intent:RestoreCommitIntent=serde_json::from_value(job.summary["restoreCommit"].clone()).map_err(|_|corrupt())?;
     let identity=store.external_identity().map_err(pds_error)?;
+    let activated=store.lww_activated_receipt(&intent.header.request_id).map_err(pds_error)?;
     if identity.store_id!=job.admission_identity.store_id
         || identity.library_epoch!=job.admission_identity.library_epoch
         || identity.selection_epoch!=job.admission_identity.selection_epoch
-        || identity.generation!=format!("revision-{revision}")
+        || activated.is_none_or(|(activated_revision,generation)|activated_revision!=revision || generation!=identity.generation)
         || store.lww_binding_authority().map_err(pds_error)?!=intent.header.binding_authority {
         return Err(ProviderError::new(ErrorKind::PreconditionFailed));
     }

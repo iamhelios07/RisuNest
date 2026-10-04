@@ -1288,8 +1288,12 @@ mod tests {
         assert!(store.snapshot_list().unwrap().is_empty());
         let db = rusqlite::Connection::open(target.join("persistent/persistent.sqlite")).unwrap();
         assert_eq!(
-            db.query_row::<i64, _, _>("SELECT count(*) FROM asset_aliases", [], |r| r.get(0))
-                .unwrap(),
+            db.query_row::<i64, _, _>(
+                "SELECT count(*) FROM asset_aliases WHERE generation=(SELECT id FROM generations WHERE state='active')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap(),
             0
         );
     }
@@ -1347,7 +1351,7 @@ mod tests {
             if !corrupt_existing {
                 let db = rusqlite::Connection::open(target.join("persistent/persistent.sqlite"))
                     .unwrap();
-                db.execute_batch("CREATE TRIGGER reject_replacement BEFORE DELETE ON root WHEN OLD.generation='revision-1' BEGIN SELECT RAISE(ABORT,'synthetic commit failure'); END;").unwrap();
+                db.execute_batch("CREATE TRIGGER reject_replacement BEFORE UPDATE ON generations BEGIN SELECT RAISE(ABORT,'synthetic commit failure'); END;").unwrap();
             }
             let jobs = directory.path().join("restore-job");
             fs::create_dir(&jobs).unwrap();
@@ -1382,7 +1386,7 @@ mod tests {
                 assert_eq!(observer.read_root(None).unwrap().value, expected);
                 let db = rusqlite::Connection::open(target.join("persistent/persistent.sqlite")).unwrap();
                 assert_eq!(db.query_row::<i64,_,_>("SELECT revision FROM lww_requests WHERE request_id=?1", [&job.id()], |row| row.get(0)).unwrap(), 2);
-                assert_eq!(db.query_row::<String,_,_>("SELECT object_hash FROM asset_aliases WHERE generation='revision-2' AND logical_key='assets/synthetic-0.bin'", [], |row| row.get(0)).unwrap(), hash);
+                assert_eq!(db.query_row::<String,_,_>("SELECT object_hash FROM asset_aliases WHERE generation=(SELECT id FROM generations WHERE state='active') AND logical_key='assets/synthetic-0.bin'", [], |row| row.get(0)).unwrap(), hash);
             } else {
                 assert_eq!(failure.code, "portable-backup-failed");
                 assert_eq!(failure.message, "device-storage-failed: Native backup section storage failed");

@@ -108,7 +108,7 @@ fn stage_count(store: &PersistentStore) -> i64 {
     store
         .connection
         .query_row(
-            "SELECT count(*) FROM root WHERE generation LIKE 'staging-%'",
+            "SELECT count(*) FROM generations WHERE state='staging'",
             [],
             |row| row.get(0),
         )
@@ -1087,8 +1087,8 @@ fn staged_rows(store: &PersistentStore) -> (i64, i64) {
     store
         .connection
         .query_row(
-            "SELECT (SELECT count(*) FROM root WHERE generation LIKE 'staging-%'),
-                    (SELECT count(*) FROM messages WHERE generation LIKE 'staging-%')",
+            "SELECT (SELECT count(*) FROM generations WHERE state='staging'),
+                    (SELECT count(*) FROM messages WHERE generation IN (SELECT id FROM generations WHERE state='staging'))",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
