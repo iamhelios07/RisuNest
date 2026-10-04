@@ -95,7 +95,7 @@ import { isTauriIOS, isTauriAndroid, isTauriDesktop } from "../platform";
 import { notifyDesktop } from "../desktopNotifications";
 import { classifyChatParserHistory } from '../chatParserHistory'
 import { getDeviceSettings } from '../storage/deviceSettings'
-import { cloneConversationMetadata } from '../storage/selectedConversationLifecycle'
+import { cloneConversationMetadata, isMetadataOnlySelectedConversation } from '../storage/selectedConversationLifecycle'
 import {
     attachHistoryWindow,
     getHistoryWindowStart,
@@ -1017,7 +1017,14 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
     DBState.db.statics.messages += 1
     selectedChar = get(selectedCharID)
     const nowChatroom = DBState.db.characters[selectedChar]
-    nowChatroom.lastInteraction = Date.now()
+    // A metadata-only conversation saves only its own messages and metadata,
+    // so the character detail is left as it was opened.
+    const characterDetailWritable = () => {
+        const owner = DBState.db.characters[selectedChar]
+        const conversation = owner?.chats[owner.chatPage]
+        return !conversation || !isMetadataOnlySelectedConversation(conversation)
+    }
+    if (characterDetailWritable()) nowChatroom.lastInteraction = Date.now()
     selectedChat = nowChatroom.chatPage
     const selectedConversation = boundedChat ?? nowChatroom.chats[selectedChat]
     const activeSession = getActiveConversationSession()
@@ -2592,7 +2599,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
             },
             incrementReloadKeys: () => {
                 if (!lifecycle.isTargetCurrent()) throw new PersistentMutationFencedError()
-                DBState.db.characters[selectedChar].reloadKeys += 1
+                if (characterDetailWritable()) DBState.db.characters[selectedChar].reloadKeys += 1
             },
         },
         callbacks: {
