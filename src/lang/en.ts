@@ -2410,6 +2410,16 @@ export const languageEnglish = {
             overflowScopeHelp:
                 'Choose whether UI elements that extend beyond a chat message (setting buttons, overlays, and so on) render only on the latest message or on every message. Choose All if a character you use does not display correctly. All may make scrolling long chats slightly slower.',
         },
+        ui: {
+            title: 'UI',
+            chatEditPopup: 'Edit chat messages in a popup',
+            chatEditPopupHelp: 'Pressing the chat edit button lets you edit the message in a popup.',
+        },
+        textEditor: {
+            open: 'Edit in popup',
+            close: 'Close',
+            save: 'Save',
+        },
         inlay: {
             optimizeFailed: 'Could not optimize the selected assets.',
             animationPreserved: 'Animation conversion was skipped. The original was saved.',
