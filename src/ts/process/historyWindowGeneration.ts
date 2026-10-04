@@ -1,8 +1,9 @@
 import type { ActiveConversationSession } from '../storage/activeConversationSession'
 import type { Chat } from '../storage/database.svelte'
-import type {
-    ConversationMessageMetadata,
-    PersistentRevisionLease,
+import {
+    CONVERSATION_RANGE_MAX_LIMIT,
+    type ConversationMessageMetadata,
+    type PersistentRevisionLease,
 } from '../storage/persistentDataStore'
 import type { WindowedConversationPersistenceAuthority } from '../storage/saveCoordinator'
 import {
@@ -12,8 +13,6 @@ import {
     type HistoryWindowReader,
     type HistoryWindowSelection,
 } from './historyWindowSelection'
-
-const METADATA_PAGE_SIZE = 128
 
 export type HistoryWindowMemoryMode = 'none' | 'hypaV3'
 
@@ -84,7 +83,7 @@ export async function readStoreMessageMetadata(
     if (!lease.readConversationMessageMetadataWindow) return null
     const rows: MessageMetadata[] = []
     for (let startIndex = 0; startIndex < authority.totalMessages;) {
-        const limit = Math.min(METADATA_PAGE_SIZE, authority.totalMessages - startIndex)
+        const limit = Math.min(CONVERSATION_RANGE_MAX_LIMIT, authority.totalMessages - startIndex)
         const page = await lease.readConversationMessageMetadataWindow(
             conversationQuery(authority, startIndex, limit),
         )

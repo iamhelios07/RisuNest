@@ -159,6 +159,17 @@ describe('prepareHistoryWindow', () => {
         expect(prepared.hypaPlan?.effectiveMessageMemos).toHaveLength(2000)
     })
 
+    it('reads HypaV3 message metadata in pages of the store range limit', async () => {
+        const all = messages(9000)
+        const { lease, metadataPages } = leaseOver(all)
+
+        const rows = await readStoreMessageMetadata(lease, authority(all.length), () => {})
+
+        expect(rows).toHaveLength(9000)
+        expect(rows?.at(-1)?.chatId).toBe('id-8999')
+        expect(metadataPages()).toBe(3)
+    })
+
     it('applies the queryChatCount floor for HypaV3', async () => {
         const all = messages(100)
         const { lease } = leaseOver(all)
