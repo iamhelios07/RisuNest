@@ -7,6 +7,7 @@ import {
     type CommitTransportDependencies,
     type SharedWebview,
 } from './nativeCommitTransport'
+import { MAX_NATIVE_REQUEST_BYTES, PayloadTooLargeError } from './nativePersistenceValue'
 
 function fixture(large = true): CommitEnvelope {
     return {
@@ -185,19 +186,29 @@ describe('native commit transport', () => {
         },
     )
 
-    it.each(['linux', 'ios', 'macos'] as const)(
-        'does not turn the Windows shared-buffer budget into a %s save limit',
+    it.each(['windows', 'android', 'linux', 'ios', 'macos'] as const)(
+        'refuses a commit above the request limit on %s before sending anything',
         async (os) => {
-            const h = harness({ windows: false, [os]: true })
-            const bytes = new Uint8Array(64 * 1024 * 1024 + 1)
-            h.encode.mockResolvedValueOnce(bytes)
-            await h.transport.commit(fixture())
-            expect(h.invoke).toHaveBeenCalledTimes(1)
-            expect(h.invoke.mock.calls[0][0]).toBe('pds_commit_raw')
-            expect(h.invoke.mock.calls[0][1]).toBe(bytes)
+            const h = harness({ windows: os === 'windows', [os]: true })
+            h.encode.mockResolvedValueOnce(new Uint8Array(MAX_NATIVE_REQUEST_BYTES + 1))
+            const refused = h.transport.commit(fixture())
+            await expect(refused).rejects.toBeInstanceOf(PayloadTooLargeError)
+            await expect(refused).rejects.toMatchObject({ code: 'payload-too-large', kind: 'commit', byteLength: MAX_NATIVE_REQUEST_BYTES + 1 })
+            expect(h.invoke).not.toHaveBeenCalled()
             expect(h.webview.addEventListener).not.toHaveBeenCalled()
+            await expect(h.transport.commit(fixture(false))).resolves.toBeDefined()
         },
     )
+
+    it.each(['linux', 'ios', 'macos'] as const)('sends a commit at the request limit raw on %s', async (os) => {
+        const h = harness({ windows: false, [os]: true })
+        const bytes = new Uint8Array(MAX_NATIVE_REQUEST_BYTES)
+        h.encode.mockResolvedValueOnce(bytes)
+        await h.transport.commit(fixture())
+        expect(h.invoke).toHaveBeenCalledTimes(1)
+        expect(h.invoke.mock.calls[0][0]).toBe('pds_commit_raw')
+        expect(h.invoke.mock.calls[0][1]).toBe(bytes)
+    })
 
     it('falls back before submission for non-cloneable values, but propagates encoding failures', async () => {
         const h = harness()
@@ -260,12 +271,6 @@ describe('native commit transport', () => {
             'pds_commit_android_cancel',
         ])
         expect(h.webview.addEventListener).not.toHaveBeenCalled()
-    })
-    it('retains JSON saves above the Android assembly limit, without raw number arrays', async () => {
-        const h = harness({ windows: false, android: true })
-        h.encode.mockResolvedValueOnce(new Uint8Array(64 * 1024 * 1024 + 1))
-        await h.transport.commit(fixture())
-        expect(h.invoke).toHaveBeenCalledExactlyOnceWith('pds_commit', fixture())
     })
     it('preserves Android clone fallback, errors and queue recovery', async () => {
         const h = harness({

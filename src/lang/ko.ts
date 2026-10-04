@@ -1742,6 +1742,7 @@ export const languageKorean = {
             failed: '변경 사항을 저장하지 못했습니다. 앱을 종료하기 전에 저장을 다시 시도해주세요.',
             invalid: '{0} 데이터를 저장하지 못했습니다. 해당 데이터를 확인한 후 저장을 다시 시도해주세요.',
             storage: '변경 사항을 저장하지 못했습니다. 저장 공간을 확보한 후 저장을 다시 시도해주세요.',
+            tooLarge: '변경 사항이 너무 커서 저장할 수 없습니다. 방금 추가한 큰 대화나 데이터를 삭제한 후 저장을 다시 시도해주세요.',
             settings: '설정', conversation: '대화', presets: '프리셋', plugins: '플러그인', assets: '에셋', data: '앱',
         },
         account: {

@@ -1927,6 +1927,7 @@ export const languageEnglish = {
             failed: 'Changes could not be saved. Retry saving before closing the app.',
             invalid: '{0} could not be saved. Check this data, then retry saving.',
             storage: 'Changes could not be saved. Free storage space, then retry saving.',
+            tooLarge: 'Changes are too large to save. Delete the large chat or data you just added, then retry saving.',
             settings: 'Settings', conversation: 'Chat', presets: 'Presets', plugins: 'Plugin data', assets: 'Assets', data: 'Data',
         },
         account: {

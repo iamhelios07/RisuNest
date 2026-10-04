@@ -15,6 +15,20 @@ export class UnsaveableValueError extends Error {
     }
 }
 
+/** Native persistence requests above this many UTF-8 JSON bytes are refused on every target. */
+export const MAX_NATIVE_REQUEST_BYTES = 64 * 1024 * 1024
+
+export type PayloadTooLargeKind = 'commit' | 'message' | 'character' | 'root' | 'preset' | 'plugin-value'
+
+/** Nothing of the refused request reached native storage. */
+export class PayloadTooLargeError extends Error {
+    readonly code = 'payload-too-large'
+    constructor(readonly kind: PayloadTooLargeKind, readonly byteLength: number) {
+        super(`Cannot save ${kind}: ${byteLength} bytes exceed the native request limit`)
+        this.name = 'PayloadTooLargeError'
+    }
+}
+
 /** Native JSON stores Unicode scalar values; preserve every valid code point exactly. */
 export function prepareNativePersistenceValue<T>(input: T, area = 'persistent data'): T {
     let replacements = 0

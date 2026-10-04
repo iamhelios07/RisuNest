@@ -1,4 +1,4 @@
-import { prepareNativePersistenceValue, UnsaveableValueError } from './nativePersistenceValue'
+import { MAX_NATIVE_REQUEST_BYTES, PayloadTooLargeError, prepareNativePersistenceValue, UnsaveableValueError } from './nativePersistenceValue'
 import { invoke } from '@tauri-apps/api/core'
 import { platform } from '@tauri-apps/plugin-os'
 import type { AssetAlias, WorkingSetCommit } from './persistentDataStore'
@@ -8,7 +8,6 @@ import {
 } from './androidBinaryCommitBridge'
 import {
     ANDROID_LARGE_COMMIT_SIZE,
-    MAX_ANDROID_COMMIT_BYTES,
     sendAndroidCommit,
 } from './androidCommitTransport'
 
@@ -17,7 +16,6 @@ export interface CommitEnvelope {
     assetAliases: AssetAlias[]
 }
 export const LARGE_COMMIT_BYTES = 1024 * 1024
-export const MAX_SHARED_COMMIT_BYTES = 64 * 1024 * 1024
 const PROBE_VISITS = 4096
 
 /** A bounded routing hint, not another full JSON serialization on the UI thread. */
@@ -119,10 +117,10 @@ export class NativeCommitTransport {
             }
             throw error
         }
+        // The Android transport assembles at most this much, and every target
+        // keeps the same limit so a save that works on one works on all.
+        if (bytes.byteLength > MAX_NATIVE_REQUEST_BYTES) throw new PayloadTooLargeError('commit', bytes.byteLength)
         if (android) {
-            // Keep the existing large-save contract beyond the bounded assembly budget.
-            if (bytes.byteLength > MAX_ANDROID_COMMIT_BYTES)
-                return deps.invoke('pds_commit', { ...prepareNativePersistenceValue(input) })
             return sendAndroidCommit(
                 bytes,
                 deps.invoke,
@@ -131,8 +129,7 @@ export class NativeCommitTransport {
         }
         if (rawPlatform) return this.sendRaw(bytes)
         const webview = deps.shared()
-        if (!webview || bytes.byteLength > MAX_SHARED_COMMIT_BYTES)
-            return this.sendRaw(bytes)
+        if (!webview) return this.sendRaw(bytes)
         const requestId = crypto.randomUUID()
         let buffer: ArrayBuffer | undefined
         let nativeId: string | undefined
