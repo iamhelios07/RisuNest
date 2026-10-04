@@ -326,7 +326,7 @@ pub(crate) fn after_stage_batch(hook: Option<Box<dyn FnMut(usize, std::time::Dur
 }
 
 /// One write a stage batch holds: a record's own rows, declaring how many
-/// messages it has, or a run of those messages.
+/// messages it has, or a run of those messages, `last` when it ends them.
 enum StageWrite {
     Record {
         record: PreparedRecord,
@@ -337,6 +337,7 @@ enum StageWrite {
         conversation_id: String,
         first: usize,
         messages: Vec<rows::SerializedMessage>,
+        last: bool,
     },
 }
 
@@ -401,6 +402,7 @@ impl StageBatch {
                     conversation_id: conversation_id.clone(),
                     first,
                     messages: run,
+                    last: messages.peek().is_none(),
                 });
                 first += count;
             }
@@ -419,8 +421,10 @@ impl StageBatch {
 
     /// Writes the batch, provided the library is still at the revision the
     /// stage was prepared against: a local edit ends the stage at the next
-    /// batch rather than at activation. Cancellation is only asked before the
-    /// transaction begins, never while it commits.
+    /// batch rather than at activation. A conversation whose last messages the
+    /// batch writes is paged in it, so activation reads its manifest instead
+    /// of its messages. Cancellation is only asked before the transaction
+    /// begins, never while it commits.
     fn write(
         &mut self,
         connection: &mut rusqlite::Connection,
@@ -442,32 +446,58 @@ impl StageBatch {
                 actual: actual_revision,
             });
         }
+        let mut complete = Vec::new();
         for write in self.writes.drain(..) {
             match write {
                 StageWrite::Record {
                     record,
                     message_count,
-                } => rows::apply_serialized_record_rows(
-                    &transaction,
-                    generation,
-                    &record.locator,
-                    &record.envelope,
-                    message_count,
-                )?,
+                } => {
+                    rows::apply_serialized_record_rows(
+                        &transaction,
+                        generation,
+                        &record.locator,
+                        &record.envelope,
+                        message_count,
+                    )?;
+                    if let LogicalRecordLocator::Conversation {
+                        character_id,
+                        conversation_id,
+                    } = record.locator
+                    {
+                        if message_count == 0 {
+                            complete.push((character_id, conversation_id));
+                        }
+                    }
+                }
                 StageWrite::Messages {
                     character_id,
                     conversation_id,
                     first,
                     messages,
-                } => rows::insert_serialized_messages(
-                    &transaction,
-                    generation,
-                    &character_id,
-                    &conversation_id,
-                    first,
-                    &messages,
-                )?,
+                    last,
+                } => {
+                    rows::insert_serialized_messages(
+                        &transaction,
+                        generation,
+                        &character_id,
+                        &conversation_id,
+                        first,
+                        &messages,
+                    )?;
+                    if last {
+                        complete.push((character_id, conversation_id));
+                    }
+                }
             }
+        }
+        for (character_id, conversation_id) in complete {
+            super::commit::page_staged_conversation(
+                &transaction,
+                generation,
+                &character_id,
+                &conversation_id,
+            )?;
         }
         transaction.commit()?;
         self.records = 0;

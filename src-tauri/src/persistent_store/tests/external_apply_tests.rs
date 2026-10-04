@@ -1084,6 +1084,37 @@ fn one_long_conversation_is_staged_in_bounded_transactions() {
     assert_eq!(store.finish_prepared_replace(prepared).unwrap().revision, 2);
 }
 
+/// Activation reads no message to page an external stage: each conversation
+/// was paged as its last messages were staged, whether they arrived in the
+/// batch that wrote the conversation or several batches later.
+#[test]
+fn activating_an_external_stage_reads_no_messages_for_paging() {
+    for long in [true, false] {
+        let (directory, mut store) = open_store();
+        let prepared = if long {
+            let (staged, committed) =
+                stage_long_conversation(directory.path(), &mut store, 20_000, 0, &NeverCancelled, |_| {});
+            assert!(committed.len() >= 3, "{committed:?}");
+            staged.unwrap()
+        } else {
+            let staging = directory.path().join("download");
+            fs::create_dir(&staging).unwrap();
+            stage_wide(&mut store, &staging, 600, false).unwrap()
+        };
+        super::super::message_pages::reset_capture_work();
+        super::super::hash_work::reset_hash_work();
+        assert_eq!(store.finish_prepared_replace(prepared).unwrap().revision, 2);
+        let pages = super::super::message_pages::take_capture_work();
+        let hashes = super::super::hash_work::take_hash_work();
+        assert_eq!(pages.capture_calls, 0, "long {long}: {pages:?}");
+        assert_eq!(pages.work.messages_read, 0, "long {long}: {pages:?}");
+        assert_eq!(pages.work.pages_written, 0, "long {long}: {pages:?}");
+        for domain in ["native_message_verify", "native_page_identity"] {
+            assert!(!hashes.domains.contains_key(domain), "long {long}, {domain}: {hashes:?}");
+        }
+    }
+}
+
 /// F03. Heavy messages close a batch by their bytes, even inside one
 /// conversation.
 #[test]
