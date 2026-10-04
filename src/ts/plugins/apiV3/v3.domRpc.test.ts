@@ -19,6 +19,8 @@ const mocks = vi.hoisted(() => ({
     permissionValues: new Map<string, unknown>(),
     providers: new Map<string, Function>(),
     patchConversation: vi.fn(async (): Promise<unknown> => ({ status: 'applied', revision: 4 })),
+    listHostTools: vi.fn(async (_owner: string): Promise<unknown> => ({ scope: 'scope', tools: [] })),
+    callHostTool: vi.fn(async (_owner: string, _request: unknown, _signal?: AbortSignal): Promise<unknown> => []),
 }))
 
 const ownedStorageStub = {
@@ -136,6 +138,15 @@ vi.mock('../pluginChatOutputListeners', () => ({
     registerChatOutputListener: vi.fn(), removeChatOutputListener: vi.fn(),
 }))
 vi.mock('src/ts/conversationMutations', () => ({ appendCurrentConversationMessage: vi.fn() }))
+vi.mock('../hostToolHost', () => ({
+    hostToolBridge: {
+        forPlugin: (owner: string) => ({
+            listTools: () => mocks.listHostTools(owner),
+            callTool: (request: unknown, signal?: AbortSignal) => mocks.callHostTool(owner, request, signal),
+        }),
+    },
+    registerOwnedPluginMCP: vi.fn(),
+}))
 vi.mock('../conversationPatchAccess', () => ({
     createConversationPatchAccess: () => ({ patchConversation: mocks.patchConversation }),
 }))
@@ -582,6 +593,38 @@ function __postToParent(message) {
         expect(request).toMatchObject({ characterId: 'char', conversationId: 'conv', mutationId: 'guest-patch' })
         expect(Object.hasOwn(request.messages[0].set, '__gone')).toBe(true)
         expect(Object.hasOwn(request.messages[0].expected, '__old')).toBe(true)
+    })
+
+    it('reaches the private host tools from the guest under the db permission', async () => {
+        vi.mocked(linkPluginQueryAbortSignals).mockImplementation(() => ({ signal: new AbortController().signal, dispose() {} }))
+        const listed = { scope: 'scope-a', tools: [{ source: 'internal:dice', sourceName: 'Dice', name: 'rollDice', inputSchema: { type: 'object' } }] }
+        mocks.listHostTools.mockResolvedValueOnce(listed)
+        mocks.callHostTool.mockResolvedValueOnce([{ type: 'text', text: 'Rolled 1d6: 4' }])
+        await startFixture('tool-caller', 'globalThis.rpcReady = Promise.resolve()')
+
+        const result = JSON.parse(String(await guest('tool-caller', `
+            const list = await risuai.risunestListHostTools();
+            const content = await risuai.risunestCallHostTool({ scope: list.scope, source: 'internal:dice', name: 'rollDice', arguments: { notation: '1d6' } });
+            return JSON.stringify({ list, content });
+        `)))
+        expect(result).toEqual({ list: listed, content: [{ type: 'text', text: 'Rolled 1d6: 4' }] })
+        expect(mocks.listHostTools).toHaveBeenCalledWith('tool-caller')
+        expect(mocks.callHostTool).toHaveBeenCalledWith('tool-caller',
+            { scope: 'scope-a', source: 'internal:dice', name: 'rollDice', arguments: { notation: '1d6' } }, expect.any(AbortSignal))
+
+        mocks.confirm.mockResolvedValue(false)
+        await startFixture('denied-tool-caller', 'globalThis.rpcReady = Promise.resolve()')
+        const errors = JSON.parse(String(await guest('denied-tool-caller', `
+            const errors = [];
+            for (const call of [() => risuai.risunestListHostTools(), () => risuai.risunestCallHostTool({ scope: 's', source: 'internal:dice', name: 'rollDice' })]) {
+                try { await call(); } catch (error) { errors.push(error.message); }
+            }
+            return JSON.stringify(errors);
+        `))) as string[]
+        expect(errors).toHaveLength(2)
+        for (const error of errors) expect(error).toContain('db permission')
+        expect(mocks.listHostTools).toHaveBeenCalledTimes(1)
+        expect(mocks.callHostTool).toHaveBeenCalledTimes(1)
     })
 
     it('registers message buttons with roles and hands the clicked message to the guest', async () => {

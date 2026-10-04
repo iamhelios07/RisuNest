@@ -133,6 +133,7 @@ async function setup(database = makeDatabase()) {
     const api = createRisunestPrivateApi({
         databaseAccess: { readConversationContext: vi.fn() },
         patchAccess: access,
+        hostTools: { listTools: vi.fn(), callTool: vi.fn() },
         hasDatabasePermission: async () => true,
         lifetimeSignal: new AbortController().signal,
     })

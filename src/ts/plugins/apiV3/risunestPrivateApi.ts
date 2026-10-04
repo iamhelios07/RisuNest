@@ -8,6 +8,8 @@ import {
     type ConversationPatchResult,
 } from '../conversationPatch'
 import type { ConversationPatchAccess } from '../conversationPatchAccess'
+import { normalizeHostToolCallInput, type HostToolAccess, type HostToolList } from '../hostToolBridge'
+import type { RPCToolCallContent } from '../../process/mcp/mcplib'
 import { linkPluginQueryAbortSignals, type PluginDatabaseAccess } from '../pluginDatabaseAccess'
 
 // Methods for RisuNest's own plugins. They are not part of the public plugin API and
@@ -16,6 +18,7 @@ import { linkPluginQueryAbortSignals, type PluginDatabaseAccess } from '../plugi
 export interface RisunestPrivateApiDependencies {
     databaseAccess: Pick<PluginDatabaseAccess, 'readConversationContext'>
     patchAccess: ConversationPatchAccess
+    hostTools: HostToolAccess
     /** The periodic `db` permission, the one `getDatabase` asks for. */
     hasDatabasePermission(): Promise<boolean>
     lifetimeSignal: AbortSignal
@@ -37,6 +40,9 @@ function inputSignal(input: unknown): AbortSignal | undefined {
 
 export function createRisunestPrivateApi(dependencies: RisunestPrivateApiDependencies) {
     const patchLedger = createConversationPatchLedger(dependencies.now)
+    async function requireDatabasePermission(): Promise<void> {
+        if (!(await dependencies.hasDatabasePermission())) throw new Error('Host tools require the db permission')
+    }
     return {
         async readConversationContext(input?: unknown): Promise<ConversationContext | null> {
             const request = normalizeConversationContextInput(input)
@@ -69,6 +75,23 @@ export function createRisunestPrivateApi(dependencies: RisunestPrivateApiDepende
                     linked.dispose()
                 }
             })
+        },
+        async listHostTools(): Promise<HostToolList> {
+            await requireDatabasePermission()
+            throwIfAborted(dependencies.lifetimeSignal)
+            return dependencies.hostTools.listTools()
+        },
+        async callHostTool(input?: unknown): Promise<RPCToolCallContent[]> {
+            const request = normalizeHostToolCallInput(input)
+            const linked = linkPluginQueryAbortSignals(inputSignal(input), dependencies.lifetimeSignal)
+            try {
+                throwIfAborted(linked.signal)
+                await requireDatabasePermission()
+                throwIfAborted(linked.signal)
+                return await dependencies.hostTools.callTool(request, linked.signal)
+            } finally {
+                linked.dispose()
+            }
         },
     }
 }

@@ -70,6 +70,7 @@ import {
 } from "../pluginDatabaseAccess";
 import { createRisunestPrivateApi } from './risunestPrivateApi';
 import { conversationPatchAccess } from '../conversationPatchHost';
+import { hostToolBridge, registerOwnedPluginMCP } from '../hostToolHost';
 import { additionalMessageButtons, normalizeMessageButtonRoles, type MessageButtonDef, type MessageButtonTarget } from '../messageButtons.svelte';
 
 /*
@@ -775,6 +776,7 @@ const makeRisuaiAPIV3 = (
     const risunest = createRisunestPrivateApi({
         databaseAccess,
         patchAccess: conversationPatchAccess,
+        hostTools: hostToolBridge.forPlugin(plugin.name),
         hasDatabasePermission: () => getPluginPermission(permissionContext, 'db', 'periodically'),
         lifetimeSignal: pluginLifetime.signal,
     })
@@ -963,6 +965,10 @@ const makeRisuaiAPIV3 = (
             risunest.readConversationContext(input),
         risunestPatchConversation: (input?: unknown) =>
             risunest.patchConversation(input),
+        risunestListHostTools: () =>
+            risunest.listHostTools(),
+        risunestCallHostTool: (input?: unknown) =>
+            risunest.callHostTool(input),
 
         installPlugin: handlePluginInstallViaPlugin,
 
@@ -1356,7 +1362,7 @@ const makeRisuaiAPIV3 = (
             addPluginUnloadCallback(plugin.name, () => removePluginChatPanels(plugin.name));
             return {id};
         },
-        registerMCP: registerMCPModule,
+        registerMCP: (...args: Parameters<typeof registerMCPModule>) => registerOwnedPluginMCP(plugin.name, ...args),
         unregisterMCP: unregisterMCPModule,
         unregisterUIPart: (id: string) => {
             const removeFromMenuStore = (menuStore: MenuDef[]) => {
