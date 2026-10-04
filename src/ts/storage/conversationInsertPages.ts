@@ -1,5 +1,6 @@
 import type { Message } from './database.svelte'
 import type { ConversationMutation, WorkingSetCommit } from './persistentDataStore'
+import { jsonByteLength } from './nativePersistenceValue'
 
 /** Message bytes of inserted conversations in one commit of a split save. */
 export const CONVERSATION_INSERT_PAGE_BYTES = 16 * 1024 * 1024
@@ -15,20 +16,10 @@ export interface ConversationInsertPlan {
 export const createsConversation = (mutation: ConversationMutation): mutation is ReplaceRange & { configuredIndex: number } =>
     mutation.type === 'replace-range' && mutation.configuredIndex !== undefined
 
-function jsonBytes(value: unknown): number {
-    const text = JSON.stringify(value) ?? ''
-    let bytes = text.length
-    for (let index = 0; index < text.length; index++) {
-        const code = text.charCodeAt(index)
-        if (code >= 0x80) bytes += code >= 0x800 && (code < 0xd800 || code > 0xdfff) ? 2 : 1
-    }
-    return bytes
-}
-
 function messagePages(messages: Message[], pageBytes: number): { messages: Message[]; bytes: number }[] {
     const pages = [{ messages: [] as Message[], bytes: 0 }]
     for (const message of messages) {
-        const bytes = jsonBytes(message) + 1
+        const bytes = jsonByteLength(message) + 1
         let page = pages[pages.length - 1]
         if (page.messages.length > 0 && page.bytes + bytes > pageBytes) {
             page = { messages: [], bytes: 0 }

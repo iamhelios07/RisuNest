@@ -2023,6 +2023,51 @@ impl PersistentStore {
         )
     }
 
+    pub(crate) fn replace_put_conversation(
+        &mut self,
+        staging_id: &str,
+        character_id: &str,
+        configured_index: i64,
+        conversation: &Value,
+        message_count: i64,
+        last_message_time: Option<&Value>,
+    ) -> StoreResult<()> {
+        commit::replace_put_conversation(
+            &mut self.connection,
+            staging_id,
+            character_id,
+            configured_index,
+            conversation,
+            message_count,
+            last_message_time,
+        )
+    }
+
+    pub(crate) fn replace_add_presets(
+        &mut self,
+        staging_id: &str,
+        presets: &[Value],
+    ) -> StoreResult<()> {
+        commit::replace_add_presets(&mut self.connection, staging_id, presets)
+    }
+
+    pub(crate) fn replace_add_plugin_storage_values(
+        &mut self,
+        staging_id: &str,
+        values: &[PluginStorageValue],
+    ) -> StoreResult<()> {
+        commit::replace_add_plugin_storage_values(&mut self.connection, staging_id, values)
+    }
+
+    pub(crate) fn replace_add_plugin_storage(
+        &mut self,
+        staging_id: &str,
+        storage: &serde_json::Map<String, Value>,
+        meta: Option<&serde_json::Map<String, Value>>,
+    ) -> StoreResult<()> {
+        commit::replace_add_plugin_storage(&mut self.connection, staging_id, storage, meta)
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn replace_commit(
         &mut self,

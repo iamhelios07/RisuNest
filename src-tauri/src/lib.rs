@@ -844,6 +844,8 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         android_commit_transport::pds_commit_android_finish,
         #[cfg(target_os = "android")]
         android_commit_transport::pds_commit_android_cancel,
+        #[cfg(target_os = "android")]
+        android_commit_transport::pds_replace_android_finish,
         #[cfg(any(windows, target_os = "linux", target_os = "ios", target_os = "macos"))]
         persistent_commit_raw::pds_commit_raw,
         persistent_store::lww_commands::pds_lww_read_outbox,
@@ -869,6 +871,12 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         persistent_store::commands::pds_replace_begin,
         persistent_store::commands::pds_replace_put_root,
         persistent_store::commands::pds_replace_put_presets,
+        persistent_store::commands::pds_replace_add_presets,
+        persistent_store::commands::pds_replace_add_plugin_storage_values,
+        persistent_store::commands::pds_replace_add_plugin_storage,
+        persistent_store::commands::pds_replace_put_character_detail,
+        persistent_store::commands::pds_replace_put_conversation,
+        persistent_store::commands::pds_replace_add_conversation_messages,
         persistent_store::commands::pds_replace_add_characters,
         persistent_store::commands::pds_replace_put_asset_aliases,
         persistent_store::commands::pds_replace_put_asset_owner_heads,

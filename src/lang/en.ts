@@ -2807,6 +2807,10 @@ export const languageEnglish = {
                 'Other changes happened during the import, so it could not be applied. Try again.',
             reasonStoreError: 'A storage error stopped the import.',
             reasonUnknown: 'An unknown error occurred.',
+            reasonTooLarge: '{0} is too large to import.',
+            tooLargeItems: {
+                root: 'Settings data', preset: 'A preset', character: 'A character', conversation: 'A chat', message: 'A message', 'plugin-value': 'Plugin data',
+            },
             warningCleanupFailed:
                 'A temporary file could not be cleaned up. It will be retried at startup.',
             warningUpstreamRestoreLosses: 'Some cold storage or inlay data could not be restored. Review the restored data.',

@@ -2620,6 +2620,10 @@ export const languageKorean = {
                 '가져오는 동안 다른 변경이 있어 적용하지 못했습니다. 다시 시도하세요.',
             reasonStoreError: '저장소 오류로 가져오지 못했습니다.',
             reasonUnknown: '알 수 없는 오류가 발생했습니다.',
+            reasonTooLarge: '{0} 크기가 너무 커서 가져오지 못했습니다.',
+            tooLargeItems: {
+                root: '설정', preset: '프리셋', character: '캐릭터', conversation: '대화', message: '메시지', 'plugin-value': '플러그인 데이터',
+            },
             warningCleanupFailed:
                 '임시 파일을 정리하지 못했습니다. 다음 시작 때 다시 시도합니다.',
             warningUpstreamRestoreLosses: '콜드 스토리지 또는 인레이 데이터 일부를 복원하지 못했습니다. 복원된 데이터를 확인해주세요.',

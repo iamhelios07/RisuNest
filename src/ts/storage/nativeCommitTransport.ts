@@ -1,4 +1,4 @@
-import { MAX_NATIVE_REQUEST_BYTES, PayloadTooLargeError, prepareNativePersistenceValue, UnsaveableValueError } from './nativePersistenceValue'
+import { MAX_NATIVE_REQUEST_BYTES, PayloadTooLargeError, prepareNativePersistenceValue, UnsaveableValueError, utf8ByteLength, type PayloadTooLargeKind } from './nativePersistenceValue'
 import { invoke } from '@tauri-apps/api/core'
 import { platform } from '@tauri-apps/plugin-os'
 import type { AssetAlias, WorkingSetCommit } from './persistentDataStore'
@@ -16,7 +16,10 @@ export interface CommitEnvelope {
     assetAliases: AssetAlias[]
 }
 export const LARGE_COMMIT_BYTES = 1024 * 1024
+/** An ordinary invoke carries one staged replace request up to this many bytes. */
+export const STAGED_REQUEST_BYTES = 4 * 1024 * 1024
 const PROBE_VISITS = 4096
+const textEncoder = new TextEncoder()
 
 /** A bounded routing hint, not another full JSON serialization on the UI thread. */
 export function isLargeCommit(value: unknown, threshold = LARGE_COMMIT_BYTES): boolean {
@@ -74,6 +77,32 @@ export class NativeCommitTransport {
         const run = this.pending.then(() => this.send(input))
         this.pending = run.catch(() => undefined)
         return run
+    }
+
+    /**
+     * Sends one staged replace request. Every target refuses a request above
+     * the native limit before sending it, and Android sends one above the
+     * ordinary budget in chunks, in turn with commits.
+     */
+    async stage(command: string, kind: PayloadTooLargeKind, args: Record<string, unknown>): Promise<void> {
+        const json = JSON.stringify(args)
+        const head = `{"command":${JSON.stringify(command)},"args":`
+        const byteLength = utf8ByteLength(head) + utf8ByteLength(json) + 1
+        if (byteLength > MAX_NATIVE_REQUEST_BYTES) throw new PayloadTooLargeError(kind, byteLength)
+        const deps = this.dependencies
+        if (!(deps.android?.() ?? false) || byteLength <= STAGED_REQUEST_BYTES) {
+            await deps.invoke(command, args)
+            return
+        }
+        const body = textEncoder.encode(`${head}${json}}`)
+        const run = this.pending.then(() => sendAndroidCommit<void>(
+            body,
+            deps.invoke,
+            deps.androidBinary ? deps.androidBinary() : getAndroidBinaryCommitBridge(),
+            'pds_replace_android_finish',
+        ))
+        this.pending = run.catch(() => undefined)
+        await run
     }
 
     private async sendRaw(bytes: Uint8Array): Promise<{ revision: number }> {
