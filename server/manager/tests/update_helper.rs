@@ -1167,7 +1167,9 @@ async fn installer_guard_records_restart_failure_after_accepted_corrupt_server_s
     let (source_server, source_manager) = explicit_test_binaries();
     let expected_server = fs::read(&source_server).unwrap();
     let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("synthetic-data");
+    // The manager CLI and its guard resolve the root, so the test must name
+    // the same scheduled task when it checks and removes registrations.
+    let root = platform::resolve_manager_root(&temp.path().join("synthetic-data")).unwrap();
     let install = temp.path().join("managed-install");
     fs::create_dir_all(&root).unwrap();
     fs::create_dir_all(&install).unwrap();
@@ -1240,11 +1242,10 @@ async fn live_corrupt_replacement_rollback(
         .await
         .map_err(|error| format!("lifecycle-stop:{error}"))?;
 
-    let error = run_helper(root, server, 4_000_000, install)
-        .await
-        .expect_err("the corrupt target must fail local health verification");
-    if error != "updated-server-health-failed" {
-        return Err(format!("corrupt-target-error:{error}"));
+    match run_helper(root, server, 4_000_000, install).await {
+        Err(error) if error == "updated-server-health-failed" => {}
+        Err(error) => return Err(format!("corrupt-target-error:{error}")),
+        Ok(outcome) => return Err(format!("corrupt-target-accepted:{outcome:?}")),
     }
     let restored = wait_for_authenticated_status(&client)
         .await
@@ -1265,12 +1266,14 @@ async fn live_corrupt_replacement_rollback(
     {
         return Err("corrupt-target-manager-not-restored".into());
     }
-    let transaction = InstallTransaction::load(root, install)
+    if InstallTransaction::load(root, install)
         .map_err(|error| format!("transaction-load:{error}"))?
-        .ok_or("rollback-transaction-missing")?;
+        .is_some()
+    {
+        return Err("rollback-transaction-remains".into());
+    }
     let status = load_status(root).map_err(|error| format!("status-load:{error}"))?;
-    if transaction.phase != TransactionPhase::RolledBack
-        || status.phase != UpdatePhase::Failed
+    if status.phase != UpdatePhase::Failed
         || status.reason.as_deref() != Some("updated-server-health-failed")
         || status.last_failed_version.as_deref() != Some(target)
     {
@@ -1285,7 +1288,7 @@ async fn live_corrupt_replacement_rollback(
 async fn helper_rolls_back_a_corrupt_live_replacement_and_restarts_the_old_server() {
     let (source_server, source_manager) = explicit_test_binaries();
     let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("synthetic-data");
+    let root = platform::resolve_manager_root(&temp.path().join("synthetic-data")).unwrap();
     let install = temp.path().join("managed-install");
     let staged = temp.path().join(".risunest-sync-update-stage-corrupt-live");
     let backup = temp
