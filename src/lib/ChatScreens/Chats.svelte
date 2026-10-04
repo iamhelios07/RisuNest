@@ -49,6 +49,7 @@
     import { alertNormal } from 'src/ts/alert'
     import cloneDeep from 'lodash/cloneDeep'
     import isEqual from 'lodash/isEqual'
+    import { chatViewEvents } from 'src/ts/plugins/chatViewHost.svelte'
 
     let {
         messages,
@@ -175,6 +176,7 @@
     let projectionReconcileQueued = false
     let projectionReconcileGeneration = 0
     let destroyed = false
+    const chatView = chatViewEvents.createReporter()
     let hasMountedUsableRow = false
     let initialRowsLoading = $state(false)
     let initialRowsLoadFailed = $state(false)
@@ -985,6 +987,16 @@
                 ? (userIconPortrait ?? false)
                 : ((currentCharacter as character).largePortrait ?? false)
             const activeStreamingMessage = index === activeStreamingIndex && message.role === 'char'
+            const chatViewReport = {
+                characterId: currentCharacter.chaId,
+                conversationId: currentChat?.id,
+                index,
+                message,
+                streaming:
+                    currentChat?.isStreaming === true &&
+                    index === totalMessages - 1 &&
+                    message.role === 'char',
+            }
             const bookmarked = currentChat?.bookmarks?.includes(message.chatId ?? '') ?? false
             const renderSignature = createChatRenderSignature({
                 message,
@@ -1131,6 +1143,7 @@
                             renderSignatures.set(key, renderSignature)
                             if (parserProjectionState) parserProjectionState.needsRemount = false
                             clearQueuedRowHeight(element)
+                            chatView.rendered(key, chatViewReport)
                             settleRowMountWaiters(key, true)
                             return
                         }
@@ -1191,6 +1204,7 @@
                         initialRowsLoading = false
                         initialRowsLoadFailed = false
                         completePendingMissingRowsAnchor(key)
+                        chatView.rendered(key, chatViewReport)
                         settleRowMountWaiters(key, true)
                     },
                 })
@@ -1198,6 +1212,7 @@
                 pendingRowMounts.delete(key)
                 clearQueuedRowHeight(element)
                 const instance = mountInstances.get(key)
+                let refreshedDisplay = false
                 if ((sourceHandoff || preserveMountedRuntime) && viewportRow && activeViewportSource && sourceSnapshot) {
                     const source = activeViewportSource
                     instance?.updateViewportBinding?.({
@@ -1235,6 +1250,7 @@
                     )
                     renderSignatures.set(key, renderSignature)
                     parserProjectionState.needsRemount = false
+                    refreshedDisplay = true
                 }
                 if (deferRemountForEditor && parserProjectionState?.needsRemount) {
                     // The replacement projection aborted the retained lease. Keep the
@@ -1248,6 +1264,11 @@
                         }),
                     )
                     parserProjectionState.needsRemount = false
+                    refreshedDisplay = true
+                }
+                if (instance) {
+                    if (refreshedDisplay) chatView.rendered(key, chatViewReport)
+                    else chatView.updated(key, chatViewReport)
                 }
             }
 
@@ -1469,6 +1490,7 @@
             sourceHandoffRuntimeKeys.add(nextKey)
             const element = mountedElements.get(nextKey)
             if (element) element.dataset.chatRenderKey = nextKey
+            chatView.moved(previousKey, nextKey)
         }
     }
 
@@ -1579,6 +1601,7 @@
         }
         renderSignatures.delete(key)
         sourceHandoffRuntimeKeys.delete(key)
+        chatView.removed(key)
     }
 
     function releaseRowRuntimeState(key: string, preserveParserProjection = false): void {
@@ -2418,6 +2441,7 @@
         activeViewportSource = null
         clearScheduledWork()
         clearMountedRows()
+        chatView.dispose()
         renderSignatures.clear()
         measuredHeights.clear()
         measuredHeightIndices.clear()

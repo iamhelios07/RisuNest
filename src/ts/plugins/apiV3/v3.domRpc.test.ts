@@ -11,6 +11,7 @@ import {
     loadV3Plugins,
 } from './v3.svelte'
 import { additionalMessageButtons } from '../messageButtons.svelte'
+import { chatViewEvents } from '../chatViewHost.svelte'
 
 const mocks = vi.hoisted(() => ({
     database: null as any,
@@ -21,6 +22,7 @@ const mocks = vi.hoisted(() => ({
     patchConversation: vi.fn(async (): Promise<unknown> => ({ status: 'applied', revision: 4 })),
     listHostTools: vi.fn(async (_owner: string): Promise<unknown> => ({ scope: 'scope', tools: [] })),
     callHostTool: vi.fn(async (_owner: string, _request: unknown, _signal?: AbortSignal): Promise<unknown> => []),
+    chatViewFrames: [] as Array<() => void>,
 }))
 
 const ownedStorageStub = {
@@ -147,6 +149,18 @@ vi.mock('../hostToolHost', () => ({
     },
     registerOwnedPluginMCP: vi.fn(),
 }))
+vi.mock('../chatViewHost.svelte', async () => {
+    const { createChatViewEvents } = await import('../chatViewEvents')
+    let nextId = 0
+    return {
+        chatViewEvents: createChatViewEvents({
+            readConversation: () => ({ characterId: 'char', conversationId: 'conv', characterIndex: 1, chatIndex: 0 }),
+            watchConversation: () => () => undefined,
+            requestFrame: (callback) => { mocks.chatViewFrames.push(callback) },
+            createId: () => `chat-view-${++nextId}`,
+        }),
+    }
+})
 vi.mock('../conversationPatchAccess', () => ({
     createConversationPatchAccess: () => ({ patchConversation: mocks.patchConversation }),
 }))
@@ -663,6 +677,44 @@ function __postToParent(message) {
         expect(buttons().map(({ id }) => id)).toEqual(['translate'])
         await loadV3Plugins([])
         expect(additionalMessageButtons).toHaveLength(0)
+    })
+
+    it('delivers chat view events to the guest until unregisterUIPart or unload', async () => {
+        const name = 'chat-view'
+        await startFixture(name, `
+            globalThis.viewEvents = [];
+            globalThis.rpcReady = (async () => {
+                globalThis.viewId = (await risuai.risunestOnChatView((event) => { globalThis.viewEvents.push(event); })).id;
+            })();
+        `)
+        const reporter = chatViewEvents.createReporter()
+        const report = (index: number) => ({
+            characterId: 'char', conversationId: 'conv', index, message: { role: 'char', chatId: `m-${index}` }, streaming: false,
+        })
+        const runFrames = () => { for (const frame of mocks.chatViewFrames.splice(0)) frame() }
+        const received = async () => JSON.parse(String(await guest(name, 'return JSON.stringify(globalThis.viewEvents)')))
+        try {
+            reporter.rendered('row-4', report(4))
+            runFrames()
+            await vi.waitFor(async () => expect(await received()).toEqual([
+                { type: 'conversation', characterId: 'char', conversationId: 'conv', characterIndex: 1, chatIndex: 0 },
+                { type: 'rows', characterId: 'char', conversationId: 'conv', mounted: [{ index: 4, messageId: 'm-4', role: 'char' }], unmounted: [], rerendered: [] },
+            ]))
+
+            await guest(name, 'await risuai.unregisterUIPart(globalThis.viewId); return true')
+            reporter.rendered('row-5', report(5))
+            expect(mocks.chatViewFrames).toHaveLength(0)
+            expect(await received()).toHaveLength(2)
+
+            await guest(name, 'await risuai.risunestOnChatView(() => {}); return true')
+            expect(mocks.chatViewFrames).toHaveLength(1)
+            runFrames()
+            await loadV3Plugins([])
+            reporter.rendered('row-6', report(6))
+            expect(mocks.chatViewFrames).toHaveLength(0)
+        } finally {
+            reporter.dispose()
+        }
     })
 
     it('does not log RPC request or response payloads when DEV is false', async () => {

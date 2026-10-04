@@ -69,6 +69,7 @@ import {
     type PluginFullObjectCallContext,
 } from "../pluginDatabaseAccess";
 import { createRisunestPrivateApi } from './risunestPrivateApi';
+import { chatViewEvents } from '../chatViewHost.svelte';
 import { conversationPatchAccess } from '../conversationPatchHost';
 import { hostToolBridge, registerOwnedPluginMCP } from '../hostToolHost';
 import { additionalMessageButtons, normalizeMessageButtonRoles, type MessageButtonDef, type MessageButtonTarget } from '../messageButtons.svelte';
@@ -777,6 +778,7 @@ const makeRisuaiAPIV3 = (
         databaseAccess,
         patchAccess: conversationPatchAccess,
         hostTools: hostToolBridge.forPlugin(plugin.name),
+        chatView: chatViewEvents.forOwner(plugin.name),
         hasDatabasePermission: () => getPluginPermission(permissionContext, 'db', 'periodically'),
         lifetimeSignal: pluginLifetime.signal,
     })
@@ -969,6 +971,8 @@ const makeRisuaiAPIV3 = (
             risunest.listHostTools(),
         risunestCallHostTool: (input?: unknown) =>
             risunest.callHostTool(input),
+        risunestOnChatView: (callback?: unknown) =>
+            risunest.onChatView(callback),
 
         installPlugin: handlePluginInstallViaPlugin,
 
@@ -1378,6 +1382,7 @@ const makeRisuaiAPIV3 = (
             removeFromMenuStore(additionalChatMenu);
             removeFromMenuStore(additionalMessageButtons);
             removeChatPanel(id);
+            risunest.unregisterUIPart(id);
         },
         log: (message:string) => {
             console.log(`[RisuAI Plugin: ${plugin.name}] ${message}`);

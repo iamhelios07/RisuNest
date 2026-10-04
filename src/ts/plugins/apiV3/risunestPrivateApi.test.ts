@@ -11,14 +11,16 @@ function setup(granted: boolean | Promise<boolean> = true) {
     const patchConversation = vi.fn(async (_request: unknown, _signal?: AbortSignal): Promise<ConversationPatchResult> => ({ status: 'applied', revision: 2 }))
     const listTools = vi.fn(async () => ({ scope: 'scope', tools: [] }))
     const callTool = vi.fn(async (_request: unknown, _signal?: AbortSignal) => [{ type: 'text' as const, text: 'done' }])
+    const chatView = { register: vi.fn(() => ({ id: 'view-1' })), unregister: vi.fn(), dispose: vi.fn() }
     const api = createRisunestPrivateApi({
         databaseAccess: { readConversationContext },
         patchAccess: { patchConversation },
         hostTools: { listTools, callTool },
+        chatView,
         hasDatabasePermission,
         lifetimeSignal: lifetime.signal,
     })
-    return { api, context, readConversationContext, hasDatabasePermission, lifetime, patchConversation, listTools, callTool }
+    return { api, context, readConversationContext, hasDatabasePermission, lifetime, patchConversation, listTools, callTool, chatView }
 }
 
 describe('risunestReadConversationContext', () => {
@@ -176,5 +178,30 @@ describe('risunest host tools', () => {
         await api.callHostTool(input)
         expect(seen?.aborted).toBe(true)
         await expect(api.listHostTools()).rejects.toMatchObject({ name: 'AbortError' })
+    })
+})
+
+describe('risunestOnChatView', () => {
+    it('registers without asking for a permission and unregisters through unregisterUIPart', () => {
+        const { api, chatView, hasDatabasePermission } = setup()
+        const callback = vi.fn()
+
+        expect(api.onChatView(callback)).toEqual({ id: 'view-1' })
+        expect(chatView.register).toHaveBeenCalledWith(callback)
+        expect(hasDatabasePermission).not.toHaveBeenCalled()
+        api.unregisterUIPart('view-1')
+        expect(chatView.unregister).toHaveBeenCalledWith('view-1')
+        api.unregisterUIPart(1)
+        expect(chatView.unregister).toHaveBeenCalledTimes(1)
+        expect(() => api.onChatView('not a function')).toThrow(TypeError)
+    })
+
+    it("drops the plugin's listeners on unload and refuses new ones", () => {
+        const { api, chatView, lifetime } = setup()
+        lifetime.abort()
+
+        expect(chatView.dispose).toHaveBeenCalledTimes(1)
+        expect(() => api.onChatView(vi.fn())).toThrow(expect.objectContaining({ name: 'AbortError' }))
+        expect(chatView.register).not.toHaveBeenCalled()
     })
 })
