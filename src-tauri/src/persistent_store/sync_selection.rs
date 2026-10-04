@@ -605,6 +605,7 @@ impl super::PersistentStore {
         Ok(id)
     }
 
+    #[cfg(test)]
     pub(crate) fn register_lww_binding_stage(&self, inspection_id: &str, staging_id: &str, receive_id: &str, changes: &[super::lww::Change]) -> StoreResult<()> {
         self.register_lww_binding_stage_with(inspection_id, staging_id, receive_id, changes, true)
     }
