@@ -566,6 +566,28 @@ describe('external storage production integration', () => {
         expect(mocks.refreshWorkingSet).not.toHaveBeenCalled()
     })
 
+    it('unlocks an unfinished restore once it is stopped', async () => {
+        const { installExternalStorageProduction, requestExternalStorageRestore } = await import('./production')
+        const recovery = await import('./applicationRecovery')
+        await installExternalStorageProduction()
+        const unfinished = (id: string) => ({
+            ...succeeded('old-sync', '8'), id, kind: 'restore', state: 'uncertain',
+            phase: 'local-apply-unknown', applicationStarted: true, result: undefined,
+        })
+        mocks.bridge.startJob.mockImplementation(async (_request, id) => unfinished(id))
+        await expect(requestExternalStorageRestore('old-sync', 'snapshot-1', ['library'])).rejects.toThrow()
+        expect(recovery.hasPendingExternalApplication()).toBe(true)
+        expect(mocks.releaseFence).not.toHaveBeenCalled()
+
+        mocks.bridge.startJob.mockImplementation(async (_request, id) => ({
+            ...unfinished(id), state: 'failed', phase: 'paused', restoreStopped: true,
+        }))
+        await expect(recovery.retryExternalApplication()).rejects.toThrow()
+        expect(recovery.hasPendingExternalApplication()).toBe(false)
+        expect(mocks.releaseFence).toHaveBeenCalledOnce()
+        expect(mocks.refreshWorkingSet).not.toHaveBeenCalled()
+    })
+
     it('retains the replacement fence through authoritative restore plugin reload and adoption', async () => {
         const {
             installExternalStorageProduction,

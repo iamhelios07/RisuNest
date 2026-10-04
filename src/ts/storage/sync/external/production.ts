@@ -446,7 +446,8 @@ export async function requestExternalStorageRestore(
                             continue
                         }
                         if (job.state === 'succeeded') throw new Error('External restore has no commit receipt')
-                        if (['failed', 'cancelled'].includes(job.state) && job.applicationStarted !== true) {
+                        if (['failed', 'cancelled'].includes(job.state)
+                            && (job.applicationStarted !== true || job.restoreStopped === true)) {
                             return { kind: 'not-applied', error: restoreFailure(job) }
                         }
                         if (['failed', 'cancelled', 'uncertain', 'conflict'].includes(job.state)) {
