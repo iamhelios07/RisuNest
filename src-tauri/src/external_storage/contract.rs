@@ -415,6 +415,10 @@ impl Cancellation {
         self.0.cancelled.store(true, Ordering::Release);
         self.0.notify.notify_waiters();
     }
+    /// Whether both handles share one token.
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
     pub fn check(&self) -> Result<()> {
         if self.0.cancelled.load(Ordering::Acquire)
             || self.0.external_flag.as_ref().is_some_and(|flag| flag.load(Ordering::Acquire))

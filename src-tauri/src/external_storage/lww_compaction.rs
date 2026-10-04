@@ -50,13 +50,13 @@ impl CompactionTurn {
     }
 }
 
-fn maintenance_due(checkpoints:&[Checkpoint],segments:&[ObjectReceipt])->Result<bool> {
+fn maintenance_due<C:lww_checkpoint::Covering>(checkpoints:&[C],segments:&[ObjectReceipt])->Result<bool> {
     let retained=lww_checkpoint::retained(checkpoints)?;
     if retained.len()>1 {return Ok(true);}
-    let checkpoints=checkpoints.iter().filter(|checkpoint|retained.contains(&checkpoint.snapshot_id));
+    let checkpoints=checkpoints.iter().filter(|checkpoint|retained.contains(checkpoint.snapshot_id()));
     let mut coverage=super::lww_checkpoint::Coverage::new();
     for checkpoint in checkpoints {
-        for (writer,prefix) in &checkpoint.covered_prefixes {
+        for (writer,prefix) in checkpoint.covered_prefixes() {
             let current=coverage.entry(writer.clone()).or_insert(risunest_sync_wire::stamp::DecimalU64(0));
             *current=(*current).max(*prefix);
         }
@@ -148,12 +148,51 @@ fn live_published_objects(state:&PublishedState,capture:&mut super::capture::Cap
     }
     Ok((live,conservative))
 }
+/// The snapshots one connection already classified, keyed by the receipt that
+/// names their bytes. An ordinary snapshot is kept as not a checkpoint.
+#[derive(Default)]
+pub(crate) struct CheckpointSummaries {
+    scope:String,
+    classified:BTreeMap<ReceiptKey,Option<lww_checkpoint::CheckpointSummary>>,
+}
+type ReceiptKey=(String,Option<String>,String,u64,Option<String>);
+fn receipt_key(receipt:&ObjectReceipt)->ReceiptKey {
+    (receipt.locator.connection_identity.clone(),receipt.locator.collection.clone(),receipt.locator.object.clone(),
+        receipt.byte_length,receipt.version.as_ref().map(|version|version.0.clone()))
+}
 impl ExternalLwwEngine {
     /// The retained checkpoints when compaction is due.
+    #[cfg(test)]
     pub(crate) async fn maintenance_needed(&self,cancel:&Cancellation)->Result<Option<BTreeSet<String>>> {
-        let checkpoints=self.checkpoints(cancel).await?.into_iter().map(|(_,checkpoint)|checkpoint).collect::<Vec<_>>();
+        self.maintenance_needed_cached(&Default::default(),cancel).await
+    }
+    /// `maintenance_needed` reading only the snapshots `cache` has not classified.
+    pub(crate) async fn maintenance_needed_cached(&self,cache:&tokio::sync::Mutex<CheckpointSummaries>,cancel:&Cancellation)->Result<Option<BTreeSet<String>>> {
+        let checkpoints=self.checkpoint_summaries(cache,cancel).await?;
         if !maintenance_due(&checkpoints,&self.listing(cancel).await?)? {return Ok(None)}
         Ok(Some(lww_checkpoint::retained(&checkpoints)?))
+    }
+    /// Every published checkpoint's summary. Only a snapshot whose receipt
+    /// `cache` has not classified is read.
+    pub(crate) async fn checkpoint_summaries(&self,cache:&tokio::sync::Mutex<CheckpointSummaries>,cancel:&Cancellation)->Result<Vec<lww_checkpoint::CheckpointSummary>> {
+        let mut cache=cache.lock().await;
+        let scope=format!("{}\n{}\n{}",self.target_scope(),self.repository.repository_id,self.descriptor.repository_id);
+        if cache.scope!=scope {*cache=CheckpointSummaries{scope,classified:BTreeMap::new()};}
+        let mut classified=BTreeMap::new();let mut output=Vec::new();
+        for receipt in self.snapshot_receipts(cancel).await? {
+            receipt.locator.validate_for(&self.repository)?;
+            let key=receipt_key(&receipt);
+            // An incomplete receipt is never answered from the cache, so it is refused.
+            let known=if receipt.complete {cache.classified.get(&key).cloned()} else {None};
+            let summary=match known {
+                Some(summary)=>summary,
+                None=>self.classified_checkpoint(&receipt,cancel).await?.map(|(_,checkpoint)|lww_checkpoint::CheckpointSummary::of(&checkpoint)),
+            };
+            output.extend(summary.clone());
+            classified.insert(key,summary);
+        }
+        cache.classified=classified;
+        Ok(output)
     }
     pub(super) async fn refresh_packed_sources(&self,sources:&[super::lww_residency::PackedSource],directory:&Path,cancel:&Cancellation)->Result<Vec<super::lww_residency::PackedSource>> {
         let mut wanted=BTreeMap::new();

@@ -1725,16 +1725,27 @@ impl ExternalLwwEngine {
             .authorize_lww_new_device(&preparation.authorization_id)
             .map_err(store_error)
     }
+    #[cfg(test)]
     pub(crate) async fn receive_requests(
         &self,
         store: &mut PersistentStore,
         authority: DecimalU64,
         cancel: &Cancellation,
     ) -> Result<Vec<StageReceive>> {
+        self.receive_requests_cached(store, authority, &Default::default(), cancel).await
+    }
+    /// `receive_requests` reading only the snapshots `checkpoints` has not classified.
+    pub(crate) async fn receive_requests_cached(
+        &self,
+        store: &mut PersistentStore,
+        authority: DecimalU64,
+        checkpoints: &tokio::sync::Mutex<super::lww_compaction::CheckpointSummaries>,
+        cancel: &Cancellation,
+    ) -> Result<Vec<StageReceive>> {
         let progress=store.lww_receive_progress(authority).map_err(store_error)?;
         let current=progress.into_iter().filter(|p|p.kind=="external").filter_map(|p|p.writer_id.map(|w|(w,p.cursor))).collect::<BTreeMap<_,_>>();
         let mut covered=BTreeMap::new();
-        for (_,snapshot) in self.checkpoints(cancel).await? {
+        for snapshot in self.checkpoint_summaries(checkpoints, cancel).await? {
             for (writer,prefix) in snapshot.covered_prefixes {
                 let value=covered.entry(writer).or_insert(DecimalU64(0));
                 *value=(*value).max(prefix);
