@@ -199,7 +199,7 @@ fn status_counts_bodies_by_holder_and_forgets_a_removed_connection() {
     let split = status(&f.b);
     assert_eq!((split["serverObjects"].as_u64(), split["remoteObjects"].as_u64(), split["unavailableObjects"].as_u64()), (Some(1), Some(2), Some(0)));
     assert_eq!(split["externalObjects"], serde_json::json!([{"connectionId":"receiver","objects":1}]));
-    lww_residency::remove_connection_sources(f.directory_b.path(), "receiver").unwrap();
+    f.b.forget_external_connection_bodies("receiver").unwrap();
     assert!(lww_residency::stat(f.directory_b.path(), &external).unwrap().is_none());
     let removed = status(&f.b);
     assert_eq!((removed["serverObjects"].as_u64(), removed["remoteObjects"].as_u64(), removed["unavailableObjects"].as_u64()), (Some(1), Some(1), Some(1)));
@@ -231,4 +231,47 @@ fn download_without_a_policy_change_skips_bodies_no_storage_holds() {
     assert!(f.b.external_lww_object_is_local(&held).unwrap());
     assert!(!f.b.external_lww_object_is_local(&external).unwrap());
     assert_eq!(status(&f.b)["unavailableObjects"].as_u64(), Some(1));
+}
+
+/// Registers the source of `from` again for `hash`, through `connection`.
+fn copy_source(root: &std::path::Path, from: &str, hash: &str, connection: &str) {
+    let db = rusqlite::Connection::open(root.join("external-sync").join("remote-bodies.sqlite")).unwrap();
+    let copied = ["sources", "packed_sources"].iter().map(|table| db.execute(&format!(
+        "INSERT INTO {table}(hash,library,source) SELECT ?2,library||?3,json_set(source,'$.hash',?2,'$.connectionId',?3) FROM {table} WHERE hash=?1"),
+        rusqlite::params![from, hash, connection]).unwrap()).sum::<usize>();
+    assert_eq!(copied, 1);
+}
+
+fn catalog_row(root: &std::path::Path, hash: &str, size: u64) {
+    let db = rusqlite::Connection::open(root.join("persistent").join(crate::persistent_store::DATABASE_FILE)).unwrap();
+    db.execute("INSERT INTO asset_objects(object_hash,byte_size,created_at_ms) VALUES(?1,?2,0)", rusqlite::params![hash, size as i64]).unwrap();
+}
+
+#[test]
+fn removing_a_connection_forgets_catalog_rows_only_it_held() {
+    let mut f = CycleFixture::new();
+    let (_server, held, external) = split_holders(&mut f);
+    let root = f.directory_b.path().to_owned();
+    let connection = receiver_connection(&f);
+    ConnectionStore::open(&root).unwrap().insert(&connection.stored).unwrap();
+    let _resolver = lww_residency::install_test_source_connection(&root, Arc::new(connection)).unwrap();
+    f.b.asset_residency_download_remote(Some("receiver"), None, None, || Ok(())).unwrap();
+    let size = f.b.asset_object_byte_size(&external).unwrap().expect("the received body has a catalog row");
+    // Rows registered before their bodies arrived, as admission and restore leave them.
+    let (orphan, shared) = (format!("{:064x}", 1), format!("{:064x}", 2));
+    for hash in [&orphan, &shared] {
+        catalog_row(&root, hash, size);
+        copy_source(&root, &external, hash, "receiver");
+    }
+    copy_source(&root, &external, &shared, "other");
+    copy_source(&root, &external, &held, "receiver");
+    f.b.forget_external_connection_bodies("receiver").unwrap();
+    assert_eq!(f.b.asset_object_byte_size(&orphan).unwrap(), None, "no file, source or custody holds it");
+    assert_eq!(f.b.asset_object_byte_size(&external).unwrap(), Some(size), "a local body keeps its row");
+    assert_eq!(f.b.asset_object_byte_size(&shared).unwrap(), Some(size), "another connection still holds it");
+    assert!(f.b.asset_object_byte_size(&held).unwrap().is_some(), "server custody still holds it");
+    assert!(lww_residency::stat(&root, &orphan).unwrap().is_none());
+    assert!(lww_residency::stat(&root, &external).unwrap().is_none());
+    assert_eq!(lww_residency::stat(&root, &shared).unwrap(), Some(size));
+    f.b.asset_gc_dry_run(1024, None, super::runtime::now_ms() as i64, 0).unwrap();
 }

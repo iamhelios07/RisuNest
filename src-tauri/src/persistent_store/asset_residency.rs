@@ -80,6 +80,33 @@ impl PersistentStore {
         ).optional()?;
         Ok(size.and_then(|size| u64::try_from(size).ok()))
     }
+    /// Forgets the bodies a removed external connection held, with the catalog
+    /// rows of those that no local file, other source or server custody holds
+    /// any more, which GC would otherwise find missing.
+    pub(crate) fn forget_external_connection_bodies(&self, connection_id: &str) -> Result<()> {
+        let _guard = crate::asset_repository::coordinator::lock_repository_mutation()?;
+        let cas = PayloadCas::new(&self.repository_root)?;
+        let residency = match Residency::exists(&self.repository_root) {
+            true => Some(Residency::open(&self.repository_root)?),
+            false => None,
+        };
+        crate::external_storage::lww_residency::remove_connection_sources(&self.repository_root, connection_id, |orphans| {
+            let rows = self.connection.unchecked_transaction().map_err(std::io::Error::other)?;
+            for hash in orphans {
+                if cas.stat_object(hash)?.is_some() {
+                    continue;
+                }
+                if let Some(residency) = &residency {
+                    if residency.custody_size(hash).map_err(|error| std::io::Error::other(error.code))?.is_some() {
+                        continue;
+                    }
+                }
+                rows.execute("DELETE FROM asset_objects WHERE object_hash=?1", [hash]).map_err(std::io::Error::other)?;
+            }
+            rows.commit().map_err(std::io::Error::other)
+        })
+        .map_err(|error| SyncError { cause: Some(format!("{:?}", error.kind)), ..SyncError::new("local-storage", 503) })
+    }
     pub(crate) fn selected_character_asset_hashes(&self, character_id: &str) -> super::StoreResult<Vec<String>> {
         let generation = super::active_generation(&self.connection)?;
         let mut roots = crate::asset_repository::migration_gc::AssetRootSet::default();
