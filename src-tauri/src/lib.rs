@@ -14,11 +14,15 @@ mod boot_marker;
 mod windows_session;
 mod cold_payload_codec;
 mod data_health;
+#[cfg(any(windows, target_os = "linux"))]
+mod desktop_session;
 pub(crate) mod device_backup;
 mod external_storage;
 pub mod import_export_jobs;
 #[cfg(target_os = "ios")]
 mod ios_lifecycle;
+#[cfg(target_os = "linux")]
+mod linux_session;
 #[cfg(target_os = "linux")]
 mod linux_webview;
 #[allow(dead_code)]
@@ -491,10 +495,10 @@ fn builder_with_main_window(
             .relaunch_args(opened_files::relaunch_arguments(std::env::args_os(), std::env::current_dir().ok().as_deref()))
             .build());
     }
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     {
-        builder = builder.manage(windows_session::SessionState::default())
-            .append_invoke_initialization_script(include_str!("windows_lifecycle.js"));
+        builder = builder.manage(desktop_session::SessionState::default())
+            .append_invoke_initialization_script(include_str!("desktop_lifecycle.js"));
     }
 
     builder
@@ -537,6 +541,8 @@ fn builder_with_main_window(
                 renderer_access?;
                 #[cfg(windows)]
                 windows_session::install(app.handle())?;
+                #[cfg(target_os = "linux")]
+                linux_session::install(app.handle());
                 #[cfg(target_os = "macos")]
                 macos_lifecycle::install_native_quit(app.handle())?;
                 #[cfg(any(target_os = "android", target_os = "ios"))]
@@ -713,8 +719,8 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         macos_lifecycle::macos_exit_response,
         #[cfg(desktop)]
         opened_files::desktop_relaunch,
-        #[cfg(windows)]
-        windows_session::desktop_flush_complete,
+        #[cfg(any(windows, target_os = "linux"))]
+        desktop_session::desktop_flush_complete,
         #[cfg(any(windows, target_os = "linux"))]
         renderer_recovery::desktop_close_ack,
         #[cfg(not(target_os = "android"))]

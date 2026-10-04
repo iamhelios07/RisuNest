@@ -97,7 +97,7 @@ import {
     listenRecoveredAndroidScreenshotPublications,
 } from "./nativeScreenshotArchiveWriter";
 import { initializeIOSNative, installIOSPersistenceLifecycle } from "./iosNative";
-import { restartNativeApp, schedulePeriodicNativeSnapshot } from "./storage/nativePersistentMaintenance";
+import { checkpointNativePersistentStore, restartNativeApp, schedulePeriodicNativeSnapshot } from "./storage/nativePersistentMaintenance";
 import { yieldToUi } from './ui/yieldToUi'
 import { markBootStage, markBootSuspect } from './storage/bootAttempt'
 import {
@@ -719,7 +719,9 @@ export async function loadData() {
         disposeLifecycleCommitListeners ??= registerLifecycleCommitListeners(
             (reason) => flushLifecycle(
                 reason,
-                isTauriDesktop && nativePlatform() === 'windows' && reason === 'stop',
+                isTauriDesktop
+                    && (nativePlatform() === 'windows' || nativePlatform() === 'linux')
+                    && reason === 'stop',
             ),
             syncExitCoordinator,
         )
@@ -734,6 +736,10 @@ export async function loadData() {
             )
             disposeMacosLifecycle = await registerMacosLifecycle({
                 coordinator: syncExitCoordinator,
+                saveLocally: async () => {
+                    await flushLifecycle('stop', true)
+                    await checkpointNativePersistentStore('truncate')
+                },
             })
         }
 
