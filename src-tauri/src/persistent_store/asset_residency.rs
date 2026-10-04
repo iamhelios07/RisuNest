@@ -37,6 +37,12 @@ impl ResidencyStatus {
 }
 
 impl PersistentStore {
+    pub(crate) fn asset_object_byte_size(&self, hash: &str) -> super::StoreResult<Option<u64>> {
+        let size: Option<i64> = self.connection.query_row(
+            "SELECT byte_size FROM asset_objects WHERE object_hash=?1", [hash], |row| row.get(0),
+        ).optional()?;
+        Ok(size.and_then(|size| u64::try_from(size).ok()))
+    }
     pub(crate) fn selected_character_asset_hashes(&self, character_id: &str) -> super::StoreResult<Vec<String>> {
         let generation = super::active_generation(&self.connection)?;
         let mut roots = crate::asset_repository::migration_gc::AssetRootSet::default();

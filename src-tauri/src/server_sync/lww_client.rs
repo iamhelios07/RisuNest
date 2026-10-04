@@ -458,7 +458,6 @@ impl LwwClient {
         fit_push_page(&mut request, &mut entries)?;
         let cache = Cache::open(&store.repository_root().join("server-sync/lww-cache"))?
             .with_library(store.repository_root())?;
-        let transfer = Transfer::new(&self.client, &cache)?;
         let mut objects = BTreeSet::new();
         for entry in &entries {
             self.check()?;
@@ -533,28 +532,40 @@ impl LwwClient {
                 }
             }
         }
+        let check = || self.check();
+        let mut previous = super::previous_storage::PreviousStorage::new(
+            store.repository_root(),
+            &check,
+            self.cancelled.clone(),
+        );
         for hash in &objects {
             if cache.stat_object(hash)?.is_none() {
                 if let Some(body) = store.lww_object_body(hash)? {
                     cache.put(&body)?;
+                } else {
+                    previous.observe(store, hash)?;
                 }
             }
         }
-        transfer.upload_with_hints(
-            &objects.into_iter().collect::<Vec<_>>(),
-            &[],
-            false,
-            &std::collections::BTreeMap::new(),
-        )?;
+        Transfer::new(&self.client, &cache)?
+            .with_held(&previous)
+            .upload_with_hints(
+                &objects.into_iter().collect::<Vec<_>>(),
+                &[],
+                false,
+                &std::collections::BTreeMap::new(),
+            )?;
+        let config = self
+            .access
+            .clone()
+            .or(store.server_stored_config()?)
+            .ok_or_else(|| SyncError::new("server-unconfigured", 409))?;
+        previous.retain(&self.client, &config)?;
         let publication = Publication {
             authority: header.binding_authority,
             request,
             entries,
-            config: self
-                .access
-                .clone()
-                .or(store.server_stored_config()?)
-                .ok_or_else(|| SyncError::new("server-unconfigured", 409))?,
+            config,
         };
         let body = self.log.prepare(&publication)?;
         self.check()?;
