@@ -10,6 +10,7 @@
     import { getAssetResidencyStatus, setAssetResidencyPolicy, evictLocalAssets, cancelAssetResidencyOperation, type AssetResidencyStatus } from 'src/ts/storage/sync/serverAssetResidency'
     import { describeBlockedReason } from 'src/ts/storage/sync/blockedReasonText'
     import type { ServerConfig } from 'src/ts/storage/sync/serverSync'
+    import { PREVIOUS_FILES_DOWNLOAD_FAILED } from 'src/ts/storage/sync/bindingFlow'
     import SettingGroup from '../RisuNest/SettingGroup.svelte'
     import SettingRow from '../RisuNest/SettingRow.svelte'
     import SettingButton from '../RisuNest/SettingButton.svelte'
@@ -40,6 +41,8 @@
         if (token === 'unit-too-large') return language.lwwSync.unitTooLarge
         if (token === 'device-credential-unavailable') return copy.credentialUnavailable
         if (token === 'unauthorized' || token === 'invalid-device-token') return language.lwwSync.registrationRevoked
+        if (token === PREVIOUS_FILES_DOWNLOAD_FAILED) return language.lwwSync.downloadFailedNotConnected
+        if (token === 'previous-storage-unavailable') return language.lwwSync.previousStorageUnavailable
         if (token.startsWith('qr-')) return token.includes('permission') ? copy.cameraDenied : copy.cameraUnavailable
         return copy.errorHelp
     }

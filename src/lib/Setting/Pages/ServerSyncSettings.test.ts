@@ -113,6 +113,8 @@ it.each([
     { error: 'unauthorized', text: languageEnglish.lwwSync.registrationRevoked },
     { error: 'invalid-device-token', text: languageEnglish.lwwSync.registrationRevoked },
     { error: 'device-credential-unavailable', text: languageEnglish.risuNest.serverSync.credentialUnavailable },
+    { error: 'previous-files-download-failed', text: languageEnglish.lwwSync.downloadFailedNotConnected },
+    { error: 'previous-storage-unavailable', text: languageEnglish.lwwSync.previousStorageUnavailable },
 ])('explains "$error" instead of the generic sync error', async ({ error, text }) => {
     f.view = { status: { configured: true, bound: true }, paused: true, error }
     component = mount(ServerSyncSettings, { target: host, props: { connectTarget: vi.fn() } })
