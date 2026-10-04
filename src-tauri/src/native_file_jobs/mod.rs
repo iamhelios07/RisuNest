@@ -3471,7 +3471,6 @@ pub(crate) enum JobStage {
     PreparingAttachments,
     ReadingDatabase,
     DecodingDatabase,
-    StagingCharacters,
     FinalizingStaging,
     AwaitingActivation,
     Activating,

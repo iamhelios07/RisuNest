@@ -1012,7 +1012,6 @@ fn reference_stage_legacy_database<R: Read>(
     let character_total = characters.len() as u64;
     reader.counts.characters_total = Some(character_total);
     reader.counts.presets = presets.len() as u64;
-    reader.report_stage_items(JobStage::StagingCharacters, 0, Some(character_total))?;
     let mut start = 0;
     while start < characters.len() {
         if job.is_cancel_requested() {
@@ -1034,11 +1033,6 @@ fn reference_stage_legacy_database<R: Read>(
             .map_err(store_error)?;
         start = end;
         reader.counts.characters = start as u64;
-        reader.report_stage_items(
-            JobStage::StagingCharacters,
-            start as u64,
-            Some(character_total),
-        )?;
     }
 
     job.set_phase(JobPhase::StagingDatabase)
