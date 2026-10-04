@@ -234,6 +234,31 @@ pub(crate) fn carry_operation_log(
     tx.commit()?;
     Ok(())
 }
+/// The stored registration's credential, or none when this device can no longer read it.
+fn readable(stored: &StoredConfig, root: &std::path::Path) -> Result<Option<super::client::ServerConfig>> {
+    match stored.resolve(root) {
+        Ok(config) => Ok(Some(config)),
+        Err(error) if error.code == "device-credential-unavailable" => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+/// Settles the stored registration's pending publications before a binding change. Without a
+/// readable credential nothing can be asked, and the change goes ahead.
+pub(crate) fn fence_stored(store: &mut PersistentStore, new_device: bool) -> Result<()> {
+    let Some(stored) = store.server_stored_config()? else {
+        return Ok(());
+    };
+    let Some(config) = readable(&stored, store.repository_root())? else {
+        return Ok(());
+    };
+    let mut core = LwwClient::new(store.repository_root(), config)?;
+    core.access = Some(stored);
+    if new_device {
+        core.fence_new_device(store)
+    } else {
+        fence_for_binding_change(&core, store)
+    }
+}
 /// Settles pending publications before a binding change. When a publication's server does not
 /// answer, the switch proceeds and carries or detaches that publication instead of waiting.
 pub(crate) fn fence_for_binding_change(core: &LwwClient, store: &mut PersistentStore) -> Result<()> {
@@ -300,12 +325,12 @@ pub(crate) fn prepare_new_device(
         return Err(SyncError::new("binding-stage-integrity", 409));
     }
     let old = store.server_stored_config()?;
-    if let Some(old) = &old {
-        LwwClient::new(
-            store.repository_root(),
-            old.resolve(store.repository_root())?,
-        )?
-        .fence_new_device(store)?;
+    let old_config = match &old {
+        Some(old) => readable(old, store.repository_root())?,
+        None => None,
+    };
+    if let Some(config) = &old_config {
+        LwwClient::new(store.repository_root(), config.clone())?.fence_new_device(store)?;
     }
     let preparation = store.prepare_lww_new_device(header, staging_id)?;
     let core = LwwClient::new(
@@ -315,16 +340,9 @@ pub(crate) fn prepare_new_device(
     let same = old
         .as_ref()
         .is_some_and(|old| old.library_id == stage.target.config.library_id);
-    let former_token = if same {
-        Some(
-            old.as_ref()
-                .unwrap()
-                .resolve(store.repository_root())?
-                .token,
-        )
-    } else {
-        None
-    };
+    // An old credential this device cannot read leaves that registration listed on the server.
+    let former_token = old_config.filter(|_| same).map(|config| config.token);
+    let former = former_token.is_some();
     let (_, receipt): (_, NewDeviceClaimReceipt) = core.client.json(
         reqwest::Method::POST,
         "session/claim-writer",
@@ -341,7 +359,7 @@ pub(crate) fn prepare_new_device(
         || receipt.device_id != stage.target.config.device_id
         || receipt.library_id != stage.target.config.library_id
         || receipt.epoch != stage.target.epoch
-        || (same && !receipt.former_credential_inactive)
+        || receipt.former_credential_inactive != former
     {
         return Err(SyncError::new("new-device-registration-integrity", 409));
     }
@@ -420,7 +438,9 @@ pub(crate) fn prepare_fresh_writer(
             old.library_id == target.config.library_id && old.device_id != target.config.device_id
         })
         .ok_or_else(|| SyncError::new("registration-unchanged", 409))?;
-    LwwClient::new(&root, old.resolve(&root)?)?.fence_new_device(store)?;
+    if let Some(config) = readable(&old, &root)? {
+        LwwClient::new(&root, config)?.fence_new_device(store)?;
+    }
     let reservation_id = fresh_writer_record("fresh-writer", &target.config);
     let reservation = match claim_record::<FreshWriterReservation>(&log, &reservation_id)? {
         Some(reservation) => reservation,
@@ -434,6 +454,26 @@ pub(crate) fn prepare_fresh_writer(
             reservation
         }
     };
+    complete_fresh_writer(store, &log, header.binding_authority, &target, &old, &reservation)?;
+    Ok(NewDevicePreparation {
+        authorization_id: reservation.authorization_id,
+        writer_id: reservation.writer_id,
+    })
+}
+/// The steps after a fresh-writer reservation: the new registration claims the reserved writer,
+/// the old registration's publications are detached, and the reserved writer replaces the old one.
+fn complete_fresh_writer(
+    store: &mut PersistentStore,
+    log: &OperationLog,
+    authority: DecimalU64,
+    target: &VerifiedTarget,
+    old: &StoredConfig,
+    reservation: &FreshWriterReservation,
+) -> Result<()> {
+    let root = store.repository_root().to_owned();
+    // An old credential this device cannot read leaves that registration listed on the server.
+    let former_token = readable(old, &root)?.map(|config| config.token);
+    let former = former_token.is_some();
     let core = LwwClient::new(&root, target.config.resolve(&root)?)?;
     let (_, receipt): (_, NewDeviceClaimReceipt) = core.client.json(
         reqwest::Method::POST,
@@ -442,7 +482,7 @@ pub(crate) fn prepare_fresh_writer(
         Some(&NewDeviceClaimRequest {
             writer_id: reservation.writer_id.clone(),
             authorization_id: reservation.authorization_id.clone(),
-            former_token: Some(old.resolve(&root)?.token),
+            former_token,
         }),
         &[],
     )?;
@@ -455,7 +495,7 @@ pub(crate) fn prepare_fresh_writer(
         || receipt.device_id != target.config.device_id
         || receipt.library_id != target.config.library_id
         || receipt.epoch != target.epoch
-        || !receipt.former_credential_inactive
+        || receipt.former_credential_inactive != former
     {
         return Err(SyncError::new("new-device-registration-integrity", 409));
     }
@@ -464,16 +504,33 @@ pub(crate) fn prepare_fresh_writer(
         &fresh_writer_record("fresh-writer-claim", &target.config),
         &receipt,
     )?;
-    core.detach_inactive(&old, &reservation.authorization_id)?;
-    store.lww_adopt_fresh_writer(
-        header.binding_authority,
-        &reservation.old_writer_id,
-        &reservation.writer_id,
+    core.detach_inactive(old, &reservation.authorization_id)?;
+    store.lww_adopt_fresh_writer(authority, &reservation.old_writer_id, &reservation.writer_id)?;
+    Ok(())
+}
+/// Finishes a fresh-writer swap that stopped after its reservation, so startup installs the new
+/// registration instead of falling back to the old one.
+fn resume_fresh_writer(
+    store: &mut PersistentStore,
+    log: &OperationLog,
+    authority: DecimalU64,
+    target: &VerifiedTarget,
+    old: &StoredConfig,
+) -> Result<()> {
+    let writer = store.lww_clock_state()?.writer_id;
+    if claimed_fresh_writer(log, target)?.is_some_and(|claimed| claimed == writer) {
+        return Ok(());
+    }
+    let reservation = claim_record::<FreshWriterReservation>(
+        log,
+        &fresh_writer_record("fresh-writer", &target.config),
     )?;
-    Ok(NewDevicePreparation {
-        authorization_id: reservation.authorization_id,
-        writer_id: reservation.writer_id,
-    })
+    match reservation {
+        Some(reservation) if reservation.old_writer_id == writer => {
+            complete_fresh_writer(store, log, authority, target, old, &reservation)
+        }
+        _ => Ok(()),
+    }
 }
 pub(crate) fn activate(
     store: &mut PersistentStore,
@@ -501,6 +558,14 @@ pub(crate) fn activate(
         // A new registration to the stored library is installed only with the writer it
         // claimed, so the old writer never publishes under the new device.
         let stored = store.server_stored_config()?;
+        if let (Some(target), Some(old)) = (&selected, &stored) {
+            if old.library_id == target.config.library_id
+                && old.device_id != target.config.device_id
+                && target.authority == header.binding_authority
+            {
+                resume_fresh_writer(store, &log, header.binding_authority, target, old)?;
+            }
+        }
         let selected = match selected {
             Some(target)
                 if stored.as_ref().is_some_and(|stored| {
@@ -550,6 +615,12 @@ pub(crate) fn activate(
     }
     store.server_save_config(&target.config)?;
     log.save_config("active", &target.config)?;
+    for kind in ["fresh-writer", "fresh-writer-claim"] {
+        log.0.execute(
+            "DELETE FROM claims WHERE id=?1",
+            [fresh_writer_record(kind, &target.config)],
+        )?;
+    }
     log.0.execute(
         "INSERT INTO bindings VALUES('active',?1) ON CONFLICT(id) DO UPDATE SET body=excluded.body",
         [serde_json::to_string(&target).map_err(|_| SyncError::new("binding-integrity", 409))?],
@@ -1555,7 +1626,7 @@ mod tests {
         assert_eq!(server_unit(&server, &fresh, &next[0].0).unwrap().stamp, next[0].1);
     }
     #[test]
-    fn a_fresh_writer_claim_stopped_before_the_swap_never_publishes_the_old_writer_and_recovers() {
+    fn a_fresh_writer_swap_stopped_after_its_claim_finishes_at_startup_without_publishing_the_old_writer() {
         let server = LocalServerFixture::new();
         let (root, mut a) = local();
         let old = configure(&server, &a);
@@ -1574,25 +1645,79 @@ mod tests {
         assert!(server.server.authenticate(&old.library_id, &old.token).is_err());
         drop(a);
         let mut a = PersistentStore::open(root.path()).unwrap();
-        let request = header(&a);
-        assert_eq!(activate(&mut a, &request, None).unwrap_err().status, 401);
-        assert_eq!(a.server_stored_config().unwrap().unwrap().device_id, old.device_id);
-        assert_eq!(push_now(&bound_client(&a), &mut a).unwrap_err().status, 401);
-        assert_eq!(outbox(&a), retained);
         let reserved: FreshWriterReservation = OperationLog::open(root.path())
             .unwrap()
             .verified("claims", &format!("fresh-writer:{}:{}", fresh.library_id, fresh.device_id))
             .unwrap();
         assert_eq!(reserved.old_writer_id, old_writer);
-        let inspected = fresh_inspection(&a);
-        let prepared = fresh_writer(&mut a, &inspected.inspection_id).unwrap();
-        assert_eq!(prepared.writer_id, reserved.writer_id);
-        assert_eq!(a.lww_clock_state().unwrap().writer_id, reserved.writer_id);
         resume(&mut a);
         assert_eq!(a.server_stored_config().unwrap().unwrap().device_id, fresh.device_id);
+        assert_eq!(a.lww_clock_state().unwrap().writer_id, reserved.writer_id);
+        assert_eq!(outbox(&a), retained);
+        let log = OperationLog::open(root.path()).unwrap();
+        for kind in ["fresh-writer", "fresh-writer-claim"] {
+            let id = format!("{kind}:{}:{}", fresh.library_id, fresh.device_id);
+            assert!(!log.0.query_row("SELECT EXISTS(SELECT 1 FROM claims WHERE id=?1)", [&id], |r| r.get::<_, bool>(0)).unwrap());
+        }
         let receipt = push_now(&bound_client(&a), &mut a).unwrap().unwrap();
         assert_eq!(receipt.accepted_keys, vec![retained[0].0.clone()]);
         assert_eq!(server_unit(&server, &fresh, &retained[0].0).unwrap().stamp, retained[0].1);
+    }
+    #[test]
+    fn a_new_registration_whose_old_credential_cannot_be_read_still_swaps_the_writer_and_publishes_unsent_edits() {
+        let server = LocalServerFixture::new();
+        let (root, mut a) = local();
+        let old = configure(&server, &a);
+        bind(&mut a);
+        save(&mut a, &["root", "language"], serde_json::json!("ko"));
+        let core = bound_client(&a);
+        pending_publication(&core, &a);
+        drop(core);
+        let retained = outbox(&a);
+        a.server_stored_config().unwrap().unwrap().remove(root.path()).unwrap();
+        fence_stored(&mut a, false).unwrap();
+        fence_stored(&mut a, true).unwrap();
+        let fresh = configure(&server, &a);
+        let inspected = fresh_inspection(&a);
+        let prepared = fresh_writer(&mut a, &inspected.inspection_id).unwrap();
+        resume(&mut a);
+        assert_eq!(a.lww_clock_state().unwrap().writer_id, prepared.writer_id);
+        assert_eq!(a.server_stored_config().unwrap().unwrap().device_id, fresh.device_id);
+        let client = bound_client(&a);
+        let receipt = push_now(&client, &mut a).unwrap().unwrap();
+        assert_eq!(receipt.accepted_keys, vec![retained[0].0.clone()]);
+        assert!(client.log.pending().unwrap().is_empty());
+        assert_eq!(server_unit(&server, &fresh, &retained[0].0).unwrap().stamp, retained[0].1);
+        assert!(server.server.authenticate(&old.library_id, &old.token).is_ok());
+    }
+    #[test]
+    fn a_new_device_registration_whose_old_credential_cannot_be_read_replaces_this_device() {
+        let server = LocalServerFixture::new();
+        let (root, mut a) = local();
+        let old = configure(&server, &a);
+        bind(&mut a);
+        save(&mut a, &["root", "language"], serde_json::json!("ja"));
+        let core = bound_client(&a);
+        pending_publication(&core, &a);
+        drop(core);
+        a.server_stored_config().unwrap().unwrap().remove(root.path()).unwrap();
+        let fresh = configure(&server, &a);
+        let inspected = inspect(&a, &header(&a)).unwrap();
+        assert!(inspected.registration_changed);
+        let request = header(&a);
+        let staged = stage(&mut a, &request, &inspected.inspection_id, None).unwrap();
+        let prepared = prepare_new_device(&mut a, &request, &staged.staging_id).unwrap();
+        let result = a
+            .lww_replace_target_as_new_device(&request, &staged.staging_id, &prepared.authorization_id)
+            .unwrap();
+        let next = Header { binding_authority: result.binding_authority, request_id: uuid::Uuid::new_v4().to_string() };
+        activate(&mut a, &next, Some((&prepared.authorization_id, &result.writer_id))).unwrap();
+        assert_eq!(a.server_stored_config().unwrap().unwrap().device_id, fresh.device_id);
+        save(&mut a, &["root", "language"], serde_json::json!("ko"));
+        let client = bound_client(&a);
+        assert!(client.push(&mut a, &next, &[]).unwrap().is_some());
+        assert!(client.log.pending().unwrap().is_empty());
+        assert!(server.server.authenticate(&old.library_id, &old.token).is_ok());
     }
     #[test]
     fn inspecting_a_new_registration_never_installs_it_with_the_old_writer() {

@@ -319,9 +319,13 @@ impl LwwClient {
         Ok(Some(client))
     }
     /// Whether the server that holds a publication answers for it. An address
-    /// that cannot be reached, or that no longer serves this library, does not.
+    /// that cannot be reached or no longer serves this library does not, and
+    /// neither does a registration whose credential this device cannot read.
     pub(crate) fn answers(&self, publication: &Publication) -> Result<bool> {
-        let resolved = self.registration_client(publication)?;
+        let resolved = match self.registration_client(publication) {
+            Err(error) if error.code == "device-credential-unavailable" => return Ok(false),
+            resolved => resolved?,
+        };
         let attempt = resolved.as_ref().unwrap_or(&self.client).request_ambiguous_mutation(
             reqwest::Method::GET,
             &format!("operations/{}", publication.request.operation_id),

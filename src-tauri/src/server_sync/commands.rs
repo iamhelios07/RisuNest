@@ -259,7 +259,7 @@ pub(crate) async fn server_sync_lww_ack(app:AppHandle,request:crate::persistent_
 pub(crate) async fn server_sync_cancel(app:AppHandle)->Result<()> {recorded("cancel",app.state::<ServerSyncCommandState>().cancel())}
 #[tauri::command]
 pub(crate) async fn server_sync_lww_fence(app:AppHandle,new_device:bool)->Result<()> {
-    logged_blocking("fence",move|| {let state=app.state::<ServerSyncCommandState>();if !state.cleanup_drained()?{return Err(SyncError::new("server-sync-busy",409));}let mut store=job_store(&app)?;if store.server_stored_config()?.is_none(){return Ok(());}let core=lww_client(&store)?;if new_device{core.fence_new_device(&mut store)}else{super::binding::fence_for_binding_change(&core,&mut store)}}).await
+    logged_blocking("fence",move|| {let state=app.state::<ServerSyncCommandState>();if !state.cleanup_drained()?{return Err(SyncError::new("server-sync-busy",409));}let mut store=job_store(&app)?;super::binding::fence_stored(&mut store,new_device)}).await
 }
 
 #[tauri::command]
