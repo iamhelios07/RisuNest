@@ -3,6 +3,7 @@
 use super::{snapshot_archive, PersistentStore};
 use crate::{
     asset_repository::{object_physical_key, PayloadCas},
+    external_storage::lww_residency::RemoteBodies,
     server_sync::{
         client::ServerClient,
         residency::{AssetPolicy, Residency},
@@ -32,12 +33,16 @@ pub(crate) struct ExternalObjects {
     objects: u64,
 }
 /// Where a body this device does not hold can be fetched from. The server
-/// comes first, as in hydration.
+/// comes first, as in hydration. A body counts for an external connection
+/// only while no other live connection holds it.
 enum Holder {
     Server(u64),
     External(String, u64),
+    Shared(u64),
     Unavailable,
 }
+/// Bodies classified per registry question.
+const HOLDER_PAGE: usize = 1024;
 /// Connection IDs per connection root, read once per status or download.
 #[derive(Default)]
 struct Connections(std::collections::BTreeMap<std::path::PathBuf, BTreeSet<String>>);
@@ -302,25 +307,49 @@ impl PersistentStore {
             release_blocked,
         })
     }
-    fn residency_holder(&self, residency: &Residency, connections: &mut Connections, hash: &str) -> Result<Holder> {
-        if let Some(object) = residency.object(hash, None)? {
-            return Ok(Holder::Server(object.size));
+    /// Where each of `hashes`, none of them held here, can be fetched from.
+    fn residency_holders(
+        &self,
+        residency: &Residency,
+        remote: &mut RemoteBodies,
+        connections: &mut Connections,
+        hashes: &[String],
+    ) -> Result<Vec<Holder>> {
+        let mut server = Vec::with_capacity(hashes.len());
+        let mut external = Vec::new();
+        for hash in hashes {
+            let object = residency.object(hash, None)?;
+            if object.is_none() {
+                external.push(hash.as_str());
+            }
+            server.push(object.map(|object| Holder::Server(object.size)));
         }
-        use crate::external_storage::lww_residency::{freeze_remote_body, FrozenBodySource};
-        let source = freeze_remote_body(&self.repository_root, hash)
+        let mut registered = remote
+            .holders(&external)
             .map_err(|_| std::io::Error::other("external-source-invalid"))?;
-        let Some(source) = source else {
-            return Ok(Holder::Unavailable);
-        };
-        let (connection_id, connection_root) = match &source {
-            FrozenBodySource::Standalone(source) => (&source.connection_id, &source.connection_root),
-            FrozenBodySource::Packed(source) => (&source.connection_id, &source.connection_root),
-        };
-        Ok(if connections.contains(connection_root, connection_id)? {
-            Holder::External(connection_id.clone(), source.byte_length())
-        } else {
-            Holder::Unavailable
-        })
+        let mut holders = Vec::with_capacity(hashes.len());
+        for (hash, server) in hashes.iter().zip(server) {
+            if let Some(holder) = server {
+                holders.push(holder);
+                continue;
+            }
+            let Some(held) = registered.remove(hash) else {
+                holders.push(Holder::Unavailable);
+                continue;
+            };
+            let mut live = Vec::new();
+            for (root, id) in held.connections {
+                if connections.contains(&root, &id)? {
+                    live.push(id);
+                }
+            }
+            holders.push(match live.len() {
+                0 => Holder::Unavailable,
+                1 => Holder::External(live.remove(0), held.byte_length),
+                _ => Holder::Shared(held.byte_length),
+            });
+        }
+        Ok(holders)
     }
     pub(crate) fn asset_residency_status(&self) -> Result<ResidencyStatus> {
         let residency = Residency::open(&self.repository_root)?;
@@ -339,24 +368,35 @@ impl PersistentStore {
             evicted_bytes: 0,
         };
         let mut external = std::collections::BTreeMap::<String, u64>::new();
+        let mut missing = Vec::new();
         for hash in inventory.referenced {
             if let Some(size) = cas.stat_object(&hash)? {
                 status.local_bytes += size;
                 continue;
             }
-            match self.residency_holder(&residency, &mut connections, &hash)? {
-                Holder::Server(size) => {
-                    status.server_bytes += size;
-                    status.server_objects += 1;
-                    status.remote_bytes += size;
-                    status.remote_objects += 1;
+            missing.push(hash);
+        }
+        let mut remote = RemoteBodies::deferred(&self.repository_root);
+        for page in missing.chunks(HOLDER_PAGE) {
+            for holder in self.residency_holders(&residency, &mut remote, &mut connections, page)? {
+                match holder {
+                    Holder::Server(size) => {
+                        status.server_bytes += size;
+                        status.server_objects += 1;
+                        status.remote_bytes += size;
+                        status.remote_objects += 1;
+                    }
+                    Holder::External(connection_id, size) => {
+                        *external.entry(connection_id).or_default() += 1;
+                        status.remote_bytes += size;
+                        status.remote_objects += 1;
+                    }
+                    Holder::Shared(size) => {
+                        status.remote_bytes += size;
+                        status.remote_objects += 1;
+                    }
+                    Holder::Unavailable => status.unavailable_objects += 1,
                 }
-                Holder::External(connection_id, size) => {
-                    *external.entry(connection_id).or_default() += 1;
-                    status.remote_bytes += size;
-                    status.remote_objects += 1;
-                }
-                Holder::Unavailable => status.unavailable_objects += 1,
             }
         }
         status.external_objects = external
@@ -366,8 +406,8 @@ impl PersistentStore {
         Ok(status)
     }
     /// Downloads the bodies another storage holds without changing the policy:
-    /// every one, or only those `connection_id` holds. A body no storage holds
-    /// is left as it is.
+    /// every one, or only those `connection_id` holds and no other live
+    /// connection does. A body no storage holds is left as it is.
     pub(crate) fn asset_residency_download_remote(
         &self,
         connection_id: Option<&str>,
@@ -381,18 +421,26 @@ impl PersistentStore {
         let residency = Residency::open(&self.repository_root)?;
         let mut connections = Connections::default();
         let mut targets = BTreeSet::new();
+        let mut missing = Vec::new();
         for hash in inventory.referenced {
             check()?;
-            if cas.stat_object(&hash)?.is_some() {
-                continue;
+            if cas.stat_object(&hash)?.is_none() {
+                missing.push(hash);
             }
-            let wanted = match self.residency_holder(&residency, &mut connections, &hash)? {
-                Holder::Server(_) => connection_id.is_none(),
-                Holder::External(holder, _) => connection_id.is_none_or(|wanted| wanted == holder),
-                Holder::Unavailable => false,
-            };
-            if wanted {
-                targets.insert(hash);
+        }
+        let mut remote = RemoteBodies::deferred(&self.repository_root);
+        for page in missing.chunks(HOLDER_PAGE) {
+            check()?;
+            let holders = self.residency_holders(&residency, &mut remote, &mut connections, page)?;
+            for (hash, holder) in page.iter().zip(holders) {
+                let wanted = match holder {
+                    Holder::Server(_) | Holder::Shared(_) => connection_id.is_none(),
+                    Holder::External(holder, _) => connection_id.is_none_or(|wanted| wanted == holder),
+                    Holder::Unavailable => false,
+                };
+                if wanted {
+                    targets.insert(hash.clone());
+                }
             }
         }
         let mut hydration = crate::server_sync::residency::HydrationSession::new(&self.repository_root, cancellation)?;

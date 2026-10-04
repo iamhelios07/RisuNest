@@ -81,6 +81,32 @@ impl AssetObjectRegistrar {
         }
         Ok(())
     }
+
+    /// Registers the objects whose row is missing, of another size or marked
+    /// for deletion, and writes nothing when every row is already in place.
+    pub(crate) fn register_missing(
+        &mut self,
+        objects: &[AssetObjectRegistration],
+        created_at_ms: i64,
+    ) -> StoreResult<()> {
+        let mut missing = Vec::new();
+        {
+            let mut placed = self.connection.prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM asset_objects WHERE object_hash=?1 AND byte_size=?2)
+                    AND NOT EXISTS(SELECT 1 FROM asset_object_deletions WHERE object_hash=?1)",
+            )?;
+            for object in objects {
+                let in_place = match i64::try_from(object.byte_size) {
+                    Ok(size) => placed.query_row(params![object.object_hash, size], |row| row.get(0))?,
+                    Err(_) => false,
+                };
+                if !in_place {
+                    missing.push(object.clone());
+                }
+            }
+        }
+        self.register(&missing, created_at_ms)
+    }
 }
 
 fn begin_registration<'a>(
@@ -328,5 +354,27 @@ mod tests {
         assert!(registrar.register(&[conflicting], 3).is_err());
         assert_eq!(stored(&connection), (5, 1));
         assert!(registrar.register(&objects, -1).is_err());
+    }
+
+    #[test]
+    fn registering_only_missing_rows_writes_nothing_when_every_row_is_in_place() {
+        let directory = tempfile::tempdir().unwrap();
+        let _store = crate::persistent_store::PersistentStore::open(directory.path()).unwrap();
+        let present = AssetObjectRegistration { object_hash: "a".repeat(64), byte_size: 5 };
+        let mut registrar = AssetObjectRegistrar::open(directory.path()).unwrap();
+        registrar.register(std::slice::from_ref(&present), 1).unwrap();
+        let writer = Connection::open(directory.path().join("persistent").join(super::super::DATABASE_FILE)).unwrap();
+        // Another writer holds the database, so any write here would wait and fail.
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        registrar.register_missing(std::slice::from_ref(&present), 2).unwrap();
+        writer.execute_batch("ROLLBACK").unwrap();
+        let absent = AssetObjectRegistration { object_hash: "b".repeat(64), byte_size: 7 };
+        let conflicting = AssetObjectRegistration { object_hash: present.object_hash.clone(), byte_size: 9 };
+        assert!(registrar.register_missing(&[conflicting], 3).is_err(), "a row of another size is not in place");
+        registrar.register_missing(&[present.clone(), absent.clone()], 4).unwrap();
+        let size = |hash: &str| -> Option<i64> {
+            writer.query_row("SELECT byte_size FROM asset_objects WHERE object_hash = ?1", [hash], |row| row.get(0)).optional().unwrap()
+        };
+        assert_eq!((size(&present.object_hash), size(&absent.object_hash)), (Some(5), Some(7)));
     }
 }

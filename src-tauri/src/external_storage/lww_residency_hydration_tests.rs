@@ -51,6 +51,38 @@ fn forget_observations(root: &Path) {
 fn observed(kind: &str, root: &Path) -> Vec<PathBuf> {
     OBSERVED.lock().unwrap().iter().filter(|(k, r, _)| *k == kind && r == root).map(|(_, _, path)| path.clone()).collect()
 }
+/// Whether `observed` names `root`, however either is spelled.
+fn same_root(observed: &Path, root: &Path, canonical: &Path) -> bool {
+    observed == root || std::fs::canonicalize(observed).is_ok_and(|observed| observed == canonical)
+}
+/// How many times the registry under `root` was opened, by any spelling of `root`.
+pub(crate) fn registry_opens(root: &Path) -> usize {
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_owned());
+    OBSERVED.lock().unwrap().iter().filter(|(kind, r, _)| *kind == "remote-bodies" && same_root(r, root, &canonical)).count()
+}
+pub(crate) fn forget_registry_opens(root: &Path) {
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_owned());
+    OBSERVED.lock().unwrap().retain(|(kind, r, _)| *kind != "remote-bodies" || !same_root(r, root, &canonical));
+}
+/// Registers a standalone source of `byte_length` bytes for `hash` that no
+/// provider holds, for a test that only asks the registry about it.
+pub(crate) fn register_synthetic_source(root: &Path, hash: &str, byte_length: u64) {
+    register(root, &Source {
+        hash: hash.into(),
+        library_id: "synthetic-library".into(),
+        connection_id: "synthetic-connection".into(),
+        connection_root: root.to_owned(),
+        protected_segment: "synthetic-segment".into(),
+        body: LargeBody {
+            object_id: "synthetic-body".into(),
+            sha256: hash.into(),
+            byte_length: byte_length.into(),
+            plaintext_byte_length: byte_length.into(),
+            locator: Some(RemoteLocator { connection_identity: "synthetic-account".into(), collection: None, object: "synthetic-body".into() }),
+        },
+    })
+    .unwrap();
+}
 
 static HOLDS: Mutex<Vec<(PathBuf, usize, Duration)>> = Mutex::new(Vec::new());
 /// One hold of the repository mutation lock while `bodies` were published.
@@ -426,7 +458,7 @@ fn synthetic_object(id: &str, role: risunest_external_storage_format::snapshot::
         plaintext_sha256: [2; 32],
     }
 }
-fn synthetic_packed(hash: &str, library: &str, byte_length: u64, packs: &[&str]) -> PackedSource {
+pub(crate) fn synthetic_packed(hash: &str, library: &str, byte_length: u64, packs: &[&str]) -> PackedSource {
     use risunest_external_storage_format::snapshot::ObjectRole;
     PackedSource {
         hash: hash.into(),

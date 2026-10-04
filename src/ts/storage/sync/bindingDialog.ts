@@ -19,9 +19,12 @@ export async function confirmPreviousStorageFiles(context: PreviousStorageFilesC
     let held = 0
     try {
         const status = await getAssetResidencyStatus()
-        held = status.serverObjects + status.externalObjects
-            .filter(entry => context.target.kind !== 'external' || entry.connectionId !== context.target.connectionId)
-            .reduce((sum, entry) => sum + entry.objects, 0)
+        const target = context.target
+        // A file several storages hold counts for none of them, so it is left
+        // in whatever the target alone does not hold.
+        held = status.remoteObjects - (target.kind === 'external'
+            ? status.externalObjects.find(entry => entry.connectionId === target.connectionId)?.objects ?? 0
+            : 0)
     } catch {
         return 'connect'
     }

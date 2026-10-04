@@ -541,8 +541,9 @@ async fn receive_restore_bodies_in_store(mut store:PersistentStore,root:&Path,co
         None=>BTreeSet::new(),
     };
     let mut after=String::new();let mut sources=Vec::new();
+    let mut interner=super::lww_residency::ObjectInterner::default();
     loop {
-        let page=jobs.restore_body_page(&job.id,&after)?;
+        let page=jobs.restore_body_page(&job.id,&after,&mut interner)?;
         if page.is_empty() {break;}
         for source in page {after=source.hash.clone();sources.push(source);}
     }
@@ -586,7 +587,7 @@ async fn receive_restore_bodies_in_store(mut store:PersistentStore,root:&Path,co
 }
 
 async fn receive_restore_body(mut store:PersistentStore,root:&Path,connected:&ConnectedRepository,job:&DurableJob,revision:i64,
-    source:&super::lww_residency::PackedSource,path:Option<std::path::PathBuf>,cancel:&Cancellation)->Result<PersistentStore> {
+    source:&super::lww_residency::SharedPackedSource,path:Option<std::path::PathBuf>,cancel:&Cancellation)->Result<PersistentStore> {
     cancel.check()?;
     require_activated_target(&store,job,revision)?;
     super::lww_residency::validate_packed_source(source,&connected.handle)?;
@@ -681,7 +682,7 @@ fn prepare_local_restore(
     selection: RestoreSelection,
     sections: Vec<super::sections::CapturedSection>,
     cancel: Cancellation,
-    sources:Vec<super::lww_residency::PackedSource>,
+    sources:Vec<super::lww_residency::SharedPackedSource>,
     present:BTreeSet<String>,
     permit:crate::native_file_jobs::admission::Permit,
 ) -> Result<(Value,crate::native_file_jobs::admission::Permit)> {
@@ -700,7 +701,7 @@ fn prepare_local_restore_in_store(
     selection: RestoreSelection,
     sections: Vec<super::sections::CapturedSection>,
     cancel: Cancellation,
-    sources:Vec<super::lww_residency::PackedSource>,
+    sources:Vec<super::lww_residency::SharedPackedSource>,
     present:BTreeSet<String>,
     mut permit:crate::native_file_jobs::admission::Permit,
 ) -> Result<(Value,crate::native_file_jobs::admission::Permit)> {

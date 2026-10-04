@@ -487,6 +487,57 @@ describe('the storage usage tab', () => {
     })
 })
 
+describe('the storage usage of two connections', () => {
+    const second = { ...connection(10, 30), id: 'connection-2', displayName: 'Second' }
+    const status = (entries: { connectionId: string, objects: number }[]) => ({ policy: 'remote', localBytes: 0, remoteBytes: 3,
+        remoteObjects: 3, serverBytes: 0, serverObjects: 0, externalObjects: entries, unavailableObjects: 0, evictedBytes: 0 })
+    const remoteOnly = (id: string) => {
+        const panel = target.querySelector(`#${id}-quota-panel`)
+        if (!panel) throw new Error(`Missing the storage usage of ${id}`)
+        const term = [...panel.querySelectorAll('dt')].find(item => item.textContent?.trim() === strings.remoteOnlyFiles)
+        return term?.nextElementSibling?.textContent?.trim()
+    }
+    async function openBoth(): Promise<void> {
+        const tabs = [...target.querySelectorAll('button')].filter(item => item.textContent?.trim() === strings.quota)
+        expect(tabs).toHaveLength(2)
+        for (const tab of tabs) {
+            tab.click()
+            await settle()
+        }
+    }
+    beforeEach(async () => {
+        state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0', paused: false, decisionRequired: false },
+            connections: [connection(10, 30), second], jobs: [] })
+        // The row does not wait on the service's own usage.
+        state.getQuota.mockRejectedValue({ kind: 'transient', httpStatus: null, retryAtMs: null })
+        state.listHistory.mockResolvedValue({ items: [] })
+        target = document.createElement('div')
+        document.body.append(target)
+        component = mount(ExternalStorageSettings, { target })
+        await settle()
+    })
+    afterEach(() => {
+        if (component) unmount(component)
+        component = undefined
+        target.remove()
+        vi.clearAllMocks()
+    })
+
+    it('shows for each connection the files only it holds', async () => {
+        state.residency.mockResolvedValue(status([{ connectionId: 'connection-1', objects: 2 }]))
+        await openBoth()
+        expect(remoteOnly('connection-1')).toBe('2')
+        expect(remoteOnly('connection-2')).toBe('0')
+    })
+
+    it('leaves the row out when the status cannot be read', async () => {
+        state.residency.mockRejectedValue({ code: 'local-storage' })
+        await openBoth()
+        expect(remoteOnly('connection-1')).toBeUndefined()
+        expect(remoteOnly('connection-2')).toBeUndefined()
+    })
+})
+
 describe('a running job', () => {
     function job(counters?: 'prepared' | 'transferred') {
         return {
