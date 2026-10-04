@@ -837,6 +837,55 @@ fn device_settings_accept_only_the_assigned_keys() {
     assert_eq!(stored, DEVICE_SETTING_KEYS.len() as i64);
 }
 
+/// A backed-up setting travels as one section object, so a value that would
+/// not fit one is refused when it is written instead of failing a later backup.
+#[test]
+fn a_backed_up_setting_is_refused_above_the_section_object_limit() {
+    use crate::persistent_store::StoreError;
+    use risunest_external_storage_format::section::MAX_SECTION_OBJECT_BYTES;
+    use super::sections::LOCAL_SETTING_KEYS;
+    let refused = |result: StoreResult<()>, key: &str| match result {
+        Err(StoreError::Validation { message }) => {
+            assert_eq!(message, "device setting value is too large", "{key}")
+        }
+        other => panic!("{key}: {other:?}"),
+    };
+    // A string serializes with its two quotes, and `{"e":...}` adds six bytes.
+    let text = |length: usize| Value::String("s".repeat(length - 2));
+    let entry = |length: usize| {
+        serde_json::json!({ "e": text(length - 6) }).as_object().unwrap().clone()
+    };
+    let at_limit = text(MAX_SECTION_OBJECT_BYTES);
+    let above_limit = text(MAX_SECTION_OBJECT_BYTES + 1);
+    assert_eq!(serde_json::to_string(&at_limit).unwrap().len(), MAX_SECTION_OBJECT_BYTES);
+    assert_eq!(
+        serde_json::to_string(&entry(MAX_SECTION_OBJECT_BYTES)).unwrap().len(),
+        MAX_SECTION_OBJECT_BYTES
+    );
+
+    let (_directory, mut store) = open();
+    for key in LOCAL_SETTING_KEYS {
+        assert!(DEVICE_SETTING_KEYS.contains(&key), "{key}");
+        store.write_setting(key, &serde_json::json!("kept")).unwrap();
+        refused(store.write_setting(key, &above_limit), key);
+        assert_eq!(store.read_setting(key).unwrap(), Some(serde_json::json!("kept")));
+        store.write_setting(key, &at_limit).expect("a value at the limit is kept");
+
+        store.write_setting(key, &serde_json::json!({})).unwrap();
+        refused(store.patch_setting(key, &entry(MAX_SECTION_OBJECT_BYTES + 1)), key);
+        assert_eq!(store.read_setting(key).unwrap(), Some(serde_json::json!({})));
+        store
+            .patch_setting(key, &entry(MAX_SECTION_OBJECT_BYTES))
+            .expect("an entry that fills the limit is kept");
+        store.remove_setting(key).unwrap();
+    }
+
+    // A setting that stays on this device is never carried in a backup.
+    store
+        .write_setting("mcpStdioApprovals", &above_limit)
+        .expect("a device-only setting has no section object to fit");
+}
+
 #[test]
 fn a_settings_batch_answers_in_request_order() {
     let (_directory, store) = open();
