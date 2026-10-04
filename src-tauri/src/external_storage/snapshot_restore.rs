@@ -1903,7 +1903,7 @@ pub(crate) struct DatabaseFirstSnapshot {
     pub required:BTreeSet<String>,
     pub present:BTreeSet<String>,
     pub missing:BTreeSet<String>,
-    pub sources:Vec<super::lww_residency::PackedSource>,
+    pub sources:Vec<super::lww_residency::SharedPackedSource>,
 }
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn admit_asset_catalogs(
@@ -1990,7 +1990,9 @@ pub(crate) async fn download_snapshot_database_first(snapshot:&RemoteObject,stag
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     ).map_err(transient)?;
     let mut required=BTreeSet::new();let mut present=BTreeSet::new();let mut missing=BTreeSet::new();
-    let mut sources=Vec::new();let mut stored_packs=BTreeMap::<String,wire::StoredObject>::new();
+    let mut sources=Vec::new();let mut stored_packs=BTreeMap::<String,super::lww_residency::SharedObject>::new();
+    let mut interner=super::lww_residency::ObjectInterner::default();
+    let catalog=interner.intern(document.library.asset_catalog.clone());
     for entry in entries {
         if entry.kind!=wire::CatalogEntryKind::Object {return Err(corrupt("asset catalog kind"));}
         let hash=hex::encode(entry.content_sha256);
@@ -2014,10 +2016,10 @@ pub(crate) async fn download_snapshot_database_first(snapshot:&RemoteObject,stag
         for id in ids {
             if let Some(stored)=stored_packs.get(id) {references.push(stored.clone());continue;}
             let Some(pack)=packs.get(id) else {continue};
-            let stored=pack.stored(repository)?;
+            let stored=interner.intern(pack.stored(repository)?);
             stored_packs.insert(id.to_owned(),stored.clone());references.push(stored);
         }
-        let source=super::lww_residency::PackedSource {hash:hash.clone(),byte_length:entry.byte_length,library_id:snapshot.repository_id.clone(),connection_id:connection_id.into(),connection_root:connection_root.into(),protected_snapshot:snapshot.object_id.clone(),catalog:document.library.asset_catalog.clone(),chunks:entry.chunks,packs:references};
+        let source=super::lww_residency::PackedSource {hash:hash.clone(),byte_length:entry.byte_length,library_id:snapshot.repository_id.clone(),connection_id:connection_id.into(),connection_root:connection_root.into(),protected_snapshot:snapshot.object_id.clone(),catalog:catalog.clone(),chunks:entry.chunks,packs:references};
         super::lww_residency::validate_packed_source(&source,repository)?;
         sources.push(source);
         objects.push(PreparedObject{content_hash:hash.clone(),byte_length:entry.byte_length,source:ObjectSource::Library(hash)});

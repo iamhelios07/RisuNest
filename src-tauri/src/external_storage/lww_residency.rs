@@ -385,10 +385,10 @@ pub(crate) fn validate_packed_source<O:Borrow<StoredObject>>(source:&PackedSourc
     Ok(())
 }
 pub(crate) const PACKED_REGISTRATION_BATCH:usize=1024;
-pub(crate) fn register_packed(root:&Path,source:&PackedSource,repository:&RepositoryHandle) -> Result<()> {
+pub(crate) fn register_packed<O:Borrow<StoredObject>+Serialize>(root:&Path,source:&PackedSource<O>,repository:&RepositoryHandle) -> Result<()> {
     register_packed_many(root,std::slice::from_ref(source),repository)
 }
-pub(crate) fn register_packed_many(root:&Path,sources:&[PackedSource],repository:&RepositoryHandle) -> Result<()> {
+pub(crate) fn register_packed_many<O:Borrow<StoredObject>+Serialize>(root:&Path,sources:&[PackedSource<O>],repository:&RepositoryHandle) -> Result<()> {
     for source in sources {validate_packed_source(source,repository)?;}
     register_verified_packed_many(root,sources)
 }
@@ -493,7 +493,7 @@ impl PackMember for PackedOutline {
     fn member_hash(&self)->&str {&self.hash}
     fn pack_ids(&self)->impl Iterator<Item=&str> {self.packs.iter().map(String::as_str)}
 }
-pub(crate) fn packed_body_groups(sources:Vec<PackedSource>,priority:&BTreeSet<String>)->Vec<Vec<PackedSource>> {
+pub(crate) fn packed_body_groups<O>(sources:Vec<PackedSource<O>>,priority:&BTreeSet<String>)->Vec<Vec<PackedSource<O>>> {
     pack_groups(sources,priority)
 }
 fn pack_groups<T:PackMember>(members:Vec<T>,priority:&BTreeSet<String>)->Vec<Vec<T>> {
@@ -1058,7 +1058,7 @@ mod registration_tests {
 #[path="lww_residency_hydration_tests.rs"]
 mod hydration_tests;
 #[cfg(test)]
-pub(crate) use hydration_tests::{forget_registry_opens, register_synthetic_source, registry_opens};
+pub(crate) use hydration_tests::{forget_registry_opens, register_synthetic_source, registry_opens, synthetic_packed};
 async fn remote_source(
     root: &Path,
     hash: &str,

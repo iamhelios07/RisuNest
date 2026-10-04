@@ -5177,6 +5177,8 @@ mod tests {
                 jobs.freeze_restore_bodies(&job,&prepared.sources,&prepared.present).unwrap();
                 let pack_ids=prepared.sources.iter().flat_map(|source|source.chunks.iter().map(|chunk|chunk.pack_id.clone())).collect::<BTreeSet<_>>();
                 assert_eq!(pack_ids.len(),1);
+                let first=&prepared.sources[0];
+                assert!(prepared.sources.iter().all(|source|std::ptr::eq(&*source.catalog,&*first.catalog)&&std::ptr::eq(&*source.packs[0],&*first.packs[0])));
                 if !already_present {
                     let connection=connected.clone();let external_source=prepared.sources[0].clone();
                     spawn_blocking(move || {

@@ -458,7 +458,7 @@ fn synthetic_object(id: &str, role: risunest_external_storage_format::snapshot::
         plaintext_sha256: [2; 32],
     }
 }
-fn synthetic_packed(hash: &str, library: &str, byte_length: u64, packs: &[&str]) -> PackedSource {
+pub(crate) fn synthetic_packed(hash: &str, library: &str, byte_length: u64, packs: &[&str]) -> PackedSource {
     use risunest_external_storage_format::snapshot::ObjectRole;
     PackedSource {
         hash: hash.into(),
