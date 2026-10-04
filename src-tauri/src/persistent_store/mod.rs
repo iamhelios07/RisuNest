@@ -2250,6 +2250,7 @@ impl PersistentStore {
             &self.repository_root,
             job_id,
             CasJobKind::OfficialPublicationOrExportPreparation,
+            crate::asset_repository::job_pins::CasJobOwner::native_file_job(job_id),
             created_at_ms,
         )?;
         let pin_result = (|| -> StoreResult<()> {

@@ -44,6 +44,7 @@ vi.mock('src/ts/storage/sync/external/production', () => ({
     requestExternalStorageResolveConflict: vi.fn(),
     requestExternalStorageRestore: vi.fn(),
     requestExternalStorageDeleteHistory: vi.fn(async () => {}),
+    stopExternalStorageRestore: vi.fn(async () => {}),
 }))
 vi.mock('src/ts/storage/sync/external/bridge', () => ({
     getExternalStorageBridge: () => ({
@@ -70,7 +71,7 @@ vi.mock('src/ts/storage/sync/external/bridge', () => ({
 
 import { alertConfirm, alertCheckboxConfirm } from 'src/ts/alert'
 import ExternalStorageSettings from './ExternalStorageSettings.svelte'
-import { requestExternalStorageNow, resumeExternalStorageJob, requestExternalStorageDeleteHistory } from 'src/ts/storage/sync/external/production'
+import { requestExternalStorageNow, resumeExternalStorageJob, requestExternalStorageDeleteHistory, stopExternalStorageRestore } from 'src/ts/storage/sync/external/production'
 import { externalStorageStrings } from './strings'
 
 beforeEach(() => { state.failures.clear(); state.remedy = true })
@@ -241,6 +242,48 @@ describe('the storage usage tab', () => {
         expect(target.textContent).not.toContain(strings.completed)
         expect(labelled(strings.automaticBackup).disabled).toBe(false)
         expect([...target.querySelectorAll('button')].find(button => button.textContent?.trim() === strings.remove)?.disabled).toBe(false)
+    })
+
+    it('offers one confirmed stop for an unfinished restore in place of its error', async () => {
+        const error = { code: 'transient', message: 'synthetic', action: 'retry', retryable: false, reason: 'local-apply-unknown' }
+        const job = { id: 'unfinished-restore', connectionId: 'connection-1', kind: 'restore', state: 'uncertain',
+            phase: 'local-apply-unknown', reason: 'manual', targetRevision: '8', completedBytes: '0',
+            completedItems: '0', startedAtMs: '1', updatedAtMs: '1', applicationStarted: true, error }
+        state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0' },
+            connections: [{ ...connection(10, 30), status: 'error', lastError: error }], jobs: [job] })
+        state.jobStarted?.()
+        await settle()
+        expect(target.textContent).toContain(strings.restoreUnfinished)
+        expect(target.textContent).not.toContain(strings.publicationDecision)
+        expect(target.textContent).not.toContain(strings.retry)
+        expect(target.textContent).not.toContain(strings.uncertain)
+        const stop = () => [...target.querySelectorAll('button')].find(button => button.textContent?.trim() === strings.stopRestore)
+        vi.mocked(alertConfirm).mockResolvedValueOnce(false)
+        stop()!.click()
+        await settle()
+        expect(alertConfirm).toHaveBeenCalledWith(`${strings.stopRestoreTitle}\n${strings.stopRestoreDescription}`)
+        expect(stopExternalStorageRestore).not.toHaveBeenCalled()
+        vi.mocked(alertConfirm).mockResolvedValueOnce(true)
+        state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0' },
+            connections: [connection(10, 30)], jobs: [{ ...job, state: 'failed', phase: 'paused',
+                error: { code: 'cancelled', message: 'synthetic', action: 'retry', retryable: true } }] })
+        stop()!.click()
+        await settle()
+        expect(alertConfirm).toHaveBeenCalledTimes(2)
+        expect(alertCheckboxConfirm).not.toHaveBeenCalled()
+        expect(stopExternalStorageRestore).toHaveBeenCalledWith('unfinished-restore')
+        expect(target.textContent).not.toContain(strings.restoreUnfinished)
+        expect(stop()).toBeUndefined()
+    })
+
+    it('does not offer to stop a restore that is still running', async () => {
+        state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0' },
+            connections: [connection(10, 30)], jobs: [{ id: 'running-restore', connectionId: 'connection-1', kind: 'restore',
+                state: 'running', phase: 'downloading', completedBytes: '0', completedItems: '0', startedAtMs: '1', updatedAtMs: '1' }] })
+        state.jobStarted?.()
+        await settle()
+        expect([...target.querySelectorAll('button')].some(button => button.textContent?.trim() === strings.stopRestore)).toBe(false)
+        expect(target.textContent).not.toContain(strings.restoreUnfinished)
     })
 
     it('owns one snapshot export, reports progress and cancels that export ID', async () => {

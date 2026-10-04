@@ -569,8 +569,8 @@ impl ExternalLwwEngine {
                     let sha256 = String::new();
                     let object_id = String::new();
                     let assets = assets.into_values().collect::<Vec<_>>();
-                    let asset_job = if assets.is_empty() && controls.is_empty() && reused_controls.is_empty() && reused_assets.is_empty() {
-                        None
+                    let (asset_job, mut asset_pins) = if assets.is_empty() && controls.is_empty() && reused_controls.is_empty() && reused_assets.is_empty() {
+                        (None, None)
                     } else {
                         let job = super::journal::JobIdentity {
                             job_id,
@@ -584,14 +584,18 @@ impl ExternalLwwEngine {
                         let mut pins = crate::asset_repository::job_pins::DurableCasJob::begin(
                             &root, &job.job_id,
                             crate::asset_repository::job_pins::CasJobKind::OfficialPublicationOrExportPreparation,
+                            crate::asset_repository::job_pins::CasJobOwner::external_publication(&job.job_id),
                             super::runtime::now_ms() as i64,
                         ).map_err(transient)?;
-                        pins.pin_existing_batch(&cas, &assets.iter().filter(|asset| asset.local_pin).map(|asset| (
+                        let sealed = pins.pin_existing_batch(&cas, &assets.iter().filter(|asset| asset.local_pin).map(|asset| (
                             asset.content_hash.clone(), asset.byte_length,
                             crate::asset_repository::job_pins::CasObjectRole::DirectObject,
-                        )).collect::<Vec<_>>()).map_err(transient)?;
-                        pins.seal(store, super::runtime::now_ms() as i64).map_err(transient)?;
-                        Some(job)
+                        )).collect::<Vec<_>>()).and_then(|()| pins.seal(store, super::runtime::now_ms() as i64));
+                        if let Err(error) = sealed {
+                            let _ = pins.release(crate::asset_repository::job_pins::CasReleaseOutcome::Aborted);
+                            return Err(transient(error));
+                        }
+                        (Some(job), Some(pins))
                     };
                     let frozen_controls = frozen_controls.into_values().collect::<Vec<_>>();
                     let publication = SealedPublication {
@@ -618,9 +622,13 @@ impl ExternalLwwEngine {
                         dispatched: false,
                         complete: false,
                     };
-                    store
-                        .external_lww_persist(&publication, &bytes)
-                        .map_err(store_error)?;
+                    if let Err(error) = store.external_lww_persist(&publication, &bytes) {
+                        if let Some(pins) = asset_pins.as_mut() {
+                            let _ = pins.release(crate::asset_repository::job_pins::CasReleaseOutcome::Aborted);
+                        }
+                        return Err(store_error(error));
+                    }
+                    drop(asset_pins);
                     staged.keep();
                     (publication, bytes)
                 }

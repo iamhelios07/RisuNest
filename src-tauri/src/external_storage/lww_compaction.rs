@@ -256,7 +256,7 @@ impl ExternalLwwEngine {
             let id=journal.job_id();
             let mut job=match DurableCasJob::open(&self.connection_root,id) {
                 Ok(job)=>job,Err(failure) if failure.kind()==std::io::ErrorKind::NotFound=>DurableCasJob::begin(&self.connection_root,id,
-                    CasJobKind::OfficialPublicationOrExportPreparation,self.admitted_upper()? as i64).map_err(error)?,
+                    CasJobKind::OfficialPublicationOrExportPreparation,crate::asset_repository::job_pins::CasJobOwner::external_compaction(id),self.admitted_upper()? as i64).map_err(error)?,
                 Err(failure)=>return Err(error(failure)),
             };
             job.pin_existing_batch(&cas,&repack.iter().map(|source|(source.hash.clone(),source.byte_length,CasObjectRole::DirectObject)).collect::<Vec<_>>()).map_err(error)?;

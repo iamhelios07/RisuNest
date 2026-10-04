@@ -141,7 +141,7 @@ fn selected_archived_owner_hydration_requires_only_the_existing_full_inventory()
         tuple:["extra".into(),"assets/owner-archive.png".into(),"png".into()],
         payload_hash:Some(hex::decode(&asset).unwrap().try_into().unwrap()),
     }]).unwrap();
-    let mut job=DurableCasJob::begin(store.repository_root(),"selected-archive-owner",CasJobKind::CardOrModuleContentImport,1).unwrap();
+    let mut job=DurableCasJob::begin(store.repository_root(),"selected-archive-owner",CasJobKind::CardOrModuleContentImport,crate::asset_repository::job_pins::CasJobOwner::for_test(),1).unwrap();
     let manifest=job.prepare_reader(&cas,&mut canonical.as_slice(),CasObjectRole::OwnerManifest).unwrap();
     job.seal(&mut store,2).unwrap();
     let head=AssetOwnerHead::present(AssetOwnerLocator::CharacterAdditionalAssets { character_id:"selected-owner-archive".into() },manifest.content_hash.clone(),1);
@@ -422,6 +422,7 @@ fn residency_classification_preserves_live_plugin_snapshot_and_durable_job_roots
         &root,
         "synthetic-classification-job",
         CasJobKind::OfficialPublicationOrExportPreparation,
+        crate::asset_repository::job_pins::CasJobOwner::for_test(),
         1,
     )
     .unwrap();
@@ -453,6 +454,7 @@ fn corrupt_durable_job_proof_blocks_residency_cleanup_before_any_release() {
         root,
         "synthetic-broken-job",
         CasJobKind::OfficialPublicationOrExportPreparation,
+        crate::asset_repository::job_pins::CasJobOwner::for_test(),
         1,
     )
     .unwrap();

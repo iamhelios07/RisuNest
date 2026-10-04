@@ -221,6 +221,64 @@ fn two_actual_stores_publish_receive_and_quiet_listing() {
         assert_eq!(f.publish_a().await.segments.0, 0);
     })
 }
+fn assert_no_publication_pins_left(f: &CycleFixture) {
+    use crate::asset_repository::job_pins::{collect_durable_cas_job_roots, durable_cas_job_ids};
+    assert_eq!(durable_cas_job_ids(f.directory_a.path()).unwrap(), Vec::<String>::new());
+    let roots = collect_durable_cas_job_roots(f.directory_a.path());
+    assert!(roots.blockers.is_empty(), "{:?}", roots.blockers);
+}
+#[test]
+fn a_publication_that_cannot_seal_its_asset_pins_releases_them() {
+    run(async {
+        let mut f = CycleFixture::new();
+        small_asset(&mut f.a, "synthetic-seal-failure", &[43; 4096]);
+        rusqlite::Connection::open(f.directory_a.path().join("persistent/persistent.sqlite")).unwrap()
+            .execute_batch("CREATE TRIGGER fail_publication_seal BEFORE INSERT ON asset_objects
+                BEGIN SELECT RAISE(ABORT, 'synthetic'); END;").unwrap();
+        assert!(f.sender.publish(&mut f.a, DecimalU64(0), &[], &Cancellation::default()).await.is_err());
+        assert_no_publication_pins_left(&f);
+    })
+}
+#[test]
+fn a_publication_that_cannot_save_its_segment_releases_its_asset_pins() {
+    run(async {
+        let mut f = CycleFixture::new();
+        small_asset(&mut f.a, "synthetic-persist-failure", &[44; 4096]);
+        rusqlite::Connection::open(f.directory_a.path().join("persistent/device.sqlite")).unwrap()
+            .execute_batch("CREATE TRIGGER fail_publication_persist BEFORE INSERT ON external_lww_segments
+                BEGIN SELECT RAISE(ABORT, 'synthetic'); END;").unwrap();
+        assert!(f.sender.publish(&mut f.a, DecimalU64(0), &[], &Cancellation::default()).await.is_err());
+        assert_no_publication_pins_left(&f);
+    })
+}
+#[test]
+fn a_saved_publication_keeps_its_asset_pins_across_a_page_reload_until_it_is_sent() {
+    use crate::asset_repository::commands::{CasJobOwnerProbe, DurableCasJobState};
+    use crate::asset_repository::job_pins::durable_cas_job_ids;
+    run(async {
+        let mut f = CycleFixture::new();
+        small_asset(&mut f.a, "synthetic-saved-publication", &[45; 4096]);
+        f.provider.fail_upload_number(f.provider.upload_count() + 1, ErrorKind::Transient);
+        assert!(f.sender.publish(&mut f.a, DecimalU64(0), &[], &Cancellation::default()).await.is_err());
+        let root = f.directory_a.path().to_owned();
+        let journals = durable_cas_job_ids(&root).unwrap();
+        assert_eq!(journals.len(), 1);
+        let saved: bool = rusqlite::Connection::open(root.join("persistent/device.sqlite")).unwrap()
+            .query_row("SELECT EXISTS(SELECT 1 FROM external_lww_segments WHERE json_extract(metadata,'$.assetJob.jobId')=?1)",
+                [&journals[0]], |row| row.get(0)).unwrap();
+        assert!(saved);
+        let native_jobs = || -> std::result::Result<Vec<crate::native_file_jobs::JobStatus>, String> { Ok(Vec::new()) };
+        let open_store = || f.a.open_native_job_store().map_err(|error| error.to_string());
+        DurableCasJobState::default().sweep_after_page_start(&root, &CasJobOwnerProbe {
+            native_jobs: &native_jobs,
+            device_session_active: false,
+            open_store: &open_store,
+        }).unwrap();
+        assert_eq!(durable_cas_job_ids(&root).unwrap(), journals);
+        assert_eq!(f.publish_a().await.segments.0, 1);
+        assert_no_publication_pins_left(&f);
+    })
+}
 #[test]
 fn small_assets_use_authenticated_catalogs_and_present_bootstrap_reads_no_bodies() {
     run(async {

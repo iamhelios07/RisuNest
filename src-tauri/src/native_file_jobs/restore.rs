@@ -3005,7 +3005,7 @@ mod tests {
                 use crate::asset_repository::job_pins::{CasJobKind, CasReleaseOutcome, DurableCasJob};
                 use crate::asset_repository::PayloadCas;
                 let cas = PayloadCas::new(self.directory).unwrap();
-                let mut durable = DurableCasJob::begin(self.directory, &self.job.id(), CasJobKind::LocalBackupRestore, 0).unwrap();
+                let mut durable = DurableCasJob::begin(self.directory, &self.job.id(), CasJobKind::LocalBackupRestore, crate::asset_repository::job_pins::CasJobOwner::for_test(), 0).unwrap();
                 let payloads = super::super::legacy_backup::prepare_legacy_restore_payloads(entries, &cas, &mut durable, &NeverCancelled)?;
                 self.sink.cold_payloads = Some(payloads.cold_payloads);
                 durable.seal(&mut self.sink.store.lock().unwrap(), 0).unwrap();

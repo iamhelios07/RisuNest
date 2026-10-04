@@ -102,7 +102,7 @@ pub(crate) fn run(store:&mut PersistentStore,plan:&BodyPlan,job:&JobControl,scra
     job.set_progress(JobProgress {total_bytes:Some(missing_bytes),total_items:Some(missing.len() as u64),..Default::default()}).map_err(error)?;
     let mut pins=match DurableCasJob::open(store.repository_root(),&plan.protection_id) {
         Ok(pins)=>pins,
-        Err(failure) if failure.kind()==io::ErrorKind::NotFound=>DurableCasJob::begin(store.repository_root(),&plan.protection_id,CasJobKind::LocalBackupRestore,super::portable::now()).map_err(error)?,
+        Err(failure) if failure.kind()==io::ErrorKind::NotFound=>DurableCasJob::begin(store.repository_root(),&plan.protection_id,CasJobKind::LocalBackupRestore,crate::asset_repository::job_pins::CasJobOwner::native_file_job(&job.id()),super::portable::now()).map_err(error)?,
         Err(failure)=>return Err(error(failure)),
     };
     let outcome=(|| {

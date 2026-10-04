@@ -22,6 +22,7 @@ const mocks = vi.hoisted(() => ({
         startJob: vi.fn(),
         getJob: vi.fn(),
         cancelJob: vi.fn(),
+        stopRestore: vi.fn(),
         applyReceived: vi.fn(),
         confirmRestoreAdoption: vi.fn(async () => {}),
         openConflictSource: vi.fn(),
@@ -426,6 +427,20 @@ describe('external storage production integration', () => {
         dispose()
     })
 
+    it('stops an unfinished restore by its ID and takes the settled native state', async () => {
+        const { installExternalStorageProduction, stopExternalStorageRestore } = await import('./production')
+        await installExternalStorageProduction()
+        const stopped: ExternalJobSummary = { ...succeeded('old-sync', '8'), id: 'unfinished-restore', kind: 'restore',
+            state: 'failed', phase: 'paused', applicationStarted: true }
+        mocks.bridge.stopRestore.mockResolvedValue(stopped)
+        mocks.bridge.getState.mockClear()
+        await expect(stopExternalStorageRestore('unfinished-restore')).resolves.toBe(stopped)
+        expect(mocks.bridge.stopRestore).toHaveBeenCalledWith('unfinished-restore')
+        expect(mocks.bridge.getState).toHaveBeenCalledOnce()
+        expect(mocks.bridge.startJob).not.toHaveBeenCalled()
+        expect(mocks.flush).not.toHaveBeenCalled()
+    })
+
     it('keeps the same protected execution session through Home and foreground return', async () => {
         let visibility: DocumentVisibilityState = 'visible'
         const visible = vi.spyOn(document, 'visibilityState', 'get').mockImplementation(() => visibility)
@@ -548,6 +563,28 @@ describe('external storage production integration', () => {
         await expect(requestExternalStorageRestore('old-sync', 'snapshot-1', ['library'])).rejects.toThrow()
         expect(mocks.releaseFence).toHaveBeenCalledTimes(started ? 0 : 1)
         expect(recovery.hasPendingExternalApplication()).toBe(started)
+        expect(mocks.refreshWorkingSet).not.toHaveBeenCalled()
+    })
+
+    it('unlocks an unfinished restore once it is stopped', async () => {
+        const { installExternalStorageProduction, requestExternalStorageRestore } = await import('./production')
+        const recovery = await import('./applicationRecovery')
+        await installExternalStorageProduction()
+        const unfinished = (id: string) => ({
+            ...succeeded('old-sync', '8'), id, kind: 'restore', state: 'uncertain',
+            phase: 'local-apply-unknown', applicationStarted: true, result: undefined,
+        })
+        mocks.bridge.startJob.mockImplementation(async (_request, id) => unfinished(id))
+        await expect(requestExternalStorageRestore('old-sync', 'snapshot-1', ['library'])).rejects.toThrow()
+        expect(recovery.hasPendingExternalApplication()).toBe(true)
+        expect(mocks.releaseFence).not.toHaveBeenCalled()
+
+        mocks.bridge.startJob.mockImplementation(async (_request, id) => ({
+            ...unfinished(id), state: 'failed', phase: 'paused', restoreStopped: true,
+        }))
+        await expect(recovery.retryExternalApplication()).rejects.toThrow()
+        expect(recovery.hasPendingExternalApplication()).toBe(false)
+        expect(mocks.releaseFence).toHaveBeenCalledOnce()
         expect(mocks.refreshWorkingSet).not.toHaveBeenCalled()
     })
 

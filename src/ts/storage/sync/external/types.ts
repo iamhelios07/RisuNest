@@ -206,6 +206,7 @@ export interface StartExternalJobRequest {
 export interface ExternalJobSummary {
     id: string
     applicationStarted?: boolean
+    restoreStopped?: boolean
     reason?: 'automatic' | 'manual' | 'exitDrain'
     targetRevision?: DecimalString
     restoreRequest?: {

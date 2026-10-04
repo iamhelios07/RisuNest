@@ -357,6 +357,24 @@ pub(crate) async fn external_storage_cancel_job(app: AppHandle, job_id: String) 
     }.await)
 }
 #[tauri::command]
+pub(crate) async fn external_storage_stop_restore(app: AppHandle, job_id: String) -> Result<Value> {
+    logged("external_storage_stop_restore", async move {
+        let root = root(&app)?;
+        let store = JobStore::open(&root)?;
+        // A restore that is running again continues instead of stopping, and
+        // the claim keeps a worker from starting it while it stops.
+        let (_, _claim) = app.state::<JobCommandState>().claim(&store.read(&job_id)?)?;
+        let _permit = app.state::<crate::native_file_jobs::NativeFileJobState>()
+            .admission.file(false).map_err(local_error)?;
+        // A restore found applied stays applied even when recording that failed.
+        if reconcile_stopped_job(&app, store.read(&job_id)?)?.summary["state"] != "uncertain" {
+            return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+        }
+        let job = super::runtime_restore::stop_restore(&root, &job_id)?;
+        Ok(job_summary(&root, job))
+    }.await)
+}
+#[tauri::command]
 pub(crate) async fn external_storage_start_job(
     app: AppHandle,
     mut request: StartJobRequest,
@@ -661,7 +679,7 @@ fn settle_invalidated(job: &mut DurableJob, phase: &str) {
 }
 
 fn settle_local_restore_recovery(job: &mut DurableJob) -> bool {
-    if !super::runtime_restore::application_started(job) { return false; }
+    if !super::runtime_restore::application_started(job) || super::runtime_restore::restore_stopped(job) { return false; }
     job.summary["state"] = json!("uncertain");
     job.summary["phase"] = json!("local-apply-unknown");
     job.summary.as_object_mut().unwrap().remove("result");
@@ -1891,6 +1909,18 @@ mod tests {
         assert_eq!(job.summary["state"], "succeeded");
         assert_eq!(job.summary["result"]["receivedRevision"], "2");
         assert!(job.summary.get("error").is_none());
+    }
+
+    #[test]
+    fn a_stopped_restore_stays_failed_when_it_is_reconciled() {
+        let mut job = automatic_job();
+        job.request.kind = JobKind::Restore;
+        job.summary["applicationStarted"] = json!(true);
+        job.summary["state"] = json!("failed");
+        job.summary["restoreStopped"] = json!(true);
+        assert!(!settle_local_restore_recovery(&mut job));
+        assert_eq!(job.summary["state"], "failed");
+        assert!(job.terminal());
     }
 
     #[test]
