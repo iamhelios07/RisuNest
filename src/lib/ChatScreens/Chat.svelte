@@ -127,6 +127,7 @@
         parserAbortSignal?: AbortSignal
         restoredEditor?: ChatEditorDraft
         onEditorOpen?: () => void
+        onBodyRendered?: () => void
     }
 
     let {
@@ -167,6 +168,7 @@
         parserAbortSignal,
         restoredEditor,
         onEditorOpen,
+        onBodyRendered,
     }: Props = $props()
 
     let editDraft = $state(message)
@@ -846,6 +848,18 @@
 
     const initialEditor = untrack(() => restoredEditor)
     if (initialEditor) restoreEditor(initialEditor)
+
+    // The inline editor takes the message body's place, so closing it renders the body again.
+    let bodyReplacedByEditor = false
+    $effect(() => {
+        if (inlineEditMode) {
+            bodyReplacedByEditor = true
+            return
+        }
+        if (!bodyReplacedByEditor) return
+        bodyReplacedByEditor = false
+        untrack(() => onBodyRendered?.())
+    })
 
     function RenderGUIHtml(html:string){
         try {

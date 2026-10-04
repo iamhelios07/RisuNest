@@ -1162,6 +1162,7 @@
                             props: {
                                 restoredEditor: restoredEditor ?? undefined,
                                 onEditorOpen: () => holdOpenedEditor(instance),
+                                onBodyRendered: () => reportBodyRendered(instance),
                                 message: message.data,
                                 viewportRow,
                                 captureViewportTarget:
@@ -1639,6 +1640,11 @@
         if (key === undefined) return
         blurredEditorPins.add(key)
         addPin(key, 'editor')
+    }
+
+    function reportBodyRendered(instance: ChatInstance): void {
+        const key = [...mountInstances].find(([, value]) => value === instance)?.[0]
+        if (key !== undefined) chatView.contentRendered(key)
     }
 
     function pendingConversationDrafts(): readonly ChatEditorDraft[] {

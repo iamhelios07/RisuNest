@@ -39,6 +39,8 @@ export interface ChatViewReporter {
     rendered(key: string, report: ChatViewRowReport): void
     /** A mounted row was kept without rendering its content again. */
     updated(key: string, report: ChatViewRowReport): void
+    /** A mounted row rendered its content again by itself. */
+    contentRendered(key: string): void
     /** A mounted row kept its DOM under a new key. */
     moved(previousKey: string, nextKey: string): void
     removed(key: string): void
@@ -189,6 +191,13 @@ export function createChatViewEvents(dependencies: ChatViewEventDependencies) {
         schedule()
     }
 
+    function markRendered(key: string): void {
+        const entry = rows.get(key)
+        if (!entry || entry.streaming || listeners.size === 0) return
+        rerendered.add(key)
+        schedule()
+    }
+
     function move(previousKey: string, nextKey: string): void {
         const entry = rows.get(previousKey)
         if (!entry || previousKey === nextKey) return
@@ -227,6 +236,7 @@ export function createChatViewEvents(dependencies: ChatViewEventDependencies) {
                 updated: (key, report) => {
                     if (!disposed) record(prefix + key, report, false)
                 },
+                contentRendered: (key) => markRendered(prefix + key),
                 moved: (previousKey, nextKey) => move(prefix + previousKey, prefix + nextKey),
                 removed: (key) => remove(prefix + key),
                 dispose() {

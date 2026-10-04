@@ -88,6 +88,20 @@ describe('chat view events', () => {
         expect(drain()).toEqual([])
     })
 
+    it('reports a row that rendered its content again by itself, unless its reply is streaming', () => {
+        const { reporter, listen, drain } = setup()
+        reporter.contentRendered('k1')
+        listen()
+        reporter.rendered('k1', report(1))
+        reporter.rendered('tail', report(2, { streaming: true }))
+        drain()
+
+        reporter.contentRendered('k1')
+        reporter.contentRendered('tail')
+        reporter.contentRendered('unknown')
+        expect(drain()).toEqual([rows([], [], [row(1)])])
+    })
+
     it('reports a row that changed its index as unmounted and mounted again', () => {
         const { reporter, listen, drain } = setup()
         listen()
