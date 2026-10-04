@@ -1958,6 +1958,82 @@ fn returning_to_a_repository_without_its_pending_state_counts_a_landed_segment_w
         assert_eq!(f.b.read_root(None).unwrap().value["askRemoval"], true);
     })
 }
+fn job_released(store: &PersistentStore, job: &crate::external_storage::journal::JobIdentity) -> bool {
+    match crate::asset_repository::job_pins::DurableCasJob::open(store.repository_root(), &job.job_id) {
+        Ok(_) => false,
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+fn writer_rows(store: &PersistentStore, table: &str, writer: &str) -> i64 {
+    store.device_store().unwrap().connection()
+        .query_row(&format!("SELECT count(*) FROM {table} WHERE writer=?1"), [writer], |r| r.get(0))
+        .unwrap()
+}
+#[test]
+fn a_new_device_switch_drops_the_old_writers_segments_and_releases_their_files() {
+    run(async {
+        use crate::persistent_store::sync_selection::SyncTarget;
+        let mut f = CycleFixture::new();
+        let target = SyncTarget::External("repository".into());
+        let first = bind_external(&mut f.a, &f.sender, &target);
+        set(&mut f.a, &["root", "language"], serde_json::json!("ja"));
+        f.sender.publish(&mut f.a, first, &[], &Cancellation::default()).await.unwrap();
+        small_asset(&mut f.a, "synthetic-asset", b"synthetic old writer asset");
+        let pending = send_unconfirmed(&mut f, first, false).await;
+        let job = pending.asset_job.clone().expect("the segment holds its asset");
+        let old_writer = f.a.lww_clock_state().unwrap().writer_id;
+        assert_eq!(writer_rows(&f.a, "external_lww_segments", &old_writer), 2);
+        assert_eq!(writer_rows(&f.a, "external_lww_sequences", &old_writer), 1);
+        bind_elsewhere(&mut f.a);
+        let (header, inspection) = binding_context(&f.a, &f.sender, "synthetic-new-device");
+        let stage = f.sender.stage_binding(&mut f.a, &header, &inspection, &Cancellation::default()).await.unwrap();
+        let preparation = f.a.prepare_lww_new_device(&header, &stage.staging_id).unwrap();
+        f.a.authorize_lww_new_device(&preparation.authorization_id).unwrap();
+        let result = f.a.lww_replace_target_as_new_device(&header, &stage.staging_id, &preparation.authorization_id).unwrap();
+        assert_ne!(result.writer_id, old_writer);
+        assert_eq!(writer_rows(&f.a, "external_lww_segments", &old_writer), 0);
+        assert_eq!(writer_rows(&f.a, "external_lww_sequences", &old_writer), 0);
+        assert!(job_released(&f.a, &job));
+    })
+}
+#[test]
+fn removing_a_connection_drops_its_settled_and_unsent_segments_and_keeps_a_sent_one_without_files() {
+    run(async {
+        use crate::persistent_store::sync_selection::SyncTarget;
+        let mut f = CycleFixture::new();
+        let target = SyncTarget::External("repository".into());
+        let first = bind_external(&mut f.a, &f.sender, &target);
+        set(&mut f.a, &["root", "language"], serde_json::json!("ja"));
+        f.sender.publish(&mut f.a, first, &[], &Cancellation::default()).await.unwrap();
+        small_asset(&mut f.a, "synthetic-asset", b"synthetic sent asset");
+        let sent = send_unconfirmed(&mut f, first, false).await;
+        let sent_job = sent.asset_job.clone().expect("the sent segment holds its asset");
+        let scope = f.sender.target_scope();
+        let writer = f.a.lww_clock_state().unwrap().writer_id;
+        f.a.external_lww_forget_target(&scope).unwrap();
+        let (kept, _) = f.a.external_lww_pending(&scope, &writer).unwrap().unwrap();
+        assert_eq!(kept.seq, sent.seq);
+        assert!(kept.dispatched && !kept.complete);
+        assert!(kept.asset_job.is_none() && kept.assets.is_empty() && kept.reused_assets.is_empty());
+        assert!(job_released(&f.a, &sent_job));
+        assert_eq!(writer_rows(&f.a, "external_lww_segments", &writer), 1);
+        assert_eq!(f.a.external_lww_next_sequence(&scope, &writer).unwrap(), sent.seq.0);
+        let arrays: bool = f.a.device_store().unwrap().connection().query_row(
+            "SELECT json_type(metadata,'$.assets')='array' AND json_type(metadata,'$.reusedAssets')='array' FROM external_lww_segments WHERE writer=?1",
+            [&writer], |r| r.get(0)).unwrap();
+        assert!(arrays);
+
+        let mut g = CycleFixture::new();
+        let bound = bind_external(&mut g.a, &g.sender, &target);
+        small_asset(&mut g.a, "synthetic-asset", b"synthetic unsent asset");
+        let unsent = seal_unsent(&mut g, bound).await;
+        let unsent_job = unsent.asset_job.clone().expect("the unsent segment holds its asset");
+        let writer = g.a.lww_clock_state().unwrap().writer_id;
+        g.a.external_lww_forget_target(&g.sender.target_scope()).unwrap();
+        assert_eq!(writer_rows(&g.a, "external_lww_segments", &writer), 0);
+        assert!(job_released(&g.a, &unsent_job));
+    })
+}
 #[test]
 fn a_landed_segment_that_cleanup_removed_after_a_checkpoint_keeps_its_sequence_on_return() {
     run(async {

@@ -1327,9 +1327,8 @@ impl ExternalLwwEngine {
             } else {
                 crate::asset_repository::job_pins::CasReleaseOutcome::Aborted
             };
-            crate::asset_repository::job_pins::DurableCasJob::open(store.repository_root(), &job.job_id)
-                .and_then(|mut pins| pins.release(outcome))
-                .map_err(transient)?;
+            crate::persistent_store::external_lww::release_cas_job(store.repository_root(), &job.job_id, outcome)
+                .map_err(store_error)?;
         }
         Ok(())
     }
