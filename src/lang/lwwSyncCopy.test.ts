@@ -28,6 +28,11 @@ it('preserves the exact approved Korean replacement and restore copy', () => {
         restoreDescriptionBound: '현재 데이터를 초기화한 후 선택한 백업으로 복원하며, 복원한 내용은 원격으로 동기화됩니다. 백업이 필요한 경우 수동으로 백업해주세요.',
         restoreDescription: '현재 데이터를 초기화한 후 선택한 백업으로 복원합니다. 백업이 필요한 경우 수동으로 백업해주세요.',
         restoreAcknowledge: '현재 데이터 초기화', restoreAction: '복원',
+        previousFilesTitle: '연결하시겠습니까?',
+        previousFilesDescription: '이전에 연결한 서버나 외부 저장소에만 있는 파일이 있습니다. 연결하면 이 파일을 새 연결 대상에도 저장하며, 이 기기에도 보관하려면 다운로드 후 연결을 선택하세요.',
+        downloadThenConnect: '다운로드 후 연결',
+        downloadFailedNotConnected: '파일을 다운로드하지 못해 연결하지 않았습니다. 다시 시도하거나 다운로드하지 않고 연결하세요.',
+        previousStorageUnavailable: '이전에 연결한 서버나 외부 저장소에만 있는 파일을 가져오지 못해 동기화하지 못했습니다. 연결할 수 있을 때 다시 시도하세요.',
     })
 })
 it('preserves the exact approved English new-device action', () => {

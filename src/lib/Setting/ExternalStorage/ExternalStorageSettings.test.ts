@@ -24,6 +24,9 @@ const state = vi.hoisted(() => ({
     deleteConflict: vi.fn(),
     beginConnectionSettingsExport: vi.fn(),
     saveConnectionSettingsFile: vi.fn(),
+    removeConnection: vi.fn(),
+    residency: vi.fn(),
+    downloadRemote: vi.fn(),
 }))
 
 vi.mock('src/ts/platform', () => ({ isTauri: true, isTauriAndroid: false, isTauriIOS: false }))
@@ -33,7 +36,8 @@ vi.mock('qrcode', () => ({ default: { toDataURL: vi.fn() } }))
 vi.mock('src/ts/alert', () => ({ alertConfirm: vi.fn(), alertNormal: vi.fn(), alertCheckboxConfirm: vi.fn() }))
 vi.mock('src/ts/storage/sync/external/lwwProduction', () => ({ requestExternalLwwNow: state.syncNow, supportsExternalLwwNewDevice: () => state.remedy, subscribeExternalLwwFailures(callback: (value: ReadonlyMap<string, unknown>) => void) { callback(new Map(state.failures)); return () => {} } }))
 vi.mock('src/ts/storage/sync/bindingRegistry', () => ({ bindSyncTarget: state.bind, unbindSyncTarget: state.unbind }))
-vi.mock('src/lang', () => ({ language: { lwwSync: { newDeviceAction: 'Connect as new device', clockBlocked: 'Correct the device clock and retry.' } } }))
+vi.mock('src/lang', () => ({ language: { lwwSync: { newDeviceAction: 'Connect as new device', clockBlocked: 'Correct the device clock and retry.', previousStorageUnavailable: 'The previous storage could not be reached.', downloadFailedNotConnected: 'The files could not be downloaded, so the connection was not made.' } } }))
+vi.mock('src/ts/storage/sync/serverAssetResidency', () => ({ getAssetResidencyStatus: state.residency, downloadRemoteAssets: state.downloadRemote }))
 vi.mock('src/ts/stores.svelte' , () => ({ DBState: { db: { language: 'en' } } }))
 vi.mock('src/ts/storage/sync/external/production', () => ({
     refreshExternalStorageProductionState: vi.fn(async () => {}),
@@ -66,6 +70,7 @@ vi.mock('src/ts/storage/sync/external/bridge', () => ({
         deleteConflict: state.deleteConflict,
         beginConnectionSettingsExport: state.beginConnectionSettingsExport,
         saveConnectionSettingsFile: state.saveConnectionSettingsFile,
+        removeConnection: state.removeConnection,
     }),
 }))
 
@@ -564,4 +569,110 @@ describe('a running job', () => {
         expect(shown).not.toContain(strings.completed)
         expect(shown).not.toContain(strings.checkSummary.split('{0}')[0])
     })
+})
+
+describe('removing a connection', () => {
+    const held = (entries: { connectionId: string, objects: number }[]) => ({ policy: 'remote', localBytes: 0, remoteBytes: 1, remoteObjects: 1,
+        serverBytes: 0, serverObjects: 0, externalObjects: entries, unavailableObjects: 0, evictedBytes: 0 })
+    const removeButton = () => [...target.querySelectorAll('button')].find(button => button.textContent?.trim() === strings.remove)!
+    beforeEach(async () => {
+        state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0', paused: false, decisionRequired: false },
+            connections: [connection(10, 30)], jobs: [] })
+        state.listHistory.mockResolvedValue({ items: [] })
+        state.removeConnection.mockResolvedValue(undefined)
+        target = document.createElement('div')
+        document.body.append(target)
+        component = mount(ExternalStorageSettings, { target })
+        await settle()
+    })
+    afterEach(() => {
+        if (component) unmount(component)
+        component = undefined
+        target.remove()
+        vi.clearAllMocks()
+    })
+
+    it.each([
+        { name: 'holds no file', status: () => state.residency.mockResolvedValue(held([])) },
+        { name: 'is not the one holding files', status: () => state.residency.mockResolvedValue(held([{ connectionId: 'other', objects: 3 }])) },
+        { name: 'cannot be read', status: () => state.residency.mockRejectedValue({ code: 'local-storage' }) },
+    ])('asks the plain confirmation when the status $name', async ({ status }) => {
+        status()
+        vi.mocked(alertConfirm).mockResolvedValue(true)
+        removeButton().click(); await settle()
+        expect(alertCheckboxConfirm).not.toHaveBeenCalled(); expect(alertConfirm).toHaveBeenCalledOnce()
+        expect(state.removeConnection).toHaveBeenCalledExactlyOnceWith('connection-1'); expect(state.downloadRemote).not.toHaveBeenCalled()
+    })
+    it('asks once with an unchecked download option for files only this connection holds', async () => {
+        state.residency.mockResolvedValue(held([{ connectionId: 'connection-1', objects: 2 }]))
+        vi.mocked(alertCheckboxConfirm).mockResolvedValue({ confirmed: false, checked: false })
+        removeButton().click(); await settle()
+        expect(alertCheckboxConfirm).toHaveBeenCalledExactlyOnceWith({
+            title: strings.removeRemoteOnlyTitle, description: strings.removeRemoteOnly, checkboxLabel: strings.downloadThenRemove,
+            actionLabel: strings.remove, cancelLabel: strings.cancel, requireChecked: false,
+        })
+        expect(alertConfirm).not.toHaveBeenCalled()
+        expect(state.removeConnection).not.toHaveBeenCalled(); expect(state.downloadRemote).not.toHaveBeenCalled()
+    })
+    it('removes without downloading when the option stays unchecked', async () => {
+        state.residency.mockResolvedValue(held([{ connectionId: 'connection-1', objects: 2 }]))
+        vi.mocked(alertCheckboxConfirm).mockResolvedValue({ confirmed: true, checked: false })
+        removeButton().click(); await settle()
+        expect(state.downloadRemote).not.toHaveBeenCalled(); expect(state.removeConnection).toHaveBeenCalledExactlyOnceWith('connection-1')
+    })
+    it('downloads the files this connection holds, then removes it', async () => {
+        state.residency.mockResolvedValue(held([{ connectionId: 'connection-1', objects: 2 }]))
+        vi.mocked(alertCheckboxConfirm).mockResolvedValue({ confirmed: true, checked: true })
+        state.downloadRemote.mockResolvedValue(held([]))
+        removeButton().click(); await settle()
+        expect(state.downloadRemote).toHaveBeenCalledExactlyOnceWith('connection-1')
+        expect(state.removeConnection).toHaveBeenCalledExactlyOnceWith('connection-1')
+        expect(state.downloadRemote.mock.invocationCallOrder[0]).toBeLessThan(state.removeConnection.mock.invocationCallOrder[0])
+        expect(target.querySelector('[role="alert"]')).toBeNull()
+    })
+    it('keeps the connection and explains it when the download fails', async () => {
+        state.residency.mockResolvedValue(held([{ connectionId: 'connection-1', objects: 2 }]))
+        vi.mocked(alertCheckboxConfirm).mockResolvedValue({ confirmed: true, checked: true })
+        state.downloadRemote.mockRejectedValue({ code: 'required-asset-unavailable', status: 409, retryable: false })
+        removeButton().click(); await settle()
+        expect(state.removeConnection).not.toHaveBeenCalled()
+        expect(target.querySelector('[role="alert"]')?.textContent).toBe(strings.downloadFailedKeptConnection)
+    })
+    it('keeps the connection without a message when the download is cancelled', async () => {
+        state.residency.mockResolvedValue(held([{ connectionId: 'connection-1', objects: 2 }]))
+        vi.mocked(alertCheckboxConfirm).mockResolvedValue({ confirmed: true, checked: true })
+        state.downloadRemote.mockRejectedValue({ code: 'cancelled', status: 409, retryable: true })
+        removeButton().click(); await settle()
+        expect(state.removeConnection).not.toHaveBeenCalled()
+        expect(target.querySelector('[role="alert"]')).toBeNull()
+    })
+})
+
+it('explains a sync stopped because the previous storage could not be reached', async () => {
+    state.failures.set('connection-1', { kind: 'previousStorageUnavailable' })
+    state.getState.mockResolvedValue({ supported: true, selection: { kind: 'external', connectionId: 'connection-1', selectionEpoch: '0', paused: false, decisionRequired: false },
+        connections: [{ ...connection(10, 30), purpose: 'sync', strategy: 'sequential' }], jobs: [] })
+    state.listHistory.mockResolvedValue({ items: [] })
+    target = document.createElement('div')
+    document.body.append(target)
+    component = mount(ExternalStorageSettings, { target }); await settle()
+    expect(target.textContent).toContain('The previous storage could not be reached.')
+    expect(target.textContent).not.toContain(strings.errorGeneric)
+    unmount(component); component = undefined; target.remove()
+})
+
+it('explains a connection not made because the files could not be downloaded first', async () => {
+    state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0', paused: false, decisionRequired: false },
+        connections: [{ ...connection(10, 30), purpose: 'sync', strategy: 'sequential' }], jobs: [] })
+    state.listHistory.mockResolvedValue({ items: [] })
+    state.bind.mockRejectedValue(Object.assign(new Error('download failed'), { code: 'previous-files-download-failed' }))
+    target = document.createElement('div')
+    document.body.append(target)
+    component = mount(ExternalStorageSettings, { target }); await settle()
+    const toggle = [...target.querySelectorAll('label')].find(item => item.textContent?.trim() === strings.sync)?.querySelector('input')
+    expect(toggle).toBeDefined()
+    toggle!.click(); await settle()
+    expect(state.bind).toHaveBeenCalledWith({ kind: 'external', connectionId: 'connection-1' })
+    expect(target.querySelector('[role="alert"]')?.textContent).toBe('The files could not be downloaded, so the connection was not made.')
+    unmount(component); component = undefined; target.remove()
 })

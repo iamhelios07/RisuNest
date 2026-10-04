@@ -834,7 +834,7 @@ impl ExternalLwwEngine {
                     let source = if let Some(proof) = &asset.remote_source {
                         let spool = super::lww_residency::spool_frozen_remote_body(
                             proof, &root.join("external-storage").join("lww-publications").join(&job.job_id), cancel,
-                        ).await?.into_temp_path();
+                        ).await.map_err(Self::held_body_error)?.into_temp_path();
                         Self::check_publication_authority(store, &publication)?;
                         let source = super::content_store::ObjectSource::File(spool.to_path_buf());
                         spools.push(spool);
@@ -1099,6 +1099,20 @@ impl ExternalLwwEngine {
             else if error.code == "binding-authority-changed" || error.code == "binding-authority-unavailable" { ErrorKind::PreconditionFailed }
             else { ErrorKind::Transient })
     }
+    /// A body the server or external storage that holds it could not provide.
+    fn held_body_error(error: ProviderError) -> ProviderError {
+        match error.kind {
+            ErrorKind::Cancelled | ErrorKind::PreconditionFailed | ErrorKind::Corrupt
+                | ErrorKind::LocalStorageFull | ErrorKind::LocalPermissionDenied => error,
+            _ => ProviderError { kind: ErrorKind::PreviousStorageUnavailable, http_status: None, retry_at_ms: None,
+                oauth_error: None, oauth_error_description: None, cause: error.cause },
+        }
+    }
+    fn held_server_body_error(error: crate::server_sync::SyncError, cancel: &Cancellation) -> ProviderError {
+        if error.code == "local-storage-full" { return ProviderError::new(ErrorKind::LocalStorageFull); }
+        let cause = ErrorCause(Some(error.code.clone()));
+        Self::held_body_error(ProviderError { cause, ..Self::body_source_error(error, cancel) })
+    }
     async fn open_frozen_server_body(
         store: &mut PersistentStore, asset: &FrozenAsset, job: &super::journal::JobIdentity,
         authority: DecimalU64, cancel: &Cancellation,
@@ -1117,7 +1131,7 @@ impl ExternalLwwEngine {
             std::fs::create_dir_all(&scratch).map_err(transient)?;
             let check = || Self::check_frozen_body_authority(&store, authority, &cancel);
             crate::server_sync::residency::open_transient_server_proof_with_check(&root, &scratch, &proof, &check)
-                .map_err(|error| Self::body_source_error(error, &cancel))?.ok_or_else(segment::corrupt)
+                .map_err(|error| Self::held_server_body_error(error, &cancel))?.ok_or_else(segment::corrupt)
         }).await.map_err(transient)?
     }
     async fn read_frozen_standalone(
@@ -1134,7 +1148,7 @@ impl ExternalLwwEngine {
         } else if let Some(proof) = &asset.remote_source {
             let spool = super::lww_residency::spool_frozen_remote_body(
                 proof, &store.repository_root().join("external-storage").join("lww-publications").join(&job.job_id), cancel,
-            ).await?;
+            ).await.map_err(Self::held_body_error)?;
             Self::check_frozen_body_authority(store, authority, cancel).map_err(|error| Self::body_source_error(error, cancel))?;
             super::lww_residency::read_frozen_body_spool(proof, &spool, cancel)?
         } else {

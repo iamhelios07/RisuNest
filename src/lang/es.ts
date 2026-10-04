@@ -1507,5 +1507,10 @@ export const languageSpanish = {
         restoreDescription: "Se borrarán los datos actuales y se restaurará la copia seleccionada. Si necesita una copia de seguridad, créela manualmente.",
         restoreAcknowledge: "Borrar los datos actuales",
         restoreAction: "Restaurar",
+        previousFilesTitle: "¿Conectar?",
+        previousFilesDescription: "Algunos archivos solo están guardados en el servidor o almacenamiento externo usado antes. Al conectar, también se guardan en el nuevo destino. Para conservarlos también en este dispositivo, elija Descargar y luego conectar.",
+        downloadThenConnect: "Descargar y luego conectar",
+        downloadFailedNotConnected: "No se pudieron descargar los archivos, así que no se realizó la conexión. Vuelva a intentarlo o conecte sin descargar.",
+        previousStorageUnavailable: "No se pudieron obtener archivos guardados solo en el servidor o almacenamiento externo usado antes, así que la sincronización se detuvo. Vuelva a intentarlo cuando se pueda acceder.",
     },
 } satisfies DeepPartial<typeof import('./en').languageEnglish>;

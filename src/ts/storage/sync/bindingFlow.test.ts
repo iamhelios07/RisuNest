@@ -647,3 +647,66 @@ it('drains coordinator-queued plugin mutations before acquiring pause', async ()
     s.deps.withPausedWrites = async operation => { paused = true; try { return await operation() } finally { paused = false } }
     await s.flow.bind(target,s.transport)
 })
+
+describe('files held only by the previous storage', () => {
+    const next = { kind: 'external', connectionId: 'next' } as const
+    function ask(s: ReturnType<typeof setup>, choice: 'connect' | 'download-then-connect' | 'cancel', download: () => Promise<void> = async () => {}) {
+        const confirm = vi.fn<NonNullable<SyncBindingDependencies['confirmPreviousStorageFiles']>>(async () => { s.events.push('previous-files'); return choice })
+        s.deps.confirmPreviousStorageFiles = confirm
+        s.deps.downloadPreviousStorageFiles = async () => { s.events.push('download'); await download() }
+        return confirm
+    }
+    async function boundElsewhere() {
+        const s = setup({ empty: true }); await s.flow.bind(target, s.transport); s.events.length = 0
+        return s
+    }
+    it('asks once before the switch of a first binding to an empty target and connects as usual', async () => {
+        const s = setup({ empty: true })
+        const confirm = ask(s, 'connect')
+        expect(await s.flow.bind(target, s.transport)).toMatchObject({ kind: 'bound', action: 'initialized' })
+        expect(s.events).toEqual(['inspect', 'previous-files', 'jobs-fence', 'pause-flush', 'gate', 'switch', 'refresh', 'publish', 'resume'])
+        expect(confirm).toHaveBeenCalledOnce()
+        expect(confirm.mock.calls[0][0]).toMatchObject({ target, state: { targetAuthority: '0' } })
+    })
+    it('stays unconnected when the dialog is cancelled', async () => {
+        const s = await boundElsewhere()
+        ask(s, 'cancel')
+        expect(await s.flow.bind(next, s.transport)).toEqual({ kind: 'cancelled' })
+        expect(s.events).toEqual(['inspect', 'previous-files'])
+        expect(await s.deps.native.state()).toMatchObject({ target, targetAuthority: '1' })
+    })
+    it('downloads the files after fencing the previous binding and before the switch', async () => {
+        const s = await boundElsewhere()
+        ask(s, 'download-then-connect')
+        expect(await s.flow.bind(next, s.transport)).toMatchObject({ kind: 'bound', action: 'initialized' })
+        expect(s.events).toEqual(['inspect', 'previous-files', 'jobs-fence', 'download', 'pause-flush', 'gate', 'switch', 'refresh', 'publish', 'resume'])
+    })
+    it('does not switch and resumes the previous binding when the download fails', async () => {
+        const s = await boundElsewhere()
+        const cause = { code: 'required-asset-unavailable' }
+        ask(s, 'download-then-connect', async () => { throw cause })
+        const failure = await s.flow.bind(next, s.transport).catch(error => error)
+        expect(failure).toMatchObject({ code: 'previous-files-download-failed', cause })
+        expect(s.events).toEqual(['inspect', 'previous-files', 'jobs-fence', 'download', 'resume'])
+        expect(await s.deps.native.state()).toMatchObject({ target, targetAuthority: '1' })
+    })
+    it('stays unconnected without an error when the download is cancelled', async () => {
+        const s = await boundElsewhere()
+        ask(s, 'download-then-connect', async () => { throw { code: 'cancelled' } })
+        expect(await s.flow.bind(next, s.transport)).toEqual({ kind: 'cancelled' })
+        expect(s.events).toEqual(['inspect', 'previous-files', 'jobs-fence', 'download', 'resume'])
+        expect(await s.deps.native.state()).toMatchObject({ target, targetAuthority: '1' })
+    })
+    it.each([
+        { name: 'a replacement from a non-empty target', options: { empty: false }, prepare: () => {} },
+        { name: 'a rebind to the library this device was bound to', options: { empty: true, previouslyBoundLibrary: true }, prepare: () => {} },
+        { name: 'a binding resumed after its switch', options: { empty: true }, prepare: (s: ReturnType<typeof setup>) => s.setState({ target, targetAuthority: '9', selectionEpoch: 'same', libraryId: 'library', progress: null }) },
+    ])('does not ask for $name', async ({ options, prepare }) => {
+        const s = setup(options)
+        prepare(s)
+        const confirm = ask(s, 'cancel')
+        expect(await s.flow.bind(target, s.transport)).toMatchObject({ kind: 'bound' })
+        expect(confirm).not.toHaveBeenCalled()
+        expect(s.events).not.toContain('download')
+    })
+})

@@ -12,7 +12,7 @@ vi.mock('@tauri-apps/api/event', () => ({ listen: async () => () => {} }))
 vi.mock('src/ts/platform', () => ({ isTauri: true }))
 vi.mock('src/ts/stores.svelte', () => ({ selectedCharID: { subscribe: (run: (value: number) => void) => { run(-1); return () => {} } } }))
 vi.mock('../database.svelte', () => ({ getDatabase: () => ({ characters: [] }) }))
-vi.mock('./bindingDialog', () => ({ confirmSyncBindingReplacement: async () => true }))
+vi.mock('./bindingDialog', () => ({ confirmSyncBindingReplacement: async () => true, confirmPreviousStorageFiles: async () => 'connect', downloadPreviousStorageFiles: async () => {} }))
 vi.mock('./bindingLocalData', () => ({ hasLocalBindingData: async () => false, hasLocalSharedBindingData: async () => false }))
 vi.mock('../persistentDataRuntime.svelte', () => ({
     getPersistentDataRuntime: () => f.runtime,

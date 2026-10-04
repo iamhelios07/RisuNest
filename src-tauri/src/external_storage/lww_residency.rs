@@ -294,6 +294,41 @@ pub(crate) fn source(root: &Path, hash: &str) -> Result<Option<Source>> {
 pub(crate) fn stat(root: &Path, hash: &str) -> std::io::Result<Option<u64>> {
     RemoteBodies::open(root)?.stat(hash)
 }
+/// Forgets every body a removed connection held, so nothing counts or
+/// downloads them from it again. `orphaned` receives the bodies no other
+/// source holds and runs before the removal commits, so its failure keeps the
+/// sources.
+pub(crate) fn remove_connection_sources(
+    root: &Path,
+    connection_id: &str,
+    orphaned: impl FnOnce(&[String]) -> std::io::Result<()>,
+) -> Result<()> {
+    let Some(mut db) = database(root, false)? else {
+        return Ok(());
+    };
+    let transaction = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(local)?;
+    let mut hashes = std::collections::BTreeSet::new();
+    for table in ["sources", "packed_sources"] {
+        let filter = format!("FROM {table} WHERE json_extract(source,'$.connectionId')=?1");
+        let mut statement = transaction.prepare(&format!("SELECT hash {filter}")).map_err(local)?;
+        for hash in statement.query_map([connection_id], |row| row.get::<_, String>(0)).map_err(local)? {
+            hashes.insert(hash.map_err(local)?);
+        }
+        transaction.execute(&format!("DELETE {filter}"), [connection_id]).map_err(local)?;
+    }
+    let mut remaining = transaction
+        .prepare("SELECT EXISTS(SELECT 1 FROM sources WHERE hash=?1) OR EXISTS(SELECT 1 FROM packed_sources WHERE hash=?1)")
+        .map_err(local)?;
+    let mut orphans = Vec::new();
+    for hash in hashes {
+        if !remaining.query_row([&hash], |row| row.get::<_, bool>(0)).map_err(local)? {
+            orphans.push(hash);
+        }
+    }
+    drop(remaining);
+    orphaned(&orphans).map_err(local)?;
+    transaction.commit().map_err(local)
+}
 pub(crate) fn validate_packed_source<O:Borrow<StoredObject>>(source:&PackedSource<O>,repository:&RepositoryHandle) -> Result<()> {
     risunest_sync_wire::validate_hash(&source.hash).map_err(local)?;
     let catalog:&StoredObject=source.catalog.borrow();

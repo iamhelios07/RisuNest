@@ -261,6 +261,10 @@ impl Residency {
             .map_err(|error| std::io::Error::other(error.code))
             .and_then(|size| match size { Some(size) => Ok(Some(size)), None => crate::external_storage::lww_residency::stat(&self.root, digest) })
     }
+    /// The custody half of `gc_size`.
+    pub(crate) fn custody_size(&self, digest: &str) -> Result<Option<u64>> {
+        Ok(self.lookup(digest, None, false)?.map(|object| object.size))
+    }
     pub fn page(&self, after: &str) -> Result<Vec<(String, String, u64)>> {
         let mut statement=self.db.prepare("SELECT context||'/'||hash,hash,size FROM objects WHERE state!='released' AND context||'/'||hash>?1 ORDER BY context,hash LIMIT 128")?;
         let rows = statement

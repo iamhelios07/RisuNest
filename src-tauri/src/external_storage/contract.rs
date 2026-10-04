@@ -42,6 +42,9 @@ pub(crate) enum ErrorKind {
     FolderInaccessible,
     FolderNotRepository,
     FolderUnsupportedLocation,
+    /// A body this device does not hold could not be fetched from the server
+    /// or external storage that holds it.
+    PreviousStorageUnavailable,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
