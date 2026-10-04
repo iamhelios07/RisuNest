@@ -196,6 +196,40 @@ pub(crate) fn restore_journal_owner_ended(
     }
 }
 
+/// Whether a person stopped this restore after its local application could
+/// not be confirmed, which ends it as it is.
+pub(crate) fn restore_stopped(job: &DurableJob) -> bool {
+    job.terminal() && job.summary["restoreStopped"] == true
+}
+
+/// Ends a restore whose local application could not be confirmed. The library
+/// stays as it is, and the files the restore still held are released.
+pub(crate) fn stop_restore(root: &Path, job_id: &str) -> Result<DurableJob> {
+    let jobs = JobStore::open(root)?;
+    let mut job = jobs.read(job_id)?;
+    if !application_started(&job) || job.summary["state"] != "uncertain" {
+        return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+    }
+    job.summary["state"] = json!("failed");
+    job.summary["phase"] = json!("paused");
+    job.summary["restoreStopped"] = json!(true);
+    job.summary.as_object_mut().ok_or_else(corrupt)?.remove("result");
+    job.summary["error"] = runtime::error_dto(&ProviderError::new(ErrorKind::Cancelled));
+    job.summary["updatedAtMs"] = json!(runtime::now_ms().to_string());
+    jobs.put(&job)?;
+    // A failed release leaves a journal whose restore has ended, which the
+    // next page start releases.
+    match crate::asset_repository::job_pins::DurableCasJob::open(root, job_id) {
+        Ok(mut pins) => pins
+            .release(crate::asset_repository::job_pins::CasReleaseOutcome::Aborted)
+            .map_err(runtime::local_error)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(runtime::local_error(error)),
+    }
+    discard_finished_staging(root, &job);
+    Ok(job)
+}
+
 #[cfg(test)]
 fn mark_application_started(root: &Path, job: &DurableJob) -> Result<()> {
     let jobs = JobStore::open(root)?;
@@ -1100,6 +1134,43 @@ mod tests {
         failed.summary["state"]=json!("failed");
         jobs.put(&failed).unwrap();
         assert!(ended(&job.id,true));
+    }
+
+    #[test]
+    fn stopping_an_unfinished_restore_ends_it_and_keeps_the_library() {
+        use crate::asset_repository::job_pins::durable_cas_job_ids;
+        let directory=tempfile::tempdir().unwrap();
+        let root=directory.path();
+        let mut store=PersistentStore::open(root).unwrap();
+        let input=serde_json::from_value(json!({"connectionId":"synthetic-connection","kind":"restore","snapshotId":"synthetic-snapshot","targetRevision":"0"})).unwrap();
+        let job=DurableJob::new(input,1,store.external_identity().unwrap());
+        assert_eq!(stop_restore(root,&job.id).err().unwrap().kind,ErrorKind::NotFound);
+        commit_fixture(&mut store,root,&job);
+        assert_eq!(stop_restore(root,&job.id).err().unwrap().kind,ErrorKind::PreconditionFailed);
+        let jobs=JobStore::open(root).unwrap();
+        let mut unfinished=jobs.read(&job.id).unwrap();
+        unfinished.summary["state"]=json!("uncertain");
+        unfinished.summary["phase"]=json!("local-apply-unknown");
+        jobs.put(&unfinished).unwrap();
+        let cas=crate::asset_repository::PayloadCas::new(root).unwrap();
+        let received=cas.prepare_bytes(b"synthetic restored body").unwrap();
+        let mut pins=restore_pins(root,&job.id).unwrap();
+        pins.pin_existing(&cas,&received.content_hash,received.byte_size,crate::asset_repository::job_pins::CasObjectRole::DirectObject).unwrap();
+        drop(pins);
+        assert!(store.asset_residency_status().is_err());
+        let revision=store.revision().unwrap();
+        let library=store.read_root(None).unwrap().value;
+
+        let stopped=stop_restore(root,&job.id).unwrap();
+
+        assert_eq!(stopped.summary["state"],"failed");
+        assert!(restore_stopped(&stopped));
+        assert_eq!(jobs.read(&job.id).unwrap().summary,stopped.summary);
+        assert!(durable_cas_job_ids(root).unwrap().is_empty());
+        assert!(store.asset_residency_status().is_ok());
+        assert_eq!(store.revision().unwrap(),revision);
+        assert_eq!(store.read_root(None).unwrap().value,library);
+        assert_eq!(stop_restore(root,&job.id).err().unwrap().kind,ErrorKind::PreconditionFailed);
     }
 
     #[test]

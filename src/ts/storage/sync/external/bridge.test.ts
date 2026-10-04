@@ -14,6 +14,13 @@ describe('ExternalStorageBridge', () => {
         ])
     })
 
+    it('stops an unfinished restore by its job ID', async () => {
+        const invoke = vi.fn(async () => ({}))
+        const bridge = new ExternalStorageBridge({ supported: () => true, invoke })
+        await bridge.stopRestore('unfinished-restore')
+        expect(invoke).toHaveBeenCalledWith('external_storage_stop_restore', { jobId: 'unfinished-restore' })
+    })
+
     it('keeps pause commands separate from job admission', async () => {
         const invoke = vi.fn(async () => true)
         const bridge = new ExternalStorageBridge({ supported: () => true, invoke })

@@ -345,6 +345,18 @@ async function readBackgroundJob(id: string, background: MobileBackgroundTask): 
     return background.signal?.aborted ? bridge.cancelJob(id) : bridge.getJob(id)
 }
 
+/** Ends a restore whose local application could not be confirmed and keeps the library as it is. */
+export async function stopExternalStorageRestore(jobId: string): Promise<ExternalJobSummary> {
+    const stopped = await getExternalStorageBridge().stopRestore(jobId)
+    const current = runtime
+    if (current) {
+        const state = await getExternalStorageBridge().getState()
+        current.state = state
+        current.controller.replaceState(state)
+    }
+    return stopped
+}
+
 function restoreFailure(job: ExternalJobSummary): Error {
     const error = new Error(job.error?.message ?? 'External storage restore failed')
     error.name = job.error?.code ?? 'ExternalStorageRestoreError'

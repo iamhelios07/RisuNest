@@ -670,6 +670,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         external_storage::runtime::external_storage_get_job,
         external_storage::runtime_restore::external_storage_confirm_restore_adoption,
         external_storage::runtime::external_storage_cancel_job,
+        external_storage::runtime::external_storage_stop_restore,
         external_storage::runtime::external_storage_get_quota,
         external_storage::history::external_storage_list_history,
         external_storage::history_deletion::external_storage_prepare_history_delete,

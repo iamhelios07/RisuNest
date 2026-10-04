@@ -195,6 +195,10 @@ export class ExternalStorageBridge {
         return this.native('external_storage_cancel_job', { jobId })
     }
 
+    stopRestore(jobId: string): Promise<ExternalJobSummary> {
+        return this.native('external_storage_stop_restore', { jobId })
+    }
+
     getJob(jobId: string): Promise<ExternalJobSummary> {
         return this.native('external_storage_get_job', { jobId })
     }

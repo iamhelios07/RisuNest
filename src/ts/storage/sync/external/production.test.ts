@@ -22,6 +22,7 @@ const mocks = vi.hoisted(() => ({
         startJob: vi.fn(),
         getJob: vi.fn(),
         cancelJob: vi.fn(),
+        stopRestore: vi.fn(),
         applyReceived: vi.fn(),
         confirmRestoreAdoption: vi.fn(async () => {}),
         openConflictSource: vi.fn(),
@@ -424,6 +425,20 @@ describe('external storage production integration', () => {
         const { installExternalStorageProduction } = await import('./production')
         const dispose = await installExternalStorageProduction()
         dispose()
+    })
+
+    it('stops an unfinished restore by its ID and takes the settled native state', async () => {
+        const { installExternalStorageProduction, stopExternalStorageRestore } = await import('./production')
+        await installExternalStorageProduction()
+        const stopped: ExternalJobSummary = { ...succeeded('old-sync', '8'), id: 'unfinished-restore', kind: 'restore',
+            state: 'failed', phase: 'paused', applicationStarted: true }
+        mocks.bridge.stopRestore.mockResolvedValue(stopped)
+        mocks.bridge.getState.mockClear()
+        await expect(stopExternalStorageRestore('unfinished-restore')).resolves.toBe(stopped)
+        expect(mocks.bridge.stopRestore).toHaveBeenCalledWith('unfinished-restore')
+        expect(mocks.bridge.getState).toHaveBeenCalledOnce()
+        expect(mocks.bridge.startJob).not.toHaveBeenCalled()
+        expect(mocks.flush).not.toHaveBeenCalled()
     })
 
     it('keeps the same protected execution session through Home and foreground return', async () => {

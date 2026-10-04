@@ -23,6 +23,7 @@
         resumeExternalStorageJob,
         requestExternalStorageRestore,
         requestExternalStorageDeleteHistory,
+        stopExternalStorageRestore,
     } from 'src/ts/storage/sync/external/production'
     import type {
         ExternalConnectionResult,
@@ -306,6 +307,16 @@
         } catch (reason) { error = externalErrorMessage(strings, reason) }
     }
 
+    async function stopRestore(job: ExternalJobSummary): Promise<void> {
+        if (busy || !(await alertConfirm(`${strings.stopRestoreTitle}\n${strings.stopRestoreDescription}`))) return
+        busy = true
+        try {
+            await stopExternalStorageRestore(job.id)
+            await refresh(true)
+        } catch (reason) { error = externalErrorMessage(strings, reason) }
+        finally { busy = false }
+    }
+
 
     async function setAutomaticWork(connection: ExternalConnectionSummary, enabled: boolean): Promise<void> {
         if (!storageState || busy) return
@@ -535,6 +546,17 @@
         return storageState?.jobs.find(job => job.connectionId === connection.id)
     }
 
+    function unfinishedRestore(job: ExternalJobSummary | undefined): boolean {
+        return job?.kind === 'restore' && job.state === 'uncertain'
+    }
+
+    // An unfinished restore reports its own error through the connection, which
+    // its message replaces.
+    function restoreReportsError(connection: ExternalConnectionSummary, job: ExternalJobSummary | undefined): boolean {
+        return unfinishedRestore(job) && connection.lastError?.code === job?.error?.code
+            && connection.lastError?.reason === job?.error?.reason
+    }
+
     function connectionTone(connection: ExternalConnectionSummary): 'connected' | 'working' | 'paused' | 'attention' {
         const job = activeJob(connection)
         if (job && (externalJobIsPaused(job) || job.state === 'uncertain')) return 'attention'
@@ -650,7 +672,7 @@
                     </div>
                 </div>
 
-                {#if connection.lastError}<p class="text-sm text-danger-400">{errorLabel(connection.lastError)}</p>{/if}
+                {#if connection.lastError && !restoreReportsError(connection, job)}<p class="text-sm text-danger-400">{errorLabel(connection.lastError)}</p>{/if}
                 {#if syncFailures.has(connection.id)}
                     {@const failure = syncFailures.get(connection.id)}
                     <p class="text-sm text-danger-400" role="status">{externalErrorKind(failure) === 'clockSkew' ? language.lwwSync.clockBlocked : externalErrorMessage(strings, failure)}</p>
@@ -658,9 +680,11 @@
                         <BindingTargetSwitch target={{kind:'external',connectionId:connection.id}} options={{mode:'new-device'}} label={language.lwwSync.newDeviceAction} onBound={() => refreshExternalStorageProductionState().then(() => refresh())} onError={reason => error = externalErrorMessage(strings, reason)} />
                     {/if}
                 {/if}
-                {#if job && (!externalJobIsActive(job) || externalJobIsPaused(job)) && job.state !== 'succeeded' && !connection.lastError}<p class="text-sm text-danger-400" role="status">{jobLabel(job)}</p>{/if}
+                {#if job && (!externalJobIsActive(job) || externalJobIsPaused(job)) && job.state !== 'succeeded' && !connection.lastError && !unfinishedRestore(job)}<p class="text-sm text-danger-400" role="status">{jobLabel(job)}</p>{/if}
 
-                {#if job?.result?.decisionRequired || job?.state === 'uncertain'}
+                {#if unfinishedRestore(job)}
+                    <p class="text-sm" role="status">{strings.restoreUnfinished}</p>
+                {:else if job?.result?.decisionRequired || job?.state === 'uncertain'}
                     <p class="text-sm" role="status">{strings.publicationDecision}</p>
                 {/if}
 
@@ -707,6 +731,7 @@
                     {#if connection.purpose === 'backup'}<SettingButton busy={activeAction === `backup:${connection.id}`} disabled={busy || (job && externalJobIsActive(job))} onclick={() => runJob(connection, 'backup')}>{strings.runBackup}</SettingButton>
                     {:else if storageState.selection.kind === 'external' && storageState.selection.connectionId === connection.id}<SettingButton disabled={busy} onclick={() => syncNow(connection)}>{strings.sync}</SettingButton>{/if}
                     {#if job && externalJobIsActive(job)}<SettingButton variant="secondary" onclick={() => cancelJob(job)}>{strings.cancel}</SettingButton>{/if}
+                    {#if job && unfinishedRestore(job)}<SettingButton variant="secondary" disabled={busy} onclick={() => stopRestore(job)}>{strings.stopRestore}</SettingButton>{/if}
                 </div>
 
                 <div class="tabs" role="tablist">
