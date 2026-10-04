@@ -86,6 +86,8 @@ impl Provider for HeldAssetTransfer {
         -> ProviderFuture<'a, ()> { self.inner.delete_object(repository, locator, cancel) }
     fn reconcile_upload<'a>(&'a self, repository: &'a RepositoryHandle, intent: &'a ObjectIntent, resume: Option<&'a ResumeState>, cancel: &'a Cancellation)
         -> ProviderFuture<'a, UploadResolution> { self.inner.reconcile_upload(repository, intent, resume, cancel) }
+    fn lookup_metadata<'a>(&'a self, repository: &'a RepositoryHandle, intent: &'a ObjectIntent, known: Option<&'a RemoteLocator>, cancel: &'a Cancellation)
+        -> ProviderFuture<'a, Option<ObjectReceipt>> { self.inner.lookup_metadata(repository, intent, known, cancel) }
     fn head_locator(&self, repository: &RepositoryHandle) -> Result<RemoteLocator> { self.inner.head_locator(repository) }
 }
 
@@ -1857,6 +1859,10 @@ impl Provider for FlakyRemote {
     fn reconcile_upload<'a>(&'a self, repository: &'a RepositoryHandle, intent: &'a ObjectIntent, resume: Option<&'a ResumeState>, cancel: &'a Cancellation)
         -> ProviderFuture<'a, UploadResolution> {
         Box::pin(async move { self.check()?; self.inner.reconcile_upload(repository, intent, resume, cancel).await })
+    }
+    fn lookup_metadata<'a>(&'a self, repository: &'a RepositoryHandle, intent: &'a ObjectIntent, known: Option<&'a RemoteLocator>, cancel: &'a Cancellation)
+        -> ProviderFuture<'a, Option<ObjectReceipt>> {
+        Box::pin(async move { self.check()?; self.inner.lookup_metadata(repository, intent, known, cancel).await })
     }
     fn head_locator(&self, repository: &RepositoryHandle) -> Result<RemoteLocator> { self.inner.head_locator(repository) }
 }

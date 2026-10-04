@@ -25,7 +25,7 @@ use risunest_external_storage_format::{
     crypto::derive_key,
     format::library_fingerprint_domain,
     pack::{self, Chunk, ChunkEncoder, CompressionPolicy, ENTRY_OVERHEAD, MAX_CHUNK_BYTES},
-    section::SECTION_CODEC,
+    section::{SectionKind, SECTION_CODEC},
     snapshot as wire,
 };
 use risunest_sync_wire::head::Sequence;
@@ -3728,8 +3728,8 @@ pub(crate) async fn package_and_upload_protected(
                 byte_length: source.byte_length,
                 source: ObjectSource::File(source.path.clone()),
                 file_offset: source.offset,
-                compression: match source.kind {
-                    wire::CatalogEntryKind::SectionObject => CompressionPolicy::AlreadyCompressed,
+                compression: match (source.kind, captured.kind) {
+                    (wire::CatalogEntryKind::SectionObject, SectionKind::Hypa) => CompressionPolicy::AlreadyCompressed,
                     _ => CompressionPolicy::Text,
                 },
             })
@@ -4890,6 +4890,72 @@ mod tests {
             assert_eq!(everything.items, everything.total_items);
             assert_eq!(everything.total_items, library.total_items + section_sources);
             assert!(everything.total_bytes > library.total_bytes);
+        });
+    }
+
+    /// Plugin and setting text carried as section objects is compressed when
+    /// it shrinks, while Hypa vectors are stored as they are.
+    #[test]
+    fn section_text_objects_are_compressed_and_hypa_vectors_are_stored_raw() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let spool = root.path().join("section-spool");
+            let row = |key1: &str, value: SectionValueRow| SectionRow {
+                key1: key1.into(), key2: "string".into(), key3: "token".into(), value,
+                write_clock: risunest_sync_wire::head::Sequence::from(6u64),
+                writer_id: "writer-a".into(),
+            };
+            let capture_rows = |kind: SectionKind, rows: Vec<SectionRow>| {
+                crate::external_storage::sections::capture_section(
+                    kind, &rows, true,
+                    risunest_sync_wire::head::Sequence::from(1u64),
+                    risunest_sync_wire::head::Sequence::from(0u64),
+                    risunest_sync_wire::head::Sequence::from(6u64),
+                    &spool.join(kind.id()), &Cancellation::default(),
+                ).unwrap()
+            };
+            let text = "synthetic plugin text ".repeat(1024);
+            let vector = vec![0u8; 4096 * 4];
+            let plugins = capture_rows(SectionKind::LocalPlugins, vec![row("plugin-a", SectionValueRow::Plugin {
+                space: "string".into(), value: text.clone(),
+            })]);
+            let mut hypa = row(&"a".repeat(64), SectionValueRow::Hypa {
+                producer: "hypa-v2".into(), model: "synthetic".into(), endpoint: None,
+                preprocess_version: 1, dimensions: 4096, vector: vector.clone(), metadata: None,
+            });
+            hypa.key2 = String::new();
+            hypa.key3 = String::new();
+            let hypa = capture_rows(SectionKind::Hypa, vec![hypa]);
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let key = [23; 32];
+            let (capture, _) = captured(root.path(), "section-compression", 1, b"record", b"asset");
+            let mut transfer = journal(&root.path().join("section-compression-job"), "section-compression", &capture);
+            let snapshot_metadata = metadata("section-compression", &capture);
+            let completed = package_and_upload(
+                capture, vec![plugins, hypa], root.path(), &root.path().join("section-compression-cache"),
+                snapshot_metadata, &key, limits(256 * 1024), None, &mut transfer, &provider, &repository,
+                &PhaseProgress::silent(), &Cancellation::default(),
+            ).await.unwrap();
+            for (kind, compressed, body) in [(SectionKind::LocalPlugins, true, text.into_bytes()), (SectionKind::Hypa, false, vector)] {
+                let catalog = RemoteObject::from_stored(&completed.sections[kind.id()].entries_root, &repository).unwrap();
+                let (entries, packs, _) = snapshot_restore::read_catalog(
+                    &catalog, wire::CatalogKind::Section, &key, &root.path().join(format!("read-{}", kind.id())),
+                    &provider, &repository, &Cancellation::default(),
+                ).await.unwrap();
+                let objects: Vec<_> = entries.iter()
+                    .filter(|entry| entry.kind == wire::CatalogEntryKind::SectionObject)
+                    .collect();
+                assert_eq!(objects.len(), 1);
+                let stored: u64 = objects[0].chunks.iter().map(|chunk| chunk.stored_length).sum();
+                assert_eq!(stored < objects[0].byte_length, compressed, "{} object stored as {stored} of {}", kind.id(), objects[0].byte_length);
+                let decoded = snapshot_restore::download_packed_body(
+                    &hex::encode(objects[0].content_sha256), objects[0].byte_length, objects[0].chunks.clone(),
+                    packs.values().map(|pack| pack.stored(&repository).unwrap()).collect(),
+                    &root.path().join(format!("body-{}", kind.id())), &key, &provider, &repository, &Cancellation::default(),
+                ).await.unwrap();
+                assert_eq!(decoded, body);
+            }
         });
     }
 
@@ -7958,6 +8024,15 @@ mod tests {
                     }
                     self.inner.reconcile_upload(repository, intent, resume, cancel).await
                 })
+            }
+            fn lookup_metadata<'a>(
+                &'a self,
+                repository: &'a RepositoryHandle,
+                intent: &'a ObjectIntent,
+                known: Option<&'a RemoteLocator>,
+                cancel: &'a Cancellation,
+            ) -> ProviderFuture<'a, Option<ObjectReceipt>> {
+                self.inner.lookup_metadata(repository, intent, known, cancel)
             }
             fn head_locator(&self, repository: &RepositoryHandle) -> Result<RemoteLocator> {
                 self.inner.head_locator(repository)

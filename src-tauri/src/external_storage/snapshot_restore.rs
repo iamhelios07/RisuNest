@@ -1689,7 +1689,7 @@ pub(crate) async fn download_control_catalogs(
     provider:&dyn Provider,repository:&RepositoryHandle,cancel:&Cancellation,
 ) -> Result<Vec<PreparedObject>> {
     let mut objects=BTreeMap::new();let mut roots=BTreeMap::new();
-    for catalog in catalogs {
+    for (index,catalog) in catalogs.iter().enumerate() {
         cancel.check()?;
         if catalog.header.repository_id!=repository.repository_id || catalog.header.role!=wire::ObjectRole::Catalog {
             return Err(corrupt("control catalog scope differs"));
@@ -1699,7 +1699,7 @@ pub(crate) async fn download_control_catalogs(
             continue;
         }
         let remote=RemoteObject::from_stored(catalog,repository)?;
-        let stage=staging_root.join(&catalog.header.object_id);
+        let stage=staging_root.join(index.to_string());
         let (records,controls)=download_checkpoint_data(&remote,&stage,root_key,provider,repository,cancel).await?;
         if !records.is_empty() {return Err(corrupt("control catalog contains unit records"));}
         for mut control in controls {
@@ -1742,7 +1742,7 @@ pub(crate) async fn admit_data_catalogs(
     if catalogs.is_empty() {return Ok(Vec::new());}
     let stage=tempfile::tempdir().map_err(transient)?;
     let mut hashes=BTreeSet::new();let mut roots=BTreeMap::new();
-    for catalog in catalogs {
+    for (index,catalog) in catalogs.iter().enumerate() {
         cancel.check()?;
         if catalog.header.repository_id!=repository.repository_id || catalog.header.role!=wire::ObjectRole::Catalog {return Err(corrupt("control catalog scope differs"));}
         if let Some(previous)=roots.insert(catalog.header.object_id.clone(),catalog.clone()) {
@@ -1754,7 +1754,7 @@ pub(crate) async fn admit_data_catalogs(
             if complete {hashes.extend(known);continue;}
         }
         let remote=RemoteObject::from_stored(catalog,repository)?;
-        let directory=stage.path().join(&catalog.header.object_id);ensure_directory(&directory)?;
+        let directory=stage.path().join(index.to_string());ensure_directory(&directory)?;
         let (entries,packs,_)=read_catalog(&remote,wire::CatalogKind::Records,root_key,&directory,provider,repository,cancel).await?;
         let mut required=BTreeSet::new();let mut missing=Vec::new();
         for entry in entries {
