@@ -6,7 +6,7 @@ RisuNest Sync 관리 앱은 실행 중인 독립 데몬을 관리합니다. Wind
 
 ## 실행
 
-데몬, 관리 앱, `cloudflared`는 같은 배포 디렉터리에 있어야 합니다. Windows 실행 파일에는 `.exe`가 붙습니다.
+데몬, 관리 앱, `cloudflared`는 같은 배포 디렉터리에 있어야 합니다. Windows 실행 파일에는 `.exe`가 붙습니다. Windows 배포에는 예약 업데이트가 콘솔 창 없이 실행하는 `risunest-sync-manager-background.exe`도 같은 디렉터리에 포함됩니다.
 
 ```text
 risunest-sync-manager
