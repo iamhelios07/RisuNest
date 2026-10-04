@@ -7,6 +7,7 @@ import DefaultChatScreen from './DefaultChatScreen.svelte'
 
 const mocks = vi.hoisted(() => ({ trigger: vi.fn(), generate: vi.fn(), process: vi.fn(), error: vi.fn(), postFile: vi.fn(),
     bounded: false, appended: [] as any[], acquireComplete: vi.fn(), flush: vi.fn(async () => {}),
+    historyLimit: false, openWindow: vi.fn(), notify: vi.fn(async () => {}), scope: { finish: vi.fn(), release: vi.fn() }, createScope: vi.fn(),
     target: { characterId: 'character', conversationId: 'chat', navigationGeneration: 1, storeRevision: 1, sessionToken: 'windowed' },
 }))
 vi.mock('src/lang', () => ({ language: languageEnglish }))
@@ -16,11 +17,12 @@ vi.mock('src/ts/stores.svelte', () => {
         ScrollToMessageStore: writable(null), additionalChatMenu: writable([]), additionalFloatingActionButtons: writable([]),
         easyPanelStore: writable(false), chatPanelStore: writable(false), HideIconStore: writable(false) }
 })
-vi.mock('src/ts/process/index.svelte', () => ({ doingChat: writable(false), chatProcessStage: writable(0), sendChat: mocks.generate, getSelectedBoundedGenerationFallbackReason: () => mocks.bounded ? null : 'test-complete-conversation' }))
+vi.mock('src/ts/process/index.svelte', () => ({ doingChat: writable(false), chatProcessStage: writable(0), sendChat: mocks.generate, getSelectedBoundedGenerationFallbackReason: () => mocks.bounded ? null : 'test-complete-conversation',
+    getHistoryWindowMemoryMode: (historyLimit: boolean) => historyLimit && mocks.historyLimit ? 'none' : null, openSelectedHistoryWindow: mocks.openWindow, notifyGenerationCompletion: mocks.notify }))
 vi.mock('src/ts/util', () => ({ sleep: async () => {}, getPersonaPrompt: () => '' }))
 vi.mock('src/ts/alert', () => ({ alertError: mocks.error }))
 vi.mock('src/ts/translator/translator', () => ({}))
-vi.mock('src/ts/process/scripts', () => ({ processScript: mocks.process }))
+vi.mock('src/ts/process/scripts', () => ({ processScript: mocks.process, createPromptScriptOperationScope: mocks.createScope }))
 vi.mock('src/ts/process/triggers', () => ({ runTrigger: mocks.trigger }))
 vi.mock('src/ts/process/tts', () => ({}))
 vi.mock('src/ts/process/command', () => ({}))
@@ -30,7 +32,8 @@ vi.mock('src/ts/sync/multiuser', () => ({ ConnectionOpenStore: writable(false) }
 vi.mock('src/ts/storage/persistentDataRuntime.svelte', () => ({
     getActiveConversationSession: () => null,
     getPersistentDataRuntime: () => ({
-        captureSelectedConversationTarget: () => mocks.bounded ? mocks.target : null, getActiveConversationSession: () => null,
+        captureSelectedConversationTarget: () => mocks.bounded || mocks.historyLimit ? mocks.target : null, getActiveConversationSession: () => null,
+        acknowledgeGenerationCompletion: async () => {},
         captureSelectedConversationAuthority: () => ({ totalMessages: 1500 }),
         acquireCompleteConversation: mocks.acquireComplete,
         flushPendingData: mocks.flush,
@@ -74,6 +77,8 @@ function send() {
 beforeEach(async () => {
     vi.clearAllMocks()
     mocks.bounded = false
+    mocks.historyLimit = false
+    mocks.createScope.mockReturnValue(mocks.scope)
     mocks.appended = []
     mocks.trigger.mockImplementation(() => new Promise(resolve => { finishTrigger = () => resolve(null) }))
     mocks.process.mockImplementation(async (_character, value) => value)
@@ -185,4 +190,85 @@ it('retains attachments on input failure and preserves files added for the next 
     await vi.waitFor(() => expect(mocks.generate).toHaveBeenCalledTimes(2))
     expect(DBState.db.characters[0].chats[0].message[1].data).toBe('Following{{inlayed::file-b}}')
     expect(document.querySelectorAll('button[class*="-right-1"]')).toHaveLength(0)
+})
+
+function windowOver(store: any[], start: number) {
+    const chat = { id: 'chat', message: structuredClone(store.slice(start)) }
+    const controller = {
+        chat,
+        absoluteStartIndex: start,
+        isCurrent: () => true,
+        applyRange: (localStart: number, deleteCount: number, messages: any[]) => {
+            store.splice(start + localStart, deleteCount, ...structuredClone(messages))
+            chat.message.splice(localStart, deleteCount, ...structuredClone(messages))
+            return true
+        },
+        reconcileMetadata: () => true,
+        release: () => {},
+    }
+    return { chat, controller, release: vi.fn() }
+}
+const stored = (count: number) => Array.from({ length: count }, (_, index) => ({
+    role: index % 2 ? 'char' : 'user', data: `m${index}`, chatId: `id-${index}`,
+}))
+
+it('runs the input step over a history window when the loading limit is on', async () => {
+    mocks.historyLimit = true
+    const store = stored(4)
+    const window = windowOver(store, 2)
+    mocks.openWindow.mockResolvedValue(window)
+    mocks.trigger.mockImplementation(async (_character, _mode, { chat }) => ({
+        chat: { ...chat, message: chat.message.map((message: any, index: number) => index ? message : { ...message, data: 'triggered' }) },
+    }))
+    mocks.process.mockImplementation(async (_character, value) => `${value} processed`)
+    type('Hello')
+    send()
+    await vi.waitFor(() => expect(mocks.generate).toHaveBeenCalledOnce())
+    expect(mocks.openWindow).toHaveBeenCalledWith({ register: true })
+    expect(mocks.trigger).toHaveBeenCalledWith(DBState.db.characters[0], 'input', { chat: window.chat })
+    expect(mocks.createScope).toHaveBeenCalledWith(DBState.db.characters[0], {
+        historyWindow: { chat: window.chat, conversationId: 'chat' },
+    })
+    expect(mocks.process).toHaveBeenCalledWith(DBState.db.characters[0], 'Hello', 'editinput', {}, { promptOperationScope: mocks.scope })
+    expect(mocks.scope.finish).toHaveBeenCalledOnce()
+    expect(store.map((message) => message.data)).toEqual(['m0', 'm1', 'triggered', 'm3', 'Hello processed'])
+    expect(store[4]).toEqual(expect.objectContaining({ role: 'user', chatId: expect.any(String) }))
+    expect(window.release).toHaveBeenCalledOnce()
+    expect(mocks.flush).toHaveBeenCalledWith('generation-input')
+    expect(mocks.generate).toHaveBeenCalledWith(-1, expect.objectContaining({ historyLimit: true }))
+    expect(mocks.acquireComplete).not.toHaveBeenCalled()
+    expect(DBState.db.characters[0].chats[0].message).toEqual([])
+    expect(document.querySelector<HTMLTextAreaElement>('textarea.input-text')!.value).toBe('')
+})
+
+it('appends the says-nothing message over the window for an empty send', async () => {
+    mocks.historyLimit = true
+    DBState.db.useSayNothing = true
+    const store = stored(4)
+    mocks.openWindow.mockResolvedValue(windowOver(store, 3))
+    send()
+    await vi.waitFor(() => expect(mocks.generate).toHaveBeenCalledOnce())
+    expect(mocks.trigger).not.toHaveBeenCalled()
+    expect(store.at(-1)).toEqual(expect.objectContaining({ role: 'user', data: '*says nothing*' }))
+})
+
+it('rerolls over a tail window when the loading limit is on', async () => {
+    mocks.historyLimit = true
+    const store: any[] = stored(40)
+    mocks.openWindow.mockImplementation(async ({ tailStart }) => windowOver(store, tailStart(store.length)))
+    mocks.generate.mockImplementation(async () => {
+        store.push({ role: 'char', data: 'new', chatId: 'new' })
+        return true
+    })
+    const before = structuredClone(store.slice(0, 39))
+    type('').dispatchEvent(new KeyboardEvent('keydown', { key: 'm', ctrlKey: true, bubbles: true }))
+    await vi.waitFor(() => expect(mocks.generate).toHaveBeenCalledOnce())
+    await vi.waitFor(() => expect(store.at(-1)?.responseVariants?.candidates).toHaveLength(2))
+    expect(mocks.generate).toHaveBeenCalledWith(-1, expect.objectContaining({ historyLimit: true }))
+    expect(store.slice(0, 39)).toEqual(before)
+    expect(store.at(-1).data).toBe('new')
+    for (const [options] of mocks.openWindow.mock.calls) expect(options.tailStart(store.length)).toBeGreaterThan(30)
+    expect(mocks.acquireComplete).not.toHaveBeenCalled()
+    expect(mocks.error).not.toHaveBeenCalled()
+    expect(mocks.notify).toHaveBeenCalledWith('new')
 })

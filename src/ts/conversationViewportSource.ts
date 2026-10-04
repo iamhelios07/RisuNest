@@ -486,8 +486,9 @@ implements ConversationViewportSource {
             || !Number.isSafeInteger(deleteCount)
             || deleteCount < 0
             || startIndex + deleteCount > this.totalMessages
-            || (messages.length !== deleteCount
-                && !(startIndex === this.totalMessages && deleteCount === 0))
+            // Keys follow the absolute index, so a range may change the message
+            // count only at the end of the conversation.
+            || (messages.length !== deleteCount && startIndex + deleteCount !== this.totalMessages)
         ) throw new RangeError('Optimistic conversation range is unsupported')
         const previousRows = new Map(this.rows)
         const previousOptimisticRows = new Set(this.optimisticRows)

@@ -36,6 +36,15 @@ import {
 import { peekActiveConversationSession } from '../storage/persistentDataRuntime.svelte';
 import type { ActiveConversationSession } from '../storage/activeConversationSession';
 import { runSerializedUserTrigger } from './conversationUserTrigger';
+import {
+    findActiveHistoryWindow,
+    getHistoryMessageAt,
+    historyLength,
+    sliceHistory,
+    toHistorySpliceIndex,
+} from './historyWindowIndex';
+import { openHistoryWindowCopy, type HistoryWindowCopy } from './historyWindowWrite';
+import { PersistentMutationFencedError } from '../storage/saveCoordinator';
 let luaFactory:LuaFactory
 let luaTimeoutErrorConstructor: typeof import('wasmoon').LuaTimeoutError | undefined
 let ScriptingSafeIds = new Set<string>()
@@ -337,7 +346,7 @@ export async function runScripted(code:string, arg:{
 
             declareAPI('getChatMain', (id:string, index:number) => {
                 ensureScriptingConversation()
-                const chat = ScriptingEngineState.chat.message.at(index)
+                const chat = getHistoryMessageAt(ScriptingEngineState.chat, index)
                 if(!chat){
                     return JSON.stringify(null)
                 }
@@ -351,13 +360,13 @@ export async function runScripted(code:string, arg:{
 
             declareAPI('getChatData', (id:string, index:number) => {
                 ensureScriptingConversation()
-                const chat = ScriptingEngineState.chat.message.at(index)
+                const chat = getHistoryMessageAt(ScriptingEngineState.chat, index)
                 return chat?.data ?? ''
             })
 
             declareAPI('getChatRole', (id:string, index:number) => {
                 ensureScriptingConversation()
-                const chat = ScriptingEngineState.chat.message.at(index)
+                const chat = getHistoryMessageAt(ScriptingEngineState.chat, index)
                 return chat?.role ?? ''
             })
 
@@ -378,7 +387,9 @@ export async function runScripted(code:string, arg:{
                     return
                 }
                 ensureScriptingConversation()
-                const message = ScriptingEngineState.chat.message?.at(index)
+                const message = ScriptingEngineState.chat.message
+                    ? getHistoryMessageAt(ScriptingEngineState.chat, index)
+                    : undefined
                 if(message){
                     message.data = value ?? ''
                 }
@@ -388,7 +399,9 @@ export async function runScripted(code:string, arg:{
                     return
                 }
                 ensureScriptingConversation()
-                const message = ScriptingEngineState.chat.message?.at(index)
+                const message = ScriptingEngineState.chat.message
+                    ? getHistoryMessageAt(ScriptingEngineState.chat, index)
+                    : undefined
                 if(message){
                     message.role = value === 'user' ? 'user' : 'char'
                 }
@@ -398,14 +411,16 @@ export async function runScripted(code:string, arg:{
                     return
                 }
                 ensureScriptingConversation()
-                ScriptingEngineState.chat.message = ScriptingEngineState.chat.message.slice(start,end)
+                ScriptingEngineState.chat.message = sliceHistory(ScriptingEngineState.chat, start, end)
             })
             declareAPI('removeChat', (id:string, index:number) => {
                 if(!ScriptingSafeIds.has(id)){
                     return
                 }
                 ensureScriptingConversation()
-                ScriptingEngineState.chat.message.splice(index, 1)
+                const start = toHistorySpliceIndex(ScriptingEngineState.chat, index)
+                if (start === null) return
+                ScriptingEngineState.chat.message.splice(start, 1)
             })
             declareAPI('addChat', (id:string, role:string, value:string) => {
                 if(!ScriptingSafeIds.has(id)){
@@ -421,7 +436,9 @@ export async function runScripted(code:string, arg:{
                 }
                 ensureScriptingConversation()
                 let roleData:'user'|'char' = role === 'user' ? 'user' : 'char'
-                ScriptingEngineState.chat.message.splice(index, 0, {role: roleData, data: value ?? '', chatId: v4()})
+                const start = toHistorySpliceIndex(ScriptingEngineState.chat, index)
+                if (start === null) return
+                ScriptingEngineState.chat.message.splice(start, 0, {role: roleData, data: value ?? '', chatId: v4()})
             })
 
             declareAPI('getTokens', async (id:string, value:string) => {
@@ -433,7 +450,7 @@ export async function runScripted(code:string, arg:{
 
             declareAPI('getChatLength', (id:string) => {
                 ensureScriptingConversation()
-                return ScriptingEngineState.chat.message.length
+                return historyLength(ScriptingEngineState.chat)
             })
 
             declareAPI('getFullChatMain', (id:string) => {
@@ -1804,6 +1821,7 @@ async function runLuaEditTriggerBatch<T extends string | OpenAIChat[]>(
 ): Promise<T> {
     let ownedOperation: ReturnType<typeof createCurrentConversationOperation> = null
     let operationContext = conversationOperation
+    let historyWindowCopy: HistoryWindowCopy | null = null
     try {
         let data = content
 
@@ -1816,6 +1834,11 @@ async function runLuaEditTriggerBatch<T extends string | OpenAIChat[]>(
         if (!triggers.some((trigger) => trigger?.effect?.[0]?.type === 'triggerlua')) {
             return content
         }
+        // A send that builds from a history window hands its edit listeners the window.
+        const historyWindow = !operationContext && mode !== 'editDisplay'
+            ? findActiveHistoryWindow(char.chaId, getCurrentChat()?.id)
+            : null
+        historyWindowCopy = historyWindow ? openHistoryWindowCopy(historyWindow) : null
         const createOperation = () => {
             ownedOperation ??= createCurrentConversationOperation(onConversationCommit)
             return ownedOperation?.context
@@ -1831,7 +1854,10 @@ async function runLuaEditTriggerBatch<T extends string | OpenAIChat[]>(
                     data,
                     meta,
                     operationContext,
-                    createConversationOperation: operationContext ? undefined : createOperation,
+                    chat: historyWindowCopy?.chat,
+                    createConversationOperation: operationContext || historyWindowCopy
+                        ? undefined
+                        : createOperation,
                 })
                 data = runResult.res ?? data
             }
@@ -1841,6 +1867,9 @@ async function runLuaEditTriggerBatch<T extends string | OpenAIChat[]>(
     } catch (error) {
         return content
     } finally {
+        if (historyWindowCopy && !historyWindowCopy.commit()) {
+            throw new PersistentMutationFencedError()
+        }
         if (ownedOperation) {
             if (ownedOperation.context.hasPendingMutations()) {
                 ownedOperation.context.commit(peekActiveConversationSession(), {

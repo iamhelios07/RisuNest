@@ -2411,6 +2411,12 @@ export const languageEnglish = {
             overflowScopeAll: 'All',
             overflowScopeHelp:
                 'Choose whether UI elements that extend beyond a chat message (setting buttons, overlays, and so on) render only on the latest message or on every message. Choose All if a character you use does not display correctly. All may make scrolling long chats slightly slower.',
+            historyLimit: 'Skip loading older messages',
+            historyLimitHelp:
+                'When you send a message, older messages beyond the set maximum context size are not loaded, which improves speed and memory usage. Lorebook search, triggers, modules, regex scripts, plugins and other features that rely on older messages may not work correctly. Do not use this with modules or plugins that change the whole chat.',
+            historyLimitMultiplier: 'Loading limit',
+            historyLimitMultiplierHelp:
+                'Loads messages up to the given multiple of the set maximum context size. With HypaMemory, messages that are not summarized yet are always loaded. Increase this value if a module or plugin you use needs more older messages.',
         },
         ui: {
             title: 'UI',
@@ -3074,6 +3080,7 @@ export const languageEnglish = {
     "groupCharactersChangeFailed": "Could not change the group characters. Please try again.",
     "regexScriptTimeout": "Regex script execution timed out.",
     "generationInterruptedInBackground": "Response generation was interrupted in the background.",
+    "generationConversationChanged": "The conversation changed during generation, so the response could not be applied. Please try again.",
     "screenshotPreparationFailed": "Screenshot preparation failed. Reduce the range and try again.",
     "mcpDesktopOnly": "Local MCPs are available in the desktop app.",
     lwwSync: {
