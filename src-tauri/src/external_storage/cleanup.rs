@@ -6,7 +6,7 @@ use super::{
     connection_commands::ConnectedRepository,
     contract::{
         Cancellation, Collection, ErrorKind, LeaseKind, ObjectIntent, ObjectReceipt, ObjectRole,
-        ProviderError, ProviderFuture, RepositoryHandle, Result,
+        Provider, ProviderError, ProviderFuture, RepositoryHandle, Result,
     },
     control,
     gc_store::{locator_key, GcStore},
@@ -744,9 +744,10 @@ impl ConnectedRepositoryView<'_> {
                     };
                     let Some(receipt) = leases::control_request(
                         cancel,
-                        self.connected.provider.lookup_object(
+                        self.connected.provider.lookup_metadata(
                             &self.connected.handle,
                             &intent,
+                            None,
                             cancel,
                         ),
                     )
@@ -1020,6 +1021,17 @@ impl DocumentSource for LwwRepositoryView<'_> {
             Box::pin(control::read_catalog_children_for_repository(self.base.connected,object,&self.engine.repository.repository_id,self.documents.cancel))
         } else {self.documents.catalog(object)}
     }
+    fn metadata<'a>(&'a self,object:&'a RemoteObject)->ProviderFuture<'a,Option<ObjectReceipt>> {
+        Box::pin(async move {
+            if let Some(current)=self.verified(object)? {return Ok(Some(current))}
+            if object.role!=ObjectRole::Segment && !self.native_body(object)? {
+                return if object.repository_id==self.engine.repository.repository_id {
+                    self.documents.metadata_for_repository(object,&self.engine.repository.repository_id).await
+                } else {self.documents.metadata(object).await};
+            }
+            stored_metadata(self.engine.provider.as_ref(),&self.engine.repository,object,self.documents.cancel).await
+        })
+    }
     fn probe<'a>(&'a self,object:&'a RemoteObject)->ProviderFuture<'a,Option<ObjectReceipt>> {
         Box::pin(async move {
             if let Some(current)=self.verified(object)? {return Ok(Some(current))}
@@ -1036,7 +1048,22 @@ impl DocumentSource for LwwRepositoryView<'_> {
         })
     }
 }
+/// Presence and length of a stored object from service metadata alone.
+async fn stored_metadata(provider:&dyn Provider,repository:&RepositoryHandle,object:&RemoteObject,cancel:&Cancellation)->Result<Option<ObjectReceipt>> {
+    let intent=ObjectIntent{repository_id:repository.repository_id.clone(),job_id:"cleanup-probe".into(),object_id:object.object_id.clone(),
+        role:object.role,byte_length:object.receipt.byte_length,sha256:object.ciphertext_sha256.clone()};
+    leases::control_request(cancel,provider.lookup_metadata(repository,&intent,Some(&object.receipt.locator),cancel)).await
+}
 impl ConnectedDocuments<'_> {
+    fn metadata_for_repository<'a>(&'a self, object: &'a RemoteObject,repository_id:&'a str) -> ProviderFuture<'a, Option<ObjectReceipt>> {
+        Box::pin(async move {
+            object.stored(&self.connected.handle)?;
+            if object.repository_id != repository_id {
+                return Err(ProviderError::new(ErrorKind::Corrupt));
+            }
+            stored_metadata(self.connected.provider.as_ref(),&self.connected.handle,object,self.cancel).await
+        })
+    }
     fn probe_for_repository<'a>(&'a self, object: &'a RemoteObject,repository_id:&'a str) -> ProviderFuture<'a, Option<ObjectReceipt>> {
         Box::pin(async move {
             object.stored(&self.connected.handle)?;
@@ -1091,6 +1118,9 @@ impl DocumentSource for ConnectedDocuments<'_> {
     }
     fn probe<'a>(&'a self, object: &'a RemoteObject) -> ProviderFuture<'a, Option<ObjectReceipt>> {
         self.probe_for_repository(object,&self.connected.stored.descriptor.repository_id)
+    }
+    fn metadata<'a>(&'a self, object: &'a RemoteObject) -> ProviderFuture<'a, Option<ObjectReceipt>> {
+        self.metadata_for_repository(object,&self.connected.stored.descriptor.repository_id)
     }
 }
 
@@ -1299,6 +1329,47 @@ mod tests {
         });
     }
 
+    #[test]
+    fn lww_cleanup_checks_live_bodies_without_downloading_them() {
+        runtime().block_on(async {
+            use super::super::lww_tests::{CycleFixture,small_asset};
+            let mut f=CycleFixture::new();let cancel=Cancellation::default();
+            small_asset(&mut f.a,"live-large",&vec![37;5*1024*1024]);
+            for n in 0..3 {small_asset(&mut f.a,&format!("live-{n}"),format!("synthetic live pack entry {n}").as_bytes());}
+            f.publish_a().await;
+            let directory=tempfile::tempdir().unwrap();
+            let writer=f.a.lww_clock_state().unwrap().writer_id;
+            let completed=f.sender.compact_published(&directory.path().join("compaction"),"00000000-0000-4000-8000-0000000000a2",
+                &writer,&f.sender.capabilities,&cancel,None).await.unwrap();
+            let (_,checkpoint)=f.sender.checkpoint(&completed.reference.receipt,&cancel).await.unwrap();
+            let standalone=checkpoint.standalone_bodies.values().map(|body|body.locator.clone().unwrap().object).collect::<Vec<_>>();
+            assert_eq!(standalone.len(),1);
+            let packs=f.provider.objects_with_role(ObjectRole::Pack);
+            assert!(packs.len()>standalone.len() && standalone.iter().all(|id|packs.contains(id)),"packed and standalone bodies are live");
+            let catalogs=f.provider.objects_with_role(ObjectRole::Catalog);
+            assert!(!catalogs.is_empty());
+            let reads=|f:&CycleFixture,ids:&[String]|ids.iter().map(|id|f.provider.read_attempts(id)).collect::<Vec<_>>();
+            let reconciles=|f:&CycleFixture,ids:&[String]|ids.iter().map(|id|f.provider.reconcile_attempts(id)).collect::<Vec<_>>();
+            let (packs_before,catalogs_before,reconciled)=(reads(&f,&packs),reads(&f,&catalogs),reconciles(&f,&packs));
+            let connected=fixture_connection(&f);
+            let cache=directory.path().join("cache");let scratch=directory.path().join("probe");
+            let clock=fake::FakeLeaseClock::new(super::super::runtime::now_ms());
+            let context=LeaseContext{root:f.directory_a.path(),connection_id:"sender",writer_id:"collector",descriptor:&connected.stored.descriptor,
+                root_key:&connected.root_key,provider:connected.provider.as_ref(),repository:&connected.handle,clock:&clock,protection_supported:true,ledger:None};
+            let request=CleanupRequest{job_id:"idle-cleanup",cleanup_supported:true,limits:CleanupLimits::default(),connection_time:&available_time};
+            let outcome=run_lww(&context,&request,&f.sender,ConnectedRepositoryView{connected:&connected,writer_id:"collector",policy:RetentionPolicy::DEFAULT,
+                now_ms:super::super::runtime::now_ms(),unfinished:vec![],cache_root:&cache},&scratch,&cancel).await.unwrap();
+            assert_eq!(outcome.stop_reason,StopReason::Complete);
+            assert_eq!(outcome.deleted_objects,0);
+            assert_eq!(reads(&f,&packs),packs_before,"no live pack or standalone body is downloaded");
+            for ((id,before),after) in catalogs.iter().zip(&catalogs_before).zip(reads(&f,&catalogs)) {
+                assert!(after-before<=1,"catalog {id} is read once per cleanup run");
+            }
+            for id in &standalone {assert!(f.provider.metadata_attempts(id)>0,"a live standalone body is still checked");}
+            assert_eq!(reconciles(&f,&packs),reconciled,"the inventory survey reads metadata only");
+        });
+    }
+
     const NOW: u64 = 1000 * 24 * 60 * leases::MINUTE_MS;
     fn available_time(_: Instant) -> Result<bool> { Ok(true) }
     fn unavailable_time(_: Instant) -> Result<bool> { Ok(false) }
@@ -1377,14 +1448,31 @@ mod tests {
             self.source.listed(receipt)
         }
         fn catalog<'a>(&'a self, object: &'a RemoteObject) -> ProviderFuture<'a, Vec<RemoteObject>> {
-            self.source.catalog(object)
+            Box::pin(async move {
+                self.tick();
+                if !self.provider.holds(&object.object_id) { return Err(ProviderError::new(ErrorKind::NotFound)); }
+                self.source.catalog(object).await
+            })
         }
         fn probe<'a>(&'a self, object: &'a RemoteObject) -> ProviderFuture<'a, Option<ObjectReceipt>> {
             Box::pin(async move {
-                self.clock.advance(self.advance_once.swap(0, Ordering::SeqCst) as u64);
+                self.tick();
                 let receipt = self.source.probe(object).await?;
                 Ok(if self.provider.holds(&object.object_id) { receipt } else { None })
             })
+        }
+        fn metadata<'a>(&'a self, object: &'a RemoteObject) -> ProviderFuture<'a, Option<ObjectReceipt>> {
+            Box::pin(async move {
+                self.tick();
+                let receipt = self.source.metadata(object).await?;
+                Ok(if self.provider.holds(&object.object_id) { receipt } else { None })
+            })
+        }
+    }
+    impl Probes<'_> {
+        /// The first remote check of a run takes the time a test asks for.
+        fn tick(&self) {
+            self.clock.advance(self.advance_once.swap(0, Ordering::SeqCst) as u64);
         }
     }
     struct Harness {
