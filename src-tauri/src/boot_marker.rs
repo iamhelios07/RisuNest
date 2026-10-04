@@ -131,6 +131,7 @@ pub(crate) fn cancel_if_incomplete(app_data_root: &Path) -> io::Result<()> {
 /// Records a start that did not finish when a renderer fails again soon after it was reloaded, so
 /// the next document opens through the startup choice. A marker already on disk is left alone,
 /// because the next start counts it anyway.
+#[cfg(not(target_os = "android"))]
 pub(crate) fn record_interrupted(
     app_data_root: &Path,
     app_version: &str,
@@ -237,6 +238,7 @@ mod tests {
         assert_eq!(decision.previous, Some(Attempt::default()));
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn an_interrupted_document_after_a_finished_start_makes_the_next_start_offer_the_choice() {
         let directory = tempfile::tempdir().unwrap();
@@ -248,6 +250,7 @@ mod tests {
         assert_eq!(decision.previous.unwrap().started_at, now(5));
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn an_interruption_during_an_unfinished_start_keeps_the_existing_count() {
         let directory = tempfile::tempdir().unwrap();
