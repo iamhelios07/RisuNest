@@ -1893,6 +1893,48 @@ mod tests {
         assert!(one > 0);
         assert_eq!(manifest_reads(3), one);
     }
+
+    #[test]
+    fn a_page_reload_during_an_export_keeps_its_journal_until_the_export_finishes() {
+        use crate::asset_repository::commands::{CasJobOwnerProbe, DurableCasJobState};
+        use crate::asset_repository::job_pins::durable_cas_job_ids;
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let jobs = directory.path().join("jobs");
+        fs::create_dir_all(&jobs).unwrap();
+        let mut store = library(&source);
+        crate::server_sync::lww_tests::put_asset(&mut store, "assets/synthetic-export.bin", b"synthetic export object");
+        let revision = store.revision().unwrap();
+        let swept = std::sync::Arc::new(std::sync::Mutex::new(None));
+        portable_backup::source_io::reset_source_io();
+        {
+            let root = source.clone();
+            let swept = swept.clone();
+            portable_backup::source_io::on_capture_ready(move |_, _| {
+                let before = durable_cas_job_ids(&root).unwrap();
+                let native_jobs = || -> Result<Vec<super::super::JobStatus>, String> { Ok(Vec::new()) };
+                let open_store = || PersistentStore::open(&root).map_err(|error| error.to_string());
+                DurableCasJobState::default()
+                    .sweep_after_page_start(&root, &CasJobOwnerProbe {
+                        native_jobs: &native_jobs,
+                        device_session_active: false,
+                        open_store: &open_store,
+                    })
+                    .unwrap();
+                *swept.lock().unwrap() = Some((before, durable_cas_job_ids(&root).unwrap()));
+            });
+        }
+        let export = super::super::JobRegistry::default()
+            .create_internal(super::super::JobKind::ExportPortableBackup, Some(revision), vec![], false)
+            .unwrap();
+        let exported = export_portable(None, revision, &jobs, &directory.path().join("handoffs"), store, &export, None, "9.8.7-synthetic");
+        portable_backup::source_io::reset_source_io();
+        exported.unwrap();
+        let (before, after) = swept.lock().unwrap().take().unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(after, before);
+        assert!(durable_cas_job_ids(&source).unwrap().is_empty());
+    }
 }
 
 #[cfg(test)]
