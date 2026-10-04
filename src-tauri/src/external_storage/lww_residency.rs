@@ -122,6 +122,18 @@ pub(crate) fn stat(root: &Path, hash: &str) -> std::io::Result<Option<u64>> {
         .and_then(|source| if let Some(source)=source {Ok(Some(source.body.plaintext_byte_length.0))} else {packed_source(root,hash).map(|s|s.map(|s|s.byte_length))})
         .map_err(|_| std::io::Error::other("external-source-invalid"))
 }
+/// Forgets every body a removed connection held, so nothing counts or
+/// downloads them from it again.
+pub(crate) fn remove_connection_sources(root: &Path, connection_id: &str) -> Result<()> {
+    let Some(db) = database(root, false)? else {
+        return Ok(());
+    };
+    for table in ["sources", "packed_sources"] {
+        db.execute(&format!("DELETE FROM {table} WHERE json_extract(source,'$.connectionId')=?1"), [connection_id])
+            .map_err(local)?;
+    }
+    Ok(())
+}
 pub(crate) fn validate_packed_source(source:&PackedSource,repository:&RepositoryHandle) -> Result<()> {
     risunest_sync_wire::validate_hash(&source.hash).map_err(local)?;
     source.catalog.validate().map_err(local)?;

@@ -187,6 +187,25 @@ fn server_sync_asset_policy_operation<R: tauri::Runtime>(app: &AppHandle<R>, pol
     })
 }
 #[tauri::command]
+pub(crate) async fn asset_residency_download_remote(
+    app: AppHandle,
+    connection_id: Option<String>,
+    selected_character_id: Option<String>,
+) -> Result<crate::persistent_store::asset_residency::ResidencyStatus> {
+    logged_blocking("asset-download", move || {
+        let _admission = claim_library(&app)?;
+        let state = app.state::<ServerSyncCommandState>();
+        let (_running, cancelled) = state.claim_preparation()?;
+        job_store(&app)?.asset_residency_download_remote(connection_id.as_deref(), Some(cancelled.clone()), selected_character_id.as_deref(), || {
+            if cancelled.load(Ordering::Acquire) {
+                Err(SyncError::new("cancelled", 409))
+            } else {
+                Ok(())
+            }
+        })
+    }).await
+}
+#[tauri::command]
 pub(crate) async fn server_sync_asset_evict(
     app: AppHandle,
 ) -> Result<crate::persistent_store::asset_residency::ResidencyStatus> {

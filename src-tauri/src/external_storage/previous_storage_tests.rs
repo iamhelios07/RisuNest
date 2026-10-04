@@ -164,3 +164,71 @@ fn a_previous_external_body_that_cannot_be_fetched_publishes_no_segment_to_the_n
     assert!(f.b.lww_read_outbox(authority, 16).unwrap().entries.is_empty());
     assert!(!f.b.external_lww_object_is_local(&hash).unwrap());
 }
+
+/// A store holding one body only on the server and one only in the
+/// fixture's repository, under the remote policy.
+fn split_holders(f: &mut CycleFixture) -> (LocalServerFixture, String, String) {
+    let external = small_asset(&mut f.a, "external-held", &[83; 96 * 1024]);
+    run(f.publish_a());
+    run(f.receive_b());
+    let server = LocalServerFixture::new();
+    let core = server.client(&f.b);
+    let held = crate::server_sync::lww_tests::put_asset(&mut f.b, "assets/server-held.png", b"synthetic server held body").object_hash.unwrap();
+    drain_publications(&core, &mut f.b, &[]).unwrap();
+    f.b.asset_residency_set_policy(AssetPolicy::Remote, || Ok(())).unwrap();
+    f.b.asset_residency_evict(|| Ok(())).unwrap();
+    assert!(!f.b.external_lww_object_is_local(&held).unwrap());
+    assert!(!f.b.external_lww_object_is_local(&external).unwrap());
+    (server, held, external)
+}
+
+fn status(store: &PersistentStore) -> serde_json::Value {
+    serde_json::to_value(store.asset_residency_status().unwrap()).unwrap()
+}
+
+#[test]
+fn status_counts_bodies_by_holder_and_forgets_a_removed_connection() {
+    let mut f = CycleFixture::new();
+    let (_server, _held, external) = split_holders(&mut f);
+    let gone = status(&f.b);
+    assert_eq!((gone["serverObjects"].as_u64(), gone["remoteObjects"].as_u64(), gone["unavailableObjects"].as_u64()), (Some(1), Some(1), Some(1)),
+        "a body whose connection is gone is unavailable, not remote");
+    assert_eq!(gone["serverBytes"].as_u64(), Some(b"synthetic server held body".len() as u64));
+    assert_eq!(gone["externalObjects"], serde_json::json!([]));
+    ConnectionStore::open(f.directory_b.path()).unwrap().insert(&receiver_connection(&f).stored).unwrap();
+    let split = status(&f.b);
+    assert_eq!((split["serverObjects"].as_u64(), split["remoteObjects"].as_u64(), split["unavailableObjects"].as_u64()), (Some(1), Some(2), Some(0)));
+    assert_eq!(split["externalObjects"], serde_json::json!([{"connectionId":"receiver","objects":1}]));
+    lww_residency::remove_connection_sources(f.directory_b.path(), "receiver").unwrap();
+    assert!(lww_residency::stat(f.directory_b.path(), &external).unwrap().is_none());
+    let removed = status(&f.b);
+    assert_eq!((removed["serverObjects"].as_u64(), removed["remoteObjects"].as_u64(), removed["unavailableObjects"].as_u64()), (Some(1), Some(1), Some(1)));
+    assert_eq!(removed["externalObjects"], serde_json::json!([]));
+}
+
+#[test]
+fn download_without_a_policy_change_fetches_one_connection_or_every_holder() {
+    let mut f = CycleFixture::new();
+    let (_server, held, external) = split_holders(&mut f);
+    let connection = receiver_connection(&f);
+    ConnectionStore::open(f.directory_b.path()).unwrap().insert(&connection.stored).unwrap();
+    let _resolver = lww_residency::install_test_source_connection(f.directory_b.path(), Arc::new(connection)).unwrap();
+    f.b.asset_residency_download_remote(Some("receiver"), None, None, || Ok(())).unwrap();
+    assert!(f.b.external_lww_object_is_local(&external).unwrap());
+    assert!(!f.b.external_lww_object_is_local(&held).unwrap(), "a connection download leaves server-held bodies remote");
+    assert_eq!(status(&f.b)["policy"], "remote");
+    f.b.asset_residency_download_remote(None, None, None, || Ok(())).unwrap();
+    assert!(f.b.external_lww_object_is_local(&held).unwrap());
+    assert_eq!(status(&f.b)["policy"], "remote");
+    assert_eq!(status(&f.b)["remoteObjects"].as_u64(), Some(0));
+}
+
+#[test]
+fn download_without_a_policy_change_skips_bodies_no_storage_holds() {
+    let mut f = CycleFixture::new();
+    let (_server, held, external) = split_holders(&mut f);
+    f.b.asset_residency_download_remote(None, None, None, || Ok(())).unwrap();
+    assert!(f.b.external_lww_object_is_local(&held).unwrap());
+    assert!(!f.b.external_lww_object_is_local(&external).unwrap());
+    assert_eq!(status(&f.b)["unavailableObjects"].as_u64(), Some(1));
+}
