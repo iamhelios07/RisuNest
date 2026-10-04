@@ -499,10 +499,38 @@ pub(super) fn snapshot_path_is_link_or_reparse(path: &Path) -> StoreResult<bool>
     }
 }
 
-fn logical_database_bytes(connection: &Connection) -> StoreResult<u64> {
+/// Database page bytes less the values retired generations still store. Those
+/// rows only wait for the purge, so a size estimate leaves them out.
+pub(super) fn logical_database_bytes(connection: &Connection) -> StoreResult<u64> {
     let page_count: i64 = connection.query_row("PRAGMA page_count", [], |row| row.get(0))?;
     let page_size: i64 = connection.query_row("PRAGMA page_size", [], |row| row.get(0))?;
-    Ok((page_count as u64).saturating_mul(page_size as u64))
+    let pages = (page_count.max(0) as u64).saturating_mul(page_size.max(0) as u64);
+    let retired: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM generations WHERE state = 'retired')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !retired {
+        return Ok(pages);
+    }
+    let mut held = 0u64;
+    for (table, columns) in super::GENERATION_TABLES {
+        let values = columns
+            .split(',')
+            .map(|column| format!("coalesce(octet_length({}),0)", column.trim()))
+            .collect::<Vec<_>>()
+            .join("+");
+        let bytes: i64 = connection.query_row(
+            &format!(
+                "SELECT coalesce(sum({values}),0) FROM {table}
+                 WHERE generation IN (SELECT id FROM generations WHERE state = 'retired')"
+            ),
+            [],
+            |row| row.get(0),
+        )?;
+        held = held.saturating_add(bytes.max(0) as u64);
+    }
+    Ok(pages.saturating_sub(held))
 }
 
 pub(super) fn collect_asset_roots(
