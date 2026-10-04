@@ -119,6 +119,7 @@ impl PersistentStore {
         // roots independently of catalog membership; backup must do the same.
         let roots = snapshot_archive::Archive::open(&self.snapshots_dir)?.roots()?;
         let cas = PayloadCas::new(&self.repository_root)?;
+        let mut remote = crate::external_storage::lww_residency::RemoteBodies::open(&self.repository_root)?;
         let mut historical = BTreeSet::new();
         let mut manifests = BTreeSet::new();
         for root in roots {
@@ -128,7 +129,7 @@ impl PersistentStore {
         for manifest in manifests {
             // Ownership manifests must be available before their payload inventory is known.
             let registered=residency.as_ref().map(|residency|residency.object(&manifest,None)).transpose()?.flatten().is_some()
-                || crate::external_storage::lww_residency::stat(&self.repository_root,&manifest)?.is_some();
+                || remote.stat(&manifest)?.is_some();
             if registered && !hydration.hydrate_many_observed(std::slice::from_ref(&manifest),&check,&on_object_done)?.is_empty() {
                 return Err(SyncError::new("required-asset-unavailable",409));
             }
@@ -153,7 +154,7 @@ impl PersistentStore {
         for hash in inventory {
             check()?;
             if residency.as_ref().map(|residency|residency.object(&hash,None)).transpose()?.flatten().is_some()
-                || crate::external_storage::lww_residency::stat(&self.repository_root,&hash)?.is_some() {registered.push(hash);}
+                || remote.stat(&hash)?.is_some() {registered.push(hash);}
         }
         if !hydration.hydrate_many_outcomes_prioritized(&registered,&priority,&check,|_,_|on_object_done())?.is_empty() {
             return Err(SyncError::new("required-asset-unavailable",409));
