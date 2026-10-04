@@ -981,6 +981,27 @@ class SafFileBridgeTest {
   }
 
   @Test
+  fun `destination source accepts only exact app-owned dataset handoffs`() {
+    val appData = temporaryDirectory()
+    val handoffs = appData.resolve("native-file-jobs/handoffs")
+    handoffs.mkdirs()
+    val id = "99999999-9999-4999-8999-999999999999"
+    val source = handoffs.resolve("risu-dataset-$id.json").apply { writeBytes(byteArrayOf(1)) }
+    val outside = appData.resolve("outside/risu-dataset-$id.json").apply {
+      parentFile!!.mkdirs()
+      writeBytes(byteArrayOf(2))
+    }
+    val otherSuffix = handoffs.resolve("risu-dataset-$id.bin").apply { writeBytes(byteArrayOf(3)) }
+
+    assertEquals(source.canonicalFile, resolveManagedExportSource(appData, source.path))
+    assertEquals(id, managedExportId(source))
+    assertEquals(SafDestinationSourceKind.RISU_SAVE, managedExportSourceKind(source))
+    assertEquals(source.canonicalFile, resolveManagedExportById(appData, id))
+    assertNull(resolveManagedExportSource(appData, outside.path))
+    assertNull(resolveManagedExportSource(appData, otherSuffix.path))
+  }
+
+  @Test
   fun `destination source accepts only exact app-owned portable backup handoffs`() {
     val appData = temporaryDirectory()
     val handoffs = appData.resolve("native-file-jobs/handoffs")

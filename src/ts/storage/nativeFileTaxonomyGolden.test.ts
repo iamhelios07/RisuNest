@@ -23,6 +23,7 @@ const HANDOFF_KIND_TO_JOB_KIND: Record<
     'character-charx': 'export-character-charx',
     'character-card': 'export-character-card',
     'risu-module': 'export-risu-module',
+    'dataset-export': 'export-dataset',
 }
 // Handoffs the renderer writes itself; no native job recovers them.
 const RENDERER_HANDOFF_KINDS = ['download']

@@ -71,6 +71,9 @@ private val MANAGED_RISU_MODULE_NAME = Regex(
 private val MANAGED_DOWNLOAD_NAME = Regex(
   "risu-download-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\\.bin",
 )
+private val MANAGED_DATASET_NAME = Regex(
+  "risu-dataset-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\\.json",
+)
 private const val MANAGED_SCREENSHOT_FILE = "archive.zip.part"
 private const val MANAGED_SCREENSHOT_OWNERSHIP = "ownership"
 private const val MANAGED_SCREENSHOT_READY = "ready"
@@ -552,6 +555,9 @@ private val MANAGED_HANDOFF_KINDS = listOf(
   },
   ManagedHandoffKind(MANAGED_RISU_MODULE_NAME, SafDestinationSourceKind.RISU_SAVE) { id ->
     listOf("risu-module-$id.risum")
+  },
+  ManagedHandoffKind(MANAGED_DATASET_NAME, SafDestinationSourceKind.RISU_SAVE) { id ->
+    listOf("risu-dataset-$id.json")
   },
   ManagedHandoffKind(MANAGED_DOWNLOAD_NAME, SafDestinationSourceKind.DOWNLOAD) { id ->
     listOf("risu-download-$id.bin")

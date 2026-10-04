@@ -4,6 +4,7 @@ mod character_json_export;
 mod character_png_export;
 pub mod charx;
 mod content;
+mod dataset_export;
 pub(crate) mod download_handoff;
 mod error;
 mod jpeg_asset;
@@ -320,6 +321,10 @@ pub(crate) enum NativeFileJobStartRequest {
         destination: Option<String>,
         expected_revision: i64,
         module_index: u64,
+    },
+    ExportDataset {
+        destination: Option<String>,
+        expected_revision: i64,
     },
     PrepareContentImport {
         source: JobSource,
@@ -958,6 +963,7 @@ fn is_owned_handoff_name(path: &Path) -> bool {
         || handoff_name(path, "risu-character-card-", ".json")
         || handoff_name(path, "risu-character-card-", ".png")
         || handoff_name(path, "risu-module-", ".risum")
+        || handoff_name(path, dataset_export::PREFIX, dataset_export::SUFFIX)
         || handoff_name(path, download_handoff::PREFIX, download_handoff::SUFFIX)
 }
 
@@ -1057,6 +1063,10 @@ fn cleanup_character_card_handoff_path(root: &Path, path: &Path) -> Result<bool,
 
 fn cleanup_risu_module_handoff_path(root: &Path, path: &Path) -> Result<bool, NativeJobError> {
     cleanup_handoff_path(root, path, "risu-module-", ".risum", "RISUM")
+}
+
+fn cleanup_dataset_handoff_path(root: &Path, path: &Path) -> Result<bool, NativeJobError> {
+    cleanup_handoff_path(root, path, dataset_export::PREFIX, dataset_export::SUFFIX, "dataset")
 }
 
 fn cleanup_spool_directories_at(
@@ -1724,6 +1734,24 @@ impl NativeFileJobState {
                     prepared,
                 }
             }
+            NativeFileJobStartRequest::ExportDataset {
+                destination,
+                expected_revision,
+            } => {
+                let destination = destination.map(PathBuf::from);
+                if let Some(destination) = destination.as_deref() {
+                    validate_desktop_destination(destination)?;
+                }
+                let prepared =
+                    crate::persistent_store::commands::with_store_mut(app.state(), |store| {
+                        store.prepare_risu_save_export(expected_revision)
+                    })
+                    .map_err(native_store_error)?;
+                NativeFileJobTask::ExportDataset {
+                    destination,
+                    prepared,
+                }
+            }
             request @ NativeFileJobStartRequest::PrepareContentImport { .. } => {
                 return self.start_content(request);
             }
@@ -2365,6 +2393,16 @@ impl NativeFileJobState {
                         destination.as_deref(),
                         &job,
                     ),
+                    NativeFileJobTask::ExportDataset {
+                        destination,
+                        prepared,
+                    } => dataset_export::export_dataset(
+                        prepared,
+                        &owned_directory,
+                        &root.join("handoffs"),
+                        destination.as_deref(),
+                        &job,
+                    ),
                     NativeFileJobTask::ImportJpegAsset {
                         opened_source,
                         display_name,
@@ -2739,6 +2777,10 @@ enum NativeFileJobTask {
         module_index: u64,
         prepared: crate::persistent_store::PreparedRisuSaveExport,
     },
+    ExportDataset {
+        destination: Option<PathBuf>,
+        prepared: crate::persistent_store::PreparedRisuSaveExport,
+    },
     ImportJpegAsset {
         opened_source: Option<OpenedJobSource>,
         source: JobSource,
@@ -2772,6 +2814,7 @@ impl NativeFileJobTask {
             Self::ExportCharacterCharx { .. } => JobKind::ExportCharacterCharx,
             Self::ExportCharacterCard { .. } => JobKind::ExportCharacterCard,
             Self::ExportRisuModule { .. } => JobKind::ExportRisuModule,
+            Self::ExportDataset { .. } => JobKind::ExportDataset,
             Self::ImportJpegAsset { .. } => JobKind::ImportJpegAsset,
             #[cfg(feature = "native-kei-upload-pilot")]
             Self::KeiBackup { .. } => JobKind::KeiBackupUpload,
@@ -2809,7 +2852,8 @@ impl NativeFileJobTask {
             } => Some(*expected_revision),
             Self::ExportCharacterCharx { prepared, .. }
             | Self::ExportCharacterCard { prepared, .. }
-            | Self::ExportRisuModule { prepared, .. } => Some(prepared.revision),
+            | Self::ExportRisuModule { prepared, .. }
+            | Self::ExportDataset { prepared, .. } => Some(prepared.revision),
             #[cfg(feature = "native-kei-upload-pilot")]
             Self::KeiBackup { prepared } => Some(prepared.revision()),
             #[cfg(feature = "native-official-publication")]
@@ -3415,6 +3459,14 @@ pub(crate) fn native_risu_module_handoff_cleanup(
     logged("native_risu_module_handoff_cleanup", cleanup_risu_module_handoff_path(&state.root, Path::new(&path)))
 }
 
+#[tauri::command(async)]
+pub(crate) fn native_dataset_export_handoff_cleanup(
+    state: State<'_, NativeFileJobState>,
+    path: String,
+) -> Result<bool, NativeJobError> {
+    logged("native_dataset_export_handoff_cleanup", cleanup_dataset_handoff_path(&state.root, Path::new(&path)))
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum JobKind {
@@ -3430,6 +3482,7 @@ pub(crate) enum JobKind {
     ExportCharacterCharx,
     ExportCharacterCard,
     ExportRisuModule,
+    ExportDataset,
     PrepareContentImport,
     ImportJpegAsset,
     KeiBackupUpload,
@@ -4407,6 +4460,7 @@ impl JobControl {
             || (status.kind == JobKind::ExportCharacterCharx && status.state.is_terminal())
             || (status.kind == JobKind::ExportCharacterCard && status.state.is_terminal())
             || (status.kind == JobKind::ExportRisuModule && status.state.is_terminal())
+            || (status.kind == JobKind::ExportDataset && status.state.is_terminal())
             || (status.kind == JobKind::ExportPortableBackup && status.state.is_terminal())
             || (status.kind == JobKind::ExportCompatibleLocalBackup && status.state.is_terminal())
             || (status.device_session_id.is_some() && status.state.is_terminal())
@@ -4729,6 +4783,7 @@ impl JobControl {
             JobKind::ExportCharacterCharx => JobPhase::WritingExport,
             JobKind::ExportCharacterCard => JobPhase::WritingExport,
             JobKind::ExportRisuModule => JobPhase::WritingExport,
+            JobKind::ExportDataset => JobPhase::WritingExport,
             JobKind::PrepareContentImport => JobPhase::ReadingSource,
             JobKind::ImportJpegAsset => JobPhase::ReadingSource,
             JobKind::KeiBackupUpload => JobPhase::WritingExport,
@@ -7577,6 +7632,11 @@ mod tests {
                 "expectedRevision": 11,
                 "moduleIndex": 3
             }),
+            json!({
+                "kind": "export-dataset",
+                "destination": "C:\\chosen\\dataset.json",
+                "expectedRevision": 12
+            }),
         ];
         for case in &cases {
             assert!(case.get("assets").is_none());
@@ -7631,6 +7691,14 @@ mod tests {
                 module_index: 3,
             }
         ));
+        let dataset: NativeFileJobStartRequest = serde_json::from_value(cases[4].clone()).unwrap();
+        assert!(matches!(
+            dataset,
+            NativeFileJobStartRequest::ExportDataset {
+                destination: Some(destination),
+                expected_revision: 12,
+            } if destination == "C:\\chosen\\dataset.json"
+        ));
 
         assert_eq!(
             serde_json::to_value(JobKind::ExportCharacterCharx).unwrap(),
@@ -7643,6 +7711,10 @@ mod tests {
         assert_eq!(
             serde_json::to_value(JobKind::ExportRisuModule).unwrap(),
             json!("export-risu-module")
+        );
+        assert_eq!(
+            serde_json::to_value(JobKind::ExportDataset).unwrap(),
+            json!("export-dataset")
         );
     }
 
@@ -8132,7 +8204,11 @@ mod tests {
     #[test]
     fn terminal_native_content_export_receipts_keep_exact_recovery_kinds_until_forget() {
         let registry = JobRegistry::with_retention(0, Duration::ZERO);
-        for kind in [JobKind::ExportCharacterCard, JobKind::ExportRisuModule] {
+        for kind in [
+            JobKind::ExportCharacterCard,
+            JobKind::ExportRisuModule,
+            JobKind::ExportDataset,
+        ] {
             let job = registry.create(kind).unwrap();
             let id = job.id();
             job.start(JobPhase::WritingExport).unwrap();
@@ -8545,6 +8621,7 @@ mod tests {
                 "character-charx" => cleanup_character_charx_handoff_path,
                 "character-card" => cleanup_character_card_handoff_path,
                 "risu-module" => cleanup_risu_module_handoff_path,
+                "dataset-export" => cleanup_dataset_handoff_path,
                 "download" => |root, path| {
                     cleanup_handoff_path(
                         root,
@@ -8558,7 +8635,7 @@ mod tests {
             }
         };
         let grammars = fixture["managedHandoffs"].as_array().unwrap();
-        assert_eq!(grammars.len(), 7, "grammar count drifted from the fixture");
+        assert_eq!(grammars.len(), 8, "grammar count drifted from the fixture");
 
         for grammar in grammars {
             let kind = grammar["kind"].as_str().unwrap();
@@ -8644,6 +8721,7 @@ mod tests {
             format!("risu-character-card-{uuid}.png"),
             format!("risu-module-{uuid}.risum"),
             format!("risu-download-{uuid}.bin"),
+            format!("risu-dataset-{uuid}.json"),
         ];
         for name in &owned {
             fs::write(handoffs.join(name), b"synthetic handoff").unwrap();
@@ -8815,6 +8893,28 @@ mod tests {
         fs::write(&png, b"owned PNG").unwrap();
         assert!(cleanup_character_card_handoff_path(&root, &png).unwrap());
         assert!(!cleanup_character_card_handoff_path(&root, &png).unwrap());
+    }
+
+    #[test]
+    fn dataset_handoff_cleanup_removes_only_exact_owned_files_and_is_idempotent() {
+        let directory = TempDir::new().unwrap();
+        let root = directory.path().join("native-file-jobs");
+        let handoffs = root.join("handoffs");
+        fs::create_dir_all(&handoffs).unwrap();
+        let owned = handoffs.join(format!("risu-dataset-{}.json", Uuid::new_v4()));
+        let unrelated = handoffs.join("dataset.json");
+        fs::write(&owned, b"owned").unwrap();
+        fs::write(&unrelated, b"unrelated").unwrap();
+
+        assert!(cleanup_dataset_handoff_path(&root, &owned).unwrap());
+        assert!(!cleanup_dataset_handoff_path(&root, &owned).unwrap());
+        assert!(unrelated.is_file());
+        assert_eq!(
+            cleanup_dataset_handoff_path(&root, &unrelated)
+                .unwrap_err()
+                .code,
+            "invalid-input"
+        );
     }
 
     #[test]

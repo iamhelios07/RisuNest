@@ -799,6 +799,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         native_file_jobs::native_character_charx_handoff_cleanup,
         native_file_jobs::native_character_card_handoff_cleanup,
         native_file_jobs::native_risu_module_handoff_cleanup,
+        native_file_jobs::native_dataset_export_handoff_cleanup,
         native_file_jobs::download_handoff::native_download_handoff_create,
         native_file_jobs::download_handoff::native_download_handoff_append,
         native_file_jobs::download_handoff::native_download_handoff_cleanup,
