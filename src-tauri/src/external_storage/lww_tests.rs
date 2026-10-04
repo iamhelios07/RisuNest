@@ -1959,6 +1959,55 @@ fn returning_to_a_repository_without_its_pending_state_counts_a_landed_segment_w
     })
 }
 #[test]
+fn a_landed_segment_that_cleanup_removed_after_a_checkpoint_keeps_its_sequence_on_return() {
+    run(async {
+        use crate::persistent_store::sync_selection::SyncTarget;
+        let mut f = CycleFixture::new();
+        let target = SyncTarget::External("repository".into());
+        let first = bind_external(&mut f.a, &f.sender, &target);
+        set(&mut f.a, &["root", "language"], serde_json::json!("ko"));
+        let pending = send_unconfirmed(&mut f, first, true).await;
+        let writer = f.a.lww_clock_state().unwrap().writer_id;
+        let job = tempfile::tempdir().unwrap();
+        f.sender.compact_published(job.path(), "00000000-0000-4000-8000-0000000000c1", &writer, &fake::capabilities(true), &Cancellation::default(), None).await.unwrap();
+        f.provider.forget(&pending.object_id);
+        bind_elsewhere(&mut f.a);
+        let rebound = bind_external(&mut f.a, &f.sender, &target);
+        set(&mut f.a, &["root", "askRemoval"], serde_json::json!(true));
+        assert_eq!(f.sender.publish(&mut f.a, rebound, &[], &Cancellation::default()).await.unwrap().segments.0, 1);
+        assert_eq!(f.provider.upload_attempts(&pending.object_id), 1);
+        assert_eq!(f.a.external_lww_next_sequence(&f.sender.target_scope(), &writer).unwrap(), pending.seq.0 + 2);
+        f.receive_b().await;
+        assert_eq!(f.b.read_root(None).unwrap().value["language"], "ko");
+        assert_eq!(f.b.read_root(None).unwrap().value["askRemoval"], true);
+    })
+}
+#[test]
+fn a_landed_segment_this_device_received_keeps_its_sequence_after_cleanup_removed_it() {
+    run(async {
+        use crate::persistent_store::sync_selection::SyncTarget;
+        let mut f = CycleFixture::new();
+        let target = SyncTarget::External("repository".into());
+        let first = bind_external(&mut f.a, &f.sender, &target);
+        set(&mut f.a, &["root", "language"], serde_json::json!("ko"));
+        let pending = send_unconfirmed(&mut f, first, true).await;
+        f.receive_b().await;
+        assert_eq!(f.b.read_root(None).unwrap().value["language"], "ko");
+        bind_elsewhere(&mut f.a);
+        let rebound = bind_external(&mut f.a, &f.sender, &target);
+        f.sender.receive_and_apply(&mut f.a, rebound, &[], &Cancellation::default()).await.unwrap();
+        let writer = f.a.lww_clock_state().unwrap().writer_id;
+        assert!(f.a.lww_receive_progress(rebound).unwrap().iter().any(|p| p.writer_id.as_deref() == Some(writer.as_str()) && p.cursor == pending.seq));
+        f.provider.forget(&pending.object_id);
+        set(&mut f.a, &["root", "askRemoval"], serde_json::json!(true));
+        assert_eq!(f.sender.publish(&mut f.a, rebound, &[], &Cancellation::default()).await.unwrap().segments.0, 1);
+        assert_eq!(f.provider.upload_attempts(&pending.object_id), 1);
+        assert_eq!(f.a.external_lww_next_sequence(&f.sender.target_scope(), &writer).unwrap(), pending.seq.0 + 2);
+        f.receive_b().await;
+        assert_eq!(f.b.read_root(None).unwrap().value["askRemoval"], true);
+    })
+}
+#[test]
 fn returning_to_a_repository_without_its_pending_state_reuses_the_sequence_of_a_segment_that_never_arrived() {
     run(async {
         use crate::persistent_store::sync_selection::SyncTarget;

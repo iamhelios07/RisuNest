@@ -1312,7 +1312,8 @@ impl ExternalLwwEngine {
             match self.reconcile_sent(&publication, &sealed, cancel).await? {
                 Settlement::Landed => true,
                 Settlement::Conflict => return Err(segment::corrupt()),
-                Settlement::Nothing | Settlement::Missing => false,
+                Settlement::Nothing => false,
+                Settlement::Missing => self.landed_before_cleanup(store, &publication, cancel).await?,
             }
         } else {
             false
@@ -1331,6 +1332,35 @@ impl ExternalLwwEngine {
                 .map_err(transient)?;
         }
         Ok(())
+    }
+    /// A sent segment the repository no longer holds may have landed and been
+    /// removed after a checkpoint covered it. Its sequence is reused only when
+    /// no checkpoint covers it and this device has not received it either.
+    async fn landed_before_cleanup(
+        &self,
+        store: &mut PersistentStore,
+        publication: &SealedPublication,
+        cancel: &Cancellation,
+    ) -> Result<bool> {
+        let authority = store.lww_binding_authority().map_err(store_error)?;
+        let received = store
+            .lww_receive_progress(authority)
+            .map_err(store_error)?
+            .into_iter()
+            .any(|progress| {
+                progress.kind == "external"
+                    && progress.writer_id.as_deref() == Some(publication.writer.as_str())
+                    && progress.cursor >= publication.seq
+            });
+        if received {
+            return Ok(true);
+        }
+        Ok(self.checkpoints(cancel).await?.into_iter().any(|(_, checkpoint)| {
+            checkpoint
+                .covered_prefixes
+                .get(&publication.writer)
+                .is_some_and(|prefix| *prefix >= publication.seq)
+        }))
     }
     async fn include_objects(
         &self,
