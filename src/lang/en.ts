@@ -2849,6 +2849,7 @@ export const languageEnglish = {
             "reasonCompatibilityImport": 'Select the backup file again to import this format.',
             "reasonIo": 'The file could not be read or written. Check access to the file and try again.',
             "reasonReselectSource": 'Select the file again to retry importing.',
+            "reasonImportInterrupted": 'The import did not finish. Select the file again to import it.',
             "reasonCapability": 'This file operation is unavailable on this device.',
             "reasonRescueFormat": 'This recovery file cannot be restored directly. Use a restorable backup.',
             "reasonNoRecoverySource": 'No data was found to export for recovery.',

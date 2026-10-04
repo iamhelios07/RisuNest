@@ -2662,6 +2662,7 @@ export const languageKorean = {
             "reasonCompatibilityImport": '이 형식의 백업을 가져오려면 백업 파일을 다시 선택하세요.',
             "reasonIo": '파일을 읽거나 쓰지 못했습니다. 파일 접근 권한을 확인한 후 다시 시도해주세요.',
             "reasonReselectSource": '가져오기를 다시 시도하려면 파일을 다시 선택해주세요.',
+            "reasonImportInterrupted": '가져오기를 완료하지 못했습니다. 다시 가져오려면 파일을 다시 선택해주세요.',
             "reasonCapability": '이 기기에서는 이 파일 작업을 사용할 수 없습니다.',
             "reasonRescueFormat": '이 복구 파일은 직접 복원할 수 없습니다. 복원할 수 있는 백업을 선택해주세요.',
             "reasonNoRecoverySource": '복구 파일로 내보낼 데이터를 찾지 못했습니다.',
