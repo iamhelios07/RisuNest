@@ -299,15 +299,26 @@ impl LwwClient {
         Ok(admitted.incoming_upper_ms(&target, elapsed)?.into())
     }
     pub(crate) fn settle(&self, publication: &Publication) -> Result<OperationReceipt> {
-        let original = ServerClient::with_cancellation(
-            publication.config.resolve(&self.root)?,
-            self.cancelled.clone(),
-        )?;
-        #[cfg(test)]
-        let original = {
-            let mut original = original;
-            original.test_io = self.client.test_io.clone();
-            original
+        let current = self.client.config();
+        // The registration that sent the publication is asked through the
+        // current address when it is the one in use.
+        let resolved;
+        let original = if publication.config.library_id == current.library_id
+            && publication.config.device_id == current.device_id
+        {
+            &self.client
+        } else {
+            #[allow(unused_mut)]
+            let mut client = ServerClient::with_cancellation(
+                publication.config.resolve(&self.root)?,
+                self.cancelled.clone(),
+            )?;
+            #[cfg(test)]
+            {
+                client.test_io = self.client.test_io.clone();
+            }
+            resolved = client;
+            &resolved
         };
         let path = format!("operations/{}", publication.request.operation_id);
         let reply = original.request(
@@ -410,7 +421,6 @@ impl LwwClient {
         for publication in self.log.pending()? {
             if publication.config.library_id != former.library_id
                 || publication.config.device_id != former.device_id
-                || publication.config.endpoint != former.endpoint
             {
                 return Err(SyncError::new("publication-unsettled", 409));
             }

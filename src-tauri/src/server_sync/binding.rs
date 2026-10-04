@@ -110,13 +110,13 @@ pub(crate) fn inspect(store: &PersistentStore, header: &Header) -> Result<Inspec
     #[cfg(test)]
     super::hash_metrics::record(
         "c_binding_target_identity",
-        format!("{}:{}:{}", config.endpoint, config.library_id, head.epoch).len(),
+        format!("{}:{}", config.library_id, head.epoch).len(),
     );
-    let target_id = risunest_sync_wire::hash(
-        format!("{}:{}:{}", config.endpoint, config.library_id, head.epoch).as_bytes(),
-    );
-    let same_library =
-        |old: &StoredConfig| old.endpoint == config.endpoint && old.library_id == config.library_id;
+    // A server is identified by its library and epoch, so another spelling of
+    // its address reaches the same target.
+    let target_id =
+        risunest_sync_wire::hash(format!("{}:{}", config.library_id, head.epoch).as_bytes());
+    let same_library = |old: &StoredConfig| old.library_id == config.library_id;
     let active = core.log.verified::<VerifiedTarget>("bindings", "active").ok();
     let previously_bound_library = store.lww_previously_bound(&config.library_id, &target_id)?
         && core.log.config("active")?.is_some_and(|old| same_library(&old))
@@ -328,10 +328,9 @@ pub(crate) fn prepare_new_device(
         store.repository_root(),
         stage.target.config.resolve(store.repository_root())?,
     )?;
-    let same = old.as_ref().is_some_and(|old| {
-        old.library_id == stage.target.config.library_id
-            && old.endpoint == stage.target.config.endpoint
-    });
+    let same = old
+        .as_ref()
+        .is_some_and(|old| old.library_id == stage.target.config.library_id);
     let former_token = if same {
         Some(
             old.as_ref()
@@ -434,9 +433,7 @@ pub(crate) fn prepare_fresh_writer(
     let old = store
         .server_stored_config()?
         .filter(|old| {
-            old.endpoint == target.config.endpoint
-                && old.library_id == target.config.library_id
-                && old.device_id != target.config.device_id
+            old.library_id == target.config.library_id && old.device_id != target.config.device_id
         })
         .ok_or_else(|| SyncError::new("registration-unchanged", 409))?;
     LwwClient::new(&root, old.resolve(&root)?)?.fence_new_device(store)?;
@@ -523,8 +520,7 @@ pub(crate) fn activate(
         let selected = match selected {
             Some(target)
                 if stored.as_ref().is_some_and(|stored| {
-                    stored.endpoint == target.config.endpoint
-                        && stored.library_id == target.config.library_id
+                    stored.library_id == target.config.library_id
                         && stored.device_id != target.config.device_id
                 }) =>
             {
@@ -1332,6 +1328,106 @@ mod tests {
         let receipt = push_now(&client, &mut a).unwrap().unwrap();
         assert_eq!(receipt.accepted_keys, vec![retained[0].0.clone()]);
         assert!(push_now(&client, &mut a).unwrap().is_none());
+        assert_eq!(server_unit(&server, &fresh, &retained[0].0).unwrap().stamp, retained[0].1);
+        assert!(server.server.authenticate(&old.library_id, &old.token).is_err());
+    }
+    /// Saves `config` as the candidate under another spelling of its endpoint.
+    fn configure_endpoint(
+        store: &PersistentStore,
+        config: &super::super::client::ServerConfig,
+        endpoint: &str,
+    ) -> super::super::client::ServerConfig {
+        let config = super::super::client::ServerConfig { endpoint: endpoint.into(), ..config.clone() };
+        let stored = StoredConfig::persist(store.repository_root(), &config).unwrap();
+        OperationLog::open(store.repository_root()).unwrap().save_config("candidate", &stored).unwrap();
+        config
+    }
+    #[test]
+    fn a_rebind_under_another_endpoint_spelling_keeps_unsent_edits_and_receive_progress() {
+        use crate::server_sync::lww_tests::{drain_publications, receive_available};
+        let server = LocalServerFixture::new();
+        let (_a_root, mut a) = local();
+        let (_b_root, mut b) = local();
+        let peer = server.client(&b);
+        let registration = configure(&server, &a);
+        bind(&mut a);
+        let client = bound_client(&a);
+        save(&mut b, &["root", "askRemoval"], serde_json::json!(true));
+        drain_publications(&peer, &mut b, &[]).unwrap();
+        receive_available(&client, &mut a, &[]).unwrap();
+        drop(client);
+        let progress = a.lww_receive_progress(a.lww_binding_authority().unwrap()).unwrap();
+        assert!(!progress.is_empty());
+        save(&mut a, &["root", "language"], serde_json::json!("ko"));
+        switch_to(&mut a, SyncTarget::None, None);
+        let retained = outbox(&a);
+        assert_eq!(retained.len(), 1);
+        configure_endpoint(&a, &registration, &format!("{}/", server.endpoint));
+        let inspected = inspect(&a, &header(&a)).unwrap();
+        assert!(inspected.previously_bound_library);
+        assert!(!inspected.registration_changed && !inspected.server_restored);
+        let state = switch_to(&mut a, SyncTarget::Server("server".into()), Some(inspected.inspection_id));
+        activate(&mut a, &Header { binding_authority: state.target_authority, request_id: uuid::Uuid::new_v4().to_string() }, None).unwrap();
+        assert_eq!(outbox(&a), retained);
+        assert_eq!(
+            serde_json::to_value(a.lww_receive_progress(state.target_authority).unwrap()).unwrap(),
+            serde_json::to_value(&progress).unwrap(),
+        );
+        let client = bound_client(&a);
+        drain_publications(&client, &mut a, &[]).unwrap();
+        assert!(outbox(&a).is_empty());
+        assert_eq!(server_unit(&server, &registration, &retained[0].0).unwrap().stamp, retained[0].1);
+    }
+    #[test]
+    fn a_pending_publication_under_an_old_endpoint_spelling_settles_through_the_current_one() {
+        use crate::server_sync::lww_tests::drain_publications;
+        use risunest_sync_wire::lww::{PushRequest, UnitChange};
+        let server = LocalServerFixture::new();
+        let (_root, mut a) = local();
+        let registration = configure(&server, &a);
+        bind(&mut a);
+        save(&mut a, &["root", "language"], serde_json::json!("ko"));
+        let retained = outbox(&a);
+        let authority = a.lww_binding_authority().unwrap();
+        let entries = a.lww_read_outbox(authority, 256).unwrap().entries;
+        let gone = LocalServerFixture::new();
+        let unreachable = super::super::client::ServerConfig { endpoint: gone.endpoint.clone(), ..registration.clone() };
+        drop(gone);
+        let client = bound_client(&a);
+        client.log.prepare(&super::super::lww_client::Publication {
+            authority,
+            request: PushRequest {
+                library_id: registration.library_id.clone(),
+                writer_id: a.lww_clock_state().unwrap().writer_id,
+                operation_id: uuid::Uuid::new_v4().to_string(),
+                changes: entries.iter().map(|e| UnitChange { key: e.key.clone(), stamp: e.stamp.clone(), value: e.value.clone() }).collect(),
+            },
+            entries,
+            config: StoredConfig::persist(a.repository_root(), &unreachable).unwrap(),
+        }).unwrap();
+        drain_publications(&client, &mut a, &[]).unwrap();
+        assert!(client.log.pending().unwrap().is_empty());
+        assert!(outbox(&a).is_empty());
+        assert_eq!(server_unit(&server, &registration, &retained[0].0).unwrap().stamp, retained[0].1);
+    }
+    #[test]
+    fn a_new_registration_under_another_endpoint_spelling_keeps_the_binding_and_publishes_unsent_edits() {
+        let server = LocalServerFixture::new();
+        let (_root, mut a) = local();
+        let old = configure(&server, &a);
+        let bound = bind(&mut a);
+        save(&mut a, &["root", "language"], serde_json::json!("ko"));
+        let retained = outbox(&a);
+        let (fresh, _) = server.candidate(&a);
+        let fresh = configure_endpoint(&a, &fresh, &format!("{}/", server.endpoint));
+        let inspected = fresh_inspection(&a);
+        let prepared = fresh_writer(&mut a, &inspected.inspection_id).unwrap();
+        resume(&mut a);
+        assert_eq!(a.lww_binding_authority().unwrap(), bound.binding_authority);
+        assert_eq!(a.server_stored_config().unwrap().unwrap().device_id, fresh.device_id);
+        assert_eq!(a.lww_clock_state().unwrap().writer_id, prepared.writer_id);
+        let receipt = push_now(&bound_client(&a), &mut a).unwrap().unwrap();
+        assert_eq!(receipt.accepted_keys, vec![retained[0].0.clone()]);
         assert_eq!(server_unit(&server, &fresh, &retained[0].0).unwrap().stamp, retained[0].1);
         assert!(server.server.authenticate(&old.library_id, &old.token).is_err());
     }

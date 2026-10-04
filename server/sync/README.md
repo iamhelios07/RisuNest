@@ -100,6 +100,8 @@ Restore is a last resort for when the server data is lost and no device still ho
 
 Restore verifies the backup, creates a new server epoch, and revokes every registered device. Register each device again. A device that was connected to the restored library reports that the server was restored and, after confirmation, connects as a new device, which replaces its library with the restored server state, so changes a device made after the backup was taken are lost unless saved separately before reconnecting.
 
+Devices identify a library by its library ID and epoch, not by the address in the registration, so a device that reaches the same server under a new address or tunnel host keeps its unsent changes and receive position. Running a second server from a copy of a data directory is not supported: both copies share one library ID and epoch, and devices treat them as the same library. To run another server, `init` a new data directory.
+
 If clients stop with an integrity error because the server library holds two different changes under the same identity, the app cannot repair the library in place. Connect the devices to a new, empty library as described above, or restore a backup taken before the problem.
 
 The private `connection-state` file is operational configuration and is not part of a library backup. Preserve it separately under the same daemon OS account when restoring the same registry identity.
