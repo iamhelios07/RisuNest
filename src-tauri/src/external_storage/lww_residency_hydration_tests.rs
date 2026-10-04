@@ -85,6 +85,20 @@ fn on_after_lookup(root: &Path, hook: impl FnOnce() + Send + 'static) {
     AFTER_LOOKUP.lock().unwrap().insert(std::fs::canonicalize(root).unwrap(), Box::new(hook));
 }
 
+static BEFORE_PUBLISH: Mutex<BTreeMap<PathBuf, Hook>> = Mutex::new(BTreeMap::new());
+/// Runs what a test set for `root`, once, after bodies were read and before
+/// the first batch of them is published.
+pub(super) fn before_publish(root: &Path) {
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_owned());
+    let hook = BEFORE_PUBLISH.lock().unwrap().remove(&root);
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+fn on_before_publish(root: &Path, hook: impl FnOnce() + Send + 'static) {
+    BEFORE_PUBLISH.lock().unwrap().insert(std::fs::canonicalize(root).unwrap(), Box::new(hook));
+}
+
 fn run<T>(future: impl std::future::Future<Output = T>) -> T {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -301,6 +315,25 @@ fn a_source_deleted_between_lookup_and_registration_leaves_no_row_and_its_body_u
     assert!(stat(root, &deleted).unwrap().is_none());
     let kept = bodies.iter().filter(|(hash, _)| *hash != deleted).cloned().collect::<Vec<_>>();
     assert_resident(root, &kept);
+}
+
+#[test]
+fn a_body_whose_row_and_source_go_while_it_downloads_is_published_with_a_row() {
+    let received = received(&[3]);
+    let root = received.f.directory_b.path();
+    let bodies = &received.publications[0];
+    forget_rows(root, bodies);
+    let (repository, target) = (root.to_owned(), bodies[1].0.clone());
+    on_before_publish(root, move || {
+        // A connection removal deletes the body's sources and, with no file yet, its row.
+        let _guard = crate::asset_repository::coordinator::lock_repository_mutation().unwrap();
+        let db = database(&repository, false).unwrap().unwrap();
+        db.execute("DELETE FROM sources WHERE hash=?1", [&target]).unwrap();
+        db.execute("DELETE FROM packed_sources WHERE hash=?1", [&target]).unwrap();
+        catalog(&repository).execute("DELETE FROM asset_objects WHERE object_hash=?1", [&target]).unwrap();
+    });
+    assert!(hydrate(root, bodies).unwrap().is_empty());
+    assert_resident(root, bodies);
 }
 
 #[test]

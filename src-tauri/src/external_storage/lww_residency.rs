@@ -466,17 +466,16 @@ fn remote_error(error:ProviderError)->crate::server_sync::SyncError {
 pub(crate) fn hydrate_registered_many(root:&Path,digests:&[String],priority:&BTreeSet<String>,
     cancellation:Option<Arc<std::sync::atomic::AtomicBool>>,check:&dyn Fn()->crate::server_sync::Result<()>,
     opened:&mut dyn FnMut(&str,crate::server_sync::residency::HydrationOutcome))->crate::server_sync::Result<Vec<String>> {
-    use crate::persistent_store::asset_object_catalog::{AssetObjectRegistrar,AssetObjectRegistration,ASSET_OBJECT_CATALOG_MAX_PAGE};
+    use crate::persistent_store::asset_object_catalog::{AssetObjectRegistration,ASSET_OBJECT_CATALOG_MAX_PAGE};
     use crate::server_sync::residency::HydrationOutcome;
     let cancel=cancellation.map(Cancellation::with_external_flag).unwrap_or_default();
     let cas=crate::asset_repository::PayloadCas::new(root)?;
     let scratch=tempfile::tempdir()?;
     #[cfg(test)]
     hydration_tests::observe("scratch",root,scratch.path());
-    let publisher=Publisher{root,cas:&cas,check,cancel:&cancel};
-    let mut remote=RemoteBodies::connect(root).map_err(hydration_error)?;
-    let mut catalog:Option<AssetObjectRegistrar>=None;
     let created_at_ms=i64::try_from(super::runtime::now_ms()).map_err(hydration_error)?;
+    let publisher=Publisher{root,cas:&cas,check,cancel:&cancel,catalog:Default::default(),created_at_ms};
+    let mut remote=RemoteBodies::connect(root).map_err(hydration_error)?;
     let mut seen=BTreeSet::new();
     let digests=digests.iter().map(String::as_str).filter(|hash|seen.insert(*hash)).collect::<Vec<_>>();
     let mut unavailable=Vec::new();
@@ -519,14 +518,7 @@ pub(crate) fn hydrate_registered_many(root:&Path,digests:&[String],priority:&BTr
                 };
                 rows.push(AssetObjectRegistration{object_hash:hash.to_owned(),byte_size});
             }
-            if !rows.is_empty() {
-                if catalog.is_none() {
-                    #[cfg(test)]
-                    hydration_tests::observe("catalog",root,root);
-                    catalog=Some(AssetObjectRegistrar::open(root).map_err(hydration_error)?);
-                }
-                if let Some(catalog)=catalog.as_mut() {catalog.register(&rows,created_at_ms).map_err(hydration_error)?;}
-            }
+            publisher.register(&rows)?;
             #[cfg(test)]
             hydration_tests::record_registration_hold(root,page.len(),held.elapsed());
         }
@@ -541,7 +533,6 @@ pub(crate) fn hydrate_registered_many(root:&Path,digests:&[String],priority:&BTr
         #[cfg(test)]
         hydration_tests::crash_point(root,hydration_tests::CrashPoint::AfterRegistration)?;
     }
-    drop(catalog);
     let mut groups=Vec::new();
     for (connection,outlines) in packed {for group in pack_groups(outlines,priority) {groups.push((connection.clone(),group));}}
     groups.sort_by_key(|(_,group)|!group.iter().any(|outline|priority.contains(&outline.hash)));
@@ -718,9 +709,25 @@ struct Publisher<'a> {
     cas:&'a crate::asset_repository::PayloadCas,
     check:&'a dyn Fn()->crate::server_sync::Result<()>,
     cancel:&'a Cancellation,
+    /// The one catalog connection a hydration registers through, opened when a first row needs it.
+    catalog:std::cell::RefCell<Option<crate::persistent_store::asset_object_catalog::AssetObjectRegistrar>>,
+    created_at_ms:i64,
 }
 impl Publisher<'_> {
     fn checked(&self)->crate::server_sync::Result<()> {(self.check)()?;self.cancel.check().map_err(remote_error)}
+    fn register(&self,rows:&[crate::persistent_store::asset_object_catalog::AssetObjectRegistration])->crate::server_sync::Result<()> {
+        if rows.is_empty() {return Ok(());}
+        let mut catalog=self.catalog.borrow_mut();
+        if catalog.is_none() {
+            #[cfg(test)]
+            hydration_tests::observe("catalog",self.root,self.root);
+            *catalog=Some(crate::persistent_store::asset_object_catalog::AssetObjectRegistrar::open(self.root).map_err(hydration_error)?);
+        }
+        match catalog.as_mut() {
+            Some(catalog)=>catalog.register(rows,self.created_at_ms).map_err(hydration_error),
+            None=>Ok(()),
+        }
+    }
     fn publish(&self,bodies:Vec<StagedBody>,opened:&mut dyn FnMut(&str,crate::server_sync::residency::HydrationOutcome))->crate::server_sync::Result<()> {
         let mut batch=Vec::new();let mut bytes=0u64;
         for body in bodies {
@@ -773,15 +780,21 @@ impl Publisher<'_> {
     }
     fn publish_staged(&self,staged:Vec<crate::asset_repository::StagedPayload>)->crate::server_sync::Result<()> {
         if staged.is_empty() {return Ok(());}
+        #[cfg(test)]
+        hydration_tests::before_publish(self.root);
         let _guard=crate::asset_repository::coordinator::lock_repository_mutation()?;
         #[cfg(test)]
         let held=std::time::Instant::now();
         self.checked()?;
         #[cfg(test)]
         let count=staged.len();
-        self.cas.publish_staged_batch(staged)?;
+        let published=self.cas.publish_staged_batch(staged)?;
         #[cfg(test)]
         hydration_tests::crash_point(self.root,hydration_tests::CrashPoint::AfterPublish)?;
+        // A source deletion while these bodies were read takes the rows of bodies that had no file
+        // yet, so each published body is registered again in this hold. A row still there is kept.
+        self.register(&published.into_iter().map(|payload|crate::persistent_store::asset_object_catalog::AssetObjectRegistration{
+            object_hash:payload.content_hash,byte_size:payload.byte_size}).collect::<Vec<_>>())?;
         #[cfg(test)]
         hydration_tests::record_hold(self.root,count,held.elapsed());
         Ok(())
