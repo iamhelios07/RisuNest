@@ -416,6 +416,30 @@ mod tests {
         JobRegistry::default().create(JobKind::ExportDataset).unwrap()
     }
 
+    // The renderer export's loop over the library the store materializes.
+    fn renderer_dataset(database: &Value) -> Value {
+        let mut dataset = Vec::new();
+        for character in database["characters"].as_array().unwrap() {
+            if character["type"] == "group" {
+                continue;
+            }
+            for chat in character["chats"].as_array().unwrap() {
+                let mut entry = Map::new();
+                for (from, to) in [("name", "name"), ("desc", "description")] {
+                    if let Some(value) = character.get(from) {
+                        entry.insert(to.to_owned(), value.clone());
+                    }
+                }
+                entry.insert("chats".to_owned(), chat["message"].clone());
+                if let Some(lorebook) = character.get("globalLore") {
+                    entry.insert("lorebook".to_owned(), lorebook.clone());
+                }
+                dataset.push(Value::Object(entry));
+            }
+        }
+        Value::Array(dataset)
+    }
+
     #[test]
     fn the_dataset_parses_like_the_renderer_export_of_the_shared_fixture() {
         let mut fixture = fixture();
@@ -428,6 +452,8 @@ mod tests {
 
         let text = fs::read_to_string(&destination).unwrap();
         assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), fixture.dataset);
+        let materialized = fixture.store.materialize(Some(fixture.revision)).unwrap();
+        assert_eq!(renderer_dataset(&materialized), fixture.dataset);
         assert!(text.starts_with("[\n    {\n        \"name\": \"Alice\",\n"), "{text}");
         assert_eq!(result.revision, fixture.revision);
         assert_eq!(result.character_count, 4);
