@@ -1,6 +1,8 @@
+import { safeStructuredClone } from '../polyfill'
 import type { WindowedConversationMutationController } from '../storage/activeWorkingSet.svelte'
 import type { Chat, Message } from '../storage/database.svelte'
 import type { HistoryWindowController } from './historyWindowController'
+import { inheritHistoryWindow } from './historyWindowIndex'
 
 export interface HistoryWindowChange {
     start: number
@@ -81,4 +83,35 @@ export function writeHistoryWindowChat(controller: HistoryWindowController, resu
         change.messages,
         changeCommand(change, window.message.length),
     )
+}
+
+export interface HistoryWindowCopy {
+    readonly chat: Chat
+    /** Writes the copy's changes back through the controller. */
+    commit(): boolean
+}
+
+/** A copy of the window chat for a script that edits the chat it is handed. */
+export function openHistoryWindowCopy(controller: HistoryWindowController): HistoryWindowCopy {
+    const chat = safeStructuredClone(controller.chat)
+    inheritHistoryWindow(controller.chat, chat)
+    return {
+        chat,
+        commit: () => writeHistoryWindowChat(controller, chat),
+    }
+}
+
+/**
+ * Writes one message edit by absolute index. A message before the window is
+ * left alone, as a write to an out-of-range index is.
+ */
+export function writeHistoryWindowMessage(
+    controller: WindowedConversationMutationController,
+    absoluteIndex: number,
+    edit: (message: Message) => Message,
+): boolean {
+    const index = absoluteIndex - controller.absoluteStartIndex
+    const message = controller.chat.message[index]
+    if (index < 0 || !message) return true
+    return controller.applyRange(index, 1, [edit(message)], 'edit')
 }

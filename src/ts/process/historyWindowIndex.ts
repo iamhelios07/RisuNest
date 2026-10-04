@@ -1,4 +1,5 @@
 import type { Chat, Message } from '../storage/database.svelte'
+import type { HistoryWindowController } from './historyWindowController'
 
 // A generation that loads only the newest messages hands scripts a chat whose
 // array starts at an absolute index. Script surfaces translate their absolute
@@ -79,4 +80,57 @@ export function sliceHistory(chat: Chat, start?: number, end?: number): Message[
         Math.max(absoluteStart - offset, 0),
         Math.max(absoluteEnd - offset, 0),
     )
+}
+
+/**
+ * Array index for a `splice` start given over the whole conversation, or null
+ * when it falls before the window and the splice is left out.
+ */
+export function toHistorySpliceIndex(chat: Chat, start: number): number | null {
+    const offset = windowStarts.get(chat)
+    if (offset === undefined) return start
+    const index = normalizeSliceIndex(start, offset + chat.message.length, 0) - offset
+    return index < 0 ? null : index
+}
+
+export interface ActiveHistoryWindow {
+    characterId: string
+    conversationId: string
+    /** The metadata-only conversation in the database, while the conversation is windowed. */
+    shell: Chat | null
+    controller: HistoryWindowController
+}
+
+// Script surfaces outside the generation seams resolve the selected
+// conversation from the database. While a send builds from a window, they
+// find the window here.
+const activeWindows = new Set<ActiveHistoryWindow>()
+
+export function registerActiveHistoryWindow(window: ActiveHistoryWindow): () => void {
+    activeWindows.add(window)
+    return () => {
+        activeWindows.delete(window)
+    }
+}
+
+/** The window chat in place of a metadata-only conversation that a send is building from. */
+export function resolveHistoryWindowChat<T extends Chat | null | undefined>(chat: T): T {
+    if (!chat || activeWindows.size === 0) return chat
+    for (const window of activeWindows) {
+        if (window.shell === chat) return window.controller.chat as T
+    }
+    return chat
+}
+
+export function findActiveHistoryWindow(
+    characterId: string | undefined,
+    conversationId: string | undefined,
+): HistoryWindowController | null {
+    if (characterId === undefined || conversationId === undefined) return null
+    for (const window of activeWindows) {
+        if (window.characterId === characterId && window.conversationId === conversationId) {
+            return window.controller
+        }
+    }
+    return null
 }

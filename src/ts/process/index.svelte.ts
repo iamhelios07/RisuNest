@@ -96,7 +96,13 @@ import { notifyDesktop } from "../desktopNotifications";
 import { classifyChatParserHistory } from '../chatParserHistory'
 import { getDeviceSettings } from '../storage/deviceSettings'
 import { cloneConversationMetadata } from '../storage/selectedConversationLifecycle'
-import { attachHistoryWindow, getHistoryWindowStart, toWindowIndex } from './historyWindowIndex'
+import {
+    attachHistoryWindow,
+    getHistoryWindowStart,
+    registerActiveHistoryWindow,
+    toAbsoluteIndex,
+    toWindowIndex,
+} from './historyWindowIndex'
 import { WindowedConversationHistoryOperation } from './historyWindowHistory'
 import {
     captureSessionHistoryWindowController,
@@ -244,6 +250,10 @@ interface GenerationHistoryWindow {
     hypaPlan: HistoryWindowHypaPlan | null
     chat: Chat
     controller: HistoryWindowController
+    characterId: string
+    conversationId: string
+    /** The metadata-only conversation in the database, when the conversation was windowed. */
+    shell: Chat | null
 }
 
 /**
@@ -424,6 +434,9 @@ async function prepareGenerationHistoryWindow(
         hypaPlan: prepared.hypaPlan,
         chat,
         controller,
+        characterId: target.characterId,
+        conversationId: target.conversationId,
+        shell: authority ? conversation : null,
     }
 }
 
@@ -845,8 +858,17 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
             )
             if (!historyWindow) return false
             const unbind = bindWindowedGenerationController(historyWindow.chat, historyWindow.controller)
+            const unregister = registerActiveHistoryWindow({
+                characterId: historyWindow.characterId,
+                conversationId: historyWindow.conversationId,
+                shell: historyWindow.shell,
+                controller: historyWindow.controller,
+            })
             conversationResources.windowedController = historyWindow.controller
-            conversationResources.unbindWindowedController = unbind
+            conversationResources.unbindWindowedController = () => {
+                unregister()
+                unbind()
+            }
             boundedChat = historyWindow.chat
             console.debug('[Generation history] window', {
                 start: historyWindow.start,
@@ -1632,6 +1654,9 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
     try {
     promptScriptOperationScope = createPromptScriptOperationScope(nowChatroom, {
         pluginCompatibility: requiresLivePromptCompatibility,
+        historyWindow: historyWindow
+            ? { chat: historyWindow.chat, conversationId: historyWindow.conversationId }
+            : undefined,
     })
     const promptHistorySelection = selectPromptHistory(promptHistory)
     if (summaryAwareHistoryPlan) {
@@ -1673,10 +1698,12 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
                 role: msg.role,
             })
             : risuChatParser(msg.data, {chara: currentChar, role: msg.role})
-        // Without an allBefore marker the message index counts from the conversation start.
-        const scriptIndex = historyWindow && !promptHistorySelection.resetByAllBefore
-            ? historyWindow.start + index
-            : index
+        // Scripts read and write window messages by their index in the whole conversation.
+        const scriptIndex = !historyWindow
+            ? index
+            : requiresLivePromptCompatibility
+            ? toAbsoluteIndex(currentChat, entry.absoluteIndex)
+            : entry.absoluteIndex
         let formatedChat = (await processScriptFull(nowChatroom, parsedMessage, 'editprocess', scriptIndex, {
             chatRole: msg.role,
         }, {

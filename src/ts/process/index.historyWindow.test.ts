@@ -430,6 +430,37 @@ describe('sendChat with the history window', () => {
         expect(indices.at(-1)).toBe(999)
     })
 
+    it('passes the stored index of each message when a disabled message lies inside the window', async () => {
+        const stored = messages(1000)
+        stored[950].disabled = true
+        installWindowed(stored)
+
+        await sendChat(-1, { historyLimit: true })
+
+        const indexOf = new Map(mocks.processScriptFull.mock.calls
+            .filter((call) => call[2] === 'editprocess')
+            .map((call) => [call[1], call[3]]))
+        expect(indexOf.get('m949')).toBe(949)
+        expect(indexOf.has('m950')).toBe(false)
+        expect(indexOf.get('m951')).toBe(951)
+    })
+
+    it.each([
+        ['streamed', () => streamingResponse('answer')],
+        ['complete', () => ({ type: 'success', result: 'answer' })],
+    ])('passes the absolute index of a %s response to editoutput scripts', async (_name, response) => {
+        installWindowed(messages(1000))
+        mocks.modelResponse = response()
+
+        await expect(sendChat(-1, { historyLimit: true })).resolves.toBe(true)
+
+        const indices = mocks.processScriptFull.mock.calls
+            .filter((call) => call[2] === 'editoutput')
+            .map((call) => call[3])
+        expect(indices.length).toBeGreaterThan(0)
+        expect(new Set(indices)).toEqual(new Set([1000]))
+    })
+
     it('stores ids for window messages that lack one before reading them', async () => {
         const stored = messages(30)
         delete stored[29].chatId
