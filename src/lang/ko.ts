@@ -2017,6 +2017,7 @@ export const languageKorean = {
             serviceWorker: '오프라인 기능 준비 중',
             ui: '화면 준비 중',
             elapsed: (seconds: number) => `${seconds}초 경과`,
+            rendererRecovered: 'WebView 렌더러가 중단되어 화면을 다시 불러왔습니다.',
         },
         serverSync: {
             registrationCode: '등록 코드',
@@ -2881,7 +2882,6 @@ export const languageKorean = {
 
     "syncConflictBackupUnreadable": '이 백업을 읽을 수 없습니다. 다른 백업을 선택하세요.',
     "chatMessageActionFailed": "작업 중 메시지가 변경되었습니다. 다시 시도하세요.",
-    "chatDraftConversationRemoved": "편집 중이던 메시지가 있는 채팅이 삭제되었습니다. 저장되지 않은 내용을 복사하세요.",
     "groupCharactersChangeFailed": "그룹의 캐릭터를 변경하지 못했습니다. 다시 시도하세요.",
     "regexScriptTimeout": "정규식 스크립트 실행 시간이 초과되었습니다.",
     "generationInterruptedInBackground": "백그라운드에서 응답 생성이 중단되었습니다.",

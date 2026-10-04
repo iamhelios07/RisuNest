@@ -134,6 +134,7 @@
         getCurrentViewportSource: () =>
             persistentRuntime.getActiveConversationViewportSource(),
         captureWindowedMessageMutation: (target, index, evidence) => persistentRuntime.captureWindowedMessageMutation(target, index, evidence),
+        acquirePersistentRevision: (revision) => persistentRuntime.store.acquireRevision(revision),
     })
     let viewportBindingRevision = $state(0)
     const selectedConversationViewport = new SelectedConversationViewportBinding(
@@ -344,7 +345,7 @@
                     const controller = persistentRuntime.captureWindowedConversationMutationController(target, chat, authority.totalMessages)
                     if (!controller) return
                     try {
-                        if (!controller.applyRange(0, 0, [{ role: 'user', data: submittedInput, time: Date.now(), name: $ConnectionOpenStore ? DBState.db.username : null }], 'append')) return
+                        if (!controller.applyRange(0, 0, [{ role: 'user', data: submittedInput, time: Date.now(), name: $ConnectionOpenStore ? DBState.db.username : null, chatId: v4() }], 'append')) return
                     } finally { controller.release() }
                     if (messageInput === submittedInput) { messageInput = ''; messageInputTranslate = '' }
                     await persistentRuntime.flushPendingData('generation-input')

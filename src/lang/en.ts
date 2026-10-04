@@ -2202,6 +2202,7 @@ export const languageEnglish = {
             serviceWorker: 'Preparing offline support',
             ui: 'Preparing the interface',
             elapsed: (seconds: number) => `${seconds}s elapsed`,
+            rendererRecovered: 'The WebView renderer stopped, so the screen was reloaded.',
         },
         serverSync: {
             registrationCode: 'Registration code',
@@ -3070,7 +3071,6 @@ export const languageEnglish = {
 
     "syncConflictBackupUnreadable": 'This backup could not be read. Select another backup.',
     "chatMessageActionFailed": "The message changed while the action was in progress. Please try again.",
-    "chatDraftConversationRemoved": "The conversation containing your edit was removed. Copy your unsaved text.",
     "groupCharactersChangeFailed": "Could not change the group characters. Please try again.",
     "regexScriptTimeout": "Regex script execution timed out.",
     "generationInterruptedInBackground": "Response generation was interrupted in the background.",

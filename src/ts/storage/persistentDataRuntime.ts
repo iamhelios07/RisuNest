@@ -26,6 +26,7 @@ import type {
     DataRevision,
     PersistentDataStore,
     PersistentRevisionLease,
+    PersistentRevisionReader,
     PersistentRoot,
     PersistentConversationMetadata,
     PluginStorageMutation,
@@ -50,6 +51,7 @@ import {
     type PersistentConversationReplacementResult,
     type PersistentReplacementOptions,
     type PersistentScopedReplacementOptions,
+    type PreparedUnitIntent,
     type SaveCoordinatorClock,
     type WindowedConversationPersistenceAuthority,
 } from './saveCoordinator'
@@ -377,6 +379,8 @@ export interface PersistentDataRuntime {
     applyLwwReceive(request: LwwStageReceive): Promise<LwwApplyResult>
     drainLwwDeferred(expectedAuthorityEpoch?: number): Promise<void>
     commitPersistentUnitIntent(reason: string, mutations: readonly PersistentUnitMutation[], conversations?: readonly ConversationMutation[], wholeMessages?: readonly WholeMessageIntent[]): Promise<void>
+    /** Prepares at the revision the commit expects, through a reader pinned there; `null` commits nothing. */
+    commitPreparedUnitIntent(reason: string, prepare: (reader: PersistentRevisionReader) => Promise<PreparedUnitIntent | null>): Promise<DataRevision | null>
 
     readonly store: PersistentDataStore
     readonly revision: DataRevision
@@ -550,6 +554,16 @@ export interface PersistentDestructiveReplacementFence {
 export interface PersistentCommittedWorkingSetRefreshOptions {
     forceScalableProjection?: boolean
     changeSet?: ReplacementChangeSet
+}
+
+function unitIntentAffectedKeys(mutations: readonly PersistentUnitMutation[], conversations: readonly ConversationMutation[]): string[] {
+    const affectedKeys = mutations.map((value) => value.key)
+    for (const value of conversations) {
+        if (value.type === 'delete') affectedKeys.push(JSON.stringify(['exists', 'conversation', value.characterId, value.conversationId]))
+        else if (value.type === 'reorder') affectedKeys.push(JSON.stringify(['order', 'conversations', value.characterId]))
+        else affectedKeys.push(JSON.stringify(['messages', value.characterId, value.conversationId]))
+    }
+    return affectedKeys
 }
 
 function createDynamicOfficialPublisher(
@@ -998,6 +1012,12 @@ export function createPersistentDataRuntime(
     }
     const generating = () => [...(dependencies.state.getGeneratingConversations?.() ?? generatingConversations.snapshot())]
     const projectAppliedUnits = async (result: LwwApplyResult, baseline?: ReturnType<typeof captureLwwWorkingSetBaseline>, localIntent = false): Promise<void> => {
+        if (!localIntent && result.affectedKeys.length === 0) {
+            // Nothing reached the library, so the working set and its mirrors stay untouched.
+            coordinator.adoptAppliedUnitState(result.revision, null, null, [])
+            await commitContentCursor(result.revision)
+            return
+        }
         const database = dependencies.state.captureWorkingSetDatabase?.()
         if (!database) { coordinator.adoptAppliedUnitState(result.revision, null, null, []); return }
         baseline ??= captureLwwWorkingSetBaseline(database, coordinator.capturePersistentBaselineRoot(), dependencies.state.capturePresets?.() ?? null, coordinator.captureMaterializedBaseline(), coordinator.capturePresetRecordBaseline())
@@ -1144,14 +1164,26 @@ export function createPersistentDataRuntime(
             // edits reach them first.
             dependencies.state.beforeCapture?.()
             const translated = translatePersistentRootUnitIntents(mutations)
-            const affectedKeys = translated.map((value) => value.key)
+            const affectedKeys = unitIntentAffectedKeys(translated, conversations ?? [])
             for (const value of wholeMessages ?? []) affectedKeys.push(JSON.stringify(['messages', value.characterId, value.conversationId]))
-            for (const value of conversations ?? []) {
-                if (value.type === 'delete') affectedKeys.push(JSON.stringify(['exists', 'conversation', value.characterId, value.conversationId]))
-                else if (value.type === 'reorder') affectedKeys.push(JSON.stringify(['order', 'conversations', value.characterId]))
-                else affectedKeys.push(JSON.stringify(['messages', value.characterId, value.conversationId]))
-            }
             await coordinator.commitPersistentUnitIntent(reason, translated, conversations, wholeMessages, async (revision) => {
+                try { await projectAppliedUnits({ revision, affectedKeys, heldKeys: [], deferredKeys: [] }, undefined, true) }
+                catch (error) { coordinator.markCommittedWorkingSetRefreshRequired(revision, error); throw error }
+            })
+        },
+        async commitPreparedUnitIntent(reason, prepare) {
+            dependencies.state.beforeCapture?.()
+            let affectedKeys: string[] = []
+            return coordinator.commitPreparedUnitIntent(reason, async (revision) => {
+                const lease = await dependencies.store.acquireRevision(revision)
+                let prepared: PreparedUnitIntent | null
+                try { prepared = await prepare(lease) }
+                finally { await releasePersistentRevisionLease(lease) }
+                if (!prepared) return null
+                const translated = translatePersistentRootUnitIntents(prepared.unitMutations)
+                affectedKeys = unitIntentAffectedKeys(translated, prepared.conversations)
+                return { unitMutations: translated, conversations: prepared.conversations }
+            }, async (revision) => {
                 try { await projectAppliedUnits({ revision, affectedKeys, heldKeys: [], deferredKeys: [] }, undefined, true) }
                 catch (error) { coordinator.markCommittedWorkingSetRefreshRequired(revision, error); throw error }
             })

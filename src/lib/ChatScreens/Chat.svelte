@@ -6,7 +6,8 @@
     import { aiLawApplies, changeChatTo, foldChatToMessage, getFileSrc, createChatCopyName } from "src/ts/globalApi.svelte"
     import { ColorSchemeTypeStore } from "src/ts/gui/colorscheme"
     import { longpress } from "src/ts/gui/longtouch"
-    import { openTextEditorPopup } from "src/ts/gui/textEditorPopup.svelte"
+    import { closeTextEditorPopup, openTextEditorPopup } from "src/ts/gui/textEditorPopup.svelte"
+    import { forgetEditorPopup, type ChatEditorDraft, type ChatEditorPopup, type ChatEditorPopupHandlers } from "src/ts/chatEditorDrafts"
     import { getModelInfo } from "src/ts/model/modellist"
     import { runLuaButtonTrigger } from 'src/ts/process/scriptings'
     import { risuChatParser } from "src/ts/process/scripts"
@@ -15,7 +16,7 @@
     import { DBState, ReloadChatPointer, CurrentTriggerIdStore, popupStore } from 'src/ts/stores.svelte'
     import { ConnectionOpenStore } from "src/ts/sync/multiuser"
     import { capitalize, getUserIcon, getUserName, sleep } from "src/ts/util"
-    import { onDestroy, onMount, tick } from "svelte"
+    import { onDestroy, onMount, tick, untrack } from "svelte"
     import { type Unsubscriber } from "svelte/store"
     import { v4 as uuidv4 } from 'uuid'
     import { language } from "../../lang"
@@ -30,6 +31,8 @@
     import { getStreamingThoughtPreview } from '../../ts/parser/streamingThoughtPreview'
     import { reportFailedBookmarkOperation } from '../Others/bookmarkOperation'
     import PopupButton from "../UI/PopupButton.svelte";
+    import PluginDefinedIcon from '../Others/PluginDefinedIcon.svelte'
+    import { createMessageButtonTarget, invokeMessageButton, messageButtonsForRole } from 'src/ts/plugins/messageButtons.svelte'
     import PartialEditController from './PartialEditController.svelte';
     import { getLLMCache, setLLMCache } from "../../ts/translator/translator"
     import { DeferredInlayMarkerRegistry, withResolvedDeferredInlaySources } from "src/ts/process/files/inlayRenderSource"
@@ -70,6 +73,10 @@
     let loadingTranslationEdit = $state(false)
     let editTranslationText = $state('')
     let editTranslationKey: string | null = null
+    // A restored translation editor saves only while its cache key still names the same text.
+    let restoredTranslation = false
+    let translationEvidence: Message | null = null
+    let editPopup: ChatEditorPopup | null = null
     let chatBodyRevision = $state(0)
     let bodyRoot:HTMLElement|null = $state(null)
     let editTarget: CapturedChatMessageTarget | null = null
@@ -118,6 +125,9 @@
         bookmarked?: boolean
         parserProjection?: BoundedLiveChatParserProjection
         parserAbortSignal?: AbortSignal
+        restoredEditor?: ChatEditorDraft
+        onEditorOpen?: () => void
+        onBodyRendered?: () => void
     }
 
     let {
@@ -156,6 +166,9 @@
         bookmarked,
         parserProjection,
         parserAbortSignal,
+        restoredEditor,
+        onEditorOpen,
+        onBodyRendered,
     }: Props = $props()
 
     let editDraft = $state(message)
@@ -300,10 +313,39 @@
         )
     }
 
-    export function takeEditorDraft(): string | null {
-        if (editMode) return editDraft
-        if (editTranslationMode) return editTranslationText
-        return partialEditController?.takeEditorDraft() ?? null
+    export function captureEditorDraft(): Omit<ChatEditorDraft, 'caret'> | null {
+        if (editMode) {
+            const evidence = editIntent?.messageEvidence ?? editEvidence
+            if (!evidence) return null
+            return { kind: 'original', draft: editDraft, index: idx, evidence, popup: editInPopup ? editPopup ?? undefined : undefined }
+        }
+        if (editTranslationMode && editTranslationKey !== null && translationEvidence) {
+            return { kind: 'translation', draft: editTranslationText, index: idx, evidence: translationEvidence, translationKey: editTranslationKey }
+        }
+        return null
+    }
+
+    export function restoreEditor(restored: ChatEditorDraft) {
+        if (restored.kind === 'translation') {
+            if (restored.translationKey === undefined) return
+            editTranslationKey = restored.translationKey
+            editTranslationText = restored.draft
+            translationEvidence = safeStructuredClone(restored.evidence) as Message
+            restoredTranslation = true
+            translated = true
+            editTranslationMode = true
+            return
+        }
+        editDraft = restored.draft
+        editMode = captureEditTarget()
+        if (!restored.popup) return
+        if (!editMode) {
+            closeTextEditorPopup(restored.popup.request)
+            return
+        }
+        editInPopup = true
+        editPopup = restored.popup
+        restored.popup.owner = popupHandlers()
     }
 
     function reportRowActionRefused(): false {
@@ -416,12 +458,17 @@
         return target ? { target, release() {} } : null
     }
 
-    function beginEdit() {
+    function captureEditTarget(): boolean {
         editIntent = captureViewportEditIntent()
         editTarget = editIntent ? null : captureCurrentMessage()
         editEvidence = editTarget ? safeStructuredClone(editTarget.message) : null
+        return editIntent !== null || editTarget !== null
+    }
+
+    function beginEdit() {
         editDraft = message
-        editMode = editIntent !== null || editTarget !== null
+        editMode = captureEditTarget()
+        if (editMode) onEditorOpen?.()
     }
 
     function beginPartialEdit() {
@@ -499,26 +546,45 @@
 
     function openEditPopup() {
         editInPopup = true
-        openTextEditorPopup({
-            value: editDraft,
+        const popup: ChatEditorPopup = {
+            request: {
+                value: editDraft,
+                save: (value) => popup.owner.save(value),
+                input: (value) => popup.owner.input(value),
+                cancel: () => popup.owner.cancel(),
+            },
+            owner: popupHandlers(),
+        }
+        editPopup = popup
+        openTextEditorPopup(popup.request)
+    }
+
+    function popupHandlers(): ChatEditorPopupHandlers {
+        return {
             save: async (value) => {
                 editDraft = value
                 if (!(await edit())) return false
                 editMode = false
-                editInPopup = false
+                closeEditPopup()
                 return true
             },
-            // Keeps takeEditorDraft current if the conversation is removed while the popup is open.
+            // Keeps the draft current for a row that is torn down while the popup is open.
             input: (value) => {
                 editDraft = value
             },
             cancel: () => {
                 editMode = false
-                editInPopup = false
                 editIntent = null
                 editTarget = null
+                closeEditPopup()
             },
-        })
+        }
+    }
+
+    function closeEditPopup() {
+        editInPopup = false
+        forgetEditorPopup(editPopup)
+        editPopup = null
     }
 
     async function toggleOriginalEdit() {
@@ -664,11 +730,15 @@
 
         loadingTranslationEdit = true
         try {
+            const evidence = viewportRow?.message ?? captureCurrentMessage()?.message
             const key = await getTranslationCacheKey()
             const cached = await getLLMCache(key)
             editTranslationKey = key
             editTranslationText = cached ?? ''
+            translationEvidence = evidence ? safeStructuredClone(evidence) as Message : null
+            restoredTranslation = false
             editTranslationMode = true
+            onEditorOpen?.()
         } catch (error) {
             editTranslationKey = null
             throw error
@@ -679,10 +749,16 @@
 
     async function saveTranslationEdit() {
         if (editTranslationKey === null) return
+        if (restoredTranslation && await getTranslationCacheKey() !== editTranslationKey) {
+            reportRowActionRefused()
+            return
+        }
 
         await updateTranslationCache(editTranslationKey, editTranslationText)
         editTranslationKey = null
         editTranslationMode = false
+        restoredTranslation = false
+        translationEvidence = null
     }
 
     function displaya(message:string){
@@ -706,6 +782,24 @@
 
 
     let blankMessage = $derived((message === '{{none}}' || message === '{{blank}}' || message === '') && idx === -1 || isComment)
+    let messageButtons = $derived.by(() => {
+        if (idx < 0 || blankMessage) return []
+        const character = DBState.db.characters[selIdState.selId]
+        if (character?.chats[character.chatPage]?.isStreaming && idx === totalLength - 1) return []
+        return messageButtonsForRole(presentedRole)
+    })
+
+    function messageButtonTarget() {
+        const character = DBState.db.characters[selIdState.selId]
+        const conversation = character?.chats[character.chatPage]
+        return createMessageButtonTarget({
+            characterIndex: selIdState.selId,
+            character,
+            conversationId: conversation?.id,
+            messageIndex: idx,
+            message: viewportRow?.message ?? conversation?.message?.[idx],
+        })
+    }
     let displayMessage = $derived(isOptimizedStreamingMessage ? rawStreamingText : message)
     let streamingThoughtMode = $derived(
         !captureContext && isOptimizedStreamingMessage
@@ -750,6 +844,21 @@
 
     onDestroy(()=>{
         unsubscribers.forEach(u => u())
+    })
+
+    const initialEditor = untrack(() => restoredEditor)
+    if (initialEditor) restoreEditor(initialEditor)
+
+    // The inline editor takes the message body's place, so closing it renders the body again.
+    let bodyReplacedByEditor = false
+    $effect(() => {
+        if (inlineEditMode) {
+            bodyReplacedByEditor = true
+            return
+        }
+        if (!bodyReplacedByEditor) return
+        bodyReplacedByEditor = false
+        untrack(() => onBodyRendered?.())
     })
 
     function RenderGUIHtml(html:string){
@@ -1069,6 +1178,7 @@
                 {@render translationButton()}
                 {#if window.innerWidth >= 640}
                     {@render majorIconButtonsBody(false)}
+                    {@render pluginMessageButtons(false)}
                     {#if DBState.db.characters[selIdState.selId]}
                         <PopupButton>
                             {@render minorIconButtonsBody(true)}
@@ -1078,10 +1188,12 @@
                     {#if DBState.db.characters[selIdState.selId]}
                         <PopupButton>
                             {@render majorIconButtonsBody(true)}
+                            {@render pluginMessageButtons(true)}
                             {@render minorIconButtonsBody(true)}
                         </PopupButton>
                     {:else}
                         {@render majorIconButtonsBody(false)}
+                        {@render pluginMessageButtons(false)}
                     {/if}
                 {/if}
                 {@render rerolls()}
@@ -1368,6 +1480,20 @@
         </button>
     {/if}
 {/if}
+{/snippet}
+
+{#snippet pluginMessageButtons(showNames:boolean)}
+    {#each messageButtons as button (button.id)}
+        <button class="flex items-center hover:text-blue-500 transition-colors button-icon-plugin" title={button.name} aria-label={button.name} onclick={() => {
+            const target = messageButtonTarget()
+            if (target) invokeMessageButton(button, target)
+        }}>
+            <PluginDefinedIcon ico={button} />
+            {#if showNames || button.iconType === 'none'}
+                <span class="ml-1">{button.name}</span>
+            {/if}
+        </button>
+    {/each}
 {/snippet}
 
 {#snippet translationButton(showNames = false)}
