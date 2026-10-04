@@ -28,7 +28,13 @@ it('preserves the exact approved Korean replacement and restore copy', () => {
         restoreDescriptionBound: '현재 데이터를 초기화한 후 선택한 백업으로 복원하며, 복원한 내용은 원격으로 동기화됩니다. 백업이 필요한 경우 수동으로 백업해주세요.',
         restoreDescription: '현재 데이터를 초기화한 후 선택한 백업으로 복원합니다. 백업이 필요한 경우 수동으로 백업해주세요.',
         restoreAcknowledge: '현재 데이터 초기화', restoreAction: '복원',
+        registrationRevoked: '서버에서 이 기기의 등록이 해제되어 동기화할 수 없습니다. 서버에서 이 기기를 새로 등록한 뒤 새 등록 코드를 입력하세요.',
+        bindingIncomplete: '연결이 완료되지 않았습니다. 연결하고 동기화를 눌러 연결을 마치세요.',
     })
+})
+it('preserves the exact approved English revoked-registration and unfinished-connection copy', () => {
+    expect(languageEnglish.lwwSync.registrationRevoked).toBe("This device's registration was removed on the server, so it cannot sync. Register this device again on the server, then enter the new registration code.")
+    expect(languageEnglish.lwwSync.bindingIncomplete).toBe('The connection was not completed. Press Connect and sync to finish it.')
 })
 it('preserves the exact approved English new-device action', () => {
     expect(languageEnglish.lwwSync.newDeviceAction).toBe('Connect as new device')

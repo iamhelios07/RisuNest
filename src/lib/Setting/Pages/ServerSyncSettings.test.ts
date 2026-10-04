@@ -78,6 +78,16 @@ it('explains an item too large to send instead of the generic sync error', async
     expect(alert?.textContent).toBe(languageEnglish.lwwSync.unitTooLarge)
     expect(alert?.textContent).not.toBe(languageEnglish.risuNest.serverSync.errorHelp)
 })
+it.each([
+    { error: 'unauthorized', text: languageEnglish.lwwSync.registrationRevoked },
+    { error: 'invalid-device-token', text: languageEnglish.lwwSync.registrationRevoked },
+    { error: 'device-credential-unavailable', text: languageEnglish.risuNest.serverSync.credentialUnavailable },
+])('explains "$error" instead of the generic sync error', async ({ error, text }) => {
+    f.view = { status: { configured: true, bound: true }, paused: true, error }
+    component = mount(ServerSyncSettings, { target: host, props: { connectTarget: vi.fn() } })
+    await settle()
+    expect(host.querySelector('[role="alert"]')?.textContent).toBe(text)
+})
 it('keeps settings on the existing production action by default', async () => {
     component = mount(ServerSyncSettings, { target: host })
     await registration(); click(languageEnglish.risuNest.serverSync.connect); await settle()

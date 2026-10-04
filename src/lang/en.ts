@@ -3088,6 +3088,8 @@ export const languageEnglish = {
         restoreDescription: "The current data will be cleared and replaced with the selected backup. Make a manual backup if needed.",
         restoreAcknowledge: "Clear the current data",
         restoreAction: "Restore",
+        registrationRevoked: "This device's registration was removed on the server, so it cannot sync. Register this device again on the server, then enter the new registration code.",
+        bindingIncomplete: "The connection was not completed. Press Connect and sync to finish it.",
     },
 } satisfies I18nTranslation;
 

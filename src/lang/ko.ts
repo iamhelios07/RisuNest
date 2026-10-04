@@ -2899,5 +2899,7 @@ export const languageKorean = {
         restoreDescription: "현재 데이터를 초기화한 후 선택한 백업으로 복원합니다. 백업이 필요한 경우 수동으로 백업해주세요.",
         restoreAcknowledge: "현재 데이터 초기화",
         restoreAction: "복원",
+        registrationRevoked: "서버에서 이 기기의 등록이 해제되어 동기화할 수 없습니다. 서버에서 이 기기를 새로 등록한 뒤 새 등록 코드를 입력하세요.",
+        bindingIncomplete: "연결이 완료되지 않았습니다. 연결하고 동기화를 눌러 연결을 마치세요.",
     },
 } satisfies DeepPartial<typeof import('./en').languageEnglish>

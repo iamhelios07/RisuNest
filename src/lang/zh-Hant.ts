@@ -1551,5 +1551,7 @@ export const languageChineseTraditional = {
         restoreDescription: "將清除目前資料並還原所選備份。如需備份，請手動備份。",
         restoreAcknowledge: "清除目前資料",
         restoreAction: "還原",
+        registrationRevoked: "此裝置在伺服器上的註冊已被移除，無法同步。請在伺服器上重新註冊此裝置，然後輸入新的註冊碼。",
+        bindingIncomplete: "連線未完成。請按 Connect and sync 完成連線。",
     },
 } satisfies DeepPartial<typeof import('./en').languageEnglish>

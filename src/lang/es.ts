@@ -1507,5 +1507,7 @@ export const languageSpanish = {
         restoreDescription: "Se borrarán los datos actuales y se restaurará la copia seleccionada. Si necesita una copia de seguridad, créela manualmente.",
         restoreAcknowledge: "Borrar los datos actuales",
         restoreAction: "Restaurar",
+        registrationRevoked: "El registro de este dispositivo se eliminó en el servidor, por lo que no puede sincronizar. Vuelva a registrar este dispositivo en el servidor y después introduzca el nuevo código de registro.",
+        bindingIncomplete: "La conexión no se completó. Pulse Connect and sync para terminarla.",
     },
 } satisfies DeepPartial<typeof import('./en').languageEnglish>;

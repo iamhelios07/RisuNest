@@ -1508,5 +1508,7 @@ export const languageGerman = {
         restoreDescription: "Die aktuellen Daten werden gelöscht und durch die gewählte Sicherung ersetzt. Erstellen Sie bei Bedarf manuell eine Sicherung.",
         restoreAcknowledge: "Aktuelle Daten löschen",
         restoreAction: "Wiederherstellen",
+        registrationRevoked: "Die Registrierung dieses Geräts wurde auf dem Server entfernt, daher kann es nicht synchronisieren. Registrieren Sie dieses Gerät erneut auf dem Server und geben Sie dann den neuen Registrierungscode ein.",
+        bindingIncomplete: "Die Verbindung wurde nicht abgeschlossen. Drücken Sie Connect and sync, um sie abzuschließen.",
     },
 } satisfies DeepPartial<typeof import('./en').languageEnglish>;
