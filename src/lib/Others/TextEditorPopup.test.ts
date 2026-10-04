@@ -4,11 +4,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { mount, tick, unmount } from 'svelte'
 import { get } from 'svelte/store'
 
-vi.mock('src/ts/platform', () => ({ isMobile: false }))
+const platform = vi.hoisted(() => ({ isMobile: true }))
+vi.mock('src/ts/platform', () => ({ get isMobile() { return platform.isMobile } }))
 vi.mock('src/ts/stores.svelte', async () => {
     const { writable } = await import('svelte/store')
     return { alertStore: writable({ type: 'none', msg: '' }) }
 })
+vi.mock('./TextEditorMonaco.svelte', async () => ({ default: (await import('./TextEditorMonacoStub.test.svelte')).default }))
+vi.mock('./TextEditorPreview.svelte', async () => ({ default: (await import('./TextEditorPreviewStub.test.svelte')).default }))
 
 import TextEditorPopup from './TextEditorPopup.svelte'
 import { modalNavigation } from 'src/ts/ui/modalNavigation'
@@ -26,6 +29,7 @@ afterEach(async () => {
     component = undefined
     textEditorPopup.request = null
     alertStore.set({ type: 'none', msg: '' })
+    platform.isMobile = true
     document.body.replaceChildren()
 })
 
@@ -47,11 +51,25 @@ async function open(overrides: Partial<TextEditorPopupRequest> = {}) {
         request,
         target,
         textarea,
-        close: buttons[0],
+        close: target.querySelector<HTMLButtonElement>('button[aria-label="Close"]')!,
         cancel: buttons.find((button) => button.textContent?.trim() === 'Cancel')!,
         save: buttons.find((button) => button.textContent?.trim() === 'Save')!,
+        button: (label: string) => [...target.querySelectorAll('button')].find((button) => button.textContent?.trim() === label),
     }
 }
+
+async function openOnDesktop(overrides: Partial<TextEditorPopupRequest> = {}) {
+    platform.isMobile = false
+    const opened = await open(overrides)
+    const editor = await vi.waitFor(() => {
+        const element = opened.target.querySelector<HTMLElement>('[data-monaco-stub]')
+        expect(element).not.toBeNull()
+        return element!
+    })
+    return { ...opened, editor, editorInput: editor.querySelector('textarea')! }
+}
+
+const escape = () => new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })
 
 function type(textarea: HTMLTextAreaElement, value: string) {
     textarea.value = value
@@ -59,12 +77,14 @@ function type(textarea: HTMLTextAreaElement, value: string) {
 }
 
 describe('text editor popup', () => {
-    it('shows the text in a titled dialog and focuses it for typing', async () => {
-        const { target, textarea } = await open({ title: 'Description' })
+    it('shows the text in a titled plain editor on touch devices without opening the keyboard', async () => {
+        const { target, textarea, close } = await open({ title: 'Description' })
         expect(target.querySelector('[role="dialog"]')?.getAttribute('aria-modal')).toBe('true')
         expect(target.querySelector('h2')?.textContent).toBe('Description')
         expect(textarea.value).toBe('Original text')
-        await vi.waitFor(() => expect(document.activeElement).toBe(textarea))
+        await vi.waitFor(() => expect(document.activeElement).toBe(close))
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        expect(target.querySelector('[data-monaco-stub]')).toBeNull()
     })
 
     it('saves the edited text and closes', async () => {
@@ -172,5 +192,111 @@ describe('text editor popup', () => {
         expect(first.cancel).toHaveBeenCalledOnce()
         expect(second.cancel).not.toHaveBeenCalled()
         expect(textEditorPopup.request).toBe(second)
+    })
+})
+
+describe('text editor popup on desktop', () => {
+    it('edits in the code editor with the requested language and reports the draft', async () => {
+        const input = vi.fn()
+        const { target, editor, editorInput, save, request } = await openOnDesktop({ language: 'lua', input })
+        expect(editor.dataset.language).toBe('lua')
+        expect(target.querySelectorAll('textarea')).toHaveLength(1)
+        expect(editorInput.value).toBe('Original text')
+        type(editorInput, 'Edited in code')
+        expect(input).toHaveBeenLastCalledWith('Edited in code')
+        save.click()
+        await vi.waitFor(() => expect(request.save).toHaveBeenCalledWith('Edited in code'))
+    })
+
+    it('treats the text as markdown when no language is given', async () => {
+        const { editor } = await openOnDesktop()
+        expect(editor.dataset.language).toBe('markdown')
+    })
+
+    it('saves once on Ctrl+Enter in the code editor and keeps it from the app hotkeys', async () => {
+        const hotkeys = vi.fn()
+        document.addEventListener('keydown', hotkeys)
+        try {
+            const { request, editorInput } = await openOnDesktop()
+            type(editorInput, 'Shortcut text')
+            editorInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true, bubbles: true, cancelable: true }))
+            await vi.waitFor(() => expect(request.save).toHaveBeenCalledWith('Shortcut text'))
+            await tick()
+            expect(request.save).toHaveBeenCalledOnce()
+            expect(hotkeys).not.toHaveBeenCalled()
+        } finally {
+            document.removeEventListener('keydown', hotkeys)
+        }
+    })
+
+    it('lets the code editor close its own widget on Escape before closing the popup', async () => {
+        const host = document.createElement('div')
+        document.body.append(host)
+        const closeHost = vi.fn()
+        const hostNavigation = modalNavigation(host, { close: closeHost })
+        try {
+            const { request, editor, editorInput } = await openOnDesktop()
+            editor.dataset.widget = 'open'
+            const first = escape()
+            editorInput.dispatchEvent(first)
+            expect(first.defaultPrevented).toBe(true)
+            expect(editor.dataset.widget).toBe('closed')
+            expect(textEditorPopup.request).toBe(request)
+
+            const second = escape()
+            editorInput.dispatchEvent(second)
+            expect(second.defaultPrevented).toBe(true)
+            expect(request.cancel).toHaveBeenCalledOnce()
+            expect(textEditorPopup.request).toBeNull()
+            expect(closeHost).not.toHaveBeenCalled()
+        } finally {
+            hostNavigation.destroy()
+        }
+    })
+
+    it('closes an alert shown over it before the code editor sees Escape', async () => {
+        const { request, editor, editorInput } = await openOnDesktop()
+        editor.dataset.widget = 'open'
+        alertStore.set({ type: 'normal', msg: 'Synthetic notice' })
+        editorInput.dispatchEvent(escape())
+        expect(get(alertStore).type).toBe('none')
+        expect(editor.dataset.widget).toBe('open')
+        expect(request.cancel).not.toHaveBeenCalled()
+        expect(textEditorPopup.request).toBe(request)
+    })
+})
+
+describe('text editor popup preview', () => {
+    it('offers the preview only when the request asks for it', async () => {
+        const { button } = await openOnDesktop()
+        expect(button('Preview')).toBeUndefined()
+    })
+
+    it('previews the draft and returns to the editor', async () => {
+        const { target, editor, editorInput, button } = await openOnDesktop({ preview: true })
+        type(editorInput, 'Previewed draft')
+        button('Preview')!.click()
+        const preview = await vi.waitFor(() => {
+            const element = target.querySelector<HTMLElement>('[data-preview-stub]')
+            expect(element).not.toBeNull()
+            return element!
+        })
+        expect(preview.textContent).toBe('Previewed draft')
+        expect(editor.closest('.invisible')).not.toBeNull()
+
+        button('Edit')!.click()
+        await vi.waitFor(() => expect(target.querySelector('[data-preview-stub]')).toBeNull())
+        expect(editor.closest('.invisible')).toBeNull()
+        await vi.waitFor(() => expect(document.activeElement).toBe(editorInput))
+    })
+
+    it('closes from Escape while previewing', async () => {
+        const { request, target, button } = await openOnDesktop({ preview: true })
+        const toggle = button('Preview')!
+        toggle.click()
+        await vi.waitFor(() => expect(target.querySelector('[data-preview-stub]')).not.toBeNull())
+        toggle.dispatchEvent(escape())
+        expect(request.cancel).toHaveBeenCalledOnce()
+        expect(textEditorPopup.request).toBeNull()
     })
 })

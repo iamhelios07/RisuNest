@@ -1,6 +1,12 @@
+import { getContext, setContext } from 'svelte'
+
 export interface TextEditorPopupRequest {
     value: string
     title?: string
+    /** Monaco language of the text on desktop. Defaults to markdown. */
+    language?: string
+    /** Offers the CBS preview with its token count and toggles. */
+    preview?: boolean
     /** Applies the edited text. Resolving `false` keeps the editor open with the draft. */
     save: (value: string) => boolean | Promise<boolean>
     /** Receives the draft whenever the reader changes it. */
@@ -31,4 +37,15 @@ export function cancelTextEditorPopup(request: TextEditorPopupRequest): void {
     if (textEditorPopup.request !== request) return
     textEditorPopup.request = null
     request.cancel?.()
+}
+
+const insideKey = Symbol('textEditorPopup')
+
+/** Marks the components below as content of the editor, which cannot open a second editor over itself. */
+export function markTextEditorPopupContent(): void {
+    setContext(insideKey, true)
+}
+
+export function isInsideTextEditorPopup(): boolean {
+    return getContext<boolean | undefined>(insideKey) === true
 }

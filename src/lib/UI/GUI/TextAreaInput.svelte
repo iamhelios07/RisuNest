@@ -69,44 +69,22 @@
                 }
                 onchange(e)
             }}
-            onkeydown={async (e) => {
+            onkeydown={(e) => {
                 if (isCompositionKey(e)) return;
                 if(
-                    (shortcutModifier(e) || e.shiftKey || e.altKey)
+                    !insidePopupEditor
+                    && (shortcutModifier(e) || e.shiftKey || e.altKey)
                     && hotkeyMatches(DBState.db.hotkeys.find(hk => hk.action === 'popupEditor'), e)
                 ){
                     e.preventDefault()
-                    popUpEditorStore.value = value
-                    popUpEditorStore.mode = 'default'
-                    popUpEditorStore.language = popupLanguage
-                    popUpEditorStore.open = true
-
-                    //lazy wait
-                    while(popUpEditorStore.open){
-                        await sleep(100)
-                    }
-
-                    value = popUpEditorStore.value
-                    onInput()
+                    openTextEditor()
                 }
             }}
 
             oncontextmenu={(e) => {
-                if(DBState.db.longPressToPopupEditor){
+                if(!insidePopupEditor && DBState.db.longPressToPopupEditor){
                     e.preventDefault()
-                    popUpEditorStore.value = value
-                    popUpEditorStore.mode = 'default'
-                    popUpEditorStore.language = popupLanguage
-                    popUpEditorStore.open = true
-
-                    //lazy wait
-                    const checkInterval = setInterval(() => {
-                        if(!popUpEditorStore.open){
-                            value = popUpEditorStore.value
-                            onInput()
-                            clearInterval(checkInterval)
-                        }
-                    }, 100)
+                    openTextEditor()
                 }
             }}
 ></textarea>
@@ -132,6 +110,7 @@
     >{value ?? ''}</div>
 {/if}
     </div>
+    {#if !insidePopupEditor}
     <div class="flex shrink-0 justify-end border-t border-darkborderc px-1 py-0.5 text-textcolor2">
         <button
             type="button"
@@ -143,6 +122,7 @@
             <Maximize2Icon size={14} />
         </button>
     </div>
+    {/if}
     <div class="hidden absolute z-100 bg-bgcolor border border-darkborderc p-2 flex-col" bind:this={autoCompleteDom}>
         {#each autocompleteContents as content, i}
             <button class="w-full text-left py-1 px-2 bg-bgcolor" class:text-blue-500={selectingAutoComplete === i} onclick={() => {
@@ -156,14 +136,14 @@
     import { highlighter, getNewHighlightId, removeHighlight, AllCBS } from 'src/ts/gui/highlight'
     import { sleep } from 'src/ts/util';
     import { onDestroy, onMount, tick } from 'svelte';
-  import { DBState, disableHighlight, popUpEditorStore } from 'src/ts/stores.svelte';
+  import { DBState, disableHighlight } from 'src/ts/stores.svelte';
   import { isMobile } from 'src/ts/platform'
     import { hotkeyMatches } from 'src/ts/hotkey';
     import { isCompositionKey, shortcutModifier } from 'src/ts/hotkeyModifier';
     // A leaf input imported almost everywhere; the per-icon path avoids loading the whole icon set.
     import Maximize2Icon from '@lucide/svelte/icons/maximize-2'
     import { language } from 'src/lang'
-    import { cancelTextEditorPopup, openTextEditorPopup, type TextEditorPopupRequest } from 'src/ts/gui/textEditorPopup.svelte'
+    import { cancelTextEditorPopup, isInsideTextEditorPopup, openTextEditorPopup, type TextEditorPopupRequest } from 'src/ts/gui/textEditorPopup.svelte'
     interface Props {
         size?: 'xs'|'sm'|'md'|'lg'|'xl'|'default';
         autocomplete?: 'on'|'off';
@@ -211,6 +191,8 @@
     let inputDom: HTMLDivElement = $state()
     let textareaDom: HTMLTextAreaElement = $state()
     let editorRequest: TextEditorPopupRequest | null = null
+    // Opening an editor from a field inside the editor would replace it and drop its draft.
+    const insidePopupEditor = isInsideTextEditorPopup()
 
     const autoComplete = () => {
         if(isMobile){
@@ -305,6 +287,8 @@
     function openTextEditor() {
         const request: TextEditorPopupRequest = {
             value: value ?? '',
+            language: popupLanguage,
+            preview: popupLanguage === 'markdown',
             save: async (next) => {
                 editorRequest = null
                 value = next

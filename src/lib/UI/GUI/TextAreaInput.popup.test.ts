@@ -13,17 +13,19 @@ vi.mock('src/ts/gui/highlight', () => ({
 vi.mock('src/ts/stores.svelte', async () => {
     const { writable } = await import('svelte/store')
     return {
-        DBState: { db: { hotkeys: [] } },
+        DBState: { db: { hotkeys: [], longPressToPopupEditor: false } },
         disableHighlight: writable(false),
-        popUpEditorStore: { open: false, value: '', mode: '', language: '' },
     }
 })
 vi.mock('src/ts/platform', () => ({ isMobile: false }))
-vi.mock('src/ts/hotkey', () => ({ hotkeyMatches: () => false }))
+const hotkey = vi.hoisted(() => ({ matches: false }))
+vi.mock('src/ts/hotkey', () => ({ hotkeyMatches: () => hotkey.matches }))
 vi.mock('src/ts/util', () => ({ sleep: async () => {} }))
 
 import TextAreaInput from './TextAreaInput.svelte'
+import TextAreaInputInsidePopupHarness from './TextAreaInputInsidePopupHarness.test.svelte'
 import { textEditorPopup } from 'src/ts/gui/textEditorPopup.svelte'
+import { DBState } from 'src/ts/stores.svelte'
 
 let component: ReturnType<typeof mount> | undefined
 
@@ -31,6 +33,8 @@ afterEach(async () => {
     if (component) await unmount(component)
     component = undefined
     textEditorPopup.request = null
+    hotkey.matches = false
+    DBState.db.longPressToPopupEditor = false
     document.body.replaceChildren()
 })
 
@@ -48,7 +52,50 @@ describe('text area popup editor button', () => {
         const { expand } = await input({})
         expect(expand).not.toBeNull()
         expand.click()
+        expect(textEditorPopup.request).toMatchObject({ value: 'Field text', language: 'markdown', preview: true })
+    })
+
+    it('opens the popup editor in the field language from the popup editor hotkey', async () => {
+        const { target } = await input({ popupLanguage: 'lua' })
+        hotkey.matches = true
+        const event = new KeyboardEvent('keydown', { key: 'x', ctrlKey: true, bubbles: true, cancelable: true })
+        target.querySelector('textarea')!.dispatchEvent(event)
+        expect(event.defaultPrevented).toBe(true)
+        expect(textEditorPopup.request).toMatchObject({ value: 'Field text', language: 'lua', preview: false })
+    })
+
+    it('opens the popup editor on long press only when that option is on', async () => {
+        const { target } = await input({})
+        const field = target.querySelector('textarea')!
+        const ignored = new MouseEvent('contextmenu', { bubbles: true, cancelable: true })
+        field.dispatchEvent(ignored)
+        expect(ignored.defaultPrevented).toBe(false)
+        expect(textEditorPopup.request).toBeNull()
+
+        DBState.db.longPressToPopupEditor = true
+        const pressed = new MouseEvent('contextmenu', { bubbles: true, cancelable: true })
+        field.dispatchEvent(pressed)
+        expect(pressed.defaultPrevented).toBe(true)
         expect(textEditorPopup.request?.value).toBe('Field text')
+    })
+
+    it('does not open another popup editor from a field inside the popup editor', async () => {
+        const target = document.createElement('div')
+        document.body.append(target)
+        component = mount(TextAreaInputInsidePopupHarness, { target })
+        await tick()
+        expect(target.querySelector('button[aria-label="Edit in popup"]')).toBeNull()
+
+        hotkey.matches = true
+        DBState.db.longPressToPopupEditor = true
+        const field = target.querySelector('textarea')!
+        const key = new KeyboardEvent('keydown', { key: 'x', ctrlKey: true, bubbles: true, cancelable: true })
+        const press = new MouseEvent('contextmenu', { bubbles: true, cancelable: true })
+        field.dispatchEvent(key)
+        field.dispatchEvent(press)
+        expect(key.defaultPrevented).toBe(false)
+        expect(press.defaultPrevented).toBe(false)
+        expect(textEditorPopup.request).toBeNull()
     })
 
     it.each([false, true])('writes the saved text back and reports it to change listeners (highlight %s)', async (highlight) => {
