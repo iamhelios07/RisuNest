@@ -406,6 +406,119 @@ function __postToParent(message) {
         expect(document.querySelectorAll('iframe[data-risu-plugin-frame]')).toHaveLength(0)
     })
 
+    describe('plugin channel IPC', () => {
+        const ipcScript = (channel: string) => `
+            globalThis.received = [];
+            globalThis.rpcReady = risuai.addPluginChannelListener(${JSON.stringify(channel)}, (message, meta) => {
+                globalThis.received.push({ message, sender: meta.sender, channel: meta.channel });
+            });
+        `
+
+        async function startIpcPlugins(plugins: { name: string; allowedIPC: string[]; channel?: string }[]): Promise<void> {
+            const records = plugins.map((plugin) => ({
+                name: plugin.name,
+                script: ipcScript(plugin.channel ?? 'inbox'),
+                allowedIPC: plugin.allowedIPC,
+            }))
+            mocks.database = { aiModel: 'fixture-model', characters: [], plugins: records }
+            await loadV3Plugins(records as any)
+            await Promise.all(guestEvaluations)
+            for (const plugin of plugins) await guest(plugin.name, 'await globalThis.rpcReady; return true')
+        }
+
+        async function post(sender: string, receiver: string, channel: string, message: unknown): Promise<unknown> {
+            return guest(sender, `
+                const result = await risuai.postPluginChannelMessage(${JSON.stringify(receiver)}, ${JSON.stringify(channel)}, ${JSON.stringify(message)});
+                return result === undefined ? 'resolved' : 'unexpected';
+            `)
+        }
+
+        async function received(name: string) {
+            return JSON.parse(String(await guest(name, 'return JSON.stringify(globalThis.received)'))) as {
+                message: unknown
+                sender: string
+                channel: string
+            }[]
+        }
+
+        async function settle(): Promise<void> {
+            for (let attempt = 0; attempt < 20; attempt += 1) {
+                await new Promise<void>((resolve) => setTimeout(resolve, 0))
+            }
+        }
+
+        it('delivers both ways between a wildcard plugin and a client that names it, with the host-attested sender', async () => {
+            vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+            await startIpcPlugins([
+                { name: 'hub', allowedIPC: ['hub', '*'] },
+                { name: 'client', allowedIPC: ['client', 'hub'] },
+            ])
+
+            expect(await post('client', 'hub', 'inbox', { register: true })).toBe('resolved')
+            expect(await post('hub', 'client', 'inbox', { reply: true })).toBe('resolved')
+
+            expect(await waitFor(() => received('hub'), (value) => value.length === 1)).toEqual([
+                { message: { register: true }, sender: 'client', channel: 'inbox' },
+            ])
+            expect(await waitFor(() => received('client'), (value) => value.length === 1)).toEqual([
+                { message: { reply: true }, sender: 'hub', channel: 'inbox' },
+            ])
+        })
+
+        it('keeps the two-sided rule when only one side lists the other or a wildcard', async () => {
+            const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+            await startIpcPlugins([
+                { name: 'hub', allowedIPC: ['hub', '*'] },
+                { name: 'stranger', allowedIPC: ['stranger'] },
+                { name: 'one-sided', allowedIPC: ['one-sided', 'plain'] },
+                { name: 'plain', allowedIPC: ['plain'] },
+            ])
+
+            expect(await post('stranger', 'hub', 'inbox', 1)).toBe('resolved')
+            expect(await post('hub', 'stranger', 'inbox', 2)).toBe('resolved')
+            expect(await post('one-sided', 'plain', 'inbox', 3)).toBe('resolved')
+            expect(await post('plain', 'one-sided', 'inbox', 4)).toBe('resolved')
+            expect(await post('hub', 'missing-plugin', 'inbox', 5)).toBe('resolved')
+            await settle()
+
+            for (const name of ['hub', 'stranger', 'one-sided', 'plain']) {
+                expect(await received(name)).toEqual([])
+            }
+            expect(warn.mock.calls.filter(([text]) => String(text).includes('Attempted to send message'))).toHaveLength(5)
+        })
+
+        it('delivers between plugins that name each other without a wildcard', async () => {
+            await startIpcPlugins([
+                { name: 'left', allowedIPC: ['left', 'right'] },
+                { name: 'right', allowedIPC: ['right', 'left'] },
+            ])
+
+            expect(await post('left', 'right', 'inbox', 'hello')).toBe('resolved')
+
+            expect(await waitFor(() => received('right'), (value) => value.length === 1)).toEqual([
+                { message: 'hello', sender: 'left', channel: 'inbox' },
+            ])
+        })
+
+        it('keeps listeners apart when plugin and channel names concatenate to the same string', async () => {
+            await startIpcPlugins([
+                { name: 'sender', allowedIPC: ['*'] },
+                { name: 'a', allowedIPC: ['*'], channel: 'bc' },
+                { name: 'ab', allowedIPC: ['*'], channel: 'c' },
+            ])
+
+            expect(await post('sender', 'a', 'bc', 'for a')).toBe('resolved')
+            expect(await post('sender', 'ab', 'c', 'for ab')).toBe('resolved')
+
+            expect(await waitFor(() => received('a'), (value) => value.length === 1)).toEqual([
+                { message: 'for a', sender: 'sender', channel: 'bc' },
+            ])
+            expect(await waitFor(() => received('ab'), (value) => value.length === 1)).toEqual([
+                { message: 'for ab', sender: 'sender', channel: 'c' },
+            ])
+        })
+    })
+
     it('does not log RPC request or response payloads when DEV is false', async () => {
         vi.stubEnv('DEV', false)
         installFixtureDatabase()

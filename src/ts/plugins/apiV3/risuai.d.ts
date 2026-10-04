@@ -2207,6 +2207,8 @@ interface RisuaiPluginAPI {
 
     /**
      * Sends a message to another plugin's named channel (IPC between plugins).
+     * Delivery requires each plugin's `//@allowed-ipc` list to name the other plugin or contain `*`
+     * (RisuNest addition: `*` matches every plugin name).
      * @param pluginName - The internal name of the target plugin
      * @param channelName - The channel name to post to
      * @param message - The message payload to send

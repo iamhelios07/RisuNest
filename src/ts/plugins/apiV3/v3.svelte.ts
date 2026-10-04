@@ -88,7 +88,12 @@ import {
         - Note that Class or Callbacks inside arrays or objects are not supported
 */
 
-const pluginChannel = new Map<string, Function>();
+// Listeners by receiver plugin name, then channel name.
+const pluginChannel = new Map<string, Map<string, Function>>();
+
+function allowsIPC(allowedIPC: readonly string[] | undefined, pluginName: string): boolean {
+    return !!allowedIPC && (allowedIPC.includes(pluginName) || allowedIPC.includes('*'));
+}
 const documentEventListeners: Array<{
     target: EventTarget
     type: string
@@ -1635,9 +1640,16 @@ const makeRisuaiAPIV3 = (
             return true;
         },
         addPluginChannelListener: (channelName: string, callback: Function) => {
-            pluginChannel.set(plugin.name + channelName, callback);
+            let channels = pluginChannel.get(plugin.name);
+            if(!channels){
+                channels = new Map();
+                pluginChannel.set(plugin.name, channels);
+            }
+            channels.set(channelName, callback);
             addPluginUnloadCallback(plugin.name, () => {
-                pluginChannel.delete(plugin.name + channelName);
+                const current = pluginChannel.get(plugin.name);
+                current?.delete(channelName);
+                if(current?.size === 0) pluginChannel.delete(plugin.name);
             })
         },
         postPluginChannelMessage: (pluginName: string, channelName: string, message: any) => {
@@ -1650,18 +1662,18 @@ const makeRisuaiAPIV3 = (
                 return;
             }
 
-            if(!receiverPlugin.allowedIPC?.includes(currentPluginName)){
+            if(!allowsIPC(receiverPlugin.allowedIPC, currentPluginName)){
                 console.warn(`[RisuAI Plugin: ${currentPluginName}] Attempted to send message to plugin '${pluginName}' but receiver plugin does not allow IPC communication from this plugin. declare //@allowed-ipc ${currentPluginName} in the reciver plugin script to allow IPC communication.`);
                 return;
             }
 
-            if(!plugin.allowedIPC?.includes(receiverPlugin.name)){
+            if(!allowsIPC(plugin.allowedIPC, receiverPlugin.name)){
                 console.warn(`[RisuAI Plugin: ${currentPluginName}] Attempted to send message to plugin '${pluginName}' but the sender plugin does not allow IPC communication to this plugin. declare //@allowed-ipc ${receiverPlugin.name} in the sender plugin script to allow IPC communication.`);
                 return;
             }
 
 
-            const callback = pluginChannel.get(pluginName + channelName);
+            const callback = pluginChannel.get(pluginName)?.get(channelName);
             if(callback){
                 callback(message, {
                     sender: currentPluginName,
