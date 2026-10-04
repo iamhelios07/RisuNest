@@ -30,6 +30,8 @@
     import { getStreamingThoughtPreview } from '../../ts/parser/streamingThoughtPreview'
     import { reportFailedBookmarkOperation } from '../Others/bookmarkOperation'
     import PopupButton from "../UI/PopupButton.svelte";
+    import PluginDefinedIcon from '../Others/PluginDefinedIcon.svelte'
+    import { createMessageButtonTarget, invokeMessageButton, messageButtonsForRole } from 'src/ts/plugins/messageButtons.svelte'
     import PartialEditController from './PartialEditController.svelte';
     import { getLLMCache, setLLMCache } from "../../ts/translator/translator"
     import { DeferredInlayMarkerRegistry, withResolvedDeferredInlaySources } from "src/ts/process/files/inlayRenderSource"
@@ -706,6 +708,24 @@
 
 
     let blankMessage = $derived((message === '{{none}}' || message === '{{blank}}' || message === '') && idx === -1 || isComment)
+    let messageButtons = $derived.by(() => {
+        if (idx < 0 || blankMessage) return []
+        const character = DBState.db.characters[selIdState.selId]
+        if (character?.chats[character.chatPage]?.isStreaming && idx === totalLength - 1) return []
+        return messageButtonsForRole(presentedRole)
+    })
+
+    function messageButtonTarget() {
+        const character = DBState.db.characters[selIdState.selId]
+        const conversation = character?.chats[character.chatPage]
+        return createMessageButtonTarget({
+            characterIndex: selIdState.selId,
+            character,
+            conversationId: conversation?.id,
+            messageIndex: idx,
+            message: viewportRow?.message ?? conversation?.message?.[idx],
+        })
+    }
     let displayMessage = $derived(isOptimizedStreamingMessage ? rawStreamingText : message)
     let streamingThoughtMode = $derived(
         !captureContext && isOptimizedStreamingMessage
@@ -1069,6 +1089,7 @@
                 {@render translationButton()}
                 {#if window.innerWidth >= 640}
                     {@render majorIconButtonsBody(false)}
+                    {@render pluginMessageButtons(false)}
                     {#if DBState.db.characters[selIdState.selId]}
                         <PopupButton>
                             {@render minorIconButtonsBody(true)}
@@ -1078,10 +1099,12 @@
                     {#if DBState.db.characters[selIdState.selId]}
                         <PopupButton>
                             {@render majorIconButtonsBody(true)}
+                            {@render pluginMessageButtons(true)}
                             {@render minorIconButtonsBody(true)}
                         </PopupButton>
                     {:else}
                         {@render majorIconButtonsBody(false)}
+                        {@render pluginMessageButtons(false)}
                     {/if}
                 {/if}
                 {@render rerolls()}
@@ -1368,6 +1391,20 @@
         </button>
     {/if}
 {/if}
+{/snippet}
+
+{#snippet pluginMessageButtons(showNames:boolean)}
+    {#each messageButtons as button (button.id)}
+        <button class="flex items-center hover:text-blue-500 transition-colors button-icon-plugin" title={button.name} aria-label={button.name} onclick={() => {
+            const target = messageButtonTarget()
+            if (target) invokeMessageButton(button, target)
+        }}>
+            <PluginDefinedIcon ico={button} />
+            {#if showNames || button.iconType === 'none'}
+                <span class="ml-1">{button.name}</span>
+            {/if}
+        </button>
+    {/each}
 {/snippet}
 
 {#snippet translationButton(showNames = false)}

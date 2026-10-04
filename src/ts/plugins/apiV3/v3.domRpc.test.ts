@@ -10,6 +10,7 @@ import {
     getV3PluginInstance,
     loadV3Plugins,
 } from './v3.svelte'
+import { additionalMessageButtons } from '../messageButtons.svelte'
 
 const mocks = vi.hoisted(() => ({
     database: null as any,
@@ -581,6 +582,44 @@ function __postToParent(message) {
         expect(request).toMatchObject({ characterId: 'char', conversationId: 'conv', mutationId: 'guest-patch' })
         expect(Object.hasOwn(request.messages[0].set, '__gone')).toBe(true)
         expect(Object.hasOwn(request.messages[0].expected, '__old')).toBe(true)
+    })
+
+    it('registers message buttons with roles and hands the clicked message to the guest', async () => {
+        const name = 'message-buttons'
+        await startFixture(name, `
+            globalThis.targets = [];
+            globalThis.rpcReady = (async () => {
+                await risuai.registerButton({ name: 'Translate', icon: '<b>T</b>', iconType: 'html', location: 'message', id: 'translate', roles: ['char', 'char'] },
+                    (target) => { globalThis.targets.push(target); });
+                await risuai.registerButton({ name: 'Both', icon: '', iconType: 'none', location: 'message', id: 'both' }, () => {});
+            })();
+        `)
+        const buttons = () => additionalMessageButtons.map(({ id, name, roles }) => ({ id, name, roles }))
+        expect(buttons()).toEqual([{ id: 'translate', name: 'Translate', roles: ['char'] }, { id: 'both', name: 'Both', roles: undefined }])
+
+        const target = { characterIndex: 1, chatIndex: 0, messageIndex: 4123, messageId: 'm-4123', role: 'char', characterId: 'char', conversationId: 'conv' }
+        await additionalMessageButtons[0].callback(target)
+        expect(JSON.parse(String(await guest(name, 'return JSON.stringify(globalThis.targets)')))).toEqual([target])
+
+        await guest(name, `await risuai.registerButton({ name: 'Translated', icon: '', iconType: 'none', id: 'translate', roles: ['user'] }, () => {}); return true`)
+        expect(buttons()).toEqual([{ id: 'translate', name: 'Translated', roles: ['user'] }, { id: 'both', name: 'Both', roles: undefined }])
+
+        const errors = JSON.parse(String(await guest(name, `
+            const errors = [];
+            for (const roles of [[], ['system'], 'char']) {
+                try { await risuai.registerButton({ name: 'Bad', icon: '', iconType: 'none', location: 'message', roles }, () => {}); }
+                catch (error) { errors.push(error.message); }
+            }
+            return JSON.stringify(errors);
+        `))) as string[]
+        expect(errors).toHaveLength(3)
+        for (const error of errors) expect(error).toContain('options.roles')
+        expect(additionalMessageButtons).toHaveLength(2)
+
+        await guest(name, `await risuai.unregisterUIPart('both'); return true`)
+        expect(buttons().map(({ id }) => id)).toEqual(['translate'])
+        await loadV3Plugins([])
+        expect(additionalMessageButtons).toHaveLength(0)
     })
 
     it('does not log RPC request or response payloads when DEV is false', async () => {

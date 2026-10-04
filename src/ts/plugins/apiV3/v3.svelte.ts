@@ -70,6 +70,7 @@ import {
 } from "../pluginDatabaseAccess";
 import { createRisunestPrivateApi } from './risunestPrivateApi';
 import { conversationPatchAccess } from '../conversationPatchHost';
+import { additionalMessageButtons, normalizeMessageButtonRoles, type MessageButtonDef, type MessageButtonTarget } from '../messageButtons.svelte';
 
 /*
     V3 API for RisuAI Plugins
@@ -1236,10 +1237,11 @@ const makeRisuaiAPIV3 = (
                 name: string,
                 icon: string,
                 iconType: 'html'|'img'|'none',
-                location?: 'action'|'chat'|'hamburger',
-                id?: string
+                location?: 'action'|'chat'|'hamburger'|'message',
+                id?: string,
+                roles?: ('user'|'char')[]
             },
-            callback: () => void
+            callback: (target?: MessageButtonTarget) => void
         ) => {
             if (!arg || typeof arg !== 'object' || Array.isArray(arg)) {
                 throw new Error('registerButton: first argument must be an options object');
@@ -1256,15 +1258,16 @@ const makeRisuaiAPIV3 = (
                 throw new Error("icon must be a string");
             }
             const id = providedId || v4()
-            const menuDef:MenuDef = {
+            const menuDef:MessageButtonDef = {
                 name,
                 icon,
                 iconType,
                 callback,
-                id
+                id,
+                roles: normalizeMessageButtonRoles(arg.roles)
             }
 
-            const buttonStores = [additionalFloatingActionButtons, additionalHamburgerMenu, additionalChatMenu]
+            const buttonStores = [additionalFloatingActionButtons, additionalHamburgerMenu, additionalChatMenu, additionalMessageButtons]
             for(const store of buttonStores){
                 const existingIndex = store.findIndex(item => item.id === id)
                 if(existingIndex !== -1){
@@ -1299,6 +1302,14 @@ const makeRisuaiAPIV3 = (
                     addPluginUnloadCallback(
                         plugin.name,
                         makeMenuUnloadCallback(menuDef.id, additionalChatMenu)
+                    )
+                    break
+                }
+                case 'message':{
+                    additionalMessageButtons.push(menuDef)
+                    addPluginUnloadCallback(
+                        plugin.name,
+                        makeMenuUnloadCallback(menuDef.id, additionalMessageButtons)
                     )
                     break
                 }
@@ -1359,6 +1370,7 @@ const makeRisuaiAPIV3 = (
             removeFromMenuStore(additionalFloatingActionButtons);
             removeFromMenuStore(additionalHamburgerMenu);
             removeFromMenuStore(additionalChatMenu);
+            removeFromMenuStore(additionalMessageButtons);
             removeChatPanel(id);
         },
         log: (message:string) => {
