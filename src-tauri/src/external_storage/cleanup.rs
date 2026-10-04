@@ -1218,6 +1218,16 @@ mod tests {
             assert!(f.receiver.maintenance_needed_cached(&summaries,&cancel).await.unwrap().is_none());
             assert_eq!(reads(&f),(read,listed+4),"an idle maintenance check reads objects or lists more than twice");
 
+            let own=tokio::sync::Mutex::new(super::super::lww_compaction::CheckpointSummaries::default());
+            for request in f.sender.receive_requests_cached(&mut f.a,DecimalU64(0),&own,&cancel).await.unwrap() {
+                f.a.lww_stage_receive(&request).unwrap();
+                f.a.lww_apply_receive(&ApplyReceive{header:request.header.clone(),generating:vec![]}).unwrap();
+                f.a.lww_finish_receive(&request.header).unwrap();
+            }
+            let (read,listed)=reads(&f);
+            assert!(f.sender.receive_requests_cached(&mut f.a,DecimalU64(0),&own,&cancel).await.unwrap().is_empty());
+            assert_eq!(reads(&f),(read,listed+2),"an idle receive on the publishing device reads objects or lists more than twice");
+
             let second=f.sender.compact_published(&directory.path().join("second"),"00000000-0000-4000-8000-000000000092",&writer,
                 &f.sender.capabilities,&cancel,None).await.unwrap();
             let (read,_)=reads(&f);
