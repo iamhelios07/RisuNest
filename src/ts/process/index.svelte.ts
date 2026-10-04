@@ -529,6 +529,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
                 role: 'char',
                 data: `\`\`\`risuerror\n${error}\n\`\`\``,
                 time: Date.now(),
+                chatId: v4(),
             }
             if(currentChar?.chaId){
                 m.saying = currentChar.chaId
