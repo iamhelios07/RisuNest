@@ -351,6 +351,8 @@ impl PersistentStore {
             Some(selection_change),
             None,
         )?;
+        crate::server_sync::carry_operation_log(&self.repository_root, header.binding_authority, new_authority, false)
+            .map_err(|failure| error(failure.code))?;
         self.copy_device_unit_bodies(changes)?;
         let tx = self.device_store_mut()?.transaction()?;
         verify(&tx, header.binding_authority)?;

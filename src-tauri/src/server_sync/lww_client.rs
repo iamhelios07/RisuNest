@@ -298,28 +298,51 @@ impl LwwClient {
         .admit()?;
         Ok(admitted.incoming_upper_ms(&target, elapsed)?.into())
     }
-    pub(crate) fn settle(&self, publication: &Publication) -> Result<OperationReceipt> {
+    /// The client for the registration that sent a publication. The current
+    /// address asks for it when that registration is the one in use.
+    fn registration_client(&self, publication: &Publication) -> Result<Option<ServerClient>> {
         let current = self.client.config();
-        // The registration that sent the publication is asked through the
-        // current address when it is the one in use.
-        let resolved;
-        let original = if publication.config.library_id == current.library_id
+        if publication.config.library_id == current.library_id
             && publication.config.device_id == current.device_id
         {
-            &self.client
-        } else {
-            #[allow(unused_mut)]
-            let mut client = ServerClient::with_cancellation(
-                publication.config.resolve(&self.root)?,
-                self.cancelled.clone(),
-            )?;
-            #[cfg(test)]
-            {
-                client.test_io = self.client.test_io.clone();
+            return Ok(None);
+        }
+        #[allow(unused_mut)]
+        let mut client = ServerClient::with_cancellation(
+            publication.config.resolve(&self.root)?,
+            self.cancelled.clone(),
+        )?;
+        #[cfg(test)]
+        {
+            client.test_io = self.client.test_io.clone();
+        }
+        Ok(Some(client))
+    }
+    /// Whether the server that holds a publication answers for it. An address
+    /// that cannot be reached, or that no longer serves this library, does not.
+    pub(crate) fn answers(&self, publication: &Publication) -> Result<bool> {
+        let resolved = self.registration_client(publication)?;
+        let attempt = resolved.as_ref().unwrap_or(&self.client).request_ambiguous_mutation(
+            reqwest::Method::GET,
+            &format!("operations/{}", publication.request.operation_id),
+            None,
+            &[],
+            MAX_METADATA_BYTES,
+        )?;
+        Ok(match attempt {
+            super::client::RequestAttempt::Response(reply) => match reply.status {
+                404 => super::client::response_code(&reply).as_deref() == Some("operation-not-found"),
+                502..=504 => false,
+                _ => true,
+            },
+            super::client::RequestAttempt::Failure { error, .. } => {
+                !super::client::is_ambiguous_transient(&error) && error.code != "directory-unreachable"
             }
-            resolved = client;
-            &resolved
-        };
+        })
+    }
+    pub(crate) fn settle(&self, publication: &Publication) -> Result<OperationReceipt> {
+        let resolved = self.registration_client(publication)?;
+        let original = resolved.as_ref().unwrap_or(&self.client);
         let path = format!("operations/{}", publication.request.operation_id);
         let reply = original.request(
             reqwest::Method::GET,
@@ -329,6 +352,9 @@ impl LwwClient {
             &[],
             MAX_METADATA_BYTES,
         )?;
+        if reply.status == 404 && super::client::response_code(&reply).as_deref() != Some("operation-not-found") {
+            return Err(SyncError::new("server-unreachable", 503));
+        }
         let receipt = if reply.status == 404 {
             let (_, receipt) = original.json(
                 reqwest::Method::POST,
@@ -401,6 +427,9 @@ impl LwwClient {
     pub(crate) fn fence_new_device(&self, store: &mut PersistentStore) -> Result<()> {
         self.log.prune()?;
         for publication in self.log.pending()? {
+            if !self.answers(&publication)? {
+                continue;
+            }
             match self.settle(&publication) {
                 Ok(receipt) => self.acknowledge(store, &publication, &receipt)?,
                 Err(error) if error.status == 401 => {}

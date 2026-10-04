@@ -238,27 +238,11 @@ pub(crate) fn carry_operation_log(
 /// answer, the switch proceeds and carries or detaches that publication instead of waiting.
 pub(crate) fn fence_for_binding_change(core: &LwwClient, store: &mut PersistentStore) -> Result<()> {
     for publication in core.log.pending()? {
-        if !answers(store.repository_root(), &publication)? {
+        if !core.answers(&publication)? {
             return Ok(());
         }
     }
     core.fence(store)
-}
-fn answers(root: &std::path::Path, publication: &super::lww_client::Publication) -> Result<bool> {
-    let client = super::client::ServerClient::new(publication.config.resolve(root)?)?;
-    let attempt = client.request_ambiguous_mutation(
-        reqwest::Method::GET,
-        &format!("operations/{}", publication.request.operation_id),
-        None,
-        &[],
-        MAX_METADATA_BYTES,
-    )?;
-    Ok(match attempt {
-        super::client::RequestAttempt::Response(reply) => !matches!(reply.status, 502..=504),
-        super::client::RequestAttempt::Failure { error, .. } => {
-            !super::client::is_ambiguous_transient(&error) && error.code != "directory-unreachable"
-        }
-    })
 }
 pub(crate) fn stage(
     store: &mut PersistentStore,
@@ -370,7 +354,7 @@ pub(crate) fn prepare_new_device(
         if same {
             core.detach_inactive(old, &preparation.authorization_id)?;
         } else {
-            core.fence(store)?;
+            core.fence_new_device(store)?;
         }
     }
     store.authorize_lww_new_device(&preparation.authorization_id)?;
@@ -1246,6 +1230,98 @@ mod tests {
     fn resume(store: &mut PersistentStore) {
         let request = header(store);
         activate(store, &request, None).unwrap();
+    }
+    /// A server that, once `gone` is set, answers every request with an empty 404 the way an
+    /// address that no longer serves this library does.
+    fn vanishing_server(gone: std::sync::Arc<std::sync::atomic::AtomicBool>) -> LocalServerFixture {
+        use axum::response::IntoResponse;
+        LocalServerFixture::with_router(move |router| {
+            router.layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let gone = gone.clone();
+                    async move {
+                        if gone.load(std::sync::atomic::Ordering::SeqCst) {
+                            axum::http::StatusCode::NOT_FOUND.into_response()
+                        } else {
+                            next.run(request).await
+                        }
+                    }
+                },
+            ))
+        })
+    }
+    fn pending_publication(core: &LwwClient, store: &PersistentStore) {
+        use risunest_sync_wire::lww::{PushRequest, UnitChange};
+        let authority = store.lww_binding_authority().unwrap();
+        let entries = store.lww_read_outbox(authority, 256).unwrap().entries;
+        core.log
+            .prepare(&super::super::lww_client::Publication {
+                authority,
+                request: PushRequest {
+                    library_id: core.client.config().library_id,
+                    writer_id: store.lww_clock_state().unwrap().writer_id,
+                    operation_id: uuid::Uuid::new_v4().to_string(),
+                    changes: entries.iter().map(|e| UnitChange { key: e.key.clone(), stamp: e.stamp.clone(), value: e.value.clone() }).collect(),
+                },
+                entries,
+                config: store.server_stored_config().unwrap().unwrap(),
+            })
+            .unwrap();
+    }
+    #[test]
+    fn an_address_answering_an_empty_not_found_never_blocks_a_binding_change_and_a_missing_operation_still_cancels() {
+        let gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = vanishing_server(gone.clone());
+        let (_root, mut store) = local();
+        configure(&server, &store);
+        bind(&mut store);
+        save(&mut store, &["root", "language"], serde_json::json!("ja"));
+        let core = bound_client(&store);
+        pending_publication(&core, &store);
+        gone.store(true, std::sync::atomic::Ordering::SeqCst);
+        fence_for_binding_change(&core, &mut store).unwrap();
+        let pending = core.log.pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        let unreachable = core.settle(&pending[0]).unwrap_err();
+        assert_eq!((unreachable.code.as_str(), unreachable.status), ("server-unreachable", 503));
+        assert_eq!(core.log.pending().unwrap().len(), 1);
+        gone.store(false, std::sync::atomic::Ordering::SeqCst);
+        fence_for_binding_change(&core, &mut store).unwrap();
+        assert!(core.log.pending().unwrap().is_empty());
+    }
+    #[test]
+    fn a_new_device_switch_away_from_an_address_answering_an_empty_not_found_publishes_on_the_new_server() {
+        let gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let old = vanishing_server(gone.clone());
+        let (_root, mut a) = local();
+        configure(&old, &a);
+        bind(&mut a);
+        save(&mut a, &["root", "language"], serde_json::json!("ja"));
+        let core = bound_client(&a);
+        pending_publication(&core, &a);
+        drop(core);
+        gone.store(true, std::sync::atomic::Ordering::SeqCst);
+        let live = LocalServerFixture::new();
+        let fresh = configure(&live, &a);
+        let inspected = inspect(&a, &header(&a)).unwrap();
+        assert!(!inspected.previously_bound_library);
+        let request = header(&a);
+        let staged = stage(&mut a, &request, &inspected.inspection_id, None).unwrap();
+        let prepared = prepare_new_device(&mut a, &request, &staged.staging_id).unwrap();
+        let result = a
+            .lww_replace_target_as_new_device(&request, &staged.staging_id, &prepared.authorization_id)
+            .unwrap();
+        let next = Header { binding_authority: result.binding_authority, request_id: uuid::Uuid::new_v4().to_string() };
+        activate(&mut a, &next, Some((&prepared.authorization_id, &result.writer_id))).unwrap();
+        assert_eq!(a.server_stored_config().unwrap().unwrap().device_id, fresh.device_id);
+        save(&mut a, &["root", "language"], serde_json::json!("ko"));
+        let client = bound_client(&a);
+        assert!(client.push(&mut a, &next, &[]).unwrap().is_some());
+        assert!(client.log.pending().unwrap().is_empty());
+        let (_peer_root, mut peer) = local();
+        let receiver = live.client(&peer);
+        crate::server_sync::lww_tests::receive_available(&receiver, &mut peer, &[]).unwrap();
+        assert_eq!(peer.read_root(None).unwrap().value["language"], "ko");
     }
     #[test]
     fn a_new_registration_after_unbinding_publishes_every_retained_edit_with_its_original_stamp() {

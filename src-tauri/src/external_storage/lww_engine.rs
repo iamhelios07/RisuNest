@@ -1225,15 +1225,16 @@ impl ExternalLwwEngine {
             Err(error) => Self::fence_outcome(error, new_device),
         }
     }
-    /// Only an unreachable repository lets a binding change go ahead without
-    /// an answer, and a refusal of this device does too when the change makes
-    /// it a new device.
+    /// Only an unreachable or missing repository lets a binding change go
+    /// ahead without an answer, and a refusal of this device does too when the
+    /// change makes it a new device.
     pub(crate) fn fence_outcome(error: ProviderError, new_device: bool) -> Result<()> {
         match error.kind {
             ErrorKind::Transient
             | ErrorKind::RateLimited
             | ErrorKind::DailyQuotaExhausted
-            | ErrorKind::EndpointRejected => Ok(()),
+            | ErrorKind::EndpointRejected
+            | ErrorKind::NotFound => Ok(()),
             ErrorKind::Unauthorized | ErrorKind::ReauthRequired if new_device => Ok(()),
             _ => Err(error),
         }

@@ -1872,7 +1872,7 @@ fn unbinding_from_an_unreachable_repository_does_not_wait_for_a_sent_segment() {
     })
 }
 #[test]
-fn a_binding_fence_stops_only_for_a_refusal_or_a_damaged_segment() {
+fn a_binding_fence_stops_only_for_a_refusal_or_a_damaged_segment_and_passes_a_missing_repository() {
     run(async {
         let mut f = CycleFixture::new();
         set(&mut f.a, &["root", "language"], serde_json::json!("ko"));
@@ -1887,7 +1887,7 @@ fn a_binding_fence_stops_only_for_a_refusal_or_a_damaged_segment() {
             (ErrorKind::EndpointRejected, true, true),
             (ErrorKind::Unauthorized, false, true),
             (ErrorKind::ReauthRequired, false, true),
-            (ErrorKind::NotFound, false, false),
+            (ErrorKind::NotFound, true, true),
             (ErrorKind::RepositoryKeyUnavailable, false, false),
             (ErrorKind::Corrupt, false, false),
             (ErrorKind::Cancelled, false, false),
