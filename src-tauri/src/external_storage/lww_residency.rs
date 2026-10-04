@@ -215,6 +215,19 @@ impl RemoteBodies {
         }
         Ok(found)
     }
+    /// The hashes in `hashes` that have any registered source.
+    fn present(&mut self,hashes:&[&str])->Result<BTreeSet<String>> {
+        let mut found=BTreeSet::new();
+        let Some(db)=self.db()? else {return Ok(found)};
+        for page in hashes.chunks(LOOKUP_PAGE) {
+            let marks=(1..=page.len()).map(|index|format!("?{index}")).collect::<Vec<_>>().join(",");
+            let mut statement=db.prepare(&format!("SELECT hash FROM sources WHERE hash IN ({marks})
+                UNION SELECT hash FROM packed_sources WHERE hash IN ({marks})")).map_err(local)?;
+            let mut rows=statement.query(rusqlite::params_from_iter(page)).map_err(local)?;
+            while let Some(row)=rows.next().map_err(local)? {found.insert(row.get(0).map_err(local)?);}
+        }
+        Ok(found)
+    }
     /// The packed sources `library` registered for `hashes`.
     fn packed<'a>(&mut self,library:&str,hashes:impl IntoIterator<Item=&'a str>)->Result<BTreeMap<String,PackedSource>> {
         let mut found=BTreeMap::new();
@@ -471,30 +484,60 @@ pub(crate) fn hydrate_registered_many(root:&Path,digests:&[String],priority:&BTr
     let mut packed=BTreeMap::<ConnectionKey,Vec<PackedOutline>>::new();
     for page in digests.chunks(ASSET_OBJECT_CATALOG_MAX_PAGE as usize) {
         publisher.checked()?;
-        let mut registered=remote.registered(page).map_err(hydration_error)?;
-        let mut rows=Vec::with_capacity(page.len());
+        let mut sizes=BTreeMap::new();
         for &hash in page {
-            let byte_size=if let Some(size)=cas.stat_object(hash)? {
-                opened(hash,HydrationOutcome::AlreadyLocal);
-                size
-            } else {
-                match registered.remove(hash) {
-                    Some(Registered::Standalone(source))=>{let size=source.body.plaintext_byte_length.0;standalone.push(source);size}
-                    Some(Registered::Packed(connection,outline))=>{let size=outline.byte_length;packed.entry(connection).or_default().push(outline);size}
-                    None=>{unavailable.push(hash.to_owned());continue;}
-                }
-            };
-            rows.push(AssetObjectRegistration{object_hash:hash.to_owned(),byte_size});
+            if let Some(size)=cas.stat_object(hash)? {sizes.insert(hash,size);}
         }
-        if rows.is_empty() {continue;}
-        // A row goes in before its body's file, so no interruption leaves a published body without one.
-        // Until the file arrives, the remote source registered for the body is what the row stands on.
-        if catalog.is_none() {
+        let mut registered=remote.registered(page).map_err(hydration_error)?;
+        #[cfg(test)]
+        hydration_tests::after_lookup(root);
+        let mut local=BTreeSet::new();
+        {
+            // A row goes in before its body's file, so no interruption leaves a published body without one.
+            // Until the file arrives, the remote source registered for the body is what the row stands on.
+            // Source deletion drops, under this lock, rows left with neither a file nor a source, so each
+            // row is checked under it: a body with a source still registered gets its row, and one
+            // without a source gets a row only if its file is still there.
+            let _guard=crate::asset_repository::coordinator::lock_repository_mutation()?;
             #[cfg(test)]
-            hydration_tests::observe("catalog",root,root);
-            catalog=Some(AssetObjectRegistrar::open(root).map_err(hydration_error)?);
+            let held=std::time::Instant::now();
+            let checked=page.iter().copied().filter(|hash|sizes.contains_key(hash)||registered.contains_key(*hash)).collect::<Vec<_>>();
+            let present=remote.present(&checked).map_err(hydration_error)?;
+            let mut rows=Vec::with_capacity(checked.len());
+            for hash in checked {
+                let byte_size=if present.contains(hash) {
+                    match (sizes.get(hash),registered.get(hash)) {
+                        (Some(&size),_)=>{local.insert(hash);size}
+                        (None,Some(Registered::Standalone(source)))=>source.body.plaintext_byte_length.0,
+                        (None,Some(Registered::Packed(_,outline)))=>outline.byte_length,
+                        (None,None)=>continue,
+                    }
+                } else if let Some(size)=cas.stat_object(hash)? {
+                    local.insert(hash);size
+                } else {
+                    registered.remove(hash);continue;
+                };
+                rows.push(AssetObjectRegistration{object_hash:hash.to_owned(),byte_size});
+            }
+            if !rows.is_empty() {
+                if catalog.is_none() {
+                    #[cfg(test)]
+                    hydration_tests::observe("catalog",root,root);
+                    catalog=Some(AssetObjectRegistrar::open(root).map_err(hydration_error)?);
+                }
+                if let Some(catalog)=catalog.as_mut() {catalog.register(&rows,created_at_ms).map_err(hydration_error)?;}
+            }
+            #[cfg(test)]
+            hydration_tests::record_registration_hold(root,page.len(),held.elapsed());
         }
-        if let Some(catalog)=catalog.as_mut() {catalog.register(&rows,created_at_ms).map_err(hydration_error)?;}
+        for &hash in page {
+            if local.contains(hash) {opened(hash,HydrationOutcome::AlreadyLocal);continue;}
+            match registered.remove(hash) {
+                Some(Registered::Standalone(source))=>standalone.push(source),
+                Some(Registered::Packed(connection,outline))=>packed.entry(connection).or_default().push(outline),
+                None=>unavailable.push(hash.to_owned()),
+            }
+        }
         #[cfg(test)]
         hydration_tests::crash_point(root,hydration_tests::CrashPoint::AfterRegistration)?;
     }

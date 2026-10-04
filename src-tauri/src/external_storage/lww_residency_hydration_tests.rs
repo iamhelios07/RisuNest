@@ -61,6 +61,30 @@ fn holds(root: &Path) -> Vec<(usize, Duration)> {
     HOLDS.lock().unwrap().iter().filter(|(r, ..)| r == root).map(|(_, bodies, held)| (*bodies, *held)).collect()
 }
 
+static REGISTRATIONS: Mutex<Vec<(PathBuf, usize, Duration)>> = Mutex::new(Vec::new());
+/// One hold of the repository mutation lock while a page of `hashes` was registered.
+pub(super) fn record_registration_hold(root: &Path, hashes: usize, held: Duration) {
+    REGISTRATIONS.lock().unwrap().push((root.to_owned(), hashes, held));
+}
+fn registration_holds(root: &Path) -> Vec<(usize, Duration)> {
+    REGISTRATIONS.lock().unwrap().iter().filter(|(r, ..)| r == root).map(|(_, hashes, held)| (*hashes, *held)).collect()
+}
+
+type Hook = Box<dyn FnOnce() + Send>;
+static AFTER_LOOKUP: Mutex<BTreeMap<PathBuf, Hook>> = Mutex::new(BTreeMap::new());
+/// Runs what a test set for `root`, once, after a page was looked up in the
+/// registry and before its rows are registered.
+pub(super) fn after_lookup(root: &Path) {
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_owned());
+    let hook = AFTER_LOOKUP.lock().unwrap().remove(&root);
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+fn on_after_lookup(root: &Path, hook: impl FnOnce() + Send + 'static) {
+    AFTER_LOOKUP.lock().unwrap().insert(std::fs::canonicalize(root).unwrap(), Box::new(hook));
+}
+
 fn run<T>(future: impl std::future::Future<Output = T>) -> T {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -154,7 +178,12 @@ fn forget_rows(root: &Path, hashes: &[(String, u64)]) {
 }
 fn hydrate(root: &Path, hashes: &[(String, u64)]) -> crate::server_sync::Result<Vec<String>> {
     let digests = hashes.iter().map(|(hash, _)| hash.clone()).collect::<Vec<_>>();
-    hydrate_registered_many(root, &digests, &Default::default(), None, &|| Ok(()), &mut |_, _| {})
+    let before = registration_holds(root).len();
+    let result = hydrate_registered_many(root, &digests, &Default::default(), None, &|| Ok(()), &mut |_, _| {});
+    for (hashes, held) in &registration_holds(root)[before..] {
+        eprintln!("registration hold: {hashes} hashes in {held:?}");
+    }
+    result
 }
 fn assert_resident(root: &Path, bodies: &[(String, u64)]) {
     let cas = crate::asset_repository::PayloadCas::new(root).unwrap();
@@ -228,6 +257,7 @@ fn publication_holds_the_mutation_lock_once_per_batch_of_bodies() {
     assert_eq!(holds.iter().map(|(count, _)| count).sum::<usize>(), bodies.len());
     assert!(holds.iter().all(|(count, _)| *count <= BATCH));
     assert_eq!(holds.len(), bodies.len().div_ceil(BATCH), "every hold but the last publishes a full batch");
+    assert_eq!(registration_holds(root).iter().map(|(hashes, _)| *hashes).collect::<Vec<_>>(), vec![bodies.len()], "one page, one hold");
 }
 
 #[test]
@@ -248,6 +278,87 @@ fn a_crash_after_registration_leaves_rows_that_the_next_hydration_fills() {
     }
     assert!(hydrate(root, bodies).unwrap().is_empty());
     assert_resident(root, bodies);
+}
+
+#[test]
+fn a_source_deleted_between_lookup_and_registration_leaves_no_row_and_its_body_unavailable() {
+    let received = received(&[3]);
+    let root = received.f.directory_b.path();
+    let bodies = &received.publications[0];
+    forget_rows(root, bodies);
+    let deleted = bodies[1].0.clone();
+    let (registry, target) = (root.to_owned(), deleted.clone());
+    on_after_lookup(root, move || {
+        // A connection removal deletes the body's sources under the repository mutation lock.
+        let _guard = crate::asset_repository::coordinator::lock_repository_mutation().unwrap();
+        let db = database(&registry, false).unwrap().unwrap();
+        db.execute("DELETE FROM sources WHERE hash=?1", [&target]).unwrap();
+        db.execute("DELETE FROM packed_sources WHERE hash=?1", [&target]).unwrap();
+    });
+    assert_eq!(hydrate(root, bodies).unwrap(), vec![deleted.clone()]);
+    assert_eq!(row(root, &deleted), None, "a row needs a file or a registered source");
+    assert!(crate::asset_repository::PayloadCas::new(root).unwrap().stat_object(&deleted).unwrap().is_none());
+    assert!(stat(root, &deleted).unwrap().is_none());
+    let kept = bodies.iter().filter(|(hash, _)| *hash != deleted).cloned().collect::<Vec<_>>();
+    assert_resident(root, &kept);
+}
+
+#[test]
+fn a_local_body_without_a_source_gets_a_row_only_while_its_file_is_there() {
+    let received = received(&[2]);
+    let root = received.f.directory_b.path();
+    let bodies = &received.publications[0];
+    assert!(hydrate(root, bodies).unwrap().is_empty());
+    forget_rows(root, bodies);
+    let db = database(root, false).unwrap().unwrap();
+    for (hash, _) in bodies {
+        db.execute("DELETE FROM sources WHERE hash=?1", [hash]).unwrap();
+        db.execute("DELETE FROM packed_sources WHERE hash=?1", [hash]).unwrap();
+    }
+    drop(db);
+    let removed = bodies[0].0.clone();
+    let (repository, target) = (root.to_owned(), removed.clone());
+    on_after_lookup(root, move || {
+        // A sweep removes the file under the repository mutation lock after the hydration saw it.
+        let _guard = crate::asset_repository::coordinator::lock_repository_mutation().unwrap();
+        std::fs::remove_file(repository.join("assets").join("objects").join(&target[..2]).join(&target[2..])).unwrap();
+    });
+    let mut outcomes = Vec::new();
+    let digests = bodies.iter().map(|(hash, _)| hash.clone()).collect::<Vec<_>>();
+    let unavailable = hydrate_registered_many(root, &digests, &Default::default(), None, &|| Ok(()), &mut |hash, outcome| {
+        outcomes.push((hash.to_owned(), outcome));
+    })
+    .unwrap();
+    assert_eq!(unavailable, vec![removed.clone()]);
+    assert_eq!(row(root, &removed), None, "a row needs a file or a registered source");
+    assert_eq!(outcomes, vec![(bodies[1].0.clone(), crate::server_sync::residency::HydrationOutcome::AlreadyLocal)]);
+    assert_resident(root, &bodies[1..]);
+}
+
+#[test]
+fn a_full_page_of_hashes_is_registered_under_one_hold() {
+    use crate::persistent_store::asset_object_catalog::ASSET_OBJECT_CATALOG_MAX_PAGE;
+    const PAGE: usize = ASSET_OBJECT_CATALOG_MAX_PAGE as usize;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let _store = crate::persistent_store::PersistentStore::open(root).unwrap();
+    let hashes = (0..PAGE + 1).map(|index| format!("{index:064x}")).collect::<Vec<_>>();
+    let packed = hashes[..PAGE].iter().map(|hash| synthetic_packed(hash, "library", 1, &["pack"])).collect::<Vec<_>>();
+    register_verified_packed_many(root, &packed).unwrap();
+    {
+        // Stops after the first page, before any body is read.
+        let _crash = crash_at(root, CrashPoint::AfterRegistration);
+        let error = hydrate_registered_many(root, &hashes, &Default::default(), None, &|| Ok(()), &mut |_, _| {}).unwrap_err();
+        assert_eq!(error.code, "synthetic-crash");
+    }
+    let holds = registration_holds(root);
+    for (hashes, held) in &holds {
+        eprintln!("registration hold: {hashes} hashes in {held:?}");
+    }
+    assert_eq!(holds.iter().map(|(hashes, _)| *hashes).collect::<Vec<_>>(), vec![PAGE]);
+    let rows: i64 = catalog(root).query_row("SELECT COUNT(*) FROM asset_objects", [], |row| row.get(0)).unwrap();
+    assert_eq!(rows as usize, PAGE);
+    assert_eq!(row(root, &hashes[PAGE]), None, "the next page was not reached");
 }
 
 #[test]
