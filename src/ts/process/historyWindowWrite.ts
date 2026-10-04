@@ -14,7 +14,11 @@ function sameMessage(left: Message, right: Message): boolean {
     return left === right || JSON.stringify(left) === JSON.stringify(right)
 }
 
-/** The single range that turns `before` into `after`, or null when they match. */
+/**
+ * The single range that turns `before` into `after`, or null when they match.
+ * A range that changes the message count runs to the end of the window,
+ * because a windowed conversation changes its count only at its end.
+ */
 export function diffHistoryWindow(
     before: readonly Message[],
     after: readonly Message[],
@@ -25,7 +29,8 @@ export function diffHistoryWindow(
     if (prefix === before.length && prefix === after.length) return null
     let suffix = 0
     while (
-        suffix < shared - prefix
+        before.length === after.length
+        && suffix < shared - prefix
         && sameMessage(before[before.length - 1 - suffix], after[after.length - 1 - suffix])
     ) suffix += 1
     return {

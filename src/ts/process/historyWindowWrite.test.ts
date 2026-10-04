@@ -29,15 +29,15 @@ describe('diffHistoryWindow', () => {
         expect(diffHistoryWindow([], [])).toBeNull()
     })
 
-    it('reduces an edit, insert, removal and append to one range', () => {
+    it('reduces an edit, insert, removal and append to one range that ends the window when the count changes', () => {
         expect(diffHistoryWindow(list('a', 'b', 'c'), list('a', 'x', 'c'))).toEqual({
             start: 1, deleteCount: 1, messages: list('x'),
         })
         expect(diffHistoryWindow(list('a', 'c'), list('a', 'b', 'c'))).toEqual({
-            start: 1, deleteCount: 0, messages: list('b'),
+            start: 1, deleteCount: 1, messages: list('b', 'c'),
         })
         expect(diffHistoryWindow(list('a', 'b', 'c'), list('a', 'c'))).toEqual({
-            start: 1, deleteCount: 1, messages: [],
+            start: 1, deleteCount: 2, messages: list('c'),
         })
         expect(diffHistoryWindow(list('a'), list('a', 'b'))).toEqual({
             start: 1, deleteCount: 0, messages: list('b'),
@@ -71,7 +71,7 @@ describe('writeHistoryWindow', () => {
 
         const removal = controllerFor(list('a', 'b', 'c'))
         expect(writeHistoryWindow(removal.controller, list('c'))).toBe(true)
-        expect(removal.applyRange).toHaveBeenCalledWith(0, 2, [], 'replace-range')
+        expect(removal.applyRange).toHaveBeenCalledWith(0, 3, list('c'), 'replace-range')
         expect(removal.chat.message).toEqual(list('c'))
     })
 
