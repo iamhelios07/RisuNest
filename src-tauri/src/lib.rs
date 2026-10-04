@@ -491,7 +491,8 @@ fn builder_with_main_window(
 
     #[cfg(desktop)]
     {
-        builder = builder.plugin(tauri_plugin_updater::Builder::new()
+        builder = builder.plugin(tauri_plugin_notification::init())
+            .plugin(tauri_plugin_updater::Builder::new()
             .relaunch_args(opened_files::relaunch_arguments(std::env::args_os(), std::env::current_dir().ok().as_deref()))
             .build());
     }
