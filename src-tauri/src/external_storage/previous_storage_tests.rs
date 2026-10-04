@@ -259,6 +259,16 @@ fn a_status_pass_opens_the_body_registry_once() {
 }
 
 #[test]
+fn a_cleanup_preview_opens_the_body_registry_once() {
+    let mut f = CycleFixture::new();
+    let (_connection, _exclusive, _shared) = shared_holders(&mut f);
+    let root = f.directory_b.path().to_owned();
+    lww_residency::forget_registry_opens(&root);
+    f.b.asset_gc_dry_run(1024, None, super::runtime::now_ms() as i64, 0).unwrap();
+    assert_eq!(lww_residency::registry_opens(&root), 1);
+}
+
+#[test]
 fn download_without_a_policy_change_fetches_one_connection_or_every_holder() {
     let mut f = CycleFixture::new();
     let (_server, held, external) = split_holders(&mut f);

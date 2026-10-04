@@ -392,6 +392,76 @@ fn a_linked_record_body_in_the_content_store_is_not_a_snapshot_input() {
     assert_eq!(store.materialize(None).unwrap()["marker"], "local");
 }
 
+/// Bodies a snapshot names that this device holds only through a remote
+/// source are confirmed through one registry connection, and bodies held here
+/// ask the registry nothing.
+#[test]
+fn library_bodies_are_confirmed_through_at_most_one_registry_connection() {
+    use crate::external_storage::lww_residency::{forget_registry_opens, register_synthetic_source, registry_opens};
+    for remote_bodies in [3usize, 0] {
+        let (directory, mut store) = open_store();
+        let staging = directory.path().join("download");
+        fs::create_dir(&staging).unwrap();
+        let local = crate::asset_repository::PayloadCas::new(directory.path())
+            .unwrap()
+            .prepare_bytes(b"synthetic local body")
+            .unwrap();
+        // A registry exists either way, holding a body this snapshot does not name.
+        register_synthetic_source(directory.path(), &"f".repeat(64), 7);
+        let mut bodies = vec![(local.content_hash.clone(), local.byte_size)];
+        for index in 1..=remote_bodies {
+            let hash = format!("{index:064x}");
+            register_synthetic_source(directory.path(), &hash, 7);
+            bodies.push((hash, 7));
+        }
+        let (root, root_hash) = root_record(&staging, "remote");
+        let mut hashes = BTreeMap::from([(root.key.clone(), root_hash)]);
+        let mut records = vec![root];
+        for (index, (hash, size)) in bodies.iter().enumerate() {
+            let metadata = encode_asset_alias_metadata(&LogicalAssetAliasMetadata {
+                mime: "application/octet-stream".into(),
+                name: "payload.bin".into(),
+                ext: "bin".into(),
+                inlay_type: None,
+                width: None,
+                height: None,
+                metadata: json!({}),
+            })
+            .unwrap();
+            let (asset, record_hash) = write_record(
+                &staging,
+                LogicalRecordLocator::Asset {
+                    logical_key: format!("asset-{index}"),
+                },
+                LogicalRecordEnvelope::Asset {
+                    object_hash: Some(hash.clone()),
+                    size: *size,
+                    metadata,
+                },
+            );
+            hashes.insert(asset.key.clone(), record_hash);
+            records.push(asset);
+        }
+        let objects = bodies.iter().map(|(hash, size)| ExternalSnapshotObject {
+            content_hash: hash.clone(),
+            byte_length: *size,
+            source: ObjectSource::Library(hash.clone()),
+        });
+        let scope_id = library_fingerprint_domain();
+        let fingerprint = fingerprint(&scope_id, &hashes);
+        forget_registry_opens(directory.path());
+        let prepared = store
+            .prepare_external_snapshot_application(
+                &application(&staging, &scope_id, &fingerprint, 1),
+                records.into_iter().map(Ok),
+                objects.map(Ok),
+            )
+            .unwrap();
+        assert_eq!(registry_opens(directory.path()), usize::from(remote_bodies > 0), "{remote_bodies} remote bodies");
+        store.finish_prepared_replace(prepared).unwrap();
+    }
+}
+
 #[test]
 fn rejected_record_stream_rolls_back_the_whole_stage_and_preserves_live_library() {
     let (directory, mut store) = open_store();

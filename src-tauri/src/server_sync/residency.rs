@@ -86,7 +86,8 @@ pub(crate) struct RemoteObject {
 
 pub(crate) struct Residency {
     db: Connection,
-    root: PathBuf,
+    /// The body registry `gc_size` falls back to, opened when first asked.
+    remote: std::cell::RefCell<crate::external_storage::lww_residency::RemoteBodies>,
 }
 
 impl Residency {
@@ -138,7 +139,7 @@ impl Residency {
             return Err(SyncError::new("incompatible-residency-store", 409));
         }
         hold_anchor(root, &path);
-        Ok(Self { db, root: root.to_path_buf() })
+        Ok(Self { db, remote: std::cell::RefCell::new(crate::external_storage::lww_residency::RemoteBodies::deferred(root)) })
     }
     /// A fresh registration restores access to the same library's historical
     /// custody. Keep its original owner ID for eventual retention release.
@@ -259,7 +260,7 @@ impl Residency {
         self.lookup(digest, None, false)
             .map(|object| object.map(|object| object.size))
             .map_err(|error| std::io::Error::other(error.code))
-            .and_then(|size| match size { Some(size) => Ok(Some(size)), None => crate::external_storage::lww_residency::stat(&self.root, digest) })
+            .and_then(|size| match size { Some(size) => Ok(Some(size)), None => self.remote.borrow_mut().stat(digest) })
     }
     /// The custody half of `gc_size`.
     pub(crate) fn custody_size(&self, digest: &str) -> Result<Option<u64>> {
