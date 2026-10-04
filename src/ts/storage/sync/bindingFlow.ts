@@ -43,6 +43,17 @@ export interface NewDeviceBindingResult {
 export interface SyncBindingOptions {
     mode?: 'new-device'
 }
+export type PreviousStorageFilesChoice = 'connect' | 'download-then-connect' | 'cancel'
+export interface PreviousStorageFilesContext extends BindingContext {
+    target: Exclude<BindingTarget, { kind: 'none' }>
+}
+export const PREVIOUS_FILES_DOWNLOAD_FAILED = 'previous-files-download-failed'
+export class PreviousStorageFilesDownloadError extends Error {
+    readonly code = PREVIOUS_FILES_DOWNLOAD_FAILED
+    constructor(cause: unknown) {
+        super('The files held by the previous storage could not be downloaded', { cause })
+    }
+}
 export interface SyncBindingTransport {
     receiveAvailableChanges?(context: BindingContext): Promise<void>
     inspectTarget(context: BindingContext): Promise<InspectedSyncTarget>
@@ -89,6 +100,9 @@ export interface SyncBindingDependencies {
     refreshActivatedLibrary(): Promise<void>
     beginActivatedLibraryGuard(): BindingActivationGuard
     recovery?: BindingRecoveryRegistration
+    // Asked once for a first binding to an empty target while its switch is still required.
+    confirmPreviousStorageFiles?(context: PreviousStorageFilesContext): Promise<PreviousStorageFilesChoice>
+    downloadPreviousStorageFiles?(context: BindingContext): Promise<void>
 }
 export type BindingOutcome = { kind: 'cancelled' } | { kind: 'bound'; action: 'initialized' | 'replaced' | 'resumed' | 'new-device'; state: SyncBindingState; newDevice?: NewDeviceBindingResult }
 
@@ -106,6 +120,8 @@ export function bindingMode(explicit: SyncBindingOptions['mode'], inspected: Ins
     if (inspected.previouslyBoundLibrary && inspected.registrationChanged === true) return 'fresh-writer'
     return undefined
 }
+
+const isCancelled = (error: unknown) => typeof error === 'object' && error !== null && 'code' in error && error.code === 'cancelled'
 
 const supportsNewDevice = (transport: SyncBindingTransport) => !!(transport.prepareNewDeviceBinding && transport.replaceAsNewDevice && transport.resumeNewDeviceBinding)
 
@@ -217,6 +233,13 @@ export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
                     if (!await dependencies.confirmReplacement(reason)) return { kind: 'cancelled' }
                     acknowledged = true
                 }
+                let previousFiles: PreviousStorageFilesChoice = 'connect'
+                if (dependencies.confirmPreviousStorageFiles && inspected.empty && !replace && !inspected.previouslyBoundLibrary && switchRequired) {
+                    previousFiles = await dependencies.confirmPreviousStorageFiles({ ...context, target })
+                    if (previousFiles === 'cancel') return { kind: 'cancelled' }
+                    if (previousFiles === 'download-then-connect' && !dependencies.downloadPreviousStorageFiles) throw new Error('Sync binding download is unavailable')
+                    await check(context)
+                }
                 const staged = replace ? structuredClone(await transport.pullAvailableState(inspected, context)) : undefined
                 await check(context)
                 if (staged && (staged.targetId !== inspected.targetId || staged.libraryId !== inspected.libraryId)) {
@@ -224,6 +247,15 @@ export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
                 }
                 jobsFenced = true
                 await fenceOld(transport, context)
+                if (previousFiles === 'download-then-connect') {
+                    try { await dependencies.downloadPreviousStorageFiles!(context) } catch (error) {
+                        if (!isCancelled(error)) throw new PreviousStorageFilesDownloadError(error)
+                        jobsFenced = false
+                        await resumeOld(mode)
+                        return { kind: 'cancelled' }
+                    }
+                    await check(context)
+                }
                 const preparation = newDevice ? structuredClone(await transport.prepareNewDeviceBinding!(staged!, context)) : undefined
                 if (freshWriter) await transport.prepareFreshWriter!(inspected, context)
                 await check(context)

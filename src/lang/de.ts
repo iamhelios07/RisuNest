@@ -1508,5 +1508,10 @@ export const languageGerman = {
         restoreDescription: "Die aktuellen Daten werden gelöscht und durch die gewählte Sicherung ersetzt. Erstellen Sie bei Bedarf manuell eine Sicherung.",
         restoreAcknowledge: "Aktuelle Daten löschen",
         restoreAction: "Wiederherstellen",
+        previousFilesTitle: "Verbinden?",
+        previousFilesDescription: "Einige Dateien sind nur auf dem zuvor verwendeten Server oder externen Speicher gespeichert. Beim Verbinden werden sie auch im neuen Ziel gespeichert. Um sie auch auf diesem Gerät zu behalten, wählen Sie „Herunterladen, dann verbinden“.",
+        downloadThenConnect: "Herunterladen, dann verbinden",
+        downloadFailedNotConnected: "Die Dateien konnten nicht heruntergeladen werden, daher wurde keine Verbindung hergestellt. Versuchen Sie es erneut oder verbinden Sie ohne Herunterladen.",
+        previousStorageUnavailable: "Dateien, die nur auf dem zuvor verwendeten Server oder externen Speicher liegen, konnten nicht abgerufen werden, daher wurde die Synchronisierung angehalten. Versuchen Sie es erneut, sobald er erreichbar ist.",
     },
 } satisfies DeepPartial<typeof import('./en').languageEnglish>;

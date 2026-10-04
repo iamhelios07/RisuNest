@@ -15,6 +15,7 @@
     import { createNativeSyncBindingBridge } from 'src/ts/storage/sync/bindingNative'
     import { requestExternalLwwNow, subscribeExternalLwwFailures, supportsExternalLwwNewDevice } from 'src/ts/storage/sync/external/lwwProduction'
     import BindingTargetSwitch from 'src/ts/storage/sync/BindingTargetSwitch.svelte'
+    import { PREVIOUS_FILES_DOWNLOAD_FAILED } from 'src/ts/storage/sync/bindingFlow'
     import { language } from 'src/lang'
     import { externalJobIsActive, externalJobIsPaused, externalJobProgress, mergeExternalHistoryItems } from 'src/ts/storage/sync/external/connection'
     import {
@@ -37,6 +38,7 @@
         ExternalSnapshotExportProgress,
     } from 'src/ts/storage/sync/external/types'
     import { externalRestoreAreas } from 'src/ts/storage/sync/external/restoreScope'
+    import { downloadRemoteAssets, getAssetResidencyStatus } from 'src/ts/storage/sync/serverAssetResidency'
     import ConnectionForm from './ConnectionForm.svelte'
     import { externalConnectionTitle, externalErrorKind, externalErrorMessage, externalStorageStrings } from './strings'
 
@@ -81,7 +83,9 @@
             else await unbindSyncTarget()
             await refreshExternalStorageProductionState()
             await refresh()
-        } catch (reason) { error = externalErrorMessage(strings, reason) }
+        } catch (reason) {
+            error = externalErrorKind(reason) === PREVIOUS_FILES_DOWNLOAD_FAILED ? language.lwwSync.downloadFailedNotConnected : externalErrorMessage(strings, reason)
+        }
         finally { busy = false }
     }
     async function syncNow(connection: ExternalConnectionSummary): Promise<void> {
@@ -404,10 +408,34 @@
     }
 
     async function removeConnection(connection: ExternalConnectionSummary): Promise<void> {
-        if (!(await alertConfirm(`${strings.remove}: ${externalConnectionTitle(strings, connection)}`))) return
+        let held = 0
+        try {
+            held = (await getAssetResidencyStatus()).externalObjects.find(entry => entry.connectionId === connection.id)?.objects ?? 0
+        } catch {}
+        let download = false
+        if (held) {
+            const choice = await alertCheckboxConfirm({
+                title: strings.removeRemoteOnlyTitle,
+                description: strings.removeRemoteOnly,
+                checkboxLabel: strings.downloadThenRemove,
+                actionLabel: strings.remove,
+                cancelLabel: strings.cancel,
+                requireChecked: false,
+            })
+            if (!choice.confirmed) return
+            download = choice.checked
+        } else if (!(await alertConfirm(`${strings.remove}: ${externalConnectionTitle(strings, connection)}`))) return
         busy = true
         activeAction = `remove:${connection.id}`
         try {
+            if (download) {
+                try {
+                    await downloadRemoteAssets(connection.id)
+                } catch (reason) {
+                    if (externalErrorKind(reason) !== 'cancelled') error = strings.downloadFailedKeptConnection
+                    return
+                }
+            }
             await bridge.removeConnection(connection.id)
             await refreshExternalStorageProductionState()
             await refresh(true)
@@ -653,7 +681,9 @@
                 {#if connection.lastError}<p class="text-sm text-danger-400">{errorLabel(connection.lastError)}</p>{/if}
                 {#if syncFailures.has(connection.id)}
                     {@const failure = syncFailures.get(connection.id)}
-                    <p class="text-sm text-danger-400" role="status">{externalErrorKind(failure) === 'clockSkew' ? language.lwwSync.clockBlocked : externalErrorMessage(strings, failure)}</p>
+                    <p class="text-sm text-danger-400" role="status">{externalErrorKind(failure) === 'clockSkew' ? language.lwwSync.clockBlocked
+                        : externalErrorKind(failure) === 'previousStorageUnavailable' ? language.lwwSync.previousStorageUnavailable
+                        : externalErrorMessage(strings, failure)}</p>
                     {#if ['clockSkew', 'corrupt'].includes(externalErrorKind(failure) ?? '') && supportsExternalLwwNewDevice(connection.id)}
                         <BindingTargetSwitch target={{kind:'external',connectionId:connection.id}} options={{mode:'new-device'}} label={language.lwwSync.newDeviceAction} onBound={() => refreshExternalStorageProductionState().then(() => refresh())} onError={reason => error = externalErrorMessage(strings, reason)} />
                     {/if}

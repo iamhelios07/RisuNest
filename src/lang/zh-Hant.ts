@@ -1551,5 +1551,10 @@ export const languageChineseTraditional = {
         restoreDescription: "將清除目前資料並還原所選備份。如需備份，請手動備份。",
         restoreAcknowledge: "清除目前資料",
         restoreAction: "還原",
+        previousFilesTitle: "是否連線？",
+        previousFilesDescription: "有些檔案僅儲存在先前使用的伺服器或外部儲存空間中。連線後也會將這些檔案儲存到新的目標。如需同時保留在此裝置上，請選擇「下載後連線」。",
+        downloadThenConnect: "下載後連線",
+        downloadFailedNotConnected: "無法下載檔案，因此未進行連線。請重試，或不下載直接連線。",
+        previousStorageUnavailable: "無法取得僅儲存在先前使用的伺服器或外部儲存空間中的檔案，同步已停止。請在可以連線時重試。",
     },
 } satisfies DeepPartial<typeof import('./en').languageEnglish>

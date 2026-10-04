@@ -3088,6 +3088,11 @@ export const languageEnglish = {
         restoreDescription: "The current data will be cleared and replaced with the selected backup. Make a manual backup if needed.",
         restoreAcknowledge: "Clear the current data",
         restoreAction: "Restore",
+        previousFilesTitle: "Connect?",
+        previousFilesDescription: "Some files are stored only on the server or external storage used before. Connecting also saves them to the new target. To also keep them on this device, choose Download, then connect.",
+        downloadThenConnect: "Download, then connect",
+        downloadFailedNotConnected: "The files could not be downloaded, so the connection was not made. Try again, or connect without downloading.",
+        previousStorageUnavailable: "Files kept only on the server or external storage used before could not be fetched, so sync stopped. Try again when it can be reached.",
     },
 } satisfies I18nTranslation;
 

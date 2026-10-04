@@ -37,7 +37,7 @@ vi.mock('./bindingProduction', async importOriginal => ({
     installSyncBindingFlow: f.install,
 }))
 vi.mock('../committedWorkingSetContinuation', () => ({ registerCommittedWorkingSetContinuation: f.continuation }))
-vi.mock('./bindingDialog', () => ({ confirmSyncBindingReplacement: vi.fn() }))
+vi.mock('./bindingDialog', () => ({ confirmSyncBindingReplacement: vi.fn(), confirmPreviousStorageFiles: vi.fn(async () => 'connect'), downloadPreviousStorageFiles: vi.fn() }))
 vi.mock('./bindingLocalData', () => ({ hasLocalBindingData: vi.fn(), hasLocalSharedBindingData: vi.fn() }))
 vi.mock('./bindingRegistry', () => ({ registerSyncBindingTransport: f.register, resumeCurrentSyncBinding: f.resumeCurrent, getSyncBindingTransport: vi.fn(), bindSyncTarget: vi.fn(), unbindSyncTarget: vi.fn() }))
 vi.mock('./bindingNative', () => ({ replaceNativeSyncBinding: vi.fn(), replaceNativeSyncBindingAsNewDevice: vi.fn() }))
