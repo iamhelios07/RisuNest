@@ -606,6 +606,10 @@ impl super::PersistentStore {
     }
 
     pub(crate) fn register_lww_binding_stage(&self, inspection_id: &str, staging_id: &str, receive_id: &str, changes: &[super::lww::Change]) -> StoreResult<()> {
+        self.register_lww_binding_stage_with(inspection_id, staging_id, receive_id, changes, true)
+    }
+
+    pub(super) fn register_lww_binding_stage_with(&self, inspection_id: &str, staging_id: &str, receive_id: &str, changes: &[super::lww::Change], prove_content: bool) -> StoreResult<()> {
         if receive_id.is_empty() { return Err(invalid("Missing binding receive identity")); }
         let (authority,epoch):(String,String) = self.connection.query_row("SELECT source_authority,source_epoch FROM lww_binding_inspections WHERE inspection_id=?1", [inspection_id], |r| Ok((r.get(0)?,r.get(1)?)))?;
         if authority != self.lww_binding_authority()?.0.to_string() || epoch != read(&self.connection)?.epoch { return Err(invalid("Stale binding inspection")); }
@@ -623,7 +627,7 @@ impl super::PersistentStore {
         let existing: Option<(String,String,String)> = self.connection.query_row("SELECT inspection_id,receive_id,changes FROM lww_binding_stages WHERE staging_id=?1", [staging_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
         if let Some(existing) = existing {
             if existing != (inspection_id.into(),receive_id.into(),encoded) { return Err(invalid("Binding stage identity changed")); }
-            validate_binding_stage_content(&self.connection,staging_id)?;
+            if prove_content { validate_binding_stage_content(&self.connection,staging_id)?; }
             return Ok(());
         }
         let digest = binding_stage_digest(&self.connection, staging_id)?;
@@ -684,8 +688,8 @@ impl super::PersistentStore {
         if request.header.request_id != request.receive_id { return Err(invalid("Binding receive request identity changed")); }
         let library_committed:bool = self.connection.query_row("SELECT EXISTS(SELECT 1 FROM lww_requests WHERE request_id=?1)", [&request.header.request_id], |r| r.get(0))?;
         let changes:Vec<super::lww::Change> = serde_json::from_str(&encoded)?;
+        // The stage catalog is proved once, inside the activation transaction.
         if !library_committed {
-            validate_binding_stage_content(&self.connection,&request.staging_id)?;
             super::lww::validate_binding_source(&self.connection,&request.staging_id,&request.header,&changes)?;
         }
         self.lww_replace_target(&request.header,&request.staging_id,&changes)
@@ -725,10 +729,13 @@ pub(crate) fn binding_stage_digest(db: &Connection, staging_id: &str) -> StoreRe
     super::lww::catalog_digest(db, staging_id)
 }
 
+/// Proves the stage catalog once against both digests recorded for it.
 pub(crate) fn validate_binding_stage_content(db: &Connection, staging_id: &str) -> StoreResult<()> {
     let expected:Option<String> = db.query_row("SELECT library_digest FROM lww_binding_stages WHERE staging_id=?1", [staging_id], |r| r.get(0)).optional()?;
-    if let Some(expected) = expected {
-        if binding_stage_digest(db,staging_id)? != expected { return Err(invalid("Binding stage content changed")); }
-    }
+    let source:Option<String> = db.query_row("SELECT catalog_digest FROM lww_binding_sources WHERE staging_id=?1", [staging_id], |r| r.get(0)).optional()?;
+    if expected.is_none() && source.is_none() { return Ok(()); }
+    let actual = binding_stage_digest(db,staging_id)?;
+    if expected.is_some_and(|expected| expected != actual) { return Err(invalid("Binding stage content changed")); }
+    if source.is_some_and(|source| source != actual) { return Err(super::lww::error("binding-source-integrity")); }
     Ok(())
 }

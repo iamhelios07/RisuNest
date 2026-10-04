@@ -159,7 +159,12 @@ fn archive_alias_and_reference_controls_stage_without_reading_any_large_dependen
     let mut changed:Value=serde_json::from_str(&original).unwrap(); changed["archivedAt"]=json!(2);
     store.connection.execute("UPDATE characters SET archived_object=?2 WHERE generation=?1 AND character_id='archived'",params![stage.staging_id,changed.to_string()]).unwrap();
     assert!(crate::persistent_store::sync_selection::validate_binding_stage_content(&store.connection,&stage.staging_id).is_err());
-    assert!(validate_binding_source(&store.connection,&stage.staging_id,&header,&incoming).is_err());
+    let state=store.lww_binding_state().unwrap();
+    assert!(store.switch_lww_binding(&SwitchBindingRequest {
+        header: Header { binding_authority: state.target_authority, request_id: uuid::Uuid::new_v4().to_string() },
+        expected_selection_epoch: state.selection_epoch.clone(), target: SyncTarget::Server("remote".into()), inspection_id: Some(inspection.clone()),
+    }).is_err());
+    assert_eq!(store.lww_binding_state().unwrap().selection_epoch,state.selection_epoch);
     store.connection.execute("UPDATE characters SET archived_object=?2 WHERE generation=?1 AND character_id='archived'",params![stage.staging_id,original]).unwrap();
     activate(&mut store,&header,&inspection,&stage);
     assert!(store.read_character("archived",None).is_err());
@@ -506,4 +511,46 @@ fn binding_replacement_applies_large_shared_and_device_units_from_their_bodies()
     let device = store.device_store().unwrap().connection();
     assert_eq!(read_unit(device, &local.key).unwrap(), Some((local.stamp.clone(), local.value.clone())));
     assert_eq!(device.query_row("SELECT value FROM plugin_device_storage WHERE owner='synthetic-owner' AND space='string' AND key='large' AND tombstone=0", [], |r| r.get::<_,String>(0)).unwrap(), plugin);
+}
+
+#[test]
+fn a_bootstrap_proves_the_stage_catalog_once_per_boundary() {
+    use crate::persistent_store::hash_work::{reset_hash_work, take_hash_work};
+    let proofs = || take_hash_work().domains.get("binding_catalog_proof").map_or(0, |work| work.calls);
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = PersistentStore::open(dir.path()).unwrap();
+    let (header, inspection) = context(&store);
+    let incoming = vec![change(&["root","language"],json!("remote")),change(&["exists","character","character"],json!(true))];
+    reset_hash_work();
+    let stage = store.lww_stage_binding_units(&header, &inspection, &incoming, 7.into()).unwrap();
+    let staged = proofs();
+    reset_hash_work();
+    let state = store.lww_binding_state().unwrap();
+    let state = store.switch_lww_binding(&SwitchBindingRequest {
+        header: Header { binding_authority: state.target_authority, request_id: uuid::Uuid::new_v4().to_string() },
+        expected_selection_epoch: state.selection_epoch, target: SyncTarget::Server("remote".into()), inspection_id: Some(inspection.clone()),
+    }).unwrap();
+    let switched = proofs();
+    reset_hash_work();
+    store.replace_lww_binding(&ReplaceBindingRequest {
+        header: Header { binding_authority: state.target_authority, request_id: header.request_id.clone() },
+        expected_selection_epoch: state.selection_epoch, staging_id: stage.staging_id.clone(), receive_id: header.request_id.clone(), target_id: "target".into(), library_id: "library".into(),
+    }).unwrap();
+    let replaced = proofs();
+    assert_eq!((staged, switched, replaced), (1, 1, 1));
+    assert_eq!(active_generation(&store.connection).unwrap(), stage.staging_id);
+}
+
+#[test]
+fn a_binding_stage_cannot_be_activated_as_an_ordinary_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = PersistentStore::open(dir.path()).unwrap();
+    let (header, inspection) = context(&store);
+    let stage = store.lww_stage_binding_units(&header, &inspection, &[change(&["root","language"],json!("remote"))], 7.into()).unwrap();
+    let revision = store.revision().unwrap();
+    assert!(store.replace_commit(&stage.staging_id, Some(revision)).is_err());
+    assert_eq!(store.revision().unwrap(), revision);
+    assert_eq!(commit::generation_state(&store.connection, &stage.staging_id).unwrap().as_deref(), Some("staging"));
+    activate(&mut store, &header, &inspection, &stage);
+    assert_eq!(active_generation(&store.connection).unwrap(), stage.staging_id);
 }

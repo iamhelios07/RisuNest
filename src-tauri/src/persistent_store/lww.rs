@@ -2252,6 +2252,9 @@ impl PersistentStore {
         }
         self.lww_recover_intents()?;
         verify(self.device_store()?.connection(), header.binding_authority)?;
+        if binding_stage::is_binding_stage(&self.connection, staging_id)? {
+            return Err(error("binding-stage-not-replacement"));
+        }
         let base_revision = super::current_revision(&self.connection)?;
         let remapped_units = self.remap_retired_staging(staging_id, source_units)?;
         let effective_source_units = remapped_units.as_ref();
