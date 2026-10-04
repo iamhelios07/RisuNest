@@ -455,7 +455,8 @@ export async function importChat(){
                     if(!isFirst){
                         newChat.message.push({
                             role: presedLine.is_user ? "user" : 'char',
-                            data: formatTavernChat(presedLine.mes, DBState.db.characters[selectedID].name)
+                            data: formatTavernChat(presedLine.mes, DBState.db.characters[selectedID].name),
+                            chatId: v4(),
                         })
                     }
                 }
@@ -1240,6 +1241,7 @@ export async function addNewChat(character: character | groupChat): Promise<bool
                     saying: memberId,
                     role: 'char',
                     data: findCharacterbyId(memberId).firstMessage,
+                    chatId: v4(),
                 })
             }
         }
