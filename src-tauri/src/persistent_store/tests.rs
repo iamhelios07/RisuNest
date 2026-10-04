@@ -122,6 +122,8 @@ fn stage_root(store: &mut PersistentStore, username: &str) -> String {
     staging.staging_id
 }
 
+#[path = "tests/activation_golden_tests.rs"]
+mod activation_golden_tests;
 #[path = "tests/archive_tests.rs"]
 mod archive_tests;
 #[path = "tests/asset_alias_tests.rs"]

@@ -1,0 +1,499 @@
+use super::*;
+use crate::persistent_store::lww::{inline, unit_key, Change, Header};
+use crate::persistent_store::sync_selection::{ReplaceBindingRequest, SwitchBindingRequest, SyncTarget};
+use crate::persistent_store::{hash_work, message_pages};
+use risunest_sync_wire::{stamp::Stamp, unit::UnitValue};
+use std::collections::BTreeMap;
+
+// Library rows of the active generation (without the generation column), the
+// shared unit state and the device unit state, in a fixed order. Stamps,
+// versions and request identities differ per run and are left out.
+fn golden_dump(store: &PersistentStore) -> String {
+    let db = &store.connection;
+    let generation = active_generation(db).unwrap();
+    let mut out = String::new();
+    for &(table, _) in GENERATION_TABLES {
+        let columns = db
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .into_iter()
+            .filter(|name| name != "generation")
+            .collect::<Vec<_>>();
+        let list = columns.join(",");
+        dump_rows(
+            db,
+            &mut out,
+            table,
+            &format!("SELECT {list} FROM {table} WHERE generation=?1 ORDER BY {list}"),
+            &[&generation],
+        );
+    }
+    for (label, sql) in [
+        ("lww_units", "SELECT key,value,identity FROM lww_units ORDER BY key"),
+        ("lww_outbox", "SELECT key,value,identity,authority FROM lww_outbox ORDER BY key"),
+        ("lww_retired", "SELECT key FROM lww_retired ORDER BY key"),
+        ("lww_receive_rows", "SELECT key,value,status FROM lww_receive_rows ORDER BY key,value,status"),
+    ] {
+        dump_rows(db, &mut out, label, sql, &[]);
+    }
+    let device = store.device_store().unwrap().connection();
+    for (label, sql) in [
+        ("device_lww_units", "SELECT key,value,identity FROM lww_units ORDER BY key"),
+        ("device_lww_outbox", "SELECT key,value,identity,authority FROM lww_outbox ORDER BY key"),
+    ] {
+        dump_rows(device, &mut out, label, sql, &[]);
+    }
+    out
+}
+
+fn dump_rows(db: &Connection, out: &mut String, label: &str, sql: &str, params: &[&dyn rusqlite::ToSql]) {
+    use rusqlite::types::ValueRef;
+    out.push_str(label);
+    out.push('\n');
+    let mut statement = db.prepare(sql).unwrap();
+    let count = statement.column_count();
+    let mut rows = statement.query(params).unwrap();
+    while let Some(row) = rows.next().unwrap() {
+        let mut fields = Vec::with_capacity(count);
+        for index in 0..count {
+            fields.push(match row.get_ref(index).unwrap() {
+                ValueRef::Null => "null".to_owned(),
+                ValueRef::Integer(value) => format!("i{value}"),
+                ValueRef::Real(value) => format!("r{value}"),
+                ValueRef::Text(value) => serde_json::to_string(&String::from_utf8_lossy(value)).unwrap(),
+                ValueRef::Blob(value) => format!("b{}", hex::encode(value)),
+            });
+        }
+        out.push_str(&fields.join("|"));
+        out.push('\n');
+    }
+}
+
+fn golden(store: &PersistentStore, name: &str) -> String {
+    let dump = golden_dump(store);
+    if let Some(directory) = std::env::var_os("RISUNEST_GOLDEN_DUMP") {
+        fs::write(Path::new(&directory).join(format!("{name}.txt")), &dump).unwrap();
+    }
+    hex::encode(Sha256::digest(dump.as_bytes()))
+}
+
+fn seed_library(store: &mut PersistentStore) {
+    let database = fixture();
+    let staging = store.replace_begin().unwrap().staging_id;
+    store.replace_put_root(&staging, &staged_root(&database)).unwrap();
+    store
+        .replace_put_presets(&staging, database["botPresets"].as_array().unwrap())
+        .unwrap();
+    let mut characters = database["characters"].as_array().unwrap().clone();
+    characters.push(json!({
+        "type": "character",
+        "chaId": "archived-char",
+        "name": "Archived",
+        "chats": [{
+            "id": "archived-chat",
+            "name": "Archived Chat",
+            "message": [
+                { "role": "user", "data": "kept", "chatId": "archived-m1" },
+                { "role": "char", "data": "away", "chatId": "archived-m2" }
+            ]
+        }]
+    }));
+    store.replace_add_characters(&staging, &characters).unwrap();
+    store.replace_commit(&staging, Some(0)).unwrap();
+    store
+        .commit(&WorkingSetCommit {
+            root: Some(json!({ "username": "Local edit" })),
+            ..empty_working_set_commit(1)
+        })
+        .unwrap();
+    let revision = store.revision().unwrap();
+    store.archive_character("archived-char", revision, 10).unwrap();
+}
+
+fn build_stage(store: &mut PersistentStore) -> String {
+    let database = fixture();
+    let staging = store.replace_begin().unwrap().staging_id;
+    let mut root = staged_root(&database);
+    root["username"] = json!("Staged");
+    root["language"] = json!("staged");
+    store.replace_put_root(&staging, &root).unwrap();
+    let mut presets = database["botPresets"].as_array().unwrap().clone();
+    presets[0]["name"] = json!("Staged preset");
+    store.replace_put_presets(&staging, &presets).unwrap();
+    let mut characters = database["characters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|character| character["chaId"] != "char-b")
+        .cloned()
+        .collect::<Vec<_>>();
+    for character in &mut characters {
+        if character["chaId"] == "char-a" {
+            let messages = character["chats"][0]["message"].as_array_mut().unwrap();
+            messages[5]["data"] = json!("staged edit");
+            messages.push(json!({ "role": "user", "data": "staged tail", "chatId": "staged-tail" }));
+            messages.push(json!({ "role": "char", "data": "staged end", "chatId": "staged-end" }));
+        }
+        if character["chaId"] == "char-c" {
+            character["name"] = json!("Staged C");
+        }
+    }
+    characters.push(json!({
+        "type": "character",
+        "chaId": "char-d",
+        "name": "Staged D",
+        "chats": [{
+            "id": "char-d-chat",
+            "name": "D Chat",
+            "message": [
+                { "role": "user", "data": "first", "chatId": "d-m1" },
+                { "role": "char", "data": "second", "chatId": "d-m2" }
+            ]
+        }]
+    }));
+    store.replace_add_characters(&staging, &characters).unwrap();
+    store.replace_preserve_repositories(&staging, None).unwrap();
+    staging
+}
+
+fn source_units() -> BTreeMap<risunest_sync_wire::unit::UnitKey, UnitValue> {
+    BTreeMap::from([
+        (unit_key(&["root", "username"]).unwrap(), inline(&json!("Source username")).unwrap()),
+        (unit_key(&["character", "char-c", "name"]).unwrap(), inline(&json!("Source C")).unwrap()),
+        (unit_key(&["future-unit", "backup"]).unwrap(), inline(&json!({ "opaque": 3 })).unwrap()),
+    ])
+}
+
+fn seeded() -> (tempfile::TempDir, PersistentStore) {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = PersistentStore::open(directory.path()).unwrap();
+    seed_library(&mut store);
+    (directory, store)
+}
+
+fn header(store: &PersistentStore, request_id: &str) -> Header {
+    Header {
+        binding_authority: store.lww_binding_authority().unwrap(),
+        request_id: request_id.into(),
+    }
+}
+
+fn device_sections() -> Vec<crate::persistent_store::device_store::sections::PreparedSectionRows> {
+    use crate::persistent_store::device_store::hypa::HypaEmbeddingWrite;
+    use risunest_external_storage_format::section::SectionKind;
+    let directory = tempfile::tempdir().unwrap();
+    let mut source = PersistentStore::open(directory.path()).unwrap();
+    let device = source.device_store_mut().unwrap();
+    device
+        .write_hypa_embeddings(&[HypaEmbeddingWrite {
+            cache_key: "a".repeat(64),
+            producer: "synthetic".into(),
+            model: "golden".into(),
+            endpoint: None,
+            preprocess_version: 1,
+            dimensions: 1,
+            vector: vec![0, 0, 128, 63],
+            metadata: None,
+        }])
+        .unwrap();
+    device.write_setting("accountst", &json!("golden")).unwrap();
+    device
+        .capture_backup_sections(&[SectionKind::Hypa, SectionKind::LocalPlugins, SectionKind::LocalSettings])
+        .unwrap()
+}
+
+fn binding_stamp() -> Stamp {
+    Stamp {
+        physical_ms: 7.into(),
+        logical: 0,
+        writer_id: "00000000-0000-4000-8000-000000000001".into(),
+    }
+}
+
+fn binding_change(key: &[&str], value: Value) -> Change {
+    Change {
+        key: unit_key(key).unwrap(),
+        stamp: binding_stamp(),
+        value: inline(&value).unwrap(),
+    }
+}
+
+fn binding_messages(store: &PersistentStore, values: &[Value]) -> UnitValue {
+    use risunest_external_storage_format::message_pages::{repage, MessageHash};
+    use risunest_sync_wire::descriptor::RecordDescriptor;
+    let bodies = values
+        .iter()
+        .map(|value| risunest_sync_wire::payload_value::encode(value).unwrap())
+        .collect::<Vec<_>>();
+    let repaged = repage::<StoreError>(
+        &Default::default(),
+        bodies.iter().map(|body| MessageHash::from_bytes(body)).collect(),
+        0..0,
+        bodies.len(),
+        |index| Ok(bodies[index].clone()),
+    )
+    .unwrap();
+    for object in repaged.objects {
+        store.lww_put_object(&object.hash, &object.bytes).unwrap();
+    }
+    let manifest = repaged.index.manifest().encode().unwrap();
+    store.lww_put_object(&manifest.hash, &manifest.bytes).unwrap();
+    let mut descriptor = RecordDescriptor::content(manifest.hash);
+    descriptor.dependencies = repaged.index.pages.iter().map(|page| page.page.hash.clone()).collect();
+    descriptor.dependencies.sort();
+    descriptor.dependencies.dedup();
+    UnitValue::object(descriptor).unwrap()
+}
+
+fn binding_incoming(store: &PersistentStore) -> Vec<Change> {
+    let mut messages = binding_change(&["messages", "remote-char", "remote-chat"], Value::Null);
+    messages.value = binding_messages(
+        store,
+        &(0..5)
+            .map(|index| json!({ "role": "user", "data": format!("remote {index}"), "chatId": format!("r{index}") }))
+            .collect::<Vec<_>>(),
+    );
+    let mut held = binding_change(&["messages", "missing-char", "held-chat"], Value::Null);
+    held.value = binding_messages(store, &[json!({ "role": "user", "data": "held", "chatId": "h1" })]);
+    vec![
+        binding_change(&["root", "language"], json!("remote")),
+        binding_change(&["exists", "character", "remote-char"], json!({ "type": "character" })),
+        binding_change(&["character", "remote-char", "name"], json!("Remote")),
+        binding_change(&["character", "remote-char", "desc"], json!("Remote description")),
+        binding_change(&["exists", "conversation", "remote-char", "remote-chat"], json!(true)),
+        binding_change(&["conversation", "remote-char", "remote-chat", "name"], json!("Remote Chat")),
+        messages,
+        binding_change(&["exists", "conversation", "missing-char", "held-chat"], json!(true)),
+        binding_change(&["conversation", "missing-char", "held-chat", "name"], json!("Held")),
+        held,
+        binding_change(&["future", "opaque"], json!({ "untouched": true })),
+    ]
+}
+
+fn bind_target(store: &mut PersistentStore) {
+    let incoming = binding_incoming(store);
+    let source = header(store, &uuid::Uuid::new_v4().to_string());
+    let inspection = store
+        .register_lww_binding_inspection(
+            source.binding_authority,
+            &SyncTarget::Server("remote".into()),
+            "target",
+            "library",
+        )
+        .unwrap();
+    let stage = store
+        .lww_stage_binding_units(&source, &inspection, &incoming, 7.into())
+        .unwrap();
+    let state = store.lww_binding_state().unwrap();
+    let state = store
+        .switch_lww_binding(&SwitchBindingRequest {
+            header: header(store, &uuid::Uuid::new_v4().to_string()),
+            expected_selection_epoch: state.selection_epoch,
+            target: SyncTarget::Server("remote".into()),
+            inspection_id: Some(inspection),
+        })
+        .unwrap();
+    store
+        .replace_lww_binding(&ReplaceBindingRequest {
+            header: Header {
+                binding_authority: state.target_authority,
+                request_id: source.request_id.clone(),
+            },
+            expected_selection_epoch: state.selection_epoch,
+            staging_id: stage.staging_id,
+            receive_id: source.request_id,
+            target_id: "target".into(),
+            library_id: "library".into(),
+        })
+        .unwrap();
+}
+
+fn bind_new_device(store: &mut PersistentStore) {
+    let incoming = binding_incoming(store);
+    let source = header(store, &uuid::Uuid::new_v4().to_string());
+    let inspection = store
+        .register_lww_binding_inspection(
+            source.binding_authority,
+            &SyncTarget::Server("fresh-connection".into()),
+            "target",
+            "library",
+        )
+        .unwrap();
+    let staging = store
+        .lww_stage_binding_units(&source, &inspection, &incoming, 7.into())
+        .unwrap()
+        .staging_id;
+    let preparation = store.prepare_lww_new_device(&source, &staging).unwrap();
+    store.authorize_lww_new_device(&preparation.authorization_id).unwrap();
+    store
+        .lww_replace_target_as_new_device(&source, &staging, &preparation.authorization_id)
+        .unwrap();
+}
+
+// Captured at 9e3b21122, before activation stopped renaming the staged
+// generation. Every path must keep producing the same library and unit state.
+const PLAIN: &str = "c12b61487c8105f48d1ec1ed2849d91ad9231da4f85ec14e1c259d42b1d94375";
+const SOURCE_UNITS: &str = "e00456ebbb726f381130ae756420d10e0b453ac50dc6036e975eee95e093d878";
+const DEVICE_SECTIONS: &str = "1451d67a2fcf592cd1d0642665fb31459b635c0c7a18d10a071a1d9ccd342a6c";
+const TARGET: &str = "b1fb41fafb1fcd3f0f878ca457eedad663cc0832eea90812666f40b4039d8d09";
+const NEW_DEVICE: &str = "b1fb41fafb1fcd3f0f878ca457eedad663cc0832eea90812666f40b4039d8d09";
+
+#[test]
+fn plain_replacement_matches_the_golden_state() {
+    let (_directory, mut store) = seeded();
+    let stage = build_stage(&mut store);
+    let revision = store.revision().unwrap();
+    store.replace_commit(&stage, Some(revision)).unwrap();
+    assert_eq!(golden(&store, "plain"), PLAIN);
+}
+
+#[test]
+fn source_unit_replacement_matches_the_golden_state() {
+    let (_directory, mut store) = seeded();
+    let stage = build_stage(&mut store);
+    let header = header(&store, "golden-source-units");
+    store
+        .lww_commit_replacement_units(&header, &stage, Some(&source_units()))
+        .unwrap();
+    assert_eq!(golden(&store, "source-units"), SOURCE_UNITS);
+}
+
+#[test]
+fn device_section_replacement_matches_the_golden_state() {
+    let (_directory, mut store) = seeded();
+    let sections = device_sections();
+    let stage = build_stage(&mut store);
+    let header = header(&store, "golden-device-sections");
+    store
+        .lww_commit_replacement_with_device_sections(
+            &header,
+            &stage,
+            Some(&source_units()),
+            &sections.iter().collect::<Vec<_>>(),
+        )
+        .unwrap();
+    assert_eq!(golden(&store, "device-sections"), DEVICE_SECTIONS);
+}
+
+#[test]
+fn target_binding_replacement_matches_the_golden_state() {
+    let (_directory, mut store) = seeded();
+    bind_target(&mut store);
+    assert_eq!(golden(&store, "target"), TARGET);
+}
+
+#[test]
+fn new_device_replacement_matches_the_golden_state() {
+    let (_directory, mut store) = seeded();
+    bind_new_device(&mut store);
+    assert_eq!(golden(&store, "new-device"), NEW_DEVICE);
+}
+
+#[test]
+fn replacement_activation_work_counts() {
+    let (_directory, mut store) = seeded();
+    let stage = build_stage(&mut store);
+    let revision = store.revision().unwrap();
+    message_pages::reset_capture_work();
+    hash_work::reset_hash_work();
+    store.replace_commit(&stage, Some(revision)).unwrap();
+    let pages = message_pages::take_capture_work();
+    let hashes = hash_work::take_hash_work();
+    eprintln!("activation page work: {pages:?}");
+    eprintln!("activation hash work: {hashes:?}");
+}
+
+fn manifest_mismatches(store: &mut PersistentStore) -> Vec<String> {
+    let generation = active_generation(&store.connection).unwrap();
+    let conversations = store
+        .connection
+        .prepare("SELECT character_id,conversation_id FROM conversations WHERE generation=?1 ORDER BY 1,2")
+        .unwrap()
+        .query_map([&generation], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let transaction = store.connection.transaction().unwrap();
+    let mut mismatches = Vec::new();
+    for (character, conversation) in conversations {
+        let current = message_pages::current_manifest(&transaction, &generation, &character, &conversation).unwrap();
+        let captured = message_pages::capture_manifest(&transaction, &generation, &character, &conversation, None).unwrap();
+        if current != captured {
+            mismatches.push(format!("{character}/{conversation}"));
+        }
+    }
+    transaction.rollback().unwrap();
+    mismatches
+}
+
+fn chat_message(id: &str, data: &str) -> Value {
+    json!({ "role": "user", "data": data, "chatId": id })
+}
+
+#[test]
+fn active_manifests_equal_a_full_capture_after_every_mutation_kind() {
+    let (_directory, mut store, database) = open_fixture();
+    let mut results = Vec::new();
+
+    let revision = store.revision().unwrap();
+    store
+        .commit(&WorkingSetCommit {
+            conversations: Some(vec![
+                ConversationMutation::ReplaceRange {
+                    character_id: "char-a".into(),
+                    conversation_id: "conv-long".into(),
+                    start: 5,
+                    delete_count: 1,
+                    messages: vec![chat_message("edited-5", "edited")],
+                    conversation: None,
+                    configured_index: None,
+                },
+                ConversationMutation::ReplaceRange {
+                    character_id: "char-a".into(),
+                    conversation_id: "conv-short".into(),
+                    start: 2,
+                    delete_count: 0,
+                    messages: vec![chat_message("appended", "appended")],
+                    conversation: None,
+                    configured_index: None,
+                },
+            ]),
+            ..empty_working_set_commit(revision)
+        })
+        .unwrap();
+    results.push(("conversation edits", manifest_mismatches(&mut store)));
+
+    let revision = store.revision().unwrap();
+    store
+        .commit(&WorkingSetCommit {
+            delete_character_ids: Some(vec!["char-b".into()]),
+            ..empty_working_set_commit(revision)
+        })
+        .unwrap();
+    results.push(("delete_character", manifest_mismatches(&mut store)));
+
+    let mut replacement = database["characters"][1].clone();
+    replacement["chats"][0]["message"] = json!([chat_message("only", "only")]);
+    let revision = store.revision().unwrap();
+    store
+        .commit(&WorkingSetCommit {
+            replace_character: Some(replacement),
+            ..empty_working_set_commit(revision)
+        })
+        .unwrap();
+    results.push(("replace_character", manifest_mismatches(&mut store)));
+
+    let revision = store.revision().unwrap();
+    store.archive_character("char-a", revision, 10).unwrap();
+    results.push(("archive", manifest_mismatches(&mut store)));
+    let revision = store.revision().unwrap();
+    store.restore_character("char-a", revision).unwrap();
+    results.push(("restore", manifest_mismatches(&mut store)));
+
+    eprintln!("current manifest equivalence: {results:?}");
+    assert!(results.iter().all(|(_, mismatches)| mismatches.is_empty()), "{results:?}");
+}
