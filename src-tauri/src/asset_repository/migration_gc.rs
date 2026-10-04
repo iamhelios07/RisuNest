@@ -276,9 +276,12 @@ fn sweep_asset_candidates_with_local(
             return invalid_data("asset GC candidate is invalid or duplicated");
         }
         let physical = local(&candidate.object_hash)?;
-        let actual_size = physical.or(remote(&candidate.object_hash)?).ok_or_else(|| {
-            io::Error::new(ErrorKind::InvalidData, "asset GC candidate is missing")
-        })?;
+        let actual_size = match physical {
+            Some(size) => size,
+            None => remote(&candidate.object_hash)?.ok_or_else(|| {
+                io::Error::new(ErrorKind::InvalidData, "asset GC candidate is missing")
+            })?,
+        };
         if actual_size != candidate.byte_size {
             return invalid_data("asset GC candidate size mismatch");
         }
@@ -477,6 +480,34 @@ mod tests {
         let error = dry_run_mark_and_sweep(&cas, [], [roots], 100, 10)
             .expect_err("corrupt root manifest must abort the mark pass");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn sweep_asks_for_a_remote_source_only_when_the_local_file_is_missing() {
+        let directory = tempfile::tempdir().expect("temporary repository");
+        let cas = PayloadCas::new(directory.path()).expect("open payload CAS");
+        let local = cas.prepare_bytes(b"local-candidate").unwrap();
+        let remote_only = AssetGcCandidate {
+            object_hash: "ab".repeat(32),
+            byte_size: 7,
+            created_at_ms: 0,
+        };
+        let asked = std::cell::RefCell::new(Vec::new());
+        let report = super::dry_run_mark_and_sweep_with_remote(
+            &cas,
+            [candidate(&local, 0), remote_only.clone()],
+            [AssetRootSet::default()],
+            100,
+            10,
+            |hash| {
+                asked.borrow_mut().push(hash.to_owned());
+                Ok((hash == remote_only.object_hash).then_some(remote_only.byte_size))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(asked.into_inner(), vec![remote_only.object_hash]);
+        assert_eq!(report.potential_delete_hashes, vec![local.content_hash]);
     }
 
     fn candidate(
