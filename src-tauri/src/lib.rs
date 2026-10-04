@@ -48,6 +48,8 @@ mod publication_upload;
     target_os = "macos"
 ))]
 mod regex_shadow;
+#[cfg(not(target_os = "android"))]
+mod renderer_recovery;
 mod server_sync;
 mod trust_boundary;
 #[cfg(test)]
@@ -266,6 +268,10 @@ fn builder_with_main_window(
     let mut builder = tauri::Builder::default()
         .manage(native_startup_state)
         .plugin(tauri_plugin_opener::init());
+    #[cfg(not(target_os = "android"))]
+    {
+        builder = builder.manage(renderer_recovery::RendererRecovery::default());
+    }
     #[cfg(desktop)]
     {
         // Reject a second process before plugins with startup side effects run.
@@ -361,6 +367,7 @@ fn builder_with_main_window(
             if webview.label() == "main"
                 && matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
             {
+                renderer_recovery::document_started(webview.app_handle());
                 if let Some(state) = webview.try_state::<persistent_store::PersistentStoreState>() {
                     if let Err(error) = state.reset_renderer_session() {
                         crate::nlog!(
@@ -413,6 +420,8 @@ fn builder_with_main_window(
                 ios_lifecycle::main_document_started(webview.app_handle());
                 #[cfg(target_os = "macos")]
                 macos_lifecycle::document_started(webview.app_handle());
+                #[cfg(target_os = "linux")]
+                renderer_recovery::document_started(webview.app_handle());
                 if let Some(state) = webview.try_state::<persistent_store::PersistentStoreState>() {
                     if let Err(error) = state.reset_renderer_session() {
                         crate::nlog!(
@@ -684,6 +693,10 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         opened_files::desktop_relaunch,
         #[cfg(windows)]
         windows_session::desktop_flush_complete,
+        #[cfg(any(windows, target_os = "linux"))]
+        renderer_recovery::desktop_close_ack,
+        #[cfg(not(target_os = "android"))]
+        renderer_recovery::renderer_recovery_take,
         native_startup_status,
         app_update::commands::app_update_environment,
         app_update::commands::app_update_check,
@@ -943,8 +956,11 @@ pub fn handle_run_event(_app: &tauri::AppHandle, _event: tauri::RunEvent) {
     #[cfg(desktop)]
     if matches!(&_event, tauri::RunEvent::Exit) { opened_files::restart_on_exit(_app); }
     #[cfg(any(windows, target_os = "linux"))]
-    if matches!(&_event, tauri::RunEvent::WindowEvent { label, event: tauri::WindowEvent::CloseRequested { .. }, .. } if label == "main") {
-        cancel_incomplete_boot(_app);
+    if let tauri::RunEvent::WindowEvent { label, event: tauri::WindowEvent::CloseRequested { api, .. }, .. } = &_event {
+        if label == "main" {
+            cancel_incomplete_boot(_app);
+            renderer_recovery::on_main_close_requested(_app, api);
+        }
     }
     #[cfg(target_os = "ios")]
     if let tauri::RunEvent::Opened { urls } = &_event {

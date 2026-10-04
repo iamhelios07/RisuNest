@@ -103,6 +103,7 @@ import { markBootStage, markBootSuspect } from './storage/bootAttempt'
 import {
     finishBoot,
     isStartupExcluded,
+    takeRendererRecovery,
     type RecoveryExclusion,
 } from './storage/recoveryMode.svelte'
 import {
@@ -824,6 +825,13 @@ export async function loadData() {
         registerAndroidScreenshotPublicationRecovery()
         LoadingStatusState.startedAt = null
         loadedStore.set(true)
+        if (isTauri && !isTauriAndroid) {
+            void takeRendererRecovery().then(async (recovered) => {
+                if (!recovered) return
+                await waitAlert()
+                alertNormal(language.risuNest.startup.rendererRecovered)
+            })
+        }
         setTimeout(() => {
             void runtime.expirePersistentTrash().catch((error) => console.error('Trash expiry failed', error))
         }, 0)
