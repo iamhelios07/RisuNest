@@ -2,7 +2,7 @@ import { offerHtmlClipboardExport } from './htmlClipboardExport'
 import { defaultChatToggleBinding } from './toggleBindings'
 import { get, writable } from "svelte/store";
 import { saveImage, type character, type Chat, defaultSdDataFunc, type loreBook, getDatabase, getCharacterByIndex, setCharacterByIndex } from "./storage/database.svelte";
-import { alertAddCharacter, alertCheckboxConfirm, alertError, alertNormal, alertSelect, alertStore, alertToast, alertWait } from "./alert";
+import { alertAddCharacter, alertCheckboxConfirm, alertClear, alertError, alertNormal, alertSelect, alertStore, alertToast, alertWait } from "./alert";
 import { language } from "../lang";
 import { isArchivedCharacter } from "./storage/workingSetCatalog";
 import { restoreArchivedCharacterWithConfirmation } from "./storage/characterArchive";
@@ -883,10 +883,7 @@ export async function makeGroupImage() {
         const uri = canvas.toDataURL()
         canvas.remove()
         db.characters[charID].image = await saveImage(dataURLtoBuffer(uri));
-        alertStore.set({
-            type: 'none',
-            msg: ''
-        })
+        alertClear()
     } catch (error) {
         alertError(error)
     }
