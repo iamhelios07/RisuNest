@@ -293,7 +293,6 @@ pub(crate) async fn external_lww_stage_binding(
 pub(crate) async fn external_lww_publish(
     app: AppHandle,
     request: Request,
-    initial: bool,
 ) -> Result<PublicationResult> {
     logged("external_lww_publish", async move {
         let state = app.state::<crate::persistent_store::PersistentStoreState>();
@@ -312,17 +311,10 @@ pub(crate) async fn external_lww_publish(
                 return Err(ProviderError::new(ErrorKind::PreconditionFailed));
             }
         }
-        if initial {
-            let mut after = None;
-            loop {
-                let page = store
-                    .lww_queue_unit_state_page(&request.header, after.as_ref(), 4096)
-                    .map_err(runtime::local_error)?;
-                if !page.has_more {
-                    break;
-                }
-                after = page.after_key;
-            }
+        if request.exit_target.is_none() {
+            store
+                .lww_finish_initial_publication(&request.header)
+                .map_err(runtime::local_error)?;
         }
         let Session { engine, cancel, .. } = &mut *session;
         let result = engine

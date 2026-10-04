@@ -1336,6 +1336,10 @@ impl PersistentStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         super::sync_selection::apply_binding_selection(&tx, change)?;
+        tx.execute("DELETE FROM lww_initial_publication", [])?;
+        if change.initial_publication {
+            tx.execute("INSERT INTO lww_initial_publication VALUES(1,?1)", [new.0.to_string()])?;
+        }
         if retain {
             carry_units(&tx, header.binding_authority, new)?;
             for request_id in &dropped {
@@ -2529,6 +2533,8 @@ fn carry_device_progress(db: &Connection, old: DecimalU64, new: DecimalU64) -> S
 }
 #[cfg(test)]
 thread_local! {
+    static INITIAL_QUEUE_PAGE: std::cell::Cell<usize> = const { std::cell::Cell::new(4096) };
+    static INITIAL_QUEUE_COMMITS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static SWITCH_LIBRARY_COMMITTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 fn reset_target_device(
@@ -2980,8 +2986,69 @@ impl PersistentStore {
                 }
             }
             tx.commit()?;
+            #[cfg(test)]
+            if INITIAL_QUEUE_COMMITS.with(|left| match left.get() {
+                Some(1) => {
+                    left.set(None);
+                    true
+                }
+                Some(count) => {
+                    left.set(Some(count - 1));
+                    false
+                }
+                None => false,
+            }) {
+                return Err(error("initial-publication-stopped"));
+            }
         }
         Ok(page)
+    }
+    /// Queues every unit of the library when the switch to the current target
+    /// left that owed, a page at a time, and clears the obligation after the
+    /// last page. Queueing skips published versions, so a stopped queue starts
+    /// again from the first page.
+    pub(crate) fn lww_finish_initial_publication(&mut self, header: &Header) -> StoreResult<bool> {
+        validate_header(header)?;
+        if self.lww_binding_authority()? != header.binding_authority {
+            return Err(error("stale-binding-authority"));
+        }
+        let owed: Option<String> = self
+            .connection
+            .query_row("SELECT authority FROM lww_initial_publication WHERE singleton=1", [], |r| r.get(0))
+            .optional()?;
+        let Some(owed) = owed else {
+            return Ok(false);
+        };
+        if owed != header.binding_authority.0.to_string() {
+            self.connection.execute("DELETE FROM lww_initial_publication WHERE authority=?1", [owed])?;
+            return Ok(false);
+        }
+        #[cfg(not(test))]
+        let limit = 4096;
+        #[cfg(test)]
+        let limit = INITIAL_QUEUE_PAGE.with(std::cell::Cell::get);
+        let mut after = None;
+        loop {
+            let page = self.lww_queue_unit_state_page(header, after.as_ref(), limit)?;
+            if !page.has_more {
+                break;
+            }
+            after = page.after_key;
+        }
+        self.connection.execute("DELETE FROM lww_initial_publication WHERE authority=?1", [owed])?;
+        Ok(true)
+    }
+    #[cfg(test)]
+    pub(crate) fn stop_initial_queue_after_commits(&self, page: usize, commits: usize) {
+        INITIAL_QUEUE_PAGE.with(|limit| limit.set(page));
+        INITIAL_QUEUE_COMMITS.with(|left| left.set(Some(commits)));
+    }
+    #[cfg(test)]
+    pub(crate) fn lww_owed_initial_publication(&self) -> StoreResult<Option<String>> {
+        Ok(self
+            .connection
+            .query_row("SELECT authority FROM lww_initial_publication WHERE singleton=1", [], |r| r.get(0))
+            .optional()?)
     }
 }
 

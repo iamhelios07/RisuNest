@@ -372,6 +372,7 @@ fn server_held_publication_keeps_captured_source_and_rejects_changed_authority()
                     let target = crate::persistent_store::sync_selection::SyncTarget::External("changed-source-target".into());
                     let inspection = store.register_lww_binding_inspection(state.target_authority, &target, "synthetic-next-repository", "synthetic-next-library").unwrap();
                     store.switch_lww_binding(&crate::persistent_store::sync_selection::SwitchBindingRequest {
+                        initial_publication: false,
                         header: crate::persistent_store::lww::Header { binding_authority: state.target_authority, request_id: "frozen-source-authority".into() },
                         expected_selection_epoch: state.selection_epoch, target, inspection_id: Some(inspection),
                     }).unwrap();
@@ -917,6 +918,7 @@ fn publisher_is_distinct_from_forwarded_unit_issuer() {
         let state =
             f.b.switch_lww_binding(
                 &crate::persistent_store::sync_selection::SwitchBindingRequest {
+                    initial_publication: false,
                     header: crate::persistent_store::lww::Header {
                         binding_authority: before.target_authority,
                         request_id: "forward-bind".into(),
@@ -1435,6 +1437,7 @@ fn switching_targets_uses_independent_sequences_and_ack_receipts_without_restamp
         let bound =
             f.a.switch_lww_binding(
                 &crate::persistent_store::sync_selection::SwitchBindingRequest {
+                    initial_publication: false,
                     header: crate::persistent_store::lww::Header {
                         binding_authority: before.target_authority,
                         request_id: "different-target".into(),
@@ -1667,6 +1670,7 @@ fn bind_external(store: &mut PersistentStore, engine: &ExternalLwwEngine, target
         _ => Some(store.register_lww_binding_inspection(before.target_authority, target, &engine.repository.connection_identity, &engine.library).unwrap()),
     };
     store.switch_lww_binding(&SwitchBindingRequest {
+        initial_publication: false,
         header: crate::persistent_store::lww::Header { binding_authority: before.target_authority, request_id: uuid::Uuid::new_v4().to_string() },
         expected_selection_epoch: before.selection_epoch, target: target.clone(), inspection_id,
     }).unwrap().target_authority
@@ -1835,6 +1839,7 @@ fn bind_elsewhere(store: &mut PersistentStore) -> DecimalU64 {
     let before = store.lww_binding_state().unwrap();
     let inspection_id = store.register_lww_binding_inspection(before.target_authority, &target, "synthetic-account/elsewhere", "synthetic-elsewhere-library").unwrap();
     store.switch_lww_binding(&SwitchBindingRequest {
+        initial_publication: false,
         header: crate::persistent_store::lww::Header { binding_authority: before.target_authority, request_id: uuid::Uuid::new_v4().to_string() },
         expected_selection_epoch: before.selection_epoch, target, inspection_id: Some(inspection_id),
     }).unwrap().target_authority
@@ -1953,6 +1958,38 @@ fn returning_to_a_repository_without_its_pending_state_counts_a_landed_segment_w
         f.sender.receive_and_apply(&mut f.a, rebound, &[], &Cancellation::default()).await.unwrap();
         assert_eq!(f.a.read_root(None).unwrap().value["language"], "ko");
         assert_eq!(f.a.read_root(None).unwrap().value["askRemoval"], true);
+        f.receive_b().await;
+        assert_eq!(f.b.read_root(None).unwrap().value["language"], "ko");
+        assert_eq!(f.b.read_root(None).unwrap().value["askRemoval"], true);
+    })
+}
+#[test]
+fn an_owed_initial_publication_reaches_the_repository_after_a_stop() {
+    run(async {
+        use crate::persistent_store::sync_selection::{SwitchBindingRequest, SyncTarget};
+        let mut f = CycleFixture::new();
+        set(&mut f.a, &["root", "language"], serde_json::json!("ko"));
+        set(&mut f.a, &["root", "askRemoval"], serde_json::json!(true));
+        let before = f.a.lww_binding_state().unwrap();
+        let target = SyncTarget::External("repository".into());
+        let inspection_id = f.a.register_lww_binding_inspection(before.target_authority, &target, &f.sender.repository.connection_identity, &f.sender.library).unwrap();
+        let authority = f.a.switch_lww_binding(&SwitchBindingRequest {
+            header: crate::persistent_store::lww::Header { binding_authority: before.target_authority, request_id: uuid::Uuid::new_v4().to_string() },
+            expected_selection_epoch: before.selection_epoch, target, inspection_id: Some(inspection_id), initial_publication: true,
+        }).unwrap().target_authority;
+        let header = crate::persistent_store::lww::Header { binding_authority: authority, request_id: "synthetic-initial".into() };
+        // Stops between the library and device commits of a page, and between pages.
+        for commits in [1, 2, 3] {
+            f.a.stop_initial_queue_after_commits(1, commits);
+            assert!(f.a.lww_finish_initial_publication(&header).is_err());
+            assert!(f.a.lww_owed_initial_publication().unwrap().is_some());
+        }
+        f.a.stop_initial_queue_after_commits(1, usize::MAX);
+        assert!(f.a.lww_finish_initial_publication(&header).unwrap());
+        assert_eq!(f.a.lww_owed_initial_publication().unwrap(), None);
+        assert!(!f.a.lww_finish_initial_publication(&header).unwrap());
+        f.sender.publish(&mut f.a, authority, &[], &Cancellation::default()).await.unwrap();
+        assert!(f.a.lww_read_outbox(authority, 100).unwrap().entries.is_empty());
         f.receive_b().await;
         assert_eq!(f.b.read_root(None).unwrap().value["language"], "ko");
         assert_eq!(f.b.read_root(None).unwrap().value["askRemoval"], true);

@@ -217,7 +217,7 @@ it.each(['request', 'authority'])('rejects wrong initialized switch %s proof bef
     h.dependencies.native.switchTarget = async (...args) => { await switchTarget(...args); throw Error('response lost') }
     await expect(h.flow.bind(h.target, h.transport)).rejects.toThrow('response lost')
     if (change === 'authority') h.changeAuthority()
-    else h.dependencies.native.switchTarget = (previous, target, inspection) => switchTarget(previous, target, inspection, 'different-request')
+    else h.dependencies.native.switchTarget = (previous, target, inspection, _requestId, initialPublication) => switchTarget(previous, target, inspection, 'different-request', initialPublication)
     expect((await h.runtime.retryCommittedWorkingSetRefresh())?.projection).toBe('refresh-required')
     expect(h.events).not.toContain('projection')
     expect(h.transport.publishInitialSharedState).not.toHaveBeenCalled()
@@ -269,7 +269,7 @@ it.each(['request', 'target'])('rejects changed %s in an uncertain switch replay
     h.dependencies.native.switchTarget = async (...args) => { await switchTarget(...args); throw Error('response lost') }
     await expect(h.flow.bind(h.target, h.transport)).rejects.toThrow('response lost')
     h.dependencies.native.switchTarget = async (...args) => {
-        if (change === 'request') return switchTarget(args[0], args[1], args[2], 'changed-request')
+        if (change === 'request') return switchTarget(args[0], args[1], args[2], 'changed-request', args[4])
         return { ...await switchTarget(...args), target: { kind: 'external', connectionId: 'unrelated' } }
     }
     expect((await h.runtime.retryCommittedWorkingSetRefresh())?.projection).toBe('refresh-required')

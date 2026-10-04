@@ -182,14 +182,7 @@ const transport: SyncBindingTransport = {
     async publishInitialSharedState(c) {
         context = c
         await invoke('server_sync_lww_activate', { request: header() })
-        let afterKey: string | null = null
-        for (;;) {
-            c.signal.throwIfAborted()
-            if (c !== context) throw new Error('Sync binding changed')
-            const page = await invoke<{ afterKey: string | null; hasMore: boolean }>('pds_lww_queue_unit_state_page', { request: { ...header(), afterKey, limit: '256' } })
-            if (!page.hasMore) break
-            afterKey = page.afterKey
-        }
+        checkContext(c)
         foreground = document.visibilityState !== 'hidden'
         await pushAvailable(c, true)
     },

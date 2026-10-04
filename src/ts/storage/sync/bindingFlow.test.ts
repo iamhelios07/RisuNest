@@ -6,14 +6,16 @@ import { createMutationGatedPersistentDataStore } from '../mutationGatedPersiste
 
 function setup(options: Partial<InspectedSyncTarget> & { nonDefault?: boolean; confirm?: boolean } = {}) {
     const events: string[] = []
+    const initialPublications: boolean[] = []
     let state: SyncBindingState = { target: { kind: 'none' }, targetAuthority: '0', selectionEpoch: 'old', libraryId: null, progress: null }
     const record = (name: string) => async () => { events.push(name) }
     const deps: SyncBindingDependencies = {
         native: {
             state: async () => structuredClone(state),
             assertAuthority: async expected => { if (expected.targetAuthority !== state.targetAuthority) throw Error('stale authority') },
-            switchTarget: async (expected, target, inspection) => {
+            switchTarget: async (expected, target, inspection, _requestId, initialPublication) => {
                 if (expected.targetAuthority !== state.targetAuthority) throw Error('stale authority')
+                initialPublications.push(initialPublication)
                 events.push('switch'); state = { ...state, target, libraryId: inspection?.libraryId ?? state.libraryId, targetAuthority: String(Number(state.targetAuthority) + 1) }; return structuredClone(state)
             },
         },
@@ -31,7 +33,7 @@ function setup(options: Partial<InspectedSyncTarget> & { nonDefault?: boolean; c
         pullAvailableState: async () => { events.push('stage'); return { targetId: 'target', libraryId: 'library', stagingId: 'validated', receiveId: 'receive' } },
         replaceFromTarget: record('activate-database'), publishInitialSharedState: record('publish'), resumeBinding: record('resume'), fenceOldJobs: record('jobs-fence'),
     }
-    return { events, deps, transport, flow: createSyncBindingFlow(deps), changeAuthority: () => { state.targetAuthority = 'changed' }, setState: (next: SyncBindingState) => { state = next } }
+    return { events, initialPublications, deps, transport, flow: createSyncBindingFlow(deps), changeAuthority: () => { state.targetAuthority = 'changed' }, setState: (next: SyncBindingState) => { state = next } }
 }
 const target = { kind: 'server', connectionId: 'connection' } as const
 
@@ -406,6 +408,42 @@ describe('transport-neutral first binding', () => {
         await s.flow.bind(target, s.transport)
         expect(s.events).not.toContain('publish'); expect(s.events).not.toContain('plugin-fence')
         expect(s.events.filter(event => event === 'resume')).toHaveLength(1)
+        expect(s.initialPublications).toEqual([false])
+    })
+    it('decides the initial publication while writes are paused and carries it with the switch', async () => {
+        const s = setup({ empty: true })
+        let shared = true
+        s.deps.hasNonDefaultSharedData = async () => { s.events.push('shared-check'); return shared }
+        s.deps.refreshActivatedLibrary = async () => { s.events.push('refresh'); shared = false }
+        await s.flow.bind(target, s.transport)
+        expect(s.events).toEqual(['inspect', 'jobs-fence', 'pause-flush', 'shared-check', 'gate', 'switch', 'refresh', 'publish', 'resume'])
+        expect(s.initialPublications).toEqual([true])
+    })
+    it.each([
+        { name: 'a replacement', options: { empty: false } },
+        { name: 'a same-library rebind', options: { empty: false, previouslyBoundLibrary: true } },
+    ])('owes no initial publication for $name', async ({ options }) => {
+        const s = setup(options)
+        const check = vi.spyOn(s.deps, 'hasNonDefaultSharedData')
+        await s.flow.bind(target, s.transport)
+        expect(s.initialPublications).toEqual([false])
+        expect(check).not.toHaveBeenCalled()
+        expect(s.events).not.toContain('publish')
+    })
+    it('resumes a binding whose switch already committed without deciding or publishing again', async () => {
+        const s = setup({ empty: true })
+        s.setState({ target, targetAuthority: '5', selectionEpoch: 'switched', libraryId: 'library', progress: null })
+        const check = vi.spyOn(s.deps, 'hasNonDefaultSharedData')
+        await s.flow.bind(target, s.transport)
+        expect(s.events).toEqual(['inspect', 'jobs-fence', 'pause-flush', 'gate', 'resume'])
+        expect(check).not.toHaveBeenCalled()
+        expect(s.initialPublications).toEqual([])
+    })
+    it('unbinding owes no initial publication', async () => {
+        const s = setup({ previouslyBoundLibrary: true })
+        s.setState({ target, targetAuthority: '5', selectionEpoch: 'bound', libraryId: 'library', progress: null })
+        await s.flow.unbind()
+        expect(s.initialPublications).toEqual([false])
     })
     it('same-library recovery resumes without staging or resetting namespaces', async () => {
         const s = setup({ previouslyBoundLibrary: true }); await s.flow.bind(target, s.transport)

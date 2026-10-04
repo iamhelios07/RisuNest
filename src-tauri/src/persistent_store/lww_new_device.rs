@@ -295,6 +295,7 @@ impl PersistentStore {
         Ok((
             changes,
             BindingSelectionChange {
+                initial_publication: false,
                 expected_epoch: source_epoch,
                 new_epoch: Uuid::new_v4().to_string(),
                 target: target_connection,

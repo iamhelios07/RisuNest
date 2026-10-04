@@ -2053,6 +2053,7 @@ fn detach_for_new_authority(store: &mut PersistentStore) -> DecimalU64 {
     let selection = super::super::sync_selection::read(&store.connection).unwrap();
     let binding = store.lww_binding_authority().unwrap();
     let change = super::super::sync_selection::BindingSelectionChange {
+        initial_publication: false,
         expected_epoch: selection.epoch,
         new_epoch: Uuid::new_v4().to_string(),
         target: super::super::sync_selection::SyncTarget::None,

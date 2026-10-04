@@ -22,6 +22,7 @@ fn catalog(store: &PersistentStore, staging: &str) -> Value {
 fn activate(store: &mut PersistentStore, header: &Header, inspection: &str, stage: &BindingUnitStage) {
     let state = store.lww_binding_state().unwrap();
     let state = store.switch_lww_binding(&SwitchBindingRequest {
+        initial_publication: false,
         header: Header { binding_authority: state.target_authority, request_id: uuid::Uuid::new_v4().to_string() },
         expected_selection_epoch: state.selection_epoch, target: SyncTarget::Server("remote".into()), inspection_id: Some(inspection.into()),
     }).unwrap();
@@ -233,6 +234,7 @@ fn uncertain_target_activation_replays_device_intent_without_replacing_later_edi
     let stage=store.lww_stage_binding_units(&header,&inspection,&incoming,7.into()).unwrap();
     let state=store.lww_binding_state().unwrap();
     let state=store.switch_lww_binding(&SwitchBindingRequest {
+        initial_publication: false,
         header:Header{binding_authority:state.target_authority,request_id:uuid::Uuid::new_v4().to_string()},expected_selection_epoch:state.selection_epoch,
         target:SyncTarget::Server("remote".into()),inspection_id:Some(inspection.clone()),
     }).unwrap();
@@ -274,6 +276,7 @@ fn missing_source_or_status_proof_fails_before_switch_activation_or_writer_reser
         let clock=serde_json::to_value(store.lww_clock_state().unwrap()).unwrap(); let state=store.lww_binding_state().unwrap();
         assert!(store.lww_stage_binding_units(&header,&inspection,&incoming,7.into()).is_err());
         assert!(store.switch_lww_binding(&SwitchBindingRequest {
+            initial_publication: false,
             header:Header {binding_authority:state.target_authority,request_id:uuid::Uuid::new_v4().to_string()},expected_selection_epoch:state.selection_epoch.clone(),target:SyncTarget::Server("remote".into()),inspection_id:Some(inspection),
         }).is_err());
         assert!(store.prepare_lww_new_device(&header,&stage.staging_id).is_err());
@@ -293,6 +296,7 @@ fn missing_source_after_switch_rejects_replacement_without_creating_intent_or_ch
     let stage=store.lww_stage_binding_units(&header,&inspection,&incoming,7.into()).unwrap();
     let state=store.lww_binding_state().unwrap();
     let state=store.switch_lww_binding(&SwitchBindingRequest {
+        initial_publication: false,
         header:Header{binding_authority:state.target_authority,request_id:uuid::Uuid::new_v4().to_string()},expected_selection_epoch:state.selection_epoch,target:SyncTarget::Server("remote".into()),inspection_id:Some(inspection),
     }).unwrap();
     store.connection.execute("DELETE FROM lww_binding_sources WHERE staging_id=?1",[&stage.staging_id]).unwrap();
@@ -314,9 +318,10 @@ fn pending_switch_journal_rechecks_missing_source_before_authority_reservation()
     let stage=store.lww_stage_binding_units(&header,&inspection,&incoming,7.into()).unwrap();
     let state=store.lww_binding_state().unwrap();
     let request=SwitchBindingRequest {
+        initial_publication: false,
         header:Header{binding_authority:state.target_authority,request_id:uuid::Uuid::new_v4().to_string()},expected_selection_epoch:state.selection_epoch.clone(),target:SyncTarget::Server("remote".into()),inspection_id:Some(inspection.clone()),
     };
-    let selection=BindingSelectionChange {expected_epoch:state.selection_epoch.clone(),new_epoch:uuid::Uuid::new_v4().to_string(),target:request.target.clone(),library_id:Some("library".into()),target_id:Some("target".into()),inspection_id:Some(inspection)};
+    let selection=BindingSelectionChange { initial_publication: false,expected_epoch:state.selection_epoch.clone(),new_epoch:uuid::Uuid::new_v4().to_string(),target:request.target.clone(),library_id:Some("library".into()),target_id:Some("target".into()),inspection_id:Some(inspection)};
     store.connection.execute("INSERT INTO lww_binding_switch_requests VALUES(?1,?2,?3)",params![request.header.request_id,serde_json::to_string(&request).unwrap(),serde_json::to_string(&selection).unwrap()]).unwrap();
     store.connection.execute("DELETE FROM lww_binding_sources WHERE staging_id=?1",[&stage.staging_id]).unwrap();
     assert!(store.switch_lww_binding(&request).is_err());

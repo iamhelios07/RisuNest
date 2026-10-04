@@ -655,6 +655,7 @@ pub(crate) fn activate(
         store.lww_finish_receive(&receive.header)?;
         core.acknowledge_cursor(stage.cursor)?;
     }
+    store.lww_finish_initial_publication(header)?;
     Ok(())
 }
 
@@ -681,6 +682,7 @@ pub(crate) fn first_binding_cycle(
         if inspected.empty { return Err(SyncError::new("fixture-nonempty-target-required",409)); }
         let staged = stage(store, &super::lww_tests::header(store), &inspected.inspection_id, None)?;
         let next = store.switch_lww_binding(&crate::persistent_store::sync_selection::SwitchBindingRequest {
+            initial_publication: false,
             header: super::lww_tests::header(store),
             expected_selection_epoch: original.selection_epoch,
             target: SyncTarget::Server("server".into()),
@@ -776,6 +778,7 @@ mod tests {
         let state = store
             .switch_lww_binding(
                 &crate::persistent_store::sync_selection::SwitchBindingRequest {
+                    initial_publication: false,
                     header: request,
                     expected_selection_epoch: original.selection_epoch,
                     target: SyncTarget::Server("server".into()),
@@ -834,6 +837,7 @@ mod tests {
         let next = target
             .switch_lww_binding(
                 &crate::persistent_store::sync_selection::SwitchBindingRequest {
+                    initial_publication: false,
                     header: header(&target),
                     expected_selection_epoch: original.selection_epoch,
                     target: SyncTarget::Server("server".into()),
@@ -1014,6 +1018,7 @@ mod tests {
         let original = store.lww_binding_state().unwrap();
         store
             .switch_lww_binding(&crate::persistent_store::sync_selection::SwitchBindingRequest {
+                initial_publication: false,
                 header: header(store),
                 expected_selection_epoch: original.selection_epoch,
                 target,
@@ -1147,6 +1152,7 @@ mod tests {
         drop(client);
         let original = store.lww_binding_state().unwrap();
         let request = crate::persistent_store::sync_selection::SwitchBindingRequest {
+            initial_publication: false,
             header: header(&store),
             expected_selection_epoch: original.selection_epoch,
             target: SyncTarget::None,
@@ -1301,6 +1307,91 @@ mod tests {
     fn resume(store: &mut PersistentStore) {
         let request = header(store);
         activate(store, &request, None).unwrap();
+    }
+    fn switch_owing_initial_publication(store: &mut PersistentStore, inspection_id: String) -> Header {
+        let original = store.lww_binding_state().unwrap();
+        let state = store
+            .switch_lww_binding(&crate::persistent_store::sync_selection::SwitchBindingRequest {
+                header: header(store),
+                expected_selection_epoch: original.selection_epoch,
+                target: SyncTarget::Server("server".into()),
+                inspection_id: Some(inspection_id),
+                initial_publication: true,
+            })
+            .unwrap();
+        Header { binding_authority: state.target_authority, request_id: uuid::Uuid::new_v4().to_string() }
+    }
+    fn server_keys(server: &LocalServerFixture, config: &super::super::client::ServerConfig) -> std::collections::BTreeSet<String> {
+        let device = server.server.authenticate(&config.library_id, &config.token).unwrap();
+        let pin = server.server.create_state_pin(&device).unwrap();
+        let page = server.server.state_page(&device, &pin.pin_id, None, 1024).unwrap();
+        server.server.release_state_pin(&device, &pin.pin_id).unwrap();
+        assert!(page.next_key.is_none());
+        page.items.into_iter().map(|item| item.key.as_str().to_owned()).collect()
+    }
+    #[test]
+    fn an_initial_publication_stopped_between_pages_or_commits_finishes_when_the_binding_resumes() {
+        use crate::server_sync::lww_tests::drain_publications;
+        let mut published = Vec::new();
+        for stop in [None, Some(1), Some(2), Some(3)] {
+            let server = LocalServerFixture::new();
+            let (root, mut a) = local();
+            save(&mut a, &["root", "language"], serde_json::json!("ko"));
+            save(&mut a, &["root", "askRemoval"], serde_json::json!(true));
+            let config = configure(&server, &a);
+            let inspected = inspect(&a, &header(&a)).unwrap();
+            assert!(inspected.empty);
+            let request = switch_owing_initial_publication(&mut a, inspected.inspection_id);
+            assert_eq!(a.lww_owed_initial_publication().unwrap(), Some(request.binding_authority.0.to_string()));
+            if let Some(commits) = stop {
+                a.stop_initial_queue_after_commits(1, commits);
+                assert!(activate(&mut a, &request, None).is_err());
+                drop(a);
+                a = PersistentStore::open(root.path()).unwrap();
+                assert!(a.lww_owed_initial_publication().unwrap().is_some());
+                a.stop_initial_queue_after_commits(1, usize::MAX);
+                resume(&mut a);
+            } else {
+                activate(&mut a, &request, None).unwrap();
+            }
+            assert_eq!(a.lww_owed_initial_publication().unwrap(), None);
+            drain_publications(&bound_client(&a), &mut a, &[]).unwrap();
+            assert!(outbox(&a).is_empty());
+            published.push(server_keys(&server, &config));
+        }
+        assert!(published[0].iter().any(|key| key.contains("language")));
+        assert!(published[0].iter().any(|key| key.contains("askRemoval")));
+        for keys in &published[1..] {
+            assert_eq!(keys, &published[0]);
+        }
+    }
+    #[test]
+    fn a_switch_owes_an_initial_publication_only_when_asked_and_a_later_switch_clears_it() {
+        let server = LocalServerFixture::new();
+        let (_root, mut a) = local();
+        save(&mut a, &["root", "language"], serde_json::json!("ko"));
+        configure(&server, &a);
+        let inspected = inspect(&a, &header(&a)).unwrap();
+        let state = switch_to(&mut a, SyncTarget::Server("server".into()), Some(inspected.inspection_id));
+        assert_eq!(a.lww_owed_initial_publication().unwrap(), None);
+        activate(&mut a, &Header { binding_authority: state.target_authority, request_id: uuid::Uuid::new_v4().to_string() }, None).unwrap();
+        assert!(outbox(&a).is_empty());
+        switch_to(&mut a, SyncTarget::None, None);
+        let original = a.lww_binding_state().unwrap();
+        assert!(a
+            .switch_lww_binding(&crate::persistent_store::sync_selection::SwitchBindingRequest {
+                header: header(&a),
+                expected_selection_epoch: original.selection_epoch,
+                target: SyncTarget::None,
+                inspection_id: None,
+                initial_publication: true,
+            })
+            .is_err());
+        let inspected = inspect(&a, &header(&a)).unwrap();
+        switch_owing_initial_publication(&mut a, inspected.inspection_id);
+        assert!(a.lww_owed_initial_publication().unwrap().is_some());
+        switch_to(&mut a, SyncTarget::None, None);
+        assert_eq!(a.lww_owed_initial_publication().unwrap(), None);
     }
     /// A server that, once `gone` is set, answers every request with an empty 404 the way an
     /// address that no longer serves this library does.
