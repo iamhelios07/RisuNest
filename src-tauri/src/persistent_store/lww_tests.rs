@@ -1,6 +1,52 @@
 use super::*;
 use crate::persistent_store::query;
 
+/// Replacement changes as they were computed before the merge: both libraries
+/// captured into whole maps.
+pub(super) fn whole_library_changes(
+    db: &mut Connection,
+    generation: &str,
+    staging_id: &str,
+    source: Option<&BTreeMap<UnitKey, UnitValue>>,
+) -> StoreResult<(Vec<(UnitKey, UnitValue)>, BTreeSet<UnitKey>)> {
+    let before = projection::capture_all(db, generation, true)?;
+    let mut after = projection::capture_all(db, staging_id, true)?;
+    let mut overrides = BTreeSet::new();
+    for (key, value) in source.into_iter().flatten() {
+        if after.get(key) != Some(value) {
+            overrides.insert(key.clone());
+        }
+        after.insert(key.clone(), value.clone());
+    }
+    let mut keys = before.keys().chain(after.keys()).cloned().collect::<BTreeSet<_>>();
+    let stored: Vec<String> = db.prepare("SELECT key FROM lww_units")?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+    for raw in stored {
+        let key: UnitKey = wire(raw.try_into())?;
+        if projection::known(&key) {
+            keys.insert(key);
+        }
+    }
+    let mut changes = Vec::new();
+    for key in keys {
+        if archived_character(&key).is_some_and(|id| {
+            after.get(&unit_key(&["archive", &id]).unwrap()).is_some_and(|value| matches!(value, UnitValue::Object { .. }))
+        }) && source.is_none_or(|units| !units.contains_key(&key))
+        {
+            continue;
+        }
+        let value = after.get(&key).cloned().unwrap_or(UnitValue::Deleted);
+        if !matches!(value, UnitValue::Deleted) && parent_status(db, &key)? == "retired" {
+            return Err(error("retired-record-id"));
+        }
+        let prior = read_unit(db, &key)?.map(|(_, v)| v).or_else(|| before.get(&key).cloned()).unwrap_or(UnitValue::Deleted);
+        if prior != value {
+            changes.push((key, value));
+        }
+    }
+    overrides.retain(|key| changes.binary_search_by(|(changed, _)| changed.cmp(key)).is_ok());
+    Ok((changes, overrides))
+}
+
 fn store() -> (tempfile::TempDir, PersistentStore) {
     let dir = tempfile::tempdir().unwrap();
     let store = PersistentStore::open(dir.path()).unwrap();

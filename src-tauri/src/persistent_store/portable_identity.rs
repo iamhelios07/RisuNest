@@ -206,11 +206,11 @@ impl IdentityRemap {
 }
 
 impl PersistentStore {
-    pub(crate) fn remap_retired_staging(
+    pub(crate) fn remap_retired_staging<'a>(
         &mut self,
         staging: &str,
-        source: Option<&BTreeMap<UnitKey, UnitValue>>,
-    ) -> StoreResult<Option<BTreeMap<UnitKey, UnitValue>>> {
+        source: Option<&'a BTreeMap<UnitKey, UnitValue>>,
+    ) -> StoreResult<Option<std::borrow::Cow<'a, BTreeMap<UnitKey, UnitValue>>>> {
         let tx = self.connection.transaction()?;
         super::commit::validate_replace_commit(&tx, staging, None)?;
         let prior: Option<String> = tx
@@ -224,7 +224,7 @@ impl PersistentStore {
             let map: IdentityRemap = serde_json::from_str(&prior)?;
             let remapped = remap_source(&tx, &map, source)?;
             tx.commit()?;
-            return Ok(remapped);
+            return Ok(remapped.map(std::borrow::Cow::Owned));
         }
         let mut candidates = std::collections::BTreeSet::new();
         let chars = identity_rows(
@@ -312,7 +312,7 @@ impl PersistentStore {
         }
         if map.records.is_empty() && map.conversations.is_empty() {
             tx.commit()?;
-            return Ok(source.cloned());
+            return Ok(source.map(std::borrow::Cow::Borrowed));
         }
         let rows = json_rows(&tx, "SELECT value FROM root WHERE generation=?1", staging)?;
         for (_, mut value) in rows {
@@ -441,7 +441,7 @@ impl PersistentStore {
         )?;
         let remapped = remap_source(&tx, &map, source)?;
         tx.commit()?;
-        Ok(remapped)
+        Ok(remapped.map(std::borrow::Cow::Owned))
     }
 }
 

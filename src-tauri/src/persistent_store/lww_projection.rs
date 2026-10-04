@@ -640,8 +640,68 @@ fn capture_key(
     }
     Ok(())
 }
-/// With `current_manifests`, a conversation that already has a page manifest
-/// is read from it rather than paged again.
+pub(in crate::persistent_store) fn character_ids(tx: &Transaction<'_>, generation: &str) -> StoreResult<Vec<String>> {
+    let mut statement = tx.prepare("SELECT character_id FROM characters WHERE generation=?1")?;
+    let ids = statement.query_map([generation], |row| row.get(0))?.collect::<Result<_, _>>()?;
+    Ok(ids)
+}
+/// Every unit of one character, with conversations read from their stored
+/// manifests.
+pub(in crate::persistent_store) fn capture_character_units(
+    tx: &Transaction<'_>,
+    generation: &str,
+    id: &str,
+) -> StoreResult<BTreeMap<UnitKey, UnitValue>> {
+    let mut out = BTreeMap::new();
+    capture_character(tx, generation, id, true, true, &mut out)?;
+    Ok(out)
+}
+/// Every unit outside the characters: root, presets, plugin storage and
+/// asset aliases.
+pub(in crate::persistent_store) fn capture_shared(
+    tx: &Transaction<'_>,
+    generation: &str,
+) -> StoreResult<BTreeMap<UnitKey, UnitValue>> {
+    let mut out = BTreeMap::new();
+    capture_root(tx, generation, &mut out)?;
+    capture_presets(tx, generation, &mut out)?;
+    let plugins: Vec<(String, String)> = {
+        let mut s =
+            tx.prepare("SELECT owner,storage_key FROM plugin_storage WHERE generation=?1")?;
+        let v = s
+            .query_map([generation], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        v
+    };
+    for (owner, key) in plugins {
+        capture_key(tx, generation, &unit_key(&["plugin", &owner, &key])?, &mut out)?;
+    }
+    let owners: Vec<String> = {
+        let mut q = tx.prepare("SELECT DISTINCT owner FROM plugin_storage WHERE generation=?1")?;
+        let rows = q
+            .query_map([generation], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        rows
+    };
+    for owner in owners {
+        capture_plugin_order(tx, generation, &owner, &mut out)?;
+    }
+    let aliases: Vec<(String, String)> = {
+        let mut s = tx.prepare("SELECT kind,logical_key FROM asset_aliases WHERE generation=?1")?;
+        let v = s
+            .query_map([generation], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        v
+    };
+    for (kind, key) in aliases {
+        capture_key(tx, generation, &unit_key(&[&kind, &key])?, &mut out)?;
+    }
+    Ok(out)
+}
+/// The whole library in one map, as replacements captured it before they
+/// merged one character at a time. With `current_manifests`, a conversation
+/// that already has a page manifest is read from it rather than paged again.
+#[cfg(test)]
 pub(in crate::persistent_store) fn capture_all(
     db: &mut Connection,
     generation: &str,

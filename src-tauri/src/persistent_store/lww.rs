@@ -2297,13 +2297,7 @@ impl PersistentStore {
         }
         let base_revision = super::current_revision(&self.connection)?;
         let remapped_units = self.remap_retired_staging(staging_id, source_units)?;
-        let effective_source_units = remapped_units.as_ref();
-        let generation = active_generation(&self.connection)?;
-        // Incremental commits keep the active manifests current, and staging
-        // pages each conversation once all of its messages are written.
-        let before = projection::capture_all(&mut self.connection, &generation, true)?;
-        let mut after = projection::capture_all(&mut self.connection, staging_id, true)?;
-        let mut overrides = BTreeSet::new();
+        let effective_source_units = remapped_units.as_deref();
         if let Some(units) = effective_source_units {
             for (key, value) in units {
                 wire({
@@ -2313,60 +2307,13 @@ impl PersistentStore {
                     result
                 })?;
                 projection::validate_received(&self.connection, key, value)?;
-                if after.get(key) != Some(value) {
-                    overrides.insert(key.clone());
-                }
-                after.insert(key.clone(), value.clone());
             }
         }
-        let mut keys = before
-            .keys()
-            .chain(after.keys())
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let stored: Vec<String> = {
-            let mut s = self.connection.prepare("SELECT key FROM lww_units")?;
-            let v = s.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
-            v
-        };
-        for raw in stored {
-            let key: UnitKey = wire(raw.try_into())?;
-            if projection::known(&key) {
-                keys.insert(key);
-            }
-        }
-        let mut changes = Vec::new();
-        for key in keys {
-            let p = key.components();
-            let character = match p[0].as_str() {
-                "character" | "group-members" | "conversation" | "messages" => Some(p[1].as_str()),
-                "exists" if p[1] == "conversation" => Some(p[2].as_str()),
-                "order" if p[1] == "conversations" => Some(p[2].as_str()),
-                _ => None,
-            };
-            if character.is_some_and(|id| {
-                after
-                    .get(&unit_key(&["archive", id]).unwrap())
-                    .is_some_and(|value| matches!(value, UnitValue::Object { .. }))
-            }) && effective_source_units.is_none_or(|units| !units.contains_key(&key))
-            {
-                continue;
-            }
-            let value = after.get(&key).cloned().unwrap_or(UnitValue::Deleted);
-            if !matches!(value, UnitValue::Deleted)
-                && parent_status(&self.connection, &key)? == "retired"
-            {
-                return Err(error("retired-record-id"));
-            }
-            let prior = read_unit(&self.connection, &key)?
-                .map(|(_, v)| v)
-                .or_else(|| before.get(&key).cloned())
-                .unwrap_or(UnitValue::Deleted);
-            if prior != value {
-                changes.push((key, value));
-            }
-        }
-        overrides.retain(|key| changes.binary_search_by(|(changed, _)| changed.cmp(key)).is_ok());
+        let generation = active_generation(&self.connection)?;
+        let tx = self.connection.transaction()?;
+        let (changes, overrides) = replacement_changes(&tx, &generation, staging_id, effective_source_units)?;
+        tx.commit()?;
+        drop(remapped_units);
         let device_changes = if let Some(sections) = device_sections {
             let tx = self.device_store_mut()?.transaction()?;
             verify(&tx, header.binding_authority)?;
@@ -2527,6 +2474,149 @@ impl PersistentStore {
             tx.commit()?;
         }
         Ok(result)
+    }
+}
+
+/// The character whose archive decides whether a replacement carries this key.
+fn archived_character(key: &UnitKey) -> Option<String> {
+    let mut p = key.components();
+    match p[0].as_str() {
+        "character" | "group-members" | "conversation" | "messages" => Some(p.swap_remove(1)),
+        "exists" if p[1] == "conversation" => Some(p.swap_remove(2)),
+        "order" if p[1] == "conversations" => Some(p.swap_remove(2)),
+        _ => None,
+    }
+}
+
+/// The changes that make the active library's units those of the stage with
+/// the source units applied, sorted by key, and the changed keys whose source
+/// unit replaced the staged value. Both libraries are captured one character
+/// at a time and merged in key order, so only one character's units and the
+/// set of captured keys are held at once. Incremental commits keep the active
+/// manifests current, and staging pages each conversation once all of its
+/// messages are written, so captures read stored manifests.
+fn replacement_changes(
+    tx: &Transaction<'_>,
+    active: &str,
+    staging_id: &str,
+    source: Option<&BTreeMap<UnitKey, UnitValue>>,
+) -> StoreResult<(Vec<(UnitKey, UnitValue)>, BTreeSet<UnitKey>)> {
+    let sourced = |key: &UnitKey| source.and_then(|units| units.get(key));
+    let mut changes = Vec::new();
+    let mut overrides = BTreeSet::new();
+    let mut captured = BTreeSet::new();
+    let mut staged_archives = BTreeSet::new();
+    let archived = |staged_archives: &BTreeSet<String>, id: &str| -> StoreResult<bool> {
+        Ok(match sourced(&unit_key(&["archive", id])?) {
+            Some(value) => matches!(value, UnitValue::Object { .. }),
+            None => staged_archives.contains(id),
+        })
+    };
+    let mut decide = |key: UnitKey, before: Option<&UnitValue>, staged: Option<&UnitValue>, skip: bool| -> StoreResult<()> {
+        let source_value = sourced(&key);
+        if skip && source_value.is_none() {
+            return Ok(());
+        }
+        let value = source_value.or(staged).cloned().unwrap_or(UnitValue::Deleted);
+        if !matches!(value, UnitValue::Deleted) && parent_status(tx, &key)? == "retired" {
+            return Err(error("retired-record-id"));
+        }
+        let prior = read_unit(tx, &key)?
+            .map(|(_, value)| value)
+            .or_else(|| before.cloned())
+            .unwrap_or(UnitValue::Deleted);
+        if prior != value {
+            if source_value.is_some() && staged != source_value {
+                overrides.insert(key.clone());
+            }
+            changes.push((key, value));
+        }
+        Ok(())
+    };
+    let ids = projection::character_ids(tx, active)?
+        .into_iter()
+        .chain(projection::character_ids(tx, staging_id)?)
+        .collect::<BTreeSet<_>>();
+    let mut segments = ids.into_iter().map(Some).collect::<Vec<_>>();
+    segments.push(None);
+    for segment in segments {
+        let (before, staged) = match &segment {
+            Some(id) => (
+                projection::capture_character_units(tx, active, id)?,
+                projection::capture_character_units(tx, staging_id, id)?,
+            ),
+            None => (projection::capture_shared(tx, active)?, projection::capture_shared(tx, staging_id)?),
+        };
+        if let Some(id) = &segment {
+            if staged.get(&unit_key(&["archive", id])?).is_some_and(|value| matches!(value, UnitValue::Object { .. })) {
+                staged_archives.insert(id.clone());
+            }
+        }
+        let (mut before, mut staged) = (before.into_iter().peekable(), staged.into_iter().peekable());
+        loop {
+            let order = match (before.peek(), staged.peek()) {
+                (None, None) => break,
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (Some((old, _)), Some((new, _))) => old.cmp(new),
+            };
+            let (old, new) = match order {
+                std::cmp::Ordering::Less => (before.next(), None),
+                std::cmp::Ordering::Greater => (None, staged.next()),
+                std::cmp::Ordering::Equal => (before.next(), staged.next()),
+            };
+            let key = old.as_ref().or(new.as_ref()).map(|(key, _)| key.clone()).expect("one side has a key");
+            let skip = match archived_character(&key) {
+                Some(id) => archived(&staged_archives, &id)?,
+                None => false,
+            };
+            captured.insert(key.clone());
+            decide(key, old.as_ref().map(|(_, value)| value), new.as_ref().map(|(_, value)| value), skip)?;
+        }
+    }
+    let mut rest = Vec::new();
+    for key in source.into_iter().flat_map(BTreeMap::keys) {
+        if !captured.contains(key) {
+            rest.push(key.clone());
+        }
+    }
+    {
+        let mut statement = tx.prepare("SELECT key FROM lww_units")?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let key: UnitKey = wire(row.get::<_, String>(0)?.try_into())?;
+            if projection::known(&key) && !captured.contains(&key) && sourced(&key).is_none() {
+                rest.push(key);
+            }
+        }
+    }
+    drop(captured);
+    for key in rest {
+        let skip = match archived_character(&key) {
+            Some(id) => archived(&staged_archives, &id)?,
+            None => false,
+        };
+        decide(key, None, None, skip)?;
+    }
+    changes.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok((changes, overrides))
+}
+
+#[cfg(test)]
+impl PersistentStore {
+    /// The replacement changes merged one character at a time and computed
+    /// from two whole-library maps.
+    pub(crate) fn replacement_change_sets(
+        &mut self,
+        staging_id: &str,
+        source: Option<&BTreeMap<UnitKey, UnitValue>>,
+    ) -> StoreResult<[(Vec<(UnitKey, UnitValue)>, BTreeSet<UnitKey>); 2]> {
+        let generation = active_generation(&self.connection)?;
+        let tx = self.connection.transaction()?;
+        let merged = replacement_changes(&tx, &generation, staging_id, source)?;
+        tx.commit()?;
+        let whole = tests::whole_library_changes(&mut self.connection, &generation, staging_id, source)?;
+        Ok([merged, whole])
     }
 }
 

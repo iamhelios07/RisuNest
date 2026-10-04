@@ -625,6 +625,37 @@ fn activation_writes_each_character_detail_at_most_once() {
     assert_eq!(detail["firstMessage"], "Source D greeting");
 }
 
+#[test]
+fn merged_replacement_changes_equal_whole_library_maps() {
+    let mut rich = source_units();
+    for (key, value) in [
+        (&["character", "char-d", "desc"][..], inline(&json!("Source D description")).unwrap()),
+        (&["character", "archived-char", "name"][..], inline(&json!("Source archived")).unwrap()),
+        (&["exists", "conversation", "char-gone", "chat-gone"][..], UnitValue::Deleted),
+        (&["archive", "char-c"][..], UnitValue::Deleted),
+        (&["conversation", "char-a", "conv-long", "name"][..], inline(&json!("Source long")).unwrap()),
+    ] {
+        rich.insert(unit_key(key).unwrap(), value);
+    }
+    // Staging keeps the archived character, so both archive branches are reached.
+    for source in [None, Some(source_units()), Some(rich)] {
+        let (_directory, mut store) = seeded();
+        let stage = build_stage(&mut store);
+        let archived: bool = store
+            .connection
+            .query_row("SELECT archived_object IS NOT NULL FROM characters WHERE generation=?1 AND character_id='archived-char'", [&stage], |row| row.get(0))
+            .unwrap();
+        assert!(archived);
+        // A stored unit that neither library captures is deleted by the replacement.
+        let stored = unit_key(&["character", "char-stored-only", "name"]).unwrap();
+        crate::persistent_store::lww::put_unit(&store.connection, &stored, &binding_stamp(), &inline(&json!("Stored")).unwrap(), "synthetic", None).unwrap();
+        let [merged, whole] = store.replacement_change_sets(&stage, source.as_ref()).unwrap();
+        assert!(merged.0.iter().any(|(key, value)| key == &stored && matches!(value, UnitValue::Deleted)));
+        assert!(!merged.0.is_empty());
+        assert_eq!(merged, whole);
+    }
+}
+
 fn intent_rows(store: &PersistentStore, request_id: &str) -> i64 {
     store
         .device_store()
