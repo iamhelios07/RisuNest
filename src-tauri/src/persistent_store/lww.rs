@@ -1801,6 +1801,7 @@ impl PersistentStore {
                 revision
             };
             let mut worked = false;
+            let affected_before = result.affected_keys.len();
             for (id, change, previous_status) in changes {
                 let c = change.key.components();
                 let was_unprojected = matches!(previous_status.as_str(), "held" | "deferred");
@@ -1876,6 +1877,10 @@ impl PersistentStore {
             }
             if device {
                 device_store::finish_mutation_remote(&tx)?;
+            } else if result.affected_keys.len() == affected_before {
+                // Only row status moved (an echo of this device's own writes, or
+                // rows now held), so the library content and its revision stay.
+                super::content_change_index::finish_mutation(&tx)?;
             } else {
                 projection::refresh_orders(&tx, &generation, &result.affected_keys)?;
                 super::content_change_index::finish_mutation(&tx)?;

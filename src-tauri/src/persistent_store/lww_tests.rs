@@ -1116,6 +1116,68 @@ fn independent_fields_converge_in_both_delivery_orders() {
     );
 }
 
+#[test]
+fn echo_and_empty_receives_keep_the_revision_and_still_acknowledge() {
+    let (_dir, mut store) = store();
+    save(
+        &mut store,
+        vec![mutation(&["root", "openAIKey"], serde_json::json!("a"))],
+    );
+    let own = store
+        .lww_read_outbox(0.into(), 10)
+        .unwrap()
+        .entries
+        .remove(0);
+    let before = store.revision().unwrap();
+
+    let empty = receive(&mut store, "empty", vec![], vec![]);
+    assert!(empty.affected_keys.is_empty());
+    assert_eq!(empty.revision, before);
+
+    let echo = receive(
+        &mut store,
+        "echo",
+        vec![Change {
+            key: own.key.clone(),
+            stamp: own.stamp.clone(),
+            value: own.value.clone(),
+        }],
+        vec![],
+    );
+    assert!(echo.affected_keys.is_empty());
+    assert_eq!(echo.revision, before);
+    assert_eq!(store.revision().unwrap(), before);
+    assert!(store.lww_read_outbox(0.into(), 10).unwrap().entries.is_empty());
+    let status: String = store
+        .connection
+        .query_row(
+            "SELECT status FROM lww_receive_rows WHERE request_id='echo'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "done");
+    assert_eq!(
+        store.lww_receive_progress(0.into()).unwrap()[0].cursor,
+        1.into()
+    );
+
+    // The change context closed, so the next local write opens a new one.
+    let next = save(
+        &mut store,
+        vec![mutation(&["root", "openAIKey"], serde_json::json!("b"))],
+    );
+    assert_eq!(next.revision, before + 1);
+    let remote = receive(
+        &mut store,
+        "remote",
+        vec![change(&["root", "language"], 10, serde_json::json!("ko"))],
+        vec![],
+    );
+    assert_eq!(remote.affected_keys.len(), 1);
+    assert_eq!(remote.revision, before + 2);
+}
+
 fn create_conversation(store: &mut PersistentStore, char_id: &str, conv_id: &str) {
     save(
         store,
