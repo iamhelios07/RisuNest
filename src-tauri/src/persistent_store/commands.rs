@@ -1871,6 +1871,71 @@ mod tests {
     }
 
     #[test]
+    fn a_sweep_pass_reads_message_object_roots_once_until_a_reference_changes() {
+        use super::super::MessageObjectStore::{Device, Library};
+        let directory = tempdir().unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let mut hashes = Vec::new();
+        for db in [&store.connection, store.device_store().unwrap().connection()] {
+            let tx = db.unchecked_transaction().unwrap();
+            for index in 0..6 {
+                let body = format!("synthetic-orphan-object-{index}").into_bytes();
+                let hash = risunest_sync_wire::hash(&body);
+                super::super::message_pages::put_object(&tx, &hash, &body).unwrap();
+                hashes.push(hash);
+            }
+            tx.commit().unwrap();
+        }
+        hashes.sort();
+        hashes.dedup();
+        let marked = |store: &PersistentStore, hash: &str| -> bool {
+            store.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM message_page_object_marks WHERE hash=?1)", [hash], |row| row.get(0),
+            ).unwrap()
+        };
+        let batch = |store: &mut PersistentStore, target| store.sweep_message_page_objects(target, 1_000, 2).unwrap().wrapped;
+        let pass = |store: &mut PersistentStore, target| {
+            let mut batches = 1;
+            while !batch(store, target) { batches += 1; }
+            batches
+        };
+        let reference = |db: &rusqlite::Connection, capture: &str, hash: &str| {
+            db.execute("INSERT INTO external_storage_capture_files VALUES(?1,'synthetic-catalog',?2)", [capture, hash]).unwrap();
+        };
+
+        for target in [Library, Device] {
+            let computed = store.message_object_roots_computed();
+            assert!(pass(&mut store, target) >= 2);
+            assert_eq!(store.message_object_roots_computed() - computed, 1, "one pass read the roots more than once");
+        }
+        assert!(hashes.iter().all(|hash| marked(&store, hash)));
+        let computed = store.message_object_roots_computed();
+        assert!(!batch(&mut store, Library));
+        assert!(!batch(&mut store, Device));
+        assert_eq!(store.message_object_roots_computed(), computed, "the next single batch read the roots again");
+
+        reference(&store.connection, "synthetic-capture-own", &hashes[5]);
+        pass(&mut store, Library);
+        assert_eq!(store.message_object_roots_computed() - computed, 1);
+        assert!(!marked(&store, &hashes[5]), "a reference added between batches was not seen");
+
+        let computed = store.message_object_roots_computed();
+        let other = rusqlite::Connection::open(&store.database_path).unwrap();
+        reference(&other, "synthetic-capture-other", &hashes[3]);
+        drop(other);
+        pass(&mut store, Library);
+        assert_eq!(store.message_object_roots_computed() - computed, 1);
+        assert!(!marked(&store, &hashes[3]), "a reference another connection committed was not seen");
+
+        let computed = store.message_object_roots_computed();
+        let lease = store.acquire_revision(store.revision().unwrap()).unwrap();
+        assert!(!batch(&mut store, Library));
+        assert!(!batch(&mut store, Library));
+        assert_eq!(store.message_object_roots_computed() - computed, 1);
+        store.release_revision(&lease.lease).unwrap();
+    }
+
+    #[test]
     fn archive_operation_cancellation_reaches_the_active_operation_and_is_released() {
         let state = PersistentStoreState::default();
         let operation = state
