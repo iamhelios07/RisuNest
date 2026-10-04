@@ -4914,12 +4914,14 @@ mod tests {
                     &spool.join(kind.id()), &Cancellation::default(),
                 ).unwrap()
             };
+            let text = "synthetic plugin text ".repeat(1024);
+            let vector = vec![0u8; 4096 * 4];
             let plugins = capture_rows(SectionKind::LocalPlugins, vec![row("plugin-a", SectionValueRow::Plugin {
-                space: "string".into(), value: "synthetic plugin text ".repeat(1024),
+                space: "string".into(), value: text.clone(),
             })]);
             let mut hypa = row(&"a".repeat(64), SectionValueRow::Hypa {
                 producer: "hypa-v2".into(), model: "synthetic".into(), endpoint: None,
-                preprocess_version: 1, dimensions: 4096, vector: vec![0u8; 4096 * 4], metadata: None,
+                preprocess_version: 1, dimensions: 4096, vector: vector.clone(), metadata: None,
             });
             hypa.key2 = String::new();
             hypa.key3 = String::new();
@@ -4935,9 +4937,9 @@ mod tests {
                 snapshot_metadata, &key, limits(256 * 1024), None, &mut transfer, &provider, &repository,
                 &PhaseProgress::silent(), &Cancellation::default(),
             ).await.unwrap();
-            for (kind, compressed) in [(SectionKind::LocalPlugins, true), (SectionKind::Hypa, false)] {
+            for (kind, compressed, body) in [(SectionKind::LocalPlugins, true, text.into_bytes()), (SectionKind::Hypa, false, vector)] {
                 let catalog = RemoteObject::from_stored(&completed.sections[kind.id()].entries_root, &repository).unwrap();
-                let (entries, _, _) = snapshot_restore::read_catalog(
+                let (entries, packs, _) = snapshot_restore::read_catalog(
                     &catalog, wire::CatalogKind::Section, &key, &root.path().join(format!("read-{}", kind.id())),
                     &provider, &repository, &Cancellation::default(),
                 ).await.unwrap();
@@ -4947,6 +4949,12 @@ mod tests {
                 assert_eq!(objects.len(), 1);
                 let stored: u64 = objects[0].chunks.iter().map(|chunk| chunk.stored_length).sum();
                 assert_eq!(stored < objects[0].byte_length, compressed, "{} object stored as {stored} of {}", kind.id(), objects[0].byte_length);
+                let decoded = snapshot_restore::download_packed_body(
+                    &hex::encode(objects[0].content_sha256), objects[0].byte_length, objects[0].chunks.clone(),
+                    packs.values().map(|pack| pack.stored(&repository).unwrap()).collect(),
+                    &root.path().join(format!("body-{}", kind.id())), &key, &provider, &repository, &Cancellation::default(),
+                ).await.unwrap();
+                assert_eq!(decoded, body);
             }
         });
     }
