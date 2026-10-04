@@ -396,4 +396,45 @@ describe('independent windowed conversation interfaces', () => {
         expect(persisted!.value.message.at(-1)!.data).toBe('Generation compatibility output')
         vi.resetModules()
     }, 30_000)
+
+    it('rerolls the last response over a tail window without promoting the windowed owner', async () => {
+        vi.resetModules()
+        const { createEvictionFixture, makeConversation } = await import('./tests/selectedConversationEvictionFixture')
+        const messageCount = INITIAL_MESSAGE_COUNT + 1
+        const fixture = await createEvictionFixture(makeConversation(messageCount, DUPLICATE_POSITIONS))
+        const { store, runtime } = fixture
+        const oracle = makeConversation(messageCount, DUPLICATE_POSITIONS)
+        await runtime.initializeActiveWorkingSet(fixture.workingCopy)
+        await waitForWindowed(runtime)
+        fixture.workingCopy.maxContext = 400
+        mockPublicGeneration(fixture, true)
+        const promote = vi.spyOn(runtime, 'acquireCompleteConversation')
+        const { sendChat, openSelectedHistoryWindow } = await import('../process/index.svelte')
+        const { generateWindowedResponseCandidate } = await import('../durableReroll')
+        let nextId = 0
+        const generationLog = vi.spyOn(console, 'log').mockImplementation(() => undefined)
+        const result = await generateWindowedResponseCandidate({
+            open: (tailStart) => openSelectedHistoryWindow({ tailStart }),
+            isCurrent: () => true,
+            createId: () => `candidate-id-${nextId++}`,
+            flush: () => runtime.flushPendingData('reroll-candidate'),
+            generate: () => sendChat(-1, { historyLimit: true }),
+            aborted: () => false,
+        })
+        generationLog.mockRestore()
+
+        expect(result.completed).toBe(true)
+        await expect(runtime.flushPendingData('history-window-reroll')).resolves.toBeUndefined()
+        expect(promote).not.toHaveBeenCalled()
+        expect(runtime.getSelectedConversationMode()).toBe('windowed')
+        const persisted = (await store.readConversation('char-a', 'chat-a'))!.value
+        expect(persisted.rerollRecovery).toBeUndefined()
+        expect(persisted.message).toHaveLength(messageCount)
+        expect(persisted.message.slice(0, -1)).toEqual(oracle.message.slice(0, -1))
+        const response = persisted.message.at(-1)!
+        expect(response.data).toBe('Generation compatibility output')
+        expect(response.responseVariants?.candidates.map((candidate) => candidate.messages[0].data))
+            .toEqual([oracle.message.at(-1)!.data, 'Generation compatibility output'])
+        vi.resetModules()
+    }, 30_000)
 })
