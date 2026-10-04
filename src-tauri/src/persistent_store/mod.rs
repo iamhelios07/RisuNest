@@ -1773,15 +1773,20 @@ impl PersistentStore {
         Ok(database)
     }
 
-    pub(crate) fn materialize_without_chats(&self) -> StoreResult<Value> {
-        let (mut database, target) = query::materialize_without_chats(&self.connection)?;
+    /// Root fields and presets with the number of characters (see
+    /// [`query::binding_library`]).
+    pub(crate) fn binding_library(&self) -> StoreResult<(Value, u64)> {
+        let (mut database, characters, target) = query::binding_library(&self.connection)?;
+        let root = database.as_object_mut().ok_or_else(|| StoreError::Store {
+            message: "Persistent root must be an object".to_owned(),
+        })?;
         owner_projection::OwnerManifestProjector::from_snapshots_dir(
             &self.connection,
             &target,
             &self.snapshots_dir,
         )?
-        .project_database(&mut database)?;
-        Ok(database)
+        .project_root(root)?;
+        Ok((database, characters))
     }
 
     pub(crate) fn materialize_lease(&self, lease: &str) -> StoreResult<Value> {
