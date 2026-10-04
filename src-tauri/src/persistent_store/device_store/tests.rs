@@ -56,7 +56,6 @@ fn every_live_device_table_is_listed_here() {
         "device_change_context",
         "device_changes",
         "device_meta",
-        "device_remote_cursors",
         "device_sections",
         "device_settings",
         "external_lww_objects",
@@ -1154,7 +1153,7 @@ mod section_exchange {
     use risunest_external_storage_format::section::SectionKind;
 
     use super::super::sections::{
-        SectionCursor, SectionRow, SectionSpoolBuilder,
+        SectionRow, SectionSpoolBuilder,
         SectionValueRow, TombstonePublication, LOCAL_SETTING_KEYS,
     };
     use super::super::{plugin_values::PluginDeviceMutation, DeviceStore, Section};
@@ -1227,10 +1226,9 @@ mod section_exchange {
     }
 
     /// Invariant 2. A received row is remote material: it keeps the version it
-    /// arrived with, counts as published, and a section this device does not
-    /// take part in offers nothing for publication.
+    /// arrived with and counts as published.
     #[test]
-    fn a_received_row_stays_remote_material_and_a_non_participating_section_is_not_offered() {
+    fn a_received_row_stays_remote_material() {
         let (_directory, mut store) = open();
         set(&mut store, "mine", "local");
         store
@@ -1262,19 +1260,6 @@ mod section_exchange {
             .expect("read own row");
         assert_ne!(own_writer, "writer-b");
         assert!(own_published.is_none());
-
-        store
-            .set_section_participating(Section::LocalPlugins, true)
-            .unwrap();
-        assert!(store
-            .sections_await_publication("connection", "library")
-            .unwrap());
-        store
-            .set_section_participating(Section::LocalPlugins, false)
-            .unwrap();
-        assert!(!store
-            .sections_await_publication("connection", "library")
-            .unwrap());
     }
 
     /// Invariant 15. A deletion travels as a tombstone and the value it removed
@@ -1613,71 +1598,6 @@ mod section_exchange {
         for kind in [SectionKind::LocalPlugins, SectionKind::LocalSettings] {
             assert_eq!(refusal(kind, &small), refusal(kind, &large));
         }
-    }
-
-    /// A cursor only moves forward, so a replayed apply cannot lose ground and
-    /// a published section does not offer the same values again.
-    #[test]
-    fn a_section_cursor_never_moves_backwards() {
-        let (_directory, mut store) = open();
-        let cursor = |generation: u64, observed: u64| SectionCursor {
-            applied_generation: Sequence::from(generation),
-            applied_gc_floor: Sequence::from(0u64),
-            observed_max_write_clock: Sequence::from(observed),
-        };
-        store
-            .write_section_cursor("connection", "library", Section::Hypa, &cursor(9, 40))
-            .unwrap();
-        store
-            .write_section_cursor("connection", "library", Section::Hypa, &cursor(3, 12))
-            .unwrap();
-        assert_eq!(
-            store
-                .read_section_cursor("connection", "library", Section::Hypa)
-                .unwrap(),
-            Some(cursor(9, 40))
-        );
-        assert!(store
-            .read_section_cursor("other", "library", Section::Hypa)
-            .unwrap()
-            .is_none());
-    }
-
-    /// A row this device wrote below the highest version the remote carries is
-    /// still unpublished, so counters cannot stand in for the question.
-    #[test]
-    fn a_local_write_below_the_remote_counter_still_owes_a_publication() {
-        let (_directory, mut store) = open();
-        store
-            .set_section_participating(Section::LocalPlugins, true)
-            .unwrap();
-        set(&mut store, "mine", "local");
-        store
-            .apply_section_rows(
-                Section::LocalPlugins,
-                &[plugin_row("theirs", "remote", 40, "writer-b")],
-            )
-            .expect("apply a remote row above every local write");
-        store
-            .write_section_cursor(
-                "connection",
-                "library",
-                Section::LocalPlugins,
-                &SectionCursor {
-                    applied_generation: Sequence::from(3u64),
-                    applied_gc_floor: Sequence::from(0u64),
-                    observed_max_write_clock: Sequence::from(40u64),
-                },
-            )
-            .unwrap();
-        assert!(store
-            .sections_await_publication("connection", "library")
-            .unwrap());
-
-        // A lineage this device never exchanged with holds none of these rows.
-        assert!(store
-            .sections_await_publication("connection", "other-library")
-            .unwrap());
     }
 
 }

@@ -149,16 +149,6 @@ CREATE TABLE device_change_consumers(
   PRIMARY KEY (id, section)
 );
 
-CREATE TABLE device_remote_cursors(
-  connection_id TEXT NOT NULL,
-  library_lineage TEXT NOT NULL,
-  section TEXT NOT NULL,
-  applied_generation TEXT NOT NULL,
-  applied_gc_floor TEXT NOT NULL,
-  observed_max_write_clock TEXT NOT NULL,
-  PRIMARY KEY (connection_id, library_lineage, section)
-);
-
 CREATE TABLE plugin_claim_sessions(
   session_id TEXT PRIMARY KEY,
   import_batch_id TEXT NOT NULL,
