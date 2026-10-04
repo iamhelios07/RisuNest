@@ -506,7 +506,7 @@ describe('the storage usage of two connections', () => {
         }
     }
     beforeEach(async () => {
-        state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0', paused: false, decisionRequired: false },
+        state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0', paused: false },
             connections: [connection(10, 30), second], jobs: [] })
         // The row does not wait on the service's own usage.
         state.getQuota.mockRejectedValue({ kind: 'transient', httpStatus: null, retryAtMs: null })
