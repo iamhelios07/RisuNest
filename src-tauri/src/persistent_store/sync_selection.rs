@@ -258,6 +258,20 @@ mod binding_tests {
     use super::*;
 
     #[test]
+    fn a_switch_request_reads_the_renderer_body_and_requires_the_initial_publication_flag() {
+        let body = serde_json::json!({
+            "bindingAuthority":"4","requestId":"synthetic-switch","expectedSelectionEpoch":"epoch",
+            "target":{"kind":"server","connectionId":"server"},"inspectionId":"inspection","initialPublication":true
+        });
+        let request: SwitchBindingRequest = serde_json::from_value(body.clone()).unwrap();
+        assert!(request.initial_publication);
+        assert_eq!(request.target, SyncTarget::Server("server".into()));
+        let mut missing = body;
+        missing.as_object_mut().unwrap().remove("initialPublication");
+        assert!(serde_json::from_value::<SwitchBindingRequest>(missing).is_err());
+    }
+
+    #[test]
     fn binding_content_count_dto_uses_only_canonical_decimal_strings() {
         let encoded = serde_json::json!({
             "library":{},"sharedVariables":{},"protectedValues":{},
