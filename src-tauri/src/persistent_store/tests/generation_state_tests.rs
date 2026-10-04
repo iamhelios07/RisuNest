@@ -308,3 +308,25 @@ fn a_snapshot_taken_during_the_purge_restores_the_active_library() {
     let stage = store.snapshot_restore_stage(&snapshot.id, "restore-mid-purge").unwrap();
     assert_eq!(state(&store, &stage.staging_id).as_deref(), Some("staging"));
 }
+
+
+/// Root collection finds generations through the tables that can reference a
+/// CAS object. A new generation table belongs in that list or among the ones
+/// named here, whose objects are not CAS objects.
+#[test]
+fn root_collection_covers_every_generation_table_that_can_reference_an_object() {
+    let without_cas_objects = [
+        "asset_alias_replacement_candidates",
+        "message_page_indexes",
+        "message_page_manifests",
+    ];
+    let mut classified = snapshot::ROOT_GENERATION_TABLES
+        .iter()
+        .chain(without_cas_objects.iter())
+        .copied()
+        .collect::<Vec<_>>();
+    classified.sort_unstable();
+    let mut tables = GENERATION_TABLES.iter().map(|(table, _)| *table).collect::<Vec<_>>();
+    tables.sort_unstable();
+    assert_eq!(classified, tables);
+}
