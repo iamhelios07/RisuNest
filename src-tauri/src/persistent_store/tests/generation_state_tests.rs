@@ -308,3 +308,75 @@ fn a_snapshot_taken_during_the_purge_restores_the_active_library() {
     let stage = store.snapshot_restore_stage(&snapshot.id, "restore-mid-purge").unwrap();
     assert_eq!(state(&store, &stage.staging_id).as_deref(), Some("staging"));
 }
+
+/// A retired library only waits for the purge, so the size estimates leave its
+/// values out while its rows are still in the file.
+#[test]
+fn size_estimates_leave_out_a_retired_library() {
+    const FILLER: usize = 1024 * 1024;
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = PersistentStore::open(directory.path()).unwrap();
+    let replace = |store: &mut PersistentStore, fill: &str| {
+        let staging = store.replace_begin().unwrap().staging_id;
+        store
+            .replace_put_root(&staging, &json!({ "username": "Synthetic", "filler": fill.repeat(FILLER) }))
+            .unwrap();
+        let revision = store.revision().unwrap();
+        store.replace_commit(&staging, Some(revision)).unwrap();
+        staging
+    };
+    let page_bytes = |store: &PersistentStore| -> u64 {
+        store
+            .connection
+            .query_row(
+                "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap() as u64
+    };
+    let estimates = |store: &mut PersistentStore| -> [u64; 3] {
+        // The storage figures take the archive lock, so it is released first.
+        let snapshot = {
+            let archive = super::super::snapshot_archive::Archive::open(&store.snapshots_dir).unwrap();
+            snapshot::capture_scratch(store, &archive).unwrap().1
+        };
+        let objects = store.storage_stats().unwrap().asset_objects.bytes;
+        [
+            store.storage_stats().unwrap().database_bytes,
+            store.portable_export_lower_bound().unwrap() - objects,
+            snapshot,
+        ]
+    };
+    let first = replace(&mut store, "a");
+    purge_all(&mut store);
+    replace(&mut store, "b");
+    assert_eq!(state(&store, &first).as_deref(), Some("retired"));
+    assert!(rows(&store, &first) > 0);
+    let pages = page_bytes(&store);
+    for estimate in estimates(&mut store) {
+        assert!(estimate >= FILLER as u64, "{estimate}");
+        assert!(estimate + FILLER as u64 <= pages, "{estimate} of {pages}");
+    }
+}
+
+/// Root collection finds generations through the tables that can reference a
+/// CAS object. A new generation table belongs in that list or among the ones
+/// named here, whose objects are not CAS objects.
+#[test]
+fn root_collection_covers_every_generation_table_that_can_reference_an_object() {
+    let without_cas_objects = [
+        "asset_alias_replacement_candidates",
+        "message_page_indexes",
+        "message_page_manifests",
+    ];
+    let mut classified = snapshot::ROOT_GENERATION_TABLES
+        .iter()
+        .chain(without_cas_objects.iter())
+        .copied()
+        .collect::<Vec<_>>();
+    classified.sort_unstable();
+    let mut tables = GENERATION_TABLES.iter().map(|(table, _)| *table).collect::<Vec<_>>();
+    tables.sort_unstable();
+    assert_eq!(classified, tables);
+}

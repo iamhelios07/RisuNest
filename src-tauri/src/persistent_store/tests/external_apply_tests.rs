@@ -607,10 +607,6 @@ fn connection_removal_cancels_local_jobs_releases_roots_and_deselects() {
         "INSERT INTO external_storage_capture_refs VALUES('capture-ready','ready')",
         [],
     ).unwrap();
-    store.connection.execute(
-        "INSERT INTO external_storage_bases VALUES('connection','repository','snapshot','commit','observation',?1)",
-        [&identity],
-    ).unwrap();
 
     store
         .external_prepare_connection_removal("connection")
@@ -632,17 +628,6 @@ fn connection_removal_cancels_local_jobs_releases_roots_and_deselects() {
             .connection
             .query_row(
                 "SELECT count(*) FROM external_storage_capture_refs",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        store
-            .connection
-            .query_row(
-                "SELECT count(*) FROM external_storage_bases WHERE connection_id='connection'",
                 [],
                 |row| row.get::<_, i64>(0),
             )

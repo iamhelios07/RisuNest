@@ -70,6 +70,23 @@ use std::{
 const DEFAULT_MAX_STORED_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_TARGET_BYTES: u64 = 64 * 1024 * 1024;
 const MIN_OBJECT_BYTES: u64 = 1024;
+/// The largest pack plaintext this app seals. Asset packs are cut at it and
+/// the other catalogs below it.
+pub(crate) const MAX_PACK_PLAINTEXT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Transfer spool room a job that seals packs needs before it starts: the
+/// ciphertext of every pack that may wait for one registration wave, each with
+/// the page room it is admitted with. An envelope adds a fixed prefix and a
+/// public header of at most `MAX_PUBLIC_HEADER_BYTES` to the ciphertext.
+pub(crate) fn producing_job_spool_headroom() -> Result<u64> {
+    let pack = risunest_external_storage_format::crypto::ciphertext_length(MAX_PACK_PLAINTEXT_BYTES)
+        .map_err(corrupt)?
+        .saturating_add(8 + wire::MAX_PUBLIC_HEADER_BYTES as u64);
+    Ok((0..ACTIVE_PACK_FAMILIES).fold(0u64, |room, waiting| {
+        room.saturating_add(pack)
+            .saturating_add(super::control::inventory_page_headroom(waiting + 1))
+    }))
+}
 static SNAPSHOT_CPU: LazyLock<Arc<tokio::sync::Semaphore>> =
     LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
 
@@ -1441,7 +1458,7 @@ async fn build_entries(
     let size = StoredSize { limits, repository_id: format_repository_id };
     let max_pack = size.pack_capacity(&format!("pack-{}", "0".repeat(64)))?;
     let preferred = match kind {
-        wire::CatalogKind::Assets => 64 * 1024 * 1024,
+        wire::CatalogKind::Assets => MAX_PACK_PLAINTEXT_BYTES,
         wire::CatalogKind::Records | wire::CatalogKind::Section => 32 * 1024 * 1024,
     };
     let target = limits.target_plaintext_bytes.min(preferred).min(max_pack).max(1);

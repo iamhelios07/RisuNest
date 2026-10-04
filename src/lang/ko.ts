@@ -2571,7 +2571,6 @@ export const languageKorean = {
             stagePreparingAttachments: '첨부 파일 준비 중',
             stageReadingDatabase: '데이터베이스 읽는 중',
             stageDecodingDatabase: '데이터베이스 해석 중',
-            stageStagingCharacters: '캐릭터 저장 중',
             stageFinalizingStaging: '설정과 프리셋 저장 중',
             stageAssignPluginValues: '플러그인 값 할당',
             stageActivating: '데이터 적용 중',

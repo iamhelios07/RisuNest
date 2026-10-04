@@ -53,7 +53,6 @@ export const unsupportedExternalStorageState: ExternalStorageState = {
         kind: 'none',
         selectionEpoch: '0',
         paused: false,
-        decisionRequired: false,
     },
     connections: [],
     jobs: [],
@@ -211,7 +210,7 @@ export class ExternalStorageBridge {
 
 
     setExecutionSession(request: {
-        kind: 'foreground' | 'hidden' | 'exitDrain'
+        kind: 'foreground' | 'hidden'
         id: string
     }): Promise<void> {
         return this.native('external_storage_set_execution_session', {

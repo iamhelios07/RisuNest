@@ -73,7 +73,22 @@ fn dump_rows(db: &Connection, out: &mut String, label: &str, sql: &str, params: 
     }
 }
 
+// Readers find the active library through the meta value while the purge goes
+// by the generation states, so every activation has to move both.
+fn assert_one_active_generation(store: &PersistentStore) {
+    let marked = store
+        .connection
+        .prepare("SELECT id FROM generations WHERE state='active'")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(marked, [active_generation(&store.connection).unwrap()]);
+}
+
 fn golden(store: &PersistentStore, name: &str) -> String {
+    assert_one_active_generation(store);
     let dump = golden_dump(store);
     if let Some(directory) = std::env::var_os("RISUNEST_GOLDEN_DUMP") {
         fs::write(Path::new(&directory).join(format!("{name}.txt")), &dump).unwrap();

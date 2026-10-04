@@ -30,7 +30,6 @@ fn all_live_tables_have_an_explicit_preservation_owner() {
         "library_sync_selection",
         "local_library_identity",
         "external_storage_jobs",
-        "external_storage_bases",
         "external_storage_backup_points",
         "external_storage_history_points",
         "external_storage_captures",

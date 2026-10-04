@@ -2759,7 +2759,6 @@ export const languageEnglish = {
             stagePreparingAttachments: 'Preparing attachments',
             stageReadingDatabase: 'Reading database',
             stageDecodingDatabase: 'Decoding database',
-            stageStagingCharacters: 'Saving characters',
             stageFinalizingStaging: 'Saving settings and presets',
             stageAssignPluginValues: 'Assign plugin values',
             stageActivating: 'Applying data',

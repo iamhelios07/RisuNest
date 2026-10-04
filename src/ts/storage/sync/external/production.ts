@@ -516,7 +516,6 @@ export interface ExternalExitSelectionCapture {
         connectionId?: string
         selectionEpoch: string
         paused: boolean
-        decisionRequired: boolean
     }
 }
 

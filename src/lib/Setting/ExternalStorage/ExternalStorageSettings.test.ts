@@ -139,7 +139,7 @@ describe('the storage usage tab', () => {
         vi.mocked(requestExternalStorageNow).mockResolvedValue({ kind: 'cancelled' })
         state.getState.mockResolvedValue({
             supported: true,
-            selection: { kind: 'none', selectionEpoch: '0', paused: false, decisionRequired: false },
+            selection: { kind: 'none', selectionEpoch: '0', paused: false },
             connections: [connection(10, 30)],
             jobs: [],
         })
@@ -229,7 +229,7 @@ describe('the storage usage tab', () => {
         const job = { id: 'uncertain-operation', connectionId: 'connection-1', kind: 'backup', state: 'uncertain',
             phase: 'publication-unknown', reason: 'automatic', targetRevision: '8', completedBytes: '0',
             completedItems: '0', startedAtMs: '1', updatedAtMs: '1',
-            result: { decisionRequired: true, reason: 'publication-unknown' } }
+            result: { reason: 'publication-unknown' } }
         state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0' },
             connections: [connection(10, 30)], jobs: [job] })
         vi.mocked(resumeExternalStorageJob).mockResolvedValue({ kind: 'blocked', reason: 'publication-unknown', job } as never)
@@ -343,7 +343,7 @@ describe('the storage usage tab', () => {
 
     it.each(['mybox', 'github_releases', 'gitlab_packages'])('does not offer Sync on a %s backup connection', async providerId => {
         if (component) await unmount(component)
-        state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0', paused: false, decisionRequired: false }, connections: [{ ...connection(10, 30), providerId }], jobs: [] })
+        state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0', paused: false }, connections: [{ ...connection(10, 30), providerId }], jobs: [] })
         component = mount(ExternalStorageSettings, { target }); await settle()
         expect([...target.querySelectorAll('button')].some(item => item.textContent?.trim() === strings.sync)).toBe(false)
         expect(target.textContent).not.toContain(strings.automaticSync)
@@ -351,7 +351,7 @@ describe('the storage usage tab', () => {
     it('offers actual native new-device recovery through the shared binding action', async () => {
         if (component) await unmount(component)
         state.failures.set('connection-1', { kind: 'corrupt' }); state.bind.mockResolvedValue({ kind: 'cancelled' })
-        state.getState.mockResolvedValue({ supported: true, selection: { kind: 'external', connectionId: 'connection-1', selectionEpoch: '0', paused: false, decisionRequired: false }, connections: [{ ...connection(10, 30), purpose: 'sync', strategy: 'sequential' }], jobs: [] })
+        state.getState.mockResolvedValue({ supported: true, selection: { kind: 'external', connectionId: 'connection-1', selectionEpoch: '0', paused: false }, connections: [{ ...connection(10, 30), purpose: 'sync', strategy: 'sequential' }], jobs: [] })
         component = mount(ExternalStorageSettings, { target }); await settle()
         const recovery = [...target.querySelectorAll('button')].find(item => item.textContent?.trim() === 'Connect as new device')!
         expect(recovery).toBeDefined(); recovery.click(); await settle()
@@ -387,7 +387,7 @@ describe('the storage usage tab', () => {
         capable.capabilities.leaseOperations = true
         capable.capabilities.deleteObjects = true
         vi.mocked(requestExternalStorageNow).mockResolvedValue({ kind: 'cancelled' })
-        state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0', paused: false, decisionRequired: false }, connections: [capable], jobs: [] })
+        state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0', paused: false }, connections: [capable], jobs: [] })
         component = mount(ExternalStorageSettings, { target })
         await settle()
         await openStorageUsage()
@@ -560,7 +560,7 @@ describe('a running job', () => {
         vi.mocked(requestExternalStorageNow).mockResolvedValue({ kind: 'cancelled' })
         state.getState.mockResolvedValue({
             supported: true,
-            selection: { kind: 'none', selectionEpoch: '0', paused: false, decisionRequired: false },
+            selection: { kind: 'none', selectionEpoch: '0', paused: false },
             connections: [connection(10, 30)],
             jobs: [job(counters)],
         })
@@ -599,7 +599,7 @@ describe('a running job', () => {
         vi.mocked(requestExternalStorageNow).mockResolvedValue({ kind: 'cancelled' })
         state.getState.mockResolvedValue({
             supported: true,
-            selection: { kind: 'none', selectionEpoch: '0', paused: false, decisionRequired: false },
+            selection: { kind: 'none', selectionEpoch: '0', paused: false },
             connections: [connection(10, 30)],
             jobs: [{
                 ...job(),
@@ -627,7 +627,7 @@ describe('removing a connection', () => {
         serverBytes: 0, serverObjects: 0, externalObjects: entries, unavailableObjects: 0, evictedBytes: 0 })
     const removeButton = () => [...target.querySelectorAll('button')].find(button => button.textContent?.trim() === strings.remove)!
     beforeEach(async () => {
-        state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0', paused: false, decisionRequired: false },
+        state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0', paused: false },
             connections: [connection(10, 30)], jobs: [] })
         state.listHistory.mockResolvedValue({ items: [] })
         state.removeConnection.mockResolvedValue(undefined)
@@ -701,7 +701,7 @@ describe('removing a connection', () => {
 
 it('explains a sync stopped because the previous storage could not be reached', async () => {
     state.failures.set('connection-1', { kind: 'previousStorageUnavailable' })
-    state.getState.mockResolvedValue({ supported: true, selection: { kind: 'external', connectionId: 'connection-1', selectionEpoch: '0', paused: false, decisionRequired: false },
+    state.getState.mockResolvedValue({ supported: true, selection: { kind: 'external', connectionId: 'connection-1', selectionEpoch: '0', paused: false },
         connections: [{ ...connection(10, 30), purpose: 'sync', strategy: 'sequential' }], jobs: [] })
     state.listHistory.mockResolvedValue({ items: [] })
     target = document.createElement('div')
@@ -713,7 +713,7 @@ it('explains a sync stopped because the previous storage could not be reached', 
 })
 
 it('explains a connection not made because the files could not be downloaded first', async () => {
-    state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0', paused: false, decisionRequired: false },
+    state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0', paused: false },
         connections: [{ ...connection(10, 30), purpose: 'sync', strategy: 'sequential' }], jobs: [] })
     state.listHistory.mockResolvedValue({ items: [] })
     state.bind.mockRejectedValue(Object.assign(new Error('download failed'), { code: 'previous-files-download-failed' }))

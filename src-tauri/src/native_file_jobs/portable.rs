@@ -1464,7 +1464,7 @@ mod tests {
             before_roots
         );
         drop(db);
-        // Opening a store seeds its operational revision-0 row independently of restoration.
+        // The refused restore left the target library and its revision as they were.
         let target_store = PersistentStore::open(&target).unwrap();
         assert_eq!(target_store.revision().unwrap(), revision);
         assert_eq!(target_store.read_root(None).unwrap().value, before);
