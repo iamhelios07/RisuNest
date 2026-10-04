@@ -17,6 +17,8 @@ const defaults = {
     performanceProfile: 'normal',
     androidKeepAliveDuringGeneration: true,
     nativeFileLogEnabled: true,
+    generationHistoryLimitEnabled: false,
+    generationHistoryLimitMultiplier: 2,
 }
 
 describe('device settings', () => {
@@ -184,6 +186,45 @@ describe('device settings', () => {
         expect(JSON.parse(localStorage.getItem('risuNestDeviceSettings') ?? '')).toEqual(getDeviceSettings())
     })
 
+
+    it('persists the generation history limit and its multiplier', async () => {
+        const { updateDeviceSettings } = await loadDeviceSettings()
+        updateDeviceSettings({
+            generationHistoryLimitEnabled: true,
+            generationHistoryLimitMultiplier: 1.5,
+        })
+
+        const { getDeviceSettings } = await loadDeviceSettings()
+        expect(getDeviceSettings()).toEqual({
+            ...defaults,
+            generationHistoryLimitEnabled: true,
+            generationHistoryLimitMultiplier: 1.5,
+        })
+    })
+
+    it.each([
+        ['below one', 0.5],
+        ['not finite', null],
+        ['a string', '2'],
+    ])('rejects a stored multiplier that is %s', async (_case, multiplier) => {
+        localStorage.setItem('risuNestDeviceSettings', JSON.stringify({
+            ...defaults,
+            nativeFileLogEnabled: false,
+            generationHistoryLimitMultiplier: multiplier,
+        }))
+        const { getDeviceSettings } = await loadDeviceSettings()
+        expect(getDeviceSettings()).toEqual(defaults)
+    })
+
+    it('rejects stored settings without the generation history limit fields', async () => {
+        const { generationHistoryLimitEnabled: _enabled, generationHistoryLimitMultiplier: _multiplier, ...older } = defaults
+        localStorage.setItem('risuNestDeviceSettings', JSON.stringify({
+            ...older,
+            nativeFileLogEnabled: false,
+        }))
+        const { getDeviceSettings } = await loadDeviceSettings()
+        expect(getDeviceSettings()).toEqual(defaults)
+    })
 
     it('ignores a runtime schema override while applying valid settings', async () => {
         const { getDeviceSettings, updateDeviceSettings } = await loadDeviceSettings()
