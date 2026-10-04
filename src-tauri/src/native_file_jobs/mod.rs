@@ -8869,7 +8869,8 @@ mod tests {
         let missing = native_portable_select_sections(app.state(), "missing-job".into(), selection);
         assert_eq!(missing.unwrap_err().code, "job-not-found");
         let metadata = tauri::async_runtime::block_on(native_content_source_metadata(app.state(), "not-a-token".into()));
-        let metadata = metadata.unwrap_err().code;
+        let Err(metadata) = metadata else { panic!("an unknown token is refused") };
+        let metadata = metadata.code;
         for (command, code) in [
             ("native_legacy_backup_handoff_cleanup", refused.as_str()),
             ("native_portable_select_sections", "job-not-found"),
@@ -8904,7 +8905,7 @@ mod tests {
 pub(crate) async fn native_content_source_metadata(
     state: tauri::State<'_, NativeFileJobState>,
     token: String,
-) -> Result<String, NativeJobError> {
+) -> Result<tauri::ipc::Response, NativeJobError> {
     logged("native_content_source_metadata", async move {
         let root = state.root.clone();
         tauri::async_runtime::spawn_blocking(move || {
@@ -8917,19 +8918,23 @@ pub(crate) async fn native_content_source_metadata(
                     "Content metadata exceeds 128 MiB",
                 ));
             }
-            let mut text = String::new();
+            let mut bytes = Vec::new();
             source
                 .file
                 .take(LIMIT + 1)
-                .read_to_string(&mut text)
+                .read_to_end(&mut bytes)
                 .map_err(|e| NativeJobError::new("invalid-input", e.to_string()))?;
-            if text.len() as u64 > LIMIT {
+            if bytes.len() as u64 > LIMIT {
                 return Err(NativeJobError::new(
                     "native-limit",
                     "Content metadata exceeds 128 MiB",
                 ));
             }
-            Ok(text)
+            std::str::from_utf8(&bytes)
+                .map_err(|e| NativeJobError::new("invalid-input", e.to_string()))?;
+            // Raw bytes take the streamed channel path on Android; a string
+            // response would be evaluated as one script.
+            Ok(tauri::ipc::Response::new(bytes))
         })
         .await
         .map_err(|e| NativeJobError::new("store-error", e.to_string()))?
