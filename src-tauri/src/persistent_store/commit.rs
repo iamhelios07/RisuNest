@@ -592,6 +592,7 @@ pub(super) fn replace_add_characters(
             ));
         }
         put_full_character(&transaction, staging_id, character, configured_index)?;
+        page_staged_conversations(&transaction, staging_id, character_id)?;
         configured_index += 1;
     }
     transaction.commit()?;
@@ -665,6 +666,7 @@ pub(super) fn replace_put_conversation_row(
         message_count,
         detail,
     )?;
+    page_staged_conversation(&transaction, staging_id, character_id, conversation_id)?;
     transaction.commit()?;
     Ok(())
 }
@@ -689,6 +691,7 @@ pub(super) fn replace_add_conversation_messages(
             "Persistent data import message pages must be contiguous",
         ));
     }
+    super::message_pages::forget_pages(&transaction, staging_id, character_id, conversation_id)?;
     insert_messages(
         &transaction,
         staging_id,
@@ -697,7 +700,46 @@ pub(super) fn replace_add_conversation_messages(
         start,
         messages,
     )?;
+    page_staged_conversation(&transaction, staging_id, character_id, conversation_id)?;
     transaction.commit()?;
+    Ok(())
+}
+
+/// Pages a staged conversation once all of its messages are written, so that
+/// activation reads its manifest instead of its messages.
+pub(super) fn page_staged_conversation(
+    transaction: &Transaction<'_>,
+    staging_id: &str,
+    character_id: &str,
+    conversation_id: &str,
+) -> StoreResult<()> {
+    let complete: Option<bool> = transaction
+        .query_row(
+            "SELECT c.message_count = (SELECT count(*) FROM messages m WHERE m.generation = c.generation
+                AND m.character_id = c.character_id AND m.conversation_id = c.conversation_id)
+             FROM conversations c WHERE c.generation = ?1 AND c.character_id = ?2 AND c.conversation_id = ?3",
+            params![staging_id, character_id, conversation_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if complete == Some(true) {
+        super::message_pages::capture_manifest(transaction, staging_id, character_id, conversation_id, None)?;
+    }
+    Ok(())
+}
+
+fn page_staged_conversations(
+    transaction: &Transaction<'_>,
+    staging_id: &str,
+    character_id: &str,
+) -> StoreResult<()> {
+    let conversations = transaction
+        .prepare("SELECT conversation_id FROM conversations WHERE generation = ?1 AND character_id = ?2")?
+        .query_map(params![staging_id, character_id], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for conversation_id in conversations {
+        page_staged_conversation(transaction, staging_id, character_id, &conversation_id)?;
+    }
     Ok(())
 }
 

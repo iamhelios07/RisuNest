@@ -394,7 +394,7 @@ fn new_device_replacement_matches_the_golden_state() {
 }
 
 #[test]
-fn replacement_activation_work_counts() {
+fn replacement_activation_reads_no_messages_and_writes_no_pages() {
     let (_directory, mut store) = seeded();
     let stage = build_stage(&mut store);
     let revision = store.revision().unwrap();
@@ -405,6 +405,74 @@ fn replacement_activation_work_counts() {
     let hashes = hash_work::take_hash_work();
     eprintln!("activation page work: {pages:?}");
     eprintln!("activation hash work: {hashes:?}");
+    assert_eq!(pages.capture_calls, 0);
+    assert_eq!(pages.work.messages_read, 0);
+    assert_eq!(pages.work.pages_written, 0);
+    for domain in ["native_message_verify", "native_page_identity"] {
+        assert!(!hashes.domains.contains_key(domain), "{domain}");
+    }
+}
+
+/// Conversations of a stage whose stored manifest is missing or differs from
+/// paging its messages again.
+fn staged_manifest_gaps(store: &mut PersistentStore, staging: &str) -> Vec<String> {
+    let conversations = store
+        .connection
+        .prepare("SELECT character_id,conversation_id FROM conversations WHERE generation=?1 ORDER BY 1,2")
+        .unwrap()
+        .query_map([staging], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(!conversations.is_empty());
+    let transaction = store.connection.transaction().unwrap();
+    let mut gaps = Vec::new();
+    for (character, conversation) in conversations {
+        let stored: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM message_page_manifests WHERE generation=?1 AND character_id=?2 AND conversation_id=?3)",
+                params![staging, character, conversation],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let current = message_pages::current_manifest(&transaction, staging, &character, &conversation).unwrap();
+        let captured = message_pages::capture_manifest(&transaction, staging, &character, &conversation, None).unwrap();
+        if !stored || current != captured {
+            gaps.push(format!("{character}/{conversation}"));
+        }
+    }
+    transaction.rollback().unwrap();
+    gaps
+}
+
+#[test]
+fn staging_pages_every_conversation_it_writes() {
+    let (_directory, mut store) = seeded();
+    let whole = build_stage(&mut store);
+    assert_eq!(staged_manifest_gaps(&mut store, &whole), Vec::<String>::new());
+
+    let paged = store.replace_begin().unwrap().staging_id;
+    store.replace_put_root(&paged, &json!({ "username": "Paged" })).unwrap();
+    store.replace_put_presets(&paged, &[]).unwrap();
+    store
+        .replace_put_character_detail(&paged, &json!({ "chaId": "paged", "name": "Paged", "type": "character" }), 2)
+        .unwrap();
+    store
+        .replace_put_conversation_row(&paged, "paged", 0, &json!({ "id": "empty", "name": "Empty" }), 0, 0)
+        .unwrap();
+    store
+        .replace_put_conversation_row(&paged, "paged", 1, &json!({ "id": "long", "name": "Long" }), 0, 3)
+        .unwrap();
+    let messages = (0..3).map(|index| chat_message(&format!("paged-{index}"), "paged")).collect::<Vec<_>>();
+    store.replace_add_conversation_messages(&paged, "paged", "long", 0, &messages[..2]).unwrap();
+    store.replace_add_conversation_messages(&paged, "paged", "long", 2, &messages[2..]).unwrap();
+    assert_eq!(staged_manifest_gaps(&mut store, &paged), Vec::<String>::new());
+
+    let (_source_directory, source, _) = open_fixture();
+    let generation = active_generation(&source.connection).unwrap();
+    let source = crate::persistent_store::snapshot::open_generation_reader(&source.database_path, &generation).unwrap();
+    let portable = store.stage_portable_records(&source, &crate::local_backup::NeverCancelled).unwrap().staging_id;
+    assert_eq!(staged_manifest_gaps(&mut store, &portable), Vec::<String>::new());
 }
 
 fn manifest_mismatches(store: &mut PersistentStore) -> Vec<String> {

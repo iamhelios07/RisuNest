@@ -406,6 +406,19 @@ pub(super) fn capture_with_work(
     Ok((value, work))
 }
 
+/// Drops a conversation's page index and manifest, so the next capture pages
+/// its messages again.
+pub(super) fn forget_pages(
+    tx: &Transaction<'_>,
+    generation: &str,
+    character: &str,
+    conversation: &str,
+) -> StoreResult<()> {
+    tx.execute("DELETE FROM message_page_indexes WHERE generation=?1 AND character_id=?2 AND conversation_id=?3",params![generation,character,conversation])?;
+    tx.execute("DELETE FROM message_page_manifests WHERE generation=?1 AND character_id=?2 AND conversation_id=?3",params![generation,character,conversation])?;
+    Ok(())
+}
+
 pub(super) fn current_manifest(
     tx: &Transaction<'_>,
     generation: &str,

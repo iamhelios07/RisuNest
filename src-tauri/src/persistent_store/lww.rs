@@ -2259,8 +2259,10 @@ impl PersistentStore {
         let remapped_units = self.remap_retired_staging(staging_id, source_units)?;
         let effective_source_units = remapped_units.as_ref();
         let generation = active_generation(&self.connection)?;
-        let before = projection::capture_all(&mut self.connection, &generation)?;
-        let mut after = projection::capture_all(&mut self.connection, staging_id)?;
+        // Incremental commits keep the active manifests current, and staging
+        // pages each conversation once all of its messages are written.
+        let before = projection::capture_all(&mut self.connection, &generation, true)?;
+        let mut after = projection::capture_all(&mut self.connection, staging_id, true)?;
         if let Some(units) = effective_source_units {
             for (key, value) in units {
                 wire({

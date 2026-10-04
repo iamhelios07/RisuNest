@@ -394,6 +394,24 @@ impl PersistentStore {
         for (owner, id) in message_owners {
             tx.execute("UPDATE messages SET character_id=?4,conversation_id=?5 WHERE generation=?1 AND character_id=?2 AND conversation_id=?3",params![staging,owner,id,map.id("character",&owner),map.conversation(&owner,&id)])?;
         }
+        // Pages hold message bodies only, so a renamed conversation keeps them.
+        let page_owners = {
+            let mut q = tx.prepare(
+                "SELECT character_id,conversation_id FROM message_page_manifests WHERE generation=?1
+                 UNION SELECT character_id,conversation_id FROM message_page_indexes WHERE generation=?1",
+            )?;
+            let rows = q
+                .query_map([staging], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        for (owner, id) in page_owners {
+            for table in ["message_page_indexes", "message_page_manifests"] {
+                tx.execute(&format!("UPDATE {table} SET character_id=?4,conversation_id=?5 WHERE generation=?1 AND character_id=?2 AND conversation_id=?3"),params![staging,owner,id,map.id("character",&owner),map.conversation(&owner,&id)])?;
+            }
+        }
         let heads = json_rows(
             &tx,
             "SELECT owner_locator,owner_locator FROM asset_owner_heads WHERE generation=?1",

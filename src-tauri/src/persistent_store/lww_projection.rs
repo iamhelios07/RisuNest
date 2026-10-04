@@ -640,9 +640,12 @@ fn capture_key(
     }
     Ok(())
 }
+/// With `current_manifests`, a conversation that already has a page manifest
+/// is read from it rather than paged again.
 pub(in crate::persistent_store) fn capture_all(
     db: &mut Connection,
     generation: &str,
+    current_manifests: bool,
 ) -> StoreResult<BTreeMap<UnitKey, UnitValue>> {
     let tx = db.transaction()?;
     let mut out = BTreeMap::new();
@@ -656,7 +659,7 @@ pub(in crate::persistent_store) fn capture_all(
         v
     };
     for id in ids {
-        capture_character(&tx, generation, &id, true, false, &mut out)?;
+        capture_character(&tx, generation, &id, true, current_manifests, &mut out)?;
     }
     let plugins: Vec<(String, String)> = {
         let mut s =
