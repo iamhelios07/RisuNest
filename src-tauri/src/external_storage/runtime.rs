@@ -5,7 +5,6 @@ use super::{
     contract::*,
     job_store::{DurableJob, JobCommandState, JobKind, JobStore, Session, StartJobRequest},
     leases,
-    publication::PublicationMode,
 };
 use crate::persistent_store::{
     self,
@@ -58,13 +57,13 @@ pub(crate) fn selection_dto(selection: Selection) -> Value {
         SyncTarget::Server(id) => ("server", Some(id)),
         SyncTarget::External(id) => ("external", Some(id)),
     };
-    let mut dto = json!({"kind":kind,"selectionEpoch":selection.epoch,"paused":selection.paused,"decisionRequired":selection.decision_required});
+    let mut dto = json!({"kind":kind,"selectionEpoch":selection.epoch,"paused":selection.paused});
     if let Some(id) = id {
         dto["connectionId"] = json!(id);
     }
     dto
 }
-fn require_session(request: &StartJobRequest, current: &Session) -> Result<PublicationMode> {
+fn require_session(request: &StartJobRequest, current: &Session) -> Result<()> {
     let manual = request.reason.as_deref().unwrap_or("manual") == "manual";
     if current.id.is_empty() || current.kind == "hidden" {
         return Err(ProviderError::new(ErrorKind::Cancelled));
@@ -76,13 +75,12 @@ fn require_session(request: &StartJobRequest, current: &Session) -> Result<Publi
             return Err(ProviderError::new(ErrorKind::Cancelled));
         }
     }
-    match current.kind.as_str() {
-        "foreground" => Ok(PublicationMode::Foreground),
-        "exitDrain" => Ok(PublicationMode::ExitDrain),
-        _ => Err(ProviderError::new(ErrorKind::Cancelled)),
+    if current.kind != "foreground" {
+        return Err(ProviderError::new(ErrorKind::Cancelled));
     }
+    Ok(())
 }
-pub(crate) fn read_job_session(app: &AppHandle, id: &str) -> Result<PublicationMode> {
+pub(crate) fn read_job_session(app: &AppHandle, id: &str) -> Result<()> {
     let job = JobStore::open(&root(app)?)?.read(id)?;
     let state = app.state::<JobCommandState>();
     let current = state.session.lock().map_err(local_error)?;
@@ -114,7 +112,7 @@ pub(crate) fn external_storage_set_execution_session(
     request: SetSessionRequest,
 ) -> Result<()> {
     logged("external_storage_set_execution_session", (|| {
-        if !["foreground", "hidden", "exitDrain"].contains(&request.kind.as_str())
+        if !["foreground", "hidden"].contains(&request.kind.as_str())
             || request.id.is_empty()
             || request.id.len() > 1024
         {
@@ -122,9 +120,6 @@ pub(crate) fn external_storage_set_execution_session(
         }
         let state = app.state::<JobCommandState>();
         let mut session = state.session.lock().map_err(local_error)?;
-        if session.kind == "exitDrain" && request.kind == "hidden" {
-            return Ok(());
-        }
         let hidden = request.kind == "hidden";
         *session = Session {
             kind: request.kind,
@@ -703,9 +698,7 @@ fn settle_interrupted(job: &mut DurableJob, complete: Option<Value>, uncertain: 
         } else {
             "paused"
         });
-        let decision = uncertain && job.summary["result"]["decisionRequired"] == true
-            && job.summary["result"]["reason"] == "publication-unknown";
-        if !decision { job.summary.as_object_mut().unwrap().remove("result"); }
+        job.summary.as_object_mut().unwrap().remove("result");
         job.summary["error"] = error_dto(&ProviderError::new(ErrorKind::Transient));
         if uncertain {
             job.summary["error"]["reason"] = json!("publication-unknown");
@@ -1362,18 +1355,12 @@ fn record_check_progress(
     store.put(&job)
 }
 /// Whether a publication that is already required may also spend the optional
-/// maintenance portion. A drain has to finish instead, and a daily allowance
-/// with less headroom than the portion can spend is not spent on it.
+/// maintenance portion. A daily allowance with less headroom than the portion
+/// can spend is not spent on it.
 pub(crate) fn maintenance_allowed(
     app: &AppHandle,
     connected: &super::connection_commands::ConnectedRepository,
-    job: &DurableJob,
 ) -> bool {
-    if job.request.session.as_deref() == Some("exitDrain")
-        || job.request.reason.as_deref() == Some("exitDrain")
-    {
-        return false;
-    }
     let Ok(budget) = super::connection_commands::budget(app) else {
         return false;
     };
@@ -1535,7 +1522,7 @@ async fn run_backup(
         metadata,
         &connected.root_key,
         PackageLimits::from_capabilities(&connected.stored.capabilities)?
-            .with_maintenance(maintenance_allowed(app, connected, job)),
+            .with_maintenance(maintenance_allowed(app, connected)),
         None,
         &mut journal,
         connected.provider.as_ref(),
@@ -1693,13 +1680,15 @@ pub(crate) async fn external_storage_get_quota(
 mod tests {
     use super::*;
     #[test]
-    fn stopped_unknown_reconciliation_preserves_the_exhausted_head_decision() {
+    fn stopped_unknown_reconciliation_drops_the_stale_result_until_it_completes() {
         let mut job=automatic_job();
-        job.summary["result"]=json!({"stopReason":"uncertain","reason":"publication-unknown","decisionRequired":true});
+        job.summary["result"]=json!({"stopReason":"uncertain","reason":"publication-unknown"});
         settle_interrupted(&mut job,None,true);
-        assert_eq!(job.summary["result"]["decisionRequired"],true);
+        assert!(job.summary["result"].is_null());
+        assert_eq!(job.summary["state"],"uncertain");
+        assert_eq!(job.summary["error"]["reason"],"publication-unknown");
         settle_interrupted(&mut job,Some(json!({"publishedRevision":"1"})),false);
-        assert!(job.summary["result"]["decisionRequired"].is_null());
+        assert_eq!(job.summary["result"]["publishedRevision"],"1");
         assert_eq!(job.summary["state"],"succeeded");
     }
 
@@ -2012,17 +2001,14 @@ mod tests {
         request.reason = Some("manual".into());
         request.session = None;
         request.session_id = None;
-        assert_eq!(
-            require_session(
-                &request,
-                &Session {
-                    kind: "foreground".into(),
-                    id: "new".into()
-                }
-            )
-            .unwrap(),
-            PublicationMode::Foreground
-        );
+        assert!(require_session(
+            &request,
+            &Session {
+                kind: "foreground".into(),
+                id: "new".into()
+            }
+        )
+        .is_ok());
         assert!(require_session(
             &request,
             &Session {

@@ -16,14 +16,13 @@ const mocks = vi.hoisted(() => ({
         supported: true,
         getState: vi.fn(),
         setExecutionSession: vi.fn(async (_request: {
-            kind: 'foreground' | 'hidden' | 'exitDrain'
+            kind: 'foreground' | 'hidden'
             id: string
         }) => {}),
         startJob: vi.fn(),
         getJob: vi.fn(),
         cancelJob: vi.fn(),
         stopRestore: vi.fn(),
-        applyReceived: vi.fn(),
         confirmRestoreAdoption: vi.fn(async () => {}),
         openConflictSource: vi.fn(),
         releaseConflictSource: vi.fn(),
@@ -129,7 +128,7 @@ const initialState: ExternalStorageState = {
     supported: true,
     selection: {
         kind: 'external', connectionId: 'old-sync', selectionEpoch: 'old-epoch',
-        paused: false, decisionRequired: false,
+        paused: false,
     },
     connections: [{
         id: 'old-sync', providerId: 'webdav', purpose: 'backup', strategy: 'backup-only',
@@ -400,7 +399,6 @@ describe('external storage production integration', () => {
         mocks.bridge.cancelJob.mockReset().mockImplementation(async id => ({ ...succeeded('old-sync', '8'), id, state: 'cancelled' }))
         mocks.bridge.getJob.mockReset()
         mocks.bridge.getJob.mockImplementation(async id => (await mocks.bridge.getState()).jobs.find((job: ExternalJobSummary) => job.id === id))
-        mocks.bridge.applyReceived.mockReset()
         mocks.pendingContinuation = undefined
         mocks.restoreConflictSource.mockImplementation(async (source) => {
             await source({

@@ -714,7 +714,7 @@
 
                 {#if unfinishedRestore(job)}
                     <p class="text-sm" role="status">{strings.restoreUnfinished}</p>
-                {:else if job?.result?.decisionRequired || job?.state === 'uncertain'}
+                {:else if job?.state === 'uncertain'}
                     <p class="text-sm" role="status">{strings.publicationDecision}</p>
                 {/if}
 

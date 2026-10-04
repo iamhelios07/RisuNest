@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::native_log::logged;
 
 pub(super) const SCHEMA: &str = r#"
-CREATE TABLE library_sync_selection(singleton INTEGER PRIMARY KEY CHECK(singleton=1),target TEXT NOT NULL CHECK(target IN ('none','server','external')),connection_id TEXT,selection_epoch TEXT NOT NULL,paused INTEGER NOT NULL CHECK(paused IN (0,1)),decision_required INTEGER NOT NULL CHECK(decision_required IN (0,1)),CHECK((target='none' AND connection_id IS NULL) OR (target!='none' AND length(connection_id)>0)));
+CREATE TABLE library_sync_selection(singleton INTEGER PRIMARY KEY CHECK(singleton=1),target TEXT NOT NULL CHECK(target IN ('none','server','external')),connection_id TEXT,selection_epoch TEXT NOT NULL,paused INTEGER NOT NULL CHECK(paused IN (0,1)),CHECK((target='none' AND connection_id IS NULL) OR (target!='none' AND length(connection_id)>0)));
 CREATE TABLE local_library_identity(singleton INTEGER PRIMARY KEY CHECK(singleton=1),store_id TEXT NOT NULL,library_epoch TEXT NOT NULL);
 CREATE TABLE lww_binding_switch_requests(request_id TEXT PRIMARY KEY,body TEXT NOT NULL,change TEXT NOT NULL);
 CREATE TABLE lww_binding_switch_retained(request_id TEXT PRIMARY KEY);
@@ -39,7 +39,6 @@ pub(crate) struct Selection {
     pub target: SyncTarget,
     pub epoch: String,
     pub paused: bool,
-    pub decision_required: bool,
 }
 
 fn invalid(message: &str) -> StoreError {
@@ -51,7 +50,7 @@ fn invalid(message: &str) -> StoreError {
 pub(super) fn create_schema(db: &Connection) -> StoreResult<()> {
     db.execute_batch(SCHEMA)?;
     db.execute(
-        "INSERT INTO library_sync_selection VALUES(1,'none',NULL,?1,0,0)",
+        "INSERT INTO library_sync_selection VALUES(1,'none',NULL,?1,0)",
         [uuid::Uuid::new_v4().to_string()],
     )?;
     db.execute(
@@ -66,7 +65,7 @@ pub(super) fn create_schema(db: &Connection) -> StoreResult<()> {
 }
 
 pub(crate) fn read(db: &Connection) -> StoreResult<Selection> {
-    let (kind,id,epoch,paused,decision):(String,Option<String>,String,bool,bool)=db.query_row("SELECT target,connection_id,selection_epoch,paused,decision_required FROM library_sync_selection WHERE singleton=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
+    let (kind,id,epoch,paused):(String,Option<String>,String,bool)=db.query_row("SELECT target,connection_id,selection_epoch,paused FROM library_sync_selection WHERE singleton=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
     let target = match (kind.as_str(), id) {
         ("none", None) => SyncTarget::None,
         ("server", Some(id)) => SyncTarget::Server(id),
@@ -77,7 +76,6 @@ pub(crate) fn read(db: &Connection) -> StoreResult<Selection> {
         target,
         epoch,
         paused,
-        decision_required: decision,
     })
 }
 
@@ -115,7 +113,7 @@ pub(crate) fn select(
     if id.is_some_and(|id| id.is_empty()) {
         return Err(invalid("Missing sync connection identity"));
     }
-    tx.execute("UPDATE library_sync_selection SET target=?1,connection_id=?2,selection_epoch=?3,paused=0,decision_required=0 WHERE singleton=1",params![kind,id,uuid::Uuid::new_v4().to_string()])?;
+    tx.execute("UPDATE library_sync_selection SET target=?1,connection_id=?2,selection_epoch=?3,paused=0 WHERE singleton=1",params![kind,id,uuid::Uuid::new_v4().to_string()])?;
     tx.execute(
         "UPDATE external_storage_jobs SET phase='stale' WHERE role IN ('sync','restore') AND phase IN ('preparing','ready')",
         [],
@@ -242,7 +240,7 @@ pub(crate) fn apply_binding_selection(tx: &Transaction<'_>, change: &BindingSele
     if connection.is_some_and(|id| id.is_empty()) || (connection.is_some() && (change.library_id.as_deref().is_none_or(str::is_empty) || change.target_id.as_deref().is_none_or(str::is_empty))) {
         return Err(invalid("Missing binding identity"));
     }
-    tx.execute("UPDATE library_sync_selection SET target=?1,connection_id=?2,selection_epoch=?3,paused=0,decision_required=0 WHERE singleton=1", params![kind, connection, change.new_epoch])?;
+    tx.execute("UPDATE library_sync_selection SET target=?1,connection_id=?2,selection_epoch=?3,paused=0 WHERE singleton=1", params![kind, connection, change.new_epoch])?;
     if !matches!(change.target, SyncTarget::None) {
         tx.execute("UPDATE lww_binding_identity SET library_id=?1,target_id=?2 WHERE singleton=1", params![change.library_id, change.target_id])?;
     }

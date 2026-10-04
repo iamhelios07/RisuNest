@@ -88,11 +88,11 @@ impl StartJobRequest {
             || self
                 .reason
                 .as_deref()
-                .is_some_and(|s| !["automatic", "manual", "exitDrain"].contains(&s))
+                .is_some_and(|s| !["automatic", "manual"].contains(&s))
             || self
                 .session
                 .as_deref()
-                .is_some_and(|s| !["foreground", "exitDrain"].contains(&s))
+                .is_some_and(|s| s != "foreground")
             || self.restore_areas.as_ref().is_some_and(|areas| {
                 areas.len() > 5
                     || areas.iter().any(|s| {
