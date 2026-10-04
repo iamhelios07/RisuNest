@@ -25,6 +25,8 @@ export interface HistoryWindowControllerEnvironment {
     getCurrentSession(): ActiveConversationSession | null
     /** The conversation's live metadata, which other writers may change during the generation. */
     readLiveMetadata(): ConversationFields | null
+    /** Called once when no backend holds the window any more. */
+    onLost?(): void
 }
 
 export interface HistoryWindowController extends WindowedConversationMutationController {
@@ -164,6 +166,7 @@ export function createHistoryWindowController(
 ): HistoryWindowController {
     let backend = initial
     let released = false
+    let lost = false
     let baseline = cloneMetadataFields(chat)
     const resolve = (): WindowedConversationMutationController | null => {
         if (released) return null
@@ -178,6 +181,10 @@ export function createHistoryWindowController(
                 absoluteStartIndex,
             )
             : environment.captureWindowed(chat, absoluteStartIndex)
+        if (!backend && !lost) {
+            lost = true
+            environment.onLost?.()
+        }
         return backend
     }
     const applyRange: WindowedConversationMutationController['applyRange'] = (

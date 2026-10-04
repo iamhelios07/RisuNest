@@ -3079,6 +3079,7 @@ export const languageEnglish = {
     "groupCharactersChangeFailed": "Could not change the group characters. Please try again.",
     "regexScriptTimeout": "Regex script execution timed out.",
     "generationInterruptedInBackground": "Response generation was interrupted in the background.",
+    "generationConversationChanged": "The conversation changed during generation, so the response could not be applied. Please try again.",
     "screenshotPreparationFailed": "Screenshot preparation failed. Reduce the range and try again.",
     "mcpDesktopOnly": "Local MCPs are available in the desktop app.",
     lwwSync: {

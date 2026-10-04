@@ -5,7 +5,7 @@ import { get, writable } from "svelte/store";
 import { type character, type groupChat, type MessageGenerationInfo, type Chat, type MessagePresetInfo, activatePresetOverride, setCurrentChat, type Message } from "../storage/database.svelte";
 import { DBState } from '../stores.svelte';
 import { CharEmotion, selectedCharID } from "../stores.svelte";
-import { ChatTokenizer, tokenize, tokenizeNum } from "../tokenizer";
+import { ChatTokenizer, encodeWithTokenizer, tokenize, tokenizeNum } from "../tokenizer";
 import { language } from "../../lang";
 import { alertError, alertToast, alertNormal } from "../alert";
 import { parseChatML } from "../parser/chatML";
@@ -53,6 +53,7 @@ import {
     captureSelectedConversationAuthority,
     captureWindowedConversationMutationController,
     captureSelectedConversationTarget,
+    flushPendingData,
     getActiveConversationSession,
     invalidateActiveConversationSession,
 } from '../storage/persistentDataRuntime.svelte'
@@ -93,6 +94,26 @@ import { beginIOSGeneration, notifyIOSGenerationComplete, isBackgroundExpiryReas
 import { isTauriIOS, isTauriAndroid, isTauriDesktop } from "../platform";
 import { notifyDesktop } from "../desktopNotifications";
 import { classifyChatParserHistory } from '../chatParserHistory'
+import { getDeviceSettings } from '../storage/deviceSettings'
+import { cloneConversationMetadata } from '../storage/selectedConversationLifecycle'
+import { attachHistoryWindow, getHistoryWindowStart, toWindowIndex } from './historyWindowIndex'
+import { WindowedConversationHistoryOperation } from './historyWindowHistory'
+import {
+    captureSessionHistoryWindowController,
+    createHistoryWindowController,
+    type HistoryWindowController,
+    type HistoryWindowControllerEnvironment,
+} from './historyWindowController'
+import {
+    admitHistoryWindow,
+    createSessionHistoryWindowReader,
+    createStoreHistoryWindowReader,
+    prepareHistoryWindow,
+    readStoreMessageMetadata,
+    type HistoryWindowMemoryMode,
+} from './historyWindowGeneration'
+import type { HistoryWindowHypaPlan } from './historyWindowSelection'
+import { writeHistoryWindowChat } from './historyWindowWrite'
 
 export { doingChat } from './generationState'
 
@@ -155,12 +176,16 @@ function beginPromptHistoryOperation(
     if (session?.matchesConversation(owner.chaId, chat)) {
         return beginPinnedConversationHistoryOperation(session)
     }
-    return createCompatibilityConversationHistorySnapshot({
+    const snapshot = createCompatibilityConversationHistorySnapshot({
         characterId: owner.chaId,
         conversationId: chat.id ?? 'compatibility-current-conversation',
         messages: chat.message,
         storeRevision: session?.storeRevision ?? 0,
     })
+    const windowStart = getHistoryWindowStart(chat)
+    return windowStart === null
+        ? snapshot
+        : new WindowedConversationHistoryOperation(snapshot, windowStart)
 }
 
 function hasMismatchedActiveConversationSession(): boolean {
@@ -213,6 +238,201 @@ interface GenerationConversationResources {
     unbindWindowedController: (() => void) | null
 }
 
+interface GenerationHistoryWindow {
+    start: number
+    endedAtAllBefore: boolean
+    hypaPlan: HistoryWindowHypaPlan | null
+    chat: Chat
+    controller: HistoryWindowController
+}
+
+/**
+ * The memory mode a chat-screen send runs its history window with, or null
+ * when the send loads the whole conversation.
+ */
+export function getHistoryWindowMemoryMode(historyLimit: boolean | undefined): HistoryWindowMemoryMode | null {
+    if (historyLimit !== true) return null
+    const owner = DBState.db.characters[get(selectedCharID)]
+    if (!owner) return null
+    return admitHistoryWindow({
+        requested: true,
+        enabled: getDeviceSettings().generationHistoryLimitEnabled,
+        maxContext: DBState.db.maxContext,
+        group: owner.type === 'group',
+        supaMemory: !!owner.supaMemory,
+        supaModelType: DBState.db.supaModelType,
+        hanuraiEnable: !!DBState.db.hanuraiEnable,
+        hypav2: !!DBState.db.hypav2,
+        hypaV3: !!DBState.db.hypaV3,
+    })
+}
+
+function sameConversationTarget(
+    left: { characterId: string, conversationId: string, navigationGeneration: number } | null,
+    right: { characterId: string, conversationId: string, navigationGeneration: number },
+): boolean {
+    return left?.characterId === right.characterId
+        && left.conversationId === right.conversationId
+        && left.navigationGeneration === right.navigationGeneration
+}
+
+/**
+ * Loads the newest part of the selected conversation for one generation and
+ * returns a controller that writes it back by absolute position, whether the
+ * conversation is windowed or complete.
+ */
+async function prepareGenerationHistoryWindow(
+    initialTarget: NonNullable<ReturnType<typeof captureSelectedConversationTarget>>,
+    memory: HistoryWindowMemoryMode,
+    isTargetCurrent: () => boolean,
+    signal: AbortSignal,
+): Promise<GenerationHistoryWindow | null> {
+    let target = initialTarget
+    let authority = captureSelectedConversationAuthority()
+    if (authority && authority.sessionVersion !== authority.persistedSessionVersion) {
+        await flushPendingData('generation-history-window')
+        const current = captureSelectedConversationTarget()
+        if (!isTargetCurrent() || !current || !sameConversationTarget(current, initialTarget)) return null
+        target = current
+        authority = captureSelectedConversationAuthority()
+        if (authority && authority.sessionVersion !== authority.persistedSessionVersion) return null
+    }
+    const owner = DBState.db.characters[get(selectedCharID)]
+    const conversation = owner?.chats[owner.chatPage]
+    if (!owner || owner.chaId !== target.characterId || conversation?.id !== target.conversationId) return null
+    const hypaSettings = memory === 'hypaV3' ? getCurrentHypaV3Preset().settings : null
+    const preparation = {
+        memory,
+        conversation: cloneConversationMetadata(conversation),
+        preserveOrphanedMemory: hypaSettings?.preserveOrphanedMemory ?? false,
+        queryChatCount: hypaSettings?.queryChatCount ?? 0,
+        tokenBudget: DBState.db.maxContext * getDeviceSettings().generationHistoryLimitMultiplier,
+        // A remote or plugin tokenizer would see every older message, so the window walk counts locally.
+        countTokens: hasObservableHistoryTokenizer()
+            ? async (text: string) => (await encodeWithTokenizer(text, 'tik')).length
+            : tokenize,
+    }
+
+    let prepared: Awaited<ReturnType<typeof prepareHistoryWindow>>
+    let chat: Chat
+    let initial: WindowedConversationMutationController | null
+    if (authority) {
+        const windowedAuthority = authority
+        const assertCurrent = () => {
+            signal.throwIfAborted()
+            const currentAuthority = captureSelectedConversationAuthority()
+            if (
+                !isTargetCurrent()
+                || !sameConversationTarget(captureSelectedConversationTarget(), target)
+                || currentAuthority?.sessionToken !== windowedAuthority.sessionToken
+                || currentAuthority.storeRevision !== windowedAuthority.storeRevision
+                || currentAuthority.sessionVersion !== windowedAuthority.sessionVersion
+                || currentAuthority.totalMessages !== windowedAuthority.totalMessages
+            ) throw new PersistentMutationFencedError()
+        }
+        const lease = await getPersistentDataStore().acquireRevision(windowedAuthority.storeRevision)
+        try {
+            prepared = await prepareHistoryWindow({
+                ...preparation,
+                reader: createStoreHistoryWindowReader(lease, windowedAuthority),
+                readMetadata: () => readStoreMessageMetadata(lease, windowedAuthority, assertCurrent),
+                assertCurrent,
+            })
+        } finally {
+            await lease.release()
+        }
+        assertCurrent()
+        chat = { ...preparation.conversation, message: prepared.selection.messages } as Chat
+        initial = captureWindowedConversationMutationController(target, chat, prepared.selection.start)
+    } else {
+        const session = getActiveConversationSession()
+        if (!session?.matchesConversation(owner.chaId, conversation)) return null
+        const version = session.version
+        const assertCurrent = () => {
+            signal.throwIfAborted()
+            if (
+                !isTargetCurrent()
+                || getActiveConversationSession() !== session
+                || !session.isActive
+                || session.version !== version
+            ) throw new PersistentMutationFencedError()
+        }
+        prepared = await prepareHistoryWindow({
+            ...preparation,
+            reader: createSessionHistoryWindowReader(session),
+            readMetadata: async () => conversation.message.map((message) => ({
+                chatId: message.chatId,
+                disabled: message.disabled,
+            })),
+            assertCurrent,
+        })
+        assertCurrent()
+        chat = { ...preparation.conversation, message: prepared.selection.messages } as Chat
+        initial = captureSessionHistoryWindowController(
+            { session, conversation },
+            getActiveConversationSession,
+            chat,
+            prepared.selection.start,
+        )
+    }
+    if (!initial) return null
+    const start = prepared.selection.start
+
+    const currentConversation = () => {
+        const currentOwner = DBState.db.characters[get(selectedCharID)]
+        const current = currentOwner?.chats[currentOwner.chatPage]
+        return currentOwner?.chaId === target.characterId && current?.id === target.conversationId
+            ? { owner: currentOwner, conversation: current }
+            : null
+    }
+    const environment: HistoryWindowControllerEnvironment = {
+        captureWindowed: (windowChat, absoluteStartIndex) => {
+            const current = captureSelectedConversationTarget()
+            if (!isTargetCurrent() || !current || !sameConversationTarget(current, target)) return null
+            return captureWindowedConversationMutationController(current, windowChat, absoluteStartIndex)
+        },
+        captureSession: () => {
+            const current = isTargetCurrent() ? currentConversation() : null
+            const session = getActiveConversationSession()
+            return current && session?.matchesConversation(current.owner.chaId, current.conversation)
+                ? { session, conversation: current.conversation }
+                : null
+        },
+        getCurrentSession: getActiveConversationSession,
+        readLiveMetadata: () => {
+            const current = currentConversation()
+            return current ? cloneConversationMetadata(current.conversation) : null
+        },
+        onLost: () => {
+            if (isTargetCurrent() && !signal.aborted) alertError(language.generationConversationChanged)
+        },
+    }
+    const controller = createHistoryWindowController(environment, chat, start, initial)
+    // Prompt history and scripts find messages by id, so missing ids are stored first.
+    for (let index = 0; index < chat.message.length; index += 1) {
+        const message = chat.message[index]
+        if (message.chatId) continue
+        if (!controller.applyRange(index, 1, [{ ...message, chatId: v4() }], 'edit')) {
+            controller.release()
+            return null
+        }
+    }
+    attachHistoryWindow(chat, start)
+    return {
+        start,
+        endedAtAllBefore: prepared.selection.endedAtAllBefore,
+        hypaPlan: prepared.hypaPlan,
+        chat,
+        controller,
+    }
+}
+
+function hasObservableHistoryTokenizer(): boolean {
+    return !!(DBState.db.googleClaudeTokenizing
+        || (DBState.db.aiModel === 'custom'
+            && pluginV2.providerOptions?.get(DBState.db.currentPluginProvider)?.tokenizer === 'custom'))
+}
+
 export function getSelectedBoundedGenerationFallbackReason(): string | null {
     const owner = DBState.db.characters[get(selectedCharID)]
     const conversation = owner?.chats[owner.chatPage]
@@ -220,9 +440,6 @@ export function getSelectedBoundedGenerationFallbackReason(): string | null {
         && DBState.db.hypaV3 && !DBState.db.hypav2 && !DBState.db.hanuraiEnable
         ? getCurrentHypaV3Preset().settings : null
     const authority = hypaSettings ? captureSelectedConversationAuthority() : null
-    const hasObservableHistoryTokenizer = () => DBState.db.googleClaudeTokenizing
-        || (DBState.db.aiModel === 'custom'
-            && pluginV2.providerOptions?.get(DBState.db.currentPluginProvider)?.tokenizer === 'custom')
     const scripts = owner?.type !== 'group' && hypaSettings
         ? [
             ...(DBState.db.presetRegex ?? []),
@@ -282,6 +499,8 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     usedContinueTokens?:number,
     preview?:boolean
     previewPrompt?:boolean
+    /** A chat-screen send, which may load only recent messages when the device option is on. */
+    historyLimit?:boolean
 } = {}, inheritedReservation?: GenerationReservation):Promise<boolean> {
     const authorityEpoch = getPersistentStorageAuthorityEpoch()
     try {
@@ -343,7 +562,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
       | undefined;
     try {
         const initialTarget = captureSelectedConversationTarget()
-        const mayUseBoundedHistory = DBState.db.hypaV3
+        const mayUseBoundedHistory = (DBState.db.hypaV3 || getHistoryWindowMemoryMode(arg.historyLimit) !== null)
             && initialTarget !== null
             && typeof captureSelectedConversationAuthority === 'function'
             && captureSelectedConversationAuthority() !== null
@@ -431,6 +650,7 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
     usedContinueTokens?:number,
     preview?:boolean
     previewPrompt?:boolean
+    historyLimit?:boolean
 }, lifecycle: GenerationCompletionLifecycle, reservation: GenerationReservation,
 conversationResources: GenerationConversationResources):Promise<boolean> {
 
@@ -445,9 +665,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
     let currentChar:character
     let boundedChat: Chat | null = null
     let summaryAwareHistoryPlan: SummaryAwarePromptHistoryPlan | null = null
-    const hasObservableHistoryTokenizer = () => DBState.db.googleClaudeTokenizing
-        || (DBState.db.aiModel === 'custom'
-            && pluginV2.providerOptions?.get(DBState.db.currentPluginProvider)?.tokenizer === 'custom')
+    let historyWindow: GenerationHistoryWindow | null = null
     let generationInfo:MessageGenerationInfo|undefined = undefined
 
     const stageTimings = {
@@ -613,9 +831,29 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
             ? getCurrentHypaV3Preset().settings
             : null
         const authority = hypaSettings ? captureSelectedConversationAuthority() : null
-        const boundedFallbackReason = getSelectedBoundedGenerationFallbackReason()
+        const historyWindowMemory = getHistoryWindowMemoryMode(arg.historyLimit)
+        const boundedFallbackReason = historyWindowMemory === null
+            ? getSelectedBoundedGenerationFallbackReason()
+            : 'history-window'
         const boundedAdmission = boundedFallbackReason === null
-        if (boundedAdmission) {
+        if (historyWindowMemory !== null) {
+            historyWindow = await prepareGenerationHistoryWindow(
+                target,
+                historyWindowMemory,
+                lifecycle.isTargetCurrent,
+                abortSignal,
+            )
+            if (!historyWindow) return false
+            const unbind = bindWindowedGenerationController(historyWindow.chat, historyWindow.controller)
+            conversationResources.windowedController = historyWindow.controller
+            conversationResources.unbindWindowedController = unbind
+            boundedChat = historyWindow.chat
+            console.debug('[Generation history] window', {
+                start: historyWindow.start,
+                messages: historyWindow.chat.message.length,
+                memory: historyWindowMemory,
+            })
+        } else if (boundedAdmission) {
             const navigationGeneration = getPersistentNavigationGeneration()
             const isCurrent = () => {
                 const currentTarget = captureSelectedConversationTarget()
@@ -697,7 +935,10 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
     const activeSession = getActiveConversationSession()
     if (
         activeSession &&
-        !activeSession.matchesConversation(nowChatroom.chaId, selectedConversation)
+        !activeSession.matchesConversation(
+            nowChatroom.chaId,
+            historyWindow ? nowChatroom.chats[selectedChat] : selectedConversation,
+        )
     ) return false
     if (!boundedChat) {
         ensureCurrentConversationMessageIds(
@@ -1305,7 +1546,11 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
         }
     })()
 
-    if(nowChatroom.type !== 'group' && !greetingHistorySelection.resetByAllBefore){
+    // A window that leaves out older messages leaves out the greeting, which the token trim would drop first.
+    const greetingOutsideWindow = historyWindow !== null
+        && historyWindow.start > 0
+        && !historyWindow.endedAtAllBefore
+    if(nowChatroom.type !== 'group' && !greetingHistorySelection.resetByAllBefore && !greetingOutsideWindow){
         const firstMsg = currentChat.fmIndex === -1 ? nowChatroom.firstMessage : nowChatroom.alternateGreetings[currentChat.fmIndex]
 
         const chat:OpenAIChat = {
@@ -1331,9 +1576,16 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
             messages: currentChat.message,
         }
         : null
+    if (historyWindow && !historyWindow.controller.reconcileMetadata()) {
+        throw new PersistentMutationFencedError()
+    }
     const triggerResult = await runTrigger(currentChar, 'start', {chat: currentChat})
     if(triggerResult){
-        if (triggerSessionSnapshot && triggerResult.chat !== currentChat) {
+        if (historyWindow) {
+            if (!writeHistoryWindowChat(historyWindow.controller, triggerResult.chat)) {
+                throw new PersistentMutationFencedError()
+            }
+        } else if (triggerSessionSnapshot && triggerResult.chat !== currentChat) {
             requireCurrentConversationSession(
                 triggerSessionSnapshot.session,
                 getActiveConversationSession(),
@@ -1347,7 +1599,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
         } else {
             currentChat = triggerResult.chat
         }
-        setCurrentChat(currentChat)
+        if (!historyWindow) setCurrentChat(currentChat)
         currentTokens += triggerResult.tokens
         if(triggerResult.stopSending){
             return false
@@ -1355,7 +1607,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
     }
 
     const requiresLivePromptCompatibility = (pluginV2.editprocess?.size ?? 0) > 0
-    if (!summaryAwareHistoryPlan && nowChatroom.type !== 'group' && nowChatroom.supaMemory
+    if (!historyWindow && !summaryAwareHistoryPlan && nowChatroom.type !== 'group' && nowChatroom.supaMemory
         && DBState.db.hypaV3 && !DBState.db.hypav2 && !DBState.db.hanuraiEnable) {
         const settings = getCurrentHypaV3Preset().settings
         if (!settings.useExperimentalImpl && !requiresLivePromptCompatibility && !hasObservableHistoryTokenizer()
@@ -1393,7 +1645,13 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
     const promptHistoryEntries = requiresLivePromptCompatibility
         ? (promptHistoryCompatibilitySnapshot = createLivePromptHistoryCompatibilitySnapshot(
             currentChat.message,
-            promptHistorySelection,
+            historyWindow
+                ? {
+                    ...promptHistorySelection,
+                    startIndex: Math.max(toWindowIndex(currentChat, promptHistorySelection.startIndex), 0),
+                    endIndex: toWindowIndex(currentChat, promptHistorySelection.endIndex),
+                }
+                : promptHistorySelection,
         )).entries
         : iteratePromptHistory(promptHistory, promptHistorySelection)
     for(const entry of promptHistoryEntries){
@@ -1407,14 +1665,19 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
             msg = ensurePromptHistoryEntryId(promptHistory, entry, v4)
         }
         if (msg.chatId && summaryAwareHistoryPlan?.coveredMessageIds.has(msg.chatId)) continue
-        promptScriptOperationScope?.adoptMessageId(entry.locator, msg.chatId)
+        // Window messages carry stored ids and their locators belong to the window snapshot.
+        if (!historyWindow) promptScriptOperationScope?.adoptMessageId(entry.locator, msg.chatId)
         const parsedMessage = promptScriptOperationScope
             ? promptScriptOperationScope.parse(nowChatroom, msg.data, {
                 chara: currentChar,
                 role: msg.role,
             })
             : risuChatParser(msg.data, {chara: currentChar, role: msg.role})
-        let formatedChat = (await processScriptFull(nowChatroom, parsedMessage, 'editprocess', index, {
+        // Without an allBefore marker the message index counts from the conversation start.
+        const scriptIndex = historyWindow && !promptHistorySelection.resetByAllBefore
+            ? historyWindow.start + index
+            : index
+        let formatedChat = (await processScriptFull(nowChatroom, parsedMessage, 'editprocess', scriptIndex, {
             chatRole: msg.role,
         }, {
             promptOperationScope: promptScriptOperationScope ?? undefined,
@@ -1643,7 +1906,9 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
                 currentChat,
                 nowChatroom,
                 tokenizer,
-                summaryAwareHistoryPlan ? {
+                historyWindow?.hypaPlan ? {
+                    effectiveMessageMemos: historyWindow.hypaPlan.effectiveMessageMemos,
+                } : summaryAwareHistoryPlan ? {
                     boundaryMemo: summaryAwareHistoryPlan.boundaryMemo,
                     effectiveMessageMemos: summaryAwareHistoryPlan.effectiveMessageMemos,
                     historyStartIndex: preparedHistoryStartIndex,
@@ -2127,16 +2392,19 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
         get(selectedCharID) === requestSourceCharacterIndex &&
         DBState.db.characters[requestSourceCharacterIndex]?.chaId === requestSourceCharacterId &&
         DBState.db.characters[requestSourceCharacterIndex]?.chatPage === requestSourceChatPage &&
-        DBState.db.characters[requestSourceCharacterIndex]?.chats[requestSourceChatPage] ===
-            requestSourceShell &&
-        (conversationResources.windowedController?.isCurrent() ?? true) &&
-        getActiveConversationSession() === requestSourceSession &&
-        (requestSourceSession === null
-            ? requestSourceConversation.message === requestSourceMessages
-            : requestSourceSession.isActive &&
-              requestSourceSession.canContinueGenerationFrom(requestSourceSessionVersion!) &&
-              requestSourceSession.materializeCompatibilityArray() ===
-                  requestSourceConversation.message)
+        (historyWindow
+            // The window controller follows a promotion and checks the window's message ids.
+            ? historyWindow.controller.isCurrent()
+            : DBState.db.characters[requestSourceCharacterIndex]?.chats[requestSourceChatPage] ===
+                requestSourceShell &&
+            (conversationResources.windowedController?.isCurrent() ?? true) &&
+            getActiveConversationSession() === requestSourceSession &&
+            (requestSourceSession === null
+                ? requestSourceConversation.message === requestSourceMessages
+                : requestSourceSession.isActive &&
+                  requestSourceSession.canContinueGenerationFrom(requestSourceSessionVersion!) &&
+                  requestSourceSession.materializeCompatibilityArray() ===
+                      requestSourceConversation.message))
     const closeRequestPhase = openGenerationRequestPhase({
         characterId: requestSourceCharacterId,
         conversationId: requestSourceConversation.id ?? '',
@@ -2220,7 +2488,10 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
             publishTargetChat: (chat) => {
                 if (!lifecycle.isTargetCurrent()) throw new PersistentMutationFencedError()
                 if (boundedChat) {
-                    if (chat !== boundedChat) throw new PersistentMutationFencedError()
+                    if (chat === boundedChat) return
+                    if (!historyWindow || !writeHistoryWindowChat(historyWindow.controller, chat)) {
+                        throw new PersistentMutationFencedError()
+                    }
                 } else DBState.db.characters[selectedChar].chats[selectedChat] = chat
             },
             invalidateSession: () => {
@@ -2262,7 +2533,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
                     chat,
                     selectedChar,
                     selectedChat,
-                    messageIndex,
+                    historyWindow ? toWindowIndex(chat, messageIndex) : messageIndex,
                     abortSignal,
                 ),
             speak: async (data) => {
@@ -2313,7 +2584,8 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
             chatAdditonalTokens: arg.chatAdditonalTokens,
             continue: true,
             signal: abortSignal,
-            usedContinueTokens: resultTokens
+            usedContinueTokens: resultTokens,
+            historyLimit: arg.historyLimit,
         }, reservation)
     }
 
@@ -2366,7 +2638,8 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
         await acknowledgeCompletedGeneration()
         responseApplication.release()
         return await sendChat(chatProcessIndex, {
-            signal: abortSignal
+            signal: abortSignal,
+            historyLimit: arg.historyLimit,
         }, reservation)
     }
 
@@ -2581,7 +2854,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
                 throwError("Stable diffusion in group chat is not supported")
             }
 
-            const msgs = DBState.db.characters[selectedChar].chats[selectedChat].message
+            const msgs = (boundedChat ?? DBState.db.characters[selectedChar].chats[selectedChat]).message
             let msgStr = ''
             for(let i = (msgs.length - 1);i>=0;i--){
                 if(msgs[i].role === 'char'){

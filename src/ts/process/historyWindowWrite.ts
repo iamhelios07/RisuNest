@@ -1,5 +1,6 @@
 import type { WindowedConversationMutationController } from '../storage/activeWorkingSet.svelte'
-import type { Message } from '../storage/database.svelte'
+import type { Chat, Message } from '../storage/database.svelte'
+import type { HistoryWindowController } from './historyWindowController'
 
 export interface HistoryWindowChange {
     start: number
@@ -32,6 +33,14 @@ export function diffHistoryWindow(
     }
 }
 
+function changeCommand(change: HistoryWindowChange, length: number) {
+    return change.deleteCount === 0 && change.start === length
+        ? 'append'
+        : change.deleteCount === 1 && change.messages.length === 1
+        ? 'edit'
+        : 'replace-range'
+}
+
 /** Writes a script's edited window back through the controller as one range. */
 export function writeHistoryWindow(
     controller: WindowedConversationMutationController,
@@ -40,10 +49,36 @@ export function writeHistoryWindow(
     const before = controller.chat.message
     const change = diffHistoryWindow(before, after)
     if (!change) return true
-    const command = change.deleteCount === 0 && change.start === before.length
-        ? 'append'
-        : change.deleteCount === 1 && change.messages.length === 1
-        ? 'edit'
-        : 'replace-range'
-    return controller.applyRange(change.start, change.deleteCount, change.messages, command)
+    return controller.applyRange(
+        change.start,
+        change.deleteCount,
+        change.messages,
+        changeCommand(change, before.length),
+    )
+}
+
+/**
+ * Writes back a copy of the window chat that a script edited: its metadata
+ * replaces the window's, and its messages are written as one range.
+ */
+export function writeHistoryWindowChat(controller: HistoryWindowController, result: Chat): boolean {
+    const window = controller.chat
+    if (result !== window) {
+        const target = window as unknown as Record<string, unknown>
+        const source = result as unknown as Record<string, unknown>
+        for (const key of Object.keys(target)) {
+            if (key !== 'message' && !Object.hasOwn(source, key)) delete target[key]
+        }
+        for (const key of Object.keys(source)) {
+            if (key !== 'message') target[key] = source[key]
+        }
+    }
+    const change = diffHistoryWindow(window.message, result.message)
+    if (!change) return controller.reconcileMetadata()
+    return controller.applyRange(
+        change.start,
+        change.deleteCount,
+        change.messages,
+        changeCommand(change, window.message.length),
+    )
 }
