@@ -551,6 +551,8 @@ export function failureReason(code: string, direction: 'import' | 'export' = 'im
             return copy.reasonIo
         case 'source-reselect-required':
             return copy.reasonReselectSource
+        case 'import-interrupted':
+            return copy.reasonImportInterrupted
         case 'capability-unavailable':
             return copy.reasonCapability
         case 'rescue-format-not-restorable':
