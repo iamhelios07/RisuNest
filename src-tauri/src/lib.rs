@@ -249,6 +249,14 @@ fn window_state_plugin(directory: &std::path::Path) -> tauri::plugin::TauriPlugi
         .build()
 }
 
+/// Keeps IPC responses on the custom protocol after a failed body read.
+fn ipc_read_guard_script() -> String {
+    include_str!("ipc_read_guard.js").replace(
+        "__RISUNEST_ANDROID__",
+        if cfg!(target_os = "android") { "true" } else { "false" },
+    )
+}
+
 /// Product initialization shared by native entry points. An alternative entry
 /// manages its own [`AppPaths`] before building.
 pub fn builder() -> tauri::Builder<tauri::Wry> {
@@ -265,7 +273,8 @@ fn builder_with_main_window(
     let setup_native_startup_state = native_startup_state.clone();
     let mut builder = tauri::Builder::default()
         .manage(native_startup_state)
-        .plugin(tauri_plugin_opener::init());
+        .plugin(tauri_plugin_opener::init())
+        .append_invoke_initialization_script(ipc_read_guard_script());
     #[cfg(desktop)]
     {
         // Reject a second process before plugins with startup side effects run.
@@ -1039,6 +1048,14 @@ mod header_map_tests {
         assert_eq!(startup_failure_exit_code(&setup("cleanup-app-still-running")), 0);
         assert_eq!(startup_failure_exit_code(&setup("cleanup-lock-unavailable")), 1);
         assert_eq!(startup_failure_exit_code(&setup("invalid native path")), 1);
+    }
+
+    #[test]
+    fn ipc_read_guard_script_carries_its_target_flag() {
+        let script = ipc_read_guard_script();
+        assert!(!script.contains("__RISUNEST_ANDROID__"));
+        let flag = format!("const android = {};", cfg!(target_os = "android"));
+        assert!(script.contains(&flag));
     }
     use reqwest::header::{HeaderName, HeaderValue};
 
