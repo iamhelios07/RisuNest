@@ -366,7 +366,10 @@ pub(crate) async fn external_storage_stop_restore(app: AppHandle, job_id: String
         let (_, _claim) = app.state::<JobCommandState>().claim(&store.read(&job_id)?)?;
         let _permit = app.state::<crate::native_file_jobs::NativeFileJobState>()
             .admission.file(false).map_err(local_error)?;
-        reconcile_stopped_job(&app, store.read(&job_id)?)?;
+        // A restore found applied stays applied even when recording that failed.
+        if reconcile_stopped_job(&app, store.read(&job_id)?)?.summary["state"] != "uncertain" {
+            return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+        }
         let job = super::runtime_restore::stop_restore(&root, &job_id)?;
         Ok(job_summary(&root, job))
     }.await)
