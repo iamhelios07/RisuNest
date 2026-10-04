@@ -313,6 +313,7 @@ fn explicit_test_binaries() -> (PathBuf, PathBuf) {
     );
     assert!(server.is_absolute() && server.is_file());
     assert!(manager.is_absolute() && manager.is_file());
+    assert!(platform::background_manager_executable(&manager).is_file());
     (server, manager)
 }
 
@@ -962,6 +963,12 @@ async fn run_live_replacement_case(was_running: bool) {
         fs::copy(source, install.join(name)).unwrap();
         fs::copy(source, staged.join(name)).unwrap();
     }
+    // The installed manager starts its update helper from this sibling.
+    fs::copy(
+        platform::background_manager_executable(&source_manager),
+        platform::background_manager_executable(&installed_manager),
+    )
+    .unwrap();
     let replacement_proof = PathBuf::from("replacement-proof.txt");
     fs::write(install.join(&replacement_proof), b"old").unwrap();
     fs::write(staged.join(&replacement_proof), b"new").unwrap();
@@ -1361,7 +1368,7 @@ fn spawn_update_helper_subprocess() {
     let helper_dir = root.join("manager-update/helper");
     fs::create_dir_all(&helper_dir).unwrap();
     let helper = helper_dir.join("risunest-sync-update-helper.exe");
-    fs::copy(manager, &helper).unwrap();
+    fs::copy(platform::background_manager_executable(&manager), &helper).unwrap();
     let parent_lock = try_lock(&root).unwrap();
     let mut command = platform::process(helper);
     command
@@ -1614,6 +1621,12 @@ async fn interrupted_files_recovery_outlives_the_active_installed_manager() {
         fs::copy(source, install.join(name)).unwrap();
         fs::copy(source, staged.join(name)).unwrap();
     }
+    // The installed manager starts its recovery helper from this sibling.
+    fs::copy(
+        platform::background_manager_executable(&source_manager),
+        platform::background_manager_executable(&installed_manager),
+    )
+    .unwrap();
     fs::write(install.join("recovery-proof.txt"), b"old").unwrap();
     fs::write(staged.join("recovery-proof.txt"), b"new").unwrap();
 
