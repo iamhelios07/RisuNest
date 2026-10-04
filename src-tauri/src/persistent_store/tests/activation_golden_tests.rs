@@ -565,3 +565,58 @@ fn active_manifests_equal_a_full_capture_after_every_mutation_kind() {
     eprintln!("current manifest equivalence: {results:?}");
     assert!(results.iter().all(|(_, mismatches)| mismatches.is_empty()), "{results:?}");
 }
+
+/// Character detail writes per character during one activation, counted by a
+/// connection-local trigger.
+fn count_detail_writes(
+    store: &mut PersistentStore,
+    activate: impl FnOnce(&mut PersistentStore),
+) -> BTreeMap<String, i64> {
+    store
+        .connection
+        .execute_batch(
+            "CREATE TEMP TABLE detail_writes(character_id TEXT NOT NULL);
+             CREATE TEMP TRIGGER count_detail_writes AFTER UPDATE OF detail ON main.characters
+             BEGIN INSERT INTO detail_writes VALUES(NEW.character_id); END;",
+        )
+        .unwrap();
+    activate(store);
+    let writes = store
+        .connection
+        .prepare("SELECT character_id,count(*) FROM detail_writes GROUP BY character_id")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<BTreeMap<String, i64>, _>>()
+        .unwrap();
+    store.connection.execute_batch("DROP TRIGGER count_detail_writes; DROP TABLE detail_writes;").unwrap();
+    writes
+}
+
+#[test]
+fn activation_writes_each_character_detail_at_most_once() {
+    let (_directory, mut store) = seeded();
+    let stage = build_stage(&mut store);
+    let revision = store.revision().unwrap();
+    let plain = count_detail_writes(&mut store, |store| {
+        store.replace_commit(&stage, Some(revision)).unwrap();
+    });
+    eprintln!("plain activation detail writes: {plain:?}");
+    assert!(plain.values().all(|count| *count <= 1), "{plain:?}");
+
+    let (_directory, mut store) = seeded();
+    let stage = build_stage(&mut store);
+    let header = header(&store, "detail-writes-source-units");
+    let mut units = source_units();
+    units.insert(unit_key(&["character", "char-d", "desc"]).unwrap(), inline(&json!("Source D description")).unwrap());
+    units.insert(unit_key(&["character", "char-d", "firstMessage"]).unwrap(), inline(&json!("Source D greeting")).unwrap());
+    let sourced = count_detail_writes(&mut store, |store| {
+        store.lww_commit_replacement_units(&header, &stage, Some(&units)).unwrap();
+    });
+    eprintln!("sourced activation detail writes: {sourced:?}");
+    assert!(sourced.values().all(|count| *count <= 1), "{sourced:?}");
+    assert_eq!(sourced.get("char-d"), Some(&1));
+    let detail = store.read_character("char-d", None).unwrap().unwrap().value;
+    assert_eq!(detail["desc"], "Source D description");
+    assert_eq!(detail["firstMessage"], "Source D greeting");
+}

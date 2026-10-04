@@ -868,6 +868,59 @@ pub(in crate::persistent_store) fn apply(
 ) -> StoreResult<()> {
     apply_value(tx, generation, key, value, false)
 }
+/// The character whose detail `apply` patches for this key, when the patch
+/// touches nothing else.
+pub(in crate::persistent_store) fn character_detail_key(key: &UnitKey) -> Option<String> {
+    let mut p = key.components();
+    (matches!(p[0].as_str(), "character" | "group-members") && known(key)).then(|| p.swap_remove(1))
+}
+pub(in crate::persistent_store) fn character_detail(
+    tx: &Transaction<'_>,
+    generation: &str,
+    id: &str,
+) -> StoreResult<Value> {
+    text_value(
+        tx,
+        "SELECT detail FROM characters WHERE generation=?1 AND character_id=?2",
+        params![generation, id],
+    )?
+    .ok_or_else(|| error("parent-missing"))
+}
+/// Patches a held character detail the way `apply` would, for a key that
+/// `character_detail_key` accepts.
+pub(in crate::persistent_store) fn patch_character_detail(
+    tx: &Transaction<'_>,
+    detail: &mut Value,
+    key: &UnitKey,
+    value: &UnitValue,
+) -> StoreResult<()> {
+    patch_character(detail, &key.components(), json_value_resolved(tx, value)?, false)
+}
+fn patch_character(v: &mut Value, p: &[String], next: Option<Value>, local: bool) -> StoreResult<()> {
+    if p[0] == "group-members" {
+        for field in ["characters", "characterTalks", "characterActive"] {
+            patch(
+                v,
+                field,
+                next.as_ref().and_then(|v| v.get(field)).cloned(),
+            )?;
+        }
+    } else if p[2] == "statics" {
+        let messages = if local {
+            None
+        } else {
+            v.get("statics").and_then(|v| v.get("messages")).cloned()
+        };
+        let mut next = next.unwrap_or(json!({}));
+        if let Some(messages) = messages {
+            patch(&mut next, "messages", Some(messages))?;
+        }
+        patch(v, "statics", Some(next))?;
+    } else {
+        patch(v, &p[2], next)?;
+    }
+    Ok(())
+}
 fn apply_value(
     tx: &Transaction<'_>,
     generation: &str,
@@ -949,34 +1002,8 @@ fn apply_value(
             write_root(tx, generation, &v)?;
         }
         "character" | "group-members" => {
-            let mut v = text_value(
-                tx,
-                "SELECT detail FROM characters WHERE generation=?1 AND character_id=?2",
-                params![generation, p[1]],
-            )?
-            .ok_or_else(|| error("parent-missing"))?;
-            if p[0] == "group-members" {
-                for field in ["characters", "characterTalks", "characterActive"] {
-                    patch(
-                        &mut v,
-                        field,
-                        next.as_ref().and_then(|v| v.get(field)).cloned(),
-                    )?;
-                }
-            } else if p[2] == "statics" {
-                let messages = if local {
-                    None
-                } else {
-                    v.get("statics").and_then(|v| v.get("messages")).cloned()
-                };
-                let mut next = next.unwrap_or(json!({}));
-                if let Some(messages) = messages {
-                    patch(&mut next, "messages", Some(messages))?;
-                }
-                patch(&mut v, "statics", Some(next))?;
-            } else {
-                patch(&mut v, &p[2], next)?;
-            }
+            let mut v = character_detail(tx, generation, &p[1])?;
+            patch_character(&mut v, &p, next, local)?;
             commit::put_character_detail(tx, generation, &v)?;
         }
         "conversation" => {

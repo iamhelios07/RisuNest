@@ -1345,6 +1345,13 @@ pub(super) fn put_asset_alias(
     Ok(())
 }
 
+/// What a non-target replacement froze in its intent.
+pub(super) struct ReplacementProof<'a> {
+    pub(super) base_revision: i64,
+    pub(super) staging_digest: &'a str,
+    pub(super) overrides: &'a std::collections::BTreeSet<risunest_sync_wire::unit::UnitKey>,
+}
+
 pub(super) fn replace_commit_lww(
     connection: &mut Connection,
     staging_id: &str,
@@ -1356,7 +1363,7 @@ pub(super) fn replace_commit_lww(
     received: &[super::lww::Change],
     received_authority: Option<risunest_sync_wire::stamp::DecimalU64>,
     selection_change: Option<&super::sync_selection::BindingSelectionChange>,
-    replacement_proof: Option<(i64, &str)>,
+    replacement_proof: Option<ReplacementProof<'_>>,
 ) -> StoreResult<RevisionResult> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let completed: Option<(String,i64)> = transaction.query_row(
@@ -1369,12 +1376,12 @@ pub(super) fn replace_commit_lww(
     }
     if let Some(change)=selection_change {super::sync_selection::apply_binding_selection(&transaction,change)?;}
     require_staging(&transaction, staging_id)?;
-    if let Some((base_revision, expected_digest)) = replacement_proof {
+    if let Some(proof) = &replacement_proof {
         let actual = current_revision(&transaction)?;
-        if actual != base_revision {
-            return Err(StoreError::RevisionConflict { expected: base_revision, actual });
+        if actual != proof.base_revision {
+            return Err(StoreError::RevisionConflict { expected: proof.base_revision, actual });
         }
-        if super::lww::catalog_digest(&transaction, staging_id)? != expected_digest {
+        if super::lww::catalog_digest(&transaction, staging_id)? != proof.staging_digest {
             return Err(validation("replacement-stage-changed"));
         }
     }
@@ -1404,7 +1411,7 @@ pub(super) fn replace_commit_lww(
             if super::lww::parent_status(&transaction,key)?=="retired"&&!(key.components()[0]=="exists"&&matches!(value,risunest_sync_wire::unit::UnitValue::Deleted)){continue;}
             super::lww::put_unit(&transaction,key,stamp,value,&header.request_id,Some(header.binding_authority))?;
         }
-        super::lww::project_replacement_units(&transaction,generation,header,stamp,changes)?;
+        super::lww::project_replacement_units(&transaction,generation,header,stamp,changes,replacement_proof.as_ref().map(|proof| proof.overrides))?;
     }
     if !target {for (key,_) in changes{super::lww::ensure_publishable_parents(&transaction,key,header.binding_authority)?;}}
     let changed=if target {received.iter().map(|c|c.key.clone()).collect::<Vec<_>>()}else{changes.iter().map(|(k,_)|k.clone()).collect::<Vec<_>>()};

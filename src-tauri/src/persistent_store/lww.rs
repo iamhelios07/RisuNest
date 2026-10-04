@@ -269,6 +269,8 @@ enum Intent {
         base_revision: i64,
         staging_digest: String,
         changes: Vec<(UnitKey, UnitValue)>,
+        /// Changed keys whose source unit replaced the value captured from the stage.
+        overrides: BTreeSet<UnitKey>,
         source_units: Option<BTreeMap<UnitKey, UnitValue>>,
         device_sections: Option<device_store::sections::FrozenBackupSections>,
         device_changes: Vec<(UnitKey, UnitValue)>,
@@ -460,9 +462,13 @@ fn parent_status_in_generation(db: &Connection, key: &UnitKey, generation: Optio
     }
     Ok(if missing { "held" } else { "ready" })
 }
+/// Projects activated replacement units into the library. With `overrides`,
+/// the stage already holds every value it was captured from, so only those
+/// source-unit overrides, deletions and archive units are applied again, and
+/// each character detail they patch is written once.
 pub(super) fn project_replacement_units(
     tx: &Transaction<'_>, generation: &str, header: &Header, stamp: &Stamp,
-    changes: &[(UnitKey,UnitValue)],
+    changes: &[(UnitKey,UnitValue)], overrides: Option<&BTreeSet<UnitKey>>,
 ) -> StoreResult<()> {
     let mut ordered=changes.iter().collect::<Vec<_>>();
     ordered.sort_by_key(|(key,_)| match key.components()[0].as_str() {
@@ -471,17 +477,37 @@ pub(super) fn project_replacement_units(
         "archive" => 2,
         _ => 3,
     });
+    let mut details=BTreeMap::<String,Value>::new();
     for (key,value) in ordered {
         if read_unit(tx,key)? != Some((stamp.clone(),value.clone())) { continue; }
-        let hard_delete=key.components()[0]=="exists"&&matches!(value,UnitValue::Deleted);
+        let p=key.components();
+        let hard_delete=p[0]=="exists"&&matches!(value,UnitValue::Deleted);
         match parent_status_in_generation(tx,key,Some(generation))? {
             "retired" if !hard_delete => continue,
             "held" => {
                 tx.execute("INSERT INTO lww_receive_rows VALUES(?1,?2,?3,?4,'held')", params![header.request_id,key.as_str(),serde_json::to_string(stamp)?,serde_json::to_string(value)?])?;
             }
-            _ => projection::apply(tx,generation,key,value)?,
+            _ if overrides.is_none_or(|overrides| matches!(value,UnitValue::Deleted)||p[0]=="archive"||overrides.contains(key)) => {
+                if let Some(id)=projection::character_detail_key(key) {
+                    let detail=match details.entry(id) {
+                        std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            let detail=projection::character_detail(tx,generation,entry.key())?;
+                            entry.insert(detail)
+                        }
+                    };
+                    projection::patch_character_detail(tx,detail,key,value)?;
+                    continue;
+                }
+                if p[0]=="order"&&p[1]=="conversations" {
+                    if let Some(detail)=details.remove(&p[2]) { commit::put_character_detail(tx,generation,&detail)?; }
+                }
+                projection::apply(tx,generation,key,value)?;
+            }
+            _ => {}
         }
     }
+    for detail in details.values() { commit::put_character_detail(tx,generation,detail)?; }
     Ok(())
 }
 fn suppress_retired(db: &Connection, parent: &UnitKey) -> StoreResult<()> {
@@ -2263,6 +2289,7 @@ impl PersistentStore {
         // pages each conversation once all of its messages are written.
         let before = projection::capture_all(&mut self.connection, &generation, true)?;
         let mut after = projection::capture_all(&mut self.connection, staging_id, true)?;
+        let mut overrides = BTreeSet::new();
         if let Some(units) = effective_source_units {
             for (key, value) in units {
                 wire({
@@ -2272,6 +2299,9 @@ impl PersistentStore {
                     result
                 })?;
                 projection::validate_received(&self.connection, key, value)?;
+                if after.get(key) != Some(value) {
+                    overrides.insert(key.clone());
+                }
                 after.insert(key.clone(), value.clone());
             }
         }
@@ -2322,6 +2352,7 @@ impl PersistentStore {
                 changes.push((key, value));
             }
         }
+        overrides.retain(|key| changes.binary_search_by(|(changed, _)| changed.cmp(key)).is_ok());
         let device_changes = if let Some(sections) = device_sections {
             let tx = self.device_store_mut()?.transaction()?;
             verify(&tx, header.binding_authority)?;
@@ -2337,6 +2368,7 @@ impl PersistentStore {
                 base_revision,
                 staging_digest,
                 changes: changes.clone(),
+                overrides,
                 source_units: source_units.cloned(),
                 device_sections: device_sections.cloned(),
                 device_changes: device_changes.clone(),
@@ -2426,10 +2458,10 @@ impl PersistentStore {
             )?;
             let intent: Intent = serde_json::from_str(&body)?;
             self.completed_intent(header, &intent)?;
-            let Intent::Replacement { staging_id: original, base_revision, staging_digest, .. } = intent
+            let Intent::Replacement { staging_id: original, base_revision, staging_digest, overrides, .. } = intent
                 else { return Err(error("request-id-integrity")); };
             if original != staging_id { return Err(error("request-id-integrity")); }
-            Some((base_revision, staging_digest))
+            Some((base_revision, staging_digest, overrides))
         };
         let result = commit::replace_commit_lww(
             &mut self.connection,
@@ -2442,7 +2474,11 @@ impl PersistentStore {
             received,
             None,
             None,
-            proof.as_ref().map(|(revision, digest)| (*revision, digest.as_str())),
+            proof.as_ref().map(|(base_revision, staging_digest, overrides)| commit::ReplacementProof {
+                base_revision: *base_revision,
+                staging_digest,
+                overrides,
+            }),
         )?;
         if target {
             self.copy_device_unit_bodies(received)?;
