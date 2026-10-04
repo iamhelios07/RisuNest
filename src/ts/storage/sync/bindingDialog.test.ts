@@ -59,6 +59,12 @@ describe('files held only by the previous storage', () => {
             cancelLabel: language.lwwSync.cancelAction, requireChecked: false,
         })
     })
+    it('asks when other storages share files that count for none of them', async () => {
+        residency.status.mockResolvedValue({ ...status(0, [{ connectionId: 'next', objects: 1 }]), remoteObjects: 3 })
+        dialog.mockResolvedValue({ confirmed: true, checked: false })
+        expect(await confirmPreviousStorageFiles(context(external))).toBe('connect')
+        expect(dialog).toHaveBeenCalledOnce()
+    })
     it.each([
         { result: { confirmed: false, checked: false }, choice: 'cancel' },
         { result: { confirmed: false, checked: true }, choice: 'cancel' },

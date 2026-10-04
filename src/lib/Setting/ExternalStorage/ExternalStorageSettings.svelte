@@ -67,6 +67,7 @@
     let historyCursor = $state<Record<string, string | undefined>>({})
     let historyLoading = $state<Record<string, boolean>>({})
     let quota = $state<Record<string, ExternalQuotaSummary>>({})
+    let remoteOnly = $state<Record<string, number>>({})
     let recoveryKey = $state('')
     let recoveryPanel = $state<HTMLDivElement | undefined>()
     let connectionSettings = $state<ExternalConnectionSettingsMaterial | null>(null)
@@ -354,9 +355,25 @@
         expanded[connection.id] = kind
         try {
             if (kind === 'history') await loadHistory(connection, false)
-            if (kind === 'quota') quota[connection.id] = await bridge.getQuota(connection.id)
+            if (kind === 'quota') {
+                void loadRemoteOnlyFiles(connection)
+                quota[connection.id] = await bridge.getQuota(connection.id)
+            }
         } catch (reason) {
             error = externalErrorMessage(strings, reason)
+        }
+    }
+
+    /** Files only this connection holds, as the residency status counts them. */
+    async function remoteOnlyFiles(connection: ExternalConnectionSummary): Promise<number> {
+        return (await getAssetResidencyStatus()).externalObjects.find(entry => entry.connectionId === connection.id)?.objects ?? 0
+    }
+
+    async function loadRemoteOnlyFiles(connection: ExternalConnectionSummary): Promise<void> {
+        try {
+            remoteOnly[connection.id] = await remoteOnlyFiles(connection)
+        } catch {
+            delete remoteOnly[connection.id]
         }
     }
 
@@ -421,7 +438,7 @@
     async function removeConnection(connection: ExternalConnectionSummary): Promise<void> {
         let held = 0
         try {
-            held = (await getAssetResidencyStatus()).externalObjects.find(entry => entry.connectionId === connection.id)?.objects ?? 0
+            held = await remoteOnlyFiles(connection)
         } catch {}
         let download = false
         if (held) {
@@ -796,23 +813,29 @@
                     {@const usage = quota[connection.id]}
                     {@const retention = connection.retentionPolicy}
                     <div class="usage" role="tabpanel" id="{connection.id}-quota-panel" aria-labelledby="{connection.id}-quota-tab">
-                        {#if usage}
+                        {#if usage || remoteOnly[connection.id] !== undefined}
                             <dl class="kv">
-                                <dt>{strings.usedByService}</dt>
-                                <dd>{#if usage.storage.providerPhysicalKnown && usage.storage.providerPhysicalBytes !== null}{bytes(usage.storage.providerPhysicalBytes ?? undefined)}{:else}{strings.unknownUsage} <span class="text-textcolor2">({strings.unknownUsageHelp})</span>{/if}</dd>
-                                <dt>{strings.uploadedLowerBound}</dt>
-                                <dd>{atLeast(usage.storage.locallyUploadedBytesLowerBound)} · {strings.files.replace('{0}', usage.storage.locallyUploadedObjectCountLowerBound)}</dd>
-                                {#if usage.storage.latestReachable}
-                                    <dt>{strings.latestReachable}</dt>
-                                    <dd>{atLeast(usage.storage.latestReachable.knownDirectBytes)}</dd>
+                                {#if usage}
+                                    <dt>{strings.usedByService}</dt>
+                                    <dd>{#if usage.storage.providerPhysicalKnown && usage.storage.providerPhysicalBytes !== null}{bytes(usage.storage.providerPhysicalBytes ?? undefined)}{:else}{strings.unknownUsage} <span class="text-textcolor2">({strings.unknownUsageHelp})</span>{/if}</dd>
+                                    <dt>{strings.uploadedLowerBound}</dt>
+                                    <dd>{atLeast(usage.storage.locallyUploadedBytesLowerBound)} · {strings.files.replace('{0}', usage.storage.locallyUploadedObjectCountLowerBound)}</dd>
+                                    {#if usage.storage.latestReachable}
+                                        <dt>{strings.latestReachable}</dt>
+                                        <dd>{atLeast(usage.storage.latestReachable.knownDirectBytes)}</dd>
+                                    {/if}
+                                {/if}
+                                {#if remoteOnly[connection.id] !== undefined}
+                                    <dt>{strings.remoteOnlyFiles}</dt>
+                                    <dd>{remoteOnly[connection.id]}</dd>
                                 {/if}
                             </dl>
-                            {#if usage.buckets.length > 0}
-                                <p>{strings.requestUsage}</p>
-                                <dl class="kv">
-                                    {#each usage.buckets as bucket (bucket.id)}<dt>{bucket.id}</dt><dd>{bucket.used} / {bucket.limit} {bucket.unit}</dd>{/each}
-                                </dl>
-                            {/if}
+                        {/if}
+                        {#if usage && usage.buckets.length > 0}
+                            <p>{strings.requestUsage}</p>
+                            <dl class="kv">
+                                {#each usage.buckets as bucket (bucket.id)}<dt>{bucket.id}</dt><dd>{bucket.used} / {bucket.limit} {bucket.unit}</dd>{/each}
+                            </dl>
                         {/if}
                         {#if connection.capabilities.snapshotDiscovery && connection.capabilities.leaseOperations && connection.capabilities.deleteObjects}
                             <SettingButton busy={activeAction === `cleanup:${connection.id}`} disabled={busy || connection.status !== 'ready' || storageState.jobs.some(job => job.connectionId === connection.id && externalJobIsActive(job))} onclick={() => runJob(connection, 'cleanup')}>{strings.cleanup}</SettingButton>

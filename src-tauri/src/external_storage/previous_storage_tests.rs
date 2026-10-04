@@ -206,6 +206,58 @@ fn status_counts_bodies_by_holder_and_forgets_a_removed_connection() {
     assert_eq!(removed["externalObjects"], serde_json::json!([]));
 }
 
+/// Two bodies only the fixture's repository holds, the second of them
+/// registered as well for a second live connection.
+fn shared_holders(f: &mut CycleFixture) -> (ConnectedRepository, String, String) {
+    let exclusive = small_asset(&mut f.a, "external-exclusive", &[87; 96 * 1024]);
+    let shared = small_asset(&mut f.a, "external-shared", &[89; 96 * 1024]);
+    run(f.publish_a());
+    run(f.receive_b());
+    let root = f.directory_b.path().to_owned();
+    let connection = receiver_connection(f);
+    let mut second = connection.stored.clone();
+    second.id = "second".into();
+    second.descriptor_locator.connection_identity = "second-identity".into();
+    let mut connections = ConnectionStore::open(&root).unwrap();
+    connections.insert(&connection.stored).unwrap();
+    connections.insert(&second).unwrap();
+    copy_source(&root, &shared, &shared, "second");
+    assert!(!f.b.external_lww_object_is_local(&exclusive).unwrap());
+    assert!(!f.b.external_lww_object_is_local(&shared).unwrap());
+    (connection, exclusive, shared)
+}
+
+#[test]
+fn a_connection_counts_and_downloads_only_the_bodies_no_other_live_connection_holds() {
+    let mut f = CycleFixture::new();
+    let (connection, exclusive, shared) = shared_holders(&mut f);
+    let counted = status(&f.b);
+    assert_eq!((counted["remoteObjects"].as_u64(), counted["unavailableObjects"].as_u64()), (Some(2), Some(0)));
+    assert_eq!(counted["externalObjects"], serde_json::json!([{"connectionId":"receiver","objects":1}]),
+        "a body two live connections hold counts in neither");
+    let _resolver = lww_residency::install_test_source_connection(f.directory_b.path(), Arc::new(connection)).unwrap();
+    f.b.asset_residency_download_remote(Some("second"), None, None, || Ok(())).unwrap();
+    assert!(!f.b.external_lww_object_is_local(&shared).unwrap());
+    f.b.asset_residency_download_remote(Some("receiver"), None, None, || Ok(())).unwrap();
+    assert!(f.b.external_lww_object_is_local(&exclusive).unwrap());
+    assert!(!f.b.external_lww_object_is_local(&shared).unwrap(), "another connection still holds it");
+    assert_eq!(status(&f.b)["externalObjects"], serde_json::json!([]));
+    f.b.forget_external_connection_bodies("receiver").unwrap();
+    let after = status(&f.b);
+    assert_eq!(after["remoteObjects"].as_u64(), Some(1));
+    assert_eq!(after["externalObjects"], serde_json::json!([{"connectionId":"second","objects":1}]));
+}
+
+#[test]
+fn a_status_pass_opens_the_body_registry_once() {
+    let mut f = CycleFixture::new();
+    let (_connection, _exclusive, _shared) = shared_holders(&mut f);
+    let root = f.directory_b.path().to_owned();
+    lww_residency::forget_registry_opens(&root);
+    status(&f.b);
+    assert_eq!(lww_residency::registry_opens(&root), 1);
+}
+
 #[test]
 fn download_without_a_policy_change_fetches_one_connection_or_every_holder() {
     let mut f = CycleFixture::new();

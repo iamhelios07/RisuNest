@@ -168,9 +168,17 @@ struct PackedOutline {
     byte_length:u64,
     packs:Vec<String>,
 }
+/// Every connection that registered a source for a body, by connection root
+/// and ID, with the length the source `frozen` would choose records.
+pub(crate) struct BodyHolders {
+    pub byte_length:u64,
+    pub connections:BTreeSet<(PathBuf,String)>,
+}
 impl RemoteBodies {
     pub(crate) fn open(root:&Path)->std::io::Result<Self> {Self::connect(root).map_err(invalid_source)}
     fn connect(root:&Path)->Result<Self> {Ok(Self{root:root.to_owned(),db:database(root,false)?})}
+    /// Opens nothing until a first question needs the registry.
+    pub(crate) fn deferred(root:&Path)->Self {Self{root:root.to_owned(),db:None}}
     /// A registry created after the pass began is opened once it exists.
     fn db(&mut self)->Result<Option<&Connection>> {
         if self.db.is_none() {self.db=database(&self.root,false)?;}
@@ -211,6 +219,31 @@ impl RemoteBodies {
                         PackedOutline{hash:hash.clone(),byte_length:outline.byte_length,packs})
                 };
                 found.insert(hash,registered);
+            }
+        }
+        Ok(found)
+    }
+    /// The holders of every hash in `hashes` that has a registered source.
+    pub(crate) fn holders(&mut self,hashes:&[&str])->Result<BTreeMap<String,BodyHolders>> {
+        let mut found=BTreeMap::<String,BodyHolders>::new();
+        let Some(db)=self.db()? else {return Ok(found)};
+        for page in hashes.chunks(LOOKUP_PAGE) {
+            let marks=(1..=page.len()).map(|index|format!("?{index}")).collect::<Vec<_>>().join(",");
+            let mut statement=db.prepare(&format!("SELECT hash,0,library,source FROM sources WHERE hash IN ({marks})
+                UNION ALL SELECT hash,1,library,source FROM packed_sources WHERE hash IN ({marks}) ORDER BY 1,2,3")).map_err(local)?;
+            let mut rows=statement.query(rusqlite::params_from_iter(page)).map_err(local)?;
+            while let Some(row)=rows.next().map_err(local)? {
+                let hash:String=row.get(0).map_err(local)?;
+                let kind:i64=row.get(1).map_err(local)?;
+                let source:String=row.get(3).map_err(local)?;
+                let (byte_length,connection)=if kind==0 {
+                    let source:Source=serde_json::from_str(&source).map_err(local)?;
+                    (source.body.plaintext_byte_length.0,(source.connection_root,source.connection_id))
+                } else {
+                    let outline:OutlineRow=serde_json::from_str(&source).map_err(local)?;
+                    (outline.byte_length,(outline.connection_root,outline.connection_id))
+                };
+                found.entry(hash).or_insert_with(||BodyHolders{byte_length,connections:BTreeSet::new()}).connections.insert(connection);
             }
         }
         Ok(found)
@@ -1024,6 +1057,8 @@ mod registration_tests {
 #[cfg(test)]
 #[path="lww_residency_hydration_tests.rs"]
 mod hydration_tests;
+#[cfg(test)]
+pub(crate) use hydration_tests::{forget_registry_opens, register_synthetic_source, registry_opens};
 async fn remote_source(
     root: &Path,
     hash: &str,
