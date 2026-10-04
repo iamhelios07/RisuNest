@@ -126,7 +126,8 @@ import type { character, Chat, Database, Message } from '../storage/database.sve
 import { ActiveConversationSession } from '../storage/activeConversationSession'
 import { createMetadataOnlySelectedConversation } from '../storage/selectedConversationLifecycle'
 import { DBState, selectedCharID } from '../stores.svelte'
-import { doingChat, sendChat } from './index.svelte'
+import { doingChat, openSelectedHistoryWindow, sendChat } from './index.svelte'
+import { findActiveHistoryWindow, getHistoryWindowStart } from './historyWindowIndex'
 
 function messages(count: number): Message[] {
     return Array.from({ length: count }, (_, index): Message => ({
@@ -576,5 +577,55 @@ describe('sendChat with the history window', () => {
 
         expect((mocks.session as ActiveConversationSession).totalMessages).toBe(999)
         expect(mocks.alertError).toHaveBeenCalledWith('conversation changed')
+    })
+})
+
+describe('openSelectedHistoryWindow', () => {
+    beforeEach(() => {
+        mocks.deviceSettings = { generationHistoryLimitEnabled: true, generationHistoryLimitMultiplier: 2 }
+        mocks.flushPendingData.mockClear()
+    })
+
+    it('opens the token window and registers it for the step that runs over it', async () => {
+        const stored = messages(1000)
+        installWindowed(stored)
+
+        const window = await openSelectedHistoryWindow({ register: true })
+
+        expect(getHistoryWindowStart(window!.chat)).toBe(900)
+        expect(window!.chat.message.map((message) => message.data)).toEqual(
+            Array.from({ length: 100 }, (_, index) => `m${900 + index}`),
+        )
+        expect(findActiveHistoryWindow('character-a', 'chat-a')).toBe(window!.controller)
+        window!.release()
+        expect(findActiveHistoryWindow('character-a', 'chat-a')).toBeNull()
+    })
+
+    it('opens a tail from an absolute index and writes it back there', async () => {
+        const stored = messages(1000)
+        const before = structuredClone(stored.slice(0, 995))
+        const { bodyReads } = installWindowed(stored)
+
+        const window = await openSelectedHistoryWindow({ tailStart: (total) => total - 5 })
+
+        expect(bodyReads).toEqual([[995, 5]])
+        expect(findActiveHistoryWindow('character-a', 'chat-a')).toBeNull()
+        expect(window!.controller.applyRange(4, 1, [{ role: 'char', data: 'edited', chatId: 'id-999' }], 'edit')).toBe(true)
+        window!.release()
+        expect(stored.slice(0, 995)).toEqual(before)
+        expect(stored.at(-1)?.data).toBe('edited')
+    })
+
+    it('opens a tail of a complete conversation from its session', async () => {
+        const stored = messages(1000)
+        const { session } = installComplete(stored)
+
+        const window = await openSelectedHistoryWindow({ tailStart: () => 998 })
+
+        expect(window!.chat.message.map((message) => message.data)).toEqual(['m998', 'm999'])
+        expect(window!.controller.applyRange(2, 0, [{ role: 'user', data: 'appended', chatId: 'appended' }], 'append')).toBe(true)
+        window!.release()
+        expect(session.totalMessages).toBe(1001)
+        expect(DBState.db.characters[0].chats[0].message.at(-1)?.data).toBe('appended')
     })
 })

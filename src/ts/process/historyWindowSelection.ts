@@ -97,6 +97,36 @@ export async function selectHistoryWindow(
     }
 }
 
+/** The messages from `start` through the newest one, without a token walk. */
+export async function readHistoryWindowTail(
+    reader: HistoryWindowReader,
+    start: number,
+    assertCurrent?: () => void,
+    pageSize = DEFAULT_PAGE_SIZE,
+): Promise<HistoryWindowSelection> {
+    const total = reader.totalMessages
+    const from = Math.min(Math.max(Math.trunc(start) || 0, 0), total)
+    const messages: Message[] = []
+    let bodyPages = 0
+    for (let index = from; index < total;) {
+        const limit = Math.min(pageSize, total - index)
+        const page = await reader.read(index, limit)
+        assertCurrent?.()
+        if (page.length !== limit) throw new Error('History window page is incomplete')
+        messages.push(...page)
+        index += limit
+        bodyPages += 1
+    }
+    return {
+        start: from,
+        messages,
+        totalMessages: total,
+        endedAtAllBefore: false,
+        bodyRows: messages.length,
+        bodyPages,
+    }
+}
+
 export interface HistoryWindowHypaPlan {
     /** Ids of the enabled messages after the last `allBefore` marker. */
     effectiveMessageMemos: string[]

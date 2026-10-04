@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import type { Chat, Message } from '../storage/database.svelte'
 import {
     planHistoryWindowHypaV3,
+    readHistoryWindowTail,
     selectHistoryWindow,
     type HistoryWindowReader,
 } from './historyWindowSelection'
@@ -209,6 +210,36 @@ describe('selectHistoryWindow', () => {
                 checks += 1
                 if (checks > 1) throw new Error('stale')
             },
+        })).rejects.toThrow('stale')
+    })
+})
+
+describe('readHistoryWindowTail', () => {
+    it('reads from the start index through the newest message in pages', async () => {
+        const { reader, reads } = readerOf(messages(10))
+        const tail = await readHistoryWindowTail(reader, 3, undefined, 4)
+        expect(tail.start).toBe(3)
+        expect(tail.messages.map((message) => message.data)).toEqual(['m3', 'm4', 'm5', 'm6', 'm7', 'm8', 'm9'])
+        expect(reads).toEqual([[3, 4], [7, 3]])
+    })
+
+    it('clamps the start index to the conversation', async () => {
+        const all = messages(3)
+        expect((await readHistoryWindowTail(readerOf(all).reader, -2)).start).toBe(0)
+        const past = readerOf(all)
+        const empty = await readHistoryWindowTail(past.reader, 5)
+        expect(empty).toMatchObject({ start: 3, messages: [] })
+        expect(past.reads).toEqual([])
+    })
+
+    it('rejects a short page and checks currency after each read', async () => {
+        const all = messages(4)
+        await expect(readHistoryWindowTail(
+            { totalMessages: 4, read: async (start, limit) => all.slice(start, start + limit - 1) },
+            0,
+        )).rejects.toThrow('incomplete')
+        await expect(readHistoryWindowTail(readerOf(all).reader, 0, () => {
+            throw new Error('stale')
         })).rejects.toThrow('stale')
     })
 })

@@ -117,8 +117,9 @@ import {
     prepareHistoryWindow,
     readStoreMessageMetadata,
     type HistoryWindowMemoryMode,
+    type HistoryWindowPreparationInput,
 } from './historyWindowGeneration'
-import type { HistoryWindowHypaPlan } from './historyWindowSelection'
+import { readHistoryWindowTail, type HistoryWindowHypaPlan, type HistoryWindowReader } from './historyWindowSelection'
 import { writeHistoryWindowChat } from './historyWindowWrite'
 
 export { doingChat } from './generationState'
@@ -289,13 +290,15 @@ function sameConversationTarget(
 /**
  * Loads the newest part of the selected conversation for one generation and
  * returns a controller that writes it back by absolute position, whether the
- * conversation is windowed or complete.
+ * conversation is windowed or complete. With `tailStart`, the window holds
+ * the messages from the absolute index it returns instead of the token window.
  */
 async function prepareGenerationHistoryWindow(
     initialTarget: NonNullable<ReturnType<typeof captureSelectedConversationTarget>>,
     memory: HistoryWindowMemoryMode,
     isTargetCurrent: () => boolean,
     signal: AbortSignal,
+    tailStart?: (totalMessages: number) => number,
 ): Promise<GenerationHistoryWindow | null> {
     let target = initialTarget
     let authority = captureSelectedConversationAuthority()
@@ -322,6 +325,16 @@ async function prepareGenerationHistoryWindow(
             ? async (text: string) => (await encodeWithTokenizer(text, 'tik')).length
             : tokenize,
     }
+    const select = async (
+        reader: HistoryWindowReader,
+        readMetadata: HistoryWindowPreparationInput['readMetadata'],
+        assertCurrent: () => void,
+    ) => tailStart
+        ? {
+            selection: await readHistoryWindowTail(reader, tailStart(reader.totalMessages), assertCurrent),
+            hypaPlan: null,
+        }
+        : prepareHistoryWindow({ ...preparation, reader, readMetadata, assertCurrent })
 
     let prepared: Awaited<ReturnType<typeof prepareHistoryWindow>>
     let chat: Chat
@@ -342,12 +355,11 @@ async function prepareGenerationHistoryWindow(
         }
         const lease = await getPersistentDataStore().acquireRevision(windowedAuthority.storeRevision)
         try {
-            prepared = await prepareHistoryWindow({
-                ...preparation,
-                reader: createStoreHistoryWindowReader(lease, windowedAuthority),
-                readMetadata: () => readStoreMessageMetadata(lease, windowedAuthority, assertCurrent),
+            prepared = await select(
+                createStoreHistoryWindowReader(lease, windowedAuthority),
+                () => readStoreMessageMetadata(lease, windowedAuthority, assertCurrent),
                 assertCurrent,
-            })
+            )
         } finally {
             await lease.release()
         }
@@ -367,15 +379,14 @@ async function prepareGenerationHistoryWindow(
                 || session.version !== version
             ) throw new PersistentMutationFencedError()
         }
-        prepared = await prepareHistoryWindow({
-            ...preparation,
-            reader: createSessionHistoryWindowReader(session),
-            readMetadata: async () => conversation.message.map((message) => ({
+        prepared = await select(
+            createSessionHistoryWindowReader(session),
+            async () => conversation.message.map((message) => ({
                 chatId: message.chatId,
                 disabled: message.disabled,
             })),
             assertCurrent,
-        })
+        )
         assertCurrent()
         chat = { ...preparation.conversation, message: prepared.selection.messages } as Chat
         initial = captureSessionHistoryWindowController(
@@ -437,6 +448,61 @@ async function prepareGenerationHistoryWindow(
         characterId: target.characterId,
         conversationId: target.conversationId,
         shell: authority ? conversation : null,
+    }
+}
+
+export interface SelectedHistoryWindow {
+    readonly chat: Chat
+    readonly controller: HistoryWindowController
+    release(): void
+}
+
+/**
+ * Opens a history window over the selected conversation for a chat-screen
+ * step that runs outside generation: the token window, or with `tailStart`
+ * the messages from the absolute index it returns. A registered window is
+ * what CBS, Lua and regex read while the step runs.
+ */
+export async function openSelectedHistoryWindow(options: {
+    tailStart?: (totalMessages: number) => number
+    register?: boolean
+    signal?: AbortSignal
+} = {}): Promise<SelectedHistoryWindow | null> {
+    const target = captureSelectedConversationTarget()
+    if (!target) return null
+    const authorityEpoch = getPersistentStorageAuthorityEpoch()
+    const isTargetCurrent = () => {
+        try {
+            assertPersistentMutationAllowed(authorityEpoch)
+        } catch (error) {
+            if (error instanceof PersistentMutationFencedError) return false
+            throw error
+        }
+        return sameConversationTarget(captureSelectedConversationTarget(), target)
+    }
+    const window = await prepareGenerationHistoryWindow(
+        target,
+        'none',
+        isTargetCurrent,
+        options.signal ?? new AbortController().signal,
+        options.tailStart,
+    )
+    if (!window) return null
+    const unregister = options.register
+        ? registerActiveHistoryWindow({
+            characterId: window.characterId,
+            conversationId: window.conversationId,
+            shell: window.shell,
+            controller: window.controller,
+        })
+        : null
+    return {
+        chat: window.chat,
+        controller: window.controller,
+        release() {
+            unregister?.()
+            window.controller.release()
+        },
     }
 }
 
