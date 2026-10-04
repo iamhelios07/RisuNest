@@ -19,6 +19,8 @@ mod external_storage;
 pub mod import_export_jobs;
 #[cfg(target_os = "ios")]
 mod ios_lifecycle;
+#[cfg(target_os = "linux")]
+mod linux_webview;
 #[allow(dead_code)]
 mod local_backup;
 mod logical_records;
@@ -302,9 +304,29 @@ fn builder_with_main_window(
             .plugin(windows_appearance::init())
             .plugin(windows_webview::init());
     }
+    #[cfg(target_os = "linux")]
+    {
+        builder = builder.plugin(linux_webview::init());
+    }
     #[cfg(target_os = "macos")]
     {
         builder = builder.manage(macos_lifecycle::ExitState::default());
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        // Replaces Tauri's default handler, which only reloads.
+        builder = builder.on_web_content_process_terminate(|webview| {
+            if webview.label() == "main" {
+                crate::nlog!("error", "WebKit web content process ended");
+                renderer_recovery::renderer_exited(webview.app_handle());
+                // A quit that arrives before the reloaded document is ready no longer waits for it.
+                #[cfg(target_os = "macos")]
+                macos_lifecycle::document_started(webview.app_handle());
+            }
+            if let Err(error) = webview.reload() {
+                crate::nlog!("error", "Could not reload after the web content process ended: {error}");
+            }
+        });
     }
     #[cfg(target_os = "android")]
     {
