@@ -2,6 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { SandboxHost } from './factory'
 import {
+    createProductionPluginDatabaseAccess,
+    linkPluginQueryAbortSignals,
+} from '../pluginDatabaseAccess'
+import {
     executePluginV3,
     getV3PluginInstance,
     loadV3Plugins,
@@ -517,6 +521,39 @@ function __postToParent(message) {
                 { message: 'for ab', sender: 'sender', channel: 'c' },
             ])
         })
+    })
+
+    it('reaches the private conversation context read from the guest with the db decision', async () => {
+        const name = 'context-reader'
+        const readConversationContext = vi.fn(async () => ({ revision: 7, characterId: 'char' }))
+        vi.mocked(createProductionPluginDatabaseAccess).mockReturnValueOnce({ readConversationContext } as never)
+        vi.mocked(linkPluginQueryAbortSignals).mockImplementation((...signals) => {
+            const controller = new AbortController()
+            for (const signal of signals) signal?.addEventListener('abort', () => controller.abort(signal.reason))
+            return { signal: controller.signal, dispose() {} }
+        })
+        mocks.confirm.mockResolvedValueOnce(false)
+        await startFixture(name, 'globalThis.rpcReady = Promise.resolve()')
+
+        const result = await guest(name, `
+            const context = await risuai.risunestReadConversationContext({
+                characterId: 'char',
+                conversationId: 'conv',
+                include: { persona: true },
+                messages: { limit: 2 },
+            });
+            return JSON.stringify(context);
+        `)
+
+        expect(JSON.parse(String(result))).toEqual({ revision: 7, characterId: 'char' })
+        expect(mocks.confirm).toHaveBeenCalledTimes(1)
+        expect(readConversationContext).toHaveBeenCalledWith(
+            expect.objectContaining({
+                target: { characterId: 'char', conversationId: 'conv' },
+                messages: { window: { limit: 2 }, extraFields: [] },
+            }),
+            { allowPrivate: false, signal: expect.any(AbortSignal) },
+        )
     })
 
     it('does not log RPC request or response payloads when DEV is false', async () => {

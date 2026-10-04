@@ -1,5 +1,6 @@
 import { RevisionConflictError, SnapshotReleasedError, type PersistentDataStore, type AssetAlias } from '../../src/ts/storage/persistentDataStore'
 import type { Database } from '../../src/ts/storage/database.svelte'
+import { normalizeConversationContextInput, readPinnedConversationContext } from '../../src/ts/plugins/conversationContext'
 
 const canonical = (value: unknown): string => JSON.stringify(value, (_key, item) =>
     item && typeof item === 'object' && !Array.isArray(item)
@@ -15,6 +16,48 @@ export async function verifyContractReadback(store: PersistentDataStore): Promis
     equal(root.value.username, 'contract-committed', 'delta survives reopen')
     equal((root.value as typeof root.value & { syntheticLarge?: string }).syntheticLarge, largeText, 'large transport survives reopen')
     equal((await store.readAssetAliasesByKeys('asset', aliases.map(alias => alias.key))).value, aliases, 'aliases survive reopen')
+}
+
+async function readContext(store: PersistentDataStore, characterId: string, conversationId: string, revision: number, beforeCharacter?: () => Promise<void>) {
+    const lease = await store.acquireRevision(revision)
+    const reader = new Proxy(lease, { get(target, key) {
+        const value = Reflect.get(target, key, target)
+        if (typeof value !== 'function') return value
+        if (key !== 'readCharacter' || !beforeCharacter) return value.bind(target)
+        return async (...args: unknown[]) => {
+            const hook = beforeCharacter
+            beforeCharacter = undefined
+            await hook!()
+            return value.apply(target, args)
+        }
+    } })
+    try {
+        return await readPinnedConversationContext(reader, normalizeConversationContextInput({
+            characterId, conversationId, include: { character: true, lore: true }, messages: { limit: 128 },
+        }), { selected: null, allowPrivate: true })
+    } finally { await lease.release() }
+}
+
+export async function verifyPinnedConversationContext(store: PersistentDataStore, fixture: Database): Promise<void> {
+    const character = fixture.characters[1]
+    const chat = character.chats[1]
+    const head = (await store.readRoot()).revision
+    let committed = false
+    const pinned = await readContext(store, character.chaId, chat.id!, head, async () => {
+        const metadata = await store.readConversationMetadata(character.chaId, chat.id!)
+        await store.commit({ expectedRevision: head,
+            rootMutations: [{ type: 'set', key: 'syntheticContext', value: 'late' }],
+            conversations: [{ type: 'replace-range', characterId: character.chaId, conversationId: chat.id!,
+                start: chat.message.length, deleteCount: 0, messages: [{ role: 'char', data: 'late', chatId: 'context-late' }],
+                conversation: { ...metadata!.value.conversation, name: 'late name' } }] })
+        committed = true
+    })
+    if (!committed) throw new Error('context commit did not run')
+    equal([pinned?.revision, pinned?.characterIndex, pinned?.chatIndex, pinned?.messageCount], [head, 1, 1, chat.message.length], 'context pinned position')
+    equal([pinned?.character?.chaId, pinned?.conversation.name], [character.chaId, chat.name], 'context pinned records')
+    equal(pinned?.messages?.messages.map(message => message.chatId), chat.message.map(message => message.chatId), 'context pinned window')
+    const after = await readContext(store, character.chaId, chat.id!, head + 1)
+    equal([after?.revision, after?.messageCount, after?.conversation.name], [head + 1, chat.message.length + 1, 'late name'], 'context after commit')
 }
 
 export async function runContractScenarios(store: PersistentDataStore, fixture: Database, reopen: () => Promise<PersistentDataStore>): Promise<void> {
@@ -55,5 +98,6 @@ export async function runContractScenarios(store: PersistentDataStore, fixture: 
     let released: unknown
     try { await lease.readRoot() } catch (error) { released = error }
     if (!(released instanceof SnapshotReleasedError)) throw new Error('released lease still readable')
+    await verifyPinnedConversationContext(store, fixture)
     await verifyContractReadback(await reopen())
 }
