@@ -4,6 +4,7 @@ mod character_json_export;
 mod character_png_export;
 pub mod charx;
 mod content;
+pub(crate) mod download_handoff;
 mod error;
 mod jpeg_asset;
 pub mod screenshot_output;
@@ -869,16 +870,18 @@ fn handoff_name(path: &Path, prefix: &str, suffix: &str) -> bool {
     })
 }
 
-fn cleanup_handoff_path(
+/// Checks that `path` is an app-owned handoff file; `false` when it is gone.
+fn owned_handoff_file(
     root: &Path,
     path: &Path,
     prefix: &str,
     suffix: &str,
     label: &str,
+    failure_code: &str,
 ) -> Result<bool, NativeJobError> {
     let handoffs_root = root.join("handoffs").canonicalize().map_err(|error| {
         NativeJobError::new(
-            "cleanup-failed",
+            failure_code,
             format!("{label} handoff root cannot be resolved: {error}"),
         )
     })?;
@@ -889,7 +892,7 @@ fn cleanup_handoff_path(
     {
         return Err(NativeJobError::new(
             "invalid-input",
-            format!("{label} handoff cleanup target is not app-owned"),
+            format!("{label} handoff target is not app-owned"),
         ));
     }
     let metadata = match fs::symlink_metadata(path) {
@@ -897,7 +900,7 @@ fn cleanup_handoff_path(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => {
             return Err(NativeJobError::new(
-                "cleanup-failed",
+                failure_code,
                 format!("{label} handoff metadata is unavailable: {error}"),
             ))
         }
@@ -905,7 +908,7 @@ fn cleanup_handoff_path(
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err(NativeJobError::new(
             "invalid-input",
-            format!("{label} handoff cleanup target is not an owned regular file"),
+            format!("{label} handoff target is not an owned regular file"),
         ));
     }
     #[cfg(windows)]
@@ -915,9 +918,22 @@ fn cleanup_handoff_path(
         if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err(NativeJobError::new(
                 "invalid-input",
-                format!("{label} handoff cleanup target is a reparse point"),
+                format!("{label} handoff target is a reparse point"),
             ));
         }
+    }
+    Ok(true)
+}
+
+fn cleanup_handoff_path(
+    root: &Path,
+    path: &Path,
+    prefix: &str,
+    suffix: &str,
+    label: &str,
+) -> Result<bool, NativeJobError> {
+    if !owned_handoff_file(root, path, prefix, suffix, label, "cleanup-failed")? {
+        return Ok(false);
     }
     match fs::remove_file(path) {
         Ok(()) => Ok(true),
@@ -942,6 +958,7 @@ fn is_owned_handoff_name(path: &Path) -> bool {
         || handoff_name(path, "risu-character-card-", ".json")
         || handoff_name(path, "risu-character-card-", ".png")
         || handoff_name(path, "risu-module-", ".risum")
+        || handoff_name(path, download_handoff::PREFIX, download_handoff::SUFFIX)
 }
 
 fn cleanup_stale_handoffs(root: &Path) -> Result<(), String> {
@@ -8528,11 +8545,20 @@ mod tests {
                 "character-charx" => cleanup_character_charx_handoff_path,
                 "character-card" => cleanup_character_card_handoff_path,
                 "risu-module" => cleanup_risu_module_handoff_path,
+                "download" => |root, path| {
+                    cleanup_handoff_path(
+                        root,
+                        path,
+                        download_handoff::PREFIX,
+                        download_handoff::SUFFIX,
+                        "download",
+                    )
+                },
                 other => panic!("fixture grammar {other} has no cleanup entry point"),
             }
         };
         let grammars = fixture["managedHandoffs"].as_array().unwrap();
-        assert_eq!(grammars.len(), 6, "grammar count drifted from the fixture");
+        assert_eq!(grammars.len(), 7, "grammar count drifted from the fixture");
 
         for grammar in grammars {
             let kind = grammar["kind"].as_str().unwrap();
@@ -8617,6 +8643,7 @@ mod tests {
             format!("risu-character-card-{uuid}.json"),
             format!("risu-character-card-{uuid}.png"),
             format!("risu-module-{uuid}.risum"),
+            format!("risu-download-{uuid}.bin"),
         ];
         for name in &owned {
             fs::write(handoffs.join(name), b"synthetic handoff").unwrap();

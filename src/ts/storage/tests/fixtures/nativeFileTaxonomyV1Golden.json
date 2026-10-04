@@ -37,6 +37,11 @@
         "kind": "risu-module",
         "prefix": "risu-module-",
         "suffixes": [".risum"]
+      },
+      {
+        "kind": "download",
+        "prefix": "risu-download-",
+        "suffixes": [".bin"]
       }
     ],
     "risuSaveExport": {
