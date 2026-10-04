@@ -1,7 +1,7 @@
 use super::snapshot_archive::Archive;
 use super::{
     active_generation, current_revision, CheckpointMode, ReadTarget, SnapshotCreated, SnapshotInfo,
-    StoreError, StoreResult, DATABASE_FILE, GENERATION_TABLES,
+    StoreError, StoreResult, DATABASE_FILE,
 };
 use crate::asset_repository::migration_gc::AssetRootSet;
 use crate::asset_repository::PayloadCas;
@@ -156,6 +156,8 @@ fn prepare_restore_candidate(persistent_dir: &Path, target: &Path) -> StoreResul
     let result = (|| -> StoreResult<()> {
         let mut connection = Connection::open(&candidate)?;
         super::schema::initialize(&mut connection)?;
+        // A snapshot can hold a partly purged retired library, which restore never reads.
+        while super::commit::purge_retired_batch(&mut connection, 4096)? {}
         let transaction = connection.transaction()?;
         super::message_pages::accept_copied_database(&transaction)?;
         transaction.commit()?;
@@ -217,9 +219,9 @@ pub(super) fn sweep_temporary_generations(
     transaction.execute("DELETE FROM snapshot_leases", [])?;
     let active = active_generation(&transaction)?;
     let mut statement = transaction.prepare(
-        "SELECT generation FROM root
-         WHERE generation LIKE 'staging-%'
-            OR generation LIKE 'snapshot-%'",
+        "SELECT id FROM generations WHERE state = 'staging'
+         UNION SELECT generation FROM root
+         WHERE generation NOT IN (SELECT id FROM generations)",
     )?;
     let mut stale = statement
         .query_map([], |row| row.get::<_, String>(0))?
@@ -237,7 +239,7 @@ pub(super) fn sweep_temporary_generations(
         )?;
         let snapshot_stage: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM snapshot_restore_stages WHERE stage_id=?1 AND state='staged')",[&generation],|row|row.get(0))?;
         if generation != active && retained_stage != Some(generation.as_str()) && !binding_stage && !snapshot_stage {
-            delete_generation(&transaction, &generation)?;
+            super::commit::retire_generation(&transaction, &generation)?;
         }
     }
     transaction.commit()?;
@@ -495,16 +497,6 @@ pub(super) fn snapshot_path_is_link_or_reparse(path: &Path) -> StoreResult<bool>
     {
         Ok(false)
     }
-}
-
-fn delete_generation(transaction: &rusqlite::Transaction<'_>, generation: &str) -> StoreResult<()> {
-    for (table, _) in GENERATION_TABLES.iter().rev() {
-        transaction.execute(
-            &format!("DELETE FROM {table} WHERE generation = ?1"),
-            [generation],
-        )?;
-    }
-    Ok(())
 }
 
 fn logical_database_bytes(connection: &Connection) -> StoreResult<u64> {

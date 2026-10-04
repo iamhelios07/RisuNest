@@ -413,6 +413,8 @@ fn restore_risu_save_reader_controlled<R: Read>(
         Ok(result) => Ok(result),
         Err(error) => match sink.abort(&staging_id) {
             Ok(()) => Err(error),
+            Err(StoreError::Validation { message })
+                if message == crate::persistent_store::commit::STAGE_ACTIVATED => Err(error),
             Err(abort_error) => Err(cleanup_failed(format!(
                 "{}; staging abort failed: {}",
                 error.message, abort_error
@@ -3282,6 +3284,27 @@ mod tests {
         let store = sink.store.lock().unwrap();
         assert_eq!(store.revision().unwrap(), 1);
         assert_eq!(store.materialize(Some(1)).unwrap()["username"], "Old");
+    }
+
+    #[test]
+    fn a_failure_after_the_library_commit_keeps_the_restored_library() {
+        let (directory, sink) = fixture();
+        let path = directory.path().join("committed.risudat");
+        fs::write(&path, save_bytes(valid_blocks())).unwrap();
+        sink.store.lock().unwrap().device_store().unwrap().connection().execute_batch(
+            "CREATE TRIGGER fail_completion BEFORE UPDATE OF complete ON lww_intents
+             BEGIN SELECT RAISE(ABORT,'synthetic completion failure'); END;",
+        ).unwrap();
+        let registry = JobRegistry::default();
+        let job = registry.create(JobKind::RestoreBlockRisuSave).unwrap();
+
+        let error = restore_block_risu_save_path(&path, 1, &job, &sink).unwrap_err();
+
+        assert_ne!(error.code, "cleanup-failed", "{}", error.message);
+        assert_eq!(sink.abort_calls.load(Ordering::Acquire), 1);
+        let store = sink.store.lock().unwrap();
+        assert_eq!(store.revision().unwrap(), 2);
+        assert_eq!(store.materialize(None).unwrap()["username"], "Imported");
     }
 
     fn msgpackr_parity_fixture() -> Value {

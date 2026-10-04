@@ -209,6 +209,7 @@ impl PersistentStore {
             self.connection.execute("ATTACH DATABASE ?1 AS binding_incoming", [path.to_string_lossy().as_ref()])?;
             let copied = (|| -> StoreResult<()> {
                 let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                super::commit::begin_generation(&tx, &id)?;
                 for &(table, _) in GENERATION_TABLES {
                     copy_binding_table(&tx, table, &id)?;
                 }

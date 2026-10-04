@@ -220,6 +220,10 @@ fn startup_sweeps_unattested_and_abandoned_stages_but_retains_frozen_binding_sta
     store.connection.execute("DELETE FROM lww_binding_stages WHERE staging_id=?1",[&unattested.staging_id]).unwrap();
     drop(store); let mut store=PersistentStore::open(dir.path()).unwrap();
     for id in [&abandoned,&unattested.staging_id] {
+        assert_eq!(commit::generation_state(&store.connection,id).unwrap().as_deref(),Some("retired"));
+    }
+    while store.purge_retired_batch(256).unwrap() {}
+    for id in [&abandoned,&unattested.staging_id] {
         assert_eq!(store.connection.query_row("SELECT count(*) FROM root WHERE generation=?1",[id],|r|r.get::<_,i64>(0)).unwrap(),0);
     }
     assert!(store.lww_stage_binding_units(&other_header,&other_inspection,&[],0.into()).is_err());

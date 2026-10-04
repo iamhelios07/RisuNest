@@ -526,7 +526,7 @@ fn full_restore_recovers_original_inputs_after_library_and_device_transaction_fa
         let sections=full_device_backup(Some("frozen")); let stage=restore_stage(&mut store,"frozen");
         let header=Header{binding_authority:0.into(),request_id:format!("crash-device-restore-{phase}")};
         let original=BTreeMap::from([(unit_key(&["future-unit","frozen"]).unwrap(),inline(&serde_json::json!(phase)).unwrap())]);
-        if phase==0 { store.connection.execute_batch("CREATE TEMP TRIGGER reject_library BEFORE DELETE ON root BEGIN SELECT RAISE(ABORT,'synthetic-library-failure'); END").unwrap(); }
+        if phase==0 { store.connection.execute_batch("CREATE TEMP TRIGGER reject_library BEFORE UPDATE ON generations BEGIN SELECT RAISE(ABORT,'synthetic-library-failure'); END").unwrap(); }
         else { store.device_store().unwrap().connection().execute_batch(if phase==1 {
             "CREATE TEMP TRIGGER reject_device BEFORE INSERT ON device_settings BEGIN SELECT RAISE(ABORT,'synthetic-device-failure'); END"
         } else {

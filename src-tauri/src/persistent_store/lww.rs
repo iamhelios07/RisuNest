@@ -38,7 +38,7 @@ CREATE TABLE lww_outbox(key TEXT PRIMARY KEY,stamp TEXT NOT NULL,value TEXT NOT 
 CREATE TABLE lww_retired(key TEXT PRIMARY KEY,stamp TEXT NOT NULL);
 CREATE TABLE lww_publications(key TEXT NOT NULL,authority TEXT NOT NULL,version TEXT NOT NULL,stamp TEXT NOT NULL,identity TEXT NOT NULL,PRIMARY KEY(key,authority));
 CREATE TABLE lww_initialization_scopes(scope TEXT NOT NULL,authority TEXT NOT NULL,PRIMARY KEY(scope,authority));
-CREATE TABLE lww_requests(request_id TEXT PRIMARY KEY,digest TEXT NOT NULL,revision INTEGER NOT NULL);
+CREATE TABLE lww_requests(request_id TEXT PRIMARY KEY,digest TEXT NOT NULL,revision INTEGER NOT NULL,activated_generation TEXT);
 CREATE TABLE lww_receive_rows(request_id TEXT NOT NULL,key TEXT NOT NULL,stamp TEXT NOT NULL,value TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('staged','held','deferred','done')),PRIMARY KEY(request_id,key));
 CREATE INDEX lww_receive_status ON lww_receive_rows(status,key);
 CREATE INDEX lww_units_scope ON lww_units(json_extract(key,'$[0]'),json_extract(key,'$[1]'),json_extract(key,'$[2]'),json_extract(key,'$[3]'));
@@ -666,6 +666,9 @@ impl PersistentStore {
             if decision==LwwDecision::ApplyRemote { values.insert(change.key,(change.stamp,change.value)); }
         }
         Ok(values.into_iter().map(|(key,(_,value))|(key,value)).collect())
+    }
+    pub(crate) fn lww_activated_receipt(&self, request_id: &str) -> StoreResult<Option<(i64, String)>> {
+        activated_receipt(&self.connection, request_id)
     }
     pub(crate) fn lww_device_replacement_receipt(
         &self,
@@ -1346,7 +1349,7 @@ impl PersistentStore {
             tx.execute("DELETE FROM lww_receive_rows", [])?;
         }
         tx.execute(
-            "INSERT OR IGNORE INTO lww_requests VALUES(?1,?2,?3)",
+            "INSERT OR IGNORE INTO lww_requests(request_id,digest,revision) VALUES(?1,?2,?3)",
             params![header.request_id, digest, current_revision(&tx)?],
         )?;
         tx.commit()?;
@@ -2164,20 +2167,18 @@ impl PersistentStore {
                 return Err(StoreError::RevisionConflict { expected, actual: base_revision });
             }
         }
-        let committed: Option<(String, i64)> = self.connection.query_row(
-            "SELECT digest,revision FROM lww_requests WHERE request_id=?1", [staging_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+        let committed: Option<(String, i64, Option<String>)> = self.connection.query_row(
+            "SELECT digest,revision,activated_generation FROM lww_requests WHERE request_id=?1", [staging_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).optional()?;
-        if let Some((committed_digest, revision)) = committed {
-            if committed_digest != digest || base_revision.checked_add(1) != Some(revision) {
+        if let Some((committed_digest, revision, activated)) = committed {
+            if committed_digest != digest || base_revision.checked_add(1) != Some(revision)
+                || activated.as_deref() != Some(staging_id)
+            {
                 return Err(error("request-id-integrity"));
             }
-            for &(table, _) in super::GENERATION_TABLES {
-                let exists: bool = self.connection.query_row(
-                    &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE generation=?1)"),
-                    [staging_id], |row| row.get(0),
-                )?;
-                if exists { return Err(error("replacement-stage-reused")); }
+            if commit::generation_state(&self.connection, staging_id)?.as_deref() == Some("staging") {
+                return Err(error("replacement-stage-reused"));
             }
         } else {
             if complete { return Err(error("replacement-receipt-missing")); }
@@ -2456,6 +2457,15 @@ fn breaks_intent_integrity(failure: &StoreError) -> bool {
         message.as_str(),
         "request-id-integrity" | "request-receipt-missing" | "replacement-stage-changed" | "replacement-receipt-missing"
     ))
+}
+
+/// The revision and the generation that a replacement receipt activated.
+pub(crate) fn activated_receipt(library: &Connection, request_id: &str) -> StoreResult<Option<(i64, String)>> {
+    let row: Option<(i64, Option<String>)> = library.query_row(
+        "SELECT revision,activated_generation FROM lww_requests WHERE request_id=?1", [request_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional()?;
+    Ok(row.and_then(|(revision, generation)| generation.map(|generation| (revision, generation))))
 }
 
 pub(crate) fn completed_device_replacement_receipt(
@@ -2760,7 +2770,7 @@ pub(super) fn record_archive_state(
         witness_received(tx, incoming, context.header.binding_authority)?;
     }
     tx.execute(
-        "INSERT INTO lww_requests VALUES(?1,?2,?3)",
+        "INSERT INTO lww_requests(request_id,digest,revision) VALUES(?1,?2,?3)",
         params![
             context.header.request_id,
             context.digest,
