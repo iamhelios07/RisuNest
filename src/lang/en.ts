@@ -3093,6 +3093,8 @@ export const languageEnglish = {
         downloadThenConnect: "Download, then connect",
         downloadFailedNotConnected: "The files could not be downloaded, so the connection was not made. Try again, or connect without downloading.",
         previousStorageUnavailable: "Files kept only on the server or external storage used before could not be fetched, so sync stopped. Try again when it can be reached.",
+        registrationRevoked: "This device's registration was removed on the server, so it cannot sync. Register this device again on the server, then enter the new registration code.",
+        bindingIncomplete: "The connection was not completed. Press Connect and sync to finish it.",
     },
 } satisfies I18nTranslation;
 

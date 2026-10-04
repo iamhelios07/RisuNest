@@ -1247,15 +1247,16 @@ impl ExternalLwwEngine {
             Err(error) => Self::fence_outcome(error, new_device),
         }
     }
-    /// Only an unreachable repository lets a binding change go ahead without
-    /// an answer, and a refusal of this device does too when the change makes
-    /// it a new device.
+    /// Only an unreachable or missing repository lets a binding change go
+    /// ahead without an answer, and a refusal of this device does too when the
+    /// change makes it a new device.
     pub(crate) fn fence_outcome(error: ProviderError, new_device: bool) -> Result<()> {
         match error.kind {
             ErrorKind::Transient
             | ErrorKind::RateLimited
             | ErrorKind::DailyQuotaExhausted
-            | ErrorKind::EndpointRejected => Ok(()),
+            | ErrorKind::EndpointRejected
+            | ErrorKind::NotFound => Ok(()),
             ErrorKind::Unauthorized | ErrorKind::ReauthRequired if new_device => Ok(()),
             _ => Err(error),
         }
@@ -1333,7 +1334,8 @@ impl ExternalLwwEngine {
             match self.reconcile_sent(&publication, &sealed, cancel).await? {
                 Settlement::Landed => true,
                 Settlement::Conflict => return Err(segment::corrupt()),
-                Settlement::Nothing | Settlement::Missing => false,
+                Settlement::Nothing => false,
+                Settlement::Missing => self.landed_before_cleanup(store, &publication, cancel).await?,
             }
         } else {
             false
@@ -1347,11 +1349,39 @@ impl ExternalLwwEngine {
             } else {
                 crate::asset_repository::job_pins::CasReleaseOutcome::Aborted
             };
-            crate::asset_repository::job_pins::DurableCasJob::open(store.repository_root(), &job.job_id)
-                .and_then(|mut pins| pins.release(outcome))
-                .map_err(transient)?;
+            crate::persistent_store::external_lww::release_cas_job(store.repository_root(), &job.job_id, outcome)
+                .map_err(store_error)?;
         }
         Ok(())
+    }
+    /// A sent segment the repository no longer holds may have landed and been
+    /// removed after a checkpoint covered it. Its sequence is reused only when
+    /// no checkpoint covers it and this device has not received it either.
+    async fn landed_before_cleanup(
+        &self,
+        store: &mut PersistentStore,
+        publication: &SealedPublication,
+        cancel: &Cancellation,
+    ) -> Result<bool> {
+        let authority = store.lww_binding_authority().map_err(store_error)?;
+        let received = store
+            .lww_receive_progress(authority)
+            .map_err(store_error)?
+            .into_iter()
+            .any(|progress| {
+                progress.kind == "external"
+                    && progress.writer_id.as_deref() == Some(publication.writer.as_str())
+                    && progress.cursor >= publication.seq
+            });
+        if received {
+            return Ok(true);
+        }
+        Ok(self.checkpoints(cancel).await?.into_iter().any(|(_, checkpoint)| {
+            checkpoint
+                .covered_prefixes
+                .get(&publication.writer)
+                .is_some_and(|prefix| *prefix >= publication.seq)
+        }))
     }
     async fn include_objects(
         &self,

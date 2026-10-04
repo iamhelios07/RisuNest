@@ -2223,6 +2223,12 @@ pub(crate) async fn external_storage_remove_connection(
         drop(pds);
         let mut store = ConnectionStore::open(&root)?;
         let stored = store.read(&connection_id)?;
+        runtime::native_store(&app)?
+            .external_lww_forget_target(&format!(
+                "{}:{}",
+                stored.descriptor.repository_id, stored.descriptor_locator.connection_identity
+            ))
+            .map_err(runtime::local_error)?;
         secrets::provider_vault(&root)
             .remove(&SecretRef(stored.credential_ref.clone()))
             .await?;

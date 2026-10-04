@@ -72,7 +72,8 @@ export interface SyncBindingTransport {
 }
 export interface SyncBindingNative {
     state(): Promise<SyncBindingState>
-    switchTarget(expected: SyncBindingState, target: BindingTarget, inspection: InspectedSyncTarget | null, requestId: string): Promise<SyncBindingState>
+    // initialPublication persists that the switched-to target still needs this device's shared state queued.
+    switchTarget(expected: SyncBindingState, target: BindingTarget, inspection: InspectedSyncTarget | null, requestId: string, initialPublication: boolean): Promise<SyncBindingState>
     assertAuthority(state: SyncBindingState): Promise<void>
 }
 export interface BindingPluginLifecycle {
@@ -264,6 +265,7 @@ export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
                     await dependencies.plugins.fenceExecution()
                 }
                 let newDeviceResult: NewDeviceBindingResult | undefined
+                let initialPublication = false
                 const activate = async () => {
                     if (preparation) {
                         newDeviceResult = await transport.replaceAsNewDevice!(staged!, preparation, context)
@@ -276,7 +278,7 @@ export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
                         return activated
                     }
                     const next = !switchRequired
-                        ? state : await dependencies.native.switchTarget(state, target, inspected, switchRequestId)
+                        ? state : await dependencies.native.switchTarget(state, target, inspected, switchRequestId, initialPublication)
                     if (!sameTarget(next.target, target) || next.libraryId !== inspected.libraryId) throw new Error('Sync target changed during activation')
                     const nextContext = bindingContext(next, controller.signal, mode)
                     await check(nextContext)
@@ -292,7 +294,7 @@ export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
                         if (!newDeviceResult) throw new Error('New device sync binding is not settled')
                         await transport.resumeNewDeviceBinding!(preparation!, newDeviceResult, activatedContext)
                     } else {
-                        if (!staged && inspected.empty && !initialStatePublished && await dependencies.hasNonDefaultSharedData()) {
+                        if (initialPublication && !initialStatePublished) {
                             await check(activatedContext)
                             await transport.publishInitialSharedState(activatedContext)
                             initialStatePublished = true
@@ -314,6 +316,8 @@ export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
                         }
                         acknowledged = true
                     }
+                    // Decided while writes are paused and carried by the switch, so a stop after the switch still publishes.
+                    initialPublication = switchRequired && !staged && inspected.empty && await dependencies.hasNonDefaultSharedData()
                     if (staged || switchRequired) {
                         activationGuard = dependencies.beginActivatedLibraryGuard()
                         dependencies.recovery?.setLifecycle({
@@ -395,7 +399,7 @@ export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
                     await active.transport.fenceOldJobs(bindingContext(active.context.state, active.context.signal))
                 }
                 return await dependencies.withPausedWrites(async () => {
-                    const next = await dependencies.gate.runTransition(() => dependencies.native.switchTarget(state, { kind: 'none' }, null, crypto.randomUUID()))
+                    const next = await dependencies.gate.runTransition(() => dependencies.native.switchTarget(state, { kind: 'none' }, null, crypto.randomUUID(), false))
                     active = undefined
                     return next
                 })

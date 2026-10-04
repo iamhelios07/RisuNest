@@ -1512,5 +1512,7 @@ export const languageSpanish = {
         downloadThenConnect: "Descargar y luego conectar",
         downloadFailedNotConnected: "No se pudieron descargar los archivos, así que no se realizó la conexión. Vuelva a intentarlo o conecte sin descargar.",
         previousStorageUnavailable: "No se pudieron obtener archivos guardados solo en el servidor o almacenamiento externo usado antes, así que la sincronización se detuvo. Vuelva a intentarlo cuando se pueda acceder.",
+        registrationRevoked: "El registro de este dispositivo se eliminó en el servidor, por lo que no puede sincronizar. Vuelva a registrar este dispositivo en el servidor y después introduzca el nuevo código de registro.",
+        bindingIncomplete: "La conexión no se completó. Pulse Connect and sync para terminarla.",
     },
 } satisfies DeepPartial<typeof import('./en').languageEnglish>;

@@ -1724,6 +1724,7 @@ mod tests {
                             let inspection = store.register_lww_binding_inspection(current.target_authority,
                                 &next, "synthetic-other-target", "synthetic-other-library")?;
                             store.switch_lww_binding(&super::super::sync_selection::SwitchBindingRequest {
+                                initial_publication: false,
                                 header: super::super::lww::Header { binding_authority: current.target_authority, request_id: "overlap-switch".into() },
                                 expected_selection_epoch: current.selection_epoch, target: next, inspection_id: Some(inspection),
                             })?;

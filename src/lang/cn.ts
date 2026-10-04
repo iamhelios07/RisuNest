@@ -1513,5 +1513,7 @@ export const languageChinese = {
         downloadThenConnect: "下载后连接",
         downloadFailedNotConnected: "无法下载文件，因此未进行连接。请重试，或不下载直接连接。",
         previousStorageUnavailable: "无法获取仅保存在之前使用的服务器或外部存储中的文件，同步已停止。请在可以访问时重试。",
+        registrationRevoked: "此设备在服务器上的注册已被移除，无法同步。请在服务器上重新注册此设备，然后输入新的注册码。",
+        bindingIncomplete: "连接未完成。请按 Connect and sync 完成连接。",
     },
 } satisfies DeepPartial<typeof import('./en').languageEnglish>;

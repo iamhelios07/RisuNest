@@ -703,6 +703,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         server_sync::commands::server_sync_lww_activate,
         server_sync::commands::server_sync_lww_hydrate,
         server_sync::commands::server_sync_lww_inspect,
+        server_sync::commands::server_sync_lww_pending_binding,
         server_sync::commands::server_sync_lww_stage_target,
         server_sync::commands::server_sync_lww_prepare_new_device,
         server_sync::commands::server_sync_lww_prepare_fresh_writer,
@@ -840,7 +841,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         #[cfg(any(windows, target_os = "linux", target_os = "ios", target_os = "macos"))]
         persistent_commit_raw::pds_commit_raw,
         persistent_store::lww_commands::pds_lww_read_outbox,
-        persistent_store::lww_commands::pds_lww_queue_unit_state_page,
+        persistent_store::lww_commands::pds_lww_finish_initial_publication,
         persistent_store::lww_commands::pds_lww_stage_receive,
         persistent_store::lww_commands::pds_lww_apply_receive,
         persistent_store::lww_commands::pds_lww_finish_receive,

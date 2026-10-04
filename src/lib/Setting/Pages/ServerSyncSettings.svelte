@@ -3,7 +3,7 @@
     import { language } from 'src/lang'
     import { alertCheckboxConfirm, alertConfirm } from 'src/ts/alert'
     import { isTauri } from 'src/ts/platform'
-    import { connectServerSync, disconnectServerSync, holdServerSync, retryServerSync, getServerSyncController, getServerSyncCacheUsage, cleanupServerSyncCache, type ServerSyncCacheUsage } from 'src/ts/storage/sync/serverSyncProduction'
+    import { completeServerSyncBinding, connectServerSync, disconnectServerSync, holdServerSync, retryServerSync, getServerSyncController, getServerSyncCacheUsage, cleanupServerSyncCache, type ServerSyncCacheUsage } from 'src/ts/storage/sync/serverSyncProduction'
     import { parseServerRegistration } from 'src/ts/storage/sync/serverSyncRegistration'
     import { serverRegistrationInbox } from 'src/ts/storage/sync/serverSyncRegistrationInbox'
     import { canScanServerRegistration, createServerQrScanner } from 'src/ts/storage/sync/serverSyncQr'
@@ -38,7 +38,8 @@
         if (['clock-skew', 'incoming-clock-skew', 'accepted-clock-correction-required'].includes(token)) return language.lwwSync.clockBlocked
         if (writerRecoveryCodes.includes(token)) return language.lwwSync.writerCollision
         if (token === 'unit-too-large') return language.lwwSync.unitTooLarge
-        if (token.startsWith('credential-')) return copy.credentialUnavailable
+        if (token === 'device-credential-unavailable') return copy.credentialUnavailable
+        if (token === 'unauthorized' || token === 'invalid-device-token') return language.lwwSync.registrationRevoked
         if (token.startsWith('qr-')) return token.includes('permission') ? copy.cameraDenied : copy.cameraUnavailable
         return copy.errorHelp
     }
@@ -108,9 +109,15 @@
                 <SettingButton onclick={() => { candidate = undefined }} disabled={busy}>{copy.discardRegistration}</SettingButton>
             </div>
         {/if}
+        {#if view.bindingIncomplete}
+            <p role="status" class="mt-2 text-sm">{language.lwwSync.bindingIncomplete}</p>
+            <div class="mt-2 flex flex-wrap gap-2">
+                <SettingButton onclick={() => void run(completeServerSyncBinding)} disabled={busy}>{copy.connect}</SettingButton>
+            </div>
+        {/if}
         {#if view.status.bound}
             <div class="mt-2 flex flex-wrap gap-2">
-                <SettingButton onclick={() => void run(retryServerSync)} disabled={busy}>{copy.syncNow}</SettingButton>
+                {#if !view.bindingIncomplete}<SettingButton onclick={() => void run(retryServerSync)} disabled={busy}>{copy.syncNow}</SettingButton>{/if}
                 <SettingButton onclick={() => void run(disconnect)} disabled={busy}>{copy.disconnect}</SettingButton>
             </div>
         {/if}
