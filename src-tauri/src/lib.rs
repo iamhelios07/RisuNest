@@ -42,6 +42,7 @@ mod persistent_commit_raw;
 #[cfg(windows)]
 mod persistent_commit_transport;
 mod persistent_store;
+mod platform_tls;
 mod portable_backup;
 #[cfg(feature = "official-publication-upload-pilot")]
 mod publication_upload;
@@ -197,7 +198,10 @@ async fn native_request(url: String, body: String, header: String, method: Strin
         return format!(r#"{{"success":false,"body":"Invalid header JSON"}}"#);
     }
 
-    let client = reqwest::Client::new();
+    let client = match platform_tls::client_builder().build() {
+        Ok(client) => client,
+        Err(e) => return format!(r#"{{"success":false,"body":"{}"}}"#, e.to_string()),
+    };
     let response: Result<reqwest::Response, reqwest::Error>;
 
     if method == "POST" {
@@ -664,7 +668,7 @@ fn builder_with_main_window(
         .manage(server_sync::commands::ServerSyncCommandState::default())
         .manage(external_storage::connection_commands::ConnectionCommandState::default())
         .manage(external_storage::job_store::JobCommandState::default())
-        .plugin(tauri_plugin_http::init())
+        .plugin(tauri_plugin_http::init_with_client_builder(platform_tls::apply))
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
