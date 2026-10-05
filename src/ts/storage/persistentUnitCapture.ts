@@ -1,6 +1,6 @@
 import type { Chat, character } from './database.svelte'
 import type { ConversationMutation, PersistentUnitMutation } from './persistentDataStore'
-import { canonicalJson, canonicalClone, messageReplaceRange } from './saveCoordinatorHelpers'
+import { canonicalJson, canonicalClone, messageReplaceRange, requiresWholeObjectCapture } from './saveCoordinatorHelpers'
 import { isConversationSummaryStub } from './conversationResidency'
 
 type CompleteCharacter = character
@@ -22,9 +22,12 @@ export function diffFields(
 }
 
 export function captureMaterializedCharacter(value: CompleteCharacter): CompleteCharacter {
+    if (requiresWholeObjectCapture(value)) return canonicalClone(value)
     const result = Object.fromEntries(Object.keys(value).filter((key) => key !== 'chats' && value[key] !== undefined)
         .map((key) => [key, canonicalClone(value[key])])) as CompleteCharacter
-    result.chats = value.chats.map((chat) => Object.fromEntries(Object.keys(chat)
+    result.chats = value.chats.map((chat) => requiresWholeObjectCapture(chat,
+        isConversationSummaryStub(chat) || !Object.prototype.propertyIsEnumerable.call(chat, 'message') ? new Set(['message']) : undefined)
+        ? canonicalClone(chat) : Object.fromEntries(Object.keys(chat)
         .filter((key) => chat[key] !== undefined && (key !== 'message' || (!isConversationSummaryStub(chat)
             && Object.prototype.propertyIsEnumerable.call(chat, 'message'))))
         .map((key) => [key, key === 'message'

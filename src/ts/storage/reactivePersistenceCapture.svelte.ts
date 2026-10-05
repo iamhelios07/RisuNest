@@ -5,6 +5,7 @@ import type { Chat, character } from './database.svelte'
 import type { RootMutation } from './persistentDataStore'
 import {
     canonicalJson,
+    requiresWholeObjectCapture,
     pluginStorageJson,
     type PluginStorageCapture,
 } from './saveCoordinatorHelpers'
@@ -215,6 +216,14 @@ export function createPersistenceCanonicalCapture(read: {
     let previousShell: NonNullable<ReturnType<NonNullable<PersistenceCanonicalCapture['characterShell']>>> | null = null
     const captureShell = () => {
         const character = read.character() as character | null
+        if (character && requiresWholeObjectCapture(character)) {
+            const captured = JSON.parse(canonicalJson(character)) as character
+            const value = { ...captured, chats: captured.chats.map(({ message: _message, ...chat }) => chat) }
+            const json = canonicalJson(value)
+            if (previousShell?.json === json) return previousShell
+            previousShellParts = []
+            return previousShell = { value, json }
+        }
         const detail = shellDetail()
         if (!character || !detail) { shellChats.clear(); previousShell = null; return null }
         const active = new Set(character.chats)
@@ -222,7 +231,15 @@ export function createPersistenceCanonicalCapture(read: {
         const chats = character.chats.map((chat) => {
             let capture = shellChats.get(chat)
             if (!capture) {
-                capture = untrack(() => objectCapture(() => chat as unknown as Record<string, unknown>, new Set(['message']), false))
+                const fields = untrack(() => objectCapture(() => chat as unknown as Record<string, unknown>, new Set(['message']), false))
+                let previous: ReturnType<typeof fields>
+                capture = () => {
+                    if (!requiresWholeObjectCapture(chat, new Set(['message']))) return fields()
+                    const { message: _message, ...metadata } = JSON.parse(canonicalJson(chat)) as Chat
+                    const json = canonicalJson(metadata)
+                    if (previous?.json === json) return previous
+                    return previous = { json, entries: null, values: undefined }
+                }
                 shellChats.set(chat, capture)
             }
             return capture()!
@@ -244,6 +261,11 @@ export function createPersistenceCanonicalCapture(read: {
                 let previous: CharacterCapture | undefined
                 let previousDetail: unknown
                 const capture = () => {
+                    if (requiresWholeObjectCapture(value)) {
+                        const json = canonicalJson(value)
+                        if (previous?.json === json) return previous
+                        return previous = { json, value: JSON.parse(json) }
+                    }
                     const capturedDetail = detail()!
                     const active = new Set(value.chats)
                     for (const chat of chats.keys()) if (!active.has(chat)) chats.delete(chat)
@@ -257,7 +279,18 @@ export function createPersistenceCanonicalCapture(read: {
                             let previousChat: Chat | undefined
                             let previousMessages: Chat['message'] | undefined
                             let previousBodyJson: string | undefined
+                            let previousWholeJson: string | undefined
                             captureChat = () => {
+                                const complete = !isConversationSummaryStub(chat) && Object.prototype.propertyIsEnumerable.call(chat, 'message')
+                                if (requiresWholeObjectCapture(chat, complete ? undefined : new Set(['message']))) {
+                                    const json = canonicalJson(chat)
+                                    if (previousWholeJson === json) return previousChat!
+                                    previousWholeJson = json
+                                    previousMetadata = undefined
+                                    previousMessages = undefined
+                                    return previousChat = JSON.parse(json)
+                                }
+                                previousWholeJson = undefined
                                 const capturedMetadata = metadata()!
                                 let nextMessages: Chat['message'] | undefined
                                 if (!isConversationSummaryStub(chat) && Object.prototype.propertyIsEnumerable.call(chat, 'message')) {
