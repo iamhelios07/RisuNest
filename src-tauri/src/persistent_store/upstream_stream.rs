@@ -1,5 +1,5 @@
 use super::{commit, PersistentStore, StoreError, StoreResult};
-use rusqlite::{params, Connection, DatabaseName, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, MAIN_DB};
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
@@ -61,7 +61,7 @@ impl RootSpool {
     pub(super) fn from_stored(connection: &Connection, generation: &str) -> StoreResult<Self> {
         let root=Self::new(Arc::new(AtomicBool::new(false)))?;
         let rowid=connection.query_row("SELECT rowid FROM root WHERE generation=?1",[generation],|r|r.get(0))?;
-        let blob=connection.blob_open(DatabaseName::Main,"root","value",rowid,true)?;
+        let blob=connection.blob_open(MAIN_DB,"root","value",rowid,true)?;
         let mut decoder=serde_json::Deserializer::from_reader(BufReader::with_capacity(64*1024,blob));
         decoder.disable_recursion_limit();
         StoredRootSeed(&root).deserialize(&mut decoder)?;
@@ -162,12 +162,15 @@ impl RootSpool {
     }
 
     pub(crate) fn count(&self, field: &str) -> StoreResult<u64> {
-        Ok(self.db.query_row("SELECT COUNT(*) FROM members WHERE field=?1 AND value IS NOT NULL",[field],|r| r.get(0))?)
+        let count: i64=self.db.query_row("SELECT COUNT(*) FROM members WHERE field=?1 AND value IS NOT NULL",[field],|r| r.get(0))?;
+        u64::try_from(count).map_err(|_|invalid("legacy root member count is negative"))
     }
 
     #[cfg(test)]
     pub(crate) fn member_storage_shape(&self) -> StoreResult<(u64,u64)> {
-        Ok(self.db.query_row("SELECT COUNT(*),COALESCE(MAX(length(CAST(value AS BLOB))),0) FROM members WHERE value IS NOT NULL",[],|row|Ok((row.get(0)?,row.get(1)?)))?)
+        let (count,bytes): (i64,i64)=self.db.query_row("SELECT COUNT(*),COALESCE(MAX(length(CAST(value AS BLOB))),0) FROM members WHERE value IS NOT NULL",[],|row|Ok((row.get(0)?,row.get(1)?)))?;
+        Ok((u64::try_from(count).map_err(|_|invalid("legacy root member count is negative"))?,
+            u64::try_from(bytes).map_err(|_|invalid("legacy root member length is negative"))?))
     }
 
     pub(crate) fn remember_id(&self, scope: &str, id: &str) -> StoreResult<bool> {
@@ -428,7 +431,7 @@ impl PersistentStore {
         // and BLOB cells, and readers continue to receive the existing root type.
         tx.execute("UPDATE root SET value=CAST(zeroblob(?2) AS TEXT) WHERE generation=?1",params![staging_id,length])?;
         let rowid=tx.query_row("SELECT rowid FROM root WHERE generation=?1",[staging_id],|r|r.get(0))?;
-        let mut blob=tx.blob_open(DatabaseName::Main,"root","value",rowid,false)?;
+        let mut blob=tx.blob_open(MAIN_DB,"root","value",rowid,false)?;
         {
             let mut writer=BufWriter::with_capacity(64*1024,&mut blob);
             root.write_root(&mut writer,true)?;
@@ -561,7 +564,7 @@ mod tests {
         let preview=commit::staged_plugin_preview(&store.connection,&stage).unwrap();
         assert_eq!(preview.plugin_names,(0..128).map(|index|format!("plugin-{index}")).collect::<Vec<_>>());
         assert!(preview.values.is_empty());
-        let root_bytes:u64=store.connection.query_row("SELECT length(CAST(value AS BLOB)) FROM root WHERE generation=?1",[&stage],|r|r.get(0)).unwrap();
+        let root_bytes:i64=store.connection.query_row("SELECT length(CAST(value AS BLOB)) FROM root WHERE generation=?1",[&stage],|r|r.get(0)).unwrap();
         assert!(root_bytes>4*1024*1024);
         assert!(root.member_storage_shape().unwrap().1<64*1024);
         assert_eq!(store.revision().unwrap(),0);
