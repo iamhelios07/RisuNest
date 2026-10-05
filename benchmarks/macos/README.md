@@ -26,5 +26,18 @@ The controller verifies:
 3. the ordinary Svelte product flow with a synthetic character
 4. application restart
 5. the existing streaming display suite
+6. a quit repeated while the first one waits ends the application without asking the product again
+
+A failed phase skips only the phases that read the data it leaves: restart and the product flow after the contracts, and application restart after the product flow. The other phases still run, and the controller reports every failure at the end.
+
+Before a remote macOS run, check locally what would otherwise fail only there: harness type errors, commands the harness invokes that no handler registers, and a harness lockfile or capability that no longer matches the product.
+
+```sh
+pnpm check:benchmark-harnesses
+test -f dist/index.html || { mkdir -p dist && printf '<!doctype html>\n' > dist/index.html; }
+test -f benchmarks/macos/dist/index.html || { mkdir -p benchmarks/macos/dist && printf '<!doctype html>\n' > benchmarks/macos/dist/index.html; }
+node benchmarks/macos/prepare.mjs
+cargo check --locked --manifest-path benchmarks/macos/native/Cargo.toml
+```
 
 Reports contain synthetic assertions, timings, hashes, and process observations. Hosted-VM frame and memory measurements are diagnostics, not physical-device responsiveness, power, total memory, signing, or notarization evidence.
