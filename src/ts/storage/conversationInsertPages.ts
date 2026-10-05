@@ -1,7 +1,7 @@
 import type { Chat, Message, character } from './database.svelte'
 import type { ConversationMutation, PersistentUnitMutation, WorkingSetCommit } from './persistentDataStore'
 import { jsonByteLength, MAX_NATIVE_REQUEST_BYTES, PayloadTooLargeError, utf8ByteLength } from './nativePersistenceValue'
-import { canonicalClone, canonicalJson } from './saveCoordinatorHelpers'
+import { canonicalClone, canonicalJson, requiresWholeObjectCapture } from './saveCoordinatorHelpers'
 
 /** Message bytes of inserted conversations in one commit of a split save. */
 export const CONVERSATION_INSERT_PAGE_BYTES = 16 * 1024 * 1024
@@ -109,6 +109,7 @@ export function planConversationInsertPages(
 }
 
 export function cloneConversationByMessage(conversation: Chat): Chat {
+    if (requiresWholeObjectCapture(conversation)) return canonicalClone(conversation)
     const { message, ...metadata } = conversation
     return { ...canonicalClone(metadata), message: message.map((value, index) => JSON.parse(canonicalJson({ [index]: value }))[index]) }
 }
