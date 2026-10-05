@@ -199,6 +199,7 @@ describe('RisuNestDataHealth', () => {
         const buttons = [...target.querySelectorAll<HTMLButtonElement>('button')]
         expect(buttons.some(button => button.textContent?.trim() === strings.discardIntent)).toBe(false)
         buttons.find(button => button.textContent?.trim() === strings.completeIntent)!.click()
+        await vi.waitFor(() => expect(maintenance.completeNativeDataHealthIntent).toHaveBeenCalled())
         await settle()
         expect(maintenance.completeNativeDataHealthIntent).toHaveBeenCalledExactlyOnceWith(0, stored.revision, stored.scannedAt)
         expect(repairRuntime.acquireDestructiveReplacementFence).toHaveBeenCalledOnce()
