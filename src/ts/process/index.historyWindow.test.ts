@@ -46,6 +46,7 @@ vi.mock('../tokenizer', async () => (await import('./tests/sendChatTestHarness')
 }))
 vi.mock('../../lang', async () => (await import('./tests/sendChatTestHarness')).langModule({
     generationConversationChanged: 'conversation changed',
+    chatConversationActionFailed: 'conversation action failed',
 }))
 vi.mock('../alert', async () => (await import('./tests/sendChatTestHarness')).alertModule({
     alertError: mocks.alertError,
@@ -128,6 +129,7 @@ import { createMetadataOnlySelectedConversation } from '../storage/selectedConve
 import { DBState, selectedCharID } from '../stores.svelte'
 import { doingChat, openSelectedHistoryWindow, sendChat } from './index.svelte'
 import { findActiveHistoryWindow, getHistoryWindowStart } from './historyWindowIndex'
+import { setChatVarOnConversation } from '../parser/chatVar.svelte'
 
 function messages(count: number): Message[] {
     return Array.from({ length: count }, (_, index): Message => ({
@@ -362,6 +364,19 @@ describe('sendChat with the history window', () => {
         expect(mutations.every((mutation) => mutation.start >= 900)).toBe(true)
     })
 
+    it('counts the window with o200k_base when the model tokenizer is remote', async () => {
+        const { encodeWithTokenizer } = await import('../tokenizer')
+        vi.mocked(encodeWithTokenizer).mockClear()
+        installWindowed(messages(1000))
+        DBState.db.googleClaudeTokenizing = true
+
+        await expect(sendChat(-1, { historyLimit: true })).resolves.toBe(true)
+
+        expect(promptContents()).toEqual(range(900, 1000))
+        const tokenizers = new Set(vi.mocked(encodeWithTokenizer).mock.calls.map((call) => call[1]))
+        expect([...tokenizers]).toEqual(['o200k_base'])
+    })
+
     it('honors the multiplier', async () => {
         installWindowed(messages(1000))
         mocks.deviceSettings = { generationHistoryLimitEnabled: true, generationHistoryLimitMultiplier: 1.5 }
@@ -473,6 +488,22 @@ describe('sendChat with the history window', () => {
         expect(mutations[0]).toMatchObject({ start: 29, deleteCount: 1 })
     })
 
+    it('stores the ids a run of window messages lacks in one write', async () => {
+        const stored = messages(1000)
+        for (const message of stored.slice(0, 990)) delete message.chatId
+        const before = structuredClone(stored)
+        const { mutations } = installWindowed(stored)
+
+        await expect(sendChat(-1, { historyLimit: true })).resolves.toBe(true)
+
+        const idWrites = mutations.filter((mutation) => mutation.start < 1000)
+        expect(idWrites).toHaveLength(1)
+        expect(idWrites[0]).toMatchObject({ start: 900, deleteCount: 90 })
+        expect(stored.slice(900, 990).every((message) => typeof message.chatId === 'string')).toBe(true)
+        expect(stored.slice(0, 900)).toEqual(before.slice(0, 900))
+        expect(stored.slice(900, 1000).map((message) => message.data)).toEqual(before.slice(900).map((message) => message.data))
+    })
+
     it('writes start trigger edits to the window and keeps chat variables', async () => {
         const stored = messages(1000)
         const { owner } = installWindowed(stored)
@@ -493,6 +524,38 @@ describe('sendChat with the history window', () => {
         expect(stored.slice(0, 900)).toEqual(messages(900))
         expect(owner.chats[0].scriptstate).toEqual({ $turn: '1' })
         expect(promptContents()).toContain('edited by trigger')
+    })
+
+    it('stores chat variables set while the prompt is built when the send stops before a reply', async () => {
+        const { owner } = installWindowed(messages(1000))
+        const controller = new AbortController()
+        mocks.processScriptFull.mockImplementation(async (_char: unknown, data: string, mode: string) => {
+            if (mode === 'editprocess') {
+                setChatVarOnConversation(findActiveHistoryWindow('character-a', 'chat-a')!.chat, 'mood', 'set')
+            }
+            return { data, emoChanged: false }
+        })
+        mocks.onModelRequest = () => controller.abort()
+        mocks.modelResponse = { type: 'fail', result: 'stopped' }
+
+        await expect(sendChat(-1, { historyLimit: true, signal: controller.signal })).resolves.toBe(false)
+
+        expect(owner.chats[0].scriptstate).toEqual({ $mood: 'set' })
+    })
+
+    it('stores chat variables set before the prompt build failed', async () => {
+        const { owner } = installWindowed(messages(1000))
+        const failure = new Error('synthetic script failure')
+        mocks.processScriptFull.mockImplementation(async (_char: unknown, _data: string, mode: string) => {
+            if (mode !== 'editprocess') throw new Error(`unexpected ${mode}`)
+            setChatVarOnConversation(findActiveHistoryWindow('character-a', 'chat-a')!.chat, 'mood', 'set')
+            throw failure
+        })
+
+        await expect(sendChat(-1, { historyLimit: true })).rejects.toBe(failure)
+
+        expect(mocks.modelRequests).toHaveLength(0)
+        expect(owner.chats[0].scriptstate).toEqual({ $mood: 'set' })
     })
 
     it('writes output trigger edits through the window', async () => {
@@ -554,6 +617,81 @@ describe('sendChat with the history window', () => {
         expect(promoted.at(-1)?.data).toBe('answer')
         expect(promoted.slice(0, 1000)).toEqual(messages(1000))
         expect(mocks.alertError).not.toHaveBeenCalled()
+    })
+
+    it('carries a streaming response over to a conversation promoted after its first part was stored', async () => {
+        const stored = messages(1000)
+        const { windowed, mutations } = installWindowed(stored)
+        let stream!: ReadableStreamDefaultController<Record<string, string>>
+        mocks.modelResponse = {
+            type: 'streaming',
+            result: new ReadableStream<Record<string, string>>({
+                start(controller) {
+                    stream = controller
+                    controller.enqueue({ response: 'first' })
+                },
+            }),
+        }
+        let firstStored!: () => void
+        const firstPart = new Promise<void>((resolve) => { firstStored = resolve })
+        const record = mutations.push.bind(mutations)
+        mutations.push = (...entries) => {
+            const length = record(...entries)
+            if (entries.some((entry) => entry.messages.some((message) => message.data === 'first'))) firstStored()
+            return length
+        }
+
+        const sending = sendChat(-1, { historyLimit: true })
+        await firstPart
+        // The promotion reads the store, which already holds the first part of the response.
+        windowed.current = false
+        const owner = DBState.db.characters[0]
+        owner.chats[0] = conversationOf(structuredClone(stored))
+        mocks.session = new ActiveConversationSession({
+            characterId: 'character-a',
+            conversationId: 'chat-a',
+            conversation: owner.chats[0],
+            storeRevision: 1,
+        })
+        stream.enqueue({ response: 'first second' })
+        stream.close()
+
+        await expect(sending).resolves.toBe(true)
+        const promoted = (mocks.session as ActiveConversationSession).materializeCompatibilityArray()
+        expect(promoted).toHaveLength(1001)
+        expect(promoted.at(-1)?.data).toBe('first second')
+        expect(promoted.slice(0, 1000)).toEqual(messages(1000))
+        // The rest of the response was written through the promoted session, not the windowed store.
+        expect((mocks.session as ActiveConversationSession).version).toBeGreaterThan(0)
+        expect(stored.at(-1)?.data).toBe('first')
+        expect(mocks.alertError).not.toHaveBeenCalled()
+    })
+
+    it('tells the user when no window opens because pending edits could not be saved', async () => {
+        installWindowed(messages(1000))
+        mocks.selectedAuthority.sessionVersion = 1
+
+        await expect(sendChat(-1, { historyLimit: true })).resolves.toBe(false)
+
+        expect(mocks.flushPendingData).toHaveBeenCalledWith('generation-history-window')
+        expect(mocks.modelRequests).toHaveLength(0)
+        expect(mocks.alertError).toHaveBeenCalledWith('conversation action failed')
+    })
+
+    it('tells the user when the conversation changes while the window is read', async () => {
+        const stored = messages(1000)
+        const { lease } = installWindowed(stored)
+        const read = lease.readConversationWindow
+        lease.readConversationWindow = async (input: any) => {
+            const page = await read(input)
+            mocks.selectedAuthority = { ...mocks.selectedAuthority, sessionVersion: 1, persistedSessionVersion: 1 }
+            return page
+        }
+
+        await expect(sendChat(-1, { historyLimit: true })).resolves.toBe(false)
+
+        expect(mocks.modelRequests).toHaveLength(0)
+        expect(mocks.alertError).toHaveBeenCalledWith('conversation action failed')
     })
 
     it('refuses to write the response when the promoted conversation no longer holds the window', async () => {

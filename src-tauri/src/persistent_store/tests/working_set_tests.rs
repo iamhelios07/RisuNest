@@ -1033,6 +1033,76 @@ fn conversation_metadata_windows_exclude_bodies_and_classify_parser_work() {
 }
 
 #[test]
+fn conversation_metadata_windows_mark_only_marker_free_text_bodies_parser_inert() {
+    let (_directory, mut store, _) = open_fixture();
+    let bodies = [
+        Some(json!("plain text with { single } braces and <b>tags</b>")),
+        Some(json!("opens {{ only")),
+        Some(json!("closes }} only")),
+        Some(json!("<Thoughts>hidden")),
+        Some(json!("hidden</Thoughts>")),
+        Some(json!(42)),
+        Some(json!({ "text": "plain" })),
+        Some(Value::Null),
+        None,
+    ];
+    let messages: Vec<Value> = bodies
+        .iter()
+        .enumerate()
+        .map(|(index, body)| {
+            let mut value = message(&format!("body-{index}"));
+            match body {
+                Some(body) => value["data"] = body.clone(),
+                None => {
+                    value.as_object_mut().unwrap().remove("data");
+                }
+            }
+            value
+        })
+        .collect();
+    commit(
+        &mut store,
+        1,
+        ConversationMutation::ReplaceRange {
+            character_id: "char-a".to_owned(),
+            conversation_id: "conv-long".to_owned(),
+            start: 0,
+            delete_count: 0,
+            messages,
+            conversation: None,
+            configured_index: None,
+        },
+    );
+    let result = store
+        .read_conversation_message_metadata_window(
+            &ConversationWindowQuery {
+                character_id: "char-a".to_owned(),
+                conversation_id: "conv-long".to_owned(),
+                start_index: Some(0),
+                limit: Some(bodies.len() as i64),
+                anchor_message_id: None,
+                anchor_occurrence: None,
+                before: None,
+                after: None,
+            },
+            None,
+        )
+        .expect("read metadata range")
+        .expect("conversation exists");
+
+    let inert: Vec<bool> = result
+        .value
+        .messages
+        .iter()
+        .map(|message| message.parser_inert)
+        .collect();
+    assert_eq!(
+        inert,
+        [true, false, false, false, false, false, false, false, false]
+    );
+}
+
+#[test]
 fn replace_range_supports_append_insert_delete_and_conversation_lifecycle() {
     let (_directory, mut store, _) = open_fixture();
     let revision = commit(

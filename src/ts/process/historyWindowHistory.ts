@@ -8,7 +8,10 @@ import type { Message } from '../storage/database.svelte'
 
 /**
  * Presents a history operation over a window's messages at their absolute
- * positions. Reads that start before the window return the loaded part only.
+ * positions. A read that starts before the window is answered from the window
+ * start: an overlapping range returns its loaded part, and a range wholly
+ * before the window returns the window's first messages, so callers that page
+ * by `endIndex` move into the window.
  */
 export class WindowedConversationHistoryOperation implements ConversationHistoryOperation {
     readonly totalMessages: number

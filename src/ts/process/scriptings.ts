@@ -498,28 +498,35 @@ export async function runScripted(code:string, arg:{
                 }
                 ensureScriptingConversation()
                 const realValue = JSON.parse(value)
-                const originals = new Map<string, Chat['message'][number] | null>()
+                const originals = new Map<string, { count: number, message: Chat['message'][number] | null }>()
                 for (const message of ScriptingEngineState.chat.message) {
-                    if (message.chatId)
-                        originals.set(
-                            message.chatId,
-                            originals.has(message.chatId) ? null : message,
-                        )
+                    if (!message.chatId) continue
+                    const entry = originals.get(message.chatId)
+                    if (entry) {
+                        entry.count += 1
+                        entry.message = null
+                    } else originals.set(message.chatId, { count: 1, message })
                 }
                 const counts = new Map<string, number>()
                 for (const message of realValue) {
                     if (typeof message.chatId === 'string')
                         counts.set(message.chatId, (counts.get(message.chatId) ?? 0) + 1)
                 }
+                const kept = new Map<string, number>()
                 ScriptingEngineState.chat.message = realValue.map((v) => {
-                    // A getFullChat/setFullChat round trip keeps identity and plugin metadata.
-                    // New or duplicated identities remain new messages, never another output target.
-                    const original = counts.get(v.chatId) === 1 ? originals.get(v.chatId) : null
+                    // A stored chatId is kept for as many messages as the chat holds it, in order;
+                    // further copies and unknown ids become new messages, never another output
+                    // target. Plugin metadata carries over only when the id names one message on both sides.
+                    const entry = typeof v.chatId === 'string' ? originals.get(v.chatId) : undefined
+                    const used = entry ? kept.get(v.chatId) ?? 0 : 0
+                    if (!entry || used >= entry.count) return { role: v.role, data: v.data, chatId: v4() }
+                    kept.set(v.chatId, used + 1)
+                    const original = counts.get(v.chatId) === 1 ? entry.message : null
                     return {
                         ...original,
                         role: v.role,
                         data: v.data,
-                        chatId: original?.chatId ?? v4(),
+                        chatId: v.chatId,
                     }
                 })
             })
