@@ -54,6 +54,7 @@ import {
 } from './persistentDataStore'
 import type { PluginStorageMeta } from '../plugins/pluginOwner'
 import { readPluginStorageMetaOwner } from '../plugins/pluginOwner'
+import { replaceArrayRange } from '../arrayRange'
 
 const DATABASE_VERSION = 1
 const DATABASE_SCHEMA_ID = 'risunest-persistent-data-v1'
@@ -2683,7 +2684,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             )
             const firstPageStart = startPage * MESSAGE_PAGE_SIZE
             const messages = pages.flatMap((page) => page.value)
-            messages.splice(start - firstPageStart, deleteCount, ...mutation.messages)
+            replaceArrayRange(messages, start - firstPageStart, deleteCount, mutation.messages)
 
             if (delta !== 0) {
                 await this.deleteConversationPages(

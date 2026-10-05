@@ -23,6 +23,7 @@ import type {
 import type { RisuModule } from '../process/modules'
 import type { CommittedApplyOutcome } from './persistentDataRuntime'
 import { CONTENT_CHANGE_PAGE_LIMIT, RevisionConflictError } from './persistentDataStore'
+import { replaceArrayRange } from '../arrayRange'
 import { appendCharacterIdToOrder, removeCharacterIdFromOrder } from './characterOrderMutation'
 import {
     createConversationSummaryStubFromChat,
@@ -4188,7 +4189,7 @@ export class SaveCoordinator {
                         break
                     }
                     const messages = safeStructuredClone(range.messages)
-                    conversation.message.splice(range.start, deleteCount, ...messages)
+                    replaceArrayRange(conversation.message, range.start, deleteCount, messages)
                     eventMutations.push({
                         type: 'replace-range',
                         characterId: event.characterId,

@@ -17,6 +17,7 @@ import type {
     Versioned,
 } from './storage/persistentDataStore'
 import { validateConversationWindowQuery } from './storage/persistentDataStore'
+import { replaceArrayRange } from './arrayRange'
 
 declare const conversationViewportKeyBrand: unique symbol
 
@@ -319,7 +320,7 @@ implements ConversationViewportSource {
             while (replacements.length < mutation.messages.length) {
                 replacements.push(this.createInsertedKey())
             }
-            nextKeys.splice(mutation.start, mutation.deleteCount, ...replacements)
+            replaceArrayRange(nextKeys, mutation.start, mutation.deleteCount, replacements)
         }
         this.keys = nextKeys.length === this.session.totalMessages
             ? nextKeys
