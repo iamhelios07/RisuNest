@@ -1931,7 +1931,7 @@ impl RestoreBodyPlan {
         crate::trust_boundary::sync_directory(&self.directory).map_err(transient)?;
         Ok(())
     }
-    fn body_path(&self,hash:&str)->PathBuf {self.directory.join("assembly").join(hash)}
+    fn body_path(&self,hash:&str)->PathBuf {self.directory.join("assembly").join(format!("{hash}.stage"))}
     pub(crate) fn ready(&self)->Result<Option<(String,PathBuf)>> {
         let ready:Option<(String,i64)>=self.db.query_row("SELECT hash,bytes FROM bodies WHERE settled=0 AND remaining=0 ORDER BY priority,hash LIMIT 1",[],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(transient)?;
         ready.map(|(hash,length)| {
@@ -1988,7 +1988,7 @@ impl RestoreBodyPlan {
                 let bytes=read_chunk(&mut input,remote.plaintext_length,&chunk)?;
                 if output.as_ref().is_none_or(|(current,_)|current!=&hash) {
                     if let Some((_,file))=output.take() {file.sync_all().map_err(transient)?;}
-                    let path=self.directory.join("assembly").join(&hash);
+                    let path=self.directory.join("assembly").join(format!("{hash}.stage"));
                     crate::trust_boundary::open_regular_source(&path).map_err(transient)?;
                     output=Some((hash.clone(),OpenOptions::new().write(true).open(path).map_err(transient)?));
                 }
@@ -2486,7 +2486,8 @@ mod tests {
     #[test]
     fn restore_body_plan_retains_completed_packs_across_quota_and_cancelled_reopens() {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            let stage=tempfile::tempdir().unwrap();
+            let root=tempfile::tempdir().unwrap();
+            let stage=root.path().join("native-file-jobs/jobs/synthetic/external-restore-bodies");
             let provider=super::super::fake::FakeProvider::new(true);
             let repository=super::super::fake::repository();
             let root_key=[7;32];
@@ -2513,18 +2514,18 @@ mod tests {
             catalog.ciphertext_length=wire::envelope_length(&catalog.header).unwrap();
             let source=super::super::lww_residency::PackedSource {hash:risunest_sync_wire::hash(&body),byte_length:body.len() as u64,
                 chunks,packs,catalog,library_id:"synthetic-resume".into(),connection_id:"synthetic".into(),
-                connection_root:stage.path().into(),protected_snapshot:"synthetic-snapshot".into()};
+                connection_root:root.path().into(),protected_snapshot:"synthetic-snapshot".into()};
             for (index,interruption) in [ErrorKind::DailyQuotaExhausted,ErrorKind::Cancelled].into_iter().enumerate() {
-                let mut plan=RestoreBodyPlan::new(stage.path()).unwrap();
+                let mut plan=RestoreBodyPlan::new(&stage).unwrap();
                 plan.push(&source,false,&repository).unwrap();plan.seal().unwrap();
                 assert!(plan.next_pack(&root_key,&provider,&repository,&Cancellation::default()).await.unwrap());
                 assert!(plan.ready().unwrap().is_none(),"a partial multi-pack body must not settle");
                 provider.fail_read(&format!("pack-resume-{}",index+1),interruption);
                 assert_eq!(plan.next_pack(&root_key,&provider,&repository,&Cancellation::default()).await.unwrap_err().kind,interruption);
                 drop(plan);
-                assert!(stage.path().join("pack-plan/plan.sqlite").exists());
+                assert!(stage.join("pack-plan/plan.sqlite").exists());
             }
-            let mut plan=RestoreBodyPlan::new(stage.path()).unwrap();
+            let mut plan=RestoreBodyPlan::new(&stage).unwrap();
             plan.push(&source,false,&repository).unwrap();plan.seal().unwrap();
             assert!(plan.next_pack(&root_key,&provider,&repository,&Cancellation::default()).await.unwrap());
             let (hash,path)=plan.ready().unwrap().unwrap();
@@ -2532,14 +2533,17 @@ mod tests {
             plan.settled_retained(&hash).unwrap();
             assert!(!plan.next_pack(&root_key,&provider,&repository,&Cancellation::default()).await.unwrap());
             drop(plan);
-            let mut plan=RestoreBodyPlan::new(stage.path()).unwrap();
+            let mut plan=RestoreBodyPlan::new(&stage).unwrap();
             plan.push(&source,false,&repository).unwrap();plan.seal().unwrap();
             let (hash,path)=plan.ready().unwrap().unwrap();
-            assert_eq!(fs::read(path).unwrap(),body,"uncommitted control contents can replay after reopen");
+            assert_eq!(fs::read(&path).unwrap(),body,"uncommitted control contents can replay after reopen");
+            let cas=PayloadCas::new(root.path()).unwrap();
+            cas.adopt_import_payload(&path,&hash,body.len() as u64,&||false).unwrap();
+            assert_eq!(cas.read_object(&hash).unwrap().unwrap(),body);
             plan.settled(&hash).unwrap();
             assert!(!plan.next_pack(&root_key,&provider,&repository,&Cancellation::default()).await.unwrap());
             plan.finish().unwrap();
-            assert!(!stage.path().join("pack-plan").exists());
+            assert!(!stage.join("pack-plan").exists());
             assert_eq!(provider.read_attempts("pack-resume-0"),1,"completed prefix must not consume the next quota window");
             assert_eq!(provider.read_attempts("pack-resume-1"),2);
             assert_eq!(provider.read_attempts("pack-resume-2"),2);
