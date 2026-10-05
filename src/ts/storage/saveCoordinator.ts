@@ -3922,7 +3922,8 @@ export class SaveCoordinator {
                 conversationId: conversation.id!,
                 start: 0,
                 deleteCount: 0,
-                messages: safeStructuredClone(messages),
+                // The recorded body is already a private copy, and the commit copies it again before sending.
+                messages,
                 conversation: safeStructuredClone(conversation),
                 // An explicit append position makes the store refuse an existing id.
                 configuredIndex: order.length,
