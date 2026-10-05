@@ -1035,6 +1035,7 @@ impl DataHealthReader {
         for intent in &self.quarantined {
             findings.record(
                 Finding::new(codes::INTENT_QUARANTINED, "intent", intent.request_id.clone(), intent.error.clone())
+                    .at(intent.token.clone(), 0)
                     .targeting("intent", intent.kind.clone()),
             );
         }
