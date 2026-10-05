@@ -67,7 +67,7 @@ impl SyncError {
 }
 /// Client-side waits, another library operation that has not finished yet and
 /// ordering outcomes, whatever their status.
-pub(crate) const TRANSIENT_CODES: [&str; 13] = [
+pub(crate) const TRANSIENT_CODES: [&str; 14] = [
     "cancelled",
     "library-operation-busy",
     "server-sync-busy",
@@ -81,6 +81,7 @@ pub(crate) const TRANSIENT_CODES: [&str; 13] = [
     "pin-expired",
     "operation-history-expired",
     "state-pin-expired",
+    "journal-floor",
 ];
 /// Transport failures, client-side waits, server load, another library
 /// operation that has not finished yet and ordering outcomes are worth another
@@ -209,6 +210,7 @@ mod classification_tests {
             ("pin-expired", 410),
             ("operation-history-expired", 410),
             ("state-pin-expired", 410),
+            ("journal-floor", 410),
             ("stale-head", 412),
             ("operation-already-pending", 409),
             ("local-revision-changed", 409),
