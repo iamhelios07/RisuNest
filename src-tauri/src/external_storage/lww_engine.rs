@@ -632,9 +632,7 @@ impl ExternalLwwEngine {
                     let mut reused_controls = BTreeMap::new();
                     let mut reused_assets = BTreeMap::new();
                     let mut remote_bodies = super::lww_residency::RemoteBodies::deferred(store.repository_root());
-                    let server_bodies = if crate::server_sync::residency::Residency::exists(store.repository_root()) {
-                        Some(crate::server_sync::residency::Residency::open(store.repository_root()).map_err(|error| transient(error.code))?)
-                    } else { None };
+                    let mut server_bodies = None;
                     for entry in entries {
                         let before = length;
                         let marks = (
@@ -651,7 +649,7 @@ impl ExternalLwwEngine {
                             &mut reused_controls,
                             &mut reused_assets,
                             &mut remote_bodies,
-                            server_bodies.as_ref(),
+                            &mut server_bodies,
                             cancel,
                         )?;
                         // Earlier entries are never encoded again: the entry's own
@@ -1624,7 +1622,7 @@ impl ExternalLwwEngine {
         reused_controls: &mut BTreeMap<String,FrozenControlCatalog>,
         reused_assets: &mut BTreeMap<String,FrozenAssetReference>,
         remote_bodies: &mut super::lww_residency::RemoteBodies,
-        server_bodies: Option<&crate::server_sync::residency::Residency>,
+        server_bodies: &mut Option<crate::server_sync::residency::Residency>,
         cancel: &Cancellation,
     ) -> Result<Vec<String>> {
         let mut fresh = Vec::new();
@@ -1710,7 +1708,11 @@ impl ExternalLwwEngine {
                 remote_bodies.frozen(&hash)?
             } else { None };
             let server_source = if local_size.is_none() && remote_source.is_none() {
-                Some(server_bodies.ok_or_else(segment::corrupt)?
+                if server_bodies.is_none() {
+                    if !crate::server_sync::residency::Residency::exists(root) { return Err(segment::corrupt()); }
+                    *server_bodies = Some(crate::server_sync::residency::Residency::open(root).map_err(|error| transient(error.code))?);
+                }
+                Some(server_bodies.as_ref().ok_or_else(segment::corrupt)?
                     .object(&hash, None).map_err(|_| ProviderError::new(ErrorKind::Transient))?
                     .ok_or_else(segment::corrupt)?)
             } else { None };

@@ -1845,89 +1845,162 @@ pub(crate) async fn download_packed_body_file(
 
 pub(crate) struct RestoreBodyPlan {
     db: rusqlite::Connection,
-    scratch: tempfile::TempDir,
+    directory: PathBuf,
 }
 impl RestoreBodyPlan {
     pub(crate) fn new(directory: &Path) -> Result<Self> {
         ensure_directory(directory)?;
-        let scratch = tempfile::Builder::new().prefix("pack-plan-").tempdir_in(directory).map_err(transient)?;
-        let db = rusqlite::Connection::open(scratch.path().join("plan.sqlite")).map_err(transient)?;
-        db.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA cache_size=-4096; PRAGMA temp_store=FILE;
-            CREATE TABLE bodies(hash TEXT PRIMARY KEY,bytes INTEGER NOT NULL,remaining INTEGER NOT NULL,priority INTEGER NOT NULL);
-            CREATE INDEX ready_bodies ON bodies(remaining,priority,hash);
-            CREATE TABLE packs(id TEXT PRIMARY KEY,body TEXT NOT NULL,priority INTEGER NOT NULL);
-            CREATE INDEX next_pack ON packs(priority,id);
-            CREATE TABLE chunks(pack TEXT NOT NULL,hash TEXT NOT NULL,ordinal INTEGER NOT NULL,offset INTEGER NOT NULL,body TEXT NOT NULL,PRIMARY KEY(hash,ordinal));
-            CREATE INDEX pack_chunks ON chunks(pack,hash,ordinal); BEGIN").map_err(transient)?;
-        Ok(Self { db, scratch })
+        let directory=directory.join("pack-plan");
+        ensure_directory(&directory)?;
+        ensure_directory(&directory.join("assembly"))?;
+        let path=directory.join("plan.sqlite");
+        for suffix in ["","-wal","-shm"] {
+            let path=PathBuf::from(format!("{}{suffix}",path.display()));
+            if path.exists() {crate::trust_boundary::open_regular_source(&path).map_err(transient)?;}
+        }
+        let db=rusqlite::Connection::open(path).map_err(transient)?;
+        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA cache_size=-4096; PRAGMA temp_store=FILE;
+            CREATE TABLE IF NOT EXISTS bodies(hash TEXT PRIMARY KEY,bytes INTEGER NOT NULL,remaining INTEGER NOT NULL,priority INTEGER NOT NULL,source TEXT NOT NULL,settled INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS ready_bodies ON bodies(settled,remaining,priority,hash);
+            CREATE TABLE IF NOT EXISTS packs(id TEXT PRIMARY KEY,body TEXT NOT NULL,priority INTEGER NOT NULL,done INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS next_pack ON packs(done,priority,id);
+            CREATE TABLE IF NOT EXISTS chunks(pack TEXT NOT NULL,hash TEXT NOT NULL,ordinal INTEGER NOT NULL,offset INTEGER NOT NULL,body TEXT NOT NULL,done INTEGER NOT NULL,PRIMARY KEY(hash,ordinal));
+            CREATE INDEX IF NOT EXISTS pack_chunks ON chunks(pack,done,hash,ordinal);
+            CREATE TABLE IF NOT EXISTS seen(hash TEXT PRIMARY KEY); BEGIN IMMEDIATE;
+            DELETE FROM seen").map_err(transient)?;
+        Ok(Self {db,directory})
     }
     pub(crate) fn push<O:std::borrow::Borrow<wire::StoredObject>>(&self,source:&super::lww_residency::PackedSource<O>,priority:bool,repository:&RepositoryHandle)->Result<()> {
         super::lww_residency::validate_packed_source(source,repository)?;
-        let priority = if priority {0} else {1};
-        self.db.execute("INSERT INTO bodies VALUES(?1,?2,?3,?4)",rusqlite::params![source.hash,i64::try_from(source.byte_length).map_err(corrupt)?,source.chunks.len() as i64,priority]).map_err(corrupt)?;
+        let priority=if priority {0} else {1};
+        let mut digest=Sha256::new();
+        digest.update(source.hash.as_bytes());digest.update(source.byte_length.to_le_bytes());
+        for chunk in &source.chunks {digest.update(serde_json::to_vec(chunk).map_err(corrupt)?);}
+        let identity=hex::encode(digest.finalize());
+        let previous:Option<(u64,String)>=self.db.query_row("SELECT bytes,source FROM bodies WHERE hash=?1",[&source.hash],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(transient)?;
+        if previous.as_ref().is_some_and(|(size,digest)|*size!=source.byte_length || digest!=&identity) {return Err(corrupt("restore body source changed"));}
+        self.db.execute("INSERT INTO seen VALUES(?1)",[&source.hash]).map_err(corrupt)?;
+        self.db.execute("INSERT INTO bodies VALUES(?1,?2,?3,?4,?5,0) ON CONFLICT(hash) DO UPDATE SET priority=excluded.priority,settled=0",
+            rusqlite::params![source.hash,i64::try_from(source.byte_length).map_err(corrupt)?,source.chunks.len() as i64,priority,identity]).map_err(corrupt)?;
         for pack in &source.packs {
-            if !source.chunks.iter().any(|chunk| chunk.pack_id == pack.borrow().header.object_id) { continue; }
-            let remote = RemoteObject::from_stored(pack.borrow(),repository)?;
-            let encoded = serde_json::to_string(&remote).map_err(corrupt)?;
-            let previous:Option<String> = self.db.query_row("SELECT body FROM packs WHERE id=?1",[&remote.object_id],|row|row.get(0)).optional().map_err(transient)?;
-            if previous.as_ref().is_some_and(|body|body!=&encoded) { return Err(corrupt("conflicting restore pack")); }
-            self.db.execute("INSERT INTO packs VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET priority=min(priority,excluded.priority)",rusqlite::params![remote.object_id,encoded,priority]).map_err(transient)?;
+            if !source.chunks.iter().any(|chunk|chunk.pack_id==pack.borrow().header.object_id) {continue;}
+            let remote=RemoteObject::from_stored(pack.borrow(),repository)?;
+            let encoded=serde_json::to_string(&remote).map_err(corrupt)?;
+            let previous:Option<String>=self.db.query_row("SELECT body FROM packs WHERE id=?1",[&remote.object_id],|row|row.get(0)).optional().map_err(transient)?;
+            if previous.as_ref().is_some_and(|body|body!=&encoded) {return Err(corrupt("conflicting restore pack"));}
+            self.db.execute("INSERT INTO packs VALUES(?1,?2,?3,0) ON CONFLICT(id) DO UPDATE SET priority=min(priority,excluded.priority)",
+                rusqlite::params![remote.object_id,encoded,priority]).map_err(transient)?;
         }
-        let mut offset = 0u64;
-        for (ordinal,chunk) in source.chunks.iter().enumerate() {
-            self.db.execute("INSERT INTO chunks VALUES(?1,?2,?3,?4,?5)",rusqlite::params![chunk.pack_id,source.hash,ordinal as i64,i64::try_from(offset).map_err(corrupt)?,serde_json::to_string(chunk).map_err(corrupt)?]).map_err(transient)?;
-            offset = offset.checked_add(chunk.plaintext_length).ok_or_else(||corrupt("restore body length"))?;
+        if previous.is_none() {
+            let mut offset=0u64;
+            for (ordinal,chunk) in source.chunks.iter().enumerate() {
+                self.db.execute("INSERT INTO chunks VALUES(?1,?2,?3,?4,?5,0)",rusqlite::params![chunk.pack_id,source.hash,ordinal as i64,i64::try_from(offset).map_err(corrupt)?,serde_json::to_string(chunk).map_err(corrupt)?]).map_err(transient)?;
+                self.db.execute("UPDATE packs SET done=0 WHERE id=?1",[&chunk.pack_id]).map_err(transient)?;
+                offset=offset.checked_add(chunk.plaintext_length).ok_or_else(||corrupt("restore body length"))?;
+            }
         }
-        if source.chunks.is_empty() { fs::File::create(self.body_path(&source.hash)).map_err(transient)?; }
+        let path=self.body_path(&source.hash);
+        let intact=match fs::symlink_metadata(&path) {
+            Ok(metadata)=>metadata.is_file() && !crate::trust_boundary::is_link_like(&metadata) && metadata.len()==source.byte_length,
+            Err(error) if error.kind()==std::io::ErrorKind::NotFound=>false,
+            Err(error)=>return Err(transient(error)),
+        };
+        if !intact {
+            self.reset_body(&source.hash)?;
+            match fs::remove_file(&path) {Ok(())=>{},Err(error) if error.kind()==std::io::ErrorKind::NotFound=>{},Err(error)=>return Err(transient(error))}
+            let file=OpenOptions::new().create_new(true).write(true).open(&path).map_err(transient)?;
+            file.set_len(source.byte_length).map_err(transient)?;
+            file.sync_all().map_err(transient)?;
+        }
         Ok(())
     }
-    pub(crate) fn seal(&self)->Result<()> {self.db.execute_batch("COMMIT").map_err(transient)}
-    fn body_path(&self,hash:&str)->PathBuf {self.scratch.path().join(format!("{hash}.payload"))}
+    fn reset_body(&self,hash:&str)->Result<()> {
+        self.db.execute("UPDATE packs SET done=0 WHERE id IN(SELECT pack FROM chunks WHERE hash=?1)",[hash]).map_err(transient)?;
+        self.db.execute("UPDATE chunks SET done=0 WHERE hash=?1",[hash]).map_err(transient)?;
+        self.db.execute("UPDATE bodies SET remaining=(SELECT count(*) FROM chunks WHERE hash=?1),settled=0 WHERE hash=?1",[hash]).map_err(transient)?;
+        Ok(())
+    }
+    pub(crate) fn seal(&self)->Result<()> {
+        self.db.execute_batch("DELETE FROM chunks WHERE hash NOT IN(SELECT hash FROM seen);
+            DELETE FROM bodies WHERE hash NOT IN(SELECT hash FROM seen);
+            DELETE FROM packs WHERE id NOT IN(SELECT pack FROM chunks)").map_err(transient)?;
+        crate::trust_boundary::sync_directory(&self.directory.join("assembly")).map_err(transient)?;
+        self.db.execute_batch("COMMIT").map_err(transient)?;
+        crate::trust_boundary::sync_directory(&self.directory).map_err(transient)
+    }
+    fn body_path(&self,hash:&str)->PathBuf {self.directory.join("assembly").join(hash)}
     pub(crate) fn ready(&self)->Result<Option<(String,PathBuf)>> {
-        let ready:Option<(String,u64)>=self.db.query_row("SELECT hash,bytes FROM bodies WHERE remaining=0 ORDER BY priority,hash LIMIT 1",[],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(transient)?;
+        let ready:Option<(String,u64)>=self.db.query_row("SELECT hash,bytes FROM bodies WHERE settled=0 AND remaining=0 ORDER BY priority,hash LIMIT 1",[],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(transient)?;
         ready.map(|(hash,length)| {
             let path=self.body_path(&hash);
-            if !verify(&path,length,&hash)? {return Err(corrupt("restore body integrity"));}
+            if !verify(&path,length,&hash)? {
+                self.db.execute_batch("BEGIN IMMEDIATE").map_err(transient)?;
+                self.reset_body(&hash)?;
+                self.db.execute_batch("COMMIT").map_err(transient)?;
+                return Err(transient("restore body integrity"));
+            }
             Ok((hash,path))
         }).transpose()
     }
+    fn settled_retained(&self,hash:&str)->Result<()> {
+        self.db.execute("UPDATE bodies SET settled=1 WHERE hash=?1 AND remaining=0",[hash]).map_err(transient)?;
+        Ok(())
+    }
     pub(crate) fn settled(&self,hash:&str)->Result<()> {
+        self.db.execute_batch("BEGIN IMMEDIATE").map_err(transient)?;
+        self.db.execute("DELETE FROM chunks WHERE hash=?1 AND EXISTS(SELECT 1 FROM bodies WHERE hash=?1 AND remaining=0)",[hash]).map_err(transient)?;
         self.db.execute("DELETE FROM bodies WHERE hash=?1 AND remaining=0",[hash]).map_err(transient)?;
+        self.db.execute_batch("COMMIT").map_err(transient)?;
         match fs::remove_file(self.body_path(hash)) {Ok(())=>{},Err(error) if error.kind()==std::io::ErrorKind::NotFound=>{},Err(error)=>return Err(transient(error))}
         Ok(())
     }
+    fn finish(self)->Result<()> {
+        let pending:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM bodies WHERE settled=0)",[],|row|row.get(0)).map_err(transient)?;
+        if pending {return Err(corrupt("restore bodies are incomplete"));}
+        drop(self.db);
+        fs::remove_dir_all(self.directory).map_err(transient)
+    }
     pub(crate) async fn next_pack(&mut self,key:&[u8;32],provider:&dyn Provider,repository:&RepositoryHandle,cancel:&Cancellation)->Result<bool> {
-        let encoded:Option<String>=self.db.query_row("SELECT body FROM packs ORDER BY priority,id LIMIT 1",[],|row|row.get(0)).optional().map_err(transient)?;
+        let encoded:Option<String>=self.db.query_row("SELECT body FROM packs WHERE done=0 ORDER BY priority,id LIMIT 1",[],|row|row.get(0)).optional().map_err(transient)?;
         let Some(encoded)=encoded else {
-            let remaining:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM bodies)",[],|row|row.get(0)).map_err(transient)?;
+            let remaining:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM bodies WHERE settled=0)",[],|row|row.get(0)).map_err(transient)?;
             if remaining {return Err(corrupt("restore bodies are incomplete"));}
             return Ok(false);
         };
         let remote:RemoteObject=serde_json::from_str(&encoded).map_err(corrupt)?;
         cancel.check()?;
-        let path=open_object_with(&remote,key,self.scratch.path(),provider,repository,Durability::Scratch,cancel).await?;
+        let path=open_object_with(&remote,key,&self.directory,provider,repository,Durability::Durable,cancel).await?;
         let mut input=crate::trust_boundary::open_regular_source(&path).map_err(transient)?;
         let tx=self.db.transaction().map_err(transient)?;
         {
-            let mut query=tx.prepare("SELECT hash,offset,body FROM chunks WHERE pack=?1 ORDER BY hash,ordinal").map_err(transient)?;
+            let mut query=tx.prepare("SELECT hash,offset,body FROM chunks WHERE pack=?1 AND done=0 ORDER BY hash,ordinal").map_err(transient)?;
             let mut rows=query.query([&remote.object_id]).map_err(transient)?;
+            let mut output:Option<(String,fs::File)>=None;
             while let Some(row)=rows.next().map_err(transient)? {
                 cancel.check()?;
                 let hash:String=row.get(0).map_err(transient)?;
                 let offset:u64=row.get(1).map_err(transient)?;
                 let chunk:wire::StoredChunk=serde_json::from_str(&row.get::<_,String>(2).map_err(transient)?).map_err(corrupt)?;
                 let bytes=read_chunk(&mut input,remote.plaintext_length,&chunk)?;
-                let mut body=OpenOptions::new().create(true).write(true).open(self.scratch.path().join(format!("{hash}.payload"))).map_err(transient)?;
+                if output.as_ref().is_none_or(|(current,_)|current!=&hash) {
+                    if let Some((_,file))=output.take() {file.sync_all().map_err(transient)?;}
+                    let path=self.directory.join("assembly").join(&hash);
+                    crate::trust_boundary::open_regular_source(&path).map_err(transient)?;
+                    output=Some((hash.clone(),OpenOptions::new().write(true).open(path).map_err(transient)?));
+                }
+                let body=&mut output.as_mut().unwrap().1;
                 body.seek(SeekFrom::Start(offset)).map_err(transient)?;
                 body.write_all(&bytes).map_err(transient)?;
                 tx.execute("UPDATE bodies SET remaining=remaining-1 WHERE hash=?1 AND remaining>0",[hash]).map_err(transient)?;
             }
+            if let Some((_,file))=output {file.sync_all().map_err(transient)?;}
         }
-        tx.execute("DELETE FROM chunks WHERE pack=?1",[&remote.object_id]).map_err(transient)?;
-        tx.execute("DELETE FROM packs WHERE id=?1",[&remote.object_id]).map_err(transient)?;
+        crate::trust_boundary::sync_directory(&self.directory.join("assembly")).map_err(transient)?;
+        tx.execute("UPDATE chunks SET done=1 WHERE pack=?1",[&remote.object_id]).map_err(transient)?;
+        tx.execute("UPDATE packs SET done=1 WHERE id=?1",[&remote.object_id]).map_err(transient)?;
         tx.commit().map_err(transient)?;
         drop(input);
-        discard_object(self.scratch.path(),&remote);
+        discard_object(&self.directory,&remote);
         Ok(true)
     }
 }
@@ -2111,11 +2184,12 @@ pub(crate) async fn download_original_backup_units(
             #[cfg(test)]
             crate::persistent_store::hash_work::validation(&unit.value);
             unit.value.validate().map_err(corrupt)?;
-            plan.settled(&hash)?;
+            plan.settled_retained(&hash)?;
         }
         if !plan.next_pack(key,provider,repository,cancel).await? {break;}
     }
     content.commit().map_err(transient)?;
+    plan.finish()?;
     kept.db.execute_batch("DROP TABLE nodes; DROP TABLE fragments; DROP TABLE packs").map_err(transient)?;
     Ok(kept)
 }
@@ -2403,6 +2477,69 @@ pub(crate) async fn download_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_body_plan_retains_completed_packs_across_quota_and_cancelled_reopens() {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let stage=tempfile::tempdir().unwrap();
+            let provider=super::super::fake::FakeProvider::new(true);
+            let repository=super::super::fake::repository();
+            let root_key=[7;32];
+            let key=derive_key(&root_key,&repository.repository_id,"data").unwrap();
+            let mut body=Vec::new();let mut chunks=Vec::new();let mut packs=Vec::new();
+            for (index,bytes) in [b"synthetic first chunk".as_slice(),b"synthetic second chunk",b"synthetic final chunk"].into_iter().enumerate() {
+                let id=format!("pack-resume-{index}");
+                let hash:[u8;32]=Sha256::digest(bytes).into();
+                let mut plaintext=Vec::new();
+                let stored_length=pack::write_entry(&mut plaintext,&pack::Chunk {hash,bytes:bytes.to_vec()}).unwrap();
+                let header=wire::PublicObjectHeader::new(repository.repository_id.clone(),id.clone(),wire::ObjectRole::Pack,plaintext.len() as u64).unwrap();
+                let mut sealed=Vec::new();
+                wire::seal_envelope(&mut std::io::Cursor::new(&plaintext),&mut sealed,&key,&header).unwrap();
+                packs.push(wire::StoredObject {header,locator:wire::WireLocator {connection_identity:repository.connection_identity.clone(),collection:None,object:id.clone()},
+                    ciphertext_length:sealed.len() as u64,ciphertext_sha256:Sha256::digest(&sealed).into(),
+                    plaintext_length:plaintext.len() as u64,plaintext_sha256:Sha256::digest(&plaintext).into()});
+                provider.seed(&id,ObjectRole::Pack,sealed);
+                chunks.push(wire::StoredChunk {pack_id:id,offset:0,stored_length,plaintext_length:bytes.len() as u64,plaintext_sha256:hash});
+                body.extend_from_slice(bytes);
+            }
+            let mut catalog=packs[0].clone();
+            catalog.header=wire::PublicObjectHeader::new(repository.repository_id.clone(),"catalog-resume".into(),wire::ObjectRole::Catalog,catalog.plaintext_length).unwrap();
+            catalog.locator.object=catalog.header.object_id.clone();
+            catalog.ciphertext_length=wire::envelope_length(&catalog.header).unwrap();
+            let source=super::super::lww_residency::PackedSource {hash:risunest_sync_wire::hash(&body),byte_length:body.len() as u64,
+                chunks,packs,catalog,library_id:"synthetic-resume".into(),connection_id:"synthetic".into(),
+                connection_root:stage.path().into(),protected_snapshot:"synthetic-snapshot".into()};
+            for (index,interruption) in [ErrorKind::DailyQuotaExhausted,ErrorKind::Cancelled].into_iter().enumerate() {
+                let mut plan=RestoreBodyPlan::new(stage.path()).unwrap();
+                plan.push(&source,false,&repository).unwrap();plan.seal().unwrap();
+                assert!(plan.next_pack(&root_key,&provider,&repository,&Cancellation::default()).await.unwrap());
+                assert!(plan.ready().unwrap().is_none(),"a partial multi-pack body must not settle");
+                provider.fail_read(&format!("pack-resume-{}",index+1),interruption);
+                assert_eq!(plan.next_pack(&root_key,&provider,&repository,&Cancellation::default()).await.unwrap_err().kind,interruption);
+                drop(plan);
+                assert!(stage.path().join("pack-plan/plan.sqlite").exists());
+            }
+            let mut plan=RestoreBodyPlan::new(stage.path()).unwrap();
+            plan.push(&source,false,&repository).unwrap();plan.seal().unwrap();
+            assert!(plan.next_pack(&root_key,&provider,&repository,&Cancellation::default()).await.unwrap());
+            let (hash,path)=plan.ready().unwrap().unwrap();
+            assert_eq!(hash,source.hash);assert_eq!(fs::read(&path).unwrap(),body);
+            plan.settled_retained(&hash).unwrap();
+            assert!(!plan.next_pack(&root_key,&provider,&repository,&Cancellation::default()).await.unwrap());
+            drop(plan);
+            let mut plan=RestoreBodyPlan::new(stage.path()).unwrap();
+            plan.push(&source,false,&repository).unwrap();plan.seal().unwrap();
+            let (hash,path)=plan.ready().unwrap().unwrap();
+            assert_eq!(fs::read(path).unwrap(),body,"uncommitted control contents can replay after reopen");
+            plan.settled(&hash).unwrap();
+            assert!(!plan.next_pack(&root_key,&provider,&repository,&Cancellation::default()).await.unwrap());
+            plan.finish().unwrap();
+            assert!(!stage.path().join("pack-plan").exists());
+            assert_eq!(provider.read_attempts("pack-resume-0"),1,"completed prefix must not consume the next quota window");
+            assert_eq!(provider.read_attempts("pack-resume-1"),2);
+            assert_eq!(provider.read_attempts("pack-resume-2"),2);
+        });
+    }
 
     #[test]
     fn oversized_section_is_rejected_before_pack_access_or_allocation() {
