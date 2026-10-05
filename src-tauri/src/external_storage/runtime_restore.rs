@@ -1313,7 +1313,11 @@ pub(super) mod tests {
         use crate::asset_repository::job_pins::journal_opens;
         use std::sync::Arc;
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            let bodies=(0..24u8).map(|index|vec![index;1024+usize::from(index)]).collect::<Vec<_>>();
+            let bodies=(0..300u16).map(|index| {
+                let mut body=index.to_le_bytes().to_vec();
+                body.resize(1024+usize::from(index%64),(index%251) as u8);
+                body
+            }).collect::<Vec<_>>();
             let backup=packaged_backup(&bodies).await;
             let destination=tempfile::tempdir().unwrap();
             let root=destination.path();
@@ -1325,6 +1329,9 @@ pub(super) mod tests {
             let admission=Arc::new(crate::native_file_jobs::admission::Admission::default());
             let state=PersistentStoreState::default();
             let (receipt,permit)=activate_database_first_backup(&mut store,&state,&job,database,sections,Cancellation::default(),admission.staging().unwrap()).unwrap();
+            // Bodies that arrive locally before the transfer are pinned in place, the rest are downloaded.
+            let local=crate::asset_repository::PayloadCas::new(root).unwrap();
+            for body in bodies.iter().step_by(3) {local.prepare_bytes(body).unwrap();}
             let before=journal_opens(root,&job.id);
             let adoption=RestoreAdoptionRequest{job_id:job.id.clone(),received_revision:receipt["receivedRevision"].as_str().unwrap().into(),selected_character_id:None};
             settle_database_first_backup(store,&backup.connected,&job,adoption,&mut Some(permit),&Cancellation::default()).await.unwrap();
