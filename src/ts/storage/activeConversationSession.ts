@@ -1576,7 +1576,11 @@ export class ActiveConversationSession {
 
         this.transactionActive = true
         try {
-            const currentMetadata = cloneConversationMetadata(this.conversation)
+            // By reference: the baseline is only compared, and a rollback copies it back.
+            const currentMetadata: ConversationMetadata = {}
+            for (const [key, value] of Object.entries(this.conversation)) {
+                if (key !== 'message') currentMetadata[key] = value
+            }
             if (!conversationMetadataEqual(commit.expectedMetadata, currentMetadata)) {
                 throw new MessageLocatorMismatchError(
                     'Conversation operation metadata baseline changed',

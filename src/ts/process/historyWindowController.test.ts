@@ -6,6 +6,7 @@ import type { Chat, Message } from '../storage/database.svelte'
 import { cloneConversationMetadata } from '../storage/selectedConversationLifecycle'
 import {
     captureSessionHistoryWindowController,
+    conversationFieldsOf,
     createHistoryWindowController,
     type HistoryWindowSessionSource,
 } from './historyWindowController'
@@ -215,10 +216,26 @@ describe('history window metadata', () => {
             captureWindowed: () => null,
             captureSession: () => source,
             getCurrentSession: () => session,
-            readLiveMetadata: () => cloneConversationMetadata(source.conversation),
+            readLiveMetadata: () => conversationFieldsOf(source.conversation),
         }, chat, 2)
         return { session, source, chat, controller }
     }
+
+    it('copies the live values it takes, so later window edits stay in the window until written', () => {
+        const { session, source, chat, controller } = metadataHarness()
+        source.conversation.scriptstate = { $fromParser: 'live' }
+        const version = session.version
+
+        expect(controller.reconcileMetadata()).toBe(true)
+        expect(chat.scriptstate).not.toBe(source.conversation.scriptstate)
+        chat.scriptstate!.$fromTrigger = 'window'
+        expect(source.conversation.scriptstate).toEqual({ $fromParser: 'live' })
+        expect(session.version).toBe(version)
+
+        expect(controller.applyRange(2, 0, [message('reply')], 'append')).toBe(true)
+        expect(source.conversation.scriptstate).toEqual({ $fromParser: 'live', $fromTrigger: 'window' })
+        expect(source.conversation.scriptstate).not.toBe(chat.scriptstate)
+    })
 
     it('keeps chat variables set on the live conversation and on the window', () => {
         const { source, chat, controller } = metadataHarness()
@@ -256,5 +273,73 @@ describe('history window metadata', () => {
         expect(controller.reconcileMetadata()).toBe(true)
         expect(source.conversation.lastMemory).toBe('id-m3')
         expect(session.version).toBe(version + 1)
+    })
+})
+
+describe('history window metadata copies', () => {
+    const SUMMARIES = 3_000
+    const COMMITS = 200
+    const hypaV3Data = () => ({
+        summaries: Array.from({ length: SUMMARIES }, (_, index) => ({
+            text: `synthetic summary ${index}`,
+            chatMemos: [`id-m${index}`],
+            isImportant: false,
+        })),
+    })
+    const isHypaCopy = (value: unknown) => {
+        const record = value as { summaries?: unknown[], hypaV3Data?: { summaries?: unknown[] } } | null
+        return record?.summaries?.length === SUMMARIES || record?.hypaV3Data?.summaries?.length === SUMMARIES
+    }
+    function countHypaCopies() {
+        const clone = vi.spyOn(globalThis, 'structuredClone')
+        return {
+            count: () => clone.mock.calls.filter(([value]) => isHypaCopy(value)).length,
+            restore: () => clone.mockRestore(),
+        }
+    }
+    const fieldsOf = (conversation: Chat) => {
+        const { message: _message, ...fields } = conversation
+        return fields
+    }
+
+    it('streams into a windowed conversation without copying unchanged metadata', () => {
+        const live: Chat = { id: 'conversation-a', name: '', note: '', localLore: [], hypaV3Data: hypaV3Data(), message: [] }
+        const chat = { ...structuredClone(fieldsOf(live)), message: [message('a'), message('b')] } as Chat
+        const backend = staleable(chat, 10)
+        const copies = countHypaCopies()
+        try {
+            const controller = createHistoryWindowController({
+                captureWindowed: () => null,
+                captureSession: () => null,
+                getCurrentSession: () => null,
+                readLiveMetadata: () => fieldsOf(live),
+            }, chat, 10, backend.controller)
+            for (let index = 0; index < COMMITS; index += 1) {
+                expect(controller.applyRange(1, 1, [{ ...chat.message[1], data: `chunk ${index}` }], 'edit')).toBe(true)
+            }
+            // The baseline taken when the window opens is the only copy.
+            expect(copies.count()).toBeLessThanOrEqual(1)
+        } finally {
+            copies.restore()
+        }
+        expect(chat.message[1].data).toBe(`chunk ${COMMITS - 1}`)
+    })
+
+    it('streams into a complete conversation copying its metadata only for the mutation event', () => {
+        const { session, source } = completeConversation(4)
+        source.conversation.hypaV3Data = hypaV3Data()
+        const chat = windowFrom(source, 2)
+        const copies = countHypaCopies()
+        try {
+            const controller = captureSessionHistoryWindowController(source, () => session, chat, 2)!
+            for (let index = 0; index < COMMITS; index += 1) {
+                expect(controller.applyRange(1, 1, [{ ...chat.message[1], data: `chunk ${index}` }], 'edit')).toBe(true)
+            }
+            // Each session write copies the metadata once into its mutation event, as a plain edit does.
+            expect(copies.count()).toBeLessThanOrEqual(COMMITS)
+        } finally {
+            copies.restore()
+        }
+        expect(session.materializeCompatibilityArray()[3].data).toBe(`chunk ${COMMITS - 1}`)
     })
 })

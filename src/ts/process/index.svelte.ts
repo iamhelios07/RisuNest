@@ -106,6 +106,7 @@ import {
 import { WindowedConversationHistoryOperation } from './historyWindowHistory'
 import {
     captureSessionHistoryWindowController,
+    conversationFieldsOf,
     createHistoryWindowController,
     type HistoryWindowController,
     type HistoryWindowControllerEnvironment,
@@ -422,7 +423,7 @@ async function prepareGenerationHistoryWindow(
         getCurrentSession: getActiveConversationSession,
         readLiveMetadata: () => {
             const current = currentConversation()
-            return current ? cloneConversationMetadata(current.conversation) : null
+            return current ? conversationFieldsOf(current.conversation) : null
         },
         onLost: () => {
             if (isTargetCurrent() && !signal.aborted) alertError(language.generationConversationChanged)
