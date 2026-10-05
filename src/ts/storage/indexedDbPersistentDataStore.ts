@@ -2483,8 +2483,12 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         if (kind === 'conversation') {
             const record = await requestResult<StoredRecord<StoredConversation> | undefined>(transaction.objectStore('conversations').get(this.conversationKey(generation, id, field)))
             if (!record) throw new TypeError('Missing conversation parent')
-            patch(record.value.detail, conversationField)
-            this.putConversationRecord(transaction, generation, record.value.summary, record.value.detail)
+            const detail = record.value.detail
+            patch(detail, conversationField)
+            // The chat list reads the summary, so it follows the patched name and date.
+            const summary = { ...record.value.summary, name: typeof detail.name === 'string' ? detail.name : '' }
+            if (conversationField === 'lastDate') summary.recentAt = typeof detail.lastDate === 'number' ? detail.lastDate : 0
+            this.putConversationRecord(transaction, generation, summary, detail)
             return
         }
         if (kind === 'order' && id === 'conversations') {
