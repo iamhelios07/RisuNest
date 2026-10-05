@@ -697,7 +697,8 @@ impl PersistentStore {
         if !pinned { return Err(error("backup-capture-lease-required")); }
         Ok(reader.connection.query_row("SELECT revision FROM backup_device.device_meta WHERE singleton=1", [], |row| row.get(0))?)
     }
-    pub(crate) fn lww_backup_unit_values(&self, lease: &str) -> StoreResult<BTreeMap<UnitKey, UnitValue>> {
+    pub(crate) fn lww_visit_backup_units(&self, lease: &str, probe: &dyn crate::local_backup::CancellationProbe,
+        emit: &mut dyn FnMut(UnitKey, UnitValue) -> StoreResult<()>) -> StoreResult<()> {
         let reader = self.revision_leases.get(lease).ok_or(StoreError::SnapshotReleased)?;
         if current_revision(&reader.connection)? != reader.target.revision
             || active_generation(&reader.connection)? != reader.target.generation
@@ -708,8 +709,12 @@ impl PersistentStore {
         let authority: DecimalU64 = wire(authority.try_into())?;
         let mut statement = reader.connection.prepare("SELECT key,stamp,value FROM lww_units ORDER BY key")?;
         let rows = statement.query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?)))?;
-        let mut values = BTreeMap::<UnitKey,(Stamp,UnitValue)>::new();
+        let scratch = tempfile::NamedTempFile::new_in(&self.repository_root)?;
+        let values = Connection::open(scratch.path())?;
+        values.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA cache_size=-4096; PRAGMA temp_store=FILE;
+            CREATE TABLE units(key TEXT PRIMARY KEY,stamp TEXT NOT NULL,value TEXT NOT NULL); BEGIN")?;
         for row in rows {
+            if probe.is_cancelled() { return Err(error("cancelled")); }
             let (key,stamp,value) = row?;
             let key: UnitKey = wire(key.try_into())?;
             let stamp: Stamp = serde_json::from_str(&stamp)?;
@@ -721,23 +726,24 @@ impl PersistentStore {
                 crate::persistent_store::hash_work::validation(&value);
                 result
             })?;
-            if !projection::is_device(&key) { values.insert(key,(stamp,value)); }
+            if !projection::is_device(&key) { values.execute("INSERT INTO units VALUES(?1,?2,?3)",params![key.as_str(),serde_json::to_string(&stamp)?,serde_json::to_string(&value)?])?; }
         }
         let mut statement = reader.connection.prepare("SELECT rows.request_id,rows.key,rows.stamp,rows.value,proof.digest,proof.body FROM lww_receive_rows rows JOIN backup_device.lww_receive proof ON proof.request_id=rows.request_id WHERE rows.status IN ('held','deferred') AND proof.applied=1 AND proof.finished=1 AND proof.authority=?1 ORDER BY rows.request_id,rows.key")?;
         let rows = statement.query_map([authority.0.to_string()], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?)))?;
-        let mut proofs = BTreeMap::<String,StageReceive>::new();
+        let mut proof: Option<(String,StageReceive)> = None;
         for row in rows {
+            if probe.is_cancelled() { return Err(error("cancelled")); }
             let (request_id,key,stamp,value,digest,body) = row?;
-            if !proofs.contains_key(&request_id) {
+            if proof.as_ref().is_none_or(|(id,_)| id != &request_id) {
                 #[cfg(test)]
                 crate::persistent_store::hash_work::observe("native_backup_receive_proof", body.len());
                 if risunest_sync_wire::hash(body.as_bytes()) != digest { return Err(error("request-id-integrity")); }
                 let request: StageReceive = serde_json::from_str(&body)?;
                 if request.header.request_id != request_id || request.header.binding_authority != authority { return Err(error("request-id-integrity")); }
-                proofs.insert(request_id.clone(),request);
+                proof = Some((request_id.clone(),request));
             }
             let change = Change { key:wire(key.try_into())?, stamp:serde_json::from_str(&stamp)?, value:serde_json::from_str(&value)? };
-            let request = &proofs[&request_id];
+            let request = &proof.as_ref().unwrap().1;
             if !request.changes.contains(&change) || change.stamp.physical_ms > request.admitted_time_upper_ms { return Err(error("request-id-integrity")); }
             wire(change.stamp.validate())?;
             wire({
@@ -748,18 +754,33 @@ impl PersistentStore {
             })?;
             projection::validate_received(&reader.connection,&change.key,&change.value)?;
             if projection::is_device(&change.key) || parent_status(&reader.connection,&change.key)?=="retired" { continue; }
-            let decision = match values.get(&change.key) {
+            let previous: Option<(String,String)> = values.query_row("SELECT stamp,value FROM units WHERE key=?1",[change.key.as_str()],|row| Ok((row.get(0)?,row.get(1)?))).optional()?;
+            let decision = match previous {
                 Some((stamp,value)) => wire({
-                    let result=compare_version(stamp,value,&change.stamp,&change.value);
+                    let stamp: Stamp = serde_json::from_str(&stamp)?;
+                    let value: UnitValue = serde_json::from_str(&value)?;
+                    let result=compare_version(&stamp,&value,&change.stamp,&change.value);
                     #[cfg(test)]
-                    crate::persistent_store::hash_work::comparison(value,&change.value,&result);
+                    crate::persistent_store::hash_work::comparison(&value,&change.value,&result);
                     result
                 })?,
                 None => LwwDecision::ApplyRemote,
             };
-            if decision==LwwDecision::ApplyRemote { values.insert(change.key,(change.stamp,change.value)); }
+            if decision==LwwDecision::ApplyRemote { values.execute("INSERT INTO units VALUES(?1,?2,?3) ON CONFLICT(key) DO UPDATE SET stamp=excluded.stamp,value=excluded.value",params![change.key.as_str(),serde_json::to_string(&change.stamp)?,serde_json::to_string(&change.value)?])?; }
         }
-        Ok(values.into_iter().map(|(key,(_,value))|(key,value)).collect())
+        values.execute_batch("COMMIT")?;
+        let mut query = values.prepare("SELECT key,value FROM units ORDER BY key")?;
+        let mut rows = query.query([])?;
+        while let Some(row) = rows.next()? {
+            if probe.is_cancelled() { return Err(error("cancelled")); }
+            emit(wire(row.get::<_,String>(0)?.try_into())?,serde_json::from_str(&row.get::<_,String>(1)?)?)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn lww_backup_unit_values(&self, lease: &str) -> StoreResult<BTreeMap<UnitKey, UnitValue>> {
+        let mut values = BTreeMap::new();
+        self.lww_visit_backup_units(lease, &crate::local_backup::NeverCancelled, &mut |key,value| { values.insert(key,value); Ok(()) })?;
+        Ok(values)
     }
     pub(crate) fn lww_activated_receipt(&self, request_id: &str) -> StoreResult<Option<(i64, String)>> {
         activated_receipt(&self.connection, request_id)

@@ -101,6 +101,17 @@ pub(crate) fn small_asset(store: &mut PersistentStore, key: &str, body: &[u8]) -
     store.commit_asset_alias(&alias, store.revision().unwrap()).unwrap();
     hash
 }
+pub(crate) async fn hydrate_receiver(f: &CycleFixture, hash: &str) -> std::fs::File {
+    let connected = super::previous_storage_tests::receiver_connection(f);
+    super::connection_store::ConnectionStore::open(f.directory_b.path()).unwrap().insert(&connected.stored).unwrap();
+    let _source = super::lww_residency::install_test_source_connection(f.directory_b.path(), Arc::new(connected)).unwrap();
+    let root = f.directory_b.path().to_owned();
+    let hash = hash.to_owned();
+    super::worker_observation::spawn_blocking(move || {
+        super::lww_residency::hydrate(&root, &hash, &|| Ok(())).unwrap().unwrap()
+    }).await.unwrap()
+}
+
 pub(crate) struct CycleFixture {
     pub directory_a: tempfile::TempDir,
     pub directory_b: tempfile::TempDir,
@@ -1170,34 +1181,14 @@ fn large_bodies_stay_remote_then_only_missing_body_hydrates() {
             super::lww_residency::stat(f.directory_b.path(), &hash).unwrap(),
             Some(body.len() as u64)
         );
-        let mut file = super::lww_residency::fulfill(
-            f.directory_b.path(),
-            &hash,
-            f.provider.as_ref(),
-            &f.receiver.repository,
-            &[7; 32],
-            &Cancellation::default(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let mut file = hydrate_receiver(&f, &hash).await;
         let mut restored = Vec::new();
         std::io::Read::read_to_end(&mut file, &mut restored).unwrap();
         assert_eq!(restored, body);
         let hydrated = f.provider.transferred_body_bytes();
         assert!(hydrated.1 > before.1 + body.len() as u64);
         lww_segment::reset_hash_bytes();
-        assert!(super::lww_residency::fulfill(
-            f.directory_b.path(),
-            &hash,
-            f.provider.as_ref(),
-            &f.receiver.repository,
-            &[7; 32],
-            &Cancellation::default()
-        )
-        .await
-        .unwrap()
-        .is_some());
+        drop(hydrate_receiver(&f, &hash).await);
         assert_eq!(f.provider.transferred_body_bytes(), hydrated);
         assert_eq!(lww_segment::take_hash_bytes(), 0);
     })
@@ -2736,8 +2727,7 @@ fn a_large_body_waits_for_its_upload_in_a_file_rather_than_in_the_publication_ro
         assert!(!publication.exists(), "a finished publication leaves its files");
         assert_eq!(f.provider.upload_attempts(&pending.bodies[0].object_id), 1);
         assert_eq!(f.receive_b().await, 1);
-        let mut file = super::lww_residency::fulfill(f.directory_b.path(), &hash, f.provider.as_ref(),
-            &f.receiver.repository, &[7; 32], &Cancellation::default()).await.unwrap().unwrap();
+        let mut file = hydrate_receiver(&f, &hash).await;
         let mut restored = Vec::new();
         std::io::Read::read_to_end(&mut file, &mut restored).unwrap();
         assert!(restored == body);
