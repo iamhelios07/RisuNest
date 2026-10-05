@@ -313,6 +313,46 @@ describe('response candidates over a history window', () => {
         expect(conversation.starts).toEqual([22, 14])
     })
 
+    it('reads one tail window when the newest message is not a response', async () => {
+        const conversation = storedConversation([...longConversation(1000), message('question', 'user')])
+        const before = structuredClone(conversation.stored)
+        const { open, createId, flush } = conversation.options
+
+        expect(await moveWindowedResponseCandidate(open, 1, createId, flush)).toEqual({ moved: false, lastMessage: null })
+        expect(await moveWindowedResponseCandidate(open, -1, createId, flush)).toEqual({ moved: false, lastMessage: null })
+        expect(await generateWindowedResponseCandidate({
+            ...conversation.options,
+            generate: async () => {
+                throw new Error('must not generate')
+            },
+        })).toMatchObject({ completed: false })
+
+        expect(conversation.starts).toEqual([993, 993, 993])
+        expect(conversation.stored).toEqual(before)
+    })
+
+    it('widens past a tail of comments and disabled messages to the response', async () => {
+        const conversation = storedConversation([
+            ...longConversation(100),
+            ...Array.from({ length: 6 }, (_, index) => ({ ...message(`note${index}`), isComment: true })),
+            ...Array.from({ length: 4 }, (_, index) => ({ ...message(`off${index}`, 'user'), disabled: true })),
+        ])
+        const { open, createId, flush } = conversation.options
+
+        const move = await moveWindowedResponseCandidate(open, 1, createId, flush)
+
+        expect(move).toEqual({ moved: false, lastMessage: JSON.stringify(conversation.stored.messages.at(-1)) })
+        expect(conversation.starts).toEqual([102, 94])
+    })
+
+    it('opens a conversation shorter than the tail once', async () => {
+        const conversation = storedConversation(longConversation(3))
+        const { open, createId, flush } = conversation.options
+
+        expect(await moveWindowedResponseCandidate(open, 1, createId, flush)).toEqual({ moved: false, lastMessage: null })
+        expect(conversation.starts).toEqual([0])
+    })
+
     it('moves between candidates over a tail window', async () => {
         const conversation = storedConversation(longConversation(100))
         await generateWindowedResponseCandidate(conversation.options)

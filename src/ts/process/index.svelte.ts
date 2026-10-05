@@ -429,14 +429,21 @@ async function prepareGenerationHistoryWindow(
         },
     }
     const controller = createHistoryWindowController(environment, chat, start, initial)
-    // Prompt history and scripts find messages by id, so missing ids are stored first.
-    for (let index = 0; index < chat.message.length; index += 1) {
-        const message = chat.message[index]
-        if (message.chatId) continue
-        if (!controller.applyRange(index, 1, [{ ...message, chatId: v4() }], 'edit')) {
+    // Prompt history and scripts find messages by id, so missing ids are stored
+    // first, one write per run of messages without one.
+    for (let index = 0; index < chat.message.length;) {
+        if (chat.message[index].chatId) {
+            index += 1
+            continue
+        }
+        let end = index + 1
+        while (end < chat.message.length && !chat.message[end].chatId) end += 1
+        const run = chat.message.slice(index, end).map((message) => ({ ...message, chatId: v4() }))
+        if (!controller.applyRange(index, run.length, run, run.length === 1 ? 'edit' : 'replace-range')) {
             controller.release()
             return null
         }
+        index = end
     }
     attachHistoryWindow(chat, start)
     return {

@@ -473,6 +473,22 @@ describe('sendChat with the history window', () => {
         expect(mutations[0]).toMatchObject({ start: 29, deleteCount: 1 })
     })
 
+    it('stores the ids a run of window messages lacks in one write', async () => {
+        const stored = messages(1000)
+        for (const message of stored.slice(0, 990)) delete message.chatId
+        const before = structuredClone(stored)
+        const { mutations } = installWindowed(stored)
+
+        await expect(sendChat(-1, { historyLimit: true })).resolves.toBe(true)
+
+        const idWrites = mutations.filter((mutation) => mutation.start < 1000)
+        expect(idWrites).toHaveLength(1)
+        expect(idWrites[0]).toMatchObject({ start: 900, deleteCount: 90 })
+        expect(stored.slice(900, 990).every((message) => typeof message.chatId === 'string')).toBe(true)
+        expect(stored.slice(0, 900)).toEqual(before.slice(0, 900))
+        expect(stored.slice(900, 1000).map((message) => message.data)).toEqual(before.slice(900).map((message) => message.data))
+    })
+
     it('writes start trigger edits to the window and keeps chat variables', async () => {
         const stored = messages(1000)
         const { owner } = installWindowed(stored)

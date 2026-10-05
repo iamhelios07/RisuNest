@@ -226,15 +226,24 @@ export type OpenResponseTail = (
 
 const RESPONSE_TAIL_MESSAGES = 8
 
-/** Opens a tail window that holds the last response and the message before it. */
+/**
+ * Opens a tail window that holds the last response and the message before it.
+ * When the newest shown message is not a response, the first window is returned
+ * as it is, since no response exists to widen to.
+ */
 export async function openResponseTail(open: OpenResponseTail): Promise<ResponseTailWindow | null> {
     let count = RESPONSE_TAIL_MESSAGES
     for (;;) {
         const window = await open((total) => Math.max(total - count, 0))
         if (!window) return null
-        const range = responseRange(window.chat.message)
-        if (window.controller.absoluteStartIndex === 0 || (range && range.start > 0)) return window
-        count = Math.max(count, window.chat.message.length) * 2
+        const messages = window.chat.message
+        const range = responseRange(messages)
+        if (
+            window.controller.absoluteStartIndex === 0
+            || (range && range.start > 0)
+            || (!range && messages.some((message) => !message.isComment && !message.disabled))
+        ) return window
+        count = Math.max(count, messages.length) * 2
         window.release()
     }
 }
