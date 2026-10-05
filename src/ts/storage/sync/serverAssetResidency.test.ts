@@ -89,10 +89,10 @@ describe('asset residency mobile lifetime', () => {
         const dispose = vi.fn(async () => {})
         mock.begin.mockResolvedValue({ dispose, progress: vi.fn() })
         let finish!: (value: unknown) => void
-        mock.invoke.mockImplementation(name => name === 'server_sync_cancel' ? Promise.resolve() : new Promise(resolve => { finish = resolve }))
+        mock.invoke.mockImplementation(name => name === 'asset_residency_download_remote' ? new Promise(resolve => { finish = resolve }) : Promise.resolve())
         const run = downloadRemoteAssets('receiver', { signal: controller.signal })
         const rejected = expect(run).rejects.toMatchObject({ name: 'AbortError' })
-        await vi.waitFor(() => expect(mock.invoke).toHaveBeenCalledOnce())
+        await vi.waitFor(() => expect(mock.invoke).toHaveBeenCalledWith('asset_residency_download_remote', expect.any(Object)))
         const operationId = mock.invoke.mock.calls[0][1].operationId
         controller.abort()
         expect(mock.invoke).toHaveBeenCalledWith('server_sync_cancel', { operationId })
@@ -114,6 +114,35 @@ describe('asset residency mobile lifetime', () => {
         mock.begin.mockResolvedValue({ dispose: vi.fn(async () => {}), progress: vi.fn() })
         mock.invoke.mockResolvedValue(status)
         await downloadRemoteAssets(undefined, { target })
-        expect(mock.invoke).toHaveBeenLastCalledWith('asset_residency_download_remote', expect.objectContaining({ target, connectionId: null }))
+        expect(mock.invoke).toHaveBeenCalledWith('asset_residency_download_remote', expect.objectContaining({ target, connectionId: null }))
+    })
+    it.each(['user', 'mobile'])('reconciles %s cancellation while native preparation is still pending', async source => {
+        const controller = new AbortController()
+        const dispose = vi.fn(async () => {})
+        mock.begin.mockResolvedValue({ signal: source === 'mobile' ? controller.signal : undefined, dispose, progress: vi.fn() })
+        let prepare!: () => void
+        mock.invoke.mockImplementation(name => name === 'asset_residency_prepare_download' ? new Promise<void>(resolve => { prepare = resolve }) : Promise.resolve())
+        const run = downloadRemoteAssets('receiver', { signal: source === 'user' ? controller.signal : undefined })
+        const rejected = expect(run).rejects.toMatchObject({ name: 'AbortError' })
+        await vi.waitFor(() => expect(mock.invoke).toHaveBeenCalledOnce())
+        const operationId = mock.invoke.mock.calls[0][1].operationId
+        expect(mock.invoke).toHaveBeenCalledWith('asset_residency_prepare_download', { operationId })
+        controller.abort()
+        expect(mock.invoke).not.toHaveBeenCalledWith('server_sync_cancel', expect.anything())
+        expect(dispose).not.toHaveBeenCalled()
+        prepare()
+        await rejected
+        expect(mock.invoke).toHaveBeenCalledWith('server_sync_cancel', { operationId })
+        expect(mock.invoke).not.toHaveBeenCalledWith('asset_residency_download_remote', expect.anything())
+        expect(dispose).toHaveBeenCalledOnce()
+    })
+    it('releases preparation if the download invocation fails before returning a status', async () => {
+        const dispose = vi.fn(async () => {})
+        mock.begin.mockResolvedValue({ dispose, progress: vi.fn() })
+        mock.invoke.mockImplementation(name => name === 'asset_residency_download_remote' ? Promise.reject(new Error('invoke-failed')) : Promise.resolve())
+        await expect(downloadRemoteAssets('receiver')).rejects.toThrow('invoke-failed')
+        const operationId = mock.invoke.mock.calls[0][1].operationId
+        expect(mock.invoke).toHaveBeenLastCalledWith('server_sync_cancel', { operationId })
+        expect(dispose).toHaveBeenCalledOnce()
     })
 })
