@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-import { afterEach, beforeEach, expect, it, vi } from 'vitest'
+import { afterEach, beforeAll, beforeEach, expect, it, vi } from 'vitest'
 import { get } from 'svelte/store'
 import { bootChatInteractionApp, interactionCharacterId, interactionConversationId } from './chatInteractionApp.testSupport'
 
@@ -52,6 +52,14 @@ function recordEditsOfNextBoot() {
         }
     })
 }
+
+// The first boot transforms the whole app graph. Paying that once here keeps it
+// out of the first test's own time budget.
+beforeAll(async () => {
+    const warm = await bootChatInteractionApp()
+    await import('./ChatInteractionSurfaces.test.svelte')
+    warm.restore()
+}, 180_000)
 
 beforeEach(() => {
     target = document.createElement('div')
