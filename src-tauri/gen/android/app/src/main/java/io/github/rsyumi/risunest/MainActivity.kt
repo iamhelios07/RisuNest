@@ -691,6 +691,8 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
         }
     }
     enableEdgeToEdge()
+    // super.onCreate starts the native app, which may connect right away.
+    PlatformTls.initialize(applicationContext)
     super.onCreate(savedInstanceState)
     safScope.launch(Dispatchers.IO) {
       cleanupLegacyOpenedFiles(File(cacheDir, "opened_files"))
