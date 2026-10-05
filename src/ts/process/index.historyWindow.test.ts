@@ -619,6 +619,54 @@ describe('sendChat with the history window', () => {
         expect(mocks.alertError).not.toHaveBeenCalled()
     })
 
+    it('carries a streaming response over to a conversation promoted after its first part was stored', async () => {
+        const stored = messages(1000)
+        const { windowed, mutations } = installWindowed(stored)
+        let stream!: ReadableStreamDefaultController<Record<string, string>>
+        mocks.modelResponse = {
+            type: 'streaming',
+            result: new ReadableStream<Record<string, string>>({
+                start(controller) {
+                    stream = controller
+                    controller.enqueue({ response: 'first' })
+                },
+            }),
+        }
+        let firstStored!: () => void
+        const firstPart = new Promise<void>((resolve) => { firstStored = resolve })
+        const record = mutations.push.bind(mutations)
+        mutations.push = (...entries) => {
+            const length = record(...entries)
+            if (entries.some((entry) => entry.messages.some((message) => message.data === 'first'))) firstStored()
+            return length
+        }
+
+        const sending = sendChat(-1, { historyLimit: true })
+        await firstPart
+        // The promotion reads the store, which already holds the first part of the response.
+        windowed.current = false
+        const owner = DBState.db.characters[0]
+        owner.chats[0] = conversationOf(structuredClone(stored))
+        mocks.session = new ActiveConversationSession({
+            characterId: 'character-a',
+            conversationId: 'chat-a',
+            conversation: owner.chats[0],
+            storeRevision: 1,
+        })
+        stream.enqueue({ response: 'first second' })
+        stream.close()
+
+        await expect(sending).resolves.toBe(true)
+        const promoted = (mocks.session as ActiveConversationSession).materializeCompatibilityArray()
+        expect(promoted).toHaveLength(1001)
+        expect(promoted.at(-1)?.data).toBe('first second')
+        expect(promoted.slice(0, 1000)).toEqual(messages(1000))
+        // The rest of the response was written through the promoted session, not the windowed store.
+        expect((mocks.session as ActiveConversationSession).version).toBeGreaterThan(0)
+        expect(stored.at(-1)?.data).toBe('first')
+        expect(mocks.alertError).not.toHaveBeenCalled()
+    })
+
     it('tells the user when no window opens because pending edits could not be saved', async () => {
         installWindowed(messages(1000))
         mocks.selectedAuthority.sessionVersion = 1
