@@ -1659,6 +1659,20 @@ impl PersistentStore {
     ) -> StoreResult<OutboxPage> {
         self.lww_read_outbox_generating(expected, limit, &[])
     }
+    /// Units waiting to be published, selected as `lww_read_outbox` selects them.
+    pub(crate) fn lww_outbox_count(&self, expected: DecimalU64) -> StoreResult<u64> {
+        verify(self.device_store()?.connection(), expected)?;
+        let participates = projection::plugin_participates(self.device_store()?.connection())?;
+        let mut count = 0;
+        for db in [&self.connection, self.device_store()?.connection()] {
+            count += db.query_row(
+                "SELECT COUNT(*) FROM lww_outbox WHERE authority=?1 AND (?2 OR json_extract(key,'$[0]')<>'plugin-local')",
+                params![expected.0.to_string(), participates],
+                |r| r.get::<_, i64>(0),
+            )? as u64;
+        }
+        Ok(count)
+    }
     pub(crate) fn lww_read_outbox_generating(
         &self,
         expected: DecimalU64,

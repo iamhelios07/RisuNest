@@ -570,6 +570,46 @@ fn asset_alias_receive_retains_remote_custody_before_apply_and_hydrates_only_mis
     );
 }
 #[test]
+fn clients_made_inside_a_lane_count_what_they_publish_receive_and_download() {
+    use super::progress::{within, ProgressLane};
+    let server = LocalServerFixture::new();
+    let (_a, mut a) = local();
+    let (_b, mut b) = local();
+    let body = vec![7; 64 * 1024 + 3];
+    put_asset(&mut a, "assets/progress.png", &body);
+    save(&mut a, &["root", "language"], serde_json::json!("en"));
+
+    let send = Arc::new(ProgressLane::default());
+    within(&send, || drain_publications(&server.client(&a), &mut a, &[])).unwrap();
+    let sent = send.snapshot("send");
+    assert!(!sent.active);
+    assert!(sent.items_done >= 2);
+    assert_eq!(sent.items_done, sent.items_total);
+    assert!(sent.files_done >= 1);
+    assert_eq!(sent.files_done, sent.files_total);
+    assert!(sent.bytes_done >= body.len() as u64);
+    assert_eq!(sent.bytes_done, sent.bytes_total);
+    assert!(sent.sent_bytes >= body.len() as u64);
+    assert!(sent.received_bytes > 0);
+
+    let receive = Arc::new(ProgressLane::default());
+    within(&receive, || receive_available(&server.client(&b), &mut b, &[])).unwrap();
+    let received = receive.snapshot("receive");
+    assert!(received.listed >= 2);
+    assert!(received.items_done >= 2);
+    assert_eq!(received.items_done, received.items_total);
+    assert!(received.received_bytes > 0);
+    assert!(received.received_bytes < body.len() as u64);
+
+    let hydrate = Arc::new(ProgressLane::default());
+    within(&hydrate, || b.hydrate_registered_remote_assets(|| Ok(()))).unwrap();
+    let hydrated = hydrate.snapshot("hydrate");
+    assert_eq!((hydrated.files_done, hydrated.files_total), (1, 1));
+    assert_eq!((hydrated.bytes_done, hydrated.bytes_total), (body.len() as u64, body.len() as u64));
+    assert!(hydrated.received_bytes >= body.len() as u64);
+    assert_eq!(hydrated.step, "idle");
+}
+#[test]
 fn no_edit_push_does_not_make_a_request() {
     let server = LocalServerFixture::new();
     let (_root, mut store) = local();
