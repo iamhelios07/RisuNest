@@ -141,8 +141,6 @@
 
     $effect(() => {
         if (isTauri && $loadedStore) {
-            // Start only after storage, asset authority and the working set are ready.
-            if (!isStartupExcluded('sync', getStartupExclusions()))
             // The update check runs after the start finishes, so a start that left it off keeps it off.
             if (!isStartupExcluded('autoUpdate', getStartupExclusions()))
                 void import('./ts/update/controller').then(({ startAppUpdateChecks }) => startAppUpdateChecks())
