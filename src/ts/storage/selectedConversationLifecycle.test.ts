@@ -1149,6 +1149,93 @@ describe('selected conversation lifecycle', () => {
         },
     )
 
+    it('reads rows a receive appended to the open windowed conversation', async () => {
+        const database = {
+            username: 'Receive fixture',
+            characters: [makeCharacter(makeChat(20))],
+        } as unknown as Database
+        let workingCopy = structuredClone(database)
+        const store = new IndexedDbPersistentDataStore(
+            `selected-receive-${crypto.randomUUID()}`,
+            indexedDB,
+            IDBKeyRange,
+        )
+        await store.open()
+        await store.replaceFromDatabase(database)
+        const state: PersistentDataRuntimeStateAdapter = {
+            captureRoot: () => capturePersistentRoot(workingCopy),
+            captureWorkingSetDatabase: () => workingCopy,
+            captureSelectedCharacter: () => workingCopy.characters[0] ?? null,
+            captureCharacter: (id) =>
+                workingCopy.characters.find((character) => character.chaId === id) ?? null,
+            getSelectedCharacterId: () => workingCopy.characters[0]?.chaId,
+            getSelectedConversationId: () => workingCopy.characters[0]?.chats[0]?.id,
+            replaceDatabase: (next) => {
+                workingCopy = next
+            },
+            publishCharacter: (next) => {
+                workingCopy.characters[0] = next
+            },
+            publishConversation: (_characterId, conversation, nextCharacter) => {
+                if (nextCharacter) workingCopy.characters[0] = nextCharacter
+                else workingCopy.characters[0].chats[0] = conversation
+            },
+            canUseWindowedSelectedConversation: () => true,
+            isConversationOperationActive: () => false,
+        }
+        const runtime = createPersistentDataRuntime({
+            store,
+            state,
+            prepareDatabase: async (candidate) => candidate,
+        })
+        await runtime.initializeActiveWorkingSet(workingCopy)
+        expect(runtime.getSelectedConversationMode()).toBe('windowed')
+        const native = store as PersistentDataStore
+        native.lwwStageReceive = async () => undefined
+        native.lwwFinishReceive = async () => undefined
+        native.lwwApplyReceive = async () => {
+            const current = await store.readRoot()
+            const committed = await store.commit({
+                expectedRevision: current.revision,
+                conversations: [{
+                    type: 'replace-range',
+                    characterId: 'char-a',
+                    conversationId: 'chat-a',
+                    start: 20,
+                    deleteCount: 0,
+                    messages: [{ role: 'char', data: 'remote tail', chatId: 'remote-tail' }],
+                }],
+            })
+            return {
+                ...committed,
+                affectedKeys: [JSON.stringify(['messages', 'char-a', 'chat-a'])],
+                heldKeys: [],
+                deferredKeys: [],
+            }
+        }
+
+        await runtime.applyLwwReceive({
+            bindingAuthority: 'remote',
+            requestId: crypto.randomUUID(),
+            changes: [{
+                key: JSON.stringify(['messages', 'char-a', 'chat-a']),
+                stamp: { physicalMs: '1', logical: '0', writerId: 'remote' },
+                value: { kind: 'deleted' },
+            }],
+            progress: { kind: 'server', cursor: '1' },
+            admittedTimeUpperMs: '100',
+        })
+
+        expect(runtime.getSelectedConversationMode()).toBe('windowed')
+        const source = runtime.getActiveConversationViewportSource()!
+        await source.ensureRange({ startIndex: 20, limit: 1, reason: 'viewport' })
+        expect(runtime.captureSelectedConversationAuthority()).toMatchObject({ totalMessages: 21 })
+        expect(source.snapshot().totalMessages).toBe(21)
+        expect(source.snapshot().rowAt(20)?.message).toMatchObject({ data: 'remote tail' })
+        await runtime.flushPendingDataLocally('after-windowed-receive')
+        expect(runtime.getSelectedConversationMode()).toBe('windowed')
+    })
+
     it('keeps a windowed selected conversation authoritative across a root module append', async () => {
         const database = {
             username: 'Windowed module append fixture',

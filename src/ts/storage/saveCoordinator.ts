@@ -123,8 +123,8 @@ export interface SaveCoordinatorDependencies {
     onLocalRevision?(revision: DataRevision): void
     /** Advances revision-only working-set state synchronously and must not throw. */
     onStorageOnlyRevision?(revision: DataRevision): void
-    /** Advances an adopted windowed selected-conversation authority synchronously. */
-    onWindowedSelectedConversationRevision?(revision: DataRevision): void
+    /** Advances an adopted windowed selected-conversation authority synchronously, with its new message count when that changed. */
+    onWindowedSelectedConversationRevision?(revision: DataRevision, totalMessages?: number): void
     onConversationMutationPersistenceStarted?(
         event: ActiveConversationMutationEvent,
     ): ConversationMutationPersistenceHandle | null | undefined
@@ -4651,7 +4651,8 @@ export class SaveCoordinator {
         })
     }
 
-    adoptAppliedUnitState(revision: DataRevision, root: RootDatabase | null, presets: botPreset[] | null, characters: readonly CompleteCharacter[], presetRecords: readonly botPreset[] = presets ?? []): void {
+    adoptAppliedUnitState(revision: DataRevision, root: RootDatabase | null, presets: botPreset[] | null, characters: readonly CompleteCharacter[], presetRecords: readonly botPreset[] = presets ?? [],
+        windowedConversation?: { characterId: string; conversationId: string; totalMessages: number }): void {
         this.currentRevision = revision
         if (root) this.rootBaseline = canonicalJson(root)
         if (presets) this.presetsBaseline = canonicalJson(presets)
@@ -4666,8 +4667,12 @@ export class SaveCoordinator {
             this.characterBaselineId = persisted.chaId
         }
         if (this.windowedCharacterBaseline) {
-            this.windowedCharacterBaseline.authority.storeRevision = revision
-            this.dependencies.onWindowedSelectedConversationRevision?.(revision)
+            const authority = this.windowedCharacterBaseline.authority
+            authority.storeRevision = revision
+            const totalMessages = windowedConversation?.characterId === authority.characterId &&
+                windowedConversation.conversationId === authority.conversationId ? windowedConversation.totalMessages : undefined
+            if (totalMessages !== undefined) authority.totalMessages = totalMessages
+            this.dependencies.onWindowedSelectedConversationRevision?.(revision, totalMessages)
         }
     }
 

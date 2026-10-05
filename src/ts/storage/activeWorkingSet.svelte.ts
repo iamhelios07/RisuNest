@@ -846,7 +846,7 @@ export class ActiveWorkingSet {
         return true
     }
 
-    advanceStoreRevision(revision: DataRevision): void {
+    advanceStoreRevision(revision: DataRevision, totalMessages?: number): void {
         const state = this.selectedConversationState
         if (state?.kind !== 'windowed') {
             const previousRevision = this.activeSession?.storeRevision
@@ -866,7 +866,7 @@ export class ActiveWorkingSet {
         if (!advance) {
             throw new Error('Windowed selected conversation revision advance is unavailable')
         }
-        const authority = { ...state.authority, storeRevision: revision }
+        const authority = { ...state.authority, storeRevision: revision, totalMessages: totalMessages ?? state.authority.totalMessages }
         const viewportSource = new PersistentConversationViewportSource({
             reader: this.dependencies.store,
             characterId: state.characterId,
@@ -879,6 +879,8 @@ export class ActiveWorkingSet {
             ...state,
             stateToken: Symbol('advanced windowed selected conversation'),
             authority,
+            summary: authority.totalMessages === state.authority.totalMessages
+                ? state.summary : { ...state.summary, messageCount: authority.totalMessages },
             viewportSource,
         }
         this.selectedConversationState = advancedState

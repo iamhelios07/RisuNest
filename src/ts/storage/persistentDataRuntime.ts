@@ -678,8 +678,8 @@ export function createPersistentDataRuntime(
             dependencies.onLocalRevision?.(revision)
         }),
         onStorageOnlyRevision: (revision) => workingSet.advanceStoreRevision(revision),
-        onWindowedSelectedConversationRevision: (revision) =>
-            workingSet.advanceStoreRevision(revision),
+        onWindowedSelectedConversationRevision: (revision, totalMessages) =>
+            workingSet.advanceStoreRevision(revision, totalMessages),
         onConversationMutationPersistenceStarted: (event) =>
             workingSet.beginConversationMutationPersistence(event),
         onConversationMutationPersisted: (event) => {
@@ -1037,6 +1037,7 @@ export function createPersistentDataRuntime(
         const lease = await dependencies.store.acquireRevision(result.revision)
         const projectionBaseline = baseline
         let applied: ReturnType<typeof captureLwwWorkingSetBaseline>
+        let windowedConversation: { characterId: string; conversationId: string; totalMessages: number } | undefined
         try {
             applied = await applyLwwWorkingSetUnits(database, projectionBaseline, lease, result.affectedKeys, dependencies.state.captureCharacterIndex?.(), localIntent, () => {
                 coordinator.assertPersistentMutationAllowed(authorityEpoch)
@@ -1056,8 +1057,16 @@ export function createPersistentDataRuntime(
                     else delete root[mutation.key]
                 }
             })
+            // A windowed shell holds no messages to patch; its row source needs the received count instead.
+            if (selectedTarget && workingSet.selectedConversationMode === 'windowed' && result.affectedKeys.some((key) => {
+                const [kind, characterId, conversationId] = JSON.parse(key) as string[]
+                return kind === 'messages' && characterId === selectedTarget.characterId && conversationId === selectedTarget.conversationId
+            })) {
+                const stored = await lease.readConversationMetadata(selectedTarget.characterId, selectedTarget.conversationId)
+                if (stored) windowedConversation = { characterId: selectedTarget.characterId, conversationId: selectedTarget.conversationId, totalMessages: stored.value.totalMessages }
+            }
         } finally { await releasePersistentRevisionLease(lease) }
-        coordinator.adoptAppliedUnitState(result.revision, applied.root, applied.presets, applied.characters, applied.presetRecords)
+        coordinator.adoptAppliedUnitState(result.revision, applied.root, applied.presets, applied.characters, applied.presetRecords, windowedConversation)
         if (selectedFields && [...selectedFields].some(([field, value]) => (selectedChat as unknown as Record<string, unknown>)[field] !== value) &&
             selectedSession!.matchesConversation(selectedTarget!.characterId, selectedChat!) &&
             !selectedSession!.adoptPersistedMetadata(selectedChat!, result.revision)) {
