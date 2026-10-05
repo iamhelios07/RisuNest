@@ -168,10 +168,10 @@ function backlog(lane: ServerSyncLane | undefined): Work | undefined {
 /** What a routine attempt did and has left: changes sent and received, and assets downloaded after them. */
 export function routineWork(attempt: ServerSyncAttempt): Record<ServerSyncRoutinePhase, Work> {
     const lane = (name: ServerSyncLaneName) => attempt.lanes?.find(entry => entry.lane === name)
-    const send = lane('send'), receive = lane('receive')
+    const send = lane('send')
     const sent = send?.itemsDone ?? 0
-    // A receive that reads the server's whole state instead of its changes has no known size.
-    const received = backlog(receive) ?? { done: receive?.itemsDone ?? 0, total: Math.max(receive?.itemsDone ?? 0, receive?.itemsTotal ?? 0) }
+    // A receive that only reads back this device's own push reports no known work.
+    const received = backlog(lane('receive')) ?? { done: 0, total: 0 }
     return {
         changes: { done: sent + received.done, total: Math.max(sent, send?.itemsTotal ?? 0, attempt.plannedSend ?? 0) + received.total },
         assets: backlog(lane('hydrate')) ?? { done: 0, total: 0 },

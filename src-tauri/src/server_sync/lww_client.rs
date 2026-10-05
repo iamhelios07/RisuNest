@@ -1010,6 +1010,8 @@ impl LwwClient {
             if page.pin_id != pin.pin_id || page.start_seq != pin.start_seq {
                 return Err(SyncError::new("invalid-state-page", 502));
             }
+            // Reading the whole state has no known size, so its pages count as they arrive.
+            self.client.lane().backlog(page.items.len() as u64, 0);
             next_key = page.next_key.map(|key| key.as_str().to_owned());
             done = next_key.is_none();
             (
@@ -1045,10 +1047,12 @@ impl LwwClient {
             }
             // The journal keeps one entry per key, so a sequence span bounds the
             // changes in it; it still measures how far through the server this is.
-            self.client.lane().backlog(
-                page.next_after.0 - cursor.0,
-                page.through_seq.0 - page.next_after.0,
-            );
+            // A last page holding only this device's own publications reads back a
+            // push and is not work to show.
+            let left = page.through_seq.0 - page.next_after.0;
+            let writer = store.lww_clock_state()?.writer_id;
+            let read_back = left == 0 && page.items.iter().all(|item| item.stamp.writer_id == writer);
+            self.client.lane().backlog(if read_back { 0 } else { page.next_after.0 - cursor.0 }, left);
             (
                 page.next_after,
                 page.items

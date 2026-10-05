@@ -107,9 +107,9 @@ describe('server sync routine bar', () => {
         const stale = routine({ stages: ['publishing'], lanes: [lane('receive', { backlogLeft: 50 })] })
         expect(serverSyncRoutineView(stale, text, false)).toBeUndefined()
     })
-    it('counts page items for a receive of unknown size', () => {
-        const view = serverSyncRoutineView(routine({ stages: ['downloading'], active: ['downloading'], current: 'downloading', lanes: [lane('receive', { active: true, step: 'downloading', itemsDone: 2, itemsTotal: 4 })] }), text, false)
-        expect(view?.fraction).toBe(0.5)
+    it('has no bar for a receive that only reads back a push from this device', () => {
+        const view = serverSyncRoutineView(routine({ stages: ['downloading'], active: ['downloading'], current: 'downloading', lanes: [lane('receive', { active: true, step: 'downloading', listed: 2, itemsDone: 2, itemsTotal: 2 })] }), text, false)
+        expect(view).toBeUndefined()
     })
     it('turns into an asset bar while the assets that followed download', () => {
         const lanes = [lane('receive', { backlogDone: 100 }), lane('hydrate', { active: true, step: 'downloading', backlogDone: 1, backlogLeft: 3 })]

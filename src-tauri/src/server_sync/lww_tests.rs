@@ -603,6 +603,12 @@ fn clients_made_inside_a_lane_count_what_they_publish_receive_and_download() {
     assert!(received.backlog_done >= received.listed);
     assert_eq!(received.backlog_left, 0);
 
+    let read_back = Arc::new(ProgressLane::default());
+    within(&read_back, || receive_available(&server.client(&a), &mut a, &[])).unwrap();
+    let read_back = read_back.snapshot("receive");
+    assert!(read_back.listed >= 2);
+    assert_eq!((read_back.backlog_done, read_back.backlog_left), (0, 0));
+
     let hydrate = Arc::new(ProgressLane::default());
     within(&hydrate, || b.hydrate_registered_remote_assets(|| Ok(()))).unwrap();
     let hydrated = hydrate.snapshot("hydrate");
