@@ -141,7 +141,6 @@ pub(crate) struct ServerClient {
     config: RwLock<ServerConfig>,
     cancelled: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     retry_budget: Arc<RetryBudget>,
-    slots: Arc<request_slots::RequestSlots>,
     pub(crate) verified_bytes: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     pub(crate) retryable_failure: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
     /// The cycle's activity slot. The transfer layer raises it while object
@@ -347,7 +346,6 @@ impl ServerClient {
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(|_| SyncError::new("http-client-unavailable", 503))?;
-        let slots = request_slots::RequestSlots::for_device(&config);
         Ok(Self {
             #[cfg(test)]
             test_io: None,
@@ -356,7 +354,6 @@ impl ServerClient {
             config: RwLock::new(config),
             cancelled,
             retry_budget,
-            slots,
             verified_bytes: None,
             retryable_failure: None,
             activity: None,
@@ -500,7 +497,7 @@ impl ServerClient {
                     let code = response_code(&reply);
                     let maintenance =
                         reply.status == 503 && code.as_deref() == Some("server-updating");
-                    let transient = matches!(reply.status, 502 | 503 | 504);
+                    let transient = retryable_response(&reply);
                     if maintenance || (retry_generic && replay_safe && transient) {
                         self.report_retryable_failure(if maintenance {
                             Some("server-updating")
@@ -550,7 +547,7 @@ impl ServerClient {
         headers: &[(&str, String)],
         limit: usize,
     ) -> Result<Reply> {
-        let _permit = self.slots.acquire(|| self.ensure_active())?;
+        self.ensure_active()?;
         #[cfg(test)]
         if let Some(counter)=&self.test_io {
             counter.requests.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
@@ -761,6 +758,11 @@ fn replay_safe(method: &Method, path: &str) -> bool {
                 | "acks"
         ) || (path.starts_with("uploads/") && path.ends_with("/complete"))
             || (path.starts_with("staged-changes/") && path.ends_with("/seal")))
+}
+
+pub(crate) fn retryable_response(reply: &Reply) -> bool {
+    matches!(reply.status, 502 | 503 | 504)
+        || (reply.status == 408 && response_code(reply).as_deref() == Some("request-timeout"))
 }
 
 pub(crate) fn is_ambiguous_transient(error: &SyncError) -> bool {
@@ -1180,7 +1182,7 @@ mod tests {
         let task = std::thread::spawn(move || {
             let mut seen = 0;
             for (status, body) in responses {
-                let mut request = server.recv().unwrap();
+                let mut request = server.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
                 seen += 1;
                 std::io::copy(request.as_reader(), &mut std::io::sink()).unwrap();
                 request
@@ -1203,6 +1205,29 @@ mod tests {
             seen
         });
         (endpoint, task)
+    }
+
+    #[test]
+    fn request_timeout_replays_only_recognized_identity_bound_requests() {
+        for (path, code, replay) in [
+            ("objects/missing", "request-timeout", true),
+            ("objects/missing", "unknown-timeout", false),
+            ("uploads", "request-timeout", false),
+        ] {
+            let body = if code == "request-timeout" { r#"{"error":"request-timeout"}"# }
+                else { r#"{"error":"unknown-timeout"}"# };
+            let mut responses = vec![(408, body)];
+            if replay {
+                // Recovery checks the identity, then retries within the same budget.
+                responses.extend([(503, ""), (200, "done")]);
+            }
+            let (endpoint, task) = respond_in_order(responses);
+            let mut client = ServerClient::new(config(&endpoint)).unwrap();
+            client.retry_budget = no_sleep_budget();
+            let reply = client.request(Method::POST, path, &[], Some(b"{}".to_vec()), &[], MAX_METADATA_BYTES).unwrap();
+            assert_eq!(reply.status, if replay { 200 } else { 408 });
+            assert_eq!(task.join().unwrap(), if replay { 3 } else { 1 });
+        }
     }
 
     #[test]
@@ -1235,5 +1260,6 @@ mod tests {
 #[path = "directory_tests.rs"]
 mod directory_tests;
 
-#[path = "request_slots.rs"]
-mod request_slots;
+#[cfg(test)]
+#[path = "concurrency_tests.rs"]
+mod concurrency_tests;

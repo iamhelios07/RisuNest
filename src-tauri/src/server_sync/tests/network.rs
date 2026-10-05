@@ -261,7 +261,8 @@ async fn proxy(State(state): State<Arc<Faults>>, request: Request, next: Next) -
         let code = state.frame_code.swap(0, Ordering::Relaxed);
         if code > 0 {
             axum::body::to_bytes(request.into_body(), risunest_sync_wire::transfer::MAX_BATCH_BYTES).await.unwrap();
-            return Response::builder().status(code).header("retry-after", "0").body(Body::empty()).unwrap();
+            let body = if code == 408 { Body::from(r#"{"error":"request-timeout"}"#) } else { Body::empty() };
+            return Response::builder().status(code).header("retry-after", "0").body(body).unwrap();
         }
     }
     if path.starts_with("/objects/") && request.method().as_str() == "GET" {
@@ -608,6 +609,11 @@ fn frame_case(sizes: &[usize], depth: usize, rate: u64, failure: u16, mixed_base
 #[test]
 fn frame_batches_join_two_requests_and_shrink_after_transient_failure() {
     frame_case(&[1024 * 1024; 8], 2, 0, 503, false);
+}
+
+#[test]
+fn frame_batches_recover_after_server_request_timeout() {
+    frame_case(&[1024 * 1024; 8], 2, 0, 408, false);
 }
 
 #[test]

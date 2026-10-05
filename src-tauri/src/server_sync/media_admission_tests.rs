@@ -302,7 +302,7 @@ fn media_lookups_keep_the_residency_log_open_between_requests() {
 }
 
 #[test]
-fn a_media_grant_waits_for_server_capacity_without_a_refusal() {
+fn a_media_grant_completes_beside_eight_held_responses() {
     let (fixture, state) = admission_fixture();
     let remote = Remote::new(&fixture);
     state.reset();
@@ -316,11 +316,10 @@ fn a_media_grant_waits_for_server_capacity_without_a_refusal() {
         assert!(std::time::Instant::now() < deadline);
         std::thread::yield_now();
     }
-    let early = received.recv_timeout(std::time::Duration::from_millis(200));
+    let early = received.recv_timeout(std::time::Duration::from_secs(2));
     state.gate.send_replace(true);
     finish(held);
-    assert!(early.is_err(), "a grant waits for capacity instead of returning an error");
-    let url = received.recv_timeout(std::time::Duration::from_secs(5)).unwrap().unwrap();
+    let url = early.expect("a grant waited behind unrelated responses").unwrap();
     task.join().unwrap();
     assert!(url.starts_with(&fixture.endpoint));
     assert_eq!(state.refusals.load(Ordering::SeqCst), 0);
