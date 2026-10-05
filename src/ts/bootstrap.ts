@@ -18,7 +18,7 @@ import { registerRuntimeErrorHandlers } from "./runtimeErrors";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { MobileGUI, botMakerMode, selectedCharID, loadedStore, LoadingStatusState, bootFailure } from "./stores.svelte";
 import { loadPlugins, loadPluginsAfterAuthoritativeRestore } from "./plugins/plugins.svelte";
-import { alertConfirm, alertError, alertInput, alertLogin, alertMd, alertNormal, alertSelect, alertTOS, waitAlert } from "./alert";
+import { alertConfirm, alertError, alertInput, alertLogin, alertMd, alertNormal, alertSelect, alertToast, alertTOS, waitAlert } from "./alert";
 import { applyHubSelection, characterURLImport, downloadRisuHub, hubURL } from "./characterCards";
 import { initializeNativeLocalUrls } from "./nativeLocalUrls";
 import { loadRisuAccountData } from "./drive/accounter";
@@ -864,8 +864,9 @@ export async function loadData() {
                 return
             }
             if (isTauri && !isTauriAndroid && await takeRendererRecovery()) {
+                // A dialog replaces the toast, so it waits for queued dialogs.
                 await waitAlert()
-                alertNormal(language.risuNest.startup.rendererRecovered)
+                alertToast(language.risuNest.startup.rendererRecovered)
             }
         })
     } catch (error) {

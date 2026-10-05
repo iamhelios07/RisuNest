@@ -2202,7 +2202,7 @@ export const languageEnglish = {
             serviceWorker: 'Preparing offline support',
             ui: 'Preparing the interface',
             elapsed: (seconds: number) => `${seconds}s elapsed`,
-            rendererRecovered: 'The WebView renderer stopped, so the screen was reloaded.',
+            rendererRecovered: 'The screen was reloaded with your saved data.',
         },
         serverSync: {
             registrationCode: 'Registration code',
