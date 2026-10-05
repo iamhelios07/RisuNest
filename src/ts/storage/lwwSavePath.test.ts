@@ -5,7 +5,7 @@ import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
 import { IndexedDbPersistentDataStore } from './indexedDbPersistentDataStore'
 import { fixtureDatabase } from './tests/persistentDataFixtures'
 import { PersistentMutationFencedError, SaveCoordinator } from './saveCoordinator'
-import { capturePersistentRoot, createPersistentDataRuntime } from './persistentDataRuntime'
+import { capturePersistentRoot, createPersistentDataRuntime, type PersistentDataRuntimeStateAdapter } from './persistentDataRuntime'
 import { applyLwwWorkingSetUnits, captureLwwWorkingSetBaseline } from './lwwWorkingSetApply'
 import { createGeneratingConversationRegistry } from './generatingConversationRegistry'
 import { diffMaterializedCharacter, diffRecordCollection } from './persistentUnitCapture'
@@ -34,12 +34,12 @@ async function harness() {
     return { database, store, commit, coordinator }
 }
 
-async function runtimeHarness(registry?: ReturnType<typeof createGeneratingConversationRegistry>) {
+async function runtimeHarness(registry?: ReturnType<typeof createGeneratingConversationRegistry>, extraState?: Partial<PersistentDataRuntimeStateAdapter>) {
     const values = await harness()
-    return initializeRuntimeHarness(values, registry)
+    return initializeRuntimeHarness(values, registry, extraState)
 }
 
-async function initializeRuntimeHarness(values: Omit<Awaited<ReturnType<typeof harness>>, 'store'> & {store: PersistentDataStore}, registry?: ReturnType<typeof createGeneratingConversationRegistry>) {
+async function initializeRuntimeHarness(values: Omit<Awaited<ReturnType<typeof harness>>, 'store'> & {store: PersistentDataStore}, registry?: ReturnType<typeof createGeneratingConversationRegistry>, extraState?: Partial<PersistentDataRuntimeStateAdapter>) {
     const {database,store} = values
     const runtime = createPersistentDataRuntime({store,state:{
         captureRoot:()=>capturePersistentRoot(database), capturePresets:()=>database.botPresets,
@@ -47,6 +47,7 @@ async function initializeRuntimeHarness(values: Omit<Awaited<ReturnType<typeof h
         captureSelectedCharacter:()=>database.characters[0], captureCharacter:(id)=>database.characters.find((value)=>value.chaId===id)??null,
         getGeneratingConversations:()=>registry?.snapshot() ?? [],
         getSelectedCharacterId:()=>database.characters[0]?.chaId,replaceDatabase:()=>undefined,publishCharacter:()=>undefined,publishConversation:()=>undefined,
+        ...extraState,
     },prepareDatabase:async(value)=>value})
     await runtime.initializeActiveWorkingSet(database)
     return {...values,store:store as PersistentDataStore,runtime}
@@ -246,6 +247,30 @@ describe('LWW renderer save path', () => {
         await applyLwwWorkingSetUnits(database,baseline,reader,['["root","risunestChatEditPopup"]','["root","colorScheme"]'])
         expect(database.risunestChatEditPopup).toBe(false)
         expect(database.colorScheme).toEqual(colorScheme)
+    })
+
+    it('reports received root fields whose working-set value changed', async () => {
+        const afterRemoteRootChange = vi.fn()
+        const {database,store,runtime} = await runtimeHarness(undefined, {afterRemoteRootChange})
+        const receive = async (key: string, value: unknown) => {
+            store.lwwStageReceive = async()=>undefined
+            store.lwwApplyReceive = async()=>{
+                const revision=(await store.readRoot()).revision
+                const result=await store.commit({expectedRevision:revision,unitMutations:[{key:JSON.stringify(['root',key]),type:'set',value}]})
+                return {...result,affectedKeys:[JSON.stringify(['root',key])],heldKeys:[],deferredKeys:[]}
+            }
+            store.lwwFinishReceive=async()=>undefined
+            await runtime.applyLwwReceive({bindingAuthority:'a',requestId:crypto.randomUUID(),changes:[],progress:{kind:'server',cursor:'1'},admittedTimeUpperMs:'100'})
+        }
+        const colorSchemeName = database.colorSchemeName === 'light' ? 'dark' : 'light'
+
+        await receive('colorSchemeName', colorSchemeName)
+        expect(database.colorSchemeName).toBe(colorSchemeName)
+        expect(afterRemoteRootChange).toHaveBeenCalledExactlyOnceWith(new Set(['colorSchemeName']))
+
+        afterRemoteRootChange.mockClear()
+        await receive('colorSchemeName', colorSchemeName)
+        expect(afterRemoteRootChange).not.toHaveBeenCalled()
     })
 
     it('commits plugin units once if their pinned projection loses its revision', async () => {
