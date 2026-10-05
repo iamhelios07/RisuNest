@@ -1596,3 +1596,66 @@ fn a_bootstrap_pin_that_expires_at_once_stops_with_a_retryable_error() {
     let kept: i64 = client.log.0.query_row("SELECT count(*) FROM bootstrap", [], |r| r.get(0)).unwrap();
     assert_eq!(kept, 0);
 }
+
+/// A server whose `/time` answers `behind` milliseconds before its own clock.
+fn server_clock_behind(behind: Arc<std::sync::atomic::AtomicU64>) -> LocalServerFixture {
+    LocalServerFixture::with_router(move |router| {
+        router.layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let behind = behind.clone();
+                async move {
+                    if request.method() == axum::http::Method::GET && request.uri().path() == "/time" {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis() as u64;
+                        let sample = risunest_sync_wire::lww::TimeSample {
+                            server_time_ms: (now - behind.load(std::sync::atomic::Ordering::SeqCst)).into(),
+                            precision_ms: 1.into(),
+                        };
+                        return axum::response::IntoResponse::into_response(axum::Json(sample));
+                    }
+                    next.run(request).await
+                }
+            },
+        ))
+    })
+}
+
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+#[test]
+fn a_stamp_beyond_an_earlier_clock_sample_is_received_after_one_new_sample() {
+    let behind = Arc::new(std::sync::atomic::AtomicU64::new(60_000));
+    let server = server_clock_behind(behind.clone());
+    let writer = ServerWriter::new(&server.server);
+    let (_root, mut store) = local();
+    let client = server.client(&store);
+    // Sampled while the server answered a minute behind its own clock.
+    client.admission().unwrap();
+    behind.store(0, std::sync::atomic::Ordering::SeqCst);
+    let key = UnitKey::new(&["root", "language"]).unwrap();
+    writer.push("ahead", &key, wall_ms() + 290_000, UnitValue::inline(br#""ja""#).unwrap());
+    receive(&client, &mut store);
+    assert_eq!(store.read_root(None).unwrap().value["language"], "ja");
+}
+
+#[test]
+fn a_stamp_beyond_a_new_clock_sample_stops_receiving_without_advancing() {
+    let behind = Arc::new(std::sync::atomic::AtomicU64::new(60_000));
+    let server = server_clock_behind(behind);
+    let writer = ServerWriter::new(&server.server);
+    let (_root, mut store) = local();
+    let client = server.client(&store);
+    let key = UnitKey::new(&["root", "language"]).unwrap();
+    writer.push("ahead", &key, wall_ms() + 290_000, UnitValue::inline(br#""ja""#).unwrap());
+    let error = receive_cycle(&client, &mut store, &[]).err().unwrap();
+    assert_eq!(error.code, "incoming-clock-skew");
+    assert_eq!(server_cursor(&store), None);
+    assert_ne!(store.read_root(None).unwrap().value["language"], "ja");
+}

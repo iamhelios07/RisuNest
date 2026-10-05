@@ -1057,6 +1057,13 @@ impl LwwClient {
             }
         }
         let changes = unique.into_values().collect::<Vec<_>>();
+        let upper = if changes.iter().any(|change| change.stamp.physical_ms > upper) {
+            // A stamp beyond the kept sample is checked against a new one before
+            // it is rejected.
+            self.fresh_admission()?
+        } else {
+            upper
+        };
         self.prepare_bodies(store, &changes, upper)?;
         self.check()?;
         let staged = StageReceive {

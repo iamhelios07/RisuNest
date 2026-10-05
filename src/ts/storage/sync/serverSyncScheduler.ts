@@ -9,6 +9,8 @@ export interface ServerSyncSchedulerDependencies {
 }
 
 const integrityCodes = ['clock-skew', 'incoming-clock-skew', 'accepted-clock-correction-required', 'writer-collision', 'equal-stamp-integrity', 'server-epoch-changed', 'unauthorized', 'invalid-device-token']
+// A new clock sample can clear these, so they are rechecked instead of waiting for a manual retry.
+const clockCodes = ['clock-skew', 'incoming-clock-skew']
 export function serverSyncErrorCode(error: unknown): string {
     if (typeof error !== 'object' || !error) return ''
     if ('message' in error && typeof error.message === 'string' && integrityCodes.includes(error.message)) return error.message
@@ -49,7 +51,7 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
     const succeeded = (lane: Lane) => { if (failedLanes.delete(lane) && failedLanes.size === 0 && !blocked) dependencies.recovered?.() }
     const fail = (error: unknown, lane?: Lane) => {
         if (isCancellation(error)) return
-        if (blocked && blockedCode !== 'clock-skew') return
+        if (blocked && !clockCodes.includes(blockedCode)) return
         if (lane) failedLanes.add(lane)
         if ((typeof error === 'object' && error && 'retryable' in error && error.retryable === false && code(error) !== 'server-unreachable') || integrityCodes.includes(code(error))) {
             blocked = true
@@ -107,13 +109,13 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
         schedulePull()
     }
     const recheckClock = (): Promise<boolean> => {
-        if (!foreground || !blocked || blockedCode !== 'clock-skew' || !dependencies.retryClock) return Promise.resolve(false)
+        if (!foreground || !blocked || !clockCodes.includes(blockedCode) || !dependencies.retryClock) return Promise.resolve(false)
         if (checkingClock) return checkingClock
         checkingClock = (async () => {
             await Promise.allSettled([sending, receiving, disconnecting])
-            if (!foreground || blockedCode !== 'clock-skew') return false
+            if (!foreground || !clockCodes.includes(blockedCode)) return false
             await dependencies.retryClock!()
-            if (!foreground || blockedCode !== 'clock-skew') return false
+            if (!foreground || !clockCodes.includes(blockedCode)) return false
             blocked = false; blockedCode = ''; sendRetryAttempt = 0
             connect(); void pull().catch(() => {}); void push().catch(() => {})
             return true
