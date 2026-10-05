@@ -662,7 +662,7 @@ impl<'a> Transfer<'a> {
             self.frame_limit.set(measured_limit);
             for (result, group, elapsed) in failed {
                 match result {
-                    Ok(reply) if matches!(reply.status, 502 | 503 | 504) => {
+                    Ok(reply) if super::client::retryable_response(&reply) => {
                         let _ = client.resolve_identity();
                         client.wait_transient_response(
                             reply.retry_after,
@@ -1039,6 +1039,7 @@ impl<'a> Transfer<'a> {
         match reply.status {
             202 => Ok(true),
             404 => Ok(false),
+            429 if super::client::response_code(&reply).as_deref() == Some("delta-cache-quota") => Ok(false),
             _ => Err(response_error(reply)),
         }
     }
