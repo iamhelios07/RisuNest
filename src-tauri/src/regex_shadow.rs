@@ -616,15 +616,17 @@ pub(crate) async fn regex_execute_batch(
     input: String,
     registry: tauri::State<'_, RegexCancellationRegistry>,
 ) -> Result<RegexShadowResult, String> {
-    let execution = registry.register(&request_id)?;
-    let cancelled = Arc::clone(&execution.cancelled);
-    let result =
-        tauri::async_runtime::spawn_blocking(move || execute_batch(plan, input, Some(&cancelled)))
-            .await
-            .map_err(|_| "regex_shadow_join".to_string())?
-            .map_err(|error| error.0.to_string());
-    drop(execution);
-    result
+    crate::native_log::logged_without_detail("regex_execute_batch", async {
+        let execution = registry.register(&request_id)?;
+        let cancelled = Arc::clone(&execution.cancelled);
+        let result =
+            tauri::async_runtime::spawn_blocking(move || execute_batch(plan, input, Some(&cancelled)))
+                .await
+                .map_err(|_| "regex_shadow_join".to_string())?
+                .map_err(|error| error.0.to_string());
+        drop(execution);
+        result
+    }.await)
 }
 
 #[tauri::command]
@@ -632,7 +634,7 @@ pub(crate) fn regex_cancel_batch(
     request_id: String,
     registry: tauri::State<'_, RegexCancellationRegistry>,
 ) -> Result<bool, String> {
-    registry.cancel(&request_id)
+    crate::native_log::logged_without_detail("regex_cancel_batch", registry.cancel(&request_id))
 }
 
 fn execute_plan_with_control(

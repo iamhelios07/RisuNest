@@ -99,6 +99,19 @@ impl std::fmt::Display for OfficialPublicationUploadError {
 
 impl std::error::Error for OfficialPublicationUploadError {}
 
+impl crate::native_log::CommandFailure for OfficialPublicationUploadError {
+    fn code(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed(match self {
+            Self::InvalidRequest { .. } => "invalid-request",
+            Self::Source { .. } => "source",
+            Self::Transport { .. } => "transport",
+            Self::HttpStatus { .. } => "http-status",
+            Self::ResponseTooLarge => "response-too-large",
+            Self::InvalidResponse { .. } => "invalid-response",
+        })
+    }
+}
+
 fn endpoint(base_url: &str, path: &str) -> Result<String, OfficialPublicationUploadError> {
     let parsed = url::Url::parse(base_url).map_err(|error| {
         OfficialPublicationUploadError::InvalidRequest {
