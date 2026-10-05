@@ -1,5 +1,6 @@
 #import <AppKit/AppKit.h>
 #import <CoreFoundation/CoreFoundation.h>
+#import <CoreServices/CoreServices.h>
 #import <objc/runtime.h>
 
 static void (*requestProbe)(void);
@@ -121,5 +122,45 @@ int risunest_bench_queue_repeated_quit(void) {
         [NSApp terminate:nil];
     });
     CFRunLoopWakeUp(loop);
+    return 1;
+}
+
+static IMP originalCurrentAppleEvent;
+static BOOL syntheticSessionEvent;
+
+static NSAppleEventDescriptor *sessionAppleEvent(id manager, SEL selector) {
+    if (!syntheticSessionEvent) return ((id (*)(id, SEL))originalCurrentAppleEvent)(manager, selector);
+    NSAppleEventDescriptor *event = [NSAppleEventDescriptor appleEventWithEventClass:kCoreEventClass
+        eventID:kAEQuitApplication targetDescriptor:[NSAppleEventDescriptor nullDescriptor] returnID:kAutoGenerateReturnID transactionID:kAnyTransactionID];
+    [event setAttributeDescriptor:[NSAppleEventDescriptor descriptorWithTypeCode:kAELogOut]
+        forKeyword:kAEQuitReason];
+    return event;
+}
+
+int risunest_bench_session_quit(void (*observer)(int, int, int), void (*decision)(int), int upgrade) {
+    if (![NSThread isMainThread] || originalCurrentAppleEvent) return 0;
+    Method method = class_getInstanceMethod([NSAppleEventManager class], @selector(currentAppleEvent));
+    if (!method) return 0;
+    originalCurrentAppleEvent = method_setImplementation(method, (IMP)sessionAppleEvent);
+    syntheticSessionEvent = !upgrade;
+    if (!risunest_bench_queue_native_quit(observer, decision)) return 0;
+    CFRunLoopRef loop = CFRunLoopGetMain();
+    CFRunLoopTimerRef repeat = CFRunLoopTimerCreateWithHandler(kCFAllocatorDefault,
+        CFAbsoluteTimeGetCurrent() + 1.0, 0, 0, 0, ^(CFRunLoopTimerRef timer) {
+            // Deliver another session event to the delegate while the first real terminate: waits.
+            // A second terminate: itself follows AppKit's ordinary force-quit behavior instead.
+            syntheticSessionEvent = YES;
+            [NSApp.delegate applicationShouldTerminate:NSApp];
+        });
+    CFRunLoopAddTimer(loop, repeat, (__bridge CFStringRef)NSModalPanelRunLoopMode);
+    CFRelease(repeat);
+    if (upgrade) {
+        CFRunLoopTimerRef repeatedSession = CFRunLoopTimerCreateWithHandler(kCFAllocatorDefault,
+            CFAbsoluteTimeGetCurrent() + 2.0, 0, 0, 0, ^(CFRunLoopTimerRef timer) {
+                [NSApp.delegate applicationShouldTerminate:NSApp];
+            });
+        CFRunLoopAddTimer(loop, repeatedSession, (__bridge CFStringRef)NSModalPanelRunLoopMode);
+        CFRelease(repeatedSession);
+    }
     return 1;
 }

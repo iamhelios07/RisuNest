@@ -358,6 +358,11 @@ async function main() {
     const [, action, theme] = phase.split("-");
     await report(phase, await startupAppearance(action === "seed", theme as "light" | "dark"));
     await invoke("macos_bench_quit");
+  } else if (phase === "session-deadline" || phase === "session-upgrade") {
+    // Deliberately install no renderer exit listener. Native expiry must release AppKit.
+    await invoke("macos_lifecycle_ready");
+    await report("session-deadline-started", { passed: true, rendererResponds: false });
+    await invoke("macos_bench_session_quit");
   } else if (phase === "termination-probe") {
     const settle = async (attempt: number) => {
       await invoke("macos_bench_modal_ack", { attempt, approve: attempt === 3 });
