@@ -90,6 +90,15 @@ const openConversation = (conversationId: string) => { f.conversation = { charac
 const callOrder = (command: string) => f.invoke.mock.invocationCallOrder[f.invoke.mock.calls.findIndex(([name]) => name === command)]
 
 describe('production server LWW composition', () => {
+    it('shows why sync stopped when a committed switch cannot resume', async () => {
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        f.transport!.reportStopped!({ code: 'server-unreachable' })
+        expect(production.getServerSyncController().snapshot().error).toBe('server-unreachable')
+        f.transport!.reportStopped!(new AggregateError([{ code: 'unauthorized' }], 'stopped'))
+        expect(production.getServerSyncController().snapshot().error).toBe('unauthorized')
+        f.transport!.reportStopped!(new Error('no code'))
+        expect(production.getServerSyncController().snapshot().error).toBe('server-unreachable')
+    })
     it('exposes native configuration without starting a second binding', async () => {
         const config = { endpoint: 'https://synthetic.invalid', libraryId: 'library', deviceId: 'registration', token: 'synthetic' }
         await production.configureServerSyncConnection(config)

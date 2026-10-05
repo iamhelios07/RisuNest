@@ -63,6 +63,8 @@ export interface SyncBindingTransport {
     publishInitialSharedState(context: BindingContext): Promise<void>
     resumeBinding(context: BindingContext): Promise<void>
     fenceOldJobs(context: BindingContext): Promise<void>
+    // Told when sync stopped because the transport could not resume after a committed switch.
+    reportStopped?(error: unknown): void
     // Claims a fresh writer for a changed registration to the library this device was bound to, keeping local data.
     prepareFreshWriter?(inspected: InspectedSyncTarget, context: BindingContext): Promise<NewDeviceBindingPreparation>
     // These hooks reserve/register a writer before activation and use it only after activation.
@@ -221,6 +223,7 @@ export function createSyncBindingFlow(dependencies: SyncBindingDependencies) {
                 active = undefined
                 try { await transport.fenceOldJobs(activatedContext!) }
                 catch (fenceError) { throw new AggregateError([error, fenceError], 'Sync binding failed while stopping its transport') }
+                transport.reportStopped?.(error)
             }
             const resumeAfterRefresh = async () => {
                 try { await resumeActivated!() } catch (error) { await stopActivated(error) }

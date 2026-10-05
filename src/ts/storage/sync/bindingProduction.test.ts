@@ -207,13 +207,17 @@ it('lifts the recovery fence once the working set is refreshed, even when the ad
     const fence = vi.fn<SyncBindingTransport['fenceOldJobs']>(async () => {})
     h.transport.fenceOldJobs = fence
     h.transport.resumeBinding = vi.fn(async () => { throw Error('storage unreachable') })
+    const reportStopped = vi.fn<NonNullable<SyncBindingTransport['reportStopped']>>()
+    h.transport.reportStopped = reportStopped
     await expect(h.flow.bind(h.target, h.transport)).rejects.toThrow('partial restart failed')
+    expect(reportStopped).not.toHaveBeenCalled()
     expect(() => h.runtime.markPersistentDataDirty(1)).toThrow()
     expect((await h.runtime.retryCommittedWorkingSetRefresh())?.projection).toBe('applied')
     expect(h.database.username).toBe('Activated synthetic target')
     expect(() => h.runtime.markPersistentDataDirty(1)).not.toThrow()
     expect(h.transport.resumeBinding).toHaveBeenCalledOnce()
     expect(fence.mock.lastCall![0].state).toMatchObject({ targetAuthority: '1' })
+    expect(reportStopped).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ message: 'storage unreachable' }))
     await expect(h.runtime.retryCommittedWorkingSetRefresh()).resolves.toBeNull()
 })
 
