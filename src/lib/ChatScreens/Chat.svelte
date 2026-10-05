@@ -794,7 +794,6 @@
         const character = DBState.db.characters[selIdState.selId]
         const conversation = character?.chats[character.chatPage]
         return createMessageButtonTarget({
-            characterIndex: selIdState.selId,
             character,
             conversationId: conversation?.id,
             messageIndex: idx,
