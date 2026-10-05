@@ -13,6 +13,7 @@ import { diffRootMutations } from './rootMutation'
 
 /** Production-only: read closures must expose the deeply reactive DBState working set. */
 export interface PersistenceCanonicalCapture {
+    characterShell?(): { value: Omit<character, 'chats'> & { chats: Array<Omit<Chat, 'message'>> }; json: string } | null
     materializedCharacters?(): ReadonlyMap<string, character>
     characters?(): ReadonlyMap<string, string>
     root(): string
@@ -93,6 +94,7 @@ function objectCapture(
     let previous:
         | { volatile: false; json: string; entries: readonly (readonly [string, string])[]; values: ReadonlyMap<string, unknown> }
         | undefined
+    let previousVolatile: { json: string; entries: null; values: undefined } | undefined
     const snapshot = () => {
         const source = read()
         if (source === null) {
@@ -182,7 +184,9 @@ function objectCapture(
         const value: Record<string, unknown> = {}
         for (const key of Object.keys(source))
             if (!omit.has(key)) defineOwnEnumerableProperty(value, key, transform ? transform(key, source[key]) : source[key])
-        return { json: ordered ? pluginStorageJson(value) : canonicalJson(value), entries: null, values: undefined }
+        const json = ordered ? pluginStorageJson(value) : canonicalJson(value)
+        if (previousVolatile?.json === json) return previousVolatile
+        return previousVolatile = { json, entries: null, values: undefined }
     }
 }
 
@@ -201,60 +205,121 @@ export function createPersistenceCanonicalCapture(read: {
         undefined,
         read.rootField,
     )
-    const characterCaptures = new Map<string, { value: character; capture: () => {json:string; value:character} }>()
+    type CharacterCapture = { readonly json: string; value: character }
+    const characterCaptures = new Map<string, { value: character; capture: () => CharacterCapture }>()
+    const ownedValue = (captured: NonNullable<ReturnType<ReturnType<typeof objectCapture>>>) =>
+        captured.values ? Object.fromEntries(captured.values) : JSON.parse(captured.json)
+    const shellDetail = objectCapture(() => read.character() as Record<string, unknown> | null, new Set(['chats']), false)
+    const shellChats = new Map<Chat, ReturnType<typeof objectCapture>>()
+    let previousShellParts: unknown[] = []
+    let previousShell: NonNullable<ReturnType<NonNullable<PersistenceCanonicalCapture['characterShell']>>> | null = null
+    const captureShell = () => {
+        const character = read.character() as character | null
+        const detail = shellDetail()
+        if (!character || !detail) { shellChats.clear(); previousShell = null; return null }
+        const active = new Set(character.chats)
+        for (const chat of shellChats.keys()) if (!active.has(chat)) shellChats.delete(chat)
+        const chats = character.chats.map((chat) => {
+            let capture = shellChats.get(chat)
+            if (!capture) {
+                capture = untrack(() => objectCapture(() => chat as unknown as Record<string, unknown>, new Set(['message']), false))
+                shellChats.set(chat, capture)
+            }
+            return capture()!
+        })
+        const parts = [detail, ...chats]
+        if (previousShell && parts.length === previousShellParts.length && parts.every((part, index) => part === previousShellParts[index])) return previousShell
+        previousShellParts = parts
+        const value = { ...ownedValue(detail), chats: chats.map(ownedValue) } as NonNullable<typeof previousShell>['value']
+        let json: string | undefined
+        return previousShell = { value, get json() { return json ??= canonicalJson(value) } }
+    }
     const captureCharacters = () => {
-        const result = new Map<string, {json:string; value:character}>()
+        const result = new Map<string, CharacterCapture>()
         for (const value of read.characters?.() ?? []) {
             let entry = characterCaptures.get(value.chaId)
             if (!entry || entry.value !== value) {
                 const detail = untrack(() => objectCapture(() => value as unknown as Record<string, unknown>, new Set(['chats']), false))
-                const chats = new Map<Chat, ReturnType<typeof objectCapture>>()
-                const decoded = new Map<string, {json:string; value:unknown}>()
-                const decode = (key: string, json: string) => {
-                    let previous = decoded.get(key)
-                    if (previous?.json !== json) { previous = {json, value: JSON.parse(json)}; decoded.set(key, previous) }
-                    return previous!.value
-                }
-                let previous: {json:string; value:character} | undefined
-                let previousParts: readonly unknown[] = []
+                const chats = new Map<Chat, () => Chat>()
+                let previous: CharacterCapture | undefined
+                let previousDetail: unknown
                 const capture = () => {
                     const capturedDetail = detail()!
                     const active = new Set(value.chats)
                     for (const chat of chats.keys()) if (!active.has(chat)) chats.delete(chat)
-                    const capturedChats = value.chats.map((chat) => {
-                        let capturedChat = chats.get(chat)
-                        if (!capturedChat) {
-                            const omit = isConversationSummaryStub(chat) || !Object.prototype.propertyIsEnumerable.call(chat, 'message') ? new Set(['message']) : new Set<string>()
-                            capturedChat = untrack(() => objectCapture(() => chat as unknown as Record<string, unknown>, omit, false))
-                            chats.set(chat, capturedChat)
+                    const chatValues = value.chats.map((chat) => {
+                        let captureChat = chats.get(chat)
+                        if (!captureChat) {
+                            const metadata = untrack(() => objectCapture(() => chat as unknown as Record<string, unknown>, new Set(['message']), false))
+                            const messages = new Map<object, () => Chat['message'][number]>()
+                            const messageHooks = new Map<object, { json: string; value: Chat['message'][number] }>()
+                            let previousMetadata: unknown
+                            let previousChat: Chat | undefined
+                            let previousMessages: Chat['message'] | undefined
+                            let previousBodyJson: string | undefined
+                            captureChat = () => {
+                                const capturedMetadata = metadata()!
+                                let nextMessages: Chat['message'] | undefined
+                                if (!isConversationSummaryStub(chat) && Object.prototype.propertyIsEnumerable.call(chat, 'message')) {
+                                    const body = chat.message
+                                    // An array hook or getter can depend on the complete value.
+                                    if (typeof (body as unknown as { toJSON?: unknown }).toJSON === 'function') {
+                                        const json = canonicalJson(body)
+                                        nextMessages = json === previousBodyJson ? previousMessages : JSON.parse(json)
+                                        previousBodyJson = json
+                                    } else {
+                                        const activeMessages = new Set<object>(body)
+                                        for (const message of messages.keys()) if (!activeMessages.has(message)) messages.delete(message)
+                                        for (const message of messageHooks.keys()) if (!activeMessages.has(message)) messageHooks.delete(message)
+                                        const values = body.map((message, index) => {
+                                            if (typeof (message as unknown as { toJSON?: unknown }).toJSON === 'function') {
+                                                const json = canonicalJson({ [index]: message })
+                                                let captured = messageHooks.get(message)
+                                                if (captured?.json !== json) {
+                                                    captured = { json, value: JSON.parse(json)[index] }
+                                                    messageHooks.set(message, captured)
+                                                }
+                                                return captured.value
+                                            }
+                                            let captureMessage = messages.get(message)
+                                            if (!captureMessage) {
+                                                const fields = untrack(() => objectCapture(() => message as unknown as Record<string, unknown>, new Set(), false))
+                                                let previousFields: unknown
+                                                let previousValue: Chat['message'][number]
+                                                captureMessage = () => {
+                                                    const captured = fields()!
+                                                    if (captured !== previousFields) {
+                                                        previousFields = captured
+                                                        previousValue = ownedValue(captured)
+                                                    }
+                                                    return previousValue
+                                                }
+                                                messages.set(message, captureMessage)
+                                            }
+                                            return captureMessage()
+                                        })
+                                        nextMessages = previousMessages && values.length === previousMessages.length &&
+                                            values.every((message, index) => message === previousMessages![index]) ? previousMessages : values
+                                    }
+                                }
+                                if (previousChat && previousMetadata === capturedMetadata && previousMessages === nextMessages) return previousChat
+                                previousMetadata = capturedMetadata
+                                previousMessages = nextMessages
+                                previousChat = { ...ownedValue(capturedMetadata), ...(nextMessages ? { message: nextMessages } : {}) } as Chat
+                                return previousChat
+                            }
+                            chats.set(chat, captureChat)
                         }
-                        return capturedChat()!
+                        return captureChat()
                     })
-                    // Unchanged reactive captures keep their identity, so an unchanged
-                    // character is returned without composing its JSON again.
-                    const parts = [capturedDetail, ...capturedChats]
-                    if (previous && parts.length === previousParts.length && parts.every((part, index) => part === previousParts[index])) return previous
-                    previousParts = parts
-                    const detailEntries: readonly (readonly [string, string])[] = capturedDetail.entries ?? Object.entries(JSON.parse(capturedDetail.json)).map(([key,value]) => [key, canonicalJson(value)] as const)
-                    const details = Object.fromEntries(detailEntries
-                        .map(([key,json]) => [key, decode('detail:' + key, json)]))
-                    const serializedChats: string[] = []
-                    const chatValues: Chat[] = []
-                    for (const [index, chat] of value.chats.entries()) {
-                        const captured = capturedChats[index]
-                        serializedChats.push(captured.json)
-                        chatValues.push(Object.fromEntries((captured.entries ?? Object.entries(JSON.parse(captured.json)).map(([key,value]) => [key,canonicalJson(value)] as const))
-                            .map(([key,json]) => [key, decode('chat:' + chat.id + ':' + key, json)])) as Chat)
-                    }
-                    const fields = new Map(detailEntries)
-                    fields.set('chats', '[' + serializedChats.join(',') + ']')
-                    const order: Record<string, boolean> = {}
-                    for (const key of [...fields.keys()].sort()) defineOwnEnumerableProperty(order, key, true)
-                    const json = '{' + Object.keys(order).map((key) => JSON.stringify(key) + ':' + fields.get(key)).join(',') + '}'
-                    if (previous?.json === json) return previous
-                    return previous = {json, value: {...details, chats:chatValues} as unknown as character}
+                    if (previous && previousDetail === capturedDetail && chatValues.length === previous.value.chats.length &&
+                        chatValues.every((chat, index) => chat === previous!.value.chats[index])) return previous
+                    previousDetail = capturedDetail
+                    const owned = { ...ownedValue(capturedDetail), chats: chatValues } as character
+                    let json: string | undefined
+                    return previous = { value: owned, get json() { return json ??= canonicalJson(owned) } }
                 }
-                entry = {value, capture}
+                entry = { value, capture }
                 characterCaptures.set(value.chaId, entry)
             }
             result.set(value.chaId, entry.capture())
@@ -268,6 +333,7 @@ export function createPersistenceCanonicalCapture(read: {
     const character = fieldCapture(read.character)
     const roots = new Map<string, { entries: ReadonlyMap<string, string>; values: ReadonlyMap<string, unknown> }>()
     return {
+        characterShell: captureShell,
         characters: () => new Map([...captureCharacters()].map(([id,value]) => [id,value.json])),
         materializedCharacters: () => new Map([...captureCharacters()].map(([id,value]) => [id,value.value])),
         seedPluginStorage(capture) {

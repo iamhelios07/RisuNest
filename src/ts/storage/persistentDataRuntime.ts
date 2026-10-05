@@ -395,6 +395,7 @@ export interface PersistentDataRuntime {
     ): () => void
     captureSelectedConversationTarget(): SelectedConversationTarget | null
     captureSelectedConversationAuthority(): WindowedConversationPersistenceAuthority | null
+    recordSelectedCharacterLastInteraction(authority: WindowedConversationPersistenceAuthority, before: number | undefined, after: number): boolean
     captureWindowedMessageMutation(target: SelectedConversationTarget, absoluteIndex: number, evidence: Readonly<Message>): Promise<WindowedConversationMutationController | null>
     acquireCompleteConversation(
         reason: string,
@@ -657,8 +658,8 @@ export function createPersistentDataRuntime(
             dependencies.onLocalRevision?.(revision)
         }),
         onStorageOnlyRevision: (revision) => workingSet.advanceStoreRevision(revision),
-        onWindowedSelectedConversationRevision: (revision, totalMessages) =>
-            workingSet.advanceStoreRevision(revision, totalMessages),
+        onWindowedSelectedConversationRevision: (revision, totalMessages, preserveRows) =>
+            workingSet.advanceStoreRevision(revision, totalMessages, preserveRows),
         completeWindowedSelectedConversation: (authority, messages) =>
             workingSet.completeWindowedConversationForSave(authority, messages),
         onConversationMutationPersistenceStarted: (event) =>
@@ -993,7 +994,7 @@ export function createPersistentDataRuntime(
     const projectAppliedUnits = async (result: LwwApplyResult, baseline?: ReturnType<typeof captureLwwWorkingSetBaseline>, localIntent = false, preserveWindowMetadata = false): Promise<void> => {
         if (!localIntent && result.affectedKeys.length === 0) {
             // Nothing reached the library, so the working set and its mirrors stay untouched.
-            coordinator.adoptAppliedUnitState(result.revision, null, null, [])
+            coordinator.adoptAppliedUnitState(result.revision, null, null, [], [], undefined, true)
             await commitContentCursor(result.revision)
             return
         }
@@ -1057,7 +1058,14 @@ export function createPersistentDataRuntime(
                 if (stored) windowedConversation = { characterId: selectedTarget.characterId, conversationId: selectedTarget.conversationId, totalMessages: stored.value.totalMessages }
             }
         } finally { await releasePersistentRevisionLease(lease) }
-        coordinator.adoptAppliedUnitState(result.revision, applied.root, applied.presets, applied.characters, applied.presetRecords, windowedConversation)
+        const preserveSelectedRows = Boolean(selectedTarget) && result.affectedKeys.every((key) => {
+            const [kind, owner, id] = JSON.parse(key) as string[]
+            if (kind === 'root' || kind === 'preset' || kind === 'preset-protected' || kind === 'record' || kind === 'toggle' || kind === 'variable') return false
+            if (kind === 'character' || kind === 'conversation' || kind === 'messages') return owner !== selectedTarget!.characterId
+            if (kind === 'order') return owner === 'conversations' && id !== selectedTarget!.characterId
+            return kind === 'exists' && owner === 'character' && id !== selectedTarget!.characterId
+        })
+        coordinator.adoptAppliedUnitState(result.revision, applied.root, applied.presets, applied.characters, applied.presetRecords, windowedConversation, preserveSelectedRows)
         adoptWindowedMetadata()
         const changedRootFields = new Set(rootFields.filter((field, index) => rootValue(field) !== rootBefore[index]))
         if (changedRootFields.size > 0) {
@@ -1294,6 +1302,8 @@ export function createPersistentDataRuntime(
             workingSet.captureSelectedConversationTarget(),
         captureSelectedConversationAuthority: () =>
             workingSet.captureSelectedConversationAuthority(),
+        recordSelectedCharacterLastInteraction: (authority, before, after) =>
+            coordinator.recordSelectedCharacterLastInteraction(authority, before, after),
         acquireCompleteConversation: (reason, target) =>
             workingSet.acquireCompleteConversation(reason, target ?? undefined),
         captureWindowedMessageMutation: (target, absoluteIndex, evidence) => workingSet.captureWindowedMessageMutation(target, absoluteIndex, evidence),
