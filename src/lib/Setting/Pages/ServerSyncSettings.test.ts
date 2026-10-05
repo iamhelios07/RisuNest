@@ -476,3 +476,42 @@ it('a late bound response does not advance a dismissed server screen', async () 
     finish({ kind: 'bound' }); await settle()
     expect(host.querySelector('h1')?.textContent).toBe(languageEnglish.risuNest.onboarding.sync.title)
 })
+
+describe('layout', () => {
+    const statusText = () => host.querySelector('[data-tone]')?.textContent?.trim()
+    it('folds the registration input on a connected device until it is asked for', async () => {
+        f.view = { status: { configured: true, bound: true }, paused: false, error: '' }
+        component = mount(ServerSyncSettings, { target: host, props: { connectTarget: vi.fn() } })
+        await settle()
+        expect(host.querySelector('textarea')).toBeNull()
+        click(sync.enterCode); await tick()
+        expect(host.querySelector('textarea')).not.toBeNull()
+    })
+    it.each([
+        { name: 'not connected', view: { status: { configured: false }, paused: false, error: '' }, label: sync.disconnected, tone: 'idle' },
+        { name: 'connected', view: { status: { configured: true, bound: true }, paused: false, error: '' }, label: sync.ready, tone: 'connected' },
+        { name: 'running', view: { status: { configured: true, bound: true }, paused: false, running: true, error: '' }, label: sync.running, tone: 'working' },
+        { name: 'paused', view: { status: { configured: true, bound: true }, paused: true, error: '' }, label: sync.paused, tone: 'paused' },
+        { name: 'stopped by an error', view: { status: { configured: true, bound: true }, paused: true, error: 'unit-too-large' }, label: sync.blocked, tone: 'attention' },
+        { name: 'revoked', view: { status: { configured: true, bound: true }, paused: true, error: 'unauthorized' }, label: sync.registrationRequired, tone: 'attention' },
+    ])('labels the connection state when $name', async ({ view, label, tone }) => {
+        f.view = view
+        component = mount(ServerSyncSettings, { target: host, props: { connectTarget: vi.fn() } })
+        await settle()
+        expect(statusText()).toBe(label)
+        expect(host.querySelector('[data-tone]')?.getAttribute('data-tone')).toBe(tone)
+    })
+    it('leaves the section heading and the sync storage to the settings page', async () => {
+        const cache = { totalBytes: 2, cacheBytes: 1, protectedBytes: 0, reclaimableBytes: 1, ledgerBytes: 1, databaseBytes: 0, blockedReason: null }
+        const { getServerSyncCacheUsage } = await import('src/ts/storage/sync/serverSyncProduction')
+        vi.mocked(getServerSyncCacheUsage).mockResolvedValue(cache)
+        component = mount(ServerSyncSettings, { target: host, props: { connectTarget: vi.fn(), tone: 'onboarding' } })
+        await settle()
+        expect([...host.querySelectorAll('h2')].map(node => node.textContent)).toEqual([])
+        expect(host.textContent).not.toContain(sync.management.title)
+        expect(host.querySelector('textarea')).not.toBeNull()
+        await unmount(component); component = mount(ServerSyncSettings, { target: host, props: { connectTarget: vi.fn() } })
+        await settle()
+        expect([...host.querySelectorAll('h2')].map(node => node.textContent)).toEqual([sync.title, sync.management.title])
+    })
+})

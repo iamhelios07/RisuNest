@@ -115,7 +115,9 @@ describe('RisuNest settings navigation', () => {
         expect(panel.replace(nativeServerGroup, '')).not.toContain('<ServerSyncSettings />')
         expect(panel).toContain('{#if isTauri}\n                <RisuNestLocalData />\n            {/if}')
         const serverSettingsSource = normalizeNewlines(readFileSync('src/lib/Setting/Pages/ServerSyncSettings.svelte', 'utf8'))
-        expect(serverSettingsSource).toContain('{#if isTauri}\n    <SettingGroup title={copy.title} description={copy.description}>')
+        const markup = serverSettingsSource.slice(serverSettingsSource.indexOf('</script>'), serverSettingsSource.indexOf('<style>'))
+        const nativeOnly = markup.slice(markup.indexOf('\n{#if isTauri}'))
+        expect(nativeOnly).toContain('<SettingGroup id="risunest-server-sync" title={copy.title} description={copy.description}')
         expect(backupRestoreSource).not.toContain('ExternalStorageSettings')
     })
 
