@@ -104,7 +104,7 @@ function stageLane(attempt: ServerSyncAttempt, stage: ServerSyncStage): ServerSy
         .find(lane => lane?.active && lane.step !== 'idle')
 }
 function laneDetail(lane: ServerSyncLane, text: Text): string {
-    if (lane.step === 'listing') return text.itemsCount.replace('{0}', count(lane.listed))
+    if (lane.step === 'listing') return lane.listed > 0 ? text.itemsCount.replace('{0}', count(lane.listed)) : ''
     if ((lane.step === 'uploading' || lane.step === 'downloading') && lane.filesTotal > 0) {
         const transferred = lane.bytesTotal > 0 ? `${bytes(lane.bytesDone)} / ${bytes(lane.bytesTotal)}` : bytes(lane.bytesDone)
         return `${ratio(lane.filesDone, lane.filesTotal)} · ${transferred}`

@@ -59,6 +59,8 @@ describe('server sync progress view', () => {
         expect(view.label).toBe(text.activity.enumerating)
         expect(view.detail).toBe(text.itemsCount.replace('{0}', '300'))
         expect(view.fraction).toBeNull()
+        const empty = serverSyncProgressView(attempt({ stages: ['downloading'], active: ['downloading'], current: 'downloading', lanes: [lane('receive', { active: true, step: 'listing' })] }), text, 0)
+        expect(empty.detail).toBe('')
     })
     it('falls back to the stage label for work without a native step', () => {
         const view = serverSyncProgressView(attempt({ stages: ['downloading', 'applying'], active: ['applying'], current: 'applying', lanes: [lane('receive')] }), text, 0)
