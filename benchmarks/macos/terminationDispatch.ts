@@ -149,14 +149,28 @@ export async function terminationDispatch(phase: string) {
   note("send-session-event");
   await report("session-dispatch-ready", { ...snapshot(), passed: true });
   await invoke("macos_bench_dispatch_session_event");
+  const sentAt = performance.now();
   await pause(250);
   note("release-local-save");
   releaseCommit();
   await pause(250);
   await report("session-dispatch-after-delivery", snapshot());
-  // A delivered upgrade may leave the original coordinator awaiting a decision.
-  if (scenario === "dialog") window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
-  await pause(6_000);
+  while (performance.now() - sentAt < 6_000) {
+    await pause(Math.max(1, 6_000 - (performance.now() - sentAt)));
+  }
+  if (scenario !== "initial" && sessionRequests === 0 && rendererRequests === 1 && rendererReplies === 0) {
+    const saved = await store.readRoot();
+    check(saved.value.username === root.username && saved.revision === save.revision,
+      "the pending ordinary quit must complete the real local commit");
+    note("observation-complete");
+    await report("session-dispatch-observation-complete", {
+      ...snapshot(), observationMillis: Math.round(performance.now() - sentAt),
+      outcome: "pending-session-event-not-delivered-within-window",
+    });
+    await invoke("macos_bench_repeat_native_quit");
+    await pause(15_000);
+    throw new Error("Cleanup repeated terminate did not end the isolated app");
+  }
   await report("failure", { ...snapshot(), message: "Session event did not terminate the isolated app" });
   await invoke("macos_bench_quit");
 }
