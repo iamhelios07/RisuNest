@@ -47,6 +47,7 @@ pub(crate) mod sync_selection;
 pub(crate) use asset_object_catalog::{AssetObjectCatalog, AssetObjectCatalogPage};
 pub(crate) use commands::PersistentStoreState;
 pub(crate) use snapshot::RevisionReadLease;
+pub(crate) use snapshot::SnapshotRestoreStep;
 
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
