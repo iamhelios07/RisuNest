@@ -8,7 +8,15 @@ export const languageKorean = {
         "lorebookDeletion": "로어북 폴더와 항목 삭제",
         "partialBackup": "다른 에셋을 제외한 백업",
         "laterMessageDeletion": "이후 메시지도 함께 삭제",
-        "messageDeletionDescription": "이 메시지만 삭제되며, 이후 메시지도 함께 삭제할 경우 이 메시지 뒤의 모든 메시지가 함께 삭제됩니다."
+        "messageDeletionDescription": "이 메시지만 삭제되며, 이후 메시지도 함께 삭제할 경우 이 메시지 뒤의 모든 메시지가 함께 삭제됩니다.",
+        "hypaResetDescription": "이 채팅의 HypaV3 데이터가 모두 초기화되며, 되돌릴 수 없습니다.",
+        "hypaDeletionDescription": "이 요약 뒤의 모든 요약이 삭제되며, 되돌릴 수 없습니다.",
+        "characterTrashDescription": "이 캐릭터가 휴지통으로 이동하며, 휴지통에서 복구할 수 있습니다.",
+        "characterDeletionDescription": "이 캐릭터와 모든 채팅이 영구적으로 삭제되며, 되돌릴 수 없습니다.",
+        "lorebookDeletionDescription": "이 폴더와 폴더 안의 모든 로어북이 삭제됩니다.",
+        "dataReplacementDescription": "현재 데이터가 백업의 데이터로 교체되며, 자동 백업은 만들지 않습니다. 기존 데이터를 보관하려면 취소 후 직접 백업하세요.",
+        "partialBackupTitle": "부분 로컬 백업을 저장하시겠습니까?",
+        "partialBackupDescription": "이 백업에는 데이터베이스와 캐릭터 프로필 이미지, 사용자 아이콘, 커스텀 배경, 페르소나 아이콘, 폴더 이미지, 봇 프리셋 이미지만 포함되며, 감정 이미지, 추가 캐릭터 에셋, VITS 음성 파일 등 그 밖의 에셋은 포함되지 않습니다."
     },
 
     close: "닫기",
@@ -1846,9 +1854,9 @@ export const languageKorean = {
             deleteConfirmOne: '이 값을 삭제하시겠습니까? 삭제한 값은 복원할 수 없습니다.',
             deleteConfirmSelected: '선택한 {0}개의 값을 삭제하시겠습니까? 삭제한 값은 복원할 수 없습니다.',
             deleteAllConfirm: '플러그인 데이터 {0}개를 모두 삭제하시겠습니까?',
-            deleteAllConfirmFinal: '모든 플러그인 데이터가 사라집니다. 정말 삭제하시겠습니까?',
+            deleteAllConfirmFinal: '목록의 모든 값이 삭제되며, 삭제한 값은 복원할 수 없습니다.',
             deleteVisibleConfirm: '보이는 {0}개의 값을 삭제하시겠습니까?',
-            deleteVisibleConfirmFinal: '선택한 플러그인 데이터가 사라집니다. 정말 삭제하시겠습니까?',
+            deleteVisibleConfirmFinal: '보이는 값이 모두 삭제되며, 삭제한 값은 복원할 수 없습니다.',
             assignSelected: '선택 항목 할당',
             reassign: '다른 플러그인으로 바꾸기',
             prefixGroup: '{0}로 시작하는 {1}개 · {2}',

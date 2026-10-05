@@ -146,6 +146,18 @@ describe('checkbox confirmations', () => {
         alertStore.set({ type: 'none', msg: '' })
         await expect(result).resolves.toEqual({ confirmed: false, checked: false })
     })
+    it('keeps a line break in the title', async () => {
+        const result = alertCheckboxConfirm({ ...options, title: 'Remove the plugin?\nSynthetic plugin' })
+        target = document.createElement('div')
+        document.body.append(target)
+        mounted = mount(AlertComp, { target })
+        await tick()
+        const title = target.querySelector('#checkbox-confirm-title')!
+        expect(title.textContent).toBe('Remove the plugin?\nSynthetic plugin')
+        expect(title.classList.contains('whitespace-pre-wrap')).toBe(true)
+        action('Cancel').click()
+        await result
+    })
     it('starts a consecutive dialog unchecked', async () => {
         const { result } = await show(false)
         target.querySelector<HTMLInputElement>('input')!.click()

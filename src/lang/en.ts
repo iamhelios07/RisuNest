@@ -8,7 +8,15 @@ export const languageEnglish = {
         "lorebookDeletion": "Delete lorebook folder and entries",
         "partialBackup": "Backup without other assets",
         "laterMessageDeletion": "Also delete later messages",
-        "messageDeletionDescription": "Only this message is deleted. If you also delete later messages, every message after it is deleted too."
+        "messageDeletionDescription": "Only this message is deleted. If you also delete later messages, every message after it is deleted too.",
+        "hypaResetDescription": "All HypaV3 data in this chat is reset. This cannot be undone.",
+        "hypaDeletionDescription": "Every summary after this one is deleted. This cannot be undone.",
+        "characterTrashDescription": "This character moves to the trash, where you can restore it.",
+        "characterDeletionDescription": "This character and all of its chats are permanently deleted. This cannot be undone.",
+        "lorebookDeletionDescription": "This folder and every lorebook in it are deleted.",
+        "dataReplacementDescription": "Your current data is replaced by the backup, and no automatic backup is created. To keep your current data, cancel and back it up first.",
+        "partialBackupTitle": "Save a partial local backup?",
+        "partialBackupDescription": "This backup includes only the database and the character profile images, user icon, custom background, persona icons, folder images and bot preset images. Emotion images, additional character assets, VITS voice files and other assets are not included."
     },
 
     close: "Close",
@@ -2031,9 +2039,9 @@ export const languageEnglish = {
             deleteConfirmOne: 'Delete this value? Deleted values cannot be restored.',
             deleteConfirmSelected: 'Delete the {0} selected values? Deleted values cannot be restored.',
             deleteAllConfirm: 'Delete all {0} plugin data items?',
-            deleteAllConfirmFinal: 'All plugin data will be gone. Really delete it?',
+            deleteAllConfirmFinal: 'Every value in the list is deleted. Deleted values cannot be restored.',
             deleteVisibleConfirm: 'Delete the {0} values shown?',
-            deleteVisibleConfirmFinal: 'The selected plugin data will be gone. Really delete it?',
+            deleteVisibleConfirmFinal: 'Every value shown is deleted. Deleted values cannot be restored.',
             assignSelected: 'Assign selected',
             reassign: 'Move to another plugin',
             prefixGroup: '{1} starting with {0} · {2}',
