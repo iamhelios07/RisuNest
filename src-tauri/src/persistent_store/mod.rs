@@ -1036,9 +1036,14 @@ impl DataHealthReader {
     fn note_quarantined_intents(&self, findings: &mut crate::data_health::Findings) {
         use crate::data_health::{codes, FindingSink, Finding};
         for intent in &self.quarantined {
-            let finding = Finding::new(codes::INTENT_QUARANTINED, "intent", intent.request_id.clone(), intent.error.clone())
+            let mut finding = Finding::new(codes::INTENT_QUARANTINED, "intent", intent.request_id.clone(), intent.error.clone())
                 .targeting("intent", intent.kind.clone());
-            findings.record(if intent.discardable {
+            finding.intent_action = if intent.discardable {
+                Some(crate::data_health::IntentAction::Discard)
+            } else if intent.recoverable {
+                Some(crate::data_health::IntentAction::Complete)
+            } else { None };
+            findings.record(if finding.intent_action.is_some() {
                 finding.at(intent.token.clone(), 0)
             } else {
                 finding
