@@ -352,9 +352,9 @@
                 {/if}
             {/if}
             {#if preparation === 'failed'}
-                <p role="alert">{strings.openFailed}</p><SettingButton onclick={initialize}>{language.retry}</SettingButton>
+                <p class="mt-1 text-sm text-danger-400" role="alert">{strings.openFailed}</p><SettingButton class="mt-2" onclick={initialize}>{language.retry}</SettingButton>
             {/if}
-            {#if view.applied}<p role="status">{strings.repairApplied.replace('{0}', count(view.applied.remaining))}</p>{/if}
+            {#if view.applied}<p class="mt-1 text-sm" role="status">{strings.repairApplied.replace('{0}', count(view.applied.remaining))}</p>{/if}
             {#if view.failure}
                 <p class="mt-1 text-sm text-danger-400" role="alert">{failureMessages[view.failure]}</p>
             {/if}
