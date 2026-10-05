@@ -402,13 +402,34 @@ export async function waitForActiveNativeFileOperation(): Promise<void> {
     }
 }
 
+export async function waitForSnapshotBodyOutcomeDismissal(): Promise<void> {
+    while (true) {
+        await waitForActiveNativeFileOperation()
+        const outcome = get(nativeFileOperationOutcome)
+        if (outcome?.status?.kind !== 'snapshot-bodies') return
+        let unsubscribe: (() => void) | undefined
+        await new Promise<void>(resolve => {
+            unsubscribe = nativeFileOperationOutcome.subscribe(current => {
+                if (current !== outcome) resolve()
+            })
+        })
+        unsubscribe?.()
+    }
+}
+
 export function cancelActiveNativeFileOperation(): void {
     if (!activeController) return
     activeController.abort()
     updateActiveState({ cancelRequested: true })
 }
 
-export function dismissNativeFileOperationOutcome(): void {
+export function dismissNativeFileOperationOutcome(): void | Promise<void> {
+    const outcome = get(nativeFileOperationOutcome)
+    if (outcome?.status?.kind === 'snapshot-bodies') {
+        return invoke('native_file_job_forget', {jobId: outcome.status.jobId}).then(() => {
+            if (get(nativeFileOperationOutcome) === outcome) nativeFileOperationOutcome.set(null)
+        })
+    }
     nativeFileOperationOutcome.set(null)
 }
 

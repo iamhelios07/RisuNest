@@ -67,7 +67,7 @@ describe('native persistent maintenance', () => {
         mocks.isTauriMobile = true
         mocks.relaunch.mockReset()
         mocks.snapshotRestore.mockReset().mockResolvedValue(activation)
-        dismissNativeFileOperationOutcome()
+        nativeFileOperationOutcome.set(null)
         vi.useRealTimers()
         vi.unstubAllGlobals()
         delete (window as Window & {
@@ -388,6 +388,46 @@ describe('native persistent maintenance', () => {
         release()
         await Promise.all([busy, recovered])
         expect(get(nativeFileOperationOutcome)).toMatchObject({state:'succeeded',status:{jobId:'after-busy'}})
+    })
+    it('keeps mixed-stage outcomes and their retries until each exact receipt is dismissed', async () => {
+        const first = {...bodyStatus, jobId:'mixed-failed', snapshotStagingId:'mixed-first', state:'failed'}
+        const retried = {...bodyStatus, jobId:'mixed-retried', snapshotStagingId:'mixed-first', snapshotBodies:{...bodyStatus.snapshotBodies,stageId:'mixed-first'}}
+        const second = {...bodyStatus, jobId:'mixed-cancelled', snapshotStagingId:'mixed-second', state:'cancelled'}
+        const third = {...bodyStatus, jobId:'mixed-succeeded', snapshotStagingId:'mixed-third', snapshotBodies:{...bodyStatus.snapshotBodies,stageId:'mixed-third'}}
+        const statuses = new Map([first, retried, second, third].map(status => [status.jobId, status]))
+        const acknowledged: string[] = []
+        let rejectAcknowledgement = false
+        mocks.invoke.mockImplementation(async (command, args) => {
+            if (command === 'native_snapshot_restore_bodies_status') return statuses.get(args.receipt.jobId)
+            if (command === 'native_snapshot_restore_bodies_start') return {...bodyReceipt,jobId:retried.jobId,stagingId:retried.snapshotStagingId}
+            if (command === 'native_file_job_forget') {
+                if (rejectAcknowledgement) throw new Error('synthetic acknowledgement failure')
+                acknowledged.push(args.jobId)
+                return true
+            }
+            throw new Error(`Unexpected ${command}`)
+        })
+        const recovered = reattachNativeSnapshotRestoreBodies([first, second, third] as never)
+        await vi.waitFor(() => expect(get(nativeFileOperationOutcome)?.status?.jobId).toBe(first.jobId))
+        expect(mocks.invoke.mock.calls.some(call => call[1]?.receipt?.jobId === second.jobId)).toBe(false)
+        await retrySnapshotRestoreBodiesFromOutcome()
+        expect(get(nativeFileOperationOutcome)?.status?.jobId).toBe(retried.jobId)
+        expect(mocks.invoke.mock.calls.some(call => call[1]?.receipt?.jobId === second.jobId)).toBe(false)
+        await dismissNativeFileOperationOutcome()
+        await vi.waitFor(() => expect(get(nativeFileOperationOutcome)?.status?.jobId).toBe(second.jobId))
+        expect(acknowledged).toEqual([retried.jobId])
+        rejectAcknowledgement = true
+        await expect(dismissNativeFileOperationOutcome()).rejects.toThrow('acknowledgement failure')
+        expect(get(nativeFileOperationOutcome)?.status?.jobId).toBe(second.jobId)
+        expect(mocks.invoke.mock.calls.some(call => call[1]?.receipt?.jobId === third.jobId)).toBe(false)
+        rejectAcknowledgement = false
+        await dismissNativeFileOperationOutcome()
+        await recovered
+        expect(get(nativeFileOperationOutcome)?.status?.jobId).toBe(third.jobId)
+        await dismissNativeFileOperationOutcome()
+        expect(acknowledged).toEqual([retried.jobId, second.jobId, third.jobId])
+        expect(get(nativeFileOperationOutcome)).toBeNull()
+        expect(mocks.snapshotRestore).not.toHaveBeenCalled()
     })
     it('shows an already finished job without starting more body work', async () => {
         mocks.invoke.mockResolvedValue(bodyStatus)
