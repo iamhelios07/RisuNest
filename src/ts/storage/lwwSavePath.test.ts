@@ -13,6 +13,7 @@ import { createConversationSummaryStubFromChat } from './conversationResidency'
 import { createMetadataOnlySelectedConversation, isMetadataOnlySelectedConversation } from './selectedConversationLifecycle'
 import type { Database, character } from './database.svelte'
 import type { LwwStageReceive, PersistentDataStore, WorkingSetCommit } from './persistentDataStore'
+import { MAX_NATIVE_REQUEST_BYTES, PayloadTooLargeError } from './nativePersistenceValue'
 
 async function harness() {
     const database = structuredClone(fixtureDatabase)
@@ -354,6 +355,23 @@ describe('LWW renderer save path', () => {
         ;(database.characters[1] as character).notes = 'detail only'
         await coordinator.flushPendingDataLocally('catalog-shell')
         expect((await store.readConversation('char-a', 'conv-long'))?.value.message).toHaveLength(130)
+    })
+
+    it('pages a chat added inside a complete character when the save is too large', async () => {
+        const {database,store,commit,coordinator} = await harness()
+        const owner = database.characters[0]
+        const added = {...structuredClone(owner.chats[0]),id:'conv-added',name:'Added'}
+        owner.chats.splice(1,0,added)
+        const expected = owner.chats.map((chat) => chat.id)
+        commit.mockRejectedValueOnce(new PayloadTooLargeError('commit',MAX_NATIVE_REQUEST_BYTES + 1))
+        await coordinator.flushPendingDataLocally('large-added-chat')
+        expect(commit.mock.calls.length).toBeGreaterThan(1)
+        expect((await store.readConversation(owner.chaId,'conv-added'))?.value.message).toEqual(added.message)
+        const stored = await store.queryConversations({characterId:owner.chaId,order:'configured',limit:128})
+        expect(stored.items.map((item) => item.id)).toEqual(expected)
+        commit.mockClear()
+        await coordinator.flushPendingDataLocally('after-paged-chat')
+        expect(commit).not.toHaveBeenCalled()
     })
 
     it('creates a conversation parent before committing its complete message list', async () => {
