@@ -2693,7 +2693,7 @@ export const languageEnglish = {
             codeRecordOrphan: 'Records with no owner',
             codeObjectUnreferenced: 'Files nothing uses',
             codeUnclassified: 'Problems that could not be sorted',
-            codeIntentQuarantined: 'Changes that were not applied',
+            codeIntentQuarantined: 'Incomplete recovery records',
             discardIntent: 'Discard recovery record',
             discardIntentTitle: 'Discard this recovery record?',
             discardIntentDescription: 'The selected recovery record will be deleted and will no longer be retried. Current data is preserved.',

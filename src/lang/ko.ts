@@ -2505,7 +2505,7 @@ export const languageKorean = {
             codeRecordOrphan: '주인이 없는 기록',
             codeObjectUnreferenced: '아무 데서도 쓰지 않는 파일',
             codeUnclassified: '분류하지 못한 문제',
-            codeIntentQuarantined: '적용되지 않은 변경 사항',
+            codeIntentQuarantined: '복구를 완료하지 못한 기록',
             discardIntent: '복구 기록 폐기',
             discardIntentTitle: '복구 기록을 폐기하시겠습니까?',
             discardIntentDescription: '선택한 복구 기록이 삭제되며, 다시 시도하지 않습니다. 현재 데이터는 유지됩니다.',

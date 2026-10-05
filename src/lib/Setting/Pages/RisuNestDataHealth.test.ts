@@ -365,7 +365,7 @@ describe('RisuNestDataHealth', () => {
         expect(onOpenUnusedImages).toHaveBeenCalledOnce()
     })
 
-    it('lists a change that was not applied with its own help and the error it stopped on', async () => {
+    it('lists an incomplete recovery record with its own help and the error it stopped on', async () => {
         const target = await setup({
             ...damaged,
             counts: { blocking: 0, degraded: 1, informational: 0 },
