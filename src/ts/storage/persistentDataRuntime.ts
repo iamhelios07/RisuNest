@@ -864,6 +864,12 @@ export function createPersistentDataRuntime(
             }
         }
     }
+    const applyInstalledRootChanges = (before: RootDatabase): void => {
+        const changedFields = new Set(diffRootMutations(before, dependencies.state.captureRoot()).map((mutation) => mutation.key))
+        if (changedFields.size === 0) return
+        try { dependencies.state.afterRemoteRootChange?.(changedFields) }
+        catch (error) { dependencies.onBackgroundError?.(error) }
+    }
     const requireCommittedRefresh = (
         revision: DataRevision,
         error: unknown,
@@ -904,6 +910,7 @@ export function createPersistentDataRuntime(
             ) {
                 throw new PersistentMutationFencedError()
             }
+            const rootBefore = canonicalClone(dependencies.state.captureRoot())
             workingSet.invalidateNavigation()
             dependencies.state.replaceDatabase(
                 projected.database,
@@ -912,6 +919,7 @@ export function createPersistentDataRuntime(
             )
             if (activatedLibraryGuard) dependencies.state.afterRemoteApply?.()
             workingSet.installCommittedWorkingSet(projected.database, revision, projected.windowedMetadata)
+            applyInstalledRootChanges(rootBefore)
             deferredContentPending = projected.deferred
             if (!projected.deferred) await commitContentCursor(revision, activatedLibraryGuard !== null)
             if (activatedLibraryGuard) {
@@ -1159,10 +1167,12 @@ export function createPersistentDataRuntime(
             const projected = await projectRefreshedWorkingSet(latest.revision, {selectedCharacterId:null, selectedConversationId:null, activeCharacterIds:new Set()}, {wholeLibrary:true, root:true, presets:true, pluginStorage:true, characterIds:[], conversations:[]})
             if (projected.deferred) throw new Error('Activated library projection is incomplete')
             coordinator.assertActivatedLibraryGuard(guard.owner, token)
+            const rootBefore = canonicalClone(dependencies.state.captureRoot())
             workingSet.invalidateNavigation()
             dependencies.state.replaceDatabase(projected.database, new Set(), true)
             dependencies.state.afterRemoteApply?.()
             workingSet.installCommittedWorkingSet(projected.database, latest.revision, projected.windowedMetadata)
+            applyInstalledRootChanges(rootBefore)
             await commitContentCursor(latest.revision, true)
             guard.ready = true
             return {kind:'committed', revision:latest.revision, projection:'applied'}
