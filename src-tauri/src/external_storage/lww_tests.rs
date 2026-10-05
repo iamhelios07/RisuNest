@@ -103,7 +103,13 @@ pub(crate) fn small_asset(store: &mut PersistentStore, key: &str, body: &[u8]) -
 }
 pub(crate) async fn hydrate_receiver(f: &CycleFixture, hash: &str) -> std::fs::File {
     let connected = super::previous_storage_tests::receiver_connection(f);
-    super::connection_store::ConnectionStore::open(f.directory_b.path()).unwrap().insert(&connected.stored).unwrap();
+    let mut connections=super::connection_store::ConnectionStore::open(f.directory_b.path()).unwrap();
+    match connections.read(&connected.stored.id) {
+        Ok(stored)=>assert_eq!(serde_json::to_value(stored).unwrap(),serde_json::to_value(&connected.stored).unwrap()),
+        Err(error) if error.kind==ErrorKind::NotFound=>connections.insert(&connected.stored).unwrap(),
+        Err(error)=>panic!("synthetic hydration connection: {error:?}"),
+    }
+    drop(connections);
     let _source = super::lww_residency::install_test_source_connection(f.directory_b.path(), Arc::new(connected)).unwrap();
     let root = f.directory_b.path().to_owned();
     let hash = hash.to_owned();
