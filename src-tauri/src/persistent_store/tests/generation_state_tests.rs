@@ -344,7 +344,7 @@ fn assert_retirement_accounting(index_heavy: bool) {
         tx.execute(
             "INSERT INTO plugin_storage(generation,owner,storage_key,byte_size,ordinal,value)
              VALUES(?1,'synthetic',?2,?3,?4,?5)",
-            rusqlite::params![old, format!("{key}-{index:04}"), value.len(), index, value],
+            rusqlite::params![old, format!("{key}-{index:04}"), i64::try_from(value.len()).unwrap(), i64::try_from(index).unwrap(), value],
         ).unwrap();
     }
     tx.commit().unwrap();
@@ -404,15 +404,15 @@ fn accounting_preserves_snapshot_retention_basis() {
         rusqlite::params![old, 1024 * 1024 + 2, serde_json::to_string(&"a".repeat(1024 * 1024)).unwrap()],
     ).unwrap();
     activated(&mut store, "Replacement");
-    let pages: u64 = store.connection.query_row(
+    let pages = u64::try_from(store.connection.query_row::<i64, _, _>(
         "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()", [], |row| row.get(0),
-    ).unwrap();
+    ).unwrap()).unwrap();
     let mut retired = 0u64;
     for (table, columns) in GENERATION_TABLES {
         let sum = columns.split(',').map(|column| format!("coalesce(octet_length({}),0)", column.trim())).collect::<Vec<_>>().join("+");
-        retired += store.connection.query_row::<u64, _, _>(
+        retired += u64::try_from(store.connection.query_row::<i64, _, _>(
             &format!("SELECT coalesce(sum({sum}),0) FROM {table} WHERE generation=?1"), [&old], |row| row.get(0),
-        ).unwrap();
+        ).unwrap()).unwrap();
     }
     let expected = pages.saturating_sub(retired);
     let captured = {
@@ -423,9 +423,9 @@ fn accounting_preserves_snapshot_retention_basis() {
     assert_eq!(snapshot::byte_budget(captured), expected.saturating_mul(4).max(512 * 1024 * 1024));
     assert_eq!(snapshot::byte_budget(200 * 1024 * 1024), 800 * 1024 * 1024);
     purge_all(&mut store);
-    let remaining_pages: u64 = store.connection.query_row(
+    let remaining_pages = u64::try_from(store.connection.query_row::<i64, _, _>(
         "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()", [], |row| row.get(0),
-    ).unwrap();
+    ).unwrap()).unwrap();
     assert_eq!(snapshot::snapshot_retention_basis_bytes(&store.connection).unwrap(), remaining_pages);
 }
 

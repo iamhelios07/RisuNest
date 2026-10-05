@@ -1611,7 +1611,7 @@ describe('Chat frozen capture presentation', () => {
             })).click()
             await vi.waitFor(() => expect(markdown).toHaveBeenCalled())
             expect(markdown.mock.calls.at(-1)?.slice(0, 4)).toEqual([
-                'Refreshed parser input', replacement, 'pretranslate', 2,
+                'Refreshed parser input', replacement.chaId, 'pretranslate', 2,
             ])
             expect(target.querySelector('.risu-chat')).toBe(row)
         } finally {
