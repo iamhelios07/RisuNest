@@ -1,6 +1,6 @@
 <script lang="ts">
     import { onMount, onDestroy } from 'svelte'
-    import { TriangleAlertIcon } from '@lucide/svelte'
+    import { CheckIcon, LoaderCircleIcon, TriangleAlertIcon } from '@lucide/svelte'
     import { language } from 'src/lang'
     import { alertCheckboxConfirm, alertConfirm } from 'src/ts/alert'
     import { isTauri } from 'src/ts/platform'
@@ -14,10 +14,12 @@
     import type { ServerConfig } from 'src/ts/storage/sync/serverSync'
     import { PREVIOUS_FILES_DOWNLOAD_FAILED } from 'src/ts/storage/sync/bindingFlow'
     import { formatRisuNestStorageBytes as bytes } from 'src/ts/storage/risuNestStorageDashboard'
+    import { serverSyncProgressView } from 'src/ts/storage/sync/serverSyncProgress'
     import SettingGroup from '../RisuNest/SettingGroup.svelte'
     import SettingRow from '../RisuNest/SettingRow.svelte'
     import SettingButton from '../RisuNest/SettingButton.svelte'
     import SegmentedButtons from '../RisuNest/SegmentedButtons.svelte'
+    import SettingProgress from '../RisuNest/SettingProgress.svelte'
 
     interface Props {
         connectTarget?: (config: ServerConfig, newDevice: boolean) => Promise<unknown>
@@ -41,8 +43,11 @@
     let downloading = $state(false)
     let codeOpen = $state(false)
     let policy = $state<AssetResidencyPolicy>('full')
+    let pending = $state<number | undefined>()
+    let now = $state(Date.now())
     let dispose = () => {}
     let inboxDispose = () => {}
+    let stopWatching = () => {}
     const writerRecoveryCodes = ['writer-collision', 'equal-stamp-integrity']
     const registrationCodes = ['unauthorized', 'invalid-device-token', 'server-epoch-changed']
     let writerRecovery = $derived(writerRecoveryCodes.includes(view.error))
@@ -50,13 +55,19 @@
     // A connected device keeps its registration input folded until a code is needed again.
     let codeShown = $derived(!view.status.bound || !!view.error || !!failure || !!candidate || codeOpen)
     let status = $derived.by((): { label: string; tone: 'idle' | 'connected' | 'working' | 'paused' | 'attention' } => {
+        if (view.progress || (connected && view.running)) return { label: copy.running, tone: 'working' }
         if (!connected) return { label: copy.disconnected, tone: view.bindingIncomplete ? 'attention' : 'idle' }
-        if (view.running) return { label: copy.running, tone: 'working' }
         if (registrationCodes.includes(view.error)) return { label: copy.registrationRequired, tone: 'attention' }
         if (view.error) return { label: view.paused ? copy.blocked : copy.ready, tone: 'attention' }
         if (view.paused) return { label: copy.paused, tone: 'paused' }
         return { label: copy.ready, tone: 'connected' }
     })
+    // A short check finishes before the panel would appear, so it never flashes.
+    let progress = $derived(view.progress && now - view.progress.startedAt >= 600 ? serverSyncProgressView(view.progress, copy, now) : undefined)
+    // One place shows the panel: the asset download that started it, the server being connected, or the connection.
+    let progressPlace = $derived(!progress ? undefined : downloading ? 'assets' : candidate ? 'candidate' : view.status.bound ? 'bound' : 'incomplete')
+    // Read again when the connection settles, an attempt ends or the error changes.
+    let pendingKey = $derived(`${connected && !view.running && !view.progress}:${view.error}`)
     let residencyOptions = $derived([
         { value: 'full' as AssetResidencyPolicy, label: copy.residency.full },
         { value: 'remote' as AssetResidencyPolicy, label: copy.residency.remote },
@@ -85,7 +96,7 @@
     function readCode() { try { candidate = parseServerRegistration(code); code = ''; failure = '' } catch { failure = copy.registrationInvalid } }
     async function scan() { scanning = true; try { candidate = await scanner.scan(() => {}); failure = '' } catch (error) { failure = message(error) } finally { scanning = false } }
     async function connect(newDevice = false) { if (!candidate) return; await connectTarget(candidate, newDevice); candidate = undefined; codeOpen = false }
-    async function downloadAll() { downloading = true; try { await setAssetResidencyPolicy('full') } finally { downloading = false } }
+    async function downloadAll() { downloading = true; try { await controller.track('assets', () => setAssetResidencyPolicy('full')) } finally { downloading = false } }
     async function downloadHeld() { const release = await holdServerSync(); try { await downloadAll() } finally { await release() } }
     async function disconnect() {
         let serverObjects = 0
@@ -108,15 +119,26 @@
     }
     async function cleanCache() { if (await alertConfirm(copy.management.cleanConfirm)) await cleanupServerSyncCache() }
     // A refused change puts the control back on the stored policy.
-    function choosePolicy(next: AssetResidencyPolicy) { void run(() => setAssetResidencyPolicy(next)).finally(() => { if (residency) policy = residency.policy }) }
+    function choosePolicy(next: AssetResidencyPolicy) { void run(() => next === 'full' ? downloadAll() : setAssetResidencyPolicy(next)).finally(() => { if (residency) policy = residency.policy }) }
     $effect(() => { if (residency) policy = residency.policy })
+    $effect(() => {
+        if (!view.progress) return
+        now = Date.now()
+        const timer = setInterval(() => { now = Date.now() }, 500)
+        return () => clearInterval(timer)
+    })
+    $effect(() => {
+        if (!pendingKey.startsWith('true:')) return
+        void controller.pendingChanges().then(value => { pending = value }, () => {})
+    })
     onMount(() => {
         if (!isTauri) return
         dispose = controller.subscribe(value => { view = value })
+        stopWatching = controller.watchProgress()
         inboxDispose = serverRegistrationInbox.changed.subscribe(() => { const pending = serverRegistrationInbox.take(); if (pending) candidate = pending })
         void refresh().catch(error => { failure ||= message(error) })
     })
-    onDestroy(() => { dispose(); inboxDispose(); scanner.cancel(); serverRegistrationInbox.releaseConsumed() })
+    onDestroy(() => { dispose(); stopWatching(); inboxDispose(); scanner.cancel(); serverRegistrationInbox.releaseConsumed() })
 </script>
 
 {#snippet statusPill()}
@@ -134,16 +156,20 @@
             <div class="actions">
                 <SettingButton onclick={() => void run(completeServerSyncBinding)} busy={busy}>{copy.connect}</SettingButton>
             </div>
+            {#if progressPlace === 'incomplete'}{@render progressPanel()}{/if}
         </div>
     {/if}
     {#if view.status.bound}
         <div class="sync-block">
-            {#if connected && (view.status.libraryId || view.status.deviceId)}
+            {#if connected && (view.status.libraryId || view.status.deviceId || pending !== undefined)}
                 <dl class="kv">
                     {#if view.status.libraryId}<dt>{copy.libraryId}</dt><dd>{view.status.libraryId}</dd>{/if}
                     {#if view.status.deviceId}<dt>{copy.deviceId}</dt><dd>{view.status.deviceId}</dd>{/if}
+                    {#if pending !== undefined}<dt>{copy.pendingChanges}</dt><dd>{copy.count.replace('{0}', pending.toLocaleString())}</dd>{/if}
+                    {#if view.lastSuccessAt !== undefined && !progress}<dt>{copy.lastSuccess}</dt><dd>{new Date(view.lastSuccessAt).toLocaleString()}</dd>{/if}
                 </dl>
             {/if}
+            {#if progressPlace === 'bound'}{@render progressPanel()}{/if}
             <div class="actions">
                 {#if !view.bindingIncomplete}<SettingButton onclick={() => void run(retryServerSync)} disabled={busy}>{copy.syncNow}</SettingButton>{/if}
                 <SettingButton variant="danger" onclick={() => void run(disconnect)} disabled={busy}>{copy.disconnect}</SettingButton>
@@ -164,7 +190,7 @@
                     {#if writerRecovery}<SettingButton variant="secondary" onclick={() => void run(() => connect(true))} disabled={busy}>{language.lwwSync.newDeviceAction}</SettingButton>{/if}
                     <SettingButton variant="secondary" onclick={() => { candidate = undefined }} disabled={busy}>{copy.discardRegistration}</SettingButton>
                 </div>
-                <p class="help">{copy.connectHint}</p>
+                {#if progressPlace === 'candidate'}{@render progressPanel()}{:else}<p class="help">{copy.connectHint}</p>{/if}
             {:else}
                 <label class="text-[15px]" for="server-registration">{copy.registrationCode}</label>
                 {#if tone === 'settings'}<p class="help">{canScanServerRegistration ? copy.connectRowHelpScan : copy.connectRowHelp}</p>{/if}
@@ -188,6 +214,27 @@
 
 {#snippet alert()}
     {#if view.error || failure}<p role="alert" class="text-sm text-danger-400">{failure || message({ code: view.error })}</p>{/if}
+{/snippet}
+
+{#snippet progressPanel()}
+    {#if progress}
+        <div class="progress" data-sync-progress>
+            <SettingProgress label={progress.label} detail={progress.detail} fraction={progress.fraction} />
+            {#if progress.stages.length > 1}
+                <ol class="stages">
+                    {#each progress.stages as stage (stage.stage)}
+                        <li data-state={stage.state} aria-current={stage.state === 'active' ? 'step' : undefined}>
+                            {#if stage.state === 'done'}<CheckIcon size={14} aria-hidden="true" />{:else}<LoaderCircleIcon size={14} class="motion-safe:animate-spin" aria-hidden="true" />{/if}
+                            <span>{stage.label}</span>
+                        </li>
+                    {/each}
+                </ol>
+            {/if}
+            <dl class="kv">
+                {#each progress.counters as counter (counter.key)}<dt>{counter.label}</dt><dd>{counter.value}</dd>{/each}
+            </dl>
+        </div>
+    {/if}
 {/snippet}
 
 {#if isTauri}
@@ -216,6 +263,7 @@
                     <SettingButton variant="secondary" onclick={() => void run(evictLocalAssets)} disabled={busy}>{copy.residency.clean}</SettingButton>
                     {#if busy}<SettingButton variant="secondary" onclick={() => void cancelAssetResidencyOperation()}>{copy.residency.cancel}</SettingButton>{/if}
                 </div>
+                {#if progressPlace === 'assets'}{@render progressPanel()}{/if}
                 {#if downloading}<p role="status" class="text-sm">{copy.residency.working}</p>{/if}
                 <p class="help">{copy.residency.cleanupNote}</p>
             </div>
@@ -316,6 +364,32 @@
     }
     .kv.review dd {
         font-weight: 600;
+    }
+    .progress {
+        display: grid;
+        gap: 0.625rem;
+        min-width: 0;
+    }
+    .stages {
+        display: grid;
+        gap: 0.375rem;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+        font-size: 13px;
+    }
+    .stages li {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        min-width: 0;
+        color: var(--risu-theme-textcolor2);
+    }
+    .stages li[data-state='active'] {
+        color: var(--risu-theme-textcolor);
+    }
+    .stages li[data-state='done'] :global(svg) {
+        color: var(--risu-theme-success-500);
     }
     .value {
         font-size: 14px;

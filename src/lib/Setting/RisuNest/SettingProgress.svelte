@@ -21,7 +21,7 @@
 <div data-setting-progress role="status" aria-live="polite" class="flex flex-col gap-2 rounded-md border border-darkborderc bg-bgcolor px-3 py-2.5">
     <div class="flex flex-wrap items-center gap-x-3 gap-y-1.5">
         <LoaderCircleIcon size={15} class="shrink-0 text-borderc motion-safe:animate-spin" aria-hidden="true" />
-        <span class="min-w-0 flex-1 text-sm">{label}</span>
+        <span class="min-w-0 flex-[1_1_10rem] text-sm">{label}</span>
         {#if detail}
             <span class="text-xs text-textcolor2 tabular-nums">{detail}</span>
         {/if}
