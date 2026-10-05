@@ -52,6 +52,7 @@ import {
     getPersistentNavigationGeneration,
     acquireCompleteConversation,
     captureSelectedConversationAuthority,
+    recordSelectedCharacterLastInteraction,
     captureWindowedConversationMutationController,
     captureSelectedConversationTarget,
     flushPendingData,
@@ -1045,14 +1046,21 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
     DBState.db.statics.messages += 1
     selectedChar = get(selectedCharID)
     let nowChatroom = DBState.db.characters[selectedChar]
-    // A metadata-only conversation saves only its own messages and metadata,
-    // so the character detail is left as it was opened.
     const characterDetailWritable = () => {
         const owner = DBState.db.characters[selectedChar]
         const conversation = owner?.chats[owner.chatPage]
         return !conversation || !isMetadataOnlySelectedConversation(conversation)
     }
-    if (characterDetailWritable()) nowChatroom.lastInteraction = Date.now()
+    const interactionTime = Date.now()
+    const interactionAuthority = captureSelectedConversationAuthority()
+    if (interactionAuthority) {
+        if (interactionAuthority.characterId !== nowChatroom.chaId
+            || interactionAuthority.conversationId !== nowChatroom.chats[nowChatroom.chatPage]?.id
+            || !recordSelectedCharacterLastInteraction(interactionAuthority, nowChatroom.lastInteraction, interactionTime)) return false
+        nowChatroom.lastInteraction = interactionTime
+    } else if (characterDetailWritable()) {
+        nowChatroom.lastInteraction = interactionTime
+    }
     selectedChat = nowChatroom.chatPage
     const selectedConversation = boundedChat ?? nowChatroom.chats[selectedChat]
     const activeSession = getActiveConversationSession()

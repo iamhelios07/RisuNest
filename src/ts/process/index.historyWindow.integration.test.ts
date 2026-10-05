@@ -34,6 +34,8 @@ vi.mock('../storage/persistentDataRuntime.svelte', async (importOriginal) => ({
     getPersistentNavigationGeneration: () => current.runtime.getNavigationGeneration(),
     acquireCompleteConversation: (reason: string, target: never) => current.runtime.acquireCompleteConversation(reason, target),
     captureSelectedConversationAuthority: () => current.runtime.captureSelectedConversationAuthority(),
+    recordSelectedCharacterLastInteraction: (authority: never, before: number | undefined, after: number) =>
+        current.runtime.recordSelectedCharacterLastInteraction(authority, before, after),
     captureWindowedConversationMutationController: (target: never, chat: Chat, start: number) =>
         current.runtime.captureWindowedConversationMutationController(target, chat, start),
     captureSelectedConversationTarget: () => current.runtime.captureSelectedConversationTarget(),
