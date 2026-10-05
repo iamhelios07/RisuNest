@@ -35,6 +35,14 @@ function isDeepState(value: object): boolean {
 
 const volatileValue = Symbol('volatile persistence value')
 
+function completeObjectJson(value: object): string {
+    const captured: Record<string, unknown> = {}
+    for (const key of Object.keys(value)) {
+        defineOwnEnumerableProperty(captured, key, (value as Record<string, unknown>)[key])
+    }
+    return canonicalJson(captured)
+}
+
 function normalize(value: unknown, markVolatile: () => never): unknown {
     if (typeof value === 'function') markVolatile()
     if (!value || typeof value !== 'object') return value
@@ -217,7 +225,7 @@ export function createPersistenceCanonicalCapture(read: {
     const captureShell = () => {
         const character = read.character() as character | null
         if (character && requiresWholeObjectCapture(character)) {
-            const captured = JSON.parse(canonicalJson(character)) as character
+            const captured = JSON.parse(completeObjectJson(character)) as character
             const value = { ...captured, chats: captured.chats.map(({ message: _message, ...chat }) => chat) }
             const json = canonicalJson(value)
             if (previousShell?.json === json) return previousShell
@@ -235,7 +243,7 @@ export function createPersistenceCanonicalCapture(read: {
                 let previous: ReturnType<typeof fields>
                 capture = () => {
                     if (!requiresWholeObjectCapture(chat, new Set(['message']))) return fields()
-                    const { message: _message, ...metadata } = JSON.parse(canonicalJson(chat)) as Chat
+                    const { message: _message, ...metadata } = JSON.parse(completeObjectJson(chat)) as Chat
                     const json = canonicalJson(metadata)
                     if (previous?.json === json) return previous
                     return previous = { json, entries: null, values: undefined }
@@ -262,7 +270,8 @@ export function createPersistenceCanonicalCapture(read: {
                 let previousDetail: unknown
                 const capture = () => {
                     if (requiresWholeObjectCapture(value)) {
-                        const json = canonicalJson(value)
+                        previousDetail = undefined
+                        const json = completeObjectJson(value)
                         if (previous?.json === json) return previous
                         return previous = { json, value: JSON.parse(json) }
                     }
@@ -278,12 +287,11 @@ export function createPersistenceCanonicalCapture(read: {
                             let previousMetadata: unknown
                             let previousChat: Chat | undefined
                             let previousMessages: Chat['message'] | undefined
-                            let previousBodyJson: string | undefined
                             let previousWholeJson: string | undefined
                             captureChat = () => {
                                 const complete = !isConversationSummaryStub(chat) && Object.prototype.propertyIsEnumerable.call(chat, 'message')
                                 if (requiresWholeObjectCapture(chat, complete ? undefined : new Set(['message']))) {
-                                    const json = canonicalJson(chat)
+                                    const json = completeObjectJson(chat)
                                     if (previousWholeJson === json) return previousChat!
                                     previousWholeJson = json
                                     previousMetadata = undefined
@@ -295,45 +303,38 @@ export function createPersistenceCanonicalCapture(read: {
                                 let nextMessages: Chat['message'] | undefined
                                 if (!isConversationSummaryStub(chat) && Object.prototype.propertyIsEnumerable.call(chat, 'message')) {
                                     const body = chat.message
-                                    // An array hook or getter can depend on the complete value.
-                                    if (typeof (body as unknown as { toJSON?: unknown }).toJSON === 'function') {
-                                        const json = canonicalJson(body)
-                                        nextMessages = json === previousBodyJson ? previousMessages : JSON.parse(json)
-                                        previousBodyJson = json
-                                    } else {
-                                        const activeMessages = new Set<object>(body)
-                                        for (const message of messages.keys()) if (!activeMessages.has(message)) messages.delete(message)
-                                        for (const message of messageHooks.keys()) if (!activeMessages.has(message)) messageHooks.delete(message)
-                                        const values = body.map((message, index) => {
-                                            if (typeof (message as unknown as { toJSON?: unknown }).toJSON === 'function') {
-                                                const json = canonicalJson({ [index]: message })
-                                                let captured = messageHooks.get(message)
-                                                if (captured?.json !== json) {
-                                                    captured = { json, value: JSON.parse(json)[index] }
-                                                    messageHooks.set(message, captured)
-                                                }
-                                                return captured.value
+                                    const activeMessages = new Set<object>(body)
+                                    for (const message of messages.keys()) if (!activeMessages.has(message)) messages.delete(message)
+                                    for (const message of messageHooks.keys()) if (!activeMessages.has(message)) messageHooks.delete(message)
+                                    const values = body.map((message, index) => {
+                                        if (requiresWholeObjectCapture(message)) {
+                                            const json = canonicalJson({ [index]: message })
+                                            let captured = messageHooks.get(message)
+                                            if (captured?.json !== json) {
+                                                captured = { json, value: JSON.parse(json)[index] }
+                                                messageHooks.set(message, captured)
                                             }
-                                            let captureMessage = messages.get(message)
-                                            if (!captureMessage) {
-                                                const fields = untrack(() => objectCapture(() => message as unknown as Record<string, unknown>, new Set(), false))
-                                                let previousFields: unknown
-                                                let previousValue: Chat['message'][number]
-                                                captureMessage = () => {
-                                                    const captured = fields()!
-                                                    if (captured !== previousFields) {
-                                                        previousFields = captured
-                                                        previousValue = ownedValue(captured)
-                                                    }
-                                                    return previousValue
+                                            return captured.value
+                                        }
+                                        let captureMessage = messages.get(message)
+                                        if (!captureMessage) {
+                                            const fields = untrack(() => objectCapture(() => message as unknown as Record<string, unknown>, new Set(), false))
+                                            let previousFields: unknown
+                                            let previousValue: Chat['message'][number]
+                                            captureMessage = () => {
+                                                const captured = fields()!
+                                                if (captured !== previousFields) {
+                                                    previousFields = captured
+                                                    previousValue = ownedValue(captured)
                                                 }
-                                                messages.set(message, captureMessage)
+                                                return previousValue
                                             }
-                                            return captureMessage()
-                                        })
-                                        nextMessages = previousMessages && values.length === previousMessages.length &&
-                                            values.every((message, index) => message === previousMessages![index]) ? previousMessages : values
-                                    }
+                                            messages.set(message, captureMessage)
+                                        }
+                                        return captureMessage()
+                                    })
+                                    nextMessages = previousMessages && values.length === previousMessages.length &&
+                                        values.every((message, index) => message === previousMessages![index]) ? previousMessages : values
                                 }
                                 if (previousChat && previousMetadata === capturedMetadata && previousMessages === nextMessages) return previousChat
                                 previousMetadata = capturedMetadata

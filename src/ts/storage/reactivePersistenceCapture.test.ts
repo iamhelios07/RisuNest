@@ -94,13 +94,46 @@ describe('production reactive persistence captures', () => {
     it('keeps accessor side effects in complete chat serialization order', () => {
         let note = 'before'
         const chat = { id: 'accessor-chat',
-            get message() { note = 'after'; return [{ data: 'body' }] },
             get note() { return note },
+            get message() { note = 'after'; return [{ data: 'body' }] },
         }
         const owner = { chaId: 'accessor-owner', chats: [chat] }
         const cached = createPersistenceCanonicalCapture({ root: () => ({}), pluginStorage: () => null,
             presets: () => [], character: () => owner, characters: () => [owner as any] })
+        expect(cached.materializedCharacters!().get(owner.chaId)!.chats[0].note).toBe('before')
         expect(cached.materializedCharacters!().get(owner.chaId)!.chats[0].note).toBe('after')
+    })
+
+    it.each(['hidden', 'inherited'] as const)('does not read %s toJSON accessors on message bodies or messages', (placement) => {
+        const message = { data: 'body' }
+        const body = [message]
+        const ignored = { get() { throw new Error('ignored serialization accessor was evaluated') }, configurable: true }
+        for (const value of [body, message]) {
+            if (placement === 'hidden') Object.defineProperty(value, 'toJSON', ignored)
+            else {
+                const prototype = Object.create(Object.getPrototypeOf(value))
+                Object.defineProperty(prototype, 'toJSON', { ...ignored, enumerable: true })
+                Object.setPrototypeOf(value, prototype)
+            }
+        }
+        const owner = { chaId: 'ignored-hooks', chats: [{ id: 'chat', message: body }] }
+        const cached = createPersistenceCanonicalCapture({ root: () => ({}), pluginStorage: () => null,
+            presets: () => [], character: () => owner, characters: () => [owner as any] })
+        expect(cached.materializedCharacters!().get(owner.chaId)!.chats[0].message).toEqual([{ data: 'body' }])
+    })
+
+    it('returns to ordinary character capture after a serialization hook is removed', () => {
+        const state = fixture()
+        const owner = state.database.characters[0] as any
+        owner.name = 'normal'
+        owner.chats = []
+        const cached = createPersistenceCanonicalCapture({ root: () => state.database, pluginStorage: () => null,
+            presets: () => [], character: () => owner, characters: () => state.database.characters })
+        expect(cached.materializedCharacters!().get(owner.chaId)!.name).toBe('normal')
+        owner.toJSON = () => ({ chaId: owner.chaId, name: 'hook', chats: [] })
+        expect(cached.materializedCharacters!().get(owner.chaId)!.name).toBe('hook')
+        delete owner.toJSON
+        expect(cached.materializedCharacters!().get(owner.chaId)!.name).toBe('normal')
     })
 
     it('owns shell fields without reading bodies and invalidates nested metadata from reactive evidence', () => {
