@@ -12,6 +12,7 @@ pub(crate) mod hash_work;
 pub(crate) mod content_change_index;
 pub(crate) mod lww;
 mod upstream_identity;
+pub(crate) mod upstream_stream;
 pub(crate) mod lww_commands;
 mod content_locators;
 pub(crate) mod device_store;
