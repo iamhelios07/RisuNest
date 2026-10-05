@@ -7711,12 +7711,12 @@ mod tests {
     #[test]
     fn c_a_job_left_one_family_sends_each_pack_before_building_the_next() {
         runtime().block_on(async {
+            const RECORDS: usize = 8;
             let root = tempfile::tempdir().unwrap();
-            let provider = FakeProvider::new(false);
             let repository = fake::repository();
             let families = PackFamilies::new(ACTIVE_PACK_FAMILIES);
             let elsewhere = families.try_acquire().unwrap().unwrap();
-            let capture = captured_record_window(root.path(), "single", 1, 2000, 0, 0, 0);
+            let capture = captured_record_window(root.path(), "single", 1, RECORDS, 0, 0, 0);
             let meta = metadata("single", &capture);
             let directory = root.path().join("single-job");
             let job = format!("single-{}", uuid::Uuid::new_v4());
@@ -7727,26 +7727,36 @@ mod tests {
                     .with_limit(4 * 1024 * 1024)
                     .with_families(families.clone()),
             );
-            let (plaintexts, stop, sampler) =
-                peak_sampler(root.path().join("cache").join("build"), build_files);
+            let builds = root.path().join("cache").join("build");
+            let mut provider = GatedProvider::new(None);
+            provider.on_pack = Some(Box::new({
+                let families = families.clone();
+                let builds = builds.clone();
+                move |uploaded| {
+                    assert_eq!(families.counts(), (2, usize::from(uploaded < RECORDS)));
+                    assert_eq!(build_files(&builds), 0, "next plaintext built before pack upload");
+                }
+            }));
+            // A tiny target forces one distinct record per pack without thousands
+            // of durable body and catalog writes unrelated to family turnover.
+            let mut package_limits = limits(4096);
+            package_limits.target_plaintext_bytes = 1;
             let completed = tokio::time::timeout(
                 FAMILY_TEST_BOUND,
                 package_and_upload(
                     capture, vec![], root.path(), &root.path().join("cache"), meta, &[5; 32],
-                    limits(4096), None, &mut transfer, &provider, &repository,
+                    package_limits, None, &mut transfer, &provider, &repository,
                     &PhaseProgress::silent(), &Cancellation::default(),
                 ),
             )
             .await
-            .expect("a job left one family stopped making progress");
-            stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            sampler.join().unwrap();
-            assert!(packs_of(&completed.unwrap()) > 2);
+            .expect("a job left one family stopped making progress")
+            .unwrap();
+            assert_eq!(packs_of(&completed), RECORDS);
+            assert_eq!(provider.packs.lock().unwrap().len(), RECORDS);
             assert_eq!(families.counts(), (1, 0));
-            // One pack plaintext, or one catalog node and the next one a
-            // listing can catch beside it.
-            let plaintexts = plaintexts.load(std::sync::atomic::Ordering::Relaxed);
-            assert!(plaintexts <= 2, "{plaintexts} plaintext files with one family");
+            assert_eq!(build_files(&builds), 0);
+            assert_eq!(held_spool(&directory), 0);
             drop(elsewhere);
             assert_eq!(families.counts(), (0, 0));
         });
@@ -7927,6 +7937,7 @@ mod tests {
             inner: FakeProvider,
             refuse_pack: Option<usize>,
             pub(super) packs: std::sync::Mutex<Vec<String>>,
+            pub(super) on_pack: Option<Box<dyn Fn(usize) + Send + Sync>>,
             pub(super) gate: std::sync::Mutex<Option<String>>,
             pub(super) arrived: tokio::sync::Semaphore,
             pub(super) release: tokio::sync::Semaphore,
@@ -7938,6 +7949,7 @@ mod tests {
                     inner: FakeProvider::new(false),
                     refuse_pack,
                     packs: Default::default(),
+                    on_pack: None,
                     gate: Default::default(),
                     arrived: tokio::sync::Semaphore::new(0),
                     release: tokio::sync::Semaphore::new(0),
@@ -7984,6 +7996,9 @@ mod tests {
                 if intent.role == ObjectRole::Pack {
                     let mut packs = self.packs.lock().unwrap();
                     packs.push(intent.object_id.clone());
+                    if let Some(observe) = &self.on_pack {
+                        observe(packs.len());
+                    }
                     if self.refuse_pack == Some(packs.len()) {
                         return Box::pin(async { Err(ProviderError::new(ErrorKind::RateLimited)) });
                     }
