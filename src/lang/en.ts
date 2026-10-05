@@ -2773,6 +2773,7 @@ export const languageEnglish = {
             titleRisuSave: 'Import RisuSave',
             titleLocalBackup: 'Import local backup',
             titleBackup: 'Import RisuNest backup',
+            titleSnapshot: 'Restore snapshot',
             formatPocketRisu: 'PocketRisu backup',
             formatRisuAi: 'RisuAI backup',
             elapsed: 'Elapsed {0}',

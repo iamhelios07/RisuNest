@@ -2585,6 +2585,7 @@ export const languageKorean = {
             titleRisuSave: 'RisuSave 가져오기',
             titleLocalBackup: '로컬 백업 가져오기',
             titleBackup: 'RisuNest 백업 가져오기',
+            titleSnapshot: '스냅샷 복원',
             formatPocketRisu: 'PocketRisu 백업',
             formatRisuAi: 'RisuAI 백업',
             elapsed: '경과 {0}',

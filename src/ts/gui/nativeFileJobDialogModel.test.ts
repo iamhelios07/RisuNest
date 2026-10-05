@@ -481,6 +481,15 @@ describe('nativeFileJobDialogModel', () => {
             1_000,
         )
         expect(unknown.title).toBe(copy.titleBackup)
+
+        for (const kind of ['restore-native-snapshot', 'snapshot-bodies'] as const) {
+            const snapshot = buildNativeFileJobDialogModel(
+                running({ format: 'library-backup', status: status({ kind }) }),
+                null,
+                1_000,
+            )
+            expect(snapshot.title).toBe(copy.titleSnapshot)
+        }
     })
 
     it('uses the RisuSave template and inserts optional stages only when observed', () => {

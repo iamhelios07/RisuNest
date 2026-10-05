@@ -46,6 +46,7 @@ vi.mock('./storage/nativeFileJobs', () => ({
     NativeFileJobError: class extends Error {}, runNativeOfficialAccountSnapshotRestore: vi.fn(),
 }))
 vi.mock('./storage/androidRisuSaveRouteProduction.svelte', () => ({ registerAndroidRisuSaveRoute: vi.fn() }))
+vi.mock('./storage/iosFiles', () => ({ reportInterruptedIOSBackupSourcesAtStart: vi.fn() }))
 vi.mock('src/lang', () => ({ changeLanguage: vi.fn(), language: { risuNest: {
     startup: {
         storage: 'Storage', account: 'Account', plugins: 'Plugins', ui: 'UI', data: 'Data', serviceWorker: 'Service worker',
