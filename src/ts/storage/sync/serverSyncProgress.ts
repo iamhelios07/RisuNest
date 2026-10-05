@@ -20,10 +20,14 @@ export interface ServerSyncLane {
     bytesTotal: number
     sentBytes: number
     receivedBytes: number
+    /** Work measured before it runs: server changes after the cursor, or the assets a hydration downloads. */
+    backlogDone: number
+    /** What remains of that work now. It falls as well as grows, so a view reads it as it is. */
+    backlogLeft: number
 }
 export const readServerSyncLanes = () => invoke<ServerSyncLane[]>('server_sync_progress')
 
-const COUNTS = ['listed', 'itemsDone', 'itemsTotal', 'filesDone', 'filesTotal', 'bytesDone', 'bytesTotal', 'sentBytes', 'receivedBytes'] as const
+const COUNTS = ['listed', 'itemsDone', 'itemsTotal', 'filesDone', 'filesTotal', 'bytesDone', 'bytesTotal', 'sentBytes', 'receivedBytes', 'backlogDone'] as const
 
 /** What each lane did after `baseline` was read. */
 export function laneDeltas(current: ServerSyncLane[], baseline: ServerSyncLane[]): ServerSyncLane[] {
@@ -53,8 +57,14 @@ export function createRateMeter(windowMs = 3000) {
 }
 
 export type ServerSyncStage = 'preparing' | 'downloading' | 'applying' | 'refreshing' | 'publishing' | 'assets'
+/** A routine sync shows one bar: for its changes, or for the assets it downloads after them. */
+export type ServerSyncRoutinePhase = 'changes' | 'assets'
 export interface ServerSyncAttempt {
+    /** `full` connects a library or downloads every asset and shows each step; `routine` is automatic sync. */
+    mode: 'full' | 'routine'
     startedAt: number
+    /** When a finished attempt ended. */
+    endedAt?: number
     /** Stages in the order this attempt first entered them. */
     stages: ServerSyncStage[]
     /** Stages running now, the latest last. */
@@ -64,6 +74,10 @@ export interface ServerSyncAttempt {
     /** Lane counts since the attempt was first watched, once a sample arrived. */
     lanes?: ServerSyncLane[]
     rate?: number
+    /** Changes a watched routine attempt had to upload when it began publishing. */
+    plannedSend?: number
+    /** The furthest each routine bar got. A bar does not fall back when more work turns up. */
+    peak?: Partial<Record<ServerSyncRoutinePhase, number>>
 }
 
 type Text = (typeof languageEnglish)['risuNest']['serverSync']
@@ -143,4 +157,46 @@ export function serverSyncProgressView(attempt: ServerSyncAttempt, text: Text, n
         stages,
         counters,
     }
+}
+
+type Work = { done: number; total: number }
+/** Work a lane measured before running it, once this attempt has seen that lane at work. */
+function backlog(lane: ServerSyncLane | undefined): Work | undefined {
+    if (!lane || !(lane.active || lane.backlogDone > 0) || lane.backlogDone + lane.backlogLeft === 0) return undefined
+    return { done: lane.backlogDone, total: lane.backlogDone + lane.backlogLeft }
+}
+/** What a routine attempt did and has left: changes sent and received, and assets downloaded after them. */
+export function routineWork(attempt: ServerSyncAttempt): Record<ServerSyncRoutinePhase, Work> {
+    const lane = (name: ServerSyncLaneName) => attempt.lanes?.find(entry => entry.lane === name)
+    const send = lane('send')
+    const sent = send?.itemsDone ?? 0
+    // A receive that only reads back this device's own push reports no known work.
+    const received = backlog(lane('receive')) ?? { done: 0, total: 0 }
+    return {
+        changes: { done: sent + received.done, total: Math.max(sent, send?.itemsTotal ?? 0, attempt.plannedSend ?? 0) + received.total },
+        assets: backlog(lane('hydrate')) ?? { done: 0, total: 0 },
+    }
+}
+const share = (work: Work) => work.total > 0 ? Math.min(1, work.done / work.total) : 0
+function routinePhase(attempt: ServerSyncAttempt, work: Record<ServerSyncRoutinePhase, Work>): ServerSyncRoutinePhase {
+    return work.assets.total > 0 && (attempt.active.includes('assets') || work.changes.total === 0) ? 'assets' : 'changes'
+}
+/** `peak` after the latest counts, for the bar the attempt shows now. */
+export function routinePeak(attempt: ServerSyncAttempt): ServerSyncAttempt['peak'] {
+    const work = routineWork(attempt), phase = routinePhase(attempt, work)
+    return { ...attempt.peak, [phase]: Math.max(attempt.peak?.[phase] ?? 0, share(work[phase])) }
+}
+
+export interface ServerSyncRoutineView {
+    label: string
+    fraction: number
+    complete: boolean
+}
+/** The one bar of a routine attempt, or undefined while it has nothing to move. */
+export function serverSyncRoutineView(attempt: ServerSyncAttempt, text: Text, complete: boolean): ServerSyncRoutineView | undefined {
+    const work = routineWork(attempt)
+    if (work.changes.total + work.assets.total === 0) return undefined
+    if (complete) return { label: text.complete, fraction: 1, complete }
+    const phase = routinePhase(attempt, work)
+    return { label: phase === 'assets' ? text.progress.assets : text.running, fraction: Math.max(attempt.peak?.[phase] ?? 0, share(work[phase])), complete }
 }

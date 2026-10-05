@@ -1,7 +1,8 @@
 //! Counters the settings screen reads to show what server sync is doing.
 //!
 //! Every counter only grows, so a reader subtracts what it saw when its
-//! attempt started. Lanes that can run at the same time never share counters.
+//! attempt started. `backlog_left` is the exception: it is what remains of
+//! known work now. Lanes that can run at the same time never share counters.
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering::Relaxed};
 use std::sync::{Arc, LazyLock};
@@ -53,6 +54,10 @@ pub(crate) struct ProgressLane {
     bytes_total: AtomicU64,
     sent: AtomicU64,
     received: AtomicU64,
+    /// Work measured before it runs: the server's changes after the cursor, or
+    /// the assets a hydration will download.
+    backlog_done: AtomicU64,
+    backlog_left: AtomicU64,
 }
 impl ProgressLane {
     pub(crate) fn step(&self, step: Step) {
@@ -79,6 +84,15 @@ impl ProgressLane {
         self.sent.fetch_add(sent, Relaxed);
         self.received.fetch_add(received, Relaxed);
     }
+    /// Counts `done` units of known work and records what is left of it.
+    pub(crate) fn backlog(&self, done: u64, left: u64) {
+        self.backlog_done.fetch_add(done, Relaxed);
+        self.backlog_left.store(left, Relaxed);
+    }
+    pub(crate) fn backlog_step(&self) {
+        self.backlog_done.fetch_add(1, Relaxed);
+        let _ = self.backlog_left.fetch_update(Relaxed, Relaxed, |left| Some(left.saturating_sub(1)));
+    }
     pub(crate) fn snapshot(&self, lane: &'static str) -> LaneSnapshot {
         let active = self.active.load(Relaxed) > 0;
         LaneSnapshot {
@@ -94,6 +108,8 @@ impl ProgressLane {
             bytes_total: self.bytes_total.load(Relaxed),
             sent_bytes: self.sent.load(Relaxed),
             received_bytes: self.received.load(Relaxed),
+            backlog_done: self.backlog_done.load(Relaxed),
+            backlog_left: self.backlog_left.load(Relaxed),
         }
     }
 }
@@ -113,6 +129,8 @@ pub(crate) struct LaneSnapshot {
     pub bytes_total: u64,
     pub sent_bytes: u64,
     pub received_bytes: u64,
+    pub backlog_done: u64,
+    pub backlog_left: u64,
 }
 
 #[derive(Default)]
@@ -193,6 +211,21 @@ mod tests {
         assert!(!after.active);
         assert_eq!(after.step, "idle");
         assert_eq!((after.sent_bytes, after.received_bytes), (120, 40));
+    }
+
+    #[test]
+    fn known_work_adds_what_was_done_and_keeps_only_what_is_left() {
+        let lane = ProgressLane::default();
+        lane.backlog(40, 60);
+        lane.backlog(60, 5);
+        let read = lane.snapshot("receive");
+        assert_eq!((read.backlog_done, read.backlog_left), (100, 5));
+        lane.backlog(0, 2);
+        for _ in 0..3 {
+            lane.backlog_step();
+        }
+        let read = lane.snapshot("hydrate");
+        assert_eq!((read.backlog_done, read.backlog_left), (103, 0));
     }
 
     #[test]

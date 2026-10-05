@@ -2152,6 +2152,8 @@ export const languageKorean = {
             ready: '연결됨',
             lastSuccess: '마지막 동기화',
             running: '동기화 중',
+            complete: '동기화 완료',
+            details: '자세히',
             verifiedBytes: '주고받은 데이터',
             transferRate: '전송 속도',
             progressItems: '처리한 항목',

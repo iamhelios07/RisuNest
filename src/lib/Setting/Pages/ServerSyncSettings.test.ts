@@ -528,10 +528,10 @@ describe('layout', () => {
     })
 })
 describe('progress', () => {
-    const lane = (name: string, counts: Record<string, unknown> = {}) => ({ lane: name, active: false, step: 'idle', listed: 0, itemsDone: 0, itemsTotal: 0, filesDone: 0, filesTotal: 0, bytesDone: 0, bytesTotal: 0, sentBytes: 0, receivedBytes: 0, ...counts })
+    const lane = (name: string, counts: Record<string, unknown> = {}) => ({ lane: name, active: false, step: 'idle', listed: 0, itemsDone: 0, itemsTotal: 0, filesDone: 0, filesTotal: 0, bytesDone: 0, bytesTotal: 0, sentBytes: 0, receivedBytes: 0, backlogDone: 0, backlogLeft: 0, ...counts })
     const running = (startedAt: number) => ({
         status: { configured: true, bound: true }, paused: false, running: true, error: '',
-        progress: { startedAt, stages: ['downloading', 'publishing'], active: ['publishing'], current: 'publishing', rate: 2048, lanes: [lane('send', { active: true, step: 'uploading', filesDone: 1, filesTotal: 2, bytesDone: 1024, bytesTotal: 4096, sentBytes: 3000 }), lane('receive', { receivedBytes: 500 })] },
+        progress: { mode: 'full', startedAt, stages: ['downloading', 'publishing'], active: ['publishing'], current: 'publishing', rate: 2048, lanes: [lane('send', { active: true, step: 'uploading', filesDone: 1, filesTotal: 2, bytesDone: 1024, bytesTotal: 4096, sentBytes: 3000 }), lane('receive', { receivedBytes: 500 })] },
     })
     const panel = () => host.querySelector('[data-sync-progress]')
     it('shows the running step, the stages and the transfer counts of a sync', async () => {
@@ -573,10 +573,69 @@ describe('progress', () => {
         component = mount(ServerSyncSettings, { target: host, props: { connectTarget: vi.fn() } })
         await registration()
         expect(host.textContent).toContain(sync.connectHint)
-        publish({ status: { configured: false }, paused: false, error: '', progress: { startedAt: Date.now() - 1000, stages: ['preparing'], active: ['preparing'], current: 'preparing' } })
+        publish({ status: { configured: false }, paused: false, error: '', progress: { mode: 'full', startedAt: Date.now() - 1000, stages: ['preparing'], active: ['preparing'], current: 'preparing' } })
         await settle()
         expect(panel()?.closest('.sync-block')?.textContent).toContain(sync.reviewTitle)
         expect(host.textContent).not.toContain(sync.connectHint)
         expect(host.querySelector('[data-tone]')?.textContent?.trim()).toBe(sync.running)
+    })
+    describe('automatic sync', () => {
+        const routine = (lanes: unknown[], fields: Record<string, unknown> = {}) => ({ mode: 'routine', startedAt: Date.now(), stages: ['downloading', 'publishing'], active: ['publishing'], current: 'publishing', lanes, ...fields })
+        const connected = (fields: Record<string, unknown>) => ({ status: { configured: true, bound: true, libraryId: 'library' }, paused: false, error: '', lastSuccessAt: 0, ...fields })
+        const lastSync = () => [...host.querySelectorAll('dt')].some(term => term.textContent === sync.lastSuccess)
+        it('shows one bar as soon as a change moves, with its steps folded under Details', async () => {
+            f.view = connected({ running: true, progress: routine([lane('send', { active: true, step: 'confirming', itemsDone: 1, itemsTotal: 4, sentBytes: 900 })], { plannedSend: 4 }) })
+            component = mount(ServerSyncSettings, { target: host, props: { connectTarget: vi.fn() } })
+            await settle()
+            expect(panel()?.getAttribute('data-mode')).toBe('routine')
+            expect(panel()?.querySelector('[role="status"]')?.textContent).toContain(sync.running)
+            expect(panel()?.querySelector('[role="progressbar"]')?.getAttribute('aria-valuenow')).toBe('25')
+            expect(lastSync()).toBe(false)
+            const details = panel()!.querySelector('details')!
+            expect(details.open).toBe(false)
+            expect(details.querySelector('summary')?.textContent?.trim()).toBe(sync.details)
+            details.querySelector('summary')!.click(); await settle()
+            expect(details.open).toBe(true)
+            expect(details.textContent).toContain(`${sync.activity.confirming} · 1 / 4`)
+            expect([...details.querySelectorAll('li')].map(item => item.textContent?.trim())).toEqual([sync.stage.downloading, sync.stage.publishing])
+            expect([...details.querySelectorAll('dt')].map(term => term.textContent)).toEqual([sync.verifiedBytes, sync.transferRate, sync.progressItems, sync.elapsed])
+        })
+        it('shows nothing while automatic sync has no change to move', async () => {
+            vi.useFakeTimers()
+            try {
+                f.view = connected({ running: true, progress: routine([lane('send', { active: true, step: 'preparing' }), lane('receive')]) })
+                component = mount(ServerSyncSettings, { target: host, props: { connectTarget: vi.fn() } })
+                await vi.advanceTimersByTimeAsync(2000); await settle()
+                expect(panel()).toBeNull()
+                expect(lastSync()).toBe(true)
+            } finally { vi.useRealTimers() }
+        })
+        it('keeps a finished bar for a moment, then shows the last sync again', async () => {
+            const finished = routine([lane('send', { itemsDone: 3, itemsTotal: 3 })], { active: [], endedAt: Date.now() })
+            f.view = connected({ finished })
+            component = mount(ServerSyncSettings, { target: host, props: { connectTarget: vi.fn() } })
+            await settle()
+            expect(panel()?.querySelector('[role="status"]')?.textContent).toContain(sync.complete)
+            expect(panel()?.querySelector('[role="progressbar"]')?.getAttribute('aria-valuenow')).toBe('100')
+            expect(panel()?.querySelector('[role="status"] .lucide-loader-circle')).toBeNull()
+            expect(host.querySelector('[data-tone]')?.textContent?.trim()).toBe(sync.ready)
+            expect(lastSync()).toBe(false)
+            publish(connected({}))
+            await settle()
+            expect(panel()).toBeNull()
+            expect(lastSync()).toBe(true)
+        })
+        it('keeps Details as it was left for the next sync', async () => {
+            f.view = connected({ running: true, progress: routine([lane('send', { active: true, step: 'confirming', itemsDone: 1, itemsTotal: 2 })]) })
+            component = mount(ServerSyncSettings, { target: host, props: { connectTarget: vi.fn() } })
+            await settle()
+            panel()!.querySelector('summary')!.click(); await settle()
+            publish(connected({}))
+            await settle()
+            publish(connected({ running: true, progress: routine([lane('receive', { active: true, step: 'downloading', backlogDone: 10, backlogLeft: 30 })], { stages: ['downloading'], active: ['downloading'], current: 'downloading' }) }))
+            await settle()
+            expect(panel()!.querySelector('details')!.open).toBe(true)
+            expect(panel()?.querySelector('[role="progressbar"]')?.getAttribute('aria-valuenow')).toBe('25')
+        })
     })
 })

@@ -1,14 +1,14 @@
 import { describe, expect, it, vi } from 'vitest'
 import { languageKorean } from 'src/lang/ko'
-import { createRateMeter, laneDeltas, serverSyncProgressView, type ServerSyncAttempt, type ServerSyncLane } from './serverSyncProgress'
+import { createRateMeter, laneDeltas, routinePeak, serverSyncProgressView, serverSyncRoutineView, type ServerSyncAttempt, type ServerSyncLane } from './serverSyncProgress'
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }))
 
 const text = languageKorean.risuNest.serverSync
 const lane = (name: ServerSyncLane['lane'], counts: Partial<ServerSyncLane> = {}): ServerSyncLane => ({
-    lane: name, active: false, step: 'idle', listed: 0, itemsDone: 0, itemsTotal: 0, filesDone: 0, filesTotal: 0, bytesDone: 0, bytesTotal: 0, sentBytes: 0, receivedBytes: 0, ...counts,
+    lane: name, active: false, step: 'idle', listed: 0, itemsDone: 0, itemsTotal: 0, filesDone: 0, filesTotal: 0, bytesDone: 0, bytesTotal: 0, sentBytes: 0, receivedBytes: 0, backlogDone: 0, backlogLeft: 0, ...counts,
 })
-const attempt = (fields: Partial<ServerSyncAttempt>): ServerSyncAttempt => ({ startedAt: 0, stages: ['publishing'], active: ['publishing'], current: 'publishing', ...fields })
+const attempt = (fields: Partial<ServerSyncAttempt>): ServerSyncAttempt => ({ mode: 'full', startedAt: 0, stages: ['publishing'], active: ['publishing'], current: 'publishing', ...fields })
 
 describe('server sync lane deltas', () => {
     it('subtracts the baseline lane by lane and keeps the live step', () => {
@@ -18,6 +18,11 @@ describe('server sync lane deltas', () => {
             lane('send', { active: true, step: 'uploading', sentBytes: 300, filesDone: 3, filesTotal: 9 }),
             lane('receive'),
         ])
+    })
+    it('reads what is left of known work as it is now', () => {
+        const baseline = [lane('receive', { backlogDone: 500, backlogLeft: 40 })]
+        const current = [lane('receive', { active: true, step: 'downloading', backlogDone: 530, backlogLeft: 10 })]
+        expect(laneDeltas(current, baseline)).toEqual([lane('receive', { active: true, step: 'downloading', backlogDone: 30, backlogLeft: 10 })])
     })
 })
 
@@ -83,5 +88,46 @@ describe('server sync progress view', () => {
         expect(counted.counters.find(counter => counter.key === 'items')?.value).toBe('0 / 5')
         const uncounted = serverSyncProgressView(attempt({ lanes: [lane('send', { active: true, step: 'preparing' })] }), text, 0)
         expect(uncounted.counters.some(counter => counter.key === 'items')).toBe(false)
+    })
+})
+
+describe('server sync routine bar', () => {
+    const routine = (fields: Partial<ServerSyncAttempt>) => attempt({ mode: 'routine', ...fields })
+    it('has no bar while nothing is sent or received', () => {
+        expect(serverSyncRoutineView(routine({ lanes: [lane('send', { active: true, step: 'preparing' }), lane('receive')] }), text, false)).toBeUndefined()
+        expect(serverSyncRoutineView(routine({}), text, true)).toBeUndefined()
+    })
+    it('fills toward the upload planned when publishing began', () => {
+        const view = serverSyncRoutineView(routine({ plannedSend: 40, lanes: [lane('send', { active: true, step: 'confirming', itemsDone: 10, itemsTotal: 20 })] }), text, false)
+        expect(view).toEqual({ label: text.running, fraction: 0.25, complete: false })
+    })
+    it('measures a receive by the server changes it has left, not by what an earlier attempt left', () => {
+        const receiving = routine({ stages: ['downloading'], active: ['downloading'], current: 'downloading', lanes: [lane('receive', { active: true, step: 'downloading', backlogDone: 30, backlogLeft: 70, itemsDone: 3, itemsTotal: 3 })] })
+        expect(serverSyncRoutineView(receiving, text, false)?.fraction).toBe(0.3)
+        const stale = routine({ stages: ['publishing'], lanes: [lane('receive', { backlogLeft: 50 })] })
+        expect(serverSyncRoutineView(stale, text, false)).toBeUndefined()
+    })
+    it('has no bar for a receive that only reads back a push from this device', () => {
+        const view = serverSyncRoutineView(routine({ stages: ['downloading'], active: ['downloading'], current: 'downloading', lanes: [lane('receive', { active: true, step: 'downloading', listed: 2, itemsDone: 2, itemsTotal: 2 })] }), text, false)
+        expect(view).toBeUndefined()
+    })
+    it('turns into an asset bar while the assets that followed download', () => {
+        const lanes = [lane('receive', { backlogDone: 100 }), lane('hydrate', { active: true, step: 'downloading', backlogDone: 1, backlogLeft: 3 })]
+        const view = serverSyncRoutineView(routine({ stages: ['downloading', 'applying', 'assets'], active: ['assets'], current: 'assets', lanes }), text, false)
+        expect(view).toEqual({ label: text.progress.assets, fraction: 0.25, complete: false })
+    })
+    it('holds the furthest point a bar reached when more work turns up', () => {
+        let state = routine({ plannedSend: 4, lanes: [lane('send', { active: true, step: 'confirming', itemsDone: 3, itemsTotal: 4 })] })
+        state = { ...state, peak: routinePeak(state) }
+        expect(state.peak).toEqual({ changes: 0.75 })
+        state = { ...state, lanes: [lane('send', { active: true, step: 'confirming', itemsDone: 4, itemsTotal: 12 })] }
+        expect(serverSyncRoutineView(state, text, false)?.fraction).toBe(0.75)
+        expect(routinePeak(state)).toEqual({ changes: 0.75 })
+        state = { ...state, lanes: [lane('send', { active: true, step: 'confirming', itemsDone: 11, itemsTotal: 12 })] }
+        expect(routinePeak(state)?.changes).toBeCloseTo(11 / 12)
+    })
+    it('shows a finished attempt as a full, completed bar', () => {
+        const view = serverSyncRoutineView(routine({ active: [], lanes: [lane('send', { itemsDone: 2, itemsTotal: 2 })] }), text, true)
+        expect(view).toEqual({ label: text.complete, fraction: 1, complete: true })
     })
 })
