@@ -13,6 +13,9 @@ export default defineConfig(({ mode }) => {
             name: 'fixture-host-boundaries', enforce: 'pre',
             async resolveId(source, importer, options) {
                 source = source.replaceAll('\\', '/').replace(resolve(import.meta.dirname, '../../src').replaceAll('\\', '/') + '/', 'src/')
+                if (/\/src\/lib\/Others\/(?:MonacoEditor|TextEditorMonaco)\.svelte$/.test(importer?.replaceAll('\\', '/') ?? '') && ['src/ts/gui/codearea/cbsMonaco', 'src/ts/gui/colorscheme', 'src/lang'].includes(source)) {
+                    return resolve(import.meta.dirname, 'monacoAdapters.ts').replaceAll('\\', '/')
+                }
                 if (importer?.replaceAll('\\', '/').endsWith('/src/ts/ui/modalNavigation.ts') && /(?:^|\/)stores\.svelte$/.test(source)) {
                     return resolve(import.meta.dirname, 'modalNavigationAdapters.ts').replaceAll('\\', '/')
                 }
@@ -33,13 +36,17 @@ export default defineConfig(({ mode }) => {
                 return resolved.id.replace(/realmEndpoints\.ts$/, 'realmEndpoints.blocked.ts')
             },
         }, svelte()],
-        resolve: { alias: { src: resolve(import.meta.dirname, '../../src') } },
+        resolve: { alias: [
+            { find: /^monaco-editor$/, replacement: resolve(import.meta.dirname, '../../src/ts/gui/codearea/monacoRuntime.ts') },
+            { find: 'src', replacement: resolve(import.meta.dirname, '../../src') },
+        ] },
+        worker: { format: 'es' },
         server: { hmr: false, host: '127.0.0.1', port: 4187, strictPort: true, fs: { allow: [resolve(import.meta.dirname, '../..')] } },
         build: {
             outDir: resolve(import.meta.dirname, '../../.tmp/test-results/browser/dist'), emptyOutDir: true,
             rollupOptions: {
                 preserveEntrySignatures: 'strict',
-                input: [resolve(import.meta.dirname, 'index.html'), resolve(import.meta.dirname, 'dragDrop.html'), resolve(import.meta.dirname, 'modalNavigation.html'), resolve(import.meta.dirname, 'lazyApp.html')],
+                input: [resolve(import.meta.dirname, 'index.html'), resolve(import.meta.dirname, 'dragDrop.html'), resolve(import.meta.dirname, 'modalNavigation.html'), resolve(import.meta.dirname, 'lazyApp.html'), resolve(import.meta.dirname, 'monaco.html')],
             },
         },
     }
