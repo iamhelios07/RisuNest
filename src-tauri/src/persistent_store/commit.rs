@@ -2618,7 +2618,7 @@ fn object<'a>(value: &'a Value, context: &str) -> StoreResult<&'a Map<String, Va
         .ok_or_else(|| validation(format!("{context} must be a JSON object")))
 }
 
-// Upstream allows unnamed characters, groups, and conversations. IDs remain nonempty.
+// Upstream allows unnamed characters and conversations. IDs remain nonempty.
 fn required_display_name<'a>(value: &'a Value, context: &str) -> StoreResult<&'a str> {
     value
         .get("name")

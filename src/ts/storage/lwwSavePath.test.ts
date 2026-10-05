@@ -8,7 +8,7 @@ import { PersistentMutationFencedError, SaveCoordinator } from './saveCoordinato
 import { capturePersistentRoot, createPersistentDataRuntime, type PersistentDataRuntimeStateAdapter } from './persistentDataRuntime'
 import { applyLwwWorkingSetUnits, captureLwwWorkingSetBaseline } from './lwwWorkingSetApply'
 import { createGeneratingConversationRegistry } from './generatingConversationRegistry'
-import { diffMaterializedCharacter, diffRecordCollection } from './persistentUnitCapture'
+import { diffRecordCollection } from './persistentUnitCapture'
 import { createConversationSummaryStubFromChat } from './conversationResidency'
 import { createMetadataOnlySelectedConversation, isMetadataOnlySelectedConversation } from './selectedConversationLifecycle'
 import type { Database, character } from './database.svelte'
@@ -460,15 +460,6 @@ describe('LWW renderer save path', () => {
         await coordinator.commitPersistentUnitIntent('remove', [{ key: '["record","plugins","owner"]', type: 'delete' }])
         await coordinator.commitPersistentUnitIntent('reinstall', [{ key: '["record","plugins","owner"]', type: 'set', value: { name: 'owner', source: 'second' } }])
         expect((await store.readRoot()).value.plugins).toEqual([{ name: 'owner', source: 'second' }])
-    })
-
-    it('keeps group membership atomic and excludes unchanged fields', () => {
-        const before = { ...fixtureDatabase.characters[0], type: 'group', characters: ['a'], characterTalks: [1], characterActive: [true] } as unknown as Database['characters'][number]
-        const after = structuredClone(before)
-        Object.assign(after, { characters: ['b'], characterTalks: [2], characterActive: [false] })
-        expect(diffMaterializedCharacter(before, after).unitMutations).toEqual([
-            { key: '["group-members","char-b"]', type: 'set', value: { characters: ['b'], characterTalks: [2], characterActive: [false] } },
-        ])
     })
 
     it('pins export under paused writes while later saves wait', async () => {

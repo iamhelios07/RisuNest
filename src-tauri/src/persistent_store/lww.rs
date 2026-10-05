@@ -487,7 +487,7 @@ fn parent_keys(key: &UnitKey) -> StoreResult<Vec<UnitKey>> {
     let c = key.components();
     let p: Vec<&str> = c.iter().map(String::as_str).collect();
     match p[0] {
-        "character" | "group-members" | "archive" => {
+        "character" | "archive" => {
             Ok(vec![unit_key(&["exists", "character", p[1]])?])
         }
         "conversation" | "messages" => Ok(vec![
@@ -581,7 +581,7 @@ pub(super) fn project_replacement_units(
 fn suppress_retired(db: &Connection, parent: &UnitKey) -> StoreResult<()> {
     let p = parent.components();
     let (condition,first,second)=match p[1].as_str(){
-        "character"=>("((json_extract(key,'$[0]') IN ('character','group-members','archive','conversation','messages') AND json_extract(key,'$[1]')=?1) OR (json_extract(key,'$[0]')='exists' AND json_extract(key,'$[1]')='conversation' AND json_extract(key,'$[2]')=?1) OR (json_extract(key,'$[0]')='order' AND json_extract(key,'$[1]')='conversations' AND json_extract(key,'$[2]')=?1))",p[2].as_str(),None),
+        "character"=>("((json_extract(key,'$[0]') IN ('character','archive','conversation','messages') AND json_extract(key,'$[1]')=?1) OR (json_extract(key,'$[0]')='exists' AND json_extract(key,'$[1]')='conversation' AND json_extract(key,'$[2]')=?1) OR (json_extract(key,'$[0]')='order' AND json_extract(key,'$[1]')='conversations' AND json_extract(key,'$[2]')=?1))",p[2].as_str(),None),
         "conversation"=>("json_extract(key,'$[0]') IN ('conversation','messages') AND json_extract(key,'$[1]')=?1 AND json_extract(key,'$[2]')=?2",p[2].as_str(),Some(p[3].as_str())),
         "preset"|"persona"=>("json_extract(key,'$[0]')=?2 AND json_extract(key,'$[1]')=?1",p[2].as_str(),Some(p[1].as_str())),
         other=>("json_extract(key,'$[0]')='record' AND json_extract(key,'$[1]')=?2 AND json_extract(key,'$[2]')=?1",p[2].as_str(),Some(other)),
@@ -2795,7 +2795,7 @@ impl PersistentStore {
 fn archived_character(key: &UnitKey) -> Option<String> {
     let mut p = key.components();
     match p[0].as_str() {
-        "character" | "group-members" | "conversation" | "messages" => Some(p.swap_remove(1)),
+        "character" | "conversation" | "messages" => Some(p.swap_remove(1)),
         "exists" if p[1] == "conversation" => Some(p.swap_remove(2)),
         "order" if p[1] == "conversations" => Some(p.swap_remove(2)),
         _ => None,
@@ -3322,7 +3322,7 @@ fn initialize_owner(
         return Ok(());
     }
     let (sql,parameters):(String,Vec<String>)=match kind {
-        "character"=>("SELECT key FROM lww_units WHERE json_extract(key,'$[0]') IN ('character','group-members','archive') AND json_extract(key,'$[1]')=?1 UNION ALL SELECT key FROM lww_units WHERE json_extract(key,'$[0]')='order' AND json_extract(key,'$[1]')='conversations' AND json_extract(key,'$[2]')=?1".into(),vec![first.into()]),
+        "character"=>("SELECT key FROM lww_units WHERE json_extract(key,'$[0]') IN ('character','archive') AND json_extract(key,'$[1]')=?1 UNION ALL SELECT key FROM lww_units WHERE json_extract(key,'$[0]')='order' AND json_extract(key,'$[1]')='conversations' AND json_extract(key,'$[2]')=?1".into(),vec![first.into()]),
         "conversation"=>("SELECT key FROM lww_units WHERE json_extract(key,'$[0]') IN ('conversation','messages') AND json_extract(key,'$[1]')=?1 AND json_extract(key,'$[2]')=?2".into(),vec![first.into(),second.unwrap().into()]),
         "preset"|"persona"=>("SELECT key FROM lww_units WHERE json_extract(key,'$[0]')=?1 AND json_extract(key,'$[1]')=?2".into(),vec![kind.into(),first.into()]),
         _=>("SELECT key FROM lww_units WHERE json_extract(key,'$[0]')='record' AND json_extract(key,'$[1]')=?1 AND json_extract(key,'$[2]')=?2".into(),vec![kind.into(),first.into()]),

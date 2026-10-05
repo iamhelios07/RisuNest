@@ -7,8 +7,7 @@ import { translatePersistentRootUnitIntents } from './persistentIdentityHooks'
 import type { LwwStageReceive, LwwApplyResult, PersistentUnitMutation, ConversationMutation, WholeMessageIntent, GeneratingConversation } from './persistentDataStore'
 import { isTauri } from '../platform'
 import type { PersistenceCanonicalCapture } from './reactivePersistenceCapture.svelte'
-import type { Chat, Database, Message, botPreset, character, groupChat } from './database.svelte'
-import { removeGroupMemberReferences } from './groupMembership'
+import type { Chat, Database, Message, botPreset, character } from './database.svelte'
 import {
     ActiveWorkingSet,
     type ActiveConversationViewportSourceListener,
@@ -86,7 +85,7 @@ import {
 } from './conversationResidency'
 import { createMetadataOnlySelectedConversation, isMetadataOnlySelectedConversation } from './selectedConversationLifecycle'
 
-type CompleteCharacter = character | groupChat
+type CompleteCharacter = character
 type RootDatabase = PersistentRoot
 
 export type CommittedApplyOutcome = Readonly<{
@@ -213,32 +212,11 @@ export function publishPersistentCharacterMutationToWorkingSet(
     selectCharacterIndex: (index: number) => void,
 ): void {
     patchWorkingSetRoot(database, state.root)
-    for (const detail of state.relatedCharacters ?? []) {
-        const relatedIndex = database.characters.findIndex(
-            (candidate) => candidate.chaId === detail.chaId,
-        )
-        if (relatedIndex >= 0) {
-            patchWorkingSetCharacterDetail(database.characters[relatedIndex], detail)
-        }
-    }
     const index = database.characters.findIndex(
         (candidate) => candidate.chaId === state.characterId,
     )
     if (state.kind === 'delete') {
-        const selected = database.characters[selectedIndex]
-        if (
-            selected?.type === 'group' &&
-            Array.isArray(selected.characters) &&
-            selected.chaId !== state.characterId
-        ) {
-            const retained = removeGroupMemberReferences(
-                selected,
-                new Set([state.characterId]),
-            )
-            selected.characters = retained.characters
-            selected.characterTalks = retained.characterTalks
-            selected.characterActive = retained.characterActive
-        }
+
         if (index >= 0) database.characters.splice(index, 1)
         residency.forgetCharacter(state.characterId)
         if (selectedIndex === index) selectCharacterIndex(-1)
@@ -317,7 +295,6 @@ export interface PersistentDataRuntimeStateAdapter {
     installCompleteDatabase?(database: Database): void
     restoreSelection?(characterId: string | null, conversationId: string | null): void
     publishCharacter(character: CompleteCharacter): void
-    publishCharacterSet?(primary: CompleteCharacter, related: CharacterDetail[]): void
     publishConversation(
         characterId: string,
         conversation: Chat,
@@ -430,7 +407,7 @@ export interface PersistentDataRuntime {
     ): WindowedConversationMutationController | null
     editWindowedChatList(
         target: SelectedConversationTarget,
-        edit: (character: character | groupChat) => string | null | false,
+        edit: (character: character) => string | null | false,
     ): WindowedChatListEditResult
     tryDemoteSelectedConversation(
         target?: SelectedConversationTarget | null,
@@ -477,7 +454,7 @@ export interface PersistentDataRuntime {
         reason: string,
         mutate: PersistentCharacterDetailMutation,
     ): Promise<boolean>
-    deletePersistentCharacterWithGroupReferences(
+    deletePersistentCharacter(
         characterId: string,
         reason: string,
     ): Promise<boolean>
@@ -656,7 +633,7 @@ export function createPersistentDataRuntime(
         publishCharacterMutation: dependencies.state.publishCharacterMutation
             ? (result) => publishCommittedProjection({
                 root: true,
-                characterIds: [result.characterId, ...(result.relatedCharacters?.map((value) => value.chaId) ?? [])],
+                characterIds: [result.characterId],
             }, () => dependencies.state.publishCharacterMutation!(result))
             : undefined,
         publishConversationReplacement: dependencies.state.publishConversationReplacement
@@ -717,16 +694,6 @@ export function createPersistentDataRuntime(
         getSelectedCharacterId: dependencies.state.getSelectedCharacterId,
         getResidentCharacter: dependencies.state.captureCharacter,
         publishCharacter: dependencies.state.publishCharacter,
-        publishCharacterSet: dependencies.state.publishCharacterSet ?? ((primary, related) => {
-            for (const detail of related) {
-                const resident = dependencies.state.captureCharacter(detail.chaId)
-                if (resident) dependencies.state.publishCharacter({
-                    ...detail,
-                    chats: resident.chats,
-                } as CompleteCharacter)
-            }
-            dependencies.state.publishCharacter(primary)
-        }),
         publishConversation: dependencies.state.publishConversation,
         captureActivationRollback: dependencies.state.captureActivationRollback,
         canActivateWorkingSet: () =>
@@ -1464,20 +1431,15 @@ export function createPersistentDataRuntime(
                 patch,
                 publish,
             ),
-        expirePersistentTrash: (now) => {
-            const selected = dependencies.state.captureSelectedCharacter()
-            return withCompleteCharacter(selected?.type === 'group' ? selected.chaId : '', () =>
-                coordinator.expirePersistentTrash(now))
-        },
+        expirePersistentTrash: (now) => coordinator.expirePersistentTrash(now),
         mutatePersistentCharacterDetail: (characterId, reason, mutate) =>
             withCompleteCharacter(characterId, () => coordinator.mutatePersistentCharacterDetail(
                 characterId,
                 reason,
                 mutate,
             )),
-        deletePersistentCharacterWithGroupReferences: (characterId, reason) =>
-            withCompleteCharacter(dependencies.state.captureSelectedCharacter()?.type === 'group'
-                ? dependencies.state.captureSelectedCharacter()!.chaId : characterId, () => coordinator.deletePersistentCharacterWithGroupReferences(
+        deletePersistentCharacter: (characterId, reason) =>
+            withCompleteCharacter(characterId, () => coordinator.deletePersistentCharacter(
                 characterId,
                 reason,
             )),

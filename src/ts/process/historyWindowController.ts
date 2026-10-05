@@ -208,7 +208,7 @@ export function createHistoryWindowController(
         const source = environment.captureSession()
         if (source?.session.canAdoptPersistedMetadata && sessionHoldsWindow(source, chat, absoluteStartIndex)) {
             const persisted = source.conversation.message.slice(absoluteStartIndex)
-            const contentKeys = ['role', 'data', 'saying', 'chatId', 'name', 'otherUser', 'disabled', 'isComment'] as const
+            const contentKeys = ['role', 'data', 'saying', 'chatId', 'name', 'disabled', 'isComment'] as const
             if (persisted.every((message, index) =>
                 contentKeys.every((key) => Object.is(message[key], chat.message[index][key])))) {
                 replaceArrayRange(chat.message, 0, persisted.length, safeStructuredClone(persisted))
