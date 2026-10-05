@@ -90,6 +90,23 @@ describe('captureSessionHistoryWindowController', () => {
         controller.release()
         expect(session.pinCount('transaction')).toBe(0)
     })
+
+    it('writes a range longer than a call can take as arguments', () => {
+        const { session, source } = completeConversation(4)
+        const chat = windowFrom(source, 1)
+        const controller = captureSessionHistoryWindowController(source, () => session, chat, 1)!
+        const replacement = Array.from({ length: 130_000 }, (_, index) => message(`r${index}`))
+
+        expect(controller.applyRange(1, 1, replacement, 'replace-range')).toBe(true)
+
+        const after = session.materializeCompatibilityArray()
+        expect(after).toHaveLength(130_003)
+        expect(after.slice(0, 2).map((item) => item.data)).toEqual(['m0', 'm1'])
+        expect(after[2].data).toBe('r0')
+        expect(after.slice(-2).map((item) => item.data)).toEqual(['r129999', 'm3'])
+        expect(chat.message).toHaveLength(130_002)
+        expect(chat.message.at(-1)?.data).toBe('m3')
+    })
 })
 
 function staleable(chat: Chat, absoluteStartIndex: number) {

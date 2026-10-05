@@ -1,6 +1,7 @@
 import type { Chat, Database, Message, character, groupChat } from './database.svelte'
 import type { CommittedApplyOutcome } from './persistentDataRuntime'
 import { safeStructuredClone } from '../polyfill'
+import { replaceArrayRange } from '../arrayRange'
 import {
     ActiveConversationSession,
     createConversationSessionToken,
@@ -479,10 +480,11 @@ export class ActiveWorkingSet {
                 const detachedMessages = safeStructuredClone([...messages])
                 let rollbackViewport = () => {}
                 try {
-                    chat.message.splice(
+                    replaceArrayRange(
+                        chat.message,
                         localStart,
                         deleteCount,
-                        ...safeStructuredClone(detachedMessages),
+                        safeStructuredClone(detachedMessages),
                     )
                     const metadata = syncMetadata(state)
                     state.authority = {
@@ -523,7 +525,7 @@ export class ActiveWorkingSet {
                     return true
                 } catch (error) {
                     rollbackViewport()
-                    chat.message.splice(localStart, detachedMessages.length, ...replacedMessages)
+                    replaceArrayRange(chat.message, localStart, detachedMessages.length, replacedMessages)
                     restoreObject(
                         state.conversation as unknown as Record<string, unknown>,
                         shellSnapshot,

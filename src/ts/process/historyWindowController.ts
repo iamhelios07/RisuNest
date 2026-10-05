@@ -1,5 +1,6 @@
 import isEqual from 'lodash/isEqual'
 
+import { replaceArrayRange } from '../arrayRange'
 import { safeStructuredClone } from '../polyfill'
 import {
     cloneConversationMetadata,
@@ -107,7 +108,7 @@ export function captureSessionHistoryWindowController(
                         },
                     }),
             })
-            chat.message.splice(localStart, deleteCount, ...safeStructuredClone(detached))
+            replaceArrayRange(chat.message, localStart, deleteCount, safeStructuredClone(detached))
             expectedVersion = session.version
             return true
         },
