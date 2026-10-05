@@ -714,9 +714,11 @@ export async function loadData() {
         disposeLifecycleCommitListeners ??= registerLifecycleCommitListeners(
             (reason) => flushLifecycle(
                 reason,
-                isTauriDesktop
-                    && (nativePlatform() === 'windows' || nativePlatform() === 'linux')
-                    && reason === 'stop',
+                isTauriAndroid
+                    ? reason === 'stop' || reason === 'trim-memory'
+                    : isTauriDesktop
+                        && (nativePlatform() === 'windows' || nativePlatform() === 'linux')
+                        && reason === 'stop',
             ),
             syncExitCoordinator,
         )
