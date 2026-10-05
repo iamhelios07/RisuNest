@@ -5071,7 +5071,7 @@ export class SaveCoordinator {
         if (this.dirtyGeneration !== this.persistedDirtyGeneration &&
             !(error instanceof WindowedConversationSaveError) &&
             !(error instanceof TypeError) && !(error instanceof RevisionConflictError) &&
-            !(error instanceof Error && (error.name === 'QuotaExceededError' || error.name === 'UnsaveableValueError' || error.name === 'PayloadTooLargeError'))) {
+            !(error instanceof Error && (error.name === 'QuotaExceededError' || error.name === 'UnsaveableValueError' || error.name === 'PayloadTooLargeError' || error.message === 'retired-record-id'))) {
             this.armDebounce(this.backgroundRetryDelay)
             this.backgroundRetryDelay = Math.min(60_000, this.backgroundRetryDelay * 2)
         }

@@ -1006,6 +1006,7 @@ pub(crate) struct DataHealthReader {
     connection: Connection,
     cas: crate::asset_repository::PayloadCas,
     revision: i64,
+    quarantined: Vec<lww::QuarantinedIntent>,
 }
 
 impl DataHealthReader {
@@ -1019,10 +1020,23 @@ impl DataHealthReader {
         probe: &dyn crate::local_backup::CancellationProbe,
     ) -> StoreResult<crate::data_health::Findings> {
         let mut findings = crate::data_health::Findings::new(limit);
+        self.note_quarantined_intents(&mut findings);
         crate::portable_backup::scan_live_library(&self.connection, &self.cas, &mut findings, probe)
         .map_err(scan_failure)?;
         self.note_unreferenced_objects(&mut findings, probe)?;
         Ok(findings)
+    }
+
+    /// Reports the changes recovery set aside because their replay kept failing. They come
+    /// first, so the bound on the report never drops them.
+    fn note_quarantined_intents(&self, findings: &mut crate::data_health::Findings) {
+        use crate::data_health::{codes, FindingSink, Finding};
+        for intent in &self.quarantined {
+            findings.record(
+                Finding::new(codes::INTENT_QUARANTINED, "intent", intent.request_id.clone(), intent.error.clone())
+                    .targeting("intent", intent.kind.clone()),
+            );
+        }
     }
 
     /// Reports the stored objects no alias in this generation names. They cost space and nothing
@@ -1537,8 +1551,9 @@ impl PersistentStore {
             device_store,
             message_object_roots: MessageObjectRootsCache::default(),
         };
-        if store.device_store.is_ok() {
-            store.lww_recover_intents()?;
+        // A pending intent may still need its staging generation, so the sweep waits until
+        // every intent recovery still runs has settled.
+        if store.device_store.is_ok() && store.lww_recover_intents_at_open()? {
             snapshot::sweep_temporary_generations(&mut store.connection, retained_stage.as_deref())?;
         }
         snapshot::checkpoint(&store.connection, CheckpointMode::Truncate)?;
@@ -3371,6 +3386,10 @@ impl PersistentStore {
             connection: snapshot::open_generation_reader(&self.database_path, &target.generation)?,
             cas: crate::asset_repository::PayloadCas::new(self.repository_root())?,
             revision: target.revision,
+            quarantined: match self.device_store {
+                Ok(_) => self.lww_quarantined_intents()?,
+                Err(_) => Vec::new(),
+            },
         })
     }
 

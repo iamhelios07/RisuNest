@@ -68,6 +68,7 @@ fn every_live_device_table_is_listed_here() {
         "lww_clock",
         "lww_device_context",
         "lww_initialization_scopes",
+        "lww_intent_failures",
         "lww_intent_rows",
         "lww_intents",
         "lww_new_device_authorizations",

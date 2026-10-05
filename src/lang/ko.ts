@@ -2496,6 +2496,9 @@ export const languageKorean = {
             codeRecordOrphan: '주인이 없는 기록',
             codeObjectUnreferenced: '아무 데서도 쓰지 않는 파일',
             codeUnclassified: '분류하지 못한 문제',
+            codeIntentQuarantined: '적용되지 않은 변경 사항',
+            codeIntentQuarantinedHelp:
+                '데이터에 적용되지 않은 변경 사항입니다. 필요한 경우 같은 변경을 다시 해주세요.',
             rootFieldCharacters: '캐릭터',
             rootFieldPresets: '프리셋',
             rootFieldPluginStorage: '플러그인 저장소',
