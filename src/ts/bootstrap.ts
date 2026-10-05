@@ -249,6 +249,7 @@ export async function loadData() {
                 pendingOfficialPublications: [],
                 interruptedRestores: [],
                 libraryRestoreCommitted: false,
+                pendingSnapshotBodies: [],
             }
         if (recoveredNativeFileJobs.pendingRestoreAcknowledgements.length > 0) {
             await refreshDeviceStateAfterRestore()
@@ -830,6 +831,11 @@ export async function loadData() {
         registerAndroidScreenshotPublicationRecovery()
         LoadingStatusState.startedAt = null
         loadedStore.set(true)
+        if (isTauri && recoveredNativeFileJobs.pendingSnapshotBodies?.length) {
+            void import('./storage/nativePersistentMaintenance').then(module =>
+                module.reattachNativeSnapshotRestoreBodies(recoveredNativeFileJobs.pendingSnapshotBodies),
+            ).catch(error => console.error('Snapshot body reattachment failed', error))
+        }
         setTimeout(() => {
             void runtime.expirePersistentTrash().catch((error) => console.error('Trash expiry failed', error))
         }, 0)
