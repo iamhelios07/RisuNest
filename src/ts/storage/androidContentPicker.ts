@@ -1,5 +1,4 @@
 import { invoke } from '@tauri-apps/api/core'
-import { parseImportJson } from '../importUtf8'
 import {
     pickAndroidContentSource,
     type AndroidSafJavascriptBridge,
@@ -92,7 +91,9 @@ async function consumeAndroidContentSpool(
             const data = response instanceof ArrayBuffer
                 ? new Uint8Array(response)
                 : Uint8Array.from(response)
-            const parsedJson = destination === 'auto' ? parseImportJson(data) : undefined
+            const parsedJson = destination === 'auto'
+                ? { value: JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(data)) }
+                : undefined
             const parsed = parsedJson?.value
             const moduleJson = parsed && typeof parsed === 'object' && (
                 parsed.type === 'risuModule'

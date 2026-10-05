@@ -80,21 +80,21 @@ describe('Android bounded JSON compatibility replay', () => {
             parsedJson: { value: { entries: {} } },
         })
     })
-    it('rejects invalid JSON after compatible UTF-8 replacement', async () => {
+    it('rejects bytes that are not UTF-8 before any converter executes', async () => {
         mocks.invoke.mockResolvedValue(Uint8Array.of(0x7b, 0xff, 0x7d).buffer)
-        await expect(importReplayedAndroidContentSpool(source, 'auto')).rejects.toBeInstanceOf(SyntaxError)
+        await expect(importReplayedAndroidContentSpool(source, 'auto')).rejects.toBeInstanceOf(TypeError)
         expect(mocks.character).not.toHaveBeenCalled()
         expect(mocks.module).not.toHaveBeenCalled()
         expect(mocks.discard).toHaveBeenCalledExactlyOnceWith(source.token)
     })
-    it('reuses the parsed auto-detected value with browser Buffer malformed replacement', async () => {
+    it('rejects malformed UTF-8 even inside otherwise valid auto-detected JSON', async () => {
         const prefix = new TextEncoder().encode('{"name":"')
         const bytes = new Uint8Array([...prefix, 0xe2, 0x82, 0x22, 0x7d])
         mocks.invoke.mockResolvedValue(bytes.buffer)
-        await expect(importReplayedAndroidContentSpool(source, 'auto')).resolves.toBe('imported-character')
-        expect(mocks.character).toHaveBeenCalledWith({
-            name: source.displayName, data: bytes, parsedJson: { value: { name: '\uFFFD\uFFFD' } },
-        })
+        await expect(importReplayedAndroidContentSpool(source, 'auto')).rejects.toBeInstanceOf(TypeError)
+        expect(mocks.character).not.toHaveBeenCalled()
+        expect(mocks.module).not.toHaveBeenCalled()
+        expect(mocks.discard).toHaveBeenCalledExactlyOnceWith(source.token)
     })
     it('retains a leading BOM so auto-detected JSON rejects it', async () => {
         mocks.invoke.mockResolvedValue(encoded('\uFEFF{}'))
