@@ -2,6 +2,10 @@ mod account_credential;
 #[cfg(any(test, target_os = "android"))]
 mod android_commit_transport;
 mod app_paths;
+#[cfg(desktop)]
+mod desktop_notifications;
+#[cfg(desktop)]
+mod startup_appearance;
 mod cleanup_secrets;
 mod cleanup_webview;
 mod app_cleanup;
@@ -154,18 +158,22 @@ fn boot_marker_now() -> i64 {
 /// before anything it could fail in, so a start that never reaches the app still counts.
 #[tauri::command(async)]
 fn boot_attempt_begin(app: tauri::AppHandle) -> Result<boot_marker::BootDecision, String> {
-    let version = app.package_info().version.to_string();
-    let root = boot_marker_root(&app)?;
-    boot_marker::begin(&root, &version, boot_marker_now())
-        .map_err(|error| format!("failed to record the start attempt: {error}"))
+    crate::native_log::logged_without_detail("boot_attempt_begin", (|| {
+        let version = app.package_info().version.to_string();
+        let root = boot_marker_root(&app)?;
+        boot_marker::begin(&root, &version, boot_marker_now())
+            .map_err(|error| format!("failed to record the start attempt: {error}"))
+    })())
 }
 
 /// Records that the start finished, so the next one begins from zero.
 #[tauri::command(async)]
 fn boot_attempt_complete(app: tauri::AppHandle) -> Result<(), String> {
-    let root = boot_marker_root(&app)?;
-    boot_marker::complete(&root)
-        .map_err(|error| format!("failed to clear the start attempt: {error}"))
+    crate::native_log::logged_without_detail("boot_attempt_complete", (|| {
+        let root = boot_marker_root(&app)?;
+        boot_marker::complete(&root)
+            .map_err(|error| format!("failed to clear the start attempt: {error}"))
+    })())
 }
 
 #[tauri::command]
@@ -543,12 +551,8 @@ fn builder_with_main_window(
             if let Some((config, data_directory)) = &main_window {
                 let window_builder = tauri::WebviewWindowBuilder::from_config(app, config)?
                     .data_directory(data_directory.clone());
-                #[cfg(target_os = "linux")]
-                let window_builder = if config.background_color.is_none() {
-                    window_builder.background_color(tauri::window::Color(33, 34, 44, 255))
-                } else {
-                    window_builder
-                };
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                let window_builder = startup_appearance::configure(app.handle(), config, window_builder);
                 window_builder.build()?;
             }
             let setup_result = (|| -> Result<(), String> {
@@ -831,6 +835,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         device_backup::native_device_backup_recovery_complete,
         native_file_jobs::native_content_source_metadata,
         native_file_jobs::native_file_job_status,
+        native_file_jobs::native_file_job_prepared_content,
         native_file_jobs::native_file_job_stage_inline_asset,
         native_file_jobs::native_file_job_list,
         native_file_jobs::native_file_job_finalize,
@@ -992,6 +997,10 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         regex_shadow::regex_cancel_batch,
         #[cfg(windows)]
         windows_appearance::windows_set_appearance,
+        #[cfg(desktop)]
+        desktop_notifications::desktop_notify,
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        startup_appearance::desktop_cache_appearance,
         persistent_store::commands::pds_read_section_participation,
         persistent_store::commands::pds_set_section_participating,
         persistent_store::commands::pds_read_character_summary,
