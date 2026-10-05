@@ -245,7 +245,7 @@ export function runSharedNativeFileOperation<T>(
     }
     if (options.snapshotBodyOwner) {
         const receipt = options.snapshotBodyOwner
-        return invoke<NativeFileJobStatus>('native_file_job_status', {jobId: receipt.jobId}).then(status => {
+        return invoke<NativeFileJobStatus>('native_snapshot_restore_bodies_status', {receipt}).then(status => {
             if (kind !== 'import' || receipt.kind !== 'snapshot-bodies' || status.kind !== 'snapshot-bodies'
                 || status.jobId !== receipt.jobId || status.snapshotStagingId !== receipt.stagingId
                 || String(status.activationRevision) !== receipt.activationRevision
@@ -394,6 +394,12 @@ export function runExternalAndroidNativeFileOperation<T>(
             options,
         )
     })
+}
+
+export async function waitForActiveNativeFileOperation(): Promise<void> {
+    while (activeOperation) {
+        try { await activeOperation } catch {}
+    }
 }
 
 export function cancelActiveNativeFileOperation(): void {
