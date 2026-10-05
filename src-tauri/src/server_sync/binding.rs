@@ -113,7 +113,7 @@ fn first_state_page(core: &LwwClient) -> Result<StatePage> {
 pub(crate) fn inspect(store: &PersistentStore, header: &Header) -> Result<Inspection> {
     assert_authority(store, header)?;
     let core = candidate(store)?;
-    core.admission()?;
+    core.fresh_admission()?;
     let head = core.client.resolve_identity()?;
     let page = first_state_page(&core)?;
     let config = core
@@ -341,7 +341,7 @@ pub(crate) fn stage(
     if core.client.resolve_identity()?.epoch != target.epoch {
         return Err(SyncError::new("server-epoch-changed", 409));
     }
-    let upper = core.admission()?;
+    let upper = core.fresh_admission()?;
     let (cursor, changes) = core.state(store, upper)?;
     if core.client.resolve_identity()?.epoch != target.epoch {
         return Err(SyncError::new("server-epoch-changed", 409));
@@ -696,7 +696,7 @@ pub(crate) fn activate(
                 cursor: stage.cursor,
                 writer_id: None,
             },
-            admitted_time_upper_ms: core.admission()?,
+            admitted_time_upper_ms: core.fresh_admission()?,
         };
         store.lww_stage_receive(&receive)?;
         store.lww_apply_receive(&ApplyReceive {

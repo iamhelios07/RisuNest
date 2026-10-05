@@ -1524,3 +1524,18 @@ fn a_multi_page_bootstrap_from_a_received_cursor_keeps_it_until_the_last_page() 
     assert_eq!(received_bootstrap_units(&target), 301);
     assert_eq!(server_cursor(&target).as_deref(), Some(floor.as_str()));
 }
+
+#[test]
+fn an_empty_poll_reuses_the_admitted_clock_sample() {
+    let server = LocalServerFixture::new();
+    ServerWriter::new(&server.server).push_units("received", "received", 1);
+    let (_root, mut store) = local();
+    let client = server.client(&store);
+    receive(&client, &mut store);
+    assert!(server_cursor(&store).is_some());
+    let counters = client.client.test_io.clone().unwrap();
+    counters.reset();
+    assert_eq!(receive_cycle(&client, &mut store, &[]).unwrap().received_units, 0);
+    // One page read and one acknowledgement; the clock sample is still valid.
+    assert_eq!(counters.snapshot()[0], 2);
+}
