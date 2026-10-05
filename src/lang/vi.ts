@@ -1510,7 +1510,6 @@ export const languageVietnamese = {
         restoreAction: "Khôi phục",
         previousFilesTitle: "Kết nối?",
         previousFilesDescription: "Một số tệp chỉ được lưu trên máy chủ hoặc bộ nhớ ngoài đã dùng trước đó. Khi kết nối, các tệp này cũng được lưu vào đích mới. Để giữ chúng trên thiết bị này, hãy chọn Tải xuống rồi kết nối.",
-        previousFilesUnknownDescription: "RisuNest không thể kiểm tra liệu có tệp nào chỉ được lưu trên máy chủ hoặc bộ nhớ ngoài đã dùng trước đó hay không. Nếu có, khi kết nối các tệp này cũng được lưu vào đích mới. Để giữ chúng trên thiết bị này, hãy chọn Tải xuống rồi kết nối.",
         downloadThenConnect: "Tải xuống rồi kết nối",
         downloadFailedNotConnected: "Không thể tải xuống các tệp nên chưa kết nối. Hãy thử lại hoặc kết nối mà không tải xuống.",
         previousStorageUnavailable: "Không thể lấy các tệp chỉ được lưu trên máy chủ hoặc bộ nhớ ngoài đã dùng trước đó nên đồng bộ đã dừng. Hãy thử lại khi có thể truy cập.",

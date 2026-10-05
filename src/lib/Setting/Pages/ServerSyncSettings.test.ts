@@ -429,7 +429,7 @@ describe('starting fresh from onboarding', () => {
     it.each([
         { name: 'connected to a sync server', binding: { target: { kind: 'server', connectionId: 'server' } }, characters: [], summary: onboarding.done.data },
         { name: 'connected to external storage', binding: { target: { kind: 'external', connectionId: 'external' } }, characters: [], summary: onboarding.done.data },
-        { name: 'holding characters', binding: { target: { kind: 'none' } }, characters: [{ chaId: 'synthetic' }], summary: onboarding.done.import },
+        { name: 'holding characters', binding: { target: { kind: 'none' } }, characters: [{ chaId: 'synthetic' }], summary: onboarding.done.data },
     ])('keeps the shared settings of a library $name', async ({ binding, characters, summary }) => {
         f.bindingState.mockResolvedValue(binding)
         f.state.db.characters = characters
@@ -447,6 +447,8 @@ describe('starting fresh from onboarding', () => {
         expect(f.preset).not.toHaveBeenCalled()
         for (const key of startingValues) expect(f.state.db).not.toHaveProperty(key)
         expect(heading()).toBe(onboarding.done.title)
+        expect(host.textContent).toContain(onboarding.done.data)
+        expect(host.textContent).not.toContain(onboarding.done.import)
     })
 })
 it('mounted web onboarding offers no native server entry', async () => {

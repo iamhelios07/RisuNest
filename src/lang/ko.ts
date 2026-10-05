@@ -2059,7 +2059,7 @@ export const languageKorean = {
                 local: '이 기기에 있는 파일',
                 remoteOnly: '서버에만 있는 파일',
                 externalOnly: '외부 저장소에만 있는 파일',
-                unavailable: '이 기기에도 서버에도 없는 파일',
+                unavailable: '찾을 수 없는 파일',
                 cleanupNote:
                     '이미 다운로드한 파일은 유지됩니다. 정리하면 서버에 있는 파일의 기기 사본만 삭제되며, 스냅샷에 필요한 파일은 스냅샷을 삭제할 때까지 유지됩니다.',
                 clean: '이 기기의 사본 정리',

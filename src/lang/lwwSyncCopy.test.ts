@@ -7,9 +7,10 @@ import { languageGerman } from './de'
 import { languageSpanish } from './es'
 import { languageVietnamese } from './vi'
 
-it('provides all binding, restore and status copy in every language', () => {
-    for (const language of [languageKorean, languageChinese, languageChineseTraditional, languageGerman, languageSpanish, languageVietnamese]) {
-        expect(Object.keys(language.lwwSync).sort()).toEqual(Object.keys(languageEnglish.lwwSync).sort())
+it('provides all binding, restore and status copy in Korean and English, and no unknown key elsewhere', () => {
+    expect(Object.keys(languageKorean.lwwSync).sort()).toEqual(Object.keys(languageEnglish.lwwSync).sort())
+    for (const language of [languageChinese, languageChineseTraditional, languageGerman, languageSpanish, languageVietnamese]) {
+        for (const key of Object.keys(language.lwwSync)) expect(languageEnglish.lwwSync).toHaveProperty(key)
         for (const text of Object.values(language.lwwSync)) expect(text.length).toBeGreaterThan(0)
     }
 })

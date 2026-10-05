@@ -2244,7 +2244,7 @@ export const languageEnglish = {
                 local: 'Files on this device',
                 remoteOnly: 'Files only on the server',
                 externalOnly: 'Files only in external storage',
-                unavailable: 'Files on neither this device nor the server',
+                unavailable: 'Files not found',
                 cleanupNote:
                     'Downloaded files stay on this device. Cleanup removes only local copies of files on the server. Files needed by a snapshot stay until that snapshot is deleted.',
                 clean: 'Clear copies on this device',

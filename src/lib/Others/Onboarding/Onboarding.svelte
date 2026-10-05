@@ -266,7 +266,7 @@
         // them with every other device.
         const binding = await libraryBinding()
         if (binding !== 'none' || DBState.db.characters.length > 0) {
-            flow = goToOnboardingState(flow, 'done', binding === 'server' || binding === 'external' ? binding : 'import')
+            flow = goToOnboardingState(flow, 'done', binding === 'server' || binding === 'external' ? binding : 'existing')
             return
         }
         DBState.db = setPreset(DBState.db, prebuiltPresets.OAI2)
