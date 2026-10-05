@@ -22,7 +22,8 @@ const env = { ...process.env, CARGO_TARGET_DIR: target, TAURI_CONFIG: JSON.strin
 await command(process.execPath, [join(dirname(require.resolve('vite/package.json')), 'bin/vite.js'), 'build', '--mode', 'agent', '--config', 'tests/native/vite.config.ts'])
 await command('cargo', ['build', '--release', '--locked', '--manifest-path', 'tests/native/native/Cargo.toml'], env)
 for (const phases of [['write', 'read'], ['abort', 'read-abort'], ['contract', 'read-contract']]) {
-    const runId = randomUUID().replaceAll('-', '')
+    // Linux registers the identifier as a D-Bus name, whose elements cannot start with a digit.
+    const runId = `a${randomUUID().replaceAll('-', '').slice(1)}`
     const identifier = `io.github.rsyumi.risunest.boundary.${runId}`
     const dataHome = process.platform === 'win32' ? process.env.APPDATA
         : process.platform === 'darwin' ? join(process.env.HOME, 'Library/Application Support')
