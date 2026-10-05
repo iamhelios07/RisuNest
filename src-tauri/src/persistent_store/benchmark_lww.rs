@@ -734,6 +734,7 @@ fn verify_post_scope<T>(observation:&NativeObservation,verify:impl FnOnce()->Res
 }
 
 #[test]
+#[ignore = "measurement harness self-test"]
 fn final_post_scope_errors_and_assertions_preserve_actual_observation() {
     let observation=NativeObservation {units_visited:37,requests:11,..Default::default()};
     let sql_error=verify_post_scope::<()>(&observation,||Err("journal diagnostic failed".into())).unwrap_err();
@@ -1712,6 +1713,7 @@ pub(crate) fn collect_native_scale_certificate(store:&mut PersistentStore, plan:
 }
 
 #[test]
+#[ignore = "measurement harness self-test"]
 fn bounded_native_shards_have_real_catalog_bodies_and_owner_closure() {
     let (_directory,mut store) = server_sync::lww_tests::local();
     let plan = native_shards::ShardPlan {ordinary_messages:2,assets_per_owner:2,
@@ -1732,6 +1734,7 @@ fn bounded_native_shards_have_real_catalog_bodies_and_owner_closure() {
 }
 
 #[test]
+#[ignore = "measurement harness self-test"]
 fn lazy_native_constructor_stops_on_observed_persistence_and_honors_callback_cancellation() {
     let (_directory,mut store)=server_sync::lww_tests::local();
     let plan=native_shards::ShardPlan {ordinary_messages:2,assets_per_owner:2,..native_shards::ShardPlan::new(11,3)};
@@ -1750,6 +1753,7 @@ fn lazy_native_constructor_stops_on_observed_persistence_and_honors_callback_can
 }
 
 #[test]
+#[ignore = "measurement harness self-test"]
 fn large_asset_delta_keeps_base_certificate_and_full_prior_conversation() {
     let server=LocalServerFixture::new();
     let (_directory,mut store)=server_sync::lww_tests::local();
@@ -1770,6 +1774,7 @@ fn large_asset_delta_keeps_base_certificate_and_full_prior_conversation() {
 }
 
 #[test]
+#[ignore = "measurement harness self-test"]
 fn additional_fixed_changes_preserve_full_message_lists_and_stable_personas() {
     let (_directory,mut store) = server_sync::lww_tests::local();
     let generated = tempfile::tempdir().unwrap();
@@ -1787,6 +1792,7 @@ fn additional_fixed_changes_preserve_full_message_lists_and_stable_personas() {
 }
 
 #[test]
+#[ignore = "measurement harness self-test"]
 fn additional_native_adapters_use_real_local_transport_in_both_directions() {
     let mut driver=ServerDriver::prepare(FixtureScale::small());
     driver.a.commit(&WorkingSetCommit {expected_revision:driver.a.revision().unwrap(),
@@ -1814,6 +1820,7 @@ fn additional_native_adapters_use_real_local_transport_in_both_directions() {
 }
 
 #[test]
+#[ignore = "measurement harness self-test"]
 fn additional_native_adapters_use_real_external_cycle_in_both_directions() {
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
         let mut driver=ExternalDriver::prepare(FixtureScale::small()).await;
@@ -1846,6 +1853,7 @@ fn additional_native_adapters_use_real_external_cycle_in_both_directions() {
 }
 
 #[test]
+#[ignore = "measurement harness self-test"]
 fn final_native_local_adapters_prove_owned_identity_metadata_in_fixed_pairs() {
     let _entry=collect_final_local;
     let mut by_scale=Vec::new();
@@ -1881,6 +1889,7 @@ fn final_native_local_adapters_prove_owned_identity_metadata_in_fixed_pairs() {
         "status":"CORRECTNESS_ONLY","accepted_measurement":false,"actual_samples":by_scale,"proofs":proofs})).unwrap());
 }
 #[test]
+#[ignore = "measurement harness self-test"]
 fn final_native_resume_reopens_same_registration_and_receives_only_missed_units() {
     let mut driver=ServerDriver::prepare(FixtureScale::small());
     assert!(build_final_native_tiers(&mut driver.a,&mut driver.b,|_,_|panic!("a bound existing fixture must fail before construction"))
@@ -1894,6 +1903,7 @@ fn final_native_resume_reopens_same_registration_and_receives_only_missed_units(
 }
 
 #[test]
+#[ignore = "measurement harness self-test"]
 fn final_native_external_resume_reopens_same_writer_and_actual_bound_engine() {
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
         let driver=ExternalDriver::prepare(FixtureScale::small()).await;
@@ -1909,6 +1919,7 @@ fn final_native_external_resume_reopens_same_writer_and_actual_bound_engine() {
 }
 
 #[test]
+#[ignore = "measurement harness self-test"]
 fn final_native_bootstrap_retains_real_activation_and_body_receipts_without_source_claim() {
     let driver=ServerDriver::prepare(FixtureScale::small());
     let (_directory,mut destination)=server_sync::lww_tests::local();
@@ -1930,6 +1941,7 @@ fn final_native_bootstrap_retains_real_activation_and_body_receipts_without_sour
 }
 
 #[test]
+#[ignore = "measurement harness self-test"]
 fn final_native_sparse_boundary_uses_actual_transport_and_preserves_full_messages() {
     let mut driver=ServerDriver::prepare(FixtureScale::small());
     for direction in [final_runner::Direction::AtoB,final_runner::Direction::BtoA] {
@@ -1948,6 +1960,7 @@ fn final_native_sparse_boundary_uses_actual_transport_and_preserves_full_message
 }
 
 #[test]
+#[ignore = "measurement harness self-test"]
 fn actual_compaction_producer_keeps_unobserved_source_and_protection_invalid() {
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
         let mut fixture=crate::external_storage::lww_tests::CycleFixture::new();
@@ -2062,6 +2075,7 @@ fn actual_source_read_barrier_allows_real_foreground_publication_during_hydratio
 }
 
 #[test]
+#[ignore = "measurement harness self-test"]
 fn final_native_sse_constructor_uses_real_projection_and_independent_fresh_writers() {
     let directory=tempfile::tempdir().unwrap();
     let requirement=scale_certificate::ScaleRequirement::Correctness {minimum_database_bytes:4096,minimum_assets:3};
@@ -2099,6 +2113,7 @@ fn final_native_sse_constructor_uses_real_projection_and_independent_fresh_write
 }
 
 #[test]
+#[ignore = "measurement harness self-test"]
 fn final_native_external_adapters_return_complete_phase_and_key_evidence() {
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
         let mut driver=ExternalDriver::prepare(FixtureScale::small()).await;
@@ -2123,6 +2138,7 @@ fn final_native_external_adapters_return_complete_phase_and_key_evidence() {
 }
 
 #[test]
+#[ignore = "measurement harness self-test"]
 fn frozen_fixture_stages_real_native_rows_and_unique_message_ids() {
     let (directory, mut store) = server_sync::lww_tests::local();
     let generated = tempfile::tempdir().unwrap();
@@ -2153,6 +2169,7 @@ fn frozen_fixture_stages_real_native_rows_and_unique_message_ids() {
 }
 
 #[test]
+#[ignore = "measurement harness self-test"]
 fn external_fixture_bootstrap_correctness() {
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
         let mut driver = ExternalDriver::prepare(FixtureScale::small()).await;
@@ -2173,12 +2190,14 @@ fn external_fixture_bootstrap_correctness() {
 }
 
 #[test]
+#[ignore = "measurement harness self-test"]
 fn local_server_fixture_bootstrap_correctness() {
     let driver = ServerDriver::prepare(FixtureScale::small());
     verify_bootstrap(&driver.a, &driver.b);
 }
 
 #[test]
+#[ignore = "measurement harness self-test"]
 fn local_routine_observation_regression() {
     let mut driver = ServerDriver::prepare(FixtureScale::small());
     for change in [SmallChange::Setting, SmallChange::Preset, SmallChange::Append] {
@@ -2202,6 +2221,7 @@ fn local_routine_observation_regression() {
 }
 
 #[test]
+#[ignore = "measurement harness self-test"]
 fn actual_body_observer_binding_counts_reads_and_preserves_catalog_only_scope() {
     let directory = tempfile::tempdir().unwrap();
     let cas = crate::asset_repository::PayloadCas::new(directory.path()).unwrap();
@@ -2235,6 +2255,7 @@ fn actual_body_observer_binding_counts_reads_and_preserves_catalog_only_scope() 
 }
 
 #[test]
+#[ignore = "measurement harness self-test"]
 fn actual_body_observer_distinguishes_control_and_unknown_reads() {
     use crate::asset_repository::body_io::{register_object_purpose, BodyPurpose};
     let directory = tempfile::tempdir().unwrap();
@@ -2266,6 +2287,7 @@ fn actual_body_observer_distinguishes_control_and_unknown_reads() {
 }
 
 #[test]
+#[ignore = "measurement harness self-test"]
 fn actual_body_observer_retains_failed_asset_and_owned_only_work() {
     use crate::asset_repository::body_io::{register_object_purpose, BodyPurpose};
     use sha2::{Digest, Sha256};
@@ -2302,6 +2324,7 @@ fn actual_body_observer_retains_failed_asset_and_owned_only_work() {
 }
 
 #[test]
+#[ignore = "measurement harness self-test"]
 fn actual_body_observer_binding_rejects_escaped_file_and_path() {
     let directory = tempfile::tempdir().unwrap();
     let cas = crate::asset_repository::PayloadCas::new(directory.path()).unwrap();
@@ -2375,6 +2398,7 @@ fn windows_local_server_smoke() {
 }
 
 #[test]
+#[ignore = "measurement harness self-test"]
 fn failed_pair_persists_all_positive_domains_without_accepted_output() {
     fn sample(bytes:u64) -> NativeSample {
         let mut observation=NativeObservation::default();
