@@ -237,6 +237,17 @@ describe('LWW renderer save path', () => {
         expect((await store.readRoot()).value).toHaveProperty('opaqueFutureField',{local:true})
     })
 
+    it('applies received chat edit popup and color scheme root settings', async () => {
+        const {database} = await harness()
+        database.risunestChatEditPopup = true
+        const baseline = captureLwwWorkingSetBaseline(database,capturePersistentRoot(database),database.botPresets)
+        const colorScheme = {...database.colorScheme,bgcolor:'#101010'}
+        const reader = {readRoot:async()=>({revision:2,value:{...capturePersistentRoot(database),risunestChatEditPopup:false,colorScheme}})} as unknown as import('./persistentDataStore').PersistentRevisionReader
+        await applyLwwWorkingSetUnits(database,baseline,reader,['["root","risunestChatEditPopup"]','["root","colorScheme"]'])
+        expect(database.risunestChatEditPopup).toBe(false)
+        expect(database.colorScheme).toEqual(colorScheme)
+    })
+
     it('commits plugin units once if their pinned projection loses its revision', async () => {
         const {store,runtime,commit}=await runtimeHarness()
         vi.spyOn(store,'acquireRevision').mockRejectedValueOnce(new Error('pin lost'))
