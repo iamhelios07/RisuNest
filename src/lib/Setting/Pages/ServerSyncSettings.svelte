@@ -40,7 +40,7 @@
         if (writerRecoveryCodes.includes(token)) return language.lwwSync.writerCollision
         if (token === 'unit-too-large') return language.lwwSync.unitTooLarge
         if (token === 'device-credential-unavailable') return copy.credentialUnavailable
-        if (token === 'unauthorized' || token === 'invalid-device-token') return language.lwwSync.registrationRevoked
+        if (token === 'unauthorized' || token === 'invalid-device-token' || token === 'server-epoch-changed') return language.lwwSync.registrationRevoked
         if (token === PREVIOUS_FILES_DOWNLOAD_FAILED) return language.lwwSync.downloadFailedNotConnected
         if (token === 'previous-storage-unavailable') return language.lwwSync.previousStorageUnavailable
         if (token.startsWith('qr-')) return token.includes('permission') ? copy.cameraDenied : copy.cameraUnavailable

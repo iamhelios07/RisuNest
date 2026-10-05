@@ -16,6 +16,22 @@ describe('server LWW foreground scheduler', () => {
         f.scheduler.localChange(true); await vi.advanceTimersByTimeAsync(0); expect(f.push).toHaveBeenCalledTimes(2)
         f.scheduler.dispose()
     })
+    it('publishes on hide before disconnecting, and a return to the foreground waits for that publish', async () => {
+        const f = fixture()
+        let finish!: () => void
+        const publishHidden = vi.fn(() => new Promise<void>(resolve => { finish = resolve }))
+        const scheduler = createServerSyncScheduler({ ...f, publishHidden })
+        await scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0); f.push.mockClear()
+        scheduler.localChange()
+        const hidden = scheduler.foreground(false, true); await vi.advanceTimersByTimeAsync(0)
+        expect(publishHidden).toHaveBeenCalledOnce(); expect(f.disconnect).not.toHaveBeenCalled()
+        await scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0)
+        expect(f.push).not.toHaveBeenCalled()
+        finish(); await hidden; await vi.advanceTimersByTimeAsync(0)
+        expect(f.disconnect).not.toHaveBeenCalled(); expect(f.push).toHaveBeenCalledOnce()
+        await scheduler.foreground(false); expect(publishHidden).toHaveBeenCalledOnce(); expect(f.disconnect).toHaveBeenCalledOnce()
+        scheduler.dispose()
+    })
     it('keeps a stalled receive independent from publication', async () => {
         const f = fixture(); let release!: () => void; f.pull.mockImplementation(() => new Promise<void>(resolve => { release = resolve }))
         await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0); f.push.mockClear()

@@ -19,8 +19,9 @@ vi.mock('../persistentDataRuntime.svelte', () => ({
     getPersistentDataRuntime: () => f.runtime,
     withPausedPersistentWrites: async (_reason: string, operation: (token: unknown) => Promise<unknown>) => operation({ id: 'paused' }),
     beginActivatedLibraryGuard: () => ({ complete() {}, async abortUnchanged() {} }),
-    refreshActivatedLibraryUnderPause: async () => ({ projection: 'applied' }), applyPersistentLwwReceive: async () => {},
+    refreshActivatedLibraryUnderPause: async () => ({ projection: 'applied' }), applyPersistentLwwReceive: async () => {}, flushPendingDataLocally: async () => {},
 }))
+vi.mock('../../mobileBackgroundTask', () => ({ runWithMobileBackgroundTask: (_kind: string, operation: (task: object) => Promise<unknown>) => operation({ progress() {}, async dispose() {} }) }))
 vi.mock('../committedWorkingSetContinuation', () => ({ registerCommittedWorkingSetContinuation: vi.fn() }))
 vi.mock('src/ts/plugins/apiV3/v3.svelte', () => ({ fencePluginExecutionForAuthorityReplacement: async () => {}, invalidatePluginCachesAfterAuthorityReplacement: async () => {}, restartPluginsAfterAuthorityReplacement: async () => {} }))
 vi.mock('../persistentRevisionEvents', () => ({ subscribeLocalPersistentRevision: () => () => {} }))
@@ -30,7 +31,7 @@ vi.mock('@lucide/svelte', () => ({ LoaderCircleIcon: () => {} }))
 vi.mock('./serverSyncRegistrationInbox', () => ({ serverRegistrationInbox: { changed: { subscribe: () => () => {} }, releaseConsumed() {}, take: () => undefined } }))
 vi.mock('./serverSyncQr', () => ({ canScanServerRegistration: false, createServerQrScanner: () => ({ cancel() {} }) }))
 vi.mock('./serverAssetResidency', () => ({ getAssetResidencyStatus: async () => undefined, setAssetResidencyPolicy: vi.fn(), evictLocalAssets: vi.fn(), cancelAssetResidencyOperation: vi.fn() }))
-vi.mock('src/lang', () => ({ language: { loading: 'Loading', lwwSync: { concurrentEditNotice: 'Concurrent edits', clockBlocked: 'Clock blocked', writerCollision: 'Writer blocked', bindingIncomplete: 'Binding incomplete' }, risuNest: { serverSync: { title: 'Sync', description: 'Sync library', connect: 'Connect and sync', syncNow: 'Sync now', disconnect: 'Disconnect', disconnected: 'Stopped', ready: 'Ready', errorHelp: 'Connection failed', management: {}, residency: {} } } } }))
+vi.mock('src/lang', () => ({ language: { loading: 'Loading', lwwSync: { concurrentEditNotice: 'Concurrent edits', clockBlocked: 'Clock blocked', writerCollision: 'Writer blocked', bindingIncomplete: 'Binding incomplete', registrationRevoked: 'Registration revoked' }, risuNest: { serverSync: { title: 'Sync', description: 'Sync library', connect: 'Connect and sync', syncNow: 'Sync now', disconnect: 'Disconnect', disconnected: 'Stopped', ready: 'Ready', errorHelp: 'Connection failed', credentialUnavailable: 'Credential unavailable', registrationCode: 'Registration code', readRegistration: 'Read', management: {}, residency: {} } } } }))
 
 let production: typeof import('./serverSyncProduction')
 let ui: typeof import('svelte')
@@ -156,10 +157,25 @@ describe('persisted server offline startup', () => {
         expect(f.binding).toEqual(before)
     })
     it.each([
+        [{ code: 'unauthorized', status: 401, retryable: false }, 'Registration revoked'],
+        [{ code: 'invalid-device-token', status: 401, retryable: false }, 'Registration revoked'],
+        [{ code: 'server-epoch-changed', status: 409, retryable: false }, 'Registration revoked'],
+        [{ code: 'device-credential-unavailable', status: 409, retryable: false }, 'Credential unavailable'],
+    ])('opens the library and asks for a registration in settings when startup activation fails with %j', async (failure, text) => {
+        f.activationError = failure
+        await expect(production.installServerSyncProduction()).resolves.toBeUndefined()
+        expect(commands()).toContain('server_sync_lww_fence')
+        expect(commands()).not.toContain('server_sync_notify_start'); expect(commands()).not.toContain('pds_lww_switch_target')
+        expect(production.getServerSyncController().snapshot()).toMatchObject({ status: { bound: true }, running: false, paused: true, error: failure.code })
+        await settings()
+        expect(document.body.textContent).toContain(text)
+        expect(document.querySelector('#server-registration')).not.toBeNull()
+        expect(button('Disconnect')).toBeDefined()
+    })
+    it.each([
         { code: 'binding-authority-stale', retryable: false },
         { code: 'server-unreachable', retryable: false },
         { code: 'equal-stamp-integrity', retryable: false },
-        { code: 'unauthorized', status: 401, retryable: false },
         { code: 'local-metadata', status: 503, retryable: true },
         new Error('Local activation state is invalid'),
     ])('rejects non-recoverable or unknown activation failures after fencing startup jobs (%j)', async failure => {
