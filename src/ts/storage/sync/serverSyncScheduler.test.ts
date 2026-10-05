@@ -123,7 +123,20 @@ describe('server LWW foreground scheduler', () => {
         expect(f.retryClock).toHaveBeenCalledOnce()
         f.scheduler.dispose()
     })
-    it.each(['incoming-clock-skew', 'accepted-clock-correction-required', 'writer-collision', 'equal-stamp-integrity'])('never automatically clears %s', async code => {
+    it('rechecks an incoming clock block on foreground and blocks again while the stamp is still ahead', async () => {
+        const f = fixture(); f.pull.mockRejectedValueOnce({ code: 'incoming-clock-skew', retryable: false })
+        await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0)
+        expect(f.scheduler.isBlocked()).toBe(true)
+        await vi.advanceTimersByTimeAsync(120_000); expect(f.retryClock).not.toHaveBeenCalled()
+        f.pull.mockClear(); f.pull.mockRejectedValueOnce({ code: 'incoming-clock-skew', retryable: false })
+        await f.scheduler.foreground(false); await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0)
+        expect(f.retryClock).toHaveBeenCalledOnce(); expect(f.pull).toHaveBeenCalledOnce(); expect(f.scheduler.isBlocked()).toBe(true)
+        f.pull.mockClear()
+        await f.scheduler.conversationOpened(); await vi.advanceTimersByTimeAsync(0)
+        expect(f.retryClock).toHaveBeenCalledTimes(2); expect(f.pull).toHaveBeenCalled(); expect(f.scheduler.isBlocked()).toBe(false)
+        f.scheduler.dispose()
+    })
+    it.each(['accepted-clock-correction-required', 'writer-collision', 'equal-stamp-integrity'])('never automatically clears %s', async code => {
         const f = fixture(); f.push.mockRejectedValueOnce({ code, retryable: false })
         await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0)
         await f.scheduler.foreground(false); await f.scheduler.foreground(true); await f.scheduler.conversationOpened()
