@@ -25,10 +25,6 @@ use tauri::Manager;
 pub(crate) struct PortableSelection {
     pub(crate) library: bool,
     pub(crate) device_sections: Vec<String>,
-    /// Absent brings the whole library; present brings only the records it names, closed over
-    /// what those records refer to.
-    #[serde(default)]
-    pub(crate) items: Option<portable_backup::ArchiveSelection>,
     #[serde(default)]
     pub(crate) allow_source_preservation: bool,
 }
@@ -37,7 +33,6 @@ impl Default for PortableSelection {
         Self {
             library: true,
             device_sections: vec!["hypa".into(), "local-plugins".into(), "local-settings".into()],
-            items: None,
             allow_source_preservation: false,
         }
     }
@@ -52,9 +47,6 @@ pub(crate) struct RestorePreview {
     /// which is the only way a reader learns what to leave out.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) diagnosis: Option<crate::data_health::ScanResult>,
-    /// The records the reader can choose between.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) items: Option<portable_backup::ArchiveInventory>,
 }
 fn restore_preview(
     archive: &VerifiedArchive,
@@ -81,30 +73,24 @@ fn restore_preview(
         })?;
         sections.push(section);
     }
-    let (diagnosis, items) = match archive.manifest.library_included {
+    let diagnosis = match archive.manifest.library_included {
         true => {
             let mut findings = crate::data_health::Findings::new(2000);
             archive.scan_library(&mut findings, probe).map_err(error)?;
-            let items =
-                portable_backup::archive_inventory(&archive.db, &findings.items).map_err(error)?;
-            (
-                Some(crate::data_health::ScanResult::new(
-                    0,
-                    archive_scanned_at(),
-                    crate::data_health::ScanDepth::Deep,
-                    findings,
-                )),
-                Some(items),
-            )
+            Some(crate::data_health::ScanResult::new(
+                0,
+                archive_scanned_at(),
+                crate::data_health::ScanDepth::Deep,
+                findings,
+            ))
         }
-        false => (None, None),
+        false => None,
     };
     Ok(RestorePreview {
         library_included: archive.manifest.library_included,
         repair_required: archive.manifest.repair_required,
         device_sections: sections,
         diagnosis,
-        items,
     })
 }
 
@@ -395,7 +381,7 @@ fn export_portable_running(
     source_build: &str,
 ) -> Result<JobResultSummary, NativeJobError> {
     #[cfg(test)] let _source_observer = portable_backup::source_io::attach(&job.source_io_scope);
-    if !selection.library || selection.items.is_some() || selection.device_sections.len()!=3 || selection.device_sections.iter().cloned().collect::<std::collections::BTreeSet<_>>()
+    if !selection.library || selection.device_sections.len()!=3 || selection.device_sections.iter().cloned().collect::<std::collections::BTreeSet<_>>()
         != ["hypa".to_owned(),"local-plugins".to_owned(),"local-settings".to_owned()].into() {
         return Err(NativeJobError::new("invalid-full-backup-scope","A full backup requires every section"));
     }
@@ -607,12 +593,12 @@ fn restore_portable_inner(
         .and_then(|(_, selection)| selection)
         .unwrap_or(&fallback);
     let context = device.map(|(context, _)| context);
-    if !selection.library || selection.items.is_some() || selection.device_sections.len()!=3 || selection.device_sections.iter().cloned().collect::<std::collections::BTreeSet<_>>()
+    if !selection.library || selection.device_sections.len()!=3 || selection.device_sections.iter().cloned().collect::<std::collections::BTreeSet<_>>()
         != ["hypa".to_owned(),"local-plugins".to_owned(),"local-settings".to_owned()].into() {
         return Err(NativeJobError::new("invalid-full-backup-scope","A full backup requires every section"));
     }
     job.set_replaces_library(selection.library).map_err(error)?;
-    if selection.library && selection.items.is_none() {
+    if selection.library {
         archive.validate_library(&probe).map_err(error)?;
     }
     let mut pins = new_pins_for_job(&store, CasJobKind::LocalBackupRestore, &job.id())?;
@@ -1220,7 +1206,7 @@ mod tests {
         fs::create_dir_all(&owned).unwrap();
         let job = super::super::JobRegistry::default().create(super::super::JobKind::ExportPortableBackup).unwrap();
         job.start(JobPhase::WritingExport).unwrap();
-        let selection = PortableSelection { library: false, device_sections: vec!["local-settings".into()], items: None, allow_source_preservation: false };
+        let selection = PortableSelection { library: false, device_sections: vec!["local-settings".into()], allow_source_preservation: false };
         let failure = export_portable_running(None, 1, &owned, &directory.path().join("handoffs"), store, &job, &selection, "9.8.7-device").unwrap_err();
         assert_eq!(failure.code,"invalid-full-backup-scope");
         assert!(!directory.path().join("handoffs").exists());

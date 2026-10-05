@@ -17,10 +17,6 @@ pub(crate) use validation::{
     ObjectPage, ObjectTotals,
 };
 pub(crate) use restore_inventory::{PreservationReport, RestoreInventory};
-mod selection;
-pub(crate) use selection::{
-    inventory as archive_inventory, ArchiveInventory, ArchiveSelection, PluginKey,
-};
 
 use crate::local_backup::CancellationProbe;
 use crate::persistent_store::StoreError;
@@ -130,6 +126,18 @@ pub(crate) struct Manifest {
 pub(crate) enum Profile {
     Portable,
     SourceSqlite,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PluginKey {
+    pub(crate) owner: String,
+    pub(crate) key: String,
+}
+impl PluginKey {
+    pub(crate) fn identity(&self) -> String {
+        serde_json::to_string(self).expect("plugin identity serialization")
+    }
 }
 
 fn check(probe: &dyn CancellationProbe) -> Result<()> {

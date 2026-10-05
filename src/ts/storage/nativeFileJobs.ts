@@ -489,27 +489,6 @@ export interface NativePortableSelection {
     library: boolean
     deviceSections: NativePortableDeviceSection[]
     allowSourcePreservation?: boolean
-    /** Absent brings the whole library; present brings only the records it names. */
-    items?: NativeArchiveSelection
-}
-/** One record an import can take or leave. */
-export interface NativeArchiveEntry {
-    id: string
-    name: string
-    conversations: number
-    damaged: number
-}
-export interface NativeArchiveInventory {
-    characters: NativeArchiveEntry[]
-    presets: NativeArchiveEntry[]
-    plugins: NativeArchiveEntry[]
-}
-export interface NativeArchiveSelection {
-    characters: string[]
-    presets: string[]
-    plugins: { owner: string; key: string }[]
-    /** Records left out on purpose, whose references come in broken. */
-    excluded: { characters: string[]; presets: string[]; plugins: { owner: string; key: string }[] }
 }
 export interface NativePortableRestorePreview {
     libraryIncluded: boolean
@@ -517,7 +496,6 @@ export interface NativePortableRestorePreview {
     deviceSections: NativePortableDeviceSection[]
     /** What is wrong with the archive's library, even when the gate refuses it. */
     diagnosis?: DataHealthResult
-    items?: NativeArchiveInventory
 }
 
 export type NativeBlockRestoreRuntime = Pick<
@@ -1428,7 +1406,7 @@ async function runNativeReplacementRestore(
                     continue
                 }
                 const requiredSections=['hypa','local-plugins','local-settings'] as const
-                if (!selection.library || selection.items!==undefined || selection.deviceSections.length!==3 || new Set(selection.deviceSections).size!==3 || requiredSections.some(section=>!selection.deviceSections.includes(section)||!status.restorePreview!.deviceSections.includes(section)) || !status.restorePreview.libraryIncluded) {
+                if (!selection.library || selection.deviceSections.length!==3 || new Set(selection.deviceSections).size!==3 || requiredSections.some(section=>!selection.deviceSections.includes(section)||!status.restorePreview!.deviceSections.includes(section)) || !status.restorePreview.libraryIncluded) {
                     throw new NativeFileJobError('invalid-full-backup-scope','A full backup requires every section')
                 }
                 if (options.signal?.aborted) {
