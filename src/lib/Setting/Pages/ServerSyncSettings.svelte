@@ -146,10 +146,12 @@
 {/snippet}
 
 {#snippet connection()}
-    <div class="notice">
-        <TriangleAlertIcon size={16} class="mt-0.5 shrink-0" aria-hidden="true" />
-        <p>{language.lwwSync.concurrentEditNotice}</p>
-    </div>
+    {#if !connected}
+        <div class="notice">
+            <TriangleAlertIcon size={16} class="mt-0.5 shrink-0" aria-hidden="true" />
+            <p>{language.lwwSync.concurrentEditNotice}</p>
+        </div>
+    {/if}
     {#if view.bindingIncomplete}
         <div class="sync-block">
             <p role="status" class="text-sm">{language.lwwSync.bindingIncomplete}</p>

@@ -489,6 +489,17 @@ describe('layout', () => {
         expect(host.querySelector('textarea')).not.toBeNull()
     })
     it.each([
+        { name: 'not connected', view: { status: { configured: false }, paused: false, error: '' }, shown: true },
+        { name: 'left unfinished', view: { status: { configured: true, bound: false }, paused: false, error: '', bindingIncomplete: true }, shown: true },
+        { name: 'connected', view: { status: { configured: true, bound: true }, paused: false, error: '' }, shown: false },
+        { name: 'connected and asked for a new code', view: { status: { configured: true, bound: true }, paused: true, error: 'unauthorized' }, shown: false },
+    ])('warns about concurrent edits only before the device connects, when $name', async ({ view, shown }) => {
+        f.view = view
+        component = mount(ServerSyncSettings, { target: host, props: { connectTarget: vi.fn() } })
+        await settle()
+        expect(host.textContent?.includes(languageEnglish.lwwSync.concurrentEditNotice)).toBe(shown)
+    })
+    it.each([
         { name: 'not connected', view: { status: { configured: false }, paused: false, error: '' }, label: sync.disconnected, tone: 'idle' },
         { name: 'connected', view: { status: { configured: true, bound: true }, paused: false, error: '' }, label: sync.ready, tone: 'connected' },
         { name: 'running', view: { status: { configured: true, bound: true }, paused: false, running: true, error: '' }, label: sync.running, tone: 'working' },
