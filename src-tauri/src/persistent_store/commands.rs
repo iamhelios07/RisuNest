@@ -2244,9 +2244,9 @@ mod tests {
         let mut store = PersistentStore::open(directory.path()).unwrap();
         let tx = store.connection.transaction().unwrap();
         {
-            let mut insert = tx.prepare("INSERT INTO external_storage_capture_files VALUES('scratch-roots',?1,?2)").unwrap();
+            let mut insert = tx.prepare("INSERT INTO external_storage_capture_files(capture_id,catalog_path,file_hash) VALUES(?1,'synthetic-catalog',?2)").unwrap();
             for index in 0..12_000 {
-                insert.execute(rusqlite::params![index.to_string(), format!("{index:064x}")]).unwrap();
+                insert.execute(rusqlite::params![format!("scratch-roots-{index}"), format!("{index:064x}")]).unwrap();
             }
         }
         tx.commit().unwrap();

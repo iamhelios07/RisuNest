@@ -252,7 +252,9 @@ mod tests {
         }
         assert!(store.validate_snapshot_body_receipt(&plan.stage_id, revision + 1, &plan.authority).is_err());
         assert!(store.validate_snapshot_body_receipt(&plan.stage_id, revision, "wrong-binding").is_err());
+        assert_eq!(job.request_cancel().unwrap(), super::super::CancelOutcome::Requested);
         job.finish_cancelled().unwrap();
+        assert_eq!(job.status().state, JobState::Cancelled);
         assert!(job.retains_terminal_receipt_until_forget());
         assert!(plan.source.exists());
         assert_eq!(store.revision().unwrap(), revision);

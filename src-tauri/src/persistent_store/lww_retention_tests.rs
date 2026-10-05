@@ -446,10 +446,11 @@ fn cross_store_quarantine_cannot_abandon_device_or_binding_completion() {
         target: crate::persistent_store::sync_selection::SyncTarget::None, library_id: None, target_id: None, inspection_id: None, initial_publication: false,
     };
     let rows = intent_rows::digest("target", std::iter::empty()).unwrap();
+    let sections = full_device_backup(Some("unapplied-device-restore"));
     let cases = [
         Intent::Target { staging_id: "stage".into(), changes: rows.clone() },
         Intent::Replacement { staging_id: "stage".into(), base_revision: 0, staging_digest: "synthetic".into(), changes: rows, source_units: None,
-            device_sections: Some(Cow::Owned(device_store::sections::freeze_backup_sections(&[]).unwrap())), device_changes: Cow::Owned(vec![]) },
+            device_sections: Some(Cow::Owned(device_store::sections::freeze_backup_sections(&sections.iter().collect::<Vec<_>>()).unwrap())), device_changes: Cow::Owned(vec![]) },
         Intent::Switch { change: change.clone(), new_authority: 1.into() },
         Intent::NewDevice { authorization_id: "authorized".into(), staging_id: "stage".into(), changes: vec![], old_writer_id: "old".into(), writer_id: "new".into(), new_authority: 1.into(), selection_change: change },
     ];
