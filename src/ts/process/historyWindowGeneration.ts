@@ -84,9 +84,10 @@ export async function readStoreMessageMetadata(
     const rows: MessageMetadata[] = []
     for (let startIndex = 0; startIndex < authority.totalMessages;) {
         const limit = Math.min(CONVERSATION_RANGE_MAX_LIMIT, authority.totalMessages - startIndex)
-        const page = await lease.readConversationMessageMetadataWindow(
-            conversationQuery(authority, startIndex, limit),
-        )
+        const page = await lease.readConversationMessageMetadataWindow({
+            ...conversationQuery(authority, startIndex, limit),
+            skipParserWork: true,
+        })
         assertCurrent()
         if (
             !page

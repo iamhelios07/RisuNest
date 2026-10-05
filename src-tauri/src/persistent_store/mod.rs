@@ -736,6 +736,9 @@ pub(crate) struct ConversationWindowQuery {
     pub(crate) before: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) after: Option<i64>,
+    /// Lets a metadata window read report every message as not parser-inert instead of scanning bodies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) skip_parser_work: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
