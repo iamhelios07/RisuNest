@@ -127,7 +127,8 @@ export async function terminationDispatch(phase: string) {
     if (payload.sessionEnd) sessionRequests++;
     note(payload.sessionEnd ? "renderer-session-request" : "renderer-normal-request");
     void report("session-dispatch-renderer-request", {
-      ...snapshot(), sessionEnd: payload.sessionEnd, hasDeadline: payload.deadlineUnixMillis !== undefined,
+      ...snapshot(), sessionEnd: payload.sessionEnd,
+      hasDeadline: typeof payload.deadlineUnixMillis === "number" && Number.isFinite(payload.deadlineUnixMillis),
     }).then(() => handler(payload)).catch(error => report("failure", { message: String(error) }));
   });
   await invoke("macos_bench_main_thread_settled");
