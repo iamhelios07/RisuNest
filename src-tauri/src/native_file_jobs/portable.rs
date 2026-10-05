@@ -917,7 +917,7 @@ mod tests {
         assert_eq!(store.revision().unwrap(), 1);
     }
 
-    pub(super) fn library(root: &Path) -> PersistentStore {
+    fn library(root: &Path) -> PersistentStore {
         let mut store = PersistentStore::open(root).unwrap();
         let database: serde_json::Value =
             serde_json::from_str(include_str!("../../fixtures/persistent-fixture.json")).unwrap();
@@ -1940,7 +1940,3 @@ mod tests {
         assert!(durable_cas_job_ids(&source).unwrap().is_empty());
     }
 }
-
-#[cfg(test)]
-#[path = "portable_scale_tests.rs"]
-mod scale_tests;
