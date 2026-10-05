@@ -1267,7 +1267,7 @@ pub(crate) async fn official_publication_upload_file(
     state: State<'_, PersistentStoreState>,
     request: OfficialPublicationUploadRequest,
 ) -> Result<OfficialPublicationUploadResult, OfficialPublicationUploadError> {
-    crate::native_log::logged_without_detail("official_publication_upload_file", async {
+    crate::publication_upload::logged_upload_outcome("official_publication_upload_file", async {
         let (source, bytes) = with_store(state, |store| {
             store.open_risu_save_export_for_upload(Path::new(&request.path))
         })
