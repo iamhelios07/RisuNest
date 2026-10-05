@@ -640,6 +640,45 @@ export function createPluginDatabaseAccess(
             throw new PluginReadBaselineError('stale')
         })
     }
+    const captureConversationAdmission = (characterIndex: number, conversationId: string): Promise<{
+        characterId: string
+        conversation: Chat | undefined
+    } | null> => {
+        const captured = new Map<string, Chat>()
+        for (const character of dependencies.getCompatibilityDatabase().characters ?? []) {
+            if (readBaselines.hasRead('conversation', JSON.stringify([character.chaId, conversationId]))) continue
+            const conversation = character.chats.find(chat => chat.id === conversationId)
+            if (conversation && !isConversationSummaryStub(conversation)) {
+                captured.set(character.chaId, dependencies.snapshot(conversation))
+            }
+        }
+        const revision = dependencies.getPersistentRevision()
+        const authority = dependencies.getStorageAuthorityEpoch()
+        const pin = dependencies.store.acquireRevision(revision)
+        return pin.then(reader => withPersistentRevisionLease(reader, async reader => {
+            assertPinnedRevision(revision, reader.revision, 'Plugin conversation admission')
+            dependencies.assertPersistentMutationAllowed(authority)
+            const target = await resolvePinnedCharacterTarget(reader, characterIndex)
+            dependencies.assertPersistentMutationAllowed(authority)
+            if (!target) return null
+            if (readBaselines.hasRead('conversation', JSON.stringify([target.characterId, conversationId]))) {
+                return { characterId: target.characterId, conversation: undefined }
+            }
+            let conversation = captured.get(target.characterId)
+            if (!conversation) {
+                const persisted = await reader.readConversation(target.characterId, conversationId)
+                dependencies.assertPersistentMutationAllowed(authority)
+                if (persisted) {
+                    assertPinnedRevision(revision, persisted.revision, 'Plugin conversation admission')
+                    conversation = dependencies.snapshot(persisted.value)
+                }
+            }
+            return { characterId: target.characterId, conversation }
+        })).catch(error => {
+            if (error instanceof PluginReadBaselineError) throw error
+            throw new PluginReadBaselineError('stale')
+        })
+    }
     const captureDatabaseAdmission = (submitted: Record<string, unknown>): Promise<Record<string, unknown>> => {
         const liveHydration = new Map(dependencies.getCompatibilityDatabase().characters?.map(character => [character.chaId, { detail: !isWorkingSetCharacterStub(character), chats: new Set(character.chats.filter(chat => !isConversationSummaryStub(chat)).map(chat => chat.id)) }]))
         const captured = admissionDatabase() as unknown as Record<string, any>
@@ -1032,12 +1071,11 @@ export function createPluginDatabaseAccess(
 
         async setChatToIndex(characterIndex, chatIndex, chat, context) {
             validatePluginCompleteChat(chat)
-            const characterId = dependencies.getCompatibilityDatabase().characters?.[characterIndex]?.chaId
-            const admission = characterId && readBaselines.hasRead('conversation', JSON.stringify([characterId, chat.id])) ? undefined : captureCharacterAdmission(characterId ?? '', characterIndex)
+            const admission = captureConversationAdmission(characterIndex, chat.id!)
             const candidate = snapshotWithProvenance(chat)
             const selectedBoundary = captureSelectedCallBoundary()
             throwIfFullObjectCallAborted(context.signal)
-            const admissionCharacter = admission ? await admission as PluginCompleteCharacter : undefined
+            const admitted = await admission
             await dependencies.flushPendingData('plugin-full-object-write')
             throwIfFullObjectCallAborted(context.signal)
             dependencies.assertPersistentMutationAllowed(selectedBoundary.authorityEpoch)
@@ -1055,7 +1093,8 @@ export function createPluginDatabaseAccess(
                     candidate.id!,
                 )
             }
-            const intents = readBaselines.intent(candidate, 'conversation', JSON.stringify([target.characterId, target.conversationId]), admissionCharacter?.chats?.find(value => value.id === candidate.id) ?? {})
+            if (admitted && admitted.characterId !== target.characterId) throw new PluginReadBaselineError('target')
+            const intents = readBaselines.intent(candidate, 'conversation', JSON.stringify([target.characterId, target.conversationId]), admitted?.conversation ?? {})
             let completeLease: CompleteConversationLease | null = null
             try {
                 completeLease = await acquireSelectedLease(
