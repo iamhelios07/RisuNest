@@ -801,6 +801,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         persistent_store::commands::data_health::pds_data_health_repair_preview,
         persistent_store::commands::data_health::pds_data_health_repair_apply,
         persistent_store::commands::data_health::pds_data_health_discard_intent,
+        persistent_store::commands::data_health::pds_data_health_complete_intent,
         persistent_store::commands::data_health::pds_data_health_journals,
         persistent_store::commands::data_health::pds_data_health_undo,
         native_log::native_log_tail,
