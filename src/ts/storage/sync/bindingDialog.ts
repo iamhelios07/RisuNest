@@ -5,7 +5,7 @@ import { downloadRemoteAssets, getAssetResidencyStatus, type AssetResidencyTarge
 
 const residencyTarget = (context: PreviousStorageFilesContext): AssetResidencyTarget => context.target.kind === 'server'
     ? { kind: 'server', libraryId: context.libraryId, targetId: context.targetId }
-    : context.target
+    : { kind: 'external', connectionId: context.target.connectionId }
 
 export async function confirmSyncBindingReplacement(reason?: ReplacementReason): Promise<boolean> {
     const result = await alertCheckboxConfirm({

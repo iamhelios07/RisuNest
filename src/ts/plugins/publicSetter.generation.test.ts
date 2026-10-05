@@ -1,5 +1,5 @@
 import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 
 const fixture = vi.hoisted(() => ({
     store: null as any,
@@ -246,7 +246,7 @@ describe.each<Mode>(['history-limit', 'complete', 'standard-hypa'])('public chat
     let provider: ReturnType<typeof deferred>
     let started: ReturnType<typeof deferred>
     let initialChat: Chat
-    let output: ReturnType<typeof vi.fn>
+    let output: Mock<(event: any) => Promise<void>>
     let log: ReturnType<typeof vi.spyOn>
     let debug: ReturnType<typeof vi.spyOn>
     let releaseCommit: (() => void) | undefined

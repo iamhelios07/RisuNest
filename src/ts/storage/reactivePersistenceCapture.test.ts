@@ -51,10 +51,10 @@ describe('production reactive persistence captures', () => {
         expect(cached.characterShell!()).toBe(first)
         owner.lastInteraction = 42
         const next = cached.characterShell!()!
-        expect(next.value.metadata).toBe(first.value.metadata)
+        expect((next.value as typeof owner).metadata).toBe((first.value as typeof owner).metadata)
         owner.metadata.nested.value = 'nested edit'
         const edited = cached.characterShell!()!
-        expect(edited.value.metadata).not.toBe(first.value.metadata)
+        expect((edited.value as typeof owner).metadata).not.toBe((first.value as typeof owner).metadata)
         expect((edited.value as any).metadata.nested.value).toBe('nested edit')
         expect((first.value as any).metadata.nested.value.length).toBe(1024 * 1024)
     })

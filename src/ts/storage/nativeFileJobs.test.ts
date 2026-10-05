@@ -1158,7 +1158,7 @@ describe('native file jobs', () => {
                 copyToAndroidSaf: async (request) => {
                     copies.push(request)
                     expect(statuses.at(-1)).toMatchObject({ state: 'running', phase: 'publishing-destination', progress: { completedBytes: 0, totalBytes: 11 } })
-                    request.onProgress?.({ copiedBytes: 5, totalBytes: 11 })
+                    request.onProgress?.({ requestId: 'dataset-publication', operation: 'destination-copy', token: null, copiedBytes: 5, totalBytes: 11 })
                     return { bytes: 11, warningCodes: [] }
                 },
             },

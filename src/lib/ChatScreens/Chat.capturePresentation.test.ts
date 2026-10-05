@@ -1595,7 +1595,7 @@ describe('Chat frozen capture presentation', () => {
             const row = target.querySelector('.risu-chat')
             parserCalls.length = 0
             ;(mounted as { refreshMessageDisplay(state: import('src/ts/chatDisplayRefresh').ChatDisplayRefresh): void })
-                .refreshMessageDisplay({ message: 'Refreshed parser input', totalMessages: 3, index: 2, character: replacement })
+                .refreshMessageDisplay({ message: 'Refreshed parser input', totalMessages: 3, index: 2, character: replacement.chaId })
             await tick()
             expect(target.querySelector('.risu-chat')).toBe(row)
             expect(target.querySelector('[data-chat-body-probe]')).toBe(body)

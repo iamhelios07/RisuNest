@@ -170,7 +170,10 @@ describe('SaveCoordinator', () => {
             first.resolve({ revision: 3 })
             await flushing
             await harness.coordinator.flushPendingData('finish-overlapping-send-recency')
-            expect(commit.mock.calls.map(([request]) => request.unitMutations![0].value)).toEqual([42, 43])
+            expect(commit.mock.calls.map(([request]) => {
+                const mutation = request.unitMutations![0]
+                return 'value' in mutation ? mutation.value : undefined
+            })).toEqual([42, 43])
             expect(harness.readConversationWindow).not.toHaveBeenCalled()
             expect(harness.coordinator.hasPendingPersistenceWork).toBe(false)
         })
