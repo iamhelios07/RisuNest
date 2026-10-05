@@ -1,7 +1,6 @@
 <script lang="ts">
     import type { character, Message } from 'src/ts/storage/database.svelte'
     import Chats from './Chats.svelte'
-    import RegexData from '../SideBars/Scripts/RegexData.svelte'
     import type { ChatViewportHandle, ChatViewportJumpOptions } from 'src/ts/chatViewport'
     import type { ConversationViewportSource } from 'src/ts/conversationViewportSource'
     import type { SelectedConversationOperations } from 'src/ts/selectedConversationOperations'
@@ -18,7 +17,6 @@
         parserProjectionResolver,
         acquireConversationStartParserLease,
         selectedConversationOperations,
-        showRegexEditor = false,
     }: {
         initialMessages?: Message[]
         initialCharacter: character
@@ -29,7 +27,6 @@
             request: LiveChatParserConversationStartRequest,
         ) => Promise<{ release(): void } | null>
         selectedConversationOperations?: SelectedConversationOperations
-        showRegexEditor?: boolean
     } = $props()
 
     let messages = $state<Message[] | undefined>()
@@ -114,9 +111,6 @@
     }
 </script>
 
-{#if showRegexEditor}
-    <div data-regex-editor><RegexData bind:value={currentCharacter.customscript[0]} idx={0} /></div>
-{/if}
 
 <div class="scroll-parent">
     <Chats

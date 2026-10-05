@@ -123,6 +123,7 @@ vi.mock('../UI/GUI/TextAreaInput.svelte', async () => ({ default: (await import(
 import { DBState, ReloadGUIPointer } from 'src/ts/stores.svelte'
 import { setRuntimePerformanceProfile } from 'src/ts/runtimePerformanceProfile'
 import ChatsHarness from './ChatsHarness.test.svelte'
+import ChatsRegexHarness from './ChatsRegexHarness.test.svelte'
 import { chatMountProbe, resetChatMountProbe } from './chatMountProbe.testSupport'
 import { discardEditorDraftsExcept, pendingEditorDrafts } from 'src/ts/chatEditorDrafts'
 import { openTextEditorPopup, textEditorPopup } from 'src/ts/gui/textEditorPopup.svelte'
@@ -503,7 +504,7 @@ describe('Chats imperative mount lifecycle', () => {
         const messages = Array.from({ length: 8 }, (_, index) => makeMessage(index))
         const character = makeCharacter(messages)
         character.customscript = [{ type: 'editdisplay', in: 'before', out: 'after', comment: 'Regex', flag: '', ableFlag: false }]
-        mounted = mount(ChatsHarness, { target, props: { initialMessages: messages, initialCharacter: character, showRegexEditor: true } })
+        mounted = mount(ChatsRegexHarness, { target, props: { initialMessages: messages, initialCharacter: character } })
         await vi.waitFor(() => expect(probeElements(target)).toHaveLength(8))
         await vi.waitFor(() => expect(target.querySelector('[data-regex-editor] button')).not.toBeNull())
         target.querySelector<HTMLButtonElement>('[data-regex-editor] button')!.click()
