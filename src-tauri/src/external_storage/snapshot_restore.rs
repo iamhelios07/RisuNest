@@ -1877,8 +1877,10 @@ impl RestoreBodyPlan {
         digest.update(source.hash.as_bytes());digest.update(source.byte_length.to_le_bytes());
         for chunk in &source.chunks {digest.update(serde_json::to_vec(chunk).map_err(corrupt)?);}
         let identity=hex::encode(digest.finalize());
-        let previous:Option<(u64,String)>=self.db.query_row("SELECT bytes,source FROM bodies WHERE hash=?1",[&source.hash],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(transient)?;
-        if previous.as_ref().is_some_and(|(size,digest)|*size!=source.byte_length || digest!=&identity) {return Err(corrupt("restore body source changed"));}
+        let previous:Option<(i64,String)>=self.db.query_row("SELECT bytes,source FROM bodies WHERE hash=?1",[&source.hash],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(transient)?;
+        if let Some((size,digest))=&previous {
+            if u64::try_from(*size).map_err(corrupt)?!=source.byte_length || digest!=&identity {return Err(corrupt("restore body source changed"));}
+        }
         self.db.execute("INSERT INTO seen VALUES(?1)",[&source.hash]).map_err(corrupt)?;
         self.db.execute("INSERT INTO bodies VALUES(?1,?2,?3,?4,?5,0) ON CONFLICT(hash) DO UPDATE SET priority=excluded.priority,settled=0",
             rusqlite::params![source.hash,i64::try_from(source.byte_length).map_err(corrupt)?,source.chunks.len() as i64,priority,identity]).map_err(corrupt)?;
@@ -1926,12 +1928,14 @@ impl RestoreBodyPlan {
             DELETE FROM packs WHERE id NOT IN(SELECT pack FROM chunks)").map_err(transient)?;
         crate::trust_boundary::sync_directory(&self.directory.join("assembly")).map_err(transient)?;
         self.db.execute_batch("COMMIT").map_err(transient)?;
-        crate::trust_boundary::sync_directory(&self.directory).map_err(transient)
+        crate::trust_boundary::sync_directory(&self.directory).map_err(transient)?;
+        Ok(())
     }
     fn body_path(&self,hash:&str)->PathBuf {self.directory.join("assembly").join(hash)}
     pub(crate) fn ready(&self)->Result<Option<(String,PathBuf)>> {
-        let ready:Option<(String,u64)>=self.db.query_row("SELECT hash,bytes FROM bodies WHERE settled=0 AND remaining=0 ORDER BY priority,hash LIMIT 1",[],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(transient)?;
+        let ready:Option<(String,i64)>=self.db.query_row("SELECT hash,bytes FROM bodies WHERE settled=0 AND remaining=0 ORDER BY priority,hash LIMIT 1",[],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(transient)?;
         ready.map(|(hash,length)| {
+            let length=u64::try_from(length).map_err(corrupt)?;
             let path=self.body_path(&hash);
             if !verify(&path,length,&hash)? {
                 self.db.execute_batch("BEGIN IMMEDIATE").map_err(transient)?;
@@ -1979,7 +1983,7 @@ impl RestoreBodyPlan {
             while let Some(row)=rows.next().map_err(transient)? {
                 cancel.check()?;
                 let hash:String=row.get(0).map_err(transient)?;
-                let offset:u64=row.get(1).map_err(transient)?;
+                let offset=u64::try_from(row.get::<_,i64>(1).map_err(transient)?).map_err(corrupt)?;
                 let chunk:wire::StoredChunk=serde_json::from_str(&row.get::<_,String>(2).map_err(transient)?).map_err(corrupt)?;
                 let bytes=read_chunk(&mut input,remote.plaintext_length,&chunk)?;
                 if output.as_ref().is_none_or(|(current,_)|current!=&hash) {
@@ -2025,7 +2029,7 @@ impl OriginalUnits {
     }
     pub(crate) fn units<'a>(&'a self, content: &'a ContentStore) -> impl Iterator<Item = Result<(risunest_sync_wire::unit::UnitKey, risunest_sync_wire::unit::UnitValue)>> + 'a {
         let mut after = String::new();
-        let mut page = std::collections::VecDeque::<(String,String,u64)>::new();
+        let mut page = std::collections::VecDeque::<(String,String,i64)>::new();
         let mut finished = false;
         std::iter::from_fn(move || {
             if finished { return None; }
@@ -2036,6 +2040,7 @@ impl OriginalUnits {
                         .collect::<std::result::Result<_,_>>().map_err(transient)?;
                 }
                 let Some((key,hash,length)) = page.pop_front() else { return Ok(None); };
+                let length = u64::try_from(length).map_err(corrupt)?;
                 after = key.clone();
                 let unit = decode_original_unit(content,&key,&hash,length)?;
                 Ok(Some((unit.key,unit.value)))
@@ -2179,8 +2184,8 @@ pub(crate) async fn download_original_backup_units(
         while let Some((hash,path))=plan.ready()? {
             let bytes=read_bytes(&path,risunest_sync_wire::MAX_METADATA_BYTES)?;
             content.put(&hash,&bytes).map_err(transient)?;
-            let (unit_key,length):(String,u64)=kept.db.query_row("SELECT key,bytes FROM records WHERE hash=?1",[&hash],|row|Ok((row.get(0)?,row.get(1)?))).map_err(corrupt)?;
-            let unit=decode_original_unit(&content,&unit_key,&hash,length)?;
+            let (unit_key,length):(String,i64)=kept.db.query_row("SELECT key,bytes FROM records WHERE hash=?1",[&hash],|row|Ok((row.get(0)?,row.get(1)?))).map_err(corrupt)?;
+            let unit=decode_original_unit(&content,&unit_key,&hash,u64::try_from(length).map_err(corrupt)?)?;
             #[cfg(test)]
             crate::persistent_store::hash_work::validation(&unit.value);
             unit.value.validate().map_err(corrupt)?;
