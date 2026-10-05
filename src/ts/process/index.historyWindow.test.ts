@@ -129,6 +129,7 @@ import { createMetadataOnlySelectedConversation } from '../storage/selectedConve
 import { DBState, selectedCharID } from '../stores.svelte'
 import { doingChat, openSelectedHistoryWindow, sendChat } from './index.svelte'
 import { findActiveHistoryWindow, getHistoryWindowStart } from './historyWindowIndex'
+import { setChatVarOnConversation } from '../parser/chatVar.svelte'
 
 function messages(count: number): Message[] {
     return Array.from({ length: count }, (_, index): Message => ({
@@ -523,6 +524,38 @@ describe('sendChat with the history window', () => {
         expect(stored.slice(0, 900)).toEqual(messages(900))
         expect(owner.chats[0].scriptstate).toEqual({ $turn: '1' })
         expect(promptContents()).toContain('edited by trigger')
+    })
+
+    it('stores chat variables set while the prompt is built when the send stops before a reply', async () => {
+        const { owner } = installWindowed(messages(1000))
+        const controller = new AbortController()
+        mocks.processScriptFull.mockImplementation(async (_char: unknown, data: string, mode: string) => {
+            if (mode === 'editprocess') {
+                setChatVarOnConversation(findActiveHistoryWindow('character-a', 'chat-a')!.chat, 'mood', 'set')
+            }
+            return { data, emoChanged: false }
+        })
+        mocks.onModelRequest = () => controller.abort()
+        mocks.modelResponse = { type: 'fail', result: 'stopped' }
+
+        await expect(sendChat(-1, { historyLimit: true, signal: controller.signal })).resolves.toBe(false)
+
+        expect(owner.chats[0].scriptstate).toEqual({ $mood: 'set' })
+    })
+
+    it('stores chat variables set before the prompt build failed', async () => {
+        const { owner } = installWindowed(messages(1000))
+        const failure = new Error('synthetic script failure')
+        mocks.processScriptFull.mockImplementation(async (_char: unknown, _data: string, mode: string) => {
+            if (mode !== 'editprocess') throw new Error(`unexpected ${mode}`)
+            setChatVarOnConversation(findActiveHistoryWindow('character-a', 'chat-a')!.chat, 'mood', 'set')
+            throw failure
+        })
+
+        await expect(sendChat(-1, { historyLimit: true })).rejects.toBe(failure)
+
+        expect(mocks.modelRequests).toHaveLength(0)
+        expect(owner.chats[0].scriptstate).toEqual({ $mood: 'set' })
     })
 
     it('writes output trigger edits through the window', async () => {

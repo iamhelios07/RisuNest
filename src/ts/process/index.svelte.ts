@@ -1965,11 +1965,20 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
     } catch (error) {
         promptScriptOperationScope?.finishAfterError()
         promptScriptOperationScope = null
+        try {
+            historyWindow?.controller.reconcileMetadata()
+        } catch {
+            // The original error is the one to report.
+        }
         throw error
     } finally {
         promptScriptOperationScope?.release()
         promptHistoryCompatibilitySnapshot?.dispose()
         promptHistory.dispose()
+    }
+    // Chat variables the prompt build set on the window chat are stored before the request.
+    if (historyWindow && !historyWindow.controller.reconcileMetadata()) {
+        throw new PersistentMutationFencedError()
     }
     console.log(JSON.stringify(chats, null, 2))
 
