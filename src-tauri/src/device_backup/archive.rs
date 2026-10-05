@@ -909,6 +909,7 @@ pub(crate) fn resume_journaled_native_restore(
         for section in &pending { state.section_intent(id,section)?; }
     }
     let committed = store.lww_commit_staged_replacement_with_device_sections(&header,stage,&rows).map_err(device_store_error)?;
+    store.release_replacement_source(stage).map_err(device_store_error)?;
     let phase = state.session(id)?.phase;
     if matches!(phase.as_str(), "applying-device" | "committed") {
         let manifests = state.section_list(id,Spool::Source)?.into_iter().map(|manifest|(manifest.section_id.clone(),manifest)).collect::<BTreeMap<_,_>>();

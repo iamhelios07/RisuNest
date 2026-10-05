@@ -786,8 +786,12 @@ fn native_library_stage_survives_reopen_and_marker_prevents_second_activation() 
     original.replace_put_root(&original_stage, &serde_json::json!({"username":"restored"})).unwrap();
     original.replace_commit(&original_stage, Some(0)).unwrap();
     let lease = original.lww_acquire_library_backup_capture(original.revision().unwrap()).unwrap().lease;
-    let units = original.lww_backup_unit_values(&lease).unwrap();
+    let mut units = original.lww_backup_unit_values(&lease).unwrap();
     original.release_revision(&lease).unwrap();
+    units.insert(
+        risunest_sync_wire::unit::UnitKey::new(&["future-unit", "synthetic"]).unwrap(),
+        risunest_sync_wire::unit::UnitValue::inline(br#""synthetic opaque unit""#).unwrap(),
+    );
     let source = capture_prepared_native_sections(&mut original, &selected, &NeverCancelled).unwrap();
     let rollback =
         capture_prepared_native_sections(&mut store, &selected, &NeverCancelled).unwrap();
@@ -849,6 +853,7 @@ fn native_library_stage_survives_reopen_and_marker_prevents_second_activation() 
         resume_journaled_native_restore(&recovered, &id, &mut reopened).unwrap(),
         1
     );
+    assert_eq!(reopened.replacement_source_rows(&stage).unwrap(), 0);
     assert_eq!(reopened.revision().unwrap(), 1);
     assert_eq!(
         reopened.read_root(None).unwrap().value["username"],

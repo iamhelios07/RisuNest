@@ -1,8 +1,8 @@
 //! Source units of a replacement, staged as rows of its staging generation so a
 //! commit reads them by key instead of holding them all in memory. Layer 0 keeps
 //! the units as they were staged; layer 1 keeps them after an identity remap.
-//! The rows go with the generation: an abort or the purge of a retired library
-//! deletes them.
+//! A committed replacement releases its rows, and an abort or the purge of a
+//! retired library deletes any that remain.
 
 use super::{error, intent_rows, projection, wire};
 use crate::persistent_store::{PersistentStore, StoreResult};
@@ -169,6 +169,14 @@ impl PersistentStore {
         Ok(ReplacementSourceWriter { tx, generation: generation.to_owned() })
     }
 
+    /// Deletes the source units staged for `generation` once its replacement
+    /// committed. A commit that is retried stages them again first.
+    pub(crate) fn release_replacement_source(&mut self, generation: &str) -> StoreResult<()> {
+        let tx = self.connection.transaction()?;
+        clear(&tx, generation, None)?;
+        Ok(tx.commit()?)
+    }
+
     /// The source units staged for `generation`, in key order.
     pub(crate) fn replacement_source_units(&self, generation: &str) -> Units<'_> {
         units(&self.connection, SourceLayer::staged(generation))
@@ -185,6 +193,11 @@ impl PersistentStore {
             writer.put(key, value)?;
         }
         writer.finish()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replacement_source_row_total(&self) -> StoreResult<i64> {
+        Ok(self.connection.query_row("SELECT COUNT(*) FROM replacement_source_units", [], |row| row.get(0))?)
     }
 
     #[cfg(test)]

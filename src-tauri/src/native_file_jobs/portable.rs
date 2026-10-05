@@ -677,6 +677,7 @@ fn restore_portable_inner(
                 let header = crate::persistent_store::lww::Header { binding_authority: store.lww_binding_authority().map_err(error)?, request_id: job.id() };
                 let result = store.lww_commit_staged_replacement(&header,&stage.staging_id).map_err(error)?;
                 committed = true;
+                store.release_replacement_source(&stage.staging_id).map_err(error)?;
                 result.revision
             };
             job.publish_portable_activation(final_revision, store.lww_binding_authority().map_err(error)?.0.to_string()).map_err(error)?;
@@ -1740,6 +1741,7 @@ mod tests {
             .snapshot_list()
             .unwrap()
             .is_empty());
+        assert_eq!(PersistentStore::open(&target).unwrap().replacement_source_row_total().unwrap(), 0);
         let mut store = PersistentStore::open(&target).unwrap();
         let mut pins =
             new_pins(&store, CasJobKind::OfficialPublicationOrExportPreparation).unwrap();

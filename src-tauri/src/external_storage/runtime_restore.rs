@@ -846,6 +846,7 @@ fn prepare_local_restore_in_store(
     let revision = store.lww_commit_staged_replacement_with_device_sections(
         &intent.header,&intent.staging_id,&prepared_sections.iter().collect::<Vec<_>>(),
     ).map_err(pds_error)?;
+    store.release_replacement_source(&intent.staging_id).map_err(pds_error)?;
     drop(prepared);
     drop(maintenance);
     cleanup_staging(&staging_root);
@@ -1367,6 +1368,7 @@ pub(super) mod tests {
             let admission=Arc::new(crate::native_file_jobs::admission::Admission::default());
             let state=PersistentStoreState::default();
             let (receipt,permit)=activate_database_first_backup(&mut store,&state,&job,database,sections,Cancellation::default(),admission.staging().unwrap()).unwrap();
+            assert_eq!(store.replacement_source_row_total().unwrap(),0);
             // Bodies that arrive locally before the transfer are pinned in place, the rest are downloaded.
             let local=crate::asset_repository::PayloadCas::new(root).unwrap();
             for body in bodies.iter().step_by(3) {local.prepare_bytes(body).unwrap();}
