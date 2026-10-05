@@ -468,7 +468,8 @@ export interface SelectedHistoryWindow {
  * Opens a history window over the selected conversation for a chat-screen
  * step that runs outside generation: the token window, or with `tailStart`
  * the messages from the absolute index it returns. A registered window is
- * what CBS, Lua and regex read while the step runs.
+ * what CBS, Lua and regex read while the step runs. Returns null when the
+ * conversation changed while the window was read.
  */
 export async function openSelectedHistoryWindow(options: {
     tailStart?: (totalMessages: number) => number
@@ -487,13 +488,19 @@ export async function openSelectedHistoryWindow(options: {
         }
         return sameConversationTarget(captureSelectedConversationTarget(), target)
     }
-    const window = await prepareGenerationHistoryWindow(
-        target,
-        'none',
-        isTargetCurrent,
-        options.signal ?? new AbortController().signal,
-        options.tailStart,
-    )
+    let window: GenerationHistoryWindow | null
+    try {
+        window = await prepareGenerationHistoryWindow(
+            target,
+            'none',
+            isTargetCurrent,
+            options.signal ?? new AbortController().signal,
+            options.tailStart,
+        )
+    } catch (error) {
+        if (!(error instanceof PersistentMutationFencedError)) throw error
+        window = null
+    }
     if (!window) return null
     const unregister = options.register
         ? registerActiveHistoryWindow({
@@ -923,13 +930,22 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
             : 'history-window'
         const boundedAdmission = boundedFallbackReason === null
         if (historyWindowMemory !== null) {
-            historyWindow = await prepareGenerationHistoryWindow(
-                target,
-                historyWindowMemory,
-                lifecycle.isTargetCurrent,
-                abortSignal,
-            )
-            if (!historyWindow) return false
+            try {
+                historyWindow = await prepareGenerationHistoryWindow(
+                    target,
+                    historyWindowMemory,
+                    lifecycle.isTargetCurrent,
+                    abortSignal,
+                )
+            } catch (error) {
+                if (!(error instanceof PersistentMutationFencedError)) throw error
+            }
+            if (!historyWindow) {
+                if (lifecycle.isTargetCurrent() && !abortSignal.aborted) {
+                    alertError(language.chatConversationActionFailed)
+                }
+                return false
+            }
             const unbind = bindWindowedGenerationController(historyWindow.chat, historyWindow.controller)
             const unregister = registerActiveHistoryWindow({
                 characterId: historyWindow.characterId,

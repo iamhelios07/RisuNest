@@ -378,6 +378,23 @@
         return getHistoryWindowMemoryMode(true) !== null
     }
 
+    function isSelectedConversationTarget(
+        target: { characterId: string, conversationId: string, navigationGeneration: number },
+    ): boolean {
+        const current = persistentRuntime.captureSelectedConversationTarget()
+        return current?.characterId === target.characterId &&
+            current.conversationId === target.conversationId &&
+            current.navigationGeneration === target.navigationGeneration
+    }
+
+    // A history window that does not open stops the step; tell the user unless they moved away.
+    function reportUnopenedHistoryWindow(
+        target: { characterId: string, conversationId: string, navigationGeneration: number },
+        message = language.chatConversationActionFailed,
+    ): void {
+        if (isSelectedConversationTarget(target)) alertError(message)
+    }
+
     // The input step of a send with the loading limit on runs over a history
     // window, so the conversation is not loaded complete before generation.
     async function sendMainWindowed(
@@ -393,7 +410,10 @@
             input += `{{inlayed::${file}}}`
         }
         const window = await openSelectedHistoryWindow({ register: true })
-        if (!window) return
+        if (!window) {
+            reportUnopenedHistoryWindow(target)
+            return
+        }
         try {
             const name = $ConnectionOpenStore ? DBState.db.username : null
             if (input === '') {
@@ -432,12 +452,7 @@
         }
         await persistentRuntime.flushPendingData('generation-input')
         await sleep(10)
-        const current = persistentRuntime.captureSelectedConversationTarget()
-        if (
-            current?.characterId !== target.characterId ||
-            current.conversationId !== target.conversationId ||
-            current.navigationGeneration !== target.navigationGeneration
-        ) return
+        if (!isSelectedConversationTarget(target)) return
         updateInputSizeAll()
         await sendChatMainRaw(continueResponse)
     }
@@ -600,21 +615,23 @@
     async function rerollWindowed(signal: AbortSignal, expectedLastMessage?: string) {
         const target = persistentRuntime.captureSelectedConversationTarget()
         if (!target) return
-        const isCurrent = () => {
-            const current = persistentRuntime.captureSelectedConversationTarget()
-            return current?.characterId === target.characterId &&
-                current.conversationId === target.conversationId &&
-                current.navigationGeneration === target.navigationGeneration
-        }
         const result = await generateWindowedResponseCandidate({
             open: openResponseTailWindow,
-            isCurrent,
+            isCurrent: () => isSelectedConversationTarget(target),
             createId: v4,
             flush: () => persistentRuntime.flushPendingData('reroll-candidate'),
             generate: () => sendChat(-1, { signal, historyLimit: true }),
             aborted: () => signal.aborted,
             expectedLastMessage,
         })
+        if (!result) {
+            reportUnopenedHistoryWindow(target)
+            return
+        }
+        if (result.reopenFailed) {
+            if (!signal.aborted) reportUnopenedHistoryWindow(target, language.generationConversationChanged)
+            return
+        }
         if (result.completed) {
             await persistentRuntime.acknowledgeGenerationCompletion()
             await notifyGenerationCompletion(result.lastMessage ?? '')
@@ -623,13 +640,17 @@
     }
 
     async function moveCandidateWindowed(direction: -1 | 1) {
+        const target = persistentRuntime.captureSelectedConversationTarget()
+        if (!target) return null
         try {
-            return await moveWindowedResponseCandidate(
+            const move = await moveWindowedResponseCandidate(
                 openResponseTailWindow,
                 direction,
                 v4,
                 () => persistentRuntime.flushPendingData('select-response-candidate'),
             )
+            if (!move) reportUnopenedHistoryWindow(target)
+            return move
         } catch (error) {
             if (!(error instanceof PersistentMutationFencedError)) alertError(error)
             return null

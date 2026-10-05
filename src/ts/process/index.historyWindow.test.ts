@@ -46,6 +46,7 @@ vi.mock('../tokenizer', async () => (await import('./tests/sendChatTestHarness')
 }))
 vi.mock('../../lang', async () => (await import('./tests/sendChatTestHarness')).langModule({
     generationConversationChanged: 'conversation changed',
+    chatConversationActionFailed: 'conversation action failed',
 }))
 vi.mock('../alert', async () => (await import('./tests/sendChatTestHarness')).alertModule({
     alertError: mocks.alertError,
@@ -570,6 +571,33 @@ describe('sendChat with the history window', () => {
         expect(promoted.at(-1)?.data).toBe('answer')
         expect(promoted.slice(0, 1000)).toEqual(messages(1000))
         expect(mocks.alertError).not.toHaveBeenCalled()
+    })
+
+    it('tells the user when no window opens because pending edits could not be saved', async () => {
+        installWindowed(messages(1000))
+        mocks.selectedAuthority.sessionVersion = 1
+
+        await expect(sendChat(-1, { historyLimit: true })).resolves.toBe(false)
+
+        expect(mocks.flushPendingData).toHaveBeenCalledWith('generation-history-window')
+        expect(mocks.modelRequests).toHaveLength(0)
+        expect(mocks.alertError).toHaveBeenCalledWith('conversation action failed')
+    })
+
+    it('tells the user when the conversation changes while the window is read', async () => {
+        const stored = messages(1000)
+        const { lease } = installWindowed(stored)
+        const read = lease.readConversationWindow
+        lease.readConversationWindow = async (input: any) => {
+            const page = await read(input)
+            mocks.selectedAuthority = { ...mocks.selectedAuthority, sessionVersion: 1, persistedSessionVersion: 1 }
+            return page
+        }
+
+        await expect(sendChat(-1, { historyLimit: true })).resolves.toBe(false)
+
+        expect(mocks.modelRequests).toHaveLength(0)
+        expect(mocks.alertError).toHaveBeenCalledWith('conversation action failed')
     })
 
     it('refuses to write the response when the promoted conversation no longer holds the window', async () => {

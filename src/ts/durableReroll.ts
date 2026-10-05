@@ -285,17 +285,29 @@ interface GenerateWindowedResponseCandidateOptions
     expectedLastMessage?: string
 }
 
+export interface WindowedResponseCandidateResult {
+    completed: boolean
+    lastMessage?: string
+    /**
+     * The generation succeeded but the tail could not be opened again to store
+     * the candidate. The stored recovery restores the previous response.
+     */
+    reopenFailed?: boolean
+}
+
 /**
  * Generates a candidate over tail windows. The window is closed while the
  * generation writes the conversation and reopened from the same absolute
- * start afterwards.
+ * start afterwards. Returns null when no tail window opens.
  */
 export async function generateWindowedResponseCandidate(
     options: GenerateWindowedResponseCandidateOptions,
-): Promise<{ completed: boolean; lastMessage?: string }> {
+): Promise<WindowedResponseCandidateResult | null> {
     let window = await openResponseTail(options.open)
-    if (!window) return { completed: false }
+    if (!window) return null
     const start = window.controller.absoluteStartIndex
+    let generated = false
+    let reopenFailed = false
     try {
         if (
             options.expectedLastMessage !== undefined &&
@@ -307,18 +319,21 @@ export async function generateWindowedResponseCandidate(
             chat: window.chat,
             currentChat: async () => {
                 if (window) return window.chat
-                if (!options.isCurrent()) return undefined
+                // A failed reopen is not retried, so the recovery stays stored as it is.
+                if (reopenFailed || !options.isCurrent()) return undefined
                 window = await options.open(() => start)
-                if (!window) throw new PersistentMutationFencedError()
-                return window.chat
+                if (!window) reopenFailed = true
+                return window?.chat
             },
             session: () => window?.controller ?? null,
-            generate: () => {
+            generate: async () => {
                 window?.release()
                 window = null
-                return options.generate()
+                generated = await options.generate()
+                return generated
             },
         })
+        if (reopenFailed && generated) return { completed: false, reopenFailed: true }
         return { completed, lastMessage: window?.chat.message.at(-1)?.data }
     } finally {
         window?.release()

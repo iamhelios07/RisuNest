@@ -288,6 +288,39 @@ describe('response candidates over a history window', () => {
         expect(conversation.stored.metadata.rerollRecovery).toBeUndefined()
     })
 
+    it('returns null when no tail window opens', async () => {
+        const conversation = storedConversation(longConversation(10))
+        expect(await generateWindowedResponseCandidate({
+            ...conversation.options,
+            open: async () => null,
+            generate: async () => {
+                throw new Error('must not generate')
+            },
+        })).toBeNull()
+    })
+
+    it('keeps the stored recovery when the tail cannot be reopened after the generation', async () => {
+        const conversation = storedConversation(longConversation(100))
+        const open = conversation.options.open
+        let generated = false
+        const result = await generateWindowedResponseCandidate({
+            ...conversation.options,
+            open: async (tailStart) => generated ? null : open(tailStart),
+            generate: async () => {
+                const output = message('new')
+                conversation.stored.metadata.rerollRecovery!.outputs[output.chatId!] = structuredClone(output)
+                conversation.stored.messages.push(output)
+                generated = true
+                return true
+            },
+        })
+
+        expect(result).toEqual({ completed: false, reopenFailed: true })
+        expect(conversation.stored.metadata.rerollRecovery).toMatchObject({ phase: 'generating', startIndex: 99 })
+        const reopened = { ...structuredClone(conversation.stored.metadata), message: structuredClone(conversation.stored.messages) } as Chat
+        expect(recoverRerollMessages(reopened).slice(98).map((entry) => entry.data)).toEqual(['m98', 'm99'])
+    })
+
     it('does nothing when the last message changed after confirmation', async () => {
         const conversation = storedConversation(longConversation(10))
         const before = structuredClone(conversation.stored)

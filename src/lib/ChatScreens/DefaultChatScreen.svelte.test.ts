@@ -8,6 +8,7 @@ import DefaultChatScreen from './DefaultChatScreen.svelte'
 const mocks = vi.hoisted(() => ({ trigger: vi.fn(), generate: vi.fn(), process: vi.fn(), error: vi.fn(), postFile: vi.fn(),
     bounded: false, appended: [] as any[], acquireComplete: vi.fn(), flush: vi.fn(async () => {}),
     historyLimit: false, openWindow: vi.fn(), notify: vi.fn(async () => {}), scope: { finish: vi.fn(), release: vi.fn() }, createScope: vi.fn(),
+    chatsProps: null as any, confirm: vi.fn(async () => false),
     target: { characterId: 'character', conversationId: 'chat', navigationGeneration: 1, storeRevision: 1, sessionToken: 'windowed' },
 }))
 vi.mock('src/lang', () => ({ language: languageEnglish }))
@@ -20,7 +21,7 @@ vi.mock('src/ts/stores.svelte', () => {
 vi.mock('src/ts/process/index.svelte', () => ({ doingChat: writable(false), chatProcessStage: writable(0), sendChat: mocks.generate, getSelectedBoundedGenerationFallbackReason: () => mocks.bounded ? null : 'test-complete-conversation',
     getHistoryWindowMemoryMode: (historyLimit: boolean) => historyLimit && mocks.historyLimit ? 'none' : null, openSelectedHistoryWindow: mocks.openWindow, notifyGenerationCompletion: mocks.notify }))
 vi.mock('src/ts/util', () => ({ sleep: async () => {}, getPersonaPrompt: () => '' }))
-vi.mock('src/ts/alert', () => ({ alertError: mocks.error }))
+vi.mock('src/ts/alert', () => ({ alertError: mocks.error, alertConfirm: mocks.confirm }))
 vi.mock('src/ts/translator/translator', () => ({}))
 vi.mock('src/ts/process/scripts', () => ({ processScript: mocks.process, createPromptScriptOperationScope: mocks.createScope }))
 vi.mock('src/ts/process/triggers', () => ({ runTrigger: mocks.trigger }))
@@ -55,7 +56,10 @@ vi.mock('src/ts/gui/colorscheme', () => ({ ColorSchemeTypeStore: writable('dark'
 vi.mock('src/ts/plugins/plugins.svelte', () => ({ pluginV2: { editdisplay: new Set() } }))
 vi.mock('src/ts/parser/parser.svelte', () => ({}))
 vi.mock('./Suggestion.svelte', () => ({ default: () => {} }))
-vi.mock('./Chats.svelte', () => ({ default: () => ({ jumpTo: async () => true }) }))
+vi.mock('./Chats.svelte', () => ({ default: (_anchor: unknown, props: unknown) => {
+    mocks.chatsProps = props
+    return { jumpTo: async () => true }
+} }))
 vi.mock('./AssetInput.svelte', () => ({ default: () => {} }))
 vi.mock('./InlayFilePreview.svelte', () => ({ default: () => {} }))
 vi.mock('./ChatScreenshotCaptureSurface.svelte', () => ({ default: () => {} }))
@@ -271,4 +275,67 @@ it('rerolls over a tail window when the loading limit is on', async () => {
     expect(mocks.acquireComplete).not.toHaveBeenCalled()
     expect(mocks.error).not.toHaveBeenCalled()
     expect(mocks.notify).toHaveBeenCalledWith('new')
+})
+
+it('tells the user when no history window opens for the input step', async () => {
+    mocks.historyLimit = true
+    mocks.openWindow.mockResolvedValue(null)
+    const input = type('Hello')
+    send()
+    await vi.waitFor(() => expect(mocks.error).toHaveBeenCalledWith(languageEnglish.chatConversationActionFailed))
+    expect(mocks.error).toHaveBeenCalledOnce()
+    expect(mocks.generate).not.toHaveBeenCalled()
+    expect(input.value).toBe('Hello')
+})
+
+it('tells the user when no tail window opens for a reroll', async () => {
+    mocks.historyLimit = true
+    mocks.openWindow.mockResolvedValue(null)
+    type('').dispatchEvent(new KeyboardEvent('keydown', { key: 'm', ctrlKey: true, bubbles: true }))
+    await vi.waitFor(() => expect(mocks.error).toHaveBeenCalledWith(languageEnglish.chatConversationActionFailed))
+    expect(mocks.error).toHaveBeenCalledOnce()
+    expect(mocks.generate).not.toHaveBeenCalled()
+})
+
+it.each([
+    ['next', 'onNextReroll'],
+    ['previous', 'unReroll'],
+])('tells the user when no tail window opens for the %s candidate', async (_name, prop) => {
+    mocks.historyLimit = true
+    mocks.openWindow.mockResolvedValue(null)
+    await mocks.chatsProps[prop]()
+    expect(mocks.error).toHaveBeenCalledWith(languageEnglish.chatConversationActionFailed)
+    expect(mocks.error).toHaveBeenCalledOnce()
+    expect(mocks.confirm).not.toHaveBeenCalled()
+})
+
+it('tells the user when the tail cannot be reopened after a reroll generated a reply', async () => {
+    mocks.historyLimit = true
+    const store: any[] = stored(40)
+    let opens = 0
+    mocks.openWindow.mockImplementation(async ({ tailStart }) => ++opens > 1 ? null : windowOver(store, tailStart(store.length)))
+    mocks.generate.mockImplementation(async () => {
+        store.push({ role: 'char', data: 'new', chatId: 'new' })
+        return true
+    })
+    type('').dispatchEvent(new KeyboardEvent('keydown', { key: 'm', ctrlKey: true, bubbles: true }))
+    await vi.waitFor(() => expect(mocks.error).toHaveBeenCalledWith(languageEnglish.generationConversationChanged))
+    expect(mocks.error).toHaveBeenCalledOnce()
+    expect(mocks.notify).not.toHaveBeenCalled()
+    // The recovery stays stored, so opening the conversation restores the original response.
+    expect(store.at(-1)?.data).toBe('new')
+})
+
+it('rerolls with a user message last by reading only the newest messages', async () => {
+    mocks.historyLimit = true
+    const store: any[] = [...stored(40), { role: 'user', data: 'question', chatId: 'question' }]
+    mocks.openWindow.mockImplementation(async ({ tailStart }) => windowOver(store, tailStart(store.length)))
+    const before = structuredClone(store)
+    type('').dispatchEvent(new KeyboardEvent('keydown', { key: 'm', ctrlKey: true, bubbles: true }))
+    await vi.waitFor(() => expect(mocks.openWindow).toHaveBeenCalled())
+    await tick()
+    for (const [options] of mocks.openWindow.mock.calls) expect(options.tailStart(store.length)).toBeGreaterThan(30)
+    expect(mocks.generate).not.toHaveBeenCalled()
+    expect(mocks.error).not.toHaveBeenCalled()
+    expect(store).toEqual(before)
 })
