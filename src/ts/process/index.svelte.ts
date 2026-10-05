@@ -2480,7 +2480,9 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
     let requestSourceMessages = requestSourceConversation.message
     let requestSourceSession = getActiveConversationSession()
     let requestSourceSessionVersion = requestSourceSession?.version
+    let requestSourceLost = false
     const isRequestSourceCurrent = () =>
+        !requestSourceLost &&
         lifecycle.isTargetCurrent() &&
         get(selectedCharID) === requestSourceCharacterIndex &&
         DBState.db.characters[requestSourceCharacterIndex]?.chaId === requestSourceCharacterId &&
@@ -2502,25 +2504,47 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
         characterId: requestSourceCharacterId,
         conversationId: requestSourceConversation.id ?? '',
     }, {
-        isCurrent: isRequestSourceCurrent,
-        async adopt() {
+        prepare() {
+            if (!isRequestSourceCurrent()) return null
+            const session = getActiveConversationSession()
+            if (!session) return null
+            const version = session.version
+            const invalidationVersion = session.generationInvalidationVersion
+            return () => lifecycle.isTargetCurrent() && !abortSignal.aborted
+                && getActiveConversationSession() === session
+                && session.canContinueGenerationFrom(version)
+                && session.generationInvalidationVersion === invalidationVersion
+        },
+        invalidate: () => { requestSourceLost = true },
+        async adopt(receipt) {
             const target = captureSelectedConversationTarget()
-            const expectedSession = getActiveConversationSession()
-            const expectedVersion = expectedSession?.version
+            const expectedSession = receipt.session
+            const expectedVersion = receipt.sessionVersion
+            const receiptIsCurrent = () => expectedSession?.isActive
+                && getActiveConversationSession() === expectedSession
+                && expectedVersion !== null
+                && expectedSession.canContinueGenerationFrom(expectedVersion)
+                && expectedSession.generationInvalidationVersion === receipt.generationInvalidationVersion
+                && getPersistentStorageAuthorityEpoch() === receipt.authorityEpoch
+                && receipt.target && sameConversationTarget(captureSelectedConversationTarget(), receipt.target)
             if (!lifecycle.isTargetCurrent() || abortSignal.aborted || !target
-                || !expectedSession?.isActive
+                || !receiptIsCurrent()
                 || target.characterId !== requestSourceCharacterId
-                || target.conversationId !== requestSourceConversation.id) return
+                || target.conversationId !== requestSourceConversation.id) {
+                requestSourceLost = true
+                return
+            }
             let lease: CompleteConversationLease
             try {
                 lease = await acquireCompleteConversation('generation-public-write', target)
             } catch (error) {
-                if (error instanceof SelectedConversationPromotionStaleError) return
+                if (error instanceof SelectedConversationPromotionStaleError) { requestSourceLost = true; return }
                 throw error
             }
             if (!lifecycle.isTargetCurrent() || abortSignal.aborted
                 || lease.session !== expectedSession
-                || !lease.session.canContinueGenerationFrom(expectedVersion!)) {
+                || !receiptIsCurrent()) {
+                requestSourceLost = true
                 lease.release()
                 return
             }

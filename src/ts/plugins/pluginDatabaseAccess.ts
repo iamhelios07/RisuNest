@@ -8,6 +8,7 @@ import type {
     SelectedConversationTarget,
 } from '../storage/activeWorkingSet.svelte'
 import type { ActiveConversationSession } from '../storage/activeConversationSession'
+import type { PersistentUnitIntentProjectionObserver } from '../storage/persistentDataRuntime'
 import { getPersistentDataStore } from '../storage/persistentDataStoreFactory'
 import { isWorkingSetCharacterStub } from '../storage/workingSetCatalog'
 import type {
@@ -155,6 +156,7 @@ export interface PluginDatabaseAccessDependencies {
         units: readonly PluginUnitMutation[],
         conversations?: readonly ConversationMutation[],
         wholeMessages?: readonly PluginWholeMessageIntent[],
+        projectionObserver?: PersistentUnitIntentProjectionObserver,
     ): Promise<void>
     flushPendingData(reason: string): Promise<void>
     getCompatibilityDatabase(): Database
@@ -1111,7 +1113,11 @@ export function createPluginDatabaseAccess(
                 readBaselines.assertOpen()
                 const changes = pluginUnitIntents(intents, 'conversation', dependencies.owner, candidate, target.characterId, target.conversationId)
                 publicWrite?.prepare(target)
-                await dependencies.commitPersistentUnitIntent('plugin-setChatToIndex', changes.units, [], changes.wholeMessages)
+                if (publicWrite) {
+                    await dependencies.commitPersistentUnitIntent('plugin-setChatToIndex', changes.units, [], changes.wholeMessages, publicWrite)
+                } else {
+                    await dependencies.commitPersistentUnitIntent('plugin-setChatToIndex', changes.units, [], changes.wholeMessages)
+                }
                 committed = true
                 if (!completeLease) {
                     invalidateLeaselessSelectedWrite(
