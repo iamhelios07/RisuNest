@@ -43,6 +43,8 @@
     "desktop:test-boundary:agent": "node tests/native/run.mjs",
     "desktop:dev:agent": "tauri dev --config src-tauri/tauri.agent.conf.json",
     "desktop:build:agent": "tauri build --config src-tauri/tauri.agent.conf.json -- --locked",
+    "desktop:build:local": "node scripts/buildLocal.mjs",
+    "desktop:build:local:agent": "node scripts/buildLocal.mjs --agent",
     "sync:windows:build": "node server/manager/install/local-build.mjs --target x86_64-pc-windows-msvc",
     "sync:linux:build": "node server/manager/install/local-build.mjs --target x86_64-unknown-linux-gnu",
     "sync:macos:build": "node server/manager/install/local-build.mjs --target aarch64-apple-darwin",
