@@ -1847,10 +1847,12 @@ async function runLuaEditTriggerBatch<T extends string | OpenAIChat[]>(
             ? findActiveHistoryWindow(char.chaId, getCurrentChat()?.id)
             : null
         const sourceCurrent = historyWindow?.isCurrent()
+        const sourceVersion = historyWindow?.mutationVersion
         const sourceMessages = historyWindow ? [...historyWindow.chat.message] : null
         const createWindowChat = historyWindow ? () => {
             if (!historyWindowCopy) {
                 if (!sourceCurrent || !historyWindow.isCurrent()
+                    || sourceVersion !== historyWindow.mutationVersion
                     || sourceMessages!.length !== historyWindow.chat.message.length
                     || sourceMessages!.some((message, index) => historyWindow.chat.message[index] !== message)) {
                     throw new PersistentMutationFencedError()

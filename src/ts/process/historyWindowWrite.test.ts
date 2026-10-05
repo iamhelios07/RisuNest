@@ -4,6 +4,7 @@ import type { WindowedConversationMutationController } from '../storage/activeWo
 import type { Chat, Message } from '../storage/database.svelte'
 import { diffHistoryWindow, openHistoryWindowCopy, writeHistoryWindow } from './historyWindowWrite'
 import { captureGenerationConversationOperation } from './generationConversationOperation'
+import { createHistoryWindowController } from './historyWindowController'
 
 const message = (data: string): Message => ({ role: 'user', data, chatId: `id-${data}` })
 const list = (...values: string[]) => values.map(message)
@@ -54,6 +55,23 @@ describe('diffHistoryWindow', () => {
 })
 
 describe('writeHistoryWindow', () => {
+    it('refuses an older draft after an accepted metadata-only write', () => {
+        const base = controllerFor(list('a', 'b'))
+        const controller = createHistoryWindowController({
+            captureWindowed: () => base.controller,
+            captureSession: () => null,
+            getCurrentSession: () => null,
+            readLiveMetadata: () => base.chat,
+        }, base.chat, 40, base.controller)
+        const copy = openHistoryWindowCopy(controller)
+        copy.chat.scriptstate = { $value: 'stale' }
+        controller.chat.scriptstate = { $value: 'newer' }
+        expect(controller.applyRange(0, 0, [], 'update-metadata')).toBe(true)
+        expect(copy.commit()).toBe(false)
+        expect(controller.chat.scriptstate).toEqual({ $value: 'newer' })
+        controller.release()
+    })
+
     it.each(['deleted', 'duplicate', 'replaced', 'missing-id'] as const)(
         'rejects an owned receipt with a %s output target', (change) => {
             const base = controllerFor(list('a', 'b'))

@@ -103,6 +103,7 @@ export function openHistoryWindowCopy(
     onCommit?: ConversationCommitObserver,
 ): HistoryWindowCopy {
     const current = controller.isCurrent()
+    const sourceVersion = controller.mutationVersion
     const source = [...controller.chat.message]
     const chat = safeStructuredClone(controller.chat)
     const drafts = [...chat.message]
@@ -112,15 +113,18 @@ export function openHistoryWindowCopy(
         chat,
         commit() {
             if (committed || !current || !controller.isCurrent()
+                || sourceVersion !== controller.mutationVersion
                 || source.length !== controller.chat.message.length
                 || source.some((message, index) => controller.chat.message[index] !== message)) return false
             if (!writeHistoryWindowChat(controller, chat)) return false
             committed = true
+            const writtenVersion = controller.mutationVersion
             const written = [...controller.chat.message]
             onCommit?.({
                 follows: () => false,
                 remapWindowTarget(owner, message) {
                     if (owner !== controller || !controller.isCurrent()
+                        || writtenVersion !== controller.mutationVersion
                         || written.length !== controller.chat.message.length
                         || written.some((entry, index) => controller.chat.message[index] !== entry)) return null
                     const oldIndex = source.indexOf(message)
