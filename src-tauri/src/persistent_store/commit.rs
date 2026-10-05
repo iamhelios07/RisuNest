@@ -1474,7 +1474,6 @@ pub(super) fn put_asset_alias(
 pub(super) struct ReplacementProof<'a> {
     pub(super) base_revision: i64,
     pub(super) staging_digest: &'a str,
-    pub(super) overrides: &'a std::collections::BTreeSet<risunest_sync_wire::unit::UnitKey>,
 }
 
 pub(super) fn replace_commit_lww(
@@ -1486,6 +1485,29 @@ pub(super) fn replace_commit_lww(
     changes: &[(risunest_sync_wire::unit::UnitKey, risunest_sync_wire::unit::UnitValue)],
     target: bool,
     received: &[super::lww::Change],
+    received_authority: Option<risunest_sync_wire::stamp::DecimalU64>,
+    selection_change: Option<&super::sync_selection::BindingSelectionChange>,
+    replacement_proof: Option<ReplacementProof<'_>>,
+) -> StoreResult<RevisionResult> {
+    let rows = super::lww::FrozenRows::new()?;
+    if target {
+        for change in received { rows.insert(super::lww::intent_rows::target_row(change)?)?; }
+    } else {
+        for (key, value) in changes {
+            rows.insert(super::lww::intent_rows::replacement_row(key, value, true)?)?;
+        }
+    }
+    replace_commit_lww_rows(connection, staging_id, header, stamp, digest, &rows, target, received_authority, selection_change, replacement_proof)
+}
+
+pub(super) fn replace_commit_lww_rows(
+    connection: &mut Connection,
+    staging_id: &str,
+    header: &super::lww::Header,
+    stamp: &risunest_sync_wire::stamp::Stamp,
+    digest: &str,
+    changes: &super::lww::FrozenRows,
+    target: bool,
     received_authority: Option<risunest_sync_wire::stamp::DecimalU64>,
     selection_change: Option<&super::sync_selection::BindingSelectionChange>,
     replacement_proof: Option<ReplacementProof<'_>>,
@@ -1512,7 +1534,7 @@ pub(super) fn replace_commit_lww(
     }
     if target {
         super::sync_selection::validate_binding_stage_content(&transaction,staging_id)?;
-        super::lww::validate_binding_source(&transaction,staging_id,header,received)?;
+        super::lww::validate_binding_source_rows(&transaction,staging_id,header,changes)?;
     }
     let active=active_generation(&transaction)?;
     if target {super::lww::preserve_local_root(&transaction,&active,staging_id)?;}
@@ -1526,21 +1548,25 @@ pub(super) fn replace_commit_lww(
         transaction.execute("DELETE FROM lww_retired",[])?;
         transaction.execute("DELETE FROM lww_outbox",[])?;
         transaction.execute("DELETE FROM lww_receive_rows",[])?;
-        for change in received {if !super::lww::is_device(&change.key) {
-            super::lww::put_unit(&transaction,&change.key,&change.stamp,&change.value,&header.request_id,None)?;
-            super::lww::witness_received(&transaction,change,received_authority.unwrap_or(header.binding_authority))?;
-        }}
+        changes.visit(false, |key, received_stamp, value, _| {
+            let received_stamp = received_stamp.ok_or_else(|| validation("request-id-integrity"))?;
+            if !super::lww::is_device(&key) {
+                super::lww::put_unit(&transaction,&key,&received_stamp,&value,&header.request_id,None)?;
+                super::lww::witness_received(&transaction,&super::lww::Change { key, stamp: received_stamp, value },received_authority.unwrap_or(header.binding_authority))?;
+            }
+            Ok(())
+        })?;
         super::lww::seed_binding_holds(&transaction,staging_id,header)?;
     } else {
-        for (key,value) in changes {
-            if super::lww::parent_status(&transaction,key)?=="retired"&&!(key.components()[0]=="exists"&&matches!(value,risunest_sync_wire::unit::UnitValue::Deleted)){continue;}
-            super::lww::put_unit(&transaction,key,stamp,value,&header.request_id,Some(header.binding_authority))?;
-        }
-        super::lww::project_replacement_units(&transaction,generation,header,stamp,changes,replacement_proof.as_ref().map(|proof| proof.overrides))?;
+        changes.visit(false, |key, _, value, _| {
+            if super::lww::parent_status(&transaction,&key)?=="retired"&&!(key.components()[0]=="exists"&&matches!(value,risunest_sync_wire::unit::UnitValue::Deleted)){return Ok(());}
+            super::lww::put_unit(&transaction,&key,stamp,&value,&header.request_id,Some(header.binding_authority))?;
+            Ok(())
+        })?;
+        super::lww::project_replacement_units(&transaction,generation,header,stamp,changes)?;
+        changes.visit(false, |key, _, _, _| super::lww::ensure_publishable_parents(&transaction,&key,header.binding_authority))?;
     }
-    if !target {for (key,_) in changes{super::lww::ensure_publishable_parents(&transaction,key,header.binding_authority)?;}}
-    let changed=if target {received.iter().map(|c|c.key.clone()).collect::<Vec<_>>()}else{changes.iter().map(|(k,_)|k.clone()).collect::<Vec<_>>()};
-    super::lww::refresh_orders(&transaction,generation,&changed)?;
+    changes.refresh_orders(&transaction,generation)?;
     set_active(&transaction,revision,generation)?;
     transaction.execute("INSERT INTO lww_requests(request_id,digest,revision,activated_generation) VALUES(?1,?2,?3,?4)",params![header.request_id,digest,revision,generation])?;
     transaction.commit()?;Ok(RevisionResult{revision})
