@@ -190,6 +190,7 @@ pub(crate) async fn final_compaction_overlap_costly_slot(
     let barrier=CompactionBarrier::new();install_compaction_barrier(&job_id,barrier.clone());
     let (send,mut completed)=tokio::sync::oneshot::channel();
     let assets=asset_hashes.to_vec();let iteration=slot.iteration;let foreground_provider=provider.clone();
+    let mut versions=source.open_native_job_store().map_err(|e|e.to_string())?;
     let background=std::thread::spawn(move || {
         let outcome=(||->Result<native_maintenance::RawCompaction,String> {
             let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e|e.to_string())?;
@@ -198,7 +199,7 @@ pub(crate) async fn final_compaction_overlap_costly_slot(
                     writer_id:&writer,descriptor:&compactor.descriptor,root_key:&compactor.root_key,
                     provider:compactor.provider.as_ref(),repository:&compactor.repository,clock:leases::system_clock(),
                     protection_supported:compactor.capabilities.lease_operations,ledger:Some(ledger)};
-                native_maintenance::compact_native_raw(&compactor,&provider,&directory,&job_id,&writer,&compactor.capabilities,
+                native_maintenance::compact_native_raw(&compactor,&provider,&mut versions,&directory,&job_id,&writer,&compactor.capabilities,
                     Some((&owner,&context)),&assets,measurement::Scenario::DuringCompaction,iteration).await
             })
         })();
@@ -1962,7 +1963,7 @@ fn actual_compaction_producer_keeps_unobserved_source_and_protection_invalid() {
         let (_,capabilities)=fixture.provider.open_repository(&ConnectionConfig {provider:"fake".into(),
             profile:None,endpoint:"synthetic".into(),account_id:"synthetic".into(),location:Default::default(),
             oauth_profile:None},&SecretRef("synthetic".into()),OpenMode::Existing,&Cancellation::default()).await.unwrap();
-        let record=native_maintenance::compact_native_raw(&fixture.sender,&fixture.provider,directory.path(),job_id,&writer,
+        let record=native_maintenance::compact_native_raw(&fixture.sender,&fixture.provider,&mut fixture.a,directory.path(),job_id,&writer,
             &capabilities,None,&[],measurement::Scenario::ConsolidatedSnapshot,0)
             .await.unwrap();
         eprintln!("M-COMPACTION-PRODUCER-CORRECTNESS {}",serde_json::to_string(&record).unwrap());
