@@ -2680,6 +2680,9 @@ export const languageEnglish = {
             codeRecordOrphan: 'Records with no owner',
             codeObjectUnreferenced: 'Files nothing uses',
             codeUnclassified: 'Problems that could not be sorted',
+            codeIntentQuarantined: 'Changes that were not applied',
+            codeIntentQuarantinedHelp:
+                'These changes were not applied to the data. If you still need them, make the same change again.',
             rootFieldCharacters: 'characters',
             rootFieldPresets: 'presets',
             rootFieldPluginStorage: 'plugin storage',
