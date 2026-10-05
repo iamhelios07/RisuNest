@@ -2243,6 +2243,7 @@ export const languageEnglish = {
                 remote: 'Load from the server when needed',
                 local: 'Files on this device',
                 remoteOnly: 'Files only on the server',
+                externalOnly: 'Files only in external storage',
                 unavailable: 'Files on neither this device nor the server',
                 cleanupNote:
                     'Downloaded files stay on this device. Cleanup removes only local copies of files on the server. Files needed by a snapshot stay until that snapshot is deleted.',
@@ -2309,6 +2310,8 @@ export const languageEnglish = {
             credentialsHelp:
                 'Enter the address and this device’s credentials made in the server admin screen. Each device needs its own.',
             credentialUnavailable:
+                'The operating system could not open this device’s credentials. Unlock its key storage, or register this device again on the server and enter the new registration code.',
+            credentialUnavailableLinux:
                 'The operating system could not open this device’s credentials. Unlock its key storage, or register this device again on the server and enter the new registration code. Linux requires an unlocked Secret Service.',
             connect: 'Connect and sync',
             disconnect: 'Disconnect',
@@ -3103,6 +3106,7 @@ export const languageEnglish = {
         restoreAction: "Restore",
         previousFilesTitle: "Connect?",
         previousFilesDescription: "Some files are stored only on the server or external storage used before. Connecting also saves them to the new target. To also keep them on this device, choose Download, then connect.",
+        previousFilesUnknownDescription: "RisuNest could not check whether any files are stored only on the server or external storage used before. If there are, connecting also saves them to the new target. To also keep them on this device, choose Download, then connect.",
         downloadThenConnect: "Download, then connect",
         downloadFailedNotConnected: "The files could not be downloaded, so the connection was not made. Try again, or connect without downloading.",
         previousStorageUnavailable: "Files kept only on the server or external storage used before could not be fetched, so sync stopped. Try again when it can be reached.",

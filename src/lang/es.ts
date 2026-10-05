@@ -1509,6 +1509,7 @@ export const languageSpanish = {
         restoreAction: "Restaurar",
         previousFilesTitle: "¿Conectar?",
         previousFilesDescription: "Algunos archivos solo están guardados en el servidor o almacenamiento externo usado antes. Al conectar, también se guardan en el nuevo destino. Para conservarlos también en este dispositivo, elija Descargar y luego conectar.",
+        previousFilesUnknownDescription: "RisuNest no pudo comprobar si hay archivos guardados solo en el servidor o almacenamiento externo usado antes. Si los hay, al conectar también se guardan en el nuevo destino. Para conservarlos también en este dispositivo, elija Descargar y luego conectar.",
         downloadThenConnect: "Descargar y luego conectar",
         downloadFailedNotConnected: "No se pudieron descargar los archivos, así que no se realizó la conexión. Vuelva a intentarlo o conecte sin descargar.",
         previousStorageUnavailable: "No se pudieron obtener archivos guardados solo en el servidor o almacenamiento externo usado antes, así que la sincronización se detuvo. Vuelva a intentarlo cuando se pueda acceder.",

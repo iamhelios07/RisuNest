@@ -2058,6 +2058,7 @@ export const languageKorean = {
                 remote: '필요할 때 서버에서 불러오기',
                 local: '이 기기에 있는 파일',
                 remoteOnly: '서버에만 있는 파일',
+                externalOnly: '외부 저장소에만 있는 파일',
                 unavailable: '이 기기에도 서버에도 없는 파일',
                 cleanupNote:
                     '이미 다운로드한 파일은 유지됩니다. 정리하면 서버에 있는 파일의 기기 사본만 삭제되며, 스냅샷에 필요한 파일은 스냅샷을 삭제할 때까지 유지됩니다.',
@@ -2123,6 +2124,8 @@ export const languageKorean = {
             credentialsHelp:
                 '서버 관리 화면에서 만든 주소와 이 기기의 인증 정보를 입력하세요. 기기마다 따로 만들어야 합니다.',
             credentialUnavailable:
+                '운영체제에서 이 기기의 인증 정보를 열 수 없습니다. 키 저장소 잠금을 해제하거나, 서버에서 이 기기를 새로 등록한 뒤 새 등록 코드를 입력하세요.',
+            credentialUnavailableLinux:
                 '운영체제에서 이 기기의 인증 정보를 열 수 없습니다. 키 저장소 잠금을 해제하거나, 서버에서 이 기기를 새로 등록한 뒤 새 등록 코드를 입력하세요. Linux에서는 잠금 해제된 Secret Service가 필요합니다.',
             connect: '연결하고 동기화',
             disconnect: '연결 해제',
@@ -2914,6 +2917,7 @@ export const languageKorean = {
         restoreAction: "복원",
         previousFilesTitle: "연결하시겠습니까?",
         previousFilesDescription: "이전에 연결한 서버나 외부 저장소에만 있는 파일이 있습니다. 연결하면 이 파일을 새 연결 대상에도 저장하며, 이 기기에도 보관하려면 다운로드 후 연결을 선택하세요.",
+        previousFilesUnknownDescription: "이전에 연결한 서버나 외부 저장소에만 있는 파일이 있는지 확인하지 못했습니다. 이런 파일이 있는 경우 연결하면 새 연결 대상에도 저장하며, 이 기기에도 보관하려면 다운로드 후 연결을 선택하세요.",
         downloadThenConnect: "다운로드 후 연결",
         downloadFailedNotConnected: "파일을 다운로드하지 못해 연결하지 않았습니다. 다시 시도하거나 다운로드하지 않고 연결하세요.",
         previousStorageUnavailable: "이전에 연결한 서버나 외부 저장소에만 있는 파일을 가져오지 못해 동기화하지 못했습니다. 연결할 수 있을 때 다시 시도하세요.",
