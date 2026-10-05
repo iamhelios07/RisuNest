@@ -91,6 +91,7 @@ import {
 } from "./storage/nativeFileJobRecovery";
 import { refreshDeviceStateAfterRestore } from "./storage/deviceStateRestore";
 import { registerAndroidRisuSaveRoute } from "./storage/androidRisuSaveRouteProduction.svelte";
+import { reportInterruptedIOSBackupSourcesAtStart } from "./storage/iosFiles";
 import { isAndroidSafFileJobsEnabled } from "./storage/androidSafBridge";
 import {
     describeScreenshotPublicationError,
@@ -847,6 +848,7 @@ export async function loadData() {
         registerModelDynamic()
         await saveDb()
         registerAndroidRisuSaveRoute()
+        await reportInterruptedIOSBackupSourcesAtStart()
         if (recoveredNativeFileJobs.interruptedRestores.length > 0) {
             alertNormal(language.risuNest.backup.restoreInterrupted)
             await waitAlert()

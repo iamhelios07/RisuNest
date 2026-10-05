@@ -28,7 +28,7 @@ pub(crate) fn native_portable_source_discard(app:AppHandle,source:JobSource)->Re
 }
 
 #[tauri::command(async)]
-pub(crate) fn native_portable_source_cleanup_orphans(app:AppHandle)->Result<(),NativeJobError> {
+pub(crate) fn native_portable_source_cleanup_orphans(app:AppHandle)->Result<usize,NativeJobError> {
     logged("native_portable_source_cleanup_orphans", portable_source_custody::cleanup_orphans(&app))
 }
 pub(crate) mod raw_recovery;
