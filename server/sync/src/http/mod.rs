@@ -1,4 +1,6 @@
 mod lww;
+#[cfg(test)]
+mod admission_tests;
 use crate::{
     store::{Device, Store},
     workload::{WorkKind, Workload},
@@ -15,11 +17,7 @@ use axum::{
 };
 use risunest_sync_wire::{canonical, transfer, Sequence, MAX_METADATA_BYTES};
 use serde::Deserialize;
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
 
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(15 * 60);
@@ -33,10 +31,31 @@ struct App {
     materializers: Arc<Semaphore>,
     media_slots: Arc<Semaphore>,
     notice_slots: Arc<Semaphore>,
-    devices: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
     workload: Workload,
     shutdown: tokio::sync::watch::Receiver<bool>,
     _lifetime: Arc<()>,
+}
+
+impl App {
+    async fn authenticate(&self, library: &str, token: &str) -> Result<Device> {
+        let store = self.store.clone();
+        let library = library.to_owned();
+        let token = token.to_owned();
+        blocking(move || store.authenticate(&library, &token)).await
+    }
+
+    async fn wait_slot(&self, slots: Arc<Semaphore>) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        let mut shutdown = self.shutdown.clone();
+        tokio::select! {
+            biased;
+            _ = async {
+                if shutdown.wait_for(|stopping| *stopping).await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            } => Err(Error::new("server-updating", 503)),
+            permit = slots.acquire_owned() => permit.map_err(|_| Error::new("worker-unavailable", 503)),
+        }
+    }
 }
 #[derive(Clone)]
 struct BufferedRequest {
@@ -205,7 +224,6 @@ pub fn router_with_shutdown(
         materializers: Arc::new(Semaphore::new(1)),
         media_slots: Arc::new(Semaphore::new(16)),
         notice_slots: Arc::new(Semaphore::new(32)),
-        devices: Arc::new(Mutex::new(HashMap::new())),
         workload,
         shutdown,
         _lifetime: lifetime,
@@ -247,8 +265,8 @@ pub fn router_with_shutdown(
         .route("/ack", post(lww::ack))
         .layer(DefaultBodyLimit::max(transfer::MAX_BATCH_BYTES))
         .route_layer(middleware::from_fn_with_state(app.clone(), authorize))
-        // A held notification stream must not occupy an admission slot or a
-        // device slot for its whole life, so it authenticates on its own.
+        // A held notification stream must not occupy a request slot for its
+        // whole life, so it authenticates on its own.
         .route("/notify", get(lww::notify))
         .route("/media/{token}", get(media))
         .with_state(app)
@@ -322,8 +340,7 @@ async fn authorize(State(app): State<App>, request: Request, next: Next) -> Resp
         let library = header(request.headers(), "x-risu-library")
             .ok_or(Error::new("unauthorized", 401))?
             .to_owned();
-        let store = app.store.clone();
-        let device = blocking(move || store.authenticate(&library, &token)).await?;
+        app.authenticate(&library, &token).await?;
         // DefaultBodyLimit caps consumed bytes but does not preflight a declared
         // oversized body. Reject it after authentication, before waiting for bytes.
         if request.headers().contains_key("content-length") {
@@ -346,28 +363,15 @@ async fn authorize(State(app): State<App>, request: Request, next: Next) -> Resp
         if header(request.headers(), "content-encoding").is_some_and(|v| v != "identity") {
             return Err(Error::new("unsupported-content-encoding", 415));
         }
-        let work = app.workload.begin(WorkKind::Request)?;
-        let semaphore = {
-            let mut devices = app
-                .devices
-                .lock()
-                .map_err(|_| Error::new("worker-unavailable", 503))?;
-            devices
-                .entry(device.id.clone())
-                .or_insert_with(|| Arc::new(Semaphore::new(2)))
-                .clone()
-        };
-        let _device_permit = semaphore
-            .try_acquire_owned()
-            .map_err(|_| Error::new("device-busy", 429))?;
+        if app.workload.status()?.state != "open" {
+            return Err(Error::new("server-updating", 503));
+        }
         // Waiting for a durable worker does not consume a transfer/head slot.
         let is_wait = request.method() == axum::http::Method::GET
             && (request.uri().path().starts_with("/object-deltas/")
                 || request.uri().path().starts_with("/uploads/"));
-        let slots = if is_wait { app.wait_slots } else { app.slots };
-        let _global_permit = slots
-            .try_acquire_owned()
-            .map_err(|_| Error::new("server-busy", 429))?;
+        let slots = if is_wait { &app.wait_slots } else { &app.slots };
+        let _global_permit = app.wait_slot(slots.clone()).await?;
         // Reserve bounded body/response memory before consuming any bulk body.
         // A worker clone retains the reservation even if its HTTP future times out.
         let path = request.uri().path();
@@ -376,16 +380,15 @@ async fn authorize(State(app): State<App>, request: Request, next: Next) -> Resp
             || (path.starts_with("/uploads/") && path.ends_with("/delta"))
         {
             Some(BufferedRequest {
-                _permit: Arc::new(
-                    app.buffers
-                        .clone()
-                        .try_acquire_owned()
-                        .map_err(|_| Error::new("transfer-memory-busy", 429))?,
-                ),
+                _permit: Arc::new(app.wait_slot(app.buffers.clone()).await?),
             })
         } else {
             None
         };
+        // Queued requests do not prevent maintenance from draining active work.
+        let work = app.workload.begin(WorkKind::Request)?;
+        // Registration can be revoked while a request waits for capacity.
+        let device = app.authenticate(&library, &token).await?;
         let mut request = request;
         request.extensions_mut().insert(device);
         if let Some(buffered) = &buffered {
@@ -403,7 +406,7 @@ async fn authorize(State(app): State<App>, request: Request, next: Next) -> Resp
         // blocking work continues to hold admission until it actually returns.
         let task = tokio::spawn(async move {
             let response = next.run(request).await;
-            (response, (_device_permit, _global_permit, buffered, work))
+            (response, (_global_permit, buffered, work))
         });
         let (mut response, permits) = tokio::time::timeout(Duration::from_secs(deadline), task)
             .await
@@ -602,10 +605,7 @@ async fn media(
 ) -> Result<Response> {
     use crate::store::MediaResponse;
     use futures_util::StreamExt;
-    let permit = app
-        .media_slots
-        .try_acquire_owned()
-        .map_err(|_| Error::new("media-busy", 429))?;
+    let permit = app.wait_slot(app.media_slots.clone()).await?;
     let resolved = blocking(move || app.store.resolve_media(&token)).await?;
     let mut response = match resolved {
         MediaResponse::Refresh(url) => {

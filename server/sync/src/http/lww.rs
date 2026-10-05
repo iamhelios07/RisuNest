@@ -143,16 +143,15 @@ pub(super) async fn notify(
     let library = header(&headers, "x-risu-library")
         .ok_or(Error::new("unauthorized", 401))?
         .to_owned();
-    let store = app.store.clone();
-    let device = blocking(move || store.authenticate(&library, &token)).await?;
+    app.authenticate(&library, &token).await?;
     if *app.shutdown.borrow() || app.workload.status()?.state != "open" {
         return Err(Error::new("server-updating", 503));
     }
-    let permit = app
-        .notice_slots
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| Error::new("server-busy", 429))?;
+    let permit = app.wait_slot(app.notice_slots.clone()).await?;
+    if app.workload.status()?.state != "open" {
+        return Err(Error::new("server-updating", 503));
+    }
+    let device = app.authenticate(&library, &token).await?;
     let mut response = ws
         .max_message_size(1024)
         .max_frame_size(1024)
@@ -423,7 +422,7 @@ pub(super) mod tests {
         for _ in 0..31 {
             silent.push(connect(address, &credential).await.unwrap());
         }
-        assert_eq!(connect(address, &credential).await.err(), Some(429));
+        let mut late = tokio::time::timeout(bound, connect(address, &credential)).await.unwrap().unwrap();
         tokio::time::timeout(bound, async {
             for socket in &mut silent {
                 closed(socket).await;
@@ -431,7 +430,6 @@ pub(super) mod tests {
         })
         .await
         .expect("silent sockets keep their slots");
-        let mut late = connect(address, &credential).await.unwrap();
         tokio::time::timeout(bound, closed(&mut late))
             .await
             .expect("a silent socket stays open");
