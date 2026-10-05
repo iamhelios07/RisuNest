@@ -1043,6 +1043,12 @@ impl LwwClient {
             {
                 return Err(SyncError::new("invalid-changes-page", 502));
             }
+            // The journal keeps one entry per key, so a sequence span bounds the
+            // changes in it; it still measures how far through the server this is.
+            self.client.lane().backlog(
+                page.next_after.0 - cursor.0,
+                page.through_seq.0 - page.next_after.0,
+            );
             (
                 page.next_after,
                 page.items

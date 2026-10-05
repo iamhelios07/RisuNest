@@ -20,7 +20,7 @@ import type { ServerConfig } from './serverSync'
 import { get } from 'svelte/store'
 import { selectedCharID } from 'src/ts/stores.svelte'
 import { getDatabase } from '../database.svelte'
-import { createRateMeter, laneDeltas, readServerSyncLanes, type ServerSyncAttempt, type ServerSyncLane, type ServerSyncStage } from './serverSyncProgress'
+import { createRateMeter, laneDeltas, readServerSyncLanes, routinePeak, routineWork, type ServerSyncAttempt, type ServerSyncLane, type ServerSyncStage } from './serverSyncProgress'
 
 const selectedCharacterId = () => getDatabase().characters[get(selectedCharID)]?.chaId ?? null
 
@@ -69,21 +69,48 @@ const changed = () => { for (const listener of listeners) listener(snapshot()) }
 // have all stopped. Native counts are read only while a view watches it.
 let attempt: ServerSyncAttempt | undefined
 let attemptFailed = false
-let baseline: ServerSyncLane[] | undefined
+// Read when a watched attempt starts, so even an attempt that ends before its next read has a start to count from.
+let baseline: Promise<ServerSyncLane[] | undefined> | undefined
 let binding = false
 let operations = 0
 let lastSuccessAt: number | undefined
+// A routine attempt that moved anything stays on screen as finished for a moment.
+let finished: ServerSyncAttempt | undefined
+let finishedTimer: ReturnType<typeof setTimeout> | undefined
 let watchers = 0
 let sampling: ReturnType<typeof setInterval> | undefined
 const meter = createRateMeter()
+const readLanes = () => readServerSyncLanes().catch(() => undefined)
 async function sample(): Promise<void> {
     const captured = attempt
-    const lanes = captured && await readServerSyncLanes().catch(() => undefined)
-    if (!lanes || captured !== attempt) return
-    baseline ??= lanes
-    captured.lanes = laneDeltas(lanes, baseline)
+    if (!captured) return
+    const first = !baseline
+    const start = baseline ??= readLanes()
+    // The upload a routine bar fills toward is fixed once, when the attempt begins publishing.
+    const plan = captured.mode === 'routine' && captured.plannedSend === undefined && captured.stages.includes('publishing')
+    const [before, lanes, pending] = await Promise.all([start, first ? start : readLanes(), plan ? controller.pendingChanges().catch(() => undefined) : undefined])
+    if (captured !== attempt) return
+    if (!before) { if (baseline === start) baseline = undefined; return }
+    if (!lanes) return
+    captured.lanes = laneDeltas(lanes, before)
+    if (typeof pending === 'number') captured.plannedSend = pending + (captured.lanes.find(lane => lane.lane === 'send')?.itemsDone ?? 0)
+    captured.peak = routinePeak(captured)
     meter.add(Date.now(), captured.lanes.reduce((total, lane) => total + lane.sentBytes + lane.receivedBytes, 0))
     captured.rate = meter.rate()
+    changed()
+}
+const clearFinished = () => { clearTimeout(finishedTimer); finishedTimer = undefined; finished = undefined }
+/** Shows a routine attempt that sent or received anything as finished, from one last read of its counts. */
+async function finish(ended: ServerSyncAttempt, start: Promise<ServerSyncLane[] | undefined>): Promise<void> {
+    const [before, lanes] = await Promise.all([start, readLanes()])
+    if (!before || !lanes || attempt || !watchers) return
+    ended.lanes = laneDeltas(lanes, before)
+    const work = routineWork(ended)
+    if (work.changes.total + work.assets.total === 0) return
+    clearFinished()
+    ended.endedAt = Date.now()
+    finished = ended
+    finishedTimer = setTimeout(() => { clearFinished(); changed() }, 1500)
     changed()
 }
 const watchSamples = () => {
@@ -93,7 +120,10 @@ const watchSamples = () => {
 }
 /** Shows `stage` as running until `operation` settles. Sending and receiving can run at once. */
 async function during<T>(stage: ServerSyncStage, operation: () => Promise<T>): Promise<T> {
-    if (!attempt) { attempt = { startedAt: Date.now(), stages: [], active: [], current: stage }; attemptFailed = false; baseline = undefined; meter.reset(); watchSamples() }
+    // Connecting and downloading every asset show their steps; a routine attempt they join becomes one of them.
+    const mode = binding || operations ? 'full' : 'routine'
+    if (!attempt) { attempt = { mode, startedAt: Date.now(), stages: [], active: [], current: stage }; attemptFailed = false; baseline = undefined; meter.reset(); clearFinished(); watchSamples() }
+    else if (mode === 'full') attempt.mode = mode
     const entered = attempt
     if (!entered.stages.includes(stage)) entered.stages.push(stage)
     entered.active.push(stage); entered.current = stage
@@ -103,9 +133,11 @@ async function during<T>(stage: ServerSyncStage, operation: () => Promise<T>): P
 }
 const settleAttempt = () => {
     if (!attempt || scheduler.isRunning() || hydrating || binding || operations) return
+    const ended = attempt, start = baseline
     if (!attemptFailed) lastSuccessAt = Date.now()
     attempt = undefined
     watchSamples()
+    if (!attemptFailed && ended.mode === 'routine' && start) void finish(ended, start)
     changed()
 }
 /** A cancelled or failed step keeps the attempt from counting as a completed sync. */
@@ -326,7 +358,7 @@ export async function installServerSyncProduction(): Promise<void> {
     const visibility = () => { void updateForeground(document.visibilityState !== 'hidden').catch(value => { if (serverSyncErrorCode(value) === 'cancelled') return; error = serverSyncErrorCode(value) || 'server-unreachable'; changed() }) }
     document.addEventListener('visibilitychange', visibility)
     disposers.push(() => document.removeEventListener('visibilitychange', visibility))
-    disposeServer = () => { scheduler.dispose(); for (const dispose of disposers) dispose(); context = undefined; persistedBinding = undefined; foreground = false; hydrationPending = false; hydrationAgain = false; attempt = undefined; watchSamples() }
+    disposeServer = () => { scheduler.dispose(); for (const dispose of disposers) dispose(); context = undefined; persistedBinding = undefined; foreground = false; hydrationPending = false; hydrationAgain = false; attempt = undefined; clearFinished(); watchSamples() }
     await controller.ensureStatus()
     const current = await invoke<BindingContext['state']>('pds_lww_binding_state')
     if (current.target.kind === 'server' && status.configured) {
@@ -349,7 +381,7 @@ async function completeInterruptedBinding(): Promise<void> {
     bindingIncomplete = true; changed()
 }
 
-const snapshot = () => ({ status: { ...status, bound: persistedBinding?.target.kind === 'server' || !!context && !context.signal.aborted }, running: scheduler.isRunning() || !!hydrating, paused: !context || context.signal.aborted || scheduler.isBlocked(), replacing, draining: false, error, bindingIncomplete, progress: attempt && { ...attempt, stages: [...attempt.stages], active: [...attempt.active] }, lastSuccessAt })
+const snapshot = () => ({ status: { ...status, bound: persistedBinding?.target.kind === 'server' || !!context && !context.signal.aborted }, running: scheduler.isRunning() || !!hydrating, paused: !context || context.signal.aborted || scheduler.isBlocked(), replacing, draining: false, error, bindingIncomplete, progress: attempt && { ...attempt, stages: [...attempt.stages], active: [...attempt.active] }, finished: finished && { ...finished, stages: [...finished.stages], active: [...finished.active] }, lastSuccessAt })
 const controller = {
     snapshot,
     subscribe: (listener: (value: ReturnType<typeof snapshot>) => void) => { listeners.add(listener); listener(controller.snapshot()); return () => { listeners.delete(listener) } },

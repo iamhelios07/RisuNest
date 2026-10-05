@@ -2338,6 +2338,8 @@ export const languageEnglish = {
             ready: 'Connected',
             lastSuccess: 'Last sync',
             running: 'Syncing',
+            complete: 'Sync complete',
+            details: 'Details',
             verifiedBytes: 'Data transferred',
             transferRate: 'Transfer speed',
             progressItems: 'Items processed',

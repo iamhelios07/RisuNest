@@ -600,12 +600,15 @@ fn clients_made_inside_a_lane_count_what_they_publish_receive_and_download() {
     assert_eq!(received.items_done, received.items_total);
     assert!(received.received_bytes > 0);
     assert!(received.received_bytes < body.len() as u64);
+    assert!(received.backlog_done >= received.listed);
+    assert_eq!(received.backlog_left, 0);
 
     let hydrate = Arc::new(ProgressLane::default());
     within(&hydrate, || b.hydrate_registered_remote_assets(|| Ok(()))).unwrap();
     let hydrated = hydrate.snapshot("hydrate");
     assert_eq!((hydrated.files_done, hydrated.files_total), (1, 1));
     assert_eq!((hydrated.bytes_done, hydrated.bytes_total), (body.len() as u64, body.len() as u64));
+    assert_eq!((hydrated.backlog_done, hydrated.backlog_left), (1, 0));
     assert!(hydrated.received_bytes >= body.len() as u64);
     assert_eq!(hydrated.step, "idle");
 }

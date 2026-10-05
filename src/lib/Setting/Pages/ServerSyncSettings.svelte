@@ -1,6 +1,6 @@
 <script lang="ts">
     import { onMount, onDestroy } from 'svelte'
-    import { CheckIcon, LoaderCircleIcon, TriangleAlertIcon } from '@lucide/svelte'
+    import { CheckIcon, ChevronRightIcon, LoaderCircleIcon, TriangleAlertIcon } from '@lucide/svelte'
     import { language } from 'src/lang'
     import { alertCheckboxConfirm, alertConfirm } from 'src/ts/alert'
     import { isTauri } from 'src/ts/platform'
@@ -14,7 +14,7 @@
     import type { ServerConfig } from 'src/ts/storage/sync/serverSync'
     import { PREVIOUS_FILES_DOWNLOAD_FAILED } from 'src/ts/storage/sync/bindingFlow'
     import { formatRisuNestStorageBytes as bytes } from 'src/ts/storage/risuNestStorageDashboard'
-    import { serverSyncProgressView } from 'src/ts/storage/sync/serverSyncProgress'
+    import { serverSyncProgressView, serverSyncRoutineView, type ServerSyncProgressView } from 'src/ts/storage/sync/serverSyncProgress'
     import SettingGroup from '../RisuNest/SettingGroup.svelte'
     import SettingRow from '../RisuNest/SettingRow.svelte'
     import SettingButton from '../RisuNest/SettingButton.svelte'
@@ -45,6 +45,7 @@
     let policy = $state<AssetResidencyPolicy>('full')
     let pending = $state<number | undefined>()
     let now = $state(Date.now())
+    let detailsOpen = $state(false)
     let dispose = () => {}
     let inboxDispose = () => {}
     let stopWatching = () => {}
@@ -62,8 +63,13 @@
         if (view.paused) return { label: copy.paused, tone: 'paused' }
         return { label: copy.ready, tone: 'connected' }
     })
-    // A short check finishes before the panel would appear, so it never flashes.
-    let progress = $derived(view.progress && now - view.progress.startedAt >= 600 ? serverSyncProgressView(view.progress, copy, now) : undefined)
+    // Automatic sync shows one bar as soon as it has anything to move, and keeps it finished for a moment.
+    let shown = $derived(view.progress ?? view.finished)
+    let summary = $derived(shown?.mode === 'routine' ? serverSyncRoutineView(shown, copy, !view.progress) : undefined)
+    // Connecting and downloading every asset show their steps; a short check finishes before they would appear.
+    let progress = $derived(!shown ? undefined
+        : shown.mode === 'routine' ? summary && serverSyncProgressView(shown, copy, shown.endedAt ?? now)
+            : now - shown.startedAt >= 600 ? serverSyncProgressView(shown, copy, now) : undefined)
     // One place shows the panel: the asset download that started it, the server being connected, or the connection.
     let progressPlace = $derived(!progress ? undefined : downloading ? 'assets' : candidate ? 'candidate' : view.status.bound ? 'bound' : 'incomplete')
     // Read again when the connection settles, an attempt ends or the error changes.
@@ -218,23 +224,41 @@
     {#if view.error || failure}<p role="alert" class="text-sm text-danger-400">{failure || message({ code: view.error })}</p>{/if}
 {/snippet}
 
+{#snippet progressSteps(steps: ServerSyncProgressView)}
+    {#if steps.stages.length > 1}
+        <ol class="stages">
+            {#each steps.stages as stage (stage.stage)}
+                <li data-state={stage.state} aria-current={stage.state === 'active' ? 'step' : undefined}>
+                    {#if stage.state === 'done'}<CheckIcon size={14} aria-hidden="true" />{:else}<LoaderCircleIcon size={14} class="motion-safe:animate-spin" aria-hidden="true" />{/if}
+                    <span>{stage.label}</span>
+                </li>
+            {/each}
+        </ol>
+    {/if}
+    <dl class="kv">
+        {#each steps.counters as counter (counter.key)}<dt>{counter.label}</dt><dd>{counter.value}</dd>{/each}
+    </dl>
+{/snippet}
+
 {#snippet progressPanel()}
-    {#if progress}
+    {#if summary && progress}
+        <div class="progress" data-sync-progress data-mode="routine">
+            <SettingProgress label={summary.label} fraction={summary.fraction} done={summary.complete} />
+            <details class="group" bind:open={detailsOpen}>
+                <summary class="flex cursor-pointer list-none items-center gap-2 text-sm text-textcolor2 select-none [&::-webkit-details-marker]:hidden">
+                    <ChevronRightIcon size={16} class="shrink-0 transition-transform duration-200 group-open:rotate-90" aria-hidden="true" />
+                    <span>{copy.details}</span>
+                </summary>
+                <div class="details">
+                    {#if !summary.complete}<p class="activity">{progress.detail ? `${progress.label} · ${progress.detail}` : progress.label}</p>{/if}
+                    {@render progressSteps(progress)}
+                </div>
+            </details>
+        </div>
+    {:else if progress}
         <div class="progress" data-sync-progress>
             <SettingProgress label={progress.label} detail={progress.detail} fraction={progress.fraction} />
-            {#if progress.stages.length > 1}
-                <ol class="stages">
-                    {#each progress.stages as stage (stage.stage)}
-                        <li data-state={stage.state} aria-current={stage.state === 'active' ? 'step' : undefined}>
-                            {#if stage.state === 'done'}<CheckIcon size={14} aria-hidden="true" />{:else}<LoaderCircleIcon size={14} class="motion-safe:animate-spin" aria-hidden="true" />{/if}
-                            <span>{stage.label}</span>
-                        </li>
-                    {/each}
-                </ol>
-            {/if}
-            <dl class="kv">
-                {#each progress.counters as counter (counter.key)}<dt>{counter.label}</dt><dd>{counter.value}</dd>{/each}
-            </dl>
+            {@render progressSteps(progress)}
         </div>
     {/if}
 {/snippet}
@@ -372,6 +396,25 @@
         gap: 0.625rem;
         min-width: 0;
     }
+    /* An automatic sync bar fills from empty when it appears. */
+    .progress[data-mode='routine'] :global([role='progressbar'] > div) {
+        animation: risunest-sync-fill 0.6s ease-out;
+    }
+    @keyframes -global-risunest-sync-fill {
+        from {
+            width: 0;
+        }
+    }
+    .details {
+        display: grid;
+        gap: 0.625rem;
+        min-width: 0;
+        margin-top: 0.5rem;
+        padding-left: 1.5rem;
+    }
+    .activity {
+        font-size: 13px;
+    }
     .stages {
         display: grid;
         gap: 0.375rem;
@@ -442,7 +485,8 @@
         }
     }
     @media (prefers-reduced-motion: reduce) {
-        .status-dot {
+        .status-dot,
+        .progress[data-mode='routine'] :global([role='progressbar'] > div) {
             animation: none;
         }
     }

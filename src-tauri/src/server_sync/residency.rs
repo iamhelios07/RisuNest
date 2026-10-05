@@ -557,6 +557,8 @@ impl HydrationSession {
         let mut external = std::collections::BTreeSet::new();
         let mut server_pages = Vec::new();
         let cas = crate::asset_repository::PayloadCas::new(&self.root)?;
+        let lane = super::progress::current();
+        if let Some(lane) = &lane { lane.backlog(0, 0); }
         for page in digests.chunks(64) {
             check()?;
             let hashes = page.iter().collect::<std::collections::BTreeSet<_>>();
@@ -597,6 +599,7 @@ impl HydrationSession {
             drop(guards);
             std::thread::yield_now();
         }
+        if let Some(lane) = &lane { lane.backlog(0, server_pages.iter().map(Vec::len).sum::<usize>() as u64); }
         let external = digests.iter().filter(|hash| external.remove(hash.as_str())).cloned().collect::<Vec<_>>();
         for selected in [true, false] {
             for page in &server_pages {
@@ -616,6 +619,7 @@ impl HydrationSession {
                         let _guard = crate::asset_repository::coordinator::lock_repository_mutation()?;
                         if cas.stat_object(hash)?.is_some() {
                             opened(hash, HydrationOutcome::AlreadyLocal);
+                            if let Some(lane) = &lane { lane.backlog_step(); }
                             continue;
                         }
                     }
@@ -629,6 +633,7 @@ impl HydrationSession {
                         check()?;
                         outcome?;
                         opened(hash, HydrationOutcome::Downloaded);
+                        if let Some(lane) = &lane { lane.backlog_step(); }
                         continue;
                     }
                     let key = format!("{}:{}", proof.context, serde_json::to_string(&proof.config)
@@ -665,6 +670,7 @@ impl HydrationSession {
                             check()?;
                             outcome?;
                             opened(&object.hash, HydrationOutcome::Downloaded);
+                            if let Some(lane) = &lane { lane.backlog_step(); }
                         }
                         drop(body);
                         cache.remove_derived(&object.hash)?;
