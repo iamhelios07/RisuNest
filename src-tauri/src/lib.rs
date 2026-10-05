@@ -757,6 +757,8 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         server_sync::commands::server_sync_lww_fence,
         server_sync::commands::server_sync_lww_activate,
         server_sync::commands::server_sync_lww_hydrate,
+        server_sync::commands::server_sync_lww_pending_count,
+        server_sync::commands::server_sync_progress,
         server_sync::commands::server_sync_lww_inspect,
         server_sync::commands::server_sync_lww_pending_binding,
         server_sync::commands::server_sync_lww_stage_target,

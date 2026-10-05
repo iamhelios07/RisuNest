@@ -222,6 +222,9 @@ pub(crate) struct ServerClient {
     /// The cycle's activity slot. The transfer layer raises it while object
     /// bytes are on the wire and restores what it replaced afterwards.
     pub(crate) activity: Option<std::sync::Arc<std::sync::atomic::AtomicU8>>,
+    /// Where this client's requests and verified bodies are counted, taken
+    /// from the operation that created it.
+    lane: Arc<super::progress::ProgressLane>,
 }
 #[cfg(test)]
 #[derive(Default)]
@@ -435,12 +438,13 @@ impl ServerClient {
             verified_bytes: None,
             retryable_failure: None,
             activity: None,
+            lane: super::progress::current().unwrap_or_default(),
         })
     }
     /// A client for the same server that ignores this one's cancellation, for
     /// releasing what a cancelled operation still holds on the server.
     pub(crate) fn uncancelled(&self) -> Result<Self> {
-        let client = Self::with_cancellation(self.config(), None)?;
+        let client = Self { lane: self.lane.clone(), ..Self::with_cancellation(self.config(), None)? };
         #[cfg(test)]
         let client = Self { test_io: self.test_io.clone(), ..client };
         Ok(client)
@@ -459,9 +463,13 @@ impl ServerClient {
     }
     pub fn verified(&self, bytes: u64) {
         self.progress();
+        self.lane.file_done(bytes);
         if let Some(counter) = &self.verified_bytes {
             counter.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+    pub(crate) fn lane(&self) -> &super::progress::ProgressLane {
+        &self.lane
     }
     pub(crate) fn transferring(&self) -> TransferActivity<'_> {
         match self.activity.as_deref() {
@@ -682,6 +690,7 @@ impl ServerClient {
         for (name, value) in headers {
             request = request.header(*name, value);
         }
+        let sent = body.as_ref().map_or(0, |body| body.len() as u64);
         if let Some(body) = body {
             if body.len() > 8 * 1024 * 1024 {
                 return Err(SyncError::new("request-too-large", 413));
@@ -698,6 +707,7 @@ impl ServerClient {
                 503,
             )
         })?;
+        self.lane.wire(sent, 0);
         let status = response.status().as_u16();
         let content_range = response
             .headers()
@@ -724,6 +734,7 @@ impl ServerClient {
             .take(limit as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|_| SyncError::new("incomplete-response", 503))?;
+        self.lane.wire(0, bytes.len() as u64);
         if bytes.len() > limit {
             return Err(SyncError::new("response-too-large", 502));
         }

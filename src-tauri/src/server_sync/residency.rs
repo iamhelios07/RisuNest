@@ -650,7 +650,9 @@ impl HydrationSession {
                         self.directory = Some(directory);
                     }
                     let cache = self.cache.as_ref().unwrap();
-                    super::transfer::Transfer::new(self.clients.get(&key).unwrap(), cache)?.with_check(check)
+                    let client = self.clients.get(&key).unwrap();
+                    client.lane().plan_files(0, objects.iter().map(|object| object.size).sum());
+                    super::transfer::Transfer::new(client, cache)?.with_check(check)
                         .download(&objects.iter().map(|object| object.hash.clone()).collect::<Vec<_>>(), &[])?;
                     for object in objects {
                         let mut body = cache.open_derived(&object.hash)?.ok_or_else(|| SyncError::new("hydration-incomplete", 502))?;

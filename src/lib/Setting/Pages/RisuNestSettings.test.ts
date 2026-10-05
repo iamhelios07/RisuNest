@@ -267,6 +267,8 @@ describe('RisuNest native command integration', () => {
             'server_sync_lww_pending_binding',
             'server_sync_lww_retry',
             'server_sync_lww_drain',
+            'server_sync_lww_pending_count',
+            'server_sync_progress',
             'server_sync_cancel',
             'server_sync_notify_start',
             'server_sync_notify_stop',
