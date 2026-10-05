@@ -2575,7 +2575,7 @@ impl PersistentStore {
     pub(crate) fn storage_stats(&self) -> StoreResult<PersistentStorageStats> {
         let transaction = self.connection.unchecked_transaction()?;
         let active = active_generation(&transaction)?;
-        let database_bytes = snapshot::logical_database_bytes(&transaction)?;
+        let database_bytes = snapshot::allocated_database_bytes(&self.database_path)?;
         let asset_objects = query_count_bytes(
             &transaction,
             "SELECT COUNT(*), COALESCE(SUM(byte_size), 0) FROM asset_objects",
