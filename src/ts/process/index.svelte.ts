@@ -2522,12 +2522,31 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
             conversationResources.windowedController = null
             conversationResources.completeLease?.release()
             conversationResources.completeLease = lease
-            boundedChat = null
-            historyWindow = null
             nowChatroom = DBState.db.characters[selectedChar]
             currentChar = nowChatroom
             currentChat = nowChatroom.chats[selectedChat]
-            requestSourceConversation = currentChat
+            if (historyWindow) {
+                // The public write promotes storage, but output scripts keep the admitted absolute window.
+                const start = Math.min(historyWindow.start, currentChat.message.length)
+                const chat = { ...cloneConversationMetadata(currentChat), message: safeStructuredClone(currentChat.message.slice(start)) } as Chat
+                attachHistoryWindow(chat, start)
+                const initial = captureSessionHistoryWindowController(
+                    { session: lease.session, conversation: currentChat }, getActiveConversationSession, chat, start,
+                )
+                if (!initial) return
+                const controller = createGenerationHistoryController(target, chat, start, initial, lifecycle.isTargetCurrent, abortSignal)
+                historyWindow = { ...historyWindow, start, chat, controller, shell: null }
+                boundedChat = chat
+                conversationResources.windowedController = controller
+                const unbind = bindWindowedGenerationController(chat, controller)
+                const unregister = registerActiveHistoryWindow({
+                    characterId: target.characterId, conversationId: target.conversationId, shell: null, controller,
+                })
+                conversationResources.unbindWindowedController = () => { unregister(); unbind() }
+            } else {
+                boundedChat = null
+            }
+            requestSourceConversation = boundedChat ?? currentChat
             requestSourceShell = currentChat
             requestSourceMessages = currentChat.message
             requestSourceSession = lease.session
