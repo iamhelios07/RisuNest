@@ -322,7 +322,7 @@ async function prepareGenerationHistoryWindow(
         tokenBudget: DBState.db.maxContext * getDeviceSettings().generationHistoryLimitMultiplier,
         // A remote or plugin tokenizer would see every older message, so the window walk counts locally.
         countTokens: hasObservableHistoryTokenizer()
-            ? async (text: string) => (await encodeWithTokenizer(text, 'tik')).length
+            ? async (text: string) => (await encodeWithTokenizer(text, 'o200k_base')).length
             : tokenize,
     }
     const select = async (

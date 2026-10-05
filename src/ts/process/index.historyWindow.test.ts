@@ -363,6 +363,19 @@ describe('sendChat with the history window', () => {
         expect(mutations.every((mutation) => mutation.start >= 900)).toBe(true)
     })
 
+    it('counts the window with o200k_base when the model tokenizer is remote', async () => {
+        const { encodeWithTokenizer } = await import('../tokenizer')
+        vi.mocked(encodeWithTokenizer).mockClear()
+        installWindowed(messages(1000))
+        DBState.db.googleClaudeTokenizing = true
+
+        await expect(sendChat(-1, { historyLimit: true })).resolves.toBe(true)
+
+        expect(promptContents()).toEqual(range(900, 1000))
+        const tokenizers = new Set(vi.mocked(encodeWithTokenizer).mock.calls.map((call) => call[1]))
+        expect([...tokenizers]).toEqual(['o200k_base'])
+    })
+
     it('honors the multiplier', async () => {
         installWindowed(messages(1000))
         mocks.deviceSettings = { generationHistoryLimitEnabled: true, generationHistoryLimitMultiplier: 1.5 }
