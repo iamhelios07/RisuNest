@@ -3,7 +3,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { relaunch } from '../desktopRelaunch'
 import { isTauriIOS, isTauriMobile } from '../platform'
 import { NativeFileJobError, runNativeSnapshotRestore, type NativeFileJobStatus, type NativeSnapshotBodiesStarted, type NativeSnapshotBodyResult, type NativeSnapshotRestoreActivation } from './nativeFileJobs'
-import { nativeFileOperationOutcomeShown, runSharedNativeFileOperation, waitForActiveNativeFileOperation } from './nativeFileJobManager'
+import { nativeFileOperationOutcomeShown, runSharedNativeFileOperation, waitForSnapshotBodyOutcomeDismissal } from './nativeFileJobManager'
 import type {
     DataHealthResult,
     RepairApplied,
@@ -229,7 +229,7 @@ export async function reattachNativeSnapshotRestoreBodies(jobs: NativeFileJobSta
         const receipt = snapshotBodyReceipt(job)
         reattachedSnapshotJobs.add(job.jobId)
         while (true) {
-            await waitForActiveNativeFileOperation()
+            await waitForSnapshotBodyOutcomeDismissal()
             try { await attachNativeSnapshotRestoreBodies(receipt); break }
             catch (error) {
                 if (error instanceof Error && error.name === 'NativeFileOperationBusyError') continue

@@ -202,7 +202,10 @@
                         {#if retryAvailable}
                             <SettingButton variant="secondary" onclick={() => {void retryPortableRestoreBodiesFromOutcome().catch(() => {})}}>{language.retry}</SettingButton>
                         {/if}
-                        <SettingButton onclick={dismissNativeFileOperationOutcome}>{copy.close}</SettingButton>
+                        <SettingButton onclick={() => {void Promise.resolve(dismissNativeFileOperationOutcome()).catch(async error => {
+                            const { alertError } = await import('src/ts/alert')
+                            alertError(failureReason(error?.code ?? ''))
+                        })}}>{copy.close}</SettingButton>
                     {/if}
                 </footer>
             {/if}
