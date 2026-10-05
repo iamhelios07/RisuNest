@@ -63,6 +63,7 @@ const authority = (totalMessages: number): WindowedConversationPersistenceAuthor
 
 function leaseOver(all: Message[], options: { metadata?: boolean } = {}) {
     const bodyReads: Array<[number, number]> = []
+    const metadataQueries: unknown[] = []
     let metadataPages = 0
     const lease = {
         revision: 7,
@@ -82,7 +83,9 @@ function leaseOver(all: Message[], options: { metadata?: boolean } = {}) {
             }
         },
         ...(options.metadata === false ? {} : {
-            async readConversationMessageMetadataWindow({ startIndex, limit }: { startIndex: number, limit: number }) {
+            async readConversationMessageMetadataWindow(query: { startIndex: number, limit: number }) {
+                const { startIndex, limit } = query
+                metadataQueries.push(query)
                 metadataPages += 1
                 const slice = all.slice(startIndex, startIndex + limit)
                 return {
@@ -104,7 +107,7 @@ function leaseOver(all: Message[], options: { metadata?: boolean } = {}) {
             },
         }),
     } as unknown as PersistentRevisionLease
-    return { lease, bodyReads, metadataPages: () => metadataPages }
+    return { lease, bodyReads, metadataQueries, metadataPages: () => metadataPages }
 }
 
 const conversation = (hypaV3Data?: Chat['hypaV3Data']): Omit<Chat, 'message'> => ({
@@ -168,6 +171,18 @@ describe('prepareHistoryWindow', () => {
         expect(rows).toHaveLength(9000)
         expect(rows?.at(-1)?.chatId).toBe('id-8999')
         expect(metadataPages()).toBe(3)
+    })
+
+    it('asks the store to skip parser work, since HypaV3 reads only ids and disabled flags', async () => {
+        const all = messages(5000)
+        const { lease, metadataQueries } = leaseOver(all)
+
+        await readStoreMessageMetadata(lease, authority(all.length), () => {})
+
+        expect(metadataQueries).toEqual([
+            expect.objectContaining({ startIndex: 0, limit: 4096, skipParserWork: true }),
+            expect.objectContaining({ startIndex: 4096, limit: 904, skipParserWork: true }),
+        ])
     })
 
     it('applies the queryChatCount floor for HypaV3', async () => {

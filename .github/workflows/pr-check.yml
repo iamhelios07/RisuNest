@@ -51,8 +51,14 @@ jobs:
       - name: Check test and configuration types
         run: pnpm check:tests
 
+      - name: Check plugin API declarations
+        run: pnpm check:plugin-dts
+
       - name: Build
         run: pnpm build
+
+      - name: Check production bundles for verification code
+        run: pnpm check:production-bundle
 
       - name: Run tests
         run: pnpm test

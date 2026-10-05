@@ -117,8 +117,9 @@ export function updateDeviceSettings(
     const { schema: _schema, ...updates } = partial as Partial<RisuNestDeviceSettings>
     const currentSettings = initializeSettings()
     const next = { ...currentSettings, ...updates }
+    if (!isValidSettings(next)) throw new Error('Invalid device settings')
     const previousPerformanceProfile = currentSettings.performanceProfile
-    settings = isValidSettings(next) ? next : snapshot(defaults)
+    settings = next
     if (settings.performanceProfile !== previousPerformanceProfile) {
         setRuntimePerformanceProfile(settings.performanceProfile)
     }

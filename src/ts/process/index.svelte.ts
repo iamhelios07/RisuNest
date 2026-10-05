@@ -106,6 +106,7 @@ import {
 import { WindowedConversationHistoryOperation } from './historyWindowHistory'
 import {
     captureSessionHistoryWindowController,
+    conversationFieldsOf,
     createHistoryWindowController,
     type HistoryWindowController,
     type HistoryWindowControllerEnvironment,
@@ -322,7 +323,7 @@ async function prepareGenerationHistoryWindow(
         tokenBudget: DBState.db.maxContext * getDeviceSettings().generationHistoryLimitMultiplier,
         // A remote or plugin tokenizer would see every older message, so the window walk counts locally.
         countTokens: hasObservableHistoryTokenizer()
-            ? async (text: string) => (await encodeWithTokenizer(text, 'tik')).length
+            ? async (text: string) => (await encodeWithTokenizer(text, 'o200k_base')).length
             : tokenize,
     }
     const select = async (
@@ -422,21 +423,28 @@ async function prepareGenerationHistoryWindow(
         getCurrentSession: getActiveConversationSession,
         readLiveMetadata: () => {
             const current = currentConversation()
-            return current ? cloneConversationMetadata(current.conversation) : null
+            return current ? conversationFieldsOf(current.conversation) : null
         },
         onLost: () => {
             if (isTargetCurrent() && !signal.aborted) alertError(language.generationConversationChanged)
         },
     }
     const controller = createHistoryWindowController(environment, chat, start, initial)
-    // Prompt history and scripts find messages by id, so missing ids are stored first.
-    for (let index = 0; index < chat.message.length; index += 1) {
-        const message = chat.message[index]
-        if (message.chatId) continue
-        if (!controller.applyRange(index, 1, [{ ...message, chatId: v4() }], 'edit')) {
+    // Prompt history and scripts find messages by id, so missing ids are stored
+    // first, one write per run of messages without one.
+    for (let index = 0; index < chat.message.length;) {
+        if (chat.message[index].chatId) {
+            index += 1
+            continue
+        }
+        let end = index + 1
+        while (end < chat.message.length && !chat.message[end].chatId) end += 1
+        const run = chat.message.slice(index, end).map((message) => ({ ...message, chatId: v4() }))
+        if (!controller.applyRange(index, run.length, run, run.length === 1 ? 'edit' : 'replace-range')) {
             controller.release()
             return null
         }
+        index = end
     }
     attachHistoryWindow(chat, start)
     return {
@@ -461,7 +469,8 @@ export interface SelectedHistoryWindow {
  * Opens a history window over the selected conversation for a chat-screen
  * step that runs outside generation: the token window, or with `tailStart`
  * the messages from the absolute index it returns. A registered window is
- * what CBS, Lua and regex read while the step runs.
+ * what CBS, Lua and regex read while the step runs. Returns null when the
+ * conversation changed while the window was read.
  */
 export async function openSelectedHistoryWindow(options: {
     tailStart?: (totalMessages: number) => number
@@ -480,13 +489,19 @@ export async function openSelectedHistoryWindow(options: {
         }
         return sameConversationTarget(captureSelectedConversationTarget(), target)
     }
-    const window = await prepareGenerationHistoryWindow(
-        target,
-        'none',
-        isTargetCurrent,
-        options.signal ?? new AbortController().signal,
-        options.tailStart,
-    )
+    let window: GenerationHistoryWindow | null
+    try {
+        window = await prepareGenerationHistoryWindow(
+            target,
+            'none',
+            isTargetCurrent,
+            options.signal ?? new AbortController().signal,
+            options.tailStart,
+        )
+    } catch (error) {
+        if (!(error instanceof PersistentMutationFencedError)) throw error
+        window = null
+    }
     if (!window) return null
     const unregister = options.register
         ? registerActiveHistoryWindow({
@@ -916,13 +931,22 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
             : 'history-window'
         const boundedAdmission = boundedFallbackReason === null
         if (historyWindowMemory !== null) {
-            historyWindow = await prepareGenerationHistoryWindow(
-                target,
-                historyWindowMemory,
-                lifecycle.isTargetCurrent,
-                abortSignal,
-            )
-            if (!historyWindow) return false
+            try {
+                historyWindow = await prepareGenerationHistoryWindow(
+                    target,
+                    historyWindowMemory,
+                    lifecycle.isTargetCurrent,
+                    abortSignal,
+                )
+            } catch (error) {
+                if (!(error instanceof PersistentMutationFencedError)) throw error
+            }
+            if (!historyWindow) {
+                if (lifecycle.isTargetCurrent() && !abortSignal.aborted) {
+                    alertError(language.chatConversationActionFailed)
+                }
+                return false
+            }
             const unbind = bindWindowedGenerationController(historyWindow.chat, historyWindow.controller)
             const unregister = registerActiveHistoryWindow({
                 characterId: historyWindow.characterId,
@@ -1942,11 +1966,20 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
     } catch (error) {
         promptScriptOperationScope?.finishAfterError()
         promptScriptOperationScope = null
+        try {
+            historyWindow?.controller.reconcileMetadata()
+        } catch {
+            // The original error is the one to report.
+        }
         throw error
     } finally {
         promptScriptOperationScope?.release()
         promptHistoryCompatibilitySnapshot?.dispose()
         promptHistory.dispose()
+    }
+    // Chat variables the prompt build set on the window chat are stored before the request.
+    if (historyWindow && !historyWindow.controller.reconcileMetadata()) {
+        throw new PersistentMutationFencedError()
     }
     console.log(JSON.stringify(chats, null, 2))
 

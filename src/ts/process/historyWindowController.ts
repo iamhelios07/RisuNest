@@ -1,5 +1,6 @@
 import isEqual from 'lodash/isEqual'
 
+import { replaceArrayRange } from '../arrayRange'
 import { safeStructuredClone } from '../polyfill'
 import {
     cloneConversationMetadata,
@@ -23,7 +24,10 @@ export interface HistoryWindowControllerEnvironment {
     /** The active session, when the generation's conversation is complete. */
     captureSession(): HistoryWindowSessionSource | null
     getCurrentSession(): ActiveConversationSession | null
-    /** The conversation's live metadata, which other writers may change during the generation. */
+    /**
+     * The conversation's live metadata by reference, which other writers may
+     * change during the generation. The controller copies only what it takes.
+     */
     readLiveMetadata(): ConversationFields | null
     /** Called once when no backend holds the window any more. */
     onLost?(): void
@@ -35,6 +39,15 @@ export interface HistoryWindowController extends WindowedConversationMutationCon
      * publishes the window's own metadata changes.
      */
     reconcileMetadata(): boolean
+}
+
+/** The fields of a conversation other than its messages, by reference. */
+export function conversationFieldsOf(conversation: Chat | ConversationFields): ConversationFields {
+    const fields: Record<string, unknown> = {}
+    for (const key of Object.keys(conversation)) {
+        if (key !== 'message') fields[key] = (conversation as unknown as Record<string, unknown>)[key]
+    }
+    return fields as ConversationFields
 }
 
 function sessionHoldsWindow(
@@ -93,10 +106,14 @@ export function captureSessionHistoryWindowController(
                 || localStart + deleteCount > chat.message.length
             ) return false
             const detached = safeStructuredClone([...messages])
+            const expectedMetadata = conversationFieldsOf(conversation)
             session.applyOperation({
                 expectedVersion,
-                expectedMetadata: cloneConversationMetadata(conversation),
-                metadata: cloneConversationMetadata(chat),
+                expectedMetadata,
+                // Unchanged metadata is passed as the baseline itself, so it is not copied.
+                metadata: isEqual(conversationFieldsOf(chat), expectedMetadata)
+                    ? expectedMetadata
+                    : cloneConversationMetadata(chat),
                 ...(deleteCount === 0 && detached.length === 0
                     ? {}
                     : {
@@ -107,7 +124,7 @@ export function captureSessionHistoryWindowController(
                         },
                     }),
             })
-            chat.message.splice(localStart, deleteCount, ...safeStructuredClone(detached))
+            replaceArrayRange(chat.message, localStart, deleteCount, safeStructuredClone(detached))
             expectedVersion = session.version
             return true
         },
@@ -141,15 +158,31 @@ function mergeField(window: unknown, baseline: unknown, live: unknown, nested: b
     return window
 }
 
-function mergeLiveMetadata(chat: Chat, baseline: ConversationFields, live: ConversationFields): void {
+/** Merges live metadata into the window and returns the fields that differ from the baseline. */
+function mergeLiveMetadata(chat: Chat, baseline: ConversationFields, live: ConversationFields): string[] {
     const fields = chat as unknown as Record<string, unknown>
     const base = baseline as Record<string, unknown>
     const current = live as Record<string, unknown>
+    const changed: string[] = []
     for (const key of new Set([...Object.keys(fields), ...Object.keys(base), ...Object.keys(current)])) {
         if (key === 'message') continue
-        const value = mergeField(fields[key], base[key], current[key], false)
+        const windowChanged = !isEqual(fields[key], base[key])
+        if (!windowChanged && isEqual(current[key], base[key])) continue
+        changed.push(key)
+        const value = windowChanged ? mergeField(fields[key], base[key], current[key], false) : current[key]
+        // Live values are references, so whatever the window takes is copied.
         if (value === undefined) delete fields[key]
         else if (value !== fields[key]) fields[key] = safeStructuredClone(value)
+    }
+    return changed
+}
+
+function updateBaseline(baseline: ConversationFields, chat: Chat, keys: readonly string[]): void {
+    const base = baseline as Record<string, unknown>
+    const fields = chat as unknown as Record<string, unknown>
+    for (const key of keys) {
+        if (Object.hasOwn(fields, key)) base[key] = safeStructuredClone(fields[key])
+        else delete base[key]
     }
 }
 
@@ -167,7 +200,7 @@ export function createHistoryWindowController(
     let backend = initial
     let released = false
     let lost = false
-    let baseline = cloneMetadataFields(chat)
+    const baseline = cloneMetadataFields(chat)
     const resolve = (): WindowedConversationMutationController | null => {
         if (released) return null
         if (backend?.isCurrent()) return backend
@@ -196,9 +229,9 @@ export function createHistoryWindowController(
         const current = resolve()
         const live = current ? environment.readLiveMetadata() : null
         if (!current || !live) return false
-        mergeLiveMetadata(chat, baseline, live)
+        const changed = mergeLiveMetadata(chat, baseline, live)
         if (!current.applyRange(localStart, deleteCount, messages, command)) return false
-        baseline = cloneMetadataFields(chat)
+        updateBaseline(baseline, chat, changed)
         return true
     }
     return {
@@ -209,10 +242,11 @@ export function createHistoryWindowController(
         reconcileMetadata() {
             const live = resolve() ? environment.readLiveMetadata() : null
             if (!live) return false
-            mergeLiveMetadata(chat, baseline, live)
-            const merged = cloneMetadataFields(chat)
-            if (isEqual(merged, live)) {
-                baseline = merged
+            const changed = mergeLiveMetadata(chat, baseline, live)
+            const fields = chat as unknown as Record<string, unknown>
+            const current = live as Record<string, unknown>
+            if (changed.every((key) => isEqual(fields[key], current[key]))) {
+                updateBaseline(baseline, chat, changed)
                 return true
             }
             return applyRange(0, 0, [], 'update-metadata')

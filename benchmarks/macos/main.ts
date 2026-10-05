@@ -483,10 +483,6 @@ async function main() {
       "product working-set edit persisted through Rust",
       { revision: persisted.revision, last: persisted.value.message.at(-1)?.data },
     );
-    localStorage.setItem(
-      "macos-app-expected",
-      JSON.stringify({ conversationId, marker }),
-    );
     await report("app", {
       passed: true,
       renderedTextLength: document.getElementById("app")!.textContent!.length,
@@ -542,10 +538,10 @@ async function main() {
         check(read.last === nativeMarker, "native quit saves the fresh product edit", read);
         check(Number.isSafeInteger(saved.revision) && saved.revision > persisted.revision,
           "native quit advances the saved revision", read);
-        localStorage.setItem("macos-app-expected", JSON.stringify({
-          conversationId, marker: nativeMarker, revision: saved.revision,
-        }));
-        await report("app-native-saved", { passed: true, revision: saved.revision });
+        // The controller hands this to the restart; WebKit may drop storage written this close to the quit.
+        await report("app-native-saved", {
+          passed: true, revision: saved.revision, conversationId, marker: nativeMarker,
+        });
       } catch (error) {
         await report("failure", { passed: false, message: String(error), detail: failureDetail(error) });
         throw error;
@@ -575,9 +571,9 @@ async function main() {
     release();
   } else if (phase === "app-restart") {
     await invoke("pds_open");
-    const stored = localStorage.getItem("macos-app-expected");
-    const expected = JSON.parse(stored!);
-    check(expected, "native quit expectation was stored", { stored });
+    const stored = await invoke<string | null>("macos_bench_expected");
+    const expected = stored ? JSON.parse(stored) : null;
+    check(expected, "native quit expectation was handed over", { stored });
     const saved = await invoke<{ revision: number; value: { message: { data: string }[] } }>(
       "pds_read_conversation",
       { characterId: "char-a", conversationId: expected.conversationId },
@@ -596,6 +592,23 @@ async function main() {
       "native quit saved revision survives restart exactly", { stored, actual });
     await report("app-restart", { passed: true, revision: saved.revision });
     await invoke("macos_bench_quit");
+  } else if (phase === "quit-escape") {
+    // The document never acknowledges, as a hung renderer would not.
+    const requests: unknown[] = [];
+    await listen("risu-macos-exit-requested", ({ payload }) => {
+      requests.push(payload);
+    });
+    // As in the product, the page-start reset queued for the main thread runs before the document is ready.
+    await invoke("macos_bench_main_thread_settled");
+    await invoke("macos_lifecycle_ready");
+    await report("quit-escape-ready", { passed: true });
+    await invoke("macos_bench_native_quit");
+    await until(async () => requests.length === 1, "native quit did not reach the document");
+    await report("quit-escape-delivered", { passed: true });
+    // AppKit ends a quit repeated while the first one waits, without asking the product again.
+    await invoke("macos_bench_repeat_native_quit");
+    await pause(15_000);
+    throw new Error("a repeated native quit did not end the app");
   } else if (phase === "streaming") {
     document.getElementById("benchmark")!.remove();
     await import("../streaming/main");
