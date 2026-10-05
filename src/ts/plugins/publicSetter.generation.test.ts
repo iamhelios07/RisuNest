@@ -250,6 +250,7 @@ describe.each<Mode>(['history-limit', 'complete', 'standard-hypa'])('public chat
     let log: ReturnType<typeof vi.spyOn>
     let debug: ReturnType<typeof vi.spyOn>
     let releaseCommit: (() => void) | undefined
+    let restoreCursor: (() => void) | undefined
     let lifetime: AbortController
     let running: Promise<boolean> | undefined
     let pendingWrite: Promise<void> | undefined
@@ -318,6 +319,8 @@ describe.each<Mode>(['history-limit', 'complete', 'standard-hypa'])('public chat
         provider.resolve()
         lifetime.abort()
         await Promise.allSettled([running, pendingWrite])
+        restoreCursor?.()
+        restoreCursor = undefined
         fixture.replacers.clear()
         fixture.outputs.clear()
         access.closeReadBaselines()
@@ -404,6 +407,82 @@ describe.each<Mode>(['history-limit', 'complete', 'standard-hypa'])('public chat
         expect(stored.note).toBe('Held public setter')
         expect(stored.message.map(message => message.data)).toEqual(['covered-a', 'Unawaited insert', 'covered-b', 'tail', 'answer'])
         expect(output).toHaveBeenCalledOnce()
+    })
+
+    it.each([
+        ...['before-projection', 'lease-release', 'cursor'].flatMap(phase => [true, false].map(awaited => ({ phase, awaited, change: 'edit' }))),
+        ...[true, false].map(awaited => ({ phase: 'cursor', awaited, change: 'metadata' })),
+    ])('respects projection ownership at $phase after $change (awaited=$awaited)', async ({ phase, awaited, change }) => {
+        const projected = deferred()
+        const releaseProjection = deferred()
+        releaseCommit = releaseProjection.resolve
+        const originalCursor = fixture.store.commitWorkingSetChangeCursor
+        restoreCursor = () => {
+            if (originalCursor) fixture.store.commitWorkingSetChangeCursor = originalCursor
+            else delete fixture.store.commitWorkingSetChangeCursor
+        }
+        let held = false
+        const hold = async () => {
+            held = true
+            projected.resolve()
+            await releaseProjection.promise
+        }
+        fixture.store.commitWorkingSetChangeCursor = async (revision: number) => {
+            if (phase === 'cursor' && !held && getDatabase().characters[0].chats[0].note === 'Owned projection') await hold()
+            await originalCursor?.call(fixture.store, revision)
+        }
+        if (phase === 'before-projection') {
+            const originalCommit = fixture.store.commit.bind(fixture.store)
+            vi.spyOn(fixture.store, 'commit').mockImplementation(async (input: unknown) => {
+                const result = await originalCommit(input)
+                if (!held && JSON.stringify(input).includes('Owned projection')) await hold()
+                return result
+            })
+        } else if (phase === 'lease-release') {
+            const originalAcquire = fixture.store.acquireRevision.bind(fixture.store)
+            vi.spyOn(fixture.store, 'acquireRevision').mockImplementation(async (revision: number) => {
+                const lease = await originalAcquire(revision)
+                const release = lease.release.bind(lease)
+                lease.release = async () => {
+                    if (!held && getDatabase().characters[0].chats[0].note === 'Owned projection') await hold()
+                    await release()
+                }
+                return lease
+            })
+        }
+        const submitted = structuredClone(initialChat)
+        submitted.note = 'Owned projection'
+        if (phase !== 'before-projection') submitted.message[0].data = 'Public content'
+        fixture.replacers.add(async formated => {
+            pendingWrite = access.setChatToIndex(0, 0, submitted, { pluginName: 'fixture', signal: lifetime.signal })
+            if (awaited) await pendingWrite
+            else void pendingWrite.catch(() => undefined)
+            return formated
+        })
+        const sending = generate()
+        await projected.promise
+        const session = getActiveConversationSession()!
+        const before = session.generationInvalidationVersion
+        if (change === 'edit') {
+            session.replaceRange(session.positionAt(2), 1, [{ ...initialChat.message[2], data: 'Unrelated edit' }])
+            expect(session.generationInvalidationVersion).toBeGreaterThan(before)
+        } else {
+            const version = session.version
+            const persisted = JSON.parse(JSON.stringify(getDatabase().characters[0].chats[0])) as Chat
+            expect(session.adoptPersistedMetadata(persisted, session.storeRevision)).toBe(true)
+            expect(session.version).toBeGreaterThan(version)
+            expect(session.generationInvalidationVersion).toBe(before)
+        }
+        releaseProjection.resolve()
+        provider.resolve()
+        await expect(pendingWrite).resolves.toBeUndefined()
+        await expect(sending).resolves.toBe(change === 'metadata')
+        const stored = await reopen()
+        expect(stored.note).toBe('Owned projection')
+        expect(stored.message.map(message => message.data)).toEqual(change === 'edit'
+            ? [submitted.message[0].data, 'covered-b', 'Unrelated edit']
+            : [submitted.message[0].data, 'covered-b', 'tail', 'answer'])
+        expect(output).toHaveBeenCalledTimes(change === 'metadata' ? 1 : 0)
     })
 
     it('rejects a conversation identity replacement without losing the pending reply', async () => {

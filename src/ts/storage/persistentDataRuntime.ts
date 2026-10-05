@@ -350,6 +350,20 @@ export interface ActivatedLibraryRecoveryLifecycle {
     afterRefresh(): Promise<void>
 }
 
+export interface PersistentUnitIntentProjectionReceipt {
+    readonly revision: DataRevision
+    readonly authorityEpoch: number
+    readonly target: SelectedConversationTarget | null
+    readonly session: ActiveConversationSession | null
+    readonly sessionVersion: number | null
+    readonly generationInvalidationVersion: number | null
+}
+
+export interface PersistentUnitIntentProjectionObserver {
+    beforeProjection(): void
+    afterProjection(receipt: PersistentUnitIntentProjectionReceipt): void
+}
+
 export interface PersistentDataRuntime {
     withPausedPersistentWrites<T>(reason: string, operation: (token: PersistentMutationToken) => Promise<T>): Promise<T>
     beginActivatedLibraryGuard(token: PersistentMutationToken): PersistentActivatedLibraryGuard
@@ -357,7 +371,7 @@ export interface PersistentDataRuntime {
     refreshActivatedLibraryUnderPause(token: PersistentMutationToken): Promise<CommittedApplyOutcome>
     applyLwwReceive(request: LwwStageReceive): Promise<LwwApplyResult>
     drainLwwDeferred(expectedAuthorityEpoch?: number): Promise<void>
-    commitPersistentUnitIntent(reason: string, mutations: readonly PersistentUnitMutation[], conversations?: readonly ConversationMutation[], wholeMessages?: readonly WholeMessageIntent[]): Promise<void>
+    commitPersistentUnitIntent(reason: string, mutations: readonly PersistentUnitMutation[], conversations?: readonly ConversationMutation[], wholeMessages?: readonly WholeMessageIntent[], projectionObserver?: PersistentUnitIntentProjectionObserver): Promise<void>
     /** Prepares at the revision the commit expects, through a reader pinned there; `null` commits nothing. */
     commitPreparedUnitIntent(reason: string, prepare: (reader: PersistentRevisionReader) => Promise<PreparedUnitIntent | null>): Promise<DataRevision | null>
 
@@ -991,7 +1005,7 @@ export function createPersistentDataRuntime(
         }
     }
     const generating = () => [...(dependencies.state.getGeneratingConversations?.() ?? generatingConversations.snapshot())]
-    const projectAppliedUnits = async (result: LwwApplyResult, baseline?: ReturnType<typeof captureLwwWorkingSetBaseline>, localIntent = false, preserveWindowMetadata = false): Promise<void> => {
+    const projectAppliedUnits = async (result: LwwApplyResult, baseline?: ReturnType<typeof captureLwwWorkingSetBaseline>, localIntent = false, preserveWindowMetadata = false, projectionObserver?: PersistentUnitIntentProjectionObserver): Promise<void> => {
         if (!localIntent && result.affectedKeys.length === 0) {
             // Nothing reached the library, so the working set and its mirrors stay untouched.
             coordinator.adoptAppliedUnitState(result.revision, null, null, [], [], undefined, true)
@@ -1014,6 +1028,15 @@ export function createPersistentDataRuntime(
                 .map((field) => [field, (selectedChat as unknown as Record<string, unknown>)[field]] as const))
             : undefined
         const authorityEpoch = coordinator.storageAuthorityEpoch
+        const refreshSelectedSession = () => {
+            if (selectedFields && [...selectedFields].some(([field, value]) => (selectedChat as unknown as Record<string, unknown>)[field] !== value) &&
+                selectedSession!.matchesConversation(selectedTarget!.characterId, selectedChat!) &&
+                !selectedSession!.adoptPersistedMetadata(selectedChat!, result.revision)) {
+                const index = selectedOwner!.chats.indexOf(selectedChat!)
+                if (index >= 0) selectedOwner!.chats[index] = { ...selectedChat! }
+            }
+            if (selectedTarget && selectedSession) workingSet.refreshSelectedConversationAfterReplacement(selectedTarget, selectedSession)
+        }
         const lease = await dependencies.store.acquireRevision(result.revision)
         const projectionBaseline = baseline
         const rootFields = [...new Set(result.affectedKeys.flatMap((key) => {
@@ -1035,6 +1058,7 @@ export function createPersistentDataRuntime(
                 if (dependencies.state.captureWorkingSetDatabase?.() !== database) throw new Error('Persistent working set changed during unit projection')
                 dependencies.state.beforeCapture?.()
                 rootBefore = rootFields.map(rootValue)
+                projectionObserver?.beforeProjection()
             }, () => {
                 const canonicalCapture = dependencies.state.canonicalCapture
                 const beforeDerive = canonicalCapture?.root() ?? canonicalJson(dependencies.state.captureRoot())
@@ -1047,6 +1071,19 @@ export function createPersistentDataRuntime(
                     const root = projectionBaseline.root as unknown as Record<string, unknown>
                     if (mutation.type === 'set') root[mutation.key] = canonicalClone(mutation.value)
                     else delete root[mutation.key]
+                }
+                if (projectionObserver) {
+                    // Capture ownership in the publication turn, before lease release or cursor I/O can yield.
+                    refreshSelectedSession()
+                    const session = workingSet.activeConversationSession
+                    projectionObserver.afterProjection({
+                        revision: result.revision,
+                        authorityEpoch,
+                        target: workingSet.captureSelectedConversationTarget(),
+                        session,
+                        sessionVersion: session?.version ?? null,
+                        generationInvalidationVersion: session?.generationInvalidationVersion ?? null,
+                    })
                 }
             })
             // A windowed shell holds no messages to patch; its row source needs the received count instead.
@@ -1072,14 +1109,7 @@ export function createPersistentDataRuntime(
             try { dependencies.state.afterRemoteRootChange?.(changedRootFields) }
             catch (error) { dependencies.onBackgroundError?.(error) }
         }
-        if (selectedFields && [...selectedFields].some(([field, value]) => (selectedChat as unknown as Record<string, unknown>)[field] !== value) &&
-            selectedSession!.matchesConversation(selectedTarget!.characterId, selectedChat!) &&
-            !selectedSession!.adoptPersistedMetadata(selectedChat!, result.revision)) {
-            // A session that cannot adopt the change is republished from a new object.
-            const index = selectedOwner!.chats.indexOf(selectedChat!)
-            if (index >= 0) selectedOwner!.chats[index] = { ...selectedChat! }
-        }
-        if (selectedTarget && selectedSession) workingSet.refreshSelectedConversationAfterReplacement(selectedTarget, selectedSession)
+        if (!projectionObserver) refreshSelectedSession()
         for (const key of result.affectedKeys) {
             const [kind, owner, name] = JSON.parse(key)
             if (kind === 'plugin') dependencies.state.onPluginStorageChanged?.(owner, name)
@@ -1176,7 +1206,7 @@ export function createPersistentDataRuntime(
             })
         },
         drainLwwDeferred,
-        async commitPersistentUnitIntent(reason, mutations, conversations, wholeMessages) {
+        async commitPersistentUnitIntent(reason, mutations, conversations, wholeMessages, projectionObserver) {
             // Translation reads the effective identity records, so unsaved mirror
             // edits reach them first.
             dependencies.state.beforeCapture?.()
@@ -1184,7 +1214,7 @@ export function createPersistentDataRuntime(
             const affectedKeys = unitIntentAffectedKeys(translated, conversations ?? [])
             for (const value of wholeMessages ?? []) affectedKeys.push(JSON.stringify(['messages', value.characterId, value.conversationId]))
             await coordinator.commitPersistentUnitIntent(reason, translated, conversations, wholeMessages, async (revision) => {
-                try { await projectAppliedUnits({ revision, affectedKeys, heldKeys: [], deferredKeys: [] }, undefined, true) }
+                try { await projectAppliedUnits({ revision, affectedKeys, heldKeys: [], deferredKeys: [] }, undefined, true, false, projectionObserver) }
                 catch (error) { coordinator.markCommittedWorkingSetRefreshRequired(revision, error); throw error }
             })
         },

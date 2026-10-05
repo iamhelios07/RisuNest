@@ -1,4 +1,5 @@
 import type { GeneratingConversation } from '../storage/persistentDataStore'
+import type { PersistentUnitIntentProjectionReceipt } from '../storage/persistentDataRuntime'
 
 // A generation's request is pending between prompt building and the output message.
 // Plugin patches of plugin-owned fields may commit only then, and the generation waits
@@ -8,8 +9,9 @@ const key = (target: GeneratingConversation) => JSON.stringify([target.character
 const openPhases = new Map<string, number>()
 const patchesInFlight = new Map<string, Set<Promise<void>>>()
 interface PublicWriteObserver {
-    isCurrent(): boolean
-    adopt(): Promise<void>
+    prepare(): (() => boolean) | null
+    invalidate(): void
+    adopt(receipt: PersistentUnitIntentProjectionReceipt): Promise<void>
 }
 const publicWriteObservers = new Map<string, Set<PublicWriteObserver>>()
 
@@ -45,17 +47,31 @@ export function captureGenerationPublicWrite(target: GeneratingConversation | nu
     if (!target || !isGenerationRequestPhaseOpen(target)) return null
     const candidates = [...publicWriteObservers.get(key(target)) ?? []]
     const release = trackConversationPatch(target)
-    let accepted: PublicWriteObserver[] = []
+    let accepted: Array<{ observer: PublicWriteObserver; isCurrent: () => boolean }> = []
+    let projection: PersistentUnitIntentProjectionReceipt | null = null
     let finished = false
     return {
         prepare(actual: GeneratingConversation) {
-            if (key(actual) === key(target)) accepted = candidates.filter((observer) => observer.isCurrent())
+            if (key(actual) === key(target)) accepted = candidates.flatMap((observer) => {
+                const isCurrent = observer.prepare()
+                return isCurrent ? [{ observer, isCurrent }] : []
+            })
+        },
+        beforeProjection() {
+            accepted = accepted.filter(({ observer, isCurrent }) => {
+                if (isCurrent()) return true
+                observer.invalidate()
+                return false
+            })
+        },
+        afterProjection(receipt: PersistentUnitIntentProjectionReceipt) {
+            if (receipt.target && key(receipt.target) === key(target)) projection = receipt
         },
         async finish(committed: boolean) {
             if (finished) return
             finished = true
             try {
-                if (committed) for (const observer of accepted) await observer.adopt()
+                if (committed && projection) for (const { observer } of accepted) await observer.adopt(projection)
             } finally {
                 release()
             }
