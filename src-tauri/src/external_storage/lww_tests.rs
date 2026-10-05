@@ -299,6 +299,26 @@ fn a_saved_publication_keeps_its_asset_pins_across_a_page_reload_until_it_is_sen
     })
 }
 #[test]
+fn publication_uses_inline_and_local_sources_without_opening_an_unused_server_registry() {
+    run(async {
+        let mut f=CycleFixture::new();
+        set(&mut f.a,&["root","language"],serde_json::json!("synthetic-language"));
+        let body=b"synthetic local publication body";
+        let hash=small_asset(&mut f.a,"synthetic-local-registry",body);
+        let registry=crate::server_sync::residency::Residency::path(f.directory_a.path());
+        std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
+        std::fs::write(&registry,b"synthetic invalid unused SQLite registry").unwrap();
+        assert!(crate::server_sync::residency::Residency::open(f.directory_a.path()).is_err());
+        assert_eq!(f.publish_a().await.segments.0,1);
+        assert_eq!(f.receive_b().await,1);
+        let mut restored=hydrate_receiver(&f,&hash).await;
+        let mut bytes=Vec::new();
+        std::io::Read::read_to_end(&mut restored,&mut bytes).unwrap();
+        assert_eq!(bytes,body);
+    })
+}
+
+#[test]
 fn small_assets_use_authenticated_catalogs_and_present_bootstrap_reads_no_bodies() {
     run(async {
         use crate::asset_repository::body_io::{reset_body_io, take_body_io, register_object_purpose, BodyPurpose};
