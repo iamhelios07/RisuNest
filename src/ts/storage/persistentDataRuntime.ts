@@ -680,6 +680,8 @@ export function createPersistentDataRuntime(
         onStorageOnlyRevision: (revision) => workingSet.advanceStoreRevision(revision),
         onWindowedSelectedConversationRevision: (revision, totalMessages) =>
             workingSet.advanceStoreRevision(revision, totalMessages),
+        completeWindowedSelectedConversation: (authority, messages) =>
+            workingSet.completeWindowedConversationForSave(authority, messages),
         onConversationMutationPersistenceStarted: (event) =>
             workingSet.beginConversationMutationPersistence(event),
         onConversationMutationPersisted: (event) => {

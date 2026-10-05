@@ -19,6 +19,7 @@ import {
     publishPersistentConversationReplacementToWorkingSet,
     type PersistentDataRuntimeStateAdapter,
 } from './persistentDataRuntime'
+import type { SaveCoordinatorClock } from './saveCoordinator'
 import { createConversationSummaryStubFromChat } from './conversationResidency'
 import { createSelectedConversationOperations } from '../selectedConversationOperations'
 import { readSelectedConversationLatestTail } from '../selectedConversationTail'
@@ -1234,6 +1235,140 @@ describe('selected conversation lifecycle', () => {
         expect(source.snapshot().rowAt(20)?.message).toMatchObject({ data: 'remote tail' })
         await runtime.flushPendingDataLocally('after-windowed-receive')
         expect(runtime.getSelectedConversationMode()).toBe('windowed')
+    })
+
+    async function createWindowedEditRuntime(options: {
+        clock?: SaveCoordinatorClock
+        onLocalSaveFailure?: (error: unknown | null) => void
+    } = {}) {
+        const database = {
+            username: 'Direct edit fixture',
+            characters: [makeCharacter(makeChat(20))],
+        } as unknown as Database
+        let workingCopy = structuredClone(database)
+        const store = new IndexedDbPersistentDataStore(
+            `selected-direct-edit-${crypto.randomUUID()}`,
+            indexedDB,
+            IDBKeyRange,
+        )
+        await store.open()
+        await store.replaceFromDatabase(database)
+        const state: PersistentDataRuntimeStateAdapter = {
+            captureRoot: () => capturePersistentRoot(workingCopy),
+            captureWorkingSetDatabase: () => workingCopy,
+            captureCharacters: () => workingCopy.characters,
+            captureSelectedCharacter: () => workingCopy.characters[0] ?? null,
+            captureCharacter: (id) =>
+                workingCopy.characters.find((character) => character.chaId === id) ?? null,
+            getSelectedCharacterId: () => workingCopy.characters[0]?.chaId,
+            getSelectedConversationId: () => workingCopy.characters[0]?.chats[0]?.id,
+            replaceDatabase: (next) => {
+                workingCopy = next
+            },
+            publishCharacter: (next) => {
+                workingCopy.characters[0] = next
+            },
+            publishConversation: (_characterId, conversation, nextCharacter) => {
+                if (nextCharacter) workingCopy.characters[0] = nextCharacter
+                else workingCopy.characters[0].chats[0] = conversation
+            },
+            canUseWindowedSelectedConversation: () => true,
+            isConversationOperationActive: () => false,
+        }
+        const runtime = createPersistentDataRuntime({
+            store,
+            state,
+            prepareDatabase: async (candidate) => candidate,
+            clock: options.clock,
+            onLocalSaveFailure: options.onLocalSaveFailure,
+        })
+        await runtime.initializeActiveWorkingSet(workingCopy)
+        expect(runtime.getSelectedConversationMode()).toBe('windowed')
+        return { store, runtime, selected: () => workingCopy.characters[0] }
+    }
+
+    it('saves a direct edit of the open windowed chat with its recorded message edits', async () => {
+        const failures: unknown[] = []
+        const { store, runtime, selected } = await createWindowedEditRuntime({
+            onLocalSaveFailure: (error) => failures.push(error),
+        })
+        const controller = await runtime.captureWindowedMessageMutation(
+            runtime.captureSelectedConversationTarget()!,
+            5,
+            { role: 'char', data: 'message-5', chatId: 'message-5' },
+        )
+        expect(controller?.applyRange(
+            0,
+            1,
+            [{ role: 'char', data: 'edited five', chatId: 'message-5' }],
+            'edit',
+        )).toBe(true)
+        controller!.release()
+        selected().chats[0].note = 'direct note'
+        runtime.markPersistentDataDirty(1)
+
+        await runtime.flushPendingDataLocally('direct-shell-edit')
+
+        const stored = await store.readConversation('char-a', 'chat-a')
+        expect(stored?.value.note).toBe('direct note')
+        expect(stored?.value.message.map((message) => message.data)).toEqual(
+            Array.from({ length: 20 }, (_, index) => index === 5 ? 'edited five' : `message-${index}`),
+        )
+        expect(failures.filter((failure) => failure !== null)).toEqual([])
+        const lease = await runtime.acquireCompleteConversation('character-tab')
+        expect(selected().chats[0].note).toBe('direct note')
+        expect(selected().chats[0].message[5]).toMatchObject({ data: 'edited five' })
+        lease.release()
+    })
+
+    it('opens the complete chat when the save before it writes a direct edit whole', async () => {
+        const { store, runtime, selected } = await createWindowedEditRuntime()
+        selected().chats[0].note = 'direct note'
+        runtime.markPersistentDataDirty(1)
+
+        const lease = await runtime.acquireCompleteConversation('character-tab')
+
+        expect(runtime.getSelectedConversationMode()).toBe('complete')
+        expect(selected().chats[0].message).toHaveLength(20)
+        expect((await store.readConversation('char-a', 'chat-a'))?.value.note).toBe('direct note')
+        lease.release()
+    })
+
+    it('reports the current chat and stops retrying when its direct edit cannot be saved', async () => {
+        const timers = new Map<number, () => void>()
+        let nextTimer = 0
+        const clock: SaveCoordinatorClock = {
+            setTimeout: (callback) => {
+                timers.set(++nextTimer, callback)
+                return nextTimer
+            },
+            clearTimeout: (handle) => {
+                timers.delete(handle as number)
+            },
+        }
+        const failures: unknown[] = []
+        const { store, runtime, selected } = await createWindowedEditRuntime({
+            clock,
+            onLocalSaveFailure: (error) => failures.push(error),
+        })
+        const readConversation = store.readConversation.bind(store)
+        vi.spyOn(store, 'readConversation').mockImplementation(async (characterId, conversationId) => {
+            const result = await readConversation(characterId, conversationId)
+            return result && { ...result, value: { ...result.value, message: result.value.message.slice(1) } }
+        })
+        selected().chats[0].note = 'direct note'
+        expect(timers.size).toBe(0)
+        runtime.markPersistentDataDirty(1)
+        expect(timers.size).toBe(1)
+        const [[debounce, flush]] = timers
+        timers.delete(debounce)
+        flush()
+
+        await vi.waitFor(() => {
+            expect(failures.at(-1)).toMatchObject({ name: 'WindowedConversationSaveError' })
+        })
+        expect(timers.size).toBe(0)
+        expect((await readConversation('char-a', 'chat-a'))?.value.note).toBe('note')
     })
 
     it('keeps a windowed selected conversation authoritative across a root module append', async () => {

@@ -2241,6 +2241,13 @@ export class ActiveWorkingSet {
         let target = initialTarget
         if (this.selectedConversationState !== initialState) {
             const current = this.selectedConversationState
+            // A save completes the conversation itself when its edits have to be written whole.
+            if (
+                current?.kind === 'complete' &&
+                current.characterId === initialState.characterId &&
+                current.conversationId === initialState.conversationId &&
+                current.navigationGeneration === initialTarget.navigationGeneration
+            ) return current
             if (
                 current?.kind !== 'windowed' ||
                 current.characterId !== initialState.characterId ||
@@ -2365,6 +2372,98 @@ export class ActiveWorkingSet {
         state.viewportSource.dispose()
         this.notifyActiveConversationViewportSource()
         return complete
+    }
+
+    /**
+     * Publishes the selected windowed conversation with the given complete messages and its live
+     * metadata. The coordinator calls this inside a save and keeps its persisted baseline, so
+     * nothing here adopts the published character.
+     */
+    completeWindowedConversationForSave(
+        authority: WindowedConversationPersistenceAuthority,
+        messages: Message[],
+    ): CompleteCharacter | null {
+        const state = this.selectedConversationState
+        if (
+            state?.kind !== 'windowed' ||
+            state.characterId !== authority.characterId ||
+            state.conversationId !== authority.conversationId ||
+            state.authority.sessionToken !== authority.sessionToken ||
+            state.authority.sessionVersion !== authority.sessionVersion ||
+            state.authority.totalMessages !== authority.totalMessages ||
+            state.authority.storeRevision !== authority.storeRevision
+        ) return null
+        const resident = this.dependencies.getResidentCharacter?.(state.characterId)
+        const conversationIndex = resident?.chats.findIndex(
+            (conversation) => conversation === state.conversation,
+        ) ?? -1
+        if (!resident || conversationIndex < 0) return null
+        const conversation = {
+            ...cloneConversationMetadata(state.conversation),
+            message: messages,
+        } as Chat
+        const nextCharacter = {
+            ...resident,
+            chats: resident.chats.map((candidate, index) =>
+                index === conversationIndex ? conversation : candidate),
+        } as CompleteCharacter
+        let complete: CompleteSelectedConversationState | null = null
+        let publishedCharacter: CompleteCharacter | undefined
+        try {
+            this.selectedConversationState = null
+            this.activeSession = null
+            this.dependencies.publishConversation(
+                state.characterId,
+                conversation,
+                nextCharacter,
+                { representationOnly: true },
+            )
+            publishedCharacter = this.dependencies.getResidentCharacter?.(state.characterId)
+            const publishedConversation =
+                publishedCharacter?.chats[publishedCharacter.chatPage ?? 0]
+            if (
+                !publishedCharacter ||
+                publishedCharacter.chaId !== state.characterId ||
+                !matchesPublishedCharacter(
+                    nextCharacter,
+                    publishedCharacter,
+                    state.conversationId,
+                    true,
+                ) ||
+                !publishedConversation ||
+                publishedConversation.id !== state.conversationId ||
+                isMetadataOnlySelectedConversation(publishedConversation)
+            ) {
+                throw new Error('Complete selected conversation publication diverged')
+            }
+            complete = this.createCompleteSelectedConversationState(
+                state.characterId,
+                publishedConversation,
+                state.authority.storeRevision,
+                state.navigationGeneration,
+            )
+            this.selectedConversationState = complete
+            this.activeSession = complete.session
+        } catch (error) {
+            this.selectedConversationState = state
+            this.activeSession = null
+            complete?.viewportSource.dispose()
+            complete?.session.invalidate()
+            try {
+                this.dependencies.publishConversation(
+                    state.characterId,
+                    state.conversation,
+                    resident,
+                    { representationOnly: true },
+                )
+            } catch {
+                this.clearActiveConversationSession()
+            }
+            throw error
+        }
+        state.viewportSource.dispose()
+        this.notifyActiveConversationViewportSource()
+        return publishedCharacter
     }
 
     private createCompleteSelectedConversationState(

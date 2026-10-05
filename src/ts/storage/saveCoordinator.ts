@@ -126,6 +126,15 @@ export interface SaveCoordinatorDependencies {
     onStorageOnlyRevision?(revision: DataRevision): void
     /** Advances an adopted windowed selected-conversation authority synchronously, with its new message count when that changed. */
     onWindowedSelectedConversationRevision?(revision: DataRevision, totalMessages?: number): void
+    /**
+     * Replaces the selected windowed conversation with the given complete messages synchronously,
+     * keeping its live metadata, and returns the published character. Returns null without
+     * publishing when the selection no longer matches the authority.
+     */
+    completeWindowedSelectedConversation?(
+        authority: WindowedConversationPersistenceAuthority,
+        messages: Message[],
+    ): CompleteCharacter | null
     onConversationMutationPersistenceStarted?(
         event: ActiveConversationMutationEvent,
     ): ConversationMutationPersistenceHandle | null | undefined
@@ -174,6 +183,13 @@ export class WindowedConversationRequiresCompatibilityError extends Error {
     constructor(reason: string) {
         super(`Windowed conversation requires complete compatibility: ${reason}`)
         this.name = 'WindowedConversationRequiresCompatibilityError'
+    }
+}
+
+export class WindowedConversationSaveError extends Error {
+    constructor(reason: string, cause?: unknown) {
+        super(`The selected conversation could not be completed for saving: ${reason}`, { cause })
+        this.name = 'WindowedConversationSaveError'
     }
 }
 
@@ -2770,12 +2786,27 @@ export class SaveCoordinator {
                     'character addition requires a complete selected character',
                 )
             }
-            const conversationProjection = windowedCapture
-                ? await this.projectWindowedConversationMutations(
-                      captured,
-                      pendingConversationMutations,
-                  )
-                : this.projectConversationMutations(captured, pendingConversationMutations)
+            let conversationProjection: ConversationMutationProjection | null
+            try {
+                conversationProjection = windowedCapture
+                    ? await this.projectWindowedConversationMutations(
+                          captured,
+                          pendingConversationMutations,
+                      )
+                    : this.projectConversationMutations(captured, pendingConversationMutations)
+            } catch (error) {
+                if (
+                    !windowedCapture ||
+                    !(error instanceof WindowedConversationRequiresCompatibilityError) ||
+                    !(await this.completeWindowedConversation(
+                        windowedCapture,
+                        pendingConversationMutations,
+                        error,
+                    ))
+                )
+                    throw error
+                continue
+            }
             const recordedConversations = conversationProjection?.exactMutations ?? null
             const commit: WorkingSetCommit = { expectedRevision: this.revision }
             const materialized = await this.captureMaterializedChanges(commit, windowedCapture?.authority.characterId)
@@ -3582,6 +3613,101 @@ export class SaveCoordinator {
         this.windowedCharacterBaseline = null
         this.pendingWindowedActivationChange = null
         this.pendingWindowedChatListChange = null
+    }
+
+    /**
+     * Saves a windowed selection whose live state the recorded edits cannot explain: the
+     * conversation is rebuilt from the persisted messages and those edits, published complete,
+     * and diffed against the persisted state on the next pass. Returns false when this cannot
+     * run now, leaving the original failure to the usual retry.
+     */
+    private async completeWindowedConversation(
+        current: WindowedSelectedCharacterCapture,
+        pending: readonly PendingConversationMutation[],
+        cause: WindowedConversationRequiresCompatibilityError,
+    ): Promise<boolean> {
+        const complete = this.dependencies.completeWindowedSelectedConversation
+        const baseline = this.windowedCharacterBaseline
+        if (
+            !complete ||
+            !this.dependencies.captureCharacters ||
+            !baseline ||
+            this.dependencies.isConversationOperationActive?.() === true
+        )
+            return false
+        const authority = current.authority
+        let persisted: Awaited<ReturnType<PersistentDataStore['readConversation']>>
+        try {
+            persisted = await this.dependencies.store.readConversation(
+                authority.characterId,
+                authority.conversationId,
+            )
+        } catch (error) {
+            throw new WindowedConversationSaveError('the persisted conversation could not be read', error)
+        }
+        if (
+            !persisted ||
+            persisted.revision !== this.revision ||
+            persisted.value.id !== authority.conversationId ||
+            !Array.isArray(persisted.value.message) ||
+            persisted.value.message.length !== baseline.authority.totalMessages
+        )
+            throw new WindowedConversationSaveError('the persisted conversation changed', cause)
+        const persistedConversation = persisted.value
+        let messages = persistedConversation.message
+        let version = baseline.authority.persistedSessionVersion
+        for (const { event } of pending) {
+            if (
+                event.characterId !== authority.characterId ||
+                event.conversationId !== authority.conversationId ||
+                event.sessionToken !== authority.sessionToken ||
+                event.previousVersion !== version ||
+                event.sessionVersion <= version
+            )
+                throw new WindowedConversationSaveError('recorded edits are not a contiguous prefix', cause)
+            for (const range of event.mutations) {
+                if (
+                    range.completeOwner ||
+                    range.start > messages.length ||
+                    range.deleteCount > messages.length - range.start
+                )
+                    throw new WindowedConversationSaveError('a recorded edit exceeds the conversation', cause)
+                messages = messages
+                    .slice(0, range.start)
+                    .concat(range.messages, messages.slice(range.start + range.deleteCount))
+            }
+            version = event.sessionVersion
+        }
+        if (version !== authority.sessionVersion || messages.length !== authority.totalMessages)
+            throw new WindowedConversationSaveError('recorded edits do not reach the live conversation', cause)
+
+        let published: CompleteCharacter | null
+        this.selectedConversationTransitionActive = true
+        try {
+            published = complete(authority, messages)
+        } catch (error) {
+            throw new WindowedConversationSaveError('the complete conversation could not be published', error)
+        } finally {
+            this.selectedConversationTransitionActive = false
+        }
+        if (!published) return false
+        const persistedCharacter = {
+            ...baseline.shell,
+            chats: baseline.shell.chats.map((conversation) =>
+                conversation.id === authority.conversationId ? persistedConversation : conversation),
+        } as CompleteCharacter
+        this.materializedBaselines.set(authority.characterId, captureMaterializedCharacter(persistedCharacter))
+        this.materializedCanonicalBaselines.delete(authority.characterId)
+        this.characterBaseline = canonicalJson(persistedCharacter)
+        this.characterBaselineId = authority.characterId
+        this.windowedCharacterBaseline = null
+        this.pendingWindowedActivationChange = null
+        this.pendingWindowedChatListChange = null
+        const covered = new Set(pending)
+        this.pendingConversationMutations = this.pendingConversationMutations.filter(
+            (value) => !covered.has(value),
+        )
+        return true
     }
 
     private setWindowedCharacterBaseline(
@@ -4856,6 +4982,7 @@ export class SaveCoordinator {
         }
         this.reportBackgroundError(error)
         if (this.dirtyGeneration !== this.persistedDirtyGeneration &&
+            !(error instanceof WindowedConversationSaveError) &&
             !(error instanceof TypeError) && !(error instanceof RevisionConflictError) &&
             !(error instanceof Error && (error.name === 'QuotaExceededError' || error.name === 'UnsaveableValueError' || error.name === 'PayloadTooLargeError'))) {
             this.armDebounce(this.backgroundRetryDelay)
