@@ -36,7 +36,7 @@ fn portable_adoption_requires_completed_exact_native_session_before_release() {
     let job="coordinated-adoption";
     let id=coordinator.create_native_portable_session(job,true,&selected,0,Some(stage)).unwrap();
     let header=crate::persistent_store::lww::Header {binding_authority:store.lww_binding_authority().unwrap(),request_id:job.into()};
-    coordinator.set_library_replacement(&id,&header,&std::collections::BTreeMap::new()).unwrap();
+    coordinator.set_library_replacement(&id,&header,std::collections::BTreeMap::new().into_iter().map(Ok)).unwrap();
     journal_prepared_native_sections(&coordinator,&id,Spool::Source,&source).unwrap();
     coordinator.source_ready(&id).unwrap();
     journal_prepared_native_sections(&coordinator,&id,Spool::Rollback,&rollback).unwrap();
@@ -104,7 +104,7 @@ fn journaled_restore_carries_large_device_values_in_source_and_rollback_spools()
     let header = crate::persistent_store::lww::Header {
         binding_authority: store.lww_binding_authority().unwrap(), request_id: job.into(),
     };
-    coordinator.set_library_replacement(&id, &header, &std::collections::BTreeMap::new()).unwrap();
+    coordinator.set_library_replacement(&id, &header, std::collections::BTreeMap::new().into_iter().map(Ok)).unwrap();
     journal_prepared_native_sections(&coordinator, &id, Spool::Source, &source).unwrap();
     coordinator.source_ready(&id).unwrap();
     journal_prepared_native_sections(&coordinator, &id, Spool::Rollback, &rollback).unwrap();
@@ -697,7 +697,7 @@ fn native_journal_resumes_before_intent_and_around_an_inflight_section_commit() 
         let id = coordinator
             .create_native_portable_session("synthetic-job", true, &selected, 0, Some(stage.clone()))
             .unwrap();
-        coordinator.set_library_replacement(&id, &header, &units).unwrap();
+        coordinator.set_library_replacement(&id, &header, units.clone().into_iter().map(Ok)).unwrap();
         let source_manifests = journal_prepared_native_sections(
             &coordinator,
             &id,
@@ -815,7 +815,7 @@ fn native_library_stage_survives_reopen_and_marker_prevents_second_activation() 
         binding_authority: store.lww_binding_authority().unwrap(),
         request_id: "library-recovery-job".into(),
     };
-    coordinator.set_library_replacement(&id, &header, &units).unwrap();
+    coordinator.set_library_replacement(&id, &header, units.clone().into_iter().map(Ok)).unwrap();
     journal_prepared_native_sections(
         &coordinator,
         &id,

@@ -1388,21 +1388,19 @@ impl super::PersistentStore {
             let reader = open_generation_reader(&candidate,&generation)?;
             let stage = self.stage_portable_records(&reader,probe)?;
             let result = (|| {
-                let mut original_units=std::collections::BTreeMap::new();
-                {
-                    let mut rows=source.prepare("SELECT key,value FROM snapshot_original_units ORDER BY key")?;
-                    let mut cursor=rows.query([])?;
-                    while let Some(row)=cursor.next()? {
-                        cancelled(probe)?;
-                        let key:risunest_sync_wire::unit::UnitKey=row.get::<_,String>(0)?.try_into().map_err(|error:risunest_sync_wire::WireError|validation(error.to_string()))?;
-                        let value:risunest_sync_wire::unit::UnitValue=serde_json::from_str(&row.get::<_,String>(1)?)?;
-                        value.validate().map_err(|error|validation(error.to_string()))?;
-                        if matches!(key.components().first().map(String::as_str),Some("hypa"|"plugin-local")) {return Err(validation("snapshot source contains device units"));}
-                        super::lww::validate_received(&source,&key,&value)?;
-                        original_units.insert(key,value);
-                    }
-                }
-                let inventory=super::external_capture::original_unit_dependency_inventory(&original_units,&|hash| {
+                // The original units are read from the snapshot twice, to verify them and then to stage them, instead of being held in memory.
+                let mut rows=source.prepare("SELECT key,value FROM snapshot_original_units ORDER BY key")?;
+                let original_units=rows.query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))?.map(|row| -> StoreResult<(risunest_sync_wire::unit::UnitKey,risunest_sync_wire::unit::UnitValue)> {
+                    cancelled(probe)?;
+                    let (key,value)=row?;
+                    let key:risunest_sync_wire::unit::UnitKey=key.try_into().map_err(|error:risunest_sync_wire::WireError|validation(error.to_string()))?;
+                    let value:risunest_sync_wire::unit::UnitValue=serde_json::from_str(&value)?;
+                    value.validate().map_err(|error|validation(error.to_string()))?;
+                    if matches!(key.components().first().map(String::as_str),Some("hypa"|"plugin-local")) {return Err(validation("snapshot source contains device units"));}
+                    super::lww::validate_received(&source,&key,&value)?;
+                    Ok((key,value))
+                });
+                let inventory=super::external_capture::streamed_unit_dependency_inventory(original_units,&|hash| {
                     let length:Option<i64>=source.query_row("SELECT length(body) FROM message_page_objects WHERE hash=?1",[hash],|row|row.get(0)).optional()?;
                     if length.is_some_and(|length|length<0 || length as u64>risunest_sync_wire::MAX_METADATA_BYTES as u64) {return Err(validation("snapshot control exceeds its byte limit"));}
                     Ok(source.query_row("SELECT body FROM message_page_objects WHERE hash=?1",[hash],|row|row.get(0)).optional()?)
@@ -1430,10 +1428,14 @@ impl super::PersistentStore {
                     tx.execute("INSERT OR IGNORE INTO snapshot_restore_payloads VALUES(?1,?2,?3,0,?4)",rusqlite::params![stage.staging_id,hash,i64::try_from(size).map_err(|_|validation("snapshot payload size exceeds SQLite range"))?,cached])?;
                     if cached {tx.execute("UPDATE snapshot_restore_payloads SET cached=1 WHERE stage_id=?1 AND hash=?2",rusqlite::params![stage.staging_id,hash])?;}
                 }
-                for (key,value) in &original_units {
+                let mut cursor=rows.query([])?;
+                while let Some(row)=cursor.next()? {
                     cancelled(probe)?;
-                    tx.execute("INSERT INTO snapshot_restore_units VALUES(?1,?2,?3)",rusqlite::params![stage.staging_id,key.as_str(),serde_json::to_string(value)?])?;
+                    let key:risunest_sync_wire::unit::UnitKey=row.get::<_,String>(0)?.try_into().map_err(|error:risunest_sync_wire::WireError|validation(error.to_string()))?;
+                    let value:risunest_sync_wire::unit::UnitValue=serde_json::from_str(&row.get::<_,String>(1)?)?;
+                    super::lww::insert_replacement_source(&tx,&stage.staging_id,super::lww::STAGED_SOURCE,&key,&value)?;
                 }
+                drop(cursor);
                 let mut statement = source.prepare("SELECT o.hash,o.body FROM message_page_objects o JOIN message_page_verified_objects v ON v.hash=o.hash")?;
                 let mut rows = statement.query([])?;
                 while let Some(row) = rows.next()? {
@@ -1463,15 +1465,13 @@ impl super::PersistentStore {
         if state == "committed" { return Ok(super::RevisionResult {revision:revision.ok_or_else(||validation("snapshot commit receipt missing"))?}); }
         let request_completed:bool = self.connection.query_row("SELECT EXISTS(SELECT 1 FROM lww_requests WHERE request_id=?1)",[&request_id],|r|r.get(0))?;
         if !request_completed && self.revision()? != expected_revision { return Err(super::StoreError::RevisionConflict {expected:expected_revision,actual:self.revision()?}); }
-        let mut units = std::collections::BTreeMap::new();
-        {
-            let mut statement = self.connection.prepare("SELECT key,value FROM snapshot_restore_units WHERE stage_id=?1 ORDER BY key")?;
-            let mut rows = statement.query([stage_id])?;
-            while let Some(row) = rows.next()? { units.insert(row.get::<_,String>(0)?.try_into().map_err(|error:risunest_sync_wire::WireError|validation(error.to_string()))?,serde_json::from_str(&row.get::<_,String>(1)?)?); }
-        }
         let header = super::lww::Header {binding_authority,request_id};
-        let result = self.lww_commit_replacement_units(&header,stage_id,Some(&units))?;
-        self.connection.execute("UPDATE snapshot_restore_stages SET state='committed',revision=?2 WHERE stage_id=?1",rusqlite::params![stage_id,result.revision])?;
+        let result = self.lww_commit_staged_replacement(&header,stage_id)?;
+        // A committed stage returns its receipt above, so its source units are no longer read.
+        let tx = self.connection.transaction()?;
+        tx.execute("UPDATE snapshot_restore_stages SET state='committed',revision=?2 WHERE stage_id=?1",rusqlite::params![stage_id,result.revision])?;
+        super::lww::clear_replacement_source(&tx,stage_id,None)?;
+        tx.commit()?;
         Ok(result)
     }
 

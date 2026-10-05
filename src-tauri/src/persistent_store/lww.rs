@@ -28,6 +28,10 @@ mod intent_rows;
 mod new_device;
 #[path = "lww_projection.rs"]
 mod projection;
+#[path = "lww_replacement_source.rs"]
+mod replacement_source;
+pub(super) use replacement_source::{SourceLayer, REMAPPED as REMAPPED_SOURCE, STAGED as STAGED_SOURCE};
+pub(super) use replacement_source::{clear as clear_replacement_source, insert as insert_replacement_source, units as replacement_source_units};
 pub(super) use projection::validate_received;
 pub(super) use projection::{
     apply_mutation, capture_device_changes, capture_targets, is_device, preserve_local_root,
@@ -2245,16 +2249,39 @@ impl PersistentStore {
         header: &Header,
         staging_id: &str,
     ) -> StoreResult<RevisionResult> {
-        self.lww_commit_replacement_units(header, staging_id, None)
+        self.lww_commit_replacement_inputs(header, staging_id, false, None)
     }
+    /// Commits a replacement whose source units are staged for `staging_id`.
+    pub(crate) fn lww_commit_staged_replacement(
+        &mut self,
+        header: &Header,
+        staging_id: &str,
+    ) -> StoreResult<RevisionResult> {
+        self.lww_commit_replacement_inputs(header, staging_id, true, None)
+    }
+    #[cfg(test)]
     pub(crate) fn lww_commit_replacement_units(
         &mut self,
         header: &Header,
         staging_id: &str,
         source_units: Option<&BTreeMap<UnitKey, UnitValue>>,
     ) -> StoreResult<RevisionResult> {
-        self.lww_commit_replacement_inputs(header, staging_id, source_units, None)
+        if let Some(units) = source_units {
+            self.stage_replacement_source(staging_id, units)?;
+        }
+        self.lww_commit_replacement_inputs(header, staging_id, source_units.is_some(), None)
     }
+    /// Commits a replacement whose source units are staged for `staging_id`, with device sections.
+    pub(crate) fn lww_commit_staged_replacement_with_device_sections(
+        &mut self,
+        header: &Header,
+        staging_id: &str,
+        sections: &[&device_store::sections::PreparedSectionRows],
+    ) -> StoreResult<RevisionResult> {
+        let frozen = device_store::sections::freeze_backup_sections(sections)?;
+        self.lww_commit_replacement_inputs(header, staging_id, true, Some(&frozen))
+    }
+    #[cfg(test)]
     pub(crate) fn lww_commit_replacement_with_device_sections(
         &mut self,
         header: &Header,
@@ -2262,20 +2289,24 @@ impl PersistentStore {
         source_units: Option<&BTreeMap<UnitKey, UnitValue>>,
         sections: &[&device_store::sections::PreparedSectionRows],
     ) -> StoreResult<RevisionResult> {
+        if let Some(units) = source_units {
+            self.stage_replacement_source(staging_id, units)?;
+        }
         let frozen = device_store::sections::freeze_backup_sections(sections)?;
-        self.lww_commit_replacement_inputs(header, staging_id, source_units, Some(&frozen))
+        self.lww_commit_replacement_inputs(header, staging_id, source_units.is_some(), Some(&frozen))
     }
     fn lww_commit_replacement_inputs(
         &mut self,
         header: &Header,
         staging_id: &str,
-        source_units: Option<&BTreeMap<UnitKey, UnitValue>>,
+        staged_source: bool,
         device_sections: Option<&device_store::sections::FrozenBackupSections>,
     ) -> StoreResult<RevisionResult> {
         validate_header(header)?;
-        if source_units.is_some_and(|units| units.keys().any(projection::is_device)) {
+        if staged_source && replacement_source::contains_device_unit(&self.connection, staging_id)? {
             return Err(error("replacement-library-source-contains-device-units"));
         }
+        let source = staged_source.then(|| replacement_source::digest(&self.connection, staging_id)).transpose()?;
         let existing: Option<(String, String, bool)> = self
             .device_store()?
             .connection()
@@ -2290,7 +2321,6 @@ impl PersistentStore {
                 return Err(error("request-id-integrity"));
             }
             let intent: Intent = serde_json::from_str(&body)?;
-            let source = source_units.map(intent_rows::source_digest).transpose()?;
             if !matches!(&intent,Intent::Replacement{staging_id:old,source_units:old_units,device_sections:old_sections,..} if old==staging_id&&*old_units==source&&old_sections.as_deref()==device_sections)
             {
                 return Err(error("request-id-integrity"));
@@ -2308,24 +2338,24 @@ impl PersistentStore {
             return Err(error("binding-stage-not-replacement"));
         }
         let base_revision = super::current_revision(&self.connection)?;
-        let remapped_units = self.remap_retired_staging(staging_id, source_units)?;
-        let effective_source_units = remapped_units.as_deref();
-        if let Some(units) = effective_source_units {
-            for (key, value) in units {
+        let layer = self.remap_retired_staging(staging_id, staged_source)?;
+        let effective_source = layer.map(|layer| SourceLayer { generation: staging_id, layer });
+        if let Some(source) = effective_source {
+            for unit in replacement_source::units(&self.connection, source) {
+                let (key, value) = unit?;
                 wire({
                     let result = value.validate();
                     #[cfg(test)]
                     crate::persistent_store::hash_work::validation(&value);
                     result
                 })?;
-                projection::validate_received(&self.connection, key, value)?;
+                projection::validate_received(&self.connection, &key, &value)?;
             }
         }
         let generation = active_generation(&self.connection)?;
         let tx = self.connection.transaction()?;
-        let (changes, overrides) = replacement_changes(&tx, &generation, staging_id, effective_source_units)?;
+        let (changes, overrides) = replacement_changes(&tx, &generation, staging_id, effective_source)?;
         tx.commit()?;
-        drop(remapped_units);
         let device_changes = if let Some(sections) = device_sections {
             let tx = self.device_store_mut()?.transaction()?;
             verify(&tx, header.binding_authority)?;
@@ -2334,7 +2364,6 @@ impl PersistentStore {
             changes
         } else { vec![] };
         let staging_digest = binding_stage::catalog_digest(&self.connection, staging_id)?;
-        let source = source_units.map(intent_rows::source_digest).transpose()?;
         let rows = intent_rows::write(
             &mut self.device_store_mut()?.connection,
             &header.request_id,
@@ -2511,25 +2540,27 @@ fn replacement_changes(
     tx: &Transaction<'_>,
     active: &str,
     staging_id: &str,
-    source: Option<&BTreeMap<UnitKey, UnitValue>>,
+    source: Option<SourceLayer<'_>>,
 ) -> StoreResult<(Vec<(UnitKey, UnitValue)>, BTreeSet<UnitKey>)> {
-    let sourced = |key: &UnitKey| source.and_then(|units| units.get(key));
+    let sourced = |key: &UnitKey| -> StoreResult<Option<UnitValue>> {
+        source.map(|source| replacement_source::get(tx, source, key)).transpose().map(Option::flatten)
+    };
     let mut changes = Vec::new();
     let mut overrides = BTreeSet::new();
     let mut captured = BTreeSet::new();
     let mut staged_archives = BTreeSet::new();
     let archived = |staged_archives: &BTreeSet<String>, id: &str| -> StoreResult<bool> {
-        Ok(match sourced(&unit_key(&["archive", id])?) {
+        Ok(match sourced(&unit_key(&["archive", id])?)? {
             Some(value) => matches!(value, UnitValue::Object { .. }),
             None => staged_archives.contains(id),
         })
     };
     let mut decide = |key: UnitKey, before: Option<&UnitValue>, staged: Option<&UnitValue>, skip: bool| -> StoreResult<()> {
-        let source_value = sourced(&key);
+        let source_value = sourced(&key)?;
         if skip && source_value.is_none() {
             return Ok(());
         }
-        let value = source_value.or(staged).cloned().unwrap_or(UnitValue::Deleted);
+        let value = source_value.clone().or_else(|| staged.cloned()).unwrap_or(UnitValue::Deleted);
         if !matches!(value, UnitValue::Deleted) && parent_status(tx, &key)? == "retired" {
             return Err(error("retired-record-id"));
         }
@@ -2538,7 +2569,7 @@ fn replacement_changes(
             .or_else(|| before.cloned())
             .unwrap_or(UnitValue::Deleted);
         if prior != value {
-            if source_value.is_some() && staged != source_value {
+            if source_value.is_some() && staged != source_value.as_ref() {
                 overrides.insert(key.clone());
             }
             changes.push((key, value));
@@ -2587,9 +2618,10 @@ fn replacement_changes(
         }
     }
     let mut rest = Vec::new();
-    for key in source.into_iter().flat_map(BTreeMap::keys) {
-        if !captured.contains(key) {
-            rest.push(key.clone());
+    for unit in source.into_iter().flat_map(|source| replacement_source::units(tx, source)) {
+        let (key, _) = unit?;
+        if !captured.contains(&key) {
+            rest.push(key);
         }
     }
     {
@@ -2597,7 +2629,7 @@ fn replacement_changes(
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
             let key: UnitKey = wire(row.get::<_, String>(0)?.try_into())?;
-            if projection::known(&key) && !captured.contains(&key) && sourced(&key).is_none() {
+            if projection::known(&key) && !captured.contains(&key) && sourced(&key)?.is_none() {
                 rest.push(key);
             }
         }
@@ -2623,9 +2655,12 @@ impl PersistentStore {
         staging_id: &str,
         source: Option<&BTreeMap<UnitKey, UnitValue>>,
     ) -> StoreResult<[(Vec<(UnitKey, UnitValue)>, BTreeSet<UnitKey>); 2]> {
+        if let Some(units) = source {
+            self.stage_replacement_source(staging_id, units)?;
+        }
         let generation = active_generation(&self.connection)?;
         let tx = self.connection.transaction()?;
-        let merged = replacement_changes(&tx, &generation, staging_id, source)?;
+        let merged = replacement_changes(&tx, &generation, staging_id, source.map(|_| SourceLayer::staged(staging_id)))?;
         tx.commit()?;
         let whole = tests::whole_library_changes(&mut self.connection, &generation, staging_id, source)?;
         Ok([merged, whole])

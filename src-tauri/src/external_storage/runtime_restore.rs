@@ -631,13 +631,26 @@ async fn receive_restore_body(store:PersistentStore,mut pins:crate::asset_reposi
     Ok((store,pins))
 }
 
+/// The units as the store reads them. A read failure is kept in `failure` so
+/// it is reported as itself rather than as invalid data.
+fn store_units<'a>(
+    units:&'a snapshot_restore::OriginalUnits,
+    content:&'a super::content_store::ContentStore,
+    failure:&'a mut Option<ProviderError>,
+) -> impl Iterator<Item = crate::persistent_store::StoreResult<(risunest_sync_wire::unit::UnitKey,risunest_sync_wire::unit::UnitValue)>> + 'a {
+    units.units(content).map(move |unit| unit.map_err(|error| {
+        if failure.is_none() {*failure=Some(error);}
+        StoreError::Validation{message:"Original unit control is unavailable".into()}
+    }))
+}
+
 fn stage_original_backup_controls(
     store:&mut PersistentStore,
     snapshot:&PreparedRemoteSnapshot,
-    units:&std::collections::BTreeMap<risunest_sync_wire::unit::UnitKey,risunest_sync_wire::unit::UnitValue>,
+    units:&snapshot_restore::OriginalUnits,
     cancel:&Cancellation,
 ) -> Result<()> {
-    use crate::persistent_store::external_capture::{original_unit_control_lengths,original_unit_dependency_inventory,BackupBodyRole};
+    use crate::persistent_store::external_capture::{original_unit_control_lengths,streamed_unit_dependency_inventory,BackupBodyRole};
     let content=super::content_store::ContentStore::open(&snapshot.staging_root.join("external-storage")).map_err(pds_error)?;
     let declared=snapshot.objects.iter().map(|object| (object.content_hash.as_str(),object)).collect::<std::collections::BTreeMap<_,_>>();
     if declared.len() != snapshot.objects.len() {return Err(corrupt())}
@@ -658,17 +671,20 @@ fn stage_original_backup_controls(
     // Nothing above the bound is read here. Message pages and large unit
     // bodies are read once, in the second pass, at the lengths their
     // manifests and the snapshot declare.
-    let metadata=original_unit_control_lengths(units,
+    let mut failure=None;
+    let metadata=original_unit_control_lengths(store_units(units,&content,&mut failure),
         &|hash| read(hash,risunest_sync_wire::MAX_METADATA_BYTES as u64),
         &size,&size,&probe);
     cancel.check()?;
+    if let Some(failure)=failure.take() {return Err(failure)}
     let metadata=metadata.map_err(pds_error)?;
     let mut spool=super::capture::BackupDependencySpool::new(&snapshot.staging_root.join("verified-original-controls")).map_err(pds_error)?;
-    let inventory=original_unit_dependency_inventory(units,
+    let inventory=streamed_unit_dependency_inventory(store_units(units,&content,&mut failure),
         &|hash| match metadata.controls.get(hash) {Some(length)=>read(hash,*length),None=>Ok(None)},
         &size,&probe,true,&mut |hash,bytes,role| Ok(spool.push(hash,bytes,role)?),
     );
     cancel.check()?;
+    if let Some(failure)=failure.take() {return Err(failure)}
     let inventory=inventory.map_err(pds_error)?;
     if !inventory.spooled_payloads.is_empty() {return Err(corrupt())}
     cancel.check()?;
@@ -682,13 +698,31 @@ fn stage_original_backup_controls(
     result.map_err(pds_error)
 }
 
+/// Stages the original units as the source units of the replacement `staging_id`.
+fn stage_original_units(
+    store:&mut PersistentStore,
+    staging_id:&str,
+    staging_root:&Path,
+    units:&snapshot_restore::OriginalUnits,
+    cancel:&Cancellation,
+) -> Result<()> {
+    let content=super::content_store::ContentStore::open_existing(&staging_root.join("external-storage")).map_err(pds_error)?.ok_or_else(corrupt)?;
+    let writer=store.replacement_source_writer(staging_id).map_err(pds_error)?;
+    for unit in units.units(&content) {
+        cancel.check()?;
+        let (key,value)=unit?;
+        writer.put(&key,&value).map_err(pds_error)?;
+    }
+    writer.finish().map_err(pds_error)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_local_restore(
     app: &AppHandle,
     job: &DurableJob,
     expected_revision: i64,
     snapshot: PreparedRemoteSnapshot,
-    original_units: std::collections::BTreeMap<risunest_sync_wire::unit::UnitKey,risunest_sync_wire::unit::UnitValue>,
+    original_units: snapshot_restore::OriginalUnits,
     selection: RestoreSelection,
     sections: Vec<super::sections::CapturedSection>,
     cancel: Cancellation,
@@ -707,7 +741,7 @@ fn prepare_local_restore_in_store(
     job: &DurableJob,
     expected_revision: i64,
     snapshot: PreparedRemoteSnapshot,
-    original_units: std::collections::BTreeMap<risunest_sync_wire::unit::UnitKey,risunest_sync_wire::unit::UnitValue>,
+    original_units: snapshot_restore::OriginalUnits,
     selection: RestoreSelection,
     sections: Vec<super::sections::CapturedSection>,
     cancel: Cancellation,
@@ -803,13 +837,14 @@ fn prepare_local_restore_in_store(
     };
     restore_intent(job,expected_revision,header,prepared.as_ref().ok_or_else(corrupt)?.external_staging_id())?
     };
+    stage_original_units(store,&intent.staging_id,&staging_root,&original_units,&cancel)?;
     cancel.check()?;
     permit.upgrade_staging().map_err(runtime::local_error)?;
     let maintenance=state.acquire_device_maintenance().map_err(pds_error)?;
     if store.revision().map_err(pds_error)?!=expected_revision {return Err(ProviderError::new(ErrorKind::PreconditionFailed));}
     persist_restore_intent(&root,job,&intent)?;
-    let revision = store.lww_commit_replacement_with_device_sections(
-        &intent.header,&intent.staging_id,Some(&original_units),&prepared_sections.iter().collect::<Vec<_>>(),
+    let revision = store.lww_commit_staged_replacement_with_device_sections(
+        &intent.header,&intent.staging_id,&prepared_sections.iter().collect::<Vec<_>>(),
     ).map_err(pds_error)?;
     drop(prepared);
     drop(maintenance);
@@ -938,6 +973,7 @@ pub(super) mod tests {
         let mut invalid=RecordDescriptor::content(risunest_sync_wire::hash(b"synthetic absent opaque payload"));
         invalid.dependency_root=Some("ab".repeat(32));
         invalid_units.insert(UnitKey::new(&["z-future-unit","missing-tree"]).unwrap(),UnitValue::object(invalid).unwrap());
+        let (invalid_units,units)=(snapshot_restore::OriginalUnits::staged(&mut content,&invalid_units),snapshot_restore::OriginalUnits::staged(&mut content,&units));
         assert!(stage_original_backup_controls(&mut store,&snapshot,&invalid_units,&Cancellation::default()).is_err());
         assert!(store.lww_object_body(&manifest.hash).unwrap().is_none());
         stage_original_backup_controls(&mut store,&snapshot,&units,&Cancellation::default()).unwrap();
@@ -954,6 +990,7 @@ pub(super) mod tests {
         let mut snapshot=prepared(Some("source-device"));
         snapshot.staging_root=directory.path().join("staging");
         snapshot.objects.push(snapshot_restore::PreparedObject {content_hash:body.content_hash.clone(),byte_length:body.byte_size,source:super::super::content_store::ObjectSource::Library(body.content_hash)});
+        let units=snapshot_restore::OriginalUnits::staged(&mut super::super::content_store::ContentStore::open(&snapshot.staging_root.join("external-storage")).unwrap(),&units);
         crate::asset_repository::body_io::reset_body_io();
         stage_original_backup_controls(&mut store,&snapshot,&units,&Cancellation::default()).unwrap();
         let observed=crate::asset_repository::body_io::take_body_io();
@@ -979,11 +1016,12 @@ pub(super) mod tests {
             snapshot.objects.push(snapshot_restore::PreparedObject {content_hash:hash.clone(),byte_length:bytes.len() as u64,source:super::super::content_store::ObjectSource::Captured(hash)});
         }
         content.commit().unwrap();
-        let unit=|key:&[&str],bytes:&[u8]| std::collections::BTreeMap::from([(UnitKey::new(key).unwrap(),UnitValue::object(RecordDescriptor::content(risunest_sync_wire::hash(bytes))).unwrap())]);
-        assert!(stage_original_backup_controls(&mut store,&snapshot,&unit(&["root","additionalPrompt"],&padded),&Cancellation::default()).is_err());
+        let mut unit=|key:&[&str],bytes:&[u8]| snapshot_restore::OriginalUnits::staged(&mut content,&std::collections::BTreeMap::from([(UnitKey::new(key).unwrap(),UnitValue::object(RecordDescriptor::content(risunest_sync_wire::hash(bytes))).unwrap())]));
+        let (padded_units,body_units)=(unit(&["root","additionalPrompt"],&padded),unit(&["root","additionalPrompt"],&body));
+        assert!(stage_original_backup_controls(&mut store,&snapshot,&padded_units,&Cancellation::default()).is_err());
         assert!(store.lww_object_body(&risunest_sync_wire::hash(&body)).unwrap().is_none());
         crate::persistent_store::hash_work::reset_hash_work();
-        stage_original_backup_controls(&mut store,&snapshot,&unit(&["root","additionalPrompt"],&body),&Cancellation::default()).unwrap();
+        stage_original_backup_controls(&mut store,&snapshot,&body_units,&Cancellation::default()).unwrap();
         let work=crate::persistent_store::hash_work::take_hash_work();
         assert_eq!(work.domains["native_backup_large_unit_source"].calls,1);
         assert!(store.lww_object_body(&risunest_sync_wire::hash(&body)).unwrap()==Some(body));

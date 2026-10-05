@@ -475,7 +475,6 @@ fn begin_native_restore(
     source: &[crate::device_backup::PreparedDeviceSection],
     probe: &dyn CancellationProbe,
     durable_session_started: &mut bool,
-    source_units: &std::collections::BTreeMap<risunest_sync_wire::unit::UnitKey,risunest_sync_wire::unit::UnitValue>,
 ) -> Result<String, NativeJobError> {
     let guard = context.persistent
         .acquire_device_maintenance()
@@ -505,7 +504,8 @@ fn begin_native_restore(
     *durable_session_started = true;
     let prepared = (|| {
         let header = crate::persistent_store::lww::Header { binding_authority: store.lww_binding_authority().map_err(error)?, request_id: job.id() };
-        coordinator.set_library_replacement(&id,&header,source_units).map_err(error)?;
+        let staged: &PersistentStore = store;
+        coordinator.set_library_replacement(&id,&header,stage.into_iter().flat_map(|stage| staged.replacement_source_units(stage))).map_err(error)?;
         journal_prepared_native_sections(&coordinator, &id, Spool::Source, source)
             .map_err(error)?;
         coordinator.source_ready(&id).map_err(error)?;
@@ -608,7 +608,7 @@ fn restore_portable_inner(
         let stage = store
             .stage_portable_records(&archive.db, &probe)
             .map_err(error)?;
-        let source_units = store.stage_portable_units(&archive.db,&probe).map_err(error)?;
+        store.stage_portable_units(&stage.staging_id,&archive.db,&probe).map_err(error)?;
         let prepared_device =
             prepare_native_sections(&archive, &selection.device_sections, &probe).map_err(error)?;
         let mut committed = false;
@@ -652,7 +652,6 @@ fn restore_portable_inner(
                     &prepared_device,
                     &probe,
                     &mut durable_session_started,
-                    &source_units,
                 ) {
                     Ok(session) => session,
                     Err(failure) => {
@@ -676,7 +675,7 @@ fn restore_portable_inner(
                 result
             } else {
                 let header = crate::persistent_store::lww::Header { binding_authority: store.lww_binding_authority().map_err(error)?, request_id: job.id() };
-                let result = store.lww_commit_replacement_units(&header,&stage.staging_id,Some(&source_units)).map_err(error)?;
+                let result = store.lww_commit_staged_replacement(&header,&stage.staging_id).map_err(error)?;
                 committed = true;
                 result.revision
             };

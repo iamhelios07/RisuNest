@@ -2401,6 +2401,7 @@ pub(super) fn delete_generation(
     for (table, _) in GENERATION_TABLES.iter().rev() {
         while delete_generation_rows(transaction, table, generation, 256)? != 0 {}
     }
+    while delete_generation_rows(transaction, "replacement_source_units", generation, 256)? != 0 {}
     transaction.execute(
         "DELETE FROM snapshot_leases WHERE generation = ?1",
         [generation],
@@ -2493,7 +2494,7 @@ pub(super) fn purge_retired_batch(connection: &mut Connection, limit: usize) -> 
         .collect::<Result<Vec<_>, _>>()?;
     let mut budget = limit.max(1);
     for generation in &retired {
-        for (table, _) in GENERATION_TABLES.iter().rev() {
+        for table in GENERATION_TABLES.iter().rev().map(|(table, _)| *table).chain(["replacement_source_units"]) {
             if budget == 0 {
                 break;
             }
