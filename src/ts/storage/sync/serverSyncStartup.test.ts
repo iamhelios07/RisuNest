@@ -6,7 +6,7 @@ const f = vi.hoisted(() => ({
     invoke: vi.fn(), offline: true, repairError: undefined as unknown, activationError: undefined as unknown, fenceError: undefined as unknown,
     configured: true, pending: null as unknown, inspectError: undefined as unknown,
     binding: undefined as unknown as SyncBindingState,
-    runtime: { revision: 0, getStorageAuthorityEpoch: () => 'storage', subscribeActiveConversationViewportSource: () => () => {}, setActivatedLibraryRecoveryLifecycle() {}, markCommittedWorkingSetRefreshRequired() {} },
+    runtime: { revision: 0, getStorageAuthorityEpoch: () => 'storage', subscribeActiveConversationViewportSource: () => () => {}, captureSelectedConversationTarget: () => null, setActivatedLibraryRecoveryLifecycle() {}, markCommittedWorkingSetRefreshRequired() {} },
 }))
 vi.mock('@tauri-apps/api/core', () => ({ invoke: f.invoke }))
 vi.mock('@tauri-apps/api/event', () => ({ listen: async () => () => {} }))

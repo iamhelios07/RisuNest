@@ -250,12 +250,15 @@ export async function installServerSyncProduction(): Promise<void> {
     const disposers = [registerSyncBindingTransport({ kind: 'server', connectionId: 'server' }, transport)]
     disposers.push(subscribeLocalPersistentRevision((_revision,cause) => scheduler.localChange(cause === 'generation-complete')))
     // The source is renewed on every store revision; only a different conversation counts as opened.
-    let openedConversation = ''
+    // The one open at startup is covered by the startup pull.
+    const conversationIdentity = () => {
+        const target = getPersistentDataRuntime().captureSelectedConversationTarget()
+        return target ? JSON.stringify([target.characterId, target.conversationId]) : ''
+    }
+    let openedConversation = conversationIdentity()
     disposers.push(getPersistentDataRuntime().subscribeActiveConversationViewportSource(source => {
-        const target = source ? getPersistentDataRuntime().captureSelectedConversationTarget() : null
-        if (!target) return
-        const identity = JSON.stringify([target.characterId, target.conversationId])
-        if (identity === openedConversation) return
+        const identity = source ? conversationIdentity() : ''
+        if (!identity || identity === openedConversation) return
         openedConversation = identity
         void scheduler.conversationOpened().then(continueHydration)
     }))
