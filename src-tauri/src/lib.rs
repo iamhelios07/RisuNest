@@ -130,7 +130,13 @@ impl NativeStartupState {
         let failure = self
             .0
             .lock()
-            .map_err(|error| format!("native startup status lock failed: {error}"))?;
+            .map_err(|error| {
+                let _ = native_log::logged_without_detail::<(), _>(
+                    "native_startup_status",
+                    Err("startup-state-unavailable".to_owned()),
+                );
+                format!("native startup status lock failed: {error}")
+            })?;
         match failure.message.as_ref() {
             Some(error) => Err(format!("Native setup failed: {error}")),
             None => Ok(()),
@@ -181,11 +187,19 @@ fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
 }
 
+#[track_caller]
+fn log_native_request_failure(code: &'static str) {
+    let _ = native_log::logged_without_detail::<(), _>("native_request", Err(code.to_owned()));
+}
+
 #[tauri::command]
 async fn native_request(url: String, body: String, header: String, method: String) -> String {
     let headers_json: Value = match serde_json::from_str(&header) {
         Ok(h) => h,
-        Err(e) => return format!(r#"{{"success":false,"body":"{}"}}"#, e.to_string()),
+        Err(e) => {
+            log_native_request_failure("invalid-header-json");
+            return format!(r#"{{"success":false,"body":"{}"}}"#, e.to_string());
+        }
     };
 
     let mut headers = HeaderMap::new();
@@ -194,21 +208,31 @@ async fn native_request(url: String, body: String, header: String, method: Strin
         for (key, value) in obj {
             let header_name = match HeaderName::from_bytes(key.as_bytes()) {
                 Ok(name) => name,
-                Err(e) => return format!(r#"{{"success":false,"body":"{}"}}"#, e.to_string()),
+                Err(e) => {
+                    log_native_request_failure("invalid-header-name");
+                    return format!(r#"{{"success":false,"body":"{}"}}"#, e.to_string());
+                }
             };
             let header_value = match HeaderValue::from_str(value.as_str().unwrap_or("")) {
                 Ok(value) => value,
-                Err(e) => return format!(r#"{{"success":false,"body":"{}"}}"#, e.to_string()),
+                Err(e) => {
+                    log_native_request_failure("invalid-header-value");
+                    return format!(r#"{{"success":false,"body":"{}"}}"#, e.to_string());
+                }
             };
             headers.insert(header_name, header_value);
         }
     } else {
+        log_native_request_failure("header-json-shape");
         return format!(r#"{{"success":false,"body":"Invalid header JSON"}}"#);
     }
 
     let client = match platform_tls::client_builder().build() {
         Ok(client) => client,
-        Err(e) => return format!(r#"{{"success":false,"body":"{}"}}"#, e.to_string()),
+        Err(e) => {
+            log_native_request_failure("client-build");
+            return format!(r#"{{"success":false,"body":"{}"}}"#, e.to_string());
+        }
     };
     let response: Result<reqwest::Response, reqwest::Error>;
 
@@ -236,7 +260,10 @@ async fn native_request(url: String, body: String, header: String, method: Strin
             let status = resp.status().as_u16().to_string();
             let bytes = match resp.bytes().await {
                 Ok(b) => b,
-                Err(e) => return format!(r#"{{"success":false,"body":"{}"}}"#, e.to_string()),
+                Err(e) => {
+                    log_native_request_failure("response-body");
+                    return format!(r#"{{"success":false,"body":"{}"}}"#, e.to_string());
+                }
             };
             let encoded = general_purpose::STANDARD.encode(&bytes);
 
@@ -246,10 +273,13 @@ async fn native_request(url: String, body: String, header: String, method: Strin
                 encoded, header_json, status
             )
         }
-        Err(e) => format!(
-            r#"{{"success":false,"body":"{}","status":400}}"#,
-            e.to_string()
-        ),
+        Err(e) => {
+            log_native_request_failure("transport");
+            format!(
+                r#"{{"success":false,"body":"{}","status":400}}"#,
+                e.to_string()
+            )
+        }
     }
 }
 
