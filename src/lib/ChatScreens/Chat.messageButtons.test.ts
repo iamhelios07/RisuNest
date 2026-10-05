@@ -175,6 +175,22 @@ describe('plugin message buttons in the message action row', () => {
         expect(additionalMessageButtons[0].callback).toHaveBeenCalledWith(expect.objectContaining({ messageIndex: 1, messageId: 'm-1' }))
     })
 
+    test('moves the buttons between the row and the popup when the window is resized', async () => {
+        await mountChat({ message: 'answer', role: 'char', idx: 1, totalLength: 3 })
+        expect(pluginButtons()).toEqual(['Button char-only', 'Button both'])
+
+        setWidth(400)
+        window.dispatchEvent(new Event('resize'))
+        await tick()
+        expect(pluginButtons()).toEqual([])
+        expect(target.querySelector('.button-icon-menu')).not.toBeNull()
+
+        setWidth(1000)
+        window.dispatchEvent(new Event('resize'))
+        await tick()
+        expect(pluginButtons()).toEqual(['Button char-only', 'Button both'])
+    })
+
     test('addresses a windowed row by its absolute index without reading the conversation body', async () => {
         const conversation = { id: 'conversation-a', isStreaming: false }
         Object.defineProperty(conversation, 'message', { get() { throw new Error('windowed conversation body was accessed') } })

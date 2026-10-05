@@ -1,6 +1,7 @@
 <script lang="ts">
     import ResponseCandidateControls from './ResponseCandidateControls.svelte'
     import { activeRerollConversations } from 'src/ts/durableReroll'
+    import { innerWidth } from 'svelte/reactivity/window'
     import { doingChat } from 'src/ts/process/index.svelte'
     import { ArrowLeft, ArrowLeftRightIcon, ArrowRight, BookmarkIcon, BotIcon, CopyIcon, PowerOff, GitBranch, HamburgerIcon, LanguagesIcon, MenuIcon, PencilIcon, RefreshCcwIcon, SplitIcon, TrashIcon, UserIcon, Volume2Icon, Scissors } from "@lucide/svelte"
     import { aiLawApplies, changeChatTo, foldChatToMessage, getFileSrc, createChatCopyName } from "src/ts/globalApi.svelte"
@@ -1176,7 +1177,7 @@
             <span class="text-xs">{statusMessage}</span>
             <div class="flex items-center ml-2 gap-2">
                 {@render translationButton()}
-                {#if window.innerWidth >= 640}
+                {#if (innerWidth.current ?? 0) >= 640}
                     {@render majorIconButtonsBody(false)}
                     {@render pluginMessageButtons(false)}
                     {#if DBState.db.characters[selIdState.selId]}
