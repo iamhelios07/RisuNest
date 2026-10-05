@@ -1,9 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { mount, tick } from "svelte";
+import SyncExitDialog from "../../src/lib/Others/SyncExitDialog.svelte";
 import { createMacosExitHandler, type MacosExitRequest } from "../../src/ts/storage/macosLifecycle";
 import { SaveCoordinator } from "../../src/ts/storage/saveCoordinator";
 import { SqlitePersistentDataStore } from "../../src/ts/storage/sqlitePersistentDataStore";
 import { createSyncExitCoordinator, type SyncExitDrainResult } from "../../src/ts/storage/syncExitCoordinator";
+import { configureSyncExitCoordinator } from "../../src/ts/storage/syncExitProduction";
 import { check, pause } from "./contracts";
 
 const report = (stage: string, result: unknown) => invoke("macos_bench_report", { stage, result });
@@ -92,9 +95,15 @@ export async function terminationDispatch(phase: string) {
     }),
     softWaitMillis: scenario === "dialog" ? 50 : 30_000,
   });
+  configureSyncExitCoordinator(coordinator);
+  const dialogTarget = document.createElement("div");
+  document.body.append(dialogTarget);
+  mount(SyncExitDialog, { target: dialogTarget });
   coordinator.subscribe(state => note(`coordinator-${state.phase}`));
   const snapshot = () => ({
     scenario, route: "self-targeted-apple-event", coordinator: coordinator.snapshot().phase,
+    dialogOpen: !!dialogTarget.querySelector('[role="dialog"]'),
+    choiceButtons: dialogTarget.querySelectorAll("button").length,
     commits, activeCommits, maximumActiveCommits, checkpoints, flushCalls, coalesced,
     remoteStarts, remoteCancels, rendererRequests, sessionRequests, rendererReplies, timeline,
   });
@@ -102,6 +111,10 @@ export async function terminationDispatch(phase: string) {
     coordinator,
     saveLocally: async () => { await flushLocal(); await checkpointLocal(); },
     respond: async (token, exit) => {
+      const saved = await store.readRoot();
+      check(saved.value.username === root.username && saved.revision === save.revision,
+        "session response must follow the real local commit");
+      await tick();
       rendererReplies++;
       note(`renderer-response-${exit}`);
       await report("session-dispatch-renderer-response", { ...snapshot(), exit });
@@ -127,6 +140,10 @@ export async function terminationDispatch(phase: string) {
       check(performance.now() < deadline, "native ordinary quit did not reach the requested coordinator stage");
       await pause(10);
     }
+    await tick();
+    check(!!dialogTarget.querySelector('[role="dialog"]'), "product exit dialog must be mounted");
+    check(dialogTarget.querySelectorAll("button").length === (scenario === "dialog" ? 3 : 0),
+      "the confirmation stage must expose the real product choices");
   }
   note("send-session-event");
   await report("session-dispatch-ready", { ...snapshot(), passed: true });
@@ -137,7 +154,7 @@ export async function terminationDispatch(phase: string) {
   await pause(250);
   await report("session-dispatch-after-delivery", snapshot());
   // A delivered upgrade may leave the original coordinator awaiting a decision.
-  if (scenario !== "initial") coordinator.decide("cancel-exit");
+  if (scenario === "dialog") window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
   await pause(6_000);
   await report("failure", { ...snapshot(), message: "Session event did not terminate the isolated app" });
   await invoke("macos_bench_quit");

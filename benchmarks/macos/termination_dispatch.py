@@ -31,6 +31,8 @@ def validate_dispatch(phase, records):
     else:
         expected = {'local': 'saving', 'drain': 'syncing', 'dialog': 'remote-delayed'}[scenario]
         assert ready['coordinator'] == expected and ready['rendererRequests'] == 1
+        assert ready['dialogOpen'] is True
+        assert ready['choiceButtons'] == (3 if scenario == 'dialog' else 0)
         assert ready['commits'] == ready['maximumActiveCommits'] == 1
         assert ready['activeCommits'] == (1 if scenario == 'local' else 0)
         assert ready['checkpoints'] == ready['remoteStarts'] == (0 if scenario == 'local' else 1)
