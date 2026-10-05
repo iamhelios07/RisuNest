@@ -2702,8 +2702,9 @@ fn archived_character(key: &UnitKey) -> Option<String> {
 /// The changes that make the active library's units those of the stage with
 /// the source units applied, sorted by key, and the changed keys whose source
 /// unit replaced the staged value. Both libraries are captured one character
-/// at a time and merged in key order, so only one character's units and the
-/// set of captured keys are held at once. Incremental commits keep the active
+/// at a time and merged in key order, so besides the returned changes only one
+/// character's units and the set of captured keys are held at once. Incremental
+/// commits keep the active
 /// manifests current, and staging pages each conversation once all of its
 /// messages are written, so captures read stored manifests.
 fn replacement_changes(
