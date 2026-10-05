@@ -8,6 +8,7 @@ import type {
     AssetAlias,
     AssetOwnerHead,
     CharacterDetail,
+    ContentChangeKey,
     ConversationMutation,
     DataRevision,
     PersistentDataStore,
@@ -21,7 +22,7 @@ import type {
 } from './persistentDataStore'
 import type { RisuModule } from '../process/modules'
 import type { CommittedApplyOutcome } from './persistentDataRuntime'
-import { RevisionConflictError } from './persistentDataStore'
+import { CONTENT_CHANGE_PAGE_LIMIT, RevisionConflictError } from './persistentDataStore'
 import { appendCharacterIdToOrder, removeCharacterIdFromOrder } from './characterOrderMutation'
 import {
     createConversationSummaryStubFromChat,
@@ -380,6 +381,24 @@ function validWindowedAuthority(
         && authority.sessionVersion >= authority.persistedSessionVersion
         && Number.isSafeInteger(authority.totalMessages)
         && authority.totalMessages >= 0
+}
+
+/**
+ * Matches stored changes to the records a commit replaces with captured values
+ * rather than per-unit edits, or returns null when it replaces none.
+ */
+function replacedRecordChange(commit: WorkingSetCommit): ((key: ContentChangeKey) => boolean) | null {
+    const checks: ((key: ContentChangeKey) => boolean)[] = []
+    if (commit.root) checks.push((key) => key.kind === 'root')
+    if (commit.replacePresets) checks.push((key) => key.kind === 'preset')
+    const characters = new Set([commit.replaceCharacter, commit.addCharacter].flatMap((value) => value ? [value.chaId] : []))
+    if (characters.size) checks.push((key) => (key.kind === 'character' || key.kind === 'conversation') && characters.has(key.key1))
+    const details = new Set([commit.character, ...(commit.characterDetails ?? [])].flatMap((value) => value ? [value.chaId] : []))
+    if (details.size) checks.push((key) => key.kind === 'character' && details.has(key.key1))
+    const ranges = new Set((commit.conversations ?? []).flatMap((mutation) =>
+        mutation.type === 'replace-range' ? [JSON.stringify([mutation.characterId, mutation.conversationId])] : []))
+    if (ranges.size) checks.push((key) => key.kind === 'conversation' && ranges.has(JSON.stringify([key.key1, key.key2])))
+    return checks.length ? (key) => checks.some((check) => check(key)) : null
 }
 
 function sameWindowedAuthority(
@@ -4577,13 +4596,50 @@ export class SaveCoordinator {
 
     private async commitRoutine(input: WorkingSetCommit): Promise<{ revision: DataRevision }> {
         const captured = canonicalClone(input)
+        const replacedChange = replacedRecordChange(captured)
         while (true) {
             try { return await this.dependencies.store.commit(captured) } catch (error) {
                 if (!(error instanceof RevisionConflictError)) throw error
                 if (error.actualRevision <= captured.expectedRevision) throw error
-                captured.expectedRevision = error.actualRevision
-                this.currentRevision = error.actualRevision
+                // A replaced record is resent only when no other writer changed it since the capture.
+                const revision = replacedChange
+                    ? await this.unchangedRevision(captured.expectedRevision, error.actualRevision, replacedChange)
+                    : error.actualRevision
+                if (revision === null) throw error
+                captured.expectedRevision = revision
+                this.currentRevision = revision
             }
+        }
+    }
+
+    /** The newest revision at which no change after `base` matches, or null when one does or the store cannot tell. */
+    private async unchangedRevision(base: DataRevision, actual: DataRevision, matches: (key: ContentChangeKey) => boolean): Promise<DataRevision | null> {
+        let revision = actual
+        while (true) {
+            let lease
+            try {
+                lease = await this.dependencies.store.acquireRevision?.(revision)
+            } catch (error) {
+                if (error instanceof RevisionConflictError && error.actualRevision > revision) {
+                    revision = error.actualRevision
+                    continue
+                }
+                return null
+            }
+            if (!lease) return revision
+            return withPersistentRevisionLease(lease, async (reader) => {
+                // A store without a change index cannot show what moved, so its commit is resent as before.
+                if (!reader.readWorkingSetChangePage) return revision
+                let after: ContentChangeKey | null = null
+                while (true) {
+                    let page: ContentChangeKey[]
+                    try { page = await reader.readWorkingSetChangePage(base, after, CONTENT_CHANGE_PAGE_LIMIT) }
+                    catch { return null }
+                    if (page.some(matches)) return null
+                    if (page.length < CONTENT_CHANGE_PAGE_LIMIT) return revision
+                    after = page[page.length - 1]
+                }
+            })
         }
     }
 
