@@ -192,7 +192,7 @@ fn an_unsupported_device_schema_version_is_rejected() {
         };
         assert_eq!(
             error,
-            StoreError::Store {
+            StoreError::SchemaMismatch {
                 message: format!("unsupported device schema version {version}"),
             }
         );
@@ -213,7 +213,7 @@ fn a_changed_definition_or_a_missing_control_row_is_rejected() {
     };
     assert_eq!(
         error,
-        StoreError::Validation {
+        StoreError::SchemaMismatch {
             message: "Device schema is incompatible".to_owned(),
         }
     );

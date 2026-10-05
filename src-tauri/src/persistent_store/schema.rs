@@ -108,7 +108,7 @@ pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
     match version {
         0 => create_schema(connection),
         SCHEMA_VERSION => validate_schema(connection),
-        _ => Err(StoreError::Store {
+        _ => Err(StoreError::SchemaMismatch {
             message: format!("unsupported persistent schema version {version}"),
         }),
     }
@@ -378,7 +378,7 @@ fn validate_object_sql(
         )
         .optional()?;
     if object_sql.as_deref().map(normalize_schema_sql) != Some(normalize_schema_sql(expected)) {
-        return Err(StoreError::Validation {
+        return Err(StoreError::SchemaMismatch {
             message: message.to_owned(),
         });
     }

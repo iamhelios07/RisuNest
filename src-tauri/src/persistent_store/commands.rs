@@ -2659,6 +2659,7 @@ mod tests {
             StoreError::CommitDecode { message: String::new() },
             StoreError::Committed { revision: 1, message: String::new() },
             StoreError::Validation { message: String::new() },
+            StoreError::SchemaMismatch { message: String::new() },
             StoreError::Store { message: String::new() },
         ] {
             assert_eq!(serde_json::to_value(&error).unwrap()["code"], error.code().as_ref());

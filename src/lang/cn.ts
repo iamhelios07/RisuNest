@@ -1510,6 +1510,7 @@ export const languageChinese = {
         restoreAction: "恢复",
         previousFilesTitle: "是否连接？",
         previousFilesDescription: "有些文件仅保存在之前使用的服务器或外部存储中。连接后也会将这些文件保存到新的目标。如需同时保留在此设备上，请选择“下载后连接”。",
+        previousFilesUnknownDescription: "无法确认是否有文件仅保存在之前使用的服务器或外部存储中。如有这些文件，连接后也会将其保存到新的目标。如需同时保留在此设备上，请选择“下载后连接”。",
         downloadThenConnect: "下载后连接",
         downloadFailedNotConnected: "无法下载文件，因此未进行连接。请重试，或不下载直接连接。",
         previousStorageUnavailable: "无法获取仅保存在之前使用的服务器或外部存储中的文件，同步已停止。请在可以访问时重试。",

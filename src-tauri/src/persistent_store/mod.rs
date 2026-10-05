@@ -133,6 +133,10 @@ pub(crate) enum StoreError {
     Validation {
         message: String,
     },
+    /// The store was written by a build with a different schema and cannot be opened by this one.
+    SchemaMismatch {
+        message: String,
+    },
     #[serde(rename = "store-error")]
     Store {
         message: String,
@@ -153,7 +157,7 @@ impl std::fmt::Display for StoreError {
             }
             Self::RawBodyUnavailable => formatter.write_str("raw commit body unavailable"),
             Self::CommitBusy => formatter.write_str("previous commit is still finishing"),
-            Self::Committed { message, .. } | Self::CommitDecode { message } | Self::Validation { message } | Self::Store { message } => formatter.write_str(message),
+            Self::Committed { message, .. } | Self::CommitDecode { message } | Self::Validation { message } | Self::SchemaMismatch { message } | Self::Store { message } => formatter.write_str(message),
         }
     }
 }
@@ -170,6 +174,7 @@ impl crate::native_log::CommandFailure for StoreError {
             Self::CommitDecode { .. } => "commit-decode",
             Self::Committed { .. } => "committed",
             Self::Validation { .. } => "validation",
+            Self::SchemaMismatch { .. } => "schema-mismatch",
             Self::Store { .. } => "store-error",
         }
         .into()
@@ -923,7 +928,7 @@ pub(crate) struct PersistentStore {
     snapshots_dir: PathBuf,
     // A device store that cannot be opened must not block the library, so the
     // failure is carried until something actually needs per-device state.
-    device_store: Result<device_store::DeviceStore, String>,
+    device_store: Result<device_store::DeviceStore, StoreError>,
     message_object_roots: MessageObjectRootsCache,
 }
 
@@ -1424,12 +1429,22 @@ pub(super) fn validate_app_kv_key(key: &str) -> StoreResult<()> {
     })
 }
 
-fn open_device_store(persistent_dir: &Path) -> Result<device_store::DeviceStore, String> {
+fn open_device_store(persistent_dir: &Path) -> Result<device_store::DeviceStore, StoreError> {
     device_store::DeviceStore::open(persistent_dir).map_err(|error| {
         let message = format!("device store is unavailable: {error}");
         crate::nlog!("warn", "{message}");
-        message
+        match error {
+            StoreError::SchemaMismatch { .. } => StoreError::SchemaMismatch { message },
+            _ => StoreError::Store { message },
+        }
     })
+}
+
+fn unavailable_device_store(error: &StoreError) -> StoreError {
+    match error {
+        StoreError::SchemaMismatch { message } => StoreError::SchemaMismatch { message: message.clone() },
+        other => StoreError::Store { message: other.to_string() },
+    }
 }
 
 pub(crate) fn register_asset_objects_at_root(
@@ -1550,19 +1565,11 @@ impl PersistentStore {
     }
 
     pub(crate) fn device_store(&self) -> StoreResult<&device_store::DeviceStore> {
-        self.device_store
-            .as_ref()
-            .map_err(|message| StoreError::Store {
-                message: message.clone(),
-            })
+        self.device_store.as_ref().map_err(unavailable_device_store)
     }
 
     pub(crate) fn device_store_mut(&mut self) -> StoreResult<&mut device_store::DeviceStore> {
-        self.device_store
-            .as_mut()
-            .map_err(|message| StoreError::Store {
-                message: message.clone(),
-            })
+        self.device_store.as_mut().map_err(|error| unavailable_device_store(error))
     }
 
     pub(crate) fn revision(&self) -> StoreResult<i64> {
