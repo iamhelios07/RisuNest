@@ -705,7 +705,10 @@ impl LwwClient {
         store: &mut PersistentStore,
         upper: DecimalU64,
     ) -> Result<(DecimalU64, Vec<Change>)> {
+        // Each attempt makes the server copy the whole library under a new pin.
+        let mut attempts = 0;
         loop {
+            attempts += 1;
             let (_, pin): (_, StatePin) = self.client.json(
                 reqwest::Method::POST,
                 "state/pins",
@@ -804,7 +807,8 @@ impl LwwClient {
             }
             match result {
                 Err(error)
-                    if matches!(error.code.as_str(), "state-pin-expired" | "journal-floor") =>
+                    if attempts < 3
+                        && matches!(error.code.as_str(), "state-pin-expired" | "journal-floor") =>
                 {
                     continue
                 }
@@ -979,6 +983,11 @@ impl LwwClient {
                 self.log
                     .0
                     .execute("DELETE FROM bootstrap WHERE authority=?1", [&authority])?;
+                // A pin kept from an earlier page is replaced once; one made by this
+                // call that already expired is reported instead of pinning again.
+                if existing_pin.is_none() {
+                    return Err(SyncError::new("state-pin-expired", 410));
+                }
                 return self.receive_page(store, header);
             }
             if !(200..300).contains(&reply.status) {

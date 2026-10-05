@@ -1539,3 +1539,60 @@ fn an_empty_poll_reuses_the_admitted_clock_sample() {
     // One page read and one acknowledgement; the clock sample is still valid.
     assert_eq!(counters.snapshot()[0], 2);
 }
+
+/// A server whose state pins expire before their first page is read.
+fn pins_expire_at_once(counted: Arc<std::sync::atomic::AtomicUsize>) -> LocalServerFixture {
+    LocalServerFixture::with_router(move |router| {
+        router.layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let pins = counted.clone();
+                async move {
+                    let path = request.uri().path().to_owned();
+                    if request.method() == axum::http::Method::POST && path == "/state/pins" {
+                        // A read that never stops is ended by refusing the tenth pin.
+                        if pins.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 9 {
+                            return axum::response::IntoResponse::into_response((
+                                axum::http::StatusCode::FORBIDDEN,
+                                axum::Json(serde_json::json!({"error":"forbidden"})),
+                            ));
+                        }
+                    }
+                    if request.method() == axum::http::Method::GET && path == "/state" {
+                        return axum::response::IntoResponse::into_response((
+                            axum::http::StatusCode::GONE,
+                            axum::Json(serde_json::json!({"error":"state-pin-expired"})),
+                        ));
+                    }
+                    next.run(request).await
+                }
+            },
+        ))
+    })
+}
+
+#[test]
+fn a_state_read_whose_pin_keeps_expiring_stops_with_a_retryable_error() {
+    let pins = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server = pins_expire_at_once(pins.clone());
+    let (_root, mut store) = local();
+    let client = server.client(&store);
+    let upper = client.admission().unwrap();
+    let error = client.state(&mut store, upper).unwrap_err();
+    assert_eq!((error.code.as_str(), error.retryable), ("state-pin-expired", true));
+    assert_eq!(pins.load(std::sync::atomic::Ordering::SeqCst), 3);
+}
+
+#[test]
+fn a_bootstrap_pin_that_expires_at_once_stops_with_a_retryable_error() {
+    let pins = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server = pins_expire_at_once(pins.clone());
+    ServerWriter::new(&server.server).push_units("pinned", "pinned", 1);
+    raise_journal_floor(&server);
+    let (_root, mut store) = local();
+    let client = server.client(&store);
+    let error = receive_cycle(&client, &mut store, &[]).err().unwrap();
+    assert_eq!((error.code.as_str(), error.retryable), ("state-pin-expired", true));
+    assert_eq!(pins.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let kept: i64 = client.log.0.query_row("SELECT count(*) FROM bootstrap", [], |r| r.get(0)).unwrap();
+    assert_eq!(kept, 0);
+}
