@@ -358,6 +358,32 @@ describe('LWW renderer save path', () => {
         expect(current.desc).toBe('intervening description')
     })
 
+    it('merges another writer\'s change to a chat whose messages a save replaces and saves both without a retry', async () => {
+        const {database, store, runtime, commit} = await runtimeHarness()
+        const acquireRevision = store.acquireRevision.bind(store)
+        const readWorkingSetChangePage = vi.fn(async () => [{kind: 'conversation', key1: 'char-a', key2: 'conv-long'}])
+        store.acquireRevision = async (revision) => Object.assign(await acquireRevision(revision), {readWorkingSetChangePage})
+        const {revision} = await store.readRoot()
+        await store.commit({expectedRevision: revision, unitMutations: [
+            {key: '["conversation","char-a","conv-long","note"]', type: 'set', value: 'other writer note'},
+        ]})
+        const chat = database.characters.find((value) => value.chaId === 'char-a')!.chats.find((value) => value.id === 'conv-long')!
+        chat.message.push({role: 'user', data: 'local reply'})
+        commit.mockClear()
+
+        await runtime.flushPendingDataLocally('concurrent-chat-change')
+
+        const stored = (await store.readConversation('char-a', 'conv-long'))!.value
+        expect(stored.message).toHaveLength(131)
+        expect(stored.message.at(-1)).toMatchObject({role: 'user', data: 'local reply'})
+        expect(stored.note).toBe('other writer note')
+        expect(chat.note).toBe('other writer note')
+        expect(readWorkingSetChangePage).toHaveBeenCalledWith(revision, null, expect.any(Number))
+        expect(commit.mock.calls.map(([value]) => value.expectedRevision)).toEqual([revision, revision + 1])
+        expect(commit.mock.calls[1][0].conversations).toEqual([expect.objectContaining({type: 'replace-range', characterId: 'char-a', conversationId: 'conv-long'})])
+        expect(commit.mock.calls[1][0].unitMutations ?? []).not.toContainEqual(expect.objectContaining({key: '["conversation","char-a","conv-long","note"]'}))
+    })
+
     it('does not replace unloaded conversation bodies with empty catalog placeholders', async () => {
         const { database, store, coordinator } = await harness()
         const original = database.characters[1].chats[0]

@@ -12,6 +12,7 @@ import type {
     ConversationMutation,
     DataRevision,
     PersistentDataStore,
+    PersistentRevisionReader,
     PluginStorageMutation,
     PluginStorageValue,
     PluginStorageValueCursor,
@@ -190,6 +191,13 @@ export class WindowedConversationSaveError extends Error {
     constructor(reason: string, cause?: unknown) {
         super(`The selected conversation could not be completed for saving: ${reason}`, { cause })
         this.name = 'WindowedConversationSaveError'
+    }
+}
+
+/** A conflict whose other writer changed records the commit replaces; `keys` name those changes as units. */
+class ConcurrentRecordChangeError extends RevisionConflictError {
+    constructor(expectedRevision: DataRevision, actualRevision: DataRevision, readonly keys: readonly string[], readonly characterIds: readonly string[]) {
+        super(expectedRevision, actualRevision)
     }
 }
 
@@ -2992,7 +3000,13 @@ export class SaveCoordinator {
                     }
                 }
                 try {
-                    const committed = await this.commitFlush(commit)
+                    let committed: { revision: DataRevision }
+                    try {
+                        committed = await this.commitFlush(commit)
+                    } catch (error) {
+                        if (!(await this.mergeConcurrentRecordChange(error))) throw error
+                        continue
+                    }
                     for (const [id, value] of materialized) this.materializedBaselines.set(id, value)
                     if (this.dependencies.captureCharacters && !windowedCapture) this.setCharacterBaseline(captured)
                     this.currentRevision = committed.revision
@@ -4678,6 +4692,20 @@ export class SaveCoordinator {
         await this.finishExplicitCommit(revision)
     }
 
+    /** Merges another writer's change to the records a flush replaces into the working set, so the next pass captures against it. */
+    private async mergeConcurrentRecordChange(error: unknown): Promise<boolean> {
+        const project = this.dependencies.onRoutineUnitsCommitted
+        if (!(error instanceof ConcurrentRecordChangeError) || !project || this.committedRefreshRevision !== null) return false
+        try {
+            await project(error.actualRevision, error.keys)
+        } catch (projectionError) {
+            this.markCommittedWorkingSetRefreshRequired(error.actualRevision, projectionError)
+            throw projectionError
+        }
+        for (const id of error.characterIds) this.materializedCanonicalBaselines.delete(id)
+        return true
+    }
+
     /** Commits a flush, writing created conversations in pages when the whole save is too large. */
     private async commitFlush(commit: WorkingSetCommit): Promise<{ revision: DataRevision }> {
         try {
@@ -4728,18 +4756,26 @@ export class SaveCoordinator {
                 if (!(error instanceof RevisionConflictError)) throw error
                 if (error.actualRevision <= captured.expectedRevision) throw error
                 // A replaced record is resent only when no other writer changed it since the capture.
-                const revision = replacedChange
-                    ? await this.unchangedRevision(captured.expectedRevision, error.actualRevision, replacedChange)
-                    : error.actualRevision
-                if (revision === null) throw error
-                captured.expectedRevision = revision
-                this.currentRevision = revision
+                const rebase = replacedChange
+                    ? await this.replacedRecordRebase(captured.expectedRevision, error.actualRevision, replacedChange)
+                    : { revision: error.actualRevision }
+                if (rebase === null) throw error
+                if (rebase.merge) {
+                    throw new ConcurrentRecordChangeError(captured.expectedRevision, rebase.revision, rebase.merge.keys, rebase.merge.characterIds)
+                }
+                captured.expectedRevision = rebase.revision
+                this.currentRevision = rebase.revision
             }
         }
     }
 
-    /** The newest revision at which no change after `base` matches, or null when one does or the store cannot tell. */
-    private async unchangedRevision(base: DataRevision, actual: DataRevision, matches: (key: ContentChangeKey) => boolean): Promise<DataRevision | null> {
+    /**
+     * The newest revision at which no change after `base` matches, or, when one does, that
+     * revision with the matching changes as unit keys the working set can merge. Null when the
+     * store cannot tell or a change cannot be merged.
+     */
+    private async replacedRecordRebase(base: DataRevision, actual: DataRevision, matches: (key: ContentChangeKey) => boolean):
+        Promise<{ revision: DataRevision; merge?: { keys: string[]; characterIds: string[] } } | null> {
         let revision = actual
         while (true) {
             let lease
@@ -4752,21 +4788,71 @@ export class SaveCoordinator {
                 }
                 return null
             }
-            if (!lease) return revision
+            if (!lease) return { revision }
             return withPersistentRevisionLease(lease, async (reader) => {
                 // A store without a change index cannot show what moved, so its commit is resent as before.
-                if (!reader.readWorkingSetChangePage) return revision
+                if (!reader.readWorkingSetChangePage) return { revision }
+                const changed: ContentChangeKey[] = []
                 let after: ContentChangeKey | null = null
                 while (true) {
                     let page: ContentChangeKey[]
                     try { page = await reader.readWorkingSetChangePage(base, after, CONTENT_CHANGE_PAGE_LIMIT) }
                     catch { return null }
-                    if (page.some(matches)) return null
-                    if (page.length < CONTENT_CHANGE_PAGE_LIMIT) return revision
+                    changed.push(...page.filter(matches))
+                    if (page.length < CONTENT_CHANGE_PAGE_LIMIT) break
                     after = page[page.length - 1]
                 }
+                if (changed.length === 0) return { revision }
+                const merge = await this.concurrentRecordChanges(reader, changed)
+                if (!merge) return null
+                // Records that still equal their baselines are resent as captured.
+                return merge.keys.length > 0 ? { revision, merge } : { revision }
             })
         }
+    }
+
+    /**
+     * The units another writer changed in resident characters, found by diffing their baselines
+     * against the stored records, or null when one of the changes cannot be merged into the working set.
+     */
+    private async concurrentRecordChanges(reader: PersistentRevisionReader, changed: readonly ContentChangeKey[]):
+        Promise<{ keys: string[]; characterIds: string[] } | null> {
+        if (!this.dependencies.onRoutineUnitsCommitted) return null
+        // A windowed selection keeps its own baseline, which a unit projection does not rebase.
+        const windowedIds = new Set([this.windowedCharacterBaseline?.authority.characterId,
+            this.dependencies.captureSelectedConversationAuthority?.()?.characterId])
+        const conversationIds = new Map<string, Set<string>>()
+        for (const key of changed) {
+            if ((key.kind !== 'character' && key.kind !== 'conversation') ||
+                windowedIds.has(key.key1) || !this.materializedBaselines.has(key.key1)) return null
+            const ids = conversationIds.get(key.key1) ?? new Set<string>()
+            if (key.kind === 'conversation') ids.add(key.key2)
+            conversationIds.set(key.key1, ids)
+        }
+        const keys: string[] = []
+        for (const [characterId, ids] of conversationIds) {
+            const before = this.materializedBaselines.get(characterId)!
+            const detail = await reader.readCharacter(characterId)
+            if (!detail) return null
+            const chats: Chat[] = []
+            for (const chat of before.chats) {
+                if (!ids.has(chat.id)) {
+                    chats.push(chat)
+                    continue
+                }
+                // A message range can only be rebased against the messages it was taken from.
+                if (!Object.hasOwn(chat, 'message')) return null
+                const stored = await reader.readConversation(characterId, chat.id)
+                if (!stored) return null
+                chats.push(stored.value)
+                ids.delete(chat.id)
+            }
+            if (ids.size > 0) return null
+            const changes = diffMaterializedCharacter(before, { ...detail.value, chats } as CompleteCharacter)
+            keys.push(...changes.unitMutations.map((value) => value.key),
+                ...changes.conversations.flatMap((value) => value.type === 'reorder' ? [] : [JSON.stringify(['messages', value.characterId, value.conversationId])]))
+        }
+        return { keys, characterIds: [...conversationIds.keys()] }
     }
 
     beginActivatedLibraryGuard(token: PersistentMutationToken): symbol {
