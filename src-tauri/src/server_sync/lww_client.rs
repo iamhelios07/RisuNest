@@ -1090,12 +1090,13 @@ impl LwwClient {
         };
         let page: StageReceive = serde_json::from_str(&body)
             .map_err(|_| SyncError::new("receive-page-integrity", 409))?;
-        if page.header != *header
-            || !store
-                .lww_receive_progress(header.binding_authority)?
-                .iter()
-                .any(|p| p.kind == "server" && p.cursor == page.progress.cursor)
-        {
+        // A page that keeps the cursor at 0 writes no progress row.
+        let durable = store
+            .lww_receive_progress(header.binding_authority)?
+            .into_iter()
+            .find(|p| p.kind == "server")
+            .map_or(DecimalU64(0), |p| p.cursor);
+        if page.header != *header || durable != page.progress.cursor {
             return Err(SyncError::new("receive-not-durable", 409));
         }
         store.server_assert_receive_finished(&page)?;

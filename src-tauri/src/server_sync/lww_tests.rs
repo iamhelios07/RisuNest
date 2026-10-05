@@ -1430,3 +1430,97 @@ fn clock_retry_does_not_decode_publications_of_another_authority() {
     assert!(result.affected_keys.is_empty());
     assert_eq!(publication_ids(&client), ["other"]);
 }
+
+impl ServerWriter {
+    /// Publishes `count` units that the receiving store keeps without projecting them.
+    fn push_units(&self, operation: &str, prefix: &str, count: usize) {
+        self.server
+            .push(
+                &self.device,
+                &PushRequest {
+                    library_id: self.library_id.clone(),
+                    writer_id: Self::WRITER.into(),
+                    operation_id: operation.into(),
+                    changes: (0..count)
+                        .map(|index| UnitChange {
+                            key: UnitKey::new(&["synthetic-bootstrap", &format!("{prefix}-{index:04}")]).unwrap(),
+                            stamp: Stamp { physical_ms: 100.into(), logical: 0, writer_id: Self::WRITER.into() },
+                            value: UnitValue::inline(br#""synthetic""#).unwrap(),
+                        })
+                        .collect(),
+                },
+            )
+            .unwrap();
+    }
+}
+
+fn received_bootstrap_units(store: &PersistentStore) -> usize {
+    let authority = store.lww_binding_authority().unwrap();
+    store
+        .lww_read_unit_state(authority, None, 4096)
+        .unwrap()
+        .entries
+        .iter()
+        .filter(|entry| entry.key.components()[0] == "synthetic-bootstrap")
+        .count()
+}
+
+fn raise_journal_floor(server: &LocalServerFixture) -> String {
+    let db = rusqlite::Connection::open(server._root.path().join("metadata.sqlite")).unwrap();
+    // Old journal rows and acknowledgements no longer hold the floor.
+    db.execute("UPDATE journal SET created=0", []).unwrap();
+    db.execute("UPDATE devices SET last_ack=0", []).unwrap();
+    drop(db);
+    server.server.maintain().unwrap().min_retained_seq.as_str().to_owned()
+}
+
+fn server_cursor(store: &PersistentStore) -> Option<String> {
+    store
+        .lww_receive_progress(store.lww_binding_authority().unwrap())
+        .unwrap()
+        .into_iter()
+        .find(|progress| progress.kind == "server")
+        .map(|progress| progress.cursor.0.to_string())
+}
+
+#[test]
+fn a_multi_page_bootstrap_from_cursor_zero_finishes_every_page() {
+    let server = LocalServerFixture::new();
+    let writer = ServerWriter::new(&server.server);
+    writer.push_units("first-library", "unit", 257);
+    let floor = raise_journal_floor(&server);
+    assert_ne!(floor, "0");
+    let (_root, mut target) = local();
+    let client = server.client(&target);
+    assert_eq!(server_cursor(&target), None);
+    receive(&client, &mut target);
+    assert_eq!(received_bootstrap_units(&target), 257);
+    assert_eq!(server_cursor(&target).as_deref(), Some(floor.as_str()));
+    let pending: i64 = client
+        .log
+        .0
+        .query_row("SELECT (SELECT count(*) FROM bootstrap)+(SELECT count(*) FROM receive_pages)", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(pending, 0);
+}
+
+#[test]
+fn a_multi_page_bootstrap_from_a_received_cursor_keeps_it_until_the_last_page() {
+    let server = LocalServerFixture::new();
+    let writer = ServerWriter::new(&server.server);
+    writer.push_units("first-unit", "early", 1);
+    let (_root, mut target) = local();
+    let client = server.client(&target);
+    receive(&client, &mut target);
+    let received = server_cursor(&target).unwrap();
+    assert_ne!(received, "0");
+    writer.push_units("later-units", "later", 300);
+    let floor = raise_journal_floor(&server);
+    assert!(floor.parse::<u64>().unwrap() > received.parse::<u64>().unwrap());
+    let first = receive_cycle(&client, &mut target, &[]).unwrap();
+    assert_eq!(first.received_units, 256);
+    assert_eq!(server_cursor(&target).as_deref(), Some(received.as_str()));
+    receive(&client, &mut target);
+    assert_eq!(received_bootstrap_units(&target), 301);
+    assert_eq!(server_cursor(&target).as_deref(), Some(floor.as_str()));
+}
