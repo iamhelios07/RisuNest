@@ -1050,8 +1050,8 @@ impl LwwClient {
             // A last page holding only this device's own publications reads back a
             // push and is not work to show.
             let left = page.through_seq.0 - page.next_after.0;
-            let writer = store.lww_clock_state()?.writer_id;
-            let read_back = left == 0 && page.items.iter().all(|item| item.stamp.writer_id == writer);
+            let writer = store.lww_clock_state().ok().map(|state| state.writer_id);
+            let read_back = left == 0 && page.items.iter().all(|item| writer.as_ref() == Some(&item.stamp.writer_id));
             self.client.lane().backlog(if read_back { 0 } else { page.next_after.0 - cursor.0 }, left);
             (
                 page.next_after,

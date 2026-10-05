@@ -527,12 +527,14 @@ pub(crate) struct HydrationSession {
     directory: Option<tempfile::TempDir>,
     cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     catalog: Option<AssetObjectRegistrar>,
+    /// Whether downloads count as the planned work of the current progress lane.
+    planned: bool,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HydrationOutcome { AlreadyLocal, Downloaded }
 impl HydrationSession {
     pub(crate) fn new(root: &Path, cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) -> Result<Self> {
-        Ok(Self { root: std::fs::canonicalize(root)?, residency: None, clients: Default::default(), cache: None, directory: None, cancellation, catalog: None })
+        Ok(Self { root: std::fs::canonicalize(root)?, residency: None, clients: Default::default(), cache: None, directory: None, cancellation, catalog: None, planned: true })
     }
     pub(crate) fn open(&mut self, digest: &str, check: &dyn Fn() -> Result<()>) -> Result<Option<std::fs::File>> {
         check()?;
@@ -549,6 +551,14 @@ impl HydrationSession {
     pub(crate) fn hydrate_many_observed(&mut self, digests: &[String], check: &dyn Fn() -> Result<()>, on_object_done: &dyn Fn()) -> Result<Vec<String>> {
         self.hydrate_many_outcomes(digests, check, |_, _| on_object_done())
     }
+    /// Hydrates what the plan is read from. The work found in it is planned only afterwards,
+    /// so these downloads are not counted as part of it.
+    pub(crate) fn hydrate_many_before_plan(&mut self, digests: &[String], check: &dyn Fn() -> Result<()>, on_object_done: &dyn Fn()) -> Result<Vec<String>> {
+        self.planned = false;
+        let outcome = self.hydrate_many_observed(digests, check, on_object_done);
+        self.planned = true;
+        outcome
+    }
     pub(crate) fn hydrate_many_outcomes(&mut self, digests: &[String], check: &dyn Fn() -> Result<()>, opened: impl FnMut(&str, HydrationOutcome)) -> Result<Vec<String>> {
         self.hydrate_many_outcomes_prioritized(digests, &Default::default(), check, opened)
     }
@@ -557,7 +567,7 @@ impl HydrationSession {
         let mut external = std::collections::BTreeSet::new();
         let mut server_pages = Vec::new();
         let cas = crate::asset_repository::PayloadCas::new(&self.root)?;
-        let lane = super::progress::current();
+        let lane = super::progress::current().filter(|_| self.planned);
         if let Some(lane) = &lane { lane.backlog(0, 0); }
         for page in digests.chunks(64) {
             check()?;

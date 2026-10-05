@@ -576,7 +576,7 @@ fn clients_made_inside_a_lane_count_what_they_publish_receive_and_download() {
     let (_a, mut a) = local();
     let (_b, mut b) = local();
     let body = vec![7; 64 * 1024 + 3];
-    put_asset(&mut a, "assets/progress.png", &body);
+    let asset = put_asset(&mut a, "assets/progress.png", &body);
     save(&mut a, &["root", "language"], serde_json::json!("en"));
 
     let send = Arc::new(ProgressLane::default());
@@ -617,6 +617,18 @@ fn clients_made_inside_a_lane_count_what_they_publish_receive_and_download() {
     assert_eq!((hydrated.backlog_done, hydrated.backlog_left), (1, 0));
     assert!(hydrated.received_bytes >= body.len() as u64);
     assert_eq!(hydrated.step, "idle");
+
+    let (_c, mut c) = local();
+    receive_available(&server.client(&c), &mut c, &[]).unwrap();
+    let before_plan = Arc::new(ProgressLane::default());
+    let unavailable = within(&before_plan, || {
+        super::residency::HydrationSession::new(c.repository_root(), None)?
+            .hydrate_many_before_plan(&[asset.object_hash.clone().unwrap()], &|| Ok(()), &|| {})
+    }).unwrap();
+    assert!(unavailable.is_empty());
+    let before_plan = before_plan.snapshot("hydrate");
+    assert_eq!(before_plan.files_done, 1);
+    assert_eq!((before_plan.backlog_done, before_plan.backlog_left), (0, 0));
 }
 #[test]
 fn no_edit_push_does_not_make_a_request() {
