@@ -164,6 +164,12 @@ export function discardNativeDataHealthIntent(
     return invoke('pds_data_health_discard_intent', { finding, expectedRevision, expectedScannedAt })
 }
 
+export function completeNativeDataHealthIntent(
+    finding: number, expectedRevision: number, expectedScannedAt: number,
+): Promise<{ completed: boolean; revision: number; result: DataHealthResult }> {
+    return invoke('pds_data_health_complete_intent', { finding, expectedRevision, expectedScannedAt })
+}
+
 export function listNativeDataHealthJournals(): Promise<RepairJournalSummary[]> {
     return invoke('pds_data_health_journals')
 }
