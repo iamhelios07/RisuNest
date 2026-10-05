@@ -640,20 +640,18 @@ implements ConversationViewportSource {
     }
 
     private evictUnpinnedRows(): boolean {
-        let evicted = false
-        while (this.rows.size > this.rowBudget) {
-            let oldestIndex: number | undefined
-            let oldestAccess = Number.POSITIVE_INFINITY
-            for (const [absoluteIndex, cached] of this.rows) {
-                if (this.isPinned(absoluteIndex) || cached.lastUsed >= oldestAccess) continue
-                oldestIndex = absoluteIndex
-                oldestAccess = cached.lastUsed
-            }
-            if (oldestIndex === undefined) return evicted
-            this.rows.delete(oldestIndex)
-            evicted = true
+        const excess = this.rows.size - this.rowBudget
+        if (excess <= 0) return false
+        const unpinned: [absoluteIndex: number, lastUsed: number][] = []
+        for (const [absoluteIndex, cached] of this.rows) {
+            if (!this.isPinned(absoluteIndex)) unpinned.push([absoluteIndex, cached.lastUsed])
         }
-        return evicted
+        if (unpinned.length === 0) return false
+        unpinned.sort((left, right) => left[1] - right[1])
+        for (let index = 0; index < Math.min(excess, unpinned.length); index += 1) {
+            this.rows.delete(unpinned[index][0])
+        }
+        return true
     }
 
     private isPinned(absoluteIndex: number): boolean {
