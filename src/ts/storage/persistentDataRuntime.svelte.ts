@@ -550,6 +550,11 @@ export const captureSelectedConversationTarget = (): SelectedConversationTarget 
 export const captureSelectedConversationAuthority = ():
     WindowedConversationPersistenceAuthority | null =>
     getPersistentDataRuntime().captureSelectedConversationAuthority()
+export const recordSelectedCharacterLastInteraction = (
+    authority: WindowedConversationPersistenceAuthority,
+    before: number | undefined,
+    after: number,
+): boolean => getPersistentDataRuntime().recordSelectedCharacterLastInteraction(authority, before, after)
 export const acquireCompleteConversation = (
     reason: string,
     target?: SelectedConversationTarget | null,

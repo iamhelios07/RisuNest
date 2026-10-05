@@ -38,6 +38,42 @@ function root(state: ReturnType<typeof fixture>) {
 }
 
 describe('production reactive persistence captures', () => {
+    it('owns shell fields without reading bodies and invalidates nested metadata from reactive evidence', () => {
+        const state = fixture()
+        const owner = state.database.characters[0] as any
+        owner.metadata = { nested: { value: 'x'.repeat(1024 * 1024) } }
+        const chat = { id: 'shell', note: '' }
+        Object.defineProperty(chat, 'message', { enumerable: false, get: () => { throw new Error('body must stay unread') } })
+        owner.chats = [chat]
+        const cached = createPersistenceCanonicalCapture({ root: () => state.database, pluginStorage: () => null,
+            presets: () => [], character: () => owner, characters: () => state.database.characters })
+        const first = cached.characterShell!()!
+        expect(cached.characterShell!()).toBe(first)
+        owner.lastInteraction = 42
+        const next = cached.characterShell!()!
+        expect(next.value.metadata).toBe(first.value.metadata)
+        owner.metadata.nested.value = 'nested edit'
+        const edited = cached.characterShell!()!
+        expect(edited.value.metadata).not.toBe(first.value.metadata)
+        expect((edited.value as any).metadata.nested.value).toBe('nested edit')
+        expect((first.value as any).metadata.nested.value.length).toBe(1024 * 1024)
+    })
+
+    it('preserves message serialization hook indices and detects nonreactive hook changes', () => {
+        const state = fixture()
+        let outside = 'before'
+        state.database.characters[0].chats[0].message = [0, 1].map(() => ({
+            role: 'user', data: '', toJSON(key: string) { return { role: 'user', data: `${key}:${outside}` } },
+        })) as any
+        const cached = createPersistenceCanonicalCapture({ root: () => state.database, pluginStorage: () => null,
+            presets: () => [], character: () => state.database.characters[0], characters: () => state.database.characters })
+        const first = cached.materializedCharacters!().get('synthetic')!
+        expect(first.chats[0].message.map((message) => message.data)).toEqual(['0:before', '1:before'])
+        expect(cached.materializedCharacters!().get('synthetic')).toBe(first)
+        outside = 'after'
+        expect(cached.materializedCharacters!().get('synthetic')!.chats[0].message.map((message) => message.data)).toEqual(['0:after', '1:after'])
+    })
+
     it('reuses unchanged message encoding and decoded values when resident chat metadata changes', () => {
         const state=fixture()
         state.database.characters[0].chats[0].id='conversation'

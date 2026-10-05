@@ -27,7 +27,9 @@ export function captureMaterializedCharacter(value: CompleteCharacter): Complete
     result.chats = value.chats.map((chat) => Object.fromEntries(Object.keys(chat)
         .filter((key) => chat[key] !== undefined && (key !== 'message' || (!isConversationSummaryStub(chat)
             && Object.prototype.propertyIsEnumerable.call(chat, 'message'))))
-        .map((key) => [key, canonicalClone(chat[key])])) as Chat)
+        .map((key) => [key, key === 'message'
+            ? chat.message.map((message, index) => JSON.parse(canonicalJson({ [index]: message }))[index])
+            : canonicalClone(chat[key])])) as Chat)
     return result
 }
 
@@ -50,10 +52,11 @@ export function diffMaterializedCharacter(before: CompleteCharacter, after: Comp
             continue
         }
         unitMutations.push(...diffFields(['conversation', after.chaId, chat.id], old, chat, new Set(['message', 'id'])))
-        if (chat.message !== old.message && Object.hasOwn(chat, 'message') && Object.hasOwn(old, 'message')
-            && canonicalJson(chat.message) !== canonicalJson(old.message)) {
-            conversations.push({ type: 'replace-range', characterId: after.chaId, conversationId: chat.id,
-                ...messageReplaceRange(old.message, chat.message) })
+        if (chat.message !== old.message && Object.hasOwn(chat, 'message') && Object.hasOwn(old, 'message')) {
+            const range = messageReplaceRange(old.message, chat.message)
+            if (range.deleteCount || range.messages.length) {
+                conversations.push({ type: 'replace-range', characterId: after.chaId, conversationId: chat.id, ...range })
+            }
         }
     }
     const nextIds = new Set(after.chats.map((chat) => chat.id))
