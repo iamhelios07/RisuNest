@@ -1783,6 +1783,7 @@ pub(crate) async fn admit_data_catalogs(
     Ok(hashes.into_iter().collect())
 }
 
+#[cfg(test)]
 pub(crate) async fn download_packed_body(hash:&str,length:u64,chunks:Vec<wire::StoredChunk>,packs:Vec<wire::StoredObject>,stage:&Path,key:&[u8;32],provider:&dyn Provider,repository:&RepositoryHandle,cancel:&Cancellation)->Result<Vec<u8>> {
     let path=download_packed_body_file(hash,length,chunks,packs,stage,key,provider,repository,cancel).await?;
     std::fs::read(path).map_err(transient)
@@ -1842,41 +1843,149 @@ pub(crate) async fn download_packed_body_file(
     match &body.source { ObjectSource::File(path)=>Ok(path.clone()), _=>Err(corrupt("body source")) }
 }
 
-/// The original units of a full backup. Their controls stay in the staging
-/// content store they were downloaded to and are decoded again when read.
+pub(crate) struct RestoreBodyPlan {
+    db: rusqlite::Connection,
+    scratch: tempfile::TempDir,
+}
+impl RestoreBodyPlan {
+    pub(crate) fn new(directory: &Path) -> Result<Self> {
+        ensure_directory(directory)?;
+        let scratch = tempfile::Builder::new().prefix("pack-plan-").tempdir_in(directory).map_err(transient)?;
+        let db = rusqlite::Connection::open(scratch.path().join("plan.sqlite")).map_err(transient)?;
+        db.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA cache_size=-4096; PRAGMA temp_store=FILE;
+            CREATE TABLE bodies(hash TEXT PRIMARY KEY,bytes INTEGER NOT NULL,remaining INTEGER NOT NULL,priority INTEGER NOT NULL);
+            CREATE INDEX ready_bodies ON bodies(remaining,priority,hash);
+            CREATE TABLE packs(id TEXT PRIMARY KEY,body TEXT NOT NULL,priority INTEGER NOT NULL);
+            CREATE INDEX next_pack ON packs(priority,id);
+            CREATE TABLE chunks(pack TEXT NOT NULL,hash TEXT NOT NULL,ordinal INTEGER NOT NULL,offset INTEGER NOT NULL,body TEXT NOT NULL,PRIMARY KEY(hash,ordinal));
+            CREATE INDEX pack_chunks ON chunks(pack,hash,ordinal); BEGIN").map_err(transient)?;
+        Ok(Self { db, scratch })
+    }
+    pub(crate) fn push<O:std::borrow::Borrow<wire::StoredObject>>(&self,source:&super::lww_residency::PackedSource<O>,priority:bool,repository:&RepositoryHandle)->Result<()> {
+        super::lww_residency::validate_packed_source(source,repository)?;
+        let priority = if priority {0} else {1};
+        self.db.execute("INSERT INTO bodies VALUES(?1,?2,?3,?4)",rusqlite::params![source.hash,i64::try_from(source.byte_length).map_err(corrupt)?,source.chunks.len() as i64,priority]).map_err(corrupt)?;
+        for pack in &source.packs {
+            if !source.chunks.iter().any(|chunk| chunk.pack_id == pack.borrow().header.object_id) { continue; }
+            let remote = RemoteObject::from_stored(pack.borrow(),repository)?;
+            let encoded = serde_json::to_string(&remote).map_err(corrupt)?;
+            let previous:Option<String> = self.db.query_row("SELECT body FROM packs WHERE id=?1",[&remote.object_id],|row|row.get(0)).optional().map_err(transient)?;
+            if previous.as_ref().is_some_and(|body|body!=&encoded) { return Err(corrupt("conflicting restore pack")); }
+            self.db.execute("INSERT INTO packs VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET priority=min(priority,excluded.priority)",rusqlite::params![remote.object_id,encoded,priority]).map_err(transient)?;
+        }
+        let mut offset = 0u64;
+        for (ordinal,chunk) in source.chunks.iter().enumerate() {
+            self.db.execute("INSERT INTO chunks VALUES(?1,?2,?3,?4,?5)",rusqlite::params![chunk.pack_id,source.hash,ordinal as i64,i64::try_from(offset).map_err(corrupt)?,serde_json::to_string(chunk).map_err(corrupt)?]).map_err(transient)?;
+            offset = offset.checked_add(chunk.plaintext_length).ok_or_else(||corrupt("restore body length"))?;
+        }
+        if source.chunks.is_empty() { fs::File::create(self.body_path(&source.hash)).map_err(transient)?; }
+        Ok(())
+    }
+    pub(crate) fn seal(&self)->Result<()> {self.db.execute_batch("COMMIT").map_err(transient)}
+    fn body_path(&self,hash:&str)->PathBuf {self.scratch.path().join(format!("{hash}.payload"))}
+    pub(crate) fn ready(&self)->Result<Option<(String,PathBuf)>> {
+        let ready:Option<(String,u64)>=self.db.query_row("SELECT hash,bytes FROM bodies WHERE remaining=0 ORDER BY priority,hash LIMIT 1",[],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(transient)?;
+        ready.map(|(hash,length)| {
+            let path=self.body_path(&hash);
+            if !verify(&path,length,&hash)? {return Err(corrupt("restore body integrity"));}
+            Ok((hash,path))
+        }).transpose()
+    }
+    pub(crate) fn settled(&self,hash:&str)->Result<()> {
+        self.db.execute("DELETE FROM bodies WHERE hash=?1 AND remaining=0",[hash]).map_err(transient)?;
+        match fs::remove_file(self.body_path(hash)) {Ok(())=>{},Err(error) if error.kind()==std::io::ErrorKind::NotFound=>{},Err(error)=>return Err(transient(error))}
+        Ok(())
+    }
+    pub(crate) async fn next_pack(&mut self,key:&[u8;32],provider:&dyn Provider,repository:&RepositoryHandle,cancel:&Cancellation)->Result<bool> {
+        let encoded:Option<String>=self.db.query_row("SELECT body FROM packs ORDER BY priority,id LIMIT 1",[],|row|row.get(0)).optional().map_err(transient)?;
+        let Some(encoded)=encoded else {
+            let remaining:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM bodies)",[],|row|row.get(0)).map_err(transient)?;
+            if remaining {return Err(corrupt("restore bodies are incomplete"));}
+            return Ok(false);
+        };
+        let remote:RemoteObject=serde_json::from_str(&encoded).map_err(corrupt)?;
+        cancel.check()?;
+        let path=open_object_with(&remote,key,self.scratch.path(),provider,repository,Durability::Scratch,cancel).await?;
+        let mut input=crate::trust_boundary::open_regular_source(&path).map_err(transient)?;
+        let tx=self.db.transaction().map_err(transient)?;
+        {
+            let mut query=tx.prepare("SELECT hash,offset,body FROM chunks WHERE pack=?1 ORDER BY hash,ordinal").map_err(transient)?;
+            let mut rows=query.query([&remote.object_id]).map_err(transient)?;
+            while let Some(row)=rows.next().map_err(transient)? {
+                cancel.check()?;
+                let hash:String=row.get(0).map_err(transient)?;
+                let offset:u64=row.get(1).map_err(transient)?;
+                let chunk:wire::StoredChunk=serde_json::from_str(&row.get::<_,String>(2).map_err(transient)?).map_err(corrupt)?;
+                let bytes=read_chunk(&mut input,remote.plaintext_length,&chunk)?;
+                let mut body=OpenOptions::new().create(true).write(true).open(self.scratch.path().join(format!("{hash}.payload"))).map_err(transient)?;
+                body.seek(SeekFrom::Start(offset)).map_err(transient)?;
+                body.write_all(&bytes).map_err(transient)?;
+                tx.execute("UPDATE bodies SET remaining=remaining-1 WHERE hash=?1 AND remaining>0",[hash]).map_err(transient)?;
+            }
+        }
+        tx.execute("DELETE FROM chunks WHERE pack=?1",[&remote.object_id]).map_err(transient)?;
+        tx.execute("DELETE FROM packs WHERE id=?1",[&remote.object_id]).map_err(transient)?;
+        tx.commit().map_err(transient)?;
+        drop(input);
+        discard_object(self.scratch.path(),&remote);
+        Ok(true)
+    }
+}
+
+/// The original units keep only a disk index while their controls remain in staging.
 pub(crate) struct OriginalUnits {
-    /// Catalog key, control hash and control length, in unit key order.
-    records: Vec<(String, String, u64)>,
+    db: rusqlite::Connection,
+    _file: tempfile::NamedTempFile,
 }
 
 impl OriginalUnits {
-    /// The units, read from `content`, the content store of the staging root they were downloaded to.
+    fn new(directory: &Path) -> Result<Self> {
+        let file = tempfile::NamedTempFile::new_in(directory).map_err(transient)?;
+        let db = rusqlite::Connection::open(file.path()).map_err(transient)?;
+        db.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA cache_size=-4096; PRAGMA temp_store=FILE;
+            CREATE TABLE records(key TEXT PRIMARY KEY,hash TEXT NOT NULL,bytes INTEGER NOT NULL); CREATE UNIQUE INDEX original_control_hash ON records(hash)").map_err(transient)?;
+        Ok(Self { db, _file: file })
+    }
+    fn insert(&self, key: &str, hash: &str, length: u64) -> Result<()> {
+        self.db.execute("INSERT INTO records VALUES(?1,?2,?3)",rusqlite::params![key,hash,i64::try_from(length).map_err(corrupt)?]).map_err(corrupt)?;
+        Ok(())
+    }
     pub(crate) fn units<'a>(&'a self, content: &'a ContentStore) -> impl Iterator<Item = Result<(risunest_sync_wire::unit::UnitKey, risunest_sync_wire::unit::UnitValue)>> + 'a {
-        self.records.iter().map(move |(key, hash, length)| {
-            let unit = decode_original_unit(content, key, hash, *length)?;
-            Ok((unit.key, unit.value))
+        let mut after = String::new();
+        let mut page = std::collections::VecDeque::<(String,String,u64)>::new();
+        let mut finished = false;
+        std::iter::from_fn(move || {
+            if finished { return None; }
+            let read = (|| {
+                if page.is_empty() {
+                    let mut query = self.db.prepare("SELECT key,hash,bytes FROM records WHERE key>?1 ORDER BY key LIMIT 128").map_err(transient)?;
+                    page = query.query_map([&after],|row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).map_err(transient)?
+                        .collect::<std::result::Result<_,_>>().map_err(transient)?;
+                }
+                let Some((key,hash,length)) = page.pop_front() else { return Ok(None); };
+                after = key.clone();
+                let unit = decode_original_unit(content,&key,&hash,length)?;
+                Ok(Some((unit.key,unit.value)))
+            })();
+            match read { Ok(Some(value)) => Some(Ok(value)), Ok(None) => {finished=true;None}, Err(error) => {finished=true;Some(Err(error))} }
         })
     }
 }
 
 #[cfg(test)]
 impl OriginalUnits {
-    /// The units as a download leaves them, with their controls put in `content`.
-    pub(crate) fn staged(
-        content: &mut ContentStore,
-        units: &BTreeMap<risunest_sync_wire::unit::UnitKey, risunest_sync_wire::unit::UnitValue>,
-    ) -> Self {
-        let mut records = Vec::new();
-        for (key, value) in units {
+    pub(crate) fn staged(content: &mut ContentStore, units: &BTreeMap<risunest_sync_wire::unit::UnitKey,risunest_sync_wire::unit::UnitValue>) -> Self {
+        let records = Self::new(&std::env::temp_dir()).unwrap();
+        for (key,value) in units {
             let bytes = risunest_sync_wire::canonical::encode(&super::packaging::OriginalBackupUnit {
-                schema: "risunest.backup-unit/v1".into(), key: key.clone(), value: value.clone(),
+                schema: "risunest.backup-unit/v1".into(), key:key.clone(), value:value.clone(),
             }).unwrap();
             let hash = risunest_sync_wire::hash(&bytes);
-            content.put(&hash, &bytes).unwrap();
-            records.push((format!("original-unit/{}", hex::encode(key.as_str())), hash, bytes.len() as u64));
+            content.put(&hash,&bytes).unwrap();
+            records.insert(&format!("original-unit/{}",hex::encode(key.as_str())),&hash,bytes.len() as u64).unwrap();
         }
         content.commit().unwrap();
-        Self { records }
+        records
     }
 }
 
@@ -1909,27 +2018,106 @@ pub(crate) async fn download_original_backup_units(
     repository: &RepositoryHandle,
     cancel: &Cancellation,
 ) -> Result<OriginalUnits> {
-    let (records, objects) = download_checkpoint_data(
-        root, staging_root, key, provider, repository, cancel,
-    ).await?;
-    if !objects.is_empty() { return Err(corrupt("original unit catalog contains non-unit controls")); }
-    let content = content_store(staging_root)?;
-    let mut keys = BTreeSet::new();
-    let mut kept = Vec::with_capacity(records.len());
-    for record in records {
+    ensure_directory(staging_root)?;
+    let kept = OriginalUnits::new(staging_root)?;
+    kept.db.execute_batch("CREATE TABLE nodes(id TEXT PRIMARY KEY,body TEXT NOT NULL,visited INTEGER NOT NULL);
+        CREATE INDEX pending_nodes ON nodes(visited,id);
+        CREATE TABLE fragments(key TEXT NOT NULL,ordinal INTEGER NOT NULL,body TEXT NOT NULL,PRIMARY KEY(key,ordinal));
+        CREATE TABLE packs(id TEXT PRIMARY KEY,body TEXT NOT NULL)").map_err(transient)?;
+    kept.db.execute("INSERT INTO nodes VALUES(?1,?2,0)",rusqlite::params![root.object_id,serde_json::to_string(root).map_err(corrupt)?]).map_err(transient)?;
+    loop {
         cancel.check()?;
-        let unit = decode_original_unit(&content, &record.key, &record.content_hash, record.byte_length)?;
-        #[cfg(test)]
-        crate::persistent_store::hash_work::validation(&unit.value);
-        unit.value.validate().map_err(corrupt)?;
-        if !keys.insert(unit.key) {
-            return Err(corrupt("duplicate original unit"));
+        let encoded:Option<String>=kept.db.query_row("SELECT body FROM nodes WHERE visited=0 ORDER BY id LIMIT 1",[],|row|row.get(0)).optional().map_err(transient)?;
+        let Some(encoded)=encoded else {break;};
+        let object:RemoteObject=serde_json::from_str(&encoded).map_err(corrupt)?;
+        if object.role!=ObjectRole::Catalog || object.repository_id!=root.repository_id {return Err(corrupt("invalid original unit catalog"));}
+        let path=open_object(&object,key,staging_root,provider,repository,cancel).await?;
+        let bytes=read_bytes(&path,wire::MAX_METADATA_BYTES)?;
+        let document=wire::CatalogDocument::decode(&bytes,usize::try_from(object.plaintext_length).map_err(corrupt)?).map_err(corrupt)?;
+        if document.kind!=wire::CatalogKind::Records {return Err(corrupt("original unit catalog kind"));}
+        kept.db.execute_batch("BEGIN").map_err(transient)?;
+        if document.level==0 {
+            for pack in document.packs {
+                let pack=RemoteObject::from_stored(&pack,repository)?;
+                if pack.role!=ObjectRole::Pack || pack.repository_id!=root.repository_id {return Err(corrupt("invalid original unit pack"));}
+                let body=serde_json::to_string(&pack).map_err(corrupt)?;
+                let previous:Option<String>=kept.db.query_row("SELECT body FROM packs WHERE id=?1",[&pack.object_id],|row|row.get(0)).optional().map_err(transient)?;
+                if previous.as_ref().is_some_and(|old|old!=&body) {return Err(corrupt("conflicting original unit pack"));}
+                kept.db.execute("INSERT OR IGNORE INTO packs VALUES(?1,?2)",rusqlite::params![pack.object_id,body]).map_err(transient)?;
+            }
+            for fragment in document.entries {
+                if fragment.kind!=wire::CatalogEntryKind::Record || fragment.byte_length>risunest_sync_wire::MAX_METADATA_BYTES as u64 {return Err(corrupt("invalid original unit control"));}
+                kept.db.execute("INSERT INTO fragments VALUES(?1,?2,?3)",rusqlite::params![fragment.key,fragment.fragment_index,serde_json::to_string(&fragment).map_err(corrupt)?]).map_err(corrupt)?;
+            }
+        } else {
+            for child in document.children {
+                let child=RemoteObject::from_stored(&child.object,repository)?;
+                kept.db.execute("INSERT INTO nodes VALUES(?1,?2,0)",rusqlite::params![child.object_id,serde_json::to_string(&child).map_err(corrupt)?]).map_err(corrupt)?;
+            }
         }
-        kept.push((record.key, record.content_hash, record.byte_length));
+        kept.db.execute("UPDATE nodes SET visited=1 WHERE id=?1",[&object.object_id]).map_err(transient)?;
+        kept.db.execute_batch("COMMIT").map_err(transient)?;
+        discard_object(staging_root,&object);
     }
-    // A catalog key hex-encodes the unit key, so both orders agree.
-    kept.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-    Ok(OriginalUnits { records: kept })
+    let mut plan=RestoreBodyPlan::new(staging_root)?;
+    let mut after=String::new();
+    loop {
+        cancel.check()?;
+        let next:Option<String>=kept.db.query_row("SELECT key FROM fragments WHERE key>?1 ORDER BY key LIMIT 1",[&after],|row|row.get(0)).optional().map_err(transient)?;
+        let Some(unit_key)=next else {break;};
+        after=unit_key.clone();
+        let mut query=kept.db.prepare("SELECT body FROM fragments WHERE key=?1 ORDER BY ordinal").map_err(transient)?;
+        let mut rows=query.query([&unit_key]).map_err(transient)?;
+        let mut first:Option<wire::CatalogEntryFragment>=None;
+        let mut count=0u32;
+        let mut chunks=Vec::new();
+        let mut packs=BTreeMap::new();
+        while let Some(row)=rows.next().map_err(transient)? {
+            cancel.check()?;
+            let fragment:wire::CatalogEntryFragment=serde_json::from_str(&row.get::<_,String>(0).map_err(transient)?).map_err(corrupt)?;
+            let expected=first.get_or_insert_with(||fragment.clone());
+            if fragment.fragment_index!=count || fragment.fragment_count!=expected.fragment_count || fragment.key!=expected.key
+                || fragment.kind!=expected.kind || fragment.content_sha256!=expected.content_sha256 || fragment.byte_length!=expected.byte_length {
+                return Err(corrupt("conflicting original unit fragments"));
+            }
+            count=count.checked_add(1).ok_or_else(||corrupt("original unit fragment count"))?;
+            for chunk in fragment.chunks {
+                if !packs.contains_key(&chunk.pack_id) {
+                    let body:String=kept.db.query_row("SELECT body FROM packs WHERE id=?1",[&chunk.pack_id],|row|row.get(0)).map_err(corrupt)?;
+                    let remote:RemoteObject=serde_json::from_str(&body).map_err(corrupt)?;
+                    packs.insert(chunk.pack_id.clone(),remote.stored(repository)?);
+                }
+                chunks.push(chunk);
+            }
+        }
+        let first=first.ok_or_else(||corrupt("missing original unit fragment"))?;
+        if count!=first.fragment_count {return Err(corrupt("missing original unit fragment"));}
+        let hash=hex::encode(first.content_sha256);
+        kept.insert(&unit_key,&hash,first.byte_length)?;
+        plan.push(&super::lww_residency::PackedSource {
+            hash,byte_length:first.byte_length,chunks,packs:packs.into_values().collect(),catalog:root.stored(repository)?,
+            library_id:root.repository_id.clone(),connection_id:"original-unit-controls".into(),connection_root:staging_root.into(),protected_snapshot:root.object_id.clone(),
+        },false,repository)?;
+    }
+    plan.seal()?;
+    let mut content=content_store(staging_root)?;
+    loop {
+        cancel.check()?;
+        while let Some((hash,path))=plan.ready()? {
+            let bytes=read_bytes(&path,risunest_sync_wire::MAX_METADATA_BYTES)?;
+            content.put(&hash,&bytes).map_err(transient)?;
+            let (unit_key,length):(String,u64)=kept.db.query_row("SELECT key,bytes FROM records WHERE hash=?1",[&hash],|row|Ok((row.get(0)?,row.get(1)?))).map_err(corrupt)?;
+            let unit=decode_original_unit(&content,&unit_key,&hash,length)?;
+            #[cfg(test)]
+            crate::persistent_store::hash_work::validation(&unit.value);
+            unit.value.validate().map_err(corrupt)?;
+            plan.settled(&hash)?;
+        }
+        if !plan.next_pack(key,provider,repository,cancel).await? {break;}
+    }
+    content.commit().map_err(transient)?;
+    kept.db.execute_batch("DROP TABLE nodes; DROP TABLE fragments; DROP TABLE packs").map_err(transient)?;
+    Ok(kept)
 }
 
 pub(crate) async fn download_backup_original_units(
