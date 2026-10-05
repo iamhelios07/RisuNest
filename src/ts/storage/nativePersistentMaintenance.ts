@@ -40,6 +40,7 @@ export interface NativeStorageBytes {
 
 export interface NativePersistentStorageStats {
     snapshotBytes: number
+    /** Database, WAL and SHM file lengths, including reusable pages. */
     databaseBytes: number
     assetObjects: NativeStorageBytes
     assetAliases: NativeStorageAliasStats[]
