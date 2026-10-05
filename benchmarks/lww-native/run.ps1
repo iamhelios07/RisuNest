@@ -20,7 +20,8 @@ try {
     $cargo = 'cargo'
     $manifest = Join-Path $PSScriptRoot 'Cargo.toml'
     switch ($Action) {
-        'test' { & $cargo test --locked --manifest-path $manifest }
+        # The self-tests are ignored so the app's test run, which compiles the same modules, skips them.
+        'test' { & $cargo test --locked --manifest-path $manifest -- --include-ignored }
         'compile' { & $cargo test --locked --no-run --manifest-path $manifest }
         'plan' { & $cargo run --locked --manifest-path $manifest -- plan }
         'generate' {
