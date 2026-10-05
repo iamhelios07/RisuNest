@@ -814,6 +814,7 @@ fn conversation_windows_cover_latest_and_anchor_boundaries() {
         anchor_occurrence: None,
         before,
         after,
+        skip_parser_work: None,
     };
 
     let latest = store
@@ -885,6 +886,7 @@ fn conversation_windows_resolve_last_and_absent_far_duplicate_anchors() {
                 anchor_occurrence: None,
                 before: Some(0),
                 after: Some(0),
+                skip_parser_work: None,
             },
             None,
         )
@@ -901,6 +903,7 @@ fn conversation_windows_resolve_last_and_absent_far_duplicate_anchors() {
                 anchor_occurrence: Some(AnchorOccurrence::Last),
                 before: Some(0),
                 after: Some(0),
+                skip_parser_work: None,
             },
             None,
         )
@@ -917,6 +920,7 @@ fn conversation_windows_resolve_last_and_absent_far_duplicate_anchors() {
                 anchor_occurrence: Some(AnchorOccurrence::Last),
                 before: Some(0),
                 after: Some(0),
+                skip_parser_work: None,
             },
             None,
         )
@@ -939,6 +943,7 @@ fn conversation_windows_support_strict_absolute_ranges() {
         anchor_occurrence: None,
         before: None,
         after: None,
+        skip_parser_work: None,
     };
 
     for (start_index, limit, expected_start, expected_end, expected_ids) in [
@@ -1017,6 +1022,7 @@ fn conversation_metadata_windows_exclude_bodies_and_classify_parser_work() {
                 anchor_occurrence: None,
                 before: None,
                 after: None,
+                skip_parser_work: None,
             },
             None,
         )
@@ -1084,6 +1090,7 @@ fn conversation_metadata_windows_mark_only_marker_free_text_bodies_parser_inert(
                 anchor_occurrence: None,
                 before: None,
                 after: None,
+                skip_parser_work: None,
             },
             None,
         )
@@ -1100,6 +1107,72 @@ fn conversation_metadata_windows_mark_only_marker_free_text_bodies_parser_inert(
         inert,
         [true, false, false, false, false, false, false, false, false]
     );
+}
+
+#[test]
+fn conversation_metadata_windows_without_parser_work_keep_ids_and_disabled_flags() {
+    let (_directory, mut store, _) = open_fixture();
+    let mut dynamic = message("{{history}}");
+    dynamic["chatId"] = json!("dynamic");
+    dynamic["disabled"] = json!("allBefore");
+    let mut disabled = message("disabled");
+    disabled["disabled"] = json!(true);
+    let mut thoughts = message("<Thoughts>hidden</Thoughts>");
+    thoughts["chatId"] = json!("thoughts");
+    thoughts["role"] = json!("char");
+    commit(
+        &mut store,
+        1,
+        ConversationMutation::ReplaceRange {
+            character_id: "char-a".to_owned(),
+            conversation_id: "conv-long".to_owned(),
+            start: 1,
+            delete_count: 1,
+            messages: vec![dynamic, disabled, thoughts],
+            conversation: None,
+            configured_index: None,
+        },
+    );
+    let read = |skip_parser_work| {
+        store
+            .read_conversation_message_metadata_window(
+                &ConversationWindowQuery {
+                    character_id: "char-a".to_owned(),
+                    conversation_id: "conv-long".to_owned(),
+                    start_index: Some(0),
+                    limit: Some(4),
+                    anchor_message_id: None,
+                    anchor_occurrence: None,
+                    before: None,
+                    after: None,
+                    skip_parser_work,
+                },
+                None,
+            )
+            .expect("read metadata range")
+            .expect("conversation exists")
+            .value
+    };
+    let full = read(None);
+    let skipped = read(Some(true));
+
+    let fields = |window: &crate::persistent_store::ConversationMessageMetadataWindow| {
+        window
+            .messages
+            .iter()
+            .map(|message| (message.chat_id.clone(), message.role.clone(), message.disabled.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(fields(&skipped), fields(&full));
+    assert_eq!(
+        (skipped.start_index, skipped.end_index, skipped.total_messages),
+        (full.start_index, full.end_index, full.total_messages)
+    );
+    assert_eq!(
+        full.messages.iter().map(|message| message.parser_inert).collect::<Vec<_>>(),
+        [true, false, true, false]
+    );
+    assert!(skipped.messages.iter().all(|message| !message.parser_inert));
 }
 
 #[test]
@@ -1934,6 +2007,7 @@ fn leased_family_canonical(store: &PersistentStore, lease: &str) -> Vec<u8> {
                 anchor_occurrence: None,
                 before: None,
                 after: None,
+                skip_parser_work: None,
             },
             Some(lease),
         ).expect("read leased message window"),
@@ -2920,6 +2994,7 @@ fn replace_range_clamps_out_of_bounds_indices() {
                 anchor_occurrence: None,
                 before: None,
                 after: None,
+                skip_parser_work: None,
             },
             None,
         )
@@ -2959,6 +3034,7 @@ fn revision_leases_isolate_conversation_reads() {
                     anchor_occurrence: None,
                     before: None,
                     after: None,
+                    skip_parser_work: None,
                 },
                 lease,
             )
@@ -3001,6 +3077,7 @@ fn revision_leases_isolate_conversation_reads() {
                 anchor_occurrence: None,
                 before: None,
                 after: None,
+                skip_parser_work: None,
             },
             Some(&lease.lease),
         ),
