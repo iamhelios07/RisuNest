@@ -58,14 +58,24 @@ export const getAssetResidencyStatus = (target?: AssetResidencyTarget) =>
 async function protectedCommand(name: string, args?: Record<string, unknown>, signal?: AbortSignal, operationId?: string) {
   const task = await beginMobileBackgroundTask("sync");
   let cancellation: Promise<void> | undefined;
+  let admitted = operationId === undefined;
   const cancel = () => {
-    cancellation ??= cancelAssetResidencyOperation(operationId).catch(() => {});
+    if (admitted) cancellation ??= cancelAssetResidencyOperation(operationId).catch(() => {});
   };
   task.signal?.addEventListener("abort", cancel, { once: true });
   signal?.addEventListener("abort", cancel, { once: true });
   try {
     if (task.signal?.aborted) throw task.signal.reason;
     signal?.throwIfAborted();
+    if (operationId !== undefined) {
+      await invoke<void>("asset_residency_prepare_download", { operationId });
+      admitted = true;
+      if (signal?.aborted || task.signal?.aborted) {
+        cancel();
+        signal?.throwIfAborted();
+        throw task.signal!.reason;
+      }
+    }
     task.progress(null);
     const result = await command(name, args);
     signal?.throwIfAborted();
@@ -74,6 +84,7 @@ async function protectedCommand(name: string, args?: Record<string, unknown>, si
   } finally {
     task.signal?.removeEventListener("abort", cancel);
     signal?.removeEventListener("abort", cancel);
+    if (operationId !== undefined) cancel();
     await cancellation;
     await task.dispose();
   }
