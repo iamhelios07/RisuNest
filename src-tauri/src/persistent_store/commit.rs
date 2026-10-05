@@ -786,7 +786,7 @@ pub(super) fn replace_add_conversation_messages(
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     require_staging(&transaction, staging_id)?;
     let expected_start: i64 = transaction.query_row(
-        "SELECT COUNT(*) FROM messages WHERE generation = ?1 AND character_id = ?2 AND conversation_id = ?3",
+        "SELECT COALESCE(MAX(message_index)+1,0) FROM messages WHERE generation = ?1 AND character_id = ?2 AND conversation_id = ?3",
         params![staging_id, character_id, conversation_id],
         |row| row.get(0),
     )?;
@@ -795,7 +795,6 @@ pub(super) fn replace_add_conversation_messages(
             "Persistent data import message pages must be contiguous",
         ));
     }
-    super::message_pages::forget_pages(&transaction, staging_id, character_id, conversation_id)?;
     insert_messages(
         &transaction,
         staging_id,
@@ -809,27 +808,17 @@ pub(super) fn replace_add_conversation_messages(
     Ok(())
 }
 
-/// Pages a staged conversation once all of its messages are written, so that
-/// activation reads its manifest instead of its messages.
+/// Extends staged pages after each message batch, completing the manifest when
+/// all messages have arrived so activation never has to read the conversation.
 pub(super) fn page_staged_conversation(
     transaction: &Transaction<'_>,
     staging_id: &str,
     character_id: &str,
     conversation_id: &str,
 ) -> StoreResult<()> {
-    let complete: Option<bool> = transaction
-        .query_row(
-            "SELECT c.message_count = (SELECT count(*) FROM messages m WHERE m.generation = c.generation
-                AND m.character_id = c.character_id AND m.conversation_id = c.conversation_id)
-             FROM conversations c WHERE c.generation = ?1 AND c.character_id = ?2 AND c.conversation_id = ?3",
-            params![staging_id, character_id, conversation_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if complete == Some(true) {
-        super::message_pages::capture_manifest(transaction, staging_id, character_id, conversation_id, None)?;
-    }
-    Ok(())
+    super::message_pages::stage_conversation_pages(
+        transaction, staging_id, character_id, conversation_id, &|| Ok(()),
+    )
 }
 
 fn page_staged_conversations(
@@ -837,12 +826,11 @@ fn page_staged_conversations(
     staging_id: &str,
     character_id: &str,
 ) -> StoreResult<()> {
-    let conversations = transaction
-        .prepare("SELECT conversation_id FROM conversations WHERE generation = ?1 AND character_id = ?2")?
-        .query_map(params![staging_id, character_id], |row| row.get::<_, String>(0))?
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut statement = transaction
+        .prepare("SELECT conversation_id FROM conversations WHERE generation = ?1 AND character_id = ?2")?;
+    let conversations = statement.query_map(params![staging_id, character_id], |row| row.get::<_, String>(0))?;
     for conversation_id in conversations {
-        page_staged_conversation(transaction, staging_id, character_id, &conversation_id)?;
+        page_staged_conversation(transaction, staging_id, character_id, &conversation_id?)?;
     }
     Ok(())
 }
