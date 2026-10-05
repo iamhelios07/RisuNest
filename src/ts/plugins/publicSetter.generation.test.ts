@@ -106,6 +106,7 @@ import { getDatabase, setDatabaseLite } from '../storage/database.svelte'
 import { IndexedDbPersistentDataStore } from '../storage/indexedDbPersistentDataStore'
 import {
     acquireCompleteConversation,
+    activateCharacter,
     assertPersistentMutationAllowed,
     captureSelectedConversationAuthority,
     captureSelectedConversationTarget,
@@ -123,6 +124,7 @@ import {
 import { selectedCharID } from '../stores.svelte'
 import { doingChat, getSelectedBoundedGenerationFallbackReason, sendChat } from '../process/index.svelte'
 import { createProductionPluginDatabaseAccess, type PluginDatabaseAccess } from './pluginDatabaseAccess'
+import { findActiveHistoryWindow } from '../process/historyWindowIndex'
 import { get } from 'svelte/store'
 
 const target = { characterId: 'character-a', conversationId: 'chat-a' }
@@ -192,12 +194,12 @@ function deferred() {
     return { promise, resolve }
 }
 
-function createAccess(): PluginDatabaseAccess {
+function createAccess(flushPendingData = flushPendingDataLocally): PluginDatabaseAccess {
     return createProductionPluginDatabaseAccess({
         owner: 'public-setter-fixture',
         getPersistentRevision,
         commitPersistentUnitIntent,
-        flushPendingData: flushPendingDataLocally,
+        flushPendingData,
         assertPersistentMutationAllowed,
         getStorageAuthorityEpoch: getPersistentStorageAuthorityEpoch,
         getCompatibilityDatabase: getDatabase,
@@ -237,7 +239,7 @@ async function reopen(): Promise<Chat> {
 }
 
 type Mode = 'history-limit' | 'complete' | 'standard-hypa'
-type Edit = 'promotion' | 'metadata' | 'content' | 'insert' | 'remove'
+type Edit = 'promotion' | 'metadata' | 'content' | 'insert' | 'remove' | 'duplicate history IDs' | 'missing history ID'
 
 describe.each<Mode>(['history-limit', 'complete', 'standard-hypa'])('public chat setter during %s generation', mode => {
     let access: PluginDatabaseAccess
@@ -252,6 +254,18 @@ describe.each<Mode>(['history-limit', 'complete', 'standard-hypa'])('public chat
     let running: Promise<boolean> | undefined
     let pendingWrite: Promise<void> | undefined
     const generate = () => running = sendChat({ historyLimit: fixture.historyLimit, signal: lifetime.signal })
+    const holdPublicFlush = () => {
+        const entered = deferred()
+        const released = deferred()
+        releaseCommit = released.resolve
+        access.closeReadBaselines()
+        access = createAccess(async reason => {
+            entered.resolve()
+            await released.promise
+            await flushPendingDataLocally(reason)
+        })
+        return { entered: entered.promise, release: released.resolve }
+    }
 
     beforeEach(async () => {
         log = vi.spyOn(console, 'log').mockImplementation(() => undefined)
@@ -280,6 +294,10 @@ describe.each<Mode>(['history-limit', 'complete', 'standard-hypa'])('public chat
             initial.characters[0].supaMemory = true
             initialChat.hypaV3Data = { summaries: [{ chatMemos: ['a', 'b'], summary: 'covered' }] } as any
         }
+        initial.characters.push({
+            ...structuredClone(initial.characters[0]), chaId: 'character-b', name: 'Character B',
+            chats: [{ ...structuredClone(initialChat), id: 'chat-b', message: [{ role: 'user', data: 'Other conversation', chatId: 'other' }] }],
+        })
         await install(initial)
         access = createAccess()
         fixture.onRequest = () => {
@@ -310,7 +328,7 @@ describe.each<Mode>(['history-limit', 'complete', 'standard-hypa'])('public chat
         vi.restoreAllMocks()
     })
 
-    it.each<Edit>(['promotion', 'metadata', 'content', 'insert', 'remove'])(
+    it.each<Edit>(['promotion', 'metadata', 'content', 'insert', 'remove', 'duplicate history IDs', 'missing history ID'])(
         'keeps an awaited %s write and one reply after reopening the store',
         async edit => {
             const submitted = structuredClone(initialChat)
@@ -322,6 +340,8 @@ describe.each<Mode>(['history-limit', 'complete', 'standard-hypa'])('public chat
             if (edit === 'content') submitted.message[0].data = 'Plugin content'
             if (edit === 'insert') submitted.message.splice(1, 0, { role: 'user', data: 'Plugin insert', chatId: 'inserted' })
             if (edit === 'remove') submitted.message.splice(0, 1)
+            if (edit === 'duplicate history IDs') submitted.message[0].chatId = submitted.message[1].chatId
+            if (edit === 'missing history ID') delete submitted.message[0].chatId
             let writing: Promise<void> | undefined
             fixture.replacers.add(async formated => {
                 writing = pendingWrite = access.setChatToIndex(0, 0, submitted, { pluginName: 'fixture', signal: lifetime.signal })
@@ -401,5 +421,136 @@ describe.each<Mode>(['history-limit', 'complete', 'standard-hypa'])('public chat
         expect(stored.id).toBe(target.conversationId)
         expect(stored.message.map(message => message.data)).toEqual(['covered-a', 'covered-b', 'tail', 'answer'])
         expect(output).toHaveBeenCalledOnce()
+    })
+
+    it('keeps invalid indices as no-ops inside an awaited beforeRequest replacer', async () => {
+        fixture.replacers.add(async formated => {
+            const submitted = { ...structuredClone(initialChat), note: 'Must not be stored' }
+            for (const [characterIndex, chatIndex] of [[-1, 0], [99, 0], [0, -1], [0, 99], [0.5, 0], [0, Number.NaN]]) {
+                await expect(access.setChatToIndex(characterIndex, chatIndex, submitted, {
+                    pluginName: 'fixture', signal: lifetime.signal,
+                })).resolves.toBeUndefined()
+            }
+            return formated
+        })
+        const sending = generate()
+        await started.promise
+        provider.resolve()
+        await expect(sending).resolves.toBe(true)
+        const stored = await reopen()
+        expect(stored.note).toBe(initialChat.note)
+        expect(stored.message.map(message => message.data)).toEqual(['covered-a', 'covered-b', 'tail', 'answer'])
+        expect(output).toHaveBeenCalledOnce()
+    })
+
+    it.each(['navigation', 'cancellation'])(
+        'keeps request ownership across %s while a beforeRequest setter is waiting to flush',
+        async boundary => {
+            const flush = holdPublicFlush()
+            fixture.replacers.add(async formated => {
+                pendingWrite = access.setChatToIndex(0, 0, { ...structuredClone(initialChat), note: 'Admitted plugin note' }, {
+                    pluginName: 'fixture', signal: lifetime.signal,
+                })
+                void pendingWrite.catch(() => undefined)
+                return formated
+            })
+            const sending = generate()
+            await flush.entered
+            if (boundary === 'navigation') {
+                await expect(activateCharacter('character-b')).resolves.toBe(false)
+                expect(getDatabase().characters[get(selectedCharID)].chaId).toBe(target.characterId)
+            } else lifetime.abort()
+            flush.release()
+            provider.resolve()
+            if (boundary === 'cancellation') await expect(pendingWrite).rejects.toThrow()
+            else await expect(pendingWrite).resolves.toBeUndefined()
+            await expect(sending).resolves.toBe(boundary === 'navigation')
+            const stored = await reopen()
+            expect(stored.note).toBe(boundary === 'navigation' ? 'Admitted plugin note' : initialChat.note)
+            expect(stored.message.map(message => message.data)).toEqual(boundary === 'navigation'
+                ? ['covered-a', 'covered-b', 'tail', 'answer']
+                : ['covered-a', 'covered-b', 'tail'])
+            const other = await fixture.store.readConversation('character-b', 'chat-b')
+            expect(other.value.message.map((message: Message) => message.data)).toEqual(['Other conversation'])
+            if (boundary === 'navigation') expect(output).toHaveBeenCalledOnce()
+            else expect(output).not.toHaveBeenCalled()
+        },
+    )
+
+    it('preserves unrelated committed fields while an awaited beforeRequest setter is waiting to flush', async () => {
+        const flush = holdPublicFlush()
+        fixture.replacers.add(async formated => {
+            pendingWrite = access.setChatToIndex(0, 0, { ...structuredClone(initialChat), name: 'Plugin title' }, {
+                pluginName: 'fixture', signal: lifetime.signal,
+            })
+            await pendingWrite
+            return formated
+        })
+        const sending = generate()
+        await flush.entered
+        await commitPersistentUnitIntent('public-setter-concurrent-metadata', [
+            { key: '["conversation","character-a","chat-a","note"]', type: 'set', value: 'Concurrent note' },
+            { key: '["conversation","character-b","chat-b","name"]', type: 'set', value: 'Other title' },
+        ])
+        flush.release()
+        provider.resolve()
+        await expect(pendingWrite).resolves.toBeUndefined()
+        await expect(sending).resolves.toBe(true)
+        const stored = await reopen()
+        expect(stored.name).toBe('Plugin title')
+        expect(stored.note).toBe('Concurrent note')
+        expect(stored.message.map(message => message.data)).toEqual(['covered-a', 'covered-b', 'tail', 'answer'])
+        const other = await fixture.store.readConversation('character-b', 'chat-b')
+        expect(other.value.name).toBe('Other title')
+        expect(other.value.message.map((message: Message) => message.data)).toEqual(['Other conversation'])
+        expect(output).toHaveBeenCalledOnce()
+    })
+
+    if (mode === 'history-limit') it('keeps the nonzero admitted window registered after an awaited public metadata write', async () => {
+        const seed = database()
+        seed.maxContext = 500
+        seed.maxResponse = 0
+        initialChat = seed.characters[0].chats[0]
+        initialChat.message = Array.from({ length: 120 }, (_, index): Message => ({
+            role: index % 2 ? 'char' : 'user', data: `Synthetic message ${index}`, chatId: `message-${index}`,
+        }))
+        access.closeReadBaselines()
+        await install(seed)
+        access = createAccess()
+        const expectedTail = initialChat.message.slice(20).map(message => message.data)
+        fixture.onRequest = () => {
+            started.resolve()
+            expect(getActiveConversationSession()).toBeNull()
+            expect(captureSelectedConversationAuthority()?.totalMessages).toBe(120)
+            const window = findActiveHistoryWindow(target.characterId, target.conversationId)
+            expect(window?.absoluteStartIndex).toBe(20)
+            expect(window?.chat.message.map(message => message.data)).toEqual(expectedTail)
+            fixture.outputs.add(output)
+        }
+        fixture.replacers.add(async formated => {
+            pendingWrite = access.setChatToIndex(0, 0, { ...structuredClone(initialChat), note: 'Window metadata' }, {
+                pluginName: 'fixture', signal: lifetime.signal,
+            })
+            await pendingWrite
+            const window = findActiveHistoryWindow(target.characterId, target.conversationId)
+            expect(window?.absoluteStartIndex).toBe(20)
+            expect(window?.chat.message.map(message => message.data)).toEqual(expectedTail)
+            return formated
+        })
+        output.mockImplementation(async () => {
+            const window = findActiveHistoryWindow(target.characterId, target.conversationId)
+            expect(window?.absoluteStartIndex).toBe(20)
+            expect(window?.chat.message.map(message => message.data)).toEqual([...expectedTail, 'answer'])
+        })
+
+        const sending = generate()
+        await started.promise
+        provider.resolve()
+        await expect(sending).resolves.toBe(true)
+        const stored = await reopen()
+        expect(stored.note).toBe('Window metadata')
+        expect(stored.message.map(message => message.data)).toEqual([...initialChat.message.map(message => message.data), 'answer'])
+        expect(output).toHaveBeenCalledOnce()
+        expect(findActiveHistoryWindow(target.characterId, target.conversationId)).toBeNull()
     })
 })
