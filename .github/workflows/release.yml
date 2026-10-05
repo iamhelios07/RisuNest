@@ -580,7 +580,7 @@ jobs:
           BUNDLES: ${{ matrix.bundles }}
         run: |
           set -euo pipefail
-          pnpm exec -- tauri build --target "$TARGET" --bundles "$BUNDLES" --config "$RUNNER_TEMP/release-tauri.json" -- --locked
+          pnpm exec -- tauri bundle --target "$TARGET" --bundles "$BUNDLES" --config "$RUNNER_TEMP/release-tauri.json"
       - name: Verify app uninstall cleanup and retry
         if: matrix.os == 'windows'
         env:
