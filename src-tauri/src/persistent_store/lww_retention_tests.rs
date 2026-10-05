@@ -522,14 +522,14 @@ fn quarantined_target_and_new_device_finish_once_after_reopen_and_keep_later_pub
         drop(store);
         let mut store = PersistentStore::open(dir.path()).unwrap();
         assert_eq!(device_count(&store, "SELECT count(*) FROM lww_intent_failures WHERE quarantined=1"), 1);
-        save(&mut store, vec![mutation(&["root", "username"], serde_json::json!("later-unrelated"))]);
-        let later = store.lww_read_outbox(header.binding_authority, 100).unwrap().entries.into_iter().find(|row| row.key == unit_key(&["root", "username"]).unwrap()).unwrap();
+        save(&mut store, vec![mutation(&["root", "askRemoval"], serde_json::json!(true))]);
+        let later = store.lww_read_outbox(header.binding_authority, 100).unwrap().entries.into_iter().find(|row| row.key == unit_key(&["root", "askRemoval"]).unwrap()).unwrap();
         let selected = store.lww_quarantined_intents().unwrap().remove(0);
         let revision = store.revision().unwrap();
         assert!(store.lww_complete_quarantined_intent(&selected.request_id, &selected.token, revision).unwrap());
         assert!(!store.lww_complete_quarantined_intent(&selected.request_id, &selected.token, revision).unwrap());
         assert_eq!(active_generation(&store.connection).unwrap(), stage);
-        assert_eq!(store.read_root(None).unwrap().value["username"], "later-unrelated");
+        assert_eq!(store.read_root(None).unwrap().value["askRemoval"], true);
         assert_eq!(store.revision().unwrap(), revision);
         let state = store.lww_clock_state().unwrap();
         assert_eq!(state.binding_authority.0, header.binding_authority.0 + u64::from(new_device));
@@ -592,11 +592,18 @@ fn quarantined_completion_rejects_missing_rows_receipt_and_changed_device_withou
         match failure {
             "rows" => { store.device_store().unwrap().connection().execute("DELETE FROM lww_intent_rows WHERE request_id=?1", [&header.request_id]).unwrap(); }
             "receipt" => { store.connection.execute("UPDATE lww_requests SET digest='changed' WHERE request_id=?1", [&header.request_id]).unwrap(); }
-            "device" => { store.device_store_mut().unwrap().write_setting("accountst", &serde_json::json!("later-device")).unwrap(); }
+            "device" => {
+                let device = store.device_store_mut().unwrap();
+                let before = device.revision().unwrap();
+                device.write_plugin_device_values("quarantine-fixture", &[device_store::plugin_values::PluginDeviceMutation::Set {
+                    space: "string".into(), key: "later".into(), value: "later-device".into(),
+                }]).unwrap();
+                assert!(device.revision().unwrap() > before);
+            }
             "authority" => { store.device_store().unwrap().connection().execute("UPDATE lww_clock SET binding_authority='999'", []).unwrap(); }
             _ => { store.device_store().unwrap().connection().execute("UPDATE lww_intents SET body=json_set(body,'$.staging_id','changed') WHERE request_id=?1", [&header.request_id]).unwrap(); }
         }
-        assert!(store.lww_complete_quarantined_intent(&selected.request_id, &selected.token, revision).is_err());
+        assert!(store.lww_complete_quarantined_intent(&selected.request_id, &selected.token, revision).is_err(), "{failure}");
         let current = store.lww_quarantined_intents().unwrap().remove(0);
         assert!(!current.recoverable && !current.discardable);
         assert_eq!(device_count(&store, "SELECT count(*) FROM lww_intent_failures WHERE quarantined=1"), 1);
