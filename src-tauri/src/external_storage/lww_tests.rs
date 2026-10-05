@@ -296,7 +296,8 @@ fn a_saved_publication_keeps_its_asset_pins_across_a_page_reload_until_it_is_sen
         let open_store = || f.a.open_native_job_store().map_err(|error| error.to_string());
         DurableCasJobState::default().sweep_after_page_start(&root, &CasJobOwnerProbe {
             native_jobs: &native_jobs,
-            device_session_active: false,
+                device_job_owned: &|_| Ok(false),
+                external_job_active: &|_| Ok(false),
             open_store: &open_store,
         }).unwrap();
         assert_eq!(durable_cas_job_ids(&root).unwrap(), journals);
