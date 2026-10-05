@@ -1,5 +1,6 @@
 import type { PluginStorageValueCursor } from "../storage/persistentDataStore"
 import { reconcilePluginListUpdate } from './pluginListUpdate'
+import { captureGenerationPublicWrite } from '../process/generationRequestPhase'
 import type { RisuPlugin } from "./plugins.svelte"
 import type { Chat, Database } from '../storage/database.svelte'
 import type {
@@ -1036,6 +1037,9 @@ export function createPluginDatabaseAccess(
             const admission = characterId && readBaselines.hasRead('conversation', JSON.stringify([characterId, chat.id])) ? undefined : captureCharacterAdmission(characterId ?? '', characterIndex)
             const candidate = snapshotWithProvenance(chat)
             const selectedBoundary = captureSelectedCallBoundary()
+            const publicWrite = captureGenerationPublicWrite(selectedBoundary.target)
+            let committed = false
+            try {
             throwIfFullObjectCallAborted(context.signal)
             const admissionCharacter = admission ? await admission as PluginCompleteCharacter : undefined
             await dependencies.flushPendingData('plugin-full-object-write')
@@ -1067,7 +1071,9 @@ export function createPluginDatabaseAccess(
                 dependencies.assertPersistentMutationAllowed(selectedBoundary.authorityEpoch)
                 readBaselines.assertOpen()
                 const changes = pluginUnitIntents(intents, 'conversation', dependencies.owner, candidate, target.characterId, target.conversationId)
+                publicWrite?.prepare(target)
                 await dependencies.commitPersistentUnitIntent('plugin-setChatToIndex', changes.units, [], changes.wholeMessages)
+                committed = true
                 if (!completeLease) {
                     invalidateLeaselessSelectedWrite(
                         target.characterId,
@@ -1082,6 +1088,9 @@ export function createPluginDatabaseAccess(
                         completeLease.session,
                     )
                 }
+            }
+            } finally {
+                await publicWrite?.finish(committed)
             }
         },
 

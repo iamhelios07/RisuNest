@@ -7,15 +7,25 @@ import type { GeneratingConversation } from '../storage/persistentDataStore'
 const key = (target: GeneratingConversation) => JSON.stringify([target.characterId, target.conversationId])
 const openPhases = new Map<string, number>()
 const patchesInFlight = new Map<string, Set<Promise<void>>>()
+interface PublicWriteObserver {
+    isCurrent(): boolean
+    adopt(): Promise<void>
+}
+const publicWriteObservers = new Map<string, Set<PublicWriteObserver>>()
 
 export function isGenerationRequestPhaseOpen(target: GeneratingConversation): boolean {
     return openPhases.has(key(target))
 }
 
 /** Opens the request phase; the returned close stops admitting patches and waits for those in flight. */
-export function openGenerationRequestPhase(target: GeneratingConversation): () => Promise<void> {
+export function openGenerationRequestPhase(target: GeneratingConversation, publicWrites?: PublicWriteObserver): () => Promise<void> {
     const identity = key(target)
     openPhases.set(identity, (openPhases.get(identity) ?? 0) + 1)
+    const observers = publicWriteObservers.get(identity) ?? new Set<PublicWriteObserver>()
+    if (publicWrites) {
+        observers.add(publicWrites)
+        publicWriteObservers.set(identity, observers)
+    }
     let closed = false
     return async () => {
         if (!closed) {
@@ -25,6 +35,31 @@ export function openGenerationRequestPhase(target: GeneratingConversation): () =
             else openPhases.delete(identity)
         }
         await settleConversationPatches(target)
+        if (publicWrites) observers.delete(publicWrites)
+        if (!observers.size && publicWriteObservers.get(identity) === observers) publicWriteObservers.delete(identity)
+    }
+}
+
+/** Public setters retain their write semantics and let an admitted request adopt their result. */
+export function captureGenerationPublicWrite(target: GeneratingConversation | null) {
+    if (!target || !isGenerationRequestPhaseOpen(target)) return null
+    const candidates = [...publicWriteObservers.get(key(target)) ?? []]
+    const release = trackConversationPatch(target)
+    let accepted: PublicWriteObserver[] = []
+    let finished = false
+    return {
+        prepare(actual: GeneratingConversation) {
+            if (key(actual) === key(target)) accepted = candidates.filter((observer) => observer.isCurrent())
+        },
+        async finish(committed: boolean) {
+            if (finished) return
+            finished = true
+            try {
+                if (committed) for (const observer of accepted) await observer.adopt()
+            } finally {
+                release()
+            }
+        },
     }
 }
 
