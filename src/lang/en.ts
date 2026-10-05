@@ -7,7 +7,8 @@ export const languageEnglish = {
         "pluginDataDeletion": "Delete plugin data",
         "lorebookDeletion": "Delete lorebook folder and entries",
         "partialBackup": "Backup without other assets",
-        "onlySelectedMessage": "Delete only this message"
+        "laterMessageDeletion": "Also delete later messages",
+        "messageDeletionDescription": "Only this message is deleted. If you also delete later messages, every message after it is deleted too."
     },
 
     close: "Close",

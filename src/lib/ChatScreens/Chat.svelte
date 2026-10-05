@@ -499,9 +499,9 @@
                 confirmRemoval: () => alertConfirm(language.removeChat),
                 confirmInstantRemoval: () => alertCheckboxConfirm({
                     title: language.removeChat,
-                    description: language.instantRemoveConfirm,
-                    checkboxLabel: language.checkboxConfirmation.onlySelectedMessage,
-                    actionLabel: language.risuNest.plugins.removeAction,
+                    description: language.checkboxConfirmation.messageDeletionDescription,
+                    checkboxLabel: language.checkboxConfirmation.laterMessageDeletion,
+                    actionLabel: language.remove,
                     cancelLabel: language.cancel,
                     requireChecked: false,
                 }),

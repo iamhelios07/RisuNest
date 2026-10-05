@@ -7,7 +7,8 @@ export const languageKorean = {
         "pluginDataDeletion": "플러그인 데이터 삭제",
         "lorebookDeletion": "로어북 폴더와 항목 삭제",
         "partialBackup": "다른 에셋을 제외한 백업",
-        "onlySelectedMessage": "이 메시지만 삭제"
+        "laterMessageDeletion": "이후 메시지도 함께 삭제",
+        "messageDeletionDescription": "이 메시지만 삭제되며, 이후 메시지도 함께 삭제할 경우 이 메시지 뒤의 모든 메시지가 함께 삭제됩니다."
     },
 
     close: "닫기",
