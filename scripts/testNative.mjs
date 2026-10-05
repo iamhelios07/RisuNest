@@ -1,4 +1,6 @@
 import { spawnSync } from 'node:child_process'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -47,6 +49,25 @@ export const embeddedCrateTests = [
   },
 ]
 
+// Std-only modules whose tests sit behind a target their package runner never builds on a host.
+export const standaloneRustTests = [
+  {
+    source: 'crates/wry/src/android/response_bodies.rs',
+    name: 'wry_android_response_bodies',
+    edition: '2021',
+  },
+]
+
+export function standaloneRustCommands(directory, platform = process.platform) {
+  return standaloneRustTests.flatMap(entry => {
+    const binary = join(directory, `${entry.name}${platform === 'win32' ? '.exe' : ''}`)
+    return [
+      ['rustc', '--edition', entry.edition, '--test', entry.source, '-o', binary],
+      [binary],
+    ]
+  })
+}
+
 export function sharedCargoTarget(commonGitDirectory, configuredTarget, root) {
   const common = resolve(root, commonGitDirectory.trim())
   if (basename(common) !== '.git') throw new Error('Cannot locate the main checkout shared Cargo target')
@@ -88,11 +109,19 @@ export function runNative(group) {
   const git = spawnSync('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], { cwd: root, encoding: 'utf8', windowsHide: true })
   if (git.error || git.status !== 0) throw git.error ?? new Error(git.stderr)
   const env = { ...process.env, CARGO_TARGET_DIR: sharedCargoTarget(git.stdout, process.env.CARGO_TARGET_DIR, root) }
-  for (const [command, ...args] of nativeCommands(group)) {
+  const run = (command, args) => {
     console.log(`> ${command} ${args.join(' ')}`)
     const result = spawnSync(command, args, { cwd: root, env, stdio: 'inherit', windowsHide: true })
     if (result.error) throw result.error
     if (result.status !== 0) throw new Error(`${command} failed: ${result.signal ?? result.status}`)
+  }
+  for (const [command, ...args] of nativeCommands(group)) run(command, args)
+  if (group !== 'host') return
+  const directory = mkdtempSync(join(tmpdir(), 'risunest-standalone-rust-'))
+  try {
+    for (const [command, ...args] of standaloneRustCommands(directory)) run(command, args)
+  } finally {
+    rmSync(directory, { recursive: true, force: true })
   }
 }
 
