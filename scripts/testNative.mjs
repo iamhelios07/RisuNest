@@ -32,6 +32,12 @@ export const packageCrateTests = [
     platforms: ['win32', 'linux', 'darwin'],
   },
   {
+    manifest: 'crates/tauri-plugin-http/Cargo.toml',
+    runnerManifest: 'src-tauri/Cargo.toml',
+    package: 'tauri-plugin-http',
+    platforms: ['win32', 'linux', 'darwin'],
+  },
+  {
     manifest: 'crates/tauri-plugin-updater/Cargo.toml',
     runnerManifest: 'src-tauri/Cargo.toml',
     package: 'tauri-plugin-updater',

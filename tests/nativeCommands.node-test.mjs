@@ -18,7 +18,7 @@ test('native groups explicitly own dependency packages and full app integration 
     assert(!command.includes('--ignored'))
   }
   assert(!host[0].includes('--lib'))
-  assert.deepEqual(packageCrateTests.map(entry => entry.package), ['tauri-plugin-window-state', 'wry', 'tauri-plugin-updater'])
+  assert.deepEqual(packageCrateTests.map(entry => entry.package), ['tauri-plugin-window-state', 'wry', 'tauri-plugin-http', 'tauri-plugin-updater'])
   for (const platform of ['win32', 'linux', 'darwin']) {
     assert.deepEqual(nativeCommands('host', platform).filter(command => command.includes('--package')), packageCrateTests.map(entry => [
       'cargo', 'test', '--manifest-path', entry.runnerManifest,
