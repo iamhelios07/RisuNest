@@ -375,6 +375,15 @@ describe('quarantined intent discard', () => {
         await model.discard(item, diagnosis)
         expect(deps.discardIntent).not.toHaveBeenCalled()
     })
+    it('does not admit a quarantined record without a native discard token', async () => {
+        const ineligible = { ...item, locator: null }
+        const diagnosis = result({ items: [ineligible] })
+        const { model, deps } = harness({ getResult: vi.fn().mockResolvedValue(diagnosis) })
+        await model.load()
+        await model.discard(ineligible, diagnosis)
+        expect(deps.discardIntent).not.toHaveBeenCalled()
+        expect(model.snapshot()).toMatchObject({ result: diagnosis, activity: null, failure: null })
+    })
     it('keeps the finding on refusal and allows retry', async () => {
         const diagnosis = result({ items: [item] })
         const { model, deps } = harness({ getResult: vi.fn().mockResolvedValue(diagnosis), discardIntent: vi.fn().mockRejectedValue(new Error('stale token')) })
