@@ -1,5 +1,5 @@
 import { generatingConversations } from './generatingConversationRegistry'
-import type { LwwStageReceive, LwwApplyResult, PersistentUnitMutation, ConversationMutation, WholeMessageIntent } from './persistentDataStore'
+import type { LwwStageReceive, LwwApplyResult } from './persistentDataStore'
 import { flushPersistentIdentityEdits, derivePersistentIdentityMirrors } from './persistentIdentityHooks'
 import { applyReceivedDisplaySettings } from '../gui/receivedDisplaySettings'
 import { isConversationStreaming } from './streamingConversationRegistry'
