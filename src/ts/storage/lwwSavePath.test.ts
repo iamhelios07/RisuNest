@@ -87,7 +87,9 @@ async function identityRuntimeHarness() {
             return {...result,affectedKeys:mutations!.map((value)=>value.key),heldKeys:[],deferredKeys:[]}
         }
         native.lwwFinishReceive = async()=>undefined
-        await runtime.applyLwwReceive({bindingAuthority:'identity',requestId:crypto.randomUUID(),changes:[],progress:{kind:'server',cursor:'1'},admittedTimeUpperMs:'100'})
+        // The staged rows are not read by these stubs; a real pull always stages at least one.
+        const changes = mutations!.map((value)=>({key:value.key,stamp:{physicalMs:'1',logical:'0',writerId:'remote'},value:{kind:'deleted' as const}}))
+        await runtime.applyLwwReceive({bindingAuthority:'identity',requestId:crypto.randomUUID(),changes,progress:{kind:'server',cursor:'1'},admittedTimeUpperMs:'100'})
     }
     return {database,store,commit,runtime,receive}
 }
@@ -113,6 +115,41 @@ describe('LWW renderer save path', () => {
         commit.mockClear()
         await runtime.flushPendingDataLocally('after-received-selected-record')
         expect(commit).not.toHaveBeenCalled()
+    })
+
+    it.each([
+        ['preset', '["root","botPresetsId"]', 'preset-alpha', '["exists","preset","preset-alpha"]'],
+        ['persona', '["root","selectedPersona"]', 'persona-second', '["exists","persona","persona-second"]'],
+    ] as const)('does not save the selection that replaces a remotely deleted selected %s', async (kind, selectionKey, selectedId, existsKey) => {
+        const {database,commit,runtime,receive} = await identityRuntimeHarness()
+        await receive([{key:selectionKey,type:'set',value:selectedId}])
+        await receive([{key:existsKey,type:'delete'}])
+        const selected = kind === 'preset' ? database.botPresets[database.botPresetsId]['id'] : database.personas[database.selectedPersona].id
+        expect(selected).toBe(kind === 'preset' ? 'preset-beta' : 'persona-first')
+        commit.mockClear()
+        await runtime.flushPendingDataLocally('after-remote-selected-deletion')
+        expect(commit).not.toHaveBeenCalled()
+    })
+
+    it('captures receive baselines only for a pull that carries changes', async () => {
+        const {store,runtime} = await runtimeHarness()
+        const materialized = vi.spyOn(SaveCoordinator.prototype,'captureMaterializedBaseline')
+        const presetRecords = vi.spyOn(SaveCoordinator.prototype,'capturePresetRecordBaseline')
+        try {
+            store.lwwStageReceive = async()=>undefined
+            store.lwwApplyReceive = async()=>({revision:runtime.revision,affectedKeys:[],heldKeys:[],deferredKeys:[]})
+            store.lwwFinishReceive = async()=>undefined
+            const request = (changes: LwwStageReceive['changes']): LwwStageReceive => ({bindingAuthority:'a',requestId:crypto.randomUUID(),changes,progress:{kind:'server',cursor:'1'},admittedTimeUpperMs:'100'})
+            await runtime.applyLwwReceive(request([]))
+            expect(materialized).not.toHaveBeenCalled()
+            expect(presetRecords).not.toHaveBeenCalled()
+            await runtime.applyLwwReceive(request([{key:'["character","char-a","notes"]',stamp:{physicalMs:'1',logical:'0',writerId:'remote'},value:{kind:'inline',bytes:'InJlbW90ZSI='}}]))
+            expect(materialized).toHaveBeenCalledOnce()
+            expect(presetRecords).toHaveBeenCalledOnce()
+        } finally {
+            materialized.mockRestore()
+            presetRecords.mockRestore()
+        }
     })
 
     it('translates a plugin toggle intent after flushing an unsaved bound toggle edit', async () => {

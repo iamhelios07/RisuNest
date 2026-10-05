@@ -1148,7 +1148,8 @@ export function createPersistentDataRuntime(
                 const store = dependencies.store
                 if (!store.lwwStageReceive || !store.lwwApplyReceive || !store.lwwFinishReceive) throw new Error('LWW receive is unavailable')
                 const database = dependencies.state.captureWorkingSetDatabase?.()
-                const baseline = database ? captureLwwWorkingSetBaseline(database, dependencies.state.captureRoot(), dependencies.state.capturePresets?.() ?? null, coordinator.captureMaterializedBaseline(), coordinator.capturePresetRecordBaseline()) : undefined
+                // An empty pull leaves the library alone; any key it still reports is projected against a lazy baseline.
+                const baseline = database && staged.changes.length > 0 ? captureLwwWorkingSetBaseline(database, dependencies.state.captureRoot(), dependencies.state.capturePresets?.() ?? null, coordinator.captureMaterializedBaseline(), coordinator.capturePresetRecordBaseline()) : undefined
                 await store.lwwStageReceive(staged)
                 const header = { bindingAuthority: staged.bindingAuthority, requestId: staged.requestId }
                 const result = await store.lwwApplyReceive({ ...header, generating: generating() })
