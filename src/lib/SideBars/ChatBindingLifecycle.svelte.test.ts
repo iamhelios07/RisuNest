@@ -60,7 +60,7 @@ function interruptedConversation() {
             outputs: { 'message:partial': message('partial') },
         },
     }
-    DBState.db = { characters: [{ chaId: 'character', chatPage: 0, chats: [shell] }] }
+    DBState.db = { characters: [{ chaId: 'character', chatPage: 0, chats: [shell] }] } as never
     return { stored, shell: () => DBState.db.characters[0].chats[0] as Chat }
 }
 
