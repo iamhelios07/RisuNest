@@ -3329,7 +3329,7 @@ pub(crate) fn native_snapshot_restore_bodies_start(
         #[cfg(test)] let body_scope=crate::asset_repository::body_io::capture_body_io_scope();
         tauri::async_runtime::spawn_blocking(move || {
             let _permit=permit;
-            let operation=|| {
+            let mut operation=|| {
                 #[cfg(test)] let _source_scope=crate::portable_backup::source_io::attach(&job.source_io_scope);
                 let mut outcome=run_worker(||snapshot_bodies::run(&mut store,&plan,&job,&directory),"Snapshot body worker panicked");
                 if let Err(failure)=cleanup_one_owned_directory(directory.parent().expect("owned job directory has a parent"),&directory,&job.id()) {
@@ -3337,7 +3337,7 @@ pub(crate) fn native_snapshot_restore_bodies_start(
                 }
                 let _=snapshot_bodies::finish(&job,outcome);
             };
-            #[cfg(test)] crate::asset_repository::body_io::with_body_io_scope(body_scope,operation);
+            #[cfg(test)] crate::asset_repository::body_io::with_body_io_scope(body_scope,&mut operation);
             #[cfg(not(test))] operation();
         });
         Ok(started)
