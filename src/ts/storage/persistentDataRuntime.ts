@@ -289,6 +289,8 @@ export interface PersistentDataRuntimeStateAdapter {
     captureCharacterIndex?(): ReadonlyMap<string, CompleteCharacter>
     beforeCapture?(): void
     afterRemoteApply?(): void
+    /** Root fields whose working-set value changed when stored units were projected into it. */
+    afterRemoteRootChange?(fields: ReadonlySet<string>): void
     canonicalCapture?: PersistenceCanonicalCapture
     captureRoot(): RootDatabase
     capturePluginStorage?(): Database['pluginCustomStorage'] | null
@@ -1038,6 +1040,12 @@ export function createPersistentDataRuntime(
         const authorityEpoch = coordinator.storageAuthorityEpoch
         const lease = await dependencies.store.acquireRevision(result.revision)
         const projectionBaseline = baseline
+        const rootFields = [...new Set(result.affectedKeys.flatMap((key) => {
+            const [kind, field] = JSON.parse(key) as string[]
+            return kind === 'root' ? [field] : []
+        }))]
+        const rootValue = (field: string) => canonicalJson({ value: (database as unknown as Record<string, unknown>)[field] })
+        let rootBefore: string[] = []
         let applied: ReturnType<typeof captureLwwWorkingSetBaseline>
         let windowedConversation: { characterId: string; conversationId: string; totalMessages: number } | undefined
         try {
@@ -1045,6 +1053,7 @@ export function createPersistentDataRuntime(
                 coordinator.assertPersistentMutationAllowed(authorityEpoch)
                 if (dependencies.state.captureWorkingSetDatabase?.() !== database) throw new Error('Persistent working set changed during unit projection')
                 dependencies.state.beforeCapture?.()
+                rootBefore = rootFields.map(rootValue)
             }, () => {
                 const canonicalCapture = dependencies.state.canonicalCapture
                 const beforeDerive = canonicalCapture?.root() ?? canonicalJson(dependencies.state.captureRoot())
@@ -1069,6 +1078,11 @@ export function createPersistentDataRuntime(
             }
         } finally { await releasePersistentRevisionLease(lease) }
         coordinator.adoptAppliedUnitState(result.revision, applied.root, applied.presets, applied.characters, applied.presetRecords, windowedConversation)
+        const changedRootFields = new Set(rootFields.filter((field, index) => rootValue(field) !== rootBefore[index]))
+        if (changedRootFields.size > 0) {
+            try { dependencies.state.afterRemoteRootChange?.(changedRootFields) }
+            catch (error) { dependencies.onBackgroundError?.(error) }
+        }
         if (selectedFields && [...selectedFields].some(([field, value]) => (selectedChat as unknown as Record<string, unknown>)[field] !== value) &&
             selectedSession!.matchesConversation(selectedTarget!.characterId, selectedChat!) &&
             !selectedSession!.adoptPersistedMetadata(selectedChat!, result.revision)) {
