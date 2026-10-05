@@ -568,7 +568,16 @@ impl HydrationSession {
         let mut server_pages = Vec::new();
         let cas = crate::asset_repository::PayloadCas::new(&self.root)?;
         let lane = super::progress::current().filter(|_| self.planned);
-        if let Some(lane) = &lane { lane.backlog(0, 0); }
+        let mut seen = std::collections::BTreeSet::new();
+        let digests = digests.iter().filter(|hash| seen.insert((*hash).clone())).cloned().collect::<Vec<_>>();
+        let scope = lane.as_ref().map(|lane| lane.asset_plan(Some(digests.len())));
+        let mut completed = std::collections::BTreeSet::new();
+        let mut opened = |hash: &str, outcome| {
+            if completed.insert(hash.to_owned()) {
+                if let (Some(lane), Some(scope)) = (&lane, scope) { lane.asset_done(scope); }
+                opened(hash, outcome);
+            }
+        };
         for page in digests.chunks(64) {
             check()?;
             let hashes = page.iter().collect::<std::collections::BTreeSet<_>>();
@@ -609,7 +618,6 @@ impl HydrationSession {
             drop(guards);
             std::thread::yield_now();
         }
-        if let Some(lane) = &lane { lane.backlog(0, server_pages.iter().map(Vec::len).sum::<usize>() as u64); }
         let external = digests.iter().filter(|hash| external.remove(hash.as_str())).cloned().collect::<Vec<_>>();
         for selected in [true, false] {
             for page in &server_pages {
@@ -629,7 +637,6 @@ impl HydrationSession {
                         let _guard = crate::asset_repository::coordinator::lock_repository_mutation()?;
                         if cas.stat_object(hash)?.is_some() {
                             opened(hash, HydrationOutcome::AlreadyLocal);
-                            if let Some(lane) = &lane { lane.backlog_step(); }
                             continue;
                         }
                     }
@@ -643,7 +650,6 @@ impl HydrationSession {
                         check()?;
                         outcome?;
                         opened(hash, HydrationOutcome::Downloaded);
-                        if let Some(lane) = &lane { lane.backlog_step(); }
                         continue;
                     }
                     let key = format!("{}:{}", proof.context, serde_json::to_string(&proof.config)
@@ -680,7 +686,6 @@ impl HydrationSession {
                             check()?;
                             outcome?;
                             opened(&object.hash, HydrationOutcome::Downloaded);
-                            if let Some(lane) = &lane { lane.backlog_step(); }
                         }
                         drop(body);
                         cache.remove_derived(&object.hash)?;
@@ -694,6 +699,10 @@ impl HydrationSession {
                     &self.root, &external, priority, self.cancellation.clone(), check, &mut opened,
                 )?);
             }
+        }
+        check()?;
+        if unavailable.is_empty() {
+            if let (Some(lane), Some(scope)) = (&lane, scope) { lane.asset_settled(scope); }
         }
         Ok(unavailable)
     }
