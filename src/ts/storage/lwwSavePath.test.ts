@@ -13,6 +13,7 @@ import { createConversationSummaryStubFromChat } from './conversationResidency'
 import { createMetadataOnlySelectedConversation, isMetadataOnlySelectedConversation } from './selectedConversationLifecycle'
 import type { Database, character } from './database.svelte'
 import type { LwwStageReceive, PersistentDataStore, WorkingSetCommit } from './persistentDataStore'
+import { MAX_NATIVE_REQUEST_BYTES, PayloadTooLargeError } from './nativePersistenceValue'
 
 async function harness() {
     const database = structuredClone(fixtureDatabase)
@@ -87,7 +88,9 @@ async function identityRuntimeHarness() {
             return {...result,affectedKeys:mutations!.map((value)=>value.key),heldKeys:[],deferredKeys:[]}
         }
         native.lwwFinishReceive = async()=>undefined
-        await runtime.applyLwwReceive({bindingAuthority:'identity',requestId:crypto.randomUUID(),changes:[],progress:{kind:'server',cursor:'1'},admittedTimeUpperMs:'100'})
+        // The staged rows are not read by these stubs; a real pull always stages at least one.
+        const changes = mutations!.map((value)=>({key:value.key,stamp:{physicalMs:'1',logical:'0',writerId:'remote'},value:{kind:'deleted' as const}}))
+        await runtime.applyLwwReceive({bindingAuthority:'identity',requestId:crypto.randomUUID(),changes,progress:{kind:'server',cursor:'1'},admittedTimeUpperMs:'100'})
     }
     return {database,store,commit,runtime,receive}
 }
@@ -113,6 +116,41 @@ describe('LWW renderer save path', () => {
         commit.mockClear()
         await runtime.flushPendingDataLocally('after-received-selected-record')
         expect(commit).not.toHaveBeenCalled()
+    })
+
+    it.each([
+        ['preset', '["root","botPresetsId"]', 'preset-alpha', '["exists","preset","preset-alpha"]'],
+        ['persona', '["root","selectedPersona"]', 'persona-second', '["exists","persona","persona-second"]'],
+    ] as const)('does not save the selection that replaces a remotely deleted selected %s', async (kind, selectionKey, selectedId, existsKey) => {
+        const {database,commit,runtime,receive} = await identityRuntimeHarness()
+        await receive([{key:selectionKey,type:'set',value:selectedId}])
+        await receive([{key:existsKey,type:'delete'}])
+        const selected = kind === 'preset' ? database.botPresets[database.botPresetsId]['id'] : database.personas[database.selectedPersona].id
+        expect(selected).toBe(kind === 'preset' ? 'preset-beta' : 'persona-first')
+        commit.mockClear()
+        await runtime.flushPendingDataLocally('after-remote-selected-deletion')
+        expect(commit).not.toHaveBeenCalled()
+    })
+
+    it('captures receive baselines only for a pull that carries changes', async () => {
+        const {store,runtime} = await runtimeHarness()
+        const materialized = vi.spyOn(SaveCoordinator.prototype,'captureMaterializedBaseline')
+        const presetRecords = vi.spyOn(SaveCoordinator.prototype,'capturePresetRecordBaseline')
+        try {
+            store.lwwStageReceive = async()=>undefined
+            store.lwwApplyReceive = async()=>({revision:runtime.revision,affectedKeys:[],heldKeys:[],deferredKeys:[]})
+            store.lwwFinishReceive = async()=>undefined
+            const request = (changes: LwwStageReceive['changes']): LwwStageReceive => ({bindingAuthority:'a',requestId:crypto.randomUUID(),changes,progress:{kind:'server',cursor:'1'},admittedTimeUpperMs:'100'})
+            await runtime.applyLwwReceive(request([]))
+            expect(materialized).not.toHaveBeenCalled()
+            expect(presetRecords).not.toHaveBeenCalled()
+            await runtime.applyLwwReceive(request([{key:'["character","char-a","notes"]',stamp:{physicalMs:'1',logical:'0',writerId:'remote'},value:{kind:'inline',bytes:'InJlbW90ZSI='}}]))
+            expect(materialized).toHaveBeenCalledOnce()
+            expect(presetRecords).toHaveBeenCalledOnce()
+        } finally {
+            materialized.mockRestore()
+            presetRecords.mockRestore()
+        }
     })
 
     it('translates a plugin toggle intent after flushing an unsaved bound toggle edit', async () => {
@@ -197,6 +235,17 @@ describe('LWW renderer save path', () => {
         expect(database.vertexAccessToken).not.toBe('remote token')
         expect(database.loreBookPage).not.toBe(99)
         expect((await store.readRoot()).value).toHaveProperty('opaqueFutureField',{local:true})
+    })
+
+    it('applies received chat edit popup and color scheme root settings', async () => {
+        const {database} = await harness()
+        database.risunestChatEditPopup = true
+        const baseline = captureLwwWorkingSetBaseline(database,capturePersistentRoot(database),database.botPresets)
+        const colorScheme = {...database.colorScheme,bgcolor:'#101010'}
+        const reader = {readRoot:async()=>({revision:2,value:{...capturePersistentRoot(database),risunestChatEditPopup:false,colorScheme}})} as unknown as import('./persistentDataStore').PersistentRevisionReader
+        await applyLwwWorkingSetUnits(database,baseline,reader,['["root","risunestChatEditPopup"]','["root","colorScheme"]'])
+        expect(database.risunestChatEditPopup).toBe(false)
+        expect(database.colorScheme).toEqual(colorScheme)
     })
 
     it('commits plugin units once if their pinned projection loses its revision', async () => {
@@ -317,6 +366,23 @@ describe('LWW renderer save path', () => {
         ;(database.characters[1] as character).notes = 'detail only'
         await coordinator.flushPendingDataLocally('catalog-shell')
         expect((await store.readConversation('char-a', 'conv-long'))?.value.message).toHaveLength(130)
+    })
+
+    it('pages a chat added inside a complete character when the save is too large', async () => {
+        const {database,store,commit,coordinator} = await harness()
+        const owner = database.characters[0]
+        const added = {...structuredClone(owner.chats[0]),id:'conv-added',name:'Added'}
+        owner.chats.splice(1,0,added)
+        const expected = owner.chats.map((chat) => chat.id)
+        commit.mockRejectedValueOnce(new PayloadTooLargeError('commit',MAX_NATIVE_REQUEST_BYTES + 1))
+        await coordinator.flushPendingDataLocally('large-added-chat')
+        expect(commit.mock.calls.length).toBeGreaterThan(1)
+        expect((await store.readConversation(owner.chaId,'conv-added'))?.value.message).toEqual(added.message)
+        const stored = await store.queryConversations({characterId:owner.chaId,order:'configured',limit:128})
+        expect(stored.items.map((item) => item.id)).toEqual(expected)
+        commit.mockClear()
+        await coordinator.flushPendingDataLocally('after-paged-chat')
+        expect(commit).not.toHaveBeenCalled()
     })
 
     it('creates a conversation parent before committing its complete message list', async () => {

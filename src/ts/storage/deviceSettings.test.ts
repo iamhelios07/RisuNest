@@ -186,6 +186,24 @@ describe('device settings', () => {
         expect(JSON.parse(localStorage.getItem('risuNestDeviceSettings') ?? '')).toEqual(getDeviceSettings())
     })
 
+    it.each([
+        ['a multiplier below one', { generationHistoryLimitMultiplier: 0 }],
+        ['a non-finite multiplier', { generationHistoryLimitMultiplier: Number.POSITIVE_INFINITY }],
+        ['an unknown key', { unknownSetting: true }],
+    ])('refuses %s and keeps every stored setting', async (_name, update) => {
+        const { getDeviceSettings, subscribeDeviceSettings, updateDeviceSettings } = await loadDeviceSettings()
+        updateDeviceSettings({ performanceProfile: 'low-spec', nativeFileLogEnabled: false })
+        const stored = localStorage.getItem('risuNestDeviceSettings')
+        const listener = vi.fn()
+        subscribeDeviceSettings(listener)
+
+        expect(() => updateDeviceSettings(update as DeviceSettingsUpdate)).toThrow('Invalid device settings')
+
+        expect(getDeviceSettings()).toEqual({ ...defaults, performanceProfile: 'low-spec', nativeFileLogEnabled: false })
+        expect(localStorage.getItem('risuNestDeviceSettings')).toBe(stored)
+        expect(listener).not.toHaveBeenCalled()
+    })
+
 
     it('persists the generation history limit and its multiplier', async () => {
         const { updateDeviceSettings } = await loadDeviceSettings()
