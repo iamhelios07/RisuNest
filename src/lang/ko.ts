@@ -2722,7 +2722,7 @@ export const languageKorean = {
         boot: {
             title: 'RisuNest를 시작하지 못했습니다',
             schemaUnsupported:
-                '데이터 폴더에 호환되지 않는 사전 배포 빌드의 저장소가 남아 있습니다. RisuNest는 이 저장소를 열 수 없고 자동으로 변환하지도 않습니다. 데이터 폴더에서 저장소를 직접 삭제한 뒤 RisuNest를 다시 시작하세요.',
+                '데이터 폴더의 저장소가 다른 버전의 RisuNest에서 저장되어 이 버전에서 열 수 없으며, 다시 시작해도 열리지 않습니다. 저장소의 데이터를 보관하려는 경우 먼저 사본 저장으로 원본 데이터를 저장하세요. 그다음 데이터 폴더를 삭제하고 RisuNest를 다시 시작해주세요.',
             storeOpen:
                 '로컬 데이터 저장소를 열지 못했습니다. 다른 RisuNest 창이 저장소를 사용 중이거나 데이터 폴더를 읽을 수 없는 상태일 수 있습니다. 실행 중인 다른 창을 닫고 다시 시작하세요.',
             unknown:
@@ -2730,8 +2730,9 @@ export const languageKorean = {
             restart: '다시 시작',
             copyDetails: '오류 내용 복사',
             copied: '오류 내용을 복사했습니다.',
-            dataPathWindows: 'Windows: %APPDATA%\\RisuNest\\',
+            dataFolder: '데이터 폴더',
             dataPathAndroid: 'Android: 앱 정보 > 저장공간에서 데이터 삭제',
+            dataPathIos: 'iOS: 앱 삭제 후 다시 설치',
             stage: '단계',
         },
         diag: {

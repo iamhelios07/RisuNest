@@ -2909,7 +2909,7 @@ export const languageEnglish = {
         boot: {
             title: 'RisuNest could not start',
             schemaUnsupported:
-                'The data folder holds a persistent store from an incompatible pre-release build. RisuNest cannot open it and will not convert it. Remove that store from the data folder yourself, then start RisuNest again.',
+                'The store in the data folder was saved by a different version of RisuNest, so this version cannot open it, and restarting will not open it either. To keep its data, first save the original data with Save a copy. Then delete the data folder and start RisuNest again.',
             storeOpen:
                 'The local data store could not be opened. Another copy of RisuNest may still be using it, or the data folder may be unreadable. Close any other running copy, then start RisuNest again.',
             unknown:
@@ -2917,8 +2917,9 @@ export const languageEnglish = {
             restart: 'Restart',
             copyDetails: 'Copy error details',
             copied: 'Error details copied.',
-            dataPathWindows: 'Windows: %APPDATA%\\RisuNest\\',
+            dataFolder: 'Data folder',
             dataPathAndroid: 'Android: App info > Storage > Clear data',
+            dataPathIos: 'iOS: Delete the app and install it again',
             stage: 'Stage',
         },
         diag: {

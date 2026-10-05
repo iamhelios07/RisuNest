@@ -2849,7 +2849,7 @@ pub(super) fn validate_schema(db: &Connection) -> StoreResult<()> {
                 .to_owned()
         };
         if actual.as_deref().map(normalize) != Some(normalize(&sql)) {
-            return Err(error("invalid-lww-schema"));
+            return Err(StoreError::SchemaMismatch { message: "invalid-lww-schema".to_owned() });
         }
     }
     let columns: Vec<String> = {
@@ -2860,7 +2860,7 @@ pub(super) fn validate_schema(db: &Connection) -> StoreResult<()> {
     if !columns.iter().any(|c| c == "canonical_hash")
         || !columns.iter().any(|c| c == "canonical_size")
     {
-        return Err(error("invalid-message-hash-schema"));
+        return Err(StoreError::SchemaMismatch { message: "invalid-message-hash-schema".to_owned() });
     }
     Ok(())
 }

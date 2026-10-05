@@ -740,7 +740,7 @@ fn store_error(error: StoreError) -> NativeJobError {
             NativeJobError::new("revision-conflict", error.to_string())
         }
         StoreError::Committed { .. } | StoreError::RawBodyUnavailable | StoreError::CommitBusy
-        | StoreError::SnapshotReleased => NativeJobError::new("store-error", error.to_string()),
+        | StoreError::SnapshotReleased | StoreError::SchemaMismatch { .. } => NativeJobError::new("store-error", error.to_string()),
         StoreError::CommitDecode { .. } | StoreError::Validation { .. } => NativeJobError::new("invalid-input", error.to_string()),
         StoreError::Store { .. } => NativeJobError::new("transport-failed", error.to_string()),
     }
