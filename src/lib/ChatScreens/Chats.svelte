@@ -199,6 +199,9 @@
     let historyRowsLoadFailed = $state(false)
     let initialLatestFollow = false
     let initialLatestMessageCount: number | null = null
+    const USER_SCROLL_INTENT_MS = 1000
+    let userScrollIntentAt = Number.NEGATIVE_INFINITY
+    let scrollPointerHeld = false
     let sourceHandoffRuntimeKeys = new Set<string>()
     let sourceUnsubscribe: (() => void) | null = null
     let activeViewportSource: ConversationViewportSource | null = null
@@ -2289,6 +2292,8 @@
             )
                 return
         }
+        userScrollIntentAt = performance.now()
+        if (event.type === 'pointerdown') scrollPointerHeld = true
         positionGeneration += 1
         initialLatestFollow = false
         if (currentPendingJump()) {
@@ -2307,6 +2312,10 @@
         viewportAnchor = captureDomAnchor()
     }
 
+    function releaseScrollPointer(): void {
+        scrollPointerHeld = false
+    }
+
     function handleScroll(): void {
         if (!scrollContainer || suppressScroll || !viewportResult) return
         // Layout and browser scroll anchoring also emit scroll events. Only input
@@ -2321,7 +2330,9 @@
         const movingNewer = currentTop > lastScrollTop
         lastScrollTop = currentTop
         if (!movingOlder && !movingNewer) return
-        onScrollMove?.()
+        // Browser scroll anchoring also moves the position while rows grow.
+        if (scrollPointerHeld || performance.now() - userScrollIntentAt < USER_SCROLL_INTENT_MS)
+            onScrollMove?.()
         positionGeneration += 1
         pendingSourceHandoffAnchor = null
         pendingMissingRowsAnchor = null
@@ -2738,6 +2749,8 @@
         })
         scrollContainer?.addEventListener('pointerdown', handleUserScrollIntent)
         scrollContainer?.addEventListener('keydown', handleUserScrollIntent)
+        window.addEventListener('pointerup', releaseScrollPointer)
+        window.addEventListener('pointercancel', releaseScrollPointer)
         const unsubscribeProfile = subscribeRuntimePerformanceProfile(() => reconcileViewport())
         return () => {
             unsubscribeProfile()
@@ -2751,6 +2764,8 @@
             scrollContainer?.removeEventListener('touchmove', handleUserScrollIntent)
             scrollContainer?.removeEventListener('pointerdown', handleUserScrollIntent)
             scrollContainer?.removeEventListener('keydown', handleUserScrollIntent)
+            window.removeEventListener('pointerup', releaseScrollPointer)
+            window.removeEventListener('pointercancel', releaseScrollPointer)
             resizeObserver?.disconnect()
             resizeObserver = null
             retainScreenAnchor()

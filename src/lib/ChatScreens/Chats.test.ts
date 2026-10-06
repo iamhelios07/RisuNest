@@ -2509,10 +2509,36 @@ describe('Chats imperative mount lifecycle', () => {
         scrollParent.dispatchEvent(new Event('scroll'))
         expect(onScrollMove).not.toHaveBeenCalled()
 
+        // Scroll anchoring moves the position without input while rows grow.
+        scrollParent.scrollTop -= 100
+        scrollParent.dispatchEvent(new Event('scroll'))
+        expect(onScrollMove).not.toHaveBeenCalled()
+
         scrollParent.dispatchEvent(new WheelEvent('wheel', { deltaY: -100 }))
         scrollParent.scrollTop -= 100
         scrollParent.dispatchEvent(new Event('scroll'))
         expect(onScrollMove).toHaveBeenCalledTimes(1)
+
+        const now = performance.now()
+        const clock = vi.spyOn(performance, 'now').mockReturnValue(now + 2_000)
+        try {
+            scrollParent.scrollTop -= 100
+            scrollParent.dispatchEvent(new Event('scroll'))
+            expect(onScrollMove).toHaveBeenCalledTimes(1)
+
+            scrollParent.dispatchEvent(new PointerEvent('pointerdown'))
+            clock.mockReturnValue(now + 10_000)
+            scrollParent.scrollTop -= 100
+            scrollParent.dispatchEvent(new Event('scroll'))
+            expect(onScrollMove).toHaveBeenCalledTimes(2)
+
+            window.dispatchEvent(new PointerEvent('pointerup'))
+            scrollParent.scrollTop -= 100
+            scrollParent.dispatchEvent(new Event('scroll'))
+            expect(onScrollMove).toHaveBeenCalledTimes(2)
+        } finally {
+            clock.mockRestore()
+        }
     })
 
     test('shows one recoverable later history failure while retaining readable rows', async () => {
