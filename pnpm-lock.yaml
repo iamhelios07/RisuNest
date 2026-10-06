@@ -7,6 +7,7 @@ settings:
 overrides:
   '@huggingface/transformers>onnxruntime-node': '-'
   '@huggingface/transformers>sharp': '-'
+  '@tailwindcss/typography>postcss-selector-parser': 7.1.6
   monaco-editor>dompurify: 3.4.16
   rollup@>=4.0.0 <4.59.0: ^4.59.0
   yaml@>=2.0.0 <2.8.3: ^2.8.3
@@ -2170,10 +2171,6 @@ packages:
     resolution: {integrity: sha512-40QW5YalBNfQo5yRYmiw7Yz6TKKVr3h6970B2YE+3fQpsWcrbj1PzJgxeJ19DRQjhMbKPIuMY8rFaXc8moolVw==}
     engines: {node: '>=10.13.0'}
 
-  postcss-selector-parser@6.0.10:
-    resolution: {integrity: sha512-IQ7TZdoaqbT+LCpShg46jnZVlhWD2w6iQYAcYXfHARZ7X1t/UGhhceQDs5X0cGqKvYlHNOuv7Oa1xmb0oQuA3w==}
-    engines: {node: '>=4'}
-
   postcss-selector-parser@7.1.6:
     resolution: {integrity: sha512-7qASPzhKF2l2KLboRZux8CCTRMdGiV08vWmyKzPz22qZ7ZjQBOeY7rNzNoCLSUiftJ7HUq0GERHmxw/t0dCdMw==}
     engines: {node: '>=4'}
@@ -3189,7 +3186,7 @@ snapshots:
 
   '@tailwindcss/typography@0.5.20(tailwindcss@4.3.3)':
     dependencies:
-      postcss-selector-parser: 6.0.10
+      postcss-selector-parser: 7.1.6
       tailwindcss: 4.3.3
 
   '@tailwindcss/vite@4.3.3(vite@8.3.2(@types/node@22.20.4)(esbuild@0.27.2)(jiti@2.7.0))':
@@ -4195,11 +4192,6 @@ snapshots:
   png-chunk-text@1.0.0: {}
 
   pngjs@5.0.0: {}
-
-  postcss-selector-parser@6.0.10:
-    dependencies:
-      cssesc: 3.0.0
-      util-deprecate: 1.0.2
 
   postcss-selector-parser@7.1.6:
     dependencies:
