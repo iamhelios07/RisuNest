@@ -11,9 +11,11 @@ The plugin is registered by the RisuNest Tauri application. Do not add a second 
 Run the updater and release checks from the repository root:
 
 ```powershell
-cargo test --manifest-path crates/tauri-plugin-updater/Cargo.toml --locked
+cargo test --manifest-path src-tauri/Cargo.toml --package tauri-plugin-updater --locked --lib
 pnpm test:release
 ```
+
+The tests run through the application manifest so they build with the application's features. Cargo cannot test a non-member package that has dev-dependencies, so the upstream `tauri` dev-dependency, which only the documentation examples use, is removed from `Cargo.toml` and `Cargo.toml.orig`.
 
 ## Upstream and license
 
