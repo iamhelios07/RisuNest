@@ -51,3 +51,33 @@ test('real markdown and Lua editors retain editing, find, undo and save with a r
     expect(evidence.replies).toBeGreaterThan(0)
     expect(errors).toEqual([])
 })
+
+test('an IME composition covers its line in the line font and hides while the line is scrolled out', async ({ page, browserName }) => {
+    test.skip(browserName !== 'chromium', 'Composes through the Chromium DevTools protocol')
+    await page.goto('/monaco.html')
+    await page.waitForFunction(() => !!window.monacoDriver)
+    await page.evaluate(() => window.monacoDriver.open('markdown'))
+    await expect(page.locator('#editor textarea.inputarea')).toBeFocused()
+    const lines = Array.from({ length: 200 }, (_, index) => index === 11 ? '안녕하세요.' : `line ${index + 1}`)
+    await page.evaluate(text => window.monacoDriver.place(text, 12, 7), lines.join('\n'))
+    const cdp = await page.context().newCDPSession(page)
+    const compose = async (...steps: string[]) => {
+        for (const step of steps) await cdp.send('Input.imeSetComposition', { text: step, selectionStart: step.length, selectionEnd: step.length })
+    }
+    const composition = (line: number) => page.evaluate(line => window.monacoDriver.composition(line), line)
+
+    await compose('ㅇ', '아', '안')
+    await expect.poll(() => composition(12)).toEqual({ composing: true, background: 'rgb(33, 34, 44)', fontMatchesLine: true, visible: true, onLine: true })
+    await page.evaluate(() => window.monacoDriver.scrollBy(600))
+    await expect.poll(() => composition(12)).toMatchObject({ composing: true, visible: false })
+    await page.evaluate(() => window.monacoDriver.scrollBy(-600))
+    await expect.poll(() => composition(12)).toMatchObject({ composing: true, visible: true, onLine: true })
+    await cdp.send('Input.insertText', { text: '안' })
+    await expect.poll(() => page.evaluate(() => window.monacoDriver.state().value?.split('\n')[11])).toBe('안녕하세요.안')
+
+    await page.evaluate(() => window.monacoDriver.scrollBy(600))
+    const line = await page.evaluate(() => window.monacoDriver.firstVisibleLine() + 5)
+    await page.evaluate(line => window.monacoDriver.moveTo(line, 1), line)
+    await compose('ㄱ', '가')
+    await expect.poll(() => composition(line)).toMatchObject({ composing: true, visible: true, onLine: true })
+})
