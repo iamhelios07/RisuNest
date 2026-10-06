@@ -47,7 +47,7 @@ tauri-plugin-shell = "2.3.6"
 tauri-plugin-opener = "2.5.5"
 # Native callers may supply Cookie, Origin, Referer and other HTTP headers.
 # The plugin takes its TLS from `platform_tls`, so it enables no TLS feature.
-tauri-plugin-http = { version = "2.8.0", default-features = false, features = ["unsafe-headers", "http2", "charset", "system-proxy", "cookies"] }
+tauri-plugin-http = { version = "2.8.0", default-features = false, features = ["unsafe-headers", "http2", "charset", "system-proxy", "cookies", "gzip"] }
 oauth2 = "5.0.0"
 # External storage adapters: request signing, DAV/S3 XML, path escaping, Retry-After dates.
 hmac = "0.13.0"
