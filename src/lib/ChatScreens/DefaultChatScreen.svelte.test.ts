@@ -10,7 +10,7 @@ import { noteGenerationMessage, noteGenerationStarted, subscribeGenerationEnd, t
 
 const mocks = vi.hoisted(() => ({ trigger: vi.fn(), generate: vi.fn(), process: vi.fn(), error: vi.fn(), postFile: vi.fn(),
     bounded: false, appended: [] as any[], acquireComplete: vi.fn(), flush: vi.fn(async () => {}),
-    historyLimit: false, openWindow: vi.fn(), notify: vi.fn(async () => {}), scope: { finish: vi.fn(), release: vi.fn() }, createScope: vi.fn(),
+    historyLimit: false, targetCaptures: 0, openWindow: vi.fn(), notify: vi.fn(async () => {}), scope: { finish: vi.fn(), release: vi.fn() }, createScope: vi.fn(),
     translate: vi.fn(), chatsProps: null as any, confirm: vi.fn(async () => false),
     viewport: { jumpTo: async () => true, jumpToTop: vi.fn(async () => true), jumpToBottom: vi.fn(async () => true), navigateMessage: vi.fn(async () => true) },
     target: { characterId: 'character', conversationId: 'chat', navigationGeneration: 1, storeRevision: 1, sessionToken: 'windowed' },
@@ -36,7 +36,7 @@ vi.mock('src/ts/globalApi.svelte', () => ({ aiLawApplies: false, chatFoldedState
 vi.mock('src/ts/storage/persistentDataRuntime.svelte', () => ({
     getActiveConversationSession: () => null,
     getPersistentDataRuntime: () => ({
-        captureSelectedConversationTarget: () => mocks.bounded || mocks.historyLimit ? mocks.target : null, getActiveConversationSession: () => null,
+        captureSelectedConversationTarget: () => mocks.bounded || mocks.historyLimit || mocks.targetCaptures-- > 0 ? mocks.target : null, getActiveConversationSession: () => null,
         acknowledgeGenerationCompletion: async () => {},
         captureSelectedConversationAuthority: () => ({ totalMessages: 1500 }),
         acquireCompleteConversation: mocks.acquireComplete,
@@ -87,6 +87,7 @@ beforeEach(async () => {
     mocks.translate.mockResolvedValue('')
     mocks.bounded = false
     mocks.historyLimit = false
+    mocks.targetCaptures = 0
     mocks.target = { characterId: 'character', conversationId: 'chat', navigationGeneration: 1, storeRevision: 1, sessionToken: 'windowed' }
     mocks.createScope.mockReturnValue(mocks.scope)
     mocks.appended = []
@@ -575,6 +576,24 @@ it('reports a completed reroll after its candidate is stored and announced', asy
     type('').dispatchEvent(new KeyboardEvent('keydown', { key: 'm', ctrlKey: true, bubbles: true }))
     await vi.waitFor(() => expect(records).toEqual([endOf('completed', true)]))
     expect(store.at(-1).responseVariants.candidates).toHaveLength(2)
+    expect(mocks.notify).toHaveBeenCalledWith('new')
+})
+
+it('reports a completed reroll of the resident conversation after its candidate is stored and announced', async () => {
+    // Only the reroll's own capture sees a target, so the candidate is generated on the resident conversation.
+    mocks.targetCaptures = 1
+    const records = listenGenerationEnd()
+    const chat = DBState.db.characters[0].chats[0]
+    chat.message = [{ role: 'user', data: 'question', chatId: 'question' }, { role: 'char', data: 'old', chatId: 'old' }]
+    mocks.generate.mockImplementation(generation(true, () => {
+        chat.message.push({ role: 'char', data: 'new', chatId: 'gen-1' })
+    }))
+    mocks.notify.mockImplementation(async () => {
+        expect(records).toEqual([])
+    })
+    type('').dispatchEvent(new KeyboardEvent('keydown', { key: 'm', ctrlKey: true, bubbles: true }))
+    await vi.waitFor(() => expect(records).toEqual([endOf('completed', true)]))
+    expect(chat.message.at(-1)?.responseVariants?.candidates).toHaveLength(2)
     expect(mocks.notify).toHaveBeenCalledWith('new')
 })
 
