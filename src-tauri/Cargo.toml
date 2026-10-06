@@ -92,8 +92,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-plugin-single-instance = { version = "2.4.5", features = ["deep-link"] }
 tauri-plugin-updater = "2.13.1"
 tauri-plugin-window-state = "2"
-# 2.5 requires Tauri 2.12.
-tauri-plugin-notification = "~2.4.0"
+tauri-plugin-notification = "2.5.1"
 notify-rust = "=4.18.1"
 getrandom = "0.2.15"
 reqwest = { version = "0.12.28", features = ["blocking", "json"] }
