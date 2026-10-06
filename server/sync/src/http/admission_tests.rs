@@ -31,6 +31,7 @@ impl Fixture {
             buffers: Arc::new(Semaphore::new(buffers)),
             materializers: Arc::new(Semaphore::new(1)),
             media_slots: Arc::new(Semaphore::new(16)),
+            codecs: Arc::new(Semaphore::new(4)),
             workload: Workload::new(),
             shutdown: receiver,
             _lifetime: Arc::new(()),
@@ -483,4 +484,63 @@ async fn shutdown_wakes_media_and_materializer_waits() {
     for error in [stream.await.unwrap_err(), materializer.await.unwrap_err()] {
         assert_eq!((error.status, error.code), (503, "server-updating"));
     }
+}
+
+async fn until(mut done: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !done() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn encoded_bodies_wait_for_a_codec_permit_before_decoding() {
+    let mut fixture = Fixture::new(4).await;
+    let held = fixture.app.codecs.clone().acquire_many_owned(4).await.unwrap();
+    let encoded = body::encode("synthetic codec body ".repeat(512).as_bytes())
+        .unwrap()
+        .unwrap();
+    let request = fixture
+        .client
+        .get(format!("{}/held", fixture.endpoint))
+        .bearer_auth(&fixture.token)
+        .header("x-risu-library", &fixture.library)
+        .header(body::ENCODING_HEADER, body::ZSTD)
+        .body(encoded);
+    let job = tokio::spawn(async move { request.send().await.unwrap() });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), fixture.entered.recv())
+            .await
+            .is_err(),
+        "the route ran before its body could be decoded"
+    );
+    drop(held);
+    fixture.entered().await;
+    fixture.release.add_permits(1);
+    assert_eq!(job.await.unwrap().status(), 204);
+}
+
+#[tokio::test]
+async fn a_codec_job_keeps_its_permit_after_its_caller_is_gone() {
+    let fixture = Fixture::new(4).await;
+    let (finish, finished) = std::sync::mpsc::channel::<()>();
+    let app = fixture.app.clone();
+    let caller = tokio::spawn(async move {
+        codec(&app, move || {
+            finished.recv().unwrap();
+            Ok(())
+        })
+        .await
+    });
+    let codecs = fixture.app.codecs.clone();
+    until(|| codecs.available_permits() == 3).await;
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(codecs.available_permits(), 3);
+    finish.send(()).unwrap();
+    until(|| codecs.available_permits() == 4).await;
 }

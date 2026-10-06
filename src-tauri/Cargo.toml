@@ -19,7 +19,7 @@ tempfile = "3"
 dirs = "6"
 fs2 = "0.4"
 risunest-release-update = { path = "../crates/release-update" }
-risunest-sync-wire = { path = "../crates/sync-wire" }
+risunest-sync-wire = { path = "../crates/sync-wire", features = ["body-codec"] }
 risunest-sync-connect = { path = "../crates/sync-connect" }
 risunest-external-storage-format = { path = "../crates/external-storage-format" }
 risunest-small-object-store = { path = "../crates/small-object-store" }

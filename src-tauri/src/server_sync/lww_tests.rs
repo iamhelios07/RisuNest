@@ -575,7 +575,7 @@ fn clients_made_inside_a_lane_count_what_they_publish_receive_and_download() {
     let server = LocalServerFixture::new();
     let (_a, mut a) = local();
     let (_b, mut b) = local();
-    let body = vec![7; 64 * 1024 + 3];
+    let body = super::body_encoding_tests::noise(64 * 1024 + 3);
     let asset = put_asset(&mut a, "assets/progress.png", &body);
     save(&mut a, &["root", "language"], serde_json::json!("en"));
 
