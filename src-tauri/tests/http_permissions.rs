@@ -269,3 +269,45 @@ fn native_http_accepts_empty_gzip_labelled_responses() {
         assert_eq!(read_body(&window, &response), b"", "{method} {status}");
     }
 }
+
+#[test]
+fn native_http_keeps_no_cookies_between_requests() {
+    let listener = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/session", listener.server_addr().to_ip().unwrap());
+    let server = std::thread::spawn(move || {
+        (0..2)
+            .map(|_| {
+                let request = listener
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap()
+                    .expect("local HTTP fixture did not receive a request");
+                let cookies = request
+                    .headers()
+                    .iter()
+                    .filter(|header| header.field.equiv("Cookie"))
+                    .map(|header| header.value.to_string())
+                    .collect::<Vec<_>>();
+                let response = tiny_http::Response::empty(204).with_header(
+                    "Set-Cookie: session=synthetic; Path=/"
+                        .parse::<tiny_http::Header>()
+                        .unwrap(),
+                );
+                request.respond(response).unwrap();
+                cookies
+            })
+            .collect::<Vec<_>>()
+    });
+    let window = http_window(Target::Windows);
+
+    let responses = [send(&window, &url, "GET"), send(&window, &url, "GET")];
+
+    // The caller still sees Set-Cookie, but nothing stores it for the next request.
+    for response in &responses {
+        assert!(response["headers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|header| header[0].as_str().unwrap().eq_ignore_ascii_case("set-cookie")));
+    }
+    assert_eq!(server.join().unwrap(), [Vec::<String>::new(), Vec::new()]);
+}
