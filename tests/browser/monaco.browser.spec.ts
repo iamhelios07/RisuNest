@@ -21,27 +21,32 @@ test('real markdown and Lua editors retain editing, find, undo and save with a r
     })
     await page.goto('/monaco.html')
     await page.waitForFunction(() => !!window.monacoDriver)
+    // Monaco picks macOS key bindings from the user agent, which Playwright's WebKit reports on every host.
+    const mac = await page.evaluate(() => navigator.userAgent.includes('Macintosh'))
+    const keys = mac
+        ? { end: 'Meta+ArrowDown', undo: 'Meta+z', redo: 'Meta+Shift+z', find: 'Meta+f', save: 'Meta+Enter' }
+        : { end: 'Control+End', undo: 'Control+z', redo: 'Control+y', find: 'Control+f', save: 'Control+Enter' }
     for (const language of ['markdown', 'lua'] as const) {
         await page.evaluate(language => window.monacoDriver.open(language), language)
         const input = page.locator('#editor textarea.inputarea')
         await expect(input).toBeFocused()
         expect(await page.evaluate(() => window.monacoDriver.state())).toMatchObject({ language, editContext: false, languages: ['lua', 'markdown', 'plaintext'] })
         const original = await page.evaluate(() => window.monacoDriver.state().value)
-        await page.keyboard.press('Control+End')
+        await page.keyboard.press(keys.end)
         await page.keyboard.type(' edited')
         await expect.poll(() => page.evaluate(() => window.monacoDriver.state().value)).toBe(`${original} edited`)
-        await page.keyboard.press('Control+z')
+        await page.keyboard.press(keys.undo)
         await expect.poll(() => page.evaluate(() => window.monacoDriver.state().value)).toBe(original)
-        await page.keyboard.press('Control+y')
+        await page.keyboard.press(keys.redo)
         await expect.poll(() => page.evaluate(() => window.monacoDriver.state().value)).toBe(`${original} edited`)
-        await page.keyboard.press('Control+f')
+        await page.keyboard.press(keys.find)
         const find = page.locator('#editor').getByRole('textbox', { name: 'Find', exact: true })
         await expect(find).toBeFocused()
         await find.fill('hello')
         await expect(page.locator('#editor .find-widget .matchesCount')).toContainText('1 of 1')
         await page.keyboard.press('Escape')
         await expect(input).toBeFocused()
-        await page.keyboard.press('Control+Enter')
+        await page.keyboard.press(keys.save)
         await expect.poll(() => page.evaluate(() => window.monacoDriver.state().saved)).toEqual([`${original} edited`])
     }
     expect(await page.evaluate(() => window.monacoDriver.diff())).toEqual([{ original: 2, modified: 2 }])
