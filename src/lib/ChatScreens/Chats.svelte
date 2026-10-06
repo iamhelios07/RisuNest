@@ -19,12 +19,15 @@
     } from 'src/ts/chatRenderIdentity'
     import {
         buildChatViewport,
+        resolveChatViewportStep,
         type ChatViewportAnchor,
         type ChatViewportJumpOptions,
         type ChatViewportKeySource,
         type ChatViewportPin,
         type ChatViewportPinReason,
         type ChatViewportResult,
+        type ChatViewportRowBounds,
+        type ChatViewportStepDirection,
     } from 'src/ts/chatViewport'
     import {
         getRuntimePerformanceBudgets,
@@ -78,6 +81,7 @@
         acquireConversationStartParserLease,
         selectedConversationOperations,
         hasNewUnreadMessage = $bindable(false),
+        onScrollMove,
     }: {
         messages?: Message[]
         currentCharacter: character
@@ -99,6 +103,7 @@
         ) => Promise<{ release(): void } | null>
         selectedConversationOperations?: SelectedConversationOperations
         hasNewUnreadMessage?: boolean
+        onScrollMove?: () => void
     } = $props()
 
     const ESTIMATED_MESSAGE_HEIGHT = 256
@@ -2316,6 +2321,7 @@
         const movingNewer = currentTop > lastScrollTop
         lastScrollTop = currentTop
         if (!movingOlder && !movingNewer) return
+        onScrollMove?.()
         positionGeneration += 1
         pendingSourceHandoffAnchor = null
         pendingMissingRowsAnchor = null
@@ -2534,10 +2540,7 @@
                 const element = mountedElements.get(key)
                 if (!element) return false
                 suppressScroll = true
-                element.scrollIntoView?.({
-                    behavior: 'instant',
-                    block: options.align ?? 'start',
-                })
+                scrollRowIntoView(element, options)
                 if (options.highlight) {
                     if (highlightTimer) clearTimeout(highlightTimer)
                     element.classList.add('ring-2', 'ring-blue-500')
@@ -2579,6 +2582,101 @@
 
     export async function scrollToLatestMessage(): Promise<void> {
         await jumpToLatestMessage()
+    }
+
+    function scrollRowIntoView(
+        element: HTMLElement,
+        options: ChatViewportJumpOptions,
+    ): void {
+        if (options.align === 'end' && typeof scrollContainer?.scrollBy === 'function') {
+            const visibleBottom =
+                scrollContainer.getBoundingClientRect().bottom - (options.bottomInset ?? 0)
+            scrollContainer.scrollBy({
+                top: element.getBoundingClientRect().bottom - visibleBottom,
+                behavior: 'instant',
+            })
+            return
+        }
+        element.scrollIntoView?.({ behavior: 'instant', block: options.align ?? 'start' })
+    }
+
+    async function jumpToConversationStartRow(
+        options: ChatViewportJumpOptions = {},
+    ): Promise<boolean> {
+        if (!hasConversationStart()) return currentMessageCount() > 0 && jumpTo(0, options)
+        // Loads and mounts the oldest window; the start row sits right above message 0.
+        if (currentMessageCount() > 0 && !(await jumpTo(0))) return false
+        const scope = currentChatScope()
+        const key = conversationStartKey(scope)
+        if (!mountedElements.has(key)) {
+            reconcileViewport({ jumpTarget: 0, preserveAnchor: false })
+            await waitForLayout()
+            if (destroyed || scope !== currentChatScope()) return false
+        }
+        const element = mountedElements.get(key)
+        if (!element) return false
+        initialLatestFollow = false
+        suppressScroll = true
+        scrollRowIntoView(element, options)
+        viewportAnchor = {
+            key,
+            indexHint: 0,
+            relativeOffset:
+                element.getBoundingClientRect().top -
+                (scrollContainer?.getBoundingClientRect().top ?? 0),
+        }
+        suppressScroll = false
+        if (scrollContainer) lastScrollTop = scrollContainer.scrollTop
+        return true
+    }
+
+    export function jumpToTop(): Promise<boolean> {
+        return jumpToConversationStartRow()
+    }
+
+    export async function jumpToBottom(): Promise<boolean> {
+        hasNewUnreadMessage = false
+        const totalMessages = currentMessageCount()
+        const placed = totalMessages > 0
+            ? await jumpTo(totalMessages - 1)
+            : await jumpToConversationStartRow()
+        if (!placed || !scrollContainer) return placed
+        suppressScroll = true
+        // The chat scrolls in reverse, so zero is the latest position.
+        scrollContainer.scrollTop = 0
+        viewportAnchor = captureDomAnchor()
+        suppressScroll = false
+        lastScrollTop = scrollContainer.scrollTop
+        return true
+    }
+
+    export function navigateMessage(
+        direction: ChatViewportStepDirection,
+        bottomInset = 0,
+    ): Promise<boolean> {
+        if (!scrollContainer) return Promise.resolve(false)
+        const containerRect = scrollContainer.getBoundingClientRect()
+        const rows: ChatViewportRowBounds[] = []
+        for (const element of mountedElements.values()) {
+            const index = Number(element.dataset.chatViewportIndex)
+            if (!element.isConnected || !Number.isInteger(index)) continue
+            const rect = element.getBoundingClientRect()
+            rows.push({ index, top: rect.top, bottom: rect.bottom })
+        }
+        const startOffset = hasConversationStart() ? 1 : 0
+        const target = resolveChatViewportStep(
+            rows,
+            containerRect.top,
+            containerRect.bottom - bottomInset,
+            currentMessageCount() + startOffset,
+            direction,
+        )
+        if (target.kind === 'top') return jumpToTop()
+        if (target.kind === 'bottom') return jumpToBottom()
+        const options = { align: target.align, bottomInset }
+        return target.index < startOffset
+            ? jumpToConversationStartRow(options)
+            : jumpTo(target.index - startOffset, options)
     }
 
     let previousLength = 0
