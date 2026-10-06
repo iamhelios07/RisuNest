@@ -70,6 +70,7 @@ import {
 } from "../pluginDatabaseAccess";
 import { createRisunestPrivateApi } from './risunestPrivateApi';
 import { chatViewEvents } from '../chatViewHost.svelte';
+import { generationEndEvents } from '../generationEndHost';
 import { conversationPatchAccess } from '../conversationPatchHost';
 import { hostToolBridge, registerOwnedPluginMCP } from '../hostToolHost';
 import { additionalMessageButtons, normalizeMessageButtonRoles, type MessageButtonDef, type MessageButtonTarget } from '../messageButtons.svelte';
@@ -779,6 +780,7 @@ const makeRisuaiAPIV3 = (
         patchAccess: conversationPatchAccess,
         hostTools: hostToolBridge.forPlugin(plugin.name),
         chatView: chatViewEvents.forOwner(plugin.name),
+        generationEnd: generationEndEvents.forOwner(plugin.name),
         hasDatabasePermission: () => getPluginPermission(permissionContext, 'db', 'periodically'),
         lifetimeSignal: pluginLifetime.signal,
     })
@@ -973,6 +975,8 @@ const makeRisuaiAPIV3 = (
             risunest.callHostTool(input),
         risunestOnChatView: (callback?: unknown) =>
             risunest.onChatView(callback),
+        risunestOnGenerationEnd: (callback?: unknown) =>
+            risunest.onGenerationEnd(callback),
 
         installPlugin: handlePluginInstallViaPlugin,
 
