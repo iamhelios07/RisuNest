@@ -24,6 +24,7 @@ import { getPluginPermissionStore } from "src/ts/storage/nativePluginPermissions
 import { LLMFlags, LLMFormat, LLMProvider, LLMTokenizer, type LLMModel } from "src/ts/model/types";
 import { sendChat as processSendChat, doingChat } from "src/ts/process/index.svelte";
 import { reserveGeneration } from "src/ts/process/generationState";
+import { beginGenerationEndRun, type GenerationEndRun } from "src/ts/process/generationEnd";
 import { getModelInfo } from "src/ts/model/modellist";
 import type { ModelModeExtended } from "src/ts/process/request/shared";
 import { requestChatDataMain } from "src/ts/process/request/request";
@@ -1593,6 +1594,8 @@ const makeRisuaiAPIV3 = (
             }
 
             let completeLease: CompleteConversationLease | null = null;
+            let endRun: GenerationEndRun | null = null;
+            let completed = false;
             const reservation = reserveGeneration();
             if(!reservation){
                 throw new Error("A chat is already in progress");
@@ -1660,7 +1663,10 @@ const makeRisuaiAPIV3 = (
                     });
                 }
 
-                const sent = await processSendChat({}, reservation);
+                endRun = target ? beginGenerationEndRun(target) : null;
+                const generate = () => processSendChat({}, reservation);
+                const sent = await (endRun ? endRun.capture(generate) : generate());
+                completed = sent;
                 assertPersistentMutationAllowed(authorityEpoch);
                 if(!sent){
                     rollbackAppendedMessage();
@@ -1674,6 +1680,7 @@ const makeRisuaiAPIV3 = (
                 // so release doingChat here on both success and failure.
                 reservation.release();
                 completeLease?.release();
+                endRun?.finish(completed ? 'completed' : isCurrentTarget() ? 'failed' : 'aborted');
             }
 
             return true;

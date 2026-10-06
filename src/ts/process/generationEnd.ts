@@ -34,7 +34,7 @@ function capturing(target: GenerationEndTarget | undefined): ActiveRun | null {
         : null
 }
 
-/** Collects what a chat-screen generation on `target` does, for the generation end event. */
+/** Collects what a chat-screen or plugin `sendChat` generation on `target` does, for the generation end event. */
 export function beginGenerationEndRun(
     target: GenerationEndTarget,
     options: { reroll?: boolean } = {},
