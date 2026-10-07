@@ -357,6 +357,70 @@ describe('the storage usage tab', () => {
         expect(target.textContent).toContain(strings.pinned)
     })
 
+    it('reloads the open history when a backup finishes', async () => {
+        const older = { id: 'older', snapshotId: 'older', kind: 'backup-point', createdAtMs: '1', logicalRevision: '1',
+            complete: true, verified: true, pinned: false, includedSections: [], sameDevice: true }
+        state.listHistory.mockResolvedValue({ items: [older] })
+        const tab = [...target.querySelectorAll('button')].find(button => button.textContent?.trim() === strings.history)!
+        tab.click()
+        await settle()
+        const backup = { id: 'backup-job', connectionId: 'connection-1', kind: 'backup', state: 'running', phase: 'upload',
+            completedBytes: '4', totalBytes: '10', completedItems: '1', startedAtMs: '2', updatedAtMs: '2' }
+        state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0' },
+            connections: [connection(10, 30)], jobs: [backup] })
+        state.jobStarted?.()
+        await settle()
+        expect(state.listHistory).toHaveBeenCalledTimes(1)
+        state.listHistory.mockResolvedValue({ items: [{ ...older, id: 'newer', snapshotId: 'newer', createdAtMs: '2' }, older] })
+        state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0' },
+            connections: [connection(10, 30)], jobs: [{ ...backup, state: 'succeeded' }] })
+        state.jobStarted?.()
+        await settle()
+        expect(state.listHistory).toHaveBeenCalledTimes(2)
+        expect(state.listHistory).toHaveBeenLastCalledWith('connection-1', undefined)
+        expect(target.querySelectorAll('[role="tabpanel"] .item')).toHaveLength(2)
+    })
+
+    it('reloads the open history after a manual backup that finished between polls', async () => {
+        const tab = [...target.querySelectorAll('button')].find(button => button.textContent?.trim() === strings.history)!
+        tab.click()
+        await settle()
+        const finished = { id: 'manual-job', connectionId: 'connection-1', kind: 'backup', state: 'succeeded' }
+        vi.mocked(requestExternalStorageNow).mockResolvedValue({ kind: 'complete', revision: '2', job: finished } as never)
+        state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0' },
+            connections: [connection(10, 30)], jobs: [finished] })
+        const run = [...target.querySelectorAll('button')].find(button => button.textContent?.trim() === strings.runBackup)!
+        run.click()
+        await settle()
+        await settle()
+        expect(state.listHistory).toHaveBeenCalledTimes(2)
+    })
+
+    it('leaves a closed history alone when a backup finishes', async () => {
+        const backup = { id: 'backup-job', connectionId: 'connection-1', kind: 'backup', state: 'running', phase: 'upload',
+            completedBytes: '4', totalBytes: '10', completedItems: '1', startedAtMs: '2', updatedAtMs: '2' }
+        state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0' },
+            connections: [connection(10, 30)], jobs: [backup] })
+        state.jobStarted?.()
+        await settle()
+        state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0' },
+            connections: [connection(10, 30)], jobs: [{ ...backup, state: 'succeeded' }] })
+        state.jobStarted?.()
+        await settle()
+        expect(state.listHistory).not.toHaveBeenCalled()
+    })
+
+    it('reloads the open history from its first page on refresh', async () => {
+        const tab = [...target.querySelectorAll('button')].find(button => button.textContent?.trim() === strings.history)!
+        tab.click()
+        await settle()
+        const refresh = [...target.querySelectorAll('button')].find(button => button.textContent?.trim() === strings.refresh)!
+        refresh.click()
+        await settle()
+        expect(state.listHistory).toHaveBeenCalledTimes(2)
+        expect(state.listHistory).toHaveBeenLastCalledWith('connection-1', undefined)
+    })
+
 
     it.each(['mybox', 'github_releases', 'gitlab_packages'])('does not offer Sync on a %s backup connection', async providerId => {
         if (component) await unmount(component)
