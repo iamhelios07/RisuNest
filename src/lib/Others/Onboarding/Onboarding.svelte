@@ -1011,7 +1011,10 @@
                                                     value={item.id}
                                                     bind:group={externalSelected}
                                                 />
-                                                <span class="when">{externalWhen(item.createdAtMs)}</span>
+                                                <span class="pick-main">
+                                                    <span class="when">{externalWhen(item.createdAtMs)}</span>
+                                                    {#if item.deviceName}<span class="device">{item.deviceName}</span>{/if}
+                                                </span>
                                                 <span class="dim">{externalSize(item.storedBytes)}</span>
                                             </label>
                                         {/each}
@@ -1244,9 +1247,15 @@
     }
 
     /* ── brand panel ── */
+    /* The weave is painted in fixed dark colors, so the text on it stays light in every theme. */
     .brand {
+        --o-ink: #fff;
+        --o-soft: rgba(255, 255, 255, 0.72);
+        --o-faint: rgba(255, 255, 255, 0.5);
+
         position: relative;
         overflow: hidden;
+        color: var(--o-ink);
         padding: calc(18px + var(--o-safe-top)) 22px 30px;
         display: flex;
         flex-direction: column;
@@ -1969,10 +1978,19 @@
         flex: none;
         accent-color: var(--o-teal);
     }
-    .pick .when {
+    .pick-main {
+        display: grid;
+        flex: 1 1 0;
+        gap: 2px;
         min-width: 0;
-        flex: 1 1 auto;
+    }
+    .pick .when {
         font-variant-numeric: tabular-nums;
+    }
+    .pick .device {
+        font-size: 12px;
+        color: var(--o-soft);
+        overflow-wrap: anywhere;
     }
     .found {
         display: grid;
