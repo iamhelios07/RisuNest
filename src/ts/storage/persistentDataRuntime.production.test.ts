@@ -1352,3 +1352,57 @@ describe('preset list operations', () => {
         expect(commit).not.toHaveBeenCalled()
     })
 })
+
+async function receiveCommit(store: PersistentDataStore, runtime: ReturnType<typeof createPersistentDataRuntime>,
+    commit: Omit<WorkingSetCommit, 'expectedRevision'>, affectedKeys: string[], whileApplying?: () => void) {
+    store.lwwStageReceive = async () => undefined
+    store.lwwFinishReceive = async () => undefined
+    store.lwwApplyReceive = async () => {
+        whileApplying?.()
+        return { ...await store.commit({ expectedRevision: runtime.revision, ...commit }), affectedKeys, heldKeys: [], deferredKeys: [] }
+    }
+    await runtime.applyLwwReceive({ bindingAuthority: '1', requestId: crypto.randomUUID(), changes: [], progress: { kind: 'server', cursor: '1' }, admittedTimeUpperMs: '100' })
+}
+
+describe('received record deletions', () => {
+    async function recordRuntime() {
+        const initial = normalizeDatabaseDefaults({} as Database)
+        initial.botPresets[0].id = 'preset'
+        initial.personas = [{...initial.personas[0], id: 'persona-keep', name: 'Keep'}, {...initial.personas[0], id: 'persona-gone', name: 'Gone'}]
+        initial.selectedPersona = 0
+        initial.modules = [{id: 'module-keep', name: 'Keep', description: ''}, {id: 'module-gone', name: 'Gone', description: ''}]
+        initial.loadouts = [{id: 'loadout-keep', name: 'Keep'}, {id: 'loadout-gone', name: 'Gone'}] as unknown as Database['loadouts']
+        initial.customModels = [{id: 'model-keep', name: 'Keep'}, {id: 'model-gone', name: 'Gone'}] as unknown as Database['customModels']
+        const store = new IndexedDbPersistentDataStore(`record-deletions-${crypto.randomUUID()}`, new IDBFactory(), IDBKeyRange) as PersistentDataStore
+        await store.open()
+        await store.replaceFromDatabase(initial)
+        setDatabase(structuredClone(initial))
+        selectedCharID.set(-1)
+        const saveFailures: unknown[] = []
+        const runtime = createPersistentDataRuntime({store, state: createProductionStateAdapter(), prepareDatabase: async (value) => value,
+            onLocalSaveFailure: (error) => { if (error !== null) saveFailures.push(error) }})
+        await runtime.initializeActiveWorkingSet(getDatabase())
+        await runtime.flushPendingDataLocally('record-deletions-settle')
+        return {store, runtime, saveFailures}
+    }
+
+    it.each([
+        ['modules', 'modules', 'module'], ['loadouts', 'loadouts', 'loadout'], ['customModels', 'customModels', 'model'], ['personas', 'persona', 'persona'],
+    ].flatMap(([collection, kind, prefix]) => [false, true].map((edited) => ({collection, kind, prefix, edited}))) as {
+        collection: 'modules' | 'loadouts' | 'customModels' | 'personas', kind: string, prefix: string, edited: boolean,
+    }[])('removes a $collection record deleted on another device from the working set (edited during receive=$edited)', async ({collection, kind, prefix, edited}) => {
+        const {store, runtime, saveFailures} = await recordRuntime()
+        const records = () => getDatabase()[collection] as unknown as {id: string, name: string}[]
+        const keys = [JSON.stringify(['exists', kind, `${prefix}-gone`]), JSON.stringify(['order', collection])]
+        await receiveCommit(store, runtime, {unitMutations: [{key: keys[0], type: 'delete'}, {key: keys[1], type: 'set', value: [`${prefix}-keep`]}]}, keys,
+            edited ? () => { records().find((value) => value.id === `${prefix}-gone`)!.name = 'Edited here' } : undefined)
+
+        expect(records().map((value) => value.id)).toEqual([`${prefix}-keep`])
+        const commit = vi.spyOn(store, 'commit')
+        records()[0].name = 'Later edit'
+        await runtime.flushPendingDataLocally('after-received-record-deletion')
+        expect(commit).toHaveBeenCalledOnce()
+        expect(JSON.stringify(commit.mock.calls[0][0])).not.toContain(`${prefix}-gone`)
+        expect(saveFailures).toEqual([])
+    })
+})
