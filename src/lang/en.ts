@@ -90,6 +90,7 @@ export const languageEnglish = {
         pocket: 'Export for PocketRisu (.bin)',
         report: 'Compatibility export report',
         preserved: 'Preserved',
+        preservedSummary: 'Preserved {0} files · {1}',
         converted: 'Converted',
         excluded: 'Excluded',
         unknown: 'Not determined',

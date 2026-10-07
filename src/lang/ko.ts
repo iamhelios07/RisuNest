@@ -87,6 +87,7 @@ export const languageKorean = {
         pocket: 'PocketRisu용 내보내기 (.bin)',
         report: '호환 내보내기 보고서',
         preserved: '보존',
+        preservedSummary: '보존한 파일 {0}개 · {1}',
         converted: '변환',
         excluded: '제외',
         unknown: '집계 불가',
