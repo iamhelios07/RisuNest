@@ -1277,7 +1277,7 @@ impl ExternalLwwEngine {
     fn held_body_error(error: ProviderError) -> ProviderError {
         match error.kind {
             ErrorKind::Cancelled | ErrorKind::PreconditionFailed | ErrorKind::Corrupt
-                | ErrorKind::LocalStorageFull | ErrorKind::LocalPermissionDenied => error,
+                | ErrorKind::LocalStorageFull | ErrorKind::LocalPermissionDenied | ErrorKind::LocalFailure => error,
             _ => ProviderError { kind: ErrorKind::PreviousStorageUnavailable, http_status: None, retry_at_ms: None,
                 oauth_error: None, oauth_error_description: None, cause: error.cause },
         }

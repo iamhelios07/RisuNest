@@ -662,7 +662,7 @@ describe('external storage production integration', () => {
             })
             mocks.bridge.startJob.mockImplementation(async (_request, id) => running(id))
             mocks.bridge.getJob
-                .mockRejectedValueOnce({ kind: 'transient', httpStatus: null, retryAtMs: null })
+                .mockRejectedValueOnce({ kind: 'localFailure', httpStatus: null, retryAtMs: null })
                 .mockImplementationOnce(async id => ({
                     ...running(id), phase: 'awaiting-adoption', result: { snapshotId: 'snapshot-1', receivedRevision: '9' },
                 }))

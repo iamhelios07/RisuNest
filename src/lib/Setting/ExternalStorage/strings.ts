@@ -116,6 +116,7 @@ const english = {
     authorizationTimedOut: 'Sign-in timed out. Sign in again.',
     localStorageFull: 'This device is out of space. Free space and try again.',
     localPermissionDenied: 'The app cannot access a local file. Check its permissions and try again.',
+    localFailure: 'This device could not complete this. Try again.',
     errorGeneric: 'Could not complete this. Try again.',
     removeRemoteOnlyTitle: 'Disconnect this external storage?',
     removeRemoteOnly: 'Some files are stored only in this external storage. If you need them, download them before disconnecting.',
@@ -290,6 +291,7 @@ const korean: typeof english = {
     authorizationTimedOut: '로그인 시간이 초과되었습니다. 다시 로그인하세요.',
     localStorageFull: '기기 공간이 부족합니다. 공간을 확보한 뒤 다시 시도하세요.',
     localPermissionDenied: '로컬 파일에 접근할 수 없습니다. 권한을 확인한 뒤 다시 시도하세요.',
+    localFailure: '이 기기에서 작업을 마치지 못했습니다. 다시 시도하세요.',
     errorGeneric: '작업을 마치지 못했습니다. 다시 시도하세요.',
     removeRemoteOnlyTitle: '연결을 해제하시겠습니까?',
     removeRemoteOnly: '이 외부 저장소에만 있는 파일이 있습니다. 필요한 경우 다운로드한 뒤 연결을 해제하세요.',
@@ -434,6 +436,7 @@ export function externalErrorMessage(
         case 'authorizationTimedOut': return strings.authorizationTimedOut
         case 'localStorageFull': return strings.localStorageFull
         case 'localPermissionDenied': return strings.localPermissionDenied
+        case 'localFailure': return strings.localFailure
         case 'authorizationUnavailable': return strings.authorizationUnavailable
         case 'folderNameConflict': return strings.folderNameConflict
         case 'folderCreateFailed': return strings.folderCreateFailed

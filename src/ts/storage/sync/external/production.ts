@@ -460,7 +460,7 @@ export async function requestExternalStorageRestore(
                             unreadable = 0
                         } catch (error) {
                             // The local commit briefly closes the store the job is read through.
-                            if (externalErrorKind(error) !== 'transient' || ++unreadable > 10) throw error
+                            if (!['transient', 'localFailure'].includes(externalErrorKind(error) ?? '') || ++unreadable > 10) throw error
                             continue
                         }
                         background.progress(measuredTaskPercent(Number(job.completedBytes), Number(job.totalBytes)))
