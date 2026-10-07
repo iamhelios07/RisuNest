@@ -463,7 +463,8 @@ describe('the storage usage tab', () => {
         if (component) await unmount(component)
         state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0', paused: false }, connections: [{ ...connection(10, 30), providerId }], jobs: [] })
         component = mount(ExternalStorageSettings, { target }); await settle()
-        expect([...target.querySelectorAll('button')].some(item => item.textContent?.trim() === strings.sync)).toBe(false)
+        expect([...target.querySelectorAll('button')].some(item => [strings.sync, strings.runSync].includes(item.textContent?.trim() ?? ''))).toBe(false)
+        expect(target.textContent).not.toContain(strings.makeSyncTarget)
     })
     it('offers actual native new-device recovery through the shared binding action', async () => {
         if (component) await unmount(component)
@@ -474,6 +475,16 @@ describe('the storage usage tab', () => {
         expect(recovery).toBeDefined(); recovery.click(); await settle()
         expect(state.bind).toHaveBeenCalledWith({ kind: 'external', connectionId: 'connection-1' }, { mode: 'new-device' })
         expect(alertConfirm).not.toHaveBeenCalled(); expect(alertCheckboxConfirm).not.toHaveBeenCalled()
+    })
+    it('labels the sync target switch apart from the button that syncs now', async () => {
+        if (component) await unmount(component)
+        state.getState.mockResolvedValue({ supported: true, selection: { kind: 'external', connectionId: 'connection-1', selectionEpoch: '0', paused: false }, connections: [{ ...connection(10, 30), purpose: 'sync', strategy: 'sequential' }], jobs: [] })
+        component = mount(ExternalStorageSettings, { target }); await settle()
+        const toggle = [...target.querySelectorAll('label')].find(item => item.textContent?.trim() === strings.makeSyncTarget)?.querySelector('input')
+        expect(toggle?.checked).toBe(true)
+        const run = [...target.querySelectorAll('button')].find(item => item.textContent?.trim() === strings.runSync)!
+        expect(run).toBeDefined(); run.click(); await settle()
+        expect(state.syncNow).toHaveBeenCalledWith('connection-1')
     })
     it('combines both history deletion consequences into one checked confirmation', async () => {
         const item = { id: 'point', snapshotId: 'snapshot', pointId: 'point-id', pointObservation: 'observation', deletable: true, kind: 'backup-point', createdAtMs: '1', logicalRevision: '1', pinned: false, complete: true, verified: true, includedSections: [], sameDevice: false }
@@ -874,7 +885,7 @@ it('explains a connection not made because the files could not be downloaded fir
     target = document.createElement('div')
     document.body.append(target)
     component = mount(ExternalStorageSettings, { target }); await settle()
-    const toggle = [...target.querySelectorAll('label')].find(item => item.textContent?.trim() === strings.sync)?.querySelector('input')
+    const toggle = [...target.querySelectorAll('label')].find(item => item.textContent?.trim() === strings.makeSyncTarget)?.querySelector('input')
     expect(toggle).toBeDefined()
     toggle!.click(); await settle()
     expect(state.bind).toHaveBeenCalledWith({ kind: 'external', connectionId: 'connection-1' })

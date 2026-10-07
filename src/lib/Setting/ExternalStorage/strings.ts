@@ -44,7 +44,8 @@ const english = {
     connectionSettingsPayload: 'Settings file or QR contents', connectionSettingsPayloadPlaceholder: 'Open the settings file or scan its QR code', importConnectionSettings: 'Import settings',
     manualConnectionHelp: 'To connect without a settings file, enter the provider details and recovery key.',
     noConnections: 'No external storage is connected. Press Connect storage to connect WebDAV, an S3-compatible bucket, Google Drive, OneDrive, NAVER MYBOX, GitHub or GitLab.',
-    runBackup: 'Back up now', history: 'History', quota: 'Storage usage', recovery: 'Recovery key', remove: 'Disconnect',
+    makeSyncTarget: 'Sync with this repository',
+    runBackup: 'Back up now', runSync: 'Sync now', history: 'History', quota: 'Storage usage', recovery: 'Recovery key', remove: 'Disconnect',
     restore: 'Restore', download: 'Save as file', pin: 'Keep from cleanup', pinned: 'Kept', deleteHistory: 'Delete', local: 'Keep this device', remote: 'Keep repository',
     noHistory: 'This repository holds no backup points yet.',
     deleteHistoryConfirm: 'Delete this backup point from the repository?',
@@ -166,6 +167,17 @@ const english = {
     profiles: {
         'webdav.': 'Generic WebDAV', 's3.aws': 'Amazon S3', 's3.generic': 'Other S3-compatible', 'gitlab_packages.': 'Automatic', 'gitlab_packages.selfManaged': 'Self-managed', 'mybox.plan': '{0} plan',
     },
+
+    quotaBuckets: {
+        'mybox-download-day': 'Downloads per day',
+        'mybox-download-url-minute': 'Downloads per minute',
+        'mybox-upload-url-minute': 'Uploads per minute',
+        'mybox-metadata-minute': 'File info lookups per minute',
+        'mybox-list-minute': 'Listings per minute',
+        'mybox-folder-minute': 'Folders created per minute',
+        'mybox-delete-minute': 'Deletions per minute',
+    } as Record<string, string>,
+    requestCount: '{0} / {1} requests',
 }
 
 const korean: typeof english = {
@@ -206,7 +218,8 @@ const korean: typeof english = {
     connectionSettingsPayload: '설정 파일 또는 QR 내용', connectionSettingsPayloadPlaceholder: '설정 파일을 열거나 QR 코드를 스캔하세요', importConnectionSettings: '설정 가져오기',
     manualConnectionHelp: '설정 파일 없이 연결하려면 서비스 연결 정보와 복구 키를 입력하세요.',
     noConnections: '연결된 외부 저장소가 없습니다. 저장소 연결을 눌러 WebDAV, S3 호환 저장소, Google Drive, OneDrive, 네이버 MYBOX, GitHub, GitLab 중 하나를 연결하세요.',
-    runBackup: '지금 백업', history: '이력', quota: '저장소 용량', recovery: '복구 키', remove: '연결 해제',
+    makeSyncTarget: '이 저장소로 동기화',
+    runBackup: '지금 백업', runSync: '지금 동기화', history: '이력', quota: '저장소 용량', recovery: '복구 키', remove: '연결 해제',
     restore: '복원', download: '파일로 저장', pin: '지우지 않고 보관', pinned: '보관 중', deleteHistory: '삭제', local: '이 기기 내용 유지', remote: '저장소 내용 유지',
     noHistory: '이 저장소에 백업 지점이 아직 없습니다.',
     deleteHistoryConfirm: '이 백업 지점을 저장소에서 삭제하시겠습니까?',
@@ -328,6 +341,17 @@ const korean: typeof english = {
     profiles: {
         'webdav.': '일반 WebDAV', 's3.aws': 'Amazon S3', 's3.generic': '기타 S3 호환', 'gitlab_packages.': '자동', 'gitlab_packages.selfManaged': '직접 운영', 'mybox.plan': '{0} 요금제',
     },
+
+    quotaBuckets: {
+        'mybox-download-day': '하루 다운로드',
+        'mybox-download-url-minute': '분당 다운로드',
+        'mybox-upload-url-minute': '분당 업로드',
+        'mybox-metadata-minute': '분당 파일 정보 조회',
+        'mybox-list-minute': '분당 목록 조회',
+        'mybox-folder-minute': '분당 폴더 생성',
+        'mybox-delete-minute': '분당 삭제',
+    },
+    requestCount: '{0} / {1}회',
 }
 
 export type ExternalStorageStrings = typeof english
