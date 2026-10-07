@@ -503,6 +503,20 @@ impl LwwClient {
         header: &Header,
         generating: &[MessageLocator],
     ) -> Result<Option<PushReceipt>> {
+        let cache = lane_cache(store.repository_root(), "send");
+        let result = self.push_through(store, header, generating, &cache);
+        if result.is_ok() {
+            discard_cache(&cache);
+        }
+        result
+    }
+    fn push_through(
+        &self,
+        store: &mut PersistentStore,
+        header: &Header,
+        generating: &[MessageLocator],
+        cache_root: &Path,
+    ) -> Result<Option<PushReceipt>> {
         self.fence(store)?;
         let lane = self.client.lane();
         lane.step(Step::Preparing);
@@ -537,8 +551,7 @@ impl LwwClient {
         };
         fit_push_page(&mut request, &mut entries)?;
         lane.plan_items(entries.len());
-        let cache = Cache::open(&store.repository_root().join("server-sync/lww-cache"))?
-            .with_library(store.repository_root())?;
+        let cache = Cache::open(cache_root)?.with_library(store.repository_root())?;
         let mut objects = BTreeSet::new();
         for entry in &entries {
             self.check()?;
@@ -1232,8 +1245,21 @@ impl LwwClient {
         changes: &[Change],
         upper: DecimalU64,
     ) -> Result<()> {
-        let cache = Cache::open(&store.repository_root().join("server-sync/lww-cache"))?
-            .with_library(store.repository_root())?;
+        let cache = lane_cache(store.repository_root(), "receive");
+        let result = self.prepare_bodies_through(store, changes, upper, &cache);
+        if result.is_ok() {
+            discard_cache(&cache);
+        }
+        result
+    }
+    fn prepare_bodies_through(
+        &self,
+        store: &mut PersistentStore,
+        changes: &[Change],
+        upper: DecimalU64,
+        cache_root: &Path,
+    ) -> Result<()> {
+        let cache = Cache::open(cache_root)?.with_library(store.repository_root())?;
         let transfer = Transfer::new(&self.client, &cache)?;
         let mut controls = BTreeSet::new();
         let mut large = BTreeSet::new();
@@ -1392,6 +1418,22 @@ impl LwwClient {
         }
         Ok(())
     }
+}
+
+pub(crate) const LWW_CACHE: &str = "lww-cache";
+
+/// Each lane works in its own copy, so removing one after a finished operation
+/// never takes bodies from another lane that is still running.
+fn lane_cache(root: &Path, lane: &str) -> std::path::PathBuf {
+    root.join("server-sync").join(LWW_CACHE).join(lane)
+}
+
+/// The library holds every body a finished operation copied here; a failed
+/// one keeps its copies for the retry.
+fn discard_cache(path: &Path) {
+    // A file the system still holds is removed by the next finished operation
+    // or a cache cleanup, so this never fails an operation that completed.
+    let _ = std::fs::remove_dir_all(path);
 }
 
 /// Keeps the longest outbox prefix whose canonical push request stays below

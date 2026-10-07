@@ -1,3 +1,4 @@
+use super::body_encoding_tests::random_text;
 use super::lww_tests::{drain_publications, header, local, publish_cycle, receive_available, save, LocalServerFixture};
 use crate::persistent_store::PersistentStore;
 use risunest_sync_wire::{descriptor::RecordDescriptor, unit::{UnitValue, MAX_INLINE_UNIT_BYTES}, MAX_METADATA_BYTES};
@@ -79,4 +80,54 @@ fn a_rejected_single_entry_push_reports_unit_too_large_and_keeps_the_entry() {
     let error = ca.push(&mut a, &request, &[]).unwrap_err();
     assert_eq!((error.code.as_str(), error.retryable), ("unit-too-large", false));
     assert_eq!(pending(&a), 1);
+}
+
+type Routes = std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>;
+
+fn recording_server(fail_push: std::sync::Arc<std::sync::atomic::AtomicBool>) -> (LocalServerFixture, Routes) {
+    let routes = Routes::default();
+    let seen = routes.clone();
+    let server = LocalServerFixture::with_router(move |router| {
+        router.layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let seen = seen.clone();
+                let fail_push = fail_push.clone();
+                async move {
+                    let path = request.uri().path();
+                    if path == "/push" && fail_push.load(std::sync::atomic::Ordering::Relaxed) {
+                        return axum::response::Response::builder()
+                            .status(503)
+                            .body(axum::body::Body::from("{\"error\":\"unavailable\"}"))
+                            .unwrap();
+                    }
+                    seen.lock().unwrap().push(super::body_encoding_tests::route(path));
+                    next.run(request).await
+                }
+            },
+        ))
+    });
+    (server, routes)
+}
+
+fn lane(store: &PersistentStore, name: &str) -> std::path::PathBuf {
+    store.repository_root().join("server-sync/lww-cache").join(name)
+}
+
+#[test]
+fn a_failed_push_keeps_its_copies_for_the_retry_and_a_finished_one_removes_them() {
+    let fail_push = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (server, _) = recording_server(fail_push.clone());
+    let (_a, mut a) = local();
+    let ca = server.client(&a);
+    let value = Value::String(random_text(2 * MAX_METADATA_BYTES, 3));
+    save(&mut a, &["root", "customCSS"], value.clone());
+    let hash = risunest_sync_wire::hash(&risunest_sync_wire::payload_value::encode(&value).unwrap());
+    let request = header(&a);
+    assert!(ca.push(&mut a, &request, &[]).is_err());
+    let copies = crate::asset_repository::PayloadCas::new(&lane(&a, "send")).unwrap();
+    assert!(copies.stat_object(&hash).unwrap().is_some());
+    fail_push.store(false, std::sync::atomic::Ordering::Relaxed);
+    drain_publications(&ca, &mut a, &[]).unwrap();
+    assert_eq!(pending(&a), 0);
+    assert!(!lane(&a, "send").exists());
 }

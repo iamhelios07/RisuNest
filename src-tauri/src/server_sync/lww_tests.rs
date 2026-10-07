@@ -1212,12 +1212,11 @@ fn verified_native_controls_skip_cached_file_reads_and_unverified_corruption_fai
         .unwrap();
     assert!(!target.lww_verified_object_present(&page_hash).unwrap());
 
-    let cache = super::cache::Cache::open(
-        &target.repository_root().join("server-sync/lww-cache"),
-    )
-    .unwrap()
-    .with_library(target.repository_root())
-    .unwrap();
+    let lane = target.repository_root().join("server-sync/lww-cache/receive");
+    let cache = super::cache::Cache::open(&lane)
+        .unwrap()
+        .with_library(target.repository_root())
+        .unwrap();
     super::transfer::Transfer::new(&b.client, &cache)
         .unwrap()
         .download(&[page_hash.clone()], &[])
@@ -1228,6 +1227,7 @@ fn verified_native_controls_skip_cached_file_reads_and_unverified_corruption_fai
     let mut corrupt = original.clone();
     corrupt[0] ^= 1;
     std::fs::write(&path, &corrupt).unwrap();
+    drop(cache);
     let upper = b.admission().unwrap();
     assert_eq!(
         b.prepare_bodies(&mut target, &changes, upper)
@@ -1236,10 +1236,15 @@ fn verified_native_controls_skip_cached_file_reads_and_unverified_corruption_fai
         "cached-object-corrupt"
     );
     assert!(!target.lww_verified_object_present(&page_hash).unwrap());
+    // A failed preparation keeps what it downloaded for its retry.
+    assert_eq!(std::fs::read(&path).unwrap(), corrupt);
 
     std::fs::write(&path, &original).unwrap();
     b.prepare_bodies(&mut target, &changes, upper).unwrap();
     assert!(target.lww_verified_object_present(&page_hash).unwrap());
+    // A finished one leaves no copies behind.
+    assert!(!lane.exists());
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, &corrupt).unwrap();
     reset_body_io();
     b.client.test_io.as_ref().unwrap().reset();

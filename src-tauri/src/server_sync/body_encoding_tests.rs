@@ -40,7 +40,7 @@ fn text(len: usize, seed: usize) -> String {
 }
 
 /// Random URL-safe characters, as base64 media inside library JSON looks.
-fn random_text(len: usize, seed: usize) -> String {
+pub(crate) fn random_text(len: usize, seed: usize) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut state = 0x2545_f491_4f6c_dd1du64 ^ (seed as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
     (0..len)
@@ -88,7 +88,7 @@ struct Run {
     exchanges: BTreeSet<Exchange>,
 }
 
-fn route(path: &str) -> &'static str {
+pub(crate) fn route(path: &str) -> &'static str {
     match path {
         "/push" => "push",
         "/changes" => "changes",
