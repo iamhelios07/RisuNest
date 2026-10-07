@@ -328,19 +328,6 @@
         return Number.isFinite(time) ? new Date(time).toLocaleString() : '—'
     }
 
-    function externalSize(value?: string): string {
-        if (!value) return ''
-        const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']
-        let amount = Number(value)
-        if (!Number.isFinite(amount)) return ''
-        let index = 0
-        while (index < units.length - 1 && amount >= 1024) {
-            amount /= 1024
-            index += 1
-        }
-        return `${index === 0 ? amount : Math.round(amount * 10) / 10} ${units[index]}`
-    }
-
 
     function resetExternal(): void {
         externalConnection = undefined
@@ -1014,7 +1001,6 @@
                                                 <span class="pick-main">
                                                     <span class="when">{externalWhen(item.createdAtMs)}</span>
                                                 </span>
-                                                <span class="dim">{externalSize(item.storedBytes)}</span>
                                             </label>
                                         {/each}
                                     </div>

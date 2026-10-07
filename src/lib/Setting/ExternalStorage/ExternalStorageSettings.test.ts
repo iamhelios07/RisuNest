@@ -604,7 +604,7 @@ describe('the storage usage tab', () => {
         state.listHistory.mockResolvedValue({
             items: [{
                 id: 'snapshot', snapshotId: 'snapshot', kind: 'backup-point',
-                createdAtMs: '1', logicalRevision: 1, storedBytes: '1', pinned: false,
+                createdAtMs: '1', logicalRevision: 1, pinned: false,
                 complete: true, verified: true, includedSections: [], sameDevice: true,
                 warning: 'UNTRUSTED REMOTE WARNING',
             }],
@@ -621,7 +621,7 @@ describe('the storage usage tab', () => {
 
     it('marks the backups this device made and nothing else', async () => {
         const row = (id: string, sameDevice: boolean, kind = 'backup-point') => ({
-            id, snapshotId: id, kind, createdAtMs: '1', logicalRevision: '1', storedBytes: '6656', pinned: false,
+            id, snapshotId: id, kind, createdAtMs: '1', logicalRevision: '1', pinned: false,
             complete: true, verified: true, includedSections: [], sameDevice,
         })
         state.listHistory.mockResolvedValue({ items: [row('own', true), row('other', false), row('state', false, 'snapshot')] })
@@ -629,7 +629,7 @@ describe('the storage usage tab', () => {
         tab?.click()
         await settle()
         const meta = [...target.querySelectorAll('.item-meta')].map(item => item.textContent)
-        expect(meta).toEqual([`${strings.thisDevice} · 6.5 KiB`, '6.5 KiB', '6.5 KiB'])
+        expect(meta).toEqual([strings.thisDevice])
     })
 
     it('sends a changed limit and leaves the other one alone', async () => {

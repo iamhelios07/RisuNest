@@ -285,7 +285,6 @@ export interface ExternalHistoryItem {
     kind: 'snapshot' | 'backup-point' | 'conflict' | 'recovery-candidate'
     createdAtMs: DecimalString
     logicalRevision: DecimalString
-    storedBytes?: DecimalString
     pinned: boolean
     complete: boolean
     verified: boolean
