@@ -310,7 +310,17 @@ it('removes the asset storage controls once the server is disconnected', async (
     click(sync.disconnect); await settle()
     expect(f.disconnect).toHaveBeenCalledOnce()
     expect(host.textContent).not.toContain(sync.residency.title)
-    for (const label of [sync.residency.full, sync.residency.remote, sync.residency.clean, sync.residency.download]) expect(findButton(label)).toBeUndefined()
+    for (const label of [sync.residency.clean, sync.residency.download]) expect(findButton(label)).toBeUndefined()
+    expect(host.querySelector('[role="radiogroup"]')).toBeNull()
+})
+it('changes the asset storage choice from its radio options', async () => {
+    await mountBound(residencyStatus({ policy: 'full' }))
+    const options = [...host.querySelectorAll<HTMLInputElement>('[role="radiogroup"] input[type="radio"]')]
+    expect(options.map(option => [option.closest('label')?.textContent?.trim(), option.checked])).toEqual([[sync.residency.full, true], [sync.residency.remote, false]])
+    f.policy.mockResolvedValue(residencyStatus({ policy: 'remote' })); f.status.mockResolvedValue(residencyStatus({ policy: 'remote' }))
+    options[1].click(); await settle()
+    expect(f.policy).toHaveBeenCalledExactlyOnceWith('remote')
+    expect(options[1].checked).toBe(true)
 })
 it('shows no asset storage controls for a stored server registration that is not connected', async () => {
     f.view = { status: { configured: true, bound: false }, paused: true, error: '' }
