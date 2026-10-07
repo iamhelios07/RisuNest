@@ -2,7 +2,7 @@
 //! into the job-owned sink while hashing, Retry-After parsing and the default
 //! HTTP status classification. A service that documents a different meaning
 //! for a status (403 as throttling, 409 as a precondition) overrides it locally.
-use crate::external_storage::{contract::*, http::HttpResponse};
+use crate::external_storage::contract::*;
 use std::{collections::BTreeMap, pin::Pin};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
@@ -177,14 +177,6 @@ pub(crate) fn classify_status(
         oauth_error: None,
         oauth_error_description: None,
         cause: Default::default(),
-    }
-}
-
-pub(crate) fn require_status(response: &HttpResponse, allowed: &[u16], now_ms: u64) -> Result<()> {
-    if allowed.contains(&response.status) {
-        Ok(())
-    } else {
-        Err(classify_status(response.status, &response.headers, now_ms))
     }
 }
 
