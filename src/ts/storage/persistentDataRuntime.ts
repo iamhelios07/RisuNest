@@ -720,7 +720,12 @@ export function createPersistentDataRuntime(
             coordinator.pendingWorkingSetRefreshRevision === null &&
             dependencies.state.canDeactivateWorkingSet?.() !== false,
         canDeactivateCharacter: dependencies.state.canDeactivateCharacter,
-        releaseInactiveCharacter: dependencies.state.releaseInactiveCharacter,
+        releaseInactiveCharacter: dependencies.state.releaseInactiveCharacter
+            ? (id) => {
+                dependencies.state.releaseInactiveCharacter!(id)
+                coordinator.forgetMaterializedCharacter(id)
+            }
+            : undefined,
         shouldHydrateFullCharacter: dependencies.state.shouldHydrateFullCharacter,
         canReleaseConversation: dependencies.state.canReleaseConversation,
         canUseWindowedSelectedConversation:

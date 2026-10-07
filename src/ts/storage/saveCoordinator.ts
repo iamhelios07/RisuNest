@@ -3457,6 +3457,8 @@ export class SaveCoordinator {
                 this.setCharacterBaseline(published)
             }
         }
+        // A character kept in the catalog as a stub holds no detail to diff against.
+        if (result.kind !== 'delete') this.forgetMaterializedCharacter(result.characterId)
         if (
             options.committedSelectedCharacter !== undefined &&
             this.capture().character?.chaId === options.committedSelectedCharacter.id
@@ -4900,6 +4902,13 @@ export class SaveCoordinator {
             baselines.set(authority.characterId, shell as CompleteCharacter)
         }
         return [...baselines.values()].map((value) => ({...value, chats: value.chats.map((chat) => ({...chat}))} as CompleteCharacter))
+    }
+
+    /** Drops the baselines of a character the working set no longer holds; hydration captures new ones. */
+    forgetMaterializedCharacter(characterId: string): void {
+        if (this.dependencies.captureCharacter(characterId)) return
+        this.materializedBaselines.delete(characterId)
+        this.materializedCanonicalBaselines.delete(characterId)
     }
 
     capturePresetRecordBaseline(): botPreset[] {

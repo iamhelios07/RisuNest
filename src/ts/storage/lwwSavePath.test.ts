@@ -442,18 +442,34 @@ describe('LWW renderer save path', () => {
         const reader = {
             readCharacter: async () => ({revision: 2, value: {...restored, name: 'Restored', nickname: 'Remote nickname', chats: []}}),
         } as unknown as import('./persistentDataStore').PersistentRevisionReader
-        const applied = await applyLwwWorkingSetUnits(database, baseline, reader, ['["character","char-c","trashTime"]', '["character","char-c","name"]', '["character","char-c","nickname"]'])
+        await applyLwwWorkingSetUnits(database, baseline, reader, ['["character","char-c","trashTime"]', '["character","char-c","name"]', '["character","char-c","nickname"]'])
         expect(database.characters[2]).toBe(stub)
         expect(isCatalogCharacterStub(stub)).toBe(true)
         expect(stub).toMatchObject({name: 'Restored'})
         expect(stub).not.toHaveProperty('trashTime')
         expect(stub).not.toHaveProperty('nickname')
-        const kept = applied.characters.find((value) => value.chaId === 'char-c')
-        if (!keptBaseline) expect(kept).toBeUndefined()
-        else {
-            expect(kept).toMatchObject({name: 'Restored', nickname: 'Remote nickname'})
-            expect(kept).not.toHaveProperty('trashTime')
-        }
+    })
+
+    it('keeps received conversations and folders out of a stub that kept a baseline', async () => {
+        const {database} = await harness()
+        const full = database.characters[2] as character
+        delete (full as unknown as Record<string, unknown>).chatFolders
+        const baseline = captureLwwWorkingSetBaseline(database, capturePersistentRoot(database), database.botPresets)
+        const stub = createCatalogCharacterStub({id: full.chaId, name: full.name, image: full.image, configuredIndex: 2, recentAt: full.lastInteraction ?? 0,
+            trashed: true, conversationCount: full.chats.length, type: full.type, trashTime: full.trashTime})
+        database.characters[2] = stub
+        const folders = [{id: 'folder', name: 'Folder', folded: false}]
+        const reader = {
+            readRoot: async () => ({revision: 2, value: capturePersistentRoot(database)}),
+            readCharacter: async () => ({revision: 2, value: {...structuredClone(full), chatFolders: folders, chats: []}}),
+            queryConversations: async () => ({revision: 2, items: [{id: 'conv-trash'}, {id: 'conv-new'}]}),
+            readConversationMetadata: async () => ({revision: 2, value: {conversation: {id: 'conv-new', name: 'New', note: '', localLore: []}, totalMessages: 0}}),
+        } as unknown as import('./persistentDataStore').PersistentRevisionReader
+        await applyLwwWorkingSetUnits(database, baseline, reader, ['["exists","conversation","char-c","conv-new"]', '["order","conversations","char-c"]'])
+        expect(database.characters[2]).toBe(stub)
+        expect(isCatalogCharacterStub(stub)).toBe(true)
+        expect(stub.chats).toEqual([])
+        expect(stub).not.toHaveProperty('chatFolders')
     })
 
     it('patches received conversation metadata and messages in place without replacing chat objects', async () => {

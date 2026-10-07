@@ -37,7 +37,11 @@ export async function applyLwwWorkingSetUnits(
     database: Database, baseline: LwwWorkingSetBaseline, store: PersistentRevisionReader, affectedKeys: readonly string[], liveIndex?: ReadonlyMap<string, CompleteCharacter>, allowLocalFields = false, beforeProjection?: () => void, afterProjection?: () => void,
 ): Promise<LwwWorkingSetBaseline> {
     const charactersById = liveIndex ?? new Map(database.characters.map((value) => [value.chaId,value]))
-    const baselineById = new Map(baseline.characters.map((value) => [value.chaId,value]))
+    // A stub holds only catalog fields, so no baseline describes it.
+    const baselineById = new Map(baseline.characters.filter((value) => {
+        const live = charactersById.get(value.chaId)
+        return !live || !isWorkingSetCharacterStub(live)
+    }).map((value) => [value.chaId,value]))
     const keys = affectedKeys.map((key) => JSON.parse(key) as string[])
         .filter(([kind, , field, metadataField]) => allowLocalFields || (kind !== 'character' || CHARACTER_SHARED_FIELDS.has(field)) && (kind !== 'conversation' || CONVERSATION_SHARED_FIELDS.has(metadataField)))
         .sort((a, b) => Number(a[0] === 'root' && ['botPresetsId', 'selectedPersona'].includes(a[1])) - Number(b[0] === 'root' && ['botPresetsId', 'selectedPersona'].includes(b[1])))
@@ -126,17 +130,18 @@ export async function applyLwwWorkingSetUnits(
             const before = baselineById.get(id)
             const remote = details.get(id)
             if (!live || !remote) continue
-            // A stub keeps only catalog fields; a baseline left from an earlier hydration still follows the stored record.
-            const stub = isWorkingSetCharacterStub(live)
-            if (stub) patchCatalogCharacterField(live, remote, field)
+            // A stub takes its catalog fields from the stored record.
+            if (isWorkingSetCharacterStub(live)) {
+                patchCatalogCharacterField(live, remote, field)
+                continue
+            }
             if (!before) continue
-            const current = stub ? {} as CompleteCharacter : live
             for (const key of [field]) {
-                if (key !== 'statics' || allowLocalFields) { patchField(current, before, remote, key); continue }
+                if (key !== 'statics' || allowLocalFields) { patchField(live, before, remote, key); continue }
                 const sharedStatics = (value: unknown) => value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).filter(([key]) => key !== 'messages')) : value
-                const liveView = {statics:sharedStatics(current['statics'])}, beforeView = {statics:sharedStatics(before['statics'])}
+                const liveView = {statics:sharedStatics(live['statics'])}, beforeView = {statics:sharedStatics(before['statics'])}
                 patchField(liveView, beforeView, {statics:sharedStatics(remote['statics'])}, 'statics')
-                for (const [target, view] of [[current,liveView],[before,beforeView]] as const) {
+                for (const [target, view] of [[live,liveView],[before,beforeView]] as const) {
                     const local = target['statics'] as Record<string, unknown> | undefined
                     if (view.statics === undefined && !local?.messages) delete target['statics']
                     else target['statics'] = {...view.statics as object, ...(local && Object.hasOwn(local, 'messages') ? {messages:local.messages} : {})}

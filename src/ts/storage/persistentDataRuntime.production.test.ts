@@ -22,7 +22,7 @@ import {
 } from '../plugins/pluginStorageStore'
 import { getV2PluginAPIs } from '../plugins/plugins.svelte'
 import type { Database } from './database.svelte'
-import type { PersistentDataStore, PersistentUnitMutation } from './persistentDataStore'
+import type { PersistentDataStore, PersistentUnitMutation, WorkingSetCommit } from './persistentDataStore'
 import { getDatabase, getEffectivePresetId, normalizeDatabaseDefaults, setDatabase, setDatabaseLite, setEffectivePresetOverride } from './database.svelte'
 import {
     configurePersistentDataRuntime,
@@ -1160,13 +1160,13 @@ describe('received removal of the selected character or conversation', () => {
 describe('detail mutations of a catalog character', () => {
     const character = (chaId: string, extra: Record<string, unknown> = {}) => ({ type: 'character', chaId, name: chaId, chatPage: 0, chatFolders: [], chats: [{ id: `${chaId}-chat`, name: 'Chat', note: '', localLore: [], message: [] }], ...extra })
 
-    async function catalogRuntime(eviction: boolean, resident: readonly string[] = ['live']) {
+    async function catalogRuntime(eviction: boolean, resident: readonly string[] = ['live'], live: Record<string, unknown> = {}) {
         workingSetResidency.setEvictionAllowed(eviction)
         const initial = normalizeDatabaseDefaults({} as Database)
         initial.botPresets[0].id = 'preset'
         initial.personas[0].id = 'persona'
         initial.characters = [
-            character('live', { creatorNotes: 'Live notes' }),
+            character('live', { creatorNotes: 'Live notes', ...live }),
             character('trashed', { trashTime: 123, creatorNotes: 'Trashed notes', image: 'trashed-image' }),
             character('other', { creatorNotes: 'Other notes' }),
         ] as unknown as Database['characters']
@@ -1187,6 +1187,13 @@ describe('detail mutations of a catalog character', () => {
         await runtime.flushPendingDataLocally('catalog-detail-settle')
         for (const value of getDatabase().characters) expect(isCatalogCharacterStub(value)).toBe(!resident.includes(value.chaId))
         return { store, runtime, saveFailures }
+    }
+
+    async function receive(store: PersistentDataStore, runtime: Awaited<ReturnType<typeof catalogRuntime>>['runtime'], commit: Omit<WorkingSetCommit, 'expectedRevision'>, affectedKeys: string[]) {
+        store.lwwStageReceive = async () => undefined
+        store.lwwFinishReceive = async () => undefined
+        store.lwwApplyReceive = async () => ({ ...await store.commit({ expectedRevision: runtime.revision, ...commit }), affectedKeys, heldKeys: [], deferredKeys: [] })
+        await runtime.applyLwwReceive({ bindingAuthority: '1', requestId: crypto.randomUUID(), changes: [], progress: { kind: 'server', cursor: '1' }, admittedTimeUpperMs: '100' })
     }
 
     const editOther = (runtime: Awaited<ReturnType<typeof catalogRuntime>>['runtime']) =>
@@ -1246,16 +1253,57 @@ describe('detail mutations of a catalog character', () => {
 
     it('patches a received trash restore into a catalog character', async () => {
         const { store, runtime, saveFailures } = await catalogRuntime(true)
-        store.lwwStageReceive = async () => undefined
-        store.lwwFinishReceive = async () => undefined
-        store.lwwApplyReceive = async () => {
-            const mutations: PersistentUnitMutation[] = [{ key: '["character","trashed","trashTime"]', type: 'delete' }]
-            const result = await store.commit({ expectedRevision: runtime.revision, unitMutations: mutations })
-            return { ...result, affectedKeys: mutations.map((value) => value.key), heldKeys: [], deferredKeys: [] }
-        }
-        await runtime.applyLwwReceive({ bindingAuthority: '1', requestId: crypto.randomUUID(), changes: [], progress: { kind: 'server', cursor: '1' }, admittedTimeUpperMs: '100' })
+        const key = '["character","trashed","trashTime"]'
+        await receive(store, runtime, { unitMutations: [{ key, type: 'delete' }] }, [key])
 
         expect(getDatabase().characters.find((value) => value.chaId === 'trashed')).not.toHaveProperty('trashTime')
         expect(saveFailures).toEqual([])
+    })
+
+    it('keeps received conversations and folders out of a character released to the catalog', async () => {
+        const { store, runtime, saveFailures } = await catalogRuntime(true, ['live'], { chatFolders: undefined })
+        expect(await runtime.activateCharacter('other')).toBe(true)
+        const released = () => getDatabase().characters.find((value) => value.chaId === 'live')!
+        expect(isCatalogCharacterStub(released())).toBe(true)
+        const folders = [{ id: 'folder', name: 'Folder', folded: false }]
+        await receive(store, runtime, {
+            conversations: [{ type: 'replace-range', characterId: 'live', conversationId: 'live-chat-2', start: 0, deleteCount: 0, messages: [],
+                conversation: { id: 'live-chat-2', name: 'Second', note: '', localLore: [] } as unknown as Omit<Database['characters'][number]['chats'][number], 'message'>, configuredIndex: 1 }],
+            unitMutations: [{ key: '["order","conversations","live"]', type: 'set', value: { ids: ['live-chat', 'live-chat-2'], folders } }],
+        }, ['["exists","conversation","live","live-chat-2"]', '["order","conversations","live"]'])
+
+        expect((await store.readCharacter('live'))!.value.chatFolders).toEqual(folders)
+        expect(await store.readConversationMetadata('live', 'live-chat-2')).not.toBeNull()
+        expect(isCatalogCharacterStub(released())).toBe(true)
+        expect(released().chats).toEqual([])
+        expect(released()).not.toHaveProperty('chatFolders')
+        const commit = vi.spyOn(store, 'commit')
+        await runtime.flushPendingDataLocally('after-released-receive')
+        expect(commit).not.toHaveBeenCalled()
+        expect(saveFailures).toEqual([])
+    })
+
+    it.each(['released', 'added'])('keeps no baseline for a character %s to the catalog', async (route) => {
+        const { runtime } = await catalogRuntime(true)
+        if (route === 'released') {
+            expect(await runtime.activateCharacter('other')).toBe(true)
+            expect(isCatalogCharacterStub(getDatabase().characters.find((value) => value.chaId === 'live')!)).toBe(true)
+        } else {
+            await runtime.upsertPersistentCompleteCharacter('added', 'add-catalog-character', () => character('added', { creatorNotes: 'Added notes' }) as unknown as Database['characters'][number])
+            expect(isCatalogCharacterStub(getDatabase().characters.find((value) => value.chaId === 'added')!)).toBe(true)
+        }
+        const materialized = vi.spyOn(SaveCoordinator.prototype, 'captureMaterializedBaseline')
+        try {
+            await runtime.mutatePersistentCharacterDetail('trashed', 'character-restore', ({ root, character }) => {
+                delete character.trashTime
+                appendCharacterIdToOrder(root, 'trashed')
+            })
+
+            expect(materialized).toHaveBeenCalled()
+            const resident = getDatabase().characters.filter((value) => !isCatalogCharacterStub(value)).map((value) => value.chaId)
+            expect(materialized.mock.results.at(-1)!.value.map((value: Database['characters'][number]) => value.chaId)).toEqual(resident)
+        } finally {
+            materialized.mockRestore()
+        }
     })
 })
