@@ -1460,6 +1460,31 @@ describe('received fields the working set did not have', () => {
     })
 })
 
+describe('local global toggle edits', () => {
+    it.each(['toggle_new', 'toggle_existing'])('stores %s', async (name) => {
+        const initial = normalizeDatabaseDefaults({} as Database)
+        initial.botPresets[0].id = 'preset'
+        initial.personas[0].id = 'persona'
+        initial.globalChatVariables = {toggle_existing: '1'}
+        initial.explicitGlobalChatVariables = {toggle_existing: '1'}
+        const store = new IndexedDbPersistentDataStore(`local-toggle-${crypto.randomUUID()}`, new IDBFactory(), IDBKeyRange)
+        await store.open()
+        await store.replaceFromDatabase(initial)
+        setDatabase(structuredClone(initial))
+        selectedCharID.set(-1)
+        const runtime = createPersistentDataRuntime({store, state: createProductionStateAdapter(), prepareDatabase: async (value) => value})
+        await runtime.initializeActiveWorkingSet(getDatabase())
+        // A save reads every capture once, as the app does before the toggle changes.
+        getDatabase().classicMaxWidth = true
+        await runtime.flushPendingDataLocally('local-toggle-settle')
+
+        getDatabase().globalChatVariables[name] = '2'
+        await runtime.flushPendingDataLocally('local-toggle')
+
+        expect((await store.readRoot()).value.explicitGlobalChatVariables?.[name]).toBe('2')
+    })
+})
+
 describe('received plugin records', () => {
     const plugin = (name: string, extra: Record<string, unknown> = {}) => ({name, displayName: name, script: `// ${name}`,
         arguments: {limit: 'int'}, realArg: {limit: 1}, version: '3.0', customLink: [], argMeta: {}, enabled: true, ...extra})
