@@ -2420,7 +2420,7 @@ export const languageKorean = {
 
             title: '데이터 점검',
             description:
-                '저장된 데이터와 DB를 검사하여 잘못되거나 손상된 부분이 있는지 검사합니다.',
+                '저장된 데이터와 DB에 잘못되거나 손상된 부분이 있는지 검사합니다.',
             quickScan: '빠른 검사',
             quickScanHelp:
                 '저장된 기록과 미디어 파일의 연결 상태를 점검합니다.',
