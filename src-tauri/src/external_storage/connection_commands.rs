@@ -431,7 +431,7 @@ fn insert_preparation(
         .take()
         .map(|value| {
             risunest_external_storage_format::crypto::RecoveryKey::parse(&value)
-                .map_err(|_| ProviderError::new(ErrorKind::Corrupt))?;
+                .map_err(|_| ProviderError::new(ErrorKind::RecoveryKeyMismatch))?;
             Ok(Zeroizing::new(value))
         })
         .transpose()?;
@@ -1020,7 +1020,7 @@ pub(crate) async fn external_storage_unlock_connection(
         let recovered = recovery::open_bootstrap(&root, provider.as_ref(), &handle, &recovery_key, &cancel).await?;
         if recovered.metadata.descriptor != stored.descriptor
             || recovered.metadata.descriptor_locator != stored.descriptor_locator {
-            return Err(ProviderError::new(ErrorKind::Corrupt));
+            return Err(ProviderError::new(ErrorKind::RepositoryMismatch));
         }
         descriptor::read(&root, provider.as_ref(), &handle, &stored.descriptor_locator,
             &stored.descriptor, &recovered.key, &cancel).await?;
@@ -1876,7 +1876,7 @@ async fn commit_preparation(
                                     expected != &recovered.metadata.descriptor.repository_id
                                 })
                             {
-                                return Err(ProviderError::new(ErrorKind::Corrupt).into());
+                                return Err(ProviderError::new(ErrorKind::RepositoryMismatch).into());
                             }
                             require_repository_strategy(
                                 &capabilities,
@@ -1978,12 +1978,12 @@ async fn commit_preparation(
         .as_ref()
         .is_some_and(|expected| expected != &handle.repository_id)
     {
-        return Err(ProviderError::new(ErrorKind::Corrupt).into());
+        return Err(ProviderError::new(ErrorKind::RepositoryMismatch).into());
     }
     // Nothing this attempt left behind can be promoted later, so it goes with
     // the refusal.
     if store
-        .identity_holder(&handle.connection_identity)?
+        .identity_holder(&pending.repository_id, &handle.connection_identity)?
         .is_some_and(|held| held != connection_id)
     {
         let _ = store.remove_pending(connection_id);
@@ -2046,7 +2046,7 @@ async fn commit_preparation(
                 recovery::open_bootstrap(&root, provider.as_ref(), &handle, &recovery_key, cancel)
                     .await?;
             if recovered.metadata.descriptor != *descriptor || *recovered.key != *root_key {
-                return Err(ProviderError::new(ErrorKind::Corrupt).into());
+                return Err(ProviderError::new(ErrorKind::RepositoryMismatch).into());
             }
             descriptor::read(
                 &root,
@@ -2159,7 +2159,7 @@ pub(crate) async fn open_connected_with_cancel(
         )
         .await?;
     if handle.repository_id != stored.provider_repository_id {
-        return Err(ProviderError::new(ErrorKind::Corrupt));
+        return Err(ProviderError::new(ErrorKind::RepositoryMismatch));
     }
     stored
         .descriptor
@@ -2367,7 +2367,8 @@ pub(crate) async fn external_storage_save_connection_settings_file(
             &stored.recovery_key_ref,
         )
         .await?;
-        let imported = recovery::import_connection_settings(&verified, &recovery_key)?;
+        let imported = recovery::import_connection_settings(&verified, &recovery_key).map_err(|error|
+            if error.kind == ErrorKind::RecoveryKeyMismatch { ProviderError::new(ErrorKind::Corrupt) } else { error })?;
         if imported.repository_id != stored.descriptor.repository_id || imported.config != stored.config
         {
             return Err(ProviderError::new(ErrorKind::Corrupt));

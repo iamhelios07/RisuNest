@@ -950,6 +950,8 @@ pub(crate) fn error_dto(error: &ProviderError) -> Value {
         ErrorKind::DeviceVaultUnavailable => ("Unlock the device credential store and retry.", "retry", false),
         ErrorKind::ClockSkew => ("Correct the device clock and retry.", "retry", false),
         ErrorKind::LocationOccupied => ("Choose an empty repository folder.", "check-endpoint", false),
+        ErrorKind::RepositoryMismatch => ("This location holds a different repository.", "check-endpoint", false),
+        ErrorKind::RecoveryKeyMismatch => ("The recovery key does not match this repository.", "unlock-key", false),
         ErrorKind::LocalStorageFull => ("This device has insufficient space.", "free-space", false),
         ErrorKind::LocalPermissionDenied => ("Allow access to the local files and retry.", "retry", false),
         ErrorKind::LocalFailure => ("This device could not complete the operation.", "retry", true),

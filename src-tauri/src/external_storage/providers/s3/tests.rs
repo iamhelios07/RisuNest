@@ -467,10 +467,18 @@ fn addressing_and_endpoint_paths_build_the_documented_urls() {
         "https://s3.hf.co/synthetic-namespace/synthetic-bucket\
          ?list-type=2&prefix=risunest%2Fsnapshots%2F"
     );
-    assert_eq!(
-        hugging.connection_identity,
-        "s3/hf/https://s3.hf.co/synthetic-namespace/synthetic-bucket/risunest"
-    );
+    assert_eq!(hugging.connection_identity, "s3/synthetic-bucket/risunest");
+    // The endpoint and profile only say how to reach the bucket, so another
+    // address for the same bucket and prefix is the same repository.
+    for (profile, endpoint) in [
+        ("generic", "http://127.0.0.1:9/other-path"),
+        ("r2", "https://synthetic-account.r2.cloudflarestorage.com"),
+    ] {
+        assert_eq!(
+            context(profile, endpoint, None).connection_identity,
+            hugging.connection_identity
+        );
+    }
     assert_eq!(
         hugging.key("packs/pack-1").unwrap(),
         "risunest/packs/pack-1"
@@ -518,7 +526,7 @@ fn create_refuses_an_occupied_root_and_existing_requires_a_descriptor() {
             .unwrap();
         assert_eq!(
             handle.connection_identity,
-            format!("s3/r2/{}/{BUCKET}/{PREFIX}", server.url.as_str())
+            format!("s3/{BUCKET}/{PREFIX}")
         );
         assert_eq!(handle.repository_id, handle.connection_identity);
         assert!(reported.require(PublicationStrategy::Cas).is_ok());
@@ -1658,7 +1666,7 @@ fn a_foreign_handle_or_locator_never_reaches_the_service() {
         let mut sink = SpoolSink::create(&directory.path().join("body"), 64).unwrap();
 
         let foreign = RemoteLocator {
-            connection_identity: "s3/r2/https://other.invalid/other/root".into(),
+            connection_identity: "s3/other-bucket/root".into(),
             collection: None,
             object: "head".into(),
         };
@@ -1835,7 +1843,7 @@ fn deleting_addresses_one_key_folds_404_and_refuses_the_head_and_descriptors() {
             );
         }
         let foreign = RemoteLocator {
-            connection_identity: "s3/generic/https://other.invalid/other/root".into(),
+            connection_identity: "s3/other-bucket/root".into(),
             collection: Some("packs".into()),
             object: "packs/pack-1".into(),
         };
