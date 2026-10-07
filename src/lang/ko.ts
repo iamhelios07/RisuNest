@@ -2938,4 +2938,5 @@ export const languageKorean = {
         registrationRevoked: "서버에서 이 기기의 등록이 해제되어 동기화할 수 없습니다. 서버에서 이 기기를 새로 등록한 뒤 새 등록 코드를 입력하세요.",
         bindingIncomplete: "연결이 완료되지 않았습니다. 연결하고 동기화를 눌러 연결을 마치세요.",
     },
+    navigationBlockedWhileEditingPaused: "편집이 잠시 중단되어 캐릭터를 선택할 수 없습니다.",
 } satisfies DeepPartial<typeof import('./en').languageEnglish>

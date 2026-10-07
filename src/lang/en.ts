@@ -3126,6 +3126,7 @@ export const languageEnglish = {
         registrationRevoked: "This device's registration was removed on the server, so it cannot sync. Register this device again on the server, then enter the new registration code.",
         bindingIncomplete: "The connection was not completed. Press Connect and sync to finish it.",
     },
+    navigationBlockedWhileEditingPaused: "Editing is paused, so a character cannot be selected.",
 } satisfies I18nTranslation;
 
 type I18nTranslationFunction = (...args: any[]) => string;
