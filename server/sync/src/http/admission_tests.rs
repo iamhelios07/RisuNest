@@ -54,6 +54,7 @@ impl Fixture {
             .route("/held", get(held.clone()))
             .route("/uploads/progress", get(held.clone()))
             .route("/uploads/frames", post(held))
+            .route("/objects/{hash}/part", get(object_part))
             .route("/head", get(head))
             .route("/time", get(lww::time))
             .route("/ack", post(lww::ack))
@@ -543,4 +544,47 @@ async fn a_codec_job_keeps_its_permit_after_its_caller_is_gone() {
     assert_eq!(codecs.available_permits(), 3);
     finish.send(()).unwrap();
     until(|| codecs.available_permits() == 4).await;
+}
+
+#[tokio::test]
+async fn a_registration_revoked_during_a_codec_wait_cannot_run_after_it() {
+    let mut fixture = Fixture::new(4).await;
+    let store = fixture.app.store.clone();
+    let device = store
+        .authenticate(&fixture.library, &fixture.token)
+        .unwrap();
+    let part = b"synthetic part ".repeat(100);
+    let hash = risunest_sync_wire::hash(&part);
+    store.put_object(&device, &hash, &part).unwrap();
+    let encoded = body::encode("synthetic codec body ".repeat(512).as_bytes())
+        .unwrap()
+        .unwrap();
+    let held = fixture.app.codecs.clone().acquire_many_owned(4).await.unwrap();
+    let jobs = [
+        fixture.client.get(format!(
+            "{}/objects/{hash}/part?offset=0&length=10",
+            fixture.endpoint
+        )),
+        fixture
+            .client
+            .get(format!("{}/held", fixture.endpoint))
+            .header(body::ENCODING_HEADER, body::ZSTD)
+            .body(encoded),
+    ]
+    .map(|request| {
+        let request = request
+            .bearer_auth(&fixture.token)
+            .header("x-risu-library", &fixture.library);
+        tokio::spawn(async move { request.send().await.unwrap() })
+    });
+    let workload = fixture.app.workload.clone();
+    until(|| workload.status().unwrap().active_requests == 2).await;
+    // Let both requests pass the registration check that follows admission.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    store.revoke_device(&device.id).unwrap();
+    drop(held);
+    for job in jobs {
+        assert_eq!(job.await.unwrap().status(), 401);
+    }
+    assert!(fixture.entered.try_recv().is_err(), "the route ran for a revoked device");
 }

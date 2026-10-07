@@ -382,9 +382,17 @@ async fn decode_request(app: &App, request: Request) -> Result<Request> {
         return Ok(request);
     }
     let limit = raw_body_limit(request.uri().path());
+    let device = request
+        .extensions()
+        .get::<Device>()
+        .cloned()
+        .ok_or(Error::new("unauthorized", 401))?;
     let (mut parts, stream) = request.into_parts();
     let encoded = read_body(stream, limit).await?;
+    let store = app.store.clone();
     let raw = codec(app, move || {
+        // Registration can be revoked while a request waits for a codec permit.
+        store.require_registered(&device)?;
         body::decode(&encoded, limit).map_err(|error| match error.0 {
             "body-too-large" => Error::new("body-too-large", 413),
             _ => Error::new("invalid-body-encoding", 400),
@@ -624,6 +632,7 @@ struct PartQuery {
 /// be encoded, so its position travels in `x-risu-object-range`.
 async fn object_part(
     State(app): State<App>,
+    Extension(device): Extension<Device>,
     Path(digest): Path<String>,
     Query(PartQuery { offset, length }): Query<PartQuery>,
     headers: HeaderMap,
@@ -636,6 +645,7 @@ async fn object_part(
     // The raw part is in memory only under a codec permit.
     let (bytes, total, encoded) = codec(&app, move || {
         use std::io::{Read, Seek};
+        store.require_registered(&device)?;
         let (mut object, total) = store.open_object(&digest)?;
         if offset.checked_add(length).is_none_or(|end| end > total) {
             return Err(Error::new("invalid-object-range", 400));
