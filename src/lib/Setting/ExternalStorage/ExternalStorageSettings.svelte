@@ -859,7 +859,7 @@
                                                 <span class="item-time">{when(item.createdAtMs)}</span>
                                                 {#if item.pinned}<span class="kept"><PinIcon size={12} aria-hidden="true" />{strings.pinned}</span>{/if}
                                             </div>
-                                            {#if item.deviceName || item.storedBytes}<p class="item-meta">{[item.deviceName, item.storedBytes ? bytes(item.storedBytes) : undefined].filter(Boolean).join(' · ')}</p>{/if}
+                                            {#if item.sameDevice || item.storedBytes}<p class="item-meta">{[item.sameDevice ? strings.thisDevice : undefined, item.storedBytes ? bytes(item.storedBytes) : undefined].filter(Boolean).join(' · ')}</p>{/if}
                                             <div class="item-actions">
                                                 <SettingButton size="sm" variant="secondary" disabled={busy || (job && externalJobIsActive(job)) || !usable} onclick={() => beginRestore(connection, item)}>{strings.restore}</SettingButton>
                                                 <SettingButton size="sm" variant="quiet" disabled={busy || (job && externalJobIsActive(job)) || !usable} onclick={() => exportSnapshot(connection.id, item.snapshotId)}>{strings.download}</SettingButton>

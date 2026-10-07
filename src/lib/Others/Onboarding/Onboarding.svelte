@@ -1013,7 +1013,6 @@
                                                 />
                                                 <span class="pick-main">
                                                     <span class="when">{externalWhen(item.createdAtMs)}</span>
-                                                    {#if item.deviceName}<span class="device">{item.deviceName}</span>{/if}
                                                 </span>
                                                 <span class="dim">{externalSize(item.storedBytes)}</span>
                                             </label>
@@ -1986,11 +1985,6 @@
     }
     .pick .when {
         font-variant-numeric: tabular-nums;
-    }
-    .pick .device {
-        font-size: 12px;
-        color: var(--o-soft);
-        overflow-wrap: anywhere;
     }
     .found {
         display: grid;

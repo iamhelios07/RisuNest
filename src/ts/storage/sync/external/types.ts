@@ -293,7 +293,6 @@ export interface ExternalHistoryItem {
     includedSections: ExternalRestoreSection[]
     /** Whether these values are the ones this device wrote. */
     sameDevice: boolean
-    deviceName?: string
 }
 
 export interface ExternalHistoryDeletePreparation {

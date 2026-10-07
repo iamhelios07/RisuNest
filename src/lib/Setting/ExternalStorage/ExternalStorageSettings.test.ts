@@ -619,6 +619,19 @@ describe('the storage usage tab', () => {
         expect(target.textContent).toContain(strings.historyKinds['backup-point'])
     })
 
+    it('marks the backups this device made and nothing else', async () => {
+        const row = (id: string, sameDevice: boolean, kind = 'backup-point') => ({
+            id, snapshotId: id, kind, createdAtMs: '1', logicalRevision: '1', storedBytes: '6656', pinned: false,
+            complete: true, verified: true, includedSections: [], sameDevice,
+        })
+        state.listHistory.mockResolvedValue({ items: [row('own', true), row('other', false), row('state', false, 'snapshot')] })
+        const tab = [...target.querySelectorAll('button')].find(item => item.textContent?.trim() === strings.history)
+        tab?.click()
+        await settle()
+        const meta = [...target.querySelectorAll('.item-meta')].map(item => item.textContent)
+        expect(meta).toEqual([`${strings.thisDevice} · 6.5 KiB`, '6.5 KiB', '6.5 KiB'])
+    })
+
     it('sends a changed limit and leaves the other one alone', async () => {
         await openStorageUsage()
         const count = labelled(strings.retentionCount)
