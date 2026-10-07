@@ -2730,7 +2730,9 @@ export const languageEnglish = {
             exportFile: 'Export',
             groupRestore: 'Restore',
             restoreHelp:
-                "Restores from another app's backup. Snapshots kept on this device are restored from the snapshot list under Storage.",
+                'Restores data from an account sync conflict backup. Snapshots kept on this device are restored from the snapshot list under Storage.',
+            restoreHelpWeb:
+                'Restores data from a PocketRisu backup or an account sync conflict backup.',
             groupAccount: 'Official account',
             accountHelp:
                 'Uploads a backup to your RisuAI account or downloads it. Chat attachments are not included.',
