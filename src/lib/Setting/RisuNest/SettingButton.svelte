@@ -23,7 +23,7 @@
         primary: 'border-darkborderc bg-darkbutton font-medium text-textcolor shadow-xs hover:bg-selected',
         secondary: 'border-darkborderc bg-transparent text-textcolor shadow-xs hover:bg-selected',
         danger: 'danger bg-transparent shadow-xs',
-        quiet: 'border-transparent bg-transparent text-textcolor2 hover:bg-selected hover:text-textcolor',
+        quiet: 'quiet border-transparent bg-transparent enabled:hover:bg-selected',
     }
     const sizes = {
         md: 'gap-1.5 px-3 py-1.5 text-sm',
@@ -55,5 +55,16 @@
     }
     .danger:not(:disabled):hover {
         background: color-mix(in srgb, var(--risu-theme-danger-400) 12%, transparent);
+    }
+    /* Lifted toward the text color so an enabled quiet action reads as one, and faded further when disabled. */
+    .quiet {
+        color: color-mix(in srgb, var(--risu-theme-textcolor) 25%, var(--risu-theme-textcolor2));
+    }
+    .quiet:not(:disabled):hover {
+        color: var(--risu-theme-textcolor);
+    }
+    .quiet:disabled {
+        color: var(--risu-theme-textcolor2);
+        opacity: 0.45;
     }
 </style>
