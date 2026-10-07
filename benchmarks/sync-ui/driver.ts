@@ -35,7 +35,19 @@ async function until<T>(read: () => T | Promise<T>, timeoutMs: number, step: str
 export const redact = (text: string) => text.replace(/[A-Za-z0-9_+/=-]{32,}/g, "<redacted>").slice(0, 300);
 
 export class SyncDriver {
-  constructor(readonly phase: string, private readonly sink: SyncReport, private readonly show: (step: string) => void = () => {}) {}
+  private readonly errors: string[] = [];
+
+  constructor(readonly phase: string, private readonly sink: SyncReport, private readonly show: (step: string) => void = () => {}) {
+    // Errors the page logs are attached, redacted, to a failed step so it can be attributed.
+    const record = (values: unknown[]) => {
+      if (this.errors.length < 50)
+        this.errors.push(redact(values.map((value) => value instanceof Error ? `${value.name}: ${value.message}` : String(value)).join(" ")));
+    };
+    const original = console.error.bind(console);
+    console.error = (...values: unknown[]) => { record(values); original(...values); };
+    addEventListener("error", (event) => record([event.error ?? event.message]));
+    addEventListener("unhandledrejection", (event) => record(["unhandled rejection", event.reason]));
+  }
 
   async step<T extends Record<string, unknown>>(label: SyncLabel, name: string, run: () => Promise<T>): Promise<T> {
     this.show(name);
@@ -44,9 +56,11 @@ export class SyncDriver {
       await this.sink(`${label}:${name}`, { label, phase: this.phase, step: name, passed: true, ...result });
       return result;
     } catch (error) {
-      if (error instanceof SyncStepError) throw error;
-      throw new SyncStepError(label, name, error instanceof Error ? redact(error.message) : "failed",
-        { errorName: error instanceof Error ? error.name : typeof error });
+      const failure = error instanceof SyncStepError ? error
+        : new SyncStepError(label, name, error instanceof Error ? redact(error.message) : "failed",
+          { errorName: error instanceof Error ? error.name : typeof error });
+      failure.detail.consoleErrors = this.errors.slice(-8);
+      throw failure;
     }
   }
 
