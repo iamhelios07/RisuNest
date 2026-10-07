@@ -1,6 +1,6 @@
 # Linux native persistence benchmark
 
-Runs production persistence and regex adapters in an isolated Linux Tauri application with synthetic fixtures. It does not render the full chat UI or read installed application data.
+Runs production persistence and regex adapters, the product Svelte app with a synthetic character, and the streaming display suite in an isolated Linux Tauri application with synthetic fixtures. It does not read installed application data.
 
 On Ubuntu with the Tauri dependencies, `WebKitWebDriver`, `xvfb`, and `dbus-run-session` installed:
 
@@ -13,6 +13,8 @@ dbus-run-session -- xvfb-run -a python3 benchmarks/linux/run.py --binary "$CARGO
 node benchmarks/linux/summarize.mjs .tmp/linux-benchmark
 ```
 
-Use the repository's existing shared Cargo target. Reuse the same output directory for the restart phase.
+The `app`, `app-restart`, and `streaming` phases run the same way. `app` edits a message in the product chat and saves it, and `app-restart` reads it back after the process restarts.
+
+Use the repository's existing shared Cargo target. Reuse the same output directory for the restart phases.
 
 The runner creates and verifies its own XDG profile. Results include save latency, frame intervals, and sampled process-tree memory. They are Xvfb diagnostics, not physical Linux GPU, Wayland, IME, cold-start, or package compatibility evidence.
