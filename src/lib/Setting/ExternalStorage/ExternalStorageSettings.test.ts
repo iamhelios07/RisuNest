@@ -27,6 +27,7 @@ const state = vi.hoisted(() => ({
     removeConnection: vi.fn(),
     residency: vi.fn(),
     downloadRemote: vi.fn(),
+    binding: { target: { kind: 'none' } } as { target: { kind: string; connectionId?: string } },
 }))
 
 vi.mock('src/ts/platform', () => ({ isTauri: true, isTauriAndroid: false, isTauriIOS: false }))
@@ -36,7 +37,7 @@ vi.mock('qrcode', () => ({ default: { toDataURL: vi.fn() } }))
 vi.mock('src/ts/alert', () => ({ alertConfirm: vi.fn(), alertNormal: vi.fn(), alertCheckboxConfirm: vi.fn() }))
 vi.mock('src/ts/storage/sync/external/lwwProduction', () => ({ requestExternalLwwNow: state.syncNow, supportsExternalLwwNewDevice: () => state.remedy, subscribeExternalLwwFailures(callback: (value: ReadonlyMap<string, unknown>) => void) { callback(new Map(state.failures)); return () => {} } }))
 vi.mock('src/ts/storage/sync/bindingRegistry', () => ({ bindSyncTarget: state.bind, unbindSyncTarget: state.unbind }))
-vi.mock('src/ts/storage/sync/bindingNative', () => ({ createNativeSyncBindingBridge: () => ({ state: async () => ({ target: { kind: 'none' } }) }) }))
+vi.mock('src/ts/storage/sync/bindingNative', () => ({ createNativeSyncBindingBridge: () => ({ state: async () => state.binding }) }))
 vi.mock('src/lang', () => ({ language: { lwwSync: { newDeviceAction: 'Connect as new device', clockBlocked: 'Correct the device clock and retry.', previousStorageUnavailable: 'The previous storage could not be reached.', downloadFailedNotConnected: 'The files could not be downloaded, so the connection was not made.' } } }))
 vi.mock('src/ts/storage/sync/serverAssetResidency', () => ({ getAssetResidencyStatus: state.residency, downloadRemoteAssets: state.downloadRemote }))
 vi.mock('src/ts/stores.svelte' , () => ({ DBState: { db: { language: 'en' } } }))
@@ -79,8 +80,9 @@ import { alertConfirm, alertCheckboxConfirm } from 'src/ts/alert'
 import ExternalStorageSettings from './ExternalStorageSettings.svelte'
 import { requestExternalStorageNow, resumeExternalStorageJob, requestExternalStorageDeleteHistory, requestExternalStorageRestore, stopExternalStorageRestore } from 'src/ts/storage/sync/external/production'
 import { externalStorageStrings } from './strings'
+import { notifySyncBindingChanged } from 'src/ts/storage/sync/bindingChanges'
 
-beforeEach(() => { state.failures.clear(); state.remedy = true })
+beforeEach(() => { state.failures.clear(); state.remedy = true; state.binding = { target: { kind: 'none' } } })
 const strings = externalStorageStrings('en')
 let target: HTMLDivElement
 let component: ReturnType<typeof mount> | undefined
@@ -936,4 +938,92 @@ it('explains a connection not made because the files could not be downloaded fir
     expect(state.bind).toHaveBeenCalledWith({ kind: 'external', connectionId: 'connection-1' })
     expect(target.querySelector('[role="alert"]')?.textContent).toBe('The files could not be downloaded, so the connection was not made.')
     unmount(component); component = undefined; target.remove()
+})
+
+describe('the sync switch', () => {
+    const syncConnection = () => ({ ...connection(10, 30), purpose: 'sync' as const, strategy: 'sequential' as const })
+    const selection = (kind: 'none' | 'server' | 'external', connectionId?: string) => ({ kind, connectionId, selectionEpoch: '0', paused: false })
+    const view = (current: ReturnType<typeof selection>) => ({ supported: true, selection: current, connections: [syncConnection()], jobs: [] })
+    const toggle = () => [...target.querySelectorAll('label')].find(item => item.textContent?.trim() === strings.makeSyncTarget)!.querySelector('input')!
+    const drawnChecked = () => !!toggle().closest('label')!.querySelector('svg')
+    async function show(current: ReturnType<typeof selection>): Promise<void> {
+        state.getState.mockResolvedValue(view(current))
+        state.listHistory.mockResolvedValue({ items: [] })
+        target = document.createElement('div')
+        document.body.append(target)
+        component = mount(ExternalStorageSettings, { target })
+        await settle()
+    }
+    beforeEach(() => { vi.clearAllMocks(); state.bind.mockReset(); state.unbind.mockReset() })
+    afterEach(() => {
+        if (component) unmount(component)
+        component = undefined
+        target.remove()
+    })
+
+    it('shows the device sync target again after turning it on failed', async () => {
+        state.binding = { target: { kind: 'server', connectionId: 'server' } }
+        await show(selection('server', 'server'))
+        state.bind.mockRejectedValue({ kind: 'clockSkew' })
+        toggle().click(); await settle()
+        expect(state.bind).toHaveBeenCalledExactlyOnceWith({ kind: 'external', connectionId: 'connection-1' })
+        expect(toggle().checked).toBe(false)
+        expect(drawnChecked()).toBe(false)
+        expect(target.querySelector('[role="alert"]')?.textContent).toBe(strings.clockSkew)
+        toggle().click(); await settle()
+        expect(state.bind).toHaveBeenCalledTimes(2)
+        expect(state.unbind).not.toHaveBeenCalled()
+    })
+
+    it('stays off when the replacement is cancelled', async () => {
+        state.binding = { target: { kind: 'server', connectionId: 'server' } }
+        await show(selection('server', 'server'))
+        state.bind.mockResolvedValue({ kind: 'cancelled' })
+        toggle().click(); await settle()
+        expect(toggle().checked).toBe(false)
+        expect(drawnChecked()).toBe(false)
+        expect(target.querySelector('[role="alert"]')).toBeNull()
+        expect(state.unbind).not.toHaveBeenCalled()
+    })
+
+    it('turns on once the binding succeeds', async () => {
+        await show(selection('none'))
+        state.bind.mockImplementation(async () => {
+            state.getState.mockResolvedValue(view(selection('external', 'connection-1')))
+            return { kind: 'bound' }
+        })
+        toggle().click(); await settle()
+        expect(toggle().checked).toBe(true)
+        expect(drawnChecked()).toBe(true)
+    })
+
+    it('leaves another sync target alone when a switch drawn from an older state is turned off', async () => {
+        await show(selection('external', 'connection-1'))
+        expect(toggle().checked).toBe(true)
+        state.binding = { target: { kind: 'server', connectionId: 'server' } }
+        state.getState.mockResolvedValue(view(selection('server', 'server')))
+        toggle().click(); await settle()
+        expect(state.unbind).not.toHaveBeenCalled()
+        expect(toggle().checked).toBe(false)
+        expect(drawnChecked()).toBe(false)
+    })
+
+    it('stops sync with this repository when it is the sync target', async () => {
+        state.binding = { target: { kind: 'external', connectionId: 'connection-1' } }
+        await show(selection('external', 'connection-1'))
+        state.unbind.mockImplementation(async () => { state.getState.mockResolvedValue(view(selection('none'))) })
+        toggle().click(); await settle()
+        expect(state.unbind).toHaveBeenCalledOnce()
+        expect(toggle().checked).toBe(false)
+    })
+
+    it('shows a sync target chosen elsewhere without reopening settings', async () => {
+        await show(selection('external', 'connection-1'))
+        expect(toggle().checked).toBe(true)
+        state.getState.mockResolvedValue(view(selection('server', 'server')))
+        notifySyncBindingChanged(); await settle()
+        expect(toggle().checked).toBe(false)
+        expect(drawnChecked()).toBe(false)
+        expect([...target.querySelectorAll('button')].some(button => button.textContent?.trim() === strings.runSync)).toBe(false)
+    })
 })

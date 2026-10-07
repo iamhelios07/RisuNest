@@ -16,6 +16,7 @@
     import { getExternalStorageBridge } from 'src/ts/storage/sync/external/bridge'
     import { bindSyncTarget, unbindSyncTarget } from 'src/ts/storage/sync/bindingRegistry'
     import { createNativeSyncBindingBridge } from 'src/ts/storage/sync/bindingNative'
+    import { subscribeSyncBindingChanges } from 'src/ts/storage/sync/bindingChanges'
     import { requestExternalLwwNow, subscribeExternalLwwFailures, supportsExternalLwwNewDevice } from 'src/ts/storage/sync/external/lwwProduction'
     import BindingTargetSwitch from 'src/ts/storage/sync/BindingTargetSwitch.svelte'
     import { PREVIOUS_FILES_DOWNLOAD_FAILED } from 'src/ts/storage/sync/bindingFlow'
@@ -85,18 +86,30 @@
     /** Jobs that add or change history rows, by job ID, so the open history reloads when they finish. */
     const historyJobs = new Map<string, string>()
     let pollTimer: ReturnType<typeof setTimeout> | undefined
+    /** The state a sync switch was set to while its change runs. Otherwise it shows the device's sync target. */
+    let syncRequest = $state<Record<string, boolean>>({})
+    let stopBindingChanges: (() => void) | undefined
 
     async function setSyncBinding(connection: ExternalConnectionSummary, enabled: boolean): Promise<void> {
         busy = true
+        syncRequest[connection.id] = enabled
         try {
             if (enabled) await bindSyncTarget({ kind: 'external', connectionId: connection.id })
-            else await unbindSyncTarget()
+            else {
+                // A switch left over from an older state must not stop another sync target.
+                const current = (await createNativeSyncBindingBridge().state()).target
+                if (current.kind === 'external' && current.connectionId === connection.id) await unbindSyncTarget()
+            }
             await refreshExternalStorageProductionState()
-            await refresh()
+            error = ''
         } catch (reason) {
             error = externalErrorKind(reason) === PREVIOUS_FILES_DOWNLOAD_FAILED ? language.lwwSync.downloadFailedNotConnected : externalErrorMessage(strings, reason)
         }
-        finally { busy = false }
+        finally {
+            await refresh(true)
+            delete syncRequest[connection.id]
+            busy = false
+        }
     }
     async function syncNow(connection: ExternalConnectionSummary): Promise<void> {
         busy = true
@@ -696,6 +709,7 @@
 
     onMount(async () => {
         stopSyncFailures = subscribeExternalLwwFailures(value => syncFailures = value)
+        stopBindingChanges = subscribeSyncBindingChanges(() => { if (!destroyed) void refresh(true) })
         try {
             const stop = await bridge.onJobStarted(() => {
                 if (destroyed) return
@@ -714,6 +728,7 @@
         clearTimeout(pollTimer)
         stopJobEvents?.()
         stopSyncFailures?.()
+        stopBindingChanges?.()
         if (exportRun) void bridge.cancelExport(exportRun.id).catch(() => {})
     })
 </script>
@@ -808,7 +823,7 @@
                     {#if connection.purpose === 'backup'}
                         <SettingToggle showLabel label={strings.automaticBackup} disabled={busy} checked={!connection.automaticBackupPaused} onchange={enabled => setAutomaticWork(connection, enabled)} />
                     {:else}
-                        <SettingToggle showLabel label={strings.makeSyncTarget} disabled={busy} checked={syncTarget} onchange={enabled => setSyncBinding(connection, enabled)} />
+                        <SettingToggle showLabel label={strings.makeSyncTarget} disabled={busy} checked={syncRequest[connection.id] ?? syncTarget} onchange={enabled => setSyncBinding(connection, enabled)} />
                     {/if}
                     <div class="actions">
                         {#if renewable}<SettingButton disabled={busy} onclick={() => renewalConnection = connection}>{strings.renew}</SettingButton>{/if}
