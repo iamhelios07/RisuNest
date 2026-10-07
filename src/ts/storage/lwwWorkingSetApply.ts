@@ -6,6 +6,7 @@ import type { PersistentRevisionReader, PersistentRoot } from './persistentDataS
 import { canonicalClone, canonicalJson, clonePersistentRootFields } from './saveCoordinatorHelpers'
 import { captureMaterializedCharacter, CHARACTER_SHARED_FIELDS, CONVERSATION_SHARED_FIELDS } from './persistentUnitCapture'
 import { isWorkingSetCharacterStub, patchCatalogCharacterField } from './workingSetCatalog'
+import { defineOwnEnumerableProperty } from './ownEnumerableProperty'
 
 type CompleteCharacter = character
 
@@ -27,7 +28,9 @@ function patchField(live: object, baseline: object, remote: object, field: strin
     const unchanged = canonicalJson({ value: current[field] }) === canonicalJson({ value: before[field] })
     const write = (value: Record<string, unknown>) => {
         if (!Object.hasOwn(next, field)) delete value[field]
-        else Object.defineProperty(value, field, { value: canonicalClone(next[field]), enumerable: true, configurable: true, writable: true })
+        // Only assignment makes a state proxy report a new key to cached captures.
+        else if (field === '__proto__') defineOwnEnumerableProperty(value, field, canonicalClone(next[field]))
+        else value[field] = canonicalClone(next[field])
     }
     if (unchanged) write(current)
     write(before)

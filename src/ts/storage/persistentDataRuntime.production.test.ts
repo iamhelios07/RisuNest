@@ -1406,3 +1406,54 @@ describe('received record deletions', () => {
         expect(saveFailures).toEqual([])
     })
 })
+
+describe('received fields the working set did not have', () => {
+    async function fieldRuntime() {
+        const initial = normalizeDatabaseDefaults({} as Database)
+        const preset = initial.botPresets[0]
+        initial.botPresets = [{...structuredClone(preset), id: 'preset-selected', name: 'Selected'}, {...structuredClone(preset), id: 'preset-other', name: 'Other'}]
+        delete initial.botPresets[1].globalNote
+        initial.botPresetsId = 0
+        const persona = {id: 'persona-selected', name: 'Selected', icon: '', personaPrompt: '', note: ''}
+        initial.personas = [persona, {...persona, id: 'persona-other', name: 'Other'}]
+        initial.selectedPersona = 0
+        const store = new IndexedDbPersistentDataStore(`received-new-fields-${crypto.randomUUID()}`, new IDBFactory(), IDBKeyRange) as PersistentDataStore
+        await store.open()
+        await store.replaceFromDatabase(initial)
+        setDatabase(structuredClone(initial))
+        selectedCharID.set(-1)
+        const saveFailures: unknown[] = []
+        const runtime = createPersistentDataRuntime({store, state: createProductionStateAdapter(), prepareDatabase: async (value) => value,
+            onLocalSaveFailure: (error) => { if (error !== null) saveFailures.push(error) }})
+        await runtime.initializeActiveWorkingSet(getDatabase())
+        // A save reads every capture once, as the app does before any receive.
+        getDatabase().classicMaxWidth = true
+        await runtime.flushPendingDataLocally('received-new-fields-settle')
+        return {store, runtime, saveFailures}
+    }
+
+    it.each([
+        ['persona-selected', '["persona","persona-selected","largePortrait"]', true],
+        ['persona-other', '["persona","persona-other","largePortrait"]', true],
+        ['preset-other', '["preset","preset-other","globalNote"]', 'Received note'],
+    ] as const)('keeps a field %s received for the first time', async (id, key, value) => {
+        const {store, runtime, saveFailures} = await fieldRuntime()
+        const field = JSON.parse(key)[2] as string
+        const live = () => (id.startsWith('persona') ? getDatabase().personas : getDatabase().botPresets).find((item) => item.id === id) as unknown as Record<string, unknown>
+        expect(live()).not.toHaveProperty(field)
+        await receiveCommit(store, runtime, {unitMutations: [{key, type: 'set', value}]}, [key])
+
+        expect(live()[field]).toEqual(value)
+        const commit = vi.spyOn(store, 'commit')
+        getDatabase().classicMaxWidth = false
+        await runtime.flushPendingDataLocally('after-received-new-field')
+        expect(commit).toHaveBeenCalledOnce()
+        expect(commit.mock.calls[0][0].unitMutations ?? []).toEqual([])
+        expect(commit.mock.calls[0][0].rootMutations).toEqual([{type: 'set', key: 'classicMaxWidth', value: false}])
+        const stored = id.startsWith('persona')
+            ? (await store.readRoot()).value.personas!.find((item) => item.id === id) as unknown as Record<string, unknown>
+            : (await store.readPreset(id))!.value as unknown as Record<string, unknown>
+        expect(stored[field]).toEqual(value)
+        expect(saveFailures).toEqual([])
+    })
+})
