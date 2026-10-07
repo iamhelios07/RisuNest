@@ -1039,6 +1039,37 @@ pub(super) mod tests {
         pending
     }
 
+    /// A data root of `length` characters, as a user name of a different
+    /// length would make it.
+    pub(crate) fn padded_root(base:&Path,length:usize)->std::path::PathBuf {
+        let label=length.to_string();
+        let used=base.to_string_lossy().chars().count()+1+label.len();
+        let root=base.join(format!("{label}{}","r".repeat(length.saturating_sub(used))));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// Both databases sit below the job directory, where Windows still limits
+    /// the path SQLite opens to MAX_PATH.
+    #[test]
+    fn restore_staging_and_transfer_receipts_open_below_a_long_data_root() {
+        let base=tempfile::tempdir().unwrap();
+        for length in [47,90] {
+            let root=padded_root(base.path(),length);
+            let input=serde_json::from_value(json!({"connectionId":"synthetic-connection","kind":"restore","snapshotId":"synthetic-snapshot","targetRevision":"0"})).unwrap();
+            let job=DurableJob::new(input,1,identity());
+            let staging=staging_directory(&root,&job).join("external-storage");
+            let mut content=super::super::content_store::ContentStore::open(&staging).expect("open restore staging below a long root");
+            content.put(&hex::encode(risunest_external_storage_format::content_identity::hash(b"synthetic")),b"synthetic").unwrap();
+            content.commit().unwrap();
+            super::super::journal::TransferJournal::open(&runtime::job_directory(&root,&job.request.connection_id,&job.id),
+                super::super::journal::JobIdentity{job_id:job.id.clone(),connection_id:job.request.connection_id.clone(),
+                    repository_id:"synthetic-repository".into(),capture_id:"synthetic-capture".into(),capture:identity()})
+                .expect("open transfer receipts below a long root")
+                .record_parent(&[]).expect("record the parent below a long root");
+        }
+    }
+
     #[test]
     fn renderer_adoption_accepts_exact_durable_restore_and_refuses_another_generation() {
         let root=tempfile::tempdir().unwrap();
