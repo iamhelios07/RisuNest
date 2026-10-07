@@ -8,7 +8,9 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
@@ -432,6 +434,18 @@ class MainActivityBehaviorTest {
     assertEquals(904, resolveWebViewBottomMargin(Build.VERSION_CODES.Q, margins, imeBottom = 904))
     assertEquals(126, resolveWebViewBottomMargin(Build.VERSION_CODES.R, margins, imeBottom = 904))
     assertEquals(126, resolveWebViewBottomMargin(36, margins, imeBottom = 904))
+  }
+
+  @Test
+  fun `root back is offered to the page as a cancelable event`() {
+    val script = rootBackScript()
+
+    assertTrue(script.contains("new Event('risunest-root-back',{cancelable:true})"))
+    assertTrue(script.contains("window.dispatchEvent(e);return e.defaultPrevented"))
+    assertTrue(pageUsedRootBack("true"))
+    assertFalse(pageUsedRootBack("false"))
+    assertFalse(pageUsedRootBack("null"))
+    assertFalse(pageUsedRootBack(null))
   }
 
   @Test

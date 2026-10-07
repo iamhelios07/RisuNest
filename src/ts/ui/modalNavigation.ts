@@ -82,7 +82,9 @@ function navigationLayer(node: HTMLElement, initial: NavigationOptions, trapFocu
         live.delete(token)
         token = null
         scheduleCleanup()
-        if (opener?.isConnected) opener.focus()
+        // Focus the user already moved elsewhere, such as a text field tapped to close a menu, stays there.
+        const focused = document.activeElement
+        if (opener?.isConnected && (!focused || focused === document.body || node.contains(focused))) opener.focus()
     }
     window.addEventListener('popstate', closeOnBack)
     window.addEventListener('keydown', keydown, true)
@@ -100,6 +102,14 @@ function navigationLayer(node: HTMLElement, initial: NavigationOptions, trapFocu
             deactivate()
         },
     }
+}
+
+/**
+ * Android Back with no history entry left. A dialog shown outside every layer is cancelled instead
+ * of leaving the app, except RisuNest's own terms, where a refusal only reloads the same dialog.
+ */
+export function cancelAlertOnRootBack(event: Event) {
+    if (get(alertStore).type !== 'tos' && cancelVisibleAlert()) event.preventDefault()
 }
 
 /** Menus participate in Back and Escape without trapping keyboard focus. */

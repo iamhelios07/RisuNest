@@ -47,6 +47,8 @@ import kotlinx.coroutines.withContext
 
 private const val EXIT_CONFIRMATION_WINDOW_MILLIS = 2_000L
 private const val EXIT_FLUSH_TIMEOUT_MILLIS = 1_500L
+private const val ROOT_BACK_EVENT = "risunest-root-back"
+private const val ROOT_BACK_REPLY_TIMEOUT_MILLIS = 1_000L
 private const val NATIVE_LIFECYCLE_EVENT = "risu-native-lifecycle"
 private const val OPENED_FILES_EVENT = "risu-opened-files"
 private const val STOP_REASON = "stop"
@@ -194,6 +196,13 @@ internal fun keyboardResizesWebView(sdkInt: Int) = sdkInt < Build.VERSION_CODES.
 
 internal fun resolveWebViewBottomMargin(sdkInt: Int, margins: WebViewMargins, imeBottom: Int) =
   if (keyboardResizesWebView(sdkInt)) maxOf(margins.bottom, imeBottom) else margins.bottom
+
+/** Offers a Back with no history entry left to the page; the page answers true when it used it. */
+internal fun rootBackScript() =
+  "(function(){var e=new Event('$ROOT_BACK_EVENT',{cancelable:true});" +
+    "window.dispatchEvent(e);return e.defaultPrevented})()"
+
+internal fun pageUsedRootBack(reply: String?) = reply == "true"
 
 internal enum class BackNavigationAction {
   GO_BACK,
@@ -801,21 +810,40 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       object : OnBackPressedCallback(true) {
         override fun handleOnBackPressed() {
           if (lifecycleWebView !== webView) return
-          when (backNavigationPolicy.decide(webView.canGoBack(), SystemClock.elapsedRealtime())) {
-            BackNavigationAction.GO_BACK -> webView.goBack()
-            BackNavigationAction.SHOW_EXIT_HINT -> {
-              dispatchLifecycleFlush(EXIT_REASON)
-              Toast.makeText(
-                this@MainActivity,
-                R.string.press_back_again_to_exit,
-                Toast.LENGTH_SHORT,
-              ).show()
-            }
-            BackNavigationAction.EXIT -> requestExitFlushThenFinish()
+          val pressedAt = SystemClock.elapsedRealtime()
+          if (webView.canGoBack()) {
+            navigateBack(webView, canGoBack = true, pressedAt)
+            return
           }
+          // A dialog shown outside every navigation layer has no history entry, so the page
+          // gets this Back first. A page that does not answer leaves the exit policy in charge.
+          var answered = false
+          val answer = { used: Boolean ->
+            if (!answered && lifecycleWebView === webView) {
+              answered = true
+              if (!used) navigateBack(webView, canGoBack = false, pressedAt)
+            }
+          }
+          mainHandler.postDelayed({ answer(false) }, ROOT_BACK_REPLY_TIMEOUT_MILLIS)
+          webView.evaluateJavascript(rootBackScript()) { reply -> answer(pageUsedRootBack(reply)) }
         }
       },
     )
+  }
+
+  private fun navigateBack(webView: WebView, canGoBack: Boolean, pressedAt: Long) {
+    when (backNavigationPolicy.decide(canGoBack, pressedAt)) {
+      BackNavigationAction.GO_BACK -> webView.goBack()
+      BackNavigationAction.SHOW_EXIT_HINT -> {
+        dispatchLifecycleFlush(EXIT_REASON)
+        Toast.makeText(
+          this,
+          R.string.press_back_again_to_exit,
+          Toast.LENGTH_SHORT,
+        ).show()
+      }
+      BackNavigationAction.EXIT -> requestExitFlushThenFinish()
+    }
   }
 
 
