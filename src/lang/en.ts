@@ -2595,6 +2595,7 @@ export const languageEnglish = {
         dataHealth: {
             saveFailed: 'The report could not be saved. Try another location.',
             loadFailed: "Could not load the data check.",
+            outdated: 'The data changed after this check. Check again.',
             openFailed: "Could not open the database.",
             repairFailed: "Could not repair the data. Try again.",
             undoFailed: "Could not undo the changes. Try again.",

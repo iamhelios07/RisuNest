@@ -2410,6 +2410,7 @@ export const languageKorean = {
         dataHealth: {
             saveFailed: '결과를 저장하지 못했습니다. 다른 위치를 선택해주세요.',
             loadFailed: "데이터 점검 결과를 불러오지 못했습니다.",
+            outdated: '검사한 뒤 데이터가 바뀌었습니다. 다시 검사해주세요.',
             openFailed: "DB를 열지 못했습니다.",
             repairFailed: "데이터를 수정하지 못했습니다. 다시 시도해주세요.",
             undoFailed: "되돌리지 못했습니다. 다시 시도해주세요.",
