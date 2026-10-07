@@ -224,6 +224,43 @@ describe('the storage usage tab', () => {
         expect([...target.querySelectorAll('button')].some(button => button.textContent?.trim() === strings.retryAction)).toBe(true)
     })
 
+    it('clears a background poll failure once a later poll succeeds', async () => {
+        vi.useFakeTimers()
+        try {
+            const running = { id: 'job', connectionId: 'connection-1', kind: 'backup', state: 'running', phase: 'upload',
+                completedBytes: '4', totalBytes: '10', completedItems: '1', startedAtMs: '1', updatedAtMs: '1' }
+            state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0' },
+                connections: [connection(10, 30)], jobs: [running] })
+            state.jobStarted?.()
+            await settle()
+            const alerts = () => [...target.querySelectorAll('[role="alert"]')].map(item => item.textContent)
+            state.getState.mockRejectedValueOnce({ kind: 'transient', httpStatus: null, retryAtMs: null })
+            await vi.advanceTimersByTimeAsync(1_200)
+            await settle()
+            expect(alerts()).toEqual([strings.retry])
+            await vi.advanceTimersByTimeAsync(1_200)
+            await settle()
+            expect(alerts()).toEqual([])
+            expect(target.textContent).toContain(strings.jobActive.backup)
+        } finally { vi.useRealTimers() }
+    })
+
+    it('keeps an action failure through background refreshes', async () => {
+        vi.mocked(requestExternalStorageNow).mockResolvedValue({ kind: 'blocked', reason: 'preconditionFailed', cause: { kind: 'preconditionFailed' } })
+        const backup = [...target.querySelectorAll('button')].find(button => button.textContent?.trim() === strings.runBackup)!
+        backup.click()
+        await settle()
+        const alerts = () => [...target.querySelectorAll('[role="alert"]')].map(item => item.textContent)
+        expect(alerts()).toEqual([strings.stateChanged])
+        state.getState.mockRejectedValueOnce({ kind: 'transient', httpStatus: null, retryAtMs: null })
+        state.jobStarted?.()
+        await settle()
+        expect(alerts()).toEqual([strings.stateChanged])
+        state.jobStarted?.()
+        await settle()
+        expect(alerts()).toEqual([strings.stateChanged])
+    })
+
     it('retries the retained automatic operation and persists its pause choice', async () => {
         const job = { id: 'retained', connectionId: 'connection-1', kind: 'backup', state: 'waiting', phase: 'paused',
             reason: 'automatic', targetRevision: '8', completedBytes: '0', completedItems: '0', startedAtMs: '1', updatedAtMs: '1',

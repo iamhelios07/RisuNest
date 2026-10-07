@@ -62,6 +62,8 @@
     /** Which action is running, so only the button that started it shows a spinner. */
     let activeAction = $state('')
     let error = $state('')
+    /** A failed background refresh, which the next successful refresh clears. */
+    let pollError = $state('')
     let expanded = $state<Record<string, 'history' | 'quota' | ''>>({})
     let history = $state<Record<string, ExternalHistoryItem[]>>({})
     let historyCursor = $state<Record<string, string | undefined>>({})
@@ -139,8 +141,10 @@
                 }
             }
             if (!silent) error = ''
+            pollError = ''
         } catch (reason) {
-            error = externalErrorMessage(strings, reason)
+            if (silent) pollError = externalErrorMessage(strings, reason)
+            else error = externalErrorMessage(strings, reason)
         } finally {
             if (!silent) {
                 busy = false
@@ -889,7 +893,7 @@
             </article>
         {/each}
     {/if}
-    {#if error}<p class="px-4 py-3 text-sm text-danger-400" role="alert">{error}</p>{/if}
+    {#if error || pollError}<p class="px-4 py-3 text-sm text-danger-400" role="alert">{error || pollError}</p>{/if}
 </SettingGroup>
 
 {#if recoveryKey}
