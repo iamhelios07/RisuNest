@@ -1989,4 +1989,43 @@ pub(super) mod tests {
             assert!(!publishes_under_deleted_id(&store));
         });
     }
+
+    /// Adds a character without conversations, in the trash when `trash_time` is given.
+    fn add_character(store:&mut PersistentStore,id:&str,trash_time:Option<i64>) {
+        let mut character=json!({"chaId":id,"type":"character","name":"Synthetic","chats":[]});
+        if let Some(time)=trash_time {character["trashTime"]=json!(time);}
+        store.commit(&crate::persistent_store::WorkingSetCommit{expected_revision:store.revision().unwrap(),
+            add_character:Some(character),..Default::default()}).unwrap();
+    }
+
+    #[test]
+    fn a_restore_keeps_trashed_characters_out_of_the_character_order() {
+        const LIVE:&str="synthetic-live";
+        const LISTED:&str="synthetic-trashed-listed";
+        const UNLISTED:&str="synthetic-trashed-unlisted";
+        run(async {
+            let directory=tempfile::tempdir().unwrap();
+            let root=directory.path();
+            let mut store=PersistentStore::open(root).unwrap();
+            add_character(&mut store,LIVE,None);
+            add_character(&mut store,LISTED,Some(1));
+            add_character(&mut store,UNLISTED,Some(2));
+            store.commit(&crate::persistent_store::WorkingSetCommit{expected_revision:store.revision().unwrap(),
+                unit_mutations:Some(vec![crate::persistent_store::lww::UnitMutation::Set{key:unit_key(&["order","characters"]),value:json!([LIVE,LISTED])}]),
+                ..Default::default()}).unwrap();
+            let backup=uploaded_backup(&mut store,Vec::new()).await;
+            delete_existence(&mut store,&[&["exists","character",LISTED],&["exists","character",UNLISTED]]);
+
+            restore_over(root,&mut store,&backup).await.unwrap();
+
+            let database=store.materialize(None).unwrap();
+            assert_eq!(database["characterOrder"],json!([LIVE]));
+            let characters=database["characters"].as_array().unwrap();
+            assert_eq!(characters.len(),3);
+            for character in characters.iter().filter(|character| character["chaId"]!=LIVE) {
+                assert!(![LISTED,UNLISTED].contains(&character["chaId"].as_str().unwrap()));
+                assert!(character["trashTime"].is_i64());
+            }
+        });
+    }
 }
