@@ -213,6 +213,35 @@ describe('choosing a service', () => {
         expect(named).toHaveLength(1)
         expect(named[0].closest('label')?.querySelector('select')).not.toBeNull()
     })
+
+    it('warns about the hidden app data space only while it is the chosen Google Drive location', async () => {
+        component = mount(ConnectionForm, { target, props: { strings, onconnected: vi.fn(), oncancel: vi.fn() } })
+        await settle()
+        const google = strings.providers.google_drive
+        const space = labelControl<HTMLSelectElement>(strings.fields['google_drive.space'])
+        expect(space.value).toBe('drive')
+        expect(target.textContent).not.toContain(google.warningTitle)
+        expect(target.textContent).not.toContain(google.warning)
+
+        space.value = 'appDataFolder'
+        space.dispatchEvent(new Event('change', { bubbles: true }))
+        await settle()
+        expect(target.textContent).toContain(google.warningTitle)
+        expect(target.textContent).toContain(google.warning)
+
+        const visible = labelControl<HTMLSelectElement>(strings.fields['google_drive.space'])
+        visible.value = 'drive'
+        visible.dispatchEvent(new Event('change', { bubbles: true }))
+        await settle()
+        expect(target.textContent).not.toContain(google.warningTitle)
+    })
+
+    it('keeps the GitLab cleanup policy warning for every GitLab connection', async () => {
+        component = mount(ConnectionForm, { target, props: { strings, onconnected: vi.fn(), oncancel: vi.fn() } })
+        await settle()
+        await selectProvider('gitlab_packages')
+        expect(target.textContent).toContain(strings.providers.gitlab_packages.warningTitle)
+    })
 })
 
 describe('opening an existing repository', () => {
