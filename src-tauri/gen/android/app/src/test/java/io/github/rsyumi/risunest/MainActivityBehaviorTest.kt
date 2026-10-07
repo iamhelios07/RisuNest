@@ -1,6 +1,7 @@
 package io.github.rsyumi.risunest
 
 import android.content.ComponentCallbacks2
+import android.os.Build
 import androidx.core.view.WindowInsetsCompat
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -420,6 +421,17 @@ class MainActivityBehaviorTest {
   @Test
   fun `keyboard inset remains available to the web view`() {
     assertEquals(0, nativeMarginInsetTypes() and WindowInsetsCompat.Type.ime())
+  }
+
+  @Test
+  fun `keyboard shrinks the web view only before Android 11`() {
+    val margins = WebViewMargins(left = 0, top = 24, right = 0, bottom = 126)
+
+    assertEquals(126, resolveWebViewBottomMargin(Build.VERSION_CODES.P, margins, imeBottom = 0))
+    assertEquals(904, resolveWebViewBottomMargin(Build.VERSION_CODES.P, margins, imeBottom = 904))
+    assertEquals(904, resolveWebViewBottomMargin(Build.VERSION_CODES.Q, margins, imeBottom = 904))
+    assertEquals(126, resolveWebViewBottomMargin(Build.VERSION_CODES.R, margins, imeBottom = 904))
+    assertEquals(126, resolveWebViewBottomMargin(36, margins, imeBottom = 904))
   }
 
   @Test

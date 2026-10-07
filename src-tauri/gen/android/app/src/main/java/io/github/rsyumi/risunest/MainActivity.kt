@@ -15,6 +15,7 @@ import android.provider.Settings
 import android.provider.OpenableColumns
 import android.util.Log
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.webkit.WebView
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
@@ -184,6 +185,15 @@ internal fun resolveWebViewMargins(
 
 internal fun nativeMarginInsetTypes() = WindowInsetsCompat.Type.systemBars() or
   WindowInsetsCompat.Type.displayCutout()
+
+/**
+ * Before Android 11 the web view never learns the keyboard height from insets, so the keyboard
+ * shrinks the web view itself there. Later versions leave the keyboard inset to the web view.
+ */
+internal fun keyboardResizesWebView(sdkInt: Int) = sdkInt < Build.VERSION_CODES.R
+
+internal fun resolveWebViewBottomMargin(sdkInt: Int, margins: WebViewMargins, imeBottom: Int) =
+  if (keyboardResizesWebView(sdkInt)) maxOf(margins.bottom, imeBottom) else margins.bottom
 
 internal enum class BackNavigationAction {
   GO_BACK,
@@ -691,6 +701,11 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
         }
     }
     enableEdgeToEdge()
+    // adjustNothing reports no keyboard insets before Android 11; adjustResize reports them
+    // without resizing the edge-to-edge window.
+    if (keyboardResizesWebView(Build.VERSION.SDK_INT)) {
+      window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+    }
     // super.onCreate starts the native app, which may connect right away.
     PlatformTls.initialize(applicationContext)
     super.onCreate(savedInstanceState)
@@ -760,6 +775,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       val handledInsetTypes = nativeMarginInsetTypes()
       val systemBars = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars())
       val displayCutout = windowInsets.getInsets(WindowInsetsCompat.Type.displayCutout())
+      val ime = windowInsets.getInsets(WindowInsetsCompat.Type.ime())
       val margins = resolveWebViewMargins(
         systemBars = WebViewMargins(systemBars.left, systemBars.top, systemBars.right, systemBars.bottom),
         displayCutout = WebViewMargins(
@@ -773,7 +789,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
         leftMargin = margins.left
         topMargin = margins.top
         rightMargin = margins.right
-        bottomMargin = margins.bottom
+        bottomMargin = resolveWebViewBottomMargin(Build.VERSION.SDK_INT, margins, ime.bottom)
       }
       WindowInsetsCompat.Builder(windowInsets)
         .setInsets(handledInsetTypes, Insets.NONE)
