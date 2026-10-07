@@ -13,6 +13,8 @@ vi.mock('../parser/parser.svelte', () => ({
 }))
 const displaySettings = vi.hoisted(() => ({ apply: vi.fn(async () => undefined) }))
 vi.mock('../gui/receivedDisplaySettings', () => ({ applyReceivedDisplaySettings: displaySettings.apply }))
+const pluginRuntime = vi.hoisted(() => ({ load: vi.fn(async () => undefined) }))
+vi.mock('../plugins/plugins.svelte', async (importOriginal) => ({ ...await importOriginal<typeof import('../plugins/plugins.svelte')>(), loadPlugins: pluginRuntime.load }))
 import { selectedCharID } from '../stores.svelte'
 import { doingChat } from '../process/generationState'
 import { getRuntimePerformanceBudgets } from '../runtimePerformanceProfile'
@@ -1455,5 +1457,74 @@ describe('received fields the working set did not have', () => {
             : (await store.readPreset(id))!.value as unknown as Record<string, unknown>
         expect(stored[field]).toEqual(value)
         expect(saveFailures).toEqual([])
+    })
+})
+
+describe('received plugin records', () => {
+    const plugin = (name: string, extra: Record<string, unknown> = {}) => ({name, displayName: name, script: `// ${name}`,
+        arguments: {limit: 'int'}, realArg: {limit: 1}, version: '3.0', customLink: [], argMeta: {}, enabled: true, ...extra})
+    const record = (name: string, value?: ReturnType<typeof plugin>): PersistentUnitMutation =>
+        value ? {key: JSON.stringify(['record', 'plugins', name]), type: 'set', value} : {key: JSON.stringify(['record', 'plugins', name]), type: 'delete'}
+
+    async function pluginHarness() {
+        const initial = normalizeDatabaseDefaults({} as Database)
+        initial.botPresets[0].id = 'preset'
+        initial.personas[0].id = 'persona'
+        initial.plugins = [plugin('plugin-a'), plugin('plugin-b')] as unknown as Database['plugins']
+        const store = new IndexedDbPersistentDataStore(`received-plugins-${crypto.randomUUID()}`, new IDBFactory(), IDBKeyRange) as PersistentDataStore
+        await store.open()
+        await store.replaceFromDatabase(initial)
+        setDatabase(structuredClone(initial))
+        selectedCharID.set(-1)
+        const runtime = createPersistentDataRuntime({store, state: createProductionStateAdapter(), prepareDatabase: async (value) => value})
+        await runtime.initializeActiveWorkingSet(getDatabase())
+        await runtime.flushPendingDataLocally('received-plugins-settle')
+        pluginRuntime.load.mockClear()
+        return {store, runtime}
+    }
+
+    it.each([
+        ['an added plugin', [record('plugin-c', plugin('plugin-c'))], ['plugin-a', 'plugin-b', 'plugin-c']],
+        ['a removed plugin', [record('plugin-b')], ['plugin-a']],
+        ['a disabled plugin', [record('plugin-a', plugin('plugin-a', {enabled: false}))], ['plugin-a', 'plugin-b']],
+        ['a changed script', [record('plugin-a', plugin('plugin-a', {script: '// changed'}))], ['plugin-a', 'plugin-b']],
+        ['a changed API version', [record('plugin-a', plugin('plugin-a', {version: '2.1'}))], ['plugin-a', 'plugin-b']],
+        ['changed argument values', [record('plugin-a', plugin('plugin-a', {realArg: {limit: 2}}))], ['plugin-a', 'plugin-b']],
+        ['changed arguments', [record('plugin-a', plugin('plugin-a', {arguments: {limit: 'string'}}))], ['plugin-a', 'plugin-b']],
+    ] as const)('reloads plugins once after receiving %s', async (_, mutations, names) => {
+        const {store, runtime} = await pluginHarness()
+        await receiveCommit(store, runtime, {unitMutations: [...mutations]}, mutations.map((value) => value.key))
+        await vi.dynamicImportSettled()
+
+        expect(getDatabase().plugins.map((value) => value.name)).toEqual(names)
+        for (const mutation of mutations) if (mutation.type === 'set') expect(getDatabase().plugins.find((value) => value.name === (mutation.value as {name: string}).name)).toEqual(mutation.value)
+        expect(pluginRuntime.load).toHaveBeenCalledOnce()
+    })
+
+    it('does not reload plugins for receives that leave what plugins run unchanged', async () => {
+        const {store, runtime} = await pluginHarness()
+        const unchanged = async (commit: Omit<WorkingSetCommit, 'expectedRevision'>, keys: string[]) => {
+            await receiveCommit(store, runtime, commit, keys)
+            await vi.dynamicImportSettled()
+            expect(pluginRuntime.load).not.toHaveBeenCalled()
+        }
+
+        const renamed = record('plugin-a', plugin('plugin-a', {displayName: 'Renamed'}))
+        await unchanged({unitMutations: [renamed]}, [renamed.key])
+        expect(getDatabase().plugins[0].displayName).toBe('Renamed')
+        await unchanged({unitMutations: [{key: '["order","plugins"]', type: 'set', value: ['plugin-b', 'plugin-a']}]}, ['["order","plugins"]'])
+        expect(getDatabase().plugins.map((value) => value.name)).toEqual(['plugin-b', 'plugin-a'])
+        await unchanged({pluginStorage: [{type: 'set', owner: 'plugin-a', key: 'counter', value: 1}]}, ['["plugin","plugin-a","counter"]'])
+        await unchanged({unitMutations: [{key: '["root","classicMaxWidth"]', type: 'set', value: true}]}, ['["root","classicMaxWidth"]'])
+        expect(getDatabase().classicMaxWidth).toBe(true)
+    })
+
+    it('leaves a local plugin change to the toggle that made it', async () => {
+        const {runtime} = await pluginHarness()
+        getDatabase().plugins[0].enabled = false
+        await runtime.flushPendingDataLocally('local-plugin-toggle')
+        await vi.dynamicImportSettled()
+
+        expect(pluginRuntime.load).not.toHaveBeenCalled()
     })
 })
