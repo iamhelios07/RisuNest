@@ -105,11 +105,17 @@ function navigationLayer(node: HTMLElement, initial: NavigationOptions, trapFocu
 }
 
 /**
- * Android Back with no history entry left. A dialog shown outside every layer is cancelled instead
- * of leaving the app, except RisuNest's own terms, where a refusal only reloads the same dialog.
+ * Android Back that the WebView cannot take itself. A dialog shown outside every layer is cancelled
+ * instead of leaving the app, except RisuNest's own terms, where a refusal only reloads the same dialog.
+ * A layer whose entry the WebView skips, because it was added without a tap, closes through the page.
  */
-export function cancelAlertOnRootBack(event: Event) {
-    if (get(alertStore).type !== 'tos' && cancelVisibleAlert()) event.preventDefault()
+export function handleRootBack(event: Event) {
+    if (get(alertStore).type === 'tos') return
+    if (cancelVisibleAlert()) event.preventDefault()
+    else if (historyTokens().some(token => live.has(token))) {
+        event.preventDefault()
+        history.back()
+    }
 }
 
 /** Menus participate in Back and Escape without trapping keyboard focus. */

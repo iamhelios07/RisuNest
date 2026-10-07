@@ -197,7 +197,7 @@ internal fun keyboardResizesWebView(sdkInt: Int) = sdkInt < Build.VERSION_CODES.
 internal fun resolveWebViewBottomMargin(sdkInt: Int, margins: WebViewMargins, imeBottom: Int) =
   if (keyboardResizesWebView(sdkInt)) maxOf(margins.bottom, imeBottom) else margins.bottom
 
-/** Offers a Back with no history entry left to the page; the page answers true when it used it. */
+/** Offers the page a Back the web view cannot take itself; the page answers true when it used it. */
 internal fun rootBackScript() =
   "(function(){var e=new Event('$ROOT_BACK_EVENT',{cancelable:true});" +
     "window.dispatchEvent(e);return e.defaultPrevented})()"
@@ -815,8 +815,9 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
             navigateBack(webView, canGoBack = true, pressedAt)
             return
           }
-          // A dialog shown outside every navigation layer has no history entry, so the page
-          // gets this Back first. A page that does not answer leaves the exit policy in charge.
+          // A dialog shown outside every navigation layer has no history entry, and the web view
+          // skips entries a page added without a tap, so the page gets this Back first. A page
+          // that does not answer leaves the exit policy in charge.
           var answered = false
           val answer = { used: Boolean ->
             if (!answered && lifecycleWebView === webView) {

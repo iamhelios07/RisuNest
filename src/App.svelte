@@ -55,7 +55,7 @@
     import PersistentWorkingSetRecovery from './lib/Others/PersistentWorkingSetRecovery.svelte';
     import { persistentWorkingSetInputBlocked } from './ts/storage/persistentDataRuntime.svelte';
     import { restoreFocusAfterInputBlock } from './ts/ui/restoreFocusAfterInputBlock';
-    import { backNavigationLayer, cancelAlertOnRootBack } from './ts/ui/modalNavigation';
+    import { backNavigationLayer, handleRootBack } from './ts/ui/modalNavigation';
 
     import {
         serverSyncNavigation,
@@ -71,8 +71,8 @@
     $effect(() => restoreFocusAfterInputBlock(persistentWorkingSetInputBlocked))
 
     $effect(() => {
-        window.addEventListener('risunest-root-back', cancelAlertOnRootBack)
-        return () => window.removeEventListener('risunest-root-back', cancelAlertOnRootBack)
+        window.addEventListener('risunest-root-back', handleRootBack)
+        return () => window.removeEventListener('risunest-root-back', handleRootBack)
     })
 
     $effect(() => {
