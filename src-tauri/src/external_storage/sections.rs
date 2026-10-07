@@ -284,9 +284,10 @@ pub(crate) fn capture_backup_sections(
     spool: &Path,
     cancel: &Cancellation,
 ) -> Result<Vec<CapturedSection>> {
+    let scratch = super::leftovers::scratch_directory(store.repository_root()).map_err(transient)?;
     let device = store.device_store_mut().map_err(device_error)?;
     let kinds = [SectionKind::Hypa, SectionKind::LocalPlugins, SectionKind::LocalSettings];
-    let prepared = device.capture_backup_sections(&kinds).map_err(device_error)?;
+    let prepared = device.capture_backup_sections(&kinds, &scratch).map_err(device_error)?;
     capture_prepared_backup_sections(&prepared, spool, cancel)
 }
 
@@ -436,6 +437,7 @@ fn prepare_section_source_rows(
 /// device rows. Each returned spool is versionless and replaces only its kind.
 pub(crate) fn prepare_received_backup_sections(
     sources: &[CapturedSection],
+    scratch: &Path,
     cancel: &Cancellation,
 ) -> Result<Vec<PreparedSectionRows>> {
     let zero = Sequence::from(0u64);
@@ -452,7 +454,7 @@ pub(crate) fn prepare_received_backup_sections(
         }
         prepared.push(prepare_section_source_rows(
             source,
-            SectionSpoolBuilder::new_backup(source.kind).map_err(transient)?,
+            SectionSpoolBuilder::new_backup(source.kind, scratch).map_err(transient)?,
             false,
             cancel,
         )?);
@@ -806,7 +808,7 @@ mod tests {
         assert_eq!(objects(SectionKind::LocalSettings), BTreeSet::from([stored_setting.len() as u64]));
         assert!(objects(SectionKind::Hypa).is_empty());
 
-        let prepared = prepare_received_backup_sections(&captured, &Cancellation::default())
+        let prepared = prepare_received_backup_sections(&captured, root.path(), &Cancellation::default())
             .expect("prepare captured backup sections");
         let mut target = PersistentStore::open(&root.path().join("target")).expect("open target store");
         let stage = target.replace_begin().expect("begin replacement");
@@ -891,7 +893,7 @@ mod tests {
         )
         .expect("capture backup settings section");
         let sources = [plugin, settings];
-        let prepared = prepare_received_backup_sections(&sources, &Cancellation::default())
+        let prepared = prepare_received_backup_sections(&sources, spool.path(), &Cancellation::default())
             .expect("prepare every backup section");
         assert_eq!(prepared.iter().map(PreparedSectionRows::kind).collect::<Vec<_>>(), [
             SectionKind::LocalPlugins,
@@ -900,7 +902,7 @@ mod tests {
 
         let mut corrupt = sources.clone();
         corrupt[1].content_fingerprint[0] ^= 1;
-        assert!(prepare_received_backup_sections(&corrupt, &Cancellation::default()).is_err());
+        assert!(prepare_received_backup_sections(&corrupt, spool.path(), &Cancellation::default()).is_err());
     }
 
     #[test]
