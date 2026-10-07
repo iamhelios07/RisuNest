@@ -1072,3 +1072,48 @@ describe('the sync switch', () => {
         expect([...target.querySelectorAll('button')].some(button => button.textContent?.trim() === strings.runSync)).toBe(false)
     })
 })
+
+describe('the connection card text', () => {
+    async function show(connections: unknown[], jobs: unknown[] = []): Promise<void> {
+        state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0', paused: false }, connections, jobs })
+        state.listHistory.mockResolvedValue({ items: [] })
+        target = document.createElement('div')
+        document.body.append(target)
+        component = mount(ExternalStorageSettings, { target })
+        await settle()
+    }
+    afterEach(() => {
+        if (component) unmount(component)
+        component = undefined
+        target.remove()
+        vi.clearAllMocks()
+    })
+    const occurrences = (text: string) => (target.querySelector('article')?.textContent ?? '').split(text).length - 1
+
+    it('shows no last backup on a sync connection that never made one', async () => {
+        await show([{ ...connection(10, 30), purpose: 'sync', strategy: 'sequential' }])
+        expect(target.textContent).not.toContain(strings.lastBackup)
+    })
+
+    it('keeps the last backup on a backup connection', async () => {
+        await show([{ ...connection(10, 30), lastBackupAtMs: '1000' }])
+        expect(occurrences(strings.lastBackup)).toBe(1)
+    })
+
+    it('shows the error of a paused job once on its card', async () => {
+        const job = { id: 'paused', connectionId: 'connection-1', kind: 'backup', state: 'waiting', phase: 'paused', reason: 'automatic',
+            completedBytes: '4', totalBytes: '10', completedItems: '1', startedAtMs: '1', updatedAtMs: '1',
+            error: { code: 'transient', action: 'retry', retryable: true } }
+        await show([connection(10, 30)], [job])
+        expect(occurrences(strings.retry)).toBe(1)
+        expect(occurrences(strings.statusError)).toBe(1)
+    })
+
+    it('shows a failed job that set the connection error once on its card', async () => {
+        const error = { code: 'storageFull', action: 'free-space', retryable: false }
+        const job = { id: 'failed', connectionId: 'connection-1', kind: 'backup', state: 'failed', phase: 'failed', reason: 'manual',
+            completedBytes: '4', totalBytes: '10', completedItems: '1', startedAtMs: '1', updatedAtMs: '1', error }
+        await show([{ ...connection(10, 30), status: 'error', lastError: error }], [job])
+        expect(occurrences(strings.freeSpace)).toBe(1)
+    })
+})
