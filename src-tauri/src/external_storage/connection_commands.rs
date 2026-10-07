@@ -2210,7 +2210,9 @@ pub(crate) async fn external_storage_remove_connection(
     logged("external_storage_remove_connection", async move {
         let cleanup_state = app.state::<ConnectionCommandState>();
         let _cleanup_guard = cleanup_state.admit()?;
-        runtime::require_connection_idle(&app, &connection_id).await?;
+        let _removal = app
+            .state::<super::job_store::JobCommandState>()
+            .hold_connection_removal(&connection_id)?;
         let root = connection_root(&app)?;
         let file_jobs = app.state::<crate::native_file_jobs::NativeFileJobState>();
         let _permit = file_jobs
@@ -2221,6 +2223,7 @@ pub(crate) async fn external_storage_remove_connection(
         pds.external_prepare_connection_removal(&connection_id)
             .map_err(runtime::local_error)?;
         drop(pds);
+        runtime::end_removed_connection_jobs(&root, &connection_id)?;
         let mut store = ConnectionStore::open(&root)?;
         let stored = store.read(&connection_id)?;
         runtime::native_store(&app)?
