@@ -78,6 +78,22 @@ fn persist_restore_intent(root:&Path, job:&DurableJob, intent:&RestoreCommitInte
     jobs.put(&current)
 }
 
+/// Withdraws the commit a restore recorded when this library holds nothing of its request,
+/// so the restore counts as not applied and prepares again when resumed.
+fn withdraw_unreserved_commit(store:&PersistentStore, root:&Path, job_id:&str) -> Result<()> {
+    let jobs=JobStore::open(root)?;
+    let mut current=jobs.read(job_id)?;
+    if current.summary.get("restoreCommit").is_none() || completed_restore_in_store(store,&current)?.is_some() {return Ok(())}
+    let intent:RestoreCommitIntent=serde_json::from_value(current.summary["restoreCommit"].clone()).map_err(|_| corrupt())?;
+    if !store.lww_request_unreserved(&intent.header.request_id).map_err(pds_error)? {return Ok(())}
+    let summary=current.summary.as_object_mut().ok_or_else(corrupt)?;
+    summary.remove("restoreCommit");
+    summary.remove("applicationStarted");
+    current.summary["phase"]=json!("preparing-local");
+    current.summary["updatedAtMs"]=json!(runtime::now_ms().to_string());
+    jobs.put(&current)
+}
+
 /// Read-only completion recovery used before reopening a provider connection.
 pub(crate) fn completed_restore<R: Runtime>(app: &AppHandle<R>, job: &DurableJob) -> Result<Option<Value>> {
     if job.summary.get("restoreAdopted").is_none() || job.summary["restoreBodiesComplete"]!=true
@@ -772,6 +788,7 @@ fn prepare_local_restore_in_store(
     if current_identity.selection_epoch != job.admission_identity.selection_epoch {
         return Err(ProviderError::new(ErrorKind::PreconditionFailed));
     }
+    withdraw_unreserved_commit(store,&root,&job.id)?;
     cancel.check()?;
     if store.revision().map_err(pds_error)? != expected_revision {
         return Err(ProviderError::new(ErrorKind::PreconditionFailed));
@@ -860,14 +877,19 @@ fn prepare_local_restore_in_store(
     let committed=(||->Result<_> {
         if store.revision().map_err(pds_error)?!=expected_revision {return Err(ProviderError::new(ErrorKind::PreconditionFailed));}
         persist_restore_intent(&root,job,&intent)?;
+        #[cfg(test)] commit_failure(&root,CommitFailure::BeforeStore)?;
         let revision = store.lww_commit_staged_replacement_with_device_sections(
             &intent.header,&intent.staging_id,&prepared_sections.iter().collect::<Vec<_>>(),
         ).map_err(pds_error)?;
+        #[cfg(test)] commit_failure(&root,CommitFailure::AfterStore)?;
         store.release_replacement_source(&intent.staging_id).map_err(pds_error)?;
         Ok(revision)
     })();
     drop(prepared);
     drop(maintenance);
+    if committed.is_err() {
+        let _=logged("external_storage_restore_withdraw",withdraw_unreserved_commit(store,&root,&job.id));
+    }
     let revision=committed?;
     cleanup_staging(&staging_root);
     let result=json!({
@@ -931,6 +953,29 @@ fn write_before_commit(root:&Path,store:&mut PersistentStore)->Result<()> {
 #[cfg(test)]
 fn write_before_commit_at(root:&Path) {
     WRITES_BEFORE_COMMIT.lock().unwrap().insert(std::fs::canonicalize(root).unwrap());
+}
+
+#[cfg(test)]
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+enum CommitFailure {BeforeStore,AfterStore}
+
+#[cfg(test)]
+static COMMIT_FAILURES:std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf,CommitFailure>>=std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Fails a restore commit of `root` once at `point`, after the job recorded its commit: before
+/// the library received it, as a rejected replacement does, or after the library committed it.
+#[cfg(test)]
+fn commit_failure(root:&Path,point:CommitFailure)->Result<()> {
+    let root=std::fs::canonicalize(root).unwrap_or_else(|_|root.to_owned());
+    let mut failures=COMMIT_FAILURES.lock().unwrap();
+    if failures.get(&root)!=Some(&point) {return Ok(());}
+    failures.remove(&root);
+    Err(corrupt())
+}
+
+#[cfg(test)]
+fn fail_commit_at(root:&Path,point:CommitFailure) {
+    COMMIT_FAILURES.lock().unwrap().insert(std::fs::canonicalize(root).unwrap(),point);
 }
 
 #[cfg(test)]
@@ -1675,17 +1720,127 @@ pub(super) mod tests {
         });
     }
 
-    /// Restores `backup` over the library at `root`, admitted at its current revision.
-    async fn restore_over(root:&Path,store:&mut PersistentStore,backup:&PackagedBackup) -> Result<Value> {
+    /// A restore of `backup` admitted against the library at `root` at its current revision.
+    fn admit(root:&Path,store:&PersistentStore,backup:&PackagedBackup) -> DurableJob {
         ConnectionStore::open(root).unwrap().insert(&backup.connected.stored).unwrap();
         let request=serde_json::from_value(json!({"connectionId":"synthetic-connection","kind":"restore","snapshotId":backup.backup_id,"targetRevision":store.revision().unwrap().to_string()})).unwrap();
         let mut job=DurableJob::new(request,1,store.external_identity().unwrap());
         job.summary["restoreSource"]=backup.restore_source.clone();
         JobStore::open(root).unwrap().put(&job).unwrap();
+        job
+    }
+
+    /// Runs the restore `job` as its worker does, from the download to the local commit.
+    async fn run_job(root:&Path,store:&mut PersistentStore,backup:&PackagedBackup,job:&DurableJob) -> Result<Value> {
+        let job=JobStore::open(root).unwrap().read(&job.id).unwrap();
         let (database,sections)=prepare_database_first_backup(root,&backup.connected,&job,&Cancellation::default()).await?;
         let admission=std::sync::Arc::new(crate::native_file_jobs::admission::Admission::default());
         activate_database_first_backup(store,&PersistentStoreState::default(),&job,database,sections,Cancellation::default(),admission.staging().unwrap())
             .map(|(receipt,_)|receipt)
+    }
+
+    /// Restores `backup` over the library at `root`, admitted at its current revision.
+    async fn restore_over(root:&Path,store:&mut PersistentStore,backup:&PackagedBackup) -> Result<Value> {
+        let job=admit(root,store,backup);
+        run_job(root,store,backup,&job).await
+    }
+
+    fn request_id(job:&DurableJob) -> String {
+        format!("external-backup-restore:{}",job.id)
+    }
+
+    /// A restore that recorded its commit and stopped before the library received it, whose
+    /// stage a later store open swept.
+    fn interrupted_before_commit(root:&Path,store:&PersistentStore,backup:&PackagedBackup) -> DurableJob {
+        let job=admit(root,store,backup);
+        let header=crate::persistent_store::lww::Header{binding_authority:store.lww_binding_authority().unwrap(),request_id:request_id(&job)};
+        let target=store.revision().unwrap();
+        persist_restore_intent(root,&job,&restore_intent(&job,target,header,"synthetic-swept-stage").unwrap()).unwrap();
+        JobStore::open(root).unwrap().read(&job.id).unwrap()
+    }
+
+    fn unapplied(root:&Path,job:&DurableJob) -> bool {
+        let summary=JobStore::open(root).unwrap().read(&job.id).unwrap().summary;
+        summary.get("applicationStarted").is_none() && summary.get("restoreCommit").is_none()
+    }
+
+    #[test]
+    fn a_restore_stopped_before_the_library_received_its_commit_prepares_again_when_resumed() {
+        run(async {
+            let backup=packaged_backup(&[vec![48;4096]]).await;
+            let directory=tempfile::tempdir().unwrap();
+            let root=directory.path();
+            let mut store=PersistentStore::open(root).unwrap();
+            let job=interrupted_before_commit(root,&store,&backup);
+            assert_eq!(job.summary["applicationStarted"],true);
+
+            let receipt=run_job(root,&mut store,&backup,&job).await.unwrap();
+
+            assert_eq!(receipt["receivedRevision"],store.revision().unwrap().to_string());
+            let resumed=JobStore::open(root).unwrap().read(&job.id).unwrap();
+            assert_eq!(resumed.summary["applicationStarted"],true);
+            assert_ne!(resumed.summary["restoreCommit"]["stagingId"],"synthetic-swept-stage");
+            assert_eq!(completed_restore_in_store(&store,&resumed).unwrap(),Some(receipt));
+        });
+    }
+
+    #[test]
+    fn a_restore_stopped_before_the_library_received_its_commit_ends_unapplied_once_the_library_changed() {
+        run(async {
+            let backup=packaged_backup(&[]).await;
+            let directory=tempfile::tempdir().unwrap();
+            let root=directory.path();
+            let mut store=PersistentStore::open(root).unwrap();
+            let job=interrupted_before_commit(root,&store,&backup);
+            store.commit(&crate::persistent_store::WorkingSetCommit{expected_revision:store.revision().unwrap(),
+                root_mutations:Some(vec![crate::persistent_store::RootMutation::Set{key:"synthetic".into(),value:json!(true)}]),
+                ..Default::default()}).unwrap();
+            let revision=store.revision().unwrap();
+
+            assert_eq!(run_job(root,&mut store,&backup,&job).await.unwrap_err().kind,ErrorKind::PreconditionFailed);
+
+            assert!(unapplied(root,&job));
+            assert_eq!(store.revision().unwrap(),revision);
+        });
+    }
+
+    #[test]
+    fn a_restore_commit_the_library_rejected_ends_unapplied() {
+        run(async {
+            let backup=packaged_backup(&[vec![49;4096]]).await;
+            let directory=tempfile::tempdir().unwrap();
+            let root=directory.path();
+            let mut store=PersistentStore::open(root).unwrap();
+            let job=admit(root,&store,&backup);
+            let revision=store.revision().unwrap();
+            fail_commit_at(root,CommitFailure::BeforeStore);
+
+            assert_eq!(run_job(root,&mut store,&backup,&job).await.unwrap_err().kind,ErrorKind::Corrupt);
+
+            assert!(unapplied(root,&job));
+            assert!(store.lww_request_unreserved(&request_id(&job)).unwrap());
+            assert_eq!(store.revision().unwrap(),revision);
+        });
+    }
+
+    #[test]
+    fn a_restore_commit_the_library_received_stays_unsettled_when_its_worker_fails() {
+        run(async {
+            let backup=packaged_backup(&[vec![50;4096]]).await;
+            let directory=tempfile::tempdir().unwrap();
+            let root=directory.path();
+            let mut store=PersistentStore::open(root).unwrap();
+            let job=admit(root,&store,&backup);
+            fail_commit_at(root,CommitFailure::AfterStore);
+
+            assert_eq!(run_job(root,&mut store,&backup,&job).await.unwrap_err().kind,ErrorKind::Corrupt);
+
+            let current=JobStore::open(root).unwrap().read(&job.id).unwrap();
+            assert_eq!(current.summary["applicationStarted"],true);
+            assert!(!store.lww_request_unreserved(&request_id(&job)).unwrap());
+            let receipt=completed_restore_in_store(&store,&current).unwrap().unwrap();
+            assert_eq!(receipt["receivedRevision"],store.revision().unwrap().to_string());
+        });
     }
 
     const DELETED:&str="synthetic-deleted";
