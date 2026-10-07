@@ -1458,6 +1458,8 @@ export class SaveCoordinator {
                 presets,
             }
             const presetRootBaseline = canonicalClone(state.root)
+            // Operations edit `state.presets` in place, so the stored list is diffed from a copy.
+            const storedPresets = canonicalClone(presets)
             await mutate(state)
 
             const liveBeforeCommit = this.capture()
@@ -1471,8 +1473,8 @@ export class SaveCoordinator {
                 mutatedRoot,
             )
             const committedPresets = canonicalClone(state.presets)
-            const presetUnits = committedPresets.every((value) => typeof value['id'] === 'string') && presets.every((value) => typeof value['id'] === 'string')
-                ? this.diffPresets(presets, committedPresets) : null
+            const presetUnits = committedPresets.every((value) => typeof value['id'] === 'string') && storedPresets.every((value) => typeof value['id'] === 'string')
+                ? this.diffPresets(storedPresets, committedPresets) : null
             const presetRootMutations = diffRootMutations(rootValue.value, committedRoot)
             if (!presetRootMutations.length && presetUnits?.length === 0) return
             const committed = await this.commitRoutine({

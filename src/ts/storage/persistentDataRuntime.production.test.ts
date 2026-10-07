@@ -23,7 +23,8 @@ import {
 import { getV2PluginAPIs } from '../plugins/plugins.svelte'
 import type { Database } from './database.svelte'
 import type { PersistentDataStore, PersistentUnitMutation, WorkingSetCommit } from './persistentDataStore'
-import { getDatabase, getEffectivePresetId, normalizeDatabaseDefaults, setDatabase, setDatabaseLite, setEffectivePresetOverride } from './database.svelte'
+import { captureCurrentPreset, getDatabase, getEffectivePresetId, normalizeDatabaseDefaults, setDatabase, setDatabaseLite, setEffectivePresetOverride, setPreset } from './database.svelte'
+import { createPresetWorkingSetController } from './presetWorkingSetOperations'
 import {
     configurePersistentDataRuntime,
     createProductionStateAdapter,
@@ -1305,5 +1306,49 @@ describe('detail mutations of a catalog character', () => {
         } finally {
             materialized.mockRestore()
         }
+    })
+})
+
+describe('preset list operations', () => {
+    it.each([true, false])('stores whole presets added, copied, renamed and removed in place (catalog=%s)', async (catalog) => {
+        const initial = normalizeDatabaseDefaults({} as Database)
+        initial.botPresets[0].id = 'first-preset'
+        initial.botPresets[0].name = 'First'
+        initial.personas[0].id = 'persona'
+        const store = new IndexedDbPersistentDataStore(`preset-list-${catalog}-${crypto.randomUUID()}`, new IDBFactory(), IDBKeyRange)
+        await store.open()
+        const {revision} = await store.replaceFromDatabase(initial)
+        setDatabaseLite(catalog ? projectCompleteScalableWorkingSet(initial, null, revision, new Set()) : structuredClone(initial))
+        selectedCharID.set(-1)
+        const runtime = createPersistentDataRuntime({store, state: createProductionStateAdapter(), prepareDatabase: async (value) => value})
+        await runtime.initializeActiveWorkingSet(getDatabase())
+        const controller = createPresetWorkingSetController({
+            getDatabase, captureCurrentPreset, getEffectivePresetId,
+            applyPreset: (root, preset) => setPreset(root as Database, preset),
+            mutatePersistentPresets: (reason, mutate) => runtime.mutatePersistentPresets(reason, mutate),
+        })
+        const stored = async () => (await store.queryPresets()).items.sort((a, b) => a.configuredIndex - b.configuredIndex).map((item) => item.name)
+        const live = () => getDatabase().botPresets.map((value) => value.name)
+
+        expect(await controller.addPreset({...structuredClone(initial.botPresets[0]), name: 'Added'})).toBe(1)
+        expect(await stored()).toEqual(['First', 'Added'])
+        expect(live()).toEqual(['First', 'Added'])
+        expect(await controller.copyPreset(1)).toBe(2)
+        expect(await stored()).toEqual(['First', 'Added', 'Added Copy'])
+        expect(live()).toEqual(['First', 'Added', 'Added Copy'])
+        await controller.renamePreset(2, 'Renamed')
+        expect(await stored()).toEqual(['First', 'Added', 'Renamed'])
+        expect(live()).toEqual(['First', 'Added', 'Renamed'])
+        await controller.removePreset(1)
+        expect(await stored()).toEqual(['First', 'Renamed'])
+        expect(live()).toEqual(['First', 'Renamed'])
+        expect(getDatabase().botPresetsId).toBe(0)
+        const ids = (await store.queryPresets()).items.map((item) => item.id)
+        expect(new Set(ids).size).toBe(2)
+        expect(ids).toContain('first-preset')
+
+        const commit = vi.spyOn(store, 'commit')
+        await runtime.flushPendingDataLocally('after-preset-list-operations')
+        expect(commit).not.toHaveBeenCalled()
     })
 })
