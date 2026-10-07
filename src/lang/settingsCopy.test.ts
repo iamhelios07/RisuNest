@@ -16,9 +16,6 @@ it('keeps RisuNest Korean and English keys aligned', () => {
 })
 it('uses the required question form for owned Korean confirmations', () => {
     const inherited = new Set(['setup.finally', 'remindLaterQuestion', 'askLoadFirstMsg'])
-    expect(languageKorean.risuNest.serverSync.management.restoreConfirm).toBe(
-        '이 백업으로 복원하시겠습니까? 현재 라이브러리는 이 백업의 내용으로 교체되며, 동기화는 일시 중지됩니다. 자동 백업은 만들지 않습니다.',
-    )
     for (const [path, value] of leaves(languageKorean)) {
         let text: unknown = value
         if (typeof value === 'function') {
