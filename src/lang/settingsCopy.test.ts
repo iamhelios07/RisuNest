@@ -27,3 +27,9 @@ it('uses the required question form for owned Korean confirmations', () => {
         if (typeof text === 'string' && text.includes('까요?')) expect(inherited.has(path), path).toBe(true)
     }
 })
+it('describes only the reset and restore actions in their help', () => {
+    expect(languageKorean.risuNest.cleanup.scope).toBe('이 기기의 대화, 캐릭터, 설정, 플러그인, 연결 정보, 내부 백업과 캐시를 삭제합니다.')
+    expect(languageEnglish.risuNest.cleanup.scope).toBe('Deletes local chats, characters, settings, plugins, connection information, internal backups and cache on this device.')
+    expect(languageKorean.risuNest.backup.restoreHelp).toBe('계정 동기화 충돌 백업으로 데이터를 복원합니다.')
+    expect(languageEnglish.risuNest.backup.restoreHelp).toBe('Restores data from an account sync conflict backup.')
+})

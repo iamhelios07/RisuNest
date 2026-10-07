@@ -79,7 +79,7 @@ export const languageEnglish = {
     },
     portableBackup: {
         preservedSourceHelp:
-            'These files are kept separately because the restored library does not need them. They do not sync automatically and can be deleted from the source preservation area.',
+            'These files are kept separately because the restored library does not need them. You can delete them from the source preservation area.',
         export: 'RisuNest full backup (.risunest)',
         restore: 'Restore backup file',
         localStorage: 'Plugin local storage',
@@ -138,7 +138,7 @@ export const languageEnglish = {
     togglesUnbound: 'Toggles unbound.',
     saveToggleChanges: 'Save the changed toggle values to the binding',
     saveTogglesLabel: 'Save',
-    toggleBindingDisabled: 'Toggle binding is temporarily off. Saved values are kept.',
+    toggleBindingDisabled: 'Toggle binding is temporarily off.',
     localTogglePriority: 'Chat local overrides take priority.',
     disableToggleBinding: 'Temporarily disable toggle binding',
     saveDefaultToggles: 'Save current values as the new chat default',
@@ -997,7 +997,7 @@ export const languageEnglish = {
     risuSaveImportCommittedRefreshFailed: "The RisuSave import was committed, but the screen could not be refreshed. Select Refresh screen before making more changes.",
     risuSaveImportComplete: "RisuSave import completed.",
     risuSaveExportComplete: "RisuSave export completed.",
-    risuSaveCleanupWarning: "The operation completed, but a temporary native file could not be cleaned up. It will be retried at startup.",
+    risuSaveCleanupWarning: "The operation completed, but a temporary file could not be cleaned up. It will be retried at startup.",
     risuSaveRevisionConflict: "The database changed while the operation was starting. Please try again.",
     accountUnmigration: {
         preparing: "Preparing to store account data locally",
@@ -1948,11 +1948,11 @@ export const languageEnglish = {
         persistentData: {
             followupFailed: 'The restore is saved, but a follow-up step could not finish. Do not import the backup again. Check sync status or restart the app.',
             confirmApplicationTitle: 'The external operation still needs confirmation',
-            confirmApplicationHelp: 'The operation may still be running or may have applied only part of the data. Editing is paused to protect it. Retry checks or resumes the same operation; it does not start a new restore.',
+            confirmApplicationHelp: 'The operation may still be running or may have applied only part of the data, so editing is paused. Checking again checks or resumes the same operation.',
             confirmApplication: 'Check the same operation again',
-            confirmApplicationFailed: 'The result is still unconfirmed. Check your connection and available storage, then retry. No successful rollback has been confirmed.',
+            confirmApplicationFailed: 'The result is still unconfirmed. Check your connection and available storage, then retry.',
             refreshTitle: 'Saved changes need a screen refresh',
-            refreshHelp: 'Your changes are saved. Editing is paused until the saved data can be read back into the screen. Refreshing does not save or import the data again.',
+            refreshHelp: 'Your changes are saved. Editing is paused until the saved data can be read back into the screen.',
             refresh: 'Refresh screen',
             refreshFailed: 'The saved data could not be displayed. You can retry refreshing or restart the app.',
         },
@@ -1968,7 +1968,7 @@ export const languageEnglish = {
             archivedAt: '{0} chats · archived on {1}',
             confirmTitle: 'Archive this character?',
             confirmBody: 'Archiving compresses the chats and reduces the space they take. The character stays in the list in grayscale and you can bring it back at any time. While it is archived you cannot use or view the character.',
-            confirmCounts: '{0} chats · {1} messages · images stay as they are.',
+            confirmCounts: '{0} chats · {1} messages',
             accountOnlyTitle: 'A RisuAI account backup does not store archived characters.',
             accountOnlyBody: 'Only a RisuAI account is connected, so an archived character cannot be restored if this device loses its data. Back up to a file, or connect a sync server or external storage, before you continue.',
             restoreTitle: 'Restore this character?',
@@ -2042,7 +2042,7 @@ export const languageEnglish = {
                 warning: 'A wrong assignment can make a plugin fail, so check before you assign.',
                 summary: '{0} items · {1}',
                 autoAssign: 'Assign values you leave here to the first plugin that asks for them',
-                autoAssignHelp: 'This applies only to the first load after the import finishes. It does not apply to plugins installed later, and the result is shown on the plugin data tab in RisuNest settings.',
+                autoAssignHelp: 'This applies only to the first load after the import finishes, not to plugins installed later. The result is shown on the plugin data tab in RisuNest settings.',
                 autoAssignOffNotice: 'Automatic assignment is off. Only what you assign here is applied, and the rest stays under plugin data in RisuNest settings. You can assign them later, but plugins have to be loaded again then.',
                 skipAll: 'Skip all and continue',
                 applyAndContinue: 'Apply and continue',
@@ -2456,10 +2456,10 @@ export const languageEnglish = {
             inventorySize: 'Size',
             inventoryNoExtension: 'No extension',
             optimize: 'Convert to WebP',
-            optimizeHelp: 'Saves images that are not WebP again to use less space. Images that are already WebP and images that cannot be converted stay as they are.',
+            optimizeHelp: 'Saves images that are not WebP again as WebP to use less space.',
             optimizeNone: 'There is nothing to convert',
             optimizeConfirm: '{count} images ({size}) will be converted to WebP. You cannot get the original files back, so back them up first.',
-            optimizeFormatNotice: 'Your storage format is not WebP right now, but this converts to WebP. The setting itself stays as it is.',
+            optimizeFormatNotice: 'Your storage format is not WebP right now, but this converts to WebP.',
             optimizeSyncNotice: 'Converted images are uploaded to the server again.',
             optimizeRemoteNotice: 'Files that are not on this device are downloaded from the server.',
             optimizeProgress: 'Working on {done} of {total}',
@@ -2505,7 +2505,7 @@ export const languageEnglish = {
             exportPartial: 'The available files were exported, but some source files could not be captured completely.',
             exportCancelled: 'The export was cancelled.',
             exportFailed: 'The original files could not be exported.',
-            exportUnavailable: 'Original data export is unavailable because native setup did not finish.',
+            exportUnavailable: 'Original data export is unavailable because the app could not finish starting up.',
             startNormally: 'Start normally',
             keepTitle: 'Keep these off?',
             keepBody:
@@ -2683,7 +2683,7 @@ export const languageEnglish = {
             codeIntentQuarantined: 'Incomplete recovery records',
             discardIntent: 'Discard recovery record',
             discardIntentTitle: 'Discard this recovery record?',
-            discardIntentDescription: 'The selected recovery record will be deleted and will no longer be retried. Current data is preserved.',
+            discardIntentDescription: 'The selected recovery record will be deleted and will no longer be retried.',
             discardIntentAcknowledge: 'Delete the selected recovery record',
             discardIntentFailed: 'The recovery record could not be discarded. Check the data again.',
             completeIntent: 'Complete recovery',
@@ -2730,7 +2730,7 @@ export const languageEnglish = {
             exportFile: 'Export',
             groupRestore: 'Restore',
             restoreHelp:
-                'Restores data from an account sync conflict backup. Snapshots kept on this device are restored from the snapshot list under Storage.',
+                'Restores data from an account sync conflict backup.',
             restoreHelpWeb:
                 'Restores data from a PocketRisu backup or an account sync conflict backup.',
             groupAccount: 'Official account',
@@ -2742,7 +2742,7 @@ export const languageEnglish = {
             officialRestoreConfirm:
                 'Replace local data with the official account backup? No automatic backup will be created. Back up your current data first if you want to keep it.',
             officialRestoreInlayWarning:
-                'Official snapshots do not include separate chat attachments. Referenced images, audio, video, and signatures may not be restored. The app will restart after restoring the backup. Continue?',
+                'Official account backups do not include separate chat attachments. Referenced images, audio, video, and signatures may not be restored. The app will restart after restoring the backup. Continue?',
             officialMissing:
                 'No official account backup was found. Local data was not changed.',
             officialPublishConfirm:
@@ -2887,7 +2887,7 @@ export const languageEnglish = {
             webViewUpdateRequired: 'Update Android System WebView, then retry deleting local data.',
             cancel: 'Cancel',
             title: 'Reset',
-            scope: 'Deletes local chats, characters, settings, plugins, connection information, internal backups and cache on this device. Remote data and exported backups remain.',
+            scope: 'Deletes local chats, characters, settings, plugins, connection information, internal backups and cache on this device.',
             resetHelp: 'Returns to onboarding after deleting local data.',
             prepareRemoval: 'Prepare for app removal',
             removalHelp: 'Deletes local data folders and exits the app. Remove the program using your operating system.',

@@ -76,7 +76,7 @@ export const languageKorean = {
     },
     portableBackup: {
         preservedSourceHelp:
-            '복원한 라이브러리에 필요하지 않은 파일을 원본 보존 영역에 별도 보관했습니다. 자동 동기화되지 않으며 해당 보존 영역에서 삭제할 수 있습니다.',
+            '복원한 라이브러리에 필요하지 않은 파일을 원본 보존 영역에 별도 보관했으며, 이 영역에서 삭제할 수 있습니다.',
         export: 'RisuNest 전체 백업 (.risunest)',
         restore: '백업 파일 복원',
         localStorage: '플러그인 로컬 저장소',
@@ -136,7 +136,7 @@ export const languageKorean = {
     togglesUnbound: '토글 바인드가 해제되었습니다.',
     saveToggleChanges: '변경된 토글 값을 바인드에 저장',
     saveTogglesLabel: '저장',
-    toggleBindingDisabled: '토글 바인딩이 임시로 꺼져 있습니다. 저장된 값은 유지됩니다.',
+    toggleBindingDisabled: '토글 바인딩이 임시로 꺼져 있습니다.',
     localTogglePriority: '채팅 로컬 값이 우선 적용됩니다.',
     disableToggleBinding: '토글 바인딩 임시 비활성화',
     saveDefaultToggles: '현재 값을 새 채팅 기본값으로 저장',
@@ -863,14 +863,14 @@ export const languageKorean = {
     "risuSaveImportCommittedRefreshFailed": "RisuSave 가져오기는 반영되었지만 화면을 새로 고치지 못했습니다. 다른 변경을 하기 전에 화면 새로 고침을 선택해주세요.",
     "risuSaveImportComplete": "RisuSave 가져오기가 완료되었습니다.",
     "risuSaveExportComplete": "RisuSave 내보내기가 완료되었습니다.",
-    "risuSaveCleanupWarning": "작업은 완료되었지만 네이티브 임시 파일을 정리하지 못했습니다. 앱 시작 시 다시 정리합니다.",
+    "risuSaveCleanupWarning": "작업은 완료되었지만 임시 파일을 정리하지 못했습니다. 앱 시작 시 다시 정리합니다.",
     "risuSaveRevisionConflict": "작업을 시작하는 동안 데이터베이스가 변경되었습니다. 다시 시도해주세요.",
     accountUnmigration: {
         preparing: "계정 데이터를 로컬에 저장할 준비 중",
-        cold: "보관된 데이터 다운로드 및 검증 중",
-        assets: "자산 다운로드 및 검증 중",
+        cold: "보관된 데이터 다운로드 및 확인 중",
+        assets: "에셋 다운로드 및 확인 중",
         finishing: "로컬 저장소로 전환 마무리 중",
-        failed: "로컬 저장소로 전환을 완료하지 못했습니다. 작업 중 데이터가 변경되었다면 다른 작업이 끝난 후 다시 시도해주세요.",
+        failed: "로컬 저장소로 전환을 완료하지 못했습니다. 작업 중 데이터가 변경된 경우 다른 작업이 끝난 후 다시 시도해주세요.",
     },
     "cancelRisuSaveOperation": "RisuSave 작업 취소",
     "loadPocketRisuBackup": "PocketRisu 백업 가져오기",
@@ -1764,11 +1764,11 @@ export const languageKorean = {
         persistentData: {
             followupFailed: '복원 내용은 저장되었지만 후속 작업을 마치지 못했습니다. 백업을 다시 가져오지 말고 동기화 상태를 확인하거나 앱을 재시작해주세요.',
             confirmApplicationTitle: '외부 저장소 작업을 확인해야 합니다',
-            confirmApplicationHelp: '작업이 진행 중이거나 일부 데이터만 적용되었을 수 있어 편집을 잠시 멈췄습니다. 다시 확인하면 새 복원을 시작하지 않고 같은 작업을 확인하거나 이어서 처리합니다.',
+            confirmApplicationHelp: '작업이 진행 중이거나 일부 데이터만 적용되었을 수 있어 편집을 잠시 멈췄습니다. 다시 확인하면 같은 작업을 확인하거나 이어서 처리합니다.',
             confirmApplication: '같은 작업 다시 확인',
-            confirmApplicationFailed: '아직 결과를 확인하지 못했습니다. 연결과 저장 공간을 확인한 뒤 다시 시도해주세요. 데이터가 이전 상태로 돌아갔다고 확인된 것은 아닙니다.',
+            confirmApplicationFailed: '아직 결과를 확인하지 못했습니다. 연결과 저장 공간을 확인한 뒤 다시 시도해주세요.',
             refreshTitle: '저장은 완료되었지만 화면을 새로 고쳐야 합니다',
-            refreshHelp: '변경 사항은 저장되어 있습니다. 저장된 데이터를 화면에 다시 불러올 때까지 편집이 잠시 중단됩니다. 화면 새로 고침은 저장이나 가져오기를 다시 실행하지 않습니다.',
+            refreshHelp: '변경 사항은 저장되어 있습니다. 저장된 데이터를 화면에 다시 불러올 때까지 편집이 잠시 중단됩니다.',
             refresh: '화면 새로 고침',
             refreshFailed: '저장된 데이터를 화면에 표시하지 못했습니다. 새로 고침을 다시 시도하거나 앱을 재시작해주세요.',
         },
@@ -1784,7 +1784,7 @@ export const languageKorean = {
             archivedAt: '대화 {0}개 · {1}에 보관',
             confirmTitle: '캐릭터를 보관하시겠습니까?',
             confirmBody: '보관하면 대화를 압축해 차지하는 용량을 줄입니다. 캐릭터는 목록에 흑백으로 남고 언제든 되돌릴 수 있습니다. 보관 중에는 캐릭터를 사용하거나 조회할 수 없습니다.',
-            confirmCounts: '대화 {0}개 · 메시지 {1}개 · 이미지는 그대로 남습니다.',
+            confirmCounts: '대화 {0}개 · 메시지 {1}개',
             accountOnlyTitle: 'RisuAI 계정 백업에는 보관한 캐릭터가 저장되지 않습니다.',
             accountOnlyBody: '현재 RisuAI 계정만 연결되어 있어, 이 기기의 데이터를 잃을 경우 보관한 캐릭터를 복원할 수 없습니다. 파일로 백업하거나 동기화 서버·외부 저장소를 연결한 뒤 진행해주세요.',
             restoreTitle: '캐릭터를 복원하시겠습니까?',
@@ -1858,7 +1858,7 @@ export const languageKorean = {
                 warning: '잘못 할당하면 플러그인에서 오류가 발생할 수 있으므로 확인 후 할당하세요.',
                 summary: '{0}개 · {1}',
                 autoAssign: '할당하지 않은 값은 처음 요청하는 플러그인에 자동 할당',
-                autoAssignHelp: '가져오기를 마친 뒤 최초 로딩에만 적용됩니다. 그 이후에 설치한 플러그인에는 적용되지 않으며, 결과는 RisuNest 설정의 플러그인 데이터 탭에서 확인할 수 있습니다.',
+                autoAssignHelp: '가져오기를 마친 뒤 최초 로딩에만 적용되며, 그 이후에 설치한 플러그인에는 적용되지 않습니다. 결과는 RisuNest 설정의 플러그인 데이터 탭에서 확인할 수 있습니다.',
                 autoAssignOffNotice: '자동 할당을 껐습니다. 여기서 할당한 값만 적용되고 나머지는 RisuNest 설정의 플러그인 데이터에 남습니다. 나중에 할당할 수 있지만 그때는 플러그인을 다시 불러와야 합니다.',
                 skipAll: '모두 건너뛰고 계속',
                 applyAndContinue: '적용하고 계속',
@@ -2271,10 +2271,10 @@ export const languageKorean = {
             inventorySize: '용량',
             inventoryNoExtension: '확장자 없음',
             optimize: 'WebP로 최적화',
-            optimizeHelp: 'WebP가 아닌 이미지를 다시 저장해 용량을 줄입니다. 이미 WebP인 이미지와 바꿀 수 없는 이미지는 그대로 둡니다.',
+            optimizeHelp: 'WebP가 아닌 이미지를 WebP로 다시 저장해 용량을 줄입니다.',
             optimizeNone: '바꿀 이미지가 없습니다',
             optimizeConfirm: '이미지 {count}개({size})를 WebP로 바꿉니다. 원래 파일로 되돌릴 수 없으니 먼저 백업해 두세요.',
-            optimizeFormatNotice: '지금 저장 형식 설정은 WebP가 아니지만 이 작업은 WebP로 바꿉니다. 설정 자체는 그대로 둡니다.',
+            optimizeFormatNotice: '지금 저장 형식 설정은 WebP가 아니지만 이 작업은 WebP로 바꿉니다.',
             optimizeSyncNotice: '바뀐 이미지는 서버에 다시 올라갑니다.',
             optimizeRemoteNotice: '이 기기에 없는 파일을 서버에서 내려받습니다.',
             optimizeProgress: '{done} / {total} 처리 중',
@@ -2320,7 +2320,7 @@ export const languageKorean = {
             exportPartial: '사용 가능한 파일을 내보냈지만, 일부 원본 파일을 완전히 내보내지 못했습니다.',
             exportCancelled: '내보내기가 취소되었습니다.',
             exportFailed: '원본 파일을 내보내지 못했습니다.',
-            exportUnavailable: '네이티브 설정이 완료되지 않아 원본 데이터 내보내기를 사용할 수 없습니다.',
+            exportUnavailable: '앱 시작 준비를 마치지 못해 원본 데이터 내보내기를 사용할 수 없습니다.',
             startNormally: '그대로 시작',
             keepTitle: '계속 꺼 두시겠습니까?',
             keepBody: '{0}을(를) 끈 채로 시작했습니다. 앞으로도 꺼 두시겠습니까?',
@@ -2496,7 +2496,7 @@ export const languageKorean = {
             codeIntentQuarantined: '복구를 완료하지 못한 기록',
             discardIntent: '복구 기록 폐기',
             discardIntentTitle: '복구 기록을 폐기하시겠습니까?',
-            discardIntentDescription: '선택한 복구 기록이 삭제되며, 다시 시도하지 않습니다. 현재 데이터는 유지됩니다.',
+            discardIntentDescription: '선택한 복구 기록이 삭제되며, 다시 시도하지 않습니다.',
             discardIntentAcknowledge: '선택한 복구 기록 삭제',
             discardIntentFailed: '복구 기록을 폐기하지 못했습니다. 데이터를 다시 검사해주세요.',
             completeIntent: '복구 완료',
@@ -2543,7 +2543,7 @@ export const languageKorean = {
             exportFile: '내보내기',
             groupRestore: '복원',
             restoreHelp:
-                '계정 동기화 충돌 백업으로 데이터를 복원하며, 이 기기에 보관된 스냅샷은 저장 공간의 스냅샷 목록에서 되돌릴 수 있습니다.',
+                '계정 동기화 충돌 백업으로 데이터를 복원합니다.',
             restoreHelpWeb:
                 'PocketRisu 백업이나 계정 동기화 충돌 백업으로 데이터를 복원합니다.',
             groupAccount: '공식 계정',
@@ -2555,7 +2555,7 @@ export const languageKorean = {
             officialRestoreConfirm:
                 '공식 계정 백업으로 이 기기의 데이터를 교체하시겠습니까? 자동 백업은 만들지 않으므로, 기존 데이터를 보관하려면 먼저 직접 백업하세요.',
             officialRestoreInlayWarning:
-                '공식 스냅샷에는 별도로 저장된 채팅 첨부가 포함되지 않습니다. 연결된 이미지, 오디오, 동영상, 서명은 복원되지 않을 수 있습니다. 백업을 복원한 뒤 앱이 다시 시작됩니다. 계속하시겠습니까?',
+                '공식 계정 백업에는 별도로 저장된 채팅 첨부가 포함되지 않습니다. 연결된 이미지, 오디오, 동영상, 서명은 복원되지 않을 수 있습니다. 백업을 복원한 뒤 앱이 다시 시작됩니다. 계속하시겠습니까?',
             officialMissing:
                 '공식 계정 백업을 찾지 못했습니다. 이 기기의 데이터는 변경되지 않았습니다.',
             officialPublishConfirm:
@@ -2572,7 +2572,7 @@ export const languageKorean = {
             sourcePreserved:
                 '원본 DB와 파일을 보존했습니다. 이 보존용 백업으로 라이브러리를 교체하려면 데이터 점검에서 문제를 수정해야 합니다.',
             sourcePreservationConfirm:
-                '데이터를 복구해야 하며, 보존용 백업에 계정 정보가 포함될 수 있습니다. 보존용 백업을 저장하시겠습니까?',
+                '데이터를 복구해야 합니다. 보존용 백업에 계정 정보가 포함될 수 있습니다. 보존용 백업을 저장하시겠습니까?',
             originalDataAccountConfirm:
                 '원본 DB와 파일을 변경 없이 내보내며, 계정 정보가 포함될 수 있습니다. 원본 데이터를 내보내시겠습니까?',
             sourceRepairRequired:
@@ -2701,7 +2701,7 @@ export const languageKorean = {
             webViewUpdateRequired: 'Android System WebView를 업데이트한 후 로컬 데이터 삭제를 다시 시도해주세요.',
             cancel: '취소',
             title: '초기화',
-            scope: '이 기기의 대화, 캐릭터, 설정, 플러그인, 연결 정보, 내부 백업과 캐시를 삭제하며, 원격 데이터와 내보낸 백업은 유지됩니다.',
+            scope: '이 기기의 대화, 캐릭터, 설정, 플러그인, 연결 정보, 내부 백업과 캐시를 삭제합니다.',
             resetHelp: '로컬 데이터를 삭제한 후 온보딩으로 돌아갑니다.',
             prepareRemoval: '앱 제거 준비',
             removalHelp: '로컬 데이터 폴더를 삭제하고 앱을 종료합니다. 프로그램은 운영체제에서 제거해주세요.',
