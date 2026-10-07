@@ -485,19 +485,19 @@
         try {
             held = await remoteOnlyFiles(connection)
         } catch {}
-        let download = false
-        if (held !== 0) {
-            const choice = await alertCheckboxConfirm({
-                title: strings.removeRemoteOnlyTitle,
-                description: held === undefined ? strings.removeRemoteOnlyUnknown : strings.removeRemoteOnly,
-                checkboxLabel: strings.downloadThenRemove,
-                actionLabel: strings.remove,
-                cancelLabel: strings.cancel,
-                requireChecked: false,
-            })
-            if (!choice.confirmed) return
-            download = choice.checked
-        } else if (!(await alertConfirm(`${strings.remove}: ${externalConnectionTitle(strings, connection)}`))) return
+        const remoteOnly = held !== 0
+        // The card's own two lines tell apart connections to one service and account.
+        const name = `${externalConnectionTitle(strings, connection)}\n${connectionPlace(connection)}`
+        const choice = await alertCheckboxConfirm({
+            title: strings.removeTitle,
+            description: remoteOnly ? `${name}\n\n${held === undefined ? strings.removeRemoteOnlyUnknown : strings.removeRemoteOnly}` : name,
+            checkboxLabel: remoteOnly ? strings.downloadThenRemove : strings.remove,
+            actionLabel: strings.remove,
+            cancelLabel: strings.cancel,
+            requireChecked: !remoteOnly,
+        })
+        if (!choice.confirmed) return
+        const download = remoteOnly && choice.checked
         busy = true
         activeAction = `remove:${connection.id}`
         try {
@@ -689,6 +689,10 @@
         return value ? new Date(Number(value)).toLocaleString() : '—'
     }
 
+    function connectionPlace(connection: ExternalConnectionSummary): string {
+        return [connection.endpoint.authority, connection.endpoint.repositoryHint].join(' · ')
+    }
+
     function providerIcon(providerId: ExternalConnectionSummary['providerId']) {
         if (providerId === 'webdav') return ServerIcon
         if (providerId === 's3') return DatabaseIcon
@@ -767,7 +771,7 @@
                     <span class="provider" aria-hidden="true"><ProviderIcon size={18} /></span>
                     <div class="card-name">
                         <h3 class="card-title">{externalConnectionTitle(strings, connection)}</h3>
-                        <p class="card-sub">{[connection.endpoint.authority, connection.endpoint.repositoryHint].join(' · ')}</p>
+                        <p class="card-sub">{connectionPlace(connection)}</p>
                     </div>
                     <div class="card-status"><StatusBadge label={connectionStatus(connection)} tone={connectionTone(connection)} /></div>
                 </header>

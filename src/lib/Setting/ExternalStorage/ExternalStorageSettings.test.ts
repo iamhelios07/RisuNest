@@ -814,6 +814,8 @@ describe('removing a connection', () => {
     const held = (entries: { connectionId: string, objects: number }[]) => ({ policy: 'remote', localBytes: 0, remoteBytes: 1, remoteObjects: 1,
         serverBytes: 0, serverObjects: 0, externalObjects: entries, unavailableObjects: 0, evictedBytes: 0 })
     const removeButton = () => [...target.querySelectorAll('button')].find(button => button.textContent?.trim() === strings.remove)!
+    const name = `${strings.providers.webdav.name}
+https://synthetic.invalid · RisuNest`
     beforeEach(async () => {
         state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0', paused: false },
             connections: [connection(10, 30)], jobs: [] })
@@ -834,18 +836,46 @@ describe('removing a connection', () => {
     it.each([
         { name: 'holds no file', status: () => state.residency.mockResolvedValue(held([])) },
         { name: 'is not the one holding files', status: () => state.residency.mockResolvedValue(held([{ connectionId: 'other', objects: 3 }])) },
-    ])('asks the plain confirmation when the status $name', async ({ status }) => {
+    ])('asks for a checked confirmation that names the connection when the status $name', async ({ status }) => {
         status()
-        vi.mocked(alertConfirm).mockResolvedValue(true)
+        vi.mocked(alertCheckboxConfirm).mockResolvedValue({ confirmed: true, checked: true })
         removeButton().click(); await settle()
-        expect(alertCheckboxConfirm).not.toHaveBeenCalled(); expect(alertConfirm).toHaveBeenCalledOnce()
+        expect(alertCheckboxConfirm).toHaveBeenCalledExactlyOnceWith({
+            title: strings.removeTitle, description: name, checkboxLabel: strings.remove,
+            actionLabel: strings.remove, cancelLabel: strings.cancel, requireChecked: true,
+        })
+        expect(alertConfirm).not.toHaveBeenCalled()
         expect(state.removeConnection).toHaveBeenCalledExactlyOnceWith('connection-1'); expect(state.downloadRemote).not.toHaveBeenCalled()
+    })
+    it('keeps the connection when the confirmation is cancelled', async () => {
+        state.residency.mockResolvedValue(held([]))
+        vi.mocked(alertCheckboxConfirm).mockResolvedValue({ confirmed: false, checked: false })
+        removeButton().click(); await settle()
+        expect(state.removeConnection).not.toHaveBeenCalled()
+    })
+    it('names two connections to one service and account apart', async () => {
+        if (component) await unmount(component)
+        const other = { ...connection(10, 30), id: 'connection-2', endpoint: { ...connection(10, 30).endpoint, repositoryHint: 'RisuNest-sync' } }
+        state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0', paused: false }, connections: [connection(10, 30), other], jobs: [] })
+        state.residency.mockResolvedValue(held([]))
+        vi.mocked(alertCheckboxConfirm).mockResolvedValue({ confirmed: false, checked: false })
+        component = mount(ExternalStorageSettings, { target }); await settle()
+        for (const card of target.querySelectorAll('article')) {
+            [...card.querySelectorAll('button')].find(button => button.textContent?.trim() === strings.remove)!.click()
+            await settle()
+        }
+        expect(vi.mocked(alertCheckboxConfirm).mock.calls.map(([options]) => options.description)).toEqual([
+            name, `${strings.providers.webdav.name}
+https://synthetic.invalid · RisuNest-sync`,
+        ])
     })
     it('offers a download with unknown wording when residency cannot be read', async () => {
         state.residency.mockRejectedValue({ code: 'local-storage' })
         vi.mocked(alertCheckboxConfirm).mockResolvedValue({ confirmed: false, checked: false })
         removeButton().click(); await settle()
-        expect(alertCheckboxConfirm).toHaveBeenCalledWith(expect.objectContaining({ description: strings.removeRemoteOnlyUnknown }))
+        expect(alertCheckboxConfirm).toHaveBeenCalledWith(expect.objectContaining({ description: `${name}
+
+${strings.removeRemoteOnlyUnknown}`, requireChecked: false }))
         expect(alertConfirm).not.toHaveBeenCalled()
         expect(state.removeConnection).not.toHaveBeenCalled()
     })
@@ -854,7 +884,9 @@ describe('removing a connection', () => {
         vi.mocked(alertCheckboxConfirm).mockResolvedValue({ confirmed: false, checked: false })
         removeButton().click(); await settle()
         expect(alertCheckboxConfirm).toHaveBeenCalledExactlyOnceWith({
-            title: strings.removeRemoteOnlyTitle, description: strings.removeRemoteOnly, checkboxLabel: strings.downloadThenRemove,
+            title: strings.removeTitle, description: `${name}
+
+${strings.removeRemoteOnly}`, checkboxLabel: strings.downloadThenRemove,
             actionLabel: strings.remove, cancelLabel: strings.cancel, requireChecked: false,
         })
         expect(alertConfirm).not.toHaveBeenCalled()
