@@ -466,7 +466,7 @@ export async function requestExternalStorageRestore(
                         background.progress(measuredTaskPercent(Number(job.completedBytes), Number(job.totalBytes)))
                     }
                 },
-                // The native commit closes the persistent store until the renderer reopens it.
+                // Opens the store if the native commit could not reopen it.
                 reopenStore: () => getPersistentDataRuntime().store.open(),
                 refreshReleased: refreshActiveWorkingSetFromStore,
                 afterRefresh: async () => {

@@ -145,7 +145,7 @@ pub(crate) fn external_storage_capture_exit_target(app: AppHandle) -> Result<Val
     })())
 }
 #[tauri::command]
-pub(crate) fn external_storage_get_state(app: AppHandle) -> Result<Value> {
+pub(crate) fn external_storage_get_state<R: Runtime>(app: AppHandle<R>) -> Result<Value> {
     logged("external_storage_get_state", (|| {
         let root = root(&app)?;
         let connection_store = ConnectionStore::open(&root)?;
@@ -610,8 +610,8 @@ fn reconcile_job<R: Runtime>(app: &AppHandle<R>, mut job: DurableJob) -> Result<
         match super::runtime_restore::confirmed_restore_activation(app,&job) {
             Ok(Some(result))=>{job.summary["result"]=result;}
             Ok(None)=>{job.summary.as_object_mut().unwrap().remove("result");}
-            // A commit closes the renderer store until the renderer reopens it to
-            // adopt the library, and meanwhile the running worker's record stands.
+            // A commit's device maintenance refuses the store, and meanwhile the
+            // running worker's record stands.
             Err(error) if error.kind==ErrorKind::Transient && state.job_is_active(&job.id)? => {}
             Err(error)=>return Err(error),
         }
@@ -817,8 +817,7 @@ pub(crate) fn wake_job(app: AppHandle, id: String) -> Result<()> {
                         std::panic::Location::caller(),
                     );
                     let local_application = super::runtime_restore::application_started(&job);
-                    // A restore past its commit is pending either way, and the renderer
-                    // store that commit closed may not be open again yet.
+                    // A restore past its commit is pending either way, without reading the store.
                     let mut pds = if local_application { None } else { Some(native_store(&app)?) };
                     let authoritative = match pds.as_mut() {
                         Some(pds) => pds.external_job(&job.id).map_err(local_error)?,
