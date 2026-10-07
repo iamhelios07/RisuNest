@@ -885,7 +885,7 @@ impl<'a> Transfer<'a> {
         (bins, oversized)
     }
 
-    fn download_with_hints(
+    pub(crate) fn download_with_hints(
         &self,
         hashes: &[String],
         base_candidates: &[String],

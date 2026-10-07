@@ -50,6 +50,9 @@ impl LocalServerFixture {
             runtime: Some(runtime),
         }
     }
+    pub(crate) fn root(&self) -> &std::path::Path {
+        self._root.path()
+    }
     pub(crate) fn client(&self, store: &PersistentStore) -> LwwClient {
         let (config, stored) = self.candidate(store);
         store.server_save_config(&stored).unwrap();

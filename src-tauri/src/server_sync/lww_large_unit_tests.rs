@@ -113,6 +113,78 @@ fn lane(store: &PersistentStore, name: &str) -> std::path::PathBuf {
     store.repository_root().join("server-sync/lww-cache").join(name)
 }
 
+fn raw_bytes(client: &super::lww_client::LwwClient) -> (u64, u64) {
+    let counters = client.client.test_io.as_ref().unwrap();
+    let load = |value: &std::sync::atomic::AtomicU64| value.load(std::sync::atomic::Ordering::Relaxed);
+    (load(&counters.request_raw_bytes), load(&counters.response_raw_bytes))
+}
+
+/// Pushes a large root field from one store, receives it in another, then
+/// edits it and returns the raw bytes and routes of the edit's round trip.
+fn edit_round_trip(size: usize, expire_base: bool) -> ((u64, u64), Vec<&'static str>) {
+    let (server, routes) = recording_server(Default::default());
+    let (_a, mut a) = local();
+    let (_b, mut b) = local();
+    let ca = server.client(&a);
+    let cb = server.client(&b);
+    let original = random_text(size, 1);
+    save(&mut a, &["root", "customCSS"], json!(original));
+    drain_publications(&ca, &mut a, &[]).unwrap();
+    receive_available(&cb, &mut b, &[]).unwrap();
+    let mut edited = original;
+    edited.insert_str(size / 2, &random_text(64 * 1024, 2));
+    save(&mut a, &["root", "customCSS"], json!(edited));
+    routes.lock().unwrap().clear();
+    for client in [&ca, &cb] {
+        client.client.test_io.as_ref().unwrap().reset();
+    }
+    drain_publications(&ca, &mut a, &[]).unwrap();
+    if expire_base {
+        // The receiver comes back after the leases and upload sessions that kept
+        // the replaced body ran out and maintenance collected it.
+        let db = rusqlite::Connection::open(server.root().join("metadata.sqlite")).unwrap();
+        db.execute_batch("DELETE FROM object_leases; UPDATE uploads SET expires=0;").unwrap();
+        drop(db);
+        assert!(server.server.maintain().unwrap().objects_removed > 0);
+    }
+    receive_available(&cb, &mut b, &[]).unwrap();
+    let digest = |value: &Value| risunest_sync_wire::hash(value.to_string().as_bytes());
+    assert!(digest(&b.read_root(None).unwrap().value["customCSS"]) == digest(&json!(edited)));
+    for (store, name) in [(&a, "send"), (&b, "receive")] {
+        assert!(!lane(store, name).exists(), "{name}");
+    }
+    let sent = raw_bytes(&ca).0;
+    let received = raw_bytes(&cb).1;
+    let routes = routes.lock().unwrap().clone();
+    ((sent, received), routes)
+}
+
+#[test]
+fn an_edited_large_unit_moves_as_a_delta_in_both_directions() {
+    const MIB: u64 = 1024 * 1024;
+    // Below the inline delta limit, as one frame each way.
+    let ((sent, received), routes) = edit_round_trip(6 * MIB as usize, false);
+    eprintln!("6 MiB edit: sent {sent} received {received} routes {routes:?}");
+    assert!(sent < MIB && received < MIB, "{sent} {received}");
+    assert!(routes.contains(&"frames") && routes.contains(&"transfer"), "{routes:?}");
+    assert!(!routes.contains(&"chunk") && !routes.contains(&"part"), "{routes:?}");
+    // Above it, through the streamed delta jobs.
+    let ((sent, received), routes) = edit_round_trip(17 * MIB as usize, false);
+    eprintln!("17 MiB edit: sent {sent} received {received} routes {routes:?}");
+    assert!(sent < MIB && received < MIB, "{sent} {received}");
+    assert!(routes.contains(&"upload-delta") && routes.contains(&"object-delta"), "{routes:?}");
+    assert!(!routes.contains(&"chunk") && !routes.contains(&"part"), "{routes:?}");
+}
+
+#[test]
+fn a_receiver_whose_base_the_server_collected_downloads_the_whole_body() {
+    const MIB: u64 = 1024 * 1024;
+    let ((sent, received), routes) = edit_round_trip(6 * MIB as usize, true);
+    assert!(sent < MIB, "{sent}");
+    assert!(received > 6 * MIB, "{received}");
+    assert!(routes.contains(&"part"), "{routes:?}");
+}
+
 #[test]
 fn a_failed_push_keeps_its_copies_for_the_retry_and_a_finished_one_removes_them() {
     let fail_push = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
