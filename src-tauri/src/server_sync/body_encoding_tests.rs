@@ -353,6 +353,12 @@ fn encoded_replies_are_checked_before_callers_see_them() {
     use std::sync::atomic::AtomicUsize;
     let raw = text(4096, 7).into_bytes();
     let encoded = body_codec::encode(&raw).unwrap().unwrap();
+    let gzip = {
+        use std::io::Write;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&raw).unwrap();
+        encoder.finish().unwrap()
+    };
     let marked = |bytes: Vec<u8>, markers: usize| {
         let mut response = Response::new(Body::from(bytes));
         for _ in 0..markers {
@@ -387,6 +393,13 @@ fn encoded_replies_are_checked_before_callers_see_them() {
             }
         }))
         .route("/long", get(move || async move { marked(noise(2048), 1) }))
+        .route("/gzip", get(move || async move {
+            let mut response = Response::new(Body::from(gzip));
+            response
+                .headers_mut()
+                .insert("content-encoding", HeaderValue::from_static("gzip"));
+            response
+        }))
         .route("/cut", get({
             let calls = calls.clone();
             let encoded = encoded.clone();
@@ -447,6 +460,12 @@ fn encoded_replies_are_checked_before_callers_see_them() {
         );
     }
     assert_eq!(calls.swap(0, Ordering::SeqCst), 1, "a malformed frame is not retried");
+    // An HTTP content coding is refused, not decoded on the way in.
+    let error = get("gzip", raw.len()).err().unwrap();
+    assert_eq!(
+        (error.code.as_str(), error.status),
+        ("unexpected-content-encoding", 502)
+    );
     // A body cut mid-transfer is retried and then decoded.
     let reply = get("cut", raw.len()).unwrap();
     assert_eq!((reply.status, reply.body), (200, raw));

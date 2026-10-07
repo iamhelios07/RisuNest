@@ -409,7 +409,13 @@ impl ServerClient {
         retry_budget: Arc<RetryBudget>,
     ) -> Result<Self> {
         let url = config.validate()?;
+        // Other crates enable reqwest's decoders, which would strip a
+        // Content-Encoding this client has to see and refuse.
         let http = crate::platform_tls::blocking_client_builder()
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .no_zstd()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
