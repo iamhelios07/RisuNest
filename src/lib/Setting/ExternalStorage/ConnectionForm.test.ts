@@ -201,6 +201,20 @@ afterEach(async () => {
     target.remove()
 })
 
+describe('choosing a service', () => {
+    it('names the service once, as the label of its select', async () => {
+        component = mount(ConnectionForm, { target, props: { strings, onconnected: vi.fn(), oncancel: vi.fn() } })
+        await settle()
+
+        const headings = [...target.querySelectorAll('h1, h2, h3, h4, h5, h6')].map(item => item.textContent?.trim())
+        expect(headings).not.toContain(strings.provider)
+        const named = [...target.querySelectorAll('*')]
+            .filter(item => item.children.length === 0 && item.textContent?.trim() === strings.provider)
+        expect(named).toHaveLength(1)
+        expect(named[0].closest('label')?.querySelector('select')).not.toBeNull()
+    })
+})
+
 describe('opening an existing repository', () => {
     it('authenticates imported connection settings with the recovery key before review', async () => {
         state.prepareConnectionSettingsImport.mockResolvedValue({

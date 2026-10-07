@@ -644,7 +644,6 @@
     {#if !renewalConnection}
     <fieldset disabled={prepared !== null} class="contents">
     <section class="sub">
-        <h3 class="sub-title">{strings.provider}</h3>
         <div class="fields two">
             <label class="field">
                 <span>{strings.provider}</span>
