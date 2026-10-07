@@ -52,6 +52,8 @@ export class SyncDriver {
 
   /** The binding the native store holds before the product mounts. */
   async bindingTarget() {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("pds_open");
     const { createNativeSyncBindingBridge } = await import("../../src/ts/storage/sync/bindingNative");
     return (await createNativeSyncBindingBridge().state()).target.kind;
   }

@@ -24,11 +24,12 @@ async function markerAbsent(driver: SyncDriver, marker: string) {
   });
 }
 
-async function markerPresent(driver: SyncDriver, step: string, marker: string) {
+async function markerPresent(driver: SyncDriver, step: string, marker: string, context: Record<string, unknown> = {}) {
   let location: { characterId: string; conversationId: string } | undefined;
   await driver.step("sync-result", step, async () => {
     const search = await driver.findMarker(marker);
-    if (!search.location) missing(step, "the marker is not in the library", { characters: search.characters, conversations: search.conversations });
+    if (!search.location)
+      missing(step, "the marker is not in the library", { ...context, characters: search.characters, conversations: search.conversations });
     location = search.location;
     return { found: true, markerInLastMessage: search.markerInLastMessage, characters: search.characters, conversations: search.conversations };
   });
@@ -72,12 +73,17 @@ export async function receiveAndPush(driver: SyncDriver, input: { seed: Seed; re
   await driver.step("sync-result", "registration", () => driver.readRegistration(input.registration));
   const connected = await driver.step("sync-result", "connected", async () => {
     const outcome = await driver.connect("accept");
-    if (local.nonDefault && !outcome.replacementShown) missing("connected", "the product replaced local data without asking", outcome);
     if (outcome.replacementShown && outcome.replacementGatedByCheckbox !== true)
       missing("connected", "the replacement action was not gated by its checkbox", outcome);
-    return outcome;
+    return { ...outcome, localLibrary: local.nonDefault };
   });
-  const location = await markerPresent(driver, "expect-received", input.expect);
+  // Without a replacement the product found the server library empty; the marker search tells that apart.
+  const location = await markerPresent(driver, "expect-received", input.expect, { replacementShown: connected.replacementShown });
+  await driver.step("sync-result", "replacement-asked", async () => {
+    if (local.nonDefault && !connected.replacementShown)
+      missing("replacement-asked", "the server library replaced local data without the replacement confirmation");
+    return { asked: connected.replacementShown };
+  });
   const shown = await driver.step("sync-result", "working-set", () => driver.renderMarker(location, input.expect));
   await driver.step("sync-result", "marker-written", async () => {
     await driver.editLastMessage(location.characterId, input.marker, "sync-receive");
