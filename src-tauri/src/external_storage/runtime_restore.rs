@@ -17,7 +17,7 @@ use crate::native_log::logged;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::BTreeSet, path::Path};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, Runtime};
 #[cfg(test)]
 use super::worker_observation::spawn_blocking;
 #[cfg(not(test))]
@@ -79,7 +79,7 @@ fn persist_restore_intent(root:&Path, job:&DurableJob, intent:&RestoreCommitInte
 }
 
 /// Read-only completion recovery used before reopening a provider connection.
-pub(crate) fn completed_restore(app: &AppHandle, job: &DurableJob) -> Result<Option<Value>> {
+pub(crate) fn completed_restore<R: Runtime>(app: &AppHandle<R>, job: &DurableJob) -> Result<Option<Value>> {
     if job.summary.get("restoreAdopted").is_none() || job.summary["restoreBodiesComplete"]!=true
         || !JobStore::open(&runtime::root(app)?)?.restore_bodies_settled(&job.id)? {
         return Ok(None);
@@ -134,7 +134,7 @@ fn require_activated_target(store:&PersistentStore,job:&DurableJob,revision:i64)
     Ok(())
 }
 
-pub(crate) fn confirmed_restore_activation(app:&AppHandle,job:&DurableJob)->Result<Option<Value>> {
+pub(crate) fn confirmed_restore_activation<R: Runtime>(app:&AppHandle<R>,job:&DurableJob)->Result<Option<Value>> {
     if job.summary["applicationStarted"]!=true {return Ok(None);}
     let store=runtime::native_store(app)?;
     let Some(receipt)=completed_restore_in_store(&store,job)? else {return Ok(None)};
@@ -147,7 +147,7 @@ pub(crate) fn confirmed_restore_activation(app:&AppHandle,job:&DurableJob)->Resu
 }
 
 #[tauri::command]
-pub(crate) fn external_storage_confirm_restore_adoption(app:AppHandle,request:RestoreAdoptionRequest)->Result<Value> {
+pub(crate) fn external_storage_confirm_restore_adoption<R: Runtime>(app:AppHandle<R>,request:RestoreAdoptionRequest)->Result<Value> {
     logged("external_storage_confirm_restore_adoption", (|| confirm_restore_adoption_in_store(&runtime::native_store(&app)?,&runtime::root(&app)?,&request))())
 }
 
@@ -444,9 +444,11 @@ pub(crate) async fn run_restore(
     if let Some(result) = completed_restore(app, job)? {
         return Ok(result);
     }
-    if let Some(result)=completed_restore_in_store(&runtime::native_store(app)?,job)? {
-        return finish_restore_bodies(app,connected,job,result,None,cancel).await;
+    let store=runtime::native_store(app)?;
+    if let Some(result)=completed_restore_in_store(&store,job)? {
+        return finish_restore_bodies(app,connected,job,result,None,store,cancel).await;
     }
+    drop(store);
     let permit=app.state::<crate::native_file_jobs::NativeFileJobState>().admission.staging().map_err(runtime::local_error)?;
     let expected_revision = job
         .request
@@ -491,7 +493,7 @@ pub(crate) async fn run_restore(
             return Err(error);
         }
     };
-    finish_restore_bodies(app,connected,job,result.0,Some(result.1),cancel).await
+    finish_restore_bodies(app,connected,job,result.0,Some(result.1),result.2,cancel).await
 }
 
 fn restore_pins(root:&Path,id:&str)->Result<crate::asset_repository::job_pins::DurableCasJob> {
@@ -505,25 +507,28 @@ fn restore_pins(root:&Path,id:&str)->Result<crate::asset_repository::job_pins::D
     Ok(pins)
 }
 
-async fn finish_restore_bodies(app:&AppHandle,connected:&ConnectedRepository,job:&DurableJob,result:Value,
-    mut permit:Option<crate::native_file_jobs::admission::Permit>,cancel:&Cancellation)->Result<Value> {
+/// `store` is the connection the restore committed or recovered through. An
+/// in-session commit leaves the renderer store closed until the renderer
+/// reopens it to adopt the library, so this one serves the rest of the restore.
+async fn finish_restore_bodies<R: Runtime>(app:&AppHandle<R>,connected:&ConnectedRepository,job:&DurableJob,result:Value,
+    mut permit:Option<crate::native_file_jobs::admission::Permit>,store:PersistentStore,cancel:&Cancellation)->Result<Value> {
     let root=runtime::root(app)?;
     let jobs=JobStore::open(&root)?;
     if jobs.read(&job.id)?.summary["restoreBodiesReady"]!=true {return Err(corrupt());}
     let revision=result["receivedRevision"].as_str().ok_or_else(corrupt)?.parse::<i64>().map_err(|_|corrupt())?;
     let adoption=loop {
         let current=jobs.read(&job.id)?;
-        require_activated_target(&runtime::native_store(app)?,&current,revision)?;
+        require_activated_target(&store,&current,revision)?;
         if let Some(value)=current.summary.get("restoreAdopted") {
             let request:RestoreAdoptionRequest=serde_json::from_value(value.clone()).map_err(|_|corrupt())?;
-            confirm_restore_adoption_in_store(&runtime::native_store(app)?,&root,&request)?;
+            confirm_restore_adoption_in_store(&store,&root,&request)?;
             break request;
         }
         if permit.is_none() {permit=Some(app.state::<crate::native_file_jobs::NativeFileJobState>().admission.file(true).map_err(runtime::local_error)?);}
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     };
     drop(permit);
-    receive_restore_bodies_in_store(runtime::native_store(app)?,&root,connected,job,result,adoption.selected_character_id,cancel).await
+    receive_restore_bodies_in_store(store,&root,connected,job,result,adoption.selected_character_id,cancel).await
 }
 
 async fn receive_restore_bodies_in_store(mut store:PersistentStore,root:&Path,connected:&ConnectedRepository,job:&DurableJob,result:Value,selected_character_id:Option<String>,cancel:&Cancellation)->Result<Value> {
@@ -721,9 +726,10 @@ fn prepare_local_restore(
     sources:Vec<super::lww_residency::SharedPackedSource>,
     present:BTreeSet<String>,
     permit:crate::native_file_jobs::admission::Permit,
-) -> Result<(Value,crate::native_file_jobs::admission::Permit)> {
+) -> Result<(Value,crate::native_file_jobs::admission::Permit,PersistentStore)> {
     let mut store=runtime::native_store(app)?;
-    prepare_local_restore_in_store(&mut store,&app.state::<PersistentStoreState>(),job,expected_revision,snapshot,original_units,selection,sections,cancel,sources,present,permit)
+    let (result,permit)=prepare_local_restore_in_store(&mut store,&app.state::<PersistentStoreState>(),job,expected_revision,snapshot,original_units,selection,sections,cancel,sources,present,permit)?;
+    Ok((result,permit,store))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -742,8 +748,8 @@ fn prepare_local_restore_in_store(
     mut permit:crate::native_file_jobs::admission::Permit,
 ) -> Result<(Value,crate::native_file_jobs::admission::Permit)> {
     cancel.check()?;
-    // Open a dedicated native connection while renderer admission is still
-    // available. It remains owned across the maintenance WebView reload.
+    // The caller opened this dedicated native connection while renderer
+    // admission was available. It outlives the renderer store the commit closes.
     let root=store.repository_root().to_owned();
     let current_identity=store.external_identity().map_err(pds_error)?;
     runtime::require_admitted_library(job,&current_identity)?;
@@ -842,7 +848,6 @@ fn prepare_local_restore_in_store(
     store.release_replacement_source(&intent.staging_id).map_err(pds_error)?;
     drop(prepared);
     drop(maintenance);
-    cleanup_staging(&staging_root);
     let result=json!({
         "snapshotId": snapshot_id,
         "receivedRevision": revision.revision.to_string()
@@ -852,6 +857,8 @@ fn prepare_local_restore_in_store(
     current.summary["result"]=result.clone();
     current.summary["phase"]=json!("awaiting-adoption");
     jobs.put(&current)?;
+    // The renderer reopens its store once it reads this receipt, so the staging goes after it.
+    cleanup_staging(&staging_root);
     Ok((result,permit))
 }
 
@@ -1475,5 +1482,114 @@ pub(super) mod tests {
         assert!(durable_cas_job_ids(root).unwrap().is_empty());
         assert!(crate::asset_repository::PayloadCas::new(root).unwrap().stat_object(&asset).unwrap().is_some());
         assert!(PersistentStore::open(root).unwrap().asset_residency_status().is_ok());
+    }
+
+    /// A running app whose renderer has its store open at `root`.
+    fn restore_app(root:&Path)->tauri::App<tauri::test::MockRuntime> {
+        let app=tauri::test::mock_builder().build(tauri::test::mock_context(tauri::test::noop_assets())).unwrap();
+        app.manage(PersistentStoreState::with_test_store(PersistentStore::open(root).unwrap()));
+        app.manage(crate::native_file_jobs::NativeFileJobState::initialize(root.join("native-file-jobs")));
+        let jobs=super::super::job_store::JobCommandState::default();
+        jobs.root.set(root.to_owned()).unwrap();
+        app.manage(jobs);
+        app
+    }
+
+    /// Commits a restore of `backup` in the running `app` as its worker does, which leaves the renderer store closed.
+    async fn commit_in_session(app:&tauri::App<tauri::test::MockRuntime>,backup:&PackagedBackup)
+        ->(DurableJob,super::super::job_store::JobClaim,Value,crate::native_file_jobs::admission::Permit,PersistentStore) {
+        let root=runtime::root(app.handle()).unwrap();
+        ConnectionStore::open(&root).unwrap().insert(&backup.connected.stored).unwrap();
+        let mut store=runtime::native_store(app.handle()).unwrap();
+        let job=restore_job(&root,&store,backup);
+        let (_,claim)=app.state::<super::super::job_store::JobCommandState>().claim(&job).unwrap();
+        let (database,sections)=prepare_database_first_backup(&root,&backup.connected,&job,&Cancellation::default()).await.unwrap();
+        let permit=app.state::<crate::native_file_jobs::NativeFileJobState>().admission.staging().unwrap();
+        let (receipt,permit)=activate_database_first_backup(&mut store,&app.state::<PersistentStoreState>(),&job,database,sections,Cancellation::default(),permit).unwrap();
+        assert!(runtime::native_store(app.handle()).is_err());
+        (job,claim,receipt,permit,store)
+    }
+
+    #[test]
+    fn a_running_restore_reports_its_commit_while_the_renderer_store_is_closed() {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let backup=packaged_backup(&[vec![43;4096]]).await;
+            let destination=tempfile::tempdir().unwrap();
+            let app=restore_app(destination.path());
+            let (job,_claim,receipt,_permit,_store)=commit_in_session(&app,&backup).await;
+            let reported=runtime::external_storage_get_job(app.handle().clone(),job.id.clone()).unwrap();
+            assert_eq!(reported["result"],receipt);
+            assert_eq!((reported["state"].as_str(),reported["phase"].as_str()),(Some("running"),Some("awaiting-adoption")));
+            assert_eq!(reported["applicationStarted"],true);
+            // The gate a commit holds refuses the store the same way.
+            let maintenance=app.state::<PersistentStoreState>().acquire_device_maintenance().unwrap();
+            assert_eq!(runtime::external_storage_get_job(app.handle().clone(),job.id.clone()).unwrap(),reported);
+            drop(maintenance);
+        });
+    }
+
+    #[test]
+    fn a_restore_committed_in_session_succeeds_once_the_reopened_renderer_adopts_it() {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let bodies=vec![vec![44;4096],vec![45;8192]];
+            let backup=packaged_backup(&bodies).await;
+            let destination=tempfile::tempdir().unwrap();
+            let root=destination.path();
+            let app=restore_app(root);
+            let (job,claim,receipt,permit,store)=commit_in_session(&app,&backup).await;
+            let cancel=Cancellation::default();
+            let worker=finish_restore_bodies(app.handle(),&backup.connected,&job,receipt.clone(),Some(permit),store,&cancel);
+            let renderer=async {
+                assert_eq!(runtime::external_storage_get_job(app.handle().clone(),job.id.clone()).unwrap()["result"],receipt);
+                crate::persistent_store::commands::open_renderer_persistent_store(&app.state::<PersistentStoreState>(),root).unwrap();
+                let adoption=RestoreAdoptionRequest{job_id:job.id.clone(),received_revision:receipt["receivedRevision"].as_str().unwrap().into(),selected_character_id:None};
+                external_storage_confirm_restore_adoption(app.handle().clone(),adoption).unwrap();
+            };
+            let (finished,())=tokio::join!(worker,renderer);
+            assert_eq!(finished.unwrap(),receipt);
+            drop(claim);
+            let settled=runtime::external_storage_get_job(app.handle().clone(),job.id.clone()).unwrap();
+            assert_eq!((settled["state"].as_str(),settled["phase"].as_str()),(Some("succeeded"),Some("complete")));
+            assert_eq!(settled["result"],receipt);
+            let cas=crate::asset_repository::PayloadCas::new(root).unwrap();
+            for (asset,body) in backup.assets.iter().zip(&bodies) {assert_eq!(cas.read_object(asset).unwrap().unwrap(),*body);}
+        });
+    }
+
+    #[test]
+    fn a_restore_whose_worker_ended_after_its_commit_resumes_to_success_after_a_restart() {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let bodies=vec![vec![46;4096]];
+            let backup=packaged_backup(&bodies).await;
+            let destination=tempfile::tempdir().unwrap();
+            let root=destination.path();
+            let app=restore_app(root);
+            let (job,claim,receipt,permit,store)=commit_in_session(&app,&backup).await;
+            drop((claim,permit,store));
+            crate::persistent_store::commands::open_renderer_persistent_store(&app.state::<PersistentStoreState>(),root).unwrap();
+            let unfinished=runtime::external_storage_get_job(app.handle().clone(),job.id.clone()).unwrap();
+            assert_eq!((unfinished["state"].as_str(),unfinished["phase"].as_str()),(Some("uncertain"),Some("local-apply-unknown")));
+            assert!(unfinished["result"].is_null());
+            // Restoring the same backup again wakes the same job, which finds its commit.
+            let jobs=JobStore::open(root).unwrap();
+            let mut resumed=jobs.read(&job.id).unwrap();
+            resumed.summary["state"]=json!("running");
+            jobs.put(&resumed).unwrap();
+            let (_,claim)=app.state::<super::super::job_store::JobCommandState>().claim(&resumed).unwrap();
+            let store=runtime::native_store(app.handle()).unwrap();
+            assert_eq!(completed_restore_in_store(&store,&resumed).unwrap(),Some(receipt.clone()));
+            let cancel=Cancellation::default();
+            let worker=finish_restore_bodies(app.handle(),&backup.connected,&resumed,receipt.clone(),None,store,&cancel);
+            let renderer=async {
+                assert_eq!(runtime::external_storage_get_job(app.handle().clone(),job.id.clone()).unwrap()["result"],receipt);
+                let adoption=RestoreAdoptionRequest{job_id:job.id.clone(),received_revision:receipt["receivedRevision"].as_str().unwrap().into(),selected_character_id:None};
+                external_storage_confirm_restore_adoption(app.handle().clone(),adoption).unwrap();
+            };
+            let (finished,())=tokio::join!(worker,renderer);
+            assert_eq!(finished.unwrap(),receipt);
+            drop(claim);
+            let settled=runtime::external_storage_get_job(app.handle().clone(),job.id.clone()).unwrap();
+            assert_eq!((settled["state"].as_str(),settled["phase"].as_str()),(Some("succeeded"),Some("complete")));
+        });
     }
 }

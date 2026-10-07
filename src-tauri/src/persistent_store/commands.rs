@@ -501,7 +501,7 @@ pub(crate) fn pds_open(
 }
 
 #[cfg(test)]
-fn open_renderer_persistent_store(
+pub(crate) fn open_renderer_persistent_store(
     state: &PersistentStoreState,
     app_data_dir: &Path,
 ) -> StoreResult<PersistentStoreOpenResult> {
