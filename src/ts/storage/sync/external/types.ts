@@ -206,6 +206,8 @@ export interface ExternalJobSummary {
     id: string
     applicationStarted?: boolean
     restoreStopped?: boolean
+    /** The app cancelled the job after it kept failing; the user did not. */
+    stoppedByApp?: boolean
     reason?: 'automatic' | 'manual'
     targetRevision?: DecimalString
     restoreRequest?: {

@@ -305,7 +305,7 @@ fn refresh_transfer_counters(root: &std::path::Path, job: &mut DurableJob) {
     }
 }
 #[tauri::command]
-pub(crate) async fn external_storage_cancel_job(app: AppHandle, job_id: String) -> Result<Value> {
+pub(crate) async fn external_storage_cancel_job(app: AppHandle, job_id: String, stopped_by_app: Option<bool>) -> Result<Value> {
     logged("external_storage_cancel_job", async move {
         let store = JobStore::open(&root(&app)?)?;
         let state = app.state::<JobCommandState>();
@@ -342,14 +342,20 @@ pub(crate) async fn external_storage_cancel_job(app: AppHandle, job_id: String) 
             {
                 pds.external_cancel_prepared(&job_id).map_err(local_error)?;
             }
-            job.summary["state"] = json!("cancelled");
-            job.summary["phase"] = json!("cancelled");
-            job.summary["updatedAtMs"] = json!(now_ms().to_string());
+            settle_cancelled(&mut job, stopped_by_app == Some(true));
             store.put(&job)?;
         }
         super::runtime_restore::discard_finished_staging(&root(&app)?, &job);
         Ok(job.summary)
     }.await)
+}
+/// Settles a job as cancelled. A job the app gave up on after its own retries keeps that
+/// mark, so the renderer shows its error instead of a cancellation the user never made.
+fn settle_cancelled(job: &mut DurableJob, stopped_by_app: bool) {
+    job.summary["state"] = json!("cancelled");
+    job.summary["phase"] = json!("cancelled");
+    job.summary["updatedAtMs"] = json!(now_ms().to_string());
+    if stopped_by_app { job.summary["stoppedByApp"] = json!(true); }
 }
 #[tauri::command]
 pub(crate) async fn external_storage_stop_restore(app: AppHandle, job_id: String) -> Result<Value> {
@@ -1733,6 +1739,22 @@ mod tests {
         apply_job_connection_status(&mut repaired,&jobs);
         assert_eq!(repaired["status"],"ready");
         assert!(repaired["lastError"].is_null());
+    }
+
+    #[test]
+    fn a_cancelled_job_carries_the_app_stop_only_when_the_app_stopped_it() {
+        let mut by_user = automatic_job();
+        by_user.summary["error"] = json!({"code":"transient","action":"retry","retryable":true});
+        let mut by_app = by_user.clone();
+        settle_cancelled(&mut by_user, false);
+        settle_cancelled(&mut by_app, true);
+        for job in [&by_user, &by_app] {
+            assert_eq!(job.summary["state"], "cancelled");
+            assert_eq!(job.summary["phase"], "cancelled");
+            assert_eq!(job.summary["error"]["code"], "transient");
+        }
+        assert!(by_user.summary.get("stoppedByApp").is_none());
+        assert_eq!(by_app.summary["stoppedByApp"], true);
     }
 
     #[test]

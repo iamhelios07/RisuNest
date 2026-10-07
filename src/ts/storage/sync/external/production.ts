@@ -443,7 +443,7 @@ export async function requestExternalStorageRestore(
                             const resumed = await retryPausedJob(job, request, retries++, background)
                             if (resumed) { job = resumed; continue }
                             stopping = true
-                            job = await getExternalStorageBridge().cancelJob(jobId)
+                            job = await getExternalStorageBridge().cancelJob(jobId, !background.signal?.aborted)
                             continue
                         }
                         if (job.state === 'succeeded') throw new Error('External restore has no commit receipt')

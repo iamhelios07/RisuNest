@@ -274,11 +274,21 @@
             await refresh(true)
             schedulePoll()
         } catch (reason) {
-            error = externalErrorMessage(strings, reason)
+            const message = externalErrorMessage(strings, reason)
+            if (job === 'restore') await refresh(true)
+            if (job !== 'restore' || !rowShowsStoppedRestore(connection.id, message)) error = message
         } finally {
             busy = false
             activeAction = ''
         }
+    }
+
+    /** A restore the app stopped shows its error on the connection row, which the section does not repeat. */
+    function rowShowsStoppedRestore(connectionId: string, message: string): boolean {
+        const current = storageState?.connections.find(item => item.id === connectionId)
+        const latest = current && activeJob(current)
+        return !!current && !current.lastError && latest?.state === 'cancelled' && latest.stoppedByApp === true
+            && jobLabel(latest) === message
     }
 
     async function deleteHistory(
@@ -587,6 +597,7 @@
         if (job.state === 'queued') return strings.queued
         if (job.state === 'running') return strings.running
         if (job.state === 'conflict') return strings.resolveRequired
+        if (job.stoppedByApp) return errorLabel(job.error)
         return strings.cancelled
     }
 
@@ -758,7 +769,7 @@
                         </div>
                     {/if}
                 {/if}
-                {#if job && (!externalJobIsActive(job) || externalJobIsPaused(job)) && job.state !== 'succeeded' && !connection.lastError && !unfinishedRestore(job)}<SettingNotice role="status" tone={job.state === 'cancelled' ? 'info' : 'danger'} text={jobLabel(job)} />{/if}
+                {#if job && (!externalJobIsActive(job) || externalJobIsPaused(job)) && job.state !== 'succeeded' && !connection.lastError && !unfinishedRestore(job)}<SettingNotice role="status" tone={job.state === 'cancelled' && !job.stoppedByApp ? 'info' : 'danger'} text={jobLabel(job)} />{/if}
 
                 {#if unfinishedRestore(job)}
                     <SettingNotice role="status" text={strings.restoreUnfinished} />
