@@ -344,13 +344,15 @@ mod tests {
             let mut permissions = std::fs::metadata(&path).unwrap().permissions();
             permissions.set_readonly(true);
             std::fs::set_permissions(&path, permissions.clone()).unwrap();
-            let error = stream_to_sink(&mut body(vec![7; 16]), &mut sink, Some(16), 16, &cancel)
-                .await
-                .unwrap_err();
+            // A superuser may still open a read-only file for writing.
+            let refused = std::fs::OpenOptions::new().write(true).open(&path).is_err();
+            let result = stream_to_sink(&mut body(vec![7; 16]), &mut sink, Some(16), 16, &cancel).await;
             #[allow(clippy::permissions_set_readonly_false)]
             permissions.set_readonly(false);
             std::fs::set_permissions(&path, permissions).unwrap();
-            assert_eq!(error.kind, ErrorKind::LocalPermissionDenied);
+            if refused {
+                assert_eq!(result.unwrap_err().kind, ErrorKind::LocalPermissionDenied);
+            }
         });
     }
 
