@@ -854,7 +854,9 @@ mod tests {
             let source = captured.iter().flat_map(|section| &section.sources).next()
                 .expect("captured setting source");
             assert!(length < 120 || source.path.to_string_lossy().chars().count() > 260);
-            let prepared = prepare_received_backup_sections(&captured, &Cancellation::default())
+            let scratch = crate::external_storage::leftovers::scratch_directory(&root)
+                .expect("create app scratch");
+            let prepared = prepare_received_backup_sections(&captured, &scratch, &Cancellation::default())
                 .expect("read sections back");
             assert_eq!(prepared.len(), 3);
         }
