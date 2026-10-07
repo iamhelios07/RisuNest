@@ -1928,8 +1928,8 @@ export const languageKorean = {
             editBlockedTitle: '변경 작업이 끝나기를 기다리는 중',
             editBlocked: '다른 저장, 가져오기 또는 교체 작업이 라이브러리를 사용하고 있습니다. 계속 기다리거나 앱으로 돌아가세요.',
             saving: '앱을 닫기 전에 로컬 변경사항을 저장하고 있습니다.',
-            capturing: '종료할 때 게시할 저장 리비전을 고정하고 있습니다.',
-            syncing: '앱을 닫기 전에 저장된 변경사항을 게시하고 있습니다.',
+            capturing: '앱을 닫기 전에 동기화할 변경사항을 확인하고 있습니다.',
+            syncing: '앱을 닫기 전에 저장된 변경사항을 동기화하고 있습니다.',
             delayed: '동기화가 평소보다 오래 걸리고 있습니다. 사용자가 선택할 때까지 앱을 열어 둡니다.',
             blocked: '동기화를 마치려면 확인이 필요합니다. 다시 시도하거나, 동기화하지 않고 종료하거나, 앱으로 돌아갈 수 있습니다.',
             saveFailed: '로컬 변경사항을 저장하지 못했습니다. 다시 저장하거나, 저장하지 않고 종료하거나, 앱으로 돌아갈 수 있습니다.',
@@ -2038,7 +2038,7 @@ export const languageKorean = {
                 '연결하면 동기화 서버의 라이브러리를 이 기기로 받아옵니다. 용량이 큰 경우 시간이 소요될 수 있습니다.',
             connectRow: '서버 연결',
             connectRowHelp:
-                '서버에서 발급한 등록 코드를 붙여넣으세요. 기기마다 별도의 등록 코드가 필요합니다.',
+                '서버에서 만든 등록 코드를 붙여넣으세요. 기기마다 별도의 등록 코드가 필요합니다.',
             enterCode: '등록 코드 입력',
             viewList: '목록 보기',
             register: '등록',
@@ -2053,7 +2053,7 @@ export const languageKorean = {
                 externalOnly: '외부 저장소에만 있는 파일',
                 unavailable: '찾을 수 없는 파일',
                 cleanupNote:
-                    '이미 다운로드한 파일은 유지됩니다. 정리하면 서버에 있는 파일의 기기 사본만 삭제되며, 스냅샷에 필요한 파일은 스냅샷을 삭제할 때까지 유지됩니다.',
+                    '정리하면 서버에 있는 파일 중 이 기기의 사본을 삭제합니다.',
                 clean: '이 기기의 사본 정리',
                 cancel: '취소',
                 working: '파일 처리 중… 현재 요청이 끝나면 취소됩니다.',
@@ -2071,7 +2071,7 @@ export const languageKorean = {
                 reclaimable: '정리 가능',
                 clean: '필요 없는 임시 파일 정리',
                 ledger: '에셋 보관 기록',
-                ledgerHelp: '에셋 보관 방식에 필요한 기록이며 정리되지 않습니다.',
+                ledgerHelp: '에셋 보관 방식에 필요한 기록입니다.',
                 more: '이전 백업',
                 refresh: '목록 새로고침',
                 blockedReasons: {
@@ -2087,7 +2087,7 @@ export const languageKorean = {
                 deleteCleanupPending:
                     '로컬 백업은 삭제됐으며, 서버 정리는 나중에 계속됩니다.',
                 cleanConfirm:
-                    '필요 없는 임시 파일을 정리하시겠습니까? 진행 중인 작업에 필요한 파일과 이 기기의 라이브러리 파일은 그대로 둡니다.',
+                    '필요 없는 임시 파일을 정리하시겠습니까?',
             },
             backups: '충돌 백업',
             backupHelp:
@@ -2198,7 +2198,7 @@ export const languageKorean = {
             "cameraTimeout": 'QR 코드를 찾지 못했습니다. 다시 시도하거나 코드를 붙여넣으세요.',
             "openCameraSettings": '설정 열기',
             "registrationCodeHelpScan": '서버에서 발급한 등록 코드를 붙여넣거나 QR 코드를 스캔하세요. 기기마다 별도의 등록 코드가 필요합니다.',
-            "connectRowHelpScan": '서버에서 발급한 등록 코드를 붙여넣거나 QR 코드를 스캔하세요. 기기마다 별도의 등록 코드가 필요합니다.',
+            "connectRowHelpScan": '서버에서 만든 등록 코드를 붙여넣거나 QR 코드를 스캔하세요. 기기마다 별도의 등록 코드가 필요합니다.',
         },
         menuTitle: 'RisuNest',
         tabList: 'RisuNest 설정 탭',
@@ -2871,7 +2871,7 @@ export const languageKorean = {
                 conflictReceive: '저장소 내용 읽어오기',
                 conflictTake: '저장소 내용 사용',
                 errorSummary: '작업을 마치지 못했습니다.',
-                errorReason: '이 기기의 데이터는 그대로입니다. 인터넷 연결을 확인하고 다시 시도해주세요.',
+                errorReason: '인터넷 연결을 확인하고 다시 시도해주세요.',
                 retry: '다시 시도',
                 other: '다른 방법',
             },
@@ -2880,7 +2880,7 @@ export const languageKorean = {
                 lead: 'RisuAI 계정으로 로그인하여 계정 서버의 백업본을 불러옵니다. 로그인 창은 앱 안에서 열립니다.',
                 login: 'RisuAI 계정으로 로그인',
                 closeLogin: '로그인 창 닫기',
-                hint: '계정이 없다면 백업 파일이나 동기화를 사용해 주세요.',
+                hint: '계정이 없는 경우 백업 파일이나 동기화를 사용해주세요.',
                 signedIn: '{0}로 로그인됨',
                 cont: '계속',
             },
@@ -2891,7 +2891,7 @@ export const languageKorean = {
                 note: '채팅 첨부 파일이나 인레이 이미지 등은 포함되지 않습니다. 복원이 끝나면 앱이 다시 시작됩니다.',
                 restore: '복원하고 시작',
                 other: '다른 방법',
-                notRestored: '계정 백업을 적용하지 않았습니다. 로컬 데이터는 유지되었으므로 다시 시도하거나 다른 방법을 선택할 수 있습니다.',
+                notRestored: '계정 백업을 적용하지 않았습니다. 다시 시도하거나 다른 방법을 선택할 수 있습니다.',
             },
             done: {
                 title: '준비 완료',

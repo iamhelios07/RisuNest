@@ -2112,8 +2112,8 @@ export const languageEnglish = {
             editBlockedTitle: 'Waiting for changes to finish',
             editBlocked: 'Another save, import, or replacement is still using the library. Keep waiting, or return to the app.',
             saving: 'Saving local changes before the app closes.',
-            capturing: 'Locking the saved revision for this exit.',
-            syncing: 'Publishing saved changes before the app closes.',
+            capturing: 'Checking which changes to sync before the app closes.',
+            syncing: 'Syncing saved changes before the app closes.',
             delayed: 'Synchronization is taking longer than usual. The app will stay open until you choose what to do.',
             blocked: 'Synchronization needs attention before it can finish. You can retry, exit without syncing, or return to the app.',
             saveFailed: 'Local changes could not be saved. Retry saving, exit without saving, or return to the app.',
@@ -2237,7 +2237,7 @@ export const languageEnglish = {
                 externalOnly: 'Files only in external storage',
                 unavailable: 'Files not found',
                 cleanupNote:
-                    'Downloaded files stay on this device. Cleanup removes only local copies of files on the server. Files needed by a snapshot stay until that snapshot is deleted.',
+                    'Cleanup removes this device’s copies of files that are on the server.',
                 clean: 'Clear copies on this device',
                 cancel: 'Cancel',
                 working:
@@ -2256,7 +2256,7 @@ export const languageEnglish = {
                 reclaimable: 'Can be cleared',
                 clean: 'Clear unneeded temporary files',
                 ledger: 'Asset storage records',
-                ledgerHelp: 'Needed for asset storage and never cleared.',
+                ledgerHelp: 'Records the asset storage mode needs.',
                 more: 'Older backups',
                 refresh: 'Refresh list',
                 blockedReasons: {
@@ -2272,7 +2272,7 @@ export const languageEnglish = {
                 deleteCleanupPending:
                     'The local backup was deleted. Server cleanup will continue later.',
                 cleanConfirm:
-                    'Clear unneeded temporary files? Files the running operation needs and the library files on this device are kept.',
+                    'Clear unneeded temporary files?',
             },
             backups: 'Conflict backups',
             backupHelp:
@@ -3058,7 +3058,7 @@ export const languageEnglish = {
                 conflictReceive: 'Read the repository contents',
                 conflictTake: 'Use the repository contents',
                 errorSummary: 'This could not finish.',
-                errorReason: 'The data on this device is unchanged. Check your internet connection and try again.',
+                errorReason: 'Check your internet connection and try again.',
                 retry: 'Try again',
                 other: 'Another way',
             },
@@ -3079,7 +3079,7 @@ export const languageEnglish = {
                 note: 'Chat attachments and inlay images are not included. The app restarts once the restore finishes.',
                 restore: 'Restore and start',
                 other: 'Another way',
-                notRestored: 'The account backup was not applied. Local data was kept, so you can retry or choose another way.',
+                notRestored: 'The account backup was not applied. You can retry or choose another way.',
             },
             done: {
                 title: 'Ready',
