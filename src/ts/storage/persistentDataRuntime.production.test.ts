@@ -22,7 +22,7 @@ import {
 } from '../plugins/pluginStorageStore'
 import { getV2PluginAPIs } from '../plugins/plugins.svelte'
 import type { Database } from './database.svelte'
-import type { PersistentDataStore } from './persistentDataStore'
+import type { PersistentDataStore, PersistentUnitMutation } from './persistentDataStore'
 import { getDatabase, getEffectivePresetId, normalizeDatabaseDefaults, setDatabase, setDatabaseLite, setEffectivePresetOverride } from './database.svelte'
 import {
     configurePersistentDataRuntime,
@@ -999,14 +999,15 @@ describe('received removal of the selected character or conversation', () => {
             atProjection.push({ selected: get(selectedCharID), character: current?.chaId, conversation: current?.chats[current.chatPage ?? 0]?.id })
             deriveMirrors()
         }
-        const receive = async (keys: string[]) => {
+        const receive = async (units: (string | PersistentUnitMutation)[]) => {
+            const mutations = units.map((unit): PersistentUnitMutation => typeof unit === 'string' ? { key: unit, type: 'delete' } : unit)
             store.lwwStageReceive = async () => undefined
             store.lwwFinishReceive = async () => undefined
             store.lwwApplyReceive = async () => {
-                const result = keys.length === 0
+                const result = mutations.length === 0
                     ? { revision: runtime.revision }
-                    : await store.commit({ expectedRevision: runtime.revision, unitMutations: keys.map((key) => ({ key, type: 'delete' as const })) })
-                return { ...result, affectedKeys: keys, heldKeys: [], deferredKeys: [] }
+                    : await store.commit({ expectedRevision: runtime.revision, unitMutations: mutations })
+                return { ...result, affectedKeys: mutations.map((value) => value.key), heldKeys: [], deferredKeys: [] }
             }
             await runtime.applyLwwReceive({ bindingAuthority: '1', requestId: crypto.randomUUID(), changes: [], progress: { kind: 'server', cursor: '1' }, admittedTimeUpperMs: '100' })
         }
@@ -1059,6 +1060,18 @@ describe('received removal of the selected character or conversation', () => {
         expect(saveFailures).toEqual([])
         // Only the local position of the open conversation follows it.
         expect(commit.mock.calls.flatMap(([input]) => input.unitMutations ?? [])).toEqual([{ key: '["character","char-b","chatPage"]', type: 'set', value: 0 }])
+    })
+
+    it.each([true, false])('keeps the open conversation when a received order moves it (windowed=%s)', async (windowed) => {
+        const { store, runtime, receive, saveFailures, atProjection } = await receiveRuntime(windowed, 1)
+        await receive([{ key: '["order","conversations","char-b"]', type: 'set', value: { ids: ['b-chat-2', 'b-chat-1'], folders: [] } }])
+
+        expect(atProjection[0]).toEqual({ selected: 1, character: 'char-b', conversation: 'b-chat-1' })
+        expect(getDatabase().characters[1].chats.map((value) => value.id)).toEqual(['b-chat-2', 'b-chat-1'])
+        expect(runtime.captureSelectedConversationTarget()).toMatchObject({ characterId: 'char-b', conversationId: 'b-chat-1' })
+        expect(runtime.getSelectedConversationMode()).toBe(windowed ? 'windowed' : 'complete')
+        await runtime.flushPendingDataLocally('after-conversation-order')
+        expect(saveFailures).toEqual([])
     })
 
     it.each([true, false])('opens the first remaining conversation when the open one is removed (windowed=%s)', async (windowed) => {
