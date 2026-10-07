@@ -259,7 +259,10 @@ fn corrupt() -> ProviderError {
 fn pds_error(error: StoreError) -> ProviderError {
     match error {
         StoreError::RevisionConflict { .. } => ProviderError::new(ErrorKind::PreconditionFailed),
-        StoreError::Validation { .. } => corrupt(),
+        StoreError::Validation { message } => {
+            crate::nlog!("warn", "external restore rejected by the store: {message}");
+            corrupt()
+        }
         _ => ProviderError::new(ErrorKind::Transient),
     }
 }
