@@ -2976,6 +2976,12 @@ fn replacement_changes(
         }
         let value = source_value.clone().or_else(|| staged.cloned()).unwrap_or(UnitValue::Deleted);
         if !matches!(value, UnitValue::Deleted) && parent_status(tx, &key)? == "retired" {
+            // The identity remap moved every record the stage holds, so a
+            // source unit still under a retired ID belongs to no restored
+            // record and stays covered by its tombstone.
+            if staged.is_none() {
+                return Ok(());
+            }
             return Err(error("retired-record-id"));
         }
         let prior = read_unit(tx, &key)?

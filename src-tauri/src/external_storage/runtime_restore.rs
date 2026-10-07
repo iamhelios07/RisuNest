@@ -1335,7 +1335,7 @@ pub(super) mod tests {
 
     /// A full backup of a library holding `assets`, uploaded to a fake repository.
     pub(in crate::external_storage) struct PackagedBackup {
-        _source_root:tempfile::TempDir,
+        _source_root:Option<tempfile::TempDir>,
         _work:tempfile::TempDir,
         pub(in crate::external_storage) connected:ConnectedRepository,
         backup_id:String,
@@ -1350,16 +1350,24 @@ pub(super) mod tests {
 
     /// A packaged backup whose source device `seed` prepared first.
     pub(in crate::external_storage) async fn packaged_backup_seeded(assets:&[Vec<u8>],seed:impl FnOnce(&mut PersistentStore)) -> PackagedBackup {
-        use super::super::{fake,journal::{JobIdentity,TransferJournal},packaging,phase_progress::PhaseProgress};
-        use std::sync::Arc;
         let source_root=tempfile::tempdir().unwrap();
         let mut source=PersistentStore::open(source_root.path()).unwrap();
         seed(&mut source);
         let assets=assets.iter().enumerate().map(|(index,bytes)| crate::server_sync::lww_tests::put_asset(&mut source,&format!("assets/synthetic-restore-{index}.bin"),bytes).object_hash.unwrap()).collect::<Vec<_>>();
+        let mut backup=uploaded_backup(&mut source,assets).await;
+        backup._source_root=Some(source_root);
+        backup
+    }
+
+    /// A full backup of `source` as it is now, uploaded to a fake repository.
+    async fn uploaded_backup(source:&mut PersistentStore,assets:Vec<String>) -> PackagedBackup {
+        use super::super::{fake,journal::{JobIdentity,TransferJournal},packaging,phase_progress::PhaseProgress};
+        use std::sync::Arc;
+        let source_root=source.repository_root().to_owned();
         let probe=runtime::CancelProbe(Cancellation::default());
         let hydration=source.hydrate_external_capture_dependencies("sender",&probe).unwrap();
         let (lease,prepared)=source.lww_acquire_backup_capture(source.revision().unwrap()).unwrap();
-        let sections=super::super::sections::capture_prepared_backup_sections(&prepared,&source_root.path().join("backup-sections"),&probe.0).unwrap();
+        let sections=super::super::sections::capture_prepared_backup_sections(&prepared,&source_root.join("backup-sections"),&probe.0).unwrap();
         let capture=source.capture_external_library_from_lease_with_sections("sender",&hydration,&lease.lease,sections,&probe).unwrap();
         let sections=capture.catalog.backup_sections().unwrap();
         let original_units=capture.catalog.original_backup_units().unwrap();
@@ -1385,11 +1393,12 @@ pub(super) mod tests {
                 remote_generation:None,original_units,
             },
         };
-        let backup=packaging::package_and_upload(capture,sections,source_root.path(),&work.path().join("cache"),metadata,
+        let backup=packaging::package_and_upload(capture,sections,&source_root,&work.path().join("cache"),metadata,
             &connected.root_key,packaging::PackageLimits::from_capabilities(&connected.stored.capabilities).unwrap(),None,&mut transfer,
             connected.provider.as_ref(),&connected.handle,&PhaseProgress::silent(),&Cancellation::default()).await.unwrap();
+        source.release_revision(&lease.lease).unwrap();
         let restore_source=serde_json::to_value(backup.reference.stored(&connected.handle).unwrap()).unwrap();
-        PackagedBackup {_source_root:source_root,_work:work,connected,backup_id,provider,restore_source,assets}
+        PackagedBackup {_source_root:None,_work:work,connected,backup_id,provider,restore_source,assets}
     }
 
     /// A restore of `backup` admitted against the library at `root`.
@@ -1663,6 +1672,163 @@ pub(super) mod tests {
             drop(claim);
             let settled=runtime::external_storage_get_job(app.handle().clone(),job.id.clone()).unwrap();
             assert_eq!((settled["state"].as_str(),settled["phase"].as_str()),(Some("succeeded"),Some("complete")));
+        });
+    }
+
+    /// Restores `backup` over the library at `root`, admitted at its current revision.
+    async fn restore_over(root:&Path,store:&mut PersistentStore,backup:&PackagedBackup) -> Result<Value> {
+        ConnectionStore::open(root).unwrap().insert(&backup.connected.stored).unwrap();
+        let request=serde_json::from_value(json!({"connectionId":"synthetic-connection","kind":"restore","snapshotId":backup.backup_id,"targetRevision":store.revision().unwrap().to_string()})).unwrap();
+        let mut job=DurableJob::new(request,1,store.external_identity().unwrap());
+        job.summary["restoreSource"]=backup.restore_source.clone();
+        JobStore::open(root).unwrap().put(&job).unwrap();
+        let (database,sections)=prepare_database_first_backup(root,&backup.connected,&job,&Cancellation::default()).await?;
+        let admission=std::sync::Arc::new(crate::native_file_jobs::admission::Admission::default());
+        activate_database_first_backup(store,&PersistentStoreState::default(),&job,database,sections,Cancellation::default(),admission.staging().unwrap())
+            .map(|(receipt,_)|receipt)
+    }
+
+    const DELETED:&str="synthetic-deleted";
+    const DELETED_CHAT:&str="synthetic-deleted-chat";
+
+    fn unit_key(parts:&[&str]) -> risunest_sync_wire::unit::UnitKey {
+        risunest_sync_wire::unit::UnitKey::new(parts).unwrap()
+    }
+
+    fn retired_keys(store:&PersistentStore) -> Vec<String> {
+        let mut statement=store.library_rows().prepare("SELECT key FROM lww_retired ORDER BY key").unwrap();
+        statement.query_map([],|row|row.get(0)).unwrap().collect::<std::result::Result<_,_>>().unwrap()
+    }
+
+    fn live_unit(store:&PersistentStore,parts:&[&str]) -> bool {
+        use rusqlite::OptionalExtension;
+        let value:Option<String>=store.library_rows().query_row("SELECT value FROM lww_units WHERE key=?1",[unit_key(parts).as_str()],|row|row.get(0)).optional().unwrap();
+        value.is_some_and(|value| !matches!(serde_json::from_str(&value).unwrap(),risunest_sync_wire::unit::UnitValue::Deleted))
+    }
+
+    /// A character with one conversation whose message carries a bookmark, a bookmark name and a Hypa memo.
+    fn add_deleted_character(store:&mut PersistentStore) {
+        store.commit(&crate::persistent_store::WorkingSetCommit{expected_revision:store.revision().unwrap(),
+            add_character:Some(json!({"chaId":DELETED,"type":"character","name":"Synthetic deleted","chats":[{
+                "id":DELETED_CHAT,"name":"Synthetic chat",
+                "message":[{"role":"user","data":"synthetic message","chatId":"synthetic-message"}],
+                "bookmarks":["synthetic-message"],"bookmarkNames":{"synthetic-message":"kept"},"hypaV3Data":{"memos":["synthetic-message"]},
+            }]})),
+            unit_mutations:Some(vec![crate::persistent_store::lww::UnitMutation::Set{key:unit_key(&["order","characters"]),value:json!([DELETED])}]),
+            ..Default::default()}).unwrap();
+    }
+
+    /// Hard-deletes as the renderer does: the existence units and the character order without the character.
+    fn delete_existence(store:&mut PersistentStore,keys:&[&[&str]]) {
+        use crate::persistent_store::lww::UnitMutation;
+        let mut mutations=keys.iter().map(|key| UnitMutation::Delete{key:unit_key(key)}).collect::<Vec<_>>();
+        mutations.push(UnitMutation::Set{key:unit_key(&["order","characters"]),value:json!([])});
+        store.commit(&crate::persistent_store::WorkingSetCommit{expected_revision:store.revision().unwrap(),
+            unit_mutations:Some(mutations),..Default::default()}).unwrap();
+    }
+
+    /// Whether `store` publishes anything but a deletion under the deleted character's ID.
+    fn publishes_under_deleted_id(store:&PersistentStore) -> bool {
+        store.lww_read_outbox(store.lww_binding_authority().unwrap(),1000).unwrap().entries.iter()
+            .any(|entry| entry.key.components().iter().any(|part| part==DELETED)
+                && !matches!(entry.value,risunest_sync_wire::unit::UnitValue::Deleted))
+    }
+
+    /// The deleted character is back under a new ID with its conversation, whose ID is new when it
+    /// was retired as well, and its messages and message references. Only the new IDs are published.
+    fn assert_restored_under_new_ids(store:&PersistentStore,conversation_retired:bool) {
+        let database=store.materialize(None).unwrap();
+        let [character]=database["characters"].as_array().unwrap().as_slice() else {panic!("one character is restored")};
+        let id=character["chaId"].as_str().unwrap();
+        assert_ne!(id,DELETED);
+        assert_eq!(character["name"],"Synthetic deleted");
+        assert_eq!(database["characterOrder"],json!([id]));
+        let [chat]=character["chats"].as_array().unwrap().as_slice() else {panic!("one conversation is restored")};
+        let chat_id=chat["id"].as_str().unwrap();
+        assert_eq!(chat_id!=DELETED_CHAT,conversation_retired);
+        assert_eq!(chat["message"][0]["data"],"synthetic message");
+        assert_eq!(chat["message"][0]["chatId"],"synthetic-message");
+        assert_eq!(chat["bookmarks"],json!(["synthetic-message"]));
+        assert_eq!(chat["bookmarkNames"],json!({"synthetic-message":"kept"}));
+        assert_eq!(chat["hypaV3Data"],json!({"memos":["synthetic-message"]}));
+        let outbox=store.lww_read_outbox(store.lww_binding_authority().unwrap(),1000).unwrap().entries;
+        let published=|parts:&[&str]| outbox.iter().any(|entry| entry.key==unit_key(parts) && !matches!(entry.value,risunest_sync_wire::unit::UnitValue::Deleted));
+        assert!(published(&["exists","character",id]));
+        assert!(published(&["exists","conversation",id,chat_id]));
+        assert!(published(&["messages",id,chat_id]));
+        assert!(published(&["order","characters"]));
+        let order=risunest_sync_wire::unit::UnitValue::inline(&serde_json::to_vec(&json!({"ids":[chat_id],"folders":[]})).unwrap()).unwrap();
+        assert!(outbox.iter().any(|entry| entry.key==unit_key(&["order","conversations",id]) && entry.value==order));
+        assert!(!publishes_under_deleted_id(store));
+    }
+
+    fn run<T>(future:impl std::future::Future<Output=T>) -> T {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(future)
+    }
+
+    #[test]
+    fn a_backup_restores_a_character_deleted_after_it_under_a_new_id() {
+        let character:&[&str]=&["exists","character",DELETED];
+        let conversation:&[&str]=&["exists","conversation",DELETED,DELETED_CHAT];
+        // The renderer deletes the character's existence alone. A device can also hold the
+        // conversation's existence as retired, which a deletion before the character's leaves.
+        for retired in [vec![character],vec![conversation,character]] {
+            run(async {
+                let directory=tempfile::tempdir().unwrap();
+                let root=directory.path();
+                let mut store=PersistentStore::open(root).unwrap();
+                add_deleted_character(&mut store);
+                let backup=uploaded_backup(&mut store,Vec::new()).await;
+                for key in &retired {delete_existence(&mut store,&[key]);}
+                let mut expected=retired.iter().map(|parts| unit_key(parts).as_str().to_owned()).collect::<Vec<_>>();
+                expected.sort();
+                assert_eq!(retired_keys(&store),expected);
+
+                restore_over(root,&mut store,&backup).await.unwrap();
+
+                assert_restored_under_new_ids(&store,retired.contains(&conversation));
+            });
+        }
+    }
+
+    #[test]
+    fn a_backup_restores_a_character_whose_deletion_was_received_under_a_new_id() {
+        run(async {
+            let mut f=super::super::lww_tests::CycleFixture::new();
+            add_deleted_character(&mut f.a);
+            f.publish_a().await;
+            f.receive_b().await;
+            let backup=uploaded_backup(&mut f.b,Vec::new()).await;
+            delete_existence(&mut f.a,&[&["exists","character",DELETED]]);
+            f.publish_a().await;
+            f.receive_b().await;
+            assert_eq!(retired_keys(&f.b),[unit_key(&["exists","character",DELETED]).as_str()]);
+
+            let root=f.directory_b.path().to_owned();
+            restore_over(&root,&mut f.b,&backup).await.unwrap();
+
+            assert_restored_under_new_ids(&f.b,false);
+        });
+    }
+
+    #[test]
+    fn a_backup_holding_units_of_a_character_deleted_before_it_restores_without_them() {
+        run(async {
+            let directory=tempfile::tempdir().unwrap();
+            let root=directory.path();
+            let mut store=PersistentStore::open(root).unwrap();
+            add_deleted_character(&mut store);
+            delete_existence(&mut store,&[&["exists","character",DELETED]]);
+            // The units under the deleted character outlive it, so the backup carries them.
+            assert!(live_unit(&store,&["conversation",DELETED,DELETED_CHAT,"bookmarkNames"]));
+            assert!(live_unit(&store,&["exists","conversation",DELETED,DELETED_CHAT]));
+            let backup=uploaded_backup(&mut store,Vec::new()).await;
+
+            restore_over(root,&mut store,&backup).await.unwrap();
+
+            assert_eq!(store.materialize(None).unwrap()["characters"],json!([]));
+            assert_eq!(retired_keys(&store),[unit_key(&["exists","character",DELETED]).as_str()]);
+            assert!(!publishes_under_deleted_id(&store));
         });
     }
 }
