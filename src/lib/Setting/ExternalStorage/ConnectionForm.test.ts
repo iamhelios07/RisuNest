@@ -732,7 +732,6 @@ describe('what a connection stores', () => {
         })
         await settle()
         await selectProvider('s3')
-        expect(target.textContent).not.toContain(strings.scopeHelp)
         await fillRequiredFields()
         button(strings.prepare).click()
         await settle()

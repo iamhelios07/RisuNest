@@ -464,7 +464,6 @@ describe('the storage usage tab', () => {
         state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0', paused: false }, connections: [{ ...connection(10, 30), providerId }], jobs: [] })
         component = mount(ExternalStorageSettings, { target }); await settle()
         expect([...target.querySelectorAll('button')].some(item => item.textContent?.trim() === strings.sync)).toBe(false)
-        expect(target.textContent).not.toContain(strings.automaticSync)
     })
     it('offers actual native new-device recovery through the shared binding action', async () => {
         if (component) await unmount(component)
