@@ -5,7 +5,7 @@ import type { Chat, Database, botPreset, character } from './database.svelte'
 import type { PersistentRevisionReader, PersistentRoot } from './persistentDataStore'
 import { canonicalClone, canonicalJson, clonePersistentRootFields } from './saveCoordinatorHelpers'
 import { captureMaterializedCharacter, CHARACTER_SHARED_FIELDS, CONVERSATION_SHARED_FIELDS } from './persistentUnitCapture'
-import { isWorkingSetCharacterStub } from './workingSetCatalog'
+import { isWorkingSetCharacterStub, patchCatalogCharacterField } from './workingSetCatalog'
 
 type CompleteCharacter = character
 
@@ -125,13 +125,18 @@ export async function applyLwwWorkingSetUnits(
             const live = charactersById.get(id)
             const before = baselineById.get(id)
             const remote = details.get(id)
-            if (!live || !before || !remote) continue
+            if (!live || !remote) continue
+            // A stub keeps only catalog fields; a baseline left from an earlier hydration still follows the stored record.
+            const stub = isWorkingSetCharacterStub(live)
+            if (stub) patchCatalogCharacterField(live, remote, field)
+            if (!before) continue
+            const current = stub ? {} as CompleteCharacter : live
             for (const key of [field]) {
-                if (key !== 'statics' || allowLocalFields) { patchField(live, before, remote, key); continue }
+                if (key !== 'statics' || allowLocalFields) { patchField(current, before, remote, key); continue }
                 const sharedStatics = (value: unknown) => value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).filter(([key]) => key !== 'messages')) : value
-                const liveView = {statics:sharedStatics(live['statics'])}, beforeView = {statics:sharedStatics(before['statics'])}
+                const liveView = {statics:sharedStatics(current['statics'])}, beforeView = {statics:sharedStatics(before['statics'])}
                 patchField(liveView, beforeView, {statics:sharedStatics(remote['statics'])}, 'statics')
-                for (const [target, view] of [[live,liveView],[before,beforeView]] as const) {
+                for (const [target, view] of [[current,liveView],[before,beforeView]] as const) {
                     const local = target['statics'] as Record<string, unknown> | undefined
                     if (view.statics === undefined && !local?.messages) delete target['statics']
                     else target['statics'] = {...view.statics as object, ...(local && Object.hasOwn(local, 'messages') ? {messages:local.messages} : {})}
