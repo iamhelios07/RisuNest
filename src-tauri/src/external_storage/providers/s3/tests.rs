@@ -2110,3 +2110,24 @@ fn lost_multipart_completion_requires_exact_remote_bytes() {
         assert!(line(&records[4]).starts_with("GET "));
     });
 }
+
+/// The external LWW opening admits its clock from the listing it requests.
+#[test]
+fn every_profile_listing_yields_a_usable_clock_sample() {
+    runtime().block_on(async {
+        let date = httpdate::fmt_http_date(std::time::UNIX_EPOCH + std::time::Duration::from_millis(NOW_MS));
+        for profile in ["aws", "r2", "b2", "hf", "generic"] {
+            let server = WireServer::start(vec![
+                reply(200, &[("Date", &date)], listing("descriptors", &["descriptor-1"], None)),
+                reply(200, &[("Date", &date)], listing("segments", &[], None)),
+            ]);
+            let test = dependencies();
+            let (provider, handle) = opened(&test, profile, &server).await;
+            let started = std::time::Instant::now();
+            provider.list_objects(&handle, Collection::Segments, None, 1, &Cancellation::default()).await.unwrap();
+            assert!(test.dependencies.requests.clock_sample_after(&handle.account, started).unwrap().is_some(), "{profile}");
+            let records = server.requests.lock().unwrap();
+            assert!(line(&records[1]).starts_with("GET ") && header(&records[1], "cache-control").as_deref() == Some("no-cache, no-store"), "{profile}");
+        }
+    });
+}
