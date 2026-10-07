@@ -43,6 +43,7 @@
     } from 'src/ts/storage/sync/external/types'
     import { externalRestoreAreas } from 'src/ts/storage/sync/external/restoreScope'
     import { downloadRemoteAssets, getAssetResidencyStatus } from 'src/ts/storage/sync/serverAssetResidency'
+    import { formatRisuNestStorageBytes } from 'src/ts/storage/risuNestStorageDashboard'
     import ConnectionForm from './ConnectionForm.svelte'
     import { externalConnectionTitle, externalErrorKind, externalErrorMessage, externalStorageStrings } from './strings'
 
@@ -574,17 +575,7 @@
     }
 
     function bytes(value?: string): string {
-        if (!value) return '—'
-        const amount = BigInt(value)
-        const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']
-        let divisor = 1n
-        let index = 0
-        while (index < units.length - 1 && amount >= divisor * 1024n) {
-            divisor *= 1024n
-            index += 1
-        }
-        if (index === 0) return `${amount} B`
-        return `${Number((amount * 10n) / divisor) / 10} ${units[index]}`
+        return value ? formatRisuNestStorageBytes(Number(value)) : '—'
     }
 
     function jobLabel(job: ExternalJobSummary): string {

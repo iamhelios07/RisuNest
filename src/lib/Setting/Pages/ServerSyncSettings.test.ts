@@ -24,7 +24,7 @@ vi.mock('src/ts/storage/fileOperationErrorPresentation', () => ({ presentFileOpe
 vi.mock('src/ts/characterCards', () => ({ hubURL: 'https://synthetic.invalid' }))
 vi.mock('src/ts/globalApi.svelte', () => ({ getVersionString: () => 'synthetic' }))
 vi.mock('src/ts/gui/colorscheme', () => ({ updateTextThemeAndCSS: vi.fn() }))
-vi.mock('src/ts/gui/nativeFileJobDialogModel', () => ({ buildNativeFileJobDialogModel: () => ({ open: false }), formatElapsed: (milliseconds: number) => `${Math.floor(milliseconds / 1000)}s` }))
+vi.mock('src/ts/gui/nativeFileJobDialogModel', async importOriginal => ({ formatBytes: (await importOriginal<typeof import('src/ts/gui/nativeFileJobDialogModel')>()).formatBytes, buildNativeFileJobDialogModel: () => ({ open: false }), formatElapsed: (milliseconds: number) => `${Math.floor(milliseconds / 1000)}s` }))
 vi.mock('src/ts/process/templates/templates', () => ({ prebuiltPresets: {} }))
 vi.mock('src/ts/storage/database.svelte', () => ({ setPreset: f.preset }))
 vi.mock('src/ts/storage/nativeFileJobManager', async () => { const { writable } = await import('svelte/store'); return { cancelActiveNativeFileOperation: vi.fn(), dismissNativeFileOperationOutcome: vi.fn(), nativeFileJobHost: writable('dialog'), nativeFileOperation: writable(null), nativeFileOperationOutcome: writable(null) } })
@@ -335,6 +335,12 @@ it('counts only files the server holds as kept only on the server', async () => 
     const row = [...host.querySelectorAll('*')].find(node => node.children.length === 0 && node.textContent === sync.residency.remoteOnly)?.parentElement?.parentElement
     expect(row?.textContent).toContain('4.0 MiB')
     expect(host.textContent).not.toContain('8.0 MiB')
+})
+it('prints an empty server share in the same unit as external storage sizes', async () => {
+    await mountBound(residencyStatus({ remoteBytes: 0, remoteObjects: 0, serverBytes: 0, serverObjects: 0 }))
+    const row = [...host.querySelectorAll('*')].find(node => node.children.length === 0 && node.textContent === sync.residency.remoteOnly)?.parentElement?.parentElement
+    expect(row?.textContent).toContain('0 B')
+    expect(host.textContent).not.toContain('bytes')
 })
 describe('downloading files kept only on the server', () => {
     it.each([
