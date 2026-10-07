@@ -2220,7 +2220,6 @@ export const languageKorean = {
             exportPartial: '사용 가능한 파일을 내보냈지만, 일부 원본 파일을 완전히 내보내지 못했습니다.',
             exportCancelled: '내보내기가 취소되었습니다.',
             exportFailed: '원본 파일을 내보내지 못했습니다.',
-            exportUnavailable: '앱 시작 준비를 마치지 못해 원본 데이터 내보내기를 사용할 수 없습니다.',
             startNormally: '그대로 시작',
             keepBody: '{0}을(를) 끈 채로 시작했습니다. 앞으로도 꺼 두시겠습니까?',
         },

@@ -2405,7 +2405,6 @@ export const languageEnglish = {
             exportPartial: 'The available files were exported, but some source files could not be captured completely.',
             exportCancelled: 'The export was cancelled.',
             exportFailed: 'The original files could not be exported.',
-            exportUnavailable: 'Original data export is unavailable because the app could not finish starting up.',
             startNormally: 'Start normally',
             keepBody:
                 'The app started with {0} left off. Keep them off from now on?',
