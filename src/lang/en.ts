@@ -1920,6 +1920,7 @@ export const languageEnglish = {
             storage: 'Changes could not be saved. Free storage space, then retry saving.',
             tooLarge: 'Changes are too large to save. Delete the large chat or data you just added, then retry saving.',
             currentChat: 'Changes to the current chat could not be saved. Retry saving. If saving keeps failing, restart the app; unsaved changes will be lost.',
+            deleted: 'Changes to data deleted on another device could not be saved. Delete that data, then retry saving.',
             settings: 'Settings', conversation: 'Chat', presets: 'Presets', plugins: 'Plugin data', assets: 'Assets', data: 'Data',
         },
         account: {
