@@ -907,6 +907,8 @@ https://synthetic.invalid · RisuNest-sync`,
         removeButton().click(); await settle()
         expect(alertCheckboxConfirm).toHaveBeenCalledWith(expect.objectContaining({ description: `${name}
 
+${strings.removeDeletes}
+
 ${strings.removeRemoteOnlyUnknown}`, requireChecked: false }))
         expect(alertConfirm).not.toHaveBeenCalled()
         expect(state.removeConnection).not.toHaveBeenCalled()
@@ -930,6 +932,8 @@ ${strings.removeRemoteOnlyUnknown}`, requireChecked: false }))
             await vi.advanceTimersByTimeAsync(100); await settle()
             expect(alertCheckboxConfirm).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ description: `${name}
 
+${strings.removeDeletes}
+
 ${strings.removeRemoteOnlyUnknown}`, requireChecked: false }))
             expect(target.querySelector('button[aria-busy="true"]')).toBeNull()
             expect(removeButton().disabled).toBe(false)
@@ -944,6 +948,8 @@ ${strings.removeRemoteOnlyUnknown}`, requireChecked: false }))
         removeButton().click(); await settle()
         expect(alertCheckboxConfirm).toHaveBeenCalledExactlyOnceWith({
             title: strings.removeTitle, description: `${name}
+
+${strings.removeDeletes}
 
 ${strings.removeRemoteOnly}`, checkboxLabel: strings.downloadThenRemove,
             actionLabel: strings.remove, cancelLabel: strings.cancel, requireChecked: false,

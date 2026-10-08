@@ -515,7 +515,7 @@
         const name = `${externalConnectionTitle(strings, connection)}\n${connectionPlace(connection)}`
         const choice = await alertCheckboxConfirm({
             title: strings.removeTitle,
-            description: remoteOnly ? `${name}\n\n${held === undefined ? strings.removeRemoteOnlyUnknown : strings.removeRemoteOnly}` : name,
+            description: remoteOnly ? `${name}\n\n${strings.removeDeletes}\n\n${held === undefined ? strings.removeRemoteOnlyUnknown : strings.removeRemoteOnly}` : name,
             checkboxLabel: remoteOnly ? strings.downloadThenRemove : strings.removeAcknowledge,
             actionLabel: strings.remove,
             cancelLabel: strings.cancel,
