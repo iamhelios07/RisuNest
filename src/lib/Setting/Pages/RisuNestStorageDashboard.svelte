@@ -272,7 +272,7 @@
         <div data-storage-summary-placeholder class="p-4" role="status" aria-live="polite" aria-label={language.loading}>
             <div class="h-9 w-40 animate-pulse rounded-md bg-darkbutton" aria-hidden="true"></div>
             <div class="mt-3 h-3 w-full animate-pulse rounded-full bg-darkbutton" aria-hidden="true"></div>
-            <div class="mt-3 grid grid-cols-1 gap-x-5 gap-y-1.5 @md:grid-cols-3" aria-hidden="true">
+            <div class="mt-3 grid grid-cols-[repeat(auto-fit,minmax(min(100%,14rem),1fr))] gap-x-5 gap-y-1.5" aria-hidden="true">
                 {#each Array(3) as _}
                     <div class="h-4 animate-pulse rounded-xs bg-darkbutton"></div>
                 {/each}
