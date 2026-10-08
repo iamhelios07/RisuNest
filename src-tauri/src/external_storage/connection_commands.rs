@@ -2070,10 +2070,18 @@ async fn commit_preparation(
     } else {
         None
     };
-    Ok(ConnectionResult {
-        connection: connection::summary(&stored),
-        recovery,
-    })
+    Ok(committed_result(&stored, preparation.request.mode, recovery))
+}
+
+/// A stored connection does not keep how it was opened, so the result carries the request's mode.
+fn committed_result(
+    stored: &StoredConnection,
+    mode: ConnectionOpenMode,
+    recovery: Option<RecoveryKeyMaterial>,
+) -> ConnectionResult {
+    let mut connection = connection::summary(stored);
+    connection.mode = mode;
+    ConnectionResult { connection, recovery }
 }
 
 async fn validate_sync_folder_before_commit(
@@ -2875,6 +2883,17 @@ mod tests {
             verified_at_ms: 1,
             last_sync_at_ms: None, last_backup_at_ms: None, retention_policy: None,
         }
+    }
+
+    #[test]
+    fn a_committed_connection_reports_the_mode_it_was_opened_in() {
+        let stored = renewal_fixture();
+        let created = committed_result(&stored, ConnectionOpenMode::Create, Some(RecoveryKeyMaterial { key: "recovery".into() }));
+        assert!(created.connection.mode == ConnectionOpenMode::Create);
+        assert!(created.recovery.is_some());
+        let opened = committed_result(&stored, ConnectionOpenMode::Existing, None);
+        assert!(opened.connection.mode == ConnectionOpenMode::Existing);
+        assert!(opened.recovery.is_none());
     }
 
     #[test]
