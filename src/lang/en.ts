@@ -2407,8 +2407,9 @@ export const languageEnglish = {
             exportCancelled: 'The export was cancelled.',
             exportFailed: 'The original files could not be exported.',
             startNormally: 'Start normally',
-            keepBody:
-                'The app started with {0} left off. Keep them off from now on?',
+            keepTitle: 'Keep these off from now on?',
+            keepDescription: 'Left off for this start: {0}',
+            keepAction: 'Keep off',
         },
         storage: {
             snapshotSizeNote:

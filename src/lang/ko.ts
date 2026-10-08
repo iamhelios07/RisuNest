@@ -2222,7 +2222,9 @@ export const languageKorean = {
             exportCancelled: '내보내기가 취소되었습니다.',
             exportFailed: '원본 파일을 내보내지 못했습니다.',
             startNormally: '그대로 시작',
-            keepBody: '{0}을(를) 끈 채로 시작했습니다. 앞으로도 꺼 두시겠습니까?',
+            keepTitle: '앞으로도 꺼 두시겠습니까?',
+            keepDescription: '이번 시작에서 끈 항목: {0}',
+            keepAction: '앞으로도 끄기',
         },
         storage: {
             snapshotSizeNote:

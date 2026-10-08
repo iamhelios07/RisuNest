@@ -207,6 +207,24 @@ export async function alertCheckboxConfirm(options: AlertCheckboxConfirmOptions)
         : result
 }
 
+export interface AlertActionConfirmOptions {
+    title: string
+    description: string
+    actionLabel: string
+    cancelLabel: string
+}
+
+/** The checkbox confirmation without a checkbox, for a choice whose two answers need their own labels. */
+export async function alertActionConfirm(options: AlertActionConfirmOptions): Promise<boolean> {
+    let confirmed = false
+    await alertStoreImported.open({
+        type: 'checkboxConfirm', msg: options.title,
+        checkboxConfirm: { ...options, checkboxLabel: '', requireChecked: false },
+        onCheckboxConfirm: (reported) => { confirmed = reported.confirmed },
+    })
+    return confirmed
+}
+
 export async function alertConfirm(msg:string){
 
     const result = await alertStoreImported.open({
