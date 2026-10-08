@@ -90,6 +90,8 @@
     let pollTimer: ReturnType<typeof setTimeout> | undefined
     /** The state a sync switch was set to while its change runs. Otherwise it shows the device's sync target. */
     let syncRequest = $state<Record<string, boolean>>({})
+    /** The state an automatic backup switch was set to while its change runs. Otherwise it shows the stored setting. */
+    let automaticRequest = $state<Record<string, boolean>>({})
     let stopBindingChanges: (() => void) | undefined
 
     async function setSyncBinding(connection: ExternalConnectionSummary, enabled: boolean): Promise<void> {
@@ -373,12 +375,17 @@
     async function setAutomaticWork(connection: ExternalConnectionSummary, enabled: boolean): Promise<void> {
         if (!storageState || busy) return
         busy = true
+        automaticRequest[connection.id] = enabled
         try {
             await bridge.setAutomaticBackupPaused(connection.id, !enabled)
             await refreshExternalStorageProductionState()
-            await refresh(true)
+            error = ''
         } catch (reason) { error = externalErrorMessage(strings, reason) }
-        finally { busy = false }
+        finally {
+            await refresh(true)
+            delete automaticRequest[connection.id]
+            busy = false
+        }
     }
 
     async function unlock(): Promise<void> {
@@ -840,7 +847,7 @@
 
                 <div class="controls">
                     {#if connection.purpose === 'backup'}
-                        <SettingToggle showLabel label={strings.automaticBackup} disabled={busy} checked={!connection.automaticBackupPaused} onchange={enabled => setAutomaticWork(connection, enabled)} />
+                        <SettingToggle showLabel label={strings.automaticBackup} disabled={busy} checked={automaticRequest[connection.id] ?? !connection.automaticBackupPaused} onchange={enabled => setAutomaticWork(connection, enabled)} />
                     {:else}
                         <SettingToggle showLabel label={strings.makeSyncTarget} disabled={busy} checked={syncRequest[connection.id] ?? syncTarget} onchange={enabled => setSyncBinding(connection, enabled)} />
                     {/if}

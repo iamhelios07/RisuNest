@@ -1100,6 +1100,61 @@ describe('the sync switch', () => {
     })
 })
 
+describe('the automatic backup switch', () => {
+    const view = (paused: boolean) => ({ supported: true, selection: { kind: 'none', selectionEpoch: '0', paused: false }, connections: [{ ...connection(10, 30), automaticBackupPaused: paused }], jobs: [] })
+    const toggle = () => [...target.querySelectorAll('label')].find(item => item.textContent?.trim() === strings.automaticBackup)!.querySelector('input')!
+    const drawnChecked = () => !!toggle().closest('label')!.querySelector('svg')
+    async function show(paused: boolean): Promise<void> {
+        state.getState.mockResolvedValue(view(paused))
+        state.listHistory.mockResolvedValue({ items: [] })
+        target = document.createElement('div')
+        document.body.append(target)
+        component = mount(ExternalStorageSettings, { target })
+        await settle()
+    }
+    beforeEach(() => { vi.clearAllMocks(); state.setAutomaticBackupPaused.mockReset() })
+    afterEach(() => {
+        if (component) unmount(component)
+        component = undefined
+        target.remove()
+    })
+
+    it('shows the stored setting again after turning it off failed', async () => {
+        await show(false)
+        state.setAutomaticBackupPaused.mockRejectedValue({ kind: 'transient' })
+        toggle().click(); await settle()
+        expect(state.setAutomaticBackupPaused).toHaveBeenCalledExactlyOnceWith('connection-1', true)
+        expect(toggle().checked).toBe(true)
+        expect(drawnChecked()).toBe(true)
+        expect(target.querySelector('[role="alert"]')).not.toBeNull()
+        toggle().click(); await settle()
+        expect(state.setAutomaticBackupPaused).toHaveBeenLastCalledWith('connection-1', true)
+    })
+
+    it('shows the requested setting only while the change runs', async () => {
+        await show(true)
+        let finish!: () => void
+        state.setAutomaticBackupPaused.mockImplementation(() => new Promise<void>(resolve => { finish = resolve }))
+        toggle().click(); await settle()
+        expect(state.setAutomaticBackupPaused).toHaveBeenCalledExactlyOnceWith('connection-1', false)
+        expect(toggle().checked).toBe(true)
+        expect(drawnChecked()).toBe(true)
+        state.getState.mockResolvedValue(view(true))
+        finish(); await settle()
+        expect(toggle().checked).toBe(false)
+        expect(drawnChecked()).toBe(false)
+    })
+
+    it('stays on the new setting once it is stored', async () => {
+        await show(true)
+        state.setAutomaticBackupPaused.mockImplementation(async () => { state.getState.mockResolvedValue(view(false)) })
+        toggle().click(); await settle()
+        expect(toggle().checked).toBe(true)
+        expect(drawnChecked()).toBe(true)
+        expect(target.querySelector('[role="alert"]')).toBeNull()
+    })
+})
+
 describe('the connection card text', () => {
     async function show(connections: unknown[], jobs: unknown[] = []): Promise<void> {
         state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0', paused: false }, connections, jobs })
