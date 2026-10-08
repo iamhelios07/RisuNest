@@ -667,6 +667,52 @@ describe('selected conversation lifecycle', () => {
         expect(harness.workingSet.captureSelectedConversationAuthority()).not.toBeNull()
     })
 
+    it('waits for background persistence queued during the promotion read', async () => {
+        const harness = makeHarness(3)
+        expect(harness.workingSet.tryDemoteSelectedConversation()).toBe(true)
+        const target = harness.workingSet.captureSelectedConversationTarget()!
+        harness.setReadConversation(vi.fn(async () => {
+            harness.setPendingPersistence(true)
+            return { revision: 7, value: structuredClone(harness.persistedConversation) }
+        }) as typeof harness.readConversation)
+        harness.coordinator.flushPendingData.mockImplementation(async () => {
+            harness.setPendingPersistence(false)
+        })
+
+        const lease = await harness.workingSet.acquireCompleteConversation('bound-editor', target)
+
+        expect(harness.coordinator.flushPendingData).toHaveBeenCalledTimes(2)
+        expect(harness.readConversation).toHaveBeenCalledOnce()
+        expect(harness.workingSet.selectedConversationMode).toBe('complete')
+        expect(lease.session.totalMessages).toBe(3)
+        lease.release()
+    })
+
+    it('reads the conversation again when background persistence moves the promotion revision', async () => {
+        const harness = makeHarness(3)
+        expect(harness.workingSet.tryDemoteSelectedConversation()).toBe(true)
+        const target = harness.workingSet.captureSelectedConversationTarget()!
+        let revision = 7
+        harness.setReadConversation(vi.fn(async () => {
+            if (revision === 7) harness.setPendingPersistence(true)
+            return { revision, value: structuredClone(harness.persistedConversation) }
+        }) as typeof harness.readConversation)
+        harness.coordinator.flushPendingData.mockImplementation(async () => {
+            if (!harness.coordinator.hasPendingPersistenceWork) return
+            harness.setPendingPersistence(false)
+            revision = 8
+            harness.setCoordinatorRevision(8)
+            harness.workingSet.advanceStoreRevision(8, undefined, true)
+        })
+
+        const lease = await harness.workingSet.acquireCompleteConversation('bound-editor', target)
+
+        expect(harness.readConversation).toHaveBeenCalledTimes(2)
+        expect(harness.workingSet.selectedConversationMode).toBe('complete')
+        expect(lease.target.storeRevision).toBe(8)
+        lease.release()
+    })
+
     it('keeps the windowed owner when complete adoption fails after publication', async () => {
         const harness = makeHarness(3)
         expect(harness.workingSet.tryDemoteSelectedConversation()).toBe(true)
