@@ -978,7 +978,7 @@
                                         </span>
                                     </label>
                                 </div>
-                                <p class="help">{strings.retentionHelp} {strings.retentionOtherDevices}</p>
+                                <p class="help">{strings.retentionHelp}</p>
                             </section>
                             <section class="usage-section">
                                 {#if connection.capabilities.snapshotDiscovery && connection.capabilities.leaseOperations && connection.capabilities.deleteObjects}
