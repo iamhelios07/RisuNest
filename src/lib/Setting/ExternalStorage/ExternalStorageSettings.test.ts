@@ -1153,6 +1153,39 @@ describe('the automatic backup switch', () => {
         expect(drawnChecked()).toBe(true)
         expect(target.querySelector('[role="alert"]')).toBeNull()
     })
+
+    // Native reports a connection whose automatic backup is off as `paused`.
+    const turnedOff = () => {
+        const value = { ...connection(10, 30), status: 'paused' as const, automaticBackupPaused: true }
+        value.capabilities = { ...value.capabilities, leaseOperations: true, deleteObjects: true }
+        return value
+    }
+
+    it('keeps the connection shown as connected while automatic backup is off', async () => {
+        state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0', paused: false }, connections: [turnedOff()], jobs: [] })
+        state.listHistory.mockResolvedValue({ items: [] })
+        target = document.createElement('div')
+        document.body.append(target)
+        component = mount(ExternalStorageSettings, { target })
+        await settle()
+        const badge = target.querySelector('.card-status .status')!
+        expect(badge.textContent?.trim()).toBe(strings.statusReady)
+        expect(badge.getAttribute('data-tone')).toBe('connected')
+        expect(toggle().checked).toBe(false)
+    })
+
+    it('still offers cleanup while automatic backup is off', async () => {
+        state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0', paused: false }, connections: [turnedOff()], jobs: [] })
+        state.listHistory.mockResolvedValue({ items: [] })
+        state.getQuota.mockRejectedValue({ kind: 'transient', httpStatus: null, retryAtMs: null })
+        target = document.createElement('div')
+        document.body.append(target)
+        component = mount(ExternalStorageSettings, { target })
+        await settle()
+        await openStorageUsage()
+        const cleanup = [...target.querySelectorAll('button')].find(button => button.textContent?.trim() === strings.cleanup)
+        expect(cleanup?.disabled).toBe(false)
+    })
 })
 
 describe('the connection card text', () => {

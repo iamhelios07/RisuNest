@@ -640,9 +640,13 @@
         return externalErrorMessage(strings, value)
     }
 
+    /** A connection whose automatic backup is off reports `paused`, and it runs every other job. */
+    function connectionUsable(connection: ExternalConnectionSummary): boolean {
+        return connection.status === 'ready' || connection.status === 'paused'
+    }
+
     function connectionStatusLabel(status: ExternalConnectionSummary['status']): string {
-        if (status === 'ready') return strings.statusReady
-        if (status === 'paused') return strings.statusPaused
+        if (status === 'ready' || status === 'paused') return strings.statusReady
         if (status === 'reauth-required') return strings.statusReauth
         if (status === 'key-locked') return strings.statusLocked
         return strings.statusError
@@ -663,12 +667,11 @@
             && connection.lastError?.reason === job?.error?.reason
     }
 
-    function connectionTone(connection: ExternalConnectionSummary): 'connected' | 'working' | 'paused' | 'attention' {
+    function connectionTone(connection: ExternalConnectionSummary): 'connected' | 'working' | 'attention' {
         const job = activeJob(connection)
         if (job && (externalJobIsPaused(job) || job.state === 'uncertain')) return 'attention'
         if (job && externalJobIsActive(job)) return 'working'
-        if (connection.status === 'ready') return 'connected'
-        if (connection.status === 'paused') return 'paused'
+        if (connectionUsable(connection)) return 'connected'
         return 'attention'
     }
 
@@ -973,7 +976,7 @@
                             <section class="usage-section">
                                 {#if connection.capabilities.snapshotDiscovery && connection.capabilities.leaseOperations && connection.capabilities.deleteObjects}
                                     <div class="actions">
-                                        <SettingButton variant="secondary" busy={activeAction === `cleanup:${connection.id}`} disabled={busy || connection.status !== 'ready' || storageState.jobs.some(job => job.connectionId === connection.id && externalJobIsActive(job))} onclick={() => runJob(connection, 'cleanup')}>{strings.cleanup}</SettingButton>
+                                        <SettingButton variant="secondary" busy={activeAction === `cleanup:${connection.id}`} disabled={busy || !connectionUsable(connection) || storageState.jobs.some(job => job.connectionId === connection.id && externalJobIsActive(job))} onclick={() => runJob(connection, 'cleanup')}>{strings.cleanup}</SettingButton>
                                     </div>
                                 {/if}
                                 <p class="help">{strings.cleanupTrashNotice} {strings.providerCapacityHelp}</p>
