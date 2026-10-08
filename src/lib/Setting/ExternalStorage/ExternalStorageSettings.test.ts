@@ -540,7 +540,7 @@ describe('the storage usage tab', () => {
         const tab = [...target.querySelectorAll('button')].find(item => item.textContent?.trim() === strings.history)!; tab.click(); await settle()
         const remove = [...target.querySelectorAll('button')].find(item => item.textContent?.trim() === strings.deleteHistory)!; remove.click(); await settle()
         expect(alertCheckboxConfirm).toHaveBeenCalledOnce(); expect(alertConfirm).not.toHaveBeenCalled()
-        expect(alertCheckboxConfirm).toHaveBeenCalledWith(expect.objectContaining({ requireChecked: true, description: `${strings.deleteOtherDeviceConfirm} ${strings.deleteLastRetainedConfirm}` }))
+        expect(alertCheckboxConfirm).toHaveBeenCalledWith(expect.objectContaining({ requireChecked: true, description: `${strings.deleteOtherDeviceConfirm} ${strings.deleteLastRetainedConfirm}`, checkboxLabel: strings.deleteHistoryAcknowledge, actionLabel: strings.deleteHistory }))
         expect(requestExternalStorageDeleteHistory).toHaveBeenCalledWith('connection-1', item, true, true)
     })
     it('keeps the quota label scoped to locally known repository data', async () => {

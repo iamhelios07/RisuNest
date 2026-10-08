@@ -326,7 +326,7 @@
                 const answer = await alertCheckboxConfirm({
                     title: strings.deleteHistoryConfirm,
                     description: descriptions.join(' '),
-                    checkboxLabel: strings.deleteHistory,
+                    checkboxLabel: strings.deleteHistoryAcknowledge,
                     actionLabel: strings.deleteHistory,
                     cancelLabel: strings.cancel,
                     requireChecked: true,
