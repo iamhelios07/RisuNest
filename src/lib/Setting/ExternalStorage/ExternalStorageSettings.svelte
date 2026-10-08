@@ -490,7 +490,7 @@
         try {
             held = await Promise.race([
                 remoteOnlyFiles(connection),
-                new Promise<undefined>(resolve => { timer = setTimeout(resolve, REMOTE_ONLY_CHECK_MS) }),
+                new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), REMOTE_ONLY_CHECK_MS) }),
             ])
         } catch {} finally {
             clearTimeout(timer)
