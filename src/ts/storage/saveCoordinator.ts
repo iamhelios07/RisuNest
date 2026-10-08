@@ -2762,11 +2762,6 @@ export class SaveCoordinator {
                     ? this.captureDetachedCharacter()
                     : null
             const addition = this.capturePendingAddition()
-            if (windowedCapture && addition) {
-                throw new WindowedConversationRequiresCompatibilityError(
-                    'character addition requires a complete selected character',
-                )
-            }
             let conversationProjection: ConversationMutationProjection | null
             try {
                 conversationProjection = windowedCapture
