@@ -582,6 +582,8 @@ impl HydrationSession {
         let mut seen = std::collections::BTreeSet::new();
         let digests = digests.iter().filter(|hash| seen.insert((*hash).clone())).cloned().collect::<Vec<_>>();
         let scope = lane.as_ref().map(|lane| lane.asset_plan(Some(digests.len())));
+        // Finding what is already here comes before the downloads this scope plans below.
+        if let Some(lane) = &lane { lane.step(super::progress::Step::Preparing); }
         let mut completed = std::collections::BTreeSet::new();
         let mut opened = |hash: &str, outcome| {
             if completed.insert(hash.to_owned()) {
@@ -630,6 +632,10 @@ impl HydrationSession {
             std::thread::yield_now();
         }
         let external = digests.iter().filter(|hash| external.remove(hash.as_str())).cloned().collect::<Vec<_>>();
+        // Every server body's size is known before the first download, so its byte total is planned
+        // once, on the lane the downloading clients report to.
+        let planned_bytes = server_pages.iter().flatten().map(|object| object.size).sum::<u64>();
+        if let Some(lane) = super::progress::current().filter(|_| planned_bytes > 0) { lane.plan_files(0, planned_bytes); }
         for selected in [true, false] {
             for page in &server_pages {
                 let objects = page.iter().filter(|object| {
@@ -683,7 +689,6 @@ impl HydrationSession {
                     }
                     let cache = self.cache.as_ref().unwrap();
                     let client = self.clients.get(&key).unwrap();
-                    client.lane().plan_files(0, objects.iter().map(|object| object.size).sum());
                     super::transfer::Transfer::new(client, cache)?.with_check(check)
                         .download(&objects.iter().map(|object| object.hash.clone()).collect::<Vec<_>>(), &[])?;
                     for object in objects {
