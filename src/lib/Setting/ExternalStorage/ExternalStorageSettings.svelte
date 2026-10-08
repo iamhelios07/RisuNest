@@ -786,6 +786,7 @@
             {@const remedy = renewable || lockable || recheckable || retryable}
             {@const syncTarget = storageState.selection.kind === 'external' && storageState.selection.connectionId === connection.id}
             {@const backedUp = connection.purpose === 'backup' || !!connection.lastBackupAtMs}
+            {@const synced = connection.purpose === 'sync' && !!connection.lastSyncAtMs}
             <article class="card">
                 <header class="card-head">
                     <span class="provider" aria-hidden="true"><ProviderIcon size={18} /></span>
@@ -823,8 +824,9 @@
                         <div class="actions"><SettingButton variant="secondary" size="sm" onclick={() => exportRun && bridge.cancelExport(exportRun.id)}>{strings.cancel}</SettingButton></div>
                     </div>
                 {/if}
-                {#if backedUp || job?.state === 'succeeded'}
+                {#if backedUp || synced || job?.state === 'succeeded'}
                     <dl class="kv">
+                        {#if synced}<dt>{language.risuNest.serverSync.lastSuccess}</dt><dd>{when(connection.lastSyncAtMs)}</dd>{/if}
                         {#if backedUp}<dt>{strings.lastBackup}</dt><dd>{when(connection.lastBackupAtMs)}</dd>{/if}
                         {#if job && job.state === 'succeeded'}<dt>{strings.progress}</dt><dd role="status" aria-live="polite">{jobSummary(job)}</dd>{/if}
                     </dl>

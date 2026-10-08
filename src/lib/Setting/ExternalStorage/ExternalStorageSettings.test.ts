@@ -38,7 +38,7 @@ vi.mock('src/ts/alert', () => ({ alertConfirm: vi.fn(), alertNormal: vi.fn(), al
 vi.mock('src/ts/storage/sync/external/lwwProduction', () => ({ requestExternalLwwNow: state.syncNow, supportsExternalLwwNewDevice: () => state.remedy, subscribeExternalLwwFailures(callback: (value: ReadonlyMap<string, unknown>) => void) { callback(new Map(state.failures)); return () => {} } }))
 vi.mock('src/ts/storage/sync/bindingRegistry', () => ({ bindSyncTarget: state.bind, unbindSyncTarget: state.unbind }))
 vi.mock('src/ts/storage/sync/bindingNative', () => ({ createNativeSyncBindingBridge: () => ({ state: async () => state.binding }) }))
-vi.mock('src/lang', () => ({ language: { lwwSync: { newDeviceAction: 'Connect as new device', clockBlocked: 'Correct the device clock and retry.', previousStorageUnavailable: 'The previous storage could not be reached.', downloadFailedNotConnected: 'The files could not be downloaded, so the connection was not made.' } } }))
+vi.mock('src/lang', () => ({ language: { risuNest: { serverSync: { lastSuccess: 'Last sync' } }, lwwSync: { newDeviceAction: 'Connect as new device', clockBlocked: 'Correct the device clock and retry.', previousStorageUnavailable: 'The previous storage could not be reached.', downloadFailedNotConnected: 'The files could not be downloaded, so the connection was not made.' } } }))
 vi.mock('src/ts/storage/sync/serverAssetResidency', () => ({ getAssetResidencyStatus: state.residency, downloadRemoteAssets: state.downloadRemote }))
 vi.mock('src/ts/stores.svelte' , () => ({ DBState: { db: { language: 'en' } } }))
 vi.mock('src/ts/storage/sync/external/production', () => ({
@@ -1175,6 +1175,24 @@ describe('the connection card text', () => {
     it('shows no last backup on a sync connection that never made one', async () => {
         await show([{ ...connection(10, 30), purpose: 'sync', strategy: 'sequential' }])
         expect(target.textContent).not.toContain(strings.lastBackup)
+    })
+
+    it('shows when a sync connection last synced, formatted like the last backup', async () => {
+        await show([{ ...connection(10, 30), purpose: 'sync', strategy: 'sequential', lastSyncAtMs: '1000' }])
+        const terms = [...target.querySelectorAll('dt')]
+        const row = terms.find(term => term.textContent === 'Last sync')
+        expect(row?.nextElementSibling?.textContent).toBe(new Date(1000).toLocaleString())
+        expect(occurrences(strings.lastBackup)).toBe(0)
+    })
+
+    it('shows no last sync on a sync connection that has not synced', async () => {
+        await show([{ ...connection(10, 30), purpose: 'sync', strategy: 'sequential' }])
+        expect(target.textContent).not.toContain('Last sync')
+    })
+
+    it('shows both times on a sync connection that also made a backup', async () => {
+        await show([{ ...connection(10, 30), purpose: 'sync', strategy: 'sequential', lastSyncAtMs: '2000', lastBackupAtMs: '1000' }])
+        expect([...target.querySelectorAll('dt')].map(term => term.textContent)).toEqual(['Last sync', strings.lastBackup])
     })
 
     it('keeps the last backup on a backup connection', async () => {
