@@ -36,7 +36,10 @@ export async function appCleanupBeforeBootstrap(): Promise<void> {
     }
     const ko = navigator.language.startsWith('ko')
     const host = document.createElement('main')
-    host.style.cssText = 'font:16px system-ui;padding:2rem;max-width:42rem;margin:auto;line-height:1.6;color:var(--risu-theme-textcolor,inherit);background:var(--risu-theme-bgcolor,transparent)'
+    // The body does not scroll and #app fills it, so the page covers the viewport itself.
+    host.style.cssText = 'position:fixed;inset:0;z-index:100;overflow:auto;color:var(--risu-theme-textcolor,inherit);background:var(--risu-theme-bgcolor,transparent)'
+    const panel = document.createElement('section')
+    panel.style.cssText = 'font:16px system-ui;padding:2rem;max-width:42rem;margin:auto;line-height:1.6'
     const heading = document.createElement('h1')
     heading.textContent = ko ? 'RisuNest 초기화' : 'RisuNest reset'
     const message = document.createElement('p')
@@ -101,7 +104,8 @@ export async function appCleanupBeforeBootstrap(): Promise<void> {
         action.disabled = cancel.disabled = true
         void invoke('app_cleanup_cancel').catch(refreshFailure)
     }
-    host.append(heading, message, action, cancellation, cancel)
+    panel.append(heading, message, action, cancellation, cancel)
+    host.append(panel)
     document.getElementById('preloading')?.remove()
     document.body.append(host)
     if (status?.pending && status.error !== null) showFailure(status.error)
