@@ -2148,6 +2148,9 @@ export const languageKorean = {
         },
         ui: {
             title: 'UI',
+            messageSendKey: '메시지 보내기 키',
+            messageSendKeyHelp: '채팅 입력창에서 어떤 키를 눌러야 메시지가 보내질지 결정합니다. Enter를 선택하는 경우 Shift+Enter로 줄바꿈이 가능하고, Ctrl/Shift+Enter를 선택하는 경우 Ctrl+Enter 또는 Shift+Enter로 메시지를 보낼 수 있습니다. Ctrl/Shift+Enter나 버튼 클릭을 선택하는 경우 Enter로 줄바꿈이 가능해집니다. 이 설정은 기기별로 따로 적용됩니다.',
+            messageSendKeyButton: '버튼 클릭',
             chatEditPopup: '채팅 수정 팝업창 사용',
             chatEditPopupHelp: '채팅 수정 버튼을 누르면 팝업창에서 내용을 수정할 수 있도록 합니다.',
         },
