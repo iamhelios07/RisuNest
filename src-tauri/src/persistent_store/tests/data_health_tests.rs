@@ -44,7 +44,7 @@ fn stored(database: Value) -> (tempfile::TempDir, PersistentStore) {
     (directory, store)
 }
 
-fn scan(store: &mut PersistentStore) -> Findings {
+pub(super) fn scan(store: &mut PersistentStore) -> Findings {
     let revision = store.revision().expect("read revision");
     let lease = store
         .acquire_revision(revision)
@@ -342,7 +342,7 @@ fn an_archived_character_whose_bodies_the_server_holds_is_not_reported() {
     assert_eq!(archive_findings(&scan(&mut store)), 0);
 }
 
-fn blocking(findings: &Findings) -> Vec<&crate::data_health::Finding> {
+pub(super) fn blocking(findings: &Findings) -> Vec<&crate::data_health::Finding> {
     findings
         .items
         .iter()

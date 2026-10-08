@@ -14,6 +14,8 @@ vi.mock('src/lang', () => ({ language: { risuNest: { archive: {
     restoreTitle: 'Restore', restoreBody: 'Confirm restore',
     archiveFailed: 'archive-failed', restoreFailed: 'restore-failed',
     archiveRefreshFailed: 'archive-refresh-failed', restoreRefreshFailed: 'restore-refresh-failed',
+    archiveRemoteAssetUnavailable: 'archive-remote-unavailable', archiveAssetMissing: 'archive-asset-missing',
+    restoreRemoteAssetUnavailable: 'restore-remote-unavailable', restoreAssetMissing: 'restore-asset-missing',
 } } } }))
 vi.mock('../stores.svelte', () => ({ DBState: { db: harness.database }, selectedCharID: writable(0) }))
 vi.mock('src/lib/workingSetNavigation', () => ({ clearCharacterSelection: harness.clearSelection }))
@@ -74,6 +76,27 @@ describe('character archive ownership', () => {
             expect(harness.error).toHaveBeenCalledWith('archive-failed')
             expect(harness.refresh).not.toHaveBeenCalled()
             expect(harness.release).toHaveBeenCalledOnce()
+        } finally { log.mockRestore() }
+    })
+
+    it('names a file the native store could not fetch or find', async () => {
+        const log = vi.spyOn(console, 'error').mockImplementation(() => {})
+        try {
+            for (const [message, restoreText, archiveText] of [
+                ['character archive data could not be fetched', 'restore-remote-unavailable', 'archive-remote-unavailable'],
+                ['character archive data is missing', 'restore-asset-missing', 'archive-asset-missing'],
+                ['synthetic other failure', 'restore-failed', 'archive-failed'],
+            ]) {
+                const failure = Object.assign(new Error(message), { code: 'validation' })
+                harness.error.mockClear()
+                harness.restore.mockRejectedValueOnce(failure)
+                expect(await restoreArchivedCharacterWithConfirmation('char-a')).toBe(false)
+                expect(harness.error).toHaveBeenCalledWith(restoreText)
+                harness.error.mockClear()
+                harness.archive.mockRejectedValueOnce(failure)
+                expect(await archiveCharacterWithConfirmation('char-a')).toBe(false)
+                expect(harness.error).toHaveBeenCalledWith(archiveText)
+            }
         } finally { log.mockRestore() }
     })
 })

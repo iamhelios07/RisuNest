@@ -1996,10 +1996,10 @@ impl PersistentStore {
         archive::preview(connection, &target.generation, character_id)
     }
 
-    pub(crate) fn archive_character(&mut self,character_id:&str,expected_revision:i64,now_ms:i64)->StoreResult<RevisionResult> {self.lww_archive(character_id,expected_revision,now_ms,false,&||false)}
-    pub(crate) fn archive_character_with_cancellation(&mut self,character_id:&str,expected_revision:i64,now_ms:i64,is_cancelled:&dyn Fn()->bool)->StoreResult<RevisionResult> {self.lww_archive(character_id,expected_revision,now_ms,false,is_cancelled)}
-    pub(crate) fn restore_character(&mut self,character_id:&str,expected_revision:i64)->StoreResult<RevisionResult> {self.lww_archive(character_id,expected_revision,0,true,&||false)}
-    pub(crate) fn restore_character_with_cancellation(&mut self,character_id:&str,expected_revision:i64,is_cancelled:&dyn Fn()->bool)->StoreResult<RevisionResult> {self.lww_archive(character_id,expected_revision,0,true,is_cancelled)}
+    pub(crate) fn archive_character(&mut self,character_id:&str,expected_revision:i64,now_ms:i64)->StoreResult<RevisionResult> {self.lww_archive(character_id,expected_revision,now_ms,false,&||false,None)}
+    pub(crate) fn archive_character_with_cancellation(&mut self,character_id:&str,expected_revision:i64,now_ms:i64,is_cancelled:&dyn Fn()->bool,cancellation:Option<std::sync::Arc<std::sync::atomic::AtomicBool>>)->StoreResult<RevisionResult> {self.lww_archive(character_id,expected_revision,now_ms,false,is_cancelled,cancellation)}
+    pub(crate) fn restore_character(&mut self,character_id:&str,expected_revision:i64)->StoreResult<RevisionResult> {self.lww_archive(character_id,expected_revision,0,true,&||false,None)}
+    pub(crate) fn restore_character_with_cancellation(&mut self,character_id:&str,expected_revision:i64,is_cancelled:&dyn Fn()->bool,cancellation:Option<std::sync::Arc<std::sync::atomic::AtomicBool>>)->StoreResult<RevisionResult> {self.lww_archive(character_id,expected_revision,0,true,is_cancelled,cancellation)}
 
     pub(crate) fn replace_begin(&mut self) -> StoreResult<StagingResult> {
         commit::replace_begin(&mut self.connection)

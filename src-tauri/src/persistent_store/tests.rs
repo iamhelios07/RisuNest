@@ -130,6 +130,8 @@ mod activation_golden_tests;
 mod message_staging_tests;
 #[path = "tests/archive_tests.rs"]
 mod archive_tests;
+#[path = "tests/archive_residency_tests.rs"]
+mod archive_residency_tests;
 #[path = "tests/asset_alias_tests.rs"]
 mod asset_alias_tests;
 #[path = "tests/asset_catalog_gc_tests.rs"]

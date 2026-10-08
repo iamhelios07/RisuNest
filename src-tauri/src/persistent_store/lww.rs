@@ -1553,8 +1553,11 @@ impl PersistentStore {
         at_ms: i64,
         restore: bool,
         cancel: &dyn Fn() -> bool,
+        cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> StoreResult<RevisionResult> {
         self.lww_recover_intents()?;
+        // A body fetched here is in place before the intent exists, so a replay never fetches.
+        super::archive::fetch_operation_body(&self.connection, &self.repository_root, char_id, restore, cancel, cancellation)?;
         let header = Header {
             binding_authority: self.lww_binding_authority()?,
             request_id: Uuid::new_v4().to_string(),

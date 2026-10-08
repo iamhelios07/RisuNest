@@ -1977,6 +1977,10 @@ export const languageEnglish = {
             "restoreFailed": 'The character could not be restored.',
             "archiveRefreshFailed": 'The character was archived, but the list could not be refreshed. Please restart the app.',
             "restoreRefreshFailed": 'The character was restored, but the list could not be refreshed. Please restart the app.',
+            "archiveRemoteAssetUnavailable": 'Files kept only on the server or external storage could not be fetched, so the character was not archived. Check the connection and try again.',
+            "archiveAssetMissing": 'Some files are gone, so the character was not archived. Review them in Data check.',
+            "restoreRemoteAssetUnavailable": 'Files kept only on the server or external storage could not be fetched, so the character was not restored. Check the connection and try again.',
+            "restoreAssetMissing": 'Some files are gone, so the character was not restored. Review them in Data check.',
         },
         exportExcluded: {
             title: 'Export finished',

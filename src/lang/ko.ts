@@ -1793,6 +1793,10 @@ export const languageKorean = {
             "restoreFailed": '캐릭터를 복원하지 못했습니다.',
             "archiveRefreshFailed": '캐릭터를 보관했지만 목록에 반영하지 못했습니다. 앱을 다시 시작해주세요.',
             "restoreRefreshFailed": '캐릭터를 복원했지만 목록에 반영하지 못했습니다. 앱을 다시 시작해주세요.',
+            "archiveRemoteAssetUnavailable": '서버나 외부 저장소에만 있는 파일을 가져오지 못해 캐릭터를 보관하지 못했습니다. 연결을 확인한 후 다시 시도해주세요.',
+            "archiveAssetMissing": '사라진 파일이 있어 캐릭터를 보관하지 못했습니다. 데이터 점검에서 확인해주세요.',
+            "restoreRemoteAssetUnavailable": '서버나 외부 저장소에만 있는 파일을 가져오지 못해 캐릭터를 복원하지 못했습니다. 연결을 확인한 후 다시 시도해주세요.',
+            "restoreAssetMissing": '사라진 파일이 있어 캐릭터를 복원하지 못했습니다. 데이터 점검에서 확인해주세요.',
         },
         exportExcluded: {
             title: '내보내기 완료',
