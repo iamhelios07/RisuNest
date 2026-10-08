@@ -206,7 +206,7 @@ impl super::PersistentStore {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn pds_lww_binding_content(state: tauri::State<'_, super::commands::PersistentStoreState>) -> StoreResult<BindingContent> {
     logged("pds_lww_binding_content", super::commands::with_store(state, |store| store.lww_binding_content()))
 }
@@ -744,7 +744,7 @@ fn validate_binding_inspection_stages(store: &super::PersistentStore, inspection
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn pds_lww_binding_state(state: tauri::State<'_, super::commands::PersistentStoreState>) -> StoreResult<BindingState> {
     logged("pds_lww_binding_state", super::commands::with_store_mut(state, |store| { store.lww_recover_intents()?; store.lww_binding_state() }))
 }

@@ -142,7 +142,7 @@ pub(crate) fn external_storage_set_execution_session(
         Ok(())
     })())
 }
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn external_storage_capture_exit_target(app: AppHandle) -> Result<Value> {
     logged("external_storage_capture_exit_target", (|| {
         let store = native_store(&app)?;
@@ -152,7 +152,7 @@ pub(crate) fn external_storage_capture_exit_target(app: AppHandle) -> Result<Val
         )
     })())
 }
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn external_storage_get_state<R: Runtime>(app: AppHandle<R>) -> Result<Value> {
     logged("external_storage_get_state", (|| {
         let root = root(&app)?;
@@ -257,7 +257,7 @@ pub(crate) struct SetPausedRequest {
     paused: bool,
     expected_selection_epoch: String,
 }
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn external_storage_set_sync_paused(app: AppHandle, request: SetPausedRequest) -> Result<Value> {
     logged("external_storage_set_sync_paused", (|| {
         let selected = native_store(&app)?.external_set_paused(&request.expected_selection_epoch, request.paused).map_err(local_error)?;
@@ -268,7 +268,7 @@ pub(crate) fn external_storage_set_sync_paused(app: AppHandle, request: SetPause
 pub(crate) fn external_storage_set_automatic_backup_paused(app: AppHandle, connection_id: String, paused: bool) -> Result<()> {
     logged("external_storage_set_automatic_backup_paused", (|| ConnectionStore::open(&root(&app)?)?.set_automatic_backup_paused(&connection_id, paused))())
 }
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn external_storage_get_job<R: Runtime>(app: AppHandle<R>, job_id: String) -> Result<Value> {
     logged("external_storage_get_job", (|| {
         let directory = root(&app)?;

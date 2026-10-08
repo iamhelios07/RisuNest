@@ -162,7 +162,7 @@ pub(crate) fn confirmed_restore_activation<R: Runtime>(app:&AppHandle<R>,job:&Du
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn external_storage_confirm_restore_adoption<R: Runtime>(app:AppHandle<R>,request:RestoreAdoptionRequest)->Result<Value> {
     logged("external_storage_confirm_restore_adoption", (|| confirm_restore_adoption_in_store(&runtime::native_store(&app)?,&runtime::root(&app)?,&request))())
 }
