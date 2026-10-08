@@ -210,10 +210,13 @@ impl PersistentStore {
         };
         let (_, missing) = split_local(&PayloadCas::new(&self.repository_root)?, images, &check)?;
         if missing.is_empty() { return check(); }
+        // An icon no storage holds is skipped and left to the data check, which reports it.
+        let held = RemoteHolders::open(&self.repository_root)?.held(&missing)?;
+        let missing = missing.into_iter().zip(held).filter_map(|(hash, held)| held.then_some(hash)).collect::<Vec<_>>();
+        if missing.is_empty() { return check(); }
         let mut hydration = crate::server_sync::residency::HydrationSession::new(&self.repository_root, cancellation)?;
-        if !hydration.hydrate_many_outcomes_prioritized(&missing, &priority, &check, |_, _| on_object_done())?.is_empty() {
-            return Err(SyncError::new("required-asset-unavailable", 409));
-        }
+        // One whose last holder went away during the pass is skipped the same way.
+        hydration.hydrate_many_outcomes_prioritized(&missing, &priority, &check, |_, _| on_object_done())?;
         check()
     }
 

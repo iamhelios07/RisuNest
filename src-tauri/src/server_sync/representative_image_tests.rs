@@ -144,11 +144,74 @@ fn a_missing_representative_is_never_reported_local_and_does_not_hide_available_
     add(&mut store, character("available", &available.key));
     assert_eq!(status(&store)["unavailableObjects"], 1);
     assert_eq!(status(&store)["localBytes"], 0);
-    assert_eq!(hydrate(&store).unwrap_err().code, "required-asset-unavailable");
+    hydrate(&store).expect("an icon no storage holds is skipped");
     assert!(cas.stat_object(available.object_hash.as_ref().unwrap()).unwrap().is_some());
     assert!(cas.stat_object(missing.object_hash.as_ref().unwrap()).unwrap().is_none());
     assert_eq!(status(&store)["unavailableObjects"], 1);
     assert_eq!(status(&store)["localBytes"], available.size);
+}
+
+/// The aliases the quick data check finds without a body.
+fn absent_aliases(store: &mut PersistentStore) -> Vec<String> {
+    let revision = store.revision().unwrap();
+    let lease = store.acquire_revision(revision).unwrap().lease;
+    let findings = store.data_health_reader(&lease).unwrap().scan(2000, &crate::local_backup::NeverCancelled).unwrap();
+    store.release_revision(&lease).unwrap();
+    findings.items.iter()
+        .filter(|finding| finding.code == crate::data_health::codes::ALIAS_OBJECT_ABSENT)
+        .map(|finding| finding.owner.id.clone())
+        .collect()
+}
+
+#[test]
+fn an_icon_no_storage_holds_is_skipped_beside_an_available_one_and_stays_in_the_data_check() {
+    let server = LocalServerFixture::new();
+    let (_root, mut store) = local();
+    let core = server.client(&store);
+    let available = put_asset(&mut store, "assets/quiet-available.png", b"synthetic quiet available image");
+    drain_publications(&core, &mut store, &[]).unwrap();
+    store.asset_residency_set_policy(AssetPolicy::Remote, || Ok(())).unwrap();
+    store.asset_residency_evict(|| Ok(())).unwrap();
+    let missing = put_asset(&mut store, "assets/quiet-missing.png", b"synthetic quiet missing image");
+    let cas = PayloadCas::new(store.repository_root()).unwrap();
+    let missing_hash = missing.object_hash.as_ref().unwrap();
+    cas.unlink_exact_object(missing_hash, missing.size as u64, &crate::asset_repository::object_physical_key(missing_hash)).unwrap();
+    add(&mut store, character("missing", &missing.key));
+    add(&mut store, character("available", &available.key));
+    assert!(cas.stat_object(available.object_hash.as_ref().unwrap()).unwrap().is_none());
+
+    let lane = Arc::new(super::progress::ProgressLane::default());
+    let visits = std::cell::Cell::new(0);
+    super::progress::within(&lane, || hydrate_binding_assets(&store, &header(&store), Arc::new(AtomicBool::new(false)), Some("missing"), || visits.set(visits.get() + 1)))
+        .expect("an icon no storage holds is not a sync error");
+    assert_eq!(visits.get(), 1, "only the available icon is fetched");
+    assert_eq!(cas.read_object(available.object_hash.as_ref().unwrap()).unwrap().unwrap(), b"synthetic quiet available image");
+    assert!(cas.stat_object(missing_hash).unwrap().is_none());
+    let scope = lane.snapshot("hydrate").asset_scope.expect("the available icon is planned");
+    assert_eq!((scope.done, scope.total, scope.settled), (1, Some(1), true), "the skipped icon is not planned work");
+
+    let again = Arc::new(super::progress::ProgressLane::default());
+    super::progress::within(&again, || hydrate(&store)).expect("a later pass stays quiet");
+    assert!(again.snapshot("hydrate").asset_scope.is_none(), "nothing is left to download");
+    assert_eq!(status(&store)["unavailableObjects"], 1);
+    assert_eq!(absent_aliases(&mut store), vec![missing.key.clone()]);
+}
+
+#[test]
+fn an_unreachable_server_still_fails_the_icon_pass() {
+    let server = LocalServerFixture::new();
+    let (_root, mut store) = local();
+    let core = server.client(&store);
+    let main = put_asset(&mut store, "assets/unreachable-main.png", b"synthetic unreachable representative");
+    drain_publications(&core, &mut store, &[]).unwrap();
+    store.asset_residency_set_policy(AssetPolicy::Remote, || Ok(())).unwrap();
+    store.asset_residency_evict(|| Ok(())).unwrap();
+    add(&mut store, character("unreachable", &main.key));
+    drop(core);
+    drop(server);
+    let error = hydrate(&store).expect_err("a held icon the server cannot send is still an error");
+    assert_eq!(error.code, "server-unreachable");
+    assert!(PayloadCas::new(store.repository_root()).unwrap().stat_object(main.object_hash.as_ref().unwrap()).unwrap().is_none());
 }
 
 #[test]
