@@ -327,7 +327,8 @@ const adoptSchedulerAuthority = (c: BindingContext) => {
     scheduler.reset(); error = ''; hydrationError = ''; schedulerAuthority = c.state.targetAuthority
 }
 const transport: SyncBindingTransport = {
-    inspectTarget: c => during('preparing', () => invoke('server_sync_lww_inspect', { request: { bindingAuthority: c.state.targetAuthority, requestId: crypto.randomUUID() } })),
+    // A registration that cannot join this way is refused here, before the library is read.
+    inspectTarget: c => during('preparing', () => invoke('server_sync_lww_inspect', { request: { bindingAuthority: c.state.targetAuthority, requestId: crypto.randomUUID() }, newDevice: c.mode === 'new-device' })),
     pullAvailableState: async (inspected,c) => { const staged = await during('downloading', () => invoke<StagedSyncTarget>('server_sync_lww_stage_target', { inspectionId: inspected.inspectionId, request: { bindingAuthority: c.state.targetAuthority, requestId: crypto.randomUUID() } })); bindingStaged = true; return staged },
     replaceFromTarget: (...args) => during('applying', () => replaceNativeSyncBinding(...args)),
     reportStopped(value) {

@@ -38,7 +38,7 @@ pub(crate) fn bind_server(store: &mut PersistentStore, server: &LocalServerFixtu
     use crate::persistent_store::sync_selection::{SwitchBindingRequest, SyncTarget};
     let client = server.client(store);
     let original = store.lww_binding_state().unwrap();
-    let inspected = super::binding::inspect(store, &header(store)).unwrap();
+    let inspected = super::binding::inspect(store, &header(store), false).unwrap();
     store.switch_lww_binding(&SwitchBindingRequest {
         header: header(store),
         expected_selection_epoch: original.selection_epoch,

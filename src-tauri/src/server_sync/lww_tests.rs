@@ -1319,7 +1319,7 @@ fn a_new_target_initialization_preserves_received_issuers_under_its_authenticate
     assert_ne!(publisher, original_issuer);
     let c = new_target.client(&target);
     let original = target.lww_binding_state().unwrap();
-    let inspected = super::binding::inspect(&target, &header(&target)).unwrap();
+    let inspected = super::binding::inspect(&target, &header(&target), false).unwrap();
     let request = header(&target);
     target
         .switch_lww_binding(

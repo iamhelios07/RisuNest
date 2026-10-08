@@ -195,6 +195,7 @@ fn new_device_claim_binds_exact_intent_and_strict_receipt_shape() {
         canonical::decode::<NewDeviceClaimRequest>(&serde_json::to_vec(&json).unwrap(), 4096)
             .is_err()
     );
+    let request_digest = request.digest().unwrap();
     let receipt = NewDeviceClaimReceipt {
         authorization_id: request.authorization_id,
         writer_id: request.writer_id,
@@ -208,10 +209,42 @@ fn new_device_claim_binds_exact_intent_and_strict_receipt_shape() {
         canonical::decode::<NewDeviceClaimReceipt>(&encoded, 4096).unwrap(),
         receipt
     );
-    let mut json = serde_json::to_value(receipt).unwrap();
+    let mut json = serde_json::to_value(&receipt).unwrap();
     json["fresh"] = serde_json::json!(true);
     assert!(
         canonical::decode::<NewDeviceClaimReceipt>(&serde_json::to_vec(&json).unwrap(), 4096)
             .is_err()
     );
+    let unclaimed = NewDeviceClaimState {
+        claim: None,
+        used: true,
+    };
+    let encoded = canonical::encode(&unclaimed).unwrap();
+    assert_eq!(encoded, br#"{"claim":null,"used":true}"#);
+    assert_eq!(
+        canonical::decode::<NewDeviceClaimState>(&encoded, 4096).unwrap(),
+        unclaimed
+    );
+    let claimed = NewDeviceClaimState {
+        claim: Some(NewDeviceClaimStatus {
+            request_digest,
+            receipt,
+        }),
+        used: true,
+    };
+    let encoded = canonical::encode(&claimed).unwrap();
+    assert_eq!(
+        canonical::decode::<NewDeviceClaimState>(&encoded, 4096).unwrap(),
+        claimed
+    );
+    for invalid in [
+        serde_json::json!({"claim":null}),
+        serde_json::json!(null),
+        serde_json::json!({"claim":null,"used":false,"writer":"other"}),
+    ] {
+        assert!(
+            canonical::decode::<NewDeviceClaimState>(&serde_json::to_vec(&invalid).unwrap(), 4096)
+                .is_err()
+        );
+    }
 }

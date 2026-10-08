@@ -353,7 +353,7 @@ pub(crate) async fn server_sync_lww_activate(app:AppHandle,request:crate::persis
 #[tauri::command]
 pub(crate) async fn server_sync_lww_pending_binding(app:AppHandle)->Result<Option<super::binding::PendingBinding>> {logged_blocking("pending-binding",move||{super::binding::pending_binding(&job_store(&app)?)}).await}
 #[tauri::command]
-pub(crate) async fn server_sync_lww_inspect(app:AppHandle,request:crate::persistent_store::lww::Header)->Result<super::binding::Inspection> {logged_blocking("inspect",move||within(&LANES.binding,|| {super::binding::inspect(&job_store(&app)?,&request)})).await}
+pub(crate) async fn server_sync_lww_inspect(app:AppHandle,request:crate::persistent_store::lww::Header,new_device:bool)->Result<super::binding::Inspection> {logged_blocking("inspect",move||within(&LANES.binding,|| {super::binding::inspect(&job_store(&app)?,&request,new_device)})).await}
 #[tauri::command]
 pub(crate) async fn server_sync_lww_stage_target(app:AppHandle,request:crate::persistent_store::lww::Header,inspection_id:String)->Result<super::binding::StagedTarget> {logged_blocking("stage-target",move||within(&LANES.binding,|| {let _permit=claim_library(&app)?;let state=app.state::<ServerSyncCommandState>();let (_stage,cancelled)=state.claim_stage()?;super::binding::stage(&mut job_store(&app)?,&request,&inspection_id,Some(cancelled))})).await}
 #[tauri::command]
@@ -565,7 +565,7 @@ mod tests {
         save(&mut source,&["root","language"],serde_json::json!("ja"));
         let source_header=header(&source);core.push(&mut source,&source_header,&[]).unwrap();
         server.prepare_binding_candidate(&target);
-        let inspected=super::super::binding::inspect(&target,&header(&target)).unwrap();
+        let inspected=super::super::binding::inspect(&target,&header(&target),false).unwrap();
         let inspected_pins=released.load(Ordering::Acquire);
         let (stage,cancelled)=state.claim_stage().unwrap();
         let target_header=header(&target);
