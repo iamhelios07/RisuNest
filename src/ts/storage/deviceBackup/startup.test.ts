@@ -30,12 +30,10 @@ beforeEach(() => {
     configurable: true,
     value: {},
   });
-  localStorage.removeItem("risuNestServerSyncRestoreHold");
 });
 afterEach(() => {
   delete (window as Window & { __TAURI_INTERNALS__?: unknown })
     .__TAURI_INTERNALS__;
-  localStorage.removeItem("risuNestServerSyncRestoreHold");
   document.body.replaceChildren();
   vi.restoreAllMocks();
 });
@@ -107,7 +105,7 @@ describe("device maintenance bootstrap ordering", () => {
     expect(state.normalStarted).toHaveBeenCalledTimes(1);
   });
 
-  it("holds server sync before acknowledging a completed native library restore", async () => {
+  it("acknowledges a completed native library restore before the normal app starts", async () => {
     let bootstraps = 0;
     state.invoke.mockImplementation((command: string, args?: unknown) => {
       if (command === "app_cleanup_status") return Promise.resolve({ pending: false, mode: null, error: null });
@@ -119,9 +117,6 @@ describe("device maintenance bootstrap ordering", () => {
             : { mode: "normal", session: null },
         );
       if (command === "native_device_backup_recovery_complete") {
-        expect(localStorage.getItem("risuNestServerSyncRestoreHold")).toBe(
-          "true",
-        );
         expect(args).toEqual({ sessionId: "native-restore-1" });
         return Promise.resolve();
       }
@@ -141,7 +136,7 @@ describe("device maintenance bootstrap ordering", () => {
     expect(state.normalStarted).toHaveBeenCalledTimes(1);
   });
 
-  it("acknowledges a device-only native restore without holding server sync", async () => {
+  it("acknowledges a device-only native restore", async () => {
     let bootstraps = 0;
     state.invoke.mockImplementation((command: string) => {
       if (command === "app_cleanup_status") return Promise.resolve({ pending: false, mode: null, error: null });
@@ -152,10 +147,8 @@ describe("device maintenance bootstrap ordering", () => {
             ? nativeComplete(false)
             : { mode: "normal", session: null },
         );
-      if (command === "native_device_backup_recovery_complete") {
-        expect(localStorage.getItem("risuNestServerSyncRestoreHold")).toBeNull();
+      if (command === "native_device_backup_recovery_complete")
         return Promise.resolve();
-      }
       throw new Error(`Unexpected command: ${command}`);
     });
 
@@ -165,7 +158,7 @@ describe("device maintenance bootstrap ordering", () => {
     expect(state.normalStarted).toHaveBeenCalledTimes(1);
   });
 
-  it("blocks a malformed native completion before writing the restore hold", async () => {
+  it("blocks a malformed native completion before acknowledging it", async () => {
     state.invoke.mockImplementation((command: string) => {
       if (command === "app_cleanup_status") return Promise.resolve({ pending: false, mode: null, error: null });
       if (command === "native_startup_status") return Promise.resolve();
@@ -184,7 +177,6 @@ describe("device maintenance bootstrap ordering", () => {
       ),
     );
 
-    expect(localStorage.getItem("risuNestServerSyncRestoreHold")).toBeNull();
     expect(state.invoke).not.toHaveBeenCalledWith(
       "native_device_backup_recovery_complete",
       expect.anything(),
@@ -222,7 +214,6 @@ describe("device maintenance bootstrap ordering", () => {
       ),
     );
     expect(state.normalStarted).not.toHaveBeenCalled();
-    expect(localStorage.getItem("risuNestServerSyncRestoreHold")).toBe("true");
 
     const { deviceMaintenanceBeforeBootstrap } = await import("./entry");
     await expect(deviceMaintenanceBeforeBootstrap()).resolves.toBeUndefined();

@@ -75,8 +75,6 @@ export async function deviceMaintenanceBeforeBootstrap(
     )
       throw new Error("Native device restore completion has no session ID");
     const sessionId = session.sessionId;
-    if (session.includesLibrary === true)
-      localStorage.setItem("risuNestServerSyncRestoreHold", "true");
     await invoke("native_device_backup_recovery_complete", { sessionId });
     bootstrap = await invoke<NativeDeviceBackupBootstrap>(
       "native_device_backup_bootstrap",
