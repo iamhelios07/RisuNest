@@ -248,6 +248,30 @@ describe('the storage usage tab', () => {
         } finally { vi.useRealTimers() }
     })
 
+    it('shows the time left of a transfer beside its progress until its byte total changes', async () => {
+        vi.useFakeTimers()
+        try {
+            let completed = 0
+            let total = 1_000_000
+            state.getState.mockImplementation(async () => ({ supported: true, selection: { kind: 'none', selectionEpoch: '0' }, connections: [connection(10, 30)],
+                jobs: [{ id: 'job', connectionId: 'connection-1', kind: 'backup', state: 'running', phase: 'upload', counters: 'transferred',
+                    completedBytes: String(completed), totalBytes: String(total), completedItems: '1', startedAtMs: '1', updatedAtMs: '1' }] }))
+            state.jobStarted?.()
+            await settle()
+            const row = () => [...target.querySelectorAll('dt')].find(term => term.textContent === strings.remaining)
+            const poll = async () => { completed += 50_000; await vi.advanceTimersByTimeAsync(1_200); await settle() }
+            for (let index = 0; index < 4; index += 1) await poll()
+            expect(row()).toBeUndefined()
+            await poll()
+            // 250,000 bytes in six seconds, with 750,000 left.
+            expect(row()?.nextElementSibling?.textContent).toBe('00:18')
+            expect(row()?.closest('[role="status"]')).toBeNull()
+            total = 2_000_000
+            await poll()
+            expect(row()).toBeUndefined()
+        } finally { vi.useRealTimers() }
+    })
+
     it('keeps an action failure through background refreshes', async () => {
         vi.mocked(requestExternalStorageNow).mockResolvedValue({ kind: 'blocked', reason: 'preconditionFailed', cause: { kind: 'preconditionFailed' } })
         const backup = [...target.querySelectorAll('button')].find(button => button.textContent?.trim() === strings.runBackup)!

@@ -2086,6 +2086,7 @@ export const languageKorean = {
             progressFiles: '처리한 파일',
             pendingChanges: '올릴 변경',
             elapsed: '경과',
+            remaining: '남은 시간',
             count: '{0}개',
             itemsCount: '{0}개 항목',
             activity: { enumerating: '항목 확인 중', preparing: '이 기기의 변경 내용 준비 중', downloading: '받을 데이터 다운로드 및 확인 중', verifying: '서버에 있는 항목 확인 중', uploading: '업로드 중', confirming: '서버 확인 대기 중', staging: '받은 내용 저장 중' },

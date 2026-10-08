@@ -2271,6 +2271,7 @@ export const languageEnglish = {
             progressFiles: 'Files processed',
             pendingChanges: 'Changes to upload',
             elapsed: 'Elapsed',
+            remaining: 'Remaining',
             count: '{0}',
             itemsCount: '{0} items',
             activity: { enumerating: 'Counting items', preparing: 'Preparing changes on this device', downloading: 'Downloading and checking incoming data', verifying: 'Checking items on the server', uploading: 'Uploading', confirming: 'Waiting for server confirmation', staging: 'Saving received data' },

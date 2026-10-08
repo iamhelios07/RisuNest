@@ -714,6 +714,27 @@ describe('server sync progress', () => {
         expect(controller.snapshot().finished).toBeUndefined()
         stop()
     })
+    it('estimates the time left of an asset download from its own rate once it ran for five seconds', async () => {
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        let reads = 0
+        f.invoke.mockImplementation(async command => {
+            if (command !== 'server_sync_progress') return null
+            const index = reads++
+            return sendLanes({}).map(lane => lane.lane === 'assets' && index > 0 ? { ...lane, active: true, step: 'downloading', bytesDone: 100 * index, bytesTotal: 10_000, assetScope: { id: 1, done: index, total: 50, settled: false } } : lane)
+        })
+        const controller = production.getServerSyncController()
+        const stop = controller.watchProgress()
+        let finish!: () => void
+        const download = controller.track('assets', () => new Promise<void>(resolve => { finish = resolve }))
+        await settle()
+        await vi.advanceTimersByTimeAsync(5000); await settle()
+        expect(controller.snapshot().progress?.remainingMs).toBeUndefined()
+        await vi.advanceTimersByTimeAsync(500); await settle()
+        // 1,000 bytes over five seconds, with 8,900 left.
+        expect(controller.snapshot().progress?.remainingMs).toBe(44_500)
+        finish(); await download
+        stop()
+    })
     it('shows no finished bar after an asset download', async () => {
         production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
         countedPush([{}, { itemsDone: 2, itemsTotal: 2 }])

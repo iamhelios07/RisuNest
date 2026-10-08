@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core'
 import type { languageEnglish } from 'src/lang/en'
 import { formatElapsed } from '../../gui/nativeFileJobDialogModel'
 import { formatRisuNestStorageBytes } from '../risuNestStorageDashboard'
+import { formatRemaining } from './remainingTime'
 
 export type ServerSyncLaneName = 'send' | 'receive' | 'hydrate' | 'binding' | 'assets'
 export type ServerSyncNativeStep = 'idle' | 'preparing' | 'checking' | 'uploading' | 'confirming' | 'listing' | 'downloading' | 'staging'
@@ -82,6 +83,8 @@ export interface ServerSyncAttempt {
     plannedSend?: number
     /** Server changes after the receive cursor, as a watched attempt first read them. */
     plannedReceive?: number
+    /** Time left of the running asset download, once its rate is known. */
+    remainingMs?: number
     /** Change progress keeps its peak; asset progress belongs to its current finite scope. */
     peak?: Partial<Record<ServerSyncRoutinePhase, number>>
 }
@@ -93,7 +96,7 @@ export interface ServerSyncProgressView {
     /** Share done, or null while the running step reports no total. */
     fraction: number | null
     stages: { stage: ServerSyncStage; label: string; state: 'done' | 'active' }[]
-    counters: { key: 'bytes' | 'rate' | 'items' | 'files' | 'elapsed'; label: string; value: string }[]
+    counters: { key: 'bytes' | 'rate' | 'items' | 'files' | 'elapsed' | 'remaining'; label: string; value: string }[]
 }
 
 const STAGE_LANES: Record<ServerSyncStage, ServerSyncLaneName[]> = {
@@ -146,6 +149,15 @@ function stageWork(attempt: ServerSyncAttempt, lane: ServerSyncLane): Work | und
     if (lane.lane === 'send' || lane.lane === 'receive') return itemWork(attempt, lane.lane)
     return lane.lane === 'binding' && lane.step !== 'listing' ? itemWork(attempt, 'binding') : undefined
 }
+/**
+ * The running step measured in bytes against a total planned once: an asset download scope.
+ * Uploads and receives plan their bytes page by page, so they have none.
+ */
+export function bytePhase(attempt: ServerSyncAttempt): { key: string; done: number; total: number } | undefined {
+    const lane = stageLane(attempt, attempt.active.at(-1) ?? attempt.current)
+    if (!lane?.assetScope?.total || lane.step !== 'downloading' || lane.bytesTotal <= 0) return undefined
+    return { key: `${lane.lane}:${lane.assetScope.id}`, done: lane.bytesDone, total: lane.bytesTotal }
+}
 function laneDetail(attempt: ServerSyncAttempt, lane: ServerSyncLane, text: Text): string {
     const work = stageWork(attempt, lane)
     if (work) return ratio(work.done, work.total)
@@ -177,6 +189,7 @@ export function serverSyncProgressView(attempt: ServerSyncAttempt, text: Text, n
         if (filesDone > 0) counters.push({ key: 'files', label: text.progressFiles, value: count(filesDone) })
     }
     counters.push({ key: 'elapsed', label: text.elapsed, value: formatElapsed(now - attempt.startedAt) })
+    if (attempt.remainingMs !== undefined) counters.push({ key: 'remaining', label: text.remaining, value: formatRemaining(attempt.remainingMs) })
     return {
         // Asset downloads have one native step, so their stage names them more precisely.
         label: lane && current !== 'assets' ? text.activity[ACTIVITY[lane.step as Exclude<ServerSyncNativeStep, 'idle'>]] : text.progress[current],

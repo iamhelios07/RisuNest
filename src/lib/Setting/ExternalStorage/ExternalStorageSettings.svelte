@@ -45,6 +45,7 @@
     import { externalRestoreAreas } from 'src/ts/storage/sync/external/restoreScope'
     import { downloadRemoteAssets, getAssetResidencyStatus } from 'src/ts/storage/sync/serverAssetResidency'
     import { formatRisuNestStorageBytes } from 'src/ts/storage/risuNestStorageDashboard'
+    import { createRemainingTimeEstimator, formatRemaining } from 'src/ts/storage/sync/remainingTime'
     import ConnectionForm from './ConnectionForm.svelte'
     import { externalConnectionTitle, externalErrorKind, externalErrorMessage, externalStorageStrings } from './strings'
 
@@ -97,6 +98,9 @@
     /** The state an automatic backup switch was set to while its change runs. Otherwise it shows the stored setting. */
     let automaticRequest = $state<Record<string, boolean>>({})
     let stopBindingChanges: (() => void) | undefined
+    /** Time left of each connection's running transfer, once its rate is known. */
+    let remaining = $state<Record<string, number>>({})
+    const remainingEstimators = new Map<string, ReturnType<typeof createRemainingTimeEstimator>>()
 
     async function setSyncBinding(connection: ExternalConnectionSummary, enabled: boolean): Promise<void> {
         busy = true
@@ -153,6 +157,7 @@
         }
         try {
             storageState = await bridge.getState()
+            estimateRemaining(storageState)
             for (const connection of storageState.connections) {
                 if (historyRequested.has(connection.id)) continue
                 historyRequested.add(connection.id)
@@ -187,6 +192,22 @@
         await refresh()
         const open = storageState?.connections.filter(connection => selectedTab(connection.id) === 'history') ?? []
         await Promise.all(open.map(connection => loadHistory(connection, false)))
+    }
+
+    function estimateRemaining(state: ExternalStorageState): void {
+        const at = Date.now()
+        const next: Record<string, number> = {}
+        for (const connection of state.connections) {
+            const job = state.jobs.find(item => item.connectionId === connection.id)
+            // Only a running phase measured in bytes has a time left.
+            const phase = job && externalJobIsActive(job) && !externalJobIsPaused(job) && activeJobFraction(job) !== null
+                ? `${job.id}:${job.phase}:${job.counters ?? ''}` : undefined
+            let estimator = remainingEstimators.get(connection.id)
+            if (!estimator) remainingEstimators.set(connection.id, estimator = createRemainingTimeEstimator())
+            const left = estimator.update(phase, Number(job?.completedBytes ?? 0), Number(job?.totalBytes ?? 0), at)
+            if (left !== undefined) next[connection.id] = left
+        }
+        remaining = next
     }
 
     function schedulePoll(whileBusy = false): void {
@@ -854,6 +875,9 @@
                 {#if job && externalJobIsPaused(job) && job.error?.retryAtMs}<p class="note">{strings.retryAt.replace('{0}', when(job.error.retryAtMs))}</p>{/if}
                 {#if job && externalJobIsActive(job) && !externalJobIsPaused(job)}
                     <SettingProgress label={activeJobLabel(job)} detail={jobSize(job)} fraction={activeJobFraction(job)} />
+                    {#if remaining[connection.id] !== undefined}
+                        <dl class="kv"><dt>{strings.remaining}</dt><dd>{formatRemaining(remaining[connection.id])}</dd></dl>
+                    {/if}
                 {/if}
 
                 {#if unlockConnection?.id === connection.id}

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { languageKorean } from 'src/lang/ko'
-import { createRateMeter, laneDeltas, routinePeak, serverSyncProgressView, serverSyncRoutineView, type ServerSyncAttempt, type ServerSyncLane } from './serverSyncProgress'
+import { bytePhase, createRateMeter, laneDeltas, routinePeak, serverSyncProgressView, serverSyncRoutineView, type ServerSyncAttempt, type ServerSyncLane } from './serverSyncProgress'
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }))
 
@@ -114,6 +114,21 @@ describe('server sync progress view', () => {
         expect(counted.counters.find(counter => counter.key === 'items')?.value).toBe('0 / 5')
         const uncounted = serverSyncProgressView(attempt({ lanes: [lane('send', { active: true, step: 'preparing' })] }), text, 0)
         expect(uncounted.counters.some(counter => counter.key === 'items')).toBe(false)
+    })
+})
+
+describe('server sync remaining time', () => {
+    const downloading = (counts: Partial<ServerSyncLane>) => attempt({ stages: ['assets'], active: ['assets'], current: 'assets', lanes: [lane('assets', { active: true, step: 'downloading', bytesDone: 100, bytesTotal: 400, assetScope: { id: 3, done: 1, total: 4, settled: false }, ...counts })] })
+    it('measures only an asset download, whose byte total is planned once per scope', () => {
+        expect(bytePhase(downloading({}))).toEqual({ key: 'assets:3', done: 100, total: 400 })
+        expect(bytePhase(downloading({ step: 'preparing' }))).toBeUndefined()
+        expect(bytePhase(downloading({ assetScope: { id: 3, done: 0, total: null, settled: false } }))).toBeUndefined()
+        expect(bytePhase(attempt({ lanes: [lane('send', { active: true, step: 'uploading', bytesDone: 100, bytesTotal: 400 })] }))).toBeUndefined()
+    })
+    it('lists the time left after the elapsed time once it is known', () => {
+        expect(serverSyncProgressView(downloading({}), text, 0).counters.some(counter => counter.key === 'remaining')).toBe(false)
+        const view = serverSyncProgressView({ ...downloading({}), remainingMs: 61_200 }, text, 5_000)
+        expect(view.counters.slice(-2).map(counter => [counter.label, counter.value])).toEqual([[text.elapsed, '00:05'], [text.remaining, '01:02']])
     })
 })
 
