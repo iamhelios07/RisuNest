@@ -2334,8 +2334,8 @@ export const languageEnglish = {
         ui: {
             title: 'UI',
             messageSendKey: 'Message send key',
-            messageSendKeyHelp: 'Choose which key sends a message in the chat input. With Enter selected, Shift+Enter inserts a newline. With Ctrl/Shift+Enter selected, either Ctrl+Enter or Shift+Enter sends a message. With Ctrl/Shift+Enter or button click selected, Enter inserts a newline. This setting applies separately to each device.',
-            messageSendKeyButton: 'Button click',
+            messageSendKeyHelp: 'With Enter, Enter sends a message and Shift+Enter inserts a newline. With Ctrl/Shift+Enter, Ctrl+Enter or Shift+Enter sends a message and Enter inserts a newline. With Send button, Enter inserts a newline and only the send button sends a message.',
+            messageSendKeyButton: 'Send button',
             chatEditPopup: 'Edit chat messages in a popup',
             chatEditPopupHelp: 'Pressing the chat edit button lets you edit the message in a popup.',
         },
