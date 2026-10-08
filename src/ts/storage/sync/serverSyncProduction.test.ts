@@ -146,6 +146,17 @@ describe('production server LWW composition', () => {
         notifySyncBindingChanged(); await settle()
         expect(bound.at(-1)).toBe(false)
     })
+    it('reads the stored asset policy with every status request', async () => {
+        let assetPolicy = 'remote'
+        f.invoke.mockImplementation(async command => command === 'server_sync_status' ? { configured: false, writerId: 'writer', bindingAuthority: '0', assetPolicy }
+            : command === 'pds_lww_binding_state' ? { target: { kind: 'none' }, targetAuthority: '0', selectionEpoch: '0', libraryId: null, progress: null } : null)
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        const controller = production.getServerSyncController()
+        expect(controller.snapshot().status.assetPolicy).toBe('remote')
+        assetPolicy = 'full'
+        await controller.ensureStatus()
+        expect(controller.snapshot().status.assetPolicy).toBe('full')
+    })
     it('resumes interrupted Full hydration on foreground after the cancelled lane settles', async () => {
         production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
         let reject!: (error: unknown) => void
