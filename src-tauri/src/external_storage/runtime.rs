@@ -1370,6 +1370,36 @@ pub(crate) fn transfer_progress(
     job_phase_progress(root, job_id, "transferred")
 }
 
+/// Continues the transfer reading an earlier phase of `job` recorded, for a
+/// phase whose downloads that phase already planned.
+pub(crate) fn resumed_transfer_progress(
+    root: &std::path::Path,
+    job: &DurableJob,
+) -> std::sync::Arc<super::phase_progress::PhaseProgress> {
+    let summary = &job.summary;
+    let count = |name: &str| {
+        summary[name]
+            .as_str()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    let reading = if summary["counters"] == "transferred" {
+        super::phase_progress::PhaseCounters {
+            items: count("completedItems"),
+            total_items: count("totalItems"),
+            bytes: count("completedBytes"),
+            total_bytes: count("totalBytes"),
+        }
+    } else {
+        super::phase_progress::PhaseCounters::default()
+    };
+    let root = root.to_path_buf();
+    let job_id = job.id.clone();
+    super::phase_progress::PhaseProgress::resumed(reading, move |reading| {
+        let _ = record_counters(&root, &job_id, "transferred", reading);
+    })
+}
+
 fn record_check_progress(
     root: &std::path::Path,
     job_id: &str,

@@ -420,7 +420,7 @@ pub(crate) async fn prepare_database_first_backup(
     let staging_root = staging_directory(&root, job);
     let transferred = runtime::transfer_progress(&root, &job.id);
     let database=snapshot_restore::download_snapshot_database_first(&remote,&staging_root,&root,&root,
-        &job.request.connection_id,&connected.root_key,connected.provider.as_ref(),&connected.handle,cancel).await?;
+        &job.request.connection_id,&connected.root_key,connected.provider.as_ref(),&connected.handle,&transferred,cancel).await?;
     let snapshot=&database.snapshot;
     cancel.check()?;
     validate_download(connected, snapshot_id, snapshot)?;
@@ -567,6 +567,7 @@ async fn receive_restore_bodies_in_store(mut store:PersistentStore,root:&Path,co
     };
     let stage=root.join("native-file-jobs/jobs").join(&job.id).join("external-restore-bodies");
     let mut plan=snapshot_restore::RestoreBodyPlan::new(&stage)?;
+    let transferred=runtime::resumed_transfer_progress(&root,job);
     let mut pins=restore_pins(&root,&job.id)?;
     let cas=crate::asset_repository::PayloadCas::new(&root).map_err(runtime::local_error)?;
     let mut after=String::new();
@@ -600,8 +601,9 @@ async fn receive_restore_bodies_in_store(mut store:PersistentStore,root:&Path,co
             jobs.settle_restore_body(&job.id,&hash)?;
             plan.settled(&hash)?;
         }
-        if !plan.next_pack(&connected.root_key,connected.provider.as_ref(),&connected.handle,cancel).await? {break;}
+        if !plan.next_pack(&connected.root_key,connected.provider.as_ref(),&connected.handle,&transferred,cancel).await? {break;}
     }
+    transferred.flush();
     drop(plan);
     cleanup_staging(&stage);
     cancel.check()?;
@@ -1686,6 +1688,44 @@ pub(super) mod tests {
             assert_eq!(settled["result"],receipt);
             let cas=crate::asset_repository::PayloadCas::new(root).unwrap();
             for (asset,body) in backup.assets.iter().zip(&bodies) {assert_eq!(cas.read_object(asset).unwrap().unwrap(),*body);}
+        });
+    }
+
+    /// The transfer a restore reports is what it downloads, and before the
+    /// renderer adopts it the total already holds the asset bodies it receives after.
+    #[test]
+    fn a_restore_reports_every_byte_it_downloads() {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let bodies=vec![vec![48;4096],vec![49;8192]];
+            let backup=packaged_backup(&bodies).await;
+            let destination=tempfile::tempdir().unwrap();
+            let root=destination.path();
+            let app=restore_app(root);
+            let read=|| backup.provider.transferred_body_bytes().1;
+            let before=read();
+            let counters=|job:&str| {
+                let summary=JobStore::open(root).unwrap().read(job).unwrap().summary;
+                assert_eq!(summary["counters"],"transferred");
+                let value=|key:&str| summary[key].as_str().unwrap().parse::<u64>().unwrap();
+                (value("completedBytes"),value("totalBytes"))
+            };
+            let (job,claim,receipt,permit,store)=commit_in_session(&app,&backup).await;
+            let (downloaded,total)=counters(&job.id);
+            assert_eq!(downloaded,read()-before);
+            assert!(total>downloaded,"the asset bodies are still to come: {downloaded} of {total}");
+            let cancel=Cancellation::default();
+            let worker=finish_restore_bodies(app.handle(),&backup.connected,&job,receipt.clone(),Some(permit),store,&cancel);
+            let renderer=async {
+                let adoption=RestoreAdoptionRequest{job_id:job.id.clone(),received_revision:receipt["receivedRevision"].as_str().unwrap().into(),selected_character_id:None};
+                external_storage_confirm_restore_adoption(app.handle().clone(),adoption).unwrap();
+            };
+            let (finished,())=tokio::join!(worker,renderer);
+            assert_eq!(finished.unwrap(),receipt);
+            drop(claim);
+            assert_eq!(counters(&job.id),(read()-before,total));
+            let settled=runtime::external_storage_get_job(app.handle().clone(),job.id.clone()).unwrap();
+            assert_eq!(settled["state"],"succeeded");
+            assert_eq!((settled["completedBytes"].as_str(),settled["totalBytes"].as_str()),(Some(total.to_string().as_str()),Some(total.to_string().as_str())));
         });
     }
 
