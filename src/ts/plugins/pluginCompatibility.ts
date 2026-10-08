@@ -68,26 +68,42 @@ export function createPluginLoadOrchestrator<T>(dependencies: PluginLoadDependen
     }
 }
 
+/**
+ * Waits for plugin work to finish, but only for `waitLimitMs`: past it the
+ * reload interrupts plugin work once `canInterrupt` allows.
+ */
 export function createDeferredPluginReload(dependencies: {
     isIdle(): boolean
+    canInterrupt(): boolean
     subscribe(changed: () => void): void
-    reload(isCurrent: () => boolean): Promise<void>
+    reload(isCurrent: () => boolean, interrupt: boolean): Promise<void>
     onError(error: unknown): void
+    waitLimitMs: number
 }) {
     let requested = false
     let running = false
     let scheduled = false
+    let overdue = false
+    let limit: ReturnType<typeof setTimeout> | undefined
     let epoch = 0
+    const disarm = () => {
+        clearTimeout(limit)
+        limit = undefined
+        overdue = false
+    }
     const schedule = () => {
         if (scheduled) return
         scheduled = true
         queueMicrotask(() => {
             scheduled = false
-            if (!requested || running || !dependencies.isIdle()) return
+            if (!requested || running) return
+            const interrupt = !dependencies.isIdle()
+            if (interrupt && !(overdue && dependencies.canInterrupt())) return
             requested = false
+            disarm()
             running = true
             const started = epoch
-            void dependencies.reload(() => started === epoch).catch(dependencies.onError).finally(() => {
+            void dependencies.reload(() => started === epoch, interrupt).catch(dependencies.onError).finally(() => {
                 running = false
                 if (requested) schedule()
             })
@@ -95,7 +111,18 @@ export function createDeferredPluginReload(dependencies: {
     }
     dependencies.subscribe(schedule)
     return {
-        request() { requested = true; schedule() },
-        cancel() { requested = false; epoch++ },
+        request() {
+            requested = true
+            limit ??= setTimeout(() => {
+                overdue = true
+                schedule()
+            }, dependencies.waitLimitMs)
+            schedule()
+        },
+        cancel() {
+            requested = false
+            epoch++
+            disarm()
+        },
     }
 }

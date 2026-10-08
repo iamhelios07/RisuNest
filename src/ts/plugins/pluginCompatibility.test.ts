@@ -21,7 +21,7 @@ describe('plugin load orchestration', () => {
         let idle = false
         let changed!: () => void
         const reload = vi.fn(async () => {})
-        const deferredReload = createDeferredPluginReload({ isIdle: () => idle, subscribe: fn => { changed = fn }, reload, onError: vi.fn() })
+        const deferredReload = createDeferredPluginReload({ isIdle: () => idle, canInterrupt: () => true, subscribe: fn => { changed = fn }, reload, onError: vi.fn(), waitLimitMs: 60_000 })
         deferredReload.request()
         deferredReload.request()
         await Promise.resolve()
@@ -36,6 +36,39 @@ describe('plugin load orchestration', () => {
         changed()
         await Promise.resolve()
         expect(reload).toHaveBeenCalledTimes(1)
+    })
+
+    it('interrupts plugin work that never settles once the wait limit passes, after chat generation ends', async () => {
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+        try {
+            let interruptible = true
+            let changed!: () => void
+            const reload = vi.fn(async (_isCurrent: () => boolean, _interrupt: boolean) => {})
+            const deferredReload = createDeferredPluginReload({
+                isIdle: () => false, canInterrupt: () => interruptible,
+                subscribe: fn => { changed = fn }, reload, onError: vi.fn(), waitLimitMs: 1_000,
+            })
+            deferredReload.request()
+            await vi.advanceTimersByTimeAsync(999)
+            expect(reload).not.toHaveBeenCalled()
+            interruptible = false
+            await vi.advanceTimersByTimeAsync(1)
+            expect(reload).not.toHaveBeenCalled()
+            interruptible = true
+            changed()
+            await vi.waitFor(() => expect(reload).toHaveBeenCalledOnce())
+            expect(reload.mock.calls[0][1]).toBe(true)
+
+            deferredReload.request()
+            deferredReload.cancel()
+            await vi.advanceTimersByTimeAsync(1_000)
+            expect(reload).toHaveBeenCalledOnce()
+            deferredReload.request()
+            await vi.advanceTimersByTimeAsync(999)
+            expect(reload).toHaveBeenCalledOnce()
+            await vi.advanceTimersByTimeAsync(1)
+            expect(reload).toHaveBeenCalledTimes(2)
+        } finally { vi.useRealTimers() }
     })
 
     it('checks idle admission inside the load mutex before clearing providers', async () => {

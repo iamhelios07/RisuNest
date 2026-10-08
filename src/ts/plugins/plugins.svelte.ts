@@ -9,7 +9,7 @@ import { fetchNative, globalFetch, readImage, saveAsset } from "../globalApi.sve
 import { DBState, hotReloading } from "../stores.svelte";
 import type { ScriptMode } from "../process/scripts";
 import { reconcilePluginListUpdate } from "./pluginListUpdate";
-import { areV3PluginsIdle, customV3ProviderMetaStore, loadV3Plugins, prepareV3PluginsForReload, subscribeV3PluginActivity } from "./apiV3/v3.svelte";
+import { areV3PluginsIdle, canInterruptV3Plugins, customV3ProviderMetaStore, loadV3Plugins, prepareV3PluginsForReload, subscribeV3PluginActivity } from "./apiV3/v3.svelte";
 import { pluginCodeTranspiler } from "./apiV3/transpiler";
 import {
     createPluginLoadOrchestrator,
@@ -452,12 +452,17 @@ const applyPluginLoad = createPluginLoadOrchestrator<RisuPlugin>({
 const pluginLoadReentrancy = createPluginLoadReentrancyGuard((error) => console.error(error))
 let syncReload: ReturnType<typeof createDeferredPluginReload> | undefined
 
+/** How long a received plugin change waits for plugin work before interrupting it. */
+export const PLUGIN_SYNC_RELOAD_WAIT_LIMIT_MS = 60_000
+
 export function requestPluginReloadAfterSync(): void {
     syncReload ??= createDeferredPluginReload({
         isIdle: areV3PluginsIdle,
+        canInterrupt: canInterruptV3Plugins,
         subscribe: subscribeV3PluginActivity,
-        reload: (isCurrent) => loadPlugins(true, isCurrent),
+        reload: (isCurrent, interrupt) => loadPlugins(true, isCurrent, interrupt),
         onError: (error) => console.error(error),
+        waitLimitMs: PLUGIN_SYNC_RELOAD_WAIT_LIMIT_MS,
     })
     syncReload.request()
 }
@@ -502,7 +507,7 @@ export function keepPluginsOffForThisStart() {
     pluginsOffForThisStart = true
 }
 
-export async function loadPlugins(whenIdle = false, isCurrent: () => boolean = () => true) {
+export async function loadPlugins(whenIdle = false, isCurrent: () => boolean = () => true, interrupt = false) {
     if (!whenIdle) cancelPluginReloadAfterSync()
     if (pluginsOffForThisStart) return
     console.log('Loading plugins...')
@@ -516,7 +521,7 @@ export async function loadPlugins(whenIdle = false, isCurrent: () => boolean = (
 
     await applyPluginLoad(enabledPlugins.filter(isSupportedPluginVersion), () => {
         if (!isCurrent()) return false
-        if (!whenIdle || prepareV3PluginsForReload()) return true
+        if (!whenIdle || prepareV3PluginsForReload(interrupt)) return true
         requestPluginReloadAfterSync()
         return false
     }, isCurrent)

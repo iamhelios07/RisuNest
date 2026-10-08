@@ -10,6 +10,7 @@ import {
     getV3PluginInstance,
     loadV3Plugins,
     areV3PluginsIdle,
+    prepareV3PluginsForReload,
 } from './v3.svelte'
 import { registerOwnedPluginMCP } from '../hostToolHost'
 import { requestChatDataMain } from '../../process/request/request'
@@ -492,6 +493,21 @@ function __postToParent(message) {
         expect(areV3PluginsIdle()).toBe(false)
         doingChat.set(false)
         expect(areV3PluginsIdle()).toBe(true)
+    })
+
+    it('lets a reload interrupt a plugin script that never settles, but never a chat generation', async () => {
+        await startFixture('never-settles', `
+            globalThis.rpcReady = Promise.resolve();
+            await new Promise(() => {});
+        `)
+        expect(areV3PluginsIdle()).toBe(false)
+        expect(prepareV3PluginsForReload()).toBe(false)
+        doingChat.set(true)
+        expect(prepareV3PluginsForReload(true)).toBe(false)
+        doingChat.set(false)
+        expect(prepareV3PluginsForReload(true)).toBe(true)
+        await loadV3Plugins([])
+        expect(document.querySelectorAll('iframe[data-risu-plugin-frame]')).toHaveLength(0)
     })
 
     it('aborts a running model request when its sandbox unloads', async () => {

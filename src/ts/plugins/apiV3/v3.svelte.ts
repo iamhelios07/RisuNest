@@ -1757,13 +1757,18 @@ export function subscribeV3PluginActivity(listener: () => void): () => void {
     return () => { pluginActivityListeners.delete(listener); unsubscribe(); };
 }
 
+/** A reload may stop plugin work, but never a chat generation or an authority replacement. */
+export function canInterruptV3Plugins(): boolean {
+    return !authorityReplacementFenced && !get(doingChat);
+}
+
 export function areV3PluginsIdle(): boolean {
-    return !authorityReplacementFenced && !get(doingChat)
+    return canInterruptV3Plugins()
         && v3PluginInstances.every(({ host }) => host.isIdle?.() ?? true);
 }
 
-export function prepareV3PluginsForReload(): boolean {
-    if (!areV3PluginsIdle()) return false;
+export function prepareV3PluginsForReload(interrupt = false): boolean {
+    if (!(interrupt ? canInterruptV3Plugins() : areV3PluginsIdle())) return false;
     for (const { host } of v3PluginInstances) host.beginUnload?.();
     return true;
 }
