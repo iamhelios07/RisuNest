@@ -1576,6 +1576,57 @@ describe('received unit projection', () => {
     })
 })
 
+describe('received root fields without a value', () => {
+    async function rootRuntime(catalog: boolean) {
+        const initial = normalizeDatabaseDefaults({} as Database)
+        initial.botPresets[0].id = 'preset'
+        initial.personas[0].id = 'persona'
+        initial.askRemoval = false
+        initial.sendWithEnter = false
+        initial.animationSpeed = 0.8
+        const store = new IndexedDbPersistentDataStore(`received-root-defaults-${catalog}-${crypto.randomUUID()}`, new IDBFactory(), IDBKeyRange) as PersistentDataStore
+        await store.open()
+        const {revision} = await store.replaceFromDatabase(initial)
+        setDatabase(catalog ? projectCompleteScalableWorkingSet(structuredClone(initial), null, revision) : structuredClone(initial))
+        selectedCharID.set(-1)
+        const saveFailures: unknown[] = []
+        const runtime = createPersistentDataRuntime({store, state: createProductionStateAdapter(), prepareDatabase: async (value) => value,
+            onLocalSaveFailure: (error) => { if (error !== null) saveFailures.push(error) }})
+        await runtime.initializeActiveWorkingSet(getDatabase())
+        await runtime.flushPendingDataLocally('received-root-defaults-settle')
+        return {store, runtime, saveFailures}
+    }
+    async function savedKeys(store: PersistentDataStore, runtime: ReturnType<typeof createPersistentDataRuntime>) {
+        const commit = vi.spyOn(store, 'commit')
+        getDatabase().classicMaxWidth = !getDatabase().classicMaxWidth
+        await runtime.flushPendingDataLocally('after-received-root-defaults')
+        const keys = commit.mock.calls.flatMap(([input]) => [...input.rootMutations ?? [], ...input.unitMutations ?? []]).map((value) => value.key)
+        commit.mockRestore()
+        return keys
+    }
+
+    it.each([false, true].flatMap((catalog) => (['askRemoval', 'sendWithEnter'] as const).map((field) => ({catalog, field}))))(
+        'gives a removed $field the value a load gives it without saving it (catalog=$catalog)', async ({catalog, field}) => {
+            const {store, runtime, saveFailures} = await rootRuntime(catalog)
+            const key = JSON.stringify(['root', field])
+            await receiveCommit(store, runtime, {unitMutations: [{key, type: 'delete'}]}, [key])
+            expect(getDatabase()[field]).toBe(normalizeDatabaseDefaults({} as Database)[field])
+            expect(await savedKeys(store, runtime)).toEqual(['classicMaxWidth'])
+            expect((await store.readRoot()).value[field]).toBeUndefined()
+            expect(saveFailures).toEqual([])
+        })
+
+    it.each([false, true])('keeps a local edit made while a removal is received (catalog=%s)', async (catalog) => {
+        const {store, runtime, saveFailures} = await rootRuntime(catalog)
+        const key = JSON.stringify(['root', 'animationSpeed'])
+        await receiveCommit(store, runtime, {unitMutations: [{key, type: 'delete'}]}, [key], () => { getDatabase().animationSpeed = 1.2 })
+        expect(getDatabase().animationSpeed).toBe(1.2)
+        expect(await savedKeys(store, runtime)).toEqual(['animationSpeed', 'classicMaxWidth'])
+        expect((await store.readRoot()).value.animationSpeed).toBe(1.2)
+        expect(saveFailures).toEqual([])
+    })
+})
+
 describe('received fields the working set did not have', () => {
     async function fieldRuntime() {
         const initial = normalizeDatabaseDefaults({} as Database)

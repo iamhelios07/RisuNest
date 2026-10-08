@@ -267,6 +267,8 @@ export interface PersistentDataRuntimeStateAdapter {
     captureCharacterIndex?(): ReadonlyMap<string, CompleteCharacter>
     beforeCapture?(): void
     afterRemoteApply?(): void
+    /** Root fields that projected units left without a value take the value a load gives them. */
+    fillRootFieldDefaults?(fields: readonly string[]): void
     /** Root fields whose working-set value changed when stored units were projected into it. */
     afterRemoteRootChange?(fields: ReadonlySet<string>): void
     /** A received plugin record changed which plugins run or how they are loaded. */
@@ -1132,6 +1134,7 @@ export function createPersistentDataRuntime(
                 pluginsChanged = receivedPlugins.length > 0 && pluginLoadInputs() !== pluginsBefore
                 const canonicalCapture = dependencies.state.canonicalCapture
                 const beforeDerive = canonicalCapture?.root() ?? canonicalJson(dependencies.state.captureRoot())
+                if (rootFields.length > 0) dependencies.state.fillRootFieldDefaults?.(rootFields)
                 dependencies.state.afterRemoteApply?.()
                 const afterDerive = canonicalCapture?.root() ?? canonicalJson(dependencies.state.captureRoot())
                 const derivedMutations = beforeDerive === afterDerive ? [] : canonicalCapture
