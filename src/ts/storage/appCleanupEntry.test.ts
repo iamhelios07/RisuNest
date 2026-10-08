@@ -72,6 +72,13 @@ describe('app cleanup startup gate', () => {
         expect(page.style.overflow).toBe('auto')
         expect(page.style.background).toContain('--risu-theme-bgcolor')
         expect(page.style.color).toContain('--risu-theme-textcolor')
+        // The app stylesheet strips the default button look, so both buttons have to bring their own.
+        for (const button of page.querySelectorAll('button')) {
+            expect(button.classList).toContain('border')
+            expect(button.classList).toContain('bg-darkbutton')
+            expect(button.classList).toContain('disabled:opacity-50')
+        }
+        expect(page.querySelectorAll('button')).toHaveLength(2)
     })
     it('blocks normal startup when cleanup status is unavailable', async () => {
         vi.mocked(invoke).mockRejectedValue(new Error('status-unavailable'))
