@@ -1,0 +1,240 @@
+use super::{
+    commands::hydrate_binding_assets,
+    lww_tests::{drain_publications, header, local, put_asset, LocalServerFixture},
+    residency::AssetPolicy,
+};
+use crate::{asset_repository::PayloadCas, persistent_store::{PersistentStore, WorkingSetCommit}};
+use serde_json::{json, Value};
+use std::sync::{Arc, atomic::AtomicBool};
+
+fn character(id: &str, image: &str) -> Value {
+    json!({"chaId":id,"type":"character","name":"Synthetic","image":image,"chats":[]})
+}
+
+fn add(store: &mut PersistentStore, value: Value) {
+    store.commit(&WorkingSetCommit { expected_revision: store.revision().unwrap(), add_character: Some(value), ..Default::default() }).unwrap();
+}
+
+fn replace(store: &mut PersistentStore, value: Value) {
+    store.commit(&WorkingSetCommit { expected_revision: store.revision().unwrap(), replace_character: Some(value), ..Default::default() }).unwrap();
+}
+
+fn hydrate(store: &PersistentStore) -> super::Result<()> {
+    hydrate_binding_assets(store, &header(store), Arc::new(AtomicBool::new(false)), None, || {})
+}
+
+fn status(store: &PersistentStore) -> Value {
+    serde_json::to_value(store.asset_residency_status().unwrap()).unwrap()
+}
+
+#[test]
+fn remote_policy_fetches_only_current_representatives_and_reuses_them_after_restart() {
+    let server = LocalServerFixture::new();
+    let (root, mut store) = local();
+    let core = server.client(&store);
+    let main = put_asset(&mut store, "assets/main.png", b"synthetic representative");
+    let emotion = put_asset(&mut store, "assets/emotion.png", b"synthetic emotion");
+    let extra = put_asset(&mut store, "assets/extra.png", b"synthetic extra");
+    drain_publications(&core, &mut store, &[]).unwrap();
+    store.asset_residency_set_policy(AssetPolicy::Remote, || Ok(())).unwrap();
+    store.asset_residency_evict(|| Ok(())).unwrap();
+    let mut first = character("first", &main.key);
+    first["emotionImages"] = json!([["neutral", emotion.key]]);
+    first["additionalAssets"] = json!([["extra", extra.key, "png"]]);
+    add(&mut store, first);
+    add(&mut store, character("same-image", &main.key));
+    let mut trashed = character("trashed", &extra.key);
+    trashed["trashTime"] = json!(1);
+    add(&mut store, trashed);
+    assert_eq!(status(&store)["localBytes"], 0);
+    assert_eq!(status(&store)["serverObjects"], 3);
+    assert_eq!(status(&store)["unavailableObjects"], 0);
+    let visits = std::cell::Cell::new(0);
+    hydrate_binding_assets(&store, &header(&store), Arc::new(AtomicBool::new(false)), Some("first"), || visits.set(visits.get() + 1)).unwrap();
+    assert_eq!(visits.get(), 1, "two representatives sharing a hash use one body");
+    let cas = PayloadCas::new(store.repository_root()).unwrap();
+    assert_eq!(cas.read_object(main.object_hash.as_ref().unwrap()).unwrap().unwrap(), b"synthetic representative");
+    assert!(cas.stat_object(emotion.object_hash.as_ref().unwrap()).unwrap().is_none());
+    assert!(cas.stat_object(extra.object_hash.as_ref().unwrap()).unwrap().is_none());
+    assert_eq!(status(&store)["localBytes"], main.size);
+    assert_eq!(status(&store)["serverObjects"], 2);
+    assert_eq!(status(&store)["unavailableObjects"], 0);
+    assert_eq!(store.asset_residency_evict(|| Ok(())).unwrap().evicted_bytes, 0);
+    crate::asset_repository::body_io::reset_body_io();
+    hydrate(&store).unwrap();
+    let work = crate::asset_repository::body_io::take_body_io();
+    assert_eq!((work.stat_requests, work.batch_stat_requests), (0, 1));
+    assert!(work.domains.is_empty(), "checking retained representatives does not open their bodies");
+    drop(core);
+    drop(server);
+    drop(store);
+    let reopened = PersistentStore::open(root.path()).unwrap();
+    hydrate(&reopened).expect("an already-local representative needs no server");
+    assert_eq!(PayloadCas::new(root.path()).unwrap().read_object(main.object_hash.as_ref().unwrap()).unwrap().unwrap(), b"synthetic representative");
+}
+
+#[test]
+fn offload_tracks_replacement_alias_overwrite_trash_and_deletion_without_changing_logical_assets() {
+    let server = LocalServerFixture::new();
+    let (_root, mut store) = local();
+    let core = server.client(&store);
+    let old = put_asset(&mut store, "assets/old.png", b"old synthetic image");
+    let new = put_asset(&mut store, "assets/new.png", b"new synthetic image");
+    add(&mut store, character("first", &old.key));
+    drain_publications(&core, &mut store, &[]).unwrap();
+    store.asset_residency_set_policy(AssetPolicy::Remote, || Ok(())).unwrap();
+    let cas = PayloadCas::new(store.repository_root()).unwrap();
+    assert_eq!(store.asset_residency_evict(|| Ok(())).unwrap().evicted_bytes, new.size as u64);
+    assert!(cas.stat_object(old.object_hash.as_ref().unwrap()).unwrap().is_some());
+    replace(&mut store, character("first", &new.key));
+    hydrate(&store).unwrap();
+    assert_eq!(store.asset_residency_evict(|| Ok(())).unwrap().evicted_bytes, old.size as u64);
+    assert!(cas.stat_object(old.object_hash.as_ref().unwrap()).unwrap().is_none());
+    assert!(store.read_asset_alias("asset", &old.key, None).unwrap().is_some());
+    // Keep another logical reference so the previous body remains an offload candidate.
+    // Unreferenced bodies belong to ordinary asset GC instead.
+    put_asset(&mut store, "assets/previous-new.png", b"new synthetic image");
+    let replacement = put_asset(&mut store, &new.key, b"replacement under the same logical key");
+    drain_publications(&core, &mut store, &[]).unwrap();
+    store.asset_residency_evict(|| Ok(())).unwrap();
+    assert!(cas.stat_object(replacement.object_hash.as_ref().unwrap()).unwrap().is_some());
+    assert!(cas.stat_object(new.object_hash.as_ref().unwrap()).unwrap().is_none());
+    let mut trashed = character("first", &new.key);
+    trashed["trashTime"] = json!(1);
+    replace(&mut store, trashed);
+    store.asset_residency_evict(|| Ok(())).unwrap();
+    assert!(cas.stat_object(replacement.object_hash.as_ref().unwrap()).unwrap().is_none());
+    replace(&mut store, character("first", &new.key));
+    hydrate(&store).unwrap();
+    assert!(cas.stat_object(replacement.object_hash.as_ref().unwrap()).unwrap().is_some());
+    store.commit(&WorkingSetCommit { expected_revision: store.revision().unwrap(), delete_character_ids: Some(vec!["first".into()]), ..Default::default() }).unwrap();
+    store.asset_residency_evict(|| Ok(())).unwrap();
+    assert!(cas.stat_object(replacement.object_hash.as_ref().unwrap()).unwrap().is_none());
+}
+
+#[test]
+fn an_archived_catalog_image_stays_local_while_its_archive_can_be_offloaded() {
+    let server = LocalServerFixture::new();
+    let (_root, mut store) = local();
+    let core = server.client(&store);
+    let main = put_asset(&mut store, "assets/archive-main.png", b"synthetic archived representative");
+    add(&mut store, character("archived", &main.key));
+    store.archive_character("archived", store.revision().unwrap(), 1).unwrap();
+    drain_publications(&core, &mut store, &[]).unwrap();
+    store.asset_residency_set_policy(AssetPolicy::Remote, || Ok(())).unwrap();
+    assert!(store.asset_residency_evict(|| Ok(())).unwrap().evicted_bytes > 0);
+    assert!(PayloadCas::new(store.repository_root()).unwrap().stat_object(main.object_hash.as_ref().unwrap()).unwrap().is_some());
+    store.restore_character("archived", store.revision().unwrap()).unwrap();
+    assert_eq!(store.read_character("archived", None).unwrap().unwrap().value["image"], main.key);
+}
+
+#[test]
+fn a_missing_representative_is_never_reported_local_and_does_not_hide_available_images() {
+    let server = LocalServerFixture::new();
+    let (_root, mut store) = local();
+    let core = server.client(&store);
+    let available = put_asset(&mut store, "assets/available.png", b"synthetic available image");
+    drain_publications(&core, &mut store, &[]).unwrap();
+    store.asset_residency_set_policy(AssetPolicy::Remote, || Ok(())).unwrap();
+    store.asset_residency_evict(|| Ok(())).unwrap();
+    let missing = put_asset(&mut store, "assets/missing.png", b"synthetic missing image");
+    let cas = PayloadCas::new(store.repository_root()).unwrap();
+    cas.unlink_exact_object(missing.object_hash.as_ref().unwrap(), missing.size as u64, &crate::asset_repository::object_physical_key(missing.object_hash.as_ref().unwrap())).unwrap();
+    add(&mut store, character("missing", &missing.key));
+    add(&mut store, character("available", &available.key));
+    assert_eq!(status(&store)["unavailableObjects"], 1);
+    assert_eq!(status(&store)["localBytes"], 0);
+    assert_eq!(hydrate(&store).unwrap_err().code, "required-asset-unavailable");
+    assert!(cas.stat_object(available.object_hash.as_ref().unwrap()).unwrap().is_some());
+    assert!(cas.stat_object(missing.object_hash.as_ref().unwrap()).unwrap().is_none());
+    assert_eq!(status(&store)["unavailableObjects"], 1);
+    assert_eq!(status(&store)["localBytes"], available.size);
+}
+
+#[test]
+fn remote_representative_hydration_obeys_cancellation_and_binding_authority() {
+    let server = LocalServerFixture::new();
+    let (_root, mut store) = local();
+    let core = server.client(&store);
+    let main = put_asset(&mut store, "assets/cancelled-main.png", b"synthetic cancelled representative");
+    drain_publications(&core, &mut store, &[]).unwrap();
+    store.asset_residency_set_policy(AssetPolicy::Remote, || Ok(())).unwrap();
+    store.asset_residency_evict(|| Ok(())).unwrap();
+    add(&mut store, character("cancelled", &main.key));
+    let cancelled = hydrate_binding_assets(&store, &header(&store), Arc::new(AtomicBool::new(true)), None, || panic!("no body may finish"));
+    assert_eq!(cancelled.unwrap_err().code, "cancelled");
+    let mut stale = header(&store);
+    stale.binding_authority = (stale.binding_authority.0 + 1).into();
+    assert_eq!(hydrate_binding_assets(&store, &stale, Arc::new(AtomicBool::new(false)), None, || panic!("no body may finish")).unwrap_err().code, "binding-authority-changed");
+    assert!(PayloadCas::new(store.repository_root()).unwrap().stat_object(main.object_hash.as_ref().unwrap()).unwrap().is_none());
+    hydrate(&store).unwrap();
+}
+
+#[test]
+fn selected_representative_finishes_first_and_replacement_does_not_keep_the_old_image() {
+    let server = LocalServerFixture::new();
+    let (root, mut store) = local();
+    let core = server.client(&store);
+    let first = put_asset(&mut store, "assets/first.png", b"synthetic first representative");
+    let second = put_asset(&mut store, "assets/second.png", b"synthetic second representative");
+    drain_publications(&core, &mut store, &[]).unwrap();
+    store.asset_residency_set_policy(AssetPolicy::Remote, || Ok(())).unwrap();
+    store.asset_residency_evict(|| Ok(())).unwrap();
+    add(&mut store, character("first", &first.key));
+    add(&mut store, character("selected", &second.key));
+    let cas = PayloadCas::new(root.path()).unwrap();
+    let visits = std::cell::Cell::new(0);
+    hydrate_binding_assets(&store, &header(&store), Arc::new(AtomicBool::new(false)), Some("selected"), || {
+        visits.set(visits.get() + 1);
+        if visits.get() == 1 {
+            assert!(cas.stat_object(second.object_hash.as_ref().unwrap()).unwrap().is_some());
+            assert!(cas.stat_object(first.object_hash.as_ref().unwrap()).unwrap().is_none());
+        }
+    }).unwrap();
+    assert_eq!(visits.get(), 2);
+    replace(&mut store, character("selected", &first.key));
+    assert_eq!(store.read_character("selected", None).unwrap().unwrap().value["image"], first.key);
+    store.asset_residency_evict(|| Ok(())).unwrap();
+    assert!(cas.stat_object(first.object_hash.as_ref().unwrap()).unwrap().is_some());
+    assert!(cas.stat_object(second.object_hash.as_ref().unwrap()).unwrap().is_none());
+}
+
+#[test]
+fn offload_rechecks_a_representative_changed_while_server_retention_was_in_flight() {
+    let replacement = Arc::new(std::sync::Mutex::new(None::<(std::path::PathBuf, String)>));
+    let observed = replacement.clone();
+    let server = LocalServerFixture::with_router(move |router| router.layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let observed = observed.clone();
+            async move {
+                let retention = request.uri().path().ends_with("/objects/retention");
+                let response = next.run(request).await;
+                if retention && response.status().is_success() {
+                    let change = observed.lock().unwrap().take();
+                    if let Some((root, image)) = change {
+                        tokio::task::spawn_blocking(move || {
+                            replace(&mut PersistentStore::open(&root).unwrap(), character("changing", &image));
+                        }).await.unwrap();
+                    }
+                }
+                response
+            }
+        },
+    )));
+    let (root, mut store) = local();
+    let core = server.client(&store);
+    let old = put_asset(&mut store, "assets/before.png", b"synthetic before retention");
+    let new = put_asset(&mut store, "assets/after.png", b"synthetic after retention");
+    add(&mut store, character("changing", &old.key));
+    drain_publications(&core, &mut store, &[]).unwrap();
+    store.asset_residency_set_policy(AssetPolicy::Remote, || Ok(())).unwrap();
+    *replacement.lock().unwrap() = Some((root.path().to_path_buf(), new.key.clone()));
+    assert_eq!(store.asset_residency_evict(|| Ok(())).unwrap().evicted_bytes, 0);
+    assert!(replacement.lock().unwrap().is_none(), "the image changed during retention");
+    assert_eq!(store.read_character("changing", None).unwrap().unwrap().value["image"], new.key);
+    let cas = PayloadCas::new(root.path()).unwrap();
+    assert!(cas.stat_object(new.object_hash.as_ref().unwrap()).unwrap().is_some());
+    assert_eq!(store.asset_residency_evict(|| Ok(())).unwrap().evicted_bytes, old.size as u64);
+    assert!(cas.stat_object(old.object_hash.as_ref().unwrap()).unwrap().is_none());
+    assert!(cas.stat_object(new.object_hash.as_ref().unwrap()).unwrap().is_some());
+}

@@ -214,6 +214,70 @@ describe('production server LWW composition', () => {
         })
         await production.receiveAvailableServerChanges(); await settle(); expect(hydrationCalls()).toHaveLength(0)
     })
+    it.each([
+        { key: ['character', 'first', 'image'], value: { kind: 'inline', bytes: btoa(JSON.stringify('assets/main.png')) } },
+        { key: ['character', 'first', 'trashTime'], value: { kind: 'deleted' } },
+        { key: ['exists', 'character', 'first'], value: { kind: 'inline', bytes: 'dHJ1ZQ==' } },
+        { key: ['archive', 'first'], value: { kind: 'deleted' } },
+    ])('refreshes representatives after receiving $key without downloading the full inventory', async ({ key, value }) => {
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        visible(true); await f.transport!.resumeBinding(bindingContext()); await settle(); f.invoke.mockClear()
+        let page = true
+        f.invoke.mockImplementation(async command => {
+            if (command === 'server_sync_lww_pull' && page) {
+                page = false
+                return { ...emptyReceive(), changes: [{ key: JSON.stringify(key), value }] }
+            }
+            return command === 'server_sync_lww_pull' ? emptyReceive() : null
+        })
+        await production.receiveAvailableServerChanges(); await settle()
+        expect(hydrationCalls()).toEqual([['server_sync_lww_hydrate', {
+            request: expect.objectContaining({ bindingAuthority: '0' }), selectedCharacterId: 'selected-stable-id', representativesOnly: true,
+        }]])
+    })
+    it('coalesces local remote-policy edits and preserves another edit during representative hydration', async () => {
+        const base = f.invoke.getMockImplementation()!
+        f.invoke.mockImplementation(async (command, args) => command === 'server_sync_status'
+            ? { configured: true, writerId: 'writer', bindingAuthority: '0', assetPolicy: 'remote' } : base(command, args))
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        visible(true); await f.transport!.resumeBinding(bindingContext()); await settle(); f.invoke.mockClear()
+        let finish!: () => void
+        const original = f.invoke.getMockImplementation()!
+        f.invoke.mockImplementation((command, args) => command === 'server_sync_lww_hydrate'
+            ? new Promise<void>(resolve => { finish = resolve }) : original(command, args))
+        f.revision!(32); f.revision!(33)
+        await vi.advanceTimersByTimeAsync(2000); await settle()
+        expect(hydrationCalls()).toHaveLength(1)
+        expect(hydrationCalls()[0][1]).toMatchObject({ representativesOnly: true })
+        f.revision!(34)
+        await vi.advanceTimersByTimeAsync(2000); await settle()
+        expect(hydrationCalls()).toHaveLength(1)
+        finish(); await settle()
+        expect(hydrationCalls()).toHaveLength(2)
+        finish(); await settle()
+    })
+    it('does not scan the full asset inventory on local edits in full mode', async () => {
+        const base = f.invoke.getMockImplementation()!
+        f.invoke.mockImplementation(async (command, args) => command === 'server_sync_status'
+            ? { configured: true, writerId: 'writer', bindingAuthority: '0', assetPolicy: 'full' } : base(command, args))
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        visible(true); await f.transport!.resumeBinding(bindingContext()); await settle(); f.invoke.mockClear()
+        f.revision!(32)
+        await vi.advanceTimersByTimeAsync(2000); await settle()
+        expect(hydrationCalls()).toHaveLength(0)
+    })
+    it('fills representatives when settings switch an active binding to remote storage', async () => {
+        const base = f.invoke.getMockImplementation()!
+        let assetPolicy = 'full'
+        f.invoke.mockImplementation(async (command, args) => command === 'server_sync_status'
+            ? { configured: true, writerId: 'writer', bindingAuthority: '0', assetPolicy } : base(command, args))
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        visible(true); await f.transport!.resumeBinding(bindingContext()); await settle(); f.invoke.mockClear()
+        assetPolicy = 'remote'
+        await production.getServerSyncController().ensureStatus(); await settle()
+        expect(hydrationCalls()).toHaveLength(1)
+        expect(hydrationCalls()[0][1]).toMatchObject({ representativesOnly: true })
+    })
     it('rechecks an outgoing clock block through native settlement on open, and leaves accepted correction blocked', async () => {
         production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
         let future = true

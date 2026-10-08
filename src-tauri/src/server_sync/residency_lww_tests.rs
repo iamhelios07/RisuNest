@@ -192,14 +192,15 @@ fn selected_character_assets_finish_before_uncapped_catalog_hydration() {
     let (_root, mut store) = local();
     let core = server.client(&store);
     let hashes = (0..130).map(|index| put_asset(&mut store, &format!("assets/priority-{index}.png"), format!("synthetic priority {index}").as_bytes()).object_hash.unwrap()).collect::<Vec<_>>();
+    super::lww_tests::drain_publications(&core, &mut store, &[]).unwrap();
+    store.asset_residency_set_policy(super::residency::AssetPolicy::Remote, || Ok(())).unwrap();
+    store.asset_residency_evict(|| Ok(())).unwrap();
+    // Make every body remote before assigning the representative image.
     store.commit(&WorkingSetCommit {
         expected_revision: store.revision().unwrap(),
         add_character: Some(serde_json::json!({"chaId":"selected-priority","type":"character","name":"Synthetic","image":"assets/priority-129.png","additionalAssets":[["extra","assets/priority-128.png","png"]],"chats":[]})),
         ..Default::default()
     }).unwrap();
-    super::lww_tests::drain_publications(&core, &mut store, &[]).unwrap();
-    store.asset_residency_set_policy(super::residency::AssetPolicy::Remote, || Ok(())).unwrap();
-    store.asset_residency_evict(|| Ok(())).unwrap();
     let cas = PayloadCas::new(store.repository_root()).unwrap();
     assert_eq!(store.selected_character_asset_hashes("selected-priority").unwrap(), [hashes[128].clone(),hashes[129].clone()].into_iter().collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>());
     assert!(store.selected_character_asset_hashes("missing-character").unwrap().is_empty());
@@ -225,6 +226,10 @@ fn switching_to_full_policy_hydrates_selected_references_before_other_characters
         put_asset(&mut store,"assets/policy-second.png",b"second synthetic policy priority"),
     ];
     aliases.sort_by(|a,b| a.object_hash.cmp(&b.object_hash));
+    super::lww_tests::drain_publications(&core,&mut store,&[]).unwrap();
+    store.asset_residency_set_policy(super::residency::AssetPolicy::Remote,||Ok(())).unwrap();
+    store.asset_residency_evict(||Ok(())).unwrap();
+    // Start with remote bodies, before the new character references are hydrated.
     for (character,alias) in [("policy-other",&aliases[0]),("policy-selected",&aliases[1])] {
         store.commit(&WorkingSetCommit {
             expected_revision:store.revision().unwrap(),
@@ -232,9 +237,6 @@ fn switching_to_full_policy_hydrates_selected_references_before_other_characters
             ..Default::default()
         }).unwrap();
     }
-    super::lww_tests::drain_publications(&core,&mut store,&[]).unwrap();
-    store.asset_residency_set_policy(super::residency::AssetPolicy::Remote,||Ok(())).unwrap();
-    store.asset_residency_evict(||Ok(())).unwrap();
     let cas=PayloadCas::new(store.repository_root()).unwrap();
     let selected=aliases[1].object_hash.as_ref().unwrap(); let other=aliases[0].object_hash.as_ref().unwrap();
     assert!(cas.stat_object(selected).unwrap().is_none()); assert!(cas.stat_object(other).unwrap().is_none());

@@ -2209,7 +2209,7 @@ export const languageEnglish = {
             residency: {
                 title: 'Asset storage',
                 description:
-                    'The asset storage mode is chosen separately for each device. Keeping files locally loads assets faster but increases sync time and the space used. Using remote files saves space, but loading an asset can take longer.',
+                    'Keeping all assets on this device loads them faster but increases sync time and storage use. Loading assets from the server saves space. Each character’s current main image is kept on this device, except for characters in the trash.',
                 full: 'Keep everything on this device',
                 remote: 'Load from the server when needed',
                 local: 'Files on this device',
@@ -2218,7 +2218,7 @@ export const languageEnglish = {
                 unavailable: 'Files not found',
                 checking: 'Checking files…',
                 cleanupNote:
-                    'Cleanup removes this device’s copies of files that are on the server.',
+                    'Cleanup removes this device’s copies of files that are on the server, excluding the current main images of characters outside the trash.',
                 clean: 'Clear copies on this device',
                 cancel: 'Cancel',
                 working:

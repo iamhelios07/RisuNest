@@ -111,7 +111,14 @@ fn restoring_reads_an_archive_kept_on_this_device() {
 #[test]
 fn archiving_and_restoring_fetch_only_what_the_sync_server_holds() {
     let server = LocalServerFixture::new();
-    let (_root, mut store, manifest, before) = owner_store();
+    let (_root, mut store, manifest, mut before) = owner_store();
+    let main = crate::server_sync::lww_tests::put_asset(&mut store, "assets/char-owner-main.png", b"synthetic separate representative");
+    before["image"] = json!(main.key);
+    store.commit(&WorkingSetCommit {
+        expected_revision: store.revision().unwrap(),
+        replace_character: Some(before.clone()),
+        ..Default::default()
+    }).expect("keep the representative separate from the additional asset");
     let core = server.client(&store);
     drain_publications(&core, &mut store, &[]).expect("publish the character");
     store.asset_residency_set_policy(AssetPolicy::Remote, || Ok(())).expect("keep bodies on the server");
@@ -124,6 +131,7 @@ fn archiving_and_restoring_fetch_only_what_the_sync_server_holds() {
         .object_hash
         .expect("the additional asset has a body");
     assert!(!is_local(&store, &asset), "the remote policy leaves the asset on the server");
+    assert!(is_local(&store, main.object_hash.as_ref().unwrap()));
 
     // Archiving reads only the owner manifest, which stays on this device, and still lists the
     // asset it names.

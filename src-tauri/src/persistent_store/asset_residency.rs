@@ -173,6 +173,50 @@ fn previous_storage_wanted(
 }
 
 impl PersistentStore {
+    fn representative_image_hashes(&self, selected_character_id: Option<&str>) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
+        let generation = super::active_generation(&self.connection)?;
+        let mut images = BTreeSet::new();
+        let mut priority = BTreeSet::new();
+        let mut query = self.connection.prepare_cached(
+            "SELECT c.character_id, a.object_hash FROM characters c
+             JOIN asset_aliases a ON a.generation=c.generation AND a.kind='asset' AND a.logical_key=c.image
+             WHERE c.generation=?1 AND c.trashed=0 AND a.object_hash IS NOT NULL",
+        )?;
+        let rows = query.query_map([generation], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        for row in rows {
+            let (character_id, hash) = row?;
+            if selected_character_id == Some(character_id.as_str()) { priority.insert(hash.clone()); }
+            images.insert(hash);
+        }
+        Ok((images, priority))
+    }
+
+    pub(crate) fn hydrate_representative_images(
+        &self,
+        cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        selected_character_id: Option<&str>,
+        check: impl Fn() -> Result<()>,
+        on_object_done: impl Fn(),
+    ) -> Result<()> {
+        check()?;
+        let generation = super::active_generation(&self.connection)?;
+        let (images, priority) = self.representative_image_hashes(selected_character_id)?;
+        let check = || {
+            check()?;
+            if super::active_generation(&self.connection)? != generation {
+                return Err(SyncError::new("binding-authority-changed", 409));
+            }
+            Ok(())
+        };
+        let (_, missing) = split_local(&PayloadCas::new(&self.repository_root)?, images, &check)?;
+        if missing.is_empty() { return check(); }
+        let mut hydration = crate::server_sync::residency::HydrationSession::new(&self.repository_root, cancellation)?;
+        if !hydration.hydrate_many_outcomes_prioritized(&missing, &priority, &check, |_, _| on_object_done())?.is_empty() {
+            return Err(SyncError::new("required-asset-unavailable", 409));
+        }
+        check()
+    }
+
     pub(crate) fn asset_object_byte_size(&self, hash: &str) -> super::StoreResult<Option<u64>> {
         let size: Option<i64> = self.connection.query_row(
             "SELECT byte_size FROM asset_objects WHERE object_hash=?1", [hash], |row| row.get(0),
@@ -336,6 +380,8 @@ impl PersistentStore {
         let mut referenced = BTreeSet::new();
         let roots = self.collect_asset_gc_roots_with_backup_references(guarded, false, Some(&mut referenced))?;
         let mut local = BTreeSet::new();
+        // This is offload protection, not evidence that the body exists on this device.
+        local.extend(self.representative_image_hashes(None)?.0);
         let mut manifests = BTreeSet::new();
         let mut release_blocked = false;
         for (label, root) in roots {

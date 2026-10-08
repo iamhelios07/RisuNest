@@ -67,6 +67,7 @@ let foreground = false
 let replacing = false
 let hydrating: Promise<void> | undefined
 let hydrationPending = false
+let representativesPending = false
 let hydrationAgain = false
 let hydrationError = ''
 let schedulerAuthority: string | undefined
@@ -186,18 +187,27 @@ const receivedBodyReferences = (changes: LwwRemoteChange[]) => changes.some(chan
     const descriptor = change.value.descriptor as { dependencies?: unknown[]; dependencyRoot?: unknown; relationRoot?: unknown }
     return !!descriptor.dependencies?.length || !!descriptor.dependencyRoot || !!descriptor.relationRoot
 })
+const receivedRepresentativeReferences = (changes: LwwRemoteChange[]) => changes.some(change => {
+    const key: string[] = JSON.parse(change.key)
+    return key[0] === 'character' && (key[2] === 'image' || key[2] === 'trashTime')
+        || key[0] === 'exists' && key[1] === 'character'
+        || key[0] === 'archive'
+})
 function continueHydration(): void {
-    if (!hydrationPending || !foreground || !context || context.signal.aborted || scheduler.isBlocked()) return
+    if ((!hydrationPending && !representativesPending) || !foreground || !context || context.signal.aborted || scheduler.isBlocked()) return
     if (hydrating) { hydrationAgain = true; return }
     const captured = context
+    const representativesOnly = !hydrationPending
     hydrationPending = false
+    representativesPending = false
     hydrationAgain = false
-    hydrating = during('assets', () => invoke('server_sync_lww_hydrate', { request: header(), selectedCharacterId: selectedCharacterId() })).then(() => {
+    hydrating = during('assets', () => invoke('server_sync_lww_hydrate', { request: header(), selectedCharacterId: selectedCharacterId(), ...(representativesOnly ? { representativesOnly: true } : {}) })).then(() => {
         if (captured === context && !captured.signal.aborted && hydrationError && error === hydrationError) { error = ''; hydrationError = '' }
     }).catch(value => {
         attemptFailed = true
         if (captured !== context || captured.signal.aborted) return
-        hydrationPending = true
+        if (representativesOnly) representativesPending = true
+        else hydrationPending = true
         if (serverSyncErrorCode(value) !== 'cancelled' && foreground && !scheduler.isBlocked()) {
             hydrationError = serverSyncErrorCode(value) || 'server-unreachable'; error = hydrationError
         }
@@ -278,6 +288,7 @@ const scheduler = createServerSyncScheduler({
             catch (value) { throw localApplyFailure(value) }
             checkContext(captured)
             if (receivedBodyReferences(request.changes)) { receivedBodies = true; hydrationPending = true }
+            if (receivedRepresentativeReferences(request.changes)) { receivedBodies = true; representativesPending = true }
             if (!foreground && !completeAvailable) break
             await invoke('server_sync_lww_ack', { request: { bindingAuthority: request.bindingAuthority, requestId: request.requestId } })
             checkContext(captured)
@@ -322,7 +333,7 @@ const transport: SyncBindingTransport = {
         const code = serverSyncErrorCode(failures(value)[0])
         if (code !== 'cancelled') { error = code || 'server-unreachable'; changed() }
     },
-    async fenceOldJobs(c) { foreground = false; context = undefined; persistedBinding = undefined; await scheduler.fence(); await hydrating; await invoke('server_sync_lww_fence', { newDevice: c.mode === 'new-device' || c.mode === 'fresh-writer' }); hydrationPending = false; hydrationAgain = false },
+    async fenceOldJobs(c) { foreground = false; context = undefined; persistedBinding = undefined; await scheduler.fence(); await hydrating; await invoke('server_sync_lww_fence', { newDevice: c.mode === 'new-device' || c.mode === 'fresh-writer' }); hydrationPending = false; representativesPending = false; hydrationAgain = false },
     async receiveAvailableChanges(c) { c.signal.throwIfAborted(); if (!context || context.state.targetAuthority !== c.state.targetAuthority || context.state.selectionEpoch !== c.state.selectionEpoch) throw new Error('Sync binding changed'); await receiveAvailableServerChanges(); c.signal.throwIfAborted() },
     async publishInitialSharedState(c) {
         context = c
@@ -387,7 +398,10 @@ export async function retryServerSync(): Promise<void> {
 export async function installServerSyncProduction({ resumeBound = true }: { resumeBound?: boolean } = {}): Promise<void> {
     if (!isTauri || disposeServer) return
     const disposers = [registerSyncBindingTransport({ kind: 'server', connectionId: 'server' }, transport)]
-    disposers.push(subscribeLocalPersistentRevision((_revision,cause) => scheduler.localChange(cause === 'generation-complete')))
+    disposers.push(subscribeLocalPersistentRevision((_revision,cause) => {
+        if (status.assetPolicy === 'remote') { representativesPending = true; queueMicrotask(continueHydration) }
+        scheduler.localChange(cause === 'generation-complete')
+    }))
     // Another sync target taking over fences this one without a status read, so the server card reads it again.
     disposers.push(subscribeSyncBindingChanges(() => { void controller.ensureStatus().catch(() => {}) }))
     // The source is renewed on every store revision; only a different conversation counts as opened.
@@ -408,7 +422,7 @@ export async function installServerSyncProduction({ resumeBound = true }: { resu
     const visibility = () => { void updateForeground(document.visibilityState !== 'hidden').catch(value => { if (serverSyncErrorCode(value) === 'cancelled') return; error = serverSyncErrorCode(value) || 'server-unreachable'; changed() }) }
     document.addEventListener('visibilitychange', visibility)
     disposers.push(() => document.removeEventListener('visibilitychange', visibility))
-    disposeServer = () => { scheduler.dispose(); for (const dispose of disposers) dispose(); context = undefined; persistedBinding = undefined; foreground = false; hydrationPending = false; hydrationAgain = false; attempt = undefined; clearFinished(); watchSamples() }
+    disposeServer = () => { scheduler.dispose(); for (const dispose of disposers) dispose(); context = undefined; persistedBinding = undefined; foreground = false; hydrationPending = false; representativesPending = false; hydrationAgain = false; attempt = undefined; clearFinished(); watchSamples() }
     await controller.ensureStatus()
     if (!resumeBound) return
     const current = await invoke<BindingContext['state']>('pds_lww_binding_state')
@@ -459,7 +473,9 @@ const controller = {
     confirmReplacement: async () => {},
     holdAutomaticSync: () => { foreground = false; if (hydrating) hydrationPending = true; void scheduler.fence() },
     ensureStatus: async () => {
+        const previousPolicy = status.assetPolicy
         if (isTauri) { [status,persistedBinding] = await Promise.all([invoke<Status>('server_sync_status'),invoke<BindingContext['state']>('pds_lww_binding_state')]) }
+        if (status.assetPolicy === 'remote' && previousPolicy !== 'remote') { representativesPending = true; continueHydration() }
         if (status.configured || persistedBinding?.target.kind !== 'server') bindingIncomplete = false
         changed()
     },
