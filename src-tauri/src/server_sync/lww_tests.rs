@@ -161,6 +161,34 @@ pub(crate) fn save(store: &mut PersistentStore, parts: &[&str], value: serde_jso
         })
         .unwrap();
 }
+/// Inserts `messages` at `start` in the synthetic chat `char`/`chat`, which a
+/// start of 0 creates.
+pub(crate) fn insert_messages(
+    store: &mut PersistentStore,
+    start: i64,
+    messages: Vec<serde_json::Value>,
+) {
+    use crate::persistent_store::ConversationMutation;
+    if start == 0 {
+        save(store, &["exists", "character", "char"], serde_json::json!({"type":"character"}));
+        save(store, &["exists", "conversation", "char", "chat"], serde_json::json!(true));
+    }
+    store
+        .commit(&WorkingSetCommit {
+            expected_revision: store.revision().unwrap(),
+            conversations: Some(vec![ConversationMutation::ReplaceRange {
+                character_id: "char".into(),
+                conversation_id: "chat".into(),
+                start,
+                delete_count: 0,
+                messages,
+                conversation: None,
+                configured_index: None,
+            }]),
+            ..Default::default()
+        })
+        .unwrap();
+}
 fn push(client: &LwwClient, store: &mut PersistentStore) {
     assert!(publish_cycle(client, store, &[]).unwrap().is_some());
 }

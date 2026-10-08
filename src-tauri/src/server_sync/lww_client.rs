@@ -1371,7 +1371,7 @@ impl LwwClient {
         }
         transfer.download(&required_controls, &[])?;
         for hash in required_controls {
-            let body = cache.read(&hash, MAX_METADATA_BYTES)?;
+            let body = read_whole(&cache, &hash)?;
             store.lww_put_object(&hash, &body)?;
         }
         let binding = store.lww_binding_authority()?;
@@ -1388,12 +1388,7 @@ impl LwwClient {
         }
         transfer.download_with_hints(&required_large, &[], &hints)?;
         for hash in required_large {
-            let size = cache
-                .stat_object(&hash)?
-                .ok_or_else(|| SyncError::new("cached-object-missing", 409))?;
-            let size = usize::try_from(size)
-                .map_err(|_| SyncError::new("cached-object-too-large", 413))?;
-            let body = cache.read(&hash, size)?;
+            let body = read_whole(&cache, &hash)?;
             store.lww_put_object(&hash, &body)?;
         }
         if !remote.is_empty() {
@@ -1447,6 +1442,14 @@ fn discard_cache(path: &Path) {
     // A file the system still holds is removed by the next finished operation
     // or a cache cleanup, so this never fails an operation that completed.
     let _ = std::fs::remove_dir_all(path);
+}
+
+/// A downloaded body, whole. Message pages, archive metadata and large unit
+/// bodies are published at any size; the read still checks the body against
+/// its hash.
+#[track_caller]
+fn read_whole(cache: &Cache, hash: &str) -> Result<Vec<u8>> {
+    cache.read(hash, usize::MAX)
 }
 
 /// Units the library keeps as one body, where an edit mostly repeats the body

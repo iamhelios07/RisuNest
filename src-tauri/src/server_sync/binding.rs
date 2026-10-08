@@ -859,6 +859,23 @@ mod tests {
         crate::server_sync::lww_tests::receive_available(&receiver,&mut target,&[]).unwrap();
         assert_eq!(target.read_root(None).unwrap().value["language"],"ko");
     }
+    #[test]
+    fn a_joining_store_binds_a_chat_whose_message_page_is_larger_than_a_metadata_body() {
+        use super::super::body_encoding_tests::random_text;
+        let server = LocalServerFixture::new();
+        let (_source_root, mut source) = local();
+        let (_target_root, mut target) = local();
+        let sender = server.client(&source);
+        let data = random_text(risunest_sync_wire::MAX_METADATA_BYTES + 64 * 1024, 9);
+        crate::server_sync::lww_tests::insert_messages(&mut source, 0, vec![serde_json::json!({"role":"user","data":data})]);
+        crate::server_sync::lww_tests::drain_publications(&sender, &mut source, &[]).unwrap();
+        server.prepare_binding_candidate(&target);
+        let counters = std::sync::Arc::new(super::super::client::TestIoCounters::default());
+        first_binding_cycle(&mut target, counters, |_| {}).unwrap();
+        let chat = target.read_conversation("char", "chat", None).unwrap().unwrap().value;
+        assert_eq!(chat["message"].as_array().unwrap().len(), 1);
+        assert!(chat["message"][0]["data"] == data.as_str());
+    }
     fn configure(
         server: &LocalServerFixture,
         store: &PersistentStore,

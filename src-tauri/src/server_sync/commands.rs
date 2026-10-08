@@ -731,6 +731,22 @@ mod failure_log_tests {
     }
 
     #[test]
+    fn a_body_over_its_read_limit_logs_its_size_and_the_line_that_read_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = super::super::cache::Cache::open(directory.path()).unwrap();
+        let hash = cache.put(&[7; 2048]).unwrap();
+        let line = line!() + 1;
+        let failure = recorded("synthetic-oversized-stage", cache.read(&hash, 1024));
+        assert_eq!(failure.unwrap_err().code, "cached-object-too-large");
+        let entry = logged("synthetic-oversized-stage");
+        assert_eq!(entry.level, "error");
+        assert!(entry.message.contains(
+            "code=cached-object-too-large status=413 cause=object is 2048 bytes, limit 1024 at="
+        ));
+        assert!(entry.message.ends_with(&format!("commands.rs:{line}")));
+    }
+
+    #[test]
     fn routine_refusals_and_transient_codes_are_warnings_without_their_cause() {
         for (index, code) in EXPECTED_REFUSALS
             .iter()
