@@ -503,7 +503,7 @@
         const choice = await alertCheckboxConfirm({
             title: strings.removeTitle,
             description: remoteOnly ? `${name}\n\n${held === undefined ? strings.removeRemoteOnlyUnknown : strings.removeRemoteOnly}` : name,
-            checkboxLabel: remoteOnly ? strings.downloadThenRemove : strings.remove,
+            checkboxLabel: remoteOnly ? strings.downloadThenRemove : strings.removeAcknowledge,
             actionLabel: strings.remove,
             cancelLabel: strings.cancel,
             requireChecked: !remoteOnly,

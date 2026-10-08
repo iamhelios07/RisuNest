@@ -841,7 +841,7 @@ https://synthetic.invalid · RisuNest`
         vi.mocked(alertCheckboxConfirm).mockResolvedValue({ confirmed: true, checked: true })
         removeButton().click(); await settle()
         expect(alertCheckboxConfirm).toHaveBeenCalledExactlyOnceWith({
-            title: strings.removeTitle, description: name, checkboxLabel: strings.remove,
+            title: strings.removeTitle, description: name, checkboxLabel: strings.removeAcknowledge,
             actionLabel: strings.remove, cancelLabel: strings.cancel, requireChecked: true,
         })
         expect(alertConfirm).not.toHaveBeenCalled()
