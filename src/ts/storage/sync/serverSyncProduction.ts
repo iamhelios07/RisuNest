@@ -52,7 +52,7 @@ export function initializeNativeSyncBindings(): () => void {
 }
 export function disposeNativeSyncBindings(): void { disposeServer?.(); disposeServer = undefined; nativeBindings?.dispose(); nativeBindings = undefined }
 
-type Status = { configured: boolean; libraryId?: string | null; deviceId?: string | null; writerId: string; bindingAuthority: string }
+type Status = { configured: boolean; libraryId?: string | null; deviceId?: string | null; writerId: string; bindingAuthority: string; assetPolicy?: AssetResidencyPolicy }
 let status: Status = { configured: false, writerId: '', bindingAuthority: '0' }
 type PendingBinding = { endpoint: string; libraryId: string; epoch: string; serverEmpty: boolean }
 let bindingIncomplete = false

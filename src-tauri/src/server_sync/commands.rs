@@ -309,7 +309,11 @@ fn manage_cache(app: &AppHandle, clean: bool) -> Result<super::management::Cache
 
 #[derive(serde::Serialize)]
 #[serde(rename_all="camelCase")]
-pub(crate) struct LwwStatus { configured:bool, library_id:Option<String>, device_id:Option<String>, writer_id:String, binding_authority:risunest_sync_wire::stamp::DecimalU64 }
+pub(crate) struct LwwStatus { configured:bool, library_id:Option<String>, device_id:Option<String>, writer_id:String, binding_authority:risunest_sync_wire::stamp::DecimalU64, asset_policy:super::residency::AssetPolicy }
+fn lww_status(store:&PersistentStore)->Result<LwwStatus> {
+    let config=store.server_stored_config()?;let clock=store.lww_clock_state()?;
+    Ok(LwwStatus{configured:config.is_some(),library_id:config.as_ref().map(|c|c.library_id.clone()),device_id:config.map(|c|c.device_id),writer_id:clock.writer_id,binding_authority:clock.binding_authority,asset_policy:store.device_store()?.asset_residency_policy()?})
+}
 fn lww_client(store:&PersistentStore)->Result<super::lww_client::LwwClient> {lww_client_cancelled(store,None)}
 fn lww_client_cancelled(store:&PersistentStore,cancelled:Option<Arc<AtomicBool>>)->Result<super::lww_client::LwwClient> {
     let stored=store.server_stored_config()?.ok_or_else(||SyncError::new("server-unconfigured",409))?;
@@ -317,7 +321,7 @@ fn lww_client_cancelled(store:&PersistentStore,cancelled:Option<Arc<AtomicBool>>
 }
 #[tauri::command]
 pub(crate) async fn server_sync_status(app:AppHandle)->Result<LwwStatus> {
-    logged_blocking("status",move|| {let store=job_store(&app)?;let config=store.server_stored_config()?;let clock=store.lww_clock_state()?;Ok(LwwStatus{configured:config.is_some(),library_id:config.as_ref().map(|c|c.library_id.clone()),device_id:config.map(|c|c.device_id),writer_id:clock.writer_id,binding_authority:clock.binding_authority})}).await
+    logged_blocking("status",move||lww_status(&job_store(&app)?)).await
 }
 #[tauri::command]
 pub(crate) async fn server_sync_configure(app:AppHandle,config:super::client::ServerConfig)->Result<()> {
@@ -588,6 +592,17 @@ mod tests {
     fn assert_released(app: &tauri::App<MockRuntime>) {
         assert!(!app.state::<ServerSyncCommandState>().running.load(Ordering::Acquire));
         drop(app.state::<crate::native_file_jobs::NativeFileJobState>().admission.server().unwrap());
+    }
+    #[test]
+    fn the_sync_status_reports_the_stored_asset_policy() {
+        let (_root, store) = super::super::lww_tests::local();
+        let read = |store: &PersistentStore| serde_json::to_value(super::lww_status(store).unwrap()).unwrap();
+        let status = read(&store);
+        assert_eq!((status["configured"].as_bool(), status["assetPolicy"].as_str()), (Some(false), Some("full")));
+        store.device_store().unwrap().set_asset_residency_policy(AssetPolicy::Remote).unwrap();
+        assert_eq!(read(&store)["assetPolicy"], "remote");
+        store.device_store().unwrap().set_asset_residency_policy(AssetPolicy::Full).unwrap();
+        assert_eq!(read(&store)["assetPolicy"], "full");
     }
     #[test]
     fn a_refused_asset_policy_change_keeps_the_previous_policy_and_releases_admission() {
