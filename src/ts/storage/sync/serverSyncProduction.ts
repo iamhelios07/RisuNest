@@ -250,7 +250,8 @@ const scheduler = createServerSyncScheduler({
             if (captured !== context) throw new Error('Sync binding changed')
             const request = await during('downloading', () => invoke<LwwStageReceive>('server_sync_lww_pull', { request: header() }))
             captured.signal.throwIfAborted()
-            try { await during('applying', () => applyPersistentLwwReceive(request)) }
+            // A page is applied under the stage that received it, so reading many pages shows one stage.
+            try { await during('downloading', () => applyPersistentLwwReceive(request)) }
             catch (value) { throw localApplyFailure(value) }
             checkContext(captured)
             if (receivedBodyReferences(request.changes)) { receivedBodies = true; hydrationPending = true }
@@ -326,7 +327,12 @@ async function bindServer(options: SyncBindingOptions = {}): Promise<BindingOutc
         await controller.ensureStatus().catch(() => {})
         throw value
     }
-    finally { binding = false; settleAttempt() }
+    finally {
+        binding = false
+        // What continues after connecting, such as reading back this device's publication, shows as automatic sync.
+        if (attempt && !operations && attempt.mode === 'full') { attempt.mode = 'routine'; changed() }
+        settleAttempt()
+    }
 }
 /** With `remote`, the device keeps assets on the server from the start; `full` keeps its stored policy. */
 export async function connectServerSync(config: ServerConfig, newDevice = false, policy?: AssetResidencyPolicy): Promise<BindingOutcome> {

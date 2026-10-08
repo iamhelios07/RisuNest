@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { SyncBindingTransport, SyncBindingDependencies } from './bindingFlow'
+import { languageKorean } from 'src/lang/ko'
+import { serverSyncRoutineView } from './serverSyncProgress'
 
 const f = vi.hoisted(() => ({
     native: true,
@@ -607,7 +609,7 @@ describe('server sync progress', () => {
         const finish = hangingPush([])
         visible(true); await f.transport!.resumeBinding(bindingContext()); await settle()
         const controller = production.getServerSyncController()
-        expect(controller.snapshot().progress?.stages).toEqual(expect.arrayContaining(['downloading', 'applying', 'publishing']))
+        expect(controller.snapshot().progress?.stages).toEqual(['downloading', 'publishing', 'assets'])
         expect(controller.snapshot().progress?.active).toEqual(['publishing'])
         expect(progressReads()).toBe(0)
         finish(); await settle()
@@ -692,6 +694,60 @@ describe('server sync progress', () => {
         expect(controller.snapshot().progress).toBeUndefined()
         expect(controller.snapshot().finished).toBeUndefined()
         stop()
+    })
+    it('shows the pages read after connecting as automatic sync under one stage', async () => {
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true })
+        const pages: Array<() => void> = []
+        let served = 0, reads = 0
+        const page = (index: number) => ({ bindingAuthority: '0', requestId: `page-${index}`, changes: index < 3 ? [{ key: JSON.stringify(['root', `key-${index}`]), value: { kind: 'inline' } }] : [], progress: { kind: 'server', cursor: String(index) }, admittedTimeUpperMs: '0' })
+        f.invoke.mockImplementation(async command => {
+            if (command === 'server_sync_lww_pull') { const index = served++; return index < 3 ? new Promise(resolve => pages.push(() => resolve(page(index)))) : page(index) }
+            // Each read reports more of a receive whose backlog is known.
+            if (command === 'server_sync_progress') return sendLanes({}).map(lane => lane.lane === 'receive' ? { ...lane, active: true, step: 'downloading', backlogDone: 10 * reads++, backlogLeft: 30 } : lane)
+            if (command === 'server_sync_status') return { configured: true, writerId: 'writer', bindingAuthority: '0' }
+            if (command === 'pds_lww_binding_state') return bindingContext().state
+            return command === 'server_sync_lww_pending_count' ? 0 : null
+        })
+        const controller = production.getServerSyncController()
+        const stop = controller.watchProgress()
+        const { bindSyncTarget } = await import('./bindingRegistry')
+        let bindingMode: string | undefined
+        vi.mocked(bindSyncTarget).mockImplementation(async () => {
+            const context = bindingContext()
+            await f.transport!.inspectTarget(context)
+            await f.transport!.resumeBinding(context)
+            await settle()
+            bindingMode = controller.snapshot().progress?.mode
+            return { kind: 'bound' } as never
+        })
+        await production.connectServerSync({ endpoint: 'https://synthetic.invalid', libraryId: 'library', deviceId: 'registration', token: 'synthetic' })
+        expect(bindingMode).toBe('full')
+        expect(served).toBe(1)
+        const seen: unknown[] = []
+        let applying!: () => void
+        f.apply.mockImplementationOnce(() => new Promise(resolve => { applying = () => resolve({ revision: 31, affectedKeys: [], heldKeys: [], deferredKeys: [] }) }))
+        for (let index = 0; index < 3; index++) {
+            await vi.advanceTimersByTimeAsync(500); await settle()
+            const progress = controller.snapshot().progress!
+            seen.push({ mode: progress.mode, stages: progress.stages, label: serverSyncRoutineView(progress, languageKorean.risuNest.serverSync, false)?.label })
+            pages.shift()!(); await settle()
+            if (index === 0) { expect(controller.snapshot().progress?.active).toEqual(['downloading']); applying(); await settle() }
+        }
+        expect(seen).toEqual(Array(3).fill({ mode: 'routine', stages: ['preparing', 'downloading', 'publishing', 'assets'], label: languageKorean.risuNest.serverSync.running }))
+        expect(served).toBeGreaterThanOrEqual(4)
+        stop()
+    })
+    it.each(['replaceFromTarget', 'replaceAsNewDevice'] as const)('shows a running %s as applying what was received', async method => {
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        const native = await import('./bindingNative')
+        let finish!: () => void
+        const replace = vi.mocked<(...args: unknown[]) => Promise<unknown>>(method === 'replaceFromTarget' ? native.replaceNativeSyncBinding : native.replaceNativeSyncBindingAsNewDevice)
+        replace.mockImplementationOnce(() => new Promise(resolve => { finish = () => resolve(undefined) }))
+        const replaced = (f.transport![method] as (...args: unknown[]) => Promise<unknown>)({}, {}, bindingContext())
+        await settle()
+        expect(production.getServerSyncController().snapshot().progress).toMatchObject({ stages: ['applying'], active: ['applying'] })
+        finish(); await replaced
     })
     it('keeps the last successful time when an attempt fails', async () => {
         production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
