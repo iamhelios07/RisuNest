@@ -64,6 +64,62 @@ fn server_hydration_registers_every_body_it_fetches_or_finds_local() {
     store.asset_gc_dry_run(1024, None, crate::external_storage::runtime::now_ms() as i64, 0).unwrap();
 }
 
+/// Local, server-held and missing bodies are told apart by one batched presence check, and a
+/// link in place of a shard folder fails the status and the download instead of being counted.
+#[test]
+fn the_status_and_download_check_presence_in_one_pass_and_refuse_a_linked_shard() {
+    use crate::asset_repository::body_io::{reset_body_io, take_body_io};
+    fn link_directory(target: &std::path::Path, link: &std::path::Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            assert!(std::process::Command::new("cmd").creation_flags(0x08000000).args(["/C", "mklink", "/J"])
+                .arg(link).arg(target).output().unwrap().status.success());
+        }
+    }
+    let server = LocalServerFixture::new();
+    let (_root, mut store) = local();
+    let core = server.client(&store);
+    let held = vec![81; 64 * 1024];
+    let held_hash = put_asset(&mut store, "assets/status-held.png", &held).object_hash.unwrap();
+    super::lww_tests::drain_publications(&core, &mut store, &[]).unwrap();
+    store.asset_residency_set_policy(super::residency::AssetPolicy::Remote, || Ok(())).unwrap();
+    store.asset_residency_evict(|| Ok(())).unwrap();
+    let kept = b"synthetic body kept on this device".to_vec();
+    let kept_hash = put_asset(&mut store, "assets/status-kept.png", &kept).object_hash.unwrap();
+    let lost = b"synthetic body no storage holds".to_vec();
+    let lost_hash = put_asset(&mut store, "assets/status-lost.png", &lost).object_hash.unwrap();
+    let cas = PayloadCas::new(store.repository_root()).unwrap();
+    cas.unlink_exact_object(&lost_hash, lost.len() as u64, &crate::asset_repository::object_physical_key(&lost_hash)).unwrap();
+    let counts = |status: &serde_json::Value| ["localBytes", "serverObjects", "serverBytes", "unavailableObjects"].map(|field| status[field].as_u64().unwrap());
+
+    reset_body_io();
+    let status = serde_json::to_value(store.asset_residency_status().unwrap()).unwrap();
+    let work = take_body_io();
+    assert_eq!((work.stat_requests, work.batch_stat_requests), (0, 1));
+    assert_eq!(counts(&status), [kept.len() as u64, 1, held.len() as u64, 1]);
+
+    let shard = store.repository_root().join("assets").join("objects").join(&kept_hash[..2]);
+    let outside = tempfile::tempdir().unwrap();
+    let moved = outside.path().join("shard");
+    std::fs::rename(&shard, &moved).unwrap();
+    link_directory(&moved, &shard);
+    assert!(store.asset_residency_status().is_err());
+    assert!(store.asset_residency_download_remote(None, None, None, || Ok(())).is_err());
+    assert!(cas.stat_object(&held_hash).unwrap().is_none(), "a refused download fetches nothing");
+    #[cfg(unix)]
+    std::fs::remove_file(&shard).unwrap();
+    #[cfg(windows)]
+    std::fs::remove_dir(&shard).unwrap();
+    std::fs::rename(&moved, &shard).unwrap();
+
+    let downloaded = serde_json::to_value(store.asset_residency_download_remote(None, None, None, || Ok(())).unwrap()).unwrap();
+    assert_eq!(cas.stat_object(&held_hash).unwrap(), Some(held.len() as u64));
+    assert_eq!(counts(&downloaded), [(kept.len() + held.len()) as u64, 0, 0, 1]);
+}
+
 /// Offloading keeps every catalog row, so only the device body figure drops,
 /// by what the residency status then counts as held by the server alone.
 #[test]

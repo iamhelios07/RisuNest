@@ -122,6 +122,55 @@ impl ResidencyStatus {
         self.remote_objects > 0
     }
 }
+/// The bytes of the referenced bodies this device holds, and the hashes of those it does not.
+/// The inventory is sorted, so each page reaches only a few shard folders.
+fn split_local(cas: &PayloadCas, referenced: BTreeSet<String>, check: &impl Fn() -> Result<()>) -> Result<(u64, Vec<String>)> {
+    let referenced = referenced.into_iter().collect::<Vec<_>>();
+    let mut local_bytes = 0;
+    let mut missing = Vec::new();
+    for page in referenced.chunks(HOLDER_PAGE) {
+        check()?;
+        for (hash, size) in page.iter().zip(cas.stat_objects(page.iter().map(String::as_str))?) {
+            match size {
+                Some(size) => local_bytes += size,
+                None => missing.push(hash.clone()),
+            }
+        }
+    }
+    Ok((local_bytes, missing))
+}
+/// Of `page`, bodies this device does not hold, those another storage holds and `target` does not.
+fn previous_storage_wanted(
+    target: &PreviousStorageTarget,
+    residency: &Residency,
+    remote: &mut RemoteBodies,
+    connections: &mut Connections,
+    page: &[String],
+    holders: &[Holder],
+) -> Result<Vec<String>> {
+    let mut external = if matches!(target, PreviousStorageTarget::External { .. }) {
+        remote.holders(&page.iter().map(String::as_str).collect::<Vec<_>>())
+            .map_err(|_| std::io::Error::other("external-source-invalid"))?
+    } else { Default::default() };
+    let mut wanted = Vec::new();
+    for (hash, holder) in page.iter().zip(holders) {
+        if matches!(holder, Holder::Unavailable) { continue; }
+        let held = match target {
+            PreviousStorageTarget::Server { library_id, target_id } => residency.target_holds(hash, library_id, target_id)?,
+            PreviousStorageTarget::External { connection_id: id } => {
+                let mut held = false;
+                if let Some(registration) = external.remove(hash) {
+                    for (root, candidate) in registration.connections {
+                        if candidate == *id && connections.contains(&root, &candidate)? { held = true; break; }
+                    }
+                }
+                held
+            }
+        };
+        if !held { wanted.push(hash.clone()); }
+    }
+    Ok(wanted)
+}
 
 impl PersistentStore {
     pub(crate) fn asset_object_byte_size(&self, hash: &str) -> super::StoreResult<Option<u64>> {
@@ -397,34 +446,36 @@ impl PersistentStore {
         Ok(holders)
     }
     pub(crate) fn asset_residency_status(&self) -> Result<ResidencyStatus> {
+        self.asset_residency_status_for_target(None)
+    }
+    /// The status, with what moving to `target` would download when one is given, read from
+    /// one inventory.
+    pub(crate) fn asset_residency_status_for_target(&self, target: Option<&PreviousStorageTarget>) -> Result<ResidencyStatus> {
         let residency = Residency::open(&self.repository_root)?;
         let inventory = self.residency_inventory(false)?;
         let cas = PayloadCas::new(&self.repository_root)?;
         let mut connections = Connections::default();
+        let (local_bytes, missing) = split_local(&cas, inventory.referenced, &|| Ok(()))?;
         let mut status = ResidencyStatus {
             policy: self.device_store()?.asset_residency_policy()?,
-            local_bytes: 0,
+            local_bytes,
             remote_bytes: 0,
             remote_objects: 0,
             server_bytes: 0,
             server_objects: 0,
             external_objects: Vec::new(),
             unavailable_objects: 0,
-            previous_storage_objects: None,
+            previous_storage_objects: target.map(|_| 0),
             evicted_bytes: 0,
         };
         let mut external = std::collections::BTreeMap::<String, u64>::new();
-        let mut missing = Vec::new();
-        for hash in inventory.referenced {
-            if let Some(size) = cas.stat_object(&hash)? {
-                status.local_bytes += size;
-                continue;
-            }
-            missing.push(hash);
-        }
         let mut remote = RemoteBodies::deferred(&self.repository_root);
         for page in missing.chunks(HOLDER_PAGE) {
-            for holder in Self::residency_holders(Some(&residency), &mut remote, &mut connections, page)? {
+            let holders = Self::residency_holders(Some(&residency), &mut remote, &mut connections, page)?;
+            if let (Some(target), Some(objects)) = (target, status.previous_storage_objects.as_mut()) {
+                *objects += previous_storage_wanted(target, &residency, &mut remote, &mut connections, page, &holders)?.len() as u64;
+            }
+            for holder in holders {
                 match holder {
                     Holder::Server(size) => {
                         status.server_bytes += size;
@@ -451,48 +502,18 @@ impl PersistentStore {
             .collect();
         Ok(status)
     }
-    pub(crate) fn asset_residency_status_for_target(&self, target: Option<&PreviousStorageTarget>) -> Result<ResidencyStatus> {
-        let mut status = self.asset_residency_status()?;
-        if let Some(target) = target {
-            status.previous_storage_objects = Some(self.previous_storage_assets(target, &|| Ok(()))?.len() as u64);
-        }
-        Ok(status)
-    }
     fn previous_storage_assets(&self, target: &PreviousStorageTarget, check: &impl Fn() -> Result<()>) -> Result<BTreeSet<String>> {
         let inventory = self.residency_inventory(false)?;
         let cas = PayloadCas::new(&self.repository_root)?;
         let residency = Residency::open(&self.repository_root)?;
-        let mut missing = Vec::new();
-        for hash in inventory.referenced {
-            check()?;
-            if cas.stat_object(&hash)?.is_none() { missing.push(hash); }
-        }
+        let (_, missing) = split_local(&cas, inventory.referenced, check)?;
         let mut remote = RemoteBodies::deferred(&self.repository_root);
         let mut connections = Connections::default();
         let mut wanted = BTreeSet::new();
         for page in missing.chunks(HOLDER_PAGE) {
             check()?;
             let available = Self::residency_holders(Some(&residency), &mut remote, &mut connections, page)?;
-            let mut external = if matches!(target, PreviousStorageTarget::External { .. }) {
-                remote.holders(&page.iter().map(String::as_str).collect::<Vec<_>>())
-                    .map_err(|_| std::io::Error::other("external-source-invalid"))?
-            } else { Default::default() };
-            for (hash, holder) in page.iter().zip(available) {
-                if matches!(holder, Holder::Unavailable) { continue; }
-                let held = match target {
-                    PreviousStorageTarget::Server { library_id, target_id } => residency.target_holds(hash, library_id, target_id)?,
-                    PreviousStorageTarget::External { connection_id: id } => {
-                        let mut held = false;
-                        if let Some(registration) = external.remove(hash) {
-                            for (root, candidate) in registration.connections {
-                                if candidate == *id && connections.contains(&root, &candidate)? { held = true; break; }
-                            }
-                        }
-                        held
-                    }
-                };
-                if !held { wanted.insert(hash.clone()); }
-            }
+            wanted.extend(previous_storage_wanted(target, &residency, &mut remote, &mut connections, page, &available)?);
         }
         Ok(wanted)
     }
@@ -521,13 +542,7 @@ impl PersistentStore {
         let residency = Residency::open(&self.repository_root)?;
         let mut connections = Connections::default();
         let mut targets = BTreeSet::new();
-        let mut missing = Vec::new();
-        for hash in inventory.referenced {
-            check()?;
-            if cas.stat_object(&hash)?.is_none() {
-                missing.push(hash);
-            }
-        }
+        let (_, missing) = split_local(&cas, inventory.referenced, &check)?;
         let mut remote = RemoteBodies::deferred(&self.repository_root);
         for page in missing.chunks(HOLDER_PAGE) {
             check()?;
@@ -648,8 +663,8 @@ impl PersistentStore {
         for page in candidates.chunks(128) {
             check()?;
             let mut objects = std::collections::BTreeMap::new();
-            for hash in page {
-                if let Some(size) = cas.stat_object(hash)? {
+            for (hash, size) in page.iter().zip(cas.stat_objects(page.iter().map(String::as_str))?) {
+                if let Some(size) = size {
                     objects.insert(hash.clone(), size);
                 }
             }
