@@ -1494,6 +1494,58 @@ describe('received persona replacement', () => {
     })
 })
 
+describe('received preset selection', () => {
+    async function presetRuntime(catalog: boolean) {
+        const initial = normalizeDatabaseDefaults({} as Database)
+        const preset = initial.botPresets[0]
+        initial.botPresets = [{...structuredClone(preset), id: 'preset-a', name: 'A'}, {...structuredClone(preset), id: 'preset-b', name: 'B'}]
+        initial.botPresetsId = 1
+        initial.personas[0].id = 'persona'
+        const store = new IndexedDbPersistentDataStore(`received-preset-selection-${catalog}-${crypto.randomUUID()}`, new IDBFactory(), IDBKeyRange) as PersistentDataStore
+        await store.open()
+        const {revision} = await store.replaceFromDatabase(initial)
+        setDatabaseLite(catalog ? projectCompleteScalableWorkingSet(initial, null, revision) : structuredClone(initial))
+        selectedCharID.set(-1)
+        const saveFailures: unknown[] = []
+        const runtime = createPersistentDataRuntime({store, state: createProductionStateAdapter(), prepareDatabase: async (value) => value,
+            onLocalSaveFailure: (error) => { if (error !== null) saveFailures.push(error) }})
+        await runtime.initializeActiveWorkingSet(getDatabase())
+        getDatabase().classicMaxWidth = true
+        await runtime.flushPendingDataLocally('received-preset-selection-settle')
+        return {store, runtime, saveFailures}
+    }
+    async function savedMutations(store: PersistentDataStore, runtime: ReturnType<typeof createPersistentDataRuntime>) {
+        const commit = vi.spyOn(store, 'commit')
+        getDatabase().classicMaxWidth = !getDatabase().classicMaxWidth
+        await runtime.flushPendingDataLocally('after-received-preset-selection')
+        const mutations = commit.mock.calls.flatMap(([input]) => [...input.rootMutations ?? [], ...input.unitMutations ?? []])
+        commit.mockRestore()
+        return mutations
+    }
+
+    it.each([false, true])('does not write back a fallback for a received selection naming a preset this device does not hold (catalog=%s)', async (catalog) => {
+        const {store, runtime, saveFailures} = await presetRuntime(catalog)
+        const selection = {key: JSON.stringify(['root', 'botPresetsId']), type: 'set' as const, value: 'preset-elsewhere'}
+        await receiveCommit(store, runtime, {unitMutations: [selection]}, [selection.key])
+        expect(getDatabase().botPresets[getDatabase().botPresetsId]).toBeDefined()
+        const mutations = await savedMutations(store, runtime)
+        expect(mutations.map((value) => value.key)).toEqual(['classicMaxWidth'])
+        expect((await store.readRoot()).value.botPresetsId).toBe('preset-elsewhere')
+        expect(saveFailures).toEqual([])
+    })
+
+    it.each([false, true])('stores a local selection made after an unresolved received selection (catalog=%s)', async (catalog) => {
+        const {store, runtime, saveFailures} = await presetRuntime(catalog)
+        const selection = {key: JSON.stringify(['root', 'botPresetsId']), type: 'set' as const, value: 'preset-elsewhere'}
+        await receiveCommit(store, runtime, {unitMutations: [selection]}, [selection.key])
+        getDatabase().botPresetsId = getDatabase().botPresets.findIndex((value) => value.id === 'preset-b')
+        runtime.markPersistentDataDirty(1)
+        await runtime.flushPendingDataLocally('after-local-preset-selection')
+        expect((await store.readRoot()).value.botPresetsId).toBe('preset-b')
+        expect(saveFailures).toEqual([])
+    })
+})
+
 describe('received fields the working set did not have', () => {
     async function fieldRuntime() {
         const initial = normalizeDatabaseDefaults({} as Database)
