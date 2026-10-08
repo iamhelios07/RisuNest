@@ -525,6 +525,7 @@ export interface PersistentDataRuntime {
         reason: string,
         options?: { publishOfficial?: boolean },
     ): Promise<PersistentMutationToken>
+    /** A revision committed while this fence is held is reported as a local revision on release. */
     acquireDestructiveReplacementFence(
         expected: PersistentMutationToken,
     ): Promise<PersistentDestructiveReplacementFence>
@@ -1649,6 +1650,15 @@ export function createPersistentDataRuntime(
                     if (released) return
                     coordinator.releaseDestructiveReplacementFence(owner)
                     released = true
+                    // Nothing else can commit while the fence is held, so a later
+                    // revision is the holder's own change and sync must send it.
+                    const committed = coordinator.revision
+                    if (committed <= heldRevision) return
+                    try {
+                        dependencies.onLocalRevision?.(committed)
+                    } catch (error) {
+                        dependencies.onBackgroundError?.(error)
+                    }
                 },
             }
         },
