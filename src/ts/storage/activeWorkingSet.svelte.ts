@@ -1771,7 +1771,8 @@ export class ActiveWorkingSet {
             this.dependencies.canActivateWorkingSet?.() === false
         )
             return false
-        return revision === this.dependencies.coordinator.revision &&
+        return this.dependencies.coordinator.hasPendingPersistenceWork !== true &&
+            revision === this.dependencies.coordinator.revision &&
             mutationGeneration ===
                 this.dependencies.coordinator.mutationGeneration
             ? true
@@ -2000,6 +2001,7 @@ export class ActiveWorkingSet {
         activation?: WindowedConversationActivationChange
     }): boolean {
         if (
+            this.dependencies.coordinator.hasPendingPersistenceWork === true ||
             !this.isCurrentWindowedActivation(
                 input.generation,
                 {},
@@ -2196,46 +2198,59 @@ export class ActiveWorkingSet {
         initialTarget: SelectedConversationTarget,
         reason: string,
     ): Promise<CompleteSelectedConversationState> {
-        const flushReason = `complete-selected-conversation:${reason}`
-        await this.dependencies.coordinator.flushPendingData(flushReason)
-        let owner = this.followPromotedConversation(initialState, initialTarget)
-        if ('complete' in owner) return owner.complete
-        let { state, target } = owner
-        let persisted: Awaited<ReturnType<PersistentDataStore['readConversation']>>
-        for (let attempt = 0; ; attempt++) {
+        const sessionToken = initialState.authority.sessionToken
+        const captureOwner = (): SelectedConversationState => {
+            const current = this.selectedConversationState
+            if (
+                !current ||
+                current.characterId !== initialState.characterId ||
+                current.conversationId !== initialState.conversationId ||
+                current.navigationGeneration !== initialTarget.navigationGeneration ||
+                this.navigationGeneration !== initialTarget.navigationGeneration ||
+                this.dependencies.getSelectedCharacterId() !== initialState.characterId ||
+                (current.kind === 'windowed' && current.authority.sessionToken !== sessionToken)
+            ) throw new SelectedConversationPromotionStaleError()
+            return current
+        }
+        let state = initialState
+        let conversation: Chat
+        while (true) {
+            captureOwner()
+            await this.dependencies.coordinator.flushPendingData(
+                `complete-selected-conversation:${reason}`,
+            )
+            let current = captureOwner()
+            // A save completes the conversation itself when its edits have to be written whole.
+            if (current.kind === 'complete') return current
+            state = current
+            const target = this.captureSelectedConversationTarget()!
             this.requireCurrentWindowedState(state, target)
-            const readRevision = state.authority.storeRevision
-            persisted = await this.dependencies.store.readConversation(
+            const authority = state.authority
+            const persisted = await this.dependencies.store.readConversation(
                 state.characterId,
                 state.conversationId,
             )
-            // A sync receive or a scheduled save can queue coordinator work while
-            // the conversation reads, and the transition refuses pending work.
-            // Waits for that work, then reads again if it moved the revision.
-            for (
-                let settle = 0;
-                settle < WINDOWED_PUBLISH_SETTLE_ATTEMPTS &&
-                this.dependencies.coordinator.hasPendingPersistenceWork === true;
-                settle++
-            ) {
-                await this.dependencies.coordinator.flushPendingData(flushReason)
+            current = captureOwner()
+            if (current.kind === 'complete') return current
+            // Reads yield to writers. Settle again before publication and discard
+            // a candidate whenever persistence advanced its selected authority.
+            while (this.dependencies.coordinator.hasPendingPersistenceWork === true) {
+                await this.dependencies.coordinator.flushPendingData(
+                    `complete-selected-conversation:${reason}`,
+                )
+                current = captureOwner()
+                if (current.kind === 'complete') return current
             }
-            owner = this.followPromotedConversation(state, target)
-            if ('complete' in owner) return owner.complete
-            ;({ state, target } = owner)
+            if (current !== state || current.authority !== authority) continue
+            this.requireCurrentWindowedState(state, target)
             if (
-                state.authority.storeRevision === readRevision ||
-                attempt >= WINDOWED_CHARACTER_ACTIVATION_RETRIES
-            )
-                break
+                !persisted ||
+                persisted.revision !== authority.storeRevision ||
+                persisted.value.id !== state.conversationId
+            ) throw new SelectedConversationPromotionStaleError()
+            conversation = persisted.value
+            break
         }
-        this.requireCurrentWindowedState(state, target)
-        if (
-            this.dependencies.coordinator.revision !== state.authority.storeRevision ||
-            !persisted ||
-            persisted.revision !== state.authority.storeRevision ||
-            persisted.value.id !== state.conversationId
-        ) throw new SelectedConversationPromotionStaleError()
 
         const resident = this.dependencies.getResidentCharacter?.(state.characterId)
         if (!resident) throw new SelectedConversationPromotionStaleError()
@@ -2243,7 +2258,6 @@ export class ActiveWorkingSet {
             (conversation) => conversation === state.conversation,
         )
         if (conversationIndex < 0) throw new SelectedConversationPromotionStaleError()
-        const conversation = persisted.value
         const nextCharacter = {
             ...resident,
             chats: resident.chats.map((candidate, index) =>
