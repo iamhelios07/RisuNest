@@ -669,7 +669,7 @@ describe('progress', () => {
     const lane = (name: string, counts: Record<string, unknown> = {}) => ({ lane: name, active: false, step: 'idle', listed: 0, itemsDone: 0, itemsTotal: 0, filesDone: 0, filesTotal: 0, bytesDone: 0, bytesTotal: 0, sentBytes: 0, receivedBytes: 0, backlogDone: 0, backlogLeft: 0, ...counts })
     const running = (startedAt: number) => ({
         status: { configured: true, bound: true }, paused: false, running: true, error: '',
-        progress: { mode: 'full', startedAt, stages: ['downloading', 'publishing'], active: ['publishing'], current: 'publishing', rate: 2048, lanes: [lane('send', { active: true, step: 'uploading', filesDone: 1, filesTotal: 2, bytesDone: 1024, bytesTotal: 4096, sentBytes: 3000 }), lane('receive', { receivedBytes: 500 })] },
+        progress: { mode: 'full', startedAt, stages: ['downloading', 'publishing'], active: ['publishing'], current: 'publishing', rate: 2048, plannedSend: 4, lanes: [lane('send', { active: true, step: 'uploading', itemsDone: 1, itemsTotal: 2, filesDone: 1, filesTotal: 2, bytesDone: 1024, bytesTotal: 4096, sentBytes: 3000 }), lane('receive', { receivedBytes: 500 })] },
     })
     const panel = () => host.querySelector('[data-sync-progress]')
     it('shows the running step, the stages and the transfer counts of a sync', async () => {
@@ -679,7 +679,7 @@ describe('progress', () => {
         expect(panel()?.querySelector('[role="status"]')?.textContent).toContain(sync.activity.uploading)
         expect(panel()?.querySelector('[role="progressbar"]')?.getAttribute('aria-valuenow')).toBe('25')
         expect([...panel()!.querySelectorAll('li')].map(item => [item.textContent?.trim(), item.getAttribute('aria-current')])).toEqual([[sync.stage.downloading, null], [sync.stage.publishing, 'step']])
-        expect([...panel()!.querySelectorAll('dt')].map(term => term.textContent)).toEqual([sync.verifiedBytes, sync.transferRate, sync.progressFiles, sync.elapsed])
+        expect([...panel()!.querySelectorAll('dt')].map(term => term.textContent)).toEqual([sync.verifiedBytes, sync.transferRate, sync.progressItems, sync.progressFiles, sync.elapsed])
         expect(panel()!.textContent).toContain('2.0 KiB/s')
         expect(host.querySelector('[data-tone]')?.textContent?.trim()).toBe(sync.running)
     })
@@ -764,7 +764,7 @@ describe('progress', () => {
             expect(lastSync()).toBe(true)
         })
         it('keeps Details as it was left for the next sync', async () => {
-            f.view = connected({ running: true, progress: routine([lane('send', { active: true, step: 'confirming', itemsDone: 1, itemsTotal: 2 })]) })
+            f.view = connected({ running: true, progress: routine([lane('send', { active: true, step: 'confirming', itemsDone: 1, itemsTotal: 2 })], { plannedSend: 2 }) })
             component = mount(ServerSyncSettings, { target: host, props: { connectTarget: vi.fn() } })
             await settle()
             panel()!.querySelector('summary')!.click(); await settle()

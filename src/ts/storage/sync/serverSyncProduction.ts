@@ -21,7 +21,7 @@ import type { ServerConfig } from './serverSync'
 import { get } from 'svelte/store'
 import { selectedCharID } from 'src/ts/stores.svelte'
 import { getDatabase } from '../database.svelte'
-import { createRateMeter, laneDeltas, readServerSyncLanes, routinePeak, routineWork, type ServerSyncAttempt, type ServerSyncLane, type ServerSyncStage } from './serverSyncProgress'
+import { createRateMeter, laneDeltas, readServerSyncLanes, routineMoved, routinePeak, type ServerSyncAttempt, type ServerSyncLane, type ServerSyncStage } from './serverSyncProgress'
 import { setAssetResidencyPolicy, type AssetResidencyPolicy } from './serverAssetResidency'
 
 const selectedCharacterId = () => getDatabase().characters[get(selectedCharID)]?.chaId ?? null
@@ -90,14 +90,17 @@ async function sample(): Promise<void> {
     if (!captured) return
     const first = !baseline
     const start = baseline ??= readLanes()
-    // The upload a routine bar fills toward is fixed once, when the attempt begins publishing.
-    const plan = captured.mode === 'routine' && captured.plannedSend === undefined && captured.stages.includes('publishing')
+    // The upload a bar fills toward is fixed once, when the attempt begins publishing.
+    const plan = captured.plannedSend === undefined && captured.stages.includes('publishing')
     const [before, lanes, pending] = await Promise.all([start, first ? start : readLanes(), plan ? controller.pendingChanges().catch(() => undefined) : undefined])
     if (captured !== attempt) return
     if (!before) { if (baseline === start) baseline = undefined; return }
     if (!lanes) return
     captured.lanes = laneDeltas(lanes, before)
     if (typeof pending === 'number') captured.plannedSend = pending + (captured.lanes.find(lane => lane.lane === 'send')?.itemsDone ?? 0)
+    // A receive is measured against the server changes it reported when first seen at work.
+    const receive = captured.lanes.find(lane => lane.lane === 'receive')
+    if (captured.plannedReceive === undefined && receive && receive.backlogDone > 0) captured.plannedReceive = receive.backlogDone + receive.backlogLeft
     captured.peak = routinePeak(captured)
     meter.add(Date.now(), captured.lanes.reduce((total, lane) => total + lane.sentBytes + lane.receivedBytes, 0))
     captured.rate = meter.rate()
@@ -109,8 +112,7 @@ async function finish(ended: ServerSyncAttempt, start: Promise<ServerSyncLane[] 
     const [before, lanes] = await Promise.all([start, readLanes()])
     if (!before || !lanes || attempt || !watchers) return
     ended.lanes = laneDeltas(lanes, before)
-    const work = routineWork(ended)
-    if (work.changes.total + work.assets.total === 0) return
+    if (!routineMoved(ended)) return
     clearFinished()
     ended.endedAt = Date.now()
     finished = ended

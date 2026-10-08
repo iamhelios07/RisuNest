@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { SyncBindingTransport, SyncBindingDependencies } from './bindingFlow'
 import { languageKorean } from 'src/lang/ko'
-import { serverSyncRoutineView } from './serverSyncProgress'
+import { serverSyncProgressView, serverSyncRoutineView } from './serverSyncProgress'
 
 const f = vi.hoisted(() => ({
     native: true,
@@ -667,6 +667,35 @@ describe('server sync progress', () => {
         expect(controller.snapshot().lastSuccessAt).toBe(Date.now())
         await vi.advanceTimersByTimeAsync(1500); await settle()
         expect(controller.snapshot().finished).toBeUndefined()
+        stop()
+    })
+    it('fixes the upload and the receive of a connection once, as automatic sync does', async () => {
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        const reads: Array<Record<string, Record<string, unknown>>> = [{}, { send: { active: true, step: 'preparing' }, receive: { backlogDone: 40, backlogLeft: 60 } }, { send: { active: true, step: 'confirming', itemsDone: 256, itemsTotal: 256 }, receive: { backlogDone: 90, backlogLeft: 20 } }, { send: { active: true, step: 'confirming', itemsDone: 512, itemsTotal: 512 }, receive: { backlogDone: 150, backlogLeft: 10 } }]
+        let finish!: () => void
+        f.invoke.mockImplementation(async command => {
+            if (command === 'server_sync_lww_push') return new Promise(resolve => { finish = () => resolve(null) })
+            if (command === 'server_sync_progress') { const read = reads.length > 1 ? reads.shift()! : reads[0]; return sendLanes({}).map(lane => ({ ...lane, ...read[lane.lane] })) }
+            if (command === 'server_sync_status') return { configured: true, writerId: 'writer', bindingAuthority: '0' }
+            if (command === 'pds_lww_binding_state') return bindingContext().state
+            return command === 'server_sync_lww_pending_count' ? 600 : null
+        })
+        const controller = production.getServerSyncController()
+        const stop = controller.watchProgress()
+        const { bindSyncTarget } = await import('./bindingRegistry')
+        vi.mocked(bindSyncTarget).mockImplementation(async () => { await f.transport!.publishInitialSharedState(bindingContext()); return { kind: 'bound' } as never })
+        const connecting = production.connectServerSync({ endpoint: 'https://synthetic.invalid', libraryId: 'library', deviceId: 'registration', token: 'synthetic' })
+        await settle()
+        await vi.advanceTimersByTimeAsync(500); await settle()
+        expect(controller.snapshot().progress).toMatchObject({ mode: 'full', plannedSend: 600, plannedReceive: 100 })
+        await vi.advanceTimersByTimeAsync(1000); await settle()
+        const progress = controller.snapshot().progress!
+        expect(progress).toMatchObject({ mode: 'full', plannedSend: 600, plannedReceive: 100 })
+        const view = serverSyncProgressView(progress, languageKorean.risuNest.serverSync, Date.now())
+        expect(view.detail).toBe('512 / 600')
+        expect(view.counters.find(counter => counter.key === 'items')?.value).toBe('612 / 700')
+        expect(pendingReads()).toBe(1)
+        finish(); await connecting
         stop()
     })
     it.each([
