@@ -1729,6 +1729,31 @@ pub(super) mod tests {
         });
     }
 
+    /// The state read keeps answering while a restore commit holds the store.
+    #[test]
+    fn the_state_read_answers_while_a_restore_commit_holds_the_store() {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let backup=packaged_backup(&[vec![50;4096]]).await;
+            let destination=tempfile::tempdir().unwrap();
+            let app=restore_app(destination.path());
+            let (job,_claim,_receipt,_permit,_store)=commit_in_session(&app,&backup).await;
+            ConnectionStore::open(destination.path()).unwrap().remove(&backup.connected.stored.id).unwrap();
+            // An earlier stopped job is listed too.
+            let jobs=JobStore::open(destination.path()).unwrap();
+            let mut stopped=DurableJob::new(serde_json::from_value(json!({"connectionId":"synthetic-other","kind":"cleanup"})).unwrap(),1,job.admission_identity.clone());
+            stopped.summary["state"]=json!("failed");
+            jobs.put(&stopped).unwrap();
+            let open=runtime::external_storage_get_state(app.handle().clone()).unwrap();
+            let maintenance=app.state::<PersistentStoreState>().acquire_device_maintenance().unwrap();
+            let held=runtime::external_storage_get_state(app.handle().clone()).unwrap();
+            drop(maintenance);
+            assert_eq!(held["selection"],open["selection"]);
+            let listed=held["jobs"].as_array().unwrap().iter().find(|item|item["id"]==job.id.as_str()).unwrap();
+            assert_eq!((listed["state"].as_str(),listed["phase"].as_str()),(Some("running"),Some("awaiting-adoption")));
+            assert!(held["jobs"].as_array().unwrap().iter().any(|item|item["id"]==stopped.id.as_str()));
+        });
+    }
+
     #[test]
     fn a_restore_whose_worker_ended_after_its_commit_resumes_to_success_after_a_restart() {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {

@@ -170,15 +170,44 @@ pub(crate) fn external_storage_get_state<R: Runtime>(app: AppHandle<R>) -> Resul
         let jobs = JobStore::open(&root)?
             .list_for_state()?
             .into_iter()
-            .map(|job| reconcile_job(&app, job).map(|job| {
+            .map(|job| reconcile_job_for_read(&app, job).map(|job| {
                 job_summary(&root, job)
             }))
             .collect::<Result<Vec<_>>>()?;
         for connection in &mut connections { apply_job_connection_status(connection, &jobs); }
-        Ok(
-            json!({"supported":true,"selection":selection_dto(native_store(&app)?.external_selection().map_err(local_error)?),"connections":connections,"jobs":jobs}),
-        )
+        let state = app.state::<JobCommandState>();
+        let selection = match native_store(&app).and_then(|store| store.external_selection().map_err(local_error)) {
+            Ok(selection) => shown_selection(&state, selection)?,
+            Err(error) => match state.shown_selection.lock().map_err(local_error)?.clone() {
+                Some(selection) if store_held(&app, &error) => selection,
+                _ => return Err(error),
+            },
+        };
+        Ok(json!({"supported":true,"selection":selection,"connections":connections,"jobs":jobs}))
     })())
+}
+
+fn shown_selection(state: &JobCommandState, selection: Selection) -> Result<Value> {
+    let selection = selection_dto(selection);
+    *state.shown_selection.lock().map_err(local_error)? = Some(selection.clone());
+    Ok(selection)
+}
+
+/// Device maintenance refuses the store while it holds it, as a restore commit
+/// does.
+fn store_held<R: Runtime>(app: &AppHandle<R>, error: &ProviderError) -> bool {
+    matches!(error.kind, ErrorKind::Transient | ErrorKind::LocalFailure)
+        && app.state::<persistent_store::commands::PersistentStoreState>().maintenance_active()
+}
+
+/// A job as stored while device maintenance holds the store. The first read
+/// after it reconciles the job.
+fn reconcile_job_for_read<R: Runtime>(app: &AppHandle<R>, job: DurableJob) -> Result<DurableJob> {
+    let stored = job.clone();
+    match reconcile_job(app, job) {
+        Err(error) if store_held(app, &error) => Ok(stored),
+        reconciled => reconciled,
+    }
 }
 
 #[derive(Deserialize)]
@@ -219,7 +248,7 @@ pub(crate) async fn external_storage_set_sync_target(
             .external_select(&request.expected_selection_epoch, &target)
             .map_err(local_error)?;
         drop(active);
-        Ok(selection_dto(selected))
+        shown_selection(&state, selected)
     }.await)
 }
 #[derive(Deserialize)]
@@ -232,7 +261,7 @@ pub(crate) struct SetPausedRequest {
 pub(crate) fn external_storage_set_sync_paused(app: AppHandle, request: SetPausedRequest) -> Result<Value> {
     logged("external_storage_set_sync_paused", (|| {
         let selected = native_store(&app)?.external_set_paused(&request.expected_selection_epoch, request.paused).map_err(local_error)?;
-        Ok(selection_dto(selected))
+        shown_selection(&app.state::<JobCommandState>(), selected)
     })())
 }
 #[tauri::command]
@@ -243,7 +272,7 @@ pub(crate) fn external_storage_set_automatic_backup_paused(app: AppHandle, conne
 pub(crate) fn external_storage_get_job<R: Runtime>(app: AppHandle<R>, job_id: String) -> Result<Value> {
     logged("external_storage_get_job", (|| {
         let directory = root(&app)?;
-        let job = reconcile_job(&app, JobStore::open(&directory)?.read(&job_id)?)?;
+        let job = reconcile_job_for_read(&app, JobStore::open(&directory)?.read(&job_id)?)?;
         Ok(job_summary(&directory, job))
     })())
 }

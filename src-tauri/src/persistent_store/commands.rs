@@ -157,6 +157,13 @@ impl PersistentStoreState {
         Ok(true)
     }
 
+    pub(crate) fn maintenance_active(&self) -> bool {
+        self.renderer_gate
+            .state
+            .lock()
+            .is_ok_and(|state| state.maintenance_active)
+    }
+
     pub(crate) fn admit_renderer_operation(&self) -> StoreResult<RendererOperationGuard> {
         self.try_admit_renderer_operation()?
             .ok_or_else(renderer_gate_error)
