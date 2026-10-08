@@ -771,8 +771,8 @@ export function createPersistentDataRuntime(
         } catch (error) {
             if (strict) throw error
             // The projection is installed either way; a stale cursor only costs
-            // the next window an idempotent replay.
-            dependencies.onBackgroundError?.(error)
+            // the next window an idempotent replay, so the user has nothing to act on.
+            console.warn('The content change cursor was not committed', error)
         }
     }
     /// The change window and every record reprojected for it are read through

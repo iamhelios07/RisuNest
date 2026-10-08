@@ -1546,6 +1546,36 @@ describe('received preset selection', () => {
     })
 })
 
+describe('received unit projection', () => {
+    it('reports no background error when the content change cursor cannot be committed', async () => {
+        const initial = normalizeDatabaseDefaults({} as Database)
+        initial.botPresets[0].id = 'preset'
+        initial.personas[0].id = 'persona'
+        const store = new IndexedDbPersistentDataStore(`cursor-commit-failure-${crypto.randomUUID()}`, new IDBFactory(), IDBKeyRange) as PersistentDataStore
+        await store.open()
+        await store.replaceFromDatabase(initial)
+        setDatabase(structuredClone(initial))
+        selectedCharID.set(-1)
+        const backgroundErrors: unknown[] = []
+        const runtime = createPersistentDataRuntime({store, state: createProductionStateAdapter(), prepareDatabase: async (value) => value,
+            onBackgroundError: (error) => { backgroundErrors.push(error) }})
+        await runtime.initializeActiveWorkingSet(getDatabase())
+        const cursor = vi.fn(async () => { throw new Error('database is locked') })
+        store.commitWorkingSetChangeCursor = cursor
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+        try {
+            const key = JSON.stringify(['root', 'language'])
+            await receiveCommit(store, runtime, {unitMutations: [{key, type: 'set', value: 'ko'}]}, [key])
+            expect(getDatabase().language).toBe('ko')
+            expect(cursor).toHaveBeenCalled()
+            expect(backgroundErrors).toEqual([])
+            expect(warn).toHaveBeenCalled()
+        } finally {
+            warn.mockRestore()
+        }
+    })
+})
+
 describe('received fields the working set did not have', () => {
     async function fieldRuntime() {
         const initial = normalizeDatabaseDefaults({} as Database)
