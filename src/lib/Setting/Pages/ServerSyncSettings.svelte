@@ -23,7 +23,7 @@
     import StatusBadge from '../RisuNest/StatusBadge.svelte'
 
     interface Props {
-        connectTarget?: (config: ServerConfig, newDevice: boolean) => Promise<unknown>
+        connectTarget?: (config: ServerConfig, newDevice: boolean, policy?: AssetResidencyPolicy) => Promise<unknown>
         /** `onboarding` drops the section heading and panel, which the onboarding screen provides. */
         tone?: 'settings' | 'onboarding'
     }
@@ -105,7 +105,16 @@
     }
     function readCode() { try { candidate = parseServerRegistration(code); code = ''; failure = '' } catch { failure = copy.registrationInvalid } }
     async function scan() { scanning = true; try { candidate = await scanner.scan(() => {}); failure = '' } catch (error) { failure = message(error) } finally { scanning = false } }
-    async function connect(newDevice = false) { if (!candidate) return; await connectTarget(candidate, newDevice); candidate = undefined; codeOpen = false }
+    // A device that is not connected chooses its asset storage with the connection; a connected one keeps its group.
+    async function connect(newDevice = false) {
+        if (!candidate) return
+        const choice = connected ? undefined : policy
+        const kept = residency?.policy
+        await connectTarget(candidate, newDevice, choice)
+        candidate = undefined; codeOpen = false
+        // Connecting never downloads every asset itself, so a device that kept them on the server downloads them now.
+        if (choice === 'full' && kept === 'remote' && connected) await downloadHeld()
+    }
     async function downloadAll() { downloading = true; try { await controller.track('assets', () => setAssetResidencyPolicy('full')) } finally { downloading = false } }
     async function downloadHeld() { const release = await holdServerSync(); try { await downloadAll() } finally { await release() } }
     async function disconnect() {
@@ -209,6 +218,13 @@
                     <dt>{copy.endpoint}</dt><dd>{candidate.endpoint}</dd>
                     <dt>{copy.libraryId}</dt><dd class="mono">{candidate.libraryId}</dd>
                 </dl>
+                {#if !connected}
+                    <div class="field-head">
+                        <p class="block-title">{copy.residency.title}</p>
+                        <p class="help">{copy.residency.description}</p>
+                    </div>
+                    {@render residencyChoices()}
+                {/if}
                 <div class="actions">
                     <SettingButton onclick={() => void run(() => connect())} busy={busy} disabled={busy}>{copy.connect}</SettingButton>
                     {#if writerRecovery}<SettingButton variant="secondary" onclick={() => void run(() => connect(true))} disabled={busy}>{language.lwwSync.newDeviceAction}</SettingButton>{/if}
@@ -240,6 +256,22 @@
 
 {#snippet alert()}
     {#if view.error || failure}<SettingNotice role="alert" text={failure || message({ code: view.error })} />{/if}
+{/snippet}
+
+{#snippet residencyChoices(apply?: (next: AssetResidencyPolicy) => void)}
+    <div class="choices" role="radiogroup" aria-label={copy.residency.title} aria-disabled={busy ? 'true' : undefined}>
+        {#each residencyOptions as option (option.value)}
+            {@const checked = policy === option.value}
+            <label class="choice" data-checked={checked} data-disabled={busy}>
+                <input class="sr-only" type="radio" name="risunest-asset-residency" value={option.value} {checked} disabled={busy} onchange={() => { policy = option.value; apply?.(option.value) }} />
+                <span class="choice-icon" aria-hidden="true">
+                    {#if option.value === 'full'}<HardDriveIcon size={18} />{:else}<CloudDownloadIcon size={18} />{/if}
+                </span>
+                <span class="choice-label">{option.label}</span>
+                <span class="choice-radio" aria-hidden="true"></span>
+            </label>
+        {/each}
+    </div>
 {/snippet}
 
 {#snippet progressSteps(steps: ServerSyncProgressView)}
@@ -308,19 +340,7 @@
         ].filter(share => share.bytes > 0)}
         <SettingGroup title={copy.residency.title} description={copy.residency.description}>
             <div class="sync-block">
-                <div class="choices" role="radiogroup" aria-label={copy.residency.title} aria-disabled={busy ? 'true' : undefined}>
-                    {#each residencyOptions as option (option.value)}
-                        {@const checked = policy === option.value}
-                        <label class="choice" data-checked={checked} data-disabled={busy}>
-                            <input class="sr-only" type="radio" name="risunest-asset-residency" value={option.value} {checked} disabled={busy} onchange={() => { policy = option.value; choosePolicy(option.value) }} />
-                            <span class="choice-icon" aria-hidden="true">
-                                {#if option.value === 'full'}<HardDriveIcon size={18} />{:else}<CloudDownloadIcon size={18} />{/if}
-                            </span>
-                            <span class="choice-label">{option.label}</span>
-                            <span class="choice-radio" aria-hidden="true"></span>
-                        </label>
-                    {/each}
-                </div>
+                {@render residencyChoices(choosePolicy)}
             </div>
             <div class="sync-block">
                 {#if shares.length > 0}

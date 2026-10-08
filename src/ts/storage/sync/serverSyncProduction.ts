@@ -22,6 +22,7 @@ import { get } from 'svelte/store'
 import { selectedCharID } from 'src/ts/stores.svelte'
 import { getDatabase } from '../database.svelte'
 import { createRateMeter, laneDeltas, readServerSyncLanes, routinePeak, routineWork, type ServerSyncAttempt, type ServerSyncLane, type ServerSyncStage } from './serverSyncProgress'
+import { setAssetResidencyPolicy, type AssetResidencyPolicy } from './serverAssetResidency'
 
 const selectedCharacterId = () => getDatabase().characters[get(selectedCharID)]?.chaId ?? null
 
@@ -64,6 +65,8 @@ let hydrationPending = false
 let hydrationAgain = false
 let hydrationError = ''
 let schedulerAuthority: string | undefined
+// A connection that asked to keep assets on the server, until its binding to that library is active.
+let requestedRemoteAssets: { libraryId: string } | undefined
 const listeners = new Set<(value: ReturnType<typeof snapshot>) => void>()
 const changed = () => { for (const listener of listeners) listener(snapshot()) }
 // One attempt runs from the first sync step until sending, receiving, asset downloads and binding
@@ -274,6 +277,14 @@ const scheduler = createServerSyncScheduler({
     recovered() { if (error && error !== hydrationError) { error = ''; changed() } },
     activity() { settleAttempt(); changed() },
 })
+// Native code accepts the remote policy only once the server is active, and it must hold before the
+// first hydration. A binding to another library, such as one resumed after a cancelled bind, keeps its own.
+const remoteAssetsRequested = (c: BindingContext) => !!requestedRemoteAssets && requestedRemoteAssets.libraryId === c.state.libraryId
+async function keepAssetsRemote(c: BindingContext): Promise<void> {
+    requestedRemoteAssets = undefined
+    await setAssetResidencyPolicy('remote')
+    checkContext(c)
+}
 // Scheduler blocks and errors belong to one binding authority and never carry over to another.
 const adoptSchedulerAuthority = (c: BindingContext) => {
     if (schedulerAuthority === c.state.targetAuthority) return
@@ -295,11 +306,11 @@ const transport: SyncBindingTransport = {
         checkContext(c)
         await pushAvailable(c, true)
     },
-    async resumeBinding(c) { context = c; adoptSchedulerAuthority(c); await invoke('server_sync_lww_activate', { request: header() }); checkContext(c); persistedBinding = c.state; hydrationPending = true; await updateForeground(document.visibilityState !== 'hidden'); scheduler.remoteHint() },
+    async resumeBinding(c) { context = c; adoptSchedulerAuthority(c); await invoke('server_sync_lww_activate', { request: header() }); checkContext(c); if (remoteAssetsRequested(c)) await keepAssetsRemote(c); persistedBinding = c.state; hydrationPending = true; await updateForeground(document.visibilityState !== 'hidden'); scheduler.remoteHint() },
     prepareNewDeviceBinding: (staged,c) => invoke('server_sync_lww_prepare_new_device', { stagingId: staged.stagingId, request: { bindingAuthority: c.state.targetAuthority, requestId: staged.receiveId } }),
     replaceAsNewDevice: (...args) => during('applying', () => replaceNativeSyncBindingAsNewDevice(...args)),
     prepareFreshWriter: (inspected,c) => invoke('server_sync_lww_prepare_fresh_writer', { inspectionId: inspected.inspectionId, request: { bindingAuthority: c.state.targetAuthority, requestId: crypto.randomUUID() } }),
-    async resumeNewDeviceBinding(preparation,result,c) { await invoke('server_sync_lww_activate_new_device', { authorizationId: preparation.authorizationId, writerId: result.writerId, request: { bindingAuthority: result.bindingAuthority, requestId: crypto.randomUUID() } }); context = c; adoptSchedulerAuthority(c); checkContext(c); persistedBinding = c.state; error = ''; hydrationError = ''; hydrationPending = true; await scheduler.retry(); await updateForeground(document.visibilityState !== 'hidden'); scheduler.remoteHint() },
+    async resumeNewDeviceBinding(preparation,result,c) { await invoke('server_sync_lww_activate_new_device', { authorizationId: preparation.authorizationId, writerId: result.writerId, request: { bindingAuthority: result.bindingAuthority, requestId: crypto.randomUUID() } }); context = c; adoptSchedulerAuthority(c); checkContext(c); if (remoteAssetsRequested(c)) await keepAssetsRemote(c); persistedBinding = c.state; error = ''; hydrationError = ''; hydrationPending = true; await scheduler.retry(); await updateForeground(document.visibilityState !== 'hidden'); scheduler.remoteHint() },
 }
 export async function receiveAvailableServerChanges(): Promise<void> { await scheduler.receiveAvailableChanges() }
 export async function configureServerSyncConnection(config: ServerConfig): Promise<void> { await invoke('server_sync_configure', { config }); error = '' }
@@ -317,9 +328,14 @@ async function bindServer(options: SyncBindingOptions = {}): Promise<BindingOutc
     }
     finally { binding = false; settleAttempt() }
 }
-export async function connectServerSync(config: ServerConfig, newDevice = false): Promise<BindingOutcome> {
+/** With `remote`, the device keeps assets on the server from the start; `full` keeps its stored policy. */
+export async function connectServerSync(config: ServerConfig, newDevice = false, policy?: AssetResidencyPolicy): Promise<BindingOutcome> {
     await configureServerSyncConnection(config)
-    const outcome = await bindServer(newDevice ? { mode: 'new-device' } : {})
+    // Setting `full` here would download every asset inside the binding itself.
+    requestedRemoteAssets = policy === 'remote' ? { libraryId: config.libraryId } : undefined
+    let outcome: BindingOutcome
+    try { outcome = await bindServer(newDevice ? { mode: 'new-device' } : {}) }
+    finally { requestedRemoteAssets = undefined }
     await controller.ensureStatus()
     return outcome
 }

@@ -54,7 +54,7 @@ vi.mock('../persistentDataRuntime.svelte', () => ({
     flushPendingDataLocally: f.flush,
     getPersistentDataRuntime: () => f.runtime,
 }))
-vi.mock('../../mobileBackgroundTask', () => ({ runWithMobileBackgroundTask: f.mobile }))
+vi.mock('../../mobileBackgroundTask', () => ({ runWithMobileBackgroundTask: f.mobile, beginMobileBackgroundTask: vi.fn() }))
 vi.mock('src/ts/plugins/apiV3/v3.svelte', () => ({ fencePluginExecutionForAuthorityReplacement: vi.fn(), invalidatePluginCachesAfterAuthorityReplacement: vi.fn(), restartPluginsAfterAuthorityReplacement: vi.fn() }))
 vi.mock('../persistentRevisionEvents', () => ({ subscribeLocalPersistentRevision: (callback: (revision: number, cause?: string) => void) => { f.revision = callback; return () => {} } }))
 vi.mock('../generatingConversationRegistry', () => ({ generatingConversations: { snapshot: () => f.generating } }))
@@ -498,6 +498,79 @@ describe('production server LWW composition', () => {
         expect(production.getServerSyncController().snapshot()).toMatchObject({ status: { bound: true }, paused: true, error: 'server-unreachable' })
         await production.retryServerSync()
         expect(f.resumeCurrent).toHaveBeenCalledExactlyOnceWith(state.target)
+    })
+    describe('asset storage chosen with the connection', () => {
+        const config = { endpoint: 'https://synthetic.invalid', libraryId: 'library', deviceId: 'registration', token: 'synthetic' }
+        const residency = (policy: string) => ({ policy, localBytes: 0, remoteBytes: 0, remoteObjects: 0, serverBytes: 0, serverObjects: 0, externalObjects: [], unavailableObjects: 0, evictedBytes: 0 })
+        const policyCalls = () => f.invoke.mock.calls.filter(([command]) => command === 'server_sync_asset_policy')
+        const contextFor = (libraryId: string) => ({ ...bindingContext(), state: { ...bindingContext().state, libraryId } })
+        // The shared flow is mocked; each case drives the transport the way a binding to `libraryId` would.
+        async function bindWith(newDevice: boolean, libraryId = 'library') {
+            const { bindSyncTarget } = await import('./bindingRegistry')
+            vi.mocked(bindSyncTarget).mockImplementation(async () => {
+                const context = contextFor(libraryId)
+                if (newDevice) await f.transport!.resumeNewDeviceBinding!({ authorizationId: 'authorization', writerId: 'writer' }, { revision: 32, writerId: 'writer', bindingAuthority: '0' }, context)
+                else await f.transport!.resumeBinding(context)
+                return { kind: 'bound', action: newDevice ? 'new-device' : 'replaced', state: context.state }
+            })
+        }
+        let base: (command: string, args?: unknown) => Promise<unknown>
+        beforeEach(async () => {
+            base = f.invoke.getMockImplementation()!
+            f.invoke.mockImplementation(async (command, args) => command === 'server_sync_asset_policy' ? residency('remote') : base(command, args))
+            production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+            visible(true)
+        })
+        it.each([false, true])('keeps assets on the server from before the first hydration (new device=%s)', async newDevice => {
+            await bindWith(newDevice)
+            await production.connectServerSync(config, newDevice, 'remote'); await settle()
+            expect(policyCalls()).toEqual([['server_sync_asset_policy', { policy: 'remote' }]])
+            expect(callOrder(newDevice ? 'server_sync_lww_activate_new_device' : 'server_sync_lww_activate')).toBeLessThan(callOrder('server_sync_asset_policy'))
+            expect(callOrder('server_sync_asset_policy')).toBeLessThan(callOrder('server_sync_lww_hydrate'))
+        })
+        it.each([
+            { policy: 'full' as const, newDevice: false },
+            { policy: 'full' as const, newDevice: true },
+            { policy: undefined, newDevice: false },
+        ])('leaves the stored policy to native hydration with $policy (new device=$newDevice)', async ({ policy, newDevice }) => {
+            await bindWith(newDevice)
+            await production.connectServerSync(config, newDevice, policy); await settle()
+            expect(policyCalls()).toHaveLength(0)
+            expect(hydrationCalls()).toHaveLength(1)
+        })
+        it('applies the choice once, so a later resume of the same binding hydrates under the stored policy', async () => {
+            await bindWith(false)
+            await production.connectServerSync(config, false, 'remote'); await settle()
+            await f.transport!.fenceOldJobs(bindingContext()); await f.transport!.resumeBinding(bindingContext()); await settle()
+            expect(policyCalls()).toHaveLength(1)
+        })
+        it('forgets the choice when the binding fails', async () => {
+            const { bindSyncTarget } = await import('./bindingRegistry')
+            vi.mocked(bindSyncTarget).mockRejectedValue({ code: 'server-unreachable', retryable: true })
+            await expect(production.connectServerSync(config, false, 'remote')).rejects.toMatchObject({ code: 'server-unreachable' })
+            await f.transport!.resumeBinding(bindingContext()); await settle()
+            expect(policyCalls()).toHaveLength(0)
+            expect(hydrationCalls()).toHaveLength(1)
+        })
+        it('forgets the choice when the configuration is refused', async () => {
+            f.invoke.mockImplementation(async (command, args) => { if (command === 'server_sync_configure') throw { code: 'unauthorized' }; return base(command, args) })
+            await expect(production.connectServerSync(config, false, 'remote')).rejects.toMatchObject({ code: 'unauthorized' })
+            await f.transport!.resumeBinding(bindingContext()); await settle()
+            expect(policyCalls()).toHaveLength(0)
+        })
+        it('leaves another library, such as the binding a cancelled connection resumes, on its own policy', async () => {
+            await bindWith(false, 'previous-library')
+            await production.connectServerSync(config, false, 'remote'); await settle()
+            expect(policyCalls()).toHaveLength(0)
+            expect(hydrationCalls()).toHaveLength(1)
+        })
+        it('stops the binding before any hydration when the policy is refused', async () => {
+            f.invoke.mockImplementation(async (command, args) => { if (command === 'server_sync_asset_policy') throw { code: 'library-operation-busy' }; return base(command, args) })
+            await bindWith(false)
+            await expect(production.connectServerSync(config, false, 'remote')).rejects.toMatchObject({ code: 'library-operation-busy' })
+            await settle()
+            expect(hydrationCalls()).toHaveLength(0)
+        })
     })
     it('guards native initialization and transport registration on the web', async () => {
         f.native = false
