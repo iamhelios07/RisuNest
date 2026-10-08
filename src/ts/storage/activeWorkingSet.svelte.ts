@@ -2231,6 +2231,7 @@ export class ActiveWorkingSet {
         }
         this.requireCurrentWindowedState(state, target)
         if (
+            this.dependencies.coordinator.revision !== state.authority.storeRevision ||
             !persisted ||
             persisted.revision !== state.authority.storeRevision ||
             persisted.value.id !== state.conversationId
