@@ -49,7 +49,7 @@ it('renders and persists all three local choices in UI without changing shared s
 it('describes each send key choice', () => {
     expect(languageKorean.risuNest.ui).toMatchObject({
         messageSendKey: '메시지 보내기 키',
-        messageSendKeyHelp: 'Enter를 선택하는 경우 Enter로 메시지를 보내고 Shift+Enter로 줄바꿈합니다. Ctrl/Shift+Enter를 선택하는 경우 Ctrl+Enter나 Shift+Enter로 메시지를 보내고 Enter로 줄바꿈합니다. 전송 버튼을 선택하는 경우 Enter로 줄바꿈하며 메시지는 전송 버튼으로만 보냅니다.',
+        messageSendKeyHelp: 'Enter를 선택하는 경우 Enter로 메시지를 보내고 Shift+Enter로 줄바꿈합니다. Ctrl/Shift+Enter를 선택하는 경우 Ctrl+Enter나 Shift+Enter로 메시지를 보내고 Enter로 줄바꿈합니다. 전송 버튼을 선택하는 경우 Enter로 줄바꿈하고 메시지는 전송 버튼으로만 보냅니다.',
         messageSendKeyButton: '전송 버튼',
     })
     expect(languageEnglish.risuNest.ui).toMatchObject({

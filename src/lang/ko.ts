@@ -2149,7 +2149,7 @@ export const languageKorean = {
         ui: {
             title: 'UI',
             messageSendKey: '메시지 보내기 키',
-            messageSendKeyHelp: 'Enter를 선택하는 경우 Enter로 메시지를 보내고 Shift+Enter로 줄바꿈합니다. Ctrl/Shift+Enter를 선택하는 경우 Ctrl+Enter나 Shift+Enter로 메시지를 보내고 Enter로 줄바꿈합니다. 전송 버튼을 선택하는 경우 Enter로 줄바꿈하며 메시지는 전송 버튼으로만 보냅니다.',
+            messageSendKeyHelp: 'Enter를 선택하는 경우 Enter로 메시지를 보내고 Shift+Enter로 줄바꿈합니다. Ctrl/Shift+Enter를 선택하는 경우 Ctrl+Enter나 Shift+Enter로 메시지를 보내고 Enter로 줄바꿈합니다. 전송 버튼을 선택하는 경우 Enter로 줄바꿈하고 메시지는 전송 버튼으로만 보냅니다.',
             messageSendKeyButton: '전송 버튼',
             chatEditPopup: '채팅 수정 팝업창 사용',
             chatEditPopupHelp: '채팅 수정 버튼을 누르면 팝업창에서 내용을 수정할 수 있도록 합니다.',
