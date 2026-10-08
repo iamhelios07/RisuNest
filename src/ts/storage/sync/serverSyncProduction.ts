@@ -289,7 +289,7 @@ const scheduler = createServerSyncScheduler({
             catch (value) { throw localApplyFailure(value) }
             checkContext(captured)
             if (receivedBodyReferences(request.changes)) { receivedBodies = true; hydrationPending = true }
-            if (receivedRepresentativeReferences(request.changes)) { receivedBodies = true; representativesPending = true }
+            if (status.assetPolicy === 'remote' && receivedRepresentativeReferences(request.changes)) { receivedBodies = true; representativesPending = true }
             if (!foreground && !completeAvailable) break
             await invoke('server_sync_lww_ack', { request: { bindingAuthority: request.bindingAuthority, requestId: request.requestId } })
             checkContext(captured)

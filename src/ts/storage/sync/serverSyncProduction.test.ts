@@ -214,12 +214,16 @@ describe('production server LWW composition', () => {
         })
         await production.receiveAvailableServerChanges(); await settle(); expect(hydrationCalls()).toHaveLength(0)
     })
-    it.each([
+    const representativeChanges = [
         { key: ['character', 'first', 'image'], value: { kind: 'inline', bytes: btoa(JSON.stringify('assets/main.png')) } },
         { key: ['character', 'first', 'trashTime'], value: { kind: 'deleted' } },
         { key: ['exists', 'character', 'first'], value: { kind: 'inline', bytes: 'dHJ1ZQ==' } },
         { key: ['archive', 'first'], value: { kind: 'deleted' } },
-    ])('refreshes representatives after receiving $key without downloading the full inventory', async ({ key, value }) => {
+    ]
+    const receiveUnder = async (assetPolicy: string, key: string[], value: unknown) => {
+        const base = f.invoke.getMockImplementation()!
+        f.invoke.mockImplementation(async (command, args) => command === 'server_sync_status'
+            ? { configured: true, writerId: 'writer', bindingAuthority: '0', assetPolicy } : base(command, args))
         production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
         visible(true); await f.transport!.resumeBinding(bindingContext()); await settle(); f.invoke.mockClear()
         let page = true
@@ -231,9 +235,16 @@ describe('production server LWW composition', () => {
             return command === 'server_sync_lww_pull' ? emptyReceive() : null
         })
         await production.receiveAvailableServerChanges(); await settle()
+    }
+    it.each(representativeChanges)('refreshes representatives after receiving $key without downloading the full inventory', async ({ key, value }) => {
+        await receiveUnder('remote', key, value)
         expect(hydrationCalls()).toEqual([['server_sync_lww_hydrate', {
             request: expect.objectContaining({ bindingAuthority: '0' }), selectedCharacterId: 'selected-stable-id', representativesOnly: true,
         }]])
+    })
+    it.each(representativeChanges)('asks nothing of a device that keeps every asset after receiving $key', async ({ key, value }) => {
+        await receiveUnder('full', key, value)
+        expect(hydrationCalls()).toHaveLength(0)
     })
     it('coalesces local remote-policy edits and preserves another edit during representative hydration', async () => {
         const base = f.invoke.getMockImplementation()!
