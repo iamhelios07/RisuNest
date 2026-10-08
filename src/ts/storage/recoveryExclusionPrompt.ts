@@ -7,7 +7,7 @@ import {
     type RecoveryExclusion,
 } from './recoveryMode.svelte'
 
-function exclusionName(exclusion: RecoveryExclusion): string {
+export function exclusionName(exclusion: RecoveryExclusion): string {
     const strings = language.risuNest.recovery
     return {
         plugins: strings.excludePlugins,

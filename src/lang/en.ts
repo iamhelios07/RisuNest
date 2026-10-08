@@ -2414,6 +2414,9 @@ export const languageEnglish = {
             keepTitle: 'Keep these off from now on?',
             keepDescription: 'Left off for this start: {0}',
             keepAction: 'Keep off',
+            keptTitle: 'Kept off',
+            keptHelp: 'Items you turn on take effect when the app restarts.',
+            turnOn: 'Turn on',
         },
         storage: {
             snapshotSizeNote:

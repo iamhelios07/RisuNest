@@ -2229,6 +2229,9 @@ export const languageKorean = {
             keepTitle: '앞으로도 꺼 두시겠습니까?',
             keepDescription: '이번 시작에서 끈 항목: {0}',
             keepAction: '앞으로도 끄기',
+            keptTitle: '앞으로도 끈 항목',
+            keptHelp: '켠 항목은 앱을 다시 시작하면 적용됩니다.',
+            turnOn: '켜기',
         },
         storage: {
             snapshotSizeNote:
