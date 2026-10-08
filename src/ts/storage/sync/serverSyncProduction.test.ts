@@ -256,6 +256,19 @@ describe('production server LWW composition', () => {
         expect(hydrationCalls()).toHaveLength(2)
         finish(); await settle()
     })
+    it('checks character icons once a burst of local saves settles', async () => {
+        const base = f.invoke.getMockImplementation()!
+        f.invoke.mockImplementation(async (command, args) => command === 'server_sync_status'
+            ? { configured: true, writerId: 'writer', bindingAuthority: '0', assetPolicy: 'remote' } : base(command, args))
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        visible(true); await f.transport!.resumeBinding(bindingContext()); await settle(); f.invoke.mockClear()
+        for (const revision of [32, 33, 34]) { f.revision!(revision); await vi.advanceTimersByTimeAsync(1500); await settle() }
+        expect(hydrationCalls()).toHaveLength(0)
+        await vi.advanceTimersByTimeAsync(500); await settle()
+        expect(hydrationCalls()).toEqual([['server_sync_lww_hydrate', {
+            request: expect.objectContaining({ bindingAuthority: '0' }), selectedCharacterId: 'selected-stable-id', representativesOnly: true,
+        }]])
+    })
     it('does not scan the full asset inventory on local edits in full mode', async () => {
         const base = f.invoke.getMockImplementation()!
         f.invoke.mockImplementation(async (command, args) => command === 'server_sync_status'

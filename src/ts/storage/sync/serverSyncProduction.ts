@@ -68,6 +68,7 @@ let replacing = false
 let hydrating: Promise<void> | undefined
 let hydrationPending = false
 let representativesPending = false
+let representativesTimer: ReturnType<typeof setTimeout> | undefined
 let hydrationAgain = false
 let hydrationError = ''
 let schedulerAuthority: string | undefined
@@ -399,7 +400,8 @@ export async function installServerSyncProduction({ resumeBound = true }: { resu
     if (!isTauri || disposeServer) return
     const disposers = [registerSyncBindingTransport({ kind: 'server', connectionId: 'server' }, transport)]
     disposers.push(subscribeLocalPersistentRevision((_revision,cause) => {
-        if (status.assetPolicy === 'remote') { representativesPending = true; queueMicrotask(continueHydration) }
+        // Saves come in bursts while chatting, so character icons are checked once they settle.
+        if (status.assetPolicy === 'remote') { clearTimeout(representativesTimer); representativesTimer = setTimeout(() => { representativesTimer = undefined; representativesPending = true; continueHydration() }, 2000) }
         scheduler.localChange(cause === 'generation-complete')
     }))
     // Another sync target taking over fences this one without a status read, so the server card reads it again.
@@ -422,7 +424,7 @@ export async function installServerSyncProduction({ resumeBound = true }: { resu
     const visibility = () => { void updateForeground(document.visibilityState !== 'hidden').catch(value => { if (serverSyncErrorCode(value) === 'cancelled') return; error = serverSyncErrorCode(value) || 'server-unreachable'; changed() }) }
     document.addEventListener('visibilitychange', visibility)
     disposers.push(() => document.removeEventListener('visibilitychange', visibility))
-    disposeServer = () => { scheduler.dispose(); for (const dispose of disposers) dispose(); context = undefined; persistedBinding = undefined; foreground = false; hydrationPending = false; representativesPending = false; hydrationAgain = false; attempt = undefined; clearFinished(); watchSamples() }
+    disposeServer = () => { scheduler.dispose(); for (const dispose of disposers) dispose(); context = undefined; persistedBinding = undefined; foreground = false; hydrationPending = false; representativesPending = false; clearTimeout(representativesTimer); representativesTimer = undefined; hydrationAgain = false; attempt = undefined; clearFinished(); watchSamples() }
     await controller.ensureStatus()
     if (!resumeBound) return
     const current = await invoke<BindingContext['state']>('pds_lww_binding_state')
