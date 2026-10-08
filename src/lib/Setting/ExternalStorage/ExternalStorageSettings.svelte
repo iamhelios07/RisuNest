@@ -53,6 +53,8 @@
     const EMPTY_HISTORY_STEPS = 4
     /** What a repository accepts for each retention limit. */
     const RETENTION_LIMITS = { keepCount: [1, 1000], keepDays: [7, 3650] } as const
+    /** How long disconnecting waits for the file check before it asks without the check's answer. */
+    const REMOTE_ONLY_CHECK_MS = 3_000
     const strings = $derived(externalStorageStrings(DBState.db.language))
     let storageState = $state<ExternalStorageState | null>(null)
     let adding = $state(false)
@@ -481,10 +483,20 @@
     }
 
     async function removeConnection(connection: ExternalConnectionSummary): Promise<void> {
+        busy = true
+        activeAction = `remove:${connection.id}`
         let held: number | undefined
+        let timer: ReturnType<typeof setTimeout> | undefined
         try {
-            held = await remoteOnlyFiles(connection)
-        } catch {}
+            held = await Promise.race([
+                remoteOnlyFiles(connection),
+                new Promise<undefined>(resolve => { timer = setTimeout(resolve, REMOTE_ONLY_CHECK_MS) }),
+            ])
+        } catch {} finally {
+            clearTimeout(timer)
+            busy = false
+            activeAction = ''
+        }
         const remoteOnly = held !== 0
         // The card's own two lines tell apart connections to one service and account.
         const name = `${externalConnectionTitle(strings, connection)}\n${connectionPlace(connection)}`

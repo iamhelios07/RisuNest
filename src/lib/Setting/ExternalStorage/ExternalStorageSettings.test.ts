@@ -879,6 +879,33 @@ ${strings.removeRemoteOnlyUnknown}`, requireChecked: false }))
         expect(alertConfirm).not.toHaveBeenCalled()
         expect(state.removeConnection).not.toHaveBeenCalled()
     })
+    it('shows the disconnect as running while it checks the files', async () => {
+        state.residency.mockReturnValue(new Promise(() => {}))
+        removeButton().click(); await settle()
+        const button = target.querySelector<HTMLButtonElement>('button[aria-busy="true"]')
+        expect(button?.textContent).toContain(strings.remove)
+        expect(button?.disabled).toBe(true)
+        expect(alertCheckboxConfirm).not.toHaveBeenCalled()
+    })
+    it('asks with the unknown wording once the file check takes more than a few seconds', async () => {
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+        try {
+            state.residency.mockReturnValue(new Promise(() => {}))
+            vi.mocked(alertCheckboxConfirm).mockResolvedValue({ confirmed: false, checked: false })
+            removeButton().click(); await settle()
+            await vi.advanceTimersByTimeAsync(2_900); await settle()
+            expect(alertCheckboxConfirm).not.toHaveBeenCalled()
+            await vi.advanceTimersByTimeAsync(100); await settle()
+            expect(alertCheckboxConfirm).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ description: `${name}
+
+${strings.removeRemoteOnlyUnknown}`, requireChecked: false }))
+            expect(target.querySelector('button[aria-busy="true"]')).toBeNull()
+            expect(removeButton().disabled).toBe(false)
+            expect(state.removeConnection).not.toHaveBeenCalled()
+        } finally {
+            vi.useRealTimers()
+        }
+    })
     it('asks once with an unchecked download option for files only this connection holds', async () => {
         state.residency.mockResolvedValue(held([{ connectionId: 'connection-1', objects: 2 }]))
         vi.mocked(alertCheckboxConfirm).mockResolvedValue({ confirmed: false, checked: false })
