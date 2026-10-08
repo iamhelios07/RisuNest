@@ -31,9 +31,12 @@ export function installSyncBindingFlow(dependencies: {
     refreshActivatedLibrary(): Promise<void>
     beginActivatedLibraryGuard(): BindingActivationGuard
     recovery: BindingRecoveryRegistration
+    /** Runs each question the binding asks the user, such as whether to replace this library. */
+    whileAsking?<T>(ask: () => Promise<T>): Promise<T>
 }) {
+    const { whileAsking = ask => ask(), ...rest } = dependencies
     const flow = createSyncBindingFlow({
-        ...dependencies,
+        ...rest,
         native: dependencies.native ?? createNativeSyncBindingBridge(),
         resolveTransport: getSyncBindingTransport,
         gate: createStorageMutationGate(),
@@ -41,8 +44,8 @@ export function installSyncBindingFlow(dependencies: {
         hasNonDefaultData: async () => get((await import('../nativeFileJobManager')).nativeFileJobHost) === 'onboarding'
             ? hasLocalLibraryContent() : hasLocalBindingData(),
         hasNonDefaultSharedData: hasLocalSharedBindingData,
-        confirmReplacement: confirmSyncBindingReplacement,
-        confirmPreviousStorageFiles,
+        confirmReplacement: reason => whileAsking(() => confirmSyncBindingReplacement(reason)),
+        confirmPreviousStorageFiles: context => whileAsking(() => confirmPreviousStorageFiles(context)),
         downloadPreviousStorageFiles,
     })
     return { flow, dispose: registerSyncBindingFlow(flow) }

@@ -85,6 +85,15 @@ describe('server sync progress view', () => {
         const view = serverSyncProgressView(attempt({ stages: ['downloading'], active: ['downloading'], current: 'downloading', lanes: [lane('binding', { active: true, step: 'downloading', listed: 40, itemsDone: 10, itemsTotal: 40, filesDone: 2, filesTotal: 3 })] }), text, 0)
         expect([view.detail, view.fraction]).toEqual(['10 / 40', 0.25])
     })
+    it('shows a binding that downloads bodies after its last change, or stages them, without a share', () => {
+        const binding = (counts: Partial<ServerSyncLane>) => serverSyncProgressView(attempt({ stages: ['downloading'], active: ['downloading'], current: 'downloading', lanes: [lane('binding', { active: true, listed: 4477, listedTotal: 4477, itemsDone: 4477, itemsTotal: 4477, ...counts })] }), text, 0)
+        const bodies = binding({ step: 'downloading', filesDone: 120, filesTotal: 639 })
+        expect([bodies.label, bodies.detail, bodies.fraction]).toEqual([text.activity.downloading, '', null])
+        expect(bodies.counters.find(counter => counter.key === 'items')?.value).toBe('4,477 / 4,477')
+        expect(bodies.counters.find(counter => counter.key === 'files')?.value).toBe('120')
+        const staging = binding({ step: 'staging' })
+        expect([staging.label, staging.detail, staging.fraction]).toEqual([text.activity.staging, '', null])
+    })
     it('measures a binding listing against the units its state pin holds', () => {
         const listing = (counts: Partial<ServerSyncLane>) => serverSyncProgressView(attempt({ stages: ['preparing'], active: ['preparing'], current: 'preparing', lanes: [lane('binding', { active: true, step: 'listing', ...counts })] }), text, 0)
         const first = listing({ listed: 256, listedTotal: 1000 })
@@ -116,6 +125,11 @@ describe('server sync progress view', () => {
         const view = serverSyncProgressView(attempt({}), text, 2_000)
         expect(view.counters).toEqual([{ key: 'elapsed', label: text.elapsed, value: '00:02' }])
     })
+    it('holds the elapsed time while the attempt waits for the user', () => {
+        expect(serverSyncProgressView(attempt({ pausedAt: 3_000 }), text, 600_000).counters).toEqual([{ key: 'elapsed', label: text.elapsed, value: '00:03' }])
+        expect(serverSyncProgressView(attempt({ pausedMs: 597_000 }), text, 602_000).counters).toEqual([{ key: 'elapsed', label: text.elapsed, value: '00:05' }])
+        expect(serverSyncProgressView(attempt({ pausedAt: 700_000, pausedMs: 597_000 }), text, 900_000).counters).toEqual([{ key: 'elapsed', label: text.elapsed, value: '01:43' }])
+    })
     it('lists items only when the step knows their total', () => {
         const counted = serverSyncProgressView(attempt({ plannedSend: 5, lanes: [lane('send', { active: true, step: 'confirming', itemsDone: 0, itemsTotal: 5 })] }), text, 0)
         expect(counted.label).toBe(text.activity.confirming)
@@ -128,7 +142,7 @@ describe('server sync progress view', () => {
 describe('server sync remaining time', () => {
     const downloading = (counts: Partial<ServerSyncLane>) => attempt({ stages: ['assets'], active: ['assets'], current: 'assets', lanes: [lane('assets', { active: true, step: 'downloading', bytesDone: 100, bytesTotal: 400, assetScope: { id: 3, done: 1, total: 4, settled: false }, ...counts })] })
     it('measures only an asset download, whose byte total is planned once per scope', () => {
-        expect(bytePhase(downloading({}))).toEqual({ key: 'assets:3', done: 100, total: 400 })
+        expect(bytePhase(downloading({}))).toEqual({ key: 'assets:3', done: 100, total: 400, items: { done: 1, total: 4 } })
         expect(bytePhase(downloading({ step: 'preparing' }))).toBeUndefined()
         expect(bytePhase(downloading({ assetScope: { id: 3, done: 0, total: null, settled: false } }))).toBeUndefined()
         expect(bytePhase(attempt({ lanes: [lane('send', { active: true, step: 'uploading', bytesDone: 100, bytesTotal: 400 })] }))).toBeUndefined()

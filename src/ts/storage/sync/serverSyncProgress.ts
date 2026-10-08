@@ -70,6 +70,10 @@ export interface ServerSyncAttempt {
     /** `full` connects a library or downloads every asset and shows each step; `routine` is automatic sync. */
     mode: 'full' | 'routine'
     startedAt: number
+    /** Set while the attempt waits for the user, whose answer does not count as elapsed time. */
+    pausedAt?: number
+    /** Time the attempt waited for the user before `pausedAt`. */
+    pausedMs?: number
     /** When a finished attempt ended. */
     endedAt?: number
     /** Stages in the order this attempt first entered them. */
@@ -150,17 +154,19 @@ function stageWork(attempt: ServerSyncAttempt, lane: ServerSyncLane): Work | und
     if (lane.assetScope) return lane.assetScope.total ? capped(lane.assetScope.done, lane.assetScope.total) : undefined
     if (lane.lane === 'send' || lane.lane === 'receive') return itemWork(attempt, lane.lane)
     if (lane.lane !== 'binding') return undefined
-    if (lane.step !== 'listing') return itemWork(attempt, 'binding')
-    return lane.listedTotal > 0 ? capped(lane.listed, lane.listedTotal) : undefined
+    if (lane.step === 'listing') return lane.listedTotal > 0 ? capped(lane.listed, lane.listedTotal) : undefined
+    // A binding counts the changes it reads; the bodies it downloads after the last one and what it stages are not counted.
+    const items = lane.step === 'downloading' ? itemWork(attempt, 'binding') : undefined
+    return items && items.done < items.total ? items : undefined
 }
 /**
  * The running step measured in bytes against a total planned once: an asset download scope.
  * Uploads and receives plan their bytes page by page, so they have none.
  */
-export function bytePhase(attempt: ServerSyncAttempt): { key: string; done: number; total: number } | undefined {
+export function bytePhase(attempt: ServerSyncAttempt): { key: string; done: number; total: number; items: Work } | undefined {
     const lane = stageLane(attempt, attempt.active.at(-1) ?? attempt.current)
     if (!lane?.assetScope?.total || lane.step !== 'downloading' || lane.bytesTotal <= 0) return undefined
-    return { key: `${lane.lane}:${lane.assetScope.id}`, done: lane.bytesDone, total: lane.bytesTotal }
+    return { key: `${lane.lane}:${lane.assetScope.id}`, done: lane.bytesDone, total: lane.bytesTotal, items: { done: lane.assetScope.done, total: lane.assetScope.total } }
 }
 function laneDetail(attempt: ServerSyncAttempt, lane: ServerSyncLane, text: Text): string {
     const work = stageWork(attempt, lane)
@@ -192,7 +198,7 @@ export function serverSyncProgressView(attempt: ServerSyncAttempt, text: Text, n
         // Files are planned per transfer group, so they have no total for the whole attempt.
         if (filesDone > 0) counters.push({ key: 'files', label: text.progressFiles, value: count(filesDone) })
     }
-    counters.push({ key: 'elapsed', label: text.elapsed, value: formatElapsed(now - attempt.startedAt) })
+    counters.push({ key: 'elapsed', label: text.elapsed, value: formatElapsed((attempt.pausedAt ?? now) - attempt.startedAt - (attempt.pausedMs ?? 0)) })
     if (attempt.remainingMs !== undefined) counters.push({ key: 'remaining', label: text.remaining, value: formatRemaining(attempt.remainingMs) })
     return {
         // Asset downloads have one native step, so their stage names them more precisely.

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { SyncBindingTransport, SyncBindingDependencies } from './bindingFlow'
+import type { SyncBindingTransport, SyncBindingDependencies, SyncBindingNative } from './bindingFlow'
 import { languageKorean } from 'src/lang/ko'
 import { serverSyncProgressView, serverSyncRoutineView } from './serverSyncProgress'
 
@@ -9,6 +9,7 @@ const f = vi.hoisted(() => ({
     database: { characters: [{ chaId: 'selected-stable-id' }] },
     invoke: vi.fn(),
     install: vi.fn(),
+    switchTarget: vi.fn(),
     register: vi.fn(),
     resumeCurrent: vi.fn(),
     viewport: undefined as undefined | ((source?: unknown) => void),
@@ -32,7 +33,8 @@ const f = vi.hoisted(() => ({
         markCommittedWorkingSetRefreshRequired: vi.fn(),
     },
     transport: undefined as SyncBindingTransport | undefined,
-    dependencies: undefined as Pick<SyncBindingDependencies, 'withPausedWrites' | 'beginActivatedLibraryGuard' | 'refreshActivatedLibrary' | 'recovery'> | undefined,
+    dependencies: undefined as (Pick<SyncBindingDependencies, 'withPausedWrites' | 'beginActivatedLibraryGuard' | 'refreshActivatedLibrary' | 'recovery'>
+        & { native: SyncBindingNative; whileAsking<T>(ask: () => Promise<T>): Promise<T> }) | undefined,
 }))
 vi.mock('@tauri-apps/api/core', () => ({ invoke: f.invoke }))
 vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn(async () => () => {}) }))
@@ -47,7 +49,7 @@ vi.mock('../committedWorkingSetContinuation', () => ({ registerCommittedWorkingS
 vi.mock('./bindingDialog', () => ({ confirmSyncBindingReplacement: vi.fn(), confirmPreviousStorageFiles: vi.fn(async () => 'connect'), downloadPreviousStorageFiles: vi.fn() }))
 vi.mock('./bindingLocalData', () => ({ hasLocalBindingData: vi.fn(), hasLocalSharedBindingData: vi.fn() }))
 vi.mock('./bindingRegistry', () => ({ registerSyncBindingTransport: f.register, resumeCurrentSyncBinding: f.resumeCurrent, getSyncBindingTransport: vi.fn(), bindSyncTarget: vi.fn(), unbindSyncTarget: vi.fn() }))
-vi.mock('./bindingNative', () => ({ replaceNativeSyncBinding: vi.fn(), replaceNativeSyncBindingAsNewDevice: vi.fn() }))
+vi.mock('./bindingNative', () => ({ createNativeSyncBindingBridge: () => ({ state: vi.fn(), assertAuthority: vi.fn(), switchTarget: f.switchTarget }), replaceNativeSyncBinding: vi.fn(), replaceNativeSyncBindingAsNewDevice: vi.fn() }))
 vi.mock('../persistentDataRuntime.svelte', () => ({
     withPausedPersistentWrites: f.paused,
     beginActivatedLibraryGuard: f.guard,
@@ -731,7 +733,7 @@ describe('server sync progress', () => {
         f.invoke.mockImplementation(async command => {
             if (command !== 'server_sync_progress') return null
             const index = reads++
-            return sendLanes({}).map(lane => lane.lane === 'assets' && index > 0 ? { ...lane, active: true, step: 'downloading', bytesDone: 100 * index, bytesTotal: 10_000, assetScope: { id: 1, done: index, total: 50, settled: false } } : lane)
+            return sendLanes({}).map(lane => lane.lane === 'assets' && index > 0 ? { ...lane, active: true, step: 'downloading', bytesDone: 100 * index, bytesTotal: 10_000, assetScope: { id: 1, done: index, total: 100, settled: false } } : lane)
         })
         const controller = production.getServerSyncController()
         const stop = controller.watchProgress()
@@ -741,7 +743,7 @@ describe('server sync progress', () => {
         await vi.advanceTimersByTimeAsync(5000); await settle()
         expect(controller.snapshot().progress?.remainingMs).toBeUndefined()
         await vi.advanceTimersByTimeAsync(500); await settle()
-        // 1,000 bytes over five seconds, with 8,900 left.
+        // 1,000 bytes over five seconds, with 8,900 left, and the files it counts predict the same.
         expect(controller.snapshot().progress?.remainingMs).toBe(44_500)
         finish(); await download
         stop()
@@ -809,6 +811,60 @@ describe('server sync progress', () => {
         await settle()
         expect(production.getServerSyncController().snapshot().progress).toMatchObject({ stages: ['applying'], active: ['applying'] })
         finish(); await replaced
+    })
+    it('shows the switch to a received server state as applying it, and a switch with nothing received as no stage', async () => {
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        const { bindSyncTarget } = await import('./bindingRegistry')
+        const controller = production.getServerSyncController()
+        const state = bindingContext().state
+        let switched!: () => void
+        f.switchTarget.mockImplementation(() => new Promise(resolve => { switched = () => resolve(state) }))
+        const seen: unknown[] = []
+        vi.mocked(bindSyncTarget).mockImplementation(async () => {
+            await f.transport!.inspectTarget(bindingContext())
+            const pending = f.dependencies!.native.switchTarget(state, state.target, null, 'switch', false)
+            await settle(); seen.push(controller.snapshot().progress?.active); switched(); await pending
+            await f.transport!.pullAvailableState({ inspectionId: 'inspection' } as never, bindingContext())
+            const staged = f.dependencies!.native.switchTarget(state, state.target, null, 'switch', false)
+            await settle(); seen.push(controller.snapshot().progress?.active); switched(); await staged
+            return { kind: 'cancelled' }
+        })
+        await production.connectServerSync({ endpoint: 'https://synthetic.invalid', libraryId: 'library', deviceId: 'registration', token: 'synthetic' })
+        expect(seen).toEqual([[], ['applying']])
+        expect(f.switchTarget).toHaveBeenCalledTimes(2)
+    })
+    it('does not count the time a binding waits for the user to answer as elapsed', async () => {
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        const { bindSyncTarget } = await import('./bindingRegistry')
+        const controller = production.getServerSyncController()
+        const elapsed = () => serverSyncProgressView(controller.snapshot().progress!, languageKorean.risuNest.serverSync, Date.now()).counters.find(counter => counter.key === 'elapsed')?.value
+        let ask!: () => void
+        let answer!: (value: boolean) => void
+        let work!: () => void
+        vi.mocked(bindSyncTarget).mockImplementation(async () => {
+            await f.transport!.inspectTarget(bindingContext())
+            await new Promise<void>(resolve => { ask = resolve })
+            await f.dependencies!.whileAsking(() => new Promise<boolean>(resolve => { answer = resolve }))
+            await f.transport!.pullAvailableState({ inspectionId: 'inspection' } as never, bindingContext())
+            await new Promise<void>(resolve => { work = resolve })
+            return { kind: 'cancelled' }
+        })
+        const connected = production.connectServerSync({ endpoint: 'https://synthetic.invalid', libraryId: 'library', deviceId: 'registration', token: 'synthetic' })
+        await settle()
+        await vi.advanceTimersByTimeAsync(3_000)
+        expect(elapsed()).toBe('00:03')
+        ask(); await settle()
+        await vi.advanceTimersByTimeAsync(600_000)
+        expect(elapsed()).toBe('00:03')
+        const startedAt = controller.snapshot().progress!.startedAt
+        answer(true); await settle()
+        await vi.advanceTimersByTimeAsync(2_000)
+        expect(elapsed()).toBe('00:05')
+        // The attempt keeps its start, so the panel that waits for it to run a moment stays shown.
+        expect(controller.snapshot().progress!.startedAt).toBe(startedAt)
+        // An answer outside a binding runs without touching any attempt.
+        await expect(f.dependencies!.whileAsking(async () => 'answer')).resolves.toBe('answer')
+        work(); await connected
     })
     it('keeps the last successful time when an attempt fails', async () => {
         production.initializeNativeSyncBindings(); await production.installServerSyncProduction()

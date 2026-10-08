@@ -9,8 +9,8 @@ import { RevisionConflictError, type LwwStageReceive, type LwwRemoteChange } fro
 import { runWithMobileBackgroundTask } from '../../mobileBackgroundTask'
 import { fencePluginExecutionForAuthorityReplacement, invalidatePluginCachesAfterAuthorityReplacement, restartPluginsAfterAuthorityReplacement } from 'src/ts/plugins/apiV3/v3.svelte'
 import { registerSyncBindingTransport, resumeCurrentSyncBinding } from './bindingRegistry'
-import type { SyncBindingTransport, BindingContext, BindingOutcome, SyncBindingOptions } from './bindingFlow'
-import { replaceNativeSyncBinding, replaceNativeSyncBindingAsNewDevice } from './bindingNative'
+import type { SyncBindingTransport, BindingContext, BindingOutcome, SyncBindingOptions, StagedSyncTarget } from './bindingFlow'
+import { createNativeSyncBindingBridge, replaceNativeSyncBinding, replaceNativeSyncBindingAsNewDevice } from './bindingNative'
 import { createServerSyncScheduler, integrityCodes, serverSyncErrorCode } from './serverSyncScheduler'
 import { subscribeLocalPersistentRevision } from '../persistentRevisionEvents'
 import { listen } from '@tauri-apps/api/event'
@@ -34,7 +34,11 @@ export function initializeNativeSyncBindings(): () => void {
     if (nativeBindings) return disposeNativeSyncBindings
     let activeToken: PersistentMutationToken | undefined
     const token = () => { if (!activeToken) throw new Error('Sync binding pause is unavailable'); return activeToken }
+    const bridge = createNativeSyncBindingBridge()
     nativeBindings = installSyncBindingFlow({
+        // Switching to a received state checks that state again, so it is part of applying it.
+        native: { ...bridge, switchTarget: (...args) => bindingStaged ? during('applying', () => bridge.switchTarget(...args)) : bridge.switchTarget(...args) },
+        whileAsking,
         recovery: createSyncBindingRecoveryRegistration(getPersistentDataRuntime, token),
         withPausedWrites: operation => withPausedPersistentWrites('sync-binding', async pausedToken => {
             activeToken = pausedToken
@@ -77,6 +81,8 @@ let attemptFailed = false
 // Read when a watched attempt starts, so even an attempt that ends before its next read has a start to count from.
 let baseline: Promise<ServerSyncLane[] | undefined> | undefined
 let binding = false
+// A binding that received the server state it replaces this library with.
+let bindingStaged = false
 let operations = 0
 let lastSuccessAt: number | undefined
 // A routine attempt that moved anything stays on screen as finished for a moment.
@@ -108,7 +114,7 @@ async function sample(): Promise<void> {
     meter.add(at, captured.lanes.reduce((total, lane) => total + lane.sentBytes + lane.receivedBytes, 0))
     captured.rate = meter.rate()
     const phase = bytePhase(captured)
-    captured.remainingMs = remaining.update(phase?.key, phase?.done ?? 0, phase?.total ?? 0, at)
+    captured.remainingMs = remaining.update(phase?.key, phase?.done ?? 0, phase?.total ?? 0, at, phase?.items)
     changed()
 }
 const clearFinished = () => { clearTimeout(finishedTimer); finishedTimer = undefined; finished = undefined }
@@ -151,6 +157,15 @@ const settleAttempt = () => {
     watchSamples()
     if (!attemptFailed && ended.mode === 'routine' && start) void finish(ended, start)
     changed()
+}
+/** Stops the elapsed time of a binding while it waits for the user to answer. */
+async function whileAsking<T>(ask: () => Promise<T>): Promise<T> {
+    const held = binding ? attempt : undefined
+    if (!held || held.pausedAt !== undefined) return ask()
+    const pausedAt = held.pausedAt = Date.now()
+    changed()
+    try { return await ask() }
+    finally { held.pausedMs = (held.pausedMs ?? 0) + Date.now() - pausedAt; held.pausedAt = undefined; if (held === attempt) changed() }
 }
 /** A cancelled or failed step keeps the attempt from counting as a completed sync. */
 async function attempted<T>(operation: () => Promise<T>): Promise<T> {
@@ -301,7 +316,7 @@ const adoptSchedulerAuthority = (c: BindingContext) => {
 }
 const transport: SyncBindingTransport = {
     inspectTarget: c => during('preparing', () => invoke('server_sync_lww_inspect', { request: { bindingAuthority: c.state.targetAuthority, requestId: crypto.randomUUID() } })),
-    pullAvailableState: (inspected,c) => during('downloading', () => invoke('server_sync_lww_stage_target', { inspectionId: inspected.inspectionId, request: { bindingAuthority: c.state.targetAuthority, requestId: crypto.randomUUID() } })),
+    pullAvailableState: async (inspected,c) => { const staged = await during('downloading', () => invoke<StagedSyncTarget>('server_sync_lww_stage_target', { inspectionId: inspected.inspectionId, request: { bindingAuthority: c.state.targetAuthority, requestId: crypto.randomUUID() } })); bindingStaged = true; return staged },
     replaceFromTarget: (...args) => during('applying', () => replaceNativeSyncBinding(...args)),
     reportStopped(value) {
         const code = serverSyncErrorCode(failures(value)[0])
@@ -337,6 +352,7 @@ async function bindServer(options: SyncBindingOptions = {}): Promise<BindingOutc
     }
     finally {
         binding = false
+        bindingStaged = false
         // What continues after connecting, such as reading back this device's publication, shows as automatic sync.
         if (attempt && !operations && attempt.mode === 'full') { attempt.mode = 'routine'; changed() }
         settleAttempt()
