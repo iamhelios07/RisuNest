@@ -2760,6 +2760,8 @@ export const languageEnglish = {
             "reasonBusy": 'Another operation is using the data. Try again after it finishes.',
             "reasonPendingOperation": 'Resolve the pending synchronization operation and try again.',
             "reasonServerStatus": 'The synchronization server status could not be checked. Check the connection and try again.',
+            "reasonRemoteAssetUnavailable": 'Files kept only on the server or external storage could not be fetched, so nothing was exported. Check the connection and try again.',
+            "reasonAssetMissing": 'Some files are gone, so nothing was exported. Review them in Data check.',
             "warningSourceProblems": 'Some source data could not be read. Check the exported recovery file.',
             "warningRepairRequired": 'The source was preserved, but requires repair before it can be restored.',
             "warningCompatibilityLosses": 'Some data is not supported by the selected backup format and was excluded or converted.',

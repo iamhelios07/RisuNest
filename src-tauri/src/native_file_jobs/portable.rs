@@ -192,6 +192,12 @@ fn portable_error(failure: portable_backup::Error) -> NativeJobError {
         portable_backup::Error::Cancelled => {
             NativeJobError::new("cancelled", "Portable backup was cancelled")
         }
+        failure @ portable_backup::Error::RemotePayloadUnavailable => {
+            NativeJobError::new("remote-asset-unavailable", failure.to_string())
+        }
+        failure @ portable_backup::Error::PayloadMissing => {
+            NativeJobError::new("asset-missing", failure.to_string())
+        }
         failure => error(failure),
     }
 }
@@ -1324,6 +1330,43 @@ mod tests {
         assert_eq!(restarted.bootstrap_for_entry().unwrap().mode, "normal");
         assert_eq!(DurableCasJob::open(&restore.target, &job_id).err().map(|error| error.kind()), Some(std::io::ErrorKind::NotFound));
         assert_eq!(PersistentStore::open(&restore.target).unwrap().revision().unwrap(), restore.revision);
+    }
+
+    /// Exports a library whose one asset body is not on this device, held as `held` says.
+    fn export_without_local_body(held: bool) -> (NativeJobError, bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let mut store = library(&source);
+        let body = b"synthetic body kept elsewhere";
+        let hash = crate::server_sync::lww_tests::put_asset(&mut store, "assets/synthetic-elsewhere.bin", body)
+            .object_hash
+            .unwrap();
+        let cas = crate::asset_repository::PayloadCas::new(&source).unwrap();
+        fs::remove_file(cas.object_path(&hash).unwrap().unwrap()).unwrap();
+        if held {
+            // Custody is recorded, but the server cannot be reached.
+            crate::server_sync::residency::test_remote::hold(&source, &[(&hash, body.len() as u64)]);
+        }
+        let jobs = directory.path().join("jobs");
+        fs::create_dir_all(&jobs).unwrap();
+        let revision = store.revision().unwrap();
+        let export = super::super::JobRegistry::default()
+            .create_internal(super::super::JobKind::ExportPortableBackup, Some(revision), vec![], false)
+            .unwrap();
+        let destination = directory.path().join("backup.risunest");
+        let failure = export_portable(Some(&destination), revision, &jobs, &directory.path().join("handoffs"), store, &export, None, "9.8.7-synthetic")
+            .unwrap_err();
+        (failure, destination.exists())
+    }
+
+    #[test]
+    fn an_export_names_a_body_it_could_not_fetch_or_find_and_writes_nothing() {
+        let (unfetched, written) = export_without_local_body(true);
+        assert_eq!(unfetched.code, "remote-asset-unavailable");
+        assert!(!written);
+        let (missing, written) = export_without_local_body(false);
+        assert_eq!(missing.code, "asset-missing");
+        assert!(!written);
     }
 
     #[test]

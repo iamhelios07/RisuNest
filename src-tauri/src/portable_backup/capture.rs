@@ -191,16 +191,23 @@ fn capture_remote_payload(catalog:&Catalog,root:&Path,kind:&str,key:&str,metadat
     let server_check=|| {
         if probe.is_cancelled() {Err(crate::server_sync::SyncError::new("cancelled",499))} else {Ok(())}
     };
+    // The archive is written only after every body is in, so a body that cannot be fetched stops
+    // the backup before anything reaches its destination.
+    let unfetched=|| if probe.is_cancelled() {Error::Cancelled} else {Error::RemotePayloadUnavailable};
     if let Some(mut body)=crate::server_sync::residency::open_transient_server_with_check(root,catalog.directory.path(),hash,&server_check)
-        .map_err(|error|Error::Io(std::io::Error::other(error.code)))? {
+        .map_err(|_|unfetched())? {
         let size=body.len()?;
         if expected_size.is_some_and(|expected|expected!=size) {return Err(Error::Invalid("remote backup payload size mismatch"));}
         return catalog.add_reader(kind,key,metadata,&mut body,size,hash,probe);
     }
     let cancel=probe.cancellation_flag().map(crate::external_storage::contract::Cancellation::with_external_flag).unwrap_or_default();
     let mut body=tauri::async_runtime::block_on(crate::external_storage::lww_residency::spool_verified_remote_body(root,hash,catalog.directory.path(),&cancel))
-        .map_err(|error|Error::Io(std::io::Error::other(error.to_string())))?
-        .ok_or(Error::Invalid("required backup payload is unavailable"))?;
+        .map_err(|error| match error.kind {
+            // The connection that registered the body is gone, or the body is gone from it.
+            crate::external_storage::contract::ErrorKind::NotFound => Error::PayloadMissing,
+            _ => unfetched(),
+        })?
+        .ok_or(Error::PayloadMissing)?;
     check(probe)?;
     let size=body.as_file().metadata()?.len();
     if expected_size.is_some_and(|expected|expected!=size) {return Err(Error::Invalid("remote backup payload size mismatch"));}

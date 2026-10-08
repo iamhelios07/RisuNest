@@ -2575,6 +2575,8 @@ export const languageKorean = {
             "reasonBusy": '다른 작업에서 데이터를 사용하고 있습니다. 작업이 끝난 후 다시 시도해주세요.',
             "reasonPendingOperation": '보류 중인 동기화 작업을 해결한 후 다시 시도해주세요.',
             "reasonServerStatus": '동기화 서버 상태를 확인하지 못했습니다. 연결을 확인한 후 다시 시도해주세요.',
+            "reasonRemoteAssetUnavailable": '서버나 외부 저장소에만 있는 파일을 가져오지 못해 내보내지 못했습니다. 연결을 확인한 후 다시 시도해주세요.',
+            "reasonAssetMissing": '사라진 파일이 있어 내보내지 못했습니다. 데이터 점검에서 확인해주세요.',
             "warningSourceProblems": '일부 원본 데이터를 읽지 못했습니다. 내보낸 복구 파일을 확인해주세요.',
             "warningRepairRequired": '원본은 보존되었으며, 복원하기 전에 복구해야 합니다.',
             "warningCompatibilityLosses": '선택한 백업 형식에서 지원하지 않는 데이터 일부가 제외되거나 변환되었습니다.',
