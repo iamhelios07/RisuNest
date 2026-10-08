@@ -1,7 +1,7 @@
 //! Tauri hands an async command's future by value to the IPC resolver on the
 //! thread that received the request, which is the 1 MiB main thread on Windows
 //! and iOS. Release builds copy it through several frames there before tokio
-//! moves it to the heap: those frames measured about 23 times the size this
+//! moves it to the heap: those frames measured 23 to 62 times the size this
 //! test build reports. A command whose body is larger than `MAX_FUTURE_BYTES`
 //! awaits it through `Box::pin`.
 
