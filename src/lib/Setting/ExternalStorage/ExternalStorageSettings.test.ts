@@ -711,12 +711,12 @@ describe('the storage usage tab', () => {
             id, snapshotId: id, kind, createdAtMs: '1', logicalRevision: '1', pinned: false,
             complete: true, verified: true, includedSections: [], sameDevice,
         })
-        state.listHistory.mockResolvedValue({ items: [row('own', true), row('other', false), row('state', false, 'snapshot')] })
+        state.listHistory.mockResolvedValue({ items: [row('own', true), row('other', false), row('state', false, 'snapshot'), { ...row('kept', true), pinned: true }] })
         const tab = [...target.querySelectorAll('button')].find(item => item.textContent?.trim() === strings.history)
         tab?.click()
         await settle()
-        const meta = [...target.querySelectorAll('.item-meta')].map(item => item.textContent)
-        expect(meta).toEqual([strings.thisDevice])
+        const flags = [...target.querySelectorAll('.item')].map(item => [...item.querySelectorAll('.item-head .flag')].map(flag => flag.textContent?.trim()))
+        expect(flags).toEqual([[strings.thisDevice], [], [], [strings.pinned, strings.thisDevice]])
     })
 
     it('sends a changed limit and leaves the other one alone', async () => {

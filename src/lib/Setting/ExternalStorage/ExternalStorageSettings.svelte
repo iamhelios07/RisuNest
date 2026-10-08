@@ -10,7 +10,7 @@
     import SettingToggle from '../RisuNest/SettingToggle.svelte'
     import SettingNotice from '../RisuNest/SettingNotice.svelte'
     import StatusBadge from '../RisuNest/StatusBadge.svelte'
-    import { CloudIcon, DatabaseIcon, PackageIcon, PinIcon, ServerIcon } from '@lucide/svelte'
+    import { CloudIcon, DatabaseIcon, MonitorSmartphoneIcon, PackageIcon, PinIcon, ServerIcon } from '@lucide/svelte'
     import { alertConfirm, alertNormal, alertCheckboxConfirm } from 'src/ts/alert'
     import { DBState } from 'src/ts/stores.svelte'
     import { getExternalStorageBridge } from 'src/ts/storage/sync/external/bridge'
@@ -933,9 +933,13 @@
                                             <div class="item-head">
                                                 <span class="kind" data-kind={item.kind}>{strings.historyKinds[item.kind]}</span>
                                                 <span class="item-time">{when(item.createdAtMs)}</span>
-                                                {#if item.pinned}<span class="kept"><PinIcon size={12} aria-hidden="true" />{strings.pinned}</span>{/if}
+                                                {#if item.pinned || item.sameDevice}
+                                                    <span class="item-flags">
+                                                        {#if item.pinned}<span class="flag"><PinIcon size={12} aria-hidden="true" />{strings.pinned}</span>{/if}
+                                                        {#if item.sameDevice}<span class="flag item-device"><MonitorSmartphoneIcon size={12} aria-hidden="true" />{strings.thisDevice}</span>{/if}
+                                                    </span>
+                                                {/if}
                                             </div>
-                                            {#if item.sameDevice}<p class="item-meta">{strings.thisDevice}</p>{/if}
                                             <div class="item-actions">
                                                 <SettingButton size="sm" variant="secondary" disabled={busy || (job && externalJobIsActive(job)) || !usable} onclick={() => beginRestore(connection, item)}>{strings.restore}</SettingButton>
                                                 <SettingButton size="sm" variant="quiet" disabled={busy || (job && externalJobIsActive(job)) || !usable} onclick={() => exportSnapshot(connection.id, item.snapshotId)}>{strings.download}</SettingButton>
@@ -1331,18 +1335,24 @@
         font-weight: 500;
         font-variant-numeric: tabular-nums;
     }
-    .kept {
+    .item-flags {
+        display: inline-flex;
+        flex-wrap: wrap;
+        align-items: center;
+        row-gap: 0.25rem;
+    }
+    .flag {
         display: inline-flex;
         align-items: center;
         gap: 0.25rem;
         font-size: 12px;
+        line-height: 1.25;
         color: var(--risu-theme-textcolor2);
     }
-    .item-meta {
-        margin: 0;
-        font-size: 12.5px;
-        color: var(--risu-theme-textcolor2);
-        overflow-wrap: anywhere;
+    .flag + .flag {
+        margin-left: 0.5rem;
+        padding-left: 0.5rem;
+        border-left: 1px solid var(--risu-theme-darkborderc);
     }
     .item-actions {
         display: flex;
