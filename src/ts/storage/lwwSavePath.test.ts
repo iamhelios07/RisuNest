@@ -15,6 +15,7 @@ import { createMetadataOnlySelectedConversation, isMetadataOnlySelectedConversat
 import type { Database, character } from './database.svelte'
 import type { LwwStageReceive, PersistentDataStore, WorkingSetCommit } from './persistentDataStore'
 import { planConversationInsertPages } from './conversationInsertPages'
+import { PluginDeviceKeyspace } from '../plugins/pluginDeviceKeyspace'
 
 async function harness() {
     const database = structuredClone(fixtureDatabase)
@@ -98,6 +99,28 @@ async function identityRuntimeHarness() {
 }
 
 describe('LWW renderer save path', () => {
+    it('invalidates a held device plugin cache after receiving plugin-local units without a plugin restart', async () => {
+        let value = 'before'
+        const keyspace = new PluginDeviceKeyspace('synthetic', {
+            hydrate: async () => ({ complete: true, byteSize: value.length, entries: [{space:'string', key:'key', value}] }),
+            read: async () => value, keys: async () => ['key'], write: async () => {},
+        })
+        expect(await keyspace.getItem('string', 'key')).toBe('before')
+        const reload = vi.fn()
+        const invalidated = vi.fn(() => keyspace.invalidate())
+        const { runtime, store } = await runtimeHarness(undefined, { onPluginDeviceStorageChanged: invalidated, afterRemotePluginChange: reload })
+        store.lwwStageReceive = async () => {}
+        store.lwwApplyReceive = async () => {
+            value = 'received'
+            return { revision: runtime.revision, affectedKeys: ['["plugin-local","synthetic","string","key"]'], heldKeys: [], deferredKeys: [] }
+        }
+        store.lwwFinishReceive = async () => {}
+        await runtime.applyLwwReceive({ bindingAuthority:'synthetic', requestId:'receive-local-plugin', changes:[], progress:{kind:'server',cursor:'1'}, admittedTimeUpperMs:'100' })
+        expect(invalidated).toHaveBeenCalledWith('synthetic')
+        expect(await keyspace.getItem('string', 'key')).toBe('received')
+        expect(reload).not.toHaveBeenCalled()
+    })
+
     it('stores every page of a newly added character with its final conversation order', async () => {
         const { store, coordinator } = await harness()
         const added = { type: 'character', chaId: 'paged-addition', name: 'Paged addition', chatPage: 1,

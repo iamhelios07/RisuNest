@@ -9,10 +9,11 @@ import { fetchNative, globalFetch, readImage, saveAsset } from "../globalApi.sve
 import { DBState, hotReloading } from "../stores.svelte";
 import type { ScriptMode } from "../process/scripts";
 import { reconcilePluginListUpdate } from "./pluginListUpdate";
-import { customV3ProviderMetaStore, loadV3Plugins } from "./apiV3/v3.svelte";
+import { areV3PluginsIdle, customV3ProviderMetaStore, loadV3Plugins, prepareV3PluginsForReload, subscribeV3PluginActivity } from "./apiV3/v3.svelte";
 import { pluginCodeTranspiler } from "./apiV3/transpiler";
 import {
     createPluginLoadOrchestrator,
+    createDeferredPluginReload,
     createPluginLoadReentrancyGuard,
     runPluginUnloadCallbacks,
 } from "./pluginCompatibility";
@@ -449,6 +450,21 @@ const applyPluginLoad = createPluginLoadOrchestrator<RisuPlugin>({
     loadV3: loadV3Plugins,
 })
 const pluginLoadReentrancy = createPluginLoadReentrancyGuard((error) => console.error(error))
+let syncReload: ReturnType<typeof createDeferredPluginReload> | undefined
+
+export function requestPluginReloadAfterSync(): void {
+    syncReload ??= createDeferredPluginReload({
+        isIdle: areV3PluginsIdle,
+        subscribe: subscribeV3PluginActivity,
+        reload: (isCurrent) => loadPlugins(true, isCurrent),
+        onError: (error) => console.error(error),
+    })
+    syncReload.request()
+}
+
+export function cancelPluginReloadAfterSync(): void {
+    syncReload?.cancel()
+}
 
 function isSupportedPluginVersion(plugin: RisuPlugin): boolean {
     return plugin.version === '3.0'
@@ -486,7 +502,8 @@ export function keepPluginsOffForThisStart() {
     pluginsOffForThisStart = true
 }
 
-export async function loadPlugins() {
+export async function loadPlugins(whenIdle = false, isCurrent: () => boolean = () => true) {
+    if (!whenIdle) cancelPluginReloadAfterSync()
     if (pluginsOffForThisStart) return
     console.log('Loading plugins...')
     let db = getDatabase()
@@ -497,7 +514,12 @@ export async function loadPlugins() {
         enabledPlugins.filter((plugin: RisuPlugin) => !isSupportedPluginVersion(plugin)),
     )
 
-    await applyPluginLoad(enabledPlugins.filter(isSupportedPluginVersion))
+    await applyPluginLoad(enabledPlugins.filter(isSupportedPluginVersion), () => {
+        if (!isCurrent()) return false
+        if (!whenIdle || prepareV3PluginsForReload()) return true
+        requestPluginReloadAfterSync()
+        return false
+    }, isCurrent)
 }
 
 export async function loadPluginsAfterAuthoritativeRestore(alreadyRestarted = false) {

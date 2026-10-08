@@ -319,6 +319,7 @@ export interface PersistentDataRuntimeStateAdapter {
     captureWorkingSetDatabase?(): Database | null
     /** Host caches outside the working set that a remote change invalidates. */
     onPluginStorageChanged?(owner: string, key: string): void
+    onPluginDeviceStorageChanged?(owner: string): void
     getGeneratingConversations?(): readonly GeneratingConversation[]
     conversationViewportRowBudget?: number
     canActivateWorkingSet?(): boolean
@@ -1190,6 +1191,7 @@ export function createPersistentDataRuntime(
         for (const key of result.affectedKeys) {
             const [kind, owner, name] = JSON.parse(key)
             if (kind === 'plugin') dependencies.state.onPluginStorageChanged?.(owner, name)
+            else if (kind === 'plugin-local') dependencies.state.onPluginDeviceStorageChanged?.(owner)
             else if (kind === 'order' && owner === 'plugin-storage') {
                 dependencies.state.onPluginStorageChanged?.(name, '')
             }
