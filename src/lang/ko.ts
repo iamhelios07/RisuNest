@@ -2064,8 +2064,11 @@ export const languageKorean = {
             connect: '연결하고 동기화',
             disconnect: '연결 해제',
             disconnectTitle: '연결을 해제하시겠습니까?',
+            disconnectDescription: '이 기기와 서버의 동기화를 중지합니다.',
             disconnectRemoteOnly:
                 '서버에만 있는 파일이 있습니다. 필요한 경우 다운로드한 뒤 연결을 해제하세요.',
+            disconnectRemoteOnlyUnknown:
+                '파일을 확인할 수 없습니다. 필요한 경우 서버에만 있는 파일을 다운로드한 뒤 연결을 해제하세요.',
             downloadThenDisconnect: '다운로드 후 연결 해제',
             downloadFailedKeptConnection:
                 '파일을 다운로드하지 못해 연결을 해제하지 않았습니다. 다시 시도하거나 다운로드하지 않고 연결을 해제하세요.',

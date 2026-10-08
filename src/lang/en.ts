@@ -2249,8 +2249,11 @@ export const languageEnglish = {
             connect: 'Connect and sync',
             disconnect: 'Disconnect',
             disconnectTitle: 'Disconnect from the server?',
+            disconnectDescription: 'This device stops syncing with the server.',
             disconnectRemoteOnly:
                 'Some files are stored only on the server. If you need them, download them before disconnecting.',
+            disconnectRemoteOnlyUnknown:
+                'Files could not be checked. Download any files stored only on the server before disconnecting if you need them.',
             downloadThenDisconnect: 'Download, then disconnect',
             downloadFailedKeptConnection:
                 'The files could not be downloaded, so the server was not disconnected. Try again, or disconnect without downloading.',
