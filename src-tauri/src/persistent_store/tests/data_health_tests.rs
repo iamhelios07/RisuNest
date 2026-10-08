@@ -212,3 +212,160 @@ fn a_selected_preset_or_persona_that_is_gone_is_still_reported() {
         );
     }
 }
+
+fn scan_bounded(store: &mut PersistentStore, limit: usize) -> Findings {
+    let revision = store.revision().expect("read revision");
+    let lease = store
+        .acquire_revision(revision)
+        .expect("acquire revision lease")
+        .lease;
+    let findings = store
+        .data_health_reader(&lease)
+        .expect("open the diagnosis reader")
+        .scan(limit, &NeverCancelled)
+        .expect("scan the live library");
+    store.release_revision(&lease).expect("release lease");
+    findings
+}
+
+fn remove_local_body(store: &PersistentStore, hash: &str) {
+    let cas =
+        crate::asset_repository::PayloadCas::new(store.repository_root()).expect("open the CAS");
+    std::fs::remove_file(
+        cas.object_path(hash)
+            .expect("object path")
+            .expect("the body is stored here"),
+    )
+    .expect("remove the local body");
+}
+
+/// An alias whose body this device no longer holds, as an offload or a receive under the remote
+/// policy leaves it.
+fn alias_without_local_body(store: &PersistentStore, key: &str, body: &[u8]) -> (String, u64) {
+    let cas =
+        crate::asset_repository::PayloadCas::new(store.repository_root()).expect("open the CAS");
+    let payload = cas.prepare_bytes(body).expect("store a payload");
+    insert_alias(store, key, &payload.content_hash, payload.byte_size as i64);
+    remove_local_body(store, &payload.content_hash);
+    (payload.content_hash, payload.byte_size)
+}
+
+fn absent_aliases(findings: &Findings) -> Vec<String> {
+    findings
+        .items
+        .iter()
+        .filter(|finding| finding.code == codes::ALIAS_OBJECT_ABSENT)
+        .map(|finding| finding.owner.id.clone())
+        .collect()
+}
+
+fn alias_drops(findings: Findings) -> Vec<(String, bool)> {
+    let result = crate::data_health::ScanResult::new(0, 0, crate::data_health::ScanDepth::Quick, findings);
+    crate::data_health::repair::plan(&result)
+        .into_iter()
+        .filter_map(|candidate| match candidate.action {
+            crate::data_health::repair::RepairAction::DropAlias { key, .. } => {
+                Some((key, candidate.preferred))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn an_absent_body_the_sync_server_holds_is_not_a_problem_to_repair() {
+    let (_directory, mut store) = healthy_fixture();
+    let root = store.repository_root().to_owned();
+    let (hash, size) = alias_without_local_body(&store, "assets/offloaded", b"synthetic offloaded body");
+
+    // A body nothing holds stays the problem it is today, answered by removing the alias.
+    let unheld = scan(&mut store);
+    assert_eq!(absent_aliases(&unheld), ["assets/offloaded"]);
+    assert!(unheld.items.iter().any(|finding| finding.severity == Severity::Blocking));
+    assert_eq!(alias_drops(unheld), [("assets/offloaded".to_owned(), true)]);
+
+    crate::server_sync::residency::test_remote::hold(&root, &[(&hash, size)]);
+    let held = scan(&mut store);
+    assert_eq!(absent_aliases(&held), Vec::<String>::new());
+    assert!(
+        held.items.iter().all(|finding| finding.severity != Severity::Blocking),
+        "a body the server holds blocks nothing: {:?}",
+        held.items
+    );
+    assert_eq!(alias_drops(held), Vec::<(String, bool)>::new());
+    assert_eq!(crate::server_sync::residency::test_remote::fetched(&root), 0, "the scan downloads nothing");
+    assert!(crate::asset_repository::PayloadCas::new(&root).unwrap().stat_object(&hash).unwrap().is_none());
+}
+
+#[test]
+fn the_scan_creates_no_custody_store_on_a_device_that_never_synced() {
+    let (_directory, mut store) = healthy_fixture();
+    alias_without_local_body(&store, "assets/gone", b"synthetic gone body");
+    assert_eq!(absent_aliases(&scan(&mut store)), ["assets/gone"]);
+    assert!(!crate::server_sync::residency::Residency::exists(store.repository_root()));
+}
+
+#[test]
+fn an_archived_character_whose_bodies_the_server_holds_is_not_reported() {
+    let (_directory, mut store) = healthy_fixture();
+    let root = store.repository_root().to_owned();
+    let revision = store.revision().expect("read revision");
+    store.archive_character("char-a", revision, 10).expect("archive a character");
+    let generation = active_generation(&store.connection).expect("read active generation");
+    let archived = crate::persistent_store::archive::read_archived_object(&store.connection, &generation, "char-a")
+        .expect("read the archived character")
+        .expect("the character is archived");
+    let cas = crate::asset_repository::PayloadCas::new(&root).expect("open the CAS");
+    let mut bodies = Vec::new();
+    for hash in archived.object_roots() {
+        if let Some(size) = cas.stat_object(hash).expect("stat a body") {
+            remove_local_body(&store, hash);
+            bodies.push((hash.to_owned(), size));
+        }
+    }
+    assert!(!bodies.is_empty(), "the archive stores its records as bodies");
+    let archive_findings = |findings: &Findings| {
+        findings
+            .items
+            .iter()
+            .filter(|finding| {
+                finding.code == codes::RECORD_INVALID
+                    && finding.owner.id == "char-a"
+                    && finding.detail == "archived character payload is invalid or missing"
+            })
+            .count()
+    };
+    assert_eq!(archive_findings(&scan(&mut store)), 1);
+
+    let held = bodies.iter().map(|(hash, size)| (hash.as_str(), *size)).collect::<Vec<_>>();
+    crate::server_sync::residency::test_remote::hold(&root, &held);
+    assert_eq!(archive_findings(&scan(&mut store)), 0);
+}
+
+/// The quick scan over a library whose every body the server holds, as after a join under the
+/// remote policy. Run explicitly with `--ignored --nocapture` to read the time.
+#[test]
+#[ignore = "scale measurement"]
+fn measures_the_quick_scan_over_ten_thousand_server_held_aliases() {
+    const ALIASES: usize = 10_000;
+    let (_directory, mut store) = healthy_fixture();
+    let root = store.repository_root().to_owned();
+    let hashes = (0..ALIASES).map(|index| format!("{index:064x}")).collect::<Vec<_>>();
+    store.connection.execute_batch("BEGIN").unwrap();
+    for (index, hash) in hashes.iter().enumerate() {
+        insert_alias(&store, &format!("assets/held-{index:05}"), hash, 4);
+    }
+    store.connection.execute_batch("COMMIT").unwrap();
+    let held = hashes.iter().map(|hash| (hash.as_str(), 4)).collect::<Vec<_>>();
+    crate::server_sync::residency::test_remote::hold(&root, &held);
+    let started = std::time::Instant::now();
+    let findings = scan_bounded(&mut store, 2000);
+    let elapsed = started.elapsed();
+    eprintln!(
+        "quick scan, {ALIASES} server-held aliases: {elapsed:?}, {} findings, {} omitted, {} absent",
+        findings.items.len(),
+        findings.omitted,
+        absent_aliases(&findings).len()
+    );
+    assert_eq!(absent_aliases(&findings), Vec::<String>::new());
+}

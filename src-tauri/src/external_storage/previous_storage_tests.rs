@@ -206,6 +206,31 @@ fn status_counts_bodies_by_holder_and_forgets_a_removed_connection() {
     assert_eq!(removed["externalObjects"], serde_json::json!([]));
 }
 
+/// The aliases the quick data check finds without a body, and how many findings block.
+fn absent_aliases(store: &mut PersistentStore) -> (Vec<String>, u64) {
+    let revision = store.revision().unwrap();
+    let lease = store.acquire_revision(revision).unwrap().lease;
+    let findings = store.data_health_reader(&lease).unwrap().scan(2000, &crate::local_backup::NeverCancelled).unwrap();
+    store.release_revision(&lease).unwrap();
+    let absent = findings.items.iter()
+        .filter(|finding| finding.code == crate::data_health::codes::ALIAS_OBJECT_ABSENT)
+        .map(|finding| finding.owner.id.clone())
+        .collect();
+    (absent, crate::data_health::SeverityCounts::of(&findings.items).blocking)
+}
+
+#[test]
+fn the_data_check_reports_only_a_body_no_live_storage_holds() {
+    let mut f = CycleFixture::new();
+    let (_server, _held, _external) = split_holders(&mut f);
+    // The connection that holds the external body is not on this device yet.
+    let (gone, blocking) = absent_aliases(&mut f.b);
+    assert_eq!(gone, ["external-held"], "the server-held body is not reported");
+    assert_eq!(blocking, 1);
+    ConnectionStore::open(f.directory_b.path()).unwrap().insert(&receiver_connection(&f).stored).unwrap();
+    assert_eq!(absent_aliases(&mut f.b), (Vec::new(), 0));
+}
+
 /// Two bodies only the fixture's repository holds, the second of them
 /// registered as well for a second live connection.
 fn shared_holders(f: &mut CycleFixture) -> (ConnectedRepository, String, String) {

@@ -73,6 +73,42 @@ impl Connections {
         Ok(self.0[root].contains(id))
     }
 }
+/// Whether the Sync server or a live external storage connection holds a body
+/// this device does not, by the same rules as the residency status. It reads
+/// only this device's records and creates none.
+pub(crate) struct RemoteHolders {
+    residency: Option<Residency>,
+    remote: RemoteBodies,
+    connections: Connections,
+}
+impl RemoteHolders {
+    pub(crate) fn open(root: &std::path::Path) -> Result<Self> {
+        Ok(Self {
+            residency: Residency::exists(root).then(|| Residency::open(root)).transpose()?,
+            remote: RemoteBodies::deferred(root),
+            connections: Connections::default(),
+        })
+    }
+    /// One answer per hash, in order. None of `hashes` may be held here.
+    pub(crate) fn held(&mut self, hashes: &[String]) -> Result<Vec<bool>> {
+        // Server custody is asked per page; `residency_holders` asks per body.
+        let server = match &self.residency {
+            Some(residency) => residency.active_among(hashes)?,
+            None => BTreeSet::new(),
+        };
+        let rest = hashes.iter().filter(|hash| !server.contains(*hash)).cloned().collect::<Vec<_>>();
+        let mut external = Vec::with_capacity(rest.len());
+        for page in rest.chunks(HOLDER_PAGE) {
+            let holders = PersistentStore::residency_holders(None, &mut self.remote, &mut self.connections, page)?;
+            external.extend(holders.iter().map(|holder| !matches!(holder, Holder::Unavailable)));
+        }
+        let mut external = external.into_iter();
+        Ok(hashes
+            .iter()
+            .map(|hash| server.contains(hash) || external.next().unwrap_or(false))
+            .collect())
+    }
+}
 struct Inventory {
     referenced: BTreeSet<String>,
     local: BTreeSet<String>,
@@ -319,8 +355,7 @@ impl PersistentStore {
     }
     /// Where each of `hashes`, none of them held here, can be fetched from.
     fn residency_holders(
-        &self,
-        residency: &Residency,
+        residency: Option<&Residency>,
         remote: &mut RemoteBodies,
         connections: &mut Connections,
         hashes: &[String],
@@ -328,7 +363,7 @@ impl PersistentStore {
         let mut server = Vec::with_capacity(hashes.len());
         let mut external = Vec::new();
         for hash in hashes {
-            let object = residency.object(hash, None)?;
+            let object = residency.map(|residency| residency.object(hash, None)).transpose()?.flatten();
             if object.is_none() {
                 external.push(hash.as_str());
             }
@@ -389,7 +424,7 @@ impl PersistentStore {
         }
         let mut remote = RemoteBodies::deferred(&self.repository_root);
         for page in missing.chunks(HOLDER_PAGE) {
-            for holder in self.residency_holders(&residency, &mut remote, &mut connections, page)? {
+            for holder in Self::residency_holders(Some(&residency), &mut remote, &mut connections, page)? {
                 match holder {
                     Holder::Server(size) => {
                         status.server_bytes += size;
@@ -437,7 +472,7 @@ impl PersistentStore {
         let mut wanted = BTreeSet::new();
         for page in missing.chunks(HOLDER_PAGE) {
             check()?;
-            let available = self.residency_holders(&residency, &mut remote, &mut connections, page)?;
+            let available = Self::residency_holders(Some(&residency), &mut remote, &mut connections, page)?;
             let mut external = if matches!(target, PreviousStorageTarget::External { .. }) {
                 remote.holders(&page.iter().map(String::as_str).collect::<Vec<_>>())
                     .map_err(|_| std::io::Error::other("external-source-invalid"))?
@@ -496,7 +531,7 @@ impl PersistentStore {
         let mut remote = RemoteBodies::deferred(&self.repository_root);
         for page in missing.chunks(HOLDER_PAGE) {
             check()?;
-            let holders = self.residency_holders(&residency, &mut remote, &mut connections, page)?;
+            let holders = Self::residency_holders(Some(&residency), &mut remote, &mut connections, page)?;
             for (hash, holder) in page.iter().zip(holders) {
                 let wanted = match holder {
                     Holder::Server(_) | Holder::Shared(_) => connection_id.is_none(),

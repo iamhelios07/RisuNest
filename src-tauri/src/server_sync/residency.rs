@@ -228,6 +228,18 @@ impl Residency {
     pub fn object(&self, digest: &str, context: Option<&str>) -> Result<Option<RemoteObject>> {
         self.lookup(digest, context, true)
     }
+    /// The digests among `digests` that `object` finds, asked in pages.
+    pub(crate) fn active_among(&self, digests: &[String]) -> Result<std::collections::BTreeSet<String>> {
+        let mut found = std::collections::BTreeSet::new();
+        for page in digests.chunks(512) {
+            let marks = (1..=page.len()).map(|index| format!("?{index}")).collect::<Vec<_>>().join(",");
+            let mut query = self.db.prepare(&format!("SELECT DISTINCT o.hash FROM objects o JOIN contexts c ON c.id=o.context WHERE o.state='active' AND o.hash IN ({marks})"))?;
+            for hash in query.query_map(rusqlite::params_from_iter(page), |row| row.get::<_, String>(0))? {
+                found.insert(hash?);
+            }
+        }
+        Ok(found)
+    }
     pub(crate) fn target_holds(&self, digest: &str, library_id: &str, target_id: &str) -> Result<bool> {
         validate_hash(digest)?;
         validate_hash(target_id)?;
