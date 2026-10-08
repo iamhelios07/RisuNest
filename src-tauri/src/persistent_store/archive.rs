@@ -188,7 +188,6 @@ pub(super) fn marker_detail(character_id: &str, name: &str, character_type: &str
         "chaId": character_id,
         "name": name,
         "type": character_type,
-        "chats": [],
         "risuNestArchived": true,
     })
 }

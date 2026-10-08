@@ -204,7 +204,7 @@ fn archived_payload_roots_are_installed_and_missing_payload_is_attributed_to_cha
     let catalog = fixture(directory.path());
     let hash = hex::encode(Sha256::digest(b"synthetic file bytes"));
     let archived = serde_json::json!({"objectHash":hash,"archivedAt":1,"conversationCount":1,"messageCount":1,"assetHashes":[],"sharedObjectHash":hash,"sharedAssetHashes":[],"identityRemap":[]});
-    catalog.db.execute("INSERT INTO characters VALUES('archived',0,0,0,'Archived',NULL,0,'character',NULL,NULL,?1,?2)", rusqlite::params![r#"{"chaId":"archived","name":"Archived","type":"character"}"#,archived.to_string()]).unwrap();
+    catalog.db.execute("INSERT INTO characters VALUES('archived',0,0,0,'Archived',NULL,0,'character',NULL,NULL,?1,?2)", rusqlite::params![r#"{"chaId":"archived","name":"Archived","type":"character","risuNestArchived":true}"#,archived.to_string()]).unwrap();
     let path = directory.path().join("archived.risunest");
     catalog.write_candidate(&path, false, &Never).unwrap();
     let archive = VerifiedArchive::open(File::open(path).unwrap(), directory.path(), &Never).unwrap();
@@ -214,7 +214,7 @@ fn archived_payload_roots_are_installed_and_missing_payload_is_attributed_to_cha
     let missing = "f".repeat(64);
     let catalog = fixture(directory.path());
     let archived = serde_json::json!({"objectHash":missing,"archivedAt":1,"conversationCount":1,"messageCount":1,"assetHashes":[],"sharedObjectHash":hash,"sharedAssetHashes":[],"identityRemap":[]});
-    catalog.db.execute("INSERT INTO characters VALUES('archived',0,0,0,'Archived',NULL,0,'character',NULL,NULL,?1,?2)", rusqlite::params![r#"{"chaId":"archived","name":"Archived","type":"character"}"#,archived.to_string()]).unwrap();
+    catalog.db.execute("INSERT INTO characters VALUES('archived',0,0,0,'Archived',NULL,0,'character',NULL,NULL,?1,?2)", rusqlite::params![r#"{"chaId":"archived","name":"Archived","type":"character","risuNestArchived":true}"#,archived.to_string()]).unwrap();
     let path = directory.path().join("missing.risunest");
     catalog.write_candidate(&path, false, &Never).unwrap();
     let archive = VerifiedArchive::open(File::open(path).unwrap(), directory.path(), &Never).unwrap();

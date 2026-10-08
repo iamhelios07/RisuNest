@@ -124,7 +124,11 @@ fn capture_library_inner(
             let size=size.ok_or(Error::Invalid("original payload size is unavailable"))?;
             check(probe)?;
             if cas.stat_object(hash)? == Some(size) {
-                pins.pin_existing(&cas,hash,size,crate::asset_repository::job_pins::CasObjectRole::DirectObject)?;
+                // An archived character's references include its owner manifest, which the file
+                // inventory below pins as a manifest.
+                let owner: bool = catalog.db.query_row("SELECT EXISTS(SELECT 1 FROM asset_owner_heads WHERE manifest_hash=?1)",[hash],|row| row.get(0))?;
+                let role=if owner {crate::asset_repository::job_pins::CasObjectRole::OwnerManifest} else {crate::asset_repository::job_pins::CasObjectRole::DirectObject};
+                pins.pin_existing(&cas,hash,size,role)?;
                 let path=cas.object_path(hash)?.ok_or(Error::Invalid("pinned backup payload disappeared"))?;
                 catalog.add_pinned_file("unit",hash,"{}",&path,size,hash,probe)?;
             } else {

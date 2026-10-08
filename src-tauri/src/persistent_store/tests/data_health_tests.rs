@@ -342,6 +342,123 @@ fn an_archived_character_whose_bodies_the_server_holds_is_not_reported() {
     assert_eq!(archive_findings(&scan(&mut store)), 0);
 }
 
+fn blocking(findings: &Findings) -> Vec<&crate::data_health::Finding> {
+    findings
+        .items
+        .iter()
+        .filter(|finding| finding.severity == Severity::Blocking)
+        .collect()
+}
+
+/// Adds a character whose additional asset is listed by an owner manifest, as the app stores one.
+pub(crate) fn add_character_with_additional_asset(store: &mut PersistentStore, character_id: &str) -> String {
+    use crate::asset_repository::{
+        job_pins::{CasJobKind, CasObjectRole, CasReleaseOutcome, DurableCasJob},
+        owner_manifest_codec::{encode_owner_manifest, OwnerManifestEntry},
+    };
+    let key = format!("assets/{character_id}-extra.png");
+    let asset = crate::server_sync::lww_tests::put_asset(store, &key, b"synthetic additional asset body")
+        .object_hash
+        .expect("store the additional asset");
+    let canonical = encode_owner_manifest(&[OwnerManifestEntry {
+        tuple: ["extra".into(), key.clone(), "png".into()],
+        payload_hash: Some(hex::decode(&asset).unwrap().try_into().unwrap()),
+    }])
+    .expect("encode the owner manifest");
+    let cas = crate::asset_repository::PayloadCas::new(store.repository_root()).expect("open the CAS");
+    let mut job = DurableCasJob::begin(
+        store.repository_root(),
+        &format!("{character_id}-owner"),
+        CasJobKind::CardOrModuleContentImport,
+        crate::asset_repository::job_pins::CasJobOwner::for_test(),
+        1,
+    )
+    .expect("begin the owner job");
+    let manifest = job
+        .prepare_reader(&cas, &mut canonical.as_slice(), CasObjectRole::OwnerManifest)
+        .expect("store the owner manifest");
+    job.seal(store, 2).expect("seal the owner job");
+    store
+        .commit(&WorkingSetCommit {
+            expected_revision: store.revision().expect("read revision"),
+            add_character: Some(json!({
+                "chaId": character_id, "type": "character", "name": "Synthetic owner",
+                "image": key, "creatorNotes": "synthetic notes", "lastInteraction": 500,
+                "additionalAssets": [["extra", key, "png"]],
+                "chats": [{"id": format!("{character_id}-chat"), "name": "Chat", "message": [
+                    {"role": "user", "data": "synthetic first", "chatId": "synthetic-message"}
+                ]}],
+            })),
+            asset_owner_heads: Some(vec![AssetOwnerHead::present(
+                AssetOwnerLocator::CharacterAdditionalAssets { character_id: character_id.into() },
+                manifest.content_hash.clone(),
+                1,
+            )]),
+            ..empty_working_set_commit(store.revision().expect("read revision"))
+        })
+        .expect("add the character");
+    job.release(CasReleaseOutcome::Committed).expect("release the owner job");
+    manifest.content_hash
+}
+
+#[test]
+fn a_library_with_archived_characters_scans_clean() {
+    let (_directory, mut store) = healthy_fixture();
+    add_character_with_additional_asset(&mut store, "char-owner");
+    let before = scan(&mut store);
+    assert_eq!(blocking(&before), Vec::<&crate::data_health::Finding>::new());
+    // Alpha has an image and a last interaction, Gamma is in the trash, and the owner character
+    // has creator notes and additional assets, so every summary column differs from the marker.
+    for character_id in ["char-a", "char-c", "char-owner"] {
+        let revision = store.revision().expect("read revision");
+        store.archive_character(character_id, revision, 10).expect("archive a character");
+    }
+    let archived = scan(&mut store);
+    assert_eq!(blocking(&archived), Vec::<&crate::data_health::Finding>::new());
+    let generation = active_generation(&store.connection).expect("read active generation");
+    for character_id in ["char-a", "char-c", "char-owner"] {
+        let roots = archive::read_archived_object(&store.connection, &generation, character_id)
+            .expect("read the archived character")
+            .expect("the character is archived");
+        for hash in roots.object_roots() {
+            assert!(
+                archived.items.iter().all(|finding| finding.owner.id != hash),
+                "an archived character's body is reported: {:?}",
+                archived.items
+            );
+        }
+    }
+    let unreferenced = |findings: &Findings| {
+        findings.items.iter().filter(|finding| finding.code == codes::OBJECT_UNREFERENCED).count()
+    };
+    // The owner manifest no alias names is kept by the archive from now on.
+    assert!(unreferenced(&archived) <= unreferenced(&before));
+}
+
+#[test]
+fn a_damaged_archived_character_marker_is_still_refused() {
+    for sql in [
+        "UPDATE characters SET detail=json_set(detail,'$.name','Other') WHERE character_id='char-a'",
+        "UPDATE characters SET detail=json_set(detail,'$.chaId','char-b') WHERE character_id='char-a'",
+        "UPDATE characters SET detail=json_set(detail,'$.chats',json('[]')) WHERE character_id='char-a'",
+        "UPDATE characters SET detail=json_remove(detail,'$.risuNestArchived') WHERE character_id='char-a'",
+        "UPDATE characters SET name='Other' WHERE character_id='char-a'",
+    ] {
+        let (_directory, mut store) = healthy_fixture();
+        let revision = store.revision().expect("read revision");
+        store.archive_character("char-a", revision, 10).expect("archive a character");
+        assert!(store.connection.execute(sql, []).expect("damage the archived row") > 0, "{sql}");
+        let findings = scan(&mut store);
+        assert!(
+            blocking(&findings)
+                .iter()
+                .any(|finding| finding.code == codes::RECORD_INVALID && finding.owner.id == "char-a"),
+            "{sql}: {:?}",
+            findings.items
+        );
+    }
+}
+
 /// The quick scan over a library whose every body the server holds, as after a join under the
 /// remote policy. Run explicitly with `--ignored --nocapture` to read the time.
 #[test]

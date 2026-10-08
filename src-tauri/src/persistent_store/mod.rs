@@ -1052,9 +1052,9 @@ impl DataHealthReader {
         }
     }
 
-    /// Reports the stored objects no alias in this generation names. They cost space and nothing
-    /// else, so the diagnosis only counts them and sends the reader to the cleanup, which is the
-    /// only place a file is actually deleted.
+    /// Reports the stored objects no alias in this generation names and no archived character
+    /// keeps. They cost space and nothing else, so the diagnosis only counts them and sends the
+    /// reader to the cleanup, which is the only place a file is actually deleted.
     fn note_unreferenced_objects(
         &self,
         findings: &mut crate::data_health::Findings,
@@ -1062,8 +1062,13 @@ impl DataHealthReader {
     ) -> StoreResult<()> {
         use crate::data_health::{codes, FindingSink, Finding};
         let mut statement = self.connection.prepare(
-            "SELECT object_hash,byte_size FROM asset_objects WHERE object_hash NOT IN (
+            "WITH archived(value) AS (SELECT archived_object FROM characters WHERE json_valid(archived_object))
+             SELECT object_hash,byte_size FROM asset_objects WHERE object_hash NOT IN (
                  SELECT object_hash FROM asset_aliases WHERE object_hash IS NOT NULL
+                 UNION SELECT json_extract(value,'$.objectHash') FROM archived
+                 UNION SELECT json_extract(value,'$.sharedObjectHash') FROM archived
+                 UNION SELECT hashes.value FROM archived, json_each(archived.value,'$.assetHashes') AS hashes
+                 UNION SELECT hashes.value FROM archived, json_each(archived.value,'$.sharedAssetHashes') AS hashes
              ) ORDER BY object_hash",
         )?;
         let mut rows = statement.query([])?;
@@ -3696,4 +3701,4 @@ mod benchmark;
 #[cfg(test)]
 mod benchmark_lww;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

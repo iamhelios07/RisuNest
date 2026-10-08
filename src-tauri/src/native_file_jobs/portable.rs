@@ -2080,6 +2080,68 @@ mod tests {
     }
 
     #[test]
+    fn a_library_with_archived_characters_exports_without_preservation_and_restores_exactly() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let mut store = library(&source);
+        crate::persistent_store::tests::data_health_tests::add_character_with_additional_asset(&mut store, "char-owner");
+        let character = |database: &serde_json::Value, id: &str| {
+            database["characters"].as_array().unwrap().iter().find(|character| character["chaId"] == id).cloned()
+        };
+        let before = store.materialize(None).unwrap();
+        for id in ["char-a", "char-owner"] {
+            let revision = store.revision().unwrap();
+            store.archive_character(id, revision, 10).unwrap();
+        }
+        let jobs = directory.path().join("jobs");
+        fs::create_dir_all(&jobs).unwrap();
+        let revision = store.revision().unwrap();
+        let export = super::super::JobRegistry::default()
+            .create_internal(super::super::JobKind::ExportPortableBackup, Some(revision), vec![], false)
+            .unwrap();
+        let result = export_portable(None, revision, &jobs, &directory.path().join("handoffs"), store, &export, None, "9.8.7-synthetic")
+            .expect("a library with archived characters exports without a preservation prompt");
+        assert!(result.warning_codes.is_empty(), "{:?}", result.warning_codes);
+        let path = std::path::PathBuf::from(result.handoff_path.unwrap());
+        let archive = VerifiedArchive::open(File::open(&path).unwrap(), &jobs, &NeverCancelled).unwrap();
+        let archived: i64 = archive
+            .db
+            .query_row("SELECT count(*) FROM characters WHERE archived_object IS NOT NULL", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(archived, 2);
+        drop(archive);
+
+        let target = directory.path().join("target");
+        let target_store = library(&target);
+        let target_revision = target_store.revision().unwrap();
+        let restore_jobs = directory.path().join("restore-job");
+        fs::create_dir(&restore_jobs).unwrap();
+        let restore = super::super::JobRegistry::default()
+            .create_internal(super::super::JobKind::RestorePortableBackup, Some(target_revision), vec![], false)
+            .unwrap();
+        let bytes = fs::metadata(&path).unwrap().len();
+        restore_portable(
+            OpenedJobSource { file: File::open(path).unwrap(), custody: None, total_bytes: bytes },
+            true,
+            target_revision,
+            &restore_jobs,
+            target_store,
+            &restore,
+            None,
+        )
+        .unwrap();
+        let mut restored = PersistentStore::open(&target).unwrap();
+        for id in ["char-a", "char-owner"] {
+            let revision = restored.revision().unwrap();
+            restored.restore_character(id, revision).unwrap();
+        }
+        let after = restored.materialize(None).unwrap();
+        for id in ["char-a", "char-b", "char-c", "char-owner"] {
+            assert_eq!(character(&after, id), character(&before, id), "{id}");
+        }
+    }
+
+    #[test]
     fn portable_backup_manifest_reads_do_not_grow_with_oversized_pages() {
         use crate::persistent_store::{hash_work, WorkingSetCommit};
         let data = "x".repeat(risunest_sync_wire::MAX_METADATA_BYTES);

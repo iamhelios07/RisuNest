@@ -851,18 +851,21 @@ impl LibraryView<'_> {
         probe: &dyn CancellationProbe,
     ) -> Result<()> {
         let present: bool = row.get(2)?;
-        let character: Option<Value> = if kind == "character-additional-assets" {
-            self.db
+        let (character, archived): (Option<Value>, bool) = if kind == "character-additional-assets" {
+            match self
+                .db
                 .query_row(
-                    "SELECT detail FROM characters WHERE character_id=?1",
+                    "SELECT detail,archived_object IS NOT NULL FROM characters WHERE character_id=?1",
                     [locator],
-                    |r| r.get::<_, String>(0),
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?)),
                 )
                 .optional()?
-                .map(|v| serde_json::from_str(&v))
-                .transpose()?
+            {
+                Some((detail, archived)) => (Some(serde_json::from_str(&detail)?), archived),
+                None => (None, false),
+            }
         } else {
-            None
+            (None, false)
         };
         let owner = crate::persistent_store::AssetOwnerLocator::from_storage(kind, locator)
             .map_err(|_| Error::Invalid("invalid owner identity"))?;
@@ -873,7 +876,9 @@ impl LibraryView<'_> {
         let parent = parent
             .and_then(Value::as_object)
             .ok_or(Error::Invalid("owner parent is missing"))?;
-        if parent.contains_key(property) != present {
+        // An archived character's additional assets are listed in its archive. Its owner manifest
+        // stays, and only the manifest itself can be checked.
+        if !archived && parent.contains_key(property) != present {
             return Err(Error::Invalid("owner property presence differs"));
         }
         if !present {
@@ -891,30 +896,37 @@ impl LibraryView<'_> {
         }
         let entries = crate::asset_repository::owner_manifest_codec::decode_owner_manifest(&bytes)
             .map_err(|_| Error::Invalid("invalid owner manifest"))?;
-        let tuples = parent
-            .get(property)
-            .and_then(Value::as_array)
-            .ok_or(Error::Invalid("owner property is not an array"))?;
+        let tuples = match archived {
+            true => None,
+            false => Some(
+                parent
+                    .get(property)
+                    .and_then(Value::as_array)
+                    .ok_or(Error::Invalid("owner property is not an array"))?,
+            ),
+        };
         if entries.len()
             != usize::try_from(row.get::<_, i64>(4)?)
                 .map_err(|_| Error::Invalid("owner count overflow"))?
-            || entries.len() != tuples.len()
+            || tuples.is_some_and(|tuples| entries.len() != tuples.len())
         {
             return Err(Error::Invalid("owner entry count differs"));
         }
-        for (entry, tuple) in entries.iter().zip(tuples) {
+        for (index, entry) in entries.iter().enumerate() {
             check(probe)?;
-            let tuple = tuple
-                .as_array()
-                .ok_or(Error::Invalid("invalid owner tuple"))?;
-            if tuple.len() < 3
-                || (kind == "character-additional-assets" && tuple.len() != 3)
-                || !tuple[..3]
-                    .iter()
-                    .zip(&entry.tuple)
-                    .all(|(a, b)| a.as_str() == Some(b))
-            {
-                return Err(Error::Invalid("owner tuples differ"));
+            if let Some(tuples) = tuples {
+                let tuple = tuples[index]
+                    .as_array()
+                    .ok_or(Error::Invalid("invalid owner tuple"))?;
+                if tuple.len() < 3
+                    || (kind == "character-additional-assets" && tuple.len() != 3)
+                    || !tuple[..3]
+                        .iter()
+                        .zip(&entry.tuple)
+                        .all(|(a, b)| a.as_str() == Some(b))
+                {
+                    return Err(Error::Invalid("owner tuples differ"));
+                }
             }
             if let Some(hash) = entry.payload_hash {
                 if !self.objects.has_object(self.db, hash.as_slice())? {
