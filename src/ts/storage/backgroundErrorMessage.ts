@@ -6,10 +6,10 @@ import { language } from 'src/lang'
  */
 export function backgroundErrorMessage(error: unknown): string | Error {
     if (error instanceof Error) return error
-    let value = error
-    if (typeof value === 'string') {
-        try { value = JSON.parse(value) } catch { return value }
-        if (!value || typeof value !== 'object') return error as string
+    let value: unknown = error
+    if (typeof error === 'string') {
+        try { value = JSON.parse(error) } catch { return error }
+        if (!value || typeof value !== 'object') return error
     }
     const message = value && typeof value === 'object' ? (value as { message?: unknown }).message : undefined
     if (typeof message === 'string' && message.trim()) return message

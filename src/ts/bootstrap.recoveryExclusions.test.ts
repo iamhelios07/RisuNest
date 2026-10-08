@@ -295,7 +295,7 @@ describe('exit sync after a start that left sync off', () => {
         if (clearedDuringSession) startup.exclusions = []
         await dependencies.acquireEditFence()
         const target = await dependencies.captureTarget()
-        return { target, drain: dependencies.selectedDrain() }
+        return { target, drain: await dependencies.selectedDrain() }
     }
     beforeEach(() => {
         startup.serverPaused = true
