@@ -338,6 +338,21 @@ describe('the storage usage tab', () => {
         expect(stop()).toBeUndefined()
     })
 
+    it.each([
+        ['downloading', '40%'],
+        ['applying-local', null],
+    ])('names the restore phase %s on the running restore', async (phase, percent) => {
+        state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0' },
+            connections: [connection(10, 30)], jobs: [{ id: 'running-restore', connectionId: 'connection-1', kind: 'restore',
+                state: 'running', phase, counters: 'transferred', completedBytes: '4', totalBytes: '10', completedItems: '0', startedAtMs: '1', updatedAtMs: '1' }] })
+        state.jobStarted?.()
+        await settle()
+        const progress = target.querySelector('[data-setting-progress]')!
+        expect(progress.textContent).toContain(strings.restorePhases[phase])
+        expect(progress.querySelector('[role="progressbar"]')?.getAttribute('aria-valuenow') ?? null).toBe(percent === null ? null : '40')
+        expect(progress.textContent?.includes('%')).toBe(percent !== null)
+    })
+
     it('does not offer to stop a restore that is still running', async () => {
         state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0' },
             connections: [connection(10, 30)], jobs: [{ id: 'running-restore', connectionId: 'connection-1', kind: 'restore',

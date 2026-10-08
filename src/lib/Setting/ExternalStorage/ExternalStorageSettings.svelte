@@ -690,6 +690,17 @@
         return connectionStatusLabel(connection.status)
     }
 
+    // Restore phases after the download apply data locally, so their progress has no byte fraction.
+    const RESTORE_APPLY_PHASES = new Set(['preparing-local', 'applying-local', 'awaiting-adoption'])
+
+    function activeJobLabel(job: ExternalJobSummary): string {
+        return (job.kind === 'restore' && strings.restorePhases[job.phase]) || strings.jobActive[job.kind]
+    }
+
+    function activeJobFraction(job: ExternalJobSummary): number | null {
+        return job.kind === 'restore' && RESTORE_APPLY_PHASES.has(job.phase) ? null : externalJobProgress(job)
+    }
+
     function jobSize(job: ExternalJobSummary): string {
         const size = `${bytes(job.completedBytes)}${job.totalBytes ? ` / ${bytes(job.totalBytes)}` : ''}`
         return job.counters ? `${strings.jobCounters[job.counters]} ${size}` : size
@@ -842,8 +853,7 @@
                 {/if}
                 {#if job && externalJobIsPaused(job) && job.error?.retryAtMs}<p class="note">{strings.retryAt.replace('{0}', when(job.error.retryAtMs))}</p>{/if}
                 {#if job && externalJobIsActive(job) && !externalJobIsPaused(job)}
-                    {@const progress = externalJobProgress(job)}
-                    <SettingProgress label={strings.jobActive[job.kind]} detail={jobSize(job)} fraction={progress} />
+                    <SettingProgress label={activeJobLabel(job)} detail={jobSize(job)} fraction={activeJobFraction(job)} />
                 {/if}
 
                 {#if unlockConnection?.id === connection.id}

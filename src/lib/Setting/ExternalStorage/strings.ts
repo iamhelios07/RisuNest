@@ -129,6 +129,7 @@ const english = {
     downloadFailedKeptConnection: 'The files could not be downloaded, so the connection was kept. Try again, or disconnect without downloading.',
     jobKinds: { cleanup: 'Cleanup', backup: 'Backup', restore: 'Restore', 'pin-history': 'Keep', 'delete-history': 'Delete backup', 'check-repository': 'Check' },
     jobActive: { cleanup: 'Cleaning up', backup: 'Backing up', restore: 'Restoring', 'pin-history': 'Keeping', 'delete-history': 'Deleting backup', 'check-repository': 'Checking' },
+    restorePhases: { downloading: 'Downloading backup data', 'preparing-local': 'Preparing the restore', 'applying-local': 'Applying the restore', 'awaiting-adoption': 'Applying the restore', 'receiving-assets': 'Downloading assets' } as Record<string, string>,
     jobCounters: { prepared: 'Prepared', transferred: 'Transferred' },
     historyKinds: { snapshot: 'Sync', 'backup-point': 'Backup', conflict: 'Conflict backup', 'recovery-candidate': 'Recovery candidate' },
     endpointWarnings: {
@@ -308,6 +309,7 @@ const korean: typeof english = {
     downloadFailedKeptConnection: '파일을 다운로드하지 못해 연결을 해제하지 않았습니다. 다시 시도하거나 다운로드하지 않고 연결을 해제하세요.',
     jobKinds: { cleanup: '정리', backup: '백업', restore: '복원', 'pin-history': '보관', 'delete-history': '백업 삭제', 'check-repository': '검증' },
     jobActive: { cleanup: '정리 중', backup: '백업 중', restore: '복원 중', 'pin-history': '보관 중', 'delete-history': '백업 삭제 중', 'check-repository': '검증 중' },
+    restorePhases: { downloading: '백업 데이터 받는 중', 'preparing-local': '복원 준비 중', 'applying-local': '복원 적용 중', 'awaiting-adoption': '복원 적용 중', 'receiving-assets': '에셋 받는 중' },
     jobCounters: { prepared: '준비', transferred: '전송' },
     historyKinds: { snapshot: '동기화', 'backup-point': '백업', conflict: '충돌 백업', 'recovery-candidate': '복구 후보' },
     endpointWarnings: {
