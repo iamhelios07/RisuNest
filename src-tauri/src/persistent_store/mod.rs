@@ -1169,7 +1169,7 @@ impl StatusLibraryRoots {
     fn take(&self, database_path: &Path) -> Option<(i64, Option<AssetGcLibraryRoots>)> {
         let mut state = self.lock();
         if state.observer.is_none() {
-            state.observer = Connection::open(database_path).ok();
+            state.observer = Self::open_observer(database_path).ok();
         }
         let data_version = state.observer.as_ref()?
             .query_row("PRAGMA data_version", [], |row| row.get(0))
@@ -1179,6 +1179,20 @@ impl StatusLibraryRoots {
 
     fn put(&self, roots: Option<AssetGcLibraryRoots>) {
         self.lock().roots = roots;
+    }
+
+    /// Opens the library as the revision readers do, never creating it.
+    fn open_observer(database_path: &Path) -> StoreResult<Connection> {
+        let open = |flags| -> StoreResult<Connection> {
+            let connection = Connection::open_with_flags(database_path, flags)?;
+            connection.execute_batch("PRAGMA query_only = ON;")?;
+            Ok(connection)
+        };
+        let preferred = snapshot::revision_reader_open_flags_for_target(cfg!(target_os = "android"));
+        if cfg!(target_os = "android") {
+            return open(preferred);
+        }
+        open(preferred).or_else(|_| open(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX))
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, StatusLibraryRootsState> {

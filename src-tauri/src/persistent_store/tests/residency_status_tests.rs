@@ -90,3 +90,12 @@ fn a_residency_status_inside_a_transaction_reads_its_uncommitted_writes() {
     assert_eq!(status(&store), before);
     assert_eq!(library_collections(), 2);
 }
+
+/// The connection that watches the library for commits never creates one.
+#[test]
+fn the_status_cache_watches_nothing_when_the_library_is_absent() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("absent.sqlite");
+    assert!(super::super::StatusLibraryRoots::default().take(&path).is_none());
+    assert!(!path.exists());
+}
