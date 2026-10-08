@@ -470,14 +470,17 @@ impl PersistentStore {
         connections: &mut Connections,
         hashes: &[String],
     ) -> Result<Vec<Holder>> {
+        let sizes = match residency {
+            Some(residency) => residency.active_sizes(hashes)?,
+            None => vec![None; hashes.len()],
+        };
         let mut server = Vec::with_capacity(hashes.len());
         let mut external = Vec::new();
-        for hash in hashes {
-            let object = residency.map(|residency| residency.object(hash, None)).transpose()?.flatten();
-            if object.is_none() {
+        for (hash, size) in hashes.iter().zip(sizes) {
+            if size.is_none() {
                 external.push(hash.as_str());
             }
-            server.push(object.map(|object| Holder::Server(object.size)));
+            server.push(size.map(Holder::Server));
         }
         let mut registered = remote
             .holders(&external)
