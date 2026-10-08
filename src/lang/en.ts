@@ -2190,7 +2190,6 @@ export const languageEnglish = {
             registrationCode: 'Registration code',
             readRegistration: 'Read code',
             scanRegistration: 'Scan QR code',
-            cancelScan: 'Cancel scanning',
             registrationInvalid: 'The registration code is invalid.',
             cameraDenied:
                 'Camera access was not allowed. Try again or paste the code.',
@@ -2290,6 +2289,10 @@ export const languageEnglish = {
             errorHelp:
                 'Sync could not finish. Your edits on this device are unchanged. Try again.',
             "connectRowHelpScan": 'Paste the registration code from the server or scan its QR code. Each device needs its own registration code.',
+        },
+        qrScan: {
+            instruction: 'Fit the QR code inside the square.',
+            instructionOnboarding: 'Fit the QR code inside the square.',
         },
         menuTitle: 'RisuNest',
         tabList: 'RisuNest settings tabs',

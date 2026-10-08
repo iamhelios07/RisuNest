@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mount, tick, unmount } from 'svelte'
 import { languageEnglish } from 'src/lang/en'
-const f = vi.hoisted(() => ({ pending: vi.fn(async (): Promise<number | undefined> => undefined), connect: vi.fn(), complete: vi.fn(), configure: vi.fn(), bind: vi.fn(), disconnect: vi.fn(), hold: vi.fn(), release: vi.fn(), status: vi.fn(), policy: vi.fn(), cancel: vi.fn(), checkbox: vi.fn(), action: vi.fn(), native: true, scan: false, os: 'windows', listeners: new Set<(value: Record<string, unknown>) => void>(), bindingState: vi.fn(), preset: vi.fn(), state: { db: {} as Record<string, unknown> }, view: { status: { configured: false }, paused: false } as Record<string, unknown> }))
+const f = vi.hoisted(() => ({ pending: vi.fn(async (): Promise<number | undefined> => undefined), connect: vi.fn(), complete: vi.fn(), configure: vi.fn(), bind: vi.fn(), disconnect: vi.fn(), hold: vi.fn(), release: vi.fn(), status: vi.fn(), policy: vi.fn(), cancel: vi.fn(), checkbox: vi.fn(), action: vi.fn(), native: true, scan: false, scanner: { scan: vi.fn(), cancel: vi.fn() }, os: 'windows', listeners: new Set<(value: Record<string, unknown>) => void>(), bindingState: vi.fn(), preset: vi.fn(), state: { db: {} as Record<string, unknown> }, view: { status: { configured: false }, paused: false } as Record<string, unknown> }))
 vi.mock('src/lang', async () => ({ language: (await import('src/lang/en')).languageEnglish, changeLanguage: vi.fn() }))
 vi.mock('src/ts/platform', () => ({ get isTauri() { return f.native } }))
 vi.mock('@tauri-apps/plugin-os', () => ({ platform: () => f.os }))
@@ -15,7 +15,7 @@ vi.mock('src/ts/storage/sync/serverSyncProduction', () => ({
 vi.mock('src/ts/storage/sync/serverAssetResidency', () => ({ getAssetResidencyStatus: f.status, setAssetResidencyPolicy: f.policy, evictLocalAssets: vi.fn(), cancelAssetResidencyOperation: f.cancel }))
 vi.mock('src/ts/storage/sync/serverSyncRegistration', () => ({ parseServerRegistration: () => ({ endpoint: 'https://synthetic.invalid', libraryId: 'library', deviceId: 'registration', token: 'synthetic' }) }))
 vi.mock('src/ts/storage/sync/serverSyncRegistrationInbox', () => ({ serverRegistrationInbox: { changed: { subscribe: () => () => {} }, releaseConsumed: vi.fn() } }))
-vi.mock('src/ts/storage/sync/serverSyncQr', () => ({ get canScanServerRegistration() { return f.scan }, createServerQrScanner: () => ({ cancel: vi.fn() }) }))
+vi.mock('src/ts/storage/sync/serverSyncQr', () => ({ get canScanServerRegistration() { return f.scan }, createServerQrScanner: () => f.scanner }))
 vi.mock('src/ts/storage/sync/bindingRegistry', () => ({ bindSyncTarget: f.bind }))
 vi.mock('src/ts/storage/sync/bindingNative', () => ({ createNativeSyncBindingBridge: () => ({ state: f.bindingState }) }))
 vi.mock('src/ts/storage/sync/nativeOfficialAccountOperations', () => ({ restoreNativeOfficialAccountBackup: vi.fn() }))
@@ -37,6 +37,7 @@ vi.mock('src/lib/Setting/ExternalStorage/ConnectionForm.svelte', () => ({ defaul
 vi.mock('src/lib/Others/Onboarding/onboardingWeave', () => ({ observeOnboardingWeave: () => () => {} }))
 vi.mock('src/ts/stores.svelte', () => ({ DBState: f.state }))
 import ServerSyncSettings from './ServerSyncSettings.svelte'
+import { QrScanError } from 'src/ts/ui/qrScanner'
 import Onboarding from 'src/lib/Others/Onboarding/Onboarding.svelte'
 let component: ReturnType<typeof mount> | undefined
 let host: HTMLDivElement
@@ -143,6 +144,58 @@ it.each([false, true])('mentions the QR code in the connection help only where i
     await settle()
     expect(host.textContent).toContain(scan ? languageEnglish.risuNest.serverSync.connectRowHelpScan : languageEnglish.risuNest.serverSync.connectRowHelp)
     expect(host.textContent?.includes('QR')).toBe(scan)
+})
+describe('scanning a registration QR code', () => {
+    const sync = languageEnglish.risuNest.serverSync
+    beforeEach(() => { f.scan = true })
+    it('scans in the settings wording, and the scanned registration is reviewed before connecting', async () => {
+        f.scanner.scan.mockResolvedValue({ endpoint: 'https://scanned.invalid', libraryId: 'scanned-library', deviceId: 'device', token: 'synthetic' })
+        component = mount(ServerSyncSettings, { target: host, props: { connectTarget: vi.fn() } })
+        await settle()
+        click(sync.scanRegistration)
+        await settle()
+        expect(f.scanner.scan).toHaveBeenCalledExactlyOnceWith('settings')
+        expect(host.textContent).toContain(sync.reviewTitle)
+        expect(host.textContent).toContain('https://scanned.invalid')
+        expect(host.querySelector('[role="alert"]')).toBeNull()
+    })
+    it('marks the scan button busy while the camera runs and offers no second cancel below the camera screen', async () => {
+        f.scanner.scan.mockReturnValue(new Promise(() => {}))
+        component = mount(ServerSyncSettings, { target: host, props: { connectTarget: vi.fn() } })
+        await settle()
+        click(sync.scanRegistration)
+        await settle()
+        const buttons = [...host.querySelectorAll('button')]
+        expect(buttons).toHaveLength(2)
+        expect(buttons[1].textContent).toContain(sync.scanRegistration)
+        expect(buttons[1].getAttribute('aria-busy')).toBe('true')
+        expect(host.textContent).not.toContain(languageEnglish.cancel)
+    })
+    it('returns quietly from a cancelled scan and explains a failed one', async () => {
+        f.scanner.scan.mockRejectedValueOnce(new QrScanError('qr-scan-cancelled')).mockRejectedValueOnce(new QrScanError('qr-scan-timeout'))
+        component = mount(ServerSyncSettings, { target: host, props: { connectTarget: vi.fn() } })
+        await settle()
+        click(sync.scanRegistration)
+        await settle()
+        expect(host.querySelector('[role="alert"]')).toBeNull()
+        expect(findButton(sync.scanRegistration)?.disabled).toBe(false)
+        click(sync.scanRegistration)
+        await settle()
+        expect(host.querySelector('[role="alert"]')?.textContent).toBe(sync.cameraUnavailable)
+    })
+    it('ends a running scan when the screen closes', async () => {
+        component = mount(ServerSyncSettings, { target: host, props: { connectTarget: vi.fn() } })
+        await settle()
+        await unmount(component); component = undefined
+        expect(f.scanner.cancel).toHaveBeenCalledOnce()
+    })
+    it('scans in the onboarding wording from the onboarding screen', async () => {
+        f.scanner.scan.mockReturnValue(new Promise(() => {}))
+        await openOnboardingServer()
+        click(sync.scanRegistration)
+        await settle()
+        expect(f.scanner.scan).toHaveBeenCalledExactlyOnceWith('onboarding')
+    })
 })
 it('keeps settings on the existing production action by default', async () => {
     component = mount(ServerSyncSettings, { target: host })

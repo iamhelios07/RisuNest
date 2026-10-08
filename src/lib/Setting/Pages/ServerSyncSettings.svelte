@@ -9,6 +9,7 @@
     import { parseServerRegistration } from 'src/ts/storage/sync/serverSyncRegistration'
     import { serverRegistrationInbox } from 'src/ts/storage/sync/serverSyncRegistrationInbox'
     import { canScanServerRegistration, createServerQrScanner } from 'src/ts/storage/sync/serverSyncQr'
+    import { isQrScanCancelled } from 'src/ts/ui/qrScanner'
     import { getAssetResidencyStatus, setAssetResidencyPolicy, evictLocalAssets, cancelAssetResidencyOperation, type AssetResidencyPolicy, type AssetResidencyStatus } from 'src/ts/storage/sync/serverAssetResidency'
     import { describeBlockedReason } from 'src/ts/storage/sync/blockedReasonText'
     import type { ServerConfig } from 'src/ts/storage/sync/serverSync'
@@ -104,7 +105,7 @@
         try { await operation(); await refresh() } catch (error) { failure ||= message(error) } finally { busy = false }
     }
     function readCode() { try { candidate = parseServerRegistration(code); code = ''; failure = '' } catch { failure = copy.registrationInvalid } }
-    async function scan() { scanning = true; try { candidate = await scanner.scan(() => {}); failure = '' } catch (error) { failure = message(error) } finally { scanning = false } }
+    async function scan() { scanning = true; try { candidate = await scanner.scan(tone); failure = '' } catch (error) { if (!isQrScanCancelled(error)) failure = message(error) } finally { scanning = false } }
     // A device that is not connected chooses its asset storage with the connection; a connected one keeps its group.
     async function connect(newDevice = false) {
         if (!candidate) return
@@ -242,7 +243,6 @@
                     {#if canScanServerRegistration}
                         <SettingButton variant="secondary" onclick={() => void scan()} busy={scanning} disabled={busy}>{copy.scanRegistration}</SettingButton>
                     {/if}
-                    {#if scanning}<SettingButton variant="secondary" onclick={() => scanner.cancel()}>{copy.cancelScan}</SettingButton>{/if}
                 </div>
             {/if}
             {#if !view.status.bound}{@render alert()}{/if}

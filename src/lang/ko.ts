@@ -2006,7 +2006,6 @@ export const languageKorean = {
             registrationCode: '등록 코드',
             readRegistration: '코드 읽기',
             scanRegistration: 'QR 코드 스캔',
-            cancelScan: '스캔 취소',
             registrationInvalid: '올바른 등록 코드가 아닙니다.',
             cameraDenied:
                 '카메라 권한이 허용되지 않았습니다. 다시 시도하거나 코드를 붙여넣으세요.',
@@ -2105,6 +2104,10 @@ export const languageKorean = {
             errorHelp:
                 '동기화를 마치지 못했습니다. 이 기기에서 고친 내용은 그대로 있습니다. 다시 시도하세요.',
             "connectRowHelpScan": '서버에서 만든 등록 코드를 붙여넣거나 QR 코드를 스캔하세요. 기기마다 별도의 등록 코드가 필요합니다.',
+        },
+        qrScan: {
+            instruction: 'QR 코드를 사각형 안에 맞추세요.',
+            instructionOnboarding: 'QR 코드를 사각형 안에 맞춰주세요.',
         },
         menuTitle: 'RisuNest',
         tabList: 'RisuNest 설정 탭',
