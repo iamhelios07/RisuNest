@@ -479,7 +479,15 @@ async function reportUnsupportedPlugins(plugins: readonly RisuPlugin[]): Promise
     else alertError(message)
 }
 
+let pluginsOffForThisStart = false
+
+/** Startup left plugins off, so nothing loads them until the app starts again. */
+export function keepPluginsOffForThisStart() {
+    pluginsOffForThisStart = true
+}
+
 export async function loadPlugins() {
+    if (pluginsOffForThisStart) return
     console.log('Loading plugins...')
     let db = getDatabase()
 
