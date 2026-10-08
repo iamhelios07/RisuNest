@@ -112,7 +112,7 @@
         const kept = residency?.policy
         await connectTarget(candidate, newDevice, choice)
         candidate = undefined; codeOpen = false
-        // Connecting never downloads every asset itself, so a device that kept them on the server downloads them now.
+        // Connecting applies only a remote choice, so a device that kept assets on the server and chose full downloads them here.
         if (choice === 'full' && kept === 'remote' && connected) await downloadHeld()
     }
     async function downloadAll() { downloading = true; try { await controller.track('assets', () => setAssetResidencyPolicy('full')) } finally { downloading = false } }
