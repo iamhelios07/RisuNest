@@ -1914,6 +1914,7 @@ export const languageEnglish = {
     skipSavingAssetsOnWebSync: "Skip Saving Assets on Web Sync",
     applyAdditionalParamsToAll: "Apply Additional Parameters to All Models",
     risuNest: {
+        backgroundDataFailed: 'Some changes to the data could not be completed.',
         localSaveFailure: {
             failed: 'Changes could not be saved. Retry saving before closing the app.',
             invalid: '{0} could not be saved. Check this data, then retry saving.',

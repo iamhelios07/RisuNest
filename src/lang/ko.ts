@@ -1730,6 +1730,7 @@ export const languageKorean = {
     nanoGPTManualInput: "수동 입력",
     nanoGPTManualModelSelect: "수동 모델 선택",
     risuNest: {
+        backgroundDataFailed: '일부 데이터 변경을 완료하지 못했습니다.',
         localSaveFailure: {
             failed: '변경 사항을 저장하지 못했습니다. 앱을 종료하기 전에 저장을 다시 시도해주세요.',
             invalid: '{0} 데이터를 저장하지 못했습니다. 해당 데이터를 확인한 후 저장을 다시 시도해주세요.',
