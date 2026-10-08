@@ -606,6 +606,22 @@ export async function loadData() {
             } catch (error) {
                 console.error('External storage scheduler failed to start', error)
             }
+        } else if (isTauri) {
+            // Sync stays stopped, but its settings can still turn a sync target on or off.
+            await transition('drive-sync', language.risuNest.startup.account)
+            try {
+                await installServerSyncProduction({ resumeBound: false })
+            } catch (error) {
+                console.error('Server sync transport failed to register', error)
+            }
+            try {
+                const { installExternalSyncTransports } = await import(
+                    './storage/sync/external/production'
+                )
+                await installExternalSyncTransports()
+            } catch (error) {
+                console.error('External sync transports failed to register', error)
+            }
         }
         let heldExitRevision: number | undefined
         let heldExitFence: RetainableReplacementFence | undefined

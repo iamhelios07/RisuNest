@@ -5,7 +5,7 @@ const startup = vi.hoisted(() => ({
     native: true, exclusions: [] as string[], database: {} as any, reachUi: false,
     takeRendererRecovery: vi.fn(async () => false),
     credential: { id: 'synthetic-account', token: 'synthetic-token' },
-    readVault: vi.fn(), reconcile: vi.fn(), external: vi.fn(), stages: vi.fn(),
+    readVault: vi.fn(), reconcile: vi.fn(), external: vi.fn(), transports: vi.fn(), stages: vi.fn(),
     stop: new Error('synthetic bootstrap test reached UI'),
     markers: { getItem: vi.fn(() => null), setItem: vi.fn(), removeItem: vi.fn(), flush: vi.fn(async () => {}) },
 }))
@@ -158,7 +158,9 @@ vi.mock('./storage/bootAttempt', () => ({ markBootStage: startup.stages, markBoo
 vi.mock('./ui/yieldToUi', () => ({ yieldToUi: async () => {} }))
 vi.mock('./nativeLocalUrls', () => ({ initializeNativeLocalUrls: vi.fn() }))
 vi.mock('./iosNative', () => ({ initializeIOSNative: vi.fn(), installIOSPersistenceLifecycle: vi.fn() }))
-vi.mock('./storage/sync/external/production', () => ({ installExternalStorageProduction: startup.external }))
+vi.mock('./storage/sync/external/production', () => ({
+    installExternalStorageProduction: startup.external, installExternalSyncTransports: startup.transports,
+}))
 vi.mock('./storage/syncExitCoordinator', () => ({ createSyncExitCoordinator: vi.fn(() => ({})) }))
 vi.mock('./storage/syncExitProduction', () => ({ configureSyncExitCoordinator: vi.fn(), registerWindowCloseDrain: vi.fn() }))
 vi.mock('./storage/sync/serverSyncProduction', () => ({
@@ -202,18 +204,35 @@ describe('bootstrap recovery exclusions', () => {
         expect(initializeOfficialAccountBootstrap).not.toHaveBeenCalled()
         expect(loadRisuAccountData).not.toHaveBeenCalled()
         expect(startup.reconcile).not.toHaveBeenCalled()
-        expect(installServerSyncProduction).not.toHaveBeenCalled()
         expect(startup.external).not.toHaveBeenCalled()
         expect(startup.stages.mock.calls.flat()).not.toContain('account-bootstrap')
-        expect(startup.stages.mock.calls.flat()).not.toContain('drive-sync')
         expect(startup.stages.mock.calls.flat()).not.toContain('service-worker')
         if (native) {
             expect(initializeNativeSyncBindings).toHaveBeenCalledOnce()
+            // The sync switches in settings need the transports even while sync stays stopped.
+            expect(installServerSyncProduction).toHaveBeenCalledExactlyOnceWith({ resumeBound: false })
+            expect(startup.transports).toHaveBeenCalledOnce()
+            expect(startup.stages.mock.calls.flat()).toContain('drive-sync')
             expect(startup.readVault).toHaveBeenCalledOnce()
             expect(startup.database.account).toBe(startup.credential)
         } else {
             expect(initializeNativeSyncBindings).not.toHaveBeenCalled()
+            expect(installServerSyncProduction).not.toHaveBeenCalled()
+            expect(startup.transports).not.toHaveBeenCalled()
+            expect(startup.stages.mock.calls.flat()).not.toContain('drive-sync')
         }
+    })
+
+    it('reaches UI when registering the sync transports fails while sync is left off', async () => {
+        startup.native = true
+        startup.exclusions = ['sync']
+        vi.mocked(installServerSyncProduction).mockRejectedValueOnce(new Error('synthetic transport failure'))
+        await loadData()
+        expect(bootFailure.set).toHaveBeenLastCalledWith(expect.objectContaining({
+            stage: 'ui-state', message: startup.stop.message,
+        }))
+        expect(startup.external).not.toHaveBeenCalled()
+        expect(startup.transports).toHaveBeenCalledOnce()
     })
 
     it.each([true, false])('runs account and sync startup work when enabled (native=%s)', async (native) => {
@@ -230,6 +249,7 @@ describe('bootstrap recovery exclusions', () => {
             expect(installServerSyncProduction).toHaveBeenCalledOnce()
             expect(startup.reconcile).toHaveBeenCalledOnce()
             expect(startup.external).toHaveBeenCalledOnce()
+            expect(startup.transports).not.toHaveBeenCalled()
             expect(startup.stages.mock.calls.flat()).toContain('drive-sync')
         } else {
             expect(initializeNativeSyncBindings).not.toHaveBeenCalled()
