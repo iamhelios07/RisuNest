@@ -2209,7 +2209,7 @@ export const languageEnglish = {
             residency: {
                 title: 'Asset storage',
                 description:
-                    'Keeping all assets on this device loads them faster but increases sync time and storage use. Loading assets from the server saves space. Each character’s current main image is kept on this device, except for characters in the trash.',
+                    'Keeping all assets on this device loads them faster but increases sync time and storage use. Loading them from the server when needed saves space, and the current character icon of each character not in the trash stays on this device.',
                 full: 'Keep everything on this device',
                 remote: 'Load from the server when needed',
                 local: 'Files on this device',
@@ -2218,7 +2218,7 @@ export const languageEnglish = {
                 unavailable: 'Files not found',
                 checking: 'Checking files…',
                 cleanupNote:
-                    'Cleanup removes this device’s copies of files that are on the server, excluding the current main images of characters outside the trash.',
+                    'Cleanup removes this device’s copies of files that are on the server, except the current character icons of characters not in the trash.',
                 clean: 'Clear copies on this device',
                 cancel: 'Cancel',
                 working:
