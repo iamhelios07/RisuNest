@@ -2893,9 +2893,9 @@ export const languageEnglish = {
             },
             hub: {
                 title: 'Connect to a sync server',
-                lead: 'Create a registration code for this device under Device management on the sync server and paste it below.',
+                lead: 'Register this device on the sync server, then paste its registration code below.',
                 leadScan:
-                    'Create a registration code for this device under Device management on the sync server, then scan its QR code or paste it below.',
+                    'Register this device on the sync server, then scan its QR code or paste its registration code below.',
             },
             external: {
                 title: 'Connect external storage',
