@@ -33,7 +33,7 @@ pub(crate) struct NewDeviceReplacement {
     authorization_id: String,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn pds_lww_replace_target_as_new_device(
     state: State<'_, PersistentStoreState>,
     request: NewDeviceReplacement,

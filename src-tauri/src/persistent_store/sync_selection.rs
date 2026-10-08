@@ -748,11 +748,11 @@ fn validate_binding_inspection_stages(store: &super::PersistentStore, inspection
 pub(crate) fn pds_lww_binding_state(state: tauri::State<'_, super::commands::PersistentStoreState>) -> StoreResult<BindingState> {
     logged("pds_lww_binding_state", super::commands::with_store_mut(state, |store| { store.lww_recover_intents()?; store.lww_binding_state() }))
 }
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn pds_lww_switch_target(state: tauri::State<'_, super::commands::PersistentStoreState>, request: SwitchBindingRequest) -> StoreResult<BindingState> {
     logged("pds_lww_switch_target", super::commands::with_store_mut(state, |store| store.switch_lww_binding(&request)))
 }
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn pds_lww_replace_from_target(state: tauri::State<'_, super::commands::PersistentStoreState>, request: ReplaceBindingRequest) -> StoreResult<super::RevisionResult> {
     logged("pds_lww_replace_from_target", super::commands::with_store_mut(state, |store| store.replace_lww_binding(&request)))
 }
