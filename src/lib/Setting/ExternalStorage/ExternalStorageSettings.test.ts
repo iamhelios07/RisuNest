@@ -272,6 +272,22 @@ describe('the storage usage tab', () => {
         } finally { vi.useRealTimers() }
     })
 
+    it('shows no time left while the items a preparation counts predict far more than its bytes', async () => {
+        vi.useFakeTimers()
+        try {
+            let completed = 0
+            let items = 0
+            state.getState.mockImplementation(async () => ({ supported: true, selection: { kind: 'none', selectionEpoch: '0' }, connections: [connection(10, 30)],
+                jobs: [{ id: 'job', connectionId: 'connection-1', kind: 'backup', state: 'running', phase: 'prepare', counters: 'prepared',
+                    completedBytes: String(completed), totalBytes: '1000000', completedItems: String(items), totalItems: '1000', startedAtMs: '1', updatedAtMs: '1' }] }))
+            state.jobStarted?.()
+            await settle()
+            // A quarter of the bytes in six seconds, but only 1% of the items.
+            for (let index = 0; index < 5; index += 1) { completed += 50_000; items += 2; await vi.advanceTimersByTimeAsync(1_200); await settle() }
+            expect([...target.querySelectorAll('dt')].some(term => term.textContent === strings.remaining)).toBe(false)
+        } finally { vi.useRealTimers() }
+    })
+
     it('shows no time left for a backup upload, whose total grows with each pack', async () => {
         vi.useFakeTimers()
         try {
@@ -841,10 +857,15 @@ describe('a running job', () => {
 
     it('says whether the counted bytes are prepared or sent', async () => {
         expect(await show('prepared')).toContain(`${strings.jobCounters.prepared} 400 B / 800 B`)
+        expect(target.querySelector('[role="progressbar"]')?.getAttribute('aria-valuenow')).toBe('50')
         if (component) unmount(component)
         component = undefined
         target.remove()
-        expect(await show('transferred')).toContain(`${strings.jobCounters.transferred} 400 B / 800 B`)
+        // A backup's upload total grows with each pack it seals, so the upload shows no total or share.
+        const sent = await show('transferred')
+        expect(sent).toContain(`${strings.jobCounters.transferred} 400 B`)
+        expect(sent).not.toContain('800 B')
+        expect(target.querySelector('[role="progressbar"]')?.getAttribute('aria-valuenow') ?? null).toBeNull()
     })
 
     it('leaves a job that counts neither unlabelled', async () => {

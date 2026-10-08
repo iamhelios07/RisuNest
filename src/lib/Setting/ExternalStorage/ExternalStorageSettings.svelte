@@ -199,14 +199,13 @@
         const next: Record<string, number> = {}
         for (const connection of state.connections) {
             const job = state.jobs.find(item => item.connectionId === connection.id)
-            // Only a running phase measured in bytes has a time left. A backup's upload total
-            // grows with each sealed pack, so its first pack alone would predict too little.
+            // Only a running phase measured in bytes against a fixed total has a time left.
             const phase = job && externalJobIsActive(job) && !externalJobIsPaused(job) && activeJobFraction(job) !== null
-                && !(job.kind === 'backup' && job.counters === 'transferred')
                 ? `${job.id}:${job.phase}:${job.counters ?? ''}` : undefined
+            const items = { done: Number(job?.completedItems), total: Number(job?.totalItems) }
             let estimator = remainingEstimators.get(connection.id)
             if (!estimator) remainingEstimators.set(connection.id, estimator = createRemainingTimeEstimator())
-            const left = estimator.update(phase, Number(job?.completedBytes ?? 0), Number(job?.totalBytes ?? 0), at)
+            const left = estimator.update(phase, Number(job?.completedBytes ?? 0), Number(job?.totalBytes ?? 0), at, Number.isFinite(items.done) && items.total > 0 ? items : undefined)
             if (left !== undefined) next[connection.id] = left
         }
         remaining = next
@@ -720,12 +719,15 @@
         return (job.kind === 'restore' && strings.restorePhases[job.phase]) || strings.jobActive[job.kind]
     }
 
+    // A backup registers each pack as it seals it, so its upload has no total until it ends.
+    const uploadTotalGrows = (job: ExternalJobSummary) => job.kind === 'backup' && job.counters === 'transferred' && externalJobIsActive(job)
+
     function activeJobFraction(job: ExternalJobSummary): number | null {
-        return job.kind === 'restore' && RESTORE_APPLY_PHASES.has(job.phase) ? null : externalJobProgress(job)
+        return (job.kind === 'restore' && RESTORE_APPLY_PHASES.has(job.phase)) || uploadTotalGrows(job) ? null : externalJobProgress(job)
     }
 
     function jobSize(job: ExternalJobSummary): string {
-        const size = `${bytes(job.completedBytes)}${job.totalBytes ? ` / ${bytes(job.totalBytes)}` : ''}`
+        const size = `${bytes(job.completedBytes)}${job.totalBytes && !uploadTotalGrows(job) ? ` / ${bytes(job.totalBytes)}` : ''}`
         return job.counters ? `${strings.jobCounters[job.counters]} ${size}` : size
     }
 
