@@ -4,6 +4,7 @@ import { isTauri } from "src/ts/platform"
 import { getDatabase, type Message, type MessageGenerationInfo } from "./storage/database.svelte"
 import { alertStore as alertStoreImported } from "./stores.svelte"
 import { getDeviceMarkers } from "./storage/deviceMarkers"
+import { isInternalSaveFailure, localSaveFailureMessage } from "./storage/localSaveFailureMessage"
 
 export interface alertData{
     type: 'error'|'normal'|'none'|'ask'|'wait'|'selectChar'
@@ -36,6 +37,10 @@ export const alertStore = {
 
 export function alertError(msg: string | Error) {
     console.error(msg)
+    if (isInternalSaveFailure(msg)) {
+        alertStoreImported.set({ 'type': 'error', 'msg': localSaveFailureMessage(msg) })
+        return
+    }
     const db = getDatabase()
 
     let stackTrace: string | undefined = undefined; 
