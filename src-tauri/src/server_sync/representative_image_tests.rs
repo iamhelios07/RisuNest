@@ -238,3 +238,40 @@ fn offload_rechecks_a_representative_changed_while_server_retention_was_in_fligh
     assert!(cas.stat_object(old.object_hash.as_ref().unwrap()).unwrap().is_none());
     assert!(cas.stat_object(new.object_hash.as_ref().unwrap()).unwrap().is_some());
 }
+
+#[test]
+fn a_device_joining_with_remote_assets_fetches_received_representatives_and_follows_their_changes() {
+    let server = LocalServerFixture::new();
+    let (_source_root, mut source) = local();
+    let (target_root, mut target) = local();
+    let sender = server.client(&source);
+    let main = put_asset(&mut source, "assets/joined-main.png", b"synthetic joined representative");
+    let emotion = put_asset(&mut source, "assets/joined-emotion.png", b"synthetic joined emotion");
+    let next = put_asset(&mut source, "assets/joined-next.png", b"synthetic joined replacement");
+    let mut joined = character("joined", &main.key);
+    joined["emotionImages"] = json!([["neutral", emotion.key]]);
+    add(&mut source, joined.clone());
+    drain_publications(&sender, &mut source, &[]).unwrap();
+    server.prepare_binding_candidate(&target);
+    let counters = Arc::new(super::client::TestIoCounters::default());
+    super::binding::first_binding_cycle(&mut target, counters.clone(), |_| {}).unwrap();
+    target.asset_residency_set_policy(AssetPolicy::Remote, || Ok(())).unwrap();
+    let cas = PayloadCas::new(target_root.path()).unwrap();
+    let held = |alias: &crate::persistent_store::AssetAlias| cas.stat_object(alias.object_hash.as_ref().unwrap()).unwrap().is_some();
+    assert!(!held(&main) && !held(&emotion) && !held(&next), "joining leaves every body on the server");
+    hydrate(&target).unwrap();
+    assert!(held(&main));
+    assert!(!held(&emotion) && !held(&next));
+
+    joined["image"] = json!(next.key);
+    replace(&mut source, joined);
+    drain_publications(&sender, &mut source, &[]).unwrap();
+    let receiver = LocalServerFixture::reopen_client(&target, counters).unwrap();
+    super::lww_tests::receive_available(&receiver, &mut target, &[]).unwrap();
+    hydrate(&target).unwrap();
+    assert!(held(&next), "a received image change is fetched");
+    target.asset_residency_evict(|| Ok(())).unwrap();
+    assert!(held(&next));
+    assert!(!held(&main), "cleanup no longer keeps the replaced image");
+    assert!(!held(&emotion));
+}
