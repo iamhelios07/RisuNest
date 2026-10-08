@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { SandboxHost } from './factory'
 import { collectPluginReadProvenance, PluginReadBaselines } from '../pluginReadBaselines'
+import type { fetchNative, GlobalFetchArgs } from '../../globalApi.svelte'
 
 /**
  * The guest reports when its top level script has settled. A window the host
@@ -97,11 +98,15 @@ describe('sandbox script completion', () => {
         host.terminate()
     })
 
-    it.each(['nativeFetch', 'risuFetch'])('aborts an admitted %s with and without a caller signal', async (method) => {
+    // Each method reads the signal field of the host function it reaches.
+    it.each([
+        ['nativeFetch', 'signal' satisfies keyof Parameters<typeof fetchNative>[1]],
+        ['risuFetch', 'abortSignal' satisfies keyof GlobalFetchArgs],
+    ] as const)('aborts an admitted %s with and without a caller signal', async (method, field) => {
         for (const callerSignal of [false, true]) {
             let signal: AbortSignal | undefined
             const fetcher = vi.fn((_url, options) => new Promise(resolve => {
-                signal = options.signal
+                signal = options[field]
                 signal!.addEventListener('abort', () => resolve(null), { once: true })
             }))
             const host = new SandboxHost({ ...bridgeStubs(), [method]: fetcher })
@@ -111,7 +116,7 @@ describe('sandbox script completion', () => {
             window.dispatchEvent(new MessageEvent('message', {
                 source: frame.contentWindow,
                 data: {type:'CALL_ROOT', method, reqId:'synthetic-fetch', args:['https://synthetic.invalid', callerSignal
-                    ? {signal:{__type:'ABORT_SIGNAL_REF', abortId:'caller', aborted:false}} : {}]},
+                    ? {[field]:{__type:'ABORT_SIGNAL_REF', abortId:'caller', aborted:false}} : {}]},
             }))
             await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce())
             expect(signal?.aborted).toBe(false)

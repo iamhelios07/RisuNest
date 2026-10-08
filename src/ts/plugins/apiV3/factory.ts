@@ -594,6 +594,9 @@ await (async function() {
 })();
 `;
 
+// risuFetch takes GlobalFetchArgs, which names its signal abortSignal.
+const requestSignalKeys = new Map([['nativeFetch', 'signal'], ['risuFetch', 'abortSignal']]);
+
 export class SandboxHost {
     private iframe: HTMLIFrameElement;
     private apiFactory: any;
@@ -1122,12 +1125,13 @@ export class SandboxHost {
                 try {
 
                     const args = this.deserializeArgs(data.args || [], usedAbortIds);
-                    if (data.type === 'CALL_ROOT' && ['nativeFetch', 'risuFetch'].includes(String(data.method)) && !args[1]?.signal) {
+                    const signalKey = data.type === 'CALL_ROOT' ? requestSignalKeys.get(String(data.method)) : undefined;
+                    if (signalKey && !args[1]?.[signalKey]) {
                         const id = crypto.randomUUID();
                         const controller = new AbortController();
                         this.abortControllers.set(id, controller);
                         usedAbortIds.push(id);
-                        args[1] = { ...args[1], signal: controller.signal };
+                        args[1] = { ...args[1], [signalKey]: controller.signal };
                     }
                     if (Array.isArray(data.argProvenance)) {
                         args.forEach((arg, index) => attachPluginReadProvenance(arg, data.argProvenance![index] ?? []));
