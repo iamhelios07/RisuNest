@@ -210,6 +210,11 @@ pub(crate) async fn server_sync_asset_status(
 ) -> Result<crate::persistent_store::asset_residency::ResidencyStatus> {
     logged_blocking("asset-status", move || job_store(&app)?.asset_residency_status_for_target(target.as_ref())).await
 }
+/// How many files only one external storage connection holds, as the status counts them.
+#[tauri::command]
+pub(crate) async fn asset_residency_connection_objects(app: AppHandle, connection_id: String) -> Result<u64> {
+    logged_blocking("asset-status", move || job_store(&app)?.asset_residency_connection_objects(&connection_id)).await
+}
 #[tauri::command]
 pub(crate) async fn server_sync_asset_policy(
     app: AppHandle,

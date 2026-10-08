@@ -43,7 +43,7 @@
         ExternalSnapshotExportProgress,
     } from 'src/ts/storage/sync/external/types'
     import { externalRestoreAreas } from 'src/ts/storage/sync/external/restoreScope'
-    import { downloadRemoteAssets, getAssetResidencyStatus } from 'src/ts/storage/sync/serverAssetResidency'
+    import { countConnectionOnlyAssets, downloadRemoteAssets } from 'src/ts/storage/sync/serverAssetResidency'
     import { formatRisuNestStorageBytes } from 'src/ts/storage/risuNestStorageDashboard'
     import { createRemainingTimeEstimator, formatRemaining } from 'src/ts/storage/sync/remainingTime'
     import ConnectionForm from './ConnectionForm.svelte'
@@ -54,8 +54,6 @@
     const EMPTY_HISTORY_STEPS = 4
     /** What a repository accepts for each retention limit. */
     const RETENTION_LIMITS = { keepCount: [1, 1000], keepDays: [7, 3650] } as const
-    /** How long disconnecting waits for the file check before it asks without the check's answer. */
-    const REMOTE_ONLY_CHECK_MS = 3_000
     const strings = $derived(externalStorageStrings(DBState.db.language))
     let storageState = $state<ExternalStorageState | null>(null)
     let adding = $state(false)
@@ -83,6 +81,8 @@
     let quota = $state<Record<string, ExternalQuotaSummary>>({})
     let remoteOnly = $state<Record<string, number | null>>({})
     let removalDownload = $state<{ connectionId: string; controller: AbortController; cancelling: boolean } | null>(null)
+    /** The disconnect waiting for its file check, which cancelling abandons. */
+    let removalCheck = $state<{ connectionId: string; controller: AbortController } | null>(null)
     let recoveryKey = $state('')
     let recoveryPanel = $state<HTMLDivElement | undefined>()
     let connectionSettings = $state<ExternalConnectionSettingsMaterial | null>(null)
@@ -447,8 +447,8 @@
     }
 
     /** Files only this connection holds, as the residency status counts them. */
-    async function remoteOnlyFiles(connection: ExternalConnectionSummary): Promise<number> {
-        return (await getAssetResidencyStatus()).externalObjects.find(entry => entry.connectionId === connection.id)?.objects ?? 0
+    function remoteOnlyFiles(connection: ExternalConnectionSummary): Promise<number> {
+        return countConnectionOnlyAssets(connection.id)
     }
 
     async function loadRemoteOnlyFiles(connection: ExternalConnectionSummary): Promise<void> {
@@ -520,18 +520,20 @@
     async function removeConnection(connection: ExternalConnectionSummary): Promise<void> {
         busy = true
         activeAction = `remove:${connection.id}`
+        const check = new AbortController()
+        removalCheck = { connectionId: connection.id, controller: check }
         let held: number | undefined
-        let timer: ReturnType<typeof setTimeout> | undefined
         try {
             held = await Promise.race([
                 remoteOnlyFiles(connection),
-                new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), REMOTE_ONLY_CHECK_MS) }),
+                new Promise<undefined>(resolve => check.signal.addEventListener('abort', () => resolve(undefined), { once: true })),
             ])
         } catch {} finally {
-            clearTimeout(timer)
+            removalCheck = null
             busy = false
             activeAction = ''
         }
+        if (check.signal.aborted) return
         const remoteOnly = held !== 0
         // The card's own two lines tell apart connections to one service and account.
         const name = `${externalConnectionTitle(strings, connection)}\n${connectionPlace(connection)}`
@@ -793,6 +795,7 @@
     onDestroy(() => {
         destroyed = true
         removalDownload?.controller.abort()
+        removalCheck?.controller.abort()
         clearTimeout(pollTimer)
         stopJobEvents?.()
         stopSyncFailures?.()
@@ -1039,6 +1042,8 @@
                     <span class="foot-end">
                         {#if removalDownload?.connectionId === connection.id}
                             <SettingButton variant="secondary" disabled={removalDownload.cancelling} onclick={() => { if (removalDownload) { removalDownload.cancelling = true; removalDownload.controller.abort() } }}>{strings.cancel}</SettingButton>
+                        {:else if removalCheck?.connectionId === connection.id}
+                            <SettingButton variant="secondary" onclick={() => removalCheck?.controller.abort()}>{strings.cancel}</SettingButton>
                         {/if}
                         <SettingButton variant="danger" busy={activeAction === `remove:${connection.id}`} disabled={busy} onclick={() => removeConnection(connection)}>{strings.remove}</SettingButton>
                     </span>

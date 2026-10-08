@@ -547,6 +547,37 @@ impl PersistentStore {
             .collect();
         Ok(status)
     }
+    /// The status's `externalObjects` count for one connection. Only the
+    /// bodies registered to that connection are classified, and the library
+    /// is read only when one of them is held by that connection alone.
+    pub(crate) fn asset_residency_connection_objects(&self, connection_id: &str) -> Result<u64> {
+        let mut remote = RemoteBodies::deferred(&self.repository_root);
+        let registered = remote
+            .connection_hashes(connection_id)
+            .map_err(|_| std::io::Error::other("external-source-invalid"))?;
+        if registered.is_empty() {
+            return Ok(0);
+        }
+        let (_, missing) = split_local(&PayloadCas::new(&self.repository_root)?, registered, &|| Ok(()))?;
+        let residency = Residency::exists(&self.repository_root)
+            .then(|| Residency::open(&self.repository_root))
+            .transpose()?;
+        let mut connections = Connections::default();
+        let mut alone = Vec::new();
+        for page in missing.chunks(HOLDER_PAGE) {
+            let holders = Self::residency_holders(residency.as_ref(), &mut remote, &mut connections, page)?;
+            for (hash, holder) in page.iter().zip(holders) {
+                if matches!(holder, Holder::External(holder, _) if holder == connection_id) {
+                    alone.push(hash);
+                }
+            }
+        }
+        if alone.is_empty() {
+            return Ok(0);
+        }
+        let referenced = self.residency_inventory(false)?.referenced;
+        Ok(alone.into_iter().filter(|hash| referenced.contains(*hash)).count() as u64)
+    }
     fn previous_storage_assets(&self, target: &PreviousStorageTarget, check: &impl Fn() -> Result<()>) -> Result<BTreeSet<String>> {
         let inventory = self.residency_inventory(false)?;
         let cas = PayloadCas::new(&self.repository_root)?;

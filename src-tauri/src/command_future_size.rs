@@ -92,6 +92,7 @@ async_commands![
     app_update::commands::app_update_stage_deb,
     native_media::streaming::native_media_ensure,
     server_sync::commands::server_sync_asset_status,
+    server_sync::commands::asset_residency_connection_objects,
     server_sync::commands::server_sync_status,
     server_sync::commands::server_sync_configure,
     server_sync::commands::server_sync_lww_push,

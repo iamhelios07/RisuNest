@@ -25,7 +25,7 @@ const state = vi.hoisted(() => ({
     beginConnectionSettingsExport: vi.fn(),
     saveConnectionSettingsFile: vi.fn(),
     removeConnection: vi.fn(),
-    residency: vi.fn(),
+    connectionOnly: vi.fn(),
     downloadRemote: vi.fn(),
     binding: { target: { kind: 'none' } } as { target: { kind: string; connectionId?: string } },
 }))
@@ -39,7 +39,7 @@ vi.mock('src/ts/storage/sync/external/lwwProduction', () => ({ requestExternalLw
 vi.mock('src/ts/storage/sync/bindingRegistry', () => ({ bindSyncTarget: state.bind, unbindSyncTarget: state.unbind }))
 vi.mock('src/ts/storage/sync/bindingNative', () => ({ createNativeSyncBindingBridge: () => ({ state: async () => state.binding }) }))
 vi.mock('src/lang', () => ({ language: { risuNest: { serverSync: { lastSuccess: 'Last sync' } }, lwwSync: { newDeviceAction: 'Connect as new device', clockBlocked: 'Correct the device clock and retry.', previousStorageUnavailable: 'The previous storage could not be reached.', downloadFailedNotConnected: 'The files could not be downloaded, so the connection was not made.' } } }))
-vi.mock('src/ts/storage/sync/serverAssetResidency', () => ({ getAssetResidencyStatus: state.residency, downloadRemoteAssets: state.downloadRemote }))
+vi.mock('src/ts/storage/sync/serverAssetResidency', () => ({ countConnectionOnlyAssets: state.connectionOnly, downloadRemoteAssets: state.downloadRemote }))
 vi.mock('src/ts/stores.svelte' , () => ({ DBState: { db: { language: 'en' } } }))
 vi.mock('src/ts/storage/sync/external/production', () => ({
     refreshExternalStorageProductionState: vi.fn(async () => {}),
@@ -764,8 +764,8 @@ describe('the storage usage tab', () => {
 
 describe('the storage usage of two connections', () => {
     const second = { ...connection(10, 30), id: 'connection-2', displayName: 'Second' }
-    const status = (entries: { connectionId: string, objects: number }[]) => ({ policy: 'remote', localBytes: 0, remoteBytes: 3,
-        remoteObjects: 3, serverBytes: 0, serverObjects: 0, externalObjects: entries, unavailableObjects: 0, evictedBytes: 0 })
+    const held = (entries: { connectionId: string, objects: number }[]) => async (connectionId: string) =>
+        entries.find(entry => entry.connectionId === connectionId)?.objects ?? 0
     const remoteOnly = (id: string) => {
         const panel = target.querySelector(`#${id}-quota-panel`)
         if (!panel) throw new Error(`Missing the storage usage of ${id}`)
@@ -799,14 +799,14 @@ describe('the storage usage of two connections', () => {
     })
 
     it('shows for each connection the files only it holds', async () => {
-        state.residency.mockResolvedValue(status([{ connectionId: 'connection-1', objects: 2 }]))
+        state.connectionOnly.mockImplementation(held([{ connectionId: 'connection-1', objects: 2 }]))
         await openBoth()
         expect(remoteOnly('connection-1')).toBe('2')
         expect(remoteOnly('connection-2')).toBe('0')
     })
 
-    it('shows unknown when the status cannot be read', async () => {
-        state.residency.mockRejectedValue({ code: 'local-storage' })
+    it('shows unknown when the count cannot be read', async () => {
+        state.connectionOnly.mockRejectedValue({ code: 'local-storage' })
         await openBoth()
         expect(remoteOnly('connection-1')).toBe(strings.unknownUsage)
         expect(remoteOnly('connection-2')).toBe(strings.unknownUsage)
@@ -903,8 +903,8 @@ describe('a running job', () => {
 })
 
 describe('removing a connection', () => {
-    const held = (entries: { connectionId: string, objects: number }[]) => ({ policy: 'remote', localBytes: 0, remoteBytes: 1, remoteObjects: 1,
-        serverBytes: 0, serverObjects: 0, externalObjects: entries, unavailableObjects: 0, evictedBytes: 0 })
+    const held = (entries: { connectionId: string, objects: number }[]) => async (connectionId: string) =>
+        entries.find(entry => entry.connectionId === connectionId)?.objects ?? 0
     const removeButton = () => [...target.querySelectorAll('button')].find(button => button.textContent?.trim() === strings.remove)!
     const name = `${strings.providers.webdav.name}
 https://synthetic.invalid · RisuNest`
@@ -926,8 +926,8 @@ https://synthetic.invalid · RisuNest`
     })
 
     it.each([
-        { name: 'holds no file', status: () => state.residency.mockResolvedValue(held([])) },
-        { name: 'is not the one holding files', status: () => state.residency.mockResolvedValue(held([{ connectionId: 'other', objects: 3 }])) },
+        { name: 'holds no file', status: () => state.connectionOnly.mockImplementation(held([])) },
+        { name: 'is not the one holding files', status: () => state.connectionOnly.mockImplementation(held([{ connectionId: 'other', objects: 3 }])) },
     ])('asks for a checked confirmation that names the connection when the status $name', async ({ status }) => {
         status()
         vi.mocked(alertCheckboxConfirm).mockResolvedValue({ confirmed: true, checked: true })
@@ -940,7 +940,7 @@ https://synthetic.invalid · RisuNest`
         expect(state.removeConnection).toHaveBeenCalledExactlyOnceWith('connection-1'); expect(state.downloadRemote).not.toHaveBeenCalled()
     })
     it('keeps the connection when the confirmation is cancelled', async () => {
-        state.residency.mockResolvedValue(held([]))
+        state.connectionOnly.mockImplementation(held([]))
         vi.mocked(alertCheckboxConfirm).mockResolvedValue({ confirmed: false, checked: false })
         removeButton().click(); await settle()
         expect(state.removeConnection).not.toHaveBeenCalled()
@@ -949,7 +949,7 @@ https://synthetic.invalid · RisuNest`
         if (component) await unmount(component)
         const other = { ...connection(10, 30), id: 'connection-2', endpoint: { ...connection(10, 30).endpoint, repositoryHint: 'RisuNest-sync' } }
         state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0', paused: false }, connections: [connection(10, 30), other], jobs: [] })
-        state.residency.mockResolvedValue(held([]))
+        state.connectionOnly.mockImplementation(held([]))
         vi.mocked(alertCheckboxConfirm).mockResolvedValue({ confirmed: false, checked: false })
         component = mount(ExternalStorageSettings, { target }); await settle()
         for (const card of target.querySelectorAll('article')) {
@@ -962,7 +962,7 @@ https://synthetic.invalid · RisuNest-sync`,
         ])
     })
     it('offers a download with unknown wording when residency cannot be read', async () => {
-        state.residency.mockRejectedValue({ code: 'local-storage' })
+        state.connectionOnly.mockRejectedValue({ code: 'local-storage' })
         vi.mocked(alertCheckboxConfirm).mockResolvedValue({ confirmed: false, checked: false })
         removeButton().click(); await settle()
         expect(alertCheckboxConfirm).toHaveBeenCalledWith(expect.objectContaining({ description: `${name}
@@ -974,36 +974,52 @@ ${strings.removeRemoteOnlyUnknown}`, requireChecked: false }))
         expect(state.removeConnection).not.toHaveBeenCalled()
     })
     it('shows the disconnect as running while it checks the files', async () => {
-        state.residency.mockReturnValue(new Promise(() => {}))
+        state.connectionOnly.mockReturnValue(new Promise(() => {}))
         removeButton().click(); await settle()
         const button = target.querySelector<HTMLButtonElement>('button[aria-busy="true"]')
         expect(button?.textContent).toContain(strings.remove)
         expect(button?.disabled).toBe(true)
+        expect(state.connectionOnly).toHaveBeenCalledExactlyOnceWith('connection-1')
         expect(alertCheckboxConfirm).not.toHaveBeenCalled()
     })
-    it('asks with the unknown wording once the file check takes more than a few seconds', async () => {
+    it('asks with the counted answer however long the file check takes', async () => {
         vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
         try {
-            state.residency.mockReturnValue(new Promise(() => {}))
+            let answer!: (objects: number) => void
+            state.connectionOnly.mockReturnValue(new Promise<number>(resolve => { answer = resolve }))
             vi.mocked(alertCheckboxConfirm).mockResolvedValue({ confirmed: false, checked: false })
             removeButton().click(); await settle()
-            await vi.advanceTimersByTimeAsync(2_900); await settle()
+            await vi.advanceTimersByTimeAsync(60_000); await settle()
             expect(alertCheckboxConfirm).not.toHaveBeenCalled()
-            await vi.advanceTimersByTimeAsync(100); await settle()
+            expect(target.querySelector('button[aria-busy="true"]')?.textContent).toContain(strings.remove)
+            answer(2); await settle()
             expect(alertCheckboxConfirm).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ description: `${name}
 
 ${strings.removeDeletes}
 
-${strings.removeRemoteOnlyUnknown}`, requireChecked: false }))
+${strings.removeRemoteOnly}`, checkboxLabel: strings.downloadThenRemove, requireChecked: false }))
             expect(target.querySelector('button[aria-busy="true"]')).toBeNull()
-            expect(removeButton().disabled).toBe(false)
-            expect(state.removeConnection).not.toHaveBeenCalled()
         } finally {
             vi.useRealTimers()
         }
     })
+    it('cancelling the file check keeps the connection without asking', async () => {
+        let answer!: (objects: number) => void
+        state.connectionOnly.mockReturnValue(new Promise<number>(resolve => { answer = resolve }))
+        removeButton().click(); await settle()
+        const cancel = [...target.querySelectorAll('button')].find(button => button.textContent?.trim() === strings.cancel)!
+        expect(cancel.disabled).toBe(false)
+        cancel.click(); await settle()
+        expect(target.querySelector('button[aria-busy="true"]')).toBeNull()
+        expect(removeButton().disabled).toBe(false)
+        expect([...target.querySelectorAll('button')].some(button => button.textContent?.trim() === strings.cancel)).toBe(false)
+        answer(2); await settle()
+        expect(alertCheckboxConfirm).not.toHaveBeenCalled()
+        expect(state.removeConnection).not.toHaveBeenCalled()
+        expect(state.downloadRemote).not.toHaveBeenCalled()
+    })
     it('asks once with an unchecked download option for files only this connection holds', async () => {
-        state.residency.mockResolvedValue(held([{ connectionId: 'connection-1', objects: 2 }]))
+        state.connectionOnly.mockImplementation(held([{ connectionId: 'connection-1', objects: 2 }]))
         vi.mocked(alertCheckboxConfirm).mockResolvedValue({ confirmed: false, checked: false })
         removeButton().click(); await settle()
         expect(alertCheckboxConfirm).toHaveBeenCalledExactlyOnceWith({
@@ -1018,15 +1034,15 @@ ${strings.removeRemoteOnly}`, checkboxLabel: strings.downloadThenRemove,
         expect(state.removeConnection).not.toHaveBeenCalled(); expect(state.downloadRemote).not.toHaveBeenCalled()
     })
     it('removes without downloading when the option stays unchecked', async () => {
-        state.residency.mockResolvedValue(held([{ connectionId: 'connection-1', objects: 2 }]))
+        state.connectionOnly.mockImplementation(held([{ connectionId: 'connection-1', objects: 2 }]))
         vi.mocked(alertCheckboxConfirm).mockResolvedValue({ confirmed: true, checked: false })
         removeButton().click(); await settle()
         expect(state.downloadRemote).not.toHaveBeenCalled(); expect(state.removeConnection).toHaveBeenCalledExactlyOnceWith('connection-1')
     })
     it('downloads the files this connection holds, then removes it', async () => {
-        state.residency.mockResolvedValue(held([{ connectionId: 'connection-1', objects: 2 }]))
+        state.connectionOnly.mockImplementation(held([{ connectionId: 'connection-1', objects: 2 }]))
         vi.mocked(alertCheckboxConfirm).mockResolvedValue({ confirmed: true, checked: true })
-        state.downloadRemote.mockResolvedValue(held([]))
+        state.downloadRemote.mockResolvedValue(undefined)
         removeButton().click(); await settle()
         expect(state.downloadRemote).toHaveBeenCalledExactlyOnceWith('connection-1', { signal: expect.any(AbortSignal) })
         expect(state.removeConnection).toHaveBeenCalledExactlyOnceWith('connection-1')
@@ -1034,16 +1050,16 @@ ${strings.removeRemoteOnly}`, checkboxLabel: strings.downloadThenRemove,
         expect(target.querySelector('[role="alert"]')).toBeNull()
     })
     it('keeps the connection and explains it when the download fails', async () => {
-        state.residency.mockResolvedValue(held([{ connectionId: 'connection-1', objects: 2 }]))
+        state.connectionOnly.mockImplementation(held([{ connectionId: 'connection-1', objects: 2 }]))
         vi.mocked(alertCheckboxConfirm).mockResolvedValue({ confirmed: true, checked: true })
         state.downloadRemote.mockRejectedValue({ code: 'required-asset-unavailable', status: 409, retryable: false })
         removeButton().click(); await settle()
         expect(state.removeConnection).not.toHaveBeenCalled()
         expect(target.querySelector('[role="alert"]')?.textContent).toBe(strings.downloadFailedKeptConnection)
-        expect(state.residency).toHaveBeenCalledTimes(2)
+        expect(state.connectionOnly).toHaveBeenCalledTimes(2)
     })
     it('keeps the connection without a message when the download is cancelled', async () => {
-        state.residency.mockResolvedValue(held([{ connectionId: 'connection-1', objects: 2 }]))
+        state.connectionOnly.mockImplementation(held([{ connectionId: 'connection-1', objects: 2 }]))
         vi.mocked(alertCheckboxConfirm).mockResolvedValue({ confirmed: true, checked: true })
         state.downloadRemote.mockRejectedValue({ code: 'cancelled', status: 409, retryable: true })
         removeButton().click(); await settle()
@@ -1051,7 +1067,7 @@ ${strings.removeRemoteOnly}`, checkboxLabel: strings.downloadThenRemove,
         expect(target.querySelector('[role="alert"]')).toBeNull()
     })
     it('keeps busy ownership after cancellation until the download settles, then refreshes remaining files', async () => {
-        state.residency.mockResolvedValue(held([{ connectionId: 'connection-1', objects: 2 }]))
+        state.connectionOnly.mockImplementation(held([{ connectionId: 'connection-1', objects: 2 }]))
         vi.mocked(alertCheckboxConfirm).mockResolvedValue({ confirmed: true, checked: true })
         let finish!: () => void
         state.downloadRemote.mockImplementation(() => new Promise<void>(resolve => { finish = resolve }))
@@ -1061,21 +1077,21 @@ ${strings.removeRemoteOnly}`, checkboxLabel: strings.downloadThenRemove,
         cancel.click(); await settle()
         expect(signal.aborted).toBe(true)
         expect(removeButton().disabled).toBe(true)
-        expect(state.residency).toHaveBeenCalledOnce()
+        expect(state.connectionOnly).toHaveBeenCalledOnce()
         expect(state.removeConnection).not.toHaveBeenCalled()
-        state.residency.mockResolvedValue(held([{ connectionId: 'connection-1', objects: 1 }]))
+        state.connectionOnly.mockImplementation(held([{ connectionId: 'connection-1', objects: 1 }]))
         finish(); await settle()
-        expect(state.residency).toHaveBeenCalledTimes(2)
+        expect(state.connectionOnly).toHaveBeenCalledTimes(2)
         expect(removeButton().disabled).toBe(false)
         expect(state.removeConnection).not.toHaveBeenCalled()
         expect(target.querySelector('[role="alert"]')).toBeNull()
     })
     it('preserves the download failure when the settled residency refresh also fails', async () => {
-        state.residency.mockResolvedValueOnce(held([{ connectionId: 'connection-1', objects: 2 }])).mockRejectedValue({ code: 'local-storage' })
+        state.connectionOnly.mockImplementationOnce(held([{ connectionId: 'connection-1', objects: 2 }])).mockRejectedValue({ code: 'local-storage' })
         vi.mocked(alertCheckboxConfirm).mockResolvedValue({ confirmed: true, checked: true })
         state.downloadRemote.mockRejectedValue({ code: 'required-asset-unavailable' })
         removeButton().click(); await settle()
-        expect(state.residency).toHaveBeenCalledTimes(2)
+        expect(state.connectionOnly).toHaveBeenCalledTimes(2)
         expect(target.querySelector('[role="alert"]')?.textContent).toBe(strings.downloadFailedKeptConnection)
         expect(state.removeConnection).not.toHaveBeenCalled()
     })
