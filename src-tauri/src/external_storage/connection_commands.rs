@@ -1744,7 +1744,17 @@ async fn commit_preparation(
     if let Some(connection_id) = preparation.renewal.as_deref() {
         return renew_connection(app, connection_id, credential, cancel).await.map_err(Into::into);
     }
-    let root = connection_root(app)?;
+    commit_new_connection(&connection_root(app)?, connection_id, preparation, credential, cancel).await
+}
+
+async fn commit_new_connection(
+    root: &std::path::Path,
+    connection_id: &str,
+    preparation: &PendingPreparation,
+    credential: CredentialInput,
+    cancel: &Cancellation,
+) -> ConnectResult<ConnectionResult> {
+    let root = root.to_path_buf();
     let dependencies = connection::dependencies_for_config(&root, &preparation.request.config)?;
     let provider_vault = dependencies.vault.clone();
     let key_vault = secrets::repository_key_vault(&root);
@@ -2705,6 +2715,64 @@ mod tests {
         assert!(summary(&stored).is_err());
         stored.config.endpoint = "https://open-api.mybox.naver.com/v1".into();
         assert!(summary(&stored).is_ok());
+    }
+
+    /// The form sends S3 settings without an account, which the access key
+    /// fills in only once the connection commits.
+    #[test]
+    fn an_http_s3_connection_commits_with_the_settings_the_form_sends() {
+        use super::super::wire_fixture::{Reply, WireServer};
+        let server = WireServer::start(vec![Reply::Http {
+            status: 403,
+            headers: vec![("Content-Type".into(), "application/xml".into())],
+            body: b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>AccessDenied</Code></Error>".to_vec(),
+        }]);
+        let endpoint = server.url.origin().ascii_serialization();
+        assert!(endpoint.starts_with("http://127.0.0.1:"));
+        let state = ConnectionCommandState::default();
+        let request = PrepareConnectionRequest {
+            config: super::super::contract::ConnectionConfig {
+                provider: "s3".into(),
+                profile: Some("generic".into()),
+                endpoint,
+                account_id: String::new(),
+                location: BTreeMap::from([
+                    ("bucket".into(), "synthetic-bucket".into()),
+                    ("prefix".into(), "risunest".into()),
+                    ("region".into(), "us-east-1".into()),
+                    ("addressing".into(), "path".into()),
+                ]),
+                oauth_profile: None,
+            },
+            mode: ConnectionOpenMode::Create,
+            purpose: ConnectionPurpose::Backup,
+            recovery_key: None,
+            acknowledgements: Vec::new(),
+        };
+        let id = insert_preparation(&state, request, None, None, false).unwrap().preparation_id;
+        let pending = take_preparation(&state, &id).unwrap();
+        let secret = connection::encode_secret("s3", ProviderSecretInput::S3 {
+            access_key_id: "AKIASYNTHETICEXAMPLE".into(),
+            secret_access_key: "synthetic/secret/key".into(),
+        }).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let result = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let result = commit_new_connection(
+                root.path(), &id, &pending, CredentialInput::Bytes(secret), &Cancellation::default(),
+            ).await;
+            if let Ok(left) = ConnectionStore::open(root.path()).and_then(|store| store.pending(&id)) {
+                let _ = secrets::provider_vault(root.path()).remove(&SecretRef(left.credential_ref)).await;
+                let keys = secrets::repository_key_vault(root.path());
+                let _ = keys.remove(&SecretRef(left.root_key_ref)).await;
+                let _ = keys.remove(&SecretRef(left.recovery_key_ref)).await;
+            }
+            result
+        });
+        let Err(ConnectionFailure::Provider(error)) = result else { panic!("the refused listing must fail the commit") };
+        assert_ne!(error.kind, ErrorKind::Unsupported);
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].headers.starts_with("GET /synthetic-bucket?"), "{}", requests[0].headers.lines().next().unwrap_or_default());
     }
 
     #[test]
