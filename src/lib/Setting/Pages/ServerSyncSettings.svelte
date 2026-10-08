@@ -43,6 +43,9 @@
     let scanning = $state(false)
     let failure = $state('')
     let residency = $state<AssetResidencyStatus | undefined>()
+    // Reading the breakdown can outlast an operation started meanwhile, so only the latest read is applied.
+    let residencyRead = 0
+    let residencyFailed = $state(false)
     let cache = $state<ServerSyncCacheUsage | undefined>()
     let downloading = $state(false)
     let checkingFiles = $state(false)
@@ -58,6 +61,8 @@
     const registrationCodes = ['unauthorized', 'invalid-device-token', 'server-epoch-changed']
     let writerRecovery = $derived(writerRecoveryCodes.includes(view.error))
     let connected = $derived(!!view.status.configured && !!view.status.bound)
+    // The connection status carries the stored policy, so the choices do not wait for the breakdown.
+    let storedPolicy = $derived(view.status.assetPolicy ?? residency?.policy)
     // A connected device keeps its registration input folded until a code is needed again.
     let codeShown = $derived(!view.status.bound || !!view.error || !!failure || !!candidate || codeOpen)
     let status = $derived.by((): { label: string; tone: 'idle' | 'connected' | 'working' | 'paused' | 'attention' } => {
@@ -97,7 +102,20 @@
         if (token.startsWith('qr-')) return token.includes('permission') ? copy.cameraDenied : copy.cameraUnavailable
         return copy.errorHelp
     }
-    async function refresh() { await controller.ensureStatus(); residency = await getAssetResidencyStatus(); cache = await getServerSyncCacheUsage() }
+    async function readResidency() {
+        const read = ++residencyRead
+        residencyFailed = false
+        try {
+            const next = await getAssetResidencyStatus()
+            if (read === residencyRead) residency = next
+        } catch (error) {
+            if (read !== residencyRead) return
+            residencyFailed = true
+            throw error
+        }
+    }
+    async function readCache() { cache = await getServerSyncCacheUsage() }
+    async function refresh() { await controller.ensureStatus(); await Promise.all([readResidency(), readCache()]) }
     async function run(operation: () => Promise<unknown>) {
         if (busy) return
         busy = true; failure = ''
@@ -110,7 +128,7 @@
     async function connect(newDevice = false) {
         if (!candidate) return
         const choice = connected ? undefined : policy
-        const kept = residency?.policy
+        const kept = storedPolicy
         await connectTarget(candidate, newDevice, choice)
         candidate = undefined; codeOpen = false
         // Connecting applies only a remote choice, so a device that kept assets on the server and chose full downloads them here.
@@ -152,8 +170,8 @@
     }
     async function cleanCache() { if (await alertConfirm(copy.management.cleanConfirm)) await cleanupServerSyncCache() }
     // A refused change puts the control back on the stored policy.
-    function choosePolicy(next: AssetResidencyPolicy) { void run(() => next === 'full' ? downloadAll() : setAssetResidencyPolicy(next)).finally(() => { if (residency) policy = residency.policy }) }
-    $effect(() => { if (residency) policy = residency.policy })
+    function choosePolicy(next: AssetResidencyPolicy) { void run(() => next === 'full' ? downloadAll() : setAssetResidencyPolicy(next)).finally(() => { if (storedPolicy) policy = storedPolicy }) }
+    $effect(() => { if (storedPolicy) policy = storedPolicy })
     $effect(() => {
         if (!view.progress) return
         now = Date.now()
@@ -313,10 +331,10 @@
     {/if}
 {/snippet}
 
-{#snippet place(part: 'local' | 'server' | 'external' | 'missing', label: string, value: string)}
+{#snippet place(part: 'local' | 'server' | 'external' | 'missing', label: string, value?: string)}
     <div class="place" data-part={part}>
         <span class="place-label"><i class="place-dot" aria-hidden="true"></i><span>{label}</span></span>
-        <span class="value">{value}</span>
+        {#if value === undefined}<span class="value-pending motion-safe:animate-pulse"></span>{:else}<span class="value">{value}</span>{/if}
     </div>
 {/snippet}
 
@@ -331,33 +349,45 @@
             {@render connection()}
         </SettingGroup>
     {/if}
-    {#if residency && connected}
-        {@const externalBytes = residency.remoteObjects > residency.serverObjects ? residency.remoteBytes - residency.serverBytes : 0}
-        {@const shares = [
-            { part: 'local', bytes: residency.localBytes },
-            { part: 'server', bytes: residency.serverBytes },
-            { part: 'external', bytes: externalBytes },
-        ].filter(share => share.bytes > 0)}
+    {#if connected && storedPolicy}
         <SettingGroup title={copy.residency.title} description={copy.residency.description}>
             <div class="sync-block">
                 {@render residencyChoices(choosePolicy)}
             </div>
-            <div class="sync-block">
-                {#if shares.length > 0}
-                    <div class="distribution" aria-hidden="true">
-                        {#each shares as share (share.part)}<span data-part={share.part} style:flex-grow={share.bytes}></span>{/each}
+            {#if residency}
+                {@const externalBytes = residency.remoteObjects > residency.serverObjects ? residency.remoteBytes - residency.serverBytes : 0}
+                {@const shares = [
+                    { part: 'local', bytes: residency.localBytes },
+                    { part: 'server', bytes: residency.serverBytes },
+                    { part: 'external', bytes: externalBytes },
+                ].filter(share => share.bytes > 0)}
+                <div class="sync-block">
+                    {#if shares.length > 0}
+                        <div class="distribution" aria-hidden="true">
+                            {#each shares as share (share.part)}<span data-part={share.part} style:flex-grow={share.bytes}></span>{/each}
+                        </div>
+                    {/if}
+                    <div class="places">
+                        {@render place('local', copy.residency.local, bytes(residency.localBytes))}
+                        {@render place('server', copy.residency.remoteOnly, bytes(residency.serverBytes))}
+                        {#if residency.remoteObjects > residency.serverObjects}{@render place('external', copy.residency.externalOnly, bytes(externalBytes))}{/if}
+                        {@render place('missing', copy.residency.unavailable, copy.count.replace('{0}', residency.unavailableObjects.toLocaleString()))}
                     </div>
-                {/if}
-                <div class="places">
-                    {@render place('local', copy.residency.local, bytes(residency.localBytes))}
-                    {@render place('server', copy.residency.remoteOnly, bytes(residency.serverBytes))}
-                    {#if residency.remoteObjects > residency.serverObjects}{@render place('external', copy.residency.externalOnly, bytes(externalBytes))}{/if}
-                    {@render place('missing', copy.residency.unavailable, copy.count.replace('{0}', residency.unavailableObjects.toLocaleString()))}
                 </div>
-            </div>
+            {:else if !residencyFailed}
+                <!-- The placeholder keeps the loaded shape: the status line stands where the bar goes, above the same rows. -->
+                <div class="sync-block" data-residency-loading role="status" aria-live="polite">
+                    <p class="checking"><LoaderCircleIcon size={14} class="shrink-0 motion-safe:animate-spin" aria-hidden="true" /><span>{copy.residency.checking}</span></p>
+                    <div class="places" aria-hidden="true">
+                        {@render place('local', copy.residency.local)}
+                        {@render place('server', copy.residency.remoteOnly)}
+                        {@render place('missing', copy.residency.unavailable)}
+                    </div>
+                </div>
+            {/if}
             <div class="sync-block">
                 <div class="actions">
-                    {#if residency.policy === 'full' && residency.remoteObjects > 0}<SettingButton onclick={() => void run(downloadHeld)} busy={downloading} disabled={busy}>{copy.residency.download}</SettingButton>{/if}
+                    {#if residency?.policy === 'full' && residency.remoteObjects > 0}<SettingButton onclick={() => void run(downloadHeld)} busy={downloading} disabled={busy}>{copy.residency.download}</SettingButton>{/if}
                     <SettingButton variant="secondary" onclick={() => void run(evictLocalAssets)} disabled={busy}>{copy.residency.clean}</SettingButton>
                     {#if busy}<SettingButton variant="secondary" onclick={() => void cancelAssetResidencyOperation()}>{copy.residency.cancel}</SettingButton>{/if}
                 </div>
@@ -598,6 +628,23 @@
     .places {
         display: grid;
         gap: 0.5rem;
+    }
+    .checking {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        min-width: 0;
+        font-size: 12.5px;
+        line-height: 1rem;
+        color: color-mix(in srgb, var(--risu-theme-textcolor2) 62%, var(--risu-theme-textcolor) 38%);
+    }
+    .value-pending {
+        flex: none;
+        align-self: center;
+        width: 3.5rem;
+        height: 0.875rem;
+        border-radius: 0.25rem;
+        background: var(--risu-theme-darkbutton);
     }
     .place {
         display: flex;

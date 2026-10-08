@@ -2212,6 +2212,7 @@ export const languageEnglish = {
                 remoteOnly: 'Files only on the server',
                 externalOnly: 'Files only in external storage',
                 unavailable: 'Files not found',
+                checking: 'Checking files…',
                 cleanupNote:
                     'Cleanup removes this device’s copies of files that are on the server.',
                 clean: 'Clear copies on this device',

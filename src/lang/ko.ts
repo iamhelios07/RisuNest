@@ -2028,6 +2028,7 @@ export const languageKorean = {
                 remoteOnly: '서버에만 있는 파일',
                 externalOnly: '외부 저장소에만 있는 파일',
                 unavailable: '찾을 수 없는 파일',
+                checking: '파일 확인 중…',
                 cleanupNote:
                     '정리하면 서버에 있는 파일 중 이 기기의 사본을 삭제합니다.',
                 clean: '이 기기의 사본 정리',

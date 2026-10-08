@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mount, tick, unmount } from 'svelte'
 import { languageEnglish } from 'src/lang/en'
-const f = vi.hoisted(() => ({ pending: vi.fn(async (): Promise<number | undefined> => undefined), connect: vi.fn(), complete: vi.fn(), configure: vi.fn(), bind: vi.fn(), disconnect: vi.fn(), hold: vi.fn(), release: vi.fn(), status: vi.fn(), policy: vi.fn(), cancel: vi.fn(), checkbox: vi.fn(), action: vi.fn(), native: true, scan: false, scanner: { scan: vi.fn(), cancel: vi.fn() }, os: 'windows', listeners: new Set<(value: Record<string, unknown>) => void>(), bindingState: vi.fn(), preset: vi.fn(), state: { db: {} as Record<string, unknown> }, view: { status: { configured: false }, paused: false } as Record<string, unknown> }))
+const f = vi.hoisted(() => ({ pending: vi.fn(async (): Promise<number | undefined> => undefined), ensure: vi.fn(), connect: vi.fn(), complete: vi.fn(), configure: vi.fn(), bind: vi.fn(), disconnect: vi.fn(), hold: vi.fn(), release: vi.fn(), status: vi.fn(), policy: vi.fn(), cancel: vi.fn(), checkbox: vi.fn(), action: vi.fn(), native: true, scan: false, scanner: { scan: vi.fn(), cancel: vi.fn() }, os: 'windows', listeners: new Set<(value: Record<string, unknown>) => void>(), bindingState: vi.fn(), preset: vi.fn(), state: { db: {} as Record<string, unknown> }, view: { status: { configured: false }, paused: false } as Record<string, unknown> }))
 vi.mock('src/lang', async () => ({ language: (await import('src/lang/en')).languageEnglish, changeLanguage: vi.fn() }))
 vi.mock('src/ts/platform', () => ({ get isTauri() { return f.native } }))
 vi.mock('@tauri-apps/plugin-os', () => ({ platform: () => f.os }))
@@ -10,7 +10,7 @@ vi.mock('src/ts/alert', () => ({ alertConfirm: vi.fn(), alertCheckboxConfirm: f.
 vi.mock('src/ts/storage/sync/serverSyncProduction', () => ({
     connectServerSync: f.connect, completeServerSyncBinding: f.complete, configureServerSyncConnection: f.configure, disconnectServerSync: f.disconnect, retryServerSync: vi.fn(), holdServerSync: f.hold,
     getServerSyncCacheUsage: vi.fn(), cleanupServerSyncCache: vi.fn(),
-    getServerSyncController: () => ({ snapshot: () => f.view, subscribe: (listener: (value: Record<string, unknown>) => void) => { f.listeners.add(listener); listener(f.view); return () => { f.listeners.delete(listener) } }, ensureStatus: vi.fn(), watchProgress: () => () => {}, pendingChanges: f.pending, track: (_stage: string, operation: () => Promise<unknown>) => operation() }),
+    getServerSyncController: () => ({ snapshot: () => f.view, subscribe: (listener: (value: Record<string, unknown>) => void) => { f.listeners.add(listener); listener(f.view); return () => { f.listeners.delete(listener) } }, ensureStatus: f.ensure, watchProgress: () => () => {}, pendingChanges: f.pending, track: (_stage: string, operation: () => Promise<unknown>) => operation() }),
 }))
 vi.mock('src/ts/storage/sync/serverAssetResidency', () => ({ getAssetResidencyStatus: f.status, setAssetResidencyPolicy: f.policy, evictLocalAssets: vi.fn(), cancelAssetResidencyOperation: f.cancel }))
 vi.mock('src/ts/storage/sync/serverSyncRegistration', () => ({ parseServerRegistration: () => ({ endpoint: 'https://synthetic.invalid', libraryId: 'library', deviceId: 'registration', token: 'synthetic' }) }))
@@ -43,7 +43,7 @@ let component: ReturnType<typeof mount> | undefined
 let host: HTMLDivElement
 beforeEach(() => {
     vi.clearAllMocks(); f.native = true; f.scan = false; f.os = 'windows'; f.listeners.clear(); f.view = { status: { configured: false }, paused: false }; host = document.createElement('div'); document.body.append(host)
-    for (const mock of [f.disconnect, f.hold, f.release, f.status, f.policy, f.cancel, f.checkbox, f.action, f.complete]) mock.mockReset()
+    for (const mock of [f.disconnect, f.hold, f.release, f.status, f.policy, f.cancel, f.checkbox, f.action, f.complete, f.ensure]) mock.mockReset()
     f.hold.mockResolvedValue(f.release)
     f.state.db = { language: 'en', characters: [] }
     f.preset.mockImplementation((db: Record<string, unknown>) => ({ ...db, preset: 'starting' }))
@@ -546,6 +546,121 @@ describe('downloading files kept only on the server', () => {
         const order = [f.hold, f.policy, f.release].map(mock => mock.mock.invocationCallOrder[0])
         expect(order).toEqual([...order].sort((a, b) => a - b))
         expect(findButton(sync.residency.download)).toBeUndefined()
+    })
+})
+
+describe('asset storage before its breakdown loads', () => {
+    const connectedView = (assetPolicy: string, fields: Record<string, unknown> = {}) => ({ status: { configured: true, bound: true, assetPolicy }, paused: false, error: '', ...fields })
+    function deferred<T>() { let resolve!: (value: T) => void; let reject!: (error: unknown) => void; const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail }); return { promise, resolve, reject } }
+    const choices = () => [...host.querySelectorAll<HTMLInputElement>('[role="radiogroup"] input[type="radio"]')]
+    const shownChoices = () => choices().map(option => [option.closest('label')?.textContent?.trim(), option.checked, option.disabled])
+    const loading = () => host.querySelector('[data-residency-loading]')
+    const rowValue = (label: string) => [...host.querySelectorAll('.place')].find(row => row.querySelector('.place-label')?.textContent === label)?.querySelector('.value')?.textContent
+    async function mountLoading(assetPolicy: string) {
+        f.view = connectedView(assetPolicy)
+        const read = deferred<ReturnType<typeof residencyStatus>>()
+        f.status.mockReturnValueOnce(read.promise)
+        component = mount(ServerSyncSettings, { target: host, props: { connectTarget: vi.fn() } })
+        await settle()
+        return read
+    }
+    it('shows the choices with the stored policy and a loading state in place of the breakdown', async () => {
+        const read = await mountLoading('remote')
+        expect(host.textContent).toContain(sync.residency.title)
+        expect(shownChoices()).toEqual([[sync.residency.full, false, false], [sync.residency.remote, true, false]])
+        expect(loading()?.getAttribute('role')).toBe('status')
+        expect(loading()?.querySelector('.checking')?.textContent?.trim()).toBe(sync.residency.checking)
+        expect(loading()?.querySelector('.places')?.getAttribute('aria-hidden')).toBe('true')
+        expect([...loading()!.querySelectorAll('.place-label')].map(label => label.textContent)).toEqual([sync.residency.local, sync.residency.remoteOnly, sync.residency.unavailable])
+        expect(host.querySelectorAll('.place .value')).toHaveLength(0)
+        expect(host.querySelector('.distribution')).toBeNull()
+        expect(findButton(sync.residency.download)).toBeUndefined()
+        expect(findButton(sync.residency.clean)?.disabled).toBe(false)
+        read.resolve(residencyStatus({ localBytes: 2048 })); await settle()
+        expect(loading()).toBeNull()
+        expect(rowValue(sync.residency.local)).toBe('2.0 KiB')
+        expect(rowValue(sync.residency.remoteOnly)).toBe('4.0 KiB')
+        expect(rowValue(sync.residency.unavailable)).toBe(sync.count.replace('{0}', '0'))
+        expect(host.querySelector('.distribution')).not.toBeNull()
+        expect(findButton(sync.residency.download)).toBeUndefined()
+    })
+    it('offers the download only once the breakdown lists files kept elsewhere', async () => {
+        const read = await mountLoading('full')
+        expect(shownChoices()).toEqual([[sync.residency.full, true, false], [sync.residency.remote, false, false]])
+        expect(findButton(sync.residency.download)).toBeUndefined()
+        read.resolve(residencyStatus({ policy: 'full' })); await settle()
+        expect(findButton(sync.residency.download)?.disabled).toBe(false)
+    })
+    it('keeps the blocks of the group while the breakdown arrives', async () => {
+        const read = await mountLoading('full')
+        const blocks = () => [...host.querySelectorAll('section')].find(section => section.textContent?.includes(sync.residency.title))?.querySelectorAll('.sync-block').length
+        expect(blocks()).toBe(3)
+        read.resolve(residencyStatus({ policy: 'full' })); await settle()
+        expect(blocks()).toBe(3)
+    })
+    it('changes the choice while the breakdown loads and keeps the newer breakdown over the first one', async () => {
+        const first = await mountLoading('full')
+        f.ensure.mockImplementation(async () => { publish(connectedView('remote')) })
+        f.policy.mockResolvedValue(residencyStatus({ policy: 'remote' }))
+        f.status.mockResolvedValue(residencyStatus({ policy: 'remote', localBytes: 1024 }))
+        choices()[1].click(); await settle()
+        expect(f.policy).toHaveBeenCalledExactlyOnceWith('remote')
+        expect(loading()).toBeNull()
+        expect(rowValue(sync.residency.local)).toBe('1.0 KiB')
+        first.resolve(residencyStatus({ policy: 'full', localBytes: 8 * 1024 * 1024 })); await settle()
+        expect(rowValue(sync.residency.local)).toBe('1.0 KiB')
+        expect(shownChoices()).toEqual([[sync.residency.full, false, false], [sync.residency.remote, true, false]])
+        expect(findButton(sync.residency.download)).toBeUndefined()
+    })
+    it('disables the choices while the change runs and returns them to the stored policy when it is refused', async () => {
+        await mountLoading('remote')
+        const change = deferred<never>()
+        f.policy.mockReturnValue(change.promise)
+        choices()[0].click(); await settle()
+        expect(shownChoices()).toEqual([[sync.residency.full, true, true], [sync.residency.remote, false, true]])
+        expect(findButton(sync.residency.cancel)).toBeDefined()
+        change.reject({ code: 'server-unreachable', retryable: true }); await settle()
+        expect(shownChoices()).toEqual([[sync.residency.full, false, false], [sync.residency.remote, true, false]])
+        expect(alertText()).toBe(sync.errorHelp)
+    })
+    it('drops the loading state when the breakdown cannot be read', async () => {
+        const read = await mountLoading('remote')
+        read.reject({ code: 'local-store-unavailable' }); await settle()
+        expect(loading()).toBeNull()
+        expect(host.querySelectorAll('.place')).toHaveLength(0)
+        expect(shownChoices()).toEqual([[sync.residency.full, false, false], [sync.residency.remote, true, false]])
+        expect(findButton(sync.residency.clean)).toBeDefined()
+        expect(alertText()).toBe(sync.errorHelp)
+    })
+    it('shows the sync storage without waiting for the breakdown', async () => {
+        const { getServerSyncCacheUsage } = await import('src/ts/storage/sync/serverSyncProduction')
+        vi.mocked(getServerSyncCacheUsage).mockResolvedValue({ totalBytes: 2, cacheBytes: 1, protectedBytes: 0, reclaimableBytes: 1, ledgerBytes: 1, databaseBytes: 0, blockedReason: null })
+        await mountLoading('full')
+        expect(loading()).not.toBeNull()
+        expect(host.textContent).toContain(sync.management.title)
+    })
+    it('connects keeping every asset here and downloads them when the stored policy kept them on the server', async () => {
+        f.view = { status: { configured: false, assetPolicy: 'remote' }, paused: false, error: '' }
+        f.status.mockReturnValue(new Promise(() => {}))
+        f.policy.mockResolvedValue(residencyStatus({ policy: 'full', remoteObjects: 0, remoteBytes: 0, serverObjects: 0, serverBytes: 0 }))
+        const connectTarget = vi.fn(async () => { publish(connectedView('remote')) })
+        component = mount(ServerSyncSettings, { target: host, props: { connectTarget } })
+        await settle(); await registration()
+        expect(shownChoices()).toEqual([[sync.residency.full, false, false], [sync.residency.remote, true, false]])
+        choices()[0].click(); await tick()
+        click(sync.connect); await settle()
+        expect(connectTarget).toHaveBeenCalledExactlyOnceWith(registered, false, 'full')
+        expect(f.policy).toHaveBeenCalledExactlyOnceWith('full')
+        const order = [connectTarget, f.hold, f.policy, f.release].map(mock => mock.mock.invocationCallOrder[0])
+        expect(order).toEqual([...order].sort((a, b) => a - b))
+    })
+    it('keeps a choice made before connecting when the connection status is published again', async () => {
+        f.view = { status: { configured: false, assetPolicy: 'full' }, paused: false, error: '' }
+        component = mount(ServerSyncSettings, { target: host, props: { connectTarget: vi.fn() } })
+        await settle(); await registration()
+        choices()[1].click(); await tick()
+        publish({ status: { configured: false, assetPolicy: 'full' }, paused: false, error: '' }); await settle()
+        expect(shownChoices()).toEqual([[sync.residency.full, false, false], [sync.residency.remote, true, false]])
     })
 })
 
