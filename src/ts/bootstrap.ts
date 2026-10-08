@@ -19,6 +19,7 @@ import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { MobileGUI, botMakerMode, selectedCharID, loadedStore, LoadingStatusState, bootFailure } from "./stores.svelte";
 import { loadPlugins, loadPluginsAfterAuthoritativeRestore } from "./plugins/plugins.svelte";
 import { alertConfirm, alertError, alertInput, alertLogin, alertMd, alertNormal, alertSelect, alertToast, alertTOS, waitAlert } from "./alert";
+import { backgroundErrorMessage } from "./storage/backgroundErrorMessage";
 import { applyHubSelection, characterURLImport, downloadRisuHub, hubURL } from "./characterCards";
 import { initializeNativeLocalUrls } from "./nativeLocalUrls";
 import { loadRisuAccountData } from "./drive/accounter";
@@ -492,7 +493,7 @@ export async function loadData() {
             initializeWorkingSet: (database) => initializeActiveWorkingSet(database),
             onRemoteError: (error) => {
                 console.error(error)
-                alertError(error instanceof Error ? error : String(error))
+                alertError(backgroundErrorMessage(error))
             },
             onPullSkipped: ({ conflict }) => {
                 officialReconcilePublish = true
