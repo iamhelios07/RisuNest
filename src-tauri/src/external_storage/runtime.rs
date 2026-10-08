@@ -1723,6 +1723,24 @@ mod tests {
         assert_eq!(dto["retryable"], true);
     }
 
+    /// A long device-store write elsewhere, such as a publication persisting
+    /// its segment, does not fail a state read.
+    #[test]
+    fn a_held_device_store_write_does_not_fail_the_state_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let app = tauri::test::mock_builder().build(tauri::test::mock_context(tauri::test::noop_assets())).unwrap();
+        app.manage(persistent_store::commands::PersistentStoreState::with_test_store(PersistentStore::open(root).unwrap()));
+        let jobs = JobCommandState::default();
+        jobs.root.set(root.to_owned()).unwrap();
+        app.manage(jobs);
+        let holder = rusqlite::Connection::open(root.join("persistent").join("device.sqlite")).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let state = external_storage_get_state(app.handle().clone());
+        holder.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(state.unwrap()["supported"], true);
+    }
+
     #[test]
     fn stopped_unknown_reconciliation_drops_the_stale_result_until_it_completes() {
         let mut job=automatic_job();

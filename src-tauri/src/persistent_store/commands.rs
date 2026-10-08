@@ -2064,6 +2064,22 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    /// The intent recovery every mutable command runs first takes no device-store
+    /// write when nothing settled, so another connection's long write does not fail it.
+    #[test]
+    fn a_held_device_store_write_does_not_fail_a_change_cursor_commit() {
+        let directory = tempdir().unwrap();
+        let state = PersistentStoreState::with_test_store(PersistentStore::open(directory.path()).unwrap());
+        let holder = rusqlite::Connection::open(directory.path().join("persistent").join("device.sqlite")).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let committed = with_store_mutex_mut(&state, |store| {
+            let revision = store.revision()?;
+            store.commit_working_set_change_cursor(revision)
+        });
+        holder.execute_batch("ROLLBACK").unwrap();
+        committed.unwrap();
+    }
+
     #[test]
     fn cleanup_maintenance_timeout_preserves_admission_for_retry() {
         let state = PersistentStoreState::default();
