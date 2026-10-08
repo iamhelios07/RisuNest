@@ -132,6 +132,8 @@ mod message_staging_tests;
 mod archive_tests;
 #[path = "tests/archive_residency_tests.rs"]
 mod archive_residency_tests;
+#[path = "tests/archive_receive_tests.rs"]
+mod archive_receive_tests;
 #[path = "tests/asset_alias_tests.rs"]
 mod asset_alias_tests;
 #[path = "tests/asset_catalog_gc_tests.rs"]

@@ -166,16 +166,7 @@ pub(super) fn fetch_operation_body(
     let hash = if restore {
         read_archived_object(connection, &generation, character_id)?.map(|archived| archived.object_hash)
     } else {
-        connection
-            .query_row(
-                "SELECT manifest_hash FROM asset_owner_heads
-                 WHERE generation = ?1 AND owner_kind = 'character-additional-assets'
-                   AND owner_locator = ?2 AND present = 1",
-                params![generation, character_id],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .optional()?
-            .flatten()
+        owner_manifest_hash(connection, character_id)?
     };
     let Some(hash) = hash else { return Ok(()) };
     if PayloadCas::new(root)?.stat_object(&hash)?.is_some() {
@@ -196,6 +187,24 @@ pub(super) fn fetch_operation_body(
         Err(_) if is_cancelled() => validation(ARCHIVE_CANCELLED_MESSAGE),
         Err(_) => validation(ARCHIVE_DATA_UNAVAILABLE_MESSAGE),
     }
+}
+
+/// The owner manifest that lists the character's additional assets, which archiving reads.
+pub(super) fn owner_manifest_hash(
+    connection: &Connection,
+    character_id: &str,
+) -> StoreResult<Option<String>> {
+    let generation = super::active_generation(connection)?;
+    Ok(connection
+        .query_row(
+            "SELECT manifest_hash FROM asset_owner_heads
+             WHERE generation = ?1 AND owner_kind = 'character-additional-assets'
+               AND owner_locator = ?2 AND present = 1",
+            params![generation, character_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
 }
 
 pub(super) fn is_archived(

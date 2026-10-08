@@ -894,14 +894,16 @@ fn collect_character_asset_hashes_inner(
         .optional()?
         .flatten();
     if let Some(manifest_hash) = manifest_hash {
-        if let Some(canonical) = cas.read_object(&manifest_hash)? {
-            if let Ok(entries) =
-                crate::asset_repository::owner_manifest_codec::decode_owner_manifest(&canonical)
-            {
-                for entry in entries {
-                    if let Some(payload) = entry.payload_hash {
-                        hashes.insert(hex::encode(payload));
-                    }
+        // Assets only the manifest lists would be left out, so an absent manifest refuses.
+        let canonical = cas.read_object(&manifest_hash)?.ok_or_else(|| StoreError::Validation {
+            message: super::archive::ARCHIVE_DATA_MISSING_MESSAGE.to_owned(),
+        })?;
+        if let Ok(entries) =
+            crate::asset_repository::owner_manifest_codec::decode_owner_manifest(&canonical)
+        {
+            for entry in entries {
+                if let Some(payload) = entry.payload_hash {
+                    hashes.insert(hex::encode(payload));
                 }
             }
         }

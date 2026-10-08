@@ -935,8 +935,12 @@ impl LwwClient {
             )
             .optional()?;
         if let Some(pending) = pending {
-            return serde_json::from_str(&pending)
-                .map_err(|_| SyncError::new("receive-page-integrity", 409));
+            let page: StageReceive = serde_json::from_str(&pending)
+                .map_err(|_| SyncError::new("receive-page-integrity", 409))?;
+            // What its archives read is this device's state, which may have changed since the
+            // page was stored.
+            self.prepare_archive_bodies(store, &page.changes)?;
+            return Ok(page);
         }
         self.client.lane().step(Step::Listing);
         let upper = self.admission()?;
@@ -1421,10 +1425,29 @@ impl LwwClient {
                 }
             }
         }
+        self.prepare_archive_bodies(store, changes)?;
         #[cfg(test)]
         if let Some(counter) = &self.client.test_io {
             let mut traffic = counter.traffic.lock().unwrap();
             traffic.prepared_units += changes.len() as u64;
+        }
+        Ok(())
+    }
+    /// Brings the bodies the archives and restores in `changes` read on this device from the
+    /// storage that holds them, so applying the page never waits on a body held elsewhere.
+    fn prepare_archive_bodies(&self, store: &PersistentStore, changes: &[Change]) -> Result<()> {
+        let missing = store.lww_incoming_archive_bodies(changes)?;
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let unavailable =
+            super::residency::HydrationSession::new(store.repository_root(), self.cancelled.clone())?
+                .hydrate_many(&missing, &|| self.check())?;
+        if !unavailable.is_empty() {
+            return Err(SyncError {
+                cause: Some(format!("{} archive bodies", unavailable.len())),
+                ..SyncError::new("required-asset-unavailable", 409)
+            });
         }
         Ok(())
     }
