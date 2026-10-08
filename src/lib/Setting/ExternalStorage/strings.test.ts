@@ -3,6 +3,13 @@ import { externalErrorMessage, externalFolderErrorKind, externalStorageStrings }
 
 const strings = externalStorageStrings('en')
 
+describe('the storage usage copy', () => {
+    it('names the repository data this device knows of without calling it a lower bound', () => {
+        expect(externalStorageStrings('ko')).toMatchObject({ uploadedLowerBound: '이 기기에서 확인한 저장소 데이터', files: '파일 {0}개' })
+        expect(strings).toMatchObject({ uploadedLowerBound: 'Repository data known to this device', files: '{0} files' })
+    })
+})
+
 describe('externalErrorMessage', () => {
     it('reads the kind of a rejected command and the code of a job error', () => {
         expect(externalErrorMessage(strings, { kind: 'storageFull', httpStatus: null, retryAtMs: null }))

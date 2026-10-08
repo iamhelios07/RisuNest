@@ -547,14 +547,15 @@ describe('the storage usage tab', () => {
         expect(alertCheckboxConfirm).toHaveBeenCalledWith(expect.objectContaining({ requireChecked: true, description: `${strings.deleteOtherDeviceConfirm} ${strings.deleteLastRetainedConfirm}`, checkboxLabel: strings.deleteHistoryAcknowledge, actionLabel: strings.deleteHistory }))
         expect(requestExternalStorageDeleteHistory).toHaveBeenCalledWith('connection-1', item, true, true)
     })
-    it('keeps the quota label scoped to locally known repository data', async () => {
+    it('scopes the known repository data to this device and shows the amount it knows', async () => {
         state.getQuota.mockResolvedValue({ connectionId: 'connection-1', buckets: [], storage: {
             providerPhysicalKnown: false, locallyUploadedBytesLowerBound: '12',
-            locallyUploadedObjectCountLowerBound: '1', locallyUploadedCoverage: 'cached-upload-receipts',
+            locallyUploadedObjectCountLowerBound: '3', locallyUploadedCoverage: 'cached-upload-receipts',
         } })
         await openStorageUsage()
         await settle()
-        expect(target.textContent).toContain('Known repository data')
+        const stat = [...target.querySelectorAll('.stat')].find(item => item.querySelector('dt')?.textContent === 'Repository data known to this device')
+        expect([...stat!.querySelectorAll('dd')].map(item => item.textContent?.trim())).toEqual(['12 B', '3 files'])
         expect(target.textContent).not.toContain('Uploaded from this device')
     })
 

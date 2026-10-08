@@ -926,7 +926,7 @@
                                         </div>
                                         <div class="stat">
                                             <dt>{strings.uploadedLowerBound}</dt>
-                                            <dd class="stat-value">{atLeast(usage.storage.locallyUploadedBytesLowerBound)}</dd>
+                                            <dd class="stat-value">{bytes(usage.storage.locallyUploadedBytesLowerBound)}</dd>
                                             <dd class="stat-note">{strings.files.replace('{0}', Number(usage.storage.locallyUploadedObjectCountLowerBound).toLocaleString())}</dd>
                                         </div>
                                         {#if usage.storage.latestReachable}
@@ -1324,7 +1324,7 @@
     }
     .stats {
         display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(min(100%, 7.5rem), 1fr));
+        grid-template-columns: repeat(auto-fit, minmax(min(100%, 10rem), 1fr));
         gap: 0.5rem;
         margin: 0;
     }
@@ -1339,7 +1339,7 @@
         background: var(--risu-theme-darkbg);
     }
     .stat dt {
-        font-size: 12px;
+        font-size: 13px;
         line-height: 1.4;
         color: var(--risu-theme-textcolor2);
     }
@@ -1355,14 +1355,13 @@
         font-variant-numeric: tabular-nums;
     }
     .stat-value[data-unknown='true'] {
-        font-size: 14px;
         font-weight: 500;
-        color: var(--risu-theme-textcolor2);
+        color: color-mix(in srgb, var(--risu-theme-textcolor2) 62%, var(--risu-theme-textcolor) 38%);
     }
     .stat-note {
-        font-size: 12px;
-        line-height: 1.4;
-        color: var(--risu-theme-textcolor2);
+        font-size: 13px;
+        line-height: 1.45;
+        color: color-mix(in srgb, var(--risu-theme-textcolor2) 62%, var(--risu-theme-textcolor) 38%);
     }
     .usage-section {
         display: grid;
@@ -1446,8 +1445,8 @@
     .help {
         max-width: 62ch;
         margin: 0;
-        font-size: 12.5px;
-        line-height: 1.55;
+        font-size: 13px;
+        line-height: 1.5;
         color: color-mix(in srgb, var(--risu-theme-textcolor2) 62%, var(--risu-theme-textcolor) 38%);
     }
     .foot {
