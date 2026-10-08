@@ -264,7 +264,7 @@ describe('SaveCoordinator', () => {
                 estimatedBytes: 1,
                 install: () => harness.database.characters.push(added),
             }, 'create-character')
-            await started.promise
+            await Promise.race([started.promise, saving])
             added.name = 'Renamed during the addition'
             harness.coordinator.markPersistentDataDirty(1)
             first.resolve({ revision: 3 })
