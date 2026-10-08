@@ -44,9 +44,18 @@ pub(crate) fn record_connection_completion(
     connection_id: &str,
     kind: super::connection_store::CompletionKind,
 ) {
-    let result = root(app).and_then(|root| {
-        ConnectionStore::open(&root)?.record_completion(connection_id, kind, now_ms())
-    });
+    match root(app) {
+        Ok(root) => record_connection_completion_at(&root, connection_id, kind),
+        Err(_) => crate::nlog!("warn", "External connection completion timestamp could not be recorded"),
+    }
+}
+pub(crate) fn record_connection_completion_at(
+    root: &std::path::Path,
+    connection_id: &str,
+    kind: super::connection_store::CompletionKind,
+) {
+    let result = ConnectionStore::open(root)
+        .and_then(|mut store| store.record_completion(connection_id, kind, now_ms()));
     if result.is_err() {
         crate::nlog!("warn", "External connection completion timestamp could not be recorded");
     }
