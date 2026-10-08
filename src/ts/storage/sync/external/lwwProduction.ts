@@ -186,6 +186,11 @@ export async function installExternalLwwAdapters(state: ExternalStorageState, re
     }
 }
 
+/** Whether sync with this connection was started in this session. */
+export function isExternalLwwRunning(connectionId: string): boolean {
+    return !!adapters.get(connectionId)?.state
+}
+
 export async function requestExternalLwwNow(connectionId: string): Promise<void> {
     const adapter = adapters.get(connectionId)
     if (!adapter) throw new Error('Sync binding transport is unavailable')

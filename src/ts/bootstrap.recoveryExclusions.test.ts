@@ -6,6 +6,7 @@ const startup = vi.hoisted(() => ({
     takeRendererRecovery: vi.fn(async () => false),
     credential: { id: 'synthetic-account', token: 'synthetic-token' },
     readVault: vi.fn(), reconcile: vi.fn(), external: vi.fn(), transports: vi.fn(), stages: vi.fn(),
+    serverPaused: true, lwwRunning: false, exitDrain: vi.fn(), serverDrain: vi.fn(),
     stop: new Error('synthetic bootstrap test reached UI'),
     markers: { getItem: vi.fn(() => null), setItem: vi.fn(), removeItem: vi.fn(), flush: vi.fn(async () => {}) },
 }))
@@ -81,7 +82,8 @@ vi.mock('./storage/workingSetResidency', () => ({
     workingSetResidency: { clear: vi.fn(), markCharacterReleased: vi.fn(), reconcileConversationResidency: vi.fn() },
 }))
 vi.mock('./storage/persistentDataRuntime.svelte', () => ({
-    getPersistentDataRuntime: () => ({ store: {}, revision: 1, flushPendingData: vi.fn(), expirePersistentTrash: vi.fn(async () => {}) }),
+    getPersistentDataRuntime: () => ({ store: {}, revision: 1, flushPendingData: vi.fn(), expirePersistentTrash: vi.fn(async () => {}),
+        capturePersistentMutationToken: vi.fn(async () => ({ revision: 5 })), acquireDestructiveReplacementFence: vi.fn(async () => ({ revision: 5 })) }),
     initializeActiveWorkingSet: vi.fn(), configurePersistentDataRuntime: vi.fn(),
     hasPendingOfficialPublication: vi.fn(() => false), publishCurrentOfficialRevision: vi.fn(),
 }))
@@ -160,11 +162,14 @@ vi.mock('./nativeLocalUrls', () => ({ initializeNativeLocalUrls: vi.fn() }))
 vi.mock('./iosNative', () => ({ initializeIOSNative: vi.fn(), installIOSPersistenceLifecycle: vi.fn() }))
 vi.mock('./storage/sync/external/production', () => ({
     installExternalStorageProduction: startup.external, installExternalSyncTransports: startup.transports,
+    getExternalStorageSyncExitDrainAdapter: startup.exitDrain,
 }))
+vi.mock('./storage/sync/external/lwwProduction', () => ({ isExternalLwwRunning: () => startup.lwwRunning }))
 vi.mock('./storage/syncExitCoordinator', () => ({ createSyncExitCoordinator: vi.fn(() => ({})) }))
 vi.mock('./storage/syncExitProduction', () => ({ configureSyncExitCoordinator: vi.fn(), registerWindowCloseDrain: vi.fn() }))
 vi.mock('./storage/sync/serverSyncProduction', () => ({
-    createServerSyncExitDrainAdapter: vi.fn(), initializeNativeSyncBindings: vi.fn(),
+    createServerSyncExitDrainAdapter: startup.serverDrain, initializeNativeSyncBindings: vi.fn(),
+    getServerSyncController: () => ({ snapshot: () => ({ paused: startup.serverPaused }) }),
     installServerSyncProduction: vi.fn(), disposeNativeSyncBindings: vi.fn(),
 }))
 vi.mock('./storage/sync/external/bridge', () => ({ getExternalStorageBridge: vi.fn() }))
@@ -177,6 +182,8 @@ import { bootFailure } from './stores.svelte'
 import { loadRisuAccountData } from './drive/accounter'
 import { initializeOfficialAccountBootstrap } from './storage/sync/officialAccountBootstrap'
 import { initializeNativeSyncBindings, installServerSyncProduction } from './storage/sync/serverSyncProduction'
+import { createSyncExitCoordinator } from './storage/syncExitCoordinator'
+import { getExternalStorageBridge } from './storage/sync/external/bridge'
 
 beforeEach(() => {
     vi.clearAllMocks()
@@ -268,6 +275,66 @@ describe('bootstrap recovery exclusions', () => {
         expect(bootFailure.set).toHaveBeenLastCalledWith(expect.objectContaining({
             stage: 'drive-sync', message: failure.message,
         }))
+        expect(startup.external).not.toHaveBeenCalled()
+    })
+})
+
+describe('exit sync after a start that left sync off', () => {
+    type ExitDependencies = Parameters<typeof createSyncExitCoordinator>[0]
+    const selection = (kind: 'server' | 'external', connectionId: string) => ({ kind, connectionId, selectionEpoch: '2', paused: false })
+    async function exitTarget(current: ReturnType<typeof selection>, clearedDuringSession = false) {
+        startup.native = true
+        startup.exclusions = ['sync']
+        startup.exitDrain.mockImplementation(() => ({ id: `external:${current.connectionId}:2` }))
+        startup.serverDrain.mockImplementation((id: string) => ({ id }))
+        vi.mocked(getExternalStorageBridge).mockReturnValue({
+            captureExitTarget: async () => ({ revision: '5', libraryEpoch: '1', selection: current }),
+        } as never)
+        await loadData()
+        const dependencies = vi.mocked(createSyncExitCoordinator).mock.calls.at(-1)![0] as ExitDependencies
+        if (clearedDuringSession) startup.exclusions = []
+        await dependencies.acquireEditFence()
+        const target = await dependencies.captureTarget()
+        return { target, drain: dependencies.selectedDrain() }
+    }
+    beforeEach(() => {
+        startup.serverPaused = true
+        startup.lwwRunning = false
+    })
+
+    it('drains an external target the user started during the session without starting automatic backups', async () => {
+        startup.lwwRunning = true
+        const { target, drain } = await exitTarget(selection('external', 'connection-1'))
+        expect(target.selectionId).toBe('external:connection-1:2')
+        expect(drain?.id).toBe('external:connection-1:2')
+        expect(startup.external).not.toHaveBeenCalled()
+        expect(startup.transports).toHaveBeenCalled()
+    })
+
+    it('leaves an external target alone when it was never started', async () => {
+        const { target, drain } = await exitTarget(selection('external', 'connection-1'))
+        expect(target.selectionId).toBe('none:2')
+        expect(drain).toBeNull()
+        expect(startup.exitDrain).not.toHaveBeenCalled()
+    })
+
+    it('drains a server target the user started during the session', async () => {
+        startup.serverPaused = false
+        const { target, drain } = await exitTarget(selection('server', 'server-1'))
+        expect(target.selectionId).toBe('server:server-1:2')
+        expect(drain?.id).toBe('server:server-1:2')
+    })
+
+    it('leaves a server target alone when it was never started', async () => {
+        const { target, drain } = await exitTarget(selection('server', 'server-1'))
+        expect(target.selectionId).toBe('none:2')
+        expect(drain).toBeNull()
+    })
+
+    it('does not start sync at exit when the exclusion was cleared during the session', async () => {
+        const { target, drain } = await exitTarget(selection('external', 'connection-1'), true)
+        expect(target.selectionId).toBe('none:2')
+        expect(drain).toBeNull()
         expect(startup.external).not.toHaveBeenCalled()
     })
 })

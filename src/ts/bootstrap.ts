@@ -595,7 +595,9 @@ export async function loadData() {
             initializeNativeSyncBindings()
             window.addEventListener('pagehide', disposeNativeSyncBindings, { once: true })
         }
-        if (isTauri && !excluded('sync')) {
+        // The exit drain follows what this start did, not an exclusion cleared later in the session.
+        const syncExcludedAtStart = excluded('sync')
+        if (isTauri && !syncExcludedAtStart) {
             await transition('drive-sync', language.risuNest.startup.account)
             await installServerSyncProduction()
             try {
@@ -657,7 +659,14 @@ export async function loadData() {
                     throw new Error('Normal exit revision changed after the edit fence')
                 }
                 const selection = capture.selection
-                const syncDisabled = excluded('sync') || (
+                // A start that left sync off drains only a target the user started during the session.
+                const syncStopped = syncExcludedAtStart && !(
+                    selection.kind === 'server'
+                        ? !getServerSyncController().snapshot().paused
+                        : selection.kind === 'external' && !!selection.connectionId
+                            && (await import('./storage/sync/external/lwwProduction')).isExternalLwwRunning(selection.connectionId)
+                )
+                const syncDisabled = syncStopped || (
                     selection.kind !== 'none' && (selection.paused || (
                         selection.kind === 'server' && getServerSyncController().snapshot().paused
                     ))
@@ -686,10 +695,12 @@ export async function loadData() {
                     const {
                         getExternalStorageSyncExitDrainAdapter,
                         installExternalStorageProduction,
+                        installExternalSyncTransports,
                     } = await import(
                         './storage/sync/external/production'
                     )
-                    await installExternalStorageProduction()
+                    // A start that left sync off also left automatic backups off, so exit needs only the transports.
+                    await (syncExcludedAtStart ? installExternalSyncTransports() : installExternalStorageProduction())
                     selectedExitDrain = getExternalStorageSyncExitDrainAdapter(
                         capture,
                         heldExitFence,
