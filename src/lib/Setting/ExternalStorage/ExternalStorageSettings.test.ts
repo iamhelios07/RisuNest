@@ -557,6 +557,18 @@ describe('the storage usage tab', () => {
         const stat = [...target.querySelectorAll('.stat')].find(item => item.querySelector('dt')?.textContent === 'Repository data known to this device')
         expect([...stat!.querySelectorAll('dd')].map(item => item.textContent?.trim())).toEqual(['12 B', '3 files'])
         expect(target.textContent).not.toContain('Uploaded from this device')
+        expect(target.textContent).not.toContain(strings.usedByService)
+    })
+
+    it('shows the space used on the service only when the service reports it', async () => {
+        state.getQuota.mockResolvedValue({ connectionId: 'connection-1', buckets: [], storage: {
+            providerPhysicalBytes: '2048', providerPhysicalKnown: true, locallyUploadedBytesLowerBound: '12',
+            locallyUploadedObjectCountLowerBound: '3', locallyUploadedCoverage: 'cached-upload-receipts',
+        } })
+        await openStorageUsage()
+        await settle()
+        const stat = [...target.querySelectorAll('.stat')].find(item => item.querySelector('dt')?.textContent === strings.usedByService)
+        expect(stat?.querySelector('dd')?.textContent?.trim()).toBe('2.0 KiB')
     })
 
     it('runs manual cleanup through the production queue only for a capable connection', async () => {

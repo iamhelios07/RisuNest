@@ -918,12 +918,12 @@
                             {#if usage || remoteOnly[connection.id] !== undefined}
                                 <dl class="stats">
                                     {#if usage}
-                                        {@const known = usage.storage.providerPhysicalKnown && usage.storage.providerPhysicalBytes !== null}
-                                        <div class="stat">
-                                            <dt>{strings.usedByService}</dt>
-                                            <dd class="stat-value" data-unknown={!known}>{known ? bytes(usage.storage.providerPhysicalBytes ?? undefined) : strings.unknownUsage}</dd>
-                                            {#if !known}<dd class="stat-note">{strings.unknownUsageHelp}</dd>{/if}
-                                        </div>
+                                        {#if usage.storage.providerPhysicalKnown && usage.storage.providerPhysicalBytes !== null}
+                                            <div class="stat">
+                                                <dt>{strings.usedByService}</dt>
+                                                <dd class="stat-value">{bytes(usage.storage.providerPhysicalBytes)}</dd>
+                                            </div>
+                                        {/if}
                                         <div class="stat">
                                             <dt>{strings.uploadedLowerBound}</dt>
                                             <dd class="stat-value">{bytes(usage.storage.locallyUploadedBytesLowerBound)}</dd>
