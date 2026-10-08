@@ -1,7 +1,7 @@
 use crate::trust_boundary::{is_link_like, is_lower_hex_256, sync_directory};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs::{self, File, Metadata, OpenOptions},
     io::{self, ErrorKind, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
@@ -556,6 +556,58 @@ impl PayloadCas {
             return Ok(None);
         };
         Ok(Some(fs::symlink_metadata(path)?.len()))
+    }
+
+    /// The length of every object file, read in one pass over the shard
+    /// directories instead of one confined lookup per object.
+    pub(crate) fn object_lengths(&self) -> io::Result<HashMap<String, u64>> {
+        self.ensure_repository_root()?;
+        let mut lengths = HashMap::new();
+        let assets_directory = self.repository_root.join("assets");
+        let objects_directory = assets_directory.join("objects");
+        if !self.existing_owned_directory(&assets_directory)?
+            || !self.existing_owned_directory(&objects_directory)?
+        {
+            return Ok(lengths);
+        }
+        for shard in fs::read_dir(&objects_directory)? {
+            let shard = shard?;
+            let Some(prefix) = shard.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let metadata = match shard.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if prefix.len() != 2 || !metadata.is_dir() || is_link_like(&metadata) {
+                continue;
+            }
+            let entries = match fs::read_dir(shard.path()) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            for entry in entries {
+                let entry = entry?;
+                let Some(rest) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                let content_hash = format!("{prefix}{rest}");
+                if !is_lower_hex_256(&content_hash) {
+                    continue;
+                }
+                let metadata = match entry.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error),
+                };
+                if metadata.is_file() && !is_link_like(&metadata) {
+                    lengths.insert(content_hash, metadata.len());
+                }
+            }
+        }
+        Ok(lengths)
     }
 
     pub fn read_object(&self, content_hash: &str) -> io::Result<Option<Vec<u8>>> {

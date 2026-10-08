@@ -1208,7 +1208,14 @@ pub(crate) struct StorageDeletionStats {
 pub(crate) struct PersistentStorageStats {
     pub(crate) snapshot_bytes: u64,
     pub(crate) database_bytes: u64,
+    /// Every catalogued object, including those whose body is not on this device.
     pub(crate) asset_objects: StorageCountBytes,
+    /// The object files this device stores.
+    pub(crate) asset_bodies: StorageCountBytes,
+    /// Catalogued objects whose body is not on this device, by catalog size.
+    pub(crate) missing_asset_bodies: StorageCountBytes,
+    /// The distinct inlay objects of the active generation stored on this device.
+    pub(crate) inlay_bodies: StorageCountBytes,
     pub(crate) asset_aliases: Vec<StorageAliasStats>,
     pub(crate) plugin_storage: StorageCountBytes,
     pub(crate) characters: StorageCharacterStats,
@@ -2579,6 +2586,8 @@ impl PersistentStore {
     }
 
     pub(crate) fn storage_stats(&self) -> StoreResult<PersistentStorageStats> {
+        let bodies =
+            crate::asset_repository::PayloadCas::new(&self.repository_root)?.object_lengths()?;
         let transaction = self.connection.unchecked_transaction()?;
         let active = active_generation(&transaction)?;
         let database_bytes = snapshot::allocated_database_bytes(&self.database_path)?;
@@ -2587,6 +2596,36 @@ impl PersistentStore {
             "SELECT COUNT(*), COALESCE(SUM(byte_size), 0) FROM asset_objects",
             [],
         )?;
+        let asset_bodies = StorageCountBytes {
+            count: bodies.len() as u64,
+            bytes: bodies.values().sum(),
+        };
+        let mut missing_asset_bodies = StorageCountBytes { count: 0, bytes: 0 };
+        let mut statement = transaction.prepare("SELECT object_hash, byte_size FROM asset_objects")?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let hash: String = row.get(0)?;
+            if !bodies.contains_key(&hash) {
+                missing_asset_bodies.count += 1;
+                missing_asset_bodies.bytes += nonnegative_u64(row.get(1)?)?;
+            }
+        }
+        drop(rows);
+        drop(statement);
+        let mut inlay_bodies = StorageCountBytes { count: 0, bytes: 0 };
+        let mut statement = transaction.prepare(
+            "SELECT DISTINCT object_hash FROM asset_aliases
+             WHERE generation = ?1 AND kind = 'inlay' AND object_hash IS NOT NULL",
+        )?;
+        let mut rows = statement.query([&active])?;
+        while let Some(row) = rows.next()? {
+            if let Some(bytes) = bodies.get(&row.get::<_, String>(0)?) {
+                inlay_bodies.count += 1;
+                inlay_bodies.bytes += bytes;
+            }
+        }
+        drop(rows);
+        drop(statement);
         let plugin_storage = query_count_bytes(
             &transaction,
             "SELECT COUNT(*), COALESCE(SUM(byte_size), 0) FROM plugin_storage WHERE generation = ?1",
@@ -2654,6 +2693,9 @@ impl PersistentStore {
             snapshot_bytes: snapshot_archive::Archive::open(&self.snapshots_dir)?.bytes()?,
             database_bytes,
             asset_objects,
+            asset_bodies,
+            missing_asset_bodies,
+            inlay_bodies,
             asset_aliases: aliases,
             plugin_storage,
             characters: StorageCharacterStats {

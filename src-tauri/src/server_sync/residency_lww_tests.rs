@@ -64,6 +64,35 @@ fn server_hydration_registers_every_body_it_fetches_or_finds_local() {
     store.asset_gc_dry_run(1024, None, crate::external_storage::runtime::now_ms() as i64, 0).unwrap();
 }
 
+/// Offloading keeps every catalog row, so only the device body figure drops,
+/// by what the residency status then counts as held by the server alone.
+#[test]
+fn offloading_lowers_the_device_body_bytes_and_keeps_the_catalog() {
+    let server = LocalServerFixture::new();
+    let (_root, mut store) = local();
+    let core = server.client(&store);
+    let first = vec![71; 128 * 1024 + 1];
+    let second = vec![73; 64 * 1024];
+    put_asset(&mut store, "assets/offload-first.png", &first);
+    put_asset(&mut store, "assets/offload-second.png", &second);
+    super::lww_tests::drain_publications(&core, &mut store, &[]).unwrap();
+    let offloaded = (first.len() + second.len()) as u64;
+    let before = store.storage_stats().unwrap();
+    assert_eq!(before.missing_asset_bodies.count, 0);
+    assert!(before.asset_bodies.bytes >= offloaded);
+
+    store.asset_residency_set_policy(super::residency::AssetPolicy::Remote, || Ok(())).unwrap();
+    assert_eq!(store.asset_residency_evict(|| Ok(())).unwrap().evicted_bytes, offloaded);
+
+    let after = store.storage_stats().unwrap();
+    assert_eq!(after.asset_objects, before.asset_objects);
+    assert_eq!(after.asset_bodies.count, before.asset_bodies.count - 2);
+    assert_eq!(after.asset_bodies.bytes, before.asset_bodies.bytes - offloaded);
+    assert_eq!((after.missing_asset_bodies.count, after.missing_asset_bodies.bytes), (2, offloaded));
+    let status = serde_json::to_value(store.asset_residency_status().unwrap()).unwrap();
+    assert_eq!(status["serverBytes"], offloaded);
+}
+
 #[test]
 fn selected_archive_priority_uses_native_metadata_without_reading_the_archive() {
     use crate::asset_repository::body_io::{reset_body_io,take_body_io};
