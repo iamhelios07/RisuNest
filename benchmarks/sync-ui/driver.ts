@@ -248,7 +248,7 @@ export class SyncDriver {
   }
 
   /** Names a dialog by its type and the product string key of its message, never by its text. */
-  private async describeDialog(value: { type: string; msg?: string; stackTrace?: string; checkboxConfirm?: { title: string } }) {
+  async describeDialog(value: { type: string; msg?: string; stackTrace?: string; checkboxConfirm?: { title: string } }) {
     const { language } = await import("../../src/lang");
     const text = value.checkboxConfirm?.title ?? value.msg ?? "";
     const find = (node: unknown, path: string, depth: number): string | undefined => {

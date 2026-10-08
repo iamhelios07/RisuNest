@@ -45,30 +45,47 @@ function buttons(root: ParentNode, label: string) {
   });
 }
 
-/** Ticks and accepts the restore confirmation the product shows before it replaces the library, while `running` lasts. */
-async function answerRestoreConfirmation(running: Promise<unknown>) {
+type Dialog = { type: string; msg?: string; checkboxConfirm?: { title: string } };
+
+/** Names and closes the dialog on top, as its close button would; the record names it by type and string key. */
+async function closeDialog(driver: SyncDriver) {
+  const { get } = await import("svelte/store");
+  const { alertStore } = await import("../../src/ts/stores.svelte");
+  if (!alertStore.dialogVisible()) return null;
+  const described = await driver.describeDialog(get(alertStore) as Dialog);
+  alertStore.set({ type: "none", msg: "" });
+  return described;
+}
+
+/**
+ * Ticks and accepts the restore confirmation the product shows before it replaces the library, while
+ * `running` lasts. Any other dialog is recorded and closed, which the restore treats as a cancel.
+ */
+async function answerRestoreConfirmation(driver: SyncDriver, running: Promise<unknown>) {
   const { get } = await import("svelte/store");
   const { alertStore } = await import("../../src/ts/stores.svelte");
   const { language } = await import("../../src/lang");
-  const shown = { confirmationShown: false, confirmationGatedByCheckbox: null as boolean | null };
+  const shown = { confirmationShown: false, confirmationGatedByCheckbox: null as boolean | null, otherDialogs: [] as unknown[] };
   let settled = false;
   running.then(() => { settled = true; }, () => { settled = true; });
   const deadline = Date.now() + 120_000;
   while (!settled && !shown.confirmationShown && Date.now() < deadline) {
     if (alertStore.dialogVisible()) {
-      const value = get(alertStore) as { type: string; checkboxConfirm?: { title: string } };
-      if (value.type !== "checkboxConfirm" || value.checkboxConfirm?.title !== language.lwwSync.restoreTitle)
-        missing("restored", "unexpected product dialog", { alertType: value.type });
+      const value = get(alertStore) as Dialog;
       const dialog = document.querySelector<HTMLElement>('[role="dialog"][aria-labelledby="checkbox-confirm-title"]');
       const box = dialog?.querySelector<HTMLInputElement>('input[type="checkbox"]');
       const action = dialog ? buttons(dialog, language.lwwSync.restoreAction) : [];
-      if (dialog && box && action.length === 1) {
+      if (value.type !== "checkboxConfirm" || value.checkboxConfirm?.title !== language.lwwSync.restoreTitle) {
+        shown.otherDialogs.push(await closeDialog(driver));
+      } else if (dialog && box && action.length === 1) {
         shown.confirmationShown = true;
         shown.confirmationGatedByCheckbox = action[0].disabled && !box.checked;
         box.click();
         await new Promise((resolve) => setTimeout(resolve, 50));
-        if (!box.checked || action[0].disabled) missing("restored", "the restore action stayed disabled after acknowledging", shown);
-        action[0].click();
+        if (!box.checked || action[0].disabled) {
+          shown.otherDialogs.push({ restoreActionDisabledAfterAcknowledging: true });
+          await closeDialog(driver);
+        } else action[0].click();
       }
     }
     await new Promise((resolve) => setTimeout(resolve, 100));
@@ -134,10 +151,13 @@ export async function backupFileRestore(driver: SyncDriver, input: { seed: Seed;
         last.phase = status.phase ?? null;
       },
     }), detail);
-    const confirmation = await answerRestoreConfirmation(running);
+    const confirmation = await answerRestoreConfirmation(driver, running);
     const result = await withDeadline(300_000, running, () => missing("restored", "the restore did not finish", { ...detail(), ...confirmation }));
     if (!result) missing("restored", "the restore was cancelled", { ...detail(), ...confirmation });
-    return { warningCodes: result!.warningCodes, ...detail(), ...confirmation, outcome: await closeOutcome() };
+    // A preservation report opens a notice the restore does not wait for.
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const notice = await closeDialog(driver);
+    return { warningCodes: result!.warningCodes, ...detail(), ...confirmation, notice, outcome: await closeOutcome() };
   });
   const location = await driver.step("sync-result", "library-restored", async () => {
     const found = await markers(driver, "library-restored", input.before, input.after);

@@ -368,7 +368,14 @@ final class NativeUITests: XCTestCase {
             return false
         }, object: nil)
         let outcome = XCTWaiter().wait(for: [settled], timeout: 600)
-        attachScreenshot(app, name: "\(phase)-final")
+        if app.state == .notRunning {
+            let attachment = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+            attachment.name = "\(phase)-final"
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        } else {
+            attachScreenshot(app, name: "\(phase)-final")
+        }
         guard outcome == .completed, result.exists || failure.exists else {
             let stopped = app.state == .notRunning
             let last = step.exists ? step.label : lastStep
