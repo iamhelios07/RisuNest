@@ -393,6 +393,12 @@ impl PersistentStore {
                 local.extend(root.object_hashes.iter().cloned());
                 local.extend(root.manifest_hashes.iter().cloned());
             }
+            // External captures require their payloads, held locally or in
+            // custody, through publication, even when the source alias was
+            // removed by a later edit.
+            if label == "remote" {
+                local.extend(root.object_hashes.iter().cloned());
+            }
             if label == "server-conflict" {
                 local.extend(root.object_hashes);
             } else {
@@ -423,16 +429,6 @@ impl PersistentStore {
             local.extend(root.object_hashes);
             local.extend(root.manifest_hashes);
         }
-        // External captures require their payloads, held locally or in custody,
-        // through publication, even when the source alias was removed by a
-        // later edit.
-        local.extend(
-            crate::external_storage::capture::registered_roots(
-                &self.connection,
-                &self.repository_root,
-            )?
-            .object_hashes,
-        );
         let jobs = if guarded {
             crate::asset_repository::job_pins::collect_durable_cas_job_roots_already_guarded(
                 &self.repository_root,

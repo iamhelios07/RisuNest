@@ -394,3 +394,17 @@ fn removing_a_connection_forgets_catalog_rows_only_it_held() {
     assert_eq!(lww_residency::stat(&root, &shared).unwrap(), Some(size));
     f.b.asset_gc_dry_run(1024, None, super::runtime::now_ms() as i64, 0).unwrap();
 }
+
+
+fn registered_root_collections() -> usize {
+    crate::external_storage::capture::REGISTERED_ROOT_COLLECTIONS.with(|count| count.get())
+}
+
+#[test]
+fn a_status_collects_the_registered_capture_roots_once() {
+    let mut f = CycleFixture::new();
+    let (_connection, _exclusive, _shared) = shared_holders(&mut f);
+    let before = registered_root_collections();
+    status(&f.b);
+    assert_eq!(registered_root_collections(), before + 1);
+}
