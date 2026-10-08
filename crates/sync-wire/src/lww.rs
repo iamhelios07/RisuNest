@@ -172,6 +172,8 @@ pub struct StatePin {
     pub pin_id: String,
     pub start_seq: DecimalU64,
     pub expires_at_ms: DecimalU64,
+    /// Units the pin holds, so a reader knows how many state pages it will list.
+    pub unit_count: DecimalU64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

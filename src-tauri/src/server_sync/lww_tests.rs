@@ -1452,6 +1452,41 @@ fn bootstrap_keeps_a_lower_stamped_retirement_from_the_journal_tail() {
     assert_eq!(existence.stamp.physical_ms.0, 20);
 }
 
+#[test]
+fn a_state_read_plans_its_listing_from_the_units_its_pin_holds() {
+    let lane = Arc::new(super::progress::ProgressLane::default());
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (watched, totals) = (lane.clone(), seen.clone());
+    let server = LocalServerFixture::with_router(move |router| {
+        router.layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                if request.uri().path() == "/state" {
+                    totals.lock().unwrap().push(watched.snapshot("binding").listed_total);
+                }
+                next.run(request)
+            },
+        ))
+    });
+    let writer = ServerWriter::new(&server.server);
+    for index in 0..300 {
+        let key = UnitKey::new(&["exists", "character", &format!("synthetic-{index}")]).unwrap();
+        writer.push(&format!("create-{index}"), &key, 100, UnitValue::inline(br#"{"type":"character"}"#).unwrap());
+    }
+    let (_root, mut store) = local();
+    let changes = super::progress::within(&lane, || {
+        let client = server.client(&store);
+        let upper = client.admission().unwrap();
+        client.state(&mut store, upper).unwrap().1
+    });
+    assert_eq!(changes.len(), 300);
+    let read = lane.snapshot("binding");
+    assert_eq!((read.listed, read.listed_total), (300, 300));
+    // Every state page was requested with the whole total already planned.
+    let seen = seen.lock().unwrap();
+    assert!(seen.len() >= 2);
+    assert!(seen.iter().all(|total| *total == 300));
+}
+
 fn publication_ids(client: &LwwClient) -> Vec<String> {
     let mut query = client
         .log

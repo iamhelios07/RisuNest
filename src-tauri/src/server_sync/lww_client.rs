@@ -746,6 +746,8 @@ impl LwwClient {
                 None::<&AckRequest>,
                 &[],
             )?;
+            // The pin reports what it holds, so the listing has its total before the first page.
+            lane.plan_listing(pin.unit_count.0);
             let result = (|| {
                 let mut after = None;
                 let mut changes = Vec::new();

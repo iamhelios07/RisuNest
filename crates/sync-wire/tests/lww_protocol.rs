@@ -130,6 +130,17 @@ fn notifications_and_pages_keep_precise_cursors() {
         canonical::decode::<StatePage>(&canonical::encode(&page).unwrap(), 4096).unwrap(),
         page
     );
+    let pin = StatePin {
+        pin_id: "pin".into(),
+        start_seq: 1.into(),
+        expires_at_ms: 2.into(),
+        unit_count: 3.into(),
+    };
+    assert_eq!(
+        canonical::decode::<StatePin>(&canonical::encode(&pin).unwrap(), 4096).unwrap(),
+        pin
+    );
+    assert!(canonical::decode::<StatePin>(br#"{"expiresAtMs":"2","pinId":"pin","startSeq":"1"}"#, 4096).is_err());
     assert!(canonical::decode::<AckRequest>(br#"{"seq":1}"#, 4096).is_err());
     assert!(canonical::decode::<AckRequest>(br#"{"seq":"01"}"#, 4096).is_err());
     assert!(canonical::decode::<AckRequest>(br#"{"seq":"1","extra":true}"#, 4096).is_err());

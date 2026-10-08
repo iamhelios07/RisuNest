@@ -12,6 +12,8 @@ export interface ServerSyncLane {
     active: boolean
     step: ServerSyncNativeStep
     listed: number
+    /** Units a state read will list, as its pin reported them. */
+    listedTotal: number
     itemsDone: number
     itemsTotal: number
     filesDone: number
@@ -30,7 +32,7 @@ export interface ServerSyncLane {
 }
 export const readServerSyncLanes = () => invoke<ServerSyncLane[]>('server_sync_progress')
 
-const COUNTS = ['listed', 'itemsDone', 'itemsTotal', 'filesDone', 'filesTotal', 'bytesDone', 'bytesTotal', 'sentBytes', 'receivedBytes', 'backlogDone'] as const
+const COUNTS = ['listed', 'listedTotal', 'itemsDone', 'itemsTotal', 'filesDone', 'filesTotal', 'bytesDone', 'bytesTotal', 'sentBytes', 'receivedBytes', 'backlogDone'] as const
 
 /** What each lane did after `baseline` was read. */
 export function laneDeltas(current: ServerSyncLane[], baseline: ServerSyncLane[]): ServerSyncLane[] {
@@ -147,7 +149,9 @@ function itemWork(attempt: ServerSyncAttempt, name: 'send' | 'receive' | 'bindin
 function stageWork(attempt: ServerSyncAttempt, lane: ServerSyncLane): Work | undefined {
     if (lane.assetScope) return lane.assetScope.total ? capped(lane.assetScope.done, lane.assetScope.total) : undefined
     if (lane.lane === 'send' || lane.lane === 'receive') return itemWork(attempt, lane.lane)
-    return lane.lane === 'binding' && lane.step !== 'listing' ? itemWork(attempt, 'binding') : undefined
+    if (lane.lane !== 'binding') return undefined
+    if (lane.step !== 'listing') return itemWork(attempt, 'binding')
+    return lane.listedTotal > 0 ? capped(lane.listed, lane.listedTotal) : undefined
 }
 /**
  * The running step measured in bytes against a total planned once: an asset download scope.
