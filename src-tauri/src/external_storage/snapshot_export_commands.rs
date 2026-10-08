@@ -98,7 +98,7 @@ fn publish_uri_destination(
         .fs()
         .open(selected.clone(), options)
         .map_err(|_| ProviderError::new(ErrorKind::Transient))?;
-    let mut buffer = [0u8; 1024 * 1024];
+    let mut buffer = vec![0u8; 1024 * 1024];
     loop {
         cancel.check()?;
         let count = source
