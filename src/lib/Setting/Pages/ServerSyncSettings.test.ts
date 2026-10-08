@@ -78,6 +78,74 @@ it.each(['', 'server-unreachable', 'clock-skew', 'unauthorized'])('offers no new
     expect(findButton(languageEnglish.risuNest.serverSync.connect)).toBeDefined()
     expect(findButton(languageEnglish.lwwSync.newDeviceAction)).toBeUndefined()
 })
+describe('a registration code the server refuses', () => {
+    const usedCodes = ['registration-used', 'registration-integrity', 'registration-not-new']
+    it.each(usedCodes.flatMap(error => [{ error, tone: 'settings' as const }, { error, tone: 'onboarding' as const }]))('asks for a new registration code for "$error" in $tone', async ({ error, tone }) => {
+        f.view = { status: { configured: true, bound: false }, paused: true, error }
+        component = mount(ServerSyncSettings, { target: host, props: { connectTarget: vi.fn(), tone } })
+        await settle()
+        expect(host.querySelector('[role="alert"]')?.textContent).toBe(tone === 'onboarding' ? languageEnglish.lwwSync.registrationUsedOnboarding : languageEnglish.lwwSync.registrationUsed)
+        expect(host.querySelector('#server-registration')).not.toBeNull()
+    })
+    it('names the new registration code a duplicate device needs', async () => {
+        f.view = { status: { configured: true, bound: true }, paused: true, error: 'writer-collision', blockedCode: 'writer-collision' }
+        component = mount(ServerSyncSettings, { target: host, props: { connectTarget: vi.fn() } })
+        await settle()
+        expect(host.querySelector('[role="alert"]')?.textContent).toBe(languageEnglish.lwwSync.writerCollision)
+    })
+    it.each(usedCodes.flatMap(error => [{ error, newDevice: false }, { error, newDevice: true }]))('returns to the code input when $error refuses a connection with newDevice=$newDevice', async ({ error, newDevice }) => {
+        const stopped = { status: { configured: true, bound: true }, paused: true, error: 'writer-collision', blockedCode: 'writer-collision' }
+        f.view = stopped
+        const connectTarget = vi.fn(async (): Promise<void> => {
+            publish({ ...stopped, error })
+            throw Object.assign(new Error(error), { code: error, status: 409, retryable: false })
+        })
+        component = mount(ServerSyncSettings, { target: host, props: { connectTarget } })
+        await registration()
+        click(newDevice ? languageEnglish.lwwSync.newDeviceAction : languageEnglish.risuNest.serverSync.connect)
+        await settle()
+        expect(connectTarget).toHaveBeenCalledExactlyOnceWith(registered, newDevice, undefined)
+        expect(host.querySelector('[role="alert"]')?.textContent).toBe(languageEnglish.lwwSync.registrationUsed)
+        expect(host.querySelector('#server-registration')).not.toBeNull()
+        expect(findButton(languageEnglish.risuNest.serverSync.connect)).toBeUndefined()
+        // Sync is still stopped by the duplicate device, so a new code can connect as a new device.
+        await registration()
+        expect(findButton(languageEnglish.lwwSync.newDeviceAction)).toBeDefined()
+        connectTarget.mockImplementationOnce(async () => { publish({ status: { configured: true, bound: true }, paused: false, error: '' }) })
+        click(languageEnglish.lwwSync.newDeviceAction)
+        await settle()
+        expect(connectTarget).toHaveBeenLastCalledWith(registered, true, undefined)
+        expect(host.querySelector('#server-registration')).toBeNull()
+    })
+    it('returns to the code input when a first connection is refused', async () => {
+        const connectTarget = vi.fn(async () => { throw Object.assign(new Error('registration-used'), { code: 'registration-used', status: 409, retryable: false }) })
+        component = mount(ServerSyncSettings, { target: host, props: { connectTarget } })
+        await registration()
+        click(languageEnglish.risuNest.serverSync.connect)
+        await settle()
+        expect(connectTarget).toHaveBeenCalledExactlyOnceWith(registered, false, 'full')
+        expect(host.querySelector('[role="alert"]')?.textContent).toBe(languageEnglish.lwwSync.registrationUsed)
+        expect(host.querySelector('#server-registration')).not.toBeNull()
+    })
+    it('keeps the read code when the connection fails for another reason', async () => {
+        const connectTarget = vi.fn(async () => { throw Object.assign(new Error('server-unreachable'), { code: 'server-unreachable', status: 503, retryable: true }) })
+        component = mount(ServerSyncSettings, { target: host, props: { connectTarget } })
+        await registration()
+        click(languageEnglish.risuNest.serverSync.connect)
+        await settle()
+        expect(host.querySelector('[role="alert"]')).not.toBeNull()
+        expect(host.querySelector('#server-registration')).toBeNull()
+        expect(findButton(languageEnglish.risuNest.serverSync.connect)).toBeDefined()
+    })
+    it('keeps onboarding on the code input when the code is refused', async () => {
+        f.connect.mockRejectedValue(Object.assign(new Error('registration-used'), { code: 'registration-used', status: 409, retryable: false }))
+        await openOnboardingServer(); await registration(); click(languageEnglish.risuNest.serverSync.connect); await settle()
+        expect(f.connect).toHaveBeenCalledExactlyOnceWith(registered, false, 'full')
+        expect(heading()).toBe(onboarding.hub.title)
+        expect(host.querySelector('[role="alert"]')?.textContent).toBe(languageEnglish.lwwSync.registrationUsedOnboarding)
+        expect(host.querySelector('#server-registration')).not.toBeNull()
+    })
+})
 it('shows an unfinished connection with Connect, which finishes it with the saved registration', async () => {
     f.view = { status: { configured: false, bound: true }, paused: true, error: '', bindingIncomplete: true }
     f.complete.mockResolvedValue(undefined)

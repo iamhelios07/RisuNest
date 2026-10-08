@@ -59,7 +59,10 @@
     let stopWatching = () => {}
     const writerRecoveryCodes = ['writer-collision', 'equal-stamp-integrity']
     const registrationCodes = ['unauthorized', 'invalid-device-token', 'server-epoch-changed']
-    let writerRecovery = $derived(writerRecoveryCodes.includes(view.error))
+    // The server refused the registration code itself, so only a new one can connect.
+    const usedRegistrationCodes = ['registration-used', 'registration-integrity', 'registration-not-new']
+    // Sync stays stopped by the collision while another connection attempt fails.
+    let writerRecovery = $derived(writerRecoveryCodes.includes(view.error) || writerRecoveryCodes.includes(view.blockedCode))
     let connected = $derived(!!view.status.configured && !!view.status.bound)
     // The connection status carries the stored policy, so the choices do not wait for the breakdown.
     let storedPolicy = $derived(view.status.assetPolicy ?? residency?.policy)
@@ -97,6 +100,7 @@
         if (token === 'unit-too-large') return language.lwwSync.unitTooLarge
         if (token === 'device-credential-unavailable') return linux ? copy.credentialUnavailableLinux : copy.credentialUnavailable
         if (registrationCodes.includes(token)) return language.lwwSync.registrationRevoked
+        if (usedRegistrationCodes.includes(token)) return tone === 'onboarding' ? language.lwwSync.registrationUsedOnboarding : language.lwwSync.registrationUsed
         if (token === PREVIOUS_FILES_DOWNLOAD_FAILED) return language.lwwSync.downloadFailedNotConnected
         if (token === 'previous-storage-unavailable') return language.lwwSync.previousStorageUnavailable
         if (token.startsWith('qr-')) return token.includes('permission') ? copy.cameraDenied : copy.cameraUnavailable
@@ -133,7 +137,12 @@
         if (!candidate) return
         const choice = connected ? undefined : policy
         const kept = storedPolicy
-        await connectTarget(candidate, newDevice, choice)
+        try { await connectTarget(candidate, newDevice, choice) }
+        catch (error) {
+            // A refused code is put away so a new one can be entered.
+            if (usedRegistrationCodes.includes(errorCode(error))) candidate = undefined
+            throw error
+        }
         candidate = undefined; codeOpen = false
         // Connecting applies only a remote choice, so a device that kept assets on the server and chose full downloads them here.
         if (choice === 'full' && kept === 'remote' && connected) return downloadHeld()
