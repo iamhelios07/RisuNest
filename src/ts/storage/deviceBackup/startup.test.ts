@@ -232,6 +232,31 @@ describe("device maintenance bootstrap ordering", () => {
     expect(state.normalStarted).not.toHaveBeenCalled();
   });
 
+  it("shows the retry panel in Korean on a Korean device", async () => {
+    vi.spyOn(navigator, "language", "get").mockReturnValue("ko-KR");
+    state.invoke.mockImplementation((command: string) => {
+      if (command === "native_startup_status") return Promise.resolve();
+      if (command === "native_device_backup_bootstrap")
+        return Promise.resolve(nativeComplete(true));
+      if (command === "native_device_backup_recovery_complete")
+        return Promise.reject(new Error("synthetic acknowledgement failure"));
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    const { deviceMaintenanceBeforeBootstrap } = await import("./entry");
+    void deviceMaintenanceBeforeBootstrap({ reload: vi.fn() });
+    const panel = await vi.waitFor(() => {
+      const found = document.querySelector("main[role=\"status\"]");
+      expect(found).not.toBeNull();
+      return found as HTMLElement;
+    });
+    expect(panel.querySelector("h1")?.textContent).toBe("RisuNest 백업 복원");
+    expect(panel.querySelector("p")?.textContent).toBe(
+      "백업 복원을 완료하지 못해 앱을 시작할 수 없습니다. 다시 시도해주세요.",
+    );
+    expect(panel.querySelector("button")?.textContent).toBe("다시 시도");
+  });
+
   it("reloads native completion directly instead of requesting clone recovery", async () => {
     const reload = vi.fn();
     state.invoke.mockImplementation((command: string) => {

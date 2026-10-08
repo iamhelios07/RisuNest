@@ -17,6 +17,7 @@ export interface DeviceMaintenanceEntryDependencies {
 }
 
 function showStartupFailure(retry: () => void): void {
+  const ko = navigator.language.startsWith("ko");
   const host = document.createElement("main");
   host.setAttribute("role", "status");
   // The body does not scroll and #app fills it, so the panel covers the viewport itself.
@@ -26,12 +27,13 @@ function showStartupFailure(retry: () => void): void {
   panel.style.cssText =
     "font:16px system-ui;padding:2rem;max-width:42rem;margin:auto;line-height:1.6";
   const heading = document.createElement("h1");
-  heading.textContent = "RisuNest backup maintenance";
+  heading.textContent = ko ? "RisuNest 백업 복원" : "RisuNest backup maintenance";
   const message = document.createElement("p");
-  message.textContent =
-    "Device storage recovery could not finish. Normal app startup is blocked. Retry recovery to continue.";
+  message.textContent = ko
+    ? "백업 복원을 완료하지 못해 앱을 시작할 수 없습니다. 다시 시도해주세요."
+    : "Device storage recovery could not finish. Normal app startup is blocked. Retry recovery to continue.";
   const action = document.createElement("button");
-  action.textContent = "Retry recovery";
+  action.textContent = ko ? "다시 시도" : "Retry recovery";
   action.style.cssText = "font:inherit;padding:.5rem 1rem;cursor:pointer";
   action.onclick = () => {
     action.disabled = true;
