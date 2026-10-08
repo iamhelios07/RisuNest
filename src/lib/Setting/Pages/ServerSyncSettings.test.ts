@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mount, tick, unmount } from 'svelte'
 import { languageEnglish } from 'src/lang/en'
-const f = vi.hoisted(() => ({ pending: vi.fn(async (): Promise<number | undefined> => undefined), ensure: vi.fn(), connect: vi.fn(), complete: vi.fn(), configure: vi.fn(), bind: vi.fn(), disconnect: vi.fn(), hold: vi.fn(), release: vi.fn(), status: vi.fn(), policy: vi.fn(), cancel: vi.fn(), checkbox: vi.fn(), action: vi.fn(), native: true, scan: false, scanner: { scan: vi.fn(), cancel: vi.fn() }, os: 'windows', listeners: new Set<(value: Record<string, unknown>) => void>(), bindingState: vi.fn(), preset: vi.fn(), state: { db: {} as Record<string, unknown> }, view: { status: { configured: false }, paused: false } as Record<string, unknown> }))
+const f = vi.hoisted(() => ({ pending: vi.fn(async (): Promise<number | undefined> => undefined), ensure: vi.fn(), connect: vi.fn(), complete: vi.fn(), configure: vi.fn(), bind: vi.fn(), disconnect: vi.fn(), hold: vi.fn(), release: vi.fn(), status: vi.fn(), policy: vi.fn(), evict: vi.fn(), cancel: vi.fn(), checkbox: vi.fn(), action: vi.fn(), native: true, scan: false, scanner: { scan: vi.fn(), cancel: vi.fn() }, os: 'windows', listeners: new Set<(value: Record<string, unknown>) => void>(), bindingState: vi.fn(), preset: vi.fn(), state: { db: {} as Record<string, unknown> }, view: { status: { configured: false }, paused: false } as Record<string, unknown> }))
 vi.mock('src/lang', async () => ({ language: (await import('src/lang/en')).languageEnglish, changeLanguage: vi.fn() }))
 vi.mock('src/ts/platform', () => ({ get isTauri() { return f.native } }))
 vi.mock('@tauri-apps/plugin-os', () => ({ platform: () => f.os }))
@@ -12,7 +12,7 @@ vi.mock('src/ts/storage/sync/serverSyncProduction', () => ({
     getServerSyncCacheUsage: vi.fn(), cleanupServerSyncCache: vi.fn(),
     getServerSyncController: () => ({ snapshot: () => f.view, subscribe: (listener: (value: Record<string, unknown>) => void) => { f.listeners.add(listener); listener(f.view); return () => { f.listeners.delete(listener) } }, ensureStatus: f.ensure, watchProgress: () => () => {}, pendingChanges: f.pending, track: (_stage: string, operation: () => Promise<unknown>) => operation() }),
 }))
-vi.mock('src/ts/storage/sync/serverAssetResidency', () => ({ getAssetResidencyStatus: f.status, setAssetResidencyPolicy: f.policy, evictLocalAssets: vi.fn(), cancelAssetResidencyOperation: f.cancel }))
+vi.mock('src/ts/storage/sync/serverAssetResidency', () => ({ getAssetResidencyStatus: f.status, setAssetResidencyPolicy: f.policy, evictLocalAssets: f.evict, cancelAssetResidencyOperation: f.cancel }))
 vi.mock('src/ts/storage/sync/serverSyncRegistration', () => ({ parseServerRegistration: () => ({ endpoint: 'https://synthetic.invalid', libraryId: 'library', deviceId: 'registration', token: 'synthetic' }) }))
 vi.mock('src/ts/storage/sync/serverSyncRegistrationInbox', () => ({ serverRegistrationInbox: { changed: { subscribe: () => () => {} }, releaseConsumed: vi.fn() } }))
 vi.mock('src/ts/storage/sync/serverSyncQr', () => ({ get canScanServerRegistration() { return f.scan }, createServerQrScanner: () => f.scanner }))
@@ -43,7 +43,7 @@ let component: ReturnType<typeof mount> | undefined
 let host: HTMLDivElement
 beforeEach(() => {
     vi.clearAllMocks(); f.native = true; f.scan = false; f.os = 'windows'; f.listeners.clear(); f.view = { status: { configured: false }, paused: false }; host = document.createElement('div'); document.body.append(host)
-    for (const mock of [f.disconnect, f.hold, f.release, f.status, f.policy, f.cancel, f.checkbox, f.action, f.complete, f.ensure]) mock.mockReset()
+    for (const mock of [f.disconnect, f.hold, f.release, f.status, f.policy, f.evict, f.cancel, f.checkbox, f.action, f.complete, f.ensure]) mock.mockReset()
     f.hold.mockResolvedValue(f.release)
     f.state.db = { language: 'en', characters: [] }
     f.preset.mockImplementation((db: Record<string, unknown>) => ({ ...db, preset: 'starting' }))
@@ -601,10 +601,10 @@ describe('asset storage before its breakdown loads', () => {
     it('changes the choice while the breakdown loads and keeps the newer breakdown over the first one', async () => {
         const first = await mountLoading('full')
         f.ensure.mockImplementation(async () => { publish(connectedView('remote')) })
-        f.policy.mockResolvedValue(residencyStatus({ policy: 'remote' }))
-        f.status.mockResolvedValue(residencyStatus({ policy: 'remote', localBytes: 1024 }))
+        f.policy.mockResolvedValue(residencyStatus({ policy: 'remote', localBytes: 1024 }))
         choices()[1].click(); await settle()
         expect(f.policy).toHaveBeenCalledExactlyOnceWith('remote')
+        expect(f.status).toHaveBeenCalledOnce()
         expect(loading()).toBeNull()
         expect(rowValue(sync.residency.local)).toBe('1.0 KiB')
         first.resolve(residencyStatus({ policy: 'full', localBytes: 8 * 1024 * 1024 })); await settle()
@@ -653,6 +653,32 @@ describe('asset storage before its breakdown loads', () => {
         expect(f.policy).toHaveBeenCalledExactlyOnceWith('full')
         const order = [connectTarget, f.hold, f.policy, f.release].map(mock => mock.mock.invocationCallOrder[0])
         expect(order).toEqual([...order].sort((a, b) => a - b))
+    })
+    it.each([
+        { name: 'a policy change', returns: 'policy', policy: 'remote', act: () => choices()[1].click() },
+        { name: 'downloading the files kept elsewhere', returns: 'policy', policy: 'full', act: () => click(sync.residency.download) },
+        { name: 'a cleanup', returns: 'evict', policy: 'full', act: () => click(sync.residency.clean) },
+    ] as const)('shows the breakdown $name returns without reading it again', async ({ returns, policy, act }) => {
+        f.view = connectedView('full')
+        f.status.mockResolvedValue(residencyStatus({ policy: 'full', localBytes: 8 * 1024 * 1024 }))
+        component = mount(ServerSyncSettings, { target: host, props: { connectTarget: vi.fn() } })
+        await settle()
+        expect(rowValue(sync.residency.local)).toBe('8.0 MiB')
+        f[returns].mockResolvedValue(residencyStatus({ policy, localBytes: 3 * 1024 }))
+        act(); await settle()
+        expect(f[returns]).toHaveBeenCalledOnce()
+        expect(f.status).toHaveBeenCalledOnce()
+        expect(rowValue(sync.residency.local)).toBe('3.0 KiB')
+        expect(alertText()).toBeUndefined()
+    })
+    it('reads the breakdown again after an operation that returns none', async () => {
+        f.view = connectedView('full')
+        f.status.mockResolvedValueOnce(residencyStatus({ policy: 'full', localBytes: 8 * 1024 * 1024 })).mockResolvedValue(residencyStatus({ policy: 'full', localBytes: 1024 }))
+        component = mount(ServerSyncSettings, { target: host, props: { connectTarget: vi.fn() } })
+        await settle()
+        click(sync.syncNow); await settle()
+        expect(f.status).toHaveBeenCalledTimes(2)
+        expect(rowValue(sync.residency.local)).toBe('1.0 KiB')
     })
     it('keeps a choice made before connecting when the connection status is published again', async () => {
         f.view = { status: { configured: false, assetPolicy: 'full' }, paused: false, error: '' }

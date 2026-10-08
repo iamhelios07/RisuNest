@@ -115,12 +115,16 @@
         }
     }
     async function readCache() { cache = await getServerSyncCacheUsage() }
-    async function refresh() { await controller.ensureStatus(); await Promise.all([readResidency(), readCache()]) }
-    async function run(operation: () => Promise<unknown>) {
+    // A policy change, download or cleanup answers with the breakdown it leaves, which is shown without reading it again.
+    async function refresh(known?: AssetResidencyStatus | void) {
+        if (known) { residencyRead++; residencyFailed = false; residency = known }
+        await controller.ensureStatus(); await Promise.all([known ? undefined : readResidency(), readCache()])
+    }
+    async function run(operation: () => Promise<AssetResidencyStatus | void>) {
         if (busy) return
         busy = true; failure = ''
         // A failure the operation already explained stays over a later refresh error.
-        try { await operation(); await refresh() } catch (error) { failure ||= message(error) } finally { busy = false }
+        try { await refresh(await operation()) } catch (error) { failure ||= message(error) } finally { busy = false }
     }
     function readCode() { try { candidate = parseServerRegistration(code); code = ''; failure = '' } catch { failure = copy.registrationInvalid } }
     async function scan() { scanning = true; try { candidate = await scanner.scan(tone); failure = '' } catch (error) { if (!isQrScanCancelled(error)) failure = message(error) } finally { scanning = false } }
@@ -132,10 +136,10 @@
         await connectTarget(candidate, newDevice, choice)
         candidate = undefined; codeOpen = false
         // Connecting applies only a remote choice, so a device that kept assets on the server and chose full downloads them here.
-        if (choice === 'full' && kept === 'remote' && connected) await downloadHeld()
+        if (choice === 'full' && kept === 'remote' && connected) return downloadHeld()
     }
-    async function downloadAll() { downloading = true; try { await controller.track('assets', () => setAssetResidencyPolicy('full')) } finally { downloading = false } }
-    async function downloadHeld() { const release = await holdServerSync(); try { await downloadAll() } finally { await release() } }
+    async function downloadAll() { downloading = true; try { return await controller.track('assets', () => setAssetResidencyPolicy('full')) } finally { downloading = false } }
+    async function downloadHeld() { const release = await holdServerSync(); try { return await downloadAll() } finally { await release() } }
     async function disconnect() {
         let serverObjects: number | undefined
         let timer: ReturnType<typeof setTimeout> | undefined
