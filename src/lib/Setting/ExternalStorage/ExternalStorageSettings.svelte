@@ -199,8 +199,10 @@
         const next: Record<string, number> = {}
         for (const connection of state.connections) {
             const job = state.jobs.find(item => item.connectionId === connection.id)
-            // Only a running phase measured in bytes has a time left.
+            // Only a running phase measured in bytes has a time left. A backup's upload total
+            // grows with each sealed pack, so its first pack alone would predict too little.
             const phase = job && externalJobIsActive(job) && !externalJobIsPaused(job) && activeJobFraction(job) !== null
+                && !(job.kind === 'backup' && job.counters === 'transferred')
                 ? `${job.id}:${job.phase}:${job.counters ?? ''}` : undefined
             let estimator = remainingEstimators.get(connection.id)
             if (!estimator) remainingEstimators.set(connection.id, estimator = createRemainingTimeEstimator())

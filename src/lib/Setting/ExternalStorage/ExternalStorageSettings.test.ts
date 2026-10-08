@@ -254,7 +254,7 @@ describe('the storage usage tab', () => {
             let completed = 0
             let total = 1_000_000
             state.getState.mockImplementation(async () => ({ supported: true, selection: { kind: 'none', selectionEpoch: '0' }, connections: [connection(10, 30)],
-                jobs: [{ id: 'job', connectionId: 'connection-1', kind: 'backup', state: 'running', phase: 'upload', counters: 'transferred',
+                jobs: [{ id: 'job', connectionId: 'connection-1', kind: 'backup', state: 'running', phase: 'prepare', counters: 'prepared',
                     completedBytes: String(completed), totalBytes: String(total), completedItems: '1', startedAtMs: '1', updatedAtMs: '1' }] }))
             state.jobStarted?.()
             await settle()
@@ -269,6 +269,21 @@ describe('the storage usage tab', () => {
             total = 2_000_000
             await poll()
             expect(row()).toBeUndefined()
+        } finally { vi.useRealTimers() }
+    })
+
+    it('shows no time left for a backup upload, whose total grows with each pack', async () => {
+        vi.useFakeTimers()
+        try {
+            let completed = 0
+            state.getState.mockImplementation(async () => ({ supported: true, selection: { kind: 'none', selectionEpoch: '0' }, connections: [connection(10, 30)],
+                jobs: [{ id: 'job', connectionId: 'connection-1', kind: 'backup', state: 'running', phase: 'upload', counters: 'transferred',
+                    completedBytes: String(completed), totalBytes: '1000000', completedItems: '1', startedAtMs: '1', updatedAtMs: '1' }] }))
+            state.jobStarted?.()
+            await settle()
+            for (let index = 0; index < 8; index += 1) { completed += 50_000; await vi.advanceTimersByTimeAsync(1_200); await settle() }
+            expect([...target.querySelectorAll('dt')].some(term => term.textContent === strings.remaining)).toBe(false)
+            expect(target.textContent).toContain(strings.jobCounters.transferred)
         } finally { vi.useRealTimers() }
     })
 
