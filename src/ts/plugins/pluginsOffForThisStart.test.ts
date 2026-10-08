@@ -18,6 +18,10 @@ vi.mock('../parser/parser.svelte', () => ({
 vi.mock('./apiV3/v3.svelte', () => ({
     loadV3Plugins: vi.fn(async () => undefined),
     customV3ProviderMetaStore: [],
+    areV3PluginsIdle: () => true,
+    canInterruptV3Plugins: () => true,
+    prepareV3PluginsForReload: () => true,
+    subscribeV3PluginActivity: () => () => {},
 }))
 
 // The store module has to finish evaluating before the plugin graph pulls it in.
@@ -25,7 +29,7 @@ import '../stores.svelte'
 import * as alertModule from '../alert'
 import { loadV3Plugins } from './apiV3/v3.svelte'
 import { setDatabaseLite, type Database } from '../storage/database.svelte'
-import { keepPluginsOffForThisStart, loadPlugins, loadPluginsAfterAuthoritativeRestore, type RisuPlugin } from './plugins.svelte'
+import { keepPluginsOffForThisStart, loadPlugins, loadPluginsAfterAuthoritativeRestore, requestPluginReloadAfterSync, type RisuPlugin } from './plugins.svelte'
 
 function makePlugin(name: string, version: RisuPlugin['version']): RisuPlugin {
     return { name, version, enabled: true, script: '', realArg: {}, arguments: {}, customLink: [], argMeta: {} }
@@ -55,5 +59,13 @@ describe('plugins left off for this start', () => {
 
         expect(loadV3Plugins).not.toHaveBeenCalled()
         expect(alertModule.alertError).not.toHaveBeenCalled()
+    })
+
+    it('keeps plugins off when a received plugin change asks for a reload', async () => {
+        keepPluginsOffForThisStart()
+        requestPluginReloadAfterSync()
+        for (let turn = 0; turn < 5; turn += 1) await new Promise((resolve) => setTimeout(resolve, 0))
+
+        expect(loadV3Plugins).not.toHaveBeenCalled()
     })
 })
