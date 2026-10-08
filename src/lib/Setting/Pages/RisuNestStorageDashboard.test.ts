@@ -375,12 +375,12 @@ describe('RisuNestStorageDashboard', () => {
         )
     })
 
-    it('says that clearing a link does not delete the file', async () => {
+    it('describes the unused files row with its own action only', async () => {
         const target = setup()
-        await vi.waitFor(() => expect(target.textContent).toContain('Unused files'))
-        expect(target.textContent).toContain(
-            'Clearing a broken link in the data check does not delete the file.',
-        )
+        await vi.waitFor(() => expect(target.querySelector('[data-storage-action="gc"]')).not.toBeNull())
+
+        const row = target.querySelector<HTMLElement>('[data-storage-action="gc"]')!
+        expect(row.querySelector('p')?.textContent).toBe('Finds and deletes files that nothing refers to.')
     })
 
     it('formats large counts with locale separators', async () => {

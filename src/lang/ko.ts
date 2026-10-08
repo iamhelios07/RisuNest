@@ -2266,8 +2266,6 @@ export const languageKorean = {
             createSnapshotHelp:
                 '지금 상태를 저장해 두고 나중에 되돌릴 수 있습니다.',
             createSnapshot: '지금 만들기',
-            gcSeparation:
-                '데이터 점검에서 끊어진 연결을 지워도 파일은 삭제되지 않으므로, 필요한 경우 사용하지 않는 파일을 찾아서 삭제해주세요.',
             gcSearching: '사용하지 않는 파일을 찾는 중',
             gcDeleting: '사용하지 않는 파일을 삭제하는 중',
             gcListTitle: '삭제할 파일',
@@ -2284,7 +2282,7 @@ export const languageKorean = {
             gcHeldMigration: '진행 중인 이동에 사용 중',
             gcHeldJob: '실행 중인 작업에서 사용 중',
             gcTitle: '사용하지 않는 파일',
-            gcHelp: '어디에서도 쓰지 않는 파일을 찾아 지웁니다.',
+            gcHelp: '어디에서도 사용하지 않는 파일을 찾아 삭제합니다.',
             gcRun: '찾기',
             gcRunConfirm: '지금 삭제',
             gcResult: '삭제 가능: {0}개 ({1})',

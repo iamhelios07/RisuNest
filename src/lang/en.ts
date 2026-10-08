@@ -2451,8 +2451,6 @@ export const languageEnglish = {
             createSnapshotHelp:
                 'Saves the current state so you can return to it later.',
             createSnapshot: 'Create now',
-            gcSeparation:
-                'Clearing a broken link in the data check does not delete the file. Find and delete unused files here when needed.',
             gcSearching: 'Looking for unused files',
             gcDeleting: 'Deleting unused files',
             gcListTitle: 'Files to delete',

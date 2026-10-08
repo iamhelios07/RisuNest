@@ -302,14 +302,15 @@
                     {/if}
                 {/each}
             </div>
-            <ul data-storage-legend class="mt-3 grid grid-cols-[repeat(auto-fit,minmax(150px,1fr))] gap-x-5 gap-y-1.5 text-sm">
+            <!-- Each column fits a label and its value on one line; a narrow panel shows one column. -->
+            <ul data-storage-legend class="mt-3 grid grid-cols-[repeat(auto-fit,minmax(min(100%,14rem),1fr))] gap-x-5 gap-y-1.5 text-sm">
                 {#each segments as segment (segment.id)}
                     <!-- The media row takes the whole line while it carries the note, so the note stays on one line. -->
                     <li class="flex flex-col {segment.id === 'media' && mediaNote ? 'col-span-full' : ''}">
                         <div class="flex items-center gap-2">
                             <span class="h-2.5 w-2.5 shrink-0 rounded-xs {segment.color}" aria-hidden="true"></span>
-                            <span class="flex-1 text-textcolor2 break-keep">{segment.label}</span>
-                            <span class="tabular-nums">{formatRisuNestStorageBytes(segment.bytes)}</span>
+                            <span class="min-w-0 flex-1 text-textcolor2 break-keep">{segment.label}</span>
+                            <span class="shrink-0 whitespace-nowrap tabular-nums">{formatRisuNestStorageBytes(segment.bytes)}</span>
                         </div>
                         <!-- The placeholder holds the note's line so the legend does not move when the note arrives. -->
                         {#if segment.id === 'media' && view.residencyLoading}
@@ -385,7 +386,7 @@
         <SettingRow data-storage-action="snapshot" label={strings.createSnapshotTitle} help={strings.createSnapshotHelp}>
             <SettingButton busy={isBusy('create-snapshot')} onclick={createSnapshot}>{strings.createSnapshot}</SettingButton>
         </SettingRow>
-        <SettingRow data-storage-action="gc" label={strings.gcTitle} help={`${strings.gcHelp} ${strings.gcSeparation}`}>
+        <SettingRow data-storage-action="gc" label={strings.gcTitle} help={strings.gcHelp}>
             {#snippet below()}
                 <!-- The controls stay above the lists they produce instead of beside them. -->
                 <div class="mt-2 flex flex-wrap items-center gap-2">
