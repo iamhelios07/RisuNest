@@ -79,7 +79,7 @@ vi.mock('src/ts/storage/sync/external/bridge', () => ({
 import { alertConfirm, alertCheckboxConfirm } from 'src/ts/alert'
 import ExternalStorageSettings from './ExternalStorageSettings.svelte'
 import { requestExternalStorageNow, resumeExternalStorageJob, requestExternalStorageDeleteHistory, requestExternalStorageRestore, stopExternalStorageRestore } from 'src/ts/storage/sync/external/production'
-import { externalStorageStrings } from './strings'
+import { externalErrorMessage, externalStorageStrings } from './strings'
 import { notifySyncBindingChanged } from 'src/ts/storage/sync/bindingChanges'
 
 beforeEach(() => { state.failures.clear(); state.remedy = true; state.binding = { target: { kind: 'none' } } })
@@ -428,6 +428,7 @@ describe('the storage usage tab', () => {
         const tab = [...target.querySelectorAll('button')].find(button => button.textContent?.trim() === strings.history)!
         tab.click()
         await settle()
+        state.listHistory.mockClear()
         state.startJob.mockResolvedValue({ id: 'pin-job', connectionId: 'connection-1', kind: 'pin-history', state: 'queued' })
         const pin = [...target.querySelectorAll('button')].find(button => button.textContent?.trim() === strings.pin)!
         pin.click()
@@ -437,7 +438,7 @@ describe('the storage usage tab', () => {
             connections: [connection(10, 30)], jobs: [{ id: 'pin-job', connectionId: 'connection-1', kind: 'pin-history', state: 'succeeded' }] })
         state.jobStarted?.()
         await settle()
-        expect(state.listHistory).toHaveBeenCalledTimes(2)
+        expect(state.listHistory).toHaveBeenCalledOnce()
         expect(target.textContent).toContain(strings.pinned)
     })
 
@@ -448,20 +449,20 @@ describe('the storage usage tab', () => {
         const tab = [...target.querySelectorAll('button')].find(button => button.textContent?.trim() === strings.history)!
         tab.click()
         await settle()
+        state.listHistory.mockClear()
         const backup = { id: 'backup-job', connectionId: 'connection-1', kind: 'backup', state: 'running', phase: 'upload',
             completedBytes: '4', totalBytes: '10', completedItems: '1', startedAtMs: '2', updatedAtMs: '2' }
         state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0' },
             connections: [connection(10, 30)], jobs: [backup] })
         state.jobStarted?.()
         await settle()
-        expect(state.listHistory).toHaveBeenCalledTimes(1)
+        expect(state.listHistory).not.toHaveBeenCalled()
         state.listHistory.mockResolvedValue({ items: [{ ...older, id: 'newer', snapshotId: 'newer', createdAtMs: '2' }, older] })
         state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0' },
             connections: [connection(10, 30)], jobs: [{ ...backup, state: 'succeeded' }] })
         state.jobStarted?.()
         await settle()
-        expect(state.listHistory).toHaveBeenCalledTimes(2)
-        expect(state.listHistory).toHaveBeenLastCalledWith('connection-1', undefined)
+        expect(state.listHistory).toHaveBeenCalledExactlyOnceWith('connection-1', undefined)
         expect(target.querySelectorAll('[role="tabpanel"] .item')).toHaveLength(2)
     })
 
@@ -469,6 +470,7 @@ describe('the storage usage tab', () => {
         const tab = [...target.querySelectorAll('button')].find(button => button.textContent?.trim() === strings.history)!
         tab.click()
         await settle()
+        state.listHistory.mockClear()
         const finished = { id: 'manual-job', connectionId: 'connection-1', kind: 'backup', state: 'succeeded' }
         vi.mocked(requestExternalStorageNow).mockResolvedValue({ kind: 'complete', revision: '2', job: finished } as never)
         state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0' },
@@ -477,10 +479,12 @@ describe('the storage usage tab', () => {
         run.click()
         await settle()
         await settle()
-        expect(state.listHistory).toHaveBeenCalledTimes(2)
+        expect(state.listHistory).toHaveBeenCalledOnce()
     })
 
     it('leaves a closed history alone when a backup finishes', async () => {
+        await openStorageUsage()
+        state.listHistory.mockClear()
         const backup = { id: 'backup-job', connectionId: 'connection-1', kind: 'backup', state: 'running', phase: 'upload',
             completedBytes: '4', totalBytes: '10', completedItems: '1', startedAtMs: '2', updatedAtMs: '2' }
         state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0' },
@@ -498,11 +502,11 @@ describe('the storage usage tab', () => {
         const tab = [...target.querySelectorAll('button')].find(button => button.textContent?.trim() === strings.history)!
         tab.click()
         await settle()
+        state.listHistory.mockClear()
         const refresh = [...target.querySelectorAll('button')].find(button => button.textContent?.trim() === strings.refresh)!
         refresh.click()
         await settle()
-        expect(state.listHistory).toHaveBeenCalledTimes(2)
-        expect(state.listHistory).toHaveBeenLastCalledWith('connection-1', undefined)
+        expect(state.listHistory).toHaveBeenCalledExactlyOnceWith('connection-1', undefined)
     })
 
 
@@ -1185,6 +1189,55 @@ describe('the automatic backup switch', () => {
         await openStorageUsage()
         const cleanup = [...target.querySelectorAll('button')].find(button => button.textContent?.trim() === strings.cleanup)
         expect(cleanup?.disabled).toBe(false)
+    })
+})
+
+describe('the details tabs', () => {
+    const point = (id: string) => ({ id, snapshotId: id, kind: 'backup-point', createdAtMs: '1', logicalRevision: '1',
+        complete: true, verified: true, pinned: false, includedSections: [], sameDevice: true })
+    const second = { ...connection(10, 30), id: 'connection-2', displayName: 'Second' }
+    const failure = { kind: 'transient', httpStatus: null, retryAtMs: null }
+    async function show(): Promise<void> {
+        state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0', paused: false }, connections: [connection(10, 30), second], jobs: [] })
+        target = document.createElement('div')
+        document.body.append(target)
+        component = mount(ExternalStorageSettings, { target })
+        await settle()
+    }
+    const selected = () => [...target.querySelectorAll('[role="tab"]')]
+        .filter(tab => tab.getAttribute('aria-selected') === 'true').map(tab => tab.id)
+    beforeEach(() => { vi.clearAllMocks(); state.listHistory.mockReset() })
+    afterEach(() => {
+        if (component) unmount(component)
+        component = undefined
+        target.remove()
+    })
+
+    it('opens each card on its history and reads it once', async () => {
+        state.listHistory.mockImplementation(async (id: string) => ({ items: [point(`${id}-point`)] }))
+        await show()
+        expect(selected()).toEqual(['connection-1-history-tab', 'connection-2-history-tab'])
+        expect(state.listHistory.mock.calls).toEqual([['connection-1', undefined], ['connection-2', undefined]])
+        expect(target.querySelectorAll('[role="tabpanel"] .item')).toHaveLength(2)
+        state.jobStarted?.()
+        await settle()
+        expect(state.listHistory).toHaveBeenCalledTimes(2)
+    })
+
+    it('says in the card when its history cannot be read and does not read it again on its own', async () => {
+        state.listHistory.mockImplementation(async (id: string) => {
+            if (id === 'connection-2') throw failure
+            return { items: [] }
+        })
+        await show()
+        const panels = [...target.querySelectorAll('[role="tabpanel"]')]
+        expect(panels[0].textContent?.trim()).toBe(strings.noHistory)
+        expect(panels[1].querySelector('[data-notice]')?.textContent?.trim()).toBe(externalErrorMessage(strings, failure))
+        expect(panels[1].textContent).not.toContain(strings.noHistory)
+        expect(target.querySelector('[role="alert"]')).toBeNull()
+        state.jobStarted?.()
+        await settle()
+        expect(state.listHistory).toHaveBeenCalledTimes(2)
     })
 })
 

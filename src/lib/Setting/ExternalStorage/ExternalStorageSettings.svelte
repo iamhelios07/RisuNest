@@ -71,8 +71,12 @@
     let error = $state('')
     /** A failed background refresh, which the next successful refresh clears. */
     let pollError = $state('')
-    let expanded = $state<Record<string, 'history' | 'quota' | ''>>({})
+    /** The details tab picked on each card. A card shows its history until another tab is picked. */
+    let expanded = $state<Record<string, 'history' | 'quota'>>({})
     let history = $state<Record<string, ExternalHistoryItem[]>>({})
+    let historyError = $state<Record<string, string>>({})
+    /** Cards whose history was read once, so a failing remote is not read again on every poll. */
+    const historyRequested = new Set<string>()
     let historyCursor = $state<Record<string, string | undefined>>({})
     let historyLoading = $state<Record<string, boolean>>({})
     let quota = $state<Record<string, ExternalQuotaSummary>>({})
@@ -149,6 +153,11 @@
         }
         try {
             storageState = await bridge.getState()
+            for (const connection of storageState.connections) {
+                if (historyRequested.has(connection.id)) continue
+                historyRequested.add(connection.id)
+                void loadHistory(connection, false)
+            }
             for (const job of storageState.jobs) {
                 if (job.kind === 'backup' && externalJobIsActive(job)) historyJobs.set(job.id, job.connectionId)
             }
@@ -157,7 +166,7 @@
                 if (!completed || externalJobIsActive(completed)) continue
                 historyJobs.delete(jobId)
                 const connection = storageState.connections.find(item => item.id === connectionId)
-                if (completed.state === 'succeeded' && connection && expanded[connectionId] === 'history') {
+                if (completed.state === 'succeeded' && connection && selectedTab(connectionId) === 'history') {
                     await loadHistory(connection, false)
                 }
             }
@@ -176,7 +185,7 @@
 
     async function refreshWithHistory(): Promise<void> {
         await refresh()
-        const open = storageState?.connections.filter(connection => expanded[connection.id] === 'history') ?? []
+        const open = storageState?.connections.filter(connection => selectedTab(connection.id) === 'history') ?? []
         await Promise.all(open.map(connection => loadHistory(connection, false)))
     }
 
@@ -202,13 +211,6 @@
         if (renewed) {
             const job = activeJob(result.connection)
             if (job && externalJobIsPaused(job)) await resumeJob(result.connection, job)
-            return
-        }
-        // An already existing repository is opened to read what is in it, so
-        // its contents are shown without asking for the history tab first.
-        if (result.connection.mode === 'existing') {
-            expanded[result.connection.id] = 'history'
-            await loadHistory(result.connection, false)
         }
     }
 
@@ -405,6 +407,10 @@
     }
 
 
+    function selectedTab(connectionId: string): 'history' | 'quota' {
+        return expanded[connectionId] ?? 'history'
+    }
+
     async function openDetails(connection: ExternalConnectionSummary, kind: 'history' | 'quota'): Promise<void> {
         expanded[connection.id] = kind
         try {
@@ -449,9 +455,9 @@
             }
             history[connection.id] = items
             historyCursor[connection.id] = cursor
-            error = ''
+            delete historyError[connection.id]
         } catch (reason) {
-            error = externalErrorMessage(strings, reason)
+            historyError[connection.id] = externalErrorMessage(strings, reason)
         } finally {
             historyLoading[connection.id] = false
         }
@@ -871,14 +877,15 @@
                 <div class="details">
                     <div class="tabs" role="tablist">
                         {#each (['history', 'quota'] as const) as tab (tab)}
-                            <button type="button" role="tab" id="{connection.id}-{tab}-tab" aria-controls="{connection.id}-{tab}-panel" aria-selected={expanded[connection.id] === tab} class="tab" onclick={() => openDetails(connection, tab)}>{tab === 'history' ? strings.history : strings.quota}</button>
+                            <button type="button" role="tab" id="{connection.id}-{tab}-tab" aria-controls="{connection.id}-{tab}-panel" aria-selected={selectedTab(connection.id) === tab} class="tab" onclick={() => openDetails(connection, tab)}>{tab === 'history' ? strings.history : strings.quota}</button>
                         {/each}
                     </div>
 
-                    {#if expanded[connection.id] === 'history'}
+                    {#if selectedTab(connection.id) === 'history'}
                         {@const items = history[connection.id] ?? []}
                         <div class="panel" role="tabpanel" id="{connection.id}-history-panel" aria-labelledby="{connection.id}-history-tab">
                             {#if historyLoading[connection.id]}<p class="empty">{strings.loading}</p>
+                            {:else if historyError[connection.id]}<SettingNotice role="status" text={historyError[connection.id]} />
                             {:else if items.length === 0}<p class="empty">{strings.noHistory}</p>{/if}
                             {#if items.length > 0}
                                 <ul class="rows">
@@ -904,7 +911,7 @@
                             {/if}
                             {#if historyCursor[connection.id]}<div class="more"><SettingButton variant="secondary" size="sm" busy={historyLoading[connection.id]} onclick={() => loadHistory(connection, true)}>{strings.loadMore}</SettingButton></div>{/if}
                         </div>
-                    {:else if expanded[connection.id] === 'quota'}
+                    {:else}
                         {@const usage = quota[connection.id]}
                         {@const retention = connection.retentionPolicy}
                         <div class="panel usage" role="tabpanel" id="{connection.id}-quota-panel" aria-labelledby="{connection.id}-quota-tab">
