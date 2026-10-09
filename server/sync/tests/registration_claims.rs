@@ -543,7 +543,12 @@ async fn the_claim_route_reports_each_registration_claim_and_use_without_changin
     store
         .push(
             &actor(&store, &published),
-            &request(&store, WRITER_A, "published", vec![inline("a", WRITER_A, 1, "a")]),
+            &request(
+                &store,
+                WRITER_A,
+                "published",
+                vec![inline("a", WRITER_A, 1, "a")],
+            ),
         )
         .unwrap();
     let receipt = store
@@ -596,7 +601,12 @@ async fn the_claim_route_reports_each_registration_claim_and_use_without_changin
         store
             .push(
                 &actor(&store, &claimed),
-                &request(&store, WRITER_B, "other-writer", vec![inline("b", WRITER_B, 2, "b")]),
+                &request(
+                    &store,
+                    WRITER_B,
+                    "other-writer",
+                    vec![inline("b", WRITER_B, 2, "b")]
+                ),
             )
             .unwrap_err()
             .code,
