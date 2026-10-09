@@ -1,33 +1,19 @@
 # iOS native verification
 
-Builds and runs isolated iOS product and harness targets with synthetic fixtures. It uses a separate application identifier and never reads installed app data.
-
-The build-lab `ios-check.yml` workflow runs simulator storage, restart, streaming, file, lifecycle, product UI, and XCTest checks from an audited source snapshot.
+Builds isolated iOS test targets with synthetic fixtures and a separate application identifier.
 
 ## Physical-device package
 
-The manual `ios-testlab-package.yml` workflow produces:
+Use macOS with Xcode, XcodeGen, Node.js, pnpm, Python 3, and Rust's `aarch64-apple-ios` target installed. Install the repository's dependencies with `pnpm install --frozen-lockfile` and initialize the product's Apple project with `pnpm exec tauri ios init --ci`. Run from the repository root:
+
+```sh
+TAURI_ENV_PLATFORM=ios python3 benchmarks/ios/buildTestLab.py
+```
+
+The command builds and checks arm64 iPhoneOS artifacts with a minimum iOS version of 16.4. It writes these files under `artifacts/`:
 
 - `RisuNest-ios-testlab.zip`, containing the app, UI test runner, and `.xctestrun`
 - `RisuNest-ios-device-agent.ipa`, an agent build that is not a distribution build
-- `testlab-package.json`, containing source and toolchain provenance plus hashes
+- `testlab-package.json`, containing the Xcode version, target, signing type, file sizes, and SHA-256 hashes
 
-Inspect the current Firebase device and Xcode catalog before choosing IDs:
-
-```sh
-gcloud firebase test ios models list --project=YOUR_PROJECT
-gcloud firebase test ios versions list --project=YOUR_PROJECT
-```
-
-Run an authorized test with verified values:
-
-```sh
-gcloud firebase test ios run --project=YOUR_PROJECT --type=xctest \
-  --test=RisuNest-ios-testlab.zip --timeout=15m \
-  --device=model=VERIFIED_MODEL,version=VERIFIED_OS,locale=en_US,orientation=portrait \
-  --xcode-version=VERIFIED_XCODE
-```
-
-Firebase execution is never part of the packaging workflow and requires separate authorization. Package generation does not establish a device pass. Long locked-device, battery, thermal, iCloud provider, camera-content, and distribution-signing checks remain separate.
-
-See `docs/ios-testing.md` for the current build-lab and device procedure.
+Use a fresh `artifacts/testlab-build` directory for each run. The packages use ad-hoc signing and are not distribution builds. Package generation does not run a device test or contact a remote test service.

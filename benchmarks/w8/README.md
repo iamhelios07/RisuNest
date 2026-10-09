@@ -33,5 +33,3 @@ This build replaces SortableJS imports with a no-op build-only shim. It measures
 
     pnpm exec vite build --config benchmarks/w8/vite.sortable-upper-bound.config.ts --manifest .vite/manifest.json --outDir dist --sourcemap
     node benchmarks/w8/bundle-gates.mjs --dist dist
-
-Retained results and interpretation live under docs/native-app-analysis/roadmap-14-implementation/implementation-reports/.

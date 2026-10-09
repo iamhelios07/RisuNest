@@ -56,4 +56,4 @@ node benchmarks/roadmap14/android.mjs `
   --output <validated-results.json>
 ```
 
-An APK build, JVM test, emulator run, or pending record is not physical-device performance evidence. Scenario definitions and acceptance rationale live under `docs/native-app-analysis/roadmap-14-implementation/`.
+An APK build, JVM test, emulator run, or pending record is not physical-device performance evidence.

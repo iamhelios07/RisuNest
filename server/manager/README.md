@@ -43,9 +43,3 @@ pnpm sync:windows:build
 pnpm sync:linux:build
 pnpm sync:macos:build
 ```
-
-관리 API, 자동 실행, 업데이트 교체, 패키징 계약은 다음 내부 문서에서 관리합니다:
-
-- `docs/superpowers/specs/2026-09-13-sync-server-management-design.md`
-- `docs/superpowers/specs/2026-09-15-sync-auto-update-design.md`
-- `docs/superpowers/specs/2026-09-20-local-sync-distribution-build-design.md`

@@ -4,7 +4,7 @@ Runs isolated Android and Windows applications against synthetic Sync daemons. T
 
 ## Android
 
-Read docs/android-testing.md first. Use the documented risunest_vm_retest AVD, private ADB port 15037, agent build, and isolated application ID.
+Use a disposable synthetic AVD, an owned local ADB server, an agent build, and the isolated application ID. Set `ANDROID_HOME` or pass `--adb=<adb-executable>`. Both runners require the exact emulator serial, AVD name, and ADB port, and reject a different AVD.
 
 After the agent build, create the isolated APK from src-tauri/gen/android:
 
@@ -14,10 +14,10 @@ After the agent build, create the isolated APK from src-tauri/gen/android:
 
 Verify its package with aapt dump badging, then run from the repository root:
 
-    node benchmarks/sync-server/android-probe.mjs
-    node benchmarks/sync-server/android-runtime.mjs
-    node benchmarks/sync-server/android-runtime.mjs --ui
-    node benchmarks/sync-server/android-runtime.mjs --unresponsive-startup
+    node benchmarks/sync-server/android-probe.mjs --serial=<emulator-serial> --avd=<synthetic-avd-name> --adb-port=<owned-port>
+    node benchmarks/sync-server/android-runtime.mjs --serial=<emulator-serial> --avd=<synthetic-avd-name> --adb-port=<owned-port>
+    node benchmarks/sync-server/android-runtime.mjs --serial=<emulator-serial> --avd=<synthetic-avd-name> --adb-port=<owned-port> --ui
+    node benchmarks/sync-server/android-runtime.mjs --serial=<emulator-serial> --avd=<synthetic-avd-name> --adb-port=<owned-port> --unresponsive-startup
 
 The probe checks sustained ADB transfer and health. The runtime checks native IPC, Keystore recovery, registration, synchronization, restart, progress UI, and the bounded unresponsive-server case. They do not cover an Android foreground service.
 
@@ -58,4 +58,4 @@ These ignored tests can take substantial time and disk IO:
     cargo test --manifest-path src-tauri/Cargo.toml --locked --lib server_sync_local_commit_and_large_json_costs -- --ignored --nocapture
     cargo test --manifest-path src-tauri/Cargo.toml --locked --lib server_sync_hundred_thousand_resolved_assets_http_gate -- --ignored --nocapture
 
-Harness output stays under ignored .local paths. Current verification is recorded in docs/research/lightweight-sync-server-final-verification-2026-09-12.md; the measurements removed from this README are preserved in docs/research/2026-09-12-sync-server-benchmark-results.md.
+Harness output stays under ignored `.local` paths.

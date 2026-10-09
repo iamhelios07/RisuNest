@@ -176,7 +176,7 @@ afterEvaluate {
                 logger.warn(
                     "RisuNest: release signing is not configured (${keystorePropertiesFile.path} " +
                         "missing or incomplete), so this release artifact is UNSIGNED and cannot be " +
-                        "installed. See docs/research/android-build-audit-2026-09-06.md.",
+                        "installed.",
                 )
             }
         }

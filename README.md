@@ -21,7 +21,7 @@
 
 ## Introduction
 
-RisuNest is a cross-platform native application forked from [RisuAI](https://github.com/kwaroran/RisuAI). It is designed to preserve upstream functionality while introducing native runtime components and low-level optimizations for high performance across diverse platforms.
+RisuNest is an AI chat application forked from [RisuAI](https://github.com/kwaroran/RisuAI), available for Windows, macOS, Linux, Android, and iOS. Chat with different AI providers, manage characters and chats, and use themes and plugins.
 
 > RisuNest is an independent community project unaffiliated with the upstream RisuAI developer and is not officially approved or endorsed by RisuAI.
 
@@ -58,14 +58,11 @@ xattr -dr com.apple.quarantine /Applications/RisuNest.app
 
 ## Key Features
 
-RisuNest intentionally focuses on native platforms rather than web builds, delegating critical operations to a high-performance Rust core. Key features include:
-
-- **Robust Local Storage:** High-performance database operations powered by an embedded SQLite layer in Rust.
-- **Fast Media I/O:** Rapid asset and media caching leveraging direct native filesystem access.
-- **Full-Stack Optimization:** Targeted optimizations across both the WebView UI and Rust backend for regex processing, Lua scripting, rendering, stream decoding, lorebooks, and networking.
-- **Multi-Device Sync:** Seamless synchronization across devices powered by the dedicated RisuNest Sync server.
-- **Cloud Storage Integration:** Backup and restore support for external cloud storage (WebDAV, S3, Google Drive) without needing a self-hosted sync server.
-- **Native Mobile Support:** First-class native apps on iOS and Android with optimized memory footprint and responsiveness.
+- **Local Library:** Store characters, chats, and media on your device.
+- **Chat Customization:** Use lorebooks, regex scripts, Lua scripts, and Plugin API v3 plugins.
+- **Multi-Device Sync:** Share your library across devices through RisuNest Sync.
+- **Cloud Storage:** Back up and restore your data with WebDAV, S3, or Google Drive.
+- **Desktop and Mobile:** Use the app on Windows, macOS, Linux, Android, and iOS.
 
 However, RisuNest modifies or deprecates certain upstream RisuAI features and does not guarantee 100% backward compatibility. If you encounter a compatibility issue, please open an issue. In particular, legacy Plugin API v2/2.1 plugins are not supported; please use plugins updated for Plugin API v3.
 

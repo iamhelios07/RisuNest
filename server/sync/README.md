@@ -131,10 +131,3 @@ cargo test --manifest-path server/sync/Cargo.toml --locked
 node --test crates/sync-wire/tests/golden.test.mjs
 cargo clippy --manifest-path server/sync/Cargo.toml --locked --all-targets -- -D warnings
 ```
-
-Architecture, protocol, and verification records belong under `docs/`, especially:
-
-- `docs/superpowers/specs/2026-09-08-lightweight-sync-server-design.md`
-- `docs/superpowers/specs/2026-09-12-server-only-sync-design.md`
-- `docs/research/lightweight-sync-server-final-verification-2026-09-12.md`
-- `docs/research/2026-09-12-sync-server-benchmark-results.md`

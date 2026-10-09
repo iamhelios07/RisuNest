@@ -36,10 +36,4 @@ The only route is `/endpoints/{uuid}`:
 
 UUIDs are normalized lowercase UUIDv4 values. Responses disable caching, browser CORS access is not provided, and records expire after 30 days without a successful POST. The Worker validates only envelope encoding and size. Native clients perform AES-256-GCM authentication and HTTPS URL validation.
 
-The complete HTTP, encryption, storage, quota, and deployment contracts are maintained in:
-
-- `docs/superpowers/specs/2026-09-09-sync-endpoint-registry-design.md`
-- `docs/superpowers/plans/2026-09-09-sync-endpoint-registry.md`
-- `docs/superpowers/plans/2026-09-13-endpoint-registry-server.md`
-
-Deployment creates remote resources and must be separately authorized. Use `wrangler.example.jsonc` as the template, keep real resource IDs in ignored `wrangler.jsonc`, and authenticate Wrangler without committing credentials.
+To deploy your own Worker, use `wrangler.example.jsonc` as the template, keep real resource IDs in ignored `wrangler.jsonc`, and authenticate Wrangler without committing credentials.

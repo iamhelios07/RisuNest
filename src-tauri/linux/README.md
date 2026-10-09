@@ -32,7 +32,7 @@ AppImage normally requires FUSE 2. Use `--appimage-extract-and-run` on hosts wit
 
 ## Verification
 
-Agents must use the Realm-blocked build:
+Use the agent build for isolated package tests:
 
 ```sh
 pnpm check
@@ -40,6 +40,6 @@ dbus-run-session -- bash scripts/linux-native-tests.sh
 pnpm linux:build:agent
 ```
 
-For package smoke testing, read `docs/superpowers/specs/2026-09-13-linux-desktop-design.md` and `docs/superpowers/plans/2026-09-13-linux-packaging.md` first. Use only an agent package and the runner's synthetic XDG profile.
+For package smoke testing, use an agent package and the runner's synthetic XDG profile.
 
 WSL/Xvfb results do not replace clean-VM installation, GNOME and KDE, Wayland and X11, physical GPU, Korean IME, audio, accessibility, or distribution validation.

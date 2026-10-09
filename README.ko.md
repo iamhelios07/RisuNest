@@ -21,7 +21,7 @@
 
 ## 소개
 
-RisuNest는 [RisuAI](https://github.com/kwaroran/RisuAI)를 포크해 개발된 **네이티브 앱** 프로젝트입니다. RisuAI의 기능은 최대한 그대로 유지하면서, 네이티브 전용 기술과 최적화를 도입하여 다양한 플랫폼에서 효율적으로 실행될 수 있도록 설계되었습니다.
+RisuNest는 [RisuAI](https://github.com/kwaroran/RisuAI)를 포크한 AI 채팅 앱이며, Windows, macOS, Linux, Android, iOS에서 사용할 수 있습니다. 여러 AI 제공자와 대화하고, 캐릭터와 채팅을 관리하며, 테마와 플러그인을 사용할 수 있습니다.
 
 > RisuNest는 RisuAI 개발자와 무관한 커뮤니티 프로젝트이며, RisuAI 측의 공식 승인이나 보증을 받지 않았습니다.
 
@@ -58,14 +58,11 @@ xattr -dr com.apple.quarantine /Applications/RisuNest.app
 
 ## 주요 특징
 
-RisuNest는 공식적으로 웹 빌드를 지원하지 않고 있으며, 많은 부분이 Rust로 구동되도록 설계되었습니다. 주요 특징은 다음과 같습니다.
-
-- Rust SQLite 저장소를 사용하여 DB를 효율적으로 관리합니다.
-- 네이티브 파일 시스템을 사용해 에셋과 미디어 파일을 빠르게 저장합니다.
-- 정규식, Lua, 렌더링 최적화, 스트리밍, 로어북, 통신 등 다양한 부분에서 WebView와 Rust 모두 최적화가 이루어져 있습니다.
-- RisuNest Sync 서버를 통해 여러 기기에서 사용할 수 있습니다.
-- WebDAV, S3, Google Drive 등 외부 저장소와의 백업 및 동기화를 지원하여 서버가 없더라도 여러 기기에 걸쳐 사용하기 쉽습니다.
-- iOS와 Android에서 네이티브 앱으로 실행할 수 있으며, 모바일 환경에서도 최적화된 성능을 제공합니다.
+- **로컬 라이브러리:** 캐릭터, 채팅, 미디어를 기기에 저장합니다.
+- **채팅 설정:** 로어북, 정규식 스크립트, Lua 스크립트, Plugin API v3 플러그인을 사용할 수 있습니다.
+- **기기 간 동기화:** RisuNest Sync를 통해 여러 기기에서 라이브러리를 공유합니다.
+- **클라우드 저장소:** WebDAV, S3, Google Drive로 데이터를 백업하고 복원할 수 있습니다.
+- **데스크톱과 모바일:** Windows, macOS, Linux, Android, iOS에서 사용할 수 있습니다.
 
 단 RisuNest는 RisuAI의 일부 기능을 제거하거나 변경했으며, 100% 호환성을 보장하지 않습니다. 호환성 문제가 있다면 이슈를 열어 주시기 바랍니다. 특히 Plugin API v2/2.1 플러그인은 지원하지 않으므로, Plugin API v3 버전을 사용해주세요.
 
