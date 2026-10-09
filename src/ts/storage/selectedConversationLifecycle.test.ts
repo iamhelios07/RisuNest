@@ -713,6 +713,33 @@ describe('selected conversation lifecycle', () => {
         lease.release()
     })
 
+    it('adopts the complete conversation a save published while the promotion settled', async () => {
+        const harness = makeHarness(3)
+        expect(harness.workingSet.tryDemoteSelectedConversation()).toBe(true)
+        const target = harness.workingSet.captureSelectedConversationTarget()!
+        harness.setReadConversation(vi.fn(async () => {
+            harness.setPendingPersistence(true)
+            return { revision: 7, value: structuredClone(harness.persistedConversation) }
+        }) as typeof harness.readConversation)
+        harness.coordinator.flushPendingData.mockImplementation(async () => {
+            if (!harness.coordinator.hasPendingPersistenceWork) return
+            harness.setPendingPersistence(false)
+            expect(harness.workingSet.completeWindowedConversationForSave(
+                harness.workingSet.captureSelectedConversationAuthority()!,
+                structuredClone(harness.persistedConversation.message),
+            )).not.toBeNull()
+        })
+        const publishCount = harness.published.mock.calls.length
+
+        const lease = await harness.workingSet.acquireCompleteConversation('bound-editor', target)
+
+        expect(harness.readConversation).toHaveBeenCalledOnce()
+        expect(harness.published).toHaveBeenCalledTimes(publishCount + 1)
+        expect(harness.workingSet.selectedConversationMode).toBe('complete')
+        expect(lease.session.totalMessages).toBe(3)
+        lease.release()
+    })
+
     it('stops settling a promotion when background persistence never drains', async () => {
         const harness = makeHarness(3)
         expect(harness.workingSet.tryDemoteSelectedConversation()).toBe(true)
