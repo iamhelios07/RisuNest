@@ -1748,8 +1748,8 @@ export class ActiveWorkingSet {
     // A sync receive or a scheduled flush can queue coordinator work while an
     // activation reads, and the selection transition refuses pending work.
     // Waits for that work, then reports whether the reads are still current.
-    // A newer navigation ends the wait; persistent pending work is left for
-    // the transition to report.
+    // A newer navigation ends the wait; work still pending after it is
+    // reported like a moved revision.
     private async settleBeforeWindowedPublish(
         generation: number,
         revision: DataRevision,
