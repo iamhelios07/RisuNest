@@ -2154,6 +2154,16 @@ export const languageKorean = {
             close: '닫기',
             save: '저장',
         },
+        imageGeometry: {
+            title: '이미지 크기',
+            calculate: '이미지 크기 계산',
+            help: '이미지 크기를 계산해 저장합니다. 이 기기에 없는 파일은 건너뜁니다.',
+            counts: '저장 {saved}개, 건너뜀 {skipped}개, 실패 {failed}개',
+            complete: '이미지 크기 계산이 완료되었습니다.',
+            cancelled: '이미지 크기 계산이 취소되었습니다.',
+            catalogChanged: '이미지 목록이 변경되었습니다. 다시 계산해주세요.',
+            failed: '이미지 크기를 계산하지 못했습니다. 다시 시도해주세요.',
+        },
         inlay: {
             optimizeFailed: '선택한 에셋을 최적화하지 못했습니다.',
             animationPreserved: '애니메이션 변환을 건너뛰고 원본으로 저장했습니다.',

@@ -2339,6 +2339,16 @@ export const languageEnglish = {
             close: 'Close',
             save: 'Save',
         },
+        imageGeometry: {
+            title: 'Image dimensions',
+            calculate: 'Calculate image dimensions',
+            help: 'Calculate and save image dimensions. Files unavailable on this device are skipped.',
+            counts: 'Saved {saved}, skipped {skipped}, failed {failed}',
+            complete: 'Image dimension calculation completed.',
+            cancelled: 'Image dimension calculation cancelled.',
+            catalogChanged: 'The image list changed. Run the calculation again.',
+            failed: 'Could not complete image dimension calculation. Try again.',
+        },
         inlay: {
             optimizeFailed: 'Could not optimize the selected assets.',
             animationPreserved: 'Animation conversion was skipped. The original was saved.',
