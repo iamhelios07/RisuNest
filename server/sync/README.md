@@ -50,7 +50,7 @@ Run `risunest-sync-server --help` or a subcommand with `--help` for the complete
 
 ## Registration and remote access
 
-Configure a fixed public HTTPS address while the daemon is stopped:
+Configure a fixed HTTP or HTTPS address while the daemon is stopped:
 
 ```powershell
 ./risunest-sync-server.exe connection configure --data-dir $data --endpoint https://sync.example
@@ -58,6 +58,8 @@ Configure a fixed public HTTPS address while the daemon is stopped:
 ```
 
 Add `--registry https://registry.example` when the address should be discovered through an endpoint registry. The registry receives only an encrypted address, never the device token or decryption key.
+
+For direct LAN access, set the listener to the server's LAN IP or `0.0.0.0` and use the server's reachable address, for example `http://192.168.0.10:14319`, as the fixed endpoint. Listener changes apply on the next server start. HTTP endpoints also work with registry discovery; HTTP is not restricted to loopback or private addresses. HTTPS endpoints continue to use normal certificate verification.
 
 For a daemon-owned Quick Tunnel, use `--cloudflared ABSOLUTE_EXECUTABLE` instead of `--endpoint`. Quick Tunnel addresses may change after restart, so configure a registry when registration must remain reusable. For stable remote access, prefer a named Tunnel or another trusted HTTPS reverse proxy.
 
