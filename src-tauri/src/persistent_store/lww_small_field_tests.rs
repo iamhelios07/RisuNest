@@ -155,3 +155,56 @@ fn root_patch_and_later_unit_edit_keep_order_and_reject_stale_revisions() {
     assert!(matches!(store.commit(&input), Err(StoreError::RevisionConflict { expected: 1, actual: 2 })));
     assert_eq!(store.read_root(None).unwrap().value["language"], "ja");
 }
+
+#[test]
+fn scoped_capture_queues_exactly_the_units_a_small_save_changed() {
+    let (_directory, mut store) = fixture();
+    let delete = |parts: &[&str]| UnitMutation::Delete { key: UnitKey::new(parts).unwrap() };
+    store.commit(&WorkingSetCommit {
+        expected_revision: 1,
+        request_id: Some("synthetic-scoped-save".into()),
+        root_mutations: Some(vec![
+            RootMutation::Set { key: "language".into(), value: json!("ko") },
+            RootMutation::Delete { key: "opaque".into() },
+            RootMutation::Set { key: "modules".into(), value: json!([{"id":"new-module","name":"New"}]) },
+            RootMutation::Set { key: "characterOrder".into(), value: json!(["synthetic-character"]) },
+        ]),
+        unit_mutations: Some(vec![
+            set(&["character", "synthetic-character", "name"], json!("After")),
+            delete(&["character", "synthetic-character", "creatorNotes"]),
+            delete(&["character", "synthetic-character", "notes"]),
+            set(&["character", "synthetic-character", "statics"], json!({"messages":5,"tokens":1})),
+            set(&["character", "synthetic-character", "lastInteraction"], json!(2)),
+        ]),
+        ..Default::default()
+    }).unwrap();
+    let queued = |table: &str| -> Vec<String> {
+        let mut statement = store.connection
+            .prepare(&format!("SELECT key FROM {table} WHERE version=?1 ORDER BY key")).unwrap();
+        statement.query_map(["synthetic-scoped-save"], |row| row.get(0)).unwrap()
+            .collect::<Result<_, _>>().unwrap()
+    };
+    let mut expected: Vec<String> = [
+        &["root", "language"][..],
+        &["exists", "modules", "new-module"],
+        &["record", "modules", "new-module"],
+        // Retiring the record covers its fields.
+        &["exists", "modules", "old-module"],
+        &["order", "modules"],
+        &["order", "characters"],
+        &["character", "synthetic-character", "name"],
+        &["character", "synthetic-character", "creatorNotes"],
+    ].iter().map(|parts| UnitKey::new(parts).unwrap().as_str().to_owned()).collect();
+    expected.sort();
+    assert_eq!(queued("lww_units"), expected);
+    assert_eq!(queued("lww_outbox"), expected);
+    assert_eq!(shared(&store, &["exists", "modules", "old-module"]), None);
+    assert_eq!(shared(&store, &["character", "synthetic-character", "statics"]), Some(json!({"tokens":1})));
+    let detail = store.read_character("synthetic-character", None).unwrap().unwrap().value;
+    assert_eq!(detail["statics"]["messages"], 5);
+    assert_eq!(detail["lastInteraction"], 2);
+    assert!(detail.get("notes").is_none());
+    let root = store.read_root(None).unwrap().value;
+    assert!(root.get("opaque").is_none());
+    assert_eq!(root["personas"][0]["id"], "old-persona");
+}
