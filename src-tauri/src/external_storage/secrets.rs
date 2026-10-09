@@ -202,7 +202,7 @@ impl SecretVault for NativeSecretVault {
 
     fn store<'a>(&'a self, bytes: &'a SecretBytes) -> ProviderFuture<'a, SecretRef> {
         Box::pin(async move {
-            if bytes.0.is_empty() || bytes.0.len() > MAX_PLAINTEXT_BYTES {
+            if (bytes.0.is_empty() && !matches!(self.purpose, Purpose::Provider)) || bytes.0.len() > MAX_PLAINTEXT_BYTES {
                 return Err(ProviderError::new(ErrorKind::Corrupt));
             }
             let id = uuid::Uuid::new_v4().to_string();
@@ -223,7 +223,7 @@ impl SecretVault for NativeSecretVault {
         bytes: &'a SecretBytes,
     ) -> ProviderFuture<'a, ()> {
         Box::pin(async move {
-            if bytes.0.is_empty() || bytes.0.len() > MAX_PLAINTEXT_BYTES {
+            if (bytes.0.is_empty() && !matches!(self.purpose, Purpose::Provider)) || bytes.0.len() > MAX_PLAINTEXT_BYTES {
                 return Err(ProviderError::new(ErrorKind::Corrupt));
             }
             let id = self.parse_reference(reference)?;
@@ -637,6 +637,25 @@ mod platform {
 #[cfg(all(test, any(windows, target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_provider_password_roundtrips_and_can_replace_an_existing_password() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let vault = provider_vault(root.path());
+            let empty = SecretBytes(zeroize::Zeroizing::new(Vec::new()));
+            let reference = vault.store(&empty).await.unwrap();
+            let _cleanup = RemoveSyntheticSecret { root: root.path().to_owned(), purpose: Purpose::Provider,
+                id: reference.0.strip_prefix("provider-v1:").unwrap().to_owned() };
+            assert!(vault.read(&reference).await.unwrap().0.is_empty());
+            vault.replace(&reference, &SecretBytes(zeroize::Zeroizing::new(b"synthetic".to_vec()))).await.unwrap();
+            vault.replace(&reference, &empty).await.unwrap();
+            assert!(vault.read(&reference).await.unwrap().0.is_empty());
+            assert!(repository_key_vault(root.path()).store(&empty).await.is_err());
+            vault.remove(&reference).await.unwrap();
+        });
+    }
 
     struct RemoveSyntheticSecret { root: PathBuf, purpose: Purpose, id: String }
     impl Drop for RemoveSyntheticSecret {
