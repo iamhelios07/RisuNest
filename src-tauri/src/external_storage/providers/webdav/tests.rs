@@ -710,7 +710,7 @@ fn a_lost_put_reconciles_from_the_stored_resource() {
         let payload = source(&directory, "pack", &bytes);
         let declared = intent(&repository, "pack-2", ObjectRole::Pack, &bytes);
         let resume = ResumeState {
-            sealed_state: harness.secret(),
+            data: harness.secret().into(),
             confirmed_offset: 0,
             expires_at_ms: None,
         };

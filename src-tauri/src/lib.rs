@@ -7,6 +7,7 @@ mod desktop_notifications;
 #[cfg(desktop)]
 mod startup_appearance;
 mod cleanup_secrets;
+mod device_secrets;
 mod cleanup_webview;
 mod app_cleanup;
 mod app_update;
