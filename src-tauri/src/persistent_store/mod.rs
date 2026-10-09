@@ -2002,29 +2002,6 @@ impl PersistentStore {
         commit: &WorkingSetCommit,
         asset_aliases: &[AssetAlias],
     ) -> StoreResult<RevisionResult> {
-        let resolved;
-        let commit = if let Some(mutations) = &commit.root_mutations {
-            if commit.root.is_some() {
-                return Err(StoreError::Validation {
-                    message: "Root and rootMutations are mutually exclusive".to_owned(),
-                });
-            }
-            let current = self.read_root(None)?;
-            if current.revision != commit.expected_revision {
-                return Err(StoreError::RevisionConflict {
-                    expected: commit.expected_revision,
-                    actual: current.revision,
-                });
-            }
-            resolved = WorkingSetCommit {
-                root: Some(commit::apply_root_mutations(current.value, mutations)?),
-                root_mutations: None,
-                ..commit.clone()
-            };
-            &resolved
-        } else {
-            commit
-        };
         self.lww_commit(commit, asset_aliases)
     }
 
