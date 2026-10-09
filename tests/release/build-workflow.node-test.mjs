@@ -260,6 +260,19 @@ test("pnpm preserves the Cargo argument separator for every Tauri build", () => 
   assert.doesNotMatch(bundles[0], / -- --locked/);
 });
 
+test("Android SDK setup explicitly excludes the retired tools package", () => {
+  const directory = new URL("../../.github/workflows/", import.meta.url);
+  let setups = 0;
+  for (const name of readdirSync(directory).filter(name => /\.ya?ml$/.test(name))) {
+    const contents = readFileSync(new URL(name, directory), "utf8").replace(/\r\n/g, "\n");
+    for (const step of contents.split(/^      - /m).filter(step => step.startsWith("uses: android-actions/setup-android@"))) {
+      setups++;
+      assert.match(step, /^        with:\n          packages: platform-tools$/m, name);
+    }
+  }
+  assert(setups > 0, "Missing Android SDK setup steps");
+});
+
 test("Android jobs preserve the committed shell and let Tauri generate ignored build files", () => {
   assert.doesNotMatch(workflow, /pnpm android:init|tauri android init/);
   assert.equal((workflow.match(/name: Verify the committed Android shell/g) ?? []).length, 2);
