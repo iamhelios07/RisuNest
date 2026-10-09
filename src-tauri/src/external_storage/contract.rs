@@ -506,10 +506,33 @@ pub(crate) struct HeadReceipt {
     pub version: Option<VersionToken>,
     pub complete: bool,
 }
-/// Opaque provider state is sealed before journal storage. Offset is remote-confirmed.
+/// Capability URLs stay in the vault; S3 progress alone cannot authorize requests.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) enum ResumeData {
+    Secret(String),
+    S3Multipart(String),
+}
+impl From<SecretRef> for ResumeData {
+    fn from(reference: SecretRef) -> Self { Self::Secret(reference.0) }
+}
+impl ResumeData {
+    pub(crate) fn secret(&self) -> Result<SecretRef> {
+        match self {
+            Self::Secret(reference) if !reference.is_empty() => Ok(SecretRef(reference.clone())),
+            _ => Err(ProviderError::new(ErrorKind::Corrupt)),
+        }
+    }
+    pub(crate) fn valid(&self) -> bool {
+        match self {
+            Self::Secret(value) => !value.is_empty() && value.len() <= 1024,
+            Self::S3Multipart(value) => !value.is_empty() && value.len() <= 4 * 1024 * 1024,
+        }
+    }
+}
 #[derive(Clone)]
 pub(crate) struct ResumeState {
-    pub sealed_state: SecretRef,
+    pub data: ResumeData,
     pub confirmed_offset: u64,
     pub expires_at_ms: Option<u64>,
 }
