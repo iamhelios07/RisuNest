@@ -384,10 +384,6 @@ select optgroup {
   border-top: 1px solid rgba(98, 114, 164, 0.7);
 }
 
-.text-bordered {
-  -webkit-text-stroke: 1px #000;
-}
-
 .x-risu-risu-file {
   padding: 1rem;
   border: 1px solid var(--risu-theme-selected);
