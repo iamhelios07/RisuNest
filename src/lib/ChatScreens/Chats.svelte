@@ -976,7 +976,7 @@
                 const element = ensureElement(key, row.index)
                 currentRenderKeys.add(key)
                 renderConversationStart(key, element, totalMessages)
-                element.classList.remove('is-latest-chat-row', 'is-settled-history')
+                element.classList.remove('is-latest-chat-row')
                 orderedElements.push(element)
                 continue
             }
@@ -1315,10 +1315,6 @@
             const latest = index === totalMessages - 1
             element.classList.toggle('is-latest-chat-row', latest)
             element.classList.toggle('is-reroll-chat-row', index === rerollIndex)
-            element.classList.toggle(
-                'is-settled-history',
-                !latest && !activeStreamingMessage && row.pinReasons.length === 0,
-            )
             orderedElements.push(element)
         }
 
@@ -2843,6 +2839,5 @@
 {/if}
 <div
     class="flex flex-col-reverse"
-    class:chat-history-isolated={(DBState.db.chatMessageOverflowScope ?? 'latest') !== 'all'}
     bind:this={chatBody}
 ></div>

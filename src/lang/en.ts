@@ -2319,11 +2319,6 @@ export const languageEnglish = {
             profileLowSpec: 'Low-spec',
             profileHelp:
                 'Low-spec uses less memory, but scrolling long chats may be slightly slower.',
-            overflowScope: 'Chat message render isolation',
-            overflowScopeLatest: 'Latest message',
-            overflowScopeAll: 'All',
-            overflowScopeHelp:
-                'Choose whether UI elements that extend beyond a chat message (setting buttons, overlays, and so on) render only on the latest message or on every message. Choose All if a character you use does not display correctly. All may make scrolling long chats slightly slower.',
             historyLimit: 'Skip loading older messages',
             historyLimitHelp:
                 'When you send a message, older messages beyond the set maximum context size are not loaded, which improves speed and memory usage. Lorebook search, triggers, modules, regex scripts, plugins and other features that rely on older messages may not work correctly. Do not use this with modules or plugins that change the whole chat.',
