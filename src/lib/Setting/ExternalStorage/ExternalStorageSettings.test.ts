@@ -614,6 +614,13 @@ describe('the storage usage tab', () => {
         expect(state.bind).toHaveBeenCalledWith({ kind: 'external', connectionId: 'connection-1' }, { mode: 'new-device' })
         expect(alertConfirm).not.toHaveBeenCalled(); expect(alertCheckboxConfirm).not.toHaveBeenCalled()
     })
+    it('names the empty history of a sync connection apart from a backup connection', async () => {
+        if (component) await unmount(component)
+        state.listHistory.mockResolvedValue({ items: [] })
+        state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0', paused: false }, connections: [{ ...connection(10, 30), purpose: 'sync', strategy: 'sequential' }], jobs: [] })
+        component = mount(ExternalStorageSettings, { target }); await settle()
+        expect(target.querySelector('[role="tabpanel"]')?.textContent?.trim()).toBe(strings.noSyncHistory)
+    })
     it('labels the sync target switch apart from the button that syncs now', async () => {
         if (component) await unmount(component)
         state.getState.mockResolvedValue({ supported: true, selection: { kind: 'external', connectionId: 'connection-1', selectionEpoch: '0', paused: false }, connections: [{ ...connection(10, 30), purpose: 'sync', strategy: 'sequential' }], jobs: [] })
@@ -761,9 +768,10 @@ describe('the storage usage tab', () => {
         expect(flags).toEqual([[strings.thisDevice], [], [], [strings.pinned, strings.thisDevice]])
     })
 
-    it('keeps the concurrent transfer setting above both details tabs', async () => {
+    it('keeps the concurrent transfer setting outside the details box, visible with both tabs', async () => {
         expect(labelled(strings.transferConcurrency).value).toBe('4')
         expect(target.textContent).toContain(strings.transferConcurrencyHelp)
+        expect(labelled(strings.transferConcurrency).closest('.details')).toBeNull()
         await openStorageUsage()
         expect(labelled(strings.transferConcurrency).value).toBe('4')
         expect(labelled(strings.transferConcurrency).closest('[role="tabpanel"]')).toBeNull()

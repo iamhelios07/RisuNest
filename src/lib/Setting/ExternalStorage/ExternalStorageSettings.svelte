@@ -947,16 +947,17 @@
                     </div>
                 </div>
 
+                <div class="setting">
+                    <label class="field">
+                        <span>{strings.transferConcurrency}</span>
+                        <span class="amount">
+                            <NumberInput size="sm" className="w-20 text-right tabular-nums" disabled={busy} min={1} max={16} value={connection.transferConcurrency} onChange={event => commitTransferConcurrency(connection, event.currentTarget)} />
+                        </span>
+                    </label>
+                    <p class="help">{strings.transferConcurrencyHelp}</p>
+                </div>
+
                 <div class="details">
-                    <section class="usage-section transfer-settings">
-                        <label class="field">
-                            <span>{strings.transferConcurrency}</span>
-                            <span class="amount">
-                                <NumberInput size="sm" className="w-20 text-right tabular-nums" disabled={busy} min={1} max={16} value={connection.transferConcurrency} onChange={event => commitTransferConcurrency(connection, event.currentTarget)} />
-                            </span>
-                        </label>
-                        <p class="help">{strings.transferConcurrencyHelp}</p>
-                    </section>
                     <div class="tabs" role="tablist">
                         {#each (['history', 'quota'] as const) as tab (tab)}
                             <button type="button" role="tab" id="{connection.id}-{tab}-tab" aria-controls="{connection.id}-{tab}-panel" aria-selected={selectedTab(connection.id) === tab} class="tab" onclick={() => openDetails(connection, tab)}>{tab === 'history' ? strings.history : strings.quota}</button>
@@ -968,7 +969,7 @@
                         <div class="panel" role="tabpanel" id="{connection.id}-history-panel" aria-labelledby="{connection.id}-history-tab">
                             {#if historyLoading[connection.id]}<p class="empty">{strings.loading}</p>
                             {:else if historyError[connection.id]}<SettingNotice role="status" text={historyError[connection.id]} />
-                            {:else if items.length === 0}<p class="empty">{strings.noHistory}</p>{/if}
+                            {:else if items.length === 0}<p class="empty">{connection.purpose === 'sync' ? strings.noSyncHistory : strings.noHistory}</p>{/if}
                             {#if items.length > 0}
                                 <ul class="rows">
                                     {#each items as item (item.id)}
@@ -1276,8 +1277,13 @@
         border-radius: 0.5rem;
         background: var(--risu-theme-bgcolor);
     }
-    .transfer-settings {
-        padding: 0.75rem;
+    .setting {
+        display: grid;
+        gap: 0.375rem;
+        min-width: 0;
+    }
+    .setting .help {
+        max-width: none;
     }
     .tabs {
         display: flex;
@@ -1517,12 +1523,17 @@
     }
     .fields {
         display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
         gap: 0.5rem;
+    }
+    /* The rows share one value column, so inputs line up whether or not a unit follows them. */
+    .fields .field {
+        grid-column: 1 / -1;
+        grid-template-columns: subgrid;
     }
     .field {
         display: grid;
-        grid-template-columns: minmax(8rem, max-content) auto;
-        justify-content: start;
+        grid-template-columns: minmax(0, 1fr) auto;
         align-items: center;
         gap: 0.75rem;
         font-size: 14px;
