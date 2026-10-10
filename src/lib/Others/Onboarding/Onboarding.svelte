@@ -934,10 +934,12 @@
                             {:else if externalStage === 'working'}
                                 <h1>{externalConnection?.purpose === 'sync' ? externalStrings.transfer.syncing : ex.restoring}</h1>
                                 <p class="lead">{ex.syncingLead}</p>
-                                {@render externalRepositoryChip()}
-                                {#if externalConnection}
-                                    <ExternalTransferProgress connectionId={externalConnection.id} strings={externalStrings} job={externalJob} onboarding syncing={externalConnection.purpose === 'sync'} />
-                                {/if}
+                                <div class="external-transfer">
+                                    {@render externalRepositoryChip()}
+                                    {#if externalConnection}
+                                        <ExternalTransferProgress connectionId={externalConnection.id} strings={externalStrings} job={externalJob} onboarding syncing={externalConnection.purpose === 'sync'} />
+                                    {/if}
+                                </div>
                             {:else if externalStage === 'error'}
                                 <h1>{ex.title}</h1>
                                 {@render externalRepositoryChip()}
@@ -1936,6 +1938,11 @@
         height: 15px;
     }
     /* ── external storage: the backups a repository holds ── */
+    .external-transfer {
+        display: grid;
+        gap: 14px;
+        min-width: 0;
+    }
     .picks {
         display: grid;
         gap: 8px;
