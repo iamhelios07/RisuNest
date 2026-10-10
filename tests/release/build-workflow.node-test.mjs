@@ -96,7 +96,9 @@ test("packaging runs after successful preparation despite skipped other-product 
 });
 
 test("a green release requires completed artifact collection or published-release recovery", () => {
-  const result = workflow.slice(workflow.indexOf("\n  release-result:\n"));
+  const result = /\n  release-result:\n([\s\S]*?)(?=\n  [\w-]+:\n|$)/.exec(workflow)?.[1];
+  assert(result, "Missing release result job");
+  assert.doesNotMatch(result, /matrix\.|upload-artifact|--directory|--inventory/);
   assert.match(result, /if: \$\{\{ !cancelled\(\) \}\}/);
   assert.match(result, /needs: \[collect-publish, recover-published\]/);
   assert.match(result, /COLLECT_RESULT: \$\{\{ needs\.collect-publish\.result \}\}/);
@@ -112,6 +114,20 @@ test("a green release requires completed artifact collection or published-releas
       }, { timeout: 100, contextCodeGeneration: { strings: false, wasm: false } });
       assert.equal(exitCode, collect === "success" || recovery === "success" ? 0 : 1,
         `collection=${collect} recovery=${recovery}`);
+    }
+  }
+});
+
+test("each packaging job uploads its own artifacts with a complete publication command", () => {
+  for (const job of ["app-desktop", "app-android", "app-ios", "sync-suite"]) {
+    const block = new RegExp(`\\n  ${job}:\\n([\\s\\S]*?)(?=\\n  [\\w-]+:\\n|$)`).exec(workflow)?.[1];
+    assert(block, `Missing packaging job: ${job}`);
+    assert.match(block, /uses: actions\/upload-artifact@/, `${job} must retain its produced assets`);
+    assert.match(block, /if-no-files-found: error/);
+    const publish = /node scripts\/release\/upload-build\.mjs([^\n]*(?:\n          [^\n]+)*)/.exec(block)?.[1];
+    assert(publish, `${job} must publish its produced assets`);
+    for (const argument of ["--draft-id", "--directory", "--inventory"]) {
+      assert(publish.includes(argument), `${job} publication is missing ${argument}`);
     }
   }
 });
@@ -542,4 +558,9 @@ test("desktop releases compile once before packaging the same target and configu
   assert.match(bundle, /tauri bundle --target "\$TARGET" --bundles "\$BUNDLES" --config "\$RUNNER_TEMP\/release-tauri\.json"/);
   assert.doesNotMatch(bundle, /tauri build|cargo build|pnpm tauribuild/);
   assert.equal([...desktop.matchAll(/tauri build /g)].length, 1);
+  for (const step of desktop.split(/^      - /m)) {
+    if (step.includes("set -euo pipefail")) {
+      assert.match(step, /shell: bash/, "Windows desktop legs must select Bash for shell scripts");
+    }
+  }
 });
