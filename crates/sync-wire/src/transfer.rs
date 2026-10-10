@@ -29,8 +29,11 @@ pub fn encoded_len(frames: &[Frame]) -> Result<usize> {
                 validate_hash(hash)?;
                 Some(41)
             }
-        }.ok_or(WireError("batch-too-large"))?;
-        length = length.checked_add(4).and_then(|n| n.checked_add(payload))
+        }
+        .ok_or(WireError("batch-too-large"))?;
+        length = length
+            .checked_add(4)
+            .and_then(|n| n.checked_add(payload))
             .filter(|n| *n <= MAX_BATCH_BYTES)
             .ok_or(WireError("batch-too-large"))?;
     }

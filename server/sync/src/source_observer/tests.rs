@@ -1183,11 +1183,20 @@ fn sizing_does_not_hash_and_send_still_validates() {
     let _reset = Reset::new();
     let (root, _store, _device, inline, _) = seeded();
     let digest = risunest_sync_wire::hash(&inline);
-    begin(root.path(), "sizing".into(), "source".into(), vec![role(&digest, &["Asset"])]).unwrap();
+    begin(
+        root.path(),
+        "sizing".into(),
+        "source".into(),
+        vec![role(&digest, &["Asset"])],
+    )
+    .unwrap();
     let observed = operation(root.path());
     let frames = [shared_wire::transfer::Frame::Full(inline.clone())];
     for _ in 0..3 {
-        assert_eq!(shared_wire::transfer::encoded_len(&frames).unwrap(), inline.len() + 53);
+        assert_eq!(
+            shared_wire::transfer::encoded_len(&frames).unwrap(),
+            inline.len() + 53
+        );
     }
     let sized = snapshot(false).unwrap();
     assert!(sized.complete);
@@ -1197,8 +1206,14 @@ fn sizing_does_not_hash_and_send_still_validates() {
     drop(observed);
     let sent = snapshot(true).unwrap();
     assert!(sent.complete);
-    assert_eq!(sent.hash_domains["transfer-full-encode-sha256"].hash_calls, 1);
-    assert_eq!(sent.hash_domains["transfer-full-encode-sha256"].hash_bytes, inline.len() as u64);
+    assert_eq!(
+        sent.hash_domains["transfer-full-encode-sha256"].hash_calls,
+        1
+    );
+    assert_eq!(
+        sent.hash_domains["transfer-full-encode-sha256"].hash_bytes,
+        inline.len() as u64
+    );
     conserved(&sent);
 }
 
@@ -1211,16 +1226,27 @@ fn delta_ingress_reuses_only_the_immediate_materialized_identity() {
     let digest = risunest_sync_wire::hash(&target);
     let base_hash = risunest_sync_wire::hash(&inline);
     let recipe = risunest_sync_wire::delta::create(&[&inline], &target).unwrap();
-    let encoded = risunest_sync_wire::transfer::encode(&[
-        risunest_sync_wire::transfer::Frame::Delta(recipe)
-    ]).unwrap();
-    begin(root.path(), "delta-ingress".into(), "ingress".into(),
-        vec![role(&digest, &["Control"]), role(&base_hash, &["Control"])]).unwrap();
-    assert_eq!(store.receive_frames(&device, &encoded).unwrap(), [digest.clone()]);
+    let encoded =
+        risunest_sync_wire::transfer::encode(&[risunest_sync_wire::transfer::Frame::Delta(recipe)])
+            .unwrap();
+    begin(
+        root.path(),
+        "delta-ingress".into(),
+        "ingress".into(),
+        vec![role(&digest, &["Control"]), role(&base_hash, &["Control"])],
+    )
+    .unwrap();
+    assert_eq!(
+        store.receive_frames(&device, &encoded).unwrap(),
+        std::slice::from_ref(&digest)
+    );
     let received = snapshot(true).unwrap();
     assert!(received.complete);
     assert_eq!(received.hash_domains["frame-ingress-sha256"].hash_calls, 1);
-    assert_eq!(received.hash_domains["frame-ingress-sha256"].hash_bytes, target.len() as u64);
+    assert_eq!(
+        received.hash_domains["frame-ingress-sha256"].hash_bytes,
+        target.len() as u64
+    );
     assert!(!received.hash_domains.contains_key("object-ingress-sha256"));
     conserved(&received);
     assert_eq!(store.get_object(&digest).unwrap(), target);

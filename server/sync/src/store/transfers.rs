@@ -171,9 +171,7 @@ impl Store {
                     .ok();
                     if let Some(recipe) = recipe {
                         if let Ok(length) = recipe.encoded_len() {
-                            if length + 64 < target.len()
-                                && used + length + 5 <= 8 * 1024 * 1024
-                            {
+                            if length + 64 < target.len() && used + length + 5 <= 8 * 1024 * 1024 {
                                 frame = Frame::Delta(recipe);
                             }
                         }
