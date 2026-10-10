@@ -533,7 +533,9 @@ jobs:
           --release-input release-input.json
 
   app-desktop:
-    if: inputs.product == 'app' && needs.prepare-draft.outputs.already_published != 'true'
+    if: >-
+      !cancelled() && needs.source.result == 'success' && needs.prepare-draft.result == 'success' &&
+      inputs.product == 'app' && needs.prepare-draft.outputs.already_published != 'true'
     needs: [source, prepare-draft]
     strategy:
       fail-fast: false
@@ -632,7 +634,9 @@ jobs:
           retention-days: 2
 
   app-android:
-    if: inputs.product == 'app' && needs.prepare-draft.outputs.already_published != 'true'
+    if: >-
+      !cancelled() && needs.source.result == 'success' && needs.prepare-draft.result == 'success' &&
+      inputs.product == 'app' && needs.prepare-draft.outputs.already_published != 'true'
     needs: [source, prepare-draft]
     runs-on: ubuntu-24.04
     permissions:
@@ -715,7 +719,9 @@ jobs:
           retention-days: 2
 
   app-ios:
-    if: inputs.product == 'app' && needs.prepare-draft.outputs.already_published != 'true'
+    if: >-
+      !cancelled() && needs.source.result == 'success' && needs.prepare-draft.result == 'success' &&
+      inputs.product == 'app' && needs.prepare-draft.outputs.already_published != 'true'
     needs: [source, prepare-draft]
     runs-on: macos-15
     permissions:
@@ -772,7 +778,9 @@ jobs:
           retention-days: 2
 
   sync-suite:
-    if: inputs.product == 'sync' && needs.prepare-draft.outputs.already_published != 'true'
+    if: >-
+      !cancelled() && needs.source.result == 'success' && needs.prepare-draft.result == 'success' &&
+      inputs.product == 'sync' && needs.prepare-draft.outputs.already_published != 'true'
     needs: [source, prepare-draft]
     strategy:
       fail-fast: false
