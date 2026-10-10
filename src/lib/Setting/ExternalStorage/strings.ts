@@ -526,3 +526,23 @@ export function externalConnectionTitle(
     const name = externalProviderName(strings, connection.providerId)
     return connection.endpoint.accountHint ? `${name} · ${connection.endpoint.accountHint}` : name
 }
+
+/** The folder a connection keeps its repository in, with the fixed app folders named as in the form. */
+export function externalConnectionFolder(
+    strings: ExternalStorageStrings,
+    connection: Pick<ExternalConnectionSummary, 'providerId' | 'endpoint'>,
+): string {
+    const hint = connection.endpoint.repositoryHint
+    if (connection.providerId === 'google_drive' && hint === 'appDataFolder') return strings.options['google_drive.space.appDataFolder']
+    if (connection.providerId === 'onedrive' && hint === 'special/approot') return strings.options['onedrive.accountType.appFolder']
+    return hint
+}
+
+/** Server and folder of a connection. Google Drive and OneDrive always use one API host, so it is left out. */
+export function externalConnectionPlace(
+    strings: ExternalStorageStrings,
+    connection: Pick<ExternalConnectionSummary, 'providerId' | 'endpoint'>,
+): string {
+    const signedIn = connection.providerId === 'google_drive' || connection.providerId === 'onedrive'
+    return [signedIn ? '' : connection.endpoint.authority, externalConnectionFolder(strings, connection)].filter(Boolean).join(' · ')
+}

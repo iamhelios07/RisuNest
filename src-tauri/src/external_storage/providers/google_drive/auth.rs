@@ -70,6 +70,8 @@ struct TokenInfo {
 pub(crate) struct AuthorizedSecret {
     pub secret: SecretBytes,
     pub account_id: String,
+    /// The account's email address, when Drive reports one.
+    pub account_label: Option<String>,
 }
 fn reauth() -> ProviderError {
     ProviderError::new(ErrorKind::ReauthRequired)
@@ -245,16 +247,16 @@ pub(super) async fn verify_google_grant(
     Ok(())
 }
 
-async fn account_id(
+async fn account_identity(
     dependencies: &Dependencies,
     settings: &AuthorizationSettings,
     access_token: &str,
     account: &AccountKey,
     cancel: &Cancellation,
-) -> Result<String> {
+) -> Result<(String, Option<String>)> {
     let mut url = settings.api("/about")?;
     url.query_pairs_mut()
-        .append_pair("fields", "user(permissionId)");
+        .append_pair("fields", "user(permissionId,emailAddress)");
     let mut headers = BTreeMap::new();
     headers.insert("authorization".to_owned(), format!("Bearer {access_token}"));
     let request = HttpRequest {
@@ -274,15 +276,15 @@ async fn account_id(
         return Err(reauth());
     }
     wire::require_status(&mut response, &[200], dependencies.clock.now_ms(), cancel).await?;
-    let permission_id = wire::json::<About>(&mut response, cancel)
+    let user = wire::json::<About>(&mut response, cancel)
         .await?
         .user
-        .and_then(|user| user.permission_id)
         .ok_or_else(reauth)?;
+    let permission_id = user.permission_id.ok_or_else(reauth)?;
     if permission_id.len() > 128 || !config::is_drive_id(&permission_id) {
         return Err(reauth());
     }
-    Ok(permission_id)
+    Ok((permission_id, user.email_address))
 }
 
 // Vault instances can differ across handles; the opaque reference identifies
@@ -554,7 +556,8 @@ pub(crate) async fn exchange_authorization_code(
         cancel,
     )
     .await?;
-    let account_id = account_id(dependencies, &settings, &access_token, &pending, cancel).await?;
+    let (account_id, account_label) =
+        account_identity(dependencies, &settings, &access_token, &pending, cancel).await?;
     let account = AccountKey::new(config::PROVIDER_ID, &settings.api("/")?, &account_id)?;
     dependencies.requests.resolve_pending(&pending, &account)?;
     let secret = encode(&SecretPayload {
@@ -563,5 +566,5 @@ pub(crate) async fn exchange_authorization_code(
         expires_at_ms: Some(expires_at_ms),
         client_secret,
     })?;
-    Ok(AuthorizedSecret { secret, account_id })
+    Ok(AuthorizedSecret { secret, account_id, account_label })
 }

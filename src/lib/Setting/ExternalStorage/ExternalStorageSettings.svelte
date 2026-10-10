@@ -48,7 +48,7 @@
     import { formatRisuNestStorageBytes } from 'src/ts/storage/risuNestStorageDashboard'
     import { createRemainingTimeEstimator } from 'src/ts/storage/sync/remainingTime'
     import ConnectionForm from './ConnectionForm.svelte'
-    import { externalConnectionTitle, externalErrorKind, externalErrorMessage, externalStorageStrings } from './strings'
+    import { externalConnectionPlace, externalConnectionTitle, externalErrorKind, externalErrorMessage, externalStorageStrings } from './strings'
 
     const bridge = getExternalStorageBridge()
     /** How many empty history pages one request reads past before stopping. */
@@ -587,7 +587,7 @@
         if (check.signal.aborted) return
         const remoteOnly = held !== 0
         // The card's own two lines tell apart connections to one service and account.
-        const name = `${externalConnectionTitle(strings, connection)}\n${connectionPlace(connection)}`
+        const name = [externalConnectionTitle(strings, connection), externalConnectionPlace(strings, connection)].filter(Boolean).join('\n')
         const choice = await alertCheckboxConfirm({
             title: strings.removeTitle,
             description: remoteOnly ? `${name}\n\n${strings.removeDeletes}\n\n${held === undefined ? strings.removeRemoteOnlyUnknown : strings.removeRemoteOnly}` : name,
@@ -825,10 +825,6 @@
         return value ? new Date(Number(value)).toLocaleString() : '—'
     }
 
-    function connectionPlace(connection: ExternalConnectionSummary): string {
-        return [connection.endpoint.authority, connection.endpoint.repositoryHint].join(' · ')
-    }
-
     function providerIcon(providerId: ExternalConnectionSummary['providerId']) {
         if (providerId === 'webdav') return ServerIcon
         if (providerId === 's3') return DatabaseIcon
@@ -912,12 +908,13 @@
             {@const syncing = syncTarget && !!syncRunning[connection.id]}
             {@const backedUp = connection.purpose === 'backup' || !!connection.lastBackupAtMs}
             {@const synced = connection.purpose === 'sync' && !!connection.lastSyncAtMs}
+            {@const place = externalConnectionPlace(strings, connection)}
             <article class="card">
                 <header class="card-head">
                     <span class="provider" aria-hidden="true"><ProviderIcon size={18} /></span>
                     <div class="card-name">
                         <h3 class="card-title">{externalConnectionTitle(strings, connection)}</h3>
-                        <p class="card-sub">{connectionPlace(connection)}</p>
+                        {#if place}<p class="card-sub">{place}</p>{/if}
                     </div>
                     <div class="card-status"><StatusBadge label={connectionStatus(connection)} tone={connectionTone(connection)} /></div>
                 </header>

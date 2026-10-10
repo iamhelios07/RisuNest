@@ -3,7 +3,7 @@
 use super::{
     auth::{SecretBytes, SecretVault},
     connection::{self, *},
-    connection_store::{ConnectionStore, PendingStoredConnection, StoredConnection},
+    connection_store::{ConnectionLabels, ConnectionStore, PendingStoredConnection, StoredConnection},
     contract::{
         Cancellation, ErrorKind, Provider, ProviderError, RepositoryHandle, Result, SecretRef,
     },
@@ -42,6 +42,9 @@ struct PendingPreparation {
     imported_credential: Option<ImportedCredential>,
     bound_credential: Option<BoundCredential>,
     selected_folder_name: Option<String>,
+    /// Folder name carried by imported connection settings.
+    imported_folder_name: Option<String>,
+    account_label: Option<String>,
     transferred: bool,
     renewal: Option<String>,
 }
@@ -50,6 +53,7 @@ struct PendingPreparation {
 struct BoundCredential {
     reference: SecretRef,
     account_id: String,
+    account_label: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -73,7 +77,7 @@ struct FolderCursor {
 struct FolderSelectionSession {
     preparation_id: String,
     expires_at_ms: u64,
-    account_hint: String,
+    account_hint: Option<String>,
     drive_id: String,
     root_item_id: String,
     handles: HashMap<String, FolderNode>,
@@ -244,8 +248,8 @@ pub(crate) enum CompleteAuthorizationResult {
         folder_selection_required: bool,
         #[serde(rename = "selectionId")]
         selection_id: String,
-        #[serde(rename = "accountHint")]
-        account_hint: String,
+        #[serde(rename = "accountHint", skip_serializing_if = "Option::is_none")]
+        account_hint: Option<String>,
     },
 }
 
@@ -419,6 +423,7 @@ fn insert_preparation(
     mut request: PrepareConnectionRequest,
     expected_repository_id: Option<String>,
     imported_credential: Option<ImportedCredential>,
+    imported_folder_name: Option<String>,
     transferred: bool,
 ) -> Result<PreparedConnection> {
     if transferred && request.config.oauth_profile.is_some() && request.config.account_id.is_empty()
@@ -472,6 +477,8 @@ fn insert_preparation(
             imported_credential,
             bound_credential: None,
             selected_folder_name: None,
+            imported_folder_name,
+            account_label: None,
             transferred,
             renewal: None,
         },
@@ -610,6 +617,7 @@ async fn exchange_oauth_credential(
             Ok(BoundCredential {
                 reference: dependencies.vault.store(&authorized.secret).await?,
                 account_id: authorized.account_id,
+                account_label: authorized.account_label,
             })
         }
         "onedrive" => {
@@ -623,6 +631,7 @@ async fn exchange_oauth_credential(
             Ok(BoundCredential {
                 reference: authorized.secret,
                 account_id: authorized.account_id,
+                account_label: authorized.account_label,
             })
         }
         _ => Err(ProviderError::new(ErrorKind::Unsupported)),
@@ -662,6 +671,7 @@ async fn finish_oauth_connection(
         return Err(error.into());
     }
     pending.request.config.account_id = credential.account_id.clone();
+    pending.account_label = credential.account_label.clone();
 
     if pending.renewal.is_some() {
         let committed = commit_preparation(app, &preparation_id, &pending,
@@ -735,7 +745,7 @@ async fn finish_oauth_connection(
                         folder_selected: true,
                         folder: FolderSelection {
                             name: folder.name,
-                            account_hint: Some(credential.account_id.clone()),
+                            account_hint: credential.account_label.clone(),
                         },
                     }))
                 }
@@ -810,7 +820,7 @@ async fn finish_oauth_connection(
                             FolderSelectionSession {
                                 preparation_id: preparation_id.clone(),
                                 expires_at_ms: pending.expires_at_ms,
-                                account_hint: credential.account_id.clone(),
+                                account_hint: credential.account_label.clone(),
                                 drive_id: drive.drive_id,
                                 root_item_id: drive.root_item_id,
                                 handles: HashMap::new(),
@@ -820,7 +830,7 @@ async fn finish_oauth_connection(
                         Ok(Some(CompleteAuthorizationResult::FolderSelectionRequired {
                             folder_selection_required: true,
                             selection_id,
-                            account_hint: credential.account_id.clone(),
+                            account_hint: credential.account_label.clone(),
                         }))
                     }
                 }
@@ -909,7 +919,7 @@ pub(crate) fn external_storage_prepare_connection(
 ) -> Result<PreparedConnection> {
     logged("external_storage_prepare_connection", (|| {
         let _cleanup_guard = state.admit()?;
-        insert_preparation(&state, request, None, None, false)
+        insert_preparation(&state, request, None, None, None, false)
     })())
 }
 
@@ -926,7 +936,7 @@ pub(crate) fn external_storage_prepare_renewal(
         let expires_at_ms = now_ms().saturating_add(PREPARATION_LIFETIME_MS);
         let prepared = PreparedConnection {
             preparation_id: preparation_id.clone(), expires_at_ms: expires_at_ms.to_string(),
-            endpoint: endpoint_confirmation(&stored.config, true)?, capabilities: Some(stored.capabilities.clone()),
+            endpoint: connection::stored_endpoint(&stored)?, capabilities: Some(stored.capabilities.clone()),
             requires_o_auth: stored.config.oauth_profile.is_some(), requires_recovery_key: false,
             requires_platform_o_auth_client: false, requires_folder_selection: false, oauth_project_hint: None,
         };
@@ -935,7 +945,8 @@ pub(crate) fn external_storage_prepare_renewal(
             request: PrepareConnectionRequest { config: stored.config, mode: ConnectionOpenMode::Existing,
                 purpose, recovery_key: None, acknowledgements: vec![] },
             expires_at_ms, recovery_key: None, expected_repository_id: Some(stored.descriptor.repository_id),
-            imported_credential: None, bound_credential: None, selected_folder_name: None, transferred: false,
+            imported_credential: None, bound_credential: None, selected_folder_name: None,
+            imported_folder_name: None, account_label: None, transferred: false,
             renewal: Some(connection_id),
         });
         Ok(prepared)
@@ -946,6 +957,7 @@ async fn renew_connection(
     app: &AppHandle,
     connection_id: &str,
     credential: CredentialInput,
+    account_label: Option<String>,
     cancel: &Cancellation,
 ) -> Result<ConnectionResult> {
     let root = connection_root(app)?;
@@ -966,7 +978,7 @@ async fn renew_connection(
         descriptor::read(&root, provider.as_ref(), &handle, &stored.descriptor_locator,
             &stored.descriptor, &key, cancel).await?;
         cancel.check()?;
-        ConnectionStore::open(&root)?.replace_credential(connection_id, &stored.credential_ref, &replacement.0)
+        ConnectionStore::open(&root)?.replace_credential(connection_id, &stored.credential_ref, &replacement.0, account_label)
     }.await;
     complete_credential_renewal(dependencies.vault.as_ref(), &SecretRef(stored.credential_ref), &replacement, result).await
 }
@@ -1680,7 +1692,7 @@ pub(crate) async fn external_storage_select_folder(
         restore_preparation(&state, session.preparation_id, pending);
         Ok(FolderSelection {
             name: folder.name,
-            account_hint: Some(session.account_hint),
+            account_hint: session.account_hint,
         })
     }).await)
 }
@@ -1744,7 +1756,8 @@ async fn commit_preparation(
     cancel: &Cancellation,
 ) -> ConnectResult<ConnectionResult> {
     if let Some(connection_id) = preparation.renewal.as_deref() {
-        return renew_connection(app, connection_id, credential, cancel).await.map_err(Into::into);
+        return renew_connection(app, connection_id, credential, preparation.account_label.clone(), cancel)
+            .await.map_err(Into::into);
     }
     commit_new_connection(&connection_root(app)?, connection_id, preparation, credential, cancel).await
 }
@@ -1762,6 +1775,10 @@ async fn commit_new_connection(
     let key_vault = secrets::repository_key_vault(&root);
     let mut config = preparation.request.config.clone();
     let mut store = ConnectionStore::open(&root)?;
+    let labels = ConnectionLabels::new(
+        preparation.account_label.clone(),
+        preparation.selected_folder_name.clone().or_else(|| preparation.imported_folder_name.clone()),
+    );
     let provided_account_id = match &credential {
         CredentialInput::Bytes(secret) => secret.account_id.as_ref(),
         CredentialInput::Reference { account_id, .. } => account_id.as_ref(),
@@ -1819,6 +1836,8 @@ async fn commit_new_connection(
             if let Some(account_id) = account_id {
                 pending.config.account_id = account_id;
             }
+            pending.labels.account = labels.account.or(pending.labels.account.take());
+            pending.labels.folder = labels.folder.or(pending.labels.folder.take());
             if let Err(error) = store.put_pending(&pending) {
                 let _ = provider_vault
                     .remove(&SecretRef(pending.credential_ref.clone()))
@@ -1958,6 +1977,7 @@ async fn commit_new_connection(
                 root_key_ref: key_ref.0.clone(),
                 recovery_key_ref: recovery_key_ref.0.clone(),
                 created_at_ms: now_ms(),
+                labels,
             };
             if let Err(error) = store.put_pending(&pending) {
                 let _ = key_vault.remove(&key_ref).await;
@@ -2456,6 +2476,7 @@ pub(crate) fn external_storage_prepare_connection_settings_import(
             prepare,
             Some(imported.repository_id),
             imported_credential,
+            imported.folder_name,
             true,
         )
     })())
@@ -2665,7 +2686,7 @@ mod tests {
             recovery_key: Some(recovery::generate_key().unwrap().to_string()),
             acknowledgements: Vec::new(),
         };
-        let result = insert_preparation(&state, request, None, None, false).unwrap();
+        let result = insert_preparation(&state, request, None, None, None, false).unwrap();
         assert!(!result.requires_recovery_key);
         assert!(result.capabilities.is_none());
 
@@ -2679,7 +2700,7 @@ mod tests {
             .request
             .clone();
         invalid.recovery_key = Some("not-a-recovery-key".into());
-        assert!(insert_preparation(&state, invalid, None, None, false).is_err());
+        assert!(insert_preparation(&state, invalid, None, None, None, false).is_err());
     }
 
     #[test]
@@ -2702,7 +2723,7 @@ mod tests {
             recovery_key: None,
             acknowledgements: Vec::new(),
         };
-        assert_eq!(insert_preparation(&state, s3, None, None, false).unwrap().endpoint.authority,
+        assert_eq!(insert_preparation(&state, s3, None, None, None, false).unwrap().endpoint.authority,
             "http://127.0.0.1:9000");
 
         let mut stored = StoredConnection {
@@ -2721,7 +2742,7 @@ mod tests {
             credential_ref: "credential".into(),
             root_key_ref: "root-key".into(),
             recovery_key_ref: "recovery-key".into(),
-            retention_policy: None, transfer_concurrency: None,
+            retention_policy: None, transfer_concurrency: None, labels: Default::default(),
             capabilities: super::super::fake::capabilities(false),
             created_at_ms: 1,
             verified_at_ms: 1,
@@ -2770,7 +2791,7 @@ mod tests {
             recovery_key: None,
             acknowledgements: Vec::new(),
         };
-        let id = insert_preparation(&state, request, None, None, false).unwrap().preparation_id;
+        let id = insert_preparation(&state, request, None, None, None, false).unwrap().preparation_id;
         let pending = take_preparation(&state, &id).unwrap();
         let secret = connection::encode_secret("s3", ProviderSecretInput::S3 {
             access_key_id: "AKIASYNTHETICEXAMPLE".into(),
@@ -2797,6 +2818,64 @@ mod tests {
     }
 
     #[test]
+    fn a_commit_saves_the_names_it_was_given_and_a_resumed_commit_keeps_unreported_ones() {
+        use super::super::wire_fixture::{Reply, WireServer};
+        let server = WireServer::start(vec![Reply::Http {
+            status: 403,
+            headers: vec![("Content-Type".into(), "application/xml".into())],
+            body: b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>AccessDenied</Code></Error>".to_vec(),
+        }]);
+        let state = ConnectionCommandState::default();
+        let request = PrepareConnectionRequest {
+            config: super::super::contract::ConnectionConfig {
+                provider: "s3".into(),
+                profile: Some("generic".into()),
+                endpoint: server.url.origin().ascii_serialization(),
+                account_id: String::new(),
+                location: BTreeMap::from([
+                    ("bucket".into(), "synthetic-bucket".into()),
+                    ("prefix".into(), "risunest".into()),
+                    ("region".into(), "us-east-1".into()),
+                    ("addressing".into(), "path".into()),
+                ]),
+                oauth_profile: None,
+            },
+            mode: ConnectionOpenMode::Create,
+            purpose: ConnectionPurpose::Backup,
+            recovery_key: None,
+            acknowledgements: Vec::new(),
+        };
+        let id = insert_preparation(&state, request, None, None, Some("Imported folder".into()), false).unwrap().preparation_id;
+        let mut pending = take_preparation(&state, &id).unwrap();
+        pending.account_label = Some(" synthetic@example.invalid ".into());
+        let secret = || connection::encode_secret("s3", ProviderSecretInput::S3 {
+            access_key_id: "AKIASYNTHETICEXAMPLE".into(),
+            secret_access_key: "synthetic/secret/key".into(),
+        }).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let commit = |pending: &PendingPreparation| runtime.block_on(async {
+            assert!(commit_new_connection(
+                root.path(), &id, pending, CredentialInput::Bytes(secret()), &Cancellation::default(),
+            ).await.is_err());
+            ConnectionStore::open(root.path()).unwrap().pending(&id).unwrap().labels
+        });
+        assert_eq!(commit(&pending), ConnectionLabels::new(
+            Some("synthetic@example.invalid".into()), Some("Imported folder".into())));
+        pending.account_label = None;
+        pending.selected_folder_name = Some("Selected folder".into());
+        assert_eq!(commit(&pending), ConnectionLabels::new(
+            Some("synthetic@example.invalid".into()), Some("Selected folder".into())));
+        runtime.block_on(async {
+            let left = ConnectionStore::open(root.path()).unwrap().pending(&id).unwrap();
+            let _ = secrets::provider_vault(root.path()).remove(&SecretRef(left.credential_ref)).await;
+            let keys = secrets::repository_key_vault(root.path());
+            let _ = keys.remove(&SecretRef(left.root_key_ref)).await;
+            let _ = keys.remove(&SecretRef(left.recovery_key_ref)).await;
+        });
+    }
+
+    #[test]
     fn connection_settings_are_authenticated_before_endpoint_review() {
         let descriptor = Descriptor::new("synthetic-repository".into(), None).unwrap();
         let stored = StoredConnection {
@@ -2815,7 +2894,7 @@ mod tests {
             credential_ref: "not-exported".into(),
             root_key_ref: "not-exported".into(),
             recovery_key_ref: "not-exported-recovery".into(),
-            retention_policy: None, transfer_concurrency: None,
+            retention_policy: None, transfer_concurrency: None, labels: Default::default(),
             capabilities: super::super::fake::capabilities(false),
             created_at_ms: 1,
             verified_at_ms: 1,
@@ -2862,6 +2941,7 @@ mod tests {
                 recovery_key: Some(recovery::generate_key().unwrap().to_string()),
                 acknowledgements: Vec::new(),
             },
+            None,
             None,
             None,
             false,
@@ -2947,6 +3027,8 @@ mod tests {
             imported_credential: None,
             bound_credential: None,
             selected_folder_name: None,
+            imported_folder_name: None,
+            account_label: None,
             transferred: true,
             renewal: None,
         };
@@ -3015,7 +3097,7 @@ mod tests {
                 recovery_key: Some(recovery::generate_key().unwrap().to_string()),
                 acknowledgements: vec![],
             },
-            Some("synthetic-repository".into()), None, true,
+            Some("synthetic-repository".into()), None, None, true,
         ).unwrap();
         assert!(prepared.requires_platform_o_auth_client);
         let id = prepared.preparation_id;
@@ -3068,7 +3150,7 @@ mod tests {
             credential_ref: "old".into(), root_key_ref: "root".into(), recovery_key_ref: "recovery".into(),
             capabilities: super::super::fake::capabilities(false), created_at_ms: 1,
             verified_at_ms: 1,
-            last_sync_at_ms: None, last_backup_at_ms: None, retention_policy: None, transfer_concurrency: None,
+            last_sync_at_ms: None, last_backup_at_ms: None, retention_policy: None, transfer_concurrency: None, labels: Default::default(),
         }
     }
 

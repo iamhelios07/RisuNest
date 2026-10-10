@@ -5355,7 +5355,7 @@ mod tests {
                 stored:super::super::connection_store::StoredConnection {
                     id:"synthetic-connection".into(),config:super::super::contract::ConnectionConfig {provider:"synthetic".into(),profile:None,endpoint:"https://synthetic.invalid".into(),account_id:"account".into(),location:BTreeMap::new(),oauth_profile:None},
                     descriptor:risunest_external_storage_format::format::Descriptor::new("format-repository".into(),Some(risunest_external_storage_format::format::Strategy::Cas)).unwrap(),
-                    descriptor_locator:RemoteLocator{connection_identity:repository.connection_identity.clone(),collection:None,object:"descriptor".into()},provider_repository_id:repository.repository_id.clone(),credential_ref:"credential".into(),root_key_ref:"key".into(),recovery_key_ref:"recovery".into(),retention_policy:None,transfer_concurrency:None,capabilities:fake::capabilities(true),created_at_ms:1,verified_at_ms:1,last_sync_at_ms:None,last_backup_at_ms:None,
+                    descriptor_locator:RemoteLocator{connection_identity:repository.connection_identity.clone(),collection:None,object:"descriptor".into()},provider_repository_id:repository.repository_id.clone(),credential_ref:"credential".into(),root_key_ref:"key".into(),recovery_key_ref:"recovery".into(),retention_policy:None,transfer_concurrency:None,labels:Default::default(),capabilities:fake::capabilities(true),created_at_ms:1,verified_at_ms:1,last_sync_at_ms:None,last_backup_at_ms:None,
                 },provider:provider.clone(),handle:repository,dependencies:fake::loopback_dependencies(fake::MemoryVault::default(),1).dependencies,root_key:zeroize::Zeroizing::new(key),
             };
             let connected=Arc::new(connected);

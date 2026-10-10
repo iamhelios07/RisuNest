@@ -1589,6 +1589,15 @@ describe('the connection card text', () => {
     })
     const occurrences = (text: string) => (target.querySelector('article')?.textContent ?? '').split(text).length - 1
 
+    it('leaves out the line under the title when a signed-in connection has no saved folder name', async () => {
+        const drive = { ...connection(10, 30), providerId: 'google_drive', endpoint: { ...connection(10, 30).endpoint, providerId: 'google_drive', authority: 'https://www.googleapis.com', repositoryHint: '' } }
+        await show([drive, { ...drive, id: 'connection-2', endpoint: { ...drive.endpoint, repositoryHint: 'RisuNest', accountHint: 'synthetic@example.invalid' } }])
+        const cards = [...target.querySelectorAll('article')]
+        expect(cards[0].querySelector('.card-sub')).toBeNull()
+        expect(cards[1].querySelector('.card-title')?.textContent).toBe('Google Drive · synthetic@example.invalid')
+        expect(cards[1].querySelector('.card-sub')?.textContent).toBe('RisuNest')
+    })
+
     it('shows no last backup on a sync connection that never made one', async () => {
         await show([{ ...connection(10, 30), purpose: 'sync', strategy: 'sequential' }])
         expect(target.textContent).not.toContain(strings.lastBackup)

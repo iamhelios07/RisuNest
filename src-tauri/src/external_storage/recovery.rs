@@ -40,6 +40,7 @@ struct ConnectionSettingsPayload {
     repository_id: String,
     credential: Option<Vec<u8>>,
     account_id: Option<String>,
+    folder_name: Option<String>,
 }
 
 pub(crate) struct ImportedConnectionSettings {
@@ -47,6 +48,7 @@ pub(crate) struct ImportedConnectionSettings {
     pub repository_id: String,
     pub credential: Option<Zeroizing<Vec<u8>>>,
     pub account_id: Option<String>,
+    pub folder_name: Option<String>,
 }
 
 struct TemporaryFile(PathBuf);
@@ -324,6 +326,7 @@ pub(crate) fn export_connection_settings(
         },
         account_id: (!connection.config.account_id.is_empty())
             .then(|| connection.config.account_id.clone()),
+        folder_name: connection.labels.folder.clone(),
     };
     let plaintext = Zeroizing::new(serde_json::to_vec(&payload).map_err(|_| corrupt())?);
     ConnectionSettingsEnvelope::protect(
@@ -358,6 +361,7 @@ pub(crate) fn import_connection_settings(
         repository_id: payload.repository_id,
         credential: payload.credential.map(Zeroizing::new),
         account_id: payload.account_id,
+        folder_name: payload.folder_name,
     })
 }
 
@@ -383,7 +387,7 @@ mod tests {
             credential_ref: "credential".into(),
             root_key_ref: "root".into(),
             recovery_key_ref: "recovery".into(),
-            retention_policy: None, transfer_concurrency: None,
+            retention_policy: None, transfer_concurrency: None, labels: Default::default(),
             capabilities: Capabilities::default(),
             created_at_ms: 1,
             verified_at_ms: 1,
@@ -428,11 +432,17 @@ mod tests {
             project_id: "project".into(),
             platform_client_ids: Default::default(),
         });
+        connection.labels = crate::external_storage::connection_store::ConnectionLabels::new(
+            Some("synthetic@example.invalid".into()), Some("Synthetic folder".into()));
         let key = generate_key().unwrap();
         let bytes = export_connection_settings(&connection, &key, Some(b"oauth-token")).unwrap();
         assert!(!String::from_utf8_lossy(&bytes).contains("oauth-token"));
+        let envelope = ConnectionSettingsEnvelope::decode(&bytes).unwrap();
+        let plaintext = envelope.open(&envelope.repository_id, &parse_key(&key).unwrap()).unwrap();
+        assert!(!String::from_utf8_lossy(&plaintext).contains("synthetic@example.invalid"));
         let imported = import_connection_settings(&bytes, &key).unwrap();
         assert!(imported.credential.is_none());
+        assert_eq!(imported.folder_name.as_deref(), Some("Synthetic folder"));
     }
 
     #[test]

@@ -75,6 +75,7 @@
     import ConnectionForm from 'src/lib/Setting/ExternalStorage/ConnectionForm.svelte'
     import ExternalTransferProgress from 'src/lib/Setting/ExternalStorage/ExternalTransferProgress.svelte'
     import {
+        externalConnectionFolder,
         externalConnectionTitle,
         externalErrorMessage,
         externalStorageStrings,
@@ -564,12 +565,13 @@
 
 {#snippet externalRepositoryChip()}
     {#if externalConnection}
+        {@const folder = externalConnectionFolder(externalStrings, externalConnection)}
         <div class="file">
             <HardDrive />
             <span class="name"
                 >{externalConnectionTitle(externalStrings, externalConnection)}</span
             >
-            <span class="dim">{externalConnection.endpoint.repositoryHint}</span>
+            {#if folder}<span class="dim">{folder}</span>{/if}
         </div>
     {/if}
 {/snippet}

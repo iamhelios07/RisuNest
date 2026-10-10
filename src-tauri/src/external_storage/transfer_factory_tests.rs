@@ -30,7 +30,7 @@ pub(super) fn save(root: &Path, id: &str, descriptor: risunest_external_storage_
         id: id.into(), config: ConnectionConfig { provider: "synthetic".into(), profile: None, endpoint: "https://synthetic.invalid".into(), account_id: "account".into(), location: Default::default(), oauth_profile: None },
         descriptor, descriptor_locator: locator, provider_repository_id: fake::repository().repository_id,
         credential_ref: "credential".into(), root_key_ref: "root-key".into(), recovery_key_ref: "recovery-key".into(),
-        capabilities: fake::capabilities(false), retention_policy: None, transfer_concurrency: None,
+        capabilities: fake::capabilities(false), retention_policy: None, transfer_concurrency: None, labels: Default::default(),
         created_at_ms: 1, verified_at_ms: 1, last_sync_at_ms: None, last_backup_at_ms: None,
     };
     ConnectionStore::open(root).unwrap().insert(&stored).unwrap(); stored
