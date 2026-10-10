@@ -320,20 +320,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Run Rust test inventory in an iOS simulator
         shell: bash
-        run: |
-          set -euo pipefail
-          IPHONEOS_DEPLOYMENT_TARGET=$(node -p "require('./src-tauri/tauri.ios.conf.json').bundle.iOS.minimumSystemVersion")
-          export IPHONEOS_DEPLOYMENT_TARGET
-          device_id=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(device["udid"] for runtime,devices in data["devices"].items() if "iOS" in runtime for device in devices if device.get("isAvailable") and device.get("state") in ("Shutdown", "Booted")))')
-          xcrun simctl boot "$device_id" 2>/dev/null || true
-          xcrun simctl bootstatus "$device_id" -b
-          cat > "$RUNNER_TEMP/ios-sim-runner.sh" <<'EOF'
-          #!/bin/sh
-          exec xcrun simctl spawn "$IOS_SIMULATOR_UDID" "$@"
-          EOF
-          chmod +x "$RUNNER_TEMP/ios-sim-runner.sh"
-          IOS_SIMULATOR_UDID="$device_id" CARGO_TARGET_AARCH64_APPLE_IOS_SIM_RUNNER="$RUNNER_TEMP/ios-sim-runner.sh" cargo test --manifest-path src-tauri/Cargo.toml --release --locked --target aarch64-apple-ios-sim --lib
-          xcrun simctl shutdown "$device_id"
+        run: bash scripts/ios-native-tests.sh
       - run: pnpm ios:build:simulator:agent
 
   sync-tests:

@@ -71,6 +71,19 @@ test("WASM jobs verify native artifacts afterward and Android includes barcode t
   assert.match(workflow, /pnpm test --project app --project app-extended/);
 });
 
+test("iOS Rust tests preflight their own keychain identity before running the full inventory", () => {
+  const ios = workflow.slice(workflow.indexOf("\n  app-ios-tests:"), workflow.indexOf("\n  sync-tests:"));
+  const runner = readFileSync(new URL("../../scripts/ios-native-tests.sh", import.meta.url), "utf8");
+  assert.match(ios, /run: bash scripts\/ios-native-tests\.sh/);
+  assert.match(runner, /tauri\.ios\.conf\.json.*minimumSystemVersion/);
+  assert.match(runner, /__TEXT,__entitlements/);
+  assert.match(runner, /__TEXT,__ents_der/);
+  assert.match(runner, /keychain-access-groups/);
+  assert(runner.indexOf('"$profile/keychain-probe"\n') < runner.indexOf('cargo test '));
+  assert.match(runner, /cargo test .*--release --locked --target aarch64-apple-ios-sim --lib "\$@"/);
+  assert.doesNotMatch(runner, /--skip|--ignored|danger_accept_invalid/);
+});
+
 test("release source input uses one run timestamp instead of the commit timestamp", () => {
   assert.match(workflow, /published_at=\$\(date -u/);
   assert.doesNotMatch(workflow, /git show[^\n]*--format=%cI/);
