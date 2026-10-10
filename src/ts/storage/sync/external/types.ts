@@ -351,7 +351,7 @@ export interface ExternalRecoveryKeyMaterial {
 export interface ExternalConnectionSettingsMaterial {
     transferId: string
     expiresAtMs: DecimalString
-    qrPayload?: string
+    payload: string
 }
 
 export interface ExternalSnapshotExportResult {

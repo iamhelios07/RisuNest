@@ -121,10 +121,11 @@ enum PendingAuthorization {
     },
 }
 
+#[derive(Clone)]
 struct PendingConnectionSettings {
     connection_id: String,
     expires_at_ms: u64,
-    bytes: Vec<u8>,
+    payload: String,
 }
 
 #[derive(Default)]
@@ -153,6 +154,17 @@ impl Drop for ConnectionCommandGuard {
 }
 
 impl ConnectionCommandState {
+    fn connection_settings_for_save(&self, transfer_id: &str, at_ms: u64) -> Result<PendingConnectionSettings> {
+        let mut settings = lock(&self.connection_settings)?;
+        let pending = settings.get(transfer_id)
+            .ok_or_else(|| ProviderError::new(ErrorKind::NotFound))?;
+        if pending.expires_at_ms <= at_ms {
+            settings.remove(transfer_id);
+            return Err(ProviderError::new(ErrorKind::Cancelled));
+        }
+        Ok(pending.clone())
+    }
+
     fn admit(&self) -> Result<ConnectionCommandGuard> {
         let mut activity = lock(&self.activity)?;
         if activity.closed {
@@ -378,8 +390,7 @@ pub(crate) struct RecoveryKeyMaterial {
 pub(crate) struct ConnectionSettingsMaterial {
     transfer_id: String,
     expires_at_ms: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    qr_payload: Option<String>,
+    payload: String,
 }
 
 #[derive(Serialize)]
@@ -2354,20 +2365,21 @@ pub(crate) async fn external_storage_begin_connection_settings_export(
         )?;
         let transfer_id = uuid::Uuid::new_v4().to_string();
         let expires_at_ms = now_ms().saturating_add(PREPARATION_LIFETIME_MS);
-        let encoded = URL_SAFE_NO_PAD.encode(&bytes);
-        let qr_payload = (encoded.len() <= 2_300).then_some(encoded);
-        lock(&state.connection_settings)?.insert(
+        let payload = URL_SAFE_NO_PAD.encode(&bytes);
+        let mut settings = lock(&state.connection_settings)?;
+        settings.retain(|_, pending| pending.expires_at_ms > now_ms());
+        settings.insert(
             transfer_id.clone(),
             PendingConnectionSettings {
                 connection_id,
                 expires_at_ms,
-                bytes,
+                payload: payload.clone(),
             },
         );
         Ok(ConnectionSettingsMaterial {
             transfer_id,
             expires_at_ms: expires_at_ms.to_string(),
-            qr_payload,
+            payload,
         })
     }.await)
 }
@@ -2380,12 +2392,7 @@ pub(crate) async fn external_storage_save_connection_settings_file(
 ) -> Result<()> {
     logged("external_storage_save_connection_settings_file", async move {
         let _cleanup_guard = state.admit()?;
-        let pending = lock(&state.connection_settings)?
-            .remove(&transfer_id)
-            .ok_or_else(|| ProviderError::new(ErrorKind::NotFound))?;
-        if pending.expires_at_ms <= now_ms() {
-            return Err(ProviderError::new(ErrorKind::Cancelled));
-        }
+        let pending = state.connection_settings_for_save(&transfer_id, now_ms())?;
         let selected = app
             .dialog()
             .file()
@@ -2393,7 +2400,7 @@ pub(crate) async fn external_storage_save_connection_settings_file(
             .set_file_name("risunest-connection.rnconnection")
             .blocking_save_file()
             .ok_or_else(|| ProviderError::new(ErrorKind::Cancelled))?;
-        let encoded = URL_SAFE_NO_PAD.encode(&pending.bytes);
+        let encoded = pending.payload;
         let mut options = OpenOptions::new();
         options.write(true).create(true).truncate(true);
         let mut file = app
@@ -2505,6 +2512,20 @@ fn platform_key() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_settings_save_retries_keep_the_same_payload_until_expiry() {
+        let state = ConnectionCommandState::default();
+        state.connection_settings.lock().unwrap().insert("transfer".into(), PendingConnectionSettings {
+            connection_id: "connection".into(), expires_at_ms: 100, payload: "synthetic".repeat(3000),
+        });
+        let first = state.connection_settings_for_save("transfer", 1).unwrap();
+        let retry = state.connection_settings_for_save("transfer", 2).unwrap();
+        assert_eq!(first.payload, retry.payload);
+        assert_eq!(first.connection_id, retry.connection_id);
+        assert_eq!(state.connection_settings_for_save("transfer", 100).err().unwrap().kind, ErrorKind::Cancelled);
+        assert!(state.connection_settings.lock().unwrap().is_empty());
+    }
 
     /// The form reads the kind to tell a repository this device already holds
     /// from a provider failure, and a provider failure keeps its own shape.
