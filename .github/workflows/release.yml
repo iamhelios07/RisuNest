@@ -624,6 +624,18 @@ jobs:
         run: >-
           node scripts/release/upload-build.mjs
           --draft-id "${{ needs.prepare-draft.outputs.release_id }}"
+
+  release-result:
+    if: ${{ !cancelled() }}
+    needs: [collect-publish, recover-published]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require completed artifact verification
+        env:
+          COLLECT_RESULT: ${{ needs.collect-publish.result }}
+          RECOVERY_RESULT: ${{ needs.recover-published.result }}
+        run: |
+          node -e 'if (![process.env.COLLECT_RESULT, process.env.RECOVERY_RESULT].includes("success")) { console.error("Release artifacts were not verified."); process.exit(1); }'
           --directory release-out
           --inventory "release-out/inventory-desktop_${{ matrix.os }}_${{ matrix.arch }}.json"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

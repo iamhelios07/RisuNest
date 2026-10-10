@@ -95,6 +95,27 @@ test("packaging runs after successful preparation despite skipped other-product 
   }
 });
 
+test("a green release requires completed artifact collection or published-release recovery", () => {
+  const result = workflow.slice(workflow.indexOf("\n  release-result:\n"));
+  assert.match(result, /if: \$\{\{ !cancelled\(\) \}\}/);
+  assert.match(result, /needs: \[collect-publish, recover-published\]/);
+  assert.match(result, /COLLECT_RESULT: \$\{\{ needs\.collect-publish\.result \}\}/);
+  assert.match(result, /RECOVERY_RESULT: \$\{\{ needs\.recover-published\.result \}\}/);
+  const program = /node -e '([^'\n]+)'/.exec(result)?.[1];
+  assert(program, "Missing release completion check");
+  for (const collect of ["success", "failure", "cancelled", "skipped"]) {
+    for (const recovery of ["success", "failure", "cancelled", "skipped"]) {
+      let exitCode = 0;
+      runInNewContext(program, {
+        process: { env: { COLLECT_RESULT: collect, RECOVERY_RESULT: recovery }, exit: code => { exitCode = code; } },
+        console: { error() {} },
+      }, { timeout: 100, contextCodeGeneration: { strings: false, wasm: false } });
+      assert.equal(exitCode, collect === "success" || recovery === "success" ? 0 : 1,
+        `collection=${collect} recovery=${recovery}`);
+    }
+  }
+});
+
 test("WASM jobs verify native artifacts afterward and Android includes barcode tests", () => {
   assert.match(workflow, /pnpm test:wasm[\s\S]*dbus-run-session -- bash scripts\/linux-native-tests\.sh --lib external_storage/);
   assert.match(workflow, /:app:testLowMemorySafCopy :tauri-plugin-barcode-scanner:testDebugUnitTest/);
