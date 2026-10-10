@@ -127,6 +127,9 @@ impl ConnectionStore {
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
             CREATE TABLE IF NOT EXISTS connections(id TEXT PRIMARY KEY,value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS automatic_backup_pauses(connection_id TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS usage_objects(connection_id TEXT NOT NULL,locator TEXT NOT NULL,byte_length TEXT NOT NULL,PRIMARY KEY(connection_id,locator));
+            CREATE TABLE IF NOT EXISTS usage_observations(connection_id TEXT PRIMARY KEY,observed_at_ms INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS usage_snapshots(connection_id TEXT NOT NULL,locator TEXT NOT NULL,created_at_ms INTEGER NOT NULL,value TEXT NOT NULL,PRIMARY KEY(connection_id,locator));
             CREATE TABLE IF NOT EXISTS pending_connections(id TEXT PRIMARY KEY,value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS discovery(connection_id TEXT NOT NULL,id TEXT NOT NULL,value TEXT NOT NULL,PRIMARY KEY(connection_id,id));
             CREATE TABLE IF NOT EXISTS unusable_objects(connection_id TEXT NOT NULL,identity TEXT NOT NULL,object_id TEXT NOT NULL,reason TEXT NOT NULL,PRIMARY KEY(connection_id,identity));").map_err(storage)?;
@@ -450,6 +453,9 @@ impl ConnectionStore {
             .map_err(storage)?;
         tx.execute("DELETE FROM automatic_backup_pauses WHERE connection_id=?1", [id])
             .map_err(storage)?;
+        for table in ["usage_objects", "usage_observations", "usage_snapshots"] {
+            tx.execute(&format!("DELETE FROM {table} WHERE connection_id=?1"), [id]).map_err(storage)?;
+        }
         tx.execute("DELETE FROM connections WHERE id=?1", [id])
             .map_err(storage)?;
         tx.commit().map_err(storage)?;
@@ -484,6 +490,73 @@ impl ConnectionStore {
         let encoded = serde_json::to_string(&connection).map_err(storage)?;
         tx.execute("UPDATE connections SET value=?2 WHERE id=?1", params![id, encoded]).map_err(storage)?;
         tx.commit().map_err(storage)
+    }
+
+    pub(super) fn observe_usage(
+        &self, id: &str, repository: &super::contract::RepositoryHandle,
+        receipts: &[super::contract::ObjectReceipt], removed: Option<&RemoteLocator>,
+    ) -> Result<()> {
+        if receipts.iter().all(|receipt| !receipt.complete) && removed.is_none() { return Ok(()); }
+        let current = self.read(id)?;
+        if current.provider_repository_id != repository.repository_id
+            || current.descriptor_locator.connection_identity != repository.connection_identity
+        {
+            return Err(corrupt());
+        }
+        let tx = self.0.unchecked_transaction().map_err(storage)?;
+        for receipt in receipts.iter().filter(|receipt| receipt.complete) {
+            receipt.locator.validate_for(repository)?;
+            tx.execute("INSERT INTO usage_objects VALUES(?1,?2,?3) ON CONFLICT(connection_id,locator) DO UPDATE SET byte_length=excluded.byte_length",
+                params![id, serde_json::to_string(&receipt.locator).map_err(storage)?, receipt.byte_length.to_string()]).map_err(storage)?;
+        }
+        if let Some(locator) = removed {
+            locator.validate_for(repository)?;
+            let key = serde_json::to_string(locator).map_err(storage)?;
+            tx.execute("DELETE FROM usage_objects WHERE connection_id=?1 AND locator=?2", params![id, key]).map_err(storage)?;
+            tx.execute("DELETE FROM usage_snapshots WHERE connection_id=?1 AND locator=?2", params![id, key]).map_err(storage)?;
+        }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map_err(storage)?.as_millis().min(i64::MAX as u128) as i64;
+        tx.execute("INSERT INTO usage_observations VALUES(?1,?2) ON CONFLICT(connection_id) DO UPDATE SET observed_at_ms=MAX(observed_at_ms,excluded.observed_at_ms)",
+            params![id, now]).map_err(storage)?;
+        tx.commit().map_err(storage)
+    }
+
+    pub(super) fn remember_usage_snapshot(
+        &self, id: &str, locator: &RemoteLocator, created_at_ms: u64,
+        summary: &super::usage::ReachableUsage,
+    ) -> Result<()> {
+        let current = self.read(id)?;
+        if current.descriptor_locator.connection_identity != locator.connection_identity {
+            return Err(corrupt());
+        }
+        self.0.execute("INSERT INTO usage_snapshots VALUES(?1,?2,?3,?4) ON CONFLICT(connection_id,locator) DO UPDATE SET created_at_ms=excluded.created_at_ms,value=excluded.value",
+            params![id, serde_json::to_string(locator).map_err(storage)?, i64::try_from(created_at_ms).map_err(storage)?, serde_json::to_string(summary).map_err(storage)?]).map_err(storage)?;
+        Ok(())
+    }
+
+    pub(super) fn storage_usage(&self, id: &str) -> Result<super::usage::StorageUsage> {
+        self.read(id)?;
+        let tx = self.0.unchecked_transaction().map_err(storage)?;
+        let mut objects = 0u64;
+        let mut bytes = 0u64;
+        let mut statement = tx.prepare("SELECT byte_length FROM usage_objects WHERE connection_id=?1").map_err(storage)?;
+        for row in statement.query_map([id], |row| row.get::<_, String>(0)).map_err(storage)? {
+            let length: u64 = row.map_err(storage)?.parse().map_err(|_| corrupt())?;
+            objects = objects.checked_add(1).ok_or_else(corrupt)?;
+            bytes = bytes.checked_add(length).ok_or_else(corrupt)?;
+        }
+        let observed_at_ms = tx.query_row("SELECT observed_at_ms FROM usage_observations WHERE connection_id=?1", [id], |row| row.get::<_, i64>(0)).optional().map_err(storage)?
+            .map(u64::try_from).transpose().map_err(storage)?;
+        let latest: Option<String> = tx.query_row("SELECT s.value FROM usage_snapshots s JOIN usage_objects o ON s.connection_id=o.connection_id AND s.locator=o.locator WHERE s.connection_id=?1 ORDER BY s.created_at_ms DESC,s.locator LIMIT 1",
+            [id], |row| row.get(0)).optional().map_err(storage)?;
+        Ok(super::usage::StorageUsage {
+            provider_physical_bytes: None,
+            observed_at_ms,
+            locally_uploaded_objects_lower_bound: objects,
+            locally_uploaded_bytes_lower_bound: bytes,
+            latest_reachable: latest.map(|value| serde_json::from_str(&value).map_err(|_| corrupt())).transpose()?,
+        })
     }
 
     pub fn remember_discovery(

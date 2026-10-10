@@ -96,7 +96,7 @@ pub(crate) fn remove_connection(root: &Path, id: &str) -> Result<()> {
     Ok(())
 }
 pub(crate) fn wrap(root: &Path, connection_id: &str, provider: Arc<dyn Provider>) -> Result<Arc<dyn Provider>> {
-    Ok(Arc::new(LimitedProvider { provider, limiter: limiter(root, connection_id)? }))
+    Ok(super::usage::wrap(root, connection_id, Arc::new(LimitedProvider { provider, limiter: limiter(root, connection_id)? })))
 }
 struct LimitedProvider { provider: Arc<dyn Provider>, limiter: Arc<Limiter> }
 impl Provider for LimitedProvider {

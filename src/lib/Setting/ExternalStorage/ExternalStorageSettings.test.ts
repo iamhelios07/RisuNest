@@ -648,20 +648,70 @@ describe('the storage usage tab', () => {
     it('scopes the known repository data to this device and shows the amount it knows', async () => {
         state.getQuota.mockResolvedValue({ connectionId: 'connection-1', buckets: [], storage: {
             providerPhysicalKnown: false, locallyUploadedBytesLowerBound: '12',
-            locallyUploadedObjectCountLowerBound: '3', locallyUploadedCoverage: 'cached-upload-receipts',
+            locallyUploadedObjectCountLowerBound: '3', locallyUploadedCoverage: 'observed-remote-files', observedAtMs: '1000',
         } })
         await openStorageUsage()
         await settle()
         const stat = [...target.querySelectorAll('.stat')].find(item => item.querySelector('dt')?.textContent === 'Repository data known to this device')
-        expect([...stat!.querySelectorAll('dd')].map(item => item.textContent?.trim())).toEqual(['12 B', '3 files'])
+        expect([...stat!.querySelectorAll('dd')].slice(0, 2).map(item => item.textContent?.trim())).toEqual(['12 B', '3 files'])
+        expect(stat!.textContent).toContain(strings.lastUsageUpdate)
         expect(target.textContent).not.toContain('Uploaded from this device')
         expect(target.textContent).not.toContain(strings.usedByService)
+    })
+
+    it('shows unknown until a file observation exists instead of an empty repository', async () => {
+        state.getQuota.mockResolvedValue({ connectionId: 'connection-1', buckets: [], storage: {
+            providerPhysicalKnown: false, locallyUploadedBytesLowerBound: '0',
+            locallyUploadedObjectCountLowerBound: '0', locallyUploadedCoverage: 'observed-remote-files', observedAtMs: null,
+        } })
+        await openStorageUsage(); await settle()
+        const stat = [...target.querySelectorAll('.stat')].find(item => item.querySelector('dt')?.textContent === strings.uploadedLowerBound)!
+        expect(stat.textContent).toContain(strings.unknownUsage)
+        expect(stat.textContent).not.toContain('0 B')
+        expect(stat.textContent).not.toContain('0 files')
+    })
+
+    it('refreshes visible usage after refresh and a completed operation', async () => {
+        const usage = (bytes: string) => ({ connectionId: 'connection-1', buckets: [], storage: {
+            providerPhysicalKnown: false, locallyUploadedBytesLowerBound: bytes,
+            locallyUploadedObjectCountLowerBound: '1', locallyUploadedCoverage: 'observed-remote-files', observedAtMs: '1000',
+        } })
+        state.getQuota.mockResolvedValue(usage('12'))
+        await openStorageUsage(); await settle()
+        state.getQuota.mockResolvedValue(usage('24'))
+        const refresh = [...target.querySelectorAll('button')].find(item => item.textContent?.trim() === strings.refresh)!
+        refresh.click(); await settle()
+        expect(target.textContent).toContain('24 B')
+        state.getQuota.mockResolvedValue(usage('36'))
+        const operation = beginExternalProgress('connection-1', 'sync')
+        operation.stage('uploading')
+        await settle()
+        operation.finish('complete'); await settle()
+        expect(target.textContent).toContain('36 B')
+    })
+
+    it('keeps a completed-operation refresh that arrives during a pending usage query', async () => {
+        const usage = (bytes: string) => ({ connectionId: 'connection-1', buckets: [], storage: {
+            providerPhysicalKnown: false, locallyUploadedBytesLowerBound: bytes,
+            locallyUploadedObjectCountLowerBound: '1', locallyUploadedCoverage: 'observed-remote-files', observedAtMs: '1000',
+        } })
+        let resolveFirst!: (value: ReturnType<typeof usage>) => void
+        state.getQuota.mockImplementationOnce(() => new Promise(resolve => { resolveFirst = resolve }))
+            .mockResolvedValue(usage('48'))
+        await openStorageUsage(); await settle()
+        const operation = beginExternalProgress('connection-1', 'sync')
+        operation.stage('uploading'); await settle()
+        operation.finish('complete'); await settle()
+        expect(state.getQuota).toHaveBeenCalledTimes(1)
+        resolveFirst(usage('12')); await settle(); await settle()
+        expect(state.getQuota).toHaveBeenCalledTimes(2)
+        expect(target.textContent).toContain('48 B')
     })
 
     it('shows the space used on the service only when the service reports it', async () => {
         state.getQuota.mockResolvedValue({ connectionId: 'connection-1', buckets: [], storage: {
             providerPhysicalBytes: '2048', providerPhysicalKnown: true, locallyUploadedBytesLowerBound: '12',
-            locallyUploadedObjectCountLowerBound: '3', locallyUploadedCoverage: 'cached-upload-receipts',
+            locallyUploadedObjectCountLowerBound: '3', locallyUploadedCoverage: 'observed-remote-files', observedAtMs: '1000',
         } })
         await openStorageUsage()
         await settle()
@@ -836,7 +886,7 @@ describe('the storage usage tab', () => {
             storage: {
                 providerPhysicalBytes: null, providerPhysicalKnown: false,
                 locallyUploadedBytesLowerBound: '0', locallyUploadedObjectCountLowerBound: '0',
-                locallyUploadedCoverage: 'cached-upload-receipts',
+                locallyUploadedCoverage: 'observed-remote-files', observedAtMs: '1000',
             },
         })
         await openStorageUsage()

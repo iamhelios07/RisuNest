@@ -82,6 +82,8 @@
     let historyCursor = $state<Record<string, string | undefined>>({})
     let historyLoading = $state<Record<string, boolean>>({})
     let quota = $state<Record<string, ExternalQuotaSummary>>({})
+    const quotaLoading = new Map<string, Promise<void>>()
+    const quotaRequested = new Set<string>()
     let remoteOnly = $state<Record<string, number | null>>({})
     let removalDownload = $state<{ connectionId: string; controller: AbortController; cancelling: boolean } | null>(null)
     /** The disconnect waiting for its file check, which cancelling abandons. */
@@ -202,6 +204,7 @@
                     await loadHistory(connection, false)
                 }
             }
+            await Promise.all(storageState.connections.filter(connection => selectedTab(connection.id) === 'quota').map(loadQuota))
             if (!silent) error = ''
             pollError = ''
         } catch (reason) {
@@ -468,12 +471,26 @@
         try {
             if (kind === 'history') await loadHistory(connection, false)
             if (kind === 'quota') {
-                void loadRemoteOnlyFiles(connection)
-                quota[connection.id] = await bridge.getQuota(connection.id)
+                await loadQuota(connection)
             }
         } catch (reason) {
             error = externalErrorMessage(strings, reason)
         }
+    }
+
+    function loadQuota(connection: ExternalConnectionSummary): Promise<void> {
+        quotaRequested.add(connection.id)
+        const pending = quotaLoading.get(connection.id)
+        if (pending) return pending
+        const request = (async () => {
+            do {
+                quotaRequested.delete(connection.id)
+                const [usage] = await Promise.all([bridge.getQuota(connection.id), loadRemoteOnlyFiles(connection)])
+                if (!destroyed) quota[connection.id] = usage
+            } while (!destroyed && quotaRequested.has(connection.id))
+        })().finally(() => { quotaLoading.delete(connection.id); quotaRequested.delete(connection.id) })
+        quotaLoading.set(connection.id, request)
+        return request
     }
 
     /** Files only this connection holds, as the residency status counts them. */
@@ -508,6 +525,7 @@
             history[connection.id] = items
             historyCursor[connection.id] = cursor
             delete historyError[connection.id]
+            if (selectedTab(connection.id) === 'quota') await loadQuota(connection)
         } catch (reason) {
             historyError[connection.id] = externalErrorMessage(strings, reason)
         } finally {
@@ -1049,8 +1067,11 @@
                                         {/if}
                                         <div class="stat">
                                             <dt>{strings.uploadedLowerBound}</dt>
-                                            <dd class="stat-value">{bytes(usage.storage.locallyUploadedBytesLowerBound)}</dd>
-                                            <dd class="stat-note">{strings.files.replace('{0}', Number(usage.storage.locallyUploadedObjectCountLowerBound).toLocaleString())}</dd>
+                                            <dd class="stat-value">{usage.storage.observedAtMs === null ? strings.unknownUsage : bytes(usage.storage.locallyUploadedBytesLowerBound)}</dd>
+                                            {#if usage.storage.observedAtMs !== null}
+                                                <dd class="stat-note">{strings.files.replace('{0}', Number(usage.storage.locallyUploadedObjectCountLowerBound).toLocaleString())}</dd>
+                                                <dd class="stat-note">{strings.lastUsageUpdate}: {when(usage.storage.observedAtMs)}</dd>
+                                            {/if}
                                         </div>
                                         {#if usage.storage.latestReachable}
                                             <div class="stat">
