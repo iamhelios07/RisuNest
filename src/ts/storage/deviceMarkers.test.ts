@@ -92,17 +92,18 @@ describe('device markers', () => {
         expect(() => getDeviceMarkers()).toThrow('not loaded yet')
     })
 
-    it('keeps the plugin attempt across reopening and restored marker reloads', async () => {
+    it('keeps per-plugin attempts across reopening and restored marker reloads', async () => {
         const { stored, settings } = settingsBackend()
         const markers = await initializeDeviceMarkers(settings)
-        markers.setItem('risuNestDefaultPluginsAttempted', 'true')
+        const attempted = JSON.stringify(['provider-manager', 'yumi-translator'])
+        markers.setItem('risuNestDefaultPluginsAttempted', attempted)
         await markers.flush()
         installDeviceMarkers(null)
         const reopened = await initializeDeviceMarkers(settings)
-        expect(reopened.getItem('risuNestDefaultPluginsAttempted')).toBe('true')
+        expect(reopened.getItem('risuNestDefaultPluginsAttempted')).toBe(attempted)
         stored.delete('risuNestDeviceSettings')
         await reopened.reload!()
-        expect(reopened.getItem('risuNestDefaultPluginsAttempted')).toBe('true')
+        expect(reopened.getItem('risuNestDefaultPluginsAttempted')).toBe(attempted)
     })
 
     it('falls back to local storage on the web build', () => {

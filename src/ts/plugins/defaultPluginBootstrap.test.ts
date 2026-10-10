@@ -84,7 +84,7 @@ afterEach(() => {
     vi.restoreAllMocks()
 })
 
-describe('one-time default plugins', () => {
+describe('default plugins attempted once per ID', () => {
     it('waits for onboarding and restoration, records durably, then installs and reloads once', async () => {
         state.db.didFirstSetup = false
         onboardingHold.set(true)
@@ -107,7 +107,7 @@ describe('one-time default plugins', () => {
         expect(fetcher).not.toHaveBeenCalled()
         commit()
         await vi.waitFor(() => expect(state.loadPlugins).toHaveBeenCalledOnce())
-        expect(stored.get(key)).toBe('true')
+        expect(stored.get(key)).toBe(JSON.stringify(names))
         expect(fetcher.mock.calls.map(([url]) => url)).toEqual(names.map(name => `https://update.rsyumi.workers.dev/${name}.js`))
         expect(state.db.plugins.map(plugin => plugin.name)).toEqual(names)
         expect(state.flush).toHaveBeenCalledWith('default-plugin-install')
@@ -118,7 +118,7 @@ describe('one-time default plugins', () => {
     it.each([[['provider-manager']], [names]])('skips existing records, including disabled older API records: %j', async existing => {
         state.db.plugins = existing.map(name => ({ name, enabled: false, version: '2.1' }))
         await start()
-        await vi.waitFor(() => expect(stored.get(key)).toBe('true'))
+        await vi.waitFor(() => expect(stored.get(key)).toBe(JSON.stringify(names)))
         if (existing.length === 1) await vi.waitFor(() => expect(state.loadPlugins).toHaveBeenCalledOnce())
         expect(fetcher).toHaveBeenCalledTimes(2 - existing.length)
         expect(state.db.plugins.slice(0, existing.length)).toEqual(existing.map(name => ({ name, enabled: false, version: '2.1' })))
@@ -142,12 +142,66 @@ describe('one-time default plugins', () => {
     it('keeps the attempt when both plugins were present and one is later removed', async () => {
         state.db.plugins = names.map(name => ({ name }))
         await start()
-        await vi.waitFor(() => expect(stored.get(key)).toBe('true'))
+        await vi.waitFor(() => expect(stored.get(key)).toBe(JSON.stringify(names)))
         state.db.plugins = []
         vi.resetModules()
         loadMarkers()
         await start()
         expect(fetcher).not.toHaveBeenCalled()
+    })
+
+    it('installs a newly added default on normal startup and retains previous IDs', async () => {
+        const previous = ['retired-default', 'provider-manager']
+        stored.set(key, JSON.stringify(previous))
+        loadMarkers()
+        const module = await start()
+        await vi.waitFor(() => expect(state.loadPlugins).toHaveBeenCalledOnce())
+        expect(fetcher.mock.calls.map(([url]) => url)).toEqual(['https://update.rsyumi.workers.dev/yumi-translator.js'])
+        expect(state.db.plugins.map(plugin => plugin.name)).toEqual(['yumi-translator'])
+        expect(stored.get(key)).toBe(JSON.stringify([...previous, 'yumi-translator']))
+
+        // A later restore or sync does not start another pass in the running app.
+        const blocked = persistentWorkingSetInputBlocked as ReturnType<typeof writable<boolean>>
+        blocked.set(true)
+        onboardingHold.set(true)
+        flushSync()
+        state.db.plugins = []
+        blocked.set(false)
+        onboardingHold.set(false)
+        flushSync()
+        module.startDefaultPluginBootstrap()
+        vi.resetModules()
+        loadMarkers()
+        await start()
+        await state.markers.flush()
+        expect(fetcher).toHaveBeenCalledOnce()
+        expect(write).toHaveBeenCalledOnce()
+    })
+
+    it('does not update a previously processed plugin when a new default is added', async () => {
+        stored.set(key, JSON.stringify(['provider-manager']))
+        loadMarkers()
+        const existing = { name: 'provider-manager', enabled: false, version: '2.1' }
+        state.db.plugins = [existing]
+        await start()
+        await vi.waitFor(() => expect(state.loadPlugins).toHaveBeenCalledOnce())
+        expect(fetcher).toHaveBeenCalledOnce()
+        expect(state.db.plugins).toEqual([existing, { name: 'yumi-translator' }])
+    })
+
+    it('does not retry a newly added default after an offline failure', async () => {
+        stored.set(key, JSON.stringify(['provider-manager']))
+        loadMarkers()
+        fetcher.mockRejectedValue(new Error('offline'))
+        await start()
+        await vi.waitFor(() => expect(console.error).toHaveBeenCalled())
+        expect(stored.get(key)).toBe(JSON.stringify(names))
+        vi.resetModules()
+        loadMarkers()
+        await start()
+        await state.markers.flush()
+        expect(fetcher).toHaveBeenCalledOnce()
+        expect(state.loadPlugins).not.toHaveBeenCalled()
     })
 
     it('continues to the other plugin after an HTTP failure', async () => {
@@ -179,6 +233,16 @@ describe('one-time default plugins', () => {
         expect(fetcher).not.toHaveBeenCalled()
     })
 
+    it.each(['true', '{}', '[1]', 'invalid'])('does not overwrite an invalid attempt record: %s', async record => {
+        stored.set(key, record)
+        loadMarkers()
+        await start()
+        await vi.waitFor(() => expect(console.error).toHaveBeenCalled())
+        expect(stored.get(key)).toBe(record)
+        expect(write).not.toHaveBeenCalled()
+        expect(fetcher).not.toHaveBeenCalled()
+    })
+
     it('waits again if restoration starts before the UI yield finishes', async () => {
         let ready!: () => void
         state.yield.mockImplementationOnce(() => new Promise<void>(resolve => { ready = resolve }))
@@ -206,11 +270,11 @@ describe('one-time default plugins', () => {
         module.startDefaultPluginBootstrap()
         expect(fetcher).toHaveBeenCalledTimes(2)
         expect(state.loadPlugins).not.toHaveBeenCalled()
-        expect(stored.get(key)).toBe('true')
+        expect(stored.get(key)).toBe(JSON.stringify(names))
     })
 
     it('allows a separate data directory to have its own first attempt', async () => {
-        stored.set(key, 'true')
+        stored.set(key, JSON.stringify(names))
         loadMarkers()
         await start()
         expect(fetcher).not.toHaveBeenCalled()
@@ -231,7 +295,7 @@ describe('one-time default plugins', () => {
         await vi.waitFor(() => expect(console.error).toHaveBeenCalled())
         expect(state.importPlugin).not.toHaveBeenCalled()
         expect(state.loadPlugins).not.toHaveBeenCalled()
-        expect(stored.get(key)).toBe('true')
+        expect(stored.get(key)).toBe(JSON.stringify(names))
     })
 
     it('preserves a duplicate installed while its download was pending', async () => {

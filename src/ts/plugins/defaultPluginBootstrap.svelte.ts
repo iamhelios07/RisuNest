@@ -25,14 +25,19 @@ let started = false
 
 async function installDefaultPlugins(): Promise<void> {
     const markers = getDeviceMarkers()
-    if (markers.getItem(ATTEMPT_KEY) !== null) return
+    const attempted: unknown = JSON.parse(markers.getItem(ATTEMPT_KEY) ?? '[]')
+    if (!Array.isArray(attempted) || attempted.some(name => typeof name !== 'string')) {
+        throw new Error('Invalid default plugin attempt record')
+    }
+    const pending = DEFAULT_PLUGINS.filter(([name]) => !attempted.includes(name))
+    if (!pending.length) return
     const epoch = getPersistentStorageAuthorityEpoch()
     assertPersistentMutationAllowed(epoch)
-    markers.setItem(ATTEMPT_KEY, 'true')
+    markers.setItem(ATTEMPT_KEY, JSON.stringify([...attempted, ...pending.map(([name]) => name)]))
     await markers.flush()
 
     let installed = false
-    for (const [name, url] of DEFAULT_PLUGINS) {
+    for (const [name, url] of pending) {
         assertPersistentMutationAllowed(epoch)
         if (DBState.db.plugins.some(plugin => plugin.name === name)) continue
         const controller = new AbortController()
