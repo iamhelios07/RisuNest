@@ -111,6 +111,7 @@ function createAdapter(connectionId: string): Adapter {
             } catch (error) { progress.finish(externalProgressFailure(error)); throw error }
             finally { if (bindingProgress === progress) bindingProgress = undefined }
         },
+        setConfirmationPending(waiting) { bindingProgress?.stage(waiting ? 'waiting' : 'checking') },
         inspectTarget: binding => bindingProgress ? bindingProgress.invoke<InspectedSyncTarget>('external_lww_inspect', { request: header(connectionId, binding) }, binding.state.targetAuthority) : invoke<InspectedSyncTarget>('external_lww_inspect', { request: header(connectionId, binding) }),
         pullAvailableState: (target, binding) => {
             const args = { request: { ...header(connectionId, binding), inspectionId: target.inspectionId, targetId: target.targetId, libraryId: target.libraryId } }

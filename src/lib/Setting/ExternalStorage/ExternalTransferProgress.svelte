@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { onMount } from 'svelte'
+    import { onMount, type Snippet } from 'svelte'
     import TransferProgress from '../RisuNest/TransferProgress.svelte'
     import { subscribeExternalProgress, externalProgressFor, externalJobFraction, externalJobTotalGrows, type ExternalOperationProgress } from 'src/ts/storage/sync/external/progress'
     import { externalJobIsActive, externalJobIsPaused } from 'src/ts/storage/sync/external/connection'
@@ -8,16 +8,16 @@
     import { formatRemaining } from 'src/ts/storage/sync/remainingTime'
     import type { ExternalStorageStrings } from './strings'
 
-    let { connectionId, strings, job, remaining, onboarding = false, syncing = false }: {
+    let { connectionId, strings, job, remaining, onboarding = false, syncing = false, exportActions }: {
         connectionId: string
         strings: ExternalStorageStrings
         job?: ExternalJobSummary
         remaining?: number
         onboarding?: boolean
         syncing?: boolean
+        exportActions?: Snippet
     } = $props()
     let observations = $state<ReadonlyMap<string, ExternalOperationProgress>>(new Map())
-    let open = $state(false)
     onMount(() => subscribeExternalProgress(value => observations = value))
     const operations = $derived([
         externalProgressFor(observations, connectionId), externalProgressFor(observations, connectionId, 'download'),
@@ -51,15 +51,16 @@
 <div class="external-progress">
     {#each operations as operation (operation.kind)}
         {@const done = operation.state === 'complete'}
-        {@const stopped = operation.state === 'failed' || operation.state === 'cancelled'}
-        {@const title = operation.kind === 'export' ? strings.download : operation.kind === 'download' ? copy.downloading : operation.kind === 'binding' ? copy.connecting : copy.syncing}
-        {@const label = done ? operation.kind === 'export' ? strings.completed : operation.kind === 'download' ? copy.downloadComplete : operation.kind === 'binding' ? copy.connectionComplete : copy.syncComplete : stopped ? (operation.state === 'cancelled' ? strings.cancelled : strings.failed) : operation.kind === 'export' ? strings.download : copy[operation.stage]}
+        {@const stopped = operation.state === 'failed' || operation.state === 'cancelled' || operation.stage === 'waiting'}
+        {@const title = operation.kind === 'export' ? strings.download : operation.kind === 'download' ? copy.filesDownloading : operation.kind === 'binding' ? copy.connecting : copy.syncing}
+        {@const label = done ? operation.kind === 'export' ? strings.completed : operation.kind === 'download' ? copy.downloadComplete : operation.kind === 'binding' ? copy.connectionComplete : copy.syncComplete : operation.state === 'cancelled' ? strings.cancelled : operation.state === 'failed' ? strings.failed : operation.kind === 'export' ? strings.download : operation.kind === 'download' ? copy.filesDownloading : copy[operation.stage]}
         {@const exported = operation.exported}
-        {@const detail = exported ? `${bytes(Number(exported.completedBytes))}${exported.totalBytes ? ` / ${bytes(Number(exported.totalBytes))}` : ''}` : stopped || done ? '' : title}
+        {@const detail = exported ? `${bytes(Number(exported.completedBytes))}${exported.totalBytes ? ` / ${bytes(Number(exported.totalBytes))}` : ''}` : stopped || done || title === label ? '' : title}
         <div data-external-progress={operation.kind}>
             <TransferProgress {label} {detail} {done} {stopped}
                 fraction={done ? 1 : exported && Number(exported.totalBytes) > 0 ? Number(exported.completedBytes) / Number(exported.totalBytes) : operation.kind === 'download' && operation.totalItems ? (operation.completedItems ?? 0) / operation.totalItems : null}
-                counters={counters(operation)} detailsLabel={copy.details} collapsible={!onboarding} bind:open />
+                counters={counters(operation)} detailsLabel={copy.details} collapsible={!onboarding}
+                actions={operation.kind === 'export' && operation.state === 'running' ? exportActions : undefined} />
         </div>
     {/each}
     {#if activeJob}
@@ -68,7 +69,7 @@
         <TransferProgress
             label={(activeJob.kind === 'restore' && strings.restorePhases[activeJob.phase]) || strings.jobActive[activeJob.kind]}
             detail={localApply ? '' : activeJob.counters ? `${strings.jobCounters[activeJob.counters]} ${size}` : size}
-            {fraction} detailsLabel={copy.details} collapsible={!onboarding} bind:open
+            {fraction} detailsLabel={copy.details} collapsible={!onboarding}
             counters={jobCounters} />
     {:else if onboarding && operations.length === 0}
         <TransferProgress label={syncing ? copy.connecting : strings.jobActive.restore} detailsLabel={copy.details} />

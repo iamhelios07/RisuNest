@@ -2,7 +2,7 @@ import { Channel, invoke } from '@tauri-apps/api/core'
 import type { ExternalJobSummary, ExternalSnapshotExportProgress } from './types'
 import { externalJobIsActive, externalJobProgress } from './connection'
 
-export type ExternalStage = 'checking' | 'preparing' | 'uploading' | 'downloading' | 'applying' | 'finalizing'
+export type ExternalStage = 'checking' | 'preparing' | 'uploading' | 'downloading' | 'applying' | 'finalizing' | 'waiting'
 export interface ExternalTransferSnapshot {
     sequence: number
     stage: ExternalStage
@@ -51,55 +51,63 @@ export function clearExternalSyncProgress(connectionId: string) {
     emit()
 }
 
-/** One operation owns its channels until it settles; screens only subscribe. */
+/** One operation owns its observations; screens only subscribe. */
 export function beginExternalProgress(connectionId: string, kind: ExternalOperationProgress['kind']) {
     const slot = key(connectionId, kind)
     const prior = operations.get(slot)
     const previous = kind === 'sync' && prior?.state === 'complete' && prior.visible ? { ...prior, previous: undefined } : prior?.previous
     let value: ExternalOperationProgress = { id: crypto.randomUUID(), connectionId, kind, stage: 'checking', state: 'running', visible: kind !== 'sync', amounts: emptyAmounts(), previous }
     let ended = false
-    let channelGeneration = 0
-    const current = () => !ended && operations.get(slot)?.id === value.id
+    let phase = 0
+    const owns = () => operations.get(slot)?.id === value.id
+    const current = () => !ended && owns()
     const update = (patch: Partial<ExternalOperationProgress>) => {
-        if (!current()) return
+        if (!owns()) return
         value = { ...value, previous: operations.get(slot)?.previous, ...patch }
+        if (!ended && (['uploading', 'downloading', 'applying'].includes(value.stage)
+            || Object.values(value.amounts).some(amount => BigInt(amount) > 0n))) value.visible = true
         operations.set(slot, value)
         emit()
     }
     operations.set(slot, value)
     emit()
-    const reveal = setTimeout(() => update({ visible: true }), 600)
     return {
-        stage(stage: ExternalStage, authority?: string) { update({ stage, ...(authority ? { authority } : {}) }) },
-        items(completedItems: number, totalItems: number) { update({ stage: 'downloading', completedItems, totalItems }) },
-        exported(exported: ExternalSnapshotExportProgress) { update({ stage: 'downloading', exported }) },
+        stage(stage: ExternalStage, authority?: string) { if (current()) { phase++; update({ stage, ...(authority ? { authority } : {}) }) } },
+        items(completedItems: number, totalItems: number) { if (current()) update({ stage: 'downloading', completedItems, totalItems }) },
+        exported(exported: ExternalSnapshotExportProgress) { if (current()) update({ stage: 'downloading', exported }) },
         async invoke<T>(command: string, args: Record<string, unknown>, authority?: string): Promise<T> {
-            update({ ...(authority ? { authority } : {}) })
-            const generation = ++channelGeneration
-            const base = value.amounts
+            if (current()) update({ ...(authority ? { authority } : {}) })
+            const samplePhase = ++phase
+            const sampleAuthority = value.authority
+            let accepted = emptyAmounts()
             let sequence = -1
+            let uploading = false
             const progress = new Channel<ExternalTransferSnapshot>()
             progress.onmessage = reading => {
-                if (!current() || generation !== channelGeneration || reading.sequence <= sequence) return
+                if (!owns() || sampleAuthority !== value.authority || reading.sequence <= sequence) return
                 if (!['checking', 'preparing', 'uploading', 'downloading', 'applying', 'finalizing'].includes(reading.stage)) return
                 const amounts = emptyAmounts()
                 for (const field of Object.keys(amounts) as (keyof typeof amounts)[]) {
                     if (!/^\d+$/.test(reading[field])) return
-                    amounts[field] = (BigInt(base[field]) + BigInt(reading[field])).toString()
+                    const delta = BigInt(reading[field]) - BigInt(accepted[field])
+                    if (delta < 0n) return
+                    amounts[field] = (BigInt(value.amounts[field]) + delta).toString()
                 }
                 sequence = reading.sequence
-                update({ stage: reading.stage, amounts })
+                accepted = { ...reading }
+                uploading ||= reading.stage === 'uploading'
+                // Replies and channel messages can arrive separately. Late counts must not rewind a local phase.
+                const stage = reading.stage === 'preparing' && uploading ? 'uploading' : reading.stage
+                update({ amounts, ...(!ended && samplePhase === phase ? { stage } : {}) })
             }
-            try { return await invoke<T>(command, { ...args, progress }) }
-            finally { if (generation === channelGeneration) channelGeneration++ }
+            return invoke<T>(command, { ...args, progress })
         },
         finish(state: Exclude<ExternalOperationProgress['state'], 'running'>, meaningful = true) {
-            clearTimeout(reveal)
             if (!current()) return
-            update({ state, visible: state !== 'complete' || meaningful || kind !== 'sync' })
             ended = true
-            // One result per scope survives view remounts; successful routine rounds fade away.
-            if (state === 'complete') setTimeout(() => {
+            update({ state, visible: state !== 'complete' || meaningful || kind !== 'sync' })
+            // Recovery notices live in the connection/job state; this panel retains only a brief result.
+            setTimeout(() => {
                 const latest = operations.get(slot)
                 if (latest?.id === value.id) { operations.delete(slot); emit() }
                 else if (latest?.previous?.id === value.id) { operations.set(slot, { ...latest, previous: undefined }); emit() }

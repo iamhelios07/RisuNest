@@ -705,10 +705,12 @@
             && connection.lastError?.reason === job?.error?.reason
     }
 
-    function connectionTone(connection: ExternalConnectionSummary): 'connected' | 'working' | 'attention' {
-        if (externalProgressFor(progress, connection.id)?.state === 'running') return 'working'
+    function connectionTone(connection: ExternalConnectionSummary): 'connected' | 'working' | 'attention' | 'idle' {
         const job = activeJob(connection)
+        if (!connectionUsable(connection)) return 'attention'
         if (job && (externalJobIsPaused(job) || job.state === 'uncertain')) return 'attention'
+        const operation = externalProgressFor(progress, connection.id)
+        if (operation?.state === 'running') return operation.stage === 'waiting' ? 'idle' : 'working'
         if (job && externalJobIsActive(job)) return 'working'
         if (connectionUsable(connection)) return 'connected'
         return 'attention'
@@ -716,10 +718,12 @@
 
     // The notice under the heading explains a paused job, so the badge names only the state.
     function connectionStatus(connection: ExternalConnectionSummary): string {
-        if (externalProgressFor(progress, connection.id)?.state === 'running') return strings.transfer.syncing
         const job = activeJob(connection)
+        if (!connectionUsable(connection)) return connectionStatusLabel(connection.status)
         if (job?.state === 'uncertain') return strings.statusError
         if (job && externalJobIsPaused(job)) return ['reauth-required', 'key-locked'].includes(connection.status) ? connectionStatusLabel(connection.status) : strings.statusError
+        const operation = externalProgressFor(progress, connection.id)
+        if (operation?.state === 'running') return operation.stage === 'waiting' ? strings.transfer.waiting : operation.kind === 'binding' ? strings.transfer.connecting : strings.transfer.syncing
         if (job && externalJobIsActive(job)) return strings.jobActive[job.kind]
         return connectionStatusLabel(connection.status)
     }
@@ -874,11 +878,6 @@
                     <SettingNotice role="status" text={strings.publicationDecision} />
                 {/if}
 
-                {#if exportRun?.connectionId === connection.id}
-                    <div class="running">
-                        <div class="actions"><SettingButton variant="secondary" size="sm" onclick={() => exportRun && bridge.cancelExport(exportRun.id)}>{strings.cancel}</SettingButton></div>
-                    </div>
-                {/if}
                 {#if backedUp || synced || job?.state === 'succeeded'}
                     <dl class="kv">
                         {#if synced}<dt>{language.risuNest.serverSync.lastSuccess}</dt><dd>{when(connection.lastSyncAtMs)}</dd>{/if}
@@ -887,7 +886,13 @@
                     </dl>
                 {/if}
                 {#if job && externalJobIsPaused(job) && job.error?.retryAtMs}<p class="note">{strings.retryAt.replace('{0}', when(job.error.retryAtMs))}</p>{/if}
-                <ExternalTransferProgress connectionId={connection.id} {strings} {job} remaining={remaining[connection.id]} />
+                <ExternalTransferProgress connectionId={connection.id} {strings} {job} remaining={remaining[connection.id]}>
+                    {#snippet exportActions()}
+                        {#if exportRun?.connectionId === connection.id}
+                            <SettingButton variant="secondary" size="sm" onclick={() => exportRun && bridge.cancelExport(exportRun.id)}>{strings.cancel}</SettingButton>
+                        {/if}
+                    {/snippet}
+                </ExternalTransferProgress>
 
                 {#if unlockConnection?.id === connection.id}
                     <div class="unlock">
@@ -1202,10 +1207,6 @@
         margin: 0;
         font-size: 13px;
         color: var(--risu-theme-textcolor2);
-    }
-    .running {
-        display: grid;
-        gap: 0.5rem;
     }
     .unlock {
         display: grid;
