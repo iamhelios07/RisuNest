@@ -486,9 +486,10 @@ fn apply_recovery_platform_client(
     let Some(profile) = preparation.request.config.oauth_profile.as_mut() else {
         return Err(ProviderError::new(ErrorKind::Unsupported));
     };
-    let missing = !profile.platform_client_ids.contains_key(platform_key());
-    if !missing {
-        return if supplied.is_none() {
+    if let Some(current) = profile.platform_client_ids.get(platform_key()) {
+        return if supplied.is_none()
+            || (preparation.transferred && supplied.as_deref() == Some(current.as_str()))
+        {
             Ok(())
         } else {
             Err(ProviderError::new(ErrorKind::Unsupported))
@@ -547,6 +548,7 @@ fn authorization_config(
     }
     if preparation.request.mode == ConnectionOpenMode::Existing
         && preparation.recovery_key.is_none()
+        && preparation.renewal.is_none()
     {
         return Err(ProviderError::new(ErrorKind::ReauthRequired));
     }
@@ -2462,6 +2464,8 @@ pub(crate) fn external_storage_prepare_connection_settings_import(
 fn platform_key() -> &'static str {
     if cfg!(target_os = "windows") {
         "windows"
+    } else if cfg!(target_os = "android") {
+        "android"
     } else if cfg!(target_os = "macos") {
         "macos"
     } else if cfg!(target_os = "ios") {
@@ -2885,6 +2889,13 @@ mod tests {
             authorization_config(&state, &id, None).err().unwrap().kind,
             ErrorKind::ReauthRequired
         );
+        state.preparations.lock().unwrap().get_mut(&id).unwrap().renewal = Some("existing-connection".into());
+        let renewed = authorization_config(&state, &id, None).unwrap();
+        assert_eq!(renewed.account_id, authenticated);
+        assert_eq!(
+            renewed.oauth_profile.unwrap().platform_client_ids.get(platform_key()).unwrap(),
+            "123-current.apps.googleusercontent.com",
+        );
         state
             .preparations
             .lock()
@@ -2896,6 +2907,11 @@ mod tests {
             authorization_config(&state, &id, None).err().unwrap().kind,
             ErrorKind::Cancelled
         );
+    }
+
+    #[test]
+    fn oauth_client_platform_matches_the_compilation_target() {
+        assert_eq!(platform_key(), std::env::consts::OS);
     }
 
     #[test]
@@ -2945,6 +2961,23 @@ mod tests {
             Some("123-current.apps.googleusercontent.com".into()),
         )
         .unwrap();
+        apply_recovery_platform_client(
+            &mut pending,
+            Some("123-current.apps.googleusercontent.com".into()),
+        )
+        .unwrap();
+        apply_recovery_platform_client(&mut pending, None).unwrap();
+        assert!(apply_recovery_platform_client(
+            &mut pending,
+            Some("123-different.apps.googleusercontent.com".into()),
+        )
+        .is_err());
+        pending.transferred = false;
+        assert!(apply_recovery_platform_client(
+            &mut pending,
+            Some("123-current.apps.googleusercontent.com".into()),
+        )
+        .is_err());
         let oauth = pending.request.config.oauth_profile.unwrap();
         assert_eq!(oauth.project_id, "synthetic-project");
         assert_eq!(
@@ -2952,6 +2985,75 @@ mod tests {
             "123-current.apps.googleusercontent.com"
         );
     }
+
+    #[test]
+    fn recovered_onedrive_client_preserves_the_application_across_retries_and_renewal() {
+        let state = ConnectionCommandState::default();
+        let client_id = "12345678-1234-1234-1234-123456789012";
+        let other_client_id = "87654321-4321-4321-4321-210987654321";
+        let source_platform = if platform_key() == "windows" { "android" } else { "windows" };
+        let prepared = insert_preparation(
+            &state,
+            PrepareConnectionRequest {
+                config: super::super::contract::ConnectionConfig {
+                    provider: "onedrive".into(), profile: None,
+                    endpoint: "https://graph.microsoft.com/v1.0".into(),
+                    account_id: "synthetic-account".into(),
+                    location: BTreeMap::from([
+                        ("accountType".into(), "personal".into()),
+                        ("tenant".into(), "common".into()),
+                        ("driveId".into(), "synthetic-drive".into()),
+                        ("rootItemId".into(), "synthetic-folder".into()),
+                        ("redirectUri".into(), "https://login.microsoftonline.com/common/oauth2/nativeclient".into()),
+                    ]),
+                    oauth_profile: Some(super::super::contract::OAuthProfile {
+                        project_id: client_id.into(),
+                        platform_client_ids: BTreeMap::from([(source_platform.into(), client_id.into())]),
+                    }),
+                },
+                mode: ConnectionOpenMode::Existing, purpose: ConnectionPurpose::Backup,
+                recovery_key: Some(recovery::generate_key().unwrap().to_string()),
+                acknowledgements: vec![],
+            },
+            Some("synthetic-repository".into()), None, true,
+        ).unwrap();
+        assert!(prepared.requires_platform_o_auth_client);
+        let id = prepared.preparation_id;
+        assert_eq!(
+            authorization_config(&state, &id, Some(other_client_id.into())).err().unwrap().kind,
+            ErrorKind::Unsupported,
+        );
+        for _ in 0..2 {
+            let config = authorization_config(&state, &id, Some(client_id.into())).unwrap();
+            assert_eq!(config.account_id, "synthetic-account");
+            assert_eq!(
+                providers::onedrive::authorization_policy(&config, platform_key()).unwrap().client_id,
+                client_id,
+            );
+        }
+        {
+            let mut preparations = state.preparations.lock().unwrap();
+            let pending = preparations.get_mut(&id).unwrap();
+            pending.recovery_key = None;
+        }
+        assert_eq!(
+            authorization_config(&state, &id, None).err().unwrap().kind,
+            ErrorKind::ReauthRequired,
+        );
+        {
+            let mut preparations = state.preparations.lock().unwrap();
+            let pending = preparations.get_mut(&id).unwrap();
+            pending.renewal = Some("existing-connection".into());
+            pending.transferred = false;
+        }
+        let config = authorization_config(&state, &id, None).unwrap();
+        assert_eq!(config.account_id, "synthetic-account");
+        assert_eq!(
+            providers::onedrive::authorization_policy(&config, platform_key()).unwrap().client_id,
+            client_id,
+        );
+    }
+
     fn renewal_fixture() -> StoredConnection {
         let handle = super::super::fake::repository();
         StoredConnection {
