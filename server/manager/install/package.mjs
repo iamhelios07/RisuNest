@@ -16,6 +16,7 @@ import {
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertNoIdentifierOverride, assertSyncIdentifier, mergeTauriConfig } from "../../../scripts/release/tauri-config.mjs";
+import { writeZipArchive } from "../../../scripts/release/platform/package.mjs";
 
 const manager = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const gui = join(manager, "gui");
@@ -223,10 +224,6 @@ function inspectMacBundle(app, releaseInput, build, vendorSha256, destination, p
   return { binaries, cloudflared };
 }
 
-export function writeWindowsArchive(source, archive) {
-  run("python", ["-m", "zipfile", "-c", resolve(archive), ...archiveEntries(source)], source);
-}
-
 export function packageNativeSuite({ nativeBuild, rawArchive, output, releaseInput, cloudflaredSha256 }) {
   const build = typeof nativeBuild === "string" ? JSON.parse(readFileSync(nativeBuild, "utf8")) : nativeBuild;
   const target = build.target;
@@ -309,7 +306,7 @@ export function packageNativeSuite({ nativeBuild, rawArchive, output, releaseInp
         assertBundleSelection(join(temporary, "risunest-sync-gui.exe"), "UNK");
         validateOwnedInventory(temporary, join(temporary, "risunest-sync-bundle.json"), releaseInput, build);
         const archive = join(destination, "managed.zip");
-        writeWindowsArchive(temporary, archive);
+        writeZipArchive(temporary, archive);
         const installer = unique(bundleRoot, (path) => basename(path).startsWith(`RisuNest Sync_${releaseInput.version}_`) && path.endsWith("-setup.exe"), "NSIS installer");
         const installerStage = mkdtempSync(join(destination, ".sync-nsis-proof-"));
         run("7z", ["x", "-y", `-o${installerStage}`, installer]);
