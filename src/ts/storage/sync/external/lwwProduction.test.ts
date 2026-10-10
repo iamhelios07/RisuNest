@@ -120,8 +120,10 @@ describe('external sync asset downloads', () => {
         await requestExternalLwwNow('sync'); await settle()
         expect(fixture.download).toHaveBeenCalledOnce()
     })
-    it('retains a download failure across successful metadata sync and retries pending bodies', async () => {
-        const failure = { code: 'download-unavailable' }
+    it.each([
+        { code: 'download-unavailable' },
+        { code: 'asset-jobs-busy', status: 409, retryable: true },
+    ])('retains $code across successful metadata sync and retries pending bodies', async failure => {
         fixture.download.mockRejectedValueOnce(failure)
         dispose = await installExternalLwwAdapters(state()); await settle()
         let failures: ReadonlyMap<string, unknown> = new Map()
@@ -143,8 +145,11 @@ describe('external sync asset downloads', () => {
         await vi.advanceTimersByTimeAsync(1); await requestExternalLwwNow('sync'); await settle()
         expect(fixture.download).toHaveBeenCalledTimes(2)
     })
-    it('retries an actionable download failure only after recovery or an explicit request', async () => {
-        fixture.download.mockRejectedValueOnce({ kind: 'localStorageFull', retryable: false })
+    it.each([
+        { kind: 'localStorageFull', retryable: false },
+        { code: 'asset-jobs-unresolved', status: 409, retryable: false },
+    ])('retries a blocked download only after recovery or an explicit request: %j', async failure => {
+        fixture.download.mockRejectedValueOnce(failure)
         dispose = await installExternalLwwAdapters(state()); await settle()
         await vi.advanceTimersByTimeAsync(120_000)
         expect(fixture.download).toHaveBeenCalledOnce()
