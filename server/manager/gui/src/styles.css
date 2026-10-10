@@ -745,15 +745,12 @@ dialog p {
   margin-top: 20px;
 }
 dialog.qr-dialog {
-  max-width: 100vw;
-  width: 420px;
-  padding-inline: 0;
-  border-inline-width: 0;
-}
-.qr-dialog .registration-details {
-  padding-inline: 26px;
+  width: min(480px, calc(100vw - 40px));
 }
 .qr {
+  background: white;
+  border-radius: 8px;
+  padding: 12px;
   margin: 16px auto;
   width: fit-content;
   max-width: 100%;

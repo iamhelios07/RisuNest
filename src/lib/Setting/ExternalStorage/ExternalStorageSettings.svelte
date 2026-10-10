@@ -1081,7 +1081,7 @@
 {/if}
 
 {#if connectionSettings}
-    <div class="fixed inset-0 z-[1000] flex items-center justify-center bg-black/60 p-4" class:qr-overlay={!!connectionSettingsQr}>
+    <div class="fixed inset-0 z-[1000] flex items-center justify-center bg-black/60 p-4">
         <div
             bind:this={connectionSettingsPanel}
             tabindex="-1"
@@ -1090,12 +1090,9 @@
             aria-labelledby="external-connection-settings-title"
             class="dialog outline-hidden"
             class:qr-dialog={!!connectionSettingsQr}
-            style:--qr-size={`${connectionSettingsQrSize}px`}
         >
-            <div class="connection-settings-copy">
-                <h3 id="external-connection-settings-title" class="text-lg font-bold">{strings.connectionSettings}</h3>
-                <p class="text-sm text-textcolor2">{strings.connectionSettingsNotice}</p>
-            </div>
+            <h3 id="external-connection-settings-title" class="text-lg font-bold">{strings.connectionSettings}</h3>
+            <p class="text-sm text-textcolor2">{strings.connectionSettingsNotice}</p>
             {#if connectionSettingsQr}<img class="connection-settings-qr mx-auto" src={connectionSettingsQr} width={connectionSettingsQrSize} height={connectionSettingsQrSize} alt={strings.connectionSettingsQr} />
             {:else}<p class="rounded-md border border-darkborderc bg-darkbg p-3 text-sm">{strings.connectionSettingsFileOnly}</p>{/if}
             <div class="actions"><SettingButton onclick={saveConnectionSettingsFile}>{strings.saveConnectionSettings}</SettingButton><SettingButton variant="secondary" onclick={closeConnectionSettings}>{strings.closeRecovery}</SettingButton></div>
@@ -1539,25 +1536,13 @@
         background: var(--risu-theme-bgcolor);
         color: var(--risu-theme-textcolor);
     }
-    .qr-overlay {
-        padding-inline: 0;
-    }
     .qr-dialog {
         grid-template-columns: minmax(0, 1fr);
-        width: max(28rem, var(--qr-size));
-        max-width: 100%;
-        padding-inline: 0;
-        border-inline-width: 0;
-    }
-    .connection-settings-copy {
-        display: grid;
-        gap: 1rem;
-    }
-    .qr-dialog .connection-settings-copy,
-    .qr-dialog .actions {
-        padding-inline: min(1.25rem, 5vw);
+        width: 28rem;
     }
     .connection-settings-qr {
+        max-width: 100%;
+        height: auto;
         image-rendering: pixelated;
     }
 </style>

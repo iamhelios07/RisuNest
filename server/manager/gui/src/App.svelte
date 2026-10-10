@@ -654,25 +654,23 @@
         >
       </div>
     </form>
-  {:else if dialog === "issued"}
-    <div class="registration-details">
-      <h2>기기 등록 코드</h2>
-      {#if local}<p>
+  {:else if dialog === "issued"}<h2>기기 등록 코드</h2>
+    {#if local}<p>
         이 컴퓨터에서 실행하는 RisuNest 앱에만 등록할 수 있습니다. 해당 앱에서 QR
         코드를 스캔하거나 등록 링크를 붙여 넣으세요.
       </p>{:else}<p>
         등록할 기기의 RisuNest 앱에서 QR 코드를 스캔하거나 등록 링크를 붙여
         넣으세요.
       </p>{/if}
-    </div>
-    {#if svg}<div class="qr">{@html svg}</div>{/if}
-    <div class="registration-details">
-      <textarea readonly aria-label="기기 등록 링크" value={uri}></textarea>
-      <p>이 화면을 닫으면 등록 코드를 다시 확인할 수 없습니다.</p>
-      <div class="dialog-actions">
-        <button onclick={() => copy(uri)}><Copy size={15} /> 링크 복사</button
-        ><button class="primary" onclick={close}>완료</button>
-      </div>
+    {#if svg}<div class="qr">{@html svg}</div>{/if}<textarea
+      readonly
+      aria-label="기기 등록 링크"
+      value={uri}
+    ></textarea>
+    <p>이 화면을 닫으면 등록 코드를 다시 확인할 수 없습니다.</p>
+    <div class="dialog-actions">
+      <button onclick={() => copy(uri)}><Copy size={15} /> 링크 복사</button
+      ><button class="primary" onclick={close}>완료</button>
     </div>
   {:else if dialog === "revoke" && selected}<h2>이 기기를 해제하시겠습니까?</h2>
     <p>
