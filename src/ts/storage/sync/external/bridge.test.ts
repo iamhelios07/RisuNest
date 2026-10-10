@@ -182,7 +182,7 @@ describe('ExternalStorageBridge', () => {
 
     it('exports connection settings through an opaque staged file transfer', async () => {
         const invoke = vi.fn(async (command: string) => command.includes('begin')
-            ? { transferId: 'transfer', expiresAtMs: '1', qrPayload: null }
+            ? { transferId: 'transfer', expiresAtMs: '1', payload: 'synthetic' }
             : undefined)
         const bridge = new ExternalStorageBridge({ supported: () => true, invoke })
 

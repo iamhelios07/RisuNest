@@ -167,7 +167,7 @@ describe('the storage usage tab', () => {
         state.beginConnectionSettingsExport.mockResolvedValue({
             transferId: 'settings-transfer',
             expiresAtMs: '1000',
-            qrPayload: null,
+            payload: 'synthetic',
         })
         state.saveConnectionSettingsFile.mockResolvedValue(undefined)
         target = document.createElement('div')
@@ -704,7 +704,7 @@ describe('the storage usage tab', () => {
         const image = 'data:image/png;base64,c3ludGhldGlj'
         state.qrDataUrl.mockResolvedValue(image)
         state.beginConnectionSettingsExport.mockResolvedValue({
-            transferId: 'settings-transfer', expiresAtMs: '1000', qrPayload,
+            transferId: 'settings-transfer', expiresAtMs: '1000', payload: qrPayload,
         })
         const button = [...target.querySelectorAll('button')].find(
             item => item.textContent?.trim() === strings.connectionSettings,
@@ -712,7 +712,7 @@ describe('the storage usage tab', () => {
         button.click()
         await settle()
 
-        expect(state.qrDataUrl).toHaveBeenCalledWith(qrPayload, { margin: 4, scale })
+        expect(state.qrDataUrl).toHaveBeenCalledWith(qrPayload, { margin: 4, scale: scale * 2 })
         const qr = target.querySelector<HTMLImageElement>(`img[alt="${strings.connectionSettingsQr}"]`)!
         expect(qr.src).toBe(image)
         expect(qr.width).toBe(size)

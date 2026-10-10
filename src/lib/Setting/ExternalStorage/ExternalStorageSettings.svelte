@@ -1,6 +1,6 @@
 <script lang="ts">
     import { onDestroy, onMount } from 'svelte'
-    import QRCode from 'qrcode'
+    import ConnectionSettingsDialog from './ConnectionSettingsDialog.svelte'
     import { runWithMobileBackgroundTask, measuredTaskPercent } from 'src/ts/mobileBackgroundTask'
     import TextInput from 'src/lib/UI/GUI/TextInput.svelte'
     import NumberInput from 'src/lib/UI/GUI/NumberInput.svelte'
@@ -89,9 +89,6 @@
     let recoveryKey = $state('')
     let recoveryPanel = $state<HTMLDivElement | undefined>()
     let connectionSettings = $state<ExternalConnectionSettingsMaterial | null>(null)
-    let connectionSettingsPanel = $state<HTMLDivElement | undefined>()
-    let connectionSettingsQr = $state('')
-    let connectionSettingsQrSize = $state(0)
     /** The history entry whose restore scope is open, and what is ticked in it. */
     let exportRun = $state<{ id: string; connectionId: string; progress?: ExternalSnapshotExportProgress } | null>(null)
     /** Jobs that add or change history rows, by job ID, so the open history reloads when they finish. */
@@ -628,41 +625,16 @@
     }
 
 
-    async function displayConnectionSettings(material: ExternalConnectionSettingsMaterial): Promise<void> {
-        connectionSettings = material
-        if (!material.qrPayload) {
-            connectionSettingsQr = ''
-            return
-        }
-        try {
-            const modules = QRCode.create(material.qrPayload).modules.size + 8
-            const scale = Math.ceil(240 / modules)
-            connectionSettingsQrSize = modules * scale
-            connectionSettingsQr = await QRCode.toDataURL(material.qrPayload, { margin: 4, scale })
-        } catch {
-            connectionSettingsQr = ''
-        }
-    }
-
     async function createConnectionSettings(connection: ExternalConnectionSummary): Promise<void> {
         busy = true
         activeAction = `settings:${connection.id}`
         try {
-            await displayConnectionSettings(await bridge.beginConnectionSettingsExport(connection.id))
+            connectionSettings = await bridge.beginConnectionSettingsExport(connection.id)
         } catch (reason) {
             error = externalErrorMessage(strings, reason)
         } finally {
             busy = false
             activeAction = ''
-        }
-    }
-
-    async function saveConnectionSettingsFile(): Promise<void> {
-        if (!connectionSettings) return
-        try {
-            await bridge.saveConnectionSettingsFile(connectionSettings.transferId)
-        } catch (reason) {
-            error = externalErrorMessage(strings, reason)
         }
     }
 
@@ -676,7 +648,6 @@
 
     function closeConnectionSettings(): void {
         connectionSettings = null
-        connectionSettingsQr = ''
     }
 
     async function exportSnapshot(connectionId: string, snapshotId: string): Promise<void> {
@@ -838,9 +809,6 @@
 
     $effect(() => {
         if (recoveryKey) recoveryPanel?.focus()
-    })
-    $effect(() => {
-        if (connectionSettings) connectionSettingsPanel?.focus()
     })
 
     onMount(async () => {
@@ -1155,23 +1123,10 @@
 {/if}
 
 {#if connectionSettings}
-    <div class="fixed inset-0 z-[1000] flex items-center justify-center bg-black/60 p-4">
-        <div
-            bind:this={connectionSettingsPanel}
-            tabindex="-1"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="external-connection-settings-title"
-            class="dialog outline-hidden"
-            class:qr-dialog={!!connectionSettingsQr}
-        >
-            <h3 id="external-connection-settings-title" class="text-lg font-bold">{strings.connectionSettings}</h3>
-            <p class="text-sm text-textcolor2">{strings.connectionSettingsNotice}</p>
-            {#if connectionSettingsQr}<img class="connection-settings-qr mx-auto" src={connectionSettingsQr} width={connectionSettingsQrSize} height={connectionSettingsQrSize} alt={strings.connectionSettingsQr} />
-            {:else}<p class="rounded-md border border-darkborderc bg-darkbg p-3 text-sm">{strings.connectionSettingsFileOnly}</p>{/if}
-            <div class="actions"><SettingButton onclick={saveConnectionSettingsFile}>{strings.saveConnectionSettings}</SettingButton><SettingButton variant="secondary" onclick={closeConnectionSettings}>{strings.closeRecovery}</SettingButton></div>
-        </div>
-    </div>
+    {#key connectionSettings.transferId}
+        <ConnectionSettingsDialog payload={connectionSettings.payload} {strings}
+            onsave={() => bridge.saveConnectionSettingsFile(connectionSettings!.transferId)} onclose={closeConnectionSettings} />
+    {/key}
 {/if}
 
 <style>
@@ -1618,14 +1573,5 @@
         border-radius: 0.5rem;
         background: var(--risu-theme-bgcolor);
         color: var(--risu-theme-textcolor);
-    }
-    .qr-dialog {
-        grid-template-columns: minmax(0, 1fr);
-        width: 28rem;
-    }
-    .connection-settings-qr {
-        max-width: 100%;
-        height: auto;
-        image-rendering: pixelated;
     }
 </style>

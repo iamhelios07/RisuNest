@@ -10,6 +10,7 @@ use risunest_external_storage_format::{
     format::Descriptor,
 };
 use serde::{Deserialize, Serialize};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use std::{
     collections::BTreeSet,
     io::Write,
@@ -37,9 +38,9 @@ pub(crate) struct ImportedBootstrap {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ConnectionSettingsPayload {
     config: ConnectionConfig,
-    repository_id: String,
-    credential: Option<Vec<u8>>,
-    account_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credential: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     folder_name: Option<String>,
 }
 
@@ -318,14 +319,11 @@ pub(crate) fn export_connection_settings(
     let code = parse_key(recovery_key)?;
     let payload = ConnectionSettingsPayload {
         config: connection.config.clone(),
-        repository_id: connection.descriptor.repository_id.clone(),
         credential: if connection.config.oauth_profile.is_some() {
             None
         } else {
-            credential.map(ToOwned::to_owned)
+            credential.map(|value| URL_SAFE_NO_PAD.encode(value))
         },
-        account_id: (!connection.config.account_id.is_empty())
-            .then(|| connection.config.account_id.clone()),
         folder_name: connection.labels.folder.clone(),
     };
     let plaintext = Zeroizing::new(serde_json::to_vec(&payload).map_err(|_| corrupt())?);
@@ -349,18 +347,21 @@ pub(crate) fn import_connection_settings(
         .map_err(|_| key_mismatch())?;
     let payload: ConnectionSettingsPayload =
         serde_json::from_slice(&plaintext).map_err(|_| corrupt())?;
-    if payload.repository_id != envelope.repository_id
-        || payload.repository_id.is_empty()
-        || payload.config.provider.is_empty()
+    if payload.config.provider.is_empty()
         || payload.config.oauth_profile.is_some() && payload.credential.is_some()
     {
         return Err(corrupt());
     }
+    let credential = payload.credential
+        .map(|value| URL_SAFE_NO_PAD.decode(value).map(Zeroizing::new).map_err(|_| corrupt()))
+        .transpose()?;
+    let account_id = (!payload.config.account_id.is_empty())
+        .then(|| payload.config.account_id.clone());
     Ok(ImportedConnectionSettings {
         config: payload.config,
-        repository_id: payload.repository_id,
-        credential: payload.credential.map(Zeroizing::new),
-        account_id: payload.account_id,
+        repository_id: envelope.repository_id,
+        credential,
+        account_id,
         folder_name: payload.folder_name,
     })
 }
@@ -412,8 +413,12 @@ mod tests {
         let exported: serde_json::Value = serde_json::from_slice(&plaintext).unwrap();
         assert!(exported.get("transferConcurrency").is_none());
         assert!(exported["config"].get("transferConcurrency").is_none());
+        assert!(exported.get("repositoryId").is_none());
+        assert!(exported.get("accountId").is_none());
+        assert_eq!(exported["credential"], "c2VjcmV0");
         assert!(imported.config == connection.config);
         assert_eq!(imported.repository_id, "repository");
+        assert_eq!(imported.account_id.as_deref(), Some("account"));
         assert_eq!(imported.credential.unwrap().as_slice(), b"secret");
         assert_eq!(
             import_connection_settings(&bytes, &generate_key().unwrap()).err().expect("refused").kind,
@@ -423,6 +428,23 @@ mod tests {
         let last = damaged.len() - 1;
         damaged[last] ^= 1;
         assert!(import_connection_settings(&damaged, &key).is_err());
+    }
+
+    #[test]
+    fn connection_settings_preserve_binary_credentials_and_optional_fields() {
+        let mut connection = stored();
+        connection.labels.folder = Some("Synthetic folder".into());
+        let key = generate_key().unwrap();
+        let credential: Vec<u8> = (0..=255).collect();
+        let bytes = export_connection_settings(&connection, &key, Some(&credential)).unwrap();
+        let imported = import_connection_settings(&bytes, &key).unwrap();
+        assert_eq!(imported.credential.unwrap().as_slice(), credential);
+        assert_eq!(imported.folder_name, connection.labels.folder);
+        connection.config.account_id.clear();
+        let bytes = export_connection_settings(&connection, &key, None).unwrap();
+        let imported = import_connection_settings(&bytes, &key).unwrap();
+        assert!(imported.credential.is_none());
+        assert!(imported.account_id.is_none());
     }
 
     #[test]
