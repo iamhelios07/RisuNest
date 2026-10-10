@@ -33,6 +33,7 @@
         ExternalFolderSelection,
     } from 'src/ts/storage/sync/external/types'
     import {
+        externalConnectionFolder,
         externalEndpointWarning,
         externalErrorMessage,
         externalErrorKind,
@@ -135,6 +136,7 @@
         selectingFolder ? 'selecting' : folder ? 'selected' : folderError ? 'invalid' : 'empty',
     )
     const accountHint = $derived(folder?.accountHint ?? folderSelector?.accountHint ?? prepared?.endpoint.accountHint)
+    const repositoryName = $derived(prepared ? externalConnectionFolder(strings, { providerId: prepared.endpoint.providerId, endpoint: prepared.endpoint }) : '')
     const authorizationAvailable = $derived(
         providerDescriptors.find(provider => provider.id === providerId)?.authorizationAvailable ?? true,
     )
@@ -765,8 +767,8 @@
                         {/if}
                         {#if folderError}<span class="field-error" role="alert">{folderError}</span>{/if}
                     </dd>
-                {:else}
-                    <dt>{strings.repository}</dt><dd>{prepared.endpoint.repositoryHint}</dd>
+                {:else if repositoryName}
+                    <dt>{strings.repository}</dt><dd>{repositoryName}</dd>
                 {/if}
                 {#if mode === 'create'}
                     <dt>{strings.purposeReview}</dt>

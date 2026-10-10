@@ -1098,4 +1098,17 @@ describe('authorization waiting copy and renewal', () => {
         expect(connected).toHaveBeenCalledWith({ connection: renewed })
         expect(state.prepareConnection).not.toHaveBeenCalled()
     })
+
+    it.each([
+        ['appDataFolder', 'Hidden app data'],
+        ['', undefined],
+    ])('reviews a signed-in renewal with the saved account and folder %#', async (repositoryHint, shown) => {
+        const renewed = { id: 'existing', providerId: 'google_drive', purpose: 'backup' } as import('src/ts/storage/sync/external/types').ExternalConnectionSummary
+        state.prepareRenewal.mockResolvedValue({ ...prepared, endpoint: { ...prepared.endpoint, accountHint: 'synthetic@example.invalid', repositoryHint } })
+        component = mount(ConnectionForm, { target, props: { strings, renewalConnection: renewed, onconnected: vi.fn(), oncancel: vi.fn() } })
+        await settle()
+        const terms = [...target.querySelectorAll('dt')]
+        expect(terms.find(term => term.textContent === strings.account)?.nextElementSibling?.textContent).toBe('synthetic@example.invalid')
+        expect(terms.find(term => term.textContent === strings.repository)?.nextElementSibling?.textContent).toBe(shown)
+    })
 })
