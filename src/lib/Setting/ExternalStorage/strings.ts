@@ -132,6 +132,11 @@ const english = {
     jobActive: { cleanup: 'Cleaning up', backup: 'Backing up', restore: 'Restoring', 'pin-history': 'Keeping', 'delete-history': 'Deleting backup', 'check-repository': 'Checking' },
     restorePhases: { downloading: 'Downloading backup data', 'preparing-local': 'Preparing the restore', 'applying-local': 'Applying the restore', 'awaiting-adoption': 'Applying the restore', 'receiving-assets': 'Downloading assets' } as Record<string, string>,
     jobCounters: { prepared: 'Prepared', transferred: 'Transferred' },
+    transfer: {
+        details: 'Details', syncing: 'Syncing', connecting: 'Connecting', downloading: 'Downloading files', syncComplete: 'Sync completed', downloadComplete: 'Download completed', connectionComplete: 'Connected',
+        prepared: 'Prepared', uploaded: 'Upload confirmed', downloaded: 'Download confirmed', objects: '{0} objects', files: 'Files ready',
+        checking: 'Checking repository', preparing: 'Preparing data', uploading: 'Uploading', applying: 'Applying data', finalizing: 'Finishing',
+    },
     historyKinds: { snapshot: 'Sync', 'backup-point': 'Backup', conflict: 'Conflict backup', 'recovery-candidate': 'Recovery candidate' },
     endpointWarnings: {
         'github-dedicated-repository': 'Use a separate private repository. This connection is backup only.',
@@ -313,6 +318,11 @@ const korean: typeof english = {
     jobActive: { cleanup: '정리 중', backup: '백업 중', restore: '복원 중', 'pin-history': '보관 중', 'delete-history': '백업 삭제 중', 'check-repository': '검증 중' },
     restorePhases: { downloading: '백업 데이터 받는 중', 'preparing-local': '복원 준비 중', 'applying-local': '복원 적용 중', 'awaiting-adoption': '복원 적용 중', 'receiving-assets': '에셋 받는 중' },
     jobCounters: { prepared: '준비', transferred: '전송' },
+    transfer: {
+        details: '자세히', syncing: '동기화 중', connecting: '연결 중', downloading: '파일 다운로드 중', syncComplete: '동기화 완료', downloadComplete: '다운로드 완료', connectionComplete: '연결 완료',
+        prepared: '준비', uploaded: '업로드 확인', downloaded: '다운로드 확인', objects: '{0}개 객체', files: '준비된 파일',
+        checking: '저장소 확인 중', preparing: '데이터 준비 중', uploading: '업로드 중', applying: '데이터 반영 중', finalizing: '마무리 중',
+    },
     historyKinds: { snapshot: '동기화', 'backup-point': '백업', conflict: '충돌 백업', 'recovery-candidate': '복구 후보' },
     endpointWarnings: {
         'github-dedicated-repository': '백업 전용 비공개 저장소를 따로 쓰세요. 이 연결은 백업만 합니다.',

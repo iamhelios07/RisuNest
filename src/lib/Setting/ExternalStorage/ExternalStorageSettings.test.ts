@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mount, tick, unmount } from 'svelte'
+import { clearExternalProgress } from 'src/ts/storage/sync/external/progress'
 
 const state = vi.hoisted(() => ({
     getState: vi.fn(),
@@ -82,7 +83,7 @@ import { requestExternalStorageNow, resumeExternalStorageJob, requestExternalSto
 import { externalErrorMessage, externalStorageStrings } from './strings'
 import { notifySyncBindingChanged } from 'src/ts/storage/sync/bindingChanges'
 
-beforeEach(() => { state.failures.clear(); state.remedy = true; state.binding = { target: { kind: 'none' } } })
+beforeEach(() => { clearExternalProgress('connection-1'); state.failures.clear(); state.remedy = true; state.binding = { target: { kind: 'none' } } })
 const strings = externalStorageStrings('en')
 let target: HTMLDivElement
 let component: ReturnType<typeof mount> | undefined

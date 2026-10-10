@@ -6,7 +6,8 @@
     import NumberInput from 'src/lib/UI/GUI/NumberInput.svelte'
     import SettingGroup from '../RisuNest/SettingGroup.svelte'
     import SettingButton from '../RisuNest/SettingButton.svelte'
-    import SettingProgress from '../RisuNest/SettingProgress.svelte'
+    import ExternalTransferProgress from './ExternalTransferProgress.svelte'
+    import { beginExternalProgress, clearExternalProgress, externalProgressFailure, externalJobFraction, externalJobTotalGrows, externalProgressFor, subscribeExternalProgress, type ExternalOperationProgress } from 'src/ts/storage/sync/external/progress'
     import SettingToggle from '../RisuNest/SettingToggle.svelte'
     import SettingNotice from '../RisuNest/SettingNotice.svelte'
     import StatusBadge from '../RisuNest/StatusBadge.svelte'
@@ -45,7 +46,7 @@
     import { externalRestoreAreas } from 'src/ts/storage/sync/external/restoreScope'
     import { countConnectionOnlyAssets, downloadRemoteAssets } from 'src/ts/storage/sync/serverAssetResidency'
     import { formatRisuNestStorageBytes } from 'src/ts/storage/risuNestStorageDashboard'
-    import { createRemainingTimeEstimator, formatRemaining } from 'src/ts/storage/sync/remainingTime'
+    import { createRemainingTimeEstimator } from 'src/ts/storage/sync/remainingTime'
     import ConnectionForm from './ConnectionForm.svelte'
     import { externalConnectionTitle, externalErrorKind, externalErrorMessage, externalStorageStrings } from './strings'
 
@@ -63,6 +64,8 @@
     let destroyed = false
     let stopJobEvents: (() => void) | undefined
     let stopSyncFailures: (() => void) | undefined
+    let stopProgress: (() => void) | undefined
+    let progress = $state<ReadonlyMap<string, ExternalOperationProgress>>(new Map())
     let syncFailures = $state<ReadonlyMap<string, unknown>>(new Map())
     let busy = $state(false)
     /** Which action is running, so only the button that started it shows a spinner. */
@@ -564,6 +567,7 @@
                 }
             }
             await bridge.removeConnection(connection.id)
+            clearExternalProgress(connection.id)
             await refreshExternalStorageProductionState()
             await refresh(true)
         } catch (reason) {
@@ -624,21 +628,25 @@
         if (busy || exportRun) return
         const id = crypto.randomUUID()
         exportRun = { id, connectionId }
+        const observation = beginExternalProgress(connectionId, 'export')
         busy = true
         try {
-            await runWithMobileBackgroundTask('export', async background => {
+            const result = await runWithMobileBackgroundTask('export', async background => {
                 const abort = () => { void bridge.cancelExport(id).catch(() => {}) }
                 background.signal?.addEventListener('abort', abort, { once: true })
                 try {
                     background.signal?.throwIfAborted()
                     const result = await bridge.exportSnapshot(connectionId, snapshotId, id, progress => {
                         if (exportRun?.id === id) exportRun = { id, connectionId, progress }
+                        observation.exported(progress)
                         background.progress(measuredTaskPercent(Number(progress.completedBytes), Number(progress.totalBytes)))
                     })
                     return result.cancelled ? null : result
                 } finally { background.signal?.removeEventListener('abort', abort) }
             }, undefined, true)
+            observation.finish(result ? 'complete' : 'cancelled')
         } catch (reason) {
+            observation.finish(externalProgressFailure(reason))
             if (externalErrorKind(reason) !== 'cancelled') error = externalErrorMessage(strings, reason)
         } finally {
             if (exportRun?.id === id) exportRun = null
@@ -698,6 +706,7 @@
     }
 
     function connectionTone(connection: ExternalConnectionSummary): 'connected' | 'working' | 'attention' {
+        if (externalProgressFor(progress, connection.id)?.state === 'running') return 'working'
         const job = activeJob(connection)
         if (job && (externalJobIsPaused(job) || job.state === 'uncertain')) return 'attention'
         if (job && externalJobIsActive(job)) return 'working'
@@ -707,6 +716,7 @@
 
     // The notice under the heading explains a paused job, so the badge names only the state.
     function connectionStatus(connection: ExternalConnectionSummary): string {
+        if (externalProgressFor(progress, connection.id)?.state === 'running') return strings.transfer.syncing
         const job = activeJob(connection)
         if (job?.state === 'uncertain') return strings.statusError
         if (job && externalJobIsPaused(job)) return ['reauth-required', 'key-locked'].includes(connection.status) ? connectionStatusLabel(connection.status) : strings.statusError
@@ -714,18 +724,11 @@
         return connectionStatusLabel(connection.status)
     }
 
-    // Restore phases after the download apply data locally, so their progress has no byte fraction.
-    const RESTORE_APPLY_PHASES = new Set(['preparing-local', 'applying-local', 'awaiting-adoption'])
-
-    function activeJobLabel(job: ExternalJobSummary): string {
-        return (job.kind === 'restore' && strings.restorePhases[job.phase]) || strings.jobActive[job.kind]
-    }
-
     // A backup registers each pack as it seals it, so its upload has no total until it ends.
-    const uploadTotalGrows = (job: ExternalJobSummary) => job.kind === 'backup' && job.counters === 'transferred' && externalJobIsActive(job)
+    const uploadTotalGrows = externalJobTotalGrows
 
     function activeJobFraction(job: ExternalJobSummary): number | null {
-        return (job.kind === 'restore' && RESTORE_APPLY_PHASES.has(job.phase)) || uploadTotalGrows(job) ? null : externalJobProgress(job)
+        return externalJobFraction(job)
     }
 
     function jobSize(job: ExternalJobSummary): string {
@@ -779,6 +782,11 @@
 
     onMount(async () => {
         stopSyncFailures = subscribeExternalLwwFailures(value => syncFailures = value)
+        stopProgress = subscribeExternalProgress(value => {
+            const completed = [...value].some(([key, operation]) => operation.visible && operation.state === 'complete' && progress.get(key)?.state === 'running')
+            progress = value
+            if (completed && !destroyed) void refresh(true)
+        })
         stopBindingChanges = subscribeSyncBindingChanges(() => { if (!destroyed) void refresh(true) })
         try {
             const stop = await bridge.onJobStarted(() => {
@@ -799,6 +807,7 @@
         clearTimeout(pollTimer)
         stopJobEvents?.()
         stopSyncFailures?.()
+        stopProgress?.()
         stopBindingChanges?.()
         if (exportRun) void bridge.cancelExport(exportRun.id).catch(() => {})
     })
@@ -866,9 +875,7 @@
                 {/if}
 
                 {#if exportRun?.connectionId === connection.id}
-                    {@const amount = exportRun.progress}
                     <div class="running">
-                        <SettingProgress label={strings.download} detail={amount ? `${bytes(amount.completedBytes)}${amount.totalBytes ? ` / ${bytes(amount.totalBytes)}` : ''}` : ''} fraction={amount?.totalBytes && Number(amount.totalBytes) > 0 ? Number(amount.completedBytes) / Number(amount.totalBytes) : null} />
                         <div class="actions"><SettingButton variant="secondary" size="sm" onclick={() => exportRun && bridge.cancelExport(exportRun.id)}>{strings.cancel}</SettingButton></div>
                     </div>
                 {/if}
@@ -880,12 +887,7 @@
                     </dl>
                 {/if}
                 {#if job && externalJobIsPaused(job) && job.error?.retryAtMs}<p class="note">{strings.retryAt.replace('{0}', when(job.error.retryAtMs))}</p>{/if}
-                {#if job && externalJobIsActive(job) && !externalJobIsPaused(job)}
-                    <SettingProgress label={activeJobLabel(job)} detail={jobSize(job)} fraction={activeJobFraction(job)} />
-                    {#if remaining[connection.id] !== undefined}
-                        <dl class="kv"><dt>{strings.remaining}</dt><dd>{formatRemaining(remaining[connection.id])}</dd></dl>
-                    {/if}
-                {/if}
+                <ExternalTransferProgress connectionId={connection.id} {strings} {job} remaining={remaining[connection.id]} />
 
                 {#if unlockConnection?.id === connection.id}
                     <div class="unlock">

@@ -8,7 +8,7 @@ const fixture = vi.hoisted(() => ({
     registrations: new Map<string, SyncBindingTransport>(), viewport: undefined as undefined | ((source: unknown) => void),
     revision: undefined as undefined | ((revision: number, cause: string) => void),
 }))
-vi.mock('@tauri-apps/api/core', () => ({ invoke: fixture.invoke }))
+vi.mock('@tauri-apps/api/core', () => ({ invoke: fixture.invoke, Channel: class { onmessage = (_value: unknown) => {} } }))
 vi.mock('@tauri-apps/api/event', () => ({ listen: fixture.listen }))
 vi.mock('../../../platform', () => ({ get isTauri() { return fixture.native } }))
 vi.mock('../../../mobileBackgroundTask', () => ({ runWithMobileBackgroundTask: fixture.mobile }))

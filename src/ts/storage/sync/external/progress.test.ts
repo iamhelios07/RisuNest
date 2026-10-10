@@ -1,0 +1,81 @@
+import { afterEach, describe, expect, it, vi } from 'vitest'
+const native = vi.hoisted(() => ({ invoke: vi.fn() }))
+vi.mock('@tauri-apps/api/core', () => ({ invoke: native.invoke, Channel: class { onmessage = (_value: unknown) => {} } }))
+import { beginExternalProgress, clearExternalProgress, externalJobFraction, externalProgressFor, subscribeExternalProgress, type ExternalOperationProgress, type ExternalTransferSnapshot } from './progress'
+import type { ExternalJobSummary } from './types'
+const reading = (sequence: number, uploadedBytes: string): ExternalTransferSnapshot => ({ sequence, stage: 'uploading', uploadedBytes, preparedBytes: '0', downloadedBytes: '0', uploadedObjects: '1', downloadedObjects: '0' })
+afterEach(() => { for (const id of ['a', 'b']) clearExternalProgress(id); vi.useRealTimers(); native.invoke.mockReset() })
+describe('external progress ownership', () => {
+    it('isolates connections and operations, ignores old sequences, and retains the result for remounts', async () => {
+        vi.useFakeTimers()
+        let state: ReadonlyMap<string, ExternalOperationProgress> = new Map()
+        const stop = subscribeExternalProgress(value => state = value)
+        let finish!: () => void
+        native.invoke.mockImplementation(() => new Promise<void>(resolve => finish = resolve))
+        const a = beginExternalProgress('a', 'binding')
+        const run = a.invoke('synthetic', {}, '4')
+        const channel = native.invoke.mock.calls[0][1].progress
+        channel.onmessage(reading(2, '100'))
+        channel.onmessage(reading(1, '999'))
+        const b = beginExternalProgress('b', 'download')
+        b.items(2, 8)
+        expect(externalProgressFor(state, 'a')?.amounts.uploadedBytes).toBe('100')
+        expect(externalProgressFor(state, 'b', 'download')?.completedItems).toBe(2)
+        finish(); await run
+        a.stage('applying', '5')
+        channel.onmessage(reading(3, '500'))
+        expect(externalProgressFor(state, 'a')).toMatchObject({ stage: 'applying', authority: '5', state: 'running' })
+        stop()
+        a.finish('complete')
+        const remount = subscribeExternalProgress(value => state = value)
+        expect(externalProgressFor(state, 'a')?.state).toBe('complete')
+        b.finish('cancelled'); remount()
+    })
+    it('a new attempt cannot be overwritten or cleared by a previous attempt', async () => {
+        vi.useFakeTimers()
+        let state: ReadonlyMap<string, ExternalOperationProgress> = new Map()
+        const stop = subscribeExternalProgress(value => state = value)
+        const old = beginExternalProgress('a', 'binding')
+        old.finish('complete')
+        const retry = beginExternalProgress('a', 'binding')
+        retry.stage('downloading')
+        old.finish('failed')
+        await vi.advanceTimersByTimeAsync(4000)
+        expect(externalProgressFor(state, 'a')).toMatchObject({ state: 'running', stage: 'downloading' })
+        retry.finish('failed'); stop()
+    })
+    it('does not flash a no-change check and does not let routine work replace binding progress', async () => {
+        vi.useFakeTimers()
+        let state: ReadonlyMap<string, ExternalOperationProgress> = new Map()
+        const stop = subscribeExternalProgress(value => state = value)
+        const routine = beginExternalProgress('a', 'sync')
+        expect(externalProgressFor(state, 'a')).toBeUndefined()
+        routine.finish('complete', false)
+        expect(externalProgressFor(state, 'a')).toBeUndefined()
+        const binding = beginExternalProgress('a', 'binding')
+        binding.stage('applying')
+        const next = beginExternalProgress('a', 'sync')
+        await vi.advanceTimersByTimeAsync(700)
+        expect(externalProgressFor(state, 'a')?.stage).toBe('applying')
+        binding.finish('complete'); next.finish('complete', false); stop()
+    })
+    it('accumulates bounded native pages without treating their totals as a whole-operation percentage', async () => {
+        let state: ReadonlyMap<string, ExternalOperationProgress> = new Map()
+        const stop = subscribeExternalProgress(value => state = value)
+        native.invoke.mockImplementation(async (_command, { progress }) => progress.onmessage(reading(1, '50')))
+        const run = beginExternalProgress('a', 'binding')
+        await run.invoke('first', {}); await run.invoke('second', {})
+        expect(externalProgressFor(state, 'a')?.amounts.uploadedBytes).toBe('100')
+        run.finish('complete'); stop()
+    })
+})
+describe('phase denominators', () => {
+    const job: ExternalJobSummary = { id: 'job', connectionId: 'a', kind: 'restore', state: 'running', phase: 'downloading', counters: 'transferred', completedBytes: '100', totalBytes: '100', completedItems: '1', startedAtMs: '0', updatedAtMs: '0' }
+    it.each(['preparing-local', 'applying-local', 'awaiting-adoption'])('keeps %s indeterminate after a complete download', phase => {
+        expect(externalJobFraction({ ...job, phase })).toBeNull()
+    })
+    it('uses fixed download totals but never a growing backup upload total', () => {
+        expect(externalJobFraction(job)).toBe(1)
+        expect(externalJobFraction({ ...job, kind: 'backup' })).toBeNull()
+    })
+})

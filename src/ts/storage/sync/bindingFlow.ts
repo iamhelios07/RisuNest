@@ -57,6 +57,7 @@ export class PreviousStorageFilesDownloadError extends Error {
     }
 }
 export interface SyncBindingTransport {
+    observeBinding?(operation: () => Promise<BindingOutcome>): Promise<BindingOutcome>
     receiveAvailableChanges?(context: BindingContext): Promise<void>
     inspectTarget(context: BindingContext): Promise<InspectedSyncTarget>
     pullAvailableState(target: InspectedSyncTarget, context: BindingContext): Promise<StagedSyncTarget>
