@@ -19,6 +19,7 @@ const state = vi.hoisted(() => ({
     removeRetainedPublication: vi.fn(),
     getQuota: vi.fn(),
     setRetentionPolicy: vi.fn(),
+    setTransferConcurrency: vi.fn(),
     listHistory: vi.fn(),
     listConflicts: vi.fn(),
     recheckConflict: vi.fn(),
@@ -72,6 +73,7 @@ vi.mock('src/ts/storage/sync/external/bridge', () => ({
         removeRetainedPublication: state.removeRetainedPublication,
         getQuota: state.getQuota,
         setRetentionPolicy: state.setRetentionPolicy,
+        setTransferConcurrency: state.setTransferConcurrency,
         listHistory: state.listHistory,
         listConflicts: state.listConflicts,
         recheckConflict: state.recheckConflict,
@@ -109,6 +111,7 @@ function connection(keepCount: number, keepDays: number) {
             remoteVerified: true,
         },
         retentionPolicy: { keepCount, keepDays },
+        transferConcurrency: 4,
         capabilities: {
             immutableCreate: true, directCompleteRead: true, atomicCreateHead: false,
             conditionalHeadUpdate: false, stableHeadReplace: false, headReadAfterWrite: false,
@@ -155,6 +158,7 @@ describe('the storage usage tab', () => {
         // The rows have to stand on their own: usage is a separate request.
         state.getQuota.mockRejectedValue({ kind: 'transient', httpStatus: null, retryAtMs: null })
         state.setRetentionPolicy.mockResolvedValue(undefined)
+        state.setTransferConcurrency.mockResolvedValue(undefined)
         state.listHistory.mockResolvedValue({ items: [] })
         state.beginConnectionSettingsExport.mockResolvedValue({
             transferId: 'settings-transfer',
@@ -755,6 +759,47 @@ describe('the storage usage tab', () => {
         await settle()
         const flags = [...target.querySelectorAll('.item')].map(item => [...item.querySelectorAll('.item-head .flag')].map(flag => flag.textContent?.trim()))
         expect(flags).toEqual([[strings.thisDevice], [], [], [strings.pinned, strings.thisDevice]])
+    })
+
+    it('keeps the concurrent transfer setting above both details tabs', async () => {
+        expect(labelled(strings.transferConcurrency).value).toBe('4')
+        expect(target.textContent).toContain(strings.transferConcurrencyHelp)
+        await openStorageUsage()
+        expect(labelled(strings.transferConcurrency).value).toBe('4')
+        expect(labelled(strings.transferConcurrency).closest('[role="tabpanel"]')).toBeNull()
+    })
+
+    it.each(['', '0', '17', '1.5', 'Infinity'])('restores invalid concurrent transfer input %s without saving', async value => {
+        const input = labelled(strings.transferConcurrency)
+        input.value = value
+        input.dispatchEvent(new Event('change', { bubbles: true }))
+        await settle()
+        expect(input.value).toBe('4')
+        expect(state.setTransferConcurrency).not.toHaveBeenCalled()
+    })
+
+    it('disables a pending transfer preference and restores its value after a failed save', async () => {
+        let fail!: (error: unknown) => void
+        state.setTransferConcurrency.mockImplementationOnce(() => new Promise((_resolve, reject) => { fail = reject }))
+        const input = labelled(strings.transferConcurrency)
+        input.value = '8'
+        input.dispatchEvent(new Event('change', { bubbles: true }))
+        await tick()
+        expect(state.setTransferConcurrency).toHaveBeenCalledWith('connection-1', 8)
+        expect(input.disabled).toBe(true)
+        fail({ kind: 'transient' })
+        await settle()
+        expect(input.value).toBe('4')
+        expect(input.disabled).toBe(false)
+    })
+
+    it('saves a valid concurrent transfer value and updates the saved control', async () => {
+        const input = labelled(strings.transferConcurrency)
+        input.value = '16'
+        input.dispatchEvent(new Event('change', { bubbles: true }))
+        await settle()
+        expect(state.setTransferConcurrency).toHaveBeenCalledWith('connection-1', 16)
+        expect(state.setRetentionPolicy).not.toHaveBeenCalled()
     })
 
     it('sends a changed limit and leaves the other one alone', async () => {
