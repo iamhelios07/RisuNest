@@ -521,6 +521,27 @@
         if (value !== policy[limit]) void changeRetentionPolicy(connection, { ...policy, [limit]: value })
     }
 
+    async function commitTransferConcurrency(connection: ExternalConnectionSummary, input: HTMLInputElement): Promise<void> {
+        const saved = connection.transferConcurrency
+        const value = Number(input.value)
+        if (!input.value.trim() || !Number.isInteger(value) || value < 1 || value > 16) {
+            input.value = String(saved)
+            return
+        }
+        if (value === saved) return
+        busy = true
+        try {
+            await bridge.setTransferConcurrency(connection.id, value)
+            connection.transferConcurrency = value
+            await refresh(true)
+        } catch (failure) {
+            input.value = String(connection.transferConcurrency)
+            error = externalErrorMessage(strings, failure)
+        } finally {
+            busy = false
+        }
+    }
+
     async function removeConnection(connection: ExternalConnectionSummary): Promise<void> {
         busy = true
         activeAction = `remove:${connection.id}`
@@ -927,6 +948,15 @@
                 </div>
 
                 <div class="details">
+                    <section class="usage-section transfer-settings">
+                        <label class="field">
+                            <span>{strings.transferConcurrency}</span>
+                            <span class="amount">
+                                <NumberInput size="sm" className="w-20 text-right tabular-nums" disabled={busy} min={1} max={16} value={connection.transferConcurrency} onChange={event => commitTransferConcurrency(connection, event.currentTarget)} />
+                            </span>
+                        </label>
+                        <p class="help">{strings.transferConcurrencyHelp}</p>
+                    </section>
                     <div class="tabs" role="tablist">
                         {#each (['history', 'quota'] as const) as tab (tab)}
                             <button type="button" role="tab" id="{connection.id}-{tab}-tab" aria-controls="{connection.id}-{tab}-panel" aria-selected={selectedTab(connection.id) === tab} class="tab" onclick={() => openDetails(connection, tab)}>{tab === 'history' ? strings.history : strings.quota}</button>
@@ -1245,6 +1275,9 @@
         border: 1px solid var(--risu-theme-darkborderc);
         border-radius: 0.5rem;
         background: var(--risu-theme-bgcolor);
+    }
+    .transfer-settings {
+        padding: 0.75rem;
     }
     .tabs {
         display: flex;
