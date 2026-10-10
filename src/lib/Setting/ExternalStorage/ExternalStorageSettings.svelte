@@ -12,13 +12,13 @@
     import SettingNotice from '../RisuNest/SettingNotice.svelte'
     import StatusBadge from '../RisuNest/StatusBadge.svelte'
     import { CloudIcon, DatabaseIcon, MonitorSmartphoneIcon, PackageIcon, PinIcon, ServerIcon } from '@lucide/svelte'
-    import { alertConfirm, alertNormal, alertCheckboxConfirm } from 'src/ts/alert'
+    import { alertActionConfirm, alertConfirm, alertNormal, alertCheckboxConfirm } from 'src/ts/alert'
     import { DBState } from 'src/ts/stores.svelte'
     import { getExternalStorageBridge } from 'src/ts/storage/sync/external/bridge'
-    import { bindSyncTarget, unbindSyncTarget } from 'src/ts/storage/sync/bindingRegistry'
+    import { bindSyncTarget, resumeCurrentSyncBinding, unbindSyncTarget } from 'src/ts/storage/sync/bindingRegistry'
     import { createNativeSyncBindingBridge } from 'src/ts/storage/sync/bindingNative'
     import { subscribeSyncBindingChanges } from 'src/ts/storage/sync/bindingChanges'
-    import { requestExternalLwwNow, subscribeExternalLwwFailures, supportsExternalLwwNewDevice } from 'src/ts/storage/sync/external/lwwProduction'
+    import { isExternalLwwRunning, requestExternalLwwNow, subscribeExternalLwwFailures, supportsExternalLwwNewDevice } from 'src/ts/storage/sync/external/lwwProduction'
     import BindingTargetSwitch from 'src/ts/storage/sync/BindingTargetSwitch.svelte'
     import { PREVIOUS_FILES_DOWNLOAD_FAILED } from 'src/ts/storage/sync/bindingFlow'
     import { language } from 'src/lang'
@@ -99,6 +99,10 @@
     let pollTimer: ReturnType<typeof setTimeout> | undefined
     /** The state a sync switch was set to while its change runs. Otherwise it shows the device's sync target. */
     let syncRequest = $state<Record<string, boolean>>({})
+    /** Whether sync with each connection was started in this session, read on every refresh. */
+    let syncRunning = $state<Record<string, boolean>>({})
+    /** A connection made for sync while its recovery key is on screen starts syncing once the key is closed. */
+    let pendingSyncStart: ExternalConnectionSummary | undefined
     /** The state an automatic backup switch was set to while its change runs. Otherwise it shows the stored setting. */
     let automaticRequest = $state<Record<string, boolean>>({})
     let stopBindingChanges: (() => void) | undefined
@@ -110,12 +114,12 @@
         busy = true
         syncRequest[connection.id] = enabled
         try {
-            if (enabled) await bindSyncTarget({ kind: 'external', connectionId: connection.id })
-            else {
-                // A switch left over from an older state must not stop another sync target.
-                const current = (await createNativeSyncBindingBridge().state()).target
-                if (current.kind === 'external' && current.connectionId === connection.id) await unbindSyncTarget()
-            }
+            const current = (await createNativeSyncBindingBridge().state()).target
+            const selected = current.kind === 'external' && current.connectionId === connection.id
+            // A start that left sync off keeps this target, so turning the switch on resumes it.
+            if (enabled) await (selected ? resumeCurrentSyncBinding(current) : bindSyncTarget({ kind: 'external', connectionId: connection.id }))
+            // A switch left over from an older state must not stop another sync target.
+            else if (selected) await unbindSyncTarget()
             await refreshExternalStorageProductionState()
             error = ''
         } catch (reason) {
@@ -131,7 +135,25 @@
         busy = true
         try { await requestExternalLwwNow(connection.id) }
         catch (reason) { error = externalErrorMessage(strings, reason) }
-        finally { busy = false }
+        finally {
+            await refresh(true)
+            busy = false
+        }
+    }
+    /** Makes a connection made for sync this device's sync target, asking first when another target is set. */
+    async function startSync(connection: ExternalConnectionSummary): Promise<void> {
+        const current = await createNativeSyncBindingBridge().state().then(binding => binding.target, reason => {
+            error = externalErrorMessage(strings, reason)
+            return undefined
+        })
+        if (!current) return
+        if (current.kind !== 'none' && !await alertActionConfirm({
+            title: strings.switchSyncTitle,
+            description: current.kind === 'server' ? strings.switchSyncFromServer : strings.switchSyncFromExternal,
+            actionLabel: strings.startSync,
+            cancelLabel: strings.cancel,
+        })) return
+        await setSyncBinding(connection, true)
     }
     function beginRestore(connection: ExternalConnectionSummary, item: ExternalHistoryItem): void {
         try {
@@ -161,6 +183,7 @@
         }
         try {
             storageState = await bridge.getState()
+            syncRunning = Object.fromEntries(storageState.connections.map(connection => [connection.id, isExternalLwwRunning(connection.id)]))
             estimateRemaining(storageState)
             for (const connection of storageState.connections) {
                 if (historyRequested.has(connection.id)) continue
@@ -237,6 +260,9 @@
         if (renewed) {
             const job = activeJob(result.connection)
             if (job && externalJobIsPaused(job)) await resumeJob(result.connection, job)
+        } else if (result.connection.purpose === 'sync') {
+            if (recoveryKey) pendingSyncStart = result.connection
+            else await startSync(result.connection)
         }
     }
 
@@ -641,7 +667,11 @@
     }
 
     function closeRecoveryKey(): void {
+        if (!recoveryKey) return
         recoveryKey = ''
+        const connection = pendingSyncStart
+        pendingSyncStart = undefined
+        if (connection) void startSync(connection)
     }
 
     function closeConnectionSettings(): void {
@@ -730,13 +760,20 @@
             && connection.lastError?.reason === job?.error?.reason
     }
 
-    function connectionTone(connection: ExternalConnectionSummary): 'connected' | 'working' | 'attention' | 'idle' {
+    /** A sync target that this start left off, or that stopped, until its switch or sync button starts it again. */
+    function syncStopped(connection: ExternalConnectionSummary): boolean {
+        const selection = storageState?.selection
+        return connection.purpose === 'sync' && selection?.kind === 'external' && selection.connectionId === connection.id && !syncRunning[connection.id]
+    }
+
+    function connectionTone(connection: ExternalConnectionSummary): 'connected' | 'working' | 'attention' | 'idle' | 'paused' {
         const job = activeJob(connection)
         if (!connectionUsable(connection)) return 'attention'
         if (job && (externalJobIsPaused(job) || job.state === 'uncertain')) return 'attention'
         const operation = externalProgressFor(progress, connection.id)
         if (operation?.state === 'running') return operation.stage === 'waiting' ? 'idle' : 'working'
         if (job && externalJobIsActive(job)) return 'working'
+        if (syncStopped(connection)) return 'paused'
         if (connectionUsable(connection)) return 'connected'
         return 'attention'
     }
@@ -750,6 +787,7 @@
         const operation = externalProgressFor(progress, connection.id)
         if (operation?.state === 'running') return operation.stage === 'waiting' ? strings.transfer.waiting : operation.kind === 'binding' ? strings.transfer.connecting : strings.transfer.syncing
         if (job && externalJobIsActive(job)) return strings.jobActive[job.kind]
+        if (syncStopped(connection)) return strings.statusPaused
         return connectionStatusLabel(connection.status)
     }
 
@@ -871,6 +909,7 @@
             {@const retryable = !!job && externalJobIsPaused(job) && ['retry', 'wait', 'free-space'].includes(job.error?.action ?? '') && ['backup', 'cleanup', 'restore', 'check-repository', 'pin-history', 'delete-history'].includes(job.kind)}
             {@const remedy = renewable || lockable || recheckable || retryable}
             {@const syncTarget = storageState.selection.kind === 'external' && storageState.selection.connectionId === connection.id}
+            {@const syncing = syncTarget && !!syncRunning[connection.id]}
             {@const backedUp = connection.purpose === 'backup' || !!connection.lastBackupAtMs}
             {@const synced = connection.purpose === 'sync' && !!connection.lastSyncAtMs}
             <article class="card">
@@ -933,7 +972,7 @@
                     {#if connection.purpose === 'backup'}
                         <SettingToggle showLabel label={strings.automaticBackup} disabled={busy} checked={automaticRequest[connection.id] ?? !connection.automaticBackupPaused} onchange={enabled => setAutomaticWork(connection, enabled)} />
                     {:else}
-                        <SettingToggle showLabel label={strings.makeSyncTarget} disabled={busy} checked={syncRequest[connection.id] ?? syncTarget} onchange={enabled => setSyncBinding(connection, enabled)} />
+                        <SettingToggle showLabel label={strings.makeSyncTarget} disabled={busy} checked={syncRequest[connection.id] ?? syncing} onchange={enabled => setSyncBinding(connection, enabled)} />
                     {/if}
                     <div class="actions">
                         {#if renewable}<SettingButton disabled={busy} onclick={() => renewalConnection = connection}>{strings.renew}</SettingButton>{/if}
