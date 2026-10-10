@@ -500,7 +500,7 @@ describe('the storage usage tab', () => {
         await settle()
         transferProgress.onmessage({ sequence: 2, network: { id: 'export', atMs: 1000, sentBytes: '0', receivedBytes: '2097152', sending: false, receiving: true } })
         await settle()
-        expect(target.querySelector('[data-external-progress="export"] [data-transfer-speed]')?.textContent).toContain('↓ 2.0 MiB/s')
+        expect(target.querySelector('[data-external-progress="export"] [data-transfer-speed]')?.textContent).toContain(`${strings.transfer.downloadSpeed} 2.0 MiB/s`)
         expect(target.textContent).toContain('10 B / 20 B')
         const cancel = [...target.querySelectorAll('button')].find(button => button.textContent?.trim() === strings.cancel)!
         expect(cancel.closest('[data-external-progress="export"]')?.querySelector('[role="progressbar"]')).toBeTruthy()
