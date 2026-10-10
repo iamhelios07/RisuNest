@@ -414,14 +414,23 @@ jobs:
             'helper_rolls_back_a_corrupt_live_replacement_and_restarts_the_old_server',
             'installer_guard_records_restart_failure_after_accepted_corrupt_server_start'
           )
+          $logDirectory = Join-Path $env:RUNNER_TEMP 'sync-update-tests'
+          New-Item -ItemType Directory -Force -Path $logDirectory | Out-Null
           foreach ($test in $tests) {
-            $output = & cargo test --manifest-path server/manager/Cargo.toml --release --locked --target '${{ matrix.target }}' --test update_helper $test -- --ignored --exact --nocapture 2>&1 |
-              Tee-Object -FilePath "$env:RUNNER_TEMP/$test.log"
+            & cargo test --manifest-path server/manager/Cargo.toml --release --locked --target '${{ matrix.target }}' --test update_helper $test -- --ignored --exact --nocapture 2>&1 |
+              Tee-Object -FilePath (Join-Path $logDirectory "$test.log") -OutVariable output | Out-Host
             if ($LASTEXITCODE -ne 0) { throw "$test failed." }
             if (($output | Out-String) -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored;') {
               throw "$test did not execute exactly one passing test."
             }
           }
+      - name: Preserve Windows scheduled update test logs
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sync-update-tests-${{ matrix.target }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/sync-update-tests/*.log
+          retention-days: 3
       - name: Run Linux systemd, TUI and installer lifecycle
         if: runner.os == 'Linux'
         run: |
