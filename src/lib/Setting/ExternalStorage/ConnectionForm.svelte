@@ -10,6 +10,7 @@
     import { openUrl } from '@tauri-apps/plugin-opener'
     import { type as osType } from '@tauri-apps/plugin-os'
     import { isTauriAndroid, isTauriIOS } from 'src/ts/platform'
+    import { selectDomFiles } from 'src/ts/storage/fileSelection'
     import { createQrScanner, isQrScanCancelled } from 'src/ts/ui/qrScanner'
     import { getExternalStorageBridge } from 'src/ts/storage/sync/external/bridge'
     import {
@@ -303,23 +304,10 @@
         resetPrepared()
     }
 
-    function readConnectionSettingsFile(): Promise<string | null> {
-        return new Promise(resolve => {
-            const input = document.createElement('input')
-            input.type = 'file'
-            // The Android picker hides extensions it does not know, so it stays
-            // open there and the contents are checked when the key is read.
-            if (!isTauriAndroid) input.accept = '.rnconnection,text/plain'
-            input.style.display = 'none'
-            const finish = async (file?: File) => {
-                input.remove()
-                resolve(file ? await file.text() : null)
-            }
-            input.addEventListener('cancel', () => void finish())
-            input.addEventListener('change', () => void finish(input.files?.[0] ?? undefined))
-            document.body.appendChild(input)
-            input.click()
-        })
+    async function readConnectionSettingsFile(): Promise<string | null> {
+        // The Android picker hides extensions it does not know.
+        const [file] = await selectDomFiles({ accept: isTauriAndroid ? '' : '.rnconnection,text/plain' })
+        return file ? file.text() : null
     }
 
     async function loadConnectionSettingsFile(): Promise<void> {

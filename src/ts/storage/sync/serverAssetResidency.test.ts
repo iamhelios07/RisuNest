@@ -6,11 +6,32 @@ vi.mock('src/ts/stores.svelte', () => ({ selectedCharID: { subscribe: (run: (val
 vi.mock('../database.svelte', () => ({ getDatabase: () => ({ characters: [{ chaId: 'selected-policy-character' }] }) }))
 import { countConnectionOnlyAssets, downloadRemoteAssets, evictLocalAssets, getAssetResidencyStatus, setAssetResidencyPolicy } from './serverAssetResidency'
 import { clearExternalProgress, externalProgressFor, subscribeExternalProgress, type ExternalOperationProgress } from './external/progress'
+import { reserveLibraryFileOperation, waitForLibraryFileOperation } from '../libraryFileOperation'
 
 const status = { policy: 'full', localBytes: 2, remoteBytes: 1, remoteObjects: 1, serverBytes: 1, serverObjects: 1, externalObjects: [], unavailableObjects: 0, evictedBytes: 0 }
 beforeEach(() => { vi.resetAllMocks(); mock.selectedIndex = 0 })
 afterEach(() => { clearExternalProgress('receiver'); vi.restoreAllMocks() })
 describe('asset residency mobile lifetime', () => {
+    it('keeps file admission waiting for an existing asset transfer even when its caller cancels', async () => {
+        let finish!: () => void
+        const held = new Promise<void>(resolve => { finish = resolve })
+        mock.begin.mockResolvedValue({ dispose: vi.fn(async () => {}), progress: vi.fn() })
+        mock.invoke.mockImplementation(async name => { if (name === 'asset_residency_download_remote') { await held; return status } })
+        const controller = new AbortController()
+        const download = downloadRemoteAssets(undefined, { signal: controller.signal })
+        const result = download.catch(error => error)
+        await vi.waitFor(() => expect(mock.invoke).toHaveBeenCalledWith('asset_residency_download_remote', expect.anything()))
+        const release = reserveLibraryFileOperation()
+        const ready = vi.fn()
+        const waiting = Promise.resolve(waitForLibraryFileOperation(new AbortController().signal)).then(ready)
+        try {
+            controller.abort()
+            for (let i = 0; i < 10; i++) await Promise.resolve()
+            expect(ready).not.toHaveBeenCalled()
+            finish(); expect(await result).toMatchObject({ name: 'AbortError' }); await waiting
+            expect(ready).toHaveBeenCalledOnce()
+        } finally { finish(); await download.catch(() => {}); release() }
+    })
     it.each([0, 2])('shows an automatic download only when its plan has files (%i)', async totalItems => {
         let readings: ReadonlyMap<string, ExternalOperationProgress> = new Map()
         const stop = subscribeExternalProgress(value => { readings = value })

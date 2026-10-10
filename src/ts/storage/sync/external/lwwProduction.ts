@@ -12,6 +12,7 @@ import { createNativeSyncBindingBridge, replaceNativeSyncBinding, replaceNativeS
 import { registerSyncBindingTransport, resumeCurrentSyncBinding } from '../bindingRegistry'
 import { SERVER_SYNC_DEVICE_CHANGED_EVENT } from '../serverSyncNativeSignals'
 import { downloadRemoteAssets } from '../serverAssetResidency'
+import { isLibraryFileOperationReserved, registerLibraryFileOperationGate, subscribeLibraryFileOperationReleased } from '../../libraryFileOperation'
 import { createLwwScheduler, type LwwCall, type LwwOperation, type LwwTurn } from './lwwScheduler'
 import type { ExternalStorageState } from './types'
 import { beginExternalProgress, clearExternalProgress, clearExternalSyncProgress, externalProgressFailure, type ExternalProgressRun } from './progress'
@@ -35,7 +36,7 @@ export function supportsExternalLwwNewDevice(id: string): boolean {
 }
 const header = (connectionId: string, context: BindingContext, requestId: string = crypto.randomUUID()) => ({ connectionId, bindingAuthority: context.state.targetAuthority, requestId, generating: generatingConversations.snapshot() })
 const native = createNativeSyncBindingBridge()
-const foregroundAvailable = () => document.visibilityState !== 'hidden' && navigator.onLine
+const foregroundAvailable = () => document.visibilityState !== 'hidden' && navigator.onLine && !isLibraryFileOperationReserved()
 // A start that left sync off registers the transports, so settings can still change the sync target,
 // but leaves the bound target stopped until the user starts it.
 let resumeBoundTarget = true
@@ -238,7 +239,13 @@ function createAdapter(connectionId: string): Adapter {
         async receiveAvailableChanges(binding) { await receive(binding) },
     }
     const unregister = registerSyncBindingTransport({ kind: 'external', connectionId }, transport)
-    const adapter: Adapter = { transport, scheduler, stopHydration, resumeHydration, generation: 0, dispose() { adapter.generation++; scheduler.stop(); void stopHydration(); active = undefined; reportFailure(connectionId); unregister(); clearExternalProgress(connectionId); if (adapters.get(connectionId) === adapter) adapters.delete(connectionId) } }
+    const unregisterGate = registerLibraryFileOperationGate(async () => {
+        if (bindingProgress) throw Object.assign(new Error('server-sync-busy'), { code: 'server-sync-busy' })
+        await adapter.foreground
+        await scheduler.settled()
+        await hydrating
+    })
+    const adapter: Adapter = { transport, scheduler, stopHydration, resumeHydration, generation: 0, dispose() { adapter.generation++; scheduler.stop(); void stopHydration(); active = undefined; reportFailure(connectionId); unregister(); unregisterGate(); clearExternalProgress(connectionId); if (adapters.get(connectionId) === adapter) adapters.delete(connectionId) } }
     return adapter
 }
 
@@ -287,7 +294,9 @@ export async function installExternalLwwAdapters(state: ExternalStorageState, re
     })
     let hiddenFlushed = document.visibilityState === 'hidden'
     let wasOnline = navigator.onLine
+    let disposed = false
     const foreground = () => {
+        if (disposed || isLibraryFileOperationReserved()) return
         const wentOffline = !navigator.onLine && wasOnline
         wasOnline = navigator.onLine
         const flushHidden = document.visibilityState === 'hidden' && !hiddenFlushed
@@ -307,7 +316,7 @@ export async function installExternalLwwAdapters(state: ExternalStorageState, re
                     if (adapters.get(adapter.state?.target.kind === 'external' ? adapter.state.target.connectionId : '') !== adapter
                         || generation !== adapter.generation || document.visibilityState === 'hidden' || !navigator.onLine) return
                     const current = await native.state()
-                    if (generation !== adapter.generation || current.targetAuthority !== authority || current.target.kind !== 'external') return
+                    if (generation !== adapter.generation || current.targetAuthority !== authority || current.target.kind !== 'external' || !foregroundAvailable()) return
                     await invoke('external_lww_resume', { connectionId: current.target.connectionId })
                     if (generation === adapter.generation && foregroundAvailable()) { adapter.resumeHydration(); await adapter.scheduler.resumeForeground() }
                 })().catch(() => {}).finally(() => {
@@ -320,7 +329,14 @@ export async function installExternalLwwAdapters(state: ExternalStorageState, re
     document.addEventListener('visibilitychange', foreground)
     window.addEventListener('online', foreground)
     window.addEventListener('offline', foreground)
+    const releaseFileOperation = subscribeLibraryFileOperationReleased(() => {
+        const resuming = [...adapters.values()].flatMap(adapter => adapter.foreground ? [adapter.foreground] : [])
+        if (resuming.length) void Promise.allSettled(resuming).then(foreground)
+        else foreground()
+    })
     return () => {
+        disposed = true
+        releaseFileOperation()
         disposeRevision(); disposeDevice(); disposeConversation()
         document.removeEventListener('visibilitychange', foreground)
         window.removeEventListener('online', foreground); window.removeEventListener('offline', foreground)

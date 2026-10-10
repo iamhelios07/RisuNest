@@ -43,6 +43,28 @@ afterEach(() => { dispose?.(); dispose = undefined; vi.useRealTimers() })
 const settle = async () => { for (let i = 0; i < 20; i++) await Promise.resolve() }
 const assetPage = (requestId = 'asset-page') => ({ header: { bindingAuthority: '4', requestId }, changes: [{ key: '["asset","synthetic-image"]', value: { kind: 'inline', value: { objectHash: 'synthetic-hash' } } }] })
 describe('external sync asset downloads', () => {
+    it('waits for external assets before file work and keeps them stopped across picker visibility changes', async () => {
+        const admission = await import('../../libraryFileOperation')
+        let finish!: () => void
+        fixture.download.mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve }))
+        dispose = await installExternalLwwAdapters(state()); await settle()
+        const release = admission.reserveLibraryFileOperation()
+        const ready = vi.fn()
+        const waiting = Promise.resolve(admission.waitForLibraryFileOperation(new AbortController().signal)).then(ready)
+        try {
+            await settle(); expect(ready).not.toHaveBeenCalled()
+            finish(); await waiting
+            fixture.download.mockClear(); fixture.invoke.mockClear()
+            Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' }); document.dispatchEvent(new Event('visibilitychange'))
+            await settle()
+            Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' }); document.dispatchEvent(new Event('visibilitychange'))
+            fixture.revision!(15, 'generation-complete')
+            await vi.advanceTimersByTimeAsync(65_000); await settle()
+            expect(fixture.download).not.toHaveBeenCalled()
+            expect(fixture.invoke.mock.calls.some(([command]) => ['external_lww_publish', 'external_lww_receive'].includes(command))).toBe(false)
+        } finally { finish(); release(); await settle() }
+        expect(fixture.download).toHaveBeenCalledOnce()
+    })
     it('downloads missing bodies on resume without delaying metadata sync', async () => {
         let finish!: () => void
         fixture.download.mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve }))

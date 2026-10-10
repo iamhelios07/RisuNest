@@ -4,6 +4,12 @@ import { beginMobileBackgroundTask } from "../../mobileBackgroundTask";
 import { get } from "svelte/store";
 import { selectedCharID } from "src/ts/stores.svelte";
 import { getDatabase } from "../database.svelte";
+import { registerLibraryFileOperationGate } from '../libraryFileOperation';
+
+const operations = new Set<Promise<unknown>>();
+registerLibraryFileOperationGate(async () => {
+  while (operations.size) await Promise.allSettled([...operations]);
+});
 
 export type AssetResidencyTarget = { kind: 'external'; connectionId: string } | { kind: 'server'; libraryId: string; targetId: string };
 
@@ -62,7 +68,12 @@ export async function countConnectionOnlyAssets(connectionId: string): Promise<n
   if (!count(objects)) throw new Error("invalid-asset-residency-status");
   return objects;
 }
-async function protectedCommand(name: string, args?: Record<string, unknown>, signal?: AbortSignal, operationId?: string) {
+function protectedCommand(name: string, args?: Record<string, unknown>, signal?: AbortSignal, operationId?: string) {
+  const operation = runProtectedCommand(name, args, signal, operationId);
+  operations.add(operation);
+  return operation.finally(() => { operations.delete(operation); });
+}
+async function runProtectedCommand(name: string, args?: Record<string, unknown>, signal?: AbortSignal, operationId?: string) {
   const task = await beginMobileBackgroundTask("sync");
   let cancellation: Promise<void> | undefined;
   let admitted = operationId === undefined;
