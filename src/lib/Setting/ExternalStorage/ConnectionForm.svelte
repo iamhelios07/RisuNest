@@ -101,6 +101,9 @@
     let authorizationStatus = $state('')
     let destroyed = false
     let authorizationCompletionInFlight = $state(false)
+    let readyAuthorizationId = $state<string | null>(null)
+    let authorizationListener: Promise<void> | null = null
+    let stopAuthorizationListener: (() => void) | null = null
     let cancellationId: string | null = null
     let cancellationPromise: Promise<boolean> | null = null
     let folder = $state<ExternalFolderSelection | null>(null)
@@ -163,6 +166,28 @@
 
     $effect(() => onbusychange(busy))
 
+    $effect(() => {
+        if (!destroyed && !busy && readyAuthorizationId && readyAuthorizationId === pendingAuthorizationId) {
+            readyAuthorizationId = null
+            if (selectingFolder) void finishFolderSelection()
+            else void connect()
+        }
+    })
+
+    async function watchAuthorization(): Promise<void> {
+        if (!isTauriAndroid) return
+        authorizationListener ??= bridge.onAuthorizationReady(id => {
+            if (!destroyed && id === pendingAuthorizationId) readyAuthorizationId = id
+        }).then(stop => {
+            if (destroyed) stop()
+            else stopAuthorizationListener = stop
+        }).catch(reason => {
+            authorizationListener = null
+            throw reason
+        })
+        await authorizationListener
+    }
+
     onMount(async () => {
         if (renewalConnection) busy = true
         try {
@@ -181,6 +206,7 @@
     })
     onDestroy(() => {
         destroyed = true
+        stopAuthorizationListener?.()
         const authorizationId = pendingAuthorizationId
         if (authorizationId) {
             void cancelNativeAuthorization(authorizationId)
@@ -450,6 +476,8 @@
         endpointConfirmed = false
         selectingFolder = true
         try {
+            await watchAuthorization()
+            if (destroyed) return
             const pending = await bridge.beginAuthorization(
                 prepared.preparationId,
                 prepared.requiresPlatformOAuthClient ? currentPlatformClientId.trim() : undefined,
@@ -537,7 +565,7 @@
     }
 
     async function connect(): Promise<void> {
-        if (!prepared || !endpointConfirmed) return
+        if (!prepared || !endpointConfirmed || busy) return
         if (folderSelection && !folder) return
         if (!folderSelection && !prepared.requiresOAuth && !fromTransfer
             && reportMissingFields(definition.secretFields)) return
@@ -552,6 +580,8 @@
             }
             if (prepared.requiresOAuth) {
                 if (!pendingAuthorizationId) {
+                    await watchAuthorization()
+                    if (destroyed) return
                     const pending = await bridge.beginAuthorization(
                         prepared.preparationId,
                         prepared.requiresPlatformOAuthClient

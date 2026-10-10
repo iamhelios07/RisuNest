@@ -1225,7 +1225,7 @@ pub(crate) async fn external_storage_begin_authorization(
 #[cfg(target_os = "android")]
 #[tauri::command]
 pub(crate) async fn external_storage_begin_authorization(
-    _app: AppHandle,
+    app: AppHandle,
     state: State<'_, ConnectionCommandState>,
     request: BeginAuthorizationRequest,
 ) -> Result<PendingAuthorizationSummary> {
@@ -1238,10 +1238,16 @@ pub(crate) async fn external_storage_begin_authorization(
         let config = { authorization_config(&state, &preparation_id, current_platform_client_id)? };
         let authorization_id = uuid::Uuid::new_v4().to_string();
         let expires_at_ms = now_ms().saturating_add(PREPARATION_LIFETIME_MS);
+        let on_ready: Box<dyn FnOnce() + Send> = Box::new({
+            let authorization_id = authorization_id.clone();
+            move || {
+                let _ = tauri::Emitter::emit(&app, "external-storage-authorization-ready", authorization_id);
+            }
+        });
         let (authorization, authorization_url, authorization_state) = match config.provider.as_str() {
             "google_drive" => {
                 let policy = providers::google_drive::auth::android_web_authorization_policy(&config)?;
-                let (flow, url) = super::oauth::android_google_web_authorization(policy)?;
+                let (flow, url) = super::oauth::android_google_web_authorization(policy, on_ready)?;
                 (
                     PendingAuthorization::Google {
                         preparation_id,
@@ -1260,7 +1266,7 @@ pub(crate) async fn external_storage_begin_authorization(
                     super::oauth::ANDROID_ONEDRIVE_REDIRECT_URI.into(),
                 );
                 let policy = providers::onedrive::authorization_policy(&exchange_config, "android")?;
-                let (flow, url) = super::oauth::android_redirect_authorization(policy)?;
+                let (flow, url) = super::oauth::android_redirect_authorization(policy, on_ready)?;
                 (
                     PendingAuthorization::OneDrive {
                         preparation_id,

@@ -63,7 +63,8 @@ struct TokenResponse {
 
 #[derive(Deserialize)]
 struct TokenInfo {
-    issued_to: Option<String>,
+    aud: Option<String>,
+    azp: Option<String>,
     scope: Option<String>,
 }
 
@@ -210,8 +211,8 @@ pub(super) async fn verify_google_grant(
     cancel: &Cancellation,
 ) -> Result<()> {
     let mut url = token_info_endpoint;
-    // Google OAuth2 API v2 documents access_token as a tokeninfo query
-    // parameter. HttpRequest is intentionally neither Debug nor Serialize,
+    // Tokeninfo accepts access_token as a query parameter.
+    // HttpRequest is intentionally neither Debug nor Serialize,
     // and transport errors discard URLs so this value cannot reach logs.
     url.query_pairs_mut()
         .append_pair("access_token", access_token);
@@ -233,7 +234,9 @@ pub(super) async fn verify_google_grant(
     }
     wire::require_status(&mut response, &[200], dependencies.clock.now_ms(), cancel).await?;
     let token = wire::json::<TokenInfo>(&mut response, cancel).await?;
-    if token.issued_to.as_deref() != Some(expected_client_id) {
+    if token.aud.as_deref() != Some(expected_client_id)
+        || token.azp.as_deref() != Some(expected_client_id)
+    {
         return Err(reauth());
     }
     let granted_scopes = token.scope.as_deref().unwrap_or_default();
