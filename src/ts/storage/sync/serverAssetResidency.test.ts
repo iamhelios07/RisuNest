@@ -5,11 +5,41 @@ vi.mock('../../mobileBackgroundTask', () => ({ beginMobileBackgroundTask: mock.b
 vi.mock('src/ts/stores.svelte', () => ({ selectedCharID: { subscribe: (run: (value: number) => void) => { run(mock.selectedIndex); return () => {} } } }))
 vi.mock('../database.svelte', () => ({ getDatabase: () => ({ characters: [{ chaId: 'selected-policy-character' }] }) }))
 import { countConnectionOnlyAssets, downloadRemoteAssets, evictLocalAssets, getAssetResidencyStatus, setAssetResidencyPolicy } from './serverAssetResidency'
+import { clearExternalProgress, externalProgressFor, subscribeExternalProgress, type ExternalOperationProgress } from './external/progress'
 
 const status = { policy: 'full', localBytes: 2, remoteBytes: 1, remoteObjects: 1, serverBytes: 1, serverObjects: 1, externalObjects: [], unavailableObjects: 0, evictedBytes: 0 }
 beforeEach(() => { vi.resetAllMocks(); mock.selectedIndex = 0 })
-afterEach(() => vi.restoreAllMocks())
+afterEach(() => { clearExternalProgress('receiver'); vi.restoreAllMocks() })
 describe('asset residency mobile lifetime', () => {
+    it.each([0, 2])('shows an automatic download only when its plan has files (%i)', async totalItems => {
+        let readings: ReadonlyMap<string, ExternalOperationProgress> = new Map()
+        const stop = subscribeExternalProgress(value => { readings = value })
+        mock.begin.mockResolvedValue({ dispose: vi.fn(async () => {}), progress: vi.fn() })
+        mock.invoke.mockImplementation(async (name, args) => {
+            if (name !== 'asset_residency_download_remote') return
+            expect(externalProgressFor(readings, 'receiver', 'download')).toBeUndefined()
+            expect(args).toMatchObject({ connectionId: null, selectedCharacterId: 'selected-policy-character' })
+            expect(args).not.toHaveProperty('target')
+            args.progress.onmessage({ completedItems: 0, totalItems })
+            if (totalItems) expect(externalProgressFor(readings, 'receiver', 'download')).toMatchObject({ state: 'running', completedItems: 0, totalItems })
+            else expect(externalProgressFor(readings, 'receiver', 'download')).toBeUndefined()
+            args.progress.onmessage({ completedItems: totalItems, totalItems })
+            return status
+        })
+        await downloadRemoteAssets(undefined, { progressConnectionId: 'receiver', showEmpty: false })
+        if (totalItems) expect(externalProgressFor(readings, 'receiver', 'download')).toMatchObject({ state: 'complete', completedItems: totalItems, totalItems })
+        else expect(externalProgressFor(readings, 'receiver', 'download')).toBeUndefined()
+        stop()
+    })
+    it('shows automatic download failures even before a file plan arrives', async () => {
+        let readings: ReadonlyMap<string, ExternalOperationProgress> = new Map()
+        const stop = subscribeExternalProgress(value => { readings = value })
+        mock.begin.mockResolvedValue({ dispose: vi.fn(async () => {}), progress: vi.fn() })
+        mock.invoke.mockImplementation(async name => { if (name === 'asset_residency_download_remote') throw new Error('download-unavailable') })
+        await expect(downloadRemoteAssets('receiver', { showEmpty: false })).rejects.toThrow('download-unavailable')
+        expect(externalProgressFor(readings, 'receiver', 'download')).toMatchObject({ state: 'failed', visible: true })
+        stop()
+    })
     it('prioritizes the actual selected character when switching to full policy', async () => {
         mock.begin.mockResolvedValue({ dispose: vi.fn(async () => {}), progress: vi.fn() })
         mock.invoke.mockResolvedValue(status)

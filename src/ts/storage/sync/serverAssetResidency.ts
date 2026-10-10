@@ -102,14 +102,18 @@ export const setAssetResidencyPolicy = (policy: AssetResidencyPolicy) =>
   policy === "full"
     ? protectedCommand("server_sync_asset_policy", { policy, selectedCharacterId: selectedCharacterId() })
     : command("server_sync_asset_policy", { policy });
-/** Downloads the bodies one external connection holds, or every holder's, keeping the policy. */
-export const downloadRemoteAssets = async (connectionId?: string, options?: { signal?: AbortSignal; target?: AssetResidencyTarget }) => {
+/** Downloads connection-exclusive bodies, every holder's bodies, or files absent from a target. */
+export const downloadRemoteAssets = async (connectionId?: string, options?: { signal?: AbortSignal; target?: AssetResidencyTarget; showEmpty?: boolean; progressConnectionId?: string }) => {
   const operationId = crypto.randomUUID();
-  const externalId = connectionId ?? (options?.target?.kind === 'external' ? options.target.connectionId : undefined);
-  const run = externalId ? beginExternalProgress(externalId, 'download') : undefined;
+  const externalId = connectionId ?? (options?.target?.kind === 'external' ? options.target.connectionId : options?.progressConnectionId);
+  const run = externalId ? beginExternalProgress(externalId, 'download', options?.showEmpty ?? true) : undefined;
+  let hasItems = false;
   const progress = run ? new Channel<{ completedItems: number; totalItems: number }>() : undefined;
   if (progress) progress.onmessage = value => {
-    if (count(value.completedItems) && count(value.totalItems) && value.completedItems <= value.totalItems) run?.items(value.completedItems, value.totalItems);
+    if (count(value.completedItems) && count(value.totalItems) && value.completedItems <= value.totalItems) {
+      hasItems ||= value.totalItems > 0;
+      if (value.totalItems > 0 || options?.showEmpty !== false) run?.items(value.completedItems, value.totalItems);
+    }
   };
   try {
     const result = await protectedCommand("asset_residency_download_remote", {
@@ -119,7 +123,7 @@ export const downloadRemoteAssets = async (connectionId?: string, options?: { si
       ...(options?.target ? { target: options.target } : {}),
       ...(progress ? { progress, transferProgress: run!.networkChannel() } : {}),
     }, options?.signal, operationId);
-    run?.finish('complete');
+    run?.finish('complete', hasItems || options?.showEmpty !== false);
     return result;
   } catch (error) { run?.finish(externalProgressFailure(error)); throw error; }
 };
