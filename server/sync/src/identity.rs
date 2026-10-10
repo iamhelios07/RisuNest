@@ -3,7 +3,9 @@ use crate::{Error, Result};
 pub fn new_uuid() -> Result<String> {
     let mut bytes = [0; 16];
     getrandom::getrandom(&mut bytes).map_err(|_| Error::new("entropy-unavailable", 503))?;
-    Ok(uuid::Builder::from_random_bytes(bytes).into_uuid().to_string())
+    Ok(uuid::Builder::from_random_bytes(bytes)
+        .into_uuid()
+        .to_string())
 }
 
 pub fn is_uuid_v4(value: &str) -> bool {

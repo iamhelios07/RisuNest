@@ -153,6 +153,24 @@ fn source(run:&str)->Result<source_process::SourceProcess,String> {
         &environment("LWW_SOURCE_FINGERPRINT")?,&environment("LWW_SOURCE_BINARY_SHA")?,run)
 }
 
+const RENDERER_DEVICE_REQUESTS:[(&str,&str,&str);2]=[
+    ("windows-registration.uri","synthetic-renderer-windows","72000000-0000-4000-8000-000000000000"),
+    ("android-registration.uri","synthetic-renderer-android","73000000-0000-4000-8000-000000000000"),
+];
+
+#[test]
+fn renderer_peer_registration_requests_are_accepted_by_sync() {
+    let root=tempfile::tempdir().unwrap();
+    let store=risunest_sync_server::store::Store::init(root.path()).unwrap();
+    let mut devices=BTreeSet::new();
+    for (_,name,request) in RENDERER_DEVICE_REQUESTS {
+        let uri=store.issue_named_registration(name,request,Some("http://127.0.0.1:8080")).unwrap();
+        let registration=risunest_sync_connect::Registration::parse_uri(&uri).unwrap();
+        assert!(devices.insert(registration.device_id));
+    }
+    assert_eq!(store.managed_devices().unwrap().len(),RENDERER_DEVICE_REQUESTS.len());
+}
+
 pub(super) fn renderer_setup()->Result<(),String> {
     if environment("RISUNEST_LWW_FINAL_STAGE")?!="authorized-synthetic" {return Err("renderer setup gate is closed".into());}
     let checkpoint=environment("RISUNEST_LWW_FINAL_CHECKPOINT")?;
@@ -196,9 +214,10 @@ pub(super) fn renderer_setup()->Result<(),String> {
         if acknowledged==0 || submitted<initial["units"].as_u64().ok_or("actual initial unit count missing")? {
             return Err("renderer source lacks acknowledged complete producer publication".into());
         }
-        let registrations=[("producer-registration.uri",config.encode_uri().map_err(|_|"producer URI encoding failed")?),
-            ("windows-registration.uri",child.register("synthetic-renderer-windows",&"72".repeat(32))?.uri),
-            ("android-registration.uri",child.register("synthetic-renderer-android",&"73".repeat(32))?.uri)];
+        let mut registrations=vec![("producer-registration.uri",config.encode_uri().map_err(|_|"producer URI encoding failed")?)];
+        for (file,name,request) in RENDERER_DEVICE_REQUESTS {
+            registrations.push((file,child.register(name,request)?.uri));
+        }
         for (name,uri) in registrations {
             use std::io::Write;
             let mut file=std::fs::OpenOptions::new().create_new(true).write(true).open(output.join(name)).map_err(|e|e.to_string())?;

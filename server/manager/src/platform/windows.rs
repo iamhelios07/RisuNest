@@ -406,9 +406,17 @@ mod tests {
         let prefix = helper_task_prefix(root);
         let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
         assert!(valid_helper_task(root, &format!("{prefix}{id}")));
-        assert!(!valid_helper_task(Path::new("other-instance"), &format!("{prefix}{id}")));
-        for invalid in [id.to_uppercase(), id.replace("-4aaa-", "-7aaa-"),
-            id.replace("-8aaa-", "-0aaa-"), format!("{id}\n"), "a".repeat(64)] {
+        assert!(!valid_helper_task(
+            Path::new("other-instance"),
+            &format!("{prefix}{id}")
+        ));
+        for invalid in [
+            id.to_uppercase(),
+            id.replace("-4aaa-", "-7aaa-"),
+            id.replace("-8aaa-", "-0aaa-"),
+            format!("{id}\n"),
+            "a".repeat(64),
+        ] {
             assert!(!valid_helper_task(root, &format!("{prefix}{invalid}")));
         }
     }

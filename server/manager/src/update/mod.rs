@@ -1225,8 +1225,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let nonce = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_owned();
         assert!(installer_guard_path(root.path(), &nonce, "ready").is_ok());
-        for invalid in [format!("{nonce}\r\n"), nonce.to_uppercase(), "a".repeat(64),
-            nonce.replace("-4aaa-", "-7aaa-"), nonce.replace("-8aaa-", "-0aaa-")] {
+        for invalid in [
+            format!("{nonce}\r\n"),
+            nonce.to_uppercase(),
+            "a".repeat(64),
+            nonce.replace("-4aaa-", "-7aaa-"),
+            nonce.replace("-8aaa-", "-0aaa-"),
+        ] {
             assert_eq!(
                 installer_guard_path(root.path(), &invalid, "ready").unwrap_err(),
                 "installer-guard-invalid"
