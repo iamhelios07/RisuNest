@@ -1142,7 +1142,7 @@ mod tests {
         assert!(root.exists());
         send_command(
             &mut input,
-            json!({"op":"register","requestId":"registration","name":"Synthetic protocol device","registrationRequestId":"a".repeat(64)}),
+            json!({"op":"register","requestId":"registration","name":"Synthetic protocol device","registrationRequestId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}),
         );
         let registration = receive.recv_timeout(DRAIN_LIMIT).unwrap();
         assert_eq!(registration["type"], "registration");

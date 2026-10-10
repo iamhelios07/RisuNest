@@ -183,7 +183,7 @@ pub(super) fn renderer_setup()->Result<(),String> {
     if shutdown_file.exists() {return Err("renderer setup shutdown sentinel already exists".into());}
     let mut child=source(&format!("renderer-{}",uuid::Uuid::new_v4()))?;
     let setup=(||->Result<(),String> {
-        let producer=native_bootstrap::source_client(&mut child,&store,"synthetic-renderer-producer",&"71".repeat(32),false)?;
+        let producer=native_bootstrap::source_client(&mut child,&store,"synthetic-renderer-producer","71000000-0000-4000-8000-000000000000",false)?;
         let config=producer.client.config();
         bind(&mut store,SyncTarget::Server(config.endpoint.clone()),&config.endpoint,&config.library_id);
         let initial=queue_initial_producer(&mut store,&certificate,certificate.assets.len())?;
@@ -475,7 +475,7 @@ fn costly_server(output:&Path,producer:&mut PersistentStore,server:LocalServerFi
                 },
                 "server-sync-first-binding"=>{
                     let mut child=source(&format!("final-{label}"))?;
-                    let sender=native_bootstrap::source_client(&mut child,producer,"synthetic-final-producer",&hex::encode(sha2::Sha256::digest(label.as_bytes())),false)?;
+                    let sender=native_bootstrap::source_client(&mut child,producer,"synthetic-final-producer",&uuid::Uuid::new_v4().to_string(),false)?;
                     let config=sender.client.config();
                     bind(producer,SyncTarget::Server(config.endpoint.clone()),&config.endpoint,&config.library_id);
                     let initial=queue_initial_producer(producer,certificate,hashes.len())?;
@@ -486,7 +486,7 @@ fn costly_server(output:&Path,producer:&mut PersistentStore,server:LocalServerFi
                     let roles=observed.body_objects.iter().map(|(hash,object)|(hash.clone(),object.purposes.iter().cloned().collect()))
                         .collect::<BTreeMap<String,BTreeSet<String>>>();
                     let candidate=native_bootstrap::source_client(&mut child,&destination,"synthetic-final-destination",
-                        &hex::encode(sha2::Sha256::digest(format!("destination-{label}").as_bytes())),true)?;
+                        &uuid::Uuid::new_v4().to_string(),true)?;
                     if scenario==Scenario::DuringAssetTransfer {
                         let hash=delta.as_ref().ok_or("excluded large Asset delta absent")?["payloadHash"].as_str().ok_or("large Asset delta hash absent")?;
                         let mut roles=roles;roles.entry(hash.into()).or_default().insert("Asset".into());
