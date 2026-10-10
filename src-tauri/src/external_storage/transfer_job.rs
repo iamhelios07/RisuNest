@@ -362,11 +362,12 @@ pub(crate) async fn upload_wave(
         }
         let mut active = FuturesUnordered::new();
         let mut failure = None;
+        let mut failed = Vec::new();
         loop {
             if failure.is_none() {
                 if let Err(error) = cancel.check() { failure = Some(error); }
             }
-            while failure.is_none() && active.len() < limit {
+            while failure.is_none() && failed.is_empty() && active.len() < limit {
                 let Some((ordinal, body)) = ready.pop_front() else { break; };
                 active.push(async move {
                     let outcome = provider.create_object(repository, &body.intent, &body.source,
@@ -375,10 +376,24 @@ pub(crate) async fn upload_wave(
                 });
             }
             let Some((ordinal, body, outcome)) = active.next().await else { break; };
-            // Every active sibling is settled even after another body fails.
-            match settle_upload(journal, body, outcome, provider, repository, cancel).await {
-                Ok(receipt) => receipts[ordinal] = Some(receipt),
-                Err(error) => { if failure.is_none() { failure = Some(error); } }
+            match outcome {
+                Ok(receipt) => {
+                    match settle_upload(journal, body, Ok(receipt), provider, repository, cancel).await {
+                        Ok(receipt) => receipts[ordinal] = Some(receipt),
+                        Err(error) => { if failure.is_none() { failure = Some(error); } }
+                    }
+                }
+                Err(error) => failed.push((ordinal, body, error)),
+            }
+            // Recovery may read a body through the shared limiter. Drain all
+            // active uploads first so unpolled siblings cannot retain its slots.
+            if active.is_empty() {
+                for (ordinal, body, error) in failed.drain(..) {
+                    match settle_upload(journal, body, Err(error), provider, repository, cancel).await {
+                        Ok(receipt) => receipts[ordinal] = Some(receipt),
+                        Err(error) => { if failure.is_none() { failure = Some(error); } }
+                    }
+                }
             }
         }
         if let Some(error) = failure { return Err(error); }

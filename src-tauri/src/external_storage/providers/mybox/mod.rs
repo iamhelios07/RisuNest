@@ -126,7 +126,7 @@ impl Context {
         } else {
             listed.files.extend(files);
         }
-        listed.complete = complete;
+        listed.complete |= complete;
         if changed {
             listed.generation += 1;
         }

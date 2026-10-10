@@ -2075,9 +2075,6 @@ mod tests {
         store.put(&holder).unwrap();
         assert!(spool_budget_owner(root.path(), &store, &waiting).unwrap().is_none());
     }
-    /// A producing job starts only when the spool the other jobs hold leaves
-    /// room for every pack its first wave seals, so a full spool makes it wait
-    /// before it starts instead of refusing it partway through.
     #[test]
     fn retained_lww_and_job_spools_share_admission_and_start_headroom() {
         let root = tempfile::tempdir().unwrap();
@@ -2110,6 +2107,9 @@ mod tests {
         assert!(spool_budget(root.path(), "synthetic-lww").try_reserve(limit).unwrap().is_some());
     }
 
+    /// A producing job starts only when the spool the other jobs hold leaves
+    /// room for every pack its first wave seals, so a full spool makes it wait
+    /// before it starts instead of refusing it partway through.
     #[test]
     fn a_producing_job_waits_to_start_until_its_first_wave_fits() {
         use super::super::journal::{SpoolBudget, TRANSFER_SPOOL_BUDGET};

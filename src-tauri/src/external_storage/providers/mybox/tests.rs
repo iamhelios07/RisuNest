@@ -1390,6 +1390,48 @@ fn upload_confirmation_uses_verified_newest_first_entries() {
 }
 
 #[test]
+fn partial_upload_confirmations_preserve_a_complete_multipage_cache() {
+    runtime().block_on(async {
+        let existing: Vec<String> = (0..=PAGE_SIZE).map(|index| {
+            resource(&format!("old-{index:04}.bin"), &format!("old-{index:04}"), "file", 4)
+        }).collect();
+        let mut replies = open_replies(1024, 4096, 0);
+        replies.push(json(200, &listing(&existing[..PAGE_SIZE as usize], Some("last-page"))));
+        replies.push(json(200, &listing(&existing[PAGE_SIZE as usize..], None)));
+        for name in ["new-a", "new-b"] {
+            let mut newest = vec![resource(&format!("{name}.bin"), name, "file", 5)];
+            newest.extend_from_slice(&existing[..PAGE_SIZE as usize - 1]);
+            replies.push(json(200, &listing(&newest, Some("older"))));
+        }
+        let api = WireServer::start(replies);
+        let provider = Mybox { deps: fixture().dependencies };
+        let cancel = Cancellation::default();
+        let (repository, _) = provider.open_repository(&settings(&api), &secret(), OpenMode::Existing, &cancel).await.unwrap();
+        let context = provider.context(&repository).unwrap();
+        assert!(provider.lookup(context, "packs", "new-a.bin", &cancel).await.unwrap().is_none());
+        assert_eq!(api.requests.lock().unwrap().len(), 6);
+
+        for (name, next) in [("new-a", "new-b"), ("new-b", "new-c")] {
+            let confirmed = provider.confirm(context, "packs", &format!("{name}.bin"), &cancel).await.unwrap().unwrap();
+            assert_eq!(confirmed.id, name);
+            assert_eq!(confirmed.size, 5);
+            assert!(context.cached("packs", &format!("{next}.bin")).unwrap().is_none(),
+                "a partial confirmation must retain the complete listing's negative answers");
+            assert!(provider.lookup(context, "packs", &format!("{next}.bin"), &cancel).await.unwrap().is_none());
+            let older = provider.lookup(context, "packs", "old-1000.bin", &cancel).await.unwrap().unwrap();
+            assert_eq!(older.id, "old-1000");
+        }
+        assert_eq!(context.cached("packs", "new-a.bin").unwrap().unwrap().id, "new-a");
+        let requests = api.requests.lock().unwrap();
+        assert_eq!(requests.len(), 8, "only the initial two pages and each newest-first confirmation are needed");
+        assert!(requests[5].headers.lines().next().unwrap().contains("cursor=last-page"));
+        for request in &requests[6..] {
+            assert!(request.headers.lines().next().unwrap().contains("sort=createdAt%2Cdesc"));
+        }
+    });
+}
+
+#[test]
 fn concurrent_listing_changes_preserve_additions_and_removals_in_both_paths() {
     use crate::external_storage::http::{HttpTransport, NativeHttpTransport};
     use std::sync::atomic::{AtomicUsize, Ordering};

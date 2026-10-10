@@ -1095,40 +1095,40 @@ impl ExternalLwwEngine {
             for index in next_body..end {
                 cancel.check()?;
                 if publication.bodies[index].complete { continue; }
-            let job = publication.asset_job.clone().ok_or_else(segment::corrupt)?;
-            let path = sealed_body_path(store.repository_root(), &job.job_id, &publication.bodies[index].object_id);
-            if publication.bodies[index].sha256.is_empty() {
-                let body = &publication.bodies[index];
-                let asset = publication.assets.iter().find(|asset| asset.content_hash == body.content_hash)
-                    .ok_or_else(segment::corrupt)?;
-                let (byte_length, sha256) = self.seal_frozen_standalone(store, asset, &job, &body.object_id, publication.authority, &path, cancel).await?;
-                publication.bodies[index].sha256 = sha256;
-                publication.bodies[index].byte_length = byte_length;
-                store.external_lww_persist(&publication, &sealed).map_err(store_error)?;
-            }
-            let body = publication.bodies[index].clone();
-            let source = super::transfer::SpoolSource::verified(&path, body.byte_length, &body.sha256)?;
-            let intent = ObjectIntent {
-                job_id: self.library.clone(),
-                repository_id: self.repository.repository_id.clone(),
-                object_id: body.object_id.clone(),
-                role: ObjectRole::Pack,
-                byte_length: body.byte_length,
-                sha256: body.sha256.clone(),
-            };
-            let mut finished = None;
-            {
-                let saved = publication.bodies[index].resume.as_ref().map(Self::resume);
-                match self.provider.reconcile_upload(&self.repository, &intent, saved.as_ref(), cancel).await? {
-                    UploadResolution::Complete(receipt) => finished = Some(receipt),
-                    UploadResolution::Resumable(state) => publication.bodies[index].resume = Some(Self::saved(state)),
-                    UploadResolution::RestartRequired => publication.bodies[index].resume = None,
-                    UploadResolution::Conflict => return Err(segment::corrupt()),
+                let job = publication.asset_job.clone().ok_or_else(segment::corrupt)?;
+                let path = sealed_body_path(store.repository_root(), &job.job_id, &publication.bodies[index].object_id);
+                if publication.bodies[index].sha256.is_empty() {
+                    let body = &publication.bodies[index];
+                    let asset = publication.assets.iter().find(|asset| asset.content_hash == body.content_hash)
+                        .ok_or_else(segment::corrupt)?;
+                    let (byte_length, sha256) = self.seal_frozen_standalone(store, asset, &job, &body.object_id, publication.authority, &path, cancel).await?;
+                    publication.bodies[index].sha256 = sha256;
+                    publication.bodies[index].byte_length = byte_length;
+                    store.external_lww_persist(&publication, &sealed).map_err(store_error)?;
                 }
-                store
-                    .external_lww_persist(&publication, &sealed)
-                    .map_err(store_error)?;
-            }
+                let body = publication.bodies[index].clone();
+                let source = super::transfer::SpoolSource::verified(&path, body.byte_length, &body.sha256)?;
+                let intent = ObjectIntent {
+                    job_id: self.library.clone(),
+                    repository_id: self.repository.repository_id.clone(),
+                    object_id: body.object_id.clone(),
+                    role: ObjectRole::Pack,
+                    byte_length: body.byte_length,
+                    sha256: body.sha256.clone(),
+                };
+                let mut finished = None;
+                {
+                    let saved = publication.bodies[index].resume.as_ref().map(Self::resume);
+                    match self.provider.reconcile_upload(&self.repository, &intent, saved.as_ref(), cancel).await? {
+                        UploadResolution::Complete(receipt) => finished = Some(receipt),
+                        UploadResolution::Resumable(state) => publication.bodies[index].resume = Some(Self::saved(state)),
+                        UploadResolution::RestartRequired => publication.bodies[index].resume = None,
+                        UploadResolution::Conflict => return Err(segment::corrupt()),
+                    }
+                    store
+                        .external_lww_persist(&publication, &sealed)
+                        .map_err(store_error)?;
+                }
                 if let Some(receipt) = finished {
                     Self::validate_receipt(&intent, &receipt)?;
                     publication.bodies[index].locator = Some(receipt.locator);

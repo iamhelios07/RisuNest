@@ -7895,7 +7895,7 @@ mod tests {
     /// One globally available family still permits progress because sealed
     /// ciphertext releases its family before waiting for remote completion.
     #[test]
-    fn c_a_job_left_one_family_sends_each_pack_before_building_the_next() {
+    fn c_a_job_left_one_family_completes_with_one_preparation_at_a_time() {
         runtime().block_on(async {
             const RECORDS: usize = 8;
             let root = tempfile::tempdir().unwrap();

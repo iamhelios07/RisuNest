@@ -8,11 +8,12 @@ pub(crate) struct GateProvider {
     entered: tokio::sync::mpsc::UnboundedSender<String>,
     gates: std::sync::Mutex<std::collections::BTreeMap<String, std::sync::Arc<tokio::sync::Semaphore>>>,
     pub(crate) fail: std::sync::Mutex<Option<String>>,
+    fail_kind: ErrorKind,
 }
 impl GateProvider {
     pub(crate) fn new() -> (Self, tokio::sync::mpsc::UnboundedReceiver<String>) {
         let (entered, receiver) = tokio::sync::mpsc::unbounded_channel();
-        (Self { inner: std::sync::Arc::new(FakeProvider::new(false)), minimum_bytes: 0, entered, gates: Default::default(), fail: Default::default() }, receiver)
+        (Self { inner: std::sync::Arc::new(FakeProvider::new(false)), minimum_bytes: 0, entered, gates: Default::default(), fail: Default::default(), fail_kind: ErrorKind::RateLimited }, receiver)
     }
     pub(crate) fn release(&self, object: &str) {
         self.gates.lock().unwrap().get(object).unwrap().add_permits(1);
@@ -61,7 +62,7 @@ impl GateProvider {
                             _ = cancel.cancelled() => return Err(ProviderError::new(ErrorKind::Cancelled)),
                         }
                         if self.fail.lock().unwrap().as_deref() == Some(&intent.object_id) {
-                            return Err(ProviderError::new(ErrorKind::RateLimited));
+                            return Err(ProviderError::new(self.fail_kind));
                         }
                     }
                     Ok(receipt)
@@ -165,5 +166,65 @@ fn concurrent_wave_refills_and_settles_siblings_before_returning_error() {
         upload(&mut journal, &members[0].object_id, &provider, &repository, &cancel).await.unwrap();
         assert_eq!(provider.inner.upload_attempts(&members[0].object_id), 1);
         assert!(journal.record(&members[0].object_id).unwrap().unwrap().released);
+    });
+}
+
+#[test]
+fn lowered_limit_drains_uploads_before_recovery_reads_and_resumes_ready_members() {
+    use crate::external_storage::{transfer_factory_tests, transfer_limit};
+    runtime().block_on(async {
+        let root = tempfile::tempdir().unwrap();
+        let (mut journal, members) = prepare_wave(&root.path().join("job"), 6);
+        transfer_factory_tests::save(root.path(), "connection",
+            Descriptor::new("format-repository".into(), None).unwrap(), fake::locator());
+        let (mut gate, mut entered) = GateProvider::new();
+        gate.fail_kind = ErrorKind::Transient;
+        let gate = std::sync::Arc::new(gate);
+        let provider = transfer_limit::wrap(root.path(), "connection", gate.clone()).unwrap();
+        let repository = fake::repository();
+        let cancel = Cancellation::default();
+        let receipts = {
+            let wave = upload_wave(&mut journal, &members, "format-repository", &[8; 32],
+                provider.as_ref(), &repository, &cancel);
+            tokio::pin!(wave);
+            let first = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                let mut first = Vec::new();
+                while first.len() < 4 {
+                    tokio::select! {
+                        result = &mut wave => panic!("wave ended before four active bodies: {result:?}"),
+                        object = entered.recv() => first.push(object.unwrap()),
+                    }
+                }
+                first
+            }).await.unwrap();
+            transfer_limit::set_limit(root.path(), "connection", 1).unwrap();
+            *gate.fail.lock().unwrap() = Some(first[0].clone());
+            gate.release(&first[0]);
+            assert!(matches!(futures::poll!(wave.as_mut()), std::task::Poll::Pending));
+            assert_eq!(gate.inner.read_attempts(&first[0]), 0);
+            for object in &first[1..] { gate.release(object); }
+            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                tokio::join!(wave.as_mut(), async {
+                    for member in &members[4..] {
+                        let object = entered.recv().await.unwrap();
+                        assert_eq!(object, member.object_id);
+                        assert!(entered.try_recv().is_err());
+                        gate.release(&object);
+                    }
+                })
+            }).await.expect("failed upload recovery retained unpolled sibling slots");
+            assert_eq!(gate.inner.read_attempts(&first[0]), 1);
+            result.unwrap()
+        };
+        drop(journal);
+        let journal = TransferJournal::open(&root.path().join("job"), identity()).unwrap();
+        for (member, receipt) in members.iter().zip(receipts) {
+            assert_eq!(receipt.locator.object, member.object_id);
+            assert_eq!(gate.inner.upload_attempts(&member.object_id), 1);
+            let row = journal.record(&member.object_id).unwrap().unwrap();
+            assert!(row.released);
+            assert_eq!(row.receipt.unwrap().locator.object, member.object_id);
+            assert!(!journal.spool_path(&member.object_id).exists());
+        }
     });
 }

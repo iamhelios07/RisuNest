@@ -876,7 +876,9 @@ impl TransferJournal {
         if page_object.is_empty() || members.is_empty() {
             return Err(corrupt());
         }
-        let transaction = self.db.unchecked_transaction().map_err(storage)?;
+        let transaction = self.db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(storage)?;
         for member in members {
             let row: Option<(Option<String>, Option<i64>, Option<String>)> = transaction
                 .query_row(
@@ -1256,6 +1258,44 @@ mod tests {
         journal.register(&intent).unwrap();
         drop(journal);
         (root, store, identity, directory)
+    }
+
+    #[test]
+    fn cover_waits_for_the_preparation_writer_before_reading_members() {
+        thread_local! {
+            static WAITING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+        }
+        fn wait_for_writer(attempt: i32) -> bool {
+            WAITING.with(|waiting| {
+                if let Some(waiting) = waiting.borrow_mut().take() { let _ = waiting.send(()); }
+            });
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            attempt < 5_000
+        }
+        let (_root, _store, identity, directory) = fixture();
+        let mut journal = TransferJournal::open(&directory, identity).unwrap();
+        let writer = journal.preparation_handle(Arc::new(std::sync::atomic::AtomicUsize::new(0))).unwrap();
+        let member = WaveMember {
+            object_id: "pack".into(), plaintext_length: 5, plaintext_sha256: "a".repeat(64),
+        };
+        writer.db.execute_batch("BEGIN IMMEDIATE; UPDATE objects SET attempted=1 WHERE id='pack';").unwrap();
+        let (waiting, contended) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            WAITING.with(|slot| *slot.borrow_mut() = Some(waiting));
+            journal.db.busy_handler(Some(wait_for_writer)).unwrap();
+            let result = journal.cover("inventory-page", &[member]);
+            (journal, result)
+        });
+        let waited = contended.recv_timeout(std::time::Duration::from_secs(10));
+        writer.db.execute_batch("COMMIT").unwrap();
+        let (journal, result) = worker.join().unwrap();
+        waited.expect("coverage must wait without first retaining a read lock");
+        result.unwrap();
+        let row = journal.record("pack").unwrap().unwrap();
+        assert!(row.attempted);
+        assert_eq!(journal.covered_by("pack").unwrap().as_deref(), Some("inventory-page"));
+        let members = journal.page_members("inventory-page").unwrap();
+        assert_eq!((members[0].1, members[0].2.as_str()), (5, "a".repeat(64).as_str()));
     }
 
     #[test]
