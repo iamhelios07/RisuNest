@@ -64,7 +64,19 @@ pub(super) fn direct_objects<'a>(
 }
 
 pub(crate) fn summarize(root: &Path, connection_id: &str) -> Result<StorageUsage> {
-    ConnectionStore::open(root)?.storage_usage(connection_id)
+    let store = ConnectionStore::open(root)?;
+    let connection = store.read(connection_id)?;
+    let mut receipts = super::lww_residency::usage_receipts(root, &connection)?;
+    for (directory, repository_id) in [
+        (root.join("external-storage").join("package-cache").join(connection_id), &connection.provider_repository_id),
+        (super::runtime::connection_directory(root, connection_id).join("package-cache"), &connection.descriptor.repository_id),
+    ] {
+        receipts.extend(super::package_cache::cached_remote_objects(
+            &directory, repository_id, &connection.descriptor_locator.connection_identity,
+        )?.into_iter().map(|object| object.receipt));
+    }
+    store.remember_known_usage(connection_id, &receipts)?;
+    store.storage_usage(connection_id)
 }
 
 pub(super) fn remember_snapshot(
@@ -222,18 +234,18 @@ mod tests {
         id: &str,
         role: ObjectRole,
     ) -> RemoteObject {
+        sized_object(repository, id, role, 1)
+    }
+
+    fn sized_object(repository: &RepositoryHandle, id: &str, role: ObjectRole, length: u64) -> RemoteObject {
         let mut locator = fake::locator();
         locator.object = id.into();
-        let wire_role = match role {
-            ObjectRole::SyncState => risunest_external_storage_format::snapshot::ObjectRole::SyncState,
-            ObjectRole::Catalog => risunest_external_storage_format::snapshot::ObjectRole::Catalog,
-            _ => unreachable!(),
-        };
+        let wire_role = super::super::packaging::wire_role(role).unwrap();
         let header = risunest_external_storage_format::snapshot::PublicObjectHeader::new(
             repository.repository_id.clone(),
             id.into(),
             wire_role,
-            1,
+            length,
         )
         .unwrap();
         let bytes = risunest_external_storage_format::snapshot::envelope_length(&header).unwrap();
@@ -249,7 +261,7 @@ mod tests {
                 complete: true,
             },
             ciphertext_sha256: "11".repeat(32),
-            plaintext_length: 1,
+            plaintext_length: length,
             plaintext_sha256: "22".repeat(32),
         }
     }
@@ -265,6 +277,102 @@ mod tests {
     fn totals(root: &Path, id: &str) -> (u64, u64) {
         let usage = summarize(root, id).unwrap();
         (usage.locally_uploaded_objects_lower_bound, usage.locally_uploaded_bytes_lower_bound)
+    }
+
+    #[test]
+    fn usage_includes_existing_sync_backup_and_residency_files_without_retransferring() {
+        use super::super::{lww_residency, package_cache::PackageCache, runtime};
+        let root = tempfile::tempdir().unwrap();
+        saved(root.path(), "connection");
+        let store = ConnectionStore::open(root.path()).unwrap();
+        let stored = store.read("connection").unwrap();
+        let repository = fake::repository();
+        let sync_cache = PackageCache::open(&root.path().join("external-storage/package-cache/connection")).unwrap();
+        let backup_cache = PackageCache::open(&runtime::connection_directory(root.path(), "connection").join("package-cache")).unwrap();
+        let mut objects = (0..64).map(|index| sized_object(&repository, &format!("pack-{index}"), ObjectRole::Pack, 16 * 1024 * 1024)).collect::<Vec<_>>();
+        let catalog = object(&repository, "asset-catalog", ObjectRole::Catalog);
+        objects.push(catalog.clone());
+        sync_cache.put_objects(&repository, &objects).unwrap();
+        let mut format_repository = fake::repository();
+        format_repository.repository_id = stored.descriptor.repository_id.clone();
+        let backup = object(&format_repository, "backup-catalog", ObjectRole::Catalog);
+        backup_cache.put_object(&repository, &backup).unwrap();
+        // The same physical pack may be retained in both cache namespaces.
+        let duplicate = sized_object(&format_repository, "pack-0", ObjectRole::Pack, 16 * 1024 * 1024);
+        backup_cache.put_object(&repository, &duplicate).unwrap();
+        format_repository.repository_id = "another-library".into();
+        let foreign = object(&format_repository, "foreign", ObjectRole::Catalog);
+        backup_cache.put_object(&repository, &foreign).unwrap();
+
+        let registry_pack = sized_object(&repository, "registry-pack", ObjectRole::Pack, 1024);
+        let source = lww_residency::PackedSource {
+            hash: "11".repeat(32), byte_length: 1, library_id: stored.descriptor.repository_id.clone(),
+            connection_id: stored.id.clone(), connection_root: root.path().into(), protected_snapshot: "segment".into(),
+            catalog: catalog.stored(&repository).unwrap(), chunks: Vec::new(),
+            packs: vec![objects[0].stored(&repository).unwrap(), registry_pack.stored(&repository).unwrap()],
+        };
+        let mut second = source.clone(); second.hash = "22".repeat(32);
+        lww_residency::register_verified_packed_many(root.path(), [&source, &second]).unwrap();
+        let standalone = lww_residency::Source {
+            hash: "33".repeat(32), library_id: stored.descriptor.repository_id.clone(), connection_id: stored.id.clone(),
+            connection_root: root.path().into(), protected_segment: "segment".into(),
+            body: super::super::lww_segment::LargeBody {
+                object_id: "standalone".into(), sha256: "44".repeat(32), byte_length: (24u64 * 1024 * 1024).into(),
+                plaintext_byte_length: 1u64.into(), locator: Some(RemoteLocator { object: "standalone".into(), ..fake::locator() }),
+            },
+        };
+        lww_residency::register(root.path(), &standalone).unwrap();
+        let mut foreign_source = standalone.clone();
+        foreign_source.hash = "55".repeat(32); foreign_source.connection_id = "other-connection".into();
+        foreign_source.body.locator.as_mut().unwrap().object = "foreign-standalone".into();
+        lww_residency::register(root.path(), &foreign_source).unwrap();
+        let observed = (0..7).map(|index| ObjectReceipt {
+            locator: RemoteLocator { object: format!("observed-{index}"), ..fake::locator() },
+            byte_length: 4 * 1024 * 1024, version: None, checksum: None, complete: true,
+        }).collect::<Vec<_>>();
+        store.observe_usage("connection", &repository, &observed, None).unwrap();
+        let before = store.storage_usage("connection").unwrap();
+        assert_eq!((before.locally_uploaded_objects_lower_bound, before.locally_uploaded_bytes_lower_bound), (7, 28 * 1024 * 1024));
+        let expected_bytes = objects.iter().map(|object| object.receipt.byte_length).sum::<u64>()
+            + backup.receipt.byte_length + registry_pack.receipt.byte_length + standalone.body.byte_length.0 + 28 * 1024 * 1024;
+        assert!(expected_bytes > 1024 * 1024 * 1024);
+        assert_eq!(totals(root.path(), "connection"), (75, expected_bytes));
+        let observed_at = summarize(root.path(), "connection").unwrap().observed_at_ms;
+        assert_eq!(totals(root.path(), "connection"), (75, expected_bytes));
+        assert_eq!(summarize(root.path(), "connection").unwrap().observed_at_ms, observed_at);
+
+        // Older local references must not resurrect a confirmed deletion.
+        store.observe_usage("connection", &repository, &[], Some(&objects[0].receipt.locator)).unwrap();
+        assert_eq!(totals(root.path(), "connection"), (74, expected_bytes - objects[0].receipt.byte_length));
+        store.observe_usage("connection", &repository, &[objects[0].receipt.clone()], None).unwrap();
+        assert_eq!(totals(root.path(), "connection"), (75, expected_bytes));
+    }
+
+    #[test]
+    fn cached_files_are_visible_before_a_new_sync_and_newer_observations_win() {
+        let root = tempfile::tempdir().unwrap();
+        saved(root.path(), "connection");
+        let repository = fake::repository();
+        let cache = super::super::package_cache::PackageCache::open(&root.path().join("external-storage/package-cache/connection")).unwrap();
+        let original = object(&repository, "cached", ObjectRole::Catalog);
+        cache.put_object(&repository, &original).unwrap();
+        let before = summarize(root.path(), "connection").unwrap();
+        assert_eq!(before.locally_uploaded_objects_lower_bound, 1);
+        assert_eq!(before.locally_uploaded_bytes_lower_bound, original.receipt.byte_length);
+        assert_eq!(before.observed_at_ms, Some(1));
+        let store = ConnectionStore::open(root.path()).unwrap();
+        let mut updated = original.receipt.clone();
+        updated.byte_length += 100;
+        store.observe_usage("connection", &repository, &[updated.clone()], None).unwrap();
+        assert_eq!(totals(root.path(), "connection"), (1, updated.byte_length));
+
+        let removed = object(&repository, "removed-before-query", ObjectRole::Catalog);
+        cache.put_object(&repository, &removed).unwrap();
+        store.observe_usage("connection", &repository, &[], Some(&removed.receipt.locator)).unwrap();
+        assert_eq!(totals(root.path(), "connection"), (1, updated.byte_length));
+        // Discarding a reuse cache is not evidence that its remote files were deleted.
+        cache.forget_object(&original.repository_id, &repository, &original.object_id).unwrap();
+        assert_eq!(totals(root.path(), "connection"), (1, updated.byte_length));
     }
 
     #[test]

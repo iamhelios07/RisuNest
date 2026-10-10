@@ -128,6 +128,7 @@ impl ConnectionStore {
             CREATE TABLE IF NOT EXISTS connections(id TEXT PRIMARY KEY,value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS automatic_backup_pauses(connection_id TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS usage_objects(connection_id TEXT NOT NULL,locator TEXT NOT NULL,byte_length TEXT NOT NULL,PRIMARY KEY(connection_id,locator));
+            CREATE TABLE IF NOT EXISTS usage_removed(connection_id TEXT NOT NULL,locator TEXT NOT NULL,PRIMARY KEY(connection_id,locator));
             CREATE TABLE IF NOT EXISTS usage_observations(connection_id TEXT PRIMARY KEY,observed_at_ms INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS usage_snapshots(connection_id TEXT NOT NULL,locator TEXT NOT NULL,created_at_ms INTEGER NOT NULL,value TEXT NOT NULL,PRIMARY KEY(connection_id,locator));
             CREATE TABLE IF NOT EXISTS pending_connections(id TEXT PRIMARY KEY,value TEXT NOT NULL);
@@ -453,7 +454,7 @@ impl ConnectionStore {
             .map_err(storage)?;
         tx.execute("DELETE FROM automatic_backup_pauses WHERE connection_id=?1", [id])
             .map_err(storage)?;
-        for table in ["usage_objects", "usage_observations", "usage_snapshots"] {
+        for table in ["usage_objects", "usage_removed", "usage_observations", "usage_snapshots"] {
             tx.execute(&format!("DELETE FROM {table} WHERE connection_id=?1"), [id]).map_err(storage)?;
         }
         tx.execute("DELETE FROM connections WHERE id=?1", [id])
@@ -506,6 +507,8 @@ impl ConnectionStore {
         let tx = self.0.unchecked_transaction().map_err(storage)?;
         for receipt in receipts.iter().filter(|receipt| receipt.complete) {
             receipt.locator.validate_for(repository)?;
+            tx.execute("DELETE FROM usage_removed WHERE connection_id=?1 AND locator=?2",
+                params![id, serde_json::to_string(&receipt.locator).map_err(storage)?]).map_err(storage)?;
             tx.execute("INSERT INTO usage_objects VALUES(?1,?2,?3) ON CONFLICT(connection_id,locator) DO UPDATE SET byte_length=excluded.byte_length",
                 params![id, serde_json::to_string(&receipt.locator).map_err(storage)?, receipt.byte_length.to_string()]).map_err(storage)?;
         }
@@ -513,12 +516,35 @@ impl ConnectionStore {
             locator.validate_for(repository)?;
             let key = serde_json::to_string(locator).map_err(storage)?;
             tx.execute("DELETE FROM usage_objects WHERE connection_id=?1 AND locator=?2", params![id, key]).map_err(storage)?;
+            tx.execute("INSERT OR IGNORE INTO usage_removed VALUES(?1,?2)", params![id, key]).map_err(storage)?;
             tx.execute("DELETE FROM usage_snapshots WHERE connection_id=?1 AND locator=?2", params![id, key]).map_err(storage)?;
         }
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
             .map_err(storage)?.as_millis().min(i64::MAX as u128) as i64;
         tx.execute("INSERT INTO usage_observations VALUES(?1,?2) ON CONFLICT(connection_id) DO UPDATE SET observed_at_ms=MAX(observed_at_ms,excluded.observed_at_ms)",
             params![id, now]).map_err(storage)?;
+        tx.commit().map_err(storage)
+    }
+
+    pub(super) fn remember_known_usage(&self, id: &str, receipts: &[super::contract::ObjectReceipt]) -> Result<()> {
+        if receipts.is_empty() { return Ok(()); }
+        let current = self.read(id)?;
+        let tx = self.0.unchecked_transaction().map_err(storage)?;
+        let mut added = 0;
+        for receipt in receipts.iter().filter(|receipt| receipt.complete) {
+            if receipt.locator.connection_identity != current.descriptor_locator.connection_identity
+                || receipt.locator.object.is_empty() { return Err(corrupt()); }
+            // Direct observations and confirmed removals take precedence over cached references.
+            added += tx.execute("INSERT INTO usage_objects SELECT ?1,?2,?3
+                WHERE NOT EXISTS(SELECT 1 FROM usage_removed WHERE connection_id=?1 AND locator=?2)
+                ON CONFLICT(connection_id,locator) DO NOTHING",
+                params![id, serde_json::to_string(&receipt.locator).map_err(storage)?, receipt.byte_length.to_string()]).map_err(storage)?;
+        }
+        if added > 0 {
+            let observed = current.verified_at_ms.max(current.last_sync_at_ms.unwrap_or(0)).max(current.last_backup_at_ms.unwrap_or(0));
+            tx.execute("INSERT INTO usage_observations VALUES(?1,?2) ON CONFLICT(connection_id) DO UPDATE SET observed_at_ms=MAX(observed_at_ms,excluded.observed_at_ms)",
+                params![id, observed.min(i64::MAX as u64) as i64]).map_err(storage)?;
+        }
         tx.commit().map_err(storage)
     }
 
