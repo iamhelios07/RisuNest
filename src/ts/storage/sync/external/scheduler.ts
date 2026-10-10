@@ -153,16 +153,21 @@ export function createExternalStorageScheduler(
                     return
                 }
                 const stopRetry = () => { blocked.add(key) }
-                if (result.error?.retryable === false) { stopRetry(); return }
-                const causeKind = externalErrorKind('cause' in result ? result.cause : undefined) ?? result.reason
+                if (result.reason === 'publication-unknown' || result.error?.reason === 'publication-unknown') { stopRetry(); return }
+                const causeKind = result.error?.code ?? externalErrorKind('cause' in result ? result.cause : undefined) ?? result.reason
+                if (result.error?.retryable === false) {
+                    if (!['clockSkew', 'preconditionFailed'].includes(causeKind)) stopRetry()
+                    return
+                }
+                if (!result.error && causeKind === 'clockSkew') return
                 if (!result.error && ['endpointRejected', 'unauthorized', 'reauthRequired',
-                    'repositoryKeyUnavailable', 'deviceVaultUnavailable', 'clockSkew', 'storageFull',
+                    'repositoryKeyUnavailable', 'deviceVaultUnavailable', 'storageFull',
                     'localStorageFull', 'localPermissionDenied', 'unsupported', 'corrupt', 'notFound',
                     'repositoryMismatch'].includes(causeKind)) { stopRetry(); return }
                 if (!result.error && result.reason === 'preconditionFailed') {
                     const count = (refusals.get(key) ?? 0) + 1
                     refusals.set(key, count)
-                    if (count >= 3) { stopRetry(); return }
+                    if (count >= 3) return
                 }
                 if (
                     result.error?.retryable
@@ -173,10 +178,10 @@ export function createExternalStorageScheduler(
                     scheduleNext()
                     return
                 }
-                if (result.error?.action === 'wait' || result.error?.action === 'reauthenticate'
+                if (result.error?.action === 'reauthenticate'
                     || result.error?.action === 'unlock-key'
-                    || result.error?.action === 'free-space'
-                    || result.reason === 'publication-unknown') { stopRetry(); return }
+                    || result.error?.action === 'free-space') { stopRetry(); return }
+                if (result.error?.action === 'wait') return
                 merge(destination, item.revision)
                 scheduleNext()
             }).finally(() => {

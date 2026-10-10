@@ -342,6 +342,74 @@ describe('external storage scheduler', () => {
         scheduler.stop()
     })
 
+    it.each([
+        { kind: 'blocked', reason: 'clockSkew' },
+        { kind: 'blocked', reason: 'clockSkew', error: { code: 'clockSkew', retryable: false, action: 'retry' } },
+        { kind: 'blocked', reason: 'preconditionFailed', error: { code: 'preconditionFailed', retryable: false, action: 'retry' } },
+        { kind: 'blocked', reason: 'repositoryBusy', error: { code: 'repositoryBusy', retryable: true, action: 'wait' } },
+    ])('lets a new save retry $reason without repeating an unchanged attempt', async blocked => {
+        const { scheduler, request } = harness()
+        request.mockResolvedValueOnce(blocked as never)
+        scheduler.durableRevision('1')
+        await vi.advanceTimersByTimeAsync(600_000)
+        expect(request).toHaveBeenCalledTimes(1)
+        scheduler.durableRevision('9')
+        await vi.advanceTimersByTimeAsync(59_999)
+        expect(request).toHaveBeenCalledTimes(1)
+        await vi.advanceTimersByTimeAsync(1)
+        expect(request).toHaveBeenCalledTimes(2)
+        expect(request).toHaveBeenLastCalledWith(expect.objectContaining({ targetRevision: '9' }))
+        scheduler.stop()
+    })
+
+    it('limits precondition retries until a new save arrives', async () => {
+        const { scheduler, request } = harness()
+        request.mockResolvedValue({ kind: 'blocked', reason: 'preconditionFailed' } as never)
+        scheduler.durableRevision('1')
+        await vi.advanceTimersByTimeAsync(600_000)
+        expect(request).toHaveBeenCalledTimes(3)
+        scheduler.durableRevision('9')
+        await vi.advanceTimersByTimeAsync(60_000)
+        expect(request).toHaveBeenCalledTimes(4)
+        expect(request).toHaveBeenLastCalledWith(expect.objectContaining({ targetRevision: '9' }))
+        scheduler.stop()
+    })
+
+    it('retains a newer save when an older request must wait without a deadline', async () => {
+        const { scheduler, request } = harness()
+        let finish!: (value: never) => void
+        request.mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
+        scheduler.durableRevision('1')
+        await vi.advanceTimersByTimeAsync(60_000)
+        scheduler.durableRevision('9')
+        await vi.advanceTimersByTimeAsync(60_000)
+        finish({ kind: 'blocked', reason: 'repositoryBusy', error: {
+            code: 'repositoryBusy', retryable: true, action: 'wait',
+        } } as never)
+        await vi.advanceTimersByTimeAsync(0)
+        expect(request).toHaveBeenCalledTimes(2)
+        expect(request).toHaveBeenLastCalledWith(expect.objectContaining({ targetRevision: '9' }))
+        scheduler.stop()
+    })
+
+    it.each([
+        { reason: 'storageFull' },
+        { reason: 'localPermissionDenied' },
+        { reason: 'corrupt' },
+        { reason: 'repositoryMismatch' },
+        { reason: 'publication-unknown' },
+        { reason: 'publication-unknown', error: { code: 'preconditionFailed', retryable: false, action: 'retry' } },
+    ])('does not retry $reason merely because another save arrives', async blocked => {
+        const { scheduler, request } = harness()
+        request.mockResolvedValueOnce({ kind: 'blocked', ...blocked } as never)
+        scheduler.durableRevision('1')
+        await vi.advanceTimersByTimeAsync(60_000)
+        scheduler.durableRevision('9')
+        await vi.advanceTimersByTimeAsync(600_000)
+        expect(request).toHaveBeenCalledTimes(1)
+        scheduler.stop()
+    })
+
     it('retains the observed retry wait across wall-clock jumps and recovery', async () => {
         vi.setSystemTime(0)
         const { scheduler, request } = harness()

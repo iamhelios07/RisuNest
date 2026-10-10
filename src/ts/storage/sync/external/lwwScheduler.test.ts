@@ -243,6 +243,49 @@ describe('bounded LWW ownership under latency', () => {
         expect(f.receive).toHaveBeenCalledTimes(3)
         f.scheduler.stop()
     })
+    it.each([undefined, 5_000])('runs a waiting manual request after only its native retry deadline (%s)', async retryMillis => {
+        const f = fixture(); await started(f)
+        const pending = held<ReturnType<typeof turn>>()
+        f.publish.mockImplementationOnce(() => pending.promise)
+        f.scheduler.dirty(true); await tick()
+        const manual = f.scheduler.manualNow()
+        pending.reject({ kind: 'transient', ...(retryMillis === undefined ? {} : { retryAtMs: Date.now() + retryMillis }) })
+        await tick()
+        if (retryMillis !== undefined) {
+            await vi.advanceTimersByTimeAsync(retryMillis - 1)
+            expect(f.publish).toHaveBeenCalledTimes(1)
+            await vi.advanceTimersByTimeAsync(1)
+        }
+        expect(f.publish).toHaveBeenCalledTimes(2)
+        await manual
+        f.scheduler.stop()
+    })
+    it.each(['publish', 'receive'] as const)('runs stopped forced %s without the automatic retry cooldown', async operation => {
+        const f = fixture(); await started(f)
+        const callsBefore = f[operation].mock.calls.length
+        f[operation].mockRejectedValueOnce({ kind: 'transient' })
+        if (operation === 'publish') f.scheduler.dirty(true)
+        else void f.scheduler.conversationOpened()
+        await f.scheduler.settled(); f.scheduler.stop()
+        const forced = operation === 'publish' ? f.scheduler.publishNow(true) : f.scheduler.receiveNow(true)
+        await tick()
+        expect(f[operation]).toHaveBeenCalledTimes(callsBefore + 2)
+        await forced
+    })
+    it.each(['publish', 'receive'] as const)('retains automatic %s demand after native cancellation', async operation => {
+        const f = fixture(); await started(f)
+        const callsBefore = f[operation].mock.calls.length
+        f[operation].mockRejectedValueOnce({ kind: 'cancelled' })
+        if (operation === 'publish') f.scheduler.dirty(true)
+        else void f.scheduler.conversationOpened()
+        await f.scheduler.settled()
+        const cooldown = operation === 'publish' ? 15_000 : 20_000
+        await vi.advanceTimersByTimeAsync(cooldown - 1)
+        expect(f[operation]).toHaveBeenCalledTimes(callsBefore + 1)
+        await vi.advanceTimersByTimeAsync(1)
+        expect(f[operation]).toHaveBeenCalledTimes(callsBefore + 2)
+        f.scheduler.stop()
+    })
     it('alternates bounded turns before either backlog is empty', async () => {
         const f = fixture(); await started(f)
         const order: string[] = []

@@ -52,6 +52,7 @@ export function createLwwScheduler(dependencies: LwwSchedulerDependencies) {
     let quiescence: { promise: Promise<void>; resolve(): void } | undefined
     const waiting = new Map<ExplicitKind, Waiting>()
     const retryAt: Record<LwwOperation, number> = { publish: 0, receive: 0, maintenance: 0 }
+    const serviceRetryAt: Record<LwwOperation, number> = { publish: 0, receive: 0, maintenance: 0 }
     const blocked = new Set<LwwOperation>()
     const failureByOperation = new Map<LwwOperation, unknown>()
     const checkSettled = () => {
@@ -67,10 +68,11 @@ export function createLwwScheduler(dependencies: LwwSchedulerDependencies) {
         const failure = error as { kind?: string; code?: string; retryAtMs?: string | number; retryable?: boolean; action?: string }
         const kind = failure?.kind ?? failure?.code
         const deadline = Number(failure?.retryAtMs)
-        retryAt[operation] = Math.max(retryAt[operation], now() + Math.max(operation === 'publish' ? 15_000 : operation === 'receive' ? 20_000 : 60_000,
-            Number.isFinite(deadline) ? deadline - wallNow() : 0))
-        if (kind !== 'clockSkew' && (failure?.retryable === false || ['reauthenticate', 'unlock-key', 'free-space', 'check-endpoint'].includes(failure?.action ?? '')
-            || ['unauthorized', 'reauthRequired', 'deviceVaultUnavailable', 'repositoryKeyUnavailable', 'localStorageFull', 'localPermissionDenied', 'storageFull', 'endpointRejected', 'corrupt', 'repositoryMismatch', 'cancelled'].includes(kind ?? ''))) blocked.add(operation)
+        if (Number.isFinite(deadline)) serviceRetryAt[operation] = Math.max(serviceRetryAt[operation], now() + Math.max(0, deadline - wallNow()))
+        retryAt[operation] = Math.max(retryAt[operation], serviceRetryAt[operation],
+            now() + (operation === 'publish' ? 15_000 : operation === 'receive' ? 20_000 : 60_000))
+        if (kind !== 'clockSkew' && kind !== 'cancelled' && (failure?.retryable === false || ['reauthenticate', 'unlock-key', 'free-space', 'check-endpoint'].includes(failure?.action ?? '')
+            || ['unauthorized', 'reauthRequired', 'deviceVaultUnavailable', 'repositoryKeyUnavailable', 'localStorageFull', 'localPermissionDenied', 'storageFull', 'endpointRejected', 'corrupt', 'repositoryMismatch'].includes(kind ?? ''))) blocked.add(operation)
         failureByOperation.set(operation, error)
         dependencies.failed(error, operation)
     }
@@ -134,7 +136,7 @@ export function createLwwScheduler(dependencies: LwwSchedulerDependencies) {
             throw error
         }
     }
-    const explicitDue = (item: Waiting) => item.kind === 'manual' ? Math.max(retryAt.publish, retryAt.receive) : retryAt[item.kind]
+    const explicitDue = (item: Waiting) => item.kind === 'manual' ? Math.max(serviceRetryAt.publish, serviceRetryAt.receive) : serviceRetryAt[item.kind]
     const pump = () => {
         clearWake()
         if (inFlight) return
