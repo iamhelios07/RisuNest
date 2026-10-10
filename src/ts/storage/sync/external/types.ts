@@ -326,7 +326,8 @@ export interface ExternalQuotaSummary {
         providerPhysicalKnown: boolean
         locallyUploadedBytesLowerBound: DecimalString
         locallyUploadedObjectCountLowerBound: DecimalString
-        locallyUploadedCoverage: 'cached-upload-receipts'
+        locallyUploadedCoverage: 'observed-remote-files'
+        observedAtMs: DecimalString | null
         latestReachable?: {
             snapshotId: string
             knownDirectBytes: DecimalString
