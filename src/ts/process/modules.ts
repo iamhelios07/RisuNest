@@ -348,7 +348,7 @@ export async function importModule() {
                 {},
                 (error) => {
                     console.error(error)
-                    alertError(error instanceof StdioModuleImportError ? error : language.errors.noData)
+                    alertError(error instanceof Error ? error : String(error))
                 },
             )
             return
