@@ -313,7 +313,7 @@ pub(crate) fn provider_descriptors() -> Vec<ProviderDescriptor> {
     vec![
         provider(
             "webdav",
-            "WebDAV / Koofr",
+            "WebDAV",
             false,
             &["sequential", "backup-only"],
             &["koofr"],

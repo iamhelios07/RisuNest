@@ -151,7 +151,7 @@ const english = {
         'gitlab-cleanup-policy': 'GitLab package cleanup policies can delete backups. Keep cleanup policies off for this project. This connection is backup only.',
     },
     providers: {
-        webdav: { name: 'WebDAV / Koofr', description: 'Connects to a WebDAV folder. Leave the account and password empty if authentication is not required.' },
+        webdav: { name: 'WebDAV', description: 'Connects to a WebDAV folder. Leave the account and password empty if authentication is not required.' },
         s3: { name: 'S3-compatible storage', description: 'Uses an S3-compatible bucket such as Amazon S3, Cloudflare R2, Backblaze B2 or Hugging Face.' },
         google_drive: { name: 'Google Drive', description: 'Signs in with a Google account and uses a Drive folder or the hidden app data space.', warningTitle: 'Take care with the hidden app data space', warning: 'If you choose the hidden app data space, deleting the app data in Drive also deletes the backups.' },
         onedrive: { name: 'OneDrive', description: 'Signs in with a Microsoft account and uses a personal, work or app-only folder.' },
@@ -345,7 +345,7 @@ const korean: typeof english = {
         'gitlab-cleanup-policy': 'GitLab의 패키지 정리 정책이 백업을 지울 수 있습니다. 이 프로젝트에서는 정리 정책을 꺼 두세요. 이 연결은 백업만 합니다.',
     },
     providers: {
-        webdav: { name: 'WebDAV / Koofr', description: 'WebDAV 폴더에 연결합니다. 인증이 필요하지 않은 경우 계정과 비밀번호를 비워두세요.' },
+        webdav: { name: 'WebDAV', description: 'WebDAV 폴더에 연결합니다. 인증이 필요하지 않은 경우 계정과 비밀번호를 비워두세요.' },
         s3: { name: 'S3 호환 저장소', description: 'Amazon S3, Cloudflare R2, Backblaze B2, Hugging Face 같은 S3 호환 버킷을 씁니다.' },
         google_drive: { name: 'Google Drive', description: 'Google 계정으로 로그인해 Drive 폴더나 숨겨진 앱 데이터 공간을 씁니다.', warningTitle: '숨겨진 앱 데이터 공간에 주의하세요', warning: '숨겨진 앱 데이터 공간을 고른 경우, Drive에서 앱 데이터를 삭제하면 백업도 함께 지워집니다.' },
         onedrive: { name: 'OneDrive', description: 'Microsoft 계정으로 로그인해 개인·회사·앱 전용 폴더를 씁니다.' },

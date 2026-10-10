@@ -9,7 +9,7 @@ describe('the connection title and place', () => {
 
     it('shows the server and folder of a self-hosted repository', () => {
         const webdav = connection('webdav', { authority: 'https://synthetic.invalid', repositoryHint: '/RisuNest', accountHint: 'synthetic-user' })
-        expect(externalConnectionTitle(strings, webdav)).toBe('WebDAV / Koofr · synthetic-user')
+        expect(externalConnectionTitle(strings, webdav)).toBe('WebDAV · synthetic-user')
         expect(externalConnectionPlace(strings, webdav)).toBe('https://synthetic.invalid · /RisuNest')
     })
 
