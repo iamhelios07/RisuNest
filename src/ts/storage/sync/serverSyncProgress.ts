@@ -3,6 +3,7 @@ import type { languageEnglish } from 'src/lang/en'
 import { formatElapsed } from '../../gui/nativeFileJobDialogModel'
 import { formatRisuNestStorageBytes } from '../risuNestStorageDashboard'
 import { formatRemaining } from './remainingTime'
+import type { TransferRateSample } from './transferRate'
 export { createRateMeter } from './transferRate'
 
 export type ServerSyncLaneName = 'send' | 'receive' | 'hydrate' | 'binding' | 'assets'
@@ -24,6 +25,8 @@ export interface ServerSyncLane {
     bytesTotal: number
     sentBytes: number
     receivedBytes: number
+    sending: boolean
+    receiving: boolean
     /** Server changes after the receive cursor. */
     backlogDone: number
     /** What remains of that work now. It falls as well as grows, so a view reads it as it is. */
@@ -69,7 +72,7 @@ export interface ServerSyncAttempt {
     current: ServerSyncStage
     /** Lane counts since the attempt was first watched, once a sample arrived. */
     lanes?: ServerSyncLane[]
-    rate?: number
+    network?: TransferRateSample
     /** Changes a watched attempt had to upload when it began publishing. */
     plannedSend?: number
     /** Server changes after the receive cursor, as a watched attempt first read them. */
@@ -87,7 +90,7 @@ export interface ServerSyncProgressView {
     /** Share done, or null while the running step reports no total. */
     fraction: number | null
     stages: { stage: ServerSyncStage; label: string; state: 'done' | 'active' }[]
-    counters: { key: 'bytes' | 'rate' | 'items' | 'files' | 'elapsed' | 'remaining'; label: string; value: string }[]
+    counters: { key: 'bytes' | 'items' | 'files' | 'elapsed' | 'remaining'; label: string; value: string }[]
 }
 
 const STAGE_LANES: Record<ServerSyncStage, ServerSyncLaneName[]> = {
@@ -177,7 +180,6 @@ export function serverSyncProgressView(attempt: ServerSyncAttempt, text: Text, n
     const counters: ServerSyncProgressView['counters'] = []
     if (attempt.lanes) {
         counters.push({ key: 'bytes', label: text.verifiedBytes, value: `↑ ${bytes(sent)} · ↓ ${bytes(received)}` })
-        counters.push({ key: 'rate', label: text.transferRate, value: attempt.rate === undefined ? '-' : `${bytes(attempt.rate)}/s` })
         if (unplanned > 0) counters.push({ key: 'items', label: text.progressItems, value: count(itemsDone) })
         else if (itemsTotal > 0) counters.push({ key: 'items', label: text.progressItems, value: ratio(itemsDone, itemsTotal) })
         // Files are planned per transfer group, so they have no total for the whole attempt.
