@@ -225,6 +225,14 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/tests"
           echo "TMPDIR=$(cd "$RUNNER_TEMP/tests" && pwd -P)" >> "$GITHUB_ENV"
+      - name: Use runner temporary storage for Windows tests
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $nativeTestTemp = Join-Path $env:RUNNER_TEMP 'native-tests'
+          New-Item -ItemType Directory -Force -Path $nativeTestTemp | Out-Null
+          "TEMP=$nativeTestTemp" >> $env:GITHUB_ENV
+          "TMP=$nativeTestTemp" >> $env:GITHUB_ENV
       - if: runner.os == 'Linux'
         run: dbus-run-session -- bash scripts/linux-native-tests.sh --release --target ${{ matrix.target }}
       - if: runner.os != 'Linux'
