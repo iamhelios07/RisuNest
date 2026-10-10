@@ -1047,6 +1047,15 @@ mod tests {
         );
         let (fingerprint, entries) = source_identity();
         assert_eq!(fingerprint.len(), 64);
+        let identity = entries
+            .iter()
+            .find(|entry| entry["path"] == "server/sync/src/identity.rs")
+            .expect("the UUID implementation must be part of the compiled source identity");
+        assert_eq!(identity["role"], "server");
+        assert_eq!(
+            identity["sha256"],
+            hex::encode(Sha256::digest(include_bytes!("identity.rs")))
+        );
         for path in [
             "crates/small-object-store/src/lib.rs",
             "crates/sync-wire/src/delta.rs",
