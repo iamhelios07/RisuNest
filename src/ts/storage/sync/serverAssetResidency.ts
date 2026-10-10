@@ -117,7 +117,7 @@ export const downloadRemoteAssets = async (connectionId?: string, options?: { si
       selectedCharacterId: selectedCharacterId(),
       operationId,
       ...(options?.target ? { target: options.target } : {}),
-      ...(progress ? { progress } : {}),
+      ...(progress ? { progress, transferProgress: run!.networkChannel() } : {}),
     }, options?.signal, operationId);
     run?.finish('complete');
     return result;

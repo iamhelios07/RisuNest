@@ -1,7 +1,19 @@
 use super::{capabilities::Capabilities, contract::*, phase_progress::{PhaseCounters, PhaseProgress}};
 use serde::Serialize;
-use std::{collections::{BTreeMap, BTreeSet}, path::{Path, PathBuf}, sync::{Arc, Mutex, OnceLock}, time::{Duration, Instant}};
+use std::{cell::RefCell, collections::{BTreeMap, BTreeSet}, future::Future, path::{Path, PathBuf}, pin::Pin, sync::{Arc, Mutex, OnceLock}, task::{Context, Poll}, time::{Duration, Instant}};
 use tauri::ipc::Channel;
+use tokio::io::{AsyncRead, ReadBuf};
+
+#[derive(Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NetworkSnapshot {
+    id: String,
+    at_ms: u64,
+    sent_bytes: String,
+    received_bytes: String,
+    sending: bool,
+    receiving: bool,
+}
 
 #[derive(Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -13,6 +25,7 @@ pub(crate) struct Snapshot {
     downloaded_bytes: String,
     uploaded_objects: String,
     downloaded_objects: String,
+    network: NetworkSnapshot,
 }
 struct Reading {
     snapshot: Snapshot,
@@ -22,18 +35,28 @@ struct Reading {
     uploads: BTreeSet<String>,
     downloads: BTreeSet<String>,
     sent: Instant,
+    network_sent: u64,
+    network_received: u64,
+    sending: usize,
+    receiving: usize,
 }
 pub(crate) struct Run {
     sink: Box<dyn Fn(Snapshot) + Send + Sync>,
     reading: Mutex<Reading>,
+    started: Instant,
 }
 impl Run {
     fn update(&self, stage: &'static str, change: impl FnOnce(&mut Reading), force: bool) {
+        self.change(Some(stage), change, force);
+    }
+    fn change(&self, stage: Option<&'static str>, change: impl FnOnce(&mut Reading), force: bool) {
         if let Ok(mut reading) = self.reading.lock() {
-            let changed = reading.snapshot.stage != stage;
-            reading.snapshot.stage = stage;
+            let changed = stage.is_some_and(|stage| reading.snapshot.stage != stage);
+            if let Some(stage) = stage { reading.snapshot.stage = stage; }
             change(&mut reading);
-            if force || changed || reading.sent.elapsed() >= Duration::from_millis(250) {
+            let network_stopped = (reading.snapshot.network.sending && reading.sending == 0)
+                || (reading.snapshot.network.receiving && reading.receiving == 0);
+            if force || changed || network_stopped || reading.sent.elapsed() >= Duration::from_millis(250) {
                 reading.sent = Instant::now();
                 reading.snapshot.sequence += 1;
                 reading.snapshot.prepared_bytes = reading.prepared.to_string();
@@ -41,6 +64,11 @@ impl Run {
                 reading.snapshot.downloaded_bytes = reading.downloaded.to_string();
                 reading.snapshot.uploaded_objects = reading.uploads.len().to_string();
                 reading.snapshot.downloaded_objects = reading.downloads.len().to_string();
+                reading.snapshot.network.at_ms = self.started.elapsed().as_millis() as u64;
+                reading.snapshot.network.sent_bytes = reading.network_sent.to_string();
+                reading.snapshot.network.received_bytes = reading.network_received.to_string();
+                reading.snapshot.network.sending = reading.sending > 0;
+                reading.snapshot.network.receiving = reading.receiving > 0;
                 (self.sink)(reading.snapshot.clone());
             }
         }
@@ -64,9 +92,10 @@ impl Observer {
         self.begin_sink(channel.map(|channel| Box::new(move |snapshot| { let _ = channel.send(snapshot); }) as Box<dyn Fn(Snapshot) + Send + Sync>))
     }
     fn begin_sink(&self, sink: Option<Box<dyn Fn(Snapshot) + Send + Sync>>) -> Guard {
-        let run = sink.map(|sink| Arc::new(Run { sink, reading: Mutex::new(Reading {
-            snapshot: Snapshot::default(), prepared: 0, uploaded: 0, downloaded: 0,
+        let run = sink.map(|sink| Arc::new(Run { sink, started: Instant::now(), reading: Mutex::new(Reading {
+            snapshot: Snapshot { network: NetworkSnapshot { id: uuid::Uuid::new_v4().to_string(), ..Default::default() }, ..Default::default() }, prepared: 0, uploaded: 0, downloaded: 0,
             uploads: BTreeSet::new(), downloads: BTreeSet::new(), sent: Instant::now(),
+            network_sent: 0, network_received: 0, sending: 0, receiving: 0,
         }) }));
         if let Ok(mut current) = self.0.lock() { *current = run.clone(); }
         if let Some(run) = &run { run.update("checking", |_| {}, true); }
@@ -75,6 +104,53 @@ impl Observer {
     fn current(&self) -> Option<Arc<Run>> { self.0.lock().ok()?.clone() }
     pub(crate) fn wrap(&self, provider: Arc<dyn Provider>) -> Arc<dyn Provider> {
         Arc::new(ObservedProvider { provider, observer: self.clone() })
+    }
+    pub(crate) async fn scope<T>(&self, work: impl Future<Output = T>) -> T { NETWORK.scope(self.current(), work).await }
+    pub(crate) fn within<T>(&self, work: impl FnOnce() -> T) -> T {
+        struct Restore(Option<Arc<Run>>);
+        impl Drop for Restore { fn drop(&mut self) { BLOCKING_NETWORK.with(|slot| slot.replace(self.0.take())); } }
+        let _restore = Restore(BLOCKING_NETWORK.with(|slot| slot.replace(self.current())));
+        work()
+    }
+}
+
+tokio::task_local! { static NETWORK: Option<Arc<Run>>; }
+thread_local! { static BLOCKING_NETWORK: RefCell<Option<Arc<Run>>> = const { RefCell::new(None) }; }
+
+/// Count only HTTP body consumption, never provider source verification or local cache reads.
+pub(crate) fn network_reader(reader: Pin<Box<dyn AsyncRead + Send>>, upload: bool) -> Pin<Box<dyn AsyncRead + Send>> {
+    let run = NETWORK.try_with(Clone::clone).unwrap_or_else(|_| BLOCKING_NETWORK.with(|slot| slot.borrow().clone()));
+    let Some(run) = run else { return reader; };
+    run.change(None, |r| { if upload { r.sending += 1; } else { r.receiving += 1; } }, false);
+    Box::pin(NetworkReader { reader, run: Some(run), upload })
+}
+struct NetworkReader { reader: Pin<Box<dyn AsyncRead + Send>>, run: Option<Arc<Run>>, upload: bool }
+impl NetworkReader {
+    fn finish(&mut self) {
+        if let Some(run) = self.run.take() {
+            run.change(None, |r| { if self.upload { r.sending = r.sending.saturating_sub(1); } else { r.receiving = r.receiving.saturating_sub(1); } }, false);
+        }
+    }
+}
+impl Drop for NetworkReader { fn drop(&mut self) { self.finish(); } }
+impl AsyncRead for NetworkReader {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let capacity = buf.remaining();
+        let result = self.reader.as_mut().poll_read(cx, buf);
+        if let Poll::Ready(result) = &result {
+            let bytes = (buf.filled().len() - before) as u64;
+            if bytes > 0 {
+                if let Some(run) = &self.run {
+                    run.change(None, |r| {
+                        if self.upload { r.network_sent = r.network_sent.saturating_add(bytes); }
+                        else { r.network_received = r.network_received.saturating_add(bytes); }
+                    }, false);
+                }
+            }
+            if result.is_err() || (bytes == 0 && capacity > 0) { self.finish(); }
+        }
+        result
     }
 }
 
@@ -90,6 +166,7 @@ impl JobProgress {
         Self { key, _guard: guard, observer }
     }
     pub(crate) fn wrap(&self, provider: Arc<dyn Provider>) -> Arc<dyn Provider> { self.observer.wrap(provider) }
+    pub(crate) async fn scope<T>(&self, work: impl Future<Output = T>) -> T { self.observer.scope(work).await }
 }
 impl Drop for JobProgress {
     fn drop(&mut self) { if let Some(jobs) = JOBS.get() { if let Ok(mut jobs) = jobs.lock() { jobs.remove(&self.key); } } }
@@ -132,7 +209,7 @@ impl Provider for ObservedProvider {
         let run = self.observer.current();
         Box::pin(async move {
             if let Some(run) = &run { run.update("downloading", |_| {}, false); }
-            let result = self.provider.read_object(r,l,v,s,x).await?;
+            let result = self.observer.scope(self.provider.read_object(r,l,v,s,x)).await?;
             if let (Some(run), ReadReceipt::Body(receipt)) = (&run, &result) { run.accepted(receipt, false); }
             Ok(result)
         })
@@ -142,7 +219,7 @@ impl Provider for ObservedProvider {
         let run = self.observer.current();
         Box::pin(async move {
             if let Some(run) = &run { run.update("uploading", |_| {}, false); }
-            let result = self.provider.create_object(r,i,s,resume,x).await?;
+            let result = self.observer.scope(self.provider.create_object(r,i,s,resume,x)).await?;
             if let Some(run) = &run { run.accepted(&result, true); }
             Ok(result)
         })
@@ -158,7 +235,7 @@ impl Provider for ObservedProvider {
     fn reconcile_upload<'a>(&'a self, r: &'a RepositoryHandle, i: &'a ObjectIntent, s: Option<&'a ResumeState>, x: &'a Cancellation) -> ProviderFuture<'a, UploadResolution> {
         let run = self.observer.current();
         Box::pin(async move {
-            let result = self.provider.reconcile_upload(r,i,s,x).await?;
+            let result = self.observer.scope(self.provider.reconcile_upload(r,i,s,x)).await?;
             if let (Some(run), UploadResolution::Complete(receipt)) = (&run, &result) { run.accepted(receipt, true); }
             Ok(result)
         })
@@ -207,6 +284,7 @@ mod tests {
             assert_eq!(provider.upload_attempts("synthetic-pack"), 2);
             assert_eq!(provider.read_attempts("synthetic-pack"), 1);
             assert_eq!(provider.listing_count(), 0);
+            assert_eq!((&last.network.sent_bytes, &last.network.received_bytes), (&"0".into(), &"0".into()));
         });
     }
 
@@ -227,5 +305,85 @@ mod tests {
         assert!(job_snapshot(&root.path().join("two")).is_none());
         drop(job);
         assert!(job_snapshot(&root.path().join("one")).is_none());
+    }
+
+    #[test]
+    fn native_http_reports_partial_bodies_without_object_receipts_and_counts_retries() {
+        use crate::external_storage::{http::{HttpRequest, HttpTransport, NativeHttpTransport}, quota::AccountKey, wire_fixture::{Reply, WireServer}};
+        use tokio::io::AsyncReadExt;
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let server = WireServer::start((0..2).map(|_| Reply::Http { status: 200, headers: vec![], body: vec![7; 1024] }).collect());
+            let observer = Observer::default();
+            let snapshots = Arc::new(Mutex::new(Vec::new()));
+            let sink = snapshots.clone();
+            let guard = observer.begin_sink(Some(Box::new(move |value| sink.lock().unwrap().push(value))));
+            let transport = NativeHttpTransport::for_loopback_tests();
+            let cancel = Cancellation::default();
+            for attempt in 1..=2 {
+                let request = HttpRequest { method: reqwest::Method::PUT, url: server.url.clone(), headers: BTreeMap::new(),
+                    body: Some(Box::pin(std::io::Cursor::new(vec![9; 512]))), content_length: Some(512),
+                    operation: ProviderOperation::Create, account: AccountKey::new("webdav", &server.url, "synthetic").unwrap(),
+                    api_request: true, mybox_charge: None, control: false };
+                let mut response = observer.scope(transport.send(request, &cancel)).await.unwrap();
+                observer.current().unwrap().reading.lock().unwrap().sent = Instant::now() - Duration::from_secs(1);
+                let mut part = [0; 64];
+                response.body.read_exact(&mut part).await.unwrap();
+                let sample = snapshots.lock().unwrap().last().unwrap().clone();
+                assert_eq!(sample.network.sent_bytes, (attempt * 512).to_string());
+                assert_eq!(sample.network.received_bytes, ((attempt - 1) * 1024 + 64).to_string());
+                assert!(sample.network.receiving);
+                assert_eq!(sample.downloaded_bytes, "0");
+                assert_eq!(sample.uploaded_bytes, "0");
+                response.body.read_to_end(&mut Vec::new()).await.unwrap();
+            }
+            drop(guard);
+            let sample = snapshots.lock().unwrap().last().unwrap().clone();
+            assert_eq!(sample.network.received_bytes, "2048");
+            assert!(!sample.network.sending && !sample.network.receiving);
+            assert_eq!(server.requests.lock().unwrap().len(), 2);
+        });
+    }
+
+    #[test]
+    fn network_readers_keep_their_owner_across_async_interleaving_and_replacement() {
+        use tokio::io::AsyncReadExt;
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let a = Observer::default(); let b = Observer::default();
+            let first = a.begin_sink(Some(Box::new(|_| {})));
+            let _other = b.begin_sink(Some(Box::new(|_| {})));
+            let old = a.current().unwrap();
+            let mut reader = a.scope(async { network_reader(Box::pin(std::io::Cursor::new(vec![1; 10])), true) }).await;
+            let _next = a.begin_sink(Some(Box::new(|_| {})));
+            let read_old = async { tokio::task::yield_now().await; reader.read_to_end(&mut Vec::new()).await.unwrap(); };
+            let read_other = b.scope(async {
+                let mut reader = network_reader(Box::pin(std::io::Cursor::new(vec![2; 20])), false);
+                tokio::task::yield_now().await; reader.read_to_end(&mut Vec::new()).await.unwrap();
+            });
+            tokio::join!(read_old, read_other);
+            drop(first);
+            assert_eq!(old.reading.lock().unwrap().network_sent, 10);
+            assert_eq!(a.current().unwrap().reading.lock().unwrap().network_sent, 0);
+            assert_eq!(b.current().unwrap().reading.lock().unwrap().network_received, 20);
+        });
+    }
+
+    #[test]
+    fn blocking_scope_restores_its_owner_and_dropping_a_body_stops_activity() {
+        use tokio::io::AsyncReadExt;
+        let observer = Observer::default();
+        let _guard = observer.begin_sink(Some(Box::new(|_| {})));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        observer.within(|| runtime.block_on(async {
+            let mut reader = network_reader(Box::pin(std::io::Cursor::new(vec![1; 100])), false);
+            reader.read_exact(&mut [0; 4]).await.unwrap();
+            assert_eq!(observer.current().unwrap().reading.lock().unwrap().receiving, 1);
+            drop(reader);
+            assert_eq!(observer.current().unwrap().reading.lock().unwrap().receiving, 0);
+        }));
+        runtime.block_on(async {
+            let mut reader = network_reader(Box::pin(std::io::Cursor::new(vec![1; 100])), false);
+            reader.read_to_end(&mut Vec::new()).await.unwrap();
+        });
+        assert_eq!(observer.current().unwrap().reading.lock().unwrap().network_received, 4);
     }
 }

@@ -6,6 +6,41 @@ import type { ExternalJobSummary } from './types'
 const reading = (sequence: number, uploadedBytes: string): ExternalTransferSnapshot => ({ sequence, stage: 'uploading', uploadedBytes, preparedBytes: '0', downloadedBytes: '0', uploadedObjects: '1', downloadedObjects: '0' })
 afterEach(() => { for (const id of ['a', 'b']) clearExternalProgress(id); vi.useRealTimers(); native.invoke.mockReset() })
 describe('external progress ownership', () => {
+    it('keeps body throughput separate from confirmed amounts and rejects samples from replaced operations', async () => {
+        let state: ReadonlyMap<string, ExternalOperationProgress> = new Map()
+        const stop = subscribeExternalProgress(value => state = value)
+        const run = beginExternalProgress('a', 'download')
+        run.items(0, 3)
+        const channel = run.networkChannel()
+        const network = { id: 'native', atMs: 1000, sentBytes: '0', receivedBytes: '2000', sending: false, receiving: true }
+        channel.onmessage({ ...reading(2, '999'), network })
+        expect(externalProgressFor(state, 'a', 'download')).toMatchObject({ stage: 'downloading', completedItems: 0, amounts: { uploadedBytes: '0', downloadedBytes: '0' }, network })
+        channel.onmessage({ ...reading(1, '0'), network: { ...network, receivedBytes: '9000' } })
+        channel.onmessage({ ...reading(3, '0'), network: { ...network, receivedBytes: 'invalid' } })
+        expect(externalProgressFor(state, 'a', 'download')?.network?.receivedBytes).toBe('2000')
+        const retry = beginExternalProgress('a', 'download')
+        channel.onmessage({ ...reading(4, '0'), network })
+        expect(externalProgressFor(state, 'a', 'download')?.network).toBeUndefined()
+        retry.finish('complete'); stop()
+    })
+    it('does not let delayed native speed replace a newer native page or local phase', async () => {
+        let state: ReadonlyMap<string, ExternalOperationProgress> = new Map()
+        const stop = subscribeExternalProgress(value => state = value)
+        native.invoke.mockResolvedValue(undefined)
+        const run = beginExternalProgress('a', 'binding')
+        await run.invoke('first', {})
+        const first = native.invoke.mock.calls[0][1].progress
+        await run.invoke('second', {})
+        const second = native.invoke.mock.calls[1][1].progress
+        const network = { id: 'second', atMs: 1000, sentBytes: '2000', receivedBytes: '0', sending: true, receiving: false }
+        second.onmessage({ ...reading(1, '0'), uploadedObjects: '0', network })
+        first.onmessage({ ...reading(1, '0'), network: { ...network, id: 'first', sentBytes: '9999' } })
+        expect(externalProgressFor(state, 'a')?.network).toEqual(network)
+        run.stage('applying')
+        second.onmessage({ ...reading(2, '100'), network: { ...network, sentBytes: '9999' } })
+        expect(externalProgressFor(state, 'a')).toMatchObject({ stage: 'applying', network, amounts: { uploadedBytes: '100' } })
+        run.finish('complete'); stop()
+    })
     it('isolates connections and operations, ignores old sequences, and retains the result for remounts', async () => {
         vi.useFakeTimers()
         let state: ReadonlyMap<string, ExternalOperationProgress> = new Map()

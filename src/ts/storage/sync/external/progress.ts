@@ -1,6 +1,7 @@
 import { Channel, invoke } from '@tauri-apps/api/core'
 import type { ExternalJobSummary, ExternalSnapshotExportProgress } from './types'
 import { externalJobIsActive, externalJobProgress } from './connection'
+import type { TransferRateSample } from '../transferRate'
 
 export type ExternalStage = 'checking' | 'preparing' | 'uploading' | 'downloading' | 'applying' | 'finalizing' | 'waiting'
 export interface ExternalTransferSnapshot {
@@ -11,6 +12,7 @@ export interface ExternalTransferSnapshot {
     downloadedBytes: string
     uploadedObjects: string
     downloadedObjects: string
+    network?: TransferRateSample
 }
 export interface ExternalOperationProgress {
     id: string
@@ -20,7 +22,8 @@ export interface ExternalOperationProgress {
     stage: ExternalStage
     state: 'running' | 'complete' | 'failed' | 'cancelled'
     visible: boolean
-    amounts: Omit<ExternalTransferSnapshot, 'sequence' | 'stage'>
+    amounts: Omit<ExternalTransferSnapshot, 'sequence' | 'stage' | 'network'>
+    network?: TransferRateSample
     completedItems?: number
     totalItems?: number
     exported?: ExternalSnapshotExportProgress
@@ -30,6 +33,11 @@ const emptyAmounts = () => ({ preparedBytes: '0', uploadedBytes: '0', downloaded
 const operations = new Map<string, ExternalOperationProgress>()
 const listeners = new Set<(value: ReadonlyMap<string, ExternalOperationProgress>) => void>()
 const key = (id: string, kind: ExternalOperationProgress['kind']) => `${id}:${kind}`
+export function validTransferRateSample(sample: TransferRateSample | undefined): sample is TransferRateSample {
+    return !!sample && typeof sample.id === 'string' && !!sample.id && Number.isSafeInteger(sample.atMs) && sample.atMs >= 0
+        && [sample.sentBytes, sample.receivedBytes].every(value => /^\d+$/.test(value) && Number.isSafeInteger(Number(value)))
+        && typeof sample.sending === 'boolean' && typeof sample.receiving === 'boolean'
+}
 function emit() { for (const listener of listeners) listener(new Map(operations)) }
 export function subscribeExternalProgress(listener: (value: ReadonlyMap<string, ExternalOperationProgress>) => void) {
     listeners.add(listener)
@@ -75,6 +83,16 @@ export function beginExternalProgress(connectionId: string, kind: ExternalOperat
         stage(stage: ExternalStage, authority?: string) { if (current()) { phase++; update({ stage, ...(authority ? { authority } : {}) }) } },
         items(completedItems: number, totalItems: number) { if (current()) update({ stage: 'downloading', completedItems, totalItems }) },
         exported(exported: ExternalSnapshotExportProgress) { if (current()) update({ stage: 'downloading', exported }) },
+        networkChannel() {
+            let sequence = -1
+            const channel = new Channel<ExternalTransferSnapshot>()
+            channel.onmessage = reading => {
+                if (!current() || reading.sequence <= sequence || !validTransferRateSample(reading.network)) return
+                sequence = reading.sequence
+                update({ network: reading.network })
+            }
+            return channel
+        },
         async invoke<T>(command: string, args: Record<string, unknown>, authority?: string): Promise<T> {
             if (current()) update({ ...(authority ? { authority } : {}) })
             const samplePhase = ++phase
@@ -98,7 +116,7 @@ export function beginExternalProgress(connectionId: string, kind: ExternalOperat
                 uploading ||= reading.stage === 'uploading'
                 // Replies and channel messages can arrive separately. Late counts must not rewind a local phase.
                 const stage = reading.stage === 'preparing' && uploading ? 'uploading' : reading.stage
-                update({ amounts, ...(!ended && samplePhase === phase ? { stage } : {}) })
+                update({ amounts, ...(!ended && samplePhase === phase ? { stage, ...(validTransferRateSample(reading.network) ? { network: reading.network } : {}) } : {}) })
             }
             return invoke<T>(command, { ...args, progress })
         },

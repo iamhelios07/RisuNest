@@ -4,7 +4,7 @@
     import SettingProgress from './SettingProgress.svelte'
 
     let { label, detail = '', fraction = null, done = false, stopped = false, activity = '',
-        stages = [], counters = [], detailsLabel, collapsible = false, open = $bindable(false), actions }: {
+        stages = [], counters = [], detailsLabel, collapsible = false, open = $bindable(false), actions, speed }: {
         label: string
         detail?: string
         fraction?: number | null
@@ -17,6 +17,7 @@
         collapsible?: boolean
         open?: boolean
         actions?: Snippet
+        speed?: Snippet
     } = $props()
 </script>
 
@@ -42,6 +43,7 @@
 
 <div class="transfer-progress">
     <SettingProgress {label} {detail} {fraction} {done} {stopped} {actions} />
+    {#if speed}{@render speed()}{/if}
     {#if activity || stages.length > 1 || counters.length}
         {#if collapsible}
             <details class="group" bind:open>

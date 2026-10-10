@@ -640,7 +640,7 @@
                         if (exportRun?.id === id) exportRun = { id, connectionId, progress }
                         observation.exported(progress)
                         background.progress(measuredTaskPercent(Number(progress.completedBytes), Number(progress.totalBytes)))
-                    })
+                    }, observation.networkChannel())
                     return result.cancelled ? null : result
                 } finally { background.signal?.removeEventListener('abort', abort) }
             }, undefined, true)

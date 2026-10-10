@@ -34,7 +34,7 @@ describe('asset residency mobile lifetime', () => {
         mock.begin.mockResolvedValue({ dispose, progress: vi.fn() })
         mock.invoke.mockResolvedValue(status)
         await downloadRemoteAssets('receiver')
-        expect(mock.invoke).toHaveBeenCalledWith('asset_residency_download_remote', { connectionId: 'receiver', selectedCharacterId: 'selected-policy-character', operationId: expect.any(String), progress: expect.objectContaining({ onmessage: expect.any(Function) }) })
+        expect(mock.invoke).toHaveBeenCalledWith('asset_residency_download_remote', { connectionId: 'receiver', selectedCharacterId: 'selected-policy-character', operationId: expect.any(String), progress: expect.objectContaining({ onmessage: expect.any(Function) }), transferProgress: expect.objectContaining({ onmessage: expect.any(Function) }) })
         await downloadRemoteAssets()
         expect(mock.invoke).toHaveBeenCalledWith('asset_residency_download_remote', { connectionId: null, selectedCharacterId: 'selected-policy-character', operationId: expect.any(String) })
         expect(mock.begin).toHaveBeenCalledTimes(2)

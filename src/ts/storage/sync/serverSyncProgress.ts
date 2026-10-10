@@ -3,6 +3,7 @@ import type { languageEnglish } from 'src/lang/en'
 import { formatElapsed } from '../../gui/nativeFileJobDialogModel'
 import { formatRisuNestStorageBytes } from '../risuNestStorageDashboard'
 import { formatRemaining } from './remainingTime'
+export { createRateMeter } from './transferRate'
 
 export type ServerSyncLaneName = 'send' | 'receive' | 'hydrate' | 'binding' | 'assets'
 export type ServerSyncNativeStep = 'idle' | 'preparing' | 'checking' | 'uploading' | 'confirming' | 'listing' | 'downloading' | 'staging'
@@ -46,22 +47,6 @@ export function laneDeltas(current: ServerSyncLane[], baseline: ServerSyncLane[]
     })
 }
 
-/** Bytes per second over the last few seconds of samples. */
-export function createRateMeter(windowMs = 3000) {
-    const samples: { at: number; bytes: number }[] = []
-    return {
-        add(at: number, bytes: number) {
-            samples.push({ at, bytes })
-            while (samples.length > 2 && at - samples[1].at >= windowMs) samples.shift()
-        },
-        rate(): number | undefined {
-            if (samples.length < 2) return undefined
-            const first = samples[0], last = samples[samples.length - 1]
-            return last.at > first.at ? Math.max(0, last.bytes - first.bytes) * 1000 / (last.at - first.at) : undefined
-        },
-        reset() { samples.length = 0 },
-    }
-}
 
 export type ServerSyncStage = 'preparing' | 'downloading' | 'applying' | 'refreshing' | 'publishing' | 'assets'
 /** A routine sync shows one bar: for its changes, or for the assets it downloads after them. */

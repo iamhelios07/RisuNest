@@ -32,6 +32,7 @@ const state = vi.hoisted(() => ({
 }))
 
 vi.mock('src/ts/platform', () => ({ isTauri: true, isTauriAndroid: false, isTauriIOS: false }))
+vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn(), Channel: class { onmessage = (_value: unknown) => {} } }))
 vi.mock('@tauri-apps/plugin-os', () => ({ type: () => 'windows' }))
 vi.mock('@tauri-apps/plugin-opener', () => ({ openUrl: vi.fn() }))
 vi.mock('qrcode', () => ({ default: { toDataURL: vi.fn() } }))
@@ -482,6 +483,12 @@ describe('the storage usage tab', () => {
         expect(download.disabled).toBe(true)
         expect(state.exportSnapshot).toHaveBeenCalledOnce()
         expect(state.exportSnapshot.mock.calls[0].slice(0, 2)).toEqual(['connection-1', 'snapshot'])
+        const transferProgress = state.exportSnapshot.mock.calls[0][4]
+        transferProgress.onmessage({ sequence: 1, network: { id: 'export', atMs: 0, sentBytes: '0', receivedBytes: '0', sending: false, receiving: true } })
+        await settle()
+        transferProgress.onmessage({ sequence: 2, network: { id: 'export', atMs: 1000, sentBytes: '0', receivedBytes: '2097152', sending: false, receiving: true } })
+        await settle()
+        expect(target.querySelector('[data-external-progress="export"] [data-transfer-speed]')?.textContent).toContain('↓ 2.0 MiB/s')
         expect(target.textContent).toContain('10 B / 20 B')
         const cancel = [...target.querySelectorAll('button')].find(button => button.textContent?.trim() === strings.cancel)!
         expect(cancel.closest('[data-external-progress="export"]')?.querySelector('[role="progressbar"]')).toBeTruthy()

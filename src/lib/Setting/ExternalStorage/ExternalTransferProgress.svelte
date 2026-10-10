@@ -1,7 +1,8 @@
 <script lang="ts">
     import { onMount, type Snippet } from 'svelte'
     import TransferProgress from '../RisuNest/TransferProgress.svelte'
-    import { subscribeExternalProgress, externalProgressFor, externalJobFraction, externalJobTotalGrows, type ExternalOperationProgress } from 'src/ts/storage/sync/external/progress'
+    import TransferSpeed from '../RisuNest/TransferSpeed.svelte'
+    import { subscribeExternalProgress, externalProgressFor, externalJobFraction, externalJobTotalGrows, validTransferRateSample, type ExternalOperationProgress } from 'src/ts/storage/sync/external/progress'
     import { externalJobIsActive, externalJobIsPaused } from 'src/ts/storage/sync/external/connection'
     import type { ExternalJobSummary } from 'src/ts/storage/sync/external/types'
     import { formatRisuNestStorageBytes as bytes } from 'src/ts/storage/risuNestStorageDashboard'
@@ -60,7 +61,13 @@
             <TransferProgress {label} {detail} {done} {stopped}
                 fraction={done ? 1 : exported && Number(exported.totalBytes) > 0 ? Number(exported.completedBytes) / Number(exported.totalBytes) : operation.kind === 'download' && operation.totalItems ? (operation.completedItems ?? 0) / operation.totalItems : null}
                 counters={counters(operation)} detailsLabel={copy.details} collapsible={!onboarding}
-                actions={operation.kind === 'export' && operation.state === 'running' ? exportActions : undefined} />
+                actions={operation.kind === 'export' && operation.state === 'running' ? exportActions : undefined}>
+                {#snippet speed()}
+                    {#if !done && !stopped && !['applying', 'finalizing'].includes(operation.stage) && validTransferRateSample(operation.network)}
+                        <TransferSpeed sample={operation.network} uploadLabel={copy.uploadSpeed} downloadLabel={copy.downloadSpeed} />
+                    {/if}
+                {/snippet}
+            </TransferProgress>
         </div>
     {/each}
     {#if activeJob}
@@ -70,7 +77,13 @@
             label={(activeJob.kind === 'restore' && strings.restorePhases[activeJob.phase]) || strings.jobActive[activeJob.kind]}
             detail={localApply ? '' : activeJob.counters ? `${strings.jobCounters[activeJob.counters]} ${size}` : size}
             {fraction} detailsLabel={copy.details} collapsible={!onboarding}
-            counters={jobCounters} />
+            counters={jobCounters}>
+            {#snippet speed()}
+                {#if !localApply && validTransferRateSample(activeJob.transfer?.network)}
+                    <TransferSpeed sample={activeJob.transfer.network} uploadLabel={copy.uploadSpeed} downloadLabel={copy.downloadSpeed} />
+                {/if}
+            {/snippet}
+        </TransferProgress>
     {:else if onboarding && operations.length === 0}
         <TransferProgress label={syncing ? copy.connecting : strings.jobActive.restore} detailsLabel={copy.details} />
     {/if}

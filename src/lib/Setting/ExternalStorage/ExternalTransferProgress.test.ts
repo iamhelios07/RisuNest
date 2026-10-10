@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { mount, tick, unmount } from 'svelte'
+import { SvelteMap } from 'svelte/reactivity'
 const native = vi.hoisted(() => ({ invoke: vi.fn() }))
 vi.mock('@tauri-apps/api/core', () => ({ invoke: native.invoke, Channel: class { onmessage = (_value: unknown) => {} } }))
 import ExternalTransferProgress from './ExternalTransferProgress.svelte'
@@ -20,6 +21,42 @@ afterEach(async () => {
     component = undefined; target?.remove(); clearExternalProgress('synthetic'); vi.useRealTimers()
 })
 describe('external storage shared panel', () => {
+    it.each(['backup', 'restore'] as const)('shows %s network speed from live job samples and hides it when paused', async kind => {
+        vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'performance'] })
+        const network = { id: kind, atMs: 0, sentBytes: '0', receivedBytes: '0', sending: kind === 'backup', receiving: kind === 'restore' }
+        const transfer = { sequence: 1, stage: 'uploading' as const, preparedBytes: '0', uploadedBytes: '0', downloadedBytes: '0', uploadedObjects: '0', downloadedObjects: '0', network }
+        const job: ExternalJobSummary = { id: kind, connectionId: 'synthetic', kind, state: 'running', phase: kind === 'backup' ? 'preparing' : 'downloading', completedBytes: '0', completedItems: '0', startedAtMs: '0', updatedAtMs: '0', transfer }
+        const jobs = new SvelteMap([['current', job]])
+        target = document.createElement('div'); document.body.append(target)
+        component = mount(ExternalTransferProgress, { target, props: { connectionId: 'synthetic', strings, get job() { return jobs.get('current') } } })
+        await tick()
+        jobs.set('current', { ...job, transfer: { ...transfer, sequence: 2, network: { ...network, atMs: 1000, sentBytes: '1048576', receivedBytes: '2097152' } } })
+        await tick()
+        expect(target.textContent).toContain(kind === 'backup' ? '↑ 1.0 MiB/s' : '↓ 2.0 MiB/s')
+        jobs.set('current', { ...jobs.get('current')!, phase: 'applying-local', kind: 'restore' }); await tick()
+        expect(target.querySelector('[data-transfer-speed]')).toBeNull()
+        jobs.set('current', { ...job, state: 'waiting', phase: 'paused' }); await tick()
+        expect(target.querySelector('[data-transfer-speed]')).toBeNull()
+    })
+    it('shows partial network transfer before any item completes and hides speed during local work and completion', async () => {
+        vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'performance'] })
+        await show({ onboarding: true })
+        const run = beginExternalProgress('synthetic', 'binding')
+        let report!: (reading: unknown) => void
+        native.invoke.mockImplementation(async (_name, { progress }) => { report = progress.onmessage })
+        await run.invoke('synthetic', {})
+        const reading = { sequence: 1, stage: 'downloading', preparedBytes: '0', uploadedBytes: '0', downloadedBytes: '0', uploadedObjects: '0', downloadedObjects: '0', network: { id: 'native', atMs: 0, sentBytes: '0', receivedBytes: '0', sending: false, receiving: true } }
+        report(reading); await tick()
+        report({ ...reading, sequence: 2, network: { ...reading.network, atMs: 1000, receivedBytes: '1048576' } }); await tick()
+        expect(target.textContent).toContain('↓ 1.0 MiB/s')
+        expect(target.textContent).not.toContain(strings.transfer.downloaded)
+        run.stage('waiting'); await tick()
+        expect(target.querySelector('[data-transfer-speed]')).toBeNull()
+        run.stage('applying'); await tick()
+        expect(target.querySelector('[data-transfer-speed]')).toBeNull()
+        run.finish('complete'); await tick()
+        expect(target.querySelector('[data-transfer-speed]')).toBeNull()
+    })
     it('observes an automatic operation started after mounting and keeps details collapsed', async () => {
         vi.useFakeTimers(); await show()
         const run = beginExternalProgress('synthetic', 'sync')

@@ -133,6 +133,7 @@ const english = {
     restorePhases: { downloading: 'Downloading backup data', 'preparing-local': 'Preparing the restore', 'applying-local': 'Applying the restore', 'awaiting-adoption': 'Applying the restore', 'receiving-assets': 'Downloading assets' } as Record<string, string>,
     jobCounters: { prepared: 'Prepared', transferred: 'Transferred' },
     transfer: {
+        uploadSpeed: 'Upload speed', downloadSpeed: 'Download speed',
         details: 'Details', syncing: 'Syncing', connecting: 'Connecting', downloading: 'Downloading sync data', filesDownloading: 'Downloading files', waiting: 'Waiting for your response', syncComplete: 'Sync completed', downloadComplete: 'Download completed', connectionComplete: 'Connected',
         prepared: 'Prepared', uploaded: 'Uploaded', downloaded: 'Downloaded', objects: '{0} items', files: 'Files ready',
         checking: 'Checking repository', preparing: 'Preparing data', uploading: 'Uploading', applying: 'Applying data', finalizing: 'Finishing',
@@ -319,6 +320,7 @@ const korean: typeof english = {
     restorePhases: { downloading: '백업 데이터 받는 중', 'preparing-local': '복원 준비 중', 'applying-local': '복원 적용 중', 'awaiting-adoption': '복원 적용 중', 'receiving-assets': '에셋 받는 중' },
     jobCounters: { prepared: '준비', transferred: '전송' },
     transfer: {
+        uploadSpeed: '업로드 속도', downloadSpeed: '다운로드 속도',
         details: '자세히', syncing: '동기화 중', connecting: '연결 중', downloading: '동기화 데이터 다운로드 중', filesDownloading: '파일 다운로드 중', waiting: '사용자 응답 대기 중', syncComplete: '동기화 완료', downloadComplete: '다운로드 완료', connectionComplete: '연결 완료',
         prepared: '준비', uploaded: '업로드 완료', downloaded: '다운로드 완료', objects: '{0}개 항목', files: '준비된 파일',
         checking: '저장소 확인 중', preparing: '데이터 준비 중', uploading: '업로드 중', applying: '데이터 반영 중', finalizing: '마무리 중',
