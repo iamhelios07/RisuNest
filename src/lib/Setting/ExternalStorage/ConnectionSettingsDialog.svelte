@@ -59,6 +59,7 @@
 
     async function save(): Promise<void> {
         saving = true
+        feedback = ''
         error = ''
         try {
             await onsave()
@@ -134,13 +135,13 @@
             <textarea bind:this={text} aria-label={strings.connectionSettingsPayload} readonly value={payload}
                 rows="3" spellcheck="false" autocapitalize="off"
                 class="w-full rounded-md border border-darkborderc bg-darkbg p-2 font-mono text-xs text-textcolor shadow-xs"></textarea>
-            <div class="copy-row">
+            <div class="feedback">
                 <span class="text-sm text-textcolor2" role="status">{feedback}</span>
-                <SettingButton variant="secondary" busy={copying} onclick={copy}>{strings.copyConnectionSettings}</SettingButton>
+                {#if error}<p class="text-sm text-draculared" role="alert">{error}</p>{/if}
             </div>
-            {#if error}<p class="text-sm text-draculared" role="alert">{error}</p>{/if}
         </div>
         <div bind:this={footer} class="actions">
+            <SettingButton variant="secondary" busy={copying} onclick={copy}>{strings.copyConnectionSettings}</SettingButton>
             <SettingButton busy={saving} onclick={save}>{strings.saveConnectionSettings}</SettingButton>
             <SettingButton variant="secondary" onclick={onclose}>{strings.closeRecovery}</SettingButton>
         </div>
@@ -176,6 +177,6 @@
     .qr { align-self: center; max-width: 100%; height: auto; image-rendering: pixelated; }
     .controls { display: grid; gap: 0.5rem; min-width: 0; }
     textarea { resize: none; overflow-wrap: anywhere; }
-    .copy-row { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; }
+    .feedback { min-height: 1.25rem; line-height: 1.25rem; }
     .actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 0.5rem; }
 </style>
