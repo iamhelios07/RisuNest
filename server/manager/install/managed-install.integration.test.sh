@@ -295,7 +295,7 @@ test "$failure_license_hash" != "$stable_license_hash"
 mv "$update_service_path" "$test_root/update-service.backup"
 mkdir "$update_service_path"
 configuration_log="$test_root/post-swap-configuration-failure.log"
-if sh "$failure_dir/install.sh" --non-interactive --policy=notify >"$configuration_log" 2>&1; then
+if sh "$failure_dir/install.sh" --non-interactive --policy=notify 2>&1 | tee "$configuration_log"; then
   fail 'post-swap configuration failure unexpectedly succeeded'
 fi
 grep -Fq 'user-service-write-failed' "$configuration_log" || fail 'configuration fixture failed for a reason other than schedule write rejection'
