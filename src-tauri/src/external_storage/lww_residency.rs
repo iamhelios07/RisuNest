@@ -676,6 +676,8 @@ fn hydrate_pack_group(root:&Path,connection:&OpenedSource,group:Vec<SharedPacked
                     if current_repository.repository_id!=repository.repository_id || current_repository.connection_identity!=repository.connection_identity {return Err(segment::corrupt());}
                     let engine=super::lww_engine::ExternalLwwEngine {provider:provider.clone(),repository:current_repository,library:library_id.clone(),
                         root_key:zeroize::Zeroizing::new(**key),admission:None,connection_id:connection_id.clone(),connection_root:connection_root.clone(),
+                        #[cfg(test)]
+                        test_lease_clock:None,
                         capabilities:stored.capabilities.clone(),descriptor:stored.descriptor.clone()};
                     let stale=missing.iter().map(SharedPackedSource::unshared).collect::<Vec<_>>();
                     let refreshed=engine.refresh_packed_sources(&stale,&scratch.join("current-catalogs"),cancel).await?;
@@ -925,6 +927,8 @@ pub(crate) async fn spool_frozen_remote_body(source:&FrozenBodySource,destinatio
                     if current_repository.repository_id!=repository.repository_id || current_repository.connection_identity!=repository.connection_identity {return Err(segment::corrupt());}
                     let engine=super::lww_engine::ExternalLwwEngine{provider:provider.clone(),repository:current_repository,library:source.library_id.clone(),
                         root_key:zeroize::Zeroizing::new(*key),admission:None,connection_id:connection_id.clone(),connection_root:connection_root.clone(),
+                        #[cfg(test)]
+                        test_lease_clock:None,
                         capabilities:stored.capabilities.clone(),descriptor:stored.descriptor.clone()};
                     let mut refreshed=engine.refresh_packed_sources(std::slice::from_ref(source),&scratch.path().join("current-catalogs"),cancel).await?;
                     let refreshed=refreshed.pop().ok_or_else(segment::corrupt)?;
