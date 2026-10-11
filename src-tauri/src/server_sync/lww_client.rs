@@ -290,6 +290,23 @@ impl LwwClient {
             clocks.remove(&self.clock_key());
         }
     }
+
+    #[cfg(test)]
+    pub(super) fn admit_synthetic_clock(&self, now_ms: u64) {
+        let key = self.clock_key();
+        let clock = ClockSample {
+            target_id: key.2.clone(),
+            request_wall_ms: now_ms,
+            response_wall_ms: now_ms,
+            request_monotonic_ms: 0,
+            response_monotonic_ms: 0,
+            target_ms: now_ms,
+            precision_ms: 0,
+            successful: true,
+            cached_or_aged: false,
+        }.admit().unwrap();
+        CLOCKS.lock().unwrap().insert(key, (Instant::now(), clock));
+    }
     /// The incoming bound from the library's current sample, sampling the
     /// server clock only when there is none or it expired.
     pub(crate) fn admission(&self) -> Result<DecimalU64> {
