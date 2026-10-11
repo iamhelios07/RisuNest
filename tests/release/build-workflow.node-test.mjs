@@ -156,6 +156,9 @@ test("iOS Rust tests preflight their own keychain identity before running the fu
   assert.match(runner, /__TEXT,__entitlements/);
   assert.match(runner, /__TEXT,__ents_der/);
   assert.match(runner, /keychain-access-groups/);
+  assert.match(runner, /spawn "\$device_id" "\$profile\/test-runner" "\$profile\/keychain-probe"/);
+  assert.match(runner, /spawn "\$IOS_SIMULATOR_UDID" "\$IOS_RUST_TEST_RUNNER" "\$@"/);
+  assert.match(runner, /export IOS_RUST_TEST_RUNNER="\$profile\/test-runner"/);
   assert(runner.indexOf('"$profile/keychain-probe"\n') < runner.indexOf('cargo test '));
   assert.match(runner, /cargo test .*--release --locked --target aarch64-apple-ios-sim --lib "\$@"/);
   assert.doesNotMatch(runner, /--skip|--ignored|danger_accept_invalid/);
