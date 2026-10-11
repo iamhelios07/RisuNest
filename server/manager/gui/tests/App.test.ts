@@ -1,5 +1,6 @@
 import { mount, tick, unmount } from "svelte";
 import { beforeEach, afterEach, expect, it, vi } from "vitest";
+import { version as syncVersion } from "../../../version.json";
 import App from "../src/App.svelte";
 import type { Backend, Environment, PlatformStatus, Status } from "../src/api";
 
@@ -715,5 +716,5 @@ it("renders unknown update reasons as a localized outcome with a separate diagno
   expect(target.textContent).toContain("업데이트를 완료하지 못했습니다.");
   expect(target.querySelector("code")?.textContent).toBe("synthetic-unknown-reason");
   expect(target.querySelector("code")?.closest("p")?.classList.contains("warning")).toBe(true);
-  expect(target.textContent).toContain("RisuNest Sync · 1.0.0");
+  expect(target.textContent).toContain(`RisuNest Sync · ${syncVersion}`);
 });
