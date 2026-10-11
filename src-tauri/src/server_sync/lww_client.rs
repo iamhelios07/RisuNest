@@ -569,6 +569,7 @@ impl LwwClient {
         fit_push_page(&mut request, &mut entries)?;
         lane.plan_items(entries.len());
         let cache = Cache::open(cache_root)?.with_library(store.repository_root())?;
+        let prepared = cache.begin_batch()?;
         let mut objects = BTreeSet::new();
         for entry in &entries {
             self.check()?;
@@ -658,6 +659,7 @@ impl LwwClient {
                 }
             }
         }
+        prepared.commit()?;
         let mut hints = BTreeMap::new();
         for entry in &entries {
             if let UnitValue::Object { descriptor, .. } = &entry.value {

@@ -423,18 +423,7 @@ impl ServerClient {
         retry_budget: Arc<RetryBudget>,
     ) -> Result<Self> {
         let url = config.validate()?;
-        // Other crates enable reqwest's decoders, which would strip a
-        // Content-Encoding this client has to see and refuse.
-        let http = crate::platform_tls::blocking_client_builder()
-            .no_gzip()
-            .no_brotli()
-            .no_deflate()
-            .no_zstd()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|_| SyncError::new("http-client-unavailable", 503))?;
+        let http = shared_transport()?;
         Ok(Self {
             #[cfg(test)]
             test_io: None,
@@ -882,6 +871,29 @@ impl ServerClient {
     }
 }
 
+fn shared_transport() -> Result<Client> {
+    static TRANSPORT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
+    if let Some(client) = TRANSPORT.get() {
+        return Ok(client.clone());
+    }
+    // The pool holds no credentials or job state. Every request supplies its own
+    // identity, cancellation and deadline, including after a binding changes.
+    // Other crates enable decoders, which would hide a Content-Encoding this
+    // client has to see and refuse.
+    let client = crate::platform_tls::blocking_client_builder()
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .no_zstd()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|_| SyncError::new("http-client-unavailable", 503))?;
+    let _ = TRANSPORT.set(client);
+    Ok(TRANSPORT.get().unwrap().clone())
+}
+
 pub(crate) fn response_code(reply: &Reply) -> Option<String> {
     serde_json::from_slice::<serde_json::Value>(&reply.body)
         .ok()
@@ -1096,6 +1108,48 @@ mod tests {
             device_id: "device".into(),
             token: "a".repeat(64),
         }
+    }
+
+    #[test]
+    fn successive_clients_reuse_transport_without_sharing_credentials_or_cancellation() {
+        use axum::{extract::ConnectInfo, http::{HeaderMap, StatusCode}, Router};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let captured = seen.clone();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async move {
+                let router = Router::new().fallback(move |ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>, headers: HeaderMap| {
+                    let captured = captured.clone();
+                    async move {
+                        captured.lock().unwrap().push((peer, headers["authorization"].to_str().unwrap().to_owned()));
+                        StatusCode::NO_CONTENT
+                    }
+                });
+                axum::serve(tokio::net::TcpListener::from_std(listener).unwrap(), router.into_make_service_with_connect_info::<std::net::SocketAddr>())
+                    .with_graceful_shutdown(async { let _ = stopped.await; }).await.unwrap();
+            });
+        });
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let first = ServerClient::with_cancellation(config(&endpoint), Some(cancelled.clone())).unwrap();
+        assert_eq!(first.request(Method::GET, "head", &[], None, &[], 1024).unwrap().status, 204);
+        cancelled.store(true, Ordering::Release);
+        assert_eq!(first.request(Method::GET, "head", &[], None, &[], 1024).err().unwrap().code, "cancelled");
+        drop(first);
+        let mut next = config(&endpoint);
+        next.token = "b".repeat(64);
+        let second = ServerClient::new(next).unwrap();
+        assert_eq!(second.request(Method::GET, "head", &[], None, &[], 1024).unwrap().status, 204);
+        stop.send(()).unwrap();
+        server.join().unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].0, seen[1].0, "a new Sync page should reuse the established TCP connection");
+        assert_eq!(seen[0].1, format!("Bearer {}", "a".repeat(64)));
+        assert_eq!(seen[1].1, format!("Bearer {}", "b".repeat(64)));
     }
     #[test]
     fn verified_progress_renews_more_than_five_minutes_of_transient_failures() {
