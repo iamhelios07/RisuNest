@@ -1,10 +1,19 @@
 use risunest_network_log::{Query, Recorder, Settings, Side};
 use serde::Deserialize;
 use serde_json::Value;
-use std::{io::Write, path::Path};
+use std::{io::Write, path::Path, sync::RwLock};
 use tauri::{Manager, State};
 
-pub(crate) struct NetworkLogState(pub Result<Recorder, String>);
+pub(crate) struct NetworkLogState(RwLock<Result<Recorder, String>>);
+impl NetworkLogState {
+    fn recorder(&self) -> Result<Recorder, String> { self.0.read().map_err(|_| "network-log-unavailable".to_owned())?.clone() }
+    #[cfg(any(mobile, test))]
+    pub(crate) fn reopen(&self, paths: &crate::app_paths::AppPaths) -> Result<(), String> {
+        let next = initialize(paths).0.into_inner().map_err(|_| "network-log-unavailable")?;
+        *self.0.write().map_err(|_| "network-log-unavailable")? = next;
+        Ok(())
+    }
+}
 
 pub(crate) fn initialize(paths: &crate::app_paths::AppPaths) -> NetworkLogState {
     let retained = paths.data.join("network-logs");
@@ -15,7 +24,7 @@ pub(crate) fn initialize(paths: &crate::app_paths::AppPaths) -> NetworkLogState 
         risunest_network_log::install(recorder.clone());
         Ok(recorder)
     })();
-    NetworkLogState(result)
+    NetworkLogState(RwLock::new(result))
 }
 fn exclude_backup(path: &Path) -> Result<(), String> {
     #[cfg(any(target_os = "ios", target_os = "macos"))]
@@ -38,6 +47,7 @@ pub(crate) enum Operation {
     Detail { id: String },
     Body { id: String, side: Side, offset: u64, length: Option<usize>, hex: Option<bool> },
     Events { id: String, offset: u64 },
+    ArrivalTimes { id: String, ends: Vec<u64> },
     Copy { id: String, side: Side },
     Retain { id: String },
     Delete { id: String },
@@ -52,7 +62,7 @@ pub(crate) async fn network_log_command(
     request: Operation,
 ) -> Result<Value, String> {
     if webview.label() != "main" { return Err("network-log-access-denied".into()); }
-    let recorder = state.0.as_ref().map_err(Clone::clone)?.clone();
+    let recorder = state.recorder()?;
     let app = webview.app_handle().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let jobs = app.state::<crate::native_file_jobs::NativeFileJobState>();
@@ -64,6 +74,7 @@ pub(crate) async fn network_log_command(
         Operation::Detail { id } => json(recorder.record(id)?),
         Operation::Body { id, side, offset, length, hex } => json(recorder.snapshot(id)?.body_range(side, offset, length.unwrap_or(risunest_network_log::PAGE_BYTES), hex)?),
         Operation::Events { id, offset } => json(recorder.snapshot(id)?.observations(offset)?),
+        Operation::ArrivalTimes { id, ends } => json(recorder.snapshot(id)?.arrival_times(&ends)?),
         Operation::Copy { id, side } => json(recorder.snapshot(id)?.copy_body(side)?),
         Operation::Retain { id } => { recorder.retain(id)?; Ok(Value::Null) },
         Operation::Delete { id } => { recorder.delete(id)?; Ok(Value::Null) },
@@ -99,4 +110,30 @@ pub(crate) async fn network_log_command(
             }
         }
     }}).await.map_err(|_| "network-log-worker-failed".to_string())?
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reopening_replaces_the_recorder_without_invalidating_state_references() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = crate::app_paths::AppPaths::isolated(root.path().join("synthetic-network-log")).unwrap();
+        let state = initialize(&paths);
+        let borrowed = &state;
+        let old = borrowed.recorder().unwrap();
+        old.configure(Settings { retain: true, ..Settings::default() }).unwrap();
+        old.shutdown();
+        state.reopen(&paths).unwrap();
+        assert!(old.is_stopped());
+        let current = borrowed.recorder().unwrap();
+        assert!(!current.is_stopped());
+        assert!(!current.settings().enabled);
+        assert!(current.settings().retain);
+        current.configure(Settings { hide_auth: false, ..Settings::default() }).unwrap();
+        assert!(!borrowed.recorder().unwrap().settings().hide_auth);
+        current.shutdown();
+    }
 }

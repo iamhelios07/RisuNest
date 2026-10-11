@@ -3,7 +3,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{Arc, Weak},
 };
@@ -53,6 +53,10 @@ pub(crate) struct Store {
     retained: PathBuf,
     pub(crate) bytes: [u64; 2],
     pub stop_active: bool,
+    recent_count: u64,
+    overhead: [u64; 2],
+    writers: HashMap<(String, usize), File>,
+    started: HashMap<String, std::time::Instant>,
     decoders: HashMap<(String, usize), crate::decoding::Decoder>,
     readers: HashMap<String, Weak<()>>,
 }
@@ -92,6 +96,10 @@ impl Store {
             retained,
             bytes: [0, 0],
             stop_active: false,
+            recent_count: 0,
+            overhead: [0, 0],
+            writers: HashMap::new(),
+            started: HashMap::new(),
             decoders: HashMap::new(),
             readers: HashMap::new(),
         };
@@ -170,6 +178,8 @@ impl Store {
                 r.get::<_, i64>(0)
             })
             .map_err(err)? as u64;
+        store.refresh_overhead(false);
+        store.refresh_overhead(true);
         Ok(store)
     }
     pub fn settings(&self) -> Result<Settings, String> {
@@ -189,6 +199,7 @@ impl Store {
         output.sync_all().map_err(err)?;
         drop(output);
         fs::rename(tmp, self.retained.join("settings.json")).map_err(err)?;
+        self.refresh_overhead(true);
         let _ = self.room(false, 0, settings, None);
         Ok(())
     }
@@ -202,16 +213,19 @@ impl Store {
     pub(crate) fn dir(&self, record: &Record) -> PathBuf {
         self.root(record.retained).join(&record.id)
     }
+    fn refresh_overhead(&mut self, retained: bool) {
+        self.overhead[usize::from(retained)] =
+            ["index.sqlite", "index.sqlite-journal", "settings.json"]
+                .iter()
+                .map(|p| {
+                    fs::metadata(self.root(retained).join(p))
+                        .map(|m| m.len())
+                        .unwrap_or(0)
+                })
+                .sum::<u64>();
+    }
     fn used(&self, retained: bool) -> u64 {
-        let overhead = ["index.sqlite", "index.sqlite-journal", "settings.json"]
-            .iter()
-            .map(|p| {
-                fs::metadata(self.root(retained).join(p))
-                    .map(|m| m.len())
-                    .unwrap_or(0)
-            })
-            .sum::<u64>();
-        self.bytes[usize::from(retained)] + overhead
+        self.bytes[usize::from(retained)] + self.overhead[usize::from(retained)]
     }
     fn room(
         &mut self,
@@ -226,19 +240,14 @@ impl Store {
             settings.recent_mib
         } * MIB;
         loop {
-            let count: u64 = self
-                .db
-                .query_row("SELECT count(*) FROM recent.records", [], |r| {
-                    r.get::<_, i64>(0)
-                })
-                .map_err(err)? as u64;
             if self
                 .used(retained)
                 .saturating_add(extra)
                 .saturating_add(2 * MIB)
                 <= limit
                 && (retained
-                    || count + u64::from(inserting.is_some()) <= settings.recent_count as u64)
+                    || self.recent_count + u64::from(inserting.is_some())
+                        <= settings.recent_count as u64)
             {
                 return Ok(());
             }
@@ -260,6 +269,7 @@ impl Store {
             self.db
                 .execute_batch("PRAGMA recent.incremental_vacuum;")
                 .map_err(err)?;
+            self.refresh_overhead(false);
         }
     }
     pub fn insert(&mut self, record: &Record, settings: &Settings) -> Result<(), String> {
@@ -273,6 +283,13 @@ impl Store {
         if let Err(error) = self.update(record) {
             let _ = fs::remove_dir_all(&dir);
             return Err(error);
+        }
+        if !record.retained {
+            self.recent_count += 1;
+        }
+        if record.state == "active" {
+            self.started
+                .insert(record.id.clone(), std::time::Instant::now());
         }
         Ok(())
     }
@@ -312,8 +329,10 @@ impl Store {
             .filter(|((key, _), _)| key == id)
             .all(|(_, d)| d.complete || d.limited)
     }
-    pub fn finish_decoding(&mut self, id: &str) {
+    pub fn finish(&mut self, id: &str) {
         self.decoders.retain(|(key, _), _| key != id);
+        self.writers.retain(|(key, _), _| key != id);
+        self.started.remove(id);
     }
     pub fn update(&mut self, record: &Record) -> Result<(), String> {
         self.db
@@ -337,6 +356,7 @@ impl Store {
                 ],
             )
             .map_err(err)?;
+        self.refresh_overhead(record.retained);
         Ok(())
     }
     pub fn append(
@@ -381,7 +401,9 @@ impl Store {
             length: bytes.len() as u64,
             kind: kind.unwrap_or("chunk").into(),
         };
-        let event = if record.stream_kind.is_some() {
+        let event = if record.stream_kind.as_deref() == Some("websocket")
+            || (record.stream_kind.as_deref() == Some("sse") && matches!(side, Side::Response))
+        {
             let mut data = serde_json::to_vec(&observation).map_err(err)?;
             data.push(b'\n');
             data
@@ -395,31 +417,56 @@ impl Store {
             None,
         )?;
         let path = self.dir(record);
-        let mut body = file(&path.join(side.file()), true)?;
-        let before = body.metadata().map_err(err)?.len();
-        let result = body.write_all(bytes);
-        let written = body.metadata().map_err(err)?.len().saturating_sub(before);
-        record.body_mut(side).captured_bytes += written;
-        self.bytes[usize::from(record.retained)] += written;
-        result.map_err(err)?;
+        let key = (record.id.clone(), side.index());
+        if !self.writers.contains_key(&key) {
+            self.writers
+                .insert(key.clone(), file(&path.join(side.file()), true)?);
+        }
+        let body = self.writers.get_mut(&key).unwrap();
+        let mut remaining = bytes;
+        while !remaining.is_empty() {
+            match body.write(remaining) {
+                Ok(0) => return Err("network-log-storage-failed".into()),
+                Ok(written) => {
+                    record.body_mut(side).captured_bytes += written as u64;
+                    self.bytes[usize::from(record.retained)] += written as u64;
+                    remaining = &remaining[written..];
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(err(error)),
+            }
+        }
         if !event.is_empty() {
-            let mut events = file(&path.join("events"), true)?;
-            let before = events.metadata().map_err(err)?.len();
-            let result = events.write_all(&event);
-            let written = events.metadata().map_err(err)?.len().saturating_sub(before);
-            if result.is_err() {
-                events.set_len(before).map_err(err)?;
+            let key = (record.id.clone(), 2);
+            if !self.writers.contains_key(&key) {
+                self.writers
+                    .insert(key.clone(), file(&path.join("events"), true)?);
+            }
+            let events = self.writers.get_mut(&key).unwrap();
+            if events.write_all(&event).is_err() {
+                events.set_len(record.event_bytes).map_err(err)?;
                 return Err("network-log-storage-failed".into());
             }
-            record.event_bytes += written;
-            self.bytes[usize::from(record.retained)] += written;
+            record.event_bytes += event.len() as u64;
+            self.bytes[usize::from(record.retained)] += event.len() as u64;
         }
         Ok(())
     }
     pub fn record(&self, id: &str) -> Result<Record, String> {
         valid_id(id)?;
         let json: Option<String> = self.db.query_row("SELECT detail FROM main.records WHERE id=?1 UNION ALL SELECT detail FROM recent.records WHERE id=?1 LIMIT 1", [id], |r| r.get(0)).optional().map_err(err)?;
-        serde_json::from_str(&json.ok_or_else(|| "network-log-expired".to_string())?).map_err(err)
+        let mut record: Record =
+            serde_json::from_str(&json.ok_or_else(|| "network-log-expired".to_string())?)
+                .map_err(err)?;
+        self.elapsed(&mut record);
+        Ok(record)
+    }
+    fn elapsed(&self, record: &mut Record) {
+        if record.state == "active" {
+            if let Some(start) = self.started.get(&record.id) {
+                record.elapsed_ms = start.elapsed().as_millis() as u64;
+            }
+        }
     }
     pub fn list(&self, query: &Query) -> Result<Listing, String> {
         if query.search.len() > 1024 || query.offset > 1_000_000 {
@@ -444,7 +491,8 @@ impl Store {
             .map_err(err)?;
         let mut items = Vec::new();
         for row in rows {
-            let record: Record = serde_json::from_str(&row.map_err(err)?).map_err(err)?;
+            let mut record: Record = serde_json::from_str(&row.map_err(err)?).map_err(err)?;
+            self.elapsed(&mut record);
             items.push(ListItem::from(&record));
         }
         let has_more = items.len() > 50;
@@ -500,6 +548,7 @@ impl Store {
             settings,
             Some(id),
         )?;
+        self.writers.retain(|(key, _), _| key != id);
         let from = self.dir(&record);
         let to = self.retained.join(id);
         record.retained = true;
@@ -542,6 +591,9 @@ impl Store {
             }
             return Err(error);
         }
+        self.recent_count = self.recent_count.saturating_sub(1);
+        self.refresh_overhead(false);
+        self.refresh_overhead(true);
         self.bytes[0] = self.bytes[0].saturating_sub(bytes);
         self.bytes[1] += bytes;
         if from.exists() {
@@ -571,6 +623,10 @@ impl Store {
                 [id],
             )
             .map_err(err)?;
+        if !record.retained {
+            self.recent_count = self.recent_count.saturating_sub(1);
+        }
+        self.refresh_overhead(record.retained);
         self.bytes[usize::from(record.retained)] = self.bytes[usize::from(record.retained)]
             .saturating_sub(
                 record.request.body.captured_bytes
@@ -580,6 +636,7 @@ impl Store {
         Ok(())
     }
     pub fn clear_recent(&mut self) -> Result<(), String> {
+        self.writers.clear();
         self.db
             .execute_batch("DELETE FROM recent.records; DETACH DATABASE recent;")
             .map_err(err)?;
@@ -587,6 +644,91 @@ impl Store {
     }
 }
 impl Snapshot {
+    pub fn arrival_times(&mut self, ends: &[u64]) -> Result<Vec<Option<u64>>, String> {
+        if ends.len() > 50 || ends.windows(2).any(|pair| pair[0] > pair[1]) {
+            return Err("invalid-network-log-query".into());
+        }
+        if ends.is_empty() || self.record.stream_kind.as_deref() != Some("sse") {
+            return Ok(vec![None; ends.len()]);
+        }
+        let mut reader =
+            BufReader::with_capacity(4096, (&mut self.events).take(self.record.event_bytes));
+        // Locate the first response chunk by its body offset, then read the bounded page in order.
+        let mut low = 0;
+        let mut high = self.record.event_bytes;
+        let first = ends[0];
+        while low < high {
+            let mid = low + (high - low) / 2;
+            reader
+                .get_mut()
+                .get_mut()
+                .seek(SeekFrom::Start(mid))
+                .map_err(err)?;
+            reader = BufReader::with_capacity(
+                4096,
+                reader
+                    .into_inner()
+                    .into_inner()
+                    .take(self.record.event_bytes - mid),
+            );
+            if mid > 0 {
+                let mut skipped = Vec::new();
+                reader
+                    .by_ref()
+                    .take(1024)
+                    .read_until(b'\n', &mut skipped)
+                    .map_err(err)?;
+            }
+            let position =
+                self.record.event_bytes - reader.get_ref().limit() - reader.buffer().len() as u64;
+            let mut line = String::new();
+            reader
+                .by_ref()
+                .take(1024)
+                .read_line(&mut line)
+                .map_err(err)?;
+            let observation: Option<Observation> = if line.is_empty() {
+                None
+            } else {
+                Some(serde_json::from_str(&line).map_err(err)?)
+            };
+            if observation.is_some_and(|o| o.offset + o.length < first) {
+                low = position + line.len() as u64;
+            } else {
+                high = mid;
+            }
+        }
+        let input = reader.into_inner().into_inner();
+        input.seek(SeekFrom::Start(low)).map_err(err)?;
+        let mut reader = BufReader::with_capacity(4096, input.take(self.record.event_bytes - low));
+        let mut result = vec![None; ends.len()];
+        let mut index = 0;
+        let mut line = String::new();
+        while index < ends.len() {
+            line.clear();
+            if reader
+                .by_ref()
+                .take(1024)
+                .read_line(&mut line)
+                .map_err(err)?
+                == 0
+            {
+                break;
+            }
+            let observation: Observation = serde_json::from_str(&line).map_err(err)?;
+            if !matches!(observation.side, Side::Response) {
+                continue;
+            }
+            while index < ends.len() && ends[index] <= observation.offset + observation.length {
+                if ends[index] > observation.offset {
+                    result[index] = Some(observation.elapsed_ms);
+                }
+                index += 1;
+            }
+        }
+        Ok(result)
+    }
+
     pub fn body_page(&mut self, side: Side, offset: u64) -> Result<BodyPage, String> {
         self.body_range(side, offset, PAGE_BYTES, None)
     }

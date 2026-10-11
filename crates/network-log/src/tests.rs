@@ -754,3 +754,238 @@ fn interrupted_retained_record_recovers_only_committed_bytes_and_cleans_cache() 
     assert!(!cache.join("unflushed").exists());
     recovered.shutdown();
 }
+
+#[test]
+fn overflowing_request_keeps_response_metadata_and_response_body() {
+    let f = Fixture::new();
+    f.enable(false, false);
+    let c = f.begin();
+    f.detail(&c);
+    let (release, wait) = mpsc::channel();
+    let (ready, started) = mpsc::channel();
+    f.recorder
+        .0
+        .sender
+        .send(Event::Job(Box::new(move |_| {
+            ready.send(()).unwrap();
+            wait.recv_timeout(Duration::from_secs(5)).unwrap();
+        })))
+        .unwrap();
+    started.recv().unwrap();
+    c.append(Side::Request, &vec![b'x'; 6 * MIB as usize]);
+    c.response(201, "https://synthetic.example/final", &text_headers());
+    release.send(()).unwrap();
+    let pending = f.detail(&c);
+    assert_eq!(pending.response.status, Some(201));
+    assert!(!pending.response.headers.is_empty());
+    c.append(Side::Response, b"data: preserved\n\n");
+    c.finish("complete");
+    let record = f.detail(&c);
+    assert_eq!(record.capture_error.as_deref(), Some("queue-full"));
+    assert!(record.request.body.truncated);
+    assert!(!record.response.body.truncated);
+    assert_eq!(
+        f.snapshot(&c).copy_body(Side::Response).unwrap(),
+        "data: preserved\n\n"
+    );
+}
+
+#[test]
+fn idle_websocket_does_not_write_the_index_but_elapsed_time_advances() {
+    let f = Fixture::new();
+    f.enable(false, false);
+    let c = f
+        .recorder
+        .begin(
+            "ws",
+            "WS",
+            "wss://synthetic.example",
+            &http::HeaderMap::new(),
+        )
+        .guard();
+    c.response(101, "wss://synthetic.example", &http::HeaderMap::new());
+    f.detail(&c);
+    let index = f.root.path().join("recent/index.sqlite");
+    let before = fs::metadata(&index).unwrap().modified().unwrap();
+    std::thread::sleep(Duration::from_millis(700));
+    assert_eq!(fs::metadata(&index).unwrap().modified().unwrap(), before);
+    let record = f.detail(&c);
+    assert!(record.elapsed_ms >= 700);
+    assert_eq!(fs::metadata(&index).unwrap().modified().unwrap(), before);
+    c.append_message(Side::Response, b"hello", Some("text"));
+    assert_eq!(f.detail(&c).response.body.captured_bytes, 5);
+    c.finish("complete");
+    assert_eq!(f.detail(&c).state, "complete");
+}
+
+#[test]
+fn websocket_text_and_readable_control_payloads_stay_readable() {
+    let f = Fixture::new();
+    f.enable(false, false);
+    let c = f
+        .recorder
+        .begin(
+            "ws",
+            "WS",
+            "wss://synthetic.example",
+            &http::HeaderMap::new(),
+        )
+        .guard();
+    c.append_message(Side::Response, b"hello", Some("text"));
+    c.append_message(Side::Response, b"", Some("pong"));
+    c.append_message(Side::Response, b"ping", Some("ping"));
+    c.append_message(Side::Response, b"world", Some("text"));
+    c.finish("complete");
+    assert_eq!(
+        f.snapshot(&c).copy_body(Side::Response).unwrap(),
+        "hellopingworld"
+    );
+    let events = f.snapshot(&c).observations(0).unwrap();
+    assert_eq!(events.text.lines().count(), 4);
+    let mut json = Vec::new();
+    f.snapshot(&c).export_json(&mut json).unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&json).unwrap();
+    assert_eq!(json["response"]["body"]["encoding"], "utf8");
+}
+
+#[test]
+#[ignore = "paced disk-throughput measurement"]
+fn sustained_sse_preserves_small_and_large_chunks_without_queue_overflow() {
+    let f = Fixture::new();
+    f.enable(false, false);
+    for (size, count, interval) in [(1024, 1000, 2), (16 * 1024, 1000, 2), (64 * 1024, 500, 4)] {
+        let c = f.begin();
+        c.response(200, "https://synthetic.example/stream", &text_headers());
+        f.detail(&c);
+        let bytes = vec![b'x'; size];
+        let start = Instant::now();
+        let mut peak = 0;
+        for index in 0..count {
+            c.append(Side::Response, &bytes);
+            peak = peak.max(f.recorder.0.queued.load(Ordering::Relaxed));
+            if let Some(remaining) =
+                Duration::from_millis((index + 1) * interval).checked_sub(start.elapsed())
+            {
+                std::thread::sleep(remaining);
+            }
+        }
+        c.finish("complete");
+        let record = f.detail(&c);
+        eprintln!(
+            "chunk={size} count={count} elapsed_ms={} captured={} peak_queue={peak}",
+            start.elapsed().as_millis(),
+            record.response.body.captured_bytes
+        );
+        assert_eq!(record.response.body.captured_bytes, size as u64 * count);
+        assert!(!record.response.body.truncated);
+        assert!(record.capture_error.is_none());
+    }
+}
+
+#[test]
+fn request_decode_failure_does_not_stop_response_capture() {
+    let f = Fixture::new();
+    f.enable(false, false);
+    let mut headers = text_headers();
+    headers.insert("content-encoding", "gzip".parse().unwrap());
+    let c = f
+        .recorder
+        .begin("test", "POST", "https://synthetic.example", &headers)
+        .guard();
+    c.append(Side::Request, b"invalid-gzip");
+    f.detail(&c);
+    c.response(400, "https://synthetic.example", &text_headers());
+    c.append(Side::Response, b"data: error preserved\n\n");
+    c.finish("complete");
+    assert_eq!(f.detail(&c).response.status, Some(400));
+    assert_eq!(f.detail(&c).capture_error.as_deref(), Some("decode-failed"));
+    assert_eq!(
+        f.snapshot(&c).copy_body(Side::Response).unwrap(),
+        "data: error preserved\n\n"
+    );
+}
+
+#[test]
+fn sse_arrival_lookup_uses_the_chunk_containing_each_event_end() {
+    use std::io::Read;
+    let f = Fixture::new();
+    f.enable(false, false);
+    let c = f.begin();
+    c.response(200, "https://synthetic.example", &text_headers());
+    for index in 0..200 {
+        c.append(Side::Response, &vec![b'x'; 10 + index]);
+    }
+    c.finish("complete");
+    let mut snapshot = f.snapshot(&c);
+    let mut text = String::new();
+    (&mut snapshot.events)
+        .take(snapshot.record.event_bytes)
+        .read_to_string(&mut text)
+        .unwrap();
+    let chunks: Vec<Observation> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(chunks.len(), 200);
+    for index in [0, 1, 49, 99, 150, 198, 199] {
+        let chunk = &chunks[index];
+        let ends = [chunk.offset + 1, chunk.offset + chunk.length];
+        assert_eq!(
+            snapshot.arrival_times(&ends).unwrap(),
+            vec![Some(chunk.elapsed_ms); 2]
+        );
+    }
+    let ends = chunks
+        .iter()
+        .skip(120)
+        .take(50)
+        .map(|c| c.offset + c.length)
+        .collect::<Vec<_>>();
+    let expected = chunks
+        .iter()
+        .skip(120)
+        .take(50)
+        .map(|c| Some(c.elapsed_ms))
+        .collect::<Vec<_>>();
+    assert_eq!(snapshot.arrival_times(&ends).unwrap(), expected);
+    assert_eq!(
+        snapshot
+            .arrival_times(&[snapshot.record.response.body.captured_bytes + 1])
+            .unwrap(),
+        vec![None]
+    );
+    assert!(snapshot.arrival_times(&[10, 1]).is_err());
+    assert!(snapshot.arrival_times(&[1; 51]).is_err());
+}
+
+#[test]
+fn response_and_completion_survive_a_full_event_queue() {
+    let f = Fixture::new();
+    f.enable(false, false);
+    let c = f.begin();
+    f.detail(&c);
+    let (release, wait) = mpsc::channel();
+    let (ready, started) = mpsc::channel();
+    f.recorder
+        .0
+        .sender
+        .send(Event::Job(Box::new(move |_| {
+            ready.send(()).unwrap();
+            wait.recv_timeout(Duration::from_secs(5)).unwrap();
+        })))
+        .unwrap();
+    started.recv().unwrap();
+    for _ in 0..QUEUE_EVENTS + 1 {
+        c.append(Side::Request, b"x");
+    }
+    assert!(f.recorder.0.queued.load(Ordering::Relaxed) < QUEUE_BYTES);
+    c.response(204, "https://synthetic.example/final", &text_headers());
+    c.finish("complete");
+    release.send(()).unwrap();
+    let record = f.detail(&c);
+    assert_eq!(record.response.status, Some(204));
+    assert!(!record.response.headers.is_empty());
+    assert_eq!(record.state, "complete");
+    assert_eq!(record.capture_error.as_deref(), Some("queue-full"));
+    assert!(record.request.body.truncated);
+}

@@ -47,6 +47,29 @@ describe('native network settings', () => {
         button('보관').click(); await settle(); expect(mock.call).toHaveBeenCalledWith({ op: 'retain', id: 'synthetic' })
         button('JSON 다운로드').click(); await settle(); expect(mock.download).toHaveBeenCalledWith('synthetic')
     })
+    it('shows SSE sequence and arrival times across pages without marking a known boundary partial', async () => {
+        const original = mock.call.getMockImplementation()!
+        const stream = 'data: value\n\n'.repeat(51)
+        mock.call.mockImplementation(async request => {
+            if (request.op === 'detail') return { ...record, streamKind: 'sse' }
+            if (request.op === 'body') return { text: stream.slice(request.offset), offset: request.offset, nextOffset: stream.length, total: stream.length, binary: false }
+            if (request.op === 'arrivalTimes') return request.ends.map((end: number) => end * 10)
+            return original(request)
+        })
+        host.querySelector<HTMLButtonElement>('.request-row')!.click(); await settle(); button('이벤트').click(); await settle()
+        let events = [...host.querySelectorAll('.event-row > summary')]
+        expect(events).toHaveLength(50)
+        expect(events[0].textContent).toContain('#1')
+        expect(events[49].textContent).toContain('#50')
+        expect(events[0].querySelector('time')?.getAttribute('title')).toBe(new Date(130).toISOString())
+        button('다음').click(); await settle()
+        events = [...host.querySelectorAll('.event-row > summary')]
+        expect(events).toHaveLength(1)
+        expect(events[0].textContent).toContain('#51')
+        expect(events[0].textContent).not.toContain('일부 표시')
+        button('이전').click(); await settle()
+        expect(host.querySelector('.event-row > summary')?.textContent).toContain('#1')
+    })
     it('renders the selected WebSocket message after asynchronous loading', async () => {
         const original = mock.call.getMockImplementation()!
         mock.call.mockImplementation(async request => request.op === 'detail' ? { ...record, streamKind: 'websocket' } : request.op === 'events'

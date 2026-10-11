@@ -266,6 +266,7 @@ pub(crate) struct Reply {
 /// marker is set.
 pub(crate) struct PreparedBody {
     wire: Vec<u8>,
+    log_body: Option<Vec<u8>>,
     encoded: bool,
     #[cfg(test)]
     raw_len: usize,
@@ -669,11 +670,13 @@ impl ServerClient {
                 encoded: true,
                 #[cfg(test)]
                 raw_len: raw.len(),
+                log_body: risunest_network_log::enabled().then_some(raw),
             },
             None => PreparedBody {
                 #[cfg(test)]
                 raw_len: raw.len(),
                 wire: raw,
+                log_body: None,
                 encoded: false,
             },
         }))
@@ -753,12 +756,11 @@ impl ServerClient {
         let capture = risunest_network_log::begin("sync", request.method().as_str(), request.url().as_str(), request.headers());
         if capture.is_active() {
             if let Some(body) = body {
+                let raw = body.log_body.as_deref().unwrap_or(&body.wire);
                 if body.encoded {
-                    match body_codec::decode(&body.wire, 8 * 1024 * 1024) {
-                        Ok(raw) => { capture.representation(risunest_network_log::Side::Request, "decoded-sync"); capture.append(risunest_network_log::Side::Request, &raw); },
-                        Err(_) => { capture.representation(risunest_network_log::Side::Request, "encoded-sync"); capture.append(risunest_network_log::Side::Request, &body.wire); },
-                    }
-                } else { capture.append(risunest_network_log::Side::Request, &body.wire); }
+                    capture.representation(risunest_network_log::Side::Request, if body.log_body.is_some() { "decoded-sync" } else { "encoded-sync" });
+                }
+                capture.append(risunest_network_log::Side::Request, raw);
             }
         }
         let response = self.http.execute(request).map_err(|e| {
@@ -1018,7 +1020,7 @@ mod progress_tests {
         let worker_lane = lane.clone();
         let worker = std::thread::spawn(move || super::super::progress::within(&worker_lane, || {
             let client = ServerClient::new(super::tests::config(&endpoint)).unwrap();
-            let body = PreparedBody { wire: vec![7; UPLOAD], encoded: false, raw_len: UPLOAD };
+            let body = PreparedBody { wire: vec![7; UPLOAD], log_body: None, encoded: false, raw_len: UPLOAD };
             client.request_once(Method::PUT, "synthetic", &[], Some(&body), &[], 8192).unwrap().body
         }));
         noticed.recv_timeout(Duration::from_secs(5)).unwrap();

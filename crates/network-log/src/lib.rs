@@ -46,6 +46,10 @@ struct Signal {
     pending: AtomicUsize,
     outcome: AtomicU8,
     reason: AtomicU8,
+    body_reason: [AtomicU8; 2],
+    response: Mutex<Option<Message>>,
+    representations: Mutex<[Option<&'static str>; 2]>,
+    dirty: AtomicBool,
     elapsed: AtomicU64,
     observed: [AtomicU64; 2],
     admitted: [AtomicU64; 2],
@@ -55,12 +59,37 @@ struct Signal {
 }
 impl Signal {
     fn stop(&self, reason: u8) {
+        self.dirty.store(true, Ordering::Release);
         let _ = self
             .reason
             .compare_exchange(0, reason, Ordering::AcqRel, Ordering::Relaxed);
         if reason == 2 {
             *self.owner.warning.lock().unwrap() = Some("queue-full".into());
         }
+    }
+}
+impl Signal {
+    fn stop_body(&self, side: Side, reason: u8) {
+        let _ = self.body_reason[side.index()].compare_exchange(
+            0,
+            reason,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
+        self.dirty.store(true, Ordering::Release);
+        if reason == 2 {
+            *self.owner.warning.lock().unwrap() = Some("queue-full".into());
+        }
+    }
+    fn capture_reason(&self) -> u8 {
+        [
+            self.reason.load(Ordering::Relaxed),
+            self.body_reason[0].load(Ordering::Relaxed),
+            self.body_reason[1].load(Ordering::Relaxed),
+        ]
+        .into_iter()
+        .find(|r| *r != 0)
+        .unwrap_or(0)
     }
 }
 impl Drop for Signal {
@@ -99,8 +128,6 @@ impl Drop for Envelope {
 }
 enum Payload {
     Start(Record),
-    Response(Message),
-    Representation(Side, &'static str),
     Bytes(Side, Vec<u8>, u64, Option<String>),
 }
 enum Event {
@@ -207,43 +234,14 @@ impl Recorder {
                                     }
                                     result
                                 }
-                                Payload::Response(response) => {
-                                    if let Some((_, record)) = active.get_mut(&signal.id) {
-                                        record.response = response.clone();
-                                        store.prepare_decoding(
-                                            record,
-                                            Side::Response,
-                                            signal.limit,
-                                        );
-                                        if record.response.headers.iter().any(|h| {
-                                            h.name.eq_ignore_ascii_case("content-type")
-                                                && h.value.contains("text/event-stream")
-                                        }) {
-                                            record.stream_kind = Some("sse".into());
-                                        }
-                                        if let Err(error) = store.admit_metadata(record, &settings)
-                                        {
-                                            record.response.headers.clear();
-                                            Err(error)
-                                        } else {
-                                            store.update(record)
-                                        }
-                                    } else {
-                                        Ok(())
-                                    }
-                                }
-                                Payload::Representation(side, representation) => {
-                                    if let Some((_, record)) = active.get_mut(&signal.id) {
-                                        record.body_mut(*side).representation =
-                                            representation.to_string();
-                                    }
-                                    Ok(())
-                                }
                                 Payload::Bytes(side, bytes, elapsed, kind) => {
                                     if let Some((_, record)) = active.get_mut(&signal.id) {
-                                        if [3, 4, 6]
-                                            .contains(&signal.reason.load(Ordering::Relaxed))
-                                        {
+                                        apply_metadata(&mut store, signal, record, &settings);
+                                        signal.dirty.store(true, Ordering::Release);
+                                        if [3, 4, 6].contains(
+                                            &signal.body_reason[side.index()]
+                                                .load(Ordering::Relaxed),
+                                        ) {
                                             Ok(())
                                         } else {
                                             store.append(
@@ -261,11 +259,16 @@ impl Recorder {
                                 }
                             };
                             if let Err(error) = result {
-                                signal.stop(match error.as_str() {
+                                let reason = match error.as_str() {
                                     "quota" => 3,
                                     "decode-failed" => 6,
                                     _ => 4,
-                                });
+                                };
+                                if let Payload::Bytes(side, ..) = &envelope.event {
+                                    signal.stop_body(*side, reason);
+                                } else {
+                                    signal.stop(reason);
+                                }
                                 *owner.warning.lock().unwrap() = Some(error);
                             }
                         }
@@ -341,6 +344,10 @@ impl Recorder {
             pending: AtomicUsize::new(0),
             outcome: AtomicU8::new(0),
             reason: AtomicU8::new(0),
+            body_reason: [AtomicU8::new(0), AtomicU8::new(0)],
+            response: Mutex::new(None),
+            representations: Mutex::new([None, None]),
+            dirty: AtomicBool::new(true),
             elapsed: AtomicU64::new(0),
             observed: [AtomicU64::new(0), AtomicU64::new(0)],
             admitted: [AtomicU64::new(0), AtomicU64::new(0)],
@@ -438,6 +445,46 @@ impl Recorder {
         self.0.stopped.load(Ordering::Acquire)
     }
 }
+fn apply_metadata(
+    store: &mut storage::Store,
+    signal: &Signal,
+    record: &mut Record,
+    settings: &Settings,
+) {
+    if let Some(response) = signal.response.lock().unwrap().take() {
+        record.response = response;
+        store.prepare_decoding(record, Side::Response, signal.limit);
+        if record.response.headers.iter().any(|h| {
+            h.name.eq_ignore_ascii_case("content-type") && h.value.contains("text/event-stream")
+        }) {
+            record.stream_kind = Some("sse".into());
+        }
+        if let Err(error) = store.admit_metadata(record, settings) {
+            record.response.headers.clear();
+            signal.stop_body(Side::Response, if error == "quota" { 3 } else { 4 });
+            *signal.owner.warning.lock().unwrap() = Some(error);
+        }
+        signal.dirty.store(true, Ordering::Release);
+    }
+    for (index, value) in signal
+        .representations
+        .lock()
+        .unwrap()
+        .iter_mut()
+        .enumerate()
+    {
+        if let Some(value) = value.take() {
+            record
+                .body_mut(if index == 0 {
+                    Side::Request
+                } else {
+                    Side::Response
+                })
+                .representation = value.into();
+            signal.dirty.store(true, Ordering::Release);
+        }
+    }
+}
 fn flush(
     store: &mut storage::Store,
     active: &mut std::collections::HashMap<String, (Arc<Signal>, Record)>,
@@ -449,12 +496,17 @@ fn flush(
             signal.stop(1);
         }
         let outcome = signal.outcome.load(Ordering::Acquire);
+        let settings = signal.owner.settings.lock().unwrap().clone();
+        apply_metadata(store, signal, record, &settings);
         let terminal = (outcome != 0 || signal.reason.load(Ordering::Relaxed) == 1)
             && signal.pending.load(Ordering::Acquire) == 0;
         if force == 0
             && !terminal
             && (signal.start.elapsed().as_millis() as u64) < record.elapsed_ms + 250
         {
+            return true;
+        }
+        if !terminal && force != 2 && !signal.dirty.swap(false, Ordering::AcqRel) {
             return true;
         }
         record.elapsed_ms = if outcome == 0 {
@@ -492,10 +544,14 @@ fn flush(
                 }
             }
         }
-        if terminal && outcome == 1 && !store.decoding_complete(&record.id) {
+        if terminal
+            && outcome == 1
+            && signal.capture_reason() == 0
+            && !store.decoding_complete(&record.id)
+        {
             signal.stop(6);
         }
-        record.capture_error = match signal.reason.load(Ordering::Relaxed) {
+        record.capture_error = match signal.capture_reason() {
             1 => Some("stopped"),
             2 => Some("queue-full"),
             3 => Some("quota"),
@@ -512,7 +568,7 @@ fn flush(
             *signal.owner.warning.lock().unwrap() = Some(error);
         }
         if terminal || force == 2 {
-            store.finish_decoding(&record.id);
+            store.finish(&record.id);
         }
         !terminal && force != 2
     });
@@ -520,7 +576,8 @@ fn flush(
 impl Capture {
     pub fn is_active(&self) -> bool {
         self.0.as_ref().is_some_and(|s| {
-            s.reason.load(Ordering::Relaxed) == 0 && s.owner.enabled.load(Ordering::Relaxed)
+            matches!(s.reason.load(Ordering::Relaxed), 0 | 5)
+                && s.owner.enabled.load(Ordering::Relaxed)
         })
     }
     pub fn was_stopped(&self) -> bool {
@@ -535,6 +592,17 @@ impl Capture {
         let Some(signal) = &self.0 else {
             return;
         };
+        let side = match &event {
+            Payload::Bytes(side, ..) => Some(*side),
+            _ => None,
+        };
+        let failed = || {
+            if let Some(side) = side {
+                signal.stop_body(side, 2);
+            } else {
+                signal.stop(2);
+            }
+        };
         if signal
             .owner
             .queued
@@ -543,7 +611,7 @@ impl Capture {
             })
             .is_err()
         {
-            signal.stop(2);
+            failed();
             return;
         }
         signal.pending.fetch_add(1, Ordering::Relaxed);
@@ -558,7 +626,7 @@ impl Capture {
             .try_send(Event::Capture(envelope))
             .is_err()
         {
-            signal.stop(2);
+            failed();
         }
     }
     pub fn response(&self, status: u16, url: &str, headers: &http::HeaderMap) {
@@ -587,12 +655,15 @@ impl Capture {
             },
             method: None,
         };
-        let bytes = response.queued_bytes() + 2048;
-        self.enqueue(Payload::Response(response), bytes);
+        // One bounded response slot per admitted capture survives a full body queue.
+        *signal.response.lock().unwrap() = Some(response);
+        signal.dirty.store(true, Ordering::Release);
+        let _ = signal.owner.sender.try_send(Event::Wake);
     }
     pub fn mark_partial(&self) {
         if let Some(signal) = &self.0 {
             signal.partial.store(true, Ordering::Relaxed);
+            signal.dirty.store(true, Ordering::Release);
         }
     }
     pub fn representation(&self, side: Side, value: &'static str) {
@@ -602,7 +673,10 @@ impl Capture {
                     signal.binary[side.index()].store(true, Ordering::Relaxed);
                 }
             }
-            self.enqueue(Payload::Representation(side, value), 64);
+            if let Some(signal) = &self.0 {
+                signal.representations.lock().unwrap()[side.index()] = Some(value);
+                signal.dirty.store(true, Ordering::Release);
+            }
         }
     }
     pub fn append(&self, side: Side, bytes: &[u8]) {
@@ -617,10 +691,13 @@ impl Capture {
             return;
         }
         signal.observed[side.index()].fetch_add(bytes.len() as u64, Ordering::Relaxed);
-        if signal.reason.load(Ordering::Relaxed) != 0 {
+        signal.dirty.store(true, Ordering::Release);
+        if !self.is_active() || signal.body_reason[side.index()].load(Ordering::Relaxed) != 0 {
             return;
         }
-        if matches!(kind, Some("binary" | "ping" | "pong")) {
+        if kind == Some("binary")
+            || (matches!(kind, Some("ping" | "pong")) && std::str::from_utf8(bytes).is_err())
+        {
             signal.binary[side.index()].store(true, Ordering::Relaxed);
         }
         let limit = if !signal.websocket && signal.binary[side.index()].load(Ordering::Relaxed) {
@@ -650,7 +727,7 @@ impl Capture {
             );
         }
         for chunk in bytes[..count].chunks(CHUNK_BYTES) {
-            if signal.reason.load(Ordering::Relaxed) != 0 {
+            if !self.is_active() || signal.body_reason[side.index()].load(Ordering::Relaxed) != 0 {
                 break;
             }
             self.enqueue(
@@ -687,6 +764,8 @@ impl Capture {
                     },
                     Ordering::Release,
                 );
+                signal.dirty.store(true, Ordering::Release);
+                let _ = signal.owner.sender.try_send(Event::Wake);
             }
         }
     }

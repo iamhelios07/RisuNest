@@ -33,6 +33,7 @@ export type LogOperation =
     | { op: 'detail' | 'retain' | 'delete'; id: string }
     | { op: 'body'; id: string; side: LogSide; offset: number; length?: number; hex?: boolean }
     | { op: 'events'; id: string; offset: number }
+    | { op: 'arrivalTimes'; id: string; ends: number[] }
     | { op: 'copy'; id: string; side: LogSide }
     | { op: 'export'; id: string; destination?: string }
 export function networkLog<T>(request: LogOperation): Promise<T> { return invoke<T>('network_log_command', { request }) }
@@ -85,12 +86,12 @@ export function prettyLogJson(text: string): string | null {
 
 export interface SsePreviewEvent { event: string; id: string; data: string; raw: string; complete: boolean; partial: boolean; endOffset: number }
 /** A bounded diagnostic view. The stored response remains the unmodified source. */
-export function parseSsePreview(text: string, offset = 0): SsePreviewEvent[] {
+export function parseSsePreview(text: string, offset = 0, partialStart = offset > 0): SsePreviewEvent[] {
     const events: SsePreviewEvent[] = []
     let event = '', id = '', data: string[] = [], raw = '', first = true, bytes = offset
     const encoder = new TextEncoder()
     const emit = (complete: boolean) => {
-        if (raw) events.push({ event: event || 'message', id, data: data.join('\n'), raw, complete, partial: first && offset > 0, endOffset: bytes })
+        if (raw) events.push({ event: event || 'message', id, data: data.join('\n'), raw, complete, partial: first && partialStart, endOffset: bytes })
         first = false; event = ''; id = ''; data = []; raw = ''
     }
     const lines = text.matchAll(/([^\r\n]*)(\r\n|\r|\n|$)/g)

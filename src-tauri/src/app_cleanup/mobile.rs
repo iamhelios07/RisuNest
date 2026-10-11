@@ -169,8 +169,8 @@ pub(super) fn rebuild(app: &AppHandle) -> Result<(), String> {
     }
     app.state::<crate::NativeStartupState>().finish_cleanup()?;
     crate::native_log::global_state().configure_file_path(&state.paths.data);
-    app.unmanage::<crate::network_log::NetworkLogState>();
-    app.manage(crate::network_log::initialize(&app.state::<crate::app_paths::AppPaths>()));
+    app.state::<crate::network_log::NetworkLogState>()
+        .reopen(&app.state::<crate::app_paths::AppPaths>())?;
     Ok(())
 }
 

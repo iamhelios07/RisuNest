@@ -24,7 +24,10 @@
     let tab = $state<'headers' | 'request' | 'response' | 'events'>('headers')
     let body = $state<LogBodyPage | null>(null)
     let bodyOffset = $state(0)
-    let pageHistory = $state<number[]>([])
+    let pageHistory = $state<{ offset: number; sequence: number; boundary: boolean }[]>([])
+    let sequence = $state(1)
+    let boundary = $state(true)
+    let arrivals = $state<(number | null)[]>([])
     let observations = $state<LogObservation[]>([])
     let message = $state<LogObservation | null>(null)
     let messageBody = $state<LogBodyPage | null>(null)
@@ -40,7 +43,7 @@
     let noticeTimer: ReturnType<typeof setTimeout> | undefined
     let refreshing = false
     const selectedSide = $derived(tab === 'request' ? 'request' : 'response')
-    const sseEvents = $derived(detail?.streamKind === 'sse' && body ? parseSsePreview(body.text, body.offset) : [])
+    const sseEvents = $derived(detail?.streamKind === 'sse' && body ? parseSsePreview(body.text, body.offset, !boundary) : [])
     const prettyText = $derived.by(() => {
         if (!body || body.binary || body.offset !== 0 || body.nextOffset < body.total) return null
         return prettyLogJson(body.text)
@@ -82,17 +85,20 @@
         if (mounted && version === listVersion) listing = result
     }
     async function loadDetail() {
-        const id = selected, currentTab = tab, currentOffset = bodyOffset, version = ++detailVersion
+        const id = selected, currentTab = tab, currentOffset = bodyOffset, currentBoundary = boundary, version = ++detailVersion
         if (!id) return
         const result = await networkLog<NetworkLogRecord>({ op: 'detail', id })
         let page: LogBodyPage | null = null
         let events: LogObservation[] = []
+        let times: (number | null)[] = []
         if (currentTab !== 'headers') {
             page = currentTab === 'events' && result.streamKind === 'websocket'
                 ? await networkLog<LogBodyPage>({ op: 'events', id, offset: currentOffset })
                 : await networkLog<LogBodyPage>({ op: 'body', id, side: currentTab === 'request' ? 'request' : 'response', offset: currentOffset })
             if (currentTab === 'events' && result.streamKind === 'sse') {
-                const end = parseSsePreview(page.text, page.offset).at(-1)?.endOffset
+                const parsed = parseSsePreview(page.text, page.offset, !currentBoundary)
+                times = await networkLog<(number | null)[]>({ op: 'arrivalTimes', id, ends: parsed.map(event => event.endOffset) })
+                const end = parsed.at(-1)?.endOffset
                 if (end !== undefined && end < page.nextOffset) {
                     page = { ...page, text: new TextDecoder().decode(new TextEncoder().encode(page.text).subarray(0, end - page.offset)), nextOffset: end }
                 }
@@ -101,7 +107,7 @@
                 events = page.text.trim().split('\n').filter(Boolean).map(line => JSON.parse(line) as LogObservation)
             }
         }
-        if (mounted && selected === id && version === detailVersion) { detail = result; body = page; observations = events }
+        if (mounted && selected === id && version === detailVersion) { detail = result; body = page; observations = events; arrivals = times }
     }
     async function refresh() {
         if (refreshing) return
@@ -116,18 +122,28 @@
     }
     function searchChanged() { clearTimeout(searchTimer); searchTimer = setTimeout(filter, 200) }
     function select(id: string) {
-        selected = id; detail = null; body = null; tab = 'headers'; bodyOffset = 0; pageHistory = []; message = null; messageBody = null; error = ''
+        selected = id; detail = null; body = null; tab = 'headers'; bodyOffset = 0; pageHistory = []; sequence = 1; boundary = true; arrivals = []; message = null; messageBody = null; error = ''
         void loadDetail().catch(value => { error = reason(value) })
     }
     function selectTab(value: typeof tab) {
-        tab = value; body = null; bodyOffset = 0; pageHistory = []; pretty = false; message = null; messageBody = null
+        tab = value; body = null; bodyOffset = 0; pageHistory = []; sequence = 1; boundary = true; arrivals = []; pretty = false; message = null; messageBody = null
         void loadDetail().catch(value => { error = reason(value) })
     }
     function bodyPage(forward: boolean) {
         if (!body) return
-        if (forward) { pageHistory = [...pageHistory, bodyOffset]; bodyOffset = body.nextOffset }
-        else { bodyOffset = pageHistory.at(-1) ?? 0; pageHistory = pageHistory.slice(0, -1) }
-        message = null; messageBody = null
+        if (forward) {
+            pageHistory = [...pageHistory, { offset: bodyOffset, sequence, boundary }]
+            if (tab === 'events' && detail?.streamKind === 'sse') {
+                sequence += sseEvents.filter(event => event.complete).length
+                boundary = sseEvents.at(-1)?.complete ?? boundary
+            }
+            bodyOffset = body.nextOffset
+        } else {
+            const previous = pageHistory.at(-1)
+            bodyOffset = previous?.offset ?? 0; sequence = previous?.sequence ?? 1; boundary = previous?.boundary ?? true
+            pageHistory = pageHistory.slice(0, -1)
+        }
+        body = null; arrivals = []; message = null; messageBody = null
         void loadDetail().catch(value => { error = reason(value) })
     }
     async function copy(side: LogSide) {
@@ -236,7 +252,7 @@
                     </div>
                 </div>
                 {#if tab === 'events' && detail.streamKind === 'sse'}
-                    <div class="divide-y divide-darkborderc/50">{#each sseEvents as event}<details class="event-row px-4 py-2"><summary class="flex cursor-pointer gap-2 text-xs"><span class="font-mono">{event.event}</span>{#if event.id}<span>{event.id}</span>{/if}{#if !event.complete || event.partial}<span class="text-textcolor2">{t.fragment}</span>{/if}</summary><pre class="code mt-2">{event.data || event.raw}</pre><details class="mt-2 text-xs text-textcolor2"><summary class="cursor-pointer">{t.raw}</summary><pre class="code mt-2">{event.raw}</pre></details></details>{:else}<p class="p-4 text-sm text-textcolor2">{t.missingEvents}</p>{/each}</div>
+                    <div class="divide-y divide-darkborderc/50">{#each sseEvents as event, index}<details class="event-row px-4 py-2"><summary class="flex flex-wrap cursor-pointer gap-2 text-xs"><span class="text-textcolor2">#{sequence + index}</span>{#if arrivals[index] != null}<time class="text-textcolor2" title={new Date(detail.startedAt + arrivals[index]!).toISOString()}>{new Date(detail.startedAt + arrivals[index]!).toLocaleTimeString(undefined, { hour12: false })}.{String((detail.startedAt + arrivals[index]!) % 1000).padStart(3, '0')}</time>{/if}<span class="font-mono">{event.event}</span>{#if event.id}<span>{event.id}</span>{/if}{#if !event.complete || event.partial}<span class="text-textcolor2">{t.fragment}</span>{/if}</summary><pre class="code mt-2">{event.data || event.raw}</pre><details class="mt-2 text-xs text-textcolor2"><summary class="cursor-pointer">{t.raw}</summary><pre class="code mt-2">{event.raw}</pre></details></details>{:else}<p class="p-4 text-sm text-textcolor2">{t.missingEvents}</p>{/each}</div>
                 {:else if tab === 'events' && detail.streamKind === 'websocket'}
                     <div class="divide-y divide-darkborderc/50">{#each observations as item}<button class="flex w-full justify-between rounded-none px-4 py-2 text-xs" onclick={() => openMessage(item)}><span class="flex gap-3"><span class="text-textcolor2">{item.elapsedMs.toLocaleString()} ms</span><span>{item.side === 'request' ? t.sent : t.received}</span><span class="font-mono">{item.kind}</span></span><span>{logSize(item.length)}</span></button>{:else}<p class="p-4 text-sm text-textcolor2">{t.missingEvents}</p>{/each}</div>
                     {#if message}<div class="border-t border-darkborderc p-4"><h4 class="mb-2 text-xs text-textcolor2">{message.kind} · {logSize(message.length)}</h4><pre class="code">{messageBody?.text ?? t.loading}</pre></div>{/if}
