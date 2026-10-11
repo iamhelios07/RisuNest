@@ -12,7 +12,7 @@ vi.mock('src/ts/storage/sync/serverSyncProduction', () => ({
     getServerSyncCacheUsage: vi.fn(), cleanupServerSyncCache: vi.fn(),
     getServerSyncController: () => ({ snapshot: () => f.view, subscribe: (listener: (value: Record<string, unknown>) => void) => { f.listeners.add(listener); listener(f.view); return () => { f.listeners.delete(listener) } }, ensureStatus: f.ensure, watchProgress: () => () => {}, pendingChanges: f.pending, track: (_stage: string, operation: () => Promise<unknown>) => operation() }),
 }))
-vi.mock('src/ts/storage/sync/serverAssetResidency', () => ({ getAssetResidencyStatus: f.status, setAssetResidencyPolicy: f.policy, evictLocalAssets: f.evict, cancelAssetResidencyOperation: f.cancel }))
+vi.mock('src/ts/storage/sync/serverAssetResidency', () => ({ getAssetResidencyStatus: f.status, setAssetResidencyPolicy: f.policy, evictLocalAssets: f.evict, cancelLocalAssetCleanup: f.cancel, cancelAssetResidencyOperation: f.cancel }))
 vi.mock('src/ts/storage/sync/serverSyncRegistration', () => ({ parseServerRegistration: () => ({ endpoint: 'https://synthetic.invalid', libraryId: 'library', deviceId: 'registration', token: 'synthetic' }) }))
 vi.mock('src/ts/storage/sync/serverSyncRegistrationInbox', () => ({ serverRegistrationInbox: { changed: { subscribe: () => () => {} }, releaseConsumed: vi.fn() } }))
 vi.mock('src/ts/storage/sync/serverSyncQr', () => ({ get canScanServerRegistration() { return f.scan }, createServerQrScanner: () => f.scanner }))
@@ -37,11 +37,13 @@ vi.mock('src/lib/Setting/ExternalStorage/ConnectionForm.svelte', () => ({ defaul
 vi.mock('src/lib/Others/Onboarding/onboardingWeave', () => ({ observeOnboardingWeave: () => () => {} }))
 vi.mock('src/ts/stores.svelte', () => ({ DBState: f.state }))
 import ServerSyncSettings from './ServerSyncSettings.svelte'
+import { assetCleanupProgress, type AssetCleanupState } from 'src/ts/storage/sync/serverAssetCleanupProgress'
 import { QrScanError } from 'src/ts/ui/qrScanner'
 import Onboarding from 'src/lib/Others/Onboarding/Onboarding.svelte'
 let component: ReturnType<typeof mount> | undefined
 let host: HTMLDivElement
 beforeEach(() => {
+    assetCleanupProgress.set(undefined)
     vi.clearAllMocks(); f.native = true; f.scan = false; f.os = 'windows'; f.listeners.clear(); f.view = { status: { configured: false }, paused: false }; host = document.createElement('div'); document.body.append(host)
     for (const mock of [f.disconnect, f.hold, f.release, f.status, f.policy, f.evict, f.cancel, f.checkbox, f.action, f.complete, f.ensure]) mock.mockReset()
     f.hold.mockResolvedValue(f.release)
@@ -56,6 +58,76 @@ function click(text: string) { const button = [...host.querySelectorAll('button'
 async function registration() { await tick(); const input = host.querySelector('textarea')!; input.value = 'synthetic-registration'; input.dispatchEvent(new Event('input', { bubbles: true })); await tick(); click(languageEnglish.risuNest.serverSync.readRegistration); await tick() }
 function publish(view: Record<string, unknown>) { f.view = view; for (const listener of f.listeners) listener(view) }
 const findButton = (text: string) => [...host.querySelectorAll('button')].find(button => button.textContent?.trim() === text)
+it('shows cleanup phases immediately, survives remount, and refreshes after cancellation', async () => {
+    const copy = languageEnglish.risuNest.serverSync
+    f.view = { status: { configured: true, bound: true, assetPolicy: 'remote' }, running: false, paused: false }
+    const status = { policy: 'remote', localBytes: 8192, remoteBytes: 0, remoteObjects: 0, serverBytes: 0, serverObjects: 0, externalObjects: [], unavailableObjects: 0, evictedBytes: 0 }
+    f.status.mockResolvedValue(status)
+    const reading: AssetCleanupState = { operationId: 'synthetic', state: 'running', sequence: 0, stage: 'preparing', completedItems: 0, totalItems: null, evictedItems: 0, evictedBytes: 0 }
+    let finish!: () => void
+    f.evict.mockImplementation(() => { assetCleanupProgress.set(reading); return new Promise<void>(resolve => { finish = resolve }) })
+    component = mount(ServerSyncSettings, { target: host }); await settle()
+    click(copy.residency.clean); await settle()
+    const panel = () => host.querySelector('[data-asset-cleanup-progress]')!
+    expect(panel().textContent).toContain(copy.residency.cleanup.preparing)
+    expect(panel().querySelector('[role="progressbar"]')!.hasAttribute('aria-valuenow')).toBe(false)
+    expect(findButton(copy.residency.clean)?.disabled).toBe(true)
+    assetCleanupProgress.set({ ...reading, stage: 'checking', completedItems: 2, totalItems: 4 }); await settle()
+    expect(panel().textContent).toContain(copy.residency.cleanup.checking)
+    expect(panel().querySelector('[role="progressbar"]')!.getAttribute('aria-valuenow')).toBe('50')
+    assetCleanupProgress.set({ ...reading, stage: 'deleting', completedItems: 1, totalItems: 4, evictedItems: 1, evictedBytes: 4096 }); await settle()
+    expect(panel().querySelector('details')?.open).toBe(false)
+    await unmount(component); component = mount(ServerSyncSettings, { target: host }); await settle()
+    expect(panel().textContent).toContain(copy.residency.cleanup.deleting)
+    expect(findButton(copy.residency.clean)?.disabled).toBe(true)
+    f.cancel.mockImplementation(() => assetCleanupProgress.update(value => value && { ...value, state: 'cancelling' }))
+    click(copy.residency.cancel); await settle()
+    expect(panel().textContent).toContain(copy.residency.cleanup.cancelling)
+    expect(findButton(copy.residency.cancel)?.disabled).toBe(true)
+    f.status.mockClear()
+    assetCleanupProgress.update(value => value && { ...value, state: 'cancelled' }); await settle()
+    expect(panel().textContent).toContain(copy.residency.cleanup.cancelled)
+    expect(panel().querySelector('.lucide-loader-circle')).toBeNull()
+    expect(f.status).toHaveBeenCalledOnce()
+    expect(findButton(copy.residency.clean)?.disabled).toBe(false)
+    finish(); await settle()
+})
+it.each([false, true])('refreshes capacity after a partial cleanup failure and preserves its error (refresh fails: %s)', async refreshFails => {
+    const copy = languageEnglish.risuNest.serverSync
+    f.view = { status: { configured: true, bound: true, assetPolicy: 'remote' }, running: false, paused: false }
+    const status = { policy: 'remote', localBytes: 8192, remoteBytes: 0, remoteObjects: 0, serverBytes: 0, serverObjects: 0, externalObjects: [], unavailableObjects: 0, evictedBytes: 0 }
+    f.status.mockResolvedValue(status)
+    component = mount(ServerSyncSettings, { target: host }); await settle()
+    f.status.mockClear()
+    f.evict.mockImplementation(async () => {
+        assetCleanupProgress.set({ operationId: 'synthetic', state: 'failed', stage: 'deleting', sequence: 2, completedItems: 1, totalItems: 2, evictedItems: 1, evictedBytes: 4096 })
+        if (refreshFails) f.status.mockRejectedValue({ code: 'writer-collision' })
+        else f.status.mockResolvedValue({ ...status, localBytes: 4096, remoteBytes: 4096, remoteObjects: 1, serverBytes: 4096, serverObjects: 1 })
+        throw { code: 'storage-io' }
+    })
+    click(copy.residency.clean); await settle()
+    expect(f.status).toHaveBeenCalledOnce()
+    expect(host.textContent).toContain(copy.residency.cleanup.failed)
+    expect(host.textContent).toContain(copy.errorHelp)
+    expect(host.textContent).not.toContain(languageEnglish.lwwSync.writerCollision)
+    if (!refreshFails) {
+        expect(host.textContent).not.toContain('8.0 KiB')
+        expect(host.textContent).toContain('4.0 KiB')
+    }
+    expect(findButton(copy.residency.clean)?.disabled).toBe(false)
+})
+it.each(['finalizing', 'complete', 'failed'] as const)('renders cleanup %s without confusing processed files with removed files', async state => {
+    const copy = languageEnglish.risuNest.serverSync
+    f.view = { status: { configured: true, bound: true, assetPolicy: 'remote' }, running: false, paused: false }
+    assetCleanupProgress.set({ operationId: 'synthetic', state: state === 'finalizing' ? 'running' : state, stage: 'finalizing', sequence: 2, completedItems: 4, totalItems: null, evictedItems: 3, evictedBytes: 4096 })
+    component = mount(ServerSyncSettings, { target: host }); await settle()
+    const panel = host.querySelector('[data-asset-cleanup-progress]')!
+    expect(panel.textContent).toContain(copy.residency.cleanup[state])
+    expect(panel.querySelector('[role="progressbar"]')!.getAttribute('aria-valuenow')).toBe(state === 'complete' ? '100' : null)
+    if (state === 'complete') expect(panel.textContent).toContain(copy.count.replace('{0}', '3'))
+    expect(findButton(copy.residency.clean)?.disabled).toBe(state === 'finalizing')
+    expect(!!findButton(copy.residency.cancel)).toBe(state === 'finalizing')
+})
 it.each([
     { error: '', newDevice: false },
     { error: 'writer-collision', newDevice: false },

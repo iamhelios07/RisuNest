@@ -950,8 +950,21 @@ impl PayloadCas {
             content_hash,
             expected_byte_size,
             expected_physical_key,
+            true,
             |_| Ok(()),
         )
+    }
+
+    /// Requires positively acknowledged, persisted server custody for this exact
+    /// hash and size. Offloading discards a local copy of that retained content.
+    /// All path, size, open-handle identity and replacement checks still apply.
+    pub(crate) fn unlink_retained_object(
+        &self,
+        content_hash: &str,
+        expected_byte_size: u64,
+        expected_physical_key: &str,
+    ) -> io::Result<ExactObjectUnlink> {
+        self.unlink_exact_object_inner(content_hash, expected_byte_size, expected_physical_key, false, |_| Ok(()))
     }
 
     #[cfg(test)]
@@ -966,6 +979,7 @@ impl PayloadCas {
             content_hash,
             expected_byte_size,
             expected_physical_key,
+            true,
             after_hash,
         )
     }
@@ -975,6 +989,7 @@ impl PayloadCas {
         content_hash: &str,
         expected_byte_size: u64,
         expected_physical_key: &str,
+        verify_content: bool,
         after_hash: impl FnOnce(&Path) -> io::Result<()>,
     ) -> io::Result<ExactObjectUnlink> {
         #[cfg(test)]
@@ -998,14 +1013,17 @@ impl PayloadCas {
                 "deletion tombstone size does not match the exact canonical object",
             ));
         }
-        let actual_hash = hash_open_file(&mut file, &|| false)?;
+        let actual_hash = if verify_content { Some(hash_open_file(&mut file, &|| false)?) } else { None };
         if exact_file_identity(&file)? != identity {
             return exact_object_changed();
         }
-        if actual_hash != content_hash {
+        if actual_hash.as_deref().is_some_and(|hash| hash != content_hash) {
             return collision_or_corruption(expected_physical_key);
         }
         after_hash(&path)?;
+        if exact_file_identity(&file)? != identity {
+            return exact_object_changed();
+        }
         let metadata = fs::symlink_metadata(&path)?;
         self.validate_owned_file(&path, &metadata)?;
         let final_file = self.open_exact_owned_file(&path)?;
@@ -2139,6 +2157,33 @@ mod tests {
         assert!(cas
             .holds_exact_object(&prepared.content_hash, prepared.byte_size, &|| false)
             .unwrap());
+    }
+
+    #[test]
+    fn retained_unlink_keeps_size_path_and_replacement_checks_without_reading_body() {
+        use std::fs;
+        for verify_content in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let cas = PayloadCas::new(directory.path()).unwrap();
+            let payload = cas.prepare_bytes(b"synthetic retained body").unwrap();
+            assert!(cas.unlink_retained_object(&payload.content_hash, payload.byte_size + 1, &payload.physical_key).is_err());
+            assert!(cas.unlink_retained_object(&payload.content_hash, payload.byte_size, "assets/elsewhere").is_err());
+            let path = directory.path().join(&payload.physical_key);
+            let replacement = vec![42; payload.byte_size as usize];
+            let result = cas.unlink_exact_object_inner(&payload.content_hash, payload.byte_size, &payload.physical_key, verify_content, |_| {
+                fs::remove_file(&path)?;
+                fs::write(&path, &replacement)
+            });
+            assert!(result.is_err());
+            assert_eq!(fs::read(&path).unwrap(), replacement);
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let payload = cas.prepare_bytes(b"synthetic retained body").unwrap();
+        crate::persistent_store::hash_work::reset_hash_work();
+        assert!(matches!(cas.unlink_retained_object(&payload.content_hash, payload.byte_size, &payload.physical_key).unwrap(), ExactObjectUnlink::Removed { .. }));
+        assert!(crate::persistent_store::hash_work::take_hash_work().domains.is_empty());
+        assert_eq!(cas.stat_object(&payload.content_hash).unwrap(), None);
     }
 }
 
