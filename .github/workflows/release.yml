@@ -412,8 +412,23 @@ jobs:
           "TMP=$nativeTestTemp" >> $env:GITHUB_ENV
       - if: runner.os == 'Linux'
         run: dbus-run-session -- bash scripts/linux-native-tests.sh --release --target ${{ matrix.target }}
-      - if: runner.os != 'Linux'
+      - if: runner.os == 'macOS'
         run: cargo test --manifest-path src-tauri/Cargo.toml --release --locked --target ${{ matrix.target }}
+      - name: Run Windows native tests with isolated storage stress cases
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          isolated=(
+            external_storage::packaging::tests::c_a_spool_with_room_for_two_objects_still_finishes_the_publication
+            external_storage::packaging::tests::c_a_no_op_publication_whose_every_run_exceeds_the_bound_writes_nothing
+            external_storage::packaging::tests::c_required_edits_beyond_the_bound_are_all_published_beside_a_bounded_cycle
+          )
+          skips=()
+          for test in "${isolated[@]}"; do skips+=(--skip "$test"); done
+          cargo test --manifest-path src-tauri/Cargo.toml --release --locked --target '${{ matrix.target }}' -- "${skips[@]}"
+          cargo test --manifest-path src-tauri/Cargo.toml --release --locked --target '${{ matrix.target }}' --lib -- --exact "${isolated[@]}" --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/native-storage-tests.log"
+          grep -F 'test result: ok. 3 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/native-storage-tests.log"
       - run: cargo test --manifest-path src-tauri/Cargo.toml --package tauri-plugin-updater --release --locked --target ${{ matrix.target }} --lib
       - if: runner.os == 'Linux'
         run: dbus-run-session -- bash scripts/linux-native-tests.sh --package tauri-plugin-window-state --release --target ${{ matrix.target }} --lib

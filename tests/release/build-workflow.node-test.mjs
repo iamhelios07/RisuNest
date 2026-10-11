@@ -491,7 +491,7 @@ test("Linux app native release tests retain all targets in the maintained creden
   ]);
   for (const run of primaryRuns) assert.doesNotMatch(run, /(?:^|\s)--lib(?:\s|$)/);
   assert.match(native, /if: runner.os == 'Linux'\n\s+run: dbus-run-session -- bash scripts\/linux-native-tests.sh --release --target/);
-  assert.match(native, /if: runner.os != 'Linux'\n\s+run: cargo test --manifest-path src-tauri\/Cargo.toml --release --locked --target/);
+  assert.match(native, /if: runner.os == 'macOS'\n\s+run: cargo test --manifest-path src-tauri\/Cargo.toml --release --locked --target/);
   const packageRuns = [...native.matchAll(/^\s+(?:- )?run: ([^\n]* --package [^\n]*)$/gm)]
     .map((match) => match[1]);
   assert.deepEqual(packageRuns, [
@@ -631,4 +631,24 @@ test("Sync compiles its GUI once with the same configuration used for bundling",
   assert.match(pack, /\[cli, "bundle", "--target", target, \.\.\.configArgs, "--bundles", bundles\]/);
   assert(pack.indexOf('required(build.gui, "GUI output")') < pack.indexOf('[cli, "bundle"'));
   assert.match(pack, /assertBundleSelection\(join\(temporary, "risunest-sync-gui.exe"\), "UNK"\)/);
+});
+
+test("Windows isolates measured storage stress cases without dropping or serializing other tests", () => {
+  const block = /name: Run Windows native tests with isolated storage stress cases\n([\s\S]*?)(?=\n      - )/.exec(workflow)?.[1];
+  assert(block);
+  assert.match(block, /if: runner.os == 'Windows'/);
+  assert.match(block, /set -euo pipefail/);
+  const isolated = /isolated=\(([\s\S]*?)\)/.exec(block)[1].trim().split(/\s+/);
+  assert.deepEqual(isolated, [
+    "external_storage::packaging::tests::c_a_spool_with_room_for_two_objects_still_finishes_the_publication",
+    "external_storage::packaging::tests::c_a_no_op_publication_whose_every_run_exceeds_the_bound_writes_nothing",
+    "external_storage::packaging::tests::c_required_edits_beyond_the_bound_are_all_published_beside_a_bounded_cycle",
+  ]);
+  assert.match(block, /for test in "\$\{isolated\[@\]\}"; do skips\+=\(--skip "\$test"\); done/);
+  const commands = block.split("\n").map(line => line.trim()).filter(line => line.startsWith("cargo test "));
+  assert.equal(commands.length, 2);
+  assert.match(commands[0], /--release --locked --target '\$\{\{ matrix.target \}\}' -- "\$\{skips\[@\]\}"$/);
+  assert.doesNotMatch(commands[0], /--lib|--test-threads/);
+  assert.match(commands[1], /--release --locked --target '\$\{\{ matrix.target \}\}' --lib -- --exact "\$\{isolated\[@\]\}" --test-threads=1 --nocapture/);
+  assert.match(block, /grep -F 'test result: ok\. 3 passed; 0 failed; 0 ignored;'/);
 });
