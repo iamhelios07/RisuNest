@@ -125,6 +125,12 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with: { node-version: "24", package-manager-cache: false }
       - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+        with: { components: rustfmt }
+      - name: Check Sync formatting
+        if: inputs.product == 'sync'
+        run: |
+          cargo fmt --manifest-path server/sync/Cargo.toml --check
+          cargo fmt --manifest-path server/manager/Cargo.toml --check
       - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
         if: inputs.product == 'app'
         with: { distribution: temurin, java-version: "21" }
@@ -190,76 +196,6 @@ jobs:
       - run: pnpm test:browser:agent
       - run: pnpm check:plugin-dts
       - run: pnpm check:production-bundle
-
-  app-native-tests:
-    if: inputs.product == 'app'
-    needs: source
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { runner: windows-2022, target: x86_64-pc-windows-msvc }
-          - { runner: windows-11-arm, target: aarch64-pc-windows-msvc }
-          - { runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu }
-          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
-          - { runner: macos-15-intel, target: x86_64-apple-darwin }
-          - { runner: macos-15, target: aarch64-apple-darwin }
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with: { ref: "${{ needs.source.outputs.source_commit }}", persist-credentials: false }
-      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
-        with: { targets: "${{ matrix.target }}" }
-      - uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
-        with:
-          path: |
-            ~/.cargo/registry/cache
-            ~/.cargo/registry/index
-            ~/.cargo/git/db
-          key: release-cargo-1.97.1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('src-tauri/Cargo.lock', 'crates/sync-wire/Cargo.lock', 'server/sync/Cargo.lock', 'server/manager/Cargo.lock', 'server/manager/gui/src-tauri/Cargo.lock') }}
-          restore-keys: release-cargo-1.97.1-${{ runner.os }}-${{ runner.arch }}-
-      - name: Install Linux test dependencies
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libwebkit2gtk-4.1-dev libssl-dev libdbus-1-dev libayatana-appindicator3-dev librsvg2-dev gnome-keyring dbus-x11 xvfb
-      - name: Use a temporary directory without symlinked ancestors
-        if: runner.os == 'macOS'
-        run: |
-          mkdir -p "$RUNNER_TEMP/tests"
-          echo "TMPDIR=$(cd "$RUNNER_TEMP/tests" && pwd -P)" >> "$GITHUB_ENV"
-      - name: Use runner temporary storage for Windows tests
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $nativeTestTemp = Join-Path $env:RUNNER_TEMP 'native-tests'
-          New-Item -ItemType Directory -Force -Path $nativeTestTemp | Out-Null
-          "TEMP=$nativeTestTemp" >> $env:GITHUB_ENV
-          "TMP=$nativeTestTemp" >> $env:GITHUB_ENV
-      - if: runner.os == 'Linux'
-        run: dbus-run-session -- bash scripts/linux-native-tests.sh --release --target ${{ matrix.target }}
-      - if: runner.os != 'Linux'
-        run: cargo test --manifest-path src-tauri/Cargo.toml --release --locked --target ${{ matrix.target }}
-      - run: cargo test --manifest-path src-tauri/Cargo.toml --package tauri-plugin-updater --release --locked --target ${{ matrix.target }} --lib
-      - if: runner.os == 'Linux'
-        run: dbus-run-session -- bash scripts/linux-native-tests.sh --package tauri-plugin-window-state --release --target ${{ matrix.target }} --lib
-      - if: runner.os != 'Linux'
-        run: cargo test --manifest-path src-tauri/Cargo.toml --package tauri-plugin-window-state --release --locked --target ${{ matrix.target }} --lib
-      - if: runner.os == 'Linux'
-        run: dbus-run-session -- cargo test --manifest-path crates/wry/Cargo.toml --package wry --release --locked --target ${{ matrix.target }} --lib
-      - if: runner.os != 'Linux'
-        run: cargo test --manifest-path crates/wry/Cargo.toml --package wry --release --locked --target ${{ matrix.target }} --lib
-      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
-        if: matrix.runner == 'windows-2022' || matrix.runner == 'ubuntu-24.04' || matrix.runner == 'macos-15'
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
-        if: matrix.runner == 'windows-2022' || matrix.runner == 'ubuntu-24.04' || matrix.runner == 'macos-15'
-        with: { node-version: "24", package-manager-cache: false }
-      - if: matrix.runner == 'windows-2022' || matrix.runner == 'ubuntu-24.04' || matrix.runner == 'macos-15'
-        run: pnpm install --frozen-lockfile
-      - name: Windows and macOS persistence boundary
-        if: matrix.runner == 'windows-2022' || matrix.runner == 'macos-15'
-        run: pnpm desktop:test-boundary:agent
-      - name: Linux persistence boundary
-        if: matrix.runner == 'ubuntu-24.04'
-        run: xvfb-run -a dbus-run-session -- bash scripts/linux-native-tests.sh --boundary
 
   app-android-tests:
     if: inputs.product == 'app'
@@ -332,117 +268,6 @@ jobs:
         run: bash scripts/ios-native-tests.sh
       - run: pnpm ios:build:simulator:agent
 
-  sync-tests:
-    if: inputs.product == 'sync'
-    needs: source
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { runner: windows-2022, target: x86_64-pc-windows-msvc }
-          - { runner: windows-11-arm, target: aarch64-pc-windows-msvc }
-          - { runner: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
-          - { runner: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
-          - { runner: macos-15-intel, target: x86_64-apple-darwin }
-          - { runner: macos-15, target: aarch64-apple-darwin }
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with: { ref: "${{ needs.source.outputs.source_commit }}", persist-credentials: false }
-      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
-        with:
-          targets: ${{ matrix.target }}
-          components: clippy, rustfmt
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
-        with: { node-version: "24", package-manager-cache: false }
-      - uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
-        with:
-          path: |
-            ~/.cargo/registry/cache
-            ~/.cargo/registry/index
-            ~/.cargo/git/db
-          key: release-cargo-1.97.1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('src-tauri/Cargo.lock', 'crates/sync-wire/Cargo.lock', 'server/sync/Cargo.lock', 'server/manager/Cargo.lock', 'server/manager/gui/src-tauri/Cargo.lock') }}
-          restore-keys: release-cargo-1.97.1-${{ runner.os }}-${{ runner.arch }}-
-      - name: Use a temporary directory without symlinked ancestors
-        if: runner.os == 'macOS'
-        run: |
-          mkdir -p "$RUNNER_TEMP/tests"
-          echo "TMPDIR=$(cd "$RUNNER_TEMP/tests" && pwd -P)" >> "$GITHUB_ENV"
-      - run: cargo fmt --manifest-path server/sync/Cargo.toml --check
-      - run: cargo fmt --manifest-path server/manager/Cargo.toml --check
-      - run: cargo clippy --manifest-path server/sync/Cargo.toml --all-targets --locked --target ${{ matrix.target }} -- -D warnings
-      - run: cargo test --manifest-path crates/sync-wire/Cargo.toml --release --locked --target ${{ matrix.target }}
-      - run: cargo test --manifest-path server/sync/Cargo.toml --release --locked --target ${{ matrix.target }}
-      - run: cargo test --manifest-path server/manager/Cargo.toml --release --locked --target ${{ matrix.target }}
-      - name: Run synthetic Linux installer success and rollback checks
-        if: runner.os == 'Linux'
-        run: bash server/manager/install/install.test.sh
-      - name: Build native process harness executables
-        run: |
-          cargo build --manifest-path server/sync/Cargo.toml --release --locked --target ${{ matrix.target }}
-          cargo build --manifest-path server/manager/Cargo.toml --release --locked --target ${{ matrix.target }}
-      - name: Run isolated daemon and manager process lifecycle
-        shell: bash
-        run: >-
-          node server/manager/tests/daemon-process.mjs
-          "$CARGO_TARGET_DIR/${{ matrix.target }}/release/risunest-sync-server${{ runner.os == 'Windows' && '.exe' || '' }}"
-          "$CARGO_TARGET_DIR/${{ matrix.target }}/release/risunest-sync-manager${{ runner.os == 'Windows' && '.exe' || '' }}"
-      - name: Run Windows Task Scheduler lifecycle
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: >-
-          ./server/manager/tests/windows-startup.ps1
-          -Manager "$env:CARGO_TARGET_DIR/${{ matrix.target }}/release/risunest-sync-manager.exe"
-          -Server "$env:CARGO_TARGET_DIR/${{ matrix.target }}/release/risunest-sync-server.exe"
-      - name: Run Windows scheduled update success and recovery lifecycle
-        if: runner.os == 'Windows'
-        shell: pwsh
-        env:
-          RISUNEST_TEST_SERVER: ${{ format('{0}/{1}/release/risunest-sync-server.exe', env.CARGO_TARGET_DIR, matrix.target) }}
-          RISUNEST_TEST_MANAGER: ${{ format('{0}/{1}/release/risunest-sync-manager.exe', env.CARGO_TARGET_DIR, matrix.target) }}
-        run: |
-          $tests = @(
-            'no_claim_helper_task_is_removed_without_consuming_recovery_state',
-            'helper_replaces_and_restarts_an_isolated_live_server',
-            'helper_verifies_a_stopped_replacement_then_restores_stopped_intent',
-            'interrupted_files_recovery_outlives_the_active_installed_manager',
-            'helper_recovers_the_live_server_when_its_parent_does_not_exit',
-            'helper_rolls_back_a_corrupt_live_replacement_and_restarts_the_old_server',
-            'installer_guard_records_restart_failure_after_accepted_corrupt_server_start'
-          )
-          $logDirectory = Join-Path $env:RUNNER_TEMP 'sync-update-tests'
-          New-Item -ItemType Directory -Force -Path $logDirectory | Out-Null
-          foreach ($test in $tests) {
-            & cargo test --manifest-path server/manager/Cargo.toml --release --locked --target '${{ matrix.target }}' --test update_helper $test -- --ignored --exact --nocapture 2>&1 |
-              Tee-Object -FilePath (Join-Path $logDirectory "$test.log") -OutVariable output | Out-Host
-            if ($LASTEXITCODE -ne 0) { throw "$test failed." }
-            if (($output | Out-String) -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored;') {
-              throw "$test did not execute exactly one passing test."
-            }
-          }
-      - name: Preserve Windows scheduled update test logs
-        if: always() && runner.os == 'Windows'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: sync-update-tests-${{ matrix.target }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/sync-update-tests/*.log
-          retention-days: 3
-      - name: Run Linux systemd, TUI and installer lifecycle
-        if: runner.os == 'Linux'
-        run: |
-          sudo loginctl enable-linger "$USER"
-          test "$(loginctl show-user "$USER" -p Linger --value)" = yes
-          systemctl --user daemon-reload
-          python3 server/manager/tests/linux-process.py \
-            "$CARGO_TARGET_DIR/${{ matrix.target }}/release/risunest-sync-server" \
-            "$CARGO_TARGET_DIR/${{ matrix.target }}/release/risunest-sync-manager"
-      - name: Run macOS LaunchAgent and updater schedule lifecycle
-        if: runner.os == 'macOS'
-        run: >-
-          sh server/manager/tests/macos-startup.sh
-          "$CARGO_TARGET_DIR/${{ matrix.target }}/release/risunest-sync-server"
-          "$CARGO_TARGET_DIR/${{ matrix.target }}/release/risunest-sync-manager"
-
   sync-gui-tests:
     if: inputs.product == 'sync'
     needs: source
@@ -505,11 +330,10 @@ jobs:
 
   prepare-draft:
     if: >-
-      always() && needs.source.result == 'success' && needs.release-tooling-tests.result == 'success' &&
-      needs.endpoint-registry-tests.result == 'success' && needs.shared-wasm-tests.result == 'success' &&
-      ((inputs.product == 'app' && needs.app-web-tests.result == 'success' && needs.app-native-tests.result == 'success' && needs.app-android-tests.result == 'success' && needs.app-ios-tests.result == 'success') ||
-       (inputs.product == 'sync' && needs.sync-tests.result == 'success' && needs.sync-gui-tests.result == 'success'))
-    needs: [source, release-tooling-tests, endpoint-registry-tests, shared-wasm-tests, app-web-tests, app-native-tests, app-android-tests, app-ios-tests, sync-tests, sync-gui-tests]
+      always() && needs.source.result == 'success' && needs.release-tooling-tests.result == 'success' && needs.endpoint-registry-tests.result == 'success' && needs.shared-wasm-tests.result == 'success' &&
+      ((inputs.product == 'app' && needs.app-web-tests.result == 'success') ||
+       (inputs.product == 'sync' && needs.sync-gui-tests.result == 'success'))
+    needs: [source, release-tooling-tests, endpoint-registry-tests, shared-wasm-tests, app-web-tests, sync-gui-tests]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -544,7 +368,7 @@ jobs:
   app-desktop:
     if: >-
       !cancelled() && needs.source.result == 'success' && needs.prepare-draft.result == 'success' &&
-      inputs.product == 'app' && needs.prepare-draft.outputs.already_published != 'true'
+      inputs.product == 'app'
     needs: [source, prepare-draft]
     strategy:
       fail-fast: false
@@ -571,9 +395,43 @@ jobs:
         with: { targets: "${{ matrix.target }}" }
       - name: Install Linux package dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libwebkit2gtk-4.1-dev libssl-dev libdbus-1-dev libayatana-appindicator3-dev librsvg2-dev patchelf desktop-file-utils shared-mime-info xdg-utils libfuse2t64
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libwebkit2gtk-4.1-dev libssl-dev libdbus-1-dev libayatana-appindicator3-dev librsvg2-dev patchelf desktop-file-utils shared-mime-info xdg-utils libfuse2t64 gnome-keyring dbus-x11 xvfb
       - run: pnpm install --frozen-lockfile
+      - name: Use a temporary directory without symlinked ancestors
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p "$RUNNER_TEMP/tests"
+          echo "TMPDIR=$(cd "$RUNNER_TEMP/tests" && pwd -P)" >> "$GITHUB_ENV"
+      - name: Use runner temporary storage for Windows tests
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $nativeTestTemp = Join-Path $env:RUNNER_TEMP 'native-tests'
+          New-Item -ItemType Directory -Force -Path $nativeTestTemp | Out-Null
+          "TEMP=$nativeTestTemp" >> $env:GITHUB_ENV
+          "TMP=$nativeTestTemp" >> $env:GITHUB_ENV
+      - if: runner.os == 'Linux'
+        run: dbus-run-session -- bash scripts/linux-native-tests.sh --release --target ${{ matrix.target }}
+      - if: runner.os != 'Linux'
+        run: cargo test --manifest-path src-tauri/Cargo.toml --release --locked --target ${{ matrix.target }}
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --package tauri-plugin-updater --release --locked --target ${{ matrix.target }} --lib
+      - if: runner.os == 'Linux'
+        run: dbus-run-session -- bash scripts/linux-native-tests.sh --package tauri-plugin-window-state --release --target ${{ matrix.target }} --lib
+      - if: runner.os != 'Linux'
+        run: cargo test --manifest-path src-tauri/Cargo.toml --package tauri-plugin-window-state --release --locked --target ${{ matrix.target }} --lib
+      - if: runner.os == 'Linux'
+        run: dbus-run-session -- cargo test --manifest-path crates/wry/Cargo.toml --package wry --release --locked --target ${{ matrix.target }} --lib
+      - if: runner.os != 'Linux'
+        run: cargo test --manifest-path crates/wry/Cargo.toml --package wry --release --locked --target ${{ matrix.target }} --lib
+      - name: Windows and macOS persistence boundary
+        if: matrix.runner == 'windows-2022' || matrix.runner == 'macos-15'
+        run: pnpm desktop:test-boundary:agent
+      - name: Linux persistence boundary
+        if: matrix.runner == 'ubuntu-24.04'
+        run: xvfb-run -a dbus-run-session -- bash scripts/linux-native-tests.sh --boundary
+
       - name: Compile app desktop binary without signing key
+        if: needs.prepare-draft.outputs.already_published != 'true'
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
@@ -585,6 +443,7 @@ jobs:
           pnpm exec -- tauri build --target "$TARGET" --no-bundle --config "$RUNNER_TEMP/release-tauri.json" -- --locked
           cp "$CARGO_TARGET_DIR/$TARGET/release/$EXECUTABLE" release-work/app-binary
       - name: Bundle app desktop assets
+        if: needs.prepare-draft.outputs.already_published != 'true'
         shell: bash
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
@@ -595,11 +454,12 @@ jobs:
           set -euo pipefail
           pnpm exec -- tauri bundle --target "$TARGET" --bundles "$BUNDLES" --config "$RUNNER_TEMP/release-tauri.json"
       - name: Verify app uninstall cleanup and retry
-        if: matrix.os == 'windows'
+        if: matrix.os == 'windows' && needs.prepare-draft.outputs.already_published != 'true'
         env:
           RISUNEST_REQUIRE_NSIS: "1"
         run: node --test tests/release/app-nsis-uninstall.node-test.mjs
       - name: Package app desktop assets
+        if: needs.prepare-draft.outputs.already_published != 'true'
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
@@ -609,6 +469,7 @@ jobs:
           set -euo pipefail
           node scripts/release/package-app.mjs --kind desktop --os "$OS" --arch "$ARCH" --bundle-dir "$CARGO_TARGET_DIR/$TARGET/release/bundle" --binary release-work/app-binary --release-input release-input.json --output release-work/packages
       - name: Sign final app desktop assets
+        if: needs.prepare-draft.outputs.already_published != 'true'
         shell: bash
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
@@ -620,7 +481,7 @@ jobs:
           mkdir -p release-out
           node scripts/release/build.mjs --release-input release-input.json --leg "desktop_${OS}_${ARCH}" --assets-json release-work/packages/assets.json --output release-out --public-key "$RISUNEST_UPDATE_PUBLIC_KEY"
       - name: Verify the produced macOS archive with the production updater
-        if: matrix.os == 'darwin'
+        if: matrix.os == 'darwin' && needs.prepare-draft.outputs.already_published != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -628,7 +489,7 @@ jobs:
           cargo test --manifest-path src-tauri/Cargo.toml --package tauri-plugin-updater --target '${{ matrix.target }}' --release --locked --lib updater::tests::produced_macos_archive_replaces_disposable_app_and_preserves_sibling_data -- --ignored --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/app-update-install.log"
           grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/app-update-install.log"
       - name: Upload final assets to draft
-        if: inputs.publish == true
+        if: inputs.publish == true && needs.prepare-draft.outputs.already_published != 'true'
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: >-
@@ -637,6 +498,7 @@ jobs:
           --directory release-out
           --inventory "release-out/inventory-desktop_${{ matrix.os }}_${{ matrix.arch }}.json"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: needs.prepare-draft.outputs.already_published != 'true'
         with:
           name: ${{ inputs.publish && format('inventory-app-desktop-{0}-{1}', matrix.os, matrix.arch) || format('rehearsal-app-desktop-{0}-{1}', matrix.os, matrix.arch) }}
           path: ${{ inputs.publish && format('release-out/inventory-desktop_{0}_{1}.json', matrix.os, matrix.arch) || 'release-out/*' }}
@@ -645,9 +507,9 @@ jobs:
 
   app-android:
     if: >-
-      !cancelled() && needs.source.result == 'success' && needs.prepare-draft.result == 'success' &&
+      !cancelled() && needs.source.result == 'success' && needs.prepare-draft.result == 'success' && needs.app-android-tests.result == 'success' &&
       inputs.product == 'app' && needs.prepare-draft.outputs.already_published != 'true'
-    needs: [source, prepare-draft]
+    needs: [source, prepare-draft, app-android-tests]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -730,9 +592,9 @@ jobs:
 
   app-ios:
     if: >-
-      !cancelled() && needs.source.result == 'success' && needs.prepare-draft.result == 'success' &&
+      !cancelled() && needs.source.result == 'success' && needs.prepare-draft.result == 'success' && needs.app-ios-tests.result == 'success' &&
       inputs.product == 'app' && needs.prepare-draft.outputs.already_published != 'true'
-    needs: [source, prepare-draft]
+    needs: [source, prepare-draft, app-ios-tests]
     runs-on: macos-15
     permissions:
       contents: write
@@ -790,7 +652,7 @@ jobs:
   sync-suite:
     if: >-
       !cancelled() && needs.source.result == 'success' && needs.prepare-draft.result == 'success' &&
-      inputs.product == 'sync' && needs.prepare-draft.outputs.already_published != 'true'
+      inputs.product == 'sync'
     needs: [source, prepare-draft]
     strategy:
       fail-fast: false
@@ -818,12 +680,102 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with: { python-version: "3.12" }
       - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
-        with: { targets: "${{ matrix.target }}" }
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy
       - run: pnpm install --frozen-lockfile
+      - name: Use a temporary directory without symlinked ancestors
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p "$RUNNER_TEMP/tests"
+          echo "TMPDIR=$(cd "$RUNNER_TEMP/tests" && pwd -P)" >> "$GITHUB_ENV"
+      - name: Use runner temporary storage for Windows tests
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $nativeTestTemp = Join-Path $env:RUNNER_TEMP 'native-tests'
+          New-Item -ItemType Directory -Force -Path $nativeTestTemp | Out-Null
+          "TEMP=$nativeTestTemp" >> $env:GITHUB_ENV
+          "TMP=$nativeTestTemp" >> $env:GITHUB_ENV
+      - run: cargo clippy --manifest-path server/sync/Cargo.toml --all-targets --locked --target ${{ matrix.target }} -- -D warnings
+      - run: cargo test --manifest-path crates/sync-wire/Cargo.toml --release --locked --target ${{ matrix.target }}
+      - run: cargo test --manifest-path server/sync/Cargo.toml --release --locked --target ${{ matrix.target }}
+      - run: cargo test --manifest-path server/manager/Cargo.toml --release --locked --target ${{ matrix.target }}
+      - name: Run synthetic Linux installer success and rollback checks
+        if: runner.os == 'Linux'
+        run: bash server/manager/install/install.test.sh
+      - name: Build native process harness executables
+        shell: bash
+        run: |
+          cargo build --manifest-path server/sync/Cargo.toml --release --locked --target ${{ matrix.target }}
+          cargo build --manifest-path server/manager/Cargo.toml --release --locked --target ${{ matrix.target }}
+      - name: Run isolated daemon and manager process lifecycle
+        shell: bash
+        run: >-
+          node server/manager/tests/daemon-process.mjs
+          "$CARGO_TARGET_DIR/${{ matrix.target }}/release/risunest-sync-server${{ runner.os == 'Windows' && '.exe' || '' }}"
+          "$CARGO_TARGET_DIR/${{ matrix.target }}/release/risunest-sync-manager${{ runner.os == 'Windows' && '.exe' || '' }}"
+      - name: Run Windows Task Scheduler lifecycle
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: >-
+          ./server/manager/tests/windows-startup.ps1
+          -Manager "$env:CARGO_TARGET_DIR/${{ matrix.target }}/release/risunest-sync-manager.exe"
+          -Server "$env:CARGO_TARGET_DIR/${{ matrix.target }}/release/risunest-sync-server.exe"
+      - name: Run Windows scheduled update success and recovery lifecycle
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          RISUNEST_TEST_SERVER: ${{ format('{0}/{1}/release/risunest-sync-server.exe', env.CARGO_TARGET_DIR, matrix.target) }}
+          RISUNEST_TEST_MANAGER: ${{ format('{0}/{1}/release/risunest-sync-manager.exe', env.CARGO_TARGET_DIR, matrix.target) }}
+        run: |
+          $tests = @(
+            'no_claim_helper_task_is_removed_without_consuming_recovery_state',
+            'helper_replaces_and_restarts_an_isolated_live_server',
+            'helper_verifies_a_stopped_replacement_then_restores_stopped_intent',
+            'interrupted_files_recovery_outlives_the_active_installed_manager',
+            'helper_recovers_the_live_server_when_its_parent_does_not_exit',
+            'helper_rolls_back_a_corrupt_live_replacement_and_restarts_the_old_server',
+            'installer_guard_records_restart_failure_after_accepted_corrupt_server_start'
+          )
+          $logDirectory = Join-Path $env:RUNNER_TEMP 'sync-update-tests'
+          New-Item -ItemType Directory -Force -Path $logDirectory | Out-Null
+          foreach ($test in $tests) {
+            & cargo test --manifest-path server/manager/Cargo.toml --release --locked --target '${{ matrix.target }}' --test update_helper $test -- --ignored --exact --nocapture 2>&1 |
+              Tee-Object -FilePath (Join-Path $logDirectory "$test.log") -OutVariable output | Out-Host
+            if ($LASTEXITCODE -ne 0) { throw "$test failed." }
+            if (($output | Out-String) -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored;') {
+              throw "$test did not execute exactly one passing test."
+            }
+          }
+      - name: Preserve Windows scheduled update test logs
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sync-update-tests-${{ matrix.target }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/sync-update-tests/*.log
+          retention-days: 3
+      - name: Run Linux systemd, TUI and installer lifecycle
+        if: runner.os == 'Linux'
+        run: |
+          sudo loginctl enable-linger "$USER"
+          test "$(loginctl show-user "$USER" -p Linger --value)" = yes
+          systemctl --user daemon-reload
+          python3 server/manager/tests/linux-process.py \
+            "$CARGO_TARGET_DIR/${{ matrix.target }}/release/risunest-sync-server" \
+            "$CARGO_TARGET_DIR/${{ matrix.target }}/release/risunest-sync-manager"
+      - name: Run macOS LaunchAgent and updater schedule lifecycle
+        if: runner.os == 'macOS'
+        run: >-
+          sh server/manager/tests/macos-startup.sh
+          "$CARGO_TARGET_DIR/${{ matrix.target }}/release/risunest-sync-server"
+          "$CARGO_TARGET_DIR/${{ matrix.target }}/release/risunest-sync-manager"
+
       - name: Install Sync GUI dependencies
-        if: matrix.os != 'linux'
+        if: matrix.os != 'linux' && needs.prepare-draft.outputs.already_published != 'true'
         run: pnpm --dir server/manager/gui --ignore-workspace install --frozen-lockfile
       - name: Fetch and verify pinned cloudflared
+        if: needs.prepare-draft.outputs.already_published != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -833,9 +785,10 @@ jobs:
           OS: ${{ matrix.os }}
           ARCH: ${{ matrix.arch }}
       - name: Prove Windows cloudflared start, tunnel, stop and restart
-        if: matrix.os == 'windows'
+        if: matrix.os == 'windows' && needs.prepare-draft.outputs.already_published != 'true'
         run: node scripts/release/verify-cloudflared.mjs --binary "$env:RISUNEST_CLOUDFLARED"
       - name: Build and package Sync distributions
+        if: needs.prepare-draft.outputs.already_published != 'true'
         shell: bash
         env:
           RISUNEST_UPDATE_PUBLIC_KEY: ${{ secrets.RISUNEST_UPDATE_PUBLIC_KEY }}
@@ -856,6 +809,7 @@ jobs:
           vendor_sha=$(node -p "require('./vendor/vendor.json').executableSha256")
           node server/manager/install/package.mjs --native-build release-work/native/native-build.json --raw-archive "$raw" --release-input release-input.json --output release-work/packages --cloudflared-sha256 "$vendor_sha"
       - name: Sign final Sync distributions
+        if: needs.prepare-draft.outputs.already_published != 'true'
         shell: bash
         env:
           RISUNEST_UPDATE_PUBLIC_KEY: ${{ secrets.RISUNEST_UPDATE_PUBLIC_KEY }}
@@ -867,7 +821,7 @@ jobs:
           set -euo pipefail
           node scripts/release/build.mjs --release-input release-input.json --leg "sync_${OS}_${ARCH}" --assets-json release-work/packages/assets.json --output release-out --public-key "$RISUNEST_UPDATE_PUBLIC_KEY"
       - name: Install, reinstall and roll back the produced Linux managed package
-        if: matrix.os == 'linux'
+        if: matrix.os == 'linux' && needs.prepare-draft.outputs.already_published != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -877,11 +831,11 @@ jobs:
           managed=$(node -e "const path=require('node:path'); const matches=require('./release-work/packages/assets.json').filter((asset) => asset.download.variant === 'managed' && asset.download.os === 'linux' && asset.download.arch === process.argv[1] && asset.download.format === 'tar.gz'); if (matches.length !== 1) throw new Error('Expected one managed Linux archive.'); process.stdout.write(path.resolve(matches[0].path));" "${{ matrix.arch }}")
           env -u XDG_CONFIG_HOME -u XDG_DATA_HOME bash server/manager/install/managed-install.integration.test.sh "$managed"
       - name: Run synthetic Windows NSIS install failure and rollback checks
-        if: matrix.os == 'windows'
+        if: matrix.os == 'windows' && needs.prepare-draft.outputs.already_published != 'true'
         shell: pwsh
         run: pwsh -NoProfile -File server/manager/install/windows.test.ps1
       - name: Apply and roll back the produced macOS Sync app
-        if: matrix.os == 'darwin'
+        if: matrix.os == 'darwin' && needs.prepare-draft.outputs.already_published != 'true'
         shell: bash
         env:
           RISUNEST_TEST_RUST_TARGET: ${{ matrix.target }}
@@ -892,7 +846,7 @@ jobs:
           sh server/manager/tests/macos-update.sh "$managed" "$managed.sig" "$inventory" 2>&1 | tee "$RUNNER_TEMP/macos-update.log"
           grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/macos-update.log"
       - name: Upload final assets to draft
-        if: inputs.publish == true
+        if: inputs.publish == true && needs.prepare-draft.outputs.already_published != 'true'
         env: { GITHUB_TOKEN: "${{ github.token }}" }
         run: >-
           node scripts/release/upload-build.mjs
@@ -900,6 +854,7 @@ jobs:
           --directory release-out
           --inventory "release-out/inventory-sync_${{ matrix.os }}_${{ matrix.arch }}.json"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: needs.prepare-draft.outputs.already_published != 'true'
         with:
           name: ${{ inputs.publish && format('inventory-sync-{0}-{1}', matrix.os, matrix.arch) || format('rehearsal-sync-{0}-{1}', matrix.os, matrix.arch) }}
           path: ${{ inputs.publish && format('release-out/inventory-sync_{0}_{1}.json', matrix.os, matrix.arch) || 'release-out/*' }}
@@ -909,9 +864,10 @@ jobs:
   collect-publish:
     if: >-
       always() && needs.prepare-draft.result == 'success' && needs.prepare-draft.outputs.already_published != 'true' &&
-      ((inputs.product == 'app' && needs.app-desktop.result == 'success' && needs.app-android.result == 'success' && needs.app-ios.result == 'success') ||
-       (inputs.product == 'sync' && needs.sync-suite.result == 'success'))
-    needs: [source, prepare-draft, app-desktop, app-android, app-ios, sync-suite]
+      needs.source.result == 'success' && needs.release-tooling-tests.result == 'success' && needs.endpoint-registry-tests.result == 'success' && needs.shared-wasm-tests.result == 'success' &&
+      ((inputs.product == 'app' && needs.app-web-tests.result == 'success' && needs.app-desktop.result == 'success' && needs.app-android-tests.result == 'success' && needs.app-ios-tests.result == 'success' && needs.app-android.result == 'success' && needs.app-ios.result == 'success') ||
+       (inputs.product == 'sync' && needs.sync-gui-tests.result == 'success' && needs.sync-suite.result == 'success'))
+    needs: [source, release-tooling-tests, endpoint-registry-tests, shared-wasm-tests, prepare-draft, app-web-tests, app-desktop, app-android-tests, app-ios-tests, app-android, app-ios, sync-gui-tests, sync-suite]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -987,8 +943,12 @@ jobs:
           retention-days: 2
 
   recover-published:
-    if: always() && inputs.publish == true && needs.prepare-draft.outputs.already_published == 'true'
-    needs: [source, prepare-draft]
+    if: >-
+      always() && inputs.publish == true && needs.prepare-draft.result == 'success' && needs.prepare-draft.outputs.already_published == 'true' &&
+      needs.source.result == 'success' && needs.release-tooling-tests.result == 'success' && needs.endpoint-registry-tests.result == 'success' && needs.shared-wasm-tests.result == 'success' &&
+      ((inputs.product == 'app' && needs.app-web-tests.result == 'success' && needs.app-desktop.result == 'success' && needs.app-android-tests.result == 'success' && needs.app-ios-tests.result == 'success') ||
+       (inputs.product == 'sync' && needs.sync-gui-tests.result == 'success' && needs.sync-suite.result == 'success'))
+    needs: [source, release-tooling-tests, endpoint-registry-tests, shared-wasm-tests, prepare-draft, app-web-tests, app-desktop, app-android-tests, app-ios-tests, sync-gui-tests, sync-suite]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
