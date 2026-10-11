@@ -12,6 +12,8 @@ use risunest_sync_wire::{
 use rusqlite::{params, Connection, OptionalExtension};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const STATE_PIN_LIFETIME_SECONDS: i64 = 3600;
+
 pub(super) fn time_ms() -> Result<u64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -493,7 +495,7 @@ impl Store {
         )?;
         let head = Self::read_head(&tx)?;
         let expires = super::uploads::now()?
-            .checked_add(3600)
+            .checked_add(STATE_PIN_LIFETIME_SECONDS)
             .ok_or(Error::new("clock-overflow", 503))?;
         let id = random_id()?;
         tx.execute(
@@ -527,8 +529,8 @@ impl Store {
         let mut db = self.reader()?;
         let tx = db.transaction()?;
         Self::require_device(&tx, device)?;
-        let seq: Option<String> = tx.query_row("SELECT start_seq FROM state_pins WHERE id=?1 AND device=?2 AND expires>unixepoch()", params![pin,device.id], |r| r.get(0)).optional()?;
-        let seq = seq.ok_or(Error::new("state-pin-expired", 410))?;
+        let pinned: Option<(String, i64)> = tx.query_row("SELECT start_seq,expires FROM state_pins WHERE id=?1 AND device=?2 AND expires>unixepoch()", params![pin,device.id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        let (seq, expires) = pinned.ok_or(Error::new("state-pin-expired", 410))?;
         let mut stmt = tx.prepare("SELECT body FROM state_pin_units WHERE pin=?1 AND key>?2 COLLATE BINARY ORDER BY key COLLATE BINARY LIMIT ?3")?;
         let rows = stmt.query_map(
             params![
@@ -558,12 +560,34 @@ impl Store {
         } else {
             None
         };
-        Ok(StatePage {
+        let page = StatePage {
             pin_id: pin.into(),
             start_seq: seq.try_into()?,
             items,
             next_key,
-        })
+        };
+        drop(stmt);
+        tx.commit()?;
+        drop(db);
+
+        // Keep an active read on the same snapshot without writing on every page.
+        let now = super::uploads::now()?;
+        if expires.saturating_sub(now) <= STATE_PIN_LIFETIME_SECONDS / 2 {
+            let renewed = now.checked_add(STATE_PIN_LIFETIME_SECONDS)
+                .ok_or(Error::new("clock-overflow", 503))?;
+            let mut db = self.db()?;
+            let tx = db.transaction()?;
+            Self::require_device(&tx, device)?;
+            let updated = tx.execute(
+                "UPDATE state_pins SET expires=MAX(expires,?1) WHERE id=?2 AND device=?3 AND expires>unixepoch()",
+                params![renewed, pin, device.id],
+            )?;
+            if updated == 0 {
+                return Err(Error::new("state-pin-expired", 410));
+            }
+            tx.commit()?;
+        }
+        Ok(page)
     }
 
     pub fn release_state_pin(&self, device: &Device, pin: &str) -> Result<()> {

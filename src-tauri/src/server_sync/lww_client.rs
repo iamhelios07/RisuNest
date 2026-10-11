@@ -771,7 +771,7 @@ impl LwwClient {
                 let mut after = None;
                 let mut changes = Vec::new();
                 loop {
-                    let mut query = vec![("pin", pin.pin_id.clone()), ("limit", "256".into())];
+                    let mut query = vec![("pin", pin.pin_id.clone()), ("limit", "1024".into())];
                     if let Some(key) = after {
                         query.push(("afterKey", key));
                     }
@@ -805,7 +805,7 @@ impl LwwClient {
                     let (_, tail): (_, ChangesPage) = self.client.json(
                         reqwest::Method::GET,
                         "changes",
-                        &[("after", cursor.0.to_string()), ("limit", "256".into())],
+                        &[("after", cursor.0.to_string()), ("limit", "1024".into())],
                         None::<&AckRequest>,
                         &[],
                     )?;
@@ -1437,7 +1437,7 @@ impl LwwClient {
                 let mut residency = super::residency::Residency::open(store.repository_root())?;
                 residency.retain(&self.client, &config, &head, &missing)?;
                 let objects=missing.iter().map(|(hash,_)| {let proof=residency.object(hash,None)?.ok_or_else(||SyncError::new("remote-object-unavailable",409))?;Ok(crate::persistent_store::asset_object_catalog::AssetObjectRegistration{object_hash:hash.clone(),byte_size:proof.size})}).collect::<Result<Vec<_>>>()?;
-                for page in objects.chunks(128) {
+                for page in objects.chunks(crate::persistent_store::asset_object_catalog::ASSET_OBJECT_CATALOG_MAX_PAGE as usize) {
                     store
                         .asset_object_catalog()
                         .register(page, now_ms()? as i64)?;

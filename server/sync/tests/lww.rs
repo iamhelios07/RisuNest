@@ -511,6 +511,45 @@ fn stable_state_pin_pages_in_key_byte_order_while_tail_continues() {
 }
 
 #[test]
+fn active_state_pin_pages_renew_the_same_snapshot_only_near_expiry() {
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::init(root.path()).unwrap();
+    let a = device(&store);
+    let b = device(&store);
+    let original = inline("a", WRITER_A, 1, "original");
+    store.push(&a, &request(&store, WRITER_A, "initial", vec![original.clone()])).unwrap();
+    let pin = store.create_state_pin(&a).unwrap();
+    store.push(&a, &request(&store, WRITER_A, "changed", vec![inline("a", WRITER_A, 2, "changed")])).unwrap();
+    let db = Connection::open(root.path().join("metadata.sqlite")).unwrap();
+    let now: i64 = db.query_row("SELECT unixepoch()", [], |row| row.get(0)).unwrap();
+    let expiry = || db.query_row("SELECT expires FROM state_pins WHERE id=?1", [&pin.pin_id], |row| row.get::<_, i64>(0)).unwrap();
+
+    db.execute("UPDATE state_pins SET expires=?1 WHERE id=?2", rusqlite::params![now + 3500, pin.pin_id]).unwrap();
+    store.state_page(&a, &pin.pin_id, None, 1024).unwrap();
+    assert_eq!(expiry(), now + 3500);
+
+    db.execute("UPDATE state_pins SET expires=?1 WHERE id=?2", rusqlite::params![now + 60, pin.pin_id]).unwrap();
+    assert_eq!(store.state_page(&b, &pin.pin_id, None, 1024).unwrap_err().code, "state-pin-expired");
+    assert_eq!(expiry(), now + 60);
+    assert_eq!(store.state_page(&a, &pin.pin_id, None, 0).unwrap_err().code, "invalid-limit");
+    assert_eq!(expiry(), now + 60);
+    let page = store.state_page(&a, &pin.pin_id, None, 1024).unwrap();
+    assert_eq!(page.pin_id, pin.pin_id);
+    assert_eq!(page.start_seq, pin.start_seq);
+    assert_eq!(page.items, vec![original]);
+    assert!(expiry() >= now + 3600);
+    let renewed = expiry();
+    store.state_page(&a, &pin.pin_id, None, 1024).unwrap();
+    assert_eq!(expiry(), renewed);
+
+    db.execute("UPDATE state_pins SET expires=0 WHERE id=?1", [&pin.pin_id]).unwrap();
+    assert_eq!(store.state_page(&a, &pin.pin_id, None, 1024).unwrap_err().code, "state-pin-expired");
+    assert_eq!(expiry(), 0);
+    store.release_state_pin(&a, &pin.pin_id).unwrap();
+    assert_eq!(store.state_page(&a, &pin.pin_id, None, 1024).unwrap_err().code, "state-pin-expired");
+}
+
+#[test]
 fn a_device_that_left_pins_behind_can_still_read_state() {
     let root = tempfile::tempdir().unwrap();
     let store = Store::init(root.path()).unwrap();

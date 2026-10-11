@@ -1499,23 +1499,22 @@ fn a_state_read_plans_its_listing_from_the_units_its_pin_holds() {
         ))
     });
     let writer = ServerWriter::new(&server.server);
-    for index in 0..300 {
-        let key = UnitKey::new(&["exists", "character", &format!("synthetic-{index}")]).unwrap();
-        writer.push(&format!("create-{index}"), &key, 100, UnitValue::inline(br#"{"type":"character"}"#).unwrap());
-    }
+    writer.push_units("first-page", "first", 1024);
+    writer.push_units("second-page", "second", 1024);
+    writer.push_units("last-page", "last", 2);
     let (_root, mut store) = local();
     let changes = super::progress::within(&lane, || {
         let client = server.client(&store);
         let upper = client.admission().unwrap();
         client.state(&mut store, upper).unwrap().1
     });
-    assert_eq!(changes.len(), 300);
+    assert_eq!(changes.len(), 2050);
     let read = lane.snapshot("binding");
-    assert_eq!((read.listed, read.listed_total), (300, 300));
+    assert_eq!((read.listed, read.listed_total), (2050, 2050));
     // Every state page was requested with the whole total already planned.
     let seen = seen.lock().unwrap();
-    assert!(seen.len() >= 2);
-    assert!(seen.iter().all(|total| *total == 300));
+    assert_eq!(seen.len(), 3);
+    assert!(seen.iter().all(|total| *total == 2050));
 }
 
 fn publication_ids(client: &LwwClient) -> Vec<String> {
