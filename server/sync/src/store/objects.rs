@@ -20,7 +20,33 @@ use std::{fs, io::Write, path::Path};
 pub(super) const SMALL_OBJECT_BYTES: usize = 64 * 1024;
 pub(super) use small_object_store::delete_batch as delete_inline;
 
+// Four workers improved file-backed persistence in release measurements with
+// depths 1, 2 and 4. Keep this bounded independently of the request's body count.
 const FILE_IO_WORKERS: usize = 4;
+
+fn spawn_file_worker<'scope, 'env, F, T>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    worker: F,
+) -> std::io::Result<std::thread::ScopedJoinHandle<'scope, T>>
+where
+    F: FnOnce() -> T + Send + 'scope,
+    T: Send + 'scope,
+{
+    #[cfg(test)]
+    if frame_metrics::SPAWN_FAILURE_MASK.with(|mask| {
+        let current = mask.get();
+        mask.set(current >> 1);
+        current & 1 != 0
+    }) {
+        return Err(std::io::ErrorKind::WouldBlock.into());
+    }
+    std::thread::Builder::new().spawn_scoped(scope, worker)
+}
+
+enum FileWork<'scope, T> {
+    Worker(std::thread::ScopedJoinHandle<'scope, Result<Vec<T>>>),
+    Current(Result<Vec<T>>),
+}
 
 fn file_batch<T: Sync, U: Send>(items: &[T], operation: impl Fn(&T) -> Result<U> + Sync) -> Result<Vec<U>> {
     #[cfg(not(test))]
@@ -39,20 +65,28 @@ fn file_batch<T: Sync, U: Send>(items: &[T], operation: impl Fn(&T) -> Result<U>
                 let observed = crate::source_observer::worker();
                 #[cfg(test)]
                 let samples = frame_metrics::SAMPLES.with(|samples| samples.borrow().clone());
-                scope.spawn(move || {
+                let worker = spawn_file_worker(scope, move || {
                     #[cfg(test)]
                     let _observed = observed.enter();
                     #[cfg(test)]
                     frame_metrics::SAMPLES.with(|current| *current.borrow_mut() = samples);
                     group.iter().map(operation).collect::<Result<Vec<_>>>()
-                })
+                });
+                match worker {
+                    Ok(worker) => FileWork::Worker(worker),
+                    // Thread exhaustion must not unwind while holding objects_gate.
+                    Err(_) => FileWork::Current(group.iter().map(operation).collect()),
+                }
             })
             .collect::<Vec<_>>();
         // Every worker must end before a failure releases staging files or the publication gate.
-        let results = workers.into_iter().map(|worker| worker.join()).collect::<Vec<_>>();
+        let results = workers.into_iter().map(|work| match work {
+            FileWork::Worker(worker) => worker.join().unwrap_or_else(|_| Err(Error::new("storage-unavailable", 503))),
+            FileWork::Current(result) => result,
+        }).collect::<Vec<_>>();
         let mut completed = Vec::with_capacity(items.len());
         for result in results {
-            completed.extend(result.map_err(|_| Error::new("storage-unavailable", 503))??);
+            completed.extend(result?);
         }
         Ok(completed)
     })
@@ -504,6 +538,7 @@ pub(super) mod frame_metrics {
     std::thread_local! {
         pub static SAMPLES: std::cell::RefCell<Option<std::sync::Arc<std::sync::Mutex<[Vec<u128>; 8]>>>> = const { std::cell::RefCell::new(None) };
         pub static FILE_WORKERS: std::cell::Cell<usize> = const { std::cell::Cell::new(super::FILE_IO_WORKERS) };
+        pub static SPAWN_FAILURE_MASK: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
         /// Counts the bodies a reply actually opened. A transfer reply is
         /// planned from object metadata, so this must stay at the number of
         /// bodies the reply carries.
@@ -789,18 +824,71 @@ mod tests {
     #[test]
     fn file_batch_joins_successful_workers_before_returning_an_error() {
         use std::sync::{atomic::{AtomicUsize, Ordering}, Barrier};
-        let entered = Barrier::new(FILE_IO_WORKERS);
+        for depth in [2, 4, 8] {
+            frame_metrics::FILE_WORKERS.with(|workers| workers.set(depth));
+            let items = (0..depth).collect::<Vec<_>>();
+            let entered = Barrier::new(depth);
+            let completed = AtomicUsize::new(0);
+            let result = file_batch(&items, |index| {
+                entered.wait();
+                if *index == 0 {
+                    return Err(Error::new("storage-io", 503));
+                }
+                completed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
+            assert_eq!(result.unwrap_err().code, "storage-io");
+            assert_eq!(completed.load(Ordering::SeqCst), depth - 1);
+        }
+        frame_metrics::FILE_WORKERS.with(|workers| workers.set(FILE_IO_WORKERS));
+    }
+
+    #[test]
+    fn thread_creation_failure_falls_back_without_poisoning_publication() {
+        use risunest_sync_wire::transfer::{self, Frame};
+        frame_metrics::FILE_WORKERS.with(|workers| workers.set(4));
+        // Four preparation attempts, followed by four publication attempts.
+        for failures in [0x0f, 0xf0, 0xaa, 0xff] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = Store::init(directory.path()).unwrap();
+            let registration = store.add_device().unwrap();
+            let device = super::super::Device { id: registration.device_id };
+            let bodies = (0..8).map(|index| vec![index; SMALL_OBJECT_BYTES + 1]).collect::<Vec<_>>();
+            let frames = bodies.iter().cloned().map(Frame::Full).collect::<Vec<_>>();
+            let encoded = transfer::encode(&frames).unwrap();
+            frame_metrics::SPAWN_FAILURE_MASK.with(|mask| mask.set(failures));
+            let received = store.receive_frames(&device, &encoded).unwrap();
+            assert_eq!(received, bodies.iter().map(|body| hash(body)).collect::<Vec<_>>());
+            assert_eq!(frame_metrics::SPAWN_FAILURE_MASK.with(std::cell::Cell::get), 0);
+            assert!(!store.objects_gate.is_poisoned());
+            assert!(store.temporary_paths.lock().unwrap().is_empty());
+            assert_eq!(std::fs::read_dir(directory.path().join("staging")).unwrap().count(), 0);
+            store.maintain().unwrap();
+            assert_eq!(store.receive_frames(&device, &encoded).unwrap(), received);
+            for body in &bodies {
+                assert_eq!(&store.get_object(&hash(body)).unwrap(), body);
+            }
+        }
+        frame_metrics::FILE_WORKERS.with(|workers| workers.set(FILE_IO_WORKERS));
+    }
+
+    #[test]
+    fn mixed_inline_and_spawned_file_work_finishes_before_an_error_returns() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        frame_metrics::FILE_WORKERS.with(|workers| workers.set(4));
+        frame_metrics::SPAWN_FAILURE_MASK.with(|mask| mask.set(0b1010));
         let completed = AtomicUsize::new(0);
-        let result = file_batch(&[0, 1, 2, 3], |index| {
-            entered.wait();
-            if *index == 0 {
+        let result = file_batch(&(0..8).collect::<Vec<_>>(), |index| {
+            if *index == 3 {
                 return Err(Error::new("storage-io", 503));
             }
             completed.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            Ok(*index)
         });
         assert_eq!(result.unwrap_err().code, "storage-io");
-        assert_eq!(completed.load(Ordering::SeqCst), FILE_IO_WORKERS - 1);
+        assert_eq!(completed.load(Ordering::SeqCst), 7);
+        assert_eq!(frame_metrics::SPAWN_FAILURE_MASK.with(std::cell::Cell::get), 0);
+        frame_metrics::FILE_WORKERS.with(|workers| workers.set(FILE_IO_WORKERS));
     }
 
     #[test]

@@ -423,7 +423,20 @@ impl ServerClient {
         retry_budget: Arc<RetryBudget>,
     ) -> Result<Self> {
         let url = config.validate()?;
-        let http = shared_transport()?;
+        // New clients must pick up system proxy changes. Keep the connection
+        // pool scoped to this client and its transfer workers.
+        // Other crates enable reqwest's decoders, which would strip a
+        // Content-Encoding this client has to see and refuse.
+        let http = crate::platform_tls::blocking_client_builder()
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .no_zstd()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|_| SyncError::new("http-client-unavailable", 503))?;
         Ok(Self {
             #[cfg(test)]
             test_io: None,
@@ -871,29 +884,6 @@ impl ServerClient {
     }
 }
 
-fn shared_transport() -> Result<Client> {
-    static TRANSPORT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
-    if let Some(client) = TRANSPORT.get() {
-        return Ok(client.clone());
-    }
-    // The pool holds no credentials or job state. Every request supplies its own
-    // identity, cancellation and deadline, including after a binding changes.
-    // Other crates enable decoders, which would hide a Content-Encoding this
-    // client has to see and refuse.
-    let client = crate::platform_tls::blocking_client_builder()
-        .no_gzip()
-        .no_brotli()
-        .no_deflate()
-        .no_zstd()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|_| SyncError::new("http-client-unavailable", 503))?;
-    let _ = TRANSPORT.set(client);
-    Ok(TRANSPORT.get().unwrap().clone())
-}
-
 pub(crate) fn response_code(reply: &Reply) -> Option<String> {
     serde_json::from_slice::<serde_json::Value>(&reply.body)
         .ok()
@@ -1111,7 +1101,7 @@ mod tests {
     }
 
     #[test]
-    fn successive_clients_reuse_transport_without_sharing_credentials_or_cancellation() {
+    fn successive_clients_refresh_transport_without_sharing_credentials_or_cancellation() {
         use axum::{extract::ConnectInfo, http::{HeaderMap, StatusCode}, Router};
         use std::sync::atomic::{AtomicBool, Ordering};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1147,7 +1137,7 @@ mod tests {
         server.join().unwrap();
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 2);
-        assert_eq!(seen[0].0, seen[1].0, "a new Sync page should reuse the established TCP connection");
+        assert_ne!(seen[0].0, seen[1].0, "a new client must refresh transport configuration");
         assert_eq!(seen[0].1, format!("Bearer {}", "a".repeat(64)));
         assert_eq!(seen[1].1, format!("Bearer {}", "b".repeat(64)));
     }
