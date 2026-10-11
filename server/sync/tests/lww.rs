@@ -517,24 +517,71 @@ fn state_pins_allow_long_reads_without_extending_their_deadline() {
     let a = device(&store);
     let b = device(&store);
     let original = inline("a", WRITER_A, 1, "original");
-    store.push(&a, &request(&store, WRITER_A, "initial", vec![original.clone()])).unwrap();
-    let before = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    store
+        .push(
+            &a,
+            &request(&store, WRITER_A, "initial", vec![original.clone()]),
+        )
+        .unwrap();
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let pin = store.create_state_pin(&a).unwrap();
-    let after = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     assert!((before + 24 * 3600..=after + 24 * 3600).contains(&(pin.expires_at_ms.0 / 1000)));
-    store.push(&a, &request(&store, WRITER_A, "changed", vec![inline("a", WRITER_A, 2, "changed")])).unwrap();
+    store
+        .push(
+            &a,
+            &request(
+                &store,
+                WRITER_A,
+                "changed",
+                vec![inline("a", WRITER_A, 2, "changed")],
+            ),
+        )
+        .unwrap();
     let db = Connection::open(root.path().join("metadata.sqlite")).unwrap();
-    let now: i64 = db.query_row("SELECT unixepoch()", [], |row| row.get(0)).unwrap();
-    let expiry = || db.query_row("SELECT expires FROM state_pins WHERE id=?1", [&pin.pin_id], |row| row.get::<_, i64>(0)).unwrap();
+    let now: i64 = db
+        .query_row("SELECT unixepoch()", [], |row| row.get(0))
+        .unwrap();
+    let expiry = || {
+        db.query_row(
+            "SELECT expires FROM state_pins WHERE id=?1",
+            [&pin.pin_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+    };
 
-    db.execute("UPDATE state_pins SET expires=?1 WHERE id=?2", rusqlite::params![now + 3500, pin.pin_id]).unwrap();
+    db.execute(
+        "UPDATE state_pins SET expires=?1 WHERE id=?2",
+        rusqlite::params![now + 3500, pin.pin_id],
+    )
+    .unwrap();
     store.state_page(&a, &pin.pin_id, None, 1024).unwrap();
     assert_eq!(expiry(), now + 3500);
 
-    db.execute("UPDATE state_pins SET expires=?1 WHERE id=?2", rusqlite::params![now + 60, pin.pin_id]).unwrap();
-    assert_eq!(store.state_page(&b, &pin.pin_id, None, 1024).unwrap_err().code, "state-pin-expired");
+    db.execute(
+        "UPDATE state_pins SET expires=?1 WHERE id=?2",
+        rusqlite::params![now + 60, pin.pin_id],
+    )
+    .unwrap();
+    assert_eq!(
+        store
+            .state_page(&b, &pin.pin_id, None, 1024)
+            .unwrap_err()
+            .code,
+        "state-pin-expired"
+    );
     assert_eq!(expiry(), now + 60);
-    assert_eq!(store.state_page(&a, &pin.pin_id, None, 0).unwrap_err().code, "invalid-limit");
+    assert_eq!(
+        store.state_page(&a, &pin.pin_id, None, 0).unwrap_err().code,
+        "invalid-limit"
+    );
     assert_eq!(expiry(), now + 60);
     db.execute_batch("BEGIN IMMEDIATE").unwrap();
     let page = store.state_page(&a, &pin.pin_id, None, 1024).unwrap();
@@ -546,11 +593,24 @@ fn state_pins_allow_long_reads_without_extending_their_deadline() {
     store.state_page(&a, &pin.pin_id, None, 1024).unwrap();
     assert_eq!(expiry(), now + 60);
 
-    db.execute("UPDATE state_pins SET expires=0 WHERE id=?1", [&pin.pin_id]).unwrap();
-    assert_eq!(store.state_page(&a, &pin.pin_id, None, 1024).unwrap_err().code, "state-pin-expired");
+    db.execute("UPDATE state_pins SET expires=0 WHERE id=?1", [&pin.pin_id])
+        .unwrap();
+    assert_eq!(
+        store
+            .state_page(&a, &pin.pin_id, None, 1024)
+            .unwrap_err()
+            .code,
+        "state-pin-expired"
+    );
     assert_eq!(expiry(), 0);
     store.release_state_pin(&a, &pin.pin_id).unwrap();
-    assert_eq!(store.state_page(&a, &pin.pin_id, None, 1024).unwrap_err().code, "state-pin-expired");
+    assert_eq!(
+        store
+            .state_page(&a, &pin.pin_id, None, 1024)
+            .unwrap_err()
+            .code,
+        "state-pin-expired"
+    );
 }
 
 #[test]

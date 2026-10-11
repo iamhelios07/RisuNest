@@ -27,7 +27,7 @@ fn state_restore_registers_remote_sizes_without_downloading_local_or_duplicate_a
     let work = crate::asset_repository::body_io::take_body_io();
     assert_eq!(changes.len(), 4);
     assert_eq!((work.stat_requests, work.batch_stat_requests), (0, 1));
-    let db = rusqlite::Connection::open(store.repository_root().join("persistent").join(crate::persistent_store::DATABASE_FILE)).unwrap();
+    let db = crate::sqlite_open::open(store.repository_root().join("persistent").join(crate::persistent_store::DATABASE_FILE)).unwrap();
     let mut query = db.prepare("SELECT object_hash,byte_size FROM asset_objects").unwrap();
     let registered = query.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))).unwrap()
         .collect::<rusqlite::Result<BTreeMap<_, _>>>().unwrap();
@@ -86,7 +86,7 @@ fn metadata_restore_measurement() {
         let (_, changes) = client.state(&mut store, upper).unwrap();
         let elapsed = start.elapsed();
         assert_eq!(changes.len(), count);
-        let db = rusqlite::Connection::open(store.repository_root().join("persistent").join(crate::persistent_store::DATABASE_FILE)).unwrap();
+        let db = crate::sqlite_open::open(store.repository_root().join("persistent").join(crate::persistent_store::DATABASE_FILE)).unwrap();
         let registered: i64 = db.query_row("SELECT count(*) FROM asset_objects", [], |row| row.get(0)).unwrap();
         assert_eq!(registered, count as i64);
         let paths = requests.lock().unwrap();

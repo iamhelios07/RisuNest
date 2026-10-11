@@ -48,7 +48,10 @@ enum FileWork<'scope, T> {
     Current(Result<Vec<T>>),
 }
 
-fn file_batch<T: Sync, U: Send>(items: &[T], operation: impl Fn(&T) -> Result<U> + Sync) -> Result<Vec<U>> {
+fn file_batch<T: Sync, U: Send>(
+    items: &[T],
+    operation: impl Fn(&T) -> Result<U> + Sync,
+) -> Result<Vec<U>> {
     #[cfg(not(test))]
     let depth = FILE_IO_WORKERS;
     #[cfg(test)]
@@ -80,10 +83,15 @@ fn file_batch<T: Sync, U: Send>(items: &[T], operation: impl Fn(&T) -> Result<U>
             })
             .collect::<Vec<_>>();
         // Every worker must end before a failure releases staging files or the publication gate.
-        let results = workers.into_iter().map(|work| match work {
-            FileWork::Worker(worker) => worker.join().unwrap_or_else(|_| Err(Error::new("storage-unavailable", 503))),
-            FileWork::Current(result) => result,
-        }).collect::<Vec<_>>();
+        let results = workers
+            .into_iter()
+            .map(|work| match work {
+                FileWork::Worker(worker) => worker
+                    .join()
+                    .unwrap_or_else(|_| Err(Error::new("storage-unavailable", 503))),
+                FileWork::Current(result) => result,
+            })
+            .collect::<Vec<_>>();
         let mut completed = Vec::with_capacity(items.len());
         for result in results {
             completed.extend(result?);
@@ -439,7 +447,7 @@ impl Store {
             for directory in directories {
                 #[cfg(test)]
                 let measured = std::time::Instant::now();
-                sync_directory(&directory)?;
+                sync_directory(directory)?;
                 #[cfg(test)]
                 frame_metrics::record(6, measured);
             }
@@ -535,8 +543,10 @@ impl Store {
 
 #[cfg(test)]
 pub(super) mod frame_metrics {
+    type Samples = std::sync::Arc<std::sync::Mutex<[Vec<u128>; 8]>>;
+
     std::thread_local! {
-        pub static SAMPLES: std::cell::RefCell<Option<std::sync::Arc<std::sync::Mutex<[Vec<u128>; 8]>>>> = const { std::cell::RefCell::new(None) };
+        pub static SAMPLES: std::cell::RefCell<Option<Samples>> = const { std::cell::RefCell::new(None) };
         pub static FILE_WORKERS: std::cell::Cell<usize> = const { std::cell::Cell::new(super::FILE_IO_WORKERS) };
         pub static SPAWN_FAILURE_MASK: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
         /// Counts the bodies a reply actually opened. A transfer reply is
@@ -794,17 +804,28 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::init(directory.path()).unwrap();
         let registration = store.add_device().unwrap();
-        let device = super::super::Device { id: registration.device_id };
+        let device = super::super::Device {
+            id: registration.device_id,
+        };
         let sizes = [64 * 1024, 64 * 1024 + 1, 256 * 1024, 256 * 1024 + 1];
         let bodies = sizes.map(|size| vec![0x5a; size]);
-        let frames = bodies.iter().cycle().take(16).cloned().map(Frame::Full).collect::<Vec<_>>();
+        let frames = bodies
+            .iter()
+            .cycle()
+            .take(16)
+            .cloned()
+            .map(Frame::Full)
+            .collect::<Vec<_>>();
         let encoded = transfer::encode(&frames).unwrap();
         for _ in 0..2 {
             store.receive_frames(&device, &encoded).unwrap();
         }
         for (body, expected) in bodies.iter().zip([true, false, false, false]) {
             let digest = hash(body);
-            assert_eq!(placement(&store.reader().unwrap(), &digest).unwrap(), Some((body.len() as u64, expected)));
+            assert_eq!(
+                placement(&store.reader().unwrap(), &digest).unwrap(),
+                Some((body.len() as u64, expected))
+            );
             assert_eq!(store.object_path(&digest).unwrap().exists(), !expected);
         }
         drop(store);
@@ -823,7 +844,10 @@ mod tests {
 
     #[test]
     fn file_batch_joins_successful_workers_before_returning_an_error() {
-        use std::sync::{atomic::{AtomicUsize, Ordering}, Barrier};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Barrier,
+        };
         for depth in [2, 4, 8] {
             frame_metrics::FILE_WORKERS.with(|workers| workers.set(depth));
             let items = (0..depth).collect::<Vec<_>>();
@@ -852,17 +876,32 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let store = Store::init(directory.path()).unwrap();
             let registration = store.add_device().unwrap();
-            let device = super::super::Device { id: registration.device_id };
-            let bodies = (0..8).map(|index| vec![index; SMALL_OBJECT_BYTES + 1]).collect::<Vec<_>>();
+            let device = super::super::Device {
+                id: registration.device_id,
+            };
+            let bodies = (0..8)
+                .map(|index| vec![index; SMALL_OBJECT_BYTES + 1])
+                .collect::<Vec<_>>();
             let frames = bodies.iter().cloned().map(Frame::Full).collect::<Vec<_>>();
             let encoded = transfer::encode(&frames).unwrap();
             frame_metrics::SPAWN_FAILURE_MASK.with(|mask| mask.set(failures));
             let received = store.receive_frames(&device, &encoded).unwrap();
-            assert_eq!(received, bodies.iter().map(|body| hash(body)).collect::<Vec<_>>());
-            assert_eq!(frame_metrics::SPAWN_FAILURE_MASK.with(std::cell::Cell::get), 0);
+            assert_eq!(
+                received,
+                bodies.iter().map(|body| hash(body)).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                frame_metrics::SPAWN_FAILURE_MASK.with(std::cell::Cell::get),
+                0
+            );
             assert!(!store.objects_gate.is_poisoned());
             assert!(store.temporary_paths.lock().unwrap().is_empty());
-            assert_eq!(std::fs::read_dir(directory.path().join("staging")).unwrap().count(), 0);
+            assert_eq!(
+                std::fs::read_dir(directory.path().join("staging"))
+                    .unwrap()
+                    .count(),
+                0
+            );
             store.maintain().unwrap();
             assert_eq!(store.receive_frames(&device, &encoded).unwrap(), received);
             for body in &bodies {
@@ -887,7 +926,10 @@ mod tests {
         });
         assert_eq!(result.unwrap_err().code, "storage-io");
         assert_eq!(completed.load(Ordering::SeqCst), 7);
-        assert_eq!(frame_metrics::SPAWN_FAILURE_MASK.with(std::cell::Cell::get), 0);
+        assert_eq!(
+            frame_metrics::SPAWN_FAILURE_MASK.with(std::cell::Cell::get),
+            0
+        );
         frame_metrics::FILE_WORKERS.with(|workers| workers.set(FILE_IO_WORKERS));
     }
 
@@ -897,8 +939,12 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::init(directory.path()).unwrap();
         let registration = store.add_device().unwrap();
-        let device = super::super::Device { id: registration.device_id };
-        let bodies = (0..8).map(|index| vec![index; SMALL_OBJECT_BYTES + 1]).collect::<Vec<_>>();
+        let device = super::super::Device {
+            id: registration.device_id,
+        };
+        let bodies = (0..8)
+            .map(|index| vec![index; SMALL_OBJECT_BYTES + 1])
+            .collect::<Vec<_>>();
         let hashes = bodies.iter().map(|body| hash(body)).collect::<Vec<_>>();
         let frames = bodies.iter().cloned().map(Frame::Full).collect::<Vec<_>>();
         let encoded = transfer::encode(&frames).unwrap();
@@ -908,9 +954,22 @@ mod tests {
         for digest in &hashes {
             assert!(store.object_size(digest).unwrap().is_none());
         }
-        assert_eq!(store.db().unwrap().query_row("SELECT count(*) FROM object_leases", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(
+            store
+                .db()
+                .unwrap()
+                .query_row("SELECT count(*) FROM object_leases", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
         assert!(store.temporary_paths.lock().unwrap().is_empty());
-        assert_eq!(std::fs::read_dir(directory.path().join("staging")).unwrap().count(), 0);
+        assert_eq!(
+            std::fs::read_dir(directory.path().join("staging"))
+                .unwrap()
+                .count(),
+            0
+        );
         std::fs::remove_dir(&blocked).unwrap();
         assert_eq!(store.receive_frames(&device, &encoded).unwrap(), hashes);
         for (body, digest) in bodies.iter().zip(&hashes) {
@@ -1232,9 +1291,12 @@ mod tests {
                 let root = tempfile::tempdir().unwrap();
                 let store = Store::init(root.path()).unwrap();
                 let registration = store.add_device().unwrap();
-                let device = super::super::Device { id: registration.device_id };
+                let device = super::super::Device {
+                    id: registration.device_id,
+                };
                 let count = 64usize;
-                frame_metrics::SAMPLES.with(|samples| *samples.borrow_mut() = Some(Default::default()));
+                frame_metrics::SAMPLES
+                    .with(|samples| *samples.borrow_mut() = Some(Default::default()));
                 let frames = (0..count)
                     .map(|index| {
                         let mut body = vec![0x5a; size];
@@ -1256,7 +1318,9 @@ mod tests {
                 );
                 frame_metrics::SAMPLES.with(|samples| {
                     let samples = samples.borrow_mut().take().unwrap();
-                    for (stage, mut values) in samples.lock().unwrap().clone().into_iter().enumerate() {
+                    for (stage, mut values) in
+                        samples.lock().unwrap().clone().into_iter().enumerate()
+                    {
                         if values.is_empty() {
                             continue;
                         }
