@@ -378,7 +378,7 @@ function pickWebBackupFile(signal: AbortSignal): Promise<File | null> {
  */
 export async function importLegacyBackupWithWebView(
     context: LegacyLocalBackupFallbackContext,
-    lifecycle: { beforeActivation?(): Promise<void>; onCommitted?(): void } = {},
+    lifecycle: { firstRun?: boolean; beforeActivation?(): Promise<void>; onCommitted?(): void } = {},
     confirmationTitle = language.backupLoadConfirm,
 ): Promise<{ warningCodes: string[], upstreamLosses: { coldMissing: number, invalidInlays: number, pocketInlays: number } } | null> {
     const file = await pickWebBackupFile(context.signal)
@@ -583,8 +583,9 @@ export async function importLegacyBackupWithWebView(
             .filter((key) => !restoredColdStoragePayloads.has(key))
         const affectedCold = getColdStorageAffectedCharacters(dbData, missingColdStorageKeys)
         upstreamLosses.coldMissing = missingColdStorageKeys.length
-        const description = missingColdStorageKeys.length === 0 ? language.checkboxConfirmation.dataReplacementDescription
-            : `${language.checkboxConfirmation.dataReplacementDescription}\n\n${language.errors.coldStorageIncompleteRestoreConfirm(affectedCold.characterNames.join(', '), missingColdStorageKeys.length, affectedCold.unresolvedKeys.length, false)}`
+        const warnings = missingColdStorageKeys.length === 0 ? []
+            : [language.errors.coldStorageIncompleteRestoreConfirm(affectedCold.characterNames.join(', '), missingColdStorageKeys.length, affectedCold.unresolvedKeys.length, false)]
+        const description = [language.checkboxConfirmation.dataReplacementDescription, ...warnings].join('\n\n')
         if (!isTauri && !(await alertCheckboxConfirm({
             title: confirmationTitle,
             description,
@@ -604,7 +605,7 @@ export async function importLegacyBackupWithWebView(
 
         report('activating')
         await installLocalBackup(dbData, {
-            ...(isTauri ? {upstreamImportWarnings: [description]} : {}),
+            ...(isTauri ? {upstreamImportWarnings: warnings, firstRun: lifecycle.firstRun} : {}),
             replaceDatabase: async (...args) => {
                 await lifecycle.beforeActivation?.()
                 checkCancelled()

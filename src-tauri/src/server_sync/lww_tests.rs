@@ -687,6 +687,37 @@ fn no_edit_push_does_not_make_a_request() {
     );
 }
 
+#[test]
+fn a_metadata_publication_batches_cache_durability_and_arrives_intact() {
+    let server = LocalServerFixture::new();
+    let (_source_root, mut source) = local();
+    let (_target_root, mut target) = local();
+    let fields = ["additionalPrompt", "NAIImgUrl", "autofillRequestUrl", "language", "ImagenModel"];
+    let values = fields.iter().enumerate().map(|(index, field)| {
+        (*field, serde_json::json!(format!("synthetic body {index} ").repeat(risunest_sync_wire::unit::MAX_INLINE_UNIT_BYTES / 16 + 1)))
+    }).collect::<Vec<_>>();
+    for (key, value) in &values {
+        save(&mut source, &["root", key], value.clone());
+    }
+    let sender = server.client(&source);
+    let pending = source.lww_read_outbox(header(&source).binding_authority, 256).unwrap();
+    assert_eq!(pending.entries.len(), fields.len());
+    assert!(pending.entries.iter().all(|entry| matches!(entry.value, UnitValue::Object { .. })));
+    super::cache::take_batch_commits();
+    super::cache::take_put_calls();
+    let receipt = publish_cycle(&sender, &mut source, &[]).unwrap().unwrap();
+    let commits = super::cache::take_batch_commits();
+    assert!(super::cache::take_put_calls() >= fields.len() as u64);
+    assert_eq!(commits, 1, "small metadata bodies should share one durable cache transaction");
+    assert_eq!(receipt.accepted_keys.len(), fields.len());
+    assert!(source.lww_read_outbox(header(&source).binding_authority, 1).unwrap().entries.is_empty());
+    receive_available(&server.client(&target), &mut target, &[]).unwrap();
+    let root = target.read_root(None).unwrap();
+    for (key, value) in values {
+        assert_eq!(root.value[key], value);
+    }
+}
+
 fn publication(client: &LwwClient, store: &PersistentStore) -> Publication {
     let entries = store
         .lww_read_outbox(store.lww_binding_authority().unwrap(), 256)

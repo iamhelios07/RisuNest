@@ -423,6 +423,8 @@ impl ServerClient {
         retry_budget: Arc<RetryBudget>,
     ) -> Result<Self> {
         let url = config.validate()?;
+        // New clients must pick up system proxy changes. Keep the connection
+        // pool scoped to this client and its transfer workers.
         // Other crates enable reqwest's decoders, which would strip a
         // Content-Encoding this client has to see and refuse.
         let http = crate::platform_tls::blocking_client_builder()
@@ -1096,6 +1098,48 @@ mod tests {
             device_id: "device".into(),
             token: "a".repeat(64),
         }
+    }
+
+    #[test]
+    fn successive_clients_refresh_transport_without_sharing_credentials_or_cancellation() {
+        use axum::{extract::ConnectInfo, http::{HeaderMap, StatusCode}, Router};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let captured = seen.clone();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async move {
+                let router = Router::new().fallback(move |ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>, headers: HeaderMap| {
+                    let captured = captured.clone();
+                    async move {
+                        captured.lock().unwrap().push((peer, headers["authorization"].to_str().unwrap().to_owned()));
+                        StatusCode::NO_CONTENT
+                    }
+                });
+                axum::serve(tokio::net::TcpListener::from_std(listener).unwrap(), router.into_make_service_with_connect_info::<std::net::SocketAddr>())
+                    .with_graceful_shutdown(async { let _ = stopped.await; }).await.unwrap();
+            });
+        });
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let first = ServerClient::with_cancellation(config(&endpoint), Some(cancelled.clone())).unwrap();
+        assert_eq!(first.request(Method::GET, "head", &[], None, &[], 1024).unwrap().status, 204);
+        cancelled.store(true, Ordering::Release);
+        assert_eq!(first.request(Method::GET, "head", &[], None, &[], 1024).err().unwrap().code, "cancelled");
+        drop(first);
+        let mut next = config(&endpoint);
+        next.token = "b".repeat(64);
+        let second = ServerClient::new(next).unwrap();
+        assert_eq!(second.request(Method::GET, "head", &[], None, &[], 1024).unwrap().status, 204);
+        stop.send(()).unwrap();
+        server.join().unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_ne!(seen[0].0, seen[1].0, "a new client must refresh transport configuration");
+        assert_eq!(seen[0].1, format!("Bearer {}", "a".repeat(64)));
+        assert_eq!(seen[1].1, format!("Bearer {}", "b".repeat(64)));
     }
     #[test]
     fn verified_progress_renews_more_than_five_minutes_of_transient_failures() {

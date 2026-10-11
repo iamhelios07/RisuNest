@@ -493,6 +493,7 @@ export interface PreparedUnitIntent {
 export interface PersistentReplacementOptions {
     upstreamImport?: boolean
     upstreamImportWarnings?: string[]
+    firstRun?: boolean
     onPluginsRestarted?(): void
     publishOfficial?: boolean
     authoritative?: boolean
