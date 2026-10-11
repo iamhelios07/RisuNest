@@ -49,12 +49,6 @@ export type BackupSourceFactory = (
 export type BackupRestoreResult = NativeFileJobResult | { warningCodes: string[] }
 export interface BackupRestoreOptions extends NativeFileRestoreJobOptions {
     onSource?(source: SourceInfo): void
-    /**
-     * The device holds nothing worth keeping yet, as on the first-run
-     * screen: skip the replacement confirmation and describe the section
-     * choice as a first import rather than an overwrite.
-     */
-    firstRun?: boolean
 }
 
 function combineSignals(...signals: (AbortSignal | undefined)[]) {
@@ -310,6 +304,7 @@ export async function restoreBackupFromNativeSource(
                                     setSource: onSource,
                                     setPartialWritesPossible: context.setPartialWritesPossible,
                                 }, {
+                                    firstRun: options.firstRun,
                                     beforeActivation: async () => {
                                         await restoreOptions.beforeActivation?.()
                                     },

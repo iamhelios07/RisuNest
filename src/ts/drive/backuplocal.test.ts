@@ -272,7 +272,7 @@ describe('local backup persistent snapshot', () => {
         expect(JSON.stringify(context.onStatus.mock.calls)).toContain(`coldstorage_${coldKey}.json`)
     })
 
-    it.each([[true,false,false],[false,false,false],[true,true,false],[true,false,true]])('preflights, acknowledges, and preserves committed outcomes (%s,%s,%s)', async (confirmed, bodyFails, native) => {
+    it.each([[true,false,false,false],[false,false,false,false],[true,true,false,false],[true,false,true,false],[true,false,true,true]])('preflights, acknowledges, and preserves committed outcomes (%s,%s,%s, first run %s)', async (confirmed, bodyFails, native, firstRun) => {
         state.native = native
         const { alertCheckboxConfirm } = await import('../alert')
         vi.mocked(alertCheckboxConfirm).mockResolvedValueOnce({ confirmed, checked: confirmed })
@@ -329,7 +329,7 @@ describe('local backup persistent snapshot', () => {
         }
 
         const {language} = await import('../../lang')
-        const pending = importLegacyBackupWithWebView(context, {}, language.pocketRisuImportConfirm)
+        const pending = importLegacyBackupWithWebView(context, {firstRun}, language.pocketRisuImportConfirm)
         await vi.waitFor(() => expect(click).toHaveBeenCalledOnce())
         input.dispatchEvent(new Event('change'))
         if (!confirmed) {
@@ -352,7 +352,7 @@ describe('local backup persistent snapshot', () => {
         createElement.mockRestore()
         if (native) {
             expect(alertCheckboxConfirm).not.toHaveBeenCalled()
-            expect(state.replacePersistentDatabase.mock.calls[0][2]).toMatchObject({upstreamImport:true, upstreamImportWarnings:[language.checkboxConfirmation.dataReplacementDescription]})
+            expect(state.replacePersistentDatabase.mock.calls[0][2]).toMatchObject({upstreamImport:true, upstreamImportWarnings:[], ...(firstRun ? {firstRun:true} : {})})
         } else {
             expect(alertCheckboxConfirm).toHaveBeenCalledOnce()
             expect(alertCheckboxConfirm).toHaveBeenCalledWith(expect.objectContaining({title:language.pocketRisuImportConfirm}))
