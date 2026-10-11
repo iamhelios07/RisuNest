@@ -140,7 +140,10 @@
     async function cleanCopies() {
         try { return await evictLocalAssets() }
         catch (error) {
-            if ($assetCleanupProgress?.state !== 'cancelled') throw error
+            if ($assetCleanupProgress?.state === 'cancelled') return
+            failure ||= message(error)
+            if (mounted) await readResidency().catch(() => {})
+            throw error
         }
     }
     // A new code replaces the refusal of the previous one. Other connection failures stay.

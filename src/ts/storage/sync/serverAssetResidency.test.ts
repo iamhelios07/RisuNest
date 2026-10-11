@@ -41,8 +41,10 @@ describe('asset residency mobile lifetime', () => {
         finish(status)
         await rejected
         expect(get(assetCleanupProgress)).toMatchObject({ state: 'cancelled', evictedBytes: 4096 })
-        report({ ...reading, sequence: 4, completedItems: 10 })
-        expect(get(assetCleanupProgress)?.completedItems).toBe(3)
+        report({ ...reading, sequence: 4, completedItems: 4, evictedItems: 4, evictedBytes: 8192 })
+        expect(get(assetCleanupProgress)).toMatchObject({ state: 'cancelled', evictedItems: 4, evictedBytes: 8192 })
+        report({ ...reading, sequence: 3 })
+        expect(get(assetCleanupProgress)?.evictedBytes).toBe(8192)
         expect(dispose).toHaveBeenCalledOnce()
     })
     it('cancels cleanup before preparation finishes without starting deletion', async () => {
@@ -75,6 +77,24 @@ describe('asset residency mobile lifetime', () => {
         await evictLocalAssets()
         previous({ sequence: 999, stage: 'deleting', completedItems: 0, totalItems: 3, evictedItems: 0, evictedBytes: 0 })
         expect(get(assetCleanupProgress)).toMatchObject({ state: 'complete', evictedItems: 3, evictedBytes: 4096 })
+        report({ sequence: 1000, stage: 'deleting', completedItems: 0, totalItems: 3, evictedItems: 0, evictedBytes: 0 })
+        expect(get(assetCleanupProgress)).toMatchObject({ state: 'complete', evictedItems: 3, evictedBytes: 4096 })
+    })
+    it('accepts final failure counters but excludes an old operation after a retry begins', async () => {
+        mock.begin.mockResolvedValue({ dispose: vi.fn(async () => {}), progress: vi.fn() })
+        let report!: (value: unknown) => void
+        mock.invoke.mockImplementation(async (name, args) => {
+            if (name !== 'server_sync_asset_evict') return
+            report = args.progress.onmessage
+            throw { code: 'storage-io' }
+        })
+        await expect(evictLocalAssets()).rejects.toMatchObject({ code: 'storage-io' })
+        report({ sequence: 3, stage: 'deleting', completedItems: 2, totalItems: 3, evictedItems: 2, evictedBytes: 8192 })
+        expect(get(assetCleanupProgress)).toMatchObject({ state: 'failed', evictedItems: 2, evictedBytes: 8192 })
+        const previous = report
+        await expect(evictLocalAssets()).rejects.toMatchObject({ code: 'storage-io' })
+        previous({ sequence: 4, stage: 'deleting', completedItems: 3, totalItems: 3, evictedItems: 3, evictedBytes: 12288 })
+        expect(get(assetCleanupProgress)).toMatchObject({ state: 'failed', evictedItems: 0, evictedBytes: 0 })
     })
     it('keeps file admission waiting for an existing asset transfer even when its caller cancels', async () => {
         let finish!: () => void

@@ -795,7 +795,9 @@ impl PersistentStore {
             // Retention checks current server presence and size in the same
             // transaction as the custody grant. Most pages need only this call.
             if let Err(error) = residency.retain(&client, &config, &head, &requested) {
-                if error.code != "object-not-found" { return Err(error); }
+                // A missing body can also surface as storage-io while its
+                // catalog row still exists. Probe once, then verify any repair.
+                if !matches!(error.code.as_str(), "object-not-found" | "corrupt-object" | "storage-io") { return Err(error); }
                 let identities = page.iter().map(|(hash, size)| serde_json::json!({"hash":hash,"size":size.to_string()})).collect::<Vec<_>>();
                 #[derive(serde::Deserialize)]
                 #[serde(deny_unknown_fields)]

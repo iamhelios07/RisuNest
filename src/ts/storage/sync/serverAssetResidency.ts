@@ -150,8 +150,10 @@ export async function evictLocalAssets(): Promise<AssetResidencyStatus> {
   const progress = new Channel<AssetCleanupSnapshot>();
   progress.onmessage = value => {
     if (!validAssetCleanupSnapshot(value)) return;
+    // The final channel message can arrive after invoke rejects. Preserve the
+    // terminal state while accepting this operation's last partial counters.
     assetCleanupProgress.update(current => current?.operationId === operationId
-      && (current.state === 'running' || current.state === 'cancelling') && value.sequence > current.sequence
+      && current.state !== 'complete' && value.sequence > current.sequence
       ? { ...current, ...value } : current);
   };
   try {

@@ -238,7 +238,7 @@ fn server_sync_asset_policy_operation<R: tauri::Runtime>(app: &AppHandle<R>, pol
 }
 #[tauri::command]
 pub(crate) fn asset_residency_prepare_download(app: AppHandle, operation_id: String) -> Result<()> {
-    recorded("asset-download", app.state::<ServerSyncCommandState>().prepare_asset_operation(operation_id))
+    recorded("asset-prepare", app.state::<ServerSyncCommandState>().prepare_asset_operation(operation_id))
 }
 #[tauri::command]
 pub(crate) async fn asset_residency_download_remote(

@@ -92,6 +92,30 @@ it('shows cleanup phases immediately, survives remount, and refreshes after canc
     expect(findButton(copy.residency.clean)?.disabled).toBe(false)
     finish(); await settle()
 })
+it.each([false, true])('refreshes capacity after a partial cleanup failure and preserves its error (refresh fails: %s)', async refreshFails => {
+    const copy = languageEnglish.risuNest.serverSync
+    f.view = { status: { configured: true, bound: true, assetPolicy: 'remote' }, running: false, paused: false }
+    const status = { policy: 'remote', localBytes: 8192, remoteBytes: 0, remoteObjects: 0, serverBytes: 0, serverObjects: 0, externalObjects: [], unavailableObjects: 0, evictedBytes: 0 }
+    f.status.mockResolvedValue(status)
+    component = mount(ServerSyncSettings, { target: host }); await settle()
+    f.status.mockClear()
+    f.evict.mockImplementation(async () => {
+        assetCleanupProgress.set({ operationId: 'synthetic', state: 'failed', stage: 'deleting', sequence: 2, completedItems: 1, totalItems: 2, evictedItems: 1, evictedBytes: 4096 })
+        if (refreshFails) f.status.mockRejectedValue({ code: 'writer-collision' })
+        else f.status.mockResolvedValue({ ...status, localBytes: 4096, remoteBytes: 4096, remoteObjects: 1, serverBytes: 4096, serverObjects: 1 })
+        throw { code: 'storage-io' }
+    })
+    click(copy.residency.clean); await settle()
+    expect(f.status).toHaveBeenCalledOnce()
+    expect(host.textContent).toContain(copy.residency.cleanup.failed)
+    expect(host.textContent).toContain(copy.errorHelp)
+    expect(host.textContent).not.toContain(languageEnglish.lwwSync.writerCollision)
+    if (!refreshFails) {
+        expect(host.textContent).not.toContain('8.0 KiB')
+        expect(host.textContent).toContain('4.0 KiB')
+    }
+    expect(findButton(copy.residency.clean)?.disabled).toBe(false)
+})
 it.each(['finalizing', 'complete', 'failed'] as const)('renders cleanup %s without confusing processed files with removed files', async state => {
     const copy = languageEnglish.risuNest.serverSync
     f.view = { status: { configured: true, bound: true, assetPolicy: 'remote' }, running: false, paused: false }
