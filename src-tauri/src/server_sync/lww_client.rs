@@ -1418,14 +1418,12 @@ impl LwwClient {
         }
         if !remote.is_empty() {
             let cas = crate::asset_repository::PayloadCas::new(store.repository_root())?;
+            let local_sizes = cas.stat_objects(remote.iter().map(String::as_str))?;
             let missing = remote
                 .into_iter()
-                .filter_map(|hash| match cas.stat_object(&hash) {
-                    Ok(None) => Some(Ok((hash, None))),
-                    Ok(Some(_)) => None,
-                    Err(e) => Some(Err(e)),
-                })
-                .collect::<std::io::Result<Vec<_>>>()?;
+                .zip(local_sizes)
+                .filter_map(|(hash, size)| size.is_none().then_some((hash, None)))
+                .collect::<Vec<_>>();
             if !missing.is_empty() {
                 let config = self
                     .access
@@ -1436,7 +1434,12 @@ impl LwwClient {
                 let head = self.client.resolve_identity()?;
                 let mut residency = super::residency::Residency::open(store.repository_root())?;
                 residency.retain(&self.client, &config, &head, &missing)?;
-                let objects=missing.iter().map(|(hash,_)| {let proof=residency.object(hash,None)?.ok_or_else(||SyncError::new("remote-object-unavailable",409))?;Ok(crate::persistent_store::asset_object_catalog::AssetObjectRegistration{object_hash:hash.clone(),byte_size:proof.size})}).collect::<Result<Vec<_>>>()?;
+                let hashes = missing.into_iter().map(|(hash, _)| hash).collect::<Vec<_>>();
+                let sizes = residency.active_sizes(&hashes)?;
+                let objects = hashes.into_iter().zip(sizes).map(|(object_hash, size)| {
+                    let byte_size = size.ok_or_else(|| SyncError::new("remote-object-unavailable", 409))?;
+                    Ok(crate::persistent_store::asset_object_catalog::AssetObjectRegistration { object_hash, byte_size })
+                }).collect::<Result<Vec<_>>>()?;
                 for page in objects.chunks(crate::persistent_store::asset_object_catalog::ASSET_OBJECT_CATALOG_MAX_PAGE as usize) {
                     store
                         .asset_object_catalog()

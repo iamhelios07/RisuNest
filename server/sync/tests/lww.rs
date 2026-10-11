@@ -511,14 +511,17 @@ fn stable_state_pin_pages_in_key_byte_order_while_tail_continues() {
 }
 
 #[test]
-fn active_state_pin_pages_renew_the_same_snapshot_only_near_expiry() {
+fn state_pins_allow_long_reads_without_extending_their_deadline() {
     let root = tempfile::tempdir().unwrap();
     let store = Store::init(root.path()).unwrap();
     let a = device(&store);
     let b = device(&store);
     let original = inline("a", WRITER_A, 1, "original");
     store.push(&a, &request(&store, WRITER_A, "initial", vec![original.clone()])).unwrap();
+    let before = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     let pin = store.create_state_pin(&a).unwrap();
+    let after = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    assert!((before + 24 * 3600..=after + 24 * 3600).contains(&(pin.expires_at_ms.0 / 1000)));
     store.push(&a, &request(&store, WRITER_A, "changed", vec![inline("a", WRITER_A, 2, "changed")])).unwrap();
     let db = Connection::open(root.path().join("metadata.sqlite")).unwrap();
     let now: i64 = db.query_row("SELECT unixepoch()", [], |row| row.get(0)).unwrap();
@@ -533,14 +536,15 @@ fn active_state_pin_pages_renew_the_same_snapshot_only_near_expiry() {
     assert_eq!(expiry(), now + 60);
     assert_eq!(store.state_page(&a, &pin.pin_id, None, 0).unwrap_err().code, "invalid-limit");
     assert_eq!(expiry(), now + 60);
+    db.execute_batch("BEGIN IMMEDIATE").unwrap();
     let page = store.state_page(&a, &pin.pin_id, None, 1024).unwrap();
+    db.execute_batch("ROLLBACK").unwrap();
     assert_eq!(page.pin_id, pin.pin_id);
     assert_eq!(page.start_seq, pin.start_seq);
     assert_eq!(page.items, vec![original]);
-    assert!(expiry() >= now + 3600);
-    let renewed = expiry();
+    assert_eq!(expiry(), now + 60);
     store.state_page(&a, &pin.pin_id, None, 1024).unwrap();
-    assert_eq!(expiry(), renewed);
+    assert_eq!(expiry(), now + 60);
 
     db.execute("UPDATE state_pins SET expires=0 WHERE id=?1", [&pin.pin_id]).unwrap();
     assert_eq!(store.state_page(&a, &pin.pin_id, None, 1024).unwrap_err().code, "state-pin-expired");

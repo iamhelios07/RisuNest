@@ -12,6 +12,8 @@ use risunest_sync_wire::{
 };
 use std::sync::Arc;
 
+mod metadata_restore;
+
 pub(crate) struct LocalServerFixture {
     pub server: Arc<Store>,
     pub endpoint: String,
@@ -1492,7 +1494,7 @@ fn a_state_read_plans_its_listing_from_the_units_its_pin_holds() {
         router.layer(axum::middleware::from_fn(
             move |request: axum::extract::Request, next: axum::middleware::Next| {
                 if request.uri().path() == "/state" {
-                    totals.lock().unwrap().push(watched.snapshot("binding").listed_total);
+                    totals.lock().unwrap().push(watched.snapshot("binding").listing.unwrap().total);
                 }
                 next.run(request)
             },
@@ -1510,11 +1512,57 @@ fn a_state_read_plans_its_listing_from_the_units_its_pin_holds() {
     });
     assert_eq!(changes.len(), 2050);
     let read = lane.snapshot("binding");
-    assert_eq!((read.listed, read.listed_total), (2050, 2050));
+    assert_eq!(read.listed, 2050);
+    let listing = read.listing.unwrap();
+    assert_eq!((listing.done, listing.total), (2050, 2050));
     // Every state page was requested with the whole total already planned.
     let seen = seen.lock().unwrap();
     assert_eq!(seen.len(), 3);
     assert!(seen.iter().all(|total| *total == 2050));
+}
+
+#[test]
+fn a_restarted_state_read_does_not_double_its_listing_total() {
+    let lane = Arc::new(super::progress::ProgressLane::default());
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (watched, totals) = (lane.clone(), seen.clone());
+    let server = LocalServerFixture::with_router(move |router| {
+        router.layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let expire = if request.uri().path() == "/state" {
+                    let mut totals = totals.lock().unwrap();
+                    let listing = watched.snapshot("binding").listing.unwrap();
+                    totals.push((listing.done, listing.total));
+                    totals.len() == 2
+                } else { false };
+                async move {
+                    if expire {
+                        return axum::response::IntoResponse::into_response((
+                            axum::http::StatusCode::GONE,
+                            axum::Json(serde_json::json!({"error":"state-pin-expired"})),
+                        ));
+                    }
+                    next.run(request).await
+                }
+            },
+        ))
+    });
+    let writer = ServerWriter::new(&server.server);
+    writer.push_units("first-page", "first", 1024);
+    writer.push_units("last-page", "last", 2);
+    let (_root, mut store) = local();
+    let changes = super::progress::within(&lane, || {
+        let client = server.client(&store);
+        let upper = client.admission().unwrap();
+        client.state(&mut store, upper).unwrap().1
+    });
+    assert_eq!(changes.len(), 1026);
+    let read = lane.snapshot("binding");
+    assert!(read.listed > 1026);
+    assert!(read.received_bytes > 0);
+    let listing = read.listing.unwrap();
+    assert_eq!((listing.done, listing.total), (1026, 1026));
+    assert_eq!(*seen.lock().unwrap(), [(0, 1026), (1024, 1026), (0, 1026), (1024, 1026)]);
 }
 
 fn publication_ids(client: &LwwClient) -> Vec<String> {
