@@ -6,6 +6,7 @@ use crate::asset_repository::job_pins::{
     CasJobKind, CasObjectRole, CasReleaseOutcome, DurableCasJob,
 };
 use crate::asset_repository::{owner_manifest_codec, PayloadCas};
+use crate::asset_repository::import_payloads::{prepare_import_payloads, ImportPayload, ImportPinning};
 use crate::local_backup::{
     parse_legacy_local_backup_v1_observed, write_legacy_local_backup_v1, CancellationProbe,
     LegacyBackupWriteEntry, LegacyBackupWriteSource, LocalBackupError, LocalBackupErrorCode,
@@ -81,12 +82,15 @@ impl CancellationProbe for JobCancellation<'_> {
 
 const PROGRESS_REPORT_INTERVAL_BYTES: u64 = 1024 * 1024;
 
-/// Observes attachments being copied into the CAS during a legacy restore.
+/// Observes attachments being prepared in the CAS during a legacy restore.
 pub(crate) trait LegacyPrepareObserver {
     fn begin(&self, _total: u64) {}
     fn item_started(&self, _logical_name: &str) {}
     fn item_bytes(&self, _bytes: u64) {}
     fn item_done(&self) {}
+    fn items_done(&self, count: u64) {
+        for _ in 0..count { self.item_done(); }
+    }
 }
 
 #[cfg(test)]
@@ -111,7 +115,7 @@ struct LegacyProgressState {
 /// Progress reporter for a legacy backup restore. It is the cancellation
 /// probe, the archive parse observer, and the attachment observer at once, and
 /// it charges every stage against one fixed budget of twice the archive size:
-/// each byte is read from the archive once and then either copied into the
+/// each byte is read from the archive once and then either verified in the
 /// CAS or parsed as the database. Reports never fail the restore; a rejected
 /// report only costs the dialog one update.
 struct LegacyRestoreProgress<'a> {
@@ -287,10 +291,14 @@ impl LegacyPrepareObserver for LegacyRestoreProgress<'_> {
     }
 
     fn item_done(&self) {
+        self.items_done(1);
+    }
+
+    fn items_done(&self, count: u64) {
         {
             let mut state = self.state.borrow_mut();
-            state.counts.attachments_prepared += 1;
-            state.stage_completed += 1;
+            state.counts.attachments_prepared += count;
+            state.stage_completed += count;
             state.current_item = None;
         }
         self.report();
@@ -684,6 +692,7 @@ pub(crate) fn prepare_legacy_restore_payloads_observed(
     let mut invalid_inlays = Vec::new();
     let mut cold_payloads = HashMap::new();
     let mut asset_keys = HashSet::new();
+    let mut incoming = Vec::new();
     observer.begin(
         entries
             .iter()
@@ -704,23 +713,19 @@ pub(crate) fn prepare_legacy_restore_payloads_observed(
                 if !asset_keys.insert(("inlay".to_owned(), id.to_owned())) {
                     return Err(invalid("legacy backup contains a duplicate Inlay key"));
                 }
-                observer.item_started(&entry.logical_name);
                 asset_aliases.push(pocket_risu::prepare(
                     entry,
                     id,
                     ext,
                     &pocket_metadata,
-                    cas,
-                    durable,
                     cancellation,
-                    observer,
                 )?);
-                observer.item_done();
+                incoming.push(import_payload(entry)?);
             }
             continue;
         }
-        observer.item_started(&entry.logical_name);
         if let Some(key) = cold_key(&entry.logical_name) {
+            observer.item_started(&entry.logical_name);
             let staged = prepare_cold(entry, cancellation, observer)?;
             if cold_payloads.insert(key, staged).is_some() {
                 return Err(invalid(
@@ -728,6 +733,7 @@ pub(crate) fn prepare_legacy_restore_payloads_observed(
                 ));
             }
         } else if let Some(encoded_key) = inlay_key_hex(&entry.logical_name) {
+            observer.item_started(&entry.logical_name);
             let alias = match prepare_inlay(entry, encoded_key, cas, durable, cancellation, observer) {
                 Ok(alias) => alias,
                 Err(error) if error.code == LocalBackupErrorCode::DatabaseRestore => {
@@ -742,14 +748,24 @@ pub(crate) fn prepare_legacy_restore_payloads_observed(
             }
             asset_aliases.push(alias);
         } else {
-            let alias = prepare_asset(entry, cas, durable, cancellation, observer)?;
+            let alias = prepare_asset(entry)?;
             if !asset_keys.insert((alias.kind.clone(), alias.key.clone())) {
                 return Err(invalid("legacy backup contains a duplicate asset key"));
             }
             asset_aliases.push(alias);
+            incoming.push(import_payload(entry)?);
+            continue;
         }
         observer.item_done();
     }
+    let mut completed = 0;
+    prepare_import_payloads(cas, durable, &incoming, ImportPinning::DuringPreparation, &|| cancellation.is_cancelled(), |bytes, count| {
+        observer.item_bytes(bytes);
+        if completed < count {
+            observer.items_done((count - completed) as u64);
+            completed = count;
+        }
+    }).map_err(|error| cancellation_io(error, cancellation))?;
     check_cancelled(cancellation)?;
     Ok(PreparedLegacyRestorePayloads {
         invalid_inlays,
@@ -792,16 +808,7 @@ fn reject_account_encryption(entries: &[StagedLocalBackupEntry]) -> Result<(), L
 
 fn prepare_asset(
     entry: &StagedLocalBackupEntry,
-    cas: &PayloadCas,
-    durable: &mut DurableCasJob,
-    cancellation: &dyn CancellationProbe,
-    observer: &dyn LegacyPrepareObserver,
 ) -> Result<AssetAlias, LocalBackupError> {
-    let file = open_staged(entry)?;
-    let mut source = CancellationReader::observed(file, cancellation, observer);
-    let payload = durable
-        .prepare_reader(cas, &mut source, CasObjectRole::DirectObject)
-        .map_err(|error| cancellation_io(error, cancellation))?;
     let name = entry
         .logical_name
         .rsplit('/')
@@ -815,9 +822,9 @@ fn prepare_asset(
         .to_owned();
     Ok(AssetAlias {
         key: format!("assets/{}", entry.logical_name),
-        object_hash: Some(payload.content_hash),
+        object_hash: Some(entry.sha256.clone()),
         kind: "asset".to_owned(),
-        size: to_alias_size(payload.byte_size)?,
+        size: to_alias_size(entry.byte_length)?,
         mime: String::new(),
         name,
         ext,
@@ -825,6 +832,16 @@ fn prepare_asset(
         width: None,
         height: None,
         metadata: Value::Object(Map::new()),
+    })
+}
+
+fn import_payload(entry: &StagedLocalBackupEntry) -> Result<ImportPayload, LocalBackupError> {
+    Ok(ImportPayload {
+        path: entry.staged_path.clone().ok_or_else(|| invalid("legacy backup payload is not staged"))?,
+        hash: entry.sha256.clone(),
+        size: entry.byte_length,
+        sync_required: true,
+        progress_items: 1,
     })
 }
 
@@ -1394,6 +1411,12 @@ mod tests {
         assert_eq!(scale.total_bytes, Some(2_000));
         assert_eq!(scale.fixed_items, Some((7, Some(7))));
         assert_eq!(scale.counts.cold_storage, 1);
+
+        progress.items_done(2);
+        let detail = job.status().detail.unwrap();
+        assert_eq!((detail.stage_completed, detail.stage_total), (3, Some(3)));
+        assert_eq!(detail.counts.attachments_prepared, 3);
+        assert_eq!(progress.restore_scale().base_bytes, 1_300);
     }
 
     #[test]
@@ -1478,7 +1501,7 @@ mod tests {
 
         parse_legacy_local_backup_v1(
             &mut Cursor::new(bytes),
-            directory.path(),
+            &test_legacy_staging(directory.path()),
             PayloadTarget::JobStaging,
             &mut planner,
             &NeverCancelled,
@@ -1544,7 +1567,7 @@ mod tests {
         };
         parse_legacy_local_backup_v1(
             &mut Cursor::new(bytes),
-            directory.path(),
+            &test_legacy_staging(directory.path()),
             PayloadTarget::JobStaging,
             &mut planner,
             &NeverCancelled,
@@ -1668,7 +1691,7 @@ mod tests {
 
         let error = parse_legacy_local_backup_v1(
             &mut Cursor::new(bytes),
-            directory.path(),
+            &test_legacy_staging(directory.path()),
             PayloadTarget::JobStaging,
             &mut planner,
             &NeverCancelled,
@@ -1726,7 +1749,7 @@ mod tests {
 
         parse_legacy_local_backup_v1(
             &mut Cursor::new(bytes),
-            directory.path(),
+            &test_legacy_staging(directory.path()),
             PayloadTarget::JobStaging,
             &mut planner,
             &NeverCancelled,
@@ -1769,4 +1792,11 @@ mod tests {
     }
 
 
+}
+
+#[cfg(test)]
+fn test_legacy_staging(root: &std::path::Path) -> std::path::PathBuf {
+    let path = root.join("native-file-jobs/jobs").join(Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&path).unwrap();
+    path
 }

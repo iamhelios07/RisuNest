@@ -58,6 +58,14 @@ pub(crate) struct StagedPayload {
     pub(super) content_hash: String,
     pub(super) byte_size: u64,
     directory_entries_synced: bool,
+    move_on_publish: bool,
+}
+
+#[cfg(test)]
+impl StagedPayload {
+    pub(super) fn transfer_observation_to(&mut self, owner: std::thread::ThreadId) {
+        self.body_identity.transfer_to(owner);
+    }
 }
 
 #[derive(Debug)]
@@ -300,6 +308,85 @@ impl PayloadCas {
         self.publish_staged(staged)
     }
 
+    /// Takes custody of a verified private import file without copying its body.
+    pub(crate) fn stage_import_payload(
+        &self,
+        path: &Path,
+        expected_hash: &str,
+        expected_size: u64,
+        sync_required: bool,
+        cancelled: &impl Fn() -> bool,
+        progress: &impl Fn(u64),
+    ) -> io::Result<StagedPayload> {
+        validate_content_hash(expected_hash)?;
+        self.ensure_repository_root()?;
+        reject_link_components(path)?;
+        let canonical = fs::canonicalize(path)?;
+        let jobs = self.repository_root.join("native-file-jobs").join("jobs");
+        if !canonical.starts_with(&jobs)
+            || !matches!(path.extension().and_then(|s| s.to_str()), Some("payload" | "stage" | "entry"))
+        {
+            return invalid_owned_path(path, "only private import payloads may be staged");
+        }
+        #[cfg(test)]
+        let mut observed_identity = super::body_io::PendingOwnedIdentity::new();
+        let file = self.open_exact_owned_file_with_access(&canonical, sync_required)?;
+        let identity = exact_file_identity(&file)?;
+        #[cfg(any(unix, windows))]
+        if identity.links != 1 {
+            return invalid_owned_path(path, "import staging must have exactly one link");
+        }
+        if identity.byte_size() != expected_size {
+            return collision_or_corruption(expected_hash);
+        }
+        if cancelled() { return Err(io::Error::other("import cancelled")); }
+        let mut file = if sync_required {
+            file.sync_all()?;
+            drop(file);
+            self.open_exact_owned_file(&canonical)?
+        } else { file };
+        if exact_file_identity(&file)? != identity { return exact_object_changed(); }
+        let mut hash = Sha256::new();
+        #[cfg(test)]
+        super::body_io::body_sha_begin("owned", "cas_import_adopt");
+        let mut buffer = [0_u8; COPY_BUFFER_BYTES];
+        loop {
+            if cancelled() { return Err(io::Error::other("import cancelled")); }
+            let read = file.read(&mut buffer);
+            #[cfg(test)]
+            super::body_io::read_result("owned", &read);
+            let length = read?;
+            if length == 0 { break; }
+            hash.update(&buffer[..length]);
+            #[cfg(test)]
+            super::body_io::body_sha_update("owned", "cas_import_adopt", length);
+            progress(length as u64);
+        }
+        let content_hash = hex::encode(hash.finalize());
+        if content_hash != expected_hash || exact_file_identity(&file)? != identity {
+            return collision_or_corruption(expected_hash);
+        }
+        if cancelled() { return Err(io::Error::other("import cancelled")); }
+        #[cfg(test)]
+        observed_identity.verified(&content_hash);
+        Ok(StagedPayload {
+            #[cfg(test)]
+            body_identity: super::body_io::OwnedIdentity::new(&content_hash),
+            verified_file: file,
+            staging: StagingFile {
+                parent: canonical.parent().expect("import parent").to_path_buf(),
+                path: canonical,
+                owned: true,
+            },
+            repository_root: self.repository_root.clone(),
+            identity,
+            content_hash,
+            byte_size: expected_size,
+            directory_entries_synced: true,
+            move_on_publish: cfg!(any(windows, target_os = "android")),
+        })
+    }
+
     pub(crate) fn stage_reader_expected(
         &self,
         reader: &mut impl Read,
@@ -393,6 +480,7 @@ impl PayloadCas {
             content_hash,
             byte_size,
             directory_entries_synced,
+            move_on_publish: false,
         })
     }
 
@@ -478,6 +566,7 @@ impl PayloadCas {
             content_hash,
             byte_size,
             mut directory_entries_synced,
+            move_on_publish,
             ..
         } = staged;
         #[cfg(test)]
@@ -515,15 +604,18 @@ impl PayloadCas {
         )?;
         let object_path = object_directory.join(&content_hash[2..]);
 
-        #[cfg(target_os = "android")]
-        let publication =
-            crate::trust_boundary::rename_without_replace(&staging_path, &object_path);
-        #[cfg(not(target_os = "android"))]
+        #[cfg(any(target_os = "android", windows))]
+        let publication = if move_on_publish || cfg!(target_os = "android") {
+            crate::trust_boundary::rename_without_replace(&staging_path, &object_path)
+        } else {
+            fs::hard_link(&staging_path, &object_path)
+        };
+        #[cfg(not(any(target_os = "android", windows)))]
         let publication = fs::hard_link(&staging_path, &object_path);
         #[cfg(all(test, target_os = "android"))]
         super::body_io::publication_result("rename", &publication, byte_size);
         #[cfg(all(test, not(target_os = "android")))]
-        super::body_io::publication_result("hard-link", &publication, byte_size);
+        super::body_io::publication_result(if move_on_publish { "rename" } else { "hard-link" }, &publication, byte_size);
         let deduplicated = match publication {
             Ok(()) => {
                 directory_entries_synced &= sync_parent(&object_directory)?;
@@ -991,6 +1083,10 @@ impl PayloadCas {
     }
 
     fn open_exact_owned_file(&self, path: &Path) -> io::Result<File> {
+        self.open_exact_owned_file_with_access(path, false)
+    }
+
+    fn open_exact_owned_file_with_access(&self, path: &Path, writable: bool) -> io::Result<File> {
         #[cfg(test)]
         let _body_scope = {
             let hash = path.parent().and_then(Path::file_name).and_then(|name| name.to_str())
@@ -1001,7 +1097,7 @@ impl PayloadCas {
             hash.as_deref().map(super::body_io::object_scope)
         };
         let mut options = OpenOptions::new();
-        options.read(true);
+        options.read(true).write(writable);
         #[cfg(unix)]
         options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
         #[cfg(windows)]

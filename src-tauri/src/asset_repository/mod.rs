@@ -1,6 +1,7 @@
 pub(crate) mod commands;
 pub(crate) mod coordinator;
 pub(crate) mod job_pins;
+pub(crate) mod import_payloads;
 mod journal_frame;
 pub(crate) mod migration_gc;
 #[path = "../owner_manifest_codec.rs"]
