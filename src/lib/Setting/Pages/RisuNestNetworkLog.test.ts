@@ -1,0 +1,58 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { mount, unmount, tick } from 'svelte'
+import { languageKorean } from 'src/lang/ko'
+const mock = vi.hoisted(() => ({ call: vi.fn(), download: vi.fn(), language: {} as any }))
+vi.mock('src/lang', () => ({ language: mock.language }))
+vi.mock('src/ts/network/networkLog', async original => ({ ...await original<typeof import('src/ts/network/networkLog')>(), networkLog: mock.call, downloadNetworkLog: mock.download }))
+vi.mock('src/ts/platform', () => ({ isTauriAndroid: false, isTauriIOS: false }))
+import Component from './RisuNestNetworkLog.svelte'
+const settings = { enabled: false, retain: false, hideAuth: true, recentCount: 200, recentMib: 1024, retainedMib: 1024, bodyMib: 512 }
+const body = { observedBytes: 5, capturedBytes: 5, binary: false, truncated: false, representation: 'observed' }
+const record = { id: 'synthetic', source: 'native-http', startedAt: 0, elapsedMs: 42, retained: false, headerMasking: true, state: 'complete', captureError: null,
+    request: { method: 'POST', url: 'https://synthetic.example/chat', status: null, headers: [{ name: 'authorization', value: 'Bearer sk••••••abcdef' }], body },
+    response: { method: null, url: 'https://synthetic.example/chat', status: 200, headers: [], body }, streamKind: null, eventBytes: 0 }
+let host: HTMLElement, component: ReturnType<typeof mount>
+async function settle() { for (let i = 0; i < 18; i++) { await Promise.resolve(); await tick() } }
+function button(text: string) { const result = [...host.querySelectorAll('button')].find(b => b.textContent?.trim() === text); if (!result) throw new Error(`missing ${text}`); return result }
+beforeEach(async () => {
+    Object.assign(mock.language, languageKorean); vi.clearAllMocks()
+    mock.call.mockImplementation(async request => {
+        switch (request.op) {
+            case 'settings': return settings
+            case 'configure': return request.settings
+            case 'list': return { items: [{ ...record, ...record.request, id: 'synthetic', status: 200, capturedBytes: 10 }], hasMore: false, recentBytes: 10, retainedBytes: 0, warning: null }
+            case 'detail': return record
+            case 'body': return { text: 'hello', offset: 0, nextOffset: 5, total: 5, binary: false }
+            case 'copy': return 'hello'
+        }
+    })
+    host = document.createElement('div'); document.body.append(host); component = mount(Component, { target: host }); await settle()
+})
+afterEach(async () => { await unmount(component); host.remove() })
+describe('native network settings', () => {
+    it('shows opt-in defaults, exact warning, and omits removed status copy', async () => {
+        const inputs = [...host.querySelectorAll<HTMLInputElement>('input[type=checkbox]')]
+        expect(inputs.map(input => input.checked)).toEqual([false, false, true])
+        expect(host.textContent).toContain('최근 요청은 임시로 기록하며, 앱을 종료하면 삭제됩니다. 로그에는 인증 정보가 포함될 수 있으니 주의해주세요.')
+        for (const text of ['스트림 수신 완료', '기록 중지됨', '보관하지 않은 요청은 종료 시 삭제', '인증 정보 숨김 적용됨']) expect(host.textContent).not.toContain(text)
+        inputs[0].checked = true; inputs[0].dispatchEvent(new Event('change', { bubbles: true })); await settle()
+        expect(mock.call).toHaveBeenCalledWith({ op: 'configure', settings: { ...settings, enabled: true } })
+    })
+    it('opens headers and bodies, copies, retains, and downloads one request', async () => {
+        host.querySelector<HTMLButtonElement>('.request-row')!.click(); await settle()
+        expect(host.textContent).toContain('Bearer sk••••••abcdef')
+        button('응답 본문').click(); await settle(); expect(host.querySelector('pre')?.textContent).toBe('hello')
+        const writeText = vi.fn().mockResolvedValue(undefined); Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true })
+        button('복사').click(); await settle(); expect(writeText).toHaveBeenCalledWith('hello')
+        button('보관').click(); await settle(); expect(mock.call).toHaveBeenCalledWith({ op: 'retain', id: 'synthetic' })
+        button('JSON 다운로드').click(); await settle(); expect(mock.download).toHaveBeenCalledWith('synthetic')
+    })
+    it('renders the selected WebSocket message after asynchronous loading', async () => {
+        const original = mock.call.getMockImplementation()!
+        mock.call.mockImplementation(async request => request.op === 'detail' ? { ...record, streamKind: 'websocket' } : request.op === 'events'
+            ? { text: JSON.stringify({ elapsedMs: 10, side: 'response', offset: 0, length: 5, kind: 'text' }) + '\n', offset: 0, nextOffset: 90, total: 90, binary: false } : original(request))
+        host.querySelector<HTMLButtonElement>('.request-row')!.click(); await settle(); button('메시지').click(); await settle()
+        const message = [...host.querySelectorAll('button')].find(b => b.textContent?.includes('10 ms'))!; message.click(); await settle()
+        expect(host.querySelector('pre')?.textContent).toBe('hello')
+    })
+})

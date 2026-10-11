@@ -9,7 +9,8 @@ import { embeddedCrateTests, hostManifests, nativeCommands, packageCrateTests, p
 test('native groups explicitly own dependency packages and full app integration targets', () => {
   const protocol = nativeCommands('protocol', 'win32')
   assert.deepEqual(protocol.map(command => command[3]), protocolManifests)
-  assert.equal(protocol.length, 5)
+  assert.equal(protocol.length, 6)
+  assert(protocol.find(command => command[3] === 'crates/network-log/Cargo.toml').includes('reqwest'))
   const host = nativeCommands('host', 'win32')
   assert.deepEqual(host.slice(0, 4).map(command => command[3]), hostManifests)
   for (const command of [...protocol, ...host]) {
