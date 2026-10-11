@@ -525,8 +525,8 @@ pub(crate) fn hydrate_registered_many(root:&Path,digests:&[String],priority:&BTr
     for page in digests.chunks(ASSET_OBJECT_CATALOG_MAX_PAGE as usize) {
         publisher.checked()?;
         let mut sizes=BTreeMap::new();
-        for &hash in page {
-            if let Some(size)=cas.stat_object(hash)? {sizes.insert(hash,size);}
+        for (&hash,size) in page.iter().zip(cas.stat_objects(page.iter().copied())?) {
+            if let Some(size)=size {sizes.insert(hash,size);}
         }
         let mut registered=remote.registered(page).map_err(hydration_error)?;
         #[cfg(test)]
@@ -816,20 +816,30 @@ impl Publisher<'_> {
         for (hash,outcome) in outcomes {opened(hash,outcome);}
         Ok(())
     }
-    /// Takes each body's hydration lock in hash order and stages the body under
-    /// it. The batch is published while every lock is still held, so no other
+    /// Takes each body's hydration lock in hash order. Preparation and
+    /// publication retain every lock, so no other
     /// hydration of these bodies runs between staging and publication.
-    fn stage_locked<'b>(&self,rest:&'b [StagedBody],staged:&mut Vec<crate::asset_repository::StagedPayload>,
+    fn stage_locked<'b>(&self,rest:&'b [StagedBody],staged:&mut Vec<&'b StagedBody>,
         outcomes:&mut Vec<(&'b str,crate::server_sync::residency::HydrationOutcome)>)->crate::server_sync::Result<()> {
         use crate::server_sync::residency::HydrationOutcome;
-        let Some((body,rest))=rest.split_first() else {return self.publish_staged(std::mem::take(staged))};
+        let Some((body,rest))=rest.split_first() else {
+            let cas=self.cas;
+            let prepared=crate::asset_repository::parallel_stage::stage_batch(staged,&||self.checked(),&|body,stopped| {
+                Self::stage(cas,body,&|| {
+                    if stopped.load(std::sync::atomic::Ordering::Acquire) {Err(crate::server_sync::SyncError::new("cancelled",409))}
+                    else {Ok(())}
+                })
+            });
+            self.checked()?;
+            return self.publish_staged(prepared?);
+        };
         crate::server_sync::residency::with_hydration_lock(self.root,&body.hash,self.check,|| {
             self.checked()?;
             if let Some(actual)=self.cas.stat_object(&body.hash)? {
                 if actual!=body.size {return Err(hydration_error("invalid-body"));}
                 outcomes.push((&body.hash,HydrationOutcome::AlreadyLocal));
             } else {
-                staged.push(self.stage(body)?);
+                staged.push(body);
                 outcomes.push((&body.hash,HydrationOutcome::Downloaded));
             }
             self.stage_locked(rest,staged,outcomes)
@@ -837,7 +847,7 @@ impl Publisher<'_> {
     }
     /// Copies a body into repository staging. The staged copy keeps its sync,
     /// because a torn file of the right size would pass every presence check.
-    fn stage(&self,body:&StagedBody)->crate::server_sync::Result<crate::asset_repository::StagedPayload> {
+    fn stage(cas:&crate::asset_repository::PayloadCas,body:&StagedBody,check:&dyn Fn()->crate::server_sync::Result<()>)->crate::server_sync::Result<crate::asset_repository::StagedPayload> {
         #[cfg(test)]
         let _scope=crate::asset_repository::body_io::object_scope(&body.hash);
         let input=crate::trust_boundary::open_regular_source(&body.path);
@@ -848,7 +858,7 @@ impl Publisher<'_> {
         let mut input=crate::asset_repository::body_io::TrackedBodyFile::new(input,&body.hash);
         #[cfg(not(test))]
         let mut input=input;
-        crate::server_sync::transfer::stage_checked(self.cas,&mut input,&body.hash,body.size,&|| self.checked())
+        crate::server_sync::transfer::stage_checked(cas,&mut input,&body.hash,body.size,check)
     }
     fn publish_staged(&self,staged:Vec<crate::asset_repository::StagedPayload>)->crate::server_sync::Result<()> {
         if staged.is_empty() {return Ok(());}
