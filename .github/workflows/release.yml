@@ -366,6 +366,7 @@ jobs:
           --release-input release-input.json
 
   app-desktop:
+    name: app-desktop (${{ matrix.os == 'darwin' && 'macos' || matrix.os }} ${{ matrix.arch }})
     if: >-
       !cancelled() && needs.source.result == 'success' && needs.prepare-draft.result == 'success' &&
       inputs.product == 'app'
@@ -665,6 +666,7 @@ jobs:
           retention-days: 2
 
   sync-suite:
+    name: sync-suite (${{ matrix.os == 'darwin' && 'macos' || matrix.os }} ${{ matrix.arch }})
     if: >-
       !cancelled() && needs.source.result == 'success' && needs.prepare-draft.result == 'success' &&
       inputs.product == 'sync'
