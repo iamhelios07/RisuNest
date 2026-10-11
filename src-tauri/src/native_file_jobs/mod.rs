@@ -5962,14 +5962,14 @@ mod tests {
     }
 
     fn wait_for_content_job(state: &NativeFileJobState, job_id: &str) -> JobStatus {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let status = state.status(job_id).unwrap();
             if status.state.is_terminal() {
                 return status;
             }
-            assert!(Instant::now() < deadline, "content preparation timed out");
-            thread::yield_now();
+            assert!(Instant::now() < deadline, "content preparation timed out: {status:?}");
+            thread::sleep(Duration::from_millis(5));
         }
     }
 

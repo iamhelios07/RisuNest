@@ -22,7 +22,7 @@ export function lazyAppBoundaries(): Plugin {
         },
         resolveId(source, importer) {
             const owner = importer?.replaceAll('\\', '/')
-            if (!owner || !(owner === `${root}/src/App.svelte` || [...retained].some(file => owner.endsWith(`/${file}`)))) return null
+            if (!owner?.startsWith(`${root}/src/`) || !(owner === `${root}/src/App.svelte` || [...retained].some(file => owner.endsWith(`/${file}`)))) return null
             if (!(source.startsWith('.') || source.startsWith('src/') || source.replaceAll('\\', '/').startsWith(`${root}/src/`))) return null
             const file = source.split('/').at(-1)!
             const route = lazyScreens.get(file)
