@@ -2035,6 +2035,18 @@ export const languageKorean = {
                 cleanupNote:
                     '휴지통에 없는 캐릭터의 현재 캐릭터 아이콘을 제외하고, 서버에 있는 파일의 이 기기 사본을 삭제합니다.',
                 clean: '이 기기의 사본 정리',
+                cleanup: {
+                    preparing: '정리할 파일 확인 중',
+                    checking: '서버 파일 확인 중',
+                    uploading: '서버에 파일 업로드 중',
+                    deleting: '이 기기의 사본 정리 중',
+                    finalizing: '정리 결과 확인 중',
+                    cancelling: '취소 중',
+                    complete: '이 기기의 사본 정리 완료',
+                    cancelled: '사본 정리 취소',
+                    failed: '사본 정리 실패',
+                    freed: '확보한 공간',
+                },
                 cancel: '취소',
                 working: '파일 처리 중… 현재 요청이 끝나면 취소됩니다.',
             
