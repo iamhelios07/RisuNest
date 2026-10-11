@@ -382,7 +382,8 @@ impl DurableCasJob {
     pub(crate) fn publish_import_batch(
         &mut self,
         cas: &PayloadCas,
-        staged: Vec<super::StagedPayload>,
+        mut staged: Vec<super::StagedPayload>,
+        cancelled: &dyn Fn() -> bool,
     ) -> io::Result<Vec<PreparedPayload>> {
         self.ensure_preparable()?;
         self.ensure_cas(cas)?;
@@ -392,7 +393,7 @@ impl DurableCasJob {
         if staged.iter().any(|payload| payload.repository_root != self.repository_root) {
             return invalid_data("staged CAS object belongs to another repository");
         }
-        let _guard = super::coordinator::lock_repository_mutation()?;
+        let _guard = self.lock_import_publication(cas, &mut staged, cancelled)?;
         let existing = cas.stat_objects(staged.iter().map(|payload| payload.content_hash.as_str()))?;
         let mut journal = OpenOptions::new().append(true).open(&self.journal_path)?;
         // Record the whole batch before publication, including a possible partial failure.
@@ -401,13 +402,14 @@ impl DurableCasJob {
                 CasObjectRole::DirectObject, existing_size.is_none())?;
         }
         journal.sync_data()?;
-        cas.publish_staged_batch(staged)
+        cas.publish_verified_import_batch(staged)
     }
 
     pub(crate) fn publish_unmapped_content_batch(
         &mut self,
         cas: &PayloadCas,
-        staged: Vec<super::StagedPayload>,
+        mut staged: Vec<super::StagedPayload>,
+        cancelled: &dyn Fn() -> bool,
     ) -> io::Result<Vec<PreparedPayload>> {
         self.ensure_preparable()?;
         self.ensure_cas(cas)?;
@@ -415,8 +417,25 @@ impl DurableCasJob {
             return invalid_data("CAS content job is not awaiting asset mapping");
         }
         // The unsealed job blocks collection until mapping supplies the final roots.
-        let _guard = super::coordinator::lock_repository_mutation()?;
-        cas.publish_staged_batch(staged)
+        let _guard = self.lock_import_publication(cas, &mut staged, cancelled)?;
+        cas.publish_verified_import_batch(staged)
+    }
+
+    fn lock_import_publication(
+        &self,
+        cas: &PayloadCas,
+        staged: &mut [super::StagedPayload],
+        cancelled: &dyn Fn() -> bool,
+    ) -> io::Result<std::sync::MutexGuard<'static, ()>> {
+        loop {
+            if cancelled() { return Err(io::Error::other("import cancelled")); }
+            let guard = super::coordinator::lock_repository_mutation()?;
+            if cas.import_destinations_unchanged(staged)? { return Ok(guard); }
+            drop(guard);
+            // A previous batch or another writer may have supplied the object.
+            // Rehash outside the lock, then check the held file identity again.
+            cas.refresh_import_destinations(staged, cancelled)?;
+        }
     }
 
     pub(crate) fn pin_existing(

@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-const WORKERS: usize = 4;
+use super::workers::{self, WORKERS};
 const PUBLICATION_BATCH: usize = 32;
 
 #[derive(Clone, Copy)]
@@ -34,7 +34,7 @@ pub(crate) fn prepare_import_payloads(
     inputs: &[ImportPayload],
     pinning: ImportPinning,
     cancelled: &dyn Fn() -> bool,
-    progress: impl FnMut(u64, usize),
+    progress: impl FnMut(u64, usize, Option<usize>),
 ) -> io::Result<Vec<PreparedPayload>> {
     prepare_with(
         cas,
@@ -64,7 +64,7 @@ fn prepare_with(
     inputs: &[ImportPayload],
     pinning: ImportPinning,
     cancelled: &dyn Fn() -> bool,
-    mut progress: impl FnMut(u64, usize),
+    mut progress: impl FnMut(u64, usize, Option<usize>),
     stage: &(impl Fn(&ImportPayload, &AtomicBool, &AtomicU64) -> io::Result<StagedPayload> + Sync),
 ) -> io::Result<Vec<PreparedPayload>> {
     if cancelled() {
@@ -76,6 +76,7 @@ fn prepare_with(
     let stopped = AtomicBool::new(false);
     let next = AtomicUsize::new(0);
     let bytes = AtomicU64::new(0);
+    let active: [AtomicUsize; WORKERS] = std::array::from_fn(|_| AtomicUsize::new(usize::MAX));
     let mut reported_bytes = 0;
     let mut completed = 0;
     let mut output: Vec<Option<PreparedPayload>> = inputs.iter().map(|_| None).collect();
@@ -85,39 +86,42 @@ fn prepare_with(
         let mut workers = Vec::new();
         #[cfg(test)]
         let owner = std::thread::current().id();
-        for _ in 0..WORKERS.min(inputs.len()) {
+        for active in active.iter().take(inputs.len()) {
             let sender = sender.clone();
             let (stopped, next, bytes) = (&stopped, &next, &bytes);
-            #[cfg(test)]
-            let body_scope = super::body_io::capture_body_io_scope();
-            workers.push(scope.spawn(move || {
-                let run = || {
-                    while !stopped.load(Ordering::Acquire) {
-                        let index = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(input) = inputs.get(index) else {
-                            break;
-                        };
-                        let result = stage(input, stopped, bytes);
-                        #[cfg(test)]
-                        let result = result.map(|mut payload| {
-                            payload.transfer_observation_to(owner);
-                            payload
-                        });
-                        let failed = result.is_err();
-                        if sender.send((index, result)).is_err() {
-                            break;
-                        }
-                        if failed {
-                            stopped.store(true, Ordering::Release);
-                            break;
-                        }
+            let worker = workers::spawn(scope, move || {
+                while !stopped.load(Ordering::Acquire) {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(input) = inputs.get(index) else {
+                        break;
+                    };
+                    active.store(index, Ordering::Release);
+                    let result = stage(input, stopped, bytes);
+                    active.store(usize::MAX, Ordering::Release);
+                    #[cfg(test)]
+                    let result = result.map(|mut payload| {
+                        payload.transfer_observation_to(owner);
+                        payload
+                    });
+                    let failed = result.is_err();
+                    if sender.send((index, result)).is_err() {
+                        break;
                     }
-                };
-                #[cfg(test)]
-                super::body_io::with_body_io_scope(body_scope, run);
-                #[cfg(not(test))]
-                run();
-            }));
+                    if failed {
+                        stopped.store(true, Ordering::Release);
+                        break;
+                    }
+                }
+            });
+            match worker {
+                Ok(worker) => workers.push(worker),
+                Err(error) => {
+                    if workers.is_empty() {
+                        failure = Some(error);
+                    }
+                    break;
+                }
+            }
         }
         drop(sender);
         let mut pending: Vec<(usize, StagedPayload)> = Vec::with_capacity(PUBLICATION_BATCH);
@@ -149,9 +153,11 @@ fn prepare_with(
             {
                 let (indices, staged): (Vec<_>, Vec<_>) = pending.drain(..).unzip();
                 let published = match pinning {
-                    ImportPinning::DuringPreparation => durable.publish_import_batch(cas, staged),
+                    ImportPinning::DuringPreparation => {
+                        durable.publish_import_batch(cas, staged, cancelled)
+                    }
                     ImportPinning::AfterContentMapping => {
-                        durable.publish_unmapped_content_batch(cas, staged)
+                        durable.publish_unmapped_content_batch(cas, staged, cancelled)
                     }
                 };
                 match published {
@@ -168,7 +174,12 @@ fn prepare_with(
                 }
             }
             let current_bytes = bytes.load(Ordering::Relaxed);
-            progress(current_bytes - reported_bytes, completed);
+            let current = active
+                .iter()
+                .map(|active| active.load(Ordering::Acquire))
+                .find(|index| *index < inputs.len())
+                .or_else(|| pending.last().map(|(index, _)| *index));
+            progress(current_bytes - reported_bytes, completed, current);
             reported_bytes = current_bytes;
             if disconnected {
                 break;
@@ -247,6 +258,232 @@ mod tests {
     }
 
     #[test]
+    fn existing_bodies_are_hashed_by_workers_while_publication_is_locked() {
+        use crate::persistent_store::hash_work;
+        let (_root, cas, mut durable, inputs, _) = fixture(4);
+        for input in &inputs {
+            cas.prepare_bytes(&fs::read(&input.path).unwrap()).unwrap();
+        }
+        let guard = crate::asset_repository::coordinator::lock_repository_mutation().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let (prepared, coordinator_hashes) = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                hash_work::reset_hash_work();
+                let result = prepare_with(
+                    &cas,
+                    &mut durable,
+                    &inputs,
+                    ImportPinning::DuringPreparation,
+                    &|| false,
+                    |_, _, _| {},
+                    &|input, _, _| {
+                        hash_work::reset_hash_work();
+                        let result = cas.stage_import_payload(
+                            &input.path,
+                            &input.hash,
+                            input.size,
+                            true,
+                            &|| false,
+                            &|_| {},
+                        );
+                        let hashes = hash_work::take_hash_work();
+                        sender
+                            .send(
+                                hashes
+                                    .domains
+                                    .get("cas_existing_verify")
+                                    .map(|work| (work.calls, work.bytes)),
+                            )
+                            .unwrap();
+                        result
+                    },
+                );
+                (result, hash_work::take_hash_work())
+            });
+            let observed = (0..inputs.len())
+                .map(|_| receiver.recv_timeout(Duration::from_secs(5)))
+                .collect::<Vec<_>>();
+            drop(guard);
+            let result = worker.join().unwrap();
+            let observed = observed.into_iter().map(Result::unwrap).collect::<Vec<_>>();
+            assert!(observed
+                .iter()
+                .all(|work| work.is_some_and(|(calls, _)| calls == 1)));
+            assert_eq!(
+                observed
+                    .into_iter()
+                    .flatten()
+                    .map(|(_, bytes)| bytes)
+                    .sum::<u64>(),
+                inputs.iter().map(|input| input.size).sum::<u64>()
+            );
+            result
+        });
+        assert!(prepared.unwrap().iter().all(|payload| payload.deduplicated));
+        assert!(!coordinator_hashes
+            .domains
+            .contains_key("cas_existing_verify"));
+        durable.release(CasReleaseOutcome::Aborted).unwrap();
+    }
+
+    #[test]
+    fn a_destination_added_or_replaced_after_staging_is_reverified() {
+        for (present, corrupt) in [(false, false), (true, false), (true, true)] {
+            let (root, cas, mut durable, inputs, _) = fixture(1);
+            let input = &inputs[0];
+            let bytes = fs::read(&input.path).unwrap();
+            if present {
+                cas.prepare_bytes(&bytes).unwrap();
+            }
+            let staged = cas
+                .stage_import_payload(
+                    &input.path,
+                    &input.hash,
+                    input.size,
+                    true,
+                    &|| false,
+                    &|_| {},
+                )
+                .unwrap();
+            if present {
+                let object = cas.object_path(&input.hash).unwrap().unwrap();
+                fs::rename(&object, root.path().join("replaced-object")).unwrap();
+                fs::write(
+                    &object,
+                    if corrupt {
+                        vec![0x55; bytes.len()]
+                    } else {
+                        bytes.clone()
+                    },
+                )
+                .unwrap();
+            } else {
+                cas.prepare_bytes(&bytes).unwrap();
+            }
+            let result = durable.publish_import_batch(&cas, vec![staged], &|| false);
+            if corrupt {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+                assert_eq!(
+                    cas.read_object(&input.hash).unwrap().unwrap(),
+                    vec![0x55; bytes.len()]
+                );
+                assert_eq!(durable.pin_count(), 0);
+            } else {
+                assert!(result.unwrap()[0].deduplicated);
+                assert_eq!(cas.read_object(&input.hash).unwrap().unwrap(), bytes);
+            }
+            durable.release(CasReleaseOutcome::Aborted).unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_batch_cleans_verified_job_files_but_keeps_rejected_input_and_archive() {
+        let (root, cas, mut durable, mut inputs, _) = fixture(4);
+        let archive = root.path().join("original.bin");
+        fs::write(&archive, b"synthetic original archive").unwrap();
+        inputs[0].hash = "0".repeat(64);
+        let barrier = Barrier::new(4);
+        let result = prepare_with(
+            &cas,
+            &mut durable,
+            &inputs,
+            ImportPinning::DuringPreparation,
+            &|| false,
+            |_, _, _| {},
+            &|input, _, _| {
+                let result = cas.stage_import_payload(
+                    &input.path,
+                    &input.hash,
+                    input.size,
+                    true,
+                    &|| false,
+                    &|_| {},
+                );
+                barrier.wait();
+                result
+            },
+        );
+        assert!(result.is_err());
+        assert!(inputs[0].path.exists());
+        assert!(inputs[1..].iter().all(|input| !input.path.exists()));
+        assert!(cas.object_lengths().unwrap().is_empty());
+        assert_eq!(fs::read(archive).unwrap(), b"synthetic original archive");
+        durable.release(CasReleaseOutcome::Aborted).unwrap();
+    }
+
+    #[test]
+    fn progress_identifies_an_active_file_before_it_finishes() {
+        let (_root, cas, mut durable, inputs, _) = fixture(1);
+        let observed = AtomicBool::new(false);
+        prepare_with(
+            &cas,
+            &mut durable,
+            &inputs,
+            ImportPinning::DuringPreparation,
+            &|| false,
+            |_, count, current| {
+                if current == Some(0) && count == 0 {
+                    observed.store(true, Ordering::Release);
+                }
+            },
+            &|input, _, _| {
+                let started = std::time::Instant::now();
+                while !observed.load(Ordering::Acquire) {
+                    assert!(
+                        started.elapsed() < Duration::from_secs(5),
+                        "active file was not reported"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                cas.stage_import_payload(
+                    &input.path,
+                    &input.hash,
+                    input.size,
+                    true,
+                    &|| false,
+                    &|_| {},
+                )
+            },
+        )
+        .unwrap();
+        assert!(observed.load(Ordering::Acquire));
+        durable.release(CasReleaseOutcome::Aborted).unwrap();
+    }
+
+    #[test]
+    fn worker_refusal_uses_started_workers_or_returns_a_settled_error() {
+        for limit in [0, 1, 2] {
+            let (_root, cas, mut durable, inputs, _) = fixture(8);
+            body_io::reset_body_io();
+            for input in &inputs {
+                body_io::register_object_purpose(&input.hash, body_io::BodyPurpose::Asset);
+            }
+            let result = workers::with_limit(limit, || {
+                prepare_import_payloads(
+                    &cas,
+                    &mut durable,
+                    &inputs,
+                    ImportPinning::DuringPreparation,
+                    &|| false,
+                    |_, _, _| {},
+                )
+            });
+            if limit == 0 {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+                assert!(inputs.iter().all(|input| input.path.exists()));
+                assert_eq!(durable.pin_count(), 0);
+            } else {
+                assert_eq!(result.unwrap().len(), inputs.len());
+            }
+            let work = body_io::take_body_io();
+            assert!(work.complete(), "{work:?}");
+            assert_eq!(work.worker_scopes_started, limit as u64);
+            assert_eq!(work.worker_scopes_settled, limit as u64);
+            durable.release(CasReleaseOutcome::Aborted).unwrap();
+        }
+    }
+
+    #[test]
     fn four_workers_reuse_files_preserve_order_and_publish_complete_pinned_batches() {
         let (root, cas, mut durable, inputs, job_id) = fixture(73);
         body_io::reset_body_io();
@@ -264,7 +501,7 @@ mod tests {
             &inputs,
             ImportPinning::DuringPreparation,
             &|| false,
-            |bytes, count| {
+            |bytes, count, _| {
                 assert!(count >= reported.1 && count <= inputs.len());
                 reported.0 += bytes;
                 reported.1 = count;
@@ -326,7 +563,7 @@ mod tests {
             &inputs,
             ImportPinning::DuringPreparation,
             &|| cancelled.load(Ordering::Acquire),
-            |_, count| {
+            |_, count, _| {
                 if count >= PUBLICATION_BATCH {
                     cancelled.store(true, Ordering::Release);
                 }
@@ -352,7 +589,7 @@ mod tests {
             &inputs,
             ImportPinning::DuringPreparation,
             &|| false,
-            |_, _| {}
+            |_, _, _| {},
         )
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
@@ -379,7 +616,7 @@ mod tests {
             &inputs,
             ImportPinning::DuringPreparation,
             &|| false,
-            |_, _| {},
+            |_, _, _| {},
         )
         .unwrap();
         assert_eq!(output.len(), inputs.len());
@@ -409,7 +646,7 @@ mod tests {
             &inputs,
             ImportPinning::DuringPreparation,
             &|| false,
-            |_, _| {}
+            |_, _, _| {}
         )
         .is_err());
         assert_eq!(fs::read(&object).unwrap(), corrupt);
@@ -448,7 +685,6 @@ mod tests {
         let original = fs::read(&inputs[1].path).unwrap();
         cas.prepare_bytes(&original).unwrap();
         let object = cas.object_path(&inputs[1].hash).unwrap().unwrap();
-        fs::write(&object, vec![0x66; original.len()]).unwrap();
         let staged = inputs
             .iter()
             .map(|input| {
@@ -463,7 +699,11 @@ mod tests {
                 .unwrap()
             })
             .collect();
-        assert!(durable.publish_import_batch(&cas, staged).is_err());
+        fs::rename(&inputs[1].path, inputs[1].path.with_extension("replaced")).unwrap();
+        fs::write(&inputs[1].path, vec![0x66; original.len()]).unwrap();
+        assert!(durable
+            .publish_import_batch(&cas, staged, &|| false)
+            .is_err());
         assert_eq!(
             cas.read_object(&inputs[0].hash).unwrap().unwrap(),
             b"synthetic asset 0"
@@ -472,7 +712,7 @@ mod tests {
         assert_eq!(reopened.pin_count(), 2);
         drop(reopened);
         durable.release(CasReleaseOutcome::Aborted).unwrap();
-        assert_eq!(fs::read(&object).unwrap(), vec![0x66; original.len()]);
+        assert_eq!(fs::read(&object).unwrap(), original);
     }
 
     #[test]
@@ -487,7 +727,7 @@ mod tests {
             &inputs,
             ImportPinning::DuringPreparation,
             &|| false,
-            |_, count| completed = count,
+            |_, count, _| completed = count,
         )
         .unwrap();
         assert_eq!(completed, 7);
@@ -514,7 +754,7 @@ mod tests {
             &inputs,
             ImportPinning::AfterContentMapping,
             &|| false,
-            |_, _| {},
+            |_, _, _| {},
         )
         .unwrap();
         assert_eq!(output.len(), inputs.len());
@@ -596,7 +836,7 @@ mod tests {
                         &inputs,
                         pinning,
                         &|| false,
-                        |_, _| {},
+                        |_, _, _| {},
                     )
                     .unwrap();
                 } else {

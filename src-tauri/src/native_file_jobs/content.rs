@@ -840,7 +840,7 @@ fn prepare_content_payloads(
 ) -> Result<Vec<PreparedPayload>, NativeJobError> {
     let mut reported = 0;
     let mut progress_error = None;
-    let prepared = prepare_import_payloads(cas, cas_session, inputs, pinning, &|| job.is_cancel_requested(), |_, count| {
+    let prepared = prepare_import_payloads(cas, cas_session, inputs, pinning, &|| job.is_cancel_requested(), |_, count, _| {
         if reported < count {
             if let Err(error) = advance_content_assets(job, (count - reported) as u64) {
                 progress_error.get_or_insert(error);

@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-const WORKERS: usize = 4;
+use super::workers::{self, WORKERS};
 pub(crate) const MAX_BATCH: usize = 64;
 const MAX_BATCH_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -50,44 +50,37 @@ pub(crate) fn stage_batch<T: Sync, E: From<io::Error> + Send>(
         for _ in 0..WORKERS.min(inputs.len()) {
             let sender = sender.clone();
             let (next, stopped) = (&next, &stopped);
-            #[cfg(test)]
-            let body_scope = super::body_io::capture_body_io_scope();
-            #[cfg(test)]
-            let hashes = crate::server_sync::hash_metrics::capture();
-            #[cfg(test)]
-            let worker_scope = crate::external_storage::worker_observation::capture_scope();
-            workers.push(scope.spawn(move || {
-                let run = || {
+            let worker = workers::spawn(scope, move || {
+                while !stopped.load(Ordering::Acquire) {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(input) = inputs.get(index) else {
+                        break;
+                    };
+                    let result = stage(input, stopped);
                     #[cfg(test)]
-                    let _hashes = crate::server_sync::hash_metrics::enter(hashes);
-                    while !stopped.load(Ordering::Acquire) {
-                        let index = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(input) = inputs.get(index) else {
-                            break;
-                        };
-                        let result = stage(input, stopped);
-                        #[cfg(test)]
-                        let result = result.map(|mut payload| {
-                            payload.transfer_observation_to(owner);
-                            payload
-                        });
-                        let failed = result.is_err();
-                        if sender.send((index, result)).is_err() {
-                            break;
-                        }
-                        if failed {
-                            stopped.store(true, Ordering::Release);
-                            break;
-                        }
+                    let result = result.map(|mut payload| {
+                        payload.transfer_observation_to(owner);
+                        payload
+                    });
+                    let failed = result.is_err();
+                    if sender.send((index, result)).is_err() {
+                        break;
                     }
-                };
-                #[cfg(test)]
-                super::body_io::with_body_io_scope(body_scope, || {
-                    crate::external_storage::worker_observation::with_scope(worker_scope, run)
-                });
-                #[cfg(not(test))]
-                run();
-            }));
+                    if failed {
+                        stopped.store(true, Ordering::Release);
+                        break;
+                    }
+                }
+            });
+            match worker {
+                Ok(worker) => workers.push(worker),
+                Err(error) => {
+                    if workers.is_empty() {
+                        failure = Some(error.into());
+                    }
+                    break;
+                }
+            }
         }
         drop(sender);
         loop {
@@ -134,6 +127,36 @@ mod tests {
     use crate::asset_repository::{body_io, PayloadCas};
     use sha2::{Digest, Sha256};
     use std::sync::Barrier;
+
+    #[test]
+    fn worker_refusal_keeps_preparation_bounded_and_observations_settled() {
+        for limit in [0, 1, 2] {
+            let root = tempfile::tempdir().unwrap();
+            let cas = PayloadCas::new(root.path()).unwrap();
+            let bytes = b"synthetic hydration";
+            let hash = hex::encode(Sha256::digest(bytes));
+            body_io::reset_body_io();
+            body_io::register_object_purpose(&hash, body_io::BodyPurpose::Asset);
+            crate::external_storage::worker_observation::begin();
+            let result = workers::with_limit(limit, || {
+                stage_batch(&[0; 8], &|| Ok::<_, io::Error>(()), &|_, _| {
+                    cas.stage_reader_expected(&mut bytes.as_slice(), &hash, bytes.len() as u64)
+                })
+            });
+            if limit == 0 {
+                assert_eq!(result.err().unwrap().kind(), io::ErrorKind::WouldBlock);
+            } else {
+                assert_eq!(result.unwrap().len(), 8);
+            }
+            let receipts = crate::external_storage::worker_observation::take();
+            assert_eq!(receipts.len(), limit);
+            assert!(receipts.iter().all(|receipt| receipt.completed));
+            let observed = body_io::take_body_io();
+            assert!(observed.complete(), "{observed:?}");
+            assert_eq!(observed.worker_scopes_started, limit as u64);
+            assert!(cas.object_lengths().unwrap().is_empty());
+        }
+    }
 
     #[test]
     fn staging_pages_bound_file_count_and_bytes_and_admit_one_oversized_body() {

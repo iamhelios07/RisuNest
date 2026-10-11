@@ -59,6 +59,12 @@ pub(crate) struct StagedPayload {
     pub(super) byte_size: u64,
     directory_entries_synced: bool,
     move_on_publish: bool,
+    verified_existing: Option<VerifiedExistingObject>,
+}
+
+struct VerifiedExistingObject {
+    file: File,
+    identity: ExactFileIdentity,
 }
 
 #[cfg(test)]
@@ -369,6 +375,7 @@ impl PayloadCas {
         if cancelled() { return Err(io::Error::other("import cancelled")); }
         #[cfg(test)]
         observed_identity.verified(&content_hash);
+        let verified_existing = self.verify_import_destination(&content_hash, expected_size, cancelled)?;
         Ok(StagedPayload {
             #[cfg(test)]
             body_identity: super::body_io::OwnedIdentity::new(&content_hash),
@@ -384,6 +391,7 @@ impl PayloadCas {
             byte_size: expected_size,
             directory_entries_synced: true,
             move_on_publish: cfg!(any(windows, target_os = "android")),
+            verified_existing,
         })
     }
 
@@ -481,6 +489,7 @@ impl PayloadCas {
             byte_size,
             directory_entries_synced,
             move_on_publish: false,
+            verified_existing: None,
         })
     }
 
@@ -489,7 +498,7 @@ impl PayloadCas {
         staged.body_identity.check_scope();
         self.check_staged_repository(&staged)?;
         self.ensure_repository_root()?;
-        let (mut prepared, mut staging) = self.link_staged(staged, &mut sync_directory)?;
+        let (mut prepared, mut staging) = self.link_staged(staged, &mut sync_directory, None)?;
         prepared.directory_entries_synced &= staging.remove_and_sync()?;
         Ok(prepared)
     }
@@ -500,6 +509,24 @@ impl PayloadCas {
     pub(crate) fn publish_staged_batch(
         &self,
         staged: Vec<StagedPayload>,
+    ) -> io::Result<Vec<PreparedPayload>> {
+        self.publish_staged_batch_inner(staged, None)
+    }
+
+    pub(crate) fn publish_verified_import_batch(&self, mut staged: Vec<StagedPayload>) -> io::Result<Vec<PreparedPayload>> {
+        let mut verified = HashMap::new();
+        for payload in &mut staged {
+            if let Some(existing) = payload.verified_existing.take() {
+                verified.insert(payload.content_hash.clone(), existing);
+            }
+        }
+        self.publish_staged_batch_inner(staged, Some(&mut verified))
+    }
+
+    fn publish_staged_batch_inner(
+        &self,
+        staged: Vec<StagedPayload>,
+        mut verified: Option<&mut HashMap<String, VerifiedExistingObject>>,
     ) -> io::Result<Vec<PreparedPayload>> {
         for payload in &staged {
             #[cfg(test)]
@@ -516,7 +543,7 @@ impl PayloadCas {
             linked.push(self.link_staged(payload, &mut |directory: &Path| {
                 changed.insert(directory.to_path_buf());
                 Ok(true)
-            })?);
+            }, verified.as_deref_mut())?);
         }
         let mut synced = true;
         for directory in &changed {
@@ -556,6 +583,7 @@ impl PayloadCas {
         &self,
         staged: StagedPayload,
         sync_parent: &mut dyn FnMut(&Path) -> io::Result<bool>,
+        mut verified: Option<&mut HashMap<String, VerifiedExistingObject>>,
     ) -> io::Result<(PreparedPayload, StagingFile)> {
         let StagedPayload {
             #[cfg(test)]
@@ -622,7 +650,14 @@ impl PayloadCas {
                 false
             }
             Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                self.verify_existing_object(&object_path, &content_hash, byte_size, &physical_key)?;
+                if let Some(verified) = &verified {
+                    let existing = verified.get(&content_hash).ok_or_else(|| io::Error::other("CAS destination changed before publication"))?;
+                    if !self.existing_verification_matches(&object_path, existing)? {
+                        return exact_object_changed();
+                    }
+                } else {
+                    self.verify_existing_object(&object_path, &content_hash, byte_size, &physical_key)?;
+                }
                 directory_entries_synced &= sync_parent(&object_directory)?;
                 true
             }
@@ -633,6 +668,17 @@ impl PayloadCas {
                 ));
             }
         };
+
+        if !deduplicated {
+            if let Some(verified) = verified.as_mut() {
+                let file = self.open_exact_owned_file(&object_path)?;
+                let published_identity = exact_file_identity(&file)?;
+                if published_identity != exact_file_identity(&verified_file)? {
+                    return exact_object_changed();
+                }
+                verified.insert(content_hash.clone(), VerifiedExistingObject { file, identity: published_identity });
+            }
+        }
 
         drop(path_file);
         drop(verified_file);
@@ -1150,6 +1196,74 @@ impl PayloadCas {
         }
         if hash_open_file(&mut file, &|| false)? != expected_hash {
             return collision_or_corruption(physical_key);
+        }
+        Ok(())
+    }
+
+    fn verify_existing_object_checked(
+        &self,
+        path: &Path,
+        expected_hash: &str,
+        expected_size: u64,
+        physical_key: &str,
+        cancelled: &dyn Fn() -> bool,
+    ) -> io::Result<VerifiedExistingObject> {
+        #[cfg(test)]
+        let _body_scope = super::body_io::object_scope(expected_hash);
+        for _ in 0..3 {
+            let mut file = self.open_exact_owned_file(path)?;
+            let identity = exact_file_identity(&file)?;
+            if identity.byte_size() != expected_size {
+                return collision_or_corruption(physical_key);
+            }
+            if hash_open_file(&mut file, cancelled)? != expected_hash {
+                return collision_or_corruption(physical_key);
+            }
+            if exact_file_identity(&file)? == identity {
+                return Ok(VerifiedExistingObject { file, identity });
+            }
+            // A concurrent publisher may unlink its staging hard link after hashing starts.
+            // Acquire a new stable verification instead of accepting changed metadata.
+        }
+        exact_object_changed()
+    }
+
+    fn verify_import_destination(&self, hash: &str, size: u64, cancelled: &dyn Fn() -> bool) -> io::Result<Option<VerifiedExistingObject>> {
+        let Some(path) = self.existing_object_path(hash)? else { return Ok(None); };
+        match self.verify_existing_object_checked(&path, hash, size, &object_physical_key(hash), cancelled) {
+            Ok(verified) => Ok(Some(verified)),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn existing_verification_matches(&self, path: &Path, verified: &VerifiedExistingObject) -> io::Result<bool> {
+        let file = match self.open_exact_owned_file(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        Ok(exact_file_identity(&file)? == verified.identity && exact_file_identity(&verified.file)? == verified.identity)
+    }
+
+    pub(crate) fn import_destinations_unchanged(&self, staged: &[StagedPayload]) -> io::Result<bool> {
+        let existing = self.stat_objects(staged.iter().map(|payload| payload.content_hash.as_str()))?;
+        for (payload, size) in staged.iter().zip(existing) {
+            self.check_staged_repository(payload)?;
+            match (size, &payload.verified_existing) {
+                (None, None) => {},
+                (Some(_), Some(verified)) if self.existing_verification_matches(
+                    &self.repository_root.join(object_physical_key(&payload.content_hash)), verified)? => {},
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn refresh_import_destinations(&self, staged: &mut [StagedPayload], cancelled: &dyn Fn() -> bool) -> io::Result<()> {
+        for payload in staged {
+            if cancelled() { return Err(io::Error::other("import cancelled")); }
+            payload.verified_existing = self.verify_import_destination(&payload.content_hash, payload.byte_size, cancelled)?;
         }
         Ok(())
     }
@@ -1754,6 +1868,31 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_destination_verification_retries_after_staging_link_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let bytes = b"synthetic concurrent import";
+        let object = cas.prepare_bytes(bytes).unwrap();
+        let path = cas.object_path(&object.content_hash).unwrap().unwrap();
+        let staging_link = directory.path().join("publisher-staging");
+        std::fs::hard_link(&path, &staging_link).unwrap();
+        let removed = std::cell::Cell::new(false);
+        crate::persistent_store::hash_work::reset_hash_work();
+        let verified = cas.verify_existing_object_checked(&path, &object.content_hash, bytes.len() as u64,
+            &object.physical_key, &|| {
+                if !removed.replace(true) { std::fs::remove_file(&staging_link).unwrap(); }
+                false
+            }).unwrap();
+        let hashes = crate::persistent_store::hash_work::take_hash_work();
+        let work = &hashes.domains["cas_existing_verify"];
+        assert_eq!(work.calls, 2);
+        assert_eq!(work.bytes, 2 * bytes.len() as u64);
+        assert!(cas.existing_verification_matches(&path, &verified).unwrap());
+        assert_eq!(cas.read_object(&object.content_hash).unwrap().unwrap(), bytes);
     }
 
     #[test]

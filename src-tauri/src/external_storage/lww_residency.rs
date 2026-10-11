@@ -495,6 +495,7 @@ fn pack_groups<T:PackMember>(members:Vec<T>,priority:&BTreeSet<String>)->Vec<Vec
 /// after which a batch closes early. They size a batch, not a hydration: every
 /// body is published, in as many batches as it takes.
 pub(crate) const PUBLISH_BATCH_BODIES:usize=64;
+const _: () = assert!(PUBLISH_BATCH_BODIES <= crate::asset_repository::parallel_stage::MAX_BATCH);
 pub(crate) const PUBLISH_BATCH_BYTES:u64=64*1024*1024;
 fn hydration_error(_:impl std::fmt::Display)->crate::server_sync::SyncError {crate::server_sync::SyncError::new("external-body-unavailable",502)}
 fn remote_error(error:ProviderError)->crate::server_sync::SyncError {

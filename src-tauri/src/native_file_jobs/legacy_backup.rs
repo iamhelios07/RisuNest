@@ -693,6 +693,7 @@ pub(crate) fn prepare_legacy_restore_payloads_observed(
     let mut cold_payloads = HashMap::new();
     let mut asset_keys = HashSet::new();
     let mut incoming = Vec::new();
+    let mut incoming_names = Vec::new();
     observer.begin(
         entries
             .iter()
@@ -721,6 +722,7 @@ pub(crate) fn prepare_legacy_restore_payloads_observed(
                     cancellation,
                 )?);
                 incoming.push(import_payload(entry)?);
+                incoming_names.push(entry.logical_name.as_str());
             }
             continue;
         }
@@ -754,16 +756,26 @@ pub(crate) fn prepare_legacy_restore_payloads_observed(
             }
             asset_aliases.push(alias);
             incoming.push(import_payload(entry)?);
+            incoming_names.push(entry.logical_name.as_str());
             continue;
         }
         observer.item_done();
     }
     let mut completed = 0;
-    prepare_import_payloads(cas, durable, &incoming, ImportPinning::DuringPreparation, &|| cancellation.is_cancelled(), |bytes, count| {
+    let mut displayed = None;
+    let mut last_item_report: Option<std::time::Instant> = None;
+    prepare_import_payloads(cas, durable, &incoming, ImportPinning::DuringPreparation, &|| cancellation.is_cancelled(), |bytes, count, current| {
         observer.item_bytes(bytes);
         if completed < count {
             observer.items_done((count - completed) as u64);
             completed = count;
+            displayed = None;
+        }
+        if let Some(index) = current.filter(|index| Some(*index) != displayed
+            && last_item_report.is_none_or(|last| last.elapsed() >= std::time::Duration::from_millis(50))) {
+            observer.item_started(incoming_names[index]);
+            displayed = Some(index);
+            last_item_report = Some(std::time::Instant::now());
         }
     }).map_err(|error| cancellation_io(error, cancellation))?;
     check_cancelled(cancellation)?;
@@ -1333,6 +1345,37 @@ mod tests {
                 })
                 .collect::<Result<_, crate::local_backup::LocalBackupError>>()?;
             Ok(())
+        }
+    }
+
+    #[test]
+    fn parallel_assets_and_pocket_media_report_their_current_logical_name() {
+        struct Observer { names: RefCell<Vec<String>>, completed: Cell<u64> }
+        impl LegacyPrepareObserver for Observer {
+            fn item_started(&self, name: &str) { self.names.borrow_mut().push(name.to_owned()); }
+            fn items_done(&self, count: u64) { self.completed.set(self.completed.get() + count); }
+        }
+        struct Planner<'a> { cas: &'a PayloadCas, durable: &'a mut DurableCasJob, observer: &'a Observer }
+        impl StrictLocalBackupDatabaseRestore for Planner<'_> {
+            fn restore_database(&mut self, _: &StagedLocalBackupEntry, entries: &[StagedLocalBackupEntry]) -> Result<(), LocalBackupError> {
+                prepare_legacy_restore_payloads_observed(entries, self.cas, self.durable, &NeverCancelled, self.observer)?;
+                Ok(())
+            }
+        }
+        for name in ["portrait.png", "inlay/pocket.webp"] {
+            let root = tempfile::tempdir().unwrap();
+            drop(PersistentStore::open(root.path()).unwrap());
+            let cas = PayloadCas::new(root.path()).unwrap();
+            let mut durable = DurableCasJob::begin(root.path(), &Uuid::new_v4().to_string(), CasJobKind::LocalBackupRestore,
+                crate::asset_repository::job_pins::CasJobOwner::for_test(), 0).unwrap();
+            let observer = Observer { names: RefCell::new(Vec::new()), completed: Cell::new(0) };
+            let mut planner = Planner { cas: &cas, durable: &mut durable, observer: &observer };
+            let bytes = [entry(name.as_bytes(), b"synthetic body"), entry(b"database.risudat", b"RISUSAVE\0")].concat();
+            parse_legacy_local_backup_v1(&mut Cursor::new(bytes), &test_legacy_staging(root.path()), PayloadTarget::JobStaging,
+                &mut planner, &NeverCancelled).unwrap();
+            assert!(observer.names.borrow().iter().any(|reported| reported == name));
+            assert_eq!(observer.completed.get(), 1);
+            durable.release(CasReleaseOutcome::Aborted).unwrap();
         }
     }
 
