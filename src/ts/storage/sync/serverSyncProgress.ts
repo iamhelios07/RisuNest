@@ -142,7 +142,7 @@ function stageWork(attempt: ServerSyncAttempt, lane: ServerSyncLane): Work | und
     if (lane.assetScope) return lane.assetScope.total ? capped(lane.assetScope.done, lane.assetScope.total) : undefined
     if (lane.lane === 'send' || lane.lane === 'receive') return itemWork(attempt, lane.lane)
     if (lane.lane !== 'binding') return undefined
-    if (lane.step === 'listing') return lane.listing ? capped(lane.listing.done, lane.listing.total) : undefined
+    if (lane.step === 'listing') return lane.listing?.total ? capped(lane.listing.done, lane.listing.total) : undefined
     // A binding counts the changes it reads; the bodies it downloads after the last one and what it stages are not counted.
     const items = lane.step === 'downloading' ? itemWork(attempt, 'binding') : undefined
     return items && items.done < items.total ? items : undefined
@@ -159,7 +159,7 @@ export function bytePhase(attempt: ServerSyncAttempt): { key: string; done: numb
 function laneDetail(attempt: ServerSyncAttempt, lane: ServerSyncLane, text: Text): string {
     const work = stageWork(attempt, lane)
     if (work) return ratio(work.done, work.total)
-    return lane.step === 'listing' && lane.listed > 0 ? text.itemsCount.replace('{0}', count(lane.listed)) : ''
+    return lane.step === 'listing' && !lane.listing && lane.listed > 0 ? text.itemsCount.replace('{0}', count(lane.listed)) : ''
 }
 
 /** Everything the progress panel shows for a running attempt. Only totals fixed before their work ran are shown. */

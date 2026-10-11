@@ -95,11 +95,18 @@ describe('server sync progress view', () => {
     })
     it('measures a binding listing against the units its state pin holds', () => {
         const listing = (counts: Partial<ServerSyncLane>) => serverSyncProgressView(attempt({ stages: ['preparing'], active: ['preparing'], current: 'preparing', lanes: [lane('binding', { active: true, step: 'listing', ...counts })] }), text, 0)
+        const starting = listing({ listing: { done: 0, total: 1000 } })
+        expect([starting.detail, starting.fraction]).toEqual(['0 / 1,000', 0])
         const first = listing({ listed: 256, listing: { done: 256, total: 1000 } })
         expect([first.label, first.detail, first.fraction]).toEqual([text.activity.enumerating, '256 / 1,000', 0.256])
         // Changes made after the pin are read too; what is shown never passes the total.
         expect(listing({ listed: 1003, listing: { done: 1000, total: 1000 } }).detail).toBe('1,000 / 1,000')
         expect(listing({ listed: 40 }).detail).toBe(text.itemsCount.replace('{0}', '40'))
+    })
+    it.each(['preparing', 'downloading'] as const)('shows an empty binding listing without a count or share during %s', stage => {
+        const view = serverSyncProgressView(attempt({ stages: [stage], active: [stage], current: stage, lanes: [lane('binding', { active: true, step: 'listing', listing: { done: 0, total: 0 } })] }), text, 0)
+        expect([view.label, view.detail, view.fraction]).toEqual([text.activity.enumerating, '', null])
+        expect(view.counters.find(counter => counter.key === 'items')).toBeUndefined()
     })
     it('shows only the current pin after a restart while retaining all transferred bytes', () => {
         const baseline = [lane('binding', { listed: 80, receivedBytes: 1024, listing: { done: 80, total: 80 } })]
@@ -109,7 +116,9 @@ describe('server sync progress view', () => {
         expect(view.fraction).toBe(256 / 140_421)
         expect(view.counters.find(counter => counter.key === 'bytes')?.value).toBe('↑ 0 B · ↓ 3.0 KiB')
         current[0].listing = { done: 0, total: 0 }
-        expect(serverSyncProgressView(attempt({ stages: ['downloading'], active: ['downloading'], current: 'downloading', lanes: laneDeltas(current, baseline) }), text, 0).detail).toBe('0 / 0')
+        const restarted = serverSyncProgressView(attempt({ stages: ['downloading'], active: ['downloading'], current: 'downloading', lanes: laneDeltas(current, baseline) }), text, 0)
+        expect([restarted.detail, restarted.fraction]).toEqual(['', null])
+        expect(restarted.counters.find(counter => counter.key === 'bytes')?.value).toBe('↑ 0 B · ↓ 3.0 KiB')
     })
     it('reports no share while listing, and counts what was read', () => {
         const view = serverSyncProgressView(attempt({ stages: ['downloading'], active: ['downloading'], current: 'downloading', lanes: [lane('receive', { active: true, step: 'listing', listed: 300 })] }), text, 0)
