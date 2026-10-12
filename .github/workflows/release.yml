@@ -212,7 +212,9 @@ jobs:
       - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
         with:
           packages: platform-tools
-      - run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;28.2.13676358'
+      - name: Install Android SDK packages
+        timeout-minutes: 15
+        run: bash scripts/retry-command.sh sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;28.2.13676358'
       - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
         with: { targets: aarch64-linux-android,x86_64-linux-android }
       - run: pnpm install --frozen-lockfile
@@ -229,6 +231,9 @@ jobs:
           )
           for path in "${required[@]}"; do test -f "$path"; done
           git diff --exit-code -- src-tauri/gen/android
+      - name: Prepare Gradle distribution
+        timeout-minutes: 10
+        run: bash scripts/retry-command.sh bash src-tauri/gen/android/gradlew --version
       - name: Generate Android build files through a real agent build
         shell: bash
         run: |
@@ -280,7 +285,8 @@ jobs:
         with: { node-version: "24", package-manager-cache: false }
       - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
       - name: Install native GUI test dependencies
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libwebkit2gtk-4.1-dev libssl-dev libdbus-1-dev libayatana-appindicator3-dev librsvg2-dev
+        timeout-minutes: 15
+        run: sudo apt-get -o Acquire::Retries=2 --error-on=any update && sudo apt-get -o Acquire::Retries=2 install -y pkg-config libwebkit2gtk-4.1-dev libssl-dev libdbus-1-dev libayatana-appindicator3-dev librsvg2-dev
       - run: pnpm --dir server/manager/gui --ignore-workspace install --frozen-lockfile
       - run: pnpm --dir server/manager/gui --ignore-workspace check
       - run: pnpm --dir server/manager/gui --ignore-workspace test
@@ -314,7 +320,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
         with: { targets: wasm32-unknown-unknown }
       - name: Install native and WASM build dependencies
-        run: sudo apt-get update && sudo apt-get install -y clang llvm pkg-config libwebkit2gtk-4.1-dev libssl-dev libdbus-1-dev libayatana-appindicator3-dev librsvg2-dev gnome-keyring dbus-x11
+        timeout-minutes: 15
+        run: sudo apt-get -o Acquire::Retries=2 --error-on=any update && sudo apt-get -o Acquire::Retries=2 install -y clang llvm pkg-config libwebkit2gtk-4.1-dev libssl-dev libdbus-1-dev libayatana-appindicator3-dev librsvg2-dev gnome-keyring dbus-x11
       - run: pnpm install --frozen-lockfile
       - name: Install the locked WASM binding generator
         shell: pwsh
@@ -396,7 +403,8 @@ jobs:
         with: { targets: "${{ matrix.target }}" }
       - name: Install Linux package dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libwebkit2gtk-4.1-dev libssl-dev libdbus-1-dev libayatana-appindicator3-dev librsvg2-dev patchelf desktop-file-utils shared-mime-info xdg-utils libfuse2t64 gnome-keyring dbus-x11 xvfb
+        timeout-minutes: 15
+        run: sudo apt-get -o Acquire::Retries=2 --error-on=any update && sudo apt-get -o Acquire::Retries=2 install -y build-essential pkg-config libwebkit2gtk-4.1-dev libssl-dev libdbus-1-dev libayatana-appindicator3-dev librsvg2-dev patchelf desktop-file-utils shared-mime-info xdg-utils libfuse2t64 gnome-keyring dbus-x11 xvfb
       - run: pnpm install --frozen-lockfile
       - name: Use a temporary directory without symlinked ancestors
         if: runner.os == 'macOS'
@@ -544,7 +552,9 @@ jobs:
           packages: platform-tools
       - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
         with: { targets: aarch64-linux-android }
-      - run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;28.2.13676358'
+      - name: Install Android SDK packages
+        timeout-minutes: 15
+        run: bash scripts/retry-command.sh sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;28.2.13676358'
       - run: pnpm install --frozen-lockfile
       - name: Verify the committed Android shell
         shell: bash
@@ -559,6 +569,9 @@ jobs:
           )
           for path in "${required[@]}"; do test -f "$path"; done
           git diff --exit-code -- src-tauri/gen/android
+      - name: Prepare Gradle distribution
+        timeout-minutes: 10
+        run: bash scripts/retry-command.sh bash src-tauri/gen/android/gradlew --version
       - name: Configure release keystore
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -792,6 +805,7 @@ jobs:
         if: matrix.os != 'linux' && needs.prepare-draft.outputs.already_published != 'true'
         run: pnpm --dir server/manager/gui --ignore-workspace install --frozen-lockfile
       - name: Fetch and verify pinned cloudflared
+        timeout-minutes: 30
         if: needs.prepare-draft.outputs.already_published != 'true'
         shell: bash
         run: |
@@ -911,10 +925,11 @@ jobs:
           merge-multiple: false
       - name: Download draft release assets
         if: inputs.publish == true
+        timeout-minutes: 30
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release download "${{ needs.source.outputs.tag }}" --dir collected/assets
+        run: bash scripts/retry-command.sh gh release download "${{ needs.source.outputs.tag }}" --dir collected/assets --clobber
       - name: Collect and validate every required artifact
         shell: bash
         run: |
@@ -981,10 +996,11 @@ jobs:
         with: { node-version: "24", package-manager-cache: false }
       - run: pnpm install --frozen-lockfile
       - name: Download immutable published assets
+        timeout-minutes: 10
         shell: bash
         env: { GH_TOKEN: "${{ github.token }}" }
         run: >-
-          gh release download "${{ needs.source.outputs.tag }}" --dir published
+          bash scripts/retry-command.sh gh release download "${{ needs.source.outputs.tag }}" --dir published --clobber
           --pattern product-manifest.json --pattern product-manifest.json.sig
       - name: Recover latest only when this release still owns the newest catalog
         shell: bash

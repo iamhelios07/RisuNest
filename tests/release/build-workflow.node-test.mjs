@@ -396,6 +396,38 @@ test("Android jobs preserve the committed shell and let Tauri generate ignored b
   assert.match(releaseJob, /export PATH="\$ANDROID_HOME\/build-tools\/36\.0\.0:\$PATH"/);
 });
 
+test("Android prepares Gradle before builds and bounds SDK and download retries", () => {
+  const android = readFileSync(new URL("../../.github/workflows/android-check.yml", import.meta.url), "utf8").replace(/\r\n/g, "\n");
+  const jobs = [android, ...["app-android-tests", "app-android"].map(name => {
+    const start = workflow.indexOf(`\n  ${name}:\n`);
+    return workflow.slice(start, workflow.indexOf("\n  app-ios", start));
+  })];
+  for (const job of jobs) {
+    const prepare = job.indexOf("bash scripts/retry-command.sh bash src-tauri/gen/android/gradlew --version");
+    const build = job.search(/pnpm (?:exec -- tauri android build|android:build:arm64)/);
+    assert.ok(prepare >= 0 && build > prepare, "Gradle download must precede the real build");
+    assert.match(job, /bash scripts\/retry-command.sh sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;28.2.13676358'/);
+  }
+  for (const step of [...workflow.split(/^      - /m), ...android.split(/^      - /m)]) {
+    if (!step.includes("bash scripts/retry-command.sh")) continue;
+    assert.match(step, /timeout-minutes: \d+/);
+    assert.doesNotMatch(step, /retry-command\.sh (?:pnpm|cargo)/);
+    if (step.includes("gh release download")) assert.match(step, /--clobber/);
+  }
+});
+
+test("APT retries downloads internally and failed index refreshes remain failures", () => {
+  for (const name of ["release", "native-check", "linux-package-check", "pr-check"]) {
+    const contents = readFileSync(new URL(`../../.github/workflows/${name}.yml`, import.meta.url), "utf8");
+    const commands = contents.match(/sudo apt-get[^\n&]*/g) ?? [];
+    assert.ok(commands.length >= 2, name);
+    for (const command of commands) {
+      assert.match(command, /-o Acquire::Retries=2/);
+      if (/\bupdate\b/.test(command)) assert.match(command, /--error-on=any/);
+    }
+  }
+});
+
 test("Windows installer failure checks run after the job has cached NSIS", () => {
   const packageStep = workflow.indexOf("node server/manager/install/package.mjs");
   const installerTest = workflow.indexOf("server/manager/install/windows.test.ps1");
