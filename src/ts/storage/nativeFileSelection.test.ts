@@ -9,8 +9,9 @@ vi.mock('../platform', () => ({
     isTauriMobile: true,
 }))
 vi.mock('@tauri-apps/api/core', () => ({ invoke: mocks.invoke }))
-vi.mock('@tauri-apps/plugin-fs', () => ({ open: mocks.open }))
-import { selectNativeFileData, selectNativeFiles, type NativeSelectedFile } from './nativeFileSelection'
+vi.mock('@tauri-apps/plugin-fs', () => ({ open: mocks.open, SeekMode: { Start: 0 } }))
+vi.mock('src/lang', () => ({ language: { risuNest: { importDialog: { reasonUnsupportedFormat: 'Unsupported file format' } } } }))
+import { selectNativeFileData, selectNativeFiles, withNativeSelectedFile, type NativeSelectedFile } from './nativeFileSelection'
 import { selectDomFiles } from './fileSelection'
 import { isLibraryFileOperationReserved } from './libraryFileOperation'
 
@@ -86,9 +87,66 @@ describe('native mobile file selection', () => {
     })
 
     it('filters metadata before reading and still releases rejected selections', async () => {
-        expect(await selectNativeFiles({ accept: '.png' })).toEqual([])
+        await expect(selectNativeFiles({ accept: '.png' })).rejects.toThrow('Unsupported file format')
         expect(mocks.open).not.toHaveBeenCalled()
         expect(mocks.discard).toHaveBeenCalledOnce()
+    })
+
+    it('rejects a mixed-format batch instead of silently importing only part of it', async () => {
+        mocks.pick.mockResolvedValue({ cancelled: false, files: [metadata('first.risup'), metadata('second.png')] })
+        await expect(selectNativeFileData({ multiple: true, accept: '.risup' })).rejects.toThrow('Unsupported file format')
+        expect(mocks.open).not.toHaveBeenCalled()
+        expect(mocks.discard).toHaveBeenCalledTimes(2)
+    })
+
+    it('reads small slices above 2 GiB without materializing a large backup, then releases the source', async () => {
+        const size = 3 * 1024 ** 3
+        mocks.pick.mockResolvedValue({ cancelled: false, files: [metadata('large.bin', size)] })
+        const readSizes: number[] = []
+        mocks.open.mockImplementation(async () => {
+            let position = 0
+            return {
+                seek: vi.fn(async (offset: number) => { position = offset }),
+                close: vi.fn(async () => {}),
+                read: vi.fn(async (target: Uint8Array) => {
+                    readSizes.push(target.length)
+                    const count = Math.min(target.length, size - position)
+                    for (let i = 0; i < count; i++) target[i] = (position + i) % 251
+                    position += count
+                    return count || null
+                }),
+            }
+        })
+        let retained!: ReturnType<import('./nativeFileSelection').SelectedFileSlices['slice']>
+        const result = await withNativeSelectedFile({ accept: '.bin' }, async file => {
+            expect(file.size).toBe(size)
+            expect(mocks.open).not.toHaveBeenCalled()
+            expect(mocks.discard).not.toHaveBeenCalled()
+            expect(isLibraryFileOperationReserved()).toBe(true)
+            const start = 2 ** 31 + 13
+            expect([...new Uint8Array(await file.slice(start, start + 4).arrayBuffer())])
+                .toEqual([start % 251, (start + 1) % 251, (start + 2) % 251, (start + 3) % 251])
+            expect(new Uint8Array(await file.slice(-1).arrayBuffer())[0]).toBe((size - 1) % 251)
+            retained = file.slice(0, 4)
+            return 'imported'
+        })
+        expect(result).toBe('imported')
+        expect(readSizes).toEqual([4, 1, 1])
+        expect(mocks.discard).toHaveBeenCalledOnce()
+        expect(isLibraryFileOperationReserved()).toBe(false)
+        await expect(retained.arrayBuffer()).rejects.toThrow('released')
+    })
+
+    it('releases a native sliced source after consumer failure and retains both errors', async () => {
+        mocks.discard.mockRejectedValueOnce(new Error('cleanup denied'))
+        await expect(withNativeSelectedFile({}, async file => {
+            expect(mocks.discard).not.toHaveBeenCalled()
+            await file.slice(0, 4).arrayBuffer()
+            throw new Error('invalid backup')
+        })).rejects.toThrow('Error: invalid backup\nError: cleanup denied')
+        expect(handles[0].close).toHaveBeenCalledOnce()
+        expect(mocks.discard).toHaveBeenCalledOnce()
+        expect(isLibraryFileOperationReserved()).toBe(false)
     })
 
     it('returns cancellation without attempting a read', async () => {
@@ -162,7 +220,7 @@ describe('native mobile file selection', () => {
             ...metadata(), path: `/owned/${index}/source`,
         })) })
         mocks.discard.mockImplementation(path => client.request('files.discard', path))
-        await expect(selectNativeFileData({ multiple: true, accept: '.txt' })).resolves.toEqual([])
+        await expect(selectNativeFileData({ multiple: true, accept: '.txt' })).rejects.toThrow('Unsupported file format')
         expect(mocks.discard).toHaveBeenCalledTimes(40)
         expect(isLibraryFileOperationReserved()).toBe(false)
     })

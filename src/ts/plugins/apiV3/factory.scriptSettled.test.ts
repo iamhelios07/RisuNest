@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { SandboxHost } from './factory'
+import { recordNativeLogError } from '../../nativeLog'
+vi.mock('../../nativeLog', () => ({ recordNativeLogError: vi.fn(async () => {}) }))
 import { collectPluginReadProvenance, PluginReadBaselines } from '../pluginReadBaselines'
 import type { fetchNative, GlobalFetchArgs } from '../../globalApi.svelte'
 
@@ -67,6 +69,7 @@ describe('sandbox script completion', () => {
         })
         await vi.waitFor(() => expect((child as any).readError).toBe('NotReadableError'))
         expect(alertError).toHaveBeenCalledWith('[settled-test] NotReadableError: Provider denied access')
+        expect(recordNativeLogError).toHaveBeenCalledWith('[settled-test] NotReadableError: Provider denied access')
         host.terminate()
     })
 
@@ -91,6 +94,19 @@ describe('sandbox script completion', () => {
         await runGuest(host, `throw new Error('Failed to read file', {cause: new DOMException('Provider failed', 'NotReadableError')});`)
         await vi.waitFor(() => expect(alertError).toHaveBeenCalledWith('[settled-test] Error: Failed to read file\nNotReadableError: Provider failed'))
         expect(host.isIdle()).toBe(true)
+        host.terminate()
+    })
+
+    it.each([
+        'Object.create(null)',
+        'new Proxy({}, { get() { throw new Error("getter failed"); } })',
+        'Object.defineProperty(new Error("original"), "cause", { get() { throw new Error("cause getter failed"); } })',
+    ])('settles even when error reporting cannot stringify %s', async (expression) => {
+        const alertError = vi.fn()
+        const host = new SandboxHost({ ...bridgeStubs(), alertError })
+        await runGuest(host, `throw ${expression};`)
+        await vi.waitFor(() => expect(host.isIdle()).toBe(true))
+        expect(alertError).toHaveBeenCalledOnce()
         host.terminate()
     })
 
