@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core'
 import '../androidNativeControl'
 import { language } from 'src/lang'
 import { open, SeekMode } from '@tauri-apps/plugin-fs'
+import { recordNativeLogError } from '../nativeLog'
 import { isTauriAndroid, isTauriIOS } from '../platform'
 import { withLibraryFileSelection } from './libraryFileOperation'
 
@@ -47,11 +48,15 @@ function accepts(file: NativeSelectedFile, accept = ''): boolean {
                 : file.mimeType.toLowerCase() === type))
 }
 
+// Staged copies are app-private and swept by both platforms later, so a failed cleanup is
+// logged without failing a selection the user already completed.
+function logCleanupFailure(error: unknown): void {
+    void recordNativeLogError(`Selected file cleanup failed: ${String(error)}`).catch(() => {})
+}
+
 async function readSelected(file: NativeSelectedFile, signal?: AbortSignal, start = 0, end = file.bytes): Promise<Uint8Array<ArrayBuffer>> {
     signal?.throwIfAborted()
-    if (!Number.isSafeInteger(file.bytes) || file.bytes < 0) throw new Error('The selected file has an invalid size')
     const handle = await open(file.path, { read: true })
-    let failure: unknown
     try {
         if (start) await handle.seek(start, SeekMode.Start)
         const data = new Uint8Array(end - start)
@@ -62,17 +67,9 @@ async function readSelected(file: NativeSelectedFile, signal?: AbortSignal, star
             if (!count) throw new Error('The selected file ended before all bytes were read')
             position += count
         }
-        signal?.throwIfAborted()
-        if (end === file.bytes && await handle.read(new Uint8Array(1))) throw new Error('The selected file changed while reading')
         return data
-    } catch (error) {
-        failure = error
-        throw error
     } finally {
-        try { await handle.close() }
-        catch (error) {
-            throw new Error([failure, error].filter(Boolean).map(String).join('\n'), { cause: failure ?? error })
-        }
+        await handle.close().catch(logCleanupFailure)
     }
 }
 
@@ -83,16 +80,10 @@ async function withNativeSelection<T>(options: FileSelectionOptions, consume: (f
         const native = bridge()
         selecting = true
         let files: NativeSelectedFile[] = []
-        let failure: unknown
         const release = async () => {
             const owned = files
             files = []
-            const errors: unknown[] = []
-            for (const file of owned) {
-                try { await native.discard(file.path) }
-                catch (error) { errors.push(error) }
-            }
-            if (errors.length) throw new Error(errors.map(String).join('\n'), { cause: errors[0] })
+            for (const file of owned) await native.discard(file.path).catch(logCleanupFailure)
         }
         try {
             const result = await native.pick(options.multiple ?? false)
@@ -101,18 +92,16 @@ async function withNativeSelection<T>(options: FileSelectionOptions, consume: (f
             files = result.files
             if (options.signal?.aborted) return cancelled
             const selected = options.multiple ? files : files.slice(0, 1)
+            if (selected.some(file => !Number.isSafeInteger(file.bytes) || file.bytes < 0)) {
+                throw new Error('The selected file has an invalid size')
+            }
             if (selected.some(file => !accepts(file, options.accept))) {
                 throw new Error(language.risuNest.importDialog.reasonUnsupportedFormat)
             }
             return await consume(selected, release)
-        } catch (error) {
-            failure = error
-            throw error
         } finally {
             try { await release() }
-            catch (error) {
-                throw new Error([failure, error instanceof Error ? error.message : error].filter(Boolean).map(String).join('\n'), { cause: failure ?? error })
-            } finally { selecting = false }
+            finally { selecting = false }
         }
     })
 }
@@ -140,7 +129,6 @@ export interface SelectedFileSlices {
 /** Keep the source until the consumer settles, allowing early release before navigation. */
 export function withNativeSelectedFile<T>(options: Omit<FileSelectionOptions, 'multiple'>, consume: (file: SelectedFileSlices, release: () => Promise<void>) => Promise<T>): Promise<T | null> {
     return withNativeSelection<T | null>({ ...options, multiple: false }, async ([file], discard) => {
-        if (!Number.isSafeInteger(file.bytes) || file.bytes < 0) throw new Error('The selected file has an invalid size')
         let active = true
         let cached: { start: number; data: Uint8Array<ArrayBuffer> } | undefined
         const offset = (value: number) => {

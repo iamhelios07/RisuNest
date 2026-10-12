@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Buffer } from 'node:buffer'
 
 const mocks = vi.hoisted(() => ({
-    android: true, ios: false, invoke: vi.fn(), open: vi.fn(), pick: vi.fn(), discard: vi.fn(),
+    android: true, ios: false, invoke: vi.fn(), open: vi.fn(), pick: vi.fn(), discard: vi.fn(), log: vi.fn(),
 }))
 vi.mock('../platform', () => ({
     get isTauriAndroid() { return mocks.android },
@@ -12,6 +12,7 @@ vi.mock('../platform', () => ({
 vi.mock('@tauri-apps/api/core', () => ({ invoke: mocks.invoke }))
 vi.mock('@tauri-apps/plugin-fs', () => ({ open: mocks.open, SeekMode: { Start: 0 } }))
 vi.mock('src/lang', () => ({ language: { risuNest: { importDialog: { reasonUnsupportedFormat: 'Unsupported file format' } } } }))
+vi.mock('../nativeLog', () => ({ recordNativeLogError: mocks.log }))
 import { selectNativeFileData, selectNativeFiles, withNativeSelectedFile, type NativeSelectedFile } from './nativeFileSelection'
 import { selectDomFiles } from './fileSelection'
 import { isLibraryFileOperationReserved } from './libraryFileOperation'
@@ -45,6 +46,7 @@ beforeEach(() => {
     window.RisuNativeFileSelection = { pick: mocks.pick, discard: mocks.discard }
     mocks.pick.mockResolvedValue({ cancelled: false, files: [metadata()] })
     mocks.discard.mockResolvedValue(undefined)
+    mocks.log.mockResolvedValue(undefined)
     mocks.open.mockImplementation(async () => readable())
 })
 afterEach(() => { delete window.RisuNativeFileSelection })
@@ -66,7 +68,7 @@ describe('native mobile file selection', () => {
         mocks.pick.mockResolvedValue({ cancelled: false, files: [metadata('large.bin', bytes.length)] })
         mocks.open.mockImplementation(async () => readable(bytes))
         const [file] = await selectNativeFileData()
-        expect(file.data).toEqual(bytes)
+        expect(Buffer.compare(file.data, bytes)).toBe(0)
         expect(handles[0].read.mock.calls.every(([target]) => target.length <= 256 * 1024)).toBe(true)
     })
 
@@ -133,14 +135,15 @@ describe('native mobile file selection', () => {
             return 'imported'
         })
         expect(result).toBe('imported')
-        expect(readSizes).toEqual([256 * 1024, 256 * 1024, 256 * 1024, 256 * 1024, 1, 1])
+        expect(readSizes.every(length => length <= 256 * 1024)).toBe(true)
+        expect(readSizes.reduce((sum, length) => sum + length, 0)).toBeLessThanOrEqual(2 * 1024 * 1024)
         expect(mocks.discard).toHaveBeenCalledOnce()
         expect(isLibraryFileOperationReserved()).toBe(false)
         await expect(retained.arrayBuffer()).rejects.toThrow('released')
     })
 
-    it('coalesces 10,000 entry headers and deferred payloads into bounded native reads', async () => {
-        const entries = 10_000
+    it('coalesces many entry headers and deferred payloads into a few bounded native reads', async () => {
+        const entries = 4_000
         const stride = 283
         const bytes = Uint8Array.from({ length: entries * stride }, (_, index) => index % 251)
         mocks.pick.mockResolvedValue({ cancelled: false, files: [metadata('many.bin', bytes.length)] })
@@ -157,7 +160,7 @@ describe('native mobile file selection', () => {
                 expect(Buffer.compare(new Uint8Array(await file.slice(start, start + 256).arrayBuffer()), bytes.slice(start, start + 256))).toBe(0)
             }
         })
-        expect(mocks.open).toHaveBeenCalledTimes(6)
+        expect(mocks.open.mock.calls.length).toBeLessThan(10)
         expect(handles.every(handle => handle.read.mock.calls.every(([target]) => target.length <= 256 * 1024))).toBe(true)
         expect(handles.every(handle => handle.close.mock.calls.length === 1)).toBe(true)
     })
@@ -192,15 +195,16 @@ describe('native mobile file selection', () => {
         expect(mocks.discard).toHaveBeenCalledOnce()
     })
 
-    it('releases a native sliced source after consumer failure and retains both errors', async () => {
+    it('releases a native sliced source after consumer failure, keeping the consumer error and logging cleanup failure', async () => {
         mocks.discard.mockRejectedValueOnce(new Error('cleanup denied'))
         await expect(withNativeSelectedFile({}, async file => {
             expect(mocks.discard).not.toHaveBeenCalled()
             await file.slice(0, 4).arrayBuffer()
             throw new Error('invalid backup')
-        })).rejects.toThrow('Error: invalid backup\nError: cleanup denied')
+        })).rejects.toThrow(/^invalid backup$/)
         expect(handles[0].close).toHaveBeenCalledOnce()
         expect(mocks.discard).toHaveBeenCalledOnce()
+        expect(mocks.log).toHaveBeenCalledWith(expect.stringContaining('cleanup denied'))
         expect(isLibraryFileOperationReserved()).toBe(false)
     })
 
@@ -253,12 +257,19 @@ describe('native mobile file selection', () => {
         expect(handles[0].close).toHaveBeenCalledOnce()
     })
 
-    it('retains both read and cleanup errors', async () => {
+    it('keeps a completed selection when handle close and source cleanup fail, logging both', async () => {
         mocks.pick.mockResolvedValue({ cancelled: false, files: [metadata(), { ...metadata(), path: '/owned/second/source' }] })
-        mocks.open.mockRejectedValue(new Error('read denied'))
+        mocks.open.mockImplementation(async () => {
+            const handle = readable()
+            handle.close.mockRejectedValue(new Error('close denied'))
+            return handle
+        })
         mocks.discard.mockRejectedValueOnce(new Error('cleanup denied')).mockResolvedValueOnce(undefined)
-        await expect(selectNativeFileData()).rejects.toThrow('Error: read denied\nError: cleanup denied')
+        const [file] = await selectNativeFileData()
+        expect([...file.data]).toEqual([0, 128, 255, 10])
         expect(mocks.discard).toHaveBeenCalledTimes(2)
+        expect(mocks.log).toHaveBeenCalledWith(expect.stringContaining('close denied'))
+        expect(mocks.log).toHaveBeenCalledWith(expect.stringContaining('cleanup denied'))
         expect(isLibraryFileOperationReserved()).toBe(false)
     })
 

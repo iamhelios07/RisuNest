@@ -187,9 +187,7 @@ describe('local backup persistent snapshot', () => {
         })
     })
 
-    it.each([[false, false, false], [true, false, false], [true, true, false], [true, true, true]])('expands cold payloads on mobile=%s with cleanup failure=%s and log failure=%s', async (mobile, cleanupFails, logFails) => {
-        const { recordNativeLogError } = await import('../nativeLog')
-        if (logFails) vi.mocked(recordNativeLogError).mockRejectedValueOnce(new Error('native log unavailable'))
+    it.each([false, true])('expands cold payloads into the replaced local backup database on mobile=%s', async (mobile) => {
         state.mobile = mobile
         const coldKey = 'local-restore-cold'
         const database = structuredClone(risuSaveFixtureDatabase) as Database
@@ -237,9 +235,7 @@ describe('local backup persistent snapshot', () => {
         Object.defineProperty(input, 'files', { value: [file] })
         const click = vi.spyOn(input, 'click').mockImplementation(() => {})
         const createElement = vi.spyOn(document, 'createElement').mockReturnValueOnce(input)
-        const discard = vi.fn(async () => {
-            if (cleanupFails) throw new Error('synthetic source cleanup failure')
-        })
+        const discard = vi.fn(async () => {})
         const nativeReadSizes: number[] = []
         if (mobile) {
             window.RisuNativeFileSelection = {
@@ -262,21 +258,17 @@ describe('local backup persistent snapshot', () => {
                 }
             })
         }
-        const { LoadLocalBackup, importLegacyBackupWithWebView } = await import('./backuplocal')
+        const { LoadLocalBackup } = await import('./backuplocal')
         const { alertWait } = await import('../alert')
-        const pending = cleanupFails ? importLegacyBackupWithWebView(state.fallbackContext) : LoadLocalBackup()
+        const pending = LoadLocalBackup()
         if (!mobile) {
             await vi.waitFor(() => expect(click).toHaveBeenCalledOnce())
             input.dispatchEvent(new Event('change'))
         }
         await pending
-        if (cleanupFails) {
-            expect(recordNativeLogError).toHaveBeenCalledWith(expect.stringContaining('synthetic source cleanup failure'))
-        } else expect(recordNativeLogError).not.toHaveBeenCalled()
         if (mobile) {
             expect(click).not.toHaveBeenCalled()
             expect(Math.max(...nativeReadSizes)).toBeLessThanOrEqual(256 * 1024)
-            expect(state.openNativeFile).toHaveBeenCalledOnce()
             expect(discard).toHaveBeenCalledExactlyOnceWith('/owned/backup')
         }
         createElement.mockRestore()

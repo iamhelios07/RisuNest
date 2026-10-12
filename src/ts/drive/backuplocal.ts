@@ -385,21 +385,8 @@ export async function importLegacyBackupWithWebView(
 ): Promise<{ warningCodes: string[], upstreamLosses: { coldMissing: number, invalidInlays: number, pocketInlays: number } } | null> {
     if (isTauriMobile) {
         const { withNativeSelectedFile } = await import('../storage/nativeFileSelection')
-        let committedRevision: number | null = null
-        try {
-            return await withNativeSelectedFile({ accept: '.bin', signal: context.signal },
-                (file, release) => importLegacyBackupFile(file, context, lifecycle, confirmationTitle, {
-                    onCommitted: revision => { committedRevision = revision },
-                    releaseSource: release,
-                }))
-        } catch (error) {
-            if (committedRevision !== null) {
-                context.setPartialWritesPossible(true)
-                if (error instanceof NativeFileJobActivationCommittedError) throw error
-                throw new NativeFileJobActivationCommittedError(committedRevision, error)
-            }
-            throw error
-        }
+        return withNativeSelectedFile({ accept: '.bin', signal: context.signal },
+            (file, release) => importLegacyBackupFile(file, context, lifecycle, confirmationTitle, release))
     }
     const file = await pickWebBackupFile(context.signal)
     return file ? importLegacyBackupFile(file, context, lifecycle, confirmationTitle) : null
@@ -410,7 +397,7 @@ async function importLegacyBackupFile(
     context: LegacyLocalBackupFallbackContext,
     lifecycle: { firstRun?: boolean; beforeActivation?(): Promise<void>; onCommitted?(): void },
     confirmationTitle: string,
-    sourceLifecycle: { onCommitted?(revision: number): void; releaseSource?(): Promise<void> } = {},
+    releaseSource?: () => Promise<void>,
 ): Promise<{ warningCodes: string[], upstreamLosses: { coldMissing: number, invalidInlays: number, pocketInlays: number } } | null> {
     context.setSource({ name: file.name, bytes: file.size })
 
@@ -647,7 +634,6 @@ async function importLegacyBackupFile(
                 checkCancelled()
                 const outcome = await replacePersistentDatabase(...args)
                 committedRevision = outcome.revision
-                sourceLifecycle.onCommitted?.(outcome.revision)
                 lifecycle.onCommitted?.()
                 if (outcome.projection === 'refresh-required') throw new NativeFileJobActivationCommittedError(outcome.revision, new Error('Committed backup projection requires recovery'))
                 for (const entry of deferredEntries) {
@@ -666,10 +652,7 @@ async function importLegacyBackupFile(
                 await attachments.activate(checkCancelled)
                 currentItem = undefined
                 report('activating')
-                try { await sourceLifecycle.releaseSource?.() }
-                catch (error) {
-                    await recordNativeLogError(`Local backup source cleanup failed: ${String(error)}`).catch(() => {})
-                }
+                await releaseSource?.()
                 return outcome
             },
             onPostCommitError: (error) => {
