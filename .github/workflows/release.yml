@@ -140,7 +140,6 @@ jobs:
       - run: pnpm check:test-inventory
       - uses: ./.github/actions/test-references
       - run: pnpm test:node
-      - run: pnpm test --project harness
       - run: pnpm test:protocol
       - name: Preflight app signing inputs
         if: inputs.product == 'app'
@@ -191,7 +190,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
       - run: pnpm check:tests
-      - run: pnpm test --project app --project app-extended
+      - run: pnpm test
       - run: pnpm exec playwright install --with-deps chromium webkit
       - run: pnpm test:browser:agent
       - run: pnpm check:plugin-dts

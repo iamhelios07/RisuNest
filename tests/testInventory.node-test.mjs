@@ -17,7 +17,8 @@ test('classifies ordinary, extended, harness, Node and independent entries', () 
     ['benchmarks/tokenizer/nativeTokenizerBenchmark.test.ts', 'harness'],
     ['src/ts/process/luaWorkerPilotClient.test.ts', 'harness'],
     ['tests/release/contract.node-test.mjs', 'node'],
-    ['benchmarks/sync-server/transfer-comparison.test.mjs', 'node'],
+    ['benchmarks/sync-server/transfer-comparison.test.mjs', 'harness-node'],
+    ['benchmarks/startup/startup.node-test.mjs', 'harness-node'],
     ['crates/sync-wire/tests/golden.test.mjs', 'node'],
     ['server/manager/gui/tests/App.test.ts', 'manager'],
     ['server/endpoint-registry/tests/registry.worker.ts', 'registry'],
@@ -50,9 +51,9 @@ test('accepts the installed CLI JSON shape and rejects unexpected output', () =>
 })
 
 test('Node selection is bounded, deterministic and never selects measurement scripts', () => {
-  assert.deepEqual(selectNodeTests([ordinary, 'tests/externalStorageWasm.mjs', 'tests/b.node-test.mjs', 'tests/a.node-test.mjs']), [
-    'tests/a.node-test.mjs', 'tests/b.node-test.mjs',
-  ])
+  const files = [ordinary, 'tests/externalStorageWasm.mjs', 'tests/b.node-test.mjs', 'tests/a.node-test.mjs', 'benchmarks/startup/startup.node-test.mjs']
+  assert.deepEqual(selectNodeTests(files), ['tests/a.node-test.mjs', 'tests/b.node-test.mjs'])
+  assert.deepEqual(selectNodeTests(files, 'harness-node'), ['benchmarks/startup/startup.node-test.mjs'])
   assert.throws(() => selectNodeTests([ordinary]), /No Node/)
   assert.throws(() => selectNodeTests(['tests/a.node-test.mjs', 'tests/a.node-test.mjs']), /Duplicate/)
 })

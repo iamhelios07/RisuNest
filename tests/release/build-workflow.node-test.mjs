@@ -38,7 +38,7 @@ test("both products and pull requests run shared native signature and catalog te
   assert.match(checkWorkflow, /uses: dtolnay\/rust-toolchain@1\.97\.1/);
   assert.match(commonTests, /pnpm test:protocol/);
   assert.match(commonTests, /pnpm test:node/);
-  assert.match(commonTests, /pnpm test --project harness/);
+  assert.doesNotMatch(commonTests, /pnpm test --project harness/);
   assert(commonTests.indexOf("pnpm test:protocol") < commonTests.indexOf("Preflight app signing inputs"));
   assert.doesNotMatch(commonTests, /pnpm test:release/);
   assert.match(checkWorkflow, /cargo test --manifest-path crates\/release-update\/Cargo\.toml --release --locked/);
@@ -167,7 +167,7 @@ test("each packaging job uploads its own artifacts with a complete publication c
 test("WASM jobs verify native artifacts afterward and Android includes barcode tests", () => {
   assert.match(workflow, /pnpm test:wasm[\s\S]*dbus-run-session -- bash scripts\/linux-native-tests\.sh --lib external_storage/);
   assert.match(workflow, /:app:testLowMemorySafCopy :tauri-plugin-barcode-scanner:testDebugUnitTest/);
-  assert.match(workflow, /pnpm test --project app --project app-extended/);
+  assert.match(workflow, /- run: pnpm test\n/);
 });
 
 test("iOS Rust tests preflight their own keychain identity before running the full inventory", () => {
@@ -574,7 +574,7 @@ test("release tooling inventories all independently installed test owners before
     assert(install >= 0 && install < tooling.indexOf('pnpm check:test-inventory'));
   }
   assert(tooling.indexOf('pnpm check:test-inventory') < tooling.indexOf('pnpm test:node'));
-  for (const command of ['pnpm test:node', 'pnpm test --project harness', 'pnpm test --project app --project app-extended',
+  for (const command of ['pnpm test:node', '- run: pnpm test\n',
     'pnpm test:browser:agent', 'pnpm --dir server/manager/gui --ignore-workspace test',
     'pnpm --dir server/endpoint-registry --ignore-workspace test']) assert(workflow.includes(command), command);
 });

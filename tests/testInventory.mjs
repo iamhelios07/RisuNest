@@ -68,6 +68,7 @@ export async function main() {
     ...vitestInventory(root, 'server/manager/gui', 'manager'),
     ...vitestInventory(root, 'server/endpoint-registry', 'registry'),
     node: selectNodeTests(files),
+    'harness-node': selectNodeTests(files, 'harness-node'),
     browser: browserInventory(root),
   }
   assertInventory(files, inventories)

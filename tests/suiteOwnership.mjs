@@ -33,7 +33,9 @@ export function ownerOf(path) {
   path = normalizePath(path)
   if (!isTestEntry(path)) return null
   if (nodeTestExceptions.includes(path)
-    || (path.endsWith('.node-test.mjs') && ['tests', 'benchmarks'].some(root => under(path, root)))) return 'node'
+    || (path.endsWith('.node-test.mjs') && ['tests', 'benchmarks'].some(root => under(path, root)))) {
+    return under(path, 'benchmarks') ? 'harness-node' : 'node'
+  }
   if (under(path, 'tests/browser')) return 'browser'
   if (under(path, 'tests/native')) return 'native'
   if (under(path, 'server/endpoint-registry/tests') && path.endsWith('.worker.ts')) return 'registry'
@@ -59,8 +61,8 @@ export async function discoverTestEntries(root, relative = '') {
   return files.sort()
 }
 
-export function selectNodeTests(files) {
-  const selected = files.map(normalizePath).filter(path => ownerOf(path) === 'node').sort()
+export function selectNodeTests(files, owner = 'node') {
+  const selected = files.map(normalizePath).filter(path => ownerOf(path) === owner).sort()
   if (selected.length === 0) throw new Error('No Node test entries found')
   if (new Set(selected).size !== selected.length) throw new Error('Duplicate Node test entries')
   return selected
