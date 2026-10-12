@@ -8,7 +8,7 @@
     import {
         networkLog, downloadNetworkLog, logSize, parseSsePreview, prettyLogJson,
         type NetworkLogSettings, type NetworkLogListing, type NetworkLogRecord,
-        type LogBodyPage, type LogSide, type LogObservation,
+        type LogBodyPage, type LogSide, type LogObservation, type LogArrivals,
     } from 'src/ts/network/networkLog'
 
     const t = language.risuNest.networkLog
@@ -24,10 +24,12 @@
     let tab = $state<'headers' | 'request' | 'response' | 'events'>('headers')
     let body = $state<LogBodyPage | null>(null)
     let bodyOffset = $state(0)
-    let pageHistory = $state<{ offset: number; sequence: number; boundary: boolean }[]>([])
+    let pageHistory = $state<{ offset: number; sequence: number; boundary: boolean; arrivalsFrom: number }[]>([])
     let sequence = $state(1)
     let boundary = $state(true)
     let arrivals = $state<(number | null)[]>([])
+    let arrivalsFrom = 0
+    let arrivalsNext = 0
     let observations = $state<LogObservation[]>([])
     let message = $state<LogObservation | null>(null)
     let messageBody = $state<LogBodyPage | null>(null)
@@ -54,9 +56,9 @@
             'network-log-clipboard-too-large': t.clipboardLarge, 'network-log-binary-body': t.clipboardBinary,
             'network-log-expired': t.expired, 'network-log-request-active': t.activeDelete,
             'network-log-invalid-destination': t.destinationInvalid, 'network-log-export-failed': t.exportFailed,
-            'quota': t.quota, 'queue-full': t.queueFull, 'concurrent-limit': t.queueFull,
+            'quota': t.quota, 'queue-full': t.queueFull, 'concurrent-limit': t.concurrentLimit,
             'write-failed': t.writeFailed, 'network-log-storage-failed': t.writeFailed,
-            'decode-failed': t.decodeFailed, 'network-log-readers-busy': t.readersBusy,
+            'binary-skipped': t.binarySkipped, 'network-log-readers-busy': t.readersBusy,
             'body-limit': t.bodyLimited, 'metadata-limit': t.partial, 'stopped': t.stopped,
             'started-late': t.startedLate, 'interrupted': t.interrupted,
         }
@@ -76,7 +78,7 @@
         if (!settings) return
         await action(async () => {
             settings = await networkLog<NetworkLogSettings>({ op: 'configure', settings: { ...settings, ...patch } })
-            await refresh()
+            await refresh(true)
         })
     }
     async function loadList() {
@@ -85,19 +87,21 @@
         if (mounted && version === listVersion) listing = result
     }
     async function loadDetail() {
-        const id = selected, currentTab = tab, currentOffset = bodyOffset, currentBoundary = boundary, version = ++detailVersion
+        const id = selected, currentTab = tab, currentOffset = bodyOffset, currentBoundary = boundary, currentFrom = arrivalsFrom, version = ++detailVersion
         if (!id) return
         const result = await networkLog<NetworkLogRecord>({ op: 'detail', id })
         let page: LogBodyPage | null = null
         let events: LogObservation[] = []
         let times: (number | null)[] = []
+        let next = currentFrom
         if (currentTab !== 'headers') {
             page = currentTab === 'events' && result.streamKind === 'websocket'
                 ? await networkLog<LogBodyPage>({ op: 'events', id, offset: currentOffset })
                 : await networkLog<LogBodyPage>({ op: 'body', id, side: currentTab === 'request' ? 'request' : 'response', offset: currentOffset })
             if (currentTab === 'events' && result.streamKind === 'sse') {
                 const parsed = parseSsePreview(page.text, page.offset, !currentBoundary)
-                times = await networkLog<(number | null)[]>({ op: 'arrivalTimes', id, ends: parsed.map(event => event.endOffset) })
+                const found = await networkLog<LogArrivals>({ op: 'arrivalTimes', id, ends: parsed.map(event => event.endOffset), from: currentFrom })
+                times = found.times; next = found.next
                 const end = parsed.at(-1)?.endOffset
                 if (end !== undefined && end < page.nextOffset) {
                     page = { ...page, text: new TextDecoder().decode(new TextEncoder().encode(page.text).subarray(0, end - page.offset)), nextOffset: end }
@@ -107,12 +111,13 @@
                 events = page.text.trim().split('\n').filter(Boolean).map(line => JSON.parse(line) as LogObservation)
             }
         }
-        if (mounted && selected === id && version === detailVersion) { detail = result; body = page; observations = events; arrivals = times }
+        if (mounted && selected === id && version === detailVersion) { detail = result; body = page; observations = events; arrivals = times; arrivalsNext = next }
     }
-    async function refresh() {
+    // Polling rereads only records that can still change; actions pass `force` after changing one.
+    async function refresh(force = false) {
         if (refreshing) return
         refreshing = true
-        try { await loadList(); if (selected) await loadDetail() }
+        try { await loadList(); if (selected && (force || !detail || detail.state === 'active')) await loadDetail() }
         catch (value) { if (mounted) error = reason(value) }
         finally { refreshing = false }
     }
@@ -122,25 +127,26 @@
     }
     function searchChanged() { clearTimeout(searchTimer); searchTimer = setTimeout(filter, 200) }
     function select(id: string) {
-        selected = id; detail = null; body = null; tab = 'headers'; bodyOffset = 0; pageHistory = []; sequence = 1; boundary = true; arrivals = []; message = null; messageBody = null; error = ''
+        selected = id; detail = null; body = null; tab = 'headers'; bodyOffset = 0; pageHistory = []; sequence = 1; boundary = true; arrivals = []; arrivalsFrom = 0; message = null; messageBody = null; error = ''
         void loadDetail().catch(value => { error = reason(value) })
     }
     function selectTab(value: typeof tab) {
-        tab = value; body = null; bodyOffset = 0; pageHistory = []; sequence = 1; boundary = true; arrivals = []; pretty = false; message = null; messageBody = null
+        tab = value; body = null; bodyOffset = 0; pageHistory = []; sequence = 1; boundary = true; arrivals = []; arrivalsFrom = 0; pretty = false; message = null; messageBody = null
         void loadDetail().catch(value => { error = reason(value) })
     }
     function bodyPage(forward: boolean) {
         if (!body) return
         if (forward) {
-            pageHistory = [...pageHistory, { offset: bodyOffset, sequence, boundary }]
+            pageHistory = [...pageHistory, { offset: bodyOffset, sequence, boundary, arrivalsFrom }]
             if (tab === 'events' && detail?.streamKind === 'sse') {
                 sequence += sseEvents.filter(event => event.complete).length
                 boundary = sseEvents.at(-1)?.complete ?? boundary
+                arrivalsFrom = arrivalsNext
             }
             bodyOffset = body.nextOffset
         } else {
             const previous = pageHistory.at(-1)
-            bodyOffset = previous?.offset ?? 0; sequence = previous?.sequence ?? 1; boundary = previous?.boundary ?? true
+            bodyOffset = previous?.offset ?? 0; sequence = previous?.sequence ?? 1; boundary = previous?.boundary ?? true; arrivalsFrom = previous?.arrivalsFrom ?? 0
             pageHistory = pageHistory.slice(0, -1)
         }
         body = null; arrivals = []; message = null; messageBody = null
@@ -204,7 +210,7 @@
             <button class:scope-active={!retained} onclick={() => { retained = false; filter() }}>{t.recent}</button>
             <button class:scope-active={retained} onclick={() => { retained = true; filter() }}>{t.retained}</button>
         </div>
-        <button class="icon-button" aria-label={t.refresh} onclick={refresh}><RefreshCw size={15}/></button>
+        <button class="icon-button" aria-label={t.refresh} onclick={() => refresh(true)}><RefreshCw size={15}/></button>
     </div>
     <div class="mt-3 flex flex-wrap gap-2">
         <label class="search-box flex min-w-0 flex-1 items-center gap-2 rounded-md border border-darkborderc bg-darkbg px-3"><Search size={15} class="shrink-0 text-textcolor2"/><input class="min-w-0 flex-1 border-0 bg-transparent py-2 text-sm outline-none" aria-label={t.search} placeholder={t.search} bind:value={search} oninput={searchChanged}/></label>
@@ -226,7 +232,7 @@
         <section class="mt-5 min-w-0 overflow-hidden rounded-lg border border-darkborderc bg-darkbg" aria-label={detail.request.url}>
             <div class="border-b border-darkborderc px-4 py-3">
                 <div class="flex flex-wrap items-center justify-between gap-2"><div class="flex items-center gap-2 text-sm"><span class="font-semibold">{detail.request.method}</span><span>{detail.response.status ?? ''}</span></div><div class="flex flex-wrap gap-1">
-                    {#if !detail.retained}<button disabled={busy} onclick={() => action(async () => { await networkLog({ op: 'retain', id: selected }); await refresh() })}><Bookmark size={14}/>{t.keep}</button>{/if}
+                    {#if !detail.retained}<button disabled={busy} onclick={() => action(async () => { await networkLog({ op: 'retain', id: selected }); await refresh(true) })}><Bookmark size={14}/>{t.keep}</button>{/if}
                     <button disabled={busy} onclick={() => action(() => downloadNetworkLog(selected))}><Download size={14}/>{t.download}</button>
                     <button disabled={busy || detail.state === 'active'} aria-label={t.delete} onclick={() => action(async () => { await networkLog({ op: 'delete', id: selected }); selected = ''; detail = null; body = null; await refresh() })}><Trash2 size={14}/></button>
                 </div></div>
@@ -259,7 +265,7 @@
                     <div class="divide-y divide-darkborderc/50">{#each observations as item}<button class="flex w-full justify-between rounded-none px-4 py-2 text-xs" onclick={() => openMessage(item)}><span class="flex gap-3"><span class="text-textcolor2">{item.elapsedMs.toLocaleString()} ms</span><span>{item.side === 'request' ? t.sent : t.received}</span><span class="font-mono">{item.kind}</span></span><span>{logSize(item.length)}</span></button>{:else}<p class="p-4 text-sm text-textcolor2">{t.missingEvents}</p>{/each}</div>
                     {#if message}<div class="border-t border-darkborderc p-4"><h4 class="mb-2 text-xs text-textcolor2">{message.kind} · {logSize(message.length)}</h4><pre class="code">{messageBody?.text ?? t.loading}</pre></div>{/if}
                 {:else}
-                    {#if detail[selectedSide].body.truncated}<p class="px-4 pt-3 text-xs text-draculared">{t.bodyLimited}</p>{/if}
+                    {#if detail[selectedSide].body.truncated && detail.captureError !== 'binary-skipped'}<p class="px-4 pt-3 text-xs text-draculared">{t.bodyLimited}</p>{/if}
                     <pre class="code p-4">{pretty && prettyText !== null ? prettyText : (body.text || t.noBody)}</pre>
                 {/if}
                 {#if bodyOffset > 0 || body.nextOffset < body.total}<div class="flex justify-end gap-2 border-t border-darkborderc px-3 py-2"><button disabled={pageHistory.length === 0} onclick={() => bodyPage(false)}>{t.previous}</button><button disabled={body.nextOffset >= body.total} onclick={() => bodyPage(true)}>{t.next}</button></div>{/if}

@@ -169,8 +169,11 @@ pub(super) fn rebuild(app: &AppHandle) -> Result<(), String> {
     }
     app.state::<crate::NativeStartupState>().finish_cleanup()?;
     crate::native_log::global_state().configure_file_path(&state.paths.data);
-    app.state::<crate::network_log::NetworkLogState>()
-        .reopen(&app.state::<crate::app_paths::AppPaths>())?;
+    // Recording stays unavailable if the recorder cannot reopen; cleanup itself succeeded.
+    let _ = crate::native_log::logged_without_detail(
+        "network_log_initialize",
+        crate::network_log::initialize(&app.state::<crate::app_paths::AppPaths>()),
+    );
     Ok(())
 }
 

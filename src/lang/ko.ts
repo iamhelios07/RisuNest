@@ -2124,7 +2124,6 @@ export const languageKorean = {
             networkLogs: "네트워크 로그",
         },
         networkLog: {
-            decodeFailed: "압축된 본문을 모두 읽지 못했습니다.",
             readersBusy: "로그를 읽고 있습니다. 잠시 후 다시 시도해주세요.",
             "title": "네트워크 로그",
             "recording": "네트워크 기록",
@@ -2176,6 +2175,8 @@ export const languageKorean = {
             "clipboardDenied": "클립보드에 복사하지 못했습니다.",
             "quota": "기록 용량이 가득 찼습니다. 로그를 삭제하거나 용량 한도를 늘려주세요.",
             "queueFull": "일부 요청을 기록하지 못했습니다.",
+            "concurrentLimit": "동시에 진행 중인 요청이 많아 일부 요청을 기록하지 못했습니다.",
+            "binarySkipped": "바이너리 본문은 저장하지 않았습니다.",
             "expired": "임시 기록이 삭제되었습니다.",
             "activeDelete": "진행 중인 요청은 완료 후 삭제할 수 있습니다.",
             "bodyLimited": "본문 일부만 기록되었습니다.",

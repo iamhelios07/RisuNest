@@ -6,7 +6,7 @@ vi.mock('src/lang', () => ({ language: mock.language }))
 vi.mock('src/ts/network/networkLog', async original => ({ ...await original<typeof import('src/ts/network/networkLog')>(), networkLog: mock.call, downloadNetworkLog: mock.download }))
 vi.mock('src/ts/platform', () => ({ isTauriAndroid: false, isTauriIOS: false }))
 import Component from './RisuNestNetworkLog.svelte'
-const settings = { enabled: false, retain: false, hideAuth: true, recentCount: 200, recentMib: 1024, retainedMib: 1024, bodyMib: 512, bufferMib: 32, captureBinary: false }
+const settings = { enabled: false, retain: false, hideAuth: true, recentCount: 200, recentMib: 1024, retainedMib: 1024, bufferMib: 32, captureBinary: false }
 const body = { observedBytes: 5, capturedBytes: 5, binary: false, truncated: false, representation: 'observed' }
 const record = { id: 'synthetic', source: 'native-http', startedAt: 0, elapsedMs: 42, retained: false, headerMasking: true, state: 'complete', captureError: null,
     request: { method: 'POST', url: 'https://synthetic.example/chat', status: null, headers: [{ name: 'authorization', value: 'Bearer sk••••••abcdef' }], body },
@@ -77,7 +77,7 @@ describe('native network settings', () => {
         mock.call.mockImplementation(async request => {
             if (request.op === 'detail') return { ...record, streamKind: 'sse' }
             if (request.op === 'body') return { text: stream.slice(request.offset), offset: request.offset, nextOffset: stream.length, total: stream.length, binary: false }
-            if (request.op === 'arrivalTimes') return request.ends.map((end: number) => end * 10)
+            if (request.op === 'arrivalTimes') return { times: request.ends.map((end: number) => end * 10), next: request.from + 100 }
             return original(request)
         })
         host.querySelector<HTMLButtonElement>('.request-row')!.click(); await settle(); button('이벤트').click(); await settle()
@@ -86,13 +86,53 @@ describe('native network settings', () => {
         expect(events[0].textContent).toContain('#1')
         expect(events[49].textContent).toContain('#50')
         expect(events[0].querySelector('time')?.getAttribute('title')).toBe(new Date(130).toISOString())
+        const arrivalCalls = () => mock.call.mock.calls.map(([request]) => request).filter(request => request.op === 'arrivalTimes')
+        expect(arrivalCalls().at(-1).from).toBe(0)
         button('다음').click(); await settle()
         events = [...host.querySelectorAll('.event-row > summary')]
         expect(events).toHaveLength(1)
         expect(events[0].textContent).toContain('#51')
         expect(events[0].textContent).not.toContain('일부 표시')
+        expect(arrivalCalls().at(-1).from).toBe(100)
         button('이전').click(); await settle()
         expect(host.querySelector('.event-row > summary')?.textContent).toContain('#1')
+        expect(arrivalCalls().at(-1).from).toBe(0)
+    })
+    it('shows an omitted binary body as its own reason instead of a partial capture', async () => {
+        const original = mock.call.getMockImplementation()!
+        const skipped = { ...record, captureError: 'binary-skipped', response: { ...record.response, body: { ...body, capturedBytes: 0, binary: true, truncated: true } } }
+        mock.call.mockImplementation(async request => {
+            if (request.op === 'list') return { items: [{ ...skipped, ...skipped.request, status: 200, capturedBytes: 5, incomplete: false }], hasMore: false, recentBytes: 5, retainedBytes: 0, warning: null }
+            if (request.op === 'detail') return skipped
+            if (request.op === 'body') return { text: '', offset: 0, nextOffset: 0, total: 0, binary: true }
+            return original(request)
+        })
+        host.querySelector<HTMLButtonElement>('button[aria-label="새로고침"]')!.click(); await settle()
+        expect(host.querySelector('.request-row')?.textContent).not.toContain('일부 기록')
+        host.querySelector<HTMLButtonElement>('.request-row')!.click(); await settle()
+        expect(host.textContent).toContain('바이너리 본문은 저장하지 않았습니다.')
+        button('응답 본문').click(); await settle()
+        expect(host.textContent).not.toContain('본문 일부만 기록되었습니다.')
+        expect(host.querySelector('pre')?.textContent).toBe('기록된 본문이 없습니다.')
+    })
+    it('keeps polling the list but rereads only a request that is still active', async () => {
+        await unmount(component); host.remove()
+        vi.useFakeTimers()
+        try {
+            host = document.createElement('div'); document.body.append(host); component = mount(Component, { target: host }); await settle()
+            host.querySelector<HTMLButtonElement>('.request-row')!.click(); await settle()
+            const count = (op: string) => mock.call.mock.calls.filter(([request]) => request.op === op).length
+            const lists = count('list'), details = count('detail')
+            await vi.advanceTimersByTimeAsync(3100); await settle()
+            expect(count('list')).toBeGreaterThan(lists)
+            expect(count('detail')).toBe(details)
+            const original = mock.call.getMockImplementation()!
+            mock.call.mockImplementation(async request => request.op === 'detail' ? { ...record, state: 'active' } : original(request))
+            host.querySelector<HTMLButtonElement>('button[aria-label="새로고침"]')!.click(); await settle()
+            const active = count('detail')
+            await vi.advanceTimersByTimeAsync(3100); await settle()
+            expect(count('detail')).toBeGreaterThan(active)
+        } finally { vi.useRealTimers() }
     })
     it('renders the selected WebSocket message after asynchronous loading', async () => {
         const original = mock.call.getMockImplementation()!

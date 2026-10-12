@@ -14,8 +14,6 @@ pub struct Settings {
     pub recent_count: u32,
     pub recent_mib: u64,
     pub retained_mib: u64,
-    // Preserve the old setting for compatible readers; capture uses BODY_BYTES.
-    pub body_mib: u64,
     #[serde(default = "default_buffer_mib")]
     pub buffer_mib: u64,
     #[serde(default)]
@@ -33,7 +31,6 @@ impl Default for Settings {
             recent_count: 200,
             recent_mib: 1024,
             retained_mib: 1024,
-            body_mib: 512,
             buffer_mib: default_buffer_mib(),
             capture_binary: false,
         }
@@ -45,7 +42,6 @@ impl Settings {
         if ![100, 200, 500, 1000].contains(&self.recent_count)
             || !budgets.contains(&self.recent_mib)
             || !budgets.contains(&self.retained_mib)
-            || ![256, 512, 1024].contains(&self.body_mib)
             || ![4, 8, 16, 32, 64, 128].contains(&self.buffer_mib)
         {
             return Err("invalid-network-log-settings".into());
@@ -173,9 +169,12 @@ impl From<&Record> for ListItem {
             status: r.response.status,
             state: r.state.clone(),
             captured_bytes: r.request.body.captured_bytes + r.response.body.captured_bytes,
-            incomplete: r.capture_error.is_some()
-                || r.request.body.truncated
-                || r.response.body.truncated,
+            // Binary bodies left out by the binary-capture setting are not a recording loss.
+            incomplete: match r.capture_error.as_deref() {
+                Some("binary-skipped") => false,
+                Some(_) => true,
+                None => r.request.body.truncated || r.response.body.truncated,
+            },
             stream_kind: r.stream_kind.clone(),
         }
     }
@@ -205,6 +204,12 @@ pub struct BodyPage {
     pub next_offset: u64,
     pub total: u64,
     pub binary: bool,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Arrivals {
+    pub times: Vec<Option<u64>>,
+    pub next: u64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

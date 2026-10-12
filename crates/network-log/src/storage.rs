@@ -57,7 +57,6 @@ pub(crate) struct Store {
     overhead: [u64; 2],
     writers: HashMap<(String, usize), File>,
     started: HashMap<String, std::time::Instant>,
-    decoders: HashMap<(String, usize), crate::decoding::Decoder>,
     readers: HashMap<String, Weak<()>>,
 }
 pub struct Snapshot {
@@ -100,7 +99,6 @@ impl Store {
             overhead: [0, 0],
             writers: HashMap::new(),
             started: HashMap::new(),
-            decoders: HashMap::new(),
             readers: HashMap::new(),
         };
         // Only promotion manifests can recover a move interrupted before its index commit.
@@ -301,36 +299,7 @@ impl Store {
             None,
         )
     }
-    pub fn prepare_decoding(&mut self, record: &mut Record, side: Side, limit: u64) {
-        let message = match side {
-            Side::Request => &record.request,
-            Side::Response => &record.response,
-        };
-        if message.body.binary {
-            return;
-        }
-        let encoding = message
-            .headers
-            .iter()
-            .find(|h| h.name.eq_ignore_ascii_case("content-encoding"))
-            .map(|h| h.value.clone());
-        if let Some(encoding) = encoding {
-            if let Some(decoder) = crate::decoding::Decoder::new(&encoding, limit) {
-                record.body_mut(side).representation =
-                    format!("decoded-{}", encoding.to_ascii_lowercase());
-                self.decoders
-                    .insert((record.id.clone(), side.index()), decoder);
-            }
-        }
-    }
-    pub fn decoding_complete(&self, id: &str) -> bool {
-        self.decoders
-            .iter()
-            .filter(|((key, _), _)| key == id)
-            .all(|(_, d)| d.complete || d.limited)
-    }
     pub fn finish(&mut self, id: &str) {
-        self.decoders.retain(|(key, _), _| key != id);
         self.writers.retain(|(key, _), _| key != id);
         self.started.remove(id);
     }
@@ -360,32 +329,6 @@ impl Store {
         Ok(())
     }
     pub fn append(
-        &mut self,
-        record: &mut Record,
-        side: Side,
-        bytes: &[u8],
-        elapsed: u64,
-        kind: Option<&str>,
-        settings: &Settings,
-    ) -> Result<(), String> {
-        let key = (record.id.clone(), side.index());
-        if let Some(mut decoder) = self.decoders.remove(&key) {
-            let limit = decoder.limit;
-            let result = decoder.feed(bytes, |chunk| {
-                record.body_mut(side).observed_bytes += chunk.len() as u64;
-                let remaining = limit.saturating_sub(record.body(side).captured_bytes) as usize;
-                let length = remaining.min(chunk.len());
-                if length > 0 {
-                    self.append_raw(record, side, &chunk[..length], elapsed, kind, settings)?;
-                }
-                Ok(length == chunk.len())
-            });
-            self.decoders.insert(key, decoder);
-            return result;
-        }
-        self.append_raw(record, side, bytes, elapsed, kind, settings)
-    }
-    fn append_raw(
         &mut self,
         record: &mut Record,
         side: Side,
@@ -644,89 +587,57 @@ impl Store {
     }
 }
 impl Snapshot {
-    pub fn arrival_times(&mut self, ends: &[u64]) -> Result<Vec<Option<u64>>, String> {
-        if ends.len() > 50 || ends.windows(2).any(|pair| pair[0] > pair[1]) {
+    /// Maps SSE event end offsets to the observed chunk that delivered them. Reading starts at
+    /// `from`, the `next` position returned for the preceding page, so each page reads forward
+    /// over its own chunks only.
+    pub fn arrival_times(&mut self, ends: &[u64], from: u64) -> Result<Arrivals, String> {
+        let total = self.record.event_bytes;
+        if ends.len() > 50 || ends.windows(2).any(|pair| pair[0] > pair[1]) || from > total {
             return Err("invalid-network-log-query".into());
         }
+        let mut arrivals = Arrivals {
+            times: vec![None; ends.len()],
+            next: from,
+        };
         if ends.is_empty() || self.record.stream_kind.as_deref() != Some("sse") {
-            return Ok(vec![None; ends.len()]);
+            return Ok(arrivals);
         }
-        let mut reader =
-            BufReader::with_capacity(4096, (&mut self.events).take(self.record.event_bytes));
-        // Locate the first response chunk by its body offset, then read the bounded page in order.
-        let mut low = 0;
-        let mut high = self.record.event_bytes;
-        let first = ends[0];
-        while low < high {
-            let mid = low + (high - low) / 2;
-            reader
-                .get_mut()
-                .get_mut()
-                .seek(SeekFrom::Start(mid))
-                .map_err(err)?;
-            reader = BufReader::with_capacity(
-                4096,
-                reader
-                    .into_inner()
-                    .into_inner()
-                    .take(self.record.event_bytes - mid),
-            );
-            if mid > 0 {
-                let mut skipped = Vec::new();
-                reader
-                    .by_ref()
-                    .take(1024)
-                    .read_until(b'\n', &mut skipped)
-                    .map_err(err)?;
+        if from > 0 {
+            let mut previous = [0];
+            self.events.seek(SeekFrom::Start(from - 1)).map_err(err)?;
+            self.events.read_exact(&mut previous).map_err(err)?;
+            if previous[0] != b'\n' {
+                return Err("invalid-network-log-query".into());
             }
-            let position =
-                self.record.event_bytes - reader.get_ref().limit() - reader.buffer().len() as u64;
-            let mut line = String::new();
-            reader
-                .by_ref()
-                .take(1024)
-                .read_line(&mut line)
-                .map_err(err)?;
-            let observation: Option<Observation> = if line.is_empty() {
-                None
-            } else {
-                Some(serde_json::from_str(&line).map_err(err)?)
-            };
-            if observation.is_some_and(|o| o.offset + o.length < first) {
-                low = position + line.len() as u64;
-            } else {
-                high = mid;
-            }
+        } else {
+            self.events.seek(SeekFrom::Start(0)).map_err(err)?;
         }
-        let input = reader.into_inner().into_inner();
-        input.seek(SeekFrom::Start(low)).map_err(err)?;
-        let mut reader = BufReader::with_capacity(4096, input.take(self.record.event_bytes - low));
-        let mut result = vec![None; ends.len()];
-        let mut index = 0;
-        let mut line = String::new();
+        let mut reader = BufReader::with_capacity(4096, (&mut self.events).take(total - from));
+        let (mut index, mut position, mut line) = (0, from, String::new());
         while index < ends.len() {
             line.clear();
-            if reader
+            let read = reader
                 .by_ref()
                 .take(1024)
                 .read_line(&mut line)
-                .map_err(err)?
-                == 0
-            {
+                .map_err(err)?;
+            if read == 0 {
                 break;
             }
             let observation: Observation = serde_json::from_str(&line).map_err(err)?;
-            if !matches!(observation.side, Side::Response) {
-                continue;
-            }
-            while index < ends.len() && ends[index] <= observation.offset + observation.length {
-                if ends[index] > observation.offset {
-                    result[index] = Some(observation.elapsed_ms);
+            if matches!(observation.side, Side::Response) {
+                while index < ends.len() && ends[index] <= observation.offset + observation.length {
+                    if ends[index] > observation.offset {
+                        arrivals.times[index] = Some(observation.elapsed_ms);
+                        // The next page's first event can end inside this same chunk.
+                        arrivals.next = position;
+                    }
+                    index += 1;
                 }
-                index += 1;
             }
+            position += read as u64;
         }
-        Ok(result)
+        Ok(arrivals)
     }
 
     pub fn body_page(&mut self, side: Side, offset: u64) -> Result<BodyPage, String> {

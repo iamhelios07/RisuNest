@@ -2309,7 +2309,6 @@ export const languageEnglish = {
             networkLogs: "Network logs",
         },
         networkLog: {
-            decodeFailed: "The compressed body could not be fully decoded.",
             readersBusy: "A log is being read. Please try again shortly.",
             "title": "Network logs",
             "recording": "Record network requests",
@@ -2361,6 +2360,8 @@ export const languageEnglish = {
             "clipboardDenied": "Could not copy to the clipboard.",
             "quota": "Log storage is full. Delete logs or increase the storage limit.",
             "queueFull": "Some requests could not be recorded.",
+            "concurrentLimit": "Some requests were not recorded because too many were in progress.",
+            "binarySkipped": "Binary bodies were not saved.",
             "expired": "The temporary record has been deleted.",
             "activeDelete": "Delete this request after it finishes.",
             "bodyLimited": "Only part of the body was recorded.",

@@ -571,7 +571,10 @@ fn builder_with_main_window(
                 app.manage(app_paths::AppPaths::desktop(app.config())?.prepared()?);
             }
             let app_data_dir = app_paths::data_root(app)?;
-            app.manage(network_log::initialize(&app.state::<app_paths::AppPaths>()));
+            let _ = native_log::logged_without_detail(
+                "network_log_initialize",
+                network_log::initialize(&app.state::<app_paths::AppPaths>()),
+            );
             setup_native_log_state.configure_file_path(&app_data_dir);
             app.manage(setup_native_log_state.clone());
             app.manage(app_cleanup::CleanupState::initialize(app.handle())?);

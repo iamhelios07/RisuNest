@@ -4487,7 +4487,6 @@ name = "risunest-network-log"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "flate2",
  "futures-util",
  "http",
  "http-body",

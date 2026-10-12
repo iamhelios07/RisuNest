@@ -8,7 +8,6 @@ export interface NetworkLogSettings {
     recentCount: number
     recentMib: number
     retainedMib: number
-    bodyMib: number
     bufferMib: number
     captureBinary: boolean
 }
@@ -28,6 +27,8 @@ export interface NetworkLogItem {
 export interface NetworkLogListing { items: NetworkLogItem[]; hasMore: boolean; recentBytes: number; retainedBytes: number; warning: string | null }
 export interface LogBodyPage { text: string; offset: number; nextOffset: number; total: number; binary: boolean }
 export interface LogObservation { elapsedMs: number; side: LogSide; offset: number; length: number; kind: string }
+/** `next` is the position the following SSE page passes back as `from`. */
+export interface LogArrivals { times: (number | null)[]; next: number }
 export type LogOperation =
     | { op: 'settings' }
     | { op: 'configure'; settings: NetworkLogSettings }
@@ -35,7 +36,7 @@ export type LogOperation =
     | { op: 'detail' | 'retain' | 'delete'; id: string }
     | { op: 'body'; id: string; side: LogSide; offset: number; length?: number; hex?: boolean }
     | { op: 'events'; id: string; offset: number }
-    | { op: 'arrivalTimes'; id: string; ends: number[] }
+    | { op: 'arrivalTimes'; id: string; ends: number[]; from: number }
     | { op: 'copy'; id: string; side: LogSide }
     | { op: 'export'; id: string; destination?: string }
 export function networkLog<T>(request: LogOperation): Promise<T> { return invoke<T>('network_log_command', { request }) }

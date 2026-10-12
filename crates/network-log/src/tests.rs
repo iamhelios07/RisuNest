@@ -295,6 +295,8 @@ fn disabled_binary_capture_keeps_metadata_and_text_but_no_binary_payload() {
     assert_eq!(record.response.status, Some(200));
     assert_eq!(record.response.body.observed_bytes, 100_000);
     assert!(record.response.body.truncated);
+    assert_eq!(record.capture_error.as_deref(), Some("binary-skipped"));
+    assert!(!f.recorder.list(Query::default()).unwrap().items[0].incomplete);
     assert_eq!(
         f.snapshot(&c).body_page(Side::Request, 0).unwrap().text,
         "still-recorded"
@@ -416,37 +418,49 @@ fn empty_websocket_control_messages_are_observable_and_event_pages_are_bounded()
 }
 
 #[test]
-fn gzip_decodes_in_the_writer_and_a_broken_tail_is_explicit() {
-    use std::io::Write;
-    let f = Fixture::new();
-    f.enable(false, true);
-    let raw = "data: {\"delta\":\"가나다\"}\n\n".repeat(10000);
-    let mut zip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    zip.write_all(raw.as_bytes()).unwrap();
-    let zip = zip.finish().unwrap();
-    for broken in [false, true] {
-        let c = f.begin();
-        let mut headers = text_headers();
-        headers.insert("content-encoding", "gzip".parse().unwrap());
-        c.response(200, "https://synthetic.example", &headers);
-        let source = if broken {
-            &zip[..zip.len() - 8]
-        } else {
-            zip.as_slice()
-        };
-        for chunk in source.chunks(7) {
-            c.append(Side::Response, chunk);
-        }
+fn content_coding_left_by_the_transport_is_labeled_and_follows_binary_capture() {
+    let zip = [31, 139, 8, 0, 1, 2, 3, 4];
+    for capture_binary in [false, true] {
+        let f = Fixture::new();
+        f.recorder.configure(Settings { enabled: true, capture_binary, ..Settings::default() }).unwrap();
+        let mut request = http::HeaderMap::new();
+        request.insert("content-type", "application/json".parse().unwrap());
+        request.insert("content-encoding", " BR ".parse().unwrap());
+        let c = f.recorder.begin("synthetic", "POST", "https://synthetic.example", &request).guard();
+        c.append(Side::Request, b"compressed-request");
+        let mut response = text_headers();
+        response.insert("content-encoding", "gzip".parse().unwrap());
+        c.response(200, "https://synthetic.example", &response);
+        c.append(Side::Response, &zip);
         c.finish("complete");
         let record = f.detail(&c);
-        assert_eq!(record.response.body.representation, "decoded-gzip");
-        assert_eq!(record.response.body.observed_bytes, raw.len() as u64);
-        assert_eq!(f.snapshot(&c).copy_body(Side::Response).unwrap(), raw);
-        assert_eq!(
-            record.capture_error.as_deref(),
-            if broken { Some("decode-failed") } else { None }
-        );
+        assert_eq!(record.request.body.representation, "encoded-br");
+        assert_eq!(record.response.body.representation, "encoded-gzip");
+        assert!(record.request.body.binary && record.response.body.binary);
+        assert_eq!(record.response.status, Some(200));
+        assert_eq!(record.response.body.observed_bytes, zip.len() as u64);
+        let item = f.recorder.list(Query::default()).unwrap().items.remove(0);
+        if capture_binary {
+            assert!(record.capture_error.is_none());
+            assert!(!item.incomplete);
+            assert_eq!(f.snapshot(&c).body_page(Side::Response, 0).unwrap().text, "1f8b080001020304");
+        } else {
+            assert_eq!(record.capture_error.as_deref(), Some("binary-skipped"));
+            assert_eq!(record.response.body.captured_bytes, 0);
+            assert!(record.response.body.truncated);
+            assert!(!item.incomplete);
+        }
     }
+    let f = Fixture::new();
+    f.enable(false, false);
+    let mut identity = text_headers();
+    identity.insert("content-encoding", "identity".parse().unwrap());
+    let c = f.recorder.begin("synthetic", "POST", "https://synthetic.example", &identity).guard();
+    c.append(Side::Request, b"data: plain\n\n");
+    c.finish("complete");
+    let record = f.detail(&c);
+    assert_eq!(record.request.body.representation, "observed");
+    assert_eq!(f.snapshot(&c).copy_body(Side::Request).unwrap(), "data: plain\n\n");
 }
 #[test]
 fn websocket_binary_export_is_lossless_and_text_messages_remain_readable() {
@@ -565,7 +579,7 @@ fn quota_stops_capture_and_preserves_existing_retained_requests() {
 
 #[cfg(feature = "reqwest")]
 #[tokio::test(flavor = "current_thread")]
-async fn real_http_keeps_request_body_redirect_url_decoding_and_cancellation() {
+async fn real_http_keeps_request_body_redirect_url_encoding_and_cancellation() {
     use crate::reqwest::RequestBuilderExt;
     use std::io::Write;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -640,6 +654,12 @@ async fn real_http_keeps_request_body_redirect_url_decoding_and_cancellation() {
     assert_eq!(rows.items.len(), 3);
     for row in rows.items {
         let record = f.recorder.record(row.id.clone()).unwrap();
+        if record.source == "adapter-raw-gzip" {
+            assert_eq!(record.response.body.representation, "encoded-gzip");
+            assert!(record.response.body.binary);
+            assert_eq!(record.capture_error.as_deref(), Some("binary-skipped"));
+            continue;
+        }
         let text = f
             .recorder
             .snapshot(row.id)
@@ -900,29 +920,6 @@ fn sustained_sse_preserves_small_and_large_chunks_without_queue_overflow() {
 }
 
 #[test]
-fn request_decode_failure_does_not_stop_response_capture() {
-    let f = Fixture::new();
-    f.enable(false, false);
-    let mut headers = text_headers();
-    headers.insert("content-encoding", "gzip".parse().unwrap());
-    let c = f
-        .recorder
-        .begin("test", "POST", "https://synthetic.example", &headers)
-        .guard();
-    c.append(Side::Request, b"invalid-gzip");
-    f.detail(&c);
-    c.response(400, "https://synthetic.example", &text_headers());
-    c.append(Side::Response, b"data: error preserved\n\n");
-    c.finish("complete");
-    assert_eq!(f.detail(&c).response.status, Some(400));
-    assert_eq!(f.detail(&c).capture_error.as_deref(), Some("decode-failed"));
-    assert_eq!(
-        f.snapshot(&c).copy_body(Side::Response).unwrap(),
-        "data: error preserved\n\n"
-    );
-}
-
-#[test]
 fn sse_arrival_lookup_uses_the_chunk_containing_each_event_end() {
     use std::io::Read;
     let f = Fixture::new();
@@ -939,40 +936,43 @@ fn sse_arrival_lookup_uses_the_chunk_containing_each_event_end() {
         .take(snapshot.record.event_bytes)
         .read_to_string(&mut text)
         .unwrap();
-    let chunks: Vec<Observation> = text
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
-    assert_eq!(chunks.len(), 200);
-    for index in [0, 1, 49, 99, 150, 198, 199] {
-        let chunk = &chunks[index];
-        let ends = [chunk.offset + 1, chunk.offset + chunk.length];
-        assert_eq!(
-            snapshot.arrival_times(&ends).unwrap(),
-            vec![Some(chunk.elapsed_ms); 2]
-        );
+    let mut lines = Vec::new();
+    let mut position = 0;
+    for line in text.split_inclusive('\n') {
+        lines.push((position, serde_json::from_str::<Observation>(line).unwrap()));
+        position += line.len() as u64;
     }
-    let ends = chunks
+    assert_eq!(lines.len(), 200);
+    // Two events end in every chunk, so each 50-event page ends inside a chunk that the
+    // following page continues from.
+    let ends = lines
         .iter()
-        .skip(120)
-        .take(50)
-        .map(|c| c.offset + c.length)
+        .flat_map(|(_, c)| [c.offset + 1, c.offset + c.length])
         .collect::<Vec<_>>();
-    let expected = chunks
-        .iter()
-        .skip(120)
-        .take(50)
-        .map(|c| Some(c.elapsed_ms))
-        .collect::<Vec<_>>();
-    assert_eq!(snapshot.arrival_times(&ends).unwrap(), expected);
+    let mut from = 0;
+    for (page, ends) in ends.chunks(49).enumerate() {
+        let arrivals = snapshot.arrival_times(ends, from).unwrap();
+        let first = page * 49;
+        let expected = (first..first + ends.len())
+            .map(|event| Some(lines[event / 2].1.elapsed_ms))
+            .collect::<Vec<_>>();
+        assert_eq!(arrivals.times, expected);
+        assert_eq!(arrivals.next, lines[(first + ends.len() - 1) / 2].0);
+        from = arrivals.next;
+    }
     assert_eq!(
         snapshot
-            .arrival_times(&[snapshot.record.response.body.captured_bytes + 1])
+            .arrival_times(&[snapshot.record.response.body.captured_bytes + 1], from)
             .unwrap(),
-        vec![None]
+        Arrivals { times: vec![None], next: from }
     );
-    assert!(snapshot.arrival_times(&[10, 1]).is_err());
-    assert!(snapshot.arrival_times(&[1; 51]).is_err());
+    // A position past the chunk that holds an end cannot report its time.
+    let skipped = snapshot.arrival_times(&[lines[0].1.offset + 1], lines[1].0).unwrap();
+    assert_eq!(skipped.times, vec![None]);
+    assert!(snapshot.arrival_times(&[1], lines[1].0 - 1).is_err());
+    assert!(snapshot.arrival_times(&[1], snapshot.record.event_bytes + 1).is_err());
+    assert!(snapshot.arrival_times(&[10, 1], 0).is_err());
+    assert!(snapshot.arrival_times(&[1; 51], 0).is_err());
 }
 
 #[test]
@@ -1036,62 +1036,45 @@ fn default_buffer_records_a_ten_mib_request_burst_while_writer_is_paused() {
 
 
 #[test]
-fn buffer_settings_preserve_legacy_values_and_survive_restart() {
-    #[derive(serde::Serialize, serde::Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct LegacySettings {
-        enabled: bool,
-        retain: bool,
-        hide_auth: bool,
-        recent_count: u32,
-        recent_mib: u64,
-        retained_mib: u64,
-        body_mib: u64,
+fn buffer_settings_default_when_missing_and_survive_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let kept = root.path().join("kept");
+    fs::create_dir_all(&kept).unwrap();
+    let saved = serde_json::json!({
+        "enabled": true, "retain": true, "hideAuth": false,
+        "recentCount": 500, "recentMib": 256, "retainedMib": 128, "bodyMib": 16,
+    });
+    fs::write(kept.join("settings.json"), serde_json::to_vec(&saved).unwrap()).unwrap();
+    let recorder = Recorder::open(root.path().join("recent"), kept.clone()).unwrap();
+    let f = Fixture { root, recorder };
+    let mut settings = f.recorder.settings();
+    assert_eq!(settings.buffer_mib, 32);
+    assert!(!settings.capture_binary);
+    assert_eq!((settings.recent_count, settings.recent_mib, settings.retained_mib), (500, 256, 128));
+    settings.capture_binary = true;
+    for budget in [4, 8, 16, 32, 64, 128] {
+        settings.buffer_mib = budget;
+        f.recorder.configure(settings.clone()).unwrap();
+        let saved = fs::read(kept.join("settings.json")).unwrap();
+        assert_eq!(serde_json::from_slice::<Settings>(&saved).unwrap().buffer_mib, budget);
     }
-    for body_mib in [256, 512, 1024] {
-        let root = tempfile::tempdir().unwrap();
-        let kept = root.path().join("kept");
-        fs::create_dir_all(&kept).unwrap();
-        let legacy = serde_json::json!({
-            "enabled": true, "retain": true, "hideAuth": false,
-            "recentCount": 500, "recentMib": 256, "retainedMib": 128,
-            "bodyMib": body_mib,
-        });
-        fs::write(kept.join("settings.json"), serde_json::to_vec(&legacy).unwrap()).unwrap();
-        let recorder = Recorder::open(root.path().join("recent"), kept.clone()).unwrap();
-        let f = Fixture { root, recorder };
-        let mut settings = f.recorder.settings();
-        assert_eq!(settings.buffer_mib, 32);
-        assert!(!settings.capture_binary);
-        settings.capture_binary = true;
-        assert_eq!(settings.body_mib, body_mib);
-        for budget in [4, 8, 16, 32, 64, 128] {
-            settings.buffer_mib = budget;
-            f.recorder.configure(settings.clone()).unwrap();
-            let saved = fs::read(kept.join("settings.json")).unwrap();
-            let old_reader: LegacySettings = serde_json::from_slice(&saved).unwrap();
-            assert_eq!(serde_json::to_value(old_reader).unwrap(), legacy);
-            assert_eq!(serde_json::from_slice::<Settings>(&saved).unwrap().buffer_mib, budget);
-        }
-        for invalid in [0, 3, 5, 129, u64::MAX] {
-            settings.buffer_mib = invalid;
-            assert_eq!(f.recorder.configure(settings.clone()).unwrap_err(), "invalid-network-log-settings");
-            assert_eq!(f.recorder.settings().buffer_mib, 128);
-        }
-        fs::create_dir(kept.join("settings.tmp")).unwrap();
-        settings.buffer_mib = 4;
-        assert!(f.recorder.configure(settings).is_err());
+    for invalid in [0, 3, 5, 129, u64::MAX] {
+        settings.buffer_mib = invalid;
+        assert_eq!(f.recorder.configure(settings.clone()).unwrap_err(), "invalid-network-log-settings");
         assert_eq!(f.recorder.settings().buffer_mib, 128);
-        assert_eq!(f.recorder.0.queue_limit.load(Ordering::Relaxed), 128 * MIB as usize);
-        f.recorder.shutdown();
-        let reopened = Recorder::open(f.root.path().join("recent"), kept).unwrap();
-        assert_eq!(reopened.settings().buffer_mib, 128);
-        assert!(reopened.settings().capture_binary);
-        assert_eq!(reopened.0.queue_limit.load(Ordering::Relaxed), 128 * MIB as usize);
-        let value = serde_json::to_value(reopened.settings()).unwrap();
-        assert_eq!(serde_json::to_value(serde_json::from_value::<LegacySettings>(value).unwrap()).unwrap(), legacy);
-        reopened.shutdown();
     }
+    fs::create_dir(kept.join("settings.tmp")).unwrap();
+    settings.buffer_mib = 4;
+    assert!(f.recorder.configure(settings).is_err());
+    assert_eq!(f.recorder.settings().buffer_mib, 128);
+    assert_eq!(f.recorder.0.queue_limit.load(Ordering::Relaxed), 128 * MIB as usize);
+    f.recorder.shutdown();
+    let reopened = Recorder::open(f.root.path().join("recent"), kept).unwrap();
+    assert_eq!(reopened.settings().buffer_mib, 128);
+    assert!(reopened.settings().capture_binary);
+    assert!(!reopened.settings().hide_auth);
+    assert_eq!(reopened.0.queue_limit.load(Ordering::Relaxed), 128 * MIB as usize);
+    reopened.shutdown();
 }
 
 #[test]
@@ -1175,27 +1158,25 @@ fn drained_sse_can_exceed_the_shared_buffer_in_total() {
 }
 
 #[test]
-fn fixed_body_limit_applies_at_512_mib_to_each_side_regardless_of_legacy_setting() {
-    for legacy in [256, 1024] {
-        let f = Fixture::new();
-        f.recorder.configure(Settings { enabled: true, body_mib: legacy, ..Settings::default() }).unwrap();
-        let c = f.begin();
-        let signal = c.0.0.as_ref().unwrap();
-        // Seed the admitted prefix to exercise both exact boundaries without allocating 1 GiB.
-        for side in [Side::Request, Side::Response] {
-            signal.admitted[side.index()].store(512 * MIB - 16, Ordering::Relaxed);
-            signal.observed[side.index()].store(512 * MIB - 16, Ordering::Relaxed);
-            c.append(side, &[b'z'; 32]);
-        }
-        c.finish("complete");
-        let record = f.detail(&c);
-        assert_eq!(record.capture_error.as_deref(), Some("body-limit"));
-        for side in [Side::Request, Side::Response] {
-            assert_eq!(record.body(side).observed_bytes, 512 * MIB + 16);
-            assert_eq!(record.body(side).captured_bytes, 16);
-            assert!(record.body(side).truncated);
-            assert_eq!(f.snapshot(&c).copy_body(side).unwrap(), "z".repeat(16));
-        }
+fn fixed_body_limit_applies_at_512_mib_to_each_side() {
+    let f = Fixture::new();
+    f.enable(false, false);
+    let c = f.begin();
+    let signal = c.0.0.as_ref().unwrap();
+    // Seed the admitted prefix to exercise both exact boundaries without allocating 1 GiB.
+    for side in [Side::Request, Side::Response] {
+        signal.admitted[side.index()].store(512 * MIB - 16, Ordering::Relaxed);
+        signal.observed[side.index()].store(512 * MIB - 16, Ordering::Relaxed);
+        c.append(side, &[b'z'; 32]);
+    }
+    c.finish("complete");
+    let record = f.detail(&c);
+    assert_eq!(record.capture_error.as_deref(), Some("body-limit"));
+    for side in [Side::Request, Side::Response] {
+        assert_eq!(record.body(side).observed_bytes, 512 * MIB + 16);
+        assert_eq!(record.body(side).captured_bytes, 16);
+        assert!(record.body(side).truncated);
+        assert_eq!(f.snapshot(&c).copy_body(side).unwrap(), "z".repeat(16));
     }
 }
 
@@ -1273,7 +1254,7 @@ fn disabled_websocket_binary_payloads_keep_message_metadata_and_readable_text() 
     assert_eq!(record.response.body.captured_bytes, 14);
     assert!(!record.response.body.binary);
     assert!(record.response.body.truncated);
-    assert!(record.capture_error.is_none());
+    assert_eq!(record.capture_error.as_deref(), Some("binary-skipped"));
     let mut json = Vec::new();
     f.snapshot(&c).export_json(&mut json).unwrap();
     let json: serde_json::Value = serde_json::from_slice(&json).unwrap();
@@ -1381,4 +1362,44 @@ fn enabled_binary_capture_stays_best_effort_when_the_shared_queue_is_full() {
     assert_eq!(record.response.body.captured_bytes, 100_000);
     assert_eq!(record.response.status, Some(200));
     assert_eq!(record.capture_error.as_deref(), Some("queue-full"));
+}
+
+#[test]
+fn a_clean_completion_clears_the_warning_unless_another_capture_is_still_failing() {
+    let f = Fixture::new();
+    f.recorder.configure(Settings { enabled: true, buffer_mib: 4, ..Settings::default() }).unwrap();
+    let overflowed = f.begin();
+    f.detail(&overflowed);
+    let release = f.pause_writer();
+    overflowed.append(Side::Request, &vec![b'x'; 6 * MIB as usize]);
+    release.send(()).unwrap();
+    assert_eq!(f.recorder.list(Query::default()).unwrap().warning.as_deref(), Some("queue-full"));
+    let clean = f.begin();
+    clean.append(Side::Request, b"ok");
+    clean.finish("complete");
+    f.detail(&clean);
+    assert_eq!(f.recorder.list(Query::default()).unwrap().warning.as_deref(), Some("queue-full"));
+    overflowed.finish("complete");
+    f.detail(&overflowed);
+    let again = f.begin();
+    again.finish("complete");
+    f.detail(&again);
+    assert_eq!(f.recorder.list(Query::default()).unwrap().warning, None);
+}
+
+#[test]
+fn oversized_metadata_is_reported_without_stopping_capture() {
+    let f = Fixture::new();
+    f.enable(false, false);
+    let url = format!("https://synthetic.example/{}", "x".repeat(9000));
+    let c = f.recorder.begin("synthetic", "GET", &url, &http::HeaderMap::new()).guard();
+    assert!(c.is_active());
+    c.response(200, "https://synthetic.example", &text_headers());
+    c.append(Side::Response, b"data: kept\n\n");
+    c.finish("complete");
+    let record = f.detail(&c);
+    assert_eq!(record.request.url.len(), 8192);
+    assert_eq!(record.response.status, Some(200));
+    assert_eq!(record.capture_error.as_deref(), Some("metadata-limit"));
+    assert_eq!(f.snapshot(&c).copy_body(Side::Response).unwrap(), "data: kept\n\n");
 }
