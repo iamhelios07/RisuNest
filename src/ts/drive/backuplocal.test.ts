@@ -187,7 +187,7 @@ describe('local backup persistent snapshot', () => {
         })
     })
 
-    it.each([false, true])('expands cold payloads with the selected backup on mobile=%s', async (mobile) => {
+    it.each([[false, false], [true, false], [true, true]])('expands cold payloads on mobile=%s with cleanup failure=%s', async (mobile, cleanupFails) => {
         state.mobile = mobile
         const coldKey = 'local-restore-cold'
         const database = structuredClone(risuSaveFixtureDatabase) as Database
@@ -235,7 +235,9 @@ describe('local backup persistent snapshot', () => {
         Object.defineProperty(input, 'files', { value: [file] })
         const click = vi.spyOn(input, 'click').mockImplementation(() => {})
         const createElement = vi.spyOn(document, 'createElement').mockReturnValueOnce(input)
-        const discard = vi.fn(async () => {})
+        const discard = vi.fn(async () => {
+            if (cleanupFails) throw new Error('synthetic source cleanup failure')
+        })
         const nativeReadSizes: number[] = []
         if (mobile) {
             window.RisuNativeFileSelection = {
@@ -258,14 +260,17 @@ describe('local backup persistent snapshot', () => {
                 }
             })
         }
-        const { LoadLocalBackup } = await import('./backuplocal')
+        const { LoadLocalBackup, importLegacyBackupWithWebView } = await import('./backuplocal')
         const { alertWait } = await import('../alert')
-        const pending = LoadLocalBackup()
+        const pending = cleanupFails ? importLegacyBackupWithWebView(state.fallbackContext) : LoadLocalBackup()
         if (!mobile) {
             await vi.waitFor(() => expect(click).toHaveBeenCalledOnce())
             input.dispatchEvent(new Event('change'))
         }
-        await pending
+        if (cleanupFails) {
+            await expect(pending).rejects.toMatchObject({ committedRevision: 1 })
+            expect(state.fallbackContext.setPartialWritesPossible).toHaveBeenCalledWith(true)
+        } else await pending
         if (mobile) {
             expect(click).not.toHaveBeenCalled()
             expect(nativeReadSizes[0]).toBe(4)
@@ -284,11 +289,11 @@ describe('local backup persistent snapshot', () => {
         const context = state.fallbackContext
         expect(context.setSource).toHaveBeenCalledExactlyOnceWith({ name: 'backup.bin', bytes: archive.byteLength })
         // Cold payloads become record bodies, so this archive writes nothing before activation.
-        expect(context.setPartialWritesPossible).not.toHaveBeenCalled()
+        if (!cleanupFails) expect(context.setPartialWritesPossible).not.toHaveBeenCalled()
         const stages = context.onStatus.mock.calls.map(([status]) => status.detail?.stage)
         expect(stages[0]).toBe('reading-archive')
         expect(stages.filter((stage, index) => stage !== stages[index - 1])).toEqual([
-            'reading-archive', 'decoding-database', 'activating', 'restarting-app',
+            'reading-archive', 'decoding-database', 'activating', ...(cleanupFails ? [] : ['restarting-app']),
         ])
         const last = context.onStatus.mock.calls.at(-1)?.[0]
         expect(last?.kind).toBe('restore-legacy-local-backup')

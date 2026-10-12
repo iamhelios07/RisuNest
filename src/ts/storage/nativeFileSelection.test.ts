@@ -137,6 +137,16 @@ describe('native mobile file selection', () => {
         await expect(retained.arrayBuffer()).rejects.toThrow('released')
     })
 
+    it('allows release before a consumer reloads the app and discards only once', async () => {
+        await withNativeSelectedFile({}, async (file, release) => {
+            await file.slice(0, 4).arrayBuffer()
+            await release()
+            expect(mocks.discard).toHaveBeenCalledOnce()
+            await expect(file.slice(0, 1).arrayBuffer()).rejects.toThrow('released')
+        })
+        expect(mocks.discard).toHaveBeenCalledOnce()
+    })
+
     it('releases a native sliced source after consumer failure and retains both errors', async () => {
         mocks.discard.mockRejectedValueOnce(new Error('cleanup denied'))
         await expect(withNativeSelectedFile({}, async file => {

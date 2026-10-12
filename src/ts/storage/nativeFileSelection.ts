@@ -75,7 +75,7 @@ async function readSelected(file: NativeSelectedFile, signal?: AbortSignal, star
     }
 }
 
-async function withNativeSelection<T>(options: FileSelectionOptions, consume: (files: NativeSelectedFile[]) => Promise<T>, cancelled: T): Promise<T> {
+async function withNativeSelection<T>(options: FileSelectionOptions, consume: (files: NativeSelectedFile[], release: () => Promise<void>) => Promise<T>, cancelled: T): Promise<T> {
     return withLibraryFileSelection(async () => {
         if (options.signal?.aborted) return cancelled
         if (selecting) throw new Error('A file picker is already open')
@@ -83,6 +83,16 @@ async function withNativeSelection<T>(options: FileSelectionOptions, consume: (f
         selecting = true
         let files: NativeSelectedFile[] = []
         let failure: unknown
+        const release = async () => {
+            const owned = files
+            files = []
+            const errors: unknown[] = []
+            for (const file of owned) {
+                try { await native.discard(file.path) }
+                catch (error) { errors.push(error) }
+            }
+            if (errors.length) throw new Error(errors.map(String).join('\n'), { cause: errors[0] })
+        }
         try {
             const result = await native.pick(options.multiple ?? false)
             if (result.cancelled) return cancelled
@@ -93,18 +103,15 @@ async function withNativeSelection<T>(options: FileSelectionOptions, consume: (f
             if (selected.some(file => !accepts(file, options.accept))) {
                 throw new Error(language.risuNest.importDialog.reasonUnsupportedFormat)
             }
-            return await consume(selected)
+            return await consume(selected, release)
         } catch (error) {
             failure = error
             throw error
         } finally {
-            const errors: unknown[] = []
-            for (const file of files) {
-                try { await native.discard(file.path) }
-                catch (error) { errors.push(error) }
-            }
-            selecting = false
-            if (errors.length) throw new Error([failure, ...errors].filter(Boolean).map(String).join('\n'), { cause: failure ?? errors[0] })
+            try { await release() }
+            catch (error) {
+                throw new Error([failure, error instanceof Error ? error.message : error].filter(Boolean).map(String).join('\n'), { cause: failure ?? error })
+            } finally { selecting = false }
         }
     })
 }
@@ -129,9 +136,9 @@ export interface SelectedFileSlices {
     slice(start?: number, end?: number): { arrayBuffer(): Promise<ArrayBuffer> }
 }
 
-/** The source is owned by this call and remains available until the consumer settles. */
-export function withNativeSelectedFile<T>(options: Omit<FileSelectionOptions, 'multiple'>, consume: (file: SelectedFileSlices) => Promise<T>): Promise<T | null> {
-    return withNativeSelection<T | null>({ ...options, multiple: false }, async ([file]) => {
+/** Keep the source until the consumer settles, allowing early release before navigation. */
+export function withNativeSelectedFile<T>(options: Omit<FileSelectionOptions, 'multiple'>, consume: (file: SelectedFileSlices, release: () => Promise<void>) => Promise<T>): Promise<T | null> {
+    return withNativeSelection<T | null>({ ...options, multiple: false }, async ([file], discard) => {
         if (!Number.isSafeInteger(file.bytes) || file.bytes < 0) throw new Error('The selected file has an invalid size')
         let active = true
         const offset = (value: number) => {
@@ -150,7 +157,7 @@ export function withNativeSelectedFile<T>(options: Omit<FileSelectionOptions, 'm
                         return (await readSelected(file, options.signal, from, to)).buffer
                     } }
                 },
-            })
+            }, async () => { active = false; await discard() })
         } finally { active = false }
     }, null)
 }
