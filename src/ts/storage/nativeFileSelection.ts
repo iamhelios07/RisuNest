@@ -25,6 +25,7 @@ export interface FileSelectionOptions {
 
 let selecting = false
 const READ_CHUNK_BYTES = 256 * 1024
+const READ_AHEAD_BYTES = 1024 * 1024
 
 function bridge(): NativeFileSelectionBridge {
     if (isTauriAndroid) {
@@ -141,6 +142,7 @@ export function withNativeSelectedFile<T>(options: Omit<FileSelectionOptions, 'm
     return withNativeSelection<T | null>({ ...options, multiple: false }, async ([file], discard) => {
         if (!Number.isSafeInteger(file.bytes) || file.bytes < 0) throw new Error('The selected file has an invalid size')
         let active = true
+        let cached: { start: number; data: Uint8Array<ArrayBuffer> } | undefined
         const offset = (value: number) => {
             const integer = Math.trunc(value) || 0
             return integer < 0 ? Math.max(file.bytes + integer, 0) : Math.min(integer, file.bytes)
@@ -154,10 +156,18 @@ export function withNativeSelectedFile<T>(options: Omit<FileSelectionOptions, 'm
                     const to = Math.max(from, offset(end))
                     return { async arrayBuffer() {
                         if (!active) throw new Error('The selected file has been released')
-                        return (await readSelected(file, options.signal, from, to)).buffer
+                        options.signal?.throwIfAborted()
+                        if (from === to) return new ArrayBuffer(0)
+                        if (to - from > READ_AHEAD_BYTES) return (await readSelected(file, options.signal, from, to)).buffer
+                        if (!cached || from < cached.start || to > cached.start + cached.data.length) {
+                            const data = await readSelected(file, options.signal, from, Math.min(file.bytes, from + READ_AHEAD_BYTES))
+                            if (!active) throw new Error('The selected file has been released')
+                            cached = { start: from, data }
+                        }
+                        return cached.data.slice(from - cached.start, to - cached.start).buffer
                     } }
                 },
-            }, async () => { active = false; await discard() })
-        } finally { active = false }
+            }, async () => { active = false; cached = undefined; await discard() })
+        } finally { active = false; cached = undefined }
     }, null)
 }

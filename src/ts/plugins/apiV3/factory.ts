@@ -1,4 +1,5 @@
 import { recordNativeLogError } from '../../nativeLog'
+import { isTauri } from '../../platform'
 import { attachPluginReadProvenance, collectPluginReadProvenance, type PluginReadProvenance } from '../pluginReadBaselines'
 
 type MsgType =
@@ -1066,7 +1067,7 @@ export class SandboxHost {
             if (data.type === 'PLUGIN_ERROR') {
                 if (typeof data.error === 'string' && data.error.trim()) {
                     const message = `[${sourceLabel}] ${data.error.slice(0, 8192)}`;
-                    void recordNativeLogError(message).catch(() => {});
+                    if (isTauri) void recordNativeLogError(message).catch(() => {});
                     this.apiFactory.alertError?.(message);
                 }
                 return;

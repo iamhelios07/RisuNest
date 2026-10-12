@@ -187,7 +187,9 @@ describe('local backup persistent snapshot', () => {
         })
     })
 
-    it.each([[false, false], [true, false], [true, true]])('expands cold payloads on mobile=%s with cleanup failure=%s', async (mobile, cleanupFails) => {
+    it.each([[false, false, false], [true, false, false], [true, true, false], [true, true, true]])('expands cold payloads on mobile=%s with cleanup failure=%s and log failure=%s', async (mobile, cleanupFails, logFails) => {
+        const { recordNativeLogError } = await import('../nativeLog')
+        if (logFails) vi.mocked(recordNativeLogError).mockRejectedValueOnce(new Error('native log unavailable'))
         state.mobile = mobile
         const coldKey = 'local-restore-cold'
         const database = structuredClone(risuSaveFixtureDatabase) as Database
@@ -267,14 +269,14 @@ describe('local backup persistent snapshot', () => {
             await vi.waitFor(() => expect(click).toHaveBeenCalledOnce())
             input.dispatchEvent(new Event('change'))
         }
+        await pending
         if (cleanupFails) {
-            await expect(pending).rejects.toMatchObject({ committedRevision: 1 })
-            expect(state.fallbackContext.setPartialWritesPossible).toHaveBeenCalledWith(true)
-        } else await pending
+            expect(recordNativeLogError).toHaveBeenCalledWith(expect.stringContaining('synthetic source cleanup failure'))
+        } else expect(recordNativeLogError).not.toHaveBeenCalled()
         if (mobile) {
             expect(click).not.toHaveBeenCalled()
-            expect(nativeReadSizes[0]).toBe(4)
-            expect(Math.max(...nativeReadSizes)).toBeLessThan(archive.length)
+            expect(Math.max(...nativeReadSizes)).toBeLessThanOrEqual(256 * 1024)
+            expect(state.openNativeFile).toHaveBeenCalledOnce()
             expect(discard).toHaveBeenCalledExactlyOnceWith('/owned/backup')
         }
         createElement.mockRestore()
@@ -289,11 +291,11 @@ describe('local backup persistent snapshot', () => {
         const context = state.fallbackContext
         expect(context.setSource).toHaveBeenCalledExactlyOnceWith({ name: 'backup.bin', bytes: archive.byteLength })
         // Cold payloads become record bodies, so this archive writes nothing before activation.
-        if (!cleanupFails) expect(context.setPartialWritesPossible).not.toHaveBeenCalled()
+        expect(context.setPartialWritesPossible).not.toHaveBeenCalled()
         const stages = context.onStatus.mock.calls.map(([status]) => status.detail?.stage)
         expect(stages[0]).toBe('reading-archive')
         expect(stages.filter((stage, index) => stage !== stages[index - 1])).toEqual([
-            'reading-archive', 'decoding-database', 'activating', ...(cleanupFails ? [] : ['restarting-app']),
+            'reading-archive', 'decoding-database', 'activating', 'restarting-app',
         ])
         const last = context.onStatus.mock.calls.at(-1)?.[0]
         expect(last?.kind).toBe('restore-legacy-local-backup')

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { Buffer } from 'node:buffer'
 
 const mocks = vi.hoisted(() => ({
     android: true, ios: false, invoke: vi.fn(), open: vi.fn(), pick: vi.fn(), discard: vi.fn(),
@@ -23,6 +24,7 @@ const handles: { close: ReturnType<typeof vi.fn>; read: ReturnType<typeof vi.fn>
 function readable(bytes = new Uint8Array([0, 128, 255, 10]), maxRead = Infinity) {
     let position = 0
     const handle = {
+        seek: vi.fn(async (offset: number) => { position = offset }),
         read: vi.fn(async (target: Uint8Array) => {
             const chunk = bytes.subarray(position, position + Math.min(target.length, maxRead))
             target.set(chunk)
@@ -131,10 +133,53 @@ describe('native mobile file selection', () => {
             return 'imported'
         })
         expect(result).toBe('imported')
-        expect(readSizes).toEqual([4, 1, 1])
+        expect(readSizes).toEqual([256 * 1024, 256 * 1024, 256 * 1024, 256 * 1024, 1, 1])
         expect(mocks.discard).toHaveBeenCalledOnce()
         expect(isLibraryFileOperationReserved()).toBe(false)
         await expect(retained.arrayBuffer()).rejects.toThrow('released')
+    })
+
+    it('coalesces 10,000 entry headers and deferred payloads into bounded native reads', async () => {
+        const entries = 10_000
+        const stride = 283
+        const bytes = Uint8Array.from({ length: entries * stride }, (_, index) => index % 251)
+        mocks.pick.mockResolvedValue({ cancelled: false, files: [metadata('many.bin', bytes.length)] })
+        mocks.open.mockImplementation(async () => readable(bytes))
+        await withNativeSelectedFile({}, async file => {
+            for (let entry = 0; entry < entries; entry++) {
+                const start = entry * stride
+                for (const [from, to] of [[start, start + 4], [start + 4, start + 23], [start + 23, start + 27]]) {
+                    expect(Buffer.compare(new Uint8Array(await file.slice(from, to).arrayBuffer()), bytes.slice(from, to))).toBe(0)
+                }
+            }
+            for (let entry = 0; entry < entries; entry++) {
+                const start = entry * stride + 27
+                expect(Buffer.compare(new Uint8Array(await file.slice(start, start + 256).arrayBuffer()), bytes.slice(start, start + 256))).toBe(0)
+            }
+        })
+        expect(mocks.open).toHaveBeenCalledTimes(6)
+        expect(handles.every(handle => handle.read.mock.calls.every(([target]) => target.length <= 256 * 1024))).toBe(true)
+        expect(handles.every(handle => handle.close.mock.calls.length === 1)).toBe(true)
+    })
+
+    it('keeps cached slices independent, handles boundary and large reads, and honors cancellation on a cache hit', async () => {
+        const bytes = Uint8Array.from({ length: 3 * 1024 * 1024 + 7 }, (_, index) => index % 251)
+        mocks.pick.mockResolvedValue({ cancelled: false, files: [metadata('boundary.bin', bytes.length)] })
+        mocks.open.mockImplementation(async () => readable(bytes, 65_537))
+        const controller = new AbortController()
+        await withNativeSelectedFile({ signal: controller.signal }, async file => {
+            const first = new Uint8Array(await file.slice(0, 4).arrayBuffer())
+            first.fill(255)
+            expect(new Uint8Array(await file.slice(0, 4).arrayBuffer())).toEqual(bytes.slice(0, 4))
+            expect(mocks.open).toHaveBeenCalledOnce()
+            for (const [from, to] of [[1024 * 1024 - 2, 1024 * 1024 + 2], [2, 2 * 1024 * 1024], [12, 8], [-4, bytes.length]]) {
+                expect(Buffer.compare(new Uint8Array(await file.slice(from, to).arrayBuffer()), bytes.slice(from, to))).toBe(0)
+            }
+            controller.abort()
+            await expect(file.slice(-2).arrayBuffer()).rejects.toThrow()
+        })
+        expect(handles.every(handle => handle.close.mock.calls.length === 1)).toBe(true)
+        expect(mocks.discard).toHaveBeenCalledOnce()
     })
 
     it('allows release before a consumer reloads the app and discards only once', async () => {

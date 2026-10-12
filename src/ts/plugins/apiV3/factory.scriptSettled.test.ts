@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { SandboxHost } from './factory'
 import { recordNativeLogError } from '../../nativeLog'
+const platform = vi.hoisted(() => ({ native: false }))
+vi.mock('../../platform', () => ({ get isTauri() { return platform.native } }))
 vi.mock('../../nativeLog', () => ({ recordNativeLogError: vi.fn(async () => {}) }))
 import { collectPluginReadProvenance, PluginReadBaselines } from '../pluginReadBaselines'
 import type { fetchNative, GlobalFetchArgs } from '../../globalApi.svelte'
@@ -54,7 +56,9 @@ function bridgeStubs(): Record<string, unknown> {
 }
 
 describe('sandbox script completion', () => {
-    it('shows a file-read failure while retaining the plugin error event', async () => {
+    it.each([false, true])('shows a file-read failure and logs only on native=%s', async native => {
+        platform.native = native
+        vi.mocked(recordNativeLogError).mockClear()
         const alertError = vi.fn()
         const host = new SandboxHost({ ...bridgeStubs(), alertError })
         const child = await runGuest(host, `
@@ -69,7 +73,8 @@ describe('sandbox script completion', () => {
         })
         await vi.waitFor(() => expect((child as any).readError).toBe('NotReadableError'))
         expect(alertError).toHaveBeenCalledWith('[settled-test] NotReadableError: Provider denied access')
-        expect(recordNativeLogError).toHaveBeenCalledWith('[settled-test] NotReadableError: Provider denied access')
+        if (native) expect(recordNativeLogError).toHaveBeenCalledWith('[settled-test] NotReadableError: Provider denied access')
+        else expect(recordNativeLogError).not.toHaveBeenCalled()
         host.terminate()
     })
 

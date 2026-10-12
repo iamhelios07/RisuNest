@@ -666,7 +666,10 @@ async function importLegacyBackupFile(
                 await attachments.activate(checkCancelled)
                 currentItem = undefined
                 report('activating')
-                await sourceLifecycle.releaseSource?.()
+                try { await sourceLifecycle.releaseSource?.() }
+                catch (error) {
+                    await recordNativeLogError(`Local backup source cleanup failed: ${String(error)}`).catch(() => {})
+                }
                 return outcome
             },
             onPostCommitError: (error) => {
