@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Buffer } from 'node:buffer'
 
 const mocks = vi.hoisted(() => ({
-    android: true, ios: false, invoke: vi.fn(), open: vi.fn(), pick: vi.fn(), discard: vi.fn(), log: vi.fn(),
+    android: true, ios: false, invoke: vi.fn(), open: vi.fn(), pick: vi.fn(), discard: vi.fn(),
 }))
 vi.mock('../platform', () => ({
     get isTauriAndroid() { return mocks.android },
@@ -11,8 +11,7 @@ vi.mock('../platform', () => ({
 }))
 vi.mock('@tauri-apps/api/core', () => ({ invoke: mocks.invoke }))
 vi.mock('@tauri-apps/plugin-fs', () => ({ open: mocks.open, SeekMode: { Start: 0 } }))
-vi.mock('src/lang', () => ({ language: { risuNest: { importDialog: { reasonUnsupportedFormat: 'Unsupported file format' } } } }))
-vi.mock('../nativeLog', () => ({ recordNativeLogError: mocks.log }))
+import { language } from 'src/lang'
 import { selectNativeFileData, selectNativeFiles, withNativeSelectedFile, type NativeSelectedFile } from './nativeFileSelection'
 import { selectDomFiles } from './fileSelection'
 import { isLibraryFileOperationReserved } from './libraryFileOperation'
@@ -46,7 +45,6 @@ beforeEach(() => {
     window.RisuNativeFileSelection = { pick: mocks.pick, discard: mocks.discard }
     mocks.pick.mockResolvedValue({ cancelled: false, files: [metadata()] })
     mocks.discard.mockResolvedValue(undefined)
-    mocks.log.mockResolvedValue(undefined)
     mocks.open.mockImplementation(async () => readable())
 })
 afterEach(() => { delete window.RisuNativeFileSelection })
@@ -91,14 +89,14 @@ describe('native mobile file selection', () => {
     })
 
     it('filters metadata before reading and still releases rejected selections', async () => {
-        await expect(selectNativeFiles({ accept: '.png' })).rejects.toThrow('Unsupported file format')
+        await expect(selectNativeFiles({ accept: '.png' })).rejects.toThrow(language.risuNest.importDialog.reasonUnsupportedFormat)
         expect(mocks.open).not.toHaveBeenCalled()
         expect(mocks.discard).toHaveBeenCalledOnce()
     })
 
     it('rejects a mixed-format batch instead of silently importing only part of it', async () => {
         mocks.pick.mockResolvedValue({ cancelled: false, files: [metadata('first.risup'), metadata('second.png')] })
-        await expect(selectNativeFileData({ multiple: true, accept: '.risup' })).rejects.toThrow('Unsupported file format')
+        await expect(selectNativeFileData({ multiple: true, accept: '.risup' })).rejects.toThrow(language.risuNest.importDialog.reasonUnsupportedFormat)
         expect(mocks.open).not.toHaveBeenCalled()
         expect(mocks.discard).toHaveBeenCalledTimes(2)
     })
@@ -204,7 +202,7 @@ describe('native mobile file selection', () => {
         })).rejects.toThrow(/^invalid backup$/)
         expect(handles[0].close).toHaveBeenCalledOnce()
         expect(mocks.discard).toHaveBeenCalledOnce()
-        expect(mocks.log).toHaveBeenCalledWith(expect.stringContaining('cleanup denied'))
+        expect(mocks.invoke).toHaveBeenCalledWith('native_log_error', { message: expect.stringContaining('cleanup denied') })
         expect(isLibraryFileOperationReserved()).toBe(false)
     })
 
@@ -268,8 +266,8 @@ describe('native mobile file selection', () => {
         const [file] = await selectNativeFileData()
         expect([...file.data]).toEqual([0, 128, 255, 10])
         expect(mocks.discard).toHaveBeenCalledTimes(2)
-        expect(mocks.log).toHaveBeenCalledWith(expect.stringContaining('close denied'))
-        expect(mocks.log).toHaveBeenCalledWith(expect.stringContaining('cleanup denied'))
+        expect(mocks.invoke).toHaveBeenCalledWith('native_log_error', { message: expect.stringContaining('close denied') })
+        expect(mocks.invoke).toHaveBeenCalledWith('native_log_error', { message: expect.stringContaining('cleanup denied') })
         expect(isLibraryFileOperationReserved()).toBe(false)
     })
 
@@ -286,7 +284,7 @@ describe('native mobile file selection', () => {
             ...metadata(), path: `/owned/${index}/source`,
         })) })
         mocks.discard.mockImplementation(path => client.request('files.discard', path))
-        await expect(selectNativeFileData({ multiple: true, accept: '.txt' })).rejects.toThrow('Unsupported file format')
+        await expect(selectNativeFileData({ multiple: true, accept: '.txt' })).rejects.toThrow(language.risuNest.importDialog.reasonUnsupportedFormat)
         expect(mocks.discard).toHaveBeenCalledTimes(40)
         expect(isLibraryFileOperationReserved()).toBe(false)
     })

@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { SandboxHost } from './factory'
-import { recordNativeLogError } from '../../nativeLog'
+import { invoke } from '@tauri-apps/api/core'
 const platform = vi.hoisted(() => ({ native: false }))
 vi.mock('../../platform', () => ({ get isTauri() { return platform.native } }))
-vi.mock('../../nativeLog', () => ({ recordNativeLogError: vi.fn(async () => {}) }))
+vi.mock('@tauri-apps/api/core', async importOriginal => ({
+    ...await importOriginal<typeof import('@tauri-apps/api/core')>(), invoke: vi.fn(async () => {}),
+}))
 import { collectPluginReadProvenance, PluginReadBaselines } from '../pluginReadBaselines'
 import type { fetchNative, GlobalFetchArgs } from '../../globalApi.svelte'
 
@@ -58,7 +60,7 @@ function bridgeStubs(): Record<string, unknown> {
 describe('sandbox script completion', () => {
     it.each([false, true])('shows a file-read failure and logs only on native=%s', async native => {
         platform.native = native
-        vi.mocked(recordNativeLogError).mockClear()
+        vi.mocked(invoke).mockClear()
         const alertError = vi.fn()
         const host = new SandboxHost({ ...bridgeStubs(), alertError })
         const child = await runGuest(host, `
@@ -73,8 +75,9 @@ describe('sandbox script completion', () => {
         })
         await vi.waitFor(() => expect((child as any).readError).toBe('NotReadableError'))
         expect(alertError).toHaveBeenCalledWith('[settled-test] NotReadableError: Provider denied access')
-        if (native) expect(recordNativeLogError).toHaveBeenCalledWith('[settled-test] NotReadableError: Provider denied access')
-        else expect(recordNativeLogError).not.toHaveBeenCalled()
+        const logged = { message: '[settled-test] NotReadableError: Provider denied access' }
+        if (native) expect(invoke).toHaveBeenCalledWith('native_log_error', logged)
+        else expect(invoke).not.toHaveBeenCalledWith('native_log_error', logged)
         host.terminate()
     })
 
