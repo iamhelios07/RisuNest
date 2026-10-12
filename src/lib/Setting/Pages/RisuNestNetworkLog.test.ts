@@ -6,7 +6,7 @@ vi.mock('src/lang', () => ({ language: mock.language }))
 vi.mock('src/ts/network/networkLog', async original => ({ ...await original<typeof import('src/ts/network/networkLog')>(), networkLog: mock.call, downloadNetworkLog: mock.download }))
 vi.mock('src/ts/platform', () => ({ isTauriAndroid: false, isTauriIOS: false }))
 import Component from './RisuNestNetworkLog.svelte'
-const settings = { enabled: false, retain: false, hideAuth: true, recentCount: 200, recentMib: 1024, retainedMib: 1024, bodyMib: 512, bufferMib: 32 }
+const settings = { enabled: false, retain: false, hideAuth: true, recentCount: 200, recentMib: 1024, retainedMib: 1024, bodyMib: 512, bufferMib: 32, captureBinary: false }
 const body = { observedBytes: 5, capturedBytes: 5, binary: false, truncated: false, representation: 'observed' }
 const record = { id: 'synthetic', source: 'native-http', startedAt: 0, elapsedMs: 42, retained: false, headerMasking: true, state: 'complete', captureError: null,
     request: { method: 'POST', url: 'https://synthetic.example/chat', status: null, headers: [{ name: 'authorization', value: 'Bearer sk••••••abcdef' }], body },
@@ -32,9 +32,9 @@ afterEach(async () => { await unmount(component); host.remove() })
 describe('native network settings', () => {
     it('shows opt-in defaults, exact warning, and omits removed status copy', async () => {
         const inputs = [...host.querySelectorAll<HTMLInputElement>('input[type=checkbox]')]
-        expect(inputs.map(input => input.checked)).toEqual([false, false, true])
+        expect(inputs.map(input => input.checked)).toEqual([false, false, true, false])
         expect(host.textContent).toContain('최근 요청은 임시로 기록하며, 앱을 종료하면 삭제됩니다. 로그에는 인증 정보가 포함될 수 있으니 주의해주세요.')
-        for (const text of ['스트림 수신 완료', '기록 중지됨', '보관하지 않은 요청은 종료 시 삭제', '인증 정보 숨김 적용됨']) expect(host.textContent).not.toContain(text)
+        for (const text of ['스트림 수신 완료', '기록 중지됨', '보관하지 않은 요청은 종료 시 삭제', '인증 정보 숨김 적용됨', '새 요청부터 적용됩니다.']) expect(host.textContent).not.toContain(text)
         inputs[0].checked = true; inputs[0].dispatchEvent(new Event('change', { bubbles: true })); await settle()
         expect(mock.call).toHaveBeenCalledWith({ op: 'configure', settings: { ...settings, enabled: true } })
     })
@@ -49,6 +49,17 @@ describe('native network settings', () => {
             select.value = String(value); select.dispatchEvent(new Event('change', { bubbles: true })); await settle()
             expect(mock.call).toHaveBeenCalledWith({ op: 'configure', settings: { ...settings, bufferMib: value } })
             expect(select.value).toBe(String(value))
+        }
+    })
+    it('toggles binary capture independently of the recording buffer', async () => {
+        expect(host.textContent).toContain('바이너리 본문을 기록 버퍼 용량까지 저장합니다.')
+        const input = [...host.querySelectorAll('label')].find(label => label.textContent?.trim() === '바이너리 저장')!.querySelector('input')!
+        expect(input.checked).toBe(false)
+        for (const captureBinary of [true, false]) {
+            input.checked = captureBinary; input.dispatchEvent(new Event('change', { bubbles: true })); await settle()
+            expect(mock.call).toHaveBeenCalledWith({ op: 'configure', settings: { ...settings, captureBinary } })
+            expect(input.checked).toBe(captureBinary)
+            expect(host.querySelector<HTMLSelectElement>('#network-bufferMib')!.value).toBe('32')
         }
     })
     it('opens headers and bodies, copies, retains, and downloads one request', async () => {

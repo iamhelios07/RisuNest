@@ -2,7 +2,6 @@ use serde::{Deserialize, Serialize};
 
 pub const MIB: u64 = 1024 * 1024;
 pub const PAGE_BYTES: usize = 256 * 1024;
-pub const BINARY_BYTES: u64 = 64 * 1024;
 pub const BODY_BYTES: u64 = 512 * MIB;
 pub const METADATA_BYTES: usize = 128 * 1024;
 
@@ -19,6 +18,8 @@ pub struct Settings {
     pub body_mib: u64,
     #[serde(default = "default_buffer_mib")]
     pub buffer_mib: u64,
+    #[serde(default)]
+    pub capture_binary: bool,
 }
 fn default_buffer_mib() -> u64 {
     32
@@ -34,6 +35,7 @@ impl Default for Settings {
             retained_mib: 1024,
             body_mib: 512,
             buffer_mib: default_buffer_mib(),
+            capture_binary: false,
         }
     }
 }

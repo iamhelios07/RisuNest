@@ -68,6 +68,7 @@ fn text_headers() -> http::HeaderMap {
 fn defaults_are_opt_in_and_disabled_capture_does_not_copy_or_enqueue() {
     let f = Fixture::new();
     assert!(!f.recorder.settings().enabled);
+    assert!(!f.recorder.settings().capture_binary);
     assert!(f.recorder.settings().hide_auth);
     assert_eq!(f.recorder.settings().buffer_mib, 32);
     let capture = f.begin();
@@ -275,18 +276,23 @@ fn completed_recent_records_rotate_but_retained_and_active_records_survive() {
     assert!(f.recorder.record(kept_id).unwrap().retained);
 }
 #[test]
-fn binary_preview_and_text_body_limits_are_independent() {
+fn disabled_binary_capture_keeps_metadata_and_text_but_no_binary_payload() {
     let f = Fixture::new();
     f.enable(false, false);
     let c = f.begin();
     let mut headers = http::HeaderMap::new();
     headers.insert("content-type", "application/octet-stream".parse().unwrap());
     c.response(200, "https://synthetic.example", &headers);
+    f.detail(&c);
+    let release = f.pause_writer();
     c.append(Side::Response, &vec![0xff; 100_000]);
+    assert_eq!(f.recorder.0.queued.load(Ordering::Relaxed), 0);
+    release.send(()).unwrap();
     c.append(Side::Request, b"still-recorded");
     c.finish("complete");
     let record = f.detail(&c);
-    assert_eq!(record.response.body.captured_bytes, BINARY_BYTES);
+    assert_eq!(record.response.body.captured_bytes, 0);
+    assert_eq!(record.response.status, Some(200));
     assert_eq!(record.response.body.observed_bytes, 100_000);
     assert!(record.response.body.truncated);
     assert_eq!(
@@ -445,7 +451,7 @@ fn gzip_decodes_in_the_writer_and_a_broken_tail_is_explicit() {
 #[test]
 fn websocket_binary_export_is_lossless_and_text_messages_remain_readable() {
     let f = Fixture::new();
-    f.enable(false, true);
+    f.recorder.configure(Settings { enabled: true, capture_binary: true, ..Settings::default() }).unwrap();
     let c = f
         .recorder
         .begin(
@@ -1056,6 +1062,8 @@ fn buffer_settings_preserve_legacy_values_and_survive_restart() {
         let f = Fixture { root, recorder };
         let mut settings = f.recorder.settings();
         assert_eq!(settings.buffer_mib, 32);
+        assert!(!settings.capture_binary);
+        settings.capture_binary = true;
         assert_eq!(settings.body_mib, body_mib);
         for budget in [4, 8, 16, 32, 64, 128] {
             settings.buffer_mib = budget;
@@ -1078,6 +1086,7 @@ fn buffer_settings_preserve_legacy_values_and_survive_restart() {
         f.recorder.shutdown();
         let reopened = Recorder::open(f.root.path().join("recent"), kept).unwrap();
         assert_eq!(reopened.settings().buffer_mib, 128);
+        assert!(reopened.settings().capture_binary);
         assert_eq!(reopened.0.queue_limit.load(Ordering::Relaxed), 128 * MIB as usize);
         let value = serde_json::to_value(reopened.settings()).unwrap();
         assert_eq!(serde_json::to_value(serde_json::from_value::<LegacySettings>(value).unwrap()).unwrap(), legacy);
@@ -1188,4 +1197,188 @@ fn fixed_body_limit_applies_at_512_mib_to_each_side_regardless_of_legacy_setting
             assert_eq!(f.snapshot(&c).copy_body(side).unwrap(), "z".repeat(16));
         }
     }
+}
+
+#[test]
+fn enabled_binary_capture_records_ten_mib_bursts_on_both_sides() {
+    use std::io::Read;
+    let f = Fixture::new();
+    f.recorder.configure(Settings { enabled: true, capture_binary: true, ..Settings::default() }).unwrap();
+    let mut headers = http::HeaderMap::new();
+    headers.insert("content-type", "application/octet-stream".parse().unwrap());
+    let c = f.recorder.begin("synthetic", "POST", "https://synthetic.example", &headers).guard();
+    c.response(200, "https://synthetic.example", &headers);
+    f.detail(&c);
+    let release = f.pause_writer();
+    let body = vec![0xff; 10 * MIB as usize];
+    for side in [Side::Request, Side::Response] {
+        c.append(side, &body);
+    }
+    c.finish("complete");
+    release.send(()).unwrap();
+    let record = f.detail(&c);
+    assert!(record.capture_error.is_none());
+    let mut snapshot = f.snapshot(&c);
+    for side in [Side::Request, Side::Response] {
+        assert_eq!(record.body(side).captured_bytes, 10 * MIB);
+        assert_eq!(record.body(side).observed_bytes, 10 * MIB);
+        assert!(!record.body(side).truncated);
+        assert!(record.body(side).binary);
+        let input = match side { Side::Request => &mut snapshot.request, Side::Response => &mut snapshot.response };
+        let mut saved = Vec::new();
+        input.read_to_end(&mut saved).unwrap();
+        assert_eq!(saved, body);
+    }
+}
+
+#[test]
+fn binary_body_caps_are_cumulative_and_independent_for_request_and_response() {
+    let f = Fixture::new();
+    f.recorder.configure(Settings { enabled: true, capture_binary: true, buffer_mib: 4, ..Settings::default() }).unwrap();
+    let mut headers = http::HeaderMap::new();
+    headers.insert("content-type", "image/png".parse().unwrap());
+    let c = f.recorder.begin("synthetic", "POST", "https://synthetic.example", &headers).guard();
+    c.response(200, "https://synthetic.example", &headers);
+    let body = vec![0xff; MIB as usize];
+    for _ in 0..5 {
+        for side in [Side::Request, Side::Response] {
+            c.append(side, &body);
+        }
+        f.detail(&c);
+    }
+    c.finish("complete");
+    let record = f.detail(&c);
+    assert_eq!(record.capture_error.as_deref(), Some("body-limit"));
+    for side in [Side::Request, Side::Response] {
+        assert_eq!(record.body(side).captured_bytes, 4 * MIB);
+        assert_eq!(record.body(side).observed_bytes, 5 * MIB);
+        assert!(record.body(side).truncated);
+        assert_eq!(f.snapshot(&c).body_range(side, 4 * MIB - 16, 32, None).unwrap().text, "ff".repeat(16));
+    }
+}
+
+#[test]
+fn disabled_websocket_binary_payloads_keep_message_metadata_and_readable_text() {
+    let f = Fixture::new();
+    f.enable(false, false);
+    let c = f.recorder.begin("ws", "WS", "wss://synthetic.example", &http::HeaderMap::new()).guard();
+    c.append_message(Side::Response, b"hello", Some("text"));
+    c.append_message(Side::Response, &[0xff; 100_000], Some("binary"));
+    c.append_message(Side::Response, &[0xff], Some("pong"));
+    c.append_message(Side::Response, b"ping", Some("ping"));
+    c.append_message(Side::Response, b"world", Some("text"));
+    c.finish("complete");
+    let record = f.detail(&c);
+    assert_eq!(record.response.body.observed_bytes, 100_015);
+    assert_eq!(record.response.body.captured_bytes, 14);
+    assert!(!record.response.body.binary);
+    assert!(record.response.body.truncated);
+    assert!(record.capture_error.is_none());
+    let mut json = Vec::new();
+    f.snapshot(&c).export_json(&mut json).unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&json).unwrap();
+    assert_eq!(json["response"]["body"]["encoding"], "utf8");
+    assert_eq!(json["response"]["body"]["data"], "hellopingworld");
+    let events = json["stream"]["observations"].as_array().unwrap();
+    assert_eq!(events.len(), 5);
+    assert_eq!(events[1]["kind"], "binary");
+    assert_eq!(events[1]["length"], 0);
+    assert_eq!(events[2]["kind"], "pong");
+    assert_eq!(events[2]["length"], 0);
+    assert_eq!(events[3]["offset"], 5);
+    assert_eq!(events[4]["offset"], 9);
+}
+
+#[test]
+fn websocket_binary_cap_does_not_stop_later_text_and_readable_controls() {
+    let f = Fixture::new();
+    f.recorder.configure(Settings { enabled: true, capture_binary: true, buffer_mib: 4, ..Settings::default() }).unwrap();
+    let c = f.recorder.begin("ws", "WS", "wss://synthetic.example", &http::HeaderMap::new()).guard();
+    let body = vec![0xff; MIB as usize];
+    for _ in 0..5 {
+        for side in [Side::Request, Side::Response] {
+            c.append_message(side, &body, Some("binary"));
+        }
+        f.detail(&c);
+    }
+    for side in [Side::Request, Side::Response] {
+        c.append_message(side, &[0xff], Some("pong"));
+        c.append_message(side, b"ping", Some("ping"));
+        c.append_message(side, b"tail", Some("text"));
+    }
+    c.finish("complete");
+    let record = f.detail(&c);
+    assert_eq!(record.capture_error.as_deref(), Some("body-limit"));
+    for side in [Side::Request, Side::Response] {
+        assert_eq!(record.body(side).captured_bytes, 4 * MIB + 8);
+        assert_eq!(record.body(side).observed_bytes, 5 * MIB + 9);
+        assert!(record.body(side).binary);
+        assert_eq!(f.snapshot(&c).body_range(side, 4 * MIB, 8, Some(false)).unwrap().text, "pingtail");
+    }
+}
+
+#[test]
+fn binary_option_and_cap_apply_to_new_requests_and_preserve_saved_bodies() {
+    let f = Fixture::new();
+    f.enable(true, false);
+    let mut headers = http::HeaderMap::new();
+    headers.insert("content-type", "application/octet-stream".parse().unwrap());
+    let off = f.recorder.begin("synthetic", "POST", "https://synthetic.example", &headers).guard();
+    let enabled = Settings { enabled: true, retain: true, capture_binary: true, buffer_mib: 4, ..Settings::default() };
+    f.recorder.configure(enabled).unwrap();
+    let on = f.recorder.begin("synthetic", "POST", "https://synthetic.example", &headers).guard();
+    f.recorder.configure(Settings { enabled: true, retain: true, buffer_mib: 8, ..Settings::default() }).unwrap();
+    let off_again = f.recorder.begin("synthetic", "POST", "https://synthetic.example", &headers).guard();
+    let body = vec![0xff; MIB as usize];
+    for _ in 0..5 {
+        for capture in [&off, &on, &off_again] {
+            capture.append(Side::Request, &body);
+        }
+        f.detail(&on);
+    }
+    for capture in [&off, &on, &off_again] { capture.finish("complete"); }
+    assert_eq!(f.detail(&off).request.body.captured_bytes, 0);
+    assert_eq!(f.detail(&off_again).request.body.captured_bytes, 0);
+    let record = f.detail(&on);
+    assert_eq!(record.request.body.captured_bytes, 4 * MIB);
+    assert_eq!(record.request.body.observed_bytes, 5 * MIB);
+    assert_eq!(record.capture_error.as_deref(), Some("body-limit"));
+    f.recorder.shutdown();
+    let reopened = Recorder::open(f.root.path().join("recent"), f.root.path().join("kept")).unwrap();
+    assert!(!reopened.settings().capture_binary);
+    let mut snapshot = reopened.snapshot(record.id.clone()).unwrap();
+    assert_eq!(snapshot.record.request.body.captured_bytes, 4 * MIB);
+    assert_eq!(snapshot.body_range(Side::Request, 0, 16, None).unwrap().text, "ff".repeat(16));
+    let mut output = Vec::new();
+    reopened.snapshot(record.id).unwrap().export_json(&mut output).unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(json["request"]["body"]["encoding"], "hex");
+    assert_eq!(json["request"]["body"]["data"], "ff".repeat(4 * MIB as usize));
+    drop(snapshot);
+    reopened.shutdown();
+}
+
+#[test]
+fn enabled_binary_capture_stays_best_effort_when_the_shared_queue_is_full() {
+    let f = Fixture::new();
+    f.recorder.configure(Settings { enabled: true, capture_binary: true, buffer_mib: 4, ..Settings::default() }).unwrap();
+    let mut headers = http::HeaderMap::new();
+    headers.insert("content-type", "application/octet-stream".parse().unwrap());
+    let c = f.recorder.begin("synthetic", "POST", "https://synthetic.example", &headers).guard();
+    f.detail(&c);
+    let release = f.pause_writer();
+    c.append(Side::Request, &vec![0xff; 8 * MIB as usize]);
+    c.response(200, "https://synthetic.example", &headers);
+    let queued = f.recorder.0.queued.load(Ordering::Relaxed);
+    release.send(()).unwrap();
+    f.detail(&c);
+    c.append(Side::Response, &[0xff; 100_000]);
+    c.finish("complete");
+    let record = f.detail(&c);
+    assert!(queued <= 4 * MIB as usize);
+    assert!(record.request.body.captured_bytes > 0 && record.request.body.captured_bytes < 4 * MIB);
+    assert_eq!(record.request.body.observed_bytes, 8 * MIB);
+    assert_eq!(record.response.body.captured_bytes, 100_000);
+    assert_eq!(record.response.status, Some(200));
+    assert_eq!(record.capture_error.as_deref(), Some("queue-full"));
 }

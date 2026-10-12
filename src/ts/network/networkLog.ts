@@ -10,6 +10,7 @@ export interface NetworkLogSettings {
     retainedMib: number
     bodyMib: number
     bufferMib: number
+    captureBinary: boolean
 }
 export type LogSide = 'request' | 'response'
 export interface LogHeader { name: string; value: string; encoding: string | null }

@@ -181,8 +181,10 @@
                 <summary class="flex cursor-pointer items-center justify-between px-4 py-3 text-sm">{t.advanced}<ChevronDown size={15}/></summary>
                 <div class="divide-y divide-darkborderc/55 border-t border-darkborderc/55">
                     <SettingRow label={t.hideAuth} help={t.hideAuthHelp} inline>
-                        {#snippet below()}<p class="mt-1 text-xs text-textcolor2">{t.newRequests}</p>{/snippet}
                         <SettingToggle label={t.hideAuth} checked={settings.hideAuth} disabled={busy} onchange={hideAuth => configure({ hideAuth })}/>
+                    </SettingRow>
+                    <SettingRow label={t.captureBinary} help={t.captureBinaryHelp} inline>
+                        <SettingToggle label={t.captureBinary} checked={settings.captureBinary} disabled={busy} onchange={captureBinary => configure({ captureBinary })}/>
                     </SettingRow>
                     <SettingRow label={t.recentCount} labelFor="network-recent-count"><select id="network-recent-count" value={settings.recentCount} disabled={busy} onchange={event => configure({ recentCount: Number(event.currentTarget.value) })}>{#each [100, 200, 500, 1000] as count}<option value={count}>{count.toLocaleString()}</option>{/each}</select></SettingRow>
                     {#each [{ key: 'recentMib', label: t.recentBudget }, { key: 'retainedMib', label: t.retainedBudget }, { key: 'bufferMib', label: t.bufferBudget }] as option}

@@ -42,6 +42,7 @@ struct Signal {
     start: Instant,
     hide: bool,
     limit: u64,
+    binary_limit: u64,
     websocket: bool,
     pending: AtomicUsize,
     outcome: AtomicU8,
@@ -53,6 +54,7 @@ struct Signal {
     elapsed: AtomicU64,
     observed: [AtomicU64; 2],
     admitted: [AtomicU64; 2],
+    binary_admitted: [AtomicU64; 2],
     binary: [AtomicBool; 2],
     partial: AtomicBool,
     limited: [AtomicBool; 2],
@@ -342,6 +344,7 @@ impl Recorder {
             start: Instant::now(),
             hide: settings.hide_auth,
             limit: BODY_BYTES,
+            binary_limit: if settings.capture_binary { settings.buffer_mib * MIB } else { 0 },
             websocket: method == "WS",
             pending: AtomicUsize::new(0),
             outcome: AtomicU8::new(0),
@@ -353,6 +356,7 @@ impl Recorder {
             elapsed: AtomicU64::new(0),
             observed: [AtomicU64::new(0), AtomicU64::new(0)],
             admitted: [AtomicU64::new(0), AtomicU64::new(0)],
+            binary_admitted: [AtomicU64::new(0), AtomicU64::new(0)],
             binary: [AtomicBool::new(binary(headers)), AtomicBool::new(false)],
             partial: AtomicBool::new(false),
             limited: [AtomicBool::new(false), AtomicBool::new(false)],
@@ -698,33 +702,30 @@ impl Capture {
         if !self.is_active() || signal.body_reason[side.index()].load(Ordering::Relaxed) != 0 {
             return;
         }
-        if kind == Some("binary")
-            || (matches!(kind, Some("ping" | "pong")) && std::str::from_utf8(bytes).is_err())
-        {
+        let is_binary = if signal.websocket {
+            kind == Some("binary")
+                || (matches!(kind, Some("ping" | "pong")) && std::str::from_utf8(bytes).is_err())
+        } else {
+            signal.binary[side.index()].load(Ordering::Relaxed)
+        };
+        let eligible = if is_binary {
+            let prior = signal.binary_admitted[side.index()].fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            bytes.len().min(signal.binary_limit.saturating_sub(prior) as usize)
+        } else {
+            bytes.len()
+        };
+        let prior = signal.admitted[side.index()].fetch_add(eligible as u64, Ordering::Relaxed);
+        let count = eligible.min(signal.limit.saturating_sub(prior) as usize);
+        if is_binary && count > 0 {
             signal.binary[side.index()].store(true, Ordering::Relaxed);
         }
-        let limit = if !signal.websocket && signal.binary[side.index()].load(Ordering::Relaxed) {
-            BINARY_BYTES
-        } else {
-            signal.limit
-        };
-        let prior = signal.admitted[side.index()].fetch_add(bytes.len() as u64, Ordering::Relaxed);
-        let count =
-            bytes
-                .len()
-                .min(limit.saturating_sub(prior) as usize)
-                .min(if kind == Some("binary") {
-                    BINARY_BYTES as usize
-                } else {
-                    usize::MAX
-                });
-        if bytes.is_empty() && kind.is_some() {
+        if count == 0 && kind.is_some() {
             self.enqueue(
                 Payload::Bytes(
                     side,
                     vec![],
                     signal.start.elapsed().as_millis() as u64,
-                    kind.map(str::to_owned),
+                    kind.map(|k| k.chars().take(32).collect()),
                 ),
                 128,
             );
@@ -743,7 +744,7 @@ impl Capture {
                 chunk.len() + 128,
             );
         }
-        if count < bytes.len() && !signal.binary[side.index()].load(Ordering::Relaxed) {
+        if count < bytes.len() && (!is_binary || signal.binary_limit != 0) {
             signal.limited[side.index()].store(true, Ordering::Relaxed);
         }
     }
