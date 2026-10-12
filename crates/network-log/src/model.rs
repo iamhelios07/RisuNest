@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 pub const MIB: u64 = 1024 * 1024;
 pub const PAGE_BYTES: usize = 256 * 1024;
 pub const BINARY_BYTES: u64 = 64 * 1024;
+pub const BODY_BYTES: u64 = 512 * MIB;
 pub const METADATA_BYTES: usize = 128 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -14,7 +15,13 @@ pub struct Settings {
     pub recent_count: u32,
     pub recent_mib: u64,
     pub retained_mib: u64,
+    // Preserve the old setting for compatible readers; capture uses BODY_BYTES.
     pub body_mib: u64,
+    #[serde(default = "default_buffer_mib")]
+    pub buffer_mib: u64,
+}
+fn default_buffer_mib() -> u64 {
+    32
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -26,6 +33,7 @@ impl Default for Settings {
             recent_mib: 1024,
             retained_mib: 1024,
             body_mib: 512,
+            buffer_mib: default_buffer_mib(),
         }
     }
 }
@@ -36,6 +44,7 @@ impl Settings {
             || !budgets.contains(&self.recent_mib)
             || !budgets.contains(&self.retained_mib)
             || ![256, 512, 1024].contains(&self.body_mib)
+            || ![4, 8, 16, 32, 64, 128].contains(&self.buffer_mib)
         {
             return Err("invalid-network-log-settings".into());
         }

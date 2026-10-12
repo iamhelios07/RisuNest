@@ -185,9 +185,9 @@
                         <SettingToggle label={t.hideAuth} checked={settings.hideAuth} disabled={busy} onchange={hideAuth => configure({ hideAuth })}/>
                     </SettingRow>
                     <SettingRow label={t.recentCount} labelFor="network-recent-count"><select id="network-recent-count" value={settings.recentCount} disabled={busy} onchange={event => configure({ recentCount: Number(event.currentTarget.value) })}>{#each [100, 200, 500, 1000] as count}<option value={count}>{count.toLocaleString()}</option>{/each}</select></SettingRow>
-                    {#each [{ key: 'recentMib', label: t.recentBudget }, { key: 'retainedMib', label: t.retainedBudget }, { key: 'bodyMib', label: t.bodyBudget }] as option}
+                    {#each [{ key: 'recentMib', label: t.recentBudget }, { key: 'retainedMib', label: t.retainedBudget }, { key: 'bufferMib', label: t.bufferBudget }] as option}
                         <SettingRow label={option.label} labelFor={'network-' + option.key}>
-                            <select id={'network-' + option.key} value={settings[option.key as 'recentMib' | 'retainedMib' | 'bodyMib']} disabled={busy} onchange={event => configure({ [option.key]: Number(event.currentTarget.value) })}>{#each option.key === 'bodyMib' ? [256, 512, 1024] : budgets as budget}<option value={budget}>{logSize(budget * 1024 * 1024)}</option>{/each}</select>
+                            <select id={'network-' + option.key} value={settings[option.key as 'recentMib' | 'retainedMib' | 'bufferMib']} disabled={busy} onchange={event => configure({ [option.key]: Number(event.currentTarget.value) })}>{#each option.key === 'bufferMib' ? [4, 8, 16, 32, 64, 128] : budgets as budget}<option value={budget}>{logSize(budget * 1024 * 1024)}</option>{/each}</select>
                         </SettingRow>
                     {/each}
                 </div>

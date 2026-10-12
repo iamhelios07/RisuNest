@@ -18,8 +18,7 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-const QUEUE_BYTES: usize = 4 * 1024 * 1024;
-const QUEUE_EVENTS: usize = 512;
+const QUEUE_EVENTS: usize = 16_384;
 const ACTIVE_LIMIT: usize = 64;
 const CHUNK_BYTES: usize = 64 * 1024;
 static GLOBAL: OnceLock<RwLock<Option<Recorder>>> = OnceLock::new();
@@ -31,6 +30,7 @@ struct Shared {
     settings: Mutex<Settings>,
     enabled: AtomicBool,
     queued: AtomicUsize,
+    queue_limit: AtomicUsize,
     active: AtomicUsize,
     warning: Mutex<Option<String>>,
     stopping: AtomicBool,
@@ -127,7 +127,7 @@ impl Drop for Envelope {
     }
 }
 enum Payload {
-    Start(Record),
+    Start(Box<Record>),
     Bytes(Side, Vec<u8>, u64, Option<String>),
 }
 enum Event {
@@ -179,6 +179,7 @@ impl Recorder {
         let shared = Arc::new(Shared {
             sender,
             enabled: AtomicBool::new(settings.enabled),
+            queue_limit: AtomicUsize::new((settings.buffer_mib * MIB) as usize),
             settings: Mutex::new(settings),
             queued: AtomicUsize::new(0),
             active: AtomicUsize::new(0),
@@ -224,7 +225,7 @@ impl Recorder {
                                 Payload::Start(record) => {
                                     let result = store.insert(record, &settings);
                                     if result.is_ok() {
-                                        let mut record = record.clone();
+                                        let mut record = record.as_ref().clone();
                                         store.prepare_decoding(
                                             &mut record,
                                             Side::Request,
@@ -301,6 +302,7 @@ impl Recorder {
         if !settings.enabled {
             self.0.enabled.store(false, Ordering::Release);
         }
+        self.0.queue_limit.store((settings.buffer_mib * MIB) as usize, Ordering::Release);
         *self.0.settings.lock().unwrap() = settings.clone();
         self.0.enabled.store(settings.enabled, Ordering::Release);
         *self.0.warning.lock().unwrap() = None;
@@ -339,7 +341,7 @@ impl Recorder {
             owner: self.0.clone(),
             start: Instant::now(),
             hide: settings.hide_auth,
-            limit: settings.body_mib * MIB,
+            limit: BODY_BYTES,
             websocket: method == "WS",
             pending: AtomicUsize::new(0),
             outcome: AtomicU8::new(0),
@@ -392,7 +394,7 @@ impl Recorder {
             event_bytes: 0,
         };
         let bytes = record.request.queued_bytes() + record.source.capacity() + 2048;
-        capture.enqueue(Payload::Start(record), bytes);
+        capture.enqueue(Payload::Start(Box::new(record)), bytes);
         capture
     }
     fn job<T: Send + 'static>(
@@ -607,7 +609,8 @@ impl Capture {
             .owner
             .queued
             .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| {
-                n.checked_add(bytes).filter(|n| *n <= QUEUE_BYTES)
+                n.checked_add(bytes)
+                    .filter(|n| *n <= signal.owner.queue_limit.load(Ordering::Acquire))
             })
             .is_err()
         {

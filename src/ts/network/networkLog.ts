@@ -9,6 +9,7 @@ export interface NetworkLogSettings {
     recentMib: number
     retainedMib: number
     bodyMib: number
+    bufferMib: number
 }
 export type LogSide = 'request' | 'response'
 export interface LogHeader { name: string; value: string; encoding: string | null }

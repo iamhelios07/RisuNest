@@ -6,7 +6,7 @@ vi.mock('src/lang', () => ({ language: mock.language }))
 vi.mock('src/ts/network/networkLog', async original => ({ ...await original<typeof import('src/ts/network/networkLog')>(), networkLog: mock.call, downloadNetworkLog: mock.download }))
 vi.mock('src/ts/platform', () => ({ isTauriAndroid: false, isTauriIOS: false }))
 import Component from './RisuNestNetworkLog.svelte'
-const settings = { enabled: false, retain: false, hideAuth: true, recentCount: 200, recentMib: 1024, retainedMib: 1024, bodyMib: 512 }
+const settings = { enabled: false, retain: false, hideAuth: true, recentCount: 200, recentMib: 1024, retainedMib: 1024, bodyMib: 512, bufferMib: 32 }
 const body = { observedBytes: 5, capturedBytes: 5, binary: false, truncated: false, representation: 'observed' }
 const record = { id: 'synthetic', source: 'native-http', startedAt: 0, elapsedMs: 42, retained: false, headerMasking: true, state: 'complete', captureError: null,
     request: { method: 'POST', url: 'https://synthetic.example/chat', status: null, headers: [{ name: 'authorization', value: 'Bearer sk••••••abcdef' }], body },
@@ -37,6 +37,19 @@ describe('native network settings', () => {
         for (const text of ['스트림 수신 완료', '기록 중지됨', '보관하지 않은 요청은 종료 시 삭제', '인증 정보 숨김 적용됨']) expect(host.textContent).not.toContain(text)
         inputs[0].checked = true; inputs[0].dispatchEvent(new Event('change', { bubbles: true })); await settle()
         expect(mock.call).toHaveBeenCalledWith({ op: 'configure', settings: { ...settings, enabled: true } })
+    })
+    it('configures the shared buffer with the approved presets and hides the body limit', async () => {
+        expect(host.textContent).toContain('기록 버퍼 용량')
+        expect(host.textContent).not.toContain('본문당 한도')
+        expect(host.querySelector('#network-bodyMib')).toBeNull()
+        const select = host.querySelector<HTMLSelectElement>('#network-bufferMib')!
+        expect(select.value).toBe('32')
+        expect([...select.options].map(option => Number(option.value))).toEqual([4, 8, 16, 32, 64, 128])
+        for (const value of [4, 8, 16, 32, 64, 128]) {
+            select.value = String(value); select.dispatchEvent(new Event('change', { bubbles: true })); await settle()
+            expect(mock.call).toHaveBeenCalledWith({ op: 'configure', settings: { ...settings, bufferMib: value } })
+            expect(select.value).toBe(String(value))
+        }
     })
     it('opens headers and bodies, copies, retains, and downloads one request', async () => {
         host.querySelector<HTMLButtonElement>('.request-row')!.click(); await settle()

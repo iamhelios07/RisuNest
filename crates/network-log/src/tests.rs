@@ -22,6 +22,16 @@ impl Fixture {
             })
             .unwrap();
     }
+    fn pause_writer(&self) -> mpsc::Sender<()> {
+        let (release, wait) = mpsc::channel();
+        let (ready, started) = mpsc::channel();
+        self.recorder.0.sender.send(Event::Job(Box::new(move |_| {
+            ready.send(()).unwrap();
+            let _ = wait.recv_timeout(Duration::from_secs(15));
+        }))).unwrap();
+        started.recv_timeout(Duration::from_secs(15)).unwrap();
+        release
+    }
     fn begin(&self) -> CaptureGuard {
         self.recorder
             .begin(
@@ -59,6 +69,7 @@ fn defaults_are_opt_in_and_disabled_capture_does_not_copy_or_enqueue() {
     let f = Fixture::new();
     assert!(!f.recorder.settings().enabled);
     assert!(f.recorder.settings().hide_auth);
+    assert_eq!(f.recorder.settings().buffer_mib, 32);
     let capture = f.begin();
     capture.append(Side::Response, &[7; 65536]);
     capture.finish("complete");
@@ -308,7 +319,7 @@ fn queue_overflow_is_bounded_and_has_a_terminal_reason_without_backpressure() {
         c.append(Side::Response, &[b'x'; 16 * 1024]);
     }
     assert!(began.elapsed() < Duration::from_secs(2));
-    assert!(f.recorder.0.queued.load(Ordering::Relaxed) <= QUEUE_BYTES);
+    assert!(f.recorder.0.queued.load(Ordering::Relaxed) <= f.recorder.0.queue_limit.load(Ordering::Relaxed));
     c.finish("complete");
     release.send(()).unwrap();
     let record = f.detail(&c);
@@ -702,7 +713,7 @@ fn concurrent_streams_and_a_single_enormous_chunk_keep_the_shared_queue_bounded(
             });
         }
     });
-    assert!(f.recorder.0.queued.load(Ordering::Relaxed) <= QUEUE_BYTES);
+    assert!(f.recorder.0.queued.load(Ordering::Relaxed) <= f.recorder.0.queue_limit.load(Ordering::Relaxed));
     drop(huge);
     release.send(()).unwrap();
     for capture in captures {
@@ -758,7 +769,7 @@ fn interrupted_retained_record_recovers_only_committed_bytes_and_cleans_cache() 
 #[test]
 fn overflowing_request_keeps_response_metadata_and_response_body() {
     let f = Fixture::new();
-    f.enable(false, false);
+    f.recorder.configure(Settings { enabled: true, buffer_mib: 4, ..Settings::default() }).unwrap();
     let c = f.begin();
     f.detail(&c);
     let (release, wait) = mpsc::channel();
@@ -978,7 +989,7 @@ fn response_and_completion_survive_a_full_event_queue() {
     for _ in 0..QUEUE_EVENTS + 1 {
         c.append(Side::Request, b"x");
     }
-    assert!(f.recorder.0.queued.load(Ordering::Relaxed) < QUEUE_BYTES);
+    assert!(f.recorder.0.queued.load(Ordering::Relaxed) < f.recorder.0.queue_limit.load(Ordering::Relaxed));
     c.response(204, "https://synthetic.example/final", &text_headers());
     c.finish("complete");
     release.send(()).unwrap();
@@ -988,4 +999,193 @@ fn response_and_completion_survive_a_full_event_queue() {
     assert_eq!(record.state, "complete");
     assert_eq!(record.capture_error.as_deref(), Some("queue-full"));
     assert!(record.request.body.truncated);
+}
+
+
+#[test]
+fn default_buffer_records_a_ten_mib_request_burst_while_writer_is_paused() {
+    let f = Fixture::new();
+    f.enable(false, false);
+    let c = f.begin();
+    f.detail(&c);
+    let (release, wait) = mpsc::channel();
+    let (ready, started) = mpsc::channel();
+    f.recorder.0.sender.send(Event::Job(Box::new(move |_| {
+        ready.send(()).unwrap();
+        let _ = wait.recv_timeout(Duration::from_secs(15));
+    }))).unwrap();
+    started.recv_timeout(Duration::from_secs(15)).unwrap();
+    let body = vec![b'x'; 10 * MIB as usize];
+    c.append(Side::Request, &body);
+    c.finish("complete");
+    let queued = f.recorder.0.queued.load(Ordering::Relaxed);
+    release.send(()).unwrap();
+    assert!(queued >= body.len(), "only {queued} bytes admitted for a 10 MiB request");
+    let record = f.detail(&c);
+    assert_eq!(record.request.body.captured_bytes, body.len() as u64);
+    assert!(!record.request.body.truncated);
+    assert!(record.capture_error.is_none());
+    assert_eq!(f.snapshot(&c).copy_body(Side::Request).unwrap().as_bytes(), body);
+}
+
+
+#[test]
+fn buffer_settings_preserve_legacy_values_and_survive_restart() {
+    #[derive(serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct LegacySettings {
+        enabled: bool,
+        retain: bool,
+        hide_auth: bool,
+        recent_count: u32,
+        recent_mib: u64,
+        retained_mib: u64,
+        body_mib: u64,
+    }
+    for body_mib in [256, 512, 1024] {
+        let root = tempfile::tempdir().unwrap();
+        let kept = root.path().join("kept");
+        fs::create_dir_all(&kept).unwrap();
+        let legacy = serde_json::json!({
+            "enabled": true, "retain": true, "hideAuth": false,
+            "recentCount": 500, "recentMib": 256, "retainedMib": 128,
+            "bodyMib": body_mib,
+        });
+        fs::write(kept.join("settings.json"), serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let recorder = Recorder::open(root.path().join("recent"), kept.clone()).unwrap();
+        let f = Fixture { root, recorder };
+        let mut settings = f.recorder.settings();
+        assert_eq!(settings.buffer_mib, 32);
+        assert_eq!(settings.body_mib, body_mib);
+        for budget in [4, 8, 16, 32, 64, 128] {
+            settings.buffer_mib = budget;
+            f.recorder.configure(settings.clone()).unwrap();
+            let saved = fs::read(kept.join("settings.json")).unwrap();
+            let old_reader: LegacySettings = serde_json::from_slice(&saved).unwrap();
+            assert_eq!(serde_json::to_value(old_reader).unwrap(), legacy);
+            assert_eq!(serde_json::from_slice::<Settings>(&saved).unwrap().buffer_mib, budget);
+        }
+        for invalid in [0, 3, 5, 129, u64::MAX] {
+            settings.buffer_mib = invalid;
+            assert_eq!(f.recorder.configure(settings.clone()).unwrap_err(), "invalid-network-log-settings");
+            assert_eq!(f.recorder.settings().buffer_mib, 128);
+        }
+        fs::create_dir(kept.join("settings.tmp")).unwrap();
+        settings.buffer_mib = 4;
+        assert!(f.recorder.configure(settings).is_err());
+        assert_eq!(f.recorder.settings().buffer_mib, 128);
+        assert_eq!(f.recorder.0.queue_limit.load(Ordering::Relaxed), 128 * MIB as usize);
+        f.recorder.shutdown();
+        let reopened = Recorder::open(f.root.path().join("recent"), kept).unwrap();
+        assert_eq!(reopened.settings().buffer_mib, 128);
+        assert_eq!(reopened.0.queue_limit.load(Ordering::Relaxed), 128 * MIB as usize);
+        let value = serde_json::to_value(reopened.settings()).unwrap();
+        assert_eq!(serde_json::to_value(serde_json::from_value::<LegacySettings>(value).unwrap()).unwrap(), legacy);
+        reopened.shutdown();
+    }
+}
+
+#[test]
+fn larger_buffers_admit_bursts_beyond_the_old_event_ceiling() {
+    use std::io::Read;
+    for budget in [64, 128] {
+        let f = Fixture::new();
+        f.recorder.configure(Settings { enabled: true, buffer_mib: budget, ..Settings::default() }).unwrap();
+        let c = f.begin();
+        f.detail(&c);
+        let release = f.pause_writer();
+        let length = (budget - 1) * MIB;
+        let body = vec![b'x'; length as usize];
+        c.append(Side::Request, &body);
+        drop(body);
+        c.finish("complete");
+        let queued = f.recorder.0.queued.load(Ordering::Relaxed);
+        release.send(()).unwrap();
+        assert!(queued >= length as usize && queued <= (budget * MIB) as usize);
+        let record = f.detail(&c);
+        assert_eq!(record.request.body.captured_bytes, length);
+        assert!(!record.request.body.truncated);
+        assert!(record.capture_error.is_none());
+        let mut snapshot = f.snapshot(&c);
+        let mut chunk = [0; 64 * 1024];
+        let mut read = 0;
+        loop {
+            let size = snapshot.request.read(&mut chunk).unwrap();
+            if size == 0 { break; }
+            assert!(chunk[..size].iter().all(|byte| *byte == b'x'));
+            read += size as u64;
+        }
+        assert_eq!(read, length);
+    }
+}
+
+#[test]
+fn lowering_the_buffer_preserves_admitted_bytes_and_limits_the_same_active_capture() {
+    let f = Fixture::new();
+    f.enable(false, false);
+    let c = f.begin();
+    f.detail(&c);
+    let release = f.pause_writer();
+    c.append(Side::Request, &vec![b'x'; 10 * MIB as usize]);
+    release.send(()).unwrap();
+    f.recorder.configure(Settings { enabled: true, buffer_mib: 4, ..Settings::default() }).unwrap();
+    let release = f.pause_writer();
+    c.append(Side::Request, &vec![b'y'; 6 * MIB as usize]);
+    c.finish("complete");
+    let queued = f.recorder.0.queued.load(Ordering::Relaxed);
+    release.send(()).unwrap();
+    assert!(queued <= 4 * MIB as usize);
+    let record = f.detail(&c);
+    assert_eq!(record.request.body.observed_bytes, 16 * MIB);
+    assert!(record.request.body.captured_bytes > 10 * MIB);
+    assert!(record.request.body.captured_bytes < 14 * MIB);
+    assert_eq!(record.capture_error.as_deref(), Some("queue-full"));
+    assert!(record.request.body.truncated);
+    let saved = f.snapshot(&c).copy_body(Side::Request).unwrap();
+    assert!(saved.as_bytes()[..10 * MIB as usize].iter().all(|byte| *byte == b'x'));
+    assert!(saved.as_bytes()[10 * MIB as usize..].iter().all(|byte| *byte == b'y'));
+}
+
+#[test]
+fn drained_sse_can_exceed_the_shared_buffer_in_total() {
+    let f = Fixture::new();
+    f.recorder.configure(Settings { enabled: true, buffer_mib: 4, ..Settings::default() }).unwrap();
+    let c = f.begin();
+    c.response(200, "https://synthetic.example/stream", &text_headers());
+    let chunk = vec![b'x'; MIB as usize];
+    for _ in 0..12 {
+        c.append(Side::Response, &chunk);
+        f.detail(&c);
+    }
+    c.finish("complete");
+    let record = f.detail(&c);
+    assert_eq!(record.response.body.captured_bytes, 12 * MIB);
+    assert!(!record.response.body.truncated);
+    assert!(record.capture_error.is_none());
+    assert_eq!(f.snapshot(&c).copy_body(Side::Response).unwrap().len(), 12 * MIB as usize);
+}
+
+#[test]
+fn fixed_body_limit_applies_at_512_mib_to_each_side_regardless_of_legacy_setting() {
+    for legacy in [256, 1024] {
+        let f = Fixture::new();
+        f.recorder.configure(Settings { enabled: true, body_mib: legacy, ..Settings::default() }).unwrap();
+        let c = f.begin();
+        let signal = c.0.0.as_ref().unwrap();
+        // Seed the admitted prefix to exercise both exact boundaries without allocating 1 GiB.
+        for side in [Side::Request, Side::Response] {
+            signal.admitted[side.index()].store(512 * MIB - 16, Ordering::Relaxed);
+            signal.observed[side.index()].store(512 * MIB - 16, Ordering::Relaxed);
+            c.append(side, &[b'z'; 32]);
+        }
+        c.finish("complete");
+        let record = f.detail(&c);
+        assert_eq!(record.capture_error.as_deref(), Some("body-limit"));
+        for side in [Side::Request, Side::Response] {
+            assert_eq!(record.body(side).observed_bytes, 512 * MIB + 16);
+            assert_eq!(record.body(side).captured_bytes, 16);
+            assert!(record.body(side).truncated);
+            assert_eq!(f.snapshot(&c).copy_body(side).unwrap(), "z".repeat(16));
+        }
+    }
 }

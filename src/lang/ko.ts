@@ -2139,7 +2139,7 @@ export const languageKorean = {
             "recentCount": "최근 요청 수",
             "recentBudget": "최근 기록 용량",
             "retainedBudget": "보관 용량",
-            "bodyBudget": "본문당 한도",
+            "bufferBudget": "기록 버퍼 용량",
             "recent": "최근 요청",
             "retained": "보관한 로그",
             "search": "URL 또는 출처 검색",

@@ -2324,7 +2324,7 @@ export const languageEnglish = {
             "recentCount": "Recent requests",
             "recentBudget": "Recent storage",
             "retainedBudget": "Retained storage",
-            "bodyBudget": "Per-body limit",
+            "bufferBudget": "Recording buffer size",
             "recent": "Recent requests",
             "retained": "Kept logs",
             "search": "Search URL or source",
