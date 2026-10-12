@@ -107,6 +107,21 @@ The tag version must match the product version files and release-notes filename.
 If both products are released from the same commit, create both tags on that
 commit and push both explicit tag refs together.
 
+## Update your local branch
+
+After publication, the workflow updates the download sections in `README.md` and
+`README.ko.md` and commits any changes to `main`. With a clean working tree and no
+unpushed commits, run `git pull --ff-only origin main` from your local `main`.
+If you have local-only commits, rebase them onto the updated remote branch before
+pushing:
+
+```bash
+git pull --rebase origin main
+git push origin main
+```
+
+Resolve any conflicts before continuing the rebase and pushing.
+
 ## Published releases are immutable
 
 Do not move or reuse a published tag. Do not replace assets on a published

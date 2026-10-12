@@ -9,6 +9,28 @@ const cacheWorkflow = readFileSync(new URL("../../.github/workflows/release-cach
 const checkWorkflow = readFileSync(new URL("../../.github/workflows/release-check.yml", import.meta.url), "utf8").replace(/\r\n/g, "\n");
 const referenceAction = readFileSync(new URL("../../.github/actions/test-references/action.yml", import.meta.url), "utf8").replace(/\r\n/g, "\n");
 
+test("README updates follow successful production publication and share its serialization group", () => {
+  const block = /\n  update-readme:\n([\s\S]*?)(?=\n  [\w-]+:\n|$)/.exec(workflow)?.[1];
+  assert(block);
+  assert.match(block, /needs: \[source, release-result\]/);
+  const condition = /if: \$\{\{ (.+) \}\}/.exec(block)?.[1];
+  assert(condition);
+  const permits = (publish, result, cancelled = false) => runInNewContext(condition
+    .replace(/cancelled\(\)/g, JSON.stringify(cancelled))
+    .replace(/inputs\.publish/g, JSON.stringify(publish))
+    .replace(/needs\.release-result\.result/g, JSON.stringify(result)));
+  assert.equal(permits(true, "success"), true);
+  assert.equal(permits(false, "success"), false);
+  assert.equal(permits(true, "success", true), false);
+  for (const result of ["failure", "skipped", "cancelled"]) assert.equal(permits(true, result), false);
+  assert.match(block, /permissions:\n      contents: write/);
+  assert.match(block, /group: risunest-stable-publish\n      queue: max\n      cancel-in-progress: false/);
+  assert.match(block, /ref: "\$\{\{ needs\.source\.outputs\.source_commit \}\}", persist-credentials: false/);
+  assert.match(block, /GITHUB_TOKEN: \$\{\{ github\.token \}\}/);
+  assert.match(block, /run: node scripts\/release\/readme\.mjs/);
+  assert.doesNotMatch(block, /TAURI_PRIVATE_KEY|TAURI_KEY_PASSWORD|ANDROID_KEYSTORE|continue-on-error/);
+});
+
 test("both products and pull requests run shared native signature and catalog tests", () => {
   const commonTests = workflow.slice(workflow.indexOf("\n  release-tooling-tests:\n"), workflow.indexOf("\n  app-web-tests:\n"));
   assert.doesNotMatch(commonTests, /\n    if: inputs\.product/);
