@@ -24,9 +24,18 @@ Platform targets: Windows, macOS, Linux, Android, and iOS, all equal. A feature,
 - `pnpm test:full:shared` and `pnpm test:full` are the complete gates. They fail on missing prerequisites and never claim verification of another OS. `pnpm test:related` is local feedback only, not acceptance evidence.
 - Platform parity is not a per-task test matrix. A shared-path change is verified by `pnpm check` and the tests for the changed area; build or run a platform only when the change reaches platform-conditional code (`isTauri`, `isMobile`, `isAndroid`, `isIOS`), `src-tauri` Rust, or the Android/iOS project files, and then only the platforms that code serves. Never run all five targets for one task.
 - Node compatibility contracts compare against pinned RisuAI and PocketRisu checkouts; `.github/actions/test-references` and `tests/compatibleExportREADME.md` give the commits and the override variables. Never start or install the reference applications.
-- Unit tests must not make unplanned network requests: the fetch and happy-dom guards fail teardown even for caught errors. A test that owns a loopback server allows one exact origin with `allowTestLoopbackOrigin` from `tests/support/testNetwork.ts` and revokes it in teardown.
-- Source-only assertions read product files through `node:fs`, not `?raw` imports, which can hide uncovered Svelte lines from V8 coverage.
 - `package.json` keeps the upstream RisuAI scripts first, then RisuNest additions grouped by area. Name a new script `<area>:<action>[:<variant>]` and hyphenate multi-word segments. `tauribuild*` are the Vite steps that `beforeBuildCommand` runs; a harness keeps its own Vite build inline in its Tauri config or runner instead of adding a script.
+
+## Writing Tests
+
+- A test belongs only if it fails when a product behavior breaks and no other test would catch it. Temporarily break the product line a new test guards and confirm it fails; a test that passes either way, or because a mock returns the answer, does not count.
+- A fix extends the nearest existing test instead of adding a near-copy. Never add a test whose only assertion is that removed code or a never-released shape stays gone.
+- Assert what a user or caller observes (stored or returned data, the command sent, what the screen offers), not call counts, argument arrays or private helpers, unless that is the contract. When a change breaks a pinned internal detail, move the assertion to the outcome instead of updating the detail.
+- Mock only process boundaries (Tauri `invoke`, network, file system, clock) and use real modules for pure code and `src/lang`. Share one factory typed with `satisfies typeof import(...)` instead of copying a mock, so an export change fails `pnpm check` in one place.
+- Assert UI text only where code chooses or builds it, through language keys, and source or workflow text only for a named rule or cross-file contract, never style. Read product files through `node:fs`, not `?raw` imports, which can hide uncovered Svelte lines from V8 coverage.
+- Browser and E2E tests drive the real UI or public commands; a fixture adapter never reimplements a product module.
+- Keep tests small and portable: inject a limit to prove the bound at small N, wait on conditions instead of sleeping, and depend on no machine path, port or tool on PATH.
+- Unit tests must not make unplanned network requests: the fetch and happy-dom guards fail teardown even for caught errors. A test that owns a loopback server allows one exact origin with `allowTestLoopbackOrigin` from `tests/support/testNetwork.ts` and revokes it in teardown.
 
 ## Conventions and Architecture
 
