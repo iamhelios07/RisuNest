@@ -5,7 +5,7 @@ const state = vi.hoisted(() => ({
     settings: vi.fn(() => ({ nativeFileLogEnabled: false })), updates: vi.fn(),
     hub: vi.fn(),
 }))
-vi.mock('../platform', () => ({ isTauri: true }))
+vi.mock('../platform', async () => (await import('../platform.testSupport')).platformModule({ runtime: 'tauri', os: 'windows' }))
 vi.mock('./deviceMarkers', () => ({ getDeviceMarkers: () => ({ flush: state.flush }), reloadDeviceMarkers: state.reload }))
 vi.mock('./deviceSettings', () => ({ reloadDeviceSettings: state.settings }))
 vi.mock('../update/settings', () => ({ reloadAppUpdateSettings: state.updates }))

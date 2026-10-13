@@ -16,7 +16,7 @@ vi.mock('../alert', () => ({
     alertError: vi.fn(),
     alertNormal: vi.fn(),
 }))
-vi.mock('../platform', () => ({ isTauriAndroid: false }))
+vi.mock('../platform', async () => (await import('../platform.testSupport')).platformModule({ runtime: 'tauri', os: 'android' }))
 vi.mock('../plugins/plugins.svelte', () => ({
     loadPluginsAfterAuthoritativeRestore: vi.fn(),
 }))

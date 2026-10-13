@@ -1,7 +1,7 @@
 import { afterEach, expect, it, vi } from 'vitest'
 
 const effects = vi.hoisted(() => ({ hub: vi.fn() }))
-vi.mock('../platform', () => ({ isTauri: true, isTauriIOS: false }))
+vi.mock('../platform', async () => (await import('../platform.testSupport')).platformModule({ runtime: 'tauri', os: 'windows' }))
 vi.mock('../characterCards', () => ({ applyHubSelection: effects.hub }))
 vi.mock('@tauri-apps/api/core', async importOriginal => ({
     ...await importOriginal<typeof import('@tauri-apps/api/core')>(), invoke: vi.fn(async () => undefined),

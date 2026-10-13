@@ -222,11 +222,7 @@ describe('independent windowed conversation interfaces', () => {
             alertSelect: vi.fn(),
         }))
         vi.doMock('../globalApi.svelte', () => ({ fetchNative: vi.fn(), readImage: vi.fn() }))
-        vi.doMock('../platform', () => ({
-            isTauriMobile: true,
-            isTauri: false,
-            isMobile: false,
-        }))
+        vi.doMock('../platform', async () => (await import('../platform.testSupport')).platformModule({ runtime: 'web', os: 'windows' }))
         vi.doMock('../tokenizer', () => ({ tokenize: vi.fn() }))
         vi.doMock('../util', () => ({
             asBuffer: vi.fn(),

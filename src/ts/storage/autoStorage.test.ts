@@ -40,7 +40,7 @@ vi.mock('../globalApi.svelte', () => ({
     replaceDbResources: (value: unknown) => value,
 }))
 
-vi.mock('src/ts/platform', () => ({ isTauri: false }))
+vi.mock('src/ts/platform', async () => (await import('src/ts/platform.testSupport')).platformModule({ runtime: 'web', os: 'windows' }))
 vi.mock('./opfsStorage', () => ({ OpfsStorage: class {} }))
 
 vi.mock('../alert', () => ({

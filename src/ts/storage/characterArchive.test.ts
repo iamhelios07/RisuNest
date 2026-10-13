@@ -9,7 +9,7 @@ const harness = vi.hoisted(() => ({
     database: { characters: [{ chaId: 'char-a' }], account: undefined },
     runtime: undefined as object | undefined,
 }))
-vi.mock('../platform', () => ({ isTauri: true }))
+vi.mock('../platform', async () => (await import('../platform.testSupport')).platformModule({ runtime: 'tauri', os: 'windows' }))
 vi.mock('../alert', () => ({ alertConfirm: harness.confirm, alertError: harness.error }))
 vi.mock('../stores.svelte', () => ({ DBState: { db: harness.database }, selectedCharID: writable(0) }))
 vi.mock('src/lib/workingSetNavigation', () => ({ clearCharacterSelection: harness.clearSelection }))

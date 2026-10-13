@@ -87,11 +87,7 @@ vi.mock('./persistentDataRuntime.svelte', () => ({
     materializePersistentDatabaseSnapshotWithRevision:
         mocks.materializePersistentDatabaseSnapshotWithRevision,
 }))
-vi.mock('../platform', () => ({
-    get isTauri() {
-        return mocks.isTauri
-    },
-}))
+vi.mock('../platform', async () => (await import('../platform.testSupport')).platformModule(() => ({ runtime: mocks.isTauri ? 'tauri' : 'web', os: 'windows' })))
 vi.mock('./platformBlobStore', () => ({
     resolveBlobStore: async () => ({
         read: async (key: string) => mocks.blobAssets.get(key) ?? null,
