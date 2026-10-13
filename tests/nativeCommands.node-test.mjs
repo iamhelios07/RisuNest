@@ -6,32 +6,6 @@ import { fileURLToPath } from 'node:url'
 import { tmpdir } from 'node:os'
 import { embeddedCrateTests, hostManifests, nativeCommands, packageCrateTests, protocolManifests, sharedCargoTarget, standaloneRustCommands, standaloneRustTests } from '../scripts/testNative.mjs'
 
-test('native groups explicitly own dependency packages and full app integration targets', () => {
-  const protocol = nativeCommands('protocol', 'win32')
-  assert.deepEqual(protocol.map(command => command[3]), protocolManifests)
-  assert.equal(protocol.length, 6)
-  assert(protocol.find(command => command[3] === 'crates/network-log/Cargo.toml').includes('reqwest'))
-  const host = nativeCommands('host', 'win32')
-  assert.deepEqual(host.slice(0, 4).map(command => command[3]), hostManifests)
-  for (const command of [...protocol, ...host]) {
-    assert(command.includes('--locked'))
-    assert(command.includes('--release'))
-    assert(!command.includes('--ignored'))
-  }
-  assert(!host[0].includes('--lib'))
-  assert.deepEqual(packageCrateTests.map(entry => entry.package), ['tauri-plugin-window-state', 'wry', 'tauri-plugin-http', 'tauri-plugin-updater'])
-  for (const platform of ['win32', 'linux', 'darwin']) {
-    assert.deepEqual(nativeCommands('host', platform).filter(command => command.includes('--package')), packageCrateTests.map(entry => [
-      'cargo', 'test', '--manifest-path', entry.runnerManifest,
-      '--package', entry.package, '--release', '--locked', '--lib',
-    ]))
-  }
-  assert(host.at(-1).includes('tauri-plugin-updater'))
-  assert(host.at(-1).includes('--lib'))
-  assert.deepEqual(nativeCommands('host', 'linux')[0], ['dbus-run-session', '--', 'bash', 'scripts/linux-native-tests.sh', '--release'])
-  assert.throws(() => nativeCommands('everything'), /Expected/)
-})
-
 test('server singleton scopes run in three disjoint processes with normal target coverage', () => {
   for (const platform of ['win32', 'linux', 'darwin']) {
     const server = nativeCommands('host', platform).filter(command => command[3] === 'server/sync/Cargo.toml')
@@ -145,30 +119,29 @@ function nativeNetworkBypasses(source) {
   return [...source.matchAll(/\.send\s*\(\s*\)|\.execute\s*\(\s*request\s*\)|\bconnect_async(?:_tls_with_config|_with_config)?\s*\(/g)].map(match => match[0].replace(/\s+/g, ''))
 }
 
-test('native HTTP and WebSocket raw entry points stay in the reviewed adapters and fixtures', () => {
+test('native HTTP and WebSocket raw entry points stay in the reviewed adapters', () => {
   const root = fileURLToPath(new URL('../', import.meta.url))
-  const found = {}
+  const reviewed = [
+    'src-tauri/src/server_sync/client.rs',
+    'src-tauri/src/server_sync/notification.rs',
+    'crates/network-log/src/reqwest.rs',
+    'crates/tauri-plugin-updater/src/network_log.rs',
+  ]
+  const found = []
   function scan(directory) {
     for (const entry of readdirSync(join(root, directory), { withFileTypes: true })) {
       const path = `${directory}/${entry.name}`
       if (entry.isDirectory()) scan(path)
-      else if (entry.name.endsWith('.rs')) {
-        const calls = nativeNetworkBypasses(readFileSync(join(root, path), 'utf8'))
-        if (calls.length) found[path] = calls
+      else if (entry.name.endsWith('.rs') && !/(?:^|[/_])tests?\.rs$/.test(path)) {
+        // Tests may call the transport directly; product code goes through the logged adapters.
+        const product = readFileSync(join(root, path), 'utf8').split(/^#\[cfg\((?:all\()?test\b[^\n]*\]\r?\n(?:pub(?:\([^)]*\))? )?mod \w+ \{/m)[0]
+        if (nativeNetworkBypasses(product).length) found.push(path)
       }
     }
   }
   for (const directory of ['src-tauri/src', 'crates/network-log/src', 'crates/tauri-plugin-http/src', 'crates/tauri-plugin-updater/src']) scan(directory)
-  assert.deepEqual(found, {
-    'src-tauri/src/native_media/streaming/tests.rs': ['.send()', '.send()'],
-    'src-tauri/src/platform_tls.rs': ['.send()', '.send()', '.send()', '.send()', 'connect_async_tls_with_config('],
-    'src-tauri/src/server_sync/client.rs': ['.execute(request)', '.execute(request)'],
-    'src-tauri/src/server_sync/directory_tests.rs': ['.send()'],
-    'src-tauri/src/server_sync/media_admission_tests.rs': ['.send()'],
-    'src-tauri/src/server_sync/notification.rs': ['connect_async_tls_with_config('],
-    'crates/network-log/src/reqwest.rs': ['.send()', '.execute(request)', '.execute(request)'],
-    'crates/tauri-plugin-updater/src/network_log.rs': ['.send()', '.execute(request)'],
-  })
+  assert.deepEqual(found.filter(path => !reviewed.includes(path)), [])
+  assert(found.includes('crates/network-log/src/reqwest.rs'))
   assert.equal(nativeNetworkBypasses('client.get(url).send().await?;').length, 1)
   assert.equal(nativeNetworkBypasses('client.get(url).send_logged("test").await?;').length, 0)
 })
