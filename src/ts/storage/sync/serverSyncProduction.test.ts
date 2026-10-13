@@ -39,7 +39,7 @@ const f = vi.hoisted(() => ({
 }))
 vi.mock('@tauri-apps/api/core', () => ({ invoke: f.invoke, Channel: class { onmessage = (_value: unknown) => {} } }))
 vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn(async () => () => {}) }))
-vi.mock('src/ts/platform', () => ({ get isTauri() { return f.native } }))
+vi.mock('src/ts/platform', async () => (await import('src/ts/platform.testSupport')).platformModule(() => ({ runtime: f.native ? 'tauri' : 'web', os: 'windows' })))
 vi.mock('src/ts/stores.svelte', () => ({ selectedCharID: { subscribe: (run: (value: number) => void) => { run(f.selectedIndex); return () => {} } } }))
 vi.mock('../database.svelte', () => ({ getDatabase: () => f.database }))
 vi.mock('./bindingProduction', async importOriginal => ({

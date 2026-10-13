@@ -12,7 +12,7 @@ const h = vi.hoisted(() => ({
 }))
 vi.mock('@tauri-apps/api/core', () => ({ invoke: h.invoke }))
 vi.mock('@tauri-apps/api/event', () => ({ listen: async (name: string, handler: () => void) => { h.events.set(name, handler); return () => { h.events.delete(name) } } }))
-vi.mock('src/ts/platform', () => ({ isTauri: true }))
+vi.mock('src/ts/platform', async () => (await import('src/ts/platform.testSupport')).platformModule({ runtime: 'tauri', os: 'windows' }))
 vi.mock('src/ts/stores.svelte', () => ({ selectedCharID: { subscribe: (run: (value: number) => void) => { run(-1); return () => {} } } }))
 vi.mock('../database.svelte', () => ({ getDatabase: () => ({ characters: [] }) }))
 vi.mock('./bindingDialog', () => ({ confirmSyncBindingReplacement: async () => true, confirmPreviousStorageFiles: async () => 'connect', downloadPreviousStorageFiles: async () => {} }))

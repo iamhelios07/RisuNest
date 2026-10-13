@@ -25,7 +25,7 @@ const mocks = vi.hoisted(() => ({
     release: vi.fn(),
     hold: vi.fn(),
 }))
-vi.mock('../../platform', () => ({ get isTauri() { return mocks.native.enabled } }))
+vi.mock('../../platform', async () => (await import('../../platform.testSupport')).platformModule(() => ({ runtime: mocks.native.enabled ? 'tauri' : 'web', os: 'windows' })))
 vi.mock('../libraryCharacters', () => ({ hasLibraryCharacters: mocks.characters }))
 vi.mock('./serverSyncProduction', () => ({
     getServerSyncController: () => ({ beginReplacement: mocks.beginReplacement, confirmReplacement: mocks.confirmReplacement }),
