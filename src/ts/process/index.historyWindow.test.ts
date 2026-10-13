@@ -215,8 +215,8 @@ function installWindowed(stored: Message[], conversation: Partial<Chat> = {}) {
             startIndex,
             endIndex: startIndex + items.length,
             totalMessages: stored.length,
-            hasMoreBefore: false,
-            hasMoreAfter: false,
+            hasMoreBefore: startIndex > 0,
+            hasMoreAfter: startIndex + items.length < stored.length,
         },
     })
     const lease = createLeaseStub({
