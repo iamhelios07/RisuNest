@@ -470,11 +470,27 @@ function conversationMatchesAfterIdNormalization(
     const { message: capturedMessages, ...capturedMetadata } = captured
     return (
         canonicalJson(projectedMetadata) === canonicalJson(capturedMetadata) &&
-        projectedMessages.length === capturedMessages.length &&
-        projectedMessages.every((message, index) =>
-            messageMatchesAfterIdNormalization(message, capturedMessages[index]),
-        )
+        (projectedMessages === capturedMessages || (
+            projectedMessages.length === capturedMessages.length &&
+            projectedMessages.every((message, index) =>
+                messageMatchesAfterIdNormalization(message, capturedMessages[index]),
+            )
+        ))
     )
+}
+
+/** `canonicalJson(left) === canonicalJson(right)`, serializing only metadata when both share one message array. */
+function conversationJsonEquals(left: Chat, right: Chat): boolean {
+    if (left.message !== right.message) return canonicalJson(left) === canonicalJson(right)
+    const { message: _leftMessages, ...leftMetadata } = left
+    const { message: _rightMessages, ...rightMetadata } = right
+    return canonicalJson(leftMetadata) === canonicalJson(rightMetadata)
+}
+
+/** A copy whose metadata is owned and whose message array is shared. */
+function cloneConversationSharingMessages(conversation: Chat): Chat {
+    const { message, ...metadata } = conversation
+    return { ...safeStructuredClone(metadata), message } as Chat
 }
 
 interface ReplacementAdmission extends PersistentMutationToken {
@@ -4162,7 +4178,15 @@ export class SaveCoordinator {
             )
             if (projectedMatches.length !== 1 || capturedMatches.length !== 1) continue
             const projectedIndex = projected.chats.indexOf(projectedMatches[0])
-            let conversation = safeStructuredClone(projectedMatches[0])
+            // Metadata-only events leave the baseline's messages as they are, so the projection
+            // shares that array; when the capture holds the same array, only metadata is compared.
+            const sharesMessages =
+                Array.isArray(projectedMatches[0].message) &&
+                conversationPending.every(({ event }) => event.mutations.every((range) =>
+                    !range.completeOwner && range.deleteCount === 0 && range.messages.length === 0))
+            let conversation = sharesMessages
+                ? cloneConversationSharingMessages(projectedMatches[0])
+                : safeStructuredClone(projectedMatches[0])
             if (!Array.isArray(conversation.message)) continue
 
             let previousEvent: ActiveConversationMutationEvent | undefined
@@ -4200,7 +4224,9 @@ export class SaveCoordinator {
                         break
                     }
                     const messages = safeStructuredClone(range.messages)
-                    replaceArrayRange(conversation.message, range.start, deleteCount, messages)
+                    if (!sharesMessages) {
+                        replaceArrayRange(conversation.message, range.start, deleteCount, messages)
+                    }
                     eventMutations.push({
                         type: 'replace-range',
                         characterId: event.characterId,
@@ -4224,11 +4250,13 @@ export class SaveCoordinator {
                 previousEvent = event
                 if (conversationMatchesAfterIdNormalization(conversation, capturedMatches[0])) {
                     coveredCount = conversationMutations.length
-                    coveredConversation = safeStructuredClone(conversation)
+                    coveredConversation = sharesMessages
+                        ? cloneConversationSharingMessages(conversation)
+                        : safeStructuredClone(conversation)
                 }
             }
             if (coveredCount === 0 || !coveredConversation) continue
-            if (canonicalJson(coveredConversation) !== canonicalJson(capturedMatches[0])) exactConversationValues = false
+            if (!conversationJsonEquals(coveredConversation, capturedMatches[0])) exactConversationValues = false
             conversation = coveredConversation
             projected.chats[projectedIndex] = conversation
             for (let index = 0; index < coveredCount; index++) {

@@ -15,6 +15,8 @@ import {
     makeStore,
     SaveCoordinator,
 } from './saveCoordinator.testSupport'
+import { createPersistenceCanonicalCapture } from './reactivePersistenceCapture.svelte'
+import { createPersistentSaveObserverHarness } from './tests/persistentSaveObserverHarness.svelte'
 
 describe('SaveCoordinator', () => {
     it('rejects an uncovered owned append without acknowledging it and allows a later retry', async () => {
@@ -533,6 +535,79 @@ describe('SaveCoordinator', () => {
             sessionVersion: 2,
             revision: 3,
         }))
+    })
+
+    it('saves variable-only changes from conversation metadata and writes what a whole-conversation projection writes', async () => {
+        const body = 'synthetic message body'
+        const flush = async (capture: 'reactive' | 'plain') => {
+            const initial = makeChattyDatabase()
+            for (const message of initial.characters[0].chats[1].message) message.data += `: ${body}`
+            const state = capture === 'reactive' ? createPersistentSaveObserverHarness(initial) : null
+            const database = state?.database ?? initial
+            const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+            const onPersisted = vi.fn()
+            const coordinator = new SaveCoordinator({
+                store: makeStore(commit),
+                ...(state ? {
+                    canonicalCapture: createPersistenceCanonicalCapture({
+                        root: () => state.database,
+                        presets: () => [],
+                        pluginStorage: () => null,
+                        character: () => state.database.characters[0],
+                        characters: () => state.database.characters,
+                    }),
+                } : {}),
+                captureRoot: () => captureRoot(database),
+                captureCharacters: () => database.characters,
+                captureSelectedCharacter: () => database.characters[0],
+                replaceDatabase: () => undefined,
+                onConversationMutationPersisted: onPersisted,
+            })
+            coordinator.initialize(2)
+            const session = new ActiveConversationSession({
+                characterId: 'char-a', conversationId: 'two',
+                conversation: database.characters[0].chats[1], storeRevision: 2,
+                onMutation: (event) => coordinator.recordActiveConversationMutation(event),
+            })
+            session.updateChatVariables(new Map([['hp', '9']]))
+            session.updateChatVariables(new Map([['mood', 'calm']]))
+
+            // Whether the flush serializes or copies a message body.
+            const readsMessages: string[] = []
+            const stringify = JSON.stringify
+            const clone = globalThis.structuredClone
+            const serialized = vi.spyOn(JSON, 'stringify').mockImplementation(((...args: Parameters<typeof JSON.stringify>) => {
+                const json = stringify(...args)
+                if (typeof json === 'string' && json.includes(body)) readsMessages.push('serialize')
+                return json
+            }) as typeof JSON.stringify)
+            const copied = vi.spyOn(globalThis, 'structuredClone').mockImplementation(((value: unknown, options?: StructuredSerializeOptions) => {
+                try {
+                    if (stringify(value)?.includes(body)) readsMessages.push('copy')
+                } catch {
+                    // Not serializable as JSON; the clone below decides.
+                }
+                return clone(value, options)
+            }) as typeof structuredClone)
+            try {
+                await coordinator.flushPendingDataLocally('variable-only')
+            } finally {
+                serialized.mockRestore()
+                copied.mockRestore()
+            }
+            expect(onPersisted).toHaveBeenCalledTimes(2)
+            expect(coordinator.hasPendingPersistenceWork).toBe(false)
+            return { request: commit.mock.calls[0][0], readsMessages }
+        }
+
+        const reactive = await flush('reactive')
+        const plain = await flush('plain')
+
+        expect(reactive.readsMessages).toEqual([])
+        expect(plain.readsMessages).not.toEqual([])
+        expect(reactive.request).toEqual(plain.request)
+        expect(reactive.request.conversations.map((mutation: { conversation: Chat }) =>
+            mutation.conversation.scriptstate)).toEqual([{ $hp: '9' }, { $hp: '9', $mood: 'calm' }])
     })
 
     it('persists one atomic multi-range and metadata operation through one working-set commit', async () => {
