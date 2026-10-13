@@ -141,7 +141,6 @@ export class ScriptConversationAccess {
             this.options.session,
             this.options.chat,
             this.options.onCommitted,
-            { variablesFollowSession: true },
         )
         if (edits) {
             const messages = operation.chat.message

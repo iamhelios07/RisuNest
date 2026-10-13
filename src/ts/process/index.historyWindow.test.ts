@@ -407,6 +407,22 @@ describe('sendChat with the history window', () => {
         expect(after.map((message) => message.data)).toEqual(windowedStore.map((message) => message.data))
     })
 
+    it('opens the window of a complete conversation when a chat variable commits while it is measured', async () => {
+        const { owner, session } = installComplete(messages(300))
+        const tokenizer = await import('../tokenizer')
+        vi.mocked(tokenizer.tokenize).mockImplementationOnce(async () => {
+            session.updateChatVariables(new Map([['scratch', 'display']]), { origin: 'display' })
+            return 10
+        })
+        mocks.modelResponse = streamingResponse('answer')
+
+        await expect(sendChat({ historyLimit: true })).resolves.toBe(true)
+
+        expect(session.materializeCompatibilityArray().at(-1)?.data).toBe('answer')
+        expect(owner.chats[0].scriptstate).toEqual({ $scratch: 'display' })
+        expect(mocks.alertError).not.toHaveBeenCalled()
+    })
+
     it('passes absolute message indices to editprocess scripts', async () => {
         installWindowed(messages(1000))
 

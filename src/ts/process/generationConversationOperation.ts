@@ -367,9 +367,8 @@ function captureEmptyTailFallbackOperation(
             || options.getCurrentChat() !== options.chat
         ) return false
         return session === null || (
-            session.isActive
-            && options.getCurrentSession() === session
-            && session.version === sessionVersion
+            options.getCurrentSession() === session
+            && session.isContentUnchangedSince(sessionVersion!)
             && session.totalMessages === messageCount
             && session.materializeCompatibilityArray() === options.chat.message
         )

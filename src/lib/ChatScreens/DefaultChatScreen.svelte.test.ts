@@ -8,11 +8,12 @@ import { chatScreenState } from '../../ts/ui/chatScreenState.svelte'
 import { doingChat } from 'src/ts/process/index.svelte'
 import { updateDeviceSettings } from 'src/ts/storage/deviceSettings'
 import { noteGenerationMessage, noteGenerationStarted, subscribeGenerationEnd, type GenerationEndRecord } from 'src/ts/process/generationEnd'
+import { ActiveConversationSession } from 'src/ts/storage/activeConversationSession'
 
 const mocks = vi.hoisted(() => ({ trigger: vi.fn(), generate: vi.fn(), process: vi.fn(), error: vi.fn(), postFile: vi.fn(),
     bounded: false, appended: [] as any[], acquireComplete: vi.fn(), flush: vi.fn(async () => {}),
     historyLimit: false, targetCaptures: 0, openWindow: vi.fn(), notify: vi.fn(async () => {}), scope: { finish: vi.fn(), release: vi.fn() }, createScope: vi.fn(),
-    translate: vi.fn(), chatsProps: null as any, confirm: vi.fn(async () => false),
+    translate: vi.fn(), chatsProps: null as any, confirm: vi.fn(async () => false), session: null as ActiveConversationSession | null,
     viewport: { jumpTo: async () => true, jumpToTop: vi.fn(async () => true), jumpToBottom: vi.fn(async () => true), navigateMessage: vi.fn(async () => true) },
     target: { characterId: 'character', conversationId: 'chat', navigationGeneration: 1, storeRevision: 1, sessionToken: 'windowed' },
 }))
@@ -34,9 +35,9 @@ vi.mock('src/ts/process/command', () => ({}))
 vi.mock('src/ts/process/files/multisend', () => ({ postChatFile: mocks.postFile }))
 vi.mock('src/ts/globalApi.svelte', () => ({ aiLawApplies: false, chatFoldedState: writable(false), chatFoldedStateMessageIndex: writable(0) }))
 vi.mock('src/ts/storage/persistentDataRuntime.svelte', () => ({
-    getActiveConversationSession: () => null,
+    getActiveConversationSession: () => mocks.session,
     getPersistentDataRuntime: () => ({
-        captureSelectedConversationTarget: () => mocks.bounded || mocks.historyLimit || mocks.targetCaptures-- > 0 ? mocks.target : null, getActiveConversationSession: () => null,
+        captureSelectedConversationTarget: () => mocks.bounded || mocks.historyLimit || mocks.targetCaptures-- > 0 ? mocks.target : null, getActiveConversationSession: () => mocks.session,
         acknowledgeGenerationCompletion: async () => {},
         captureSelectedConversationAuthority: () => ({ totalMessages: 1500 }),
         acquireCompleteConversation: mocks.acquireComplete,
@@ -89,6 +90,7 @@ beforeEach(async () => {
     mocks.bounded = false
     mocks.historyLimit = false
     mocks.targetCaptures = 0
+    mocks.session = null
     mocks.target = { characterId: 'character', conversationId: 'chat', navigationGeneration: 1, storeRevision: 1, sessionToken: 'windowed' }
     mocks.createScope.mockReturnValue(mocks.scope)
     mocks.appended = []
@@ -353,6 +355,25 @@ it.each([
     expect(mocks.error).toHaveBeenCalledWith(language.chatConversationActionFailed)
     expect(mocks.error).toHaveBeenCalledOnce()
     expect(mocks.confirm).not.toHaveBeenCalled()
+})
+
+it('creates the next response candidate when a chat variable commits while the user confirms', async () => {
+    const conversation = DBState.db.characters[0].chats[0]
+    conversation.message = [
+        { role: 'user', data: 'question', chatId: 'question' },
+        { role: 'char', data: 'answer', chatId: 'answer' },
+    ]
+    const session = new ActiveConversationSession({
+        characterId: 'character', conversationId: 'chat', conversation, storeRevision: 1,
+    })
+    mocks.session = session
+    mocks.confirm.mockImplementationOnce(async () => {
+        session.updateChatVariables(new Map([['scratch', 'display']]), { origin: 'display' })
+        return true
+    })
+    await mocks.chatsProps.onNextReroll()
+    expect(mocks.confirm).toHaveBeenCalledWith(language.confirmNewResponseCandidate)
+    expect(mocks.generate).toHaveBeenCalledOnce()
 })
 
 it('tells the user when the tail cannot be reopened after a reroll generated a reply', async () => {

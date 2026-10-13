@@ -115,7 +115,7 @@ import {
     setDatabaseLite,
 } from '../storage/database.svelte'
 import { roadmap14Corpus } from '../storage/tests/roadmap14/losslessCorpus'
-import { ActiveConversationSession } from '../storage/activeConversationSession'
+import { ActiveConversationSession, cloneConversationMetadata } from '../storage/activeConversationSession'
 import { DBState, selectedCharID } from '../stores.svelte'
 import { doingChat } from './generationState'
 import { previewFormated, sendChat } from './index.svelte'
@@ -471,6 +471,77 @@ describe('sendChat prompt history characterization', () => {
             'plain second',
         ])
         expect(session.version).toBe(2)
+        expect(session.activePinReasons).toEqual([])
+    })
+
+    it.each([
+        ['display Lua variable', (session: ActiveConversationSession) => {
+            session.updateChatVariables(new Map([['scratch', 'display']]), { origin: 'display' })
+        }],
+        ['trigger variable', (session: ActiveConversationSession) => {
+            session.updateChatVariables(new Map([['scratch', 'trigger']]))
+        }],
+        ['plugin scriptstate patch', (session: ActiveConversationSession, chat: Chat) => {
+            const expectedMetadata = cloneConversationMetadata(chat)
+            session.applyOperation({
+                expectedVersion: session.version,
+                expectedMetadata,
+                metadata: { ...expectedMetadata, scriptstate: { ...chat.scriptstate, $scratch: 'plugin' } },
+            })
+        }],
+    ] as const)('keeps a pending prompt operation and history when a %s commits while the prompt builds', async (_name, writeVariable) => {
+        setDatabaseLite(makeDatabase())
+        const selectedCharacter = DBState.db.characters[0] as character
+        const liveChat = selectedCharacter.chats[0]
+        liveChat.message = [
+            { role: 'user', data: 'WRITE:first', chatId: 'first' },
+            { role: 'char', data: 'second', chatId: 'second' },
+            { role: 'user', data: 'third', chatId: 'third' },
+        ]
+        liveChat.fmIndex = -1
+        liveChat.scriptstate = { $kept: 'before' }
+        selectedCharacter.customscript = [{
+            comment: 'Prepare stored content',
+            in: 'WRITE:',
+            out: 'STORED:',
+            type: 'editprocess',
+            flag: 'g',
+            ableFlag: true,
+        }, {
+            comment: 'Persist processed content',
+            in: 'STORED:',
+            out: '@@inject',
+            type: 'editprocess',
+            flag: 'g',
+            ableFlag: true,
+        }]
+        const session = new ActiveConversationSession({
+            characterId: selectedCharacter.chaId,
+            conversationId: liveChat.id!,
+            conversation: liveChat,
+            storeRevision: 51,
+        })
+        testState.activeSession = session
+        mockTriggerClone()
+
+        let tokenizeCalls = 0
+        let written = false
+        testState.onTokenizeChat = () => {
+            tokenizeCalls += 1
+            if (written || tokenizeCalls < 2) return
+            written = true
+            writeVariable(session, liveChat)
+        }
+
+        await expect(sendChat({ preview: true })).resolves.toBe(true)
+
+        expect(written).toBe(true)
+        expect(liveChat.message.map((message) => message.data)).toEqual([
+            'STORED:first',
+            'second',
+            'third',
+        ])
+        expect(liveChat.scriptstate).toEqual({ $kept: 'before', $scratch: expect.any(String) })
         expect(session.activePinReasons).toEqual([])
     })
 

@@ -315,7 +315,7 @@ describe('chat screenshot source lease', () => {
         expect(source.release).toHaveBeenCalledTimes(1)
     })
 
-    it('recaptures the committed revision after flushing a pending edit', async () => {
+    it('recaptures the committed revision after flushing a pending edit and a variable commit', async () => {
         const source = harness([
             { role: 'user', data: 'before flush', chatId: 'one' },
         ])
@@ -348,6 +348,7 @@ describe('chat screenshot source lease', () => {
             source.dependencies.store,
         )
         source.dependencies.flushPendingData.mockImplementation(async () => {
+            source.session.updateChatVariables(new Map([['scratch', 'display']]), { origin: 'display' })
             source.session.acknowledgePersisted(
                 source.session.sessionToken,
                 source.session.version,

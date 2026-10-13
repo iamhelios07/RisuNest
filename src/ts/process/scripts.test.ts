@@ -552,6 +552,45 @@ describe('history-sensitive regex conversation operations', () => {
         expect(session.activePinReasons).toEqual([])
     })
 
+    it.each([
+        ['display Lua variable', { origin: 'display' as const }],
+        ['trigger variable', {}],
+    ])('runs an editinput regex after a %s commits during an input plugin hook', async (_name, origin) => {
+        const chat = {
+            id: 'regex-chat',
+            message: [{ role: 'user', data: 'before', chatId: 'message' }],
+        } as Chat
+        const char = makeCharacter([{ ...makeScript('x', '@@inject'), type: 'editinput' }])
+        char.chaId = 'regex-character'
+        char.chats = [chat]
+        char.chatPage = 0
+        const session = new ActiveConversationSession({
+            characterId: char.chaId,
+            conversationId: chat.id,
+            conversation: chat,
+            storeRevision: 21,
+        })
+        mocks.database.characters = [char] as never
+        mocks.state.currentChat = chat
+        mocks.state.session = session
+        mocks.pluginV2.editinput.add(async (data) => {
+            session.updateChatVariables(new Map([['scratch', 'written']]), origin)
+            return data
+        })
+        const result = await processScriptFull(
+            char,
+            'x',
+            'editinput',
+            0,
+            {},
+            { cache: 'bypass', regexWorker: false },
+        )
+        expect(result.data).toBe('')
+        expect(chat.message[0].data).toBe('x')
+        expect(chat.scriptstate).toEqual({ $scratch: 'written' })
+        expect(session.activePinReasons).toEqual([])
+    })
+
     it('applies @@inject through the active session batch instead of direct DB mutation', async () => {
         const chat = {
             id: 'regex-chat',
@@ -1227,6 +1266,32 @@ describe('live display script ordering', () => {
             f.cleanup()
         }
     })
+    it('runs waiting work after a chat variable commit from outside the display', async () => {
+        const f = fixture()
+        try {
+            const first = f.run('first')
+            await vi.waitFor(() => expect(f.plugin).toHaveBeenCalledOnce())
+            const second = f.run('second')
+            const results = Promise.allSettled([first, second])
+            f.session.updateChatVariables(new Map([['button', 'pressed']]))
+            f.release()
+            expect(await results).toEqual([
+                {
+                    status: 'fulfilled',
+                    value: { data: 'first', emoChanged: false },
+                },
+                {
+                    status: 'fulfilled',
+                    value: { data: 'second', emoChanged: false },
+                },
+            ])
+            expect(f.chat.scriptstate?.$scratch).toBe('second')
+            expect(f.session.activePinReasons).toEqual([])
+        } finally {
+            f.cleanup()
+        }
+    })
+
     it('rejects waiting work after an external edit and releases the queue for a fresh render', async () => {
         const f = fixture()
         try {
