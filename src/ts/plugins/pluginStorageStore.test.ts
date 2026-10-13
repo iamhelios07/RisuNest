@@ -2,11 +2,11 @@ const OWNER = 'test-plugin'
 import { describe, expect, it, vi } from 'vitest'
 import {
     RevisionConflictError,
-    type PersistentDataStore,
+    type PersistentRoot,
     type PluginStorageMutation,
     type PluginStorageValueQuery,
 } from '../storage/persistentDataStore'
-import { createLeaseStub } from '../storage/persistentDataStore.testSupport'
+import { createLeaseStub, createStoreStub } from '../storage/persistentDataStore.testSupport'
 import {
     createPluginStorageStore,
     observePluginStorageValue,
@@ -41,9 +41,9 @@ function harness(entries: Record<string, { byteSize: number; value: unknown }>, 
         return { revision, items: selected.map(({ ordinal, ...item }) => item),
             nextCursor: records.length > limit && last ? { owner: last.owner, key: last.key, ordinal: last.ordinal } : null }
     })
-    const store = {
+    const store = createStoreStub({
         open: vi.fn(async () => undefined),
-        readRoot: vi.fn(async () => ({ revision, value: {} })),
+        readRoot: vi.fn(async () => ({ revision, value: {} as PersistentRoot })),
         queryPluginStorage: vi.fn(async () => ({
             revision,
             items: Object.entries(entries)
@@ -70,7 +70,7 @@ function harness(entries: Record<string, { byteSize: number; value: unknown }>, 
             },
             release: vi.fn(async () => undefined),
         })),
-    } as unknown as PersistentDataStore
+    })
     const mutate = vi.fn(async (mutations: readonly PluginStorageMutation[]) => {
         for (const mutation of mutations) {
             if (mutation.type === 'clear') {

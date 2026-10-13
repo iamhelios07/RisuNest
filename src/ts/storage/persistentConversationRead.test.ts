@@ -1,6 +1,6 @@
 import { expect, it, vi } from 'vitest'
-import type { CharacterDetail, PersistentDataStore } from './persistentDataStore'
-import { createLeaseStub } from './persistentDataStore.testSupport'
+import type { CharacterDetail, PersistentRoot } from './persistentDataStore'
+import { createLeaseStub, createStoreStub } from './persistentDataStore.testSupport'
 import {
     PersistentConversationReadCancelledError,
     PersistentConversationReadStaleError,
@@ -65,13 +65,13 @@ function createHarness(messages: Message[]) {
         readConversationWindow,
         release,
     })
-    const store = {
+    const store = createStoreStub({
         open: vi.fn(async () => undefined),
-        readRoot: vi.fn(async () => ({ revision, value: {} })),
+        readRoot: vi.fn(async () => ({ revision, value: {} as PersistentRoot })),
         acquireRevision: vi.fn(async () => lease),
         readConversation: vi.fn(),
         materializeDatabase: vi.fn(),
-    } as unknown as PersistentDataStore
+    })
     const flushPendingData = vi.fn(async () => undefined)
     const read = (signal?: AbortSignal, count = 3, offset = 2) =>
         readPinnedSelectedConversationWindow({
