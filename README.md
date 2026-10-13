@@ -28,15 +28,15 @@ RisuNest is an AI chat application forked from [RisuAI](https://github.com/kwaro
 ## Downloads
 
 <!-- release-downloads:app:start -->
-Download [RisuNest v1.0.3](https://github.com/rsyumi/RisuNest/releases/tag/app-v1.0.3) for your operating system and CPU architecture.
+Download [RisuNest v1.0.4](https://github.com/rsyumi/RisuNest/releases/tag/app-v1.0.4) for your operating system and CPU architecture.
 
 | Platform | aarch64 (arm64) | x86_64 (x64) |
 | --- | --- | --- |
-| Windows | [EXE](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.3/RisuNest-1.0.3-windows-aarch64-setup.exe) | [EXE](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.3/RisuNest-1.0.3-windows-x86_64-setup.exe) |
-| macOS | [DMG](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.3/RisuNest-1.0.3-darwin-aarch64.dmg) | [DMG](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.3/RisuNest-1.0.3-darwin-x86_64.dmg) |
-| Linux | [DEB](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.3/RisuNest-1.0.3-linux-aarch64.deb) / [AppImage](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.3/RisuNest-1.0.3-linux-aarch64.AppImage) | [DEB](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.3/RisuNest-1.0.3-linux-x86_64.deb) / [AppImage](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.3/RisuNest-1.0.3-linux-x86_64.AppImage) |
-| Android | [APK](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.3/RisuNest-1.0.3-android-aarch64.apk) | - |
-| iOS | [IPA](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.3/RisuNest-1.0.3-ios-aarch64-unsigned.ipa) | - |
+| Windows | [EXE](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.4/RisuNest-1.0.4-windows-aarch64-setup.exe) | [EXE](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.4/RisuNest-1.0.4-windows-x86_64-setup.exe) |
+| macOS | [DMG](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.4/RisuNest-1.0.4-darwin-aarch64.dmg) | [DMG](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.4/RisuNest-1.0.4-darwin-x86_64.dmg) |
+| Linux | [DEB](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.4/RisuNest-1.0.4-linux-aarch64.deb) / [AppImage](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.4/RisuNest-1.0.4-linux-aarch64.AppImage) | [DEB](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.4/RisuNest-1.0.4-linux-x86_64.deb) / [AppImage](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.4/RisuNest-1.0.4-linux-x86_64.AppImage) |
+| Android | [APK](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.4/RisuNest-1.0.4-android-aarch64.apk) | - |
+| iOS | [IPA](https://github.com/rsyumi/RisuNest/releases/download/app-v1.0.4/RisuNest-1.0.4-ios-aarch64-unsigned.ipa) | - |
 <!-- release-downloads:app:end -->
 
 - iOS builds are distributed as unsigned IPAs and must be sideloaded using tools such as AltStore or Sideloadly.
