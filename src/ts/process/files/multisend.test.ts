@@ -34,7 +34,7 @@ vi.mock('../index.svelte', async () => {
     }
 })
 vi.mock('src/ts/globalApi.svelte', () => ({ downloadFile: mocks.downloadFile }))
-vi.mock('src/ts/platform', () => ({ isTauri: false }))
+vi.mock('src/ts/platform', async () => (await import('src/ts/platform.testSupport')).platformModule({ runtime: 'web', os: 'windows' }))
 vi.mock('../memory/hypamemory', () => ({
     HypaProcesser: class {
         addText() {}

@@ -15,7 +15,7 @@ vi.mock('../alert', () => ({
     alertSelect: vi.fn(),
 }))
 vi.mock('../globalApi.svelte', () => ({ fetchNative: vi.fn(), readImage: vi.fn() }))
-vi.mock('../platform', () => ({ isTauriMobile: true }))
+vi.mock('../platform', async () => (await import('../platform.testSupport')).platformModule({ runtime: 'tauri', os: 'android' }))
 vi.mock('../tokenizer', () => ({ tokenize: vi.fn() }))
 vi.mock('../util', () => ({
     asBuffer: vi.fn(),
