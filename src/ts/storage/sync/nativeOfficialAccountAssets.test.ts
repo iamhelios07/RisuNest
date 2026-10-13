@@ -1,8 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
 import { createNativeOfficialAccountAssets } from './nativeOfficialAccountAssets'
 import type { BlobStore } from '../blobStore'
-import type { PersistentDataStore } from '../persistentDataStore'
-import { createLeaseStub } from '../persistentDataStore.testSupport'
+import type { PersistentRoot } from '../persistentDataStore'
+import { createLeaseStub, createStoreStub } from '../persistentDataStore.testSupport'
 import type { NativeDeviceSettings } from '../nativeDeviceSettings'
 import type { AccountStorage } from '../accountStorage'
 
@@ -21,7 +21,7 @@ function harness() {
     let marker: unknown = null
     const settings = { get: vi.fn(async () => marker), set: vi.fn(async (_key, value) => { marker = value }) } as unknown as NativeDeviceSettings
     const lease = createLeaseStub({ release: vi.fn(async () => {}) })
-    const store = { readRoot: async () => ({ revision: 7 }), acquireRevision: async () => lease } as unknown as PersistentDataStore
+    const store = createStoreStub({ readRoot: async () => ({ revision: 7, value: {} as PersistentRoot }), acquireRevision: async () => lease })
     const blobs = {
         stat: vi.fn(async key => values.has(key) ? {} : null),
         read: vi.fn(async key => values.get(key) ?? null),

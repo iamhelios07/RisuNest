@@ -15,7 +15,8 @@ import {
     type Database,
 } from './database.svelte'
 import { createProductionStateAdapter } from './persistentDataRuntime.svelte'
-import type { PersistentDataStore } from './persistentDataStore'
+import type { CharacterDetail } from './persistentDataStore'
+import { createStoreStub } from './persistentDataStore.testSupport'
 import { workingSetResidency } from './workingSetResidency'
 
 afterEach(() => {
@@ -84,8 +85,8 @@ describe('selected conversation production publication identity', () => {
             revision: 1,
             value: structuredClone(conversation),
         }))
-        const store = {
-            readCharacter: vi.fn(async () => ({ revision: 1, value: detail })),
+        const store = createStoreStub({
+            readCharacter: vi.fn(async () => ({ revision: 1, value: detail as CharacterDetail })),
             queryConversations: vi.fn(async () => ({
                 revision: 1,
                 items: [
@@ -109,7 +110,7 @@ describe('selected conversation production publication identity', () => {
                 },
             })),
             readConversation,
-        } as unknown as PersistentDataStore
+        })
         const coordinator = {
             revision: 1,
             mutationGeneration: 0,
