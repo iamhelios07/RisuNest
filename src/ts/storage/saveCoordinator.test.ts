@@ -2,9 +2,8 @@ import { UNOWNED_PLUGIN_OWNER } from '../plugins/pluginOwner'
 import { describe, expect, it, vi } from 'vitest'
 import { createPersistentStoreHarness } from '../../../tests/support/persistentStoreHarness'
 import type { Chat, Database, character } from './database.svelte'
-import type { PersistentDataStore } from './persistentDataStore'
 import { RevisionConflictError } from './persistentDataStore'
-import { createLeaseStub } from './persistentDataStore.testSupport'
+import { createLeaseStub, createStoreStub } from './persistentDataStore.testSupport'
 import { canonicalJson } from './saveCoordinator'
 import {
     ActiveConversationSession,
@@ -182,7 +181,7 @@ describe('SaveCoordinator', () => {
 
     it('does not commit when the persistent working copy is clean', async () => {
         const database = makeDatabase()
-        const store = { commit: vi.fn() } as unknown as PersistentDataStore
+        const store = createStoreStub({ commit: vi.fn() })
         const coordinator = new SaveCoordinator({
             store,
             captureRoot: () => captureRoot(database),
@@ -1783,12 +1782,11 @@ describe('SaveCoordinator', () => {
             return { revision: expectedRevision + 1 }
         })
         const readWorkingSetChangePage = vi.fn(async () => [change])
-        const store = {
-            ...makeStore(commit),
+        const store = makeStore(commit, {
             acquireRevision: vi.fn(async (revision: number) => createLeaseStub({
                 revision, readWorkingSetChangePage, release: vi.fn(async () => undefined),
             })),
-        } as unknown as PersistentDataStore
+        })
         const coordinator = new SaveCoordinator({
             store,
             captureRoot: () => captureRoot(database),
@@ -1935,10 +1933,10 @@ describe('SaveCoordinator', () => {
         replacement.username = 'Replacement'
         const replacementGate = deferred<{ revision: number }>()
         const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
-        const store = {
+        const store = createStoreStub({
             commit,
             replaceFromDatabase: vi.fn(() => replacementGate.promise),
-        } as unknown as PersistentDataStore
+        })
         const coordinator = new SaveCoordinator({
             store,
             captureRoot: () => captureRoot(database),
@@ -1983,7 +1981,7 @@ describe('SaveCoordinator', () => {
         const replaceFromDatabase = vi.fn()
             .mockRejectedValueOnce(new Error('replacement failed'))
             .mockResolvedValueOnce({ revision: 3 })
-        const store = { commit, replaceFromDatabase } as unknown as PersistentDataStore
+        const store = createStoreStub({ commit, replaceFromDatabase })
         const coordinator = new SaveCoordinator({
             store,
             captureRoot: () => captureRoot(database),
@@ -2020,10 +2018,10 @@ describe('SaveCoordinator', () => {
             dispose: vi.fn(async () => undefined),
         }
         const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
-        const store = {
+        const store = createStoreStub({
             commit,
             replaceFromDatabase: vi.fn(async () => ({ revision: 3 })),
-        } as unknown as PersistentDataStore
+        })
         const coordinator = new SaveCoordinator({
             store,
             captureRoot: () => captureRoot(database),
@@ -2054,10 +2052,10 @@ describe('SaveCoordinator', () => {
         try {
             let db = makeDatabase()
             const replacementGate = deferred<{ revision: number }>()
-            const store = {
+            const store = createStoreStub({
                 commit: vi.fn(),
                 replaceFromDatabase: vi.fn(() => replacementGate.promise),
-            } as unknown as PersistentDataStore
+            })
             const coordinator = new SaveCoordinator({
                 store,
                 captureRoot: () => captureRoot(db),
@@ -2892,10 +2890,10 @@ describe('SaveCoordinator', () => {
             const database = makeDatabase()
             const publish = vi.fn(async () => undefined)
             const pin = vi.fn(async () => ({ publish, dispose: vi.fn(async () => undefined) }))
-            const store = {
+            const store = createStoreStub({
                 commit: vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 })),
                 replaceFromDatabase: vi.fn(async () => ({ revision: 9 })),
-            } as unknown as PersistentDataStore
+            })
             const coordinator = new SaveCoordinator({
                 store,
                 captureRoot: () => captureRoot(database),
@@ -2929,10 +2927,10 @@ describe('SaveCoordinator', () => {
             let database = makeDatabase()
             const publish = vi.fn(async () => undefined)
             const pin = vi.fn(async () => ({ publish, dispose: vi.fn(async () => undefined) }))
-            const store = {
+            const store = createStoreStub({
                 commit: vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 })),
                 replaceFromDatabase: vi.fn(async () => ({ revision: 9 })),
-            } as unknown as PersistentDataStore
+            })
             const coordinator = new SaveCoordinator({
                 store,
                 captureRoot: () => captureRoot(database),
@@ -3086,10 +3084,10 @@ describe('SaveCoordinator', () => {
             dispose: vi.fn(async () => undefined),
         }
         const pin = vi.fn(async () => staleHandle)
-        const store = {
+        const store = createStoreStub({
             commit: vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 })),
             replaceFromDatabase: vi.fn(async () => ({ revision: 3 })),
-        } as unknown as PersistentDataStore
+        })
         const coordinator = new SaveCoordinator({
             store,
             captureRoot: () => captureRoot(database),
@@ -3123,12 +3121,12 @@ describe('SaveCoordinator', () => {
                     .mockResolvedValueOnce(undefined),
             }
             const pin = vi.fn(async () => staleHandle)
-            const store = {
+            const store = createStoreStub({
                 commit: vi.fn(async ({ expectedRevision }) => ({
                     revision: expectedRevision + 1,
                 })),
                 replaceFromDatabase: vi.fn(async () => ({ revision: 3 })),
-            } as unknown as PersistentDataStore
+            })
             const coordinator = new SaveCoordinator({
                 store,
                 captureRoot: () => captureRoot(database),
@@ -3164,10 +3162,10 @@ describe('SaveCoordinator', () => {
             .mockImplementationOnce(() => firstCommit.promise)
             .mockResolvedValueOnce({ revision: 4 })
         const replaceFromDatabase = vi.fn(() => replacementWrite.promise)
-        const store = {
+        const store = createStoreStub({
             commit,
             replaceFromDatabase,
-        } as unknown as PersistentDataStore
+        })
         const replaceDatabase = vi.fn((replacement: Database) => {
             Object.assign(database, replacement)
         })
@@ -3239,9 +3237,9 @@ describe('SaveCoordinator', () => {
             candidate.characters[0].chats[0],
         ]
         const replacementWrite = deferred<{ revision: number }>()
-        const store = {
+        const store = createStoreStub({
             replaceFromDatabase: vi.fn(() => replacementWrite.promise),
-        } as unknown as PersistentDataStore
+        })
         const replaceDatabase = vi.fn((replacement: Database) => {
             Object.assign(database, structuredClone(replacement))
         })
@@ -3291,10 +3289,10 @@ describe('SaveCoordinator', () => {
         const commit = vi.fn(async ({ expectedRevision }) => ({
             revision: expectedRevision + 1,
         }))
-        const store = {
+        const store = createStoreStub({
             replaceFromDatabase: vi.fn(() => replacementWrite.promise),
             commit,
-        } as unknown as PersistentDataStore
+        })
         const coordinator = new SaveCoordinator({
             store,
             captureRoot: () => captureRoot(database),
@@ -3343,9 +3341,9 @@ describe('SaveCoordinator', () => {
         candidate.botPresets.reverse()
         candidate.botPresets[0].mainPrompt = 'Candidate B'
         const replacementWrite = deferred<{ revision: number }>()
-        const store = {
+        const store = createStoreStub({
             replaceFromDatabase: vi.fn(() => replacementWrite.promise),
-        } as unknown as PersistentDataStore
+        })
         const coordinator = new SaveCoordinator({
             store,
             captureRoot: () => captureRoot(database),
@@ -3382,9 +3380,9 @@ describe('SaveCoordinator', () => {
         candidate.botPresets.reverse()
         candidate.botPresets[0].mainPrompt = 'Candidate B'
         candidate.botPresets[1].name = 'Preset A2'
-        const store = {
+        const store = createStoreStub({
             replaceFromDatabase: vi.fn(async () => ({ revision: 8 })),
-        } as unknown as PersistentDataStore
+        })
         const coordinator = new SaveCoordinator({
             store,
             captureRoot: () => captureRoot(database),
@@ -3417,9 +3415,9 @@ describe('SaveCoordinator', () => {
             { ...candidate.botPresets[1], name: 'Preset B2' },
             { ...candidate.botPresets[0], name: 'Preset A2' },
         ]
-        const store = {
+        const store = createStoreStub({
             replaceFromDatabase: vi.fn(async () => ({ revision: 8 })),
-        } as unknown as PersistentDataStore
+        })
         const coordinator = new SaveCoordinator({
             store,
             captureRoot: () => captureRoot(database),
@@ -3459,9 +3457,9 @@ describe('SaveCoordinator', () => {
                 candidate.botPresets.splice(0, 1)
             }
             const replacementWrite = deferred<{ revision: number }>()
-            const store = {
+            const store = createStoreStub({
                 replaceFromDatabase: vi.fn(() => replacementWrite.promise),
-            } as unknown as PersistentDataStore
+            })
             const coordinator = new SaveCoordinator({
                 store,
                 captureRoot: () => captureRoot(database),
@@ -3504,12 +3502,12 @@ describe('SaveCoordinator', () => {
         candidate.botPresets.reverse()
         candidate.botPresets[0].mainPrompt = 'Candidate B'
         const replacementWrite = deferred<{ revision: number }>()
-        const store = {
+        const store = createStoreStub({
             replaceFromDatabase: vi.fn(() => replacementWrite.promise),
             commit: vi.fn(async ({ expectedRevision }) => ({
                 revision: expectedRevision + 1,
             })),
-        } as unknown as PersistentDataStore
+        })
         const replaceDatabase = vi.fn((replacement: Database) => {
             Object.assign(database, structuredClone(replacement))
         })
@@ -3557,10 +3555,10 @@ describe('SaveCoordinator', () => {
         candidate.botPresets[0].mainPrompt = 'Candidate B'
         const replacementWrite = deferred<{ revision: number }>()
         const commit = vi.fn()
-        const store = {
+        const store = createStoreStub({
             replaceFromDatabase: vi.fn(() => replacementWrite.promise),
             commit,
-        } as unknown as PersistentDataStore
+        })
         const coordinator = new SaveCoordinator({
             store,
             captureRoot: () => captureRoot(database),
@@ -3603,10 +3601,10 @@ describe('SaveCoordinator', () => {
                 .mockImplementation(async ({ expectedRevision }: { expectedRevision: number }) => ({
                     revision: expectedRevision + 1,
                 }))
-            const store = {
+            const store = createStoreStub({
                 commit,
                 replaceFromDatabase: vi.fn(async () => ({ revision: 3 })),
-            } as unknown as PersistentDataStore
+            })
             const coordinator = new SaveCoordinator({
                 store,
                 captureRoot: () => captureRoot(db),
@@ -3770,10 +3768,10 @@ describe('SaveCoordinator', () => {
         const database = makeDatabase()
         const replaceDatabase = vi.fn()
         const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
-        const store = {
+        const store = createStoreStub({
             commit,
             replaceFromDatabase: vi.fn().mockRejectedValue(new Error('replacement failed')),
-        } as unknown as PersistentDataStore
+        })
         const coordinator = new SaveCoordinator({
             store,
             captureRoot: () => captureRoot(database),

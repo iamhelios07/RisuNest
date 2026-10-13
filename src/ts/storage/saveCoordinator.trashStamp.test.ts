@@ -1,8 +1,7 @@
 import {describe, expect, it, vi} from 'vitest'
 vi.mock('../platform', async () => (await import('../platform.testSupport')).platformModule({runtime:'tauri',os:'windows'}))
 import {SaveCoordinator} from './saveCoordinator'
-import type {PersistentDataStore} from './persistentDataStore'
-import {createLeaseStub} from './persistentDataStore.testSupport'
+import {createLeaseStub,createStoreStub} from './persistentDataStore.testSupport'
 import {RevisionConflictError} from './persistentDataStore'
 import {makeDatabase} from './saveCoordinator.testSupport'
 import {capturePersistentRoot} from './persistentDataRuntime'
@@ -19,7 +18,7 @@ function fixture(stamp: string | undefined, recheck=stamp) {
         readCharacterSummary:async()=>({...summary,trashStampMs:recheck}),
         queryCharacters:async()=>({revision:1,items:[]}),release:vi.fn(async()=>{}),
     })
-    const store={queryCharacters:async()=>({revision:1,items:[summary]}),acquireRevision:async()=>lease,commit} as unknown as PersistentDataStore
+    const store=createStoreStub({queryCharacters:async()=>({revision:1,items:[summary]}),acquireRevision:async()=>lease,commit})
     const coordinator=new SaveCoordinator({store,captureRoot:()=>capturePersistentRoot(database),captureCharacter:()=>null,captureSelectedCharacter:()=>null,replaceDatabase:()=>{}})
     coordinator.initialize(1)
     return {coordinator,commit,lease}
