@@ -4,7 +4,7 @@ import type { PluginStorageValueQuery } from '../storage/persistentDataStore'
 const mock = vi.hoisted(() => ({
     pages: vi.fn(), release: vi.fn(async () => {}),
 }))
-vi.mock('../platform', () => ({ isTauri: false }))
+vi.mock('../platform', async () => (await import('../platform.testSupport')).platformModule({ runtime: 'web', os: 'windows' }))
 vi.mock('./plugins.svelte', () => ({ pluginStorageStore: { invalidate: vi.fn() } }))
 vi.mock('../storage/persistentDataStoreFactory', () => ({
     getPersistentDataStore: () => ({

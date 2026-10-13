@@ -9,22 +9,11 @@ const testState = vi.hoisted(() => ({
     onTokenizeChat: null as null | (() => void | Promise<void>),
     cbsCallbacks: new Map<string, (...args: any[]) => any>(),
     pluginV2: {
-        providers: new Map(),
-        providerOptions: new Map(),
-        editdisplay: new Set<(content: string) => string | Promise<string>>(),
-        editoutput: new Set<(content: string) => string | Promise<string>>(),
         editprocess: new Set<(content: string) => string | Promise<string>>(),
-        editinput: new Set<(content: string) => string | Promise<string>>(),
-        replacerbeforeRequest: new Set(),
-        replacerafterRequest: new Set(),
-        chatOutput: new Set(),
-        unload: new Set(),
-        loaded: false,
     },
 }))
 
-vi.mock('../parser/parser.svelte', () => ({
-    assetRegex: /$^/g,
+vi.mock('../parser/parser.svelte', async () => (await import('src/ts/parser/parser.testSupport')).parserStubModule({
     risuChatParser: (data: string, args: Record<string, any> = {}) => data.replace(
         /{{([^{}]+)}}/g,
         (source, body: string) => {
@@ -47,25 +36,16 @@ vi.mock('../parser/parser.svelte', () => ({
     ),
 }))
 
-vi.mock('../storage/persistentDataRuntime.svelte', () => ({
-    assertPersistentMutationAllowed: vi.fn(),
-    getPersistentStorageAuthorityEpoch: () => 0,
-    getPersistentNavigationGeneration: () => 0,
-    acknowledgeGenerationCompletion: vi.fn(async () => undefined),
-    drainDeferredLwwReceives: vi.fn(async () => undefined),
+vi.mock('../storage/persistentDataRuntime.svelte', async () => (await import('./tests/sendChatTestHarness')).persistentRuntimeModule({
     acquireCompleteConversation: testState.unexpectedNativeRuntimeAccess,
     acquireDestructiveReplacementFence: testState.unexpectedNativeRuntimeAccess,
-    captureSelectedConversationTarget: () => null,
-    captureSelectedConversationAuthority: () => null,
     capturePersistentMutationToken: testState.unexpectedNativeRuntimeAccess,
     getActiveConversationSession: () => testState.activeSession,
     getPersistentDataRuntime: testState.unexpectedNativeRuntimeAccess,
     peekActiveConversationSession: () => testState.activeSession,
 }))
 
-vi.mock('../plugins/plugins.svelte', () => ({
-    pluginV2: testState.pluginV2,
-}))
+vi.mock('../plugins/plugins.svelte', async () => (await import('./tests/sendChatTestHarness')).pluginsModule(testState.pluginV2))
 
 vi.mock('./triggers', () => ({
     runTrigger: testState.runTrigger,
@@ -85,9 +65,7 @@ vi.mock('../tokenizer', async () => (await import('./tests/sendChatTestHarness')
 
 vi.mock('./lorebook.svelte', async () => (await import('./tests/sendChatTestHarness')).lorebookModule())
 
-vi.mock('./request/request', () => ({
-    requestChatData: vi.fn(),
-}))
+vi.mock('./request/request', async () => (await import('./tests/sendChatTestHarness')).requestModule(vi.fn()))
 
 vi.mock('./stableDiff', async () => (await import('./tests/sendChatTestHarness')).stableDiffModule())
 vi.mock('./tts', async () => (await import('./tests/sendChatTestHarness')).ttsModule())
@@ -104,7 +82,7 @@ vi.mock('./files/inlays', async () => (await import('./tests/sendChatTestHarness
     getInlayAssetMetadata: vi.fn(async () => null),
 }))
 vi.mock('./models/modelString', async () => (await import('./tests/sendChatTestHarness')).modelStringModule())
-vi.mock('./inlayScreen', () => ({ runInlayScreen: vi.fn() }))
+vi.mock('./inlayScreen', async () => (await import('./tests/sendChatTestHarness')).inlayScreenModule({ runInlayScreen: vi.fn() }))
 vi.mock('./transformers', async () => (await import('./tests/sendChatTestHarness')).transformersModule({
     runImageEmbedding: vi.fn(async () => []),
 }))

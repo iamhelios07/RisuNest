@@ -15,7 +15,7 @@ vi.mock('../tokenizer', () => ({
     tokenize: vi.fn(async (text: string) => text.length),
 }))
 
-vi.mock('../parser/parser.svelte', () => ({
+vi.mock('../parser/parser.svelte', async () => (await import('src/ts/parser/parser.testSupport')).parserStubModule({
     risuChatParser: vi.fn((text: string) => text),
 }))
 
@@ -26,7 +26,6 @@ vi.mock('../util', () => ({
 }))
 
 vi.mock('../alert', () => ({ alertError: vi.fn(), alertNormal: vi.fn() }))
-vi.mock('../../lang', () => ({ language: { successExport: 'exported' } }))
 vi.mock('../globalApi.svelte', () => ({ downloadFile: vi.fn(), saveAsset: vi.fn() }))
 vi.mock('./modules', () => ({ getModuleLorebooks: vi.fn(() => []) }))
 vi.mock('../storage/persistentDataRuntime.svelte', async (importOriginal) => ({

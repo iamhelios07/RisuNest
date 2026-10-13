@@ -38,7 +38,7 @@ vi.mock('../alert', () => ({
     alertNormal: vi.fn(),
     alertSelect: vi.fn(async () => ''),
 }))
-vi.mock('../parser/parser.svelte', () => ({ risuChatParser: (value: string) => value }))
+vi.mock('../parser/parser.svelte', async () => (await import('src/ts/parser/parser.testSupport')).parserStubModule())
 vi.mock('./index.svelte', () => ({ sendChat: mocks.sendChat }))
 vi.mock('./lorebook.svelte', () => ({ loadLoreBookV3Prompt: vi.fn() }))
 vi.mock('./triggers', () => ({ runTrigger: vi.fn() }))
