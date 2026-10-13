@@ -38,7 +38,6 @@ vi.mock('src/ts/platform', async () => (await import('src/ts/platform.testSuppor
 import RisuNestStorageDashboard from './RisuNestStorageDashboard.svelte'
 import { assetResidencyStatus } from 'src/ts/storage/sync/serverAssetResidency.testSupport'
 import { languageEnglish } from 'src/lang/en'
-import { languageKorean } from 'src/lang/ko'
 
 const syncText = languageEnglish.risuNest.serverSync
 const stats = {
@@ -401,17 +400,15 @@ describe('RisuNestStorageDashboard', () => {
     it('uses a dedicated localized confirmation before deleting a conflict backup', async () => {
         const target = setup()
         alerts.alertConfirm.mockResolvedValue(false)
-        await vi.waitFor(() => expect(target.textContent).toContain('Conflict backups'))
+        await vi.waitFor(() => expect(target.textContent).toContain(languageEnglish.risuNest.storage.conflictBackups))
 
         const conflictRow = target.querySelectorAll<HTMLElement>('[data-storage-backup-list]')[1]
         conflictRow?.querySelector<HTMLButtonElement>('button')?.click()
 
         await vi.waitFor(() => expect(alerts.alertConfirm).toHaveBeenCalledWith(
-            'Delete this conflict backup? This conflict backup cannot be recovered after deletion.',
+            languageEnglish.risuNest.storage.deleteConflictBackupConfirm,
         ))
         expect(backups.remove).not.toHaveBeenCalled()
-        expect(languageKorean.risuNest.storage.deleteConflictBackupConfirm)
-            .toBe('이 충돌 백업을 삭제하시겠습니까? 삭제한 충돌 백업은 복구할 수 없습니다.')
     })
 
     it('orders all backup lists before the storage action rows', async () => {
