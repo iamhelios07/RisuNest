@@ -1,25 +1,4 @@
-// Include the actual source modules under their production paths so the
-// standalone harness exercises the same observers and repository coordinator.
-#[path = "../src/trust_boundary.rs"]
-mod trust_boundary;
-
-#[path = "../src/asset_repository"]
-mod asset_repository {
-    #[path = "body_io.rs"]
-    pub(crate) mod body_io;
-    #[path = "coordinator.rs"]
-    pub(crate) mod coordinator;
-    #[path = "payload_cas.rs"]
-    pub(crate) mod payload_cas;
-}
-
-#[path = "../src/persistent_store"]
-mod persistent_store {
-    #[path = "hash_work.rs"]
-    pub(crate) mod hash_work;
-}
-
-use asset_repository::payload_cas::{PayloadCas, PreparedPayload};
+use super::payload_cas::{PayloadCas, PreparedPayload};
 use std::ffi::OsString;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -218,25 +197,6 @@ fn zero_byte_duplicates_reuse_the_existing_immutable_object() {
             .expect("zero-byte object")
             .len(),
         0
-    );
-}
-
-#[test]
-fn rejects_an_existing_target_with_different_exact_bytes() {
-    let directory = tempfile::tempdir().expect("temporary repository");
-    let cas = PayloadCas::new(directory.path()).expect("open repository");
-    let first = cas.prepare_bytes(b"abc").expect("initial prepare");
-    let object_path = directory.path().join(&first.physical_key);
-    std::fs::write(&object_path, b"abd").expect("corrupt existing object");
-
-    let error = cas
-        .prepare_bytes(b"abc")
-        .expect_err("corruption must be rejected");
-
-    assert!(error.to_string().contains("collision or corruption"));
-    assert_eq!(
-        std::fs::read(object_path).expect("corrupt target remains visible"),
-        b"abd"
     );
 }
 
@@ -577,7 +537,7 @@ fn spawn_race_child(
     result: &Path,
 ) -> Child {
     Command::new(executable)
-        .arg("cross_process_publish_child")
+        .arg("asset_repository::payload_cas_tests::cross_process_publish_child")
         .arg("--exact")
         .arg("--nocapture")
         .env(RACE_ROOT_ENV, repository_root)

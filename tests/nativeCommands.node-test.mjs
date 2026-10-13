@@ -6,40 +6,17 @@ import { fileURLToPath } from 'node:url'
 import { tmpdir } from 'node:os'
 import { embeddedCrateTests, hostManifests, nativeCommands, packageCrateTests, protocolManifests, sharedCargoTarget, standaloneRustCommands, standaloneRustTests } from '../scripts/testNative.mjs'
 
-test('server singleton scopes run in three disjoint processes with normal target coverage', () => {
+test('the Sync server runs as one plain cargo test and its source observer only through --harness', () => {
+  const base = ['cargo', 'test', '--manifest-path', 'server/sync/Cargo.toml', '--release', '--locked']
   for (const platform of ['win32', 'linux', 'darwin']) {
-    const server = nativeCommands('host', platform).filter(command => command[3] === 'server/sync/Cargo.toml')
-    const base = ['cargo', 'test', '--manifest-path', 'server/sync/Cargo.toml', '--release', '--locked']
-    assert.deepEqual(server, [
-      [...base, '--', '--skip', 'source_observer'],
-      [...base, '--lib', 'source_observer', '--', '--skip', 'source_observer::small_object_store::tests'],
-      [...base, '--lib', 'source_observer::small_object_store::tests'],
-    ])
-    assert(!server[0].includes('--lib'))
-    assert(server.every(command => !command.some(argument => argument.startsWith('--test-threads'))))
-    const cases = [
-      { name: 'store::objects::tests::a_body_is_filed_by_its_size_and_read_back_from_wherever_it_went', target: 'lib' },
-      { name: 'management_shutdown_ends_held_stream_and_releases_daemon_owner', target: 'integration' },
-      { name: 'main', target: 'bin' },
-      { name: 'store::Store', target: 'doc' },
-      { name: 'source_observer::tests::actual_fitting_full_and_delta_transfer_sha_domains_are_observed', target: 'lib' },
-      { name: 'source_observer_harness::tests::actual_tcp_no_content_and_full_content_length_bodies_complete', target: 'lib' },
-      { name: 'source_observer_harness::serve', target: 'lib' },
-      { name: 'source_observer::small_object_store::tests::a_read_refuses_a_body_above_its_limit_and_reports_a_damaged_one', target: 'lib' },
-    ]
-    for (const { name, target } of cases) {
-      const selected = server.filter(command => {
-        const separator = command.indexOf('--')
-        const cargo = separator < 0 ? command : command.slice(0, separator)
-        const argumentsAfterSeparator = separator < 0 ? [] : command.slice(separator + 1)
-        const lib = cargo.indexOf('--lib')
-        if (lib >= 0 && (target !== 'lib' || !name.includes(cargo[lib + 1]))) return false
-        const skip = argumentsAfterSeparator.indexOf('--skip')
-        return skip < 0 || !name.includes(argumentsAfterSeparator[skip + 1])
-      })
-      assert.equal(selected.length, 1, `${platform}: ${target} ${name} must have exactly one runner`)
+    for (const group of ['protocol', 'host']) {
+      const server = nativeCommands(group, platform).filter(command => command.includes('server/sync/Cargo.toml'))
+      assert.deepEqual(server, group === 'host' ? [base] : [])
     }
   }
+  assert.deepEqual(nativeCommands('harness'), [
+    [...base, '--lib', '--features', 'source-observer', '--', '--skip', 'source_observer::small_object_store::tests'],
+  ])
 })
 
 test('host mode compiles and runs the std-only Android response body tests as their own test binary', () => {

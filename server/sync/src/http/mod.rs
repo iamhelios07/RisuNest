@@ -308,9 +308,9 @@ impl IntoResponse for Error {
     }
 }
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "source-observer"))]
     let worker = crate::source_observer::worker();
-    #[cfg(test)]
+    #[cfg(all(test, feature = "source-observer"))]
     let f = move || {
         let _entered = worker.enter();
         let result = f();
@@ -715,9 +715,9 @@ async fn object_response(
             };
             response = match body {
                 crate::store::Body::File(file) => {
-                    #[cfg(not(test))]
+                    #[cfg(not(all(test, feature = "source-observer")))]
                     let mut file = tokio::fs::File::from_std(file);
-                    #[cfg(test)]
+                    #[cfg(all(test, feature = "source-observer"))]
                     let mut file = {
                         let file = file.into_async();
                         file.selected(start, length);
@@ -734,7 +734,7 @@ async fn object_response(
                 // Already in memory and bounded by the inline threshold, so a
                 // range is a slice rather than a seek.
                 crate::store::Body::Bytes(bytes) => {
-                    #[cfg(test)]
+                    #[cfg(all(test, feature = "source-observer"))]
                     crate::source_observer::inline_selection(digest, start, length);
                     let bytes = bytes.into_inner();
                     let end = (start + length).min(bytes.len() as u64) as usize;

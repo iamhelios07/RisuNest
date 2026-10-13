@@ -7,6 +7,9 @@ publish = false
 [features]
 # Installer builds run directly under Task Scheduler without a console window.
 windows-background = []
+# Compiles the LWW benchmark's source observer into this crate's own test
+# builds. It has no effect outside `cargo test`.
+source-observer = []
 
 [dependencies]
 risunest-release-update = { path = "../../crates/release-update" }
