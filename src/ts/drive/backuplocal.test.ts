@@ -166,8 +166,11 @@ describe('local backup persistent snapshot', () => {
         Object.defineProperty(input, 'files', { value: [file] })
         const click = vi.spyOn(input, 'click').mockImplementation(() => {})
         const createElement = vi.spyOn(document, 'createElement').mockReturnValueOnce(input)
-        const discard = vi.fn(async () => {})
+        const events: string[] = []
+        const discard = vi.fn(async () => { events.push('discard') })
         if (mobile) {
+            // Android has no process relauncher, so the restore reloads the WebView.
+            vi.spyOn(location, 'search', 'set').mockImplementation(() => { events.push('relaunch') })
             window.RisuNativeFileSelection = {
                 pick: vi.fn(async () => ({ cancelled: false, files: [{ path: '/owned/backup', name: file.name, bytes: file.size, mimeType: '' }] })),
                 discard,
@@ -198,6 +201,8 @@ describe('local backup persistent snapshot', () => {
         if (mobile) {
             expect(click).not.toHaveBeenCalled()
             expect(discard).toHaveBeenCalledExactlyOnceWith('/owned/backup')
+            // The app reloads without returning, so the selected copy has to go first.
+            expect(events).toEqual(['discard', 'relaunch'])
         }
         createElement.mockRestore()
 
