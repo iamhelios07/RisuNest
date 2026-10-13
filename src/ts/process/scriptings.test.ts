@@ -1412,6 +1412,7 @@ test('Lua history and chat variables stay bound to the captured character', asyn
     storeRevision: 13,
   })
   const operationContext = createConversationOperationContext(session, originalChat)
+  // The global selection points at the replacement, so reading it instead of the captured character fails this test.
   scriptingSelectionState.index = 1
   vi.mocked(getDatabase).mockReturnValue(database as never)
   vi.mocked(getCurrentCharacter).mockReturnValue(replacementCharacter as never)
