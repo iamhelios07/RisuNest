@@ -21,7 +21,6 @@ export const nodeAppTests = [
   'src/lib/Others/modalLayering.test.ts',
   'src/lib/Setting/ExternalStorage/strings.test.ts',
   'src/lib/Setting/Pages/Module/ModuleSettings.persistence.test.ts',
-  'src/lib/Setting/Pages/RisuNestSettings.test.ts',
   'src/lib/Setting/Pages/UserSettings.account.test.ts',
   'src/lib/Setting/Pages/UserSettings.localBackupRoute.test.ts',
   'src/lib/Setting/presetOperation.test.ts',
