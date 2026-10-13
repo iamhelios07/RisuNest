@@ -2,6 +2,8 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mount, tick, unmount } from 'svelte'
+import { language } from 'src/lang'
+import { consoleLog } from 'src/ts/consoleLog'
 
 const nativeLog = vi.hoisted(() => ({
     getNativeLogTail: vi.fn(),
@@ -36,24 +38,6 @@ const deviceSettings = vi.hoisted(() => {
 vi.mock('src/ts/nativeLog', () => nativeLog)
 vi.mock('src/ts/alert', () => alerts)
 vi.mock('src/ts/storage/deviceSettings', () => deviceSettings)
-vi.mock('src/lang', () => ({
-    language: {
-        error: 'Localized error',
-        risuNest: {
-            diag: {
-                title: 'Diagnostics',
-                logTitle: 'Error log',
-                logHelp: 'Recent errors.',
-                viewLog: 'View error log',
-                copyLog: 'Copy error log',
-                fileLog: 'Save error log to a file',
-                fileLogHelp: 'File logging help',
-                logEmpty: 'No errors recorded.',
-                actionFailed: 'Localized error',
-            },
-        },
-    },
-}))
 
 import RisuNestLogViewer from './RisuNestLogViewer.svelte'
 
@@ -62,6 +46,7 @@ describe('RisuNestLogViewer', () => {
     let mounted: ReturnType<typeof mount> | undefined
 
     beforeEach(() => {
+        consoleLog.clear()
         deviceSettings.reset()
         nativeLog.getNativeLogTail.mockReset()
         nativeLog.getNativeLogFilePath.mockReset()
@@ -140,6 +125,49 @@ describe('RisuNestLogViewer', () => {
         target.querySelector<HTMLButtonElement>('[data-view-log]')!.click()
         await settleAction()
         expect(alerts.alertMd).toHaveBeenCalledWith('No errors recorded.')
+    })
+
+    it('views, copies and clears console logs with the existing dialog and clipboard behavior', async () => {
+        consoleLog.append('info', 'App', 'startup', 2000)
+        consoleLog.append('warn', 'synthetic-plugin', 'plugin output ~~~~~', 1000)
+        await render()
+        expect(target.textContent).toContain(language.risuNest.diag.consoleTitle)
+        expect(target.textContent).not.toContain('plugin output')
+        target.querySelector<HTMLButtonElement>('[data-view-console-log]')!.click()
+        await settleAction()
+        const text = '[1970-01-01T00:00:02.000Z] [info] [App] startup\n[1970-01-01T00:00:01.000Z] [warn] [synthetic-plugin] plugin output ~~~~~'
+        expect(alerts.alertMd).toHaveBeenLastCalledWith('~~~~~~\n' + text + '\n~~~~~~')
+        target.querySelector<HTMLButtonElement>('[data-copy-console-log]')!.click()
+        await settleAction()
+        expect(navigator.clipboard.writeText).toHaveBeenLastCalledWith(text)
+        target.querySelector<HTMLButtonElement>('[data-clear-console-log]')!.click()
+        expect(consoleLog.snapshot()).toEqual([])
+        target.querySelector<HTMLButtonElement>('[data-view-console-log]')!.click()
+        await settleAction()
+        expect(alerts.alertMd).toHaveBeenLastCalledWith(language.risuNest.diag.consoleEmpty)
+        expect(nativeLog.getNativeLogTail).not.toHaveBeenCalled()
+    })
+
+    it('cancels a console snapshot when cleared before its copy starts', async () => {
+        consoleLog.append('log', 'App', 'stale')
+        await render()
+        target.querySelector<HTMLButtonElement>('[data-copy-console-log]')!.click()
+        target.querySelector<HTMLButtonElement>('[data-clear-console-log]')!.click()
+        await settleAction()
+        expect(navigator.clipboard.writeText).not.toHaveBeenCalled()
+        consoleLog.append('log', 'App', 'fresh', 0)
+        target.querySelector<HTMLButtonElement>('[data-copy-console-log]')!.click()
+        await settleAction()
+        expect(navigator.clipboard.writeText).toHaveBeenLastCalledWith('[1970-01-01T00:00:00.000Z] [log] [App] fresh')
+        let rejectCopy!: (error: Error) => void
+        vi.mocked(navigator.clipboard.writeText).mockImplementationOnce(() => new Promise<void>((_, reject) => { rejectCopy = reject }))
+        Object.defineProperty(document, 'execCommand', { configurable: true, value: vi.fn(() => true) })
+        target.querySelector<HTMLButtonElement>('[data-copy-console-log]')!.click()
+        await vi.waitFor(() => expect(rejectCopy).toBeTypeOf('function'))
+        target.querySelector<HTMLButtonElement>('[data-clear-console-log]')!.click()
+        rejectCopy(new Error('permission denied'))
+        await settleAction()
+        expect(document.execCommand).not.toHaveBeenCalled()
     })
 
     it('fetches a fresh tail for copy and uses the project clipboard fallback', async () => {
@@ -283,7 +311,7 @@ describe('RisuNestLogViewer', () => {
         target.querySelector<HTMLButtonElement>('[data-view-log]')!.click()
         await settleAction()
 
-        expect(target.textContent).toContain('Localized error')
+        expect(target.textContent).toContain(language.risuNest.diag.actionFailed)
         expect(target.textContent).not.toContain('native command detail')
         expect(error).not.toHaveBeenCalled()
         expect(alerts.alertMd).not.toHaveBeenCalled()
@@ -298,7 +326,7 @@ describe('RisuNestLogViewer', () => {
         target.querySelector<HTMLButtonElement>('[data-copy-log]')!.click()
         await settleAction()
 
-        expect(target.textContent).toContain('Localized error')
+        expect(target.textContent).toContain(language.risuNest.diag.actionFailed)
         expect(target.textContent).not.toContain('copy command detail')
         expect(writeText).not.toHaveBeenCalled()
     })
