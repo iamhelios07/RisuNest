@@ -510,10 +510,7 @@ describe('selected conversation eviction correctness corpus', () => {
         )
         onTestFinished(() => luaOperation.release())
         expect(luaOperation.mode).toBe('compatibility')
-        vi.doMock('../parser/parser.svelte', () => ({
-            hasher: vi.fn(),
-            risuChatParser: (value: string) => value,
-        }))
+        vi.doMock('../parser/parser.svelte', async () => (await import('../parser/parser.testSupport')).parserStubModule({ hasher: vi.fn() }))
         vi.doMock('../alert', () => ({
             alertConfirm: vi.fn(),
             alertError: vi.fn(),
@@ -659,7 +656,7 @@ describe('selected conversation eviction correctness corpus', () => {
         }))
         vi.doMock('../alert', () => ({ alertError: vi.fn(), alertToast: vi.fn() }))
         vi.doMock('../parser/chatML', () => ({ parseChatML: (value: string) => value }))
-        vi.doMock('../parser/parser.svelte', () => ({ risuChatParser: (value: string) => value }))
+        vi.doMock('../parser/parser.svelte', async () => (await import('../parser/parser.testSupport')).parserStubModule())
         vi.doMock('../util', () => ({
             checkNullish: (value: unknown) => value == null,
             findCharacterbyId: () => fixture.workingCopy.characters[0],
@@ -780,7 +777,7 @@ describe('selected conversation eviction correctness corpus', () => {
         }))
         vi.doMock('../process/modules', () => ({ getModuleTriggers: () => [] }))
         vi.doMock('../tokenizer', () => ({ tokenize: vi.fn(async () => 0) }))
-        vi.doMock('../parser/parser.svelte', () => ({ risuChatParser: (value: string) => value }))
+        vi.doMock('../parser/parser.svelte', async () => (await import('../parser/parser.testSupport')).parserStubModule())
         vi.doMock('../process/command', () => ({ processMultiCommand: vi.fn() }))
         vi.doMock('../process/request/request', () => ({ requestChatData: vi.fn() }))
         vi.doMock('../process/stableDiff', () => ({ generateAIImage: vi.fn() }))

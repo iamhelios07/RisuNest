@@ -4,7 +4,7 @@ vi.mock('@tauri-apps/api/core', () => ({ invoke: f.invoke }))
 vi.mock('src/ts/alert', () => ({ alertCheckboxConfirm: f.dialog }))
 vi.mock('../libraryCharacters', () => ({ hasLibraryCharacters: f.characters }))
 vi.mock('src/ts/process/modules', () => ({ moduleUpdate: vi.fn(), getModules: () => [] }))
-vi.mock('src/ts/parser/parser.svelte', () => ({ risuChatParser: (text: string) => text }))
+vi.mock('src/ts/parser/parser.svelte', async () => (await import('../../parser/parser.testSupport')).parserStubModule())
 import { language } from 'src/lang'
 import { normalizeDatabaseDefaults, type Database } from '../database.svelte'
 import type { InspectedSyncTarget, SyncBindingDependencies, SyncBindingState } from './bindingFlow'

@@ -112,7 +112,7 @@ function mockPublicGeneration(
     }))
     vi.doMock('../alert', () => ({ alertError: vi.fn(), alertToast: vi.fn() }))
     vi.doMock('../parser/chatML', () => ({ parseChatML: (value: string) => value }))
-    vi.doMock('../parser/parser.svelte', () => ({ risuChatParser: (value: string) => value }))
+    vi.doMock('../parser/parser.svelte', async () => (await import('../parser/parser.testSupport')).parserStubModule())
     vi.doMock('../util', () => ({
         checkNullish: (value: unknown) => value == null,
         findCharacterbyId: () => fixture.workingCopy.characters[0],
@@ -210,10 +210,7 @@ describe('independent windowed conversation interfaces', () => {
         )
         onTestFinished(() => luaOperation.release())
         expect(luaOperation.mode).toBe('compatibility')
-        vi.doMock('../parser/parser.svelte', () => ({
-            hasher: vi.fn(),
-            risuChatParser: (value: string) => value,
-        }))
+        vi.doMock('../parser/parser.svelte', async () => (await import('../parser/parser.testSupport')).parserStubModule({ hasher: vi.fn() }))
         vi.doMock('../alert', () => ({
             alertConfirm: vi.fn(),
             alertError: vi.fn(),

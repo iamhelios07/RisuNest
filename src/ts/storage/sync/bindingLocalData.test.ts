@@ -2,7 +2,7 @@ import { beforeEach, expect, it, vi } from 'vitest'
 const invoke = vi.hoisted(() => vi.fn())
 vi.mock('@tauri-apps/api/core', () => ({ invoke }))
 vi.mock('src/ts/process/modules', () => ({ moduleUpdate: vi.fn(), getModules: () => [] }))
-vi.mock('src/ts/parser/parser.svelte', () => ({ risuChatParser: (text: string) => text }))
+vi.mock('src/ts/parser/parser.svelte', async () => (await import('../../parser/parser.testSupport')).parserStubModule())
 import { hasLocalSharedBindingData } from './bindingLocalData'
 import { normalizeDatabaseDefaults, type Database } from '../database.svelte'
 function native() {
