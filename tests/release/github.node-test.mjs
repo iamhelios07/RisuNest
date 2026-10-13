@@ -15,6 +15,15 @@ function client(responses) {
 }
 const json = (value, status = 200) => new Response(JSON.stringify(value), { status });
 
+test("publication sends the completed release body with the public transition", async () => {
+  const body = "# Release\n\n## Downloads / 다운로드\n\n| Platform | arm64 | x64 |";
+  const { github, calls } = client([json({ id: 7, draft: false, body })]);
+  await github.publish(7, body);
+  assert.equal(calls[0].url, "https://api.github.com/repos/rsyumi/RisuNest/releases/7");
+  assert.equal(calls[0].method, "PATCH");
+  assert.deepEqual(JSON.parse(calls[0].body), { draft: false, make_latest: "true", body });
+});
+
 test("GitHub reads recover from transient HTTP failures without retrying absent releases or mutations", async () => {
   const { github, calls, waits } = client([json({}, 504), json({}, 503), json({ id: 7 })]);
   assert.equal((await github.getLatest()).id, 7);
