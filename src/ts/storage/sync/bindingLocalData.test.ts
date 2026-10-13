@@ -5,12 +5,10 @@ vi.mock('src/ts/process/modules', () => ({ moduleUpdate: vi.fn(), getModules: ()
 vi.mock('src/ts/parser/parser.svelte', () => ({ risuChatParser: (text: string) => text }))
 import { hasLocalSharedBindingData } from './bindingLocalData'
 import { normalizeDatabaseDefaults, type Database } from '../database.svelte'
-import { DBState } from 'src/ts/stores.svelte'
 function native() {
     return { library: structuredClone(normalizeDatabaseDefaults({} as Database)), characterCount: '0', managedAliasCount: '0', ordinaryPluginValueCount: '0', hypaValueCount: '0', pluginLocalValueCount: '0', opaqueSharedUnitCount: '0', sharedVariables: {}, pluginLocalParticipating: false }
 }
-DBState.db = native().library
-beforeEach(() => { invoke.mockReset(); DBState.db = native().library })
+beforeEach(() => { invoke.mockReset() })
 it('a current fresh factory library has nothing to publish', async () => {
     invoke.mockResolvedValue(native())
     expect(await hasLocalSharedBindingData()).toBe(false)

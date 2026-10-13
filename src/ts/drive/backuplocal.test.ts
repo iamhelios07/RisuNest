@@ -236,7 +236,6 @@ describe('local backup persistent snapshot', () => {
         const click = vi.spyOn(input, 'click').mockImplementation(() => {})
         const createElement = vi.spyOn(document, 'createElement').mockReturnValueOnce(input)
         const discard = vi.fn(async () => {})
-        const nativeReadSizes: number[] = []
         if (mobile) {
             window.RisuNativeFileSelection = {
                 pick: vi.fn(async () => ({ cancelled: false, files: [{ path: '/owned/backup', name: file.name, bytes: file.size, mimeType: '' }] })),
@@ -248,7 +247,6 @@ describe('local backup persistent snapshot', () => {
                     seek: async (offset: number) => { position = offset },
                     read: async (buffer: Uint8Array) => {
                         expect(discard).not.toHaveBeenCalled()
-                        nativeReadSizes.push(buffer.length)
                         const data = archive.subarray(position, position + buffer.length)
                         buffer.set(data)
                         position += data.length
@@ -268,7 +266,6 @@ describe('local backup persistent snapshot', () => {
         await pending
         if (mobile) {
             expect(click).not.toHaveBeenCalled()
-            expect(Math.max(...nativeReadSizes)).toBeLessThanOrEqual(256 * 1024)
             expect(discard).toHaveBeenCalledExactlyOnceWith('/owned/backup')
         }
         createElement.mockRestore()

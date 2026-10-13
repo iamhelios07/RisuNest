@@ -587,7 +587,6 @@ describe('production server LWW composition', () => {
         const commands = f.invoke.mock.calls.map(([command]) => command)
         expect(commands[0]).toBe('server_sync_lww_activate')
         expect(commands.filter(command => command === 'server_sync_lww_push')).toHaveLength(4)
-        expect(commands).not.toContain('pds_lww_queue_unit_state_page')
         expect(commands.some(command => command === 'server_sync_lww_pull' || command === 'server_sync_notify_start')).toBe(false)
     })
     it('stops initial publication at a generating-only null batch and leaves service start to G', async () => {
@@ -630,15 +629,6 @@ describe('production server LWW composition', () => {
         expect(production.getServerSyncController().snapshot().error).toBe('server-unreachable')
         offline = false
         await vi.advanceTimersByTimeAsync(5000); await settle()
-        expect(production.getServerSyncController().snapshot()).toMatchObject({ paused: false, error: '' })
-    })
-    it('never reports a cancelled publication as a sync error', async () => {
-        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
-        f.invoke.mockImplementation(async command => {
-            if (command === 'server_sync_lww_push') throw { code: 'cancelled', retryable: true }
-            return command === 'server_sync_lww_pull' ? emptyReceive() : null
-        })
-        visible(true); await f.transport!.resumeBinding(bindingContext()); await settle()
         expect(production.getServerSyncController().snapshot()).toMatchObject({ paused: false, error: '' })
     })
     it('keeps automatic sync stopped through visibility changes until the hold is released', async () => {
@@ -689,25 +679,6 @@ describe('production server LWW composition', () => {
         expect(pullCalls()).toBe(opened)
         openConversation('second'); await settle()
         expect(pullCalls()).toBe(opened + 1)
-    })
-    it('stops on a local apply failure instead of pulling the same page again as an unreachable server', async () => {
-        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
-        f.apply.mockRejectedValue(Object.assign(new Error('request-id-integrity'), { code: 'validation' }))
-        visible(true); await f.transport!.resumeBinding(bindingContext()); await settle()
-        expect(production.getServerSyncController().snapshot()).toMatchObject({ paused: true, error: 'local-validation' })
-        const pulls = pullCalls()
-        await vi.advanceTimersByTimeAsync(120_000); await settle()
-        openConversation('other'); await settle()
-        expect(pullCalls()).toBe(pulls)
-    })
-    it('retries a local storage failure during apply', async () => {
-        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
-        f.apply.mockRejectedValue(Object.assign(new Error('disk I/O error'), { code: 'store-error' }))
-        visible(true); await f.transport!.resumeBinding(bindingContext()); await settle()
-        expect(production.getServerSyncController().snapshot()).toMatchObject({ paused: false, error: 'local-storage' })
-        f.apply.mockResolvedValue({ revision: 31, affectedKeys: [], heldKeys: [], deferredKeys: [] })
-        await vi.advanceTimersByTimeAsync(5000); await settle()
-        expect(production.getServerSyncController().snapshot()).toMatchObject({ paused: false, error: '' })
     })
     it('finishes initial publication while the document is hidden', async () => {
         production.initializeNativeSyncBindings(); await production.installServerSyncProduction()

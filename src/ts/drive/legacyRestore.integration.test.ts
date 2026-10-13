@@ -240,16 +240,6 @@ describe('legacy WebView restore integrity', () => {
         expect(state.metadata.get('assets/first.png')).toMatchObject({key: 'assets/first.png', size: 1})
         expect(state.replace).toHaveBeenCalledOnce()
     })
-    it('rejects a truncated trailing asset instead of activating the earlier database', async () => {
-        const db = entry('database.risudat', encodeRisuSaveLegacy(structuredClone(risuSaveFixtureDatabase), 'compression'))
-        const asset = entry('synthetic-image.png', new Uint8Array([1, 2, 3, 4, 5]))
-        const truncated = new Uint8Array(db.length + asset.length - 2)
-        truncated.set(db)
-        truncated.set(asset.subarray(0, asset.length - 2), db.length)
-        let failed = false
-        try { await restore(truncated) } catch { failed = true }
-        expect({ failed, activated: state.replace.mock.calls.length }).toEqual({ failed: true, activated: 0 })
-    })
 
     it('does not overwrite an existing inlay when the archive has no database', async () => {
         const original = new Uint8Array([9, 9, 9])

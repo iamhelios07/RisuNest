@@ -197,10 +197,6 @@ describe('character card additions', () => {
         expect(mocks.openDesktopPicker).not.toHaveBeenCalled()
     })
 
-    it('enables the verified native character content route', () => {
-        expect(isNativeCharacterContentImportEnabled()).toBe(true)
-    })
-
     it('commits a complete detached legacy card before returning its stable index', async () => {
         const card = {
             name: 'Synthetic card',

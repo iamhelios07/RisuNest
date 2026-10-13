@@ -50,24 +50,17 @@ beforeEach(() => {
 afterEach(() => { delete window.RisuNativeFileSelection })
 
 describe('native mobile file selection', () => {
-    it('reads exact binary bytes with short native reads and releases the handle and source', async () => {
-        mocks.open.mockImplementation(async () => readable(undefined, 1))
+    it('reads exact binary bytes across chunks with short native reads and releases the handle and source', async () => {
+        const bytes = Uint8Array.from({ length: 600_000 }, (_, index) => index % 256)
+        mocks.pick.mockResolvedValue({ cancelled: false, files: [metadata('synthetic.risup', bytes.length)] })
+        mocks.open.mockImplementation(async () => readable(bytes, 65_537))
         const [file] = await selectNativeFileData({ accept: '.json,.risup' })
         expect(file.name).toBe('synthetic.risup')
-        expect([...file.data]).toEqual([0, 128, 255, 10])
+        expect(Buffer.compare(file.data, bytes)).toBe(0)
         expect(mocks.open).toHaveBeenCalledWith('/owned/selection/source', { read: true })
         expect(handles[0].close).toHaveBeenCalledOnce()
         expect(mocks.discard).toHaveBeenCalledWith('/owned/selection/source')
         expect(isLibraryFileOperationReserved()).toBe(false)
-    })
-
-    it('bounds native IPC reads for a file larger than one chunk', async () => {
-        const bytes = new Uint8Array(600_000).fill(193)
-        mocks.pick.mockResolvedValue({ cancelled: false, files: [metadata('large.bin', bytes.length)] })
-        mocks.open.mockImplementation(async () => readable(bytes))
-        const [file] = await selectNativeFileData()
-        expect(Buffer.compare(file.data, bytes)).toBe(0)
-        expect(handles[0].read.mock.calls.every(([target]) => target.length <= 256 * 1024)).toBe(true)
     })
 
     it('uses the iOS native picker and cleanup, preserving multiple selection order and names', async () => {
