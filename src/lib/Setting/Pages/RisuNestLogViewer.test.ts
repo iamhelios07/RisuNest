@@ -3,10 +3,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mount, tick, unmount } from 'svelte'
 
-const nativeLog = vi.hoisted(() => ({
-    getNativeLogTail: vi.fn(),
-    getNativeLogFilePath: vi.fn(),
-    setNativeLogFileEnabled: vi.fn(),
+// One handler per native_log_* command; each receives the arguments the product sent with that command.
+const commands = vi.hoisted(() => ({
+    native_log_tail: vi.fn(),
+    native_log_file_path: vi.fn(),
+    native_log_set_file_enabled: vi.fn(),
 }))
 const alerts = vi.hoisted(() => ({ alertMd: vi.fn() }))
 const deviceSettings = vi.hoisted(() => {
@@ -33,7 +34,12 @@ const deviceSettings = vi.hoisted(() => {
     }
 })
 
-vi.mock('src/ts/nativeLog', () => nativeLog)
+vi.mock('@tauri-apps/api/core', async (importOriginal) => ({
+    ...await importOriginal<typeof import('@tauri-apps/api/core')>(),
+    invoke: vi.fn((command: string, args?: Record<string, unknown>) => Object.hasOwn(commands, command)
+        ? commands[command as keyof typeof commands](args)
+        : Promise.reject(new Error(`unexpected command ${command}`))),
+}))
 vi.mock('src/ts/alert', () => alerts)
 vi.mock('src/ts/storage/deviceSettings', () => deviceSettings)
 
@@ -48,15 +54,15 @@ describe('RisuNestLogViewer', () => {
 
     beforeEach(() => {
         deviceSettings.reset()
-        nativeLog.getNativeLogTail.mockReset()
-        nativeLog.getNativeLogFilePath.mockReset()
-        nativeLog.setNativeLogFileEnabled.mockReset()
+        commands.native_log_tail.mockReset()
+        commands.native_log_file_path.mockReset()
+        commands.native_log_set_file_enabled.mockReset()
         alerts.alertMd.mockReset()
         target = document.createElement('div')
         document.body.append(target)
-        nativeLog.getNativeLogTail.mockResolvedValue([])
-        nativeLog.getNativeLogFilePath.mockResolvedValue('/data/logs/risunest.log')
-        nativeLog.setNativeLogFileEnabled.mockResolvedValue(undefined)
+        commands.native_log_tail.mockResolvedValue([])
+        commands.native_log_file_path.mockResolvedValue('/data/logs/risunest.log')
+        commands.native_log_set_file_enabled.mockResolvedValue(undefined)
         Object.defineProperty(navigator, 'clipboard', {
             configurable: true,
             value: { writeText: vi.fn(async () => undefined) },
@@ -72,40 +78,39 @@ describe('RisuNestLogViewer', () => {
 
     async function render() {
         mounted = mount(RisuNestLogViewer, { target })
-        await tick()
-        await Promise.resolve()
-        await tick()
+        await settleAction()
     }
 
+    // Runs every queued promise continuation, through the nativeLog wrappers around invoke, then flushes the DOM.
     async function settleAction() {
-        await Promise.resolve()
-        await Promise.resolve()
+        await new Promise((resolve) => setTimeout(resolve, 0))
         await tick()
     }
 
     it('fetches a fresh tail for view while keeping native entries off the page', async () => {
-        nativeLog.getNativeLogTail.mockResolvedValueOnce([
+        commands.native_log_tail.mockResolvedValueOnce([
             { tsMs: 0, level: 'warn', target: 'native', message: 'older' },
             { tsMs: 1_000, level: 'error', target: 'native', message: 'newer' },
         ])
 
         await render()
 
-        expect(nativeLog.getNativeLogTail).not.toHaveBeenCalled()
+        expect(commands.native_log_tail).not.toHaveBeenCalled()
         expect(target.textContent).not.toContain('newer')
         expect(target.textContent).not.toContain('older')
 
         target.querySelector<HTMLButtonElement>('[data-view-log]')!.click()
         await settleAction()
 
-        expect(nativeLog.getNativeLogTail).toHaveBeenCalledOnce()
+        expect(commands.native_log_tail).toHaveBeenCalledOnce()
+        expect(commands.native_log_tail).toHaveBeenCalledWith({ limit: 500 })
         expect(alerts.alertMd).toHaveBeenCalledWith(
             '~~~~\n[1970-01-01T00:00:01.000Z] [error] newer\n[1970-01-01T00:00:00.000Z] [warn] older\n~~~~',
         )
     })
 
     it('lengthens the fence past any tilde run inside the log', async () => {
-        nativeLog.getNativeLogTail.mockResolvedValueOnce([
+        commands.native_log_tail.mockResolvedValueOnce([
             { tsMs: 0, level: 'error', target: 'native', message: '<b>raw</b> ~~~~~ "quoted"' },
         ])
 
@@ -128,7 +133,7 @@ describe('RisuNestLogViewer', () => {
     })
 
     it('fetches a fresh tail for copy and uses the project clipboard fallback', async () => {
-        nativeLog.getNativeLogTail.mockResolvedValueOnce([
+        commands.native_log_tail.mockResolvedValueOnce([
             { tsMs: 1_000, level: 'error', target: 'native', message: 'post-mount failure' },
         ])
         Object.defineProperty(document, 'execCommand', {
@@ -146,7 +151,7 @@ describe('RisuNestLogViewer', () => {
         target.querySelector<HTMLButtonElement>('[data-copy-log]')!.click()
         await settleAction()
 
-        expect(nativeLog.getNativeLogTail).toHaveBeenCalledOnce()
+        expect(commands.native_log_tail).toHaveBeenCalledOnce()
         expect(writeText).toHaveBeenCalledWith(
             '[1970-01-01T00:00:01.000Z] [error] post-mount failure',
         )
@@ -157,7 +162,7 @@ describe('RisuNestLogViewer', () => {
     it('ignores a stale view result when a newer view finishes first', async () => {
         await render()
         const resolvers: Array<(entries: Array<{ tsMs: number, level: string, target: string, message: string }>) => void> = []
-        nativeLog.getNativeLogTail.mockImplementation(() => new Promise((resolve) => {
+        commands.native_log_tail.mockImplementation(() => new Promise((resolve) => {
             resolvers.push(resolve)
         }))
 
@@ -177,7 +182,7 @@ describe('RisuNestLogViewer', () => {
     it('ignores a stale copy result when a newer copy finishes first', async () => {
         await render()
         const resolvers: Array<(entries: Array<{ tsMs: number, level: string, target: string, message: string }>) => void> = []
-        nativeLog.getNativeLogTail.mockImplementation(() => new Promise((resolve) => {
+        commands.native_log_tail.mockImplementation(() => new Promise((resolve) => {
             resolvers.push(resolve)
         }))
         const writeText = vi.spyOn(navigator.clipboard, 'writeText')
@@ -196,7 +201,7 @@ describe('RisuNestLogViewer', () => {
     })
 
     it('serializes clipboard writes so a late fallback cannot overwrite the newest copy', async () => {
-        nativeLog.getNativeLogTail
+        commands.native_log_tail
             .mockResolvedValueOnce([
                 { tsMs: 1_000, level: 'error', target: 'native', message: 'older' },
             ])
@@ -242,6 +247,7 @@ describe('RisuNestLogViewer', () => {
     it('synchronizes file logging with native state and device settings', async () => {
         await render()
 
+        expect(commands.native_log_file_path).toHaveBeenCalledOnce()
         expect(target.textContent).toContain('/data/logs/risunest.log')
         const checkbox = target.querySelector<HTMLInputElement>('input[type="checkbox"]')!
         expect(checkbox.classList.contains('sr-only')).toBe(true)
@@ -249,10 +255,9 @@ describe('RisuNestLogViewer', () => {
         expect(checkbox.closest('label')?.className).toContain('focus-within:outline-darkborderc')
         checkbox.checked = false
         checkbox.dispatchEvent(new Event('change', { bubbles: true }))
-        await Promise.resolve()
-        await tick()
+        await settleAction()
 
-        expect(nativeLog.setNativeLogFileEnabled).toHaveBeenCalledWith(false)
+        expect(commands.native_log_set_file_enabled).toHaveBeenCalledWith({ enabled: false })
         expect(deviceSettings.updateDeviceSettings).toHaveBeenCalledWith({ nativeFileLogEnabled: false })
 
         deviceSettings.emit({ nativeFileLogEnabled: true })
@@ -261,7 +266,7 @@ describe('RisuNestLogViewer', () => {
     })
 
     it('shows localized failure copy without rendering raw command details', async () => {
-        nativeLog.getNativeLogTail.mockRejectedValueOnce(new Error('native command detail'))
+        commands.native_log_tail.mockRejectedValueOnce(new Error('native command detail'))
         const error = vi.spyOn(console, 'error').mockImplementation(() => undefined)
         await render()
 
@@ -276,7 +281,7 @@ describe('RisuNestLogViewer', () => {
     })
 
     it('maps a copy tail failure to localized safe copy', async () => {
-        nativeLog.getNativeLogTail.mockRejectedValueOnce(new Error('copy command detail'))
+        commands.native_log_tail.mockRejectedValueOnce(new Error('copy command detail'))
         const writeText = vi.spyOn(navigator.clipboard, 'writeText')
         await render()
 
@@ -290,7 +295,7 @@ describe('RisuNestLogViewer', () => {
 
     it('disables the file logging checkbox while its native update is pending', async () => {
         let resolveNativeUpdate: (() => void) | undefined
-        nativeLog.setNativeLogFileEnabled.mockImplementation(() => new Promise<void>((resolve) => {
+        commands.native_log_set_file_enabled.mockImplementation(() => new Promise<void>((resolve) => {
             resolveNativeUpdate = resolve
         }))
         await render()
@@ -301,18 +306,17 @@ describe('RisuNestLogViewer', () => {
         await tick()
 
         expect(checkbox.disabled).toBe(true)
-        expect(nativeLog.setNativeLogFileEnabled).toHaveBeenCalledOnce()
+        expect(commands.native_log_set_file_enabled).toHaveBeenCalledOnce()
 
         resolveNativeUpdate!()
-        await Promise.resolve()
-        await tick()
+        await settleAction()
         expect(checkbox.disabled).toBe(false)
         expect(checkbox.checked).toBe(false)
     })
 
     it('rolls back a failed native update and re-enables the checkbox', async () => {
         let rejectNativeUpdate: ((error: Error) => void) | undefined
-        nativeLog.setNativeLogFileEnabled.mockImplementation(() => new Promise<void>((_resolve, reject) => {
+        commands.native_log_set_file_enabled.mockImplementation(() => new Promise<void>((_resolve, reject) => {
             rejectNativeUpdate = reject
         }))
         const error = vi.spyOn(console, 'error').mockImplementation(() => undefined)
@@ -325,8 +329,7 @@ describe('RisuNestLogViewer', () => {
         expect(checkbox.disabled).toBe(true)
 
         rejectNativeUpdate!(new Error('native toggle failed'))
-        await Promise.resolve()
-        await tick()
+        await settleAction()
         expect(checkbox.disabled).toBe(false)
         expect(checkbox.checked).toBe(true)
         expect(deviceSettings.updateDeviceSettings).not.toHaveBeenCalled()
@@ -336,15 +339,14 @@ describe('RisuNestLogViewer', () => {
     it('loads the file path once when enabling file logging', async () => {
         deviceSettings.reset(false)
         await render()
-        nativeLog.getNativeLogFilePath.mockClear()
+        commands.native_log_file_path.mockClear()
         const checkbox = target.querySelector<HTMLInputElement>('input[type="checkbox"]')!
 
         checkbox.checked = true
         checkbox.dispatchEvent(new Event('change', { bubbles: true }))
-        await Promise.resolve()
-        await tick()
+        await settleAction()
 
-        expect(nativeLog.getNativeLogFilePath).toHaveBeenCalledOnce()
+        expect(commands.native_log_file_path).toHaveBeenCalledOnce()
     })
 
     it('provides a visible theme-token focus outline for the custom toggle', async () => {
