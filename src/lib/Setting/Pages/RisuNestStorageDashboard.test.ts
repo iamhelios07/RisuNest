@@ -86,6 +86,14 @@ describe('RisuNestStorageDashboard', () => {
         expect(target.textContent).not.toContain('data-health-repair')
     })
 
+    it('describes a blocked temporary file cleanup without exposing the reason token', async () => {
+        server.getServerSyncCacheUsage.mockResolvedValueOnce({ totalBytes: 1024, cacheBytes: 1024, protectedBytes: 0, reclaimableBytes: 1024, ledgerBytes: 0, databaseBytes: 0, blockedReason: 'server-sync-busy' })
+        const target = setup()
+        await vi.waitFor(() => expect(target.textContent).toContain(syncText.management.blockedReasons['server-sync-busy']))
+        expect(target.textContent).not.toContain('server-sync-busy')
+        expect(exact(target, syncText.management.clean)?.disabled).toBe(true)
+    })
+
     function setup(
         statsPromise: Promise<typeof stats> = Promise.resolve(stats),
     ): HTMLElement {
