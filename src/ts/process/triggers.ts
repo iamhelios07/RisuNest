@@ -23,6 +23,7 @@ import {
 } from "./conversationOperationContext";
 import { createScriptConversationAccess, type ScriptConversationAccess } from './scriptConversationAccess';
 import { requestScriptDisplayRefresh } from './scriptDisplayRefresh';
+import { noteChatVariableRead } from './scriptVariableReads';
 import { peekActiveConversationSession } from "../storage/persistentDataRuntime.svelte";
 import { runSerializedUserTrigger } from './conversationUserTrigger';
 import { getHistoryMessage, historyLength, inheritHistoryWindow, sliceHistory } from './historyWindowIndex';
@@ -1315,7 +1316,7 @@ async function runTriggerImpl(char: character, mode: triggerMode, arg: RunTrigge
             return localVar
         }
         if (access) return access.getVariable(key)
-        
+        noteChatVariableRead(key)
         const state = chat.scriptstate?.['$' + key]
         if(state === undefined || state === null){
             const findResult = defaultVariables.find((f) => {

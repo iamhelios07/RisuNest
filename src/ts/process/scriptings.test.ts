@@ -16,7 +16,7 @@ import {
 } from '../storage/activeConversationSession'
 import { createConversationOperationContext } from './conversationOperationContext'
 import type { Chat, character } from '../storage/database.svelte'
-import { DBState, ReloadGUIPointer } from '../stores.svelte'
+import { DBState, ScriptDisplayRefreshPointer } from '../stores.svelte'
 import { risuChatParser } from '../parser/parser.svelte'
 import type { LuaEngine } from 'wasmoon'
 import { appendDefaultChatInput } from '../../lib/ChatScreens/defaultChatInput'
@@ -28,6 +28,7 @@ import { captureGenerationConversationOperation } from './generationConversation
 import { createChatParserDependencyStamp } from '../chatRenderIdentity'
 import { alertConfirm, alertNormal, alertToast } from '../alert'
 import { language } from '../../lang'
+import { DisplayReadRecord, recordAmbientChatVariableReads } from './scriptVariableReads'
 
 const continuationRuntime = vi.hoisted(() => ({
   session: null as ActiveConversationSession | null,
@@ -84,6 +85,7 @@ vi.mock('../stores.svelte', () => ({
     set: vi.fn(),
     update: vi.fn(),
   },
+  ScriptDisplayRefreshPointer: { update: vi.fn() },
   CurrentTriggerIdStore: {
     subscribe: (run: (value: null) => void) => {
       run(null)
@@ -1923,7 +1925,15 @@ test('runs variable-only Lua handlers and display listeners without visiting mes
   try {
     messagesReadable = false
     await runLuaButtonTrigger(fixture.char, 'click')
-    await expect(runLuaEditTrigger(fixture.char, 'editdisplay', 'row')).resolves.toBe('row:1')
+    // The display pipeline records what its listener reads for the row it renders.
+    const reads = new DisplayReadRecord()
+    const stopRecording = recordAmbientChatVariableReads(reads)
+    try {
+      await expect(runLuaEditTrigger(fixture.char, 'editdisplay', 'row')).resolves.toBe('row:1')
+    } finally {
+      stopRecording()
+    }
+    expect([...reads.keys]).toEqual(['counter'])
     expect(errors).not.toHaveBeenCalled()
     expect(fixture.chat.scriptstate).toEqual({ $counter: '1', $seen: '1' })
     // One variable commit each for the handler and the listener.
@@ -1996,7 +2006,7 @@ test('shows Lua variables at reloadDisplay and commits message edits at the end'
   vi.mocked(getCurrentCharacter).mockReturnValue(fixture.char)
   continuationRuntime.session = fixture.session
   const atRefresh: unknown[] = []
-  vi.mocked(ReloadGUIPointer.set).mockImplementation(() => {
+  vi.mocked(ScriptDisplayRefreshPointer.update).mockImplementation(() => {
     atRefresh.push({
       messages: fixture.chat.message.map((entry) => entry.data),
       scriptstate: { ...fixture.chat.scriptstate },
@@ -2013,7 +2023,7 @@ test('shows Lua variables at reloadDisplay and commits message edits at the end'
     expect(fixture.chat.message.map((entry) => entry.data)).toEqual(['edited'])
     expect(fixture.chat.scriptstate).toEqual({ $other: 'kept', $counter: '1', $after: '2' })
   } finally {
-    vi.mocked(ReloadGUIPointer.set).mockReset()
+    vi.mocked(ScriptDisplayRefreshPointer.update).mockReset()
     continuationRuntime.session = null
   }
 })

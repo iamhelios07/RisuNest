@@ -58,6 +58,8 @@ export const MobileSideBar = writable(0)
 export const SettingsMenuIndex = writable(-1)
 export const ReloadGUIPointer = writable(0)
 export const ReloadChatPointer = writable({} as Record<number, number>)
+/** Advanced when a script's variable change refreshes the rows that read it. */
+export const ScriptDisplayRefreshPointer = writable(0)
 export const ScrollToMessageStore = writable<CapturedChatMessageTarget | null>(null)
 export const OpenRealmStore = writable(false)
 export const RealmInitialOpenChar = writable<null | hubType>(null)
@@ -193,6 +195,10 @@ export const hotReloading = $state<string[]>([])
 
 ReloadGUIPointer.subscribe(() => {
     ReloadChatPointer.set({})
+    resetScriptCache()
+})
+
+ScriptDisplayRefreshPointer.subscribe(() => {
     resetScriptCache()
 })
 

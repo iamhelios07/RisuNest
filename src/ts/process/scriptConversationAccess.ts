@@ -6,6 +6,7 @@ import {
 import type { Chat, Database } from '../storage/database.svelte'
 import { peekActiveConversationSession } from '../storage/persistentDataRuntime.svelte'
 import { parseKeyValue } from '../util'
+import { noteChatVariableRead } from './scriptVariableReads'
 import {
     createConversationOperationContext,
     type ConversationCommitObserver,
@@ -72,6 +73,7 @@ export class ScriptConversationAccess {
     }
 
     getVariable(key: string): string {
+        noteChatVariableRead(key)
         const pending = this.pendingVariables.get(key)
         if (pending !== undefined) return pending
         const defaults = this.readDefaultVariables()

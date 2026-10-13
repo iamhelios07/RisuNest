@@ -83,6 +83,7 @@ vi.mock('src/ts/stores.svelte', () => {
     selectedCharID: writable(0),
     HideIconStore: writable(false),
     ReloadGUIPointer: writable(0),
+    ScriptDisplayRefreshPointer: writable(0),
     selIdState: { selId: 0 },
     createSimpleCharacter: (char: character) => ({ ...char, type: 'simple' }),
     }
@@ -96,7 +97,9 @@ vi.mock('src/ts/globalApi.svelte', () => ({
     getFileSrc: vi.fn(async (source: string) => source),
     createChatCopyName: vi.fn(),
 }))
-vi.mock('src/ts/process/scripts', () => ({
+vi.mock('src/ts/process/scripts', async () => {
+    const { getChatVar } = await import('src/ts/parser/chatVar.svelte')
+    return {
     risuChatParser: (value: string, arg: {
         chara?: any
         role?: string
@@ -110,11 +113,13 @@ vi.mock('src/ts/process/scripts', () => ({
             projectedChatID: arg.projectedChatID,
             historyOffset: (arg as any).historyOffset,
         })
+        value = value.replace(/\{\{getvar::([^}]+)\}\}/g, (_, key: string) => getChatVar(key))
         if (!value.includes('{{char}}')) return value
         if (typeof arg.chara === 'string') return value.replaceAll('{{char}}', arg.chara)
         return value.replaceAll('{{char}}', arg.chara?.name ?? '')
     },
-}))
+    }
+})
 vi.mock('src/ts/model/modellist', () => ({
     getModelInfo: (model: string) => ({ shortName: model || 'model' }),
 }))
@@ -183,6 +188,7 @@ import { alertToast } from 'src/ts/alert'
 import ChatCaptureBatchHarness from './ChatCaptureBatchHarness.test.svelte'
 import ChatsHarness from './ChatsHarness.test.svelte'
 import { chatViewEvents } from 'src/ts/plugins/chatViewHost.svelte'
+import { requestScriptDisplayRefresh } from 'src/ts/process/scriptDisplayRefresh'
 import type { ChatViewEvent } from 'src/ts/plugins/chatViewEvents'
 
 function context(overrides: Record<string, unknown> = {}) {
@@ -584,6 +590,46 @@ describe('Chat frozen capture presentation', () => {
             expect(harness.withCompleteSelectedConversation).not.toHaveBeenCalled()
         },
     )
+
+    test('shows a greeting variable again only when a script changes that variable', async () => {
+        const scriptstate = { $hp: '10', $mood: 'calm' }
+        live.db = {
+            ...live.db,
+            characters: [{
+                type: 'character',
+                name: 'Live Character',
+                chaId: 'live',
+                chatPage: 0,
+                chats: [{ id: 'greeting', message: [], scriptstate }],
+            }],
+        }
+        mounted = mount(Chat, {
+            target,
+            props: {
+                message: 'HP {{getvar::hp}}',
+                name: 'Live Character',
+                role: 'char',
+                idx: -1,
+                firstMessage: true,
+                totalLength: 0,
+                isLastMemory: false,
+            },
+        })
+        const shown = () => target.querySelector('[data-chat-body-probe]')?.textContent
+        await vi.waitFor(() => expect(shown()).toBe('HP 10'))
+
+        scriptstate.$hp = '4'
+        scriptstate.$mood = 'tense'
+        const parsesBefore = parserCalls.length
+        requestScriptDisplayRefresh({ keys: ['mood'] })
+        await Promise.resolve()
+        await tick()
+        expect(parserCalls).toHaveLength(parsesBefore)
+        expect(shown()).toBe('HP 10')
+
+        requestScriptDisplayRefresh({ keys: ['hp'] })
+        await vi.waitFor(() => expect(shown()).toBe('HP 4'))
+    })
 
     test('renders normal branch comment presentation from the frozen message', async () => {
         const message = {

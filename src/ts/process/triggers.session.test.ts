@@ -5,6 +5,7 @@ import { DBState, selectedCharID } from '../stores.svelte'
 import { processMultiCommand } from './command'
 import { createConversationOperationContext } from './conversationOperationContext'
 import { createChatParserDependencyStamp } from '../chatRenderIdentity'
+import { DisplayReadRecord, recordAmbientChatVariableReads } from './scriptVariableReads'
 
 const runtime = vi.hoisted(() => ({
     unexpectedNativeRuntimeAccess: () => {
@@ -99,6 +100,31 @@ test('keeps stored trigger permissions and parser identity stable during display
         expect(createChatParserDependencyStamp(char)).toBe(before)
     }
     expect(session.activePinReasons).toEqual([])
+})
+
+test('records the chat variables a display trigger reads for its row', async () => {
+    const { chat, char, session } = fixture()
+    chat.scriptstate = { $hp: '9' }
+    char.triggerscript[0].type = 'display'
+    char.triggerscript[0].conditions = [
+        { type: 'var', var: 'hp', value: '5', operator: '>' },
+    ]
+    char.triggerscript[0].effect = []
+    runtime.session = session
+    DBState.db = { characters: [char], templateDefaultVariables: '' } as never
+    const reads = new DisplayReadRecord()
+    const stopRecording = recordAmbientChatVariableReads(reads)
+    try {
+        await runTrigger(char, 'display', {
+            chat,
+            displayMode: true,
+            displayData: 'unchanged',
+        })
+    } finally {
+        stopRecording()
+    }
+
+    expect([...reads.keys]).toEqual(['hp'])
 })
 
 test('CAS-applies ordered trigger mutations and preserves an empty string value', async () => {

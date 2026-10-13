@@ -66,6 +66,8 @@ import {
     type DeferredInlayMarkerRegistry,
 } from 'src/ts/process/files/inlayRenderSource'
 import ChatBodyInlayHarness from './ChatBodyInlayHarness.test.svelte'
+import { displayRowsToRefresh, noteChatVariableRead, registerDisplayRow } from 'src/ts/process/scriptVariableReads'
+import type { ParseMarkdownRenderContext } from 'src/ts/parser/parser.svelte'
 import { maxTextUnitLength } from 'src/ts/parser/boundedTextUnits'
 
 const imageSource = {
@@ -891,6 +893,56 @@ describe('ChatBody deferred inlay lifecycle', () => {
         await unmount(mounted)
         mounted = undefined
         expect(revokeObjectURL.mock.calls).toEqual([['blob:second']])
+    })
+
+    test('refreshes its row for the variables the shown body read, and for any variable once translated', async () => {
+        chatState.db = {
+            autoTranslate: false,
+            translatorType: 'mock',
+            translateBeforeHTMLFormatting: false,
+            legacyTranslation: false,
+            showTranslationLoading: false,
+            newImageHandlingBeta: false,
+        }
+        const row = registerDisplayRow(() => 0)
+        try {
+            // Style decoding parses CBS too, when the body is published.
+            parserMocks.trimMarkdown.mockImplementation((value: string) => {
+                noteChatVariableRead('accent')
+                return value
+            })
+            const first = deferred<string>()
+            parserMocks.ParseMarkdown.mockImplementationOnce((_message: string, ...args: unknown[]) => {
+                ;(args[4] as ParseMarkdownRenderContext).variableReads?.note('hp')
+                return first.promise
+            })
+            const onDisplaySettled = vi.fn()
+            mounted = mount(ChatBodyInlayHarness, { target, props: { onDisplaySettled, displayRow: row } })
+            await vi.waitFor(() => expect(parserMocks.ParseMarkdown).toHaveBeenCalledOnce())
+            // A parse in progress counts with what it has read so far.
+            expect(displayRowsToRefresh({ keys: ['hp'] })).toEqual([0])
+            expect(displayRowsToRefresh({ keys: ['mood'] })).toEqual([])
+            first.resolve('<p>first</p>')
+            await vi.waitFor(() => expect(onDisplaySettled).toHaveBeenCalledOnce())
+            expect(displayRowsToRefresh({ keys: ['hp'] })).toEqual([0])
+            expect(displayRowsToRefresh({ keys: ['accent'] })).toEqual([0])
+            expect(displayRowsToRefresh({ keys: ['mood'] })).toEqual([])
+
+            // A newer parse that has not read anything yet does not hide what is shown.
+            parserMocks.ParseMarkdown.mockReturnValueOnce(new Promise(() => {}))
+            ;(mounted as { reload(): void }).reload()
+            await vi.waitFor(() => expect(parserMocks.ParseMarkdown).toHaveBeenCalledTimes(2))
+            expect(displayRowsToRefresh({ keys: ['hp'] })).toEqual([0])
+            expect(displayRowsToRefresh({ keys: ['mood'] })).toEqual([])
+
+            const { translateHTML } = await import('src/ts/translator/translator')
+            vi.mocked(translateHTML).mockResolvedValue('<span>translated</span>')
+            ;(mounted as { setTranslated(value: boolean): void }).setTranslated(true)
+            await vi.waitFor(() => expect(translateHTML).toHaveBeenCalledOnce())
+            expect(displayRowsToRefresh({ keys: ['mood'] })).toEqual([0])
+        } finally {
+            row.dispose()
+        }
     })
 
     test('keeps translated state reactive when live parsing starts after a yield', async () => {

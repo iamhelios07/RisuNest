@@ -125,6 +125,7 @@ vi.mock('src/ts/stores.svelte', async () => {
         moduleBackgroundEmbedding: writable(''),
         ReloadChatPointer: writable({}),
         ReloadGUIPointer: writable(0),
+        ScriptDisplayRefreshPointer: writable(0),
         createSimpleCharacter: (char: character) => ({
             type: 'simple',
             chaId: char.chaId,
