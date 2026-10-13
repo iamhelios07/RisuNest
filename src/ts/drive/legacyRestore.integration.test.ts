@@ -18,7 +18,6 @@ const state = vi.hoisted(() => ({
     } as const)),
 }))
 vi.mock('src/ts/alert', async () => (await import('src/ts/drive/backupRestore.testSupport')).alertModule())
-vi.mock('src/ts/nativeLog', () => ({ recordNativeLogError: vi.fn(async () => undefined) }))
 vi.mock('src/ts/globalApi.svelte', () => ({
     forageStorage: { Init: vi.fn(async () => undefined), isAccount: false },
     getUncleanables: vi.fn(async () => []),

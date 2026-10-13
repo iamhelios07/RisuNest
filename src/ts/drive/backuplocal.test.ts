@@ -9,6 +9,7 @@ import type { PersistentDataRuntime } from '../storage/persistentDataRuntime'
 import { decodeRisuSave, encodeRisuSaveLegacy } from '../storage/risuSave'
 import { risuSaveFixtureDatabase } from '../storage/tests/risuSaveFixtures'
 import { sleep } from '../util'
+import { invoke } from '@tauri-apps/api/core'
 import { getBackupInlayName } from './backupAssets'
 import { backupArchive, backupEntry, backupFile } from './backupRestore.testSupport'
 
@@ -38,7 +39,9 @@ const state = vi.hoisted(() => ({
 }))
 
 vi.mock('../alert', async () => (await import('./backupRestore.testSupport')).alertModule())
-vi.mock('../nativeLog', () => ({ recordNativeLogError: vi.fn(async () => undefined) }))
+vi.mock('@tauri-apps/api/core', async importOriginal => ({
+    ...await importOriginal<typeof import('@tauri-apps/api/core')>(), invoke: vi.fn(async () => undefined),
+}))
 vi.mock('../storage/libraryCharacters', async () => (await import('./backupRestore.testSupport')).libraryCharactersModule(async () => state.characters))
 
 vi.mock('../globalApi.svelte', () => ({
@@ -381,17 +384,15 @@ describe('local backup persistent snapshot', () => {
         const { runSharedNativeFileOperation } = await import('../storage/nativeFileJobManager')
         const { NativeFileJobError } = await import('../storage/nativeFileJobs')
         const { alertError } = await import('../alert')
-        const { recordNativeLogError } = await import('../nativeLog')
-        vi.mocked(recordNativeLogError).mockClear()
         vi.mocked(alertError).mockClear()
         vi.mocked(runSharedNativeFileOperation).mockRejectedValueOnce(
             new NativeFileJobError('revision-conflict', 'The database changed during import'),
         )
         const { LoadLocalBackup } = await import('./backuplocal')
         await LoadLocalBackup()
-        expect(recordNativeLogError).toHaveBeenCalledWith(
-            'Backup import failed [revision-conflict]: The database changed during import',
-        )
+        expect(invoke).toHaveBeenCalledWith('native_log_error', {
+            message: 'Backup import failed [revision-conflict]: The database changed during import',
+        })
         expect(alertError).not.toHaveBeenCalled()
     })
 
@@ -399,36 +400,34 @@ describe('local backup persistent snapshot', () => {
         const { runSharedNativeFileOperation } = await import('../storage/nativeFileJobManager')
         const { NativeFileJobActivationCommittedError } = await import('../storage/nativeFileJobs')
         const { alertError } = await import('../alert')
-        const { recordNativeLogError } = await import('../nativeLog')
-        vi.mocked(recordNativeLogError).mockClear()
         vi.mocked(alertError).mockClear()
         vi.mocked(runSharedNativeFileOperation).mockRejectedValueOnce(
             new NativeFileJobActivationCommittedError(2, new Error('Synthetic refresh failed')),
         )
         const { LoadLocalBackup } = await import('./backuplocal')
         await LoadLocalBackup()
-        expect(recordNativeLogError).toHaveBeenCalledWith(
-            expect.stringContaining('Backup data was imported, but the app could not refresh'),
-        )
-        expect(recordNativeLogError).toHaveBeenCalledWith(
-            expect.stringContaining('activation-committed-refresh-failed'),
-        )
-        expect(recordNativeLogError).toHaveBeenCalledWith(expect.stringContaining('Synthetic refresh failed'))
+        expect(invoke).toHaveBeenCalledWith('native_log_error', {
+            message: expect.stringContaining('Backup data was imported, but the app could not refresh'),
+        })
+        expect(invoke).toHaveBeenCalledWith('native_log_error', {
+            message: expect.stringContaining('activation-committed-refresh-failed'),
+        })
+        expect(invoke).toHaveBeenCalledWith('native_log_error', {
+            message: expect.stringContaining('Synthetic refresh failed'),
+        })
         expect(alertError).not.toHaveBeenCalled()
     })
 
     it('stays silent for cancelled imports because the dialog already reported them', async () => {
         const { runSharedNativeFileOperation } = await import('../storage/nativeFileJobManager')
         const { alertError } = await import('../alert')
-        const { recordNativeLogError } = await import('../nativeLog')
-        vi.mocked(recordNativeLogError).mockClear()
         vi.mocked(alertError).mockClear()
         vi.mocked(runSharedNativeFileOperation).mockRejectedValueOnce(
             new DOMException('cancelled', 'AbortError'),
         )
         const { LoadLocalBackup } = await import('./backuplocal')
         await LoadLocalBackup()
-        expect(recordNativeLogError).not.toHaveBeenCalled()
+        expect(invoke).not.toHaveBeenCalledWith('native_log_error', expect.anything())
         expect(alertError).not.toHaveBeenCalled()
     })
 
