@@ -1,6 +1,6 @@
 import type { Chat, Database, Message, character } from './database.svelte'
 import type { CommittedApplyOutcome } from './persistentDataRuntime'
-import { safeStructuredClone } from '../polyfill'
+import { safeStructuredClone } from '../safeStructuredClone'
 import { replaceArrayRange } from '../arrayRange'
 import {
     ActiveConversationSession,

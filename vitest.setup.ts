@@ -1,6 +1,6 @@
 import { afterEach, vi } from 'vitest'
-import rfdc from 'rfdc'
 import { testNetwork } from './tests/support/testNetwork'
+import { safeStructuredClone } from './src/ts/safeStructuredClone'
 
 // Suppress warning
 vi.mock(import('katex'), () => ({}))
@@ -35,19 +35,6 @@ if (happyDOM?.settings?.fetch) {
 // A caught transport error still fails the owning test.
 afterEach(() => testNetwork.finish())
 
-// Mirror the production safeStructuredClone from src/ts/polyfill.ts (structuredClone
-// with an rfdc fallback) instead of importing polyfill.ts, which would pull its
-// drag-drop/stream/global side effects into every suite. A JSON round-trip must not
-// be used here: it silently changes clone semantics (drops undefined/function
-// properties, stringifies Dates, mangles typed arrays, throws on cycles) in the
-// data-loss-critical storage suites.
-const rfdcClone = rfdc({
-  circles: false,
-})
-vi.stubGlobal('safeStructuredClone', <T>(data: T): T => {
-  try {
-    return structuredClone(data)
-  } catch (error) {
-    return rfdcClone(data)
-  }
-})
+// The global polyfill.ts installs, without its drag-drop, stream and Buffer side effects.
+vi.stubGlobal('safeStructuredClone', safeStructuredClone)
+

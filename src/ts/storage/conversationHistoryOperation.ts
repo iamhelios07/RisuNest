@@ -9,7 +9,7 @@ import {
     type MessageLocator,
 } from './activeConversationSession'
 import type { DataRevision } from './persistentDataStore'
-import { safeStructuredClone } from '../polyfill'
+import { safeStructuredClone } from '../safeStructuredClone'
 
 export type ConversationHistoryOperationSource = 'active-session' | 'compatibility-snapshot'
 

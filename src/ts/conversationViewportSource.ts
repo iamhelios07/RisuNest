@@ -1,5 +1,5 @@
 import { ChatRenderIdentityRegistry } from './chatRenderIdentity'
-import { safeStructuredClone } from './polyfill'
+import { safeStructuredClone } from './safeStructuredClone'
 import type {
     CapturedChatMessageTarget,
     CurrentChatMessageTarget,

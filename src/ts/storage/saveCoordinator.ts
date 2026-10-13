@@ -38,7 +38,7 @@ import type {
     ActiveConversationMutationEvent,
     ConversationSessionToken,
 } from './activeConversationSession'
-import { safeStructuredClone } from '../polyfill'
+import { safeStructuredClone } from '../safeStructuredClone'
 import {
     applyPluginStorageMutations,
     orderPluginStorageKeys,
