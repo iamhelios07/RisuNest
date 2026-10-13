@@ -762,17 +762,7 @@ fn overflowing_request_keeps_response_metadata_and_response_body() {
     f.recorder.configure(Settings { enabled: true, buffer_mib: 4, ..Settings::default() }).unwrap();
     let c = f.begin();
     f.detail(&c);
-    let (release, wait) = mpsc::channel();
-    let (ready, started) = mpsc::channel();
-    f.recorder
-        .0
-        .sender
-        .send(Event::Job(Box::new(move |_| {
-            ready.send(()).unwrap();
-            wait.recv_timeout(Duration::from_secs(5)).unwrap();
-        })))
-        .unwrap();
-    started.recv().unwrap();
+    let release = f.pause_writer();
     c.append(Side::Request, &vec![b'x'; 6 * MIB as usize]);
     c.response(201, "https://synthetic.example/final", &text_headers());
     release.send(()).unwrap();
@@ -881,17 +871,7 @@ fn response_and_completion_survive_a_full_event_queue() {
     f.enable(false, false);
     let c = f.begin();
     f.detail(&c);
-    let (release, wait) = mpsc::channel();
-    let (ready, started) = mpsc::channel();
-    f.recorder
-        .0
-        .sender
-        .send(Event::Job(Box::new(move |_| {
-            ready.send(()).unwrap();
-            wait.recv_timeout(Duration::from_secs(5)).unwrap();
-        })))
-        .unwrap();
-    started.recv().unwrap();
+    let release = f.pause_writer();
     for _ in 0..QUEUE_EVENTS + 1 {
         c.append(Side::Request, b"x");
     }
@@ -914,13 +894,7 @@ fn default_buffer_records_a_ten_mib_request_burst_while_writer_is_paused() {
     f.enable(false, false);
     let c = f.begin();
     f.detail(&c);
-    let (release, wait) = mpsc::channel();
-    let (ready, started) = mpsc::channel();
-    f.recorder.0.sender.send(Event::Job(Box::new(move |_| {
-        ready.send(()).unwrap();
-        let _ = wait.recv_timeout(Duration::from_secs(15));
-    }))).unwrap();
-    started.recv_timeout(Duration::from_secs(15)).unwrap();
+    let release = f.pause_writer();
     let body = vec![b'x'; 10 * MIB as usize];
     c.append(Side::Request, &body);
     c.finish("complete");
