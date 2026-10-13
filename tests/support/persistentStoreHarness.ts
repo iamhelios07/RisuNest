@@ -9,6 +9,7 @@ type AsyncMethod = {
     [K in keyof Store]: Store[K] extends (...args: never[]) => Promise<unknown> ? K : never
 }[keyof Store]
 type Method<K extends AsyncMethod> = Store[K] & ((...args: never[]) => Promise<unknown>)
+type Args<K extends AsyncMethod> = Store[K] extends (...args: infer A) => unknown ? A : never
 
 export interface PersistentStoreHarness {
     /** A real IndexedDB store on fake-indexeddb, private to this harness. */
@@ -18,7 +19,7 @@ export interface PersistentStoreHarness {
     /** Spies on one store method; calls still reach the real store until a test mocks them. */
     spy<K extends AsyncMethod>(method: K): MockInstance<Method<K>>
     /** Runs `onCall` before every call to `method`, which then reaches the real store. */
-    observe<K extends AsyncMethod>(method: K, onCall: (...args: Parameters<Method<K>>) => void | Promise<void>): MockInstance<Method<K>>
+    observe<K extends AsyncMethod>(method: K, onCall: (...args: Args<K>) => void | Promise<void>): MockInstance<Method<K>>
     /** Rejects the next call to `method` with `error`; later calls reach the real store. */
     failNext<K extends AsyncMethod>(method: K, error: unknown): void
     /** Holds the next call to `method` until `release()`, then lets it reach the real store. */
