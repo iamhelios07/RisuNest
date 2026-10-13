@@ -1,6 +1,10 @@
 import { beforeEach, describe, expect, test, vi } from 'vitest'
 import { get, writable } from 'svelte/store'
 
+const live = vi.hoisted(() => ({
+    session: null as import('../storage/activeConversationSession').ActiveConversationSession | null,
+}))
+
 vi.mock('../parser/chatVar.svelte', () => ({
     getChatVar: vi.fn(),
     setChatVar: vi.fn(),
@@ -9,6 +13,8 @@ vi.mock('../parser/chatVar.svelte', () => ({
 vi.mock('../stores.svelte', () => ({
     DBState: { db: {} },
     selectedCharID: writable(0),
+    ReloadChatPointer: writable({}),
+    ScriptDisplayRefreshPointer: writable(0),
 }))
 
 vi.mock('../tokenizer', () => ({
@@ -30,6 +36,7 @@ vi.mock('../globalApi.svelte', () => ({ downloadFile: vi.fn(), saveAsset: vi.fn(
 vi.mock('./modules', () => ({ getModuleLorebooks: vi.fn(() => []) }))
 vi.mock('../storage/persistentDataRuntime.svelte', async (importOriginal) => ({
     ...await importOriginal<typeof import('../storage/persistentDataRuntime.svelte')>(),
+    peekActiveConversationSession: () => live.session,
     mutatePersistentCharacterDetail: vi.fn(async (id, _reason, mutate) => {
         const character = DBState.db.characters.find(character => character.chaId === id)
         if (!character) return false
@@ -131,6 +138,7 @@ async function activePrompts() {
 
 beforeEach(() => {
     vi.restoreAllMocks()
+    live.session = null
 })
 
 describe('loadLoreBookV3Prompt characterization', () => {
@@ -244,6 +252,30 @@ describe('loadLoreBookV3Prompt characterization', () => {
 
         await expect(activePrompts()).resolves.toEqual(['three', 'two', 'one'])
         expect(constructorCalls).toBe(1)
+    })
+
+    test('commits match flags through the session that owns the selected conversation', async () => {
+        setLorebook(
+            [{
+                key: 'alpha',
+                content: '@@keep_activate_after_match\n@@dont_activate_after_match\nflagged',
+                id: 'flagged',
+            }],
+            [{ role: 'user', data: 'alpha' }],
+        )
+        const conversation = DBState.db.characters[0].chats[0]
+        const session = new ActiveConversationSession({
+            characterId: 'character-test',
+            conversationId: 'conversation-test',
+            conversation,
+            storeRevision: 0,
+        })
+        live.session = session
+
+        await expect(activePrompts()).resolves.toEqual(['flagged'])
+        expect(session.version).toBe(2)
+        expect(session.readChatVariable('__internal_ka_flagged')).toBe('true')
+        expect(session.readChatVariable('__internal_da_flagged')).toBe('true')
     })
 
     test('reads lore depth from the pinned operation instead of the live DBState array', async () => {
