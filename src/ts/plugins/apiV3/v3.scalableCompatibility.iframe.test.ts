@@ -122,11 +122,6 @@ vi.mock('src/ts/alert', () => ({
     alertConfirm: vi.fn(async () => true), alertError: vi.fn(), alertNormal: vi.fn(),
 }))
 vi.mock('src/ts/util', () => ({ sleep: vi.fn(async () => undefined) }))
-vi.mock('src/lang', () => ({ language: {
-    fetchLogConsent: '{}', getFullDatabaseConsent: '{}', mainDomAccessConsent: '{}',
-    replacerPermissionConsent: '{}', providerPermissionConsent: '{}', sendChatConsent: '{}',
-    inlayPermissionConsent: '{}',
-} }))
 vi.mock('src/ts/globalApi.svelte', () => ({
     checkCharOrder: vi.fn(), forageStorage: {}, getFetchLogs: vi.fn(),
 }))

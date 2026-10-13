@@ -80,7 +80,6 @@ vi.mock('src/ts/alert', () => ({
 }))
 // Unload callbacks race this timeout, so it has to be a real one.
 vi.mock('src/ts/util', () => ({ sleep: (ms: number) => new Promise((resolve) => setTimeout(resolve, ms)) }))
-vi.mock('src/lang', () => ({ language: {} }))
 vi.mock('src/ts/globalApi.svelte', () => ({
     checkCharOrder: vi.fn(), forageStorage: {}, getFetchLogs: vi.fn(),
 }))

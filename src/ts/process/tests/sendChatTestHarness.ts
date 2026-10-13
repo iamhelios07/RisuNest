@@ -31,16 +31,6 @@ export function tokenizerModule(overrides: ModuleOverrides & {
     }
 }
 
-export function langModule(language: ModuleOverrides = {}) {
-    return {
-        changeLanguage: vi.fn(),
-        language: {
-            errors: { toomuchtoken: 'too many tokens', httpError: 'http error' },
-            ...language,
-        },
-    }
-}
-
 export function alertModule(overrides: ModuleOverrides = {}) {
     return { alertError: vi.fn(), alertToast: vi.fn(), alertNormal: vi.fn(), ...overrides }
 }

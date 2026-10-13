@@ -36,7 +36,6 @@ vi.mock('src/ts/tokenizer', async () => (await import('../process/tests/sendChat
     tokenize: vi.fn(async () => 10),
     encodeWithTokenizer: vi.fn(async () => new Array(10).fill(0)),
 }))
-vi.mock('src/lang', async () => (await import('../process/tests/sendChatTestHarness')).langModule())
 vi.mock('src/ts/alert', async () => (await import('../process/tests/sendChatTestHarness')).alertModule())
 vi.mock('src/ts/parser/chatML', async () => (await import('../process/tests/sendChatTestHarness')).chatMLModule())
 vi.mock('src/ts/process/lorebook.svelte', async () => (await import('../process/tests/sendChatTestHarness')).lorebookModule())

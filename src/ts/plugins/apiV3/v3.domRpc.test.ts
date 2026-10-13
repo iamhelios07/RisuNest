@@ -18,6 +18,7 @@ import { doingChat } from '../../process/index.svelte'
 import { additionalMessageButtons } from '../messageButtons.svelte'
 import { chatViewEvents } from '../chatViewHost.svelte'
 import { beginGenerationEndRun, noteGenerationStarted, type GenerationEndStatus } from '../../process/generationEnd'
+import { language } from 'src/lang'
 
 const mocks = vi.hoisted(() => ({
     database: null as any,
@@ -87,11 +88,6 @@ vi.mock('src/ts/alert', () => ({
     alertNormal: vi.fn(),
 }))
 vi.mock('src/ts/util', () => ({ sleep: vi.fn(async () => undefined) }))
-vi.mock('src/lang', () => ({ language: {
-    fetchLogConsent: '{}', getFullDatabaseConsent: '{}', mainDomAccessConsent: '{}',
-    replacerPermissionConsent: '{}', providerPermissionConsent: '{}', sendChatConsent: '{}',
-    inlayPermissionConsent: '{}', pluginProviderPermissionDenied: 'permission denied',
-} }))
 vi.mock('src/ts/globalApi.svelte', () => ({
     checkCharOrder: vi.fn(), forageStorage: {}, getFetchLogs: vi.fn(),
 }))
@@ -412,7 +408,7 @@ function __postToParent(message) {
             mode: 'chat',
         })
 
-        expect(result).toEqual({ success: false, content: 'permission denied' })
+        expect(result).toEqual({ success: false, content: language.pluginProviderPermissionDenied })
         expect(await guest(name, 'return globalThis.providerCalls')).toBe(0)
     })
 
