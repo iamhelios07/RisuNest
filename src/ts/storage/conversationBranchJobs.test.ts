@@ -197,8 +197,10 @@ describe('pinned conversation branch jobs', () => {
         expect(release).toHaveBeenCalledOnce()
     })
 
-    it('matches the canonical legacy branch for a 10,000-turn source', async () => {
-        const messages = Array.from({ length: 10_000 }, (_, index) => message(
+    it('matches the canonical legacy branch across pages, with the marker opening one more', async () => {
+        // Three full source pages, so the appended marker needs a fourth branch page.
+        const turns = 3 * 128
+        const messages = Array.from({ length: turns }, (_, index) => message(
             `turn-${index.toString().padStart(5, '0')}`,
             index % 3 === 0 ? 'duplicate' : index % 3 === 1 ? undefined : `id-${index}`,
         ))
@@ -279,17 +281,15 @@ describe('pinned conversation branch jobs', () => {
 
         expect(result).toMatchObject({
             sourceStartIndex: 0,
-            sourceEndIndex: 10_000,
-            sourceTotalMessages: 10_000,
+            sourceEndIndex: turns,
+            sourceTotalMessages: turns,
             branchRevision: imported.revision + 1,
         })
-        expect(readPages).toHaveBeenCalledTimes(Math.ceil(10_000 / 128))
+        expect(readPages).toHaveBeenCalledTimes(3)
         expect(readPages!.mock.calls.every(([query]) => query.limit <= 128)).toBe(true)
         expect(readPages!.mock.calls[0][0]).toMatchObject({ startIndex: 0, limit: 128 })
         expect(readPages!.mock.calls[1][0]).toMatchObject({ startIndex: 128, limit: 128 })
-        expect(occurrencePuts).toBe(
-            Math.ceil(messages.length / 128) + Math.ceil((messages.length + 1) / 128),
-        )
+        expect(occurrencePuts).toBe(3 + 4)
 
         const expected = structuredClone(database)
         expected.characters[0].chats.unshift({

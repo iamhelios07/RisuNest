@@ -18,6 +18,7 @@ import { selectedCharID, selIdState } from '../stores.svelte'
 import type { Chat, Database, Message, character } from './database.svelte'
 import { getDatabase, setDatabaseLite } from './database.svelte'
 import { IndexedDbPersistentDataStore } from './indexedDbPersistentDataStore'
+import { CONVERSATION_RANGE_MAX_LIMIT } from './persistentDataStore'
 import { createPersistentDataRuntime } from './persistentDataRuntime'
 import { createProductionStateAdapter } from './persistentDataRuntime.svelte'
 import { workingSetResidency } from './workingSetResidency'
@@ -34,7 +35,8 @@ function makeLargeLegacyDatabase(): {
     database: Database
     messages: Message[]
 } {
-    const messages = Array.from({ length: 10_000 }, (_, index) => ({
+    // One row more than a single range read can return.
+    const messages = Array.from({ length: CONVERSATION_RANGE_MAX_LIMIT + 1 }, (_, index) => ({
         role: index % 2 === 0 ? 'user' : 'char',
         data: `synthetic-message-${index}`,
         chatId: `synthetic-id-${index}`,
