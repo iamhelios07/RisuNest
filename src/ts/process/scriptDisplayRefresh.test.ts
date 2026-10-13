@@ -69,7 +69,7 @@ vi.mock('../alert', () => ({ alertError: vi.fn(), alertNormal: vi.fn() }))
 const { processScriptFull, resetScriptCache } = await import('./scripts')
 const { requestScriptDisplayRefresh } = await import('./scriptDisplayRefresh')
 const { DisplayReadRecord, registerDisplayRow } = await import('./scriptVariableReads')
-const { getChatVar } = await import('../parser/chatVar.svelte')
+const { getChatVar, getGlobalChatVar } = await import('../parser/chatVar.svelte')
 const { ReloadChatPointer } = await import('../stores.svelte')
 
 const statusPanel: customscript = {
@@ -184,16 +184,20 @@ test('refreshes only the rows whose display read a changed chat variable', async
     expect(await refreshedRows({ keys: ['hp'] })).toEqual([2])
 })
 
-test('records the chat variables a Lua display listener reads', async () => {
+test.each(['chat', 'global', 'local global'])('records the %s variables a Lua display listener reads', async (source) => {
     const { char, chat } = installConversation([])
+    live.database.globalChatVariables = { mood: 'calm' }
+    if (source === 'local global') chat.GLGlobalVariables = { mood: 'local' }
     lua.displayListener = async () => {
         await Promise.resolve()
-        getChatVar('mood')
+        if (source === 'chat') getChatVar('mood')
+        else getGlobalChatVar('mood')
     }
     await renderRow(char, chat, 0)
 
-    expect(await refreshedRows({ keys: ['hp'] })).toEqual([])
+    expect(await refreshedRows({ keys: ['hp'] })).toEqual(source === 'chat' ? [] : [0])
     expect(await refreshedRows({ keys: ['mood'] })).toEqual([0])
+    expect(await refreshedRows({ all: true })).toEqual([0])
 })
 
 test('refreshes a row whose display ran a plugin hook for any change', async () => {
@@ -206,8 +210,11 @@ test('refreshes a row whose display ran a plugin hook for any change', async () 
     expect(await refreshedRows({ keys: ['hp'] })).toEqual([0])
 })
 
-test('records the reads of a row rendered from a projected variable snapshot', async () => {
-    const { char, chat } = installConversation([statusPanel])
+test.each(['chat', 'global'])('records the reads of a row rendered from a projected %s variable snapshot', async (source) => {
+    const { char, chat } = installConversation([{
+        ...statusPanel,
+        out: source === 'global' ? statusPanel.out.replace('getvar', 'getglobalvar') : statusPanel.out,
+    }])
     const reads = new DisplayReadRecord()
     const { data } = await processScriptFull(char, chat.message[2].data, 'editdisplay', 2, {}, {
         variableReads: reads,
@@ -227,7 +234,7 @@ test('records the reads of a row rendered from a projected variable snapshot', a
                 moduleLorebooks: [],
                 selectedCharID: 0,
                 chatVariables: { hp: '7' },
-                globalChatVariables: {},
+                globalChatVariables: { hp: '7' },
                 currentTime: 1,
             },
         },
@@ -238,4 +245,18 @@ test('records the reads of a row rendered from a projected variable snapshot', a
 
     expect(data).toBe('turn 2 <b>HP 7</b>')
     expect(await refreshedRows({ keys: ['hp'] })).toEqual([2])
+    expect(await refreshedRows({ keys: ['other'] })).toEqual(source === 'global' ? [2] : [])
+})
+
+test('keeps global variable dependencies when regex output is cached', async () => {
+    const { char, chat } = installConversation([{
+        ...statusPanel,
+        out: '<b>Global {{getglobalvar::hp}}</b>',
+    }])
+    live.database.globalChatVariables = { hp: '7' }
+    const first = await renderRow(char, chat, 0)
+    expect(first.data).toBe('turn 0 <b>Global 7</b>\n')
+    first.row.dispose()
+    expect((await renderRow(char, chat, 0)).data).toBe('turn 0 <b>Global 7</b>\n')
+    expect(await refreshedRows({ all: true })).toEqual([0])
 })

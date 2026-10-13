@@ -2,6 +2,7 @@
 
 export interface ChatVariableReadRecorder {
     note(key: string): void
+    markUntracked(): void
 }
 
 /** The chat variables one render of a row read, or untracked when a stage it ran can read without notice. */
@@ -30,6 +31,16 @@ export function noteChatVariableRead(key: string): void {
         return
     }
     for (const recorder of ambientRecorders) recorder.note(key)
+}
+
+/** A dependency outside chat variables requires conservative row refreshes. */
+export function noteUntrackedVariableRead(): void {
+    const scope = scopes[scopes.length - 1]
+    if (scope) {
+        scope.markUntracked()
+        return
+    }
+    for (const recorder of ambientRecorders) recorder.markUntracked()
 }
 
 /** Records the chat variables `read` reads synchronously. */

@@ -1181,6 +1181,8 @@ export class ActiveConversationSession {
         this.conversation.message = messages
         this.locatorRegistry.clear()
         this.sessionVersion = version
+        // Message metadata was replaced too; pending edits must not restore older fields.
+        this.lastMessageChangeVersion = version
         this.persistedSessionVersion = version
         this.currentStoreRevision = revision
         this.notifySubscribers({
@@ -1212,7 +1214,7 @@ export class ActiveConversationSession {
         return this.sessionVersion
     }
 
-    /** Advances with every committed message change; metadata-only commits keep it. */
+    /** Advances with message replacements, including metadata; chat-only metadata commits keep it. */
     get messageVersion(): number {
         return this.lastMessageChangeVersion
     }

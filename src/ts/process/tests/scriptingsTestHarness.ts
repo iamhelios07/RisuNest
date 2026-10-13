@@ -89,6 +89,8 @@ export function modulesModule() {
     return {
         getModuleLorebooks: vi.fn(() => []),
         getModuleTriggers: vi.fn(() => []),
+        getModuleRegexScripts: vi.fn(() => []),
+        getModuleAssets: vi.fn(() => []),
     } satisfies Partial<typeof import('../modules')>
 }
 
