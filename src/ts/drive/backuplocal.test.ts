@@ -12,6 +12,7 @@ import { sleep } from '../util'
 import { invoke } from '@tauri-apps/api/core'
 import { getBackupInlayName } from './backupAssets'
 import { backupArchive, backupEntry, backupFile } from './backupRestore.testSupport'
+import { readableFile } from '../storage/tauriFs.testSupport'
 
 const state = vi.hoisted(() => ({
     native: true,
@@ -131,17 +132,7 @@ describe('local backup persistent snapshot', () => {
         state.nativeFileClose.mockClear()
         state.fullReadFile.mockClear()
         state.openNativeFile.mockReset()
-        let offset = 0
-        state.openNativeFile.mockResolvedValue({
-            read: vi.fn(async (buffer: Uint8Array) => {
-                if (offset >= state.nativeFile.byteLength) return null
-                const length = Math.min(2, state.nativeFile.byteLength - offset)
-                buffer.set(state.nativeFile.subarray(offset, offset + length))
-                offset += length
-                return length
-            }),
-            close: state.nativeFileClose,
-        })
+        state.openNativeFile.mockResolvedValue({ ...readableFile(state.nativeFile, 2), close: state.nativeFileClose })
     })
 
     it.each([false, true])('expands cold payloads into the replaced local backup database on mobile=%s', async (mobile) => {
@@ -176,18 +167,8 @@ describe('local backup persistent snapshot', () => {
                 discard,
             }
             state.openNativeFile.mockImplementation(async () => {
-                let position = 0
-                return {
-                    seek: async (offset: number) => { position = offset },
-                    read: async (buffer: Uint8Array) => {
-                        expect(discard).not.toHaveBeenCalled()
-                        const data = archive.subarray(position, position + buffer.length)
-                        buffer.set(data)
-                        position += data.length
-                        return data.length || null
-                    },
-                    close: state.nativeFileClose,
-                }
+                expect(discard).not.toHaveBeenCalled()
+                return { ...readableFile(archive), close: state.nativeFileClose }
             })
         }
         const { LoadLocalBackup } = await import('./backuplocal')
