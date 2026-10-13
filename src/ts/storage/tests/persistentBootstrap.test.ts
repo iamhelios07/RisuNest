@@ -282,7 +282,7 @@ describe('bootstrapPersistentDatabase', () => {
         const persistent = structuredClone(fixtureDatabase)
         persistent.plugins = [plugin('2.1', false)]
         persistent.botPresetsId = -1
-        persistent.characters = Array.from({ length: 201 }, (_, index) => ({
+        persistent.characters = Array.from({ length: 3 }, (_, index) => ({
             type: 'character', chaId: `char-${index}`, name: `Character ${index}`, chats: [],
         }) as unknown as character)
         const harness = await createPersistentStoreHarness(persistent)
@@ -296,6 +296,7 @@ describe('bootstrapPersistentDatabase', () => {
 
         const result = await bootstrapPersistentDatabase({
             store: harness.store,
+            catalogPageSize: 2,
             prepareDatabase: async (database) =>
                 preparedResult(database, database),
             prepareRoot: async (root) => structuredClone(root),
@@ -313,7 +314,7 @@ describe('bootstrapPersistentDatabase', () => {
             'yield',
             'trash:first',
         ])
-        expect(result.database.characters).toHaveLength(201)
+        expect(result.database.characters).toHaveLength(3)
     })
 
     it('rejects a stale catalog page returned after a cooperative yield', async () => {
