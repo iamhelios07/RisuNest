@@ -3,9 +3,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { mount, tick, unmount } from 'svelte'
 
-vi.mock('src/lang', async () => ({
-    language: (await import('src/lang/en')).languageEnglish,
-}))
 vi.mock('src/ts/platform', () => ({ isTauri: true }))
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }))
 vi.mock('src/ts/stores.svelte', () => ({ DBState: { db: { plugins: [] } } }))

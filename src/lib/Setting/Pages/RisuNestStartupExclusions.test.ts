@@ -7,7 +7,6 @@ vi.mock('src/ts/storage/deviceSettings', () => ({
     updateStartupExclusions: (value: string[]) => { settings.update(value); settings.kept = [...value] },
 }))
 vi.mock('src/ts/alert', () => ({ alertActionConfirm: vi.fn() }))
-vi.mock('src/lang', async () => ({ language: (await import('src/lang/en')).languageEnglish }))
 
 import Component from './RisuNestStartupExclusions.svelte'
 import { languageEnglish } from 'src/lang/en'

@@ -36,26 +36,11 @@ const deviceSettings = vi.hoisted(() => {
 vi.mock('src/ts/nativeLog', () => nativeLog)
 vi.mock('src/ts/alert', () => alerts)
 vi.mock('src/ts/storage/deviceSettings', () => deviceSettings)
-vi.mock('src/lang', () => ({
-    language: {
-        error: 'Localized error',
-        risuNest: {
-            diag: {
-                title: 'Diagnostics',
-                logTitle: 'Error log',
-                logHelp: 'Recent errors.',
-                viewLog: 'View error log',
-                copyLog: 'Copy error log',
-                fileLog: 'Save error log to a file',
-                fileLogHelp: 'File logging help',
-                logEmpty: 'No errors recorded.',
-                actionFailed: 'Localized error',
-            },
-        },
-    },
-}))
 
+import { language } from 'src/lang'
 import RisuNestLogViewer from './RisuNestLogViewer.svelte'
+
+const strings = language.risuNest.diag
 
 describe('RisuNestLogViewer', () => {
     let target: HTMLDivElement
@@ -136,10 +121,10 @@ describe('RisuNestLogViewer', () => {
     it('shows the localized empty state', async () => {
         await render()
 
-        expect(target.textContent).not.toContain('No errors recorded.')
+        expect(target.textContent).not.toContain(strings.logEmpty)
         target.querySelector<HTMLButtonElement>('[data-view-log]')!.click()
         await settleAction()
-        expect(alerts.alertMd).toHaveBeenCalledWith('No errors recorded.')
+        expect(alerts.alertMd).toHaveBeenCalledWith(strings.logEmpty)
     })
 
     it('fetches a fresh tail for copy and uses the project clipboard fallback', async () => {
@@ -283,7 +268,7 @@ describe('RisuNestLogViewer', () => {
         target.querySelector<HTMLButtonElement>('[data-view-log]')!.click()
         await settleAction()
 
-        expect(target.textContent).toContain('Localized error')
+        expect(target.textContent).toContain(strings.actionFailed)
         expect(target.textContent).not.toContain('native command detail')
         expect(error).not.toHaveBeenCalled()
         expect(alerts.alertMd).not.toHaveBeenCalled()
@@ -298,7 +283,7 @@ describe('RisuNestLogViewer', () => {
         target.querySelector<HTMLButtonElement>('[data-copy-log]')!.click()
         await settleAction()
 
-        expect(target.textContent).toContain('Localized error')
+        expect(target.textContent).toContain(strings.actionFailed)
         expect(target.textContent).not.toContain('copy command detail')
         expect(writeText).not.toHaveBeenCalled()
     })

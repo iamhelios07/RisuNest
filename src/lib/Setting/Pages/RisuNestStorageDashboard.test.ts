@@ -34,7 +34,6 @@ vi.mock('src/ts/storage/nativePersistentMaintenance', () => maintenance)
 vi.mock('src/ts/storage/sync/syncConflictBackup', () => ({ getSyncConflictBackupStore: () => backups }))
 vi.mock('src/ts/alert', () => alerts)
 vi.mock('src/ts/platform', () => ({ isTauri: true }))
-vi.mock('src/lang', async () => ({ language: (await import('src/lang/en')).languageEnglish }))
 
 import RisuNestStorageDashboard from './RisuNestStorageDashboard.svelte'
 import { languageEnglish } from 'src/lang/en'

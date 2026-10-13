@@ -36,9 +36,6 @@ vi.mock('src/ts/storage/nativePersistentMaintenance', () => maintenance)
 vi.mock('src/ts/alert', () => alerts)
 vi.mock('src/ts/globalApi.svelte', () => files)
 vi.mock('src/ts/storage/persistentDataRuntime.svelte', () => ({ getPersistentDataRuntime: () => repairRuntime }))
-vi.mock('src/lang', async () => ({
-    language: (await import('src/lang/en')).languageEnglish,
-}))
 
 import RisuNestDataHealth from './RisuNestDataHealth.svelte'
 import { dataHealthOwnerKey } from 'src/ts/storage/dataHealthPresentation'

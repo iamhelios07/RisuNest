@@ -3,7 +3,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mount, tick, unmount } from 'svelte'
 import { languageEnglish } from 'src/lang/en'
 const f = vi.hoisted(() => ({ pending: vi.fn(async (): Promise<number | undefined> => undefined), ensure: vi.fn(), connect: vi.fn(), dismiss: vi.fn(), complete: vi.fn(), configure: vi.fn(), bind: vi.fn(), disconnect: vi.fn(), hold: vi.fn(), release: vi.fn(), status: vi.fn(), policy: vi.fn(), evict: vi.fn(), cancel: vi.fn(), checkbox: vi.fn(), action: vi.fn(), native: true, scan: false, scanner: { scan: vi.fn(), cancel: vi.fn() }, os: 'windows', listeners: new Set<(value: Record<string, unknown>) => void>(), bindingState: vi.fn(), preset: vi.fn(), state: { db: {} as Record<string, unknown> }, view: { status: { configured: false }, paused: false } as Record<string, unknown> }))
-vi.mock('src/lang', async () => ({ language: (await import('src/lang/en')).languageEnglish, changeLanguage: vi.fn() }))
 vi.mock('src/ts/platform', () => ({ get isTauri() { return f.native } }))
 vi.mock('@tauri-apps/plugin-os', () => ({ platform: () => f.os }))
 vi.mock('src/ts/alert', () => ({ alertConfirm: vi.fn(), alertCheckboxConfirm: f.checkbox, alertActionConfirm: f.action, alertError: vi.fn(), alertNormal: vi.fn(), openRisuAccountLogin: vi.fn() }))

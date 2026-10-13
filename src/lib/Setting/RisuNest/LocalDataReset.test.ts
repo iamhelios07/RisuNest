@@ -5,7 +5,6 @@ import { languageEnglish } from 'src/lang/en'
 const mocks = vi.hoisted(() => ({ invoke: vi.fn(), platform: { isTauri: true, isTauriAndroid: false, isTauriIOS: false } }))
 vi.mock('@tauri-apps/api/core', () => ({ invoke: mocks.invoke }))
 vi.mock('src/ts/platform', () => mocks.platform)
-vi.mock('src/lang', async () => ({ language: (await import('src/lang/en')).languageEnglish }))
 import Component from './LocalDataReset.svelte'
 
 let component: ReturnType<typeof mount> | undefined
