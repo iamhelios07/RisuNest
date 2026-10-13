@@ -1,9 +1,7 @@
 import { get, writable } from 'svelte/store'
 import { alertStore } from './modalNavigationAdapters'
-import { languageEnglish } from '../../src/lang/en'
-import { languageKorean } from '../../src/lang/ko'
+export { languageKorean as language } from '../../src/lang/ko'
 
-export const language = new URLSearchParams(location.search).get('locale') === 'en' ? languageEnglish : languageKorean
 export const DBState = { db: { didFirstSetup: true, characters: [{ name: 'Synthetic', chaId: 'character-a', chatPage: 0, chats: [{ id: 'chat-a' }] }], keepSessionAlive: false } }
 export const DynamicGUI = writable(false), settingsOpen = writable(false), sideBarStore = writable(true), sideBarClosing = writable(false)
 export const ShowRealmFrameStore = writable(false), openPresetList = writable(false), openPersonaList = writable(false)
@@ -60,7 +58,5 @@ export function openRoute(route: string) {
 
 export const navigationState = {
     layout(mobile: boolean) { MobileGUI.set(mobile) },
-    selection() { return { selected: get(selectedCharID), menu: get(MobileSideBar), settings: get(settingsOpen), page: get(SettingsMenuIndex), stack: get(MobileGUIStack) } },
-    showDialog() { alertStore.set({ type: 'ask', msg: 'Synthetic confirmation' }) },
-    read() { return { sidebarClosing: get(sideBarClosing), dialog: get(alertStore).type, entries: history.state?.risunestModal?.length ?? 0 } },
+    read() { return { sidebarClosing: get(sideBarClosing), entries: history.state?.risunestModal?.length ?? 0 } },
 }
