@@ -400,6 +400,7 @@
       {#each navigation as item}<button
           class:active={page === item.id}
           aria-current={page === item.id ? "page" : undefined}
+          data-page={item.id}
           onclick={() => navigate(item.id)}
           ><item.icon size={17} />{item.label}</button
         >{/each}

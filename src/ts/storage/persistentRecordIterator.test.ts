@@ -5,9 +5,9 @@ import type {
     CharacterQuery,
     ConversationPage,
     ConversationQuery,
-    PersistentRevisionLease,
     PersistentRevisionReader,
 } from './persistentDataStore'
+import { createLeaseStub } from './persistentDataStore.testSupport'
 import {
     iteratePinnedCharacters,
     iteratePinnedConversations,
@@ -33,7 +33,7 @@ function conversationPage(
 describe('persistent record iterators', () => {
     it('releases a successful lease scope once without a duplicate cleanup call', async () => {
         const release = vi.fn(async () => undefined)
-        const lease = { release } as unknown as PersistentRevisionLease
+        const lease = createLeaseStub({ release })
 
         await expect(withPersistentRevisionLease(lease, async () => 'result')).resolves.toBe(
             'result',
@@ -46,7 +46,7 @@ describe('persistent record iterators', () => {
         const release = vi.fn()
             .mockRejectedValueOnce(new Error('release unavailable'))
             .mockResolvedValueOnce(undefined)
-        const lease = { release } as unknown as PersistentRevisionLease
+        const lease = createLeaseStub({ release })
 
         await expect(withPersistentRevisionLease(lease, async () => 'result')).resolves.toBe(
             'result',
@@ -60,7 +60,7 @@ describe('persistent record iterators', () => {
         const release = vi.fn(async () => {
             throw new Error('release failed')
         })
-        const lease = { release } as unknown as PersistentRevisionLease
+        const lease = createLeaseStub({ release })
 
         await expect(withPersistentRevisionLease(lease, async () => {
             throw primaryError
@@ -74,7 +74,7 @@ describe('persistent record iterators', () => {
         const release = vi.fn()
             .mockRejectedValueOnce(firstReleaseError)
             .mockRejectedValueOnce(new Error('retry failed'))
-        const lease = { release } as unknown as PersistentRevisionLease
+        const lease = createLeaseStub({ release })
 
         await expect(withPersistentRevisionLease(lease, async () => 'result')).rejects.toBe(
             firstReleaseError,

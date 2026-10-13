@@ -1,5 +1,5 @@
 import { trackRerollOutput } from '../responseVariants'
-import { safeStructuredClone } from '../polyfill'
+import { safeStructuredClone } from '../safeStructuredClone'
 import type { ConversationOperationCommit } from './conversationOperationContext'
 import type { Chat, Message } from '../storage/database.svelte'
 import type {

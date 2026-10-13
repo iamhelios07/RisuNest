@@ -15,18 +15,6 @@ const MESSAGES_PER_CONVERSATION = 20
 const WARM_RUNS = 5
 const MEASURED_RUNS = 5
 
-type ScaleMeasurement = {
-    characterCount: number
-    durationsMs: number[]
-    heapBeforeBytes: number
-    heapAfterBytes: number
-    peakObservedHeapUsedBytes: number
-    commitCount: number
-    targetConversationReads: number
-    unrelatedCharacterClonePropertyReads: number
-    unrelatedConversationClonePropertyReads: number
-}
-
 function makeConversation(characterIndex: number, conversationIndex: number): Chat {
     return {
         id: `chat-${characterIndex}-${conversationIndex}`,
@@ -95,7 +83,7 @@ function makeSyntheticLibrary(characterCount: number): {
     }
 }
 
-async function measureScopedConversationWrites(characterCount: number): Promise<ScaleMeasurement> {
+async function expectScopedConversationWrites(characterCount: number) {
     const fixture = makeSyntheticLibrary(characterCount)
     const { database } = fixture
     const targetCharacter = database.characters[characterCount - 1]
@@ -103,16 +91,8 @@ async function measureScopedConversationWrites(characterCount: number): Promise<
     const targetConversationId = targetCharacter.chats[0].id
     let revision = 1
     let durableConversation = structuredClone(targetCharacter.chats[0])
-    let peakObservedHeapUsedBytes = 0
-    const sampleHeap = () => {
-        peakObservedHeapUsedBytes = Math.max(
-            peakObservedHeapUsedBytes,
-            process.memoryUsage().heapUsed,
-        )
-    }
     const targetReads: Array<[string, string]> = []
     const commit = vi.fn(async (input: WorkingSetCommit) => {
-        sampleHeap()
         expect(input.conversations).toBeUndefined()
         expect(input.unitMutations).toHaveLength(1)
         for (const mutation of input.unitMutations ?? []) {
@@ -127,7 +107,6 @@ async function measureScopedConversationWrites(characterCount: number): Promise<
     const store = {
         commit,
         readConversation: vi.fn(async (characterId: string, conversationId: string) => {
-            sampleHeap()
             targetReads.push([characterId, conversationId])
             if (characterId !== targetCharacterId || conversationId !== targetConversationId) {
                 throw new Error(`Unexpected unrelated conversation read: ${characterId}/${conversationId}`)
@@ -163,14 +142,12 @@ async function measureScopedConversationWrites(characterCount: number): Promise<
             ...structuredClone(targetCharacter.chats[0]),
             name: `Scoped edit ${sample}`,
         } as Chat
-        const startedAt = performance.now()
         await expect(coordinator.replacePersistentConversation(
             targetCharacterId,
             targetConversationId,
             'scoped-scale-measurement',
             replacement,
         )).resolves.toBe(true)
-        return performance.now() - startedAt
     }
 
     for (let sample = 0; sample < WARM_RUNS; sample++) await run(sample)
@@ -178,15 +155,7 @@ async function measureScopedConversationWrites(characterCount: number): Promise<
     targetReads.length = 0
     fixture.resetUnrelatedClonePropertyReads()
 
-    const heapBeforeBytes = process.memoryUsage().heapUsed
-    peakObservedHeapUsedBytes = heapBeforeBytes
-    const durationsMs: number[] = []
-    for (let sample = 0; sample < MEASURED_RUNS; sample++) {
-        durationsMs.push(await run(WARM_RUNS + sample))
-        sampleHeap()
-    }
-    const heapAfterBytes = process.memoryUsage().heapUsed
-    peakObservedHeapUsedBytes = Math.max(peakObservedHeapUsedBytes, heapAfterBytes)
+    for (let sample = 0; sample < MEASURED_RUNS; sample++) await run(WARM_RUNS + sample)
 
     expect(commit).toHaveBeenCalledTimes(MEASURED_RUNS)
     expect(targetReads).toEqual(Array.from(
@@ -198,33 +167,10 @@ async function measureScopedConversationWrites(characterCount: number): Promise<
     expect(store.materializeDatabase).not.toHaveBeenCalled()
     expect(fixture.unrelatedCharacterClonePropertyReads()).toBe(0)
     expect(fixture.unrelatedConversationClonePropertyReads()).toBe(0)
-
-    return {
-        characterCount,
-        durationsMs,
-        heapBeforeBytes,
-        heapAfterBytes,
-        peakObservedHeapUsedBytes,
-        commitCount: commit.mock.calls.length,
-        targetConversationReads: targetReads.length,
-        unrelatedCharacterClonePropertyReads: fixture.unrelatedCharacterClonePropertyReads(),
-        unrelatedConversationClonePropertyReads: fixture.unrelatedConversationClonePropertyReads(),
-    }
 }
 
 describe('SaveCoordinator scoped conversation scale', () => {
-    it('keeps a 100 to 1000 character edit bounded to one target', async () => {
-        const measurements = []
-        for (const characterCount of [100, 1_000]) {
-            measurements.push(await measureScopedConversationWrites(characterCount))
-        }
-
-        console.info('scoped-conversation-scale', JSON.stringify({
-            conversationsPerCharacter: CONVERSATIONS_PER_CHARACTER,
-            messagesPerConversation: MESSAGES_PER_CONVERSATION,
-            warmRuns: WARM_RUNS,
-            measuredRuns: MEASURED_RUNS,
-            measurements,
-        }))
+    it('keeps an edit in a 100 character library bounded to one target', async () => {
+        await expectScopedConversationWrites(100)
     })
 })

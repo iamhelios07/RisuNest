@@ -25,7 +25,7 @@ vi.mock('src/ts/storage/database.svelte', () => ({
     presetTemplate: {},
 }))
 vi.mock('src/ts/globalApi.svelte', () => ({ forageStorage: {} }))
-vi.mock('src/ts/platform', () => ({ isTauri: false }))
+vi.mock('src/ts/platform', async () => (await import('src/ts/platform.testSupport')).platformModule({ runtime: 'web', os: 'windows' }))
 
 function database(username = 'Initial'): Database {
     return {

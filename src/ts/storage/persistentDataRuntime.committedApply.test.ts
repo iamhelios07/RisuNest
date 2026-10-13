@@ -3,6 +3,7 @@ import { acquireUpstreamImportPause } from './upstreamReplacement'
 import { describe, expect, it, vi } from 'vitest'
 import type { Database } from './database.svelte'
 import type { PersistentDataStore, PersistentRevisionLease } from './persistentDataStore'
+import { createLeaseStub } from './persistentDataStore.testSupport'
 import {
     capturePersistentPluginStorage,
     capturePersistentPresets,
@@ -45,7 +46,7 @@ async function createHarness(officialPublisher?: OfficialRevisionPublisher, capt
         acquireRevision: vi.fn(async (expected: number) => {
             expect(expected).toBe(revision)
             const snapshot = structuredClone(durable)
-            const lease = {
+            const lease = createLeaseStub({
                 revision: expected,
                 readRoot: vi.fn(async () => ({ revision: expected, value: capturePersistentRoot(snapshot) })),
                 queryPresets: vi.fn(async () => ({ revision: expected, items: [] })),
@@ -80,7 +81,7 @@ async function createHarness(officialPublisher?: OfficialRevisionPublisher, capt
                 queryConversations: vi.fn(async () => ({ revision: expected, items: [] })),
                 queryPluginStorage: vi.fn(async () => ({ revision: expected, items: [] })),
                 release: vi.fn(async () => undefined),
-            } as unknown as PersistentRevisionLease
+            })
             leases.push(lease)
             return lease
         }),

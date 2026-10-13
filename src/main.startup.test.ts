@@ -15,7 +15,7 @@ vi.mock("./ts/bootstrap", async () => {
     await import("./ts/runtimePerformanceProfile");
   startup.cacheBudget =
     getRuntimePerformanceBudgets().browserAssetDataUrlCacheBytes;
-  return { loadData: vi.fn() };
+  return (await import("./ts/bootstrap.testSupport")).bootstrapModule();
 });
 vi.mock("./ts/hotkey", () => ({ initHotkey: vi.fn() }));
 vi.mock("./preload", () => ({ preLoadCheck: vi.fn() }));

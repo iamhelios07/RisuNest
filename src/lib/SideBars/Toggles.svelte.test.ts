@@ -1,14 +1,12 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { mount, tick, unmount } from 'svelte'
 import { writable } from 'svelte/store'
-import { languageEnglish } from '../../lang/en'
 import { DBState } from 'src/ts/stores.svelte'
 import Toggles from './Toggles.svelte'
 import { doingChat } from 'src/ts/process/generationState'
 
 const syntax = vi.hoisted(() => ({ type: 'toggle' }))
 
-vi.mock('src/lang', () => ({ language: languageEnglish }))
 vi.mock('src/ts/stores.svelte', () => {
     const DBState = $state({ db: {} })
     return { DBState, selectedCharID: writable(0) }

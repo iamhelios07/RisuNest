@@ -1,11 +1,11 @@
 use super::{Device, Store};
-#[cfg(test)]
+#[cfg(all(test, feature = "source-observer"))]
 use crate::source_observer::shared_wire::{
     delta,
     transfer::{self, Frame},
 };
 use crate::{Error, Result};
-#[cfg(not(test))]
+#[cfg(not(all(test, feature = "source-observer")))]
 use risunest_sync_wire::{
     delta,
     transfer::{self, Frame},
@@ -21,7 +21,7 @@ pub struct TransferRequest {
 }
 impl Store {
     pub fn receive_frames(&self, device: &Device, bytes: &[u8]) -> Result<Vec<String>> {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "source-observer"))]
         let _observed = crate::source_observer::ingress(&self.root);
         #[cfg(test)]
         let measured = std::time::Instant::now();
@@ -67,6 +67,8 @@ impl Store {
             };
             let digest = hash(&bytes);
             #[cfg(test)]
+            super::objects::frame_metrics::hashed("frame", bytes.len());
+            #[cfg(all(test, feature = "source-observer"))]
             crate::source_observer::hashed(&digest, "frame-ingress-sha256", bytes.len());
             #[cfg(test)]
             super::objects::frame_metrics::record(1, measured);
@@ -85,7 +87,7 @@ impl Store {
         device: &Device,
         requests: &[TransferRequest],
     ) -> Result<Vec<u8>> {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "source-observer"))]
         let _observed = crate::source_observer::operation(&self.root);
         if requests.len() > 1024 {
             return Err(Error::new("too-many-candidates", 400));
@@ -284,5 +286,33 @@ mod tests {
             .query_row("SELECT count(*) FROM object_leases", [], |r| r.get(0))
             .unwrap();
         assert_eq!(leases, 1);
+    }
+
+    /// A delta frame's target is hashed once when it is materialized, and
+    /// publication reuses that identity instead of hashing the body again.
+    #[test]
+    fn delta_ingress_reuses_only_the_immediate_materialized_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::init(directory.path()).unwrap();
+        let registration = store.add_device().unwrap();
+        let device = store
+            .authenticate(&registration.library_id, &registration.token)
+            .unwrap();
+        let base = b"synthetic inline control".to_vec();
+        store.put_object(&device, &hash(&base), &base).unwrap();
+        let target = [base.as_slice(), b" changed"].concat();
+        let digest = hash(&target);
+        let recipe = delta::create(&[&base], &target).unwrap();
+        let encoded = transfer::encode(&[Frame::Delta(recipe)]).unwrap();
+        super::super::objects::frame_metrics::take_hashes();
+        assert_eq!(
+            store.receive_frames(&device, &encoded).unwrap(),
+            std::slice::from_ref(&digest)
+        );
+        assert_eq!(
+            super::super::objects::frame_metrics::take_hashes(),
+            [("frame", target.len())]
+        );
+        assert_eq!(store.get_object(&digest).unwrap(), target);
     }
 }

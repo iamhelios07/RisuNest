@@ -45,7 +45,7 @@ const schedulingMocks = vi.hoisted(() => {
 })
 
 vi.mock('src/ts/process/files/inlays', () => inlayMocks)
-vi.mock('src/ts/parser/parser.svelte', () => parserMocks)
+vi.mock('src/ts/parser/parser.svelte', async () => (await import('src/ts/parser/parser.testSupport')).parserStubModule(parserMocks))
 vi.mock('src/ts/stores.svelte', () => ({ DBState: chatState }))
 vi.mock('src/ts/util', () => ({ sleep: vi.fn(() => Promise.resolve()) }))
 vi.mock('src/ts/translator/translator', () => ({

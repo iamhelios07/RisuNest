@@ -10,6 +10,7 @@ import type {
     PersistentRevisionLease,
 } from '../storage/persistentDataStore'
 import { RevisionConflictError } from '../storage/persistentDataStore'
+import { createLeaseStub } from '../storage/persistentDataStore.testSupport'
 import { getPersistentDataStore } from '../storage/persistentDataStoreFactory'
 import {
     createCatalogCharacterStub,
@@ -117,7 +118,7 @@ function createHarness(options: { unitIntent?: boolean; revisionAdmission?: bool
         const pluginStorage = database.pluginCustomStorage ?? {}
         const release = vi.fn(async () => undefined)
         releasedLeases.push(release)
-        return {
+        return createLeaseStub({
             revision,
             readRoot: async () => {
                 const { characters: _characters, botPresets, pluginCustomStorage, ...root } = database
@@ -214,7 +215,7 @@ function createHarness(options: { unitIntent?: boolean; revisionAdmission?: bool
                     endIndex: Math.min(startIndex + limit, chat.message.length),
                     messages: chat.message.slice(startIndex, startIndex + limit),
                     totalMessages: chat.message.length,
-                } }
+                } as ConversationWindow }
             },
             readPluginStorageValues: async ({ owner, afterKey, limit = 256 }) => {
                 const keys = Object.keys(pluginStorage)
@@ -238,7 +239,7 @@ function createHarness(options: { unitIntent?: boolean; revisionAdmission?: bool
                     ? { revision, value: pluginStorage[key] }
                     : null,
             release,
-        } as unknown as PersistentRevisionLease
+        })
     })
     const store = {
         open: vi.fn(async () => undefined),

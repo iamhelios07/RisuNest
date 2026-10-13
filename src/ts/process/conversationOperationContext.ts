@@ -1,4 +1,4 @@
-import { safeStructuredClone } from '../polyfill'
+import { safeStructuredClone } from '../safeStructuredClone'
 import {
     ActiveConversationSession,
     cloneConversationMetadata,
