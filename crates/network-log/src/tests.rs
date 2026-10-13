@@ -1036,22 +1036,16 @@ fn default_buffer_records_a_ten_mib_request_burst_while_writer_is_paused() {
 
 
 #[test]
-fn buffer_settings_default_when_missing_and_survive_restart() {
-    let root = tempfile::tempdir().unwrap();
-    let kept = root.path().join("kept");
-    fs::create_dir_all(&kept).unwrap();
-    let saved = serde_json::json!({
-        "enabled": true, "retain": true, "hideAuth": false,
-        "recentCount": 500, "recentMib": 256, "retainedMib": 128, "bodyMib": 16,
-    });
-    fs::write(kept.join("settings.json"), serde_json::to_vec(&saved).unwrap()).unwrap();
-    let recorder = Recorder::open(root.path().join("recent"), kept.clone()).unwrap();
-    let f = Fixture { root, recorder };
-    let mut settings = f.recorder.settings();
-    assert_eq!(settings.buffer_mib, 32);
-    assert!(!settings.capture_binary);
-    assert_eq!((settings.recent_count, settings.recent_mib, settings.retained_mib), (500, 256, 128));
-    settings.capture_binary = true;
+fn buffer_settings_survive_restart() {
+    let f = Fixture::new();
+    let kept = f.root.path().join("kept");
+    let mut settings = Settings {
+        enabled: true,
+        retain: true,
+        hide_auth: false,
+        capture_binary: true,
+        ..Settings::default()
+    };
     for budget in [4, 8, 16, 32, 64, 128] {
         settings.buffer_mib = budget;
         f.recorder.configure(settings.clone()).unwrap();

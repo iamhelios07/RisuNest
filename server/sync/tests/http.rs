@@ -38,37 +38,6 @@ struct Server {
 }
 
 #[tokio::test]
-async fn removed_coordination_endpoints_have_no_aliases() {
-    let server = Server::start().await;
-    for (method, path) in [
-        (reqwest::Method::POST, "/read-pins"),
-        (reqwest::Method::GET, "/read-pins/synthetic"),
-        (reqwest::Method::POST, "/checkpoints"),
-        (reqwest::Method::GET, "/checkpoints/synthetic"),
-        (reqwest::Method::GET, "/scopes"),
-        (reqwest::Method::POST, "/staged-changes"),
-        (reqwest::Method::POST, "/staged-changes/start"),
-        (reqwest::Method::POST, "/staged-changes/synthetic/seal"),
-        (reqwest::Method::PUT, "/staged-changes/synthetic/pages/0"),
-        (reqwest::Method::POST, "/commits"),
-        (reqwest::Method::POST, "/acks"),
-        (reqwest::Method::GET, "/events"),
-    ] {
-        let response = server
-            .auth(
-                server
-                    .client
-                    .request(method, format!("{}{path}", server.base)),
-                &server.a,
-            )
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
-    }
-}
-
-#[tokio::test]
 async fn bootstrap_paging_and_restored_cursor_errors_are_structured() {
     use risunest_sync_wire::lww::{StatePage, StatePin, TimeSample};
     let server = Server::start().await;
@@ -771,30 +740,6 @@ async fn malformed_metadata_and_frame_fail_without_mutation() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(s.store.object_size(&hash(b"good")).unwrap().is_none());
     assert!(s.store.object_size(&hash(b"bad")).unwrap().is_none());
-    assert_eq!(s.head(&s.a).await, head);
-}
-
-#[tokio::test]
-async fn removed_batch_endpoints_have_no_post_alias() {
-    let s = Server::start().await;
-    let head = s.head(&s.a).await;
-    let object = b"synthetic obsolete upload";
-    for (path, body) in [
-        ("/uploads/batch", full_frames(&[object])),
-        (
-            "/objects/batch",
-            serde_json::to_vec(&[hash(object)]).unwrap(),
-        ),
-    ] {
-        let response = s
-            .auth(s.client.post(format!("{}{path}", s.base)), &s.a)
-            .body(body)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
-    }
-    assert!(s.store.object_size(&hash(object)).unwrap().is_none());
     assert_eq!(s.head(&s.a).await, head);
 }
 

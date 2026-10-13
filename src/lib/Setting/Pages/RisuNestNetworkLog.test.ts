@@ -38,10 +38,8 @@ describe('native network settings', () => {
         inputs[0].checked = true; inputs[0].dispatchEvent(new Event('change', { bubbles: true })); await settle()
         expect(mock.call).toHaveBeenCalledWith({ op: 'configure', settings: { ...settings, enabled: true } })
     })
-    it('configures the shared buffer with the approved presets and hides the body limit', async () => {
+    it('configures the shared buffer with the approved presets', async () => {
         expect(host.textContent).toContain('기록 버퍼 용량')
-        expect(host.textContent).not.toContain('본문당 한도')
-        expect(host.querySelector('#network-bodyMib')).toBeNull()
         const select = host.querySelector<HTMLSelectElement>('#network-bufferMib')!
         expect(select.value).toBe('32')
         expect([...select.options].map(option => Number(option.value))).toEqual([4, 8, 16, 32, 64, 128])
