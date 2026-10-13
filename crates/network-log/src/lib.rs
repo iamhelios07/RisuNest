@@ -1,7 +1,7 @@
 mod export;
 mod masking;
 mod model;
-#[cfg(feature = "reqwest")]
+#[cfg(any(test, feature = "reqwest"))]
 pub mod reqwest;
 mod storage;
 pub use model::*;

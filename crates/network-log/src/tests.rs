@@ -547,7 +547,6 @@ fn quota_stops_capture_and_preserves_existing_retained_requests() {
     assert!(f.recorder.list(Query::default()).unwrap().retained_bytes <= 128 * MIB);
 }
 
-#[cfg(feature = "reqwest")]
 #[tokio::test(flavor = "current_thread")]
 async fn real_http_keeps_request_body_redirect_url_encoding_and_cancellation() {
     use crate::reqwest::RequestBuilderExt;
