@@ -7,10 +7,9 @@ import { nativePersistentRevisionLease } from '../nativePersistentExport'
 import {
     RevisionConflictError,
     SnapshotReleasedError,
-    type PersistentDataStore,
     type PersistentRoot,
 } from '../persistentDataStore'
-import { createLeaseStub } from '../persistentDataStore.testSupport'
+import { createLeaseStub, createStoreStub } from '../persistentDataStore.testSupport'
 import { decodeRisuSave, encodeRisuSaveBlock, RisuSaveType } from '../risuSave'
 import {
     streamRisuSaveFromLease,
@@ -262,9 +261,9 @@ describe('RisuSave persistent store adapter', () => {
             root: { ...root, username: 'Committed after external lease expiry' },
         })
 
-        const expiredLeaseStore = {
+        const expiredLeaseStore = createStoreStub({
             acquireRevision: async () => lease,
-        } as unknown as PersistentDataStore
+        })
         await withFlushedRisuSaveExport(
             {
                 store: expiredLeaseStore,

@@ -2,8 +2,8 @@ import { applyRootMutations } from './rootMutation'
 import { acquireUpstreamImportPause } from './upstreamReplacement'
 import { describe, expect, it, vi } from 'vitest'
 import type { Database } from './database.svelte'
-import type { PersistentDataStore, PersistentRevisionLease } from './persistentDataStore'
-import { createLeaseStub } from './persistentDataStore.testSupport'
+import type { PersistentRevisionLease } from './persistentDataStore'
+import { createLeaseStub, createStoreStub } from './persistentDataStore.testSupport'
 import {
     capturePersistentPluginStorage,
     capturePersistentPresets,
@@ -34,7 +34,7 @@ async function createHarness(officialPublisher?: OfficialRevisionPublisher, capt
     const onBackgroundError = vi.fn()
     const afterRemoteRootChange = vi.fn()
     const publishPresetWorkingSet = vi.fn()
-    const store = {
+    const store = createStoreStub({
         open: vi.fn(async () => undefined),
         readRoot: vi.fn(async () => ({ revision, value: capturePersistentRoot(durable) })),
         commit: vi.fn(async () => { throw new Error('Unexpected content commit') }),
@@ -86,7 +86,7 @@ async function createHarness(officialPublisher?: OfficialRevisionPublisher, capt
             return lease
         }),
         materializeDatabase: vi.fn(async () => { throw new Error('Unexpected complete materialization') }),
-    } as unknown as PersistentDataStore
+    })
     const runtime = createPersistentDataRuntime({
         store,
         state: {

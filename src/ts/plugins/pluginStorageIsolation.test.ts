@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
-import type { PersistentDataStore, PluginStorageMutation, PluginStorageValueQuery } from '../storage/persistentDataStore'
-import { createLeaseStub } from '../storage/persistentDataStore.testSupport'
+import type { PersistentRoot, PluginStorageMutation, PluginStorageValueQuery } from '../storage/persistentDataStore'
+import { createLeaseStub, createStoreStub } from '../storage/persistentDataStore.testSupport'
 import { createPluginStorageStore } from './pluginStorageStore'
 import { applyPluginDatabaseUpdate } from './pluginDatabaseAccess'
 import type { Database } from '../storage/database.svelte'
@@ -16,9 +16,9 @@ interface Row {
 function sharedStore(initial: readonly Row[]) {
     let rows = initial.map((row) => ({ ...row }))
     const committed: PluginStorageMutation[] = []
-    const store = {
+    const store = createStoreStub({
         open: vi.fn(async () => undefined),
-        readRoot: vi.fn(async () => ({ revision: 1, value: {} })),
+        readRoot: vi.fn(async () => ({ revision: 1, value: {} as PersistentRoot })),
         queryPluginStorage: vi.fn(async () => ({
             revision: 1,
             items: rows.map((row) => ({
@@ -61,7 +61,7 @@ function sharedStore(initial: readonly Row[]) {
             },
             release: vi.fn(async () => undefined),
         })),
-    } as unknown as PersistentDataStore
+    })
     const storage = createPluginStorageStore({
         store,
         getStorageAuthorityEpoch: () => 0,
@@ -214,11 +214,11 @@ describe('plugin storage isolation', () => {
             release = resolve
         })
         const rows: Row[] = []
-        const store = {
+        const store = createStoreStub({
             open: vi.fn(async () => undefined),
             queryPluginStorage: vi.fn(async () => ({ revision: 1, items: [] })),
             readPluginStorage: vi.fn(async () => null),
-        } as unknown as PersistentDataStore
+        })
         const storage = createPluginStorageStore({
             store,
             getStorageAuthorityEpoch: () => 0,

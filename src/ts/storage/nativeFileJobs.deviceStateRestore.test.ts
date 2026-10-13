@@ -16,6 +16,7 @@ vi.mock('../plugins/apiV3/v3.svelte',()=>({fencePluginExecutionForAuthorityRepla
 
 import { invoke } from '@tauri-apps/api/core'
 import { runNativeArchiveRestore, NativeFileJobActivationCommittedError, type NativeFileJobStatus } from './nativeFileJobs'
+import { createStoreStub } from './persistentDataStore.testSupport'
 import { initializeDeviceMarkers, installDeviceMarkers, getDeviceMarkers } from './deviceMarkers'
 import { reloadDeviceSettings, getDeviceSettings, updateDeviceSettings } from './deviceSettings'
 import { getAppUpdateSettings, reloadAppUpdateSettings, updateAppUpdateSettings,
@@ -59,7 +60,7 @@ it.each([false,true])('adopts empty device settings before body completion and r
         bodyFailure ? {...base,state:'failed',phase:'activating-database',activationRevision:4,activationAuthority:'1',deviceSessionId:'empty-settings',error:{code:'missing-body',message:'Synthetic missing body'}} : { ...base, state: 'succeeded', phase: 'complete', result, activationRevision:4,activationAuthority:'1', deviceSessionId: 'empty-settings' },
     ]
     const runtime: Parameters<typeof runNativeArchiveRestore>[0] = {
-        store: {readRoot:async()=>({revision:7})} as unknown as import('./persistentDataStore').PersistentDataStore,
+        store: createStoreStub({readRoot:async()=>({revision:7,value:{} as import('./persistentDataStore').PersistentRoot})}),
         setActivatedLibraryRecoveryLifecycle: vi.fn(),
         getStorageAuthorityEpoch: () => 1,
         withPausedPersistentWrites: async () => { throw new Error('Unexpected upstream pause') },

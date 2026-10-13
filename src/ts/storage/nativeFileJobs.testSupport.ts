@@ -1,6 +1,7 @@
 import { expect } from 'vitest'
 import type { NativeFileJobDependencies, NativeFileJobStatus } from './nativeFileJobs'
-import type { PersistentDataStore } from './persistentDataStore'
+import type { PersistentRoot } from './persistentDataStore'
+import { createStoreStub } from './persistentDataStore.testSupport'
 import type { PersistentMutationToken } from './saveCoordinator'
 
 /** A block restore job status in `state`; tests override `kind` and `phase` where they matter. */
@@ -45,7 +46,7 @@ export function restoreRuntime(
             try { return await operation({revision:options.fencedRevision ?? revision,mutationGeneration:1} as PersistentMutationToken) }
             finally { options.release?.() }
         },
-        store: {readRoot:async()=>({revision})} as unknown as PersistentDataStore,
+        store: createStoreStub({readRoot:async()=>({revision,value:{} as PersistentRoot})}),
         setActivatedLibraryRecoveryLifecycle: () => {},
         beginActivatedLibraryGuard: () => ({complete(){},abortUnchanged:async()=>{}}),
         refreshActivatedLibraryUnderPause: async () => {

@@ -1,6 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import type { PersistentDataStore } from '../storage/persistentDataStore'
-import { createLeaseStub } from '../storage/persistentDataStore.testSupport'
+import { createLeaseStub, createStoreStub } from '../storage/persistentDataStore.testSupport'
 import { prepareSummaryAwareGeneration } from './summaryAwareGenerationPreparation'
 
 function fixture(prefixCount = 300, tailCount = 2) {
@@ -64,10 +63,10 @@ function storeFor(messages: any[], revision = 7) {
         },
         async release() { released += 1 },
     })
-    const store = {
+    const store = createStoreStub({
         readConversationMessageMetadataWindow: vi.fn(),
         acquireRevision: vi.fn(async () => lease),
-    } as unknown as PersistentDataStore
+    })
     return { store, lease, bodyReads, metadataQueries, released: () => released }
 }
 
