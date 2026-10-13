@@ -6,6 +6,7 @@ import type { BlobStore } from '../storage/blobStore'
 import type { Database } from '../storage/database.svelte'
 import { IndexedDbPersistentDataStore } from '../storage/indexedDbPersistentDataStore'
 import type { PersistentDataRuntime } from '../storage/persistentDataRuntime'
+import { createLeaseStub } from '../storage/persistentDataStore.testSupport'
 import { decodeRisuSave, encodeRisuSaveLegacy } from '../storage/risuSave'
 import { risuSaveFixtureDatabase } from '../storage/tests/risuSaveFixtures'
 import { sleep } from '../util'
@@ -621,7 +622,7 @@ describe('local backup persistent snapshot', () => {
         await expect(writePinnedLocalBackupDatabase({ writeBackupStream } as any, {
             revision: 3,
             mutationGeneration: 0,
-            reader: { revision: 3 } as never,
+            reader: createLeaseStub({ revision: 3 }),
             countCharacters: vi.fn(),
             materializeDatabase: vi.fn(),
             stream: vi.fn(),
@@ -668,7 +669,7 @@ describe('local backup persistent snapshot', () => {
         await expect(writePinnedLocalBackupDatabase(writer as any, {
             revision: 3,
             mutationGeneration: 0,
-            reader: { revision: 3 } as never,
+            reader: createLeaseStub({ revision: 3 }),
             countCharacters: vi.fn(),
             materializeDatabase: vi.fn(),
             stream: vi.fn(),
@@ -700,7 +701,7 @@ describe('local backup persistent snapshot', () => {
         await expect(writePinnedLocalBackupDatabase(writer as any, {
             revision: 3,
             mutationGeneration: 0,
-            reader: { revision: 3 } as never,
+            reader: createLeaseStub({ revision: 3 }),
             countCharacters: vi.fn(),
             materializeDatabase: vi.fn(),
             stream: vi.fn(),

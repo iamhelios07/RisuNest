@@ -8,6 +8,7 @@ import ExternalTransferProgress from './ExternalTransferProgress.svelte'
 import { externalStorageStrings } from './strings'
 import { beginExternalProgress, clearExternalProgress } from 'src/ts/storage/sync/external/progress'
 import type { ExternalJobSummary } from 'src/ts/storage/sync/external/types'
+import { formatRisuNestStorageBytes as bytes } from 'src/ts/storage/risuNestStorageDashboard'
 const strings = externalStorageStrings('ko')
 let component: ReturnType<typeof mount> | undefined
 let target: HTMLDivElement
@@ -16,6 +17,8 @@ const show = async (props: Record<string, unknown> = {}) => {
     component = mount(ExternalTransferProgress, { target, props: { connectionId: 'synthetic', strings, ...props } })
     await tick()
 }
+const counterRows = () => [...target.querySelectorAll('dt')].map(term => [term.textContent, term.nextElementSibling?.textContent])
+const objectsValue = (size: number, count: string) => `${bytes(size)} · ${strings.transfer.objects.replace('{0}', count)}`
 afterEach(async () => {
     if (component) await unmount(component)
     component = undefined; target?.remove(); clearExternalProgress('synthetic'); vi.useRealTimers()
@@ -82,12 +85,16 @@ describe('external storage shared panel', () => {
     it('observes an automatic operation started after mounting and keeps details collapsed', async () => {
         vi.useFakeTimers(); await show()
         const run = beginExternalProgress('synthetic', 'sync')
-        native.invoke.mockImplementation(async (_name, { progress }) => progress.onmessage({ sequence: 1, stage: 'uploading', uploadedBytes: '4096', uploadedObjects: '2', downloadedBytes: '0', downloadedObjects: '0', preparedBytes: '2000' }))
+        native.invoke.mockImplementation(async (_name, { progress }) => progress.onmessage({ sequence: 1, stage: 'uploading', uploadedBytes: '4096', uploadedObjects: '2', downloadedBytes: '1024', downloadedObjects: '1', preparedBytes: '2000' }))
         await run.invoke('synthetic', {})
         await vi.advanceTimersByTimeAsync(650); await tick()
         expect(target.textContent).toContain(strings.transfer.uploading)
         expect(target.querySelector('details')?.open).toBe(false)
-        expect(target.textContent).toContain(strings.transfer.objects.replace('{0}', '2'))
+        expect(counterRows()).toEqual([
+            [strings.transfer.prepared, bytes(2000)],
+            [strings.transfer.uploaded, objectsValue(4096, '2')],
+            [strings.transfer.downloaded, objectsValue(1024, '1')],
+        ])
         expect(target.querySelector('[role="progressbar"]')?.hasAttribute('aria-valuenow')).toBe(false)
         run.finish('complete'); await tick()
         expect(target.textContent).toContain(strings.transfer.syncComplete)
@@ -145,7 +152,7 @@ describe('external storage shared panel', () => {
         const base: ExternalJobSummary = { id: 'backup', connectionId: 'synthetic', kind: 'backup', state: 'running', phase: 'prepare', counters: 'prepared', completedBytes: '20', totalBytes: '100', completedItems: '1', totalItems: '5', startedAtMs: '0', updatedAtMs: '0', transfer: { sequence: 1, stage: 'uploading', preparedBytes: '0', downloadedBytes: '0', downloadedObjects: '0', uploadedBytes: '50', uploadedObjects: '2' } }
         await show({ job: base, onboarding: true })
         expect(target.textContent).toContain(strings.jobCounters.prepared)
-        expect(target.textContent).toContain(strings.transfer.uploaded)
+        expect(counterRows()).toEqual([[strings.transfer.uploaded, objectsValue(50, '2')]])
         expect(target.querySelector('[role="progressbar"]')?.getAttribute('aria-valuenow')).toBe('20')
         await unmount(component!); target.remove(); component = undefined
         await show({ job: { ...base, kind: 'restore', phase: 'applying-local', counters: 'transferred', completedBytes: '100' }, onboarding: true })

@@ -5,7 +5,6 @@ import type {
     CharacterQuery,
     ConversationPage,
     ConversationQuery,
-    PersistentRevisionReader,
 } from './persistentDataStore'
 import { createLeaseStub } from './persistentDataStore.testSupport'
 import {
@@ -113,11 +112,11 @@ describe('persistent record iterators', () => {
             revision: 7,
             value: { chaId: id, name: id, type: 'character' } as CharacterDetail,
         }))
-        const reader = {
+        const reader = createLeaseStub({
             revision: 7,
             queryCharacters,
             readCharacter,
-        } as unknown as PersistentRevisionReader
+        })
 
         const ids: string[] = []
         for await (const record of iteratePinnedCharacters(reader)) ids.push(record.summary.id)
@@ -140,13 +139,13 @@ describe('persistent record iterators', () => {
         })
         const readConversation = vi.fn(async (_characterId: string, conversationId: string) => ({
             revision: 11,
-            value: { id: conversationId, name: conversationId, message: [] },
+            value: { id: conversationId, name: conversationId, note: '', localLore: [], message: [] },
         }))
-        const reader = {
+        const reader = createLeaseStub({
             revision: 11,
             queryConversations,
             readConversation,
-        } as unknown as PersistentRevisionReader
+        })
 
         const ids: string[] = []
         for await (const record of iteratePinnedConversations(reader, 'char-1')) {
@@ -159,14 +158,14 @@ describe('persistent record iterators', () => {
 
     it('fails before publishing a page from another revision', async () => {
         const readCharacter = vi.fn()
-        const reader = {
+        const reader = createLeaseStub({
             revision: 5,
             queryCharacters: vi.fn(async () => characterPage(6, [{
                 id: 'wrong', name: 'Wrong', configuredIndex: 0, recentAt: 0,
                 trashed: false, conversationCount: 0, type: 'character',
             }])),
             readCharacter,
-        } as unknown as PersistentRevisionReader
+        })
 
         const iterator = iteratePinnedCharacters(reader)[Symbol.asyncIterator]()
 
@@ -178,9 +177,9 @@ describe('persistent record iterators', () => {
         const readConversation = vi.fn(async (_characterId: string, conversationId: string) =>
             conversationId === 'missing'
                 ? null
-                : { revision: 3, value: { id: conversationId, message: [] } },
+                : { revision: 3, value: { id: conversationId, name: conversationId, note: '', localLore: [], message: [] } },
         )
-        const reader = {
+        const reader = createLeaseStub({
             revision: 3,
             queryConversations: vi.fn(async () => conversationPage(3, [
                 {
@@ -193,7 +192,7 @@ describe('persistent record iterators', () => {
                 },
             ])),
             readConversation,
-        } as unknown as PersistentRevisionReader
+        })
 
         const iterator = iteratePinnedConversations(reader, 'char-1')[Symbol.asyncIterator]()
 
