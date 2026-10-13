@@ -20,30 +20,8 @@ vi.mock('src/ts/platform', () => ({
     },
 }))
 vi.mock('src/ts/alert', () => alertMocks)
-vi.mock('src/lang', () => ({
-    language: {
-        playground: {
-            inlayDeleteConfirm: 'Delete {name}',
-            inlayDeleteMultipleConfirm: 'Delete {count}',
-            inlayDeselectAll: 'Deselect all',
-            inlayEmpty: 'Empty',
-            inlayEmptyDesc: 'No inlays',
-            inlayExplorer: 'Inlays',
-            inlayTotalAssets: '{count} assets',
-            inlayDeleteSelected: 'Delete selected',
-            inlaySelectAll: 'Select all',
-        },
-        risuNest: {
-            inlay: {
-                inventoryNoExtension: 'No extension',
-                optimizeSelected: 'Convert selected',
-                optimizeNone: 'Nothing to convert',
-                optimizeProgress: '{done} / {total}',
-            },
-        },
-    },
-}))
 
+import { language } from 'src/lang'
 import PlaygroundInlayExplorer from './PlaygroundInlayExplorer.svelte'
 
 class TestIntersectionObserver {
@@ -564,10 +542,10 @@ describe('PlaygroundInlayExplorer browser preview ownership', () => {
         await vi.waitFor(() => expect(target.querySelector('input[type="checkbox"]')).not.toBeNull())
         const labels = () => [...target.querySelectorAll('button')].map((button) => button.textContent?.trim())
 
-        expect(labels()).not.toContain('Convert selected')
+        expect(labels()).not.toContain(language.risuNest.inlay.optimizeSelected)
         target.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click()
 
-        await vi.waitFor(() => expect(labels()).toContain('Convert selected'))
+        await vi.waitFor(() => expect(labels()).toContain(language.risuNest.inlay.optimizeSelected))
         expect(target.textContent).toContain('4.0 KiB · png 1')
     })
 })
