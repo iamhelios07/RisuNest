@@ -67,6 +67,8 @@ impl Store {
             };
             let digest = hash(&bytes);
             #[cfg(test)]
+            super::objects::frame_metrics::hashed("frame", bytes.len());
+            #[cfg(test)]
             crate::source_observer::hashed(&digest, "frame-ingress-sha256", bytes.len());
             #[cfg(test)]
             super::objects::frame_metrics::record(1, measured);
@@ -284,5 +286,33 @@ mod tests {
             .query_row("SELECT count(*) FROM object_leases", [], |r| r.get(0))
             .unwrap();
         assert_eq!(leases, 1);
+    }
+
+    /// A delta frame's target is hashed once when it is materialized, and
+    /// publication reuses that identity instead of hashing the body again.
+    #[test]
+    fn delta_ingress_reuses_only_the_immediate_materialized_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::init(directory.path()).unwrap();
+        let registration = store.add_device().unwrap();
+        let device = store
+            .authenticate(&registration.library_id, &registration.token)
+            .unwrap();
+        let base = b"synthetic inline control".to_vec();
+        store.put_object(&device, &hash(&base), &base).unwrap();
+        let target = [base.as_slice(), b" changed"].concat();
+        let digest = hash(&target);
+        let recipe = delta::create(&[&base], &target).unwrap();
+        let encoded = transfer::encode(&[Frame::Delta(recipe)]).unwrap();
+        super::super::objects::frame_metrics::take_hashes();
+        assert_eq!(
+            store.receive_frames(&device, &encoded).unwrap(),
+            std::slice::from_ref(&digest)
+        );
+        assert_eq!(
+            super::super::objects::frame_metrics::take_hashes(),
+            [("frame", target.len())]
+        );
+        assert_eq!(store.get_object(&digest).unwrap(), target);
     }
 }

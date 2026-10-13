@@ -341,6 +341,8 @@ impl Store {
             if bytes.len() > MAX_TARGET_BYTES || {
                 let actual = hash(bytes);
                 #[cfg(test)]
+                frame_metrics::hashed("object", bytes.len());
+                #[cfg(test)]
                 crate::source_observer::hashed(digest, "object-ingress-sha256", bytes.len());
                 actual != *digest
             } {
@@ -553,6 +555,9 @@ pub(super) mod frame_metrics {
         /// planned from object metadata, so this must stay at the number of
         /// bodies the reply carries.
         pub static BODY_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// The identities ingress computed, by step and body length. A
+        /// materialized frame is hashed once and published under that hash.
+        pub static HASHES: std::cell::RefCell<Vec<(&'static str, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
     }
     pub fn record(stage: usize, started: std::time::Instant) {
         SAMPLES.with(|samples| {
@@ -566,6 +571,12 @@ pub(super) mod frame_metrics {
     }
     pub fn take_opens() -> usize {
         BODY_OPENS.with(|count| count.replace(0))
+    }
+    pub fn hashed(step: &'static str, bytes: usize) {
+        HASHES.with(|hashes| hashes.borrow_mut().push((step, bytes)));
+    }
+    pub fn take_hashes() -> Vec<(&'static str, usize)> {
+        HASHES.with(|hashes| hashes.take())
     }
 }
 
