@@ -100,6 +100,7 @@ afterEach(async () => {
   component = undefined;
   target.remove();
   vi.useRealTimers();
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 async function settle() {
@@ -183,6 +184,67 @@ it("does not dismiss a later error with the applied notice timer", async () => {
   expect(banner()?.textContent).toBe(message("management-stale-state"));
   await vi.advanceTimersByTimeAsync(4000);
   expect(banner()?.textContent).toBe(message("management-stale-state"));
+});
+
+it.each([
+  ["overview", "서버 주소 복사"],
+  ["connection", "임시 주소 복사"],
+  ["connection", "UUID 복사"],
+] as const)("dismisses copy feedback after four seconds on %s: %s", async (page, label) => {
+  vi.spyOn(navigator.clipboard, "writeText").mockResolvedValue();
+  snapshot.tunnel.endpoint = "https://synthetic.example.com";
+  await open();
+  pageButton(page).click();
+  await settle();
+  target.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`)!.click();
+  await settle();
+  expect(banner()?.textContent).toBe("복사했습니다.");
+  await vi.advanceTimersByTimeAsync(3999);
+  expect(banner()?.textContent).toBe("복사했습니다.");
+  await vi.advanceTimersByTimeAsync(1);
+  expect(banner()).toBeNull();
+});
+
+it("gives repeated copy feedback four seconds without dismissing a later copy error", async () => {
+  const clipboard = vi.spyOn(navigator.clipboard, "writeText").mockResolvedValue();
+  await open();
+  const copy = target.querySelector<HTMLButtonElement>('button[aria-label="서버 주소 복사"]')!;
+  copy.click();
+  await settle();
+  await vi.advanceTimersByTimeAsync(2000);
+  copy.click();
+  await settle();
+  await vi.advanceTimersByTimeAsync(3999);
+  expect(banner()?.textContent).toBe("복사했습니다.");
+  await vi.advanceTimersByTimeAsync(1);
+  expect(banner()).toBeNull();
+  copy.click();
+  await settle();
+  clipboard.mockRejectedValue(new Error("clipboard unavailable"));
+  copy.click();
+  await settle();
+  await vi.advanceTimersByTimeAsync(4000);
+  expect(banner()?.textContent).toBe("복사하지 못했습니다. 입력란의 내용을 선택해 복사하세요.");
+});
+
+it.each(["environment", "platformStatus"] as const)("clears a recovered %s error without clearing another notice", async (method) => {
+  vi.mocked(backend[method]).mockRejectedValueOnce("task-scheduler-operation-failed");
+  await open();
+  expect(banner()).not.toBeNull();
+  const refresh = target.querySelector<HTMLButtonElement>('button[aria-label="새로 고침"]')!;
+  refresh.click();
+  await vi.waitFor(() => expect(banner()).toBeNull());
+
+  vi.mocked(backend[method]).mockRejectedValueOnce("task-scheduler-operation-failed");
+  refresh.click();
+  await vi.waitFor(() => expect(banner()).not.toBeNull());
+  vi.spyOn(navigator.clipboard, "writeText").mockRejectedValue(new Error("clipboard unavailable"));
+  target.querySelector<HTMLButtonElement>('button[aria-label="서버 주소 복사"]')!.click();
+  await settle();
+  refresh.click();
+  await settle();
+  await vi.advanceTimersByTimeAsync(4000);
+  expect(banner()?.textContent).toBe("복사하지 못했습니다. 입력란의 내용을 선택해 복사하세요.");
 });
 
 it("keeps a dirty form tied to its original revision during status refresh", async () => {
@@ -288,7 +350,7 @@ it("labels retained overview data as last-known after losing the daemon", async 
   expect(target.textContent).toContain("마지막 임시 주소");
 });
 
-it("shows a registration URI once and clears it on modal close", async () => {
+async function issueRegistration() {
   const uri = "risunestlocal://sync-server/register#SYNTHETIC_SECRET_ONLY_TEST";
   vi.mocked(backend.mutate).mockResolvedValue({ uri });
   await open();
@@ -310,10 +372,42 @@ it("shows a registration URI once and clears it on modal close", async () => {
       uri,
     ),
   );
+}
+
+it("dismisses registration copy feedback and clears the URI and feedback on modal close", async () => {
+  vi.spyOn(navigator.clipboard, "writeText").mockResolvedValue();
+  await issueRegistration();
+  button("링크 복사").click();
+  await settle();
+  expect(target.querySelector("dialog[open] > [role=status]")?.textContent).toBe("복사했습니다.");
+  await vi.advanceTimersByTimeAsync(4000);
+  expect(target.querySelector("dialog[open] > [role=status]")).toBeNull();
+  expect(banner()).toBeNull();
+  button("링크 복사").click();
+  await settle();
+  expect(banner()?.textContent).toBe("복사했습니다.");
   button("완료").click();
   await settle();
   expect(target.querySelector("textarea")).toBeNull();
   expect(target.innerHTML).not.toContain("SYNTHETIC_SECRET_ONLY_TEST");
+  expect(banner()).toBeNull();
+});
+
+it.each([false, true])("ignores a pending clipboard result after closing its dialog (failure: %s)", async (failure) => {
+  let complete!: () => void;
+  vi.spyOn(navigator.clipboard, "writeText").mockImplementation(() => new Promise<void>((resolve, reject) => {
+    complete = () => failure ? reject(new Error("clipboard unavailable")) : resolve();
+  }));
+  await issueRegistration();
+  button("링크 복사").click();
+  await settle();
+  button("완료").click();
+  await settle();
+  expect(target.querySelector("dialog[open]")).toBeNull();
+  complete();
+  await settle();
+  expect(banner()).toBeNull();
+  expect(target.querySelector("dialog[open] > [role=status]")).toBeNull();
 });
 
 it("disables issuance while disconnected and does not invent storage values", async () => {
@@ -350,6 +444,49 @@ it("changes the shared update policy from run settings", async () => {
   select.dispatchEvent(new Event("change", { bubbles: true }));
   await settle();
   expect(backend.updatePolicy).toHaveBeenCalledWith("notify");
+  await vi.waitFor(() => expect(banner()?.textContent).toBe("업데이트 정책과 예약 확인 설정을 변경했습니다."));
+  await vi.advanceTimersByTimeAsync(4000);
+  expect(banner()).toBeNull();
+});
+
+it("dismisses a successful startup setting change", async () => {
+  await open();
+  pageButton("settings").click();
+  await settle();
+  target.querySelector<HTMLInputElement>('input[aria-label="서버 자동 실행"]')!.click();
+  await vi.waitFor(() => expect(banner()?.textContent).toBe("자동 실행 설정을 변경했습니다."));
+  await vi.advanceTimersByTimeAsync(4000);
+  expect(banner()).toBeNull();
+});
+
+it.each([
+  [{ result: "completed", value: "2.0.0" }, "Sync 2.0.0 업데이트를 완료했습니다."],
+  [{ result: "skipped" }, "예약된 업데이트 확인 시간이 아직 되지 않았습니다."],
+] as const)("dismisses a finished update check: %j", async (outcome, expected) => {
+  vi.mocked(backend.updateCheck).mockResolvedValue(outcome);
+  await open();
+  pageButton("settings").click();
+  await settle();
+  button("업데이트 확인 및 적용").click();
+  await vi.waitFor(() => expect(banner()?.textContent).toBe(expected));
+  await vi.advanceTimersByTimeAsync(4000);
+  expect(banner()).toBeNull();
+});
+
+it("keeps an update check in progress and an available update visible", async () => {
+  let complete!: (value: Awaited<ReturnType<Backend["updateCheck"]>>) => void;
+  vi.mocked(backend.updateCheck).mockImplementation(() => new Promise((resolve) => { complete = resolve; }));
+  await open();
+  pageButton("settings").click();
+  await settle();
+  button("업데이트 확인 및 적용").click();
+  await settle();
+  await vi.advanceTimersByTimeAsync(4000);
+  expect(banner()?.textContent).toBe("업데이트를 확인하고 있습니다.");
+  complete({ result: "available", value: "2.0.0" });
+  await settle();
+  await vi.advanceTimersByTimeAsync(4000);
+  expect(banner()?.textContent).toBe("Sync 2.0.0 업데이트를 사용할 수 있습니다.");
 });
 
 it("refreshes a schedule failure on window focus without periodically querying services", async () => {
@@ -434,6 +571,8 @@ it("reports a deferred manual update without claiming the app is current", async
   );
   expect(backend.updateCheck).toHaveBeenCalledWith(false);
   expect(target.textContent).not.toContain(updateReason("already-current"));
+  await vi.advanceTimersByTimeAsync(4000);
+  expect(banner()?.textContent).toBe("관리 작업이 끝난 뒤 다시 확인하세요.");
 });
 
 it("coordinates an automatic update after the scheduled checker found the open GUI", async () => {
@@ -489,6 +628,8 @@ it("saves network settings while the server is stopped and discards only confirm
   address.closest("form")!.dispatchEvent(new Event("submit", { cancelable: true }));
   await vi.waitFor(() => expect(backend.network).toHaveBeenCalledWith({ schema: 1, address: "0.0.0.0", port: 24319 }));
   await vi.waitFor(() => expect(banner()).not.toBeNull());
+  await vi.advanceTimersByTimeAsync(4000);
+  expect(banner()).toBeNull();
   pageButton("overview").click();
   await settle();
   expect(target.querySelector("dialog[open]")).toBeNull();
@@ -671,6 +812,10 @@ it("requires confirmation before releasing revoked device custody", async () => 
   target.querySelector<HTMLButtonElement>("dialog[open] button.primary")!.click();
   await settle();
   expect(backend.mutate).toHaveBeenCalledWith("devices/synthetic-device/forget", expect.objectContaining({ revision: "synthetic:0" }));
+  await vi.waitFor(() => expect(target.querySelector("dialog[open]")).toBeNull());
+  expect(banner()?.textContent).toBe("변경 사항을 적용했습니다.");
+  await vi.advanceTimersByTimeAsync(4000);
+  expect(banner()).toBeNull();
 });
 
 it.each([false, true])("shows an already-current result without a warning after a manual check: %s", async (manual) => {
@@ -700,6 +845,12 @@ it.each([false, true])("shows an already-current result without a warning after 
   expect(result.querySelector("code")).toBeNull();
   expect(target.textContent).not.toContain(updateReason("synthetic-previous-failure"));
   expect(target.textContent).not.toContain("already-current");
+  if (manual) {
+    expect(banner()?.textContent).toBe(updateReason("already-current"));
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(banner()).toBeNull();
+    expect(result.textContent?.trim()).toBe(`마지막 결과: ${updateReason("already-current")}`);
+  }
 });
 
 it("renders unknown update reasons as a localized outcome with a separate diagnostic code", async () => {
