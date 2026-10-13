@@ -34,7 +34,7 @@ const DUPLICATE_POSITIONS = [100, 3_000]
 const interfaceMockModules = [
     '../parser/parser.svelte', '../parser/chatML', '../alert', '../globalApi.svelte',
     '../platform', '../tokenizer', '../util', './database.svelte', '../stores.svelte',
-    './persistentDataRuntime.svelte', '../../lang', '../process/modules',
+    './persistentDataRuntime.svelte', '../process/modules',
     '../process/files/inlays', '../process/lorebook.svelte', '../process/memory/hypamemory',
     '../process/request/request', '../process/stableDiff', '../process/luaRuntime',
     '../process/scripts', '../process/triggers', '../process/command',
@@ -522,11 +522,7 @@ describe('selected conversation eviction correctness corpus', () => {
             alertSelect: vi.fn(),
         }))
         vi.doMock('../globalApi.svelte', () => ({ fetchNative: vi.fn(), readImage: vi.fn() }))
-        vi.doMock('../platform', () => ({
-            isTauriMobile: true,
-            isTauri: false,
-            isMobile: false,
-        }))
+        vi.doMock('../platform', async () => (await import('../platform.testSupport')).platformModule({ runtime: 'web', os: 'windows' }))
         vi.doMock('../tokenizer', () => ({ tokenize: vi.fn() }))
         vi.doMock('../util', () => ({
             asBuffer: vi.fn(),
@@ -661,7 +657,6 @@ describe('selected conversation eviction correctness corpus', () => {
             },
             tokenize: vi.fn(async () => 1), tokenizeNum: vi.fn(async () => []),
         }))
-        vi.doMock('../../lang', () => ({ language: { errors: {} } }))
         vi.doMock('../alert', () => ({ alertError: vi.fn(), alertToast: vi.fn() }))
         vi.doMock('../parser/chatML', () => ({ parseChatML: (value: string) => value }))
         vi.doMock('../parser/parser.svelte', () => ({ risuChatParser: (value: string) => value }))
@@ -879,7 +874,6 @@ describe('selected conversation eviction correctness corpus', () => {
             risuChatParser: (value: string) => value,
         }))
         vi.doMock('../alert', () => ({ alertConfirm: vi.fn() }))
-        vi.doMock('../../lang', () => ({ language: { hypaV3Modal: { unclassified: '' } } }))
         const { captureCurrentHypaMessageById } = await import(
             '../../lib/Others/HypaV3Modal/utils'
         )
@@ -909,7 +903,6 @@ describe('selected conversation eviction correctness corpus', () => {
             './persistentDataRuntime.svelte',
             '../process/scripts',
             '../alert',
-            '../../lang',
         ]) vi.doUnmock(moduleId)
         vi.resetModules()
 
