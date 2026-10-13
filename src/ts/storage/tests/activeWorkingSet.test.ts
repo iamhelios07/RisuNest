@@ -16,6 +16,7 @@ import type {
     PersistentDataStore,
     PersistentRevisionLease,
 } from '../persistentDataStore'
+import { createLeaseStub } from '../persistentDataStore.testSupport'
 import { fixtureDatabase } from './persistentDataFixtures'
 import { createPersistentStoreHarness } from '../../../../tests/support/persistentStoreHarness'
 
@@ -56,12 +57,10 @@ function makeLease(input: {
 }): PersistentRevisionLease {
     const revision = input.revision ?? 1
     const chats = input.chats ?? []
-    return {
+    return createLeaseStub({
         revision,
         queryPresets: vi.fn(async () => ({ revision, items: [] })),
         readPreset: vi.fn(async () => null),
-        readRoot: vi.fn(),
-        queryCharacters: vi.fn(),
         readCharacterSummary: vi.fn(async () => null),
         readCharacter:
             input.readCharacter ??
@@ -94,7 +93,6 @@ function makeLease(input: {
                 return chat ? { revision, value: structuredClone(chat) } : null
             }),
         readConversationMetadata: vi.fn(async () => null),
-        readConversationWindow: vi.fn(),
         readPluginStorageValues: vi.fn(async () => ({ revision, items: [], nextCursor: null })),
         queryPluginStorage: vi.fn(async () => ({ revision, items: [] })),
         readPluginStorage: vi.fn(async () => null),
@@ -103,7 +101,7 @@ function makeLease(input: {
         listAssetAliases: vi.fn(async () => ({ revision, items: [] })),
         readAssetOwnerHead: vi.fn(async () => null),
         release: vi.fn(async () => undefined),
-    }
+    })
 }
 
 function makeHarness(

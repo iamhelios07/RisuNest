@@ -1,10 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { Chat, Database, Message, character } from './storage/database.svelte'
 import { ActiveConversationSession } from './storage/activeConversationSession'
-import type {
-    PersistentDataStore,
-    PersistentRevisionLease,
-} from './storage/persistentDataStore'
+import type { PersistentDataStore } from './storage/persistentDataStore'
+import { createLeaseStub } from './storage/persistentDataStore.testSupport'
 import { openChatScreenshotSourceLease } from './chatScreenshotSourceLease'
 import type { ChatScreenshotRenderContext } from './chatScreenshotRange'
 import type { SelectedConversationTarget } from './storage/activeWorkingSet.svelte'
@@ -87,7 +85,7 @@ function harness(messages: Message[]) {
     })
     const release = vi.fn(async () => undefined)
     const reads: Array<{ startIndex: number; limit: number }> = []
-    const lease = {
+    const lease = createLeaseStub({
         revision: 7,
         readConversationWindow: vi.fn(async ({ startIndex = 0, limit = 1 }) => {
             reads.push({ startIndex, limit })
@@ -107,7 +105,7 @@ function harness(messages: Message[]) {
             }
         }),
         release,
-    } as unknown as PersistentRevisionLease
+    })
     const store = {
         open: vi.fn(async () => undefined),
         readRoot: vi.fn(async () => ({ revision: 7, value: {} })),
@@ -284,14 +282,14 @@ describe('chat screenshot source lease', () => {
         const originalReadRoot = source.dependencies.store.readRoot.bind(
             source.dependencies.store,
         )
-        const revisionEightLease = {
-            ...source.lease,
+        const revisionEightLease = createLeaseStub({
             revision: 8,
             readConversationWindow: vi.fn(async (input) => {
                 const result = await originalRead(input)
                 return result ? { ...result, revision: 8 } : null
             }),
-        } as unknown as PersistentRevisionLease
+            release: source.release,
+        })
         source.dependencies.flushPendingData.mockImplementation(async () => {
             source.dependencies.store.readRoot = vi.fn(async () => ({
                 ...await originalReadRoot(),
@@ -326,8 +324,7 @@ describe('chat screenshot source lease', () => {
             data: 'after flush',
             chatId: 'one',
         })
-        const revisionEightLease = {
-            ...source.lease,
+        const revisionEightLease = createLeaseStub({
             revision: 8,
             readConversationWindow: vi.fn(async ({ startIndex = 0, limit = 1 }) => {
                 const page = source.conversation.message.slice(startIndex, startIndex + limit)
@@ -345,7 +342,8 @@ describe('chat screenshot source lease', () => {
                     },
                 }
             }),
-        } as unknown as PersistentRevisionLease
+            release: source.release,
+        })
         const originalReadRoot = source.dependencies.store.readRoot.bind(
             source.dependencies.store,
         )

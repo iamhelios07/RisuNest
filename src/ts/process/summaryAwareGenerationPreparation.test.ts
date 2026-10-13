@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
-import type { PersistentDataStore, PersistentRevisionLease } from '../storage/persistentDataStore'
+import type { PersistentDataStore } from '../storage/persistentDataStore'
+import { createLeaseStub } from '../storage/persistentDataStore.testSupport'
 import { prepareSummaryAwareGeneration } from './summaryAwareGenerationPreparation'
 
 function fixture(prefixCount = 300, tailCount = 2) {
@@ -20,7 +21,7 @@ function storeFor(messages: any[], revision = 7) {
     const bodyReads: number[] = []
     const metadataQueries: any[] = []
     let released = 0
-    const lease = {
+    const lease = createLeaseStub({
         revision,
         async readConversationMessageMetadataWindow(input: any) {
             metadataQueries.push(input)
@@ -62,7 +63,7 @@ function storeFor(messages: any[], revision = 7) {
             }
         },
         async release() { released += 1 },
-    } as unknown as PersistentRevisionLease
+    })
     const store = {
         readConversationMessageMetadataWindow: vi.fn(),
         acquireRevision: vi.fn(async () => lease),

@@ -36,6 +36,7 @@ vi.mock('src/ts/alert', () => alerts)
 vi.mock('src/ts/platform', async () => (await import('src/ts/platform.testSupport')).platformModule({ runtime: 'tauri', os: 'windows' }))
 
 import RisuNestStorageDashboard from './RisuNestStorageDashboard.svelte'
+import { assetResidencyStatus } from 'src/ts/storage/sync/serverAssetResidency.testSupport'
 import { languageEnglish } from 'src/lang/en'
 import { languageKorean } from 'src/lang/ko'
 
@@ -168,10 +169,9 @@ describe('RisuNestStorageDashboard', () => {
             assetBodies: { count: 1, bytes: 1024 * 1024 },
             missingAssetBodies: { count: 3, bytes: 1024 * 1024 * 1024 },
         }
-        const status = {
-            policy: 'remote', localBytes: 1024 * 1024, remoteBytes: 1024 * 1024 * 1024, remoteObjects: 3,
-            serverBytes: 1024 * 1024 * 1024, serverObjects: 3, externalObjects: [], unavailableObjects: 0, evictedBytes: 0,
-        }
+        const status = assetResidencyStatus({
+            localBytes: 1024 * 1024, remoteBytes: 1024 * 1024 * 1024, remoteObjects: 3, serverBytes: 1024 * 1024 * 1024, serverObjects: 3,
+        })
         const mediaItem = (target: HTMLElement) =>
             [...target.querySelectorAll<HTMLElement>('[data-storage-legend] > li')]
                 .find((item) => item.textContent?.includes(languageEnglish.risuNest.storage.media))!

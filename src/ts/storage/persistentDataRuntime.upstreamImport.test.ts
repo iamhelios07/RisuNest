@@ -10,6 +10,7 @@ const library=vi.hoisted(()=>({hasCharacters:vi.fn<()=>Promise<boolean>>()}))
 vi.mock('./libraryCharacters',()=>({hasLibraryCharacters:library.hasCharacters}) satisfies typeof import('./libraryCharacters'))
 import type {Database} from './database.svelte'
 import type {PersistentDataStore,PersistentRevisionLease} from './persistentDataStore'
+import {createLeaseStub} from './persistentDataStore.testSupport'
 import {capturePersistentPluginStorage,capturePersistentPresets,capturePersistentRoot,createPersistentDataRuntime} from './persistentDataRuntime'
 import type {OfficialRevisionPublisher} from './saveCoordinator'
 import {makeDatabase} from './saveCoordinator.testSupport'
@@ -38,7 +39,7 @@ async function createHarness(officialPublisher?: OfficialRevisionPublisher, capt
         acquireRevision: vi.fn(async (expected: number) => {
             expect(expected).toBe(revision)
             const snapshot = structuredClone(durable)
-            const lease = {
+            const lease = createLeaseStub({
                 revision: expected,
                 readRoot: vi.fn(async () => ({ revision: expected, value: capturePersistentRoot(snapshot) })),
                 queryPresets: vi.fn(async () => ({ revision: expected, items: [] })),
@@ -73,7 +74,7 @@ async function createHarness(officialPublisher?: OfficialRevisionPublisher, capt
                 queryConversations: vi.fn(async () => ({ revision: expected, items: [] })),
                 queryPluginStorage: vi.fn(async () => ({ revision: expected, items: [] })),
                 release: vi.fn(async () => undefined),
-            } as unknown as PersistentRevisionLease
+            })
             leases.push(lease)
             return lease
         }),
