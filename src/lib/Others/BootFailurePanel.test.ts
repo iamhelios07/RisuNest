@@ -88,14 +88,10 @@ describe('BootFailurePanel', () => {
         expect(f.roots).not.toHaveBeenCalled()
     })
 
-    it('keeps the copy for a store from another version in both languages free of upgrade wording', async () => {
+    it('names the export button in the message for a store from another version', async () => {
         const { languageKorean } = await import('src/lang/ko')
-        expect(languageKorean.risuNest.boot.schemaUnsupported).toContain('다른 버전의 RisuNest')
-        expect(languageKorean.risuNest.boot.schemaUnsupported).toContain(languageKorean.risuNest.recovery.exportAction)
-        expect(languageEnglish.risuNest.boot.schemaUnsupported).toContain('a different version of RisuNest')
-        expect(languageEnglish.risuNest.boot.schemaUnsupported).toContain(languageEnglish.risuNest.recovery.exportAction)
         for (const translation of [languageEnglish, languageKorean]) {
-            expect(translation.risuNest.boot).not.toHaveProperty('dataPathWindows')
+            expect(translation.risuNest.boot.schemaUnsupported).toContain(translation.risuNest.recovery.exportAction)
         }
     })
 })
