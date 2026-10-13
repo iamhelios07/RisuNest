@@ -2,10 +2,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { get } from 'svelte/store'
 
 vi.mock('../globalApi.svelte', () => ({ openURL: vi.fn() }))
-vi.mock('../platform', () => ({ isTauri: true }))
+vi.mock('../platform', async () => (await import('../platform.testSupport')).platformModule({ runtime: 'tauri', os: 'windows' }))
 vi.mock('@tauri-apps/plugin-process', () => ({ relaunch: vi.fn() }))
 vi.mock('../desktopRelaunch', () => ({ relaunch: vi.fn() }))
-vi.mock('../../lang', () => ({ language: { risuNest: { update: { installLocationNotWritable: 'Move RisuNest to the Applications folder and try again.' } } } }))
 const nativeMocks = vi.hoisted(() => ({
     environment: vi.fn(async () => ({
         currentVersion: '1.0.0',
@@ -31,6 +30,7 @@ import {
     type UpdateControllerDependencies,
 } from './controller'
 import { appUpdateState, initialAppUpdateState } from './state.svelte'
+import { language } from '../../lang'
 import type { NativeUpdateCheckResult } from './manifest'
 import { getAppUpdateSettings, updateAppUpdateSettings } from './settings'
 
@@ -85,7 +85,7 @@ describe('app update controller', () => {
         vi.mocked(value.install).mockRejectedValue('install-location-not-writable')
         appUpdateState.update(state => ({ ...state, update: available.update }))
         await applyAppUpdate(value)
-        expect(get(appUpdateState)).toMatchObject({ phase: 'error', error: 'Move RisuNest to the Applications folder and try again.' })
+        expect(get(appUpdateState)).toMatchObject({ phase: 'error', error: language.risuNest.update.installLocationNotWritable })
         expect(value.restart).not.toHaveBeenCalled()
     })
     beforeEach(() => {

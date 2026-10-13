@@ -73,11 +73,6 @@ vi.mock('./alert', async () => {
         alertWait: vi.fn(),
     }
 })
-vi.mock('../lang', () => ({ language: { errors: {}, navigationBlockedWhileEditingPaused: 'Synthetic paused copy', checkboxConfirmation: {
-    characterDeletion: "Delete character",
-    characterTrashDescription: "Moves to the trash.",
-    characterDeletionDescription: "Deleted permanently.",
-} } }))
 vi.mock('./util', () => ({
     checkNullish: (value: unknown) => value === null || value === undefined,
     findCharacterbyId: mocks.findCharacterbyId,
@@ -162,6 +157,7 @@ import {
     addingEmotion,
 } from './characters'
 import { createMetadataOnlySelectedConversation } from './storage/selectedConversationLifecycle'
+import { language } from 'src/lang'
 import { SelectedConversationPromotionStaleError } from './storage/activeWorkingSet.svelte'
 import { PersistentMutationFencedError } from './storage/saveCoordinator'
 import { MobileGUIStack, OpenRealmStore, selectedCharID } from './stores.svelte'
@@ -358,7 +354,7 @@ describe('runtime chat identity', () => {
 
         await expect(changeChar(0)).resolves.toBe(false)
 
-        expect(mocks.alertToast).toHaveBeenCalledWith('Synthetic paused copy')
+        expect(mocks.alertToast).toHaveBeenCalledWith(language.navigationBlockedWhileEditingPaused)
         expect(mocks.alertError).not.toHaveBeenCalled()
         expect(get(navigationActivity)).toBeNull()
     })
@@ -429,16 +425,16 @@ describe('runtime chat identity', () => {
     })
 
     it.each([
-        ['normal', 'Moves to the trash.'],
-        ['permanent', 'Deleted permanently.'],
-    ] as const)('describes a %s removal by what it does', async (type, description) => {
+        ['normal', 'characterTrashDescription'],
+        ['permanent', 'characterDeletionDescription'],
+    ] as const)('describes a %s removal by what it does', async (type, key) => {
         const character = createBlankChar()
         mocks.database.characters.push(character)
         mocks.alertConfirm.mockResolvedValueOnce(false)
 
         await removeChar(character.chaId, character.name, type)
 
-        expect(mocks.alertConfirm).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ description }))
+        expect(mocks.alertConfirm).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ description: language.checkboxConfirmation[key] }))
     })
 
     it('removes the character ID captured before confirmation', async () => {

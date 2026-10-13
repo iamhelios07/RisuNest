@@ -59,7 +59,6 @@ vi.mock('./util', () => ({
     selectFileByDom: vi.fn(),
     sleep: vi.fn(),
 }))
-vi.mock('src/lang', () => ({ language: { errors: {}, importedCharacter: 'imported' } }))
 vi.mock('./globalApi.svelte', () => ({
     AppendableBuffer: class {},
     BlankWriter: class {
@@ -79,12 +78,9 @@ vi.mock('./globalApi.svelte', () => ({
     saveAsset: mocks.saveAsset,
     VirtualWriter: class {},
 }))
-vi.mock('src/ts/platform', () => ({
-    get isTauri() { return mocks.platform !== 'desktop' },
-    get isTauriDesktop() { return mocks.platform === 'desktop' },
-    get isTauriAndroid() { return mocks.platform === 'android' },
-    get isTauriIOS() { return mocks.platform === 'ios' },
-}))
+vi.mock('src/ts/platform', async () => (await import('src/ts/platform.testSupport')).platformModule(() => ({
+    runtime: 'tauri', os: mocks.platform === 'desktop' ? 'windows' : mocks.platform,
+})))
 vi.mock('./storage/androidContentPicker', () => ({ importAndroidContentFromPicker: mocks.importAndroid }))
 vi.mock('./storage/iosContentPicker', () => ({ importIOSContentFromPicker: mocks.importIOS }))
 vi.mock('./storage/nativeCharacterFileRoute', () => ({

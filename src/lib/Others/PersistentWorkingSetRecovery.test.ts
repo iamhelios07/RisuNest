@@ -19,9 +19,6 @@ vi.mock('src/ts/storage/persistentDataRuntime.svelte', async () => {
         retryCommittedWorkingSetRefresh: mocks.retry,
     }
 })
-vi.mock('src/lang', async () => ({
-    language: (await import('src/lang/en')).languageEnglish,
-}))
 
 import { externalApplicationRecovery } from 'src/ts/storage/sync/external/applicationRecovery'
 import Recovery from './PersistentWorkingSetRecovery.svelte'

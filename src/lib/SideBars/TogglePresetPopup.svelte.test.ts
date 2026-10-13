@@ -14,7 +14,6 @@ const mocks = vi.hoisted(() => ({
     download: vi.fn(async () => true),
     close: vi.fn(),
 }))
-vi.mock('src/lang', () => ({ language: languageEnglish }))
 vi.mock('src/ts/stores.svelte', async () => {
     const { writable } = await import('svelte/store')
     const DBState = $state({ db: {} })

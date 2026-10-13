@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { mount, tick, unmount } from 'svelte'
 import { get, writable } from 'svelte/store'
-import { languageEnglish } from 'src/lang/en'
+import { language } from 'src/lang'
 import { DBState } from 'src/ts/stores.svelte'
 import DefaultChatScreen from './DefaultChatScreen.svelte'
 import { chatScreenState } from '../../ts/ui/chatScreenState.svelte'
@@ -16,7 +16,6 @@ const mocks = vi.hoisted(() => ({ trigger: vi.fn(), generate: vi.fn(), process: 
     viewport: { jumpTo: async () => true, jumpToTop: vi.fn(async () => true), jumpToBottom: vi.fn(async () => true), navigateMessage: vi.fn(async () => true) },
     target: { characterId: 'character', conversationId: 'chat', navigationGeneration: 1, storeRevision: 1, sessionToken: 'windowed' },
 }))
-vi.mock('src/lang', () => ({ language: languageEnglish }))
 vi.mock('src/ts/stores.svelte', () => {
     const DBState = $state({ db: {} })
     return { DBState, selectedCharID: writable(0), PlaygroundStore: writable(0), hypaV3ModalOpen: writable(false),
@@ -209,7 +208,7 @@ it('holds the reroll shortcut until the submitted input has finished', async () 
 it('retains attachments on input failure and preserves files added for the next send', async () => {
     async function attach(id: string) {
         mocks.postFile.mockResolvedValueOnce([{ type: 'asset', data: id }])
-        const fileItem = () => [...document.querySelectorAll('span')].find(span => span.textContent === languageEnglish.postFile)
+        const fileItem = () => [...document.querySelectorAll('span')].find(span => span.textContent === language.postFile)
         if (!fileItem()) {
             const menu = document.querySelector('.button-icon-send')!.nextElementSibling as HTMLButtonElement
             menu.click()
@@ -329,7 +328,7 @@ it('tells the user when no history window opens for the input step', async () =>
     mocks.openWindow.mockResolvedValue(null)
     const input = type('Hello')
     send()
-    await vi.waitFor(() => expect(mocks.error).toHaveBeenCalledWith(languageEnglish.chatConversationActionFailed))
+    await vi.waitFor(() => expect(mocks.error).toHaveBeenCalledWith(language.chatConversationActionFailed))
     expect(mocks.error).toHaveBeenCalledOnce()
     expect(mocks.generate).not.toHaveBeenCalled()
     expect(input.value).toBe('Hello')
@@ -339,7 +338,7 @@ it('tells the user when no tail window opens for a reroll', async () => {
     mocks.historyLimit = true
     mocks.openWindow.mockResolvedValue(null)
     type('').dispatchEvent(new KeyboardEvent('keydown', { key: 'm', ctrlKey: true, bubbles: true }))
-    await vi.waitFor(() => expect(mocks.error).toHaveBeenCalledWith(languageEnglish.chatConversationActionFailed))
+    await vi.waitFor(() => expect(mocks.error).toHaveBeenCalledWith(language.chatConversationActionFailed))
     expect(mocks.error).toHaveBeenCalledOnce()
     expect(mocks.generate).not.toHaveBeenCalled()
 })
@@ -351,7 +350,7 @@ it.each([
     mocks.historyLimit = true
     mocks.openWindow.mockResolvedValue(null)
     await mocks.chatsProps[prop]()
-    expect(mocks.error).toHaveBeenCalledWith(languageEnglish.chatConversationActionFailed)
+    expect(mocks.error).toHaveBeenCalledWith(language.chatConversationActionFailed)
     expect(mocks.error).toHaveBeenCalledOnce()
     expect(mocks.confirm).not.toHaveBeenCalled()
 })
@@ -366,7 +365,7 @@ it('tells the user when the tail cannot be reopened after a reroll generated a r
         return true
     })
     type('').dispatchEvent(new KeyboardEvent('keydown', { key: 'm', ctrlKey: true, bubbles: true }))
-    await vi.waitFor(() => expect(mocks.error).toHaveBeenCalledWith(languageEnglish.generationConversationChanged))
+    await vi.waitFor(() => expect(mocks.error).toHaveBeenCalledWith(language.generationConversationChanged))
     expect(mocks.error).toHaveBeenCalledOnce()
     expect(mocks.notify).not.toHaveBeenCalled()
     // The recovery stays stored, so opening the conversation restores the original response.
@@ -466,7 +465,7 @@ it.each(['send', 'continue', 'reroll'] as const)('stops a pending %s after the c
         const menu = document.querySelector('.button-icon-send')!.nextElementSibling as HTMLButtonElement
         menu.click()
         await tick()
-        const continueAction = [...document.querySelectorAll('span')].find(span => span.textContent === languageEnglish.continueResponse)!.parentElement!
+        const continueAction = [...document.querySelectorAll('span')].find(span => span.textContent === language.continueResponse)!.parentElement!
         continueAction.click()
     } else {
         type('Pending response')
@@ -729,5 +728,5 @@ it('reports a reroll whose tail could not be reopened as failed', async () => {
     }))
     type('').dispatchEvent(new KeyboardEvent('keydown', { key: 'm', ctrlKey: true, bubbles: true }))
     await vi.waitFor(() => expect(records).toEqual([endOf('failed', true)]))
-    expect(mocks.error).toHaveBeenCalledWith(languageEnglish.generationConversationChanged)
+    expect(mocks.error).toHaveBeenCalledWith(language.generationConversationChanged)
 })

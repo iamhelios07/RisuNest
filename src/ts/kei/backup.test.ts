@@ -3,7 +3,7 @@ import type { Database } from '../storage/database.svelte'
 
 let native = false
 const vaultRead = vi.fn()
-vi.mock('../platform', () => ({ get isTauri() { return native } }))
+vi.mock('../platform', async () => (await import('../platform.testSupport')).platformModule(() => ({ runtime: native ? 'tauri' : 'web', os: 'windows' })))
 vi.mock('../storage/nativeAccountCredential', () => ({
     createNativeAccountCredentialVault: () => ({ read: vaultRead }),
 }))
