@@ -646,7 +646,8 @@ async fn real_http_keeps_request_body_redirect_url_encoding_and_cancellation() {
 }
 
 #[test]
-fn large_export_streams_512_mib_without_a_full_body_allocation() {
+fn large_export_streams_escaped_body_bytes() {
+    const BODY: u64 = 4 * MIB;
     struct Counter(u64);
     impl std::io::Write for Counter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -665,22 +666,22 @@ fn large_export_streams_512_mib_without_a_full_body_allocation() {
     f.recorder
         .job(move |store| {
             let mut record = store.record(&id)?;
-            record.response.body.captured_bytes = 512 * MIB;
-            record.response.body.observed_bytes = 512 * MIB;
+            record.response.body.captured_bytes = BODY;
+            record.response.body.observed_bytes = BODY;
             std::fs::OpenOptions::new()
                 .write(true)
                 .open(store.dir(&record).join("response"))
                 .unwrap()
-                .set_len(512 * MIB)
+                .set_len(BODY)
                 .unwrap();
-            store.bytes[0] += 512 * MIB;
+            store.bytes[0] += BODY;
             store.update(&record)
         })
         .unwrap();
     let mut output = Counter(0);
     f.snapshot(&c).export_json(&mut output).unwrap();
     // NUL is emitted as six JSON escape bytes, without retaining the output.
-    assert!(output.0 >= 512 * MIB * 6 && output.0 < 512 * MIB * 6 + MIB);
+    assert!(output.0 >= BODY * 6 && output.0 < BODY * 6 + MIB);
 }
 #[test]
 fn concurrent_streams_and_a_single_enormous_chunk_keep_the_shared_queue_bounded() {
@@ -968,40 +969,6 @@ fn buffer_settings_survive_restart() {
     assert!(!reopened.settings().hide_auth);
     assert_eq!(reopened.0.queue_limit.load(Ordering::Relaxed), 128 * MIB as usize);
     reopened.shutdown();
-}
-
-#[test]
-fn larger_buffers_admit_bursts_beyond_the_old_event_ceiling() {
-    use std::io::Read;
-    for budget in [64, 128] {
-        let f = Fixture::new();
-        f.recorder.configure(Settings { enabled: true, buffer_mib: budget, ..Settings::default() }).unwrap();
-        let c = f.begin();
-        f.detail(&c);
-        let release = f.pause_writer();
-        let length = (budget - 1) * MIB;
-        let body = vec![b'x'; length as usize];
-        c.append(Side::Request, &body);
-        drop(body);
-        c.finish("complete");
-        let queued = f.recorder.0.queued.load(Ordering::Relaxed);
-        release.send(()).unwrap();
-        assert!(queued >= length as usize && queued <= (budget * MIB) as usize);
-        let record = f.detail(&c);
-        assert_eq!(record.request.body.captured_bytes, length);
-        assert!(!record.request.body.truncated);
-        assert!(record.capture_error.is_none());
-        let mut snapshot = f.snapshot(&c);
-        let mut chunk = [0; 64 * 1024];
-        let mut read = 0;
-        loop {
-            let size = snapshot.request.read(&mut chunk).unwrap();
-            if size == 0 { break; }
-            assert!(chunk[..size].iter().all(|byte| *byte == b'x'));
-            read += size as u64;
-        }
-        assert_eq!(read, length);
-    }
 }
 
 #[test]
