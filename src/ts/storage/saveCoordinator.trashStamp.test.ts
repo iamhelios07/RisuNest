@@ -1,5 +1,5 @@
 import {describe, expect, it, vi} from 'vitest'
-vi.mock('../platform', () => ({isTauri:true}))
+vi.mock('../platform', async () => (await import('../platform.testSupport')).platformModule({runtime:'tauri',os:'windows'}))
 import {SaveCoordinator} from './saveCoordinator'
 import type {PersistentDataStore, PersistentRevisionLease} from './persistentDataStore'
 import {RevisionConflictError} from './persistentDataStore'

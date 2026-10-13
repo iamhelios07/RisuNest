@@ -30,7 +30,6 @@ import {
     rebasePluginMutationPublication,
 } from './pluginMutationPublication'
 import { flushSync } from 'svelte'
-import { effect_root, render_effect } from 'svelte/internal/client'
 
 vi.mock('../parser/parser.svelte', () => ({
     assetRegex: /$^/,
@@ -229,8 +228,8 @@ describe('key-scoped plugin storage publication', () => {
             } as any)
             const adapter = createProductionStateAdapter()
             const observed: number[] = []
-            const dispose = effect_root(() => {
-                render_effect(() => {
+            const dispose = $effect.root(() => {
+                $effect(() => {
                     const storage = adapter.capturePluginStorage!()!
                     for (const entry of Object.keys(storage))
                         observed.push((storage[entry] as any).nested.count)
