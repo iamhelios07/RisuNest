@@ -27,9 +27,6 @@ const rawRecovery = vi.hoisted(() => ({
 }))
 vi.mock('@tauri-apps/api/core', () => core)
 vi.mock('src/ts/storage/rawRecoveryExport', () => rawRecovery)
-vi.mock('src/lang', async () => ({
-    language: (await import('src/lang/en')).languageEnglish,
-}))
 
 import RecoveryShell from './RecoveryShell.svelte'
 import { languageEnglish } from 'src/lang/en'

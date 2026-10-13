@@ -52,9 +52,6 @@ vi.mock('src/ts/platform', () => ({
 vi.mock('src/ts/storage/officialAccountMessage', () => ({
     isExpectedHubMessage: () => false,
 }))
-vi.mock('src/lang', () => ({
-    language: new Proxy({}, { get: (_target, key) => String(key) }),
-}))
 vi.mock('@lucide/svelte', async () => {
     const { default: Stub } = await import('./AlertCompDependencyStub.test.svelte')
     return {
@@ -95,6 +92,7 @@ vi.mock('./Help.svelte', async () => ({
     default: (await import('./AlertCompDependencyStub.test.svelte')).default,
 }))
 
+import { language } from 'src/lang'
 import { alertGenerationInfoStore } from '../../ts/alert'
 import AlertComp from './AlertComp.svelte'
 
@@ -184,8 +182,8 @@ describe('AlertComp branch view', () => {
         alertStore.set({ type: 'branches', msg: 'character' })
         const target = document.createElement('div'); document.body.append(target)
         mounted = mount(AlertComp, { target })
-        await vi.waitFor(() => expect(target.textContent).toContain('branchLoadFailed'))
-        ;[...target.querySelectorAll('button')].find(button => button.textContent === 'retry')!.click()
+        await vi.waitFor(() => expect(target.textContent).toContain(language.branchLoadFailed))
+        ;[...target.querySelectorAll('button')].find(button => button.textContent === language.retry)!.click()
         await vi.waitFor(() => expect(branchMocks.getChatBranches).toHaveBeenCalledTimes(2))
         const signal = branchMocks.getChatBranches.mock.calls[1][1] as AbortSignal
         alertStore.set({ type: 'none', msg: '' }); await tick()

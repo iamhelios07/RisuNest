@@ -17,7 +17,6 @@ vi.mock('src/ts/platform', () => ({
 vi.mock('src/ts/storage/nativePaths', () => ({ nativeRoots: f.roots }))
 vi.mock('src/ts/storage/rawRecoveryExport', () => ({ exportOriginalData: f.exportOriginalData }))
 vi.mock('src/ts/alert', () => ({ alertToast: vi.fn() }))
-vi.mock('src/lang', async () => ({ language: (await import('src/lang/en')).languageEnglish }))
 
 import BootFailurePanel from './BootFailurePanel.svelte'
 import { languageEnglish } from 'src/lang/en'
