@@ -250,6 +250,48 @@ mod tests {
         );
     }
 
+    /// A reply is sized without hashing, so a carried body is hashed once,
+    /// when the reply is encoded for sending. The source observer run checks
+    /// the same reply through its own copy of the wire code.
+    #[cfg(not(feature = "source-observer"))]
+    #[test]
+    fn a_carried_body_is_hashed_only_when_the_reply_is_encoded() {
+        use delta::source_test_observer::{install, Event};
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::init(directory.path()).unwrap();
+        let registration = store.add_device().unwrap();
+        let device = store
+            .authenticate(&registration.library_id, &registration.token)
+            .unwrap();
+        let bytes = body(0, 4096);
+        let target = hash(&bytes);
+        store.put_object(&device, &target, &bytes).unwrap();
+        let thread = std::thread::current().id();
+        let hashed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = hashed.clone();
+        install(std::sync::Arc::new(move |event: Event| {
+            if std::thread::current().id() == thread
+                && event.domain == "transfer-full-encode-sha256"
+            {
+                seen.lock().unwrap().push((event.calls, event.bytes));
+            }
+        }));
+        let encoded = store
+            .transfer_objects(
+                &device,
+                &[TransferRequest {
+                    target,
+                    bases: Vec::new(),
+                }],
+            )
+            .unwrap();
+        assert_eq!(*hashed.lock().unwrap(), [(1, bytes.len() as u64)]);
+        assert!(matches!(
+            transfer::decode(&encoded).unwrap().as_slice(),
+            [Frame::Full(carried)] if *carried == bytes
+        ));
+    }
+
     /// The deduplicated target and base union is leased once per bounded
     /// group, not once per object inside the reply loop.
     #[test]

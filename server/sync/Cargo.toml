@@ -40,6 +40,8 @@ windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32
 libc = "0.2"
 
 [dev-dependencies]
+# Lets the default tests observe the hashing inside sync-wire.
+risunest-sync-wire = { path = "../../crates/sync-wire", features = ["source-observer"] }
 tokio-tungstenite = "0.29"
 minisign = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
