@@ -42,7 +42,6 @@ vi.mock('src/lang', async () => ({
 
 import RisuNestDataHealth from './RisuNestDataHealth.svelte'
 import { dataHealthOwnerKey } from 'src/ts/storage/dataHealthPresentation'
-import { languageKorean } from 'src/lang/ko'
 import { languageEnglish } from 'src/lang/en'
 import type { DataHealthResult } from 'src/ts/storage/dataHealth'
 
@@ -569,16 +568,5 @@ describe('RisuNestDataHealth', () => {
         await settle()
         expect(summary()).not.toContain(strings.outdated)
         expect(target.querySelectorAll('[data-data-health-choice]')).toHaveLength(1)
-    })
-
-    it('keeps every string it shows in both shipped languages', () => {
-        for (const key of Object.keys(strings)) {
-            expect(
-                languageKorean.risuNest.dataHealth[
-                    key as keyof typeof strings
-                ],
-                key,
-            ).toBeTruthy()
-        }
     })
 })

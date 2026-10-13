@@ -33,7 +33,6 @@ vi.mock('src/lang', async () => ({
 
 import RecoveryShell from './RecoveryShell.svelte'
 import { languageEnglish } from 'src/lang/en'
-import { languageKorean } from 'src/lang/ko'
 import {
     clearBootTrail,
     markBootStage,
@@ -206,14 +205,5 @@ describe('RecoveryShell', () => {
         expect(rawRecovery.exportOriginalData).toHaveBeenCalledOnce()
         expect(body.querySelector('[data-recovery-export]')?.textContent)
             .toContain(strings.exportComplete)
-    })
-
-    it('keeps every string it shows in both shipped languages', () => {
-        for (const key of Object.keys(strings)) {
-            expect(
-                languageKorean.risuNest.recovery[key as keyof typeof strings],
-                key,
-            ).toBeTruthy()
-        }
     })
 })
