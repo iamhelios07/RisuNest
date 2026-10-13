@@ -5,7 +5,6 @@ import { DBState } from 'src/ts/stores.svelte'
 import { getDeviceSettings, reloadDeviceSettings, updateDeviceSettings } from 'src/ts/storage/deviceSettings'
 import CustomSidebar from './CustomSidebar.svelte'
 
-vi.mock('src/lang', () => ({ language: languageEnglish }))
 vi.mock('src/ts/parser/parser.svelte', () => ({ risuChatParser: (text: string) => text }))
 vi.mock('./ModelBind.svelte', () => ({ default: () => {} }))
 vi.mock('./PersonaBind.svelte', () => ({ default: () => {} }))
