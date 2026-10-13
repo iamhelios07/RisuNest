@@ -5,10 +5,7 @@ export const testSuffix = '**/*.{test,spec}.?(c|m)[jt]s?(x)'
 export const appRoots = ['src', 'tests', 'scripts', 'src-tauri/src']
 export const appTestIncludes = appRoots.map(root => `${root}/${testSuffix}`)
 export const extendedAppTests = ['src/ts/storage/selectedConversationEvictionCorpus.test.ts']
-export const harnessVitestTests = [
-  `benchmarks/${testSuffix}`,
-  'src/ts/process/luaWorkerPilotClient.test.ts',
-]
+export const harnessVitestTests = [`benchmarks/${testSuffix}`]
 export const nodeTestExceptions = [
   'crates/sync-wire/tests/golden.test.mjs',
   'benchmarks/sync-server/transfer-comparison.test.mjs',

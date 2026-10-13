@@ -15,7 +15,6 @@ test('classifies ordinary, extended, harness, Node and independent entries', () 
     ['scripts/example.spec.mjs', 'app'],
     ['src-tauri/src/ios_ipc.test.ts', 'app'],
     ['benchmarks/tokenizer/nativeTokenizerBenchmark.test.ts', 'harness'],
-    ['src/ts/process/luaWorkerPilotClient.test.ts', 'harness'],
     ['tests/release/contract.node-test.mjs', 'node'],
     ['benchmarks/sync-server/transfer-comparison.test.mjs', 'harness-node'],
     ['benchmarks/startup/startup.node-test.mjs', 'harness-node'],
