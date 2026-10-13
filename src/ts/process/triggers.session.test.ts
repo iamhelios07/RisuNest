@@ -222,6 +222,34 @@ test.each(['command', 'v2Command'] as const)(
     },
 )
 
+test.each(['command', 'v2Command'] as const)(
+    'commits earlier Trigger variables before %s effects so /setvar keeps the last write',
+    async (type) => {
+        const { chat, char, session } = fixture()
+        char.triggerscript[0].effect = [
+            { type: 'setvar', var: 'state', value: 'trigger', operator: '=' },
+            { type, value: '/setvar key=state command', valueType: 'value' },
+        ] as never
+        runtime.session = session
+        DBState.db = {
+            characters: [char],
+            templateDefaultVariables: '',
+        } as never
+        let seenByCommand: unknown
+        // `/getvar` reads the stored chat, and `/setvar` commits through the session that owns it.
+        vi.mocked(processMultiCommand).mockImplementationOnce(async () => {
+            seenByCommand = chat.scriptstate?.$state
+            session.updateChatVariables(new Map([['state', 'command']]))
+            return ''
+        })
+
+        await runTrigger(char, 'manual', { chat, manualName: 'ordered' })
+
+        expect(seenByCommand).toBe('trigger')
+        expect(chat.scriptstate).toEqual({ $state: 'command' })
+    },
+)
+
 test('CAS-applies Trigger chat variables and note metadata', async () => {
     const { chat, char, session } = fixture()
     char.triggerscript[0].effect = [
@@ -295,7 +323,8 @@ test('keeps eager Trigger metadata on its original owner after a later error', a
 
     expect(chat.scriptstate).toEqual({ '$state': '' })
     expect(chat.note).toBe('partial note')
-    expect(session.version).toBe(1)
+    // The variable commits before the command runs, and the note after it fails.
+    expect(session.version).toBe(2)
     expect(session.activePinReasons).toEqual([])
 })
 

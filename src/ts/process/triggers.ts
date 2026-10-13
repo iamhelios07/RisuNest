@@ -1212,6 +1212,8 @@ async function runTriggerImpl(char: character, mode: triggerMode, arg: RunTrigge
     }
     const commandOperation = () => {
         if (!access) return conversationOperation ?? undefined
+        // Commands such as /getvar and /setvar use the stored chat variables.
+        access.flushVariables()
         const operation = access.writeOperation()
         adoptChat(operation.chat)
         return operation
