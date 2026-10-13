@@ -5,8 +5,8 @@ import { IndexedDbPersistentDataStore } from './indexedDbPersistentDataStore'
 import type {
     ConversationWindow,
     PersistentDataStore,
-    PersistentRevisionLease,
 } from './persistentDataStore'
+import { createLeaseStub } from './persistentDataStore.testSupport'
 import { RevisionConflictError } from './persistentDataStore'
 import { copyPinnedConversationBranch } from './conversationBranchJobs'
 
@@ -45,11 +45,11 @@ describe('pinned conversation branch jobs', () => {
                 hasMoreAfter: startIndex + limit < source.length,
             },
         }))
-        const lease = {
+        const lease = createLeaseStub({
             revision: 7,
             readConversationWindow,
             release,
-        } as unknown as PersistentRevisionLease
+        })
         const commit = vi.fn(async () => ({ revision: 8 }))
         const store = {
             acquireRevision: vi.fn(async () => lease),
@@ -118,7 +118,7 @@ describe('pinned conversation branch jobs', () => {
         const source = [message('zero', 'zero')]
         const release = vi.fn(async () => undefined)
         const beforeCommit = vi.fn(async () => undefined)
-        const lease = {
+        const lease = createLeaseStub({
             revision: 3,
             readConversationWindow: vi.fn(async () => ({
                 revision: 3,
@@ -134,7 +134,7 @@ describe('pinned conversation branch jobs', () => {
                 },
             })),
             release,
-        } as unknown as PersistentRevisionLease
+        })
         const commit = vi.fn(async () => ({ revision: 4 }))
         const store = {
             acquireRevision: vi.fn(async () => lease),
@@ -197,8 +197,10 @@ describe('pinned conversation branch jobs', () => {
         expect(release).toHaveBeenCalledOnce()
     })
 
-    it('matches the canonical legacy branch for a 10,000-turn source', async () => {
-        const messages = Array.from({ length: 10_000 }, (_, index) => message(
+    it('matches the canonical legacy branch across pages, with the marker opening one more', async () => {
+        // Three full source pages, so the appended marker needs a fourth branch page.
+        const turns = 3 * 128
+        const messages = Array.from({ length: turns }, (_, index) => message(
             `turn-${index.toString().padStart(5, '0')}`,
             index % 3 === 0 ? 'duplicate' : index % 3 === 1 ? undefined : `id-${index}`,
         ))
@@ -279,17 +281,15 @@ describe('pinned conversation branch jobs', () => {
 
         expect(result).toMatchObject({
             sourceStartIndex: 0,
-            sourceEndIndex: 10_000,
-            sourceTotalMessages: 10_000,
+            sourceEndIndex: turns,
+            sourceTotalMessages: turns,
             branchRevision: imported.revision + 1,
         })
-        expect(readPages).toHaveBeenCalledTimes(Math.ceil(10_000 / 128))
+        expect(readPages).toHaveBeenCalledTimes(3)
         expect(readPages!.mock.calls.every(([query]) => query.limit <= 128)).toBe(true)
         expect(readPages!.mock.calls[0][0]).toMatchObject({ startIndex: 0, limit: 128 })
         expect(readPages!.mock.calls[1][0]).toMatchObject({ startIndex: 128, limit: 128 })
-        expect(occurrencePuts).toBe(
-            Math.ceil(messages.length / 128) + Math.ceil((messages.length + 1) / 128),
-        )
+        expect(occurrencePuts).toBe(3 + 4)
 
         const expected = structuredClone(database)
         expected.characters[0].chats.unshift({
@@ -318,11 +318,11 @@ describe('pinned conversation branch jobs', () => {
                 },
             }
         })
-        const lease = {
+        const lease = createLeaseStub({
             revision: 4,
             readConversationWindow,
             release,
-        } as unknown as PersistentRevisionLease
+        })
         const commit = vi.fn()
         const store = {
             acquireRevision: vi.fn(async () => lease),
@@ -346,13 +346,13 @@ describe('pinned conversation branch jobs', () => {
 
     it('releases the lease and leaves commit untouched on source failure or revision conflict', async () => {
         const releaseAfterReadFailure = vi.fn(async () => undefined)
-        const readFailureLease = {
+        const readFailureLease = createLeaseStub({
             revision: 5,
             readConversationWindow: vi.fn(async () => {
                 throw new Error('source read failed')
             }),
             release: releaseAfterReadFailure,
-        } as unknown as PersistentRevisionLease
+        })
         const noCommit = vi.fn()
         const readFailureStore = {
             acquireRevision: vi.fn(async () => readFailureLease),
@@ -374,7 +374,7 @@ describe('pinned conversation branch jobs', () => {
         expect(releaseAfterReadFailure).toHaveBeenCalledOnce()
 
         const releaseAfterConflict = vi.fn(async () => undefined)
-        const conflictLease = {
+        const conflictLease = createLeaseStub({
             revision: 5,
             readConversationWindow: vi.fn(async () => ({
                 revision: 5,
@@ -390,7 +390,7 @@ describe('pinned conversation branch jobs', () => {
                 },
             })),
             release: releaseAfterConflict,
-        } as unknown as PersistentRevisionLease
+        })
         const conflictCommit = vi.fn(async () => {
             throw new RevisionConflictError(5, 6)
         })

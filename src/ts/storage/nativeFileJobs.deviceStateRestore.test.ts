@@ -1,9 +1,11 @@
 import { afterEach, expect, it, vi } from 'vitest'
 
-const effects = vi.hoisted(() => ({ hub: vi.fn(), log: vi.fn(async () => {}) }))
-vi.mock('../platform', () => ({ isTauri: true, isTauriIOS: false }))
+const effects = vi.hoisted(() => ({ hub: vi.fn() }))
+vi.mock('../platform', async () => (await import('../platform.testSupport')).platformModule({ runtime: 'tauri', os: 'windows' }))
 vi.mock('../characterCards', () => ({ applyHubSelection: effects.hub }))
-vi.mock('../nativeLog', () => ({ setNativeLogFileEnabled: effects.log }))
+vi.mock('@tauri-apps/api/core', async importOriginal => ({
+    ...await importOriginal<typeof import('@tauri-apps/api/core')>(), invoke: vi.fn(async () => undefined),
+}))
 vi.mock('./sync/bindingRegistry',()=>({prepareBoundLibraryReplacement:async()=>({bound:false,state:{targetAuthority:'0'},fence:async()=>{},assertAuthority:async()=>{},resume:async()=>{}})}))
 vi.mock('./upstreamReplacement',()=>({confirmUpstreamLibraryReplacement:async()=>true,acquireUpstreamImportPause:async(runtime:{acquireDestructiveReplacementFence():Promise<{release():void}>})=>{
     const fence=await runtime.acquireDestructiveReplacementFence()
@@ -12,6 +14,7 @@ vi.mock('./upstreamReplacement',()=>({confirmUpstreamLibraryReplacement:async()=
 }}))
 vi.mock('../plugins/apiV3/v3.svelte',()=>({fencePluginExecutionForAuthorityReplacement:async()=>{},invalidatePluginCachesAfterAuthorityReplacement:async()=>{},restartPluginsAfterAuthorityReplacement:async()=>{}}))
 
+import { invoke } from '@tauri-apps/api/core'
 import { runNativeArchiveRestore, NativeFileJobActivationCommittedError, type NativeFileJobStatus } from './nativeFileJobs'
 import { initializeDeviceMarkers, installDeviceMarkers, getDeviceMarkers } from './deviceMarkers'
 import { reloadDeviceSettings, getDeviceSettings, updateDeviceSettings } from './deviceSettings'
@@ -109,7 +112,7 @@ it.each([false,true])('adopts empty device settings before body completion and r
         else await expect(running).resolves.toEqual(result)
         expect(events).toEqual(bodyFailure ? ['activate','ack','projection','release'] : ['activate', 'ack', 'projection', 'release', 'forget'])
         expect(updates).toHaveBeenLastCalledWith(expect.objectContaining({ autoUpdateCheck: true, skippedVersion: '' }))
-        expect(effects.log).toHaveBeenCalledExactlyOnceWith(true)
+        expect(invoke).toHaveBeenCalledExactlyOnceWith('native_log_set_file_enabled', { enabled: true })
         expect(effects.hub).toHaveBeenCalledExactlyOnceWith(markers)
     } finally { unsubscribe() }
 })

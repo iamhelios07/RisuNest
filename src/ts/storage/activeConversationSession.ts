@@ -1,6 +1,6 @@
 import type { Chat, Message } from './database.svelte'
 import { CONVERSATION_RANGE_MAX_LIMIT, type DataRevision } from './persistentDataStore'
-import { safeStructuredClone } from '../polyfill'
+import { safeStructuredClone } from '../safeStructuredClone'
 import { replaceArrayRange } from '../arrayRange'
 import {
     SegmentedConversationResidency,

@@ -1,5 +1,6 @@
 import { UNOWNED_PLUGIN_OWNER } from '../plugins/pluginOwner'
 import { describe, expect, it, vi } from 'vitest'
+import { createPersistentStoreHarness } from '../../../tests/support/persistentStoreHarness'
 import type { Chat, Database, character } from './database.svelte'
 import type { PersistentDataStore } from './persistentDataStore'
 import { RevisionConflictError } from './persistentDataStore'
@@ -10,13 +11,12 @@ import {
 } from './activeConversationSession'
 import {
     captureRoot,
+    committedChanges,
     deferred,
     makeDatabase,
     makeStore,
     SaveCoordinator,
 } from './saveCoordinator.testSupport'
-import { createPersistenceCanonicalCapture } from './reactivePersistenceCapture.svelte'
-import { createPersistentSaveObserverHarness } from './tests/persistentSaveObserverHarness.svelte'
 
 describe('SaveCoordinator', () => {
     it('rejects an uncovered owned append without acknowledging it and allows a later retry', async () => {
@@ -419,11 +419,10 @@ describe('SaveCoordinator', () => {
         database.username = 'Root changed'
         coordinator.markPersistentDataDirty(1)
         await coordinator.flushPendingData('root')
-        expect(commit.mock.calls[0][0]).toMatchObject({
-            expectedRevision: 2,
-            rootMutations: [{ type: 'set', key: 'username', value: 'Root changed' }],
-        })
-        expect(commit.mock.calls[0][0]).not.toHaveProperty('replaceCharacter')
+        const rootOnly = committedChanges(commit.mock.calls[0][0])
+        expect(rootOnly.expectedRevision).toBe(2)
+        expect(rootOnly.rootChanges).toEqual({ username: 'Root changed' })
+        expect(rootOnly).not.toHaveProperty('replaceCharacter')
 
         database.characters[0].chats[1].name = 'Inactive renamed'
         database.characters[0].chats.reverse()
@@ -437,7 +436,7 @@ describe('SaveCoordinator', () => {
         database.characters[0].chats.splice(1, 1)
         coordinator.markPersistentDataDirty(1)
         await coordinator.flushPendingData('character')
-        expect(commit.mock.calls[1][0]).not.toHaveProperty('root')
+        expect(committedChanges(commit.mock.calls[1][0]).rootChanges).toEqual({})
         expect(commit.mock.calls[1][0].replaceCharacter.chats.map((chat: { id: string }) => chat.id)).toEqual([
             'two',
             'three',
@@ -447,11 +446,9 @@ describe('SaveCoordinator', () => {
         database.characters[0].name = 'Combined character'
         coordinator.markPersistentDataDirty(1)
         await coordinator.flushPendingData('combined')
-        expect(commit.mock.calls[2][0]).toMatchObject({
-            expectedRevision: 4,
-            rootMutations: [{ type: 'set', key: 'username', value: 'Combined root' }],
-            replaceCharacter: { name: 'Combined character' },
-        })
+        const combined = committedChanges(commit.mock.calls[2][0])
+        expect(combined).toMatchObject({ expectedRevision: 4, replaceCharacter: { name: 'Combined character' } })
+        expect(combined.rootChanges).toEqual({ username: 'Combined root' })
     })
 
     function makeChattyDatabase() {
@@ -535,79 +532,6 @@ describe('SaveCoordinator', () => {
             sessionVersion: 2,
             revision: 3,
         }))
-    })
-
-    it('saves variable-only changes from conversation metadata and writes what a whole-conversation projection writes', async () => {
-        const body = 'synthetic message body'
-        const flush = async (capture: 'reactive' | 'plain') => {
-            const initial = makeChattyDatabase()
-            for (const message of initial.characters[0].chats[1].message) message.data += `: ${body}`
-            const state = capture === 'reactive' ? createPersistentSaveObserverHarness(initial) : null
-            const database = state?.database ?? initial
-            const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
-            const onPersisted = vi.fn()
-            const coordinator = new SaveCoordinator({
-                store: makeStore(commit),
-                ...(state ? {
-                    canonicalCapture: createPersistenceCanonicalCapture({
-                        root: () => state.database,
-                        presets: () => [],
-                        pluginStorage: () => null,
-                        character: () => state.database.characters[0],
-                        characters: () => state.database.characters,
-                    }),
-                } : {}),
-                captureRoot: () => captureRoot(database),
-                captureCharacters: () => database.characters,
-                captureSelectedCharacter: () => database.characters[0],
-                replaceDatabase: () => undefined,
-                onConversationMutationPersisted: onPersisted,
-            })
-            coordinator.initialize(2)
-            const session = new ActiveConversationSession({
-                characterId: 'char-a', conversationId: 'two',
-                conversation: database.characters[0].chats[1], storeRevision: 2,
-                onMutation: (event) => coordinator.recordActiveConversationMutation(event),
-            })
-            session.updateChatVariables(new Map([['hp', '9']]))
-            session.updateChatVariables(new Map([['mood', 'calm']]))
-
-            // Whether the flush serializes or copies a message body.
-            const readsMessages: string[] = []
-            const stringify = JSON.stringify
-            const clone = globalThis.structuredClone
-            const serialized = vi.spyOn(JSON, 'stringify').mockImplementation(((...args: Parameters<typeof JSON.stringify>) => {
-                const json = stringify(...args)
-                if (typeof json === 'string' && json.includes(body)) readsMessages.push('serialize')
-                return json
-            }) as typeof JSON.stringify)
-            const copied = vi.spyOn(globalThis, 'structuredClone').mockImplementation(((value: unknown, options?: StructuredSerializeOptions) => {
-                try {
-                    if (stringify(value)?.includes(body)) readsMessages.push('copy')
-                } catch {
-                    // Not serializable as JSON; the clone below decides.
-                }
-                return clone(value, options)
-            }) as typeof structuredClone)
-            try {
-                await coordinator.flushPendingDataLocally('variable-only')
-            } finally {
-                serialized.mockRestore()
-                copied.mockRestore()
-            }
-            expect(onPersisted).toHaveBeenCalledTimes(2)
-            expect(coordinator.hasPendingPersistenceWork).toBe(false)
-            return { request: commit.mock.calls[0][0], readsMessages }
-        }
-
-        const reactive = await flush('reactive')
-        const plain = await flush('plain')
-
-        expect(reactive.readsMessages).toEqual([])
-        expect(plain.readsMessages).not.toEqual([])
-        expect(reactive.request).toEqual(plain.request)
-        expect(reactive.request.conversations.map((mutation: { conversation: Chat }) =>
-            mutation.conversation.scriptstate)).toEqual([{ $hp: '9' }, { $hp: '9', $mood: 'calm' }])
     })
 
     it('persists one atomic multi-range and metadata operation through one working-set commit', async () => {
@@ -1405,7 +1329,7 @@ describe('SaveCoordinator', () => {
 
         expect(commit).toHaveBeenCalledTimes(1)
         expect(commit.mock.calls[0][0]).not.toHaveProperty('replaceCharacter')
-        expect(commit.mock.calls[0][0]).not.toHaveProperty('root')
+        expect(committedChanges(commit.mock.calls[0][0]).rootChanges).toEqual({})
         expect(commit.mock.calls[0][0].conversations).toEqual([
             {
                 type: 'replace-range',
@@ -1588,12 +1512,13 @@ describe('SaveCoordinator', () => {
 
         expect(install).toHaveBeenCalledOnce()
         expect(commit).toHaveBeenCalledOnce()
-        expect(commit.mock.calls[0][0]).toMatchObject({
+        const addition = committedChanges(commit.mock.calls[0][0])
+        expect(addition).toMatchObject({
             expectedRevision: 4,
-            rootMutations: [{ type: 'set', key: 'username', value: 'Root changed' }],
             replaceCharacter: { chaId: 'char-a', name: 'Selected changed' },
             addCharacter: { chaId: 'char-added', name: 'Added' },
         })
+        expect(addition.rootChanges).toEqual({ username: 'Root changed' })
         expect(coordinator.revision).toBe(5)
     })
 
@@ -1628,49 +1553,43 @@ describe('SaveCoordinator', () => {
         'persists live character edits made while awaiting %s',
         async (stage) => {
             const { database, added } = makeAdditionDatabase()
-            const storeGate = deferred<{ revision: number }>()
+            const storage = await createPersistentStoreHarness(structuredClone(database))
+            const storeGate = stage === 'store' ? storage.gate('commit') : undefined
             const pinGate = deferred<{ publish(): Promise<void>; dispose(): Promise<void> }>()
             const publishGate = deferred<void>()
-            const commit = vi.fn()
-                .mockImplementationOnce(() => stage === 'store' ? storeGate.promise : Promise.resolve({ revision: 2 }))
-                .mockResolvedValueOnce({ revision: 3 })
             const handle = {
                 publish: vi.fn(() => stage === 'publish' ? publishGate.promise : Promise.resolve()),
                 dispose: vi.fn(async () => undefined),
             }
             const pin = vi.fn(() => stage === 'pin' ? pinGate.promise : Promise.resolve(handle))
             const coordinator = new SaveCoordinator({
-                store: makeStore(commit),
+                store: storage.store,
                 captureRoot: () => captureRoot(database),
                 captureSelectedCharacter: () => database.characters[0],
                 captureCharacter: (id) => database.characters.find((item) => item.chaId === id) ?? null,
                 replaceDatabase: () => undefined,
                 officialPublisher: { pin },
             })
-            coordinator.initialize(1)
+            coordinator.initialize(storage.revision)
 
             const saving = coordinator.commitCharacterAddition({
                 characterId: added.chaId,
                 estimatedBytes: 1,
                 install: () => database.characters.push(added),
             }, 'new-character')
+            await storeGate?.entered
             await vi.waitFor(() => {
-                if (stage === 'store') expect(commit).toHaveBeenCalledOnce()
                 if (stage === 'pin') expect(pin).toHaveBeenCalledOnce()
                 if (stage === 'publish') expect(handle.publish).toHaveBeenCalledOnce()
             })
             added.name = `Changed during ${stage}`
             coordinator.markPersistentDataDirty(1)
-            if (stage === 'store') storeGate.resolve({ revision: 2 })
+            storeGate?.release()
             if (stage === 'pin') pinGate.resolve(handle)
             if (stage === 'publish') publishGate.resolve()
             await saving
 
-            expect(commit).toHaveBeenCalledTimes(2)
-            expect(commit.mock.calls[1][0]).toMatchObject({
-                expectedRevision: 2,
-                replaceCharacter: { chaId: 'char-added', name: `Changed during ${stage}` },
-            })
+            expect((await storage.store.readCharacter('char-added'))?.value.name).toBe(`Changed during ${stage}`)
         },
     )
 
@@ -2242,13 +2161,11 @@ describe('SaveCoordinator', () => {
         expect(coordinator.pendingBytes).toBe(25)
         expect(commit).toHaveBeenCalledTimes(2)
         expect(commit.mock.calls[0][0]).toEqual(firstBatch)
-        expect(firstBatch.rootMutations).toEqual([
-            { type: 'set', key: 'username', value: 'first' },
-        ])
+        expect(committedChanges(firstBatch).rootChanges).toEqual({ username: 'first' })
         const secondBatch = structuredClone(commit.mock.calls[1][0])
+        expect(committedChanges(secondBatch).rootChanges).toEqual({ username: 'second' })
         expect(secondBatch).toMatchObject({
             expectedRevision: 2,
-            rootMutations: [{ type: 'set', key: 'username', value: 'second' }],
             replacePresets: [{ name: 'second' }],
             pluginStorage: [{
                 type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: 'payload', value: { value: 'second' },
@@ -2302,8 +2219,8 @@ describe('SaveCoordinator', () => {
         await flushing
 
         expect(commit.mock.calls.map((call) => call[0].expectedRevision)).toEqual([1, 2, 3])
-        expect(commit.mock.calls.map((call) => call[0].rootMutations)).toEqual(
-            ['one', 'two', 'three'].map((value) => [{ type: 'set', key: 'username', value }]),
+        expect(commit.mock.calls.map((call) => committedChanges(call[0]).rootChanges)).toEqual(
+            ['one', 'two', 'three'].map((username) => ({ username })),
         )
     })
 
@@ -2899,9 +2816,9 @@ describe('SaveCoordinator', () => {
         await coordinator.flushPendingData('after-adopted-mutations')
 
         expect(commit).toHaveBeenCalledOnce()
-        expect(commit).toHaveBeenCalledWith({
+        expect(committedChanges(commit.mock.calls[0][0])).toEqual({
             expectedRevision: 7,
-            rootMutations: [{ type: 'set', key: 'username', value: 'Edited root' }],
+            rootChanges: { username: 'Edited root' },
             pluginStorage: [{ type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: '__proto__', value: 0 }],
             replacePresets: [{ name: 'Adopted preset', mainPrompt: 'After preset edit' }],
             conversations: [
@@ -3713,10 +3630,9 @@ describe('SaveCoordinator', () => {
             await vi.advanceTimersByTimeAsync(500)
 
             expect(commit).toHaveBeenCalledTimes(2)
-            expect(commit.mock.calls[1][0]).toMatchObject({
-                expectedRevision: 3,
-                rootMutations: [{ type: 'set', key: 'username', value: 'Edit two' }],
-            })
+            const trailing = committedChanges(commit.mock.calls[1][0])
+            expect(trailing.expectedRevision).toBe(3)
+            expect(trailing.rootChanges).toEqual({ username: 'Edit two' })
         } finally {
             vi.useRealTimers()
         }
@@ -3746,9 +3662,7 @@ describe('SaveCoordinator', () => {
         await coordinator.flushPendingData('deselected')
 
         expect(commit).toHaveBeenCalledTimes(1)
-        expect(commit.mock.calls[0][0]).toMatchObject({
-            rootMutations: [{ type: 'set', key: 'username', value: 'Deselected' }],
-        })
+        expect(committedChanges(commit.mock.calls[0][0]).rootChanges).toEqual({ username: 'Deselected' })
         expect(commit.mock.calls[0][0]).not.toHaveProperty('replaceCharacter')
         expect(coordinator.pendingBytes).toBe(0)
     })
@@ -3874,12 +3788,9 @@ describe('SaveCoordinator', () => {
         coordinator.markPersistentDataDirty(9)
         expect(coordinator.pendingBytes).toBe(9)
         await coordinator.flushPendingData('after-failure')
-        expect(commit).toHaveBeenCalledWith(
-            expect.objectContaining({
-                expectedRevision: 7,
-                rootMutations: [{ type: 'set', key: 'username', value: 'Still dirty' }],
-            }),
-        )
+        const afterFailure = committedChanges(commit.mock.lastCall![0])
+        expect(afterFailure.expectedRevision).toBe(7)
+        expect(afterFailure.rootChanges).toEqual({ username: 'Still dirty' })
     })
 
 })

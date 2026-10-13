@@ -84,23 +84,11 @@ vi.mock('src/ts/alert', () => ({
     alertError: vi.fn(),
     alertInput: vi.fn(),
 }))
-vi.mock('src/lang', () => ({
-    language: {
-        expandAll: 'Expand all',
-        loading: 'Loading bookmarks',
-        bookmarkLoadFailed: 'Could not load bookmarks',
-        noBookmarks: 'No bookmarks',
-        retry: 'Retry',
-        collapseAll: 'Collapse all',
-        chatDataLoadFailed: 'Synthetic chat load failed',
-        loadingChatData: 'Loading synthetic chat',
-        hypaV3Modal: { retry: 'Retry' },
-    },
-}))
 vi.mock('../ChatScreens/Chat.svelte', async () => ({
     default: (await import('./BookmarkChatProbe.test.svelte')).default,
 }))
 
+import { language } from 'src/lang'
 import BookmarkList from './BookmarkList.svelte'
 import { selectedCharID } from 'src/ts/stores.svelte'
 
@@ -410,7 +398,7 @@ test('failed display lease acquisition renders only an error until retry succeed
         ).not.toBeNull(),
     )
     expect(target.querySelector('[role="alert"]')?.textContent).toContain(
-        'Synthetic chat load failed',
+        language.chatDataLoadFailed,
     )
     expect(mounts).toHaveLength(0)
     expect(target.querySelector('[data-bookmark-chat]')).toBeNull()
@@ -418,7 +406,7 @@ test('failed display lease acquisition renders only an error until retry succeed
     const retry = target.querySelector(
         '[data-live-display-load-error] button',
     ) as HTMLButtonElement
-    expect(retry.textContent).toBe('Retry')
+    expect(retry.textContent).toBe(language.hypaV3Modal.retry)
     retry.click()
     await tick()
     expect(state.acquireCompleteConversation).toHaveBeenCalledTimes(2)
@@ -482,15 +470,15 @@ test('keeps bookmark loading distinct from empty and offers retry after a read f
     state.acquireRevision.mockReturnValueOnce(new Promise((_resolve, fail) => { reject = fail }))
     mounted = mount(BookmarkList, { target })
     await tick()
-    expect(target.textContent).toContain('Loading bookmarks')
-    expect(target.textContent).not.toContain('No bookmarks')
+    expect(target.textContent).toContain(language.loading)
+    expect(target.textContent).not.toContain(language.noBookmarks)
     reject(new Error('synthetic read failure'))
-    await vi.waitFor(() => expect(target.textContent).toContain('Could not load bookmarks'))
-    expect(target.textContent).not.toContain('No bookmarks')
+    await vi.waitFor(() => expect(target.textContent).toContain(language.bookmarkLoadFailed))
+    expect(target.textContent).not.toContain(language.noBookmarks)
     state.acquireRevision.mockResolvedValue(lease)
-    ;([...target.querySelectorAll('button')].find(button => button.textContent === 'Retry') as HTMLButtonElement).click()
+    ;([...target.querySelectorAll('button')].find(button => button.textContent === language.retry) as HTMLButtonElement).click()
     await vi.waitFor(() => expect(target.querySelector('[role="button"]')).not.toBeNull())
-    expect(target.textContent).not.toContain('Could not load bookmarks')
+    expect(target.textContent).not.toContain(language.bookmarkLoadFailed)
     expect(state.acquireRevision).toHaveBeenCalledTimes(2)
 })
 
@@ -513,6 +501,6 @@ test('retries a stale bookmark revision before presenting a current result', asy
     mounted = mount(BookmarkList, { target })
     await vi.waitFor(() => expect(target.querySelector('[role="button"]')).not.toBeNull())
     expect(state.acquireRevision).toHaveBeenCalledTimes(2)
-    expect(target.textContent).not.toContain('No bookmarks')
-    expect(target.textContent).not.toContain('Could not load bookmarks')
+    expect(target.textContent).not.toContain(language.noBookmarks)
+    expect(target.textContent).not.toContain(language.bookmarkLoadFailed)
 })

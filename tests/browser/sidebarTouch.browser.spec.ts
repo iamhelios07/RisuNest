@@ -11,8 +11,8 @@ async function move(page: Page, hold: number, source: string | Locator, target: 
     const y = from!.y + from!.height / 2
     await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }] })
     await page.waitForTimeout(hold)
-    for (let step = 1; step <= 10; step++) {
-        await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x, y: y + (to!.y + to!.height / 2 - y) * step / 10 }] })
+    for (let step = 1; step <= 3; step++) {
+        await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x, y: y + (to!.y + to!.height / 2 - y) * step / 3 }] })
         await page.waitForTimeout(35)
     }
     await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] })

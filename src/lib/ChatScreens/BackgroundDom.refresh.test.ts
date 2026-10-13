@@ -40,7 +40,7 @@ vi.mock('src/ts/liveDisplayParserLease', () => ({
     },
     acquireLiveDisplayParserLease: state.acquire,
 }))
-vi.mock('src/ts/parser/parser.svelte', () => ({
+vi.mock('src/ts/parser/parser.svelte', async () => (await import('src/ts/parser/parser.testSupport')).parserStubModule({
     risuChatParser: (value: string) => value,
     ParseMarkdown: state.parse,
 }))

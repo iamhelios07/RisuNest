@@ -8,7 +8,7 @@ import {
 } from '../storage/activeConversationSession'
 import type { Chat, Database, Message } from '../storage/database.svelte'
 import { peekActiveConversationSession } from '../storage/persistentDataRuntime.svelte'
-import { safeStructuredClone } from '../polyfill'
+import { safeStructuredClone } from '../safeStructuredClone'
 import { parseKeyValue } from '../util'
 import { getHistoryMessageAt } from './historyWindowIndex'
 import { noteChatVariableRead } from './scriptVariableReads'

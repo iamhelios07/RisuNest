@@ -1,13 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { get } from 'svelte/store'
 
-vi.mock('../parser/parser.svelte', () => ({
-    assetRegex: /$^/,
-    hasher: vi.fn(async () => 'hash'),
-    parseMarkdownSafe: (value: string) => value,
-    ParseMarkdown: vi.fn(async (value: string) => value),
-    risuChatParser: (value: string) => value,
-}))
+vi.mock('../parser/parser.svelte', async () => (await import('../parser/parser.testSupport')).parserStubModule())
 
 import { ReloadGUIPointer, selectedCharID } from '../stores.svelte'
 import {
