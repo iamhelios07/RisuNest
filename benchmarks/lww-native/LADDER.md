@@ -90,3 +90,15 @@ The driver builds `cargo test --release --lib --no-run` in `src-tauri` with `RUS
 | `phaseWallMs` | wall time including setup |
 
 One line per child process (`risunest.lww-ladder-process/v1`): `rung`, `group` (`construct` for rung construction), `pid`, `exitCode`, `wallMs`, `peakWorkingSet`, `peakPrivateBytes`, polled values, `log`.
+
+## Sync server source process
+
+The final matrix and the ignored `actual_source_*` tests in `persistent_store::benchmark_lww` start the Sync server library test binary named by `LWW_SOURCE_TEST_EXE` and drive its `source_observer_harness::serve` test. The observer compiles only into Sync server test builds with the `source-observer` feature; a binary built without it has no `serve` test. Build it from the repository root with the same toolchain and shared target as the driver:
+
+```powershell
+$env:RUSTUP_TOOLCHAIN = '1.97.1'
+$env:CARGO_TARGET_DIR = '<main checkout>/src-tauri/target'
+cargo test --manifest-path server/sync/Cargo.toml --release --locked --lib --no-run --features source-observer
+```
+
+`LWW_SOURCE_TEST_EXE` is the `unittests src/lib.rs` executable Cargo prints, and `LWW_SOURCE_BINARY_SHA` is its SHA-256. `serve` refuses a `LWW_SOURCE_FINGERPRINT` that differs from the source identity compiled into it.

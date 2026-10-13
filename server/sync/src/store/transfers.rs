@@ -1,11 +1,11 @@
 use super::{Device, Store};
-#[cfg(test)]
+#[cfg(all(test, feature = "source-observer"))]
 use crate::source_observer::shared_wire::{
     delta,
     transfer::{self, Frame},
 };
 use crate::{Error, Result};
-#[cfg(not(test))]
+#[cfg(not(all(test, feature = "source-observer")))]
 use risunest_sync_wire::{
     delta,
     transfer::{self, Frame},
@@ -21,7 +21,7 @@ pub struct TransferRequest {
 }
 impl Store {
     pub fn receive_frames(&self, device: &Device, bytes: &[u8]) -> Result<Vec<String>> {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "source-observer"))]
         let _observed = crate::source_observer::ingress(&self.root);
         #[cfg(test)]
         let measured = std::time::Instant::now();
@@ -68,7 +68,7 @@ impl Store {
             let digest = hash(&bytes);
             #[cfg(test)]
             super::objects::frame_metrics::hashed("frame", bytes.len());
-            #[cfg(test)]
+            #[cfg(all(test, feature = "source-observer"))]
             crate::source_observer::hashed(&digest, "frame-ingress-sha256", bytes.len());
             #[cfg(test)]
             super::objects::frame_metrics::record(1, measured);
@@ -87,7 +87,7 @@ impl Store {
         device: &Device,
         requests: &[TransferRequest],
     ) -> Result<Vec<u8>> {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "source-observer"))]
         let _observed = crate::source_observer::operation(&self.root);
         if requests.len() > 1024 {
             return Err(Error::new("too-many-candidates", 400));

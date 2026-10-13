@@ -1,16 +1,16 @@
 use super::Store;
-#[cfg(test)]
+#[cfg(all(test, feature = "source-observer"))]
 use crate::source_observer::small_object_store;
-#[cfg(test)]
+#[cfg(all(test, feature = "source-observer"))]
 pub use crate::source_observer::Body;
 use crate::{Error, Result};
-#[cfg(not(test))]
+#[cfg(not(all(test, feature = "source-observer")))]
 use risunest_small_object_store as small_object_store;
-#[cfg(not(test))]
+#[cfg(not(all(test, feature = "source-observer")))]
 pub use risunest_small_object_store::Body;
 use risunest_sync_wire::{delta::MAX_TARGET_BYTES, hash, validate_hash};
 use rusqlite::{params, Connection, OptionalExtension};
-#[cfg(any(not(test), unix))]
+#[cfg(any(not(all(test, feature = "source-observer")), unix))]
 use std::fs::File;
 use std::{fs, io::Write, path::Path};
 
@@ -64,12 +64,12 @@ fn file_batch<T: Sync, U: Send>(
             .chunks(items.len().div_ceil(depth))
             .map(|group| {
                 let operation = &operation;
-                #[cfg(test)]
+                #[cfg(all(test, feature = "source-observer"))]
                 let observed = crate::source_observer::worker();
                 #[cfg(test)]
                 let samples = frame_metrics::SAMPLES.with(|samples| samples.borrow().clone());
                 let worker = spawn_file_worker(scope, move || {
-                    #[cfg(test)]
+                    #[cfg(all(test, feature = "source-observer"))]
                     let _observed = observed.enter();
                     #[cfg(test)]
                     frame_metrics::SAMPLES.with(|current| *current.borrow_mut() = samples);
@@ -101,7 +101,7 @@ fn file_batch<T: Sync, U: Send>(
 }
 
 pub(super) fn body_error(error: small_object_store::StoreError) -> Error {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "source-observer"))]
     crate::source_observer::note_current_violation("inline-body-error");
     match error {
         small_object_store::StoreError::TooLarge => Error::new("object-too-large", 413),
@@ -193,7 +193,7 @@ pub(super) fn publish(from: &Path, to: &Path) -> Result<()> {
 }
 impl Store {
     pub fn open_object(&self, digest: &str) -> Result<(Body, u64)> {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "source-observer"))]
         let _observed = crate::source_observer::operation(&self.root);
         let (size, inline) = {
             let db = self.reader()?;
@@ -209,9 +209,9 @@ impl Store {
             .objects_gate
             .lock()
             .map_err(|_| Error::new("storage-unavailable", 503))?;
-        #[cfg(not(test))]
+        #[cfg(not(all(test, feature = "source-observer")))]
         let file = File::open(self.object_path(digest)?)?;
-        #[cfg(test)]
+        #[cfg(all(test, feature = "source-observer"))]
         let file = crate::source_observer::TrackedFile::open(
             &self.root,
             digest,
@@ -219,7 +219,7 @@ impl Store {
             "file",
         )?;
         if file.metadata()?.len() != size {
-            #[cfg(test)]
+            #[cfg(all(test, feature = "source-observer"))]
             crate::source_observer::note_current_violation("corrupt-object");
             return Err(Error::new("corrupt-object", 503));
         }
@@ -276,9 +276,9 @@ impl Store {
     /// keeps the object where the row puts it; a damaged one is replaced there,
     /// so an upload never acknowledges a body nothing can read.
     fn filed_body_differs(&self, digest: &str, bytes: &[u8]) -> Result<bool> {
-        #[cfg(not(test))]
+        #[cfg(not(all(test, feature = "source-observer")))]
         let opened = File::open(self.object_path(digest)?);
-        #[cfg(test)]
+        #[cfg(all(test, feature = "source-observer"))]
         let opened = crate::source_observer::TrackedFile::open(
             &self.root,
             digest,
@@ -331,7 +331,7 @@ impl Store {
         device: &super::Device,
         objects: &[(String, Vec<u8>)],
     ) -> Result<()> {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "source-observer"))]
         let _observed = crate::source_observer::ingress(&self.root);
         Self::require_device(&*self.db()?, device)?;
         for (digest, bytes) in objects {
@@ -342,7 +342,7 @@ impl Store {
                 let actual = hash(bytes);
                 #[cfg(test)]
                 frame_metrics::hashed("object", bytes.len());
-                #[cfg(test)]
+                #[cfg(all(test, feature = "source-observer"))]
                 crate::source_observer::hashed(digest, "object-ingress-sha256", bytes.len());
                 actual != *digest
             } {
@@ -504,7 +504,7 @@ impl Store {
         }
     }
     pub fn get_object(&self, digest: &str) -> Result<Vec<u8>> {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "source-observer"))]
         let _observed = crate::source_observer::operation(&self.root);
         let (size, inline) = {
             let db = self.reader()?;
@@ -520,9 +520,9 @@ impl Store {
             return Ok(bytes);
         }
         let path = self.object_path(digest)?;
-        #[cfg(not(test))]
+        #[cfg(not(all(test, feature = "source-observer")))]
         let file = File::open(path)?;
-        #[cfg(test)]
+        #[cfg(all(test, feature = "source-observer"))]
         let file = crate::source_observer::TrackedFile::open(&self.root, digest, &path, "file")?;
         #[cfg(test)]
         frame_metrics::opened();
@@ -531,11 +531,11 @@ impl Store {
         file.take(size + 1).read_to_end(&mut bytes)?;
         if bytes.len() as u64 != size || {
             let actual = hash(&bytes);
-            #[cfg(test)]
+            #[cfg(all(test, feature = "source-observer"))]
             crate::source_observer::hashed(digest, "object-source-sha256", bytes.len());
             actual != digest
         } {
-            #[cfg(test)]
+            #[cfg(all(test, feature = "source-observer"))]
             crate::source_observer::note_violation("corrupt-object");
             return Err(Error::new("corrupt-object", 503));
         }
