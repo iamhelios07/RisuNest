@@ -289,20 +289,27 @@ function containsCbs(value: string, names: ReadonlySet<string>): boolean {
 
 type ConversationAccess = 'none' | 'read-only' | 'mutating'
 
+/**
+ * `cbsWritesVariables` is false where the parser runs without `runVar`, so setvar-family
+ * tags stay unexecuted and only `inject` edits the conversation.
+ */
 function classifyConversationAccess(
     plan: ReturnType<typeof getRegexExecutionPlan>,
     data: string,
+    cbsWritesVariables = true,
 ): ConversationAccess {
+    const writesVariables = (value: string) =>
+        cbsWritesVariables && containsCbs(value, MUTATING_CONVERSATION_CBS_NAMES)
     let access: ConversationAccess = containsCbs(data, HISTORY_SENSITIVE_CBS_NAMES)
         ? 'read-only'
         : 'none'
-    if (containsCbs(data, MUTATING_CONVERSATION_CBS_NAMES)) return 'mutating'
+    if (writesVariables(data)) return 'mutating'
     for (const entry of plan.entries) {
         if (
             entry.actions.includes('inject') ||
             entry.replacement.startsWith('@@inject') ||
-            (entry.dynamicPattern && containsCbs(entry.pattern, MUTATING_CONVERSATION_CBS_NAMES)) ||
-            containsCbs(entry.replacement, MUTATING_CONVERSATION_CBS_NAMES)
+            (entry.dynamicPattern && writesVariables(entry.pattern)) ||
+            writesVariables(entry.replacement)
         ) {
             return 'mutating'
         }
@@ -653,7 +660,7 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
         plan = getRegexExecutionPlan(scripts, mode)
         conversationAccess = captureContext
             ? 'none'
-            : classifyConversationAccess(plan, data)
+            : classifyConversationAccess(plan, data, mode !== 'editdisplay')
         const needsConversationOperation = conversationAccess === 'mutating'
         const historyWindow = needsConversationOperation && !captureContext && !promptOperationScope
             && (mode === 'editinput' || mode === 'editoutput')

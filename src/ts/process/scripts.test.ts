@@ -1324,7 +1324,7 @@ describe('live display script ordering', () => {
             f.cleanup()
         }
     })
-    it('persists regex display variables without invalidating the same display again', async () => {
+    it('does not write or copy the conversation for setvar in display regex', async () => {
         const f = fixture()
         try {
             f.char.customscript = [
@@ -1335,14 +1335,11 @@ describe('live display script ordering', () => {
             ]
             const events = vi.fn()
             f.session.subscribe(events)
+            // The display parser runs without runVar, so the tag is left for the row to
+            // remove; only the Lua listener of this fixture commits a variable.
             expect((await f.run('input')).data).toBe('written')
-            expect(f.chat.scriptstate).toEqual({ $scratch: 'regex' })
-            expect(events).toHaveBeenCalledTimes(2)
-            expect(
-                events.mock.calls.every(
-                    ([event]) => event.displayVariableUpdate === true,
-                ),
-            ).toBe(true)
+            expect(f.chat.scriptstate).toEqual({ $scratch: 'input' })
+            expect(events).toHaveBeenCalledOnce()
         } finally {
             f.cleanup()
         }
