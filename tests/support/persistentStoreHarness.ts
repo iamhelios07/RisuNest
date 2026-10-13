@@ -16,6 +16,8 @@ export interface PersistentStoreHarness {
     revision: number
     /** Spies on one store method; calls still reach the real store until a test mocks them. */
     spy<K extends AsyncMethod>(method: K): MockInstance<Method<K>>
+    /** Runs `onCall` before every call to `method`, which then reaches the real store. */
+    observe<K extends AsyncMethod>(method: K, onCall: (...args: Parameters<Method<K>>) => void | Promise<void>): MockInstance<Method<K>>
     /** Rejects the next call to `method` with `error`; later calls reach the real store. */
     failNext<K extends AsyncMethod>(method: K, error: unknown): void
     /** Holds the next call to `method` until `release()`, then lets it reach the real store. */
@@ -39,6 +41,12 @@ export async function createPersistentStoreHarness(database?: Database): Promise
         store,
         revision,
         spy,
+        observe(method, onCall) {
+            return spy(method).mockImplementation((async (...args: Parameters<typeof onCall>) => {
+                await onCall(...args)
+                return real(method, args)
+            }) as never)
+        },
         failNext(method, error) {
             spy(method).mockImplementationOnce((() => Promise.reject(error)) as never)
         },
