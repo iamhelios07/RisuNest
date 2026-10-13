@@ -6,6 +6,7 @@ import {
     type PluginStorageMutation,
     type PluginStorageValueQuery,
 } from '../storage/persistentDataStore'
+import { createLeaseStub } from '../storage/persistentDataStore.testSupport'
 import {
     createPluginStorageStore,
     observePluginStorageValue,
@@ -50,7 +51,7 @@ function harness(entries: Record<string, { byteSize: number; value: unknown }>, 
                 .map(([key, entry]) => ({ owner: OWNER, key, byteSize: entry.byteSize })),
         })),
         readPluginStorage,
-        acquireRevision: vi.fn(async (requestedRevision: number) => ({
+        acquireRevision: vi.fn(async (requestedRevision: number) => createLeaseStub({
             revision: requestedRevision,
             readPluginStorageValues: async (query: PluginStorageValueQuery) => ({
                 ...await readPluginStorageValues(query), revision: requestedRevision,
@@ -465,7 +466,7 @@ describe('plugin storage V3 residency', () => {
         const release = vi.fn()
             .mockRejectedValueOnce(new Error('release unavailable'))
             .mockResolvedValueOnce(undefined)
-        vi.mocked(store.acquireRevision).mockResolvedValueOnce({
+        vi.mocked(store.acquireRevision).mockResolvedValueOnce(createLeaseStub({
             revision: 4,
             queryPluginStorage: async () => ({
                 revision: 4,
@@ -475,7 +476,7 @@ describe('plugin storage V3 residency', () => {
                 items: [{ owner: OWNER, key: 'zero', value: 0 }] }),
             readPluginStorage: async () => ({ revision: 4, value: 0 }),
             release,
-        } as any)
+        }))
 
         await expect(storage.forOwner(OWNER).snapshot()).resolves.toEqual({ zero: 0 })
         expect(release).toHaveBeenCalledTimes(2)
@@ -483,7 +484,7 @@ describe('plugin storage V3 residency', () => {
 
     it('preserves an own proto key and catalog order in a pinned snapshot', async () => {
         const { storage, store } = harness({}, 100)
-        vi.mocked(store.acquireRevision).mockResolvedValueOnce({
+        vi.mocked(store.acquireRevision).mockResolvedValueOnce(createLeaseStub({
             revision: 4,
             queryPluginStorage: async () => ({
                 revision: 4,
@@ -502,7 +503,7 @@ describe('plugin storage V3 residency', () => {
                 value: key === '__proto__' ? false : key === '0' ? 0 : '',
             }),
             release: vi.fn(async () => undefined),
-        } as any)
+        }))
 
         const snapshot = await storage.forOwner(OWNER).snapshot()
 

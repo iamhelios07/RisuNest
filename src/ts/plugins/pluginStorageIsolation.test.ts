@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { PersistentDataStore, PluginStorageMutation, PluginStorageValueQuery } from '../storage/persistentDataStore'
+import { createLeaseStub } from '../storage/persistentDataStore.testSupport'
 import { createPluginStorageStore } from './pluginStorageStore'
 import { applyPluginDatabaseUpdate } from './pluginDatabaseAccess'
 import type { Database } from '../storage/database.svelte'
@@ -30,7 +31,7 @@ function sharedStore(initial: readonly Row[]) {
             const row = rows.find((item) => item.owner === owner && item.key === key)
             return row ? { revision: 1, value: structuredClone(row.value) } : null
         }),
-        acquireRevision: vi.fn(async () => ({
+        acquireRevision: vi.fn(async () => createLeaseStub({
             revision: 1,
             readPluginStorageValues: async ({ owner, afterKey, limit = 256 }: PluginStorageValueQuery) => {
                 const records = rows.map((row, ordinal) => ({ ...row, ordinal }))

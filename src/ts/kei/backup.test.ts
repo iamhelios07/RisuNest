@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Database } from '../storage/database.svelte'
+import { createLeaseStub } from '../storage/persistentDataStore.testSupport'
 
 let native = false
 const vaultRead = vi.fn()
@@ -92,9 +93,9 @@ describe('saveDbKei', () => {
             native = true
             const { nativePersistentRevisionLease } = await import('../storage/nativePersistentExport')
             const release = vi.fn(async () => undefined)
-            const lease = { revision: 7, release, ...(scenario === 'native-lease-unavailable' ? {} : {
+            const lease = createLeaseStub({ revision: 7, release }, scenario === 'native-lease-unavailable' ? undefined : {
                 [nativePersistentRevisionLease]: 'lease-7',
-            }) }
+            })
             const runtime = {
                 revision: 7,
                 flushPendingData: vi.fn(async () => undefined),

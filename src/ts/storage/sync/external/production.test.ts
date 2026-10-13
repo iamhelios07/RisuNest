@@ -2,6 +2,7 @@ import type { MobileBackgroundTask, MobileTaskKind } from '../../../mobileBackgr
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ExternalJobSummary, ExternalStorageState } from './types'
 import type { CommittedApplyOutcome } from '../../persistentDataRuntime'
+import { createLeaseStub } from '../../persistentDataStore.testSupport'
 
 const mocks = vi.hoisted(() => ({
     protected: false,
@@ -202,7 +203,7 @@ async function installActualRestorePause() {
             const store = {
                 open: async () => undefined,
                 readRoot: async () => ({ revision: mocks.revision, value: capturePersistentRoot(database) }),
-                acquireRevision: async (revision: number) => ({
+                acquireRevision: async (revision: number) => createLeaseStub({
                     revision, readRoot: async () => ({ revision, value: capturePersistentRoot(database) }),
                     queryPresets: async () => ({ revision, items: [] }),
                     queryCharacters: async () => ({ revision, items: [] }),

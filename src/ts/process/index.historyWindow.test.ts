@@ -97,6 +97,7 @@ vi.mock('../storage/persistentDataStoreFactory', async () => (await import('./te
 
 import type { character, Chat, Database, Message } from '../storage/database.svelte'
 import { ActiveConversationSession } from '../storage/activeConversationSession'
+import { createLeaseStub } from '../storage/persistentDataStore.testSupport'
 import { createMetadataOnlySelectedConversation } from '../storage/selectedConversationLifecycle'
 import { DBState, selectedCharID } from '../stores.svelte'
 import { doingChat, openSelectedHistoryWindow, sendChat } from './index.svelte'
@@ -205,7 +206,7 @@ function installWindowed(stored: Message[], conversation: Partial<Chat> = {}) {
         sessionVersion: 0,
         get totalMessages() { return stored.length },
     }
-    const page = (startIndex: number, items: unknown[]) => ({
+    const page = <T>(startIndex: number, items: T[]) => ({
         revision: 1,
         value: {
             characterId: 'character-a',
@@ -214,20 +215,22 @@ function installWindowed(stored: Message[], conversation: Partial<Chat> = {}) {
             startIndex,
             endIndex: startIndex + items.length,
             totalMessages: stored.length,
+            hasMoreBefore: startIndex > 0,
+            hasMoreAfter: startIndex + items.length < stored.length,
         },
     })
-    const lease = {
+    const lease = createLeaseStub({
         revision: 1,
-        async readConversationWindow(input: any) {
+        async readConversationWindow(input) {
             bodyReads.push([input.startIndex, input.limit])
             return page(input.startIndex, structuredClone(stored.slice(input.startIndex, input.startIndex + input.limit)))
         },
-        async readConversationMessageMetadataWindow(input: any) {
+        async readConversationMessageMetadataWindow(input) {
             return page(input.startIndex, stored.slice(input.startIndex, input.startIndex + input.limit)
                 .map((message) => ({ chatId: message.chatId, role: message.role, disabled: message.disabled, parserInert: true })))
         },
         release: vi.fn(async () => undefined),
-    }
+    })
     mocks.persistentStore = { acquireRevision: vi.fn(async () => lease) }
     mocks.windowedController = (_target: unknown, chat: Chat, absoluteStartIndex: number) => {
         if (!windowed.current || absoluteStartIndex + chat.message.length !== stored.length) return null
@@ -655,7 +658,7 @@ describe('sendChat with the history window', () => {
         const stored = messages(1000)
         const { lease } = installWindowed(stored)
         const read = lease.readConversationWindow
-        lease.readConversationWindow = async (input: any) => {
+        lease.readConversationWindow = async (input) => {
             const page = await read(input)
             mocks.selectedAuthority = { ...mocks.selectedAuthority, sessionVersion: 1, persistedSessionVersion: 1 }
             return page

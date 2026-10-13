@@ -4,6 +4,7 @@ import { createPersistentStoreHarness } from '../../../tests/support/persistentS
 import type { Chat, Database, character } from './database.svelte'
 import type { PersistentDataStore } from './persistentDataStore'
 import { RevisionConflictError } from './persistentDataStore'
+import { createLeaseStub } from './persistentDataStore.testSupport'
 import { canonicalJson } from './saveCoordinator'
 import {
     ActiveConversationSession,
@@ -1784,7 +1785,7 @@ describe('SaveCoordinator', () => {
         const readWorkingSetChangePage = vi.fn(async () => [change])
         const store = {
             ...makeStore(commit),
-            acquireRevision: vi.fn(async (revision: number) => ({
+            acquireRevision: vi.fn(async (revision: number) => createLeaseStub({
                 revision, readWorkingSetChangePage, release: vi.fn(async () => undefined),
             })),
         } as unknown as PersistentDataStore

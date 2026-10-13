@@ -33,7 +33,10 @@ vi.mock('src/ts/alert', () => ({ alertConfirm: async () => false, alertActionCon
 vi.mock('@lucide/svelte', () => ({ CheckIcon: () => {}, CloudDownloadIcon: () => {}, HardDriveIcon: () => {}, LoaderCircleIcon: () => {}, TriangleAlertIcon: () => {} }))
 vi.mock('./serverSyncRegistrationInbox', () => ({ serverRegistrationInbox: { changed: { subscribe: () => () => {} }, releaseConsumed() {}, take: () => undefined } }))
 vi.mock('./serverSyncQr', () => ({ canScanServerRegistration: false, createServerQrScanner: () => ({ cancel() {} }) }))
-vi.mock('./serverAssetResidency', () => ({ getAssetResidencyStatus: async () => undefined, setAssetResidencyPolicy: vi.fn(), evictLocalAssets: vi.fn(), cancelAssetResidencyOperation: vi.fn() }))
+vi.mock('./serverAssetResidency', async () => {
+    const { assetResidencyStatus } = await import('./serverAssetResidency.testSupport')
+    return { getAssetResidencyStatus: vi.fn(async () => assetResidencyStatus()), setAssetResidencyPolicy: vi.fn(), evictLocalAssets: vi.fn(), cancelAssetResidencyOperation: vi.fn() }
+})
 
 let production: typeof import('./serverSyncProduction')
 let ui: typeof import('svelte')
@@ -106,6 +109,7 @@ describe('persisted server offline startup', () => {
     })
     it('disconnects the actual persisted binding while activation remains offline, without starting services', async () => {
         await offlineStartup(); await settings()
+        vi.mocked((await import('./serverAssetResidency')).getAssetResidencyStatus).mockRejectedValueOnce(new Error('server-unreachable'))
         button(language.risuNest.serverSync.disconnect)!.click(); await settle()
         // The file check cannot answer here, so the disconnect is confirmed before it unbinds.
         expect((await import('src/ts/alert')).alertCheckboxConfirm).toHaveBeenCalledOnce()

@@ -8,8 +8,9 @@ import {
     type PersistentRootModuleAppend,
 } from './saveCoordinator'
 import type { Chat, Database, character } from './database.svelte'
-import type { PersistentDataStore, WorkingSetCommit } from './persistentDataStore'
+import type { AssetOwnerHead, PersistentDataStore, WorkingSetCommit } from './persistentDataStore'
 import { RevisionConflictError } from './persistentDataStore'
+import { createLeaseStub } from './persistentDataStore.testSupport'
 import { createPluginStorageStore } from '../plugins/pluginStorageStore'
 import { createConversationSummaryStubFromChat } from './conversationResidency'
 import {
@@ -159,7 +160,7 @@ describe('canonical JSON property safety', () => {
 
 function makeGroupDeletionLease(database: Database, revision = 1) {
     const authoritative = structuredClone(database)
-    return {
+    return createLeaseStub({
         revision,
         readRoot: vi.fn(async () => ({ revision, value: captureRoot(authoritative) })),
         queryCharacters: vi.fn(async ({ trash }: { trash: boolean }) => ({
@@ -183,7 +184,7 @@ function makeGroupDeletionLease(database: Database, revision = 1) {
             return { revision, value: detail }
         }),
         release: vi.fn(async () => undefined),
-    }
+    })
 }
 
 function publishGroupDeletion(database: Database, state: any): void {
@@ -695,7 +696,7 @@ describe('SaveCoordinator', () => {
         const release = vi.fn(async () => undefined)
         const store = {
             commit: vi.fn(async (_input: WorkingSetCommit) => ({ revision: 8 })),
-            acquireRevision: vi.fn(async () => ({
+            acquireRevision: vi.fn(async () => createLeaseStub({
                 revision: 7,
                 readRoot: vi.fn(async () => ({ revision: 7, value: captureRoot(database) })),
                 readAssetAliasesByKeys: vi.fn(async () => {
@@ -763,7 +764,7 @@ describe('SaveCoordinator', () => {
             { id: 'persona-0', name: 'With module', embeddedModule: { id: 'embedded', name: 'Embedded', assets: [] } },
             { name: 'Without module' },
         ] as Database['personas']
-        const existingHeads = new Map([
+        const existingHeads = new Map<string, AssetOwnerHead>([
             ['root-module-assets:first', {
                 owner: { kind: 'root-module-assets', moduleId: database.modules?.[0]?.id ?? 'new-id' },
                 present: true,
@@ -792,7 +793,7 @@ describe('SaveCoordinator', () => {
         const publishRootWorkingSet = vi.fn((root) => Object.assign(database, root))
         const store = {
             commit,
-            acquireRevision: vi.fn(async () => ({
+            acquireRevision: vi.fn(async () => createLeaseStub({
                 revision: 7,
                 readRoot: vi.fn(async () => ({ revision: 7, value: captureRoot(database) })),
                 readAssetOwnerHead,
@@ -865,7 +866,7 @@ describe('SaveCoordinator', () => {
         const publishRootWorkingSet = vi.fn((root) => Object.assign(database, root))
         const store = {
             commit,
-            acquireRevision: vi.fn(async () => ({
+            acquireRevision: vi.fn(async () => createLeaseStub({
                 revision: 7,
                 readRoot: vi.fn(async () => ({ revision: 7, value: captureRoot(database) })),
                 readAssetOwnerHead: vi.fn(async () => null),
@@ -910,7 +911,7 @@ describe('SaveCoordinator', () => {
         const pin = vi.fn(async () => { throw new Error('offline') })
         const store = {
             commit: vi.fn(async () => ({ revision: 8 })),
-            acquireRevision: vi.fn(async () => ({
+            acquireRevision: vi.fn(async () => createLeaseStub({
                 revision: 7,
                 readRoot: vi.fn(async () => ({ revision: 7, value: captureRoot(database) })),
                 readAssetOwnerHead: vi.fn(async () => null),
@@ -948,7 +949,7 @@ describe('SaveCoordinator', () => {
         },
         {
             name: 'root read',
-            acquireRevision: async () => ({
+            acquireRevision: async () => createLeaseStub({
                 revision: 7,
                 readRoot: vi.fn(async () => { throw new Error('root unavailable') }),
                 readAssetOwnerHead: vi.fn(async () => null),
@@ -958,7 +959,7 @@ describe('SaveCoordinator', () => {
         },
         {
             name: 'revision release',
-            acquireRevision: async () => ({
+            acquireRevision: async () => createLeaseStub({
                 revision: 7,
                 readRoot: vi.fn(async () => ({ revision: 7, value: captureRoot(makeDatabase()) })),
                 readAssetOwnerHead: vi.fn(async () => null),
@@ -1013,7 +1014,7 @@ describe('SaveCoordinator', () => {
         const commitError = new RevisionConflictError(7, 8)
         const store = {
             commit: vi.fn(async () => { throw commitError }),
-            acquireRevision: vi.fn(async () => ({
+            acquireRevision: vi.fn(async () => createLeaseStub({
                 revision: 7,
                 readRoot: vi.fn(async () => ({ revision: 7, value: captureRoot(database) })),
                 readAssetOwnerHead: vi.fn(async () => null),
@@ -1049,7 +1050,7 @@ describe('SaveCoordinator', () => {
         const callbackError = new RevisionConflictError(7, 8)
         const store = {
             commit: vi.fn(async () => ({ revision: 8 })),
-            acquireRevision: vi.fn(async () => ({
+            acquireRevision: vi.fn(async () => createLeaseStub({
                 revision: 7,
                 readRoot: vi.fn(async () => ({ revision: 7, value: captureRoot(database) })),
                 readAssetOwnerHead: vi.fn(async () => null),
@@ -1082,7 +1083,7 @@ describe('SaveCoordinator', () => {
         const commitError = new Error('commit response lost')
         const store = {
             commit: vi.fn(async () => { throw commitError }),
-            acquireRevision: vi.fn(async () => ({
+            acquireRevision: vi.fn(async () => createLeaseStub({
                 revision: 7,
                 readRoot: vi.fn(async () => ({ revision: 7, value: captureRoot(database) })),
                 readAssetOwnerHead: vi.fn(async () => null),
@@ -1117,7 +1118,7 @@ describe('SaveCoordinator', () => {
         const commit = vi.fn()
         const store = {
             commit,
-            acquireRevision: vi.fn(async () => ({
+            acquireRevision: vi.fn(async () => createLeaseStub({
                 revision: 7,
                 readRoot: vi.fn(async () => ({ revision: 7, value: captureRoot(database) })),
                 readAssetOwnerHead: vi.fn(async () => null),
@@ -1215,7 +1216,7 @@ describe('SaveCoordinator', () => {
         const readAssetAliasesByKeys = vi.fn(async () => ({ revision: 7, value: [existing] }))
         const store = {
             commit,
-            acquireRevision: vi.fn(async () => ({
+            acquireRevision: vi.fn(async () => createLeaseStub({
                 revision: 7,
                 readRoot: vi.fn(async () => ({ revision: 7, value: captureRoot(database) })),
                 readAssetOwnerHead: vi.fn(async () => null),
@@ -1248,7 +1249,7 @@ describe('SaveCoordinator', () => {
         const conflictingCoordinator = new SaveCoordinator({
             store: {
                 ...store,
-                acquireRevision: vi.fn(async () => ({
+                acquireRevision: vi.fn(async () => createLeaseStub({
                     revision: 7,
                     readRoot: vi.fn(async () => ({ revision: 7, value: captureRoot(database) })),
                     readAssetOwnerHead: vi.fn(async () => null),
@@ -1302,7 +1303,7 @@ describe('SaveCoordinator', () => {
         }))
         const store = {
             commit,
-            acquireRevision: vi.fn(async () => ({
+            acquireRevision: vi.fn(async () => createLeaseStub({
                 revision: 7,
                 readRoot: vi.fn(async () => ({ revision: 7, value: captureRoot(database) })),
                 readAssetOwnerHead: vi.fn(async () => null),
@@ -2615,10 +2616,9 @@ describe('SaveCoordinator', () => {
         'releases a failed permanent-delete lease and does not commit for %s',
         async (failure) => {
             const database = makeDatabase()
-            const lease = makeGroupDeletionLease(database)
-            if (failure === 'stale-lease') lease.revision = 0
+            const lease = makeGroupDeletionLease(database, failure === 'stale-lease' ? 0 : 1)
             if (failure === 'read-failure') {
-                lease.readRoot.mockRejectedValueOnce(new Error('read failed'))
+                vi.mocked(lease.readRoot).mockRejectedValueOnce(new Error('read failed'))
             }
             const commit = vi.fn()
             const coordinator = new SaveCoordinator({
@@ -2647,7 +2647,7 @@ describe('SaveCoordinator', () => {
     it('retries a transient permanent-delete lease release before committing', async () => {
         const database = makeDatabase()
         const lease = makeGroupDeletionLease(database)
-        lease.release
+        vi.mocked(lease.release)
             .mockRejectedValueOnce(new Error('release unavailable'))
             .mockResolvedValueOnce(undefined)
         const commit = vi.fn(async ({ expectedRevision }) => ({
@@ -2679,8 +2679,8 @@ describe('SaveCoordinator', () => {
         const database = makeDatabase()
         const lease = makeGroupDeletionLease(database)
         const primaryError = new Error('read failed')
-        lease.readRoot.mockRejectedValueOnce(primaryError)
-        lease.release.mockRejectedValue(new Error('release unavailable'))
+        vi.mocked(lease.readRoot).mockRejectedValueOnce(primaryError)
+        vi.mocked(lease.release).mockRejectedValue(new Error('release unavailable'))
         const commit = vi.fn()
         const coordinator = new SaveCoordinator({
             store: {
