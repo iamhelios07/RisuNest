@@ -22,13 +22,7 @@ vi.mock('src/ts/storage/deviceSettings', async (importOriginal) => {
     }) }
 })
 vi.mock('src/ts/storage/persistentDataStoreFactory', () => ({ getPersistentDataStore: () => fixture.store }))
-vi.mock('src/ts/parser/parser.svelte', () => ({
-    assetRegex: /$^/,
-    hasher: vi.fn(async () => 'hash'),
-    parseMarkdownSafe: (value: string) => value,
-    ParseMarkdown: vi.fn(async (value: string) => value),
-    risuChatParser: (value: string) => value,
-}))
+vi.mock('src/ts/parser/parser.svelte', async () => (await import('src/ts/parser/parser.testSupport')).parserStubModule())
 vi.mock('src/ts/tokenizer', async () => (await import('../process/tests/sendChatTestHarness')).tokenizerModule({
     tokenize: vi.fn(async () => 10),
     encodeWithTokenizer: vi.fn(async () => new Array(10).fill(0)),

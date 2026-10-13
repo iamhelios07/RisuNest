@@ -48,7 +48,7 @@ vi.mock('../alert', async () => (await import('./tests/sendChatTestHarness')).al
     alertError: mocks.alertError,
 }))
 vi.mock('../parser/chatML', async () => (await import('./tests/sendChatTestHarness')).chatMLModule())
-vi.mock('../parser/parser.svelte', async () => (await import('./tests/sendChatTestHarness')).parserModule())
+vi.mock('../parser/parser.svelte', async () => (await import('src/ts/parser/parser.testSupport')).parserStubModule())
 vi.mock('./lorebook.svelte', async () => (await import('./tests/sendChatTestHarness')).lorebookModule())
 vi.mock('../util', async () => (await import('./tests/sendChatTestHarness')).utilModule({
     findCharacterbyId: () => mocks.currentCharacter,

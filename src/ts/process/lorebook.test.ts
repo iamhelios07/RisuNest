@@ -15,7 +15,7 @@ vi.mock('../tokenizer', () => ({
     tokenize: vi.fn(async (text: string) => text.length),
 }))
 
-vi.mock('../parser/parser.svelte', () => ({
+vi.mock('../parser/parser.svelte', async () => (await import('src/ts/parser/parser.testSupport')).parserStubModule({
     risuChatParser: vi.fn((text: string) => text),
 }))
 

@@ -39,10 +39,6 @@ export function chatMLModule(overrides: ModuleOverrides = {}) {
     return { parseChatML: (value: string) => value, ...overrides }
 }
 
-export function parserModule(overrides: ModuleOverrides = {}) {
-    return { risuChatParser: (value: string) => value, ...overrides }
-}
-
 export function lorebookModule(overrides: ModuleOverrides = {}) {
     return { loadLoreBookV3Prompt: vi.fn(async () => ({ actives: [] })), ...overrides }
 }

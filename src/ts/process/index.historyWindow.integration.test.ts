@@ -89,10 +89,7 @@ vi.mock('./request/request', () => ({
     })),
 }))
 vi.mock('../parser/chatML', async () => (await import('./tests/sendChatTestHarness')).chatMLModule())
-vi.mock('../parser/parser.svelte', async () => (await import('./tests/sendChatTestHarness')).parserModule({
-    assetRegex: /$^/,
-    hasher: vi.fn(async () => 'hash'),
-}))
+vi.mock('../parser/parser.svelte', async () => (await import('src/ts/parser/parser.testSupport')).parserStubModule())
 vi.mock('./lorebook.svelte', async () => (await import('./tests/sendChatTestHarness')).lorebookModule())
 vi.mock('./stableDiff', async () => (await import('./tests/sendChatTestHarness')).stableDiffModule({ generateAIImage: vi.fn() }))
 vi.mock('./templates/templates', async () => (await import('./tests/sendChatTestHarness')).templatesModule())

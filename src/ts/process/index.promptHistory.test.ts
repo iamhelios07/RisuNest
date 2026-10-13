@@ -23,8 +23,7 @@ const testState = vi.hoisted(() => ({
     },
 }))
 
-vi.mock('../parser/parser.svelte', () => ({
-    assetRegex: /$^/g,
+vi.mock('../parser/parser.svelte', async () => (await import('src/ts/parser/parser.testSupport')).parserStubModule({
     risuChatParser: (data: string, args: Record<string, any> = {}) => data.replace(
         /{{([^{}]+)}}/g,
         (source, body: string) => {
