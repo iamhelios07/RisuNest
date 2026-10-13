@@ -3,17 +3,18 @@ import { test } from 'node:test'
 import { mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { assertInventory, discoverTestEntries, ownerOf, selectNodeTests } from './suiteOwnership.mjs'
+import { assertInventory, discoverTestEntries, nodeAppTests, ownerOf, selectNodeTests } from './suiteOwnership.mjs'
 import { parseVitestInventory } from './testInventory.mjs'
 
 const ordinary = 'src/ts/storage/newRegression.test.ts'
 const extended = 'src/ts/storage/selectedConversationEvictionCorpus.test.ts'
+const nodeOnly = nodeAppTests[0]
 
 test('classifies ordinary, extended, harness, Node and independent entries', () => {
   for (const [path, expected] of [
-    [ordinary, 'app'], [extended, 'app-extended'],
+    [ordinary, 'app'], [extended, 'app-extended'], [nodeOnly, 'app-node'],
     ['scripts/example.spec.mjs', 'app'],
-    ['src-tauri/src/ios_ipc.test.ts', 'app'],
+    ['src-tauri/src/newRegression.test.ts', 'app'],
     ['benchmarks/tokenizer/nativeTokenizerBenchmark.test.ts', 'harness'],
     ['src/ts/process/regexSafePlan.profile.test.ts', 'harness'],
     ['tests/release/contract.node-test.mjs', 'node'],
@@ -41,8 +42,9 @@ test('detects exclusions, duplicate ownership and missing runner owners', () => 
 
 test('accepts the installed CLI JSON shape and rejects unexpected output', () => {
   const root = join(tmpdir(), 'inventory')
-  assert.deepEqual(parseVitestInventory(JSON.stringify([{ file: join(root, ordinary), projectName: 'app' }]), root), {
-    app: [ordinary], 'app-extended': [], harness: [],
+  const listed = [{ file: join(root, ordinary), projectName: 'app' }, { file: join(root, nodeOnly), projectName: 'app-node' }]
+  assert.deepEqual(parseVitestInventory(JSON.stringify(listed), root), {
+    app: [ordinary], 'app-node': [nodeOnly], 'app-extended': [], harness: [],
   })
   for (const invalid of ['warning\n[]', '{}', '[]', '[{}]', JSON.stringify([{ file: join(root, ordinary), projectName: 'unknown' }])]) {
     assert.throws(() => parseVitestInventory(invalid, root))
