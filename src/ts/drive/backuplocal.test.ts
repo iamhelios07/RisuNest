@@ -139,7 +139,6 @@ vi.mock('../util', () => ({
     sleep: vi.fn(async () => undefined),
 }))
 vi.mock('../characterCards', () => ({ hubURL: 'https://hub.invalid' }))
-vi.mock('src/lang', async () => ({ language: (await import('src/lang/en')).languageEnglish }))
 
 function emptyBlobStore(): BlobStore {
     return {

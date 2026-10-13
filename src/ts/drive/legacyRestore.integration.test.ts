@@ -62,7 +62,6 @@ vi.mock('src/ts/util', () => ({
     decryptBuffer: vi.fn(), encryptBuffer: vi.fn(), sleep: vi.fn(async () => undefined),
 }))
 vi.mock('src/ts/characterCards', () => ({ hubURL: 'https://synthetic.invalid' }))
-vi.mock('src/lang', async () => ({ language: (await import('src/lang/en')).languageEnglish }))
 
 function entry(name: string, data: Uint8Array): Uint8Array {
     const nameBytes = new TextEncoder().encode(name)
