@@ -2,6 +2,7 @@ import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
 import { vi, type MockInstance } from 'vitest'
 import type { Database } from '../../src/ts/storage/database.svelte'
 import { IndexedDbPersistentDataStore } from '../../src/ts/storage/indexedDbPersistentDataStore'
+import type { PersistentRevisionLease } from '../../src/ts/storage/persistentDataStore'
 
 type Store = IndexedDbPersistentDataStore
 type AsyncMethod = {
@@ -22,6 +23,8 @@ export interface PersistentStoreHarness {
     failNext<K extends AsyncMethod>(method: K, error: unknown): void
     /** Holds the next call to `method` until `release()`, then lets it reach the real store. */
     gate<K extends AsyncMethod>(method: K): { entered: Promise<void>; release(): void }
+    /** Collects every lease acquired from now on, each with a spy on its `release`. */
+    leases(): PersistentRevisionLease[]
 }
 
 /** Opens a fresh store, replacing its content with `database` when one is given. */
@@ -61,6 +64,16 @@ export async function createPersistentStoreHarness(database?: Database): Promise
                 return real(method, args)
             }) as never)
             return { entered, release }
+        },
+        leases() {
+            const acquired: PersistentRevisionLease[] = []
+            spy('acquireRevision').mockImplementation((async (...args: unknown[]) => {
+                const lease = await real('acquireRevision', args) as PersistentRevisionLease
+                vi.spyOn(lease, 'release')
+                acquired.push(lease)
+                return lease
+            }) as never)
+            return acquired
         },
     }
 }
