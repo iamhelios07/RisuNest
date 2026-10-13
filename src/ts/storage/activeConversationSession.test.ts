@@ -918,6 +918,56 @@ describe('ActiveConversationSession', () => {
         })
     })
 
+    it('writes chat variables per key without a version check and keeps the message version', () => {
+        const conversation = chat()
+        conversation.scriptstate = { $kept: 'same', $open: '0' }
+        const { onMutation, session } = createSession(conversation)
+        session.append(message('appended', 'four'))
+        const messageVersion = session.messageVersion
+        expect(messageVersion).toBe(1)
+
+        expect(session.updateChatVariables(new Map([['kept', 'same']]))).toBe(false)
+        expect(session.version).toBe(1)
+        expect(session.updateChatVariables(new Map([
+            ['kept', 'same'],
+            ['open', '1'],
+            ['created', 'new'],
+        ]))).toBe(true)
+
+        expect(conversation.scriptstate).toEqual({ $kept: 'same', $open: '1', $created: 'new' })
+        expect(session.version).toBe(2)
+        expect(session.messageVersion).toBe(messageVersion)
+        expect(session.readChatVariable('open')).toBe('1')
+        const event = onMutation.mock.calls.at(-1)![0]
+        expect(event).toMatchObject({
+            previousVersion: 1,
+            sessionVersion: 2,
+            commands: ['update-metadata'],
+            mutations: [{ start: 5, deleteCount: 0, messages: [], sessionVersion: 2 }],
+            variableUpdate: { keys: ['open', 'created'] },
+            conversation: { scriptstate: { $kept: 'same', $open: '1', $created: 'new' } },
+        })
+        expect(event.displayVariableUpdate).toBeUndefined()
+
+        session.updateChatVariables(new Map([['open', '2']]), { origin: 'display' })
+        expect(onMutation.mock.calls.at(-1)![0]).toMatchObject({
+            displayVariableUpdate: true,
+            variableUpdate: { keys: ['open'], origin: 'display' },
+        })
+
+        onMutation.mockImplementationOnce(() => {
+            throw new Error('publication failed')
+        })
+        expect(() => session.updateChatVariables(new Map([
+            ['open', '3'],
+            ['rolledBack', 'value'],
+        ]))).toThrow('publication failed')
+        expect(conversation.scriptstate).toEqual({ $kept: 'same', $open: '2', $created: 'new' })
+        expect(session.version).toBe(3)
+        session.edit(session.locate(0), message('duplicate', 'edited'))
+        expect(session.messageVersion).toBe(4)
+    })
+
     it('preserves untouched legacy message identities across edits and appends', () => {
         const originalMessages = [
             message(undefined, 'zero'),

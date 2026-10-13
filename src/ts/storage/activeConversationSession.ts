@@ -96,9 +96,17 @@ export interface ActiveConversationBackwardScan {
     sessionVersion: number
 }
 
+export interface ActiveConversationVariableUpdate {
+    /** Changed chat variable names, without the `$` storage prefix. */
+    keys: readonly string[]
+    origin?: 'display'
+}
+
 export interface ActiveConversationMutationEvent {
     /** Display-listener variable writes persist without recursively invalidating that display. */
     displayVariableUpdate?: boolean
+    /** Set only for chat-variable commits, which leave every message unchanged. */
+    variableUpdate?: ActiveConversationVariableUpdate
     characterId: string
     conversationId: string
     sessionToken: ConversationSessionToken
@@ -1077,6 +1085,7 @@ export class ActiveConversationSession {
     ) => void>()
     private locatorRegistry = new ConversationLocatorRegistry()
     private sessionVersion = 0
+    private lastMessageChangeVersion = 0
     private generationContinuationStart = 0
     private persistedSessionVersion = 0
     private currentStoreRevision: DataRevision
@@ -1201,6 +1210,17 @@ export class ActiveConversationSession {
 
     get version(): number {
         return this.sessionVersion
+    }
+
+    /** Advances with every committed message change; metadata-only commits keep it. */
+    get messageVersion(): number {
+        return this.lastMessageChangeVersion
+    }
+
+    /** Reads one chat variable of the live conversation without copying it. */
+    readChatVariable(key: string): unknown {
+        this.assertActive()
+        return this.conversation.scriptstate?.['$' + key]
     }
 
     get persistedVersion(): number {
@@ -1731,6 +1751,78 @@ export class ActiveConversationSession {
         }
     }
 
+    /**
+     * Writes chat variables, last writer wins per key, regardless of what changed since
+     * the caller read them. Returns false when every value is already current.
+     */
+    updateChatVariables(
+        changes: ReadonlyMap<string, string>,
+        options: { origin?: 'display' } = {},
+    ): boolean {
+        this.assertActive()
+        if (this.transactionActive) {
+            throw new Error('Nested conversation session transactions are not supported')
+        }
+        const previousScriptstate = this.conversation.scriptstate
+        const changed = [...changes].filter(
+            ([key, value]) => previousScriptstate?.['$' + key] !== value,
+        )
+        if (changed.length === 0) return false
+
+        this.transactionActive = true
+        try {
+            const previousVersion = this.sessionVersion
+            const previousLocatorRegistry = this.locatorRegistry
+            const previousValues = changed.map(([key]) => {
+                const stateKey = '$' + key
+                return [
+                    stateKey,
+                    previousScriptstate !== undefined &&
+                        Object.prototype.hasOwnProperty.call(previousScriptstate, stateKey),
+                    previousScriptstate?.[stateKey],
+                ] as const
+            })
+            const scriptstate = (this.conversation.scriptstate ??= {})
+            for (const [key, value] of changed) scriptstate['$' + key] = value
+            const nextLocatorRegistry = previousLocatorRegistry.fork()
+            this.sessionVersion = previousVersion + 1
+            this.locatorRegistry = nextLocatorRegistry
+            try {
+                this.notifyMutation(
+                    previousVersion,
+                    ['update-metadata'],
+                    [{
+                        start: this.conversation.message.length,
+                        deleteCount: 0,
+                        messages: [],
+                        sessionVersion: this.sessionVersion,
+                    }],
+                    options.origin === 'display',
+                    {
+                        keys: changed.map(([key]) => key),
+                        ...(options.origin ? { origin: options.origin } : {}),
+                    },
+                )
+                previousLocatorRegistry.clear()
+            } catch (error) {
+                if (previousScriptstate === undefined) delete this.conversation.scriptstate
+                else {
+                    for (const [stateKey, existed, value] of previousValues) {
+                        if (existed) scriptstate[stateKey] = value
+                        else delete scriptstate[stateKey]
+                    }
+                }
+                this.sessionVersion = previousVersion
+                nextLocatorRegistry.clear()
+                this.locatorRegistry = previousLocatorRegistry
+                throw error
+            }
+            return true
+        } finally {
+            this.transactionActive = false
+        }
+    }
+
     replaceTail(position: ConversationPosition, messages: readonly Message[]): void {
         this.assertActive()
         this.transaction((transaction) => transaction.replaceTail(position, messages))
@@ -2117,6 +2209,7 @@ export class ActiveConversationSession {
         commands: readonly ActiveConversationCommandName[],
         mutations: readonly ActiveConversationMutationRange[] = [],
         displayVariableUpdate = false,
+        variableUpdate?: ActiveConversationVariableUpdate,
     ): void {
         let detachedMutations = safeStructuredClone(mutations)
         if (!this.compatibilityFallback && !this.canApplyResidentMutations(detachedMutations)) {
@@ -2127,6 +2220,7 @@ export class ActiveConversationSession {
         }
         const event: ActiveConversationMutationEvent = {
             ...(displayVariableUpdate ? { displayVariableUpdate: true } : {}),
+            ...(variableUpdate ? { variableUpdate } : {}),
             characterId: this.characterId,
             conversationId: this.conversationId,
             sessionToken: this.locatorRegistry.sessionToken,
@@ -2137,6 +2231,9 @@ export class ActiveConversationSession {
             conversation: cloneConversationMetadata(this.conversation),
         }
         this.onMutation?.(event)
+        if (commands.some((command) => command !== 'update-metadata')) {
+            this.lastMessageChangeVersion = this.sessionVersion
+        }
         this.generationContinuationStart = this.sessionVersion
         if (this.compatibilityFallback) {
             this.compatibilityBaselineMessageCount = this.conversation.message.length
