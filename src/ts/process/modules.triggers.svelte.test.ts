@@ -1,9 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { derived, get, proxy } from 'svelte/internal/client'
 import { get as getStore, writable } from 'svelte/store'
 import type { Database, triggerscript } from '../storage/database.svelte'
 
-vi.mock('src/lang', () => ({ language: {} }))
 vi.mock('../alert', () => ({}))
 vi.mock('../storage/database.svelte', () => ({
     getDatabase: vi.fn(),
@@ -37,7 +35,7 @@ beforeEach(() => {
 let fixtureId = 0
 
 function selectModules(modules: RisuModule[]) {
-    const records = proxy(
+    const records = $state(
         modules.map((module) => ({
             ...module,
             id: `synthetic-module-${++fixtureId}`,
@@ -77,8 +75,8 @@ describe('module trigger reads', () => {
             const before = JSON.stringify(records)
             // This is the Svelte $derived evaluation used by live display input
             // capture, with real state proxies and the real module getter.
-            const triggers = derived(getModuleTriggers)
-            const result = get(triggers)
+            const triggers = $derived.by(getModuleTriggers)
+            const result = triggers
 
             expect(result).toEqual([{ ...stored, lowLevelAccess: permission }])
             expect(result[0]).not.toBe(stored)
@@ -109,13 +107,13 @@ describe('module trigger reads', () => {
                 trigger: [{ ...makeTrigger(), comment: 'Third' }],
             },
         ])
-        const triggers = derived(() =>
+        const triggers = $derived(
             getModuleTriggers().map(({ comment, lowLevelAccess }) => ({
                 comment,
                 lowLevelAccess,
             })),
         )
-        expect(get(triggers)).toEqual([
+        expect(triggers).toEqual([
             { comment: 'Synthetic display trigger', lowLevelAccess: false },
             { comment: 'Second', lowLevelAccess: false },
             { comment: 'Third', lowLevelAccess: true },
@@ -123,7 +121,7 @@ describe('module trigger reads', () => {
 
         records[1].lowLevelAccess = true
         records[1].trigger![0].comment = 'Edited'
-        expect(get(triggers)).toEqual([
+        expect(triggers).toEqual([
             { comment: 'Edited', lowLevelAccess: true },
             { comment: 'Second', lowLevelAccess: true },
             { comment: 'Third', lowLevelAccess: true },
@@ -140,21 +138,21 @@ describe('live module selection', () => {
     })
 
     it('observes replacement, deletion and namespace edits without changing enabled IDs', () => {
-        const db = proxy({
+        const db = $state({
             modules: [{ id: 'module', name: 'Original', description: '', namespace: 'shared', customModuleToggle: 'old=Old' }],
             enabledModules: ['shared'],
         })
         vi.mocked(getDatabase).mockReturnValue(db as Database)
-        const toggles = derived(getModuleToggles)
-        expect(get(toggles)).toContain('old=Old')
+        const toggles = $derived.by(getModuleToggles)
+        expect(toggles).toContain('old=Old')
         db.modules[0] = { ...db.modules[0], customModuleToggle: 'new=New' }
-        expect(get(toggles)).toContain('new=New')
+        expect(toggles).toContain('new=New')
         db.modules[0].namespace = 'other'
-        expect(get(toggles)).toBe('')
+        expect(toggles).toBe('')
         db.enabledModules = ['module']
-        expect(get(toggles)).toContain('new=New')
+        expect(toggles).toContain('new=New')
         db.modules.splice(0, 1)
-        expect(get(toggles)).toBe('')
+        expect(toggles).toBe('')
     })
 
     it('keeps different ID lists distinct even when their hyphen-joined strings match', () => {
