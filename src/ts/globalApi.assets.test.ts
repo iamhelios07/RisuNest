@@ -125,7 +125,6 @@ vi.mock('./hotkey', () => ({ initMobileGesture: vi.fn() }))
 vi.mock('./gui/animation', () => ({ updateAnimationSpeed: vi.fn() }))
 vi.mock('./gui/colorscheme', () => ({ updateColorScheme: vi.fn(), updateTextThemeAndCSS: vi.fn() }))
 vi.mock('./gui/guisize', () => ({ updateGuisize: vi.fn() }))
-vi.mock('src/lang', () => ({ language: {} }))
 vi.mock('streamsaver', () => ({ default: { createWriteStream: vi.fn() } }))
 vi.mock('@tauri-apps/plugin-fs', () => ({
     open: vi.fn(async () => ({ write: state.fileWrite, close: state.fileClose })),

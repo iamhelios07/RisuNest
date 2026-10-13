@@ -50,13 +50,6 @@ vi.mock('./storage/nativeFileJobs', () => ({
 }))
 vi.mock('./storage/androidRisuSaveRouteProduction.svelte', () => ({ registerAndroidRisuSaveRoute: vi.fn() }))
 vi.mock('./storage/iosFiles', () => ({ reportInterruptedIOSBackupSourcesAtStart: vi.fn() }))
-vi.mock('src/lang', () => ({ changeLanguage: vi.fn(), language: { risuNest: {
-    startup: {
-        storage: 'Storage', account: 'Account', plugins: 'Plugins', ui: 'UI', data: 'Data', serviceWorker: 'Service worker',
-        rendererRecovered: 'Synthetic recovery notice',
-    },
-    backup: { officialAssetsRestoreFailed: 'Synthetic asset restore failed', officialAssetsMissing: 'Synthetic missing assets: {count}' },
-} } }))
 vi.mock('./platform', () => ({ get isTauri() { return startup.native }, isTauriAndroid: false, isTauriDesktop: false }))
 vi.mock('./storage/deviceSettings', () => ({ getStartupExclusions: () => startup.exclusions, loadDeviceSettings: () => ({ nativeFileLogEnabled: false }) }))
 vi.mock('./nativeLog', () => ({ recordNativeLogError: vi.fn(), setNativeLogFileEnabled: vi.fn() }))
@@ -179,6 +172,7 @@ vi.mock('./process/transformers', () => ({ releaseIdleTransformerModels: vi.fn()
 vi.mock('./process/files/inlayProviderImage', () => ({ forgetInlayProviderImages: vi.fn() }))
 
 import { loadData } from './bootstrap'
+import { language } from 'src/lang'
 import { keepPluginsOffForThisStart, loadPlugins } from './plugins/plugins.svelte'
 import { alertError, alertNormal, alertToast, alertTOS, waitAlert } from './alert'
 import { invoke } from '@tauri-apps/api/core'
@@ -379,7 +373,7 @@ describe('renderer recovery notice', () => {
         expect(startup.takeRendererRecovery).not.toHaveBeenCalled()
         expect(defaultPlugins.startDefaultPluginBootstrap).not.toHaveBeenCalled()
         answerTerms(true)
-        await vi.waitFor(() => expect(alertToast).toHaveBeenCalledExactlyOnceWith('Synthetic recovery notice'))
+        await vi.waitFor(() => expect(alertToast).toHaveBeenCalledExactlyOnceWith(language.risuNest.startup.rendererRecovered))
         await vi.waitFor(() => expect(defaultPlugins.startDefaultPluginBootstrap).toHaveBeenCalledOnce())
         expect(alertNormal).not.toHaveBeenCalled()
         expect(vi.mocked(waitAlert).mock.invocationCallOrder.at(-1))

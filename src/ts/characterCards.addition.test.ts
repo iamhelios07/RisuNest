@@ -59,7 +59,6 @@ vi.mock('./util', () => ({
     selectFileByDom: vi.fn(),
     sleep: vi.fn(),
 }))
-vi.mock('src/lang', () => ({ language: { errors: {}, importedCharacter: 'imported' } }))
 vi.mock('./globalApi.svelte', () => ({
     AppendableBuffer: class {},
     BlankWriter: class {

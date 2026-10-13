@@ -16,7 +16,6 @@ vi.mock('./stores.svelte', async () => {
 })
 vi.mock('./storage/database.svelte', () => ({ getDatabase: vi.fn(() => ({})) }))
 vi.mock('src/ts/platform', () => ({ isTauri: false }))
-vi.mock('../lang', () => ({ language: {} }))
 
 import { alertStore } from './stores.svelte'
 import { alertClear, alertConfirm, alertError, alertSelect, alertToast, alertTOS, alertWait, doingAlert, waitAlert } from './alert'

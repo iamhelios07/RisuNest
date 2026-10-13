@@ -125,7 +125,6 @@ vi.mock('./gui/colorscheme', () => ({
     updateTextThemeAndCSS: vi.fn(),
 }))
 vi.mock('./gui/guisize', () => ({ updateGuisize: vi.fn() }))
-vi.mock('src/lang', () => ({ language: {} }))
 vi.mock('streamsaver', () => ({ default: { createWriteStream: vi.fn() } }))
 vi.mock('@tauri-apps/plugin-fs', () => ({
     writeFile: vi.fn(),
