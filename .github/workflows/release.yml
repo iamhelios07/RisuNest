@@ -476,11 +476,11 @@ jobs:
         run: |
           set -euo pipefail
           pnpm exec -- tauri bundle --target "$TARGET" --bundles "$BUNDLES" --config "$RUNNER_TEMP/release-tauri.json"
-      - name: Verify app uninstall cleanup and retry
+      - name: Verify app and Sync uninstall cleanup, retry and progress
         if: matrix.os == 'windows' && needs.prepare-draft.outputs.already_published != 'true'
         env:
           RISUNEST_REQUIRE_NSIS: "1"
-        run: node --test tests/release/app-nsis-uninstall.node-test.mjs
+        run: node --test tests/release/app-nsis-uninstall.node-test.mjs tests/release/sync-nsis-uninstall.node-test.mjs tests/release/nsis-progress.node-test.mjs
       - name: Package app desktop assets
         if: needs.prepare-draft.outputs.already_published != 'true'
         shell: bash
@@ -759,18 +759,20 @@ jobs:
           RISUNEST_TEST_MANAGER: ${{ format('{0}/{1}/release/risunest-sync-manager.exe', env.CARGO_TARGET_DIR, matrix.target) }}
         run: |
           $tests = @(
-            'no_claim_helper_task_is_removed_without_consuming_recovery_state',
-            'helper_replaces_and_restarts_an_isolated_live_server',
-            'helper_verifies_a_stopped_replacement_then_restores_stopped_intent',
-            'interrupted_files_recovery_outlives_the_active_installed_manager',
-            'helper_recovers_the_live_server_when_its_parent_does_not_exit',
-            'helper_rolls_back_a_corrupt_live_replacement_and_restarts_the_old_server',
-            'installer_guard_records_restart_failure_after_accepted_corrupt_server_start'
+            'update_helper/no_claim_helper_task_is_removed_without_consuming_recovery_state',
+            'update_helper/helper_replaces_and_restarts_an_isolated_live_server',
+            'update_helper/helper_verifies_a_stopped_replacement_then_restores_stopped_intent',
+            'update_helper/interrupted_files_recovery_outlives_the_active_installed_manager',
+            'update_helper/helper_recovers_the_live_server_when_its_parent_does_not_exit',
+            'update_helper/helper_rolls_back_a_corrupt_live_replacement_and_restarts_the_old_server',
+            'update_helper/installer_guard_records_restart_failure_after_accepted_corrupt_server_start',
+            'manual_start/manual_start_is_independent_of_login_and_survives_registration_changes'
           )
           $logDirectory = Join-Path $env:RUNNER_TEMP 'sync-update-tests'
           New-Item -ItemType Directory -Force -Path $logDirectory | Out-Null
-          foreach ($test in $tests) {
-            & cargo test --manifest-path server/manager/Cargo.toml --release --locked --target '${{ matrix.target }}' --test update_helper $test -- --ignored --exact --nocapture 2>&1 |
+          foreach ($entry in $tests) {
+            $target, $test = $entry -split '/', 2
+            & cargo test --manifest-path server/manager/Cargo.toml --release --locked --target '${{ matrix.target }}' --test $target $test -- --ignored --exact --nocapture 2>&1 |
               Tee-Object -FilePath (Join-Path $logDirectory "$test.log") -OutVariable output | Out-Host
             if ($LASTEXITCODE -ne 0) { throw "$test failed." }
             if (($output | Out-String) -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored;') {
