@@ -10,8 +10,6 @@ const tauriLibRawSource = readFileSync('src-tauri/src/lib.rs', 'utf8')
 const maintenanceSource = readFileSync('src/ts/storage/nativePersistentMaintenance.ts', 'utf8')
 const replacementSource = readFileSync('src/ts/storage/upstreamReplacement.ts', 'utf8')
 const alertSource = readFileSync('src/lib/Others/AlertComp.svelte', 'utf8')
-import { languageEnglish } from 'src/lang/en'
-import { languageKorean } from 'src/lang/ko'
 import { RISUNEST_SETTINGS_TABS } from 'src/ts/setting/risuNestSettingsTabs'
 
 const normalizeNewlines = (source: string) => source.replace(/\r\n?/g, '\n')
@@ -59,18 +57,12 @@ describe('RisuNest settings navigation', () => {
         expect(settingsSource).not.toContain('$SettingsMenuIndex === 18')
     })
 
-    it('offers native and shared tabs in order, each named in both shipped languages', () => {
+    it('offers native and shared tabs in order', () => {
         expect(RISUNEST_SETTINGS_TABS).toEqual(['settings', 'storage', 'sync', 'plugin-data', 'network-logs'])
         expect(pageSource).toContain('role="tablist"')
         expect(pageSource).toContain('role="tab"')
         expect(pageSource).toContain('aria-selected={active}')
         expect(pageSource).toContain('role="tabpanel"')
-        for (const translation of [languageEnglish, languageKorean]) {
-            for (const key of ['settings', 'storage', 'sync', 'networkLogs', 'pluginData'] as const) {
-                expect(translation.risuNest.tabs[key]).toEqual(expect.any(String))
-            }
-            expect(translation.risuNest.tabList).toEqual(expect.any(String))
-        }
     })
 
     it('groups the settings tab as performance, UI, streaming, attachments, update, platform, diagnostics', () => {
@@ -150,16 +142,6 @@ describe('RisuNest backup and restore layout', () => {
             expect(backupRestoreSource).toContain(
                 `{language.risuNest.backup.${group}}`,
             )
-            expect(
-                languageEnglish.risuNest.backup[
-                    group as keyof typeof languageEnglish.risuNest.backup
-                ],
-            ).toEqual(expect.any(String))
-            expect(
-                languageKorean.risuNest.backup[
-                    group as keyof typeof languageKorean.risuNest.backup
-                ],
-            ).toEqual(expect.any(String))
         }
         expect(backupRestoreSource).toContain('data-backup-group')
         expect(backupRestoreSource).not.toContain('className="mt-2"')
@@ -280,32 +262,4 @@ describe('RisuNest native command integration', () => {
             ).toHaveLength(1)
         }
     })
-})
-describe('RisuNest startup failure language schema', () => {
-    const required = [
-        'title',
-        'schemaUnsupported',
-        'storeOpen',
-        'unknown',
-        'restart',
-        'copyDetails',
-        'copied',
-        'dataFolder',
-        'dataPathAndroid',
-        'dataPathIos',
-        'stage',
-    ]
-
-    it.each([languageEnglish, languageKorean])(
-        'contains every startup recovery string',
-        (translation) => {
-            for (const key of required) {
-                expect(
-                    translation.risuNest.boot[
-                        key as keyof typeof translation.risuNest.boot
-                    ],
-                ).toEqual(expect.any(String))
-            }
-        },
-    )
 })

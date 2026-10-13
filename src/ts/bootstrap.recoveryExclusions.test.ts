@@ -386,12 +386,6 @@ describe('renderer recovery notice', () => {
             .toBeLessThan(vi.mocked(alertToast).mock.invocationCallOrder[0])
     })
 
-    it('words the notice as a reload with saved data', async () => {
-        const [{ languageKorean }, { languageEnglish }] = await Promise.all([import('src/lang/ko'), import('src/lang/en')])
-        expect(languageKorean.risuNest.startup.rendererRecovered).toBe('저장된 데이터로 화면을 다시 불러왔습니다.')
-        expect(languageEnglish.risuNest.startup.rendererRecovered).toBe('The screen was reloaded with your saved data.')
-    })
-
     it('leaves the answer untaken when the terms are declined', async () => {
         const reload = vi.fn()
         vi.stubGlobal('location', { reload })

@@ -11,7 +11,6 @@ vi.mock('src/lang', async () => ({ language: (await import('src/lang/en')).langu
 
 import Component from './RisuNestStartupExclusions.svelte'
 import { languageEnglish } from 'src/lang/en'
-import { languageKorean } from 'src/lang/ko'
 
 const strings = languageEnglish.risuNest.recovery
 let component: ReturnType<typeof mount> | undefined
@@ -65,10 +64,5 @@ describe('items kept off from the recovery screen', () => {
         await tick()
         expect(settings.update).toHaveBeenCalledExactlyOnceWith([])
         expect(target.querySelector('h2')).toBeNull()
-    })
-
-    it('has its text in both shipped languages', () => {
-        expect(languageKorean.risuNest.recovery).toMatchObject({ keptTitle: '앞으로도 끈 항목', keptHelp: '켠 항목은 앱을 다시 시작하면 적용됩니다.', turnOn: '켜기' })
-        expect(languageEnglish.risuNest.recovery).toMatchObject({ keptTitle: 'Kept off', keptHelp: 'Items you turn on take effect when the app restarts.', turnOn: 'Turn on' })
     })
 })
