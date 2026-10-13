@@ -95,6 +95,19 @@ it('lists presets of the active prompt preset, shows all on request and applies 
     expect(mocks.toast).toHaveBeenCalledWith(languageEnglish.togglePresetApplied('One'))
 })
 
+it('uses staged values for a new preset without changing applied toggles', async () => {
+    await unmount(instance)
+    instance = mount(TogglePresetPopup, { target: document.body, props: {
+        close: mocks.close, values: { toggle_a: 'edited', toggle_b: '1' },
+    } })
+    mocks.input.mockResolvedValueOnce('Draft preset')
+    await tick()
+    byText(languageEnglish.saveNewTogglePreset).click()
+    await vi.waitFor(() => expect(presets().at(-1)?.name).toBe('Draft preset'))
+    expect(presets().at(-1)?.values).toEqual({ toggle_a: 'edited', toggle_b: '1' })
+    expect(DBState.db.globalChatVariables).toEqual({ toggle_a: '1', toggle_b: '0', toggle_orphan: 'x' })
+})
+
 it('saves a new preset from the defined toggles only and tags it with the prompt preset', async () => {
     mocks.input.mockResolvedValueOnce('  Three ')
     byText(languageEnglish.saveNewTogglePreset).click()
