@@ -8,7 +8,7 @@ import {
 } from "../parser/chatVar.svelte";
 import { hasher, type simpleCharacterArgument, risuChatParser } from "../parser/parser.svelte";
 import type { LuaEngine, LuaFactory } from "wasmoon";
-import { getCurrentCharacter, getCurrentChat, getDatabase, setDatabase, type Chat, type Database, type character, type triggerscript } from "../storage/database.svelte";
+import { getCurrentCharacter, getCurrentChat, getDatabase, setDatabase, type Chat, type Database, type Message, type character, type triggerscript } from "../storage/database.svelte";
 import { get } from "svelte/store";
 import { DBState, ReloadChatPointer, ReloadGUIPointer, selectedCharID } from "../stores.svelte";
 import { alertSelect, alertError, alertInput, alertNormal, alertConfirm } from "../alert";
@@ -279,6 +279,17 @@ export async function runScripted(code:string, arg:{
             }
             const readScriptingChat = () => ScriptingEngineState.readChat()
             const writeScriptingChat = () => ScriptingEngineState.writeChat()
+            const editScriptingMessage = (index: number, edit: (message: Message) => void) => {
+                if (ScriptingEngineState.access) {
+                    ScriptingEngineState.access.editMessage(index, edit)
+                    return
+                }
+                const chat = writeScriptingChat()
+                const message = chat.message
+                    ? getHistoryMessageAt(chat, index)
+                    : undefined
+                if (message) edit(message)
+            }
             const flushScriptingVariables = () => ScriptingEngineState.flushVariables?.()
             const getScriptingDatabase = () => ScriptingEngineState.readDatabase?.() ?? getDatabase()
             const getScriptingCharacterIndex = (db: Database) => {
@@ -429,25 +440,17 @@ export async function runScripted(code:string, arg:{
                 if(!ScriptingSafeIds.has(id)){
                     return
                 }
-                const chat = writeScriptingChat()
-                const message = chat.message
-                    ? getHistoryMessageAt(chat, index)
-                    : undefined
-                if(message){
+                editScriptingMessage(index, (message) => {
                     message.data = value ?? ''
-                }
+                })
             })
             declareAPI('setChatRole', (id:string, index:number, value:string) => {
                 if(!ScriptingSafeIds.has(id)){
                     return
                 }
-                const chat = writeScriptingChat()
-                const message = chat.message
-                    ? getHistoryMessageAt(chat, index)
-                    : undefined
-                if(message){
+                editScriptingMessage(index, (message) => {
                     message.role = value === 'user' ? 'user' : 'char'
-                }
+                })
             })
             declareAPI('cutChat', (id:string, start:number, end:number) => {
                 if(!ScriptingSafeIds.has(id)){
@@ -469,9 +472,13 @@ export async function runScripted(code:string, arg:{
                 if(!ScriptingSafeIds.has(id)){
                     return
                 }
-                const chat = writeScriptingChat()
                 let roleData:'user'|'char' = role === 'user' ? 'user' : 'char'
-                chat.message.push({role: roleData, data: value ?? '', chatId: v4()})
+                const message = {role: roleData, data: value ?? '', chatId: v4()}
+                if (ScriptingEngineState.access) {
+                    ScriptingEngineState.access.appendMessage(message)
+                    return
+                }
+                writeScriptingChat().message.push(message)
             })
             declareAPI('insertChat', (id:string, index:number, role:string, value:string) => {
                 if(!ScriptingSafeIds.has(id)){

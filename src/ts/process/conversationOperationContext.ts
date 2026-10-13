@@ -83,7 +83,7 @@ function exceedsCloneBudget(value: unknown, maxBytes: number): boolean {
     return visit(value)
 }
 
-function valuesEqual(left: unknown, right: unknown): boolean {
+export function valuesEqual(left: unknown, right: unknown): boolean {
     if (Object.is(left, right)) return true
     if (typeof left !== typeof right || left === null || right === null) return false
     if (Array.isArray(left) || Array.isArray(right)) {
@@ -107,6 +107,37 @@ function valuesEqual(left: unknown, right: unknown): boolean {
 function withoutScriptstate(metadata: ConversationMetadata): ConversationMetadata {
     const { scriptstate: _scriptstate, ...rest } = metadata
     return rest
+}
+
+/** `database` with the given conversation in place of the stored one, without copying either. */
+export function createConversationDatabaseView(
+    database: Database,
+    characterId: string,
+    conversationId: string,
+    chat: Chat,
+): Database {
+    const characterIndex = database.characters.findIndex(
+        (character) => character.chaId === characterId,
+    )
+    if (characterIndex === -1) return database
+
+    const character = database.characters[characterIndex]
+    const conversationIndex = character.chats.findIndex(
+        (conversation) => conversation.id === conversationId,
+    )
+    if (conversationIndex === -1) return database
+
+    const characters = database.characters.slice()
+    const chats = character.chats.slice()
+    chats[conversationIndex] = chat
+    characters[characterIndex] = {
+        ...character,
+        chats,
+    }
+    return {
+        ...database,
+        characters,
+    }
 }
 
 export class ConversationOperationContext {
@@ -199,28 +230,12 @@ export class ConversationOperationContext {
     }
 
     createDatabaseView(database: Database): Database {
-        const characterIndex = database.characters.findIndex(
-            (character) => character.chaId === this.session.characterId,
+        return createConversationDatabaseView(
+            database,
+            this.session.characterId,
+            this.session.conversationId,
+            this.chat,
         )
-        if (characterIndex === -1) return database
-
-        const character = database.characters[characterIndex]
-        const conversationIndex = character.chats.findIndex(
-            (conversation) => conversation.id === this.session.conversationId,
-        )
-        if (conversationIndex === -1) return database
-
-        const characters = database.characters.slice()
-        const chats = character.chats.slice()
-        chats[conversationIndex] = this.chat
-        characters[characterIndex] = {
-            ...character,
-            chats,
-        }
-        return {
-            ...database,
-            characters,
-        }
     }
 
     hasPendingMutations(): boolean {

@@ -139,10 +139,11 @@ let jsonLuaSource = ''
 function operationCharacterFixture(
   suffix: string,
   onMutation?: () => void,
+  messages: Chat['message'] = [{ role: 'user', data: 'message', chatId: `message-${suffix}` }],
 ) {
   const chat = {
     id: `lua-metadata-chat-${suffix}`,
-    message: [{ role: 'user', data: 'message', chatId: `message-${suffix}` }],
+    message: messages,
     localLore: [],
   } as unknown as Chat
   const char = {
@@ -1945,15 +1946,17 @@ test('runs variable-only Lua handlers and display listeners without visiting mes
   }
 })
 
-test('rejects a Lua message edit after the messages it read changed and keeps its variables', async () => {
-  const fixture = operationCharacterFixture('stale-message-edit')
+test.each(['after', 'before'] as const)('rejects a Lua message edit made %s the messages it read changed and keeps its variables', async (edit) => {
+  const fixture = operationCharacterFixture(`stale-message-edit-${edit}`)
+  const setChat = `setChat(id, 0, 'edited from ' .. before)`
   fixture.char.triggerscript = luaTriggerScript(`
     onButtonClick = async(function(id, data)
       local before = getChatMain(id, 0)
       setChatVar(id, 'asked', 'yes')
+      ${edit === 'before' ? setChat : ''}
       alertConfirm(id, 'synthetic confirmation'):await()
       setChatVar(id, 'answered', 'yes')
-      setChat(id, 0, 'edited from ' .. before)
+      ${edit === 'after' ? setChat : ''}
     end)
   `)
   installOperationCharacterFixture(fixture)
@@ -2016,14 +2019,184 @@ test('shows Lua variables at reloadDisplay and commits message edits at the end'
   try {
     const result = await runLuaButtonTrigger(fixture.char, 'click')
 
+    // The end commit refreshes for the variable written after reloadDisplay.
     expect(atRefresh).toEqual([
       { messages: ['message'], scriptstate: { $other: 'kept', $counter: '1' } },
+      { messages: ['edited'], scriptstate: { $other: 'kept', $counter: '1', $after: '2' } },
     ])
     expect(result.chat).toBe(fixture.chat)
     expect(fixture.chat.message.map((entry) => entry.data)).toEqual(['edited'])
     expect(fixture.chat.scriptstate).toEqual({ $other: 'kept', $counter: '1', $after: '2' })
   } finally {
     vi.mocked(ScriptDisplayRefreshPointer.update).mockReset()
+    continuationRuntime.session = null
+  }
+})
+
+test.each([
+  ['field edits', `
+    setChat(id, 1, 'edited ' .. getChatData(id, 1))
+    setChatRole(id, 3, 'char')
+    setChatVar(id, 'read', getChatData(id, 1) .. '/' .. getChatRole(id, 3) .. '/' .. cbs('{{message 1}}'))
+  `, ['user:zero', 'user:edited one', 'user:two', 'char:three'], 'edited one/char/edited one'],
+  ['an edit and an append', `
+    setChat(id, 3, 'edited ' .. getChatData(id, 3))
+    addChat(id, 'char', 'tail')
+    setChatVar(id, 'read', getChatData(id, -2) .. '/' .. getChatData(id, -1))
+  `, ['user:zero', 'user:one', 'user:two', 'user:edited three', 'char:tail'], 'edited three/tail'],
+] as const)('copies only the messages a Lua handler edits or appends (%s)', async (name, body, stored, read) => {
+  // Every property read of the other messages throws once the handler starts.
+  let locked = false
+  const messages = ['zero', 'one', 'two', 'three'].map((data, index) => {
+    const message = { role: 'user', data, chatId: `message-${index}` }
+    if (index % 2 === 1) return message
+    return new Proxy(message, {
+      get(target, property, receiver) {
+        if (locked) throw new Error(`read of message ${index}: ${String(property)}`)
+        return Reflect.get(target, property, receiver)
+      },
+    })
+  }) as Chat['message']
+  const fixture = operationCharacterFixture(`edit-set-${name.replaceAll(' ', '-')}`, undefined, messages)
+  fixture.char.triggerscript = luaTriggerScript(`
+    function onButtonClick(id, data)
+      ${body}
+    end
+  `)
+  installOperationCharacterFixture(fixture)
+  vi.mocked(getCurrentChat).mockReturnValue(fixture.chat)
+  vi.mocked(getCurrentCharacter).mockReturnValue(fixture.char)
+  continuationRuntime.session = fixture.session
+  // CBS reads the conversation from the database it is given.
+  vi.mocked(risuChatParser).mockImplementation((_value, options) =>
+    options!.db!.characters[0].chats[0].message[1].data)
+  const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+  const { runLuaButtonTrigger } = await import('./scriptings')
+  try {
+    locked = true
+    await runLuaButtonTrigger(fixture.char, 'click')
+    locked = false
+    expect(errors).not.toHaveBeenCalled()
+    expect(fixture.chat.message.map((entry) => `${entry.role}:${entry.data}`)).toEqual(stored)
+    expect(fixture.chat.scriptstate).toEqual({ $read: read })
+    expect(fixture.session.activePinReasons).toEqual([])
+  } finally {
+    locked = false
+    vi.mocked(risuChatParser).mockReset()
+    errors.mockRestore()
+    continuationRuntime.session = null
+  }
+})
+
+test.each([
+  ['field edits and appends', `
+    setChat(id, 1, 'edited ' .. getChatData(id, 1))
+    setChatRole(id, 1, 'user')
+    addChat(id, 'char', 'tail')
+    setChat(id, -1, getChatData(id, -1) .. ' after ' .. getChatData(id, 1))
+    setChat(id, 9, 'ignored')
+    setChat(id, -9, 'ignored')
+    setChatVar(id, 'read', getChatData(id, -1))
+  `, ['user:zero', 'user:edited one', 'user:two', 'char:tail after edited one']],
+  ['a structural edit after field edits', `
+    setChat(id, 0, 'edited')
+    addChat(id, 'user', 'tail')
+    insertChat(id, 1, 'char', 'inserted')
+    setChat(id, -1, getChatData(id, -1) .. ' edited')
+    setChatVar(id, 'read', getChatData(id, 1))
+  `, ['user:edited', 'char:inserted', 'char:one', 'user:two', 'user:tail edited']],
+  ['an unchanged value', `
+    setChat(id, 0, getChatData(id, 0))
+  `, ['user:zero', 'char:one', 'user:two']],
+] as const)('stores what a whole conversation copy stores for Lua edits (%s)', async (name, body, stored) => {
+  const code = `
+    function mutate(id)
+      ${body}
+    end
+    function onButtonClick(id, data)
+      mutate(id)
+    end
+    listenEdit('editInput', function(id, value)
+      mutate(id)
+      return value
+    end)
+  `
+  const slug = name.replaceAll(' ', '-')
+  const messages = () => ['zero', 'one', 'two'].map((data, index) => ({
+    role: index % 2 === 0 ? 'user' : 'char',
+    data,
+    chatId: `message-${index}`,
+  })) as Chat['message']
+  const normalize = (chat: Chat) => chat.message.map((entry) => ({
+    role: entry.role,
+    data: entry.data,
+    id: entry.chatId?.startsWith('message-') ? entry.chatId : typeof entry.chatId,
+  }))
+
+  const copy = operationCharacterFixture(`whole-copy-${slug}`, undefined, messages())
+  const operationContext = createConversationOperationContext(copy.session, copy.chat)
+  await runScripted(code, { char: copy.char, mode: 'editInput', operationContext })
+  operationContext.commit(copy.session)
+
+  const fixture = operationCharacterFixture(`edit-set-copy-${slug}`, undefined, messages())
+  fixture.char.triggerscript = luaTriggerScript(code)
+  installOperationCharacterFixture(fixture)
+  vi.mocked(getCurrentChat).mockReturnValue(fixture.chat)
+  vi.mocked(getCurrentCharacter).mockReturnValue(fixture.char)
+  continuationRuntime.session = fixture.session
+  const { runLuaButtonTrigger } = await import('./scriptings')
+  try {
+    await runLuaButtonTrigger(fixture.char, 'click')
+  } finally {
+    continuationRuntime.session = null
+  }
+
+  expect(copy.chat.message.map((entry) => `${entry.role}:${entry.data}`)).toEqual(stored)
+  expect(normalize(fixture.chat)).toEqual(normalize(copy.chat))
+  expect(fixture.chat.scriptstate).toEqual(copy.chat.scriptstate)
+  expect(fixture.session.version > 0).toBe(copy.session.version > 0)
+  expect(fixture.session.activePinReasons).toEqual([])
+})
+
+test('later trigger effects read the messages a Lua trigger edited', async () => {
+  const fixture = operationCharacterFixture('trigger-after-lua', undefined, [
+    { role: 'user', data: 'zero', chatId: 'message-0' },
+    { role: 'char', data: 'one', chatId: 'message-1' },
+  ])
+  fixture.char.triggerscript = [{
+    comment: 'luaThenRead',
+    type: 'manual',
+    conditions: [],
+    effect: [
+      { type: 'triggerlua', code: `
+        function luaThenRead(id)
+          setChat(id, -1, 'lua edited')
+          addChat(id, 'user', 'lua tail')
+        end
+      ` },
+      { type: 'v2GetMessageAtIndex', index: '1', indexType: 'value', outputVar: 'edited', indent: 0 },
+      { type: 'v2GetMessageCount', outputVar: 'count', indent: 0 },
+      { type: 'modifychat', index: '0', value: 'trigger edited' },
+    ],
+  }] as never
+  installOperationCharacterFixture(fixture)
+  vi.mocked(getCurrentChat).mockReturnValue(fixture.chat)
+  vi.mocked(getCurrentCharacter).mockReturnValue(fixture.char)
+  vi.mocked(risuChatParser).mockImplementation((value) => value)
+  continuationRuntime.session = fixture.session
+  const { runTrigger } = await import('./triggers')
+  try {
+    await runTrigger(fixture.char, 'manual', { chat: fixture.chat, manualName: 'luaThenRead' })
+
+    expect(fixture.chat.message.map((entry) => entry.data)).toEqual([
+      'trigger edited',
+      'lua edited',
+      'lua tail',
+    ])
+    expect(fixture.chat.scriptstate).toEqual({ $edited: 'lua edited', $count: '3' })
+    expect(fixture.session.activePinReasons).toEqual([])
+  } finally {
+    vi.mocked(risuChatParser).mockReset()
     continuationRuntime.session = null
   }
 })
