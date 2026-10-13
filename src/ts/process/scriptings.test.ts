@@ -36,6 +36,8 @@ const scriptingSelectionState = vi.hoisted(() => ({ index: 0 }))
 const createdLuaEngines = vi.hoisted(() => [] as LuaEngine[])
 const createdLuaEngineOptions = vi.hoisted(() => [] as unknown[])
 const diagnosticEngineSetup = vi.hoisted(() => ({ next: null as ((engine: LuaEngine) => void) | null }))
+// Replaces the product's function deadline, whose value the engine option tests check, so a run that waits it out is short.
+const engineFunctionTimeout = vi.hoisted(() => ({ ms: null as number | null }))
 
 vi.mock('../parser/parser.svelte', () => ({
   hasher: vi.fn(),
@@ -114,7 +116,7 @@ vi.mock('./luaRuntime', async (importOriginal) => {
       const createEngine = factory.createEngine.bind(factory)
       factory.createEngine = async (options) => {
         createdLuaEngineOptions.push(options)
-        const engine = await createEngine(options)
+        const engine = await createEngine(engineFunctionTimeout.ms === null ? options : { ...options, functionTimeout: engineFunctionTimeout.ms })
         createdLuaEngines.push(engine)
         const setup = diagnosticEngineSetup.next
         diagnosticEngineSetup.next = null
@@ -2048,6 +2050,7 @@ test('settles a resumed coroutine rejection without leaving an unhandled rejecti
     unhandledRejections.push(reason)
   }
   process.on('unhandledRejection', onUnhandledRejection)
+  engineFunctionTimeout.ms = 50
   vi.mocked(requestChatData).mockReset()
   vi.mocked(requestChatData).mockImplementationOnce(async () => {
     // The coroutine has reached its async boundary; only its resumed execution remains.
@@ -2074,6 +2077,7 @@ test('settles a resumed coroutine rejection without leaving an unhandled rejecti
     expect(requestChatData).toHaveBeenCalledOnce()
     expect(unhandledRejections).toEqual([])
   } finally {
+    engineFunctionTimeout.ms = null
     process.off('unhandledRejection', onUnhandledRejection)
     vi.mocked(requestChatData).mockReset()
   }

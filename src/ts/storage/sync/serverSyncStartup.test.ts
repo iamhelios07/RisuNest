@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { SyncBindingState } from './bindingFlow'
 
 const f = vi.hoisted(() => ({
@@ -41,6 +41,8 @@ let component: ReturnType<(typeof import('svelte'))['mount']> | undefined
 const settle = async () => { for (let i = 0; i < 40; i++) await Promise.resolve(); await ui.tick() }
 const commands = () => f.invoke.mock.calls.map(([command]) => command)
 const button = (text: string) => [...document.querySelectorAll('button')].find(value => value.textContent?.trim() === text)
+// The first import compiles the settings page, which can outlast a test's time limit in a full run.
+beforeAll(async () => { await import('src/lib/Setting/Pages/ServerSyncSettings.svelte') }, 60_000)
 beforeEach(async () => {
     vi.resetModules(); f.invoke.mockReset(); f.offline = true; f.repairError = undefined; f.activationError = undefined; f.fenceError = undefined
     f.configured = true; f.pending = null; f.inspectError = undefined; f.pushError = undefined

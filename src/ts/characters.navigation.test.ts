@@ -1024,7 +1024,10 @@ describe('chat list operations', () => {
         const { SaveCoordinator } = await import('./storage/saveCoordinator')
         const { createPersistenceCanonicalCapture } = await import('./storage/reactivePersistenceCapture.svelte')
         const { createPersistentSaveObserverHarness } = await import('./storage/tests/persistentSaveObserverHarness.svelte')
-        const { cloneConversationByMessage, CONVERSATION_INSERT_PAGE_BYTES } = await import('./storage/conversationInsertPages')
+        const { cloneConversationByMessage } = await import('./storage/conversationInsertPages')
+        // Two of the three messages fit in one page, as with the product page and full-size messages.
+        const pageBytes = 64 * 1024
+        const pageSlack = 8 * 1024
         const { utf8ByteLength } = await import('./storage/nativePersistenceValue')
         const { encodeNativeCommit } = await import('./storage/nativeCommitTransport')
         let encodedRequests = 0
@@ -1034,7 +1037,7 @@ describe('chat list operations', () => {
             terminate() {}
             postMessage(data: { pages: Uint8Array[]; byteLength: number }, transfer: ArrayBuffer[]) {
                 expect(Object.keys(data)).toEqual(['pages', 'byteLength'])
-                expect(data.byteLength).toBeLessThan(CONVERSATION_INSERT_PAGE_BYTES + 64 * 1024)
+                expect(data.byteLength).toBeLessThan(pageBytes + pageSlack)
                 expect(data.pages.every((page) => page.byteLength <= 1024 * 1024)).toBe(true)
                 const received = structuredClone(data, { transfer })
                 expect(data.pages.every((page) => page.byteLength === 0)).toBe(true)
@@ -1082,6 +1085,7 @@ describe('chat list operations', () => {
             captureRoot: () => ({}) as any, capturePresets: () => [], capturePluginStorage: () => null,
             captureCharacters: () => mocks.database.characters, captureSelectedCharacter: current,
             captureCharacter: (id) => mocks.database.characters.find((value: any) => value.chaId === id) ?? null, replaceDatabase: () => {},
+            conversationInsertPageBytes: pageBytes,
         })
         coordinator.initialize(revision)
         mocks.getSelectedConversationMode.mockReturnValue('complete')
@@ -1097,7 +1101,7 @@ describe('chat list operations', () => {
             await coordinator.flushPendingData('after-duplicate-selection')
             return result
         })
-        const data = '한글🐿️é'.repeat(550_000)
+        const data = '한글🐿️é'.repeat(2_000)
         const messages = [0, 1, 2].map((index) => ({ role: 'user', data: `${index}:${data}`, chatId: `import-message-${index}` }))
         mocks.selectSingleFile.mockResolvedValueOnce({ name: 'large-synthetic.json', data: new TextEncoder().encode(JSON.stringify({
             type: 'risuChat', ver: 2, data: { id: 'input', name: 'Large import', note: '', localLore: [], message: messages }, folders: [],
@@ -1124,7 +1128,7 @@ describe('chat list operations', () => {
                 chats: [{ id: 'new-character-chat', name: 'New chat', note: '', localLore: [], message: messages }] } as any, 'large-character-import')
             expect((stored.get('new-character-chat') as any).message.map((message: any) => message.data)).toEqual(messages.map((message) => message.data))
             expect(requests.find((request) => request.addCharacter)?.addCharacter.chats).toEqual([])
-            expect(largestEncoding).toBeLessThan(CONVERSATION_INSERT_PAGE_BYTES + 64 * 1024)
+            expect(largestEncoding).toBeLessThan(pageBytes + pageSlack)
             expect(requests.filter((request) => request.conversations?.some((mutation: any) => mutation.start > 0))).toHaveLength(4)
             expect(encodedRequests).toBe(requests.length)
             expect(coordinator.hasPendingPersistenceWork).toBe(false)
@@ -1133,7 +1137,7 @@ describe('chat list operations', () => {
             vi.unstubAllGlobals()
             mocks.commitCharacterAddition.mockImplementation(async (request: any) => request.install())
         }
-    }, 30_000)
+    })
 
     it('keeps the selected chat when another chat is removed', async () => {
         const character = buildSelectedCharacter()

@@ -121,6 +121,8 @@ export interface SaveCoordinatorDependencies {
     officialPublisher?: OfficialRevisionPublisher
     clock?: SaveCoordinatorClock
     now?(): number
+    /** Message bytes of created conversations in one commit of a split save; defaults to CONVERSATION_INSERT_PAGE_BYTES. */
+    conversationInsertPageBytes?: number
     onRoutineUnitsCommitted?(revision: DataRevision, keys: readonly string[]): Promise<void>
     onLocalRevision?(revision: DataRevision): void
     /** Advances revision-only working-set state synchronously and must not throw. */
@@ -4713,7 +4715,7 @@ export class SaveCoordinator {
 
     /** Commits a flush, writing created conversations in pages when the whole save is too large. */
     private async commitFlush(commit: WorkingSetCommit): Promise<{ revision: DataRevision }> {
-        const plan = planConversationInsertPages(commit)
+        const plan = planConversationInsertPages(commit, this.dependencies.conversationInsertPageBytes)
         return plan ? this.commitInsertPages(commit.expectedRevision, plan) : this.commitRoutine(commit)
     }
 

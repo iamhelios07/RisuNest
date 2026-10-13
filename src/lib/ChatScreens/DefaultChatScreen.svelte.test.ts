@@ -546,54 +546,35 @@ it('does not send or reroll from composing keyboard events', async () => {
     expect(input.value).toBe('Composition draft')
 })
 
-const sendKeyCases: Array<{ name: string; keys: KeyboardEventInit; sends: string[] }> = [
-    { name: 'Enter', keys: {}, sends: ['enter'] },
-    { name: 'Shift+Enter', keys: { shiftKey: true }, sends: ['ctrl-shift-enter'] },
-    { name: 'Ctrl+Enter', keys: { ctrlKey: true }, sends: ['ctrl-shift-enter'] },
-    { name: 'Command+Enter', keys: { metaKey: true }, sends: ['ctrl-shift-enter'] },
-    { name: 'Alt+Enter', keys: { altKey: true }, sends: [] },
-    { name: 'Ctrl+Shift+Enter', keys: { ctrlKey: true, shiftKey: true }, sends: [] },
-    { name: 'Command+Shift+Enter', keys: { metaKey: true, shiftKey: true }, sends: [] },
-    { name: 'Ctrl+Command+Enter', keys: { ctrlKey: true, metaKey: true }, sends: [] },
-    { name: 'Ctrl+Alt+Enter', keys: { ctrlKey: true, altKey: true }, sends: [] },
-    { name: 'composing Enter', keys: { isComposing: true }, sends: [] },
-    { name: 'composing Shift+Enter', keys: { isComposing: true, shiftKey: true }, sends: [] },
-    { name: 'WebKit IME confirmation', keys: { keyCode: 229, ctrlKey: true }, sends: [] },
-]
+// messageSendKey.test.ts covers each key in each mode; this proves both inputs follow the device setting.
+it.each(['textarea.input-text', '#messageInputTranslate'])('%s sends with the key the device setting selects', async (selector) => {
+    mocks.bounded = true
+    DBState.db.sendWithEnter = false
+    DBState.db.useAutoTranslateInput = true
+    await tick()
+    const draft = type('Synthetic send-key draft')
+    updateDeviceSettings({ messageSendKey: 'ctrl-shift-enter' })
+    const input = document.querySelector<HTMLTextAreaElement>(selector)!
+    const enter = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })
+    input.dispatchEvent(enter)
+    await tick()
+    expect(enter.defaultPrevented).toBe(false)
+    expect(mocks.generate).not.toHaveBeenCalled()
+    expect(draft.value).toBe('Synthetic send-key draft')
+    const ctrlEnter = new KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true, bubbles: true, cancelable: true })
+    input.dispatchEvent(ctrlEnter)
+    expect(ctrlEnter.defaultPrevented).toBe(true)
+    await vi.waitFor(() => expect(mocks.generate).toHaveBeenCalledOnce())
+})
 
-for (const mode of ['enter', 'ctrl-shift-enter', 'button'] as const) {
-    for (const selector of ['textarea.input-text', '#messageInputTranslate']) {
-        it.each(sendKeyCases)(`${mode}, ${selector}: $name sends only when selected`, async ({ keys, sends }) => {
-            mocks.bounded = true
-            DBState.db.sendWithEnter = false
-            DBState.db.useAutoTranslateInput = true
-            await tick()
-            const draft = type('Synthetic send-key draft')
-            updateDeviceSettings({ messageSendKey: mode })
-            const input = document.querySelector<HTMLTextAreaElement>(selector)!
-            const event = new KeyboardEvent('keydown', { key: 'Enter', ...keys, bubbles: true, cancelable: true })
-            input.dispatchEvent(event)
-            if (sends.includes(mode)) {
-                expect(event.defaultPrevented).toBe(true)
-                await vi.waitFor(() => expect(mocks.generate).toHaveBeenCalledOnce())
-            } else {
-                await tick()
-                expect(event.defaultPrevented).toBe(false)
-                expect(mocks.generate).not.toHaveBeenCalled()
-                expect(draft.value).toBe('Synthetic send-key draft')
-            }
-        })
-    }
-
-    it(`keeps the send button available in ${mode} mode`, async () => {
-        mocks.bounded = true
-        updateDeviceSettings({ messageSendKey: mode })
-        type('Synthetic button draft')
-        document.querySelector<HTMLButtonElement>('.button-icon-send')!.click()
-        await vi.waitFor(() => expect(mocks.generate).toHaveBeenCalledOnce())
-        expect(mocks.appended).toEqual([expect.objectContaining({ data: 'Synthetic button draft' })])
-    })
-}
+it.each(['enter', 'ctrl-shift-enter', 'button'] as const)('keeps the send button available in %s mode', async (mode) => {
+    mocks.bounded = true
+    updateDeviceSettings({ messageSendKey: mode })
+    type('Synthetic button draft')
+    document.querySelector<HTMLButtonElement>('.button-icon-send')!.click()
+    await vi.waitFor(() => expect(mocks.generate).toHaveBeenCalledOnce())
+    expect(mocks.appended).toEqual([expect.objectContaining({ data: 'Synthetic button draft' })])
+})
 
 const stopListening: Array<() => void> = []
 function listenGenerationEnd() {
