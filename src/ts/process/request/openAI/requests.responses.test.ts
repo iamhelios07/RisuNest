@@ -53,9 +53,6 @@ vi.mock('src/ts/globalApi.svelte', () => ({
     textifyReadableStream: vi.fn(),
 }))
 
-vi.mock('src/lang', () => ({
-    language: { errors: { httpError: 'HTTP ' } },
-}))
 
 vi.mock('src/ts/alert', () => ({
     alertError: vi.fn(),

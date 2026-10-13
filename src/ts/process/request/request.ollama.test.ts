@@ -13,7 +13,6 @@ const mocks = vi.hoisted(() => ({
     genTime: 1,
   },
 }));
-vi.mock("src/lang", () => ({ language: {} }));
 vi.mock("src/ts/globalApi.svelte", () => ({
   fetchNative: mocks.fetch,
   globalFetch: vi.fn(),
