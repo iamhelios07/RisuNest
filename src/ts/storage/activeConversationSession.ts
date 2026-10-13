@@ -1753,12 +1753,12 @@ export class ActiveConversationSession {
 
     /**
      * Writes chat variables, last writer wins per key, regardless of what changed since
-     * the caller read them. Returns false when every value is already current.
+     * the caller read them. Returns the keys whose value changed.
      */
     updateChatVariables(
         changes: ReadonlyMap<string, string>,
         options: { origin?: 'display' } = {},
-    ): boolean {
+    ): readonly string[] {
         this.assertActive()
         if (this.transactionActive) {
             throw new Error('Nested conversation session transactions are not supported')
@@ -1767,7 +1767,7 @@ export class ActiveConversationSession {
         const changed = [...changes].filter(
             ([key, value]) => previousScriptstate?.['$' + key] !== value,
         )
-        if (changed.length === 0) return false
+        if (changed.length === 0) return []
 
         this.transactionActive = true
         try {
@@ -1817,7 +1817,7 @@ export class ActiveConversationSession {
                 this.locatorRegistry = previousLocatorRegistry
                 throw error
             }
-            return true
+            return changed.map(([key]) => key)
         } finally {
             this.transactionActive = false
         }

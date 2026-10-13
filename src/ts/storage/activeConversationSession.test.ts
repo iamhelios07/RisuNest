@@ -926,13 +926,13 @@ describe('ActiveConversationSession', () => {
         const messageVersion = session.messageVersion
         expect(messageVersion).toBe(1)
 
-        expect(session.updateChatVariables(new Map([['kept', 'same']]))).toBe(false)
+        expect(session.updateChatVariables(new Map([['kept', 'same']]))).toEqual([])
         expect(session.version).toBe(1)
         expect(session.updateChatVariables(new Map([
             ['kept', 'same'],
             ['open', '1'],
             ['created', 'new'],
-        ]))).toBe(true)
+        ]))).toEqual(['open', 'created'])
 
         expect(conversation.scriptstate).toEqual({ $kept: 'same', $open: '1', $created: 'new' })
         expect(session.version).toBe(2)

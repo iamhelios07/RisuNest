@@ -25,6 +25,20 @@ export interface ConversationOperationCommit {
 
 export type ConversationCommitObserver = (commit: ConversationOperationCommit) => void
 
+export interface ConversationOperationOptions {
+    /**
+     * The operation does not own chat variables: commits keep the session's current
+     * `scriptstate`, and variable-only commits made meanwhile do not make it stale.
+     */
+    variablesFollowSession?: boolean
+}
+
+export interface ConversationOperationCommitOptions {
+    origin?: 'display'
+    /** Chat variables written with the operation, applied over the session's current values. */
+    variables?: ReadonlyMap<string, string>
+}
+
 export interface ConversationReplaceRangeBatchEntry {
     type: 'replace-range'
     startIndex: number
@@ -90,18 +104,29 @@ function valuesEqual(left: unknown, right: unknown): boolean {
     )
 }
 
+function withoutScriptstate(metadata: ConversationMetadata): ConversationMetadata {
+    const { scriptstate: _scriptstate, ...rest } = metadata
+    return rest
+}
+
 export class ConversationOperationContext {
-    readonly baseVersion: number
     readonly chat: Chat
     readonly mode: ConversationOperationMode
 
-    private readonly originalMetadata: ConversationMetadata
+    private currentBaseVersion: number
+    private readonly baseMessageVersion: number
+    private readonly variablesFollowSession: boolean
+    private originalMetadata: ConversationMetadata
     private readonly originalMessages: Message[]
     private readonly sourceMessages: Message[]
     private readonly sourceMessageIdentities: readonly Message[]
     private readonly pin: ActiveConversationPin
     private readonly precedingGenerationVersion: number
     private released = false
+
+    get baseVersion(): number {
+        return this.currentBaseVersion
+    }
 
     get characterId(): string {
         return this.session.characterId
@@ -115,6 +140,7 @@ export class ConversationOperationContext {
         private readonly session: ActiveConversationSession,
         private readonly sourceChat: Chat,
         private readonly onCommitted?: ConversationCommitObserver,
+        options: ConversationOperationOptions = {},
     ) {
         if (session.materializeCompatibilityArray() !== sourceChat.message) {
             throw new Error(
@@ -122,7 +148,9 @@ export class ConversationOperationContext {
             )
         }
 
-        this.baseVersion = session.version
+        this.currentBaseVersion = session.version
+        this.baseMessageVersion = session.messageVersion
+        this.variablesFollowSession = options.variablesFollowSession ?? false
         this.precedingGenerationVersion = session.generationInvalidationVersion
         this.sourceMessages = sourceChat.message
         this.sourceMessageIdentities = [...sourceChat.message]
@@ -265,8 +293,11 @@ export class ConversationOperationContext {
         projectedMessage.chatId = messageId
     }
 
-    collectMutationBatch(): ConversationMutationBatch {
+    collectMutationBatch(
+        variables?: ReadonlyMap<string, string>,
+    ): ConversationMutationBatch {
         this.assertOpen()
+        this.followVariableCommits()
         if (this.session.version !== this.baseVersion) {
             throw new ConversationSessionStaleError(
                 this.baseVersion,
@@ -332,7 +363,7 @@ export class ConversationOperationContext {
             })
         }
 
-        const metadata = cloneConversationMetadata(this.chat)
+        const metadata = this.committedMetadata(variables)
         if (!conversationMetadataEqual(this.originalMetadata, metadata)) {
             batch.push({
                 type: 'update-metadata',
@@ -342,19 +373,62 @@ export class ConversationOperationContext {
         return batch
     }
 
+    /** Adopts variable-only commits made since this operation started, if nothing else changed. */
+    private followVariableCommits(): void {
+        if (
+            !this.variablesFollowSession ||
+            this.session.version === this.currentBaseVersion ||
+            this.session.messageVersion !== this.baseMessageVersion
+        ) {
+            return
+        }
+        const currentMetadata = cloneConversationMetadata(this.sourceChat)
+        if (!conversationMetadataEqual(
+            withoutScriptstate(this.originalMetadata),
+            withoutScriptstate(currentMetadata),
+        )) {
+            return
+        }
+        this.originalMetadata = currentMetadata
+        this.currentBaseVersion = this.session.version
+    }
+
+    private committedMetadata(
+        variables?: ReadonlyMap<string, string>,
+    ): ConversationMetadata {
+        const metadata = cloneConversationMetadata(this.chat)
+        if (!this.variablesFollowSession) {
+            for (const [key, value] of variables ?? []) {
+                const scriptstate = (metadata.scriptstate ??= {}) as Record<string, unknown>
+                scriptstate['$' + key] = value
+            }
+            return metadata
+        }
+        const current = this.originalMetadata.scriptstate as Record<string, unknown> | undefined
+        if (current === undefined && !variables?.size) {
+            delete metadata.scriptstate
+            return metadata
+        }
+        const scriptstate: Record<string, unknown> = safeStructuredClone(current ?? {})
+        for (const [key, value] of variables ?? []) scriptstate['$' + key] = value
+        metadata.scriptstate = scriptstate
+        return metadata
+    }
+
     commit(
         currentSession: ActiveConversationSession | null,
-        options: { origin?: 'display' } = {},
+        options: ConversationOperationCommitOptions = {},
     ): ConversationMutationBatch {
         try {
             requireCurrentConversationSession(this.session, currentSession)
+            this.followVariableCommits()
             if (this.session.version !== this.baseVersion) {
                 throw new ConversationSessionStaleError(
                     this.baseVersion,
                     this.session.version,
                 )
             }
-            const batch = this.collectMutationBatch()
+            const batch = this.collectMutationBatch(options.variables)
             const range = batch.find(
                 (mutation): mutation is ConversationReplaceRangeBatchEntry =>
                     mutation.type === 'replace-range',
@@ -364,7 +438,7 @@ export class ConversationOperationContext {
                     mutation.type === 'update-metadata',
             )
             this.session.applyOperation({
-                ...options,
+                ...(options.origin ? { origin: options.origin } : {}),
                 expectedVersion: this.baseVersion,
                 expectedMetadata: this.originalMetadata,
                 metadata: metadata?.metadata ?? this.originalMetadata,
@@ -387,9 +461,11 @@ export class ConversationOperationContext {
 
     commitMetadata(
         currentSession: ActiveConversationSession | null,
+        variables?: ReadonlyMap<string, string>,
     ): ConversationMutationBatch {
         try {
             requireCurrentConversationSession(this.session, currentSession)
+            this.followVariableCommits()
             if (this.session.version !== this.baseVersion) {
                 throw new ConversationSessionStaleError(
                     this.baseVersion,
@@ -407,7 +483,7 @@ export class ConversationOperationContext {
                     'Conversation operation metadata baseline changed',
                 )
             }
-            const metadata = cloneConversationMetadata(this.chat)
+            const metadata = this.committedMetadata(variables)
             const batch: ConversationMutationBatch = conversationMetadataEqual(
                 this.originalMetadata,
                 metadata,
@@ -455,6 +531,7 @@ export function createConversationOperationContext(
     session: ActiveConversationSession,
     sourceChat: Chat,
     onCommitted?: ConversationCommitObserver,
+    options?: ConversationOperationOptions,
 ): ConversationOperationContext {
-    return new ConversationOperationContext(session, sourceChat, onCommitted)
+    return new ConversationOperationContext(session, sourceChat, onCommitted, options)
 }
