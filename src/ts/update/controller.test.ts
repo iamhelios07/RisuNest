@@ -31,7 +31,7 @@ import {
 } from './controller'
 import { appUpdateState, initialAppUpdateState } from './state.svelte'
 import { language } from '../../lang'
-import type { NativeUpdateCheckResult } from './manifest'
+import type { NativeUpdateCheckResult, StagedDebUpdate } from './manifest'
 import { getAppUpdateSettings, updateAppUpdateSettings } from './settings'
 
 const available: NativeUpdateCheckResult = {
@@ -185,6 +185,73 @@ describe('app update controller', () => {
         expect(vi.getTimerCount()).toBe(1)
         await vi.advanceTimersToNextTimerAsync()
         expect(nativeMocks.check).toHaveBeenCalledTimes(2)
+    })
+
+    it.each(['cancelled', 'failed', 'staged'] as const)('pauses automatic checks during installation and resumes after %s', async (outcome) => {
+        vi.useFakeTimers()
+        vi.setSystemTime(UPDATE_CHECK_INTERVAL_MS + 1_000)
+        vi.stubGlobal('requestIdleCallback', (callback: IdleRequestCallback) => {
+            callback({ didTimeout: false, timeRemaining: () => 50 })
+            return 1
+        })
+        updateAppUpdateSettings({ autoUpdateCheck: true, skippedVersion: '', lastCheckedAt: Date.now() })
+        await startAppUpdateChecks()
+
+        const fixture = dependencies()
+        let finish!: () => void
+        const stagedDeb = { path: '/tmp/update.deb', installCommand: 'sudo apt install /tmp/update.deb' }
+        if (outcome === 'staged') {
+            fixture.value.stageDeb = vi.fn(() => new Promise<StagedDebUpdate>(resolve => { finish = () => resolve(stagedDeb) }))
+        } else {
+            fixture.value.install = vi.fn(() => new Promise<void>((_, reject) => {
+                finish = () => reject(new Error(outcome))
+            }))
+        }
+        appUpdateState.update(state => ({
+            ...state,
+            phase: 'available',
+            update: { ...available.update!, installStrategy: outcome === 'staged' ? 'stage-deb' : 'self-install' },
+        }))
+        const pending = applyAppUpdate(fixture.value)
+        await Promise.resolve()
+        expect(vi.getTimerCount()).toBe(0)
+        if (outcome === 'failed') appUpdateState.update(state => ({ ...state, phase: 'applying' }))
+        updateAppUpdateSettings({ skippedVersion: '' })
+        expect(vi.getTimerCount()).toBe(0)
+        await vi.advanceTimersByTimeAsync(UPDATE_CHECK_INTERVAL_MS + 1)
+        expect(nativeMocks.check).not.toHaveBeenCalled()
+
+        finish()
+        await pending
+        expect(get(appUpdateState).phase).toBe(outcome === 'staged' ? 'staged' : outcome === 'cancelled' ? 'available' : 'error')
+        await vi.advanceTimersByTimeAsync(0)
+        expect(nativeMocks.check).toHaveBeenCalledTimes(1)
+        await vi.advanceTimersByTimeAsync(UPDATE_CHECK_INTERVAL_MS - 1)
+        expect(nativeMocks.check).toHaveBeenCalledTimes(1)
+        await vi.advanceTimersByTimeAsync(1)
+        expect(nativeMocks.check).toHaveBeenCalledTimes(2)
+    })
+
+    it.each(['disabled', 'stopped'] as const)('does not resume automatic checks if %s during a download', async (action) => {
+        vi.useFakeTimers()
+        vi.setSystemTime(UPDATE_CHECK_INTERVAL_MS + 1_000)
+        updateAppUpdateSettings({ autoUpdateCheck: true, lastCheckedAt: Date.now() })
+        await startAppUpdateChecks()
+        await vi.advanceTimersByTimeAsync(0)
+        const fixture = dependencies()
+        let fail!: () => void
+        fixture.value.stageDeb = vi.fn(() => new Promise<StagedDebUpdate>((_, reject) => {
+            fail = () => reject(new Error('cancelled'))
+        }))
+        appUpdateState.update(state => ({ ...state, update: { ...available.update!, installStrategy: 'stage-deb' } }))
+        const pending = applyAppUpdate(fixture.value)
+        if (action === 'disabled') updateAppUpdateSettings({ autoUpdateCheck: false })
+        else stopAppUpdateChecks()
+        await vi.advanceTimersByTimeAsync(UPDATE_CHECK_INTERVAL_MS + 1)
+        fail()
+        await pending
+        expect(vi.getTimerCount()).toBe(0)
+        expect(nativeMocks.check).not.toHaveBeenCalled()
     })
 
     it('awaits local persistence and retains the fence through installation and restart', async () => {
