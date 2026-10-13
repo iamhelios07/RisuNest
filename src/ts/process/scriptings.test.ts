@@ -1855,6 +1855,8 @@ test('runs variable-only Lua handlers and display listeners without visiting mes
     await expect(runLuaEditTrigger(fixture.char, 'editdisplay', 'row')).resolves.toBe('row:1')
     expect(errors).not.toHaveBeenCalled()
     expect(fixture.chat.scriptstate).toEqual({ $counter: '1', $seen: '1' })
+    // One variable commit each for the handler and the listener.
+    expect(fixture.session.version).toBe(2)
   } finally {
     messagesReadable = true
     errors.mockRestore()

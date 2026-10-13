@@ -29,7 +29,6 @@ import { getRuntimePerformanceBudgets, subscribeRuntimePerformanceProfile } from
 import { createLuaFactory, runLuaSource } from './luaRuntime';
 import { withObjectUrl } from '../objectUrl';
 import {
-    createConversationOperationContext,
     type ConversationOperationContext,
     type ConversationCommitObserver,
 } from './conversationOperationContext';
@@ -139,7 +138,6 @@ export async function runScripted(code:string, arg:{
     operationContext?: ConversationOperationContext
     /** The selected conversation through a variable scope and copy-on-edit messages. */
     access?: ScriptConversationAccess
-    createConversationOperation?: () => ConversationOperationContext | undefined
     createConversationChat?: () => Chat
 }){
     const type: 'lua'|'py' = arg.type ?? 'lua'
@@ -212,32 +210,16 @@ export async function runScripted(code:string, arg:{
         ScriptingEngineState.operationDatabase = operationDatabase
         ScriptingEngineState.selectedCharacterId = selectedCharacterId
         ScriptingEngineState.capturedCharacterOwner = capturedCharacterOwner
-        let invocationOperationContext = arg.operationContext
         let invocationChatReady = false
         ScriptingEngineState.ensureConversationOperation = () => {
-            if (arg.createConversationChat) {
-                if (invocationChatReady) return
-                const ownedChat = arg.createConversationChat()
-                invocationChatReady = true
-                ScriptingEngineState.chat = ownedChat
-                ScriptingEngineState.setVar = (key: string, value: string) =>
-                    setChatVarOnConversation(ownedChat, key, value)
-                ScriptingEngineState.getVar = (key: string) =>
-                    getChatVarFromConversation(capturedDatabase, selectedCharacterId, ownedChat, key)
-                return
-            }
-            if (invocationOperationContext || !arg.createConversationOperation) return
-            const context = arg.createConversationOperation()
-            if (!context) return
-            invocationOperationContext = context
-            const database = context.createDatabaseView(getDatabase())
-            ScriptingEngineState.chat = context.chat
-            ScriptingEngineState.operationDatabase = database
-            ScriptingEngineState.selectedCharacterId = context.characterId
+            if (!arg.createConversationChat || invocationChatReady) return
+            const ownedChat = arg.createConversationChat()
+            invocationChatReady = true
+            ScriptingEngineState.chat = ownedChat
             ScriptingEngineState.setVar = (key: string, value: string) =>
-                setChatVarOnConversation(context.chat, key, value)
+                setChatVarOnConversation(ownedChat, key, value)
             ScriptingEngineState.getVar = (key: string) =>
-                getChatVarFromConversation(database, context.characterId, context.chat, key)
+                getChatVarFromConversation(capturedDatabase, selectedCharacterId, ownedChat, key)
         }
         const legacyChat = () => {
             ScriptingEngineState.ensureConversationOperation?.()

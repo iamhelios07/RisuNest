@@ -40,8 +40,11 @@ export class ScriptConversationAccess {
     private firstReadMessageVersion: number | null = null
     private failure: { error: unknown } | null = null
     private defaultVariables: Map<string, string> | null | undefined
+    private readonly precedingGenerationVersion: number
 
-    constructor(private readonly options: ScriptConversationAccessOptions) {}
+    constructor(private readonly options: ScriptConversationAccessOptions) {
+        this.precedingGenerationVersion = options.session.generationInvalidationVersion
+    }
 
     get session(): ActiveConversationSession {
         return this.options.session
@@ -139,10 +142,28 @@ export class ScriptConversationAccess {
         this.requireCurrent()
         const changes = new Map(this.pendingVariables)
         this.pendingVariables.clear()
-        const keys = this.options.session.updateChatVariables(changes, {
+        const session = this.options.session
+        const baseVersion = session.version
+        const keys = session.updateChatVariables(changes, {
             ...(this.options.origin ? { origin: this.options.origin } : {}),
         })
-        if (keys.length > 0) this.options.onVariablesCommitted?.(keys)
+        if (keys.length === 0) return keys
+        const version = session.version
+        const chat = this.options.chat
+        // The same receipt an operation reports, so a generation waiting on this
+        // conversation adopts the commit instead of treating it as a foreign edit.
+        this.options.onCommitted?.({
+            follows: (current, previousVersion, target) =>
+                current === session &&
+                previousVersion !== null &&
+                previousVersion >= this.precedingGenerationVersion &&
+                previousVersion <= baseVersion &&
+                target === chat &&
+                session.isActive &&
+                session.version === version &&
+                session.materializeCompatibilityArray() === target.message,
+        })
+        this.options.onVariablesCommitted?.(keys)
         return keys
     }
 
@@ -178,6 +199,7 @@ export class ScriptConversationAccess {
             throw failure.error
         }
         if (!operation) {
+            this.requireCurrent()
             this.flushVariables()
             return
         }

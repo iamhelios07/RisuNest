@@ -316,6 +316,72 @@ test('rejects an awaited trigger batch after the active conversation advances', 
     }
 })
 
+test('runs a variable-only trigger without visiting messages', async () => {
+    const { chat, char, session } = fixture()
+    char.triggerscript[0].effect = [
+        { type: 'setvar', var: 'state', value: 'new', operator: '=' },
+    ] as never
+    runtime.session = session
+    DBState.db = { characters: [char], templateDefaultVariables: '' } as never
+    // The length is a constant-time read; any element read or iteration visits messages.
+    let messagesReadable = true
+    chat.message = new Proxy(chat.message, {
+        get(target, property, receiver) {
+            if (!messagesReadable && property !== 'length') {
+                throw new Error(`message read: ${String(property)}`)
+            }
+            return Reflect.get(target, property, receiver)
+        },
+    })
+
+    messagesReadable = false
+    try {
+        const result = await runTrigger(char, 'manual', { chat, manualName: 'ordered' })
+        expect(result?.chat).toBe(chat)
+    } finally {
+        messagesReadable = true
+    }
+    expect(chat.scriptstate).toEqual({ $state: 'new' })
+    expect(session.activePinReasons).toEqual([])
+})
+
+test.each(['variables', 'message edit'] as const)(
+    'keeps trigger variables when messages change while it waits (%s)',
+    async (kind) => {
+        const { chat, char, session } = fixture()
+        char.triggerscript[0].effect = [
+            { type: 'setvar', var: 'state', value: 'new', operator: '=' },
+            { type: 'v2Wait', value: '0.001', valueType: 'value' },
+            ...(kind === 'message edit' ? [{ type: 'modifychat', index: '1', value: 'edited' }] : []),
+        ] as never
+        runtime.session = session
+        DBState.db = { characters: [char], templateDefaultVariables: '' } as never
+        vi.useFakeTimers()
+
+        try {
+            const settled = runTrigger(char, 'manual', { chat, manualName: 'ordered' }).then(
+                () => null,
+                (error: unknown) => error,
+            )
+            await vi.advanceTimersByTimeAsync(0)
+            session.edit(session.locate(0), { role: 'user', data: 'concurrent', chatId: 'message-0' })
+            await vi.advanceTimersByTimeAsync(1)
+
+            // An edit computed before the change is not applied over it.
+            expect(await settled).toEqual(kind === 'variables'
+                ? null
+                : expect.objectContaining({ message: expect.stringMatching(/session version/i) }))
+            expect(chat.message.map((entry) => entry.data)).toEqual(['concurrent', 'one'])
+            expect(chat.scriptstate).toEqual({ $state: 'new' })
+            // The external edit and the trigger's variable commit.
+            expect(session.version).toBe(2)
+            expect(session.activePinReasons).toEqual([])
+        } finally {
+            vi.useRealTimers()
+        }
+    },
+)
+
 test('does not publish Trigger metadata to either conversation after navigation', async () => {
     const original = fixture()
     original.chat.note = 'original note'
