@@ -47,6 +47,7 @@ export const nodeAppTests = [
   'src/ts/chatScreenshotRange.test.ts',
   'src/ts/chatScreenshotSourceLease.test.ts',
   'src/ts/chatViewport.test.ts',
+  'src/ts/consoleLog.test.ts',
   'src/ts/conversationMutations.test.ts',
   'src/ts/conversationViewportSource.test.ts',
   'src/ts/deepLinkDispatcher.test.ts',

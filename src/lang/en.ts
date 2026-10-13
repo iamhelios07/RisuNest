@@ -2929,6 +2929,10 @@ export const languageEnglish = {
             logHelp: 'Recent errors. Attach them when reporting a problem.',
             viewLog: 'View',
             copyLog: 'Copy',
+            consoleTitle: 'Console log',
+            consoleHelp: 'View recent app and plugin logs. Logs are cleared when the app restarts.',
+            consoleEmpty: 'No console logs recorded.',
+            clearLog: 'Clear',
             fileLog: 'Save error log to a file',
             fileLogHelp:
                 'Secrets such as API keys are masked before being written.',
