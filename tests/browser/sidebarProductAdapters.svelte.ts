@@ -1,5 +1,6 @@
 import { writable } from 'svelte/store'
 import type { Database } from '../../src/ts/storage/database.svelte'
+import { indexCharactersById } from '../../src/ts/characterIndex'
 export { languageEnglish as language } from '../../src/lang/en'
 
 export const DBState = $state({ db: {
@@ -22,7 +23,7 @@ export const additionalHamburgerMenu = []
 export const tooltipRight = () => ({})
 export const setDatabase = (db: Database) => { DBState.db = db }
 export const checkCharOrder = () => {}
-export const getCharacterIndexObject = () => Object.fromEntries(DBState.db.characters.map((c, i) => [c.chaId, i]))
+export const getCharacterIndexObject = () => indexCharactersById(DBState.db.characters)
 export const changeChar = (index: number) => { DBState.clicks++; selectedCharID.set(index) }
 export const clearCharacterSelection = async () => { selectedCharID.set(-1); return true }
 export const getCharImage = () => ''

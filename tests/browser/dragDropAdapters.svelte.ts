@@ -17,7 +17,4 @@ export const importRegex = async (value: unknown[]) => value
 export const getCurrentCharacter = () => DBState.db.characters[0]
 export const getCurrentChat = () => DBState.db.characters[0].chats[0]
 export const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
-export const sortableOptions = {
-    delay: 300, delayOnTouchOnly: true, filter: '.no-sort',
-    onMove: (event: { related: HTMLElement }) => !event.related.className.includes('no-sort'),
-}
+export { sortableOptions } from '../../src/ts/sortableOptions'
