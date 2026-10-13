@@ -283,12 +283,17 @@ describe('RisuNestDataHealth', () => {
         const text = [...target.querySelectorAll('[data-data-health-item]')]
             .map((item) => item.textContent ?? '')
             .join('\n')
-        expect(text).toContain('Module “Weather” has no link for asset 1.')
         expect(text).toContain(
-            'The module assigned to character “Mari”, chat “First chat”, does not exist.',
+            strings.moduleAssetMissing.replace('{0}', 'Weather').replace('{1}', '1'),
         )
         expect(text).toContain(
-            'Character “Mari”, chat “First chat”, has broken inlay data in message 8.',
+            strings.conversationModuleMissing.replace('{0}', 'Mari').replace('{1}', 'First chat'),
+        )
+        expect(text).toContain(
+            strings.conversationMessageInlayMissing
+                .replace('{0}', 'Mari')
+                .replace('{1}', 'First chat')
+                .replace('{2}', '8'),
         )
         expect(text).not.toContain('character-1/chat-1')
     })
