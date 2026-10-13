@@ -1935,7 +1935,8 @@ async function runLuaEditTriggerBatch<T extends string | OpenAIChat[]>(
         if (historyWindowCopy && !historyWindowCopy.commit()) {
             throw new PersistentMutationFencedError()
         }
-        access?.commit()
+        // A listener that changed nothing keeps its result after the conversation closes.
+        access?.commitIfChanged()
     }
 }
 

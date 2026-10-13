@@ -2299,8 +2299,9 @@ test('keeps stored trigger permissions and parser identity stable during Lua dis
   }
 })
 
-test('releases a read-only Lua edit operation without publishing an empty commit', async () => {
-  const fixture = operationCharacterFixture('read-only-edit-operation')
+test.each(['current', 'navigated'] as const)('releases a read-only Lua edit operation without publishing an empty commit (%s)', async (state) => {
+  const fixture = operationCharacterFixture(`read-only-edit-operation-${state}`)
+  const replacement = operationCharacterFixture(`read-only-edit-replacement-${state}`)
   fixture.char.customscript = []
   fixture.char.triggerscript = [
     {
@@ -2313,7 +2314,8 @@ test('releases a read-only Lua edit operation without publishing an empty commit
           code: `
       listenEdit('editOutput', function(id, value)
         getChatVar(id, 'missing')
-        return value
+        alertNormal(id, 'synthetic read')
+        return value .. ':read'
       end)
     `,
         },
@@ -2323,13 +2325,17 @@ test('releases a read-only Lua edit operation without publishing an empty commit
   installOperationCharacterFixture(fixture)
   vi.mocked(getCurrentChat).mockReturnValue(fixture.chat)
   continuationRuntime.session = fixture.session
+  // The conversation closes after the listener's last read.
+  vi.mocked(alertNormal).mockImplementationOnce(() => {
+    if (state === 'navigated') continuationRuntime.session = replacement.session
+  })
   const applyOperation = vi.spyOn(fixture.session, 'applyOperation')
   const { runLuaEditTrigger } = await import('./scriptings')
 
   try {
     await expect(
       runLuaEditTrigger(fixture.char, 'editoutput', 'unchanged'),
-    ).resolves.toBe('unchanged')
+    ).resolves.toBe('unchanged:read')
     expect(applyOperation).not.toHaveBeenCalled()
     expect(fixture.session.activePinReasons).toEqual([])
   } finally {

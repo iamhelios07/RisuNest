@@ -222,12 +222,17 @@ export class ScriptConversationAccess {
         this.finish(true)
     }
 
+    /** Commits like `commit`, but with nothing to commit it finishes even if the conversation closed. */
+    commitIfChanged(): void {
+        this.finish(true, false)
+    }
+
     /** Commits variables and conversation metadata, dropping message edits. */
     commitWithoutMessages(): void {
         this.finish(false)
     }
 
-    private finish(withMessages: boolean): void {
+    private finish(withMessages: boolean, requireOpen = true): void {
         const operation = this.operation
         const edits = withMessages ? this.edits : null
         const failure = this.failure
@@ -241,7 +246,7 @@ export class ScriptConversationAccess {
             throw failure.error
         }
         if (!operation && !edits) {
-            this.requireCurrent()
+            if (requireOpen) this.requireCurrent()
             this.flushVariables()
             return
         }
