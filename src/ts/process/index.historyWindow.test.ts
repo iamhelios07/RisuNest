@@ -44,10 +44,6 @@ vi.mock('../tokenizer', async () => (await import('./tests/sendChatTestHarness')
     tokenize: vi.fn(async () => 10),
     encodeWithTokenizer: vi.fn(async () => new Array(10).fill(0)),
 }))
-vi.mock('../../lang', async () => (await import('./tests/sendChatTestHarness')).langModule({
-    generationConversationChanged: 'conversation changed',
-    chatConversationActionFailed: 'conversation action failed',
-}))
 vi.mock('../alert', async () => (await import('./tests/sendChatTestHarness')).alertModule({
     alertError: mocks.alertError,
 }))
@@ -129,6 +125,7 @@ import { DBState, selectedCharID } from '../stores.svelte'
 import { doingChat, openSelectedHistoryWindow, sendChat } from './index.svelte'
 import { findActiveHistoryWindow, getHistoryWindowStart } from './historyWindowIndex'
 import { setChatVarOnConversation } from '../parser/chatVar.svelte'
+import { language } from '../../lang'
 
 function messages(count: number): Message[] {
     return Array.from({ length: count }, (_, index): Message => ({
@@ -674,7 +671,7 @@ describe('sendChat with the history window', () => {
 
         expect(mocks.flushPendingData).toHaveBeenCalledWith('generation-history-window')
         expect(mocks.modelRequests).toHaveLength(0)
-        expect(mocks.alertError).toHaveBeenCalledWith('conversation action failed')
+        expect(mocks.alertError).toHaveBeenCalledWith(language.chatConversationActionFailed)
     })
 
     it('tells the user when the conversation changes while the window is read', async () => {
@@ -690,7 +687,7 @@ describe('sendChat with the history window', () => {
         await expect(sendChat({ historyLimit: true })).resolves.toBe(false)
 
         expect(mocks.modelRequests).toHaveLength(0)
-        expect(mocks.alertError).toHaveBeenCalledWith('conversation action failed')
+        expect(mocks.alertError).toHaveBeenCalledWith(language.chatConversationActionFailed)
     })
 
     it('refuses to write the response when the promoted conversation no longer holds the window', async () => {
@@ -713,7 +710,7 @@ describe('sendChat with the history window', () => {
         await expect(sendChat({ historyLimit: true })).resolves.toBe(false)
 
         expect((mocks.session as ActiveConversationSession).totalMessages).toBe(999)
-        expect(mocks.alertError).toHaveBeenCalledWith('conversation changed')
+        expect(mocks.alertError).toHaveBeenCalledWith(language.generationConversationChanged)
     })
 })
 

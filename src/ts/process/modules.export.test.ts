@@ -20,13 +20,6 @@ vi.mock('../storage/androidContentPicker', () => ({ importAndroidContentFromPick
 vi.mock('../storage/nativeModuleFileRoute', () => ({ importDesktopNativeModulePath: mocks.importDesktop }))
 vi.mock('@tauri-apps/plugin-dialog', () => ({ open: mocks.open }))
 
-vi.mock('src/lang', () => ({
-    language: {
-        errors: { noData: 'no data' },
-        successExport: 'exported',
-        mcpStdioModuleImportBlocked: 'Local MCP module import blocked',
-    },
-}))
 vi.mock('../alert', () => ({
     alertClear: vi.fn(),
     alertConfirm: vi.fn(),

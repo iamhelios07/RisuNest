@@ -17,7 +17,6 @@ vi.mock('../alert', () => ({
     alertError: vi.fn(),
     alertWait: vi.fn(),
 }))
-vi.mock('src/lang', () => ({ language: {} }))
 
 beforeEach(() => {
     mocks.fetchProtectedResource.mockReset()

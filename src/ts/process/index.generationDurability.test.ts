@@ -125,7 +125,6 @@ vi.mock('../tokenizer', async () => (await import('./tests/sendChatTestHarness')
     tokenize: harness.tokenize,
     tokenizeNum: harness.tokenizeNum,
 }))
-vi.mock('../../lang', async () => (await import('./tests/sendChatTestHarness')).langModule())
 vi.mock('../alert', async () => (await import('./tests/sendChatTestHarness')).alertModule())
 vi.mock('../parser/chatML', async () => (await import('./tests/sendChatTestHarness')).chatMLModule({
     parseChatML: vi.fn(() => []),

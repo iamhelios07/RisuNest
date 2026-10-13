@@ -68,7 +68,6 @@ vi.mock('../tokenizer', async () => (await import('./tests/sendChatTestHarness')
         return mocks.tokenizeResult ? await mocks.tokenizeResult : 1
     }),
 }))
-vi.mock('../../lang', async () => (await import('./tests/sendChatTestHarness')).langModule())
 vi.mock('../alert', async () => (await import('./tests/sendChatTestHarness')).alertModule())
 vi.mock('../parser/chatML', async () => (await import('./tests/sendChatTestHarness')).chatMLModule())
 vi.mock('../parser/parser.svelte', async () => (await import('./tests/sendChatTestHarness')).parserModule())

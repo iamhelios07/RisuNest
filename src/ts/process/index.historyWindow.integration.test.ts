@@ -72,10 +72,6 @@ vi.mock('../tokenizer', async () => (await import('./tests/sendChatTestHarness')
     tokenize: vi.fn(async () => 10),
     encodeWithTokenizer: vi.fn(async () => new Array(10).fill(0)),
 }))
-vi.mock('../../lang', async () => (await import('./tests/sendChatTestHarness')).langModule({
-    generationConversationChanged: 'conversation changed',
-    chatConversationActionFailed: 'conversation action failed',
-}))
 vi.mock('../alert', async () => {
     const harness = await import('./tests/sendChatTestHarness')
     current.alertError = vi.fn()
