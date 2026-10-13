@@ -1,5 +1,5 @@
 mod common;
-use common::{inline, request, WRITER_A, WRITER_B};
+use common::{inline, request, HANG_BOUND, WRITER_A, WRITER_B};
 use reqwest::{Client, RequestBuilder, StatusCode};
 use risunest_sync_server::{
     http,
@@ -21,10 +21,6 @@ fn full_frames(objects: &[&[u8]]) -> Vec<u8> {
         .collect::<Vec<_>>();
     transfer::encode(&frames).expect("synthetic full frames must fit")
 }
-
-/// Turns a lost response into a failure. Loaded hosts answer a loopback request
-/// in far less, so it never decides an outcome.
-const BOUND: Duration = Duration::from_secs(60);
 
 struct Server {
     base: String,
@@ -322,7 +318,7 @@ async fn bounded_bulk_buffers_leave_head_available_and_release_after_completion(
         let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
         socket.write_all(format!("POST /uploads/frames HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nX-Risu-Library: {}\r\nContent-Length: {}\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",credential.token,credential.library_id,frame.len()).as_bytes()).await.unwrap();
         let mut interim = Vec::new();
-        tokio::time::timeout(BOUND, async {
+        tokio::time::timeout(HANG_BOUND, async {
             while !interim.ends_with(b"\r\n\r\n") {
                 interim.push(socket.read_u8().await.unwrap());
             }
@@ -359,13 +355,13 @@ async fn bounded_bulk_buffers_leave_head_available_and_release_after_completion(
     let mut first = sockets.remove(0);
     first.write_all(&frame).await.unwrap();
     let mut completed = Vec::new();
-    tokio::time::timeout(BOUND, first.read_to_end(&mut completed))
+    tokio::time::timeout(HANG_BOUND, first.read_to_end(&mut completed))
         .await
         .unwrap()
         .unwrap();
     assert!(completed.starts_with(b"HTTP/1.1 204 No Content"));
     assert_eq!(
-        tokio::time::timeout(BOUND, pending)
+        tokio::time::timeout(HANG_BOUND, pending)
             .await
             .unwrap()
             .unwrap()
@@ -476,7 +472,11 @@ impl Server {
         Self {
             base,
             store,
-            client: Client::builder().no_proxy().timeout(BOUND).build().unwrap(),
+            client: Client::builder()
+                .no_proxy()
+                .timeout(HANG_BOUND)
+                .build()
+                .unwrap(),
             a,
             b,
             task,
@@ -576,7 +576,7 @@ async fn unauthorized_large_unfinished_body_is_rejected_before_reading_it() {
     .await
     .unwrap();
     let mut bytes = [0; 1024];
-    let count = tokio::time::timeout(BOUND, tcp.read(&mut bytes))
+    let count = tokio::time::timeout(HANG_BOUND, tcp.read(&mut bytes))
         .await
         .unwrap()
         .unwrap();
@@ -608,7 +608,7 @@ async fn stalled_upload_does_not_hold_library_writer_or_another_device_slot() {
     let headers=format!("POST /uploads/frames HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nX-Risu-Library: {}\r\nContent-Length: {}\r\n\r\n",s.a.token,s.a.library_id,frame.len());
     tcp.write_all(headers.as_bytes()).await.unwrap();
     tcp.write_all(&frame[..10]).await.unwrap();
-    tokio::time::timeout(BOUND, async {
+    tokio::time::timeout(HANG_BOUND, async {
         s.upload(&s.b, b"concurrent").await;
         let request = request(
             &s.store,
@@ -722,7 +722,7 @@ async fn malformed_metadata_and_frame_fail_without_mutation() {
     let headers=format!("POST /uploads/frames HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nX-Risu-Library: {}\r\nContent-Length: {}\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",s.a.token,s.a.library_id,transfer::MAX_BATCH_BYTES+1);
     oversized.write_all(headers.as_bytes()).await.unwrap();
     let mut response = [0; 1024];
-    let length = tokio::time::timeout(BOUND, oversized.read(&mut response))
+    let length = tokio::time::timeout(HANG_BOUND, oversized.read(&mut response))
         .await
         .unwrap()
         .unwrap();
@@ -831,7 +831,7 @@ async fn streamed_frame_body_limit_rejects_before_publishing() {
         .build()
         .unwrap();
     assert!(!request.headers().contains_key("content-length"));
-    let response = tokio::time::timeout(BOUND, s.client.execute(request))
+    let response = tokio::time::timeout(HANG_BOUND, s.client.execute(request))
         .await
         .expect("the oversized streamed body was not answered")
         .unwrap();
