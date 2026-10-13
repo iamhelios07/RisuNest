@@ -6,7 +6,10 @@ vi.mock('./deviceStateRestore', () => deviceRestore)
 const binding = vi.hoisted(() => ({ prepare: vi.fn() }))
 vi.mock('./sync/bindingRegistry', () => ({prepareBoundLibraryReplacement: binding.prepare}))
 vi.mock('../plugins/apiV3/v3.svelte', () => ({fencePluginExecutionForAuthorityReplacement:async()=>{},invalidatePluginCachesAfterAuthorityReplacement:async()=>{},restartPluginsAfterAuthorityReplacement:async()=>{}}))
+const library = vi.hoisted(() => ({ hasCharacters: vi.fn<() => Promise<boolean>>() }))
+vi.mock('./libraryCharacters', () => ({ hasLibraryCharacters: library.hasCharacters }) satisfies typeof import('./libraryCharacters'))
 beforeEach(() => {
+    library.hasCharacters.mockReset().mockResolvedValue(true)
     restoreAlerts.checkbox.mockReset().mockResolvedValue({confirmed:true,checked:true})
     binding.prepare.mockReset().mockImplementation(async () => ({bound:false,state:{targetAuthority:'1'},fence:async()=>{},assertAuthority:async()=>{},resume:async()=>{}}))
 })
@@ -4803,6 +4806,30 @@ it.each([
         expect(commands).toContain('native_file_job_finalize')
         expect(commands).not.toContain('native_file_job_cancel')
     } finally { clock.mockRestore() }
+})
+
+it.each([false, true])('replaces a library that holds no character without asking, bound=%s', async bound => {
+    library.hasCharacters.mockResolvedValue(false)
+    binding.prepare.mockImplementation(async () => ({bound,state:{targetAuthority:'1'},fence:async()=>{},assertAuthority:async()=>{},resume:async()=>{}}))
+    const result = {revision:18,sourceBytes:128,sourceFingerprintKind:'whole-file-sha256' as const,sourceSha256:'a'.repeat(64),characterCount:1,presetCount:0,warningCodes:[]}
+    const states = [{...status('waitingForInput'),phase:'awaiting-activation'}, status('succeeded',result)]
+    const commands: string[] = []
+    const acquire = vi.fn()
+    await expect(runNativeBlockRisuSaveRestore(restoreRuntime(17,{acquire}), {type:'desktopPath',path:'synthetic.risudat'}, {}, {
+        isTauri:()=>true,
+        wait:async()=>{},
+        invoke:async command=>{
+            commands.push(command)
+            if(command==='native_file_job_start') return {jobId:'job-1'}
+            if(command==='native_file_job_status') return states.shift()
+            return true
+        },
+    })).resolves.toEqual(result)
+    expect(restoreAlerts.checkbox).not.toHaveBeenCalled()
+    expect(restoreAlerts.confirm).not.toHaveBeenCalled()
+    expect(acquire).toHaveBeenCalledOnce()
+    expect(commands).toContain('native_file_job_finalize')
+    expect(commands).not.toContain('native_file_job_cancel')
 })
 
 it('cancels staged restore and waits for terminal settlement when the fresh precondition fails', async () => {
