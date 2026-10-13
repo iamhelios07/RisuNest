@@ -14,11 +14,9 @@ const alertMocks = vi.hoisted(() => ({ alertConfirm: vi.fn() }))
 const platformMocks = vi.hoisted(() => ({ isTauri: true }))
 
 vi.mock('src/ts/process/files/inlays', () => inlayMocks)
-vi.mock('src/ts/platform', () => ({
-    get isTauri() {
-        return platformMocks.isTauri
-    },
-}))
+vi.mock('src/ts/platform', async () => (await import('src/ts/platform.testSupport')).platformModule(() => ({
+    runtime: platformMocks.isTauri ? 'tauri' : 'web', os: 'windows',
+})))
 vi.mock('src/ts/alert', () => alertMocks)
 
 import { language } from 'src/lang'

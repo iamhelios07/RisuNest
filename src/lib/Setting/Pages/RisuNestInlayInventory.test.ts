@@ -21,7 +21,7 @@ const optimization = vi.hoisted(() => ({
 }))
 vi.mock('src/ts/process/files/inlays', () => inlays)
 vi.mock('src/ts/alert', () => alerts)
-vi.mock('src/ts/platform', () => ({ isTauri: true }))
+vi.mock('src/ts/platform', async () => (await import('src/ts/platform.testSupport')).platformModule({ runtime: 'tauri', os: 'windows' }))
 vi.mock('src/ts/storage/sync/serverSyncProduction', () => ({
     getServerSyncController: () => ({ snapshot: () => ({ running: false, paused: false, error: '' }) }),
 }))

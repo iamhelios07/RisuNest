@@ -37,7 +37,7 @@ const state = vi.hoisted(() => ({
     characters: vi.fn(async () => true),
 }))
 
-vi.mock('src/ts/platform', () => ({ isTauri: true, isTauriAndroid: false, isTauriIOS: false }))
+vi.mock('src/ts/platform', async () => (await import('src/ts/platform.testSupport')).platformModule({ runtime: 'tauri', os: 'windows' }))
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn(), Channel: class { onmessage = (_value: unknown) => {} } }))
 vi.mock('@tauri-apps/plugin-os', () => ({ type: () => 'windows' }))
 vi.mock('@tauri-apps/plugin-opener', () => ({ openUrl: vi.fn() }))

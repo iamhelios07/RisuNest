@@ -3,7 +3,7 @@ import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import { mount, unmount } from 'svelte'
 const mocks = vi.hoisted(() => ({ invoke: vi.fn(), confirm: vi.fn(), error: vi.fn() }))
 vi.mock('@tauri-apps/api/core', () => ({ invoke: mocks.invoke }))
-vi.mock('src/ts/platform', () => ({ isTauri: true }))
+vi.mock('src/ts/platform', async () => (await import('src/ts/platform.testSupport')).platformModule({ runtime: 'tauri', os: 'windows' }))
 vi.mock('src/ts/alert', () => ({ alertConfirm: mocks.confirm, alertError: mocks.error }))
 vi.mock('src/ts/storage/localDataSections', () => ({ readLocalDataParticipation: async () => [], setLocalDataParticipating: vi.fn() }))
 vi.mock('src/ts/storage/localDataRemotes', () => ({ readLocalDataRemoteState: async () => 'none' }))

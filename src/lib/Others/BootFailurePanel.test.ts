@@ -9,11 +9,9 @@ const f = vi.hoisted(() => ({
     roots: vi.fn(),
     exportOriginalData: vi.fn(),
 }))
-vi.mock('src/ts/platform', () => ({
-    isTauri: true,
-    get isTauriAndroid() { return f.android },
-    get isTauriIOS() { return f.ios },
-}))
+vi.mock('src/ts/platform', async () => (await import('src/ts/platform.testSupport')).platformModule(() => ({
+    runtime: 'tauri', os: f.ios ? 'ios' : f.android ? 'android' : 'windows',
+})))
 vi.mock('src/ts/storage/nativePaths', () => ({ nativeRoots: f.roots }))
 vi.mock('src/ts/storage/rawRecoveryExport', () => ({ exportOriginalData: f.exportOriginalData }))
 vi.mock('src/ts/alert', () => ({ alertToast: vi.fn() }))

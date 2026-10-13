@@ -3,7 +3,6 @@ import { mount, unmount, tick } from 'svelte'
 import { language } from 'src/lang'
 const mock = vi.hoisted(() => ({ call: vi.fn(), download: vi.fn() }))
 vi.mock('src/ts/network/networkLog', async original => ({ ...await original<typeof import('src/ts/network/networkLog')>(), networkLog: mock.call, downloadNetworkLog: mock.download }))
-vi.mock('src/ts/platform', () => ({ isTauriAndroid: false, isTauriIOS: false }))
 import Component from './RisuNestNetworkLog.svelte'
 const settings = { enabled: false, retain: false, hideAuth: true, recentCount: 200, recentMib: 1024, retainedMib: 1024, bufferMib: 32, captureBinary: false }
 const body = { observedBytes: 5, capturedBytes: 5, binary: false, truncated: false, representation: 'observed' }

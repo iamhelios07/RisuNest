@@ -49,7 +49,7 @@ vi.mock('src/ts/alert', () => ({
     alertNormal: vi.fn(),
     alertSelect: vi.fn(),
 }))
-vi.mock('src/ts/platform', () => ({ isTauriMobile: true }))
+vi.mock('src/ts/platform', async () => (await import('src/ts/platform.testSupport')).platformModule({ runtime: 'tauri', os: 'android' }))
 vi.mock('src/ts/tokenizer', () => ({ tokenize: vi.fn() }))
 vi.mock('src/ts/util', () => ({
     asBuffer: vi.fn(),

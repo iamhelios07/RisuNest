@@ -33,7 +33,7 @@ const alerts = vi.hoisted(() => ({
 vi.mock('src/ts/storage/nativePersistentMaintenance', () => maintenance)
 vi.mock('src/ts/storage/sync/syncConflictBackup', () => ({ getSyncConflictBackupStore: () => backups }))
 vi.mock('src/ts/alert', () => alerts)
-vi.mock('src/ts/platform', () => ({ isTauri: true }))
+vi.mock('src/ts/platform', async () => (await import('src/ts/platform.testSupport')).platformModule({ runtime: 'tauri', os: 'windows' }))
 
 import RisuNestStorageDashboard from './RisuNestStorageDashboard.svelte'
 import { languageEnglish } from 'src/lang/en'
