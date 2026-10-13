@@ -5,6 +5,7 @@ import {
 } from './saveCoordinator'
 import type { Database } from './database.svelte'
 import type { PersistentDataStore, PersistentRoot, WorkingSetCommit } from './persistentDataStore'
+import { createStoreStub } from './persistentDataStore.testSupport'
 
 export function makeDatabase(): Database {
     return {
@@ -31,11 +32,8 @@ export function deferred<T>() {
     return { promise, resolve, reject }
 }
 
-export function makeStore(commit = vi.fn()) {
-    return {
-        commit,
-        replaceFromDatabase: vi.fn(),
-    } as unknown as PersistentDataStore
+export function makeStore(commit = vi.fn(), members: Partial<PersistentDataStore> = {}) {
+    return createStoreStub({ commit, replaceFromDatabase: vi.fn(), ...members })
 }
 
 /** Marks a root key that a commit removes. */

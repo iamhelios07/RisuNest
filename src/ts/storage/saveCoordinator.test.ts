@@ -1816,7 +1816,10 @@ describe('SaveCoordinator', () => {
         const conflict = new RevisionConflictError(1, 2)
         const commit = vi.fn(() => gate.promise)
         const coordinator = new SaveCoordinator({
-            store: makeStore(commit),
+            // A lease without a change index cannot show what moved, so the conflicting commit is resent.
+            store: makeStore(commit, {
+                acquireRevision: async (revision) => createLeaseStub({ revision, release: async () => undefined }),
+            }),
             captureRoot: () => captureRoot(database),
             captureSelectedCharacter: () => database.characters[0],
             captureCharacter: (id) => database.characters.find((item) => item.chaId === id) ?? null,
