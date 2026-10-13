@@ -499,7 +499,12 @@ pub(crate) async fn close_after_unread_body(request: Request, next: Next) -> Res
     let read = Arc::new(AtomicBool::new(request.body().is_end_stream()));
     let http1 = request.version() < Version::HTTP_2;
     let tracked = read.clone();
-    let request = request.map(|body| axum::body::Body::new(BodyEndTracker { body, read: tracked }));
+    let request = request.map(|body| {
+        axum::body::Body::new(BodyEndTracker {
+            body,
+            read: tracked,
+        })
+    });
     let mut response = next.run(request).await;
     if http1 && !read.load(Ordering::Acquire) {
         response

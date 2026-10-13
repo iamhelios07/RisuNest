@@ -864,7 +864,12 @@ async fn a_reply_sent_before_the_request_body_is_read_closes_the_connection() {
     assert!(head.contains("\r\nconnection: close\r\n"), "{head}");
 
     // A rejection without a body, and a request whose body was read, keep the connection.
-    let response = s.client.get(format!("{}/head", s.base)).send().await.unwrap();
+    let response = s
+        .client
+        .get(format!("{}/head", s.base))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert!(response.headers().get("connection").is_none());
     let response = s

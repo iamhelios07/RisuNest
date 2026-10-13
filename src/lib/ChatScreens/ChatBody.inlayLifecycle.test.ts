@@ -896,6 +896,7 @@ describe('ChatBody deferred inlay lifecycle', () => {
     })
 
     test('refreshes its row for the variables the shown body read, and for any variable once translated', async () => {
+        vi.useFakeTimers()
         chatState.db = {
             autoTranslate: false,
             translatorType: 'mock',
@@ -918,12 +919,14 @@ describe('ChatBody deferred inlay lifecycle', () => {
             })
             const onDisplaySettled = vi.fn()
             mounted = mount(ChatBodyInlayHarness, { target, props: { onDisplaySettled, displayRow: row } })
-            await vi.waitFor(() => expect(parserMocks.ParseMarkdown).toHaveBeenCalledOnce())
+            await vi.advanceTimersByTimeAsync(0)
+            expect(parserMocks.ParseMarkdown).toHaveBeenCalledOnce()
             // A parse in progress counts with what it has read so far.
             expect(displayRowsToRefresh({ keys: ['hp'] })).toEqual([0])
             expect(displayRowsToRefresh({ keys: ['mood'] })).toEqual([])
             first.resolve('<p>first</p>')
-            await vi.waitFor(() => expect(onDisplaySettled).toHaveBeenCalledOnce())
+            await vi.advanceTimersByTimeAsync(0)
+            expect(onDisplaySettled).toHaveBeenCalledOnce()
             expect(displayRowsToRefresh({ keys: ['hp'] })).toEqual([0])
             expect(displayRowsToRefresh({ keys: ['accent'] })).toEqual([0])
             expect(displayRowsToRefresh({ keys: ['mood'] })).toEqual([])
@@ -931,14 +934,19 @@ describe('ChatBody deferred inlay lifecycle', () => {
             // A newer parse that has not read anything yet does not hide what is shown.
             parserMocks.ParseMarkdown.mockReturnValueOnce(new Promise(() => {}))
             ;(mounted as { reload(): void }).reload()
-            await vi.waitFor(() => expect(parserMocks.ParseMarkdown).toHaveBeenCalledTimes(2))
+            await vi.advanceTimersByTimeAsync(0)
+            expect(parserMocks.ParseMarkdown).toHaveBeenCalledTimes(2)
             expect(displayRowsToRefresh({ keys: ['hp'] })).toEqual([0])
             expect(displayRowsToRefresh({ keys: ['mood'] })).toEqual([])
 
             const { translateHTML } = await import('src/ts/translator/translator')
             vi.mocked(translateHTML).mockResolvedValue('<span>translated</span>')
             ;(mounted as { setTranslated(value: boolean): void }).setTranslated(true)
-            await vi.waitFor(() => expect(translateHTML).toHaveBeenCalledOnce())
+            await vi.advanceTimersByTimeAsync(0)
+            expect(target.textContent).toContain('translated')
+            // Initial auto-translation state must not overwrite a later manual toggle.
+            await vi.runAllTimersAsync()
+            expect(target.textContent).toContain('translated')
             expect(displayRowsToRefresh({ keys: ['mood'] })).toEqual([0])
         } finally {
             row.dispose()

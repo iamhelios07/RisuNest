@@ -356,14 +356,14 @@
 
                     const lastTranslated = translated
 
-                    setTimeout(() => {
-                            translated = translateText
-                    }, 10)
-
                     // State change of `translated` triggers markParsing again,
                     // causing redundant translation attempts
                     if (lastTranslated !== translateText) {
                         job.transitional = true
+                        setTimeout(() => {
+                            if (destroyed || job.disposed || activeParseJob !== job) return
+                            translated = translateText
+                        }, 10)
                         return ''
                     }
                 } catch (error) {

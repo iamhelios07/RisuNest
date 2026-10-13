@@ -1342,7 +1342,11 @@ mod tests {
             let server = std::thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
                 read_request(&mut stream);
-                write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {expected}\r\n\r\na").unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {expected}\r\n\r\na"
+                )
+                .unwrap();
                 while receive_chunk.recv().is_ok() {
                     if stream.write_all(b"a").is_err() {
                         break;
@@ -1351,9 +1355,10 @@ mod tests {
             });
             let client = http_client().unwrap();
             let destination = path.clone();
-            let download = tokio::spawn(async move {
-                fetch_file(&client, &url, expected, &destination).await
-            });
+            let download =
+                tokio::spawn(
+                    async move { fetch_file(&client, &url, expected, &destination).await },
+                );
             for received in 1..=4 {
                 if received > 1 {
                     tokio::time::advance(Duration::from_secs(30)).await;
@@ -1361,8 +1366,14 @@ mod tests {
                 }
                 let deadline = Instant::now() + Duration::from_secs(5);
                 while fs::metadata(&path).map_or(0, |metadata| metadata.len()) < received {
-                    assert!(!download.is_finished(), "download stopped despite read progress");
-                    assert!(Instant::now() < deadline, "loopback download made no progress");
+                    assert!(
+                        !download.is_finished(),
+                        "download stopped despite read progress"
+                    );
+                    assert!(
+                        Instant::now() < deadline,
+                        "loopback download made no progress"
+                    );
                     // Keep the paused clock from advancing while real socket I/O is pending.
                     tokio::task::yield_now().await;
                 }
@@ -1371,10 +1382,16 @@ mod tests {
                 tokio::time::advance(Duration::from_secs(61)).await;
                 let deadline = Instant::now() + Duration::from_secs(5);
                 while !download.is_finished() {
-                    assert!(Instant::now() < deadline, "stalled download did not time out");
+                    assert!(
+                        Instant::now() < deadline,
+                        "stalled download did not time out"
+                    );
                     tokio::task::yield_now().await;
                 }
-                assert_eq!(download.await.unwrap().unwrap_err(), "update-download-failed");
+                assert_eq!(
+                    download.await.unwrap().unwrap_err(),
+                    "update-download-failed"
+                );
             } else {
                 download.await.unwrap().unwrap();
             }
