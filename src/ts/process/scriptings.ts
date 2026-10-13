@@ -49,6 +49,12 @@ import {
     type ScriptConversationAccess,
 } from './scriptConversationAccess';
 import { requestScriptDisplayRefresh } from './scriptDisplayRefresh';
+import { beginDisplayScriptRun, noticeScriptTimeout } from './scriptTimeoutNotice';
+
+/** Deadline for each synchronous Lua segment of a listener. */
+const LUA_LISTENER_TIMEOUT_MS = 2_000
+/** Deadline for each synchronous Lua segment of a handler the user started. */
+const LUA_USER_HANDLER_TIMEOUT_MS = 60_000
 let luaFactory:LuaFactory
 let luaTimeoutErrorConstructor: typeof import('wasmoon').LuaTimeoutError | undefined
 let ScriptingSafeIds = new Set<string>()
@@ -138,6 +144,8 @@ export async function runScripted(code:string, arg:{
     operationContext?: ConversationOperationContext
     /** The selected conversation through a variable scope and copy-on-edit messages. */
     access?: ScriptConversationAccess
+    /** A button or manual trigger the user started, which gets the longer deadline. */
+    userStarted?: boolean
     createConversationChat?: () => Chat
 }){
     const type: 'lua'|'py' = arg.type ?? 'lua'
@@ -196,7 +204,8 @@ export async function runScripted(code:string, arg:{
         await ensureLuaFactory()
     }
     const ownerChaId = char?.chaId ?? 'global'
-    const ScriptingEngineState = getOrCreateEngineState(mode, type, ownerChaId, code);
+    const functionTimeout = arg.userStarted ? LUA_USER_HANDLER_TIMEOUT_MS : LUA_LISTENER_TIMEOUT_MS
+    const ScriptingEngineState = getOrCreateEngineState(mode, type, ownerChaId, code, functionTimeout);
     ScriptingEngineState.activeUses++
     let invocationFinished = false
     
@@ -248,7 +257,7 @@ export async function runScripted(code:string, arg:{
                 ScriptingEngineState.engine?.global.close()
                 ScriptingEngineState.engine = await luaFactory.createEngine({
                     injectObjects: true,
-                    functionTimeout: 2_000,
+                    functionTimeout,
                 })
                 const luaEngine = ScriptingEngineState.engine
                 declareAPI = (name:string, func:Function) => {
@@ -1411,6 +1420,7 @@ export async function runScripted(code:string, arg:{
                         'editDisplay', 'editInput', 'editOutput', 'manual'].includes(mode) ? mode : 'custom'
                     console.error({ code: 'lua-listener-timeout', mode: diagnosticMode,
                         elapsedMs: performance.now() - listenerStartedAt })
+                    noticeScriptTimeout(mode === 'editDisplay')
                 } else {
                     console.error(error)
                 }
@@ -1511,8 +1521,9 @@ function getOrCreateEngineState(
     type: 'lua'|'py',
     ownerChaId: string,
     code: string,
+    functionTimeout: number,
 ): ScriptingEngineState {
-    const cacheKey = JSON.stringify([type, ownerChaId, mode, code])
+    const cacheKey = JSON.stringify([type, ownerChaId, mode, code, functionTimeout])
     let engineState = ScriptingEngines.get(cacheKey);
     if (engineState) {
         engineState.lastUsed = ++scriptingEngineRecency
@@ -1752,6 +1763,27 @@ export async function runLuaEditTrigger<T extends string | OpenAIChat[]>(
     onConversationCommit?: ConversationCommitObserver,
     signal?: AbortSignal,
 ): Promise<T> {
+    const run = () => runLuaEditTriggerForMode(
+        char, mode, content, meta, conversationOperation, onConversationCommit, signal,
+    )
+    if (mode !== 'editdisplay' && mode !== 'editDisplay') return run()
+    const endDisplayRun = beginDisplayScriptRun()
+    try {
+        return await run()
+    } finally {
+        endDisplayRun()
+    }
+}
+
+async function runLuaEditTriggerForMode<T extends string | OpenAIChat[]>(
+    char: character | simpleCharacterArgument,
+    mode: string,
+    content: T,
+    meta?: object,
+    conversationOperation?: ConversationOperationContext,
+    onConversationCommit?: ConversationCommitObserver,
+    signal?: AbortSignal,
+): Promise<T> {
     switch (mode) {
         case 'editinput':
             mode = 'editInput'
@@ -1943,6 +1975,7 @@ async function runLuaButtonTriggerBatch(
                     data: data,
                     operationContext: conversationOperation,
                     access: access ?? undefined,
+                    userStarted: true,
                 })
             }
         }

@@ -26,7 +26,8 @@ import {
 } from '../conversationMutations'
 import { captureGenerationConversationOperation } from './generationConversationOperation'
 import { createChatParserDependencyStamp } from '../chatRenderIdentity'
-import { alertConfirm, alertNormal } from '../alert'
+import { alertConfirm, alertNormal, alertToast } from '../alert'
+import { language } from '../../lang'
 
 const continuationRuntime = vi.hoisted(() => ({
   session: null as ActiveConversationSession | null,
@@ -51,6 +52,7 @@ vi.mock('../alert', () => ({
   alertInput: vi.fn(),
   alertNormal: vi.fn(),
   alertSelect: vi.fn(),
+  alertToast: vi.fn(),
 }))
 
 vi.mock('../globalApi.svelte', () => ({ fetchNative: vi.fn(), readImage: vi.fn() }))
@@ -1569,17 +1571,37 @@ test('records the synthetic LLM Promise await result in a supported listener mod
   }, 'model')
 })
 
-test('creates production Lua engines with the handler deadline', async () => {
-  await runScripted('', {
-    char: { chaId: 'bounded-handler-options' } as never,
-    chat: { message: [] } as never,
-    mode: 'bounded-handler-options',
-  })
+test.each([
+  ['listener', 2_000],
+  ['button', 60_000],
+  ['manual trigger', 60_000],
+] as const)('creates production Lua engines with the %s deadline', async (entry, functionTimeout) => {
+  const char = {
+    type: 'character',
+    chaId: `bounded-${entry.replace(' ', '-')}-options`,
+    chatPage: 0,
+    chats: [{ message: [] }],
+    triggerscript: [{
+      comment: 'manualAction',
+      type: 'manual',
+      conditions: [],
+      effect: [{ type: 'triggerlua', code: `-- ${entry} deadline` }],
+    }],
+    defaultVariables: '',
+  } as unknown as character
+  DBState.db = { characters: [char], templateDefaultVariables: '' } as never
+  vi.mocked(getDatabase).mockReturnValue(DBState.db as never)
+  if (entry === 'listener') {
+    await runScripted(`-- ${entry} deadline`, { char, chat: { message: [] } as never, mode: 'output' })
+  } else if (entry === 'button') {
+    const { runLuaButtonTrigger } = await import('./scriptings')
+    await runLuaButtonTrigger(char, 'click')
+  } else {
+    const { runTrigger } = await import('./triggers')
+    await runTrigger(char, 'manual', { chat: char.chats[0], manualName: 'manualAction' })
+  }
 
-  expect(createdLuaEngineOptions.at(-1)).toEqual({
-    injectObjects: true,
-    functionTimeout: 2_000,
-  })
+  expect(createdLuaEngineOptions.at(-1)).toEqual({ injectObjects: true, functionTimeout })
 })
 
 test.each(['timeout', 'ordinary'] as const)('classifies the actual Wasmoon instruction-hook timeout without changing ordinary diagnostics (%s)', async (kind) => {
@@ -1592,6 +1614,7 @@ test.each(['timeout', 'ordinary'] as const)('classifies the actual Wasmoon instr
     })
   }
   const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+  vi.mocked(alertToast).mockClear()
   const elapsedClock = vi.spyOn(performance, 'now').mockReturnValueOnce(100).mockReturnValueOnce(125)
   const deadlineClock = vi.spyOn(Date, 'now').mockImplementation(() => now)
   try {
@@ -1606,10 +1629,12 @@ test.each(['timeout', 'ordinary'] as const)('classifies the actual Wasmoon instr
       mode: 'output',
     })
     if (kind === 'timeout') {
+      expect(alertToast).toHaveBeenCalledExactlyOnceWith(language.risuNest.scriptTimeout)
       expect(errors.mock.calls).toEqual([[{ code: 'lua-listener-timeout', mode: 'output', elapsedMs: 25 }]])
       expect(Number.isFinite(errors.mock.calls[0][0].elapsedMs)).toBe(true)
       expect(errors.mock.calls[0][0].elapsedMs).toBeGreaterThanOrEqual(0)
     } else {
+      expect(alertToast).not.toHaveBeenCalled()
       expect(errors).toHaveBeenCalledOnce()
       expect(errors.mock.calls[0]).toHaveLength(1)
       expect(errors.mock.calls[0][0]).toBeInstanceOf(Error)
@@ -1620,6 +1645,52 @@ test.each(['timeout', 'ordinary'] as const)('classifies the actual Wasmoon instr
   } finally {
     diagnosticEngineSetup.next = null
     elapsedClock.mockRestore()
+    deadlineClock.mockRestore()
+    errors.mockRestore()
+  }
+})
+
+test('shows one Lua timeout notice for the display listeners of one refresh', async () => {
+  let now = Date.now()
+  diagnosticEngineSetup.next = (engine) => {
+    engine.global.set('slowDisplay', () => {
+      now += 2_001
+    })
+  }
+  const char = {
+    type: 'character',
+    chaId: 'display-timeout-notice',
+    triggerscript: [{
+      type: 'start',
+      conditions: [],
+      effect: [{
+        type: 'triggerlua',
+        code: `
+          listenEdit('editDisplay', function(id, value)
+            slowDisplay()
+            local total = 0
+            for i = 1, 10000 do total = total + i end
+            return value .. total
+          end)
+        `,
+      }],
+    }],
+  } as unknown as character
+  const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+  const deadlineClock = vi.spyOn(Date, 'now').mockImplementation(() => now)
+  vi.mocked(alertToast).mockClear()
+  const { runLuaEditTrigger } = await import('./scriptings')
+  try {
+    await expect(Promise.all([
+      runLuaEditTrigger(char, 'editdisplay', 'first'),
+      runLuaEditTrigger(char, 'editdisplay', 'second'),
+    ])).resolves.toEqual(['first', 'second'])
+    expect(alertToast).toHaveBeenCalledExactlyOnceWith(language.risuNest.scriptTimeout)
+
+    await runLuaEditTrigger(char, 'editdisplay', 'later')
+    expect(alertToast).toHaveBeenCalledTimes(2)
+  } finally {
+    diagnosticEngineSetup.next = null
     deadlineClock.mockRestore()
     errors.mockRestore()
   }

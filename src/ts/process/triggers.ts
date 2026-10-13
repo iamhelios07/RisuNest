@@ -1711,6 +1711,7 @@ async function runTriggerImpl(char: character, mode: triggerMode, arg: RunTrigge
                         chat: chat,
                         operationContext: conversationOperation,
                         access: access ?? undefined,
+                        userStarted: mode === 'manual',
                     })
 
                     if(triggerCodeResult.stopSending){
