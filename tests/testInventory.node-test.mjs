@@ -3,7 +3,7 @@ import { test } from 'node:test'
 import { mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { assertInventory, discoverTestEntries, nodeAppTests, ownerOf, selectNodeTests } from './suiteOwnership.mjs'
+import { assertInventory, assertListedTestsExist, discoverTestEntries, extendedAppTests, nodeAppTests, ownerOf, selectNodeTests } from './suiteOwnership.mjs'
 import { parseVitestInventory } from './testInventory.mjs'
 
 const ordinary = 'src/ts/storage/newRegression.test.ts'
@@ -38,6 +38,12 @@ test('detects exclusions, duplicate ownership and missing runner owners', () => 
   assert.throws(() => assertInventory([ordinary], { app: [ordinary], harness: [ordinary] }), /Duplicate/)
   assert.throws(() => assertInventory([extended], { app: [] }), /Missing runner/)
   assert.throws(() => assertInventory([extended], { app: [extended] }), /Unexpected/)
+})
+
+test('every listed extended and node entry exists', () => {
+  const listed = [...extendedAppTests, ...nodeAppTests]
+  assert.doesNotThrow(() => assertListedTestsExist(listed))
+  assert.throws(() => assertListedTestsExist(listed.filter(path => path !== nodeOnly)), new RegExp(nodeOnly))
 })
 
 test('accepts the installed CLI JSON shape and rejects unexpected output', () => {

@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { assertInventory, discoverTestEntries, normalizePath, selectNodeTests } from './suiteOwnership.mjs'
+import { assertInventory, assertListedTestsExist, discoverTestEntries, normalizePath, selectNodeTests } from './suiteOwnership.mjs'
 
 export function parseVitestInventory(output, root, owner) {
   const entries = JSON.parse(output)
@@ -63,6 +63,7 @@ export function browserInventory(root) {
 export async function main() {
   const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
   const files = await discoverTestEntries(root)
+  assertListedTestsExist(files)
   const inventories = {
     ...vitestInventory(root),
     ...vitestInventory(root, 'server/manager/gui', 'manager'),

@@ -12,10 +12,6 @@ export const nodeAppTests = [
   'src-tauri/src/ipc_read_guard.test.ts',
   'src/appUpdateCheck.test.ts',
   'src/lang/checkboxConfirmCopy.test.ts',
-  'src/lang/lwwSyncCopy.test.ts',
-  'src/lang/serverSyncCopy.test.ts',
-  'src/lang/settingsCopy.test.ts',
-  'src/lang/upstreamBackupRestoreCopy.test.ts',
   'src/lib/ChatScreens/conversationStartMutations.test.ts',
   'src/lib/ChatScreens/defaultChatInput.test.ts',
   'src/lib/Others/HypaV3Modal/hypaOrphanState.test.ts',
@@ -411,6 +407,13 @@ export function selectNodeTests(files, owner = 'node') {
   if (selected.length === 0) throw new Error('No Node test entries found')
   if (new Set(selected).size !== selected.length) throw new Error('Duplicate Node test entries')
   return selected
+}
+
+// A listed path that no longer exists would silently stop routing a renamed test.
+export function assertListedTestsExist(files) {
+  const present = new Set(files.map(normalizePath))
+  const missing = [...extendedAppTests, ...nodeAppTests].filter(path => !present.has(path))
+  if (missing.length) throw new Error(`Listed test entries missing: ${missing.join(', ')}`)
 }
 
 export function assertInventory(files, inventories) {
