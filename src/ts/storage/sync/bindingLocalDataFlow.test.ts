@@ -10,10 +10,11 @@ import { normalizeDatabaseDefaults, type Database } from '../database.svelte'
 import type { InspectedSyncTarget, SyncBindingDependencies, SyncBindingState } from './bindingFlow'
 import { installSyncBindingFlow } from './bindingProduction'
 import { bindSyncTarget, registerSyncBindingTransport } from './bindingRegistry'
+import { assetResidencyStatus } from './serverAssetResidency.testSupport'
 
 // The binding table composed through the real character check wiring, native content check and dialogs.
 const target = { kind: 'server', connectionId: 'server' } as const
-const residency = { policy: 'remote', localBytes: 0, remoteBytes: 0, remoteObjects: 0, serverBytes: 0, serverObjects: 0, externalObjects: [], unavailableObjects: 0, previousStorageObjects: 0, evictedBytes: 0 }
+const residency = assetResidencyStatus()
 const factory = () => structuredClone(normalizeDatabaseDefaults({} as Database))
 let state: SyncBindingState
 let cleanup: (() => void)[] = []

@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { SyncBindingTransport, SyncBindingDependencies, SyncBindingNative } from './bindingFlow'
 import { languageKorean } from 'src/lang/ko'
-import { serverSyncProgressView, serverSyncRoutineView } from './serverSyncProgress'
+import { serverSyncProgressView, serverSyncRoutineView, type ServerSyncLane, type ServerSyncLaneName } from './serverSyncProgress'
+import { serverSyncLane } from './serverSyncProgress.testSupport'
+import { assetResidencyStatus } from './serverAssetResidency.testSupport'
 
 const f = vi.hoisted(() => ({
     native: true,
@@ -112,7 +114,7 @@ describe('production server LWW composition', () => {
         f.invoke.mockImplementation(async (command, args) => {
             if (command === 'asset_residency_download_remote') {
                 holding = true; await held; holding = false
-                return { policy: 'full', localBytes: 0, remoteBytes: 0, remoteObjects: 0, serverBytes: 0, serverObjects: 0, unavailableObjects: 0, evictedBytes: 0, externalObjects: [] }
+                return assetResidencyStatus()
             }
             if (command === 'external_lww_publish') return { segments: '0', more: false }
             return base(command, args)
@@ -750,7 +752,6 @@ describe('production server LWW composition', () => {
     })
     describe('asset storage chosen with the connection', () => {
         const config = { endpoint: 'https://synthetic.invalid', libraryId: 'library', deviceId: 'registration', token: 'synthetic' }
-        const residency = (policy: string) => ({ policy, localBytes: 0, remoteBytes: 0, remoteObjects: 0, serverBytes: 0, serverObjects: 0, externalObjects: [], unavailableObjects: 0, evictedBytes: 0 })
         const policyCalls = () => f.invoke.mock.calls.filter(([command]) => command === 'server_sync_asset_policy')
         const contextFor = (libraryId: string) => ({ ...bindingContext(), state: { ...bindingContext().state, libraryId } })
         // The shared flow is mocked; each case drives the transport the way a binding to `libraryId` would.
@@ -766,7 +767,7 @@ describe('production server LWW composition', () => {
         let base: (command: string, args?: unknown) => Promise<unknown>
         beforeEach(async () => {
             base = f.invoke.getMockImplementation()!
-            f.invoke.mockImplementation(async (command, args) => command === 'server_sync_asset_policy' ? residency('remote') : base(command, args))
+            f.invoke.mockImplementation(async (command, args) => command === 'server_sync_asset_policy' ? assetResidencyStatus({ policy: 'remote' }) : base(command, args))
             production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
             visible(true)
         })
@@ -828,15 +829,12 @@ describe('production server LWW composition', () => {
     })
 })
 describe('server sync progress', () => {
-    const lanes = (sent: number) => ['send', 'receive', 'hydrate', 'binding', 'assets'].map(lane => ({
-        lane, active: lane === 'send', sending: lane === 'send', receiving: false, step: lane === 'send' ? 'uploading' : 'idle', listed: 0, itemsDone: 0, itemsTotal: 0, filesDone: 0, filesTotal: 0, bytesDone: 0, bytesTotal: 0, sentBytes: lane === 'send' ? sent : 0, receivedBytes: 0, backlogDone: 0, backlogLeft: 0,
-    }))
-    const sendLanes = (send: Record<string, unknown>) => ['send', 'receive', 'hydrate', 'binding', 'assets'].map(lane => ({
-        lane, active: false, sending: false, receiving: false, step: 'idle', listed: 0, itemsDone: 0, itemsTotal: 0, filesDone: 0, filesTotal: 0, bytesDone: 0, bytesTotal: 0, sentBytes: 0, receivedBytes: 0, backlogDone: 0, backlogLeft: 0, ...(lane === 'send' ? send : {}),
-    }))
+    const laneNames: ServerSyncLaneName[] = ['send', 'receive', 'hydrate', 'binding', 'assets']
+    const sendLanes = (send: Partial<ServerSyncLane>) => laneNames.map(lane => serverSyncLane(lane, lane === 'send' ? send : {}))
+    const lanes = (sent: number) => sendLanes({ active: true, sending: true, step: 'uploading', sentBytes: sent })
     const pendingReads = () => f.invoke.mock.calls.filter(([command]) => command === 'server_sync_lww_pending_count').length
     /** A push that waits; each lanes read takes the next of `reads` and repeats the last. */
-    const countedPush = (reads: Record<string, unknown>[], pending: number | null = null) => {
+    const countedPush = (reads: Partial<ServerSyncLane>[], pending: number | null = null) => {
         let finish!: (failure?: unknown) => void
         f.invoke.mockImplementation(async command => command === 'server_sync_lww_push' ? new Promise((resolve, reject) => { finish = failure => failure ? reject(failure) : resolve(null) })
             : command === 'server_sync_lww_pull' ? emptyReceive()
