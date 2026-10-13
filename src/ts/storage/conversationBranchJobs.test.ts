@@ -2,11 +2,8 @@ import { IDBFactory, IDBKeyRange, IDBObjectStore } from 'fake-indexeddb'
 import { describe, expect, it, vi } from 'vitest'
 import type { Chat, Database, Message } from './database.svelte'
 import { IndexedDbPersistentDataStore } from './indexedDbPersistentDataStore'
-import type {
-    ConversationWindow,
-    PersistentDataStore,
-} from './persistentDataStore'
-import { createLeaseStub } from './persistentDataStore.testSupport'
+import type { ConversationWindow } from './persistentDataStore'
+import { createLeaseStub, createStoreStub } from './persistentDataStore.testSupport'
 import { RevisionConflictError } from './persistentDataStore'
 import { copyPinnedConversationBranch } from './conversationBranchJobs'
 
@@ -51,10 +48,10 @@ describe('pinned conversation branch jobs', () => {
             release,
         })
         const commit = vi.fn(async () => ({ revision: 8 }))
-        const store = {
+        const store = createStoreStub({
             acquireRevision: vi.fn(async () => lease),
             commit,
-        } as unknown as PersistentDataStore
+        })
         const branch = {
             id: 'branch-chat',
             name: 'Source (Branch)',
@@ -136,10 +133,10 @@ describe('pinned conversation branch jobs', () => {
             release,
         })
         const commit = vi.fn(async () => ({ revision: 4 }))
-        const store = {
+        const store = createStoreStub({
             acquireRevision: vi.fn(async () => lease),
             commit,
-        } as unknown as PersistentDataStore
+        })
         const character = {
             type: 'character',
             chaId: 'char-a',
@@ -324,10 +321,10 @@ describe('pinned conversation branch jobs', () => {
             release,
         })
         const commit = vi.fn()
-        const store = {
+        const store = createStoreStub({
             acquireRevision: vi.fn(async () => lease),
             commit,
-        } as unknown as PersistentDataStore
+        })
 
         await expect(copyPinnedConversationBranch(store, {
             characterId: 'char-a',
@@ -354,10 +351,10 @@ describe('pinned conversation branch jobs', () => {
             release: releaseAfterReadFailure,
         })
         const noCommit = vi.fn()
-        const readFailureStore = {
+        const readFailureStore = createStoreStub({
             acquireRevision: vi.fn(async () => readFailureLease),
             commit: noCommit,
-        } as unknown as PersistentDataStore
+        })
         const request = {
             characterId: 'char-a',
             sourceConversationId: 'source-chat',
@@ -394,10 +391,10 @@ describe('pinned conversation branch jobs', () => {
         const conflictCommit = vi.fn(async () => {
             throw new RevisionConflictError(5, 6)
         })
-        const conflictStore = {
+        const conflictStore = createStoreStub({
             acquireRevision: vi.fn(async () => conflictLease),
             commit: conflictCommit,
-        } as unknown as PersistentDataStore
+        })
 
         await expect(copyPinnedConversationBranch(conflictStore, request)).rejects.toBeInstanceOf(
             RevisionConflictError,

@@ -836,8 +836,45 @@ async fn streamed_frame_body_limit_rejects_before_publishing() {
         .expect("the oversized streamed body was not answered")
         .unwrap();
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    // The rest of the body stays unread, so the connection is not offered for reuse.
+    assert_eq!(response.headers()["connection"], "close");
     assert!(s.store.object_size(&hash(object)).unwrap().is_none());
     assert_eq!(s.head(&s.a).await, head);
+}
+
+#[tokio::test]
+async fn a_reply_sent_before_the_request_body_is_read_closes_the_connection() {
+    let s = Server::start().await;
+    let body = br#"[{"target":"0000","bases":[]}]"#;
+    let mut socket = tokio::net::TcpStream::connect(s.base.strip_prefix("http://").unwrap())
+        .await
+        .unwrap();
+    // The body is withheld, so the rejection is sent before any of it is read.
+    let request = format!(
+        "POST /objects/transfer HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    socket.write_all(request.as_bytes()).await.unwrap();
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        head.push(socket.read_u8().await.unwrap());
+    }
+    let head = String::from_utf8(head).unwrap().to_ascii_lowercase();
+    assert!(head.starts_with("http/1.1 401"), "{head}");
+    assert!(head.contains("\r\nconnection: close\r\n"), "{head}");
+
+    // A rejection without a body, and a request whose body was read, keep the connection.
+    let response = s.client.get(format!("{}/head", s.base)).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(response.headers().get("connection").is_none());
+    let response = s
+        .auth(s.client.post(format!("{}/objects/missing", s.base)), &s.a)
+        .json(&serde_json::json!([{"hash":hash(b"absent"),"size":"6"}]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get("connection").is_none());
 }
 
 #[tokio::test]

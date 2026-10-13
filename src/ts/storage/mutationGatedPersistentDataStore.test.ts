@@ -3,6 +3,7 @@ import { createPersistentStoreHarness } from '../../../tests/support/persistentS
 import type { Database } from './database.svelte'
 import { createMutationGatedPersistentDataStore } from './mutationGatedPersistentDataStore'
 import type { PersistentDataStore, WorkingSetCommit } from './persistentDataStore'
+import { createStoreStub } from './persistentDataStore.testSupport'
 import {
     createInRealmStorageLockManager,
     createStorageMutationGate,
@@ -62,7 +63,7 @@ describe('createMutationGatedPersistentDataStore', () => {
         expect(await gated.readConversationMessageMetadataWindow!(query)).toBe(result)
         expect(write).not.toHaveBeenCalled()
         // The read is optional in the store contract, and the real store always has it.
-        expect(createMutationGatedPersistentDataStore({} as PersistentDataStore, gate).readConversationMessageMetadataWindow).toBeUndefined()
+        expect(createMutationGatedPersistentDataStore(createStoreStub({}), gate).readConversationMessageMetadataWindow).toBeUndefined()
     })
 
     it('gates ordinary commits and full replacements while preserving exact inputs and results', async () => {

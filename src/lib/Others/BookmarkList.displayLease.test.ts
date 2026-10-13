@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import { mount, tick, unmount } from 'svelte'
 import { createMetadataOnlySelectedConversation } from 'src/ts/storage/selectedConversationLifecycle'
+import type { Message } from 'src/ts/storage/database.svelte'
+import type { PersistentDataStore } from 'src/ts/storage/persistentDataStore'
+import { createLeaseStub } from 'src/ts/storage/persistentDataStore.testSupport'
 import { createBookmarkDisplayDatabase } from './BookmarkDisplayState.test.svelte'
 
 const state = vi.hoisted(() => ({
@@ -11,7 +14,7 @@ const state = vi.hoisted(() => ({
     selectedIndex: 0,
     selection: null as any,
     acquireCompleteConversation: vi.fn(),
-    acquireRevision: vi.fn(),
+    acquireRevision: vi.fn<PersistentDataStore['acquireRevision']>(),
     selectionListeners: new Set<() => void>(),
 }))
 vi.mock('src/ts/storage/database.svelte', () => ({
@@ -58,7 +61,7 @@ vi.mock('src/ts/storage/persistentDataRuntime.svelte', () => ({
         acquireCompleteConversation: (...args: any[]) =>
             state.acquireCompleteConversation(...args),
         store: {
-            acquireRevision: (...args: any[]) => state.acquireRevision(...args),
+            acquireRevision: (revision: number) => state.acquireRevision(revision),
         },
     }),
 }))
@@ -110,7 +113,7 @@ function completeLease(release: () => void) {
 }
 
 function prepare(lua: boolean) {
-    const message = {
+    const message: Message = {
         chatId: 'bookmark-message',
         role: 'char',
         data: 'Synthetic bookmarked message',
@@ -153,7 +156,7 @@ function prepare(lua: boolean) {
         storeRevision: 1,
     }
     const releaseRevision = vi.fn()
-    state.acquireRevision.mockResolvedValue({
+    state.acquireRevision.mockResolvedValue(createLeaseStub({
         revision: 1,
         readConversationWindow: async () => ({
             revision: 1,
@@ -169,7 +172,7 @@ function prepare(lua: boolean) {
             },
         }),
         release: releaseRevision,
-    })
+    }))
     return { character, releaseRevision }
 }
 
@@ -464,7 +467,7 @@ test.each([false, true])(
 
 test('keeps bookmark loading distinct from empty and offers retry after a read failure', async () => {
     prepare(false)
-    const lease = await state.acquireRevision()
+    const lease = await state.acquireRevision(1)
     state.acquireRevision.mockClear()
     let reject!: (reason: unknown) => void
     state.acquireRevision.mockReturnValueOnce(new Promise((_resolve, fail) => { reject = fail }))
@@ -484,20 +487,20 @@ test('keeps bookmark loading distinct from empty and offers retry after a read f
 
 test('retries a stale bookmark revision before presenting a current result', async () => {
     prepare(false)
-    const lease = await state.acquireRevision()
+    const lease = await state.acquireRevision(1)
     state.acquireRevision.mockClear()
-    state.acquireRevision.mockImplementationOnce(async () => ({
+    state.acquireRevision.mockImplementationOnce(async () => createLeaseStub({
         ...lease,
-        readConversationWindow: async (...args: any[]) => {
-            const result = await lease.readConversationWindow(...args)
+        readConversationWindow: async (query) => {
+            const result = await lease.readConversationWindow(query)
             state.selection = { ...state.selection, storeRevision: 2 }
             return result
         },
-    })).mockResolvedValue({
+    })).mockResolvedValue(createLeaseStub({
         ...lease,
         revision: 2,
-        readConversationWindow: async (...args: any[]) => ({ ...await lease.readConversationWindow(...args), revision: 2 }),
-    })
+        readConversationWindow: async (query) => ({ ...await lease.readConversationWindow(query), revision: 2 }),
+    }))
     mounted = mount(BookmarkList, { target })
     await vi.waitFor(() => expect(target.querySelector('[role="button"]')).not.toBeNull())
     expect(state.acquireRevision).toHaveBeenCalledTimes(2)

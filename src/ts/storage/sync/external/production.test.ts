@@ -2,6 +2,7 @@ import type { MobileBackgroundTask, MobileTaskKind } from '../../../mobileBackgr
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ExternalJobSummary, ExternalStorageState } from './types'
 import type { CommittedApplyOutcome } from '../../persistentDataRuntime'
+import { createLeaseStub, createStoreStub } from '../../persistentDataStore.testSupport'
 
 const mocks = vi.hoisted(() => ({
     protected: false,
@@ -199,17 +200,17 @@ async function installActualRestorePause() {
     Object.assign(mocks.persistentRuntime, {
         store: { open: mocks.openStore },
         async withPausedPersistentWrites(reason: string, operation: (token: unknown) => Promise<unknown>) {
-            const store = {
+            const store = createStoreStub({
                 open: async () => undefined,
                 readRoot: async () => ({ revision: mocks.revision, value: capturePersistentRoot(database) }),
-                acquireRevision: async (revision: number) => ({
+                acquireRevision: async (revision: number) => createLeaseStub({
                     revision, readRoot: async () => ({ revision, value: capturePersistentRoot(database) }),
                     queryPresets: async () => ({ revision, items: [] }),
                     queryCharacters: async () => ({ revision, items: [] }),
                     queryPluginStorage: async () => ({ revision, items: [] }),
                     release: async () => {},
                 }),
-            } as unknown as import('../../persistentDataStore').PersistentDataStore
+            })
             actual = createPersistentDataRuntime({
                 store, state: {
                     captureRoot: () => capturePersistentRoot(database), captureSelectedCharacter: () => null,

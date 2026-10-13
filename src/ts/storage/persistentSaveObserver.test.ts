@@ -5,6 +5,7 @@ import { ActiveConversationSession } from './activeConversationSession'
 import { observePersistentSaveChanges } from './persistentSaveObserver.svelte'
 import { PersistentMutationFencedError, SaveCoordinator } from './saveCoordinator'
 import type { PersistentDataStore } from './persistentDataStore'
+import { createStoreStub } from './persistentDataStore.testSupport'
 import { PENDING_SAVE_BYTE_LIMIT } from './pendingDataSize'
 import { createMetadataOnlySelectedConversation } from './selectedConversationLifecycle'
 import { createPersistentSaveObserverHarness } from './tests/persistentSaveObserverHarness.svelte'
@@ -314,7 +315,7 @@ describe('persistent save mutation observation', () => {
         let revision = 1
         const commit = vi.fn(async () => ({ revision: ++revision }))
         const coordinator = new SaveCoordinator({
-            store: { commit } as unknown as PersistentDataStore,
+            store: createStoreStub({ commit }),
             captureRoot,
             captureSelectedCharacter: () => state.database.characters[0],
             captureCharacter: () => state.database.characters[0],
@@ -471,7 +472,7 @@ describe('persistent save mutation observation', () => {
             const commit = vi.fn(async (_request: Parameters<PersistentDataStore['commit']>[0]) => ({ revision: ++revision }))
             const onPersisted = vi.fn()
             const coordinator = new SaveCoordinator({
-                store: { commit, replaceFromDatabase: vi.fn() } as unknown as PersistentDataStore,
+                store: createStoreStub({ commit, replaceFromDatabase: vi.fn() }),
                 ...(state ? {
                     canonicalCapture: createPersistenceCanonicalCapture({
                         root: () => state.database,

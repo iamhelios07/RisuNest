@@ -5,7 +5,7 @@ import { DBState, selIdState } from '../stores.svelte';
 import { aiWatermarkingLawApplies, getFileSrc, getFileImageSource } from '../globalApi.svelte';
 import { isTauri } from "src/ts/platform"
 import { getChatVar, setChatVar, getGlobalChatVar } from './chatVar.svelte';
-import { noteChatVariableRead, recordChatVariableReads, type DisplayReadRecord } from '../process/scriptVariableReads';
+import { noteChatVariableRead, noteUntrackedVariableRead, recordChatVariableReads, type DisplayReadRecord } from '../process/scriptVariableReads';
 import { processScriptFull, type ProcessScriptCaptureContext } from '../process/scripts';
 import { get } from 'svelte/store';
 import css, { type CssAtRuleAST, type CssDeclarationAST } from '@adobe/css-tools'
@@ -1104,6 +1104,7 @@ function readMatcherChatVar(context: matcherArg | null, key: string): string {
 }
 
 function readMatcherGlobalChatVar(context: matcherArg | null, key: string): string {
+    noteUntrackedVariableRead()
     return context?.globalChatVariables
         ? context.globalChatVariables[key] ?? 'null'
         : getGlobalChatVar(key)

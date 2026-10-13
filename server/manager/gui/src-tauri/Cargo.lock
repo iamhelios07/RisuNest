@@ -3377,6 +3377,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.2.17",
  "hex",
+ "http-body",
  "libc",
  "qrcode",
  "reqwest 0.12.28",

@@ -1,8 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { Chat, Database, Message, character } from './storage/database.svelte'
 import { ActiveConversationSession } from './storage/activeConversationSession'
-import type { PersistentDataStore } from './storage/persistentDataStore'
-import { createLeaseStub } from './storage/persistentDataStore.testSupport'
+import type { PersistentRoot } from './storage/persistentDataStore'
+import { createLeaseStub, createStoreStub } from './storage/persistentDataStore.testSupport'
 import { openChatScreenshotSourceLease } from './chatScreenshotSourceLease'
 import type { ChatScreenshotRenderContext } from './chatScreenshotRange'
 import type { SelectedConversationTarget } from './storage/activeWorkingSet.svelte'
@@ -106,11 +106,11 @@ function harness(messages: Message[]) {
         }),
         release,
     })
-    const store = {
+    const store = createStoreStub({
         open: vi.fn(async () => undefined),
-        readRoot: vi.fn(async () => ({ revision: 7, value: {} })),
+        readRoot: vi.fn(async () => ({ revision: 7, value: {} as PersistentRoot })),
         acquireRevision: vi.fn(async () => lease),
-    } as unknown as PersistentDataStore
+    })
     let activeSession: ActiveConversationSession | null = session
     let navigationGeneration = 1
     const dependencies = {

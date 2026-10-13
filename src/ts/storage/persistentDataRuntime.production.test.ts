@@ -20,6 +20,7 @@ import {
 import { getV2PluginAPIs } from '../plugins/plugins.svelte'
 import type { Database } from './database.svelte'
 import type { PersistentDataStore, PersistentUnitMutation, WorkingSetCommit } from './persistentDataStore'
+import { createStoreStub } from './persistentDataStore.testSupport'
 import { captureCurrentPreset, getDatabase, getEffectivePresetId, normalizeDatabaseDefaults, setDatabase, setDatabaseLite, setEffectivePresetOverride, setPreset } from './database.svelte'
 import { createPresetWorkingSetController } from './presetWorkingSetOperations'
 import {
@@ -404,7 +405,7 @@ describe('production persistent working-set publication', () => {
             selectedCharID.set(-1)
             const adapter = createProductionStateAdapter()
             const commit = vi.fn(async ({expectedRevision}) => ({revision: expectedRevision + 1}))
-            const coordinator = new SaveCoordinator({store: {commit} as unknown as PersistentDataStore, ...adapter})
+            const coordinator = new SaveCoordinator({store: createStoreStub({commit}), ...adapter})
             coordinator.initialize(1)
             const accepted = adapter.captureRoot()
             delete accepted[field]
@@ -439,7 +440,7 @@ describe('production persistent working-set publication', () => {
             selectedCharID.set(-1)
             const adapter = createProductionStateAdapter()
             const commit = vi.fn(async ({expectedRevision}) => ({revision: expectedRevision + 1}))
-            const coordinator = new SaveCoordinator({store: {commit} as unknown as PersistentDataStore, ...adapter})
+            const coordinator = new SaveCoordinator({store: createStoreStub({commit}), ...adapter})
             coordinator.initialize(1)
             const accepted = adapter.captureRoot()
             delete accepted[field]
@@ -476,7 +477,7 @@ describe('production persistent working-set publication', () => {
         const adapter = createProductionStateAdapter()
         const commit = vi.fn().mockRejectedValueOnce(new Error('Synthetic failure'))
             .mockImplementation(async ({expectedRevision}) => ({revision: expectedRevision + 1}))
-        const coordinator = new SaveCoordinator({store: {commit} as unknown as PersistentDataStore, ...adapter})
+        const coordinator = new SaveCoordinator({store: createStoreStub({commit}), ...adapter})
         coordinator.initialize(1)
         const accepted = adapter.captureRoot()
         delete accepted.explicitGlobalChatVariables
@@ -524,7 +525,7 @@ describe('production persistent working-set publication', () => {
             captureRoot: () => {
                 throw new Error('Must use the production canonical capture')
             },
-            store: { commit } as unknown as PersistentDataStore,
+            store: createStoreStub({ commit }),
         })
         coordinator.initialize(1)
         getDatabase().username = 'Immediately changed'
@@ -961,14 +962,14 @@ describe('production persistent working-set publication', () => {
         const storage = createPluginStorageStore({
             getStorageAuthorityEpoch: () => 0,
             assertPersistentMutationAllowed: vi.fn(),
-            store: {
+            store: createStoreStub({
                 open: async () => undefined,
                 queryPluginStorage: async () => ({
                     revision: 1,
                     items: [{ owner: UNOWNED_PLUGIN_OWNER, key: 'nested', byteSize: 1 }],
                 }),
                 readPluginStorage: async () => ({ revision: 1, value: nestedValue }),
-            } as unknown as PersistentDataStore,
+            }),
             mutate: async () => undefined,
         })
         const unregister = registerPluginStorageLifecycle(storage)

@@ -56,6 +56,9 @@ vi.mock('../storage/database.svelte', async () => (await import('./tests/scripti
 vi.mock('../stores.svelte', async () => (await import('./tests/scriptingsTestHarness')).storesModule(() => scriptingSelectionState.index))
 
 vi.mock('./modules', async () => (await import('./tests/scriptingsTestHarness')).modulesModule())
+vi.mock('../plugins/plugins.svelte', () => ({ pluginV2: {
+  editdisplay: new Set(), editinput: new Set(), editoutput: new Set(), editprocess: new Set(),
+} }))
 
 vi.mock('./files/inlays', async () => (await import('./tests/scriptingsTestHarness')).inlaysModule())
 vi.mock('./lorebook.svelte', async () => (await import('./tests/scriptingsTestHarness')).lorebookModule())
@@ -1412,6 +1415,7 @@ test('Lua history and chat variables stay bound to the captured character', asyn
     storeRevision: 13,
   })
   const operationContext = createConversationOperationContext(session, originalChat)
+  // The global selection points at the replacement, so reading it instead of the captured character fails this test.
   scriptingSelectionState.index = 1
   vi.mocked(getDatabase).mockReturnValue(database as never)
   vi.mocked(getCurrentCharacter).mockReturnValue(replacementCharacter as never)
@@ -1604,49 +1608,51 @@ test.each(['timeout', 'ordinary'] as const)('classifies the actual Wasmoon instr
   }
 })
 
-test('shows one Lua timeout notice for the display listeners of one refresh', async () => {
+test('shows one Lua timeout notice for queued display pipelines and another for a later refresh', async () => {
+  const fixture = operationCharacterFixture('display-timeout-notice')
+  fixture.char.customscript = []
   let now = Date.now()
   diagnosticEngineSetup.next = (engine) => {
     engine.global.set('slowDisplay', () => {
       now += 2_001
     })
   }
-  const char = {
-    type: 'character',
-    chaId: 'display-timeout-notice',
-    triggerscript: [{
-      type: 'start',
-      conditions: [],
-      effect: [{
-        type: 'triggerlua',
-        code: `
-          listenEdit('editDisplay', function(id, value)
-            slowDisplay()
-            local total = 0
-            for i = 1, 10000 do total = total + i end
-            return value .. total
-          end)
-        `,
-      }],
-    }],
-  } as unknown as character
+  fixture.char.triggerscript = luaTriggerScript(`
+    listenEdit('editDisplay', function(id, value)
+      slowDisplay()
+      local total = 0
+      for i = 1, 10000 do total = total + i end
+      return value .. total
+    end)
+  `)
+  installOperationCharacterFixture(fixture)
+  vi.mocked(getCurrentChat).mockReturnValue(fixture.chat)
+  vi.mocked(getCurrentCharacter).mockReturnValue(fixture.char)
+  continuationRuntime.session = fixture.session
+  const previousLocalStorage = globalThis.localStorage
+  vi.stubGlobal('localStorage', { getItem: () => null })
+  vi.mocked(risuChatParser).mockImplementation(value => value)
   const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined)
   const deadlineClock = vi.spyOn(Date, 'now').mockImplementation(() => now)
   vi.mocked(alertToast).mockClear()
-  const { runLuaEditTrigger } = await import('./scriptings')
   try {
+    const { processScriptFull } = await import('./scripts')
     await expect(Promise.all([
-      runLuaEditTrigger(char, 'editdisplay', 'first'),
-      runLuaEditTrigger(char, 'editdisplay', 'second'),
-    ])).resolves.toEqual(['first', 'second'])
+      processScriptFull(fixture.char, 'first', 'editdisplay', 0),
+      processScriptFull(fixture.char, 'second', 'editdisplay', 1),
+    ])).resolves.toMatchObject([{ data: 'first' }, { data: 'second' }])
+    expect(errors.mock.calls.filter(([error]) => error?.code === 'lua-listener-timeout')).toHaveLength(2)
     expect(alertToast).toHaveBeenCalledExactlyOnceWith(language.risuNest.scriptTimeout)
 
-    await runLuaEditTrigger(char, 'editdisplay', 'later')
+    await processScriptFull(fixture.char, 'later', 'editdisplay', 0)
     expect(alertToast).toHaveBeenCalledTimes(2)
   } finally {
     diagnosticEngineSetup.next = null
     deadlineClock.mockRestore()
     errors.mockRestore()
+    continuationRuntime.session = null
+    vi.mocked(risuChatParser).mockReset()
+    vi.stubGlobal('localStorage', previousLocalStorage)
   }
 })
 
@@ -1897,8 +1903,9 @@ test('runs variable-only Lua handlers and display listeners without visiting mes
   }
 })
 
-test.each(['after', 'before'] as const)('rejects a Lua message edit made %s the messages it read changed and keeps its variables', async (edit) => {
-  const fixture = operationCharacterFixture(`stale-message-edit-${edit}`)
+test.each(['after', 'before'].flatMap(edit => ['content', 'metadata'].map(change => ({ edit, change }))))('rejects a Lua message edit made $edit the message $change changed and keeps its variables', async ({ edit, change }) => {
+  const fixture = operationCharacterFixture(`stale-message-edit-${edit}-${change}`)
+  if (change === 'metadata') fixture.chat.scriptstate = { $asked: 'yes' }
   const setChat = `setChat(id, 0, 'edited from ' .. before)`
   fixture.char.triggerscript = luaTriggerScript(`
     onButtonClick = async(function(id, data)
@@ -1926,14 +1933,23 @@ test.each(['after', 'before'] as const)('rejects a Lua message edit made %s the 
     const click = runLuaButtonTrigger(fixture.char, 'click')
     await vi.waitFor(() => expect(confirm).toBeTypeOf('function'))
     expect(askedWhileWaiting).toBe('yes')
-    fixture.session.edit(fixture.session.locate(0), {
-      ...fixture.chat.message[0],
-      data: 'external',
-    })
+    if (change === 'metadata') {
+      expect(fixture.session.adoptPersistedMetadata({
+        ...fixture.chat,
+        message: fixture.chat.message.map(message => ({ ...message, pluginMetadata: 'external' })),
+      }, 15)).toBe(true)
+    } else {
+      fixture.session.edit(fixture.session.locate(0), {
+        ...fixture.chat.message[0],
+        data: 'external',
+      })
+    }
     confirm(true)
 
     await expect(click).rejects.toThrow(ConversationSessionStaleError)
-    expect(fixture.chat.message.map((entry) => entry.data)).toEqual(['external'])
+    expect(fixture.chat.message[0]).toMatchObject(change === 'metadata'
+      ? { data: 'message', pluginMetadata: 'external' }
+      : { data: 'external' })
     expect(fixture.chat.scriptstate).toEqual({ $asked: 'yes', $answered: 'yes' })
     expect(fixture.session.activePinReasons).toEqual([])
   } finally {

@@ -5,12 +5,11 @@ import type {
     CharacterPage,
     ConversationPage,
     ConversationWindow,
-    PersistentDataStore,
     PluginStorageMutation,
     PersistentRevisionLease,
 } from '../storage/persistentDataStore'
 import { RevisionConflictError } from '../storage/persistentDataStore'
-import { createLeaseStub } from '../storage/persistentDataStore.testSupport'
+import { createLeaseStub, createStoreStub } from '../storage/persistentDataStore.testSupport'
 import { getPersistentDataStore } from '../storage/persistentDataStoreFactory'
 import {
     createCatalogCharacterStub,
@@ -241,7 +240,7 @@ function createHarness(options: { unitIntent?: boolean; revisionAdmission?: bool
             release,
         })
     })
-    const store = {
+    const store = createStoreStub({
         open: vi.fn(async () => undefined),
         queryCharacters: vi.fn(async () => characterPage),
         queryConversations: vi.fn(async () => conversationPage),
@@ -253,7 +252,7 @@ function createHarness(options: { unitIntent?: boolean; revisionAdmission?: bool
         commit: vi.fn(),
         replaceFromDatabase: vi.fn(),
         acquireRevision,
-    } as unknown as PersistentDataStore
+    })
     const flushPendingData = vi.fn(async () => undefined)
     const snapshot = vi.fn((value: unknown) => structuredClone(value))
     const applyCompatibilityDatabaseLite = vi.fn((_database: Record<string, unknown>) => undefined)

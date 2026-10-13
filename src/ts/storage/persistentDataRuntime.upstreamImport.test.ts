@@ -9,8 +9,8 @@ vi.mock('../plugins/apiV3/v3.svelte',()=>plugins)
 const library=vi.hoisted(()=>({hasCharacters:vi.fn<()=>Promise<boolean>>()}))
 vi.mock('./libraryCharacters',()=>({hasLibraryCharacters:library.hasCharacters}) satisfies typeof import('./libraryCharacters'))
 import type {Database} from './database.svelte'
-import type {PersistentDataStore,PersistentRevisionLease} from './persistentDataStore'
-import {createLeaseStub} from './persistentDataStore.testSupport'
+import type {PersistentRevisionLease} from './persistentDataStore'
+import {createLeaseStub,createStoreStub} from './persistentDataStore.testSupport'
 import {capturePersistentPluginStorage,capturePersistentPresets,capturePersistentRoot,createPersistentDataRuntime} from './persistentDataRuntime'
 import type {OfficialRevisionPublisher} from './saveCoordinator'
 import {makeDatabase} from './saveCoordinator.testSupport'
@@ -26,7 +26,7 @@ async function createHarness(officialPublisher?: OfficialRevisionPublisher, capt
     const onWorkingSetRefreshRequired = vi.fn()
     const onBackgroundError = vi.fn()
     const publishPresetWorkingSet = vi.fn()
-    const store = {
+    const store = createStoreStub({
         commitWorkingSetChangeCursor:vi.fn(async()=>{}),
         open: vi.fn(async () => undefined),
         readRoot: vi.fn(async () => ({ revision, value: capturePersistentRoot(durable) })),
@@ -79,7 +79,7 @@ async function createHarness(officialPublisher?: OfficialRevisionPublisher, capt
             return lease
         }),
         materializeDatabase: vi.fn(async () => { throw new Error('Unexpected complete materialization') }),
-    } as unknown as PersistentDataStore
+    })
     const runtime = createPersistentDataRuntime({
         store,
         state: {

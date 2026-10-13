@@ -1,9 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { Chat, Database, character } from './database.svelte'
-import type {
-    PersistentDataStore,
-    WorkingSetCommit,
-} from './persistentDataStore'
+import type { WorkingSetCommit } from './persistentDataStore'
+import { createStoreStub } from './persistentDataStore.testSupport'
 import type { PersistentConversationReplacementResult } from './saveCoordinator'
 import {
     captureRoot,
@@ -104,7 +102,7 @@ async function expectScopedConversationWrites(characterCount: number) {
         }
         return { revision: ++revision }
     })
-    const store = {
+    const store = createStoreStub({
         commit,
         readConversation: vi.fn(async (characterId: string, conversationId: string) => {
             targetReads.push([characterId, conversationId])
@@ -122,7 +120,7 @@ async function expectScopedConversationWrites(characterCount: number) {
         materializeDatabase: vi.fn(async () => {
             throw new Error('Scoped conversation write must not materialize the database')
         }),
-    } as unknown as PersistentDataStore
+    })
     const coordinator = new SaveCoordinator({
         store,
         captureRoot: () => captureRoot(database),
