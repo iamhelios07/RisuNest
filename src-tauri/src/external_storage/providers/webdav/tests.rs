@@ -1242,9 +1242,10 @@ fn documented_statuses_map_to_provider_errors_with_their_retry_hints() {
             reply(401, &[("WWW-Authenticate", "Basic realm=\"dav\"")], b""),
             reply(507, &[], b""),
             reply(423, &[], b""),
-            reply(429, &[("Retry-After", "60")], b""),
             reply(404, &[], b""),
             reply(302, &[], b""),
+            // Last, because a later request on this account waits out its Retry-After.
+            reply(429, &[("Retry-After", "60")], b""),
         ]);
         let repository = harness.opened().await;
         let directory = tempfile::tempdir().unwrap();
@@ -1254,10 +1255,10 @@ fn documented_statuses_map_to_provider_errors_with_their_retry_hints() {
             (ErrorKind::StorageFull, 507, None),
             // A write lock another client holds clears on its own timeout.
             (ErrorKind::Transient, 423, None),
-            (ErrorKind::RateLimited, 429, Some(NOW_MS + 60_000)),
             (ErrorKind::NotFound, 404, None),
             // A redirect without a destination cannot be followed.
             (ErrorKind::EndpointRejected, 302, None),
+            (ErrorKind::RateLimited, 429, Some(NOW_MS + 60_000)),
         ];
         for (index, (kind, status, retry_at_ms)) in expected.into_iter().enumerate() {
             let mut staging = sink(&directory, &format!("read-{index}"));
