@@ -181,6 +181,7 @@ vi.mock('../storage/persistentDataStoreFactory', async () => (await import('./te
 import type { character, Chat, Database, Message } from '../storage/database.svelte'
 import { ActiveConversationSession } from '../storage/activeConversationSession'
 import { SelectedConversationPromotionStaleError } from '../storage/activeWorkingSet.svelte'
+import { createLeaseStub } from '../storage/persistentDataStore.testSupport'
 import { PersistentMutationFencedError } from '../storage/saveCoordinator'
 import { DBState, selectedCharID } from '../stores.svelte'
 import { doingChat, sendChat } from './index.svelte'
@@ -498,9 +499,9 @@ describe('sendChat generation session integration', () => {
             totalMessages: storedMessages.length,
         }
         const bodyReads: number[] = []
-        const lease = {
+        const lease = createLeaseStub({
             revision: 1,
-            async readConversationMessageMetadataWindow(input: any) {
+            async readConversationMessageMetadataWindow(input) {
                 const end = Math.min(storedMessages.length, input.startIndex + input.limit)
                 return {
                     revision: 1,
@@ -520,7 +521,7 @@ describe('sendChat generation session integration', () => {
                     },
                 }
             },
-            async readConversationWindow(input: any) {
+            async readConversationWindow(input) {
                 bodyReads.push(input.startIndex)
                 return {
                     revision: 1,
@@ -537,7 +538,7 @@ describe('sendChat generation session integration', () => {
                 }
             },
             release: vi.fn(async () => undefined),
-        }
+        })
         mocks.persistentStore = {
             readConversationMessageMetadataWindow: vi.fn(),
             acquireRevision: vi.fn(async () => lease),
