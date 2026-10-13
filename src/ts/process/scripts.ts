@@ -288,10 +288,6 @@ function requireScriptConversationOwner(owner: ScriptConversationOwner): void {
     }
 }
 
-const MUTATING_CONVERSATION_CBS_NAMES = new Set([
-    'addvar', 'setvar', 'setdefaultvar',
-])
-
 function containsCbs(value: string, names: ReadonlySet<string>): boolean {
     for (const match of value.matchAll(/(?:{{|<)\s*#?\/?\s*([^}:|>\s]+)/gi)) {
         if (names.has(match[1].toLowerCase())) return true
@@ -302,27 +298,18 @@ function containsCbs(value: string, names: ReadonlySet<string>): boolean {
 type ConversationAccess = 'none' | 'read-only' | 'mutating'
 
 /**
- * `cbsWritesVariables` is false where the parser runs without `runVar`, so setvar-family
- * tags stay unexecuted and only `inject` edits the conversation.
+ * Script parses run without `runVar`, so setvar-family tags stay unexecuted and only
+ * `inject` edits the conversation.
  */
 function classifyConversationAccess(
     plan: ReturnType<typeof getRegexExecutionPlan>,
     data: string,
-    cbsWritesVariables = true,
 ): ConversationAccess {
-    const writesVariables = (value: string) =>
-        cbsWritesVariables && containsCbs(value, MUTATING_CONVERSATION_CBS_NAMES)
     let access: ConversationAccess = containsCbs(data, HISTORY_SENSITIVE_CBS_NAMES)
         ? 'read-only'
         : 'none'
-    if (writesVariables(data)) return 'mutating'
     for (const entry of plan.entries) {
-        if (
-            entry.actions.includes('inject') ||
-            entry.replacement.startsWith('@@inject') ||
-            (entry.dynamicPattern && writesVariables(entry.pattern)) ||
-            writesVariables(entry.replacement)
-        ) {
+        if (entry.actions.includes('inject') || entry.replacement.startsWith('@@inject')) {
             return 'mutating'
         }
         if (
@@ -684,7 +671,7 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
         plan = getRegexExecutionPlan(scripts, mode)
         conversationAccess = captureContext
             ? 'none'
-            : classifyConversationAccess(plan, data, mode !== 'editdisplay')
+            : classifyConversationAccess(plan, data)
         const needsConversationOperation = conversationAccess === 'mutating'
         const historyWindow = needsConversationOperation && !captureContext && !promptOperationScope
             && (mode === 'editinput' || mode === 'editoutput')

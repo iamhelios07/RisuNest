@@ -631,7 +631,7 @@ describe('sendChat prompt history characterization', () => {
         selectedCharacter.customscript = [{
             comment: 'Must not route to the aliased session',
             in: 'WRITE:',
-            out: '{{setvar::wrong_owner::value}}',
+            out: '@@inject',
             type: 'editprocess',
             flag: 'g',
             ableFlag: true,
