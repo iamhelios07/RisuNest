@@ -57,7 +57,7 @@ vi.mock('src/ts/storage/androidSafBridge', () => ({}))
 vi.mock('src/ts/process/modules', () => ({ getModuleRegexScripts: () => [] }))
 vi.mock('src/ts/gui/colorscheme', () => ({ ColorSchemeTypeStore: writable('dark') }))
 vi.mock('src/ts/plugins/plugins.svelte', () => ({ pluginV2: { editdisplay: new Set() } }))
-vi.mock('src/ts/parser/parser.svelte', () => ({}))
+vi.mock('src/ts/parser/parser.svelte', async () => (await import('src/ts/parser/parser.testSupport')).parserStubModule())
 vi.mock('./Suggestion.svelte', () => ({ default: () => {} }))
 vi.mock('./Chats.svelte', () => ({ default: (_anchor: unknown, props: unknown) => {
     mocks.chatsProps = props

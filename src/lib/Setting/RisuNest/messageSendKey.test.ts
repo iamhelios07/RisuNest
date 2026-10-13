@@ -9,7 +9,7 @@ import { getDeviceSettings, reloadDeviceSettings, updateDeviceSettings } from 's
 import { sharedRootFields } from 'src/ts/storage/persistentRootFields'
 import RisuNestSettingRows from './RisuNestSettingRows.svelte'
 
-vi.mock('src/ts/parser/parser.svelte', () => ({ risuChatParser: (text: string) => text }))
+vi.mock('src/ts/parser/parser.svelte', async () => (await import('src/ts/parser/parser.testSupport')).parserStubModule())
 
 let mounted: ReturnType<typeof mount> | undefined
 afterEach(async () => {

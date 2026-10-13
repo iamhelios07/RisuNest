@@ -33,7 +33,7 @@ vi.mock('src/ts/storage/database.svelte', () => ({
     getCurrentChat: () => scriptingState.database.characters[0]?.chats[0],
     setDatabase: vi.fn(),
 }))
-vi.mock('src/ts/parser/parser.svelte', () => ({
+vi.mock('src/ts/parser/parser.svelte', async () => (await import('src/ts/parser/parser.testSupport')).parserStubModule({
     hasher: vi.fn(),
     risuChatParser: (value: string) => value,
     ParseMarkdown: (value: string, character: character) => {

@@ -61,7 +61,7 @@ class TestIntersectionObserver {
 }
 
 vi.mock('../SideBars/Scripts/RegexData.svelte', () => ({ default: () => {} }))
-vi.mock('src/ts/parser/parser.svelte', () => ({ ParseMarkdown: vi.fn(async (value: string) => value) }))
+vi.mock('src/ts/parser/parser.svelte', async () => (await import('src/ts/parser/parser.testSupport')).parserStubModule())
 vi.mock('./ChatBody.svelte', async () => ({
     default: (await import('./ChatBodyCaptureProbe.test.svelte')).default,
 }))

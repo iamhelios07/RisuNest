@@ -100,7 +100,7 @@ vi.mock('./globalApi.svelte', () => ({
     getFileSrc: vi.fn(),
 }))
 vi.mock('./process/inlayScreen', () => ({ updateInlayScreen: (value: unknown) => value }))
-vi.mock('./parser/parser.svelte', () => ({ parseMarkdownSafe: (value: string) => value }))
+vi.mock('./parser/parser.svelte', async () => (await import('./parser/parser.testSupport')).parserStubModule())
 vi.mock('./translator/translator', () => ({ translateHTML: vi.fn() }))
 vi.mock('./process/index.svelte', async () => {
     const { writable } = await import('svelte/store')

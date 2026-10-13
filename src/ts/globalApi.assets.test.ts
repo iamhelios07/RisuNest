@@ -40,7 +40,7 @@ vi.mock('./storage/defaultPrompts', async () => (await import('./globalApi.testS
 vi.mock('./process/modules', async () => (await import('./globalApi.testSupport')).modulesModule())
 vi.mock('./process/coldstorageData', async () => (await import('./globalApi.testSupport')).coldStorageDataModule())
 vi.mock('./plugins/plugins.svelte', async () => (await import('./globalApi.testSupport')).pluginsModule())
-vi.mock('./parser/parser.svelte', () => ({ hasher: vi.fn(async () => 'hashed') }))
+vi.mock('./parser/parser.svelte', async () => (await import('./parser/parser.testSupport')).parserStubModule())
 vi.mock('./drive/accounter', async () => (await import('./globalApi.testSupport')).accounterModule())
 vi.mock('./observer.svelte', async () => (await import('./globalApi.testSupport')).observerModule())
 vi.mock('./characters', async () => (await import('./globalApi.testSupport')).charactersModule())

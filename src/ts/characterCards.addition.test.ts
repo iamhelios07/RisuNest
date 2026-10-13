@@ -103,7 +103,7 @@ vi.mock('./stores.svelte', () => ({
     selectedCharID: { set: vi.fn() },
     settingsOpen: { set: vi.fn() },
 }))
-vi.mock('./parser/parser.svelte', () => ({ hasher: vi.fn() }))
+vi.mock('./parser/parser.svelte', async () => (await import('./parser/parser.testSupport')).parserStubModule({ hasher: vi.fn() }))
 vi.mock('./process/files/inlays', () => ({ reencodeImage: vi.fn() }))
 vi.mock('./pngChunk', () => ({
     PngChunk: {

@@ -15,7 +15,7 @@ vi.mock('src/ts/util', () => ({ sleep: vi.fn() }))
 vi.mock('src/ts/storage/database.svelte', () => ({ getDatabase: () => ({}) }))
 vi.mock('src/ts/storage/deviceMarkers', () => ({ getDeviceMarkers: vi.fn() }))
 vi.mock('../../ts/characters', async () => (await import('./AlertComp.testSupport')).charactersModule())
-vi.mock('../../ts/parser/parser.svelte', () => ({ ParseMarkdown: vi.fn() }))
+vi.mock('../../ts/parser/parser.svelte', async () => (await import('../../ts/parser/parser.testSupport')).parserStubModule({ ParseMarkdown: vi.fn() }))
 vi.mock('src/ts/characterCards', async () => (await import('./AlertComp.testSupport')).characterCardsModule())
 vi.mock('src/ts/globalApi.svelte', () => ({
     aiLawApplies: () => false,

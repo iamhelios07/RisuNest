@@ -31,13 +31,7 @@ import {
 } from './pluginMutationPublication'
 import { flushSync } from 'svelte'
 
-vi.mock('../parser/parser.svelte', () => ({
-    assetRegex: /$^/,
-    hasher: vi.fn(async () => 'hash'),
-    parseMarkdownSafe: (value: string) => value,
-    ParseMarkdown: vi.fn(async (value: string) => value),
-    risuChatParser: (value: string) => value,
-}))
+vi.mock('../parser/parser.svelte', async () => (await import('../parser/parser.testSupport')).parserStubModule())
 
 /** A durable authority the V3 store can read, standing apart from DBState. */
 function durablePluginStore(entries: Record<string, unknown>) {

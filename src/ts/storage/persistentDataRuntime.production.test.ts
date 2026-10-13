@@ -4,13 +4,7 @@ import { get } from 'svelte/store'
 import { flushSync } from 'svelte'
 import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
 
-vi.mock('../parser/parser.svelte', () => ({
-    assetRegex: /$^/,
-    hasher: vi.fn(async () => 'hash'),
-    parseMarkdownSafe: (value: string) => value,
-    ParseMarkdown: vi.fn(async (value: string) => value),
-    risuChatParser: (value: string) => value,
-}))
+vi.mock('../parser/parser.svelte', async () => (await import('../parser/parser.testSupport')).parserStubModule())
 const displaySettings = vi.hoisted(() => ({ apply: vi.fn(async () => undefined) }))
 vi.mock('../gui/receivedDisplaySettings', () => ({ applyReceivedDisplaySettings: displaySettings.apply }))
 const pluginRuntime = vi.hoisted(() => ({ load: vi.fn(async () => undefined) }))
