@@ -7,24 +7,16 @@ export const DynamicGUI = writable(false), settingsOpen = writable(false), sideB
 export const ShowRealmFrameStore = writable(false), openPresetList = writable(false), openPersonaList = writable(false)
 export const MobileGUI = writable(false), CustomGUISettingMenuStore = writable(false), loadedStore = writable(true)
 export { alertStore }
-export const bookmarkListOpen = writable(false), bootFailure = writable(null), recoveryStart = writable(null)
+export const bookmarkListOpen = writable(false)
 export const LoadingStatusState = { startedAt: null, text: '' }
 export const popupStore = {}, easyPanelStore = {}, popUpEditorStore = {}, loadoutModalStore = {}, irisStore = {}, customSideBarConfigDialogStore = {}
 export const hypaV3ModalOpen = writable(false), hypaV3ProgressStore = writable({ open: false })
-export const MobileGUIStack = writable(1), MobileSideBar = writable(0), selectedCharID = writable(-1), CharConfigSubMenu = writable(0)
+export const MobileGUIStack = writable(1), MobileSideBar = writable(0), selectedCharID = writable(-1)
 export const onboardingHold = writable(false), showRealmInfoStore = writable(null), SettingsMenuIndex = writable(0)
 export const MobileSearch = writable(''), additionalSettingsMenu = []
-export const clearCharacterSelection = async () => { selectedCharID.set(-1); return true }
 export const persistentWorkingSetInputBlocked = writable(false), navigationActivity = writable(null), isLite = writable(false)
-export const serverSyncNavigation = writable(null), serverSyncScreenRequest = writable(null), dataHealthNavigation = writable(null)
-export const isTauri = false, isTauriMobile = false, DATA_HEALTH_SECTION_ID = 'synthetic-data-health'
-export const RECOVERY_EXCLUSIONS = []
-export const importCharacterProcess = () => {}, importPreset = () => {}, getDatabase = () => DBState.db, setDatabase = () => {}
-export const readModule = () => {}, alertConfirm = () => {}, alertNormal = () => {}, alertToast = () => {}, checkCharOrder = () => {}
 export const keepFocusedInputVisible = () => {}, restoreFocusAfterInputBlock = () => {}
 export { modalNavigation, backNavigationLayer, handleRootBack } from '../../src/ts/ui/modalNavigation'
-export const offerToKeepRecoveryExclusions = async () => false, isStartupExcluded = () => true, getStartupExclusions = () => [], updateStartupExclusions = () => {}
-export const exportOriginalData = () => {}, openRisuNestSettingsTab = () => {}
 export const textEditorPopup = { request: null }
 
 let failingRoute = ''
