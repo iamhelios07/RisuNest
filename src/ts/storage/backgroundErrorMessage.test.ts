@@ -1,11 +1,9 @@
-import { describe, expect, it, vi } from 'vitest'
+import { describe, expect, it } from 'vitest'
 
-vi.mock('src/lang', async () => ({ language: (await import('src/lang/en')).languageEnglish }))
-
-import { languageEnglish } from 'src/lang/en'
+import { language } from 'src/lang'
 import { backgroundErrorMessage } from './backgroundErrorMessage'
 
-const fallback = languageEnglish.risuNest.backgroundDataFailed
+const fallback = language.risuNest.backgroundDataFailed
 
 describe('backgroundErrorMessage', () => {
     it('keeps an Error for its message and stack', () => {

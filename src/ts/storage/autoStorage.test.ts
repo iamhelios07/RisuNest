@@ -70,13 +70,6 @@ vi.mock('./risuSave', () => ({
     decodeRisuSave: async () => ({ formatversion: 4, characters: [] }),
 }))
 
-vi.mock('src/lang', () => ({
-    language: {
-        loadDataFromAccount: 'load',
-        saveCurrentDataToAccount: 'save',
-    },
-}))
-
 vi.mock('../process/coldstorage.svelte', () => ({
     collectColdStorageBackupPayloads: mocks.collectColdStorageBackupPayloads,
     replaceColdStoragePayloadResources: (value: unknown) => value,
