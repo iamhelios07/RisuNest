@@ -35,7 +35,7 @@ vi.mock('../database.svelte', () => ({
     presetTemplate: {},
 }))
 vi.mock('../../globalApi.svelte', () => ({ forageStorage: {} }))
-vi.mock('src/ts/platform', () => ({ isTauri: false }))
+vi.mock('src/ts/platform', async () => (await import('src/ts/platform.testSupport')).platformModule({ runtime: 'web', os: 'windows' }))
 
 async function concatenate(chunks: AsyncIterable<Uint8Array>): Promise<Uint8Array> {
     const values: Uint8Array[] = []
