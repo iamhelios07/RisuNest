@@ -30,15 +30,7 @@ const mocks = vi.hoisted(() => ({
     onModelRequest: null as null | (() => void),
 }))
 
-vi.mock('../iosNative', () => ({
-    beginIOSGeneration: async (signal?: AbortSignal) => ({
-        signal,
-        progress: () => undefined,
-        dispose: async () => undefined,
-    }),
-    notifyIOSGenerationComplete: vi.fn(),
-    isBackgroundExpiryReason: () => false,
-}))
+vi.mock('../iosNative', async () => (await import('./tests/sendChatTestHarness')).iosNativeModule())
 vi.mock('../tokenizer', async () => (await import('./tests/sendChatTestHarness')).tokenizerModule({
     // Every message costs ten tokens in the window walk.
     tokenize: vi.fn(async () => 10),
@@ -53,13 +45,11 @@ vi.mock('./lorebook.svelte', async () => (await import('./tests/sendChatTestHarn
 vi.mock('../util', async () => (await import('./tests/sendChatTestHarness')).utilModule({
     findCharacterbyId: () => mocks.currentCharacter,
 }))
-vi.mock('./request/request', () => ({
-    requestChatData: vi.fn(async (request: unknown) => {
-        mocks.modelRequests.push(request)
-        mocks.onModelRequest?.()
-        return mocks.modelResponse
-    }),
-}))
+vi.mock('./request/request', async () => (await import('./tests/sendChatTestHarness')).requestModule(vi.fn(async (request: unknown) => {
+    mocks.modelRequests.push(request)
+    mocks.onModelRequest?.()
+    return mocks.modelResponse
+})))
 vi.mock('./stableDiff', async () => (await import('./tests/sendChatTestHarness')).stableDiffModule())
 vi.mock('./scripts', async () => (await import('./tests/sendChatTestHarness')).scriptsModule({
     processScriptFull: mocks.processScriptFull,
@@ -79,14 +69,10 @@ vi.mock('./memory/hypamemory', async () => (await import('./tests/sendChatTestHa
 vi.mock('./embedding/addinfo', async () => (await import('./tests/sendChatTestHarness')).addinfoModule())
 vi.mock('./files/inlays', async () => (await import('./tests/sendChatTestHarness')).inlaysModule())
 vi.mock('./models/modelString', async () => (await import('./tests/sendChatTestHarness')).modelStringModule())
-vi.mock('./inlayScreen', () => ({ runInlayScreen: (_char: unknown, data: string) => ({ text: data }) }))
+vi.mock('./inlayScreen', async () => (await import('./tests/sendChatTestHarness')).inlayScreenModule())
 vi.mock('./transformers', async () => (await import('./tests/sendChatTestHarness')).transformersModule())
-vi.mock('./memory/hanuraiMemory', () => ({
-    hanuraiMemory: vi.fn(async (chats, { currentTokens }) => ({ chats, tokens: currentTokens })),
-}))
-vi.mock('./memory/hypav2', () => ({
-    hypaMemoryV2: vi.fn(async (chats, currentTokens) => ({ chats, currentTokens })),
-}))
+vi.mock('./memory/hanuraiMemory', async () => (await import('./tests/sendChatTestHarness')).hanuraiMemoryModule())
+vi.mock('./memory/hypav2', async () => (await import('./tests/sendChatTestHarness')).hypav2Module())
 vi.mock('./memory/hypav3', async () => (await import('./tests/sendChatTestHarness')).hypav3Module({
     getCurrentHypaV3Preset: () => ({ settings: mocks.hypaSettings }),
     hypaMemoryV3: mocks.hypaMemoryV3,
@@ -95,28 +81,19 @@ vi.mock('./scriptings', async () => (await import('./tests/sendChatTestHarness')
 vi.mock('../model/modellist', async () => (await import('./tests/sendChatTestHarness')).modellistModule())
 vi.mock('./modules', async () => (await import('./tests/sendChatTestHarness')).modulesModule())
 vi.mock('../globalApi.svelte', async () => (await import('./tests/sendChatTestHarness')).globalApiModule())
-vi.mock('../plugins/plugins.svelte', () => ({ pluginV2: { chatOutput: new Set(), editprocess: new Set() } }))
-vi.mock('../plugins/pluginDatabaseAccess', async (importOriginal) => (await import('./tests/sendChatTestHarness')).pluginDatabaseAccessModule(importOriginal as () => Promise<Record<string, unknown>>))
+vi.mock('../plugins/plugins.svelte', async () => (await import('./tests/sendChatTestHarness')).pluginsModule())
+vi.mock('../plugins/pluginDatabaseAccess', async (importOriginal) => (await import('./tests/sendChatTestHarness')).pluginDatabaseAccessModule(importOriginal))
 vi.mock('./presetChain', () => ({ activatePresetChainForRequest: vi.fn(async () => undefined) }))
 vi.mock('../storage/deviceSettings', () => ({ getDeviceSettings: () => mocks.deviceSettings }))
-vi.mock('../storage/persistentDataRuntime.svelte', () => ({
-    assertPersistentMutationAllowed: () => undefined,
-    getPersistentStorageAuthorityEpoch: () => 0,
-    getPersistentNavigationGeneration: () => 0,
-    acknowledgeGenerationCompletion: vi.fn(async () => undefined),
-    drainDeferredLwwReceives: vi.fn(async () => undefined),
+vi.mock('../storage/persistentDataRuntime.svelte', async () => (await import('./tests/sendChatTestHarness')).persistentRuntimeModule({
     captureSelectedConversationTarget: () => mocks.selectedTarget,
     captureSelectedConversationAuthority: () => mocks.selectedAuthority,
-    recordSelectedCharacterLastInteraction: vi.fn(() => true),
     captureWindowedConversationMutationController: (...args: any[]) => mocks.windowedController?.(...args) ?? null,
     acquireCompleteConversation: mocks.acquireCompleteConversation,
     flushPendingData: mocks.flushPendingData,
     getActiveConversationSession: () => mocks.session,
-    invalidateActiveConversationSession: () => undefined,
 }))
-vi.mock('../storage/persistentDataStoreFactory', () => ({
-    getPersistentDataStore: () => mocks.persistentStore,
-}))
+vi.mock('../storage/persistentDataStoreFactory', async () => (await import('./tests/sendChatTestHarness')).persistentDataStoreFactoryModule(() => mocks.persistentStore))
 
 import type { character, Chat, Database, Message } from '../storage/database.svelte'
 import { ActiveConversationSession } from '../storage/activeConversationSession'
