@@ -10,6 +10,7 @@ import { decodeRisuSave, encodeRisuSaveLegacy } from '../storage/risuSave'
 import { risuSaveFixtureDatabase } from '../storage/tests/risuSaveFixtures'
 import { sleep } from '../util'
 import { getBackupInlayName } from './backupAssets'
+import { backupArchive, backupEntry, backupFile } from './backupRestore.testSupport'
 
 const state = vi.hoisted(() => ({
     native: true,
@@ -36,18 +37,9 @@ const state = vi.hoisted(() => ({
     },
 }))
 
-vi.mock('../alert', () => ({
-    alertConfirm: vi.fn(async () => true), alertCheckboxConfirm: vi.fn(async () => ({ confirmed: true, checked: true })),
-    alertActionConfirm: vi.fn(async () => true),
-    alertError: vi.fn(),
-    alertMd: vi.fn(),
-    alertNormal: vi.fn(),
-    alertStore: { set: vi.fn() },
-    alertWait: vi.fn(),
-}))
-
+vi.mock('../alert', async () => (await import('./backupRestore.testSupport')).alertModule())
 vi.mock('../nativeLog', () => ({ recordNativeLogError: vi.fn(async () => undefined) }))
-vi.mock('../storage/libraryCharacters', () => ({ hasLibraryCharacters: async () => state.characters }))
+vi.mock('../storage/libraryCharacters', async () => (await import('./backupRestore.testSupport')).libraryCharactersModule(async () => state.characters))
 
 vi.mock('../globalApi.svelte', () => ({
     forageStorage: { Init: vi.fn(async () => undefined), isAccount: false },
@@ -80,65 +72,28 @@ vi.mock('../globalApi.svelte', () => ({
     },
 }))
 
-vi.mock('../storage/platformBlobStore', () => ({
-    resolveBlobStore: async () => state.blobStore,
+vi.mock('../storage/platformBlobStore', async () => (await import('./backupRestore.testSupport')).blobStoreModule(() => state.blobStore!))
+vi.mock('../storage/database.svelte', async () => (await import('./backupRestore.testSupport')).databaseModule(() => state.currentDatabase!))
+vi.mock('../storage/persistentDataRuntime.svelte', async () => (await import('./backupRestore.testSupport')).persistentRuntimeModule({
+    getPersistentDataRuntime: () => state.runtime!,
+    replacePersistentDatabase: (database, reason, options) => state.replacePersistentDatabase(database, reason, options),
 }))
-
-vi.mock('../storage/database.svelte', () => ({
-    getDatabase: () => state.currentDatabase,
-    presetTemplate: {},
-}))
-
-vi.mock('../storage/persistentDataRuntime.svelte', () => ({
-    getPersistentDataRuntime: () => state.runtime,
-    publishCurrentOfficialRevision: vi.fn(async () => undefined),
-    replacePersistentDatabase: (database: Database, reason: string, options?: import('../storage/saveCoordinator').PersistentReplacementOptions) => (
-        state.replacePersistentDatabase(database, reason, options)
-    ),
-}))
-
-vi.mock('../process/coldstorage.svelte', () => ({
-    getColdStorageBackupKey: (name: string) => {
-        const match = /^coldstorage_(.+)\.json$/.exec(name)
-        return match?.[1] ?? null
-    },
-    isColdStorageBackupData: (value: unknown) => Boolean(
-        value
-        && typeof value === 'object'
-        && ('character' in value || 'message' in value),
-    ),
-    listColdDataKeys: async (database: Database) => database.characters
-        .map((character) => character.coldstorage)
-        .filter((key): key is string => Boolean(key)),
-}))
-
-vi.mock('src/ts/platform', () => ({
-    get isTauri() {return state.native},
-    isTauriDesktop: true,
-    get isTauriAndroid() { return state.mobile },
-    isTauriIOS: false,
-    get isTauriMobile() { return state.mobile },
-}))
-
-vi.mock('@tauri-apps/plugin-fs', () => ({
-    BaseDirectory: {},
-    SeekMode: { Start: 0 },
+vi.mock('../process/coldstorage.svelte', async () => (await import('./backupRestore.testSupport')).coldStorageModule())
+vi.mock('src/ts/platform', async () => (await import('src/ts/platform.testSupport')).platformModule(() => ({
+    runtime: state.native ? 'tauri' : 'web',
+    os: state.mobile ? 'android' : 'windows',
+})))
+vi.mock('@tauri-apps/plugin-fs', async () => (await import('../storage/tauriFs.testSupport')).pluginFsModule({
     open: state.openNativeFile,
     readFile: state.fullReadFile,
-    writeFile: vi.fn(),
 }))
-
-vi.mock('../desktopRelaunch', () => ({ relaunch: vi.fn() }))
+vi.mock('../desktopRelaunch', async () => (await import('./backupRestore.testSupport')).relaunchModule())
 vi.mock('../storage/nativeFileJobManager', async (original) => ({
     ...await original<object>(),
     runSharedNativeFileOperation: vi.fn(async (_kind, _label, run) => run(state.fallbackContext)),
 }))
-vi.mock('../util', () => ({
-    decryptBuffer: vi.fn(),
-    encryptBuffer: vi.fn(),
-    sleep: vi.fn(async () => undefined),
-}))
-vi.mock('../characterCards', () => ({ hubURL: 'https://hub.invalid' }))
+vi.mock('../util', async () => (await import('./backupRestore.testSupport')).utilModule())
+vi.mock('../characterCards', async () => (await import('./backupRestore.testSupport')).characterCardsModule())
 
 function emptyBlobStore(): BlobStore {
     return {
@@ -188,7 +143,7 @@ describe('local backup persistent snapshot', () => {
 
     it.each([false, true])('expands cold payloads into the replaced local backup database on mobile=%s', async (mobile) => {
         state.mobile = mobile
-        const coldKey = 'local-restore-cold'
+        const coldKey = '00000000-0000-4000-8000-00000000c01d'
         const database = structuredClone(risuSaveFixtureDatabase) as Database
         database.characters[0].coldstorage = coldKey
         const restoredName = 'Restored cold character'
@@ -199,37 +154,11 @@ describe('local backup persistent snapshot', () => {
                 coldstorage: undefined,
             },
         }
-        const encodeEntry = (name: string, data: Uint8Array) => {
-            const encodedName = new TextEncoder().encode(name)
-            const record = new Uint8Array(8 + encodedName.byteLength + data.byteLength)
-            const view = new DataView(record.buffer)
-            view.setUint32(0, encodedName.byteLength, true)
-            record.set(encodedName, 4)
-            view.setUint32(4 + encodedName.byteLength, data.byteLength, true)
-            record.set(data, 8 + encodedName.byteLength)
-            return record
-        }
-        const entries = [
-            encodeEntry(`coldstorage_${coldKey}.json`, new TextEncoder().encode(JSON.stringify(cold))),
-            encodeEntry('database.risudat', encodeRisuSaveLegacy(database, 'compression')),
-        ]
-        const archive = new Uint8Array(entries.reduce((sum, entry) => sum + entry.byteLength, 0))
-        let offset = 0
-        for (const entry of entries) {
-            archive.set(entry, offset)
-            offset += entry.byteLength
-        }
-        const file = {
-            name: 'backup.bin',
-            size: archive.byteLength,
-            slice: (start: number, end: number) => ({ arrayBuffer: async () => archive.slice(start, end).buffer }),
-            stream: () => new ReadableStream<Uint8Array>({
-                start(controller) {
-                    controller.enqueue(archive)
-                    controller.close()
-                },
-            }),
-        } as File
+        const archive = backupArchive(
+            backupEntry(`coldstorage_${coldKey}.json`, new TextEncoder().encode(JSON.stringify(cold))),
+            backupEntry('database.risudat', encodeRisuSaveLegacy(database, 'compression')),
+        )
+        const file = backupFile('backup.bin', archive)
         const input = document.createElement('input')
         Object.defineProperty(input, 'files', { value: [file] })
         const click = vi.spyOn(input, 'click').mockImplementation(() => {})
@@ -312,44 +241,17 @@ describe('local backup persistent snapshot', () => {
         const { alertCheckboxConfirm } = await import('../alert')
         vi.mocked(alertCheckboxConfirm).mockResolvedValueOnce({ confirmed, checked: confirmed })
         const database = structuredClone(risuSaveFixtureDatabase) as Database
-        const encodeEntry = (name: string, data: Uint8Array) => {
-            const encodedName = new TextEncoder().encode(name)
-            const record = new Uint8Array(8 + encodedName.byteLength + data.byteLength)
-            const view = new DataView(record.buffer)
-            view.setUint32(0, encodedName.byteLength, true)
-            record.set(encodedName, 4)
-            view.setUint32(4 + encodedName.byteLength, data.byteLength, true)
-            record.set(data, 8 + encodedName.byteLength)
-            return record
-        }
         const damagedInlayName = getBackupInlayName('damaged-inlay')
-        const entries = [
-            encodeEntry(damagedInlayName, Uint8Array.of(9, 0, 0, 0, 1, 2)),
-            encodeEntry('database.risudat', encodeRisuSaveLegacy(database, 'compression')),
-        ]
-        const archive = new Uint8Array(entries.reduce((sum, entry) => sum + entry.byteLength, 0))
-        let archiveOffset = 0
-        for (const entry of entries) {
-            archive.set(entry, archiveOffset)
-            archiveOffset += entry.byteLength
-        }
-        const file = {
-            name: 'damaged-inlay.bin',
-            size: archive.byteLength,
-            slice: (start: number, end: number) => ({ arrayBuffer: async () => {
-                if (start === 8 + new TextEncoder().encode(damagedInlayName).byteLength && end - start === 6) {
-                    expect(state.replacePersistentDatabase).toHaveBeenCalledOnce()
-                    if (bodyFails) throw new Error('synthetic attachment read failure')
-                }
-                return archive.slice(start, end).buffer
-            } }),
-            stream: () => new ReadableStream<Uint8Array>({
-                start(controller) {
-                    controller.enqueue(archive)
-                    controller.close()
-                },
-            }),
-        } as File
+        const archive = backupArchive(
+            backupEntry(damagedInlayName, Uint8Array.of(9, 0, 0, 0, 1, 2)),
+            backupEntry('database.risudat', encodeRisuSaveLegacy(database, 'compression')),
+        )
+        const file = backupFile('damaged-inlay.bin', archive, (start, end) => {
+            if (start === 8 + new TextEncoder().encode(damagedInlayName).byteLength && end - start === 6) {
+                expect(state.replacePersistentDatabase).toHaveBeenCalledOnce()
+                if (bodyFails) throw new Error('synthetic attachment read failure')
+            }
+        })
         const input = document.createElement('input')
         Object.defineProperty(input, 'files', { value: [file] })
         const click = vi.spyOn(input, 'click').mockImplementation(() => {})
@@ -413,20 +315,7 @@ describe('local backup persistent snapshot', () => {
         vi.mocked(alertActionConfirm).mockResolvedValueOnce(answer)
         const database = structuredClone(risuSaveFixtureDatabase) as Database
         database.characters[0].coldstorage = 'missing-cold'
-        const encoded = encodeRisuSaveLegacy(database, 'compression')
-        const encodedName = new TextEncoder().encode('database.risudat')
-        const archive = new Uint8Array(8 + encodedName.byteLength + encoded.byteLength)
-        const view = new DataView(archive.buffer)
-        view.setUint32(0, encodedName.byteLength, true)
-        archive.set(encodedName, 4)
-        view.setUint32(4 + encodedName.byteLength, encoded.byteLength, true)
-        archive.set(encoded, 8 + encodedName.byteLength)
-        const file = {
-            name: 'cold-missing.bin',
-            size: archive.byteLength,
-            slice: (start: number, end: number) => ({ arrayBuffer: async () => archive.slice(start, end).buffer }),
-            stream: () => new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(archive); controller.close() } }),
-        } as File
+        const file = backupFile('cold-missing.bin', backupEntry('database.risudat', encodeRisuSaveLegacy(database, 'compression')))
         const input = document.createElement('input')
         Object.defineProperty(input, 'files', { value: [file] })
         const click = vi.spyOn(input, 'click').mockImplementation(() => {})
@@ -446,28 +335,9 @@ describe('local backup persistent snapshot', () => {
     })
 
     it('stops a WebView import after cancellation without publishing staged attachments', async () => {
-        const assetName = 'partial-asset.png'
-        const encodedName = new TextEncoder().encode(assetName)
-        const data = new Uint8Array([1, 2, 3])
-        const entry = new Uint8Array(8 + encodedName.byteLength + data.byteLength)
-        const view = new DataView(entry.buffer)
-        view.setUint32(0, encodedName.byteLength, true)
-        entry.set(encodedName, 4)
-        view.setUint32(4 + encodedName.byteLength, data.byteLength, true)
-        entry.set(data, 8 + encodedName.byteLength)
         const controller = new AbortController()
         // Cancel after reading the first entry header, before any attachment body.
-        const file = {
-            name: 'partial.bin',
-            size: entry.byteLength,
-            slice: (start: number, end: number) => ({ arrayBuffer: async () => entry.slice(start, end).buffer }),
-            stream: () => new ReadableStream<Uint8Array>({
-                start(stream) {
-                    stream.enqueue(entry)
-                    stream.close()
-                },
-            }),
-        } as File
+        const file = backupFile('partial.bin', backupEntry('partial-asset.png', new Uint8Array([1, 2, 3])))
         const input = document.createElement('input')
         Object.defineProperty(input, 'files', { value: [file] })
         const click = vi.spyOn(input, 'click').mockImplementation(() => {})
