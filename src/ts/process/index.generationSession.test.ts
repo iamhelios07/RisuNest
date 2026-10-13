@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
     events: [] as string[],
     modelResponse: null as any,
     modelRequestCount: 0,
+    realTriggers: false,
     authorityEpoch: 0,
     modelRequests: [] as any[],
     presetActivationCount: 0,
@@ -100,15 +101,19 @@ vi.mock('./tts', async () => (await import('./tests/sendChatTestHarness')).ttsMo
     sayTTS: mocks.sayTTS,
 }))
 vi.mock('./memory/supaMemory', async () => (await import('./tests/sendChatTestHarness')).supaMemoryModule())
-vi.mock('./triggers', () => ({
-    runTrigger: vi.fn(async (_char: unknown, mode: string, arg: { chat: any }) => {
+vi.mock('./command', () => ({ processMultiCommand: vi.fn() }))
+vi.mock('./infunctions', () => ({ calcString: vi.fn(() => 0) }))
+vi.mock('./triggers', async (importOriginal) => {
+    const original = await importOriginal<typeof import('./triggers')>()
+    return { runTrigger: vi.fn(async (char: any, mode: string, arg: { chat: any }) => {
+        if (mocks.realTriggers) return original.runTrigger(char, mode as any, arg as any)
         if (mode === 'start') return null
         mocks.events.push('output-trigger')
         const clone = JSON.parse(JSON.stringify(arg.chat))
         if (mocks.outputTriggerReturnsNull) return null
         return mocks.outputTrigger ? await mocks.outputTrigger(clone) : { chat: clone }
-    }),
-}))
+    }) }
+})
 vi.mock('./memory/hypamemory', async () => (await import('./tests/sendChatTestHarness')).hypamemoryModule())
 vi.mock('./embedding/addinfo', async () => (await import('./tests/sendChatTestHarness')).addinfoModule())
 vi.mock('./files/inlays', async () => (await import('./tests/sendChatTestHarness')).inlaysModule())
@@ -176,6 +181,7 @@ vi.mock('../storage/persistentDataRuntime.svelte', () => ({
             : mocks.windowedController,
     acquireCompleteConversation: mocks.acquireCompleteConversation,
     getActiveConversationSession: () => mocks.session,
+    peekActiveConversationSession: () => mocks.session,
     invalidateActiveConversationSession: () => {
         mocks.events.push('invalidate-session')
         mocks.session?.invalidate()
@@ -192,6 +198,7 @@ import { SelectedConversationPromotionStaleError } from '../storage/activeWorkin
 import { PersistentMutationFencedError } from '../storage/saveCoordinator'
 import { DBState, selectedCharID } from '../stores.svelte'
 import { doingChat, sendChat } from './index.svelte'
+import type { triggerscript } from './triggers'
 import { isGenerationRequestPhaseOpen, trackConversationPatch } from './generationRequestPhase'
 import { beginGenerationEndRun, subscribeGenerationEnd, type GenerationEndRecord, type GenerationEndStatus } from './generationEnd'
 
@@ -345,6 +352,7 @@ describe('sendChat generation session integration', () => {
         mocks.events.length = 0
         mocks.modelResponse = streamingResponse('answer')
         mocks.modelRequestCount = 0
+        mocks.realTriggers = false
         mocks.authorityEpoch = 0
         mocks.modelRequests.length = 0
         mocks.presetActivationCount = 0
@@ -1703,6 +1711,59 @@ describe('sendChat generation session integration', () => {
 
             expect(result).toBe(true)
             expect(records).toEqual([])
+        })
+    })
+
+    describe('start triggers', () => {
+        beforeEach(() => {
+            mocks.realTriggers = true
+        })
+
+        function installStartTrigger(
+            trigger: triggerscript,
+            onMutation: ConstructorParameters<typeof ActiveConversationSession>[0]['onMutation'],
+        ) {
+            const installed = installDatabase(makeChat(), [], onMutation)
+            installed.currentCharacter.triggerscript = [trigger]
+            DBState.db.templateDefaultVariables = ''
+            return installed
+        }
+
+        it('completes generation when a setvar start trigger commits through the active session', async () => {
+            const onMutation = vi.fn()
+            const { chat, session } = installStartTrigger({
+                comment: 'set flag on start',
+                type: 'start',
+                conditions: [],
+                effect: [{ type: 'setvar', operator: '=', var: 'flag', value: 'on' }],
+            }, onMutation)
+
+            await expect(sendChat()).resolves.toBe(true)
+
+            expect(chat.scriptstate).toEqual({ $flag: 'on' })
+            expect(chat.message.at(-1)).toMatchObject({ role: 'char', data: 'answer' })
+            expect(mocks.modelRequestCount).toBe(1)
+            expect(session.matchesConversation('character-a', chat)).toBe(true)
+            expect(onMutation.mock.calls.map(([event]) => event.commands)).not.toContainEqual(
+                ['replace-conversation'],
+            )
+        })
+
+        it('does not self-replace the conversation when the start trigger changes nothing', async () => {
+            const onMutation = vi.fn()
+            const { chat } = installStartTrigger({
+                comment: 'never passes',
+                type: 'start',
+                conditions: [{ type: 'value', var: 'a', value: 'b', operator: '=' }],
+                effect: [{ type: 'setvar', operator: '=', var: 'flag', value: 'on' }],
+            }, onMutation)
+
+            await expect(sendChat()).resolves.toBe(true)
+
+            expect(chat.scriptstate).toBeUndefined()
+            expect(onMutation.mock.calls.map(([event]) => event.commands)).not.toContainEqual(
+                ['replace-conversation'],
+            )
         })
     })
 })

@@ -23,7 +23,7 @@ vi.mock('@tauri-apps/plugin-fs', () => ({
     remove: vi.fn(), writeFile: vi.fn(),
 }))
 vi.mock('@tauri-apps/api/webviewWindow', () => ({ getCurrentWebviewWindow: () => ({ maximize: vi.fn() }) }))
-vi.mock('@tauri-apps/api/core', () => ({ convertFileSrc: vi.fn() }))
+vi.mock('@tauri-apps/api/core', () => ({ convertFileSrc: vi.fn(), invoke: vi.fn() }))
 vi.mock('@tauri-apps/api/path', () => ({ join: vi.fn() }))
 vi.mock('./util', () => ({ changeFullscreen: vi.fn(), sleep: vi.fn() }))
 vi.mock('./update', () => ({ checkRisuUpdate: vi.fn() }))
@@ -180,7 +180,10 @@ vi.mock('./process/files/inlayProviderImage', () => ({ forgetInlayProviderImages
 
 import { loadData } from './bootstrap'
 import { keepPluginsOffForThisStart, loadPlugins } from './plugins/plugins.svelte'
-import { alertNormal, alertToast, alertTOS, waitAlert } from './alert'
+import { alertError, alertNormal, alertToast, alertTOS, waitAlert } from './alert'
+import { invoke } from '@tauri-apps/api/core'
+import { setNativeLogFileEnabled } from './nativeLog'
+import { initializePersistentStorage } from './storage/persistentStorageRuntime'
 import { bootFailure } from './stores.svelte'
 import { loadRisuAccountData } from './drive/accounter'
 import { initializeOfficialAccountBootstrap } from './storage/sync/officialAccountBootstrap'
@@ -409,5 +412,29 @@ describe('renderer recovery notice', () => {
         answerTerms(true)
         await vi.waitFor(() => expect(startup.takeRendererRecovery).toHaveBeenCalled())
         expect(defaultPlugins.startDefaultPluginBootstrap).not.toHaveBeenCalled()
+    })
+})
+
+describe('native setup failure', () => {
+    it('stops bootstrap before diagnostics and exposes the existing failure panel state', async () => {
+        startup.native = true
+        startup.exclusions = []
+        const failure = new Error('synthetic native setup failure')
+        startupMocks.checkNativeStartupStatus.mockRejectedValueOnce(failure)
+
+        await loadData()
+
+        expect(invoke).not.toHaveBeenCalled()
+        expect(setNativeLogFileEnabled).not.toHaveBeenCalled()
+        expect(initializePersistentStorage).not.toHaveBeenCalled()
+        expect(loadPlugins).not.toHaveBeenCalled()
+        expect(initializeNativeSyncBindings).not.toHaveBeenCalled()
+        expect(installServerSyncProduction).not.toHaveBeenCalled()
+        expect(bootFailure.set).toHaveBeenLastCalledWith({
+            kind: 'unknown',
+            message: failure.message,
+            stage: 'native-setup',
+        })
+        expect(alertError).not.toHaveBeenCalled()
     })
 })
