@@ -19,7 +19,10 @@ vi.mock("./ts/bootstrap", async () => {
 });
 vi.mock("./ts/hotkey", () => ({ initHotkey: vi.fn() }));
 vi.mock("./preload", () => ({ preLoadCheck: vi.fn() }));
-vi.mock("svelte", () => ({ mount: vi.fn(() => ({})) }));
+vi.mock("svelte", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("svelte")>()),
+  mount: vi.fn(() => ({})),
+}));
 vi.mock("./ts/storage/deviceBackup/jobRecovery", () => ({
   resumePortableExportsAfterBootstrap: vi.fn(async () => {}),
 }));

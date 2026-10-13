@@ -1,3 +1,5 @@
+import { untrack } from 'svelte'
+
 export type ConsoleLogLevel = 'log' | 'info' | 'debug' | 'warn' | 'error'
 export interface ConsoleLogEntry {
     tsMs: number
@@ -54,10 +56,16 @@ export function createConsoleLogBuffer(maxEntries = 5_000, maxBytes = 8 * 1024 *
 
 export const consoleLog = createConsoleLogBuffer()
 
+// Formatting reads logged objects, so a running effect must not subscribe to logged state.
+export function installAppConsoleCapture(target: Pick<Console, ConsoleLogLevel> = console): () => void {
+    return installConsoleCapture(target, (level, message) => consoleLog.append(level, 'App', message), untrack)
+}
+
 // This function is also injected into plugin frames. Keep its runtime dependencies inside it.
 export function installConsoleCapture(
     target: Pick<Console, ConsoleLogLevel>,
     emit: (level: ConsoleLogLevel, message: string) => void,
+    run: <T>(read: () => T) => T = (read) => read(),
 ): () => void {
     const levels = ['log', 'info', 'debug', 'warn', 'error'] as const
     const restorers: (() => void)[] = []
@@ -145,7 +153,7 @@ export function installConsoleCapture(
         const wrapper = (...args: unknown[]) => {
             if (!capturing) {
                 capturing = true
-                try { emit(level, format(args)) } catch { /* Diagnostics must not break the caller. */ }
+                try { emit(level, run(() => format(args))) } catch { /* Diagnostics must not break the caller. */ }
                 finally { capturing = false }
             }
             return original.apply(target, args)
