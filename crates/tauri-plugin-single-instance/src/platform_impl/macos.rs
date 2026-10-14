@@ -13,14 +13,24 @@ use crate::semver_compat::semver_compat_string;
 use crate::SingleInstanceCallback;
 use tauri::{
     plugin::{self, TauriPlugin},
-    AppHandle, Config, Manager, RunEvent, Runtime,
+    AppHandle, Manager, RunEvent, Runtime,
 };
 use tokio::io::AsyncReadExt;
 
-pub fn init<R: Runtime>(cb: Box<SingleInstanceCallback<R>>) -> TauriPlugin<R> {
+struct SocketPath(PathBuf);
+
+pub fn init<R: Runtime>(
+    cb: Box<SingleInstanceCallback<R>>,
+    instance_id: Option<String>,
+) -> TauriPlugin<R> {
     plugin::Builder::new("single-instance")
-        .setup(|app, _api| {
-            let socket = socket_path(app.config(), app.package_info());
+        .setup(move |app, _api| {
+            let socket = match &instance_id {
+                // Keep `-` and `_` distinct so different keys never share a socket.
+                Some(id) => PathBuf::from(format!("/tmp/{}_si.sock", id.replace('.', "_"))),
+                None => socket_path(&app.config().identifier, app.package_info()),
+            };
+            app.manage(SocketPath(socket.clone()));
 
             // Notify the singleton which may or may not exist.
             match notify_singleton(&socket) {
@@ -54,12 +64,15 @@ pub fn init<R: Runtime>(cb: Box<SingleInstanceCallback<R>>) -> TauriPlugin<R> {
 }
 
 pub fn destroy<R: Runtime, M: Manager<R>>(manager: &M) {
-    let socket = socket_path(manager.config(), manager.package_info());
+    let socket = match manager.try_state::<SocketPath>() {
+        Some(socket) => socket.0.clone(),
+        None => socket_path(&manager.config().identifier, manager.package_info()),
+    };
     socket_cleanup(&socket);
 }
 
-fn socket_path(config: &Config, _package_info: &tauri::PackageInfo) -> PathBuf {
-    let identifier = config.identifier.replace(['.', '-'].as_ref(), "_");
+fn socket_path(id: &str, _package_info: &tauri::PackageInfo) -> PathBuf {
+    let identifier = id.replace(['.', '-'].as_ref(), "_");
 
     #[cfg(feature = "semver")]
     let identifier = format!(

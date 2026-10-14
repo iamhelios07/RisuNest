@@ -46,6 +46,7 @@ pub fn destroy<R: Runtime, M: Manager<R>>(manager: &M) {
 pub struct Builder<R: Runtime> {
     callback: Box<SingleInstanceCallback<R>>,
     dbus_id: Option<String>,
+    instance_id: Option<String>,
 }
 
 impl<R: Runtime> Default for Builder<R> {
@@ -58,6 +59,7 @@ impl<R: Runtime> Default for Builder<R> {
                 }
             }),
             dbus_id: None,
+            instance_id: None,
         }
     }
 }
@@ -93,9 +95,20 @@ impl<R: Runtime> Builder<R> {
         self
     }
 
+    /// Set the key that identifies the single instance on every platform: the
+    /// Windows mutex and message window names, the macOS socket path, and the
+    /// Linux D-Bus name when no [`Builder::dbus_id`] is set.
+    ///
+    /// Defaults to the app's bundle identifier set in tauri.conf.json.
+    pub fn instance_id(mut self, instance_id: impl Into<String>) -> Self {
+        self.instance_id = Some(instance_id.into());
+        self
+    }
+
     pub fn build(self) -> TauriPlugin<R> {
         platform_impl::init(
             self.callback,
+            self.instance_id,
             #[cfg(target_os = "linux")]
             self.dbus_id,
         )

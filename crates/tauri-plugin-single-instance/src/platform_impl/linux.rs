@@ -30,11 +30,14 @@ struct DBusName(String);
 
 pub fn init<R: Runtime>(
     callback: Box<SingleInstanceCallback<R>>,
+    instance_id: Option<String>,
     dbus_id: Option<String>,
 ) -> TauriPlugin<R> {
     plugin::Builder::new("single-instance")
         .setup(move |app, _api| {
-            let mut dbus_name = dbus_id.unwrap_or_else(|| app.config().identifier.clone());
+            let mut dbus_name = dbus_id
+                .or(instance_id)
+                .unwrap_or_else(|| app.config().identifier.clone());
             dbus_name.push_str(".SingleInstance");
 
             #[cfg(feature = "semver")]

@@ -52,11 +52,14 @@ impl<R: Runtime> UserData<R> {
     }
 }
 
-pub fn init<R: Runtime>(callback: Box<SingleInstanceCallback<R>>) -> TauriPlugin<R> {
+pub fn init<R: Runtime>(
+    callback: Box<SingleInstanceCallback<R>>,
+    instance_id: Option<String>,
+) -> TauriPlugin<R> {
     plugin::Builder::new("single-instance")
-        .setup(|app, _api| {
+        .setup(move |app, _api| {
             #[allow(unused_mut)]
-            let mut id = app.config().identifier.clone();
+            let mut id = instance_id.unwrap_or_else(|| app.config().identifier.clone());
             #[cfg(feature = "semver")]
             {
                 id.push('_');
