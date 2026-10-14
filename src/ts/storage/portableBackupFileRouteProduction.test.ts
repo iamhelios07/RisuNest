@@ -164,6 +164,42 @@ describe('common backup file production route', () => {
         expect(m.legacy).not.toHaveBeenCalled()
         expect(m.invoke).toHaveBeenLastCalledWith('native_portable_source_discard', { source: { type: 'androidSeekable', token: 'synthetic-custody' } })
     })
+    it.each(['androidSeekable', 'iosScoped'] as const)('settles a %s restore cancelled during its copy without waiting for the copy reply', async type => {
+        const source = { type, token: 'synthetic-custody' }
+        let reply!: (value: unknown) => void
+        const copyReply = new Promise(resolve => { reply = resolve })
+        let copying = false
+        const released: string[] = []
+        const removed: string[] = []
+        const { materializeAndroidBackupSource } = await vi.importActual<typeof import('./androidSafBridge')>('./androidSafBridge')
+        const { materializeIOSBackupSource } = await vi.importActual<typeof import('./iosFiles')>('./iosFiles')
+        m.materializeAndroid.mockImplementation((token, options) => materializeAndroidBackupSource(token, options, {
+            copyExport() {},
+            materializeBackupSource() { copying = true; return copyReply as Promise<string> },
+            discardPortableSource(token) { released.push(token); return true },
+            discardSource(token) { removed.push(token); return true },
+        }))
+        m.materializeIOS.mockImplementation(materializeIOSBackupSource)
+        m.invoke.mockImplementation(async (command, args) => {
+            if (command === 'native_backup_source_format') return 'local-backup'
+            if (command === 'plugin:ios-native|materialize_backup_source') { copying = true; return copyReply }
+            if (command === 'native_portable_source_discard' && type === 'iosScoped') released.push(args.source.token)
+            if (command === 'plugin:ios-native|discard_file') removed.push(args.path)
+            return true
+        })
+        const restoring = restoreBackupFromNativeSource(source)
+        await vi.waitFor(() => expect(copying).toBe(true))
+        m.controller.abort()
+        await expect(restoring).rejects.toMatchObject({ name: 'AbortError' })
+        // Android releases through its control bridge, iOS through the same command the route uses.
+        expect(released).toEqual(type === 'iosScoped' ? ['synthetic-custody', 'synthetic-custody'] : ['synthetic-custody'])
+        expect(m.legacy).not.toHaveBeenCalled()
+        expect(m.invoke).toHaveBeenLastCalledWith('native_portable_source_discard', { source })
+        reply(type === 'iosScoped'
+            ? { path: '/owned/late.risudat', name: 'late.risudat', bytes: 42 }
+            : JSON.stringify({ ready: [{ token: 'late-copy' }], failures: [] }))
+        await vi.waitFor(() => expect(removed).toEqual([type === 'iosScoped' ? '/owned/late.risudat' : 'late-copy']))
+    })
     it.each([false, true])('reports iOS copy progress and propagates cancellation before restore (cancel %s)', async cancel => {
         const { materializeIOSBackupSource, discardIOSFile } = await vi.importActual<typeof import('./iosFiles')>('./iosFiles')
         m.materializeIOS.mockImplementation(materializeIOSBackupSource)
