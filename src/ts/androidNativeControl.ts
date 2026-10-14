@@ -104,7 +104,7 @@ export function createAndroidControlClient(port: AndroidControlMessagePort) {
         request<T>(method: string, ...args: string[]): Promise<T> {
             return request<T>(method, args)
         },
-        requestWithProgress<T>(method: string, onProgress: ((progress: AndroidBackupCopyProgress) => void) | undefined, ...args: string[]): Promise<T> {
+        requestWithProgress<T>(method: 'saf.materializeBackupSource', onProgress: ((progress: AndroidBackupCopyProgress) => void) | undefined, ...args: string[]): Promise<T> {
             return request<T>(method, args, onProgress)
         },
     }

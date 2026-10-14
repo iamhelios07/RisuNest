@@ -1,4 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { clearMocks, mockIPC } from '@tauri-apps/api/mocks'
 const m = vi.hoisted(() => ({
     invoke: vi.fn(),
     open: vi.fn(),
@@ -26,7 +27,7 @@ const m = vi.hoisted(() => ({
     runtime: { revision: 4 },
 }))
 vi.mock('../drive/backuplocal', () => ({ importLegacyBackupWithWebView: m.fallback }))
-vi.mock('@tauri-apps/api/core', () => ({ invoke: m.invoke }))
+vi.mock('@tauri-apps/api/core', async original => ({ ...(await original<typeof import('@tauri-apps/api/core')>()), invoke: m.invoke } satisfies typeof import('@tauri-apps/api/core')))
 vi.mock('@tauri-apps/plugin-dialog', () => ({ open: m.open, save: m.save }))
 vi.mock('../platform', async () => (await import('../platform.testSupport')).platformModule({ runtime: 'tauri', os: 'windows' }))
 vi.mock('../alert', () => ({ alertConfirm: m.confirm, alertNormal: vi.fn() }))
@@ -85,6 +86,8 @@ const result = {
 describe('common backup file production route', () => {
     beforeEach(() => {
         vi.resetAllMocks()
+        vi.stubGlobal('window', { crypto: globalThis.crypto })
+        mockIPC(() => undefined)
         m.controller = new AbortController()
         m.manager.mockImplementation(async (_kind, _label, run) =>
             run({
@@ -106,6 +109,7 @@ describe('common backup file production route', () => {
         })
         m.save.mockResolvedValue('C:\\synthetic\\backup.risunest')
     })
+    afterEach(() => { clearMocks(); vi.unstubAllGlobals() })
     it.each(['androidSeekable','iosScoped'] as const)('keeps fresh %s source seekable without materialization', async (type) => {
         const source={type,token:'synthetic-custody'}
         await expect(restoreBackupFromNativeSource(source)).resolves.toEqual(result)
@@ -136,6 +140,40 @@ describe('common backup file production route', () => {
         }))
         expect(m.legacy.mock.calls[0][1]).toEqual({type:'androidSpool',token:'synthetic-materialized'})
         expect(m.discard).toHaveBeenCalledWith('synthetic-materialized')
+    })
+    it.each([false, true])('reports iOS copy progress and propagates cancellation before restore (cancel %s)', async cancel => {
+        const { materializeIOSBackupSource, discardIOSFile } = await vi.importActual<typeof import('./iosFiles')>('./iosFiles')
+        m.materializeIOS.mockImplementation(materializeIOSBackupSource)
+        const iosModule = await import('./iosFiles')
+        vi.mocked(iosModule.discardIOSFile).mockImplementation(discardIOSFile)
+        let finishCopy: (() => void) | undefined
+        m.invoke.mockImplementation(async (command, args) => {
+            if (command === 'native_backup_source_format') return 'local-backup'
+            if (command === 'plugin:ios-native|materialize_backup_source') {
+                args.onProgress.onmessage({ copiedBytes: 4 * 1024 ** 3, totalBytes: 8 * 1024 ** 3 })
+                const copied = { path: '/owned/copied.risudat', name: 'copied.risudat', bytes: 8 * 1024 ** 3 }
+                if (cancel) return new Promise(resolve => {
+                    finishCopy = () => resolve(copied)
+                    m.controller.abort()
+                })
+                return copied
+            }
+            if (command === 'native_portable_source_discard') finishCopy?.()
+            return true
+        })
+        const restoring = restoreBackupFromNativeSource({ type: 'iosScoped', token: 'synthetic-custody' })
+        if (cancel) await expect(restoring).rejects.toMatchObject({ name: 'AbortError' })
+        else await expect(restoring).resolves.toEqual(result)
+        expect(m.status).toHaveBeenCalledWith(expect.objectContaining({ detail: expect.objectContaining({
+            stage: 'copying-source', stageUnit: 'bytes', stageCompleted: 4 * 1024 ** 3, stageTotal: 8 * 1024 ** 3,
+        }) }))
+        if (cancel) {
+            expect(m.legacy).not.toHaveBeenCalled()
+        } else {
+            expect(m.legacy.mock.calls[0][1]).toEqual({ type: 'desktopPath', path: '/owned/copied.risudat' })
+        }
+        expect(m.invoke).toHaveBeenCalledWith('native_portable_source_discard', { source: { type: 'iosScoped', token: 'synthetic-custody' } })
+        expect(m.invoke).toHaveBeenCalledWith('plugin:ios-native|discard_file', { path: '/owned/copied.risudat' })
     })
     it('discards invalid seekable custody without materializing',async()=>{
         m.invoke.mockImplementation(async(command)=>{if(command==='native_backup_source_format')throw new Error('invalid-catalog');return true})

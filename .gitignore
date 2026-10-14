@@ -62,6 +62,7 @@ dist.zip
 !/scripts/runNodeTests.mjs
 !/scripts/testNative.mjs
 !/scripts/testAndroid.ps1
+!/scripts/testIOSPortableSourceContracts.mjs
 !/scripts/buildLocal.mjs
 .env
 /server/node/ssl/certificate
