@@ -105,7 +105,7 @@ export async function exportBackup({ source, sink, signal, progress = () => {} }
             if (!path.length) root = Array.isArray(value) ? 'array' : value && typeof value === 'object' ? 'object' : 'scalar';
             if (path.length === 1 && ['character', 'message'].includes(path[0])) chat = true;
             found.visit(path, value);
-        });
+        }, { cold: true });
         await writer.begin('coldstorage_' + key + '.json');
         for await (const bytes of gunzip(compressed, signal)) {
             size += bytes.length;

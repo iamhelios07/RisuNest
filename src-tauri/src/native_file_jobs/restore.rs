@@ -29,11 +29,13 @@ const CHARACTER_BATCH_COUNT: usize = 16;
 const CHARACTER_BATCH_BYTES: usize = 8 * 1024 * 1024;
 const MESSAGE_PAGE_COUNT: usize = 128;
 const MESSAGE_PAGE_BYTES: u64 = 8 * 1024 * 1024;
+pub(super) const RESTORE_RECORD_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 pub(crate) struct RestoreLimits {
     pub(crate) max_encoded_block_bytes: u64,
     pub(crate) max_decoded_block_bytes: u64,
+    pub(crate) max_record_bytes: u64,
 }
 
 impl Default for RestoreLimits {
@@ -41,6 +43,7 @@ impl Default for RestoreLimits {
         Self {
             max_encoded_block_bytes: u32::MAX as u64,
             max_decoded_block_bytes: 1024 * 1024 * 1024,
+            max_record_bytes: RESTORE_RECORD_BYTES,
         }
     }
 }
@@ -1555,7 +1558,7 @@ fn read_character_block<R: Read>(
         remaining: encoded_length,
     };
     let staging_error = RefCell::new(None);
-    let record_bytes = Cell::new(None);
+    let record_bytes = RecordBudget::new(limits.max_record_bytes);
     let retained = Cell::new(true);
     let seed = CharacterSeed {
         retained: &retained,
@@ -1615,9 +1618,20 @@ fn read_character_block<R: Read>(
     Ok(retained.get())
 }
 
+pub(super) struct RecordBudget {
+    bytes: Cell<Option<u64>>,
+    limit: u64,
+}
+
+impl RecordBudget {
+    pub(super) fn new(limit: u64) -> Self { Self { bytes: Cell::new(None), limit } }
+    pub(super) fn set(&self, bytes: Option<u64>) { self.bytes.set(bytes); }
+    fn get(&self) -> Option<u64> { self.bytes.get() }
+}
+
 pub(super) struct RecordLimitReader<'a, R> {
     pub(super) inner: R,
-    pub(super) bytes: &'a Cell<Option<u64>>,
+    pub(super) bytes: &'a RecordBudget,
 }
 
 impl<R: Read> Read for RecordLimitReader<'_, R> {
@@ -1626,7 +1640,7 @@ impl<R: Read> Read for RecordLimitReader<'_, R> {
         if let Some(bytes) = self.bytes.get() {
             let bytes = bytes.saturating_add(read as u64);
             self.bytes.set(Some(bytes));
-            if bytes > MESSAGE_PAGE_BYTES {
+            if bytes > self.bytes.limit {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "restore record limit exceeded"));
             }
         }
@@ -1634,8 +1648,8 @@ impl<R: Read> Read for RecordLimitReader<'_, R> {
     }
 }
 
-pub(super) struct BoundedValueSeed<'a>(pub(super) &'a Cell<Option<u64>>);
-pub(super) struct BoundedStringSeed<'a>(pub(super) &'a Cell<Option<u64>>);
+pub(super) struct BoundedValueSeed<'a>(pub(super) &'a RecordBudget);
+pub(super) struct BoundedStringSeed<'a>(pub(super) &'a RecordBudget);
 
 impl<'de> DeserializeSeed<'de> for BoundedStringSeed<'_> {
     type Value = String;
@@ -1658,34 +1672,26 @@ impl<'de> DeserializeSeed<'de> for BoundedValueSeed<'_> {
     }
 }
 
-fn retained_json_bytes<E: de::Error>(value: &impl serde::Serialize) -> Result<u64, E> {
-    struct SizeWriter(u64);
+fn retained_json_bytes<E: de::Error>(value: &impl serde::Serialize, limit: u64) -> Result<u64, E> {
+    struct SizeWriter(u64, u64);
     impl Write for SizeWriter {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
             self.0 = self.0.saturating_add(bytes.len() as u64);
-            if self.0 > MESSAGE_PAGE_BYTES {
+            if self.0 > self.1 {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "restore record limit exceeded"));
             }
             Ok(bytes.len())
         }
         fn flush(&mut self) -> io::Result<()> { Ok(()) }
     }
-    let mut size = SizeWriter(0);
+    let mut size = SizeWriter(0, limit);
     serde_json::to_writer(&mut size, value).map_err(E::custom)?;
     Ok(size.0)
 }
 
-fn check_detail_size<E: de::Error>(detail: &Map<String, Value>) -> Result<(), E> {
-    retained_json_bytes::<E>(detail).map(|_| ())
-}
-
-fn insert_detail<E: de::Error>(detail: &mut Map<String, Value>, bytes: &mut u64, key: String, value: Value) -> Result<(), E> {
-    if let Some(previous) = detail.get(&key) {
-        *bytes = bytes.saturating_sub(retained_json_bytes::<E>(&key)? + retained_json_bytes::<E>(previous)? + 2);
-    }
-    *bytes = bytes.saturating_add(retained_json_bytes::<E>(&key)?)
-        .saturating_add(retained_json_bytes::<E>(&value)?).saturating_add(2);
-    if *bytes > MESSAGE_PAGE_BYTES { return Err(E::custom("restore record limit exceeded")); }
+fn insert_detail<E: de::Error>(detail: &mut Map<String, Value>, limit: u64, key: String, value: Value) -> Result<(), E> {
+    retained_json_bytes::<E>(&key, limit)?;
+    retained_json_bytes::<E>(&value, limit)?;
     detail.insert(key, value);
     Ok(())
 }
@@ -1702,7 +1708,7 @@ struct CharacterMetadata {
 
 struct CharacterMetadataSeed<'a> {
     wrapped: bool,
-    record_bytes: &'a Cell<Option<u64>>,
+    record_bytes: &'a RecordBudget,
 }
 
 impl<'de> DeserializeSeed<'de> for CharacterMetadataSeed<'_> {
@@ -1939,7 +1945,7 @@ struct CharacterSeed<'a> {
     retained: &'a Cell<bool>,
     chats_to_skip: u64,
     limits: RestoreLimits,
-    record_bytes: &'a Cell<Option<u64>>,
+    record_bytes: &'a RecordBudget,
     character_name: &'a str,
     cold_detected: &'a Cell<bool>,
     spool_directory: &'a Path,
@@ -1976,7 +1982,6 @@ impl<'de> Visitor<'de> for CharacterVisitor<'_> {
         A: MapAccess<'de>,
     {
         let mut detail = Map::new();
-        let mut detail_bytes = 2;
         let mut conversation_count = 0i64;
         let mut saw_chats = false;
         let mut chats_to_skip = self.0.chats_to_skip;
@@ -2009,7 +2014,7 @@ impl<'de> Visitor<'de> for CharacterVisitor<'_> {
                 })?;
             } else {
                 let value = map.next_value_seed(BoundedValueSeed(self.0.record_bytes))?;
-                insert_detail::<A::Error>(&mut detail, &mut detail_bytes, key, value)?;
+                insert_detail::<A::Error>(&mut detail, self.0.record_bytes.limit, key, value)?;
             }
         }
         if detail.get("coldstorage").and_then(Value::as_str).is_some_and(|key| !key.is_empty()) { self.0.cold_detected.set(true); }
@@ -2040,7 +2045,7 @@ impl<'de> Visitor<'de> for CharacterVisitor<'_> {
 
 struct ChatsSeed<'a> {
     limits: RestoreLimits,
-    record_bytes: &'a Cell<Option<u64>>,
+    record_bytes: &'a RecordBudget,
     character_name: &'a str,
     cold_detected: &'a Cell<bool>,
     spool_directory: &'a Path,
@@ -2109,7 +2114,7 @@ impl<'de> Visitor<'de> for ChatsVisitor<'_> {
 
 struct ConversationSeed<'a> {
     limits: RestoreLimits,
-    record_bytes: &'a Cell<Option<u64>>,
+    record_bytes: &'a RecordBudget,
     character_name: &'a str,
     cold_detected: &'a Cell<bool>,
     spool_directory: &'a Path,
@@ -2148,7 +2153,6 @@ impl<'de> Visitor<'de> for ConversationVisitor<'_> {
         A: MapAccess<'de>,
     {
         let mut detail = Map::new();
-        let mut detail_bytes = 2;
         let mut messages = MessageSpool::empty();
         let mut saw_messages = false;
         while let Some(key) = map.next_key_seed(BoundedStringSeed(self.0.record_bytes))? {
@@ -2169,7 +2173,7 @@ impl<'de> Visitor<'de> for ConversationVisitor<'_> {
                 })?;
             } else {
                 let value = map.next_value_seed(BoundedValueSeed(self.0.record_bytes))?;
-                insert_detail::<A::Error>(&mut detail, &mut detail_bytes, key, value)?;
+                insert_detail::<A::Error>(&mut detail, self.0.record_bytes.limit, key, value)?;
             }
         }
         if self.0.sink.expands_cold_payloads() {
@@ -2189,7 +2193,6 @@ impl<'de> Visitor<'de> for ConversationVisitor<'_> {
                             if let Some(value) = fields.remove(field) { detail.insert(field.to_owned(), value); }
                         }
                     }
-                    check_detail_size::<A::Error>(&detail)?;
                 } else {
                     self.0.sink.unavailable_cold_payload(&key, self.0.character_name).map_err(|error| {
                         *self.0.staging_error.borrow_mut() = Some(error);
@@ -2273,13 +2276,12 @@ impl<'de> Visitor<'de> for ColdChatVisitor<'_> {
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
         let mut messages = None;
         let mut fields = Map::new();
-        let mut field_bytes = 2;
         while let Some(key) = map.next_key_seed(BoundedStringSeed(self.0.record_bytes))? {
             if key == "message" {
                 messages = Some(map.next_value_seed(MessagesSeed { ..self.0 })?);
             } else if matches!(key.as_str(), "savedToggleValues" | "bindedPersona" | "hypaV2Data" | "hypaV3Data" | "scriptstate" | "localLore") {
                 let value = map.next_value_seed(BoundedValueSeed(self.0.record_bytes))?;
-                insert_detail::<A::Error>(&mut fields, &mut field_bytes, key, value)?;
+                insert_detail::<A::Error>(&mut fields, self.0.record_bytes.limit, key, value)?;
             } else { map.next_value::<IgnoredAny>()?; }
         }
         Ok(messages.filter(|messages| messages.is_array).map(|messages| (messages, Some(fields))))
@@ -2292,6 +2294,7 @@ struct MessageSpool {
     last_time: Option<i64>,
     cold_key: Option<String>,
     is_array: bool,
+    record_limit: u64,
 }
 
 impl IgnoredJsonValue for MessageSpool {
@@ -2302,15 +2305,16 @@ impl IgnoredJsonValue for MessageSpool {
 
 impl MessageSpool {
     fn empty() -> Self {
-        Self { file: None, count: 0, last_time: None, cold_key: None, is_array: false }
+        Self { file: None, count: 0, last_time: None, cold_key: None, is_array: false, record_limit: RESTORE_RECORD_BYTES }
     }
-    fn new(directory: &Path) -> io::Result<Self> {
+    fn new(directory: &Path, record_limit: u64) -> io::Result<Self> {
         Ok(Self {
             file: Some(tempfile::tempfile_in(directory)?),
             count: 0,
             last_time: None,
             cold_key: None,
             is_array: true,
+            record_limit,
         })
     }
 
@@ -2341,7 +2345,7 @@ impl MessageSpool {
             let mut length = [0u8; 4];
             reader.read_exact(&mut length).map_err(&spool_error)?;
             let length = u32::from_le_bytes(length) as u64;
-            if length > MESSAGE_PAGE_BYTES {
+            if length > self.record_limit {
                 return Err(spool_error(io::Error::new(io::ErrorKind::InvalidData, "message spool record limit exceeded")));
             }
             let mut bytes = vec![0u8; length as usize];
@@ -2352,7 +2356,7 @@ impl MessageSpool {
                 &mut message,
                 &format!("{conversation_id}:response:{index}"),
             )?;
-            let length = retained_json_bytes::<serde_json::Error>(&message).map_err(|error| error.to_string())?;
+            let length = retained_json_bytes::<serde_json::Error>(&message, self.record_limit).map_err(|error| error.to_string())?;
             if !page.is_empty()
                 && (page.len() >= MESSAGE_PAGE_COUNT
                     || page_bytes.saturating_add(length) > MESSAGE_PAGE_BYTES)
@@ -2389,7 +2393,7 @@ impl MessageSpool {
 }
 
 struct MessagesSeed<'a> {
-    record_bytes: &'a Cell<Option<u64>>,
+    record_bytes: &'a RecordBudget,
     cold_detected: &'a Cell<bool>,
     spool_directory: &'a Path,
     staging_error: &'a RefCell<Option<StoreError>>,
@@ -2425,7 +2429,7 @@ impl<'de> Visitor<'de> for MessagesVisitor<'_> {
             *self.0.staging_error.borrow_mut() = Some(StoreError::from(error));
             de::Error::custom(message)
         };
-        let mut spool = MessageSpool::new(self.0.spool_directory).map_err(&spool_error)?;
+        let mut spool = MessageSpool::new(self.0.spool_directory, self.0.record_bytes.limit).map_err(&spool_error)?;
         let file = spool.file.as_mut().expect("created message spool");
         while let Some(message) = sequence.next_element_seed(BoundedValueSeed(self.0.record_bytes))? {
             if self.0.job.is_cancel_requested() {
@@ -2440,7 +2444,7 @@ impl<'de> Visitor<'de> for MessagesVisitor<'_> {
                 *self.0.staging_error.borrow_mut() = Some(StoreError::Store { message: error.to_string() });
                 de::Error::custom(error)
             })?;
-            if bytes.len() as u64 > MESSAGE_PAGE_BYTES { return Err(de::Error::custom("restore record limit exceeded")); }
+            if bytes.len() as u64 > self.0.record_bytes.limit { return Err(de::Error::custom("restore record limit exceeded")); }
             file.write_all(&(bytes.len() as u32).to_le_bytes()).map_err(&spool_error)?;
             file.write_all(&bytes).map_err(&spool_error)?;
             spool.count = spool.count.checked_add(1).ok_or_else(|| de::Error::custom("message count overflow"))?;
@@ -3285,13 +3289,13 @@ mod tests {
         let path = directory.path().join("oversized.json");
         let mut file = File::create(&path).unwrap();
         file.write_all(b"[{\"role\":\"user\",\"data\":\"").unwrap();
-        for _ in 0..129 { file.write_all(&[b'x'; 64 * 1024]).unwrap(); }
+        for _ in 0..3 { file.write_all(&[b'x'; 64 * 1024]).unwrap(); }
         file.write_all(b"\"}]").unwrap();
         drop(file);
         sink.cold_payloads = Some(std::collections::HashMap::from([("chat".to_owned(), path)]));
         let source = cold_block_source(directory.path(), &serde_json::to_vec(&json!({"chaId":"char-1","chats":[cold_chat("chat")]})).unwrap(), false);
         let job = JobRegistry::default().create(JobKind::RestoreBlockRisuSave).unwrap();
-        let error = restore_block_risu_save_path(&source, 1, &job, &sink).unwrap_err();
+        let error = restore_block_risu_save_path_with_limits(&source, 1, &job, &sink, RestoreLimits { max_record_bytes: 64 * 1024, ..Default::default() }).unwrap_err();
         assert!(error.message.contains("restore record limit exceeded"), "{error:?}");
         assert_eq!(sink.store.lock().unwrap().revision().unwrap(), 1);
         assert_eq!(sink.max_message_page.load(Ordering::Acquire), 0);
@@ -3338,11 +3342,33 @@ mod tests {
     }
 
     #[test]
+    fn streaming_character_fields_are_bounded_individually() {
+        let (directory, sink) = fixture();
+        let character = json!({"chaId":"char-1", "name":"Synthetic", "chats":[],
+            "description":"a".repeat(40 * 1024), "creatorNotes":"b".repeat(40 * 1024)});
+        let source = cold_block_source(directory.path(), &serde_json::to_vec(&character).unwrap(), true);
+        let job = JobRegistry::default().create(JobKind::RestoreBlockRisuSave).unwrap();
+        restore_block_risu_save_path_with_limits(&source, 1, &job, &sink,
+            RestoreLimits { max_record_bytes: 64 * 1024, ..Default::default() }).unwrap();
+        let restored = sink.store.lock().unwrap().materialize(Some(2)).unwrap();
+        assert_eq!(restored["characters"][0]["description"], character["description"]);
+        assert_eq!(restored["characters"][0]["creatorNotes"], character["creatorNotes"]);
+        let padded = format!(r#"{{"chaId":"char-1","name":"Synthetic","chats":[],"description":{}"x"}}"#, " ".repeat(64 * 1024));
+        let source = cold_block_source(directory.path(), padded.as_bytes(), true);
+        let job = JobRegistry::default().create(JobKind::RestoreBlockRisuSave).unwrap();
+        let error = restore_block_risu_save_path_with_limits(&source, 2, &job, &sink,
+            RestoreLimits { max_record_bytes: 64 * 1024, ..Default::default() }).unwrap_err();
+        assert!(error.message.contains("restore record limit exceeded"));
+        assert_eq!(sink.store.lock().unwrap().materialize(Some(2)).unwrap(), restored);
+    }
+
+    #[test]
     fn cold_streaming_sequential_spool_respects_message_page_byte_limit() {
         let (directory, mut sink) = fixture();
         let messages = json!([
             {"role":"user", "data":"a".repeat(MESSAGE_PAGE_BYTES as usize / 2)},
             {"role":"char", "data":"b".repeat(MESSAGE_PAGE_BYTES as usize / 2)},
+            {"role":"user", "data":"c".repeat(MESSAGE_PAGE_BYTES as usize + 1024)},
         ]);
         sink.cold_payloads = Some(std::collections::HashMap::from([write_cold_payload(directory.path(), "chat", &messages)]));
         let source = cold_block_source(directory.path(), &serde_json::to_vec(&json!({"chaId":"char-1","name":"Synthetic","chats":[cold_chat("chat")]})).unwrap(), false);
@@ -3350,14 +3376,14 @@ mod tests {
         restore_block_risu_save_path(&source, 1, &job, &sink).unwrap();
         let restored = sink.store.lock().unwrap().materialize(Some(2)).unwrap();
         assert_eq!(restored["characters"][0]["chats"][0]["message"], messages);
-        assert_eq!(*sink.message_pages.lock().unwrap(), [1, 1]);
+        assert_eq!(*sink.message_pages.lock().unwrap(), [1, 1, 1]);
     }
 
     #[test]
     fn cold_streaming_sequential_spool_rejects_truncated_and_oversized_lengths_as_store_errors() {
-        for bytes in [vec![4, 0], vec![4, 0, 0, 0, b'{'], ((MESSAGE_PAGE_BYTES + 1) as u32).to_le_bytes().to_vec()] {
+        for bytes in [vec![4, 0], vec![4, 0, 0, 0, b'{'], (1025u32).to_le_bytes().to_vec()] {
             let (directory, sink) = fixture();
-            let mut spool = MessageSpool::new(directory.path()).unwrap();
+            let mut spool = MessageSpool::new(directory.path(), 1024).unwrap();
             spool.count = 1;
             spool.file.as_mut().unwrap().write_all(&bytes).unwrap();
             let job = JobRegistry::default().create(JobKind::RestoreBlockRisuSave).unwrap();
@@ -3376,6 +3402,41 @@ mod tests {
         io::copy(&mut File::open(path).unwrap(), output).unwrap();
     }
 
+    #[test]
+    #[ignore = "explicit large compatible backup acceptance run"]
+    fn compatible_backup_roundtrips_large_fields_and_message() {
+        for target in [super::super::legacy_backup::CompatibilityTarget::RisuAi, super::super::legacy_backup::CompatibilityTarget::PocketRisu] {
+            let source = tempfile::tempdir().unwrap();
+            let mut store = PersistentStore::open(source.path()).unwrap();
+            let staging = store.replace_begin().unwrap().staging_id;
+            store.replace_put_upstream_root(&staging, &json!({"username":"Synthetic","plugins":[],"modules":[]})).unwrap();
+            let first = "a".repeat(33 * 1024 * 1024);
+            let second = "b".repeat(33 * 1024 * 1024);
+            let message = "c".repeat(9 * 1024 * 1024);
+            store.replace_add_characters(&staging, &[
+                json!({"chaId":"large","type":"character","name":"Synthetic","desc":first,"firstMessage":second,
+                    "chats":[{"id":"large-chat","name":"Synthetic chat","message":[{"role":"char","data":message,"chatId":"large-message"}]}]}),
+            ]).unwrap();
+            let revision = store.replace_commit(&staging, Some(0)).unwrap().revision;
+            let owned = source.path().join("owned");
+            let handoff = source.path().join("handoff");
+            fs::create_dir(&owned).unwrap();
+            fs::create_dir(&handoff).unwrap();
+            let output = source.path().join("export.bin");
+            let export_job = JobRegistry::default().create(JobKind::ExportCompatibleLocalBackup).unwrap();
+            super::super::legacy_backup::export_compatible_local_backup(target, Some(&output), revision,
+                &owned, &handoff, store, &export_job).unwrap();
+            let (directory, mut sink) = fixture();
+            let job = JobRegistry::default().create(JobKind::RestoreLegacyLocalBackup).unwrap();
+            restore_container_payloads(&output, directory.path(), &mut sink, &job).unwrap();
+            let restored = sink.store.lock().unwrap().materialize(None).unwrap();
+            let character = &restored["characters"][0];
+            assert!(character["desc"].as_str().is_some_and(|value| value == first));
+            assert!(character["firstMessage"].as_str().is_some_and(|value| value == second));
+            assert!(character["chats"][0]["message"][0]["data"].as_str().is_some_and(|value| value == message));
+        }
+    }
+
     fn restore_cold_container(source: &Path, directory: &Path, sink: &mut StoreSink, job: &JobControl) -> JobResultSummary {
         try_restore_cold_container(source, directory, sink, job).unwrap()
     }
@@ -3386,15 +3447,19 @@ mod tests {
 
     /// Restores a legacy backup container and reports its prepared asset aliases and invalid inlays.
     fn restore_container_payloads(source: &Path, directory: &Path, sink: &mut StoreSink, job: &JobControl) -> Result<(JobResultSummary, Value), crate::local_backup::LocalBackupError> {
+        restore_container_payloads_with_limits(source, directory, sink, job, RestoreLimits::default())
+    }
+
+    fn restore_container_payloads_with_limits(source: &Path, directory: &Path, sink: &mut StoreSink, job: &JobControl, limits: RestoreLimits) -> Result<(JobResultSummary, Value), crate::local_backup::LocalBackupError> {
         use crate::local_backup::{LocalBackupError, NeverCancelled, PayloadTarget, StagedLocalBackupEntry, StrictLocalBackupDatabaseRestore};
-        struct Restore<'a> { directory: &'a Path, sink: &'a mut StoreSink, job: &'a JobControl, result: Option<JobResultSummary>, payloads: Value }
+        struct Restore<'a> { directory: &'a Path, sink: &'a mut StoreSink, job: &'a JobControl, result: Option<JobResultSummary>, payloads: Value, limits: RestoreLimits }
         impl StrictLocalBackupDatabaseRestore for Restore<'_> {
             fn restore_database(&mut self, database: &StagedLocalBackupEntry, entries: &[StagedLocalBackupEntry]) -> Result<(), LocalBackupError> {
                 use crate::asset_repository::job_pins::{CasJobKind, CasReleaseOutcome, DurableCasJob};
                 use crate::asset_repository::PayloadCas;
                 let cas = PayloadCas::new(self.directory).unwrap();
                 let mut durable = DurableCasJob::begin(self.directory, &self.job.id(), CasJobKind::LocalBackupRestore, crate::asset_repository::job_pins::CasJobOwner::for_test(), 0).unwrap();
-                let payloads = super::super::legacy_backup::prepare_legacy_restore_payloads(entries, &cas, &mut durable, &NeverCancelled)?;
+                let payloads = super::super::legacy_backup::prepare_legacy_restore_payloads_with_limits(entries, &cas, &mut durable, &NeverCancelled, &super::super::legacy_backup::NoopPrepareObserver, self.limits)?;
                 let mut cold_keys: Vec<&String> = payloads.cold_payloads.keys().collect();
                 cold_keys.sort();
                 self.payloads = json!({
@@ -3404,13 +3469,13 @@ mod tests {
                 });
                 self.sink.cold_payloads = Some(payloads.cold_payloads);
                 durable.seal(&mut self.sink.store.lock().unwrap(), 0).unwrap();
-                self.result = Some(restore_block_risu_save_path(database.staged_path.as_ref().unwrap(), 1, self.job, self.sink)
+                self.result = Some(restore_block_risu_save_path_with_limits(database.staged_path.as_ref().unwrap(), 1, self.job, self.sink, self.limits)
                     .map_err(|error| LocalBackupError::database_restore(error.message))?);
                 durable.release(CasReleaseOutcome::Committed).unwrap();
                 Ok(())
             }
         }
-        let mut restore = Restore { directory, sink, job, result: None, payloads: Value::Null };
+        let mut restore = Restore { directory, sink, job, result: None, payloads: Value::Null, limits };
         crate::local_backup::parse_legacy_local_backup_v1(&mut File::open(source).unwrap(), directory, PayloadTarget::JobStaging, &mut restore, &NeverCancelled)?;
         Ok((restore.result.unwrap(), restore.payloads))
     }
@@ -3463,7 +3528,7 @@ mod tests {
             let mut output = File::create(&payload).unwrap();
             if nested { output.write_all(br#"{"character":{"chaId":"char-1","chats":[{"message":"#).unwrap(); }
             output.write_all(br#"[{"role":"user","data":""#).unwrap();
-            for _ in 0..144 { output.write_all(&[b'x';64*1024]).unwrap(); }
+            for _ in 0..3 { output.write_all(&[b'x';64*1024]).unwrap(); }
             output.write_all(b"\"}]").unwrap();
             if nested { output.write_all(b"}]}}").unwrap(); }
             drop(output);
@@ -3476,7 +3541,7 @@ mod tests {
             write_container_entry(&mut output, "coldstorage/large.json", &payload);
             drop(output);
             let job = JobRegistry::default().create(JobKind::RestoreLegacyLocalBackup).unwrap();
-            let error = try_restore_cold_container(&archive, directory.path(), &mut sink, &job).unwrap_err();
+            let error = restore_container_payloads_with_limits(&archive, directory.path(), &mut sink, &job, RestoreLimits { max_record_bytes: 64 * 1024, ..Default::default() }).unwrap_err();
             assert!(error.message.contains("cold payload exceeds the record limit"), "{error:?}");
             assert_eq!(sink.abort_calls.load(Ordering::Acquire), 0, "preparation must reject before replacement staging begins");
             assert_eq!(sink.incremental_character_calls.load(Ordering::Acquire), 0);
@@ -3543,13 +3608,13 @@ mod tests {
         let payload = directory.path().join("scalar.json");
         let mut output = File::create(&payload).unwrap();
         output.write_all(br#"{"character":""#).unwrap();
-        for _ in 0..144 { output.write_all(&[b'x';64*1024]).unwrap(); }
+        for _ in 0..3 { output.write_all(&[b'x';64*1024]).unwrap(); }
         output.write_all(b"\"}").unwrap();
         drop(output);
         sink.cold_payloads = Some(std::collections::HashMap::from([("scalar".to_owned(), payload)]));
         let source = cold_block_source(directory.path(), br#"{"chaId":"char-1","chats":[],"coldstorage":"scalar"}"#, true);
         let job = JobRegistry::default().create(JobKind::RestoreBlockRisuSave).unwrap();
-        let error = restore_block_risu_save_path(&source, 1, &job, &sink).unwrap_err();
+        let error = restore_block_risu_save_path_with_limits(&source, 1, &job, &sink, RestoreLimits { max_record_bytes: 64 * 1024, ..Default::default() }).unwrap_err();
         assert!(error.message.contains("restore record limit exceeded"), "{error:?}");
         assert_eq!(sink.incremental_character_calls.load(Ordering::Acquire), 0);
         assert_eq!(sink.store.lock().unwrap().revision().unwrap(), 1);
@@ -4344,6 +4409,7 @@ mod tests {
             RestoreLimits {
                 max_encoded_block_bytes: u32::MAX as u64,
                 max_decoded_block_bytes: 64,
+                ..Default::default()
             },
         )
         .unwrap_err();
@@ -4380,6 +4446,7 @@ mod tests {
                 RestoreLimits {
                     max_encoded_block_bytes: 64,
                     max_decoded_block_bytes: 1024,
+                    ..Default::default()
                 },
             )
             .unwrap_err();
@@ -4964,6 +5031,7 @@ mod tests {
             RestoreLimits {
                 max_encoded_block_bytes: 1024,
                 max_decoded_block_bytes: 8,
+                ..Default::default()
             },
         )
         .unwrap_err();

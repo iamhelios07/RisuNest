@@ -3,8 +3,8 @@ import { ByteReader, ExportError, check, chunks, decoder, encoder, fail, streamO
 
 export const COLD_HEADER = '\uEF01COLDSTORAGE\uEF01';
 export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-// RisuNest caps each message and character detail at 8 MiB and any other block at 1 GiB decoded.
-const MAX_STRING = 8 * 1024 * 1024;
+// Messages, field values and keys have independent bounds; streamed containers do not.
+const MAX_STRING = 64 * 1024 * 1024;
 const MAX_BLOCK = 1024 * 1024 * 1024;
 // Longer MessagePack strings cannot hold a reference, so they are skipped undecoded.
 const MAX_REFERENCE = 64 * 1024;
@@ -14,18 +14,25 @@ const EMPTY_PLUGIN_STORAGE = Uint8Array.of(11, 0, 13, ...encoder.encode('pluginS
 
 // Token events avoid retaining enclosing characters, chats, or the root object.
 export class JsonScan {
-    constructor(visit, { maxString = MAX_STRING, blank = false } = {}) {
+    constructor(visit, { maxString = MAX_STRING, blank = false, cold = false } = {}) {
         this.visit = visit; this.stack = []; this.rootDone = false; this.pending = 0;
-        this.maxString = maxString; this.blank = blank;
+        this.maxString = maxString; this.blank = blank; this.cold = cold;
+        this.receivedBytes = 0; this.previousScalar = null;
         this.decoder = new TextDecoder('utf-8', { fatal: true });
         this.tokenizer = new Tokenizer({ stringBufferSize: 64 * 1024 });
         this.tokenizer.onToken = token => { this.pending = 0; this.token(token); };
     }
-    token({ token, value }) {
+    token({ token, value, offset }) {
+        this.checkScalarEnd(offset);
+        if (token === T.STRING && encoder.encode(JSON.stringify(value)).length > this.maxString) fail('recordTooLarge');
+        if ([T.STRING, T.NUMBER, T.TRUE, T.FALSE, T.NULL].includes(token)) this.previousScalar = offset;
+        for (const container of this.stack) {
+            if (container.bounded && offset - container.start + 1 > this.maxString) fail('recordTooLarge');
+        }
         const frame = this.stack.at(-1);
         if (frame?.state === 'colon') {
             if (token !== T.COLON) fail('invalidData');
-            frame.state = 'value'; return;
+            frame.state = 'value'; frame.valueStart = offset + 1; return;
         }
         if (frame?.state === 'comma') {
             if (token === T.COMMA) { frame.state = frame.object ? 'key' : 'value'; return; }
@@ -40,18 +47,25 @@ export class JsonScan {
         if (frame?.state === 'valueOrEnd' && token === T.RIGHT_BRACKET) { this.stack.pop(); return; }
         if (!frame && this.rootDone) fail('invalidData');
         const path = frame ? [...frame.path, frame.object ? frame.key : frame.index++] : [];
+        const recordStart = frame?.object ? frame.valueStart : offset;
+        if (this.previousScalar !== null) this.previousScalar = recordStart;
         if (frame) frame.state = 'comma'; else this.rootDone = true;
         if (token === T.LEFT_BRACE || token === T.LEFT_BRACKET) {
             if (this.stack.length >= 256) fail('invalidData');
             const object = token === T.LEFT_BRACE;
             this.visit(path, object ? {} : []);
-            this.stack.push({ path, object, state: object ? 'keyOrEnd' : 'valueOrEnd', index: 0 });
+            const relative = this.cold && path[0] === 'character' ? path.slice(1) : path;
+            const streamed = relative.length === 0
+                || relative.length === 1 && (relative[0] === 'chats' || this.cold && relative[0] === 'message')
+                || relative[0] === 'chats' && typeof relative[1] === 'number'
+                    && (relative.length === 2 || relative.length === 3 && relative[2] === 'message');
+            this.stack.push({ path, object, state: object ? 'keyOrEnd' : 'valueOrEnd', index: 0, start: recordStart, bounded: !streamed });
         } else if ([T.STRING, T.NUMBER, T.TRUE, T.FALSE, T.NULL].includes(token)) {
-            if (typeof value === 'string' && value.length > this.maxString) fail('recordTooLarge');
             this.visit(path, value);
         } else fail('invalidData');
     }
     write(bytes) {
+        this.receivedBytes += bytes.length;
         this.pending += bytes.length;
         if (this.pending > this.maxString + 256 * 1024) fail('recordTooLarge');
         try {
@@ -65,9 +79,14 @@ export class JsonScan {
             const tail = this.decoder.decode();
             if (tail) this.tokenizer.write(tail);
             this.tokenizer.end();
+            this.checkScalarEnd(this.receivedBytes);
         }
         catch (error) { if (error instanceof ExportError) throw error; fail('invalidData'); }
         if (this.stack.length || !this.rootDone && !this.blank) fail('truncated');
+    }
+    checkScalarEnd(offset) {
+        if (this.previousScalar !== null && offset - this.previousScalar > this.maxString) fail('recordTooLarge');
+        this.previousScalar = null;
     }
 }
 export function references() {

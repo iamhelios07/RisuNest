@@ -992,6 +992,7 @@ fn legacy_restore_keeps_the_decoded_size_limit() {
             let limits = RestoreLimits {
                 max_encoded_block_bytes: u32::MAX as u64,
                 max_decoded_block_bytes: limit,
+                ..Default::default()
             };
             let (expected, _) = assert_same_outcome(&format!("{kind} limit {limit}"), &wire, limits);
             assert_eq!(expected.outcome.is_ok(), accepted, "{kind} limit {limit}");
