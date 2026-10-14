@@ -279,7 +279,10 @@ path = "main.rs"
         $armHost = $generated.Replace('${If} ${IsNativeAMD64}', '${If} 0 = 1').Replace('${ElseIf} ${IsNativeARM64}', '${ElseIf} 1 = 1')
         $x64OnArm = Compile-Template 'x64-on-arm64' (Set-Architecture $armHost 'x64')
         Run-Installer $x64OnArm @('/S', '/NS') 1
-        $armOnArm = Compile-Template 'arm64-on-arm64' ($armHost.Replace('!define ARCH "x64"', '!define ARCH "arm64"'))
+        # x64 builds installed on ARM64 before the architecture check keep receiving x64 updates.
+        Run-Installer $x64OnArm @('/S', '/NS', '/UPDATE') 0
+        if ((Get-ItemProperty $uninstallKey).DisplayVersion -ne '1.0.4') { throw 'An x64 update of an existing ARM64 installation was refused.' }
+        $armOnArm = Compile-Template 'arm64-on-arm64' (Set-Architecture $armHost 'arm64')
         Run-Installer $armOnArm @('/S', '/NS') 0
         if (!(Test-Path $keep)) { throw 'Architecture migration removed unowned data.' }
         # Reinstalling a registered installation whose folder was deleted recreates it in place.
@@ -309,6 +312,8 @@ path = "main.rs"
         Run-Installer (Join-Path $installed 'uninstall.exe') @('/S', "_?=$installed") 0
         if (Test-Path (Join-Path $installed "$fixtureName.exe")) { throw 'The updated installation could not be removed.' }
         if (!(Test-Path $keep)) { throw 'Removal deleted an unowned file.' }
+        Run-Installer $x64OnArm @('/S', '/NS', '/UPDATE', "/D=$installed") 1
+        if (Test-Path $uninstallKey) { throw 'An x64 update without an existing installation was accepted on ARM64.' }
         foreach ($displayLanguage in @(1042, 1033, 1041)) {
             $languageLog = Join-Path $testRoot "language-$displayLanguage.txt"
             $probe = @"

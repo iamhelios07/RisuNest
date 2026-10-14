@@ -496,20 +496,6 @@ FunctionEnd
 
 Function .onInit
   StrCpy $RequestedInstallDir $INSTDIR
-  StrCpy $PackageArchitecture "${ARCH}"
-  StrCpy $DetectedArchitecture "x86"
-  ${If} ${IsNativeAMD64}
-    StrCpy $DetectedArchitecture "x64"
-  ${ElseIf} ${IsNativeARM64}
-    StrCpy $DetectedArchitecture "arm64"
-  ${EndIf}
-  ${If} $DetectedArchitecture != $PackageArchitecture
-    StrCpy $InstallFailureMessage "$(InstallArchitecture)"
-    ${If} $DetectedArchitecture == "x86"
-      StrCpy $InstallFailureMessage "$(InstallUnsupportedWindows)"
-    ${EndIf}
-    Call InitializationFailure
-  ${EndIf}
   ${GetOptions} $CMDLINE "/P" $PassiveMode
   ${IfNot} ${Errors}
     StrCpy $PassiveMode 1
@@ -557,6 +543,31 @@ Function .onInit
     !insertmacro MULTIUSER_INIT
   !endif
   ReadRegStr $0 SHCTX "${UNINSTKEY}" "UninstallString"
+  StrCpy $PackageArchitecture "${ARCH}"
+  StrCpy $DetectedArchitecture "x86"
+  ${If} ${IsNativeAMD64}
+    StrCpy $DetectedArchitecture "x64"
+  ${ElseIf} ${IsNativeARM64}
+    StrCpy $DetectedArchitecture "arm64"
+  ${EndIf}
+  StrCpy $1 1
+  ${If} $DetectedArchitecture != $PackageArchitecture
+    StrCpy $1 0
+    ; x64 builds installed on ARM64 before this check request x64 packages from their updater.
+    ${If} $DetectedArchitecture == "arm64"
+    ${AndIf} $PackageArchitecture == "x64"
+    ${AndIf} $UpdateMode = 1
+    ${AndIf} $0 != ""
+      StrCpy $1 1
+    ${EndIf}
+  ${EndIf}
+  ${If} $1 = 0
+    StrCpy $InstallFailureMessage "$(InstallArchitecture)"
+    ${If} $DetectedArchitecture == "x86"
+      StrCpy $InstallFailureMessage "$(InstallUnsupportedWindows)"
+    ${EndIf}
+    Call InitializationFailure
+  ${EndIf}
   ${If} $0 != ""
     ReadRegStr $ExistingNsis SHCTX "${MANUPRODUCTKEY}" ""
     ${If} $ExistingNsis == ""
