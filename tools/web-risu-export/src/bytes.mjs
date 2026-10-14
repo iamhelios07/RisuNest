@@ -9,6 +9,12 @@ export class ExportError extends Error {
 }
 export function fail(code) { throw new ExportError(code); }
 export function check(signal) { signal?.throwIfAborted(); }
+export const wait = (milliseconds, signal) => new Promise((resolve, reject) => {
+    check(signal);
+    const abort = () => { clearTimeout(timer); reject(signal.reason); };
+    const timer = setTimeout(() => { signal?.removeEventListener('abort', abort); resolve(); }, milliseconds);
+    signal?.addEventListener('abort', abort, { once: true });
+});
 export const hex = bytes => Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
 export const keyHex = key => hex(encoder.encode(key));
 export function fromHex(value) {
@@ -166,7 +172,7 @@ export class ArchiveWriter {
     constructor(sink, signal, onBytes = () => {}, bufferSize = 1024 * 1024) {
         this.sink = sink; this.signal = signal; this.onBytes = onBytes;
         this.buffer = new Uint8Array(bufferSize); this.used = 0;
-        this.position = 0; this.names = new Set(); this.nameBytes = 0; this.active = null;
+        this.position = 0; this.extent = 0; this.names = new Set(); this.nameBytes = 0; this.active = null;
     }
     async flush() {
         check(this.signal);
@@ -192,10 +198,26 @@ export class ArchiveWriter {
         if (this.names.size >= 200000 || this.nameBytes + encoded.length > 64 * 1024 * 1024) fail('tooMany');
         if (size != null) u32(size);
         this.names.add(name); this.nameBytes += encoded.length;
+        const origin = this.position;
         await this.raw(u32(encoded.length)); await this.raw(encoded);
         const lengthPosition = this.position;
         await this.raw(u32(size ?? 0));
-        this.active = { start: this.position, lengthPosition, expected: size };
+        this.active = { name, nameBytes: encoded.length, origin, start: this.position, lengthPosition, expected: size };
+    }
+    // Discards the unfinished entry; later entries overwrite its bytes and finish() trims any excess.
+    async rollback() {
+        const entry = this.active;
+        if (!entry) return;
+        this.active = null;
+        this.names.delete(entry.name); this.nameBytes -= entry.nameBytes;
+        const flushed = this.position - this.used;
+        if (entry.origin >= flushed) this.used -= this.position - entry.origin;
+        else {
+            this.used = 0; this.extent = Math.max(this.extent, flushed);
+            await this.sink.seek(entry.origin);
+        }
+        this.onBytes(entry.origin - this.position);
+        this.position = entry.origin;
     }
     async append(bytes) {
         if (!this.active || this.position - this.active.start + bytes.length > U32_MAX) fail('entryTooLarge');
@@ -222,7 +244,9 @@ export class ArchiveWriter {
     }
     async finish() {
         if (this.active || !this.names.has('database.risudat')) fail('invalidData');
-        await this.flush(); check(this.signal); await this.sink.close();
+        await this.flush(); check(this.signal);
+        if (this.extent > this.position) await this.sink.truncate(this.position);
+        await this.sink.close();
     }
     async abort() { this.used = 0; await this.sink.abort().catch(() => {}); }
 }

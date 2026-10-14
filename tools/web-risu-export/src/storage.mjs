@@ -1,8 +1,12 @@
 import * as oauth from 'openid-client';
-import { ExportError, check, decoder, encoder, fail, fromHex, keyHex, sourceOf } from './bytes.mjs';
+import { ExportError, check, decoder, encoder, fail, fromHex, keyHex, sourceOf, wait } from './bytes.mjs';
 import { references, scanDatabase } from './scan.mjs';
 
 const DB_KEY = 'database/database.bin';
+// The self-hosted Node server keeps saves on the server, not in this browser.
+export function checkPlatform() {
+    if (globalThis.__NODE__) fail('nodeServer');
+}
 export class IdbStore {
     constructor(db, store) { this.db = db; this.store = store; }
     static async open(name, store = 'keyvaluepairs', factory = indexedDB) {
@@ -55,12 +59,6 @@ export class IdbStore {
     }
     close() { this.db.close(); }
 }
-const wait = (milliseconds, signal) => new Promise((resolve, reject) => {
-    check(signal);
-    const abort = () => { clearTimeout(timer); reject(signal.reason); };
-    const timer = setTimeout(() => { signal?.removeEventListener('abort', abort); resolve(); }, milliseconds);
-    signal?.addEventListener('abort', abort, { once: true });
-});
 export class AccountReader {
     constructor({ storage = localStorage, fetcher = (...args) => globalThis.fetch(...args), getKeys, signal, legacyToken = '' }) {
         this.storage = storage; this.fetcher = fetcher; this.getKeys = getKeys; this.signal = signal;
@@ -141,14 +139,47 @@ export class AccountReader {
         });
     }
 }
-export function responseSource(response) {
-    if (!response.ok || response.status === 204 || !response.body) fail('missing');
+// A body that stalls or ends short of its declared size is `interrupted` so the entry can restart.
+export function responseSource(response, signal, idle = 60000) {
+    if (!response.ok || response.status === 204 || !response.body) {
+        void response.body?.cancel().catch(() => {});
+        fail(response.status === 204 || response.status === 404 || response.ok ? 'missing' : 'network');
+    }
     const raw = response.headers.get('x-body-size') ?? (response.headers.get('content-encoding') ? null : response.headers.get('content-length'));
     const size = raw !== null && /^\d+$/.test(raw) ? Number(raw) : null;
     let used = false;
     return {
         size,
-        stream() { if (used) fail('invalidData'); used = true; return response.body; },
+        stream() {
+            if (used) fail('invalidData');
+            used = true;
+            const reader = response.body.getReader();
+            let received = 0;
+            const stop = (controller, error) => {
+                void reader.cancel().catch(() => {});
+                controller.error(signal?.aborted ? signal.reason : error instanceof ExportError ? error : new ExportError('interrupted'));
+            };
+            return new ReadableStream({
+                async pull(controller) {
+                    let timer, item;
+                    try {
+                        item = await Promise.race([reader.read(), new Promise((_, reject) => {
+                            timer = setTimeout(() => reject(new ExportError('interrupted')), idle);
+                        })]);
+                    } catch (error) { stop(controller, error); return; }
+                    finally { clearTimeout(timer); }
+                    if (item.done) {
+                        if (size != null && received !== size) stop(controller, new ExportError('interrupted'));
+                        else controller.close();
+                        return;
+                    }
+                    received += item.value.length;
+                    if (size != null && received > size) { stop(controller, new ExportError('changed')); return; }
+                    controller.enqueue(item.value);
+                },
+                cancel(reason) { return reader.cancel(reason); }
+            }, { highWaterMark: 0 });
+        },
         async cancel() { if (!used) await response.body.cancel().catch(() => {}); }
     };
 }
@@ -159,6 +190,7 @@ async function fileAt(root, name) {
 }
 export class BrowserSource {
     static async open(signal, onMode = () => {}) {
+        checkPlatform();
         const source = new BrowserSource();
         source.abortController = new AbortController();
         source.onAbort = () => source.abortController.abort(signal.reason);
@@ -247,7 +279,8 @@ export class BrowserSource {
                 if (match?.match && cached) return sourceOf(cached);
                 fail('changed');
             }
-            return responseSource(response);
+            try { return responseSource(response, this.signal); }
+            catch (error) { if (error.code === 'missing') fail('missingDatabase'); throw error; }
         }
         const value = this.mode === 'opfs' ? await fileAt(this.root, keyHex(DB_KEY)) : await this.local?.get(DB_KEY);
         if (!value) fail('missingDatabase');
@@ -259,12 +292,12 @@ export class BrowserSource {
             : await (this.mode === 'account' ? this.cache : this.local)?.get(key);
         if (local != null) return sourceOf(local);
         if (this.mode !== 'account') fail('missing');
-        return responseSource(await this.account.read(key));
+        return responseSource(await this.account.read(key), this.signal);
     }
     async cold(key) {
         if (this.mode === 'account') {
             const response = await this.account.request('/hub/account/coldstorage', { 'x-risu-key': key });
-            if (response.status === 200) return responseSource(response);
+            if (response.status === 200) return responseSource(response, this.signal);
             await response.body?.cancel().catch(() => {});
             if (![404, 204].includes(response.status)) fail('network');
         }
@@ -272,11 +305,8 @@ export class BrowserSource {
         if (!file) fail('missing');
         return sourceOf(file);
     }
-    async inlay(key) {
-        const value = await this.inlays?.get(key);
-        if (!value) fail('missing');
-        return value;
-    }
+    // A removed inlay is skipped here and reported as a change by verifyInventory.
+    async inlay(key) { return this.inlays?.get(key); }
     async verifyInventory(expected) {
         const flags = ['accountst', 'opfs_flag!', 'hub', 'ignoreRisuAuth'].map(key => localStorage.getItem(key));
         if (JSON.stringify(flags) !== JSON.stringify(this.flags)) fail('changed');
