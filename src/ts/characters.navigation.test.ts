@@ -35,6 +35,7 @@ const mocks = vi.hoisted(() => ({
     editWindowedChatList: vi.fn(),
     alertConfirm: vi.fn(async (_options?: unknown) => true),
     alertSelect: vi.fn(async () => '0'),
+    presentAlert: vi.fn((_alert: { type: string, msg: string, onSelect?(index: number): void }) => {}),
     alertAddCharacter: vi.fn(async () => 'createfromScratch'),
     alertError: vi.fn(),
     alertToast: vi.fn(),
@@ -61,20 +62,17 @@ vi.mock('./storage/database.svelte', () => ({
         mocks.database.characters[index] = character
     },
 }))
-vi.mock('./alert', async () => {
-    const { writable } = await import('svelte/store')
-    return {
-        alertAddCharacter: mocks.alertAddCharacter,
-        alertConfirm: mocks.alertConfirm,
-        alertCheckboxConfirm: async (options: unknown) => ({ confirmed: await mocks.alertConfirm(options), checked: true }),
-        alertError: mocks.alertError,
-        alertToast: mocks.alertToast,
-        alertNormal: vi.fn(),
-        alertSelect: mocks.alertSelect,
-        alertStore: writable({ type: 'none', msg: '' }),
-        alertWait: vi.fn(),
-    }
-})
+vi.mock('./alert', () => ({
+    alertAddCharacter: mocks.alertAddCharacter,
+    alertConfirm: mocks.alertConfirm,
+    alertCheckboxConfirm: async (options: unknown) => ({ confirmed: await mocks.alertConfirm(options), checked: true }),
+    alertError: mocks.alertError,
+    alertToast: mocks.alertToast,
+    alertNormal: vi.fn(),
+    alertSelect: mocks.alertSelect,
+    alertStore: { set: mocks.presentAlert },
+    alertWait: vi.fn(),
+}))
 vi.mock('./util', () => ({
     checkNullish: (value: unknown) => value === null || value === undefined,
     findCharacterbyId: mocks.findCharacterbyId,
@@ -165,7 +163,6 @@ import { PersistentMutationFencedError } from './storage/saveCoordinator'
 import { MobileGUIStack, OpenRealmStore, selectedCharID } from './stores.svelte'
 import { doingChat } from './process/index.svelte'
 import { translateHTML } from './translator/translator'
-import { alertStore } from './alert'
 import { createConversationSummaryStub } from './storage/conversationResidency'
 import {
     beginNavigationActivity,
@@ -1502,8 +1499,8 @@ describe('chat list operations', () => {
 
         await exportChat(0)
         if (mode === '3') {
-            const offer = get(alertStore) as { msg: string, onSelect(index: number): void }
-            offer.onSelect(offer.msg.split('||').findIndex(choice => choice.endsWith('(.html)')))
+            const offer = mocks.presentAlert.mock.lastCall![0]
+            offer.onSelect!(offer.msg.split('||').findIndex(choice => choice.endsWith('(.html)')))
         }
 
         const exported = await vi.waitFor(() => Buffer.from(mocks.downloadFile.mock.calls[0][1]).toString())
