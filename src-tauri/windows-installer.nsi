@@ -605,6 +605,10 @@ Function .onInit
       ${EndIf}
     ${EndIf}
     ReadRegStr $0 SHCTX "${UNINSTKEY}" "DisplayVersion"
+    !ifmacrodef NSIS_HOOK_INSTALLED_VERSION
+      ; Replaces $0 with the version of the files in $INSTDIR when they can change without this installer.
+      !insertmacro NSIS_HOOK_INSTALLED_VERSION
+    !endif
     StrCpy $ExistingVersionRelation "unknown"
     ${If} $0 != ""
       ; The plugin ranks invalid versions below valid ones, including an empty string.

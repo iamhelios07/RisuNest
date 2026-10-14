@@ -42,12 +42,10 @@ SectionEnd
 });
 import { readFileSync, mkdirSync } from 'node:fs';
 
-test('Sync NSIS preserves data by default, protects updates, and aborts before binary removal on cleanup failure', { skip }, () => {
-  const directory = mkdtempSync(join(tmpdir(), 'risunest-sync-nsis-runtime-'));
-  const q = value => value.replaceAll('$', '$$').replaceAll('"', '$\\"');
-  try {
-    const stubSource = join(directory, 'manager.rs');
-    writeFileSync(stubSource, String.raw`
+const q = value => value.replaceAll('$', '$$').replaceAll('"', '$\\"');
+function buildManagerStub(directory) {
+  const stubSource = join(directory, 'manager.rs');
+  writeFileSync(stubSource, String.raw`
 use std::{env, fs, io::Write};
 fn main() {
  let mut root=env::current_exe().unwrap().parent().unwrap().to_path_buf();
@@ -74,11 +72,22 @@ fn main() {
  }
 }
 `);
-    const binary = join(directory, 'manager.exe');
-    const built = spawnSync('rustc', ['--edition=2021', stubSource, '-o', binary], { encoding: 'utf8', timeout: 60000, windowsHide: true });
-    assert.equal(built.status, 0, built.stderr);
-    const hook = join(directory, 'hook.nsh');
-    writeFileSync(hook, readFileSync(resolve('server/manager/install/windows.nsh'), 'utf8').replaceAll('$LOCALAPPDATA', '$INSTDIR\\local').replace(/!include [^\r\n]+windows-common.nsh"/, `!include "${resolve('src-tauri/windows-common.nsh')}"`));
+  const binary = join(directory, 'manager.exe');
+  const built = spawnSync('rustc', ['--edition=2021', stubSource, '-o', binary], { encoding: 'utf8', timeout: 60000, windowsHide: true });
+  assert.equal(built.status, 0, built.stderr);
+  return binary;
+}
+function writeManagerHook(directory) {
+  const hook = join(directory, 'hook.nsh');
+  writeFileSync(hook, readFileSync(resolve('server/manager/install/windows.nsh'), 'utf8').replaceAll('$LOCALAPPDATA', '$INSTDIR\\local').replace(/!include [^\r\n]+windows-common.nsh"/, `!include "${resolve('src-tauri/windows-common.nsh')}"`));
+  return hook;
+}
+
+test('Sync NSIS preserves data by default, protects updates, and aborts before binary removal on cleanup failure', { skip }, () => {
+  const directory = mkdtempSync(join(tmpdir(), 'risunest-sync-nsis-runtime-'));
+  try {
+    const binary = buildManagerStub(directory);
+    const hook = writeManagerHook(directory);
     const script = join(directory, 'installer.nsi');
     writeFileSync(script, String.raw`
 Unicode true
@@ -233,6 +242,62 @@ SectionEnd
       const result = spawnSync(join(directory, 'installer.exe'), ['/S', `/D=${requested}`], { timeout: 30000, windowsHide: true });
       assert.equal(result.status, 0);
       assert.equal(readFileSync(join(directory, 'checked-path'), 'utf8'), join(expected, 'SyntheticSync.exe'));
+    }
+  } finally {
+    assert.equal(dirname(directory), resolve(tmpdir()));
+    rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
+
+const setupScript = (directory, hook, body) => String.raw`
+Unicode true
+RequestExecutionLevel user
+SilentInstall silent
+OutFile "${q(join(directory, 'installer.exe'))}"
+!include LogicLib.nsh
+!include FileFunc.nsh
+LoadLanguageFile "${'$'}{NSISDIR}\Contrib\Language files\English.nlf"
+LoadLanguageFile "${'$'}{NSISDIR}\Contrib\Language files\Korean.nlf"
+!define MAINBINARYNAME "SyntheticSync"
+!define PRODUCTNAME "Synthetic Sync"
+!macro CheckIfAppIsRunning executable product
+!macroend
+!include "${q(hook)}"
+Section
+${body}
+SectionEnd
+`;
+
+test('Sync setup compares against the version in the installed bundle marker', { skip }, () => {
+  const directory = mkdtempSync(join(tmpdir(), 'risunest-sync-nsis-version-'));
+  try {
+    const script = join(directory, 'installer.nsi');
+    writeFileSync(script, setupScript(directory, writeManagerHook(directory), String.raw`
+StrCpy $0 "registry"
+!insertmacro NSIS_HOOK_INSTALLED_VERSION
+FileOpen $1 "$INSTDIR\installed-version" w
+FileWrite $1 $0
+FileClose $1`));
+    const compiled = spawnSync(compiler, ['/V2', script], { encoding: 'utf8', timeout: 30000, windowsHide: true });
+    assert.equal(compiled.status, 0, `${compiled.stdout}\n${compiled.stderr}`);
+    const generated = {
+      schema: 'risunest-sync-bundle/v1', product: 'sync', variant: 'managed', version: '1.0.7', protocolId: 'synthetic', storeFormatId: 'synthetic',
+      files: ['risunest-sync-manager.exe'], vendor: [{ name: 'cloudflared', version: '2025.8.1', path: 'cloudflared.exe' }],
+    };
+    for (const [name, marker, expected] of [
+      ['generated', `${JSON.stringify(generated, null, 2)}\n`, '1.0.7'],
+      ['compact', JSON.stringify(generated), '1.0.7'],
+      ['spaced', '{"schema": "version", "version" :\t"1.0.8"}', '1.0.8'],
+      ['missing', undefined, 'registry'],
+      ['unversioned', `${JSON.stringify({ ...generated, version: undefined }, null, 2)}\n`, 'registry'],
+      ['numeric', '{"version": 107}', 'registry'],
+      ['empty', '{"version": ""}', 'registry'],
+    ]) {
+      const location = join(directory, name);
+      mkdirSync(location);
+      if (marker !== undefined) writeFileSync(join(location, 'risunest-sync-bundle.json'), marker);
+      assert.equal(spawnSync(join(directory, 'installer.exe'), ['/S', `/D=${location}`], { timeout: 30000, windowsHide: true }).status, 0);
+      assert.equal(readFileSync(join(location, 'installed-version'), 'utf8'), expected, name);
     }
   } finally {
     assert.equal(dirname(directory), resolve(tmpdir()));

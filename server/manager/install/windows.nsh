@@ -89,6 +89,80 @@ Var SyncDeleteMode
 Var SyncDiagnostic
 Var SyncPreviousInstall
 
+!macro SyncSkipMarkerBlanks
+  ${Do}
+    StrCpy $3 $1 1 $2
+    ${If} $3 != " "
+    ${AndIf} $3 != "$\t"
+      ${Break}
+    ${EndIf}
+    IntOp $2 $2 + 1
+  ${Loop}
+!macroend
+
+; Archive updates replace the program files without the uninstall entry, so the bundle marker
+; carries the installed version. The generated marker writes the bundle's "version" key before
+; "vendor", the only key holding nested versions. Leaves $0 unchanged when the marker cannot be
+; read. Uses $1-$6.
+!macro NSIS_HOOK_INSTALLED_VERSION
+  ClearErrors
+  FileOpen $5 "$INSTDIR\risunest-sync-bundle.json" r
+  ${IfNot} ${Errors}
+    StrCpy $6 0
+    ${Do}
+      ClearErrors
+      FileRead $5 $1
+      ${If} ${Errors}
+        ${Break}
+      ${EndIf}
+      StrCpy $2 0
+      ${Do}
+        StrCpy $3 $1 1 $2
+        ${If} $3 == ""
+          ${Break}
+        ${EndIf}
+        StrCpy $4 $1 9 $2
+        StrCpy $3 $1 8 $2
+        IntOp $2 $2 + 1
+        ${If} $4 S== '"version"'
+          IntOp $2 $2 + 8
+        ${ElseIf} $3 S== '"vendor"'
+          IntOp $2 $2 + 7
+        ${Else}
+          ${Continue}
+        ${EndIf}
+        !insertmacro SyncSkipMarkerBlanks
+        ${If} $3 == ":"
+          StrCpy $6 1
+          ${If} $4 S== '"version"'
+            IntOp $2 $2 + 1
+            !insertmacro SyncSkipMarkerBlanks
+            ${If} $3 == '"'
+              StrCpy $4 ""
+              ${Do}
+                IntOp $2 $2 + 1
+                StrCpy $3 $1 1 $2
+                ${If} $3 == '"'
+                  ${If} $4 != ""
+                    StrCpy $0 $4
+                  ${EndIf}
+                  ${Break}
+                ${ElseIf} $3 == ""
+                  ${Break}
+                ${EndIf}
+                StrCpy $4 "$4$3"
+              ${Loop}
+            ${EndIf}
+          ${EndIf}
+          ${Break}
+        ${EndIf}
+      ${Loop}
+    ${LoopUntil} $6 = 1
+    FileClose $5
+  ${EndIf}
+  ClearErrors
+!macroend
+
 !macro NSIS_HOOK_PREINSTALL
   SetDetailsPrint both
   StrCpy $SyncPreviousInstall $ExistingNsis

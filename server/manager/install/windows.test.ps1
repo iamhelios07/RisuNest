@@ -342,6 +342,9 @@ path = "main.rs"
             }
             $released = Join-Path $testRoot 'released'
             Expand-Archive -LiteralPath $ReleasedBundle -DestinationPath $released
+            $releasedVersion = [string](Get-Content (Join-Path $released 'risunest-sync-bundle.json') -Raw | ConvertFrom-Json).version
+            if ($releasedVersion -notmatch '^(\d+)\.(\d+)\.(\d+)$') { throw "Unexpected released Sync version: $releasedVersion." }
+            $nextVersion = "$($Matches[1]).$($Matches[2]).$([int]$Matches[3] + 1)"
             $syncInstall = Join-Path $testRoot 'released Sync installation'
             Copy-Item $released $syncInstall -Recurse
             Copy-Item $fake (Join-Path $syncInstall 'uninstall.exe')
@@ -371,7 +374,7 @@ path = "main.rs"
                 Set-Item -Path $productKey -Value $syncInstall
                 New-Item -Path $uninstallKey -Force | Out-Null
                 Set-ItemProperty $uninstallKey UninstallString "`"$syncInstall\uninstall.exe`""
-                Set-ItemProperty $uninstallKey DisplayVersion '1.0.3'
+                Set-ItemProperty $uninstallKey DisplayVersion $releasedVersion
 
                 $next = Join-Path $project 'next-bundle'
                 Copy-Item $released $next -Recurse
@@ -388,6 +391,7 @@ path = "main.rs"
                 $syncHook = "!define SYNC_INSTALLER_MANAGER `"$ManagerBinary`"`n!define SYNC_INSTALLER_BACKGROUND `"$BackgroundBinary`"`n" + $syncHook
                 $syncHookPath = Join-Path $project 'sync-hooks.nsh'
                 $syncHook | Set-Content -Encoding utf8 $syncHookPath
+                $config.version = $nextVersion
                 $config.bundle.windows.nsis.installerHooks = $syncHookPath
                 $config.bundle.windows.nsis.compression = 'zlib'
                 $resources = @{}
@@ -412,6 +416,14 @@ Function un.onUninstFailed
 FunctionEnd
 "@
                 $syncFixture = Compile-Template 'released-upgrade' $syncGenerated
+                # Archive updates leave DisplayVersion behind, so setup compares against the installed bundle marker.
+                $installedMarker = Join-Path $syncInstall 'risunest-sync-bundle.json'
+                $markerText = [IO.File]::ReadAllText($installedMarker)
+                [IO.File]::WriteAllText($installedMarker, ([regex]'"version":\s*"[^"]*"').Replace($markerText, '"version": "9.0.0"', 1))
+                try {
+                    Run-Installer $syncFixture @('/S', '/NS') 1
+                } finally { [IO.File]::WriteAllText($installedMarker, $markerText) }
+                if ((Get-ItemProperty $uninstallKey).DisplayVersion -ne $releasedVersion) { throw 'A refused downgrade changed the installation.' }
                 Run-Installer $syncFixture @('/S', '/NS') 0
                 if ((Get-FileHash (Join-Path $data 'risunest-sync-instance.json')).Hash -ne $before) { throw 'Upgrade changed instance ownership.' }
                 Invoke-Manager @('status')
@@ -419,7 +431,7 @@ FunctionEnd
                 Run-Installer (Join-Path $syncInstall 'uninstall.exe') @('/S', "_?=$syncInstall") 0
                 if (Test-Path $oldManager) { throw 'Updated released bundle could not be removed normally.' }
                 if (!(Test-Path (Join-Path $data 'metadata.sqlite'))) { throw 'Normal removal deleted server data.' }
-                Write-Output 'Released Sync 1.0.3 running-server upgrade and normal removal passed.'
+                Write-Output "Released Sync $releasedVersion running-server upgrade and normal removal passed."
                 Run-Installer $syncFixture @('/S', '/NS', "/D=$syncInstall") 0
                 Invoke-Manager @('installer', 'forget-removal')
                 $unowned = Join-Path $syncInstall 'user-owned.txt'
@@ -482,7 +494,8 @@ FunctionEnd
         foreach ($key in @($uninstallKey, $productKey)) {
             if (Test-Path -LiteralPath $key) { Remove-Item -LiteralPath $key -Recurse }
         }
-        Remove-Item -LiteralPath $fixtureBinary, $fixtureInstaller -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $fixtureBinary -ErrorAction SilentlyContinue
+        Get-ChildItem -LiteralPath $bundleRoot -Filter "${product}_*-setup.exe" -ErrorAction SilentlyContinue | Remove-Item -ErrorAction SilentlyContinue
     }
 }
 finally {
