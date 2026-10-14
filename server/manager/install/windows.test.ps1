@@ -172,12 +172,23 @@ path = "main.rs"
         $env:CARGO_TARGET_DIR = $priorTarget
         Pop-Location
     }
-    $generatedRoot = Join-Path $sharedTarget 'release/nsis/x64'
+    # Tauri bundles for the host architecture, so the fixtures follow it on x64 and ARM64 runners.
+    $bundleRoot = Join-Path $sharedTarget 'release/bundle/nsis'
+    $fixtureInstallers = @(Get-ChildItem -LiteralPath $bundleRoot -Filter "${product}_1.0.4_*-setup.exe")
+    if ($fixtureInstallers.Count -ne 1) { throw "Expected one generated installer for $product, found $($fixtureInstallers.Count)." }
+    $fixtureInstaller = $fixtureInstallers[0].FullName
+    $arch = [regex]::Match($fixtureInstallers[0].Name, '_1\.0\.4_(x64|arm64)-setup\.exe$').Groups[1].Value
+    if (!$arch) { throw "Unexpected generated installer name: $($fixtureInstallers[0].Name)." }
+    $generatedRoot = Join-Path $sharedTarget "release/nsis/$arch"
     $generated = [IO.File]::ReadAllText((Join-Path $generatedRoot 'installer.nsi'))
     $installed = Join-Path $testRoot 'manual upgrade with spaces'
     $uninstallKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$product"
     $productKey = "HKCU:\Software\$publisher\$product"
-    $fixtureInstaller = Join-Path $sharedTarget "release/bundle/nsis/${product}_1.0.4_x64-setup.exe"
+    function Set-Architecture([string]$source, [string]$value) {
+        $define = "!define ARCH `"$arch`""
+        if (!$source.Contains($define)) { throw 'The generated template does not define its package architecture.' }
+        return $source.Replace($define, "!define ARCH `"$value`"")
+    }
     function Run-Installer([string]$executable, [string[]]$arguments, [int]$expected) {
         $process = Start-Process -FilePath $executable -ArgumentList $arguments -PassThru -WindowStyle Hidden
         if (!$process.WaitForExit(30000)) {
@@ -261,12 +272,12 @@ path = "main.rs"
         }
         Remove-Item Env:RISUNEST_NSIS_CONFIRM
         Set-ItemProperty $uninstallKey DisplayVersion '1.0.3'
-        $otherArch = Compile-Template 'wrong-architecture' ($generated.Replace('!define ARCH "x64"', '!define ARCH "arm64"'))
+        $otherArch = Compile-Template 'wrong-architecture' (Set-Architecture $generated $(if ($arch -eq 'x64') { 'arm64' } else { 'x64' }))
         Run-Installer $otherArch @('/S', '/NS') 1
         if ((Get-ItemProperty $uninstallKey).DisplayVersion -ne '1.0.3') { throw 'Architecture rejection occurred after changing the installation.' }
         # Substitute only native-architecture detection to exercise ARM64-host decisions on x64 CI.
         $armHost = $generated.Replace('${If} ${IsNativeAMD64}', '${If} 0 = 1').Replace('${ElseIf} ${IsNativeARM64}', '${ElseIf} 1 = 1')
-        $x64OnArm = Compile-Template 'x64-on-arm64' $armHost
+        $x64OnArm = Compile-Template 'x64-on-arm64' (Set-Architecture $armHost 'x64')
         Run-Installer $x64OnArm @('/S', '/NS') 1
         $armOnArm = Compile-Template 'arm64-on-arm64' ($armHost.Replace('!define ARCH "x64"', '!define ARCH "arm64"'))
         Run-Installer $armOnArm @('/S', '/NS') 0
