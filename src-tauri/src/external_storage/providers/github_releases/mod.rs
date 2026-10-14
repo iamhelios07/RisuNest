@@ -1002,7 +1002,10 @@ impl Provider for GithubReleases {
             let first_tag = context.tag(&batch, 0);
             let prefix = first_tag.strip_suffix('0').ok_or_else(corrupt)?;
             let mut found = None;
-            for page in 1..=api::MAX_RELEASE_SCAN_PAGES {
+            // A match is only unique after every release page has been checked.
+            let mut page = 1;
+            loop {
+                cancel.check()?;
                 let releases = self.releases_page(context, page, cancel).await?;
                 let complete = releases.len() < api::RELEASE_PAGE_SIZE;
                 for release in releases {
@@ -1017,8 +1020,8 @@ impl Provider for GithubReleases {
                     found = Some(Self::receipt(context, &release.tag_name, release.id, &asset, intent));
                 }
                 if complete { return Ok(found); }
+                page = page.checked_add(1).ok_or_else(|| ProviderError::new(ErrorKind::Transient))?;
             }
-            Err(ProviderError::new(ErrorKind::Transient))
         })
     }
 

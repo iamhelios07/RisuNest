@@ -158,31 +158,97 @@ fn existing_repository_replies() -> Vec<Reply> {
 #[test]
 fn inventory_lookup_finds_later_releases_after_gaps_and_rejects_duplicates() {
     runtime().block_on(async {
-        for duplicate in [false, true] {
+        for (early, late) in [(true, false), (false, true), (false, false), (true, true)] {
+            for (last_page, full_last_page) in [
+                (api::MAX_RELEASE_SCAN_PAGES, true),
+                (api::MAX_RELEASE_SCAN_PAGES + 1, false),
+                (api::MAX_RELEASE_SCAN_PAGES + 1, true),
+            ] {
+                let bytes = b"inventory-payload";
+                let mut replies = existing_repository_replies();
+                for page in 1..=last_page {
+                    let count = if page == last_page && !full_last_page { 1 } else { api::RELEASE_PAGE_SIZE };
+                    let mut releases: Vec<_> = (0..count).map(|index| {
+                        release(u64::from(page) * 1000 + index as u64, &job_tag("other-job", index as u32))
+                    }).collect();
+                    if page == 1 || page == last_page {
+                        let (id, seq, present) = if page == 1 { (40, 9, early) } else { (41, 12, late) };
+                        releases[0] = release(id, &job_tag("job-1", seq));
+                        replies.push(reply(200, json!(releases)));
+                        replies.push(reply(200, if present {
+                            json!([asset(id + 50, "pack-object", bytes.len() as u64, Some(digest_of(bytes)))])
+                        } else { json!([]) }));
+                    } else {
+                        replies.push(reply(200, json!(releases)));
+                    }
+                }
+                if full_last_page { replies.push(reply(200, json!([]))); }
+                let server = github_server(replies);
+                let provider = adapter(dependencies().dependencies);
+                let handle = open(provider.as_ref(), &server, OpenMode::Existing).await.unwrap();
+                let intent = object_intent(&handle, ObjectRole::Pack, "object", bytes);
+                let result = provider.lookup_metadata(&handle, &intent, None, &Cancellation::default()).await;
+                match (early, late) {
+                    (true, true) => assert_eq!(result.unwrap_err().kind, ErrorKind::PreconditionFailed),
+                    (false, false) => assert!(result.unwrap().is_none()),
+                    _ => assert_eq!(result.unwrap().unwrap().locator.object, if early { "40/90" } else { "41/91" }),
+                }
+                assert!(server.requests.lock().unwrap().iter().all(|request| method_of(request) == "GET"));
+            }
+        }
+    });
+}
+
+#[test]
+fn inventory_lookup_keeps_late_failures_and_cancellation_after_finding_an_asset() {
+    runtime().block_on(async {
+        for outcome in ["transient", "rate-limited", "cancelled"] {
             let bytes = b"inventory-payload";
             let mut replies = existing_repository_replies();
-            replies.push(reply(200, json!([
-                release(40, &job_tag("job-1", 9)),
-                release(41, &job_tag("job-1", 12)),
-                release(42, &job_tag("other-job", 0)),
-            ])));
-            replies.push(reply(200, json!([asset(90, "pack-object", bytes.len() as u64, Some(digest_of(bytes)))])));
-            replies.push(reply(200, if duplicate {
-                json!([asset(91, "pack-object", bytes.len() as u64, Some(digest_of(bytes)))])
-            } else { json!([]) }));
+            for page in 1..=api::MAX_RELEASE_SCAN_PAGES {
+                let mut releases: Vec<_> = (0..api::RELEASE_PAGE_SIZE).map(|index| {
+                    release(u64::from(page) * 1000 + index as u64, &job_tag("other-job", index as u32))
+                }).collect();
+                if page == 1 { releases[0] = release(40, &job_tag("job-1", 9)); }
+                replies.push(reply(200, json!(releases)));
+                if page == 1 {
+                    replies.push(reply(200, json!([asset(90, "pack-object", bytes.len() as u64, Some(digest_of(bytes)))])));
+                }
+            }
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let (_release_tx, release_rx) = std::sync::mpsc::channel();
+            replies.push(match outcome {
+                "cancelled" => Reply::Gated { send_headers: true, ready: ready_tx, release: release_rx },
+                "rate-limited" => Reply::Http {
+                    status: 429,
+                    headers: vec![("retry-after".into(), "120".into())],
+                    body: Vec::new(),
+                },
+                _ => reply(503, json!({})),
+            });
             let server = github_server(replies);
             let provider = adapter(dependencies().dependencies);
             let handle = open(provider.as_ref(), &server, OpenMode::Existing).await.unwrap();
             let intent = object_intent(&handle, ObjectRole::Pack, "object", bytes);
-            let result = provider.lookup_metadata(&handle, &intent, None, &Cancellation::default()).await;
-            if duplicate {
-                assert_eq!(result.unwrap_err().kind, ErrorKind::PreconditionFailed);
-            } else {
-                assert_eq!(result.unwrap().unwrap().locator.object, "40/90");
-            }
-            let requests = server.requests.lock().unwrap();
-            assert_eq!(requests.len(), 4);
-            assert!(requests.iter().all(|request| method_of(request) == "GET"));
+            let cancel = Cancellation::default();
+            let mut lookup = provider.lookup_metadata(&handle, &intent, None, &cancel);
+            let result = if outcome == "cancelled" {
+                tokio::select! {
+                    result = &mut lookup => result,
+                    ready = ready_rx => {
+                        ready.unwrap();
+                        cancel.cancel();
+                        lookup.await
+                    }
+                }
+            } else { lookup.await };
+            let error = result.unwrap_err();
+            assert_eq!(error.kind, match outcome {
+                "cancelled" => ErrorKind::Cancelled,
+                "rate-limited" => ErrorKind::RateLimited,
+                _ => ErrorKind::Transient,
+            });
+            if outcome == "rate-limited" { assert_eq!(error.retry_at_ms, Some(NOW_MS + 120_000)); }
         }
     });
 }
