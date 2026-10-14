@@ -11,7 +11,7 @@ use super::{
 use crate::persistent_store::{
     commands::PersistentStoreState,
     external_apply::{ExternalSnapshotApplication, ExternalSnapshotObject, ExternalSnapshotRecord},
-    lww::StagingProgress,
+    lww::{StagingObserver, StagingProgress},
     PersistentStore, StoreError,
 };
 use crate::native_log::logged;
@@ -703,6 +703,7 @@ fn stage_original_backup_controls(
     snapshot:&PreparedRemoteSnapshot,
     units:&snapshot_restore::OriginalUnits,
     cancel:&Cancellation,
+    report:&dyn Fn(Option<StagingProgress>),
 ) -> Result<()> {
     use crate::persistent_store::external_capture::{original_unit_control_lengths,streamed_unit_dependency_inventory,BackupBodyRole};
     let content=super::content_store::ContentStore::open(&snapshot.staging_root.join("external-storage")).map_err(pds_error)?;
@@ -722,18 +723,22 @@ fn stage_original_backup_controls(
     };
     let size=|hash:&str| Ok(declared.get(hash).map(|object| object.byte_length));
     let probe=runtime::CancelProbe(cancel.clone());
+    let mut emit=|progress:StagingProgress| -> crate::persistent_store::StoreResult<()> {report(Some(progress));Ok(())};
+    let mut progress=StagingObserver::new(&mut emit);
+    // Both passes read every unit, so one share counts the units twice.
+    progress.begin("read",Some(units.count()?.saturating_mul(2))).map_err(pds_error)?;
     // Nothing above the bound is read here. Message pages and large unit
     // bodies are read once, in the second pass, at the lengths their
     // manifests and the snapshot declare.
     let mut failure=None;
-    let metadata=original_unit_control_lengths(store_units(units,&content,&mut failure),
+    let metadata=original_unit_control_lengths(store_units(units,&content,&mut failure).map(|unit| {progress.advance()?;unit}),
         &|hash| read(hash,risunest_sync_wire::MAX_METADATA_BYTES as u64),
         &size,&size,&probe);
     cancel.check()?;
     if let Some(failure)=failure.take() {return Err(failure)}
     let metadata=metadata.map_err(pds_error)?;
     let mut spool=super::capture::BackupDependencySpool::new(&snapshot.staging_root.join("verified-original-controls")).map_err(pds_error)?;
-    let inventory=streamed_unit_dependency_inventory(store_units(units,&content,&mut failure),
+    let inventory=streamed_unit_dependency_inventory(store_units(units,&content,&mut failure).map(|unit| {progress.advance()?;unit}),
         &|hash| match metadata.controls.get(hash) {Some(length)=>read(hash,*length),None=>Ok(None)},
         &size,&probe,true,&mut |hash,bytes,role| Ok(spool.push(hash,bytes,role)?),
     );
@@ -743,10 +748,12 @@ fn stage_original_backup_controls(
     if !inventory.spooled_payloads.is_empty() {return Err(corrupt())}
     cancel.check()?;
     spool.seal().map_err(pds_error)?;
+    progress.begin("copy",Some(spool.count().map_err(pds_error)?)).map_err(pds_error)?;
     let result=spool.visit(&mut |hash,bytes,role| {
         if cancel.check().is_err() {return Err(StoreError::Validation{message:"External restore cancelled".into()})}
         if role != BackupBodyRole::Control {return Err(StoreError::Validation{message:"Backup control role differs".into()})}
-        store.lww_put_object(hash,bytes)
+        store.lww_put_object(hash,bytes)?;
+        progress.advance()
     });
     cancel.check()?;
     result.map_err(pds_error)
@@ -837,7 +844,9 @@ fn prepare_local_restore_in_store(
     if store.revision().map_err(pds_error)? != expected_revision {
         return Err(ProviderError::new(ErrorKind::PreconditionFailed));
     }
-    stage_original_backup_controls(store,&snapshot,&original_units,&cancel)?;
+    stage_original_backup_controls(store,&snapshot,&original_units,&cancel,report)?;
+    // The steps up to the snapshot application report no share.
+    report(None);
     JobStore::open(&root)?.freeze_restore_bodies(job,&sources,&present)?;
     // A catalog row needs its body or its remote source, so the sources are registered first.
     super::lww_residency::register_verified_packed_many(store.repository_root(),&sources)?;
@@ -901,7 +910,7 @@ fn prepare_local_restore_in_store(
     } else {
         None
     };
-    // Only the snapshot application reports a share; the steps after it do not.
+    // The steps after the snapshot application report no share.
     report(None);
 
     // Preparing every selected section before touching the device file keeps a
@@ -1120,9 +1129,9 @@ pub(super) mod tests {
         invalid.dependency_root=Some("ab".repeat(32));
         invalid_units.insert(UnitKey::new(&["z-future-unit","missing-tree"]).unwrap(),UnitValue::object(invalid).unwrap());
         let (invalid_units,units)=(snapshot_restore::OriginalUnits::staged(&mut content,&invalid_units),snapshot_restore::OriginalUnits::staged(&mut content,&units));
-        assert!(stage_original_backup_controls(&mut store,&snapshot,&invalid_units,&Cancellation::default()).is_err());
+        assert!(stage_original_backup_controls(&mut store,&snapshot,&invalid_units,&Cancellation::default(),&|_|{}).is_err());
         assert!(store.lww_object_body(&manifest.hash).unwrap().is_none());
-        stage_original_backup_controls(&mut store,&snapshot,&units,&Cancellation::default()).unwrap();
+        stage_original_backup_controls(&mut store,&snapshot,&units,&Cancellation::default(),&|_|{}).unwrap();
         assert_eq!(store.lww_object_body(&manifest.hash).unwrap(),Some(manifest.bytes));
     }
 
@@ -1138,7 +1147,7 @@ pub(super) mod tests {
         snapshot.objects.push(snapshot_restore::PreparedObject {content_hash:body.content_hash.clone(),byte_length:body.byte_size,source:super::super::content_store::ObjectSource::Library(body.content_hash)});
         let units=snapshot_restore::OriginalUnits::staged(&mut super::super::content_store::ContentStore::open(&snapshot.staging_root.join("external-storage")).unwrap(),&units);
         crate::asset_repository::body_io::reset_body_io();
-        stage_original_backup_controls(&mut store,&snapshot,&units,&Cancellation::default()).unwrap();
+        stage_original_backup_controls(&mut store,&snapshot,&units,&Cancellation::default(),&|_|{}).unwrap();
         let observed=crate::asset_repository::body_io::take_body_io();
         assert!(observed.complete());
         assert_eq!(observed.asset_work(),Default::default());
@@ -1164,10 +1173,10 @@ pub(super) mod tests {
         content.commit().unwrap();
         let mut unit=|key:&[&str],bytes:&[u8]| snapshot_restore::OriginalUnits::staged(&mut content,&std::collections::BTreeMap::from([(UnitKey::new(key).unwrap(),UnitValue::object(RecordDescriptor::content(risunest_sync_wire::hash(bytes))).unwrap())]));
         let (padded_units,body_units)=(unit(&["root","additionalPrompt"],&padded),unit(&["root","additionalPrompt"],&body));
-        assert!(stage_original_backup_controls(&mut store,&snapshot,&padded_units,&Cancellation::default()).is_err());
+        assert!(stage_original_backup_controls(&mut store,&snapshot,&padded_units,&Cancellation::default(),&|_|{}).is_err());
         assert!(store.lww_object_body(&risunest_sync_wire::hash(&body)).unwrap().is_none());
         crate::persistent_store::hash_work::reset_hash_work();
-        stage_original_backup_controls(&mut store,&snapshot,&body_units,&Cancellation::default()).unwrap();
+        stage_original_backup_controls(&mut store,&snapshot,&body_units,&Cancellation::default(),&|_|{}).unwrap();
         let work=crate::persistent_store::hash_work::take_hash_work();
         assert_eq!(work.domains["native_backup_large_unit_source"].calls,1);
         assert!(store.lww_object_body(&risunest_sync_wire::hash(&body)).unwrap()==Some(body));
@@ -1922,7 +1931,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn a_restore_reports_each_snapshot_application_phase_and_ends_the_share_before_the_device_steps() {
+    fn a_restore_reports_each_counted_preparation_step_and_clears_the_share_between_them() {
         run(async {
             let backup=packaged_backup_seeded(&[vec![53;4096]],|store|{
                 let staging=store.replace_begin().unwrap().staging_id;
@@ -1936,23 +1945,26 @@ pub(super) mod tests {
             let mut store=PersistentStore::open(root).unwrap();
             let job=admit(root,&store,&backup);
             let (database,sections)=prepare_database_first_backup(root,&backup.connected,&job,&Cancellation::default()).await.unwrap();
-            let (objects,records)=(database.snapshot.objects.len() as u64,database.snapshot.records.len() as u64);
-            assert!(objects>0 && records>0);
+            let (units,objects,records)=(database.original_units.count().unwrap(),database.snapshot.objects.len() as u64,database.snapshot.records.len() as u64);
+            assert!(units>0 && objects>0 && records>0);
             let seen=std::cell::RefCell::new(Vec::new());
             let admission=std::sync::Arc::new(crate::native_file_jobs::admission::Admission::default());
             activate_database_first_backup_observed(&mut store,&PersistentStoreState::default(),&job,database,sections,Cancellation::default(),
                 admission.staging().unwrap(),&|progress:Option<StagingProgress>| seen.borrow_mut().push(progress.map(|progress|(progress.phase,progress.done,progress.total)))).unwrap();
             let seen=seen.into_inner();
-            // Each phase is one bar that fills to the count its input declares.
+            // The steps between and after the counted ones clear the share instead of keeping a full bar.
+            let mut steps=seen.iter().map(|progress|progress.map(|(phase,..)|phase)).collect::<Vec<_>>();
+            steps.dedup();
+            assert_eq!(steps,[Some("read"),Some("copy"),None,Some("validate"),Some("project"),None]);
+            assert_eq!(seen.iter().filter(|progress|progress.is_none()).count(),2);
+            // Each phase is one bar that fills to the count its input declares; both control passes read every unit.
             let mut phases=seen.iter().flatten().map(|&(phase,_,total)|(phase,total)).collect::<Vec<_>>();
             phases.dedup();
-            assert_eq!(phases,[("validate",Some(objects)),("project",Some(records))]);
+            assert!(matches!(phases[1],("copy",Some(controls)) if controls>0),"{phases:?}");
+            assert_eq!([phases[0],phases[2],phases[3]],[("read",Some(2*units)),("validate",Some(objects)),("project",Some(records))]);
             for (phase,total) in phases {
                 assert_eq!(seen.iter().flatten().rev().find(|(name,..)|*name==phase).map(|&(_,done,_)|done),total,"{phase}");
             }
-            // The share ends once, before the steps that follow report nothing.
-            assert_eq!(seen.last(),Some(&None));
-            assert_eq!(seen.iter().filter(|progress|progress.is_none()).count(),1);
         });
     }
 

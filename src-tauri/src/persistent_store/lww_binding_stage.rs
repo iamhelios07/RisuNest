@@ -31,21 +31,21 @@ pub(crate) struct StagingProgress {
     pub total: Option<u64>,
 }
 
-pub(in crate::persistent_store) struct StagingObserver<'a> {
+pub(crate) struct StagingObserver<'a> {
     emit: &'a mut dyn FnMut(StagingProgress) -> StoreResult<()>,
     progress: StagingProgress,
     updated: std::time::Instant,
 }
 
 impl<'a> StagingObserver<'a> {
-    pub(in crate::persistent_store) fn new(emit: &'a mut dyn FnMut(StagingProgress) -> StoreResult<()>) -> Self {
+    pub(crate) fn new(emit: &'a mut dyn FnMut(StagingProgress) -> StoreResult<()>) -> Self {
         Self { emit, progress: StagingProgress { phase: "read", done: 0, total: None }, updated: std::time::Instant::now() }
     }
-    pub(in crate::persistent_store) fn begin(&mut self, phase: &'static str, total: Option<u64>) -> StoreResult<()> {
+    pub(crate) fn begin(&mut self, phase: &'static str, total: Option<u64>) -> StoreResult<()> {
         self.progress = StagingProgress { phase, done: 0, total };
         self.flush()
     }
-    pub(in crate::persistent_store) fn advance(&mut self) -> StoreResult<()> {
+    pub(crate) fn advance(&mut self) -> StoreResult<()> {
         self.progress.done += 1;
         if self.progress.total == Some(self.progress.done) { self.flush() } else { self.poll() }
     }
