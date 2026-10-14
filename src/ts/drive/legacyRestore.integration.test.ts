@@ -4,6 +4,8 @@ import type { BlobMetadata, BlobWriteMetadata } from 'src/ts/storage/blobStore'
 import type { Database } from 'src/ts/storage/database.svelte'
 import type { CommittedApplyOutcome, PersistentDataRuntime } from 'src/ts/storage/persistentDataRuntime'
 import { File } from 'node:buffer'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { encodeRisuSaveLegacy } from 'src/ts/storage/risuSave'
 import { risuSaveFixtureDatabase } from 'src/ts/storage/tests/risuSaveFixtures'
 import { encodeBackupInlayEntry, getBackupInlayName } from 'src/ts/drive/backupAssets'
@@ -78,6 +80,17 @@ afterEach(() => {
 })
 
 describe('legacy WebView restore integrity', () => {
+    it.each(['v1.10.0', 'v1.12.0', 'v1.14.0'])('preserves Voyage Context 4 settings from a PocketRisu %s backup', async (version) => {
+        const archive = readFileSync(resolve(`src-tauri/src/native_file_jobs/legacy_backup/fixtures/pocket-risu-${version}.bin`))
+        let restored: Database | undefined
+        state.replace.mockImplementationOnce(async (database) => {
+            restored = database
+            return { kind: 'committed', revision: 2, projection: 'applied' }
+        })
+        await restore(archive)
+        expect(restored).toMatchObject({ hypaModel: 'voyageContext4', voyageApiKey: 'synthetic-voyage-key' })
+    })
+
     it('restores an extensionless PocketRisu JSON inlay after the replacement handshake', async () => {
         const payload = new TextEncoder().encode(JSON.stringify({
             name: 'old.png', data: 'data:image/png;base64,CQgH', ext: 'png', type: 'image', width: 3, height: 1,
