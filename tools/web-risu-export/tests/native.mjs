@@ -14,14 +14,14 @@ const output = path.join(root, '.tmp/native');
 await mkdir(output, { recursive: true });
 // A chat-shaped cold payload is restored; a referenced settings payload is skipped and restored as unavailable.
 const skippedCold = '30000000-0000-4000-8000-000000000003';
-const character = { image: 'assets/missing.png', coldstorage: coldId, chats: [{ message: [{ data: COLD_HEADER + skippedCold }] }] };
+const character = { image: 'assets/missing.png', coldstorage: coldId, chats: [{ name: 'Synthetic chat', message: [{ data: COLD_HEADER + skippedCold }] }] };
 const db = database({ character, pluginStorage: rawBlock(11, 'pluginStorage', Buffer.alloc(0)) });
 const sink = new MemorySink();
 const result = await exportBackup({
     source: fixtureSource({
         db, assets: new Map([['assets/nested/image.webp', new Uint8Array([1, 2, 3])]]),
         cold: new Map([
-            [coldId, gzipSync(Buffer.from('{"character":{"chaId":"character-1","chats":[]}}'))],
+            [coldId, gzipSync(Buffer.from(JSON.stringify({ character: { chaId: 'character-1', name: 'Synthetic', chats: character.chats } })))],
             [skippedCold, gzipSync(Buffer.from('{"settings":true}'))]
         ]),
         inlays: new Map([

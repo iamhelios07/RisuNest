@@ -3410,8 +3410,11 @@ mod tests {
                 Ok(())
             }
         }
+        // Entries are staged in the job's private directory, the only place asset payloads may be staged from.
+        let staging = directory.join("native-file-jobs").join("jobs").join(job.id());
+        fs::create_dir_all(&staging).unwrap();
         let mut restore = Restore { directory, sink, job, result: None, payloads: Value::Null };
-        crate::local_backup::parse_legacy_local_backup_v1(&mut File::open(source).unwrap(), directory, PayloadTarget::JobStaging, &mut restore, &NeverCancelled)?;
+        crate::local_backup::parse_legacy_local_backup_v1(&mut File::open(source).unwrap(), &staging, PayloadTarget::JobStaging, &mut restore, &NeverCancelled)?;
         Ok((restore.result.unwrap(), restore.payloads))
     }
 
