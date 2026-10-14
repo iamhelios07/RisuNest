@@ -503,7 +503,7 @@ fn parse_and_stage_legacy<R: Read>(
 ) -> Result<ParsedCounts, NativeJobError> {
     let remaining = reader.total.saturating_sub(reader.completed);
     if remaining > limits.max_decoded_block_bytes {
-        return Err(invalid("decoded legacy RisuSave limit exceeded"));
+        return Err(limit_error("decoded legacy RisuSave limit exceeded"));
     }
     reader.set_stage(JobStage::DecodingDatabase)?;
     let spool_directory=reader.scale.spool_directory.clone();
@@ -529,7 +529,7 @@ fn parse_and_stage_compressed_legacy<R: Read>(
 ) -> Result<ParsedCounts, NativeJobError> {
     let remaining = reader.total.saturating_sub(reader.completed);
     if remaining > limits.max_encoded_block_bytes {
-        return Err(invalid("encoded legacy RisuSave limit exceeded"));
+        return Err(limit_error("encoded legacy RisuSave limit exceeded"));
     }
     reader.set_stage(JobStage::DecodingDatabase)?;
     let spool_directory=reader.scale.spool_directory.clone();
@@ -1219,7 +1219,7 @@ fn parse_and_stage<R: Read>(
         reader.read_exact_checked(&mut length_bytes)?;
         let encoded_length = u32::from_le_bytes(length_bytes) as u64;
         if encoded_length > limits.max_encoded_block_bytes {
-            return Err(invalid(format!("encoded block limit exceeded for {name}")));
+            return Err(limit_error(format!("encoded block limit exceeded for {name}")));
         }
         if encoded_length > reader.total.saturating_sub(reader.completed) {
             return Err(truncated(format!("truncated block body for {name}")));
@@ -1477,7 +1477,7 @@ fn read_block_value<R: Read>(
     };
     if compression == 0 {
         if encoded_length > limits.max_decoded_block_bytes {
-            return Err(invalid(format!("decoded block limit exceeded for {name}")));
+            return Err(limit_error(format!("decoded block limit exceeded for {name}")));
         }
         let decoded = DecodedLimitReader::new(block, limits.max_decoded_block_bytes, job, name);
         let mut buffered = BufReader::with_capacity(READ_CHUNK_BYTES, decoded);
@@ -1577,7 +1577,7 @@ fn read_character_block<R: Read>(
     };
     if compression == 0 {
         if encoded_length > limits.max_decoded_block_bytes {
-            return Err(invalid(format!("decoded block limit exceeded for {name}")));
+            return Err(limit_error(format!("decoded block limit exceeded for {name}")));
         }
         let decoded = DecodedLimitReader::new(block, limits.max_decoded_block_bytes, job, name);
         let mut buffered = BufReader::with_capacity(READ_CHUNK_BYTES, decoded);
@@ -2688,7 +2688,7 @@ fn messagepack_error(error: rmpv::decode::Error, job: &JobControl) -> NativeJobE
     }
     let message = error.to_string();
     if message.contains("decoded block limit exceeded for legacy RisuSave") {
-        return invalid(message);
+        return limit_error(message);
     }
     if message.contains("source read failed") {
         return invalid_source(message);
@@ -2708,7 +2708,7 @@ fn messagepack_io_error(error: io::Error, job: &JobControl) -> NativeJobError {
     }
     let message = error.to_string();
     if message.contains("decoded block limit exceeded for legacy RisuSave") {
-        return invalid(message);
+        return limit_error(message);
     }
     if message.contains("source read failed") {
         return invalid_source(message);
@@ -2732,7 +2732,7 @@ fn json_error(
     }
     let message = error.to_string();
     if message.contains("decoded block limit exceeded") || message.contains("restore record limit exceeded") {
-        return invalid(message);
+        return limit_error(message);
     }
     if message.contains("source read failed") {
         return invalid_source(message);
@@ -2751,9 +2751,13 @@ fn gzip_io_error(name: &str, error: io::Error, job: &dyn RestoreControl) -> Nati
         return cancelled(format!("restore cancelled while decoding block {name}"));
     }
     if error.to_string().contains("decoded block limit exceeded") {
-        return invalid(error.to_string());
+        return limit_error(error.to_string());
     }
     corrupt(format!("invalid gzip in block {name}: {error}"))
+}
+
+fn limit_error(message: impl AsRef<str>) -> NativeJobError {
+    NativeJobError::too_large(if message.as_ref().contains("record limit") { "record" } else { "backup" }, message)
 }
 
 fn invalid(message: impl AsRef<str>) -> NativeJobError {
@@ -4414,7 +4418,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(error.code, "invalid-input");
+        assert_eq!(error.code, "payload-too-large");
         assert!(error.message.contains("decoded block limit"));
         assert_eq!(sink.store.lock().unwrap().revision().unwrap(), 1);
     }
@@ -4451,7 +4455,7 @@ mod tests {
             )
             .unwrap_err();
 
-            assert_eq!(error.code, "invalid-input");
+            assert_eq!(error.code, "payload-too-large");
             assert!(error
                 .message
                 .contains("encoded legacy RisuSave limit exceeded"));
@@ -5035,7 +5039,7 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert_eq!(error.code, "invalid-input");
+        assert_eq!(error.code, "payload-too-large");
         assert!(error.message.contains("decoded block limit"));
         assert_eq!(sink.store.lock().unwrap().revision().unwrap(), 1);
 

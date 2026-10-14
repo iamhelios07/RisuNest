@@ -584,6 +584,13 @@ impl Drop for LegacyReplacementSink {
 }
 
 fn local_backup_error(error: LocalBackupError) -> NativeJobError {
+    let item = match error.code {
+        LocalBackupErrorCode::RecordTooLarge => Some("record"),
+        LocalBackupErrorCode::DecodedBlockTooLarge => Some("backup"),
+        LocalBackupErrorCode::LengthOverflow => Some("backup-entry"),
+        _ => None,
+    };
+    if let Some(item) = item { return NativeJobError::too_large(item, error.message); }
     let code = match error.code {
         LocalBackupErrorCode::CompatibilityImportRequired => "compatibility-import-required",
         LocalBackupErrorCode::UnsupportedEncryption | LocalBackupErrorCode::UnsupportedFormat => {
@@ -979,7 +986,7 @@ fn prepare_cold_with_limits(
 ) -> Result<std::path::PathBuf, LocalBackupError> {
     let file = open_staged(entry)?;
     if entry.byte_length > limits.max_decoded_block_bytes || file.metadata().map_err(LocalBackupError::io)?.len() > limits.max_decoded_block_bytes {
-        return Err(invalid("decoded block limit exceeded for cold payload"));
+        return Err(LocalBackupError::new(LocalBackupErrorCode::DecodedBlockTooLarge, "decoded block limit exceeded for cold payload"));
     }
     let source = CancellationReader::observed(file, cancellation, observer);
     let record_bytes = restore::RecordBudget::new(limits.max_record_bytes);
@@ -994,7 +1001,7 @@ fn prepare_cold_with_limits(
                     "legacy backup job was cancelled",
                 )
             } else if error.to_string().contains("restore record limit exceeded") {
-                invalid("legacy backup cold payload exceeds the record limit")
+                LocalBackupError::new(LocalBackupErrorCode::RecordTooLarge, "legacy backup cold payload exceeds the record limit")
             } else {
                 invalid("legacy backup cold payload is invalid")
             }

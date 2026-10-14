@@ -494,6 +494,7 @@ export interface NativeFileJobStatus {
     error?: {
         code: string
         message: string
+        itemKind?: string
     }
 }
 
@@ -681,6 +682,7 @@ export class NativeFileJobError extends Error {
         readonly code: string,
         message: string,
         readonly warningCodes: string[] = [],
+        readonly itemKind?: string,
     ) {
         super(message)
         this.name = 'NativeFileJobError'
@@ -1214,7 +1216,8 @@ async function invokeNative(
             'message' in error &&
             typeof error.message === 'string'
         ) {
-            throw new NativeFileJobError(error.code, error.message)
+            throw new NativeFileJobError(error.code, error.message, [],
+                'itemKind' in error && typeof error.itemKind === 'string' ? error.itemKind : undefined)
         }
         throw error
     }
@@ -1729,6 +1732,7 @@ async function runNativeReplacementRestore(
                 : new NativeFileJobError(
                       terminal.error?.code ?? 'restore-failed',
                       terminal.error?.message ?? `${operation} failed`,
+                      [], terminal.error?.itemKind,
                   ))
         try {
             await invokeNative(dependencies, 'native_file_job_forget', {
@@ -2037,6 +2041,7 @@ async function runNativeBlockRisuSaveExportAtRevision(
         throw new NativeFileJobError(
             terminal.error?.code ?? 'export-failed',
             terminal.error?.message ?? 'Native block RisuSave export failed',
+            [], terminal.error?.itemKind,
         )
     } catch (error) {
         outcomeFailed = true
@@ -2112,6 +2117,7 @@ async function runNativeManagedExport(
             throw new NativeFileJobError(
                 terminal.error?.code ?? 'export-failed',
                 terminal.error?.message ?? `${spec.operation} failed`,
+                [], terminal.error?.itemKind,
             )
         }
         if (!terminal.result) {
@@ -2671,6 +2677,7 @@ export async function prepareNativeContentImport(
                     status.error?.code ?? 'content-prepare-failed',
                     status.error?.message ??
                         'Native content preparation failed',
+                    [], status.error?.itemKind,
                 )
                 await forgetBestEffort()
                 cleanupAttempted = true

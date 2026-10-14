@@ -26,7 +26,7 @@ impl<W: Write> Write for DecodedSizeWriter<W> {
 
 fn io_job_error(error: io::Error) -> NativeJobError {
     if error.kind() == io::ErrorKind::InvalidData && error.to_string() == DATABASE_TOO_LARGE {
-        NativeJobError::new("payload-too-large", DATABASE_TOO_LARGE)
+        NativeJobError::too_large("compatible-database", DATABASE_TOO_LARGE)
     } else {
         super::io_job_error(error)
     }
@@ -579,8 +579,8 @@ fn write_database(
     let file = writer.inner.finish().map_err(io_job_error)?;
     file.sync_all().map_err(io_job_error)?;
     if file.metadata().map_err(io_job_error)?.len() > u32::MAX as u64 {
-        return Err(NativeJobError::new(
-            "unsupported-format",
+        return Err(NativeJobError::too_large(
+            "compatible-database",
             "target .bin database entry exceeds 4 GiB limit; use a RisuNest backup",
         ));
     }
@@ -770,8 +770,8 @@ fn array_header(writer: &mut dyn Write, len: u64) -> Result<(), NativeJobError> 
 }
 fn length_header(writer: &mut dyn Write, len: u64, tag: u8) -> Result<(), NativeJobError> {
     let length = u32::try_from(len).map_err(|_| {
-        NativeJobError::new(
-            "unsupported-format",
+        NativeJobError::too_large(
+            "compatible-database",
             "target MessagePack collection exceeds 32-bit limit",
         )
     })?;

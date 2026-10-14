@@ -23,6 +23,8 @@ pub(crate) enum LocalBackupErrorCode {
     DuplicateDatabase,
     MissingDatabase,
     LengthOverflow,
+    RecordTooLarge,
+    DecodedBlockTooLarge,
     TruncatedInput,
     SourceLengthMismatch,
     Cancelled,

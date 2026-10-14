@@ -876,9 +876,18 @@ fn stage_payload(
     file: std::fs::File,
     is_cancelled: &dyn Fn() -> bool,
 ) -> StoreResult<StagedArchivePayload> {
+    stage_payload_with_limit(connection, file, is_cancelled, MAX_DECODED_ARCHIVE_BYTES)
+}
+
+fn stage_payload_with_limit(
+    connection: &Connection,
+    file: std::fs::File,
+    is_cancelled: &dyn Fn() -> bool,
+    max_decoded_bytes: u64,
+) -> StoreResult<StagedArchivePayload> {
     ensure_not_cancelled(is_cancelled)?;
     let decoder = GzDecoder::new(BufReader::new(CancellationAwareIo::new(file, is_cancelled)));
-    let mut limited = decoder.take(MAX_DECODED_ARCHIVE_BYTES.saturating_add(1));
+    let mut limited = decoder.take(max_decoded_bytes.saturating_add(1));
     let payload = {
         let mut deserializer = serde_json::Deserializer::from_reader(&mut limited);
         let payload = ArchivePayloadSeed {
@@ -886,17 +895,13 @@ fn stage_payload(
             is_cancelled,
         }
         .deserialize(&mut deserializer);
-        // A JSON failure keeps only its position, so name a cancellation here.
-        let payload = match payload {
-            Err(_) if is_cancelled() => return validation(ARCHIVE_CANCELLED_MESSAGE),
-            payload => payload?,
-        };
-        deserializer.end()?;
-        payload
+        payload.and_then(|payload| deserializer.end().map(|()| payload))
     };
+    if is_cancelled() { return validation(ARCHIVE_CANCELLED_MESSAGE); }
     if limited.limit() == 0 {
         return validation("archived character exceeds the decoded size limit");
     }
+    let payload = payload?;
     let mut compressed = limited.into_inner().into_inner();
     if !compressed.fill_buf()?.is_empty() {
         return validation("archived character has trailing compressed data");
@@ -927,6 +932,15 @@ mod decoding_tests {
         let mut padded = PAYLOAD.to_vec();
         padded.extend_from_slice(b"  ");
         assert!(decompress_bounded(&encoded(&padded), PAYLOAD.len() as u64).is_err());
+        let connection = Connection::open_in_memory().unwrap();
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&compressed).unwrap();
+        let payload = stage_payload_with_limit(&connection, file.reopen().unwrap(), &|| false, PAYLOAD.len() as u64).unwrap();
+        assert_eq!(payload.character_id, "synthetic");
+        for limit in [16, PAYLOAD.len() as u64 - 1] {
+            let error = stage_payload_with_limit(&connection, file.reopen().unwrap(), &|| false, limit).err().unwrap();
+            assert!(error.to_string().contains("archived character exceeds the decoded size limit"));
+        }
     }
 
     #[test]

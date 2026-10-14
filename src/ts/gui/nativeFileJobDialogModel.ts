@@ -512,9 +512,10 @@ export function failureReason(code: string, direction: 'import' | 'export' = 'im
     const copy = language.risuNest.importDialog
     switch (code) {
         case 'payload-too-large': {
+            if (direction === 'export' && itemKind === 'compatible-database') return copy.reasonCompatibleDatabaseTooLarge
             const item = itemKind && Object.hasOwn(copy.tooLargeItems, itemKind)
                 ? copy.tooLargeItems[itemKind as keyof typeof copy.tooLargeItems] : undefined
-            return item ? copy.reasonTooLarge.replace('{0}', item) : copy.reasonUnknown
+            return item ? (direction === 'export' ? copy.reasonExportTooLarge : copy.reasonTooLarge).replace('{0}', item) : copy.reasonUnknown
         }
         case 'destination-required':
         case 'unsupported-without-destination':
@@ -765,7 +766,7 @@ export function buildNativeFileJobDialogModel(
                     : copy.resultExportCancelled
             } else {
                 summary = copy.resultExportFailed
-                reason = failureReason(outcome.error?.code ?? '', 'export')
+                reason = failureReason(outcome.error?.code ?? '', 'export', outcome.error?.itemKind)
             }
         } else if (outcome.state === 'succeeded') {
             summary = restarting ? copy.resultRestarting : copy.resultSucceeded

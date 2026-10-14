@@ -161,7 +161,8 @@ function outcomeError(kind: NativeFileOperationKind, error: unknown): NativeFile
         'code' in error && typeof error.code === 'string' &&
         'message' in error && typeof error.message === 'string'
     ) {
-        return { code: error.code, message: error.message, recoveryRequired: false }
+        return { code: error.code, message: error.message, recoveryRequired: false,
+            ...('itemKind' in error && typeof error.itemKind === 'string' ? { itemKind: error.itemKind } : {}) }
     }
     return {
         code: `${kind}-error`,

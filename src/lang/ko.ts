@@ -1792,6 +1792,8 @@ export const languageKorean = {
         
             "archiveFailed": '캐릭터를 보관하지 못했습니다.',
             "restoreFailed": '캐릭터를 복원하지 못했습니다.',
+            "archiveTooLarge": '캐릭터 데이터 크기가 너무 커서 보관하지 못했습니다.',
+            "restoreTooLarge": '캐릭터 데이터 크기가 너무 커서 복원하지 못했습니다.',
             "archiveRefreshFailed": '캐릭터를 보관했지만 목록에 반영하지 못했습니다. 앱을 다시 시작해주세요.',
             "restoreRefreshFailed": '캐릭터를 복원했지만 목록에 반영하지 못했습니다. 앱을 다시 시작해주세요.',
             "archiveRemoteAssetUnavailable": '서버나 외부 저장소에만 있는 파일을 가져오지 못해 캐릭터를 보관하지 못했습니다. 연결을 확인한 후 다시 시도해주세요.',
@@ -2629,8 +2631,11 @@ export const languageKorean = {
             reasonStoreError: '저장소 오류로 가져오지 못했습니다.',
             reasonUnknown: '알 수 없는 오류가 발생했습니다.',
             reasonTooLarge: '{0} 크기가 너무 커서 가져오지 못했습니다.',
+            reasonExportTooLarge: '{0} 크기가 너무 커서 내보내지 못했습니다.',
+            reasonCompatibleDatabaseTooLarge: '데이터 크기가 너무 커서 호환 백업으로 내보내지 못했습니다. RisuNest 백업을 사용하세요.',
             tooLargeItems: {
                 root: '설정', preset: '프리셋', character: '캐릭터', conversation: '대화', message: '메시지', 'plugin-value': '플러그인 데이터',
+                record: '데이터 항목', backup: '백업 데이터', 'backup-entry': '백업 항목', card: '캐릭터 카드', module: '모듈', content: '카드 또는 모듈', 'owner-manifest': '추가 에셋 목록', 'compatible-database': '데이터',
             },
             warningCleanupFailed:
                 '임시 파일을 정리하지 못했습니다. 다음 시작 때 다시 시도합니다.',

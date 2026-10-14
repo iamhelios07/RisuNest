@@ -1976,6 +1976,8 @@ export const languageEnglish = {
         
             "archiveFailed": 'The character could not be archived.',
             "restoreFailed": 'The character could not be restored.',
+            "archiveTooLarge": 'The character data is too large to archive.',
+            "restoreTooLarge": 'The character data is too large to restore.',
             "archiveRefreshFailed": 'The character was archived, but the list could not be refreshed. Please restart the app.',
             "restoreRefreshFailed": 'The character was restored, but the list could not be refreshed. Please restart the app.',
             "archiveRemoteAssetUnavailable": 'Files kept only on the server or external storage could not be fetched, so the character was not archived. Check the connection and try again.',
@@ -2814,8 +2816,11 @@ export const languageEnglish = {
             reasonStoreError: 'A storage error stopped the import.',
             reasonUnknown: 'An unknown error occurred.',
             reasonTooLarge: '{0} is too large to import.',
+            reasonExportTooLarge: '{0} is too large to export.',
+            reasonCompatibleDatabaseTooLarge: 'The data is too large to export as a compatible backup. Use a RisuNest backup.',
             tooLargeItems: {
                 root: 'Settings data', preset: 'A preset', character: 'A character', conversation: 'A chat', message: 'A message', 'plugin-value': 'Plugin data',
+                record: 'A data item', backup: 'Backup data', 'backup-entry': 'A backup entry', card: 'The character card', module: 'The module', content: 'The card or module', 'owner-manifest': 'The additional asset list', 'compatible-database': 'The data',
             },
             warningCleanupFailed:
                 'A temporary file could not be cleaned up. It will be retried at startup.',

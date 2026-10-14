@@ -67,7 +67,7 @@ fn parse_chunks(bytes: &[u8]) -> Result<Vec<ParsedPngChunk<'_>>, NativeJobError>
         }
         let length = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
         if length > MAX_PNG_CHUNK_BYTES {
-            return Err(invalid_input("PNG chunk exceeds its length limit"));
+            return Err(NativeJobError::too_large("card", "PNG chunk exceeds its length limit"));
         }
         let kind: [u8; 4] = bytes[offset + 4..header_end].try_into().unwrap();
         if !kind.iter().all(u8::is_ascii_alphabetic) {
@@ -134,9 +134,7 @@ fn prepare_png_portrait(
         return Err(cancelled("PNG export cancelled before portrait decoding"));
     }
     if bytes.len() > limits.max_input_bytes {
-        return Err(invalid_input(
-            "character portrait exceeds the PNG input limit",
-        ));
+        return Err(NativeJobError::too_large("card", "character portrait exceeds the PNG input limit"));
     }
     let mut reader = image::ImageReader::new(Cursor::new(bytes.as_slice()))
         .with_guessed_format()
@@ -151,20 +149,17 @@ fn prepare_png_portrait(
     reader.limits(image_limits);
     let decoder = reader
         .into_decoder()
-        .map_err(|error| invalid_input(format!("character portrait is invalid: {error}")))?;
+        .map_err(portrait_decode_error)?;
     let (width, height) = image::ImageDecoder::dimensions(&decoder);
-    if width == 0
-        || height == 0
-        || width > limits.max_dimension
+    if width == 0 || height == 0 { return Err(invalid_input("character portrait dimensions are invalid")); }
+    if width > limits.max_dimension
         || height > limits.max_dimension
         || u64::from(width).saturating_mul(u64::from(height)) > limits.max_pixels
     {
-        return Err(invalid_input(
-            "character portrait dimensions exceed the PNG limit",
-        ));
+        return Err(NativeJobError::too_large("card", "character portrait dimensions exceed the PNG limit"));
     }
     let decoded = image::DynamicImage::from_decoder(decoder)
-        .map_err(|error| invalid_input(format!("character portrait is invalid: {error}")))?;
+        .map_err(portrait_decode_error)?;
     if is_cancelled() {
         return Err(cancelled("PNG export cancelled before portrait encoding"));
     }
@@ -184,9 +179,17 @@ fn prepare_png_portrait(
         )
         .map_err(|error| invalid_input(format!("character portrait cannot be encoded: {error}")))?;
     if png.len() > limits.max_input_bytes {
-        return Err(invalid_input("encoded PNG portrait exceeds its byte limit"));
+        return Err(NativeJobError::too_large("card", "encoded PNG portrait exceeds its byte limit"));
     }
     Ok(png)
+}
+
+fn portrait_decode_error(error: image::ImageError) -> NativeJobError {
+    if matches!(error, image::ImageError::Limits(_)) {
+        NativeJobError::too_large("card", "character portrait exceeds the PNG decode limit")
+    } else {
+        invalid_input(format!("character portrait is invalid: {error}"))
+    }
 }
 
 #[cfg(test)]
@@ -327,7 +330,7 @@ where
             })
             .collect::<Result<Vec<_>, NativeJobError>>()?;
         if next_reference > limits.max_embedded_asset_count as u64 {
-            return Err(invalid_input("PNG embedded asset count exceeds its limit"));
+            return Err(NativeJobError::too_large("card", "PNG embedded asset count exceeds its limit"));
         }
         let embedded_asset_bytes = sources.iter().flatten().try_fold(
             0_u64,
@@ -337,7 +340,7 @@ where
                     JsonAssetSource::FallbackPortrait => FALLBACK_PORTRAIT.len() as u64,
                 };
                 if size > limits.max_embedded_asset_bytes {
-                    return Err(invalid_input("PNG embedded asset exceeds the importer limit"));
+                    return Err(NativeJobError::too_large("card", "PNG embedded asset exceeds the importer limit"));
                 }
                 total
                     .checked_add(size)
@@ -345,11 +348,11 @@ where
             },
         )?;
         if embedded_asset_bytes > limits.max_embedded_asset_total_bytes {
-            return Err(invalid_input("PNG embedded asset total exceeds its limit"));
+            return Err(NativeJobError::too_large("card", "PNG embedded asset total exceeds its limit"));
         }
         let metadata_length = serialized_json_length(&metadata)?;
         if metadata_length as u64 > limits.max_card_metadata_bytes {
-            return Err(invalid_input("PNG card metadata exceeds the importer limit"));
+            return Err(NativeJobError::too_large("card", "PNG card metadata exceeds the importer limit"));
         }
         let portrait = prepare_png_portrait(portrait, PngExportLimits::default(), || {
             job.is_cancel_requested()
@@ -501,7 +504,7 @@ fn portrait_bytes(
     let size = u64::try_from(alias.size)
         .map_err(|_| invalid_input("pinned character portrait size is invalid"))?;
     if size > PngExportLimits::default().max_input_bytes as u64 {
-        return Err(invalid_input("character portrait exceeds the PNG input limit"));
+        return Err(NativeJobError::too_large("card", "character portrait exceeds the PNG input limit"));
     }
     read_verified_object(repository, &hash, size, job)
 }
@@ -556,7 +559,7 @@ fn write_asset_text_chunk(
         ),
     };
     if size > PngCardLimits::default().max_embedded_asset_bytes {
-        return Err(invalid_input("PNG embedded asset exceeds the importer limit"));
+        return Err(NativeJobError::too_large("card", "PNG embedded asset exceeds the importer limit"));
     }
     let encoded = size
         .checked_add(2)
@@ -567,7 +570,7 @@ fn write_asset_text_chunk(
         .unwrap()
         .checked_add(encoded)
         .and_then(|value| u32::try_from(value).ok())
-        .ok_or_else(|| invalid_input("PNG embedded asset chunk exceeds its limit"))?;
+        .ok_or_else(|| NativeJobError::too_large("card", "PNG embedded asset chunk exceeds its limit"))?;
     output
         .write_all(&data_length.to_be_bytes())
         .map_err(io_error)?;
@@ -680,7 +683,7 @@ fn write_base64_text_chunk(
         .unwrap()
         .checked_add(encoded)
         .and_then(|length| u32::try_from(length).ok())
-        .ok_or_else(|| invalid_input("PNG text chunk is too large"))?;
+        .ok_or_else(|| NativeJobError::too_large("card", "PNG text chunk is too large"))?;
     output
         .write_all(&data_length.to_be_bytes())
         .map_err(io_error)?;
@@ -756,7 +759,7 @@ fn write_base64_json_text_chunk(
         .unwrap()
         .checked_add(encoded)
         .and_then(|length| u32::try_from(length).ok())
-        .ok_or_else(|| invalid_input("PNG text chunk is too large"))?;
+        .ok_or_else(|| NativeJobError::too_large("card", "PNG text chunk is too large"))?;
     output
         .write_all(&data_length.to_be_bytes())
         .map_err(io_error)?;
@@ -794,7 +797,7 @@ fn write_base64_json_text_chunk(
 }
 
 fn write_chunk(output: &mut impl Write, kind: &[u8; 4], data: &[u8]) -> Result<(), NativeJobError> {
-    let length = u32::try_from(data.len()).map_err(|_| invalid_input("PNG chunk is too large"))?;
+    let length = u32::try_from(data.len()).map_err(|_| NativeJobError::too_large("card", "PNG chunk is too large"))?;
     output.write_all(&length.to_be_bytes()).map_err(io_error)?;
     output.write_all(kind).map_err(io_error)?;
     output.write_all(data).map_err(io_error)?;
@@ -906,6 +909,8 @@ mod tests {
         image::DynamicImage::ImageRgba8(image)
             .write_to(&mut Cursor::new(&mut webp), image::ImageFormat::WebP)
             .unwrap();
+        let refused = prepare_png_portrait(webp.clone(), PngExportLimits { max_dimension: 1, ..PngExportLimits::default() }, || false).unwrap_err();
+        assert_eq!(refused.code, "payload-too-large");
         let png = prepare_png_portrait(webp, PngExportLimits::default(), || false).unwrap();
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
         assert!(parse_chunks(&png).is_ok());
@@ -1128,7 +1133,7 @@ mod tests {
                 &JobRegistry::default().create(JobKind::ExportCharacterCard).unwrap(),
                 refused_limits, PreparedRisuSaveExport::release_reader,
             ).unwrap_err();
-            assert_eq!(refused.code, "invalid-input");
+            assert_eq!(refused.code, "payload-too-large");
             assert!(!destination.exists());
         }
         export_character_png_with_release(
