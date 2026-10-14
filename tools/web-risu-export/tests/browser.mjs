@@ -29,7 +29,13 @@ try {
         const errors = [];
         page.on('pageerror', error => errors.push(error.message));
         await page.goto(origin);
-        const db = database({ character: { image: 'assets/synthetic.webp', ...(mode === 'account' ? { coldstorage: coldId } : {}) } });
+        const db = database({
+            character: {
+                image: 'assets/synthetic.webp', ...(mode === 'account' ? { coldstorage: coldId } : {}),
+                ...(mode === 'indexeddb' ? { emotionImages: [['sad', 'assets/missing.png']] } : {})
+            },
+            ...(mode === 'account' ? { root: { characterOrder: [{ img: 'assets/folder.png' }] }, presets: [{ image: 'assets/preset.png' }] } : {})
+        });
         if (mode === 'account') {
             await context.route('https://sv.risuai.xyz/**', async route => {
                 const request = route.request(), path = new URL(request.url()).pathname;
@@ -46,6 +52,8 @@ try {
                     if (key === 'database/database.bin') body = db;
                     else if (key === 'assets/synthetic.webp') body = Buffer.alloc(8 * 1024 * 1024, 37);
                     else if (key === 'assets/cold.png') body = Buffer.from([5, 6]);
+                    else if (key === 'assets/folder.png') body = Buffer.from([8, 9]);
+                    else if (key === 'assets/preset.png') body = Buffer.from([10, 11]);
                     else throw new Error('Unexpected synthetic asset request');
                 } else if (path === '/hub/account/coldstorage') {
                     assert.equal(request.headers()['x-risu-key'], coldId);
@@ -99,7 +107,8 @@ try {
                     const stream = await (await root.getFileHandle('synthetic-output.bin', { create: true })).createWritable();
                     return {
                         write: async data => { await new Promise(resolve => setTimeout(resolve, window.fixtureWriteDelay)); return stream.write(data); },
-                        seek: position => stream.seek(position), close: () => stream.close(), abort: () => stream.abort()
+                        seek: position => stream.seek(position), truncate: size => stream.truncate(size),
+                        close: () => stream.close(), abort: () => stream.abort()
                     };
                 }
             });
@@ -121,6 +130,12 @@ try {
             throw error;
         }
         assert(await page.evaluate(() => window.fixtureTicks) > 2);
+        if (mode === 'indexeddb') {
+            const skipped = panel.locator('.skipped');
+            await skipped.getByText('The following items were skipped. Everything else is included in the backup.', { exact: true }).waitFor();
+            assert.deepEqual(await skipped.locator('dt').allTextContents(), ['Missing assets']);
+            assert.deepEqual(await skipped.locator('dd').allTextContents(), ['1']);
+        }
         await page.screenshot({ path: path.join(scratch, mode + '.png') });
         let output;
         if (mode === 'firefox-fallback') {
@@ -135,9 +150,8 @@ try {
             await panel.getByRole('status').filter({ hasText: 'Temporary files removed' }).waitFor();
             assert.equal(await page.evaluate(async () => {
                 const root = await navigator.storage.getDirectory();
-                const dir = await root.getDirectoryHandle('risunest-web-export-v1');
-                return (await Array.fromAsync(dir.keys())).length;
-            }), 0);
+                return (await Array.fromAsync(root.keys())).includes('risunest-web-export-v1');
+            }), false);
         } else {
             const downloading = page.waitForEvent('download');
             await page.evaluate(async () => {
@@ -154,10 +168,12 @@ try {
         assert.deepEqual(entries.get('database.risudat'), db);
         assert.equal(entries.get('synthetic.webp').length, 8 * 1024 * 1024);
         assert(entries.get('synthetic.webp').every(byte => byte === 37));
-        assert.equal(entries.size, mode === 'account' ? 7 : 4);
+        assert.equal(entries.size, mode === 'account' ? 9 : 4);
         if (mode === 'account') {
             assert.deepEqual(entries.get('cached.png'), Buffer.from([7]));
             assert.deepEqual(entries.get('cold.png'), Buffer.from([5, 6]));
+            assert.deepEqual(entries.get('folder.png'), Buffer.from([8, 9]));
+            assert.deepEqual(entries.get('preset.png'), Buffer.from([10, 11]));
             assert.equal(JSON.parse(entries.get('coldstorage_' + coldId + '.json')).character.chaId, 'character-1');
         }
         if (mode === 'indexeddb') {
@@ -167,6 +183,11 @@ try {
             await panel.getByRole('status').filter({ hasText: 'Export cancelled' }).waitFor();
             await panel.getByRole('combobox').selectOption('ko');
             await panel.getByRole('status').filter({ hasText: '내보내기가 취소되었습니다' }).waitFor();
+            await page.evaluate(() => { globalThis.__NODE__ = true; });
+            await panel.getByRole('button', { name: '백업 내보내기', exact: true }).click();
+            await panel.getByRole('status').filter({ hasText: '서버의 저장 폴더를 대신 백업해주세요' }).waitFor();
+            assert(await panel.locator('.skipped').isHidden());
+            await page.evaluate(() => { delete globalThis.__NODE__; });
         }
         if (mode === 'opfs') {
             await page.evaluate(() => {

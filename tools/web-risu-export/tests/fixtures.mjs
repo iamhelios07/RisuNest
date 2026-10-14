@@ -1,5 +1,5 @@
 import { gzipSync } from 'node:zlib';
-import { sourceOf } from '../src/bytes.mjs';
+import { ExportError, sourceOf } from '../src/bytes.mjs';
 
 export function block(type, name, value, compressed = false) {
     const body = Buffer.from(JSON.stringify(value));
@@ -12,14 +12,15 @@ export function rawBlock(type, name, body, compressed = false) {
     label.copy(header, 3); header.writeUInt32LE(body.length, 3 + label.length);
     return Buffer.concat([header, body]);
 }
-export function database({ compressed = false, root = {}, character = {}, modules = [] } = {}) {
+// `pluginStorage` is the stored value, or a Buffer holding the whole encoded block.
+export function database({ compressed = false, root = {}, character = {}, modules = [], presets = [], pluginStorage = {} } = {}) {
     const entries = [
-        [4, 'preset', []], [5, 'modules', modules], [9, 'plugins', []],
-        [10, 'loadouts', []], [11, 'pluginStorage', {}], [0, 'config', { version: 1 }],
+        [4, 'preset', presets], [5, 'modules', modules], [9, 'plugins', []],
+        [10, 'loadouts', []], [11, 'pluginStorage', pluginStorage], [0, 'config', { version: 1 }],
         [2, 'character-1', { chaId: 'character-1', type: 'character', name: 'Synthetic', chats: [], ...character }]
     ];
     entries.unshift([1, 'root', { formatversion: 7, __directory: entries.map(e => e[1]), ...root }]);
-    return Buffer.concat([Buffer.from('RISUSAVE\0'), ...entries.map(e => block(...e, compressed))]);
+    return Buffer.concat([Buffer.from('RISUSAVE\0'), ...entries.map(e => Buffer.isBuffer(e[2]) ? e[2] : block(...e, compressed))]);
 }
 export function archive(bytes) {
     const buffer = Buffer.from(bytes);
@@ -44,6 +45,7 @@ export class MemorySink {
         this.bytes.set(bytes, this.offset); this.offset += bytes.length;
     }
     async seek(position) { this.offset = position; }
+    async truncate(size) { this.bytes = this.bytes.subarray(0, size); this.offset = Math.min(this.offset, size); }
     async close() { this.closed = true; }
     async abort() { this.aborted = true; }
 }
@@ -52,9 +54,9 @@ export function fixtureSource({ db = database(), assets = new Map(), inlays = ne
         mode,
         inventory: async () => ({ assets: [...assets.keys()], inlays: [...inlays.keys()], cold: [...cold.keys()] }),
         database: async () => sourceOf(db),
-        asset: async key => { if (!assets.has(key)) throw new Error('missing'); return sourceOf(assets.get(key)); },
+        asset: async key => { if (!assets.has(key)) throw new ExportError('missing'); return sourceOf(assets.get(key)); },
         inlay: async key => inlays.get(key),
-        cold: async key => sourceOf(cold.get(key)),
+        cold: async key => { if (!cold.has(key)) throw new ExportError('missing'); return sourceOf(cold.get(key)); },
         verifyInventory: async () => {},
         close() {}
     };

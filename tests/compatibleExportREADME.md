@@ -5,7 +5,15 @@ against synthetic fixtures, never installed app data, real backups, or copies of
 user data. It does not start either reference app, mount real app storage, or
 allow network access.
 
+Prepare the libraries after checking out the pinned reference revisions. This
+installs only the libraries used by the harness in isolated directories; it does
+not install or start either reference application. The preparation command copies
+each reference lockfile so the selected libraries retain its resolved versions.
+
 ```powershell
+node scripts/compatibleExportDependencies.mjs --prepare
+pnpm --dir .tmp/test-reference-dependencies/risuai install --no-frozen-lockfile
+pnpm --dir .tmp/test-reference-dependencies/pocket install --no-frozen-lockfile
 node scripts/compatibleExportContract.mjs --check
 node scripts/compatibleExportReferenceHarness.mjs --check
 node --test tests/compatibleExport.node-test.mjs
@@ -13,12 +21,14 @@ node scripts/compatibleExportReferenceHarness.mjs --archive .tmp/compatible-fixt
 node scripts/compatibleExportReferenceHarness.mjs --archive .tmp/compatible-fixtures/pocket.bin --target pocket
 ```
 
-The reference roots default to the documented local RisuAI and PocketRisu
-checkouts. `RISUAI_REFERENCE` and `POCKETRISU_REFERENCE` may select another checkout
+The reference roots default to `.tmp/test-references/risuai` and
+`.tmp/test-references/pocket`, populated by `.github/actions/test-references`.
+`RISUAI_REFERENCE` and `POCKETRISU_REFERENCE` may select another checkout
 at the exact pinned revision. The contract generator checks the revision and
 hashes the actual source bytes. Running either generator without `--check`
 updates its generated JSON; do this only as part of an explicit reference update
-with acceptance review.
+with acceptance review. Source checks accept LF and CRLF checkouts; other source
+changes still fail.
 
 ## Generated recursive contract
 
@@ -50,8 +60,12 @@ Both targets execute `decodeRisuSave`, the full `setDatabase`, the full
 `checkNewFormat` bootstrap normalizer, `encodeRisuSaveLegacy`, and a second decode.
 The MessagePack no-eval module runs without Node's Buffer fast path to match the
 web clients. UI language updates and draft-cache sweeping are isolated, and
-storage uses isolated memory. Libraries resolve from each reference checkout;
-the reference package manifest and lockfile are pinned with runtime sources.
+storage uses isolated memory. Libraries resolve from the isolated directories
+above. `RISUAI_REFERENCE_DEPENDENCIES` and `POCKETRISU_REFERENCE_DEPENDENCIES`
+may select another directory containing the required `node_modules`. Missing
+packages, versions that differ from the reference lockfile, and parent-directory
+fallbacks fail before reference execution. The reference package manifest and
+lockfile are pinned with runtime sources.
 Network, timers, application dialogs requiring a
 decision, and unmodeled side effects throw.
 
@@ -86,6 +100,9 @@ also accepts the native writer's synthetic output for the same reference
 decode/bootstrap/re-save path and prints only counts, lengths, and hashes.
 For native archives it also checks declared root, preset, character, module,
 persona, folder and owner-array asset references remain unchanged after re-save.
+Folders with asset references are matched by ID, so removing an unrelated empty
+folder does not look like an image change. Missing referenced folders, changed
+images and duplicate folder IDs fail.
 Both actual target `loadAsset` and `readImage` functions must return byte hashes
 matching the imported storage entry at each exact mapped path. This walk never
 searches prompts, scripts, plugin data or arbitrary strings.

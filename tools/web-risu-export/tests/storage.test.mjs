@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import 'fake-indexeddb/auto';
-import { AccountReader, IdbStore, responseSource } from '../src/storage.mjs';
+import { AccountReader, BrowserSource, IdbStore, responseSource } from '../src/storage.mjs';
 import { keyHex } from '../src/bytes.mjs';
 
 const memoryStorage = initial => {
@@ -94,4 +94,21 @@ test('429 retry is bounded and cancellation interrupts backoff', async () => {
         fetcher: async () => new Response('', { status: 429, headers: { 'retry-after': '0' } })
     });
     await assert.rejects(failed.read('assets/a.png'), error => error.code === 'network');
+});
+test('account bodies that stall or end early are reported as interrupted', async () => {
+    const drain = async stream => { for await (const _ of stream); };
+    const short = responseSource(new Response(Uint8Array.of(1, 2), { headers: { 'x-body-size': '3' } }));
+    await assert.rejects(drain(short.stream()), error => error.code === 'interrupted');
+    const stalled = responseSource(new Response(new ReadableStream({ start(controller) { controller.enqueue(Uint8Array.of(1)); } })), undefined, 20);
+    await assert.rejects(drain(stalled.stream()), error => error.code === 'interrupted');
+    const longer = responseSource(new Response(Uint8Array.of(1, 2, 3), { headers: { 'x-body-size': '2' } }));
+    await assert.rejects(drain(longer.stream()), error => error.code === 'changed');
+    for (const [status, code] of [[204, 'missing'], [404, 'missing'], [500, 'network']]) {
+        assert.throws(() => responseSource(new Response(status === 204 ? null : 'synthetic', { status })), error => error.code === code);
+    }
+});
+test('a Node server page stops before reading browser storage', async () => {
+    globalThis.__NODE__ = true;
+    try { await assert.rejects(BrowserSource.open(), error => error.code === 'nodeServer'); }
+    finally { delete globalThis.__NODE__; }
 });

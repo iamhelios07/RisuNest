@@ -334,6 +334,18 @@
   function check(signal3) {
     signal3?.throwIfAborted();
   }
+  var wait = (milliseconds, signal3) => new Promise((resolve, reject) => {
+    check(signal3);
+    const abort = () => {
+      clearTimeout(timer);
+      reject(signal3.reason);
+    };
+    const timer = setTimeout(() => {
+      signal3?.removeEventListener("abort", abort);
+      resolve();
+    }, milliseconds);
+    signal3?.addEventListener("abort", abort, { once: true });
+  });
   var hex = (bytes) => Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
   var keyHex = (key) => hex(encoder.encode(key));
   function fromHex(value) {
@@ -527,6 +539,7 @@
       this.buffer = new Uint8Array(bufferSize);
       this.used = 0;
       this.position = 0;
+      this.extent = 0;
       this.names = /* @__PURE__ */ new Set();
       this.nameBytes = 0;
       this.active = null;
@@ -558,11 +571,29 @@
       if (size != null) u32(size);
       this.names.add(name);
       this.nameBytes += encoded.length;
+      const origin = this.position;
       await this.raw(u32(encoded.length));
       await this.raw(encoded);
       const lengthPosition = this.position;
       await this.raw(u32(size ?? 0));
-      this.active = { start: this.position, lengthPosition, expected: size };
+      this.active = { name, nameBytes: encoded.length, origin, start: this.position, lengthPosition, expected: size };
+    }
+    // Discards the unfinished entry; later entries overwrite its bytes and finish() trims any excess.
+    async rollback() {
+      const entry = this.active;
+      if (!entry) return;
+      this.active = null;
+      this.names.delete(entry.name);
+      this.nameBytes -= entry.nameBytes;
+      const flushed = this.position - this.used;
+      if (entry.origin >= flushed) this.used -= this.position - entry.origin;
+      else {
+        this.used = 0;
+        this.extent = Math.max(this.extent, flushed);
+        await this.sink.seek(entry.origin);
+      }
+      this.onBytes(entry.origin - this.position);
+      this.position = entry.origin;
     }
     async append(bytes) {
       if (!this.active || this.position - this.active.start + bytes.length > U32_MAX) fail("entryTooLarge");
@@ -591,6 +622,7 @@
       if (this.active || !this.names.has("database.risudat")) fail("invalidData");
       await this.flush();
       check(this.signal);
+      if (this.extent > this.position) await this.sink.truncate(this.position);
       await this.sink.close();
     }
     async abort() {
@@ -2954,12 +2986,17 @@
   var UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   var MAX_STRING = 8 * 1024 * 1024;
   var MAX_BLOCK = 1024 * 1024 * 1024;
+  var MAX_REFERENCE = 64 * 1024;
+  var MAX_HELD_PLUGIN_STORAGE = 64 * 1024;
+  var EMPTY_PLUGIN_STORAGE = Uint8Array.of(11, 0, 13, ...encoder.encode("pluginStorage"), 2, 0, 0, 0, ...encoder.encode("{}"));
   var JsonScan = class {
-    constructor(visit) {
+    constructor(visit, { maxString = MAX_STRING, blank = false } = {}) {
       this.visit = visit;
       this.stack = [];
       this.rootDone = false;
       this.pending = 0;
+      this.maxString = maxString;
+      this.blank = blank;
       this.decoder = new TextDecoder("utf-8", { fatal: true });
       this.tokenizer = new Tokenizer({ stringBufferSize: 64 * 1024 });
       this.tokenizer.onToken = (token) => {
@@ -3009,13 +3046,13 @@
         this.visit(path, object ? {} : []);
         this.stack.push({ path, object, state: object ? "keyOrEnd" : "valueOrEnd", index: 0 });
       } else if ([tokenType_default.STRING, tokenType_default.NUMBER, tokenType_default.TRUE, tokenType_default.FALSE, tokenType_default.NULL].includes(token)) {
-        if (typeof value === "string" && value.length > MAX_STRING) fail("recordTooLarge");
+        if (typeof value === "string" && value.length > this.maxString) fail("recordTooLarge");
         this.visit(path, value);
       } else fail("invalidData");
     }
     write(bytes) {
       this.pending += bytes.length;
-      if (this.pending > MAX_STRING + 256 * 1024) fail("recordTooLarge");
+      if (this.pending > this.maxString + 256 * 1024) fail("recordTooLarge");
       try {
         const text2 = this.decoder.decode(bytes, { stream: true });
         if (text2) this.tokenizer.write(text2);
@@ -3033,39 +3070,45 @@
         if (error instanceof ExportError) throw error;
         fail("invalidData");
       }
-      if (!this.rootDone || this.stack.length) fail("truncated");
+      if (this.stack.length || !this.rootDone && !this.blank) fail("truncated");
     }
   };
   function references() {
-    const assets = /* @__PURE__ */ new Set(), cold = /* @__PURE__ */ new Set();
+    const assets = /* @__PURE__ */ new Set(), cold = /* @__PURE__ */ new Set(), pluginCold = /* @__PURE__ */ new Set();
     let token = "";
     function addCold(key) {
       if (!UUID.test(key)) fail("invalidCold");
       cold.add(key);
     }
+    function visitPluginStorage(path, value) {
+      if (path.length === 2 && path[0] === "_coldplugin" && typeof value === "string" && value) pluginCold.add(value);
+    }
     return {
       assets,
       cold,
+      pluginCold,
+      visitPluginStorage,
       get token() {
         return token;
       },
       visit(path, value) {
         if (typeof value !== "string") return;
         const key = path.at(-1), parent = path.at(-2);
+        if (path[0] === "pluginCustomStorage") visitPluginStorage(path.slice(1), value);
         if (key === "token" && parent === "account") token = value;
         if (key === "coldstorage" && value) addCold(value);
         if (parent === "coldStoragedChats" && value) addCold(value);
         if (key === "data" && value.startsWith(COLD_HEADER)) addCold(value.slice(COLD_HEADER.length));
         if (!value.startsWith("assets/")) return;
-        if (["customBackground", "userIcon", "image", "icon", "imgFile"].includes(key) || key === "uri" && path.includes("ccAssets") || parent === "files" && path.includes("vits") || key === 1 && ["emotionImages", "additionalAssets", "assets"].includes(path.at(-3))) {
+        if (["customBackground", "userIcon", "image", "icon", "imgFile"].includes(key) || key === "img" && path.at(-3) === "characterOrder" || key === "uri" && path.includes("ccAssets") || parent === "files" && path.includes("vits") || key === 1 && ["emotionImages", "additionalAssets", "assets"].includes(path.at(-3))) {
           assets.add(value);
           if (assets.size + cold.size > 199999) fail("tooMany");
         }
       }
     };
   }
-  async function scanJson(stream, visit, signal3, max = MAX_BLOCK) {
-    const parser = new JsonScan(visit);
+  async function scanJson(stream, visit, signal3, max = MAX_BLOCK, options) {
+    const parser = new JsonScan(visit, options);
     const breathe = yielding(signal3);
     let length = 0;
     for await (const bytes of chunks(stream, signal3)) {
@@ -3087,7 +3130,10 @@
       if ((tag & 224) === 160) length = tag & 31;
       else if (tag >= 217 && tag <= 219) length = await reader.number([1, 2, 4][tag - 217]);
       if (length != null) {
-        if (length > MAX_STRING) fail("recordTooLarge");
+        if (!asKey && length > MAX_REFERENCE) {
+          for await (const _ of reader.parts(length)) await breathe();
+          return;
+        }
         const text2 = decoder.decode(await reader.take(length));
         if (!asKey) visit(path, text2);
         return text2;
@@ -3137,15 +3183,41 @@
     await value([]);
     if (await reader.available()) fail("invalidData");
   }
-  async function scanDatabase(stream, refs, signal3, onChunk, maxDecodedBlockBytes = MAX_BLOCK) {
+  async function* tap(parts, write) {
+    for await (const part of parts) {
+      await write(part);
+      yield part;
+    }
+  }
+  async function* hold(parts, held) {
+    for await (const part of parts) {
+      held.push(part.slice());
+      yield part;
+    }
+  }
+  var OutputError = class {
+    constructor(error) {
+      this.error = error;
+    }
+  };
+  async function scanDatabase(stream, refs, signal3, onChunk, maxDecodedBlockBytes = MAX_BLOCK, write = null) {
     const reader = new ByteReader(stream, signal3, onChunk);
+    const output = write;
+    write = output && (async (bytes) => {
+      try {
+        await output(bytes);
+      } catch (error) {
+        throw new OutputError(error);
+      }
+    });
     try {
       const first = await reader.take(9);
       if (decoder.decode(first) !== "RISUSAVE\0") {
         const tail = await reader.take(2);
         const prefix = [...first, ...tail];
         if (decoder.decode(Uint8Array.from(prefix.slice(0, 10))) !== "\0RISUSAVE\0" || ![7, 8, 9].includes(prefix[10])) fail("unsupported");
-        const rest = streamOf(reader.rest());
+        await write?.(Uint8Array.from(prefix));
+        const rest = streamOf(write ? tap(reader.rest(), write) : reader.rest());
         const decoded = prefix[10] === 7 ? rest : rest.pipeThrough(new DecompressionStream("gzip"));
         const limited = new ByteReader(decoded, signal3, (bytes) => {
           decodedBytes += bytes.length;
@@ -3159,20 +3231,31 @@
         }
         return;
       }
+      await write?.(first);
       const names = /* @__PURE__ */ new Set(), directory = /* @__PURE__ */ new Set();
       let directoryFound = false;
       const expected = /* @__PURE__ */ new Map([[0, "config"], [1, "root"], [4, "preset"], [5, "modules"], [9, "plugins"], [10, "loadouts"], [11, "pluginStorage"]]);
       while (await reader.available()) {
-        const [type, compression, nameLength] = await reader.take(3);
-        const name = decoder.decode(await reader.take(nameLength));
-        const length = await reader.number(4, true);
+        const head = await reader.take(3);
+        const [type, compression, nameLength] = head;
+        const label = await reader.take(nameLength);
+        const name = decoder.decode(label);
+        const size = await reader.take(4);
+        const length = new DataView(size.buffer, size.byteOffset, 4).getUint32(0, true);
         if (!name || names.has(name) || compression > 1) fail("invalidData");
         if (![0, 1, 2, 4, 5, 7, 9, 10, 11].includes(type)) fail("unsupported");
         if (expected.has(type) && expected.get(type) !== name) fail("invalidData");
         names.add(name);
         if (names.size > 2e5) fail("tooMany");
+        const header = new Uint8Array(7 + nameLength);
+        header.set(head);
+        header.set(label, 3);
+        header.set(size, 3 + nameLength);
+        const held = write && type === 11 && length <= MAX_HELD_PLUGIN_STORAGE ? [] : null;
+        if (write && !held) await write(header);
         let characterId = null, rootType = null;
-        let block = streamOf(reader.parts(length));
+        const parts = reader.parts(length);
+        let block = streamOf(held ? hold(parts, held) : write ? tap(parts, write) : parts);
         if (compression) block = block.pipeThrough(new DecompressionStream("gzip"));
         await scanJson(block, (path, value) => {
           if (!path.length) rootType = Array.isArray(value) ? "array" : value && typeof value === "object" ? "object" : "scalar";
@@ -3186,9 +3269,19 @@
               directory.add(value);
             } else fail("invalidData");
           }
-          if (![0, 4, 9, 10, 11].includes(type)) refs.visit(path, value);
-        }, signal3, maxDecodedBlockBytes);
-        if ([4, 5, 9, 10].includes(type) ? rootType !== "array" : rootType !== "object") fail("invalidData");
+          if (type === 11) refs.visitPluginStorage?.(path, value);
+          else if (![0, 9, 10].includes(type)) refs.visit(path, value);
+        }, signal3, maxDecodedBlockBytes, { maxString: type === 2 || type === 7 ? MAX_STRING : maxDecodedBlockBytes, blank: type === 11 });
+        if (type === 11 && rootType === null) {
+          if (write && !held) fail("invalidData");
+          if (held) await write(EMPTY_PLUGIN_STORAGE);
+        } else {
+          if ([4, 5, 9, 10].includes(type) ? rootType !== "array" : rootType !== "object") fail("invalidData");
+          if (held) {
+            await write(header);
+            for (const part of held) await write(part);
+          }
+        }
         if (type === 2 || type === 7) {
           if (characterId !== name) fail("invalidData");
         }
@@ -3198,6 +3291,7 @@
       for (const name of directory) if (!names.has(name)) fail("invalidData");
       for (const name of names) if (name !== "root" && !directory.has(name)) fail("invalidData");
     } catch (error) {
+      if (error instanceof OutputError) throw error.error;
       if (error instanceof ExportError || signal3?.aborted) throw error;
       fail("invalidData");
     } finally {
@@ -3207,6 +3301,9 @@
 
   // src/storage.mjs
   var DB_KEY = "database/database.bin";
+  function checkPlatform() {
+    if (globalThis.__NODE__) fail("nodeServer");
+  }
   var IdbStore = class _IdbStore {
     constructor(db, store) {
       this.db = db;
@@ -3292,18 +3389,6 @@
       this.db.close();
     }
   };
-  var wait = (milliseconds, signal3) => new Promise((resolve, reject) => {
-    check(signal3);
-    const abort = () => {
-      clearTimeout(timer);
-      reject(signal3.reason);
-    };
-    const timer = setTimeout(() => {
-      signal3?.removeEventListener("abort", abort);
-      resolve();
-    }, milliseconds);
-    signal3?.addEventListener("abort", abort, { once: true });
-  });
   var AccountReader = class {
     constructor({ storage = localStorage, fetcher = (...args) => globalThis.fetch(...args), getKeys, signal: signal3, legacyToken = "" }) {
       this.storage = storage;
@@ -3402,8 +3487,12 @@
       });
     }
   };
-  function responseSource(response) {
-    if (!response.ok || response.status === 204 || !response.body) fail("missing");
+  function responseSource(response, signal3, idle = 6e4) {
+    if (!response.ok || response.status === 204 || !response.body) {
+      void response.body?.cancel().catch(() => {
+      });
+      fail(response.status === 204 || response.status === 404 || response.ok ? "missing" : "network");
+    }
     const raw = response.headers.get("x-body-size") ?? (response.headers.get("content-encoding") ? null : response.headers.get("content-length"));
     const size = raw !== null && /^\d+$/.test(raw) ? Number(raw) : null;
     let used = false;
@@ -3412,7 +3501,42 @@
       stream() {
         if (used) fail("invalidData");
         used = true;
-        return response.body;
+        const reader = response.body.getReader();
+        let received = 0;
+        const stop = (controller, error) => {
+          void reader.cancel().catch(() => {
+          });
+          controller.error(signal3?.aborted ? signal3.reason : error instanceof ExportError ? error : new ExportError("interrupted"));
+        };
+        return new ReadableStream({
+          async pull(controller) {
+            let timer, item;
+            try {
+              item = await Promise.race([reader.read(), new Promise((_, reject) => {
+                timer = setTimeout(() => reject(new ExportError("interrupted")), idle);
+              })]);
+            } catch (error) {
+              stop(controller, error);
+              return;
+            } finally {
+              clearTimeout(timer);
+            }
+            if (item.done) {
+              if (size != null && received !== size) stop(controller, new ExportError("interrupted"));
+              else controller.close();
+              return;
+            }
+            received += item.value.length;
+            if (size != null && received > size) {
+              stop(controller, new ExportError("changed"));
+              return;
+            }
+            controller.enqueue(item.value);
+          },
+          cancel(reason) {
+            return reader.cancel(reason);
+          }
+        }, { highWaterMark: 0 });
       },
       async cancel() {
         if (!used) await response.body.cancel().catch(() => {
@@ -3432,6 +3556,7 @@
   var BrowserSource = class _BrowserSource {
     static async open(signal3, onMode = () => {
     }) {
+      checkPlatform();
       const source = new _BrowserSource();
       source.abortController = new AbortController();
       source.onAbort = () => source.abortController.abort(signal3.reason);
@@ -3532,7 +3657,12 @@
           if (match?.match && cached) return sourceOf(cached);
           fail("changed");
         }
-        return responseSource(response);
+        try {
+          return responseSource(response, this.signal);
+        } catch (error) {
+          if (error.code === "missing") fail("missingDatabase");
+          throw error;
+        }
       }
       const value = this.mode === "opfs" ? await fileAt(this.root, keyHex(DB_KEY)) : await this.local?.get(DB_KEY);
       if (!value) fail("missingDatabase");
@@ -3543,12 +3673,12 @@
       const local = this.mode === "opfs" ? await fileAt(this.root, keyHex(key)) : await (this.mode === "account" ? this.cache : this.local)?.get(key);
       if (local != null) return sourceOf(local);
       if (this.mode !== "account") fail("missing");
-      return responseSource(await this.account.read(key));
+      return responseSource(await this.account.read(key), this.signal);
     }
     async cold(key) {
       if (this.mode === "account") {
         const response = await this.account.request("/hub/account/coldstorage", { "x-risu-key": key });
-        if (response.status === 200) return responseSource(response);
+        if (response.status === 200) return responseSource(response, this.signal);
         await response.body?.cancel().catch(() => {
         });
         if (![404, 204].includes(response.status)) fail("network");
@@ -3557,10 +3687,9 @@
       if (!file) fail("missing");
       return sourceOf(file);
     }
+    // A removed inlay is skipped here and reported as a change by verifyInventory.
     async inlay(key) {
-      const value = await this.inlays?.get(key);
-      if (!value) fail("missing");
-      return value;
+      return this.inlays?.get(key);
     }
     async verifyInventory(expected) {
       const flags = ["accountst", "opfs_flag!", "hub", "ignoreRisuAuth"].map((key) => localStorage.getItem(key));
@@ -3578,6 +3707,19 @@
   };
 
   // src/export.mjs
+  var MAX_COLD = 1024 * 1024 * 1024;
+  var BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
+  var RETRIES = 3;
+  var UNREADABLE = /* @__PURE__ */ new Set(["invalidData", "truncated", "recordTooLarge", "invalidCold"]);
+  var unreadable = (error) => error instanceof ExportError && UNREADABLE.has(error.code);
+  async function* gunzip(source, signal3) {
+    try {
+      yield* chunks(source.stream().pipeThrough(new DecompressionStream("gzip")), signal3);
+    } catch (error) {
+      if (error instanceof TypeError) fail("invalidCold");
+      throw error;
+    }
+  }
   function assetName(key) {
     if (!key.startsWith("assets/")) fail("invalidName");
     const name = key.slice(7);
@@ -3586,12 +3728,14 @@
   }
   function inlaySource(key, record) {
     if (typeof key !== "string" || !key || key.startsWith("assets/")) fail("invalidInlay");
-    if (!record || !["image", "audio", "video", "signature"].includes(record.type) || typeof record.name !== "string" || typeof record.ext !== "string") fail("invalidInlay");
+    if (!record || typeof record !== "object" || typeof record.name !== "string" || typeof record.ext !== "string") fail("invalidInlay");
+    const type = record.type ?? (record.data instanceof Blob || /^data:image\//i.test(record.data) ? "image" : null);
+    if (!["image", "audio", "video", "signature"].includes(type)) fail("invalidInlay");
     let payload, mime;
     if (record.data instanceof Blob) {
       payload = sourceOf(record.data);
       mime = record.data.type;
-    } else if (typeof record.data === "string" && record.type === "signature") {
+    } else if (typeof record.data === "string" && type === "signature") {
       payload = sourceOf(encoder.encode(record.data));
       mime = "application/json";
     } else if (typeof record.data === "string") {
@@ -3600,26 +3744,21 @@
       if (comma < 0 || !/^data:[^,;]*;base64$/i.test(header2)) fail("invalidInlay");
       mime = header2.slice(5, -7);
       const length = record.data.length - comma - 1;
-      if (length % 4 !== 0 || !length) fail("invalidInlay");
+      if (length % 4 !== 0 || !length || !BASE64.test(record.data.slice(comma + 1))) fail("invalidInlay");
       const size = length / 4 * 3 - (record.data.endsWith("==") ? 2 : record.data.endsWith("=") ? 1 : 0);
       payload = {
         size,
         stream: () => streamOf((async function* () {
           for (let offset = comma + 1; offset < record.data.length; offset += 256 * 1024) {
-            let binary;
-            try {
-              binary = atob(record.data.slice(offset, offset + 256 * 1024));
-            } catch {
-              fail("invalidInlay");
-            }
+            const binary = atob(record.data.slice(offset, offset + 256 * 1024));
             yield Uint8Array.from(binary, (c) => c.charCodeAt(0));
           }
         })())
       };
     } else fail("invalidInlay");
     const fallbackMime = { jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", json: "application/json" };
-    mime ||= fallbackMime[record.ext] ?? (record.type === "signature" ? "application/json" : record.type + "/" + record.ext);
-    const { data, type, ...extra } = record;
+    mime ||= fallbackMime[record.ext] ?? (type === "signature" ? "application/json" : type + "/" + record.ext);
+    const { data, type: _, ...extra } = record;
     const metadata = { ...extra, key, kind: "inlay", inlayType: type, mime, size: payload.size };
     for (const dimension of ["width", "height"]) {
       if (metadata[dimension] != null && (!Number.isSafeInteger(metadata[dimension]) || metadata[dimension] < 0)) fail("invalidInlay");
@@ -3643,13 +3782,14 @@
   }
   async function exportBackup({ source, sink, signal: signal3, progress = () => {
   } }) {
-    const state = { stage: "inventory", mode: source.mode, bytes: 0, readBytes: 0, items: 0, total: null, started: performance.now() };
+    const skipped = { missingAssets: 0, missingCold: 0, unreadableCold: 0, pluginCold: 0, unsupportedInlays: 0 };
+    const state = { stage: "inventory", mode: source.mode, bytes: 0, readBytes: 0, items: 0, total: null, skipped, started: performance.now() };
     let last = 0;
     const report = (patch = {}, force = false) => {
       Object.assign(state, patch);
       if (force || performance.now() - last >= 100) {
         last = performance.now();
-        progress({ ...state });
+        progress({ ...state, skipped: { ...skipped } });
       }
     };
     const writer = new ArchiveWriter(sink, signal3, (n) => {
@@ -3657,66 +3797,114 @@
       report();
     });
     const breathe = yielding(signal3);
+    const retrying = async (first, reopen, write) => {
+      let value = first;
+      for (let retry2 = 0; ; retry2++) {
+        try {
+          return await write(value);
+        } catch (error) {
+          check(signal3);
+          if (error?.code !== "interrupted") throw error;
+          if (retry2 === RETRIES) fail("network");
+          await writer.rollback();
+          await wait(500 * 2 ** retry2, signal3);
+          value = await reopen();
+        }
+      }
+    };
+    const writeCold = async (key, compressed) => {
+      const found = references();
+      let root = null, chat = false, size = 0;
+      const parser = new JsonScan((path, value) => {
+        if (!path.length) root = Array.isArray(value) ? "array" : value && typeof value === "object" ? "object" : "scalar";
+        if (path.length === 1 && ["character", "message"].includes(path[0])) chat = true;
+        found.visit(path, value);
+      });
+      await writer.begin("coldstorage_" + key + ".json");
+      for await (const bytes of gunzip(compressed, signal3)) {
+        size += bytes.length;
+        if (size > MAX_COLD) fail("recordTooLarge");
+        parser.write(bytes);
+        await writer.append(bytes);
+        await breathe();
+      }
+      parser.end();
+      if (root !== "array" && !(root === "object" && chat)) fail("invalidCold");
+      await writer.end();
+      return found;
+    };
     let pending = null;
     try {
       report({}, true);
       const inventory = await source.inventory();
-      const refs = references();
       report({ stage: "database" }, true);
-      let database = await source.database();
-      const hash = sha256.create();
-      await writer.begin("database.risudat", database.size);
-      await scanDatabase(database.stream(), refs, signal3, async (bytes) => {
-        hash.update(bytes);
-        state.readBytes += bytes.length;
-        await writer.append(bytes);
-        await breathe();
+      let refs, initialHash;
+      await retrying(await source.database(), () => source.database(), async (database) => {
+        refs = references();
+        const hash = sha256.create();
+        let read = 0;
+        await writer.begin("database.risudat");
+        try {
+          await scanDatabase(database.stream(), refs, signal3, async (bytes) => {
+            hash.update(bytes);
+            read += bytes.length;
+            state.readBytes += bytes.length;
+            await breathe();
+          }, void 0, (bytes) => writer.append(bytes));
+        } catch (error) {
+          state.readBytes -= read;
+          throw error;
+        }
+        if (database.size != null && read !== database.size) fail("changed");
+        await writer.end();
+        initialHash = hex(hash.digest());
       });
-      await writer.end();
-      database = null;
-      const initialHash = hex(hash.digest());
       state.items++;
-      const coldKeys = /* @__PURE__ */ new Set([...inventory.cold, ...refs.cold]);
+      report({ stage: "cold", total: null }, true);
+      const coldKeys = new Set(refs.cold);
       for (const key of coldKeys) {
         check(signal3);
-        if (!UUID.test(key)) fail("invalidCold");
-        report({ stage: "cold", total: null }, true);
-        const compressed = await source.cold(key);
-        let coldRoot = false, coldField = false;
-        const parser = new JsonScan((path, value) => {
-          if (!path.length) coldRoot = Array.isArray(value) ? "array" : value && typeof value === "object" ? "object" : false;
-          if (path.length === 1 && ["character", "message"].includes(path[0])) coldField = true;
-          refs.visit(path, value);
-        });
-        let size = 0;
-        await writer.begin("coldstorage_" + key + ".json");
-        const decoded = compressed.stream().pipeThrough(new DecompressionStream("gzip"));
-        for await (const bytes of chunks(decoded, signal3)) {
-          size += bytes.length;
-          if (size > 1024 * 1024 * 1024) fail("recordTooLarge");
-          parser.write(bytes);
-          await writer.append(bytes);
-          await breathe();
+        let found;
+        try {
+          found = await retrying(await source.cold(key), () => source.cold(key), (compressed) => writeCold(key, compressed));
+        } catch (error) {
+          check(signal3);
+          const reason = error?.code === "missing" ? "missingCold" : unreadable(error) ? "unreadableCold" : null;
+          if (!reason) throw error;
+          await writer.rollback();
+          skipped[reason]++;
+          report();
+          continue;
         }
-        parser.end();
-        if (!coldRoot || coldRoot === "object" && !coldField) fail("invalidCold");
-        await writer.end();
+        for (const asset of found.assets) refs.assets.add(asset);
+        for (const next of found.cold) coldKeys.add(next);
+        if (coldKeys.size + refs.assets.size > 199999) fail("tooMany");
         state.items++;
-        for (const next of refs.cold) coldKeys.add(next);
-        if (coldKeys.size > 199999) fail("tooMany");
+        report();
       }
+      for (const key of refs.pluginCold) if (!coldKeys.has(key)) skipped.pluginCold++;
       const assets = [.../* @__PURE__ */ new Set([...inventory.assets, ...refs.assets])].sort();
       report({ stage: "assets", total: state.items + assets.length + inventory.inlays.length }, true);
       const prepare = (key) => source.asset(key).then((value) => ({ value }), (error) => ({ error }));
       if (assets.length) pending = prepare(assets[0]);
       for (let i = 0; i < assets.length; i++) {
         check(signal3);
+        const key = assets[i], name = assetName(key);
         const item = await pending;
         pending = null;
-        if (item.error) throw item.error;
+        if (item.error && item.error.code !== "missing") throw item.error;
         if (i + 1 < assets.length && source.mode === "account") pending = prepare(assets[i + 1]);
-        await writer.entry(assetName(assets[i]), item.value);
-        state.items++;
+        try {
+          if (item.error) throw item.error;
+          await retrying(item.value, () => source.asset(key), (value) => writer.entry(name, value));
+          state.items++;
+        } catch (error) {
+          check(signal3);
+          if (error?.code !== "missing") throw error;
+          await writer.rollback();
+          skipped.missingAssets++;
+          state.total--;
+        }
         report();
         await breathe();
         if (i + 1 < assets.length && !pending) pending = prepare(assets[i + 1]);
@@ -3724,24 +3912,36 @@
       report({ stage: "inlays" }, true);
       for (const key of inventory.inlays) {
         check(signal3);
-        const entry = inlaySource(key, await source.inlay(key));
-        await writer.entry(entry.name, entry);
-        state.items++;
+        try {
+          const entry = inlaySource(key, await source.inlay(key));
+          await writer.entry(entry.name, entry);
+          state.items++;
+        } catch (error) {
+          check(signal3);
+          if (error?.code !== "invalidInlay") throw error;
+          await writer.rollback();
+          skipped.unsupportedInlays++;
+          state.total--;
+        }
         report();
         await breathe();
       }
       report({ stage: "verify" }, true);
       await source.verifyInventory(inventory);
-      const finalHash = await digest(await source.database(), signal3, (n) => {
-        state.readBytes += n;
-        report();
-      });
+      const finalHash = await retrying(
+        await source.database(),
+        () => source.database(),
+        (database) => digest(database, signal3, (n) => {
+          state.readBytes += n;
+          report();
+        })
+      );
       if (initialHash !== finalHash) fail("changed");
       await source.verifyInventory(inventory);
       report({ stage: "finishing" }, true);
       await writer.finish();
       report({ stage: "complete" }, true);
-      return { bytes: writer.position, items: state.items };
+      return { bytes: writer.position, items: state.items, skipped: { ...skipped } };
     } catch (error) {
       source.cancel?.();
       await writer.abort();
@@ -3781,6 +3981,13 @@
       elapsed: "Elapsed",
       speed: "Write speed",
       read: "Database read",
+      skipped: "Skipped",
+      skippedNote: "The following items were skipped. Everything else is included in the backup.",
+      missingAssets: "Missing assets",
+      missingCold: "Missing archived chats",
+      unreadableCold: "Unreadable archived chats",
+      pluginCold: "Plugin storage data",
+      unsupportedInlays: "Unsupported inlays",
       local: "Local",
       indexeddb: "Local · IndexedDB",
       opfs: "Local · OPFS",
@@ -3794,15 +4001,14 @@
       active: "An export is already running.",
       failed: "Export failed. No complete backup was saved.",
       changed: "Saved data changed during export. Stop edits and generation, wait for saving to finish, then try again.",
-      missing: "A required asset or archived chat is missing. Open it in RisuAI and try again.",
       missingDatabase: "No saved RisuAI database was found on this page.",
+      nodeServer: "This RisuAI page saves data on its server, not in this browser. Back up the server’s save folder instead.",
       login: "Account authentication failed. Sign in again in RisuAI, wait for saving to finish, then retry.",
       network: "An account download failed. Check the connection and try again.",
       migration: "A storage migration is incomplete. Reload RisuAI and wait for it to finish before exporting.",
       unsupported: "This saved database format is not supported. Open and save it in the supported RisuAI release, then retry.",
       invalidData: "Saved data is malformed or unsupported. Export was stopped.",
       invalidCold: "An archived-chat reference is invalid. Export was stopped.",
-      invalidInlay: "An inlay is malformed or unsupported. Export was stopped.",
       invalidName: "An asset name cannot be preserved in this backup format. Export was stopped.",
       duplicate: "Two entries would use the same backup name. Export was stopped.",
       truncated: "A saved file ended unexpectedly. Export was stopped.",
@@ -3842,6 +4048,13 @@
       elapsed: "경과 시간",
       speed: "기록 속도",
       read: "읽은 DB 용량",
+      skipped: "제외한 항목",
+      skippedNote: "다음 항목은 백업에서 제외했습니다. 나머지 데이터는 모두 백업에 포함되었습니다.",
+      missingAssets: "찾을 수 없는 에셋",
+      missingCold: "찾을 수 없는 보관된 채팅",
+      unreadableCold: "읽을 수 없는 보관된 채팅",
+      pluginCold: "플러그인 저장 데이터",
+      unsupportedInlays: "지원하지 않는 인레이",
       local: "로컬",
       indexeddb: "로컬 · IndexedDB",
       opfs: "로컬 · OPFS",
@@ -3855,15 +4068,14 @@
       active: "내보내기가 진행 중입니다.",
       failed: "내보내기에 실패했습니다. 완성된 백업이 저장되지 않았습니다.",
       changed: "내보내기 중 저장된 데이터가 변경되었습니다. 편집과 생성을 중지하고 저장이 완료된 후 다시 시도해주세요.",
-      missing: "필요한 에셋 또는 보관된 채팅이 없습니다. 웹리스에서 해당 데이터를 연 후 다시 시도해주세요.",
       missingDatabase: "이 페이지에서 저장된 웹리스 DB를 찾을 수 없습니다.",
+      nodeServer: "이 웹리스 페이지는 데이터를 브라우저가 아닌 서버에 저장합니다. 서버의 저장 폴더를 대신 백업해주세요.",
       login: "계정 인증에 실패했습니다. 웹리스에 다시 로그인하고 저장이 완료된 후 다시 시도해주세요.",
       network: "계정 데이터 다운로드에 실패했습니다. 연결을 확인하고 다시 시도해주세요.",
       migration: "저장소 이동이 완료되지 않았습니다. 웹리스를 새로고침하고 이동이 끝난 후 내보내기해주세요.",
       unsupported: "지원하지 않는 DB 저장 형식입니다. 지원하는 웹리스 릴리즈에서 열고 저장한 후 다시 시도해주세요.",
       invalidData: "저장된 데이터가 잘못되었거나 지원하지 않는 형식입니다. 내보내기가 중지되었습니다.",
       invalidCold: "보관된 채팅 참조가 잘못되었습니다. 내보내기가 중지되었습니다.",
-      invalidInlay: "인레이 데이터가 잘못되었거나 지원하지 않는 형식입니다. 내보내기가 중지되었습니다.",
       invalidName: "백업 형식에서 보존할 수 없는 에셋 이름입니다. 내보내기가 중지되었습니다.",
       duplicate: "백업 파일 이름이 중복됩니다. 내보내기가 중지되었습니다.",
       truncated: "저장된 파일이 중간에 끊겼습니다. 내보내기가 중지되었습니다.",
@@ -3919,6 +4131,11 @@
     for await (const [name, handle] of dir.entries()) {
       if (handle.kind === "file" && TEMP_NAME.test(name)) await dir.removeEntry(name);
     }
+    try {
+      await (await navigator.storage.getDirectory()).removeEntry(TEMP_DIR);
+    } catch (error) {
+      if (!["NotFoundError", "InvalidModificationError"].includes(error.name)) throw error;
+    }
   }
   function mount() {
     const existing = document.getElementById("risunest-web-export");
@@ -3941,7 +4158,8 @@ dl{display:grid;grid-template-columns:1fr 1fr;gap:5px 12px;margin:12px 0}dt{colo
 <p data-text="intro"></p><p class="note" data-text="firefox" hidden></p>
 <label><input type="checkbox"><span data-text="confirmed"></span></label>
 <p class="status" role="status" aria-live="polite"></p><progress hidden></progress>
-<dl hidden><dt data-text="written"></dt><dd data-value="bytes"></dd><dt data-text="items"></dt><dd data-value="items"></dd><dt data-text="elapsed"></dt><dd data-value="elapsed"></dd><dt data-text="speed"></dt><dd data-value="speed"></dd><dt data-text="read"></dt><dd data-value="read"></dd></dl>
+<dl hidden><dt data-text="written"></dt><dd data-value="bytes"></dd><dt data-text="items"></dt><dd data-value="items"></dd><dt data-text="elapsed"></dt><dd data-value="elapsed"></dd><dt data-text="speed"></dt><dd data-value="speed"></dd><dt data-text="read"></dt><dd data-value="read"></dd><dt data-text="skipped" data-skipped hidden></dt><dd data-value="skipped" data-skipped hidden></dd></dl>
+<div class="skipped" hidden><p class="note" data-text="skippedNote"></p><dl></dl></div>
 <div class="actions"><button class="primary" data-action="start" data-text="start" disabled></button><button data-action="cancel" data-text="cancel" hidden></button><button class="primary" data-action="download" data-text="download" hidden></button><button data-action="persist" data-text="persist" hidden></button><button data-action="cleanup" data-text="cleanup" hidden></button><button data-action="close" data-text="close"></button></div>
 </section>`;
     document.documentElement.append(host);
@@ -3969,6 +4187,17 @@ dl{display:grid;grid-template-columns:1fr 1fr;gap:5px 12px;margin:12px 0}dt{colo
         find('[data-value="items"]').textContent = state.items + (state.total == null ? "" : " / " + state.total);
         find('[data-value="elapsed"]').textContent = Math.floor(seconds / 60) + ":" + String(Math.floor(seconds % 60)).padStart(2, "0");
         find('[data-value="speed"]').textContent = formatBytes(state.bytes / seconds) + "/s";
+        const skipped = Object.entries(state.skipped ?? {}).filter(([, count]) => count);
+        const total = skipped.reduce((sum, [, count]) => sum + count, 0);
+        for (const node of root.querySelectorAll("[data-skipped]")) node.hidden = !total;
+        find('[data-value="skipped"]').textContent = total;
+        find(".skipped").hidden = !total || busy || state.stage !== "complete";
+        find(".skipped dl").replaceChildren(...skipped.flatMap(([reason, count]) => {
+          const term = document.createElement("dt"), value = document.createElement("dd");
+          term.textContent = t(reason);
+          value.textContent = count;
+          return [term, value];
+        }));
         const progress = find("progress");
         progress.hidden = !busy;
         if (state.total != null && !["verify", "finishing"].includes(state.stage)) {
@@ -4053,6 +4282,7 @@ dl{display:grid;grid-template-columns:1fr 1fr;gap:5px 12px;margin:12px 0}dt{colo
       endTime = null;
       output = null;
       find("dl").hidden = true;
+      find(".skipped").hidden = true;
       find("progress").hidden = true;
       button("cancel").disabled = false;
       find(".status").classList.remove("error");
@@ -4061,6 +4291,7 @@ dl{display:grid;grid-template-columns:1fr 1fr;gap:5px 12px;margin:12px 0}dt{colo
       render();
       let picker;
       try {
+        checkPlatform();
         picker = temporary ? null : window.showSaveFilePicker({
           suggestedName: "RisuNest-web-backup-" + (/* @__PURE__ */ new Date()).toISOString().slice(0, 10) + ".bin",
           types: [{ description: "RisuNest backup", accept: { "application/octet-stream": [".bin"] } }]
