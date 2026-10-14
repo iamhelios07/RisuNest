@@ -173,8 +173,11 @@ Var SyncPreviousInstall
   sync_install_dir_ready:
   !insertmacro CheckInstallDestination
   InitPluginsDir
+  ; An unfinished install keeps its baseline so a retry still removes the files it replaced.
+  IfFileExists "$INSTDIR\risunest-sync-bundle.previous.json" sync_baseline_ready
   ClearErrors
-  CopyFiles /SILENT "$INSTDIR\risunest-sync-bundle.json" "$PLUGINSDIR\previous-bundle.json"
+  CopyFiles /SILENT "$INSTDIR\risunest-sync-bundle.json" "$INSTDIR\risunest-sync-bundle.previous.json"
+  sync_baseline_ready:
   ClearErrors
   !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
   StrCpy $R7 ""
@@ -223,13 +226,15 @@ Var SyncPreviousInstall
   sync_obsolete:
   StrCmp $SyncPreviousInstall "" sync_schedule
   DetailPrint "$(SyncObsolete)"
-  nsExec::ExecToStack '"$INSTDIR\risunest-sync-manager.exe" installer obsolete-files "$PLUGINSDIR\previous-bundle.json"'
+  nsExec::ExecToStack '"$INSTDIR\risunest-sync-manager.exe" installer obsolete-files "$INSTDIR\risunest-sync-bundle.previous.json"'
   Pop $0
   Pop $1
   StrCmp $0 "0" sync_obsolete_checked
   StrCpy $SyncFailureMessage "$(SyncObsoleteFailed)"
   Goto sync_install_failed
   sync_obsolete_checked:
+  Delete "$INSTDIR\risunest-sync-bundle.previous.json"
+  ClearErrors
   StrCpy $2 $1 7
   ${If} $2 == "skipped"
     DetailPrint "$(SyncObsoleteSkipped)"
