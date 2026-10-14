@@ -1,0 +1,7 @@
+node_modules/
+.tmp/
+test-results/
+!package-lock.json
+!dist/
+!dist/*.js
+!dist/THIRD_PARTY_LICENSES.md
