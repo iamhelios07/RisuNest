@@ -141,6 +141,29 @@ describe('common backup file production route', () => {
         expect(m.legacy.mock.calls[0][1]).toEqual({type:'androidSpool',token:'synthetic-materialized'})
         expect(m.discard).toHaveBeenCalledWith('synthetic-materialized')
     })
+    it('propagates cancellation into the Android copy and removes its late result before restore', async () => {
+        m.invoke.mockResolvedValue('local-backup')
+        const released: string[] = []
+        const removed: string[] = []
+        const bridge = {
+            copyExport() {},
+            async materializeBackupSource() {
+                m.controller.abort()
+                await Promise.resolve()
+                return JSON.stringify({ ready: [{ token: 'late-copy' }], failures: [] })
+            },
+            discardPortableSource(token: string) { released.push(token); return true },
+            discardSource(token: string) { removed.push(token); return true },
+        }
+        const { materializeAndroidBackupSource } = await vi.importActual<typeof import('./androidSafBridge')>('./androidSafBridge')
+        m.materializeAndroid.mockImplementation((token, options) => materializeAndroidBackupSource(token, options, bridge))
+        await expect(restoreBackupFromNativeSource({ type: 'androidSeekable', token: 'synthetic-custody' }))
+            .rejects.toMatchObject({ name: 'AbortError' })
+        expect(released).toEqual(['synthetic-custody'])
+        expect(removed).toEqual(['late-copy'])
+        expect(m.legacy).not.toHaveBeenCalled()
+        expect(m.invoke).toHaveBeenLastCalledWith('native_portable_source_discard', { source: { type: 'androidSeekable', token: 'synthetic-custody' } })
+    })
     it.each([false, true])('reports iOS copy progress and propagates cancellation before restore (cancel %s)', async cancel => {
         const { materializeIOSBackupSource, discardIOSFile } = await vi.importActual<typeof import('./iosFiles')>('./iosFiles')
         m.materializeIOS.mockImplementation(materializeIOSBackupSource)

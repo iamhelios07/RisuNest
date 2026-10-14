@@ -4,6 +4,7 @@ import { join } from '@tauri-apps/api/path'
 import { iosStagingPath } from './nativePaths'
 import { mkdir, remove, writeFile } from '@tauri-apps/plugin-fs'
 import { isTauriIOS } from '../platform'
+import { backupSourceCopyFailure } from './backupSourceCopyFailure'
 
 export interface IOSPickedFile {
     path: string
@@ -93,7 +94,7 @@ export async function materializeIOSBackupSource(
         return result
     } catch (error) {
         if (options.signal?.aborted) throw cancelled()
-        throw error
+        throw backupSourceCopyFailure(error)
     } finally {
         options.signal?.removeEventListener('abort', onAbort)
         if (onProgress) onProgress.onmessage = () => {}

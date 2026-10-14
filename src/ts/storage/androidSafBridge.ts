@@ -1,5 +1,6 @@
 import { withLibraryFileSelection } from './libraryFileOperation'
 import '../androidNativeControl'
+import { BackupSourceCopyError } from './backupSourceCopyFailure'
 import type { NativeFileJobSource } from './nativeFileJobs'
 
 const SPOOL_EVENT = 'risu-android-spool-ready'
@@ -459,7 +460,7 @@ export async function materializeAndroidBackupSource(
             throw cancelled()
         }
         const failure = batch.failures[0]
-        if (failure) throw new AndroidSafSourceError(failure.code, failure.code)
+        if (failure) throw new BackupSourceCopyError(failure.code)
         if (batch.ready.length !== 1) throw new AndroidSafSourceError('source-reselect-required', 'Backup source copy is unavailable')
         return {type: 'androidSpool', token: batch.ready[0].token}
     } catch (error) {
