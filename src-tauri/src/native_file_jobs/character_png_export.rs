@@ -4,6 +4,7 @@ use super::{
     JobControl, JobPhase, JobProgress, JobResultSummary, NativeJobError,
 };
 use crate::asset_repository::PayloadCas;
+use crate::import_export_jobs::png_card::PngCardLimits;
 use crate::persistent_store::{
     export::{self, destination},
     PreparedRisuSaveExport, StoreResult,
@@ -23,9 +24,6 @@ use uuid::Uuid;
 
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 const MAX_PNG_CHUNK_BYTES: usize = i32::MAX as usize;
-const MAX_EMBEDDED_ASSET_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_EMBEDDED_ASSET_COUNT: u64 = 10_000;
-const MAX_EMBEDDED_ASSET_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 struct PngExportLimits {
@@ -251,6 +249,7 @@ pub(crate) fn export_character_png(
         handoff_directory,
         destination_path,
         job,
+        PngCardLimits::default(),
         PreparedRisuSaveExport::release_reader,
     )
 }
@@ -264,6 +263,7 @@ fn export_character_png_with_release<F>(
     handoff_directory: &Path,
     destination_path: Option<&Path>,
     job: &JobControl,
+    limits: PngCardLimits,
     release_reader: F,
 ) -> Result<JobResultSummary, NativeJobError>
 where
@@ -326,7 +326,7 @@ where
                 Ok(Some(reference))
             })
             .collect::<Result<Vec<_>, NativeJobError>>()?;
-        if next_reference > MAX_EMBEDDED_ASSET_COUNT {
+        if next_reference > limits.max_embedded_asset_count as u64 {
             return Err(invalid_input("PNG embedded asset count exceeds its limit"));
         }
         let embedded_asset_bytes = sources.iter().flatten().try_fold(
@@ -336,24 +336,20 @@ where
                     JsonAssetSource::Cas { size, .. } => *size,
                     JsonAssetSource::FallbackPortrait => FALLBACK_PORTRAIT.len() as u64,
                 };
-                if size > MAX_EMBEDDED_ASSET_BYTES {
-                    return Err(invalid_input(
-                        "PNG embedded asset exceeds the importer limit",
-                    ));
+                if size > limits.max_embedded_asset_bytes {
+                    return Err(invalid_input("PNG embedded asset exceeds the importer limit"));
                 }
                 total
                     .checked_add(size)
                     .ok_or_else(|| invalid_input("PNG embedded asset total length overflow"))
             },
         )?;
-        if embedded_asset_bytes > MAX_EMBEDDED_ASSET_TOTAL_BYTES {
+        if embedded_asset_bytes > limits.max_embedded_asset_total_bytes {
             return Err(invalid_input("PNG embedded asset total exceeds its limit"));
         }
         let metadata_length = serialized_json_length(&metadata)?;
-        if metadata_length > super::content::JSON_CARD_MAX_METADATA_BYTES {
-            return Err(invalid_input(
-                "PNG card metadata exceeds the importer limit",
-            ));
+        if metadata_length as u64 > limits.max_card_metadata_bytes {
+            return Err(invalid_input("PNG card metadata exceeds the importer limit"));
         }
         let portrait = prepare_png_portrait(portrait, PngExportLimits::default(), || {
             job.is_cancel_requested()
@@ -505,9 +501,7 @@ fn portrait_bytes(
     let size = u64::try_from(alias.size)
         .map_err(|_| invalid_input("pinned character portrait size is invalid"))?;
     if size > PngExportLimits::default().max_input_bytes as u64 {
-        return Err(invalid_input(
-            "character portrait exceeds the PNG input limit",
-        ));
+        return Err(invalid_input("character portrait exceeds the PNG input limit"));
     }
     read_verified_object(repository, &hash, size, job)
 }
@@ -561,10 +555,8 @@ fn write_asset_text_chunk(
             Box::new(Cursor::new(FALLBACK_PORTRAIT)),
         ),
     };
-    if size > MAX_EMBEDDED_ASSET_BYTES {
-        return Err(invalid_input(
-            "PNG embedded asset exceeds the importer limit",
-        ));
+    if size > PngCardLimits::default().max_embedded_asset_bytes {
+        return Err(invalid_input("PNG embedded asset exceeds the importer limit"));
     }
     let encoded = size
         .checked_add(2)
@@ -1024,6 +1016,7 @@ mod tests {
                 &handoffs,
                 (!portable).then_some(destination.as_path()),
                 &job,
+                PngCardLimits::default(),
                 |prepared| {
                     release_calls.set(release_calls.get() + 1);
                     prepared.release_reader()?;
@@ -1118,7 +1111,27 @@ mod tests {
         let job = JobRegistry::default()
             .create(JobKind::ExportCharacterCard)
             .unwrap();
-        export_character_png(
+        let limits = PngCardLimits {
+            max_embedded_asset_count: 1,
+            max_embedded_asset_bytes: asset.size as u64,
+            max_embedded_asset_total_bytes: asset.size as u64,
+            ..PngCardLimits::default()
+        };
+        for refused_limits in [
+            PngCardLimits { max_embedded_asset_count: 0, ..limits },
+            PngCardLimits { max_embedded_asset_bytes: asset.size as u64 - 1, ..limits },
+            PngCardLimits { max_embedded_asset_total_bytes: asset.size as u64 - 1, ..limits },
+        ] {
+            let refused = export_character_png_with_release(
+                store.prepare_risu_save_export(revision).unwrap(), "png-character", metadata.clone(),
+                &owned, &directory.path().join("handoffs"), Some(&destination),
+                &JobRegistry::default().create(JobKind::ExportCharacterCard).unwrap(),
+                refused_limits, PreparedRisuSaveExport::release_reader,
+            ).unwrap_err();
+            assert_eq!(refused.code, "invalid-input");
+            assert!(!destination.exists());
+        }
+        export_character_png_with_release(
             prepared,
             "png-character",
             metadata,
@@ -1126,6 +1139,8 @@ mod tests {
             &directory.path().join("handoffs"),
             Some(&destination),
             &job,
+            limits,
+            PreparedRisuSaveExport::release_reader,
         )
         .unwrap();
         let parse_root = directory.path().join("parse");
@@ -1133,7 +1148,7 @@ mod tests {
         let parsed = parse_png_card(
             &mut fs::File::open(destination).unwrap(),
             &parse_root,
-            PngCardLimits::default(),
+            limits,
             || false,
         )
         .unwrap();
