@@ -13,7 +13,14 @@ pub enum Entry {
 
 pub async fn main(entry: Entry) {
     if let Err(error) = run(entry).await {
-        eprintln!("{} ({})", tui::error_message(&error), error);
+        if cfg!(windows) && std::env::args().any(|arg| {
+            matches!(arg.as_str(), "installer" | "lock-held" | "prepare-update" | "--dry-run")
+        }) {
+            eprintln!("{error}");
+            eprintln!("{}", tui::error_message(&error));
+        } else {
+            eprintln!("{} ({})", tui::error_message(&error), error);
+        }
         std::process::exit(1);
     }
 }
@@ -45,7 +52,8 @@ async fn run(entry: Entry) -> Result<()> {
             "--data-dir" => root = PathBuf::from(args.next().ok_or("data-dir-required")?),
             "--server" => executable = PathBuf::from(args.next().ok_or("server-path-required")?),
             "--help" | "-h" => {
-                println!("risunest-sync-manager [--data-dir PATH] [--server EXECUTABLE] [status|start|stop|autostart install|autostart remove|update status|update policy automatic|notify|off|update check|uninstall [--delete-data] [--dry-run] [--yes]]\n명령을 생략하면 관리 메뉴를 엽니다.");
+                let force = if cfg!(windows) { " [--force]" } else { "" };
+                println!("risunest-sync-manager [--data-dir PATH] [--server EXECUTABLE] [status|start|stop|autostart install|autostart remove|update status|update policy automatic|notify|off|update check|uninstall{force} [--delete-data] [--dry-run] [--yes]]\n명령을 생략하면 관리 메뉴를 엽니다.");
                 return Ok(());
             }
             _ => command.push(arg),
@@ -163,6 +171,28 @@ async fn run(entry: Entry) -> Result<()> {
             cleanup
         }
         ["installer", "finish", nonce] => update::finish_installer_guard(&root, nonce),
+        #[cfg(windows)]
+        ["installer", "register"] => crate::removal::register(&root, &executable),
+        #[cfg(windows)]
+        ["installer", "obsolete-files", previous] => {
+            let removed = crate::removal::remove_obsolete_owned_files(&executable, &PathBuf::from(previous))?;
+            println!("{}", if removed { "checked" } else { "skipped" });
+            Ok(())
+        }
+        #[cfg(windows)]
+        ["installer", "removal-check", mode, data] => {
+            let force = match *mode { "force" => true, "normal" => false, _ => return Err("invalid-uninstall-option".into()) };
+            let delete = match *data { "delete" => true, "preserve" => false, _ => return Err("invalid-uninstall-option".into()) };
+            let plan = crate::removal::plan_with_force(&root, &executable, delete, force)?;
+            if !plan.blockers.is_empty() { return Err(plan.blockers.join(", ")); }
+            println!("{}", if plan.delete_data { "delete-data" } else { "keep-data" });
+            Ok(())
+        }
+        #[cfg(windows)]
+        ["installer", "remove-files", mode] => {
+            let force = match *mode { "force" => true, "normal" => false, _ => return Err("invalid-uninstall-option".into()) };
+            crate::removal::remove_owned_files(&root, &executable, force)
+        }
         #[cfg(not(windows))]
         ["removal-helper", parent, mode @ ("delete" | "preserve")] => {
             crate::removal::finish_after_exit(
@@ -174,6 +204,12 @@ async fn run(entry: Entry) -> Result<()> {
             .await
         }
         ["uninstall", "lock-held"] => crate::removal::cleanup_services(&root, &executable).await,
+        #[cfg(windows)]
+        ["uninstall", "lock-held", "--force"] => {
+            let plan = crate::removal::plan_with_force(&root, &executable, false, true)?;
+            if !plan.blockers.is_empty() { return Err(plan.blockers.join(", ")); }
+            crate::removal::cleanup_services(&root, &executable).await
+        }
         ["installer", "forget-removal"] => crate::removal::forget_registration(&root, &executable),
         ["installer", "delete-data"] => crate::removal::delete_registered_data(&root, &executable),
         ["uninstall", ..] => crate::removal::cli(&root, &executable, &command[1..]).await,

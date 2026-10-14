@@ -19,6 +19,8 @@ RequestExecutionLevel user
 OutFile "${join(directory, 'test.exe')}"
 !include LogicLib.nsh
 !include FileFunc.nsh
+LoadLanguageFile "${'$'}{NSISDIR}\Contrib\Language files\English.nlf"
+LoadLanguageFile "${'$'}{NSISDIR}\Contrib\Language files\Korean.nlf"
 !define MAINBINARYNAME "SyntheticSync"
 !define PRODUCTNAME "Synthetic Sync"
 !macro CheckIfAppIsRunning executable product
@@ -48,12 +50,16 @@ test('Sync NSIS preserves data by default, protects updates, and aborts before b
     writeFileSync(stubSource, String.raw`
 use std::{env, fs, io::Write};
 fn main() {
- let root=env::current_exe().unwrap().parent().unwrap().to_path_buf();
+ let mut root=env::current_exe().unwrap().parent().unwrap().to_path_buf();
  let mut values=env::args().skip(1).collect::<Vec<_>>();
  let data=if values.first().is_some_and(|v| v=="--data-dir") {let data=std::path::PathBuf::from(values[1].clone());values.drain(0..2);data} else {root.join("local/RisuNestSyncData")};
+ if values.first().is_some_and(|v| v=="--server") {root=std::path::PathBuf::from(&values[1]).parent().unwrap().to_owned();values.drain(0..2);}
  if values.iter().any(|v| v=="forget-removal") {return;}
  assert!(data.starts_with(&root));
- let args=values.join(" ");
+ let args=values.join(" ").trim().to_owned();
+ if args=="installer removal-check normal delete" {println!("delete-data");}
+ if args=="installer removal-check normal preserve" {println!("keep-data");}
+ if args=="installer removal-check force delete" {println!("keep-data");}
  let mut log=fs::OpenOptions::new().create(true).append(true).open(root.join("calls")).unwrap();
  writeln!(log,"{args}: {}",data.display()).unwrap();
  if values.first().is_some_and(|v| v=="installer") && values.get(1).is_some_and(|v| v=="prepare") {
@@ -72,7 +78,7 @@ fn main() {
     const built = spawnSync('rustc', ['--edition=2021', stubSource, '-o', binary], { encoding: 'utf8', timeout: 60000, windowsHide: true });
     assert.equal(built.status, 0, built.stderr);
     const hook = join(directory, 'hook.nsh');
-    writeFileSync(hook, readFileSync(resolve('server/manager/install/windows.nsh'), 'utf8').replaceAll('$LOCALAPPDATA', '$INSTDIR\\local'));
+    writeFileSync(hook, readFileSync(resolve('server/manager/install/windows.nsh'), 'utf8').replaceAll('$LOCALAPPDATA', '$INSTDIR\\local').replace(/!include [^\r\n]+windows-common.nsh"/, `!include "${resolve('src-tauri/windows-common.nsh')}"`));
     const script = join(directory, 'installer.nsi');
     writeFileSync(script, String.raw`
 Unicode true
@@ -82,6 +88,8 @@ SilentUnInstall silent
 OutFile "${q(join(directory, 'installer.exe'))}"
 !include LogicLib.nsh
 !include FileFunc.nsh
+LoadLanguageFile "${'$'}{NSISDIR}\Contrib\Language files\English.nlf"
+LoadLanguageFile "${'$'}{NSISDIR}\Contrib\Language files\Korean.nlf"
 !define MAINBINARYNAME "SyntheticSync"
 !define PRODUCTNAME "Synthetic Sync"
 Var UpdateMode
@@ -119,12 +127,13 @@ SectionEnd
       { name: 'custom', custom: true, args: ['/DELETEAPPDATA'], data: false, installed: false, code: 0 },
       { name: 'update', args: ['/UPDATE', '/DELETEAPPDATA'], data: true, installed: false, code: 0 },
       { name: 'failed', args: ['/DELETEAPPDATA'], fail: true, data: true, installed: true, code: 1 },
+      { name: 'forced-unregistered', args: ['/FORCE', '/DELETEAPPDATA'], unregistered: true, data: true, installed: false, code: 0 },
     ]) {
       const location = join(directory, scenario.name);
       const dataRoot = join(location, scenario.custom ? 'custom server data' : 'local/RisuNestSyncData');
       mkdirSync(dataRoot, { recursive: true });
       writeFileSync(join(dataRoot, 'synthetic'), 'fixture');
-      writeFileSync(join(dataRoot, 'risunest-sync-instance.json'), '{}');
+      if (!scenario.unregistered) writeFileSync(join(dataRoot, 'risunest-sync-instance.json'), '{}');
       if (scenario.fail) writeFileSync(join(location, 'fail'), 'fixture');
       assert.equal(spawnSync(join(directory, 'installer.exe'), ['/S', `/D=${location}`], { timeout: 30000, windowsHide: true }).status, 0);
       const result = spawnSync(join(location, 'uninstall.exe'), ['/S', ...scenario.args, `_?=${location}`], { timeout: 30000, windowsHide: true, env: { ...process.env, RISUNEST_SYNC_UNINSTALL_DATA_DIR: scenario.custom ? dataRoot : '' } });
@@ -137,12 +146,18 @@ SectionEnd
         assert.doesNotMatch(calls, /uninstall|delete-data|forget-removal/);
       } else {
         assert.equal([...calls.matchAll(/^installer prepare ([1-9]\d*):/gm)].length, 1, `${scenario.name}: prepare receives the uninstaller owner PID`);
-        assert.match(calls, /^uninstall lock-held:/m);
+        assert.match(calls, /^uninstall lock-held(?: --force)?:/m);
         assert.ok(calls.indexOf('installer prepare ') < calls.indexOf('uninstall lock-held'), `${scenario.name}: acquire guard before cleanup`);
       }
       if (scenario.name === 'delete') {
         assert.match(calls, /^installer finish aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:/m);
         assert.ok(calls.indexOf('installer finish') < calls.indexOf('installer delete-data'));
+      }
+      if (scenario.unregistered) {
+        assert.match(calls, /installer removal-check force delete/);
+        assert.match(calls, /uninstall lock-held --force/);
+        assert.match(calls, /installer remove-files force/);
+        assert.doesNotMatch(calls, /installer delete-data/);
       }
     }
   } finally {
@@ -166,6 +181,8 @@ SilentInstall silent
 OutFile "${q(join(directory, 'installer.exe'))}"
 !include LogicLib.nsh
 !include FileFunc.nsh
+LoadLanguageFile "${'$'}{NSISDIR}\Contrib\Language files\English.nlf"
+LoadLanguageFile "${'$'}{NSISDIR}\Contrib\Language files\Korean.nlf"
 !define MAINBINARYNAME "SyntheticSync"
 !define PRODUCTNAME "Synthetic Sync"
 !define RISUNEST_SYNC_DEFAULT_INSTALL_DIR "${q(original)}"
