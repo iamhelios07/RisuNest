@@ -24,6 +24,32 @@ afterEach(async () => {
     component = undefined; target?.remove(); clearExternalProgress('synthetic'); vi.useRealTimers()
 })
 describe('external storage shared panel', () => {
+    it('shows the staging phase share beside its operation after completed transfers without inventing a total or completing the operation', async () => {
+        await show({ onboarding: true })
+        const run = beginExternalProgress('synthetic', 'binding')
+        let report!: (reading: unknown) => void
+        native.invoke.mockImplementation(async (_name, { progress }) => { report = progress.onmessage })
+        await run.invoke('synthetic', {})
+        const statusValues = () => [...target.querySelectorAll('[role="status"] .tabular-nums')].map(node => node.textContent)
+        const reading = { sequence: 1, stage: 'applying', preparedBytes: '0', uploadedBytes: '0', downloadedBytes: '1024', uploadedObjects: '0', downloadedObjects: '100' }
+        report({ ...reading, staging: { phase: 'validate', done: 25, total: 100 } }); await tick()
+        expect(target.textContent).toContain(strings.staging.validate)
+        expect(statusValues()).toEqual([strings.transfer.connecting, '25%'])
+        expect(counterRows()).toEqual([[strings.transfer.downloaded, objectsValue(1024, '100')]])
+        expect(target.querySelector('[role="progressbar"]')?.getAttribute('aria-valuenow')).toBe('25')
+        report({ ...reading, sequence: 2, staging: { phase: 'project', done: 3, total: null } }); await tick()
+        expect(target.textContent).toContain(strings.staging.project)
+        expect(statusValues()).toEqual([strings.transfer.connecting])
+        expect(target.querySelector('[role="progressbar"]')?.hasAttribute('aria-valuenow')).toBe(false)
+        report({ ...reading, sequence: 3, staging: { phase: 'check', done: 100, total: 100 } }); await tick()
+        expect(target.textContent).toContain(strings.staging.check)
+        expect(target.textContent).not.toContain(strings.transfer.connectionComplete)
+        run.stage('finalizing'); await tick()
+        expect(target.textContent).not.toContain(strings.staging.check)
+        expect(target.querySelector('[role="progressbar"]')?.hasAttribute('aria-valuenow')).toBe(false)
+        run.finish('complete'); await tick()
+        expect(target.textContent).toContain(strings.transfer.connectionComplete)
+    })
     it.each(['backup', 'restore'] as const)('shows %s network speed from live job samples and hides it when paused', async kind => {
         vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'performance'] })
         const network = { id: kind, atMs: 0, sentBytes: '0', receivedBytes: '0', sending: kind === 'backup', receiving: kind === 'restore' }
