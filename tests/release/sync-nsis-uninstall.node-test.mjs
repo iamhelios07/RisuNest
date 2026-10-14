@@ -117,6 +117,17 @@ ${'$'}{GetOptions} $0 "/UPDATE" $1
 ${'$'}{IfNot} ${'$'}{Errors}
 StrCpy $UpdateMode 1
 ${'$'}{EndIf}
+; The template preselects deletion for /DELETEAPPDATA; /UNCHECKED stands for the user clearing it.
+ClearErrors
+${'$'}{GetOptions} $0 "/DELETEAPPDATA" $1
+${'$'}{IfNot} ${'$'}{Errors}
+StrCpy $DeleteAppDataCheckboxState 1
+${'$'}{EndIf}
+ClearErrors
+${'$'}{GetOptions} $0 "/UNCHECKED" $1
+${'$'}{IfNot} ${'$'}{Errors}
+StrCpy $DeleteAppDataCheckboxState 0
+${'$'}{EndIf}
 FunctionEnd
 Section Uninstall
 !insertmacro NSIS_HOOK_PREUNINSTALL
@@ -134,6 +145,7 @@ SectionEnd
       { name: 'failed', args: ['/DELETEAPPDATA'], fail: true, data: true, installed: true, code: 1 },
       { name: 'forced-unregistered', args: ['/FORCE', '/DELETEAPPDATA'], unregistered: true, data: true, installed: false, code: 0 },
       { name: 'copy-failed', args: [], missingManager: true, data: true, installed: false, code: 1 },
+      { name: 'unchecked', args: ['/DELETEAPPDATA', '/UNCHECKED'], data: true, installed: false, code: 0 },
     ]) {
       const location = join(directory, scenario.name);
       const dataRoot = join(location, scenario.custom ? 'custom server data' : 'local/RisuNestSyncData');
@@ -171,6 +183,10 @@ SectionEnd
         assert.match(calls, /installer removal-check force delete/);
         assert.match(calls, /uninstall lock-held --force/);
         assert.match(calls, /installer remove-files force/);
+        assert.doesNotMatch(calls, /installer delete-data/);
+      }
+      if (scenario.name === 'unchecked') {
+        assert.match(calls, /^installer removal-check normal preserve:/m);
         assert.doesNotMatch(calls, /installer delete-data/);
       }
     }

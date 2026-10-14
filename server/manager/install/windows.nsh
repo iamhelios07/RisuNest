@@ -245,11 +245,6 @@ Var SyncPreviousInstall
   ${If} $1 != ""
     StrCpy $R9 $1
   ${EndIf}
-  ClearErrors
-  ${un.GetOptions} $0 "/DELETEAPPDATA" $1
-  ${IfNot} ${Errors}
-    StrCpy $DeleteAppDataCheckboxState 1
-  ${EndIf}
   StrCpy $SyncFailureMessage "$(SyncCheckFailed)"
   DetailPrint "$(SyncCheck)"
   StrCpy $SyncForce "normal"
