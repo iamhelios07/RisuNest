@@ -96,7 +96,6 @@ export function references() {
                 || (parent === 'files' && path.includes('vits'))
                 || (key === 1 && ['emotionImages', 'additionalAssets', 'assets'].includes(path.at(-3)))) {
                 assets.add(value);
-                if (assets.size + cold.size > 199999) fail('tooMany');
             }
         }
     };
@@ -210,7 +209,6 @@ export async function scanDatabase(stream, refs, signal, onChunk, maxDecodedBloc
             if (![0, 1, 2, 4, 5, 7, 9, 10, 11].includes(type)) fail('unsupported');
             if (expected.has(type) && expected.get(type) !== name) fail('invalidData');
             names.add(name);
-            if (names.size > 200000) fail('tooMany');
             const header = new Uint8Array(7 + nameLength);
             header.set(head); header.set(label, 3); header.set(size, 3 + nameLength);
             const held = write && type === 11 && length <= MAX_HELD_PLUGIN_STORAGE ? [] : null;

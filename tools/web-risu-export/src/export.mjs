@@ -157,7 +157,6 @@ export async function exportBackup({ source, sink, signal, progress = () => {} }
             }
             for (const asset of found.assets) refs.assets.add(asset);
             for (const next of found.cold) coldKeys.add(next);
-            if (coldKeys.size + refs.assets.size > 199999) fail('tooMany');
             state.items++; report();
         }
         // Upstream v3 plugin storage values live in cold storage; RisuNest cannot restore them yet.

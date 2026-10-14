@@ -1,6 +1,7 @@
 import "../../src/ts/polyfill";
 import { invoke as nativeInvoke } from "@tauri-apps/api/core";
-import { appDataDir, join } from "@tauri-apps/api/path";
+import { join } from "@tauri-apps/api/path";
+import { nativeDataPath } from "../../src/ts/storage/nativePaths";
 import {
   PluginDeviceKeyspace,
   createNativePluginDeviceBackend,
@@ -394,7 +395,7 @@ async function start() {
   control.stage = "export";
   control.startedAt = Date.now();
   control.backupPath = await join(
-    await appDataDir(),
+    await nativeDataPath(),
     "synthetic-device-backup.risunest",
   );
   save();
@@ -467,7 +468,7 @@ async function completeRestore() {
       await syntheticRuntime(),
       {
         type: "desktopPath",
-        path: await join(await appDataDir(), "synthetic-cancelled.risunest"),
+        path: await join(await nativeDataPath(), "synthetic-cancelled.risunest"),
       },
       { library: false, deviceSections: ["hypa"] },
       {
@@ -604,7 +605,18 @@ function fail(error: unknown) {
     "Synthetic device backup smoke failed";
 }
 
-const entryCompletion = deviceMaintenanceBeforeBootstrap()
+async function verifySyntheticRoot() {
+  const expected = import.meta.env.VITE_DEVICE_SMOKE_ROOT;
+  if (!expected && navigator.userAgent.includes('Windows')) throw new Error('Synthetic Windows root is required');
+  if (expected) {
+    const actual = await nativeDataPath();
+    const normalized = (value: string) => value.replaceAll('\\', '/').toLowerCase();
+    if (normalized(actual) !== normalized(expected)) throw new Error('Synthetic native root mismatch');
+  }
+}
+
+const entryCompletion = verifySyntheticRoot()
+  .then(() => deviceMaintenanceBeforeBootstrap())
   .then(resume)
   .catch(fail);
 

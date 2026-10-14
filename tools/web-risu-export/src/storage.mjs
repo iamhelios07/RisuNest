@@ -51,7 +51,6 @@ export class IdbStore {
             if (!batch.length) break;
             if (batch.some(key => typeof key !== 'string')) fail('invalidName');
             all.push(...batch);
-            if (all.length > 200000) fail('tooMany');
             last = batch.at(-1);
             if (batch.length < 512) break;
         } while (true);
@@ -258,7 +257,6 @@ export class BrowserSource {
                     const key = fromHex(name);
                     if (key?.startsWith('assets/')) assets.push(key);
                 }
-                if (assets.length + cold.length > 199999) fail('tooMany');
             }
         }
         if (this.mode !== 'opfs') {
@@ -266,7 +264,6 @@ export class BrowserSource {
             assets.push(...(await db?.keys(this.signal) ?? []).filter(key => key.startsWith('assets/')));
         }
         const inlays = await this.inlays?.keys(this.signal) ?? [];
-        if (assets.length + cold.length + inlays.length > 199999) fail('tooMany');
         return { assets: assets.sort(), cold: cold.sort(), inlays: inlays.sort() };
     }
     async database() {
