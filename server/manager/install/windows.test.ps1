@@ -282,6 +282,20 @@ path = "main.rs"
         $armOnArm = Compile-Template 'arm64-on-arm64' ($armHost.Replace('!define ARCH "x64"', '!define ARCH "arm64"'))
         Run-Installer $armOnArm @('/S', '/NS') 0
         if (!(Test-Path $keep)) { throw 'Architecture migration removed unowned data.' }
+        # Reinstalling a registered installation whose folder was deleted recreates it in place.
+        $deleted = Join-Path $testRoot 'deleted installation'
+        Move-Item -LiteralPath $installed -Destination $deleted
+        try {
+            Run-Installer $fixtureInstaller @('/S', '/NS', "/D=$relocated") 1
+            Run-Installer $modeInstaller @('/P', '/NS', "/D=$relocated") 1
+            if (Test-Path $relocated) { throw 'A missing installation folder allowed relocation.' }
+            Run-Installer $fixtureInstaller @('/S', '/NS') 0
+            if (!(Test-Path (Join-Path $installed "$fixtureName.exe"))) { throw 'Reinstalling did not recreate the missing installation folder.' }
+            if ((Get-Item $productKey).GetValue('') -ne $installed) { throw 'Reinstalling relocated the missing installation folder.' }
+        } finally {
+            if (Test-Path -LiteralPath $installed) { Remove-Item -LiteralPath $installed -Recurse -Force }
+            Move-Item -LiteralPath $deleted -Destination $installed
+        }
         $permissions = Get-Acl -LiteralPath $installed
         $denied = Get-Acl -LiteralPath $installed
         $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User

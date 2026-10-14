@@ -570,11 +570,19 @@ Function .onInit
       StrCpy $InstallFailureMessage "$(InstallLocationMissing)"
       Call InitializationFailure
     ${EndIf}
-    GetFullPathName $INSTDIR "$ExistingNsis\."
+    ; The installation folder may be gone; reinstalling there recreates it.
+    StrCpy $0 "$ExistingNsis\."
+    Call NormalizePath
+    ${If} $0 == ""
+      StrCpy $InstallFailureMessage "$(InstallLocationMissing)"
+      Call InitializationFailure
+    ${EndIf}
+    StrCpy $INSTDIR $0
     ${If} ${Silent}
     ${OrIf} $PassiveMode = 1
       ${If} $RequestedInstallDir != "${PLACEHOLDER_INSTALL_DIR}"
-        GetFullPathName $0 "$RequestedInstallDir\."
+        StrCpy $0 "$RequestedInstallDir\."
+        Call NormalizePath
         ${If} $0 != $INSTDIR
           StrCpy $InstallFailureMessage "$(InstallRelocation)"
           Call InitializationFailure
@@ -617,6 +625,18 @@ Function InitializationFailure
     MessageBox MB_OK|MB_ICONSTOP "$InstallFailureMessage"
   SetErrorLevel 1
   Quit
+FunctionEnd
+
+; GetFullPathName fails for a path that does not exist; the Win32 call only normalizes it.
+; Takes the path in $0 and leaves the normalized path, or "" on failure, in $0.
+Function NormalizePath
+  System::Call 'kernel32::GetFullPathNameW(w r0, i ${NSIS_MAX_STRLEN}, w .r1, p 0) i .r2'
+  ${If} $2 = 0
+  ${OrIf} $2 >= ${NSIS_MAX_STRLEN}
+    StrCpy $0 ""
+  ${Else}
+    StrCpy $0 $1
+  ${EndIf}
 FunctionEnd
 
 Function SkipExistingDirectory
