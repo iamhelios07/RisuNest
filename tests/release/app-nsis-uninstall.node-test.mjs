@@ -88,7 +88,6 @@ SilentUnInstall silent
 OutFile "${quote(join(root, "installer.exe"))}"
 !include LogicLib.nsh
 !include FileFunc.nsh
-!include WordFunc.nsh
 LoadLanguageFile "${'$'}{NSISDIR}\Contrib\Language files\English.nlf"
 LoadLanguageFile "${'$'}{NSISDIR}\Contrib\Language files\Korean.nlf"
 !define MAINBINARYNAME "SyntheticRisuNest"

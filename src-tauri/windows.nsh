@@ -1,4 +1,5 @@
 !include "${__FILEDIR__}\windows-common.nsh"
+!include WordFunc.nsh
 LangString AppRemoveData 1033 "Removing RisuNest application data..."
 LangString AppRemoveData 1042 "RisuNest 애플리케이션 데이터를 삭제합니다..."
 LangString AppRemoveFailed 1033 "RisuNest application data could not be removed. Run the uninstaller again to retry."
