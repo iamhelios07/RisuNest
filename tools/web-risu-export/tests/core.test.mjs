@@ -29,7 +29,8 @@ test('incremental JSON visits leaves without retaining parents and rejects malfo
 test('current release block layout discovers assets and cold references across compressed chunk boundaries', async () => {
     for (const compressed of [false, true]) {
         const db = database({
-            compressed, root: { customBackground: 'assets/background.webp', personas: [{ embeddedModule: { assets: [['x', 'assets/module.png']] } }] },
+            compressed, root: { customBackground: 'assets/background.webp', personas: [{ embeddedModule: { assets: [['x', 'assets/module.png']] } }], characterOrder: [{ img: 'assets/folder.png', imgFile: 'assets/folder-file.png' }] },
+            presets: [{ image: 'assets/preset.png' }],
             character: {
                 image: 'assets/icon.jpg', emotionImages: [['happy', 'assets/happy.png']],
                 additionalAssets: [['file', 'assets/file.bin']], vits: { files: { voice: 'assets/voice.onnx' } },
@@ -40,17 +41,17 @@ test('current release block layout discovers assets and cold references across c
         const refs = references(); let raw = 0;
         await scanDatabase(fragmented(db, 3), refs, undefined, bytes => { raw += bytes.length; });
         assert.equal(raw, db.length);
-        assert.deepEqual([...refs.assets].sort(), ['background.webp', 'card.webp', 'file.bin', 'happy.png', 'icon.jpg', 'module.png', 'voice.onnx'].map(v => 'assets/' + v).sort());
+        assert.deepEqual([...refs.assets].sort(), ['background.webp', 'card.webp', 'file.bin', 'folder.png', 'folder-file.png', 'happy.png', 'icon.jpg', 'module.png', 'preset.png', 'voice.onnx'].map(v => 'assets/' + v).sort());
         assert.deepEqual([...refs.cold], [coldId]);
     }
 });
 test('raw and compressed legacy message-pack databases preserve reference discovery', async () => {
-    const packed = msgpack({ characters: [{ image: 'assets/old.png', chats: [{ message: [{ data: COLD_HEADER + coldId }] }] }] });
+    const packed = msgpack({ characters: [{ image: 'assets/old.png', chats: [{ message: [{ data: COLD_HEADER + coldId }] }] }], characterOrder: [{ img: 'assets/folder.png' }], botPresets: [{ image: 'assets/preset.png' }] });
     for (const format of [7, 8, 9]) {
         const bytes = Buffer.concat([Buffer.from('\0RISUSAVE\0'), Buffer.from([format]), format === 7 ? packed : gzipSync(packed)]);
         const refs = references();
         await scanDatabase(fragmented(bytes, 2), refs);
-        assert.deepEqual([...refs.assets], ['assets/old.png']);
+        assert.deepEqual([...refs.assets].sort(), ['assets/folder.png', 'assets/old.png', 'assets/preset.png']);
         assert.deepEqual([...refs.cold], [coldId]);
         await assert.rejects(scanDatabase(fragmented(bytes, 2), references(), undefined, undefined, 32), error => error.code === 'recordTooLarge');
     }
@@ -65,7 +66,7 @@ test('rejects directory mismatches, unsupported blocks and truncation', async ()
     for (const bytes of invalid) await assert.rejects(scanDatabase(fragmented(bytes, 7), references()), ExportError);
 });
 test('backup contains original database bytes, every asset type, orphaned inlays and decoded cold JSON', async () => {
-    const db = database({ character: { image: 'assets/icon.jpg', coldstorage: coldId } });
+    const db = database({ character: { image: 'assets/icon.jpg', coldstorage: coldId }, root: { characterOrder: [{ img: 'assets/folder.png', imgFile: 'assets/folder-file.png' }] }, presets: [{ image: 'assets/preset.png' }] });
     const cold = Buffer.from(JSON.stringify({ character: { chaId: 'character-1', image: 'assets/archived.webp' } }));
     const media = Buffer.from([0, 1, 2, 253, 254, 255]);
     const inlays = new Map([
@@ -75,18 +76,20 @@ test('backup contains original database bytes, every asset type, orphaned inlays
         ['signature', { name: 'sig', ext: 'json', type: 'signature', data: '{"signatures":[]}' }]
     ]);
     const source = fixtureSource({
-        db, assets: new Map([['assets/icon.jpg', media], ['assets/archived.webp', media], ['assets/nested/model.onnx', media]]),
+        db, mode: 'account', assets: new Map(['icon.jpg', 'archived.webp', 'nested/model.onnx', 'folder.png', 'folder-file.png', 'preset.png'].map(name => ['assets/' + name, media])),
         cold: new Map([[coldId, gzipSync(cold)]]), inlays
     });
+    // Only the unreferenced model is cached; all referenced images must be discovered.
+    source.inventory = async () => ({ assets: ['assets/nested/model.onnx'], cold: [coldId], inlays: [...inlays.keys()] });
     const sink = new MemorySink(), progress = [];
     const result = await exportBackup({ source, sink, progress: item => progress.push(item) });
     const entries = archive(sink.bytes);
-    assert.equal(result.items, 9);
+    assert.equal(result.items, 12);
     assert.equal(result.bytes, sink.bytes.length);
     assert(sink.closed && !sink.aborted);
     assert.deepEqual(entries.get('database.risudat'), db);
     assert.deepEqual(entries.get('coldstorage_' + coldId + '.json'), cold);
-    for (const name of ['icon.jpg', 'archived.webp', 'nested/model.onnx']) assert.deepEqual(entries.get(name), media);
+    for (const name of ['icon.jpg', 'archived.webp', 'nested/model.onnx', 'folder.png', 'folder-file.png', 'preset.png']) assert.deepEqual(entries.get(name), media);
     for (const [key, original] of inlays) {
         const bytes = entries.get('inlay_' + keyHex(key) + '.risuinlay');
         const size = bytes.readUInt32LE(0);
@@ -104,7 +107,9 @@ test('missing referenced assets, changed database and failed writes never finali
     const changed = fixtureSource();
     let reads = 0;
     changed.database = async () => sourceOf(database({ root: { name: 'version-' + reads++ } }));
-    for (const source of [missing, changed]) {
+    const missingFolder = fixtureSource({ db: database({ root: { characterOrder: [{ img: 'assets/missing-folder.png' }] } }) });
+    const missingPreset = fixtureSource({ db: database({ presets: [{ image: 'assets/missing-preset.png' }] }) });
+    for (const source of [missing, missingFolder, missingPreset, changed]) {
         const sink = new MemorySink();
         await assert.rejects(exportBackup({ source, sink }));
         assert(sink.aborted && !sink.closed);

@@ -79,6 +79,7 @@ export function references() {
             if (key === 'data' && value.startsWith(COLD_HEADER)) addCold(value.slice(COLD_HEADER.length));
             if (!value.startsWith('assets/')) return;
             if (['customBackground', 'userIcon', 'image', 'icon', 'imgFile'].includes(key)
+                || (key === 'img' && path.at(-3) === 'characterOrder')
                 || (key === 'uri' && path.includes('ccAssets'))
                 || (parent === 'files' && path.includes('vits'))
                 || (key === 1 && ['emotionImages', 'additionalAssets', 'assets'].includes(path.at(-3)))) {
@@ -193,7 +194,7 @@ export async function scanDatabase(stream, refs, signal, onChunk, maxDecodedBloc
                         directory.add(value);
                     } else fail('invalidData');
                 }
-                if (![0, 4, 9, 10, 11].includes(type)) refs.visit(path, value);
+                if (![0, 9, 10, 11].includes(type)) refs.visit(path, value);
             }, signal, maxDecodedBlockBytes);
             if ([4, 5, 9, 10].includes(type) ? rootType !== 'array' : rootType !== 'object') fail('invalidData');
             if (type === 2 || type === 7) {

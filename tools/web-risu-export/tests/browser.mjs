@@ -29,7 +29,10 @@ try {
         const errors = [];
         page.on('pageerror', error => errors.push(error.message));
         await page.goto(origin);
-        const db = database({ character: { image: 'assets/synthetic.webp', ...(mode === 'account' ? { coldstorage: coldId } : {}) } });
+        const db = database({
+            character: { image: 'assets/synthetic.webp', ...(mode === 'account' ? { coldstorage: coldId } : {}) },
+            ...(mode === 'account' ? { root: { characterOrder: [{ img: 'assets/folder.png' }] }, presets: [{ image: 'assets/preset.png' }] } : {})
+        });
         if (mode === 'account') {
             await context.route('https://sv.risuai.xyz/**', async route => {
                 const request = route.request(), path = new URL(request.url()).pathname;
@@ -46,6 +49,8 @@ try {
                     if (key === 'database/database.bin') body = db;
                     else if (key === 'assets/synthetic.webp') body = Buffer.alloc(8 * 1024 * 1024, 37);
                     else if (key === 'assets/cold.png') body = Buffer.from([5, 6]);
+                    else if (key === 'assets/folder.png') body = Buffer.from([8, 9]);
+                    else if (key === 'assets/preset.png') body = Buffer.from([10, 11]);
                     else throw new Error('Unexpected synthetic asset request');
                 } else if (path === '/hub/account/coldstorage') {
                     assert.equal(request.headers()['x-risu-key'], coldId);
@@ -154,10 +159,12 @@ try {
         assert.deepEqual(entries.get('database.risudat'), db);
         assert.equal(entries.get('synthetic.webp').length, 8 * 1024 * 1024);
         assert(entries.get('synthetic.webp').every(byte => byte === 37));
-        assert.equal(entries.size, mode === 'account' ? 7 : 4);
+        assert.equal(entries.size, mode === 'account' ? 9 : 4);
         if (mode === 'account') {
             assert.deepEqual(entries.get('cached.png'), Buffer.from([7]));
             assert.deepEqual(entries.get('cold.png'), Buffer.from([5, 6]));
+            assert.deepEqual(entries.get('folder.png'), Buffer.from([8, 9]));
+            assert.deepEqual(entries.get('preset.png'), Buffer.from([10, 11]));
             assert.equal(JSON.parse(entries.get('coldstorage_' + coldId + '.json')).character.chaId, 'character-1');
         }
         if (mode === 'indexeddb') {

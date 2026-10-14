@@ -12,9 +12,9 @@ export function rawBlock(type, name, body, compressed = false) {
     label.copy(header, 3); header.writeUInt32LE(body.length, 3 + label.length);
     return Buffer.concat([header, body]);
 }
-export function database({ compressed = false, root = {}, character = {}, modules = [] } = {}) {
+export function database({ compressed = false, root = {}, character = {}, modules = [], presets = [] } = {}) {
     const entries = [
-        [4, 'preset', []], [5, 'modules', modules], [9, 'plugins', []],
+        [4, 'preset', presets], [5, 'modules', modules], [9, 'plugins', []],
         [10, 'loadouts', []], [11, 'pluginStorage', {}], [0, 'config', { version: 1 }],
         [2, 'character-1', { chaId: 'character-1', type: 'character', name: 'Synthetic', chats: [], ...character }]
     ];
