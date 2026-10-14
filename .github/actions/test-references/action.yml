@@ -15,3 +15,9 @@ runs:
         ref: b315d898abd543fffaf5346d8eb3246b20da92cd
         path: .tmp/test-references/pocket
         persist-credentials: false
+    - name: Prepare isolated reference libraries
+      shell: bash
+      run: |
+        node scripts/compatibleExportDependencies.mjs --prepare
+        pnpm --dir .tmp/test-reference-dependencies/risuai install --no-frozen-lockfile
+        pnpm --dir .tmp/test-reference-dependencies/pocket install --no-frozen-lockfile
