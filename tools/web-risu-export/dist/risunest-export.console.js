@@ -3711,7 +3711,15 @@
   var BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
   var RETRIES = 3;
   var UNREADABLE = /* @__PURE__ */ new Set(["invalidData", "truncated", "recordTooLarge", "invalidCold"]);
-  var unreadable = (error) => error instanceof ExportError ? UNREADABLE.has(error.code) : error instanceof TypeError;
+  var unreadable = (error) => error instanceof ExportError && UNREADABLE.has(error.code);
+  async function* gunzip(source, signal3) {
+    try {
+      yield* chunks(source.stream().pipeThrough(new DecompressionStream("gzip")), signal3);
+    } catch (error) {
+      if (error instanceof TypeError) fail("invalidCold");
+      throw error;
+    }
+  }
   function assetName(key) {
     if (!key.startsWith("assets/")) fail("invalidName");
     const name = key.slice(7);
@@ -3813,8 +3821,7 @@
         found.visit(path, value);
       });
       await writer.begin("coldstorage_" + key + ".json");
-      const decoded = compressed.stream().pipeThrough(new DecompressionStream("gzip"));
-      for await (const bytes of chunks(decoded, signal3)) {
+      for await (const bytes of gunzip(compressed, signal3)) {
         size += bytes.length;
         if (size > MAX_COLD) fail("recordTooLarge");
         parser.write(bytes);

@@ -7,8 +7,12 @@ const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
 // A download that stalls or ends early restarts its entry, paced like the request retries.
 const RETRIES = 3;
 const UNREADABLE = new Set(['invalidData', 'truncated', 'recordTooLarge', 'invalidCold']);
-// Corrupt gzip surfaces as a TypeError from DecompressionStream.
-const unreadable = error => error instanceof ExportError ? UNREADABLE.has(error.code) : error instanceof TypeError;
+const unreadable = error => error instanceof ExportError && UNREADABLE.has(error.code);
+async function* gunzip(source, signal) {
+    // DecompressionStream reports corrupt gzip as a TypeError.
+    try { yield* chunks(source.stream().pipeThrough(new DecompressionStream('gzip')), signal); }
+    catch (error) { if (error instanceof TypeError) fail('invalidCold'); throw error; }
+}
 
 export function assetName(key) {
     if (!key.startsWith('assets/')) fail('invalidName');
@@ -103,8 +107,7 @@ export async function exportBackup({ source, sink, signal, progress = () => {} }
             found.visit(path, value);
         });
         await writer.begin('coldstorage_' + key + '.json');
-        const decoded = compressed.stream().pipeThrough(new DecompressionStream('gzip'));
-        for await (const bytes of chunks(decoded, signal)) {
+        for await (const bytes of gunzip(compressed, signal)) {
             size += bytes.length;
             if (size > MAX_COLD) fail('recordTooLarge');
             parser.write(bytes); await writer.append(bytes); await breathe();

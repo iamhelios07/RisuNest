@@ -215,6 +215,19 @@ test('cold storage exports only restorable archived chats and reports what it sk
     assert.deepEqual(result.skipped, { missingAssets: 0, missingCold: 0, unreadableCold: 3, pluginCold: 1, unsupportedInlays: 0 });
     assert(!requested.includes(plugin));
 });
+test('an output failure while writing an archived chat stops the export instead of skipping it', async () => {
+    const db = database({ character: { coldstorage: coldId } });
+    // The payload outgrows the output buffer, so the failing write happens inside the cold entry.
+    const cold = new Map([[coldId, gzipSync(JSON.stringify({ character: { chaId: 'character-1', note: 'x'.repeat(2 * 1024 * 1024) } }))]]);
+    const sink = new MemorySink(), progress = [];
+    const write = sink.write.bind(sink);
+    let writes = 0;
+    // The first two writes are the database entry and its backpatched length.
+    sink.write = async bytes => { if (++writes > 2) throw new TypeError('Synthetic closed output'); return write(bytes); };
+    await assert.rejects(exportBackup({ source: fixtureSource({ db, cold }), sink, progress: item => progress.push(item) }), TypeError);
+    assert.equal(progress.at(-1).stage, 'cold');
+    assert(sink.aborted && !sink.closed);
+});
 test('legacy untyped image inlays are exported and unusable inlays are skipped', async () => {
     const media = Buffer.from([137, 80, 78, 71]);
     const inlays = new Map([
