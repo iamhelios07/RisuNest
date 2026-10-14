@@ -22,7 +22,7 @@ mod classification;
 mod quarantine;
 #[path = "lww_binding_stage.rs"]
 mod binding_stage;
-pub(crate) use binding_stage::{BindingUnitStage, StagingProgress};
+pub(crate) use binding_stage::{BindingUnitStage, StagingObserver, StagingProgress};
 pub(super) use binding_stage::{binding_source_rows, source_digest_rows, catalog_digest, catalog_digest_observed, seed_binding_holds, validate_binding_source, validate_binding_source_rows, BINDING_STAGE_SCHEMA};
 #[path = "lww_intent_rows.rs"]
 pub(super) mod intent_rows;
