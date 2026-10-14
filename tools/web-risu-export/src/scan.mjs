@@ -1,15 +1,22 @@
 import { Tokenizer, TokenType as T } from '@streamparser/json';
-import { ByteReader, ExportError, check, chunks, decoder, fail, streamOf, yielding } from './bytes.mjs';
+import { ByteReader, ExportError, check, chunks, decoder, encoder, fail, streamOf, yielding } from './bytes.mjs';
 
 export const COLD_HEADER = '\uEF01COLDSTORAGE\uEF01';
 export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// RisuNest caps each message and character detail at 8 MiB and any other block at 1 GiB decoded.
 const MAX_STRING = 8 * 1024 * 1024;
 const MAX_BLOCK = 1024 * 1024 * 1024;
+// Longer MessagePack strings cannot hold a reference, so they are skipped undecoded.
+const MAX_REFERENCE = 64 * 1024;
+// An unset upstream pluginCustomStorage is an empty block; RisuNest 1.0.4 and older reject it.
+const MAX_HELD_PLUGIN_STORAGE = 64 * 1024;
+const EMPTY_PLUGIN_STORAGE = Uint8Array.of(11, 0, 13, ...encoder.encode('pluginStorage'), 2, 0, 0, 0, ...encoder.encode('{}'));
 
 // Token events avoid retaining enclosing characters, chats, or the root object.
 export class JsonScan {
-    constructor(visit) {
+    constructor(visit, { maxString = MAX_STRING, blank = false } = {}) {
         this.visit = visit; this.stack = []; this.rootDone = false; this.pending = 0;
+        this.maxString = maxString; this.blank = blank;
         this.decoder = new TextDecoder('utf-8', { fatal: true });
         this.tokenizer = new Tokenizer({ stringBufferSize: 64 * 1024 });
         this.tokenizer.onToken = token => { this.pending = 0; this.token(token); };
@@ -40,13 +47,13 @@ export class JsonScan {
             this.visit(path, object ? {} : []);
             this.stack.push({ path, object, state: object ? 'keyOrEnd' : 'valueOrEnd', index: 0 });
         } else if ([T.STRING, T.NUMBER, T.TRUE, T.FALSE, T.NULL].includes(token)) {
-            if (typeof value === 'string' && value.length > MAX_STRING) fail('recordTooLarge');
+            if (typeof value === 'string' && value.length > this.maxString) fail('recordTooLarge');
             this.visit(path, value);
         } else fail('invalidData');
     }
     write(bytes) {
         this.pending += bytes.length;
-        if (this.pending > MAX_STRING + 256 * 1024) fail('recordTooLarge');
+        if (this.pending > this.maxString + 256 * 1024) fail('recordTooLarge');
         try {
             const text = this.decoder.decode(bytes, { stream: true });
             if (text) this.tokenizer.write(text);
@@ -60,19 +67,24 @@ export class JsonScan {
             this.tokenizer.end();
         }
         catch (error) { if (error instanceof ExportError) throw error; fail('invalidData'); }
-        if (!this.rootDone || this.stack.length) fail('truncated');
+        if (this.stack.length || !this.rootDone && !this.blank) fail('truncated');
     }
 }
 export function references() {
-    const assets = new Set(), cold = new Set();
+    const assets = new Set(), cold = new Set(), pluginCold = new Set();
     let token = '';
     function addCold(key) { if (!UUID.test(key)) fail('invalidCold'); cold.add(key); }
+    // Upstream v3 plugin storage keeps each value in cold storage under pluginCustomStorage._coldplugin.
+    function visitPluginStorage(path, value) {
+        if (path.length === 2 && path[0] === '_coldplugin' && typeof value === 'string' && value) pluginCold.add(value);
+    }
     return {
-        assets, cold,
+        assets, cold, pluginCold, visitPluginStorage,
         get token() { return token; },
         visit(path, value) {
             if (typeof value !== 'string') return;
             const key = path.at(-1), parent = path.at(-2);
+            if (path[0] === 'pluginCustomStorage') visitPluginStorage(path.slice(1), value);
             if (key === 'token' && parent === 'account') token = value;
             if (key === 'coldstorage' && value) addCold(value);
             if (parent === 'coldStoragedChats' && value) addCold(value);
@@ -89,8 +101,8 @@ export function references() {
         }
     };
 }
-export async function scanJson(stream, visit, signal, max = MAX_BLOCK) {
-    const parser = new JsonScan(visit);
+export async function scanJson(stream, visit, signal, max = MAX_BLOCK, options) {
+    const parser = new JsonScan(visit, options);
     const breathe = yielding(signal);
     let length = 0;
     for await (const bytes of chunks(stream, signal)) {
@@ -112,7 +124,10 @@ async function scanMessagePack(reader, visit, signal) {
         if ((tag & 0xe0) === 0xa0) length = tag & 31;
         else if (tag >= 0xd9 && tag <= 0xdb) length = await reader.number([1, 2, 4][tag - 0xd9]);
         if (length != null) {
-            if (length > MAX_STRING) fail('recordTooLarge');
+            if (!asKey && length > MAX_REFERENCE) {
+                for await (const _ of reader.parts(length)) await breathe();
+                return;
+            }
             const text = decoder.decode(await reader.take(length));
             if (!asKey) visit(path, text);
             return text;
@@ -148,15 +163,28 @@ async function scanMessagePack(reader, visit, signal) {
     await value([]);
     if (await reader.available()) fail('invalidData');
 }
-export async function scanDatabase(stream, refs, signal, onChunk, maxDecodedBlockBytes = MAX_BLOCK) {
+async function* tap(parts, write) {
+    for await (const part of parts) { await write(part); yield part; }
+}
+async function* hold(parts, held) {
+    for await (const part of parts) { held.push(part.slice()); yield part; }
+}
+// Output failures keep their own error instead of reading as malformed input.
+class OutputError { constructor(error) { this.error = error; } }
+// `write` receives the database to store: the source bytes, except that an empty
+// pluginStorage block becomes an empty object.
+export async function scanDatabase(stream, refs, signal, onChunk, maxDecodedBlockBytes = MAX_BLOCK, write = null) {
     const reader = new ByteReader(stream, signal, onChunk);
+    const output = write;
+    write = output && (async bytes => { try { await output(bytes); } catch (error) { throw new OutputError(error); } });
     try {
         const first = await reader.take(9);
         if (decoder.decode(first) !== 'RISUSAVE\0') {
             const tail = await reader.take(2);
             const prefix = [...first, ...tail];
             if (decoder.decode(Uint8Array.from(prefix.slice(0, 10))) !== '\0RISUSAVE\0' || ![7, 8, 9].includes(prefix[10])) fail('unsupported');
-            const rest = streamOf(reader.rest());
+            await write?.(Uint8Array.from(prefix));
+            const rest = streamOf(write ? tap(reader.rest(), write) : reader.rest());
             const decoded = prefix[10] === 7 ? rest : rest.pipeThrough(new DecompressionStream('gzip'));
             const limited = new ByteReader(decoded, signal, bytes => {
                 decodedBytes += bytes.length;
@@ -167,20 +195,29 @@ export async function scanDatabase(stream, refs, signal, onChunk, maxDecodedBloc
             finally { await limited.close(); }
             return;
         }
+        await write?.(first);
         const names = new Set(), directory = new Set();
         let directoryFound = false;
         const expected = new Map([[0, 'config'], [1, 'root'], [4, 'preset'], [5, 'modules'], [9, 'plugins'], [10, 'loadouts'], [11, 'pluginStorage']]);
         while (await reader.available()) {
-            const [type, compression, nameLength] = await reader.take(3);
-            const name = decoder.decode(await reader.take(nameLength));
-            const length = await reader.number(4, true);
+            const head = await reader.take(3);
+            const [type, compression, nameLength] = head;
+            const label = await reader.take(nameLength);
+            const name = decoder.decode(label);
+            const size = await reader.take(4);
+            const length = new DataView(size.buffer, size.byteOffset, 4).getUint32(0, true);
             if (!name || names.has(name) || compression > 1) fail('invalidData');
             if (![0, 1, 2, 4, 5, 7, 9, 10, 11].includes(type)) fail('unsupported');
             if (expected.has(type) && expected.get(type) !== name) fail('invalidData');
             names.add(name);
             if (names.size > 200000) fail('tooMany');
+            const header = new Uint8Array(7 + nameLength);
+            header.set(head); header.set(label, 3); header.set(size, 3 + nameLength);
+            const held = write && type === 11 && length <= MAX_HELD_PLUGIN_STORAGE ? [] : null;
+            if (write && !held) await write(header);
             let characterId = null, rootType = null;
-            let block = streamOf(reader.parts(length));
+            const parts = reader.parts(length);
+            let block = streamOf(held ? hold(parts, held) : write ? tap(parts, write) : parts);
             if (compression) block = block.pipeThrough(new DecompressionStream('gzip'));
             await scanJson(block, (path, value) => {
                 if (!path.length) rootType = Array.isArray(value) ? 'array' : value && typeof value === 'object' ? 'object' : 'scalar';
@@ -194,9 +231,16 @@ export async function scanDatabase(stream, refs, signal, onChunk, maxDecodedBloc
                         directory.add(value);
                     } else fail('invalidData');
                 }
-                if (![0, 9, 10, 11].includes(type)) refs.visit(path, value);
-            }, signal, maxDecodedBlockBytes);
-            if ([4, 5, 9, 10].includes(type) ? rootType !== 'array' : rootType !== 'object') fail('invalidData');
+                if (type === 11) refs.visitPluginStorage?.(path, value);
+                else if (![0, 9, 10].includes(type)) refs.visit(path, value);
+            }, signal, maxDecodedBlockBytes, { maxString: type === 2 || type === 7 ? MAX_STRING : maxDecodedBlockBytes, blank: type === 11 });
+            if (type === 11 && rootType === null) {
+                if (write && !held) fail('invalidData');
+                if (held) await write(EMPTY_PLUGIN_STORAGE);
+            } else {
+                if ([4, 5, 9, 10].includes(type) ? rootType !== 'array' : rootType !== 'object') fail('invalidData');
+                if (held) { await write(header); for (const part of held) await write(part); }
+            }
             if (type === 2 || type === 7) {
                 if (characterId !== name) fail('invalidData');
             }
@@ -206,6 +250,7 @@ export async function scanDatabase(stream, refs, signal, onChunk, maxDecodedBloc
         for (const name of directory) if (!names.has(name)) fail('invalidData');
         for (const name of names) if (name !== 'root' && !directory.has(name)) fail('invalidData');
     } catch (error) {
+        if (error instanceof OutputError) throw error.error;
         if (error instanceof ExportError || signal?.aborted) throw error;
         fail('invalidData');
     } finally { await reader.close(); }
