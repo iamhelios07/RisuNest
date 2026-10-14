@@ -862,10 +862,60 @@ jobs:
           systemctl --user daemon-reload
           managed=$(node -e "const path=require('node:path'); const matches=require('./release-work/packages/assets.json').filter((asset) => asset.download.variant === 'managed' && asset.download.os === 'linux' && asset.download.arch === process.argv[1] && asset.download.format === 'tar.gz'); if (matches.length !== 1) throw new Error('Expected one managed Linux archive.'); process.stdout.write(path.resolve(matches[0].path));" "${{ matrix.arch }}")
           env -u XDG_CONFIG_HOME -u XDG_DATA_HOME bash server/manager/install/managed-install.integration.test.sh "$managed"
+      - name: Fetch and verify the previous published Windows Sync bundle
+        if: matrix.os == 'windows' && needs.prepare-draft.outputs.already_published != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'EOF'
+          import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
+          import { join } from "node:path";
+          import { compareVersions, parseTag } from "./scripts/release/contracts.mjs";
+          import { assetName, readJson } from "./scripts/release/common.mjs";
+          import { GitHubReleases } from "./scripts/release/github.mjs";
+          import { verifyFileSignature } from "./scripts/release/signatures.mjs";
+          // The upgrade and removal checks start from the newest Sync release published before this one.
+          const github = new GitHubReleases(process.env.GH_TOKEN);
+          const current = readJson("release-input.json").version;
+          const previous = (await github.listPublishedStable())
+            .filter(release => /^sync-v\d+\.\d+\.\d+$/.test(release.tag_name))
+            .map(release => ({ release, version: parseTag(release.tag_name).version }))
+            .filter(({ version }) => compareVersions(version, current) < 0)
+            .sort((a, b) => compareVersions(b.version, a.version))[0];
+          if (!previous) {
+            console.log("No Sync release was published before this one; released-bundle checks are skipped.");
+          } else {
+            const name = assetName({ product: "sync", variant: "managed", os: "windows", arch: process.env.ARCH, format: "zip", version: previous.version });
+            const directory = join(process.env.RUNNER_TEMP, "released-sync");
+            mkdirSync(directory, { recursive: true });
+            const bundle = join(directory, name);
+            writeFileSync(bundle, await github.downloadAsset(previous.release, name, 256 * 1024 * 1024));
+            const signature = (await github.downloadAsset(previous.release, `${name}.sig`, 64 * 1024)).toString("utf8");
+            await verifyFileSignature(bundle, signature, process.env.RISUNEST_UPDATE_PUBLIC_KEY);
+            appendFileSync(process.env.GITHUB_ENV, `RISUNEST_RELEASED_SYNC_BUNDLE=${bundle}\n`);
+            console.log(`Verified ${name} from ${previous.release.tag_name}.`);
+          }
+          EOF
       - name: Run synthetic Windows NSIS install failure and rollback checks
         if: matrix.os == 'windows' && needs.prepare-draft.outputs.already_published != 'true'
         shell: pwsh
-        run: pwsh -NoProfile -File server/manager/install/windows.test.ps1
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          $arguments = @()
+          if ($env:RISUNEST_RELEASED_SYNC_BUNDLE) {
+            $built = Join-Path $env:CARGO_TARGET_DIR "$env:TARGET/release"
+            $arguments = @(
+              '-ReleasedBundle', $env:RISUNEST_RELEASED_SYNC_BUNDLE,
+              '-ManagerBinary', (Join-Path $built 'risunest-sync-manager.exe'),
+              '-BackgroundBinary', (Join-Path $built 'risunest-sync-manager-background.exe')
+            )
+          }
+          pwsh -NoProfile -File server/manager/install/windows.test.ps1 @arguments
+          if ($LASTEXITCODE -ne 0) { throw "windows.test.ps1 exited with $LASTEXITCODE." }
       - name: Apply and roll back the produced macOS Sync app
         if: matrix.os == 'darwin' && needs.prepare-draft.outputs.already_published != 'true'
         shell: bash
