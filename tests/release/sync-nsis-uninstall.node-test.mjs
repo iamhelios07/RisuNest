@@ -100,6 +100,11 @@ Var DeleteAppDataCheckboxState
   Abort "Process check must use the installed executable path"
 !macroend
 !include "${q(hook)}"
+Function un.onUninstFailed
+FileOpen $0 "$INSTDIR\diagnostic" w
+FileWrite $0 "$SyncFailureMessage"
+FileClose $0
+FunctionEnd
 Section
 SetOutPath "$INSTDIR"
 File /oname=risunest-sync-manager.exe "${q(binary)}"
@@ -128,6 +133,7 @@ SectionEnd
       { name: 'update', args: ['/UPDATE', '/DELETEAPPDATA'], data: true, installed: false, code: 0 },
       { name: 'failed', args: ['/DELETEAPPDATA'], fail: true, data: true, installed: true, code: 1 },
       { name: 'forced-unregistered', args: ['/FORCE', '/DELETEAPPDATA'], unregistered: true, data: true, installed: false, code: 0 },
+      { name: 'copy-failed', args: [], missingManager: true, data: true, installed: false, code: 1 },
     ]) {
       const location = join(directory, scenario.name);
       const dataRoot = join(location, scenario.custom ? 'custom server data' : 'local/RisuNestSyncData');
@@ -136,10 +142,18 @@ SectionEnd
       if (!scenario.unregistered) writeFileSync(join(dataRoot, 'risunest-sync-instance.json'), '{}');
       if (scenario.fail) writeFileSync(join(location, 'fail'), 'fixture');
       assert.equal(spawnSync(join(directory, 'installer.exe'), ['/S', `/D=${location}`], { timeout: 30000, windowsHide: true }).status, 0);
+      if (scenario.missingManager) rmSync(join(location, 'risunest-sync-manager.exe'));
       const result = spawnSync(join(location, 'uninstall.exe'), ['/S', ...scenario.args, `_?=${location}`], { timeout: 30000, windowsHide: true, env: { ...process.env, RISUNEST_SYNC_UNINSTALL_DATA_DIR: scenario.custom ? dataRoot : '' } });
       assert.equal(result.status, scenario.code, `${scenario.name}: exit ${existsSync(join(location, "calls")) ? readFileSync(join(location, "calls"), "utf8") : "no manager calls"}`);
       assert.equal(existsSync(join(location, 'risunest-sync-manager.exe')), scenario.installed, `${scenario.name}: manager remains on failure`);
       assert.equal(existsSync(join(dataRoot, 'synthetic')), scenario.data, `${scenario.name}: data`);
+      if (scenario.missingManager) {
+        const diagnostic = readFileSync(join(location, 'diagnostic'), 'utf8');
+        assert.match(diagnostic, /removal-helper-copy-failed:/);
+        assert.ok(diagnostic.includes(join(location, 'risunest-sync-manager.exe')));
+        assert.equal(existsSync(join(location, 'calls')), false);
+        continue;
+      }
       const calls = readFileSync(join(location, 'calls'), 'utf8');
       if (scenario.name === 'update') {
         assert.match(calls, /^prepare-update:/);

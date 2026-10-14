@@ -235,6 +235,10 @@ path = "main.rs"
         $modeSource = [regex]::Replace($modeSource, 'FunctionEnd\r?\n\r?\nFunction InitializationFailure', "  SetSilent silent`nFunctionEnd`n`nFunction InitializationFailure")
         if (!$modeSource.Contains('SetSilent silent')) { throw 'Invocation-mode fixture did not insert its unattended continuation.' }
         $modeInstaller = Compile-Template 'invocation-modes' $modeSource
+        Set-ItemProperty $uninstallKey DisplayVersion '1.0.3'
+        Run-Installer $modeInstaller @('/P', '/NS', "/D=$relocated") 1
+        if (Test-Path $relocated) { throw 'Passive relocation changed the destination.' }
+        if ((Get-ItemProperty $uninstallKey).DisplayVersion -ne '1.0.3') { throw 'Passive relocation changed the installed version.' }
         foreach ($previous in @('1.0.3', '1.0.4', '9.0.0', 'invalid-version')) {
             $refused = $previous -in @('9.0.0', 'invalid-version')
             foreach ($mode in @('passive', 'interactive')) {
@@ -395,6 +399,35 @@ FunctionEnd
                 if (Test-Path $oldManager) { throw 'Forced removal left an owned manager.' }
                 if (!(Test-Path $unowned) -or !(Test-Path (Join-Path $data 'metadata.sqlite'))) { throw 'Forced removal deleted unowned files or unregistered data.' }
                 Write-Output 'Generated Sync forced removal preserves unowned files and unregistered data.'
+                Remove-Item -LiteralPath $unowned
+                foreach ($removalMode in @('normal', 'force')) {
+                    if (!(Test-Path $data)) {
+                        $seedServer = Join-Path $released 'risunest-sync-server.exe'
+                        & $seedServer init --data-dir $data | Out-Null
+                        if ($LASTEXITCODE -ne 0) { throw 'Synthetic data initialization failed.' }
+                        $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+                        $listener.Start()
+                        $port = $listener.LocalEndpoint.Port
+                        $listener.Stop()
+                        & $seedServer network configure --data-dir $data --listen "127.0.0.1:$port" | Out-Null
+                        if ($LASTEXITCODE -ne 0) { throw 'Synthetic listener configuration failed.' }
+                        & $ManagerBinary --data-dir $data --server $server update policy off | Out-Null
+                        if ($LASTEXITCODE -ne 0) { throw 'Synthetic update policy configuration failed.' }
+                    }
+                    Run-Installer $syncFixture @('/S', '/NS', "/D=$syncInstall") 0
+                    Invoke-Manager @('uninstall', 'lock-held')
+                    if ($removalMode -eq 'force') { Invoke-Manager @('installer', 'forget-removal') }
+                    $syntheticData = [IO.Path]::GetFullPath($data)
+                    if (!$syntheticData.StartsWith($testRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+                        throw 'Refusing to remove data outside the synthetic test profile.'
+                    }
+                    Remove-Item -LiteralPath $syntheticData -Recurse -Force
+                    $removeArgs = if ($removalMode -eq 'force') { @('/S', '/FORCE', "_?=$syncInstall") } else { @('/S', "_?=$syncInstall") }
+                    Run-Installer (Join-Path $syncInstall 'uninstall.exe') $removeArgs 0
+                    if (Test-Path $oldManager) { throw "$removalMode removal without a data directory left program files." }
+                    if (Test-Path $data) { throw "$removalMode removal recreated the absent data directory." }
+                }
+                Write-Output 'Normal and forced removal do not recreate an absent data directory.'
             } finally {
                 if (Test-Path $oldManager) {
                     & $oldManager --data-dir $data --server $server uninstall lock-held | Out-Null

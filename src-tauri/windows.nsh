@@ -16,17 +16,18 @@ LangString AppRemoveFailed 1042 "RisuNest 애플리케이션 데이터를 삭제
     SetDetailsPrint both
     DetailPrint "$(AppRemoveData)"
     SetDetailsPrint none
+    StrCpy $InstallFailureMessage ""
     ClearErrors
     ExecWait '"$INSTDIR\${MAINBINARYNAME}.exe" --remove-local-data --yes' $R6
-    SetDetailsPrint both
     ${If} ${Errors}
-    ${OrIf} $R6 != 0
+      StrCpy $InstallFailureMessage "$(AppRemoveFailed) (app-cleanup-launch-failed)"
+    ${ElseIf} $R6 != 0
+      StrCpy $InstallFailureMessage "$(AppRemoveFailed) (app-cleanup-exit:$R6)"
+    ${EndIf}
+    SetDetailsPrint both
+    ${If} $InstallFailureMessage != ""
       ; Keep the application and uninstaller available for another attempt.
       SetErrorLevel 1
-      StrCpy $InstallFailureMessage "$(AppRemoveFailed) (app-cleanup-exit:$R6)"
-      ${If} ${Errors}
-        StrCpy $InstallFailureMessage "$(AppRemoveFailed) (app-cleanup-launch-failed)"
-      ${EndIf}
       DetailPrint "$InstallFailureMessage"
       IfSilent +2
         MessageBox MB_OK|MB_ICONSTOP "$InstallFailureMessage"

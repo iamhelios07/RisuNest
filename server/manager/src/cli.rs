@@ -12,10 +12,9 @@ pub enum Entry {
 }
 
 pub async fn main(entry: Entry) {
-    if let Err(error) = run(entry).await {
-        if cfg!(windows) && std::env::args().any(|arg| {
-            matches!(arg.as_str(), "installer" | "lock-held" | "prepare-update" | "--dry-run")
-        }) {
+    let mut installer_diagnostics = false;
+    if let Err(error) = run(entry, &mut installer_diagnostics).await {
+        if installer_diagnostics {
             eprintln!("{error}");
             eprintln!("{}", tui::error_message(&error));
         } else {
@@ -42,7 +41,7 @@ fn background_command(command: &[&str]) -> bool {
     )
 }
 
-async fn run(entry: Entry) -> Result<()> {
+async fn run(entry: Entry, installer_diagnostics: &mut bool) -> Result<()> {
     let mut args = std::env::args().skip(1);
     let mut root = platform::default_data_dir()?;
     let mut executable = platform::server_executable()?;
@@ -59,9 +58,12 @@ async fn run(entry: Entry) -> Result<()> {
             _ => command.push(arg),
         }
     }
-    if entry == Entry::Background
-        && !background_command(&command.iter().map(String::as_str).collect::<Vec<_>>())
-    {
+    let command_parts = command.iter().map(String::as_str).collect::<Vec<_>>();
+    *installer_diagnostics = cfg!(windows) && matches!(command_parts.as_slice(),
+        ["installer", ..] | ["prepare-update", ..] | ["start", "lock-held"]
+        | ["uninstall", "lock-held", ..] | ["autostart", "install", "lock-held"]
+        | ["update", "schedule", "reconcile", "lock-held"]);
+    if entry == Entry::Background && !background_command(&command_parts) {
         return Err("invalid-command".into());
     }
     if !root.is_absolute() {
@@ -70,12 +72,7 @@ async fn run(entry: Entry) -> Result<()> {
     root = platform::resolve_manager_root(&root)?;
     let client = Client::new(root.clone())?;
     let manager = platform::manager_executable()?;
-    match command
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .as_slice()
-    {
+    match command_parts.as_slice() {
         [] => tui::run(&root, &executable).await,
         ["status"] => {
             println!("{}", client.status().await?);

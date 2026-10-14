@@ -737,13 +737,13 @@ pub async fn cli(root: &Path, server: &Path, arguments: &[String]) -> Result<()>
         }
     }
     let preview = plan_with_force(root, server, delete_data, force)?;
-    if !preview.blockers.is_empty() {
-        return Err(preview.blockers.join(", "));
-    }
     println!(
         "{}",
         serde_json::to_string_pretty(&preview).map_err(|_| "removal-preview-failed")?
     );
+    if !preview.blockers.is_empty() {
+        return Err(preview.blockers.join(", "));
+    }
     if dry_run {
         return Ok(());
     }

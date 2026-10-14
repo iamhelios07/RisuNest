@@ -224,7 +224,7 @@ SectionEnd
       assert.deepEqual(result.progress, names.map(name => [name, overrides[name] ?? stages[name]]));
     };
     expectStages(run('sync', 'install'), ['prepare', 'register', 'obsolete', 'schedule', 'autostart', 'start', 'finish']);
-    expectStages(run('sync', 'fresh', { existing: false }), ['register', 'obsolete', 'schedule', 'autostart', 'start']);
+    expectStages(run('sync', 'fresh', { existing: false }), ['register', 'schedule', 'autostart', 'start']);
     const removing = { prepare: 'Stopping RisuNest Sync and preparing removal...', finish: 'Preparing to remove RisuNest Sync server data...' };
     expectStages(run('sync', 'preserve', { remove: true }), ['check', 'prepare', 'cleanup', 'files', 'finish-removal', 'forget'], removing);
     expectStages(run('sync', 'delete', { remove: true, deleteData: true }), ['check', 'prepare', 'cleanup', 'finish', 'data', 'files', 'forget'], removing);

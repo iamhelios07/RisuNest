@@ -572,11 +572,13 @@ Function .onInit
     ${EndIf}
     GetFullPathName $INSTDIR "$ExistingNsis\."
     ${If} ${Silent}
-    ${AndIf} $RequestedInstallDir != "${PLACEHOLDER_INSTALL_DIR}"
-      GetFullPathName $0 "$RequestedInstallDir\."
-      ${If} $0 != $INSTDIR
-        StrCpy $InstallFailureMessage "$(InstallRelocation)"
-        Call InitializationFailure
+    ${OrIf} $PassiveMode = 1
+      ${If} $RequestedInstallDir != "${PLACEHOLDER_INSTALL_DIR}"
+        GetFullPathName $0 "$RequestedInstallDir\."
+        ${If} $0 != $INSTDIR
+          StrCpy $InstallFailureMessage "$(InstallRelocation)"
+          Call InitializationFailure
+        ${EndIf}
       ${EndIf}
     ${EndIf}
     ReadRegStr $0 SHCTX "${UNINSTKEY}" "DisplayVersion"

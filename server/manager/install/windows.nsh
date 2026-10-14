@@ -85,9 +85,11 @@ Var SyncForce
 Var SyncForceOption
 Var SyncDeleteMode
 Var SyncDiagnostic
+Var SyncPreviousInstall
 
 !macro NSIS_HOOK_PREINSTALL
   SetDetailsPrint both
+  StrCpy $SyncPreviousInstall $ExistingNsis
   ${IfThen} $ExistingNsis != "" ${|} Goto sync_install_dir_ready ${|}
   StrCmp $INSTDIR "${RISUNEST_SYNC_DEFAULT_INSTALL_DIR}" 0 sync_install_dir_ready
   StrCpy $INSTDIR "${RISUNEST_SYNC_INSTALL_DIR}"
@@ -103,6 +105,7 @@ Var SyncDiagnostic
   IfFileExists "$INSTDIR\risunest-sync-bundle.json" sync_prepare_existing
   IfFileExists "$INSTDIR\risunest-sync-manager.exe" 0 sync_prepare_done
   sync_prepare_existing:
+  StrCpy $SyncPreviousInstall "1"
   System::Call 'kernel32::GetCurrentProcessId()i.r0'
   DetailPrint "$(SyncPrepare)"
   !ifdef SYNC_INSTALLER_MANAGER
@@ -142,6 +145,7 @@ Var SyncDiagnostic
   StrCpy $SyncFailureMessage "$(SyncRegisterFailed)"
   Goto sync_install_failed
   sync_obsolete:
+  StrCmp $SyncPreviousInstall "" sync_schedule
   DetailPrint "$(SyncObsolete)"
   nsExec::ExecToStack '"$INSTDIR\risunest-sync-manager.exe" installer obsolete-files "$PLUGINSDIR\previous-bundle.json"'
   Pop $0
@@ -154,6 +158,7 @@ Var SyncDiagnostic
   ${If} $2 == "skipped"
     DetailPrint "$(SyncObsoleteSkipped)"
   ${EndIf}
+  sync_schedule:
   DetailPrint "$(SyncSchedule)"
   nsExec::ExecToStack '"$INSTDIR\risunest-sync-manager.exe" update schedule reconcile lock-held'
   Pop $0
@@ -229,7 +234,11 @@ Var SyncDiagnostic
   StrCpy $SyncFailureMessage "$(SyncRemovePrepareFailed)"
   ClearErrors
   CopyFiles /SILENT "$INSTDIR\risunest-sync-manager.exe" "$PLUGINSDIR\risunest-sync-remove.exe"
-  IfErrors sync_uninstall_failed
+  IfErrors 0 sync_uninstall_copy_ready
+  StrCpy $0 "copy-failed"
+  StrCpy $1 "removal-helper-copy-failed: $INSTDIR\risunest-sync-manager.exe -> $PLUGINSDIR\risunest-sync-remove.exe"
+  Goto sync_uninstall_failed
+  sync_uninstall_copy_ready:
   StrCpy $R9 "$LOCALAPPDATA\RisuNestSyncData"
   ${un.GetParameters} $0
   ReadEnvStr $1 RISUNEST_SYNC_UNINSTALL_DATA_DIR
@@ -266,6 +275,7 @@ Var SyncDiagnostic
     DetailPrint "$(SyncDataKept)"
   ${EndIf}
   StrCpy $R7 ""
+  IfFileExists "$R9\." 0 sync_uninstall_cleanup
   System::Call 'kernel32::GetCurrentProcessId()i.r0'
   StrCpy $SyncFailureMessage "$(SyncRemoveGuardFailed)"
   DetailPrint "$(SyncRemovePrepare)"
@@ -276,6 +286,7 @@ Var SyncDiagnostic
   StrCpy $R7 $1 36
   StrLen $2 $R7
   StrCmp $2 "36" 0 sync_uninstall_failed
+  sync_uninstall_cleanup:
   StrCpy $SyncFailureMessage "$(SyncCleanupFailed)"
   DetailPrint "$(SyncCleanup)"
   nsExec::ExecToStack '"$INSTDIR\risunest-sync-manager.exe" --data-dir "$R9" uninstall lock-held $SyncForceOption'

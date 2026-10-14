@@ -100,6 +100,11 @@ Var UpdateMode
   FileClose $0
 !macroend
 !include "${quote(resolve("src-tauri/windows.nsh"))}"
+Function un.onUninstFailed
+  FileOpen $0 "$INSTDIR\diagnostic" w
+  FileWrite $0 "$InstallFailureMessage"
+  FileClose $0
+FunctionEnd
 Section
   SetOutPath "$INSTDIR"
   File /oname=SyntheticRisuNest.exe "${quote(join(root, "cleanup.exe"))}"
@@ -148,6 +153,11 @@ SectionEnd
       assert.equal(existsSync(join(location, "cleanup-called")), scenario.called, `${scenario.name}: cleanup invocation`);
       assert.equal(existsSync(join(location, "registered")), scenario.installed, `${scenario.name}: registration`);
       if (!scenario.missing) assert.equal(existsSync(join(location, "SyntheticRisuNest.exe")), scenario.installed, `${scenario.name}: binary`);
+      if (scenario.missing || scenario.fail) {
+        const diagnostic = readFileSync(join(location, "diagnostic"), "utf8");
+        assert.match(diagnostic, scenario.missing ? /app-cleanup-launch-failed/ : /app-cleanup-exit:7/);
+        assert.doesNotMatch(diagnostic, scenario.missing ? /app-cleanup-exit:/ : /app-cleanup-launch-failed/);
+      }
       if (scenario.fail) {
         rmSync(join(location, "fail-cleanup"));
         const retry = spawnSync(join(location, "uninstall.exe"), ["/S", "/DELETE_DATA", `_?=${location}`], { timeout: 30_000, windowsHide: true });

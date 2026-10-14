@@ -129,6 +129,13 @@ mod windows {
         fs::create_dir_all(&install).unwrap();
         let manager = install.join("risunest-sync-manager.exe");
         fs::copy(env!("CARGO_BIN_EXE_risunest-sync-manager"), &manager).unwrap();
+        for value in ["installer", "lock-held", "prepare-update", "--dry-run"] {
+            let result = Command::new(&manager).args(["--data-dir", value, "status"]).output().unwrap();
+            let error = String::from_utf8_lossy(&result.stderr);
+            assert!(!result.status.success());
+            assert!(error.contains("absolute-data-dir-required"));
+            assert!(!error.starts_with("absolute-data-dir-required"), "An option value selected installer diagnostics: {error}");
+        }
         let server = install.join("risunest-sync-server.exe");
         fs::write(&server, "synthetic never executed").unwrap();
         let marker = install.join("risunest-sync-bundle.json");
@@ -153,8 +160,13 @@ mod windows {
         fs::write(&extra, "synthetic").unwrap();
         let blocked_preview = invoke(&manager, &["uninstall", "--dry-run"]);
         assert!(!blocked_preview.status.success());
-        assert!(blocked_preview.stdout.is_empty());
-        assert!(String::from_utf8_lossy(&blocked_preview.stderr).starts_with("removal-unowned-install-files\n"));
+        let blocked_plan: serde_json::Value = serde_json::from_slice(&blocked_preview.stdout).unwrap();
+        assert_eq!(blocked_plan["blockers"], serde_json::json!(["removal-unowned-install-files"]));
+        assert!(String::from_utf8_lossy(&blocked_preview.stderr).contains("removal-unowned-install-files"));
+        let installer_check = invoke(&manager, &["installer", "removal-check", "normal", "preserve"]);
+        assert!(!installer_check.status.success());
+        assert!(installer_check.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&installer_check.stderr).starts_with("removal-unowned-install-files\n"));
         let cleanup = invoke(&manager, &["uninstall", "lock-held"]);
         assert!(cleanup.status.success(), "{}", String::from_utf8_lossy(&cleanup.stderr));
         let instance = risunest_sync_manager::platform::instance_name(&root);
@@ -174,7 +186,7 @@ mod windows {
         let blocked = invoke(&manager, &["uninstall", "--dry-run"]);
         assert!(!blocked.status.success());
         assert!(blocked.stdout.is_empty());
-        assert!(String::from_utf8_lossy(&blocked.stderr).starts_with("removal-registration-missing\n"));
+        assert!(String::from_utf8_lossy(&blocked.stderr).contains("removal-registration-missing"));
         let copied = base.join("removal-helper.exe");
         fs::copy(&manager, &copied).unwrap();
         let removed = invoke(&copied, &["installer", "remove-files", "force"]);
